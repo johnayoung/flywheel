@@ -192,7 +192,10 @@ async fn a_recording_is_valid_asciinema_with_timing_and_resizes() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{started}");
     let name = started["recording"]["name"].as_str().unwrap().to_owned();
-    assert!(name.starts_with(&sid) && name.ends_with(".cast"), "{name}");
+    assert!(
+        name.starts_with("taped-") && name.ends_with("Z.cast"),
+        "{name}"
+    );
     assert_eq!(started["recording"]["active"], true);
     // Starting again is the same recording.
     let (status, again) = hub
@@ -393,6 +396,11 @@ async fn recordings_rotate_at_their_cap_keep_the_directory_bounded_and_end_with_
     for rec in &recordings {
         let name = rec["name"].as_str().unwrap();
         assert!(name.starts_with(base), "{name}");
+        // Its cap holds, the marker ending it included.
+        assert!(
+            rec["size"].as_u64().unwrap() <= limits.max_file_bytes,
+            "{name}: {rec}"
+        );
         let cast = parse_cast(&hub.download(name).await).unwrap();
         assert!(monotonic(&cast.events), "{name}");
         assert_eq!(cast.header["x_fw_hub"]["part"], rec["part"]);
@@ -417,7 +425,11 @@ async fn recordings_rotate_at_their_cap_keep_the_directory_bounded_and_end_with_
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
     let listed = hub.get("/api/recordings").await;
-    let newest = &listed["recordings"][0];
+    // Listed together, in part order: the last part is the newest.
+    let rows = listed["recordings"].as_array().unwrap();
+    let parts: Vec<u64> = rows.iter().map(|r| r["part"].as_u64().unwrap()).collect();
+    assert!(parts.windows(2).all(|w| w[0] < w[1]), "{parts:?}");
+    let newest = rows.last().unwrap();
     assert_eq!(newest["active"], false, "{listed}");
     let cast = parse_cast(&hub.download(newest["name"].as_str().unwrap()).await).unwrap();
     let last = cast.events.last().unwrap();

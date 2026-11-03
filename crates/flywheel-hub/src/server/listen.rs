@@ -197,9 +197,9 @@ pub async fn run(
                             grace = Some(deadline);
                         }
                     },
-                    Phase::Pending | Phase::Main => {}
+                    Phase::Pending | Phase::Main | Phase::Viewer => {}
                 }
-                let pending = phase != Phase::Main;
+                let pending = !matches!(phase, Phase::Main | Phase::Viewer);
                 tokio::select! {
                     _ = served.as_mut() => break,
                     () = closed(&mut close) => {

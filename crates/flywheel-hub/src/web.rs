@@ -306,10 +306,11 @@ pub fn viewer_page(credential: &str) -> String {
 <body class="vw">
 <header class="vw-head">
   <div class="vw-titles">
-    <span class="vw-kicker">flywheel hub &middot; <b>read-only view</b></span>
+    <span class="vw-kicker"><span class="vw-brand">flywheel hub &middot; </span><b>read-only view</b></span>
     <h1 id="vw-title">Shared terminal</h1>
   </div>
   <div class="vw-pills">
+    <button type="button" id="vw-fit" class="vw-pill vw-btn" title="Fit the terminal to the window, or keep it readable and scroll">fit</button>
     <span id="vw-status" class="vw-pill" hidden></span>
     <span id="vw-link" class="vw-pill" data-link="connecting">connecting</span>
   </div>
@@ -319,7 +320,7 @@ pub fn viewer_page(credential: &str) -> String {
   <div id="vw-note" class="vw-note" role="status" hidden></div>
 </main>
 <footer class="vw-foot">
-  <span>Watching a live terminal: you cannot type into it.</span>
+  <span id="vw-what">Watching a live terminal: you cannot type into it.</span>
   <span id="vw-meta" class="vw-meta"></span>
 </footer>
 </body>
@@ -379,10 +380,14 @@ pub const PLAYER_HTML: &str = r##"<!doctype html>
 <body class="vw pl">
 <header class="vw-head">
   <div class="vw-titles">
-    <span class="vw-kicker">flywheel hub &middot; <b>replay</b></span>
+    <span class="vw-kicker"><span class="vw-brand">flywheel hub &middot; </span><b>replay</b></span>
     <h1 id="vw-title">Recording</h1>
   </div>
   <div class="vw-pills">
+    <a class="vw-pill" id="pl-prev" href="#" hidden>&larr; part</a>
+    <span class="vw-pill" id="pl-part" hidden></span>
+    <a class="vw-pill" id="pl-next" href="#" hidden>part &rarr;</a>
+    <button type="button" id="vw-fit" class="vw-pill vw-btn" title="Fit the terminal to the window, or keep it readable and scroll">fit</button>
     <a class="vw-pill" id="pl-download" href="#" download>download .cast</a>
     <a class="vw-pill" href="/">hub</a>
   </div>
@@ -393,7 +398,10 @@ pub const PLAYER_HTML: &str = r##"<!doctype html>
 </main>
 <footer class="pl-bar">
   <button type="button" id="pl-play" class="pl-btn" disabled>Play</button>
-  <input type="range" id="pl-seek" class="pl-seek" min="0" max="1000" step="1" value="0" disabled aria-label="Position">
+  <div class="pl-track">
+    <input type="range" id="pl-seek" class="pl-seek" min="0" max="1000" step="1" value="0" disabled aria-label="Position">
+    <div id="pl-marks" class="pl-marks"></div>
+  </div>
   <span id="pl-time" class="pl-time">0:00 / 0:00</span>
   <label class="pl-opt">speed
     <select id="pl-speed">

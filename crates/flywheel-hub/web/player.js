@@ -11,6 +11,7 @@
   const name = decodeURIComponent(window.location.hash.slice(1));
   const view = window.FwHubTermView($("vw-term"), $("vw-stage"));
   const IDLE_CAP = 2;
+  const CONTINUED = /^continued in (\S+\.cast)$/;
   const SEEK_STEP = 5;
 
   const play = {
@@ -91,6 +92,10 @@
         if (batch) view.write(batch);
         batch = "";
         note(`The process ended (${event.data.replace(/^exit:?\s*/, "") || "exit"}).`);
+      } else if (event.code === "m" && CONTINUED.test(event.data)) {
+        if (batch) view.write(batch);
+        batch = "";
+        note("This part ends here: the recording continues in the next part.");
       }
       play.next += 1;
     }
@@ -122,9 +127,60 @@
     play.last = now;
     play.pos = Math.min(play.duration, play.pos + dt * play.speed);
     advance(play.pos);
-    if (play.pos >= play.duration) play.playing = false;
+    if (play.pos >= play.duration) {
+      play.playing = false;
+      // Played to its end: carry on in the next part.
+      if (play.nextPart) {
+        window.location.replace(`/replay#${encodeURIComponent(play.nextPart)}`);
+        return;
+      }
+    }
     render();
     if (play.playing) play.frame = window.requestAnimationFrame(tick);
+  }
+
+  // `<base>.cast` is part 1, `<base>.partN.cast` part N.
+  function partName(part) {
+    const base = name.replace(/(\.part\d+)?\.cast$/, "");
+    return part <= 1 ? `${base}.cast` : `${base}.part${part}.cast`;
+  }
+
+  // The part links, and a tick on the bar for every marker.
+  function renderParts() {
+    const hub = play.header.x_fw_hub || {};
+    const part = Number(hub.part) || 1;
+    const continued = play.events.find((e) => e.code === "m" && CONTINUED.test(e.data));
+    play.nextPart = continued ? CONTINUED.exec(continued.data)[1] : "";
+    const prev = $("pl-prev");
+    prev.hidden = part <= 1;
+    if (part > 1) prev.href = `/replay#${encodeURIComponent(partName(part - 1))}`;
+    const next = $("pl-next");
+    next.hidden = !play.nextPart;
+    if (play.nextPart) next.href = `/replay#${encodeURIComponent(play.nextPart)}`;
+    const label = $("pl-part");
+    label.hidden = part <= 1 && !play.nextPart;
+    label.textContent = `part ${part}`;
+    const marks = $("pl-marks");
+    marks.textContent = "";
+    if (!play.duration) return;
+    for (const event of play.events) {
+      if (event.code !== "m") continue;
+      const kind = /^exit/.test(event.data) ? "exit" : CONTINUED.test(event.data) ? "continued" : "marker";
+      const tick = document.createElement("button");
+      tick.type = "button";
+      tick.className = "pl-mark";
+      tick.dataset.kind = kind;
+      tick.style.left = `${(event.at / play.duration) * 100}%`;
+      tick.title = `${clock(event.at)}  ${event.data}`;
+      tick.setAttribute("aria-label", tick.title);
+      tick.addEventListener("click", () => {
+        const wasPlaying = play.playing;
+        pause();
+        seek(event.at);
+        if (wasPlaying && play.pos < play.duration) start();
+      });
+      marks.appendChild(tick);
+    }
   }
 
   function start() {
@@ -186,6 +242,7 @@
     play.header = parsed.header;
     play.events = parsed.events;
     retime();
+    renderParts();
     const title = parsed.header.title || name;
     $("vw-title").textContent = title;
     document.title = `${title} - replay`;
@@ -204,6 +261,7 @@
     // Keep the place: the same event stays next.
     const at = play.next > 0 ? play.events[play.next - 1].t : 0;
     retime();
+    renderParts();
     const event = play.events.find((e) => e.t >= at);
     play.pos = event ? Math.min(event.at, play.duration) : play.duration;
     render();
@@ -238,6 +296,13 @@
       pause();
       seek(0);
     }
+  });
+  // Fit the whole screen to the window, or keep it readable and scroll.
+  const fitButton = $("vw-fit");
+  fitButton.addEventListener("click", () => view.toggleMode());
+  view.onMode((mode) => {
+    fitButton.textContent = mode === "fit" ? "fit" : "readable";
+    fitButton.setAttribute("aria-pressed", mode === "fit" ? "true" : "false");
   });
   window.addEventListener("hashchange", () => window.location.reload());
   load();

@@ -295,7 +295,7 @@ window.FwHubSharing = function (ctx) {
     rec.title = recording
       ? `Recording to ${session.recording}: click to stop`
       : "Record this session (asciinema .cast: output, timing, resizes)";
-    $("#rec-label").textContent = recording ? "recording" : "rec";
+    $("#rec-label").textContent = recording ? "REC" : "rec";
     const links = session && session.live ? session.live.link_viewers || 0 : 0;
     share.title = links
       ? `${links} watching through a share link · share a read-only view`

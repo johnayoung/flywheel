@@ -21,7 +21,11 @@
 @media (prefers-reduced-motion: reduce) {
   .rec-pill.on .rec-dot, .sh-row.active .rec-dot { animation: none; }
 }
-.share-pill b { color: var(--signal); }
+/* A row's recording dot, and the pills' labels where the header keeps only
+   icons: a live recording or link viewers must not be missed. */
+.row-rec { width: .5rem; height: .5rem; color: var(--alert); background: var(--alert); animation: rec-pulse 1.6s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .row-rec { animation: none; } }
+.rec-pill.on #rec-label { font-size: 10px; margin-left: .3rem; font-weight: 700; }
 
 #dlg-sharing { width: min(46rem, calc(100vw - 2rem)); }
 .sh-new { display: grid; gap: .8rem; padding: .8rem .9rem; border: 1px solid var(--rule-2); background: var(--bg-3); }

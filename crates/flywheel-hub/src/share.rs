@@ -35,6 +35,10 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(3600);
 pub const MIN_TTL: Duration = Duration::from_secs(60);
 /// The longest expiry accepted (a share link always ends).
 pub const MAX_TTL: Duration = Duration::from_secs(30 * 86_400);
+/// Viewer sockets one share link may have open at once.
+pub const MAX_VIEWERS_PER_SHARE: usize = 32;
+/// Viewer sockets open at once across every share link.
+pub const MAX_VIEWERS: usize = 256;
 /// Random bytes in a share secret (256 bits).
 const SECRET_BYTES: usize = 32;
 /// Random bytes in a share id.
@@ -419,7 +423,7 @@ impl ShareStore {
             .and_then(|revoked| {
                 if revoked.is_empty() {
                     Err(ShareError::NotFound(format!(
-                        "no share {which} (fw hub share ls)"
+                        "share {which:?} (see fw hub share ls)"
                     )))
                 } else {
                     Ok(revoked)
@@ -505,10 +509,19 @@ impl ShareStore {
         self.changes.subscribe()
     }
 
-    /// Count an open viewer of `share` until the guard drops.
-    pub fn hold_viewer(&self, share: &ShareInfo) -> ViewerHold {
+    /// Count an open viewer of `share` until the guard drops; `None` when
+    /// the link already has [`MAX_VIEWERS_PER_SHARE`] open, or every link
+    /// together [`MAX_VIEWERS`] (a link's holder is an outsider: their
+    /// sockets must not exhaust the hub's descriptors).
+    pub fn hold_viewer(&self, share: &ShareInfo) -> Option<ViewerHold> {
         {
             let mut viewers = self.viewers.lock().unwrap_or_else(PoisonError::into_inner);
+            let total: usize = viewers.by_share.values().sum();
+            if total >= MAX_VIEWERS
+                || viewers.by_share.get(&share.id).copied().unwrap_or(0) >= MAX_VIEWERS_PER_SHARE
+            {
+                return None;
+            }
             *viewers.by_share.entry(share.id.clone()).or_insert(0) += 1;
             *viewers
                 .by_session
@@ -519,11 +532,11 @@ impl ShareStore {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(share.id.clone(), unix_now());
-        ViewerHold {
+        Some(ViewerHold {
             share: share.id.clone(),
             session: share.session_id.clone(),
             viewers: Arc::clone(&self.viewers),
-        }
+        })
     }
 
     /// Share-link viewers of session `session_id` open now.
@@ -691,13 +704,20 @@ mod tests {
             store.issue("s2", DEFAULT_TTL, Some("\u{7}")),
             Err(ShareError::Invalid(_))
         ));
-        let hold = store.hold_viewer(&info);
+        let hold = store.hold_viewer(&info).unwrap();
         assert_eq!(store.list().unwrap()[0].viewers, 1);
         assert_eq!(store.session_viewers("s1"), 1);
         drop(hold);
         assert_eq!(store.list().unwrap()[0].viewers, 0);
         assert_eq!(store.session_viewers("s1"), 0);
         assert!(store.list().unwrap()[0].last_used.is_some());
+        // A link's open viewers are capped.
+        let holds: Vec<_> = (0..MAX_VIEWERS_PER_SHARE)
+            .map(|_| store.hold_viewer(&info).unwrap())
+            .collect();
+        assert!(store.hold_viewer(&info).is_none());
+        drop(holds);
+        assert!(store.hold_viewer(&info).is_some());
         store.issue("s2", DEFAULT_TTL, None).unwrap();
         assert_eq!(store.revoke_all(Some("s2")).unwrap().len(), 1);
         assert_eq!(store.revoke_all(None).unwrap().len(), 1);

@@ -44,11 +44,17 @@
     return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
   }
 
+  // The link is over: nothing on screen may still read as live.
   function end(message) {
     state.over = true;
     clearTimeout(state.retry);
     link("ended", "ended");
     note(message, true);
+    const pill = $("vw-status");
+    pill.hidden = true;
+    pill.textContent = "";
+    $("vw-what").textContent = "No longer live: the screen is as it last was.";
+    $("vw-meta").textContent = message.replace(/^This share link (was|has) /, "link ").replace(/\.$/, "");
     if (state.socket) state.socket.close();
   }
 
@@ -170,6 +176,14 @@
       }, wait);
     };
   }
+
+  // Fit the whole screen to the window, or keep it readable and scroll.
+  const fitButton = $("vw-fit");
+  fitButton.addEventListener("click", () => view.toggleMode());
+  view.onMode((mode) => {
+    fitButton.textContent = mode === "fit" ? "fit" : "readable";
+    fitButton.setAttribute("aria-pressed", mode === "fit" ? "true" : "false");
+  });
 
   info().finally(connect);
   setInterval(info, INFO_MS);

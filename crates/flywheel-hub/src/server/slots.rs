@@ -3,6 +3,12 @@
 //! * **Main** ([`Slots::new`]'s `main_cap`): connections whose latest
 //!   request carried a valid credential (token, login cookie, peer
 //!   credential). Kept alive; a stop lets their requests finish.
+//! * **Share links** (as many as the unauthenticated pool, [`UNAUTH_PER_CLIENT`]
+//!   per client): connections whose latest request carried a live share
+//!   link's credential. A link is handed to outsiders by design, so its
+//!   holders never take a main slot (they would lock the operator out):
+//!   a full share pool, or a client over its share of it, is refused at
+//!   once instead of waiting. Kept alive like main ones.
 //! * **Unauthenticated** (`pending_cap`, much smaller): every connection
 //!   starts here -- nothing is known about it before its first request
 //!   head -- and leaves the moment a head carries a valid credential (it
@@ -67,6 +73,8 @@ pub enum Phase {
     Pending,
     /// Holding a main slot.
     Main,
+    /// Holding a share-link slot.
+    Viewer,
     /// Evicted from the pending pool: its task closes it, unless a request
     /// head already in its socket buffer authenticates first (it would
     /// have, but for the race).
@@ -82,6 +90,7 @@ pub struct Slots {
     pending: Mutex<Pool>,
     pending_cap: usize,
     per_client: usize,
+    viewer_cap: usize,
 }
 
 #[derive(Debug, Default)]
@@ -92,6 +101,9 @@ struct Pool {
     /// Pending connections per client key (`None`: not known yet, or this
     /// machine -- never capped, and each its own client for eviction).
     clients: HashMap<Option<IpAddr>, usize>,
+    /// Share-link connections per client key, and in all.
+    viewers: HashMap<Option<IpAddr>, usize>,
+    viewer_total: usize,
 }
 
 /// One connection's standing, shared by its task and its requests.
@@ -107,7 +119,7 @@ struct ConnState {
     phase: Phase,
     /// Its key in [`Pool::order`] while pending.
     seq: u64,
-    /// The client key it counts against while pending.
+    /// The client key it counts against while pending or a viewer.
     client: Option<IpAddr>,
     /// A request head arrived on it.
     head: bool,
@@ -146,6 +158,21 @@ impl Pool {
 
     fn add_client(&mut self, key: Option<IpAddr>) {
         *self.clients.entry(key).or_default() += 1;
+    }
+
+    /// A share-link connection of `state.client` leaves its pool.
+    fn drop_viewer(&mut self, state: &mut ConnState) {
+        if state.phase != Phase::Viewer {
+            return;
+        }
+        self.viewer_total = self.viewer_total.saturating_sub(1);
+        if let Some(n) = self.viewers.get_mut(&state.client) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.viewers.remove(&state.client);
+            }
+        }
+        state.phase = Phase::Pending;
     }
 
     fn drop_client(&mut self, key: Option<IpAddr>) {
@@ -252,6 +279,7 @@ impl Slots {
             pending: Mutex::new(Pool::default()),
             pending_cap,
             per_client,
+            viewer_cap: pending_cap,
         }
     }
 
@@ -323,6 +351,13 @@ impl Slots {
                 Phase::Closed => return false,
                 Phase::Pending => pool.remove(&state),
                 Phase::Evicted => state.phase = Phase::Pending,
+                Phase::Viewer => {
+                    // It waits for a main slot like a fresh request.
+                    pool.drop_viewer(&mut state);
+                    state.deadline = Instant::now() + UNAUTH_REQUEST_TIMEOUT;
+                    drop(state);
+                    conn.wake.notify_one();
+                }
             }
         }
         let Ok(permit) = Arc::clone(&self.main).acquire_owned().await else {
@@ -338,8 +373,40 @@ impl Slots {
                 true
             }
             Phase::Main => true,
-            Phase::Evicted | Phase::Closed => false,
+            Phase::Viewer | Phase::Evicted | Phase::Closed => false,
         }
+    }
+
+    /// A request on `conn` carried a live share link's credential: hold a
+    /// share-link slot, counted against `client` (`None`: this machine,
+    /// uncounted per client). Never waits: false when the share pool is
+    /// full, `client` holds its share of it, or the connection was closed.
+    /// A main connection keeps its slot.
+    pub fn shared(&self, conn: &Conn, client: Option<IpAddr>) -> bool {
+        let key = client.map(client_key);
+        let mut pool = self.pool();
+        let mut state = conn.lock();
+        match state.phase {
+            Phase::Main => return true,
+            Phase::Closed => return false,
+            Phase::Viewer if state.client == key => return true,
+            Phase::Viewer => pool.drop_viewer(&mut state),
+            Phase::Pending | Phase::Evicted => {}
+        }
+        let held = pool.viewers.get(&key).copied().unwrap_or(0);
+        if pool.viewer_total >= self.viewer_cap || (key.is_some() && held >= self.per_client) {
+            return false;
+        }
+        if state.phase == Phase::Pending {
+            pool.remove(&state);
+        }
+        pool.viewer_total += 1;
+        *pool.viewers.entry(key).or_default() += 1;
+        state.client = key;
+        state.phase = Phase::Viewer;
+        drop(state);
+        conn.wake.notify_one();
+        true
     }
 
     /// A request on `conn` did not authenticate: it counts (from now on)
@@ -356,6 +423,7 @@ impl Slots {
         if state.phase == Phase::Closed {
             return false;
         }
+        pool.drop_viewer(&mut state);
         let in_pool = state.phase == Phase::Pending && pool.order.contains_key(&state.seq);
         // Others of `key` it would sit beside.
         let others = pool.count(key) - usize::from(in_pool && state.client == key);
@@ -395,7 +463,7 @@ impl Slots {
         let mut pool = self.pool();
         let mut state = conn.lock();
         match state.phase {
-            Phase::Main => false,
+            Phase::Main | Phase::Viewer => false,
             Phase::Closed => true,
             Phase::Evicted | Phase::Pending => {
                 pool.remove(&state);
@@ -412,6 +480,7 @@ impl Slots {
         if state.phase == Phase::Pending {
             pool.remove(&state);
         }
+        pool.drop_viewer(&mut state);
         state.phase = Phase::Closed;
         state.main = None;
     }
@@ -425,6 +494,11 @@ impl Slots {
     #[cfg(test)]
     pub fn main_available(&self) -> usize {
         self.main.available_permits()
+    }
+
+    #[cfg(test)]
+    pub fn viewers_len(&self) -> usize {
+        self.pool().viewer_total
     }
 }
 
@@ -444,6 +518,11 @@ impl Admission {
     /// See [`Slots::authenticated`].
     pub async fn authenticated(&self) -> bool {
         self.slots.authenticated(&self.conn).await
+    }
+
+    /// See [`Slots::shared`].
+    pub fn shared(&self, client: Option<IpAddr>) -> bool {
+        self.slots.shared(&self.conn, client)
     }
 
     /// See [`Slots::unauthenticated`].
@@ -676,5 +755,39 @@ mod tests {
         assert!(slots.unauthenticated(&again, None));
         assert!(slots.close_if_pending(&again));
         assert!(!slots.unauthenticated(&again, None));
+    }
+
+    #[tokio::test]
+    async fn share_link_connections_hold_their_own_slots_never_main_ones() {
+        let slots = Slots::new(1, 3, 2);
+        // A link's holder fills its share of the share pool, from one
+        // address and from others; never a main slot.
+        let a = with_head(&slots, ip("198.51.100.1"));
+        let b = with_head(&slots, ip("198.51.100.1"));
+        assert!(slots.shared(&a, ip("198.51.100.1")));
+        assert!(slots.shared(&b, ip("198.51.100.1")));
+        let c = with_head(&slots, ip("198.51.100.1"));
+        assert!(!slots.shared(&c, ip("198.51.100.1")), "per-client cap");
+        let d = with_head(&slots, ip("198.51.100.2"));
+        assert!(slots.shared(&d, ip("198.51.100.2")));
+        let e = with_head(&slots, None);
+        assert!(!slots.shared(&e, None), "the pool is full");
+        assert_eq!((slots.viewers_len(), slots.main_available()), (3, 1));
+        assert_eq!(slots.pending_len(), 2);
+        // Kept alive: a stop or freeze leaves them to finish.
+        assert!(!slots.close_if_pending(&a));
+        // The operator still gets the main slot at once.
+        assert!(slots.authenticated(&e).await);
+        assert_eq!(phase(&e), Phase::Main);
+        // A viewer connection that then authenticates leaves the share
+        // pool; one that sends nothing competes as unauthenticated.
+        slots.release(&e);
+        assert!(slots.authenticated(&d).await);
+        assert_eq!(slots.viewers_len(), 2);
+        assert!(slots.unauthenticated(&b, ip("198.51.100.1")));
+        assert_eq!((phase(&b), slots.viewers_len()), (Phase::Pending, 1));
+        slots.release(&a);
+        assert_eq!(slots.viewers_len(), 0);
+        assert!(slots.shared(&c, ip("198.51.100.1")));
     }
 }

@@ -376,12 +376,17 @@ pub(super) async fn viewer_ws(
         Ok(ws) => ws,
         Err(rejection) => return upgrade_refused(&rejection),
     };
+    let Some(hold) = app.hub.shares().hold_viewer(&share) else {
+        return error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "this share link has too many viewers open; close one and retry",
+        );
+    };
     let gate = gate.map(|axum::Extension(gate)| gate);
     let shutdown = app.shutdown.clone();
     let hub = Arc::clone(&app.hub);
     ws.max_message_size(WS_MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
-            let hold = hub.shares().hold_viewer(&share);
             hub.emit(HubEvent::Sessions);
             read_only_pump(socket, &session, &share, changes, shutdown, gate, &hub).await;
             drop(hold);

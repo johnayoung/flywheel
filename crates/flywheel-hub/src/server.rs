@@ -707,4 +707,87 @@ mod tests {
         assert!(BodyBound::PUBLIC.timeout < crate::handoff::FREEZE_TIMEOUT);
         assert!(BodyBound::PUBLIC.timeout < listen::CLOSE_GRACE);
     }
+
+    /// Share-link connections never take main slots: a link's holder
+    /// filling every slot it can still leaves the operator's requests
+    /// served.
+    #[tokio::test]
+    async fn share_link_connections_cannot_lock_the_operator_out() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::open(crate::HubOptions::new(dir.path().join("state"))).unwrap();
+        let token = hub.token().expose().to_owned();
+        let (_, credential) = hub
+            .shares()
+            .issue("s1", crate::share::DEFAULT_TTL, None)
+            .unwrap();
+        let (closing, rx) = watch::channel(false);
+        let app = router(Arc::clone(&hub), ServerOptions::default(), rx);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let listener = crate::handoff::GatedListener::new(listener, crate::handoff::Gate::new());
+        let cap = 4;
+        tokio::spawn(listen::run(
+            listener,
+            app,
+            cap,
+            Vec::new(),
+            std::future::pending(),
+            closing,
+        ));
+        // Read one response's status line and head (no body framing
+        // needed: the line is all a test asserts).
+        async fn status(stream: &mut tokio::net::TcpStream) -> String {
+            let mut buf = vec![0u8; 8192];
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("answered in time")
+                .unwrap();
+            String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        }
+        // Keep-alive share-link connections, many more than main slots.
+        let viewer_cap = slots::unauthenticated_cap(cap);
+        let mut held = Vec::new();
+        let mut refused = 0;
+        for _ in 0..viewer_cap + 4 {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let head = format!("GET /share/{credential}/info HTTP/1.1\r\nHost: x\r\n\r\n");
+            stream.write_all(head.as_bytes()).await.unwrap();
+            let line = status(&mut stream).await;
+            if line.contains(" 200 ") {
+                held.push(stream);
+            } else {
+                assert!(line.contains(" 429 "), "{line}");
+                refused += 1;
+            }
+        }
+        assert_eq!(held.len(), viewer_cap);
+        assert_eq!(refused, 4);
+        // The operator is still served, at once.
+        for _ in 0..cap + 1 {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let head = format!(
+                "GET /api/shares HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            let line = status(&mut stream).await;
+            assert!(line.contains(" 200 "), "{line}");
+        }
+        // A share-link slot freed is a slot back.
+        drop(held.pop());
+        let mut stream = loop {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let head = format!("GET /share/{credential}/info HTTP/1.1\r\nHost: x\r\n\r\n");
+            stream.write_all(head.as_bytes()).await.unwrap();
+            if status(&mut stream).await.contains(" 200 ") {
+                break stream;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let _ = stream.shutdown().await;
+    }
 }

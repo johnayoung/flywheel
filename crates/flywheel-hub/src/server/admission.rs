@@ -1,6 +1,6 @@
-//! Middleware: file each request's connection in the main or the
-//! unauthenticated slot pool ([`super::slots`]) by whether the request
-//! carries a valid credential, before any route sees it.
+//! Middleware: file each request's connection in the main, the share-link,
+//! or the unauthenticated slot pool ([`super::slots`]) by the credential
+//! the request carries, before any route sees it.
 //!
 //! This only sorts connections; `require_auth` still decides what a
 //! request may do. The sort checks credentials without counting failures
@@ -19,9 +19,18 @@ use axum::response::{IntoResponse, Response};
 use std::sync::PoisonError;
 use std::time::Instant;
 
-/// Whether the request carries a live login cookie, the token, a peer
-/// credential, or (in its `/share/` path) a live share link's credential.
-fn presents_credential(app: &AppState, request: &Request, client: Client) -> bool {
+/// What a request presents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Presented {
+    /// A live login cookie, the token, or a peer credential.
+    Credential,
+    /// A live share link's credential (in its `/share/` path): an
+    /// outsider's, which never takes a main slot.
+    ShareLink,
+    Nothing,
+}
+
+fn presented(app: &AppState, request: &Request, client: Client) -> Presented {
     let headers = request.headers();
     let locked = || {
         !client.same_machine
@@ -32,25 +41,27 @@ fn presents_credential(app: &AppState, request: &Request, client: Client) -> boo
                 .locked(client.ip, Instant::now())
                 .is_some()
     };
-    if let Some((credential, _)) = crate::share::credential_in_path(request.uri().path()) {
-        return !locked()
-            && matches!(
-                app.hub.shares().verify(credential),
-                crate::share::Verdict::Live(_)
-            );
-    }
     let token = app.hub.token();
     let cookies = login_cookies(headers, &cookie_name(token.expose()));
     if cookies.iter().any(|c| app.hub.login_valid(c)) {
-        return true;
+        return Presented::Credential;
     }
-    let Some(bearer) = header_str(headers, header::AUTHORIZATION).and_then(bearer_value) else {
-        return false;
-    };
-    if locked() {
-        return false;
+    if let Some(bearer) = header_str(headers, header::AUTHORIZATION).and_then(bearer_value)
+        && !locked()
+        && (token.matches(bearer) || app.peers.verify(bearer).is_some())
+    {
+        return Presented::Credential;
     }
-    token.matches(bearer) || app.peers.verify(bearer).is_some()
+    if let Some((credential, _)) = crate::share::credential_in_path(request.uri().path())
+        && !locked()
+        && matches!(
+            app.hub.shares().verify(credential),
+            crate::share::Verdict::Live(_)
+        )
+    {
+        return Presented::ShareLink;
+    }
+    Presented::Nothing
 }
 
 fn closing(status: StatusCode, message: &'static str) -> Response {
@@ -69,18 +80,30 @@ pub(super) async fn admit(State(app): State<AppState>, request: Request, next: N
         return next.run(request).await;
     };
     let client = Client::of(request.extensions(), request.headers(), &app.options);
-    if presents_credential(&app, &request, client) {
-        if !admission.authenticated().await {
-            return closing(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the hub dropped this connection; retry\n",
-            );
-        }
-        return next.run(request).await;
-    }
     // This machine's own requests (no proxy in between) are not counted
     // per client: the pool's size still bounds them.
     let counted = (!client.same_machine).then_some(client.ip);
+    match presented(&app, &request, client) {
+        Presented::Credential => {
+            if !admission.authenticated().await {
+                return closing(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the hub dropped this connection; retry\n",
+                );
+            }
+            return next.run(request).await;
+        }
+        Presented::ShareLink => {
+            if !admission.shared(counted) {
+                return closing(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many share-link connections; retry\n",
+                );
+            }
+            return next.run(request).await;
+        }
+        Presented::Nothing => {}
+    }
     if !admission.unauthenticated(counted) {
         return closing(
             StatusCode::TOO_MANY_REQUESTS,

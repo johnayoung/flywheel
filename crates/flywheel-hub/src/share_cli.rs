@@ -7,18 +7,41 @@ use crate::endpoint::{Endpoint, EndpointArgs};
 use crate::remote::{LoginTarget, qr_lines};
 use crate::script::{query_escape, resolve};
 use crate::util::{fail, str_field};
-use chrono::{Local, TimeZone};
+use chrono::{TimeZone, Utc};
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
+/// A Unix time in UTC (as recording file names are), with how far off it
+/// is: `2026-11-03 10:59 UTC (in 57m)`.
 fn when(unix: Option<u64>) -> String {
-    unix.and_then(|s| i64::try_from(s).ok())
-        .and_then(|s| Local.timestamp_opt(s, 0).single())
-        .map_or_else(
-            || "-".to_owned(),
-            |t| t.format("%Y-%m-%d %H:%M").to_string(),
-        )
+    let Some(at) = unix
+        .and_then(|s| i64::try_from(s).ok())
+        .and_then(|s| Utc.timestamp_opt(s, 0).single())
+    else {
+        return "-".to_owned();
+    };
+    format!(
+        "{} ({})",
+        at.format("%Y-%m-%d %H:%M UTC"),
+        relative(at.timestamp() - Utc::now().timestamp())
+    )
+}
+
+/// `in 57m`, `3h ago`, `now`.
+fn relative(delta: i64) -> String {
+    let span = delta.unsigned_abs();
+    let text = match span {
+        0..60 => return "now".to_owned(),
+        60..3600 => format!("{}m", span / 60),
+        3600..86_400 => format!("{}h{:02}m", span / 3600, span % 3600 / 60),
+        _ => format!("{}d{}h", span / 86_400, span % 86_400 / 3600),
+    };
+    if delta > 0 {
+        format!("in {text}")
+    } else {
+        format!("{text} ago")
+    }
 }
 
 fn size(bytes: u64) -> String {
@@ -459,8 +482,9 @@ fn record_ls(args: &RecordLsArgs, out: &mut dyn Write) -> Result<i32, String> {
     for rec in &recordings {
         let _ = writeln!(
             out,
-            "{:<52} {:>10}  {}  {}{}",
+            "{:<52} {:>7} {:>10}  {}  {}{}",
             str_field(rec, "name"),
+            format!("part {}", rec["part"].as_u64().unwrap_or(1)),
             size(rec["size"].as_u64().unwrap_or(0)),
             when(rec["started"].as_u64()),
             rec["title"].as_str().unwrap_or("-"),
@@ -506,6 +530,13 @@ fn record_get(
     }
     let mut options = std::fs::OpenOptions::new();
     options.write(true);
+    // A recording holds whatever its terminal showed: as private as the
+    // hub's own copy.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
     if args.force {
         options.create(true).truncate(true);
     } else {
@@ -518,6 +549,12 @@ fn record_get(
             format!("{}: {e}", target.display())
         }
     })?;
+    #[cfg(unix)]
+    {
+        // An existing file --force overwrites keeps no wider mode.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
     file.write_all(&bytes)
         .map_err(|e| format!("{}: {e}", target.display()))?;
     let _ = writeln!(
@@ -545,4 +582,19 @@ fn record_rm(args: &RecordName, out: &mut dyn Write) -> Result<i32, String> {
     )?;
     let _ = writeln!(out, "deleted {}", args.name);
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn times_read_in_utc_with_how_far_off_they_are() {
+        assert_eq!(relative(30), "now");
+        assert_eq!(relative(57 * 60 + 5), "in 57m");
+        assert_eq!(relative(-(3 * 3600 + 4 * 60)), "3h04m ago");
+        assert_eq!(relative(2 * 86_400 + 3600), "in 2d1h");
+        assert_eq!(when(None), "-");
+        assert!(when(Some(0)).starts_with("1970-01-01 00:00 UTC ("));
+    }
 }

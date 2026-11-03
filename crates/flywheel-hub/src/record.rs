@@ -40,6 +40,11 @@ pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
 /// How often an idle recorder looks for output (the timing resolution of
 /// output arriving after a pause).
 const POLL: Duration = Duration::from_millis(10);
+/// Bytes an event line takes beyond its data (time, code, quoting).
+const EVENT_OVERHEAD: u64 = 64;
+/// Room kept at the end of a part for the marker that ends it
+/// (`continued in <next part>`, or the exit).
+const END_RESERVE: u64 = 512;
 /// Longest header line read when listing.
 const MAX_HEADER: u64 = 64 * 1024;
 /// How much of a file's end is read to find its last event time.
@@ -179,6 +184,42 @@ pub fn valid_name(name: &str) -> bool {
         && !name.contains("..")
 }
 
+/// A session name as a file name part: letters, digits, `-` and `_`
+/// (anything else a `-`), at most 48 characters; the session id's start
+/// when nothing is left.
+fn file_label(name: &str, session_id: &str) -> String {
+    let mut label = String::new();
+    for c in name.chars() {
+        let c = if c.is_ascii_alphanumeric() || c == '_' {
+            c
+        } else {
+            '-'
+        };
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        label.push(c);
+        if label.len() >= 48 {
+            break;
+        }
+    }
+    let label = label.trim_end_matches('-');
+    if label.is_empty() {
+        session_id.chars().take(12).collect()
+    } else {
+        label.to_owned()
+    }
+}
+
+/// The name every part of the recording `name` shares.
+fn base_of(name: &str) -> &str {
+    let stem = name.strip_suffix(".cast").unwrap_or(name);
+    match stem.rsplit_once(".part") {
+        Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => stem,
+    }
+}
+
 fn part_file(base: &str, part: u32) -> String {
     if part <= 1 {
         format!("{base}.cast")
@@ -270,11 +311,13 @@ impl Recordings {
         self.recorders().get(id).is_some_and(|r| r.thread.is_some())
     }
 
-    /// Start recording session `session_id` (live, running) under `title`.
+    /// Start recording session `session_id` (live, running) under `title`,
+    /// in a file named for `label` (its session name) and the UTC time.
     /// Already recording: that recording, `false`.
     pub fn start(
         self: &Arc<Self>,
         session_id: &str,
+        label: &str,
         title: &str,
         session: &Arc<PtySession>,
         ended: EndNotice,
@@ -293,7 +336,12 @@ impl Recordings {
             chrono::DateTime::<chrono::Utc>::from(UNIX_EPOCH + Duration::from_millis(started_ms))
                 .format("%Y%m%dT%H%M%S%3fZ")
                 .to_string();
-        let base = format!("{session_id}-{stamp}");
+        let mut base = format!("{}-{stamp}", file_label(label, session_id));
+        if self.dir.join(part_file(&base, 1)).exists() {
+            // Another session of that name started this millisecond.
+            let short: String = session_id.chars().take(8).collect();
+            base = format!("{base}-{short}");
+        }
         let entry = ActiveEntry {
             session_id: session_id.to_owned(),
             file: part_file(&base, 1),
@@ -304,6 +352,13 @@ impl Recordings {
         };
         self.sweep();
         let attachment = session.attach_with(0);
+        // Exited since the check above: its exit event went out before
+        // this subscription, so a recorder would never see it.
+        if attachment.exit.is_some() {
+            return Err(RecordError::Conflict(format!(
+                "session {session_id} is not running: nothing to record"
+            )));
+        }
         let path = self.dir.join(&entry.file);
         let mut writer = CastWriter::create(&path, attachment.cols, attachment.rows, &entry)
             .map_err(io_error(&path))?;
@@ -369,18 +424,36 @@ impl Recordings {
     /// Stop recording session `id`: what was output so far is written out
     /// and the file closed.
     pub fn stop(&self, id: &str) -> Result<RecordingInfo, RecordError> {
-        let Some(mut recorder) = self.recorders().remove(id) else {
-            return Err(RecordError::Conflict(format!(
-                "session {id} is not being recorded"
-            )));
+        // Listed (its file active: no sweep deletes it) until its thread
+        // has written out and closed the file.
+        let (entry, generation, thread) = {
+            let mut recorders = self.recorders();
+            let Some(recorder) = recorders.get_mut(id) else {
+                return Err(RecordError::Conflict(format!(
+                    "session {id} is not being recorded"
+                )));
+            };
+            recorder.control.store(STOP, Ordering::Release);
+            (
+                Arc::clone(&recorder.entry),
+                recorder.generation,
+                recorder.thread.take(),
+            )
         };
-        recorder.control.store(STOP, Ordering::Release);
-        if let Some(thread) = recorder.thread.take() {
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
+        {
+            let mut recorders = self.recorders();
+            if recorders
+                .get(id)
+                .is_some_and(|r| r.generation == generation)
+            {
+                recorders.remove(id);
+            }
+        }
         self.save_active();
-        let file = recorder
-            .entry
+        let file = entry
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .file
@@ -602,11 +675,19 @@ impl Recordings {
                     .flatten()
             })
             .collect();
+        // A recording's parts together, in order; the recording with the
+        // latest part first.
+        let mut latest: HashMap<String, (Option<u64>, Option<u64>)> = HashMap::new();
+        for info in &list {
+            let slot = latest.entry(base_of(&info.name).to_owned()).or_default();
+            *slot = (*slot).max((info.started, info.modified));
+        }
         list.sort_by(|a, b| {
-            b.started
-                .cmp(&a.started)
-                .then(b.modified.cmp(&a.modified))
-                .then(b.name.cmp(&a.name))
+            let (ka, kb) = (base_of(&a.name), base_of(&b.name));
+            latest[kb]
+                .cmp(&latest[ka])
+                .then(kb.cmp(ka))
+                .then(a.part.cmp(&b.part))
         });
         Ok(list)
     }
@@ -701,14 +782,52 @@ struct Worker {
 
 impl Worker {
     fn run(mut self) {
+        // Once stopping: how many more events to write (those queued when
+        // the stop was seen). Checked before every event, as under
+        // sustained output the queue never runs empty.
+        let mut stopping: Option<usize> = None;
         let finished = loop {
+            match (stopping, self.control.load(Ordering::Acquire)) {
+                (Some(0), _) => break false,
+                (Some(left), _) => stopping = Some(left - 1),
+                (None, STOP) => {
+                    stopping = Some(self.events.len());
+                    continue;
+                }
+                (None, FREEZE) => {
+                    // The next process resumes from here.
+                    let _ = self.writer.flush();
+                    return;
+                }
+                (None, _) => {}
+            }
             match self.events.try_recv() {
                 Ok(SessionEvent::Output(bytes)) => {
-                    if let Err(e) = self.writer.output(&bytes) {
+                    let line = match self.writer.output_line(&bytes) {
+                        Ok(Some(line)) => line,
+                        Ok(None) => continue,
+                        Err(e) => break self.failed(&e),
+                    };
+                    // An event that would cross the cap opens the next
+                    // part instead (its fresh snapshot shows this output).
+                    if !self.room_for(line.len()) {
+                        if !self.rotate() {
+                            break true;
+                        }
+                        continue;
+                    }
+                    if let Err(e) = self.writer.line(&line) {
                         break self.failed(&e);
                     }
                 }
                 Ok(SessionEvent::Resize { cols, rows }) => {
+                    // `[t,"r","65535x65535"]`: inside the overhead.
+                    if !self.room_for(0) {
+                        if !self.rotate() {
+                            break true;
+                        }
+                        continue;
+                    }
                     if let Err(e) = self.writer.resize(cols, rows) {
                         break self.failed(&e);
                     }
@@ -720,28 +839,30 @@ impl Worker {
                     break true;
                 }
                 Err(broadcast::error::TryRecvError::Closed) => break true,
+                Err(broadcast::error::TryRecvError::Lagged(_)) if stopping.is_some() => {
+                    break false;
+                }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                    // Output was lost: carry on from the screen as it is.
-                    if !self.resync() {
+                    // Output was lost: carry on from the screen as it is
+                    // (in the next part when the screen would not fit).
+                    let carried = if self.room_for(self.screen_estimate().saturating_mul(6)) {
+                        self.resync()
+                    } else {
+                        self.rotate()
+                    };
+                    if !carried {
                         break true;
                     }
                 }
                 Err(broadcast::error::TryRecvError::Empty) => {
+                    if stopping.is_some() {
+                        break false;
+                    }
                     if let Err(e) = self.writer.flush() {
                         break self.failed(&e);
                     }
-                    match self.control.load(Ordering::Acquire) {
-                        STOP => break false,
-                        FREEZE => {
-                            // The next process resumes from here.
-                            return;
-                        }
-                        _ => std::thread::sleep(POLL),
-                    }
+                    std::thread::sleep(POLL);
                 }
-            }
-            if self.writer.bytes >= self.max_file_bytes() && !self.rotate() {
-                break true;
             }
         };
         let _ = self.writer.finish();
@@ -756,6 +877,31 @@ impl Worker {
                 (self.ended)(&id);
             }
         }
+    }
+
+    /// Whether `len` more bytes still fit the part, leaving room for the
+    /// marker that ends it.
+    fn room_for(&self, len: usize) -> bool {
+        // Nothing but the header and snapshot yet: write it regardless
+        // (a part must make progress).
+        if self.writer.bytes <= self.writer.opening {
+            return true;
+        }
+        let len = u64::try_from(len).unwrap_or(u64::MAX);
+        self.writer
+            .bytes
+            .saturating_add(len)
+            .saturating_add(1 + EVENT_OVERHEAD + END_RESERVE)
+            <= self.max_file_bytes()
+    }
+
+    /// An upper bound on a screen-only snapshot of the session.
+    fn screen_estimate(&self) -> usize {
+        self.session.upgrade().map_or(0, |s| {
+            let (cols, rows) = s.size();
+            // A cell is a character plus its attribute escapes.
+            usize::from(cols) * usize::from(rows) * 24
+        })
     }
 
     fn max_file_bytes(&self) -> u64 {
@@ -781,7 +927,10 @@ impl Worker {
         self.events = attachment.events;
         let wrote = self.writer.marker("resync").and_then(|()| {
             self.writer.resize(attachment.cols, attachment.rows)?;
-            self.writer.output(&attachment.replay)
+            match self.writer.output_line(&attachment.replay)? {
+                Some(line) => self.writer.line(&line),
+                None => Ok(()),
+            }
         });
         wrote.is_ok()
     }
@@ -840,6 +989,8 @@ struct CastWriter {
     last: f64,
     /// Bytes in the file.
     bytes: u64,
+    /// Bytes its header and opening snapshot take.
+    opening: u64,
     /// The start of a UTF-8 sequence the next output completes.
     pending: Vec<u8>,
 }
@@ -869,6 +1020,7 @@ impl CastWriter {
             started_ms: entry.started_ms,
             last: 0.0,
             bytes: 0,
+            opening: 0,
             pending: Vec::new(),
         };
         writer.line(&header.to_string())?;
@@ -895,6 +1047,7 @@ impl CastWriter {
             started_ms,
             last,
             bytes: len,
+            opening: 0,
             pending: Vec::new(),
         };
         if torn {
@@ -926,12 +1079,25 @@ impl CastWriter {
         self.line(&line)
     }
 
+    #[cfg(test)]
     fn output(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        match self.output_line(bytes)? {
+            Some(line) => self.line(&line),
+            None => Ok(()),
+        }
+    }
+
+    /// The event line for `bytes` of output, not yet written (`None`: it
+    /// only began a UTF-8 sequence).
+    fn output_line(&mut self, bytes: &[u8]) -> std::io::Result<Option<String>> {
         let text = take_text(&mut self.pending, bytes);
         if text.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        self.event("o", &text)
+        let t = self.time();
+        serde_json::to_string(&(t, "o", text))
+            .map(Some)
+            .map_err(std::io::Error::other)
     }
 
     /// The screen the recording opens on, at t=0 (the moment its part
@@ -939,7 +1105,9 @@ impl CastWriter {
     fn snapshot(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         let text = String::from_utf8_lossy(bytes).into_owned();
         let line = serde_json::to_string(&(0.0, "o", text)).map_err(std::io::Error::other)?;
-        self.line(&line)
+        self.line(&line)?;
+        self.opening = self.bytes;
+        Ok(())
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> std::io::Result<()> {
@@ -1045,6 +1213,7 @@ impl Hub {
         let title = format!("{workspace}/{}", view.record.name);
         let started = self.recordings().start(
             &view.record.id,
+            &view.record.name,
             &title,
             &session,
             self.recording_ended_notice(),
@@ -1137,6 +1306,86 @@ mod tests {
         assert_eq!(take_text(&mut pending, &euro[1..]), "\u{20ac}");
         assert!(pending.is_empty());
         assert_eq!(take_text(&mut pending, b"x\xffy"), "x\u{FFFD}y");
+    }
+
+    #[test]
+    fn files_are_named_for_their_session() {
+        assert_eq!(file_label("shell1", "abc"), "shell1");
+        assert_eq!(file_label("fix: the ../bug!", "abc"), "fix-the-bug");
+        assert_eq!(file_label("...", "0123456789abcdef"), "0123456789ab");
+        assert!(valid_name(&part_file(&file_label("a b/c", "x"), 2)));
+        assert_eq!(file_label(&"x".repeat(100), "id").len(), 48);
+    }
+
+    /// A stop is seen between events, not only once the queue drains:
+    /// under sustained output it never does. What was queued when it was
+    /// seen is still written.
+    #[test]
+    fn a_stop_ends_a_recording_under_sustained_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.cast");
+        let entry = ActiveEntry {
+            session_id: "s".into(),
+            file: "x.cast".into(),
+            base: "x".into(),
+            part: 1,
+            started_ms: now_ms(),
+            title: "t".into(),
+        };
+        let mut writer = CastWriter::create(&path, 80, 24, &entry).unwrap();
+        writer.snapshot(b"").unwrap();
+        let (tx, events) = broadcast::channel(1 << 16);
+        let control = Arc::new(AtomicU8::new(RUN));
+        let worker = Worker {
+            owner: Weak::new(),
+            entry: Arc::new(Mutex::new(entry)),
+            generation: 0,
+            control: Arc::clone(&control),
+            session: Weak::new(),
+            events,
+            writer,
+            ended: Arc::new(|_: &str| {}),
+        };
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            worker.run();
+            let _ = done_tx.send(());
+        });
+        // A producer that keeps the queue from ever running empty.
+        let producing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let producer = {
+            let producing = Arc::clone(&producing);
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while producing.load(Ordering::Acquire) {
+                    if tx.len() < 2000 {
+                        n += 1;
+                        let _ = tx.send(SessionEvent::Output(axum::body::Bytes::from(format!(
+                            "line {n}\n"
+                        ))));
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        control.store(STOP, Ordering::Release);
+        let stopped = done.recv_timeout(Duration::from_secs(10));
+        producing.store(false, Ordering::Release);
+        producer.join().unwrap();
+        assert!(stopped.is_ok(), "the recorder never saw its stop");
+        thread.join().unwrap();
+        let cast = parse_cast(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(cast.output().contains("line 1\n"));
+    }
+
+    #[test]
+    fn parts_share_their_base() {
+        assert_eq!(base_of("a-1Z.cast"), "a-1Z");
+        assert_eq!(base_of("a-1Z.part12.cast"), "a-1Z");
+        assert_eq!(base_of(&part_file("x", 3)), "x");
+        assert_eq!(base_of("a.partx.cast"), "a.partx");
     }
 
     #[test]

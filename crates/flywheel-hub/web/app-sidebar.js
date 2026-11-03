@@ -282,6 +282,7 @@ function renderSession(session, index) {
       "span",
       { className: "session-meta" },
       session.machine ? machineBadge(session.machine) : null,
+      recBadge(session),
       el("span", { className: `session-state ${st.tone}`, textContent: st.label, title: st.title || undefined }),
       launcher.rowChip(session),
       actions,
@@ -293,6 +294,12 @@ function renderSession(session, index) {
     // A companion sits under its agent: the agent's line says it all.
     session.companion_of && sessionById(session.companion_of) ? null : worktrees.badge(session),
   );
+}
+
+// A session being recorded says so on its row.
+function recBadge(session) {
+  if (!session.recording) return null;
+  return el("span", { className: "rec-dot row-rec", title: `Recording to ${session.recording}`, "aria-label": "recording" });
 }
 
 const machineBadge = (name) => el("span", { className: "machine-badge", textContent: name, title: `on machine ${name}` });
@@ -606,9 +613,9 @@ function updateMeters() {
   $("#meter-size").textContent = session && term ? `${term.cols}×${term.rows}` : "";
   const viewers = session && session.live ? session.live.clients : 0;
   const links = session && session.live ? session.live.link_viewers || 0 : 0;
-  $("#meter-viewers").textContent = [viewers > 1 ? `${viewers} viewers` : "", links ? `${links} via link` : ""]
-    .filter(Boolean)
-    .join(" + ");
+  // Link viewers are the share pill's count.
+  $("#meter-viewers").textContent = viewers > 1 ? `${viewers} viewers` : "";
+  $("#meter-viewers").title = links ? `${links} more through a share link` : "";
 }
 
 function showError(error) {

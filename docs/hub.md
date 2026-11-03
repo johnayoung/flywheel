@@ -283,7 +283,8 @@ fw hub share ls; fw hub share revoke pairing     # or the id; --all [--session S
 - Reaches only: `/share/<cred>` (viewer page: terminal, title, status, expiry; no sidebar, no input), `/share/<cred>/info` (`{"share":{"name","expires","now"},"session":{"name","workspace","kind","state","code","signal","title","agent","live","cols","rows"}|null}`), `/share/<cred>/ws` (the terminal socket, read-only), and its own assets (`viewer.js`, `term-view.js`, `viewer.css`, xterm). Any other path under it, and the credential as a bearer anywhere (`/api/...`, `/`, `/assets/...`): 403.
 - Read-only socket: the snapshot, output, `size`, `exit`, `reset` as on `/api/sessions/{id}/ws`; every `input`/`resize`/`theme`/binary message is refused (`{"type":"error"}`), nothing reaches the PTY. It never sizes the PTY, never counts as viewing (seen/notify) or in `live.clients` (it is `live.link_viewers`). Cross-origin upgrades refused.
 - Revoke or expiry closes open views at once (code **4004**); the link then answers 404 (revoked) / 410 (expired). A live handoff closes them with 1012 and the viewer reconnects. Token rotation leaves links alone (revoke them).
-- Admission: a request whose path carries a live link's credential authenticates its connection (the main pool, kept alive); a wrong one is a failed credential for the failure limit.
+- Admission: a request whose path carries a live link's credential holds a **share-link slot** (its own pool, sized like the unauthenticated one, 8 per client; kept alive; full: 429 at once), never a main slot, so a link holder cannot lock the operator out. At most 32 open views per link and 256 in all (429). A wrong credential is a failure for the failure limit.
+- Viewer: `fit` / `readable` toggle (fit the whole screen to the window, or a readable font that scrolls; auto picks readable when fitting would go under 8 px; remembered per browser). After revoke/expiry it says the screen is no longer live.
 - UI: the `share` header pill (count = link viewers now), palette "Share <session>", sidebar `sharing` chip: mint (label, expiry; copied), list with viewers, revoke. This hub's sessions only (a machine's: share there).
 
 ## Recording
@@ -294,10 +295,11 @@ fw hub record stop agent; fw hub record ls
 fw hub record get <name> -o demo.cast; asciinema play demo.cast   # or Play in the UI: /replay#<name>
 ```
 
-- Opt-in per session; `<state-dir>/recordings/<session>-<UTC time>.cast` (0600), asciinema v2: header (`width`, `height`, `timestamp`, `title` = `workspace/session`, `x_fw_hub` `{session_id, part}`), then `[t, "o", text]` output (UTF-8; a split sequence waits for its end, invalid bytes are U+FFFD), `[t, "r", "COLSxROWS"]` resizes, `[t, "m", label]` markers (`exit: N`, `resync` after falling behind, `continued in <part>`). Starts with the screen as it is (screen-only snapshot at t=0); times are monotonic.
-- Caps: 64 MiB per file, then it rotates to `<base>.part<N>.cast` (a fresh snapshot first); 1 GiB for the directory, oldest finished recordings deleted first (`HubOptions::record_limits`).
+- Opt-in per session; `<state-dir>/recordings/<session name>-<UTC time>.cast` (0600; the name as `[A-Za-z0-9_-]`, at most 48), asciinema v2: header (`width`, `height`, `timestamp`, `title` = `workspace/session`, `x_fw_hub` `{session_id, part}`), then `[t, "o", text]` output (UTF-8; a split sequence waits for its end, invalid bytes are U+FFFD), `[t, "r", "COLSxROWS"]` resizes, `[t, "m", label]` markers (`exit: N`, `resync` after falling behind, `continued in <part>`). Starts with the screen as it is (screen-only snapshot at t=0); times are monotonic.
+- Caps: 64 MiB per file (the closing marker included), then it rotates to `<base>.part<N>.cast` (a fresh snapshot first); 1 GiB for the directory, oldest finished recordings deleted first (`HubOptions::record_limits`).
 - Ends when stopped, when the process exits (or is relaunched), or when the hub stops (written out and closed). `fw hub upgrade` keeps it going in the same file: the old hub writes out what was output and lets go (`recordings/active.json`), the new one reopens it in append mode before the sessions resume (no gap). A normal restart does not resume recordings.
-- A recorder is not a viewer (`live.clients`). An active recording downloads as written so far; delete refuses it (409: stop first).
+- A recorder is not a viewer (`live.clients`). An active recording downloads as written so far; delete refuses it (409: stop first). A stop writes what was queued when it was seen, then closes (bounded under sustained output).
+- Listed with a recording's parts together, in order. Player (`/replay#<name>`): play/pause, speed, seek, skip idle, `fit`/`readable`, markers as ticks on the bar (click to seek), prev/next part links, and it continues into the next part at the end. `record get` writes 0600. CLI times are UTC with a relative offset.
 - Replay player (`/replay#<name>`, signed-in browsers only): play/pause (space), seek (arrows +/-5 s), speed 0.5-8x, skip idle (gaps over 2 s play as 2 s), download.
 
 ## Push notifications
@@ -573,7 +575,7 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}` (unknown en
 | GET / POST / DELETE | `/shares[?session=]` | list `{"shares":[{"id","session_id","session","name","created","expires","viewers","last_used"}]}` / mint `{"session_id","expires_in"?\|"expires"?,"name"?}` -> 201 `{"share","session","credential","path"}` (shown once) / revoke all (of `session`) `{"revoked":[...]}` |
 | DELETE | `/shares/{id or label}` | `{"revoked":[...]}`; open views close (4004) |
 | POST | `/sessions/{id}/record/start` \| `/stop` | `{"recording":{"name","session_id","title","part","size","started","modified","cols","rows","active"},"started"?}`: 201 started, 200 already recording; 409 not running / not recording |
-| GET | `/recordings` | `{"dir","limits":{"max_file_bytes","max_total_bytes"},"total_bytes","recordings":[recording]}` newest first |
+| GET | `/recordings` | `{"dir","limits":{"max_file_bytes","max_total_bytes"},"total_bytes","recordings":[recording]}` newest recording first, its parts in order |
 | GET / DELETE | `/recordings/{name}` | the `.cast` (`application/x-asciicast`, attachment) / 204 (409 while active) |
 | GET | `/kinds` | `{"kinds":[{"kind","available","program"}]}`: which session kinds this host can launch |
 | POST | `/login-codes` | `{"code","expires_in":300}`: a one-time code for `/login?code=` |

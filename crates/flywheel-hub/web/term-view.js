@@ -1,8 +1,11 @@
 // flywheel hub: a watch-only terminal for the share link viewer
 // (viewer.js) and the replay player (player.js). An xterm.js terminal
 // that never takes input, drawn at the size it is told (the session's,
-// never the window's), its font scaled so that size fits the stage's
-// width (down to a floor; past it the stage scrolls). Resizes are queued
+// never the window's). Two ways to draw it: "fit" scales the font so that
+// size fits the stage's width (the whole screen, however small), "read"
+// keeps the font readable and lets the stage scroll (a phone on a wide
+// PTY). "auto" picks fit unless that would be unreadable; a toggle
+// (`toggleMode`, remembered per browser) overrides it. Resizes are queued
 // behind the output written before them, so nothing is drawn at the wrong
 // size.
 "use strict";
@@ -27,7 +30,13 @@ window.FwHubTermView = function (host, stage) {
     },
   };
   const MAX_FONT = 15;
-  const MIN_FONT = 6;
+  // Fit mode never goes below this (it would not fit at all).
+  const MIN_FONT = 3;
+  // Auto mode reads instead of fitting below this.
+  const READABLE = 8;
+  // The font in read mode.
+  const READ_FONT = 12;
+  const MODE_KEY = "fw-hub-termview-mode";
   // JetBrains Mono's advance is 0.6 em; the measured width corrects it.
   const ADVANCE = 0.6;
   const light = window.matchMedia("(prefers-color-scheme: light)");
@@ -60,14 +69,36 @@ window.FwHubTermView = function (host, stage) {
 
   let cols = 80;
   let rows = 24;
+  let chosen = "auto";
+  try {
+    const saved = window.localStorage.getItem(MODE_KEY);
+    if (saved === "fit" || saved === "read") chosen = saved;
+  } catch (_) {
+    // storage unavailable: auto
+  }
+  let drawn = "fit"; // what auto resolved to last
+  stage.dataset.termMode = drawn;
+  const listeners = [];
 
-  // Scale the font so `cols` fit the stage's width.
+  // Scale the font so `cols` fit the stage's width, or keep it readable.
   function fit() {
     const style = window.getComputedStyle(host);
     const pad = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
     const width = Math.max(0, stage.clientWidth - pad - 2);
     let size = Math.floor((width / (cols * ADVANCE)) * 10) / 10;
     size = Math.max(MIN_FONT, Math.min(MAX_FONT, size));
+    const mode = chosen === "auto" ? (size < READABLE ? "read" : "fit") : chosen;
+    if (mode !== drawn) {
+      drawn = mode;
+      stage.dataset.termMode = mode;
+      if (mode === "fit") stage.scrollLeft = 0;
+      listeners.forEach((fn) => fn(mode));
+    }
+    if (mode === "read") {
+      size = Math.max(size, READ_FONT);
+      if (term.options.fontSize !== size) term.options.fontSize = size;
+      return;
+    }
     if (term.options.fontSize !== size) term.options.fontSize = size;
     // Correct by the width actually drawn (the font's real advance).
     const screen = host.querySelector(".xterm-screen");
@@ -109,5 +140,22 @@ window.FwHubTermView = function (host, stage) {
     },
     size: () => ({ cols, rows }),
     fit,
+    // "fit" or "read", as drawn now.
+    mode: () => drawn,
+    // Switch between fitting and reading (remembered); `fn(mode)` hears
+    // every change.
+    toggleMode() {
+      chosen = drawn === "fit" ? "read" : "fit";
+      try {
+        window.localStorage.setItem(MODE_KEY, chosen);
+      } catch (_) {
+        // not remembered
+      }
+      fit();
+    },
+    onMode(fn) {
+      listeners.push(fn);
+      fn(drawn);
+    },
   };
 };

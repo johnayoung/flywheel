@@ -330,6 +330,8 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   .session { min-height: 2.75rem; }
   .ws-head { min-height: 2.6rem; }
   .side-foot .chip { padding: .5rem .65rem; }
+  /* No keyboard here: the chips are their names, not chords. */
+  .side-foot .chip kbd { display: none; }
   .icon { min-width: 2.2rem; min-height: 2.2rem; }
 }
 
@@ -352,6 +354,9 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   .empty:has(.empty-attention:not([hidden])) h1 { font-size: clamp(1.8rem, 9vw, 2.6rem); }
   /* --bar-above: the height of the bar under the terminal (mobile.js). */
   .toasts { bottom: calc(.6rem + max(var(--bar-above, 0px), env(safe-area-inset-bottom))); }
+  /* The sessions drawer open: no toast over its footer (commands.js holds
+     their clocks until it closes). */
+  body.side-open .toasts { display: none; }
 }
 
 @media (max-width: 480px) {

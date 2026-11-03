@@ -175,7 +175,8 @@ window.FwHubMobile = function (ctx) {
 
   function controlChar(ch) {
     if (/^[a-zA-Z]$/.test(ch)) return String.fromCharCode(ch.toUpperCase().charCodeAt(0) & 0x1f);
-    const table = { "@": "\x00", " ": "\x00", "[": "\x1b", "\\": "\x1c", "]": "\x1d", "^": "\x1e", "_": "\x1f", "?": "\x7f", "2": "\x00", "3": "\x1b", "4": "\x1c", "5": "\x1d", "6": "\x1e", "7": "\x1f", "8": "\x7f" };
+    // As xterm sends them: Ctrl+/ and Ctrl+- are ^_, Ctrl+| ^\, Ctrl+~ ^^.
+    const table = { "@": "\x00", " ": "\x00", "[": "\x1b", "\\": "\x1c", "]": "\x1d", "^": "\x1e", "_": "\x1f", "?": "\x7f", "2": "\x00", "3": "\x1b", "4": "\x1c", "5": "\x1d", "6": "\x1e", "7": "\x1f", "8": "\x7f", "/": "\x1f", "-": "\x1f", "|": "\x1c", "~": "\x1e" };
     return table[ch] ?? ch;
   }
 
@@ -210,6 +211,14 @@ window.FwHubMobile = function (ctx) {
     return `${app ? "\x1bO" : "\x1b["}${letter}`;
   }
 
+  // A tilde-style key (Page Up/Down) with the armed modifiers.
+  function tilde(code) {
+    const mod = 1 + (mods.alt ? 2 : 0) + (mods.ctrl ? 4 : 0);
+    return mod > 1 ? `\x1b[${code};${mod}~` : `\x1b[${code}~`;
+  }
+  // Alt before a key the modifiers do not otherwise change: ESC first.
+  const withAlt = (seq) => (mods.alt ? `\x1b${seq}` : seq);
+
   function send(data) {
     if (!state.attached || state.exited) return;
     ctx.sendData(data);
@@ -221,9 +230,9 @@ window.FwHubMobile = function (ctx) {
   // and Enter; Esc, ^C, Shift+Tab) and always fits a phone's width; the
   // second scrolls sideways.
   const PRIMARY = [
-    { label: "esc", title: "Escape", seq: () => "\x1b" },
+    { label: "esc", title: "Escape", seq: () => withAlt("\x1b") },
     { label: "tab", title: "Tab", seq: () => (mods.alt ? "\x1b\t" : "\t") },
-    { label: "⇧tab", title: "Shift+Tab (Claude: cycle permission mode)", seq: () => "\x1b[Z" },
+    { label: "⇧tab", title: "Shift+Tab (Claude: cycle permission mode)", seq: () => withAlt("\x1b[Z") },
     { label: "ctrl", title: "Ctrl (sticky: tap for the next key, twice to lock)", mod: "ctrl" },
     { label: "←", title: "Left", seq: () => arrow("D"), repeat: true },
     { label: "↑", title: "Up", seq: () => arrow("A"), repeat: true },
@@ -234,12 +243,13 @@ window.FwHubMobile = function (ctx) {
   ];
   const SECONDARY = [
     { label: "alt", title: "Alt (sticky: tap for the next key, twice to lock)", mod: "alt" },
-    { label: "/", title: "Slash", seq: () => "/" },
-    { label: "|", title: "Pipe", seq: () => "|" },
-    { label: "~", title: "Tilde", seq: () => "~" },
-    { label: "-", title: "Dash", seq: () => "-" },
-    { label: "pgup", title: "Page Up", seq: () => "\x1b[5~", repeat: true },
-    { label: "pgdn", title: "Page Down", seq: () => "\x1b[6~", repeat: true },
+    // Characters take the armed ctrl/alt as a typed one does.
+    { label: "/", title: "Slash", seq: () => transformInput("/") },
+    { label: "|", title: "Pipe", seq: () => transformInput("|") },
+    { label: "~", title: "Tilde", seq: () => transformInput("~") },
+    { label: "-", title: "Dash", seq: () => transformInput("-") },
+    { label: "pgup", title: "Page Up", seq: () => tilde(5), repeat: true },
+    { label: "pgdn", title: "Page Down", seq: () => tilde(6), repeat: true },
   ];
 
   function keyButton(key) {

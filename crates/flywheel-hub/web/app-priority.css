@@ -41,6 +41,14 @@ button#meter-usage { max-width: 16rem; text-align: left; }
   .crumbs .crumb-session { min-width: 4ch; }
   #meter-viewers { display: none; }
 }
+/* A phone: the crumbs (name, kind, status, why?) keep a floor of room and
+   the pills never paint over them: when both do not fit on one row, the
+   pills wrap onto a second one under the name. */
+@media (max-width: 760px) {
+  #term-header { flex-wrap: wrap; row-gap: .25rem; }
+  #term-header > .crumbs { flex: 1 1 11rem; min-width: min(11rem, calc(100% - 3rem)); overflow: hidden; }
+  .meters { flex: 1 1 auto; flex-wrap: wrap; row-gap: .25rem; }
+}
 /* The sidebar beside a narrow header: the kind tag goes (the sidebar's
    glyph says it). */
 @media (min-width: 761px) and (max-width: 820px) {

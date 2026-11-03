@@ -5,8 +5,9 @@
 //
 // Env: FW (the fw binary; default target/debug/fw), PLAYWRIGHT (path to
 // the playwright package; default: resolved from node's paths), CHROMIUM
-// (a browser executable, when playwright's own is not installed). Runs a hub
-// on a temp state dir and a free port with a fake `claude` first on PATH;
+// (a browser executable, when playwright's own is not installed), PORT (the
+// hub's port; default: a free one). Runs a hub on a temp state dir and a
+// port with a fake `claude` first on PATH;
 // never touches the default state dir or port 7420. Screenshots go to
 // OUT_DIR (default: a temp dir, printed). Exit 0 = every check passed.
 import { spawn } from "node:child_process";
@@ -52,7 +53,7 @@ const repo = path.join(tmp, "repo");
 fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
 const state = path.join(tmp, "state");
 
-const port = await freePort();
+const port = process.env.PORT ? Number(process.env.PORT) : await freePort();
 const base = `http://127.0.0.1:${port}`;
 const hub = spawn(fw, ["hub", "serve", "--state-dir", state, "--port", String(port), "--no-flywheel"], {
   env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SHELL: "/bin/sh" },
@@ -365,6 +366,34 @@ try {
     return bad;
   });
   check(headerHits.length === 0, `phone: header with usage keeps name, status and why? whole (${headerHits.join(", ")})`);
+  // Every pill showing at once (share, rec on, flip, suggested, review,
+  // flywheel) at 390 and 430: they wrap under the name rather than paint
+  // over it, and the name keeps readable room.
+  await mp.evaluate(() => {
+    for (const id of ["share-toggle", "rec-toggle", "flip-toggle", "rv-toggle", "fw-toggle"]) document.getElementById(id).hidden = false;
+    document.getElementById("rec-label").textContent = "rec 0:42";
+  });
+  for (const width of [390, 430]) {
+    await mp.setViewportSize({ width, height: 844 });
+    await mp.waitForTimeout(300);
+    const crowded = await mp.evaluate(() => {
+      // A render may have hidden them again (this is a shell session).
+      for (const id of ["share-toggle", "rec-toggle", "flip-toggle", "rv-toggle", "fw-toggle", "crumb-status", "crumb-why"]) document.getElementById(id).hidden = false;
+      const bad = [];
+      for (const sel of ["#crumb-session", "#crumb-status", "#crumb-why"]) {
+        const node = document.querySelector(sel);
+        const r = node.getBoundingClientRect();
+        const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        if (!hit || !(node === hit || node.contains(hit))) bad.push(`${sel} under ${hit ? hit.id || hit.className : "nothing"}`);
+        if (r.right > innerWidth + 1) bad.push(`${sel} off screen`);
+      }
+      const name = document.querySelector("#crumb-session").getBoundingClientRect().width;
+      if (name < 100) bad.push(`name only ${Math.round(name)}px`);
+      return bad;
+    });
+    check(crowded.length === 0, `phone ${width}: every header pill shown, the name, status and why? stay whole (${crowded.join(", ")})`);
+  }
+  await mp.setViewportSize({ width: 390, height: 844 });
   await mp.screenshot({ path: path.join(out, "phone-solo.png") });
   // The menu opens the sidebar.
   await mp.locator(".menu-toggle").tap();

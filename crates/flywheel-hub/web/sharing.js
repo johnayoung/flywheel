@@ -22,12 +22,7 @@ window.FwHubSharing = function (ctx) {
 
   const local = (session) => !!session && !session.machine;
 
-  function size(bytes) {
-    if (bytes < 1024) return `${bytes} B`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-    if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
-    return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
-  }
+  const size = window.FwHubFmt.bytes;
 
   function when(unix) {
     if (!unix) return "";
@@ -274,10 +269,13 @@ window.FwHubSharing = function (ctx) {
       const name = stopped.recording.name;
       toast(el("span", {}, "Recording saved: ", el("b", { textContent: name })), {
         actions: [
-          el("button", {
-            type: "button",
+          // A link, as the Sharing sheet's: a phone opens it as one.
+          el("a", {
+            className: "text-btn toast-link",
+            href: `/replay#${encodeURIComponent(name)}`,
+            target: "_blank",
+            rel: "noopener",
             textContent: "Play",
-            onclick: () => window.open(`/replay#${encodeURIComponent(name)}`, "_blank", "noopener"),
           }),
         ],
       });

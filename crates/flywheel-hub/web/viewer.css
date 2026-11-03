@@ -220,3 +220,18 @@ a.vw-pill::before, .vw-btn::before { display: none; }
   .pl-track { order: 5; flex-basis: 100%; }
   .vw-head h1 { min-width: 0; }
 }
+
+/* Touch screens: every control at least 44px tall (WCAG 2.5.5), fields
+   at 16px (iOS zooms into a focused field under that), a thumb-sized
+   seek handle and a checkbox label the whole height of the bar. */
+@media (pointer: coarse) {
+  .vw-btn, a.vw-pill, .pl-btn { min-height: 44px; }
+  .vw-btn, a.vw-pill { min-width: 44px; justify-content: center; }
+  .pl-opt { min-height: 44px; }
+  .pl-opt select, input, select { font-size: 16px; min-height: 44px; }
+  .pl-opt input[type="checkbox"] { width: 22px; height: 22px; }
+  .pl-seek { height: 44px; }
+  .pl-seek::-webkit-slider-thumb { width: 26px; height: 26px; }
+  .pl-seek::-moz-range-thumb { width: 26px; height: 26px; }
+  .pl-mark { top: .6rem; height: .8rem; width: 4px; margin-left: -2px; }
+}

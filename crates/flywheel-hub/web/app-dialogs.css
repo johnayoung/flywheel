@@ -679,6 +679,11 @@
   font: 400 11px/1.4 var(--term);
 }
 .toast-actions { display: flex; gap: .8rem; flex: none; }
+.toast-link { color: var(--signal); text-decoration: none; text-transform: uppercase; letter-spacing: .1em; }
+/* Touch: a toast's actions take a finger (44px). */
+@media (pointer: coarse) {
+  .toast-actions > button, .toast-actions > a { display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; padding: 0 .5rem; }
+}
 
 @media (max-width: 760px) {
   .commands { width: 100%; border-left-width: 1px; }

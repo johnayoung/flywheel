@@ -58,8 +58,8 @@ impl Output {
         String::from_utf8_lossy(&self.stdout).into_owned()
     }
 
-    /// stderr as one line: git's `fatal: ` / `error: ` / `hint: ` prefixes
-    /// dropped, blank lines skipped, lines joined with `; `.
+    /// stderr, line by line as git wrote it: `fatal: ` / `error: ` /
+    /// `hint: ` prefixes dropped, blank lines skipped.
     pub fn error_text(&self) -> String {
         let joined = self
             .stderr
@@ -72,7 +72,7 @@ impl Output {
             })
             .filter(|l| !l.is_empty())
             .collect::<Vec<_>>()
-            .join("; ");
+            .join("\n");
         if !joined.is_empty() {
             return joined;
         }
@@ -466,6 +466,6 @@ mod tests {
             truncated: false,
             timed_out: false,
         };
-        assert_eq!(out.error_text(), "bad thing; do this");
+        assert_eq!(out.error_text(), "bad thing\ndo this");
     }
 }

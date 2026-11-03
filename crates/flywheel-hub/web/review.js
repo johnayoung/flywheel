@@ -204,7 +204,7 @@ window.FwHubReview = function (ctx) {
       fill(body, el("p", { className: "rv-empty", textContent: ui.error || "Reading git..." }));
       return;
     }
-    const branch = data.branch || "detached HEAD";
+    const branch = data.branch || (data.rebasing ? `${data.rebasing} (rebasing)` : "detached HEAD");
     const up = data.upstream;
     fill(where,
       icon("branch"),
@@ -305,6 +305,9 @@ window.FwHubReview = function (ctx) {
           data.operation === "rebase" && data.agent
             ? el("button", { type: "button", className: "slab ghost rv-ask", textContent: `Ask ${data.agent.name} to resolve`, onclick: () => askAgent("resolve_conflicts") })
             : null,
+          data.operation === "rebase"
+            ? el("button", { type: "button", className: "slab ghost rv-ask", textContent: "Abort the rebase…", onclick: () => plan("abort") })
+            : null,
         ),
       );
     }
@@ -324,7 +327,7 @@ window.FwHubReview = function (ctx) {
         section(
           "Untracked",
           data.untracked.length,
-          data.untracked.map((u) => fileCard("untracked", { path: u.path, status: "added", insertions: null, deletions: null, binary: false })),
+          data.untracked.map((u) => fileCard("untracked", { path: u.path, status: "untracked", insertions: null, deletions: null, binary: false })),
         ),
       );
     }
@@ -412,7 +415,7 @@ window.FwHubReview = function (ctx) {
     }
   }
 
-  const STATUS = { added: "A", modified: "M", deleted: "D", renamed: "R", copied: "C", type: "T", unmerged: "U" };
+  const STATUS = { added: "A", modified: "M", deleted: "D", renamed: "R", copied: "C", type: "T", unmerged: "U", untracked: "?" };
 
   function fileCard(scope, f) {
     const key = keyOf(scope, f);
@@ -437,7 +440,9 @@ window.FwHubReview = function (ctx) {
       ),
       f.binary
         ? el("span", { className: "rv-counts", textContent: "binary" })
-        : f.insertions !== null && f.insertions !== undefined
+        : f.status === "untracked"
+          ? el("span", { className: "rv-counts", textContent: "new" })
+          : f.insertions !== null && f.insertions !== undefined
           ? el("span", { className: "rv-counts" }, el("span", { className: "add", textContent: `+${f.insertions}` }), el("span", { className: "del", textContent: `-${f.deletions}` }))
           : null,
       icon("chev"),
@@ -505,7 +510,7 @@ window.FwHubReview = function (ctx) {
     const lang = langOf(f.path);
     const split = ui.mode === "split" && wide();
     box.append(split ? splitView(hunks.rows, lang) : unifiedView(hunks.rows, lang));
-    box.classList.toggle("split", split);
+    box.classList.toggle("rv-sbs", split);
     if (file.next) {
       box.append(
         el("button", {
@@ -523,33 +528,45 @@ window.FwHubReview = function (ctx) {
   }
 
   // Patch lines -> meta notes and rows {kind: hunk|ctx|add|del|note, old, new, text}.
+  // A conflicted file comes as git's combined diff (`diff --cc`, `@@@`
+  // hunks, one marker column per side): a line any side adds is an add,
+  // one the result drops a del; line numbers are the first side's and the
+  // result's.
   function parse(lines) {
     const meta = [];
     const rows = [];
     let inHunk = false;
+    let width = 1;
     let oldNo = 0;
     let newNo = 0;
     for (const line of lines) {
-      const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(line);
+      const hunk = /^(@{2,}) -(\d+)(?:,\d+)? (?:-\d+(?:,\d+)? )*\+(\d+)(?:,\d+)? @{2,}(.*)$/.exec(line);
       if (hunk) {
         inHunk = true;
-        oldNo = Number(hunk[1]);
-        newNo = Number(hunk[2]);
+        width = hunk[1].length - 1;
+        oldNo = Number(hunk[2]);
+        newNo = Number(hunk[3]);
         rows.push({ kind: "hunk", text: line });
         continue;
       }
-      if (line.startsWith("diff --git ")) {
+      if (line.startsWith("diff --git ") || line.startsWith("diff --cc ") || line.startsWith("diff --combined ")) {
         inHunk = false;
+        if (!line.startsWith("diff --git ")) meta.push("Conflicted: both sides, as git shows an unmerged file.");
         continue;
       }
       if (!inHunk) {
-        if (/^(new file mode|deleted file mode|rename from|rename to|similarity index|old mode|new mode|Binary files)/.test(line)) meta.push(line);
+        if (/^(new file mode|deleted file mode|rename from|rename to|similarity index|old mode|new mode|Binary files|\* Unmerged path)/.test(line)) meta.push(line);
         continue;
       }
-      if (line.startsWith("+")) rows.push({ kind: "add", new: newNo++, text: line.slice(1) });
-      else if (line.startsWith("-")) rows.push({ kind: "del", old: oldNo++, text: line.slice(1) });
-      else if (line.startsWith("\\")) rows.push({ kind: "note", text: line.slice(2) });
-      else rows.push({ kind: "ctx", old: oldNo++, new: newNo++, text: line.slice(1) });
+      if (line.startsWith("\\")) {
+        rows.push({ kind: "note", text: line.slice(2) });
+        continue;
+      }
+      const marks = line.slice(0, width);
+      const text = line.slice(width);
+      if (marks.includes("-")) rows.push({ kind: "del", old: marks[0] === "-" ? oldNo++ : undefined, text });
+      else if (marks.includes("+")) rows.push({ kind: "add", old: marks[0] === "+" ? undefined : oldNo++, new: newNo++, text });
+      else rows.push({ kind: "ctx", old: oldNo++, new: newNo++, text });
     }
     return { meta, rows };
   }
@@ -581,7 +598,7 @@ window.FwHubReview = function (ctx) {
     const half = (kind, no, text) =>
       kind
         ? el("div", { className: `rv-h ${kind}` }, el("span", { className: "ln", textContent: String(no) }), el("code", {}, ...paint(text, lang)))
-        : el("div", { className: "rv-h empty" });
+        : el("div", { className: "rv-h blank" });
     let i = 0;
     while (i < rows.length) {
       const r = rows[i];
@@ -702,7 +719,7 @@ window.FwHubReview = function (ctx) {
       list.push(button("Rebase onto base…", "rebase", { ghost: true, disabled: !data.behind || !!data.operation, title: data.behind ? `Replay onto ${data.base && data.base.name}` : "Already on top of the base" }));
       list.push(button("Merge into base…", "merge", { disabled: !data.ahead, title: `Fast-forward ${data.base ? data.base.name : "the base"} in the main checkout` }));
     }
-    // Phones scroll the row: what can run now comes first.
+    // Phones: what can run now comes first.
     if (phone()) list.sort((x, y) => Number(x.disabled) - Number(y.disabled));
     fill($("#rv-actions"), ...list);
   }
@@ -711,6 +728,7 @@ window.FwHubReview = function (ctx) {
   const sheet = $("#dlg-review");
   const sheetBody = $("#rva-body");
   const okButton = $("#rva-ok");
+  const cancelButton = $("#rva-cancel");
   const act = {
     action: null,
     plan: null,
@@ -720,6 +738,8 @@ window.FwHubReview = function (ctx) {
     timer: null,
     fields: {},
     after: null, // the button the outcome offers next
+    then: null, // the action to plan after this one succeeds (rebase, then merge)
+    stay: false, // `after` plans in this sheet instead of closing it
   };
 
   sheet.addEventListener("close", () => {
@@ -734,6 +754,7 @@ window.FwHubReview = function (ctx) {
     push: ["push", "Push the branch"],
     pr: ["pull request", "Open a pull request"],
     rebase: ["rebase", "Rebase onto the base"],
+    abort: ["abort rebase", "Abort the rebase"],
     merge: ["merge", "Merge into the base"],
   };
 
@@ -758,6 +779,7 @@ window.FwHubReview = function (ctx) {
   function requestBody(action) {
     const f = act.fields;
     if (action === "commit") return { message: f.message ? f.message.value : "" };
+    if (action === "push") return { remote: f.remote && f.remote.value ? f.remote.value : undefined };
     if (action === "pr") {
       return {
         title: f.title ? f.title.value : undefined,
@@ -769,8 +791,12 @@ window.FwHubReview = function (ctx) {
     return {};
   }
 
-  function plan(action) {
+  function plan(action, then) {
     if (!ui.id || !ui.data) return;
+    act.then = then || null;
+    act.stay = false;
+    cancelButton.hidden = false;
+    cancelButton.textContent = "Cancel";
     act.action = action;
     act.plan = null;
     act.done = false;
@@ -781,7 +807,7 @@ window.FwHubReview = function (ctx) {
     $("#rva-kicker").textContent = kicker;
     $("#rva-title").textContent = title;
     okButton.textContent = "Confirm";
-    okButton.className = `slab${action === "merge" || action === "rebase" ? " danger" : ""}`;
+    okButton.className = `slab${action === "merge" || action === "rebase" || action === "abort" ? " danger" : ""}`;
     fill(sheetBody, ...editor(action), el("div", { id: "rva-plan", className: "rva-plan" }, el("p", { className: "rv-empty", textContent: "Planning..." })));
     syncOk();
     if (!sheet.open) sheet.showModal();
@@ -828,10 +854,12 @@ window.FwHubReview = function (ctx) {
       return out;
     }
     if (action === "pr") {
-      f.title = el("input", { type: "text", maxLength: 256, oninput: syncOk, autocomplete: "off" });
-      f.body = el("textarea", { rows: 6, className: "rva-text" });
+      // The plan (and its fingerprint) covers the title, body, base and
+      // draft: what runs is what is shown.
+      f.title = el("input", { type: "text", maxLength: 256, oninput: () => replan(400), autocomplete: "off" });
+      f.body = el("textarea", { rows: 6, className: "rva-text", oninput: () => replan(400) });
       f.base = el("input", { type: "text", placeholder: "the base branch", oninput: () => replan(400), autocomplete: "off", spellcheck: false });
-      f.draft = el("input", { type: "checkbox" });
+      f.draft = el("input", { type: "checkbox", onchange: () => replan(0) });
       return [
         el("label", { className: "field" }, el("span", { className: "field-label", textContent: "Title" }), f.title),
         el("label", { className: "field" }, el("span", { className: "field-label", textContent: "Body" }), f.body),
@@ -842,6 +870,15 @@ window.FwHubReview = function (ctx) {
           el("label", { className: "cmd-check" }, f.draft, " draft"),
         ),
       ];
+    }
+    if (action === "push" && ui.data.remotes && ui.data.remotes.length > 1) {
+      f.remote = el(
+        "select",
+        { onchange: () => replan(0) },
+        el("option", { value: "", textContent: "its push remote (automatic)" }),
+        ...ui.data.remotes.map((r) => el("option", { value: r.name, textContent: `${r.name}  ${r.url}` })),
+      );
+      return [el("label", { className: "field" }, el("span", { className: "field-label", textContent: "Remote" }), f.remote)];
     }
     return [];
   }
@@ -900,7 +937,11 @@ window.FwHubReview = function (ctx) {
             el("button", { type: "button", className: "text-btn", textContent: "Copy", onclick: () => ctx.copyText(commands).then((ok) => toast(ok ? "Copied the commands." : "Copy failed.")) }),
           )
         : null,
-      plan.refusal ? el("p", { className: "rva-refusal", textContent: plan.refusal }) : null,
+      plan.refusal
+        ? emptyMessage(plan)
+          ? el("p", { className: "rva-hint", textContent: "Write a message (or ask the agent), then confirm." })
+          : el("p", { className: "rva-refusal", textContent: plan.refusal })
+        : null,
       plan.needs_rebase
         ? el("button", { type: "button", className: "slab ghost", textContent: "Rebase onto base first…", onclick: () => planLater("rebase") })
         : null,
@@ -908,8 +949,15 @@ window.FwHubReview = function (ctx) {
   }
 
   function planLater(action) {
-    // From inside the sheet: replace its content with the new action.
-    plan(action);
+    // From inside the sheet: replace its content with the new action, and
+    // come back to this one once it succeeds.
+    plan(action, act.action);
+  }
+
+  // The commit dialog, nothing typed yet: a hint, not an error.
+  function emptyMessage(plan) {
+    const f = act.fields;
+    return act.action === "commit" && f.message && !f.message.value.trim() && /commit message/.test(plan.refusal || "");
   }
 
   function syncOk() {
@@ -924,8 +972,14 @@ window.FwHubReview = function (ctx) {
 
   okButton.addEventListener("click", async () => {
     if (act.done) {
+      const after = act.after;
+      if (act.stay) {
+        act.stay = false;
+        after();
+        return;
+      }
       sheet.close("done");
-      if (act.after) act.after();
+      if (after) after();
       return;
     }
     if (!act.plan || act.plan.refusal || act.busy) return;
@@ -961,8 +1015,16 @@ window.FwHubReview = function (ctx) {
   function showOutcome(action, report) {
     const offer = [];
     act.after = null;
+    cancelButton.hidden = true;
     okButton.textContent = "Done";
     okButton.className = "slab";
+    if (report.ok && act.then) {
+      const next = act.then;
+      okButton.textContent = `${TITLES[next][1]}…`;
+      // Planned in the same sheet (closing it would cancel the new plan).
+      act.after = () => plan(next);
+      act.stay = true;
+    }
     if (action === "merge" && report.worktree) {
       const wt = report.worktree;
       const blocked = wt.blocking && wt.blocking.length;
@@ -984,6 +1046,13 @@ window.FwHubReview = function (ctx) {
     if (action === "rebase" && !report.ok && ui.data && ui.data.agent) {
       okButton.textContent = `Ask ${ui.data.agent.name} to resolve…`;
       act.after = () => askAgent("resolve_conflicts");
+    }
+    // Done is the only way out, unless the outcome offers a next step
+    // (then Close declines it; a merge's "Keep it" already does).
+    const declined = offer.some((n) => n.tagName === "BUTTON");
+    if (act.after && !declined) {
+      cancelButton.hidden = false;
+      cancelButton.textContent = "Close";
     }
     if (action === "pr" && report.url) {
       offer.push(el("a", { href: report.url, target: "_blank", rel: "noopener noreferrer", className: "rva-url", textContent: report.url }));

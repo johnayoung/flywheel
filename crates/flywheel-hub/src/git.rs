@@ -407,7 +407,17 @@ pub fn create(repo: &Path, plan: &WorktreePlan) -> Result<WorktreeRef, String> {
     let path = plan.path.to_string_lossy().into_owned();
     git(
         repo,
-        &["worktree", "add", "-b", &plan.branch, &path, &plan.base],
+        // --no-track: a branch cut from `origin/main` must not track it (a
+        // push would then land on the remote's main).
+        &[
+            "worktree",
+            "add",
+            "--no-track",
+            "-b",
+            &plan.branch,
+            &path,
+            &plan.base,
+        ],
     )
     .map_err(|e| format!("git worktree add failed: {e}"))?;
     let path = plan

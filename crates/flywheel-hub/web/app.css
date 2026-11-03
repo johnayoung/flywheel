@@ -2959,6 +2959,7 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 }
 .rv-st.st-added { background: color-mix(in srgb, var(--fw-ok) 22%, transparent); color: var(--fw-ok); }
 .rv-st.st-deleted, .rv-st.st-unmerged { background: color-mix(in srgb, var(--alert) 20%, transparent); color: var(--alert); }
+.rv-st.st-untracked { background: var(--bg-4); color: var(--ink-3); }
 .rv-st.st-renamed, .rv-st.st-copied { background: color-mix(in srgb, var(--brass) 22%, transparent); color: var(--brass); }
 
 .rv-diff { overflow-x: auto; scrollbar-width: thin; scrollbar-color: var(--rule-2) transparent; }
@@ -2985,7 +2986,7 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .rv-pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 .rv-h { display: grid; grid-template-columns: 3.2rem minmax(0, 1fr); white-space: pre; overflow: hidden; }
 .rv-h code { overflow: hidden; text-overflow: ellipsis; }
-.rv-h.empty { background: repeating-linear-gradient(135deg, transparent 0 6px, var(--rule) 6px 7px); opacity: .5; }
+.rv-h.blank { background: repeating-linear-gradient(135deg, transparent 0 6px, var(--rule) 6px 7px); opacity: .5; }
 .rv-pair .rv-h:first-child { border-right: 1px solid var(--rule); }
 .rv-more { margin: .5rem .6rem .6rem; }
 .tk-k { color: var(--signal); }
@@ -3039,6 +3040,8 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .rva-details .more { color: var(--ink-3); }
 .rva-warn { margin: 0; color: var(--brass); font-size: 11.5px; line-height: 1.5; }
 .rva-warn::before { content: "\26A0  "; }
+.rva-hint { margin: 0; color: var(--ink-3); font-size: 11.5px; line-height: 1.5; }
+.rva-refusal, .rva-outcome { white-space: pre-line; overflow-wrap: anywhere; }
 .rva-refusal, .rva-outcome.bad { margin: 0; padding: .55rem .7rem; border-left: 3px solid var(--alert); background: color-mix(in srgb, var(--alert) 10%, transparent); color: var(--ink); line-height: 1.5; }
 .rva-outcome.ok { margin: 0; padding: .55rem .7rem; border-left: 3px solid var(--fw-ok); background: color-mix(in srgb, var(--fw-ok) 10%, transparent); color: var(--ink); line-height: 1.5; }
 .rva-cmds { display: grid; gap: .3rem; justify-items: start; }
@@ -3055,7 +3058,7 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   user-select: text;
   -webkit-user-select: text;
 }
-.rva-ran summary { cursor: pointer; color: var(--ink-2); font: 400 11.5px var(--term); overflow-wrap: anywhere; }
+.rva-ran summary { cursor: pointer; color: var(--ink-2); font: 400 11.5px var(--term); white-space: nowrap; overflow-x: auto; scrollbar-width: none; }
 .rva-ran .rva-cmd { margin-top: .35rem; max-height: 14rem; }
 .rva-url { color: var(--signal); font: 500 12px var(--term); overflow-wrap: anywhere; }
 
@@ -3091,14 +3094,11 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   .rv-l { grid-template-columns: 2.4rem 2.4rem 1rem auto; }
   .rv-code { font-size: 11.5px; }
   .rv-actions {
-    flex-wrap: nowrap;
-    overflow-x: auto;
+    flex-wrap: wrap;
     padding: .5rem .5rem calc(.5rem + env(safe-area-inset-bottom));
-    scrollbar-width: none;
   }
-  .rv-actions .slab { flex: none; min-height: 44px; }
+  .rv-actions .slab { flex: 1 1 auto; min-height: 44px; padding: .45rem .6rem; }
   .rv-more, .rva-ask .text-btn, .rva-cmds .text-btn { min-height: 44px; }
   .rv-sheet { width: 100vw; max-width: 100vw; max-height: 100dvh; height: 100dvh; margin: 0; border-radius: 0; }
-  .rva-cmd { white-space: pre-wrap; overflow-wrap: anywhere; }
   .rva-row { flex-direction: column; align-items: stretch; }
 }

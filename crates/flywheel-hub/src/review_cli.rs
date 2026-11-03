@@ -10,6 +10,17 @@ use serde_json::{Value, json};
 use std::io::{BufRead, IsTerminal, Write};
 use std::time::Duration;
 
+/// The reader of our output went away (`| head`): stop quietly.
+const CLOSED_PIPE: &str = "\u{0}closed pipe";
+
+fn io_error(e: std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::BrokenPipe {
+        CLOSED_PIPE.to_owned()
+    } else {
+        e.to_string()
+    }
+}
+
 /// Review actions can run commit hooks and push to a slow remote.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(330);
 
@@ -53,6 +64,10 @@ pub struct MergeArgs {
     /// when nothing would be lost; the merged branch is deleted too).
     #[arg(long)]
     remove_worktree: bool,
+    /// Abort the worktree's stopped rebase instead (the branch goes back
+    /// to where it was before it).
+    #[arg(long, conflicts_with_all = ["rebase", "remove_worktree"])]
+    abort_rebase: bool,
     /// Print the plan / outcome as JSON.
     #[arg(long)]
     json: bool,
@@ -94,7 +109,7 @@ pub fn review(args: &ReviewArgs, out: &mut dyn Write, err: &mut dyn Write) -> i3
             .as_deref()
             .map(|b| format!("&base={}", query_escape(b)))
             .unwrap_or_default();
-        let io = |e: std::io::Error| e.to_string();
+        let io = io_error;
         if let Some(path) = &args.diff {
             let mut offset = 0u64;
             let mut pages = Vec::new();
@@ -154,6 +169,7 @@ pub fn review(args: &ReviewArgs, out: &mut dyn Write, err: &mut dyn Write) -> i3
     })();
     match result {
         Ok(()) => 0,
+        Err(message) if message == CLOSED_PIPE => 0,
         Err(message) => {
             let _ = writeln!(err, "fw hub: {message}");
             1
@@ -210,10 +226,17 @@ fn render_set(out: &mut dyn Write, title: &str, set: &Value) -> std::io::Result<
 }
 
 fn render_review(r: &Value, out: &mut dyn Write) -> std::io::Result<()> {
+    let rebasing = r
+        .get("rebasing")
+        .and_then(Value::as_str)
+        .map(|b| format!("{b} (rebasing)"));
     let branch = r
         .get("branch")
         .and_then(Value::as_str)
-        .unwrap_or("(detached HEAD)");
+        .map(str::to_owned)
+        .or(rebasing)
+        .unwrap_or_else(|| "(detached HEAD)".to_owned());
+    let base_is_upstream = r.get("base").is_some_and(|b| s(b, "source") == "upstream");
     writeln!(out, "{} in {}", s(r, "session"), s(r, "dir"))?;
     match r.get("base").filter(|b| !b.is_null()) {
         Some(base) => writeln!(
@@ -229,7 +252,9 @@ fn render_review(r: &Value, out: &mut dyn Write) -> std::io::Result<()> {
             "{branch}: no base or upstream to compare against (--base REF)"
         )?,
     }
-    if let Some(up) = r.get("upstream").filter(|u| !u.is_null()) {
+    if base_is_upstream {
+        // The line above is the upstream comparison already.
+    } else if let Some(up) = r.get("upstream").filter(|u| !u.is_null()) {
         writeln!(
             out,
             "upstream {}: {} ahead, {} behind",
@@ -325,6 +350,7 @@ fn ask(question: &str, err: &mut dyn Write) -> bool {
 pub fn merge(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match merge_inner(args, out, err) {
         Ok(code) => code,
+        Err(message) if message == CLOSED_PIPE => 0,
         Err(message) => {
             let _ = writeln!(err, "fw hub: {message}");
             1
@@ -346,7 +372,10 @@ fn approved(args: &MergeArgs, question: &str, err: &mut dyn Write) -> Result<boo
 fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     let conn = Endpoint::resolve(&args.endpoint)?.with_timeout(ACTION_TIMEOUT);
     let (id, label) = find(&conn, &args.session)?;
-    let io = |e: std::io::Error| e.to_string();
+    let io = io_error;
+    if args.abort_rebase {
+        return abort_rebase(args, &conn, &id, &label, out, err);
+    }
     let dry = json!({ "dry_run": true });
     let mut plan = conn.blocking_call(
         "POST",
@@ -485,6 +514,52 @@ fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Re
     }
     if args.json {
         writeln!(out, "{report}").map_err(io)?;
+    }
+    Ok(0)
+}
+
+/// `fw hub merge --abort-rebase`: show the plan, confirm, run.
+fn abort_rebase(
+    args: &MergeArgs,
+    conn: &Endpoint,
+    id: &str,
+    label: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32, String> {
+    let io = io_error;
+    let url = format!("/api/sessions/{id}/review/abort");
+    let plan = conn.blocking_call("POST", &url, Some(&json!({ "dry_run": true })))?;
+    if let Some(why) = plan.get("refusal").and_then(Value::as_str) {
+        if args.json {
+            writeln!(out, "{plan}").map_err(io)?;
+        }
+        return Err(format!("cannot abort {label}'s rebase: {why}"));
+    }
+    if !args.json {
+        render_plan(&plan, out).map_err(io)?;
+    }
+    if !approved(args, "Abort the rebase?", err)? {
+        if args.json {
+            writeln!(out, "{plan}").map_err(io)?;
+            return Ok(0);
+        }
+        writeln!(
+            err,
+            "fw hub: not aborted (pass --yes to run without a prompt)"
+        )
+        .map_err(io)?;
+        return Ok(1);
+    }
+    let done = conn.blocking_call(
+        "POST",
+        &url,
+        Some(&json!({ "confirm": s(&plan, "fingerprint") })),
+    )?;
+    if args.json {
+        writeln!(out, "{done}").map_err(io)?;
+    } else {
+        writeln!(out, "{}", s(&done, "summary")).map_err(io)?;
     }
     Ok(0)
 }

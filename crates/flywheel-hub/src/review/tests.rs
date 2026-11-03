@@ -244,9 +244,40 @@ fn diffs_page_and_cover_every_scope() {
             "{bad:?}"
         );
     }
-    // A pathspec-looking name is taken literally.
-    let none = diff(&tools(), &t, Scope::Unstaged, "*", None, 0).unwrap();
-    assert!(none.lines.is_empty(), "{:?}", none.lines);
+    // A pathspec-looking name is taken literally: no file is named `*`.
+    let none = diff(&tools(), &t, Scope::Unstaged, "*", None, 0).unwrap_err();
+    assert!(none.contains("has no unstaged change"), "{none}");
+    // A path the scope does not change is an error, not an empty diff;
+    // so is a tracked file asked for as untracked.
+    let err = diff(&tools(), &t, Scope::Committed, "nonexistent", None, 0).unwrap_err();
+    assert!(err.contains("has no committed change"), "{err}");
+    assert!(diff(&tools(), &t, Scope::Staged, "README", None, 0).is_err());
+    assert!(diff(&tools(), &t, Scope::Untracked, "README", None, 0).is_err());
+}
+
+#[test]
+fn a_renamed_file_is_diffed_as_the_rename_by_either_name() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    run_git(wt, &["mv", "README", "README2.md"]);
+    run_git(wt, &["commit", "-qm", "rename"]);
+    let t = f.target();
+    let r = read(&tools(), &t).unwrap();
+    assert_eq!(r.committed.files[0].status, "renamed");
+    for asked in ["README2.md", "README"] {
+        let page = diff(&tools(), &t, Scope::Committed, asked, None, 0).unwrap();
+        assert_eq!(page.path, "README2.md");
+        assert!(
+            page.lines.iter().any(|l| l == "rename from README"),
+            "{asked}: {:?}",
+            page.lines
+        );
+        assert!(
+            !page.lines.iter().any(|l| l.starts_with("new file mode")),
+            "{asked}: {:?}",
+            page.lines
+        );
+    }
 }
 
 #[test]
@@ -285,6 +316,30 @@ fn commit_all_runs_what_was_confirmed_and_refuses_a_moved_tree() {
     ));
     // The tree moves after the plan: stale.
     write(wt, "late.txt", "late\n");
+    let stale = commit(
+        &tools(),
+        &t,
+        "feat: change things\n\nBody line.",
+        &plan.fingerprint,
+    )
+    .unwrap_err();
+    assert!(stale.to_string().contains("changed since"), "{stale}");
+    assert_eq!(run_git(wt, &["rev-list", "--count", "main..HEAD"]), "0");
+
+    // An edit keeping the same files and line counts, and an untracked
+    // file rewritten, after the plan: stale too (contents are hashed).
+    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.").unwrap();
+    write(wt, "README", "chanGED\n");
+    let stale = commit(
+        &tools(),
+        &t,
+        "feat: change things\n\nBody line.",
+        &plan.fingerprint,
+    )
+    .unwrap_err();
+    assert!(stale.to_string().contains("changed since"), "{stale}");
+    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.").unwrap();
+    write(wt, "late.txt", "LATE\n");
     let stale = commit(
         &tools(),
         &t,
@@ -749,4 +804,204 @@ fn one_action_at_a_time_per_repository() {
     assert!(matches!(again, Err(ActionError::Conflict(_))));
     drop(lock);
     assert!(RepoLock::take(&tools(), &f.repo).is_ok());
+}
+
+#[test]
+fn a_partly_staged_file_counts_once() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    write(wt, "README", "one\ntwo\nthree\nx\n");
+    run_git(wt, &["add", "README"]);
+    write(wt, "README", "one\ntwo\nthree\nx\ny\n");
+    let plan = plan_commit(&tools(), &t, "fix: one file").unwrap();
+    assert_eq!(plan.summary, "Stage all 1 file and commit them on feat");
+    let done = commit(&tools(), &t, "fix: one file", &plan.fingerprint).unwrap();
+    assert!(
+        done.summary.starts_with("Committed 1 file as "),
+        "{}",
+        done.summary
+    );
+}
+
+#[test]
+fn a_branch_tracking_another_name_is_pushed_to_its_own_name() {
+    let f = Fixture::new();
+    let bare = f.remote();
+    run_git(&f.repo, &["push", "-q", "origin", "main"]);
+    run_git(&f.repo, &["fetch", "-q", "origin"]);
+    let main_before = run_git(&bare, &["rev-parse", "refs/heads/main"]);
+    // A worktree cut from origin/main does not track it.
+    let plan = git::plan(&f.repo, "task", "", Some("origin/main")).unwrap();
+    let task = git::create(&f.repo, &plan).unwrap();
+    assert!(
+        Command::new("git")
+            .args([
+                "-C",
+                task.path.to_str().unwrap(),
+                "rev-parse",
+                "@{upstream}"
+            ])
+            .output()
+            .unwrap()
+            .status
+            .code()
+            != Some(0),
+        "a new worktree branch tracks nothing"
+    );
+    // A branch that does track origin/main (git checkout -b x origin/main).
+    let wt = &f.wt.path;
+    run_git(wt, &["branch", "--set-upstream-to", "origin/main"]);
+    commit_file(wt, "a.txt", "a\n", "feat: a");
+    let t = f.target();
+    let plan = plan_push(&tools(), &t, None).unwrap();
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    assert_eq!(
+        plan.commands[0].args,
+        ["push", "-u", "origin", "refs/heads/feat:refs/heads/feat"]
+    );
+    assert!(
+        plan.details
+            .iter()
+            .any(|d| d.contains("it tracks origin/main now")),
+        "{:?}",
+        plan.details
+    );
+    push(&tools(), &t, None, &plan.fingerprint).unwrap();
+    assert_eq!(
+        run_git(&bare, &["rev-parse", "refs/heads/main"]),
+        main_before
+    );
+    assert_eq!(
+        run_git(&bare, &["rev-parse", "refs/heads/feat"]),
+        run_git(wt, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        run_git(wt, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+        "origin/feat"
+    );
+
+    // Another remote: pushed to its same-named branch, the upstream kept.
+    let backup = f.root.join("backup.git");
+    run_git(&f.root, &["init", "-q", "--bare", backup.to_str().unwrap()]);
+    run_git(
+        &f.repo,
+        &["remote", "add", "backup", backup.to_str().unwrap()],
+    );
+    let plan = plan_push(&tools(), &t, Some("backup")).unwrap();
+    assert_eq!(
+        plan.commands[0].args,
+        ["push", "backup", "refs/heads/feat:refs/heads/feat"]
+    );
+    assert!(
+        plan.details
+            .iter()
+            .any(|d| d.contains("keeps tracking origin/feat")),
+        "{:?}",
+        plan.details
+    );
+    push(&tools(), &t, Some("backup"), &plan.fingerprint).unwrap();
+    assert_eq!(
+        run_git(wt, &["rev-parse", "--abbrev-ref", "@{upstream}"]),
+        "origin/feat"
+    );
+}
+
+#[test]
+fn a_pull_request_opens_from_the_same_named_branch_as_confirmed() {
+    let f = Fixture::new();
+    f.remote();
+    run_git(&f.repo, &["push", "-q", "origin", "main"]);
+    let wt = &f.wt.path;
+    commit_file(wt, "a.txt", "a\n", "feat: a");
+    run_git(wt, &["push", "-q", "origin", "feat"]);
+    run_git(wt, &["fetch", "-q", "origin"]);
+    run_git(wt, &["branch", "--set-upstream-to", "origin/main"]);
+    run_git(
+        &f.repo,
+        &["remote", "set-url", "origin", "https://github.com/o/r.git"],
+    );
+    let bin = f.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let authed = Tools {
+        gh: fake_gh(&bin, 0),
+        ..Tools::default()
+    };
+    let t = f.target();
+    let a = PrRequest {
+        title: Some("Title A".into()),
+        draft: true,
+        ..PrRequest::default()
+    };
+    let plan = plan_pr(&authed, &t, &a).unwrap();
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    let head = plan.commands[0]
+        .args
+        .iter()
+        .position(|x| x == "--head")
+        .unwrap();
+    assert_eq!(plan.commands[0].args[head + 1], "feat");
+    // Confirming another title or draft than the plan showed: stale.
+    for other in [
+        PrRequest {
+            title: Some("Title B".into()),
+            draft: true,
+            ..PrRequest::default()
+        },
+        PrRequest {
+            title: Some("Title A".into()),
+            draft: false,
+            ..PrRequest::default()
+        },
+        PrRequest {
+            body: Some("other body".into()),
+            ..a.clone()
+        },
+    ] {
+        let err = pr(&authed, &t, &other, &plan.fingerprint).unwrap_err();
+        assert!(err.to_string().contains("changed since"), "{err}");
+    }
+    assert!(!bin.join("gh.log").exists());
+    pr(&authed, &t, &a, &plan.fingerprint).unwrap();
+    assert!(bin.join("gh.log").exists());
+}
+
+#[test]
+fn a_stopped_rebase_can_be_aborted_as_confirmed() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    assert!(
+        plan_abort(&tools(), &t)
+            .unwrap()
+            .refusal
+            .unwrap()
+            .contains("no rebase")
+    );
+    commit_file(wt, "README", "one\nbranch\nthree\n", "branch edit");
+    let before = run_git(wt, &["rev-parse", "HEAD"]);
+    commit_file(&f.repo, "README", "one\nmain\nthree\n", "main edit");
+    let plan = plan_rebase(&tools(), &t).unwrap();
+    assert!(!rebase(&tools(), &t, &plan.fingerprint).unwrap().ok);
+    let r = read(&tools(), &t).unwrap();
+    assert_eq!(r.branch, None);
+    assert_eq!(r.rebasing.as_deref(), Some("feat"));
+    let plan = plan_abort(&tools(), &t).unwrap();
+    assert_eq!(plan.refusal, None);
+    assert_eq!(plan.commands[0].args, ["rebase", "--abort"]);
+    let done = abort(&tools(), &t, &plan.fingerprint).unwrap();
+    assert!(done.ok, "{done:?}");
+    let r = read(&tools(), &t).unwrap();
+    assert_eq!(r.operation, None);
+    assert_eq!(r.branch.as_deref(), Some("feat"));
+    assert_eq!(run_git(wt, &["rev-parse", "HEAD"]), before);
+}
+
+#[test]
+fn status_paths_cover_every_entry_kind() {
+    let status = b"# branch.oid abc\x001 .M N... 100644 100644 100644 a a sub dir/one file\x002 R. N... 100644 100644 100644 a a R100 new name\x00old name\x00u UU N... 100644 100644 100644 100644 a b c both\x00? fresh one\x00! ignored\x00";
+    assert_eq!(
+        status_paths(status),
+        ["sub dir/one file", "new name", "both", "fresh one"]
+    );
 }

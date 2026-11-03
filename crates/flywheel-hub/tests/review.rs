@@ -271,6 +271,28 @@ async fn a_worktree_session_is_reviewed_committed_pushed_merged_and_removed() {
     assert_eq!(review["mergeable"], true);
     assert_eq!(review["agent"]["id"], agent_id);
     assert_eq!(review["remotes"][0]["name"], "origin");
+    // A base that names nothing is an error, not "nothing to review"; so
+    // is the diff of a path the review does not list.
+    let (status, body) = hub
+        .call(
+            reqwest::Method::GET,
+            &format!("/api/sessions/{agent_id}/review?base=nosuch"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.to_string().contains("names no branch or commit"),
+        "{body}"
+    );
+    let (status, body) = hub
+        .call(
+            reqwest::Method::GET,
+            &format!("/api/sessions/{agent_id}/review/diff?scope=committed&path=nonexistent"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
     // Commits made through the companion shell show up as the branch's.
     let (status, sent) = hub

@@ -56,7 +56,36 @@ pub(super) async fn remove_session(
         }
     };
     let hub = Arc::clone(&app.hub);
-    let outcome = blocking(move || hub.remove_session_with(&id, options)).await?;
+    let outcome = blocking(move || {
+        let label = hub
+            .session(&id)
+            .map_or_else(|_| id.clone(), |v| v.record.label());
+        let result = hub.remove_session_with(&id, options);
+        // Removing a worktree (and maybe its branch) is logged like the
+        // review actions that lead to it.
+        if options.remove_worktree {
+            match &result {
+                Ok(done) => {
+                    if let Some(w) = &done.worktree {
+                        eprintln!(
+                            "fw hub: closed {label} and removed worktree {}{}; branch {} {}",
+                            w.path.display(),
+                            if options.force { " (forced)" } else { "" },
+                            w.branch,
+                            if w.branch_deleted {
+                                "deleted (merged)"
+                            } else {
+                                "kept"
+                            }
+                        );
+                    }
+                }
+                Err(e) => eprintln!("fw hub: removing {label}'s worktree refused or failed: {e}"),
+            }
+        }
+        result
+    })
+    .await?;
     if options.remove_worktree {
         Ok(Json(outcome).into_response())
     } else {

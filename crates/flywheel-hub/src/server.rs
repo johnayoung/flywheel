@@ -214,6 +214,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions/{id}/review/push", post(review_api::push))
         .route("/api/sessions/{id}/review/pr", post(review_api::pr))
         .route("/api/sessions/{id}/review/rebase", post(review_api::rebase))
+        .route("/api/sessions/{id}/review/abort", post(review_api::abort))
         .route("/api/sessions/{id}/review/merge", post(review_api::merge))
         .route("/api/sessions/{id}/review/ask", post(review_api::ask))
         .route("/api/sessions/{id}/ws", get(session_ws))

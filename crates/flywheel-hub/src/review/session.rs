@@ -10,7 +10,9 @@ use crate::hub::{Hub, HubError, WorktreeInfo};
 use crate::state::{SessionRecord, StateError};
 use crate::transcript::PasteOutcome;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 
 /// A session's review: the work tree's [`Review`] plus who it is for.
 #[derive(Debug, Clone, Serialize)]
@@ -34,10 +36,16 @@ pub struct AgentRef {
 /// An action and what it needs.
 #[derive(Debug, Clone)]
 pub enum Action {
-    Commit { message: String },
-    Push { remote: Option<String> },
+    Commit {
+        message: String,
+    },
+    Push {
+        remote: Option<String>,
+    },
     Pr(PrRequest),
     Rebase,
+    /// Abort a stopped rebase.
+    Abort,
     Merge,
 }
 
@@ -48,6 +56,7 @@ impl Action {
             Self::Push { .. } => "push",
             Self::Pr(_) => "pr",
             Self::Rebase => "rebase",
+            Self::Abort => "abort",
             Self::Merge => "merge",
         }
     }
@@ -136,6 +145,15 @@ impl Hub {
             ))
         })?;
         let given = base.map(check_base).transpose()?;
+        if let Some(base) = &given
+            && !super::resolves(tools, &top, base)
+        {
+            return Err(StateError::Invalid(format!(
+                "base {base:?} names no branch or commit in {}",
+                top.display()
+            ))
+            .into());
+        }
         let (base, base_source) = match (given, &worktree) {
             (Some(base), _) => (Some(base), BaseSource::Given),
             (None, Some(w)) => (Some(w.base.clone()), BaseSource::Worktree),
@@ -219,7 +237,7 @@ impl Hub {
 
     /// What `action` would do (nothing runs).
     pub fn review_plan(&self, tools: &Tools, id: &str, action: &Action) -> Result<Plan, HubError> {
-        let (_, target) = self.review_target(tools, id, None)?;
+        let (record, target) = self.review_target(tools, id, None)?;
         let plan = match action {
             Action::Commit { message } => {
                 super::check_message(message).map_err(action_error)?;
@@ -228,9 +246,35 @@ impl Hub {
             Action::Push { remote } => super::plan_push(tools, &target, remote.as_deref()),
             Action::Pr(request) => super::plan_pr(tools, &target, request),
             Action::Rebase => super::plan_rebase(tools, &target),
+            Action::Abort => super::plan_abort(tools, &target),
             Action::Merge => super::plan_merge(tools, &target),
         };
-        plan.map_err(|e| StateError::Conflict(e).into())
+        let plan = plan.map_err(|e| HubError::from(StateError::Conflict(e)))?;
+        self.log_refusal(&record, action.name(), plan.refusal.as_deref());
+        Ok(plan)
+    }
+
+    /// Log a plan's refusal to the hub log, once per session and action
+    /// until it changes (a dialog re-plans as you type).
+    fn log_refusal(&self, record: &SessionRecord, action: &str, refusal: Option<&str>) {
+        static LAST: Mutex<Option<HashMap<(String, String), String>>> = Mutex::new(None);
+        let mut last = LAST.lock().unwrap_or_else(PoisonError::into_inner);
+        let last = last.get_or_insert_with(HashMap::new);
+        let key = (record.id.clone(), action.to_owned());
+        match refusal {
+            None => {
+                last.remove(&key);
+            }
+            Some(why) if last.get(&key).map(String::as_str) != Some(why) => {
+                eprintln!(
+                    "fw hub: review {}: {action}: refused: {}",
+                    record.label(),
+                    one_line(why)
+                );
+                last.insert(key, why.to_owned());
+            }
+            Some(_) => {}
+        }
     }
 
     /// Run `action` as confirmed (`confirm`: the plan's fingerprint).
@@ -248,6 +292,7 @@ impl Hub {
             Action::Push { remote } => super::push(tools, &target, remote.as_deref(), confirm),
             Action::Pr(request) => super::pr(tools, &target, request, confirm),
             Action::Rebase => super::rebase(tools, &target, confirm),
+            Action::Abort => super::abort(tools, &target, confirm),
             Action::Merge => super::merge(tools, &target, confirm),
         };
         match &result {
@@ -265,14 +310,15 @@ impl Hub {
                     if outcome.ok {
                         "ok".to_owned()
                     } else {
-                        format!("stopped: {}", outcome.summary)
+                        format!("stopped: {}", one_line(&outcome.summary))
                     }
                 );
             }
             Err(e) => eprintln!(
-                "fw hub: review {}: {}: not run or failed: {e}",
+                "fw hub: review {}: {}: not run or failed: {}",
                 record.label(),
-                action.name()
+                action.name(),
+                one_line(&e.to_string())
             ),
         }
         let outcome = result.map_err(action_error)?;
@@ -334,6 +380,15 @@ impl Hub {
         }
         Ok(plan)
     }
+}
+
+/// A message on one log line.
+fn one_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The prompt pasted into the agent.

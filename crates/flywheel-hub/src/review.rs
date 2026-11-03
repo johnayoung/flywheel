@@ -217,6 +217,10 @@ pub struct Review {
     /// An operation stopped half-way: `rebase`, `merge`, `cherry-pick`,
     /// `revert`.
     pub operation: Option<String>,
+    /// The branch a stopped rebase is rebasing (HEAD is detached
+    /// meanwhile).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rebasing: Option<String>,
 }
 
 impl Review {
@@ -281,6 +285,13 @@ pub fn toplevel(tools: &Tools, dir: &Path) -> Option<PathBuf> {
     Git::new(tools, dir)
         .maybe(&["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
+}
+
+/// Whether `base` names a commit in the repository `dir` is in.
+pub fn resolves(tools: &Tools, dir: &Path, base: &str) -> bool {
+    Git::new(tools, dir)
+        .maybe(&["rev-parse", "--verify", "-q", &format!("{base}^{{commit}}")])
+        .is_some()
 }
 
 /// Mask the credential in a remote URL (`https://user:token@host/...`).
@@ -435,6 +446,17 @@ fn operation(git_dir: &Path) -> Option<String> {
     }
 }
 
+/// The branch a rebase stopped in the work tree whose git dir is
+/// `git_dir` is rebasing.
+fn rebasing(git_dir: &Path) -> Option<String> {
+    ["rebase-merge", "rebase-apply"].iter().find_map(|d| {
+        let name = std::fs::read_to_string(git_dir.join(d).join("head-name")).ok()?;
+        let name = name.trim();
+        Some(name.strip_prefix("refs/heads/").unwrap_or(name).to_owned())
+            .filter(|n| !n.is_empty() && n != "detached HEAD")
+    })
+}
+
 /// `git rev-list --left-right --count a...b` as (left, right).
 fn left_right(git: &Git<'_>, range: &str) -> (u32, u32) {
     git.maybe(&["rev-list", "--left-right", "--count", range])
@@ -521,6 +543,7 @@ pub fn read(tools: &Tools, target: &Target) -> Result<Review, String> {
         untracked_truncated: false,
         conflicts: Vec::new(),
         operation: operation(&git_dir),
+        rebasing: rebasing(&git_dir),
     };
     if let Some((name, source)) = base_name {
         let sha = git.maybe(&["rev-parse", "--verify", "-q", &format!("{name}^{{commit}}")]);
@@ -624,6 +647,15 @@ pub enum Scope {
 }
 
 impl Scope {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Staged => "staged",
+            Self::Unstaged => "unstaged",
+            Self::Untracked => "untracked",
+        }
+    }
+
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw {
             "committed" => Ok(Self::Committed),
@@ -683,45 +715,76 @@ pub fn diff(
         .transpose()?;
     let git = Git::new(tools, &target.dir);
     let literal = |p: &str| format!(":(literal){p}");
+    let range: Vec<String> = match scope {
+        Scope::Committed => vec![read_base_only(&git, target)?, "HEAD".into()],
+        Scope::Staged => vec!["--cached".into()],
+        Scope::Unstaged | Scope::Untracked => Vec::new(),
+    };
     let mut args: Vec<String> = vec!["diff".into()];
     args.extend(DIFF_FLAGS.iter().map(|f| (*f).to_owned()));
     let any_exit = scope == Scope::Untracked;
-    match scope {
-        Scope::Committed => {
-            let review = read_base_only(&git, target)?;
-            args.push(review);
-            args.push("HEAD".into());
+    let path = if scope == Scope::Untracked {
+        // The file must be untracked and in the tree (not through a
+        // symlinked directory to elsewhere).
+        let full = target.dir.join(path);
+        let parent_ok = full
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .zip(target.dir.canonicalize().ok())
+            .is_some_and(|(p, top)| p.starts_with(top));
+        let listed = git
+            .raw(
+                &[
+                    "ls-files",
+                    "-z",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    &literal(path),
+                ],
+                64 * 1024,
+            )
+            .is_ok_and(|o| nul_list(&o.stdout).iter().any(|p| p == path));
+        if !parent_ok || full.symlink_metadata().is_err() || !listed {
+            return Err(format!("{path} is not an untracked file here"));
         }
-        Scope::Staged => args.push("--cached".into()),
-        Scope::Unstaged => {}
-        Scope::Untracked => {
-            // The file must exist in the tree (not through a symlinked
-            // directory to elsewhere).
-            let full = target.dir.join(path);
-            let parent_ok = full
-                .parent()
-                .and_then(|p| p.canonicalize().ok())
-                .zip(target.dir.canonicalize().ok())
-                .is_some_and(|(p, top)| p.starts_with(top));
-            if !parent_ok || full.symlink_metadata().is_err() {
-                return Err(format!("{path} is not an untracked file here"));
-            }
-            args.retain(|a| a != "-M");
-            args.extend([
-                "--no-index".into(),
-                "--".into(),
-                "/dev/null".into(),
-                path.into(),
-            ]);
+        args.retain(|a| a != "-M");
+        args.extend([
+            "--no-index".into(),
+            "--".into(),
+            "/dev/null".into(),
+            path.into(),
+        ]);
+        path.to_owned()
+    } else {
+        // The path must be one the scope changes; a rename is diffed as
+        // one (asked by either name), as the file list shows it.
+        let mut list: Vec<String> = vec!["diff".into(), "--name-status".into(), "-z".into()];
+        list.extend(DIFF_FLAGS.iter().map(|f| (*f).to_owned()));
+        list.extend(range.iter().cloned());
+        let list: Vec<&str> = list.iter().map(String::as_str).collect();
+        let listed = git.raw(&list, READ_LIMIT)?;
+        if !listed.success() {
+            return Err(listed.error_text());
         }
-    }
-    if scope != Scope::Untracked {
+        let changes = parse_changes(&[], &listed.stdout);
+        let change = changes
+            .iter()
+            .find(|c| c.path == path && old_path.is_none_or(|o| c.old_path.as_deref() == Some(o)))
+            .or_else(|| {
+                changes
+                    .iter()
+                    .find(|c| old_path.is_none() && c.old_path.as_deref() == Some(path))
+            })
+            .ok_or_else(|| format!("{path} has no {} change", scope.word()))?;
+        args.extend(range);
         args.push("--".into());
-        args.push(literal(path));
-        if let Some(old) = old_path {
+        args.push(literal(&change.path));
+        if let Some(old) = &change.old_path {
             args.push(literal(old));
         }
-    }
+        change.path.clone()
+    };
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = git.raw(&refs, MAX_DIFF_BYTES)?;
     // --no-index exits 1 when the files differ.
@@ -750,7 +813,7 @@ pub fn diff(
     let offset = offset.min(total_lines);
     let end = (offset + DIFF_PAGE_LINES).min(total_lines);
     Ok(DiffPage {
-        path: path.to_owned(),
+        path,
         scope,
         binary,
         lines: all[offset..end].iter().map(|l| (*l).to_owned()).collect(),
@@ -908,8 +971,10 @@ fn fingerprint(parts: &[&str]) -> String {
         .collect()
 }
 
-/// Everything that makes a work tree's state: HEAD, branch, index, and
-/// every change (untracked files included).
+/// Everything that makes a work tree's state: HEAD, branch, index, every
+/// change (untracked files included) and what each changed file holds
+/// now, so an edit after the review -- even one keeping the same line
+/// counts -- makes the plan stale.
 fn tree_state(git: &Git<'_>) -> Result<String, String> {
     let status = git.raw(
         &[
@@ -924,18 +989,91 @@ fn tree_state(git: &Git<'_>) -> Result<String, String> {
     if !status.success() {
         return Err(status.error_text());
     }
-    // Changes without content changes in status (an edit keeping the
-    // same set of changed files) still move the plan: hash the diff too.
-    let diff = git.raw(
-        &["diff", "HEAD", "--no-color", "--no-ext-diff", "--stat=200"],
-        READ_LIMIT,
-    );
-    let diff = diff.map(|o| o.stdout).unwrap_or_default();
-    Ok(format!(
-        "{}\u{1}{}",
-        String::from_utf8_lossy(&status.stdout),
-        String::from_utf8_lossy(&diff)
-    ))
+    if status.truncated {
+        return Err("too many changes to plan against (git status is cut)".into());
+    }
+    let mut state = String::from_utf8_lossy(&status.stdout).into_owned();
+    for path in status_paths(&status.stdout) {
+        state.push('\u{1}');
+        state.push_str(&path);
+        state.push('\u{2}');
+        state.push_str(&content_hash(&git.dir.join(&path)));
+    }
+    Ok(state)
+}
+
+/// The work-tree paths `git status --porcelain=v2 -z` names (changed,
+/// unmerged, untracked).
+fn status_paths(status: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut tokens = status.split(|b| *b == 0).filter(|t| !t.is_empty());
+    while let Some(entry) = tokens.next() {
+        let entry = String::from_utf8_lossy(entry);
+        // Fields before the path: 1 -> 8, 2 -> 9 (then the source path as
+        // its own token), u -> 10, ? -> 1.
+        let (fields, renamed) = match entry.as_bytes().first() {
+            Some(b'1') => (8, false),
+            Some(b'2') => (9, true),
+            Some(b'u') => (10, false),
+            Some(b'?') => (1, false),
+            _ => continue,
+        };
+        if let Some(path) = entry.splitn(fields + 1, ' ').nth(fields) {
+            paths.push(path.to_owned());
+        }
+        if renamed {
+            tokens.next();
+        }
+    }
+    paths
+}
+
+/// Files larger than this are known by size and modification time, not
+/// read through.
+const HASH_FILE_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// What a file holds: a SHA-256 of its bytes (a symlink: of its target;
+/// a huge file: its size and modification time), or why it has none
+/// (gone, a directory such as a submodule).
+fn content_hash(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let Ok(meta) = path.symlink_metadata() else {
+        return "gone".into();
+    };
+    let mut digest = Sha256::new();
+    if meta.file_type().is_symlink() {
+        match std::fs::read_link(path) {
+            Ok(to) => digest.update(to.to_string_lossy().as_bytes()),
+            Err(_) => return "unreadable link".into(),
+        }
+    } else if meta.is_file() && meta.len() > HASH_FILE_LIMIT {
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        return format!("large {} {modified}", meta.len());
+    } else if meta.is_file() {
+        let Ok(mut file) = std::fs::File::open(path) else {
+            return format!("unreadable {}", meta.len());
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => digest.update(&buf[..n]),
+                Err(_) => return format!("unreadable {}", meta.len()),
+            }
+        }
+    } else {
+        return "not a file".into();
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn plural(n: usize, word: &str) -> String {
@@ -987,7 +1125,16 @@ pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan
     for u in &review.untracked {
         details.push(format!("new {}", u.path));
     }
-    let files = review.staged.files.len() + review.unstaged.files.len() + review.untracked.len();
+    // A file both staged and changed again since is one file.
+    let files = review
+        .staged
+        .files
+        .iter()
+        .chain(&review.unstaged.files)
+        .map(|f| f.path.as_str())
+        .chain(review.untracked.iter().map(|u| u.path.as_str()))
+        .collect::<HashSet<_>>()
+        .len();
     let branch = review
         .branch
         .clone()
@@ -1031,13 +1178,28 @@ pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan
     })
 }
 
+/// Where a branch is pushed.
+struct PushTo {
+    remote: String,
+    /// Always the same-named branch there (`refs/heads/<branch>`): a
+    /// branch tracking another name (`origin/main`) is never pushed onto
+    /// it.
+    dest: String,
+    /// The branch tracks exactly `remote`/`dest` already.
+    tracked: bool,
+    /// `-u`: it tracks nothing yet, or another branch on the same remote.
+    set_upstream: bool,
+    /// What it tracks now when that is not `remote`/`dest`.
+    tracking: Option<String>,
+}
+
 /// Which remote, and which branch on it, `branch` is pushed to.
 fn push_destination(
     git: &Git<'_>,
     branch: &str,
     remotes: &[Remote],
     wanted: Option<&str>,
-) -> Result<(String, String, bool), String> {
+) -> Result<PushTo, String> {
     let names: Vec<&str> = remotes.iter().map(|r| r.name.as_str()).collect();
     if names.is_empty() {
         return Err("the repository has no remotes: add one (git remote add)".into());
@@ -1061,17 +1223,28 @@ fn push_destination(
             .or_else(|| (names.len() == 1).then(|| names[0].to_owned()))
             .ok_or_else(|| format!("pick a remote: {}", names.join(", ")))?,
     };
-    let tracked = upstream_remote.as_deref() == Some(remote.as_str());
-    let dest = match (&upstream_merge, tracked) {
-        (Some(merge), true) => merge.clone(),
-        _ => format!("refs/heads/{branch}"),
+    let dest = format!("refs/heads/{branch}");
+    let same_remote = upstream_remote.as_deref() == Some(remote.as_str());
+    let tracked = same_remote && upstream_merge.as_deref() == Some(dest.as_str());
+    let tracking = match (&upstream_remote, &upstream_merge) {
+        (Some(r), Some(m)) if !tracked => Some(format!(
+            "{r}/{}",
+            m.strip_prefix("refs/heads/").unwrap_or(m)
+        )),
+        _ => None,
     };
-    Ok((remote, dest, tracked && upstream_merge.is_some()))
+    Ok(PushTo {
+        set_upstream: !tracked && (upstream_remote.is_none() || same_remote),
+        remote,
+        dest,
+        tracked,
+        tracking,
+    })
 }
 
-/// Plan pushing the branch (never forced): to its push remote, else its
-/// upstream's, else `origin`, else the only remote; `-u` when it has no
-/// upstream yet.
+/// Plan pushing the branch (never forced) to the same-named branch on
+/// its push remote, else its upstream's, else `origin`, else the only
+/// remote; `-u` when it tracks nothing there yet.
 pub fn plan_push(tools: &Tools, target: &Target, remote: Option<&str>) -> Result<Plan, String> {
     let git = Git::new(tools, &target.dir);
     let review = read(tools, target)?;
@@ -1088,45 +1261,65 @@ pub fn plan_push(tools: &Tools, target: &Target, remote: Option<&str>) -> Result
         }
         Some(branch) => match push_destination(&git, branch, &review.remotes, remote) {
             Err(why) => refusal = Some(why),
-            Ok((name, dest, tracked)) => {
+            Ok(to) => {
+                let name = &to.remote;
                 let mut args = vec!["push".to_owned()];
-                if !tracked {
+                if to.set_upstream {
                     args.push("-u".into());
                 }
                 args.push(name.clone());
-                args.push(format!("refs/heads/{branch}:{dest}"));
+                args.push(format!("refs/heads/{branch}:{}", to.dest));
                 commands.push(Planned::new(&tools.git, &target.dir, args, PUSH_TIMEOUT));
-                let short = dest.strip_prefix("refs/heads/").unwrap_or(&dest);
                 let url = review
                     .remotes
                     .iter()
-                    .find(|r| r.name == name)
+                    .find(|r| r.name == *name)
                     .map(|r| r.url.clone())
                     .unwrap_or_default();
-                summary = format!("Push {branch} to {name}/{short} ({url})");
-                match review.upstream.as_ref().filter(|_| tracked) {
-                    Some(up) if up.ahead == 0 && up.behind == 0 => {
-                        refusal = Some(format!("{} is up to date with {}", branch, up.name));
-                    }
-                    Some(up) => {
+                summary = format!("Push {branch} to {name}/{branch} ({url})");
+                // What the remote has of it, as last fetched.
+                let there = format!("{name}/{branch}");
+                let known = git
+                    .maybe(&[
+                        "rev-parse",
+                        "--verify",
+                        "-q",
+                        &format!("refs/remotes/{there}^{{commit}}"),
+                    ])
+                    .is_some();
+                if known {
+                    let (behind, ahead) = left_right(&git, &format!("refs/remotes/{there}...HEAD"));
+                    if ahead == 0 && behind == 0 {
+                        refusal = Some(format!("{branch} is up to date with {there}"));
+                    } else {
                         details.push(format!(
-                            "{} ahead of {}",
-                            plural(up.ahead as usize, "commit"),
-                            up.name
+                            "{} ahead of {there}",
+                            plural(ahead as usize, "commit")
                         ));
-                        if up.behind > 0 {
-                            details.push(format!(
-                                "{} has {} this branch lacks: the push is refused unless you pull or rebase first (it is never forced)",
-                                up.name,
-                                plural(up.behind as usize, "commit")
-                            ));
-                        }
                     }
-                    None => details.push(format!(
-                        "creates {name}/{short} and sets it as the upstream of {branch}"
-                    )),
+                    if behind > 0 {
+                        details.push(format!(
+                            "{there} has {} this branch lacks: the push is refused unless you pull or rebase first (it is never forced)",
+                            plural(behind as usize, "commit")
+                        ));
+                    }
+                } else {
+                    details.push(format!("creates {there}"));
                 }
-                chosen = format!("{name}\u{1}{dest}");
+                match (&to.tracking, to.set_upstream) {
+                    (_, false) if to.tracked => {}
+                    (Some(old), true) => details.push(format!(
+                        "sets {there} as the upstream of {branch} (it tracks {old} now, which is not pushed to)"
+                    )),
+                    (None, true) => {
+                        details.push(format!("sets {there} as the upstream of {branch}"));
+                    }
+                    (Some(old), false) => {
+                        details.push(format!("{branch} keeps tracking {old}"));
+                    }
+                    (None, false) => {}
+                }
+                chosen = format!("{name}\u{1}{}\u{1}{}", to.dest, to.set_upstream);
             }
         },
     }
@@ -1248,12 +1441,25 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
     let review = read(tools, target)?;
     let mut refusal: Option<String> = None;
     let branch = review.branch.clone();
-    let upstream = review.upstream.clone();
-    let remote = upstream
-        .as_ref()
-        .map(|u| u.remote.clone())
+    // The remote the branch is pushed to, and the same-named branch there
+    // (what the pull request is opened from).
+    let remote = branch
+        .as_deref()
+        .and_then(|b| push_destination(&git, b, &review.remotes, None).ok())
+        .map(|to| to.remote)
         .or_else(|| review.remotes.first().map(|r| r.name.clone()))
         .unwrap_or_default();
+    let pushed = branch.as_deref().and_then(|b| {
+        let there = format!("{remote}/{b}");
+        git.maybe(&[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/remotes/{there}^{{commit}}"),
+        ])?;
+        let (behind, ahead) = left_right(&git, &format!("refs/remotes/{there}...HEAD"));
+        Some((there, ahead, behind))
+    });
     let host = review
         .remotes
         .iter()
@@ -1270,21 +1476,25 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
         .body
         .clone()
         .unwrap_or_else(|| defaults.body.clone());
-    match (&branch, &upstream, &base) {
+    match (&branch, &pushed, &base) {
         (None, _, _) => refusal = Some("HEAD is detached: a pull request needs a branch".into()),
         (Some(b), None, _) => {
             refusal = Some(format!(
-                "{b} is not pushed yet: push it first (the pull request is opened from the pushed branch)"
+                "{b} is not pushed to {remote} yet: push it first (the pull request is opened from the pushed branch)"
             ));
         }
-        (Some(_), Some(up), _) if up.ahead > 0 || up.behind > 0 => {
+        (Some(_), Some((there, ahead, behind)), _) if *ahead > 0 || *behind > 0 => {
             refusal = Some(format!(
-                "the branch and {} differ ({} ahead, {} behind): push first so the pull request shows what you reviewed",
-                up.name, up.ahead, up.behind
+                "the branch and {there} differ ({ahead} ahead, {behind} behind): push first so the pull request shows what you reviewed"
             ));
         }
         (Some(_), Some(_), None) => {
             refusal = Some("name the base branch the pull request merges into".into());
+        }
+        (Some(b), Some(_), Some(base)) if base == b => {
+            refusal = Some(format!(
+                "the pull request would merge {b} into itself: name another base"
+            ));
         }
         _ => {}
     }
@@ -1311,16 +1521,7 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
         "--base".into(),
         base.clone().unwrap_or_default(),
         "--head".into(),
-        upstream
-            .as_ref()
-            .map(|u| {
-                u.name
-                    .split_once('/')
-                    .map_or(u.name.as_str(), |(_, b)| b)
-                    .to_owned()
-            })
-            .or_else(|| branch.clone())
-            .unwrap_or_default(),
+        branch.clone().unwrap_or_default(),
         "--title".into(),
         title.clone(),
         "--body-file".into(),
@@ -1332,10 +1533,7 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
     let command = Planned::new(&program, &target.dir, args, GH_TIMEOUT)
         .with_stdin(body.clone().into_bytes(), "the body");
     let head = review.head.clone().unwrap_or_default();
-    let up = upstream
-        .as_ref()
-        .map(|u| u.name.clone())
-        .unwrap_or_default();
+    let there = pushed.as_ref().map(|p| p.0.clone()).unwrap_or_default();
     Ok(Plan {
         action: "pr",
         summary: format!(
@@ -1355,7 +1553,17 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
             vec!["uncommitted changes are not in the pull request".into()]
         },
         commands: vec![command],
-        fingerprint: fingerprint(&["pr", &head, &up, base.as_deref().unwrap_or_default()]),
+        // Everything that shapes the command: what runs is what was
+        // confirmed.
+        fingerprint: fingerprint(&[
+            "pr",
+            &head,
+            &there,
+            base.as_deref().unwrap_or_default(),
+            &title,
+            &body,
+            if request.draft { "draft" } else { "ready" },
+        ]),
         refusal,
         needs_rebase: false,
         defaults: Some(defaults),
@@ -1439,6 +1647,43 @@ pub fn plan_rebase(tools: &Tools, target: &Target) -> Result<Plan, String> {
             &state,
             base.as_ref().and_then(|b| b.sha.as_deref()).unwrap_or_default(),
         ]),
+        refusal,
+        needs_rebase: false,
+        defaults: None,
+    })
+}
+
+/// Plan aborting a stopped rebase: the branch goes back to where it was
+/// before it.
+pub fn plan_abort(tools: &Tools, target: &Target) -> Result<Plan, String> {
+    let git = Git::new(tools, &target.dir);
+    let review = read(tools, target)?;
+    let state = tree_state(&git)?;
+    let refusal = (review.operation.as_deref() != Some("rebase"))
+        .then(|| format!("no rebase is stopped in {}", target.dir.display()));
+    let branch = review
+        .rebasing
+        .clone()
+        .unwrap_or_else(|| "the branch".into());
+    let mut details = vec![format!(
+        "{branch} goes back to the commit it was on before the rebase"
+    )];
+    if !review.conflicts.is_empty() || !review.staged.files.is_empty() {
+        details
+            .push("conflict resolutions and staged changes made during the rebase are lost".into());
+    }
+    Ok(Plan {
+        action: "abort",
+        summary: format!("Abort the rebase of {branch} in {}", target.dir.display()),
+        details,
+        warnings: Vec::new(),
+        commands: vec![Planned::new(
+            &tools.git,
+            &target.dir,
+            vec!["rebase".into(), "--abort".into()],
+            REBASE_TIMEOUT,
+        )],
+        fingerprint: fingerprint(&["abort", &state]),
         refusal,
         needs_rebase: false,
         defaults: None,
@@ -1742,13 +1987,26 @@ pub fn commit(
     let done = run_plan(&plan)?;
     let head = head_of(tools, &target.dir);
     let short = head.as_deref().map_or("?", |h| &h[..h.len().min(10)]);
+    // What the commit holds, as git recorded it.
+    let files = Git::new(tools, &target.dir)
+        .raw(
+            &[
+                "diff-tree",
+                "--no-commit-id",
+                "--root",
+                "-r",
+                "--name-only",
+                "-z",
+                "HEAD",
+            ],
+            READ_LIMIT,
+        )
+        .map(|o| nul_list(&o.stdout).len())
+        .unwrap_or_default();
     Ok(Outcome {
         action: "commit",
         ok: true,
-        summary: format!(
-            "Committed {} as {short}",
-            plural(plan.details.len(), "file")
-        ),
+        summary: format!("Committed {} as {short}", plural(files, "file")),
         ran: done.into_iter().map(|(r, _)| r).collect(),
         conflicts: Vec::new(),
         url: None,
@@ -1889,6 +2147,23 @@ pub fn rebase(tools: &Tools, target: &Target, confirm: &str) -> Result<Outcome, 
         conflicts,
         url: None,
         head,
+    })
+}
+
+/// Abort the stopped rebase, as confirmed.
+pub fn abort(tools: &Tools, target: &Target, confirm: &str) -> Result<Outcome, ActionError> {
+    let _lock = RepoLock::take(tools, &target.dir)?;
+    let plan = plan_abort(tools, target).map_err(unplannable)?;
+    confirmed(&plan, confirm)?;
+    let done = run_plan(&plan)?;
+    Ok(Outcome {
+        action: "abort",
+        ok: true,
+        summary: plan.summary.replacen("Abort ", "Aborted ", 1),
+        ran: done.into_iter().map(|(r, _)| r).collect(),
+        conflicts: Vec::new(),
+        url: None,
+        head: head_of(tools, &target.dir),
     })
 }
 

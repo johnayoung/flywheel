@@ -1,6 +1,6 @@
 //! Review from anywhere: `GET /api/sessions/{id}/review`, a file's diff
 //! (`GET .../review/diff`), and the guarded actions (`POST
-//! .../review/{commit,push,pr,rebase,merge}`: `dry_run` plans, `confirm`
+//! .../review/{commit,push,pr,rebase,abort,merge}`: `dry_run` plans, `confirm`
 //! runs the plan with that fingerprint) and `POST .../review/ask`.
 
 use super::{ApiJson, ApiResult, AppState, blocking, error_response};
@@ -110,6 +110,7 @@ fn action(name: &str, body: &ActionBody) -> Action {
             draft: body.draft,
         }),
         "rebase" => Action::Rebase,
+        "abort" => Action::Abort,
         _ => Action::Merge,
     }
 }
@@ -153,6 +154,7 @@ action_route!(commit, "commit");
 action_route!(push, "push");
 action_route!(pr, "pr");
 action_route!(rebase, "rebase");
+action_route!(abort, "abort");
 action_route!(merge, "merge");
 
 #[derive(Deserialize)]

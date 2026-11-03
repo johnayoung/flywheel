@@ -55,7 +55,8 @@ fn install_sample(state: &Path) -> PathBuf {
 }
 
 /// A probe plugin: `env` dumps its environment and cwd, `slow` records
-/// its pid and hangs, `toast` answers a toast (on session.removed).
+/// its pid and hangs, `toast` answers a toast (on session.removed), `log`
+/// appends the share and record events it gets to `events.jsonl`.
 fn install_probe(state: &Path) -> PathBuf {
     let dir = state.join("plugins/probe");
     std::fs::create_dir_all(&dir).unwrap();
@@ -67,6 +68,18 @@ timeout_secs = 1
 [[events]]
 on = "session.removed"
 command = ["./probe.sh", "toast"]
+[[events]]
+on = "share.created"
+command = ["./probe.sh", "log"]
+[[events]]
+on = "share.revoked"
+command = ["./probe.sh", "log"]
+[[events]]
+on = "record.started"
+command = ["./probe.sh", "log"]
+[[events]]
+on = "record.stopped"
+command = ["./probe.sh", "log"]
 [[actions]]
 id = "env"
 title = "Dump the environment"
@@ -85,6 +98,11 @@ command = ["./probe.sh", "bad"]
     support::write_script(
         &dir.join("probe.sh"),
         r#"#!/bin/sh
+if [ "$1" = log ]; then
+  doc=$(cat)
+  printf '%s\n' "$doc" >> "$FW_HUB_PLUGIN_DIR/events.jsonl"
+  exit 0
+fi
 cat > /dev/null
 case "$1" in
   env) env > "$FW_HUB_PLUGIN_DIR/env.txt"; pwd > "$FW_HUB_PLUGIN_DIR/cwd.txt"; echo '{"toast":"env dumped"}' ;;
@@ -762,5 +780,123 @@ esac
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+    hub.stop().await;
+}
+
+/// Wait for the probe's `event` matching `pred`.
+async fn probe_event(probe: &Path, event: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    wait_event(probe, |e| e["event"] == event && pred(e)).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn share_and_record_events_reach_plugins_without_secrets() {
+    let hub = TestHub::start().await;
+    let probe = install_probe(&hub.state());
+    let (code, out, err) = hub.cli(&["plugin", "enable", "probe"]).await;
+    assert_eq!(code, 0, "{out}{err}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, listed) = hub.call(reqwest::Method::GET, "/api/plugins", None).await;
+        let enabled = listed["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "probe" && p["enabled"] == true);
+        if enabled {
+            break;
+        }
+        assert!(Instant::now() < deadline, "probe never enabled: {listed}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let repo = hub.dir.path().join("repo").canonicalize().unwrap();
+    let workspace = hub
+        .post(
+            "/api/workspaces",
+            json!({"name": "demo", "folders": [repo]}),
+        )
+        .await;
+    let session = hub
+        .post(
+            "/api/sessions",
+            json!({"workspace_id": workspace["id"], "name": "taped"}),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+
+    // share.created: the share and its session, never the credential.
+    let made = hub
+        .post(
+            "/api/shares",
+            json!({"session_id": sid, "name": "demo-link", "expires": "15m"}),
+        )
+        .await;
+    let credential = made["credential"].as_str().unwrap().to_owned();
+    let secret = credential.rsplit('_').next().unwrap().to_owned();
+    let created = probe_event(&probe, "share.created", |_| true).await;
+    let share = &created["payload"]["share"];
+    assert_eq!(share["id"], made["share"]["id"], "{created}");
+    assert_eq!(share["name"], "demo-link");
+    assert_eq!(share["session_id"], sid.as_str());
+    assert_eq!(
+        share["expires"].as_u64().unwrap() - share["created"].as_u64().unwrap(),
+        900
+    );
+    assert_eq!(created["payload"]["session"]["id"], sid.as_str());
+    assert_eq!(created["payload"]["session"]["name"], "taped");
+
+    // share.revoked, one per link.
+    let (status, _) = hub
+        .call(reqwest::Method::DELETE, "/api/shares/demo-link", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let revoked = probe_event(&probe, "share.revoked", |_| true).await;
+    assert_eq!(revoked["payload"]["share"]["id"], made["share"]["id"]);
+    assert_eq!(revoked["payload"]["session"]["id"], sid.as_str());
+
+    // record.started / record.stopped (stopped by hand).
+    let started = hub
+        .post(&format!("/api/sessions/{sid}/record/start"), json!({}))
+        .await;
+    let file = started["recording"]["name"].as_str().unwrap().to_owned();
+    let event = probe_event(&probe, "record.started", |_| true).await;
+    assert_eq!(event["payload"]["recording"]["name"], file.as_str());
+    assert_eq!(event["payload"]["recording"]["session_id"], sid.as_str());
+    assert_eq!(event["payload"]["session"]["id"], sid.as_str());
+    hub.post(&format!("/api/sessions/{sid}/record/stop"), json!({}))
+        .await;
+    let event = probe_event(&probe, "record.stopped", |e| {
+        e["payload"]["reason"] == "stopped"
+    })
+    .await;
+    assert_eq!(event["payload"]["recording"]["name"], file.as_str());
+    assert_eq!(event["payload"]["recording"]["active"], false);
+    assert!(event["payload"]["recording"]["size"].as_u64().unwrap() > 0);
+
+    // A recording that ends with its process: reason "ended".
+    let started = hub
+        .post(&format!("/api/sessions/{sid}/record/start"), json!({}))
+        .await;
+    let second = started["recording"]["name"].as_str().unwrap().to_owned();
+    probe_event(&probe, "record.started", |e| {
+        e["payload"]["recording"]["name"] == second.as_str()
+    })
+    .await;
+    hub.post(
+        &format!("/api/sessions/{sid}/input"),
+        json!({"data": "exit 0", "enter": true}),
+    )
+    .await;
+    let event = probe_event(&probe, "record.stopped", |e| {
+        e["payload"]["reason"] == "ended"
+    })
+    .await;
+    assert_eq!(event["payload"]["recording"]["name"], second.as_str());
+
+    // Nothing the probe got carries the credential, its secret, or a link.
+    let all = std::fs::read_to_string(probe.join("events.jsonl")).unwrap();
+    assert!(!all.contains(&credential), "{all}");
+    assert!(!all.contains(&secret), "{all}");
+    assert!(!all.contains("/share/"), "{all}");
+    assert!(!all.contains("fwview_"), "{all}");
     hub.stop().await;
 }

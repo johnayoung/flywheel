@@ -16,6 +16,7 @@ window.FwHubSharing = function (ctx) {
     session: null, // the session a new link would show
     seq: 0, // drops superseded list answers
     timer: 0, // re-reads the lists while the dialog is open (viewers, expiry)
+    policy: "", // the hub's expiry policy last applied to the picker
   };
   const REFRESH_MS = 5000;
 
@@ -119,8 +120,31 @@ window.FwHubSharing = function (ctx) {
       return;
     }
     if (seq !== ui.seq) return;
+    applyPolicy(shares.policy);
     renderShares(shares.shares || []);
     renderRecordings(recordings);
+  }
+
+  // The hub's expiry policy (hub.toml [shares]): choices past the longest
+  // allowed are disabled, and its default is picked (added to the list
+  // when it is not one of the choices). Applied again only when it
+  // changes, so a choice made in the open dialog stays.
+  function applyPolicy(policy) {
+    if (!policy) return;
+    const key = `${policy.default_expires_in}/${policy.max_expires_in}`;
+    if (ui.policy === key) return;
+    ui.policy = key;
+    const select = $("#share-expires");
+    for (const option of [...select.options]) if (option.dataset.policy) option.remove();
+    const fallback = policy.default_expires_in;
+    if (![...select.options].some((o) => Number(o.value) === fallback)) {
+      const option = el("option", { value: String(fallback), textContent: `${span(fallback)} (hub default)` });
+      option.dataset.policy = "1";
+      const after = [...select.options].find((o) => Number(o.value) > fallback);
+      select.insertBefore(option, after || null);
+    }
+    for (const option of select.options) option.disabled = Number(option.value) > policy.max_expires_in;
+    select.value = String(fallback);
   }
 
   function renderShares(shares) {
@@ -316,5 +340,13 @@ window.FwHubSharing = function (ctx) {
     return items;
   }
 
-  return { open, toggleRecord, renderHeader, paletteItems };
+  // Whether the keymap's share.open / record.toggle apply to `sessionId`
+  // (this hub's own; recording needs it running or being recorded).
+  const canShare = (sessionId) => local(sessionById(sessionId));
+  function canRecord(sessionId) {
+    const session = sessionById(sessionId);
+    return local(session) && (!!session.live || !!session.recording);
+  }
+
+  return { open, toggleRecord, renderHeader, paletteItems, canShare, canRecord };
 };

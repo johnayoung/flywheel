@@ -85,8 +85,12 @@ pub struct HubOptions {
     /// Agent launch defaults per kind (`hub.toml` `[agents.*]`): fill
     /// the fields a launch leaves unset.
     pub agent_defaults: crate::config::AgentDefaults,
-    /// Session recordings' size caps (see [`crate::record`]).
+    /// Session recordings' size caps (see [`crate::record`]; `hub.toml`
+    /// `[recordings]`).
     pub record_limits: crate::record::RecordLimits,
+    /// New share links' default and longest expiry (`hub.toml`
+    /// `[shares]`).
+    pub share_policy: crate::share::SharePolicy,
 }
 
 impl HubOptions {
@@ -117,6 +121,7 @@ impl HubOptions {
             worktree_branch_prefix: String::new(),
             agent_defaults: crate::config::AgentDefaults::default(),
             record_limits: crate::record::RecordLimits::default(),
+            share_policy: crate::share::SharePolicy::default(),
         }
     }
 }
@@ -515,6 +520,8 @@ impl Hub {
             worktree_branch_prefix: options.worktree_branch_prefix.clone(),
             import_root: options.import_root.clone(),
             agent_defaults: options.agent_defaults.clone(),
+            record_limits: options.record_limits,
+            share_policy: options.share_policy,
         };
         let record_limits = options.record_limits;
         Ok(Arc::new(Self {
@@ -734,9 +741,11 @@ impl Hub {
             .clone()
     }
 
-    /// Put reloaded settings in force: sessions, worktrees, imports, and
-    /// agent launches started from now on use them.
+    /// Put reloaded settings in force: sessions, worktrees, imports,
+    /// agent launches, and share links started from now on use them;
+    /// recordings (running ones too) the new caps.
     pub fn set_tunables(&self, tunables: crate::config::Tunables) {
+        self.recordings.set_limits(tunables.record_limits);
         *self
             .tunables
             .write()

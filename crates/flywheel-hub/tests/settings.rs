@@ -61,6 +61,8 @@ impl TestHub {
         options.scrollback_lines = effective.scrollback_lines;
         options.worktree_branch_prefix = effective.worktree_branch_prefix.clone();
         options.agent_defaults = effective.agent_defaults.clone();
+        options.record_limits = effective.record_limits;
+        options.share_policy = effective.share_policy;
         let hub = support::open_hub(options);
         config.attach(&hub, None).unwrap();
         let token = hub.token().expose().to_owned();
@@ -226,8 +228,9 @@ async fn settings_validate_conflicts_persist_and_push() {
             .iter()
             .any(|a| a["id"] == "session.jump" && a["indexed"] == true)
     );
-    // Fan-out's board and launcher are rebindable (unbound by default).
-    for id in ["fanout.open", "fanout.new"] {
+    // Fan-out's board and launcher, sharing and recording are rebindable
+    // (unbound by default).
+    for id in ["fanout.open", "fanout.new", "share.open", "record.toggle"] {
         assert!(
             first["actions"]
                 .as_array()
@@ -576,4 +579,138 @@ async fn hub_toml_precedence_hot_reload_and_errors() {
     // A start refuses an invalid file.
     let e = ConfigWatch::open(&state, Flags::default(), None).unwrap_err();
     assert!(e.contains("scrollbak"), "{e}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hub_toml_recording_caps_and_share_expiry_apply_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let toml = state.join("hub.toml");
+    std::fs::write(
+        &toml,
+        "[recordings]\npart_cap = \"128KiB\"\ndir_cap = 1048576\n[shares]\ndefault_expiry = \"10m\"\nmax_expiry = \"2h\"\n",
+    )
+    .unwrap();
+    // A flag beats the file (the longest expiry), the file the default.
+    let hub = TestHub::start(
+        dir.path(),
+        Flags {
+            share_max_expiry: Some(Duration::from_secs(3 * 3600)),
+            ..Flags::default()
+        },
+    )
+    .await;
+    let config = hub.get("/api/config").await;
+    for (key, value, source) in [
+        ("recordings.part_cap", "128KiB", "file"),
+        ("recordings.dir_cap", "1MiB", "file"),
+        ("shares.default_expiry", "10m", "file"),
+        ("shares.max_expiry", "3h", "flag"),
+    ] {
+        let entry = value_of(&config, key);
+        assert_eq!(entry["value"], value, "{key}: {entry}");
+        assert_eq!(entry["source"], source, "{key}: {entry}");
+        assert_eq!(entry["apply"], "live", "{key}: {entry}");
+    }
+    let limits = &hub.get("/api/recordings").await["limits"];
+    assert_eq!(limits["max_file_bytes"], 128 * 1024);
+    assert_eq!(limits["max_total_bytes"], 1024 * 1024);
+    let policy = &hub.get("/api/shares").await["policy"];
+    assert_eq!(policy["default_expires_in"], 600);
+    assert_eq!(policy["max_expires_in"], 3 * 3600);
+
+    // Share links follow the policy: the default, and nothing longer
+    // than the longest.
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let (_, workspace) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/workspaces",
+            Some(json!({"name": "w", "folders": [repo]})),
+        )
+        .await;
+    let (status, session) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/sessions",
+            Some(json!({"workspace_id": workspace["id"], "kind": "shell"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{session}");
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let lasts = |made: &Value| {
+        made["share"]["expires"].as_u64().unwrap() - made["share"]["created"].as_u64().unwrap()
+    };
+    let (status, made) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/shares",
+            Some(json!({"session_id": sid})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    assert_eq!(lasts(&made), 600);
+    let (status, refused) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/shares",
+            Some(json!({"session_id": sid, "expires": "4h"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap_or_default().contains("3h"),
+        "{refused}"
+    );
+
+    // Hot reload: new caps in force for recordings, a new default for
+    // links made from now on.
+    let rev = config["rev"].as_u64().unwrap();
+    std::fs::write(
+        &toml,
+        "[recordings]\npart_cap = \"256KiB\"\ndir_cap = \"2MiB\"\n[shares]\ndefault_expiry = \"20m\"\n",
+    )
+    .unwrap();
+    let reloaded = config_after(&hub, rev).await;
+    assert!(reloaded["file"]["error"].is_null(), "{reloaded}");
+    assert!(
+        reloaded["pending_restart"].as_array().unwrap().is_empty(),
+        "{reloaded}"
+    );
+    let limits = &hub.get("/api/recordings").await["limits"];
+    assert_eq!(limits["max_file_bytes"], 256 * 1024);
+    assert_eq!(limits["max_total_bytes"], 2 * 1024 * 1024);
+    let (status, made) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/shares",
+            Some(json!({"session_id": sid})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    assert_eq!(lasts(&made), 1200);
+
+    // Inconsistent or out-of-bounds caps: reported by key, the last good
+    // settings stay.
+    let rev = reloaded["rev"].as_u64().unwrap();
+    std::fs::write(
+        &toml,
+        "[recordings]\npart_cap = \"1MiB\"\ndir_cap = \"512KiB\"\n[shares]\ndefault_expiry = \"3d\"\nmax_expiry = \"1d\"\n",
+    )
+    .unwrap();
+    let broken = config_after(&hub, rev).await;
+    let error = broken["file"]["error"].as_str().unwrap();
+    assert!(error.contains("recordings.dir_cap"), "{error}");
+    assert!(error.contains("shares.default_expiry"), "{error}");
+    assert_eq!(
+        hub.get("/api/recordings").await["limits"]["max_file_bytes"],
+        256 * 1024
+    );
+    std::fs::write(&toml, "[recordings]\npart_cap = \"1KiB\"\n").unwrap();
+    let (code, _, err) = hub.cli(&["config", "check"]).await;
+    assert_eq!(code, 1);
+    assert!(err.contains("recordings.part_cap"), "{err}");
+    hub.stop().await;
 }

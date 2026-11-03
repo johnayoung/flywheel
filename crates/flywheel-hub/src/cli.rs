@@ -279,12 +279,34 @@ pub(crate) struct HubArgs {
     /// (`<prefix><task>`, e.g. `agent/`) [default: none].
     #[arg(long, value_name = "PREFIX", value_parser = parse_branch_prefix)]
     worktree_branch_prefix: Option<String>,
+    /// Size a recording part reaches before it rotates to the next, e.g.
+    /// 64MiB (64KiB to 4GiB) [default: 64MiB, or hub.toml
+    /// recordings.part_cap].
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    record_part_cap: Option<u64>,
+    /// Size of the recordings directory past which the oldest finished
+    /// recordings are deleted, e.g. 1GiB [default: 1GiB, or hub.toml
+    /// recordings.dir_cap].
+    #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+    record_dir_cap: Option<u64>,
+    /// Expiry of a share link that names none, e.g. 1h [default: 1h, or
+    /// hub.toml shares.default_expiry].
+    #[arg(long, value_name = "DURATION", value_parser = crate::share::parse_ttl)]
+    share_default_expiry: Option<Duration>,
+    /// Longest expiry a share link may have, e.g. 1d (60s to 30d)
+    /// [default: 30d, or hub.toml shares.max_expiry].
+    #[arg(long, value_name = "DURATION", value_parser = crate::share::parse_ttl)]
+    share_max_expiry: Option<Duration>,
     #[command(flatten)]
     pub(crate) state: StateDirArg,
 }
 
 fn parse_branch_prefix(raw: &str) -> Result<String, String> {
     crate::git::validate_prefix(raw)
+}
+
+fn parse_size(raw: &str) -> Result<u64, String> {
+    crate::record::parse_size(raw)
 }
 
 impl HubArgs {
@@ -335,6 +357,21 @@ impl HubArgs {
         if let Some(prefix) = &self.worktree_branch_prefix {
             argv.extend(["--worktree-branch-prefix".to_owned(), prefix.clone()]);
         }
+        if let Some(bytes) = self.record_part_cap {
+            argv.extend(["--record-part-cap".to_owned(), bytes.to_string()]);
+        }
+        if let Some(bytes) = self.record_dir_cap {
+            argv.extend(["--record-dir-cap".to_owned(), bytes.to_string()]);
+        }
+        if let Some(ttl) = self.share_default_expiry {
+            argv.extend([
+                "--share-default-expiry".to_owned(),
+                ttl.as_secs().to_string(),
+            ]);
+        }
+        if let Some(ttl) = self.share_max_expiry {
+            argv.extend(["--share-max-expiry".to_owned(), ttl.as_secs().to_string()]);
+        }
         argv.extend([
             "--state-dir".to_owned(),
             state_dir.to_string_lossy().into_owned(),
@@ -356,6 +393,10 @@ impl HubArgs {
             no_flywheel: self.no_flywheel,
             import_root: self.import_root.clone(),
             worktree_branch_prefix: self.worktree_branch_prefix.clone(),
+            record_part_cap: self.record_part_cap,
+            record_dir_cap: self.record_dir_cap,
+            share_default_expiry: self.share_default_expiry,
+            share_max_expiry: self.share_max_expiry,
         }
     }
 
@@ -947,6 +988,8 @@ fn serve_cmd(
     options.worktree_branch_prefix = effective.worktree_branch_prefix.clone();
     options.import_root = effective.import_root.clone();
     options.agent_defaults = effective.agent_defaults.clone();
+    options.record_limits = effective.record_limits;
+    options.share_policy = effective.share_policy;
     // One hub per state dir: the hub holds `<state-dir>/serve.lock` for
     // its whole life (a second would overwrite the first's runtime file and
     // report socket, leaving `url` / `token --rotate` and agent hooks unable
@@ -1387,6 +1430,44 @@ mod tests {
             reparsed.hub.notify_url.as_deref(),
             Some("https://ntfy.sh/topic")
         );
+    }
+
+    #[test]
+    fn recording_and_share_flags_reach_the_detached_serve() {
+        let cli = HubCli::try_parse_from([
+            "fw hub",
+            "serve",
+            "--record-part-cap",
+            "128KiB",
+            "--record-dir-cap",
+            "1GiB",
+            "--share-default-expiry",
+            "10m",
+            "--share-max-expiry",
+            "1d",
+        ])
+        .unwrap();
+        let HubCommand::Serve(args) = cli.command else {
+            panic!("not serve");
+        };
+        let mut again = vec!["fw hub".to_owned(), "serve".to_owned()];
+        again.extend(args.hub.to_argv(Path::new("/state")));
+        let HubCommand::Serve(reparsed) = HubCli::try_parse_from(again).unwrap().command else {
+            panic!("not serve");
+        };
+        let flags = reparsed.hub.flags();
+        assert_eq!(flags.record_part_cap, Some(128 * 1024));
+        assert_eq!(flags.record_dir_cap, Some(1 << 30));
+        assert_eq!(flags.share_default_expiry, Some(Duration::from_secs(600)));
+        assert_eq!(flags.share_max_expiry, Some(Duration::from_secs(86_400)));
+        assert!(HubCli::try_parse_from(["fw hub", "serve", "--record-part-cap", "lots"]).is_err());
+    }
+
+    #[test]
+    fn recordings_and_share_links_have_no_machine() {
+        let (code, _, err) = run_args(&["record", "ls", "--machine", "desktop"]);
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains("no --machine"), "{err}");
     }
 
     #[test]

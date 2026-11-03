@@ -382,6 +382,8 @@ const GLOBAL_ACTIONS = {
   "companion.flip": () => (state.attached ? commands.flipCompanion() : false),
   "flywheel.toggle": () => flywheel.togglePill(),
   "review.toggle": () => review.togglePill(),
+  "share.open": () => (sharing.canShare(state.attached) ? sharing.open(state.attached) : false),
+  "record.toggle": () => (sharing.canRecord(state.attached) ? sharing.toggleRecord(state.attached) : false),
   "fanout.open": () => {
     document.body.classList.remove("side-open");
     fanout.open();

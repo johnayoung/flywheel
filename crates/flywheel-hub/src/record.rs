@@ -50,6 +50,67 @@ const MAX_HEADER: u64 = 64 * 1024;
 /// How much of a file's end is read to find its last event time.
 const TAIL: u64 = 256 * 1024;
 
+/// Bounds of a part cap (`hub.toml` `recordings.part_cap`): below the
+/// floor a part would hold little beyond its opening snapshot.
+pub const MIN_PART_BYTES: u64 = 64 * 1024;
+pub const MAX_PART_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Largest directory cap (`recordings.dir_cap`).
+pub const MAX_DIR_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+
+const SIZE_UNITS: &[(&str, u64)] = &[
+    ("tib", 1 << 40),
+    ("gib", 1 << 30),
+    ("mib", 1 << 20),
+    ("kib", 1 << 10),
+    ("tb", 1 << 40),
+    ("gb", 1 << 30),
+    ("mb", 1 << 20),
+    ("kb", 1 << 10),
+    ("t", 1 << 40),
+    ("g", 1 << 30),
+    ("m", 1 << 20),
+    ("k", 1 << 10),
+    ("b", 1),
+];
+
+/// Parse a size: plain bytes (`65536`) or a number with a binary unit
+/// (`512KiB`, `64MiB`, `1GiB`; `K`/`KB`, `M`/`MB`, `G`/`GB`, `T`/`TB`
+/// mean the same, case aside).
+pub fn parse_size(raw: &str) -> Result<u64, String> {
+    let text = raw.trim().to_ascii_lowercase().replace(' ', "");
+    let digits = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (number, unit) = text.split_at(digits);
+    let bad =
+        || format!("bad size {raw:?}: a number of bytes, or with a unit like 512KiB, 64MiB, 1GiB");
+    let n: u64 = number.parse().map_err(|_| bad())?;
+    let scale = if unit.is_empty() {
+        1
+    } else {
+        SIZE_UNITS
+            .iter()
+            .find(|(name, _)| *name == unit)
+            .map(|(_, scale)| *scale)
+            .ok_or_else(bad)?
+    };
+    n.checked_mul(scale).ok_or_else(bad)
+}
+
+/// A size written back the way [`parse_size`] reads it: the largest
+/// binary unit that divides it (`64MiB`), else bytes.
+pub fn format_size(bytes: u64) -> String {
+    for (name, scale) in [
+        ("TiB", 1u64 << 40),
+        ("GiB", 1 << 30),
+        ("MiB", 1 << 20),
+        ("KiB", 1 << 10),
+    ] {
+        if bytes >= scale && bytes.is_multiple_of(scale) {
+            return format!("{}{name}", bytes / scale);
+        }
+    }
+    bytes.to_string()
+}
+
 const RUN: u8 = 0;
 /// Drain what was output, then end the recording.
 const STOP: u8 = 1;
@@ -137,9 +198,9 @@ struct ActiveFile {
     recordings: Vec<ActiveEntry>,
 }
 
-/// Told when a recording ended by itself (its process exited), with the
-/// session's id.
-pub type EndNotice = Arc<dyn Fn(&str) + Send + Sync>;
+/// Told when a recording ended by itself (its process exited, or writing
+/// failed), with the session's id and the last part's file name.
+pub type EndNotice = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 struct Recorder {
     entry: Arc<Mutex<ActiveEntry>>,
@@ -152,7 +213,10 @@ struct Recorder {
 /// being recorded.
 pub struct Recordings {
     dir: PathBuf,
-    limits: RecordLimits,
+    /// Changeable while recordings run (`hub.toml` `[recordings]`): a
+    /// recorder reads the part cap before every event, sweeps the
+    /// directory cap.
+    limits: Mutex<RecordLimits>,
     recorders: Mutex<HashMap<String, Recorder>>,
     generation: std::sync::atomic::AtomicU64,
     /// Serializes rotations' and starts' directory sweeps.
@@ -233,7 +297,7 @@ impl Recordings {
     pub fn new(state_dir: &Path, limits: RecordLimits) -> Self {
         Self {
             dir: state_dir.join(RECORDINGS_DIR),
-            limits,
+            limits: Mutex::new(limits),
             recorders: Mutex::new(HashMap::new()),
             generation: std::sync::atomic::AtomicU64::new(0),
             sweeping: Mutex::new(()),
@@ -245,7 +309,14 @@ impl Recordings {
     }
 
     pub fn limits(&self) -> RecordLimits {
-        self.limits
+        *self.limits.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Put new caps in force: running recordings rotate at the new part
+    /// cap from their next event; the directory cap applies at the next
+    /// sweep (a start or a rotation).
+    pub fn set_limits(&self, limits: RecordLimits) {
+        *self.limits.lock().unwrap_or_else(PoisonError::into_inner) = limits;
     }
 
     fn recorders(&self) -> MutexGuard<'_, HashMap<String, Recorder>> {
@@ -639,10 +710,11 @@ impl Recordings {
                 })
             })
             .collect();
+        let max_total = self.limits().max_total_bytes;
         let mut total: u64 = files.iter().map(|f| f.1).sum();
         files.sort_by_key(|f| f.0);
         for (_, size, path, name) in files {
-            if total <= self.limits.max_total_bytes {
+            if total <= max_total {
                 break;
             }
             if active.contains(&name) {
@@ -867,14 +939,12 @@ impl Worker {
         };
         let _ = self.writer.finish();
         if finished && let Some(owner) = self.owner.upgrade() {
-            let id = self
-                .entry
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .session_id
-                .clone();
+            let (id, file) = {
+                let entry = self.entry.lock().unwrap_or_else(PoisonError::into_inner);
+                (entry.session_id.clone(), entry.file.clone())
+            };
             if owner.ended(&id, self.generation) {
-                (self.ended)(&id);
+                (self.ended)(&id, &file);
             }
         }
     }
@@ -907,7 +977,7 @@ impl Worker {
     fn max_file_bytes(&self) -> u64 {
         self.owner
             .upgrade()
-            .map_or(DEFAULT_MAX_FILE_BYTES, |o| o.limits.max_file_bytes)
+            .map_or(DEFAULT_MAX_FILE_BYTES, |o| o.limits().max_file_bytes)
     }
 
     fn failed(&self, e: &std::io::Error) -> bool {
@@ -1219,6 +1289,15 @@ impl Hub {
             self.recording_ended_notice(),
         )?;
         self.emit(HubEvent::Sessions);
+        if started.1 {
+            self.emit_lifecycle(
+                "record.started",
+                json!({
+                    "session": self.event_session(&view.record.id),
+                    "recording": started.0,
+                }),
+            );
+        }
         Ok(started)
     }
 
@@ -1227,15 +1306,37 @@ impl Hub {
         let view = self.session(id)?;
         let info = self.recordings().stop(&view.record.id)?;
         self.emit(HubEvent::Sessions);
+        self.emit_lifecycle(
+            "record.stopped",
+            json!({
+                "session": self.event_session(&view.record.id),
+                "recording": info,
+                "reason": "stopped",
+            }),
+        );
         Ok(info)
     }
 
-    /// What a recording that ends by itself (its process exited) tells.
+    /// What a recording that ends by itself (its process exited, or
+    /// writing failed) tells: the UIs, and plugins (`record.stopped`,
+    /// reason `ended`).
     pub(crate) fn recording_ended_notice(self: &Arc<Self>) -> EndNotice {
         let weak = Arc::downgrade(self);
-        Arc::new(move |_id: &str| {
+        Arc::new(move |id: &str, file: &str| {
             if let Some(hub) = weak.upgrade() {
                 hub.emit(HubEvent::Sessions);
+                let recording = hub
+                    .recordings()
+                    .info_of(file)
+                    .map_or(Value::Null, |info| json!(info));
+                hub.emit_lifecycle(
+                    "record.stopped",
+                    json!({
+                        "session": hub.event_session(id),
+                        "recording": recording,
+                        "reason": "ended",
+                    }),
+                );
             }
         })
     }
@@ -1298,6 +1399,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sizes_parse_and_round_trip() {
+        assert_eq!(parse_size("65536").unwrap(), 65536);
+        assert_eq!(parse_size("64KiB").unwrap(), 64 * 1024);
+        assert_eq!(parse_size("64 mb").unwrap(), 64 << 20);
+        assert_eq!(parse_size("1G").unwrap(), 1 << 30);
+        for bad in ["", "MiB", "12xb", "-1", "1.5MiB", "99999999999999TiB"] {
+            assert!(parse_size(bad).is_err(), "{bad}");
+        }
+        for bytes in [65536, 64 << 20, 3 << 30, 1 << 40, 100_000] {
+            assert_eq!(parse_size(&format_size(bytes)).unwrap(), bytes);
+        }
+        assert_eq!(format_size(64 << 20), "64MiB");
+        assert_eq!(format_size(100_000), "100000");
+    }
+
+    #[test]
+    fn limits_change_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let recordings = Recordings::new(dir.path(), RecordLimits::default());
+        let tighter = RecordLimits {
+            max_file_bytes: MIN_PART_BYTES,
+            max_total_bytes: 4 * MIN_PART_BYTES,
+        };
+        recordings.set_limits(tighter);
+        assert_eq!(recordings.limits(), tighter);
+    }
+
+    #[test]
     fn split_utf8_sequences_are_joined_and_invalid_bytes_replaced() {
         let mut pending = Vec::new();
         let euro = "\u{20ac}".as_bytes();
@@ -1344,7 +1473,7 @@ mod tests {
             session: Weak::new(),
             events,
             writer,
-            ended: Arc::new(|_: &str| {}),
+            ended: Arc::new(|_: &str, _: &str| {}),
         };
         let (done_tx, done) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {

@@ -76,9 +76,11 @@ pub(crate) struct ShareArgs {
     command: Option<ShareCommand>,
     /// The session to share: id, unique id prefix, or name.
     session: Option<String>,
-    /// How long the link works: 30m, 1h, 8h, 2d (60s to 30d).
-    #[arg(long, default_value = "1h", value_name = "DURATION")]
-    expires: String,
+    /// How long the link works: 30m, 1h, 8h, 2d (60s to the hub's
+    /// shares.max_expiry, 30d unless set) [default: the hub's
+    /// shares.default_expiry, 1h unless set].
+    #[arg(long, value_name = "DURATION")]
+    expires: Option<String>,
     /// A label for the link (as `share ls` and `share revoke` name it).
     #[arg(long, value_name = "LABEL")]
     name: Option<String>,
@@ -184,10 +186,15 @@ fn share_new(args: &ShareArgs, out: &mut dyn Write, err: &mut dyn Write) -> Resu
         );
     };
     no_machine(&args.endpoint)?;
-    crate::share::parse_ttl(&args.expires)?;
+    if let Some(expires) = &args.expires {
+        crate::share::parse_ttl(expires)?;
+    }
     let hub = Endpoint::resolve(&args.endpoint)?;
     let (id, session) = find_session(&hub, query)?;
-    let mut body = json!({ "session_id": id, "expires": args.expires });
+    let mut body = json!({ "session_id": id });
+    if let Some(expires) = &args.expires {
+        body["expires"] = json!(expires);
+    }
     if let Some(name) = &args.name {
         body["name"] = json!(name);
     }
@@ -357,6 +364,8 @@ fn share_revoke(args: &ShareRevokeArgs, out: &mut dyn Write) -> Result<i32, Stri
 
 // --- record ---------------------------------------------------------------------
 
+// `--machine` is refused here too (a peer credential manages no
+// recordings): hidden from help.
 #[derive(Debug, clap::Args)]
 pub(crate) struct RecordArgs {
     #[command(subcommand)]
@@ -382,6 +391,7 @@ enum RecordCommand {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(mut_arg("machine", |arg| arg.hide(true)))]
 struct RecordTarget {
     /// Session id, unique id prefix, or name.
     session: String,
@@ -393,6 +403,7 @@ struct RecordTarget {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(mut_arg("machine", |arg| arg.hide(true)))]
 struct RecordLsArgs {
     /// Print JSON: {"dir","limits","total_bytes","recordings":[...]}.
     #[arg(long)]
@@ -402,6 +413,7 @@ struct RecordLsArgs {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(mut_arg("machine", |arg| arg.hide(true)))]
 struct RecordGetArgs {
     /// The recording's file name (as `record ls` lists it).
     name: String,
@@ -416,6 +428,7 @@ struct RecordGetArgs {
 }
 
 #[derive(Debug, clap::Args)]
+#[command(mut_arg("machine", |arg| arg.hide(true)))]
 struct RecordName {
     /// The recording's file name (as `record ls` lists it).
     name: String,
@@ -424,6 +437,21 @@ struct RecordName {
 }
 
 pub(crate) fn record(args: &RecordArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let endpoint = match &args.command {
+        RecordCommand::Start(a) | RecordCommand::Stop(a) => &a.endpoint,
+        RecordCommand::Ls(a) => &a.endpoint,
+        RecordCommand::Get(a) => &a.endpoint,
+        RecordCommand::Rm(a) => &a.endpoint,
+    };
+    if let Some(machine) = &endpoint.machine {
+        return fail(
+            err,
+            &format!(
+                "recordings have no --machine: record {machine}'s sessions from that machine \
+                 (`fw hub record` there)"
+            ),
+        );
+    }
     let result = match &args.command {
         RecordCommand::Start(a) => record_toggle(a, true, out),
         RecordCommand::Stop(a) => record_toggle(a, false, out),

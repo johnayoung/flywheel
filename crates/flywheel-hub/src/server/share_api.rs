@@ -15,7 +15,7 @@ use super::{
 };
 use crate::hub::{Hub, HubError, HubEvent};
 use crate::pty::{PtySession, SessionEvent};
-use crate::share::{DEFAULT_TTL, MAX_TTL, MIN_TTL, ShareError, ShareInfo, Verdict, parse_ttl};
+use crate::share::{ShareError, ShareInfo, Verdict, parse_ttl};
 use crate::state::StateError;
 use crate::vt::{SNAPSHOT_HISTORY_BYTES, TextSource};
 use crate::web;
@@ -76,30 +76,25 @@ pub(super) async fn create(
     State(app): State<AppState>,
     ApiJson(body): ApiJson<NewShare>,
 ) -> ApiResult<Response> {
-    let ttl = match (body.expires_in, body.expires.as_deref()) {
+    let asked = match (body.expires_in, body.expires.as_deref()) {
         (Some(_), Some(_)) => {
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
                 "give expires_in or expires, not both",
             ));
         }
-        (Some(seconds), None) => Duration::from_secs(seconds),
+        (Some(seconds), None) => Some(Duration::from_secs(seconds)),
         (None, Some(text)) => match parse_ttl(text) {
-            Ok(ttl) => ttl,
+            Ok(ttl) => Some(ttl),
             Err(message) => return Ok(error_response(StatusCode::BAD_REQUEST, &message)),
         },
-        (None, None) => DEFAULT_TTL,
+        (None, None) => None,
     };
-    if ttl < MIN_TTL || ttl > MAX_TTL {
-        return Ok(error_response(
-            StatusCode::BAD_REQUEST,
-            &format!(
-                "an expiry is {}s to {} days",
-                MIN_TTL.as_secs(),
-                MAX_TTL.as_secs() / 86_400
-            ),
-        ));
-    }
+    // hub.toml `[shares]`: the default and the longest allowed.
+    let ttl = match app.hub.tunables().share_policy.expiry(asked) {
+        Ok(ttl) => ttl,
+        Err(message) => return Ok(error_response(StatusCode::BAD_REQUEST, &message)),
+    };
     let hub = Arc::clone(&app.hub);
     let (view, info, credential) = blocking(move || {
         let view = hub.session(&body.session_id)?;
@@ -109,6 +104,14 @@ pub(super) async fn create(
         Ok((view, info, credential))
     })
     .await?;
+    // Plugins hear of it without the credential or any link to it.
+    app.hub.emit_lifecycle(
+        "share.created",
+        json!({
+            "session": app.hub.event_session(&info.session_id),
+            "share": share_event(&info),
+        }),
+    );
     let path = format!("{}{credential}", crate::share::SHARE_PATH);
     let mut response = (
         StatusCode::CREATED,
@@ -126,6 +129,31 @@ pub(super) async fn create(
     Ok(response)
 }
 
+/// A share as plugin events carry it: never the credential, its digest, or
+/// a link (the link is the credential).
+fn share_event(info: &ShareInfo) -> Value {
+    json!({
+        "id": info.id,
+        "session_id": info.session_id,
+        "name": info.name,
+        "created": info.created,
+        "expires": info.expires,
+    })
+}
+
+/// `share.revoked` for each of `revoked`.
+fn announce_revoked(hub: &Hub, revoked: &[ShareInfo]) {
+    for info in revoked {
+        hub.emit_lifecycle(
+            "share.revoked",
+            json!({
+                "session": hub.event_session(&info.session_id),
+                "share": share_event(info),
+            }),
+        );
+    }
+}
+
 pub(super) async fn list(State(app): State<AppState>) -> ApiResult<Json<Value>> {
     let hub = Arc::clone(&app.hub);
     let shares = blocking(move || {
@@ -136,7 +164,14 @@ pub(super) async fn list(State(app): State<AppState>) -> ApiResult<Json<Value>> 
             .collect::<Vec<_>>())
     })
     .await?;
-    Ok(Json(json!({ "shares": shares })))
+    let policy = app.hub.tunables().share_policy;
+    Ok(Json(json!({
+        "shares": shares,
+        "policy": {
+            "default_expires_in": policy.default_ttl.as_secs(),
+            "max_expires_in": policy.max_ttl.as_secs(),
+        },
+    })))
 }
 
 pub(super) async fn revoke(
@@ -145,6 +180,7 @@ pub(super) async fn revoke(
 ) -> ApiResult<Json<Value>> {
     let hub = Arc::clone(&app.hub);
     let revoked = blocking(move || Ok(hub.shares().revoke(&which)?)).await?;
+    announce_revoked(&app.hub, &revoked);
     Ok(Json(json!({ "revoked": revoked })))
 }
 
@@ -167,6 +203,7 @@ pub(super) async fn revoke_all(
         Ok(hub.shares().revoke_all(session.as_deref())?)
     })
     .await?;
+    announce_revoked(&app.hub, &revoked);
     Ok(Json(json!({ "revoked": revoked })))
 }
 

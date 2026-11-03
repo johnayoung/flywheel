@@ -245,8 +245,9 @@ fn info(entry: &PeerEntry) -> PeerInfo {
 /// hub's user, so it can read the token file (and anything else that user
 /// can) through one. The refusals keep the credential itself off the
 /// token, login codes, peers, machines and the `/m/` proxy, off the file
-/// import, and off this hub's plugins, settings, and config (a machine's
-/// UI is its own hub's).
+/// import, off this hub's plugins, settings, and config (a machine's
+/// UI is its own hub's), and off its share links and recordings (a
+/// machine's sessions are shared and recorded from that machine).
 pub fn peer_forbidden(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
@@ -260,8 +261,17 @@ pub fn peer_forbidden(path: &str) -> bool {
         || under("/api/settings")
         || under("/api/config")
         || under("/api/shares")
+        || under("/api/recordings")
+        || is_record_control(path)
         || under("/m")
         || !path.starts_with("/api")
+}
+
+/// `/api/sessions/{id}/record/...` (start and stop recording a session).
+fn is_record_control(path: &str) -> bool {
+    path.strip_prefix("/api/sessions/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, tail)| tail == "record" || tail.starts_with("record/"))
 }
 
 /// A running hub's peers: the store behind peer authentication and
@@ -488,6 +498,10 @@ mod tests {
             "/api/config",
             "/api/shares",
             "/api/shares/abc",
+            "/api/recordings",
+            "/api/recordings/x.cast",
+            "/api/sessions/abc/record/start",
+            "/api/sessions/abc/record/stop",
             "/m/b/api/sessions",
             "/",
             "/login",

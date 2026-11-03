@@ -200,6 +200,57 @@ pub fn parse_ttl(raw: &str) -> Result<Duration, String> {
     Ok(ttl)
 }
 
+/// An expiry written back the way [`parse_ttl`] reads it (`1h`, `30d`,
+/// `1h30m`, `90s`).
+pub fn format_ttl(ttl: Duration) -> String {
+    let mut left = ttl.as_secs();
+    if left == 0 {
+        return "0s".into();
+    }
+    let mut text = String::new();
+    for (unit, size) in [("d", 86_400), ("h", 3600), ("m", 60), ("s", 1)] {
+        if left >= size {
+            text.push_str(&format!("{}{unit}", left / size));
+            left %= size;
+        }
+    }
+    text
+}
+
+/// How long new share links last: the expiry one gets when it names none,
+/// and the longest one may name (`hub.toml` `[shares]`; both within
+/// [`MIN_TTL`]..=[`MAX_TTL`], the default no longer than the longest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharePolicy {
+    pub default_ttl: Duration,
+    pub max_ttl: Duration,
+}
+
+impl Default for SharePolicy {
+    fn default() -> Self {
+        Self {
+            default_ttl: DEFAULT_TTL,
+            max_ttl: MAX_TTL,
+        }
+    }
+}
+
+impl SharePolicy {
+    /// The expiry a new link gets: `asked`, else the default; refused
+    /// past the longest allowed (or under [`MIN_TTL`]).
+    pub fn expiry(&self, asked: Option<Duration>) -> Result<Duration, String> {
+        let ttl = asked.unwrap_or(self.default_ttl);
+        if ttl < MIN_TTL || ttl > self.max_ttl {
+            return Err(format!(
+                "an expiry is {} to {} on this hub",
+                format_ttl(MIN_TTL),
+                format_ttl(self.max_ttl)
+            ));
+        }
+        Ok(ttl)
+    }
+}
+
 /// This hub's shares, as on disk.
 #[derive(Debug, Default)]
 struct Shares {
@@ -606,6 +657,28 @@ pub fn list_offline(state_dir: &Path) -> Result<Vec<ShareInfo>, ShareError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiries_round_trip_and_the_policy_bounds_them() {
+        for raw in ["90s", "30m", "1h", "1h30m", "2d", "30d", "1d1h1m1s"] {
+            let ttl = parse_ttl(raw).unwrap();
+            assert_eq!(parse_ttl(&format_ttl(ttl)).unwrap(), ttl, "{raw}");
+        }
+        assert_eq!(format_ttl(Duration::from_secs(7 * 86_400)), "7d");
+        let policy = SharePolicy {
+            default_ttl: Duration::from_secs(600),
+            max_ttl: Duration::from_secs(3600),
+        };
+        assert_eq!(policy.expiry(None).unwrap(), Duration::from_secs(600));
+        assert_eq!(
+            policy.expiry(Some(Duration::from_secs(3600))).unwrap(),
+            Duration::from_secs(3600)
+        );
+        let refused = policy.expiry(Some(Duration::from_secs(3601))).unwrap_err();
+        assert!(refused.contains("1h"), "{refused}");
+        assert!(policy.expiry(Some(Duration::from_secs(59))).is_err());
+        assert_eq!(SharePolicy::default().max_ttl, MAX_TTL);
+    }
 
     #[test]
     fn issue_verify_expire_and_revoke() {

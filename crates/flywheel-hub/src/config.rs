@@ -60,6 +60,10 @@ pub struct FileConfig {
     pub agents: AgentsSection,
     #[serde(default)]
     pub plugins: PluginsSection,
+    #[serde(default)]
+    pub recordings: RecordingsSection,
+    #[serde(default)]
+    pub shares: SharesSection,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -127,6 +131,56 @@ pub struct PluginsSection {
     pub max_concurrent: Option<usize>,
 }
 
+/// Session recordings' caps: sizes as bytes or with a unit (`"64MiB"`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingsSection {
+    pub part_cap: Option<SizeSetting>,
+    pub dir_cap: Option<SizeSetting>,
+}
+
+/// New share links' expiry: durations (`"1h"`, `"7d"`) or seconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharesSection {
+    pub default_expiry: Option<DurationSetting>,
+    pub max_expiry: Option<DurationSetting>,
+}
+
+/// A size in the file: a number of bytes, or text with a unit.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SizeSetting {
+    Bytes(u64),
+    Text(String),
+}
+
+impl SizeSetting {
+    fn bytes(&self) -> Result<u64, String> {
+        match self {
+            Self::Bytes(n) => Ok(*n),
+            Self::Text(text) => crate::record::parse_size(text),
+        }
+    }
+}
+
+/// A duration in the file: seconds, or text like `1h30m`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DurationSetting {
+    Seconds(u64),
+    Text(String),
+}
+
+impl DurationSetting {
+    fn duration(&self) -> Result<Duration, String> {
+        match self {
+            Self::Seconds(n) => crate::share::parse_ttl(&n.to_string()),
+            Self::Text(text) => crate::share::parse_ttl(text),
+        }
+    }
+}
+
 /// What `fw hub serve` was given on its command line (`None` / empty /
 /// `false`: not given, so the file or the default decides).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -142,6 +196,10 @@ pub struct Flags {
     pub no_flywheel: bool,
     pub import_root: Option<PathBuf>,
     pub worktree_branch_prefix: Option<String>,
+    pub record_part_cap: Option<u64>,
+    pub record_dir_cap: Option<u64>,
+    pub share_default_expiry: Option<Duration>,
+    pub share_max_expiry: Option<Duration>,
 }
 
 /// Where an effective value came from.
@@ -214,6 +272,8 @@ pub struct Tunables {
     pub worktree_branch_prefix: String,
     pub import_root: Option<PathBuf>,
     pub agent_defaults: AgentDefaults,
+    pub record_limits: crate::record::RecordLimits,
+    pub share_policy: crate::share::SharePolicy,
 }
 
 /// Every setting resolved, with where each came from.
@@ -233,6 +293,8 @@ pub struct Effective {
     pub agent_defaults: AgentDefaults,
     pub plugins_enabled: bool,
     pub plugins_max_concurrent: usize,
+    pub record_limits: crate::record::RecordLimits,
+    pub share_policy: crate::share::SharePolicy,
     sources: Vec<(&'static str, Source)>,
 }
 
@@ -265,6 +327,10 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("agents.codex.sandbox", Apply::Live),
     ("plugins.enabled", Apply::Live),
     ("plugins.max_concurrent", Apply::Restart),
+    ("recordings.part_cap", Apply::Live),
+    ("recordings.dir_cap", Apply::Live),
+    ("shares.default_expiry", Apply::Live),
+    ("shares.max_expiry", Apply::Live),
 ];
 
 impl Effective {
@@ -282,6 +348,8 @@ impl Effective {
             worktree_branch_prefix: self.worktree_branch_prefix.clone(),
             import_root: self.import_root.clone(),
             agent_defaults: self.agent_defaults.clone(),
+            record_limits: self.record_limits,
+            share_policy: self.share_policy,
         }
     }
 
@@ -315,6 +383,20 @@ impl Effective {
             "agents.codex.sandbox" => opt(&self.agent_defaults.codex.sandbox),
             "plugins.enabled" => json!(self.plugins_enabled),
             "plugins.max_concurrent" => json!(self.plugins_max_concurrent),
+            "recordings.part_cap" => {
+                json!(crate::record::format_size(
+                    self.record_limits.max_file_bytes
+                ))
+            }
+            "recordings.dir_cap" => {
+                json!(crate::record::format_size(
+                    self.record_limits.max_total_bytes
+                ))
+            }
+            "shares.default_expiry" => {
+                json!(crate::share::format_ttl(self.share_policy.default_ttl))
+            }
+            "shares.max_expiry" => json!(crate::share::format_ttl(self.share_policy.max_ttl)),
             _ => Value::Null,
         }
     }
@@ -598,6 +680,8 @@ pub fn resolve(
         file_concurrency,
         DEFAULT_PLUGIN_CONCURRENCY
     );
+    let (record_limits, share_policy) =
+        resolve_recordings_and_shares(file, flags, &mut sources, &mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -616,8 +700,114 @@ pub fn resolve(
         agent_defaults: AgentDefaults { claude, codex },
         plugins_enabled,
         plugins_max_concurrent,
+        record_limits,
+        share_policy,
         sources,
     })
+}
+
+/// `[recordings]` and `[shares]`, flag over file over default, each value
+/// in its bounds and the pair consistent (the directory holds at least a
+/// part; the default expiry is no longer than the longest).
+fn resolve_recordings_and_shares(
+    file: &FileConfig,
+    flags: &Flags,
+    sources: &mut Vec<(&'static str, Source)>,
+    errors: &mut Vec<String>,
+) -> (crate::record::RecordLimits, crate::share::SharePolicy) {
+    use crate::record::{
+        DEFAULT_MAX_FILE_BYTES, DEFAULT_MAX_TOTAL_BYTES, MAX_DIR_BYTES, MAX_PART_BYTES,
+        MIN_PART_BYTES, RecordLimits, format_size,
+    };
+    use crate::share::{DEFAULT_TTL, MAX_TTL, SharePolicy, format_ttl};
+    let mut pick = |key: &'static str, flag: Option<u64>, file: Option<u64>, default: u64| {
+        let (value, source) = match (flag, file) {
+            (Some(v), _) => (v, Source::Flag),
+            (None, Some(v)) => (v, Source::File),
+            (None, None) => (default, Source::Default),
+        };
+        sources.push((key, source));
+        value
+    };
+    let mut size = |key: &str, setting: &Option<SizeSetting>| {
+        setting.as_ref().and_then(|s| match s.bytes() {
+            Ok(n) => Some(n),
+            Err(message) => {
+                errors.push(format!("{key}: {message}"));
+                None
+            }
+        })
+    };
+    let file_part = size("recordings.part_cap", &file.recordings.part_cap);
+    let file_dir = size("recordings.dir_cap", &file.recordings.dir_cap);
+    let mut duration = |key: &str, setting: &Option<DurationSetting>| {
+        setting.as_ref().and_then(|s| match s.duration() {
+            Ok(d) => Some(d.as_secs()),
+            Err(message) => {
+                errors.push(format!("{key}: {message}"));
+                None
+            }
+        })
+    };
+    let file_default = duration("shares.default_expiry", &file.shares.default_expiry);
+    let file_max = duration("shares.max_expiry", &file.shares.max_expiry);
+    let part = pick(
+        "recordings.part_cap",
+        flags.record_part_cap,
+        file_part,
+        DEFAULT_MAX_FILE_BYTES,
+    );
+    let dir = pick(
+        "recordings.dir_cap",
+        flags.record_dir_cap,
+        file_dir,
+        DEFAULT_MAX_TOTAL_BYTES,
+    );
+    let default_ttl = pick(
+        "shares.default_expiry",
+        flags.share_default_expiry.map(|d| d.as_secs()),
+        file_default,
+        DEFAULT_TTL.as_secs(),
+    );
+    let max_ttl = pick(
+        "shares.max_expiry",
+        flags.share_max_expiry.map(|d| d.as_secs()),
+        file_max,
+        MAX_TTL.as_secs(),
+    );
+    if !(MIN_PART_BYTES..=MAX_PART_BYTES).contains(&part) {
+        errors.push(format!(
+            "recordings.part_cap: {} is outside {}..={}",
+            format_size(part),
+            format_size(MIN_PART_BYTES),
+            format_size(MAX_PART_BYTES)
+        ));
+    } else if dir < part || dir > MAX_DIR_BYTES {
+        errors.push(format!(
+            "recordings.dir_cap: {} is outside {}..={} (at least recordings.part_cap)",
+            format_size(dir),
+            format_size(part),
+            format_size(MAX_DIR_BYTES)
+        ));
+    }
+    // Each expiry is already within MIN_TTL..=MAX_TTL (parse_ttl).
+    if default_ttl > max_ttl {
+        errors.push(format!(
+            "shares.default_expiry: {} is longer than shares.max_expiry ({})",
+            format_ttl(Duration::from_secs(default_ttl)),
+            format_ttl(Duration::from_secs(max_ttl))
+        ));
+    }
+    (
+        RecordLimits {
+            max_file_bytes: part,
+            max_total_bytes: dir,
+        },
+        SharePolicy {
+            default_ttl: Duration::from_secs(default_ttl),
+            max_ttl: Duration::from_secs(max_ttl),
+        },
+    )
 }
 
 /// A kind's launch defaults, validated as a launch of that kind is.
@@ -952,6 +1142,14 @@ sandbox = "workspace-write"
 [plugins]
 enabled = true                    # live: off runs no plugin
 max_concurrent = 4                # restart
+
+[recordings]                      # live: running recordings too
+part_cap = "64MiB"                # a part past it rotates (64KiB..4GiB)
+dir_cap = "1GiB"                  # oldest finished recordings go past it
+
+[shares]                          # live: links made from now on
+default_expiry = "1h"             # a link naming no expiry
+max_expiry = "30d"                # the longest one may name (60s..30d)
 "#;
 
 #[cfg(test)]

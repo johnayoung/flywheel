@@ -307,6 +307,7 @@ async fn a_share_link_is_a_read_only_view_of_its_one_session() {
         ("vendor/xterm/xterm.js", StatusCode::OK),
         ("app.js", StatusCode::FORBIDDEN),
         ("sharing.js", StatusCode::FORBIDDEN),
+        ("settings.js", StatusCode::FORBIDDEN),
     ] {
         let response = hub
             .http
@@ -321,6 +322,9 @@ async fn a_share_link_is_a_read_only_view_of_its_one_session() {
         (reqwest::Method::GET, "/screen"),
         (reqwest::Method::POST, "/paste"),
         (reqwest::Method::GET, "/api/sessions"),
+        (reqwest::Method::GET, "/api/settings"),
+        (reqwest::Method::GET, "/api/plugins"),
+        (reqwest::Method::GET, "/api/config"),
     ] {
         let response = hub
             .http
@@ -350,6 +354,13 @@ async fn a_share_link_is_a_read_only_view_of_its_one_session() {
         &format!("/api/sessions/{sid}/screen"),
         "/api/shares",
         "/api/whoami",
+        // Settings, plugins, hub.toml, and recordings are the operator's.
+        "/api/settings",
+        "/api/settings/keys/check",
+        "/api/plugins",
+        "/api/plugins/hello/logs",
+        "/api/config",
+        "/api/recordings",
         "/",
         "/assets/app.js",
         "/replay",

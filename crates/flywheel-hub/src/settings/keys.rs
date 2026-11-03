@@ -124,6 +124,18 @@ pub const ACTIONS: &[ActionSpec] = &[
         &["alt+w"],
     ),
     global(
+        "share.open",
+        "Sessions",
+        "Share the attached session (read-only link)",
+        &[],
+    ),
+    global(
+        "record.toggle",
+        "Sessions",
+        "Start or stop recording the attached session",
+        &[],
+    ),
+    global(
         "commands.toggle",
         "Agents",
         "Suggested commands drawer",

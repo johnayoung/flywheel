@@ -70,6 +70,10 @@ pub const EVENTS: &[&str] = &[
     "review.rebased",
     "review.merged",
     "fanout.finished",
+    "share.created",
+    "share.revoked",
+    "record.started",
+    "record.stopped",
 ];
 const STATUSES: &[&str] = &["working", "blocked", "done", "idle", "unknown"];
 const KINDS: &[&str] = &["shell", "claude", "codex"];

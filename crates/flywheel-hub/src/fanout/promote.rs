@@ -9,7 +9,11 @@
 //! `crate::flywheel::FlywheelProvider`), never as hand-rolled JSON here:
 //!
 //! * the goal: the request's, else the seeding task's, else the prompt's
-//!   first line; the whole prompt goes into `context.notes`;
+//!   first line; the whole prompt goes into `context.notes` -- unless the
+//!   fan-out was seeded from a task with its prompt unedited: then that
+//!   task's context, field for field (a seeded fan-out promotes only under
+//!   an explicitly named new id: the task it came from is the durable one,
+//!   which `fw worker` re-verifies as it is);
 //! * the fan-out's graders: command graders, in order (held-out ones stay
 //!   in the held-out registry: a task's graders are shown to its agent);
 //! * protected paths: `context.constraints` lines; what enforces them in
@@ -28,9 +32,11 @@
 //!
 //! **Seed** ("Fan out this task", `fw hub fanout new --from-task`): a
 //! fan-out from a task's goal and context plus its command graders and
-//! its held-out graders ([`seeded`]). Held-out graders run like the others
-//! but never reach an agent: the prompt must not name them, and "ask to
-//! fix" says only that a held-out check failed.
+//! its held-out graders ([`seeded`]), held to the repo's protected paths.
+//! Held-out graders run like the others but are kept out of what the hub
+//! tells an agent: the prompt must not name them, and "ask to fix" says
+//! only that a held-out check failed (an agent running as the operator's
+//! user could still read them on disk, as with the worker's gate).
 
 use super::{CreateFanout, Fanout, GraderInput, GraderSpec};
 use chrono::{DateTime, Utc};
@@ -41,6 +47,24 @@ use std::path::PathBuf;
 pub const MAX_GOAL_CHARS: usize = 600;
 /// The tag every promoted task carries.
 pub const PROMOTED_TAG: &str = "hub-fanout";
+
+/// A task's `context`, field for field (what a promotion of a fan-out
+/// seeded from it, prompt unedited, writes back).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedContext {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relevant: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub constraints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_goals: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edge_cases: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
+}
 
 /// The flywheel task a fan-out was seeded from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +84,19 @@ pub struct TaskOrigin {
     /// transcript): the worker still applies them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_run: Vec<String>,
+    /// The task's context and tags as defined.
+    #[serde(default)]
+    pub context: SeedContext,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// The fan-out's prompt is the task's own, unedited: a promotion
+    /// writes the task's context back instead of the prompt.
+    #[serde(default)]
+    pub prompt_seeded: bool,
+    /// The protected paths that came from the repo's `[submit]
+    /// protected_paths` (the loop enforces those already).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repo_protect: Vec<String>,
 }
 
 /// A task file written from a fan-out.
@@ -75,6 +112,80 @@ pub struct Promotion {
     pub at: DateTime<Utc>,
 }
 
+/// Where a promoted task file is now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotedState {
+    /// Still under `active/<phase>/`: the loop has not archived it.
+    Active,
+    /// Its phase was archived (`archive/<phase>[-N]/`): done and landed.
+    Archived,
+    /// Neither: removed or moved by hand.
+    Gone,
+}
+
+/// A [`Promotion`] as a board shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PromotedView {
+    #[serde(flatten)]
+    pub promotion: Promotion,
+    pub state: PromotedState,
+    /// Where the file is now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<PathBuf>,
+}
+
+impl Promotion {
+    /// Where its file is now: where it was written, else where archiving
+    /// its phase moved it (`<tasks>/archive/<phase>` or `<phase>-N`).
+    pub fn view(&self) -> PromotedView {
+        let (state, current) = if self.path.is_file() {
+            (PromotedState::Active, Some(self.path.clone()))
+        } else {
+            match self.archived() {
+                Some(path) => (PromotedState::Archived, Some(path)),
+                None => (PromotedState::Gone, None),
+            }
+        };
+        PromotedView {
+            promotion: self.clone(),
+            state,
+            current,
+        }
+    }
+
+    fn archived(&self) -> Option<PathBuf> {
+        let file = self.path.file_name()?;
+        let phase_dir = self.path.parent()?;
+        let active = phase_dir.parent()?;
+        if active.file_name()? != "active" {
+            return None;
+        }
+        let archive = active.parent()?.join("archive");
+        let mut found: Option<(u64, PathBuf)> = None;
+        for entry in std::fs::read_dir(&archive).ok()?.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rank = if name == self.phase {
+                1
+            } else {
+                match name
+                    .strip_prefix(&self.phase)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .and_then(|n| n.parse::<u64>().ok())
+                {
+                    Some(n) => n,
+                    None => continue,
+                }
+            };
+            let path = entry.path().join(file);
+            if path.is_file() && found.as_ref().is_none_or(|(best, _)| rank > *best) {
+                found = Some((rank, path));
+            }
+        }
+        found.map(|(_, path)| path)
+    }
+}
+
 // --- the provider seam's plain data ------------------------------------------
 
 /// A task definition to write, as the hub drafts it. The provider maps it
@@ -87,8 +198,14 @@ pub struct TaskDraft {
     pub phase: Option<String>,
     pub goal: String,
     pub notes: String,
+    #[serde(default)]
+    pub relevant: Vec<String>,
     pub constraints: Vec<String>,
     pub references: Vec<String>,
+    #[serde(default)]
+    pub non_goals: Vec<String>,
+    #[serde(default)]
+    pub edge_cases: Vec<String>,
     pub tags: Vec<String>,
     /// Command graders, in order.
     pub graders: Vec<GraderSpec>,
@@ -129,6 +246,10 @@ pub struct TaskWritten {
     /// The directory source lists it now (what `fw worker` and `fw status`
     /// read).
     pub listed: bool,
+    /// The other active tasks with no done run: `fw worker` drains them
+    /// too (in phase order), not only this one.
+    #[serde(default)]
+    pub queue: Vec<String>,
 }
 
 /// A flywheel task as a fan-out seed.
@@ -148,6 +269,32 @@ pub struct TaskSeed {
     pub held_out: Vec<GraderSpec>,
     /// Its graders the hub does not run (rubric, manual, transcript).
     pub not_run: Vec<String>,
+    pub context: SeedContext,
+    pub tags: Vec<String>,
+    /// What a candidate must leave unchanged: the repo's `[submit]
+    /// protected_paths` the hub can hold to (literal paths and `dir/**`),
+    /// then the paths its constraints name ([`protected_in_constraint`]).
+    pub protect: Vec<String>,
+    /// The part of `protect` from `[submit] protected_paths`.
+    pub repo_protect: Vec<String>,
+    /// `[submit] protected_paths` patterns the hub cannot hold to (globs
+    /// inside a name): the loop still refuses a landing touching them.
+    pub protect_skipped: Vec<String>,
+}
+
+/// A protected path as a task constraint line (what a promotion writes).
+pub fn constraint_line(path: &str) -> String {
+    format!(
+        "Leave `{path}` unchanged: the fan-out this task came from failed any candidate that \
+         changed it."
+    )
+}
+
+/// The path a [`constraint_line`] protects (`None`: any other constraint).
+pub fn protected_in_constraint(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("Leave `")?;
+    let (path, tail) = rest.split_once('`')?;
+    (tail.starts_with(" unchanged") && !path.trim().is_empty()).then_some(path)
 }
 
 impl TaskSeed {
@@ -169,6 +316,8 @@ impl TaskSeed {
                 .map(|(i, g)| g.name.clone().unwrap_or_else(|| format!("held-out {}", i + 1)))
                 .collect::<Vec<_>>(),
             "not_run": self.not_run,
+            "protect": self.protect,
+            "protect_skipped": self.protect_skipped,
         })
     }
 }
@@ -287,24 +436,37 @@ fn reference_of(
 /// The task a promotion of `fanout` writes, before the provider validates
 /// it (see the module doc).
 pub fn draft(fanout: &Fanout, request: &PromoteRequest) -> Result<Drafted, String> {
+    let origin = fanout.origin.as_ref();
+    let named_id = request
+        .task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if let (Some(origin), None) = (origin, named_id) {
+        // The task it came from is the durable asset already: a second
+        // task for the same intent is a deliberate choice, never a default.
+        return Err(format!(
+            "fan-out {:?} came from flywheel task {}, which stays the durable task: to verify \
+             it through the loop, run `fw worker` in {} (the Flywheel panel's Start worker); to \
+             write a separate task anyway, name its id (--task-id)",
+            fanout.name,
+            origin.task_id,
+            origin.folder.display()
+        ));
+    }
     let goal = request
         .goal
         .as_deref()
         .map(str::trim)
         .filter(|g| !g.is_empty())
         .map(cut_words)
-        .or_else(|| fanout.origin.as_ref().map(|o| o.goal.clone()))
+        .or_else(|| origin.map(|o| o.goal.clone()))
         .unwrap_or_else(|| default_goal(&fanout.prompt));
     if goal.trim().is_empty() {
         return Err("the task needs a goal: name one (the prompt has no text line)".into());
     }
     let tag = &fanout.id[..fanout.id.len().min(4)];
-    let task_id = match request
-        .task_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
+    let task_id = match named_id {
         Some(id) => id.to_owned(),
         None => {
             let base = slug(&fanout.name, 40);
@@ -342,24 +504,20 @@ pub fn draft(fanout: &Fanout, request: &PromoteRequest) -> Result<Drafted, Strin
     let mut warnings = Vec::new();
     let held = fanout.graders.len() - graders.len();
     if held > 0 {
-        let registered = fanout.origin.as_ref().map(|o| o.task_id.as_str());
-        warnings.push(match registered {
+        let (s, v) = if held == 1 { ("", "s") } else { ("s", "") };
+        warnings.push(match origin.map(|o| o.task_id.as_str()) {
             Some(origin) if origin != task_id => format!(
                 "{held} held-out grader{s} stay{v} out of the task file: registered for task \
                  {origin}, so they gate {origin}, not {task_id} (register them for {task_id} \
-                 with /fw-verify to gate it too)",
-                s = if held == 1 { "" } else { "s" },
-                v = if held == 1 { "s" } else { "" },
+                 with /fw-verify to gate it too)"
             ),
             _ => format!(
-                "{held} held-out grader{s} stay{v} out of the task file (the held-out gate \
-                 runs them at landing, never shown to the agent)",
-                s = if held == 1 { "" } else { "s" },
-                v = if held == 1 { "s" } else { "" },
+                "{held} held-out grader{s} stay{v} out of the task file: the held-out gate runs \
+                 only what is registered for {task_id} under [held_out] root (/fw-verify)"
             ),
         });
     }
-    if let Some(origin) = &fanout.origin
+    if let Some(origin) = origin
         && !origin.not_run.is_empty()
     {
         warnings.push(format!(
@@ -369,7 +527,43 @@ pub fn draft(fanout: &Fanout, request: &PromoteRequest) -> Result<Drafted, Strin
         ));
     }
     let reference = reference_of(fanout, request)?;
-    let mut references = Vec::new();
+    if reference.is_none() && request.reference.is_none() {
+        let passing: Vec<&str> = fanout
+            .candidates
+            .iter()
+            .filter(|c| {
+                c.grade
+                    .as_ref()
+                    .is_some_and(|g| g.passed && !g.no_change() && g.head.is_some())
+            })
+            .map(|c| c.label.as_str())
+            .collect();
+        if let Some(first) = passing.first() {
+            warnings.push(format!(
+                "no winner picked, so no reference commit: {} passed every grader (name one \
+                 with --reference {first}, or the Reference commit choice)",
+                passing.join(", ")
+            ));
+        }
+    }
+    // Seeded from a task, prompt unedited: that task's context, field for
+    // field, instead of the prompt drawn from it.
+    let carried = origin.filter(|o| o.prompt_seeded).map(|o| &o.context);
+    let mut context = carried.cloned().unwrap_or_default();
+    if carried.is_none() {
+        if let Some(o) = origin {
+            context.relevant.clone_from(&o.context.relevant);
+        }
+        context.notes = format!(
+            "Promoted from the hub's verified fan-out \"{name}\" ({id}, base {base} at \
+             {base_sha}). The prompt its agents got:\n\n{prompt}",
+            name = fanout.name,
+            id = &fanout.id[..fanout.id.len().min(8)],
+            base = fanout.base,
+            base_sha = &fanout.base_sha[..fanout.base_sha.len().min(12)],
+            prompt = fanout.prompt.trim_end(),
+        );
+    }
     if let Some((label, head)) = &reference {
         let candidate = fanout.candidate(label);
         let branch = candidate.map_or("", |c| c.worktree.branch.as_str());
@@ -377,45 +571,47 @@ pub fn draft(fanout: &Fanout, request: &PromoteRequest) -> Result<Drafted, Strin
             Some(model) => format!(", {}:{model}", c.kind.as_str()),
             None => format!(", {}", c.kind.as_str()),
         });
-        references.push(format!(
+        let seeded = origin.map_or_else(String::new, |o| {
+            format!(" (seeded from flywheel task {})", o.task_id)
+        });
+        context.references.push(format!(
             "Commit {head} (branch {branch}, fan-out candidate {label}{agent}) passed every \
-             grader of the hub fan-out \"{name}\" from {base} at {base_sha}. It is prior work \
-             to consult (`git show {short}`), not the solution to copy: this task must pass \
-             its graders on its own.",
+             grader of the hub fan-out \"{name}\"{seeded} from {base} at {base_sha}. It is \
+             prior work to consult (`git show {short}`), not the solution to copy: this task \
+             must pass its graders on its own.",
             name = fanout.name,
             base = fanout.base,
             base_sha = &fanout.base_sha[..fanout.base_sha.len().min(12)],
             short = &head[..head.len().min(12)],
         ));
     }
-    let constraints = fanout
-        .protect
-        .iter()
-        .map(|p| {
-            format!(
-                "Leave `{p}` unchanged: the fan-out this task came from failed any candidate \
-                 that changed it."
-            )
-        })
-        .collect();
-    let notes = format!(
-        "Promoted from the hub's verified fan-out \"{name}\" ({id}, base {base} at \
-         {base_sha}). The prompt its agents got:\n\n{prompt}",
-        name = fanout.name,
-        id = &fanout.id[..fanout.id.len().min(8)],
-        base = fanout.base,
-        base_sha = &fanout.base_sha[..fanout.base_sha.len().min(12)],
-        prompt = fanout.prompt.trim_end(),
-    );
+    let repo_protect = origin.map_or(&[][..], |o| o.repo_protect.as_slice());
+    for path in &fanout.protect {
+        let line = constraint_line(path);
+        let stated = context
+            .constraints
+            .iter()
+            .any(|c| protected_in_constraint(c) == Some(path.as_str()));
+        if !repo_protect.contains(path) && !stated {
+            context.constraints.push(line);
+        }
+    }
+    let mut tags = origin.map(|o| o.tags.clone()).unwrap_or_default();
+    if !tags.iter().any(|t| t == PROMOTED_TAG) {
+        tags.push(PROMOTED_TAG.to_owned());
+    }
     Ok(Drafted {
         draft: TaskDraft {
             task_id,
             phase,
             goal,
-            notes,
-            constraints,
-            references,
-            tags: vec![PROMOTED_TAG.to_owned()],
+            notes: context.notes,
+            relevant: context.relevant,
+            constraints: context.constraints,
+            references: context.references,
+            non_goals: context.non_goals,
+            edge_cases: context.edge_cases,
+            tags,
             graders,
             protect: fanout.protect.clone(),
         },
@@ -441,34 +637,44 @@ pub fn fingerprint(plan: &TaskFilePlan) -> String {
 
 // --- seed -------------------------------------------------------------------------
 
-/// The words of a held-out grader an agent must never be shown: its whole
-/// command and every absolute path in it (the oracle script).
-fn secret_words(grader: &GraderSpec) -> Vec<&str> {
-    let mut words = vec![grader.run.trim()];
-    words.extend(
-        grader
-            .run
-            .split_whitespace()
-            .map(|w| w.trim_matches(|c| c == '\'' || c == '"' || c == ';'))
-            .filter(|w| w.starts_with('/') && w.len() > 1),
-    );
+/// The words of a held-out grader command an agent must never be shown:
+/// the whole command, every absolute path in it (the oracle script), and
+/// those paths' file names (`exact.sh`).
+pub(crate) fn secret_words(run: &str) -> Vec<&str> {
+    let mut words = vec![run.trim()];
+    for word in run
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == '('))
+        .filter(|w| w.starts_with('/') && w.len() > 1)
+    {
+        words.push(word);
+        if let Some(name) = word.rsplit('/').next().filter(|n| n.len() >= 3) {
+            words.push(name);
+        }
+    }
+    words.retain(|w| !w.is_empty());
     words
 }
 
 /// `request` seeded from `seed` (its `from_task`): the task's prompt when
 /// it brings none, its command graders when it brings none, then its
 /// held-out graders (always, marked held out; a request grader running the
-/// same command is replaced by it). Refused when the prompt names a
-/// held-out grader.
+/// same command is replaced by it), and the task's protected paths.
+/// Refused when the prompt names a held-out grader, or nothing is left to
+/// grade with.
 pub fn seeded(mut request: CreateFanout, seed: &TaskSeed) -> Result<CreateFanout, String> {
+    let prompt_seeded =
+        request.prompt.trim().is_empty() || request.prompt.trim() == seed.prompt.trim();
     if request.prompt.trim().is_empty() {
         request.prompt.clone_from(&seed.prompt);
     }
     for held in &seed.held_out {
-        if let Some(word) = secret_words(held)
-            .into_iter()
-            .find(|w| !w.is_empty() && request.prompt.contains(w))
-        {
+        // A bare file name the task's own prompt already says is public
+        // to the loop's agent too; a command or path never is.
+        if let Some(word) = secret_words(&held.run).into_iter().find(|w| {
+            request.prompt.contains(w)
+                && !(!w.contains('/') && *w != held.run.trim() && seed.prompt.contains(w))
+        }) {
             return Err(format!(
                 "the prompt names a held-out grader of task {} ({word:?}): held-out graders \
                  run, but are never shown to the agents",
@@ -492,6 +698,12 @@ pub fn seeded(mut request: CreateFanout, seed: &TaskSeed) -> Result<CreateFanout
         };
         !held_runs.contains(&run)
     });
+    // Held out is the registry's to say, never the request's.
+    for input in &mut request.graders {
+        if let GraderInput::Spec(spec) = input {
+            spec.held_out = false;
+        }
+    }
     request.graders.extend(seed.held_out.iter().map(|g| {
         GraderInput::Spec(GraderSpec {
             run: g.run.clone(),
@@ -499,6 +711,26 @@ pub fn seeded(mut request: CreateFanout, seed: &TaskSeed) -> Result<CreateFanout
             held_out: true,
         })
     }));
+    if request.graders.is_empty() {
+        return Err(if seed.not_run.is_empty() {
+            format!(
+                "task {} has no command grader for the hub to run: add one (--grader)",
+                seed.task_id
+            )
+        } else {
+            format!(
+                "task {}'s graders ({}) are not ones the hub runs (it runs command graders; \
+                 the worker applies the others): add a command grader (--grader)",
+                seed.task_id,
+                seed.not_run.join(", ")
+            )
+        });
+    }
+    for path in &seed.protect {
+        if !request.protect.iter().any(|p| p.trim() == path) {
+            request.protect.push(path.clone());
+        }
+    }
     if request.name.as_deref().is_none_or(|n| n.trim().is_empty()) {
         request.name = Some(seed.task_id.clone());
     }
@@ -512,6 +744,10 @@ pub fn seeded(mut request: CreateFanout, seed: &TaskSeed) -> Result<CreateFanout
         digest: seed.digest.clone(),
         held_out: seed.held_out.len(),
         not_run: seed.not_run.clone(),
+        context: seed.context.clone(),
+        tags: seed.tags.clone(),
+        prompt_seeded,
+        repo_protect: seed.repo_protect.clone(),
     });
     Ok(request)
 }
@@ -623,6 +859,11 @@ mod tests {
             "held-out graders stay out of the task file"
         );
         assert!(none.warnings[0].contains("1 held-out grader stays out"));
+        assert!(
+            none.warnings[1].contains("no winner picked") && none.warnings[1].contains("c1"),
+            "a passing candidate is offered as a reference: {:?}",
+            none.warnings
+        );
         assert!(none.draft.constraints[0].contains("`check.sh`"));
         assert_eq!(none.reference, None, "no winner, none named: no reference");
         assert!(none.draft.references.is_empty());
@@ -730,6 +971,16 @@ mod tests {
                 false,
             )],
             not_run: vec!["rubric".into()],
+            context: SeedContext {
+                relevant: vec!["answer.txt".into()],
+                constraints: vec![constraint_line("README.md"), "No new files.".into()],
+                notes: "Promoted from the hub's verified fan-out \"first\" (x).".into(),
+                ..SeedContext::default()
+            },
+            tags: vec!["core".into(), PROMOTED_TAG.into()],
+            protect: vec!["flywheel.toml".into(), ".github".into(), "README.md".into()],
+            repo_protect: vec!["flywheel.toml".into(), ".github".into()],
+            protect_skipped: vec!["*.lock".into()],
         }
     }
 
@@ -806,5 +1057,180 @@ mod tests {
                 .validated()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_client_cannot_mark_a_grader_held_out() {
+        let r = request("x", Vec::new());
+        let mut plain = r.clone();
+        plain.from_task = None;
+        plain.graders = vec![
+            GraderInput::Run("cargo test".into()),
+            GraderInput::Spec(spec("sh check.sh", None, true)),
+        ];
+        let graders = plain.validated().unwrap().graders;
+        assert!(
+            graders.iter().all(|g| !g.held_out),
+            "only the registry makes a grader held out: {graders:?}"
+        );
+        // Through a seed too: a request's own held-out mark is dropped.
+        let s = seed();
+        let marked = seeded(
+            request(
+                "x",
+                vec![GraderInput::Spec(spec("sh check.sh", None, true))],
+            ),
+            &s,
+        )
+        .unwrap();
+        let graders = marked.validated().unwrap().graders;
+        assert_eq!(
+            graders
+                .iter()
+                .map(|g| (g.run.as_str(), g.held_out))
+                .collect::<Vec<_>>(),
+            [
+                ("sh check.sh", false),
+                (
+                    "python3 /abs/.flywheel/verification/held-out/oracle.py",
+                    true
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn a_seed_brings_the_task_protected_paths_and_says_when_nothing_runs() {
+        let s = seed();
+        let r = seeded(request("", Vec::new()), &s).unwrap();
+        assert_eq!(r.protect, ["flywheel.toml", ".github", "README.md"]);
+        let valid = r.validated().unwrap();
+        assert_eq!(valid.protect, ["flywheel.toml", ".github", "README.md"]);
+        let origin = r.origin.unwrap();
+        assert!(origin.prompt_seeded);
+        assert_eq!(origin.repo_protect, ["flywheel.toml", ".github"]);
+        assert!(
+            !seeded(request("my own words", Vec::new()), &s)
+                .unwrap()
+                .origin
+                .unwrap()
+                .prompt_seeded
+        );
+
+        // The oracle's file name alone is a leak too.
+        let named = seeded(request("make oracle.py happy", Vec::new()), &s).unwrap_err();
+        assert!(named.contains("oracle.py"), "{named}");
+
+        let mut rubric = seed();
+        rubric.graders.clear();
+        rubric.held_out.clear();
+        rubric.not_run = vec!["rubric friendly".into()];
+        let err = seeded(request("", Vec::new()), &rubric).unwrap_err();
+        assert!(
+            err.contains("rubric friendly") && err.contains("not ones the hub runs"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn promoting_a_seeded_fan_out_keeps_the_task_structure() {
+        let s = seed();
+        let r = seeded(request("", Vec::new()), &s).unwrap();
+        let mut f = fanout();
+        f.prompt = r.prompt.clone();
+        f.protect = r.validated().unwrap().protect;
+        f.graders = vec![
+            spec("cargo test", Some("tests"), false),
+            spec(&s.held_out[0].run, None, true),
+        ];
+        f.origin = r.origin.clone();
+
+        // The task it came from is the durable one: no duplicate by default.
+        let refused = draft(&f, &PromoteRequest::default()).unwrap_err();
+        assert!(
+            refused.contains("came from flywheel task answer") && refused.contains("fw worker"),
+            "{refused}"
+        );
+
+        let named = PromoteRequest {
+            task_id: Some("answer-two".into()),
+            ..PromoteRequest::default()
+        };
+        let d = draft(&f, &named).unwrap().draft;
+        assert_eq!(d.goal, "Answer 42");
+        assert_eq!(d.relevant, ["answer.txt"]);
+        assert_eq!(
+            d.constraints,
+            [constraint_line("README.md"), "No new files.".to_owned()],
+            "the task's constraints as they were, the repo's protected paths not repeated"
+        );
+        assert_eq!(
+            d.notes.matches("Promoted from").count(),
+            1,
+            "never nested: {}",
+            d.notes
+        );
+        assert!(!d.notes.contains("# Goal"), "{}", d.notes);
+        assert_eq!(d.tags, ["core", PROMOTED_TAG]);
+
+        // An edited prompt is what the agents got: it becomes the notes.
+        f.origin.as_mut().unwrap().prompt_seeded = false;
+        f.prompt = "Do it my way.".into();
+        let edited = draft(&f, &named).unwrap().draft;
+        assert!(edited.notes.ends_with("Do it my way."), "{}", edited.notes);
+        assert_eq!(edited.relevant, ["answer.txt"]);
+    }
+
+    #[test]
+    fn a_promotion_view_follows_the_file_into_the_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("tasks/active/03-x");
+        std::fs::create_dir_all(&active).unwrap();
+        let path = active.join("x.json");
+        std::fs::write(&path, "{}").unwrap();
+        let promotion = Promotion {
+            task_id: "x".into(),
+            phase: "03-x".into(),
+            path: path.clone(),
+            reference: None,
+            at: Utc::now(),
+        };
+        assert_eq!(promotion.view().state, PromotedState::Active);
+        let archived = dir.path().join("tasks/archive/03-x-2");
+        std::fs::create_dir_all(dir.path().join("tasks/archive")).unwrap();
+        std::fs::rename(&active, &archived).unwrap();
+        let view = promotion.view();
+        assert_eq!(view.state, PromotedState::Archived);
+        assert_eq!(view.current, Some(archived.join("x.json")));
+        std::fs::remove_dir_all(&archived).unwrap();
+        assert_eq!(promotion.view().state, PromotedState::Gone);
+    }
+
+    #[test]
+    fn a_broken_held_out_pin_never_names_the_oracle_to_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let oracle = dir.path().join("secret-oracle.sh");
+        std::fs::write(&oracle, "grep -qx 42 answer.txt\n").unwrap();
+        let held = spec(&format!("sh '{}'", oracle.display()), None, true);
+        let (pins, _) = crate::fanout::pin_graders(
+            &[spec("true", None, false), held.clone()],
+            dir.path(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(pins.len(), 1);
+        assert!(pins[0].held_out);
+        std::fs::write(&oracle, "true\n").unwrap();
+        let why = crate::fanout::pins_broken(&pins).unwrap();
+        assert!(why.contains("1 held-out grader script"), "{why}");
+        assert!(!why.contains("secret-oracle"), "{why}");
+
+        // Whatever an error says, ask-to-fix strips a held-out grader from it.
+        let mut grade = candidate("c1", false, "1").grade.unwrap();
+        grade.error = Some(format!("grader script {} changed", oracle.display()));
+        grade.graders = vec![crate::fanout::GraderRun::skipped(&held)];
+        let prompt = crate::fanout::fix_prompt(&grade).unwrap();
+        assert!(!prompt.contains("secret-oracle"), "{prompt}");
+        assert!(prompt.contains("[held-out]"), "{prompt}");
     }
 }

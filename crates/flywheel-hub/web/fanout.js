@@ -467,7 +467,7 @@ window.FwHubFanout = function (ctx) {
       { className: "fo-graders" },
       el("span", { className: "field-label", textContent: "graders" }),
       f.graders.map((g, i) => el("code", { className: `fo-grader${g.held_out ? " held" : ""}`, title: g.held_out ? `held out: never shown to the agents, not even when asking to fix\n${g.run}` : g.run, textContent: `${i + 1}. ${g.held_out ? "[held out] " : ""}${g.name ? `${g.name}: ` : ""}${g.run}` })),
-      el("span", { className: "fo-note", textContent: `run by the hub (${f.runner || "no runner"}) in each worktree, ${f.timeout_secs}s each; held out of the prompt` }),
+      el("span", { className: "fo-note", textContent: `run by the hub (${f.runner || "no runner"}) in each worktree, ${f.timeout_secs}s each; not added to the prompt${f.origin ? " (the task's own prompt lists its visible graders; held-out ones never)" : ""}` }),
       f.protect.length ? el("span", { className: "fo-note", textContent: `protected: ${f.protect.join(", ")}` }) : null,
       ctx.task().boardNotes(f),
     );
@@ -861,7 +861,7 @@ window.FwHubFanout = function (ctx) {
       seed ? seedNote(seed) : null,
       field("Prompt", "", prompt),
       group("Agents", `${MIN}-${MAX}, a model each`, cands, addCand),
-      group("Graders", "run by the hub with /bin/sh -c in each worktree, held out of the prompt. A script named by absolute path is pinned (changed, it fails every grading); one inside the repo is protected.", graders, addGrader),
+      group("Graders", "run by the hub with /bin/sh -c in each worktree; not added to the prompt (a task's prompt lists its visible graders, as the worker's does). A script named by absolute path is pinned (changed, it fails every grading); one inside the repo is protected.", graders, addGrader),
       el("details", { className: "fo-more" },
         el("summary", { textContent: "options: permissions, timeout, protected paths" }),
         el("div", { className: "fo-two" }, field("Claude permission mode", "", mode), field("Grader timeout", "seconds, each", timeout)),
@@ -875,6 +875,7 @@ window.FwHubFanout = function (ctx) {
     if (seed) {
       name.value = seed.task_id;
       prompt.value = seed.prompt;
+      protect.value = (seed.protect || []).join("\n");
     }
     workspace.addEventListener("change", fillFolders);
     folder.addEventListener("change", loadBases);
@@ -961,6 +962,9 @@ window.FwHubFanout = function (ctx) {
         : null,
       (seed.not_run || []).length
         ? el("p", { textContent: `Not run by the hub (the worker still applies them): ${seed.not_run.join(", ")}.` })
+        : null,
+      (seed.protect_skipped || []).length
+        ? el("p", { textContent: `Protected at landing only (globs the hub cannot hold a candidate to): ${seed.protect_skipped.join(", ")}.` })
         : null);
   }
 

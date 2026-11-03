@@ -17,7 +17,9 @@ use crate::hub_flywheel::{HubFlywheel, TaskLayout};
 use flywheel_core::loaders::{load_task_data, load_task_file, load_task_str, task_digest};
 use flywheel_core::task::{Grader, Task};
 use flywheel_hub::fanout::GraderSpec;
-use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten, slug};
+use flywheel_hub::fanout::promote::{
+    SeedContext, TaskDraft, TaskFilePlan, TaskSeed, TaskWritten, protected_in_constraint, slug,
+};
 use flywheel_orchestrator::held_out_gate::HeldOutGraderSource;
 use flywheel_orchestrator::sources::{
     DirectoryWorkSource, WorkSource, iter_active_phase_dirs, iter_active_task_files,
@@ -92,8 +94,11 @@ fn next_phase(tasks_dir: &Path, task_id: &str) -> String {
 fn task_value(draft: &TaskDraft) -> Value {
     let mut context = Map::new();
     for (key, list) in [
+        ("relevant", &draft.relevant),
         ("references", &draft.references),
         ("constraints", &draft.constraints),
+        ("non_goals", &draft.non_goals),
+        ("edge_cases", &draft.edge_cases),
     ] {
         if !list.is_empty() {
             context.insert(key.into(), json!(list));
@@ -175,6 +180,14 @@ pub fn plan_task(
     let phase = match &draft.phase {
         Some(phase) => {
             check_segment("phase", phase)?;
+            if !tasks_dir.join("active").join(phase).is_dir()
+                && tasks_dir.join("archive").join(phase).is_dir()
+            {
+                return Err(format!(
+                    "phase {phase} is archived (its tasks are done and landed): name an active \
+                     phase or a new one"
+                ));
+            }
             phase.clone()
         }
         None => next_phase(&tasks_dir, &draft.task_id),
@@ -275,6 +288,9 @@ pub fn write_task(
     draft: &TaskDraft,
     contents: &str,
 ) -> Result<TaskWritten, String> {
+    // The checks plan_task makes (no such id yet) hold until the file is
+    // in place: one write at a time.
+    let _writing = provider.task_write_lock();
     let plan = plan_task(provider, folder, draft)?;
     if plan.contents != contents {
         return Err("the task file would differ from the one reviewed: review it again".into());
@@ -287,7 +303,13 @@ pub fn write_task(
     // Written aside (a dot file the walk skips), then linked into place:
     // the listing never sees half a file, and an existing file is never
     // replaced.
-    let staging = dir.join(format!(".{}.json.hub-{}", plan.task_id, std::process::id()));
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let staging = dir.join(format!(
+        ".{}.json.hub-{}-{}",
+        plan.task_id,
+        std::process::id(),
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&staging, contents)
         .map_err(|e| format!("writing {}: {e}", staging.display()))?;
     let linked = std::fs::hard_link(&staging, &plan.path);
@@ -300,17 +322,29 @@ pub fn write_task(
     })?;
     let task = load_task_file(&plan.path).map_err(|e| e.to_string())?;
     let TaskLayout { tasks_dir, .. } = provider.task_layout(folder)?;
-    let listed = DirectoryWorkSource::new(&tasks_dir)
+    let items = DirectoryWorkSource::new(&tasks_dir)
         .list_work()
-        .map_err(|e| format!("listing {}: {e}", tasks_dir.display()))?
+        .map_err(|e| format!("listing {}: {e}", tasks_dir.display()))?;
+    let listed = items
         .iter()
         .any(|item| item.task.id == task.id && item.local_path.as_deref() == Some(&plan.path));
+    // What else `fw worker` there would drain: it picks over every active
+    // task, not this one only.
+    let done = provider.done_tasks(folder)?;
+    let mut queue: Vec<String> = Vec::new();
+    for item in &items {
+        let id = &item.task.id;
+        if *id != task.id && !done.contains(id) && !queue.contains(id) {
+            queue.push(id.clone());
+        }
+    }
     Ok(TaskWritten {
         path: plan.path,
         relative: plan.relative,
         task_id: plan.task_id,
         phase: plan.phase,
         listed,
+        queue,
     })
 }
 
@@ -406,6 +440,34 @@ fn held_out_graders(
         .collect())
 }
 
+/// `[submit] protected_paths` as hub protected paths (a path or a
+/// directory, compared by content): a literal path, or `dir/**`, maps to
+/// itself / `dir`; a pattern with a glob inside a name cannot, and is
+/// returned apart (the loop still enforces it at landing).
+fn hub_protect(patterns: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut skipped = Vec::new();
+    for pattern in patterns {
+        let mut path = pattern.trim().trim_end_matches('/');
+        while let Some(dir) = path.strip_suffix("/**") {
+            path = dir;
+        }
+        let literal = !path.is_empty()
+            && !path.starts_with('/')
+            && path != "**"
+            && !path.contains(['*', '?', '['])
+            && !path.split('/').any(|p| p == ".." || p.is_empty());
+        if literal {
+            if !paths.iter().any(|p| p == path) {
+                paths.push(path.to_owned());
+            }
+        } else {
+            skipped.push(pattern.clone());
+        }
+    }
+    (paths, skipped)
+}
+
 /// See `FlywheelProvider::task_seed`.
 pub fn task_seed(provider: &HubFlywheel, folder: &Path, task_id: &str) -> Result<TaskSeed, String> {
     let layout = provider.task_layout(folder)?;
@@ -442,6 +504,19 @@ pub fn task_seed(provider: &HubFlywheel, folder: &Path, task_id: &str) -> Result
         }
     }
     let held_out = held_out_graders(&layout, folder, &task)?;
+    let (repo_protect, protect_skipped) = hub_protect(&layout.protected_paths);
+    let mut protect = repo_protect.clone();
+    for path in task
+        .context
+        .constraints
+        .iter()
+        .filter_map(|c| protected_in_constraint(c))
+    {
+        if !protect.iter().any(|p| p == path) {
+            protect.push(path.to_owned());
+        }
+    }
+    let ctx = &task.context;
     Ok(TaskSeed {
         folder: folder.to_path_buf(),
         task_id: task.id.clone(),
@@ -452,6 +527,18 @@ pub fn task_seed(provider: &HubFlywheel, folder: &Path, task_id: &str) -> Result
         graders,
         held_out,
         not_run,
+        context: SeedContext {
+            relevant: ctx.relevant.clone(),
+            references: ctx.references.clone(),
+            constraints: ctx.constraints.clone(),
+            non_goals: ctx.non_goals.clone(),
+            edge_cases: ctx.edge_cases.clone(),
+            notes: ctx.notes.clone(),
+        },
+        tags: task.tags.clone(),
+        protect,
+        repo_protect,
+        protect_skipped,
     })
 }
 
@@ -478,6 +565,9 @@ mod tests {
             phase: None,
             goal: "Make answer.txt say 42.".into(),
             notes: "The prompt:\n\nwrite 42".into(),
+            relevant: vec!["answer.txt".into()],
+            non_goals: Vec::new(),
+            edge_cases: Vec::new(),
             constraints: vec!["Leave `check.sh` unchanged.".into()],
             references: vec!["Commit abc passed.".into()],
             tags: vec!["hub-fanout".into()],
@@ -527,8 +617,9 @@ mod tests {
             value["context"]["constraints"][0],
             "Leave `check.sh` unchanged."
         );
+        assert_eq!(value["context"]["relevant"][0], "answer.txt");
         assert!(
-            value["context"].get("relevant").is_none(),
+            value["context"].get("non_goals").is_none(),
             "empty fields are left out"
         );
 
@@ -647,5 +738,120 @@ mod tests {
                 .unwrap_err()
                 .contains("no active task")
         );
+    }
+
+    #[test]
+    fn an_archived_phase_is_refused_and_the_queue_is_named() {
+        let dir = repo();
+        let root = dir.path().canonicalize().unwrap();
+        let provider = HubFlywheel::new("/bin/fw");
+        let mut into = draft("answer-42");
+        into.phase = Some("04-old".into());
+        let err = provider.plan_task(&root, &into).unwrap_err();
+        assert!(err.contains("phase 04-old is archived"), "{err}");
+
+        let plan = provider.plan_task(&root, &draft("answer-42")).unwrap();
+        let written = provider
+            .write_task(&root, &draft("answer-42"), &plan.contents)
+            .unwrap();
+        assert_eq!(
+            written.queue,
+            vec!["existing".to_owned()],
+            "the worker drains the other active task too"
+        );
+    }
+
+    #[test]
+    fn concurrent_promotions_never_define_one_id_twice() {
+        let dir = repo();
+        let root = dir.path().canonicalize().unwrap();
+        let provider = std::sync::Arc::new(HubFlywheel::new("/bin/fw"));
+        let drafts: Vec<TaskDraft> = (0..6)
+            .map(|i| {
+                let mut d = draft("answer");
+                d.phase = Some(format!("0{}-p{i}", i + 5));
+                d
+            })
+            .collect();
+        let plans: Vec<String> = drafts
+            .iter()
+            .map(|d| provider.plan_task(&root, d).unwrap().contents)
+            .collect();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(drafts.len()));
+        let handles: Vec<_> = drafts
+            .into_iter()
+            .zip(plans)
+            .map(|(d, contents)| {
+                let provider = std::sync::Arc::clone(&provider);
+                let barrier = std::sync::Arc::clone(&barrier);
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    provider.write_task(&root, &d, &contents)
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            results.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "{results:?}"
+        );
+        for err in results.iter().filter_map(|r| r.as_ref().err()) {
+            assert!(err.contains("already defined"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_seed_holds_candidates_to_the_repo_protected_paths_and_its_constraints() {
+        assert_eq!(
+            hub_protect(&[
+                ".github/**".into(),
+                "flywheel.toml".into(),
+                "*.lock".into(),
+                "src/**/*.rs".into(),
+                "**".into(),
+            ]),
+            (
+                vec![".github".to_owned(), "flywheel.toml".to_owned()],
+                vec![
+                    "*.lock".to_owned(),
+                    "src/**/*.rs".to_owned(),
+                    "**".to_owned()
+                ]
+            )
+        );
+        let dir = repo();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("flywheel.toml"),
+            "[source]\nkind = \"directory\"\n\n[submit]\nprotected_paths = [\".github/**\", \"flywheel.toml\", \"*.lock\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".flywheel/tasks/active/01-first/answer.json"),
+            serde_json::to_string(&json!({
+                "id": "answer",
+                "goal": "Make answer.txt say 42.",
+                "tags": ["core"],
+                "context": {
+                    "relevant": ["answer.txt"],
+                    "constraints": [flywheel_hub::fanout::promote::constraint_line("README.md"), "no new files"],
+                    "edge_cases": ["an empty file"],
+                },
+                "graders": [{"type": "rubric", "assertions": ["friendly"], "name": "friendly"}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let provider = HubFlywheel::new("/bin/fw");
+        let seed = provider.task_seed(&root, "answer").unwrap();
+        assert_eq!(seed.protect, [".github", "flywheel.toml", "README.md"]);
+        assert_eq!(seed.repo_protect, [".github", "flywheel.toml"]);
+        assert_eq!(seed.protect_skipped, ["*.lock"]);
+        assert_eq!(seed.context.relevant, ["answer.txt"]);
+        assert_eq!(seed.context.edge_cases, ["an empty file"]);
+        assert_eq!(seed.tags, ["core"]);
+        assert_eq!(seed.not_run, ["rubric friendly"]);
     }
 }

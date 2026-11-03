@@ -386,6 +386,19 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
     let sid = seeded["id"].as_str().unwrap().to_owned();
     assert_eq!(seeded["origin"]["task_id"], task_id.as_str());
     assert_eq!(seeded["origin"]["held_out"], 1);
+    let protect: Vec<&str> = seeded["protect"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    for path in ["README.md", "flywheel.toml", ".github"] {
+        assert!(
+            protect.contains(&path),
+            "the task's constraint and the repo's [submit] protected_paths hold the candidates: \
+             {protect:?}"
+        );
+    }
     assert_eq!(seeded["name"], task_id.as_str());
     assert_eq!(
         graders(&seeded["graders"]),
@@ -443,6 +456,16 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
         "{prompt}"
     );
 
+    // The task it came from is the durable one: promoting it again needs
+    // a new id, named on purpose.
+    let dup = env.fw(&["fanout", "promote", &sid, "--yes"]);
+    assert!(!dup.status.success());
+    let dup = String::from_utf8_lossy(&dup.stderr);
+    assert!(
+        dup.contains(&format!("came from flywheel task {task_id}")) && dup.contains("fw worker"),
+        "{dup}"
+    );
+
     // Round trip: the seeded fan-out promoted gives the task's command
     // graders back (the held-out one stays in the registry).
     let back = env.json(&[
@@ -462,6 +485,26 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
         serde_json::from_str(&read(Path::new(back["written"]["path"].as_str().unwrap()))).unwrap();
     assert_eq!(again["goal"], task["goal"]);
     assert_eq!(graders(&again["graders"]), graders(&task["graders"]));
+    // Field for field, not flattened into one prompt and nested again.
+    assert_eq!(again["context"]["notes"], task["context"]["notes"]);
+    assert_eq!(
+        again["context"]["constraints"], task["context"]["constraints"],
+        "{again:#}"
+    );
+    let references = again["context"]["references"].as_array().unwrap();
+    assert_eq!(references.len(), 2, "the original's, then this fan-out's");
+    assert_eq!(references[0], task["context"]["references"][0]);
+    assert!(
+        references[1]
+            .as_str()
+            .unwrap()
+            .contains(&format!("seeded from flywheel task {task_id}"))
+    );
+    assert_eq!(
+        back["written"]["queue"],
+        serde_json::json!([task_id]),
+        "the worker would drain the original too"
+    );
     assert!(
         back["warnings"][0]
             .as_str()

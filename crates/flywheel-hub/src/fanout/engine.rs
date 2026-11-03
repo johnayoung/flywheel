@@ -1136,7 +1136,7 @@ impl Fanouts {
             warnings,
             summary: false,
             origin: fanout.origin.clone(),
-            promoted: fanout.promoted.clone(),
+            promoted: fanout.promoted.iter().map(super::Promotion::view).collect(),
         }
     }
 

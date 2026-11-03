@@ -64,7 +64,7 @@ use flywheel_orchestrator::workflow::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -90,6 +90,10 @@ pub struct HubFlywheel {
     folders: Mutex<HashMap<PathBuf, Arc<Mutex<Folder>>>>,
     /// Most recently used last.
     transcripts: Mutex<VecDeque<OpenTranscript>>,
+    /// Held across a task file's final check and write
+    /// (`crate::hub_tasks::write_task`): two promotions never both pass
+    /// the "id not defined yet" check.
+    task_writes: Mutex<()>,
 }
 
 /// A run's transcript kept warm between polls.
@@ -114,6 +118,7 @@ impl HubFlywheel {
             program: program.into(),
             folders: Mutex::new(HashMap::new()),
             transcripts: Mutex::new(VecDeque::new()),
+            task_writes: Mutex::new(()),
         }
     }
 
@@ -215,24 +220,44 @@ impl HubFlywheel {
         })
     }
 
-    /// How many runs `root`'s store holds for `task_id` (none without a
-    /// store yet).
-    pub(crate) fn task_runs(&self, root: &Path, task_id: &str) -> Result<usize, String> {
+    /// The task file write lock (see `task_writes`).
+    pub(crate) fn task_write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.task_writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// `root`'s store's runs matching `filter` (none without a store yet).
+    fn lifecycles(&self, root: &Path, filter: &LifecycleFilter) -> Result<Vec<Lifecycle>, String> {
         let state = self.folder(root);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
         let resolved = state.resolve(root)?;
         let core = match resolved.stores(root)? {
             Some(bundle) => Arc::clone(&bundle.core),
-            None => return Ok(0),
+            None => return Ok(Vec::new()),
         };
         drop(state);
+        core.list_lifecycles(filter)
+            .map_err(|e| format!("reading the store: {e}"))
+    }
+
+    /// How many runs `root`'s store holds for `task_id`.
+    pub(crate) fn task_runs(&self, root: &Path, task_id: &str) -> Result<usize, String> {
         let filter = LifecycleFilter {
             task_id: Some(task_id.to_owned()),
             ..LifecycleFilter::default()
         };
-        core.list_lifecycles(&filter)
-            .map(|runs| runs.len())
-            .map_err(|e| format!("reading the store: {e}"))
+        Ok(self.lifecycles(root, &filter)?.len())
+    }
+
+    /// The task ids with a done run in `root`'s store.
+    pub(crate) fn done_tasks(&self, root: &Path) -> Result<HashSet<String>, String> {
+        let filter = LifecycleFilter::default().with_statuses([Status::Done]);
+        Ok(self
+            .lifecycles(root, &filter)?
+            .into_iter()
+            .map(|l| l.task_id)
+            .collect())
     }
 }
 

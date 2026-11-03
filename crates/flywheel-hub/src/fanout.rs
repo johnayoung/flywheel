@@ -374,6 +374,10 @@ pub struct Winner {
 pub struct Pin {
     pub path: PathBuf,
     pub sha256: String,
+    /// A held-out grader names it: its path is never put in an error an
+    /// agent may be shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_out: bool,
 }
 
 /// A fan-out as stored.
@@ -688,6 +692,14 @@ impl CreateFanout {
             .iter()
             .enumerate()
             .map(|(i, input)| validate_grader(input).map_err(|e| format!("grader {}: {e}", i + 1)))
+            .map(|grader| {
+                // Only a task's held-out registry makes a grader held out
+                // (`promote::seeded`), never a client's say-so.
+                grader.map(|mut g| {
+                    g.held_out &= self.origin.is_some();
+                    g
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let timeout_secs = self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
         if !(1..=MAX_TIMEOUT_SECS).contains(&timeout_secs) {
@@ -845,7 +857,8 @@ pub fn pin_graders(
                     continue;
                 }
                 let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                if pins.iter().any(|p| p.path == canonical) {
+                if let Some(pin) = pins.iter_mut().find(|p| p.path == canonical) {
+                    pin.held_out |= grader.held_out;
                     continue;
                 }
                 let sha256 = sha256_file(&canonical)
@@ -853,6 +866,7 @@ pub fn pin_graders(
                 pins.push(Pin {
                     path: canonical,
                     sha256,
+                    held_out: grader.held_out,
                 });
             } else if word.contains('/')
                 && repo.join(path).is_file()
@@ -869,21 +883,57 @@ pub fn pin_graders(
 
 /// Why the pinned grader scripts no longer are what the fan-out started
 /// with (`None`: every one hashes the same).
+/// A held-out grader's script is named only as such.
 pub fn pins_broken(pins: &[Pin]) -> Option<String> {
-    let changed: Vec<String> = pins
+    let broken: Vec<&Pin> = pins
         .iter()
         .filter(|p| sha256_file(&p.path).as_deref() != Some(p.sha256.as_str()))
-        .map(|p| p.path.display().to_string())
         .collect();
-    if changed.is_empty() {
+    if broken.is_empty() {
         return None;
     }
+    let named: Vec<String> = broken
+        .iter()
+        .filter(|p| !p.held_out)
+        .map(|p| p.path.display().to_string())
+        .collect();
+    let held = broken.len() - named.len();
+    let mut what = Vec::new();
+    if !named.is_empty() {
+        what.push(format!(
+            "grader script{} {}",
+            if named.len() == 1 { "" } else { "s" },
+            named.join(", ")
+        ));
+    }
+    if held > 0 {
+        what.push(format!(
+            "{held} held-out grader script{}",
+            if held == 1 { "" } else { "s" }
+        ));
+    }
     Some(format!(
-        "grader script{} {} changed (or went) since the fan-out started: the check is no longer \
-         the one every candidate is held to; restore it, or start a new fan-out",
-        if changed.len() == 1 { "" } else { "s" },
-        changed.join(", ")
+        "{} changed (or went) since the fan-out started: the check is no longer the one every \
+         candidate is held to; restore it, or start a new fan-out",
+        what.join(" and ")
     ))
+}
+
+/// `text` with every held-out grader command of `graders`, and the paths
+/// and script names in it, replaced: what an agent may be shown.
+fn redact_held_out(text: &str, graders: &[GraderRun]) -> String {
+    let mut words: Vec<&str> = graders
+        .iter()
+        .filter(|g| g.held_out)
+        .flat_map(|g| promote::secret_words(&g.run))
+        .collect();
+    // Longest first: a command before the paths inside it.
+    words.sort_by_key(|w| std::cmp::Reverse(w.len()));
+    let mut text = text.to_owned();
+    for word in words {
+        text = text.replace(word, "[held-out]");
+    }
+    text
 }
 
 /// The grading error for tracked files flagged out of git status's sight.
@@ -969,6 +1019,7 @@ pub fn fix_prompt(grade: &Grade) -> Option<String> {
         return None;
     }
     if let Some(error) = &grade.error {
+        let error = redact_held_out(error, &grade.graders);
         return Some(format!(
             "The hub could not grade your work in this worktree: {error}. Check that the \
              worktree is in a usable state (no rebase or merge left half-way), then commit \
@@ -1174,8 +1225,8 @@ pub struct FanoutView {
     /// The flywheel task it was seeded from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<TaskOrigin>,
-    /// The flywheel task files written from it.
-    pub promoted: Vec<Promotion>,
+    /// The flywheel task files written from it, and where each is now.
+    pub promoted: Vec<promote::PromotedView>,
 }
 
 impl FanoutView {

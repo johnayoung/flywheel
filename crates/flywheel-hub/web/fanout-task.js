@@ -140,14 +140,15 @@ window.FwHubFanoutTask = function (ctx) {
             ? "Its directory work source lists it: `fw worker` there picks it up and verifies it through the loop (its graders, then the held-out gate and landing). Commit the file to keep it with the repo."
             : "Written, but the directory work source does not list it (see the Flywheel panel's problem line).",
         }),
-        ...(done.warnings || []).map((x) => el("p", { className: "fo-plan-warn", textContent: `warning: ${x}` }))),
+        ...(done.warnings || []).map((x) => el("p", { className: "fo-plan-warn", textContent: `warning: ${x}` })),
+        queueNote(w.queue || [])),
       el("footer", { className: "sheet-foot" },
         el("button", { type: "submit", className: "slab ghost", value: "", textContent: "Close" }),
         el("button", { type: "button", className: "slab ghost", textContent: "Open Flywheel panel", onclick: () => {
           dialog.close();
           ctx.openFlywheel(folder, f.workspace_id);
         } }),
-        el("button", { type: "button", className: "slab", textContent: "Run with worker here", title: "Start fw worker in a new shell session in this folder", onclick: () => {
+        el("button", { type: "button", className: "slab", textContent: "Run with worker here", title: "Start fw worker in a new shell session in this folder: it drains every active task not done yet, this one included", onclick: () => {
           dialog.close();
           ctx.startWorker(folder, f.workspace_id);
         } })),
@@ -155,7 +156,38 @@ window.FwHubFanoutTask = function (ctx) {
     dialog.querySelector(".sheet-foot .slab:not(.ghost)").focus();
   }
 
+  // `fw worker` takes no task: it drains the whole active queue.
+  function queueNote(queue) {
+    if (!queue.length) return null;
+    return el("p", { className: "fo-plan-warn", textContent: `fw worker drains every active task, not only this one: ${queue.length} other${queue.length === 1 ? "" : "s"} not done yet may run first (${queue.join(", ")}).` });
+  }
+
+  // A fan-out seeded from a task: that task is the durable one already.
+  // Re-verify it with the worker, or write a separate task deliberately.
   function promote(f) {
+    if (!f.origin) return promoteForm(f, "");
+    const o = f.origin;
+    const folder = f.folder || f.repo;
+    dialog.replaceChildren(el(
+      "form",
+      { method: "dialog" },
+      el("header", { className: "sheet-head" }, el("span", { className: "sheet-kicker", textContent: "flywheel task" }), el("h2", { textContent: `${f.name} came from task ${o.task_id}` })),
+      el("div", { className: "fo-act-body" },
+        el("p", { className: "fo-plan-summary" }, "Task ", el("code", { textContent: o.phase ? `${o.phase}/${o.task_id}` : o.task_id }), " is already the durable spec and graders for this work", o.held_out ? `, held-out oracle${o.held_out === 1 ? "" : "s"} included` : "", ". To verify it through the loop, run the worker in this folder."),
+        el("p", { className: "fo-plan-detail", textContent: "fw worker drains every active task not done yet, in phase order, this one included. A separate task (a new id) leaves the original's held-out oracles behind." })),
+      el("footer", { className: "sheet-foot" },
+        el("button", { type: "submit", className: "slab ghost", value: "", textContent: "Close" }),
+        el("button", { type: "button", className: "slab ghost", textContent: "Write a separate task…", onclick: () => promoteForm(f, `${o.task_id}-${f.id.slice(0, 4)}`) }),
+        el("button", { type: "button", className: "slab", textContent: `Run ${o.task_id} with worker here`, onclick: () => {
+          dialog.close();
+          ctx.startWorker(folder, f.workspace_id);
+        } })),
+    ));
+    if (!dialog.open) dialog.showModal();
+    dialog.querySelector(".sheet-foot .slab:not(.ghost)").focus();
+  }
+
+  function promoteForm(f, suggestedId) {
     const taskId = el("input", { type: "text", maxLength: 100, spellcheck: false, autocomplete: "off", placeholder: "default: the fan-out's name and tag" });
     const phases = el("datalist", { id: "fo-task-phases" });
     const phase = el("input", { type: "text", maxLength: 100, spellcheck: false, autocomplete: "off", placeholder: "default: a new phase after the others" });
@@ -182,8 +214,9 @@ window.FwHubFanoutTask = function (ctx) {
     reference.addEventListener("change", previewSoon);
     writeButton.addEventListener("click", write);
     node.addEventListener("submit", (event) => event.preventDefault());
+    taskId.value = suggestedId;
     dialog.replaceChildren(node);
-    dialog.showModal();
+    if (!dialog.open) dialog.showModal();
     taskId.focus();
     preview();
   }
@@ -206,8 +239,16 @@ window.FwHubFanoutTask = function (ctx) {
     if (f.origin) {
       notes.push(el("span", { className: "fo-note fo-origin", textContent: `from flywheel task ${f.origin.task_id}${f.origin.held_out ? ` · ${f.origin.held_out} held-out grader${f.origin.held_out === 1 ? "" : "s"} from its registry` : ""}` }));
     }
+    const folder = f.folder || f.repo;
     for (const p of f.promoted || []) {
-      notes.push(el("span", { className: "fo-note fo-origin", title: p.path, textContent: `promoted to flywheel task ${p.task_id} (${p.phase})` }));
+      const where = p.state === "archived" ? " · archived (done and landed)" : p.state === "gone" ? " · file no longer there" : "";
+      notes.push(el("button", {
+        type: "button",
+        className: "text-btn fo-note fo-origin",
+        title: `${p.current || `${p.path} (no longer there)`}\nOpen the Flywheel panel`,
+        textContent: `promoted to flywheel task ${p.task_id} (${p.phase})${where}`,
+        onclick: () => ctx.openFlywheel(folder, f.workspace_id),
+      }));
     }
     return notes;
   }

@@ -579,11 +579,15 @@ fn render(view: &Value, verbose: bool, out: &mut dyn Write) -> std::io::Result<(
         )?;
     }
     for p in list(view, "promoted") {
+        let at = match str_field(p, "state") {
+            "archived" => format!("archived (done): {}", str_field(p, "current")),
+            "gone" => format!("{} (no longer there)", str_field(p, "path")),
+            _ => str_field(p, "path").to_owned(),
+        };
         writeln!(
             out,
-            "promoted to flywheel task {}: {}",
-            str_field(p, "task_id"),
-            str_field(p, "path")
+            "promoted to flywheel task {}: {at}",
+            str_field(p, "task_id")
         )?;
     }
     if let Some(w) = view.get("winner").filter(|w| !w.is_null()) {
@@ -1091,6 +1095,21 @@ fn promote(args: &PromoteArgs, out: &mut dyn Write, err: &mut dyn Write) -> Resu
         }
     )
     .map_err(io)?;
+    let queue: Vec<&str> = list(written, "queue")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if !queue.is_empty() {
+        writeln!(
+            out,
+            "note: `fw worker` drains every active task, not only this one; {} other{} not done \
+             yet may run first: {}",
+            queue.len(),
+            if queue.len() == 1 { "" } else { "s" },
+            queue.join(", ")
+        )
+        .map_err(io)?;
+    }
     Ok(0)
 }
 

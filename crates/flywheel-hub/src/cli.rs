@@ -133,6 +133,11 @@ enum HubCommand {
     /// --findings prints its answer, --send-findings pastes it into the
     /// author.
     AskReview(crate::agent_handoff_cli::AskReviewArgs),
+    /// Prompt queues: prompts typed into an agent session one at a time,
+    /// each once the agent is done (never while it is blocked, someone
+    /// types into it, or a grading or review uses it): add, ls, rm,
+    /// clear, move, pause, resume.
+    Queue(crate::queue_cli::QueueArgs),
     /// Fast-forward a worktree session's base onto its branch in the main
     /// checkout (git merge --ff-only), after printing exactly what runs.
     /// Refused when the main checkout is not on the base or has
@@ -596,6 +601,7 @@ pub fn run_with(
         HubCommand::Doctor(args) => crate::doctor::doctor(&args, out, err),
         HubCommand::Handoff(args) => crate::agent_handoff_cli::handoff(&args, out, err),
         HubCommand::AskReview(args) => crate::agent_handoff_cli::ask_review(&args, out, err),
+        HubCommand::Queue(args) => crate::queue_cli::main(&args, out, err),
     }
 }
 
@@ -1149,6 +1155,7 @@ fn serve_cmd(
     options.record_limits = effective.record_limits;
     options.share_policy = effective.share_policy;
     options.reviewer = effective.reviewer;
+    options.queue_typing_quiet = effective.queue_typing_quiet;
     // One hub per state dir: the hub holds `<state-dir>/serve.lock` for
     // its whole life (a second would overwrite the first's runtime file and
     // report socket, leaving `url` / `token --rotate` and agent hooks unable

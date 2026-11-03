@@ -76,6 +76,8 @@ pub const EVENTS: &[&str] = &[
     "share.revoked",
     "record.started",
     "record.stopped",
+    "queue.delivered",
+    "queue.stalled",
 ];
 const STATUSES: &[&str] = &["working", "blocked", "done", "idle", "unknown"];
 const KINDS: &[&str] = &["shell", "claude", "codex"];

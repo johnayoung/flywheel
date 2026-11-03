@@ -142,4 +142,21 @@ Workspace folders with a `flywheel.toml` or `.flywheel/` get the verified loop b
 - Each adopted folder has one watcher (stat every 2 s, re-read on change or every 15 s). A missing SQLite store is never created.
 - Seam: `flywheel-hub` defines `flywheel::FlywheelProvider`; the `flywheel` crate implements it (`hub_flywheel.rs`), so the hub never depends on the loop's crates.
 
-<!-- Prompt queue (hub/35): its section goes here. -->
+## Prompt queue
+
+Per agent session, a FIFO of prompts the hub types in itself: "when it's done, then do X". Kept by the hub owning the session (`state.json`); `--machine` and the UI reach another machine's through the proxy.
+
+```bash
+fw hub queue add api "run the tests and fix what fails"
+fw hub queue add api --when idle "now write the changelog entry"
+fw hub queue ls api
+```
+
+- Add from Compose (**Queue** beside Send), the drawer (header `queue` pill, `Alt Q`; a sheet on phones), the palette, or `fw hub queue add`.
+- **Triggers** (`--when`): `done` (default): at rest (turn finished, or waiting for its first prompt); `idle`: at rest and a client viewed the finished turn; `blocked-cleared`: once at the front, the agent blocked, the block was answered, and that turn finished.
+- **Never** while `working`, `blocked`, or `unknown`; within 1.5 s of the rest starting; within `queue.typing_quiet` of anyone typing (terminal, `attach`, `send`, Compose; not focus reports); while a fan-out grading or a review action (commit, push, PR, rebase, merge, ask for a review) holds it.
+- **One at a time**: the next waits for a rest that began after the last delivery. Delivery = bracketed paste, then Enter. The newest 20 delivered stay, with `delivered_at`.
+- **Exactly once**: `sending` is saved before the paste, `delivered` after. A hub that died between settles it on start: the text as a user message in the transcript -> `delivered` (`reconciled`), else pending again. `fw hub upgrade` lets a delivery under way finish and starts none until the new hub took over.
+- **Stalls** stop the queue until resumed (`queue resume`, the drawer, Needs you): the agent exited, was not restored or came back a shell, the paste was refused, or a delivered prompt started no turn within 120 s. Removing a session drops its queue (`queue.stalled`).
+- **Order**: drag or the up/down buttons; `queue move`. Pending items can be edited or removed; one being sent cannot. 50 pending per session, 64 KiB per prompt.
+- Events: `queue.delivered`, `queue.stalled` ([hub-api: Plugin events](api.md#plugin-events)).

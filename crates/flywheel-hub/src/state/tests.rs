@@ -984,3 +984,106 @@ fn version_1_files_migrate_and_stale_layout_entries_are_pruned_on_load() {
     let raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert!(raw["layouts"].get("w-gone").is_none(), "{raw}");
 }
+
+#[test]
+fn a_version_4_file_with_promoted_fanouts_migrates_to_queues_losing_neither() {
+    use crate::fanout::{Fanout, GraderSpec, Promotion, TaskOrigin};
+    use crate::queue::{ItemState, QueueItem, When};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo(dir.path(), "r").canonicalize().unwrap();
+    let mut store = HubStore::open(dir.path()).unwrap();
+    let ws = store
+        .create_workspace(input("w", vec![repo.clone()]))
+        .unwrap();
+    let mut session = running_session(&ws.id, &repo);
+    session.kind = SessionKind::Claude;
+    session.command = vec!["claude".into()];
+    store.insert_session(session.clone()).unwrap();
+    let origin: TaskOrigin = serde_json::from_value(serde_json::json!({
+        "folder": repo,
+        "task_id": "fix-retry",
+        "phase": "01-retry",
+        "goal": "retries back off",
+        "digest": "d".repeat(64),
+        "held_out": 1,
+        "not_run": ["rubric"],
+        "tags": ["retry"],
+        "prompt_seeded": true,
+    }))
+    .unwrap();
+    let promotion = Promotion {
+        task_id: "fix-retry".into(),
+        phase: "01-retry".into(),
+        path: repo.join(".flywheel/tasks/active/01-retry/fix-retry.json"),
+        reference: Some("c".repeat(40)),
+        at: Utc::now(),
+    };
+    let fanout = Fanout {
+        id: "f1".into(),
+        name: "retry".into(),
+        workspace_id: ws.id.clone(),
+        repo: repo.clone(),
+        base: "main".into(),
+        base_sha: "b".repeat(40),
+        prompt: "p".into(),
+        commit_instruction: true,
+        graders: vec![
+            GraderSpec {
+                run: "cargo test".into(),
+                name: Some("unit".into()),
+                held_out: false,
+            },
+            GraderSpec {
+                run: "./held-out.sh".into(),
+                name: Some("held".into()),
+                held_out: true,
+            },
+        ],
+        timeout_secs: 60,
+        protect: vec![],
+        pins: vec![],
+        created_at: Utc::now(),
+        candidates: vec![],
+        winner: None,
+        origin: Some(origin),
+        promoted: vec![promotion],
+    };
+    store.insert_fanout(fanout.clone()).unwrap();
+    drop(store);
+
+    // Rewrite it as a schema-4 hub (fan-outs and their promotion fields,
+    // no queues) left it.
+    let path = dir.path().join(STATE_FILE);
+    let mut raw: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    raw["version"] = 4.into();
+    assert!(raw.get("queues").is_none());
+    assert_eq!(raw["fanouts"][0]["promoted"][0]["task_id"], "fix-retry");
+    assert_eq!(raw["fanouts"][0]["graders"][1]["held_out"], true);
+    fs::write(&path, raw.to_string()).unwrap();
+
+    let mut store = HubStore::open(dir.path()).unwrap();
+    let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(written["version"], STATE_VERSION);
+    const _: () = assert!(STATE_VERSION == 5, "queues arrived in schema 5");
+    assert_eq!(store.fanout("f1").unwrap(), &fanout);
+    let now = Utc::now();
+    store
+        .update_queue(&session.id, |q| {
+            q.items.push(QueueItem {
+                id: "item-1".into(),
+                text: "then write the changelog".into(),
+                when: When::Done,
+                added_at: now,
+                blocked_at: None,
+                state: ItemState::Pending,
+            });
+        })
+        .unwrap();
+    drop(store);
+
+    let store = HubStore::open(dir.path()).unwrap();
+    assert_eq!(store.fanout("f1").unwrap(), &fanout);
+    let queue = store.queue(&session.id).unwrap();
+    assert_eq!(queue.items.len(), 1);
+    assert_eq!(queue.items[0].text, "then write the changelog");
+}

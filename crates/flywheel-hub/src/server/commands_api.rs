@@ -68,6 +68,7 @@ pub(super) async fn paste(
     ApiJson(request): ApiJson<PasteRequest>,
 ) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
+    hub.note_typing(&id, request.text.as_bytes());
     let outcome = blocking(move || hub.paste(&id, &request.text, request.run)).await?;
     Ok(Json(outcome).into_response())
 }

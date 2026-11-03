@@ -251,6 +251,7 @@ pub(super) async fn session_input(
             "nothing to send: give data and/or enter",
         ));
     }
+    app.hub.note_typing(&id, b"input");
     let bracketed = request.paste && session.bracketed_paste();
     let bytes = if request.paste {
         crate::pty::paste_bytes(&request.data, bracketed)

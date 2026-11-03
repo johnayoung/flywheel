@@ -23,11 +23,12 @@ use std::path::{Path, PathBuf};
 /// State file name inside the state dir.
 pub const STATE_FILE: &str = "state.json";
 /// On-disk schema version: 2 added per-workspace `layouts`, 3 launch
-/// `templates` (and sessions' `launch` options), 4 verified `fanouts`.
+/// `templates` (and sessions' `launch` options), 4 verified `fanouts`, 5
+/// per-session prompt `queues`.
 /// Older files load and are written back as the current version; a newer
 /// hub's file is refused rather than rewritten without what it does not
 /// know.
-pub const STATE_VERSION: u32 = 4;
+pub const STATE_VERSION: u32 = 5;
 /// The oldest schema version still loaded.
 pub const STATE_VERSION_MIN: u32 = 1;
 /// Limits on workspace input.
@@ -338,6 +339,9 @@ struct StateDoc {
     /// Verified fan-outs (see [`crate::fanout`]), oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fanouts: Vec<crate::fanout::Fanout>,
+    /// Session id -> its prompt queue (see [`crate::queue`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    queues: BTreeMap<String, crate::queue::SessionQueue>,
 }
 
 /// Store and validation failures.

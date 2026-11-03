@@ -8,7 +8,7 @@ How the hub behaves underneath the UI. Front door: [hub](../hub.md).
 - A **missing** folder (moved, unmounted) refuses new sessions until it is back or removed. `git` / `missing` are re-read on every listing.
 - **Session**: one PTY in one folder. Kind `shell` (`$SHELL` or an argv), `claude`, or `codex` (resolved on the hub's `PATH`; missing CLI = 400).
 - Session states: `running`, `exited` (code or signal; scrollback stays attachable), `stopped` (hub stopped while it ran; carries `last_cwd`, `restore_error`).
-- Persisted in `<state-dir>/state.json` (atomic writes, schema 4; older files migrate, newer are refused).
+- Persisted in `<state-dir>/state.json` (atomic writes, schema 5 -- 2 layouts, 3 launch templates, 4 fan-outs, 5 prompt queues; older files migrate, newer are refused).
 - Kill hangs up the whole session: the leader's group plus background jobs (Linux scans `/proc`; elsewhere the leader's group only).
 - Terminal size is shared (max 500x300). In the web UI a pane resizes the PTY only while focused or sole viewer, after a divider drag ends; other panes clip to the shared size (badge `NNxNN · another viewer's size`).
 - Input queued past 4 MiB for a terminal that is not reading is dropped (client gets `error`).
@@ -53,6 +53,7 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 - Agents spawned earlier keep hooks pointing at the old binary path: upgrade in place (`cargo install`) or keep it until they relaunch.
 - Mechanism: over `handoff.sock` (same-user only) the old hub freezes (listener stays open, open requests get 503, PTYs paused), closes WebSockets with **1012**, and passes listener, locks, PTY masters, pidfds, emulator snapshots, and held input via `SCM_RIGHTS`. It exits only after the new hub acks.
 - Input reaching the old hub after handover is refused (503), never lost or typed twice.
+- A prompt-queue delivery under way finishes first; none starts until the new hub took over.
 - Failure before commit thaws the old hub (it keeps serving); a stuck new hub is killed after `--timeout`.
 - Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; for these `--allow-restart` falls back to stop + start with the same flags and env (sessions restored, not kept). Another handoff in progress: retry. A systemd unit's hub: `systemctl --user restart <unit>`.
 - Handed-over processes are no longer children: exits are seen via pidfd with **unknown exit code** (`exited ?`). The new hub runs no restore pass.

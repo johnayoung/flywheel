@@ -43,6 +43,8 @@ pub mod peers;
 pub mod plugin_cli;
 pub mod plugins;
 pub mod pty;
+pub mod queue;
+pub mod queue_cli;
 pub mod record;
 pub mod remote;
 pub mod report;

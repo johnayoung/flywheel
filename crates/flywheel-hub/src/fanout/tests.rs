@@ -511,7 +511,8 @@ fn state_files_from_before_fanouts_load_and_fanouts_round_trip() {
         serde_json::from_slice(&std::fs::read(dir.path().join(crate::state::STATE_FILE)).unwrap())
             .unwrap();
     assert_eq!(written["version"], json!(crate::state::STATE_VERSION));
-    assert_eq!(crate::state::STATE_VERSION, 4);
+    // Fan-outs arrived in schema 4.
+    const _: () = assert!(crate::state::STATE_VERSION >= 4);
 
     let fanout = Fanout {
         id: "f1".into(),
@@ -561,7 +562,7 @@ fn state_files_from_before_fanouts_load_and_fanouts_round_trip() {
     // A newer hub's file is refused, not rewritten.
     std::fs::write(
         dir.path().join(crate::state::STATE_FILE),
-        json!({"version": 5}).to_string(),
+        json!({"version": crate::state::STATE_VERSION + 1}).to_string(),
     )
     .unwrap();
     assert!(HubStore::open(dir.path()).is_err());

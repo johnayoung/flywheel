@@ -75,6 +75,15 @@ impl Hub {
         // Gradings running now are cut short and stay pending: whichever
         // hub carries on runs them again.
         self.grading.pause();
+        // No prompt queue delivers from here on; one under way finishes
+        // (and is recorded) before the state file is handed over.
+        if !self.queue.pause(left()) {
+            self.handoff_thaw(false);
+            return Err(format!(
+                "a queued prompt was still being delivered after {}s",
+                timeout.as_secs()
+            ));
+        }
         // The next hub reads the state file from here on; what changes
         // meanwhile (a session exiting) is written on a thaw.
         let _ = self.store().set_read_only(true);
@@ -129,6 +138,7 @@ impl Hub {
             eprintln!("fw hub: {e}");
         }
         self.grading.resume();
+        self.queue.resume();
         // Before the sessions run again: no output goes unrecorded.
         self.resume_recordings();
         let live: Vec<Arc<PtySession>> = self.live().values().cloned().collect();
@@ -235,6 +245,7 @@ impl Hub {
             server.resume();
         }
         crate::transcript::spawn_watcher(self);
+        self.start_queues();
         self.emit(super::HubEvent::Sessions);
     }
 }

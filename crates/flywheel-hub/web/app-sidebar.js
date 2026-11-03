@@ -286,6 +286,7 @@ function renderSession(session, index) {
       recBadge(session),
       el("span", { className: `session-state ${st.tone}`, textContent: st.label, title: st.title || undefined }),
       launcher.rowChip(session),
+      promptQueue.rowChip(session),
       actions,
     ),
     // What a blocked agent asks, readable without hover (touch).
@@ -528,6 +529,7 @@ function renderMain() {
   $("#meter-cwd").title = session ? session.cwd : "";
   launcher.renderHeader(session);
   sharing.renderHeader(session);
+  promptQueue.renderHeader(session);
   renderFlip(session);
   updateMeters();
   const counts = attentionCounts();

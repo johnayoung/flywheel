@@ -243,6 +243,8 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `review.requested` | `{"author","reviewer","reused","kind","base","branch","dir"}` |
 | `handoff.sent` | `{"from","to","source","bytes","truncated"}` (on the target's hub; findings: `source` `review_findings`) |
 | `fanout.finished` | `fanout` (below); no `session` |
+| `queue.delivered` | `item` `{"id","text" (first 2000 chars),"bytes","when","added_at","delivered_at"}`, `pending` |
+| `queue.stalled` | `reason`, `item`, `pending` |
 | `share.created` | `share` `{"id","session_id","name","created","expires"}` (unix seconds); never the credential, its digest, or a link |
 | `share.revoked` | as above; one per link a revoke ends; expiry sends none |
 | `record.started` | `recording` `{"name","session_id","title","part","size","started","modified","cols","rows","active"}` (no path); `session` `null` once removed |
@@ -258,4 +260,19 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 
 Candidates come best first. `tail` = the last 400 characters of the first failing grader's stderr; no other grader output.
 
-<!-- Prompt queue (hub/35): add its routes and events here. -->
+## Prompt queues
+
+Behaviour: [hub-workflows: Prompt queue](workflows.md#prompt-queue). `{item}` = an id prefix (4+) or a position (1 = next). Every write returns the queue.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/queues` | every session's queue |
+| GET / POST | `/api/sessions/{id}/queue` | GET `{"session_id","session","paused","stalled"?:{"at","reason","item"?},"last_delivered_at"?,"pending","items","waiting"?,"typing_quiet_secs"}` (400 a shell); POST `{"text","when"?}` -> 201 `{"item","queue"}` |
+| PATCH / DELETE | `/api/sessions/{id}/queue/items/{item}` | PATCH `{"text"?,"when"?}`; 409 one being sent |
+| POST | `/api/sessions/{id}/queue/items/{item}/move` | `{"position"}` (1-based among the pending) |
+| POST | `/api/sessions/{id}/queue/pause` | |
+| POST | `/api/sessions/{id}/queue/resume` | also clears a stall |
+| POST | `/api/sessions/{id}/queue/clear` | `{"all"?}`: the delivered history too |
+
+- Item: `{"id","text","when","added_at","state":"pending|sending|delivered","sending_at"?,"delivered_at"?,"reconciled"?,"blocked_at"?,"position"?}`. `waiting`: why the next one is not sent now.
+- Session listings carry `queue: {"pending","paused"?,"stalled"?,"next_when"?,"last_delivered_at"?}`.

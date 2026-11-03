@@ -107,7 +107,17 @@ fw hub plugin logs NAME [--lines|-n N] [--json]     # newest runs (default 20)
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent status hooks only
 ```
 
-<!-- Prompt queue (hub/35): add its verbs here. -->
+Prompt queues ([hub-workflows: Prompt queue](workflows.md#prompt-queue)); `ITEM` = a position (1 = next) or an id prefix:
+
+```bash
+fw hub queue add SESSION TEXT|- [--when done|idle|blocked-cleared] [--json] {remote} {machine}   # typed in once the turn is done
+fw hub queue ls [SESSION] [--json] {remote} {machine}
+fw hub queue rm SESSION ITEM [--json] {remote} {machine}
+fw hub queue clear SESSION [--all] [--json] {remote} {machine}   # --all: the delivered history too
+fw hub queue move SESSION ITEM POS [--json] {remote} {machine}   # POS among the pending (1 = next)
+fw hub queue pause SESSION [--json] {remote} {machine}
+fw hub queue resume SESSION [--json] {remote} {machine}   # also clears a stall
+```
 
 ### Verb notes
 
@@ -197,6 +207,9 @@ max_expiry = "30d"                # the longest one may name (60s..30d)
 
 [review]                          # live: "ask for a review"
 reviewer = "other"                # other (claude <-> codex) | same | claude | codex
+
+[queue]                           # live: prompt queues
+typing_quiet = "8s"               # no typing in a session this long before its queue delivers (1s..10m)
 ```
 
 | Key | Flag | Default | Applies |
@@ -226,6 +239,7 @@ reviewer = "other"                # other (claude <-> codex) | same | claude | c
 | `shares.default_expiry` | `--share-default-expiry` | `"1h"` (links made from now on) | live |
 | `shares.max_expiry` | `--share-max-expiry` | `"30d"` | live |
 | `review.reviewer` | - | `"other"` | live |
+| `queue.typing_quiet` | - | `"8s"` (1s-10m) | live |
 
 Not in hub.toml: push (`notify.toml`, it holds secrets), detection overrides (`agent-detection/`), plugins (`plugins/`), UI settings (`settings.json`).
 
@@ -303,6 +317,7 @@ Defaults, all rebindable (Settings > Keyboard). `mod` = Ctrl (Cmd on macOS); `al
 | `review.toggle` | `alt+g` | Review the attached session's git work |
 | `handoff.send` | - | Send the terminal selection to another agent |
 | `review.ask` | - | Ask an agent of the other kind to review the attached session |
+| `queue.toggle` | `alt+q` | Prompt queue of the attached agent |
 | `fanout.open` | - | Verified fan-outs |
 | `fanout.new` | - | New verified fan-out |
 | `pane.split_right` | `alt+\` | Split right with a new shell |
@@ -363,7 +378,7 @@ All files 0600, the dir 0700.
 |---|---|
 | `token` | access token (256 bits, hex) |
 | `logins.json` | login-cookie digests (30 days, at most 256) |
-| `state.json` | workspaces, sessions, layouts, templates, fan-outs (schema 4; older migrate, newer refused) |
+| `state.json` | workspaces, sessions, layouts, templates, fan-outs, prompt queues (schema 5; older migrate, newer refused) |
 | `settings.json` | UI settings |
 | `hub.toml`, `notify.toml` | above |
 | `server.json`, `serve.lock`, `report.sock`, `handoff.sock` | running hub: pid/address/URLs, one-hub lock, hook channel, live-handoff socket |

@@ -90,6 +90,9 @@ const mobile = window.FwHubMobile({
   },
   // The selection popover's "Send to agent" (handoff.js).
   sendSelection: (text) => handoff.sendSelection(state.attached, text),
+  // Compose's "Queue" (queue.js).
+  canQueue: (session) => promptQueue.canQueue(session),
+  queuePrompt: (id, text) => promptQueue.add(id, text),
 });
 
 // A pane resizes its session's PTY (fits it to its box) only while it

@@ -66,6 +66,8 @@ pub struct FileConfig {
     pub shares: SharesSection,
     #[serde(default)]
     pub review: ReviewSection,
+    #[serde(default)]
+    pub queue: QueueSection,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -159,6 +161,15 @@ pub struct SharesSection {
 pub struct ReviewSection {
     /// `other` (default), `same`, `claude`, or `codex`.
     pub reviewer: Option<String>,
+}
+
+/// Prompt queues (see [`crate::queue`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueSection {
+    /// How long a session must go without typed input before its queue
+    /// delivers: seconds, or `"8s"` / `"1m"`.
+    pub typing_quiet: Option<DurationSetting>,
 }
 
 /// Which agent kind "ask for a review" launches, relative to the author's.
@@ -339,6 +350,8 @@ pub struct Tunables {
     pub record_limits: crate::record::RecordLimits,
     pub share_policy: crate::share::SharePolicy,
     pub reviewer: ReviewerChoice,
+    /// No typed input for this long before a queue delivers.
+    pub queue_typing_quiet: Duration,
 }
 
 /// Every setting resolved, with where each came from.
@@ -363,6 +376,7 @@ pub struct Effective {
     pub record_limits: crate::record::RecordLimits,
     pub share_policy: crate::share::SharePolicy,
     pub reviewer: ReviewerChoice,
+    pub queue_typing_quiet: Duration,
     sources: Vec<(&'static str, Source)>,
 }
 
@@ -402,6 +416,7 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("shares.default_expiry", Apply::Live),
     ("shares.max_expiry", Apply::Live),
     ("review.reviewer", Apply::Live),
+    ("queue.typing_quiet", Apply::Live),
 ];
 
 impl Effective {
@@ -422,6 +437,7 @@ impl Effective {
             record_limits: self.record_limits,
             share_policy: self.share_policy,
             reviewer: self.reviewer,
+            queue_typing_quiet: self.queue_typing_quiet,
         }
     }
 
@@ -477,6 +493,7 @@ impl Effective {
             }
             "shares.max_expiry" => json!(crate::share::format_ttl(self.share_policy.max_ttl)),
             "review.reviewer" => json!(self.reviewer.as_str()),
+            "queue.typing_quiet" => json!(crate::share::format_ttl(self.queue_typing_quiet)),
             _ => Value::Null,
         }
     }
@@ -821,6 +838,21 @@ pub fn resolve(
         file_reviewer,
         ReviewerChoice::Other
     );
+    let file_quiet = file.queue.typing_quiet.as_ref().and_then(|setting| {
+        let raw = match setting {
+            DurationSetting::Seconds(n) => n.to_string(),
+            DurationSetting::Text(text) => text.clone(),
+        };
+        crate::queue::parse_quiet(&raw)
+            .map_err(|message| errors.push(format!("queue.typing_quiet: {message}")))
+            .ok()
+    });
+    let queue_typing_quiet = pick!(
+        "queue.typing_quiet",
+        None::<Duration>,
+        file_quiet,
+        crate::queue::DEFAULT_TYPING_QUIET
+    );
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -844,6 +876,7 @@ pub fn resolve(
         record_limits,
         share_policy,
         reviewer,
+        queue_typing_quiet,
         sources,
     })
 }
@@ -1297,6 +1330,9 @@ max_expiry = "30d"                # the longest one may name (60s..30d)
 
 [review]                          # live: "ask for a review"
 reviewer = "other"                # other (claude <-> codex) | same | claude | codex
+
+[queue]                           # live: prompt queues
+typing_quiet = "8s"               # no typing in a session this long before its queue delivers (1s..10m)
 "#;
 
 #[cfg(test)]

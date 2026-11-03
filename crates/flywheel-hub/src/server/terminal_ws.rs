@@ -58,6 +58,7 @@ pub(super) async fn session_ws(
                 credential,
                 gate,
                 &hub,
+                &id,
             )
             .await;
             // One viewer fewer: panes that follow another's size may now be
@@ -185,6 +186,7 @@ async fn pump(
     mut credential: CredentialWatch,
     gate: Option<crate::handoff::Gate>,
     hub: &Hub,
+    id: &str,
 ) {
     let Some(attachment) = attach(&session, SNAPSHOT_HISTORY_BYTES).await else {
         return;
@@ -235,6 +237,7 @@ async fn pump(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(text.as_str()) {
                             Ok(ClientMessage::Input { data }) => {
+                                hub.note_typing(id, data.as_bytes());
                                 if !forward_input(&mut socket, &session, data.into_bytes()).await {
                                     break;
                                 }
@@ -262,6 +265,7 @@ async fn pump(
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
+                        hub.note_typing(id, &bytes);
                         if !forward_input(&mut socket, &session, bytes.to_vec()).await {
                             break;
                         }

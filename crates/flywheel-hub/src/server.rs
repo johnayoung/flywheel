@@ -68,6 +68,7 @@ mod plugins_api;
 mod promote_api;
 mod proxy;
 mod pwa;
+mod queue_api;
 mod record_api;
 mod review_api;
 mod search_api;
@@ -295,6 +296,22 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             post(handoff_api::compose),
         )
         .route("/api/sessions/{id}/handoff", post(handoff_api::deliver))
+        .route("/api/queues", get(queue_api::list))
+        .route(
+            "/api/sessions/{id}/queue",
+            get(queue_api::get_queue).post(queue_api::add),
+        )
+        .route("/api/sessions/{id}/queue/clear", post(queue_api::clear))
+        .route("/api/sessions/{id}/queue/pause", post(queue_api::pause))
+        .route("/api/sessions/{id}/queue/resume", post(queue_api::resume))
+        .route(
+            "/api/sessions/{id}/queue/items/{item}",
+            axum::routing::patch(queue_api::edit).delete(queue_api::remove),
+        )
+        .route(
+            "/api/sessions/{id}/queue/items/{item}/move",
+            post(queue_api::move_item),
+        )
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/search", get(search_api::search))
         .route("/api/sessions/{id}/transcript", get(search_api::transcript))

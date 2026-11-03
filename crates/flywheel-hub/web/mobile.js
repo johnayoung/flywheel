@@ -11,7 +11,8 @@
 //   prompt on screen (Claude's numbered permission dialogs, a "(y/n)"
 //   line) as buttons.
 // * Compose: a real text area (autocorrect, dictation) whose text is sent
-//   as one bracketed paste plus Enter; per-device history.
+//   as one bracketed paste plus Enter, or (an agent) queued to be sent
+//   once its turn is done (queue.js); per-device history.
 // * Touch on the terminal: swipe scrolls (with momentum; in full-screen
 //   programs it scrolls them), long-press selects (drag to extend) with a
 //   Copy button, pinch sets the font size (kept per device).
@@ -513,6 +514,7 @@ window.FwHubMobile = function (ctx) {
       area.value = typeof saved === "string" ? saved : "";
       $("#compose-pos").textContent = "";
     }
+    $("#compose-queue").hidden = !ctx.canQueue(sessionById(composeFor));
     historyAt = -1;
     autosize();
     area.focus();
@@ -584,7 +586,9 @@ window.FwHubMobile = function (ctx) {
     $("#compose-pos").textContent = historyAt === -1 ? "" : `${historyAt + 1}/${list.length}`;
   }
 
-  async function sendCompose(run) {
+  // `how`: "run" (paste, Enter), "paste", or "queue" (typed in once the
+  // agent's turn is done).
+  async function sendCompose(how) {
     const area = $("#compose-text");
     const text = area.value.replace(/\s+$/, "");
     const id = composeFor;
@@ -592,10 +596,11 @@ window.FwHubMobile = function (ctx) {
       area.focus();
       return;
     }
-    const button = run ? $("#compose-send") : $("#compose-paste");
+    const button = $(`#compose-${how === "run" ? "send" : how}`);
     button.disabled = true;
     try {
-      await api("POST", `/api/sessions/${id}/paste`, { text, run });
+      if (how === "queue") await ctx.queuePrompt(id, text);
+      else await api("POST", `/api/sessions/${id}/paste`, { text, run: how === "run" });
       const list = history().filter((t) => t !== text);
       list.unshift(text);
       store.set("compose-history", list.slice(0, HISTORY_MAX));
@@ -606,7 +611,7 @@ window.FwHubMobile = function (ctx) {
       autosize();
       closeCompose(false);
     } catch (error) {
-      toast(`Not sent: ${error.message}`, { tone: "bad", timeout: 7000 });
+      toast(`${how === "queue" ? "Not queued" : "Not sent"}: ${error.message}`, { tone: "bad", timeout: 7000 });
     } finally {
       button.disabled = false;
     }
@@ -622,7 +627,7 @@ window.FwHubMobile = function (ctx) {
       if (event.isComposing) return;
       if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
         event.preventDefault();
-        sendCompose(true);
+        sendCompose("run");
       } else if (event.key === "Escape") {
         event.preventDefault();
         closeCompose(true);
@@ -634,8 +639,9 @@ window.FwHubMobile = function (ctx) {
         recall(-1);
       }
     });
-    $("#compose-send").addEventListener("click", () => sendCompose(true));
-    $("#compose-paste").addEventListener("click", () => sendCompose(false));
+    $("#compose-send").addEventListener("click", () => sendCompose("run"));
+    $("#compose-paste").addEventListener("click", () => sendCompose("paste"));
+    $("#compose-queue").addEventListener("click", () => sendCompose("queue"));
     $("#compose-prev").addEventListener("click", () => recall(1));
     $("#compose-next").addEventListener("click", () => recall(-1));
     $("#compose-close").addEventListener("click", () => closeCompose(false));

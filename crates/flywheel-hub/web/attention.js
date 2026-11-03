@@ -1,6 +1,7 @@
 // flywheel hub: the attention list. Every agent that needs you, across all
 // workspaces, at the top of the sidebar (the phone's session switcher):
-// blocked ones first (longest waiting first), then fan-outs whose graders
+// blocked ones first (longest waiting first), then prompt queues that
+// stalled (queue.js: the agent exited, a paste was refused), then fan-outs whose graders
 // finished since this browser looked (fanout.js; their candidates' own
 // finished turns are not listed), then finished turns this browser has
 // not looked at (newest first), then flywheel tasks that failed,
@@ -129,15 +130,16 @@ window.FwHubAttention = function (ctx) {
     const list = entries();
     const loop = flywheel ? flywheel.attention() : [];
     const graded = fanout ? fanout.attention() : [];
+    const queues = ctx.queue ? ctx.queue().attention() : [];
     for (const root of [$("#attention"), $("#empty-attention")]) {
       if (!root) continue;
-      const any = list.length || loop.length || graded.length;
+      const any = list.length || loop.length || graded.length || queues.length;
       root.hidden = !any;
-      root.replaceChildren(...(any ? content(list, loop, graded) : []));
+      root.replaceChildren(...(any ? content(list, loop, graded, queues) : []));
     }
   }
 
-  function content(list, loop, graded) {
+  function content(list, loop, graded, queues) {
     const blocked = list.filter((e) => e.agent.status === "blocked").length;
     const alerts = loop.reduce((n, e) => n + (e.count || 1), 0);
     return [
@@ -152,6 +154,7 @@ window.FwHubAttention = function (ctx) {
             list.length - blocked ? `${list.length - blocked} done` : "",
             alerts ? `${alerts} flywheel` : "",
             graded.length ? `${graded.length} fan-out${graded.length === 1 ? "" : "s"}` : "",
+            queues.length ? `${queues.length} queue${queues.length === 1 ? "" : "s"} stalled` : "",
           ]
             .filter(Boolean)
             .join(" / "),
@@ -162,6 +165,7 @@ window.FwHubAttention = function (ctx) {
         "ul",
         { className: "attn-list" },
         list.filter((e) => e.agent.status === "blocked").map(row),
+        queues.map((s) => ctx.queue().attentionRow(s)),
         graded.map((f) => fanout.attentionRow(f)),
         list.filter((e) => e.agent.status !== "blocked").map(row),
         loop.map(flywheelRow),

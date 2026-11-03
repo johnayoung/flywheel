@@ -262,6 +262,11 @@ impl Hub {
             Some(agent) => self.session(&agent.id)?,
             None => self.session(&record.id)?,
         };
+        // Neither the author's nor its reviewer's prompt queue types in
+        // while the review is set up and asked.
+        let mut held = vec![author.record.id.clone()];
+        held.extend(author.record.reviewer.clone());
+        let _held = self.hold_sessions(held, "asking for a review");
         if let Some(kind) = request.kind
             && !kind.is_agent()
         {

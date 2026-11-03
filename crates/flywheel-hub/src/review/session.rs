@@ -396,6 +396,9 @@ impl Hub {
         via: MergeVia,
     ) -> Result<ActionReport, HubError> {
         let (record, target) = self.review_target(tools, id, None)?;
+        // No prompt queue types into an agent of this work tree while git
+        // works on it.
+        let _held = self.hold_dir(&target.dir, &format!("a review {}", action.name()));
         if matches!(action, Action::Merge)
             && via == MergeVia::Review
             && let Some(why) = self.review_fanout(&target).and_then(|f| f.merge_refusal())

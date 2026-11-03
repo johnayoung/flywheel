@@ -328,6 +328,12 @@ impl Hub {
         self.board().alert(id).map(|a| (a.status, a.spell))
     }
 
+    /// An agent session's status, a finished turn counted as seen once
+    /// any client viewed it (`None` once untracked).
+    pub fn agent_status(&self, id: &str) -> Option<StatusView> {
+        self.board().status(id, Audience::Anyone)
+    }
+
     /// Every agent session's status and workspace rollup, for one client.
     pub fn status_snapshot(&self, client: &str) -> Snapshot {
         self.board().snapshot(Audience::Client(client))

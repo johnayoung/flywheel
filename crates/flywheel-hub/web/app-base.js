@@ -355,6 +355,7 @@ function closeOverlays(keep) {
   if (keep !== "commands" && commands.isOpen()) commands.toggle();
   if (keep !== "flywheel") flywheel.close();
   if (keep !== "review") review.close();
+  if (keep !== "queue") promptQueue.close();
   explain.close();
 }
 
@@ -419,6 +420,8 @@ const attention = window.FwHubAttention({
   $, el, icon, age, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
   flywheel,
   fanout,
+  // Stalled prompt queues (queue.js).
+  queue: () => promptQueue,
 });
 const notify = window.FwHubNotify({
   $, state, store, prefs: settings, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,
@@ -527,6 +530,19 @@ const handoff = window.FwHubHandoff({
     const term = focusedTerm();
     return term && term.hasSelection() ? term.getSelection() : "";
   },
+});
+
+// Prompt queues (queue.js): prompts typed into an agent session one
+// finished turn at a time.
+const promptQueue = window.FwHubQueue({
+  $, el, icon, api, age, state, sessionById, isAgent,
+  toast: (...args) => commands.toast(...args),
+  keyOf: (id) => settings.keyOf(id),
+  confirmDialog: (options) => confirmDialog(options),
+  openSession: (id) => openSession(id),
+  refresh: () => refresh().catch(() => {}),
+  focusTerminal: () => focusTerminal(),
+  onOpen: () => closeOverlays("queue"),
 });
 
 // Read-only share links and recordings (sharing.js).

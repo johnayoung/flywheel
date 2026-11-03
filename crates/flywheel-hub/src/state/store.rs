@@ -10,6 +10,7 @@ use crate::auth::write_private;
 use crate::fanout::{Fanout, MAX_FANOUTS};
 use crate::layout::{Layout, Tab};
 use crate::pty::ExitInfo;
+use crate::queue::SessionQueue;
 use chrono::Utc;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -68,8 +69,12 @@ impl HubStore {
                 layouts,
                 templates,
                 fanouts,
+                queues,
                 ..
             } = &mut doc;
+            let before = queues.len();
+            queues.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+            pruned |= queues.len() != before;
             let before = layouts.len();
             layouts.retain(|id, _| workspaces.iter().any(|w| &w.id == id));
             pruned |= layouts.len() != before;
@@ -581,6 +586,7 @@ impl HubStore {
             }
         }
         let removed = self.doc.sessions.remove(index);
+        let queue = self.doc.queues.remove(id);
         let workspace_id = removed.workspace_id.clone();
         let previous_layout = self.doc.layouts.get(&workspace_id).cloned();
         let relaid = self
@@ -594,6 +600,9 @@ impl HubStore {
                 (workspace_id.clone(), layout.rev)
             });
         self.save_or_rollback(|doc| {
+            if let Some(queue) = queue {
+                doc.queues.insert(removed.id.clone(), queue);
+            }
             doc.sessions.insert(index, removed);
             for (session, (reviewer, review_of)) in doc.sessions.iter_mut().zip(previous_pairs) {
                 session.reviewer = reviewer;
@@ -818,6 +827,48 @@ impl HubStore {
         let kept = removed.clone();
         self.save_or_rollback(|doc| doc.fanouts.insert(index, kept))?;
         Ok(removed)
+    }
+
+    // --- prompt queues -------------------------------------------------------
+
+    /// Session `id`'s prompt queue (`None`: never queued to).
+    pub fn queue(&self, id: &str) -> Option<&SessionQueue> {
+        self.doc.queues.get(id)
+    }
+
+    /// Every session's queue.
+    pub fn queues(&self) -> &BTreeMap<String, SessionQueue> {
+        &self.doc.queues
+    }
+
+    /// Change session `id`'s queue (created empty) with `edit` and save
+    /// (put back as it was when the save fails). An emptied queue that
+    /// holds nothing worth keeping is dropped.
+    pub fn update_queue<R>(
+        &mut self,
+        id: &str,
+        edit: impl FnOnce(&mut SessionQueue) -> R,
+    ) -> Result<R, StateError> {
+        self.session(id)?;
+        let previous = self.doc.queues.get(id).cloned();
+        let queue = self.doc.queues.entry(id.to_owned()).or_default();
+        let result = edit(queue);
+        if queue.is_vacant() {
+            self.doc.queues.remove(id);
+        }
+        if self.doc.queues.get(id) == previous.as_ref() {
+            return Ok(result);
+        }
+        let key = id.to_owned();
+        self.save_or_rollback(|doc| match previous {
+            Some(previous) => {
+                doc.queues.insert(key, previous);
+            }
+            None => {
+                doc.queues.remove(&key);
+            }
+        })?;
+        Ok(result)
     }
 
     fn workspace_index(&self, id: &str) -> Result<usize, StateError> {

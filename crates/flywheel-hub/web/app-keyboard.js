@@ -97,6 +97,7 @@ function paletteCommands() {
   fanout.paletteItems(cmd);
   review.paletteItems(cmd);
   handoff.paletteItems(cmd);
+  promptQueue.paletteItems(cmd);
   mobile.paletteItems(cmd);
   notify.paletteItems(cmd);
   for (const workspace of state.workspaces) {
@@ -386,6 +387,7 @@ const GLOBAL_ACTIONS = {
   "review.toggle": () => review.togglePill(),
   "handoff.send": () => (state.attached ? handoff.sendSelection(state.attached) : false),
   "review.ask": () => (state.attached ? handoff.askReview(state.attached) : false),
+  "queue.toggle": () => promptQueue.togglePill(),
   "share.open": () => (sharing.canShare(state.attached) ? sharing.open(state.attached) : false),
   "record.toggle": () => (sharing.canRecord(state.attached) ? sharing.toggleRecord(state.attached) : false),
   "fanout.open": () => {
@@ -484,6 +486,7 @@ const actions = {
   "flip-companion": () => commands.flipCompanion(),
   "toggle-flywheel": () => flywheel.togglePill(),
   "toggle-review": () => review.togglePill(),
+  "toggle-queue": () => promptQueue.togglePill(),
   search: () => search.open(),
   settings: () => {
     document.body.classList.remove("side-open");

@@ -67,6 +67,7 @@ impl Hub {
             .launch
             .as_ref()
             .is_some_and(agent::AgentLaunch::bypasses_permissions);
+        let queue = self.queue_brief(&record.id);
         SessionView {
             record,
             live,
@@ -75,6 +76,7 @@ impl Hub {
             usage,
             unchecked,
             recording,
+            queue,
         }
     }
 
@@ -629,6 +631,9 @@ impl Hub {
     pub fn remove_session(&self, id: &str) -> Result<(), HubError> {
         let described = self.event_session(id);
         let mut store = self.store();
+        let queued = store
+            .queue(id)
+            .map_or(0, crate::queue::SessionQueue::pending_count);
         let relaid = store.remove_session(id)?;
         let live = self.live().remove(id);
         drop(store);
@@ -656,6 +661,18 @@ impl Hub {
             Err(e) => eprintln!("fw hub: removing session {id}: its share links stay: {e}"),
         }
         if let Some(session) = described {
+            if queued > 0 {
+                // Its queue goes with it: whoever queued must hear of it.
+                self.emit_lifecycle(
+                    "queue.stalled",
+                    serde_json::json!({
+                        "session": session.clone(),
+                        "reason": "the session was removed",
+                        "item": null,
+                        "pending": queued,
+                    }),
+                );
+            }
             self.emit_lifecycle("session.removed", serde_json::json!({ "session": session }));
         }
         Ok(())

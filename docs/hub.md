@@ -74,7 +74,7 @@ Docs column: `topic: section`; read it with `fw docs <topic>`.
 | Plugins | local executables on hub events and as palette actions | [hub-reference: plugin.toml](hub/reference.md#plugintoml), [hub-api: Plugins](hub/api.md#plugins) |
 | Doctor | checks this machine for the hub, each finding with a fix | [hub-internals: Doctor](hub/internals.md#doctor) |
 | API | REST + terminal and events WebSockets | [hub-api](hub/api.md) |
-<!-- Prompt queue (hub/35): add its row here. -->
+| Prompt queue | per-session prompts the hub types in once the agent is done, exactly once | [hub-workflows: Prompt queue](hub/workflows.md#prompt-queue) |
 
 ## Verbs
 
@@ -84,7 +84,7 @@ Full syntax, flags, and files: [hub-reference](hub/reference.md). `fw hub <verb>
 |---|---|
 | Server | `start` `stop` `upgrade` `status` `logs` `serve` `install-service` `doctor` |
 | Sign-in and access | `open` `url` `token` `tls` `peer` `machine` `share` |
-| Sessions | `ls` `new` `send` `read` `wait` `attach` `kill` `relaunch` `explain` `import` `template` |
+| Sessions | `ls` `new` `send` `read` `wait` `attach` `kill` `relaunch` `explain` `import` `template` `queue` |
 | Agent output | `commands` `search` `record` |
 | Git and agents together | `review` `merge` `handoff` `ask-review` `fanout` |
 | Settings | `config` `plugin` |

@@ -93,6 +93,9 @@ pub struct HubOptions {
     pub share_policy: crate::share::SharePolicy,
     /// Which agent kind "ask for a review" launches (`review.reviewer`).
     pub reviewer: crate::config::ReviewerChoice,
+    /// How long a session goes without typed input before its prompt
+    /// queue delivers (`queue.typing_quiet`).
+    pub queue_typing_quiet: Duration,
 }
 
 impl HubOptions {
@@ -125,6 +128,7 @@ impl HubOptions {
             record_limits: crate::record::RecordLimits::default(),
             share_policy: crate::share::SharePolicy::default(),
             reviewer: crate::config::ReviewerChoice::Other,
+            queue_typing_quiet: crate::queue::DEFAULT_TYPING_QUIET,
         }
     }
 }
@@ -309,6 +313,9 @@ pub struct SessionView {
     /// The recording being written (`fw hub record start`): its file name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recording: Option<String>,
+    /// Its prompt queue (see [`crate::queue`]), when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue: Option<crate::queue::QueueBrief>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes &T
@@ -466,6 +473,8 @@ pub struct Hub {
     shares: crate::share::ShareStore,
     /// Session recordings (`fw hub record`).
     recordings: Arc<crate::record::Recordings>,
+    /// Prompt queues' typing times, holds, and delivery gate.
+    queue: crate::queue::QueueRuntime,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -505,6 +514,7 @@ impl Hub {
         *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
         crate::transcript::spawn_watcher(&hub);
         git::spawn_watcher(&hub);
+        hub.start_queues();
         Ok(hub)
     }
 
@@ -528,6 +538,7 @@ impl Hub {
             record_limits: options.record_limits,
             share_policy: options.share_policy,
             reviewer: options.reviewer,
+            queue_typing_quiet: options.queue_typing_quiet,
         };
         let record_limits = options.record_limits;
         Ok(Arc::new(Self {
@@ -561,6 +572,7 @@ impl Hub {
                 &options_state_dir,
                 record_limits,
             )),
+            queue: crate::queue::QueueRuntime::default(),
             _serve_lock: serve_lock,
         }))
     }
@@ -634,6 +646,11 @@ impl Hub {
     /// Read-only share links.
     pub fn shares(&self) -> &crate::share::ShareStore {
         &self.shares
+    }
+
+    /// The prompt queues' runtime side.
+    pub(crate) fn queue_runtime(&self) -> &crate::queue::QueueRuntime {
+        &self.queue
     }
 
     /// Session recordings.
@@ -792,6 +809,9 @@ impl Hub {
     /// `timeout` for them to exit, and release their PTYs. (Stopped is
     /// recorded first: the hangup's own exit must not read as a crash.)
     pub fn shutdown(&self, timeout: Duration) {
+        // No prompt is typed into a session being hung up (one under way
+        // finishes first).
+        self.queue.stop(KILL_GRACE);
         // Graders running now are killed; they run again on the next start.
         self.grading.stop();
         if let Some(mut server) = self

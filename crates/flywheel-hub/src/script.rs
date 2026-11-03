@@ -306,6 +306,23 @@ fn pairing_label(session: &Value, sessions: &[Value]) -> String {
     label
 }
 
+/// ` (queue: 2)`, ` (queue: 2, paused)`, ` (queue stalled: why)` for a
+/// session with a prompt queue, else empty.
+fn queue_label(session: &Value) -> String {
+    let Some(queue) = session.get("queue").filter(|q| q.is_object()) else {
+        return String::new();
+    };
+    if let Some(stall) = queue.get("stalled").filter(|s| s.is_object()) {
+        return format!(" (queue stalled: {})", str_field(stall, "reason"));
+    }
+    let pending = queue.get("pending").and_then(Value::as_u64).unwrap_or(0);
+    match (pending, queue.get("paused") == Some(&Value::Bool(true))) {
+        (0, false) => String::new(),
+        (n, false) => format!(" (queue: {n})"),
+        (n, true) => format!(" (queue: {n}, paused)"),
+    }
+}
+
 /// A token count for humans: `950`, `12.3k`, `4.56M`.
 pub fn tokens_label(n: u64) -> String {
     match n {
@@ -433,11 +450,12 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                     state_label(s),
                     str_field(s, "name").to_owned(),
                     format!(
-                        "{}{}{}{}{}",
+                        "{}{}{}{}{}{}",
                         live_cwd(s),
                         git_label(s),
                         companion_label(s, &sessions),
                         pairing_label(s, &sessions),
+                        queue_label(s),
                         usage_label(s)
                     ),
                 ]

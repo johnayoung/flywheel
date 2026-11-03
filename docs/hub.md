@@ -1,6 +1,6 @@
 # Hub
 
-`fw hub` is a web workspace for AI coding agents (Claude Code, Codex, plain shells): the hub server owns every terminal as a real PTY, and browsers, phones, and `fw hub attach` attach and detach without disturbing it. Workspaces group folders (git repos or plain directories); agents run in them or in sibling git worktrees, with live status, exact-copy suggested commands, review, and verified fan-outs beside the terminals. Crate: `crates/flywheel-hub`.
+`fw hub` is a web workspace for AI coding agents (Claude Code, Codex, shells) whose server owns every terminal, so browsers, phones, and `fw hub attach` come and go without disturbing a session. Workspaces group folders; agents run there or in sibling git worktrees, with live status, exact-copy suggested commands, review, and verified fan-outs. Crate: `crates/flywheel-hub`.
 
 ## Security first
 
@@ -15,7 +15,7 @@
   - local CA (`--tls auto`): installing it trusts this hub's names only; check the fingerprint (`fw hub tls ca`).
   - agent status reports: advisory UI state; they cannot start, stop, or change a session.
 
-Details: [hub/security.md](hub/security.md).
+Details: [hub-security](hub/security.md).
 
 ## 60-second quickstart
 
@@ -44,39 +44,41 @@ After a rebuild use `fw hub upgrade` (live handoff, no session restarts), not st
 
 ## Feature map
 
+Docs column: `topic: section`; read it with `fw docs <topic>`.
+
 | Feature | What | Docs |
 |---|---|---|
-| Sessions | server-owned PTYs; snapshot replay on attach; many viewers | [internals](hub/internals.md#model) |
-| Workspaces | name + 1..32 folders; VS Code `*.code-workspace` import | [reference](hub/reference.md#verbs), [internals](hub/internals.md#model) |
-| Lifecycle | `start` / `stop` / `upgrade` (live handoff) / restore on restart / systemd unit | [internals](hub/internals.md#lifecycle-and-restore) |
-| Agent status | working / blocked / done / idle per client, hooks + screen manifests, `explain` | [internals](hub/internals.md#agent-status) |
-| Agent launcher | first prompt, model, permissions, per-workspace templates | [workflows](hub/workflows.md#agent-launcher) |
-| Suggested commands | agent code blocks exactly as written; Copy / Send / Send + Run | [workflows](hub/workflows.md#suggested-commands) |
-| Scripting | `new` / `send` / `wait` / `read` / `commands` from scripts and agents | [workflows](hub/workflows.md#scripting-agents) |
-| Terminal client | `fw hub attach`: any terminal, local or over SSH | [internals](hub/internals.md#terminal-client-fw-hub-attach) |
-| Layout | tabs and split panes per workspace, shared by every browser | [internals](hub/internals.md#layout-tabs-and-split-panes) |
-| Phone | key bar, quick answers, compose, PWA, Needs-you start screen | [internals](hub/internals.md#phone) |
-| Worktrees | sibling `<repo>.worktrees/<task>` per agent; companion shells | [workflows](hub/workflows.md#worktrees-and-companion-shells) |
-| Review | branch diff, commit / push / PR / rebase / ff-merge with exact-command plans | [workflows](hub/workflows.md#review) |
-| Handoff, peer review | send a selection / diff / command to another agent; Claude <-> Codex review | [workflows](hub/workflows.md#handoff-and-peer-review) |
-| Verified fan-out | one prompt to 2-6 agents, graded by commands the hub runs; pick the winner | [workflows](hub/workflows.md#verified-fan-out) |
-| Flywheel panel | the verified loop's tasks, runs, workers beside the terminals | [workflows](hub/workflows.md#flywheel-panel) |
-| Search | one query over scrollback, transcripts, commands | [internals](hub/internals.md#search) |
-| Usage and cost | tokens and list-price cost per session, workspace, day, week | [workflows](hub/workflows.md#usage-and-cost) |
-| Notifications | browser alerts; ntfy-style push on blocked / done | [internals](hub/internals.md#push-notifications) |
-| Remote access | tailscale serve, built-in TLS, LAN | [security](hub/security.md#remote-access) |
-| Machines | one UI over several hubs, proxied with peer credentials | [security](hub/security.md#machines-and-peers) |
-| Share links | read-only, expiring live views of a session | [security](hub/security.md#share-links) |
-| Recording | asciinema v2 `.cast` per session; in-browser replay | [internals](hub/internals.md#recording) |
-| Settings | `hub.toml` (server) + synced UI settings and rebindable keys | [reference](hub/reference.md#hubtoml) |
-| Plugins | local executables on hub events and as palette actions | [reference](hub/reference.md#plugintoml), [api](hub/api.md#plugins) |
-| Doctor | checks this machine for the hub, each finding with a fix | [internals](hub/internals.md#doctor) |
-| API | REST + terminal and events WebSockets | [api](hub/api.md) |
+| Sessions | server-owned PTYs; snapshot replay on attach; many viewers | [hub-internals: Model](hub/internals.md#model) |
+| Workspaces | name + 1..32 folders; VS Code `*.code-workspace` import | [hub-reference: Verbs](hub/reference.md#verbs), [hub-internals: Model](hub/internals.md#model) |
+| Lifecycle | `start` / `stop` / `upgrade` (live handoff) / restore on restart / systemd unit | [hub-internals: Lifecycle and restore](hub/internals.md#lifecycle-and-restore) |
+| Agent status | working / blocked / done / idle per client, hooks + screen manifests, `explain` | [hub-internals: Agent status](hub/internals.md#agent-status) |
+| Agent launcher | first prompt, model, permissions, per-workspace templates | [hub-workflows: Agent launcher](hub/workflows.md#agent-launcher) |
+| Suggested commands | agent code blocks exactly as written; Copy / Send / Send + Run | [hub-workflows: Suggested commands](hub/workflows.md#suggested-commands) |
+| Scripting | `new` / `send` / `wait` / `read` / `commands` from scripts and agents | [hub-workflows: Scripting agents](hub/workflows.md#scripting-agents) |
+| Terminal client | `fw hub attach`: any terminal, local or over SSH | [hub-internals: Terminal client: fw hub attach](hub/internals.md#terminal-client-fw-hub-attach) |
+| Layout | tabs and split panes per workspace, shared by every browser | [hub-internals: Layout: tabs and split panes](hub/internals.md#layout-tabs-and-split-panes) |
+| Phone | key bar, quick answers, compose, PWA, Needs-you start screen | [hub-internals: Phone](hub/internals.md#phone) |
+| Worktrees | sibling `<repo>.worktrees/<task>` per agent; companion shells | [hub-workflows: Worktrees and companion shells](hub/workflows.md#worktrees-and-companion-shells) |
+| Review | branch diff, commit / push / PR / rebase / ff-merge with exact-command plans | [hub-workflows: Review](hub/workflows.md#review) |
+| Handoff, peer review | send a selection / diff / command to another agent; Claude <-> Codex review | [hub-workflows: Handoff and peer review](hub/workflows.md#handoff-and-peer-review) |
+| Verified fan-out | one prompt to 2-6 agents, graded by commands the hub runs; pick the winner | [hub-workflows: Verified fan-out](hub/workflows.md#verified-fan-out) |
+| Flywheel panel | the verified loop's tasks, runs, workers beside the terminals | [hub-workflows: Flywheel panel](hub/workflows.md#flywheel-panel) |
+| Search | one query over scrollback, transcripts, commands | [hub-internals: Search](hub/internals.md#search) |
+| Usage and cost | tokens and list-price cost per session, workspace, day, week | [hub-workflows: Usage and cost](hub/workflows.md#usage-and-cost) |
+| Notifications | browser alerts; ntfy-style push on blocked / done | [hub-internals: Push notifications](hub/internals.md#push-notifications) |
+| Remote access | tailscale serve, built-in TLS, LAN | [hub-security: Remote access](hub/security.md#remote-access) |
+| Machines | one UI over several hubs, proxied with peer credentials | [hub-security: Machines and peers](hub/security.md#machines-and-peers) |
+| Share links | read-only, expiring live views of a session | [hub-security: Share links](hub/security.md#share-links) |
+| Recording | asciinema v2 `.cast` per session; in-browser replay | [hub-internals: Recording](hub/internals.md#recording) |
+| Settings | `hub.toml` (server) + synced UI settings and rebindable keys | [hub-reference: hub.toml](hub/reference.md#hubtoml) |
+| Plugins | local executables on hub events and as palette actions | [hub-reference: plugin.toml](hub/reference.md#plugintoml), [hub-api: Plugins](hub/api.md#plugins) |
+| Doctor | checks this machine for the hub, each finding with a fix | [hub-internals: Doctor](hub/internals.md#doctor) |
+| API | REST + terminal and events WebSockets | [hub-api](hub/api.md) |
 <!-- Prompt queue (hub/35): add its row here. -->
 
 ## Verbs
 
-Full syntax, flags, and files: [hub/reference.md](hub/reference.md). `fw hub <verb> --help` is authoritative.
+Full syntax, flags, and files: [hub-reference](hub/reference.md). `fw hub <verb> --help` is authoritative.
 
 | Group | Verbs |
 |---|---|
@@ -90,10 +92,10 @@ Full syntax, flags, and files: [hub/reference.md](hub/reference.md). `fw hub <ve
 
 ## More
 
-- [hub/reference.md](hub/reference.md) -- every verb and flag, serve flags, `hub.toml`, `notify.toml`, `plugin.toml`, state-dir files, keyboard shortcuts.
-- [hub/api.md](hub/api.md) -- REST routes, terminal and events WebSockets, plugin payloads.
-- [hub/security.md](hub/security.md) -- auth, remote access, TLS, machines and peers, share links, connection bounds.
-- [hub/workflows.md](hub/workflows.md) -- scripting, launcher, suggested commands, usage, worktrees, review, handoff, fan-out, Flywheel panel.
-- [hub/internals.md](hub/internals.md) -- model, terminal emulation, lifecycle, restore, live handoff, status detection, layout, phone, search, recording, push, doctor.
+- [hub-reference](hub/reference.md) -- every verb and flag, serve flags, `hub.toml`, `notify.toml`, `plugin.toml`, state-dir files, keyboard shortcuts.
+- [hub-api](hub/api.md) -- REST routes, terminal and events WebSockets, plugin payloads.
+- [hub-security](hub/security.md) -- auth, remote access, TLS, machines and peers, share links, connection bounds.
+- [hub-workflows](hub/workflows.md) -- scripting, launcher, suggested commands, usage, worktrees, review, handoff, fan-out, Flywheel panel.
+- [hub-internals](hub/internals.md) -- model, terminal emulation, lifecycle, restore, live handoff, status detection, layout, phone, search, recording, push, doctor.
 
-Embedded in the binary: `fw docs hub`, `fw docs hub-reference`, `fw docs hub-api`, `fw docs hub-security`, `fw docs hub-workflows`, `fw docs hub-internals`.
+Read each with `fw docs <topic>`, e.g. `fw docs hub-workflows`.

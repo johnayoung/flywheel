@@ -17,7 +17,10 @@
 //!   it does not, and has one `## Plugin events` row per
 //!   [`plugins::EVENTS`] entry.
 //! * `docs/hub.md` (the front door) names every top-level verb and stays
-//!   short.
+//!   short; `docs/cli.md`'s `| Hub |` row names every top-level verb.
+//! * All hub pages stay within a total and per-page byte budget and a
+//!   line-length cap (condensed, not moved), and every link between them
+//!   names the `fw docs` topic it opens (`hub-workflows: Verified fan-out`).
 //!
 //! [`config::EXAMPLE`]: crate::config::EXAMPLE
 //! [`config::KEYS`]: crate::config::KEYS
@@ -596,4 +599,138 @@ fn hub_doc_links_resolve() {
         "terminal-client-fw-hub-attach"
     );
     assert_eq!(anchor("hub.toml"), "hubtoml");
+}
+
+/// Every hub doc page, as `(path under docs/, its \`fw docs\` topic)`.
+const PAGES: [(&str, &str); 6] = [
+    ("hub.md", "hub"),
+    ("hub/reference.md", "hub-reference"),
+    ("hub/api.md", "hub-api"),
+    ("hub/security.md", "hub-security"),
+    ("hub/workflows.md", "hub-workflows"),
+    ("hub/internals.md", "hub-internals"),
+];
+
+/// The hub docs' size budget, all pages together: condensed, not moved.
+const HUB_DOCS_MAX_BYTES: usize = 100 * 1024;
+/// One reference page's budget.
+const PAGE_MAX_BYTES: usize = 26 * 1024;
+/// The longest line any hub page may hold: a line longer than this is a
+/// paragraph that wants splitting or cutting.
+const LINE_MAX_CHARS: usize = 400;
+
+#[test]
+fn hub_docs_stay_concise() {
+    let mut total = 0;
+    let mut errors = Vec::new();
+    for (page, _) in PAGES {
+        let text = read_doc(page);
+        total += text.len();
+        if page != "hub.md" && text.len() > PAGE_MAX_BYTES {
+            errors.push(format!(
+                "{page} is {} bytes (budget {PAGE_MAX_BYTES})",
+                text.len()
+            ));
+        }
+        for (n, line) in text.lines().enumerate() {
+            let chars = line.chars().count();
+            if chars > LINE_MAX_CHARS {
+                errors.push(format!(
+                    "{page}:{}: {chars} chars (max {LINE_MAX_CHARS})",
+                    n + 1
+                ));
+            }
+        }
+    }
+    if total > HUB_DOCS_MAX_BYTES {
+        errors.push(format!(
+            "hub docs total {total} bytes (budget {HUB_DOCS_MAX_BYTES})"
+        ));
+    }
+    assert!(
+        errors.is_empty(),
+        "hub docs grew past their budget (condense, do not move):\n{}",
+        errors.join("\n")
+    );
+}
+
+/// The `[text](target)` links of `text`.
+fn links(text: &str) -> Vec<(&str, &str)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("](") {
+        let label_start = rest[..at].rfind('[').map_or(at, |i| i + 1);
+        let label = &rest[label_start..at];
+        let after = &rest[at + 2..];
+        let Some(end) = after.find(')') else { break };
+        out.push((label, &after[..end]));
+        rest = &after[end..];
+    }
+    out
+}
+
+#[test]
+fn hub_links_name_their_fw_docs_topic() {
+    // `fw docs` prints the markdown raw: a link must say which topic to
+    // open (`hub-workflows: Verified fan-out`), not only a repo path.
+    let mut errors = Vec::new();
+    for (page, _) in PAGES {
+        let dir = std::path::Path::new(page)
+            .parent()
+            .unwrap_or(std::path::Path::new(""));
+        let text = read_doc(page);
+        for (label, target) in links(&text) {
+            let file = target.split('#').next().unwrap_or_default();
+            if file.is_empty() || target.contains("://") {
+                continue;
+            }
+            let joined = dir.join(file);
+            let resolved = joined
+                .to_string_lossy()
+                .replace("hub/../", "")
+                .trim_start_matches("./")
+                .to_owned();
+            let Some((_, topic)) = PAGES.iter().find(|(p, _)| *p == resolved) else {
+                continue;
+            };
+            let named = label == *topic || label.starts_with(&format!("{topic}: "));
+            if !named {
+                errors.push(format!(
+                    "{page}: [{label}]({target}) should read [{topic}...]"
+                ));
+            }
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "hub doc links must name their fw docs topic:\n{}",
+        errors.join("\n")
+    );
+}
+
+#[test]
+fn cli_md_hub_row_names_every_verb() {
+    let cli = read_doc("cli.md");
+    let row = cli
+        .lines()
+        .find(|l| l.starts_with("| Hub |"))
+        .expect("docs/cli.md has a `| Hub |` row");
+    let tree = tree();
+    let missing: Vec<&str> = tree
+        .get_subcommands()
+        .map(clap::Command::get_name)
+        .filter(|name| *name != "help" && !row.contains(&format!("`{name}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "docs/cli.md `| Hub |` row misses {missing:?}"
+    );
+}
+
+#[test]
+fn link_scanner_reads_labels() {
+    assert_eq!(
+        links("a [hub-api](hub/api.md) b [x [y]](z.md#q)"),
+        vec![("hub-api", "hub/api.md"), ("y]", "z.md#q")]
+    );
 }

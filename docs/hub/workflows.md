@@ -1,91 +1,96 @@
 # Hub workflows
 
-Driving agents: scripting, launching, suggested commands, cost, worktrees, review, handoff, verified fan-out, and the Flywheel panel. Front door: [../hub.md](../hub.md).
+Driving agents from scripts and the UI. Front door: [hub](../hub.md).
 
 ## Scripting agents
-
-`send` types, `wait` blocks on the events socket (no polling), `read` / `commands` read back. `wait --until idle` accepts `done`; `--changed` ignores the state current at start (the previous turn's `done`), but against this machine's hub counts any status that began after the wait process started (Linux: to the 10 ms tick), so `fw hub wait --changed &` then a prompt cannot miss a fast turn; an agent wait fails (1) if the session ends first; `--until exit` prints `exited N` / `killed (SIG)`. `--timeout` bounds everything, connecting included, but the state is always checked once (`--timeout 0`: check and return; reaching the hub may take up to 1 s).
 
 ```bash
 id=$(fw hub new demo --kind claude --name fixer)
 fw hub wait "$id" --until idle --timeout 60           # agent up, waiting for a prompt
 fw hub send "$id" $'Fix the failing test in src/lib.rs\n'
 fw hub wait "$id" --until done --changed --timeout 900 || { fw hub read "$id"; exit 1; }
-fw hub commands "$id" --last > next.sh                # the newest shell block it suggested, exactly
-fw hub send sh "$(cat next.sh)" --enter               # run it in an interactive shell session
-fw hub new demo --name build -- sh -c "$(cat next.sh)"   # or as a one-shot session...
-fw hub wait build --until exit --timeout 600          # ...and wait for it to end (prints `exited N`)
-fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"   # 0: it waits on a permission prompt
+fw hub commands "$id" --last > next.sh                # newest shell block it suggested, exactly
+fw hub send sh "$(cat next.sh)" --enter               # run it in a shell session
+fw hub new demo --name build -- sh -c "$(cat next.sh)" && fw hub wait build --until exit --timeout 600
+fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"   # 0: it waits on a prompt
 ```
+
+- `wait` listens on the events socket (no polling). Exit 0 met, 124 timeout, 1 error (an agent wait also fails if the session ends first).
+- `--changed` ignores the state current at start but counts any status begun after the wait process started, so `wait --changed &` then a prompt cannot miss a fast turn.
+- `--until idle` also accepts `done`; `--until exit` prints `exited N` / `killed (SIG)`. `--timeout 0` checks once.
 
 ## Agent launcher
 
-The new-session form (and `fw hub new`) starts an agent with:
+The new-session form and `fw hub new` take:
 
-- **First prompt**: passed as the CLI's positional prompt after `--` (`claude [opts] -- PROMPT`, `codex [opts] -- PROMPT`), so it is the first user turn (after Claude's folder-trust dialog, if shown). Only on create; a relaunch or restore never re-sends it. Max 32 KiB.
-- **Model**: `claude --model` (alias or full id) / `codex -m`; suggestions offered, any id accepted (`[A-Za-z0-9._:/@[]-]`, no leading `-`).
-- **Permissions**: Claude `--permission-mode manual|acceptEdits|plan|auto|dontAsk|bypassPermissions` (the UI warns on bypass, `fw hub new` prints a warning, the hub logs it, views carry `unchecked: true`); Codex `-a untrusted|on-failure|on-request|never` and `-s read-only|workspace-write|danger-full-access`. Recorded as the session's `launch`, reapplied on relaunch/restore.
-- **Templates** (per workspace, in `state.json`, schema 3; agents only): name, kind, prompt, model, permissions, worktree yes/no. Pick one in the form to fill it, "save as template" / delete there (both ask for a second click), or `fw hub template`. Saving over an existing name is refused unless `--replace` (overwrites every option) or `--edit` (changes only the flags given; `--model ''` clears one). Quick launch: palette "New agent from template: NAME" or the sidebar's **From template** (phone too); an unchecked template is marked, listed last, and asks to confirm. A worktree template gets task `<name-slug>-<4 hex>` unless `new --worktree TASK`. `new --template` flags override the template's; a `--kind` different from the template's keeps only its prompt.
-
-API: [api](api.md#sessions) (`POST /api/sessions`, templates).
+- **First prompt** (`--prompt`, max 32 KiB): passed after `--` as the CLI's first user turn. Only on create; relaunch and restore never re-send it.
+- **Model**: `claude --model` / `codex -m`; any id is accepted.
+- **Permissions**: Claude `--permission-mode` (`bypassPermissions` warns everywhere and marks the session `unchecked`); Codex `-a` approval and `-s` sandbox. Reapplied on relaunch and restore.
+- **Templates** (per workspace, agents only): kind, prompt, model, permissions, worktree yes/no. `fw hub template save` refuses an existing name unless `--replace` (all options) or `--edit` (only the flags given).
+- Launch from a template: palette "New agent from template: NAME", the sidebar's **From template**, or `new --template NAME` (its flags override the template's).
+- Defaults for launches naming none: `hub.toml` `[agents.*]`.
 
 ## Suggested commands
 
-Agents draw suggested commands with margins and wrapping, so copying them off the terminal breaks them. The hub reads the same text from the agent's own record instead and serves each fenced code block exactly as written.
+Agents wrap commands for the screen, so copying them off the terminal breaks them. The hub reads each fenced code block from the agent's own record and serves it **exactly as written**.
 
-- **Sources**: Claude Code's transcript (`projects/*/<agent_session_id>.jsonl`, or the hooks' `transcript_path`), assistant text only (not thinking, tool output, or subagent sidechains); Codex's rollout (`$CODEX_HOME` or `~/.codex`, `sessions/YYYY/MM/DD/rollout-*-<thread-id>.jsonl`, newest day first, at most 400 days back; restore's resume check uses the same search), or, when none is found, the `notify` payload's `last-assistant-message` (closed fences only: the report budget can cut it).
-- **Tailing**: running agent sessions are checked every second (at once on a hook report) from a byte offset; lines over 8 MiB are skipped unread; a replaced or truncated file is re-read without duplicates; `/clear` (new conversation id) finishes the old file and follows the new one. The newest 500 blocks per session (and where reading stopped) are saved to `<state-dir>/commands/<session>.json`, so a restart keeps every block, pre-`/clear` ones included, under the same `seq`, and a resumed agent (restore) is followed on from where reading stopped. A session restored as a fallback shell is not followed (its saved blocks stay listed). A backlog read reports at most the newest 500. Codex rollout items carry no id: a block is keyed by its line's byte offset.
-- **Shell blocks**: languages `bash sh zsh shell console shell-session fish ksh`, or untagged when the first non-comment line starts with a common command, a path (`./x`, `~/x`, `/x`), `*.sh`, `VAR=value`, or `$ `. `command` (what Copy/Send use) is `text`, except in `console`-style blocks (console languages, or untagged starting with `$ `): only the commands, `$ ` stripped, with continuations (after a trailing `\`, or `> ` lines, stripped) and the output lines left out.
-- **Paste** (`Send`, `POST /sessions/{id}/paste`): the same encoding as `fw hub send` (`/input` with `paste`): bracketed when the target program enabled it (markers inside the text removed, newlines sent as CR), trailing newlines dropped, Enter (50 ms later, as its own keypress) only with `run`. A multi-line paste into a terminal without bracketed paste is refused (409) unless `run` (use Copy there).
-- CLI: on a terminal, control characters in a block print as `^[` etc. (piped output and `--json` are exact). A shell session resolves to its workspace's single agent session. `--copy` writes OSC 52 to the terminal (stdout, else `/dev/tty`) and a confirmation to stderr: works over SSH in terminals that allow it; tmux needs `set -g set-clipboard on`; under GNU screen (`$STY`) it is DCS-wrapped; large copies (over ~75 KB encoded) are dropped by some terminals.
-- **Commands drawer** (web): (`suggested` in the header, `Alt C`, or the palette; it overlays the terminal so opening it never resizes the PTY for other viewers) lists the attached agent's code blocks newest first (from a shell session: the workspace's agent that suggested last, or the one picked), unwrapped in monospace, each with Copy (the clipboard API on https/localhost, a selected-textarea fallback on plain-http LAN and iOS Safari), Send (paste into the chosen running shell of the workspace, no Enter) and Send + Run. "send to" defaults to the agent's companion shell, else the attached shell, else a shell in the agent's directory; with none, it is "new shell (companion)" and the buttons read Open shell & send / Open shell & run (start the companion, wait for its prompt, paste). A line under the pickers says where Send goes. Keys in the drawer: arrows / `j` `k` pick, `Enter` or `c` copy, `1`-`9` copy the card with that number (cards are numbered by position; the block's id is the tooltip), `s` Send, `Shift S` Send + Run, `Esc` close. Lines wider than the card fade at the edge with a `wide: scroll` hint. A new shell command from an agent in the workspace in view raises a toast with Copy. The header badge counts the drawer's source only: the attached agent's own unseen blocks (from a shell, the agent that suggested last, named beside the count).
+- Sources: Claude's transcript (assistant text only) and Codex's rollout (`$CODEX_HOME/sessions/.../rollout-*-<thread-id>.jsonl`), else Codex's `notify` payload.
+- Tailed every second and on each hook report; the newest 500 blocks per session persist in `<state-dir>/commands/<id>.json` across restarts and `/clear`.
+- Shell blocks: `bash sh zsh shell console fish ksh ...`, or untagged blocks that start like a command. In `console` blocks `command` keeps only the commands (`$ ` stripped, output dropped).
+- Send (paste) is bracketed when the program enabled it; Enter only with Send + Run. A multi-line paste into a terminal without bracketed paste is refused (409): use Copy.
+- `fw hub commands S --copy`: OSC 52 to your terminal, works over SSH (tmux needs `set -g set-clipboard on`; some terminals drop copies over ~75 KB).
+- **Commands drawer** (`Alt C`): the attached agent's blocks newest first, each with Copy, Send, Send + Run. It overlays the terminal, never resizing the PTY.
+- Send goes to the agent's companion shell by default (else the attached shell); with none the buttons open one first. Keys: `j`/`k`, `Enter`/`c` copy, `1`-`9` copy that card, `s` send, `Shift S` send + run.
 
 ## Usage and cost
 
-The transcript tailer also counts tokens: Claude's per-response `message.usage` (repeated lines of one message id count once; subagent transcripts `<id>/subagents/*.jsonl` included), Codex's rollout `token_count` events (growth of the cumulative totals; model from `turn_context`). Cost uses the model the transcript records (Claude's plan mode may run a different model than `--model`).
-
-- **Prices**: an embedded table (`crates/flywheel-hub/src/usage.rs`, `PRICES`): Anthropic first-party list prices as of 2026-10-06 (cache writes 1.25x input for 5 m TTL, 2x for 1 h; Haiku 5.5 / Sonnet 4.x long-context tiers; fast mode 2x where priced) and OpenAI GPT-5 prices (2025-11). A model not in it shows tokens only and `priced: false` with `unpriced_models` -- never a guessed price. Server-tool fees (web search) are not included.
-- **Where**: each agent session's `usage` (`GET /api/sessions`, `fw hub ls [--json]`, events message `{"type":"usage"}`): turns, tokens, `cost_usd`, `today`, `week`, by model, last call. Header meter (`tokens · cost · billed model`; phone: cost; click or tap for the breakdown in a popover under it) and sidebar row show it (tooltip: breakdown). Costs are API list-price equivalents, also for subscription plans. `GET /api/usage` (also `usage` in `fw hub ls --json`): hub and per-workspace `today` / `week` (local Monday start) / `total`; the sidebar shows today and week.
-- **Kept**: with the session's commands (`<state-dir>/commands/<id>.json`, 62 days of per-day totals, and where each earlier conversation's file was left, so `/resume` of one reads on instead of recounting); a removed session's usage moves to `<state-dir>/usage-archive.json` once (a removed id is never followed again) so rollups keep it.
+- Counted from transcripts: Claude's `message.usage` (subagents included), Codex's `token_count`. Cost uses the model the transcript records.
+- Prices: embedded table (`crates/flywheel-hub/src/usage.rs` `PRICES`; Anthropic list prices as of 2026-10-06, OpenAI GPT-5 prices 2025-11). Unknown models show tokens only, never a guessed price. Server-tool fees are not counted.
+- Costs are API list-price equivalents, including for subscription plans.
+- Shown in the header meter, sidebar rows, `fw hub ls [--json]`, `GET /api/usage` (hub and workspace `today` / `week` / `total`).
+- Kept with the session's commands file (62 days of daily totals); a removed session's usage moves to `usage-archive.json`.
 
 ## Worktrees and companion shells
 
-- **Worktree sessions** (git folders only): `fw hub new WS --worktree TASK [--base REF]` or the new-session form's "in a new sibling worktree" runs `git worktree add -b <prefix>TASK <main-parent>/<repo>.worktrees/TASK <base>` and starts the session there (named TASK unless `--name`). `<main-parent>/<repo>` is the main checkout even when the folder is itself a linked worktree; a path inside a repo, an existing directory or branch, or a bad task name (`[A-Za-z0-9._-]`, max 64) is refused before git runs. Base: `REF`, else the repo's current branch (detached: its commit). A failed launch removes the fresh worktree.
-- The record keeps `worktree: {repo, path, branch, base}`; `cwd` is the worktree. Restore and relaunch keep it there (worktree deleted meanwhile: `restore_error`). The workspace folder is `repo`.
-- **Badges**: every session in a git directory shows branch, ahead/behind (worktree: vs its base; else the upstream), changed and untracked files. A background thread reads them (`git status`, `rev-list`): at start, on agent status changes, ~1.5 s and 4.5 s after a command is run by `send --enter` / Send + Run, and every 20 s for running sessions. Listing never runs git.
-- **Close**: `kill --rm --remove-worktree` (UI: Close offers keep / remove) also closes the session's companion shells and runs `git worktree remove`. Refused (409, nothing closed) while another session (running or not) uses it, and -- unless `--force` -- when it has uncommitted changes, untracked files, or commits its base lacks (base deleted: commits no other local branch has). The branch is deleted only when nothing would be lost; forced removal of an unmerged branch keeps the branch. A plain close keeps the worktree. Only the agent's close removes it (400 on a companion).
-- **Companion shell**: an agent's linked shell in its directory (worktree included), `companion_of: <agent id>`, listed right after it. Created on demand (`Alt \``, the drawer's Open shell, `POST /api/sessions/{id}/companion`); an ended one is relaunched in place, so there is one per agent. Closing the agent closes it too. Suggested-command Send targets it by default. The header's `shell` / `agent` pill flips between them (for phones); `ls` marks it `(companion of AGENT)`.
-- **Readiness** before pasting into a new companion: bracketed paste enabled (bash 5.1+, zsh), else output then 500 ms quiet, else after 5 s anyway (typed ahead; `ready: "timeout"`).
+```bash
+fw hub new WS --kind claude --worktree fix-retry [--base main]   # git worktree add -b <prefix>fix-retry ../<repo>.worktrees/fix-retry
+fw hub kill fix-retry --rm --remove-worktree                     # refused if work would be lost, unless --force
+```
+
+- The worktree is always a sibling of the **main** checkout; base = `--base`, else the current branch. A bad task name, existing dir, or existing branch is refused before git runs; a failed launch removes the worktree.
+- Branch badges (branch, ahead/behind vs base or upstream, changed, untracked) are refreshed in the background: on status changes, after Send + Run, and every 20 s.
+- Removing the worktree is refused (409) while another session uses it, or, without `--force`, with uncommitted changes, untracked files, or commits its base lacks. The branch is deleted only when nothing would be lost.
+- **Companion shell**: one per agent, in its directory (`Alt \``, the drawer, `POST /api/sessions/{id}/companion`). Closing the agent closes it. The header's `shell` / `agent` pill flips between them.
 
 ## Review
 
-Any session in a git folder (worktree sessions, their companions, plain sessions in a repo) can be reviewed from the browser, a phone, or the CLI: header pill `review` / `Alt G` / palette. Desktop: a drawer over the terminal (never resizes the PTY); phones: a full-screen sheet.
+Any session in a git folder: header pill `review`, `Alt G`, or `fw hub review`. A drawer on desktop (never resizes the PTY), a sheet on phones.
 
-- **Base**: a worktree's base; else the branch's upstream; `?base=` / `--base` overrides (400 if it starts with `-` or names no commit).
-- **Shows**: commits on HEAD the base lacks (newest 200; `ahead`/`behind`), committed files vs the merge base with +/- (renames, binary), and the working tree apart: conflicts, staged, unstaged, untracked; upstream sync, remotes (credentials masked), an operation in progress.
-- **Diffs**: per file (a path the scope does not change is a 400; a rename is diffed as one, asked by either name; a conflicted file shows git's combined diff), lazily, unified or side by side (desktop >= 1000 px; phones unified), light syntax colouring; binary files and changes over 400 lines start collapsed; 2000 lines per page with Load more; at most 8 MiB read per file. Re-read when the session's git badge changes.
-- **Actions** -- each a dry run first showing the exact commands (and where they run), what they touch, and why not; running needs that plan's `fingerprint`, and a repository that moved since is refused (409, re-plan):
-  - **Commit all**: `git add -A` then `git commit -F -` (message on stdin; hooks run). What `add` staged must match the plan (same paths, same contents, nothing left unstaged), else the index is put back and nothing is committed. "Ask the agent" pastes a prompt (shown first) into the session's agent asking for a message in a `text` block; the first new block fills the editor.
-  - **Push**: `git push <remote> <planned HEAD>:refs/heads/B` (then `git branch --set-upstream-to=<remote>/B B` where `-u` applies) -- the commit reviewed, never one added since; always the same-named branch (a branch tracking `origin/main` is never pushed onto it): push remote, `remote.pushDefault`, upstream's, `origin`, else the only one (or picked). The upstream is set only when it tracks nothing, or another branch on that remote. Never forced; a diverged remote is git's refusal, shown. New worktree branches are cut `--no-track`.
-  - **Open PR**: `gh pr create --base --head B --title --body-file -` from the pushed same-named branch; the fingerprint covers title, body, base and draft. Refused when not pushed / out of sync, the remote has no host, or `gh` is not installed or not signed in for that host (`gh auth status --hostname`).
-  - **Rebase onto base** (worktrees): `git rebase <base>` in the worktree; refused with uncommitted changes. A conflict stops it there, left in progress; the agent can be asked to resolve and `--continue`, or **Abort** (`git rebase --abort`; `POST .../review/abort`). From the merge dialog, a successful rebase returns to the merge.
-  - **Merge into base** (worktrees): `git -C <main checkout> merge --ff-only <planned B commit>` (a commit landing on B after the plan is not merged). Refused when the main checkout is not on the base, has uncommitted tracked changes or an operation in progress, the base is a commit, or it is not a fast-forward (`needs_rebase`: rebase first). Then offers removing the worktree (the usual close dialog: nothing lost, merged branch deleted).
-- **Staleness**: commit/rebase/abort fingerprints hash `git status --porcelain=v2` plus the content of every changed and untracked file (files over 64 MiB: size and mtime).
-- **Runner**: argv only, no shell; own session (no terminal: nothing prompts), `GIT_TERMINAL_PROMPT=0`, editors `true`; output capped; deadlines (reads 20 s, commit/push 5 min, rebase/merge 2 min, gh 60 s) kill the process group; at most 4 git/gh at once hub-wide; one action per repository at a time. Every action, ask, plan refusal (once until it changes), and worktree removal is logged to the hub log (commands, not messages).
+- Base: the worktree's base, else the upstream; `--base` overrides.
+- Shows commits ahead, committed files vs the merge base, and the working tree (conflicts, staged, unstaged, untracked). Per-file diffs, unified or side by side.
+- **Every action is planned first**: the exact commands, where they run, and any refusal. Running needs that plan's `fingerprint`; a repo that changed since is refused (409, re-plan).
+
+| Action | Runs | Refused when |
+|---|---|---|
+| Commit all | `git add -A`; `git commit -F -` (hooks run) | what `add` staged differs from the plan |
+| Push | `git push <remote> <planned HEAD>:refs/heads/<B>` | never forced; a diverged remote is git's refusal |
+| Open PR | `gh pr create --base --head B --body-file -` | not pushed / out of sync, no `gh` auth for the host |
+| Rebase onto base | `git rebase <base>` in the worktree | uncommitted changes (a conflict stops there; Abort) |
+| Merge into base | `git -C <main checkout> merge --ff-only <planned commit>` | main checkout dirty or off base, not a fast-forward |
+
+- "Ask the agent" pastes a prompt for a commit message or conflict resolution into the session's agent.
+- Runner: argv only, no shell, no prompts (`GIT_TERMINAL_PROMPT=0`), deadlines kill the group, 4 git/gh at once hub-wide, one action per repo. Every action is logged.
 
 ## Handoff and peer review
 
-Claude Code and Codex side by side, working together through the hub. Hub module `agent_handoff.rs` (not `handoff.rs`: that is `fw hub upgrade`'s).
-
-- **Send to agent**: part of one session -> another agent session (any workspace, any machine) as one prompt: `From <session> on <branch>: <what>` (`in <dir>` without a branch; `(machine <host>)` when the target is on another machine), then the content in one fence (longer than any backtick run inside), then `[truncated by fw hub: kept the first N of M bytes]` when cut (default 32 KiB, line boundary). Sources: the terminal selection (palette, `handoff.send` key, phone selection popover), a transcript message or the part of it selected (viewer's `To agent`), a suggested block (Commands drawer), the branch diff or one file's (Review drawer). The hub adds only the header and fence: nothing but what you picked. Composed on the source's hub, edited in the dialog (`Ctrl Enter` sends), delivered on the target's hub (bracketed paste, then Enter); a machine is reached through `/m/<machine>`. CLI: `fw hub handoff FROM TO` (`--machine M`: FROM on M; `--to-machine N|local`: TO on N, or this hub). An agent session restored as a plain shell takes no handoff (409): kill and relaunch it.
-- **Ask for a review** (Review drawer, palette, `review.ask` key, `fw hub ask-review`): a reviewer of the other kind (`review.reviewer`; a shell's work gets Claude; the other kind when that one is not installed; `--kind` must be installed) in the author's directory and worktree, read-only: Claude `--permission-mode plan`, Codex `-a never -s read-only`. First prompt: review `git diff <base>...HEAD` (cut at 24 KiB, with how to read the rest), uncommitted changes noted, findings with file:line, commands and changes in fences. A running paired reviewer of that kind is asked again (pasted); else a new one starts and the one it replaces (stopped, or another kind) is closed: one reviewer per author. Requests are serialized (a double click asks the first reviewer again). 409 when nothing is committed or changed.
-- **Pairing**: the author's `reviewer`, the reviewer's `review_of` (state.json; survives restarts). Sidebar: the reviewer hangs under its author, with linked chips; `fw hub ls`: `(reviewed by R)` / `(reviews A)`. Closing the author closes its reviewers; a reviewer never removes the worktree.
-- **Findings**: the reviewer's text after its last prompt (its transcript; Codex without a rollout: its newest reply's blocks), its code blocks with Copy / To author, and **Send findings to <author>** (editable) under `From <reviewer> on <branch>: review findings (...)`.
-- **Events**: `review.requested`, `handoff.sent` ([api](api.md#plugin-events)).
+- **Send to agent** (`fw hub handoff FROM TO`, palette, `handoff.send`): a terminal selection, transcript message, suggested block, or diff goes to another agent session (any workspace or machine) as one prompt: a `From <session> on <branch>:` header, then the content in one fence. Cut at 32 KiB by default; editable before sending.
+- **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a reviewer of the other kind (`review.reviewer`), read-only (Claude `plan`, Codex `-a never -s read-only`), in the author's worktree, prompted with `git diff <base>...HEAD`. One reviewer per author; asking again reuses it.
+- Findings: the reviewer's latest reply with its code blocks; **Send findings to <author>** pastes them back.
+- Pairing (`reviewer` / `review_of`) survives restarts; closing the author closes its reviewers. Events: `review.requested`, `handoff.sent`.
 
 ## Verified fan-out
 
-One prompt to 2-6 agents (claude and/or codex, a model each), each in its own sibling worktree cut from **the same base commit**, plus grader commands the **hub** runs -- the flywheel loop's verification, beside the terminals. UI: sidebar **Fan-out**, palette "New verified fan-out"; CLI: `fw hub fanout`.
+One prompt to 2-6 agents, each in its own sibling worktree from **the same base commit**, graded by commands the **hub** runs.
 
 ```bash
 id=$(fw hub fanout new demo --prompt "Fix the flaky retry test" \
@@ -97,43 +102,44 @@ fw hub fanout pick "$id" c1 --yes [--rebase]
 fw hub fanout cleanup "$id" [--force] --yes
 ```
 
-- **Agent claims are untrusted**: a candidate's finished turn (Claude `Stop`, Codex `notify`), or its agent's process ending, only *queues* grading; the verdict is the graders' exit codes. **Held out of the prompt only**: agents run as your user, so one could read them from the hub's state or API, and Ask to fix shows the failing command. What is enforced: they run in the worktree, so a grader the repo tracks (`cargo test`) is editable by the agent -- list the paths it reads under `--protect` (compared by content hash against the base: a candidate changing one fails), or put the oracle outside the repo (as with the [held-out gate](../held-out-gate.md)). A grader's absolute-path script (<= 1 MiB) is pinned by hash at launch (changed later, every grading fails); a relative path in the repo (`./scripts/check.sh`) is added to `--protect`. Tracked files flagged skip-worktree / assume-unchanged fail a grading (git status would not show them).
-- **Grading** = flywheel-core's command-grader runner (injected by `fw`, same semantics as a task's `command` graders): in order, `/bin/sh -c` in its own process group, pass = exit 0, the group killed at `--timeout` (default 900 s each), the first failure skips the rest, a failing grader's stdout/stderr tails kept (8 KiB each; a pass keeps none). At most 2 gradings run at once, hub-wide. Recorded per candidate: verdict, each grader's status / exit / duration / output, HEAD and `git status` at the start (a worktree that changes meanwhile is flagged), diff from where it left the base (commits + uncommitted + untracked lines), cost and tokens. A new finished turn grades again (after Ask to fix). Re-grade any time.
-- **Ranking**: passing first (smaller diff, then lower cost; a pass that changes nothing ranks last among them, cannot be picked, and the board warns that the graders pass on the base unchanged), then failing (more graders passing, smaller diff, lower cost), then stale (changed since graded), grading, and not yet graded. Each card says why (`below c1: larger diff (31 vs 1 lines)`).
-- **Pick winner** (needs a fresh pass graded on a clean tree, the worktree still on its fan-out branch, and that branch at exactly the commit that passed -- what lands is what was graded): the review merge (`git -C <main checkout> merge --ff-only <commit>`, plan shown first, fingerprint-confirmed). Base moved since: offered a rebase (`--rebase`), which grades again; pick once it passes. One winner per fan-out.
-- **Cleanup**: remove the others' worktrees and sessions (default: all but the winner), refused per candidate when it holds work nothing else has (commits not in the base, uncommitted or untracked files) unless `--force` (commits stay on their branch); or `--stop-only` (hang up the sessions, keep the worktrees; an agent that never finished is then graded as it is). After the pick the board offers to remove the winner's merged worktree too. `rm` forgets the record only.
-- **Ask to fix** pastes the first failing grader's command, exit, and output tail (or the protected paths changed) into that candidate's agent, then Enter.
-- **Kept** in `state.json` (schema 4; at most 50 fan-outs). A grading cut short by `fw hub stop` or a live handoff (`fw hub upgrade` pauses gradings) runs again in the hub that carries on; a turn finished meanwhile is graded on start.
-- **Needs you**: a fan-out whose graders finished joins the list (green when one passes, after blocked agents) until its board is opened in that browser; its candidates' finished turns are not listed separately. Candidate sessions are named `c1-<name>-<tag>`. A launch that fails part-way removes its sessions, worktrees, and branches. Phone: the board is a full-screen sheet; Pick winner and the cleanup sheet work there.
-- This hub's fan-outs only (another machine's live on its own hub).
+- **Agent claims are untrusted**: a finished turn only queues grading; the verdict is the graders' exit codes.
+- **Graders are held out of the prompt only**: agents run as you and could read them. A grader the repo tracks is editable by the agent: list its inputs under `--protect` (a candidate changing one fails) or keep the oracle outside the repo ([held-out gate](../held-out-gate.md)). Absolute-path scripts are pinned by hash at launch.
+- Grading = flywheel-core's command-grader runner: in order, `/bin/sh -c`, pass = exit 0, `--timeout` 900 s each, first failure stops, 8 KiB output tails kept. 2 gradings at once hub-wide.
+- Ranking: passing (smaller diff, then lower cost), then failing, stale, grading, ungraded. A pass that changes nothing cannot be picked (the graders pass on the base).
+- **Pick** needs a fresh pass on a clean tree at exactly the graded commit, then ff-merges it (plan + fingerprint). Base moved: `--rebase`, which grades again.
+- **Cleanup** removes the losers' worktrees and sessions, refusing ones holding unique work unless `--force`; `--stop-only` keeps worktrees. `rm` forgets the record only.
+- Kept in `state.json` (max 50). Gradings cut short by stop or upgrade rerun in the hub that carries on. This hub's fan-outs only.
 
 ## Fan-outs and flywheel tasks
 
-A fan-out is a one-off; a flywheel task is the durable spec + grader asset the loop re-verifies. Both ways, for a folder flywheel drives with a **directory** work source:
+For a folder flywheel drives with a **directory** work source:
 
 ```bash
-fw hub fanout promote "$id"            # shows the path and the exact bytes; asks
-fw hub fanout promote "$id" --yes      # writes .flywheel/tasks/active/NN-<slug>/<slug>-<tag>.json
+fw hub fanout promote "$id"            # dry run: path and exact bytes
+fw hub fanout promote "$id" --yes      # writes .flywheel/tasks/active/NN-<slug>/<slug>-<tag>.json (uncommitted)
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote** (board **Promote**): goal = `--goal`, else the seeding task's, else the prompt's first line; the whole prompt -> `context.notes`; graders -> `command` graders in order; `--protect` paths -> `context.constraints` lines (the plan names those flywheel.toml's `[submit] protected_paths` does not cover: only that list refuses a landing, and the hub never edits flywheel.toml); the winner's commit (or `--reference CAND`, a passing candidate) -> one `context.references` line, prior work to consult, not the solution (no winner: a warning names the passing candidates). Validated and written by the `flywheel` crate through core's task loader (`hub_tasks.rs`), read back through the directory source. Phase default: a new `NN-<slug>` after every active/archived one; an archived phase name is refused.
-- **Where it lands**: a new **uncommitted** file in the fan-out's main checkout, as `/fw-plan` and `fw init` do; `fw worker` reads the working tree, and the hub never commits to your branch. Refused: an existing file, an id already defined (active or archived), or an id with runs in the store (runs are keyed by task id); writes are serialized, so two promotions never define one id. Dry run first; the write confirms the plan's fingerprint. Then **Run with worker here** (Start worker) so the loop verifies it again. `fw worker` takes no task: it drains every active task not done yet, so the result lists the others it may run first. The board's line follows the file (active, archived once landed, or gone).
-- **Fan out this task** (Flywheel panel, a task's **fan out**): prompt = the task's goal, context, and command graders (`# Goal` / `# Context` / `# Graders`); graders = its command graders (editable), then its **held-out** graders (`[held_out] root`: its registration plus matching standing oracles), added server-side at launch (a client cannot mark a grader held out); protect = `[submit] protected_paths` the hub can hold to (literal paths, `dir/**`; other globs stay landing-only, listed) plus the paths its "Leave `X` unchanged" constraints name. A task with no command grader is refused, naming the graders the hub does not run (rubric / manual / transcript; the worker still applies them). A registry that cannot be read refuses the launch (fail closed).
-- **Held-out graders are kept out of what the hub tells an agent**: a prompt naming one (its command, script path, or script file name) is refused, **Ask to fix** says only that a held-out check failed (no command, no output, a changed oracle's path redacted). Not a sandbox: agents run as your user and could read the registry, `state.json`, or the API, as with the worker's held-out gate.
-- **Promoting a task-seeded fan-out**: the task it came from is the durable one, so the board offers **Run `<task>` with worker here**; a separate task needs an explicit `--task-id` (and leaves the original's held-out oracles behind: register them with `/fw-verify`). With the prompt unedited, the task's context is written back field for field (relevant, references, constraints, non-goals, edge cases, notes, tags), plus the reference commit.
+- **Promote**: goal (`--goal`, else the seeding task's, else the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, the winner's commit -> a reference. Written through core's task loader; refused for an existing file, id, or an id with runs.
+- `--protect` paths become constraints only: only flywheel.toml `[submit] protected_paths` refuses a landing, and the hub never edits flywheel.toml.
+- The file is left **uncommitted** in the main checkout; then **Run with worker here**. `fw worker` drains every active task, so others may run first.
+- **Fan out this task** (Flywheel panel): prompt from the task's goal and context; graders = its command graders plus its **held-out** graders, added server-side. A task with no command grader is refused; an unreadable held-out registry fails closed.
+- Held-out graders never reach an agent through the hub: a prompt naming one is refused, and Ask to fix says only that a held-out check failed. Not a sandbox (agents run as you).
+- Promoting a task-seeded fan-out offers **Run `<task>` with worker here**; a new task needs `--task-id`.
 
 ## Flywheel panel
 
-**Postgres-backed repos read the DSN from the hub's own environment** (`FLYWHEEL_PG_DSN`, else `DATABASE_URL`; flywheel.toml never carries one): start `fw hub serve` from a shell that exports it. One DSN serves every postgres folder; the store label (`postgres host:port/db`, no credentials) shows which database a panel read.
+**Postgres stores read the DSN from the hub's own environment** (`FLYWHEEL_PG_DSN`, else `DATABASE_URL`): start the hub from a shell that exports it.
 
-Workspace folders that are flywheel-adopted repos (a `flywheel.toml` or a `.flywheel/` dir) get a Flywheel panel: the verified loop beside the terminals. Read-only (a task file is written only by a fan-out's confirmed Promote); `--no-flywheel` turns it off (and Promote / fan out this task with it).
+Workspace folders with a `flywheel.toml` or `.flywheel/` get the verified loop beside the terminals. Read-only; `--no-flywheel` turns it off.
 
-- **What it shows**: active phases (`tasks/active/<phase>/`) and their tasks as `pending | running | verified | failed | parked | awaiting | blocked` (from `fw status --json`: `verified` = a DONE lifecycle, `parked` = DONE but its landing parked); in-flight runs (the console's live rows); the 12 newest runs with their latest attempt's grader receipts; worker liveness (a live lease in `task_claims` -- an idle worker holds none) and autopilot liveness (`.flywheel/logs/autopilot/activity.json`); claims; and alerts (failed, stranded, stopped, awaiting a gate, blocked), which also join the sidebar's **Needs you** list: one row per alert while a folder has 1-2, else one row for the folder. **Mark seen** in the panel drops a folder's current alerts from Needs you in this browser until they change or new ones appear. Runs show DONE as `verified`.
-- **Worktrees**: flywheel keeps a store per checkout (`fw worker` / `fw status` resolve `.flywheel/` under the worktree itself), so a workspace folder that is a linked git worktree of an adopted repo reads its own store (empty until a worker runs there) and its panel says `Linked worktree of <main>`; Start worker here runs there, against that store. A sibling-worktree session not in a watched folder gets its base folder's panel, labelled as that checkout's loop.
-- **Where**: an adopted folder's sidebar chip gets a `verified/total` badge (plus the unseen alert count, red, pulsing while runs or daemons are live); click it, the `flywheel` header pill (attached session in an adopted folder; `Alt F`), a Needs-you row, or the palette.
-- **Actions**: **Start worker here** opens a hub shell session `fw worker` (`fw worker 2`, ... when taken) running `<this fw> worker` in the folder, in a split below the focused pane (never over it; a new tab without room) (a real terminal; when it exits, Ctrl-C included, the shell stays; a restart restores it as a plain shell). While a worker the hub started still runs there, a start is refused (409) unless confirmed as another. **Output** on a task / run opens its `fw show` summary and its redacted agent transcript (`<store dir>/logs/runs/<run>.jsonl`, newest 1500 entries, followed live while the run is in flight). **fan out** on a task not yet verified launches a fan-out seeded from it (see [Fan-outs and flywheel tasks](#fan-outs-and-flywheel-tasks)).
-- **Cost**: one watcher thread per adopted folder; every 2s it stats the policy, store (+ `-wal`), task tree, and activity record, and re-reads only on a change or every 15s (leases lapse with time). Each folder's own `flywheel.toml` is read (paths anchored at the folder, never the hub's cwd); stores are opened once and kept until the folder leaves every workspace (a failed read reconnects). A missing SQLite store is never created (tasks list as pending). Tracker sources (`github*`) are not listed (a network call per read): runs, claims, and alerts still show. Opening a store runs its idempotent schema bootstrap, as every `fw` read verb does.
-- **Seam**: `flywheel-hub` defines `flywheel::FlywheelProvider` and plain data; the `flywheel` crate implements it (`hub_flywheel.rs`) over its console/status code and injects it into `fw hub serve`, so the hub never depends on the loop's crates.
+- Shows active phases and tasks (`pending | running | verified | failed | parked | awaiting | blocked`, from `fw status --json`), live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, and alerts.
+- Alerts join the sidebar's **Needs you**; **Mark seen** drops them in this browser until they change.
+- Open it from the folder chip's `verified/total` badge, the `flywheel` header pill (`Alt F`), or the palette.
+- **Start worker here**: a hub shell running `fw worker` in a split below the focused pane. A second is refused (409) unless confirmed.
+- **Output** on a run: its `fw show` summary and redacted agent transcript, followed live.
+- A linked worktree reads its own store (`Linked worktree of <main>`). Tracker sources (`github*`) are not listed.
+- Each adopted folder has one watcher (stat every 2 s, re-read on change or every 15 s). A missing SQLite store is never created.
+- Seam: `flywheel-hub` defines `flywheel::FlywheelProvider`; the `flywheel` crate implements it (`hub_flywheel.rs`), so the hub never depends on the loop's crates.
 
 <!-- Prompt queue (hub/35): its section goes here. -->

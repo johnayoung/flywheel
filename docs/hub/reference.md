@@ -1,12 +1,12 @@
 # Hub reference
 
-Every `fw hub` verb and flag, the serve flags, and the files the hub reads. `fw hub <verb> --help` is authoritative; `crates/flywheel-hub/src/docs_drift.rs` fails the build when this page and the CLI or `hub.toml` schema disagree. Front door: [../hub.md](../hub.md).
+Every `fw hub` verb and flag, the serve flags, and the hub's files. `fw hub <verb> --help` is authoritative; `crates/flywheel-hub/src/docs_drift.rs` fails the build when this page drifts from the CLI or `hub.toml`. Front door: [hub](../hub.md).
 
 ## Conventions
 
 - `SESSION` / `WS`: id, unique id prefix, or name; an exact name beats a prefix; ambiguity is an error.
 - Every verb but `report` takes `--state-dir DIR` (default `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub`).
-- `{remote}` = `[--url URL] [--token T] [--fingerprint SHA256]`: a hub elsewhere. Token: prefer `FW_HUB_TOKEN` (argv is world-readable); without one, the state dir's token goes only to that state dir's running hub. An https `--url` is trusted by the system roots plus this state dir's local CA, or `--fingerprint` (a hub's `fw hub tls ca`, which outlives renewals, or its certificate's).
+- `{remote}` = `[--url URL] [--token T] [--fingerprint SHA256]`: a hub elsewhere. Prefer `FW_HUB_TOKEN` to `--token` (argv is world-readable). TLS trust: [hub-security](security.md#https-without-tailscale).
 - `{machine}` = `[--machine NAME]`: a machine registered on that hub, reached through its proxy (`fw hub ls --machine desktop`).
 - `{serve}` = the [serve flags](#serve-flags).
 
@@ -111,33 +111,32 @@ fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]  
 
 ### Verb notes
 
-- **`new`**: `--create` makes workspace `WS` (with `--folder`) when none matches. `--folder` (alias `--repo`) is a path (relative to the caller's directory; on the hub's machine under `--url`) or a folder's label or directory name. A taken `--name` is refused. Shell `ARGV` replaces `$SHELL`.
-- **`send`**: wraps text in `ESC[200~ ... ESC[201~` only when the program enabled bracketed paste (markers inside the text are stripped, repeatedly); a final newline becomes Enter, sent 50 ms later as its own keypress (`printf 'make\n' | fw hub send s -` runs it). `--raw` sends bytes untouched (`fw hub send s $'\x03' --raw` is Ctrl-C).
-- **`import`**: VS Code workspace files (JSONC). Each `folders` entry's `path` (relative to the file, absolute, or `~/`) or `file://` `uri` (on WSL also `vscode-remote://wsl+<this distro>/...`) becomes a folder, its `name` the label. Workspace named after the file unless `--name` (one file only). Missing folders and non-local entries are listed as skipped; a file with nothing importable fails. An existing name is refused unless `--update` (replaces folders and labels; refused when it drops a folder a running session is in). Every file is tried; exit 1 if any failed.
-- **`open`**: mints a one-time code for `http://<loopback>:<port>/login?code=...[#session=<id>]` (under `--url`: that URL), prints it, and writes a 0600 redirect page `open-<id>.html` in the state dir (expired ones swept) so the code never goes on an opener's argv. Opener: `$BROWSER` (`:`-separated, `%s` = the page's `file://` URL), else on WSL `wslview`, else `cmd.exe /c start`, else `xdg-open` (macOS `open`). Only an opener that cannot start falls through; one that runs and fails ends it (exit 1: the code is single-use).
-- **`url`**: lists a fresh code under every URL that reaches the hub, most remote-friendly first: `public`, `tailnet https (tailscale serve)`, `tailnet (MagicDNS)` / `tailnet` (100.x, only when an interface carries it), `lan (<iface>)` (non-loopback binds; container bridges skipped), `this machine`. `--qr` draws the first remote one (black-on-white half blocks). With TLS on: two QRs (see [security](security.md#https-without-tailscale)). The token is never printed by `serve` or `url`.
-- **`token --rotate`**: a running hub switches at once: every cookie, code, and open terminal or events socket of the old token stops (sockets close 4001; the UI returns to sign-in). Agent hooks are unaffected (per-spawn secrets). With no hub it just rewrites the file.
-- **`report`**: what agent hooks run; needs the session's environment (`FLYWHEEL_HUB_SESSION`, `FLYWHEEL_HUB_REPORT_SOCKET`, `FLYWHEEL_HUB_REPORT_SECRET`), never prints to stdout, fails with exit 1 (never 2, which would stop a Claude `Stop`).
-- **`wait`**, **`kill`**, **`merge`**, **`review`**, **`handoff`**, **`fanout`**: semantics in [workflows.md](workflows.md); **`attach`**, **`explain`**, **`upgrade`**, **`doctor`**: [internals.md](internals.md).
+- **`new`**: `--create` makes workspace `WS` (with `--folder`) if none matches. `--folder` (alias `--repo`) is a path or a folder's label / dir name. Shell `ARGV` replaces `$SHELL`.
+- **`send`**: bracketed paste only when the program enabled it; a final newline becomes Enter, sent 50 ms later. `--raw` sends bytes untouched (`fw hub send s $'\x03' --raw` is Ctrl-C).
+- **`import`**: VS Code `*.code-workspace` files (JSONC); each `folders` entry becomes a folder, its `name` the label. Missing and non-local entries are skipped and listed. `--update` replaces an existing workspace's folders.
+- **`open`**: mints a one-time code and opens it via a 0600 redirect page in the state dir (the code never goes on argv). Opener: `$BROWSER`, else `wslview`, `cmd.exe /c start`, `xdg-open` / `open`.
+- **`url`**: a fresh code under every URL that reaches the hub, most remote-friendly first (public, tailnet https, tailnet, lan, this machine). `--qr` draws the first remote one. The token is never printed.
+- **`report`**: the agent hook entry point; needs the session's env, never prints to stdout, fails with exit 1 (never 2, which would stop a Claude `Stop`).
+- Semantics of the rest: [hub-workflows](workflows.md) (`wait`, `kill`, `review`, `merge`, `handoff`, `fanout`) and [hub-internals](internals.md) (`attach`, `explain`, `upgrade`, `doctor`).
 
 ## Serve flags
 
-Taken by `serve`, `start`, `install-service`. Every one but `--notify-url` is also a `hub.toml` key; a flag given wins over the file.
+Taken by `serve`, `start`, `install-service`. All but `--notify-url` are also `hub.toml` keys; a flag wins over the file.
 
 | Flag | Default | |
 |---|---|---|
 | `--bind` | `127.0.0.1` | non-loopback prints a warning |
 | `--port` | `7420` | `0` picks a free port |
-| `--public-url` | none | origin browsers reach the hub at through a proxy (`https://box.tailnet.ts.net`); repeatable; accepted as an origin, listed first by `url`, `Secure` cookies when https; origin only (no path) |
+| `--public-url` | none | origin browsers reach the hub at through a proxy (no path); repeatable; listed first by `url` |
 | `--allow-origin` | none | extra browser origin accepted; repeatable; same-origin always allowed |
 | `--trusted-proxy` | none | proxy on another machine whose `X-Forwarded-*` are believed (loopback always is); repeatable |
 | `--tls` | `off` | `auto` (local name-constrained CA), `off`, or `CERT,KEY` (PEM files you supply) |
-| `--tls-name` | none | extra DNS name, IP, or network (`192.168.0.0/16`, at most /8) for the local CA; repeatable; added later needs `fw hub tls rotate` |
-| `--scrollback-lines` | `5000` | per session; capped at 1M cells (lines x cols). 24 B per cell: a full 5000 x 120 session holds ~14 MiB |
+| `--tls-name` | none | extra name, IP, or network (at most /8) for the local CA; repeatable; later additions need `fw hub tls rotate` |
+| `--scrollback-lines` | `5000` | per session, capped at 1M cells; 24 B a cell (~14 MiB for 5000 x 120) |
 | `--no-restore` | off | drop pending restores for good |
 | `--no-agent-resume` | off | restore agents as fresh shells |
 | `--no-flywheel` | off | no Flywheel panel (nor Promote / fan out this task) |
-| `--import-root` | `~/code` | where the UI's VS Code import looks (3 levels deep; hidden, `node_modules`/`target`/..., symlinked dirs skipped) |
+| `--import-root` | `~/code` | where the UI's VS Code import looks (3 levels deep) |
 | `--notify-url` | none | ntfy-compatible push URL; overrides `url` in `notify.toml` (visible in `ps`: prefer the file) |
 | `--worktree-branch-prefix` | none | session worktree branches are `<prefix><task>` (e.g. `agent/`) |
 | `--record-part-cap` | `64MiB` | a recording part past it rotates (`64KiB`-`4GiB`; bytes or `KiB`/`MiB`/`GiB`) |
@@ -147,7 +146,10 @@ Taken by `serve`, `start`, `install-service`. Every one but `--notify-url` is al
 
 ## hub.toml
 
-`<state-dir>/hub.toml`, the hub's own settings. Precedence per key: **flag > file > default** (a list flag replaces the file's list). Unknown keys and bad values are errors naming the key. Invalid at start: `serve` refuses (exit 2). Edited while running: re-read within 1 s; valid -> live keys apply at once (`config show` lists the rest as waiting for a restart); invalid -> the last good settings stay, the error goes to the log, `GET /api/config`, a UI toast, the red gear, and `fw hub config check` (exit 1). `fw hub doctor` runs the same validation.
+`<state-dir>/hub.toml`. Precedence: **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors naming the key; `serve` refuses an invalid file (exit 2).
+
+- Edited while running: re-read within 1 s. Live keys apply at once; `fw hub config show` lists the rest as pending restart.
+- An invalid edit keeps the last good settings and is reported in the log, a UI toast, and `fw hub config check` (exit 1).
 
 ```toml
 [server]                          # restart to apply
@@ -225,11 +227,11 @@ reviewer = "other"                # other (claude <-> codex) | same | claude | c
 | `shares.max_expiry` | `--share-max-expiry` | `"30d"` | live |
 | `review.reviewer` | - | `"other"` | live |
 
-Not in hub.toml: push (`notify.toml`: it holds secrets), detection overrides (`agent-detection/`), plugins (`plugins/`), UI settings (`settings.json`). `fw hub config show` asks the running hub (else reads the file; flags then unknown).
+Not in hub.toml: push (`notify.toml`, it holds secrets), detection overrides (`agent-detection/`), plugins (`plugins/`), UI settings (`settings.json`).
 
 ## notify.toml
 
-`<state-dir>/notify.toml`, must be `chmod 600` (topic and token are secrets). Behaviour: [internals](internals.md#push-notifications).
+`<state-dir>/notify.toml`, must be `chmod 600`. Behaviour: [hub-internals](internals.md#push-notifications).
 
 ```toml
 url = "https://ntfy.example.com/hub"
@@ -242,7 +244,7 @@ detail = false                 # names only: leave out what a blocked agent asks
 
 ## plugin.toml
 
-`<state-dir>/plugins/<name>/plugin.toml` (`name`: `[a-z0-9][a-z0-9_-]{0,31}`). **A plugin runs as you, unsandboxed; the hub reviews nothing.** Only you install one (copy the directory); the UI and API enable, disable, and run plugins, never download one. Found plugins are **disabled** until `fw hub plugin enable NAME` (or the Settings toggle; kept in `<state-dir>/plugins.json`). Re-scanned every 2 s; an invalid manifest is listed with its error and never run. Sample: `crates/flywheel-hub/plugins/hello`. Run protocol and payloads: [api](api.md#plugins).
+**A plugin runs as you, unsandboxed; the hub reviews nothing.** Install by copying a directory to `<state-dir>/plugins/<name>/`; the UI and API never download one. New plugins are **disabled** until `fw hub plugin enable NAME`. Re-scanned every 2 s. Sample: `crates/flywheel-hub/plugins/hello`. Run protocol: [hub-api](api.md#plugins).
 
 ```toml
 description = "Ping me when an agent is stuck"
@@ -261,7 +263,7 @@ command = ["./summarize.py"]       # optional: else the top-level command
 
 ## UI settings
 
-Palette "Settings", the sidebar gear, `Alt ,` (a full-screen sheet on phones). Kept by the hub in `<state-dir>/settings.json` (0600, revisioned), so they follow you to every device; any one can be kept for **this device** only (browser local storage).
+`Alt ,` or the sidebar gear. Stored by the hub (`settings.json`), so they follow you to every device; any one can be kept for **this device** only.
 
 | Section | |
 |---|---|
@@ -273,11 +275,11 @@ Palette "Settings", the sidebar gear, `Alt ,` (a full-screen sheet on phones). K
 | Plugins | per plugin: enable toggle, events, actions (run), last run, last error, logs |
 | Server | read-only: effective hub.toml with sources, file error, pending restart |
 
-**Key bindings**: up to 4 per action, `mod+...+key` (`mod` = Ctrl, Cmd on macOS; `alt` = Alt, Ctrl+Option on macOS; then `shift`, `meta`; key = the physical key: `a`-`z` `0`-`9` `f1`-`f24` arrows `pageup` ... `` ` - = [ ] \ ; ' , . / ``). Pane-prefix keys bind the character typed (`%`, `"`, `z`) or `ctrl+arrow`. The server refuses (422, each finding named): keys the browser/OS keeps (`ctrl+w`, `ctrl+t`, `ctrl+n`, `ctrl+tab`, `ctrl+pageup/down`, `ctrl+shift+i/j/c`, `ctrl+alt+delete`, `alt+f4`, `alt+tab`, `f11`, any `meta+`), keys terminals need (no modifier, `shift+` only, `ctrl+c` `ctrl+d` `ctrl+z` `ctrl+\` `ctrl+[` ...), a key bound twice in one scope, a prefix action on the prefix key. It warns on keys a shell loses (`alt+b/f/d/.`, `ctrl+<letter>`, `ctrl+left/right`) and keys desktops take (`ctrl+alt+t/l/arrows`, `ctrl+space`, `ctrl+shift+v`). Fixed: in-dialog navigation (arrows, `j` `k`, Enter, Esc), F2 / Delete on sidebar rows. Key hints across the UI follow the keymap; `?` after the prefix or palette "Keyboard shortcuts" lists the bindings in force.
+**Key bindings**: up to 4 per action, `mod+...+key` (`mod` = Ctrl, Cmd on macOS). The server refuses (422) keys the browser or OS keeps (`ctrl+w`, `ctrl+t`, `alt+tab`, any `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), and duplicates in one scope. It warns on keys shells lose (`alt+b/f`, `ctrl+<letter>`) and keys desktops take (`ctrl+alt+t`).
 
 ## Keyboard shortcuts
 
-Defaults, every one rebindable (Settings > Keyboard). `mod` = Ctrl (Cmd on macOS); `alt` = Alt (Ctrl Option on macOS, so Option keeps typing layout characters; elsewhere an Alt key the layout turns into a character also goes to the terminal). Hub shortcuts are captured before the terminal sees them. `prefix.*` keys work only with the pane prefix on (after `prefix.arm`; pressed twice it sends `^B`).
+Defaults, all rebindable (Settings > Keyboard). `mod` = Ctrl (Cmd on macOS); `alt` = Alt (Ctrl Option on macOS). `prefix.*` keys work only after `prefix.arm` (pressed twice it sends `^B`).
 
 | Action | Default | |
 |---|---|---|

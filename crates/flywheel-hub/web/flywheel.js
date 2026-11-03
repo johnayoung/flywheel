@@ -581,9 +581,35 @@ window.FwHubFlywheel = function (ctx) {
         "span",
         { className: "fw-task-meta" },
         task.worker_id ? el("small", { textContent: task.worker_id, title: "worker" }) : null,
+        fanOutButton(task),
         outputButton(task.run_id, task.id),
       ),
     );
+  }
+
+  // "Fan out this task" (fanout-task.js): this hub's folders only, and
+  // only work not verified yet.
+  function fanOutButton(task) {
+    const folder = ui.folder;
+    if (!ctx.fanOutTask || machineOfKey(folder) || task.state === "verified") return null;
+    return el("button", {
+      type: "button",
+      className: "text-btn fw-out",
+      textContent: "fan out",
+      title: `Fan out ${task.id}: several agents in worktrees on its goal, graded by the hub with its command graders and its held-out ones (never shown to the agents)`,
+      onclick: (event) => {
+        event.stopPropagation();
+        const workspace = workspaceFor(folder);
+        ctx.fanOutTask(pathOf(folder), workspace ? workspace.id : ui.workspaceId, task.id);
+      },
+    });
+  }
+
+  // "Run with worker here" from elsewhere (a promoted fan-out): the
+  // folder's panel, then its Start worker.
+  function startWorkerIn(folder, workspaceId) {
+    open(folder, workspaceId);
+    return startWorker();
   }
 
   function graderChips(graders) {
@@ -1012,5 +1038,6 @@ window.FwHubFlywheel = function (ctx) {
     paletteItems,
     isOpen: () => !!ui.folder,
     openRun,
+    startWorkerIn,
   };
 };

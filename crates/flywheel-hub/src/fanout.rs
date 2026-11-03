@@ -32,11 +32,13 @@
 
 mod engine;
 mod facts;
+pub mod promote;
 
 pub use engine::{
     CleanupItem, CleanupReport, CleanupRequest, Fanouts, FixPlan, PickPlan, PickReport,
     RebaseReport,
 };
+pub use promote::{Promotion, TaskOrigin};
 
 use crate::agent::{AgentLaunch, SessionKind};
 use crate::git::WorktreeRef;
@@ -81,6 +83,12 @@ pub struct GraderSpec {
     pub run: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// A held-out grader (a flywheel task's `[held_out]` oracle, see
+    /// `promote`): run like any other, but "ask to fix" never shows the
+    /// agent its command or output, and promoting the fan-out back to a
+    /// task leaves it in the held-out registry instead of the task file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_out: bool,
 }
 
 impl GraderSpec {
@@ -140,6 +148,10 @@ pub struct GraderRun {
     /// Why it could not start, or how long it was allowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Its grader is held out (see [`GraderSpec::held_out`]); set by the
+    /// engine from the fan-out's graders, whatever the runner said.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub held_out: bool,
 }
 
 impl GraderRun {
@@ -189,6 +201,7 @@ impl GraderRun {
             stdout_truncated: false,
             stderr_truncated: false,
             detail: None,
+            held_out: spec.held_out,
         }
     }
 }
@@ -390,6 +403,13 @@ pub struct Fanout {
     pub candidates: Vec<Candidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub winner: Option<Winner>,
+    /// The flywheel task it was seeded from ("Fan out this task").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TaskOrigin>,
+    /// The flywheel task files written from it ("Promote to flywheel
+    /// task"), oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub promoted: Vec<Promotion>,
 }
 
 impl Fanout {
@@ -599,6 +619,14 @@ pub struct CreateFanout {
     pub cols: Option<u16>,
     #[serde(default)]
     pub rows: Option<u16>,
+    /// Seed from this flywheel task of `folder` (its directory source):
+    /// the server re-reads the task and its held-out graders at launch
+    /// (see `promote::seeded`); `prompt` and `graders` may then be empty.
+    #[serde(default)]
+    pub from_task: Option<String>,
+    /// Set by the server from `from_task`, never by a request.
+    #[serde(skip)]
+    pub origin: Option<TaskOrigin>,
 }
 
 fn default_true() -> bool {
@@ -619,6 +647,9 @@ pub struct Validated {
 impl CreateFanout {
     /// Every field checked and normalized (no git or disk access).
     pub fn validated(&self) -> Result<Validated, String> {
+        if self.from_task.is_some() && self.origin.is_none() {
+            return Err("a fan-out from a flywheel task is seeded by the server first".into());
+        }
         let prompt = crate::agent::validate_prompt(Some(&self.prompt))?
             .filter(|p| !p.trim().is_empty())
             .ok_or("a fan-out needs a prompt: the task every agent gets")?;
@@ -699,6 +730,7 @@ fn validate_grader(input: &GraderInput) -> Result<GraderSpec, String> {
         GraderInput::Run(run) => GraderSpec {
             run: run.clone(),
             name: None,
+            held_out: false,
         },
         GraderInput::Spec(spec) => spec.clone(),
     };
@@ -731,7 +763,11 @@ fn validate_grader(input: &GraderInput) -> Result<GraderSpec, String> {
         }
         Some(name) => Some(name.to_owned()),
     };
-    Ok(GraderSpec { run, name })
+    Ok(GraderSpec {
+        run,
+        name,
+        held_out: spec.held_out,
+    })
 }
 
 /// A protected path: relative to the repo, no `..`, normalized.
@@ -948,6 +984,17 @@ pub fn fix_prompt(grade: &Grade) -> Option<String> {
         ));
     }
     let failed = grade.first_failure()?;
+    if failed.held_out {
+        // A held-out check's command and output are never the agent's to
+        // see (flywheel's held-out gate): only that one failed.
+        return Some(format!(
+            "A held-out check the hub ran on your work in this worktree failed ({outcome}). \
+             Held-out checks and their output are not shown to you. Re-read the task, make \
+             sure your work fully does what it asks (edge cases included), then commit your \
+             changes.",
+            outcome = failed.outcome(),
+        ));
+    }
     let mut output = String::new();
     for (stream, text) in [("stdout", &failed.stdout), ("stderr", &failed.stderr)] {
         let text = text.trim_end();
@@ -1124,6 +1171,11 @@ pub struct FanoutView {
     /// A list entry: no grader output, worktree reads up to
     /// half a minute old (`GET /api/fanouts/{id}` has the full board).
     pub summary: bool,
+    /// The flywheel task it was seeded from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TaskOrigin>,
+    /// The flywheel task files written from it.
+    pub promoted: Vec<Promotion>,
 }
 
 impl FanoutView {

@@ -266,3 +266,15 @@
   .fo-rcpt summary { min-height: 32px; display: flex; align-items: center; }
   .fo-cand-row .icon, .fo-grader-row .icon { min-height: 44px; min-width: 44px; }
 }
+
+/* --- flywheel tasks (fanout-task.js) ------------------------------------ */
+
+.fo-grader.held { border-style: dashed; border-color: var(--brass); color: var(--ink-2); }
+.fo-origin { flex-basis: 100%; }
+.fo-seed { display: grid; gap: .25rem; padding: .55rem .75rem; border: 1px solid var(--rule-2); border-left: 4px solid var(--fw-ok); background: var(--bg-2); font-size: 11.5px; color: var(--ink-2); }
+.fo-seed p { margin: 0; overflow-wrap: anywhere; }
+.fo-seed-held { color: var(--brass); }
+.fo-task .fo-act-body { margin: .2rem 0 .4rem; }
+.fo-task-preview { min-width: 0; }
+.fo-task-preview code { overflow-wrap: anywhere; }
+.fo-task-file { max-height: 20rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }

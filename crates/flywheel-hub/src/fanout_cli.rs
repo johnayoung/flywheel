@@ -1,4 +1,4 @@
-//! `fw hub fanout new|ls|show|wait|grade|fix|pick|cleanup|rm`: verified
+//! `fw hub fanout new|ls|show|wait|grade|fix|pick|promote|cleanup|rm`: verified
 //! fan-outs over the running hub's API (see `crate::fanout`).
 //!
 //! Fan-outs are named by id, unique id prefix, or name; candidates by
@@ -46,6 +46,11 @@ enum FanoutCommand {
     /// Merge the winner into the base (git merge --ff-only in the main
     /// checkout), only while its worktree is exactly what passed.
     Pick(PickArgs),
+    /// Write the fan-out as a flywheel task of its repo's directory work
+    /// source (prompt as context, graders as command graders, the winner's
+    /// commit as a reference), for `fw worker` to verify again: shows the
+    /// file first, writes it uncommitted.
+    Promote(PromoteArgs),
     /// Remove the losers' worktrees and sessions (default: every candidate
     /// but the winner); refused where unique work would be lost unless
     /// --force.
@@ -58,9 +63,15 @@ enum FanoutCommand {
 struct NewArgs {
     /// Workspace id, unique id prefix, or name.
     workspace: String,
-    /// The task every agent gets (`-` reads it from stdin).
-    #[arg(long, value_name = "TEXT")]
-    prompt: String,
+    /// The task every agent gets (`-` reads it from stdin). With
+    /// --from-task: default the task's goal, context, and graders.
+    #[arg(long, value_name = "TEXT", required_unless_present = "from_task")]
+    prompt: Option<String>,
+    /// Seed from this flywheel task of the folder (its directory source):
+    /// its prompt and command graders unless given, plus its held-out
+    /// graders, which run but are never shown to the agents.
+    #[arg(long, value_name = "TASK_ID")]
+    from_task: Option<String>,
     /// One agent: claude or codex, with a model after a colon
     /// (`claude:opus`, `codex:gpt-5.1-codex`). Give 2 to 6.
     #[arg(long = "agent", value_name = "KIND[:MODEL]", required = true)]
@@ -69,7 +80,11 @@ struct NewArgs {
     /// (in order; the first failure skips the rest). `name=COMMAND` names
     /// it when name is a lowercase word (`unit=cargo test`; an uppercase
     /// `VAR=1 cmd` stays a command). Agents are not shown these.
-    #[arg(long = "grader", value_name = "COMMAND", required = true)]
+    #[arg(
+        long = "grader",
+        value_name = "COMMAND",
+        required_unless_present = "from_task"
+    )]
     graders: Vec<String>,
     /// One of the workspace's git folders (default: the first).
     #[arg(long, value_name = "PATH|LABEL")]
@@ -190,6 +205,31 @@ struct PickArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct PromoteArgs {
+    fanout: String,
+    /// The task id (default: the fan-out's name and tag).
+    #[arg(long, value_name = "ID")]
+    task_id: Option<String>,
+    /// The `active/<phase>` directory (default: a new phase after the
+    /// existing ones).
+    #[arg(long, value_name = "NAME")]
+    phase: Option<String>,
+    /// The goal (default: the seeding task's, else the prompt's first line).
+    #[arg(long, value_name = "TEXT")]
+    goal: Option<String>,
+    /// The candidate whose passing commit is referenced (default: the
+    /// winner); `none` for no reference.
+    #[arg(long, value_name = "LABEL|none")]
+    reference: Option<String>,
+    #[arg(long, short = 'y')]
+    yes: bool,
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+}
+
+#[derive(Debug, clap::Args)]
 struct CleanupArgs {
     fanout: String,
     /// Candidates (labels or session names); default: all but the winner.
@@ -259,6 +299,7 @@ pub(crate) fn main(args: &FanoutArgs, out: &mut dyn Write, err: &mut dyn Write) 
         FanoutCommand::Grade(a) => grade(a, out),
         FanoutCommand::Fix(a) => fix(a, out, err),
         FanoutCommand::Pick(a) => pick(a, out, err),
+        FanoutCommand::Promote(a) => promote(a, out, err),
         FanoutCommand::Cleanup(a) => cleanup(a, out, err),
         FanoutCommand::Rm(a) => rm(a, out),
     };
@@ -385,14 +426,16 @@ fn grader_spec(raw: &str) -> Value {
 
 fn new(args: &NewArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     let conn = Endpoint::resolve(&args.endpoint)?.with_timeout(ACTION_TIMEOUT);
-    let prompt = if args.prompt == "-" {
-        let mut text = String::new();
-        std::io::stdin()
-            .read_to_string(&mut text)
-            .map_err(|e| format!("cannot read the prompt from stdin: {e}"))?;
-        text
-    } else {
-        args.prompt.clone()
+    let prompt = match args.prompt.as_deref() {
+        Some("-") => {
+            let mut text = String::new();
+            std::io::stdin()
+                .read_to_string(&mut text)
+                .map_err(|e| format!("cannot read the prompt from stdin: {e}"))?;
+            text
+        }
+        Some(prompt) => prompt.to_owned(),
+        None => String::new(),
     };
     let workspaces = conn.blocking_workspaces()?;
     let workspace = resolve(&workspaces, &args.workspace, "workspace")?;
@@ -417,6 +460,7 @@ fn new(args: &NewArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, 
         "timeout_secs": args.timeout,
         "protect": args.protect,
         "commit_instruction": !args.no_commit_instruction,
+        "from_task": args.from_task,
     });
     if args.permission_mode.as_deref() == Some("bypassPermissions") {
         let _ = writeln!(
@@ -493,9 +537,16 @@ fn render(view: &Value, verbose: bool, out: &mut dyn Write) -> std::io::Result<(
     )?;
     let graders: Vec<String> = list(view, "graders")
         .iter()
-        .map(|g| match g.get("name").and_then(Value::as_str) {
-            Some(name) => format!("{name} ({})", str_field(g, "run")),
-            None => str_field(g, "run").to_owned(),
+        .map(|g| {
+            let label = match g.get("name").and_then(Value::as_str) {
+                Some(name) => format!("{name} ({})", str_field(g, "run")),
+                None => str_field(g, "run").to_owned(),
+            };
+            if g.get("held_out").and_then(Value::as_bool) == Some(true) {
+                format!("{label} [held out]")
+            } else {
+                label
+            }
         })
         .collect();
     writeln!(
@@ -517,6 +568,22 @@ fn render(view: &Value, verbose: bool, out: &mut dyn Write) -> std::io::Result<(
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join(", ")
+        )?;
+    }
+    if let Some(o) = view.get("origin").filter(|o| !o.is_null()) {
+        writeln!(
+            out,
+            "from flywheel task {} ({})",
+            str_field(o, "task_id"),
+            str_field(o, "folder")
+        )?;
+    }
+    for p in list(view, "promoted") {
+        writeln!(
+            out,
+            "promoted to flywheel task {}: {}",
+            str_field(p, "task_id"),
+            str_field(p, "path")
         )?;
     }
     if let Some(w) = view.get("winner").filter(|w| !w.is_null()) {
@@ -949,6 +1016,81 @@ fn pick(args: &PickArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
         writeln!(out, "\nthe others (fw hub fanout cleanup {}):", &id[..8]).map_err(io)?;
         render_cleanup(losers, out).map_err(io)?;
     }
+    Ok(0)
+}
+
+fn render_task_plan(answer: &Value, out: &mut dyn Write) -> std::io::Result<()> {
+    let plan = answer.get("plan").unwrap_or(&Value::Null);
+    writeln!(
+        out,
+        "task {} in phase {}{}",
+        str_field(plan, "task_id"),
+        str_field(plan, "phase"),
+        if plan.get("new_phase").and_then(Value::as_bool) == Some(true) {
+            " (new)"
+        } else {
+            ""
+        }
+    )?;
+    writeln!(out, "writes {}:", str_field(plan, "path"))?;
+    for line in str_field(plan, "contents").lines() {
+        writeln!(out, "  | {line}")?;
+    }
+    for note in list(plan, "notes") {
+        writeln!(out, "{}", note.as_str().unwrap_or_default())?;
+    }
+    for warning in list(answer, "warnings") {
+        writeln!(out, "warning: {}", warning.as_str().unwrap_or_default())?;
+    }
+    Ok(())
+}
+
+fn promote(args: &PromoteArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
+    let conn = Endpoint::resolve(&args.endpoint)?.with_timeout(ACTION_TIMEOUT);
+    let (id, _) = find(&conn, &args.fanout)?;
+    let io = |e: std::io::Error| e.to_string();
+    let url = format!("/api/fanouts/{id}/promote");
+    let mut body = json!({
+        "task_id": args.task_id,
+        "phase": args.phase,
+        "goal": args.goal,
+        "reference": args.reference,
+        "dry_run": true,
+    });
+    let plan = conn.blocking_call("POST", &url, Some(&body))?;
+    if !args.json {
+        render_task_plan(&plan, out).map_err(io)?;
+    }
+    if !approved(args.yes, args.json, "Write it?", err) {
+        if args.json {
+            print_json(out, &plan)?;
+            return Ok(0);
+        }
+        let _ = writeln!(
+            err,
+            "fw hub: not written (pass --yes to write without a prompt)"
+        );
+        return Ok(1);
+    }
+    body["dry_run"] = json!(false);
+    body["confirm"] = json!(str_field(&plan, "fingerprint"));
+    let done = conn.blocking_call("POST", &url, Some(&body))?;
+    if args.json {
+        print_json(out, &done)?;
+        return Ok(0);
+    }
+    let written = done.get("written").unwrap_or(&Value::Null);
+    writeln!(
+        out,
+        "wrote {} (uncommitted){}",
+        str_field(written, "path"),
+        if written.get("listed").and_then(Value::as_bool) == Some(true) {
+            "; the directory source lists it: run `fw worker` there to verify it"
+        } else {
+            ""
+        }
+    )
+    .map_err(io)?;
     Ok(0)
 }
 

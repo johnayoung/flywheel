@@ -20,6 +20,7 @@
 //! Changes reach browsers as `{"type":"flywheel"}` messages on
 //! `/api/events`.
 
+use crate::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use crate::hub::{Hub, SessionView};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -375,6 +376,27 @@ pub trait FlywheelProvider: Send + Sync + 'static {
     /// Drop whatever is kept open for `folder` (stores, listings,
     /// transcripts): it left every workspace. A later read reopens.
     fn forget(&self, folder: &Path);
+
+    /// What writing `draft` as a task of `folder`'s directory work source
+    /// would write: the path and the exact bytes, validated through the
+    /// loop's own task loader. Refused for a non-directory source, an
+    /// invalid definition, or a task id already in use there.
+    fn plan_task(&self, folder: &Path, draft: &TaskDraft) -> Result<TaskFilePlan, String>;
+
+    /// Write `draft` (as [`FlywheelProvider::plan_task`] plans it, which
+    /// must still produce exactly `contents`) as a new file -- never over
+    /// an existing one -- and read it back through the work source.
+    fn write_task(
+        &self,
+        folder: &Path,
+        draft: &TaskDraft,
+        contents: &str,
+    ) -> Result<TaskWritten, String>;
+
+    /// Task `task_id` of `folder`'s directory work source as a fan-out
+    /// seed, with its held-out graders (failing closed: a configured
+    /// held-out registry that cannot be read is an error, never "none").
+    fn task_seed(&self, folder: &Path, task_id: &str) -> Result<TaskSeed, String>;
 }
 
 /// What a browser hears about a folder.

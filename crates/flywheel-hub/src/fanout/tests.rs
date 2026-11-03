@@ -134,6 +134,7 @@ fn run(name: &str, status: GraderStatus, code: Option<i32>) -> GraderRun {
         stdout_truncated: false,
         stderr_truncated: false,
         detail: None,
+        held_out: false,
     }
 }
 
@@ -313,10 +314,12 @@ fn grader_scripts_are_pinned_or_protected() {
         GraderSpec {
             run: format!("sh '{}' && ./scripts/check.sh", outside.display()),
             name: None,
+            held_out: false,
         },
         GraderSpec {
             run: format!("CHECK={} cargo test -p x", outside.display()),
             name: None,
+            held_out: false,
         },
     ];
     let (pins, protect) = pin_graders(&graders, &repo, vec!["tests".into()]).unwrap();
@@ -358,6 +361,8 @@ fn summaries_carry_no_grader_output() {
         runner: None,
         warnings: vec![],
         summary: false,
+        origin: None,
+        promoted: vec![],
     };
     fanout.summarize();
     assert!(fanout.summary);
@@ -520,6 +525,7 @@ fn state_files_from_before_fanouts_load_and_fanouts_round_trip() {
         graders: vec![GraderSpec {
             run: "true".into(),
             name: None,
+            held_out: false,
         }],
         timeout_secs: 60,
         protect: vec![],
@@ -527,6 +533,8 @@ fn state_files_from_before_fanouts_load_and_fanouts_round_trip() {
         created_at: Utc::now(),
         candidates: vec![],
         winner: None,
+        origin: None,
+        promoted: Vec::new(),
     };
     store.insert_fanout(fanout.clone()).unwrap();
     assert!(
@@ -600,6 +608,8 @@ fn the_finished_event_carries_the_ranked_board_and_only_a_short_tail() {
         runner: None,
         warnings: vec![],
         summary: false,
+        origin: None,
+        promoted: vec![],
     };
     let payload = finished_payload(&board);
     let f = &payload["fanout"];

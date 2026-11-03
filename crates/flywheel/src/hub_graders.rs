@@ -84,6 +84,8 @@ fn to_run(record: &GraderResultRecord, run: &str) -> GraderRun {
         stdout_truncated: flag(payload, "stdout_truncated"),
         stderr_truncated: flag(payload, "stderr_truncated"),
         detail,
+        // The engine marks held-out graders from the fan-out's own list.
+        held_out: false,
     }
 }
 
@@ -163,6 +165,7 @@ mod tests {
         GraderSpec {
             run: run.to_owned(),
             name: name.map(str::to_owned),
+            held_out: false,
         }
     }
 

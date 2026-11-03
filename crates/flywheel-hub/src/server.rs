@@ -65,6 +65,7 @@ mod import_api;
 mod listen;
 mod notify_api;
 mod plugins_api;
+mod promote_api;
 mod proxy;
 mod pwa;
 mod record_api;
@@ -337,6 +338,8 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/fanouts/{id}/pick", post(fanout_api::pick))
         .route("/api/fanouts/{id}/rebase", post(fanout_api::rebase))
         .route("/api/fanouts/{id}/cleanup", post(fanout_api::cleanup))
+        .route("/api/fanouts/{id}/promote", post(promote_api::promote))
+        .route("/api/flywheel/task", get(promote_api::task_seed))
         // Read-only share links and session recordings.
         .route(
             "/api/shares",

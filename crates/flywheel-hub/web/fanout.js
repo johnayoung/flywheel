@@ -10,9 +10,11 @@
 // grades again), then remove the losers' worktrees (refused where unique
 // work would be lost unless forced) or just stop their sessions. A
 // fan-out whose graders finished joins Needs you until its board is
-// viewed. app-base.js creates it with its helpers; protocol: /api/fanouts*
-// and the events socket's {"type":"fanout"} pushes. This hub's fan-outs
-// only (machines' are reached on their own hub).
+// viewed. Promote to a flywheel task and the task-seeded launch live in
+// fanout-task.js (ctx.task). app-base.js creates it with its helpers;
+// protocol: /api/fanouts* and the events socket's {"type":"fanout"}
+// pushes. This hub's fan-outs only (machines' are reached on their own
+// hub).
 "use strict";
 
 window.FwHubFanout = function (ctx) {
@@ -451,6 +453,7 @@ window.FwHubFanout = function (ctx) {
         "div",
         { className: "fo-head-actions" },
         switcher,
+        f ? el("button", { type: "button", className: "slab ghost", textContent: "Promote", title: "Promote to flywheel task: write it as a task of the repo's directory work source, for fw worker to verify again", onclick: () => ctx.task().promote(f) }) : null,
         el("button", { type: "button", className: "slab ghost", textContent: "New", title: "New verified fan-out", onclick: () => openLaunch(f && f.workspace_id) }),
         closeButton("the fan-out board"),
       ),
@@ -463,9 +466,10 @@ window.FwHubFanout = function (ctx) {
       "div",
       { className: "fo-graders" },
       el("span", { className: "field-label", textContent: "graders" }),
-      f.graders.map((g, i) => el("code", { className: "fo-grader", title: g.run, textContent: `${i + 1}. ${g.name ? `${g.name}: ` : ""}${g.run}` })),
+      f.graders.map((g, i) => el("code", { className: `fo-grader${g.held_out ? " held" : ""}`, title: g.held_out ? `held out: never shown to the agents, not even when asking to fix\n${g.run}` : g.run, textContent: `${i + 1}. ${g.held_out ? "[held out] " : ""}${g.name ? `${g.name}: ` : ""}${g.run}` })),
       el("span", { className: "fo-note", textContent: `run by the hub (${f.runner || "no runner"}) in each worktree, ${f.timeout_secs}s each; held out of the prompt` }),
       f.protect.length ? el("span", { className: "fo-note", textContent: `protected: ${f.protect.join(", ")}` }) : null,
+      ctx.task().boardNotes(f),
     );
     const warnings = (f.warnings || []).length
       ? el("div", { className: "fo-banner warn" }, f.warnings.map((w) => el("p", { textContent: w })))
@@ -808,7 +812,8 @@ window.FwHubFanout = function (ctx) {
     loadBases();
   }
 
-  function openLaunch(workspaceId) {
+  // `seed`: a flywheel task (GET /api/flywheel/task) to fan out.
+  function openLaunch(workspaceId, seed) {
     const usable = state.workspaces.filter((w) => !w.machine && w.folders.some((x) => x.git && !x.missing));
     if (!usable.length) {
       toast("A fan-out needs a workspace with a git folder: create one first.", { tone: "bad" });
@@ -831,7 +836,8 @@ window.FwHubFanout = function (ctx) {
       if (cands.children.length < MAX) cands.append(candidateRow("claude", ""));
       launchCount();
     } }, icon("plus"), "agent");
-    const graders = el("ol", { className: "fo-grader-rows" }, graderRow("", ""));
+    const graders = el("ol", { className: "fo-grader-rows" },
+      seed && seed.graders.length ? seed.graders.map((g) => graderRow(g.name || "", g.run)) : graderRow("", ""));
     const addGrader = el("button", { type: "button", className: "text-btn", onclick: () => graders.append(graderRow("", "")) }, icon("plus"), "grader");
     const mode = selectOf(CLAUDE_MODES, "", "Claude permission mode");
     const approval = selectOf(CODEX_APPROVALS, "", "Codex approval");
@@ -848,10 +854,11 @@ window.FwHubFanout = function (ctx) {
     const formNode = el(
       "form",
       { method: "dialog", novalidate: true },
-      el("header", { className: "sheet-head" }, el("span", { className: "sheet-kicker", textContent: "verified fan-out" }), el("h2", { textContent: "One prompt, several agents" })),
+      el("header", { className: "sheet-head" }, el("span", { className: "sheet-kicker", textContent: "verified fan-out" }), el("h2", { textContent: seed ? `Fan out flywheel task ${seed.task_id}` : "One prompt, several agents" })),
       el("p", { className: "sheet-body", textContent: "Each agent works in its own sibling worktree cut from the same commit. When one reports a finished turn the hub runs your graders in its worktree; the board ranks them: graders passing first, then the smaller diff, then the lower cost." }),
       el("div", { className: "fo-two" }, field("Workspace", "", workspace), field("Folder", "git", folder)),
       el("div", { className: "fo-two" }, field("Base branch", "every worktree starts here", base, bases), field("Name", "", name)),
+      seed ? seedNote(seed) : null,
       field("Prompt", "", prompt),
       group("Agents", `${MIN}-${MAX}, a model each`, cands, addCand),
       group("Graders", "run by the hub with /bin/sh -c in each worktree, held out of the prompt. A script named by absolute path is pinned (changed, it fails every grading); one inside the repo is protected.", graders, addGrader),
@@ -864,7 +871,11 @@ window.FwHubFanout = function (ctx) {
       error,
       el("footer", { className: "sheet-foot" }, el("button", { type: "button", className: "slab ghost", "data-close": true, textContent: "Cancel" }), submit),
     );
-    form = { node: formNode, workspace, folder, base, bases, name, prompt, cands, addCand, graders, mode, approval, sandbox, timeout, protect, commit, error, submit };
+    form = { node: formNode, workspace, folder, base, bases, name, prompt, cands, addCand, graders, mode, approval, sandbox, timeout, protect, commit, error, submit, seed: seed || null };
+    if (seed) {
+      name.value = seed.task_id;
+      prompt.value = seed.prompt;
+    }
     workspace.addEventListener("change", fillFolders);
     folder.addEventListener("change", loadBases);
     mode.addEventListener("change", () => {
@@ -881,6 +892,10 @@ window.FwHubFanout = function (ctx) {
     });
     launch.replaceChildren(formNode);
     fillFolders();
+    if (seed && [...folder.options].some((o) => o.value === seed.folder)) {
+      folder.value = seed.folder;
+      loadBases();
+    }
     launchCount();
     launch.showModal();
     prompt.focus();
@@ -903,7 +918,8 @@ window.FwHubFanout = function (ctx) {
     });
     const graders = [...f.graders.children].map((row) => row.read()).filter((g) => g.run).map((g) => (g.name ? g : { run: g.run }));
     if (!f.prompt.value.trim()) return fail("Write the prompt every agent gets.");
-    if (!graders.length) return fail("Add at least one grader command: it is what verifies the agents.");
+    const held = f.seed ? f.seed.held_out.length : 0;
+    if (!graders.length && !held) return fail("Add at least one grader command: it is what verifies the agents.");
     const body = {
       workspace_id: f.workspace.value,
       folder: f.folder.value || undefined,
@@ -915,6 +931,7 @@ window.FwHubFanout = function (ctx) {
       timeout_secs: Number(f.timeout.value) || 900,
       protect: f.protect.value.split("\n").map((p) => p.trim()).filter(Boolean),
       commit_instruction: f.commit.checked,
+      from_task: f.seed ? f.seed.task_id : undefined,
       ...ctx.termSize(),
     };
     f.submit.disabled = true;
@@ -932,6 +949,19 @@ window.FwHubFanout = function (ctx) {
     ctx.refresh();
     await reload();
     open(view.id);
+  }
+
+  // What a task-seeded launch adds and leaves out.
+  function seedNote(seed) {
+    const held = seed.held_out || [];
+    return el("div", { className: "fo-seed" },
+      el("p", { textContent: `From ${seed.phase ? `${seed.phase}/` : ""}${seed.task_id}: its goal and context as the prompt, its command graders below (edit either).` }),
+      held.length
+        ? el("p", { className: "fo-seed-held", textContent: `+ ${held.length} held-out grader${held.length === 1 ? "" : "s"} (${held.join(", ")}): added by the hub at launch, run in every worktree, never shown to the agents.` })
+        : null,
+      (seed.not_run || []).length
+        ? el("p", { textContent: `Not run by the hub (the worker still applies them): ${seed.not_run.join(", ")}.` })
+        : null);
   }
 
   function paletteItems(cmd) {
@@ -954,5 +984,8 @@ window.FwHubFanout = function (ctx) {
     openLaunch,
     paletteItems,
     isOpen: () => board.open,
+    close: () => {
+      if (board.open) board.close();
+    },
   };
 };

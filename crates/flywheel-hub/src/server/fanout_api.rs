@@ -11,6 +11,7 @@
 //! * `POST .../rebase {"candidate","dry_run"|"confirm"}` -- rebase onto
 //!   the base (it is graded again);
 //! * `POST .../cleanup {"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}`;
+//! * `POST .../promote` -- write it as a flywheel task (`promote_api`);
 //! * `{"type":"fanout","id"}` on the events socket when one changes.
 
 use super::{ApiJson, ApiResult, AppState, blocking, error_response};
@@ -56,6 +57,8 @@ pub(super) async fn create(
     let Some(engine) = engine(&app) else {
         return Ok(off());
     };
+    // "Fan out this task": the task and its held-out graders, read now.
+    let body = super::promote_api::seed_request(&app, body).await?;
     let view = blocking(move || engine.create(body)).await?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
 }

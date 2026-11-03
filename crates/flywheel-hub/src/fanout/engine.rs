@@ -541,7 +541,14 @@ impl Fanouts {
                         tail_bytes: TAIL_BYTES,
                     };
                     match runner.run(&request, cancel) {
-                        Ok(runs) => graders = runs,
+                        Ok(mut runs) => {
+                            // Held out is the fan-out's to say, not the
+                            // runner's.
+                            for (run, spec) in runs.iter_mut().zip(&fanout.graders) {
+                                run.held_out = spec.held_out;
+                            }
+                            graders = runs;
+                        }
                         Err(RunnerError::Cancelled) => {
                             self.unstart(hub, id, label);
                             return JobEnd::Cancelled;
@@ -864,6 +871,8 @@ impl Fanouts {
             created_at: Utc::now(),
             candidates,
             winner: None,
+            origin: request.origin.clone(),
+            promoted: Vec::new(),
         };
         if let Err(e) = hub.store().insert_fanout(fanout.clone()) {
             undo(&started);
@@ -957,6 +966,20 @@ impl Fanouts {
             .collect();
         views.reverse();
         Ok(views)
+    }
+
+    /// One fan-out as stored.
+    pub fn record(&self, id: &str) -> Result<Fanout, HubError> {
+        Ok(self.hub()?.store().fanout(id)?.clone())
+    }
+
+    /// Note a task file written from fan-out `id`.
+    pub fn note_promotion(&self, id: &str, promotion: super::Promotion) -> Result<(), HubError> {
+        let hub = self.hub()?;
+        hub.store()
+            .update_fanout(id, |f| f.promoted.push(promotion))?;
+        hub.emit(HubEvent::Fanout { id: id.to_owned() });
+        Ok(())
     }
 
     /// One fan-out's board.
@@ -1112,6 +1135,8 @@ impl Fanouts {
             runner: self.runner_name(),
             warnings,
             summary: false,
+            origin: fanout.origin.clone(),
+            promoted: fanout.promoted.clone(),
         }
     }
 

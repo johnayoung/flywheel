@@ -371,6 +371,8 @@ const flywheel = window.FwHubFlywheel({
   rerender: () => render(),
   onOpen: () => closeOverlays("flywheel"),
   focusTerminal: () => focusTerminal(),
+  // "Fan out this task" (fanout-task.js, below).
+  fanOutTask: (folder, workspaceId, taskId) => fanoutTask.fanOutTask(folder, workspaceId, taskId),
 });
 
 // Verified fan-outs (fanout.js): one prompt to several agents in
@@ -388,6 +390,26 @@ const fanout = window.FwHubFanout({
   focusTerminal: () => focusTerminal(),
   // The Needs-you list, menu badge and title all count fan-outs.
   onChange: () => render(),
+  // Promote / task-seeded launch (fanout-task.js).
+  task: () => fanoutTask,
+});
+// A fan-out and a flywheel task, both ways (fanout-task.js): Promote on
+// the board, "fan out" on the Flywheel panel's tasks.
+const fanoutTask = window.FwHubFanoutTask({
+  el, api,
+  toast: (...args) => commands.toast(...args),
+  focusTerminal: () => focusTerminal(),
+  openLaunch: (workspaceId, seed) => fanout.openLaunch(workspaceId, seed),
+  // The board steps aside for the loop's panel and the worker's terminal.
+  openFlywheel: (folder, workspaceId) => {
+    fanout.close();
+    flywheel.open(folder, workspaceId);
+  },
+  startWorker: (folder, workspaceId) => {
+    fanout.close();
+    return flywheel.startWorkerIn(folder, workspaceId);
+  },
+  onPromoted: () => fanout.reload(),
 });
 
 // The phone and alerts modules (pwa.js, attention.js, notify.js,

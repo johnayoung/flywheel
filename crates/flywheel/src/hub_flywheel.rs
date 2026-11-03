@@ -43,6 +43,7 @@ use flywheel_core::audit::run_file_path;
 use flywheel_core::lifecycle::{Lifecycle, Status};
 use flywheel_core::store::{HarnessStore, LifecycleFilter};
 use flywheel_core::store_memory::InMemoryStore;
+use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome, LiveRun, Note,
     PanelClaim, PanelPhase, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight,
@@ -171,6 +172,67 @@ impl HubFlywheel {
             open.pop_front();
         }
         transcript
+    }
+}
+
+/// What the task writer and reader (`crate::hub_tasks`) need of a folder:
+/// its policy resolved the way the panel reads it.
+pub(crate) struct TaskLayout {
+    /// The directory source's tasks dir (absolute).
+    pub tasks_dir: PathBuf,
+    /// The `[held_out] root` registry, when configured.
+    pub held_out: Option<flywheel_orchestrator::held_out_gate::FilesystemHeldOutGraderSource>,
+    /// `[submit] protected_paths`: what a landing may not change.
+    pub protected_paths: Vec<String>,
+}
+
+impl HubFlywheel {
+    /// `root`'s tasks dir and held-out registry; refused when its tasks do
+    /// not come from a directory source.
+    pub(crate) fn task_layout(&self, root: &Path) -> Result<TaskLayout, String> {
+        let state = self.folder(root);
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let resolved = state.resolve(root)?;
+        let tasks_dir = resolved.tasks_dir.clone().ok_or_else(|| {
+            format!(
+                "tasks come from the {} source in {}: only a directory source takes task \
+                 files",
+                resolved.source_label,
+                root.display()
+            )
+        })?;
+        let held_out =
+            flywheel_worktree::daemon::build_held_out_source(resolved.policy.as_ref(), root);
+        let protected_paths = resolved
+            .policy
+            .as_ref()
+            .map(|p| p.protected_paths.clone())
+            .unwrap_or_default();
+        Ok(TaskLayout {
+            tasks_dir,
+            held_out,
+            protected_paths,
+        })
+    }
+
+    /// How many runs `root`'s store holds for `task_id` (none without a
+    /// store yet).
+    pub(crate) fn task_runs(&self, root: &Path, task_id: &str) -> Result<usize, String> {
+        let state = self.folder(root);
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let resolved = state.resolve(root)?;
+        let core = match resolved.stores(root)? {
+            Some(bundle) => Arc::clone(&bundle.core),
+            None => return Ok(0),
+        };
+        drop(state);
+        let filter = LifecycleFilter {
+            task_id: Some(task_id.to_owned()),
+            ..LifecycleFilter::default()
+        };
+        core.list_lifecycles(&filter)
+            .map(|runs| runs.len())
+            .map_err(|e| format!("reading the store: {e}"))
     }
 }
 
@@ -982,5 +1044,22 @@ impl FlywheelProvider for HubFlywheel {
             self.program.to_string_lossy().into_owned(),
             "worker".to_owned(),
         ]
+    }
+
+    fn plan_task(&self, folder: &Path, draft: &TaskDraft) -> Result<TaskFilePlan, String> {
+        crate::hub_tasks::plan_task(self, folder, draft)
+    }
+
+    fn write_task(
+        &self,
+        folder: &Path,
+        draft: &TaskDraft,
+        contents: &str,
+    ) -> Result<TaskWritten, String> {
+        crate::hub_tasks::write_task(self, folder, draft, contents)
+    }
+
+    fn task_seed(&self, folder: &Path, task_id: &str) -> Result<TaskSeed, String> {
+        crate::hub_tasks::task_seed(self, folder, task_id)
     }
 }

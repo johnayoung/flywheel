@@ -14,6 +14,7 @@ pub mod exec;
 pub mod history_screen;
 pub mod hub_flywheel;
 pub mod hub_graders;
+pub mod hub_tasks;
 pub mod quit_prompt;
 pub mod session;
 pub mod session_screen;

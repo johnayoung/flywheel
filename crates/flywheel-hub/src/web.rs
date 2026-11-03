@@ -121,6 +121,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ("machines.js", include_bytes!("../web/machines.js"), JS),
     ("panes.js", include_bytes!("../web/panes.js"), JS),
     ("search.js", include_bytes!("../web/search.js"), JS),
+    ("settings.js", include_bytes!("../web/settings.js"), JS),
     ("login.js", include_bytes!("../web/login.js"), JS),
     (
         "app.css",
@@ -165,6 +166,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "app-machines.css",
         include_bytes!("../web/app-machines.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-settings.css",
+        include_bytes!("../web/app-settings.css"),
         "text/css; charset=utf-8",
     ),
     (

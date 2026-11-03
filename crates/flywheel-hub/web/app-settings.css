@@ -1,0 +1,123 @@
+/* flywheel hub -- Settings (settings.js): sections, preference rows, the
+ * rebindable keymap, plugins, the hub.toml view; density and transcript
+ * ligature switches. Loaded after app-machines.css. */
+
+.settings-sheet { width: min(46rem, calc(100vw - 2rem)); }
+.settings-sheet form { gap: .8rem; }
+
+.settings-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .3rem;
+  margin: 0 -.2rem;
+}
+.settings-tab {
+  padding: .35rem .7rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: none;
+  color: var(--ink-2);
+  font: 600 10px/1.4 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.settings-tab:hover { color: var(--ink); }
+.settings-tab[aria-selected="true"] { color: var(--signal); border-color: var(--signal); background: var(--signal-soft); }
+
+.settings-body { display: grid; gap: .55rem; min-height: 14rem; }
+.settings-note { font-size: 11px; }
+.settings-body a { color: var(--signal); }
+
+.pref-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(9rem, 13rem) auto;
+  gap: .4rem .8rem;
+  align-items: center;
+  padding: .5rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+.pref-label { display: grid; gap: .15rem; min-width: 0; color: var(--ink); }
+.pref-control select, .pref-control input[type="number"], .pref-control input[type="text"] {
+  width: 100%;
+  padding: .45rem .6rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 12px var(--mono);
+  font-stretch: 87.5%;
+}
+.pref-control select:focus, .pref-control input:focus { outline: none; border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-soft); }
+@media (pointer: coarse) { .pref-control select, .pref-control input[type="number"], .pref-control input[type="text"] { font-size: 16px; } }
+.pref-control input[type="checkbox"] { width: 1.1rem; height: 1.1rem; }
+.pref-scope { display: flex; gap: .5rem; align-items: center; justify-content: flex-end; white-space: nowrap; }
+.pref-device { display: inline-flex; gap: .25rem; align-items: center; color: var(--ink-3); font-size: 10.5px; cursor: pointer; }
+.pref-tag { color: var(--ink-3); font-size: 10.5px; border: 1px dashed var(--rule-2); padding: 0 .35rem; border-radius: 2px; }
+
+.keys-scope { display: flex; flex-wrap: wrap; gap: .4rem 1rem; align-items: center; }
+.keys-group { display: grid; gap: 0; margin-top: .6rem; }
+.keys-group h3 { margin: 0 0 .2rem; }
+.key-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: .3rem .7rem;
+  align-items: center;
+  padding: .3rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+.key-row.capturing { background: var(--signal-soft); box-shadow: inset 2px 0 0 var(--signal); padding-left: .4rem; }
+.key-label { min-width: 0; color: var(--ink); }
+.key-chips { display: flex; flex-wrap: wrap; gap: .3rem; justify-content: flex-end; }
+.key-chip { display: inline-flex; align-items: center; gap: .1rem; }
+.key-chip kbd, .key-capture { font-family: var(--term); }
+.key-capture { border-style: dashed; color: var(--signal); animation: blink 1.2s steps(2) infinite; }
+.key-x { border: 0; background: none; color: var(--ink-3); cursor: pointer; padding: 0 .2rem; font-size: 13px; line-height: 1; }
+.key-x:hover { color: var(--alert); }
+.key-none { color: var(--ink-3); font-size: 10.5px; }
+.key-actions { display: flex; gap: .4rem; }
+.key-findings { grid-column: 1 / -1; }
+.key-findings p { margin: 0; font-size: 11px; }
+.key-warn { margin: 0; color: var(--brass); font-size: 11px; }
+
+.plugin-card { display: grid; gap: .35rem; padding: .7rem .8rem; border: 1px solid var(--rule-2); border-radius: 2px; background: var(--bg-2); }
+.plugin-card.invalid { border-color: var(--alert); }
+.plugin-head { display: flex; gap: .5rem; align-items: baseline; }
+.plugin-toggle { margin-left: auto; }
+.plugin-meta { margin: 0; color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
+.plugin-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+.plugin-card .sheet-body, .plugin-card .form-error { margin: 0; }
+.plugin-logs { margin: 0; padding-left: 1.1rem; font-size: 10.5px; color: var(--ink-2); display: grid; gap: .25rem; }
+.plugin-logs li.bad { color: var(--alert); }
+.plugin-logs pre { margin: .1rem 0 0; white-space: pre-wrap; color: var(--ink-3); font-family: var(--term); }
+
+.config-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.config-table th { text-align: left; color: var(--ink-3); font-weight: 600; letter-spacing: .12em; text-transform: uppercase; font-size: 9.5px; padding: .3rem .4rem; border-bottom: 1px solid var(--rule-2); }
+.config-table td { padding: .3rem .4rem; border-bottom: 1px solid var(--rule); overflow-wrap: anywhere; vertical-align: top; }
+.config-table .src-flag { color: var(--signal); }
+.config-table .src-file { color: var(--brass); }
+.config-table .src-default { color: var(--ink-3); }
+
+.chip.settings-gear svg { width: .8rem; height: .8rem; }
+.chip.settings-gear.warn { color: var(--alert); border-color: var(--alert); }
+
+/* Density: compact tightens the sidebar rows and pane title bars. */
+body.density-compact .session { min-height: 1.6rem; padding-top: .05rem; padding-bottom: .05rem; }
+body.density-compact .side-foot, body.density-compact .side-actions { gap: .25rem; }
+body.density-compact .pane-head { height: 1.35rem; }
+
+/* Transcripts, suggested commands, run output, and diffs show text exactly
+   as written: no ligatures (-> != ===) unless Settings turns them on. */
+body:not(.ligatures) :is(.tx-body, #cmd-list, #run-body, .rv-diff, #search-results, .fw-run-sheet) {
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+}
+
+@media (max-width: 760px) {
+  .settings-sheet { width: 100vw; max-width: 100vw; max-height: 100dvh; height: 100dvh; border-radius: 0; }
+  .pref-row { grid-template-columns: minmax(0, 1fr) minmax(7rem, 45%); }
+  .pref-scope { grid-column: 1 / -1; justify-content: flex-start; }
+  .key-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .key-actions { grid-column: 1 / -1; justify-content: flex-end; }
+  .settings-tab { padding: .55rem .7rem; }
+}

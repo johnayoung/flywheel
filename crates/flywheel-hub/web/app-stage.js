@@ -457,7 +457,7 @@ async function splitWithShell(pane, side) {
 
 // Alt+` between an agent and its companion shell: side by side on a
 // wide screen (palette "Companion shell" turns that off), else in place.
-const companionBeside = () => store.get("companion", "split") !== "swap";
+const companionBeside = () => settings.get("keyboard.companion", "split") !== "swap";
 function flipTo(id, from) {
   const tab = activeTab();
   if (phone() || !companionBeside() || !window.matchMedia(WIDE).matches || !tab) {

@@ -225,7 +225,31 @@ window.FwHubLauncher = function (ctx) {
     if (!agent) tplSave.hidden = true;
     models.replaceChildren(...(MODELS[kind] || []).map((m) => el("option", { value: m })));
     modelInput.placeholder = kind === "codex" ? "default: gpt-5-codex..." : "default: opus, sonnet...";
+    prefill();
     updateWarning();
+  }
+
+  // Settings' agent defaults for this kind go into fields the user has
+  // not touched since they were last filled.
+  let filled = null;
+  const fields = () => ({
+    model: modelInput.value,
+    permission_mode: modeSelect.value,
+    approval: approvalSelect.value,
+    sandbox: sandboxSelect.value,
+  });
+  function prefill() {
+    if (!ctx.agentDefaults || (kind !== "claude" && kind !== "codex")) return;
+    const now = fields();
+    const blank = { model: "", permission_mode: "", approval: "", sandbox: "" };
+    const untouched = JSON.stringify(now) === JSON.stringify(filled || blank);
+    if (!untouched) return;
+    const d = ctx.agentDefaults(kind);
+    modelInput.value = d.model;
+    if ([...modeSelect.options].some((o) => o.value === d.permission_mode)) modeSelect.value = d.permission_mode;
+    if ([...approvalSelect.options].some((o) => o.value === d.approval)) approvalSelect.value = d.approval;
+    if ([...sandboxSelect.options].some((o) => o.value === d.sandbox)) sandboxSelect.value = d.sandbox;
+    filled = fields();
   }
 
   function updateWarning() {
@@ -271,6 +295,8 @@ window.FwHubLauncher = function (ctx) {
     modeSelect.value = "";
     approvalSelect.value = "";
     sandboxSelect.value = "";
+    filled = null;
+    prefill();
     tplSave.hidden = true;
     tplName.value = "";
     tplError.textContent = "";

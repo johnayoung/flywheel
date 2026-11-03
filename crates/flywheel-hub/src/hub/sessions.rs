@@ -128,8 +128,10 @@ impl Hub {
             (kind, None) => vec![self.agent_program(kind)?.to_string_lossy().into_owned()],
         };
         let name = request.name.as_deref().map(validate_name).transpose()?;
-        let options = request
-            .launch
+        let tunables = self.tunables();
+        let options = tunables
+            .agent_defaults
+            .fill(request.kind, &request.launch)
             .validated(request.kind)
             .map_err(StateError::Invalid)?;
         let prompt =
@@ -147,7 +149,7 @@ impl Hub {
                 let mut plan = git::plan(
                     &cwd,
                     &new.task,
-                    &self.options.worktree_branch_prefix,
+                    &tunables.worktree_branch_prefix,
                     new.base.as_deref(),
                 )
                 .map_err(StateError::Invalid)?;
@@ -239,6 +241,9 @@ impl Hub {
         drop(store);
         self.git.nudge(badge_key(&record));
         self.emit(HubEvent::Sessions);
+        if let Some(session) = self.event_session(&record.id) {
+            self.emit_lifecycle("session.created", serde_json::json!({ "session": session }));
+        }
         Ok(self.view(record))
     }
 
@@ -450,7 +455,7 @@ impl Hub {
                     .collect(),
                 cols: cols.filter(|&c| c > 0).unwrap_or(DEFAULT_COLS),
                 rows: rows.filter(|&r| r > 0).unwrap_or(DEFAULT_ROWS),
-                scrollback_lines: self.options.scrollback_lines,
+                scrollback_lines: self.tunables().scrollback_lines,
             },
             move |exit| {
                 if let Some(hub) = weak.upgrade() {
@@ -573,6 +578,7 @@ impl Hub {
     /// Record an exit. The exited PTY stays in the live map -- its
     /// scrollback remains attachable -- until the session is removed.
     pub(super) fn on_session_exit(&self, id: &str, generation: Option<u64>, exit: ExitInfo) {
+        let exit_json = serde_json::json!({ "code": exit.code, "signal": exit.signal });
         let _ = self.store().mark_exited(id, exit);
         if let Some(generation) = generation {
             let source = StatusSource::Hub {
@@ -581,6 +587,12 @@ impl Hub {
             self.apply_signal(id, generation, Signal::Ended, None, source);
         }
         self.emit(HubEvent::Sessions);
+        if let Some(session) = self.event_session(id) {
+            self.emit_lifecycle(
+                "session.exited",
+                serde_json::json!({ "session": session, "exit": exit_json }),
+            );
+        }
     }
 
     /// Hang up a session's processes (SIGHUP, SIGKILL after
@@ -604,6 +616,7 @@ impl Hub {
 
     /// Kill (if running) and forget a session.
     pub fn remove_session(&self, id: &str) -> Result<(), HubError> {
+        let described = self.event_session(id);
         let mut store = self.store();
         let relaid = store.remove_session(id)?;
         let live = self.live().remove(id);
@@ -617,6 +630,9 @@ impl Hub {
         self.emit(HubEvent::Sessions);
         if let Some((workspace_id, rev)) = relaid {
             self.emit(HubEvent::Layout { workspace_id, rev });
+        }
+        if let Some(session) = described {
+            self.emit_lifecycle("session.removed", serde_json::json!({ "session": session }));
         }
         Ok(())
     }

@@ -12,6 +12,45 @@
 // (the "solo" pane) and never edits layouts.
 
 const TERM_FONT = '"FW Term", ui-monospace, "SF Mono", Menlo, Consolas, monospace';
+// Settings' appearance.term_font -> the CSS stack ("FW Term" is JetBrains Mono).
+const TERM_FONTS = {
+  jetbrains: TERM_FONT,
+  martian: '"FW Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+  system: 'ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace',
+};
+
+// The xterm options Settings decides.
+function termPrefs() {
+  const style = settings.get("terminal.cursor_style", "block");
+  const lines = settings.get("terminal.scrollback", 10000);
+  return {
+    fontFamily: TERM_FONTS[settings.get("appearance.term_font", "jetbrains")] || TERM_FONT,
+    fontSize: mobile.fontSize(),
+    cursorStyle: ["block", "bar", "underline"].includes(style) ? style : "block",
+    cursorBlink: settings.get("terminal.cursor_blink", true) !== false,
+    scrollback: Number.isInteger(lines) ? lines : 10000,
+  };
+}
+
+// Put changed terminal settings on every live pane (a new font is
+// loaded before it is measured; the panes refit).
+async function applyTermPrefs() {
+  const next = termPrefs();
+  if (document.fonts && next.fontFamily.startsWith('"FW Mono"')) {
+    await document.fonts.load(`${next.fontSize}px "FW Mono"`).catch(() => {});
+  }
+  for (const pane of livePanes()) {
+    const t = pane.term;
+    if (!t) continue;
+    let refit = false;
+    for (const [key, value] of Object.entries(next)) {
+      if (t.options[key] === value) continue;
+      t.options[key] = value;
+      if (key === "fontFamily" || key === "fontSize") refit = true;
+    }
+    if (refit && pane.refit) pane.refit();
+  }
+}
 const L = window.FwHubLayout;
 const phone = () => window.matchMedia(NARROW).matches;
 // Wide enough for an agent and its companion shell side by side.
@@ -34,7 +73,7 @@ Object.defineProperty(state, "exited", { get: () => (focusedPane() ? focusedPane
 Object.defineProperty(state, "replaying", { get: () => !!(focusedPane() && focusedPane().replaying) });
 
 const mobile = window.FwHubMobile({
-  $, el, state, store, api, sessionById, agentStatus,
+  $, el, state, store, prefs: settings, api, sessionById, agentStatus,
   toast: commands.toast,
   copyText: commands.copyText,
   term: () => focusedTerm(),
@@ -72,6 +111,7 @@ const panes = window.FwHubPanes({
     return name ? { name, link: machines.linkOf(name) } : null;
   },
   fontSize: () => mobile.fontSize(),
+  termPrefs: () => termPrefs(),
   termTheme: () => ({ theme: TERM_THEMES[resolvedTheme()], minimumContrastRatio: contrastFloor() }),
   transformInput: (data) => mobile.transformInput(data),
   fitTerminal: (pane) => mobile.fitTerminal(pane),

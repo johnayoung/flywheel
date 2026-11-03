@@ -23,7 +23,7 @@ use crate::vscode;
 use crate::vt::DEFAULT_SCROLLBACK_LINES;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -82,6 +82,9 @@ pub struct HubOptions {
     /// Prefix of the branches new session worktrees are cut on
     /// (`<prefix><task>`; `fw hub serve --worktree-branch-prefix`).
     pub worktree_branch_prefix: String,
+    /// Agent launch defaults per kind (`hub.toml` `[agents.*]`): fill
+    /// the fields a launch leaves unset.
+    pub agent_defaults: crate::config::AgentDefaults,
 }
 
 impl HubOptions {
@@ -110,6 +113,7 @@ impl HubOptions {
                 .filter(|h| !h.is_empty())
                 .map(|h| PathBuf::from(h).join("code")),
             worktree_branch_prefix: String::new(),
+            agent_defaults: crate::config::AgentDefaults::default(),
         }
     }
 }
@@ -338,6 +342,24 @@ pub enum HubEvent {
     /// A verified fan-out changed (launched, graded, picked, removed):
     /// re-read it.
     Fanout { id: String },
+    /// The stored UI settings were saved (`rev`: the new revision).
+    Settings { rev: u64 },
+    /// `hub.toml` was reloaded (applied, or found invalid).
+    Config { rev: u64 },
+    /// Plugins changed on disk, were enabled or disabled, or ran.
+    Plugins,
+    /// A plugin's response asked every open UI for a toast.
+    PluginToast {
+        plugin: String,
+        message: String,
+        tone: String,
+    },
+    /// A lifecycle event plugins subscribe to (`session.created`,
+    /// `review.merged`, ... see [`crate::plugins::EVENTS`]) with its data.
+    Lifecycle {
+        event: &'static str,
+        payload: serde_json::Value,
+    },
 }
 
 /// Facts about the server-owned PTY (present until the session is removed
@@ -412,6 +434,9 @@ pub struct Hub {
     search: crate::search::SearchIndex,
     /// Pauses (a handoff) and stops (a shutdown) fan-out gradings.
     grading: Arc<crate::fanout::GradingControl>,
+    /// The settings `hub.toml` can change while the hub runs (seeded
+    /// from the options; see [`crate::config`]).
+    tunables: RwLock<crate::config::Tunables>,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -464,6 +489,12 @@ impl Hub {
         let logins = Logins::load(&options.state_dir, unix_now());
         let (events, _) = broadcast::channel(EVENT_DEPTH);
         let options_state_dir = options.state_dir.clone();
+        let tunables = crate::config::Tunables {
+            scrollback_lines: options.scrollback_lines,
+            worktree_branch_prefix: options.worktree_branch_prefix.clone(),
+            import_root: options.import_root.clone(),
+            agent_defaults: options.agent_defaults.clone(),
+        };
         Ok(Arc::new(Self {
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),
@@ -488,6 +519,7 @@ impl Hub {
             detection: Arc::new(Detection::with_overrides(&options_state_dir)),
             search: crate::search::SearchIndex::default(),
             grading: Arc::default(),
+            tunables: RwLock::new(tunables),
             _serve_lock: serve_lock,
         }))
     }
@@ -517,6 +549,33 @@ impl Hub {
     pub(crate) fn emit(&self, event: HubEvent) {
         // No subscribers is fine.
         let _ = self.events.send(event);
+    }
+
+    /// Announce a plugin lifecycle event (one of
+    /// [`crate::plugins::EVENTS`]) with `payload`.
+    pub fn emit_lifecycle(&self, event: &'static str, payload: serde_json::Value) {
+        debug_assert!(crate::plugins::EVENTS.contains(&event), "{event}");
+        self.emit(HubEvent::Lifecycle { event, payload });
+    }
+
+    /// A session as plugin events describe it (`None`: no such session).
+    pub fn event_session(&self, id: &str) -> Option<serde_json::Value> {
+        let view = self.session(id).ok()?;
+        let workspace = self.workspace(&view.record.workspace_id).ok();
+        let record = &view.record;
+        Some(serde_json::json!({
+            "id": record.id,
+            "name": record.name,
+            "kind": record.kind,
+            "state": record.state,
+            "workspace_id": record.workspace_id,
+            "workspace": workspace.map(|w| w.name),
+            "cwd": record.cwd,
+            "worktree": record.worktree,
+            "companion_of": record.companion_of,
+            "branch": view.git.as_ref().and_then(|g| g.branch.clone()),
+            "agent": view.agent,
+        }))
     }
 
     /// Suggested commands read from agent transcripts.
@@ -626,8 +685,25 @@ impl Hub {
     }
 
     /// The default root the import picker searches.
-    pub fn import_root(&self) -> Option<&Path> {
-        self.options.import_root.as_deref()
+    pub fn import_root(&self) -> Option<PathBuf> {
+        self.tunables().import_root
+    }
+
+    /// The live-changeable settings in force (`hub.toml`, flags).
+    pub fn tunables(&self) -> crate::config::Tunables {
+        self.tunables
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Put reloaded settings in force: sessions, worktrees, imports, and
+    /// agent launches started from now on use them.
+    pub fn set_tunables(&self, tunables: crate::config::Tunables) {
+        *self
+            .tunables
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = tunables;
     }
 
     pub(crate) fn store(&self) -> MutexGuard<'_, HubStore> {

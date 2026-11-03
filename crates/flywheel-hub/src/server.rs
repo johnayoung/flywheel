@@ -62,11 +62,13 @@ mod flywheel_api;
 mod import_api;
 mod listen;
 mod notify_api;
+mod plugins_api;
 mod proxy;
 mod pwa;
 mod review_api;
 mod search_api;
 mod sessions_api;
+mod settings_api;
 mod slots;
 mod templates_api;
 mod terminal_ws;
@@ -158,6 +160,11 @@ pub struct ServerOptions {
     /// Verified fan-outs (`/api/fanouts*`, the events socket's `fanout`
     /// messages); `None` turns them off.
     pub fanouts: Option<Arc<crate::fanout::Fanouts>>,
+    /// `hub.toml` as the running hub reads it (`GET /api/config`); `None`
+    /// answers from the file and the defaults.
+    pub config: Option<Arc<crate::config::ConfigWatch>>,
+    /// The plugin host (`/api/plugins*`); `None`: no plugins run.
+    pub plugins: Option<Arc<crate::plugins::PluginHost>>,
 }
 
 #[derive(Clone)]
@@ -170,6 +177,8 @@ struct AppState {
     peers: Arc<crate::peers::PeerStore>,
     /// Other hubs this one proxies to (`fw hub machine`).
     machines: Arc<crate::machines::Machines>,
+    /// The UI's preferences and keymap (`settings.json`).
+    settings: Arc<crate::settings::SettingsStore>,
 }
 
 /// Build the router. Flipping `shutdown` to `true` closes every open
@@ -177,7 +186,9 @@ struct AppState {
 pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<bool>) -> Router {
     let peers = Arc::new(crate::peers::PeerStore::load(hub.state_dir()));
     let machines = Arc::new(crate::machines::Machines::load(hub.state_dir()));
+    let settings = Arc::new(crate::settings::SettingsStore::load(hub.state_dir()));
     let state = AppState {
+        settings,
         hub,
         options: Arc::new(options),
         shutdown,
@@ -261,6 +272,22 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/events", get(events_ws))
         .route("/api/notify", get(notify_api::status))
         .route("/api/notify/test", post(notify_api::test))
+        .route(
+            "/api/settings",
+            get(settings_api::get_settings).put(settings_api::put_settings),
+        )
+        .route("/api/settings/keys/check", post(settings_api::check_keys))
+        .route("/api/config", get(settings_api::get_config))
+        .route("/api/plugins", get(plugins_api::list))
+        .route(
+            "/api/plugins/{name}",
+            axum::routing::put(plugins_api::toggle),
+        )
+        .route("/api/plugins/{name}/logs", get(plugins_api::logs))
+        .route(
+            "/api/plugins/{name}/actions/{action}",
+            post(plugins_api::run_action),
+        )
         .route("/api/flywheel", get(flywheel_api::list))
         .route("/api/flywheel/panel", get(flywheel_api::panel))
         .route("/api/flywheel/run", get(flywheel_api::run_output))

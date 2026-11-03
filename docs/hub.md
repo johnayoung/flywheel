@@ -21,10 +21,12 @@ fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N]   # agent
 fw hub search QUERY [--regex] [--case] [--session S] [--workspace W] [--kind K]... [--source scrollback|transcript|commands]... [--limit N] [--per-session N] [--offset N] [--json]   # see Search; exit 0 hits, 1 none
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent hooks only
 # start/serve also take --handoff (take over from the running hub; --bind/--port ignored)
-# SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--no-flywheel] [--import-root DIR] [--notify-url URL] [--worktree-branch-prefix P]
+# SERVE FLAGS (each also a hub.toml key; a flag wins): [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--no-flywheel] [--import-root DIR] [--notify-url URL] [--worktree-branch-prefix P]
 fw hub machine add NAME URL [--mint [--peer-name N]] [--fingerprint SHA256] [--replace]   # register another hub (secret from FW_HUB_MACHINE_SECRET or stdin); --replace re-pairs NAME in place; see Machines
 fw hub machine ls [--no-probe] | rm NAME | test [NAME]     # [--json]
 fw hub peer issue --name X | ls | revoke NAME|ID           # credentials other hubs hold to reach this one
+fw hub config check [--file PATH] | show [--json]          # <state-dir>/hub.toml: validate / settings in force + source; see Settings
+fw hub plugin ls [--json] | enable NAME | disable NAME | logs NAME [-n N] [--json]   # local plugins; see Plugins
 # every verb but report (hooks only) takes --state-dir DIR
 # ls/new/send/read/wait/attach/kill/relaunch/commands/search/template/explain/review/merge/open/url also take [--url URL] [--token T]: a hub elsewhere
 #   and (all but url) [--machine NAME]: a machine registered on that hub, through its proxy (`fw hub ls --machine desktop`)
@@ -115,6 +117,8 @@ Replaces the running hub process with a new one **without ending any session**: 
 
 `report` is what agent sessions' hooks run (see Agent status); it needs the session's environment, never prints to stdout, and fails with exit 1 (never 2, which would stop a Claude `Stop`).
 
+Every flag below but `--notify-url` and `--state-dir` is also a `hub.toml` key (see Settings); a flag given wins over the file.
+
 | Flag | Default | |
 |---|---|---|
 | `--bind` | `127.0.0.1` | non-loopback prints a warning |
@@ -127,6 +131,100 @@ Replaces the running hub process with a new one **without ending any session**: 
 | `--worktree-branch-prefix` | none | session worktree branches are `<prefix><task>` (e.g. `agent/`) |
 | `--import-root` | `~/code` | where the UI's VS Code import looks for `*.code-workspace` (3 levels deep; hidden, `node_modules`/`target`/... and symlinked dirs skipped) |
 | `--state-dir` | `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub` | |
+
+## Settings and hub.toml
+
+Two layers, both validated by the server:
+
+- **`<state-dir>/hub.toml`** -- the hub's own settings (what `serve` flags set). Precedence per key: **flag > file > default** (a list flag replaces the file's list). Unknown keys and bad values are errors naming the key. Invalid at start: `serve` refuses (exit 2). Edited while running: re-read within 1 s; valid -> live keys apply at once (`config show` lists the rest as waiting for a restart); invalid -> the last good settings stay, the error goes to the log, `GET /api/config`, a UI toast, the gear (red), and `fw hub config check` (exit 1).
+- **Settings** (palette "Settings", the sidebar's gear, `Alt ,`; a full-screen sheet on phones) -- UI preferences kept by the hub in `<state-dir>/settings.json` (0600, revisioned), so they follow you to every device; any one can be kept for **this device** only (browser local storage). Per-browser choices made before Settings existed (theme, pane prefix, text size, key bar, alerts) became that browser's device overrides.
+
+```toml
+[server]                          # at restart
+bind = "127.0.0.1"
+port = 7420
+public_urls = ["https://box.tailnet.ts.net"]
+allow_origins = []
+trusted_proxies = []
+[sessions]
+scrollback_lines = 5000           # live: sessions started from now on
+restore = true                    # at restart (--no-restore)
+agent_resume = true               # at restart (--no-agent-resume)
+[worktrees]
+branch_prefix = "agent/"          # live
+[import]
+root = "~/code"                   # live
+[flywheel]
+enabled = true                    # at restart (--no-flywheel)
+[agents.claude]                   # live: fills a launch (CLI, API, web) that names none
+model = "opus"
+permission_mode = "acceptEdits"
+[agents.codex]
+model = "gpt-5-codex"
+approval = "on-request"
+sandbox = "workspace-write"
+[plugins]
+enabled = true                    # live: false runs no plugin
+max_concurrent = 4                # at restart (1-16)
+```
+
+Not in hub.toml: push (`notify.toml`, 0600: it holds secrets), detection overrides (`agent-detection/`), plugins (`plugins/`). `fw hub config show` asks the running hub (else reads the file; flags unknown) and prints every key, value, source (`flag | file | default`), and when it applies.
+
+| Settings section | |
+|---|---|
+| Appearance | theme, terminal font (JetBrains Mono / Martian Mono / system), text size (unset: 13, phones 11), density (compact) |
+| Terminal | scrollback in view (client side; the hub's own is `sessions.scrollback_lines`), cursor style / blink, ligatures in transcripts, commands, run output, diffs (off) |
+| Keyboard | pane prefix, key bar, companion key mode; **every shortcut**, rebindable (below) |
+| Notifications | system notifications (device only: a browser permission), command toasts |
+| Agents | the new-session form's pre-filled model / permission mode / approvals / sandbox per kind |
+| Plugins | each plugin: enable toggle, events, actions (run), last run, last error, logs |
+| Server | read-only: effective hub.toml with sources, file error, pending restart |
+
+**Keys**: each action has up to 4 bindings, `mod+...+key` (`mod` = Ctrl, Cmd on macOS; `alt` = Alt, Ctrl+Option on macOS; then `shift`, `meta`; key = the physical key: `a`-`z` `0`-`9` `f1`-`f24` arrows `pageup` ... `` ` - = [ ] \ ; ' , . / ``; `alt+1..9` for the nth-session action). Pane-prefix keys bind the character typed (`%`, `"`, `z`) or `ctrl+arrow`. Saved for all devices or "this device only". The server refuses (422, every finding named): keys the browser/OS keeps (`ctrl+w`, `ctrl+t`, `ctrl+n`, `ctrl+tab`, `ctrl+pageup/down`, `alt+f4`, `alt+tab`, `f11`, any `meta+`), keys terminals need (no modifier, `shift+` only, `ctrl+c` `ctrl+d` `ctrl+z` `ctrl+\` `ctrl+[` ...), and a key bound twice in one scope (`mod+k` = `ctrl+k`); it warns on keys a shell loses (`alt+b/f/d/.`, `ctrl+<letter>`, `ctrl+left/right`). Fixed: in-dialog navigation (arrows, `j` `k`, Enter, Esc), F2 / Delete on sidebar rows. The keys reference (`?` after the prefix, palette "Keyboard shortcuts") lists the bindings in force.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/settings` | `{"rev","values","keys","keymap","prefs":[spec],"actions":[{"id","group","label","scope","indexed","defaults"}],"rules":{"reserved","terminal","shadowed"},"load_error","file"}` |
+| PUT | `/settings` | `{"rev","values"?:{id: value\|null},"keys"?:{action: [keys]\|null}}` -> the view + `warnings`; 409 stale `{"error","settings"}`; 422 `{"error","errors":[{"action","key","message"}]}` |
+| POST | `/settings/keys/check` | `{"keys":{action:[keys]}}` -> `{"keys","errors","warnings"}` (saves nothing) |
+| GET | `/config` | `{"file":{"path","exists","error","loaded_at"},"rev","values":[{"key","value","source","apply"}],"pending_restart","running"}` |
+
+Events socket: `{"type":"settings","rev"}`, `{"type":"config","rev"}` (re-read).
+
+## Plugins
+
+Local executables the hub runs on its events and as palette actions (herdr's model). **They run as you, with your user's access, unsandboxed: the hub reviews nothing.** Nothing installs one but you: copy a directory to `<state-dir>/plugins/<name>/` (`[a-z0-9][a-z0-9_-]{0,31}`); the UI and API can enable, disable, and run plugins, never download one. A plugin found is **disabled** until `fw hub plugin enable NAME` (or its Settings toggle): `<state-dir>/plugins.json`. Sample: `crates/flywheel-hub/plugins/hello`.
+
+```toml
+# <state-dir>/plugins/ping/plugin.toml
+description = "Ping me when an agent is stuck"
+command = ["./hook.sh"]            # argv, no shell; ./x is the plugin dir's, a bare name is looked up on PATH
+timeout_secs = 10                  # 1-300
+[[events]]
+on = "status.changed"              # hub.started session.created session.exited session.removed status.changed
+statuses = ["blocked", "done"]     #   review.committed review.pushed review.pr_opened review.rebased review.merged fanout.finished
+kinds = ["claude", "codex"]        # optional: sessions of these kinds
+[[actions]]                        # palette "Plugin: <title>", Settings > Plugins
+id = "summarize"
+title = "Summarize this session"
+context = "session"                # needs an attached session (default "hub")
+command = ["./summarize.py"]       # optional: else the top-level command
+```
+
+- **Run**: cwd = the plugin dir, own process group, stdin = one JSON document `{"version":1,"type":"event"|"action","plugin","event"|"action","at","hub":{"version"},"payload"}` (`payload.session`: id, name, kind, state, workspace(_id), cwd, worktree, branch, agent; `status.changed` adds `status`, `previous`, `detail`; `session.exited` `exit`; `review.*` `dir`, `head`, `branch`, `base`, `url`, `summary`). Environment: only `PATH HOME USER LOGNAME SHELL LANG LANGUAGE LC_ALL LC_CTYPE LC_MESSAGES TZ TMPDIR TERM XDG_* DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS` from the hub, plus `FW_HUB_PLUGIN`, `FW_HUB_PLUGIN_DIR`, `FW_HUB_PLUGIN_TRIGGER` (`event:<name>` / `action:<id>`), `FW_HUB_STATE_DIR` -- never `FW_HUB_TOKEN`, peer/report secrets, or DSNs (a plugin can still read the token file: it is you). At the deadline SIGTERM, then SIGKILL 0.5 s later, to the whole group. stdout/stderr: 64 KiB each kept. At most `plugins.max_concurrent` runs at once; 64 waiting, then events are dropped (logged).
+- **Response**: stdout that is a JSON object: `{"toast": "text" | {"message","tone":"info|ok|warn|error"}}` (events: shown in every open UI; actions: to the caller), and for actions only `{"paste":{"text","run"?,"session"?}}` (into the action's session unless `session`; as `POST /paste`, 64 KiB max). Anything else on stdout is just logged; a malformed object is the run's error.
+- **Logs**: every run to `<state-dir>/plugin-logs/<name>.jsonl` (0600; trigger, exit / signal, `timed_out`, duration, error, 4 KiB of each stream, response; trimmed to the newest 200 past 512 KiB) and failures to the hub log. `fw hub plugin logs NAME`, Settings' logs, `GET /api/plugins/{name}/logs`.
+- Re-scanned every 2 s (new, changed, removed, enabled); an invalid `plugin.toml` is listed with its error and never run.
+- `fanout.finished` is accepted for verified fan-out (backlog item 24); until fan-out ships nothing emits it (the hook point is `Hub::emit_lifecycle`).
+
+| Method | Path | |
+|---|---|---|
+| GET | `/plugins` | `{"enabled","dir","events","plugins":[{"name","dir","enabled","valid","error","description","version","timeout_secs","events","actions":[{"id","title","context"}],"last_run","last_error"}]}` |
+| PUT | `/plugins/{name}` | `{"enabled"}` -> the plugin |
+| GET | `/plugins/{name}/logs[?limit=N]` | `{"plugin","runs":[...]}` newest first (max 200) |
+| POST | `/plugins/{name}/actions/{id}` | `{"session_id"?}` -> `{"ok","toast","paste","log"}`; 404 unknown, 409 disabled / plugins off / needs a session |
+
+Events socket: `{"type":"plugins"}` (re-list), `{"type":"plugin_toast","plugin","message","tone"}`. Peer credentials are refused on `/api/plugins*`, `/api/settings*`, `/api/config`.
 
 ## Remote access (phone, other machines)
 
@@ -155,7 +253,7 @@ FW_HUB_MACHINE_SECRET=$(ssh desktop fw hub token) fw hub machine add desktop URL
 fw hub ls --machine desktop; fw hub attach --machine desktop SESSION
 ```
 
-- **Peer credential** (`fwpeer_<id>_<secret>`, 256 bits; digests in B's `peers.json`, 0600): API and WebSockets only -- never a browser login. **Equivalent to B's token**: it starts sessions running any command as B's user, so it can read B's token file. Allowed: what drives sessions, search and transcripts, templates, and usage included. Refused (403, defense in depth, not a boundary): `/api/token/rotate`, `/api/login-codes`, `/api/peers*`, `/api/machines*`, `/api/workspaces/import`, `/api/code-workspaces`, `/m/*`, and every non-`/api` page. Survives B's token rotation; `fw hub peer revoke` ends its requests at once and closes its sockets (4003). `peer issue/ls/revoke` go through B's running hub, else edit the file (a running hub re-reads it on change).
+- **Peer credential** (`fwpeer_<id>_<secret>`, 256 bits; digests in B's `peers.json`, 0600): API and WebSockets only -- never a browser login. **Equivalent to B's token**: it starts sessions running any command as B's user, so it can read B's token file. Allowed: what drives sessions, search and transcripts, templates, and usage included. Refused (403, defense in depth, not a boundary): `/api/token/rotate`, `/api/login-codes`, `/api/peers*`, `/api/machines*`, `/api/workspaces/import`, `/api/code-workspaces`, `/api/plugins*`, `/api/settings*`, `/api/config`, `/m/*`, and every non-`/api` page. Survives B's token rotation; `fw hub peer revoke` ends its requests at once and closes its sockets (4003). `peer issue/ls/revoke` go through B's running hub, else edit the file (a running hub re-reads it on change).
 - **A's side**: `machines.json` (0600, state dir 0700) holds name, URL, peer credential, optional pin. Plaintext on purpose: an OS keyring (Secret Service, Keychain) hands secrets to any process of the same user once unlocked -- exactly who can already read the file (and the hub token beside it, and every session) -- is absent on headless boxes and WSL where hubs usually run, and its Linux client (`keyring` over Secret Service) would add a D-Bus client stack to the static musl release builds for no gain against that threat. Protect the state dir as you would `~/.ssh`: full-disk encryption against a lost disk; keep it out of unencrypted backups. `machine ls` names the store (`credentials: <path> (plaintext file, mode 0600)`; `--json`: `credential_store`). `add` checks the credential with `GET /api/whoami` there and refuses a hub token, this hub itself, and a hub already registered (same URL, hub id, or peer; a credential it minted for a refused add is revoked). `add --replace` (UI: Re-pair) swaps a machine's credential, URL, or pin keeping its name, and revokes the old credential. `rm` asks B to revoke the credential (`DELETE /api/peer`; else it says how). Names: `[a-z0-9-]`, 1-32, not `local`.
 - **Proxy**: only `/api/...` on a registered machine's base URL (SSRF guard; redirects, cookies refused/stripped). Request bodies up to 8 MiB, answers up to 32 MiB, 120 s per call; answers are served as JSON, plain text, or opaque bytes only, with `Content-Disposition: attachment` and CSP `sandbox` (a machine's answer never runs as this hub's page). A machine's 401 becomes 502 `{"error","machine","machine_state":"refused"}` (never signs the browser out); unreachable is 502 `offline`. After a refusal A answers for 90 s without asking (B's failure limit counts A's address). WebSockets relay frame by frame with backpressure; B's 4001-4003 reach the browser as 4010, a removed machine closes with 4011, a lost link 1011.
 - **TLS**: https machines are verified against the system roots, or by `--fingerprint` (SHA-256 of the leaf certificate, `openssl x509 -noout -fingerprint -sha256`; names and expiry not checked, like an SSH host key). An untrusted certificate's refusal names the fingerprint it saw.
@@ -278,7 +376,7 @@ Each workspace has a **layout**: named tabs, each a tree of splits (side by side
 | `Alt Shift H J K L` | move the focused pane's nearest divider left / down / up / right |
 | `Alt Z` / `Alt X` | zoom (this browser) / close pane |
 | `Alt T`, `Alt PgUp/PgDn` | new tab, previous / next tab |
-| `Ctrl B` then a key | only with palette "Pane prefix Ctrl B: on": `%` `"` split, arrows focus, `Ctrl` arrows resize, `z` `x` `c` `n` `p` `1`-`9` `,` (rename) `&` (close tab) `o` (next pane) `?`; `Ctrl B` twice sends `^B` |
+| `Ctrl B` then a key | only with the pane prefix on (Settings > Keyboard, or palette): `%` `"` split, arrows focus, `Ctrl` arrows resize, `z` `x` `c` `n` `p` `1`-`9` `,` (rename) `&` (close tab) `o` (next pane) `?`; `Ctrl B` twice sends `^B` |
 
 ## Agent status
 
@@ -476,8 +574,11 @@ curl -s -H "Authorization: Bearer $T" -H 'content-type: application/json' \
 
 Sidebar: workspaces (collapsible, with an agent rollup chip: blocked / working / done) > sessions, each with its kind glyph and a status dot (live / done / failed / stopped / gone; ended sessions keep their exit code across hub restarts; a running agent shows working / blocked / done / idle instead, blocked with an alert edge). The tab title and favicon badges count blocked and done agents (`(1 blocked, 2 done) ...`; one favicon badge each); on narrow screens the drawer button badges agents in other sessions that need you. A blocked row shows what it asks under its name. Status and list changes are pushed over the events socket; the UI polls only while that socket is down. Dialogs create workspaces (folder paths checked live, plain folders marked "no git", optional per-folder labels; paste several lines at once; or **Import VS Code workspace**: the `*.code-workspace` files under a search root you can change, Import / Update per file (Update first shows what it adds and drops), or a pasted path, then a report of every folder and every skipped entry, duplicates included) and sessions (shell | claude | codex, folder picker defaulting to the attached session's folder, with a filter past 5 folders; missing folders disabled; on a git folder, an optional new sibling worktree with its path, branch, and base previewed live). Rows in git directories carry a branch line (`wt` for worktrees, ↑ahead ↓behind ~changed ?untracked); companion shells hang under their agent. Sidebar folder chips: filled dot = git, hollow = plain folder, struck red = missing. The attached session is kept in the URL (`#session=<id>`), so reloads re-attach; a dropped socket keeps the last screen, shows a countdown banner (and how many keystrokes were not sent), and reconnects with backoff (immediately on `online` / tab focus). An ended process, or a session whose terminal did not survive a hub restart, offers Relaunch (in place) and Close. A viewed session removed elsewhere (another browser, `fw hub kill --rm`, its workspace deleted) leaves its pane (a toast says so while other panes remain; with none left, the empty stage says "Session removed." and why) -- nothing to relaunch; so does a stale `#session=` link on load. Only a session list fetched after the attach can declare it gone (overlapping refreshes are sequenced). Themes: auto (follows the OS), dark, light; the light theme lifts low-contrast agent TUI colours to 4.5:1.
 
+Defaults below; every one is rebindable in Settings > Keyboard.
+
 | Key | |
 |---|---|
+| `Alt ,` | Settings |
 | `Ctrl K` | command palette (fuzzy: sessions, actions, themes); again inside it sends a literal `^K` |
 | `Alt N` / `Alt Shift N` | new session / new workspace |
 | `Alt 1`..`9`, `Alt Up/Down` | jump to the nth / previous / next session with a terminal (numbers skip gone ones) |

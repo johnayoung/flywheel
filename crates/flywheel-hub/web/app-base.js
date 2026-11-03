@@ -103,6 +103,20 @@ const store = {
   },
 };
 
+// Settings (settings.js): preferences the hub keeps for you, this
+// device's overrides, the keymap every shortcut dispatches on, plugins,
+// and the hub.toml view. Made first: the theme and keys below read it.
+const settings = window.FwHubSettings({
+  $, el, icon, store, IS_MAC,
+  rawApi: (...args) => rawApi(...args),
+  toast: (...args) => commands.toast(...args),
+  // The attached session when it is this hub's (plugins run here).
+  attachedLocal: () => {
+    const session = sessionById(state.attached);
+    return session && !session.machine ? session.id : null;
+  },
+});
+
 // --- state -----------------------------------------------------------
 
 const state = {
@@ -313,6 +327,7 @@ const commands = window.FwHubCommands({
   el,
   icon,
   isAgent,
+  toastsOn: () => settings.get("notifications.toasts", true) !== false,
   api,
   state,
   sessionById,
@@ -374,7 +389,7 @@ const attention = window.FwHubAttention({
   fanout,
 });
 const notify = window.FwHubNotify({
-  $, state, store, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,
+  $, state, store, prefs: settings, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,
   openSession: (id) => openSession(id),
   present: () => present(),
 });
@@ -385,6 +400,13 @@ const worktrees = window.FwHubWorktree({ $, el, icon, api });
 // fields, launch templates, quick launch, and token usage.
 const launcher = window.FwHubLauncher({
   $, el, api, state, worktrees,
+  // The new-session form's pre-filled agent options (Settings: agents).
+  agentDefaults: (kind) => ({
+    model: settings.get(`agents.${kind}.model`, "") || "",
+    permission_mode: kind === "claude" ? settings.get("agents.claude.permission_mode", "") || "" : "",
+    approval: kind === "codex" ? settings.get("agents.codex.approval", "") || "" : "",
+    sandbox: kind === "codex" ? settings.get("agents.codex.sandbox", "") || "" : "",
+  }),
   remoteUsage: () => machines.usage(),
   // The spend strip counts this hub only: named so once machines show.
   localLabel: () => (machines.any() ? machines.host() || "this hub" : ""),
@@ -641,12 +663,18 @@ const TERM_THEMES = {
 };
 const THEMES = ["auto", "dark", "light"];
 const prefersLight = window.matchMedia("(prefers-color-scheme: light)");
-let theme = THEMES.includes(store.get("theme", "auto")) ? store.get("theme", "auto") : "auto";
+const themePref = () => {
+  const kept = settings.get("appearance.theme", "auto");
+  return THEMES.includes(kept) ? kept : "auto";
+};
+let theme = themePref();
 const resolvedTheme = () => (theme === "auto" ? (prefersLight.matches ? "light" : "dark") : theme);
 
-function applyTheme(next) {
+// `persist`: a choice made here (saved as the theme setting); false when
+// applying the setting itself.
+function applyTheme(next, persist = true) {
   theme = next;
-  store.set("theme", theme);
+  if (persist && next !== themePref()) settings.set("appearance.theme", next);
   document.documentElement.dataset.theme = theme;
   $("#theme-label").textContent = theme;
   for (const pane of livePanes()) {
@@ -681,4 +709,19 @@ window.addEventListener("focus", () => sendTheme());
 // backgrounds -- pale blue, gold -- that vanish on the light theme's
 // paper. xterm lifts any cell below this ratio against its background.
 const contrastFloor = () => (resolvedTheme() === "light" ? 4.5 : 1);
-prefersLight.addEventListener("change", () => applyTheme(theme));
+prefersLight.addEventListener("change", () => applyTheme(theme, false));
+
+// Settings changed (here, on another device, or a device override): put
+// them in force.
+settings.onChange((ids) => {
+  const has = (prefix) => ids.some((id) => id === prefix || id.startsWith(prefix));
+  if (has("appearance.theme") && themePref() !== theme) applyTheme(themePref(), false);
+  if (has("appearance.density")) document.body.classList.toggle("density-compact", settings.get("appearance.density") === "compact");
+  if (has("terminal.transcript_ligatures")) document.body.classList.toggle("ligatures", settings.get("terminal.transcript_ligatures") === true);
+  if (has("appearance.term_font") || has("appearance.font_size") || has("terminal.")) applyTermPrefs();
+  if (has("keyboard.pane_prefix")) setPrefixOn(settings.get("keyboard.pane_prefix", false) === true);
+  if (has("keyboard.key_bar")) mobile.render();
+  if (has("notifications.alerts")) notify.renderChip();
+});
+document.body.classList.toggle("density-compact", settings.get("appearance.density") === "compact");
+document.body.classList.toggle("ligatures", settings.get("terminal.transcript_ligatures") === true);

@@ -284,6 +284,8 @@ function onPush(message, machine) {
     onLayoutEvent(message);
   } else if (message.type === "fanout" && !machine) {
     fanout.onEvent(message);
+  } else if (!machine && ["settings", "config", "plugins", "plugin_toast"].includes(message.type)) {
+    settings.onPush(message);
   }
 }
 

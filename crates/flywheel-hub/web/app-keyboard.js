@@ -12,6 +12,10 @@ const palette = {
 
 function paletteCommands() {
   const attached = sessionById(state.attached);
+  // Hints name the keys in force (Settings: keyboard).
+  const k = (id) => settings.keyOf(id);
+  const prefixLabel = k("prefix.arm") || "(unbound)";
+  const jump = (settings.keymap()["session.jump"] || [])[0] || "";
   const items = [];
   const numbering = new Map(attachable().map((s, i) => [s.id, i]));
   for (const session of orderedSessions()) {
@@ -21,16 +25,16 @@ function paletteCommands() {
       group: "Sessions",
       glyph: glyphFor(session.kind),
       label: session.name,
-      hint: `${session.machine ? `${session.machine} · ` : ""}${workspace ? workspace.name : ""} · ${statusLook(session).label}${n < 9 ? ` · ${MOD} ${n + 1}` : ""}${session.live ? "" : " · no terminal"}`,
+      hint: `${session.machine ? `${session.machine} · ` : ""}${workspace ? workspace.name : ""} · ${statusLook(session).label}${n < 9 && jump ? ` · ${settings.label(jump.replace("1..9", String(n + 1)))}` : ""}${session.live ? "" : " · no terminal"}`,
       run: () => openSession(session.id),
     });
   }
   const cmd = (label, hint, run, glyph = "chev", extra = {}) => items.push({ group: "Commands", glyph, label, hint, run, ...extra });
-  cmd("New session", `${MOD} N`, () => openSessionDialog(), "plus");
+  cmd("New session", k("session.new"), () => openSessionDialog(), "plus");
   for (const workspace of state.workspaces) {
     cmd(`New session in ${workspace.name}`, workspace.machine ? `on ${workspace.machine}` : "", () => openSessionDialog(workspace.id), "plus");
   }
-  cmd("New workspace", `${MOD} Shift N`, () => openWorkspaceDialog(), "plus");
+  cmd("New workspace", k("workspace.new"), () => openWorkspaceDialog(), "plus");
   cmd("Machines", "other machines' hubs: add, test, remove", () => machines.openDialog(), "chev");
   for (const name of machines.names()) {
     if (machines.linkOf(name) !== "online") cmd(`Reconnect to ${name}`, machines.linkOf(name), () => machines.reconnect(name), "redo");
@@ -40,50 +44,50 @@ function paletteCommands() {
     importer.open();
   }, "import");
   if (attached) {
-    cmd(`Rename ${attached.name}`, `${MOD} R`, () => startRename(attached.id), "pen");
+    cmd(`Rename ${attached.name}`, k("session.rename"), () => startRename(attached.id), "pen");
     if (attached.state === "running" && attached.live) {
       cmd(`Stop ${attached.name}`, "keep scrollback", () => stopSession(attached.id), "stop");
     } else {
       cmd(`Relaunch ${attached.name}`, "same session, fresh process", () => relaunch(attached.id), "redo");
     }
-    cmd(`Close ${attached.name}`, `${MOD} W`, () => closeSession(attached.id), "x");
+    cmd(`Close ${attached.name}`, k("session.close"), () => closeSession(attached.id), "x");
     cmd("Detach", "close every pane here; the sessions keep running", () => detach(), "chev");
   }
   if (state.view && !phone()) {
     const tab = activeTab();
     const pane = focusedPane();
     if (pane && pane.sessionId) {
-      cmd("Split right: new shell", `${MOD} \\`, () => splitWithShell(pane, "right"), "split-right");
-      cmd("Split down: new shell", `${MOD} -`, () => splitWithShell(pane, "down"), "split-down");
+      cmd("Split right: new shell", k("pane.split_right"), () => splitWithShell(pane, "right"), "split-right");
+      cmd("Split down: new shell", k("pane.split_down"), () => splitWithShell(pane, "down"), "split-down");
       if (tab && L.panes(tab.root).length > 1) {
-        cmd(zoomedIn(tab) ? "Unzoom pane" : "Zoom pane", `${MOD} Z`, () => toggleZoom(), "zoom");
+        cmd(zoomedIn(tab) ? "Unzoom pane" : "Zoom pane", k("pane.zoom"), () => toggleZoom(), "zoom");
         cmd("Move pane to a new tab", "", () => paneToTab(pane), "chev");
       }
-      cmd("Close pane", `${MOD} X · the session keeps running`, () => closePane(), "x");
+      cmd("Close pane", `${k("pane.close")} · the session keeps running`, () => closePane(), "x");
     }
-    cmd("New tab", `${MOD} T`, () => newTab(), "plus");
+    cmd("New tab", k("tab.new"), () => newTab(), "plus");
     const layout = viewLayout();
     if (layout) {
       layout.tabs.forEach((t, i) => {
-        if (t !== tab) cmd(`Tab: ${t.name}`, `${L.panes(t.root).length} panes${prefix.on && i < 9 ? ` · Ctrl B ${i + 1}` : ""}`, () => selectTab(t.id), "chev");
+        if (t !== tab) cmd(`Tab: ${t.name}`, `${L.panes(t.root).length} panes${prefix.on && i < 9 ? ` · ${prefixLabel} ${i + 1}` : ""}`, () => selectTab(t.id), "chev");
       });
       if (tab) {
-        cmd(`Rename tab ${tab.name}`, prefix.on ? "Ctrl B ," : "double-click the tab", () => {
+        cmd(`Rename tab ${tab.name}`, prefix.on ? `${prefixLabel} ${settings.keyOf("prefix.rename_tab")}` : "double-click the tab", () => {
           tabRenaming = tab.id;
           renderTabs();
         }, "pen");
       }
     }
   }
-  cmd(`Pane prefix Ctrl B: turn ${prefix.on ? "off" : "on"}`, prefix.on ? "now on (Ctrl B twice sends ^B)" : "tmux-style: Ctrl B then % \" arrows z x c n p", () => {
-    prefix.on = !prefix.on;
-    store.set("prefix", prefix.on);
-    armPrefix(false);
-    commands.toast(prefix.on ? "Pane prefix on: Ctrl B, then a key (Ctrl B twice sends ^B)." : "Pane prefix off: Ctrl B goes to the terminal.", { timeout: 3500 });
+  cmd(`Pane prefix ${prefixLabel}: turn ${prefix.on ? "off" : "on"}`, prefix.on ? `now on (${prefixLabel} twice sends it)` : `tmux-style: ${prefixLabel} then a key (Settings: keyboard)`, () => {
+    const on = !prefix.on;
+    setPrefixOn(on);
+    settings.set("keyboard.pane_prefix", on);
+    commands.toast(on ? `Pane prefix on: ${prefixLabel}, then a key (${prefixLabel} twice sends it).` : `Pane prefix off: ${prefixLabel} goes to the terminal.`, { timeout: 3500 });
   }, "gear");
   const beside = companionBeside();
-  cmd(`Companion shell: ${beside ? "in place" : "beside the agent"}`, `${MOD} \` ${beside ? "now opens it beside (wide screens)" : "now flips in place"}`, () => {
-    store.set("companion", beside ? "swap" : "split");
+  cmd(`Companion shell: ${beside ? "in place" : "beside the agent"}`, `${settings.keyOf("companion.flip")} ${beside ? "now opens it beside (wide screens)" : "now flips in place"}`, () => {
+    settings.set("keyboard.companion", beside ? "swap" : "split");
   }, "gear");
   launcher.paletteItems(cmd);
   search.paletteItems(cmd);
@@ -99,7 +103,8 @@ function paletteCommands() {
   for (const t of THEMES) {
     cmd(`Theme: ${t}`, t === theme ? "current" : "", () => applyTheme(t), "gear");
   }
-  cmd("Keyboard shortcuts", "", () => $("#dlg-keys").showModal(), "chev");
+  cmd("Keyboard shortcuts", settings.keyOf("keys.show"), () => settings.showKeys(), "chev");
+  settings.paletteItems(cmd);
   cmd("Sign out", "", logout, "x");
   return items;
 }
@@ -263,35 +268,76 @@ function jumpBy(delta) {
   openSession(live[next].id);
 }
 
-// The hub chord: Alt (no Ctrl/Meta) elsewhere, Ctrl+Option on macOS.
-function hubChord(event) {
-  if (event.metaKey) return false;
-  return IS_MAC ? event.ctrlKey && event.altKey : event.altKey && !event.ctrlKey;
-}
-
-// Whether the key reports its plain character (Alt+7 -> "7"), as
-// opposed to a layout character or a dead key.
-const typesItself = (event, ch) => event.key.length === 1 && event.key.toUpperCase() === ch;
-
 const ARROWS = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
-const VIM = { KeyH: "left", KeyJ: "down", KeyK: "up", KeyL: "right" };
 
-// The tmux-style prefix (off unless turned on: palette "Pane prefix"):
-// Ctrl+B, then one key. Ctrl+B twice sends a literal ^B.
-const prefix = { on: store.get("prefix", false) === true, armed: false, timer: 0 };
+// The tmux-style prefix (off unless turned on: Settings, or palette "Pane
+// prefix"): its key (default Ctrl+B), then one key. The prefix key twice
+// sends it to the terminal.
+const prefix = { on: settings.get("keyboard.pane_prefix", false) === true, armed: false, timer: 0 };
 function armPrefix(armed) {
   prefix.armed = armed;
   clearTimeout(prefix.timer);
   if (armed) prefix.timer = setTimeout(() => armPrefix(false), 2500);
   $("#prefix-pill").hidden = !armed;
 }
+function setPrefixOn(on) {
+  prefix.on = on;
+  armPrefix(false);
+}
+
+// The control character a Ctrl+letter key sends (Ctrl+B -> ^B), or "".
+function controlChar(event) {
+  const m = /^Key([A-Z])$/.exec(event.code);
+  return event.ctrlKey && m ? String.fromCharCode(m[1].charCodeAt(0) - 64) : "";
+}
+
+const isPrefixKey = (event) => {
+  const hit = settings.match(event);
+  return !!hit && hit.id === "prefix.arm";
+};
+
+// What each prefix action does (index: the nth of a 1..9 range).
+const PREFIX_ACTIONS = {
+  "prefix.split_right": () => splitWithShell(focusedPane(), "right"),
+  "prefix.split_down": () => splitWithShell(focusedPane(), "down"),
+  "prefix.focus_left": () => focusToward("left"),
+  "prefix.focus_down": () => focusToward("down"),
+  "prefix.focus_up": () => focusToward("up"),
+  "prefix.focus_right": () => focusToward("right"),
+  "prefix.resize_left": () => nudgePane("left"),
+  "prefix.resize_down": () => nudgePane("down"),
+  "prefix.resize_up": () => nudgePane("up"),
+  "prefix.resize_right": () => nudgePane("right"),
+  "prefix.zoom": () => toggleZoom(),
+  "prefix.close_pane": () => closePane(),
+  "prefix.new_tab": () => newTab(),
+  "prefix.next_tab": () => cycleTab(1),
+  "prefix.prev_tab": () => cycleTab(-1),
+  "prefix.next_pane": () => cyclePane(1),
+  "prefix.tab": (n) => {
+    const layout = viewLayout();
+    const t = layout && layout.tabs[n];
+    if (t) selectTab(t.id);
+  },
+  "prefix.rename_tab": () => {
+    const t = activeTab();
+    if (t) {
+      tabRenaming = t.id;
+      renderTabs();
+    }
+  },
+  "prefix.close_tab": () => {
+    const t = activeTab();
+    if (t) closeTab(t.id);
+  },
+  "prefix.help": () => settings.showKeys(),
+};
 
 // Returns true when the key was the prefix's (and is consumed).
 function prefixKey(event) {
   if (!prefix.on || phone()) return false;
-  const ctrlB = event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey && event.code === "KeyB";
   if (!prefix.armed) {
-    if (!ctrlB) return false;
+    if (!isPrefixKey(event)) return false;
     event.preventDefault();
     event.stopPropagation();
     armPrefix(true);
@@ -301,69 +347,81 @@ function prefixKey(event) {
   event.preventDefault();
   event.stopPropagation();
   armPrefix(false);
-  const key = event.key;
-  const pane = focusedPane();
-  if (ctrlB) {
-    if (pane) pane.send(JSON.stringify({ type: "input", data: "\x02" }));
-  } else if (key === "%") {
-    splitWithShell(pane, "right");
-  } else if (key === '"') {
-    splitWithShell(pane, "down");
-  } else if (ARROWS[event.code] && event.ctrlKey) {
-    nudgePane(ARROWS[event.code]);
-  } else if (ARROWS[event.code]) {
-    focusToward(ARROWS[event.code]);
-  } else if (key === "z") {
-    toggleZoom();
-  } else if (key === "x") {
-    closePane();
-  } else if (key === "c") {
-    newTab();
-  } else if (key === "n") {
-    cycleTab(1);
-  } else if (key === "p") {
-    cycleTab(-1);
-  } else if (key === "o") {
-    cyclePane(1);
-  } else if (/^[1-9]$/.test(key)) {
-    const layout = viewLayout();
-    const t = layout && layout.tabs[Number(key) - 1];
-    if (t) selectTab(t.id);
-  } else if (key === ",") {
-    const t = activeTab();
-    if (t) {
-      tabRenaming = t.id;
-      renderTabs();
-    }
-  } else if (key === "&") {
-    const t = activeTab();
-    if (t) closeTab(t.id);
-  } else if (key === "?") {
-    $("#dlg-keys").showModal();
+  if (isPrefixKey(event)) {
+    const pane = focusedPane();
+    const literal = controlChar(event);
+    if (pane && literal) pane.send(JSON.stringify({ type: "input", data: literal }));
+    return true;
   }
+  const hit = settings.matchPrefix(event);
+  if (hit && PREFIX_ACTIONS[hit.id]) PREFIX_ACTIONS[hit.id](hit.index);
   return true;
 }
 
+// What each global action does; returning false leaves the key to the
+// terminal (the action does not apply here and now).
+const GLOBAL_ACTIONS = {
+  "session.new": () => openSessionDialog(),
+  "workspace.new": () => openWorkspaceDialog(),
+  "session.jump": (n) => {
+    const target = attachable()[n];
+    if (!target) return false;
+    openSession(target.id);
+    return true;
+  },
+  "session.next": () => jumpBy(1),
+  "session.prev": () => jumpBy(-1),
+  "session.rename": () => (state.attached ? startRename(state.attached) : false),
+  "session.close": () => (state.attached ? closeSession(state.attached) : false),
+  "commands.toggle": () => {
+    review.close();
+    commands.toggle();
+  },
+  "commands.copy_last": () => commands.copyLast(),
+  "companion.flip": () => (state.attached ? commands.flipCompanion() : false),
+  "flywheel.toggle": () => flywheel.togglePill(),
+  "review.toggle": () => review.togglePill(),
+  "pane.split_right": () => splitWithShell(focusedPane(), "right"),
+  "pane.split_down": () => splitWithShell(focusedPane(), "down"),
+  "pane.focus_left": () => focusToward("left"),
+  "pane.focus_down": () => focusToward("down"),
+  "pane.focus_up": () => focusToward("up"),
+  "pane.focus_right": () => focusToward("right"),
+  "pane.resize_left": () => nudgePane("left"),
+  "pane.resize_down": () => nudgePane("down"),
+  "pane.resize_up": () => nudgePane("up"),
+  "pane.resize_right": () => nudgePane("right"),
+  "pane.zoom": () => toggleZoom(),
+  "pane.close": () => (state.focusId && !phone() ? closePane() : false),
+  "tab.new": () => (state.view && !phone() ? newTab() : false),
+  "tab.prev": () => cycleTab(-1),
+  "tab.next": () => cycleTab(1),
+  "settings.open": () => settings.open(),
+  "keys.show": () => settings.showKeys(),
+};
+
 // Capture phase: runs before xterm sees the key, so hub shortcuts never
-// reach the shell (Ctrl+K twice sends a literal ^K).
+// reach the shell. Every binding comes from the keymap (Settings).
 window.addEventListener(
   "keydown",
   (event) => {
-    const mod = event.ctrlKey || event.metaKey;
-    if (mod && !event.altKey && !event.shiftKey && event.code === "KeyK") {
+    if (settings.isCapturing()) return;
+    const hit = settings.match(event);
+    if (hit && hit.id === "palette.open") {
       event.preventDefault();
       event.stopPropagation();
       if (paletteOpen()) {
+        // Again inside the palette: the key itself, to the terminal.
         closePalette();
-        if (focusedPane()) focusedPane().send(JSON.stringify({ type: "input", data: "\x0b" }));
+        const literal = controlChar(event);
+        if (focusedPane() && literal) focusedPane().send(JSON.stringify({ type: "input", data: literal }));
       } else if (!document.querySelector("dialog[open]")) {
         search.close(false);
         openPalette();
       }
       return;
     }
-    // Ctrl Shift F (Cmd Shift F on macOS): search every session.
-    if (mod && event.shiftKey && !event.altKey && event.code === "KeyF") {
+    if (hit && hit.id === "search.open") {
       event.preventDefault();
       event.stopPropagation();
       if (paletteOpen()) closePalette();
@@ -372,64 +430,10 @@ window.addEventListener(
     }
     if (paletteOpen() || search.isOpen() || document.querySelector("dialog[open]") || $("#ctx-menu")) return;
     if (prefixKey(event)) return;
-    if (!hubChord(event)) return;
-    let handled = true;
-    const digit = /^Digit([1-9])$/.exec(event.code);
-    const letter = /^Key([A-Z])$/.exec(event.code);
-    if ((digit || letter) && !IS_MAC && !typesItself(event, (digit || letter)[1])) {
-      // The layout made Alt+key into a character of its own: the
-      // terminal's, not a hub shortcut.
-      handled = false;
-    } else if (digit) {
-      const target = attachable()[Number(digit[1]) - 1];
-      if (target) openSession(target.id);
-      else handled = false;
-    } else if (event.code === "KeyN") {
-      if (event.shiftKey) openWorkspaceDialog();
-      else openSessionDialog();
-    } else if (event.code === "ArrowDown" && !event.shiftKey) {
-      jumpBy(1);
-    } else if (event.code === "ArrowUp" && !event.shiftKey) {
-      jumpBy(-1);
-    } else if (event.code === "KeyR" && !event.shiftKey && state.attached) {
-      startRename(state.attached);
-    } else if (event.code === "KeyW" && !event.shiftKey && state.attached) {
-      closeSession(state.attached);
-    } else if (event.code === "KeyC") {
-      if (event.shiftKey) commands.copyLast();
-      else {
-        review.close();
-        commands.toggle();
-      }
-    } else if (event.code === "Backquote" && !event.shiftKey && state.attached) {
-      commands.flipCompanion();
-    } else if (event.code === "KeyF" && !event.shiftKey) {
-      flywheel.togglePill();
-    } else if (event.code === "KeyG" && !event.shiftKey) {
-      review.togglePill();
-    } else if (event.code === "Backslash" && !event.shiftKey && (IS_MAC || event.key === "\\")) {
-      splitWithShell(focusedPane(), "right");
-    } else if (event.code === "Minus" && !event.shiftKey && (IS_MAC || event.key === "-")) {
-      splitWithShell(focusedPane(), "down");
-    } else if (event.shiftKey && ARROWS[event.code]) {
-      focusToward(ARROWS[event.code]);
-    } else if (event.shiftKey && VIM[event.code]) {
-      nudgePane(VIM[event.code]);
-    } else if (event.code === "KeyZ" && !event.shiftKey) {
-      toggleZoom();
-    } else if (event.code === "KeyX" && !event.shiftKey && state.focusId && !phone()) {
-      closePane();
-    } else if (event.code === "KeyT" && !event.shiftKey && state.view && !phone()) {
-      newTab();
-    } else if (event.code === "PageDown" || event.code === "PageUp") {
-      cycleTab(event.code === "PageDown" ? 1 : -1);
-    } else {
-      handled = false;
-    }
-    if (handled) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
+    if (!hit || hit.id === "prefix.arm" || !GLOBAL_ACTIONS[hit.id]) return;
+    if (GLOBAL_ACTIONS[hit.id](hit.index) === false) return;
+    event.preventDefault();
+    event.stopPropagation();
   },
   true,
 );
@@ -466,6 +470,10 @@ const actions = {
   "toggle-flywheel": () => flywheel.togglePill(),
   "toggle-review": () => review.togglePill(),
   search: () => search.open(),
+  settings: () => {
+    document.body.classList.remove("side-open");
+    settings.open();
+  },
   machines: () => {
     document.body.classList.remove("side-open");
     machines.openDialog();

@@ -66,11 +66,9 @@ window.FwHubPanes = function (ctx) {
 
     function makeTerm() {
       const term = new window.Terminal({
-        cursorBlink: true,
-        fontFamily: ctx.TERM_FONT,
-        fontSize: ctx.fontSize(),
         lineHeight: 1.12,
-        scrollback: 10000,
+        // Font, size, cursor, scrollback: Settings (appearance, terminal).
+        ...ctx.termPrefs(),
         allowProposedApi: false,
         ...ctx.termTheme(),
       });

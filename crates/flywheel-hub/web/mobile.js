@@ -127,12 +127,12 @@ window.FwHubMobile = function (ctx) {
   // Phones get a smaller default so agent TUIs have room to draw.
   const defaultFont = () => (Math.min(window.screen.width, window.innerWidth) < 500 ? 11 : 13);
   const fontSize = () => {
-    const kept = store.get("font-size", null);
+    const kept = ctx.prefs.get("appearance.font_size", null);
     return Number.isInteger(kept) && kept >= FONT_MIN && kept <= FONT_MAX ? kept : defaultFont();
   };
   // "auto" (touch screens), "on", or "off".
   const keybarPref = () => {
-    const kept = store.get("keybar", "auto");
+    const kept = ctx.prefs.get("keyboard.key_bar", "auto");
     return ["auto", "on", "off"].includes(kept) ? kept : "auto";
   };
   const keybarWanted = () => keybarPref() === "on" || (keybarPref() === "auto" && coarse.matches);
@@ -370,7 +370,8 @@ window.FwHubMobile = function (ctx) {
       t.options.fontSize = next;
       pane.refit();
     }
-    if (keep) store.set("font-size", next);
+    // Text size from the key bar, a pinch, or the palette: this device's.
+    if (keep) ctx.prefs.set("appearance.font_size", next, { device: true });
   }
 
   // --- fitting ---------------------------------------------------------
@@ -825,7 +826,7 @@ window.FwHubMobile = function (ctx) {
       const mode = touch.mode;
       if (mode === "pinch") {
         if (event.touches.length) return;
-        store.set("font-size", term().options.fontSize);
+        ctx.prefs.set("appearance.font_size", term().options.fontSize, { device: true });
       } else if (mode === "scroll") {
         // A recent move carries on as momentum.
         if (event.timeStamp - touch.lastT < 80) flingFrom(touch.velocity);
@@ -955,7 +956,7 @@ window.FwHubMobile = function (ctx) {
     const pref = keybarPref();
     const next = { auto: keybarWanted() ? "off" : "on", on: "off", off: "auto" }[pref];
     cmd(`Key bar: ${next}`, `now ${pref}${pref === "auto" ? (coarse.matches ? " (touch: shown)" : " (shown on touch screens)") : ""}`, () => {
-      store.set("keybar", next);
+      ctx.prefs.set("keyboard.key_bar", next, { device: true });
       render();
     }, "gear");
     cmd("Text: larger", `${fontSize()}px`, () => setFont(fontSize() + 1), "plus");
@@ -979,7 +980,7 @@ window.FwHubMobile = function (ctx) {
   coarse.addEventListener("change", () => render());
 
   return {
-    fontSize, fitTerminal, transformInput, attachTerminal, render, paletteItems, openCompose,
+    fontSize, setFont, fitTerminal, transformInput, attachTerminal, render, paletteItems, openCompose,
     pruneDrafts, forget,
   };
 };

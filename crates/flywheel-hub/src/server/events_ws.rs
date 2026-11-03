@@ -173,6 +173,22 @@ async fn events_pump(
                     Ok(HubEvent::Fanout { id }) => {
                         socket.send(text(json!({ "type": "fanout", "id": id }))).await.is_ok()
                     }
+                    Ok(HubEvent::Settings { rev }) => {
+                        socket.send(text(json!({ "type": "settings", "rev": rev }))).await.is_ok()
+                    }
+                    Ok(HubEvent::Config { rev }) => {
+                        socket.send(text(json!({ "type": "config", "rev": rev }))).await.is_ok()
+                    }
+                    Ok(HubEvent::Plugins) => {
+                        socket.send(text(json!({ "type": "plugins" }))).await.is_ok()
+                    }
+                    Ok(HubEvent::PluginToast { plugin, message, tone }) => {
+                        socket
+                            .send(text(json!({ "type": "plugin_toast", "plugin": plugin, "message": message, "tone": tone })))
+                            .await
+                            .is_ok()
+                    }
+                    Ok(HubEvent::Lifecycle { .. }) => true,
                     Ok(HubEvent::Layout { workspace_id, rev }) => {
                         socket.send(text(json!({ "type": "layout", "workspace_id": workspace_id, "rev": rev }))).await.is_ok()
                     }

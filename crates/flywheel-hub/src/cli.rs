@@ -131,6 +131,12 @@ enum HubCommand {
     Machine(crate::machine_cli::MachineArgs),
     /// Credentials other hubs hold to reach this one: issue, ls, revoke.
     Peer(crate::machine_cli::PeerArgs),
+    /// <state-dir>/hub.toml: check validates it, show prints the settings
+    /// in force and where each came from (flag, file, default).
+    Config(crate::config_cli::ConfigArgs),
+    /// Local plugins (<state-dir>/plugins/<name>/plugin.toml) run on hub
+    /// events and as palette actions: ls, enable, disable, logs.
+    Plugin(crate::plugin_cli::PluginArgs),
 }
 
 // `--machine` is refused here (a peer credential mints no login codes):
@@ -209,13 +215,15 @@ struct ServeArgs {
 /// How the hub serves: shared by `serve`, `start`, and `install-service`.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct HubArgs {
-    /// Address to listen on. Anything but loopback exposes shells to the
-    /// network: prefer `tailscale serve` for remote access.
-    #[arg(long, default_value_t = IpAddr::V4(Ipv4Addr::LOCALHOST))]
-    bind: IpAddr,
-    /// Port to listen on (0 picks a free port).
-    #[arg(long, default_value_t = DEFAULT_PORT)]
-    port: u16,
+    /// Address to listen on [default: 127.0.0.1, or hub.toml
+    /// server.bind]. Anything but loopback exposes shells to the network:
+    /// prefer `tailscale serve` for remote access.
+    #[arg(long)]
+    bind: Option<IpAddr>,
+    /// Port to listen on (0 picks a free port) [default: 7420, or hub.toml
+    /// server.port].
+    #[arg(long)]
+    port: Option<u16>,
     /// Extra browser origin to accept (e.g. https://box.tailnet.ts.net);
     /// repeatable. Same-origin is always accepted.
     #[arg(long = "allow-origin", value_name = "ORIGIN")]
@@ -234,9 +242,10 @@ pub(crate) struct HubArgs {
     #[arg(long = "trusted-proxy", value_name = "IP")]
     trusted_proxies: Vec<IpAddr>,
     /// Per-session scrollback kept by the server's terminal emulator, in
-    /// lines (capped at 1M cells, so wide terminals keep fewer).
-    #[arg(long, value_name = "LINES", default_value_t = crate::vt::DEFAULT_SCROLLBACK_LINES)]
-    scrollback_lines: usize,
+    /// lines (capped at 1M cells, so wide terminals keep fewer)
+    /// [default: 5000, or hub.toml sessions.scrollback_lines].
+    #[arg(long, value_name = "LINES")]
+    scrollback_lines: Option<usize>,
     /// Do not restore the sessions the last clean shutdown stopped: they
     /// stay stopped, on later starts too, until relaunched (`fw hub
     /// relaunch` or the UI).
@@ -275,12 +284,15 @@ impl HubArgs {
     /// These options as `serve` arguments, with `state_dir` (absolute)
     /// in place of the one given.
     pub(crate) fn to_argv(&self, state_dir: &Path) -> Vec<String> {
-        let mut argv = vec![
-            "--bind".to_owned(),
-            self.bind.to_string(),
-            "--port".to_owned(),
-            self.port.to_string(),
-        ];
+        // Only what was given: the rest comes from hub.toml (re-read by
+        // the started hub) or the defaults.
+        let mut argv = Vec::new();
+        if let Some(bind) = self.bind {
+            argv.extend(["--bind".to_owned(), bind.to_string()]);
+        }
+        if let Some(port) = self.port {
+            argv.extend(["--port".to_owned(), port.to_string()]);
+        }
         for origin in &self.allow_origins {
             argv.extend(["--allow-origin".to_owned(), origin.clone()]);
         }
@@ -290,10 +302,9 @@ impl HubArgs {
         for proxy in &self.trusted_proxies {
             argv.extend(["--trusted-proxy".to_owned(), proxy.to_string()]);
         }
-        argv.extend([
-            "--scrollback-lines".to_owned(),
-            self.scrollback_lines.to_string(),
-        ]);
+        if let Some(lines) = self.scrollback_lines {
+            argv.extend(["--scrollback-lines".to_owned(), lines.to_string()]);
+        }
         if self.no_restore {
             argv.push("--no-restore".to_owned());
         }
@@ -322,6 +333,23 @@ impl HubArgs {
             state_dir.to_string_lossy().into_owned(),
         ]);
         argv
+    }
+
+    /// What was given on the command line, for [`crate::config`].
+    pub(crate) fn flags(&self) -> crate::config::Flags {
+        crate::config::Flags {
+            bind: self.bind,
+            port: self.port,
+            public_urls: self.public_urls.clone(),
+            allow_origins: self.allow_origins.clone(),
+            trusted_proxies: self.trusted_proxies.clone(),
+            scrollback_lines: self.scrollback_lines,
+            no_restore: self.no_restore,
+            no_agent_resume: self.no_agent_resume,
+            no_flywheel: self.no_flywheel,
+            import_root: self.import_root.clone(),
+            worktree_branch_prefix: self.worktree_branch_prefix.clone(),
+        }
     }
 
     /// The `--public-url`s as origins (an error names the bad one).
@@ -432,6 +460,8 @@ pub fn run_with(
         HubCommand::Open(args) => browser::open(&args, out, err),
         HubCommand::Machine(args) => crate::machine_cli::machine(&args, out, err),
         HubCommand::Peer(args) => crate::machine_cli::peer(&args, out, err),
+        HubCommand::Config(args) => crate::config_cli::main(&args, out, err),
+        HubCommand::Plugin(args) => crate::plugin_cli::main(&args, out, err),
     }
 }
 
@@ -861,17 +891,31 @@ fn serve_cmd(
             return 1;
         }
     };
-    let public_urls = match hub_args.public_url_origins() {
-        Ok(urls) => urls,
-        Err(message) => {
-            let _ = writeln!(err, "fw hub: {message}");
-            return 2;
-        }
-    };
+    if let Err(message) = hub_args.public_url_origins() {
+        let _ = writeln!(err, "fw hub: {message}");
+        return 2;
+    }
     if let Err(e) = crate::paths::ensure_private_dir(&state_dir) {
         let _ = writeln!(err, "fw hub: state dir {}: {e}", state_dir.display());
         return 1;
     }
+    // `<state-dir>/hub.toml` under the flags given (flag > file > default).
+    let config = match crate::config::ConfigWatch::open(
+        &state_dir,
+        hub_args.flags(),
+        crate::config::home_dir(),
+    ) {
+        Ok(config) => Arc::new(config),
+        Err(message) => {
+            let _ = writeln!(
+                err,
+                "fw hub: {message}\nfw hub: fix it (`fw hub config check`) or move it aside; not starting"
+            );
+            return 2;
+        }
+    };
+    let effective = config.started().clone();
+    let public_urls = effective.public_urls.clone();
     crate::install_crypto_provider();
     let notify = match NotifyConfig::load(&state_dir, hub_args.notify_url.as_deref()) {
         Ok(config) => config,
@@ -881,17 +925,12 @@ fn serve_cmd(
         }
     };
     let mut options = HubOptions::new(state_dir);
-    options.scrollback_lines = hub_args.scrollback_lines;
+    options.scrollback_lines = effective.scrollback_lines;
     options.report_command = report_command();
-    options.agent_resume = !hub_args.no_agent_resume;
-    if let Some(prefix) = &hub_args.worktree_branch_prefix {
-        options.worktree_branch_prefix = prefix.clone();
-    }
-    if let Some(root) = &hub_args.import_root {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let root = crate::state::expand_home(root, home.as_deref());
-        options.import_root = Some(std::path::absolute(&root).unwrap_or(root));
-    }
+    options.agent_resume = effective.agent_resume;
+    options.worktree_branch_prefix = effective.worktree_branch_prefix.clone();
+    options.import_root = effective.import_root.clone();
+    options.agent_defaults = effective.agent_defaults.clone();
     // One hub per state dir: the hub holds `<state-dir>/serve.lock` for
     // its whole life (a second would overwrite the first's runtime file and
     // report socket, leaving `url` / `token --rotate` and agent hooks unable
@@ -943,7 +982,7 @@ fn serve_cmd(
             return 1;
         }
     };
-    let bind = SocketAddr::new(hub_args.bind, hub_args.port);
+    let bind = SocketAddr::new(effective.bind, effective.port);
     let listening = match taken_over.as_mut() {
         Some(taken) => taken.listener(&runtime),
         None => runtime.block_on(tokio::net::TcpListener::bind(bind)),
@@ -956,7 +995,7 @@ fn serve_cmd(
         }
     };
     let local = listener.local_addr().unwrap_or(bind);
-    if !hub_args.bind.is_loopback() {
+    if !effective.bind.is_loopback() {
         let _ = writeln!(
             err,
             "fw hub: WARNING: listening on {local}, reachable beyond this machine. \
@@ -1003,15 +1042,15 @@ fn serve_cmd(
     if let Some(said) = handed_over {
         // Sessions came along running: nothing to restore.
         let _ = writeln!(out, "{said}");
-    } else if hub_args.no_restore {
+    } else if !effective.restore {
         match hub.forgo_restore() {
             Ok(0) => {
-                let _ = writeln!(out, "session restore off (--no-restore)");
+                let _ = writeln!(out, "session restore off (--no-restore / sessions.restore)");
             }
             Ok(n) => {
                 let _ = writeln!(
                     out,
-                    "session restore off (--no-restore): {n} session{} stay{} stopped until relaunched",
+                    "session restore off (--no-restore / sessions.restore): {n} session{} stay{} stopped until relaunched",
                     if n == 1 { "" } else { "s" },
                     if n == 1 { "s" } else { "" }
                 );
@@ -1113,13 +1152,13 @@ fn serve_cmd(
         }
         None => None,
     };
-    let mut allowed_origins = hub_args.allow_origins;
+    let mut allowed_origins = effective.allow_origins.clone();
     allowed_origins.extend(public_urls);
     if let Some(ts) = &tailscale {
         allowed_origins.extend(ts.serve_urls.iter().cloned());
     }
-    let flywheel = match (&extensions.flywheel, hub_args.no_flywheel) {
-        (Some(provider), false) => {
+    let flywheel = match (&extensions.flywheel, effective.flywheel) {
+        (Some(provider), true) => {
             let monitor = FlywheelMonitor::new(Arc::clone(provider), MonitorTiming::default());
             match monitor.watch(&hub) {
                 Ok(()) => Some(monitor),
@@ -1141,13 +1180,36 @@ fn serve_cmd(
             None
         }
     };
+    // Plugins: local executables on hub events and as palette actions.
+    let plugins = Arc::new(crate::plugins::PluginHost::new(
+        hub.state_dir(),
+        crate::plugins::HostOptions {
+            max_concurrent: effective.plugins_max_concurrent,
+            base_env: std::env::vars_os().collect(),
+            enabled: effective.plugins_enabled,
+        },
+    ));
+    {
+        let _enter = runtime.enter();
+        plugins.watch(&hub);
+    }
+    // hub.toml edits: live keys in force at once, the UI told.
+    if let Err(e) = config.attach(&hub, Some(Arc::clone(&plugins))) {
+        let _ = writeln!(
+            err,
+            "fw hub: {} will not be re-read while running: {e}",
+            config.path().display()
+        );
+    }
     let server_options = ServerOptions {
         allowed_origins,
-        trusted_proxies: hub_args.trusted_proxies,
+        trusted_proxies: effective.trusted_proxies.clone(),
         notifier,
         flywheel,
         review_tools,
         fanouts,
+        config: Some(Arc::clone(&config)),
+        plugins: Some(plugins),
     };
     let state_dir = hub.state_dir().to_path_buf();
     let result = runtime.block_on(serve_gated(

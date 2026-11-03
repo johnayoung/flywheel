@@ -27,6 +27,7 @@
 <link rel="stylesheet" href="/assets/app-drawers.css">
 <link rel="stylesheet" href="/assets/app-search.css">
 <link rel="stylesheet" href="/assets/app-machines.css">
+<link rel="stylesheet" href="/assets/app-settings.css">
 <link rel="stylesheet" href="/assets/app-priority.css">
 <link rel="stylesheet" href="/assets/app-fanout.css">
 </head>
@@ -103,6 +104,7 @@
       </button>
       <button type="button" class="chip alerts" id="alerts-toggle" aria-pressed="false"><span class="alerts-dot" aria-hidden="true"></span><span id="alerts-label">alerts off</span></button>
       <button type="button" class="chip" data-action="machines" title="Other machines' hubs">machines</button>
+      <button type="button" class="chip settings-gear" id="settings-gear" data-action="settings" title="Settings" aria-label="Settings"><svg aria-hidden="true"><use href="#i-gear"/></svg><span>settings</span></button>
       <button type="button" class="chip" data-action="logout">sign out</button>
     </footer>
   </aside>
@@ -455,36 +457,27 @@
   <div id="run-body" class="run-body" role="tabpanel" tabindex="0"></div>
 </dialog>
 
+<dialog id="dlg-settings" class="sheet settings-sheet" aria-labelledby="settings-title">
+  <form method="dialog">
+    <header class="sheet-head">
+      <span class="sheet-kicker">preferences</span>
+      <h2 id="settings-title">Settings</h2>
+    </header>
+    <nav id="settings-nav" class="settings-nav" role="tablist" aria-label="Settings sections"></nav>
+    <div id="settings-body" class="settings-body" role="tabpanel"></div>
+    <footer class="sheet-foot">
+      <button type="submit" class="slab">Done</button>
+    </footer>
+  </form>
+</dialog>
+
 <dialog id="dlg-keys" class="sheet narrow" aria-labelledby="keys-title">
   <form method="dialog">
     <header class="sheet-head">
       <span class="sheet-kicker">reference</span>
       <h2 id="keys-title">Keyboard</h2>
     </header>
-    <dl class="keys wide">
-      <div><dt><kbd>Ctrl</kbd><kbd>K</kbd></dt><dd>command palette (press again inside it to send a literal <code>^K</code>)</dd></div>
-      <div><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>F</kbd></dt><dd>search every session: scrollback, agent transcripts, suggested commands</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>N</kbd></dt><dd>new session</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>N</kbd></dt><dd>new workspace</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>1</kbd>&ndash;<kbd>9</kbd></dt><dd>jump to the nth session</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>&uarr;</kbd> / <kbd>&darr;</kbd></dt><dd>previous / next session</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>R</kbd></dt><dd>rename the attached session</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>W</kbd></dt><dd>close the attached session</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>C</kbd></dt><dd>show / hide suggested commands</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd></dt><dd>copy the last suggested shell command</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>G</kbd></dt><dd>review the attached session's git work: commits, diffs, commit / push / PR / merge</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>F</kbd></dt><dd>Flywheel panel of the attached session's folder</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>`</kbd></dt><dd>flip between an agent and its companion shell (opened on first use)</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>\</kbd> / <kbd>Alt</kbd><kbd>-</kbd></dt><dd>split the focused pane right / down (a new shell; an agent's companion first)</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>&larr;</kbd><kbd>&uarr;</kbd><kbd>&darr;</kbd><kbd>&rarr;</kbd></dt><dd>focus the pane that way</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>H</kbd><kbd>J</kbd><kbd>K</kbd><kbd>L</kbd></dt><dd>move the focused pane's divider left / down / up / right</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>Z</kbd> / <kbd>Alt</kbd><kbd>X</kbd></dt><dd>zoom the focused pane (this browser only) / close it (the session keeps running)</dd></div>
-      <div><dt><kbd>Alt</kbd><kbd>T</kbd>, <kbd>Alt</kbd><kbd>PgUp</kbd> / <kbd>PgDn</kbd></dt><dd>new tab, previous / next tab</dd></div>
-      <div><dt><kbd>Ctrl</kbd><kbd>B</kbd> then a key</dt><dd>with the pane prefix on (palette): <code>%</code> <code>"</code> split, arrows focus, <kbd>Ctrl</kbd> arrows resize, <code>z</code> zoom, <code>x</code> close pane, <code>c</code> new tab, <code>n</code> <code>p</code> <code>1</code>-<code>9</code> tabs, <code>,</code> rename, <code>&amp;</code> close tab, <code>o</code> next pane; <kbd>Ctrl</kbd><kbd>B</kbd> twice sends ^B</dd></div>
-      <div><dt>drag a session</dt><dd>onto a pane's edge: split that way; its middle: show it there. Right-click a pane's title bar: its menu</dd></div>
-      <div><dt><kbd>F2</kbd> / double-click</dt><dd>rename the focused sidebar session (Tab to it)</dd></div>
-      <div><dt><kbd>Delete</kbd></dt><dd>close the focused sidebar session</dd></div>
-    </dl>
+    <dl class="keys wide" id="keys-list"></dl>
     <footer class="sheet-foot">
       <button type="submit" class="slab">Done</button>
     </footer>
@@ -567,6 +560,7 @@
 <script src="/assets/layout.js"></script>
 <script src="/assets/panes.js"></script>
 <script src="/assets/search.js"></script>
+<script src="/assets/settings.js"></script>
 <script src="/assets/app-base.js"></script>
 <script src="/assets/app-layout.js"></script>
 <script src="/assets/app-stage.js"></script>

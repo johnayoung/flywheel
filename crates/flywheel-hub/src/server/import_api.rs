@@ -65,7 +65,7 @@ pub(super) async fn find_code_workspaces(
     {
         Some(raw) => expand_home(&PathBuf::from(raw), env.home.as_deref()),
         None => match app.hub.import_root() {
-            Some(root) => root.to_path_buf(),
+            Some(root) => root,
             None => {
                 return error_response(
                     StatusCode::BAD_REQUEST,

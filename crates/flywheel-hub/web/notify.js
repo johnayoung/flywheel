@@ -10,7 +10,7 @@
 "use strict";
 
 window.FwHubNotify = function (ctx) {
-  const { $, state, store, sessionById, workspaceById, pwa, api, toast, openSession, present, attention } = ctx;
+  const { $, state, sessionById, workspaceById, pwa, api, toast, openSession, present, attention } = ctx;
 
   const supported = "Notification" in window;
   const IS_IOS = /iphone|ipad|ipod/i.test(navigator.userAgent) ||
@@ -24,7 +24,8 @@ window.FwHubNotify = function (ctx) {
   let push = undefined; // the hub's webhook push: null (off) or {host, events}
 
   const permission = () => (supported ? Notification.permission : "unsupported");
-  const isOn = () => supported && store.get("notify", false) === true && permission() === "granted";
+  // Per device (a browser permission): Settings' notifications.alerts.
+  const isOn = () => supported && ctx.prefs.get("notifications.alerts", false) === true && permission() === "granted";
 
   function renderChip() {
     const chip = $("#alerts-toggle");
@@ -42,7 +43,7 @@ window.FwHubNotify = function (ctx) {
 
   async function toggle() {
     if (isOn()) {
-      store.set("notify", false);
+      ctx.prefs.set("notifications.alerts", false, { device: true });
       renderChip();
       toast("Alerts off on this device.");
       return;
@@ -70,7 +71,7 @@ window.FwHubNotify = function (ctx) {
       toast("Notifications are blocked for this site: allow them in the browser's site settings, then try again.", { tone: "bad", timeout: 9000 });
       return;
     }
-    store.set("notify", true);
+    ctx.prefs.set("notifications.alerts", true, { device: true });
     await pwa.register();
     renderChip();
     toast("Alerts on: this device hears about blocked and finished agents while the hub is in the background.");
@@ -182,5 +183,5 @@ window.FwHubNotify = function (ctx) {
   renderChip();
   loadPush();
 
-  return { onStatus, toggle, paletteItems, isOn };
+  return { onStatus, toggle, paletteItems, isOn, renderChip };
 };

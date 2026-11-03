@@ -617,11 +617,14 @@ fn install_service_prints_a_unit_running_serve() {
     let exe = Path::new(env!("CARGO_BIN_EXE_fw")).canonicalize().unwrap();
     assert!(
         unit.contains(&format!(
-            "ExecStart=\"{}\" \"hub\" \"serve\" \"--bind\" \"127.0.0.1\" \"--port\" \"7777\"",
+            "ExecStart=\"{}\" \"hub\" \"serve\" \"--port\" \"7777\"",
             exe.display()
         )),
         "{unit}"
     );
+    // Only the flags given: the rest stays hub.toml's (or the default).
+    assert!(!unit.contains("\"--bind\""), "{unit}");
+    assert!(!unit.contains("\"--scrollback-lines\""), "{unit}");
     assert!(unit.contains(&format!("\"--state-dir\" \"{}\"", env.state.display())));
     assert!(unit.contains("Environment=\"SHELL=/bin/sh\""), "{unit}");
     // Its output is the journal: no login code there.

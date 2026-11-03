@@ -55,8 +55,13 @@ async function boot() {
       document.fonts.load('600 13px "FW Term"'),
     ])
     : Promise.resolve();
-  await Promise.race([fonts, new Promise((r) => setTimeout(r, 1500))]).catch(() => {});
-  applyTheme(theme);
+  // The hub's settings (theme, keys, terminal) before the first paint.
+  await Promise.all([
+    Promise.race([fonts, new Promise((r) => setTimeout(r, 1500))]).catch(() => {}),
+    Promise.race([settings.start(), new Promise((r) => setTimeout(r, 1500))]).catch(() => {}),
+  ]);
+  theme = themePref();
+  applyTheme(theme, false);
   loadKinds();
   // Static chord labels follow the platform's hub modifier.
   document.querySelectorAll("kbd").forEach((k) => {

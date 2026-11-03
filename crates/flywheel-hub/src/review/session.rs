@@ -323,6 +323,32 @@ impl Hub {
         }
         let outcome = result.map_err(action_error)?;
         self.nudge_review_badges(&target);
+        if outcome.ok {
+            let event = match action {
+                Action::Commit { .. } => "review.committed",
+                Action::Push { .. } => "review.pushed",
+                Action::Pr(_) => "review.pr_opened",
+                Action::Rebase => "review.rebased",
+                Action::Merge => "review.merged",
+                Action::Abort => "",
+            };
+            if !event.is_empty()
+                && let Some(session) = self.event_session(id)
+            {
+                self.emit_lifecycle(
+                    event,
+                    serde_json::json!({
+                        "session": session,
+                        "dir": target.dir,
+                        "head": outcome.head,
+                        "url": outcome.url,
+                        "summary": outcome.summary,
+                        "branch": target.worktree.as_ref().map(|w| w.branch.clone()),
+                        "base": target.worktree.as_ref().map(|w| w.base.clone()),
+                    }),
+                );
+            }
+        }
         let worktree = match action {
             Action::Merge if outcome.ok => self.worktree_info(id).ok(),
             _ => None,

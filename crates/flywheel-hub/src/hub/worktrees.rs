@@ -178,7 +178,7 @@ impl Hub {
         view.branches = git::branches(folder);
         view.default_base = git::status(folder, None).ok().and_then(|s| s.branch);
         if let Some(task) = task.filter(|t| !t.trim().is_empty()) {
-            match git::plan(folder, task, &self.options.worktree_branch_prefix, base) {
+            match git::plan(folder, task, &self.tunables().worktree_branch_prefix, base) {
                 Ok(plan) => view.plan = Some(plan),
                 Err(e) => view.error = Some(e),
             }

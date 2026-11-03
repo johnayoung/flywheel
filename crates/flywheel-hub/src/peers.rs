@@ -244,8 +244,9 @@ fn info(entry: &PeerEntry) -> PeerInfo {
 /// not a boundary: a peer starts sessions running any command as this
 /// hub's user, so it can read the token file (and anything else that user
 /// can) through one. The refusals keep the credential itself off the
-/// token, login codes, peers, machines and the `/m/` proxy, and off the
-/// file import.
+/// token, login codes, peers, machines and the `/m/` proxy, off the file
+/// import, and off this hub's plugins, settings, and config (a machine's
+/// UI is its own hub's).
 pub fn peer_forbidden(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
@@ -255,6 +256,9 @@ pub fn peer_forbidden(path: &str) -> bool {
         || under("/api/machines")
         || under("/api/workspaces/import")
         || under("/api/code-workspaces")
+        || under("/api/plugins")
+        || under("/api/settings")
+        || under("/api/config")
         || under("/m")
         || !path.starts_with("/api")
 }
@@ -477,6 +481,10 @@ mod tests {
             "/api/machines/b/test",
             "/api/workspaces/import",
             "/api/code-workspaces",
+            "/api/plugins",
+            "/api/plugins/p/actions/a",
+            "/api/settings",
+            "/api/config",
             "/m/b/api/sessions",
             "/",
             "/login",

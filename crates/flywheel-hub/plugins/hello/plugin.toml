@@ -1,0 +1,26 @@
+# Sample flywheel hub plugin (docs/hub.md, Plugins). Install by copying
+# this directory to <state-dir>/plugins/hello, then `fw hub plugin enable
+# hello`. It runs as you, with no sandbox: read hello.sh first.
+description = "Records the events it gets; says hello; types git status"
+version = "1"
+command = ["./hello.sh"]
+timeout_secs = 5
+
+[[events]]
+on = "session.created"
+
+[[events]]
+on = "status.changed"
+statuses = ["blocked", "done"]
+
+[[events]]
+on = "review.merged"
+
+[[actions]]
+id = "hello"
+title = "Say hello"
+
+[[actions]]
+id = "git-status"
+title = "Type git status into this session"
+context = "session"

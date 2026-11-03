@@ -727,6 +727,8 @@ window.FwHubCommands = function (ctx) {
     }
     ui.unseen[id] = (ui.unseen[id] || 0) + shell.length;
     renderDrawer();
+    // Settings: notifications, "Command toasts".
+    if (ctx.toastsOn && !ctx.toastsOn()) return;
     const newest = shell[0];
     toast(
       el(

@@ -355,6 +355,78 @@ async fn failed_attempts_are_limited_per_client() {
     hub.shutdown().await;
 }
 
+/// The close frame `socket` ends with (skipping data before it).
+async fn close_code(socket: &mut Ws) -> u16 {
+    loop {
+        match timeout(Duration::from_secs(10), socket.next())
+            .await
+            .expect("closed in time")
+        {
+            Some(Ok(Message::Close(frame))) => break u16::from(frame.unwrap().code),
+            Some(Ok(_)) => {}
+            other => panic!("expected a close frame, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logging_out_closes_the_sockets_that_login_opened() {
+    let hub = TestHub::start(ServerOptions::default()).await;
+    let login = |hub: &TestHub| {
+        hub.http
+            .get(hub.url(&format!("/login?token={}", hub.token())))
+            .send()
+    };
+    let ending = cookie_pair(&login(&hub).await.unwrap());
+    let staying = cookie_pair(&login(&hub).await.unwrap());
+    let sid = hub.shell(&["/bin/sh"]).await;
+    let mut ws = hub.connect(&sid, &ending).await;
+    let mut events = hub.connect_events(&ending).await;
+    let mut other = hub.connect(&sid, &staying).await;
+
+    let logout = hub
+        .http
+        .post(hub.url("/logout"))
+        .header(ORIGIN, format!("http://{}", hub.addr))
+        .header(COOKIE, &ending)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+    // Both of that login's sockets close with 4002; no input gets through.
+    assert_eq!(close_code(&mut ws).await, 4002);
+    assert_eq!(close_code(&mut events).await, 4002);
+    // Another browser's login keeps its terminal.
+    other
+        .send(Message::text(
+            json!({ "type": "input", "data": "echo still-$((6*7))\r" }).to_string(),
+        ))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = String::new();
+    while !seen.contains("still-42") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left, other.next()).await.expect("output in time") {
+            Some(Ok(Message::Binary(bytes))) => seen.push_str(&String::from_utf8_lossy(&bytes)),
+            Some(Ok(_)) => {}
+            end => panic!("the other login's socket ended: {end:?}"),
+        }
+    }
+    // Where the UI lands after a 4002 close: the login page says why.
+    let notice = hub
+        .http
+        .get(hub.url("/?signed_out=ended"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(notice.contains("login ended"), "{notice}");
+    hub.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotating_the_token_signs_everyone_out_without_a_restart() {
     let hub = TestHub::start(ServerOptions::default()).await;

@@ -44,8 +44,12 @@ use tokio::sync::broadcast;
 const BROADCAST_DEPTH: usize = 1024;
 /// How long the waiter lets the reader drain output after the child exits.
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(2);
-/// Terminal size bounds accepted from clients.
-pub const MAX_DIMENSION: u16 = 1000;
+/// Terminal size bounds accepted from clients. Any viewer may resize a
+/// session and the size outlives it, so these bound what one resize can
+/// make the emulator hold (both screens, ~40 bytes a cell): 500x300 is
+/// a 4K display at a small font, and about 6 MB.
+pub const MAX_COLS: u16 = 500;
+pub const MAX_ROWS: u16 = 300;
 /// Input bytes queued for a child that is not reading its stdin before
 /// further input is refused.
 pub const INPUT_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
@@ -179,14 +183,10 @@ impl std::fmt::Debug for PtySession {
     }
 }
 
-fn clamp_dimension(value: u16) -> u16 {
-    value.clamp(1, MAX_DIMENSION)
-}
-
 fn pty_size(cols: u16, rows: u16) -> PtySize {
     PtySize {
-        rows: clamp_dimension(rows),
-        cols: clamp_dimension(cols),
+        rows: rows.clamp(1, MAX_ROWS),
+        cols: cols.clamp(1, MAX_COLS),
         pixel_width: 0,
         pixel_height: 0,
     }
@@ -398,7 +398,7 @@ impl PtySession {
         self.queue.queued.load(Ordering::Acquire)
     }
 
-    /// Resize the terminal (clamped to `1..=MAX_DIMENSION`). The kernel
+    /// Resize the terminal (clamped to [`MAX_COLS`] x [`MAX_ROWS`]). The kernel
     /// delivers SIGWINCH to the foreground process group.
     pub fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
         let size = pty_size(cols, rows);
@@ -492,17 +492,36 @@ impl PtySession {
             });
     }
 
+    /// [`PtySession::kill`] for many sessions at once, on the calling
+    /// thread: hang every one up, give them `grace` (shared) to go quiet,
+    /// SIGKILL whatever is left -- leader or not -- and wait up to `settle`
+    /// for that to land. Returns only once nothing more can be done, so a
+    /// process about to exit does not leave a `nohup`ed child behind.
+    pub fn terminate_all(sessions: &[Arc<Self>], grace: Duration, settle: Duration) {
+        let hung: Vec<&Arc<Self>> = sessions
+            .iter()
+            .filter(|s| s.signal_session(libc::SIGHUP))
+            .collect();
+        let deadline = Instant::now() + grace;
+        let stubborn: Vec<&Arc<Self>> = hung
+            .into_iter()
+            .filter(|s| !s.wait_quiet(deadline.saturating_duration_since(Instant::now())))
+            .collect();
+        for session in &stubborn {
+            session.signal_session(libc::SIGKILL);
+        }
+        let deadline = Instant::now() + settle;
+        for session in &stubborn {
+            session.wait_quiet(deadline.saturating_duration_since(Instant::now()));
+        }
+    }
+
     /// Stop the reader and writer threads and refuse further input. The
     /// threads notice within [`RELEASE_POLL`]; once they and every other
     /// holder drop their `Arc`, the PTY master is closed. Use after
     /// [`PtySession::kill`] when the session is being forgotten.
     pub fn release(&self) {
         self.queue.released.store(true, Ordering::Release);
-    }
-
-    /// Whether [`PtySession::release`] has been called.
-    pub fn is_released(&self) -> bool {
-        self.queue.released.load(Ordering::Acquire)
     }
 
     /// Every process still in this session, other than an already-reaped
@@ -837,6 +856,8 @@ mod tests {
     #[test]
     fn resize_is_visible_to_the_child() {
         let session = PtySession::spawn(spec("read _; stty size; sleep 30"), |_| {}).unwrap();
+        session.resize(1000, 1000).unwrap();
+        assert_eq!(session.size(), (MAX_COLS, MAX_ROWS));
         session.resize(132, 43).unwrap();
         assert_eq!(session.size(), (132, 43));
         let mut att = session.attach();
@@ -936,6 +957,31 @@ mod tests {
             wait_for(Duration::from_secs(10), || Arc::strong_count(&session) == 1),
             "threads still hold the session"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminate_all_kills_a_hangup_immune_child_before_returning() {
+        // `nohup` ignores SIGHUP; the leader dies of it at once, so only a
+        // synchronous escalation catches the child before the caller exits.
+        let session = PtySession::spawn(
+            spec("nohup sleep 300 >/dev/null 2>&1 & echo bg=$!; exec sleep 300"),
+            |_| {},
+        )
+        .unwrap();
+        let mut att = session.attach();
+        let seen = read_until(&mut att, "bg=", Duration::from_secs(10));
+        let seen = seen + &read_until(&mut att, "\n", Duration::from_secs(2));
+        let bg = marked_pid(&seen, "bg=");
+        drop(att);
+        assert!(pid_alive(bg));
+        PtySession::terminate_all(
+            std::slice::from_ref(&session),
+            Duration::from_millis(300),
+            Duration::from_secs(5),
+        );
+        assert!(session.exit_info().is_some());
+        assert!(!pid_alive(bg), "the nohup child outlived terminate_all");
     }
 
     #[cfg(target_os = "linux")]

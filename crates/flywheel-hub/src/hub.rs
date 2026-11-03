@@ -338,6 +338,9 @@ pub struct Hub {
     logins: Mutex<Logins>,
     /// Bumped on every token rotation; open WebSockets close on a change.
     rotations: tokio::sync::watch::Sender<u64>,
+    /// Bumped whenever a browser login may have ended (logout, eviction);
+    /// WebSockets a login opened re-check it on a change.
+    login_changes: tokio::sync::watch::Sender<u64>,
     store: Mutex<HubStore>,
     live: Mutex<HashMap<String, Arc<PtySession>>>,
     board: Mutex<StatusBoard>,
@@ -398,6 +401,7 @@ impl Hub {
             login_codes: Mutex::new(LoginCodes::default()),
             logins: Mutex::new(logins),
             rotations: tokio::sync::watch::Sender::new(0),
+            login_changes: tokio::sync::watch::Sender::new(0),
             store: Mutex::new(store),
             live: Mutex::new(HashMap::new()),
             board: Mutex::new(StatusBoard::default()),
@@ -485,12 +489,25 @@ impl Hub {
         self.login_codes().redeem(presented, Instant::now())
     }
 
-    /// Start a browser login: the secret its cookie carries.
+    /// Start a browser login: the secret its cookie carries. Issuing may
+    /// evict the oldest login (see [`crate::auth::MAX_LOGINS`]).
     pub fn issue_login(&self) -> Result<String, HubError> {
         let mut logins = self.logins();
+        let before = logins.len();
         let secret = logins.issue(unix_now())?;
         logins.save(&self.options.state_dir)?;
+        if logins.len() <= before {
+            drop(logins);
+            self.login_changes.send_modify(|n| *n += 1);
+        }
         Ok(secret)
+    }
+
+    /// Notified whenever a browser login may have ended early (logout or
+    /// eviction; expiry is not announced -- re-check [`Hub::login_valid`]
+    /// now and then).
+    pub fn subscribe_login_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.login_changes.subscribe()
     }
 
     /// Whether `secret` is a live browser login.
@@ -503,6 +520,8 @@ impl Hub {
         let mut logins = self.logins();
         if logins.revoke(secret) {
             logins.save(&self.options.state_dir)?;
+            drop(logins);
+            self.login_changes.send_modify(|n| *n += 1);
         }
         Ok(())
     }
@@ -1897,15 +1916,11 @@ impl Hub {
             .collect();
         let _ = self.store().mark_all_stopped(&last_cwds);
         let sessions: Vec<Arc<PtySession>> = self.live().drain().map(|(_, s)| s).collect();
+        // On this thread, not `kill`'s detached escalation: the process may
+        // exit as soon as this returns, and a `nohup`ed child must not
+        // outlive it.
         let grace = timeout / 2;
-        for session in &sessions {
-            session.kill(grace);
-        }
-        let deadline = Instant::now() + timeout;
-        for session in &sessions {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            session.wait_exit(remaining);
-        }
+        PtySession::terminate_all(&sessions, grace, timeout - grace);
         for session in &sessions {
             session.release();
         }

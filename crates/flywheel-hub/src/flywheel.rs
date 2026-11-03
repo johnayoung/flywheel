@@ -694,9 +694,12 @@ impl FlywheelMonitor {
 /// provider's argv) under `/bin/sh`, then the user's shell once it exits,
 /// so the terminal stays open on the worker's last words. Restored after
 /// a hub restart it comes back as a plain shell (a one-off command is
-/// never re-run; see `restore`).
+/// never re-run; see `restore`). The wrapper traps Ctrl-C/Ctrl-\ with a
+/// no-op rather than ignoring them, so the worker (which execs with default
+/// handlers) still gets the signal while the wrapper -- in the same
+/// foreground group -- survives it and goes on to the shell.
 pub fn worker_session_command(worker: &[String]) -> Vec<String> {
-    let script = "\"$@\"; status=$?; printf '\\n[fw worker exited with status %s]\\n' \"$status\"; \
+    let script = "trap : INT QUIT; \"$@\"; status=$?; printf '\\n[fw worker exited with status %s]\\n' \"$status\"; \
                   exec \"${SHELL:-/bin/sh}\"";
     let mut argv = vec![
         "/bin/sh".to_owned(),
@@ -863,6 +866,58 @@ mod tests {
             .unwrap();
         assert!(marker.exists());
         assert!(String::from_utf8_lossy(&out.stdout).contains("exited with status 0"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ctrl_c_stops_the_worker_but_leaves_the_shell() {
+        use crate::pty::{PtySession, SpawnSpec};
+        use crate::vt::TextSource;
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join("shell");
+        crate::test_support::write_script(&shell, "#!/bin/sh\necho shell-up\nexec sleep 30\n");
+        let argv = worker_session_command(&[
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo worker-up; exec sleep 30".into(),
+        ]);
+        let session = PtySession::spawn(
+            SpawnSpec {
+                argv,
+                cwd: dir.path().to_path_buf(),
+                env: vec![("SHELL".into(), shell.display().to_string())],
+                env_remove: Vec::new(),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            },
+            |_| {},
+        )
+        .unwrap();
+        let screen = || {
+            session
+                .screen_text(TextSource::Recent { lines: 20 })
+                .lines
+                .join("\n")
+        };
+        let until = |needle: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !screen().contains(needle) {
+                assert!(Instant::now() < deadline, "no {needle:?} in {:?}", screen());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        until("worker-up");
+        let _ = session.write(b"\x03".to_vec());
+        until("shell-up");
+        assert!(
+            screen().contains("[fw worker exited with status 130]"),
+            "{}",
+            screen()
+        );
+        assert!(session.exit_info().is_none(), "the session must survive ^C");
+        session.kill(Duration::from_millis(200));
+        assert!(session.wait_exit(Duration::from_secs(10)));
     }
 
     #[test]

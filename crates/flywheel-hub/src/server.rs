@@ -26,7 +26,8 @@
 //!   (the viewer's colours, which the server's colour-query answers use from
 //!   then on; send on attach, theme change, and focus); **binary** frames
 //!   are raw input.
-//! * Rotating the token closes every socket with code 4001.
+//! * Rotating the token closes every socket with code 4001; the end of the
+//!   browser login that opened it (logout, expiry, eviction), with 4002.
 //!
 //! Events WebSocket (`GET /api/events?client=<id>`), hub-wide, text JSON:
 //!
@@ -48,11 +49,12 @@
 //!   other panes on screen (all count as viewed; nothing while hidden). The
 //!   `client` id (a browser keeps one in local storage) scopes
 //!   seen-tracking; without one, the connection gets its own.
-//! * Rotating the token closes it with code 4001 too.
+//! * Rotating the token closes it with code 4001 too, a login ending 4002.
 
 mod commands_api;
 mod flywheel_api;
 mod import_api;
+mod listen;
 mod notify_api;
 mod pwa;
 mod worktree_api;
@@ -104,6 +106,9 @@ const MAX_SCREEN_LINES: usize = 100_000;
 /// WebSocket close code sent when the token rotates (the client must log
 /// in again).
 pub const WS_CLOSE_ROTATED: u16 = 4001;
+/// WebSocket close code sent when the browser login that opened the socket
+/// ended (logout, expiry, eviction).
+pub const WS_CLOSE_SIGNED_OUT: u16 = 4002;
 /// How long [`serve`] waits for sessions to exit on shutdown.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -219,7 +224,9 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
 }
 
 /// Serve on `listener` until `shutdown_signal` resolves, then close
-/// WebSockets, hang up every session, and record them stopped.
+/// WebSockets, hang up every session, and record them stopped. Raises this
+/// process's soft descriptor limit to the hard one, and bounds what an
+/// unauthenticated client can hold open (see `server/listen.rs`).
 pub async fn serve(
     listener: TcpListener,
     hub: Arc<Hub>,
@@ -228,15 +235,10 @@ pub async fn serve(
 ) -> std::io::Result<()> {
     let (tx, rx) = watch::channel(false);
     let app = router(Arc::clone(&hub), options, rx);
-    let app = app.into_make_service_with_connect_info::<Peer>();
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal.await;
-            let _ = tx.send(true);
-        })
-        .await;
+    listen::raise_fd_limit();
+    listen::run(listener, app, listen::connection_cap(), shutdown_signal, tx).await;
     let _ = tokio::task::spawn_blocking(move || hub.shutdown(SHUTDOWN_TIMEOUT)).await;
-    result
+    Ok(())
 }
 
 // --- auth -------------------------------------------------------------------
@@ -250,15 +252,6 @@ fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
 pub struct Peer {
     pub remote: SocketAddr,
     pub local: Option<SocketAddr>,
-}
-
-impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, TcpListener>> for Peer {
-    fn connect_info(stream: axum::serve::IncomingStream<'_, TcpListener>) -> Self {
-        Self {
-            remote: *stream.remote_addr(),
-            local: stream.io().local_addr().ok(),
-        }
-    }
 }
 
 /// Who sent a request: the client address the failure limiter keys on,
@@ -323,7 +316,8 @@ impl FromRequestParts<AppState> for Client {
 
 /// The outcome of checking a request's credentials.
 enum Auth {
-    Granted,
+    /// Admitted: by a login cookie (its secret) or by the token (`None`).
+    Granted(Option<String>),
     /// No credential presented.
     Anonymous,
     /// A wrong credential (counted against the client).
@@ -356,13 +350,15 @@ fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
     if cookies.is_empty() && bearer.is_none() {
         return Auth::Anonymous;
     }
-    if cookies.iter().any(|c| app.hub.login_valid(c)) {
-        return Auth::Granted;
-    }
     let bearer_ok = || bearer.is_some_and(|b| token.matches(b));
+    if let Some(login) = cookies.iter().find(|c| app.hub.login_valid(c)) {
+        // A valid bearer alongside makes the token the credential: it
+        // outlives the login.
+        return Auth::Granted((!bearer_ok()).then(|| (*login).to_owned()));
+    }
     if client.same_machine {
         return if bearer_ok() {
-            Auth::Granted
+            Auth::Granted(None)
         } else {
             Auth::Denied
         };
@@ -373,7 +369,7 @@ fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
         return Auth::Limited(wait);
     }
     if bearer_ok() {
-        Auth::Granted
+        Auth::Granted(None)
     } else {
         failures.record_failure(client.ip, now);
         Auth::Denied
@@ -412,11 +408,94 @@ fn insert_retry_after(response: &mut Response, wait: Duration) {
     }
 }
 
-/// The token-rotation watch a request subscribed to before its
-/// credentials were checked: a WebSocket granted on a token that rotates
-/// at any later moment sees the change and closes.
+/// How often a WebSocket a login opened re-checks that the login is still
+/// live (expiry is not announced; logout and eviction are).
+const LOGIN_RECHECK: Duration = Duration::from_secs(60);
+
+/// What ends a WebSocket's right to stay open: the credential that opened
+/// it. Subscribed before the credentials were checked, so a socket granted
+/// on a token that rotates at any later moment sees the change and closes;
+/// one a login cookie opened also closes once that login ends (logout,
+/// expiry, eviction).
 #[derive(Clone)]
-struct RotationWatch(watch::Receiver<u64>);
+struct CredentialWatch {
+    rotations: watch::Receiver<u64>,
+    login: Option<LoginWatch>,
+}
+
+#[derive(Clone)]
+struct LoginWatch {
+    secret: String,
+    changes: watch::Receiver<u64>,
+}
+
+impl CredentialWatch {
+    fn new(hub: &Hub) -> Self {
+        Self {
+            rotations: hub.subscribe_rotations(),
+            login: None,
+        }
+    }
+
+    fn for_login(mut self, hub: &Hub, secret: Option<String>) -> Self {
+        self.login = secret.map(|secret| LoginWatch {
+            secret,
+            changes: hub.subscribe_login_changes(),
+        });
+        self
+    }
+
+    /// Resolves with the close frame to send once the credential is no
+    /// longer valid; never while it is. Cancel-safe (each `select!` arm
+    /// re-polls it), with `recheck` kept by the caller so it keeps time
+    /// across polls.
+    async fn revoked(&mut self, hub: &Hub, recheck: &mut tokio::time::Interval) -> CloseFrame {
+        loop {
+            let login_event = async {
+                match &mut self.login {
+                    Some(login) => {
+                        tokio::select! {
+                            changed = login.changes.changed() => changed.is_ok(),
+                            _ = recheck.tick() => true,
+                        }
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                changed = self.rotations.changed() => {
+                    if changed.is_ok() {
+                        return CloseFrame {
+                            code: WS_CLOSE_ROTATED,
+                            reason: "token rotated: log in again".into(),
+                        };
+                    }
+                    // The hub is gone: shutdown handles it.
+                    std::future::pending::<()>().await;
+                }
+                alive = login_event => {
+                    if !alive {
+                        std::future::pending::<()>().await;
+                    }
+                    if let Some(login) = &self.login
+                        && !hub.login_valid(&login.secret)
+                    {
+                        return CloseFrame {
+                            code: WS_CLOSE_SIGNED_OUT,
+                            reason: "signed out: log in again".into(),
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn login_recheck() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(LOGIN_RECHECK);
+    interval.reset();
+    interval
+}
 
 async fn require_auth(
     State(app): State<AppState>,
@@ -424,10 +503,12 @@ async fn require_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let rotations = app.hub.subscribe_rotations();
+    let watch = CredentialWatch::new(&app.hub);
     match authenticate(&app, request.headers(), client) {
-        Auth::Granted => {
-            request.extensions_mut().insert(RotationWatch(rotations));
+        Auth::Granted(login) => {
+            request
+                .extensions_mut()
+                .insert(watch.for_login(&app.hub, login));
             next.run(request).await
         }
         Auth::Limited(wait) => too_many_attempts(wait),
@@ -522,7 +603,7 @@ async fn index(
     Query(query): Query<IndexQuery>,
 ) -> Response {
     match authenticate(&app, &headers, client) {
-        Auth::Granted => {
+        Auth::Granted(_) => {
             let mut response = no_store(Html(web::INDEX_HTML).into_response());
             // The service worker keeps only this page (never the sign-in
             // page) as the offline app shell.
@@ -537,6 +618,9 @@ async fn index(
             let notice = match query.signed_out.as_deref() {
                 Some("rotated") => Some(
                     "Signed out: the hub's token was rotated. Sign in again with a fresh link from `fw hub url`.",
+                ),
+                Some("ended") => Some(
+                    "Signed out: this browser's login ended. Sign in again with a fresh link from `fw hub url`.",
                 ),
                 _ => None,
             };
@@ -665,7 +749,7 @@ async fn asset(
 ) -> Response {
     if !web::is_public_asset(&path) {
         match authenticate(&app, &headers, client) {
-            Auth::Granted => {}
+            Auth::Granted(_) => {}
             Auth::Limited(wait) => return too_many_attempts(wait),
             Auth::Anonymous | Auth::Denied => {
                 return error_response(StatusCode::UNAUTHORIZED, "authentication required");
@@ -1140,7 +1224,7 @@ async fn session_ws(
     Path(id): Path<String>,
     client: Client,
     headers: HeaderMap,
-    rotations: Option<axum::Extension<RotationWatch>>,
+    credential: Option<axum::Extension<CredentialWatch>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !origin_ok(&headers, client, &app.options) {
@@ -1154,14 +1238,14 @@ async fn session_ws(
     };
     let shutdown = app.shutdown.clone();
     // Taken before the credentials were checked (see `require_auth`).
-    let rotations = match rotations {
-        Some(axum::Extension(RotationWatch(rx))) => rx,
-        None => app.hub.subscribe_rotations(),
+    let credential = match credential {
+        Some(axum::Extension(watch)) => watch,
+        None => CredentialWatch::new(&app.hub),
     };
     let hub = Arc::clone(&app.hub);
     ws.max_message_size(WS_MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
-            pump(socket, Arc::clone(&session), shutdown, rotations, &hub).await;
+            pump(socket, Arc::clone(&session), shutdown, credential, &hub).await;
             // One viewer fewer: panes that follow another's size may now be
             // the only viewer and fit themselves (re-list for `live.clients`).
             drop(session);
@@ -1267,7 +1351,7 @@ async fn pump(
     mut socket: WebSocket,
     session: Arc<PtySession>,
     mut shutdown: watch::Receiver<bool>,
-    mut rotations: watch::Receiver<u64>,
+    mut credential: CredentialWatch,
     hub: &Hub,
 ) {
     let Some(attachment) = attach(&session, SNAPSHOT_HISTORY_BYTES).await else {
@@ -1280,6 +1364,7 @@ async fn pump(
     hub.emit(HubEvent::Sessions);
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.reset();
+    let mut recheck = login_recheck();
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -1366,16 +1451,9 @@ async fn pump(
                     break;
                 }
             }
-            changed = rotations.changed() => {
-                if changed.is_ok() {
-                    let close = CloseFrame {
-                        code: WS_CLOSE_ROTATED,
-                        reason: "token rotated: log in again".into(),
-                    };
-                    let _ = socket.send(Message::Close(Some(close))).await;
-                    break;
-                }
-                // The hub is gone: shutdown handles it.
+            close = credential.revoked(hub, &mut recheck) => {
+                let _ = socket.send(Message::Close(Some(close))).await;
+                break;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
@@ -1408,7 +1486,7 @@ async fn events_ws(
     Query(query): Query<EventsQuery>,
     client: Client,
     headers: HeaderMap,
-    rotations: Option<axum::Extension<RotationWatch>>,
+    credential: Option<axum::Extension<CredentialWatch>>,
     ws: WebSocketUpgrade,
 ) -> Response {
     if !origin_ok(&headers, client, &app.options) {
@@ -1428,12 +1506,12 @@ async fn events_ws(
     let shutdown = app.shutdown.clone();
     let flywheel = app.options.flywheel.as_ref().map(|m| m.subscribe());
     // Taken before the credentials were checked (see `require_auth`).
-    let rotations = match rotations {
-        Some(axum::Extension(RotationWatch(rx))) => rx,
-        None => app.hub.subscribe_rotations(),
+    let credential = match credential {
+        Some(axum::Extension(watch)) => watch,
+        None => CredentialWatch::new(&app.hub),
     };
     ws.max_message_size(64 * 1024)
-        .on_upgrade(move |socket| events_pump(socket, hub, client, shutdown, rotations, flywheel))
+        .on_upgrade(move |socket| events_pump(socket, hub, client, shutdown, credential, flywheel))
 }
 
 #[derive(Deserialize)]
@@ -1495,7 +1573,7 @@ async fn events_pump(
     hub: Arc<Hub>,
     client: String,
     mut shutdown: watch::Receiver<bool>,
-    mut rotations: watch::Receiver<u64>,
+    mut credential: CredentialWatch,
     mut flywheel: Option<broadcast::Receiver<crate::flywheel::FlywheelEvent>>,
 ) {
     let mut events = hub.subscribe();
@@ -1508,6 +1586,7 @@ async fn events_pump(
     }
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.reset();
+    let mut recheck = login_recheck();
     loop {
         tokio::select! {
             event = events.recv() => {
@@ -1573,15 +1652,9 @@ async fn events_pump(
                     break;
                 }
             }
-            changed = rotations.changed() => {
-                if changed.is_ok() {
-                    let close = CloseFrame {
-                        code: WS_CLOSE_ROTATED,
-                        reason: "token rotated: log in again".into(),
-                    };
-                    let _ = socket.send(Message::Close(Some(close))).await;
-                    break;
-                }
+            close = credential.revoked(&hub, &mut recheck) => {
+                let _ = socket.send(Message::Close(Some(close))).await;
+                break;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {

@@ -20,6 +20,11 @@ uuid.workspace = true
 clap.workspace = true
 tokio = { workspace = true, features = ["net"] }
 axum = { version = "0.8", features = ["ws"] }
+# The accept loop under `serve` (`server/listen.rs`): hyper's HTTP/1 server
+# with a header-read timeout and a connection cap, which `axum::serve` lacks.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+tower = { version = "0.5", features = ["util"] }
 portable-pty = "0.9"
 # Server-side terminal emulation (snapshots on attach, rendered text).
 # Pinned: `vt.rs` relies on its swap_alt/grid internals behaving as tested.

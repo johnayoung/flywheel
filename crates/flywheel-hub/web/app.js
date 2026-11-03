@@ -1942,9 +1942,11 @@
       if (state.events !== socket) return;
       state.events = null;
       state.viewing = undefined;
-      // 4001: the hub's token was rotated (as on the terminal socket).
-      if (event.code === 4001) {
-        window.location.replace("/?signed_out=rotated" + window.location.hash);
+      // 4001: the hub's token was rotated; 4002: this browser's login
+      // ended (signed out elsewhere, expired). Either way: sign in again.
+      if (event.code === 4001 || event.code === 4002) {
+        const why = event.code === 4001 ? "rotated" : "ended";
+        window.location.replace("/?signed_out=" + why + window.location.hash);
         return;
       }
       startPolling();

@@ -222,6 +222,32 @@ async fn input(ws: &mut Ws, data: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_never_finishes_its_request_is_dropped() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let hub = TestHub::start().await;
+    // A request head with no terminating blank line, then silence.
+    let mut stalled = TcpStream::connect(hub.addr).await.unwrap();
+    stalled
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let mut buf = [0u8; 256];
+    let read = timeout(Duration::from_secs(30), stalled.read(&mut buf))
+        .await
+        .expect("the hub must close a stalled request");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(5),
+        "closed too early"
+    );
+    // A real request is served meanwhile and after.
+    let ok = hub.http.get(hub.url("/healthz")).send().await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn everything_but_login_requires_the_token() {
     let hub = TestHub::start().await;
     let get = |path: &str| hub.http.get(hub.url(path)).send();

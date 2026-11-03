@@ -458,7 +458,7 @@ impl Notifier {
         for (name, value) in headers {
             request = request.header(*name, value.as_str());
         }
-        let response = request.send().await.map_err(|e| describe(&e))?;
+        let response = request.send().await.map_err(|e| crate::net::describe(&e))?;
         Ok(response.status().as_u16())
     }
 
@@ -616,30 +616,6 @@ impl Notifier {
                 });
             }
         })
-    }
-}
-
-/// What failed, without the URL (its path is the secret topic).
-fn describe(error: &reqwest::Error) -> String {
-    use std::error::Error as _;
-    let what = if error.is_connect() {
-        "cannot connect"
-    } else if error.is_timeout() {
-        "timed out"
-    } else if error.is_builder() || error.is_request() {
-        "cannot send"
-    } else {
-        "no answer"
-    };
-    let mut cause = error.source();
-    let mut innermost = None;
-    while let Some(e) = cause {
-        innermost = Some(e.to_string());
-        cause = e.source();
-    }
-    match innermost {
-        Some(cause) => format!("{what}: {cause}"),
-        None => what.to_owned(),
     }
 }
 

@@ -310,14 +310,14 @@ impl Endpoint {
         let response = request
             .send()
             .await
-            .map_err(|e| self.unreachable(&describe(&e)))?;
+            .map_err(|e| self.unreachable(&crate::net::describe(&e)))?;
         let status = response.status().as_u16();
         let body = response
             .bytes()
             .await
-            .map_err(|e| format!("reading the hub's answer: {}", describe(&e)))?;
+            .map_err(|e| format!("reading the hub's answer: {}", crate::net::describe(&e)))?;
         if !(200..300).contains(&status) {
-            return Err(api_error(status, &error_message(&body)));
+            return Err(api_error(status, &crate::net::error_text(&body)));
         }
         if body.is_empty() {
             return Ok(Value::Null);
@@ -336,14 +336,14 @@ impl Endpoint {
             .bearer_auth(self.token())
             .send()
             .await
-            .map_err(|e| self.unreachable(&describe(&e)))?;
+            .map_err(|e| self.unreachable(&crate::net::describe(&e)))?;
         let status = response.status().as_u16();
         let body = response
             .bytes()
             .await
-            .map_err(|e| format!("reading the hub's answer: {}", describe(&e)))?;
+            .map_err(|e| format!("reading the hub's answer: {}", crate::net::describe(&e)))?;
         if !(200..300).contains(&status) {
-            return Err(api_error(status, &error_message(&body)));
+            return Err(api_error(status, &crate::net::error_text(&body)));
         }
         Ok(body.to_vec())
     }
@@ -437,7 +437,7 @@ fn ws_error(error: &tokio_tungstenite::tungstenite::Error) -> String {
             let message = response
                 .body()
                 .as_deref()
-                .map(error_message)
+                .map(crate::net::error_text)
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| {
                     response
@@ -450,14 +450,6 @@ fn ws_error(error: &tokio_tungstenite::tungstenite::Error) -> String {
         }
         other => format!("WebSocket handshake failed: {other}"),
     }
-}
-
-/// The API's `{"error": ...}` message of a refusal, or its raw body.
-fn error_message(body: &[u8]) -> String {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
-        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_owned())
 }
 
 /// An API failure for humans: a bad token says so; a request the hub
@@ -488,10 +480,7 @@ pub fn no_hub_message(state_dir: &Path) -> String {
     let flag = if default_state_dir().as_deref() == Some(state_dir) {
         String::new()
     } else {
-        format!(
-            " --state-dir {}",
-            shell_word(&state_dir.display().to_string())
-        )
+        format!(" --state-dir {}", crate::util::shell_path(state_dir))
     };
     format!(
         "no hub is running for state dir {} (start one with `fw hub start{flag}`)",
@@ -500,17 +489,6 @@ pub fn no_hub_message(state_dir: &Path) -> String {
 }
 
 /// `word` as one shell word (single-quoted when it needs to be).
-fn shell_word(word: &str) -> String {
-    if !word.is_empty()
-        && word
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%=,".contains(&b))
-    {
-        word.to_owned()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
 
 /// `--url`: an http(s) origin, no path, query, or credentials.
 fn parse_base(raw: &str) -> Result<Url, String> {
@@ -559,21 +537,6 @@ fn is_local_hub(base: &Url, listen: SocketAddr) -> bool {
 /// rustls on ring with the system's roots (an https hub).
 fn tls_config() -> Result<rustls::ClientConfig, String> {
     crate::net::roots_config(crate::net::native_roots("an https hub")?)
-}
-
-fn describe(error: &reqwest::Error) -> String {
-    use std::error::Error as _;
-    let what = if error.is_connect() {
-        "cannot connect"
-    } else if error.is_timeout() {
-        "timed out"
-    } else {
-        "request failed"
-    };
-    match error.source() {
-        Some(source) => format!("{what}: {source}"),
-        None => what.to_owned(),
-    }
 }
 
 /// A fresh client id for the events socket (`[A-Za-z0-9_-]`, unique per
@@ -688,8 +651,9 @@ mod tests {
             message.ends_with("(start one with `fw hub start --state-dir '/tmp/hub state'`)"),
             "{message}"
         );
-        assert_eq!(shell_word("/a/b-c.d"), "/a/b-c.d");
-        assert_eq!(shell_word("it's"), "'it'\\''s'");
+        assert_eq!(crate::util::shell_quote("/a/b-c.d"), "/a/b-c.d");
+        assert_eq!(crate::util::shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(crate::util::shell_quote("~/x"), "'~/x'");
         if let Some(default) = default_state_dir() {
             assert!(no_hub_message(&default).ends_with("(start one with `fw hub start`)"));
         }

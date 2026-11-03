@@ -32,6 +32,7 @@ use crate::hub::{Hub, HubError, SessionView};
 use crate::pty::PtySession;
 use crate::state::{SessionState, StateError};
 use crate::transcript::{Format, MAX_LINE_BYTES};
+use crate::util::file_identity;
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use serde_json::Value;
@@ -810,17 +811,6 @@ pub struct MessageMeta {
     /// Its text was cut at [`MAX_MESSAGE_BYTES`].
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
-}
-
-#[cfg(unix)]
-fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    (meta.dev(), meta.ino())
-}
-
-#[cfg(not(unix))]
-fn file_identity(_meta: &std::fs::Metadata) -> (u64, u64) {
-    (0, 0)
 }
 
 /// Cut `text` to at most `max` bytes, on a character boundary.

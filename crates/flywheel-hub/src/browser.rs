@@ -18,9 +18,7 @@
 use crate::auth::{LOGIN_CODE_TTL, write_private};
 use crate::cli::{browse_host, resolve_state_dir};
 use crate::endpoint::{Endpoint, EndpointArgs};
-use crate::script::resolve;
 use crate::server::code_login_url;
-use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -193,9 +191,7 @@ fn windows_path(path: &Path) -> Option<String> {
 fn login_url(conn: &Endpoint, args: &OpenArgs) -> Result<String, String> {
     let fragment = match &args.session {
         Some(query) => {
-            let sessions = conn.blocking_sessions()?;
-            let session = resolve(&sessions, query, "session")?;
-            let id = session.get("id").and_then(Value::as_str).unwrap_or("");
+            let (id, _) = crate::script::find_session(conn, query)?;
             format!("#session={id}")
         }
         None => String::new(),

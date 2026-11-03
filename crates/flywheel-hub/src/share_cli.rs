@@ -5,10 +5,11 @@
 use crate::cli::{Qr, hub_targets, resolve_state_dir};
 use crate::endpoint::{Endpoint, EndpointArgs};
 use crate::remote::{LoginTarget, qr_lines};
-use crate::script::{query_escape, resolve};
+use crate::script::find_session;
+use crate::script::query_escape;
 use crate::util::{fail, str_field};
 use chrono::{TimeZone, Utc};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
@@ -44,22 +45,9 @@ fn relative(delta: i64) -> String {
     }
 }
 
-fn size(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    match bytes {
-        b if b < KIB => format!("{b} B"),
-        b if b < KIB * KIB => format!("{:.1} KiB", b as f64 / KIB as f64),
-        b if b < KIB * KIB * KIB => format!("{:.1} MiB", b as f64 / (KIB * KIB) as f64),
-        b => format!("{:.2} GiB", b as f64 / (KIB * KIB * KIB) as f64),
-    }
-}
+use crate::util::human_bytes as size;
 
 /// The session `query` names on `conn`: `(id, record)`.
-fn find_session(conn: &Endpoint, query: &str) -> Result<(String, Value), String> {
-    let sessions = conn.blocking_sessions()?;
-    let session = resolve(&sessions, query, "session")?;
-    Ok((str_field(session, "id").to_owned(), session.clone()))
-}
 
 // --- share ----------------------------------------------------------------------
 
@@ -528,8 +516,9 @@ fn record_ls(args: &RecordLsArgs, out: &mut dyn Write) -> Result<i32, String> {
         "{} in {} (cap {}, {} per part)",
         size(list["total_bytes"].as_u64().unwrap_or(0)),
         list["dir"].as_str().unwrap_or("-"),
-        size(list["limits"]["max_total_bytes"].as_u64().unwrap_or(0)),
-        size(list["limits"]["max_file_bytes"].as_u64().unwrap_or(0)),
+        // The caps as `config show` and doctor write them.
+        crate::record::format_size(list["limits"]["max_total_bytes"].as_u64().unwrap_or(0)),
+        crate::record::format_size(list["limits"]["max_file_bytes"].as_u64().unwrap_or(0)),
     );
     Ok(0)
 }

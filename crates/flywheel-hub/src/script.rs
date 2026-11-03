@@ -297,16 +297,22 @@ pub fn tokens_label(n: u64) -> String {
     }
 }
 
+/// Dollars as every CLI surface writes them: `$0.42`, and a sub-cent
+/// spend kept visible (`$0.0031`).
+pub fn dollars(usd: f64) -> String {
+    if usd > 0.0 && usd < 0.01 {
+        format!("${usd:.4}")
+    } else {
+        format!("${usd:.2}")
+    }
+}
+
 /// A cost for humans: `$0.42`, `$0.0031`; marked `+` when some tokens
 /// are of a model without a known price.
 pub fn cost_label(cost: &Value) -> String {
     let usd = cost.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
     let priced = cost.get("priced").and_then(Value::as_bool) != Some(false);
-    let amount = if usd > 0.0 && usd < 0.01 {
-        format!("${usd:.4}")
-    } else {
-        format!("${usd:.2}")
-    };
+    let amount = dollars(usd);
     if priced {
         amount
     } else if usd == 0.0 {
@@ -878,7 +884,9 @@ pub(crate) struct SessionArg {
 }
 
 /// The session `query` names, as `(id, record)`.
-fn find_session(conn: &Endpoint, query: &str) -> Result<(String, Value), String> {
+/// The session `query` names on `conn` (id, unique id prefix, or name):
+/// `(id, record)`.
+pub(crate) fn find_session(conn: &Endpoint, query: &str) -> Result<(String, Value), String> {
     let sessions = conn.blocking_sessions()?;
     let session = resolve(&sessions, query, "session")?;
     Ok((str_field(session, "id").to_owned(), session.clone()))

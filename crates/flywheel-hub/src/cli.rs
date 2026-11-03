@@ -127,7 +127,9 @@ enum HubCommand {
     /// ranked board, pick the winner (merged into the base), clean up.
     Fanout(crate::fanout_cli::FanoutArgs),
     /// Other hubs shown and proxied by this one: add, ls, rm, test.
-    /// Every scripting verb but `url` takes --machine NAME to reach one.
+    /// The session-scripting verbs (ls, new, send, ..., merge, open,
+    /// fanout) take --machine NAME to reach one; url, share and record do
+    /// not.
     Machine(crate::machine_cli::MachineArgs),
     /// Credentials other hubs hold to reach this one: issue, ls, revoke.
     Peer(crate::machine_cli::PeerArgs),

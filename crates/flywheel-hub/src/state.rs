@@ -11,6 +11,7 @@ mod store;
 pub use store::HubStore;
 
 use crate::agent::{AgentLaunch, SessionKind};
+use crate::config::home_dir;
 use crate::git::WorktreeRef;
 use crate::layout::Layout;
 use crate::pty::ExitInfo;
@@ -422,12 +423,6 @@ pub fn expand_home(path: &Path, home: Option<&Path>) -> PathBuf {
         Ok(rest) => home.join(rest),
         Err(_) => path.to_path_buf(),
     }
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
 }
 
 /// Whether `path` is a git work-tree root: a `.git` dir, or the `.git`

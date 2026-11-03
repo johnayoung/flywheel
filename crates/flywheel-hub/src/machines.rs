@@ -628,7 +628,7 @@ impl Machine {
                 Err(LinkError::Refused(self.refused_message()))
             }
             Ok(response) => Ok(response),
-            Err(e) => Err(self.unreachable(&describe(&e))),
+            Err(e) => Err(self.unreachable(&crate::net::describe(&e))),
         };
         self.note(outcome.as_ref().map(|_| ()));
         outcome
@@ -648,7 +648,7 @@ impl Machine {
                 "machine {} answered HTTP {} to whoami: {} (is it a flywheel hub new enough for machines?)",
                 self.record.name,
                 status.as_u16(),
-                error_text(&body)
+                crate::net::error_text(&body)
             ));
             self.note(Err(&error));
             return Err(error);
@@ -691,7 +691,7 @@ impl Machine {
             return Err(format!(
                 "machine {} would not mint a peer credential: {} (HTTP {})",
                 self.record.name,
-                error_text(&bytes),
+                crate::net::error_text(&bytes),
                 status.as_u16()
             ));
         }
@@ -724,7 +724,7 @@ impl Machine {
             Err(LinkError::Unreachable(format!(
                 "machine {} did not revoke the credential: {} (HTTP {status})",
                 self.record.name,
-                error_text(&body)
+                crate::net::error_text(&body)
             )))
         }
     }
@@ -788,7 +788,11 @@ pub async fn read_capped(mut response: reqwest::Response, limit: usize) -> Resul
         return Err(format!("its answer is larger than {limit} bytes: refused"));
     }
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| describe(&e))? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| crate::net::describe(&e))?
+    {
         if body.len() + chunk.len() > limit {
             return Err(format!("its answer is larger than {limit} bytes: refused"));
         }
@@ -800,45 +804,6 @@ pub async fn read_capped(mut response: reqwest::Response, limit: usize) -> Resul
 fn looks_like_tls(why: &str) -> bool {
     let why = why.to_ascii_lowercase();
     why.contains("certificate") || why.contains("tls") || why.contains("unknownissuer")
-}
-
-/// The API's `{"error": ...}` of a body, or the body itself.
-pub fn error_text(body: &[u8]) -> String {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
-        .unwrap_or_else(|| {
-            String::from_utf8_lossy(body)
-                .trim()
-                .chars()
-                .take(300)
-                .collect()
-        })
-}
-
-fn describe(error: &reqwest::Error) -> String {
-    let what = if error.is_connect() {
-        "cannot connect"
-    } else if error.is_timeout() {
-        "timed out"
-    } else {
-        "request failed"
-    };
-    // The whole chain: TLS reasons sit a few sources down.
-    let mut causes = Vec::new();
-    let mut source = std::error::Error::source(error);
-    while let Some(cause) = source {
-        let text = cause.to_string();
-        if !causes.contains(&text) {
-            causes.push(text);
-        }
-        source = cause.source();
-    }
-    if causes.is_empty() {
-        what.to_owned()
-    } else {
-        format!("{what}: {}", causes.join(": "))
-    }
 }
 
 // --- the registry -------------------------------------------------------------

@@ -330,17 +330,7 @@ pub fn display(program: &str, args: &[String]) -> String {
 }
 
 /// One word, single-quoted for a shell when it needs to be.
-pub fn quote(word: &str) -> String {
-    let plain = !word.is_empty()
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,^~".contains(c));
-    if plain {
-        word.to_owned()
-    } else {
-        format!("'{}'", word.replace('\'', r"'\''"))
-    }
-}
+pub use crate::util::shell_quote as quote;
 
 #[cfg(test)]
 mod tests {

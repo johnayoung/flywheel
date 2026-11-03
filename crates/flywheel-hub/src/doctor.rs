@@ -7,6 +7,7 @@
 use crate::agent::{self, SessionKind};
 use crate::cli::{DEFAULT_PORT, StateDirArg, resolve_state_dir};
 use crate::review::runner::{self, Spec};
+use crate::util::shell_path;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
@@ -875,7 +876,10 @@ pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
                     meta.uid()
                 ),
             )
-            .fix(format!("sudo chown -R $(id -u):$(id -g) {}", dir.display())),
+            .fix(format!(
+                "sudo chown -R $(id -u):$(id -g) {}",
+                shell_path(dir)
+            )),
         );
     } else if !writable(dir) {
         checks.push(
@@ -884,7 +888,7 @@ pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
                 Level::Fail,
                 format!("{} is not writable", dir.display()),
             )
-            .fix(format!("chmod u+rwx {}", dir.display())),
+            .fix(format!("chmod u+rwx {}", shell_path(dir))),
         );
     } else if mode & 0o077 != 0 {
         checks.push(
@@ -897,7 +901,7 @@ pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
                     dir.display()
                 ),
             )
-            .fix(format!("chmod 700 {}", dir.display())),
+            .fix(format!("chmod 700 {}", shell_path(dir))),
         );
     } else {
         checks.push(Check::new(
@@ -906,12 +910,7 @@ pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
             format!("{} (mode {mode:o}, yours)", dir.display()),
         ));
     }
-    for secret in [
-        crate::auth::TOKEN_FILE,
-        crate::auth::LOGINS_FILE,
-        crate::notify::CONFIG_FILE,
-        "machines.json",
-    ] {
+    for secret in SECRET_FILES {
         let path = dir.join(secret);
         if let Ok(meta) = std::fs::metadata(&path) {
             let mode = meta.mode() & 0o777;
@@ -927,10 +926,10 @@ pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
                     )
                     .fix(format!(
                         "chmod 600 {}{}",
-                        path.display(),
-                        if secret == crate::auth::TOKEN_FILE {
+                        shell_path(&path),
+                        if *secret == crate::auth::TOKEN_FILE {
                             "; then `fw hub token --rotate` (it may have been read)"
-                        } else if secret == crate::notify::CONFIG_FILE {
+                        } else if *secret == crate::notify::CONFIG_FILE {
                             "; the hub ignores it (no push notifications) until then"
                         } else {
                             ""
@@ -940,8 +939,64 @@ pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
             }
         }
     }
+    // Directories of private files: recordings (whole terminal output)
+    // and plugin logs (what plugins printed), written 0600.
+    for (name, what) in PRIVATE_DIRS {
+        let sub = dir.join(name);
+        let Ok(entries) = std::fs::read_dir(&sub) else {
+            continue;
+        };
+        let open: Vec<String> = entries
+            .flatten()
+            .filter(|e| {
+                e.metadata()
+                    .is_ok_and(|m| m.is_file() && m.mode() & 0o077 != 0)
+            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        if open.is_empty() {
+            continue;
+        }
+        let shown: Vec<&str> = open.iter().take(3).map(String::as_str).collect();
+        checks.push(
+            Check::new(
+                "secrets",
+                Level::Fail,
+                format!(
+                    "{} in {} {} readable by other users ({}{})",
+                    crate::util::plural(open.len(), what),
+                    sub.display(),
+                    if open.len() == 1 { "is" } else { "are" },
+                    shown.join(", "),
+                    if open.len() > shown.len() {
+                        ", ..."
+                    } else {
+                        ""
+                    }
+                ),
+            )
+            .fix(format!("chmod -R go-rwx {}", shell_path(&sub))),
+        );
+    }
     checks
 }
+
+/// State files holding credentials or their digests: never readable by
+/// other users.
+const SECRET_FILES: &[&str] = &[
+    crate::auth::TOKEN_FILE,
+    crate::auth::LOGINS_FILE,
+    crate::notify::CONFIG_FILE,
+    crate::machines::MACHINES_FILE,
+    crate::peers::PEERS_FILE,
+    crate::share::SHARES_FILE,
+];
+
+/// State directories whose files are private: (directory, what a file is).
+const PRIVATE_DIRS: &[(&str, &str)] = &[
+    (crate::record::RECORDINGS_DIR, "recording file"),
+    (crate::plugins::LOG_DIR, "plugin log"),
+];
 
 fn unsafe_getuid() -> u32 {
     // SAFETY: getuid has no preconditions and cannot fail.
@@ -997,7 +1052,7 @@ pub fn config_checks(dir: &Path, home: Option<&Path>) -> Vec<Check> {
                 Level::Fail,
                 format!("{}: {e}", notify_path.display()),
             )
-            .fix(format!("chmod 600 {}", notify_path.display())),
+            .fix(format!("chmod 600 {}", shell_path(&notify_path))),
         ),
         Ok(text) => checks.push(
             match crate::notify::NotifyConfig::from_parts(Some(&text), None) {
@@ -1369,9 +1424,9 @@ pub fn disk_check(dir: &Path, warn_below: u64, fail_below: u64) -> Check {
         .sum();
     let summary = format!(
         "{} free at {} (logs {})",
-        human_bytes(free),
+        crate::util::human_bytes(free),
         probe.display(),
-        human_bytes(logs)
+        crate::util::human_bytes(logs)
     );
     if free < fail_below {
         Check::new(id, Level::Fail, summary)
@@ -1402,7 +1457,7 @@ pub fn recordings_check(dir: &Path, limits: crate::record::RecordLimits) -> Chec
     let used: u64 = list.iter().map(|r| r.size).sum();
     let summary = format!(
         "{} of dir_cap {cap_text} in {} file{}",
-        human_bytes(used),
+        crate::util::human_bytes(used),
         list.len(),
         if list.len() == 1 { "" } else { "s" }
     );
@@ -1436,21 +1491,6 @@ fn free_bytes(path: &Path) -> Option<u64> {
     #[allow(clippy::useless_conversion)]
     let free = u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize));
     Some(free)
-}
-
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
 }
 
 #[cfg(test)]
@@ -1683,6 +1723,41 @@ mod tests {
         let checks = state_dir_checks(&state);
         assert_eq!(checks.len(), 1);
         assert_eq!(checks[0].level, Level::Ok, "{checks:?}");
+
+        // The newer secrets too: share and peer digests, recordings (whole
+        // terminal output), and plugin logs.
+        let open = |path: &Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        };
+        for file in [crate::share::SHARES_FILE, crate::peers::PEERS_FILE] {
+            std::fs::write(state.join(file), "{}").unwrap();
+            open(&state.join(file));
+        }
+        for (sub, name) in [
+            (crate::record::RECORDINGS_DIR, "a.cast"),
+            (crate::plugins::LOG_DIR, "p.jsonl"),
+        ] {
+            std::fs::create_dir(state.join(sub)).unwrap();
+            std::fs::write(state.join(sub).join(name), "x").unwrap();
+            open(&state.join(sub).join(name));
+        }
+        let failing: Vec<Check> = state_dir_checks(&state)
+            .into_iter()
+            .filter(|c| c.level == Level::Fail)
+            .collect();
+        let said = |needle: &str| failing.iter().any(|c| c.summary.contains(needle));
+        assert_eq!(failing.len(), 4, "{failing:?}");
+        assert!(said("shares.json") && said("peers.json"), "{failing:?}");
+        assert!(
+            said("1 recording file") && said("1 plugin log"),
+            "{failing:?}"
+        );
+        assert!(
+            failing
+                .iter()
+                .any(|c| c.fix.as_deref().unwrap().starts_with("chmod -R go-rwx ")),
+            "{failing:?}"
+        );
     }
 
     #[test]
@@ -1851,7 +1926,7 @@ mod tests {
         );
         // A dir not created yet: its nearest existing parent's filesystem.
         assert_eq!(disk_check(&dir.path().join("a/b"), 0, 0).level, Level::Ok);
-        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(crate::util::human_bytes(1536), "1.5 KiB");
         assert_eq!(ntp_synchronized("yes\n"), Some(true));
         assert_eq!(ntp_synchronized("no"), Some(false));
         assert_eq!(ntp_synchronized(""), None);

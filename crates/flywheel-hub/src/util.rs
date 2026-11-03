@@ -15,6 +15,45 @@ pub(crate) fn str_field<'a>(item: &'a Value, field: &str) -> &'a str {
     item.get(field).and_then(Value::as_str).unwrap_or("")
 }
 
+/// One word as a shell reads it back verbatim: as is when every character
+/// is plain, else single-quoted (a leading `~`, `^` or `=` is quoted too:
+/// shells expand those at a word's start). For showing a command a person
+/// can paste (a fix line, a planned git call): nothing is run through it.
+pub fn shell_quote(word: &str) -> String {
+    let plain = !word.is_empty()
+        && !word.starts_with(['~', '^', '='])
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,^~".contains(c));
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// [`shell_quote`] of a path.
+pub fn shell_path(path: &Path) -> String {
+    shell_quote(&path.to_string_lossy())
+}
+
+/// A size as people read it: `512 B`, `1.5 KiB`, `64.0 MiB`, `1.0 GiB`
+/// (a config value is written [`crate::record::format_size`]'s way).
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// `"1 file"`, `"3 files"`.
 pub(crate) fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })

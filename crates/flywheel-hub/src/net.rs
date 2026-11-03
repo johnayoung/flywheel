@@ -1,8 +1,9 @@
 //! Client-side networking shared by the scripting endpoint
 //! ([`crate::endpoint`]), the machine proxy ([`crate::machines`]), and the
 //! notify webhook ([`crate::notify`]): rustls client configs on ring (never
-//! a process-wide default provider) and the WebSocket connect. Each caller
-//! keeps its own error wording and, for machines, its pinning verifier.
+//! a process-wide default provider), the WebSocket connect, and how a
+//! failed request and an API error body read. Machines keep their pinning
+//! verifier.
 
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -11,6 +12,56 @@ use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use url::Url;
+
+/// A failed HTTP request for people: what failed, then every distinct
+/// cause down the chain (a TLS reason or "Connection refused" sits a few
+/// sources down; the first is often only hyper's "client error
+/// (Connect)"). Never the URL: only the sources are shown, and reqwest
+/// names the URL in the top error alone (a webhook's URL is a secret).
+pub fn describe(error: &reqwest::Error) -> String {
+    let what = if error.is_connect() {
+        "cannot connect"
+    } else if error.is_timeout() {
+        "timed out"
+    } else if error.is_builder() {
+        "cannot send"
+    } else {
+        "request failed"
+    };
+    let mut causes: Vec<String> = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !causes.contains(&text) {
+            causes.push(text);
+        }
+        source = cause.source();
+    }
+    if causes.is_empty() {
+        what.to_owned()
+    } else {
+        format!("{what}: {}", causes.join(": "))
+    }
+}
+
+/// An API answer's error: its `{"error": ...}` message, else the body's
+/// text (at most 300 characters).
+pub fn error_text(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            String::from_utf8_lossy(body)
+                .trim()
+                .chars()
+                .take(300)
+                .collect()
+        })
+}
 
 /// Anything a WebSocket can run over (plain TCP or TLS).
 pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}

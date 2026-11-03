@@ -5,7 +5,7 @@
 //! hub's review API.
 
 use crate::endpoint::{Endpoint, EndpointArgs};
-use crate::script::{resolve, session_label};
+use crate::script::session_label;
 use serde_json::{Value, json};
 use std::io::{BufRead, IsTerminal, Write};
 use std::time::Duration;
@@ -90,9 +90,8 @@ fn list<'a>(v: &'a Value, k: &str) -> &'a [Value] {
 }
 
 fn find(conn: &Endpoint, query: &str) -> Result<(String, String), String> {
-    let sessions = conn.blocking_sessions()?;
-    let session = resolve(&sessions, query, "session")?;
-    Ok((s(session, "id").to_owned(), session_label(session)))
+    let (id, session) = crate::script::find_session(conn, query)?;
+    Ok((id, session_label(&session)))
 }
 
 fn query_escape(raw: &str) -> String {

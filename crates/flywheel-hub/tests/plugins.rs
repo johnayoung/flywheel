@@ -364,6 +364,20 @@ async fn plugins_receive_events_answer_actions_and_are_bounded() {
         tokio::time::sleep(Duration::from_millis(30)).await;
     };
     fire(&env, "UserPromptSubmit", json!({"prompt": "go"}));
+    // The host reads the status a change notification points at: let it
+    // see "working" before the next change (else two quick reports read as
+    // one change with no previous status).
+    let path = format!("/api/sessions/{}", claude["id"].as_str().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (_, view) = hub.call(reqwest::Method::GET, &path, None).await;
+        if view["agent"]["status"] == "working" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never working: {view}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
     fire(
         &env,
         "PermissionRequest",

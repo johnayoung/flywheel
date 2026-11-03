@@ -55,6 +55,9 @@ window.FwHubAttention = function (ctx) {
             "span",
             { className: "attn-line" },
             el("b", { className: "attn-name", textContent: session.name }),
+            session.machine
+              ? el("span", { className: "machine-badge", textContent: session.machine, title: `on machine ${session.machine}` })
+              : null,
             el("span", { className: "attn-ws", textContent: workspace ? workspace.name : "" }),
             branch
               ? el("span", { className: "attn-branch", title: `worktree branch ${branch}` }, icon("branch"), el("span", { textContent: branch }))
@@ -90,7 +93,7 @@ window.FwHubAttention = function (ctx) {
           onclick: () => flywheel.open(folder),
           title: count > 1
             ? `${label}: ${alert.detail}. Open its Flywheel panel.`
-            : `${alert.subject} in ${folder}: ${alert.detail}`,
+            : `${alert.subject} in ${label}: ${alert.detail}`,
         },
         el("span", { className: "glyph fw" }, icon("wheel")),
         el(

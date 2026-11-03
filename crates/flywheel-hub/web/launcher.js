@@ -169,7 +169,12 @@ window.FwHubLauncher = function (ctx) {
     if (rollupBusy) return;
     rollupBusy = true;
     try {
-      rollups = await api("GET", "/api/usage");
+      const [local, remote] = await Promise.all([
+        api("GET", "/api/usage"),
+        ctx.remoteUsage ? ctx.remoteUsage() : [],
+      ]);
+      // This hub's spend strip; every machine's workspace chips.
+      rollups = { ...local, workspaces: [...(local.workspaces || []), ...remote] };
       renderSpend();
       ctx.onRollups();
     } catch (_) {

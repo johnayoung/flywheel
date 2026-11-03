@@ -22,8 +22,12 @@ fw hub search QUERY [--regex] [--case] [--session S] [--workspace W] [--kind K].
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent hooks only
 # start/serve also take --handoff (take over from the running hub; --bind/--port ignored)
 # SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--no-flywheel] [--import-root DIR] [--notify-url URL] [--worktree-branch-prefix P]
+fw hub machine add NAME URL [--mint [--peer-name N]] [--fingerprint SHA256]   # register another hub (secret from FW_HUB_MACHINE_SECRET or stdin); see Machines
+fw hub machine ls [--no-probe] | rm NAME | test [NAME]     # [--json]
+fw hub peer issue --name X | ls | revoke NAME|ID           # credentials other hubs hold to reach this one
 # every verb but report (hooks only) takes --state-dir DIR
 # ls/new/send/read/wait/attach/kill/relaunch/commands/search/review/merge/open/url also take [--url URL] [--token T]: a hub elsewhere
+#   and [--machine NAME]: a machine registered on that hub, through its proxy (`fw hub ls --machine desktop`)
 #   (token: prefer FW_HUB_TOKEN; without one, the state dir's token goes only to that state dir's running hub)
 ```
 
@@ -135,6 +139,34 @@ fw hub url --qr                                  # scan with the phone
 - `serve` and `url` run `tailscale status --json` / `tailscale serve status --json` (3 s timeout; `tailscale` on `PATH` or the macOS app): a `serve` whose `/` proxies to the hub's port is listed and, when found at startup, accepted as an origin. Tailnet up but nothing served: they print the `tailscale serve` command.
 - Behind any reverse proxy on this machine, `X-Forwarded-For` (last entry), `X-Forwarded-Host` (counts as same-origin), and `X-Forwarded-Proto` are believed only from loopback peers (IPv4-mapped ones under `--bind ::` included) and `--trusted-proxy` addresses. A proxy elsewhere: pass `--public-url` and `--trusted-proxy`. `tailscale serve` keeps `Host` and sets the forwarded headers, so starting it after `fw hub serve` works (it is just not listed as an origin until the next start).
 - LAN: `fw hub serve --bind 0.0.0.0` (warns; plain HTTP, so the clipboard API is off on phones), then `fw hub url --qr`.
+
+## Machines
+
+One browser UI over several hubs (herdr's "connecting machines"). This hub (A) registers other hubs (B) and relays the browser's API calls and WebSockets to them under `/m/<machine>/api/...`, so the browser talks to A's origin only (one `tailscale serve` covers the phone) and never holds a remote credential.
+
+```bash
+# on B: a peer credential for A (printed once, alone on stdout)
+fw hub peer issue --name laptop > /tmp/cred
+# on A: register B (never pass secrets on argv)
+fw hub machine add desktop https://desktop.tailnet.ts.net < /tmp/cred
+FW_HUB_MACHINE_SECRET=$(ssh desktop fw hub token) fw hub machine add desktop URL --mint   # or: B's token, used once to mint one; not stored
+fw hub ls --machine desktop; fw hub attach --machine desktop SESSION
+```
+
+- **Peer credential** (`fwpeer_<id>_<secret>`, 256 bits; digests in B's `peers.json`, 0600): API and WebSockets only -- never a browser login. Refused (403): `/api/token/rotate`, `/api/login-codes`, `/api/peers*`, `/api/machines*`, `/api/workspaces/import`, `/api/code-workspaces`, `/m/*`, and every non-`/api` page. Survives B's token rotation; `fw hub peer revoke` ends its requests at once and closes its sockets (4003). `peer issue/ls/revoke` go through B's running hub, else edit the file (a running hub re-reads it on change).
+- **A's side**: `machines.json` (0600) holds name, URL, peer credential, optional pin. `add` checks the credential with `GET /api/whoami` there and refuses a hub token. `rm` asks B to revoke the credential (`DELETE /api/peer`; else it says how). Names: `[a-z0-9-]`, 1-32, not `local`.
+- **Proxy**: only `/api/...` on a registered machine's base URL (SSRF guard; redirects, cookies refused/stripped). Bodies up to 8 MiB, 120 s per call. A machine's 401 becomes 502 `{"error","machine","machine_state":"refused"}` (never signs the browser out); unreachable is 502 `offline`. After a refusal A answers for 90 s without asking (B's failure limit counts A's address). WebSockets relay frame by frame with backpressure; B's 4001-4003 reach the browser as 4010, a removed machine closes with 4011, a lost link 1011.
+- **TLS**: https machines are verified against the system roots, or by `--fingerprint` (SHA-256 of the leaf certificate, `openssl x509 -noout -fingerprint -sha256`; names and expiry not checked, like an SSH host key). An untrusted certificate's refusal names the fingerprint it saw.
+- **UI**: the sidebar groups workspaces by machine (this hub first), each head with its link state (online / connecting / offline with retry countdown / refused) and Reconnect; each machine has its own events socket with independent backoff (0.5 s doubling to 30 s), and keeps its last lists while unreachable. Needs you, notifications, tab counts, attach, layout, commands, review, worktrees, launcher, and the Flywheel panel all work for its sessions; a machine badge marks them. New workspaces pick a machine (VS Code import: this hub only). **Machines** (sidebar footer, palette) adds, tests, and removes them.
+
+| Method | Path | |
+|---|---|---|
+| GET | `/whoami` | `{"scope":"full"\|"peer","peer","version","host"}` |
+| GET / POST | `/peers` | list `{"peers":[{"id","name","created","last_used"}]}` / `{"name"}` -> 201 `{"peer","credential"}` |
+| DELETE | `/peers/{id or name}` | revoke; `DELETE /peer`: a peer credential revokes itself |
+| GET / POST | `/machines` | `{"host","machines":[view]}` / `{"name","url","credential"\|"token","peer_name"?,"fingerprint"?}` -> 201 view (`{"name","url","fingerprint","peer","added","status":{"state","since","error","version","host","presented_fingerprint"}}`) |
+| DELETE | `/machines/{name}` | `{"machine","revoked","note"}` |
+| POST | `/machines/{name}/test` | `{"ok","latency_ms","whoami"\|"error","machine"}` |
 
 ## Push notifications
 

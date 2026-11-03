@@ -112,7 +112,7 @@ window.FwHubNotify = function (ctx) {
     if (!session) return;
     const workspace = workspaceById(session.workspace_id);
     const branch = attention.branchOf(session);
-    const where = `${workspace ? `${workspace.name} / ${session.name}` : session.name}${branch ? ` (on ${branch})` : ""}`;
+    const where = `${session.machine ? `${session.machine}: ` : ""}${workspace ? `${workspace.name} / ${session.name}` : session.name}${branch ? ` (on ${branch})` : ""}`;
     const title = agent.status === "blocked" ? `${session.name} is blocked` : `${session.name} is done`;
     const body = agent.status === "blocked"
       ? `${where} waits on you${agent.detail ? `: ${agent.detail}` : "."}`

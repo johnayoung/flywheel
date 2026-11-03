@@ -36,7 +36,7 @@ pub const LOGINS_FILE: &str = "logins.json";
 /// to expiry.
 pub const MAX_LOGINS: usize = 256;
 
-fn random_hex(bytes: usize) -> Result<String, TokenError> {
+pub(crate) fn random_hex(bytes: usize) -> Result<String, TokenError> {
     let mut buf = vec![0u8; bytes];
     getrandom::fill(&mut buf).map_err(|e| TokenError::Random(e.to_string()))?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())

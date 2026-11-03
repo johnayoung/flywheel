@@ -58,6 +58,7 @@ mod flywheel_api;
 mod import_api;
 mod listen;
 mod notify_api;
+mod proxy;
 mod pwa;
 mod review_api;
 mod search_api;
@@ -82,7 +83,7 @@ use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use futures_util::SinkExt;
 use serde::Deserialize;
@@ -118,6 +119,9 @@ pub const WS_CLOSE_RESTART: u16 = 1012;
 /// WebSocket close code sent when the browser login that opened the socket
 /// ended (logout, expiry, eviction).
 pub const WS_CLOSE_SIGNED_OUT: u16 = 4002;
+/// WebSocket close code sent when the peer credential that opened the
+/// socket was revoked (`fw hub peer revoke`).
+pub const WS_CLOSE_PEER_REVOKED: u16 = 4003;
 /// How long [`serve`] waits for sessions to exit on shutdown.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -149,16 +153,24 @@ struct AppState {
     options: Arc<ServerOptions>,
     shutdown: watch::Receiver<bool>,
     failures: Arc<Mutex<FailureLimiter>>,
+    /// Credentials other hubs hold to reach this one (`fw hub peer`).
+    peers: Arc<crate::peers::PeerStore>,
+    /// Other hubs this one proxies to (`fw hub machine`).
+    machines: Arc<crate::machines::Machines>,
 }
 
 /// Build the router. Flipping `shutdown` to `true` closes every open
 /// WebSocket so a graceful shutdown can finish.
 pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<bool>) -> Router {
+    let peers = Arc::new(crate::peers::PeerStore::load(hub.state_dir()));
+    let machines = Arc::new(crate::machines::Machines::load(hub.state_dir()));
     let state = AppState {
         hub,
         options: Arc::new(options),
         shutdown,
         failures: Arc::new(Mutex::new(FailureLimiter::default())),
+        peers,
+        machines,
     };
     let protected = Router::new()
         .route(
@@ -240,6 +252,19 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/flywheel/panel", get(flywheel_api::panel))
         .route("/api/flywheel/run", get(flywheel_api::run_output))
         .route("/api/flywheel/worker", post(flywheel_api::start_worker))
+        // Multiple machines: this hub's peers (remote side) and machines
+        // (local side), and the proxy to them.
+        .route("/api/whoami", get(proxy::whoami))
+        .route("/api/peer", delete(proxy::revoke_self))
+        .route("/api/peers", get(proxy::list_peers).post(proxy::issue_peer))
+        .route("/api/peers/{which}", delete(proxy::revoke_peer))
+        .route(
+            "/api/machines",
+            get(proxy::list_machines).post(proxy::add_machine),
+        )
+        .route("/api/machines/{name}", delete(proxy::remove_machine))
+        .route("/api/machines/{name}/test", post(proxy::test_machine))
+        .route("/m/{name}/{*rest}", any(proxy::forward))
         // Anything else under /api answers in the API's error form too.
         .route("/api/{*rest}", any(api_not_found))
         .route("/api", any(api_not_found))
@@ -377,6 +402,9 @@ impl FromRequestParts<AppState> for Client {
 enum Auth {
     /// Admitted: by a login cookie (its secret) or by the token (`None`).
     Granted(Option<String>),
+    /// Admitted with a peer credential (another hub): the API only, within
+    /// the peer scope (`peers::peer_forbidden`).
+    Peer(crate::peers::PeerInfo),
     /// No credential presented.
     Anonymous,
     /// A wrong credential (counted against the client).
@@ -415,23 +443,26 @@ fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
         // outlives the login.
         return Auth::Granted((!bearer_ok()).then(|| (*login).to_owned()));
     }
+    let check = || {
+        if bearer_ok() {
+            return Some(Auth::Granted(None));
+        }
+        bearer.and_then(|b| app.peers.verify(b)).map(Auth::Peer)
+    };
     if client.same_machine {
-        return if bearer_ok() {
-            Auth::Granted(None)
-        } else {
-            Auth::Denied
-        };
+        return check().unwrap_or(Auth::Denied);
     }
     let mut failures = app.failures.lock().unwrap_or_else(PoisonError::into_inner);
     let now = Instant::now();
     if let Some(wait) = failures.locked(client.ip, now) {
         return Auth::Limited(wait);
     }
-    if bearer_ok() {
-        Auth::Granted(None)
-    } else {
-        failures.record_failure(client.ip, now);
-        Auth::Denied
+    match check() {
+        Some(auth) => auth,
+        None => {
+            failures.record_failure(client.ip, now);
+            Auth::Denied
+        }
     }
 }
 
@@ -480,6 +511,16 @@ const LOGIN_RECHECK: Duration = Duration::from_secs(60);
 struct CredentialWatch {
     rotations: watch::Receiver<u64>,
     login: Option<LoginWatch>,
+    peer: Option<PeerWatch>,
+}
+
+/// A peer credential's socket closes when that peer is revoked (rotating
+/// the token leaves peers alone).
+#[derive(Clone)]
+struct PeerWatch {
+    id: String,
+    store: Arc<crate::peers::PeerStore>,
+    changes: watch::Receiver<u64>,
 }
 
 #[derive(Clone)]
@@ -493,7 +534,17 @@ impl CredentialWatch {
         Self {
             rotations: hub.subscribe_rotations(),
             login: None,
+            peer: None,
         }
+    }
+
+    fn for_peer(mut self, store: &Arc<crate::peers::PeerStore>, id: String) -> Self {
+        self.peer = Some(PeerWatch {
+            id,
+            store: Arc::clone(store),
+            changes: store.subscribe(),
+        });
+        self
     }
 
     fn for_login(mut self, hub: &Hub, secret: Option<String>) -> Self {
@@ -521,9 +572,18 @@ impl CredentialWatch {
                     None => std::future::pending().await,
                 }
             };
+            let peer_event = async {
+                match &mut self.peer {
+                    Some(peer) => peer.changes.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 changed = self.rotations.changed() => {
                     if changed.is_ok() {
+                        if self.peer.is_some() {
+                            continue;
+                        }
                         return CloseFrame {
                             code: WS_CLOSE_ROTATED,
                             reason: "token rotated: log in again".into(),
@@ -531,6 +591,19 @@ impl CredentialWatch {
                     }
                     // The hub is gone: shutdown handles it.
                     std::future::pending::<()>().await;
+                }
+                alive = peer_event => {
+                    if !alive {
+                        std::future::pending::<()>().await;
+                    }
+                    if let Some(peer) = &self.peer
+                        && !peer.store.contains(&peer.id)
+                    {
+                        return CloseFrame {
+                            code: WS_CLOSE_PEER_REVOKED,
+                            reason: "peer credential revoked".into(),
+                        };
+                    }
                 }
                 alive = login_event => {
                     if !alive {
@@ -568,6 +641,19 @@ async fn require_auth(
             request
                 .extensions_mut()
                 .insert(watch.for_login(&app.hub, login));
+            next.run(request).await
+        }
+        Auth::Peer(peer) => {
+            if crate::peers::peer_forbidden(request.uri().path()) {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "not allowed with a peer credential (it drives sessions; it cannot \
+                     administer this hub)",
+                );
+            }
+            let watch = watch.for_peer(&app.peers, peer.id.clone());
+            request.extensions_mut().insert(watch);
+            request.extensions_mut().insert(peer);
             next.run(request).await
         }
         Auth::Limited(wait) => too_many_attempts(wait),
@@ -673,7 +759,7 @@ async fn index(
             response
         }
         Auth::Limited(wait) => login_refused(wait),
-        Auth::Anonymous | Auth::Denied => {
+        Auth::Anonymous | Auth::Denied | Auth::Peer(_) => {
             let notice = match query.signed_out.as_deref() {
                 Some("rotated") => Some(
                     "Signed out: the hub's token was rotated. Sign in again with a fresh link from `fw hub url`.",
@@ -810,7 +896,7 @@ async fn asset(
         match authenticate(&app, &headers, client) {
             Auth::Granted(_) => {}
             Auth::Limited(wait) => return too_many_attempts(wait),
-            Auth::Anonymous | Auth::Denied => {
+            Auth::Anonymous | Auth::Denied | Auth::Peer(_) => {
                 return error_response(StatusCode::UNAUTHORIZED, "authentication required");
             }
         }

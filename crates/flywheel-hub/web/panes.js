@@ -302,7 +302,8 @@ window.FwHubPanes = function (ctx) {
       stopRetry();
       setLink("connecting", pane.retry ? `retry ${pane.retry}` : "connecting");
       const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-      const socket = new WebSocket(`${scheme}://${window.location.host}/api/sessions/${id}/ws`);
+      const path = ctx.socketPath ? ctx.socketPath(id) : `/api/sessions/${id}/ws`;
+      const socket = new WebSocket(`${scheme}://${window.location.host}${path}`);
       socket.binaryType = "arraybuffer";
       pane.socket = socket;
       pane.replaying = false;
@@ -400,6 +401,21 @@ window.FwHubPanes = function (ctx) {
           setLink("connecting", "hub restarting");
           showBanner("The hub is restarting (upgrade); the session keeps running. Reconnecting…", [], true);
           pane.retryTimer = setTimeout(() => pane.reconnectNow(), 300);
+          return;
+        }
+        if (event.code === 4010 || event.code === 4011) {
+          // A machine's session: that machine refused this hub's
+          // credential (revoked there) or was removed from this hub. The
+          // last screen stays; retrying waits for a fix.
+          setLink("lost", event.code === 4010 ? "machine refused" : "machine removed");
+          showBanner(
+            event.code === 4010
+              ? `${event.reason || "The machine refused this hub's credential"}. Re-add the machine (Machines in the palette), then reconnect.`
+              : "This session's machine was removed from this hub.",
+            event.code === 4010
+              ? [el("button", { type: "button", className: "slab", onclick: () => pane.reconnectNow() }, "Reconnect")]
+              : [],
+          );
           return;
         }
         scheduleReconnect(id, event.code);

@@ -122,6 +122,11 @@ enum HubCommand {
     /// uncommitted changes, or the branch is not a fast-forward (--rebase
     /// rebases it onto the base first).
     Merge(crate::review_cli::MergeArgs),
+    /// Other hubs shown and proxied by this one: add, ls, rm, test.
+    /// Every scripting verb takes --machine NAME to reach one.
+    Machine(crate::machine_cli::MachineArgs),
+    /// Credentials other hubs hold to reach this one: issue, ls, revoke.
+    Peer(crate::machine_cli::PeerArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -413,6 +418,8 @@ pub fn run_with(
         HubCommand::Relaunch(args) => script::relaunch(&args, out, err),
         HubCommand::Import(args) => script::import(&args, out, err),
         HubCommand::Open(args) => browser::open(&args, out, err),
+        HubCommand::Machine(args) => crate::machine_cli::machine(&args, out, err),
+        HubCommand::Peer(args) => crate::machine_cli::peer(&args, out, err),
     }
 }
 

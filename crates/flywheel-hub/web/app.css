@@ -3405,3 +3405,105 @@ button.meter.usage[hidden] { display: none; }
      opens from the sidebar's search chip and the palette. */
   #search-toggle { display: none; }
 }
+
+/* --- machines (machines.js) ------------------------------------------------
+   With other machines registered, the sidebar is a rack: this hub's
+   workspaces, then each machine's, each under a stencilled head with its
+   link lamp (online steady, connecting pulsing, offline hollow, refused in
+   alert red) and its own reconnect. */
+.machine-group + .machine-group { margin-top: .35rem; border-top: 1px solid var(--rule); }
+.machine-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .5rem .8rem .35rem .85rem;
+  background: linear-gradient(var(--bg-2) 70%, transparent);
+  font-size: 9.5px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.machine-name {
+  flex: 0 1 auto;
+  min-width: 3ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 700 .92rem/1 var(--display);
+  letter-spacing: .08em;
+  color: var(--ink-2);
+}
+.machine-state {
+  flex: 0 100 auto;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.machine-retry { flex: none; }
+.machine-head.link-refused .machine-state { color: var(--alert); }
+.machine-head.link-offline .machine-state { color: var(--brass); }
+.machine-retry { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--signal); }
+.machine-dot {
+  flex: none;
+  width: .5rem;
+  height: .5rem;
+  border-radius: 50%;
+  border: 1.5px solid var(--ink-3);
+}
+.machine-dot.link-online { background: var(--signal); border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-soft); }
+.machine-dot.link-connecting { border-color: var(--brass); animation: machine-pulse 1.1s var(--ease) infinite; }
+.machine-dot.link-offline { border-color: var(--brass); }
+.machine-dot.link-refused { background: var(--alert); border-color: var(--alert); }
+@keyframes machine-pulse { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .machine-dot.link-connecting { animation: none; } }
+.machine-head.link-offline ~ .workspace, .machine-head.link-refused ~ .workspace { opacity: .62; }
+.machine-empty { padding-left: 1.35rem; }
+
+/* A machine's name on its sessions: a stamped tag. */
+.machine-badge {
+  flex: none;
+  max-width: 6.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: .05rem .3rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  font-size: 8.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  background: var(--bg-3);
+}
+.crumb-ws .machine-badge { vertical-align: 1px; }
+
+/* The machines dialog. */
+.machines-intro { font-size: 11.5px; }
+.machine-list { list-style: none; margin: .2rem 0 0; padding: 0; display: grid; gap: .4rem; }
+.machine-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: .65rem;
+  padding: .6rem .7rem;
+  border: 1px solid var(--rule);
+  background: var(--bg-3);
+}
+.machine-row .machine-dot { margin-top: .3rem; }
+.machine-row-text { display: grid; gap: .15rem; min-width: 0; }
+.machine-row-text b { font: 700 1rem/1 var(--display); letter-spacing: .06em; text-transform: uppercase; }
+.machine-row-text small { color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
+.machine-row-text .machine-err { color: var(--alert); }
+.machine-row-text .machine-fp { font-size: 9.5px; }
+.machine-row-tools { display: flex; gap: .35rem; }
+.machine-none { color: var(--ink-3); font-size: 11px; padding: .3rem 0; }
+.machine-add { display: grid; gap: .55rem; margin: .4rem 0 0; padding: .7rem 0 0; border: 0; border-top: 1px dashed var(--rule-2); }
+.machine-add legend { padding: 0 0 .2rem; }
+.machine-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: .6rem; }
+@media (max-width: 760px) { .machine-grid { grid-template-columns: 1fr; } }

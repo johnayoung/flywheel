@@ -54,6 +54,11 @@ pub(crate) struct EndpointArgs {
     /// only when it names the hub running for that state dir).
     #[arg(long, value_name = "TOKEN")]
     pub(crate) token: Option<String>,
+    /// A machine registered on that hub (`fw hub machine ls`): reach its
+    /// sessions through the hub's proxy, with the peer credential the hub
+    /// keeps for it.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) machine: Option<String>,
     #[command(flatten)]
     pub(crate) state: StateDirArg,
 }
@@ -68,6 +73,9 @@ pub type Socket = WebSocketStream<Box<dyn Io>>;
 /// A resolved hub: base URL and credential.
 pub struct Endpoint {
     base: Url,
+    /// `/m/<machine>` when a machine is reached through this hub's proxy,
+    /// else empty.
+    prefix: String,
     token: RwLock<String>,
     /// The state dir the token was read from (re-read after a rotation);
     /// `None` for a token given by hand.
@@ -99,6 +107,26 @@ impl Endpoint {
     /// the hub running for the state dir (`--token` / FW_HUB_TOKEN, else
     /// its token file).
     pub(crate) fn resolve(args: &EndpointArgs) -> Result<Self, String> {
+        let endpoint = Self::resolve_hub(args)?;
+        match &args.machine {
+            Some(machine) => endpoint.via_machine(machine),
+            None => Ok(endpoint),
+        }
+    }
+
+    /// The same hub, its calls going to machine `name` through its proxy.
+    pub fn via_machine(mut self, name: &str) -> Result<Self, String> {
+        let name = crate::machines::validate_machine_name(name).map_err(|e| e.to_string())?;
+        self.prefix = format!("/m/{name}");
+        Ok(self)
+    }
+
+    /// The machine reached through the proxy, if any.
+    pub fn machine(&self) -> Option<&str> {
+        self.prefix.strip_prefix("/m/")
+    }
+
+    fn resolve_hub(args: &EndpointArgs) -> Result<Self, String> {
         let explicit = args.token.clone().or_else(|| {
             std::env::var(TOKEN_ENV)
                 .ok()
@@ -223,6 +251,7 @@ impl Endpoint {
             .map_err(|e| format!("HTTP client setup failed: {e}"))?;
         Ok(Self {
             base,
+            prefix: String::new(),
             token: RwLock::new(token),
             token_dir,
             local,
@@ -239,13 +268,24 @@ impl Endpoint {
     }
 
     fn url(&self, path: &str) -> Result<Url, String> {
+        let full = if self.prefix.is_empty() {
+            path.to_owned()
+        } else {
+            format!("{}{path}", self.prefix)
+        };
         self.base
-            .join(path)
+            .join(&full)
             .map_err(|e| format!("bad API path {path:?}: {e}"))
     }
 
     /// Why the hub could not be reached: `why`, naming the hub.
     fn unreachable(&self, why: &str) -> String {
+        if let Some(machine) = self.machine() {
+            return format!(
+                "cannot reach machine {machine} through the hub at {}: {why}",
+                self.base()
+            );
+        }
         match &self.local {
             Some(info) => format!(
                 "cannot reach the running hub (pid {}) at {}: {why}",

@@ -243,13 +243,15 @@
 
   // --- API -------------------------------------------------------------
 
-  async function api(method, path, body) {
+  // `path` as given (a machine's calls already under /m/<machine>).
+  async function rawApi(method, path, body) {
     const init = { method, credentials: "same-origin", headers: {} };
     if (body !== undefined) {
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(body);
     }
     const response = await fetch(path, init);
+    // Always this hub's own refusal: a machine's is a 502 (the proxy).
     if (response.status === 401) {
       window.location.replace("/" + window.location.hash);
       throw new Error("signed out");
@@ -261,9 +263,34 @@
     } catch (_) {
       throw new Error(`${response.status} ${response.statusText}`);
     }
-    if (!response.ok) throw new Error((data && data.error) || response.statusText);
+    if (!response.ok) {
+      const error = new Error((data && data.error) || response.statusText);
+      if (data && data.machine_state) error.machineState = data.machine_state;
+      throw error;
+    }
     return data;
   }
+
+  // Every call naming a remote workspace or session goes to its machine
+  // (machines.js); the rest to this hub.
+  const api = (method, path, body) => rawApi(method, machines.route(method, path, body), body);
+
+  // Other machines' hubs (machines.js): their workspaces and sessions
+  // beside this hub's, through its proxy.
+  const machines = window.FwHubMachines({
+    $, el, icon, state, rawApi,
+    clientId: CLIENT_ID,
+    toast: (...args) => commands.toast(...args),
+    confirmDialog: (options) => confirmDialog(options),
+    currentView: () => currentView(),
+    // Lists or connection states changed: merge and repaint.
+    onChange: () => renderSoon(),
+    onStatusChange: () => renderStatus(),
+    onStatus: (message) => applyStatus(message),
+    onEvent: (message, machine) => onPush(message, machine),
+    onMachineFlywheel: (machine) => flywheel.reloadMachine(machine),
+    signedOut: (why) => window.location.replace("/?signed_out=" + why + window.location.hash),
+  });
 
   // The Commands drawer (commands.js): agents' suggested code blocks.
   const commands = window.FwHubCommands({
@@ -287,6 +314,7 @@
   // flywheel-adopted folders.
   const flywheel = window.FwHubFlywheel({
     $, el, icon, api, age, span, state, workspaceById, sessionById, folderLabel,
+    machinePrefix: (machine) => machines.prefix(machine),
     openSession: (id, place) => openSession(id, place),
     toast: commands.toast,
     confirmDialog: (options) => confirmDialog(options),
@@ -318,6 +346,7 @@
   // fields, launch templates, quick launch, and token usage.
   const launcher = window.FwHubLauncher({
     $, el, api, state, worktrees,
+    remoteUsage: () => machines.usage(),
     toast: (...args) => commands.toast(...args),
     sessionById: (id) => sessionById(id),
     workspaceById: (id) => workspaceById(id),
@@ -392,7 +421,11 @@
     let ws;
     let ss;
     try {
-      [ws, ss] = await Promise.all([api("GET", "/api/workspaces"), api("GET", "/api/sessions")]);
+      [ws, ss] = await Promise.all([
+        api("GET", "/api/workspaces"),
+        api("GET", "/api/sessions"),
+        force ? machines.reloadAll() : null,
+      ]);
     } catch (error) {
       if (seq < state.refreshApplied) return;
       state.offline += 1;
@@ -411,8 +444,9 @@
     state.refreshApplied = seq;
     state.offline = 0;
     $("#offline").hidden = true;
-    state.workspaces = ws.workspaces;
-    state.sessions = ss.sessions;
+    state.localWorkspaces = ws.workspaces;
+    state.localSessions = ss.sessions;
+    mergeLists();
     mobile.pruneDrafts(state.sessions.map((s) => s.id));
     // Layouts of workspaces this page has not loaded yet (the first open
     // of one is then instant).
@@ -429,7 +463,7 @@
     for (const pane of livePanes()) {
       if (pane.term && pane.size && !pane.replaying && pane.claims() === pane.following) pane.claim();
     }
-    const snapshot = JSON.stringify([ws, ss]);
+    const snapshot = JSON.stringify([ws, ss, machines.version()]);
     const busy = $("#sidebar").contains(document.activeElement) &&
       document.activeElement.matches("input, select, textarea");
     if (!force && snapshot === state.snapshot) return;
@@ -459,7 +493,7 @@
       if (session && !session.live && !pane.socket && !pane.exited) pane.show(session.id, true);
     }
     if (!gone.length) return false;
-    state.snapshot = JSON.stringify([ws, ss]);
+    state.snapshot = JSON.stringify([ws, ss, machines.version()]);
     const meta = state.attachedMeta;
     const focused = focusedPane();
     const ours = gone.every((p) => state.closing.has(p.sessionId));
@@ -495,6 +529,22 @@
     }
     if (state.view) loadLayout(state.view).then(() => renderStage()).catch(() => {});
     return true;
+  }
+
+  // This hub's workspaces and sessions, then every machine's (machines.js
+  // keeps a machine's last lists while it is unreachable).
+  function mergeLists() {
+    state.workspaces = [...(state.localWorkspaces || []), ...machines.workspaces()];
+    state.sessions = [...(state.localSessions || []), ...machines.sessions()];
+  }
+
+  // A machine's lists or state changed: refresh (this hub's lists are
+  // cheap; the merge, repaint, and letting go of panes whose session is
+  // gone all run as for this hub's own changes).
+  let renderTimer = 0;
+  function renderSoon() {
+    clearTimeout(renderTimer);
+    renderTimer = setTimeout(() => refresh(false).catch(() => {}), 30);
   }
 
   const STALE_LINK = "The session this link points to no longer exists (it was closed, or its workspace deleted).";
@@ -655,6 +705,8 @@
 
   const panes = window.FwHubPanes({
     el, state, sessionById, TERM_FONT, status, goneText, exitHow,
+    // A machine's session attaches through this hub's proxy.
+    socketPath: (id) => machines.route("GET", `/api/sessions/${id}/ws`),
     fontSize: () => mobile.fontSize(),
     termTheme: () => ({ theme: TERM_THEMES[resolvedTheme()], minimumContrastRatio: contrastFloor() }),
     transformInput: (data) => mobile.transformInput(data),
@@ -819,7 +871,7 @@
   }
 
   async function putLayout(workspaceId, layout) {
-    const response = await fetch(`/api/workspaces/${workspaceId}/layout`, {
+    const response = await fetch(machines.route("PUT", `/api/workspaces/${workspaceId}/layout`), {
       method: "PUT",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
@@ -2050,9 +2102,12 @@
   }
 
   function sendView(force) {
+    machines.sendView(force);
     const socket = state.events;
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    const view = currentView();
+    const all = currentView();
+    const here = (id) => id && !machines.machineOf(id);
+    const view = { session_id: here(all.session_id) ? all.session_id : null, visible: all.visible.filter(here) };
     const key = JSON.stringify(view);
     if (!force && key === state.viewing) return;
     state.viewing = key;
@@ -2104,8 +2159,13 @@
         return;
       }
       if (message.type === "snapshot") {
-        state.agent = message.sessions || {};
-        state.rollup = message.workspaces || {};
+        // This hub's statuses; the machines' stay (they have their own
+        // sockets).
+        const local = (id) => !machines.machineOf(id);
+        for (const id of Object.keys(state.agent)) if (local(id)) delete state.agent[id];
+        for (const id of Object.keys(state.rollup)) if (local(id)) delete state.rollup[id];
+        Object.assign(state.agent, message.sessions || {});
+        Object.assign(state.rollup, message.workspaces || {});
         if (state.restarted) {
           // Back after a live handoff (`fw hub upgrade`, close 1012).
           state.restarted = false;
@@ -2115,24 +2175,13 @@
         if (message.version) state.hubVersion = message.version;
         renderStatus();
       } else if (message.type === "status") {
-        notify.onStatus(message.session_id, state.agent[message.session_id], message.status);
-        if (message.status) state.agent[message.session_id] = message.status;
-        else delete state.agent[message.session_id];
-        if (message.workspace_id) {
-          if (message.workspace_status) state.rollup[message.workspace_id] = message.workspace_status;
-          else delete state.rollup[message.workspace_id];
-        }
-        renderStatus();
+        applyStatus(message);
       } else if (message.type === "sessions") {
         refresh(false).catch(() => {});
-      } else if (message.type === "commands") {
-        commands.onEvent(message);
-      } else if (message.type === "usage") {
-        launcher.onUsage(message);
-      } else if (message.type === "flywheel" || message.type === "flywheel_reset") {
-        flywheel.onEvent(message);
-      } else if (message.type === "layout") {
-        onLayoutEvent(message);
+        // Machines added or removed here.
+        machines.sync().then(() => renderSoon());
+      } else {
+        onPush(message, null);
       }
     };
     socket.onclose = (event) => {
@@ -2160,8 +2209,34 @@
     };
   }
 
+  // A status push (this hub's or a machine's).
+  function applyStatus(message) {
+    notify.onStatus(message.session_id, state.agent[message.session_id], message.status);
+    if (message.status) state.agent[message.session_id] = message.status;
+    else delete state.agent[message.session_id];
+    if (message.workspace_id) {
+      if (message.workspace_status) state.rollup[message.workspace_id] = message.workspace_status;
+      else delete state.rollup[message.workspace_id];
+    }
+    renderStatus();
+  }
+
+  // The other pushes; `machine`: the machine that sent it (null: here).
+  function onPush(message, machine) {
+    if (message.type === "commands") {
+      commands.onEvent(message);
+    } else if (message.type === "usage") {
+      launcher.onUsage(message);
+    } else if (message.type === "flywheel" || message.type === "flywheel_reset") {
+      flywheel.onEvent(message, machine);
+    } else if (message.type === "layout") {
+      onLayoutEvent(message);
+    }
+  }
+
   const eventsWake = () => {
     if (!state.events) connectEvents();
+    machines.wake();
   };
   window.addEventListener("online", eventsWake);
   document.addEventListener("visibilitychange", () => {
@@ -2529,6 +2604,7 @@
       el(
         "span",
         { className: "session-meta" },
+        session.machine ? machineBadge(session.machine) : null,
         el("span", { className: `session-state ${st.tone}`, textContent: st.label, title: st.title || undefined }),
         launcher.rowChip(session),
         actions,
@@ -2541,6 +2617,8 @@
       session.companion_of && sessionById(session.companion_of) ? null : worktrees.badge(session),
     );
   }
+
+  const machineBadge = (name) => el("span", { className: "machine-badge", textContent: name, title: `on machine ${name}` });
 
   // The workspace's most urgent agent status (idle and unknown stay quiet).
   function rollupChip(workspace) {
@@ -2644,11 +2722,36 @@
     );
   }
 
+  // With machines: this hub's workspaces, then each machine's, each group
+  // under a head with its connection state.
+  function machineGroups(numbering) {
+    let i = 0;
+    const group = (name, list, empty) => el(
+      "section",
+      { className: `machine-group${name ? "" : " local"}`, dataset: { machine: name || "" } },
+      machines.header(name),
+      list.length
+        ? list.map((w) => renderWorkspace(w, i++, numbering))
+        : el("div", { className: "ws-empty machine-empty", textContent: empty }),
+    );
+    const local = state.workspaces.filter((w) => !w.machine);
+    return [
+      group(null, local, "No workspaces on this machine."),
+      ...machines.names().map((name) => {
+        const list = state.workspaces.filter((w) => w.machine === name);
+        const link = machines.linkOf(name);
+        return group(name, list, link === "online" ? "No workspaces there." : link === "connecting" ? "Connecting…" : "Not reachable yet.");
+      }),
+    ];
+  }
+
   function render() {
     search.refreshFilters();
     const numbering = new Map(attachable().map((s, i) => [s.id, i]));
     const root = $("#workspaces");
-    if (state.workspaces.length === 0) {
+    if (machines.any()) {
+      root.replaceChildren(...machineGroups(numbering));
+    } else if (state.workspaces.length === 0) {
       root.replaceChildren(
         el(
           "div",
@@ -2705,7 +2808,10 @@
     const emptyTab = !session && !phone() && state.view && workspaceById(state.view) && activeTab() ? focusedLeaf() : null;
     const workspace = session ? workspaceById(session.workspace_id) : emptyTab ? workspaceById(state.view) : null;
     $("#empty").hidden = !!session;
-    $("#crumb-workspace").textContent = workspace ? workspace.name : "";
+    $("#crumb-workspace").replaceChildren(
+      ...(workspace && workspace.machine ? [machineBadge(workspace.machine), " "] : []),
+      workspace ? workspace.name : "",
+    );
     $("#crumb-session").textContent = session ? session.name : emptyTab ? "Empty pane" : "No session";
     // Without a session the header's session controls mean nothing.
     $("#cmd-toggle").hidden = !session;
@@ -3013,14 +3119,43 @@
     $("#workspace-submit").textContent = workspace ? "Save" : "Create";
     wsForm.name.value = workspace ? workspace.name : "";
     $("#repo-rows").replaceChildren();
+    // Which machine it lives on (its folders are paths there).
+    const field = $("#ws-machine-field");
+    field.hidden = !machines.any();
+    const select = $("#ws-machine");
+    const current = workspace ? workspace.machine || "" : (machineOfView() || "");
+    select.replaceChildren(
+      el("option", { value: "", textContent: `${machines.host() || "this machine"} (this hub)` }),
+      ...machines.names().map((name) => el("option", { value: name, textContent: name })),
+    );
+    select.value = current;
+    select.disabled = !!workspace;
     if (workspace) workspace.folders.forEach((f) => addRepoRow(f));
     else addRepoRow("");
     importer.reset(!workspace);
+    // VS Code import reads this machine's files: here only.
+    $("#ws-import").hidden = !!workspace || !!select.value;
     $("#dlg-workspace").showModal();
     wsForm.name.focus();
   }
 
   $("#add-repo").addEventListener("click", () => addRepoRow("").input.focus());
+  // Another machine: the folder paths are checked again, there.
+  $("#ws-machine").addEventListener("change", () => {
+    $("#ws-import").hidden = !!$("#ws-machine").value;
+    for (const row of $("#repo-rows").children) if (row.input.value.trim()) checkRow(row);
+  });
+
+  // The machine of the workspace on the stage (a new workspace defaults to it).
+  const machineOfView = () => (workspaceById(state.view) || {}).machine || null;
+
+  // Calls without an id (kinds, folder checks, worktree plans, a new
+  // workspace) go to the machine the open dialog is about.
+  machines.setContext(() => {
+    if ($("#dlg-workspace").open) return wsEditing ? wsEditing.machine || null : $("#ws-machine").value || null;
+    if ($("#dlg-session").open) return (workspaceById($("#session-workspace").value) || {}).machine || null;
+    return null;
+  });
   // A stale error (name taken, bad path) clears as soon as the form changes.
   wsForm.addEventListener("input", () => {
     $("#workspace-error").textContent = "";
@@ -3071,13 +3206,18 @@
 
   const sessionForm = $("#session-form");
 
+  // What the dialog's machine can launch (each machine has its own).
+  const kindsKey = () => ($("#dlg-session").open ? (workspaceById($("#session-workspace").value) || {}).machine : null) || "";
   async function loadKinds() {
+    const key = kindsKey();
+    state.kindsBy = state.kindsBy || {};
     try {
-      state.kinds = (await api("GET", "/api/kinds")).kinds;
+      state.kindsBy[key] = (await api("GET", "/api/kinds")).kinds;
     } catch (_) {
-      state.kinds = state.kinds || [{ kind: "shell", available: true, program: null }];
+      state.kindsBy[key] = state.kindsBy[key] || [{ kind: "shell", available: true, program: null }];
     }
-    return state.kinds;
+    if (!key) state.kinds = state.kindsBy[key];
+    return state.kindsBy[key];
   }
 
   function selectedKind() {
@@ -3219,10 +3359,17 @@
     worktrees.reset();
     $("#session-error").textContent = "";
     $("#session-workspace").replaceChildren(
-      ...state.workspaces.map((w) => el("option", { value: w.id, textContent: w.name, selected: w.id === target.id })),
+      ...state.workspaces.map((w) => el("option", {
+        value: w.id,
+        textContent: w.machine ? `${w.name} (${w.machine})` : w.name,
+        selected: w.id === target.id,
+      })),
     );
     launcher.reset(target.id);
-    renderKinds(state.kinds || [{ kind: "shell", available: true, program: null }], store.get("kind", "shell"));
+    renderKinds(
+      (state.kindsBy && state.kindsBy[target.machine || ""]) || state.kinds || [{ kind: "shell", available: true, program: null }],
+      store.get("kind", "shell"),
+    );
     renderRepoPicker();
     $("#session-place").value = place || "pane";
     placePickChanged();
@@ -3250,6 +3397,11 @@
     launcher.reset($("#session-workspace").value);
     renderRepoPicker();
     placePickChanged();
+    // Another machine launches what is installed there.
+    const keep = selectedKind();
+    loadKinds().then((kinds) => {
+      if ($("#dlg-session").open) renderKinds(kinds, keep);
+    });
   });
   $("#repo-picker").addEventListener("change", pickedFolderChanged);
   $("#repo-picker").addEventListener("input", (event) => {
@@ -3320,16 +3472,20 @@
         group: "Sessions",
         glyph: glyphFor(session.kind),
         label: session.name,
-        hint: `${workspace ? workspace.name : ""} · ${status(session).label}${n < 9 ? ` · ${MOD} ${n + 1}` : ""}${session.live ? "" : " · no terminal"}`,
+        hint: `${session.machine ? `${session.machine} · ` : ""}${workspace ? workspace.name : ""} · ${status(session).label}${n < 9 ? ` · ${MOD} ${n + 1}` : ""}${session.live ? "" : " · no terminal"}`,
         run: () => openSession(session.id),
       });
     }
     const cmd = (label, hint, run, glyph = "chev", extra = {}) => items.push({ group: "Commands", glyph, label, hint, run, ...extra });
     cmd("New session", `${MOD} N`, () => openSessionDialog(), "plus");
     for (const workspace of state.workspaces) {
-      cmd(`New session in ${workspace.name}`, "", () => openSessionDialog(workspace.id), "plus");
+      cmd(`New session in ${workspace.name}`, workspace.machine ? `on ${workspace.machine}` : "", () => openSessionDialog(workspace.id), "plus");
     }
     cmd("New workspace", `${MOD} Shift N`, () => openWorkspaceDialog(), "plus");
+    cmd("Machines", "other machines' hubs: add, test, remove", () => machines.openDialog(), "chev");
+    for (const name of machines.names()) {
+      if (machines.linkOf(name) !== "online") cmd(`Reconnect to ${name}`, machines.linkOf(name), () => machines.reconnect(name), "redo");
+    }
     cmd("Import VS Code workspace", ".code-workspace files", () => {
       openWorkspaceDialog();
       importer.open();
@@ -3755,6 +3911,10 @@
     "toggle-flywheel": () => flywheel.togglePill(),
     "toggle-review": () => review.togglePill(),
     search: () => search.open(),
+    machines: () => {
+      document.body.classList.remove("side-open");
+      machines.openDialog();
+    },
   };
   document.addEventListener("click", (event) => {
     const target = event.target.closest("[data-action]");
@@ -3809,6 +3969,8 @@
     document.querySelectorAll("[title]").forEach((node) => {
       node.title = node.title.replace(/\bAlt\b/g, MOD);
     });
+    // Other machines' lists first, so a #session= of theirs re-attaches.
+    await machines.start();
     try {
       await refresh();
     } catch (error) {

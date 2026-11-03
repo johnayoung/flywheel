@@ -7,7 +7,10 @@
 // agent transcript). app.js creates it with its helpers; protocol:
 // GET /api/flywheel, /api/flywheel/panel, /api/flywheel/run, POST
 // /api/flywheel/worker, and the events socket's {"type":"flywheel"} and
-// {"type":"flywheel_reset"} pushes.
+// {"type":"flywheel_reset"} pushes. Another machine's folders
+// (machines.js) are read through this hub's proxy; their keys here are
+// `<machine>\u0001<path>` (a path alone is this hub's), so the same repo
+// path on two machines stays two panels.
 "use strict";
 
 window.FwHubFlywheel = function (ctx) {
@@ -44,6 +47,17 @@ window.FwHubFlywheel = function (ctx) {
     blocked: "blocked",
   };
 
+  // --- folders on machines -----------------------------------------------
+
+  const SEP = "\u0001";
+  const keyOf = (machine, path) => (machine ? `${machine}${SEP}${path}` : path);
+  const machineOfKey = (key) => (key && key.includes(SEP) ? key.slice(0, key.indexOf(SEP)) : null);
+  const pathOf = (key) => (key && key.includes(SEP) ? key.slice(key.indexOf(SEP) + 1) : key);
+  const via = (key) => ctx.machinePrefix(machineOfKey(key));
+  const sameMachine = (item, key) => (item.machine || null) === machineOfKey(key);
+  // A summary or panel as kept here: its folder is the key.
+  const keyed = (machine, value) => (machine ? { ...value, folder: keyOf(machine, value.folder) } : value);
+
   // --- time --------------------------------------------------------------
 
   const { age: ago, span } = ctx;
@@ -56,33 +70,44 @@ window.FwHubFlywheel = function (ctx) {
 
   // --- data --------------------------------------------------------------
 
-  async function reload() {
+  // One machine's folders (`null`: this hub's), replacing what it had.
+  async function reloadMachine(machine) {
     try {
-      const data = await api("GET", "/api/flywheel");
-      ui.enabled = !!data.enabled;
-      ui.summaries = new Map((data.folders || []).map((s) => [s.folder, s]));
-      for (const [folder, s] of ui.summaries) prune(folder, s);
+      const data = await api("GET", `${ctx.machinePrefix(machine)}/api/flywheel`);
+      if (!machine) ui.enabled = !!data.enabled;
+      for (const key of [...ui.summaries.keys()]) {
+        if (machineOfKey(key) === (machine || null)) ui.summaries.delete(key);
+      }
+      for (const s of data.folders || []) {
+        const kept = keyed(machine, s);
+        ui.summaries.set(kept.folder, kept);
+        prune(kept.folder, kept);
+      }
     } catch (_) {
       return;
     }
     changed();
-    if (ui.folder) loadPanel();
+    if (ui.folder && machineOfKey(ui.folder) === (machine || null)) loadPanel();
   }
 
-  function onEvent(message) {
+  const reload = () => reloadMachine(null);
+
+  function onEvent(message, machine) {
     if (message.type === "flywheel_reset") {
-      reload();
+      reloadMachine(machine || null);
       return;
     }
-    ui.enabled = true;
+    if (!machine) ui.enabled = true;
+    const key = keyOf(machine, message.folder);
     if (message.summary) {
-      ui.summaries.set(message.folder, message.summary);
-      prune(message.folder, message.summary);
+      const kept = keyed(machine, message.summary);
+      ui.summaries.set(key, kept);
+      prune(key, kept);
     } else {
-      ui.summaries.delete(message.folder);
+      ui.summaries.delete(key);
     }
     changed();
-    if (ui.folder === message.folder) {
+    if (ui.folder === key) {
       if (message.summary) loadPanel();
       else renderDrawer();
     }
@@ -109,7 +134,10 @@ window.FwHubFlywheel = function (ctx) {
     ui.loading = !ui.panel || ui.panel.folder !== folder;
     if (ui.loading) renderDrawer();
     try {
-      const panel = await api("GET", `/api/flywheel/panel?folder=${encodeURIComponent(folder)}`);
+      const panel = keyed(
+        machineOfKey(folder),
+        await api("GET", `${via(folder)}/api/flywheel/panel?folder=${encodeURIComponent(pathOf(folder))}`),
+      );
       if (seq !== ui.seq || ui.folder !== folder) return;
       const same = ui.panel && ui.panel.folder === folder && !ui.error && content(ui.panel) === content(panel);
       ui.panel = panel;
@@ -212,17 +240,21 @@ window.FwHubFlywheel = function (ctx) {
     if (!session) return null;
     const cwd = session.cwd || "";
     let best = null;
-    for (const folder of ui.summaries.keys()) {
-      if ((cwd === folder || cwd.startsWith(`${folder}/`)) && (!best || folder.length > best.length)) best = folder;
+    for (const key of ui.summaries.keys()) {
+      if (!sameMachine(session, key)) continue;
+      const folder = pathOf(key);
+      if ((cwd === folder || cwd.startsWith(`${folder}/`)) && (!best || key.length > best.length)) best = key;
     }
-    if (!best && session.worktree && ui.summaries.has(session.worktree.repo)) best = session.worktree.repo;
+    const base = session.worktree ? keyOf(session.machine, session.worktree.repo) : null;
+    if (!best && base && ui.summaries.has(base)) best = base;
     return best;
   }
 
   // Whether `session` reaches `folder`'s panel only through its worktree's
   // base folder (not by running in it).
-  function viaWorktree(session, folder) {
-    if (!session || !session.worktree || session.worktree.repo !== folder) return false;
+  function viaWorktree(session, key) {
+    const folder = pathOf(key);
+    if (!session || !sameMachine(session, key) || !session.worktree || session.worktree.repo !== folder) return false;
     const cwd = session.cwd || "";
     return cwd !== folder && !cwd.startsWith(`${folder}/`);
   }
@@ -243,24 +275,35 @@ window.FwHubFlywheel = function (ctx) {
 
   // Hub sessions running a worker in `folder` (started from this panel;
   // one restored after a hub restart is a plain shell).
-  function workerSessions(folder) {
+  function workerSessions(key) {
+    const folder = pathOf(key);
     return state.sessions.filter((s) =>
-      s.cwd === folder && s.live && s.live.pid && s.state === "running" && !s.fallback_command &&
+      sameMachine(s, key) && s.cwd === folder && s.live && s.live.pid && s.state === "running" && !s.fallback_command &&
       Array.isArray(s.command) && s.command[3] === "fw-worker");
   }
 
-  function workspaceFor(folder) {
+  function workspaceFor(key) {
+    const folder = pathOf(key);
+    const here = (w) => sameMachine(w, key) && w.folders.some((f) => f.path === folder);
     const preferred = ui.workspaceId && workspaceById(ui.workspaceId);
-    if (preferred && preferred.folders.some((f) => f.path === folder)) return preferred;
-    return state.workspaces.find((w) => w.folders.some((f) => f.path === folder)) || null;
+    if (preferred && here(preferred)) return preferred;
+    return state.workspaces.find(here) || null;
   }
 
-  function labelFor(folder) {
+  // A folder's label; another machine's says which.
+  function labelFor(key) {
+    const folder = pathOf(key);
+    const machine = machineOfKey(key);
+    let label = folder.split("/").filter(Boolean).pop() || folder;
     for (const w of state.workspaces) {
+      if (!sameMachine(w, key)) continue;
       const f = w.folders.find((x) => x.path === folder);
-      if (f) return folderLabel(f);
+      if (f) {
+        label = folderLabel(f);
+        break;
+      }
     }
-    return folder.split("/").filter(Boolean).pop() || folder;
+    return machine ? `${label} (${machine})` : label;
   }
 
   // --- sidebar: folder chips --------------------------------------------
@@ -268,12 +311,13 @@ window.FwHubFlywheel = function (ctx) {
   // `node` is the plain folder chip; an adopted folder's becomes a button
   // that opens its panel, with a verified / total count and a tone dot.
   function folderChip(folder, node, workspaceId) {
-    const s = summary(folder.path);
+    const key = keyOf((workspaceById(workspaceId) || {}).machine, folder.path);
+    const s = summary(key);
     if (!s) return node;
     const count = total(s);
     const verified = s.counts.verified || 0;
     const t = tone(s);
-    const fresh = unseen(folder.path, s).length;
+    const fresh = unseen(key, s).length;
     const why = fresh
       ? `${fresh} need${fresh === 1 ? "s" : ""} you`
       : s.live_runs ? `${s.live_runs} running` : s.worker_live ? "worker live" : "idle";
@@ -283,12 +327,12 @@ window.FwHubFlywheel = function (ctx) {
       "button",
       {
         type: "button",
-        className: `fw-chip ${t}${ui.folder === folder.path ? " open" : ""}`,
+        className: `fw-chip ${t}${ui.folder === key ? " open" : ""}`,
         title: `${node.title}\nflywheel: ${tasks}, ${why}.${wt} Open the Flywheel panel.`,
         "aria-label": `${folderLabel(folder)}: Flywheel panel (${tasks}, ${why})${s.worktree_of ? ", linked worktree" : ""}`,
         onclick: (event) => {
           event.stopPropagation();
-          open(folder.path, workspaceId);
+          open(key, workspaceId);
         },
       },
       node,
@@ -471,7 +515,9 @@ window.FwHubFlywheel = function (ctx) {
     }
     try {
       const request = { folder, workspace_id: workspace.id, another };
-      let out = await post("/api/flywheel/worker", request);
+      const workerPath = `${via(folder)}/api/flywheel/worker`;
+      request.folder = pathOf(folder);
+      let out = await post(workerPath, request);
       if (out.status === 409 && out.data && out.data.running) {
         const running = out.data.running;
         const ok = await confirmDialog({
@@ -485,7 +531,7 @@ window.FwHubFlywheel = function (ctx) {
           openSession(running.id);
           return;
         }
-        out = await post("/api/flywheel/worker", { ...request, another: true });
+        out = await post(workerPath, { ...request, another: true });
       }
       if (!out.ok) throw new Error((out.data && out.data.error) || `HTTP ${out.status}`);
       const view = out.data;
@@ -648,8 +694,8 @@ window.FwHubFlywheel = function (ctx) {
     $("#fw-title").textContent = labelFor(folder);
     // The LRMs keep the path's slashes in place under the start-ellipsis
     // (direction: rtl) styling, as the header's cwd meter does.
-    $("#fw-path").textContent = `\u200e${folder}\u200e`;
-    $("#fw-path").title = folder;
+    $("#fw-path").textContent = `\u200e${pathOf(folder)}\u200e`;
+    $("#fw-path").title = machineOfKey(folder) ? `${pathOf(folder)} on ${machineOfKey(folder)}` : folder;
     const workers = workerSessions(folder);
     const body = $("#fw-body");
     if (!panel) {
@@ -807,7 +853,7 @@ window.FwHubFlywheel = function (ctx) {
     try {
       const out = await api(
         "GET",
-        `/api/flywheel/run?folder=${encodeURIComponent(run.folder)}&run=${encodeURIComponent(run.runId)}&since=${run.next}`,
+        `${via(run.folder)}/api/flywheel/run?folder=${encodeURIComponent(pathOf(run.folder))}&run=${encodeURIComponent(run.runId)}&since=${run.next}`,
       );
       if (ui.run !== run || seq !== run.seq) return;
       const restart = out.from > run.next || run.next === 0;
@@ -951,6 +997,7 @@ window.FwHubFlywheel = function (ctx) {
 
   return {
     reload,
+    reloadMachine,
     onEvent,
     folderChip,
     attention,

@@ -58,6 +58,7 @@ mod import_api;
 mod listen;
 mod notify_api;
 mod pwa;
+mod review_api;
 mod worktree_api;
 
 use crate::auth::{
@@ -135,6 +136,8 @@ pub struct ServerOptions {
     /// The Flywheel panel's monitor (`/api/flywheel*` and the events
     /// socket's `flywheel` messages); `None` turns the panel off.
     pub flywheel: Option<Arc<crate::flywheel::FlywheelMonitor>>,
+    /// The `git` and `gh` the review endpoints run.
+    pub review_tools: crate::review::Tools,
 }
 
 #[derive(Clone)]
@@ -205,6 +208,14 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             get(worktree_api::worktree_info),
         )
         .route("/api/worktrees/plan", get(worktree_api::plan))
+        .route("/api/sessions/{id}/review", get(review_api::review))
+        .route("/api/sessions/{id}/review/diff", get(review_api::diff))
+        .route("/api/sessions/{id}/review/commit", post(review_api::commit))
+        .route("/api/sessions/{id}/review/push", post(review_api::push))
+        .route("/api/sessions/{id}/review/pr", post(review_api::pr))
+        .route("/api/sessions/{id}/review/rebase", post(review_api::rebase))
+        .route("/api/sessions/{id}/review/merge", post(review_api::merge))
+        .route("/api/sessions/{id}/review/ask", post(review_api::ask))
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/login-codes", post(mint_login_code))
         .route("/api/token/rotate", post(rotate_token))

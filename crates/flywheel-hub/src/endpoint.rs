@@ -1,5 +1,6 @@
 //! The one hub client: every `fw hub` verb that talks to a running hub
 //! (`ls`, `new`, `send`, `read`, `kill`, `relaunch`, `import`, `commands`,
+//! `review`, `merge`,
 //! `open`, `url`, `token --rotate`, `status`, `wait`, `attach`) resolves
 //! it here and speaks to it through [`Endpoint`].
 //!

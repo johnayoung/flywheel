@@ -22,7 +22,7 @@ fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]  
 # start/serve also take --handoff (take over from the running hub; --bind/--port ignored)
 # SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--no-flywheel] [--import-root DIR] [--notify-url URL] [--worktree-branch-prefix P]
 # every verb but report (hooks only) takes --state-dir DIR
-# ls/new/send/read/wait/attach/kill/relaunch/commands/open/url also take [--url URL] [--token T]: a hub elsewhere
+# ls/new/send/read/wait/attach/kill/relaunch/commands/review/merge/open/url also take [--url URL] [--token T]: a hub elsewhere
 #   (token: prefer FW_HUB_TOKEN; without one, the state dir's token goes only to that state dir's running hub)
 ```
 
@@ -38,6 +38,8 @@ fw hub attach [SESSION] [--prefix C-b] [--no-status]      # this terminal on a s
 fw hub kill SESSION [--rm [--remove-worktree [--force]]]   # hang up (record kept, as exited); --rm also forgets it; see Worktrees
 fw hub relaunch SESSION                                    # start an exited/stopped session again in place
 fw hub import FILE.code-workspace... [--name N] [--update] [--json]   # VS Code multi-root workspaces -> workspaces
+fw hub review SESSION [--base REF] [--json] [--diff PATH [--scope committed|staged|unstaged|untracked]]   # see Review
+fw hub merge SESSION [--yes] [--rebase] [--remove-worktree] [--json]   # ff the base onto a worktree branch in the main checkout
 ```
 
 `import` reads VS Code workspace files (JSONC: comments, trailing commas): each `folders` entry's `path` (relative to the file's directory, absolute, or `~/`) or `file://` `uri` (and, on WSL, `vscode-remote://wsl+<this distro>/...`) becomes a folder, its `name` the folder's label. The workspace is named after the file (`personal.code-workspace` -> `personal`) unless `--name` (one file only). Missing folders and entries naming no local directory (other remotes, Windows paths) are listed as skipped (stderr summarizes); a file with nothing importable fails. An existing workspace of that name is refused unless `--update`, which replaces its folders and labels (refused when that drops a folder a running session is in). Every file is tried; exit 1 if any failed.
@@ -173,6 +175,21 @@ detail = false                 # names only: leave out what a blocked agent asks
 - **Companion shell**: an agent's linked shell in its directory (worktree included), `companion_of: <agent id>`, listed right after it. Created on demand (`Alt \``, the drawer's Open shell, `POST /api/sessions/{id}/companion`); an ended one is relaunched in place, so there is one per agent. Closing the agent closes it too. Suggested-command Send targets it by default. The header's `shell` / `agent` pill flips between them (for phones); `ls` marks it `(companion of AGENT)`.
 - **Readiness** before pasting into a new companion: bracketed paste enabled (bash 5.1+, zsh), else output then 500 ms quiet, else after 5 s anyway (typed ahead; `ready: "timeout"`).
 
+## Review
+
+Any session in a git folder (worktree sessions, their companions, plain sessions in a repo) can be reviewed from the browser, a phone, or the CLI: header pill `review` / `Alt G` / palette. Desktop: a drawer over the terminal (never resizes the PTY); phones: a full-screen sheet.
+
+- **Base**: a worktree's base; else the branch's upstream; `?base=` / `--base` overrides (refused if it starts with `-`).
+- **Shows**: commits on HEAD the base lacks (newest 200; `ahead`/`behind`), committed files vs the merge base with +/- (renames, binary), and the working tree apart: conflicts, staged, unstaged, untracked; upstream sync, remotes (credentials masked), an operation in progress.
+- **Diffs**: per file, lazily, unified or side by side (desktop >= 1000 px; phones unified), light syntax colouring; binary files and changes over 400 lines start collapsed; 2000 lines per page with Load more; at most 8 MiB read per file. Re-read when the session's git badge changes.
+- **Actions** -- each a dry run first showing the exact commands (and where they run), what they touch, and why not; running needs that plan's `fingerprint`, and a repository that moved since is refused (409, re-plan):
+  - **Commit all**: `git add -A` then `git commit -F -` (message on stdin; hooks run). "Ask the agent" pastes a prompt (shown first) into the session's agent asking for a message in a `text` block; the first new block fills the editor.
+  - **Push**: `git push [-u] <remote> refs/heads/B:<dest>`: push remote, `remote.pushDefault`, upstream's, `origin`, else the only one. Never forced; a diverged remote is git's refusal, shown.
+  - **Open PR**: `gh pr create --base --head --title --body-file -` from the pushed branch. Refused when not pushed / out of sync, the remote has no host, or `gh` is not installed or not signed in for that host (`gh auth status --hostname`).
+  - **Rebase onto base** (worktrees): `git rebase <base>` in the worktree; refused with uncommitted changes. A conflict stops it there, left in progress; the agent can be asked to resolve and `--continue`.
+  - **Merge into base** (worktrees): `git -C <main checkout> merge --ff-only refs/heads/B`. Refused when the main checkout is not on the base, has uncommitted tracked changes or an operation in progress, the base is a commit, or it is not a fast-forward (`needs_rebase`: rebase first). Then offers removing the worktree (the usual close dialog: nothing lost, merged branch deleted).
+- **Runner**: argv only, no shell; own session (no terminal: nothing prompts), `GIT_TERMINAL_PROMPT=0`, editors `true`; output capped; deadlines (reads 20 s, commit/push 5 min, rebase/merge 2 min, gh 60 s) kill the process group; at most 4 git/gh at once hub-wide; one action per repository at a time. Every action and ask is logged to the hub log (commands, not messages).
+
 ## Layout: tabs and split panes
 
 Each workspace has a **layout**: named tabs, each a tree of splits (side by side or stacked, any ratio) whose leaves are panes showing one session. Stored on the hub (`state.json`, per workspace, revisioned), shared by every browser; which tab is active, the focused pane, and zoom are per browser.
@@ -278,6 +295,10 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}` (unknown en
 | GET / PATCH / DELETE | `/sessions/{id}` | PATCH `{"name"}` renames; DELETE kills and forgets (204); `?remove_worktree=true[&force=true]` also removes companions + worktree: 200 `{"removed":[ids],"worktree":{"path","branch","branch_deleted"}}`, 409 with why when refused |
 | GET | `/sessions/{id}/worktree` | `{"worktree","path","branch","base","missing","dirty","untracked","unmerged","refusal","companions","blocking"}` (runs git) |
 | POST | `/sessions/{id}/companion` | `{"cols"?,"rows"?,"text"?,"run"?}`: the agent's companion shell (201 started now, 200 running); with `text` also pastes (as `/paste`) once ready: `{"session","created","ready":"running\|bracketed\|quiet\|timeout","paste"}` |
+| GET | `/sessions/{id}/review[?base=]` | `{"session_id","session","agent","mergeable","dir","worktree","branch","head","base":{"name","source","sha","merge_base","is_branch"},"ahead","behind","upstream","remotes","commits","committed","staged","unstaged","untracked","conflicts","operation"}`; a set is `{"files":[{"path","old_path"?,"status","insertions","deletions","binary"}],"insertions","deletions","truncated"}` |
+| GET | `/sessions/{id}/review/diff?scope=committed\|staged\|unstaged\|untracked&path=[&old_path=&offset=&base=]` | `{"path","scope","binary","lines","offset","next","total_lines","truncated"}` |
+| POST | `/sessions/{id}/review/{commit,push,pr,rebase,merge}` | `{"dry_run":true,...}` -> plan `{"action","summary","details","warnings","commands":[{"dir","program","args","display"}],"fingerprint","refusal","needs_rebase","defaults"?}`; `{"confirm":fingerprint,...}` runs -> `{"ok","summary","ran":[{"display","code","output"}],"conflicts","url"?,"head","worktree"?}`; 409 refused/stale/failed. Bodies: commit `message`; push `remote`; pr `title`,`body`,`base`,`draft` |
+| POST | `/sessions/{id}/review/ask` | `{"kind":"commit_message\|resolve_conflicts","dry_run"?}` -> `{"agent","prompt","paste"?}` |
 | GET | `/worktrees/plan?folder=&task=&base=` | `{"dir","default_base","branches","plan":{"path","branch","base"}\|null,"error"}` (the form checks as you type) |
 | POST | `/sessions/{id}/kill` | 202: SIGHUP the session (SIGKILL after 3s); record kept. 409 when nothing is left to kill |
 | POST | `/sessions/{id}/relaunch` | relaunch an ended (`exited`/`stopped`) session in place: same id, name, command, folder; fresh PTY + scrollback. Body `{"cols"?,"rows"?}`. 409 while it runs. `/restart` is its old name |
@@ -331,6 +352,7 @@ Sidebar: workspaces (collapsible, with an agent rollup chip: blocked / working /
 | `Alt C` / `Alt Shift C` | Commands drawer / copy the last suggested shell command |
 | ``Alt ` `` | flip between an agent and its companion shell (opened on first use) |
 | `Alt F` | Flywheel panel of the attached session's folder |
+| `Alt G` | Review of the attached session (git) |
 
 The **Commands drawer** (`suggested` in the header, `Alt C`, or the palette; it overlays the terminal so opening it never resizes the PTY for other viewers) lists the attached agent's code blocks newest first (from a shell session: the workspace's agent that suggested last, or the one picked), unwrapped in monospace, each with Copy (the clipboard API on https/localhost, a selected-textarea fallback on plain-http LAN and iOS Safari), Send (paste into the chosen running shell of the workspace, no Enter) and Send + Run. "send to" defaults to the agent's companion shell, else the attached shell, else a shell in the agent's directory; with none, it is "new shell (companion)" and the buttons read Open shell & send / Open shell & run (start the companion, wait for its prompt, paste). A line under the pickers says where Send goes. Keys in the drawer: arrows / `j` `k` pick, `Enter` or `c` copy, `1`-`9` copy the nth, `s` Send, `Shift S` Send + Run, `Esc` close. Lines wider than the card fade at the edge with a `wide: scroll` hint. A new shell command from an agent in the workspace in view raises a toast with Copy. The header badge counts the drawer's source only: the attached agent's own unseen blocks (from a shell, the agent that suggested last, named beside the count).
 

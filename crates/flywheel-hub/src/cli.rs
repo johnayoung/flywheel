@@ -99,6 +99,16 @@ enum HubCommand {
     /// written (shell commands unless --all), newest first; or copy the
     /// newest with OSC 52.
     Commands(crate::commands_cli::CommandsArgs),
+    /// A session's git work: its branch against its base (commits,
+    /// changed files with +/- counts), and staged, unstaged, and untracked
+    /// changes apart; --diff PATH prints one file's diff.
+    Review(crate::review_cli::ReviewArgs),
+    /// Fast-forward a worktree session's base onto its branch in the main
+    /// checkout (git merge --ff-only), after printing exactly what runs.
+    /// Refused when the main checkout is not on the base or has
+    /// uncommitted changes, or the branch is not a fast-forward (--rebase
+    /// rebases it onto the base first).
+    Merge(crate::review_cli::MergeArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -367,6 +377,8 @@ pub fn run_with(
         HubCommand::Url(args) => url_cmd(&args, out, err),
         HubCommand::Serve(args) => serve_cmd(args, out, err, extensions),
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),
+        HubCommand::Review(args) => crate::review_cli::review(&args, out, err),
+        HubCommand::Merge(args) => crate::review_cli::merge(&args, out, err),
         // Routed before parsing (see `report_main`); reached only via help.
         HubCommand::Report(_) => 0,
         HubCommand::Start(args) => lifecycle::start(&args, out, err),
@@ -1079,6 +1091,7 @@ fn serve_cmd(
         trusted_proxies: hub_args.trusted_proxies,
         notifier,
         flywheel,
+        review_tools: crate::review::Tools::default(),
     };
     let state_dir = hub.state_dir().to_path_buf();
     let result = runtime.block_on(serve_gated(

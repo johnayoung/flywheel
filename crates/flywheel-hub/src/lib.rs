@@ -31,6 +31,8 @@ pub mod pty;
 pub mod remote;
 pub mod report;
 pub mod restore;
+pub mod review;
+pub mod review_cli;
 pub mod script;
 pub mod server;
 pub mod state;

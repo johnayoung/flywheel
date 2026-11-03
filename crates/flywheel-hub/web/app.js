@@ -294,6 +294,7 @@
     rerender: () => render(),
     onOpen: () => {
       if (commands.isOpen()) commands.toggle();
+      review.close();
     },
     focusTerminal: () => focusTerminal(),
   });
@@ -313,6 +314,21 @@
   // Sibling worktrees (worktree.js): the new-session fields, row badges,
   // and the keep / remove close dialog.
   const worktrees = window.FwHubWorktree({ $, el, icon, api });
+  // Review (review.js): a session's commits, diffs, and the guarded
+  // commit / push / PR / rebase / merge actions.
+  const review = window.FwHubReview({
+    $, el, icon, api, state, sessionById, age, MOD,
+    toast: commands.toast,
+    copyText: (text) => commands.copyText(text),
+    confirmDialog: (options) => confirmDialog(options),
+    closeSession: (id) => closeSession(id),
+    refresh: () => refresh(),
+    focusTerminal: () => focusTerminal(),
+    onOpen: () => {
+      if (commands.isOpen()) commands.toggle();
+      flywheel.close();
+    },
+  });
 
   // `force` re-renders even when nothing changed. The periodic refresh
   // passes false and also holds off while a sidebar field has focus, so a
@@ -2302,7 +2318,7 @@
   // palette, a menu, the Commands drawer, the Flywheel panel, Compose.
   function overlayOpen() {
     return !!document.querySelector("dialog[open]") || paletteOpen() || !!$("#ctx-menu") ||
-      commands.isOpen() || flywheel.isOpen() || !$("#compose").hidden;
+      commands.isOpen() || flywheel.isOpen() || review.isOpen() || !$("#compose").hidden;
   }
 
   // Whether focus may move to the terminal by itself (an attach, a stage
@@ -2678,6 +2694,7 @@
     commands.render();
     commands.prefetch();
     flywheel.render();
+    review.render();
     mobile.render();
 
     const actions = $("#empty-actions");
@@ -3299,6 +3316,7 @@
     }, "gear");
     commands.paletteItems(cmd);
     flywheel.paletteItems(cmd);
+    review.paletteItems(cmd);
     mobile.paletteItems(cmd);
     notify.paletteItems(cmd);
     for (const workspace of state.workspaces) {
@@ -3592,11 +3610,16 @@
         closeSession(state.attached);
       } else if (event.code === "KeyC") {
         if (event.shiftKey) commands.copyLast();
-        else commands.toggle();
+        else {
+          review.close();
+          commands.toggle();
+        }
       } else if (event.code === "Backquote" && !event.shiftKey && state.attached) {
         commands.flipCompanion();
       } else if (event.code === "KeyF" && !event.shiftKey) {
         flywheel.togglePill();
+      } else if (event.code === "KeyG" && !event.shiftKey) {
+        review.togglePill();
       } else if (event.code === "Backslash" && !event.shiftKey && (IS_MAC || event.key === "\\")) {
         splitWithShell(focusedPane(), "right");
       } else if (event.code === "Minus" && !event.shiftKey && (IS_MAC || event.key === "-")) {
@@ -3640,9 +3663,13 @@
     "cycle-theme": () => applyTheme(THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]),
     logout,
     "toggle-sidebar": () => document.body.classList.toggle("side-open"),
-    "toggle-commands": () => commands.toggle(),
+    "toggle-commands": () => {
+      review.close();
+      commands.toggle();
+    },
     "flip-companion": () => commands.flipCompanion(),
     "toggle-flywheel": () => flywheel.togglePill(),
+    "toggle-review": () => review.togglePill(),
   };
   document.addEventListener("click", (event) => {
     const target = event.target.closest("[data-action]");

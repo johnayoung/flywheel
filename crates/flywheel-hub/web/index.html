@@ -104,6 +104,7 @@
         <span id="meter-viewers" class="meter"></span>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
         <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
+        <button type="button" id="rv-toggle" class="cmd-pill rv-pill" data-action="toggle-review" aria-pressed="false" aria-controls="review" hidden><svg><use href="#i-branch"/></svg>review<b id="rv-count" hidden></b></button>
         <button type="button" id="fw-toggle" class="cmd-pill fw-pill" data-action="toggle-flywheel" aria-pressed="false" aria-controls="flywheel" hidden><svg><use href="#i-wheel"/></svg>flywheel<b id="fw-count" hidden></b></button>
         <span id="prefix-pill" class="prefix-pill" hidden title="Pane prefix: press a key (% &quot; arrows z x c n p 1-9 , &amp; ?), Esc to cancel">ctrl b</span>
         <span id="link" class="link-pill" data-link="idle">idle</span>
@@ -146,6 +147,22 @@
           <button type="button" class="icon" id="fw-close" title="Close (Esc)" aria-label="Close the Flywheel panel"><svg><use href="#i-x"/></svg></button>
         </header>
         <div id="fw-body" class="fw-body"></div>
+      </aside>
+      <aside id="review" class="commands rv-drawer" hidden tabindex="-1" aria-label="Review">
+        <header class="cmd-head">
+          <div class="cmd-title">
+            <span class="sheet-kicker">review</span>
+            <h2 id="rv-title"></h2>
+            <span id="rv-where" class="rv-where"></span>
+          </div>
+          <div class="rv-head-actions">
+            <button type="button" class="icon" id="rv-refresh" title="Read again" aria-label="Read the review again"><svg><use href="#i-redo"/></svg></button>
+            <button type="button" class="icon" id="rv-close" title="Close (Esc)" aria-label="Close the review"><svg><use href="#i-x"/></svg></button>
+          </div>
+        </header>
+        <nav id="rv-tabs" class="rv-tabs" role="tablist" aria-label="Review"></nav>
+        <div id="rv-body" class="rv-body"></div>
+        <footer id="rv-actions" class="rv-actions" aria-label="Actions"></footer>
       </aside>
       <div id="empty" class="empty">
         <section id="empty-attention" class="attention empty-attention" hidden aria-label="Agents that need you"></section>
@@ -310,6 +327,20 @@
   </form>
 </dialog>
 
+<dialog id="dlg-review" class="sheet rv-sheet" aria-labelledby="rva-title">
+  <form method="dialog">
+    <header class="sheet-head">
+      <span class="sheet-kicker" id="rva-kicker">review</span>
+      <h2 id="rva-title"></h2>
+    </header>
+    <div id="rva-body" class="rva-body"></div>
+    <footer class="sheet-foot">
+      <button type="submit" class="slab ghost" value="cancel">Cancel</button>
+      <button type="button" class="slab" id="rva-ok">Confirm</button>
+    </footer>
+  </form>
+</dialog>
+
 <dialog id="dlg-run" class="sheet fw-run-sheet" aria-labelledby="run-title">
   <header class="sheet-head run-head">
     <div>
@@ -343,6 +374,7 @@
       <div><dt><kbd>Alt</kbd><kbd>W</kbd></dt><dd>close the attached session</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>C</kbd></dt><dd>show / hide suggested commands</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>C</kbd></dt><dd>copy the last suggested shell command</dd></div>
+      <div><dt><kbd>Alt</kbd><kbd>G</kbd></dt><dd>review the attached session's git work: commits, diffs, commit / push / PR / merge</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>F</kbd></dt><dd>Flywheel panel of the attached session's folder</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>`</kbd></dt><dd>flip between an agent and its companion shell (opened on first use)</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>\</kbd> / <kbd>Alt</kbd><kbd>-</kbd></dt><dd>split the focused pane right / down (a new shell; an agent's companion first)</dd></div>
@@ -385,6 +417,7 @@
 <script src="/assets/notify.js"></script>
 <script src="/assets/mobile.js"></script>
 <script src="/assets/worktree.js"></script>
+<script src="/assets/review.js"></script>
 <script src="/assets/layout.js"></script>
 <script src="/assets/panes.js"></script>
 <script src="/assets/app.js"></script>

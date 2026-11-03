@@ -30,6 +30,9 @@ window.FwHubCommands = function (ctx) {
   };
 
   const { isAgent } = ctx;
+  // Shortcut hints follow the keymap ("" when unbound).
+  const withKey = (text, id) => window.FwHubFmt.withKey(text, ctx.keyOf(id));
+  const flipKey = () => ctx.keyOf("companion.flip");
   // A shell: a shell session, or an agent restored as a fallback shell.
   const runsShell = (s) => s.kind === "shell" || Array.isArray(s.fallback_command);
   const isRunning = (s) => s && s.live && s.live.pid && s.state === "running";
@@ -132,7 +135,7 @@ window.FwHubCommands = function (ctx) {
       setTimeout(() => node.remove(), 180);
     };
     node.addEventListener("click", (event) => {
-      if (event.target.closest("button")) setTimeout(dismiss, 0);
+      if (event.target.closest("button, a")) setTimeout(dismiss, 0);
     });
     root.append(node);
     while (root.children.length > 3) root.firstElementChild.remove();
@@ -146,7 +149,12 @@ window.FwHubCommands = function (ctx) {
         // No popover support: toasts stay in the page.
       }
     }
-    if (timeout) setTimeout(dismiss, timeout);
+    // A phone's open sessions drawer hides the toasts (they would cover
+    // its footer): the clock waits until it closes, so none goes unseen.
+    const hiddenNow = () =>
+      document.body.classList.contains("side-open") && window.matchMedia("(max-width: 760px)").matches;
+    const later = () => (hiddenNow() ? setTimeout(later, 1000) : setTimeout(dismiss, timeout));
+    if (timeout) later();
     return node;
   }
 
@@ -211,15 +219,22 @@ window.FwHubCommands = function (ctx) {
     return list[0].timestamp || "";
   }
 
-  // The attached agent session; else the user's pick; else the agent in
-  // this workspace that suggested something most recently.
+  // The attached agent session; else the user's pick; else (a companion
+  // shell) its own agent; else the agent working in the attached shell's
+  // directory that suggested something most recently; else the one in this
+  // workspace that did. A shell's default never comes from an agent in
+  // another directory (another worktree) while one works here.
   function currentSource() {
     const attached = attachedSession();
     if (isAgent(attached)) return attached;
     const pool = sources();
     const picked = pool.find((s) => s.id === ui.source);
     if (picked) return picked;
-    return pool.slice().sort((a, b) => (newestSeqTime(b.id) > newestSeqTime(a.id) ? 1 : -1))[0] || null;
+    const own = attached && attached.companion_of ? pool.find((s) => s.id === attached.companion_of) : null;
+    if (own) return own;
+    const newest = (list) => list.slice().sort((a, b) => (newestSeqTime(b.id) > newestSeqTime(a.id) ? 1 : -1))[0] || null;
+    const here = attached ? pool.filter((s) => s.cwd === attached.cwd) : [];
+    return newest(here) || newest(pool);
   }
 
   // Running shells of the source's workspace.
@@ -258,7 +273,7 @@ window.FwHubCommands = function (ctx) {
         : "";
     }
     if (target.open) {
-      return `No shell runs in ${placeOf(target.open)} yet. Open shell starts ${target.open.name}'s companion shell there, waits for its prompt, then pastes (Run also presses Enter). ${ctx.MOD} \` flips between them.`;
+      return `No shell runs in ${placeOf(target.open)} yet. Open shell starts ${target.open.name}'s companion shell there, waits for its prompt, then pastes (Run also presses Enter).${flipKey() ? ` ${flipKey()} flips between them.` : ""}`;
     }
     const where = target.session.cwd ? ` in ${placeOf(target.session)}` : "";
     const own = source && target.session.companion_of === source.id ? ` (${source.name}'s companion)` : "";
@@ -336,7 +351,7 @@ window.FwHubCommands = function (ctx) {
       return;
     }
     if (!isAgent(attached)) {
-      toast(`${ctx.MOD} \` flips between an agent session and its companion shell; ${attached.name} is a shell.`, { timeout: 3000 });
+      toast(`${flipKey() || "The companion flip"} flips between an agent session and its companion shell; ${attached.name} is a shell.`, { timeout: 3000 });
       return;
     }
     const running = companionOf(attached);
@@ -464,8 +479,8 @@ window.FwHubCommands = function (ctx) {
       : []));
     count.hidden = !unseen;
     $("#cmd-toggle").title = unseen
-      ? `Suggested commands: ${unseen} new from ${source.name} (${ctx.MOD} C)`
-      : `Suggested commands (${ctx.MOD} C)`;
+      ? withKey(`Suggested commands: ${unseen} new from ${source.name}`, "commands.toggle")
+      : withKey("Suggested commands", "commands.toggle");
     $("#cmd-toggle").setAttribute("aria-pressed", String(ui.open));
     if (!ui.open) return;
 
@@ -758,16 +773,16 @@ window.FwHubCommands = function (ctx) {
 
   function paletteItems(cmd) {
     const source = currentSource();
-    cmd(ui.open ? "Hide suggested commands" : "Show suggested commands", `${ctx.MOD} C`, toggle, "copy");
+    cmd(ui.open ? "Hide suggested commands" : "Show suggested commands", ctx.keyOf("commands.toggle"), toggle, "copy");
     if (source) {
-      cmd(`Copy last command from ${source.name}`, `${ctx.MOD} Shift C`, copyLast, "copy");
+      cmd(`Copy last command from ${source.name}`, ctx.keyOf("commands.copy_last"), copyLast, "copy");
     }
     const attached = attachedSession();
     if (attached && attached.companion_of && sessionById(attached.companion_of)) {
-      cmd(`Back to agent ${sessionById(attached.companion_of).name}`, `${ctx.MOD} \``, flipCompanion, "claude");
+      cmd(`Back to agent ${sessionById(attached.companion_of).name}`, flipKey(), flipCompanion, "claude");
     } else if (isAgent(attached)) {
       const running = companionOf(attached);
-      cmd(running ? `Companion shell of ${attached.name}` : `Open a companion shell for ${attached.name}`, `${ctx.MOD} \``, flipCompanion, "shell");
+      cmd(running ? `Companion shell of ${attached.name}` : `Open a companion shell for ${attached.name}`, flipKey(), flipCompanion, "shell");
     }
   }
 

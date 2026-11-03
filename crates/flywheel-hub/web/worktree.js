@@ -27,7 +27,7 @@ window.FwHubWorktree = function (ctx) {
     blocked: false, // the last check found the worktree cannot be cut
   };
 
-  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const { plural } = window.FwHubFmt;
 
   function setNote(text, tone) {
     note.textContent = text || "";

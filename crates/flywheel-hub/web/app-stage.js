@@ -268,14 +268,14 @@ function renderPaneHead(pane) {
     el(
       "span",
       { className: "pane-tools" },
-      splitTool(iconButton("split-right", `Split right: new shell (${MOD} \\)`, () => splitWithShell(pane, "right"))),
-      splitTool(iconButton("split-down", `Split down: new shell (${MOD} -)`, () => splitWithShell(pane, "down"))),
-      iconButton(zoomed ? "unzoom" : "zoom", zoomed ? `Unzoom (${MOD} Z)` : `Zoom (${MOD} Z)`, () => toggleZoom(pane.id)),
+      splitTool(iconButton("split-right", withKey("Split right: new shell", "pane.split_right"), () => splitWithShell(pane, "right"))),
+      splitTool(iconButton("split-down", withKey("Split down: new shell", "pane.split_down"), () => splitWithShell(pane, "down"))),
+      iconButton(zoomed ? "unzoom" : "zoom", withKey(zoomed ? "Unzoom" : "Zoom", "pane.zoom"), () => toggleZoom(pane.id)),
       iconButton("dots", "Pane menu", (event) => {
         const box = event.currentTarget.getBoundingClientRect();
         paneMenu(pane, box.left, box.bottom + 2);
       }),
-      iconButton("x", `Close pane: the session keeps running (${MOD} X)`, () => closePane(pane.id)),
+      iconButton("x", withKey("Close pane: the session keeps running", "pane.close"), () => closePane(pane.id)),
     ),
   ].filter(Boolean));
 }

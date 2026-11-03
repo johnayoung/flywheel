@@ -323,15 +323,20 @@ const favicon = {
 };
 
 // Blocked and done agents (optionally all but one session).
+// What needs you elsewhere, counted as Needs you lists it: a fan-out's
+// finished candidates are one item, its row (until its board is opened),
+// not one per candidate.
 function attentionCounts(except) {
   let blocked = 0;
   let done = 0;
+  const graded = fanout.candidateSessions();
   for (const session of state.sessions) {
     if (session.id === except) continue;
     const agent = agentStatus(session);
     if (agent && agent.status === "blocked") blocked += 1;
-    if (agent && agent.status === "done") done += 1;
+    if (agent && agent.status === "done" && !graded.has(session.id)) done += 1;
   }
+  done += fanout.attention().length;
   return { blocked, done };
 }
 

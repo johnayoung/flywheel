@@ -162,7 +162,7 @@ function flagError(sessionId, error) {
 async function deleteWorkspace(workspace) {
   const sessions = state.sessions.filter((s) => s.workspace_id === workspace.id);
   const running = sessions.filter((s) => s.state === "running");
-  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const { plural } = window.FwHubFmt;
   const ok = await confirmDialog({
     kicker: "delete workspace",
     title: `Delete ${workspace.name}?`,
@@ -485,10 +485,10 @@ function renderFlip(session) {
   if (dot && !agentState) dot.remove();
   if (dot && agentState) dot.className = `flip-dot dot ${agentState.dot}`;
   button.title = parent
-    ? `Back to agent ${parent.name}${agentState && agentState.label ? `, ${agentState.label}` : ""} (${MOD} \`)`
+    ? withKey(`Back to agent ${parent.name}${agentState && agentState.label ? `, ${agentState.label}` : ""}`, "companion.flip")
     : running
-      ? `Companion shell ${running.name} (${MOD} \`)`
-      : `Open a companion shell in ${session.name}'s directory (${MOD} \`)`;
+      ? withKey(`Companion shell ${running.name}`, "companion.flip")
+      : withKey(`Open a companion shell in ${session.name}'s directory`, "companion.flip");
   button.setAttribute("aria-label", button.title);
 }
 

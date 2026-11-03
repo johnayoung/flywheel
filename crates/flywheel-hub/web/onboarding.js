@@ -27,7 +27,7 @@ window.FwHubOnboarding = function (ctx) {
     importError: "",
   };
 
-  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const { plural } = window.FwHubFmt;
   // A touch-only device has no keys to learn (palette "Shortcut tour"
   // still plays it).
   const touchOnly = window.matchMedia("(hover: none) and (pointer: coarse)");

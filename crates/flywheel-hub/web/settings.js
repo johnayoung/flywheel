@@ -665,7 +665,7 @@ window.FwHubSettings = function (ctx) {
     const nodes = [
       el("p", {
         className: "sheet-body settings-note",
-        textContent: `Click a key to change it, then press the new one (Esc cancels). Keys the browser or OS keep (Ctrl W, Ctrl T, ...) and keys a terminal needs (Ctrl C, plain letters) are refused; a key bound twice is a conflict. ${IS_MAC ? "Ctrl Opt is the hub chord here (Option alone types characters)." : ""}`,
+        textContent: `Click a key to change it (or add / set for another), then press the new one (Esc cancels; × removes a key). Keys the browser or OS keep (Ctrl W, Ctrl T, ...) and keys a terminal needs (Ctrl C, plain letters) are refused; a key bound twice is a conflict. ${IS_MAC ? "Ctrl Opt is the hub chord here (Option alone types characters)." : ""}`,
       }),
       head,
     ];
@@ -695,7 +695,17 @@ window.FwHubSettings = function (ctx) {
       el(
         "span",
         { className: "key-chip" },
-        el("kbd", { textContent: label(k) }),
+        el(
+          "button",
+          {
+            type: "button",
+            className: "key-chip-key",
+            title: `Change ${label(k)}: press the new key`,
+            "aria-label": `Change ${label(k)} for ${a.label}`,
+            onclick: () => startCapture(a, k),
+          },
+          el("kbd", { textContent: label(k) }),
+        ),
         el("button", {
           type: "button",
           className: "key-x",
@@ -757,8 +767,10 @@ window.FwHubSettings = function (ctx) {
     renderSection();
   }
 
-  function startCapture(a) {
-    view.capturing = { id: a.id, scope: a.scope, indexed: a.indexed, pending: null, errors: [], warnings: [] };
+  // `replace`: the key a click on its chip changes (else the new key is
+  // added).
+  function startCapture(a, replace = null) {
+    view.capturing = { id: a.id, scope: a.scope, indexed: a.indexed, replace, pending: null, errors: [], warnings: [] };
     renderSection();
   }
   function stopCapture() {
@@ -798,7 +810,11 @@ window.FwHubSettings = function (ctx) {
         key = `${digit[1]}1..9`;
       }
       const a = action(view.capturing.id);
-      const keys = [...(keymap()[a.id] || []).filter((k) => k !== key), key].slice(-4);
+      const before = keymap()[a.id] || [];
+      const replace = view.capturing.replace;
+      const keys = replace && before.includes(replace)
+        ? [...new Set(before.map((k) => (k === replace ? key : k)))]
+        : [...before.filter((k) => k !== key), key].slice(-4);
       view.capturing.pending = key;
       renderSection();
       await apply(a, keys);

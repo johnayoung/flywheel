@@ -700,6 +700,27 @@ mod tests {
         assert!(seen.len() > 100, "found only {} app names", seen.len());
     }
 
+    /// Shortcut hints come from the keymap (`keyHint`/`withKey`, or a
+    /// module's `ctx.keyOf`): a key spelled into a hint (`${MOD} G`) would
+    /// go on showing the default after a rebind or unbind in Settings.
+    #[test]
+    fn shortcut_hints_follow_the_keymap() {
+        for (path, bytes, kind) in ASSETS {
+            if *kind != JS || path.starts_with("vendor/") {
+                continue;
+            }
+            let js = std::str::from_utf8(bytes).unwrap();
+            for (n, line) in js.lines().enumerate() {
+                assert!(
+                    !line.contains("${MOD}") && !line.contains("${ctx.MOD}"),
+                    "{path}:{}: a hardcoded shortcut hint (use keyHint/withKey): {}",
+                    n + 1,
+                    line.trim()
+                );
+            }
+        }
+    }
+
     #[test]
     fn stylesheet_fonts_are_embedded() {
         let (css, _) = asset("app.css").unwrap();

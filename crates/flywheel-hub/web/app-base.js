@@ -116,6 +116,12 @@ const settings = window.FwHubSettings({
     return session && !session.machine ? session.id : null;
   },
 });
+// A shortcut hint from the keymap (never a hardcoded key: a rebind or
+// unbind in Settings shows everywhere). `keyHint(id)`: the key, "" when
+// unbound; `withKey(text, id)`: "text (key)", or just text.
+const keyHint = (id) => settings.keyOf(id);
+const withKey = (text, id) => window.FwHubFmt.withKey(text, keyHint(id));
+
 
 // --- state -----------------------------------------------------------
 
@@ -332,7 +338,7 @@ const commands = window.FwHubCommands({
   state,
   sessionById,
   workspaceById,
-  MOD,
+  keyOf: (id) => keyHint(id),
   openSession: (id) => openSession(id),
   flipTo: (id, from) => flipTo(id, from),
   refresh: () => refresh(),
@@ -378,7 +384,8 @@ const fanout = window.FwHubFanout({
   refresh: () => refresh().catch(() => {}),
   termSize: () => sizeHint(),
   focusTerminal: () => focusTerminal(),
-  onChange: () => attention.render(),
+  // The Needs-you list, menu badge and title all count fan-outs.
+  onChange: () => render(),
 });
 
 // The phone and alerts modules (pwa.js, attention.js, notify.js,
@@ -447,7 +454,8 @@ const launcher = window.FwHubLauncher({
 // Review (review.js): a session's commits, diffs, and the guarded
 // commit / push / PR / rebase / merge actions.
 const review = window.FwHubReview({
-  $, el, icon, api, state, sessionById, age, MOD,
+  $, el, icon, api, state, sessionById, age,
+  keyOf: (id) => keyHint(id),
   toast: commands.toast,
   copyText: (text) => commands.copyText(text),
   confirmDialog: (options) => confirmDialog(options),
@@ -455,6 +463,8 @@ const review = window.FwHubReview({
   refresh: () => refresh(),
   focusTerminal: () => focusTerminal(),
   onOpen: () => closeOverlays("review"),
+  // A fan-out candidate's review lands it through the board.
+  openFanout: (id) => fanout.open(id),
 });
 // The "why?" beside the status pill (explain.js).
 const explain = window.FwHubExplain({ $, el, api });

@@ -182,8 +182,8 @@ function renderTabs() {
   bar.replaceChildren(...[
     el("span", { className: "tabs-ws", textContent: workspace ? workspace.name : "" }),
     el("div", { className: "tab-list", role: "tablist", "aria-label": "Tabs" }, tabs),
-    layout.tabs.length < L.MAX_TABS ? iconButton("plus", `New tab (${MOD} T)`, newTab) : null,
-    zoomedIn(active) ? el("button", { type: "button", className: "zoom-pill", onclick: () => toggleZoom(zoomedIn(active)), title: `Unzoom (${MOD} Z)` }, "zoomed") : null,
+    layout.tabs.length < L.MAX_TABS ? iconButton("plus", withKey("New tab", "tab.new"), newTab) : null,
+    zoomedIn(active) ? el("button", { type: "button", className: "zoom-pill", onclick: () => toggleZoom(zoomedIn(active)), title: withKey("Unzoom", "pane.zoom") }, "zoomed") : null,
   ].filter(Boolean));
 }
 
@@ -299,12 +299,12 @@ function paneMenu(pane, x, y) {
   const others = state.sessions.filter((s) => s.workspace_id === session.workspace_id && !shown.has(s.id));
   const zoomed = zoomedIn(tab) === pane.id;
   const items = [
-    { label: "Split right: new shell", hint: `${MOD} \\`, run: () => splitWithShell(pane, "right") },
-    { label: "Split down: new shell", hint: `${MOD} -`, run: () => splitWithShell(pane, "down") },
-    { label: zoomed ? "Unzoom" : "Zoom", hint: `${MOD} Z`, run: () => toggleZoom(pane.id), disabled: L.panes(tab.root).length < 2 },
+    { label: "Split right: new shell", hint: keyHint("pane.split_right"), run: () => splitWithShell(pane, "right") },
+    { label: "Split down: new shell", hint: keyHint("pane.split_down"), run: () => splitWithShell(pane, "down") },
+    { label: zoomed ? "Unzoom" : "Zoom", hint: keyHint("pane.zoom"), run: () => toggleZoom(pane.id), disabled: L.panes(tab.root).length < 2 },
     { label: "Move to a new tab", run: () => paneToTab(pane), disabled: L.panes(tab.root).length < 2 },
-    { label: "Close pane (keeps running)", hint: `${MOD} X`, run: () => closePane(pane.id) },
-    { label: `Close session ${session.name}`, hint: `${MOD} W`, danger: true, run: () => closeSession(session.id) },
+    { label: "Close pane (keeps running)", hint: keyHint("pane.close"), run: () => closePane(pane.id) },
+    { label: `Close session ${session.name}`, hint: keyHint("session.close"), danger: true, run: () => closeSession(session.id) },
   ];
   if (others.length) {
     items.push({ group: "show beside" });
@@ -326,7 +326,7 @@ function tabMenu(t, x, y) {
       tabRenaming = t.id;
       renderTabs();
     } },
-    { label: "New tab", hint: `${MOD} T`, run: newTab, disabled: layout.tabs.length >= L.MAX_TABS },
+    { label: "New tab", hint: keyHint("tab.new"), run: newTab, disabled: layout.tabs.length >= L.MAX_TABS },
     { label: "Close tab (sessions keep running)", danger: true, run: () => closeTab(t.id), disabled: layout.tabs.length < 2 },
   ]);
 }

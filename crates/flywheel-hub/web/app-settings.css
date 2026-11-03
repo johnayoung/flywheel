@@ -71,6 +71,8 @@
 .key-chips { display: flex; flex-wrap: wrap; gap: .3rem; justify-content: flex-end; }
 .key-chip { display: inline-flex; align-items: center; gap: .1rem; }
 .key-chip kbd, .key-capture { font-family: var(--term); }
+.key-chip-key { background: none; border: 0; padding: 0; margin: 0; color: inherit; font: inherit; cursor: pointer; }
+.key-chip-key:hover kbd, .key-chip-key:focus-visible kbd { border-color: var(--signal); }
 .key-capture { border-style: dashed; color: var(--signal); animation: blink 1.2s steps(2) infinite; }
 .key-x { border: 0; background: none; color: var(--ink-3); cursor: pointer; padding: 0 .2rem; font-size: 13px; line-height: 1; }
 .key-x:hover { color: var(--alert); }
@@ -122,9 +124,17 @@ body:not(.ligatures) :is(.tx-body, #cmd-list, #run-body, .rv-diff, #search-resul
   .pref-scope { grid-column: 1 / -1; justify-content: flex-start; }
   .key-row { grid-template-columns: minmax(0, 1fr) auto; }
   .key-actions { grid-column: 1 / -1; justify-content: flex-end; }
-  .settings-tab { padding: .55rem .7rem; flex: none; }
-  /* One row of tabs that scrolls sideways, not three rows. */
-  .settings-nav { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin: 0; padding-bottom: .1rem; }
-  .settings-nav::-webkit-scrollbar { display: none; }
+  /* Every tab in view: they wrap onto rows (a sideways-scrolling row
+     hid four of seven behind a clipped edge). */
+  .settings-tab { padding: .55rem .6rem; flex: 1 0 auto; letter-spacing: .1em; }
+  .settings-nav { margin: 0; }
   .config-table { display: block; overflow-x: auto; }
+}
+
+/* Touch: tabs, the "this device" switches and reset take a finger. */
+@media (pointer: coarse) {
+  .settings-tab { min-height: 44px; }
+  .pref-device { min-height: 44px; padding: 0 .2rem; }
+  .pref-device input[type="checkbox"] { width: 22px; height: 22px; }
+  .pref-scope .text-btn, .key-actions .text-btn { min-height: 44px; min-width: 44px; }
 }

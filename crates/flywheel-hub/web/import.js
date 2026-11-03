@@ -26,7 +26,7 @@ window.FwHubImport = function (ctx) {
   const report = $("#import-report");
   const error = $("#import-error");
 
-  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const { plural } = window.FwHubFmt;
 
   function setOpen(open) {
     toggle.setAttribute("aria-expanded", String(open));

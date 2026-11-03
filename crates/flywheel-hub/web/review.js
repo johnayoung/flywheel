@@ -48,7 +48,9 @@ window.FwHubReview = function (ctx) {
   const wide = () => window.matchMedia("(min-width: 1000px)").matches;
   // replaceChildren, skipping the null / false a conditional child gives.
   const fill = (node, ...children) => node.replaceChildren(...children.flat().filter((c) => c !== null && c !== undefined && c !== false));
-  const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  const { plural } = window.FwHubFmt;
+  // Shortcut hints follow the keymap ("" when unbound).
+  const withKey = (text, id) => window.FwHubFmt.withKey(text, ctx.keyOf(id));
   const drawer = $("#review");
   const body = $("#rv-body");
 
@@ -112,7 +114,9 @@ window.FwHubReview = function (ctx) {
     return !!session && (!!session.git || !!session.worktree);
   }
 
-  function open(id) {
+  // `follow`: re-targeted to the newly attached session (keep the focus
+  // where it is).
+  function open(id, follow = false) {
     const session = sessionById(id);
     if (!reviewable(session)) return;
     if (ui.id !== id) {
@@ -124,7 +128,7 @@ window.FwHubReview = function (ctx) {
     ui.error = "";
     ctx.onOpen();
     renderDrawer();
-    drawer.focus({ preventScroll: true });
+    if (!follow) drawer.focus({ preventScroll: true });
     load();
     renderPill();
   }
@@ -166,7 +170,7 @@ window.FwHubReview = function (ctx) {
     count.hidden = !n;
     count.textContent = n ? `↑${n}` : "";
     pill.dataset.dirty = String(!!(git && (git.dirty || git.untracked)));
-    pill.title = `Review ${git && git.branch ? git.branch : "this branch"}${git && git.against ? ` against ${git.against}` : ""} (${ctx.MOD} G)`;
+    pill.title = withKey(`Review ${git && git.branch ? git.branch : "this branch"}${git && git.against ? ` against ${git.against}` : ""}`, "review.toggle");
   }
 
   // The session's badge moved (a commit, an edit): read the review again,
@@ -174,6 +178,15 @@ window.FwHubReview = function (ctx) {
   function render() {
     renderPill();
     if (!ui.id) return;
+    // The attached session changed under the drawer (a hash link, a
+    // notification, the palette, a companion flip): its actions must
+    // never act on a session the user has left. A phone's full-screen
+    // sheet closes; the desktop drawer follows the new session.
+    if (state.attached && state.attached !== ui.id) {
+      if (!phone() && reviewable(sessionById(state.attached))) open(state.attached, true);
+      else close();
+      return;
+    }
     const session = sessionById(ui.id);
     if (!session) {
       close();
@@ -218,6 +231,12 @@ window.FwHubReview = function (ctx) {
           ? el("span", { className: "rv-up", textContent: "· not pushed" })
           : null,
     );
+    if (data.fanout) {
+      where.append(el("span", {
+        className: "rv-up",
+        textContent: `· fan-out ${data.fanout.name}: ${data.fanout.candidate}${data.fanout.winner ? ` (${data.fanout.winner} won)` : ""}`,
+      }));
+    }
     where.title = data.dir;
     renderTabs(data);
     renderActions(data);
@@ -717,7 +736,24 @@ window.FwHubReview = function (ctx) {
     ];
     if (worktree) {
       list.push(button("Rebase onto base…", "rebase", { ghost: true, disabled: !data.behind || !!data.operation, title: data.behind ? `Replay onto ${data.base && data.base.name}` : "Already on top of the base" }));
-      list.push(button("Merge into base…", "merge", { disabled: !data.ahead, title: `Fast-forward ${data.base ? data.base.name : "the base"} in the main checkout` }));
+      const fo = data.fanout;
+      if (fo && !fo.winner) {
+        // A fan-out candidate lands through Pick winner (it merges only
+        // the commit that passed the graders), never this merge.
+        list.push(el("button", {
+          type: "button",
+          className: "slab rv-act",
+          textContent: "Pick winner on the board…",
+          title: `Candidate ${fo.candidate} of the fan-out "${fo.name}": land it with Pick winner, which merges only what passed its graders`,
+          dataset: { action: "fanout" },
+          onclick: () => {
+            close();
+            if (ctx.openFanout) ctx.openFanout(fo.id);
+          },
+        }));
+      } else {
+        list.push(button("Merge into base…", "merge", { disabled: !data.ahead, title: `Fast-forward ${data.base ? data.base.name : "the base"} in the main checkout` }));
+      }
     }
     // Phones: what can run now comes first.
     if (phone()) list.sort((x, y) => Number(x.disabled) - Number(y.disabled));
@@ -834,7 +870,7 @@ window.FwHubReview = function (ctx) {
         onkeydown: (event) => {
           if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
             event.preventDefault();
-            okButton.click();
+            confirmNow();
           }
         },
       });
@@ -846,7 +882,7 @@ window.FwHubReview = function (ctx) {
             "div",
             { className: "rva-ask" },
             el("button", { type: "button", className: "text-btn", textContent: `Ask ${ui.data.agent.name} to write it`, onclick: () => askAgent("commit_message") }),
-            el("button", { type: "button", className: "text-btn", textContent: "Use its last block", onclick: useAgentBlock }),
+            el("button", { type: "button", className: "text-btn", textContent: "Use its last text block", title: `Fill in ${ui.data.agent.name}'s newest code block that is not a shell command`, onclick: useAgentBlock }),
             f.askNote,
           ),
         );
@@ -883,9 +919,30 @@ window.FwHubReview = function (ctx) {
     return [];
   }
 
+  // A field changed: the plan shown (and its fingerprint, which covers the
+  // fields) is stale at once, so Confirm never sends it; the new one is
+  // fetched after `delay`.
   function replan(delay) {
     clearTimeout(act.timer);
-    act.timer = setTimeout(fetchPlan, delay);
+    act.seq++;
+    act.plan = null;
+    syncOk();
+    act.timer = setTimeout(() => {
+      act.timer = null;
+      act.planning = fetchPlan();
+    }, delay);
+  }
+
+  // Confirm from the keyboard (Ctrl Enter) right after typing: plan the
+  // fields as they are now, then confirm that plan.
+  async function confirmNow() {
+    if (act.timer) {
+      clearTimeout(act.timer);
+      act.timer = null;
+      act.planning = fetchPlan();
+    }
+    if (act.planning) await act.planning;
+    okButton.click();
   }
 
   async function fetchPlan() {
@@ -1085,9 +1142,11 @@ window.FwHubReview = function (ctx) {
     watch.timer = null;
   }
 
+  // The agent's newest code block that is not a shell command (a commit
+  // message is prose: a ```sh block is never one).
   async function newestBlock(agentId) {
-    const list = await api("GET", `/api/sessions/${agentId}/commands?all=true&limit=1`);
-    return (list.commands || [])[0] || null;
+    const list = await api("GET", `/api/sessions/${agentId}/commands?all=true&limit=20`);
+    return (list.commands || []).find((c) => !c.shell) || null;
   }
 
   async function askAgent(kind) {
@@ -1160,7 +1219,7 @@ window.FwHubReview = function (ctx) {
     try {
       const block = await newestBlock(agent.id);
       if (block) fillMessage(block.text);
-      else toast(`${agent.name} has suggested no code block yet.`);
+      else toast(`${agent.name} has written no text block yet (shell commands are not messages).`);
     } catch (error) {
       toast(error.message, { tone: "bad" });
     }
@@ -1171,7 +1230,7 @@ window.FwHubReview = function (ctx) {
   function paletteItems(cmd) {
     const session = sessionById(state.attached);
     if (!reviewable(session)) return;
-    cmd(ui.id ? "Close review" : `Review ${session.name}`, `${ctx.MOD} G: commits, diffs, commit / push / PR / merge`, togglePill, "branch");
+    cmd(ui.id ? "Close review" : `Review ${session.name}`, [ctx.keyOf("review.toggle"), "commits, diffs, commit / push / PR / merge"].filter(Boolean).join(": "), togglePill, "branch");
   }
 
   window.addEventListener("resize", () => {

@@ -2068,7 +2068,7 @@
     if (!sessionById(id)) return;
     const showing = livePanes().filter((p) => p.sessionId === id);
     try {
-      await api("POST", `/api/sessions/${id}/restart`, sizeHint());
+      await api("POST", `/api/sessions/${id}/relaunch`, sizeHint());
       await refresh();
       if (!showing.length) {
         await openSession(id);

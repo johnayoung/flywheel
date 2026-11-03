@@ -242,6 +242,11 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    /// How errors name the session: `name (id)`.
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.name, self.id)
+    }
+
     /// The workspace folder the session belongs to: its worktree's repo,
     /// else its own directory.
     pub fn folder(&self) -> &Path {
@@ -957,9 +962,17 @@ pub fn validate_folder(raw: &Path) -> Result<PathBuf, StateError> {
             raw.display()
         )));
     }
-    let canonical = path
-        .canonicalize()
-        .map_err(|e| StateError::Invalid(format!("folder path {}: {e}", path.display())))?;
+    let canonical = path.canonicalize().map_err(|e| {
+        let why = match e.kind() {
+            std::io::ErrorKind::NotFound => "does not exist".to_owned(),
+            std::io::ErrorKind::PermissionDenied => {
+                "is not accessible (permission denied)".to_owned()
+            }
+            std::io::ErrorKind::NotADirectory => "is not a directory".to_owned(),
+            _ => format!("cannot be resolved: {e}"),
+        };
+        StateError::Invalid(format!("folder path {} {why}", path.display()))
+    })?;
     if !canonical.is_dir() {
         return Err(StateError::Invalid(format!(
             "folder path {} is not a directory",
@@ -1767,7 +1780,7 @@ mod tests {
         assert!(!is_git_root(&plain));
         let message = |p: &Path| validate_folder(p).unwrap_err().to_string();
         assert!(message(Path::new("rel/x")).contains("must be absolute"));
-        assert!(message(&dir.path().join("missing")).contains("missing"));
+        assert!(message(&dir.path().join("missing")).ends_with("missing does not exist"));
         assert!(message(&file).contains("not a directory"));
     }
 

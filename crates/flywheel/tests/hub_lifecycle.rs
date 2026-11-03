@@ -422,7 +422,7 @@ fn start_script_stop_and_restore_shells_where_they_were() {
     // Ambiguity and misses are errors, not guesses.
     let output = env.fw(&["read", "nope"]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no session named"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no session matches"));
 
     let status = env.ok(&["status"]);
     assert!(status.contains("workspaces: 2"), "{status}");

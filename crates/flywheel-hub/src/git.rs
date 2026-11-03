@@ -614,6 +614,15 @@ pub fn remove(worktree: &WorktreeRef, force: bool) -> Result<Removed, String> {
         args.push(&path);
         git(repo, &args).map_err(|e| format!("git worktree remove failed: {e}"))?;
     }
+    // The last sibling worktree gone: drop its now-empty `<repo>.worktrees`
+    // too (a non-empty one stays; remove_dir refuses it).
+    if let Some(parent) = worktree.path.parent()
+        && parent
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with(".worktrees"))
+    {
+        let _ = std::fs::remove_dir(parent);
+    }
     let branch_deleted = check.unmerged == 0
         && git_ok(
             repo,
@@ -997,6 +1006,8 @@ mod tests {
         let removed = remove(&clean, false).unwrap();
         assert!(removed.branch_deleted);
         assert!(!clean.path.exists());
+        // It was the only one: no empty `<repo>.worktrees` is left behind.
+        assert!(!clean.path.parent().unwrap().exists());
         assert!(!git_ok(
             &repo,
             &["show-ref", "--verify", "--quiet", "refs/heads/clean"]
@@ -1052,6 +1063,14 @@ mod tests {
         remove(&gone, false).unwrap();
         let list = git(&repo, &["worktree", "list", "--porcelain"]).unwrap();
         assert!(!list.contains("gone"), "{list}");
+
+        // With a sibling left, the shared directory stays.
+        let one = create(&repo, &plan(&repo, "one", "", None).unwrap()).unwrap();
+        let two = create(&repo, &plan(&repo, "two", "", None).unwrap()).unwrap();
+        remove(&one, false).unwrap();
+        assert!(two.path.exists());
+        remove(&two, false).unwrap();
+        assert!(!two.path.parent().unwrap().exists());
     }
 
     #[test]

@@ -872,6 +872,63 @@ async fn api_errors_are_json_and_edge_inputs_are_handled() {
         let error: Value = response.json().await.expect("JSON error body");
         assert!(error["error"].as_str().is_some_and(|e| !e.is_empty()));
     }
+    // So do unknown endpoints, wrong methods, bad upgrades, and bad kinds;
+    // and no message carries axum's boilerplate lead-in.
+    for (method, path, body, status, says) in [
+        (
+            reqwest::Method::GET,
+            "/api/nothing",
+            None,
+            StatusCode::NOT_FOUND,
+            "no such endpoint",
+        ),
+        (
+            reqwest::Method::DELETE,
+            "/api/kinds",
+            None,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method not allowed",
+        ),
+        (
+            reqwest::Method::GET,
+            "/api/events?client=bad!",
+            None,
+            StatusCode::BAD_REQUEST,
+            "client must be",
+        ),
+        (
+            reqwest::Method::GET,
+            "/api/events",
+            None,
+            StatusCode::BAD_REQUEST,
+            "WebSocket upgrade required",
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/sessions",
+            Some(json!({ "workspace_id": workspace_id, "kind": "bogus" })),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "kind: unknown variant",
+        ),
+        (
+            reqwest::Method::GET,
+            "/api/sessions/zzz/screen?lines=5",
+            None,
+            StatusCode::NOT_FOUND,
+            "zzz",
+        ),
+    ] {
+        let mut request = hub.authed(method, path);
+        if let Some(body) = body {
+            request = request.json(&body);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), status, "{path}");
+        let error: Value = response.json().await.expect("JSON error body");
+        let message = error["error"].as_str().unwrap_or_default();
+        assert!(message.contains(says), "{path}: {message}");
+        assert!(!message.contains("Failed to"), "{path}: {message}");
+    }
 
     // A zero size means "default", not a 1x1 terminal.
     let zero: Value = hub
@@ -1201,7 +1258,7 @@ async fn restart_relaunches_an_ended_session_in_place() {
     let restart = |sid: String| {
         hub.authed(
             reqwest::Method::POST,
-            &format!("/api/sessions/{sid}/restart"),
+            &format!("/api/sessions/{sid}/relaunch"),
         )
         .json(&json!({ "cols": 90, "rows": 20 }))
         .send()

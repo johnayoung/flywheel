@@ -1833,15 +1833,15 @@ impl Hub {
     /// in its session. The record stays (as exited) until
     /// [`Hub::remove_session`]. A conflict when there is nothing to kill.
     pub fn kill_session(&self, id: &str) -> Result<(), HubError> {
-        self.store().session(id)?;
+        let label = self.store().session(id)?.label();
         let Some(session) = self.live_session(id) else {
             return Err(StateError::Conflict(format!(
-                "session {id} has no process on this server"
+                "session {label} has no process on this server"
             ))
             .into());
         };
         if session.exit_info().is_some() && session.session_processes().is_empty() {
-            return Err(StateError::Conflict(format!("session {id} has already exited")).into());
+            return Err(StateError::Conflict(format!("session {label} has already exited")).into());
         }
         session.kill(KILL_GRACE);
         Ok(())

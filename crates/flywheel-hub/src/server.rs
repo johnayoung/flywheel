@@ -77,7 +77,7 @@ use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures_util::SinkExt;
 use serde::Deserialize;
@@ -181,6 +181,8 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             get(import_api::find_code_workspaces),
         )
         .route("/api/sessions/{id}/kill", post(kill_session))
+        .route("/api/sessions/{id}/relaunch", post(restart_session))
+        // The route's first name, kept for older clients.
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))
         .route("/api/sessions/{id}/input", post(session_input))
@@ -208,6 +210,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/flywheel/panel", get(flywheel_api::panel))
         .route("/api/flywheel/run", get(flywheel_api::run_output))
         .route("/api/flywheel/worker", post(flywheel_api::start_worker))
+        // Anything else under /api answers in the API's error form too.
+        .route("/api/{*rest}", any(api_not_found))
+        .route("/api", any(api_not_found))
+        .method_not_allowed_fallback(api_method_not_allowed)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
     Router::new()
         .route("/", get(index))
@@ -805,6 +811,27 @@ impl IntoResponse for ApiError {
 
 type ApiResult<T> = Result<T, ApiError>;
 
+async fn api_not_found() -> Response {
+    error_response(StatusCode::NOT_FOUND, "no such endpoint")
+}
+
+async fn api_method_not_allowed() -> Response {
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "method not allowed for this endpoint",
+    )
+}
+
+/// A WebSocket upgrade the request could not make, in the API's form.
+fn upgrade_refused(
+    rejection: &axum::extract::ws::rejection::WebSocketUpgradeRejection,
+) -> Response {
+    error_response(
+        rejection.status(),
+        &format!("WebSocket upgrade required: {}", rejection.body_text()),
+    )
+}
+
 /// `Json` whose rejections (bad syntax, wrong shape, missing content type)
 /// answer in the API's `{"error": ...}` form like every other error.
 struct ApiJson<T>(T);
@@ -821,10 +848,27 @@ where
             Ok(Json(value)) => Ok(Self(value)),
             Err(rejection) => Err(error_response(
                 rejection.status(),
-                &bounded_message(&rejection.body_text()),
+                &bounded_message(&rejection_message(&rejection.body_text())),
             )),
         }
     }
+}
+
+/// An extractor rejection's text without axum's boilerplate lead-in
+/// ("Failed to deserialize the JSON body into the target type: kind:
+/// unknown variant ..." -> "kind: unknown variant ...").
+fn rejection_message(text: &str) -> String {
+    const LEADS: [&str; 4] = [
+        "Failed to deserialize the JSON body into the target type: ",
+        "Failed to parse the request body as JSON: ",
+        "Failed to deserialize query string: ",
+        "Failed to deserialize form body: ",
+    ];
+    let text = LEADS
+        .iter()
+        .find_map(|lead| text.strip_prefix(lead))
+        .unwrap_or(text);
+    text.to_owned()
 }
 
 /// Longest body-rejection message echoed back. serde's error names the
@@ -1069,9 +1113,14 @@ async fn session_screen(
     let Query(query) = match query {
         Ok(query) => query,
         Err(rejection) => {
-            return Ok(error_response(rejection.status(), &rejection.body_text()));
+            return Ok(error_response(
+                rejection.status(),
+                &rejection_message(&rejection.body_text()),
+            ));
         }
     };
+    // An unknown session is a 404 whatever the options say.
+    let label = app.hub.session(&id)?.record.label();
     let lines = match query.lines.as_deref() {
         None => DEFAULT_RECENT_LINES,
         Some(raw) => match raw.parse::<usize>() {
@@ -1100,11 +1149,10 @@ async fn session_screen(
             ));
         }
     };
-    app.hub.session(&id)?;
     let Some(session) = app.hub.live_session(&id) else {
         return Ok(error_response(
             StatusCode::NOT_FOUND,
-            &format!("session {id} has no terminal on this server"),
+            &format!("session {label} has no terminal on this server"),
         ));
     };
     let text = blocking(move || Ok(session.screen_text(source))).await?;
@@ -1131,12 +1179,12 @@ struct InputRequest {
     enter: bool,
 }
 
-fn input_refused(outcome: WriteOutcome) -> Option<Response> {
+fn input_refused(outcome: WriteOutcome, label: &str) -> Option<Response> {
     match outcome {
         WriteOutcome::Queued => None,
         WriteOutcome::Closed => Some(error_response(
             StatusCode::CONFLICT,
-            "the session has exited",
+            &format!("session {label} has exited"),
         )),
         WriteOutcome::Backlogged => Some(error_response(
             StatusCode::CONFLICT,
@@ -1154,16 +1202,17 @@ async fn session_input(
     ApiJson(request): ApiJson<InputRequest>,
 ) -> ApiResult<Response> {
     let view = app.hub.session(&id)?;
+    let label = view.record.label();
     let Some(session) = app.hub.live_session(&id) else {
         return Ok(error_response(
             StatusCode::CONFLICT,
-            &format!("session {id} has no terminal on this server"),
+            &format!("session {label} has no terminal on this server"),
         ));
     };
     if session.exit_info().is_some() {
         return Ok(error_response(
             StatusCode::CONFLICT,
-            "the session has exited",
+            &format!("session {label} has exited"),
         ));
     }
     if request.data.is_empty() && !request.enter {
@@ -1180,7 +1229,7 @@ async fn session_input(
     };
     let mut sent = bytes.len();
     if !bytes.is_empty()
-        && let Some(refused) = input_refused(session.write(bytes))
+        && let Some(refused) = input_refused(session.write(bytes), &label)
     {
         return Ok(refused);
     }
@@ -1188,7 +1237,7 @@ async fn session_input(
         if sent > 0 {
             tokio::time::sleep(crate::pty::ENTER_DELAY).await;
         }
-        if let Some(refused) = input_refused(session.write(b"\r".to_vec())) {
+        if let Some(refused) = input_refused(session.write(b"\r".to_vec()), &label) {
             return Ok(refused);
         }
         sent += 1;
@@ -1225,7 +1274,7 @@ async fn session_ws(
     client: Client,
     headers: HeaderMap,
     credential: Option<axum::Extension<CredentialWatch>>,
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     if !origin_ok(&headers, client, &app.options) {
         return error_response(StatusCode::FORBIDDEN, "cross-origin WebSocket refused");
@@ -1235,6 +1284,10 @@ async fn session_ws(
             StatusCode::NOT_FOUND,
             &format!("session {id} has no terminal on this server"),
         );
+    };
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return upgrade_refused(&rejection),
     };
     let shutdown = app.shutdown.clone();
     // Taken before the credentials were checked (see `require_auth`).
@@ -1487,7 +1540,7 @@ async fn events_ws(
     client: Client,
     headers: HeaderMap,
     credential: Option<axum::Extension<CredentialWatch>>,
-    ws: WebSocketUpgrade,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     if !origin_ok(&headers, client, &app.options) {
         return error_response(StatusCode::FORBIDDEN, "cross-origin WebSocket refused");
@@ -1501,6 +1554,10 @@ async fn events_ws(
             );
         }
         None => crate::state::new_id(),
+    };
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return upgrade_refused(&rejection),
     };
     let hub = Arc::clone(&app.hub);
     let shutdown = app.shutdown.clone();

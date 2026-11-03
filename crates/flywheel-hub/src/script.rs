@@ -7,6 +7,7 @@
 use crate::auth::Token;
 use crate::cli::{StateDirArg, resolve_state_dir, running_hub};
 use crate::client;
+use crate::paths::default_state_dir;
 use crate::remote::RuntimeInfo;
 use serde_json::{Value, json};
 use std::io::{Read, Write};
@@ -29,20 +30,22 @@ pub struct HubConn {
 impl HubConn {
     /// Connect to the hub serving `state_dir`.
     pub fn connect(state_dir: &Path) -> Result<Self, String> {
-        let info = running_hub(state_dir)?.ok_or_else(|| {
-            format!(
-                "no hub is running for state dir {} (start one with `fw hub start`)",
-                state_dir.display()
-            )
-        })?;
+        Self::running(state_dir)?.ok_or_else(|| no_hub_message(state_dir))
+    }
+
+    /// The hub serving `state_dir`, or `None` when none runs.
+    pub fn running(state_dir: &Path) -> Result<Option<Self>, String> {
+        let Some(info) = running_hub(state_dir)? else {
+            return Ok(None);
+        };
         let token = Token::load(state_dir)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "the running hub's token file is missing".to_owned())?;
-        Ok(Self {
+        Ok(Some(Self {
             info,
             token,
             timeout: CALL_TIMEOUT,
-        })
+        }))
     }
 
     /// The same hub, waited on for at most `timeout` per call (a probe of
@@ -101,6 +104,37 @@ impl HubConn {
 
 /// An API failure for humans: a request the hub refused (4xx) says why
 /// in its own words; anything else keeps the HTTP status to go on.
+/// What a verb that needs the running hub says when there is none: how to
+/// start one for the same state dir (`--state-dir` spelled out unless it
+/// is the default).
+pub fn no_hub_message(state_dir: &Path) -> String {
+    let flag = if default_state_dir().as_deref() == Some(state_dir) {
+        String::new()
+    } else {
+        format!(
+            " --state-dir {}",
+            shell_word(&state_dir.display().to_string())
+        )
+    };
+    format!(
+        "no hub is running for state dir {} (start one with `fw hub start{flag}`)",
+        state_dir.display()
+    )
+}
+
+/// `word` as one shell word (single-quoted when it needs to be).
+fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%=,".contains(&b))
+    {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
 fn api_error(status: u16, message: &str) -> String {
     match (status, message.is_empty()) {
         (400..500, false) => message.to_owned(),
@@ -148,7 +182,8 @@ pub fn resolve<'a>(items: &'a [Value], query: &str, what: &str) -> Result<&'a Va
         .iter()
         .filter(|i| str_field(i, "id").starts_with(query))
         .collect();
-    pick(prefixed, "id prefix")?.ok_or_else(|| format!("no {what} named {query:?}"))
+    pick(prefixed, "id prefix")?
+        .ok_or_else(|| format!("no {what} matches {query:?} (id, id prefix, or name)"))
 }
 
 fn short(id: &str) -> &str {
@@ -416,7 +451,7 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
     if workspaces.is_empty() {
         let _ = writeln!(
             out,
-            "no workspaces (create one with `fw hub new <name> --repo PATH --create` or in the web UI)"
+            "no workspaces (create one with `fw hub new <name> --folder PATH --create` or in the web UI)"
         );
         return 0;
     }
@@ -496,23 +531,23 @@ pub(crate) struct NewArgs {
     /// One of the workspace's folders (default: its first): a path
     /// (relative to the current directory), or a folder's label or
     /// directory name.
-    #[arg(long, visible_alias = "folder", value_name = "FOLDER")]
-    repo: Option<PathBuf>,
+    #[arg(long, visible_alias = "repo", value_name = "FOLDER")]
+    folder: Option<PathBuf>,
     /// Session name (default: program and number).
     #[arg(long)]
     name: Option<String>,
-    /// Create the workspace (named WORKSPACE, with --repo as its folder)
-    /// when none matches.
-    #[arg(long, requires = "repo")]
+    /// Create the workspace (named WORKSPACE, with --folder as its
+    /// folder) when none matches.
+    #[arg(long, requires = "folder")]
     create: bool,
     /// Run it in a new sibling worktree of its (git) folder:
-    /// `<repo-parent>/<repo>.worktrees/TASK` on branch TASK (after the
+    /// `<folder-parent>/<folder>.worktrees/TASK` on branch TASK (after the
     /// hub's --worktree-branch-prefix). Names the session TASK unless
     /// --name.
     #[arg(long, value_name = "TASK")]
     worktree: Option<String>,
     /// Branch or commit the worktree's branch is cut from (default: the
-    /// repo's current branch).
+    /// folder's current branch).
     #[arg(long, requires = "worktree", value_name = "REF")]
     base: Option<String>,
     /// Print the new session as JSON instead of its id.
@@ -564,24 +599,24 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
         }
     }
     let workspaces = conn.workspaces()?;
-    let (workspace_id, repo) = match resolve(&workspaces, &args.workspace, "workspace") {
+    let (workspace_id, folder) = match resolve(&workspaces, &args.workspace, "workspace") {
         Ok(workspace) => {
-            let repo = args
-                .repo
+            let folder = args
+                .folder
                 .as_deref()
                 .map(|query| pick_folder(workspace, query))
                 .transpose()?;
-            (str_field(workspace, "id").to_owned(), repo)
+            (str_field(workspace, "id").to_owned(), folder)
         }
         Err(message) if !args.create || message.contains("ambiguous") => {
             return Err(message);
         }
         Err(_) => {
-            let repo = args.repo.as_deref().map(absolute).transpose()?;
+            let folder = args.folder.as_deref().map(absolute).transpose()?;
             // Check the worktree first: a refused one must not leave an
             // empty workspace behind.
             if let (Some(task), Some(folder)) =
-                (&args.worktree, repo.as_ref().filter(|f| f.is_dir()))
+                (&args.worktree, folder.as_ref().filter(|f| f.is_dir()))
             {
                 let mut query = format!(
                     "folder={}&task={}",
@@ -599,7 +634,7 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
             let created = conn.call(
                 "POST",
                 "/api/workspaces",
-                Some(&json!({ "name": args.workspace, "repos": [repo] })),
+                Some(&json!({ "name": args.workspace, "folders": [folder] })),
             )?;
             let _ = writeln!(
                 err,
@@ -607,12 +642,12 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
                 str_field(&created, "name"),
                 str_field(&created, "id")
             );
-            (str_field(&created, "id").to_owned(), repo)
+            (str_field(&created, "id").to_owned(), folder)
         }
     };
     let mut body = json!({ "workspace_id": workspace_id, "kind": args.kind });
-    if let Some(repo) = repo {
-        body["repo"] = json!(repo);
+    if let Some(folder) = folder {
+        body["folder"] = json!(folder);
     }
     if let Some(name) = &args.name {
         body["name"] = json!(name);
@@ -1032,7 +1067,7 @@ pub(crate) fn relaunch(args: &RelaunchArgs, out: &mut dyn Write, err: &mut dyn W
         let (id, _) = find_session(&conn, &args.target.session)?;
         conn.call(
             "POST",
-            &format!("/api/sessions/{id}/restart"),
+            &format!("/api/sessions/{id}/relaunch"),
             Some(&json!({})),
         )
     });
@@ -1054,6 +1089,20 @@ pub(crate) fn relaunch(args: &RelaunchArgs, out: &mut dyn Write, err: &mut dyn W
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_no_hub_hint_starts_a_hub_for_the_same_state_dir() {
+        let message = no_hub_message(Path::new("/tmp/hub state"));
+        assert!(
+            message.ends_with("(start one with `fw hub start --state-dir '/tmp/hub state'`)"),
+            "{message}"
+        );
+        assert_eq!(shell_word("/a/b-c.d"), "/a/b-c.d");
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
+        if let Some(default) = default_state_dir() {
+            assert!(no_hub_message(&default).ends_with("(start one with `fw hub start`)"));
+        }
+    }
 
     fn items() -> Vec<Value> {
         vec![
@@ -1082,7 +1131,10 @@ mod tests {
             "{ambiguous}"
         );
         assert!(id("ab").unwrap_err().contains("ambiguous"));
-        assert_eq!(id("zz").unwrap_err(), "no session named \"zz\"");
+        assert_eq!(
+            id("zz").unwrap_err(),
+            "no session matches \"zz\" (id, id prefix, or name)"
+        );
         assert!(id("  ").is_err());
     }
 

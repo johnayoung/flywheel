@@ -2,7 +2,6 @@
 //! status hook agent sessions run).
 
 use crate::auth::{LOGIN_CODE_TTL, Token};
-use crate::client;
 use crate::flywheel::{FlywheelMonitor, MonitorTiming};
 use crate::hub::{Hub, HubError, HubOptions, RestoreOutcome};
 use crate::notify::{Notifier, NotifyConfig};
@@ -399,7 +398,12 @@ fn report_main(
     err: &mut dyn Write,
 ) -> i32 {
     #[derive(Debug, Parser)]
-    #[command(name = "fw hub report")]
+    #[command(
+        name = "fw hub report",
+        about = "Report an agent session's status to its hub (for the agent's hooks only: \
+                 run inside a hub session, it reads FLYWHEEL_HUB_SESSION, \
+                 FLYWHEEL_HUB_REPORT_SOCKET and FLYWHEEL_HUB_REPORT_SECRET; no --state-dir)"
+    )]
     struct ReportCli {
         #[command(flatten)]
         args: ReportArgs,
@@ -505,40 +509,13 @@ pub(crate) fn running_hub(state_dir: &Path) -> Result<Option<RuntimeInfo>, Strin
 /// Rotate through the running hub (so it switches without a restart), or
 /// in the token file when none runs.
 fn rotate(state_dir: &Path) -> Result<String, String> {
-    if let Some(info) = running_hub(state_dir)? {
-        let token = Token::load(state_dir)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "the running hub's token file is missing".to_owned())?;
-        match client::request(
-            info.connect_addr(),
-            "POST",
-            "/api/token/rotate",
-            token.expose(),
-            None,
-            CLIENT_TIMEOUT,
-        ) {
-            Ok(response) if response.status == 204 => {
-                return Ok(
-                    "token rotated; the running hub signed out every browser and closed every terminal connection (log in again via `fw hub url`)"
-                        .to_owned(),
-                );
-            }
-            Ok(response) => {
-                return Err(format!(
-                    "the running hub (pid {}) refused the rotation: {} {}",
-                    info.pid,
-                    response.status,
-                    response.error_message()
-                ));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "cannot reach the running hub (pid {}) at {}: {e}",
-                    info.pid,
-                    info.connect_addr()
-                ));
-            }
-        }
+    if let Some(hub) = script::HubConn::running(state_dir)? {
+        hub.with_timeout(CLIENT_TIMEOUT)
+            .call("POST", "/api/token/rotate", None)?;
+        return Ok(
+            "token rotated; the running hub signed out every browser and closed every terminal connection (log in again via `fw hub url`)"
+                .to_owned(),
+        );
     }
     Token::rotate(state_dir).map_err(|e| e.to_string())?;
     Ok("token rotated (no hub is running; the next `fw hub serve` uses it)".to_owned())
@@ -597,43 +574,14 @@ fn auto_qr(targets: &[LoginTarget]) -> Qr {
 
 /// Ask the hub serving `dir` for a one-time login code.
 pub(crate) fn mint_remote_code(dir: &Path) -> Result<(RuntimeInfo, String), String> {
-    let dir = dir.to_path_buf();
-    let info = running_hub(&dir)?.ok_or_else(|| {
-        format!(
-            "no hub is running for state dir {} (start one with `fw hub serve`)",
-            dir.display()
-        )
-    })?;
-    let token = Token::load(&dir)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "the running hub's token file is missing".to_owned())?;
-    let response = client::request(
-        info.connect_addr(),
-        "POST",
-        "/api/login-codes",
-        token.expose(),
-        None,
-        CLIENT_TIMEOUT,
-    )
-    .map_err(|e| {
-        format!(
-            "cannot reach the running hub (pid {}) at {}: {e}",
-            info.pid,
-            info.connect_addr()
-        )
-    })?;
-    if response.status != 200 {
-        return Err(format!(
-            "the running hub refused to mint a login code: {} {}",
-            response.status,
-            response.error_message()
-        ));
-    }
-    let code = serde_json::from_slice::<serde_json::Value>(&response.body)
-        .ok()
-        .and_then(|v| v.get("code").and_then(|c| c.as_str()).map(str::to_owned))
+    let hub = script::HubConn::connect(dir)?.with_timeout(CLIENT_TIMEOUT);
+    let body = hub.call("POST", "/api/login-codes", None)?;
+    let code = body
+        .get("code")
+        .and_then(|c| c.as_str())
+        .map(str::to_owned)
         .ok_or_else(|| "the running hub sent no login code".to_owned())?;
-    Ok((info, code))
+    Ok((hub.info, code))
 }
 
 /// Whether [`print_login`] draws the QR code.

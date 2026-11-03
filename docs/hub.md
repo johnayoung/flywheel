@@ -19,7 +19,7 @@ fw hub token [--rotate]                       # print the access token (created 
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N]   # agent-suggested code blocks
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent hooks only
 # SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--no-flywheel] [--import-root DIR] [--notify-url URL] [--worktree-branch-prefix P]
-# every verb takes --state-dir DIR
+# every verb but report (hooks only) takes --state-dir DIR
 ```
 
 Scripting the running hub (sessions/workspaces by id, unique id prefix, or name; exact name beats prefix; ambiguity is an error):
@@ -250,7 +250,7 @@ Workspace folders that are flywheel-adopted repos (a `flywheel.toml` or a `.flyw
 
 ## API
 
-All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`rows` of 0 mean the default (120x32).
+All under `/api`, JSON, token required. Errors are `{"error":"..."}` (unknown endpoints 404 and wrong methods 405 too); a malformed body is 400, a JSON body of the wrong shape 422. `cols`/`rows` of 0 mean the default (120x32).
 
 | Method | Path | |
 |---|---|---|
@@ -265,7 +265,7 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}`. `cols`/`ro
 | POST | `/sessions/{id}/companion` | `{"cols"?,"rows"?,"text"?,"run"?}`: the agent's companion shell (201 started now, 200 running); with `text` also pastes (as `/paste`) once ready: `{"session","created","ready":"running\|bracketed\|quiet\|timeout","paste"}` |
 | GET | `/worktrees/plan?folder=&task=&base=` | `{"dir","default_base","branches","plan":{"path","branch","base"}\|null,"error"}` (the form checks as you type) |
 | POST | `/sessions/{id}/kill` | 202: SIGHUP the session (SIGKILL after 3s); record kept. 409 when nothing is left to kill |
-| POST | `/sessions/{id}/restart` | relaunch an ended (`exited`/`stopped`) session in place: same id, name, command, repo; fresh PTY + scrollback. Body `{"cols"?,"rows"?}`. 409 while it runs |
+| POST | `/sessions/{id}/relaunch` | relaunch an ended (`exited`/`stopped`) session in place: same id, name, command, folder; fresh PTY + scrollback. Body `{"cols"?,"rows"?}`. 409 while it runs. `/restart` is its old name |
 | GET | `/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered plain text (below) |
 | POST | `/sessions/{id}/input` | `{"data","paste"?,"enter"?}` -> `{"bytes","bracketed"}`: type into it (`paste`: as `fw hub send`). 409 when it has no running terminal or is not reading |
 | GET | `/sessions/{id}/commands[?limit=N&all=true]` | suggested code blocks, newest first (shell only unless `all`; `limit` 1..500, default 50): `{"session_id","conversation","transcript","commands":[{"seq","conversation","message_id","timestamp","block_index","lang","shell","text","command","source"}]}` |
@@ -299,7 +299,7 @@ Screen text: `source=visible` (default) is the screen's rows (`lines` is refused
 ```bash
 T=$(fw hub token)
 curl -s -H "Authorization: Bearer $T" -H 'content-type: application/json' \
-  -d '{"name":"flywheel","repos":["/home/me/code/flywheel"]}' http://127.0.0.1:7420/api/workspaces
+  -d '{"name":"flywheel","folders":["/home/me/code/flywheel"]}' http://127.0.0.1:7420/api/workspaces
 ```
 
 ## Web UI

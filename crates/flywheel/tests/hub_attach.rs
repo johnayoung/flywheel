@@ -294,7 +294,7 @@ fn setup() -> (tempfile::TempDir, std::path::PathBuf, Server, String) {
         &server,
         "POST",
         "/api/workspaces",
-        Some(json!({ "name": "demo", "repos": [dir.join("repo")] })),
+        Some(json!({ "name": "demo", "folders": [dir.join("repo")] })),
     );
     assert_eq!(code, 201, "{workspace}");
     let ws = workspace["id"].as_str().unwrap().to_owned();
@@ -743,7 +743,7 @@ fn wait_returns_when_the_agent_reports_done_and_times_out_with_124() {
     // Unknown session: exit 1.
     let (code, _, stderr) = finish(wait_cmd(&dir, &["nope", "--until", "exit"]));
     assert_eq!(code, Some(1));
-    assert!(stderr.contains("no session named"), "{stderr}");
+    assert!(stderr.contains("no session matches"), "{stderr}");
 }
 
 #[test]

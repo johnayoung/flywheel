@@ -161,6 +161,7 @@ fn grade(passed: bool, lines: u64, graders: Vec<GraderRun>) -> Grade {
         cost_usd: None,
         tokens: 0,
         error: None,
+        operator: false,
     }
 }
 

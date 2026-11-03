@@ -522,16 +522,20 @@ impl Fanouts {
                 Err(e) => error = Some(e),
             }
         }
+        // Errors no agent can fix: the board offers it no Ask to fix.
+        let mut operator = false;
         if error.is_none()
             && let Some(why) = super::pins_broken(&fanout.pins)
         {
             error = Some(why);
+            operator = true;
         }
         let mut graders: Vec<GraderRun> = Vec::new();
         if error.is_none() {
             match &self.runner {
                 None => {
-                    error = Some("this hub has no grader runner (start it with `fw hub`)".into())
+                    error = Some("this hub has no grader runner (start it with `fw hub`)".into());
+                    operator = true;
                 }
                 Some(runner) => {
                     let request = GradeRequest {
@@ -624,6 +628,7 @@ impl Fanouts {
             cost_usd,
             tokens,
             error,
+            operator,
         };
         let summary = match grade.failure() {
             None => format!("pass ({} lines changed)", grade.diff.lines()),
@@ -1192,6 +1197,12 @@ impl Fanouts {
             .grade
             .as_ref()
             .ok_or_else(|| conflict(format!("{label} has not been graded")))?;
+        if grade.operator {
+            return Err(conflict(format!(
+                "{label} could not be graded, and that is not its agent's to fix: {}",
+                grade.error.as_deref().unwrap_or("grading failed")
+            )));
+        }
         let prompt =
             fix_prompt(grade).ok_or_else(|| conflict(format!("{label} passes: nothing to fix")))?;
         let session = hub.session(&candidate.session_id)?;

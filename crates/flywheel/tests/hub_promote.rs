@@ -521,4 +521,25 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
             "{id}: {listed:?}"
         );
     }
+    // The oracle changed under the fan-out: that is the operator's to
+    // restore, so its agent is asked nothing (nor told a held-out grader
+    // exists).
+    let mut changed = read(&oracle);
+    changed.push_str("# edited\n");
+    std::fs::write(&oracle, changed).unwrap();
+    env.ok(&["fanout", "grade", &sid, "c2"]);
+    let regraded = env.json(&["fanout", "wait", &sid, "--timeout", "90", "--json"]);
+    let grade = &candidate(&regraded, "c2")["grade"];
+    assert_eq!(grade["operator"], true, "{grade:#}");
+    assert!(
+        grade["error"]
+            .as_str()
+            .unwrap()
+            .contains("1 held-out grader script")
+    );
+    let refused = env.fw(&["fanout", "fix", &sid, "c2", "--json"]);
+    assert!(!refused.status.success());
+    let refused = String::from_utf8_lossy(&refused.stderr);
+    assert!(refused.contains("not its agent's to fix"), "{refused}");
+    assert!(!refused.contains("exact.sh"), "{refused}");
 }

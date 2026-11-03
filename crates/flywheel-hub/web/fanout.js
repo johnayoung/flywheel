@@ -381,7 +381,9 @@ window.FwHubFanout = function (ctx) {
       if (session) actions.push(actionButton("Review", "Its commits and diffs (review drawer)", () => { board.close(); ctx.openReview(c.session_id); }));
       if (!f.winner) {
         actions.push(actionButton("Re-grade", "Run the graders again now", () => regrade(f, c), { pending: isBusy(f, c, "grade"), disabled: c.verdict === "pending" || !ui.runner }));
-        if (g && !g.passed && session && session.state === "running" && c.verdict !== "pending") {
+        // An operator-side failure (a changed grader script) is not the
+        // agent's to fix: the card's error says what to do instead.
+        if (g && !g.passed && !g.operator && session && session.state === "running" && c.verdict !== "pending") {
           actions.push(actionButton("Ask to fix", "Paste what failed into its agent; it is graded again when it finishes", () => fix(f, c), { pending: isBusy(f, c, "fix") }));
         }
         if (c.verdict === "pass") {

@@ -282,6 +282,11 @@ pub struct Grade {
     /// Grading itself failed (git, the runner): the candidate fails.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// `error` is the operator's to fix, not the agent's (a pinned grader
+    /// script changed, no grader runner): nothing is asked of the agent,
+    /// whose prompt must never hear of the held-out graders involved.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub operator: bool,
 }
 
 impl Grade {
@@ -1013,9 +1018,10 @@ pub fn task_name(name: &str, tag: &str, label: &str) -> String {
     format!("{slug}-{tag}-{label}")
 }
 
-/// The prompt "ask candidate to fix" pastes: what failed and its output.
+/// The prompt "ask candidate to fix" pastes: what failed and its output
+/// (`None`: it passes, or the failure is the operator's to fix).
 pub fn fix_prompt(grade: &Grade) -> Option<String> {
-    if grade.passed {
+    if grade.passed || grade.operator {
         return None;
     }
     if let Some(error) = &grade.error {

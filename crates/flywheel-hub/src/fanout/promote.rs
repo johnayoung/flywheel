@@ -806,6 +806,7 @@ mod tests {
                 cost_usd: None,
                 tokens: 0,
                 error: None,
+                operator: false,
             }),
             gradings: 1,
             fixes: 0,
@@ -1232,5 +1233,10 @@ mod tests {
         let prompt = crate::fanout::fix_prompt(&grade).unwrap();
         assert!(!prompt.contains("secret-oracle"), "{prompt}");
         assert!(prompt.contains("[held-out]"), "{prompt}");
+        // A broken pin is the operator's: the agent is asked nothing (and
+        // so never hears that a held-out grader exists).
+        grade.error = Some(why);
+        grade.operator = true;
+        assert_eq!(crate::fanout::fix_prompt(&grade), None);
     }
 }

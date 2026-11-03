@@ -4,7 +4,7 @@
 
 use crate::endpoint::{Endpoint, EndpointArgs};
 use crate::script::{query_escape, resolve};
-use crate::util::{fail, str_field};
+use crate::util::{fail, print_json, str_field};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 
@@ -237,11 +237,7 @@ fn ls(args: &LsArgs, out: &mut dyn Write) -> Result<(), String> {
         .transpose()?;
     let templates = list(&conn, only.as_deref())?;
     if args.json {
-        let _ = writeln!(
-            out,
-            "{}",
-            serde_json::to_string_pretty(&json!({ "templates": templates })).unwrap_or_default()
-        );
+        print_json(out, &json!({ "templates": templates }));
         return Ok(());
     }
     if templates.is_empty() {

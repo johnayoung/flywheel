@@ -4,7 +4,7 @@
 use crate::cli::{StateDirArg, resolve_state_dir};
 use crate::config::{self, CONFIG_FILE};
 use crate::endpoint::Endpoint;
-use crate::util::fail;
+use crate::util::{fail, print_json};
 use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
@@ -129,11 +129,7 @@ fn show(args: &ShowArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         },
     };
     if args.json {
-        let _ = writeln!(
-            out,
-            "{}",
-            serde_json::to_string_pretty(&view).unwrap_or_default()
-        );
+        print_json(out, &view);
         return 0;
     }
     print_view(&view, out);

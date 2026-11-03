@@ -2,9 +2,9 @@
 //! sessions (scrollback, agent transcripts, suggested commands).
 
 use crate::endpoint::{Endpoint, EndpointArgs};
-use crate::script::resolve;
+use crate::script::{query_escape, resolve};
 use crate::search::{DEFAULT_LIMIT, DEFAULT_PER_SESSION, MAX_LIMIT, MAX_OFFSET, MAX_PER_SESSION};
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use crate::util::str_field;
 use serde_json::Value;
 use std::io::{IsTerminal, Write};
 
@@ -83,15 +83,11 @@ fn names<T: PartialEq>(picked: &[T], table: &[(T, &'static str)]) -> String {
         .join(",")
 }
 
-fn encode(text: &str) -> String {
-    utf8_percent_encode(text, NON_ALPHANUMERIC).to_string()
-}
-
 /// The `/api/search` path for `args` (ids already resolved).
 fn path_of(args: &SearchArgs, session: Option<&str>, workspace: Option<&str>) -> String {
     let mut path = format!(
         "/api/search?q={}&limit={}&per_session={}",
-        encode(&args.query),
+        query_escape(&args.query),
         args.limit,
         args.per_session
     );
@@ -105,10 +101,10 @@ fn path_of(args: &SearchArgs, session: Option<&str>, workspace: Option<&str>) ->
         path.push_str("&case=true");
     }
     if let Some(id) = session {
-        path.push_str(&format!("&session={}", encode(id)));
+        path.push_str(&format!("&session={}", query_escape(id)));
     }
     if let Some(id) = workspace {
-        path.push_str(&format!("&ws={}", encode(id)));
+        path.push_str(&format!("&ws={}", query_escape(id)));
     }
     if !args.kind.is_empty() {
         path.push_str(&format!("&kind={}", names(&args.kind, &KINDS)));
@@ -136,14 +132,14 @@ fn search(args: &SearchArgs) -> Result<Value, String> {
     let session = match &args.session {
         Some(wanted) => {
             let sessions = conn.blocking_sessions()?;
-            Some(field(resolve(&sessions, wanted, "session")?, "id").to_owned())
+            Some(str_field(resolve(&sessions, wanted, "session")?, "id").to_owned())
         }
         None => None,
     };
     let workspace = match &args.workspace {
         Some(wanted) => {
             let workspaces = conn.blocking_workspaces()?;
-            Some(field(resolve(&workspaces, wanted, "workspace")?, "id").to_owned())
+            Some(str_field(resolve(&workspaces, wanted, "workspace")?, "id").to_owned())
         }
         None => None,
     };
@@ -154,14 +150,10 @@ fn search(args: &SearchArgs) -> Result<Value, String> {
     )
 }
 
-fn field<'a>(value: &'a Value, key: &str) -> &'a str {
-    value.get(key).and_then(Value::as_str).unwrap_or_default()
-}
-
 /// `value`'s string `key` safe for a terminal: control characters (an
 /// agent-written escape sequence) shown as spaces.
 fn text(value: &Value, key: &str) -> String {
-    plain(field(value, key))
+    plain(str_field(value, key))
 }
 
 fn plain(text: &str) -> String {
@@ -198,9 +190,9 @@ fn local_time(raw: &str) -> String {
 /// One hit as a line: where, then the snippet with the match marked.
 pub fn hit_line(hit: &Value, color: bool) -> String {
     let n = |key: &str| hit.get(key).and_then(Value::as_u64).unwrap_or_default();
-    let place = match field(hit, "source") {
+    let place = match str_field(hit, "source") {
         "scrollback" => {
-            let screen = if field(hit, "screen") == "alternate" {
+            let screen = if str_field(hit, "screen") == "alternate" {
                 " alt"
             } else {
                 ""
@@ -208,7 +200,7 @@ pub fn hit_line(hit: &Value, color: bool) -> String {
             format!("scrollback{screen} -{}", n("from_end"))
         }
         "transcript" => {
-            let who = match field(hit, "kind") {
+            let who = match str_field(hit, "kind") {
                 "tool" => format!("tool {}", text(hit, "tool")),
                 _ => text(hit, "role"),
             };
@@ -276,7 +268,7 @@ fn render(
             text(group, "session"),
             text(group, "kind"),
             text(group, "state"),
-            field(group, "session_id").get(..8).unwrap_or_default(),
+            str_field(group, "session_id").get(..8).unwrap_or_default(),
         )
         .map_err(io)?;
         let shown = group

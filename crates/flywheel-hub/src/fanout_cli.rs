@@ -5,11 +5,12 @@
 //! label (`c1`) or session name.
 
 use crate::endpoint::{Endpoint, EndpointArgs, client_id};
+use crate::review_cli::render_plan;
 use crate::script::{pick_folder, resolve, tokens_label};
-use crate::util::{fail, str_field};
+use crate::util::{approved, fail, list, str_field, write_json};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::io::{BufRead, IsTerminal, Read, Write};
+use std::io::{Read, Write};
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -329,44 +330,8 @@ pub(crate) fn main(args: &FanoutArgs, out: &mut dyn Write, err: &mut dyn Write) 
     }
 }
 
-fn print_json(out: &mut dyn Write, value: &Value) -> Result<(), String> {
-    writeln!(
-        out,
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    )
-    .map_err(|e| e.to_string())
-}
-
-fn list<'a>(v: &'a Value, k: &str) -> &'a [Value] {
-    v.get(k)
-        .and_then(Value::as_array)
-        .map_or(&[], Vec::as_slice)
-}
-
 fn short(sha: &str) -> &str {
     &sha[..sha.len().min(12)]
-}
-
-/// Ask on the terminal; `false` unless the answer is yes.
-fn ask(question: &str, err: &mut dyn Write) -> bool {
-    let _ = write!(err, "{question} [y/N] ");
-    let _ = err.flush();
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
-}
-
-fn approved(yes: bool, json: bool, question: &str, err: &mut dyn Write) -> bool {
-    if yes {
-        return true;
-    }
-    if json || !std::io::stdin().is_terminal() {
-        return false;
-    }
-    ask(question, err)
 }
 
 /// The fan-out `query` names: `(id, view)`.
@@ -488,7 +453,7 @@ fn new(args: &NewArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, 
     }
     let view = conn.blocking_call("POST", "/api/fanouts", Some(&body))?;
     if args.json {
-        print_json(out, &view)?;
+        write_json(out, &view).map_err(|e| e.to_string())?;
     } else {
         writeln!(out, "{}", str_field(&view, "id")).map_err(|e| e.to_string())?;
     }
@@ -499,7 +464,7 @@ fn ls(args: &ListArgs, out: &mut dyn Write) -> Result<i32, String> {
     let conn = Endpoint::resolve(&args.endpoint)?;
     let listed = conn.blocking_call("GET", "/api/fanouts", None)?;
     if args.json {
-        print_json(out, &listed)?;
+        write_json(out, &listed).map_err(|e| e.to_string())?;
         return Ok(0);
     }
     let io = |e: std::io::Error| e.to_string();
@@ -708,7 +673,7 @@ fn show(args: &ShowArgs, out: &mut dyn Write) -> Result<i32, String> {
     let (id, _) = find(&conn, &args.fanout)?;
     let view = conn.blocking_call("GET", &format!("/api/fanouts/{id}"), None)?;
     if args.json {
-        print_json(out, &view)?;
+        write_json(out, &view).map_err(|e| e.to_string())?;
     } else {
         render(&view, args.verbose, out).map_err(|e| e.to_string())?;
     }
@@ -826,7 +791,7 @@ fn wait(args: &WaitArgs, out: &mut dyn Write) -> Result<i32, String> {
     match end {
         WaitEnd::Settled(view) => {
             if args.json {
-                print_json(out, &view)?;
+                write_json(out, &view).map_err(|e| e.to_string())?;
             } else {
                 render(&view, false, out).map_err(|e| e.to_string())?;
             }
@@ -872,7 +837,7 @@ fn fix(args: &ConfirmArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i
     }
     if !approved(args.yes, args.json, "Paste it?", err) {
         if args.json {
-            print_json(out, &plan)?;
+            write_json(out, &plan).map_err(|e| e.to_string())?;
             return Ok(0);
         }
         let _ = writeln!(
@@ -883,7 +848,7 @@ fn fix(args: &ConfirmArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i
     }
     let done = conn.blocking_call("POST", &url, Some(&json!({ "candidate": label })))?;
     if args.json {
-        print_json(out, &done)?;
+        write_json(out, &done).map_err(|e| e.to_string())?;
     } else {
         writeln!(
             out,
@@ -892,20 +857,6 @@ fn fix(args: &ConfirmArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i
         .map_err(io)?;
     }
     Ok(0)
-}
-
-fn render_plan(plan: &Value, out: &mut dyn Write) -> std::io::Result<()> {
-    writeln!(out, "{}", str_field(plan, "summary"))?;
-    for d in list(plan, "details") {
-        writeln!(out, "  {}", d.as_str().unwrap_or_default())?;
-    }
-    for w in list(plan, "warnings") {
-        writeln!(out, "  warning: {}", w.as_str().unwrap_or_default())?;
-    }
-    for c in list(plan, "commands") {
-        writeln!(out, "  $ {}", str_field(c, "display"))?;
-    }
-    Ok(())
 }
 
 fn render_cleanup(items: &[Value], out: &mut dyn Write) -> std::io::Result<()> {
@@ -974,7 +925,7 @@ fn pick(args: &PickArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
             .and_then(Value::as_bool)
             == Some(true);
         if args.json {
-            print_json(out, &done)?;
+            write_json(out, &done).map_err(|e| e.to_string())?;
         } else {
             writeln!(
                 out,
@@ -995,7 +946,7 @@ fn pick(args: &PickArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
     }
     if let Some(why) = plan.get("refusal").and_then(Value::as_str) {
         if args.json {
-            print_json(out, &plan)?;
+            write_json(out, &plan).map_err(|e| e.to_string())?;
         }
         let hint = if needs_rebase {
             " (--rebase rebases it first; it is then graded again)"
@@ -1010,7 +961,7 @@ fn pick(args: &PickArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
     }
     if !approved(args.yes, args.json, "Merge?", err) {
         if args.json {
-            print_json(out, &plan)?;
+            write_json(out, &plan).map_err(|e| e.to_string())?;
             return Ok(0);
         }
         let _ = writeln!(
@@ -1025,7 +976,7 @@ fn pick(args: &PickArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
         Some(&json!({ "candidate": label, "confirm": str_field(&merge, "fingerprint") })),
     )?;
     if args.json {
-        print_json(out, &done)?;
+        write_json(out, &done).map_err(|e| e.to_string())?;
         return Ok(0);
     }
     let merged = done.get("merge").cloned().unwrap_or(Value::Null);
@@ -1085,7 +1036,7 @@ fn promote(args: &PromoteArgs, out: &mut dyn Write, err: &mut dyn Write) -> Resu
     }
     if !approved(args.yes, args.json, "Write it?", err) {
         if args.json {
-            print_json(out, &plan)?;
+            write_json(out, &plan).map_err(|e| e.to_string())?;
             return Ok(0);
         }
         let _ = writeln!(
@@ -1098,7 +1049,7 @@ fn promote(args: &PromoteArgs, out: &mut dyn Write, err: &mut dyn Write) -> Resu
     body["confirm"] = json!(str_field(&plan, "fingerprint"));
     let done = conn.blocking_call("POST", &url, Some(&body))?;
     if args.json {
-        print_json(out, &done)?;
+        write_json(out, &done).map_err(|e| e.to_string())?;
         return Ok(0);
     }
     let written = done.get("written").unwrap_or(&Value::Null);
@@ -1173,7 +1124,7 @@ fn cleanup(args: &CleanupArgs, out: &mut dyn Write, err: &mut dyn Write) -> Resu
     }
     if !approved(args.yes, args.json, "Go ahead?", err) {
         if args.json {
-            print_json(out, &plan)?;
+            write_json(out, &plan).map_err(|e| e.to_string())?;
             return Ok(0);
         }
         let _ = writeln!(
@@ -1189,7 +1140,7 @@ fn cleanup(args: &CleanupArgs, out: &mut dyn Write, err: &mut dyn Write) -> Resu
             i.get("done").and_then(Value::as_bool) == Some(true) || i.get("error").is_some()
         });
     if args.json {
-        print_json(out, &done)?;
+        write_json(out, &done).map_err(|e| e.to_string())?;
     } else if !carried.is_empty() {
         // The refused ones were listed above, reasons and all.
         writeln!(out).map_err(io)?;

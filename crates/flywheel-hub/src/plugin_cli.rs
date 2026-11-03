@@ -5,7 +5,7 @@
 
 use crate::cli::{StateDirArg, resolve_state_dir};
 use crate::plugins;
-use crate::util::fail;
+use crate::util::{fail, print_json};
 use serde_json::{Value, json};
 use std::io::Write;
 
@@ -78,11 +78,7 @@ pub(crate) fn main(args: &PluginArgs, out: &mut dyn Write, err: &mut dyn Write) 
                 .collect();
             if a.json {
                 let doc = json!({"dir": dir.join(plugins::PLUGINS_DIR).to_string_lossy(), "plugins": views});
-                let _ = writeln!(
-                    out,
-                    "{}",
-                    serde_json::to_string_pretty(&doc).unwrap_or_default()
-                );
+                print_json(out, &doc);
                 return 0;
             }
             if views.is_empty() {

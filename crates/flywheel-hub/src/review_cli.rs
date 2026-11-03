@@ -5,9 +5,10 @@
 //! hub's review API.
 
 use crate::endpoint::{Endpoint, EndpointArgs};
-use crate::script::session_label;
+use crate::script::{query_escape, session_label};
+use crate::util::{approved, list, str_field, write_json};
 use serde_json::{Value, json};
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::Write;
 use std::time::Duration;
 
 /// The reader of our output went away (`| head`): stop quietly.
@@ -75,27 +76,13 @@ pub struct MergeArgs {
     endpoint: EndpointArgs,
 }
 
-fn s<'a>(v: &'a Value, k: &str) -> &'a str {
-    v.get(k).and_then(Value::as_str).unwrap_or("")
-}
-
 fn n(v: &Value, k: &str) -> u64 {
     v.get(k).and_then(Value::as_u64).unwrap_or(0)
-}
-
-fn list<'a>(v: &'a Value, k: &str) -> &'a [Value] {
-    v.get(k)
-        .and_then(Value::as_array)
-        .map_or(&[], Vec::as_slice)
 }
 
 fn find(conn: &Endpoint, query: &str) -> Result<(String, String), String> {
     let (id, session) = crate::script::find_session(conn, query)?;
     Ok((id, session_label(&session)))
-}
-
-fn query_escape(raw: &str) -> String {
-    url::form_urlencoded::byte_serialize(raw.as_bytes()).collect()
 }
 
 /// Run `fw hub review`.
@@ -155,12 +142,7 @@ pub fn review(args: &ReviewArgs, out: &mut dyn Write, err: &mut dyn Write) -> i3
             None,
         )?;
         if args.json {
-            writeln!(
-                out,
-                "{}",
-                serde_json::to_string_pretty(&review).unwrap_or_default()
-            )
-            .map_err(io)?;
+            write_json(out, &review).map_err(io)?;
         } else {
             render_review(&review, out).map_err(io)?;
         }
@@ -184,7 +166,7 @@ fn counts(f: &Value) -> String {
 }
 
 fn file_line(f: &Value) -> String {
-    let status = match s(f, "status") {
+    let status = match str_field(f, "status") {
         "added" => "A",
         "deleted" => "D",
         "renamed" => "R",
@@ -194,8 +176,8 @@ fn file_line(f: &Value) -> String {
         _ => "M",
     };
     let path = match f.get("old_path").and_then(Value::as_str) {
-        Some(old) => format!("{old} -> {}", s(f, "path")),
-        None => s(f, "path").to_owned(),
+        Some(old) => format!("{old} -> {}", str_field(f, "path")),
+        None => str_field(f, "path").to_owned(),
     };
     format!("  {status} {:>12}  {path}", counts(f))
 }
@@ -235,14 +217,21 @@ fn render_review(r: &Value, out: &mut dyn Write) -> std::io::Result<()> {
         .map(str::to_owned)
         .or(rebasing)
         .unwrap_or_else(|| "(detached HEAD)".to_owned());
-    let base_is_upstream = r.get("base").is_some_and(|b| s(b, "source") == "upstream");
-    writeln!(out, "{} in {}", s(r, "session"), s(r, "dir"))?;
+    let base_is_upstream = r
+        .get("base")
+        .is_some_and(|b| str_field(b, "source") == "upstream");
+    writeln!(
+        out,
+        "{} in {}",
+        str_field(r, "session"),
+        str_field(r, "dir")
+    )?;
     match r.get("base").filter(|b| !b.is_null()) {
         Some(base) => writeln!(
             out,
             "{branch} vs {} ({}): {} ahead, {} behind",
-            s(base, "name"),
-            s(base, "source"),
+            str_field(base, "name"),
+            str_field(base, "source"),
             n(r, "ahead"),
             n(r, "behind")
         )?,
@@ -257,7 +246,7 @@ fn render_review(r: &Value, out: &mut dyn Write) -> std::io::Result<()> {
         writeln!(
             out,
             "upstream {}: {} ahead, {} behind",
-            s(up, "name"),
+            str_field(up, "name"),
             n(up, "ahead"),
             n(up, "behind")
         )?;
@@ -274,10 +263,10 @@ fn render_review(r: &Value, out: &mut dyn Write) -> std::io::Result<()> {
             writeln!(
                 out,
                 "  {}  {}  ({}, {})",
-                s(c, "short"),
-                s(c, "subject"),
-                s(c, "author"),
-                s(c, "date")
+                str_field(c, "short"),
+                str_field(c, "subject"),
+                str_field(c, "author"),
+                str_field(c, "date")
             )?;
         }
     }
@@ -306,7 +295,7 @@ fn render_review(r: &Value, out: &mut dyn Write) -> std::io::Result<()> {
         gap(out)?;
         writeln!(out, "untracked ({}):", untracked.len())?;
         for u in untracked {
-            writeln!(out, "  ? {}", s(u, "path"))?;
+            writeln!(out, "  ? {}", str_field(u, "path"))?;
         }
     }
     let conflicts = list(r, "conflicts");
@@ -320,8 +309,8 @@ fn render_review(r: &Value, out: &mut dyn Write) -> std::io::Result<()> {
     Ok(())
 }
 
-fn render_plan(plan: &Value, out: &mut dyn Write) -> std::io::Result<()> {
-    writeln!(out, "{}", s(plan, "summary"))?;
+pub(crate) fn render_plan(plan: &Value, out: &mut dyn Write) -> std::io::Result<()> {
+    writeln!(out, "{}", str_field(plan, "summary"))?;
     for d in list(plan, "details") {
         writeln!(out, "  {}", d.as_str().unwrap_or_default())?;
     }
@@ -329,20 +318,9 @@ fn render_plan(plan: &Value, out: &mut dyn Write) -> std::io::Result<()> {
         writeln!(out, "  warning: {}", w.as_str().unwrap_or_default())?;
     }
     for c in list(plan, "commands") {
-        writeln!(out, "  $ {}", s(c, "display"))?;
+        writeln!(out, "  $ {}", str_field(c, "display"))?;
     }
     Ok(())
-}
-
-/// Ask on the terminal; `false` unless the answer is yes.
-fn ask(question: &str, err: &mut dyn Write) -> bool {
-    let _ = write!(err, "{question} [y/N] ");
-    let _ = err.flush();
-    let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
 }
 
 /// Run `fw hub merge`.
@@ -355,17 +333,6 @@ pub fn merge(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 
             1
         }
     }
-}
-
-/// Whether to go ahead with `plan`: `--yes`, else a yes on the terminal.
-fn approved(args: &MergeArgs, question: &str, err: &mut dyn Write) -> Result<bool, String> {
-    if args.yes {
-        return Ok(true);
-    }
-    if args.json || !std::io::stdin().is_terminal() {
-        return Ok(false);
-    }
-    Ok(ask(question, err))
 }
 
 fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
@@ -397,7 +364,7 @@ fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Re
         if !args.json {
             render_plan(&rebase, out).map_err(io)?;
         }
-        if !approved(args, "Rebase?", err)? {
+        if !approved(args.yes, args.json, "Rebase?", err) {
             if args.json {
                 writeln!(out, "{rebase}").map_err(io)?;
             } else {
@@ -412,18 +379,18 @@ fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Re
         let done = conn.blocking_call(
             "POST",
             &format!("/api/sessions/{id}/review/rebase"),
-            Some(&json!({ "confirm": s(&rebase, "fingerprint") })),
+            Some(&json!({ "confirm": str_field(&rebase, "fingerprint") })),
         )?;
         if done.get("ok").and_then(Value::as_bool) != Some(true) {
             if args.json {
                 writeln!(out, "{done}").map_err(io)?;
             } else {
-                writeln!(out, "{}", s(&done, "summary")).map_err(io)?;
+                writeln!(out, "{}", str_field(&done, "summary")).map_err(io)?;
             }
             return Ok(1);
         }
         if !args.json {
-            writeln!(out, "{}\n", s(&done, "summary")).map_err(io)?;
+            writeln!(out, "{}\n", str_field(&done, "summary")).map_err(io)?;
         }
         plan = conn.blocking_call(
             "POST",
@@ -445,7 +412,7 @@ fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Re
     if !args.json {
         render_plan(&plan, out).map_err(io)?;
     }
-    if !approved(args, "Merge?", err)? {
+    if !approved(args.yes, args.json, "Merge?", err) {
         if args.json {
             writeln!(out, "{plan}").map_err(io)?;
             return Ok(0);
@@ -460,11 +427,11 @@ fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Re
     let done = conn.blocking_call(
         "POST",
         &format!("/api/sessions/{id}/review/merge"),
-        Some(&json!({ "confirm": s(&plan, "fingerprint") })),
+        Some(&json!({ "confirm": str_field(&plan, "fingerprint") })),
     )?;
     let mut report = json!({ "merge": done });
     if !args.json {
-        writeln!(out, "{}", s(&report["merge"], "summary")).map_err(io)?;
+        writeln!(out, "{}", str_field(&report["merge"], "summary")).map_err(io)?;
     }
     if args.remove_worktree {
         let removed = conn.blocking_call(
@@ -479,8 +446,8 @@ fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Re
                     writeln!(
                         out,
                         "removed {label} and worktree {}; branch {} {}",
-                        s(&wt, "path"),
-                        s(&wt, "branch"),
+                        str_field(&wt, "path"),
+                        str_field(&wt, "branch"),
                         if wt.get("branch_deleted").and_then(Value::as_bool) == Some(true) {
                             "deleted (merged)"
                         } else {
@@ -538,7 +505,7 @@ fn abort_rebase(
     if !args.json {
         render_plan(&plan, out).map_err(io)?;
     }
-    if !approved(args, "Abort the rebase?", err)? {
+    if !approved(args.yes, args.json, "Abort the rebase?", err) {
         if args.json {
             writeln!(out, "{plan}").map_err(io)?;
             return Ok(0);
@@ -553,12 +520,12 @@ fn abort_rebase(
     let done = conn.blocking_call(
         "POST",
         &url,
-        Some(&json!({ "confirm": s(&plan, "fingerprint") })),
+        Some(&json!({ "confirm": str_field(&plan, "fingerprint") })),
     )?;
     if args.json {
         writeln!(out, "{done}").map_err(io)?;
     } else {
-        writeln!(out, "{}", s(&done, "summary")).map_err(io)?;
+        writeln!(out, "{}", str_field(&done, "summary")).map_err(io)?;
     }
     Ok(0)
 }

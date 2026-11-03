@@ -1,16 +1,25 @@
 //! Small helpers the CLI verbs and file watchers share.
 
+use serde::Serialize;
 use serde_json::Value;
-use std::io::Write;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
-/// Print `value` as pretty JSON on its own line (a `--json` answer).
-pub(crate) fn print_json(out: &mut dyn Write, value: &Value) {
-    let _ = writeln!(
+/// Write `value` as pretty JSON on its own line (a `--json` answer).
+pub(crate) fn write_json<T: Serialize + ?Sized>(
+    out: &mut dyn Write,
+    value: &T,
+) -> std::io::Result<()> {
+    writeln!(
         out,
         "{}",
         serde_json::to_string_pretty(value).unwrap_or_default()
-    );
+    )
+}
+
+/// [`write_json`], for a verb whose exit code does not depend on the write.
+pub(crate) fn print_json<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) {
+    let _ = write_json(out, value);
 }
 
 /// Print `fw hub: <message>` to `err`; the failing exit code (1).
@@ -22,6 +31,36 @@ pub(crate) fn fail(err: &mut dyn Write, message: &str) -> i32 {
 /// `item[field]` as a string, `""` when missing or not a string.
 pub(crate) fn str_field<'a>(item: &'a Value, field: &str) -> &'a str {
     item.get(field).and_then(Value::as_str).unwrap_or("")
+}
+
+/// `item[field]` as an array, empty when missing or not an array.
+pub(crate) fn list<'a>(item: &'a Value, field: &str) -> &'a [Value] {
+    item.get(field)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// Ask on the terminal; `false` unless the answer is yes.
+pub(crate) fn ask(question: &str, err: &mut dyn Write) -> bool {
+    let _ = write!(err, "{question} [y/N] ");
+    let _ = err.flush();
+    let mut line = String::new();
+    if std::io::stdin().lock().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes")
+}
+
+/// Whether to go ahead with a guarded action: `--yes`, else a yes on the
+/// terminal (never asked under `--json` or without a terminal).
+pub(crate) fn approved(yes: bool, json: bool, question: &str, err: &mut dyn Write) -> bool {
+    if yes {
+        return true;
+    }
+    if json || !std::io::stdin().is_terminal() {
+        return false;
+    }
+    ask(question, err)
 }
 
 /// One word as a shell reads it back verbatim: as is when every character

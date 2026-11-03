@@ -9,7 +9,8 @@ Trust model, auth, remote access, TLS, machines, share links. Front door: [hub](
 - Protect the state dir like `~/.ssh`: full-disk encryption, no unencrypted backups. Every secret file is 0600, the dir 0700.
 - **Status reports are advisory**: hooks report over `<state-dir>/report.sock` (unix socket, never on the network) with a per-spawn secret valid for one session; they cannot start, stop, or change a session.
 - Share links are read-only but show everything the terminal shows ([below](#share-links)).
-- Held-out graders are kept out of what the hub tells agents, not out of their reach ([hub-workflows](workflows.md#fan-outs-and-flywheel-tasks)).
+- Plugins (`<state-dir>/plugins/`) are your executables, run as you; disabled until enabled.
+- Held-out graders: kept out of what the hub tells agents, not out of their reach ([hub-workflows](workflows.md#fan-outs-and-flywheel-tasks)).
 
 ## Auth
 

@@ -7,7 +7,7 @@ How the hub behaves underneath the UI. Front door: [hub](../hub.md).
 - **Workspace**: a unique name + 1..32 **folders** (existing dirs, absolute or `~/`), each a git work-tree root or a plain dir, with an optional label. Repo-only features (worktrees, branch badges) apply where `git` is true.
 - A **missing** folder (moved, unmounted) refuses new sessions until it is back or removed. `git` / `missing` are re-read on every listing.
 - **Session**: one PTY in one folder. Kind `shell` (`$SHELL` or an argv), `claude`, or `codex` (resolved on the hub's `PATH`; missing CLI = 400).
-- Session states: `running`, `exited` (code or signal; scrollback stays attachable), `stopped` (hub stopped while it ran; carries `last_cwd`, `restore_error`).
+- Session states: `running`, `exited` (code or signal; its PTY closes, scrollback stays attachable), `stopped` (hub stopped while it ran; carries `last_cwd`, `restore_error`).
 - Persisted in `<state-dir>/state.json` (atomic writes, schema 5 -- 2 layouts, 3 launch templates, 4 fan-outs, 5 prompt queues; older files migrate, newer are refused).
 - Kill hangs up the whole session: the leader's group plus background jobs (Linux scans `/proc`; elsewhere the leader's group only).
 - Terminal size is shared (max 500x300). In the web UI a pane resizes the PTY only while focused or sole viewer, after a divider drag ends; other panes clip to the shared size (badge `NNxNN · another viewer's size`).

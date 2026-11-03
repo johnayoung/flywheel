@@ -7,15 +7,7 @@
 - **A hub is a shell over HTTP.** Anyone holding its token, a login cookie, a peer credential for it, or a shell in one of its sessions has a shell as you.
 - **Agents are not sandboxed.** They run as you and can read the state dir: the token, and `machines.json`'s credentials for every registered machine. Run untrusted agents under another user or in a container.
 - **Bind:** `127.0.0.1` by default. For other devices use `tailscale serve` (recommended) or `--bind 0.0.0.0 --tls auto` (built-in HTTPS, name-constrained local CA). Never plain `--bind 0.0.0.0` on an untrusted network: plain HTTP, and phones lose clipboard, notifications, and install.
-- **Trust model, one line each:**
-  - token (`<state-dir>/token`, 0600) and login cookies: full control.
-  - peer credential (`fw hub peer issue`): equivalent to the token; it can start sessions that read the token file.
-  - share link (`fw hub share`): read-only, but shows everything that terminal shows, typed secrets included.
-  - plugins (`<state-dir>/plugins/`): your executables, run as you, unsandboxed; disabled until you enable them.
-  - local CA (`--tls auto`): installing it trusts this hub's names only; check the fingerprint (`fw hub tls ca`).
-  - agent status reports: advisory UI state; they cannot start, stop, or change a session.
-
-Details: [hub-security](hub/security.md).
+- Share links are read-only but show everything the terminal shows; plugins are your executables, unsandboxed. The rest of the trust model: [hub-security](hub/security.md#trust-model).
 
 ## 60-second quickstart
 
@@ -25,7 +17,7 @@ fw hub doctor                                  # optional: PATH, claude/codex, h
 fw hub start                                   # detached on 127.0.0.1:7420; prints one-time login URLs
 fw hub open                                    # this machine's browser, signed in
 fw hub import ~/code/*.code-workspace          # VS Code multi-root workspaces -> hub workspaces
-id=$(fw hub new personal --kind claude --prompt "Fix the failing test")   # or the UI's New session (Alt N)
+id=$(fw hub new myrepo --create --folder ~/code/myrepo --kind claude --prompt "Fix the failing test")   # or the UI (Alt N)
 fw hub wait "$id" --until done --timeout 900
 fw hub commands "$id" --last --copy            # newest suggested shell block, exact text, OSC 52 copy
 ```
@@ -92,10 +84,4 @@ Full syntax, flags, and files: [hub-reference](hub/reference.md). `fw hub <verb>
 
 ## More
 
-- [hub-reference](hub/reference.md) -- every verb and flag, serve flags, `hub.toml`, `notify.toml`, `plugin.toml`, state-dir files, keyboard shortcuts.
-- [hub-api](hub/api.md) -- REST routes, terminal and events WebSockets, plugin payloads.
-- [hub-security](hub/security.md) -- auth, remote access, TLS, machines and peers, share links, connection bounds.
-- [hub-workflows](hub/workflows.md) -- scripting, launcher, suggested commands, usage, worktrees, review, handoff, fan-out, Flywheel panel.
-- [hub-internals](hub/internals.md) -- model, terminal emulation, lifecycle, restore, live handoff, status detection, layout, phone, search, recording, push, doctor.
-
-Read each with `fw docs <topic>`, e.g. `fw docs hub-workflows`.
+Pages: [hub-reference](hub/reference.md), [hub-api](hub/api.md), [hub-security](hub/security.md), [hub-workflows](hub/workflows.md), [hub-internals](hub/internals.md); read each with `fw docs <topic>`.

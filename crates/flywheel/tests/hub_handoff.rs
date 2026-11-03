@@ -491,6 +491,16 @@ fn upgrade_hands_every_session_to_the_new_process_alive() {
         "{sleeper}"
     );
 
+    // An ended session lets go of its terminal, and still hands over
+    // (its screen alone) on the next upgrade.
+    let (_, ended_before) = attach(&env, setup.port, &setup.sleeper);
+    env.ok(&["upgrade", "--binary", env!("CARGO_BIN_EXE_fw")]);
+    let sleeper = env.session(&setup.sleeper);
+    assert_eq!(sleeper["state"], "exited", "{sleeper}");
+    let (_, ended_after) = attach(&env, setup.port, &setup.sleeper);
+    assert_eq!(ended_after, ended_before, "an ended session's screen");
+    assert!(String::from_utf8_lossy(&ended_after).contains("sleeping"));
+
     // A normal stop still records the running sessions for restore.
     let stopped = env.ok(&["stop"]);
     assert!(stopped.contains("recorded for restore"), "{stopped}");

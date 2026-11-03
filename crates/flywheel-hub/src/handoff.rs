@@ -930,14 +930,17 @@ fn send_offer(source: &Source, stream: &UnixStream, frozen: &Frozen) -> std::io:
         &passed,
     )?;
     for frozen in &frozen.sessions {
-        let Some(master) = frozen.session.master_fd() else {
+        // An ended session that closed its PTY goes over as its screen
+        // alone (no descriptors).
+        let master = frozen.session.master_fd();
+        if master.is_none() && frozen.export.meta.exit.is_none() {
             return Err(std::io::Error::other(format!(
                 "session {} has no terminal descriptor",
                 frozen.id
             )));
-        };
-        let pidfd = frozen.session.pidfd();
-        let mut fds = vec![master];
+        }
+        let pidfd = master.and_then(|_| frozen.session.pidfd());
+        let mut fds: Vec<RawFd> = master.into_iter().collect();
         fds.extend(pidfd);
         let PtyExport {
             meta,
@@ -1085,11 +1088,12 @@ pub fn receive(
             )));
         };
         let mut fds = fds.into_iter();
-        let Some(master) = fds.next() else {
+        let master = fds.next();
+        if master.is_none() && pty.exit.is_none() {
             return Err(HandoffError::Failed(format!(
                 "session {id}: no terminal descriptor arrived"
             )));
-        };
+        }
         let pidfd = if pidfd { fds.next() } else { None };
         if snapshot_len > bin.len() {
             return Err(HandoffError::Failed(format!(

@@ -42,7 +42,7 @@ impl Master {
         }
     }
 
-    fn raw_fd(&self) -> Option<RawFd> {
+    pub(crate) fn raw_fd(&self) -> Option<RawFd> {
         match self {
             Self::Spawned(master) => master.as_raw_fd(),
             Self::Adopted(fd) => Some(fd.as_raw_fd()),
@@ -157,7 +157,9 @@ pub(crate) struct PtyExport {
 /// A session to adopt: the descriptors received plus its export.
 #[derive(Debug)]
 pub(crate) struct Adopt {
-    pub master: OwnedFd,
+    /// `None` for a session that had ended and closed its PTY (see
+    /// [`PtySession::close_io`]): only its screen is handed over.
+    pub master: Option<OwnedFd>,
     pub pidfd: Option<OwnedFd>,
     pub export: PtyExport,
     pub scrollback_lines: usize,
@@ -198,18 +200,24 @@ impl PtySession {
         self.queue.queued.fetch_sub(len, Ordering::AcqRel);
     }
 
-    /// The master's descriptor (valid while the session lives).
+    /// The master's descriptor: valid while the session is paused (no
+    /// close can run then), `None` once an ended session closed it.
     pub(crate) fn master_fd(&self) -> Option<RawFd> {
         self.master
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .raw_fd()
+            .as_ref()
+            .and_then(Master::raw_fd)
     }
 
-    /// The leader's pidfd, when there is one (valid while the session
-    /// lives).
+    /// The leader's pidfd, when there is one (valid while paused, or
+    /// until the session ends).
     pub(crate) fn pidfd(&self) -> Option<RawFd> {
-        self.pidfd.as_ref().map(AsRawFd::as_raw_fd)
+        self.pidfd
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(AsRawFd::as_raw_fd)
     }
 
     /// Adopt a session handed over by another hub, **paused**: its
@@ -233,10 +241,6 @@ impl PtySession {
         screen.process(&export.snapshot);
         // Rebuilding asks nothing of the program.
         let _ = screen.take_replies();
-        let fd = master.as_raw_fd();
-        let reader = File::from(master.try_clone()?);
-        // A plain descriptor: dropping it sends the program nothing.
-        let writer = File::from(master.try_clone()?);
         let (events, _) = broadcast::channel(BROADCAST_DEPTH);
         let (input, input_rx) = std_mpsc::channel::<Vec<u8>>();
         let queue = Arc::new(InputQueue::new());
@@ -248,6 +252,45 @@ impl PtySession {
         }
         queue.pausing.store(true, Ordering::Release);
         let exited = export.meta.exit.clone();
+        let Some(master) = master else {
+            // An ended session whose PTY had closed: a screen, no I/O.
+            if exited.is_none() {
+                return Err(std::io::Error::other(
+                    "a running session arrived without its terminal",
+                ));
+            }
+            {
+                let mut state = queue.pause_state();
+                state.requested = false;
+                state.held.clear();
+                state.reader_done = true;
+                state.writer_done = true;
+            }
+            queue.queued.store(0, Ordering::Release);
+            queue.pausing.store(false, Ordering::Release);
+            queue.closing.store(true, Ordering::Release);
+            drop(input_rx);
+            return Ok(Arc::new(Self {
+                shared: Mutex::new(Shared {
+                    screen,
+                    exit: exited,
+                    reaped: true,
+                    output_bytes: export.meta.output_bytes,
+                    size,
+                }),
+                exited: Condvar::new(),
+                events,
+                input,
+                queue,
+                master: Mutex::new(None),
+                pid: export.meta.pid,
+                pidfd: Mutex::new(None),
+            }));
+        };
+        let fd = master.as_raw_fd();
+        let reader = File::from(master.try_clone()?);
+        // A plain descriptor: dropping it sends the program nothing.
+        let writer = File::from(master.try_clone()?);
         let session = Arc::new(Self {
             shared: Mutex::new(Shared {
                 screen,
@@ -260,9 +303,9 @@ impl PtySession {
             events,
             input,
             queue,
-            master: Mutex::new(Master::Adopted(master)),
+            master: Mutex::new(Some(Master::Adopted(master))),
             pid: export.meta.pid,
-            pidfd,
+            pidfd: Mutex::new(pidfd),
         });
         let drained_rx = session.start_io(fd, Box::new(reader), Box::new(writer), input_rx)?;
         if exited.is_some() {
@@ -285,6 +328,7 @@ impl PtySession {
                     signal: None,
                 };
                 waiter.record_exit(info.clone());
+                waiter.close_io();
                 on_exit(info);
             })?;
         Ok(session)
@@ -326,6 +370,70 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         false
+    }
+
+    /// An ended session that closed its PTY hands over as its screen
+    /// alone, and the adopted copy is as ended.
+    #[test]
+    fn an_ended_session_without_its_pty_hands_over_its_screen() {
+        let original = PtySession::spawn(
+            SpawnSpec {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo gone-away; exit 4".into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 1000,
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert!(original.wait_exit(Duration::from_secs(10)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while original.has_pty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!original.has_pty());
+        assert!(original.pause(Duration::from_secs(1)));
+        assert_eq!(original.master_fd(), None);
+        assert_eq!(original.pidfd(), None);
+        let export = original.handoff_export();
+        let adopted = PtySession::adopt(
+            Adopt {
+                master: None,
+                pidfd: None,
+                export: export.clone(),
+                scrollback_lines: 1000,
+            },
+            |_| panic!("an ended session never exits again"),
+        )
+        .unwrap();
+        assert_eq!(original.attach().replay, adopted.attach().replay);
+        assert_eq!(adopted.exit_info().unwrap().code, Some(4));
+        assert!(!adopted.has_pty());
+        assert!(adopted.pause(Duration::from_secs(1)));
+        adopted.resume();
+        assert_eq!(adopted.write(b"x".to_vec()), WriteOutcome::Closed);
+        // A running session cannot arrive without its terminal.
+        let mut running = export;
+        running.meta.exit = None;
+        assert!(
+            PtySession::adopt(
+                Adopt {
+                    master: None,
+                    pidfd: None,
+                    export: running,
+                    scrollback_lines: 1000,
+                },
+                |_| {},
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -409,7 +517,7 @@ mod tests {
         let (exit_tx, exit_rx) = std_mpsc::channel();
         let adopted = PtySession::adopt(
             Adopt {
-                master,
+                master: Some(master),
                 pidfd,
                 export: export.clone(),
                 scrollback_lines: 1000,

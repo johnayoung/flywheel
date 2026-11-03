@@ -168,6 +168,10 @@ struct Shared {
 struct InputQueue {
     queued: AtomicUsize,
     released: AtomicBool,
+    /// The child has exited and the reader drained the PTY: the writer
+    /// ends (nothing can read its input) so the descriptors can close
+    /// (see [`PtySession::close_io`]).
+    closing: AtomicBool,
     /// Mirrors `pause.requested` for the I/O threads' cheap checks.
     pausing: AtomicBool,
     pause: Mutex<PauseState>,
@@ -197,6 +201,7 @@ impl InputQueue {
         Self {
             queued: AtomicUsize::new(0),
             released: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             pausing: AtomicBool::new(false),
             pause: Mutex::new(PauseState::default()),
             pause_changed: Condvar::new(),
@@ -209,6 +214,12 @@ impl InputQueue {
 
     fn released(&self) -> bool {
         self.released.load(Ordering::Acquire)
+    }
+
+    /// Whether the I/O threads should end: released, or closing (the
+    /// session is over; only its screen stays).
+    fn stopping(&self) -> bool {
+        self.released() || self.closing.load(Ordering::Acquire)
     }
 
     /// Park the calling I/O thread while a pause is requested. `stash`
@@ -264,12 +275,14 @@ pub struct PtySession {
     events: broadcast::Sender<SessionEvent>,
     input: std_mpsc::Sender<Vec<u8>>,
     queue: Arc<InputQueue>,
-    master: Mutex<handoff::Master>,
+    /// The PTY master; `None` once the session is over and its
+    /// descriptors were closed ([`PtySession::close_io`]).
+    master: Mutex<Option<handoff::Master>>,
     pid: Option<u32>,
     /// A pidfd for the leader (Linux), opened before anything could reap
     /// it: what a live handoff passes on so the next hub can tell when it
-    /// exits.
-    pidfd: Option<std::os::fd::OwnedFd>,
+    /// exits. Closed with the master.
+    pidfd: Mutex<Option<std::os::fd::OwnedFd>>,
 }
 
 impl std::fmt::Debug for PtySession {
@@ -356,9 +369,9 @@ impl PtySession {
             events,
             input,
             queue,
-            master: Mutex::new(handoff::Master::Spawned(pair.master)),
+            master: Mutex::new(Some(handoff::Master::Spawned(pair.master))),
             pid,
-            pidfd,
+            pidfd: Mutex::new(pidfd),
         });
 
         let drained_rx = session
@@ -381,6 +394,7 @@ impl PtySession {
                 // the exit event is ordered after it.
                 let _ = drained_rx.recv_timeout(DRAIN_AFTER_EXIT);
                 waiter_session.record_exit(info.clone());
+                waiter_session.close_io();
                 on_exit(info);
             })
             .map_err(|e| spawn_err(e.to_string()))?;
@@ -405,13 +419,18 @@ impl PtySession {
                 reader_session.read_loop(fd, reader);
                 reader_session.queue.done(true);
                 let _ = drained_tx.send(());
+                reader_session.close_io();
             })?;
         let queue = Arc::clone(&self.queue);
+        let writer_session = Arc::downgrade(self);
         thread::Builder::new()
             .name("hub-pty-writer".into())
             .spawn(move || {
                 write_loop(fd, writer, &input_rx, &queue);
                 queue.done(false);
+                if let Some(session) = writer_session.upgrade() {
+                    session.close_io();
+                }
             })?;
         Ok(drained_rx)
     }
@@ -455,6 +474,51 @@ impl PtySession {
                 Err(_) => break,
             }
         }
+    }
+
+    /// Let go of an ended session's PTY: once the child has exited and
+    /// the reader drained the PTY, nothing more can be read from or
+    /// written to it, so the writer thread ends and the master and pidfd
+    /// close (an exited session otherwise holds two ptmx descriptors, a
+    /// pidfd and a thread until it is removed). The emulator stays: the
+    /// screen, scrollback and attach replay need nothing else. Called from
+    /// each I/O thread's end and after the exit is recorded; the last of
+    /// them closes. Never while a pause holds the session (a handoff is
+    /// exporting its descriptors): [`PtySession::resume`] retries.
+    pub(crate) fn close_io(&self) {
+        let mut pause = self.queue.pause_state();
+        if pause.requested || !pause.reader_done || self.lock().exit.is_none() {
+            return;
+        }
+        if !pause.writer_done {
+            self.queue.closing.store(true, Ordering::Release);
+            return;
+        }
+        // The pause lock is held: no pause can start (and read the
+        // descriptors) while they close.
+        pause.held.clear();
+        let master = self
+            .master
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let pidfd = self
+            .pidfd
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(pause);
+        drop(master);
+        drop(pidfd);
+    }
+
+    /// Whether the session's PTY is still open (false once
+    /// [`PtySession::close_io`] closed an ended session's descriptors).
+    pub fn has_pty(&self) -> bool {
+        self.master
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
     }
 
     fn record_exit(&self, info: ExitInfo) {
@@ -562,10 +626,11 @@ impl PtySession {
                 });
             }
         }
-        self.master
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .resize(size)
+        match &*self.master.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(master) => master.resize(size),
+            // Over: only the screen is resized.
+            None => Ok(()),
+        }
     }
 
     /// Current `(cols, rows)`.
@@ -615,12 +680,14 @@ impl PtySession {
     /// taken it raw yet, e.g. an agent TUI still starting): what is typed
     /// is echoed back as text.
     pub fn echoes_input(&self) -> bool {
-        let Some(fd) = self.master_fd() else {
+        // Held for the call: the master cannot close under it.
+        let master = self.master.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(fd) = master.as_ref().and_then(handoff::Master::raw_fd) else {
             return false;
         };
         // SAFETY: tcgetattr writes one `termios`, valid for the call; `fd`
         // is this live session's master (on Linux it reports the slave's
-        // settings).
+        // settings), kept open by the lock held.
         let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
         if unsafe { libc::tcgetattr(fd, &raw mut termios) } != 0 {
             return false;
@@ -739,6 +806,8 @@ impl PtySession {
         self.queue.pausing.store(false, Ordering::Release);
         drop(state);
         self.queue.pause_changed.notify_all();
+        // An ended session whose close a pause put off.
+        self.close_io();
     }
 
     /// Whether a [`PtySession::pause`] is in force.
@@ -829,7 +898,7 @@ impl PtySession {
 fn wait_ready(fd: libc::c_int, events: libc::c_short, queue: &InputQueue) -> Wake {
     let timeout = libc::c_int::try_from(RELEASE_POLL.as_millis()).unwrap_or(200);
     loop {
-        if queue.released() {
+        if queue.stopping() {
             return Wake::Released;
         }
         if queue.pausing.load(Ordering::Acquire) {
@@ -868,7 +937,7 @@ fn write_loop(
     // Input to write before the channel's: what a pause held.
     let mut pending: Vec<u8> = Vec::new();
     loop {
-        if queue.released() {
+        if queue.stopping() {
             return;
         }
         let bytes = if pending.is_empty() {
@@ -1045,6 +1114,57 @@ mod tests {
             }
         }
         seen
+    }
+
+    fn wait_closed(session: &PtySession) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.has_pty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        !session.has_pty()
+    }
+
+    /// An ended session lets go of its PTY, pidfd and writer thread but
+    /// keeps its screen for viewers.
+    #[test]
+    fn an_ended_session_closes_its_pty_and_keeps_its_screen() {
+        let sessions: Vec<_> = (0..20)
+            .map(|i| PtySession::spawn(spec(&format!("echo ended-{i}; exit 3")), |_| {}).unwrap())
+            .collect();
+        for (i, session) in sessions.iter().enumerate() {
+            assert!(session.wait_exit(Duration::from_secs(10)));
+            assert!(wait_closed(session), "session {i} still holds its pty");
+            {
+                let pause = session.queue.pause_state();
+                assert!(pause.reader_done && pause.writer_done, "both threads ended");
+            }
+            assert!(session.pidfd.lock().unwrap().is_none());
+            let text = session.screen_text(TextSource::Visible).lines.join("\n");
+            assert!(text.contains(&format!("ended-{i}")), "{text}");
+            let replay = String::from_utf8_lossy(&session.attach().replay).into_owned();
+            assert!(replay.contains(&format!("ended-{i}")));
+            assert_eq!(session.exit_info().unwrap().code, Some(3));
+            assert_eq!(session.write(b"x".to_vec()), WriteOutcome::Closed);
+            assert!(session.resize(100, 30).is_ok());
+            assert!(
+                session.pause(Duration::from_secs(1)),
+                "nothing left to park"
+            );
+            session.resume();
+        }
+    }
+
+    /// A descendant still holding the terminal keeps it open (its output
+    /// still shows) until it too is gone.
+    #[test]
+    fn a_session_stays_open_while_a_descendant_holds_the_terminal() {
+        let session =
+            PtySession::spawn(spec("set -m; (sleep 1; echo late-output) & exit 0"), |_| {})
+                .unwrap();
+        assert!(session.wait_exit(Duration::from_secs(10)));
+        assert!(wait_closed(&session));
+        let text = session.screen_text(TextSource::Visible).lines.join("\n");
+        assert!(text.contains("late-output"), "{text}");
     }
 
     #[test]

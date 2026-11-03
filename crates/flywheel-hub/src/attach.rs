@@ -45,6 +45,7 @@ mod picker;
 mod term;
 
 use crate::endpoint::{Endpoint, EndpointArgs, Socket, stable_client_id};
+use crate::util::str_field as str_of;
 use crate::vt::Emulator;
 use filter::OutputFilter;
 use futures_util::{SinkExt, StreamExt};
@@ -256,10 +257,6 @@ pub(crate) fn attach(args: &AttachArgs, out: &mut dyn Write, err: &mut dyn Write
             fail(err, &message)
         }
     }
-}
-
-fn str_of<'a>(v: &'a Value, field: &str) -> &'a str {
-    v.get(field).and_then(Value::as_str).unwrap_or("")
 }
 
 /// How the client ended.

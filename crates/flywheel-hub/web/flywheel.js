@@ -65,8 +65,7 @@ window.FwHubFlywheel = function (ctx) {
     const date = new Date(iso);
     return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString([], { hour12: false });
   }
-  const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
-  const dollars = (n) => `$${(n || 0).toFixed(2)}`;
+  const { tokens, dollars } = window.FwHubFmt;
 
   // --- data --------------------------------------------------------------
 

@@ -66,19 +66,7 @@ window.FwHubLauncher = function (ctx) {
 
   // --- formatting -----------------------------------------------------------
 
-  function tokens(n) {
-    n = n || 0;
-    if (n < 1000) return String(n);
-    if (n < 1e6) return `${(n / 1e3).toFixed(n < 1e4 ? 1 : 0)}k`;
-    return `${(n / 1e6).toFixed(2)}M`;
-  }
-
-  function dollars(usd) {
-    if (!usd) return "$0";
-    if (usd < 0.01) return `$${usd.toFixed(4)}`;
-    if (usd < 100) return `$${usd.toFixed(2)}`;
-    return `$${Math.round(usd)}`;
-  }
+  const { tokens, dollars } = window.FwHubFmt;
 
   // "$0.42", "$0.42+" (some tokens of a model without a price), or the
   // token count alone when nothing is priced -- never a guessed price.

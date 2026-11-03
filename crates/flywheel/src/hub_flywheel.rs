@@ -47,6 +47,7 @@ use flywheel_hub::flywheel::{
     Alert, AlertKind, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome, LiveRun, Note,
     PanelClaim, PanelPhase, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight,
 };
+use flywheel_hub::util::path_identity as file_identity;
 use flywheel_orchestrator::autopilot_activity::{epoch_now, is_record_live, read_activity};
 use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore};
 use flywheel_orchestrator::pg_preflight::dsn_target;
@@ -229,17 +230,6 @@ struct OpenStores {
     bundle: StoreBundle,
     /// The SQLite file's identity when opened: a replaced file reopens.
     identity: Option<(u64, u64)>,
-}
-
-#[cfg(unix)]
-fn file_identity(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_identity(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|m| (m.len(), 0))
 }
 
 impl Folder {

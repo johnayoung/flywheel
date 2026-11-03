@@ -13,7 +13,7 @@
 //! self-signed hub).
 
 use crate::auth::{unix_now, write_private};
-use crate::endpoint::{Io, Socket};
+use crate::net::Socket;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -23,8 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
 /// The machines file inside the state dir.
@@ -275,21 +273,13 @@ fn tls_config(
     pin: Option<&str>,
     observed: Arc<Mutex<Option<String>>>,
 ) -> Result<rustls::ClientConfig, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = crate::net::provider();
     let roots = match pin {
         Some(_) => None,
         None => {
-            let mut store = rustls::RootCertStore::empty();
-            for cert in rustls_native_certs::load_native_certs().certs {
-                let _ = store.add(cert);
-            }
-            if store.is_empty() {
-                return Err(
-                    "no trusted root certificates on this system for an https machine \
-                     (pin its certificate with --fingerprint)"
-                        .into(),
-                );
-            }
+            let store = crate::net::native_roots(
+                "an https machine (pin its certificate with --fingerprint)",
+            )?;
             Some(
                 rustls::client::WebPkiServerVerifier::builder_with_provider(
                     Arc::new(store),
@@ -306,22 +296,7 @@ fn tls_config(
         observed,
         algorithms: provider.signature_verification_algorithms,
     };
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS setup failed: {e}"))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
-        .with_no_client_auth())
-}
-
-/// The TLS config reqwest wants even for plain http (never used).
-fn plain_config() -> Result<rustls::ClientConfig, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS setup failed: {e}"))?
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth())
+    crate::net::verifier_config(provider, Arc::new(verifier))
 }
 
 // --- one machine --------------------------------------------------------------
@@ -439,7 +414,7 @@ impl Machine {
             .map(Arc::new);
         let preconfigured = match &tls {
             Some(config) => config.as_ref().clone(),
-            None => plain_config().map_err(MachineError::Invalid)?,
+            None => crate::net::plain_config().map_err(MachineError::Invalid)?,
         };
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -764,63 +739,32 @@ impl Machine {
         if let Some(held) = self.held_refusal() {
             return Err(Err(held));
         }
-        let mut url = self.target(path_and_query).map_err(Err)?;
-        let secure = url.scheme() == "https";
-        url.set_scheme(if secure { "wss" } else { "ws" })
-            .map_err(|()| Err(LinkError::Invalid("cannot form the WebSocket URL".into())))?;
-        let host = url
-            .host_str()
-            .unwrap_or_default()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_owned();
-        let port = url.port_or_known_default().unwrap_or(80);
-        let mut request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| Err(LinkError::Invalid(format!("bad WebSocket request: {e}"))))?;
-        let bearer = format!("Bearer {}", self.record.credential)
-            .parse()
-            .map_err(|_| {
-                Err(LinkError::Invalid(
-                    "credential is not a header value".into(),
-                ))
-            })?;
-        request.headers_mut().insert("authorization", bearer);
+        let url = self.target(path_and_query).map_err(Err)?;
         let connect = async {
-            let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
-                .await
-                .map_err(|e| Err(self.unreachable(&e.to_string())))?;
-            let _ = tcp.set_nodelay(true);
-            let stream: Box<dyn Io> = match &self.tls {
-                Some(config) => {
-                    let name =
-                        rustls::pki_types::ServerName::try_from(host.clone()).map_err(|e| {
-                            Err(LinkError::Invalid(format!(
-                                "bad TLS server name {host:?}: {e}"
-                            )))
-                        })?;
-                    let tls = tokio_rustls::TlsConnector::from(Arc::clone(config))
-                        .connect(name, tcp)
-                        .await
-                        .map_err(|e| Err(self.unreachable(&format!("TLS: {e}"))))?;
-                    Box::new(tls)
-                }
-                None => Box::new(tcp),
-            };
-            let config = WebSocketConfig::default()
-                .max_message_size(Some(WS_MAX_MESSAGE))
-                .max_frame_size(Some(WS_MAX_MESSAGE));
-            match tokio_tungstenite::client_async_with_config(request, stream, Some(config)).await {
-                Ok((socket, _)) => Ok(socket),
-                Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            use crate::net::WsError;
+            use tokio_tungstenite::tungstenite::Error;
+            match crate::net::connect_ws(
+                &url,
+                &self.record.credential,
+                self.tls.as_ref(),
+                WS_MAX_MESSAGE,
+            )
+            .await
+            {
+                Ok(socket) => Ok(socket),
+                Err(WsError::Invalid(message)) => Err(Err(LinkError::Invalid(message))),
+                Err(WsError::Connect(why)) => Err(Err(self.unreachable(&why))),
+                Err(WsError::Tls(why)) => Err(Err(self.unreachable(&format!("TLS: {why}")))),
+                Err(WsError::Handshake(Error::Http(response))) => {
                     let status = response.status().as_u16();
                     if status == 401 {
                         return Err(Err(LinkError::Refused(self.refused_message())));
                     }
                     Err(Ok((status, response.body().clone().unwrap_or_default())))
                 }
-                Err(e) => Err(Err(self.unreachable(&format!("WebSocket handshake: {e}")))),
+                Err(WsError::Handshake(e)) => {
+                    Err(Err(self.unreachable(&format!("WebSocket handshake: {e}"))))
+                }
             }
         };
         let outcome = tokio::time::timeout(CONNECT_TIMEOUT, connect)

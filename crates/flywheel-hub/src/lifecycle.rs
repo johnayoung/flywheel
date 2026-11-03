@@ -8,6 +8,7 @@ use crate::cli::{
 use crate::daemon::{self, LOG_FILE};
 use crate::endpoint::Endpoint;
 use crate::remote::{RuntimeInfo, ServeLock};
+use crate::util::fail;
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -19,11 +20,6 @@ pub const EXIT_NOT_RUNNING: i32 = 3;
 /// How long `status` (a health probe) and `start`'s report wait for the hub
 /// to answer: a hub that is alive but wedged must not stall them.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-
-fn fail(err: &mut dyn Write, message: &str) -> i32 {
-    let _ = writeln!(err, "fw hub: {message}");
-    1
-}
 
 /// The state dir, absolute (the daemon runs from `/`) and created 0700.
 fn prepare_state_dir(state: &StateDirArg) -> Result<PathBuf, String> {

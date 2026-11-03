@@ -5,6 +5,7 @@
 //! new|kill|relaunch` or in the web UI.
 
 use super::{Ev, HubView, status_counts};
+use crate::util::str_field as str_of;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -44,10 +45,6 @@ pub enum Row {
         /// The server holds its terminal (attachable).
         live: bool,
     },
-}
-
-fn str_of<'a>(v: &'a Value, field: &str) -> &'a str {
-    v.get(field).and_then(Value::as_str).unwrap_or("")
 }
 
 /// The list: each workspace (in hub order) with its sessions, then any

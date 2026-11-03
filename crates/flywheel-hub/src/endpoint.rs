@@ -25,10 +25,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use url::Url;
 
 /// How long connecting (TCP, TLS, WebSocket handshake) may take.
@@ -63,12 +59,7 @@ pub(crate) struct EndpointArgs {
     pub(crate) state: StateDirArg,
 }
 
-/// Anything a WebSocket can run over (plain TCP or TLS).
-pub trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
-
-/// A WebSocket to the hub.
-pub type Socket = WebSocketStream<Box<dyn Io>>;
+pub use crate::net::{Io, Socket};
 
 /// A resolved hub: base URL and credential.
 pub struct Endpoint {
@@ -244,7 +235,7 @@ impl Endpoint {
             .user_agent(concat!("flywheel-hub/", env!("CARGO_PKG_VERSION")));
         builder = match &tls {
             Some(config) => builder.tls_backend_preconfigured(config.as_ref().clone()),
-            None => builder.tls_backend_preconfigured(tls_config_plain()?),
+            None => builder.tls_backend_preconfigured(crate::net::plain_config()?),
         };
         let http = builder
             .build()
@@ -393,56 +384,19 @@ impl Endpoint {
     /// Open the WebSocket at `path` (`/api/events?client=...`,
     /// `/api/sessions/{id}/ws`).
     pub async fn websocket(&self, path: &str) -> Result<Socket, String> {
-        let mut url = self.url(path)?;
-        let secure = url.scheme() == "https";
-        url.set_scheme(if secure { "wss" } else { "ws" })
-            .map_err(|()| "cannot form the WebSocket URL".to_owned())?;
-        let host = url
-            .host_str()
-            .ok_or_else(|| "the hub URL has no host".to_owned())?
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_owned();
-        let port = url
-            .port_or_known_default()
-            .ok_or_else(|| "the hub URL has no port".to_owned())?;
-        let mut request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|e| format!("bad WebSocket request: {e}"))?;
-        let bearer = format!("Bearer {}", self.token())
-            .parse()
-            .map_err(|_| "the token is not a valid header value".to_owned())?;
-        request.headers_mut().insert("authorization", bearer);
-        let connect = async {
-            let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
-                .await
-                .map_err(|e| self.unreachable(&e.to_string()))?;
-            let _ = tcp.set_nodelay(true);
-            let stream: Box<dyn Io> = match &self.tls {
-                Some(config) => {
-                    let name = rustls::pki_types::ServerName::try_from(host.clone())
-                        .map_err(|e| format!("bad TLS server name {host:?}: {e}"))?;
-                    let tls = tokio_rustls::TlsConnector::from(Arc::clone(config))
-                        .connect(name, tcp)
-                        .await
-                        .map_err(|e| format!("TLS with {} failed: {e}", self.base()))?;
-                    Box::new(tls)
-                }
-                None => Box::new(tcp),
-            };
-            let config = WebSocketConfig::default()
-                .max_message_size(Some(WS_MAX_MESSAGE))
-                .max_frame_size(Some(WS_MAX_MESSAGE));
-            let (socket, _) =
-                tokio_tungstenite::client_async_with_config(request, stream, Some(config))
-                    .await
-                    .map_err(|e| ws_error(&e))?;
-            Ok::<_, String>(socket)
-        };
+        use crate::net::WsError;
+        let url = self.url(path)?;
+        let token = self.token();
+        let connect = crate::net::connect_ws(&url, &token, self.tls.as_ref(), WS_MAX_MESSAGE);
         tokio::time::timeout(CONNECT_TIMEOUT, connect)
             .await
             .map_err(|_| format!("timed out connecting to the hub at {}", self.base()))?
+            .map_err(|e| match e {
+                WsError::Invalid(message) => message,
+                WsError::Connect(why) => self.unreachable(&why),
+                WsError::Tls(why) => format!("TLS with {} failed: {why}", self.base()),
+                WsError::Handshake(e) => ws_error(&e),
+            })
     }
 }
 
@@ -574,28 +528,7 @@ fn is_local_hub(base: &Url, listen: SocketAddr) -> bool {
 
 /// rustls on ring with the system's roots (an https hub).
 fn tls_config() -> Result<rustls::ClientConfig, String> {
-    let mut roots = rustls::RootCertStore::empty();
-    for cert in rustls_native_certs::load_native_certs().certs {
-        let _ = roots.add(cert);
-    }
-    if roots.is_empty() {
-        return Err("no trusted root certificates found on this system for an https hub".into());
-    }
-    client_config(roots)
-}
-
-/// A TLS config reqwest needs even for plain http (it is never used).
-fn tls_config_plain() -> Result<rustls::ClientConfig, String> {
-    client_config(rustls::RootCertStore::empty())
-}
-
-fn client_config(roots: rustls::RootCertStore) -> Result<rustls::ClientConfig, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS setup failed: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth())
+    crate::net::roots_config(crate::net::native_roots("an https hub")?)
 }
 
 fn describe(error: &reqwest::Error) -> String {

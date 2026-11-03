@@ -179,7 +179,7 @@ impl Tail {
         let Ok(meta) = file.metadata() else {
             return;
         };
-        let identity = file_identity(&meta);
+        let identity = crate::util::file_identity(&meta);
         if self.identity.is_some_and(|known| known != identity) || meta.len() < self.offset {
             // Replaced or truncated: start over.
             self.offset = 0;
@@ -280,17 +280,6 @@ impl Tail {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-#[cfg(unix)]
-fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    (meta.dev(), meta.ino())
-}
-
-#[cfg(not(unix))]
-fn file_identity(_meta: &std::fs::Metadata) -> (u64, u64) {
-    (0, 0)
 }
 
 /// The reply in a Claude Code transcript line: an `assistant` line of the

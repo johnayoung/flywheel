@@ -1076,9 +1076,7 @@ fn content_hash(path: &Path) -> String {
         .collect()
 }
 
-fn plural(n: usize, word: &str) -> String {
-    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
-}
+use crate::util::plural;
 
 fn change_line(prefix: &str, f: &FileChange) -> String {
     let counts = match (f.insertions, f.deletions) {

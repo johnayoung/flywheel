@@ -666,27 +666,13 @@ fn basic_auth(url: &url::Url) -> Option<String> {
 }
 
 /// TLS for the webhook: rustls on ring, the platform's trusted roots (an
-/// https URL needs at least one). Built here, not from a process-wide
-/// default provider, so it never depends on one being installed.
+/// https URL needs at least one).
 fn tls_config(https: bool) -> Result<rustls::ClientConfig, String> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
     if https {
-        for cert in rustls_native_certs::load_native_certs().certs {
-            let _ = roots.add(cert);
-        }
+        crate::net::roots_config(crate::net::native_roots("an https notify URL")?)
+    } else {
+        crate::net::plain_config()
     }
-    if https && roots.is_empty() {
-        return Err(
-            "no trusted root certificates found on this system for an https notify URL".into(),
-        );
-    }
-    let config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS setup failed: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    Ok(config)
 }
 
 #[cfg(test)]

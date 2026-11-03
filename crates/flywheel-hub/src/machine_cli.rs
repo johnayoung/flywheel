@@ -11,6 +11,7 @@ use crate::cli::{StateDirArg, resolve_state_dir};
 use crate::endpoint::Endpoint;
 use crate::peers::PeerStore;
 use crate::script::query_escape;
+use crate::util::{fail, str_field};
 use chrono::{TimeZone, Utc};
 use serde_json::{Value, json};
 use std::io::{BufRead, IsTerminal, Write};
@@ -18,15 +19,6 @@ use std::time::Duration;
 
 /// Where `machine add` reads the secret from before stdin.
 pub const SECRET_ENV: &str = "FW_HUB_MACHINE_SECRET";
-
-fn fail(err: &mut dyn Write, message: &str) -> i32 {
-    let _ = writeln!(err, "fw hub: {message}");
-    1
-}
-
-fn str_field<'a>(item: &'a Value, field: &str) -> &'a str {
-    item.get(field).and_then(Value::as_str).unwrap_or("")
-}
 
 fn when(unix: Option<u64>) -> String {
     unix.and_then(|s| i64::try_from(s).ok())

@@ -4,17 +4,9 @@
 
 use crate::endpoint::{Endpoint, EndpointArgs};
 use crate::script::{query_escape, resolve};
+use crate::util::{fail, str_field};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
-
-fn str_field<'a>(item: &'a Value, field: &str) -> &'a str {
-    item.get(field).and_then(Value::as_str).unwrap_or("")
-}
-
-fn fail(err: &mut dyn Write, message: &str) -> i32 {
-    let _ = writeln!(err, "fw hub: {message}");
-    1
-}
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct TemplateArgs {

@@ -8,16 +8,13 @@
 
 use crate::cli::{StateDirArg, resolve_state_dir};
 use crate::endpoint::{Endpoint, EndpointArgs};
+use crate::util::{fail, str_field};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Characters of an id shown by `ls` (any unique prefix addresses it).
 pub const SHORT_ID: usize = 8;
-
-fn str_field<'a>(item: &'a Value, field: &str) -> &'a str {
-    item.get(field).and_then(Value::as_str).unwrap_or("")
-}
 
 /// How messages name a session record: `name (id)`, as the hub's own
 /// errors do.
@@ -206,11 +203,6 @@ fn folders_of(workspace: &Value) -> Vec<FolderRow> {
 /// and missing directories marked.
 fn folder_list(workspace: &Value) -> Vec<String> {
     folders_of(workspace).iter().map(FolderRow::shown).collect()
-}
-
-fn fail(err: &mut dyn Write, message: &str) -> i32 {
-    let _ = writeln!(err, "fw hub: {message}");
-    1
 }
 
 fn connect(endpoint: &EndpointArgs) -> Result<Endpoint, String> {

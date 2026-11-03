@@ -285,7 +285,7 @@ pub fn follow(path: &Path, offset: u64, out: &mut dyn Write) -> std::io::Result<
                     // path names by now (a rotation may land in between).
                     let meta = file.metadata()?;
                     file.seek(SeekFrom::Start(start.min(meta.len())))?;
-                    current = Some((file, Some(identity_of(&meta))));
+                    current = Some((file, Some(crate::util::file_identity(&meta))));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -308,7 +308,7 @@ pub fn follow(path: &Path, offset: u64, out: &mut dyn Write) -> std::io::Result<
             if wrote {
                 out.flush()?;
             }
-            if file_identity(path) != *identity {
+            if crate::util::path_identity(path) != *identity {
                 // Rotated (or replaced): the old file is drained; follow
                 // the new one from its start.
                 current = None;
@@ -317,25 +317,6 @@ pub fn follow(path: &Path, offset: u64, out: &mut dyn Write) -> std::io::Result<
             }
         }
         std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-/// Device and inode of `path` (changes when the log rotates).
-fn file_identity(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|meta| identity_of(&meta))
-}
-
-/// Device and inode of a file.
-fn identity_of(meta: &std::fs::Metadata) -> (u64, u64) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        (meta.dev(), meta.ino())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
-        (0, 0)
     }
 }
 

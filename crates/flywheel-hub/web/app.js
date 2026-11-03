@@ -314,6 +314,33 @@
   // Sibling worktrees (worktree.js): the new-session fields, row badges,
   // and the keep / remove close dialog.
   const worktrees = window.FwHubWorktree({ $, el, icon, api });
+  // The agent launcher and cost meter (launcher.js): the form's agent
+  // fields, launch templates, quick launch, and token usage.
+  const launcher = window.FwHubLauncher({
+    $, el, api, state, worktrees,
+    toast: (...args) => commands.toast(...args),
+    sessionById: (id) => sessionById(id),
+    workspaceById: (id) => workspaceById(id),
+    selectedKind: () => selectedKind(),
+    selectKind: (kind) => {
+      const radio = sessionForm.querySelector(`input[name="kind"][value="${kind}"]`);
+      if (radio && !radio.disabled) radio.checked = true;
+      updateSessionPlaceholder();
+    },
+    refresh: () => refresh(),
+    createSession: (body, place) => createSession(body, place),
+    // Never under a half-typed sidebar field (a rename): the next
+    // render shows it.
+    onRollups: () => {
+      const busy = $("#sidebar").contains(document.activeElement) &&
+        document.activeElement.matches("input, select, textarea");
+      if (!busy) render();
+    },
+    onSessionUsage: (id) => {
+      if (state.attached === id) launcher.renderHeader(sessionById(id));
+      refresh(false).catch(() => {});
+    },
+  });
   // Review (review.js): a session's commits, diffs, and the guarded
   // commit / push / PR / rebase / merge actions.
   const review = window.FwHubReview({
@@ -393,6 +420,7 @@
     }
     state.snapshot = snapshot;
     render();
+    launcher.rollupsSoon();
   }
 
   // Panes whose session was removed (closed in another browser or by the
@@ -2078,6 +2106,8 @@
         refresh(false).catch(() => {});
       } else if (message.type === "commands") {
         commands.onEvent(message);
+      } else if (message.type === "usage") {
+        launcher.onUsage(message);
       } else if (message.type === "flywheel" || message.type === "flywheel_reset") {
         flywheel.onEvent(message);
       } else if (message.type === "layout") {
@@ -2479,6 +2509,7 @@
         "span",
         { className: "session-meta" },
         el("span", { className: `session-state ${st.tone}`, textContent: st.label, title: st.title || undefined }),
+        launcher.rowChip(session),
         actions,
       ),
       // What a blocked agent asks, readable without hover (touch).
@@ -2532,6 +2563,7 @@
           el("span", { className: "chev" }, icon("chev")),
           el("span", { className: "ws-name", textContent: workspace.name, title: workspace.name }),
           rollupChip(workspace),
+          launcher.workspaceChip(workspace.id),
           el(
             "span",
             { className: "ws-count", title: `${live} running of ${sessions.length}` },
@@ -2620,6 +2652,7 @@
     wheel.style.setProperty("--spin-state", running ? "running" : "paused");
 
     attention.render();
+    launcher.render();
     if (!tabRenaming) renderTabs();
     for (const pane of livePanes()) renderPaneHead(pane);
     renderMain();
@@ -2666,6 +2699,7 @@
     // (direction: rtl) styling.
     $("#meter-cwd").textContent = session ? `\u200e${session.cwd}\u200e` : "";
     $("#meter-cwd").title = session ? session.cwd : "";
+    launcher.renderHeader(session);
     renderFlip(session);
     updateMeters();
     const counts = attentionCounts();
@@ -3053,7 +3087,9 @@
         }),
       ));
     $("#kind-picker").replaceChildren(el("legend", { className: "field-label", textContent: "Runs" }), ...cards);
+    launcher.setKind(selectedKind());
   }
+  $("#kind-picker").addEventListener("change", () => launcher.setKind(selectedKind()));
 
   function renderRepoPicker() {
     const workspace = workspaceById($("#session-workspace").value);
@@ -3163,6 +3199,7 @@
     $("#session-workspace").replaceChildren(
       ...state.workspaces.map((w) => el("option", { value: w.id, textContent: w.name, selected: w.id === target.id })),
     );
+    launcher.reset(target.id);
     renderKinds(state.kinds || [{ kind: "shell", available: true, program: null }], store.get("kind", "shell"));
     renderRepoPicker();
     $("#session-place").value = place || "pane";
@@ -3188,6 +3225,7 @@
     $("#place-pick").hidden = !usable;
   }
   $("#session-workspace").addEventListener("change", () => {
+    launcher.reset($("#session-workspace").value);
     renderRepoPicker();
     placePickChanged();
   });
@@ -3198,11 +3236,13 @@
   $("#wt-pick").addEventListener("input", updateSessionPlaceholder);
   // Enter launches from anywhere in the form (radios do not submit on
   // their own).
+  // In the prompt, Enter is a new line and Ctrl/Cmd Enter launches.
   sessionForm.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.isComposing && !event.target.matches("button, select")) {
-      event.preventDefault();
-      sessionForm.requestSubmit();
-    }
+    if (event.key !== "Enter" || event.isComposing || event.target.matches("button, select")) return;
+    if (event.target.matches("textarea") && !(event.ctrlKey || event.metaKey)) return;
+    if (event.target.closest("#tpl-save")) return;
+    event.preventDefault();
+    sessionForm.requestSubmit();
   });
 
   sessionForm.addEventListener("submit", async (event) => {
@@ -3217,7 +3257,7 @@
     submit.disabled = true;
     $("#session-error").textContent = "";
     try {
-      const body = { workspace_id: workspaceId, kind };
+      const body = { workspace_id: workspaceId, kind, ...launcher.request() };
       if (repoInput) body.repo = repoInput.value;
       const worktree = worktrees.request();
       if (worktree) body.worktree = worktree;
@@ -3318,6 +3358,7 @@
     cmd(`Companion shell: ${beside ? "in place" : "beside the agent"}`, `${MOD} \` ${beside ? "now opens it beside (wide screens)" : "now flips in place"}`, () => {
       store.set("companion", beside ? "swap" : "split");
     }, "gear");
+    launcher.paletteItems(cmd);
     commands.paletteItems(cmd);
     flywheel.paletteItems(cmd);
     review.paletteItems(cmd);
@@ -3433,10 +3474,11 @@
 
   const paletteOpen = () => !$("#palette").hidden;
 
-  function openPalette() {
+  // `query`: a filter to start from.
+  function openPalette(query) {
     palette.items = paletteCommands();
     palette.index = 0;
-    $("#palette-input").value = "";
+    $("#palette-input").value = typeof query === "string" ? query : "";
     $("#palette").hidden = false;
     renderPalette();
     $("#palette-input").focus();
@@ -3663,7 +3705,11 @@
   const actions = {
     "new-session": () => openSessionDialog(),
     "new-workspace": () => openWorkspaceDialog(),
-    palette: openPalette,
+    palette: () => openPalette(),
+    "from-template": () => {
+      document.body.classList.remove("side-open");
+      openPalette(launcher.PALETTE_PREFIX);
+    },
     "cycle-theme": () => applyTheme(THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]),
     logout,
     "toggle-sidebar": () => document.body.classList.toggle("side-open"),

@@ -61,8 +61,11 @@ enum HubCommand {
     InstallService(lifecycle::InstallServiceArgs),
     /// List workspaces and their sessions with state.
     Ls(script::LsArgs),
-    /// Open a session in a workspace; prints its id.
+    /// Open a session in a workspace; prints its id. Agents take a first
+    /// prompt, model, and permission options, or a saved --template.
     New(script::NewArgs),
+    /// A workspace's launch templates: ls, save, rm.
+    Template(crate::template_cli::TemplateArgs),
     /// Type text into a session (pasted, bracketed-paste aware).
     Send(script::SendArgs),
     /// Print a session's screen text.
@@ -394,6 +397,7 @@ pub fn run_with(
         HubCommand::InstallService(args) => lifecycle::install_service(&args, out, err),
         HubCommand::Ls(args) => script::ls(&args, out, err),
         HubCommand::New(args) => script::new(&args, out, err),
+        HubCommand::Template(args) => crate::template_cli::main(&args, out, err),
         HubCommand::Send(args) => script::send(&args, out, err),
         HubCommand::Read(args) => script::read(&args, out, err),
         HubCommand::Explain(args) => crate::detect::explain::run(&args, out, err),

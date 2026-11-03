@@ -308,6 +308,7 @@ pub(super) async fn start_worker(
             cols: request.cols,
             rows: request.rows,
             worktree: None,
+            ..CreateSession::default()
         })
         .map_err(StartRefused::Hub)
     })

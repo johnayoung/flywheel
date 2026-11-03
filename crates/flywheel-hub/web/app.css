@@ -3156,3 +3156,111 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   .rv-sheet { width: 100vw; max-width: 100vw; max-height: 100dvh; height: 100dvh; margin: 0; border-radius: 0; }
   .rva-row { flex-direction: column; align-items: stretch; }
 }
+
+/* --- Agent launcher: templates, first prompt, model, permissions. --- */
+.tpl-line { display: flex; align-items: center; gap: .6rem; }
+.tpl-line select { flex: 1; }
+.text-btn.danger { color: var(--alert); }
+.text-btn[hidden] { display: none; }
+
+.agent-opts {
+  gap: .55rem;
+  padding: .75rem .8rem .8rem;
+  border: 1px solid var(--rule-2);
+  border-left: 2px solid var(--signal);
+  border-radius: 2px;
+  background: var(--bg-2);
+}
+.agent-opts[hidden] { display: none; }
+.agent-opts legend { padding: 0 .3rem; margin-left: -.3rem; }
+.ao-prompt { display: grid; gap: .3rem; }
+.ao-prompt textarea {
+  width: 100%;
+  min-height: 5.2rem;
+  max-height: 40vh;
+  padding: .55rem .65rem;
+  resize: vertical;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 12px/1.5 var(--term);
+}
+.ao-prompt textarea:focus, .ao-field input:focus, .ao-field select:focus {
+  outline: none;
+  border-color: var(--signal);
+  box-shadow: 0 0 0 3px var(--signal-soft);
+}
+.ao-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); gap: .5rem .7rem; }
+.ao-field { display: grid; gap: .3rem; min-width: 0; }
+.ao-field input, .ao-field select {
+  width: 100%;
+  padding: .45rem .55rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 12px var(--term);
+}
+.agent-opts[data-kind="claude"] .codex-only,
+.agent-opts[data-kind="codex"] .claude-only { display: none; }
+.agent-warn {
+  margin: 0;
+  padding: .5rem .6rem;
+  border-left: 3px solid var(--alert);
+  background: color-mix(in srgb, var(--alert) 12%, transparent);
+  color: var(--ink);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.agent-warn[hidden] { display: none; }
+
+.tpl-save { display: flex; gap: .5rem; }
+.tpl-save[hidden] { display: none; }
+.tpl-save input {
+  flex: 1;
+  min-width: 0;
+  padding: .45rem .55rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 12px var(--term);
+}
+.tpl-save input:focus { outline: none; border-color: var(--signal); }
+.sheet-foot .tpl-save-toggle { margin-right: auto; }
+
+/* --- Token usage and cost. --- */
+.meter.usage { color: var(--brass); cursor: help; }
+.session-cost {
+  font-size: 9.5px;
+  color: var(--brass);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: help;
+}
+.session-cost.partial { color: var(--ink-3); }
+.ws-cost {
+  font-size: 9.5px;
+  color: var(--brass);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ws-cost:empty { display: none; }
+.spend {
+  display: flex;
+  align-items: baseline;
+  gap: .4rem;
+  padding: .45rem 1.1rem;
+  border-top: 1px solid var(--rule);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+  cursor: help;
+}
+.spend[hidden] { display: none; }
+.spend .spend-k { font-size: 8.5px; letter-spacing: .18em; text-transform: uppercase; color: var(--ink-3); }
+.spend b { color: var(--brass); font-weight: 600; margin-right: .5rem; }
+#from-template { grid-column: 1 / -1; }
+#from-template[hidden] { display: none; }
+@media (max-width: 760px) { .meter.usage { display: none; } }

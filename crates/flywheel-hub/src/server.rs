@@ -60,6 +60,7 @@ mod listen;
 mod notify_api;
 mod pwa;
 mod review_api;
+mod templates_api;
 mod worktree_api;
 
 use crate::auth::{
@@ -181,6 +182,13 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
                 .delete(worktree_api::remove_session),
         )
         .route("/api/kinds", get(list_kinds))
+        .route("/api/templates", get(templates_api::list))
+        .route("/api/workspaces/{id}/templates", post(templates_api::save))
+        .route(
+            "/api/workspaces/{id}/templates/{name}",
+            axum::routing::delete(templates_api::remove),
+        )
+        .route("/api/usage", get(templates_api::usage))
         .route("/api/folders/check", get(check_folder))
         // The pre-folders name of the same check.
         .route("/api/repos/check", get(check_folder))
@@ -946,7 +954,22 @@ async fn blocking<T: Send + 'static>(
 // Both stat every folder (git/missing flags): off the executor.
 async fn list_workspaces(State(app): State<AppState>) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
-    let workspaces = blocking(move || Ok(hub.workspaces())).await?;
+    let (workspaces, templates) =
+        blocking(move || Ok((hub.workspaces(), hub.templates(None)?))).await?;
+    // Each workspace with its launch templates (the new-session form and
+    // the palette's quick launch read them from here).
+    let workspaces: Vec<serde_json::Value> = workspaces
+        .into_iter()
+        .map(|workspace| {
+            let mut value = serde_json::to_value(&workspace).unwrap_or_default();
+            let own: Vec<&crate::hub::TemplateView> = templates
+                .iter()
+                .filter(|t| t.workspace_id == workspace.id)
+                .collect();
+            value["templates"] = serde_json::to_value(own).unwrap_or_default();
+            value
+        })
+        .collect();
     Ok(Json(json!({ "workspaces": workspaces })).into_response())
 }
 
@@ -1748,6 +1771,13 @@ async fn events_pump(
                         socket.send(commands_api::event_message(&session_id, added)).await.is_ok()
                     }
                     Ok(HubEvent::Unwatched { .. }) => true,
+                    Ok(HubEvent::Usage { session_id }) => {
+                        let usage = hub.session(&session_id).ok().and_then(|v| v.usage);
+                        socket
+                            .send(text(json!({ "type": "usage", "session_id": session_id, "usage": usage })))
+                            .await
+                            .is_ok()
+                    }
                     Ok(HubEvent::Layout { workspace_id, rev }) => {
                         socket.send(text(json!({ "type": "layout", "workspace_id": workspace_id, "rev": rev }))).await.is_ok()
                     }

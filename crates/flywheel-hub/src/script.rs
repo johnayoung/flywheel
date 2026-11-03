@@ -296,9 +296,56 @@ fn companion_label(session: &Value, sessions: &[Value]) -> String {
     }
 }
 
+/// A token count for humans: `950`, `12.3k`, `4.56M`.
+pub fn tokens_label(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.2}M", n as f64 / 1e6),
+    }
+}
+
+/// A cost for humans: `$0.42`, `$0.0031`; marked `+` when some tokens
+/// are of a model without a known price.
+pub fn cost_label(cost: &Value) -> String {
+    let usd = cost.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
+    let priced = cost.get("priced").and_then(Value::as_bool) != Some(false);
+    let amount = if usd > 0.0 && usd < 0.01 {
+        format!("${usd:.4}")
+    } else {
+        format!("${usd:.2}")
+    };
+    if priced {
+        amount
+    } else if usd == 0.0 {
+        "unpriced".to_owned()
+    } else {
+        format!("{amount}+unpriced")
+    }
+}
+
+/// ` · 12.3k tok $0.42` for an agent session with usage, else empty.
+fn usage_label(session: &Value) -> String {
+    match session.get("usage").filter(|u| u.is_object()) {
+        Some(usage) => format!(
+            " \u{b7} {} tok {}",
+            tokens_label(
+                usage
+                    .get("total_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            ),
+            cost_label(usage)
+        ),
+        None => String::new(),
+    }
+}
+
 #[derive(Debug, clap::Args)]
 pub(crate) struct LsArgs {
-    /// Print JSON: {"workspaces":[{...,"sessions":[...]}]}.
+    /// Print JSON: {"workspaces":[{...,"sessions":[...]}],"usage":{...}}
+    /// (each agent session with its `usage`; `usage` is the hub's and
+    /// each workspace's today, this week, and all time).
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -306,12 +353,19 @@ pub(crate) struct LsArgs {
 }
 
 pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let listed = connect(&args.endpoint)
-        .and_then(|conn| Ok((conn.blocking_workspaces()?, conn.blocking_sessions()?)));
+    let conn = match connect(&args.endpoint) {
+        Ok(conn) => conn,
+        Err(message) => return fail(err, &message),
+    };
+    let listed = conn
+        .blocking_workspaces()
+        .and_then(|w| Ok((w, conn.blocking_sessions()?)));
     let (workspaces, sessions) = match listed {
         Ok(lists) => lists,
         Err(message) => return fail(err, &message),
     };
+    // A hub from before usage has no /api/usage: the listing stands.
+    let usage = conn.blocking_call("GET", "/api/usage", None).ok();
     let of = |w: &Value| -> Vec<Value> {
         sessions
             .iter()
@@ -328,7 +382,11 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                 w
             })
             .collect();
-        print_json(out, &json!({ "workspaces": nested }));
+        let mut listing = json!({ "workspaces": nested });
+        if let Some(usage) = usage {
+            listing["usage"] = usage;
+        }
+        print_json(out, &listing);
         return 0;
     }
     if workspaces.is_empty() {
@@ -359,10 +417,11 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                     state_label(s),
                     str_field(s, "name").to_owned(),
                     format!(
-                        "{}{}{}",
+                        "{}{}{}{}",
                         live_cwd(s),
                         git_label(s),
-                        companion_label(s, &sessions)
+                        companion_label(s, &sessions),
+                        usage_label(s)
                     ),
                 ]
             })
@@ -399,7 +458,42 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
             }
         }
     }
+    if let Some(line) = usage.as_ref().and_then(usage_footer) {
+        let _ = writeln!(out, "\n{line}");
+    }
     0
+}
+
+/// `usage: today $1.20 (310k tok), this week $8.95 (2.1M tok)` when the
+/// hub counted any.
+fn usage_footer(usage: &Value) -> Option<String> {
+    let total = usage.get("total")?;
+    if total
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        == 0
+    {
+        return None;
+    }
+    let part = |key: &str| {
+        let cost = usage.get(key).cloned().unwrap_or(Value::Null);
+        format!(
+            "{} ({} tok)",
+            cost_label(&cost),
+            tokens_label(
+                cost.get("total_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            )
+        )
+    };
+    Some(format!(
+        "usage: today {}, this week {}, all time {}",
+        part("today"),
+        part("week"),
+        part("total")
+    ))
 }
 
 // --- new --------------------------------------------------------------------
@@ -408,9 +502,15 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
 pub(crate) struct NewArgs {
     /// Workspace id, unique id prefix, or name.
     workspace: String,
-    /// shell (default), claude, or codex.
-    #[arg(long, default_value = "shell", value_parser = ["shell", "claude", "codex"])]
-    kind: String,
+    /// shell, claude, or codex (default: the template's, else shell).
+    #[arg(long, value_parser = ["shell", "claude", "codex"])]
+    kind: Option<String>,
+    /// Start from the workspace's launch template NAME (kind, prompt,
+    /// model, permission options, worktree); flags given here win.
+    #[arg(long, value_name = "NAME")]
+    template: Option<String>,
+    #[command(flatten)]
+    launch: crate::template_cli::LaunchFlags,
     /// One of the workspace's folders (default: its first): a path
     /// (relative to the current directory), or a folder's label or
     /// directory name.
@@ -529,7 +629,33 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
             (str_field(&created, "id").to_owned(), folder)
         }
     };
-    let mut body = json!({ "workspace_id": workspace_id, "kind": args.kind });
+    let template = args
+        .template
+        .as_deref()
+        .map(|name| crate::template_cli::find(&conn, &workspace_id, name))
+        .transpose()?;
+    let kind = args
+        .kind
+        .clone()
+        .or_else(|| template.as_ref().map(|t| str_field(t, "kind").to_owned()))
+        .unwrap_or_else(|| "shell".to_owned());
+    let mut body = json!({ "workspace_id": workspace_id, "kind": kind });
+    if let Some(template) = &template {
+        for key in ["prompt", "model", "permission_mode", "approval", "sandbox"] {
+            if let Some(value) = template.get(key).filter(|v| v.is_string()) {
+                body[key] = value.clone();
+            }
+        }
+    }
+    args.launch.apply(&mut body, args.launch.prompt_text()?);
+    // A template that runs in a worktree gets one named after it, unless
+    // --worktree names it.
+    let worktree = args.worktree.clone().or_else(|| {
+        template
+            .as_ref()
+            .filter(|t| t.get("worktree").and_then(Value::as_bool) == Some(true))
+            .map(|t| crate::template_cli::task_from(str_field(t, "name")))
+    });
     if let Some(folder) = folder {
         body["folder"] = json!(folder);
     }
@@ -539,7 +665,7 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
     if !args.command.is_empty() {
         body["command"] = json!(args.command);
     }
-    if let Some(task) = &args.worktree {
+    if let Some(task) = &worktree {
         body["worktree"] = json!({ "task": task, "base": args.base });
     }
     let view = conn.blocking_call("POST", "/api/sessions", Some(&body))?;
@@ -557,7 +683,7 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
 
 /// `raw` percent-escaped for a URL query value (RFC 3986 unreserved
 /// characters kept).
-fn query_escape(raw: &str) -> String {
+pub(crate) fn query_escape(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {

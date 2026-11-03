@@ -153,6 +153,7 @@ mod tests {
             fallback_command: None,
             worktree: None,
             companion_of: None,
+            launch: None,
         }
     }
 

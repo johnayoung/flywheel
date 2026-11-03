@@ -31,6 +31,8 @@ Scripting the running hub, or the one `--url` names (sessions/workspaces by id, 
 ```bash
 fw hub ls [--json]                                         # workspaces > sessions: short id, kind, state (+ agent status), name, live cwd [branch +ahead -behind ~changed ?untracked]
 fw hub new WS [--kind shell|claude|codex] [--folder PATH|LABEL] [--name N] [--create] [--worktree TASK [--base REF]] [--json] [-- ARGV...]   # prints the id; a taken --name is refused (--repo = --folder)
+fw hub new WS --kind claude|codex [--prompt TEXT|-] [--model M] [--permission-mode P] [--approval A] [--sandbox S] [--template NAME]   # agent launch; see Agent launcher
+fw hub template ls [WS] [--json] | save WS NAME --kind K [launch flags] [--worktree] | rm WS NAME   # per-workspace launch templates
 fw hub send SESSION TEXT|- [--enter] [--raw]               # pasted: newlines -> CR, bracketed when the program enabled it
 fw hub read SESSION [--source visible|recent] [--lines N] [--json]
 fw hub explain SESSION [--json]                            # why its status: hook | manifest:<file>#<rule> | heuristic, + screen rule, evidence rows, rules tried
@@ -264,6 +266,25 @@ any = ["would you like to run the following command?"]   # also: all, none (subs
 - **Cost**: read only after output (at most every 250 ms, once more when it stops) and while a settle is pending, by one thread per agent session; patterns compiled once per load (`regex`: linear time, 256 KiB program cap); a rule reads at most 100 rows of 512 chars; at most 64 rules, 8 clauses each, 16 patterns per list, 400 chars each, 64 KiB per file.
 - **Claude** rules are from Claude Code 2.1.306 screens (fixtures in `detect/fixtures/`); **Codex** rules from the codex TUI's own strings and snapshot tests (`codex-rs/tui`). **Shell** rules (password / `[y/N]` / prompt on the last row) only answer `explain`.
 - **Explain**: `fw hub explain S` (`GET /api/sessions/{id}/explain`, the UI's `why?` beside the status pill) gives the status, what set it (`source`: `hook` + agent event, `manifest` + file (`codex.toml` bundled, `agent-detection/codex.toml` override) + rule, `heuristic` + reason, `hub` (process exit)), a fresh read of the screen (rule, detail, evidence rows), every rule with why it did not match, the manifest's origin and version, and override problems.
+
+## Agent launcher
+
+The new-session form (and `fw hub new`) starts an agent with:
+
+- **First prompt**: passed as the CLI's positional prompt after `--` (`claude [opts] -- PROMPT`, `codex [opts] -- PROMPT`), so it is the first user turn (after Claude's folder-trust dialog, if shown). Only on create; a relaunch or restore never re-sends it. Max 32 KiB.
+- **Model**: `claude --model` (alias or full id) / `codex -m`; suggestions offered, any id accepted (`[A-Za-z0-9._:/@[]-]`, no leading `-`).
+- **Permissions**: Claude `--permission-mode manual|acceptEdits|plan|auto|dontAsk|bypassPermissions` (the UI warns on bypass); Codex `-a untrusted|on-failure|on-request|never` and `-s read-only|workspace-write|danger-full-access`. Recorded as the session's `launch`, reapplied on relaunch/restore.
+- **Templates** (per workspace, in `state.json`, schema 3): name, kind, prompt, model, permissions, worktree yes/no. Pick one in the form to fill it, "save as template" / delete there, or `fw hub template`. Quick launch: palette "New agent from template: NAME" or the sidebar's **From template** (phone too). A worktree template gets task `<name-slug>-<4 hex>` unless `new --worktree TASK`. `new --template` flags override the template's.
+
+API: `POST /api/sessions` takes `prompt`, `model`, `permission_mode`, `approval`, `sandbox`; `GET /api/templates[?workspace_id=]`, `POST /api/workspaces/{id}/templates` (create/replace by `name`), `DELETE /api/workspaces/{id}/templates/{name}`; `GET /api/workspaces` lists each workspace's `templates`.
+
+## Usage and cost
+
+The transcript tailer also counts tokens: Claude's per-response `message.usage` (repeated lines of one message id count once; subagent transcripts `<id>/subagents/*.jsonl` included), Codex's rollout `token_count` events (growth of the cumulative totals; model from `turn_context`). Cost uses the model the transcript records (Claude's plan mode may run a different model than `--model`).
+
+- **Prices**: an embedded table (`crates/flywheel-hub/src/usage.rs`, `PRICES`): Anthropic first-party list prices as of 2026-10-06 (cache writes 1.25x input for 5 m TTL, 2x for 1 h; Haiku 5.5 / Sonnet 4.x long-context tiers; fast mode 2x where priced) and OpenAI GPT-5 prices (2025-11). A model not in it shows tokens only and `priced: false` with `unpriced_models` -- never a guessed price. Server-tool fees (web search) are not included.
+- **Where**: each agent session's `usage` (`GET /api/sessions`, `fw hub ls [--json]`, events message `{"type":"usage"}`): turns, tokens, `cost_usd`, `today`, `week`, by model, last call. Header meter and sidebar row show it (tooltip: breakdown). `GET /api/usage` (also `usage` in `fw hub ls --json`): hub and per-workspace `today` / `week` (local Monday start) / `total`; the sidebar shows today and week.
+- **Kept**: with the session's commands (`<state-dir>/commands/<id>.json`, 62 days of per-day totals); a removed session's usage moves to `<state-dir>/usage-archive.json` so rollups keep it.
 
 ## Suggested commands
 

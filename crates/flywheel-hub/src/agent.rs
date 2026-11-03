@@ -192,6 +192,208 @@ pub fn claude_args(session_id: &str, resume: bool, report: Option<&[String]>) ->
     args
 }
 
+// --- launch options -----------------------------------------------------------
+
+/// Claude Code's `--permission-mode` choices (claude 2.1.306). Omitted:
+/// the CLI's own default (its settings, else asking before edits).
+pub const CLAUDE_PERMISSION_MODES: &[&str] = &[
+    "manual",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+];
+/// The permission mode that skips every check (the UI warns about it).
+pub const CLAUDE_BYPASS_MODE: &str = "bypassPermissions";
+/// Codex's `--ask-for-approval` policies.
+pub const CODEX_APPROVALS: &[&str] = &["untrusted", "on-failure", "on-request", "never"];
+/// Codex's `--sandbox` policies.
+pub const CODEX_SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
+/// Model choices offered by the launcher (any other id is accepted too):
+/// Claude Code's aliases, then full ids.
+pub const CLAUDE_MODELS: &[&str] = &[
+    "opus",
+    "sonnet",
+    "haiku",
+    "fable",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+    "claude-fable-5-1",
+];
+pub const CODEX_MODELS: &[&str] = &["gpt-5-codex", "gpt-5", "gpt-5.1-codex", "gpt-5.1"];
+/// Longest model id accepted.
+pub const MAX_MODEL_CHARS: usize = 100;
+/// Largest initial prompt (it travels as one argv element; Linux caps
+/// one at 128 KiB).
+pub const MAX_PROMPT_BYTES: usize = 32 * 1024;
+
+/// How an agent CLI is started, beyond the hub's own wiring: its model and
+/// permission policy. Recorded with the session, so a relaunch or restore
+/// runs it the same way.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AgentLaunch {
+    /// `claude --model` / `codex -m`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Claude Code's `--permission-mode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    /// Codex's `--ask-for-approval`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+    /// Codex's `--sandbox`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+}
+
+impl AgentLaunch {
+    /// Nothing set (the CLI's defaults).
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Blank fields dropped, every value checked against `kind`: a shell
+    /// takes none, Claude no Codex policy and the other way round.
+    pub fn validated(&self, kind: SessionKind) -> Result<Self, String> {
+        let clean = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        };
+        let launch = Self {
+            model: clean(&self.model),
+            permission_mode: clean(&self.permission_mode),
+            approval: clean(&self.approval),
+            sandbox: clean(&self.sandbox),
+        };
+        if launch.is_empty() {
+            return Ok(launch);
+        }
+        let name = kind.as_str();
+        if kind == SessionKind::Shell {
+            return Err("a shell session takes no model or permission mode".into());
+        }
+        if let Some(model) = &launch.model {
+            validate_model(model)?;
+        }
+        let pick = |value: &Option<String>, allowed: &[&str], what: &str, flag: &str| match value {
+            Some(v) if !allowed.contains(&v.as_str()) => Err(format!(
+                "{what} {v:?} is not one of {} ({name} {flag})",
+                allowed.join(", ")
+            )),
+            _ => Ok(()),
+        };
+        match kind {
+            SessionKind::Claude => {
+                if launch.approval.is_some() || launch.sandbox.is_some() {
+                    return Err(
+                        "approval and sandbox are Codex policies; Claude takes a permission mode"
+                            .into(),
+                    );
+                }
+                pick(
+                    &launch.permission_mode,
+                    CLAUDE_PERMISSION_MODES,
+                    "permission mode",
+                    "--permission-mode",
+                )?;
+            }
+            SessionKind::Codex => {
+                if launch.permission_mode.is_some() {
+                    return Err(
+                        "a permission mode is Claude's; Codex takes an approval policy and a sandbox"
+                            .into(),
+                    );
+                }
+                pick(&launch.approval, CODEX_APPROVALS, "approval policy", "-a")?;
+                pick(&launch.sandbox, CODEX_SANDBOXES, "sandbox", "-s")?;
+            }
+            SessionKind::Shell => unreachable!("shells were refused above"),
+        }
+        Ok(launch)
+    }
+
+    /// The CLI flags for these options (after the hub's own wiring).
+    pub fn args(&self, kind: SessionKind) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut push = |flag: &str, value: &Option<String>| {
+            if let Some(value) = value {
+                args.push(flag.to_owned());
+                args.push(value.clone());
+            }
+        };
+        match kind {
+            SessionKind::Claude => {
+                push("--model", &self.model);
+                push("--permission-mode", &self.permission_mode);
+            }
+            SessionKind::Codex => {
+                push("-m", &self.model);
+                push("-a", &self.approval);
+                push("-s", &self.sandbox);
+            }
+            SessionKind::Shell => {}
+        }
+        args
+    }
+
+    /// Whether these options switch the agent's safety checks off.
+    pub fn bypasses_permissions(&self) -> bool {
+        self.permission_mode.as_deref() == Some(CLAUDE_BYPASS_MODE)
+            || (self.approval.as_deref() == Some("never")
+                && self.sandbox.as_deref() == Some("danger-full-access"))
+    }
+}
+
+/// A model id: letters, digits and `.-_:/@[]`, not starting with `-` (it
+/// is a flag's value; never another flag).
+pub fn validate_model(model: &str) -> Result<(), String> {
+    if model.chars().count() > MAX_MODEL_CHARS {
+        return Err(format!("model is longer than {MAX_MODEL_CHARS} characters"));
+    }
+    let ok = model.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".-_:/@[]".contains(c));
+    if !ok {
+        return Err(format!(
+            "model {model:?} may only hold letters, digits and . - _ : / @ [ ] (and starts with a letter or digit)"
+        ));
+    }
+    Ok(())
+}
+
+/// An initial prompt as given: `None` when blank; refused when too large
+/// or holding a NUL (it cannot travel in argv).
+pub fn validate_prompt(prompt: Option<&str>) -> Result<Option<String>, String> {
+    let Some(prompt) = prompt.filter(|p| !p.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if prompt.len() > MAX_PROMPT_BYTES {
+        return Err(format!(
+            "the initial prompt is larger than {MAX_PROMPT_BYTES} bytes"
+        ));
+    }
+    if prompt.contains('\0') {
+        return Err("the initial prompt holds a NUL byte".into());
+    }
+    Ok(Some(prompt.trim_end().to_owned()))
+}
+
+/// argv that hands an agent CLI its first user turn: both take the prompt
+/// as their positional argument (`claude [options] [prompt]`, `codex
+/// [OPTIONS] [PROMPT]`), after `--` so a prompt starting with `-` (or
+/// naming a Codex subcommand) stays the prompt. Goes last.
+pub fn prompt_args(kind: SessionKind, prompt: &str) -> Vec<String> {
+    match kind {
+        SessionKind::Claude | SessionKind::Codex => vec!["--".to_owned(), prompt.to_owned()],
+        SessionKind::Shell => Vec::new(),
+    }
+}
+
 /// Extra argv for a Codex session: its turn-complete notifier runs
 /// `report --source codex --event notify <payload-json>`.
 pub fn codex_args(report: Option<&[String]>) -> Vec<String> {
@@ -542,6 +744,104 @@ mod tests {
         assert_eq!(args[..3], ["--session-id", id, "--settings"]);
         let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
         assert!(settings["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
+    fn launch_options_build_each_clis_flags_and_refuse_the_wrong_kind() {
+        let claude = AgentLaunch {
+            model: Some(" opus ".into()),
+            permission_mode: Some("acceptEdits".into()),
+            ..AgentLaunch::default()
+        }
+        .validated(SessionKind::Claude)
+        .unwrap();
+        assert_eq!(
+            claude.args(SessionKind::Claude),
+            ["--model", "opus", "--permission-mode", "acceptEdits"]
+        );
+        assert!(!claude.bypasses_permissions());
+        let codex = AgentLaunch {
+            model: Some("gpt-5-codex".into()),
+            approval: Some("on-request".into()),
+            sandbox: Some("workspace-write".into()),
+            ..AgentLaunch::default()
+        }
+        .validated(SessionKind::Codex)
+        .unwrap();
+        assert_eq!(
+            codex.args(SessionKind::Codex),
+            [
+                "-m",
+                "gpt-5-codex",
+                "-a",
+                "on-request",
+                "-s",
+                "workspace-write"
+            ]
+        );
+        // Blank fields are no fields; nothing set is no flags.
+        let blank = AgentLaunch {
+            model: Some("  ".into()),
+            ..AgentLaunch::default()
+        };
+        let blank = blank.validated(SessionKind::Shell).unwrap();
+        assert!(blank.is_empty() && blank.args(SessionKind::Claude).is_empty());
+        let bypass = AgentLaunch {
+            permission_mode: Some(CLAUDE_BYPASS_MODE.into()),
+            ..AgentLaunch::default()
+        };
+        assert!(
+            bypass
+                .validated(SessionKind::Claude)
+                .unwrap()
+                .bypasses_permissions()
+        );
+        let refused = |launch: AgentLaunch, kind: SessionKind| launch.validated(kind).unwrap_err();
+        let model = |m: &str| AgentLaunch {
+            model: Some(m.into()),
+            ..AgentLaunch::default()
+        };
+        assert!(refused(model("opus"), SessionKind::Shell).contains("shell"));
+        assert!(
+            refused(model("--dangerously-skip-permissions"), SessionKind::Claude).contains("model")
+        );
+        assert!(refused(model("a b"), SessionKind::Claude).contains("model"));
+        assert!(
+            model("claude-opus-5-5[1m]")
+                .validated(SessionKind::Claude)
+                .is_ok()
+        );
+        let mode = |m: &str| AgentLaunch {
+            permission_mode: Some(m.into()),
+            ..AgentLaunch::default()
+        };
+        assert!(refused(mode("yolo"), SessionKind::Claude).contains("acceptEdits"));
+        assert!(refused(mode("plan"), SessionKind::Codex).contains("Claude"));
+        let approval = AgentLaunch {
+            approval: Some("never".into()),
+            ..AgentLaunch::default()
+        };
+        assert!(refused(approval.clone(), SessionKind::Claude).contains("Codex"));
+        let sandbox = AgentLaunch {
+            sandbox: Some("everything".into()),
+            ..AgentLaunch::default()
+        };
+        assert!(refused(sandbox, SessionKind::Codex).contains("read-only"));
+    }
+
+    #[test]
+    fn prompts_go_last_after_a_double_dash() {
+        assert_eq!(
+            prompt_args(SessionKind::Claude, "-v means verbose\nfix it"),
+            ["--", "-v means verbose\nfix it"]
+        );
+        assert_eq!(prompt_args(SessionKind::Codex, "review"), ["--", "review"]);
+        assert!(prompt_args(SessionKind::Shell, "x").is_empty());
+        assert_eq!(validate_prompt(None), Ok(None));
+        assert_eq!(validate_prompt(Some(" \n ")), Ok(None));
+        assert_eq!(validate_prompt(Some("go\n\n")), Ok(Some("go".into())));
+        assert!(validate_prompt(Some("a\0b")).is_err());
+        assert!(validate_prompt(Some(&"x".repeat(MAX_PROMPT_BYTES + 1))).is_err());
     }
 
     #[test]

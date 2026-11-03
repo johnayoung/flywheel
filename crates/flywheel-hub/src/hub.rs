@@ -170,6 +170,12 @@ pub struct CreateSession {
     pub rows: Option<u16>,
     /// Run it in a new sibling worktree of its (git) folder.
     pub worktree: Option<NewWorktree>,
+    /// An agent's first user turn (handed to its CLI at launch; never
+    /// again on a relaunch or restore).
+    pub prompt: Option<String>,
+    /// An agent's model and permission options.
+    #[serde(flatten)]
+    pub launch: agent::AgentLaunch,
 }
 
 /// A new worktree for a session: `<repo-parent>/<repo>.worktrees/<task>`
@@ -274,6 +280,17 @@ pub struct SessionView {
     /// Branch, changes, and ahead/behind of its directory (git folders
     /// and worktrees), from the badge cache: refreshed in the background.
     pub git: Option<GitStatus>,
+    /// An agent session's tokens and cost, from its transcript (absent
+    /// before its first counted call).
+    pub usage: Option<crate::usage::UsageView>,
+}
+
+/// A launch template with the workspace it belongs to.
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateView {
+    pub workspace_id: String,
+    #[serde(flatten)]
+    pub template: crate::state::LaunchTemplate,
 }
 
 /// A hub-wide change, pushed to every events subscriber.
@@ -295,6 +312,8 @@ pub enum HubEvent {
     /// A workspace's tabs and splits were saved (or a removed session's
     /// panes closed): `rev` is the new revision.
     Layout { workspace_id: String, rev: u64 },
+    /// An agent session's token usage grew (re-read its usage).
+    Usage { session_id: String },
 }
 
 /// Facts about the server-owned PTY (present until the session is removed
@@ -422,7 +441,8 @@ impl Hub {
                 options.claude_config_dir.clone(),
                 options.codex_home.clone(),
                 Some(options.state_dir.join(crate::transcript::COMMANDS_DIR)),
-            ),
+            )
+            .with_archive(crate::usage::archive_path(&options.state_dir)),
             options,
             token: RwLock::new(token),
             login_codes: Mutex::new(LoginCodes::default()),
@@ -570,7 +590,7 @@ impl Hub {
         self.options.import_root.as_deref()
     }
 
-    fn store(&self) -> MutexGuard<'_, HubStore> {
+    pub(crate) fn store(&self) -> MutexGuard<'_, HubStore> {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -725,6 +745,7 @@ impl Hub {
         for session in freed {
             forget(&session);
         }
+        self.commands.forget(&removed);
         self.emit(HubEvent::Sessions);
         Ok(())
     }
@@ -767,11 +788,15 @@ impl Hub {
             .then(|| self.board().status(&record.id, Audience::Anyone))
             .flatten();
         let git = self.git.get(&badge_key(&record));
+        let usage = self
+            .commands
+            .usage(&record, chrono::Local::now().date_naive());
         SessionView {
             record,
             live,
             agent,
             git,
+            usage,
         }
     }
 
@@ -832,6 +857,19 @@ impl Hub {
             (kind, None) => vec![self.agent_program(kind)?.to_string_lossy().into_owned()],
         };
         let name = request.name.as_deref().map(validate_name).transpose()?;
+        let options = request
+            .launch
+            .validated(request.kind)
+            .map_err(StateError::Invalid)?;
+        let prompt =
+            agent::validate_prompt(request.prompt.as_deref()).map_err(StateError::Invalid)?;
+        if prompt.is_some() && !request.kind.is_agent() {
+            return Err(StateError::Invalid(
+                "an initial prompt is for agent sessions; send text to a shell with fw hub send"
+                    .into(),
+            )
+            .into());
+        }
         // Everything else checked: only now cut the worktree (git work).
         let worktree = match &request.worktree {
             Some(new) => {
@@ -873,8 +911,9 @@ impl Hub {
             fallback_command: None,
             worktree: worktree.clone(),
             companion_of: None,
+            launch: (!options.is_empty()).then_some(options),
         };
-        let launched = self.launch(record, request.cols, request.rows);
+        let launched = self.launch(record, request.cols, request.rows, prompt.as_deref());
         if launched.is_err()
             && let Some(worktree) = &worktree
         {
@@ -890,13 +929,14 @@ impl Hub {
         record: SessionRecord,
         cols: Option<u16>,
         rows: Option<u16>,
+        prompt: Option<&str>,
     ) -> Result<SessionView, HubError> {
         let id = record.id.clone();
         // Insert the live entry and the record under the store lock so the
         // exit callback (which also takes it) cannot observe a session that
         // is live but unrecorded.
         let mut store = self.store();
-        let session = match self.spawn_pty(&record, cols, rows, false) {
+        let session = match self.spawn_pty(&record, cols, rows, false, prompt) {
             Ok(session) => session,
             Err(e) => {
                 self.board().untrack(&id);
@@ -998,8 +1038,9 @@ impl Hub {
             fallback_command: None,
             worktree: agent.worktree.clone(),
             companion_of: Some(agent.id.clone()),
+            launch: None,
         };
-        Ok((self.launch(record, cols, rows)?, true))
+        Ok((self.launch(record, cols, rows, None)?, true))
     }
 
     /// Paste `text` into an agent session's companion shell, starting it
@@ -1223,6 +1264,7 @@ impl Hub {
         cols: Option<u16>,
         rows: Option<u16>,
         resume: bool,
+        prompt: Option<&str>,
     ) -> Result<Arc<PtySession>, HubError> {
         // Never fall back to wherever the PTY layer would start it (the
         // hub's own directory or $HOME) while the record says otherwise.
@@ -1251,23 +1293,29 @@ impl Hub {
                 .map_err(HubError::Internal)?;
             generation = Some(key.generation);
             let report = self.options.report_command.as_deref();
+            let options = record.launch.clone().unwrap_or_default();
+            // The first prompt goes to a new conversation only.
+            let mut resuming = resume;
             match kind {
                 SessionKind::Claude => {
                     if let Some(conversation) = &record.agent_session_id {
-                        argv.extend(agent::claude_args(
-                            conversation,
-                            self.claude_transcript_exists(record, conversation),
-                            report,
-                        ));
+                        let exists = self.claude_transcript_exists(record, conversation);
+                        resuming |= exists;
+                        argv.extend(agent::claude_args(conversation, exists, report));
                     }
+                    argv.extend(options.args(kind));
                 }
                 SessionKind::Codex => {
                     argv.extend(agent::codex_args(report));
+                    argv.extend(options.args(kind));
                     if let Some(thread) = record.agent_session_id.as_deref().filter(|_| resume) {
                         argv.extend(agent::codex_resume_args(thread));
                     }
                 }
                 SessionKind::Shell => {}
+            }
+            if let Some(prompt) = prompt.filter(|_| !resuming) {
+                argv.extend(agent::prompt_args(kind, prompt));
             }
             env.push((
                 report::SOCKET_ENV.to_owned(),
@@ -1707,7 +1755,7 @@ impl Hub {
             store.set_agent_session_id(id, &conversation)?;
             record.agent_session_id = Some(conversation);
         }
-        let session = self.spawn_pty(&record, cols, rows, false)?;
+        let session = self.spawn_pty(&record, cols, rows, false, None)?;
         let record = match store.mark_running(id) {
             Ok(record) => record,
             Err(e) => {
@@ -1828,7 +1876,13 @@ impl Hub {
         relaunched.fallback_command = fallback.clone();
         relaunched.cwd = cwd.clone();
         let session = self
-            .spawn_pty(&relaunched, None, None, plan.how == RestoreHow::Resume)
+            .spawn_pty(
+                &relaunched,
+                None,
+                None,
+                plan.how == RestoreHow::Resume,
+                None,
+            )
             .map_err(|e| e.to_string())?;
         if let Err(e) = store.mark_restored(&record.id, fallback) {
             drop(store);
@@ -1964,6 +2018,8 @@ impl Hub {
         if let Some(session) = live {
             forget(&session);
         }
+        // Its usage moves to the archive now, so no rollup misses it.
+        self.commands.forget(&[id.to_owned()]);
         self.emit(HubEvent::Sessions);
         if let Some((workspace_id, rev)) = relaid {
             self.emit(HubEvent::Layout { workspace_id, rev });
@@ -1972,6 +2028,47 @@ impl Hub {
     }
 
     // --- layouts --------------------------------------------------------------
+
+    /// Launch templates: one workspace's, or every workspace's (in
+    /// workspace order), each with its workspace id.
+    pub fn templates(&self, workspace_id: Option<&str>) -> Result<Vec<TemplateView>, HubError> {
+        let store = self.store();
+        let ids: Vec<String> = match workspace_id {
+            Some(id) => vec![store.workspace(id)?.id.clone()],
+            None => store.workspaces().iter().map(|w| w.id.clone()).collect(),
+        };
+        let mut views = Vec::new();
+        for id in ids {
+            for template in store.templates(&id)? {
+                views.push(TemplateView {
+                    workspace_id: id.clone(),
+                    template,
+                });
+            }
+        }
+        Ok(views)
+    }
+
+    /// Save (create or replace by name) a workspace's launch template.
+    pub fn save_template(
+        &self,
+        workspace_id: &str,
+        template: crate::state::LaunchTemplate,
+    ) -> Result<TemplateView, HubError> {
+        let template = self.store().save_template(workspace_id, template)?;
+        self.emit(HubEvent::Sessions);
+        Ok(TemplateView {
+            workspace_id: workspace_id.to_owned(),
+            template,
+        })
+    }
+
+    /// Remove a workspace's launch template.
+    pub fn remove_template(&self, workspace_id: &str, name: &str) -> Result<(), HubError> {
+        self.store().remove_template(workspace_id, name)?;
+        self.emit(HubEvent::Sessions);
+        Ok(())
+    }
 
     /// A workspace's tabs and splits (`rev` 0, no tabs: never saved).
     pub fn layout(&self, workspace_id: &str) -> Result<crate::layout::Layout, HubError> {

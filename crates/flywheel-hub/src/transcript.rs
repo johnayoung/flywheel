@@ -16,12 +16,22 @@
 //! dir (`commands/<session>.json`), so a restarted hub keeps every block,
 //! including those of conversations before a `/clear`, under the same
 //! `seq`, and resumes reading where it stopped.
+//!
+//! The same tail counts the session's token usage ([`crate::usage`]):
+//! Claude Code's per-response `usage`, plus its subagents' transcripts
+//! (`<conversation>/subagents/*.jsonl` beside the main one, read for usage
+//! only), and Codex's `token_count` events. Usage is saved in the same
+//! file; a removed session's moves to the hub's usage archive.
 
 use crate::agent::{SessionKind, claude_transcript, codex_rollout, is_conversation_id};
 use crate::commands::{Command, CommandSource, MAX_BLOCK_BYTES, copyable, fenced_blocks, is_shell};
 use crate::hub::{Hub, HubError, HubEvent};
 use crate::pty::{ENTER_DELAY, WriteOutcome, paste_bytes};
 use crate::state::{SessionRecord, StateError};
+use crate::usage::{
+    CodexCursor, RollupBuilder, SessionUsage, Turn, UsageArchive, UsageView, claude_turn,
+    codex_line,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -52,6 +62,8 @@ const MAX_PENDING_NOTIFY: usize = 16;
 pub const FRESH_WITHIN: Duration = Duration::from_secs(120);
 /// Largest paste accepted.
 pub const MAX_PASTE_BYTES: usize = 1024 * 1024;
+/// Subagent transcripts followed per session (for usage).
+const MAX_SUBAGENT_TAILS: usize = 256;
 
 /// Which agent's file format a tail reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,6 +92,17 @@ struct Tail {
     pending: Vec<u8>,
     /// Inside an over-long line: drop bytes up to its newline.
     skipping: bool,
+    /// Read for usage only (a Claude subagent's transcript).
+    usage_only: bool,
+    /// Where a Codex rollout's token counting stands.
+    codex: CodexCursor,
+}
+
+/// What one transcript line holds for the hub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Item {
+    Reply(Reply),
+    Usage(Turn),
 }
 
 /// One reply's text from a transcript line.
@@ -102,6 +125,16 @@ impl Tail {
             identity: None,
             pending: Vec::new(),
             skipping: false,
+            usage_only: false,
+            codex: CodexCursor::default(),
+        }
+    }
+
+    /// A tail of a Claude subagent's transcript, read for usage only.
+    fn usage_only(path: PathBuf, conversation: Option<String>) -> Self {
+        Self {
+            usage_only: true,
+            ..Self::new(path, Format::Claude, conversation)
         }
     }
 
@@ -116,6 +149,8 @@ impl Tail {
             identity: saved.identity,
             pending: Vec::new(),
             skipping: false,
+            usage_only: saved.usage_only,
+            codex: saved.codex,
         }
     }
 
@@ -126,13 +161,15 @@ impl Tail {
             conversation: self.conversation.clone(),
             offset: self.line_start,
             identity: self.identity,
+            usage_only: self.usage_only,
+            codex: self.codex.clone(),
         }
     }
 
     /// Read what was appended since the last call, handing `each` the
-    /// replies in the complete lines as they are read (so a long backlog
-    /// is never held whole). A missing file reads as nothing.
-    fn read(&mut self, each: &mut dyn FnMut(Reply)) {
+    /// replies and usage in the complete lines as they are read (so a
+    /// long backlog is never held whole). A missing file reads as nothing.
+    fn read(&mut self, each: &mut dyn FnMut(Item)) {
         let Ok(mut file) = File::open(&self.path) else {
             return;
         };
@@ -146,6 +183,8 @@ impl Tail {
             self.line_start = 0;
             self.pending.clear();
             self.skipping = false;
+            // A new file counts from nothing.
+            self.codex.total = None;
         }
         self.identity = Some(identity);
         if meta.len() == self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
@@ -191,15 +230,34 @@ impl Tail {
     }
 
     /// One complete line, starting at byte `start` of the file.
-    fn line(&self, line: &[u8], start: u64, each: &mut dyn FnMut(Reply)) {
-        // Cheap pre-filter: only lines with a fence are parsed (big tool
-        // results without one are skipped unparsed).
-        if !contains(line, b"```") && !contains(line, b"~~~") {
+    fn line(&mut self, line: &[u8], start: u64, each: &mut dyn FnMut(Item)) {
+        // Cheap pre-filter: only lines with a fence, or usage, are parsed
+        // (big tool results are skipped unparsed).
+        let fenced = !self.usage_only && (contains(line, b"```") || contains(line, b"~~~"));
+        let usage = match self.format {
+            Format::Claude => {
+                contains(line, b"\"usage\"") && contains(line, b"\"type\":\"assistant\"")
+            }
+            Format::Codex => contains(line, b"token_count") || contains(line, b"turn_context"),
+        };
+        if !fenced && !usage {
             return;
         }
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
             return;
         };
+        if usage {
+            let turn = match self.format {
+                Format::Claude => claude_turn(&value),
+                Format::Codex => codex_line(&value).and_then(|l| self.codex.feed(l)),
+            };
+            if let Some(turn) = turn {
+                each(Item::Usage(turn));
+            }
+        }
+        if !fenced {
+            return;
+        }
         let reply = match self.format {
             Format::Claude => claude_reply(&value),
             Format::Codex => codex_reply(&value),
@@ -212,7 +270,7 @@ impl Tail {
             if reply.message_id.is_empty() {
                 reply.message_id = format!("@{start}");
             }
-            each(reply);
+            each(Item::Reply(reply));
         }
     }
 }
@@ -309,6 +367,11 @@ struct Saved {
     tail: Option<SavedTail>,
     /// Oldest first.
     commands: Vec<Command>,
+    #[serde(default)]
+    usage: SessionUsage,
+    /// Claude subagent transcripts being read for usage.
+    #[serde(default)]
+    subagents: Vec<SavedTail>,
 }
 
 /// Where a tail stopped.
@@ -320,6 +383,10 @@ struct SavedTail {
     /// The start of the first line not yet read.
     offset: u64,
     identity: Option<(u64, u64)>,
+    #[serde(default)]
+    usage_only: bool,
+    #[serde(default)]
+    codex: CodexCursor,
 }
 
 /// One session's commands and the tail feeding them.
@@ -341,6 +408,12 @@ struct SessionCommands {
     file: Option<PathBuf>,
     /// Why the last save failed.
     save_error: Option<String>,
+    /// Tokens and cost so far.
+    usage: SessionUsage,
+    /// Claude subagent transcripts of the current conversation.
+    subagents: Vec<Tail>,
+    /// Usage changed since the last refresh reported it.
+    usage_changed: bool,
 }
 
 impl SessionCommands {
@@ -371,6 +444,8 @@ impl SessionCommands {
         }
         log.next_seq = log.next_seq.max(saved.next_seq);
         log.tail = saved.tail.map(Tail::resume);
+        log.usage = saved.usage;
+        log.subagents = saved.subagents.into_iter().map(Tail::resume).collect();
         log
     }
 
@@ -383,6 +458,8 @@ impl SessionCommands {
             next_seq: self.next_seq,
             tail: self.tail.as_ref().map(Tail::saved),
             commands: self.entries.iter().cloned().collect(),
+            usage: self.usage.clone(),
+            subagents: self.subagents.iter().map(Tail::saved).collect(),
         };
         let result = serde_json::to_vec(&saved)
             .map_err(std::io::Error::other)
@@ -473,11 +550,45 @@ impl SessionCommands {
     fn drain(&mut self, mut tail: Tail, added: &mut Vec<Command>) -> Tail {
         let source = source_of(tail.format);
         let conversation = tail.conversation.clone();
-        tail.read(&mut |reply| {
-            let more = self.add(&reply, conversation.as_deref(), source, false);
-            push_bounded(added, more);
+        tail.read(&mut |item| match item {
+            Item::Reply(reply) => {
+                let more = self.add(&reply, conversation.as_deref(), source, false);
+                push_bounded(added, more);
+            }
+            Item::Usage(turn) => {
+                self.usage_changed |= self.usage.observe(&turn);
+            }
         });
         tail
+    }
+
+    /// Follow the Claude subagent transcripts beside `main` (the current
+    /// conversation's `<id>.jsonl`): `<id>/subagents/*.jsonl`.
+    fn follow_subagents(&mut self, main: &Path, conversation: Option<&str>) {
+        let Some(dir) = main
+            .file_stem()
+            .map(|stem| main.with_file_name(stem).join("subagents"))
+        else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut found: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "jsonl") && p.is_file())
+            .collect();
+        found.sort();
+        for path in found {
+            if self.subagents.len() >= MAX_SUBAGENT_TAILS {
+                break;
+            }
+            if !self.subagents.iter().any(|t| t.path == path) {
+                self.subagents
+                    .push(Tail::usage_only(path, conversation.map(str::to_owned)));
+            }
+        }
     }
 }
 
@@ -513,6 +624,17 @@ pub struct CommandBook {
     swept: std::sync::atomic::AtomicBool,
     sessions: Mutex<HashMap<String, Arc<Mutex<SessionCommands>>>>,
     wake: Mutex<Option<mpsc::Sender<()>>>,
+    /// Usage of removed sessions, and where it is saved.
+    archive: Mutex<UsageArchive>,
+    archive_file: Option<PathBuf>,
+}
+
+/// What [`CommandBook::refresh_all`] found.
+#[derive(Debug, Default)]
+pub struct Refreshed {
+    /// New commands, oldest first.
+    pub commands: Vec<Command>,
+    pub usage_changed: bool,
 }
 
 /// Which commands [`CommandBook::list`] returns.
@@ -553,6 +675,8 @@ impl CommandBook {
             swept: std::sync::atomic::AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             wake: Mutex::new(None),
+            archive: Mutex::new(UsageArchive::default()),
+            archive_file: None,
         }
     }
 
@@ -663,13 +787,21 @@ impl CommandBook {
     /// Read whatever `record`'s agent wrote since the last call; returns
     /// the new commands (oldest first).
     pub fn refresh(&self, record: &SessionRecord) -> Vec<Command> {
+        self.refresh_all(record).commands
+    }
+
+    /// [`Self::refresh`], also saying whether its usage changed.
+    pub fn refresh_all(&self, record: &SessionRecord) -> Refreshed {
         // A fallback shell (an agent restored without its conversation)
         // writes no transcript: its saved blocks stay listed, unfollowed.
         if !record.runs_agent() {
-            return Vec::new();
+            return Refreshed::default();
         }
         let entry = self.entry(&record.id);
         let mut log = entry.lock().unwrap_or_else(PoisonError::into_inner);
+        if log.usage.workspace_id.as_deref() != Some(record.workspace_id.as_str()) {
+            log.usage.workspace_id = Some(record.workspace_id.clone());
+        }
         let conversation = record.agent_session_id.clone();
         let mut added = Vec::new();
         let mut switched = false;
@@ -690,6 +822,10 @@ impl CommandBook {
                         if let Some(old) = log.tail.take() {
                             log.drain(old, &mut added);
                         }
+                        // ...and its subagents' (they belong to it).
+                        for old in std::mem::take(&mut log.subagents) {
+                            log.drain(old, &mut added);
+                        }
                         log.tail = Some(Tail::new(path, format, conversation.clone()));
                         log.missed = None;
                         switched = true;
@@ -700,7 +836,14 @@ impl CommandBook {
         }
         if let Some(tail) = log.tail.take() {
             let tail = log.drain(tail, &mut added);
+            if tail.format == Format::Claude {
+                log.follow_subagents(&tail.path.clone(), conversation.as_deref());
+            }
             log.tail = Some(tail);
+        }
+        for tail in std::mem::take(&mut log.subagents) {
+            let tail = log.drain(tail, &mut added);
+            log.subagents.push(tail);
         }
         // Codex replies with no rollout to read: from the notify payload
         // (possibly cut short by the report budget: closed fences only).
@@ -718,10 +861,72 @@ impl CommandBook {
                 push_bounded(&mut added, more);
             }
         }
-        if switched || !added.is_empty() {
+        let usage_changed = std::mem::take(&mut log.usage_changed);
+        if switched || !added.is_empty() || usage_changed {
             log.save();
         }
-        added
+        Refreshed {
+            commands: added,
+            usage_changed,
+        }
+    }
+
+    /// A session's token usage (`None` before its first counted call).
+    pub fn usage(&self, record: &SessionRecord, today: chrono::NaiveDate) -> Option<UsageView> {
+        if !record.kind.is_agent() {
+            return None;
+        }
+        let entry = self.entry(&record.id);
+        let log = entry.lock().unwrap_or_else(PoisonError::into_inner);
+        (!log.usage.is_empty()).then(|| log.usage.view(today))
+    }
+
+    /// Add `record`'s usage to `rollup`.
+    pub fn add_usage(
+        &self,
+        record: &SessionRecord,
+        rollup: &mut RollupBuilder,
+        today: chrono::NaiveDate,
+    ) {
+        if !record.kind.is_agent() {
+            return;
+        }
+        let entry = self.entry(&record.id);
+        let log = entry.lock().unwrap_or_else(PoisonError::into_inner);
+        rollup.add_session(&log.usage, today);
+    }
+
+    /// Usage of removed sessions.
+    pub fn archive(&self) -> UsageArchive {
+        self.archive
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Keep removed sessions' usage in the archive at `path` (loaded now).
+    pub fn with_archive(mut self, path: PathBuf) -> Self {
+        *self
+            .archive
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner) = UsageArchive::load(&path);
+        self.archive_file = Some(path);
+        self
+    }
+
+    /// Move removed sessions' usage into the archive and save it.
+    fn archive_usage(&self, removed: &[SessionUsage]) {
+        let removed: Vec<&SessionUsage> = removed.iter().filter(|u| !u.is_empty()).collect();
+        if removed.is_empty() {
+            return;
+        }
+        let mut archive = self.archive.lock().unwrap_or_else(PoisonError::into_inner);
+        for usage in removed {
+            archive.fold(usage, "");
+        }
+        if let Some(file) = &self.archive_file {
+            let _ = archive.save(file);
+        }
     }
 
     /// A session's commands, newest first.
@@ -752,14 +957,18 @@ impl CommandBook {
         self.sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|id, _| {
+            .retain(|id, entry| {
                 let kept = keep.contains(id);
                 if !kept {
-                    gone.push(id.clone());
+                    gone.push((id.clone(), Arc::clone(entry)));
                 }
                 kept
             });
-        for id in gone {
+        let mut removed = Vec::new();
+        for (id, entry) in gone {
+            removed.push(std::mem::take(
+                &mut entry.lock().unwrap_or_else(PoisonError::into_inner).usage,
+            ));
             if let Some(file) = self.file_of(&id) {
                 let _ = std::fs::remove_file(file);
             }
@@ -775,10 +984,42 @@ impl CommandBook {
                         .and_then(|s| s.to_str())
                         .is_some_and(|id| !keep.contains(id));
                 if stale {
+                    // Removed while no hub ran: its usage is archived too.
+                    if let Some(saved) = std::fs::read(&path)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Saved>(&bytes).ok())
+                    {
+                        removed.push(saved.usage);
+                    }
                     let _ = std::fs::remove_file(path);
                 }
             }
         }
+        self.archive_usage(&removed);
+    }
+
+    /// Forget removed sessions now: their logs go, their usage moves to
+    /// the archive (what [`Self::retain`] does on its next round).
+    pub fn forget(&self, ids: &[String]) {
+        let mut removed = Vec::new();
+        for id in ids {
+            let entry = self
+                .sessions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(id);
+            let usage = match entry {
+                Some(entry) => {
+                    std::mem::take(&mut entry.lock().unwrap_or_else(PoisonError::into_inner).usage)
+                }
+                None => SessionCommands::load(self.file_of(id)).usage,
+            };
+            removed.push(usage);
+            if let Some(file) = self.file_of(id) {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+        self.archive_usage(&removed);
     }
 
     /// Save every loaded session's log now, with where reading stopped (a
@@ -890,12 +1131,54 @@ impl Hub {
     /// Read `record`'s transcript for new commands and push them to events
     /// subscribers.
     pub(crate) fn refresh_commands(&self, record: &SessionRecord) {
-        let added = self.command_book().refresh(record);
-        if !added.is_empty() {
+        let refreshed = self.command_book().refresh_all(record);
+        if !refreshed.commands.is_empty() {
             self.emit(HubEvent::Commands {
                 session_id: record.id.clone(),
-                added,
+                added: refreshed.commands,
             });
+        }
+        if refreshed.usage_changed {
+            self.emit(HubEvent::Usage {
+                session_id: record.id.clone(),
+            });
+        }
+    }
+
+    /// Token usage and cost: the whole hub's and each workspace's, today,
+    /// this week, and all time (removed sessions' included).
+    pub fn usage_rollups(&self) -> crate::usage::HubUsage {
+        let today = chrono::Local::now().date_naive();
+        let (workspaces, sessions) = {
+            let store = self.store();
+            (store.workspaces().to_vec(), store.sessions().to_vec())
+        };
+        let archive = self.command_book().archive();
+        let mut hub = RollupBuilder::default();
+        hub.add_archive(&archive, None, today);
+        let workspaces = workspaces
+            .into_iter()
+            .map(|workspace| {
+                let mut rollup = RollupBuilder::default();
+                rollup.add_archive(&archive, Some(&workspace.id), today);
+                for record in sessions.iter().filter(|s| s.workspace_id == workspace.id) {
+                    self.command_book().add_usage(record, &mut rollup, today);
+                    self.command_book().add_usage(record, &mut hub, today);
+                }
+                crate::usage::WorkspaceUsage {
+                    workspace_id: workspace.id,
+                    name: workspace.name,
+                    usage: rollup.build(),
+                }
+            })
+            .collect();
+        crate::usage::HubUsage {
+            hub: hub.build(),
+            workspaces,
+            day: today,
+            week_start: crate::usage::week_start(today),
+            price_source: crate::usage::PRICE_SOURCE,
+            prices_as_of: crate::usage::PRICE_AS_OF,
         }
     }
 
@@ -989,6 +1272,7 @@ mod tests {
             fallback_command: None,
             worktree: None,
             companion_of: None,
+            launch: None,
         }
     }
 
@@ -1351,6 +1635,124 @@ mod tests {
             added.last().unwrap().text,
             format!("echo {}", MAX_COMMANDS * 2 - 1)
         );
+    }
+
+    fn usage_line(id: &str, model: &str, input: u64, output: u64) -> String {
+        json!({
+            "type": "assistant",
+            "uuid": format!("u-{id}"),
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "message": {"id": id, "model": model, "role": "assistant",
+                "content": [{"type": "tool_use", "name": "Bash", "input": {}}],
+                "usage": {"input_tokens": input, "output_tokens": output,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}},
+        })
+        .to_string()
+            + "\n"
+    }
+
+    #[test]
+    fn claude_usage_is_counted_with_subagents_saved_and_archived_on_removal() {
+        let (dir, _, record, path) = claude_setup("c1");
+        let config = dir.path().join("claude");
+        let store = dir.path().join("state").join(COMMANDS_DIR);
+        let archive_file = dir.path().join("state").join(crate::usage::ARCHIVE_FILE);
+        let open = || {
+            CommandBook::new(Some(config.clone()), None, Some(store.clone()))
+                .with_archive(archive_file.clone())
+        };
+        let book = open();
+        let today = chrono::Local::now().date_naive();
+        assert!(book.usage(&record, today).is_none(), "nothing counted yet");
+        // A reply line without a fence still counts; its repeat does not.
+        append(&path, &usage_line("m1", "claude-sonnet-5-5", 1000, 100));
+        append(&path, &usage_line("m1", "claude-sonnet-5-5", 1000, 100));
+        let refreshed = book.refresh_all(&record);
+        assert!(refreshed.commands.is_empty() && refreshed.usage_changed);
+        assert!(!book.refresh_all(&record).usage_changed, "nothing new");
+        // A subagent's transcript beside the conversation's.
+        let subagents = path.with_file_name("c1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        append(
+            &subagents.join("agent-a1.jsonl"),
+            &usage_line("s1", "claude-haiku-5-5", 500, 50),
+        );
+        // Its fenced text is not a suggestion of the session's.
+        append(
+            &subagents.join("agent-a1.jsonl"),
+            &claude_line("x", "```sh\nrm -rf /\n```"),
+        );
+        let refreshed = book.refresh_all(&record);
+        assert!(refreshed.usage_changed);
+        assert!(refreshed.commands.is_empty());
+        let usage = book.usage(&record, today).unwrap();
+        assert_eq!(usage.turns, 2);
+        assert_eq!(usage.total.tokens.input, 1500);
+        assert_eq!(usage.today.tokens.output, 150);
+        let expected = (1000.0 * 2.0 + 100.0 * 10.0 + 500.0 * 0.10 + 50.0 * 0.50) / 1e6;
+        assert!((usage.total.cost_usd - expected).abs() < 1e-12);
+        drop(book);
+
+        // Saved: a new hub has it, and reads on from where it stopped.
+        let book = open();
+        assert_eq!(book.usage(&record, today).unwrap().turns, 2);
+        append(&path, &usage_line("m2", "claude-sonnet-5-5", 10, 1));
+        assert!(book.refresh_all(&record).usage_changed);
+        assert_eq!(book.usage(&record, today).unwrap().turns, 3);
+
+        // Removed: the archive keeps it for the rollups.
+        book.retain(&HashSet::new());
+        let mut hub = RollupBuilder::default();
+        hub.add_archive(&open().archive(), None, today);
+        assert_eq!(hub.build().today.tokens.input, 1510);
+        assert_eq!(hub.build().total.tokens.output, 151);
+        let mut workspace = RollupBuilder::default();
+        workspace.add_archive(&open().archive(), Some("w1"), today);
+        assert_eq!(workspace.build().total.tokens.input, 1510);
+    }
+
+    #[test]
+    fn codex_rollout_token_counts_are_counted_by_their_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("codex");
+        let thread = "01a07c85-9201-7123-8801-041350ceed6a";
+        let book = CommandBook::new(None, Some(home.clone()), None);
+        let record = record(SessionKind::Codex, dir.path(), thread);
+        let day = home.join("sessions/2026/11/02");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join(format!("rollout-2026-11-02T10-00-00-{thread}.jsonl"));
+        let now = chrono::Utc::now().to_rfc3339();
+        let count = |input: u64, cached: u64, output: u64| {
+            json!({"timestamp": now, "type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": input, "cached_input_tokens": cached, "output_tokens": output},
+            }}})
+            .to_string()
+                + "\n"
+        };
+        append(
+            &rollout,
+            &(json!({"type": "turn_context", "payload": {"model": "gpt-5-codex"}}).to_string()
+                + "\n"),
+        );
+        append(&rollout, &count(2000, 500, 100));
+        assert!(book.refresh_all(&record).usage_changed);
+        append(&rollout, &count(2000, 500, 100));
+        assert!(
+            !book.refresh_all(&record).usage_changed,
+            "a repeated total adds nothing"
+        );
+        append(&rollout, &count(5000, 2500, 300));
+        assert!(book.refresh_all(&record).usage_changed);
+        let usage = book
+            .usage(&record, chrono::Local::now().date_naive())
+            .unwrap();
+        assert_eq!(usage.turns, 2);
+        assert_eq!(usage.total.tokens.input, 2500);
+        assert_eq!(usage.total.tokens.cache_read, 2500);
+        assert_eq!(usage.total.tokens.output, 300);
+        let expected = (2500.0 * 1.25 + 2500.0 * 0.125 + 300.0 * 10.0) / 1e6;
+        assert!((usage.total.cost_usd - expected).abs() < 1e-12);
+        assert!(usage.total.priced);
     }
 
     #[test]

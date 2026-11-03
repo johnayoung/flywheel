@@ -7,7 +7,7 @@
 //! `stopped` (not `clean`: the hub died without recording it, so it is not
 //! restored).
 
-use crate::agent::SessionKind;
+use crate::agent::{AgentLaunch, SessionKind};
 use crate::auth::write_private;
 use crate::git::WorktreeRef;
 use crate::layout::{Layout, Tab};
@@ -20,15 +20,18 @@ use std::path::{Path, PathBuf};
 
 /// State file name inside the state dir.
 pub const STATE_FILE: &str = "state.json";
-/// On-disk schema version: 2 added per-workspace `layouts`. Version 1
-/// files (no layouts) load and are written back as 2; a newer hub's file
-/// is refused rather than rewritten without what it does not know.
-pub const STATE_VERSION: u32 = 2;
+/// On-disk schema version: 2 added per-workspace `layouts`, 3 launch
+/// `templates` (and sessions' `launch` options). Older files load and are
+/// written back as the current version; a newer hub's file is refused
+/// rather than rewritten without what it does not know.
+pub const STATE_VERSION: u32 = 3;
 /// The oldest schema version still loaded.
 pub const STATE_VERSION_MIN: u32 = 1;
 /// Limits on workspace input.
 pub const MAX_NAME_CHARS: usize = 100;
 pub const MAX_FOLDERS: usize = 32;
+/// Launch templates kept per workspace.
+pub const MAX_TEMPLATES: usize = 50;
 
 /// One directory of a workspace: a git work-tree root or a plain folder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +242,49 @@ pub struct SessionRecord {
     /// the agent's id. Suggested commands go there by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub companion_of: Option<String>,
+    /// An agent's model and permission options (every launch, relaunch,
+    /// and restore runs it with them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<AgentLaunch>,
+}
+
+/// A saved way to start an agent in a workspace: kind, first prompt,
+/// model and permission options, and whether it gets its own worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchTemplate {
+    /// Unique within its workspace.
+    pub name: String,
+    pub kind: SessionKind,
+    /// The first user turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(flatten)]
+    pub launch: AgentLaunch,
+    /// Run it in a new sibling worktree (of a git folder).
+    #[serde(default)]
+    pub worktree: bool,
+    #[serde(default = "Utc::now")]
+    pub updated_at: DateTime<Utc>,
+}
+
+impl LaunchTemplate {
+    /// Checked and normalized: a valid name, an agent kind's options only,
+    /// a bounded prompt.
+    pub fn validated(mut self) -> Result<Self, StateError> {
+        self.name = validate_name(&self.name)?;
+        self.launch = self
+            .launch
+            .validated(self.kind)
+            .map_err(StateError::Invalid)?;
+        self.prompt =
+            crate::agent::validate_prompt(self.prompt.as_deref()).map_err(StateError::Invalid)?;
+        if self.prompt.is_some() && !self.kind.is_agent() {
+            return Err(StateError::Invalid(
+                "a shell template takes no prompt".into(),
+            ));
+        }
+        Ok(self)
+    }
 }
 
 impl SessionRecord {
@@ -275,6 +321,9 @@ struct StateDoc {
     /// Workspace id -> its tabs and splits (absent: never laid out).
     #[serde(default)]
     layouts: BTreeMap<String, Layout>,
+    /// Workspace id -> its launch templates, by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    templates: BTreeMap<String, Vec<LaunchTemplate>>,
 }
 
 /// Store and validation failures.
@@ -386,11 +435,15 @@ impl HubStore {
                 workspaces,
                 sessions,
                 layouts,
+                templates,
                 ..
             } = &mut doc;
             let before = layouts.len();
             layouts.retain(|id, _| workspaces.iter().any(|w| &w.id == id));
             pruned |= layouts.len() != before;
+            let before = templates.len();
+            templates.retain(|id, _| workspaces.iter().any(|w| &w.id == id));
+            pruned |= templates.len() != before;
             for (workspace_id, layout) in layouts.iter_mut() {
                 let mut stale: Vec<String> = Vec::new();
                 for tab in &layout.tabs {
@@ -610,6 +663,7 @@ impl HubStore {
             .collect();
         self.doc.sessions.retain(|s| s.workspace_id != id);
         self.doc.layouts.remove(id);
+        self.doc.templates.remove(id);
         self.save_or_rollback(|doc| *doc = previous)?;
         Ok(removed)
     }
@@ -898,6 +952,84 @@ impl HubStore {
         Ok(layout)
     }
 
+    /// A workspace's launch templates, by name.
+    pub fn templates(&self, workspace_id: &str) -> Result<Vec<LaunchTemplate>, StateError> {
+        self.workspace(workspace_id)?;
+        Ok(self
+            .doc
+            .templates
+            .get(workspace_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Every workspace's templates (workspace id -> templates).
+    pub fn all_templates(&self) -> &BTreeMap<String, Vec<LaunchTemplate>> {
+        &self.doc.templates
+    }
+
+    /// Save a template, replacing the workspace's one of the same name.
+    pub fn save_template(
+        &mut self,
+        workspace_id: &str,
+        template: LaunchTemplate,
+    ) -> Result<LaunchTemplate, StateError> {
+        self.workspace(workspace_id)?;
+        let mut template = template.validated()?;
+        template.updated_at = Utc::now();
+        let previous = self.doc.templates.get(workspace_id).cloned();
+        let list = self
+            .doc
+            .templates
+            .entry(workspace_id.to_owned())
+            .or_default();
+        match list.iter().position(|t| t.name == template.name) {
+            Some(at) => list[at] = template.clone(),
+            None if list.len() >= MAX_TEMPLATES => {
+                return Err(StateError::Conflict(format!(
+                    "a workspace keeps at most {MAX_TEMPLATES} templates; remove one first"
+                )));
+            }
+            None => {
+                list.push(template.clone());
+                list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            }
+        }
+        self.save_or_rollback(|doc| match previous {
+            Some(previous) => {
+                doc.templates.insert(workspace_id.to_owned(), previous);
+            }
+            None => {
+                doc.templates.remove(workspace_id);
+            }
+        })?;
+        Ok(template)
+    }
+
+    /// Remove the workspace's template `name`.
+    pub fn remove_template(&mut self, workspace_id: &str, name: &str) -> Result<(), StateError> {
+        let workspace = self.workspace(workspace_id)?.name.clone();
+        let name = name.trim();
+        let list = self.doc.templates.get_mut(workspace_id);
+        let Some(at) = list
+            .as_ref()
+            .and_then(|l| l.iter().position(|t| t.name == name))
+        else {
+            return Err(StateError::NotFound(format!(
+                "template {name:?} in workspace {workspace:?}"
+            )));
+        };
+        let list = list.expect("found in it");
+        let removed = list.remove(at);
+        if list.is_empty() {
+            self.doc.templates.remove(workspace_id);
+        }
+        self.save_or_rollback(|doc| {
+            let list = doc.templates.entry(workspace_id.to_owned()).or_default();
+            list.insert(at.min(list.len()), removed);
+        })
+    }
+
     fn workspace_index(&self, id: &str) -> Result<usize, StateError> {
         self.doc
             .workspaces
@@ -1086,6 +1218,97 @@ mod tests {
         workspace.folders.iter().map(|f| f.path.clone()).collect()
     }
 
+    #[test]
+    fn templates_are_saved_replaced_removed_and_go_with_their_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut store = HubStore::open(dir.path()).unwrap();
+        let ws = store
+            .create_workspace(WorkspaceInput {
+                name: Some("w".into()),
+                folders: Some(vec![FolderSpec::Path(repo.clone())]),
+                repos: None,
+            })
+            .unwrap();
+        let template = |name: &str, model: &str| LaunchTemplate {
+            name: name.into(),
+            kind: SessionKind::Claude,
+            prompt: Some("Fix the flaky test.\nThen run it.\n".into()),
+            launch: AgentLaunch {
+                model: Some(model.into()),
+                permission_mode: Some("plan".into()),
+                ..AgentLaunch::default()
+            },
+            worktree: true,
+            updated_at: Utc::now(),
+        };
+        let saved = store
+            .save_template(&ws.id, template(" fix ", "opus"))
+            .unwrap();
+        assert_eq!(saved.name, "fix");
+        assert_eq!(
+            saved.prompt.as_deref(),
+            Some("Fix the flaky test.\nThen run it.")
+        );
+        store
+            .save_template(&ws.id, template("Audit", "sonnet"))
+            .unwrap();
+        // Same name: replaced, not added.
+        store
+            .save_template(&ws.id, template("fix", "haiku"))
+            .unwrap();
+        let names = |store: &HubStore| -> Vec<(String, Option<String>)> {
+            store
+                .templates(&ws.id)
+                .unwrap()
+                .into_iter()
+                .map(|t| (t.name, t.launch.model))
+                .collect()
+        };
+        assert_eq!(
+            names(&store),
+            [
+                ("Audit".to_owned(), Some("sonnet".to_owned())),
+                ("fix".to_owned(), Some("haiku".to_owned()))
+            ]
+        );
+        // Checked like a launch.
+        let mut bad = template("bad", "opus");
+        bad.kind = SessionKind::Shell;
+        assert!(matches!(
+            store.save_template(&ws.id, bad),
+            Err(StateError::Invalid(_))
+        ));
+        let mut bad = template("bad", "opus");
+        bad.launch.approval = Some("never".into());
+        assert!(matches!(
+            store.save_template(&ws.id, bad),
+            Err(StateError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.save_template("nope", template("x", "opus")),
+            Err(StateError::NotFound(_))
+        ));
+        // Persisted (schema 3), and loaded back.
+        drop(store);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.path().join(STATE_FILE)).unwrap()).unwrap();
+        assert_eq!(raw["version"], 3);
+        assert_eq!(raw["templates"][&ws.id][1]["permission_mode"], "plan");
+        let mut store = HubStore::open(dir.path()).unwrap();
+        assert_eq!(names(&store).len(), 2);
+        store.remove_template(&ws.id, "fix").unwrap();
+        assert!(matches!(
+            store.remove_template(&ws.id, "fix"),
+            Err(StateError::NotFound(_))
+        ));
+        assert_eq!(names(&store).len(), 1);
+        // Deleting the workspace deletes its templates.
+        store.delete_workspace(&ws.id).unwrap();
+        assert!(store.all_templates().is_empty());
+    }
+
     fn running_session(workspace_id: &str, cwd: &Path) -> SessionRecord {
         SessionRecord {
             id: new_id(),
@@ -1100,6 +1323,7 @@ mod tests {
             fallback_command: None,
             worktree: None,
             companion_of: None,
+            launch: None,
         }
     }
 

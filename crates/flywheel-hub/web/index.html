@@ -73,9 +73,11 @@
     <div id="offline" class="offline" hidden role="status">hub unreachable &mdash; retrying</div>
     <section id="attention" class="attention" hidden aria-label="Agents that need you"></section>
     <nav id="workspaces" aria-label="Workspaces"></nav>
+    <div id="spend" class="spend" hidden aria-label="Agent spend"></div>
     <div class="side-actions">
       <button type="button" class="slab" data-action="new-session" title="New session (Alt N)"><svg><use href="#i-plus"/></svg>Session</button>
       <button type="button" class="slab ghost" data-action="new-workspace" title="New workspace (Alt Shift N)"><svg><use href="#i-plus"/></svg>Workspace</button>
+      <button type="button" class="slab ghost" id="from-template" data-action="from-template" title="New agent from a saved template" hidden><svg><use href="#i-plus"/></svg>From template</button>
     </div>
     <footer class="side-foot">
       <button type="button" class="chip" data-action="palette" title="Command palette">
@@ -101,6 +103,7 @@
       </div>
       <div class="meters">
         <span id="meter-cwd" class="meter cwd"></span>
+        <span id="meter-usage" class="meter usage" hidden></span>
         <span id="meter-size" class="meter"></span>
         <span id="meter-viewers" class="meter"></span>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
@@ -261,6 +264,13 @@
       <span class="field-label">Workspace</span>
       <select name="workspace" id="session-workspace"></select>
     </label>
+    <div class="field tpl-pick" id="tpl-pick" hidden>
+      <span class="field-label">Template <span class="field-hint">fills the form; edit before launching</span></span>
+      <span class="tpl-line">
+        <select id="tpl-select" aria-label="Template"></select>
+        <button type="button" class="text-btn danger" id="tpl-delete" hidden>delete</button>
+      </span>
+    </div>
     <fieldset class="field repos-pick" id="repo-picker">
       <legend class="field-label">In folder</legend>
     </fieldset>
@@ -275,6 +285,25 @@
       </div>
       <p class="wt-note" id="wt-note" aria-live="polite"></p>
     </div>
+    <fieldset class="field agent-opts" id="agent-opts" hidden>
+      <legend class="field-label">Agent</legend>
+      <label class="ao-prompt">
+        <span class="field-label">First prompt <span class="field-hint">optional &middot; sent as the first turn &middot; Ctrl Enter launches</span></span>
+        <textarea id="agent-prompt" rows="4" spellcheck="true" placeholder="What should it do?"></textarea>
+      </label>
+      <div class="ao-row">
+        <label class="ao-field"><span class="field-label">Model</span>
+          <input id="agent-model" list="agent-models" maxlength="100" autocomplete="off" spellcheck="false"></label>
+        <datalist id="agent-models"></datalist>
+        <label class="ao-field claude-only"><span class="field-label">Permissions</span>
+          <select id="agent-mode"></select></label>
+        <label class="ao-field codex-only"><span class="field-label">Approval</span>
+          <select id="agent-approval"></select></label>
+        <label class="ao-field codex-only"><span class="field-label">Sandbox</span>
+          <select id="agent-sandbox"></select></label>
+      </div>
+      <p class="agent-warn" id="agent-warn" role="alert" hidden></p>
+    </fieldset>
     <label class="field">
       <span class="field-label">Name <span class="field-hint">optional</span></span>
       <input name="name" maxlength="100" autocomplete="off" spellcheck="false" id="session-name">
@@ -288,8 +317,14 @@
         <option value="tab">a new tab</option>
       </select>
     </label>
+    <div class="tpl-save" id="tpl-save" hidden>
+      <input id="tpl-name" maxlength="100" autocomplete="off" spellcheck="false" placeholder="template name" aria-label="Template name">
+      <button type="button" class="slab ghost" id="tpl-save-go">Save template</button>
+    </div>
+    <p class="form-error" id="tpl-error" role="alert"></p>
     <p class="form-error" id="session-error" role="alert"></p>
     <footer class="sheet-foot">
+      <button type="button" class="text-btn tpl-save-toggle" id="tpl-save-toggle" title="Save these settings (kind, prompt, model, permissions, worktree) as a template of this workspace">save as template</button>
       <button type="button" class="slab ghost" data-close>Cancel</button>
       <button type="submit" class="slab" id="session-submit">Launch <kbd>Enter</kbd></button>
     </footer>
@@ -418,6 +453,7 @@
 <script src="/assets/notify.js"></script>
 <script src="/assets/mobile.js"></script>
 <script src="/assets/worktree.js"></script>
+<script src="/assets/launcher.js"></script>
 <script src="/assets/review.js"></script>
 <script src="/assets/explain.js"></script>
 <script src="/assets/layout.js"></script>

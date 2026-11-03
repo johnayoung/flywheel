@@ -149,6 +149,19 @@ window.FwHubWorktree = function (ctx) {
     return base ? { task, base } : { task };
   }
 
+  // Turn the worktree fields on with `task` (a template that runs in a
+  // worktree), or off. False when the picked folder cannot have one.
+  function use(on, task) {
+    if (on && toggle.disabled) return false;
+    toggle.checked = !!on;
+    if (on && task) taskInput.value = task;
+    edited();
+    showFields();
+    if (!on) setBlocked(false);
+    schedule(0);
+    return true;
+  }
+
   const taskName = () => (toggle.checked ? taskInput.value.trim() : "");
   const blocked = () => form.blocked;
 
@@ -279,5 +292,5 @@ window.FwHubWorktree = function (ctx) {
     });
   }
 
-  return { setFolder, reset, request, taskName, blocked, badge, confirmClose };
+  return { setFolder, reset, request, use, taskName, blocked, badge, confirmClose };
 };

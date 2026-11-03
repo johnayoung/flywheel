@@ -69,6 +69,7 @@ pub const EVENTS: &[&str] = &[
     "review.pr_opened",
     "review.rebased",
     "review.merged",
+    "fanout.finished",
 ];
 const STATUSES: &[&str] = &["working", "blocked", "done", "idle", "unknown"];
 const KINDS: &[&str] = &["shell", "claude", "codex"];
@@ -1477,11 +1478,6 @@ context = "session"
         for (text, needle) in [
             (
                 "command=[\"x\"]\n[[events]]\non=\"nope\"\n",
-                "unknown event",
-            ),
-            (
-                // Nothing emits it yet (fan-out has not shipped).
-                "command=[\"x\"]\n[[events]]\non=\"fanout.finished\"\n",
                 "unknown event",
             ),
             ("[[events]]\non=\"session.created\"\n", "no command"),

@@ -1351,5 +1351,85 @@ fn versus(
     format!("{relation} {who}: same diff and cost (launch order)")
 }
 
+// --- the plugin event -------------------------------------------------------
+
+/// Most characters of a failing grader's output a `fanout.finished` event
+/// carries (the board and `fw hub fanout show` have the rest).
+pub const FINISHED_TAIL_CHARS: usize = 400;
+
+/// The `fanout.finished` plugin event's payload: a settled fan-out's ranked
+/// board without grader output beyond a short tail of the first failing
+/// grader. Shape (`payload.fanout`):
+///
+/// ```json
+/// {"id", "name", "workspace_id", "workspace", "repo", "base", "base_sha",
+///  "graded_at", "leader": "c2" | null, "winner": {"label","head","base","at"} | null,
+///  "counts": {"candidates","passing","failing","grading","running"},
+///  "warnings": [..],
+///  "candidates": [{"label", "rank", "verdict": "pass"|"fail"|"stale"|"pending"|"none",
+///    "passed", "kind", "model", "session_id", "session", "branch", "path", "head",
+///    "graders_passed", "graders_total", "diff": {"files","insertions","deletions","untracked"},
+///    "failure": "fails `unit` (exit 1)" | null, "tail": "..." | null,
+///    "cost_usd", "tokens", "why": [..], "pickable"}]}
+/// ```
+///
+/// Best first; `tail` is at most [`FINISHED_TAIL_CHARS`] characters of the
+/// first failing grader's stderr (its stdout when stderr is empty).
+pub fn finished_payload(view: &FanoutView) -> serde_json::Value {
+    let candidates: Vec<serde_json::Value> = view
+        .candidates
+        .iter()
+        .map(|c| {
+            let grade = c.grade.as_ref();
+            let tail = grade.and_then(Grade::first_failure).and_then(|run| {
+                let text = [&run.stderr, &run.stdout]
+                    .into_iter()
+                    .map(|t| t.trim_end())
+                    .find(|t| !t.is_empty())?;
+                Some(tail_chars(text, FINISHED_TAIL_CHARS).to_owned())
+            });
+            serde_json::json!({
+                "label": c.label,
+                "rank": c.rank,
+                "verdict": c.verdict,
+                "passed": c.verdict == Verdict::Pass,
+                "kind": c.kind,
+                "model": c.model,
+                "session_id": c.session_id,
+                "session": c.session,
+                "branch": c.branch,
+                "path": c.path,
+                "head": grade.and_then(|g| g.head.clone()).or_else(|| c.head.clone()),
+                "graders_passed": grade.map_or(0, Grade::graders_passed),
+                "graders_total": grade.map_or(0, |g| g.graders.len()),
+                "diff": grade.map(|g| &g.diff),
+                "failure": grade.and_then(Grade::failure),
+                "tail": tail,
+                "cost_usd": c.cost_usd,
+                "tokens": c.tokens,
+                "why": c.why,
+                "pickable": c.pickable,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "fanout": {
+            "id": view.id,
+            "name": view.name,
+            "workspace_id": view.workspace_id,
+            "workspace": view.workspace,
+            "repo": view.repo,
+            "base": view.base,
+            "base_sha": view.base_sha,
+            "graded_at": view.graded_at,
+            "leader": view.leader,
+            "winner": view.winner,
+            "counts": view.counts,
+            "warnings": view.warnings,
+            "candidates": candidates,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests;

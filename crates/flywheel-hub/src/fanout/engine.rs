@@ -70,6 +70,10 @@ struct Inner {
     trees: HashMap<PathBuf, (Instant, Result<TreeState, String>)>,
     /// Sessions a cleanup is removing: their agent's exit grades nothing.
     retiring: HashSet<String>,
+    /// Fan-out id -> the gradings (`label`, count) its last
+    /// `fanout.finished` reported: two gradings ending together announce
+    /// once.
+    announced: HashMap<String, Vec<(String, u32)>>,
 }
 
 /// How a grading job ended.
@@ -626,6 +630,7 @@ impl Fanouts {
             }
         });
         self.inner().trees.remove(&dir);
+        let saved = recorded.is_ok();
         match recorded {
             Ok(()) => eprintln!("fw hub: fan-out {} {label}: graded {summary}", fanout.name),
             Err(e) => eprintln!(
@@ -638,7 +643,37 @@ impl Fanouts {
         if again {
             let _ = self.queue(hub, id, label, Trigger::Done);
         }
+        if saved {
+            self.announce_if_settled(hub, id);
+        }
         JobEnd::Graded
+    }
+
+    /// `fanout.finished` (for plugins) when the grading just recorded left
+    /// the fan-out settled: no agent at work, nothing queued or grading.
+    /// Each grading that settles it announces it again (a re-grade, a fix
+    /// round's grade).
+    fn announce_if_settled(&self, hub: &Arc<Hub>, id: &str) {
+        let Ok(fanout) = hub.store().fanout(id).cloned() else {
+            return;
+        };
+        let view = self.build(&fanout, &session_map(hub), &hub.workspaces(), TREE_CACHE);
+        if !view.settled {
+            return;
+        }
+        let gradings: Vec<(String, u32)> = fanout
+            .candidates
+            .iter()
+            .map(|c| (c.label.clone(), c.gradings))
+            .collect();
+        {
+            let mut inner = self.inner();
+            if inner.announced.get(id) == Some(&gradings) {
+                return;
+            }
+            inner.announced.insert(id.to_owned(), gradings);
+        }
+        hub.emit_lifecycle("fanout.finished", super::finished_payload(&view));
     }
 
     /// A cancelled grading is queued again, not running.
@@ -802,7 +837,9 @@ impl Fanouts {
                 label,
                 session_id: view.record.id.clone(),
                 kind: *kind,
-                launch: launch.clone(),
+                // As launched: hub.toml's [agents.*] defaults fill what the
+                // request left unset.
+                launch: view.record.launch.clone().unwrap_or_default(),
                 worktree,
                 pending: None,
                 grade: None,
@@ -1081,7 +1118,11 @@ impl Fanouts {
     pub fn remove(&self, id: &str) -> Result<(), HubError> {
         let hub = self.hub()?;
         let removed = hub.store().remove_fanout(id)?;
-        self.inner().queue.retain(|(f, _)| f != id);
+        {
+            let mut inner = self.inner();
+            inner.queue.retain(|(f, _)| f != id);
+            inner.announced.remove(id);
+        }
         eprintln!("fw hub: fan-out {} ({id}) forgotten", removed.name);
         hub.emit(HubEvent::Fanout { id: id.to_owned() });
         Ok(())

@@ -16,6 +16,9 @@ statuses = ["blocked", "done"]
 [[events]]
 on = "review.merged"
 
+[[events]]
+on = "fanout.finished"
+
 [[actions]]
 id = "hello"
 title = "Say hello"

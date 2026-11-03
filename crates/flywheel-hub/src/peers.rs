@@ -508,6 +508,9 @@ mod tests {
             "/api/workspaces/abc/templates",
             "/api/workspaces/abc/templates/review",
             "/api/usage",
+            // Fan-outs keep their own rules (not settings-scoped).
+            "/api/fanouts",
+            "/api/fanouts/abc/pick",
         ] {
             assert!(!peer_forbidden(allowed), "{allowed}");
         }

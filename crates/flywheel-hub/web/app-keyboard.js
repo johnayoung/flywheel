@@ -381,6 +381,14 @@ const GLOBAL_ACTIONS = {
   "companion.flip": () => (state.attached ? commands.flipCompanion() : false),
   "flywheel.toggle": () => flywheel.togglePill(),
   "review.toggle": () => review.togglePill(),
+  "fanout.open": () => {
+    document.body.classList.remove("side-open");
+    fanout.open();
+  },
+  "fanout.new": () => {
+    document.body.classList.remove("side-open");
+    fanout.openLaunch();
+  },
   "pane.split_right": () => splitWithShell(focusedPane(), "right"),
   "pane.split_down": () => splitWithShell(focusedPane(), "down"),
   "pane.focus_left": () => focusToward("left"),

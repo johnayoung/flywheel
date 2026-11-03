@@ -73,7 +73,7 @@ impl Env {
     fn command(&self, args: &[&str]) -> Command {
         let mut argv: Vec<&str> = vec!["hub", args[0]];
         let mut rest = args[1..].to_vec();
-        if args[0] == "fanout" {
+        if args[0] == "fanout" || args[0] == "plugin" {
             // `fw hub fanout VERB --state-dir DIR ...`
             argv.push(rest.remove(0));
         }
@@ -648,4 +648,116 @@ fn fan_out_lands_only_what_was_graded() {
         "{c1}"
     );
     assert_eq!(candidate(&board, "c2")["verdict"], "pass");
+}
+
+/// Install the shipped sample plugin (`crates/flywheel-hub/plugins/hello`)
+/// into the state dir; it appends every event it gets to `events.jsonl`.
+fn install_sample_plugin(env: &Env) -> PathBuf {
+    let from = Path::new(env!("CARGO_MANIFEST_DIR")).join("../flywheel-hub/plugins/hello");
+    let to = env.state.join("plugins/hello");
+    std::fs::create_dir_all(&to).unwrap();
+    std::fs::copy(from.join("plugin.toml"), to.join("plugin.toml")).unwrap();
+    script::write_script(
+        &to.join("hello.sh"),
+        &std::fs::read_to_string(from.join("hello.sh")).unwrap(),
+    );
+    to
+}
+
+/// The `fanout.finished` events the sample plugin recorded.
+fn finished_events(plugin: &Path) -> Vec<Value> {
+    std::fs::read_to_string(plugin.join("events.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["event"] == "fanout.finished")
+        .collect()
+}
+
+#[test]
+fn a_settled_fan_out_tells_plugins_once_with_its_ranked_board() {
+    let env = Env::new();
+    fake_agents(&env);
+    let plugin = install_sample_plugin(&env);
+    env.ok(&["plugin", "enable", "hello"]);
+    // hub.toml's agent defaults fill a candidate that names no model.
+    std::fs::write(
+        env.state.join("hub.toml"),
+        "[agents.claude]\nmodel = \"fail\"\n",
+    )
+    .unwrap();
+    env.ok(&["start", "--port", "0"]);
+    let repo = env.repo.to_str().unwrap().to_owned();
+    env.ok(&["new", "demo", "--create", "--folder", &repo, "--name", "sh"]);
+    let check = env.root.join("check-answer.sh");
+    let check_grader = format!("answer={}", check.display());
+    let id = env
+        .ok(&[
+            "fanout",
+            "new",
+            "demo",
+            "--name",
+            "told",
+            "--prompt",
+            "Answer",
+            "--agent",
+            "claude",
+            "--agent",
+            "codex:pass",
+            "--grader",
+            &check_grader,
+            "--timeout",
+            "60",
+        ])
+        .trim()
+        .to_owned();
+    let board = env.board_until(&id, "both graded and settled", |b| {
+        graded(b, "c1", 1) && graded(b, "c2", 1) && b["settled"] == true
+    });
+    assert_eq!(candidate(&board, "c1")["model"], "fail");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let events = loop {
+        let events = finished_events(&plugin);
+        if !events.is_empty() {
+            break events;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no fanout.finished reached the plugin:\n{}",
+            env.ok(&["plugin", "logs", "hello"])
+        );
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    let event = &events[0];
+    assert_eq!(event["type"], "event");
+    assert_eq!(event["plugin"], "hello");
+    let f = &event["payload"]["fanout"];
+    assert_eq!(f["id"], id.as_str());
+    assert_eq!(f["name"], "told");
+    assert_eq!(f["workspace"], "demo");
+    assert_eq!(f["base"], "main");
+    assert_eq!(f["leader"], "c2");
+    assert_eq!(f["counts"]["passing"], 1);
+    assert_eq!(f["counts"]["failing"], 1);
+    let candidates = f["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0]["label"], "c2");
+    assert_eq!(candidates[0]["rank"], 1);
+    assert_eq!(candidates[0]["passed"], true);
+    assert_eq!(candidates[0]["kind"], "codex");
+    assert_eq!(
+        candidates[0]["head"],
+        candidate(&board, "c2")["grade"]["head"]
+    );
+    assert_eq!(candidates[1]["label"], "c1");
+    assert_eq!(candidates[1]["passed"], false);
+    assert_eq!(candidates[1]["failure"], "fails `answer` (exit 1)");
+    assert_eq!(candidates[1]["tail"], "got 41");
+    assert!(
+        candidates.iter().all(|c| c.get("grade").is_none()),
+        "no grader output beyond the tail: {f}"
+    );
+    // Two gradings settling it announce it once.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(finished_events(&plugin).len(), 1);
 }

@@ -557,3 +557,84 @@ fn state_files_from_before_fanouts_load_and_fanouts_round_trip() {
     .unwrap();
     assert!(HubStore::open(dir.path()).is_err());
 }
+
+#[test]
+fn the_finished_event_carries_the_ranked_board_and_only_a_short_tail() {
+    let pass = grade(true, 2, vec![run("unit", GraderStatus::Passed, Some(0))]);
+    let mut failing = run("unit", GraderStatus::Failed, Some(1));
+    failing.stdout = (1..=400).map(|i| format!("line {i}\n")).collect();
+    failing.stderr = "assertion failed: 41 == 42\n".into();
+    let fail = grade(false, 1, vec![failing]);
+    let mut views = vec![
+        view("c1", Verdict::Fail, Phase::Graded, Some(fail), Some(0.3)),
+        view("c2", Verdict::Pass, Phase::Graded, Some(pass), Some(0.1)),
+    ];
+    rank(&mut views);
+    let board = FanoutView {
+        id: "f1".into(),
+        name: "answer".into(),
+        workspace_id: "w".into(),
+        workspace: Some("demo".into()),
+        repo: PathBuf::from("/r"),
+        base: "main".into(),
+        base_sha: "b".into(),
+        prompt: "p".into(),
+        sent_prompt: "p".into(),
+        graders: vec![],
+        timeout_secs: 1,
+        protect: vec![],
+        created_at: Utc::now(),
+        winner: None,
+        leader: Some("c2".into()),
+        candidates: views,
+        counts: Counts {
+            candidates: 2,
+            passing: 1,
+            failing: 1,
+            ..Counts::default()
+        },
+        settled: true,
+        graded_at: None,
+        runner: None,
+        warnings: vec![],
+        summary: false,
+    };
+    let payload = finished_payload(&board);
+    let f = &payload["fanout"];
+    assert_eq!(f["id"], "f1");
+    assert_eq!(f["workspace"], "demo");
+    assert_eq!(f["leader"], "c2");
+    assert_eq!(f["counts"]["passing"], 1);
+    let candidates = f["candidates"].as_array().unwrap();
+    assert_eq!(candidates[0]["label"], "c2");
+    assert_eq!(candidates[0]["rank"], 1);
+    assert_eq!(candidates[0]["passed"], true);
+    assert_eq!(candidates[0]["verdict"], "pass");
+    assert!(candidates[0]["tail"].is_null());
+    assert!(candidates[0]["failure"].is_null());
+    assert_eq!(candidates[1]["label"], "c1");
+    assert_eq!(candidates[1]["passed"], false);
+    assert_eq!(candidates[1]["graders_passed"], 0);
+    assert_eq!(candidates[1]["graders_total"], 1);
+    assert_eq!(candidates[1]["failure"], "fails `unit` (exit 1)");
+    // stderr first; the grader's full output never rides along.
+    assert_eq!(candidates[1]["tail"], "assertion failed: 41 == 42");
+    let text = payload.to_string();
+    assert!(!text.contains("line 1\\n"), "{text}");
+    assert!(candidates[1].get("grade").is_none());
+
+    // Without stderr the tail is stdout's end, bounded.
+    let mut board = board;
+    for c in &mut board.candidates {
+        if let Some(g) = &mut c.grade {
+            for r in &mut g.graders {
+                r.stderr.clear();
+            }
+        }
+    }
+    let payload = finished_payload(&board);
+    let tail = payload["fanout"]["candidates"][1]["tail"].as_str().unwrap();
+    assert!(tail.chars().count() <= FINISHED_TAIL_CHARS, "{tail}");
+    assert!(tail.ends_with("line 400"), "{tail}");
+    assert!(!tail.contains("line 1\n"), "{tail}");
+}

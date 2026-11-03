@@ -226,6 +226,17 @@ async fn settings_validate_conflicts_persist_and_push() {
             .iter()
             .any(|a| a["id"] == "session.jump" && a["indexed"] == true)
     );
+    // Fan-out's board and launcher are rebindable (unbound by default).
+    for id in ["fanout.open", "fanout.new"] {
+        assert!(
+            first["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["id"] == id && a["defaults"] == json!([])),
+            "{id}"
+        );
+    }
     assert!(
         first["rules"]["reserved"]
             .as_array()

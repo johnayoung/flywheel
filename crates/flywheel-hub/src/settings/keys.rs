@@ -148,6 +148,8 @@ pub const ACTIONS: &[ActionSpec] = &[
         "Review the attached session's git work",
         &["alt+g"],
     ),
+    global("fanout.open", "Agents", "Verified fan-outs", &[]),
+    global("fanout.new", "Agents", "New verified fan-out", &[]),
     global(
         "pane.split_right",
         "Panes",

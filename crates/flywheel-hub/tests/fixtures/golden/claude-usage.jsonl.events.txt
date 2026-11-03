@@ -1,0 +1,14 @@
+@0 Some("2026-11-03T03:05:33.561Z")
+  Session("8a31d0a2-a263-426b-9bdb-840f9fec1821")
+  Text { role: User, id: "a05e6c77-9e2f-4c83-a61f-2ce9f4a7a096", parts: [Part { kind: Text, text: "Say hi in 3 words, then show a one-line bash code block that prints hello." }] }
+@305 Some("2026-11-03T03:05:34.454Z")
+  Session("8a31d0a2-a263-426b-9bdb-840f9fec1821")
+  Model("claude-haiku-5-5")
+  Usage(Turn { id: Some("msg_011CgfFj43M2ZVAW9CR7f82V"), model: "claude-haiku-5-5", fast: false, timestamp: Some("2026-11-03T03:05:34.454Z"), tokens: Tokens { input: 2, output: 105, cache_read: 10579, cache_write_5m: 0, cache_write_1h: 21376 } })
+@2403 Some("2026-11-03T03:05:34.551Z")
+  Session("8a31d0a2-a263-426b-9bdb-840f9fec1821")
+  Model("claude-haiku-5-5")
+  Usage(Turn { id: Some("msg_011CgfFj43M2ZVAW9CR7f82V"), model: "claude-haiku-5-5", fast: false, timestamp: Some("2026-11-03T03:05:34.551Z"), tokens: Tokens { input: 2, output: 105, cache_read: 10579, cache_write_5m: 0, cache_write_1h: 21376 } })
+  Text { role: Assistant, id: "30ff86fe-74ca-4b31-b716-316058bde21a", parts: [Part { kind: Text, text: "Hi there, friend!\n\n```bash\necho \"hello\"\n```" }] }
+@3339 None
+  Session("8a31d0a2-a263-426b-9bdb-840f9fec1821")

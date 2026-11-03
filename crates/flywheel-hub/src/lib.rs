@@ -11,6 +11,7 @@
 //! Operator doc: `docs/hub.md`.
 
 pub mod agent;
+pub mod agentlog;
 pub mod attach;
 pub mod auth;
 pub mod browser;
@@ -66,6 +67,8 @@ pub mod wait;
 pub mod web;
 
 /// The integration tests' helpers (stand-in scripts), for unit tests too.
+#[cfg(test)]
+mod test_golden;
 #[cfg(test)]
 #[path = "../tests/support/script.rs"]
 mod test_support;

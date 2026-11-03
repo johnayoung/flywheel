@@ -24,18 +24,19 @@
 //! file; a removed session's moves to the hub's usage archive.
 
 use crate::agent::{SessionKind, claude_transcript, codex_rollout, is_conversation_id};
+pub(crate) use crate::agentlog::Format;
+use crate::agentlog::{self, Event, JsonlTail, Line, PartKind, Read, Role};
+pub use crate::agentlog::{MAX_LINE_BYTES, READ_CHUNK};
 use crate::commands::{Command, CommandSource, MAX_BLOCK_BYTES, copyable, fenced_blocks, is_shell};
 use crate::hub::{Hub, HubError, HubEvent};
 use crate::pty::{ENTER_DELAY, WriteOutcome, paste_bytes};
 use crate::state::{SessionRecord, StateError};
 use crate::usage::{
-    CodexCursor, RollupBuilder, SessionUsage, Turn, UsageArchive, UsageView, claude_turn,
-    codex_line,
+    CodexCursor, RollupBuilder, SessionUsage, Turn, UsageArchive, UsageView, claude_usage,
+    codex_usage,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -47,11 +48,6 @@ pub const COMMANDS_DIR: &str = "commands";
 pub const MAX_COMMANDS: usize = 500;
 /// Block keys remembered per session against re-reading a replaced file.
 const MAX_KEYS: usize = 4096;
-/// A transcript line longer than this is skipped unread (tool output, not
-/// a reply worth mining).
-pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
-/// Read size per syscall.
-const READ_CHUNK: usize = 256 * 1024;
 /// How often running agent sessions' transcripts are checked.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Least time between two searches for a session's file that was not found.
@@ -68,37 +64,26 @@ const MAX_SUBAGENT_TAILS: usize = 256;
 /// kept (going back reads on from there instead of counting them again).
 const MAX_PARKED_TAILS: usize = 512;
 
-/// Which agent's file format a tail reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum Format {
-    Claude,
-    Codex,
-}
-
-/// An incremental reader of one JSONL file.
+/// An incremental reader of one transcript: the file's tail and what is
+/// known about the conversation in it.
 #[derive(Debug)]
 struct Tail {
-    path: PathBuf,
+    log: JsonlTail,
     format: Format,
     /// The conversation the file belongs to.
     conversation: Option<String>,
-    /// Bytes consumed from the file.
-    offset: u64,
-    /// Where the incomplete last line starts (`offset` minus `pending`,
-    /// or inside a skipped line): the position to resume from.
-    line_start: u64,
-    /// (device, inode) when last read: a different file at the path
-    /// (rotation) is read from the start.
-    identity: Option<(u64, u64)>,
-    /// The incomplete last line.
-    pending: Vec<u8>,
-    /// Inside an over-long line: drop bytes up to its newline.
-    skipping: bool,
     /// Read for usage only (a Claude subagent's transcript).
     usage_only: bool,
     /// Where a Codex rollout's token counting stands.
     codex: CodexCursor,
+}
+
+impl std::ops::Deref for Tail {
+    type Target = JsonlTail;
+
+    fn deref(&self) -> &JsonlTail {
+        &self.log
+    }
 }
 
 /// What one transcript line holds for the hub.
@@ -120,14 +105,9 @@ pub struct Reply {
 impl Tail {
     fn new(path: PathBuf, format: Format, conversation: Option<String>) -> Self {
         Self {
-            path,
+            log: JsonlTail::new(path),
             format,
             conversation,
-            offset: 0,
-            line_start: 0,
-            identity: None,
-            pending: Vec::new(),
-            skipping: false,
             usage_only: false,
             codex: CodexCursor::default(),
         }
@@ -144,14 +124,9 @@ impl Tail {
     /// A tail resumed from a saved position (the start of a line).
     fn resume(saved: SavedTail) -> Self {
         Self {
-            path: saved.path,
+            log: JsonlTail::resume(saved.path, saved.offset, saved.identity),
             format: saved.format,
             conversation: saved.conversation,
-            offset: saved.offset,
-            line_start: saved.offset,
-            identity: saved.identity,
-            pending: Vec::new(),
-            skipping: false,
             usage_only: saved.usage_only,
             codex: saved.codex,
         }
@@ -162,8 +137,8 @@ impl Tail {
             path: self.path.clone(),
             format: self.format,
             conversation: self.conversation.clone(),
-            offset: self.line_start,
-            identity: self.identity,
+            offset: self.position(),
+            identity: self.identity(),
             usage_only: self.usage_only,
             codex: self.codex.clone(),
         }
@@ -171,110 +146,65 @@ impl Tail {
 
     /// Read what was appended since the last call, handing `each` the
     /// replies and usage in the complete lines as they are read (so a
-    /// long backlog is never held whole). A missing file reads as nothing.
+    /// long backlog is never held whole). A missing or unreadable file
+    /// reads as nothing (it is tried again at the next poll).
     fn read(&mut self, each: &mut dyn FnMut(Item)) {
-        let Ok(mut file) = File::open(&self.path) else {
-            return;
-        };
-        let Ok(meta) = file.metadata() else {
-            return;
-        };
-        let identity = crate::util::file_identity(&meta);
-        if self.identity.is_some_and(|known| known != identity) || meta.len() < self.offset {
-            // Replaced or truncated: start over.
-            self.offset = 0;
-            self.line_start = 0;
-            self.pending.clear();
-            self.skipping = false;
+        let Self {
+            log,
+            format,
+            usage_only,
+            codex,
+            ..
+        } = self;
+        let _ = log.read(None, &mut |read| match read {
             // A new file counts from nothing.
-            self.codex.total = None;
+            Read::Restart => codex.total = None,
+            Read::Line { bytes, start } => line(*format, *usage_only, codex, bytes, start, each),
+        });
+    }
+}
+
+/// One complete transcript line, starting at byte `start` of its file.
+fn line(
+    format: Format,
+    usage_only: bool,
+    codex: &mut CodexCursor,
+    bytes: &[u8],
+    start: u64,
+    each: &mut dyn FnMut(Item),
+) {
+    // Cheap pre-filter: only lines with a fence, or usage, are parsed
+    // (big tool results are skipped unparsed).
+    let fenced = !usage_only && (contains(bytes, b"```") || contains(bytes, b"~~~"));
+    let usage = match format {
+        Format::Claude => {
+            contains(bytes, b"\"usage\"") && contains(bytes, b"\"type\":\"assistant\"")
         }
-        self.identity = Some(identity);
-        if meta.len() == self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return;
-        }
-        let mut chunk = vec![0u8; READ_CHUNK];
-        loop {
-            let n = match file.read(&mut chunk) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let base = self.offset;
-            self.offset += n as u64;
-            let mut rest = &chunk[..n];
-            let mut at_in_chunk = 0usize;
-            while let Some(at) = rest.iter().position(|&b| b == b'\n') {
-                let (head, tail) = rest.split_at(at);
-                rest = &tail[1..];
-                at_in_chunk += at + 1;
-                let start = self.line_start;
-                self.line_start = base + at_in_chunk as u64;
-                if self.skipping {
-                    self.skipping = false;
-                    continue;
-                }
-                if self.pending.is_empty() {
-                    self.line(head, start, each);
-                } else {
-                    self.pending.extend_from_slice(head);
-                    let line = std::mem::take(&mut self.pending);
-                    self.line(&line, start, each);
-                }
-            }
-            if !self.skipping {
-                if self.pending.len() + rest.len() > MAX_LINE_BYTES {
-                    self.pending = Vec::new();
-                    self.skipping = true;
-                } else {
-                    self.pending.extend_from_slice(rest);
-                }
-            }
+        Format::Codex => contains(bytes, b"token_count") || contains(bytes, b"turn_context"),
+    };
+    if !fenced && !usage {
+        return;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
+    let parsed = agentlog::parse(format, &value, start);
+    if usage {
+        let turn = match format {
+            Format::Claude => claude_usage(&parsed),
+            Format::Codex => codex_usage(&parsed).and_then(|l| codex.feed(l)),
+        };
+        if let Some(turn) = turn {
+            each(Item::Usage(turn));
         }
     }
-
-    /// One complete line, starting at byte `start` of the file.
-    fn line(&mut self, line: &[u8], start: u64, each: &mut dyn FnMut(Item)) {
-        // Cheap pre-filter: only lines with a fence, or usage, are parsed
-        // (big tool results are skipped unparsed).
-        let fenced = !self.usage_only && (contains(line, b"```") || contains(line, b"~~~"));
-        let usage = match self.format {
-            Format::Claude => {
-                contains(line, b"\"usage\"") && contains(line, b"\"type\":\"assistant\"")
-            }
-            Format::Codex => contains(line, b"token_count") || contains(line, b"turn_context"),
-        };
-        if !fenced && !usage {
-            return;
+    if fenced && let Some(mut reply) = reply_of(format, parsed) {
+        // An item without an id (Codex rollouts write none) is named by
+        // where its line starts (see [`crate::agentlog`]).
+        if reply.message_id.is_empty() {
+            reply.message_id = format!("@{start}");
         }
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(line) else {
-            return;
-        };
-        if usage {
-            let turn = match self.format {
-                Format::Claude => claude_turn(&value),
-                Format::Codex => codex_line(&value).and_then(|l| self.codex.feed(l)),
-            };
-            if let Some(turn) = turn {
-                each(Item::Usage(turn));
-            }
-        }
-        if !fenced {
-            return;
-        }
-        let reply = match self.format {
-            Format::Claude => claude_reply(&value),
-            Format::Codex => codex_reply(&value),
-        };
-        if let Some(mut reply) = reply {
-            // Codex rollouts carry no message id, and several items can
-            // share a millisecond timestamp: the line's place in the file
-            // tells replies apart (and is the same when a replaced file is
-            // read again).
-            if reply.message_id.is_empty() {
-                reply.message_id = format!("@{start}");
-            }
-            each(Item::Reply(reply));
-        }
+        each(Item::Reply(reply));
     }
 }
 
@@ -282,74 +212,52 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// The reply in a parsed transcript line: the assistant's text. Claude's
+/// text parts are mined separately; a Codex reply's `output_text` parts
+/// are one text.
+fn reply_of(format: Format, line: Line) -> Option<Reply> {
+    line.events.into_iter().find_map(|event| match event {
+        Event::Text {
+            role: Role::Assistant,
+            id,
+            parts,
+        } => {
+            let texts: Vec<String> = match format {
+                Format::Claude => parts.into_iter().map(|p| p.text).collect(),
+                Format::Codex => {
+                    let outputs: Vec<String> = parts
+                        .into_iter()
+                        .filter(|p| p.kind == PartKind::Output)
+                        .map(|p| p.text)
+                        .collect();
+                    if outputs.is_empty() {
+                        return None;
+                    }
+                    vec![outputs.concat()]
+                }
+            };
+            Some(Reply {
+                message_id: id,
+                timestamp: line.timestamp.clone(),
+                texts,
+            })
+        }
+        _ => None,
+    })
+}
+
 /// The reply in a Claude Code transcript line: an `assistant` line of the
 /// main conversation (not a subagent's sidechain) with text content.
 pub fn claude_reply(value: &serde_json::Value) -> Option<Reply> {
-    if value.get("type")?.as_str()? != "assistant"
-        || value.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
-    {
-        return None;
-    }
-    let message = value.get("message")?;
-    let texts: Vec<String> = match message.get("content")? {
-        serde_json::Value::String(text) => vec![text.clone()],
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("text"))
-            .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(str::to_owned))
-            .collect(),
-        _ => return None,
-    };
-    if texts.is_empty() {
-        return None;
-    }
-    let message_id = value
-        .get("uuid")
-        .or_else(|| message.get("id"))
-        .and_then(|v| v.as_str())?
-        .to_owned();
-    Some(Reply {
-        message_id,
-        timestamp: str_field(value, "timestamp"),
-        texts,
-    })
+    reply_of(Format::Claude, agentlog::parse(Format::Claude, value, 0))
 }
 
-/// The reply in a Codex rollout line: a `response_item` wrapping an
-/// assistant `message` (older rollouts write the item bare), its
+/// The reply in a Codex rollout line (at byte `offset` of its file, which
+/// names it: rollouts write no message ids): a `response_item` wrapping
+/// an assistant `message` (older rollouts write the item bare), its
 /// `output_text` parts.
-pub fn codex_reply(value: &serde_json::Value) -> Option<Reply> {
-    let item = match value.get("type")?.as_str()? {
-        "response_item" => value.get("payload")?,
-        "message" => value,
-        _ => return None,
-    };
-    if item.get("type")?.as_str()? != "message" || item.get("role")?.as_str()? != "assistant" {
-        return None;
-    }
-    let texts: Vec<String> = item
-        .get("content")?
-        .as_array()?
-        .iter()
-        .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("output_text"))
-        .filter_map(|p| p.get("text").and_then(|t| t.as_str()).map(str::to_owned))
-        .collect();
-    if texts.is_empty() {
-        return None;
-    }
-    // One reply's parts are one text.
-    let texts = vec![texts.concat()];
-    Some(Reply {
-        // Rollouts do not write the item id (codex-rs skips serializing
-        // it); empty means "use the line's offset" (see `Tail::line`).
-        message_id: str_field(item, "id").unwrap_or_default(),
-        timestamp: str_field(value, "timestamp"),
-        texts,
-    })
-}
-
-fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {
-    value.get(key).and_then(|v| v.as_str()).map(str::to_owned)
+pub fn codex_reply(value: &serde_json::Value, offset: u64) -> Option<Reply> {
+    reply_of(Format::Codex, agentlog::parse(Format::Codex, value, offset))
 }
 
 /// A session's commands as saved under the state dir.
@@ -1412,6 +1320,69 @@ mod tests {
     use crate::state::SessionState;
     use serde_json::json;
     use std::io::Write;
+
+    /// Append `bytes` to `path` in pieces of `size`, reading `tail` after
+    /// each; everything it handed out.
+    fn read_in_pieces(path: &Path, bytes: &[u8], size: usize, tail: &mut Tail) -> Vec<Item> {
+        let mut items = Vec::new();
+        for piece in bytes.chunks(size) {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            file.write_all(piece).unwrap();
+            tail.read(&mut |item| items.push(item));
+        }
+        items
+    }
+
+    #[test]
+    fn captured_transcripts_give_the_golden_replies_usage_and_commands() {
+        use std::fmt::Write as _;
+        for &(name, codex) in crate::test_golden::TRANSCRIPTS {
+            let format = if codex { Format::Codex } else { Format::Claude };
+            let path = crate::test_golden::fixture(name);
+            let conversation = Some("conv".to_owned());
+            let mut items = Vec::new();
+            Tail::new(path.clone(), format, conversation.clone()).read(&mut |i| items.push(i));
+            // The same file appended to in pieces (lines split anywhere)
+            // reads the same.
+            let dir = tempfile::tempdir().unwrap();
+            let copy = dir.path().join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            for size in [1, 7, 64, 4096] {
+                let _ = std::fs::remove_file(&copy);
+                let mut tail = Tail::new(copy.clone(), format, conversation.clone());
+                assert_eq!(
+                    read_in_pieces(&copy, &bytes, size, &mut tail),
+                    items,
+                    "{name} by {size}"
+                );
+            }
+            // A subagent's tail sees only the usage.
+            let mut usage_only = Vec::new();
+            Tail::usage_only(path.clone(), conversation.clone()).read(&mut |i| usage_only.push(i));
+            let usage: Vec<&Item> = items
+                .iter()
+                .filter(|i| matches!(i, Item::Usage(_)))
+                .collect();
+            if !codex {
+                assert_eq!(usage_only.iter().collect::<Vec<_>>(), usage, "{name}");
+            }
+            let mut log = SessionCommands::default();
+            let mut added = Vec::new();
+            log.drain(Tail::new(path, format, conversation), &mut added);
+            let mut out = String::new();
+            for item in &items {
+                writeln!(out, "{item:?}").unwrap();
+            }
+            for command in &added {
+                writeln!(out, "{command:?}").unwrap();
+            }
+            crate::test_golden::assert_golden(&format!("{name}.commands.txt"), &out);
+        }
+    }
 
     fn record(kind: SessionKind, cwd: &Path, conversation: &str) -> SessionRecord {
         SessionRecord {

@@ -14,6 +14,7 @@
 //! commands; a removed session's totals move to the hub's archive
 //! ([`UsageArchive`]) so day and week rollups keep them.
 
+use crate::agentlog::{self, Event, Format, Line};
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -342,53 +343,19 @@ fn count(value: &serde_json::Value, key: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The usage in a parsed Claude Code transcript line (see
+/// [`crate::agentlog`]): one API response's.
+pub fn claude_usage(line: &Line) -> Option<Turn> {
+    line.events.iter().find_map(|event| match event {
+        Event::Usage(turn) => Some(turn.clone()),
+        _ => None,
+    })
+}
+
 /// The usage on a Claude Code transcript line: an `assistant` line with
 /// `message.usage` and a real model (synthetic messages cost nothing).
 pub fn claude_turn(value: &serde_json::Value) -> Option<Turn> {
-    if value.get("type")?.as_str()? != "assistant" {
-        return None;
-    }
-    let message = value.get("message")?;
-    let usage = message.get("usage")?.as_object()?;
-    let usage = serde_json::Value::Object(usage.clone());
-    let model = message.get("model")?.as_str()?;
-    if model.is_empty() || model.starts_with('<') {
-        return None;
-    }
-    let written = count(&usage, "cache_creation_input_tokens");
-    let (write_5m, write_1h) = match usage.get("cache_creation") {
-        Some(split) if split.is_object() => (
-            count(split, "ephemeral_5m_input_tokens"),
-            count(split, "ephemeral_1h_input_tokens"),
-        ),
-        // No split: the default (5-minute) TTL.
-        _ => (written, 0),
-    };
-    let tokens = Tokens {
-        input: count(&usage, "input_tokens"),
-        output: count(&usage, "output_tokens"),
-        cache_read: count(&usage, "cache_read_input_tokens"),
-        cache_write_5m: write_5m,
-        cache_write_1h: write_1h,
-    };
-    if tokens.is_zero() {
-        return None;
-    }
-    let id = message
-        .get("id")
-        .or_else(|| value.get("uuid"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    Some(Turn {
-        id,
-        model: model.to_owned(),
-        fast: usage.get("speed").and_then(serde_json::Value::as_str) == Some("fast"),
-        timestamp: value
-            .get("timestamp")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned),
-        tokens,
-    })
+    claude_usage(&agentlog::parse(Format::Claude, value, 0))
 }
 
 /// Codex's token counts (OpenAI's shape: `input_tokens` includes the
@@ -401,7 +368,7 @@ pub struct CodexTotals {
 }
 
 impl CodexTotals {
-    fn from_json(value: &serde_json::Value) -> Option<Self> {
+    pub(crate) fn from_json(value: &serde_json::Value) -> Option<Self> {
         value.as_object()?;
         Some(Self {
             input: count(value, "input_tokens"),
@@ -444,37 +411,22 @@ pub enum CodexLine {
     },
 }
 
+/// The usage part of a parsed Codex rollout line, if any.
+pub fn codex_usage(line: &Line) -> Option<CodexLine> {
+    line.events.iter().find_map(|event| match event {
+        Event::Model(model) => Some(CodexLine::Model(model.clone())),
+        Event::TokenCount { total, last } => Some(CodexLine::Count {
+            total: *total,
+            last: *last,
+            timestamp: line.timestamp.clone(),
+        }),
+        _ => None,
+    })
+}
+
 /// The usage part of a Codex rollout line, if any.
 pub fn codex_line(value: &serde_json::Value) -> Option<CodexLine> {
-    let payload = value.get("payload")?;
-    match value.get("type")?.as_str()? {
-        "turn_context" => payload
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .filter(|m| !m.is_empty())
-            .map(|m| CodexLine::Model(m.to_owned())),
-        "event_msg" if payload.get("type")?.as_str()? == "token_count" => {
-            let info = payload.get("info").filter(|i| i.is_object())?;
-            let total = info
-                .get("total_token_usage")
-                .and_then(CodexTotals::from_json);
-            let last = info
-                .get("last_token_usage")
-                .and_then(CodexTotals::from_json);
-            if total.is_none() && last.is_none() {
-                return None;
-            }
-            Some(CodexLine::Count {
-                total,
-                last,
-                timestamp: value
-                    .get("timestamp")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-            })
-        }
-        _ => None,
-    }
+    codex_usage(&agentlog::parse(Format::Codex, value, 0))
 }
 
 /// Where a Codex rollout's counting stands (kept with its tail).
@@ -864,6 +816,29 @@ mod tests {
     /// haiku`, one reply), trimmed to the lines that matter; Claude Code's
     /// own `cost-state` line said `totalCostUSD: 0.00443369`.
     const REAL_TRANSCRIPT: &str = include_str!("../tests/fixtures/claude-usage.jsonl");
+
+    #[test]
+    fn captured_transcripts_give_the_golden_turns() {
+        use std::fmt::Write as _;
+        for &(name, codex) in crate::test_golden::TRANSCRIPTS {
+            let text = std::fs::read_to_string(crate::test_golden::fixture(name)).unwrap();
+            let mut cursor = CodexCursor::default();
+            let mut out = String::new();
+            for line in text.lines() {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                let turn = if codex {
+                    codex_line(&value).and_then(|l| cursor.feed(l))
+                } else {
+                    claude_turn(&value)
+                };
+                if let Some(turn) = turn {
+                    writeln!(out, "{turn:?}").unwrap();
+                }
+            }
+            writeln!(out, "{cursor:?}").unwrap();
+            crate::test_golden::assert_golden(&format!("{name}.usage.txt"), &out);
+        }
+    }
 
     #[test]
     fn real_transcript_costs_what_claude_code_says() {

@@ -27,18 +27,16 @@
 //! transcript ([`MAX_TRANSCRIPT_BYTES`], oldest messages dropped first).
 
 use crate::agent::SessionKind;
+use crate::agentlog::{self, Event, Format, JsonlTail, Line, Read};
+pub use crate::agentlog::{MAX_LINE_BYTES, Role, tool_text};
 use crate::commands::Command;
 use crate::hub::{Hub, HubError, SessionView};
 use crate::pty::PtySession;
 use crate::state::{SessionState, StateError};
-use crate::transcript::{Format, MAX_LINE_BYTES};
-use crate::util::file_identity;
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -85,8 +83,6 @@ const MATCH_CHARS: usize = 200;
 /// Characters of a scrollback match handed to the browser's terminal
 /// search (`match_text`).
 const MATCH_TEXT_CHARS: usize = 1000;
-/// Read size per syscall when indexing a transcript.
-const READ_CHUNK: usize = 256 * 1024;
 /// Least time between two looks for a session's transcript that was not
 /// found.
 const LOCATE_RETRY: Duration = Duration::from_secs(5);
@@ -434,14 +430,6 @@ pub enum Screen {
     Alternate,
 }
 
-/// Who wrote a transcript message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    User,
-    Assistant,
-}
-
 /// What a transcript message is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -611,31 +599,6 @@ pub struct Extracted {
     pub text: String,
 }
 
-fn str_of<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str)
-}
-
-/// A tool's input as text: `key: value` lines for an object (strings as
-/// written, the rest as JSON), a JSON string's content decoded first.
-pub fn tool_text(input: &Value) -> String {
-    match input {
-        Value::String(text) => match serde_json::from_str::<Value>(text) {
-            Ok(parsed @ Value::Object(_)) => tool_text(&parsed),
-            _ => text.clone(),
-        },
-        Value::Object(fields) => fields
-            .iter()
-            .map(|(key, value)| match value {
-                Value::String(text) => format!("{key}: {text}"),
-                other => format!("{key}: {other}"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
 fn tool_message(id: String, name: &str, input: String, timestamp: Option<String>) -> Extracted {
     Extracted {
         id,
@@ -651,151 +614,58 @@ fn tool_message(id: String, name: &str, input: String, timestamp: Option<String>
     }
 }
 
+/// The searchable messages in a parsed transcript line (see
+/// [`crate::agentlog`]): its text as one message (Claude's parts joined
+/// by blank lines, Codex's by newlines; blank text left out), each tool
+/// call as another. Thinking, tool results, and images are left out.
+pub fn messages_of(format: Format, line: Line) -> Vec<Extracted> {
+    let joiner = match format {
+        Format::Claude => "\n\n",
+        Format::Codex => "\n",
+    };
+    let mut out = Vec::new();
+    for event in line.events {
+        match event {
+            Event::Text { role, id, parts } => {
+                let text = parts
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(joiner);
+                if !text.trim().is_empty() {
+                    out.push(Extracted {
+                        id,
+                        role,
+                        kind: MessageKind::Text,
+                        tool: None,
+                        timestamp: line.timestamp.clone(),
+                        text,
+                    });
+                }
+            }
+            Event::ToolCall { id, name, input } => {
+                out.push(tool_message(id, &name, input, line.timestamp.clone()));
+            }
+            Event::Session(_) | Event::Model(_) | Event::Usage(_) | Event::TokenCount { .. } => {}
+        }
+    }
+    out
+}
+
 /// The messages in a Claude Code transcript line: a user or assistant
 /// line of the main conversation (not a subagent's sidechain) -- its text
 /// parts as one message, each `tool_use` part as another. Thinking, tool
 /// results, and images are left out.
 pub fn claude_messages(value: &Value) -> Vec<Extracted> {
-    let role = match str_of(value, "type") {
-        Some("user") => Role::User,
-        Some("assistant") => Role::Assistant,
-        _ => return Vec::new(),
-    };
-    if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-        return Vec::new();
-    }
-    let Some(message) = value.get("message") else {
-        return Vec::new();
-    };
-    let Some(id) = str_of(value, "uuid").or_else(|| str_of(message, "id")) else {
-        return Vec::new();
-    };
-    let timestamp = str_of(value, "timestamp").map(str::to_owned);
-    let mut out = Vec::new();
-    let mut texts: Vec<&str> = Vec::new();
-    let mut tools = Vec::new();
-    match message.get("content") {
-        Some(Value::String(text)) => texts.push(text),
-        Some(Value::Array(parts)) => {
-            for part in parts {
-                match str_of(part, "type") {
-                    Some("text") => texts.extend(str_of(part, "text")),
-                    Some("tool_use") => tools.push(part),
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-    let text = texts.join("\n\n");
-    if !text.trim().is_empty() {
-        out.push(Extracted {
-            id: id.to_owned(),
-            role,
-            kind: MessageKind::Text,
-            tool: None,
-            timestamp: timestamp.clone(),
-            text,
-        });
-    }
-    for (i, part) in tools.into_iter().enumerate() {
-        let name = str_of(part, "name").unwrap_or("tool");
-        let input = part.get("input").map(tool_text).unwrap_or_default();
-        out.push(tool_message(
-            format!("{id}#tool{i}"),
-            name,
-            input,
-            timestamp.clone(),
-        ));
-    }
-    out
+    messages_of(Format::Claude, agentlog::parse(Format::Claude, value, 0))
 }
-
-/// Context Codex injects as user messages (not the user's words).
-const CODEX_CONTEXT_PREFIXES: &[&str] = &["<environment_context>", "<user_instructions>"];
 
 /// The messages in a Codex rollout line (`response_item`, or the bare
 /// item older rollouts write): user and assistant messages, and function,
 /// custom tool, and local shell calls. `offset` (the line's byte offset)
 /// names items without an id.
 pub fn codex_messages(value: &Value, offset: u64) -> Vec<Extracted> {
-    let item = match str_of(value, "type") {
-        Some("response_item") => match value.get("payload") {
-            Some(payload) => payload,
-            None => return Vec::new(),
-        },
-        _ => value,
-    };
-    let timestamp = str_of(value, "timestamp").map(str::to_owned);
-    let id = str_of(item, "id")
-        .or_else(|| str_of(item, "call_id"))
-        .map_or_else(|| format!("@{offset}"), str::to_owned);
-    let message = match str_of(item, "type") {
-        Some("message") => {
-            let role = match str_of(item, "role") {
-                Some("user") => Role::User,
-                Some("assistant") => Role::Assistant,
-                _ => return Vec::new(),
-            };
-            let text = item
-                .get("content")
-                .and_then(Value::as_array)
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .filter(|p| matches!(str_of(p, "type"), Some("input_text" | "output_text")))
-                        .filter_map(|p| str_of(p, "text"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .unwrap_or_default();
-            let trimmed = text.trim_start();
-            if trimmed.is_empty()
-                || (role == Role::User
-                    && CODEX_CONTEXT_PREFIXES
-                        .iter()
-                        .any(|p| trimmed.starts_with(p)))
-            {
-                return Vec::new();
-            }
-            Extracted {
-                id,
-                role,
-                kind: MessageKind::Text,
-                tool: None,
-                timestamp,
-                text,
-            }
-        }
-        Some("function_call") => tool_message(
-            id,
-            str_of(item, "name").unwrap_or("function"),
-            item.get("arguments").map(tool_text).unwrap_or_default(),
-            timestamp,
-        ),
-        Some("custom_tool_call") => tool_message(
-            id,
-            str_of(item, "name").unwrap_or("tool"),
-            item.get("input").map(tool_text).unwrap_or_default(),
-            timestamp,
-        ),
-        Some("local_shell_call") => {
-            let command = item
-                .get("action")
-                .and_then(|a| a.get("command"))
-                .and_then(Value::as_array)
-                .map(|argv| {
-                    argv.iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .unwrap_or_default();
-            tool_message(id, "shell", command, timestamp)
-        }
-        _ => return Vec::new(),
-    };
-    vec![message]
+    messages_of(Format::Codex, agentlog::parse(Format::Codex, value, offset))
 }
 
 /// A message as indexed (its text is the corpus unit).
@@ -829,15 +699,8 @@ fn cut_to(text: &mut String, max: usize) -> bool {
 /// One transcript file's messages, read incrementally.
 #[derive(Debug)]
 struct TranscriptIndex {
-    path: PathBuf,
+    tail: JsonlTail,
     format: Format,
-    identity: Option<(u64, u64)>,
-    /// Bytes consumed.
-    offset: u64,
-    /// The incomplete last line.
-    pending: Vec<u8>,
-    /// Inside an over-long line: drop bytes up to its newline.
-    skipping: bool,
     messages: VecDeque<MessageMeta>,
     corpus: Corpus,
     next_index: u64,
@@ -861,12 +724,8 @@ fn meta_cost(meta: &MessageMeta) -> usize {
 impl TranscriptIndex {
     fn new(path: PathBuf, format: Format) -> Self {
         Self {
-            path,
+            tail: JsonlTail::new(path),
             format,
-            identity: None,
-            offset: 0,
-            pending: Vec::new(),
-            skipping: false,
             messages: VecDeque::new(),
             corpus: Corpus::default(),
             next_index: 0,
@@ -876,71 +735,32 @@ impl TranscriptIndex {
         }
     }
 
-    fn reset(&mut self) {
-        let (path, format, cap) = (self.path.clone(), self.format, self.cap);
-        *self = Self::new(path, format);
-        self.cap = cap;
+    /// Forget every message (the file is read again from the start).
+    fn clear(&mut self) {
+        self.messages.clear();
+        self.corpus = Corpus::default();
+        self.next_index = 0;
+        self.error = None;
+        self.meta_bytes = 0;
     }
 
     /// Read what the file has new, until `deadline`; returns whether it
     /// was read to its end.
     fn update(&mut self, deadline: Instant) -> bool {
-        match self.read(deadline) {
+        let mut tail = std::mem::take(&mut self.tail);
+        let read = tail.read(Some(deadline), &mut |read| match read {
+            Read::Restart => self.clear(),
+            Read::Line { bytes, start } => self.line(bytes, start),
+        });
+        self.tail = tail;
+        match read {
             Ok(complete) => {
                 self.error = None;
                 complete
             }
             Err(e) => {
-                self.error = Some(format!("cannot read {}: {e}", self.path.display()));
+                self.error = Some(format!("cannot read {}: {e}", self.tail.path.display()));
                 true
-            }
-        }
-    }
-
-    fn read(&mut self, deadline: Instant) -> std::io::Result<bool> {
-        let meta = std::fs::metadata(&self.path)?;
-        let identity = file_identity(&meta);
-        if self.identity.is_some_and(|known| known != identity) || meta.len() < self.offset {
-            // Replaced or truncated: read again from the start.
-            self.reset();
-        }
-        self.identity = Some(identity);
-        if meta.len() == self.offset {
-            return Ok(true);
-        }
-        let mut file = File::open(&self.path)?;
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut buf = vec![0u8; READ_CHUNK];
-        loop {
-            if Instant::now() >= deadline {
-                return Ok(false);
-            }
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                return Ok(true);
-            }
-            let mut pos = self.offset;
-            self.offset += n as u64;
-            let mut rest = &buf[..n];
-            while let Some(newline) = rest.iter().position(|&b| b == b'\n') {
-                if self.skipping {
-                    self.skipping = false;
-                } else {
-                    let line_start = pos - self.pending.len() as u64;
-                    let mut line = std::mem::take(&mut self.pending);
-                    line.extend_from_slice(&rest[..newline]);
-                    self.line(&line, line_start);
-                }
-                pos += newline as u64 + 1;
-                rest = &rest[newline + 1..];
-            }
-            if !self.skipping {
-                if self.pending.len() + rest.len() > MAX_LINE_BYTES {
-                    self.pending.clear();
-                    self.skipping = true;
-                } else {
-                    self.pending.extend_from_slice(rest);
-                }
             }
         }
     }
@@ -949,10 +769,7 @@ impl TranscriptIndex {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             return;
         };
-        let messages = match self.format {
-            Format::Claude => claude_messages(&value),
-            Format::Codex => codex_messages(&value, offset),
-        };
+        let messages = messages_of(self.format, agentlog::parse(self.format, &value, offset));
         for mut message in messages {
             let truncated = cut_to(&mut message.text, MAX_MESSAGE_BYTES);
             self.corpus.push(&message.text);
@@ -998,7 +815,7 @@ impl TranscriptIndex {
         self.corpus.text.len()
             + self.corpus.starts.len() * std::mem::size_of::<usize>()
             + self.meta_bytes
-            + self.pending.len()
+            + self.tail.pending_len()
     }
 
     /// Oldest index still held.
@@ -1637,6 +1454,47 @@ mod tests {
 
     fn far() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+
+    /// What an index holds: each message's metadata and text.
+    fn indexed(index: &TranscriptIndex) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for (unit, meta) in index.messages.iter().enumerate() {
+            writeln!(out, "{meta:?} {:?}", index.corpus.unit(unit)).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn captured_transcripts_index_the_golden_messages() {
+        for &(name, codex) in crate::test_golden::TRANSCRIPTS {
+            let format = if codex { Format::Codex } else { Format::Claude };
+            let path = crate::test_golden::fixture(name);
+            let mut index = TranscriptIndex::new(path.clone(), format);
+            assert!(index.update(far()));
+            assert_eq!(index.error, None);
+            let whole = indexed(&index);
+            // Appended to in pieces, the same messages.
+            let dir = tempfile::tempdir().unwrap();
+            let copy = dir.path().join(name);
+            let bytes = std::fs::read(&path).unwrap();
+            for size in [1, 7, 64, 4096] {
+                let _ = std::fs::remove_file(&copy);
+                std::fs::write(&copy, b"").unwrap();
+                let mut index = TranscriptIndex::new(copy.clone(), format);
+                for piece in bytes.chunks(size) {
+                    let mut file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&copy)
+                        .unwrap();
+                    file.write_all(piece).unwrap();
+                    assert!(index.update(far()));
+                }
+                assert_eq!(indexed(&index), whole, "{name} by {size}");
+            }
+            crate::test_golden::assert_golden(&format!("{name}.search.txt"), &whole);
+        }
     }
 
     #[test]

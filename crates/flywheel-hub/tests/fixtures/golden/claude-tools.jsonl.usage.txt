@@ -1,0 +1,5 @@
+Turn { id: Some("msg_A"), model: "claude-sonnet-5-5", fast: false, timestamp: Some("2026-11-03T04:00:01.000Z"), tokens: Tokens { input: 12, output: 3, cache_read: 0, cache_write_5m: 0, cache_write_1h: 2048 } }
+Turn { id: Some("msg_A"), model: "claude-sonnet-5-5", fast: false, timestamp: Some("2026-11-03T04:00:02.000Z"), tokens: Tokens { input: 12, output: 41, cache_read: 0, cache_write_5m: 0, cache_write_1h: 2048 } }
+Turn { id: Some("msg_S"), model: "claude-haiku-5-5", fast: true, timestamp: Some("2026-11-03T04:00:04.000Z"), tokens: Tokens { input: 100, output: 10, cache_read: 50, cache_write_5m: 0, cache_write_1h: 0 } }
+Turn { id: Some("msg_B"), model: "claude-sonnet-5-5", fast: false, timestamp: Some("2026-11-03T04:00:05.000Z"), tokens: Tokens { input: 30, output: 120, cache_read: 2048, cache_write_5m: 100, cache_write_1h: 0 } }
+CodexCursor { model: None, total: None }

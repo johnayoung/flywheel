@@ -1,0 +1,3 @@
+Turn { id: None, model: "gpt-5-codex", fast: false, timestamp: Some("2026-11-03T05:00:04.500Z"), tokens: Tokens { input: 3000, output: 200, cache_read: 1000, cache_write_5m: 0, cache_write_1h: 0 } }
+Turn { id: None, model: "gpt-5", fast: false, timestamp: Some("2026-11-03T05:00:08.000Z"), tokens: Tokens { input: 1000, output: 60, cache_read: 4000, cache_write_5m: 0, cache_write_1h: 0 } }
+CodexCursor { model: Some("gpt-5"), total: Some(CodexTotals { input: 9000, cached: 5000, output: 260 }) }

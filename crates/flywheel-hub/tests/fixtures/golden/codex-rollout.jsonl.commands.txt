@@ -1,0 +1,7 @@
+Usage(Turn { id: None, model: "gpt-5-codex", fast: false, timestamp: Some("2026-11-03T05:00:04.500Z"), tokens: Tokens { input: 3000, output: 200, cache_read: 1000, cache_write_5m: 0, cache_write_1h: 0 } })
+Reply(Reply { message_id: "@2934", timestamp: Some("2026-11-03T05:00:06.000Z"), texts: ["Tests pass. Run them with:\n\n```bash\ncargo test\n```\n\nOr one crate:\n```sh\ncargo test -p demo\n```"] })
+Usage(Turn { id: None, model: "gpt-5", fast: false, timestamp: Some("2026-11-03T05:00:08.000Z"), tokens: Tokens { input: 1000, output: 60, cache_read: 4000, cache_write_5m: 0, cache_write_1h: 0 } })
+Reply(Reply { message_id: "@4156", timestamp: None, texts: ["Legacy bare item:\n```zsh\nmake check\n```"] })
+Command { seq: 0, conversation: Some("conv"), message_id: "@2934", timestamp: Some("2026-11-03T05:00:06.000Z"), block_index: 0, lang: Some("bash"), shell: true, text: "cargo test", command: "cargo test", source: Rollout }
+Command { seq: 1, conversation: Some("conv"), message_id: "@2934", timestamp: Some("2026-11-03T05:00:06.000Z"), block_index: 1, lang: Some("sh"), shell: true, text: "cargo test -p demo", command: "cargo test -p demo", source: Rollout }
+Command { seq: 2, conversation: Some("conv"), message_id: "@4156", timestamp: None, block_index: 0, lang: Some("zsh"), shell: true, text: "make check", command: "make check", source: Rollout }

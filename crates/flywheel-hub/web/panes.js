@@ -229,6 +229,16 @@ window.FwHubPanes = function (ctx) {
       endReplay();
     }
 
+    // xterm draws no cursor at all -- not even the inactive outline --
+    // until it has had focus or a key once; a pane attached unfocused (a
+    // tab switch, a reload) would show none. Its own "show the cursor"
+    // step (internal, so guarded; no focus event reaches the program)
+    // marks it drawn. Whether it is hidden is still the program's call.
+    function initCursor() {
+      const core = pane.term && pane.term._core;
+      if (core && typeof core._showCursor === "function") core._showCursor();
+    }
+
     // Stop holding the terminal at a snapshot's size (the replay finished
     // or its socket went away) and size it by the rules again.
     function endReplay() {
@@ -310,6 +320,7 @@ window.FwHubPanes = function (ctx) {
       const replayed = () => {
         if (pane.socket !== socket) return;
         pane.replaying = false;
+        initCursor();
         pane.claim();
       };
       socket.onmessage = (event) => {

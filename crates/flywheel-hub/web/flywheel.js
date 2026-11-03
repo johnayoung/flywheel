@@ -46,17 +46,7 @@ window.FwHubFlywheel = function (ctx) {
 
   // --- time --------------------------------------------------------------
 
-  function ago(iso) {
-    const seconds = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
-    if (!Number.isFinite(seconds)) return "";
-    return span(seconds);
-  }
-  function span(seconds) {
-    if (seconds < 60) return `${Math.floor(seconds)}s`;
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-    return `${Math.floor(seconds / 86400)}d`;
-  }
+  const { age: ago, span } = ctx;
   function clock(iso) {
     const date = new Date(iso);
     return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString([], { hour12: false });
@@ -500,9 +490,10 @@ window.FwHubFlywheel = function (ctx) {
       if (!out.ok) throw new Error((out.data && out.data.error) || `HTTP ${out.status}`);
       const view = out.data;
       await ctx.refresh();
-      // The worker's terminal is the thing to watch now.
+      // The worker's terminal is the thing to watch now: beside the pane
+      // in focus (a new tab when there is no room), never over its agent.
       close();
-      openSession(view.id);
+      openSession(view.id, { split: "down" });
       toast(el("span", {}, "Started ", el("b", { textContent: view.name }), ` in ${labelFor(folder)}`), { timeout: 3500 });
     } catch (error) {
       toast(`Could not start a worker: ${error.message}`, { tone: "bad" });
@@ -667,11 +658,22 @@ window.FwHubFlywheel = function (ctx) {
       return;
     }
     stamp();
+    // No source read: the policy itself does not load (a worker would exit
+    // at once with the same error).
+    const broken = !!panel.problem && !panel.source;
     const start = el(
       "button",
-      { type: "button", className: "slab fw-start", onclick: startWorker, title: "Run fw worker in a new shell session in this folder" },
+      {
+        type: "button",
+        className: "slab fw-start",
+        onclick: startWorker,
+        disabled: broken,
+        title: broken
+          ? "The policy does not load (see below): fix flywheel.toml, then start a worker"
+          : "Run fw worker in a new shell session in this folder",
+      },
       icon("plus"),
-      panel.worker.live ? "Start another worker" : "Start worker here",
+      broken ? "Fix flywheel.toml first" : panel.worker.live ? "Start another worker" : "Start worker here",
     );
     const goto = workers.length
       ? el("button", {

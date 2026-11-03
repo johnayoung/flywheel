@@ -8,16 +8,7 @@
 "use strict";
 
 window.FwHubAttention = function (ctx) {
-  const { $, el, icon, state, workspaceById, agentStatus, openSession, flywheel } = ctx;
-
-  function age(since) {
-    const seconds = Math.max(0, (Date.now() - Date.parse(since)) / 1000);
-    if (!Number.isFinite(seconds)) return "";
-    if (seconds < 60) return "now";
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
-    return `${Math.floor(seconds / 86400)}d`;
-  }
+  const { $, el, icon, age, state, workspaceById, agentStatus, openSession, flywheel } = ctx;
 
   // Agents that need this browser, most urgent first.
   function entries() {

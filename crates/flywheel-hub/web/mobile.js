@@ -22,6 +22,93 @@
 //   not hide its top rows under the title bar).
 "use strict";
 
+// Options of the prompt lowest on a terminal's screen (`lines`: its
+// logical lines): a numbered list (Claude's permission dialogs and
+// questions: "❯ 1. Yes", "2. No, ..."), or a "(y/n)" style line -- whichever
+// comes last, so an answered dialog still on screen above a new y/n
+// question is not offered. Returns {question, options:[{label, seq}]} or
+// null. Pure (no DOM): FwHubPrompt.parse.
+window.FwHubPrompt = (function () {
+  const OPTION = /^[\s│┃|]*(?:[❯›>▶➤●*]\s*)?(\d{1,2})[.)]\s+(.+?)[\s│┃|]*$/;
+  const HOTKEY = /\s*\(([a-z])\)\s*$/i;
+  const HINT = /\s*\((?:esc|shift\+tab|tab|enter|ctrl\+[a-z])\)\s*$/i;
+  const YES_NO = /[[(]\s*(y\/n|yes\/no)\s*[\])]/i;
+
+  // The last run numbered 1, 2, 3, ... with at most a few wrapped lines
+  // between options.
+  function numberedRun(lines) {
+    const found = [];
+    lines.forEach((text, index) => {
+      const match = OPTION.exec(text);
+      if (match) found.push({ n: Number(match[1]), text: match[2], index });
+    });
+    let run = [];
+    for (let i = found.length - 1; i >= 0; i--) {
+      const option = found[i];
+      if (!run.length) {
+        run = [option];
+        continue;
+      }
+      const next = run[0];
+      if (option.n === next.n - 1 && next.index - option.index <= 4) run.unshift(option);
+      else if (run[0].n === 1) break;
+      else run = [option];
+    }
+    return run.length >= 2 && run[0].n === 1 ? run : null;
+  }
+
+  // The index of a "(y/n)" line among the last six non-empty lines.
+  function yesNoLine(lines) {
+    let seen = 0;
+    for (let i = lines.length - 1; i >= 0 && seen < 6; i--) {
+      if (!lines[i].trim()) continue;
+      seen += 1;
+      if (YES_NO.test(lines[i])) return i;
+    }
+    return -1;
+  }
+
+  function parse(lines) {
+    const run = numberedRun(lines);
+    const yn = yesNoLine(lines);
+    if (yn >= 0 && (!run || yn > run[run.length - 1].index)) {
+      return {
+        question: lines[yn].trim(),
+        options: [{ label: "y  yes", seq: "y\r" }, { label: "n  no", seq: "n\r" }],
+      };
+    }
+    if (!run) return null;
+    let question = "";
+    for (let i = run[0].index - 1; i >= Math.max(0, run[0].index - 4); i--) {
+      const text = lines[i].replace(/[─-╿|]/g, "").trim();
+      if (text) {
+        question = text;
+        break;
+      }
+    }
+    // Programs that wrap their own lines (Claude's TUI) continue an
+    // option on indented lines before the next one.
+    run.forEach((option, i) => {
+      const next = run[i + 1];
+      if (!next) return;
+      for (let j = option.index + 1; j < next.index; j++) {
+        const more = lines[j].replace(/[│┃|]/g, "").trim();
+        if (more) option.text += ` ${more}`;
+      }
+    });
+    return {
+      question,
+      options: run.map(({ n, text }) => {
+        const hotkey = HOTKEY.exec(text);
+        const label = text.replace(HOTKEY, "").replace(HINT, "").trim();
+        return { label: `${n}  ${label}`, seq: hotkey ? hotkey[1].toLowerCase() : String(n) };
+      }),
+    };
+  }
+
+  return { parse };
+})();
+
 window.FwHubMobile = function (ctx) {
   const { $, el, state, store, api, toast, copyText, sessionById, agentStatus } = ctx;
   // The focused pane's terminal (a phone shows one pane).
@@ -309,13 +396,6 @@ window.FwHubMobile = function (ctx) {
 
   // --- quick answers ---------------------------------------------------
 
-  // Options of a prompt on the terminal's visible screen: a numbered list
-  // (Claude's permission dialogs and questions: "❯ 1. Yes", "2. No, ..."),
-  // else a "(y/n)" style line. Returns {question, options:[{label, seq}]}.
-  const OPTION = /^[\s│┃|]*(?:[❯›>▶➤●*]\s*)?(\d{1,2})[.)]\s+(.+?)[\s│┃|]*$/;
-  const HOTKEY = /\s*\(([a-z])\)\s*$/i;
-  const HINT = /\s*\((?:esc|shift\+tab|tab|enter|ctrl\+[a-z])\)\s*$/i;
-
   // The screen as logical lines: a line the terminal soft-wrapped is
   // joined back onto the one it continues. `live` (quick answers): the
   // program's current screen, wherever the user has scrolled back to --
@@ -336,66 +416,6 @@ window.FwHubMobile = function (ctx) {
     return lines;
   }
 
-  function parsePrompt(lines) {
-    const found = [];
-    lines.forEach((text, index) => {
-      const match = OPTION.exec(text);
-      if (match) found.push({ n: Number(match[1]), text: match[2], index });
-    });
-    // The last run numbered 1, 2, 3, ... with at most a few wrapped lines
-    // between options.
-    let run = [];
-    for (let i = found.length - 1; i >= 0; i--) {
-      const option = found[i];
-      if (!run.length) {
-        run = [option];
-        continue;
-      }
-      const next = run[0];
-      if (option.n === next.n - 1 && next.index - option.index <= 4) run.unshift(option);
-      else if (run[0].n === 1) break;
-      else run = [option];
-    }
-    if (run.length >= 2 && run[0].n === 1) {
-      let question = "";
-      for (let i = run[0].index - 1; i >= Math.max(0, run[0].index - 4); i--) {
-        const text = lines[i].replace(/[─-╿|]/g, "").trim();
-        if (text) {
-          question = text;
-          break;
-        }
-      }
-      // Programs that wrap their own lines (Claude's TUI) continue an
-      // option on indented lines before the next one.
-      run.forEach((option, i) => {
-        const next = run[i + 1];
-        if (!next) return;
-        for (let j = option.index + 1; j < next.index; j++) {
-          const more = lines[j].replace(/[│┃|]/g, "").trim();
-          if (more) option.text += ` ${more}`;
-        }
-      });
-      return {
-        question,
-        options: run.map(({ n, text }) => {
-          const hotkey = HOTKEY.exec(text);
-          const label = text.replace(HOTKEY, "").replace(HINT, "").trim();
-          return { label: `${n}  ${label}`, seq: hotkey ? hotkey[1].toLowerCase() : String(n) };
-        }),
-      };
-    }
-    const tail = lines.filter((l) => l.trim()).slice(-6);
-    for (let i = tail.length - 1; i >= 0; i--) {
-      if (/[[(]\s*(y\/n|yes\/no)\s*[\])]/i.test(tail[i])) {
-        return {
-          question: tail[i].trim(),
-          options: [{ label: "y  yes", seq: "y\r" }, { label: "n  no", seq: "n\r" }],
-        };
-      }
-    }
-    return null;
-  }
-
   let quickKey = "";
   function renderQuick() {
     const bar = $("#quick");
@@ -411,7 +431,7 @@ window.FwHubMobile = function (ctx) {
       }
       return;
     }
-    const prompt = parsePrompt(screenLines(true));
+    const prompt = window.FwHubPrompt.parse(screenLines(true));
     const options = prompt ? prompt.options : [];
     const question = agent.detail || (prompt && prompt.question) || "waiting on you";
     const key = JSON.stringify([state.attached, question, options]);
@@ -945,7 +965,7 @@ window.FwHubMobile = function (ctx) {
   coarse.addEventListener("change", () => render());
 
   return {
-    fontSize, fitTerminal, transformInput, attachTerminal, render, paletteItems, openCompose, parsePrompt,
+    fontSize, fitTerminal, transformInput, attachTerminal, render, paletteItems, openCompose,
     pruneDrafts, forget,
   };
 };

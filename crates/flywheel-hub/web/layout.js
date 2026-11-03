@@ -135,6 +135,26 @@ window.FwHubLayout = (function () {
     return changed;
   }
 
+  // Each pane's box ({w, h}, px) were `root` laid out in a `w` x `h`
+  // stage with `gap`-px dividers between split sides (pane id -> box).
+  function boxes(root, w, h, gap = 0, out = new Map()) {
+    if (!root) return out;
+    if (root.type === "pane") {
+      out.set(root.id, { w: Math.max(0, w), h: Math.max(0, h) });
+      return out;
+    }
+    if (root.dir === "right") {
+      const inner = w - gap;
+      boxes(root.a, inner * root.ratio, h, gap, out);
+      boxes(root.b, inner * (1 - root.ratio), h, gap, out);
+    } else {
+      const inner = h - gap;
+      boxes(root.a, w, inner * root.ratio, gap, out);
+      boxes(root.b, w, inner * (1 - root.ratio), gap, out);
+    }
+    return out;
+  }
+
   // A unique "tab N" name.
   function nextTabName(layout, base = "tab") {
     const taken = new Set(layout.tabs.map((t) => t.name.toLowerCase()));
@@ -147,6 +167,6 @@ window.FwHubLayout = (function () {
   return {
     MAX_TABS, MAX_PANES, MAX_TAB_NAME, MIN_RATIO,
     newId, clone, pane, tab, panes, findPane, paneShowing, sessionsOf, split, close, parentOf,
-    resizePane, clampRatio, splitAt, prune, nextTabName,
+    resizePane, clampRatio, splitAt, prune, nextTabName, boxes,
   };
 })();

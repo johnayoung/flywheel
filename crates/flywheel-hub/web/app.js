@@ -36,6 +36,23 @@
     return svg;
   }
 
+  // An agent CLI session (not a shell).
+  const isAgent = (s) => !!s && (s.kind === "claude" || s.kind === "codex");
+
+  // A duration as the UI writes it everywhere: 42s, 5m, 3h, 2d.
+  function span(seconds) {
+    if (seconds < 60) return `${Math.floor(seconds)}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+    return `${Math.floor(seconds / 86400)}d`;
+  }
+
+  // How long ago `iso` was ("" when it is not a time).
+  function age(iso) {
+    const seconds = Math.max(0, (Date.now() - Date.parse(iso)) / 1000);
+    return Number.isFinite(seconds) ? span(seconds) : "";
+  }
+
   function iconButton(id, title, onclick, danger) {
     return el(
       "button",
@@ -246,6 +263,7 @@
     $,
     el,
     icon,
+    isAgent,
     api,
     state,
     sessionById,
@@ -261,8 +279,8 @@
   // The Flywheel panel (flywheel.js): verified-loop state for the
   // flywheel-adopted folders.
   const flywheel = window.FwHubFlywheel({
-    $, el, icon, api, state, workspaceById, sessionById, folderLabel,
-    openSession: (id) => openSession(id),
+    $, el, icon, api, age, span, state, workspaceById, sessionById, folderLabel,
+    openSession: (id, place) => openSession(id, place),
     toast: commands.toast,
     confirmDialog: (options) => confirmDialog(options),
     refresh: () => refresh(),
@@ -277,7 +295,7 @@
   // mobile.js).
   const pwa = window.FwHubPwa();
   const attention = window.FwHubAttention({
-    $, el, icon, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
+    $, el, icon, age, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
     flywheel,
   });
   const notify = window.FwHubNotify({
@@ -575,7 +593,9 @@
       if (!phone() && pane.id !== state.focusId) focusPane(pane.id, { fromTerminal: true });
     },
     onAttached: (pane) => {
-      if (pane === focusedPane()) focusTerminal();
+      // A re-attach (reconnect, hub restart) never takes the keys from an
+      // open drawer, panel, or dialog.
+      if (pane === focusedPane() && mayTakeFocus()) focusTerminal();
       refresh(false).catch(() => {});
     },
     onExit: (pane) => {
@@ -749,8 +769,11 @@
 
   // Show a session: in the pane already showing it (its tab comes to the
   // front), else -- `place` -- in the focused pane (`{pane}`: that one), a
-  // new split beside it (`{split: "right"|"left"|"down"|"up"}`), or a new
-  // tab (`{newTab: true}`). Phones show it alone, the layout untouched.
+  // new split beside it (`{split: "right"|"left"|"down"|"up"}`; when
+  // either half would be under MIN_PANE, `fallback: "swap"` shows it in
+  // the pane instead, else it gets a new tab; `keepZoom` zooms the new
+  // pane when the split one was zoomed), or a new tab (`{newTab: true}`).
+  // Phones show it alone, the layout untouched.
   async function openSession(id, place = {}) {
     const session = sessionById(id);
     if (!session) return;
@@ -813,6 +836,17 @@
     }
     const target = place.pane ? L.findPane(tab.root, place.pane) : focusedLeaf();
     if (!target) return;
+    if (place.split && !roomToSplit(tab, target.id, place.split, place.ratio || 0.5)) {
+      // Too small to halve (an agent at a few columns is unusable): show
+      // it in place (`fallback: "swap"`), else in a new tab.
+      if (place.fallback === "swap") {
+        place = { pane: target.id };
+      } else {
+        commands.toast(`No room to split (panes keep ${MIN_PANE.cols}x${MIN_PANE.rows}): opened in a new tab.`, { timeout: 4000 });
+        await openSession(id, { newTab: true });
+        return;
+      }
+    }
     if (place.split) {
       if (L.panes(tab.root).length >= L.MAX_PANES && !(where && where.tab === tab)) {
         commands.toast(`At most ${L.MAX_PANES} panes per tab.`, { timeout: 3000 });
@@ -820,7 +854,9 @@
       }
       const freshId = L.newId("p");
       view.focus[tab.id] = freshId;
-      delete view.zoom[tab.id];
+      // A split made from a zoomed pane can stay zoomed, on the new one.
+      if (place.keepZoom && zoomedIn(tab)) view.zoom[tab.id] = freshId;
+      else delete view.zoom[tab.id];
       saveViews();
       await editLayout(workspaceId, (draft) => {
         const t = draft.tabs.find((x) => x.id === tab.id);
@@ -887,6 +923,9 @@
       state.solo.dispose();
       state.solo = null;
     }
+    // Asked before any pane goes: a closed pane takes its focused xterm
+    // with it, and the keys typed next must reach the pane that took over.
+    const refocus = mayTakeFocus();
     const tab = activeTab();
     const leaves = tab ? L.panes(tab.root) : [];
     for (const [id, pane] of state.panes) {
@@ -915,7 +954,6 @@
     // Rebuild only when the shape changed (a moved xterm loses focus);
     // a ratio alone is restyled in place.
     const key = JSON.stringify([tab && tab.id, shape(tree)]);
-    const hadFocus = host.contains(document.activeElement);
     if (key !== state.stageKey) {
       state.stageKey = key;
       const park = $("#pane-park");
@@ -929,7 +967,9 @@
       pane.el.classList.toggle("focused", pane.id === state.focusId);
       renderPaneHead(pane);
     }
-    if (hadFocus && !document.querySelector("dialog[open]") && !paletteOpen()) focusTerminal();
+    if (refocus) focusTerminal();
+    // The header's link pill is the focused pane's, whoever changed focus.
+    syncLink();
     renderTabs();
     history.replaceState(null, "", state.attached ? `#session=${state.attached}` : window.location.pathname);
     rememberAttached();
@@ -1289,7 +1329,7 @@
       return;
     }
     focusPane(pane.id);
-    const agent = session.kind === "claude" || session.kind === "codex";
+    const agent = isAgent(session);
     const companion = agent ? state.sessions.find((s) => s.companion_of === session.id) : null;
     const companionShown = companion && tab && L.paneShowing(tab.root, companion.id);
     try {
@@ -1320,15 +1360,68 @@
       return;
     }
     const shown = L.paneShowing(tab.root, id);
+    const zoomed = zoomedIn(tab);
     if (shown) {
+      if (zoomed && zoomed !== shown.id) {
+        // Zoomed: flip the zoom over to it rather than unzoom the tab.
+        const view = viewOf(state.view);
+        view.zoom[tab.id] = shown.id;
+        view.focus[tab.id] = shown.id;
+        saveViews();
+        renderStage();
+        focusTerminal();
+        return;
+      }
       focusPane(shown.id);
       return;
     }
     const at = L.paneShowing(tab.root, from);
     const target = sessionById(id);
-    // The agent goes back to the left of its shell.
+    // The agent goes back to the left of its shell; with no room for that
+    // it takes the pane's place, as on a narrow screen.
     const side = target && target.companion_of ? "right" : "left";
-    openSession(id, at ? { split: side, pane: at.id } : { split: side });
+    const place = { split: side, fallback: "swap", keepZoom: true };
+    openSession(id, at ? { ...place, pane: at.id } : place);
+  }
+
+  // Smallest pane a split may leave (tmux-like "no space for new pane"):
+  // an agent's TUI, and the hub's own footer reading, need about this.
+  const MIN_PANE = { cols: 40, rows: 8 };
+  const DIVIDER_PX = 7;
+
+  // The terminal grid a pane box of `w` x `h` px holds, measured from a
+  // live pane (cell size, and the title bar and padding around the grid).
+  function gridOf(w, h) {
+    for (const pane of state.panes.values()) {
+      const dims = pane.fit && pane.el.isConnected ? pane.fit.proposeDimensions() : null;
+      const box = pane.el.getBoundingClientRect();
+      if (!dims || !dims.cols || !dims.rows || !box.width || !pane.host.clientWidth) continue;
+      const cellW = pane.host.clientWidth / dims.cols;
+      const cellH = pane.host.clientHeight / dims.rows;
+      return {
+        cols: Math.floor((w - (box.width - pane.host.clientWidth)) / cellW),
+        rows: Math.floor((h - (box.height - pane.host.clientHeight)) / cellH),
+      };
+    }
+    // Nothing on screen to measure: the terminal font's usual cell.
+    const size = mobile.fontSize();
+    return { cols: Math.floor((w - 12) / (size * 0.6)), rows: Math.floor((h - 34) / (size * 1.3)) };
+  }
+
+  // Whether splitting pane `paneId` of `tab` toward `side` leaves both
+  // halves at least MIN_PANE (laid out unzoomed, as other browsers see it).
+  function roomToSplit(tab, paneId, side, ratio = 0.5) {
+    const stage = $("#terminal").getBoundingClientRect();
+    if (!stage.width || !stage.height) return true;
+    const box = L.boxes(tab.root, stage.width, stage.height, DIVIDER_PX).get(paneId);
+    if (!box) return true;
+    const share = Math.min(ratio, 1 - ratio);
+    const across = side === "right" || side === "left";
+    const half = across
+      ? { w: (box.w - DIVIDER_PX) * share, h: box.h }
+      : { w: box.w, h: (box.h - DIVIDER_PX) * share };
+    const grid = gridOf(half.w, half.h);
+    return grid.cols >= MIN_PANE.cols && grid.rows >= MIN_PANE.rows;
   }
 
   // The focused terminal's size: a reasonable first size for a new one.
@@ -1487,13 +1580,17 @@
           type: "button",
           className: "tab-pick",
           title: `${t.name}: ${count} pane${count === 1 ? "" : "s"}${i < 9 ? ` (Ctrl B ${i + 1} with the prefix on)` : ""}; double-click to rename`,
-          onclick: () => {
+          // The first click of a double-click on another tab switches to
+          // it and rebuilds the bar, so the second lands on a new button:
+          // a click's `detail` (2 on the second) starts the rename either way.
+          onclick: (e) => {
+            if (e.detail >= 2) {
+              tabRenaming = t.id;
+              renderTabs();
+              return;
+            }
             selectTab(t.id);
             focusTerminal();
-          },
-          ondblclick: () => {
-            tabRenaming = t.id;
-            renderTabs();
           },
           oncontextmenu: (e) => {
             e.preventDefault();
@@ -1540,6 +1637,7 @@
               type: "button",
               className: `pane-chip${on ? " active" : ""}`,
               "aria-pressed": String(on),
+              title: multiTab ? `${session.name} (tab ${t.name})` : session.name,
               onclick: () => {
                 const view = viewOf(state.view);
                 view.tab = t.id;
@@ -1726,6 +1824,13 @@
   // --- sockets ---------------------------------------------------------
 
   // The header's link pill follows the focused pane.
+  // The focused pane's link state in the header (idle with none).
+  function syncLink() {
+    const pane = focusedPane();
+    if (pane && pane.sessionId) setLink(pane.link.kind, pane.link.text);
+    else setLink("idle");
+  }
+
   function setLink(kind, text) {
     const pill = $("#link");
     pill.dataset.link = kind;
@@ -2164,6 +2269,25 @@
     if (term && !document.querySelector("dialog[open]") && !paletteOpen() && !$("#ctx-menu")) term.focus();
   }
 
+  // Something over the terminal that owns the keys: a dialog, the
+  // palette, a menu, the Commands drawer, the Flywheel panel, Compose.
+  function overlayOpen() {
+    return !!document.querySelector("dialog[open]") || paletteOpen() || !!$("#ctx-menu") ||
+      commands.isOpen() || flywheel.isOpen() || !$("#compose").hidden;
+  }
+
+  // Whether focus may move to the terminal by itself (an attach, a stage
+  // rebuild): not out of an overlay or a field the user is in -- only from
+  // the stage, or from nowhere (the page itself, as after a closed pane).
+  function mayTakeFocus() {
+    if (overlayOpen()) return false;
+    const active = document.activeElement;
+    if ($("#terminal").contains(active) || $("#pane-park").contains(active)) return true;
+    // From nowhere only with a hardware keyboard: on a touch screen focus
+    // would raise the on-screen keyboard unasked.
+    return (!active || active === document.body) && !window.matchMedia("(pointer: coarse)").matches;
+  }
+
   function startRename(id) {
     const session = sessionById(id);
     if (!session) return;
@@ -2457,7 +2581,7 @@
   function renderFlip(session) {
     const button = $("#flip-toggle");
     const parent = session && session.companion_of ? sessionById(session.companion_of) : null;
-    const agent = session && (session.kind === "claude" || session.kind === "codex");
+    const agent = isAgent(session);
     button.hidden = !parent && !agent;
     if (button.hidden) return;
     const running = agent ? state.sessions.find((s) => s.companion_of === session.id && s.state === "running") : null;
@@ -3554,7 +3678,9 @@
     if (match) {
       if (sessionById(match[1])) openSession(match[1]);
       else detach(STALE_LINK, "Session removed.");
-    } else {
+    } else if (!phone()) {
+      // A phone lands on its start screen (Needs you): opening a layout
+      // pane here would mark an unseen finished turn seen unasked.
       await restoreWorkspace().catch(() => {});
     }
     // Follow an edited or navigated #session= (replaceState fires no

@@ -137,6 +137,25 @@ try {
   check(ring < 20, `desktop: status ring stays dot-sized (${ring}px)`);
   await page.screenshot({ path: path.join(out, "desktop-3-panes.png") });
 
+  // A split never leaves a pane under 40 columns: p2 (a quarter of the
+  // stage) halved would; the new shell gets its own tab instead.
+  await page.locator('#terminal .pane[data-pane="p2"] .xterm').click();
+  const tabsBefore = await page.evaluate(() => document.querySelectorAll(".tab-list [role=tab]").length);
+  await page.keyboard.press("Alt+\\");
+  await page.waitForTimeout(1500);
+  let narrow = await page.evaluate(() => ({
+    tabs: document.querySelectorAll(".tab-list [role=tab]").length,
+    toast: [...document.querySelectorAll(".toast")].map((t) => t.textContent).join(" "),
+  }));
+  check(narrow.tabs === tabsBefore + 1 && /No room to split/.test(narrow.toast), `desktop: no split below the minimum pane size (${JSON.stringify(narrow)})`);
+  // Drop that tab and its shell again (the checks below count sessions).
+  const extra = await page.evaluate(() => /#session=([0-9a-f]+)/.exec(location.hash)?.[1]);
+  await page.keyboard.press("Alt+x");
+  await page.waitForTimeout(800);
+  if (extra && !sids.includes(extra)) await api("DELETE", `/api/sessions/${extra}`);
+  await page.locator(".tab-list [role=tab]", { hasText: "agents" }).click();
+  await page.waitForFunction(() => document.querySelectorAll("#terminal .pane").length === 3);
+
   // Zoom one pane: the others are not "viewed" any more.
   await page.locator('#terminal .pane[data-pane="p1"] .xterm').click();
   await page.keyboard.press("Alt+z");
@@ -220,6 +239,23 @@ try {
   // --- phone 390x844 ------------------------------------------------------
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
   const mp = await phone.newPage();
+  // Without #session a phone lands on its start screen, not on a pane of
+  // the saved layout (which would mark finished turns seen unasked).
+  await mp.goto(`${base}/login?token=${token}`);
+  await mp.waitForURL(`${base}/`);
+  await mp.waitForTimeout(2500);
+  const landing = await mp.evaluate(() => ({
+    empty: !document.querySelector("#empty").hidden,
+    panes: document.querySelectorAll("#terminal .pane").length,
+  }));
+  check(landing.empty && landing.panes === 0, `phone: lands on the start screen, no pane opened (${JSON.stringify(landing)})`);
+  // Quick answers offer the prompt lowest on screen: an answered dialog
+  // above a newer (y/n) question is not it.
+  const quick = await mp.evaluate(() => window.FwHubPrompt.parse([
+    "Do you want to run rm?", "❯ 1. Yes", "  2. Yes, and don't ask again", "  3. No (esc)", "",
+    "Overwrite existing file config.toml? (y/n)",
+  ]).options.map((o) => o.seq));
+  check(quick[0] === "y\r", `phone: quick answers pick the newer y/n prompt (${JSON.stringify(quick)})`);
   await mp.goto(`${base}/login?token=${token}#session=${sids[1]}`);
   await mp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
   await mp.waitForTimeout(800);
@@ -250,6 +286,13 @@ try {
     return bad;
   });
   check(blocked.length === 0, `phone: no control is covered (${blocked.join(", ")})`);
+  // ... and every one is at least 44px tall (key bar keys share the width).
+  const undersized = await mp.evaluate(() => [
+    ...document.querySelectorAll(".menu-toggle, #cmd-toggle, #flip-toggle, #fw-toggle, #keybar .kb-primary .kb-key, .pane-chip"),
+  ].filter((n) => n.offsetParent !== null)
+    .map((n) => [n.className.split(" ")[0] || n.id, Math.round(n.getBoundingClientRect().height)])
+    .filter(([, h]) => h < 44));
+  check(undersized.length === 0, `phone: tap targets at least 44px tall (${JSON.stringify(undersized)})`);
   await mp.screenshot({ path: path.join(out, "phone-solo.png") });
   // The menu opens the sidebar.
   await mp.locator(".menu-toggle").tap();

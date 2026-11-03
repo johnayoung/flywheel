@@ -1757,6 +1757,10 @@ body.resizing-y, body.resizing-y * { cursor: row-resize !important; user-select:
 .cmd-pill svg { width: .7rem; height: .7rem; }
 .cmd-pill:hover, .cmd-pill[aria-pressed="true"] { color: var(--ink); border-color: var(--ink-2); }
 .cmd-pill[aria-pressed="true"] { background: var(--signal-soft); border-color: var(--signal); }
+/* The suggesting agent, when it is not the attached session (text-
+   transform off: a session name is shown as typed). */
+.cmd-pill .cmd-from { font-weight: 600; text-transform: none; }
+@media (max-width: 1100px) { .cmd-pill .cmd-from { display: none; } }
 .cmd-pill b {
   min-width: 1rem;
   padding: 0 .25rem;
@@ -1806,9 +1810,11 @@ body.resizing-y, body.resizing-y * { cursor: row-resize !important; user-select:
   padding: .3rem 1rem .7rem;
   border-bottom: 1px solid var(--rule-2);
 }
-.cmd-field { display: inline-flex; align-items: center; gap: .45rem; color: var(--ink-3); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+.cmd-field { flex: 1 1 16rem; min-width: 0; display: inline-flex; align-items: center; gap: .45rem; color: var(--ink-3); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+.cmd-field > span { flex: none; }
 .cmd-field select {
-  max-width: 12rem;
+  flex: 1;
+  min-width: 0;
   padding: .25rem .4rem;
   border: 1px solid var(--rule-2);
   border-radius: 2px;
@@ -1928,6 +1934,10 @@ body.resizing-y, body.resizing-y * { cursor: row-resize !important; user-select:
   justify-items: end;
   gap: .5rem;
   pointer-events: none;
+}
+/* A drawer open: toasts sit above its key-hint footer, not over it. */
+@media (min-width: 761px) {
+  body:has(#commands:not([hidden])) .toasts, body:has(#flywheel:not([hidden])) .toasts { bottom: 3.6rem; }
 }
 .toast {
   pointer-events: auto;
@@ -2773,4 +2783,27 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   .fw-more > summary { display: flex; justify-content: flex-start; }
   .run-head > .icon, .fw-drawer .cmd-head > .icon { width: 44px; height: 44px; }
   .run-tabs [role="tab"] { min-height: 44px; }
+}
+
+/* --- phone tap targets ------------------------------------------------------ */
+/* Every control a thumb uses is at least 44px tall (Apple HIG / WCAG 2.5.5);
+   icon-only ones 44px wide too. Kept last so it wins over the compact
+   desktop sizes above. */
+@media (max-width: 760px) {
+  .pane-chip, .qa-esc, .cmd-pill, .menu-toggle,
+  .commands .cmd-head > .icon, .cmd-list .slab, .compose-actions .slab, .fw-start {
+    min-height: 44px;
+  }
+  .cmd-pill, .menu-toggle, .commands .cmd-head > .icon, .qa-esc { min-width: 44px; }
+  .pane-chip, .qa-esc { display: inline-flex; align-items: center; justify-content: center; }
+  .cmd-pill { justify-content: center; }
+  .kb-primary .kb-key { height: 44px; }
+  /* Long answers wrap (up to three lines) instead of losing the words that
+     tell "Yes" from "Yes, and don't ask again ...". */
+  .qa { white-space: normal; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.3; }
+}
+/* The narrowest phones: the session name needs the header more than the
+   kind tag does (the glyph in the sidebar and chips still says it). */
+@media (max-width: 420px) {
+  .crumbs .kind-tag { display: none; }
 }

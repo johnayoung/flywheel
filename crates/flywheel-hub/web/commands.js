@@ -23,12 +23,12 @@ window.FwHubCommands = function (ctx) {
     all: false, // every block, not only shell commands
     loading: null, // session id being fetched
     error: "",
-    unseen: 0, // shell commands that arrived while the drawer was closed
+    unseen: {}, // agent session id -> shell commands not yet seen in the drawer
     selected: null, // seq of the card the keyboard acts on
     focusPending: false, // opened: focus the selected card once it renders
   };
 
-  const isAgent = (s) => s && (s.kind === "claude" || s.kind === "codex");
+  const { isAgent } = ctx;
   // A shell: a shell session, or an agent restored as a fallback shell.
   const runsShell = (s) => s.kind === "shell" || Array.isArray(s.fallback_command);
   const isRunning = (s) => s && s.live && s.live.pid && s.state === "running";
@@ -51,7 +51,13 @@ window.FwHubCommands = function (ctx) {
     agent ? state.sessions.find((s) => s.companion_of === agent.id && isRunning(s)) || null : null;
 
   // Where a session works, for hints: its worktree branch or its folder.
-  const placeOf = (s) => (s.worktree ? `worktree ${s.worktree.branch}` : basename(s.cwd));
+  // (by its label, as the sidebar names it).
+  function placeOf(s) {
+    if (s.worktree) return `worktree ${s.worktree.branch}`;
+    const workspace = workspaceById(s.workspace_id);
+    const folder = workspace && workspace.folders && workspace.folders.find((f) => f.path === s.cwd);
+    return folder && folder.name ? folder.name : basename(s.cwd);
+  }
 
   // Drop what refers to sessions that no longer exist (closed here or
   // elsewhere, or their workspace deleted): picks, cache, keyboard focus.
@@ -64,6 +70,9 @@ window.FwHubCommands = function (ctx) {
     if (ui.target && ui.target !== NEW_COMPANION && !live.has(ui.target)) ui.target = null;
     for (const id of Object.keys(cache)) {
       if (!live.has(id) && ui.loading !== id) delete cache[id];
+    }
+    for (const id of Object.keys(ui.unseen)) {
+      if (!live.has(id)) delete ui.unseen[id];
     }
   }
 
@@ -427,9 +436,23 @@ window.FwHubCommands = function (ctx) {
     const drawer = $("#commands");
     drawer.hidden = !ui.open;
     const source = currentSource();
+    // What the drawer shows is seen.
+    if (ui.open && source) delete ui.unseen[source.id];
+    // The badge counts the drawer's source only: the attached agent's own
+    // blocks, or (from a shell) the workspace agent that suggested last,
+    // named so its count is not taken for this session's.
+    const unseen = (source && ui.unseen[source.id]) || 0;
+    const attached = attachedSession();
     const count = $("#cmd-count");
-    count.textContent = ui.unseen ? String(ui.unseen) : "";
-    count.hidden = !ui.unseen;
+    count.replaceChildren(...(unseen
+      ? [String(unseen), source.id !== (attached && attached.id)
+        ? el("span", { className: "cmd-from", textContent: ` \u00b7 ${source.name}` })
+        : ""]
+      : []));
+    count.hidden = !unseen;
+    $("#cmd-toggle").title = unseen
+      ? `Suggested commands: ${unseen} new from ${source.name} (${ctx.MOD} C)`
+      : `Suggested commands (${ctx.MOD} C)`;
     $("#cmd-toggle").setAttribute("aria-pressed", String(ui.open));
     if (!ui.open) return;
 
@@ -553,7 +576,6 @@ window.FwHubCommands = function (ctx) {
     const wasOpen = ui.open;
     ui.open = open;
     if (open) {
-      ui.unseen = 0;
       // Keys go to the drawer at once (not the terminal behind it), and
       // to the selected card once the list has loaded.
       ui.focusPending = true;
@@ -660,10 +682,8 @@ window.FwHubCommands = function (ctx) {
       if (node) node.classList.add("arrived");
       return;
     }
-    if (!ui.open) {
-      ui.unseen += shell.length;
-      renderDrawer();
-    }
+    ui.unseen[id] = (ui.unseen[id] || 0) + shell.length;
+    renderDrawer();
     const newest = shell[0];
     toast(
       el(

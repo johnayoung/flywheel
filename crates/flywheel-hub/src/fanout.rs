@@ -1058,7 +1058,7 @@ pub fn fix_prompt(grade: &Grade) -> Option<String> {
         if text.is_empty() {
             continue;
         }
-        let tail = tail_chars(text, 3000);
+        let tail = tail_from_line_start(text, 3000);
         output.push_str(&format!("--- {stream} (last lines) ---\n{tail}\n"));
     }
     if output.is_empty() {
@@ -1081,7 +1081,7 @@ pub fn fix_prompt(grade: &Grade) -> Option<String> {
 
 /// The last `max` characters of `text`, from a line start where one is
 /// near.
-fn tail_chars(text: &str, max: usize) -> &str {
+fn tail_from_line_start(text: &str, max: usize) -> &str {
     let count = text.chars().count();
     if count <= max {
         return text;
@@ -1499,7 +1499,7 @@ pub fn finished_payload(view: &FanoutView) -> serde_json::Value {
                     .into_iter()
                     .map(|t| t.trim_end())
                     .find(|t| !t.is_empty())?;
-                Some(tail_chars(text, FINISHED_TAIL_CHARS).to_owned())
+                Some(tail_from_line_start(text, FINISHED_TAIL_CHARS).to_owned())
             });
             serde_json::json!({
                 "label": c.label,

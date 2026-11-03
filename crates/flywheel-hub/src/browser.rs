@@ -113,7 +113,7 @@ pub(crate) fn write_redirect_page(state_dir: &Path, url: &str) -> std::io::Resul
         "{PAGE_PREFIX}{}{PAGE_SUFFIX}",
         crate::state::new_id()
     ));
-    let href = html_escape(url);
+    let href = crate::web::escape_html(url);
     let script_url = serde_json::to_string(url).unwrap_or_default();
     let html = format!(
         "<!doctype html>\n<html><head><meta charset=\"utf-8\">\n\
@@ -147,13 +147,6 @@ fn remove_expired_pages(state_dir: &Path) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-}
-
-fn html_escape(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 /// `path` as a `file://` URL (bytes outside the unreserved set and `/`

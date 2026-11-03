@@ -8,7 +8,7 @@
 
 use crate::cli::{StateDirArg, resolve_state_dir};
 use crate::endpoint::{Endpoint, EndpointArgs};
-use crate::util::{fail, str_field};
+use crate::util::{fail, print_json, str_field};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -207,14 +207,6 @@ fn folder_list(workspace: &Value) -> Vec<String> {
 
 fn connect(endpoint: &EndpointArgs) -> Result<Endpoint, String> {
     Endpoint::resolve(endpoint)
-}
-
-fn print_json(out: &mut dyn Write, value: &Value) {
-    let _ = writeln!(
-        out,
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    );
 }
 
 // --- ls ---------------------------------------------------------------------

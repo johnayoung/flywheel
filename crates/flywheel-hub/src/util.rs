@@ -4,6 +4,15 @@ use serde_json::Value;
 use std::io::Write;
 use std::path::Path;
 
+/// Print `value` as pretty JSON on its own line (a `--json` answer).
+pub(crate) fn print_json(out: &mut dyn Write, value: &Value) {
+    let _ = writeln!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    );
+}
+
 /// Print `fw hub: <message>` to `err`; the failing exit code (1).
 pub(crate) fn fail(err: &mut dyn Write, message: &str) -> i32 {
     let _ = writeln!(err, "fw hub: {message}");

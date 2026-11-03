@@ -4,7 +4,7 @@
 
 use crate::endpoint::{Endpoint, EndpointArgs};
 use crate::script::{find_session, session_label};
-use crate::util::{fail, str_field};
+use crate::util::{fail, print_json, str_field};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 
@@ -138,14 +138,6 @@ fn item_ref(raw: &str) -> Result<String, String> {
         ));
     }
     Ok(reference.to_ascii_lowercase())
-}
-
-fn print_json(out: &mut dyn Write, value: &Value) {
-    let _ = writeln!(
-        out,
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    );
 }
 
 /// When `iso` was, as local `HH:MM:SS` (the date too when not today).

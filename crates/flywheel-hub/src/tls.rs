@@ -697,7 +697,8 @@ impl LocalCa {
 
     /// Sign a leaf for exactly `names` (constraints not consulted: a test
     /// of what verifiers make of a leaf outside them).
-    pub fn sign_unchecked(&self, names: &Names, now: SystemTime) -> Result<Leaf, String> {
+    #[cfg(test)]
+    pub(crate) fn sign_unchecked(&self, names: &Names, now: SystemTime) -> Result<Leaf, String> {
         self.sign(names, now, Names::default(), names.clone())
     }
 

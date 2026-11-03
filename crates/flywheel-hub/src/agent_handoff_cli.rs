@@ -6,7 +6,7 @@
 use crate::commands_cli::visible_controls;
 use crate::endpoint::{Endpoint, EndpointArgs};
 use crate::script::{find_session, session_label};
-use crate::util::{fail, str_field};
+use crate::util::{fail, print_json, str_field};
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -94,14 +94,6 @@ pub(crate) struct AskReviewArgs {
     json: bool,
     #[command(flatten)]
     endpoint: EndpointArgs,
-}
-
-fn print_json(out: &mut dyn Write, value: &Value) {
-    let _ = writeln!(
-        out,
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    );
 }
 
 /// Agent-written text for a terminal: controls shown, not obeyed.

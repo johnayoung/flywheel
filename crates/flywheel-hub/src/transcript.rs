@@ -246,20 +246,6 @@ fn reply_of(format: Format, line: Line) -> Option<Reply> {
     })
 }
 
-/// The reply in a Claude Code transcript line: an `assistant` line of the
-/// main conversation (not a subagent's sidechain) with text content.
-pub fn claude_reply(value: &serde_json::Value) -> Option<Reply> {
-    reply_of(Format::Claude, agentlog::parse(Format::Claude, value, 0))
-}
-
-/// The reply in a Codex rollout line (at byte `offset` of its file, which
-/// names it: rollouts write no message ids): a `response_item` wrapping
-/// an assistant `message` (older rollouts write the item bare), its
-/// `output_text` parts.
-pub fn codex_reply(value: &serde_json::Value, offset: u64) -> Option<Reply> {
-    reply_of(Format::Codex, agentlog::parse(Format::Codex, value, offset))
-}
-
 /// A session's commands as saved under the state dir.
 #[derive(Debug, Serialize, Deserialize)]
 struct Saved {

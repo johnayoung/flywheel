@@ -527,7 +527,7 @@ fn running_hub(dir: &Path) -> Option<Running> {
     let held = match hub_holds_lock(info.pid, &dir.join(crate::remote::LOCK_FILE)) {
         Some(held) => held,
         // No `/proc` to read: the recorded process being alive.
-        None => process_alive(info.pid),
+        None => crate::daemon::process_alive(info.pid),
     };
     if !held {
         // A stale file from a hub that died.
@@ -577,15 +577,6 @@ pub fn fdinfo_has_flock(info: &str) -> bool {
         line.strip_prefix("lock:")
             .is_some_and(|rest| rest.split_whitespace().nth(1) == Some("FLOCK"))
     })
-}
-
-fn process_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 only checks that the process exists.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// `PATH` from `/proc/<pid>/environ` (Linux; same user).

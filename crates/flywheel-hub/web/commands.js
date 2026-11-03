@@ -167,9 +167,27 @@ window.FwHubCommands = function (ctx) {
     }
   }
 
+  // An open dialog ends above the toast stack only when the stack is in its
+  // way: a toast off to the side of a centred dialog leaves it where it is
+  // (it would jump as each toast came and went). Docking moves a dialog
+  // vertically only, so the side-by-side test is stable either way.
   function dockToasts() {
-    const box = toastRoot.children.length ? toastRoot.getBoundingClientRect() : null;
-    const room = box && box.height > 0 && modals.length ? Math.ceil(window.innerHeight - box.top + 12) : 0;
+    let box = null;
+    for (const t of toastRoot.children) {
+      const r = t.getBoundingClientRect();
+      if (!r.width || !r.height) continue;
+      box = box
+        ? { left: Math.min(box.left, r.left), right: Math.max(box.right, r.right), top: Math.min(box.top, r.top) }
+        : { left: r.left, right: r.right, top: r.top };
+    }
+    const inWay =
+      box &&
+      modals.some((dialog) => {
+        if (!dialog.isConnected || !dialog.open) return false;
+        const d = dialog.getBoundingClientRect();
+        return box.left < d.right && box.right > d.left;
+      });
+    const room = inWay ? Math.ceil(window.innerHeight - box.top + 12) : 0;
     document.documentElement.style.setProperty("--toast-room", `${room}px`);
     document.body.classList.toggle("toast-docked", room > 0);
   }

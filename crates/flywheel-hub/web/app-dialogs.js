@@ -351,7 +351,7 @@ function renderKinds(kinds, preferred) {
       el("span", { className: "kind-name", textContent: k.kind === "claude" ? "Claude" : k.kind === "codex" ? "Codex" : "Shell" }),
       el("span", {
         className: "kind-prog",
-        textContent: k.available ? `\u200e${k.program || k.kind}\u200e` : "not installed",
+        textContent: k.available ? k.program || k.kind : "not installed",
         title: k.available ? (k.program || "") : `${k.kind} is not on the hub's PATH`,
       }),
     ));

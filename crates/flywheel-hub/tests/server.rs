@@ -409,6 +409,46 @@ async fn pages_refuse_unreadable_query_strings_as_a_page_or_json() {
             "{path}"
         );
     }
+    // The sign-in form's body follows the same convention: a field given
+    // twice, or a body that is not a form at all.
+    for (content_type, body, message) in [
+        (
+            "application/x-www-form-urlencoded",
+            "token=a&token=b",
+            "token is given twice",
+        ),
+        ("text/plain", "token=a", "application/x-www-form-urlencoded"),
+    ] {
+        let post = |accept: &'static str| {
+            hub.http
+                .post(hub.url("/login"))
+                .header(ORIGIN, hub.origin())
+                .header(reqwest::header::CONTENT_TYPE, content_type)
+                .header(reqwest::header::ACCEPT, accept)
+                .body(body)
+                .send()
+        };
+        let json = post("application/json").await.unwrap();
+        assert!(json.status().is_client_error(), "{content_type}");
+        assert_eq!(json.headers()["cache-control"], "no-store");
+        let error: Value = json.json().await.expect("JSON error body");
+        let text = error["error"].as_str().unwrap();
+        assert!(text.contains(message), "{content_type}: {text}");
+        assert!(!text.contains("Failed to"), "{content_type}: {text}");
+        let page = post("text/html").await.unwrap();
+        assert!(page.status().is_client_error(), "{content_type}");
+        assert!(
+            page.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"),
+            "{content_type}"
+        );
+        let page = page.text().await.unwrap();
+        assert!(page.contains("<!doctype html>"), "{content_type}: {page}");
+        assert!(page.contains(message), "{content_type}: {page}");
+        assert!(!page.contains("Failed to"), "{content_type}: {page}");
+    }
     // A readable query string still works.
     let ok = hub
         .http

@@ -43,10 +43,12 @@ window.FwHubFmt = (() => {
   }
 
   // A path for a `.path-tail` element (cut from its start, so the end --
-  // the repo, the worktree's task -- stays): the LRMs keep its slashes in
-  // place under that styling's `direction: rtl`.
+  // the repo, the worktree's task -- stays). The text is the path alone:
+  // the left-to-right marks that keep its slashes in place under
+  // `direction: rtl` are the styling's generated content, so copying the
+  // path copies no invisible characters.
   function pathTail(path) {
-    return `\u200e${path || ""}\u200e`;
+    return path || "";
   }
 
   // Put `pop` (position: fixed) under `trigger`: `gap` below it, its left

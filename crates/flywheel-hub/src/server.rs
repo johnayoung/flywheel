@@ -613,28 +613,60 @@ where
     ) -> Result<Self, Response> {
         match axum::extract::Query::<T>::from_request_parts(parts, state).await {
             Ok(axum::extract::Query(value)) => Ok(Self(value)),
-            Err(rejection) => {
-                let message =
-                    bounded_message(&query_message(&rejection_message(&rejection.body_text())));
-                let mut response = if wants_json(&parts.headers) {
-                    error_response(rejection.status(), &message)
-                } else {
-                    let mut page = axum::response::Html(crate::web::notice_page(
-                        "That link is not valid",
-                        &message,
-                        "Open the hub",
-                    ))
-                    .into_response();
-                    *page.status_mut() = rejection.status();
-                    page
-                };
-                response
-                    .headers_mut()
-                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-                Err(response)
-            }
+            Err(rejection) => Err(page_refusal(
+                &parts.headers,
+                rejection.status(),
+                "That link is not valid",
+                &query_message(&rejection_message(&rejection.body_text())),
+            )),
         }
     }
+}
+
+/// `Form` for the pages (`POST /login`): a body serde cannot read (a
+/// field given twice) or one that is not a form answers like
+/// [`PageQuery`]'s, never axum's plain text.
+struct PageForm<T>(T);
+
+impl<S, T> FromRequest<S> for PageForm<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Response> {
+        let headers = request.headers().clone();
+        match axum::Form::<T>::from_request(request, state).await {
+            Ok(axum::Form(value)) => Ok(Self(value)),
+            Err(rejection) => Err(page_refusal(
+                &headers,
+                rejection.status(),
+                "That sign-in was not valid",
+                &query_message(&rejection_message(&rejection.body_text())),
+            )),
+        }
+    }
+}
+
+/// A page route's refusal: `{"error": message}` to a client that asks for
+/// JSON, a notice page (with a link back to the hub) to anything else;
+/// never cached.
+fn page_refusal(headers: &HeaderMap, status: StatusCode, heading: &str, message: &str) -> Response {
+    let message = bounded_message(message);
+    let mut response = if wants_json(headers) {
+        error_response(status, &message)
+    } else {
+        let mut page =
+            axum::response::Html(crate::web::notice_page(heading, &message, "Open the hub"))
+                .into_response();
+        *page.status_mut() = status;
+        page
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Whether a request asks for JSON rather than a page: its `Accept` names

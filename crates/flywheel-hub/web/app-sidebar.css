@@ -142,6 +142,10 @@
 }
 
 .ws-repos span { white-space: nowrap; }
+/* A long folder name stays inside the sidebar, cut at its end with an
+   ellipsis (the full path is its tooltip). */
+.ws-repos > span, .ws-repos .fw-chip { min-width: 0; max-width: 100%; }
+.ws-repos span.git, .ws-repos span.plain, .ws-repos span.missing { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ws-repos span::before { margin-right: .3em; font-size: 8px; vertical-align: 1px; }
 .ws-repos span.git::before { content: "\25CF"; color: var(--brass); }
 .ws-repos span.plain { color: var(--ink-3); }

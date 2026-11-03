@@ -324,6 +324,14 @@
   direction: rtl;
   text-align: left;
 }
+/* Every text cut from its start (direction: rtl): left-to-right marks at
+   both ends keep a path's leading slash and trailing parts in place. They
+   are generated content, so selecting and copying the path leaves them
+   out. */
+.path-tail::before, .path-tail::after, .meter.cwd::before, .meter.cwd::after,
+.import-what small::before, .import-what small::after,
+.kind-card .kind-prog::before, .kind-card .kind-prog::after,
+.fw-path::before, .fw-path::after { content: "\200e"; }
 
 .meter.cwd {
   max-width: 28vw;

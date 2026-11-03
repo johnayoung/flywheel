@@ -104,7 +104,7 @@ window.FwHubImport = function (ctx) {
           "span",
           { className: "import-what" },
           el("b", { textContent: file.name || basename(file.path) }),
-          el("small", { textContent: `\u200e${shortPath}\u200e`, title: file.path }),
+          el("small", { textContent: shortPath, title: file.path }),
           meta,
         ),
         action,

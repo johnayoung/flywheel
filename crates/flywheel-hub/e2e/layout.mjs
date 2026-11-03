@@ -288,7 +288,7 @@ try {
 
   // --- desktop 1440x900: sidebar, popovers, toasts, long paths --------------
   // A real git repo at a long path: a worktree agent and a fan-out.
-  const repo3 = path.join(tmp, "code", "an-unusually-long-repository-directory-name-for-layout");
+  const repo3 = path.join(tmp, "code", "a-really-quite-long-repository-directory-name-to-see-truncation");
   fs.mkdirSync(repo3, { recursive: true });
   const git = (...args) => execFileSync("git", ["-C", repo3, ...args], {
     stdio: "ignore",
@@ -299,7 +299,7 @@ try {
   git("add", "README");
   git("commit", "-qm", "init");
   const ws3 = await api("POST", "/api/workspaces", { name: "polish", folders: [repo3] });
-  const task = "a-deliberately-long-task-name-for-the-path";
+  const task = "another-deliberately-long-task-name-for-the-path-check";
   const agent = await api("POST", "/api/sessions", { workspace_id: ws3.id, kind: "claude", prompt: "polish", worktree: { task }, cols: 100, rows: 30 });
   await api("POST", "/api/fanouts", { workspace_id: ws3.id, prompt: "do it", candidates: [{ kind: "claude" }, { kind: "claude" }], graders: ["true"] });
   const pol = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -329,6 +329,23 @@ try {
     return { height: Math.round(innerHeight - top), bad };
   });
   check(foot.height <= 180 && foot.bad.length === 0, `desktop: sidebar footer is ${foot.height}px (at most 180), every utility whole and named (${foot.bad.join(", ")})`);
+  // A long session name never squeezes the path or the usage button to
+  // nothing: both keep a readable, clickable width.
+  const meters = await pp.evaluate(() => ["#meter-cwd", "#meter-usage", ".crumb-session"].map((sel) => {
+    const n = document.querySelector(sel);
+    return { sel, hidden: !n || n.hidden, width: n ? Math.round(n.getBoundingClientRect().width) : 0 };
+  }));
+  check(meters.every((m) => !m.hidden && m.width >= 80), `desktop: a long session name leaves the path and usage readable (${JSON.stringify(meters)})`);
+  // A long folder name in the sidebar ends in an ellipsis inside it.
+  const folder = await pp.evaluate(() => {
+    const side = document.querySelector("#sidebar").getBoundingClientRect();
+    const n = [...document.querySelectorAll(".ws-repos span.git")].find((x) => x.textContent.startsWith("a-really"));
+    if (!n) return { ok: false, why: "missing" };
+    const r = n.getBoundingClientRect();
+    const cs = getComputedStyle(n);
+    return { ok: r.right <= side.right && cs.textOverflow === "ellipsis" && n.scrollWidth > n.clientWidth, right: r.right, side: side.right };
+  });
+  check(folder.ok, `desktop: a long sidebar folder name is ellipsized inside the sidebar (${JSON.stringify(folder)})`);
   // why? and usage open under their buttons.
   const anchored = async (trigger, pop) => {
     await pp.locator(trigger).click();
@@ -356,7 +373,8 @@ try {
     const first = at(1);
     const last = at(end);
     return {
-      ok: n.scrollWidth > n.clientWidth && getComputedStyle(n).textOverflow === "ellipsis" && last.right <= box.right + 1 && last.left >= box.left && first.left < box.left,
+      // The text is the path alone (copying it copies no marks).
+      ok: !/[\u200e\u200f]/.test(n.textContent) && n.scrollWidth > n.clientWidth && getComputedStyle(n).textOverflow === "ellipsis" && last.right <= box.right + 1 && last.left >= box.left && first.left < box.left,
       text: text.data.trim().slice(-30),
     };
   }, { sel, task });
@@ -400,6 +418,24 @@ try {
   await pp.waitForTimeout(300);
   const sheet = await overBoard("#dlg-session");
   check(sheet.toasts > 0 && sheet.bad.length === 0, `desktop: a toast stays on top of a dialog opened after it, never over it (${JSON.stringify(sheet)})`);
+  // Toasts off to the side of a centred dialog leave it where it is.
+  const still = await pp.evaluate(async () => {
+    const d = document.querySelector("#dlg-session");
+    const before = d.getBoundingClientRect();
+    const root = document.querySelector("#toasts");
+    for (const n of [...root.children]) n.remove();
+    await new Promise((r) => setTimeout(r, 200));
+    const empty = d.getBoundingClientRect();
+    // The app's own toasts (app-base.js's `commands`), so they are shown
+    // the way every toast is.
+    for (let i = 0; i < 3; i++) commands.toast(`side toast ${i}`, { timeout: 0 });
+    await new Promise((r) => setTimeout(r, 300));
+    const after = d.getBoundingClientRect();
+    const sideways = [...root.children].every((t) => t.getBoundingClientRect().left >= after.right);
+    for (const n of [...root.children]) n.remove();
+    return { sideways, before: [before.top, before.bottom], empty: [empty.top, empty.bottom], after: [after.top, after.bottom] };
+  });
+  check(still.sideways && (still.after[0] === still.empty[0] && still.after[1] === still.empty[1]), `desktop: toasts beside a dialog do not move it (${JSON.stringify(still)})`);
   await pp.keyboard.press("Escape");
   await pol.close();
 

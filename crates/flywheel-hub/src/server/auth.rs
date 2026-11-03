@@ -5,8 +5,8 @@
 //! sign a browser in and out.
 
 use super::{
-    ApiResult, AppState, PageQuery, Peer, ServerOptions, WS_CLOSE_PEER_REVOKED, WS_CLOSE_ROTATED,
-    WS_CLOSE_SIGNED_OUT, blocking, error_response, header_str,
+    ApiResult, AppState, PageForm, PageQuery, Peer, ServerOptions, WS_CLOSE_PEER_REVOKED,
+    WS_CLOSE_ROTATED, WS_CLOSE_SIGNED_OUT, blocking, error_response, header_str,
 };
 use crate::auth::{
     LOGIN_CODE_TTL, bearer_value, cookie_name, cookie_value, login_cookie, logout_cookie,
@@ -16,7 +16,7 @@ use crate::hub::Hub;
 use crate::web;
 use axum::Json;
 use axum::extract::ws::CloseFrame;
-use axum::extract::{ConnectInfo, Form, FromRequestParts, Path, Request, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, Request, State};
 use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
@@ -534,7 +534,7 @@ pub(super) async fn login_form(
     State(app): State<AppState>,
     client: Client,
     headers: HeaderMap,
-    Form(param): Form<LoginParam>,
+    PageForm(param): PageForm<LoginParam>,
 ) -> Response {
     login(&app, &headers, client, param.presented())
 }

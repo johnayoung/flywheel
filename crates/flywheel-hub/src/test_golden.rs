@@ -1,6 +1,13 @@
-//! Golden files for tests: what a consumer made of the captured fixtures
-//! under `tests/fixtures`, compared byte for byte. `FW_HUB_BLESS=1`
-//! rewrites them (only when the change in output is intended).
+//! Golden files for tests: what a consumer made of the transcript fixtures
+//! under `tests/fixtures`, compared byte for byte. `claude-usage.jsonl` and
+//! `claude-tools.jsonl` are real claude 2.1.306 transcripts (`claude -p
+//! --model haiku`; the tools one trimmed to its conversation lines, and
+//! the user name in its `ls -l` output replaced); `claude-edge-cases.jsonl`
+//! is hand-written in that version's shape for what a short real run does
+//! not show (a sidechain, a `<synthetic>` reply, an image, a compaction);
+//! `codex-rollout.jsonl` is hand-written too (codex is not installed here).
+//! `FW_HUB_BLESS=1` rewrites them (only when the change in output is
+//! intended).
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +22,7 @@ pub(crate) fn fixture(name: &str) -> PathBuf {
 pub(crate) const TRANSCRIPTS: &[(&str, bool)] = &[
     ("claude-usage.jsonl", false),
     ("claude-tools.jsonl", false),
+    ("claude-edge-cases.jsonl", false),
     ("codex-rollout.jsonl", true),
 ];
 

@@ -58,8 +58,35 @@ fn line_offsets_are_where_each_line_starts() {
 }
 
 #[test]
-fn claude_lines_name_their_conversation_and_model_and_keep_sidechains_to_usage() {
+fn a_real_claude_tool_run_gives_its_tool_calls_model_and_conversation() {
     let lines = parse_file(&fixture("claude-tools.jsonl"), Format::Claude);
+    let events: Vec<&Event> = lines.iter().flat_map(|(_, l)| &l.events).collect();
+    let calls: Vec<(&str, &str)> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ToolCall { name, input, .. } => Some((name.as_str(), input.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls.iter().all(|(name, _)| *name == "Bash"), "{calls:?}");
+    assert!(calls[0].1.starts_with("command: ls -la "), "{calls:?}");
+    assert!(calls[1].1.contains("Cargo.toml"), "{calls:?}");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Model(m) if m == "claude-haiku-5-5"))
+    );
+    assert!(
+        events.iter().any(
+            |e| matches!(e, Event::Session(id) if id == "45e7bccc-889d-471a-942e-c00859549c20")
+        )
+    );
+}
+
+#[test]
+fn claude_lines_name_their_conversation_and_model_and_keep_sidechains_to_usage() {
+    let lines = parse_file(&fixture("claude-edge-cases.jsonl"), Format::Claude);
     let sessions: Vec<&String> = lines
         .iter()
         .flat_map(|(_, l)| &l.events)

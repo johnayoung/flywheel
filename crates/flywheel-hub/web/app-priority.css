@@ -16,6 +16,10 @@ button#meter-usage { max-width: 16rem; text-align: left; }
 .cmd-pill .cmd-from { display: inline-block; max-width: 9rem; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
 @media (min-width: 821px) {
   .crumb-session { flex: 0 1 auto; min-width: 8ch; }
+  /* A long session name gives way before the path and the usage button
+     go to nothing: each keeps a floor wide enough to read and to click. */
+  #meter-cwd:not(:empty) { min-width: 7rem; }
+  button#meter-usage { min-width: 6.5rem; }
   .crumbs .why-btn, .crumb-machine { flex-shrink: 0; }
 }
 /* Below a wide desktop: the pills are their icons (the label is still their

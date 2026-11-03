@@ -1490,12 +1490,6 @@ impl Hub {
         }
     }
 
-    /// Record which session a client connection is looking at (`None`:
-    /// none, or the page is hidden). Viewing a finished turn marks it seen.
-    pub fn set_viewing(&self, viewer: u64, session_id: Option<&str>) {
-        self.set_viewing_many(viewer, session_id.as_slice());
-    }
-
     /// Record every session a client connection shows (each pane of a
     /// split layout; empty: none, or the page is hidden).
     pub fn set_viewing_many(&self, viewer: u64, session_ids: &[&str]) {

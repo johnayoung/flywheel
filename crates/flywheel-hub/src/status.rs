@@ -290,10 +290,6 @@ impl StatusBoard {
         }
     }
 
-    pub fn is_tracked(&self, session_id: &str) -> bool {
-        self.entries.contains_key(session_id)
-    }
-
     /// Whether `secret` is the current spawn's secret for the session.
     pub fn authenticate(&self, session_id: &str, secret: &str) -> Option<u64> {
         let entry = self.entries.get(session_id)?;
@@ -384,7 +380,8 @@ impl StatusBoard {
 
     /// Record what a connection is looking at (`None`: nothing, or the
     /// page is hidden). Returns whether a finished turn became seen.
-    pub fn view(&mut self, viewer: u64, session_id: Option<&str>) -> bool {
+    #[cfg(test)]
+    fn view(&mut self, viewer: u64, session_id: Option<&str>) -> bool {
         !self.view_many(viewer, session_id.as_slice()).is_empty()
     }
 

@@ -138,8 +138,8 @@ pub const DOCS_VERB: &str = "docs";
 pub const HUB_VERB: &str = "hub";
 
 /// The `fw --help` text, byte-identical to the Python router's.
-pub const USAGE: &str = "usage: flywheel [--json] [--help] <verb> [args...]
-       fw [--json] [--help] <verb> [args...]
+pub const USAGE: &str = "usage: flywheel [--json] [--help] [--version] <verb> [args...]
+       fw [--json] [--help] [--version] <verb> [args...]
 
 'flywheel' and 'fw' are byte-identical entries on one implementation.
 Bare invocation opens the operator console in a TTY; '--json' (or any
@@ -282,6 +282,10 @@ pub fn route(
     };
     if first == "-h" || first == "--help" {
         let _ = out.write_all(USAGE.as_bytes());
+        return 0;
+    }
+    if first == "-V" || first == "--version" {
+        let _ = writeln!(out, "{PROG} {}", env!("CARGO_PKG_VERSION"));
         return 0;
     }
     // Top-level flags without a verb (`fw --json`, `fw --db ...`) remain
@@ -1280,6 +1284,16 @@ mod tests {
             assert!(out.contains(&format!("\n  {verb}")), "verb {verb} missing");
         }
         assert_eq!(run(&["-h"], &unbound()).0, 0);
+    }
+
+    #[test]
+    fn version_prints_the_crate_version_and_exits_zero() {
+        for flag in ["--version", "-V"] {
+            let (code, out, err) = run(&[flag], &unbound());
+            assert_eq!(code, 0, "{flag}");
+            assert_eq!(out, format!("fw {}\n", env!("CARGO_PKG_VERSION")), "{flag}");
+            assert_eq!(err, "");
+        }
     }
 
     #[test]

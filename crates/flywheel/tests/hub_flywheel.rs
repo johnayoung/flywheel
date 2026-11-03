@@ -574,6 +574,14 @@ fn dechunk(body: &str) -> String {
     out
 }
 
+/// A fresh empty HOME under the test dir, so the hub never resolves the
+/// developer's `~/.claude`, `~/.codex`, or `~/code` import root.
+fn hermetic_home(dir: &Path) -> PathBuf {
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    home
+}
+
 fn start(dir: &Path) -> Server {
     let path = format!(
         "{}:{}",
@@ -585,7 +593,9 @@ fn start(dir: &Path) -> Server {
         .arg(dir.join("state"))
         .env("PATH", path)
         .env("SHELL", "/bin/sh")
+        .env("HOME", hermetic_home(dir))
         .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"))
+        .env("CODEX_HOME", dir.join("codex-home"))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -922,6 +932,10 @@ fn no_flywheel_turns_the_panel_off() {
         ])
         .arg(dir.join("state"))
         .env("PATH", path)
+        .env("SHELL", "/bin/sh")
+        .env("HOME", hermetic_home(&dir))
+        .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"))
+        .env("CODEX_HOME", dir.join("codex-home"))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

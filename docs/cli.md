@@ -24,6 +24,7 @@ The router (`route`, `crates/flywheel/src/cli.rs`) dispatches by the first argv 
 
 - No args open the console on a TTY, or print one `--json` snapshot when stdout is not a TTY.
 - `-h` / `--help` print the verb list and exit 0.
+- `-V` / `--version` print `fw <version>` and exit 0.
 - A leading-`-` first token (`fw --json`, `fw --db ...`) is treated as a console flag and handed to the TUI.
 - Otherwise the first token is the verb and the remaining argv is forwarded verbatim to the delegated implementation.
 

@@ -46,6 +46,10 @@ pub struct WorktreePlan {
     pub path: PathBuf,
     pub branch: String,
     pub base: String,
+    /// Cut the branch at this commit (of `base`) rather than at `base`'s
+    /// tip when it is created: `base` stays what the worktree merges into.
+    #[serde(skip)]
+    pub start: Option<String>,
 }
 
 /// A directory's git state, as badges show it.
@@ -83,6 +87,11 @@ pub struct RemovalCheck {
 impl RemovalCheck {
     /// Why removing it would lose work (`None`: it would not).
     pub fn refusal(&self) -> Option<String> {
+        self.refusal_advising("commit and merge them first, or force the removal")
+    }
+
+    /// [`Self::refusal`] with `advice` on what to do about it.
+    pub fn refusal_advising(&self, advice: &str) -> Option<String> {
         let mut why = Vec::new();
         if self.dirty > 0 {
             why.push(plural(self.dirty, "uncommitted change"));
@@ -108,7 +117,7 @@ impl RemovalCheck {
                 )
             };
             format!(
-                "worktree {} has {}; commit and merge them first, or force the removal (uncommitted work is lost; {branch})",
+                "worktree {} has {}; {advice} (uncommitted work is lost; {branch})",
                 self.path.display(),
                 why.join(" and "),
             )
@@ -432,7 +441,12 @@ pub fn plan(
         }
         None => current_base(repo)?,
     };
-    Ok(WorktreePlan { path, branch, base })
+    Ok(WorktreePlan {
+        path,
+        branch,
+        base,
+        start: None,
+    })
 }
 
 /// The repo's current branch, else (detached) its HEAD commit.
@@ -471,7 +485,7 @@ pub fn create(repo: &Path, plan: &WorktreePlan) -> Result<WorktreeRef, String> {
             "-b",
             &plan.branch,
             &path,
-            &plan.base,
+            plan.start.as_deref().unwrap_or(&plan.base),
         ],
     )
     .map_err(|e| format!("git worktree add failed: {e}"))?;
@@ -704,6 +718,20 @@ pub fn remove(worktree: &WorktreeRef, force: bool) -> Result<Removed, String> {
         branch: worktree.branch.clone(),
         branch_deleted,
     })
+}
+
+/// Delete local branch `branch` of `repo` (merged or not) if it exists;
+/// whether it was deleted.
+pub fn delete_branch(repo: &Path, branch: &str) -> bool {
+    git_ok(
+        repo,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    ) && git_ok(repo, &["branch", "-D", "--", branch])
 }
 
 // --- cached badges ------------------------------------------------------------

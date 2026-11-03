@@ -635,6 +635,18 @@
   gap: .5rem;
   pointer-events: none;
 }
+/* A manual popover (shown above an open modal dialog): none of the
+   popover's own box. */
+.toasts[popover] {
+  top: auto;
+  left: auto;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  overflow: visible;
+  background: transparent;
+  color: inherit;
+}
 /* A drawer open: toasts sit above its key-hint footer, not over it. */
 @media (min-width: 761px) {
   body:has(#commands:not([hidden])) .toasts, body:has(#flywheel:not([hidden])) .toasts { bottom: 3.6rem; }

@@ -183,7 +183,10 @@ fn graded(board: &Value, label: &str, gradings: u64) -> bool {
 /// `pass` commits answer 42, `fail` commits 41, `bigpass` commits 42 plus
 /// a 30-line file, `hang` starts working and never finishes (leaving an
 /// untracked file), `fixable` commits 41 and, once a prompt asking it to
-/// fix arrives, commits 42. A turn ends with the hook report the real CLI
+/// fix arrives, commits 42; `sidebranch` commits 42 on a branch of its
+/// own, `fifo` commits 42 and leaves an untracked symlink to a FIFO,
+/// `noop` changes nothing, `skiphide` commits 41 and rewrites the tracked
+/// `check.sh` to pass behind `--skip-worktree`. A turn ends with the hook report the real CLI
 /// would send (claude `Stop`, codex `notify`); a resume does nothing.
 fn fake_agents(env: &Env) {
     let bin = env.root.join("bin");
@@ -228,6 +231,16 @@ case "$model" in
   fail) working; answer 41; finished ;;
   bigpass) working; answer 42 30; finished ;;
   hang) working; echo wip > wip.txt ;;
+  sidebranch) working; git switch -q -c "alt-$$"; answer 42; finished ;;
+  fifo)
+    working; answer 42
+    mkfifo "$FANOUT_ROOT/fifo-$$" && ln -s "$FANOUT_ROOT/fifo-$$" pipe
+    finished ;;
+  noop) working; finished ;;
+  skiphide)
+    working; answer 41
+    git update-index --skip-worktree check.sh && echo 'exit 0' > check.sh
+    finished ;;
   fixable)
     working; answer 41; finished
     while IFS= read -r line; do
@@ -476,4 +489,163 @@ fn fan_out_grades_ranks_fixes_survives_restart_and_merges_the_winner() {
     let listed: Value = serde_json::from_str(&env.ok(&["fanout", "ls", "--json"])).unwrap();
     assert!(listed["fanouts"].as_array().unwrap().is_empty());
     assert_eq!(env.git(&env.repo, &["rev-parse", "main"]), graded_head);
+}
+
+/// What the hub must not be talked into: merging a commit that was not
+/// graded, grading through files hidden from git status or a grader script
+/// changed after launch, ranking a no-op first, hanging on a FIFO, or
+/// grading a worktree it is removing.
+#[test]
+fn fan_out_lands_only_what_was_graded() {
+    let env = Env::new();
+    fake_agents(&env);
+    env.ok(&["start", "--port", "0"]);
+    let repo = env.repo.to_str().unwrap().to_owned();
+    env.ok(&["new", "demo", "--create", "--folder", &repo, "--name", "sh"]);
+    let check = env.root.join("check-answer.sh");
+    let check_grader = format!("answer={}", check.display());
+    let new = |name: &str, agents: &[&str], graders: &[&str]| -> String {
+        let mut args = vec![
+            "fanout", "new", "demo", "--name", name, "--prompt", "Answer",
+        ];
+        for a in agents {
+            args.extend(["--agent", a]);
+        }
+        for g in graders {
+            args.extend(["--grader", g]);
+        }
+        args.extend(["--timeout", "60"]);
+        env.ok(&args).trim().to_owned()
+    };
+
+    let id = new(
+        "guard",
+        &[
+            "claude:sidebranch",
+            "claude:fifo",
+            "claude:hang",
+            "claude:pass",
+        ],
+        &[&check_grader],
+    );
+    let board = env.board(&id);
+    assert!(
+        board["candidates"][0]["session"]
+            .as_str()
+            .unwrap()
+            .starts_with("c1-"),
+        "the label leads the session name: {board}"
+    );
+    let board = env.board_until(&id, "three gradings", |b| {
+        ["c1", "c2", "c4"].iter().all(|l| graded(b, l, 1))
+    });
+    // The FIFO did not hang the grading; its symlink is untracked work.
+    assert_eq!(candidate(&board, "c2")["verdict"], "pass");
+    assert_eq!(candidate(&board, "c2")["pickable"], false);
+    // c1's passing commit is on a branch of its own: its fan-out branch
+    // (what a merge lands) was never graded.
+    assert_eq!(candidate(&board, "c1")["verdict"], "pass");
+    let refused = env.fw(&["fanout", "pick", &id, "c1", "--yes"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("not its fan-out branch"), "{stderr}");
+
+    // The pinned out-of-repo grader changes: grading c4 again fails it,
+    // and picking is refused; restored, it passes and lands.
+    let original = std::fs::read_to_string(&check).unwrap();
+    std::fs::write(&check, "#!/bin/sh\nexit 0\n").unwrap();
+    env.ok(&["fanout", "grade", &id, "c4"]);
+    let board = env.board_until(&id, "c4 graded with the changed script", |b| {
+        graded(b, "c4", 2)
+    });
+    let c4 = candidate(&board, "c4");
+    assert_eq!(c4["verdict"], "fail", "{c4}");
+    assert!(
+        c4["grade"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("changed (or went) since the fan-out started"),
+        "{c4}"
+    );
+    std::fs::write(&check, original).unwrap();
+    env.ok(&["fanout", "grade", &id, "c4"]);
+    let board = env.board_until(&id, "c4 passes again", |b| {
+        graded(b, "c4", 3) && candidate(b, "c4")["verdict"] == "pass"
+    });
+    let head = candidate(&board, "c4")["grade"]["head"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    env.ok(&["fanout", "pick", &id, "c4", "--yes"]);
+    assert_eq!(env.git(&env.repo, &["rev-parse", "main"]), head);
+
+    // Removing the never-finished c3 hangs up its agent without grading it.
+    env.ok(&["fanout", "cleanup", &id, "c3", "--force", "--yes"]);
+    std::thread::sleep(Duration::from_secs(2));
+    let c3 = candidate(&env.board(&id), "c3").clone();
+    assert_eq!(c3["phase"], "removed", "{c3}");
+    assert!(c3["grade"].is_null(), "{c3}");
+    assert_eq!(c3["gradings"], 0, "{c3}");
+
+    // A grader that passes on the base cannot tell candidates apart: the
+    // no-op ranks last, is not pickable, and the board says why.
+    let id = new(
+        "noop",
+        &["claude:noop", "claude:bigpass"],
+        &["readme=test -f README.md"],
+    );
+    let board = env.board_until(&id, "both graded", |b| {
+        graded(b, "c1", 1) && graded(b, "c2", 1)
+    });
+    assert_eq!(order(&board), ["c2", "c1"]);
+    assert_eq!(candidate(&board, "c1")["verdict"], "pass");
+    assert_eq!(candidate(&board, "c1")["pickable"], false);
+    assert!(why(&board, "c1").contains("nothing to merge"), "{board}");
+    assert!(
+        board["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("pass on main unchanged"),
+        "{board}"
+    );
+    let refused = env.fw(&["fanout", "pick", &id, "c1", "--yes"]);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("changes nothing"));
+    // The list is summaries: no grader output.
+    let listed: Value = serde_json::from_str(&env.ok(&["fanout", "ls", "--json"])).unwrap();
+    assert!(
+        listed["fanouts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["summary"] == true)
+    );
+
+    // A grader script in the repo is protected; hiding an edit to it with
+    // --skip-worktree fails the grading instead of passing it.
+    std::fs::write(
+        env.repo.join("check.sh"),
+        "test \"$(cat answer.txt 2>/dev/null)\" = 42\n",
+    )
+    .unwrap();
+    env.git(&env.repo, &["add", "check.sh"]);
+    env.git(&env.repo, &["commit", "-qm", "a check"]);
+    let id = new(
+        "hidden",
+        &["claude:skiphide", "claude:pass"],
+        &["sh ./check.sh"],
+    );
+    let board = env.board_until(&id, "both graded", |b| {
+        graded(b, "c1", 1) && graded(b, "c2", 1)
+    });
+    assert_eq!(board["protect"], serde_json::json!(["check.sh"]));
+    let c1 = candidate(&board, "c1");
+    assert_eq!(c1["verdict"], "fail", "{c1}");
+    assert!(
+        c1["grade"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("hidden from git status"),
+        "{c1}"
+    );
+    assert_eq!(candidate(&board, "c2")["verdict"], "pass");
 }

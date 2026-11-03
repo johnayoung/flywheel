@@ -136,6 +136,16 @@ window.FwHubCommands = function (ctx) {
     });
     root.append(node);
     while (root.children.length > 3) root.firstElementChild.remove();
+    // A modal dialog sits in the top layer, over everything else: the
+    // toasts (a manual popover) are shown again so they rise above it.
+    if (typeof root.showPopover === "function") {
+      try {
+        if (root.matches(":popover-open")) root.hidePopover();
+        root.showPopover();
+      } catch (_) {
+        // No popover support: toasts stay in the page.
+      }
+    }
     if (timeout) setTimeout(dismiss, timeout);
     return node;
   }

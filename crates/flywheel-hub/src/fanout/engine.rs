@@ -30,8 +30,11 @@ use tokio::sync::broadcast::error::RecvError;
 /// How long a worker waits for a job (or for a pause to end) before it
 /// looks again whether the hub is still there.
 const IDLE_WAIT: Duration = Duration::from_secs(1);
-/// How long a worktree's status read is reused by the board.
+/// How long a worktree's status read is reused by one board.
 const TREE_CACHE: Duration = Duration::from_secs(2);
+/// ... and by the list of every fan-out (refetched on every change by
+/// every browser: its git reads must not scale with events).
+const LIST_TREE_CACHE: Duration = Duration::from_secs(30);
 
 /// The fan-outs of one hub (see the module doc).
 pub struct Fanouts {
@@ -65,6 +68,8 @@ struct Inner {
     again: HashSet<String>,
     /// Worktree -> its last status read, for the board.
     trees: HashMap<PathBuf, (Instant, Result<TreeState, String>)>,
+    /// Sessions a cleanup is removing: their agent's exit grades nothing.
+    retiring: HashSet<String>,
 }
 
 /// How a grading job ended.
@@ -241,7 +246,7 @@ impl Fanouts {
                         });
                     }
                     eprintln!(
-                        "fw hub: fan-out {} {}: grading again (it did not finish before the hub stopped)",
+                        "fw hub: fan-out {} {}: grading again (cut short when the last hub process stopped or handed over)",
                         fanout.name, candidate.label
                     );
                     self.inner()
@@ -331,6 +336,9 @@ impl Fanouts {
         };
         {
             let mut inner = self.inner();
+            if inner.retiring.contains(session_id) {
+                return;
+            }
             if inner.spells.get(session_id) == Some(&spell) {
                 return;
             }
@@ -349,6 +357,7 @@ impl Fanouts {
         let Some(hub) = self.hub.upgrade() else {
             return;
         };
+        let retiring = self.inner().retiring.clone();
         let ended: Vec<(String, String)> = {
             let store = hub.store();
             store
@@ -358,6 +367,7 @@ impl Fanouts {
                     f.candidates
                         .iter()
                         .filter(|c| c.grade.is_none() && c.pending.is_none() && c.cleaned.is_none())
+                        .filter(|c| !retiring.contains(&c.session_id))
                         .filter(|c| {
                             store
                                 .session(&c.session_id)
@@ -489,6 +499,30 @@ impl Fanouts {
             }
             Err(_) => Default::default(),
         };
+        // Checks git status cannot be trusted with: tracked files flagged
+        // out of its sight, protected files compared by content, and the
+        // grader scripts the fan-out pinned.
+        let mut hashed: Vec<String> = Vec::new();
+        if error.is_none() {
+            match facts::hidden_paths(&self.tools, &dir) {
+                Ok(hidden) if !hidden.is_empty() => {
+                    error = Some(super::hidden_error(&hidden));
+                }
+                Ok(_) => {}
+                Err(e) => error = Some(e),
+            }
+        }
+        if error.is_none() {
+            match facts::protected_changes(&self.tools, &dir, &since, &fanout.protect) {
+                Ok(found) => hashed = found,
+                Err(e) => error = Some(e),
+            }
+        }
+        if error.is_none()
+            && let Some(why) = super::pins_broken(&fanout.pins)
+        {
+            error = Some(why);
+        }
         let mut graders: Vec<GraderRun> = Vec::new();
         if error.is_none() {
             match &self.runner {
@@ -540,9 +574,22 @@ impl Fanouts {
                 candidate.grade.as_ref().map_or(0, |g| g.tokens),
             ),
         };
-        let tampered = tampered(&fanout.protect, &changed);
+        let mut tampered = tampered(&fanout.protect, &changed);
+        tampered.extend(hashed);
+        tampered.sort();
+        tampered.dedup();
         let passed =
             error.is_none() && tampered.is_empty() && graders.iter().all(GraderRun::passed);
+        for run in &mut graders {
+            if run.passed() {
+                // Only a failure's output is shown or pasted: a pass keeps
+                // none (state.json stays small).
+                run.stdout.clear();
+                run.stderr.clear();
+                run.stdout_truncated = false;
+                run.stderr_truncated = false;
+            }
+        }
         let state = before.ok();
         let grade = Grade {
             trigger: pending.trigger,
@@ -689,6 +736,10 @@ impl Fanouts {
         let sent = super::sent_prompt(&valid.prompt, request.commit_instruction);
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut started: Vec<SessionView> = Vec::new();
+        // A launch that fails part-way takes back everything it started:
+        // the sessions, their worktrees, and the branches cut for them
+        // (whatever an agent committed there in the meantime is not any
+        // fan-out's work).
         let undo = |started: &[SessionView]| {
             for view in started {
                 let _ = hub.remove_session_with(
@@ -698,21 +749,37 @@ impl Fanouts {
                         force: true,
                     },
                 );
+                if let Some(worktree) = &view.record.worktree
+                    && !worktree.path.exists()
+                {
+                    crate::git::delete_branch(&worktree.repo, &worktree.branch);
+                }
             }
         };
+        let (pins, protect) =
+            super::pin_graders(&valid.graders, &folder, valid.protect.clone()).map_err(invalid)?;
         for (i, (kind, launch)) in valid.candidates.iter().enumerate() {
             let label = format!("c{}", i + 1);
+            let task = task_name(&valid.name, tag, &label);
+            // The label first: a sidebar cuts long names at the end.
+            let session_name = format!(
+                "{label}-{}",
+                task.strip_suffix(&format!("-{label}")).unwrap_or(&task)
+            );
             let created = hub.create_session(CreateSession {
                 workspace_id: workspace.id.clone(),
                 repo: Some(folder.clone()),
-                name: None,
+                name: Some(session_name),
                 kind: *kind,
                 command: None,
                 cols: request.cols,
                 rows: request.rows,
                 worktree: Some(NewWorktree {
-                    task: task_name(&valid.name, tag, &label),
+                    task,
                     base: Some(base.clone()),
+                    // Cut at the commit read above, whatever the base does
+                    // meanwhile: every candidate starts from it.
+                    at: Some(base_sha.clone()),
                 }),
                 prompt: Some(sent.clone()),
                 launch: launch.clone(),
@@ -731,19 +798,6 @@ impl Fanouts {
                     "a fan-out session has no worktree".into(),
                 ));
             };
-            // Every candidate starts from the same commit: the base must not
-            // have moved between two cuts.
-            let head = facts::tree_state(&self.tools, &worktree.path)
-                .ok()
-                .and_then(|s| s.head);
-            if head.as_deref() != Some(base_sha.as_str()) {
-                undo(&started);
-                return Err(conflict(format!(
-                    "{base} moved while the worktrees were cut (it is at {}, not {}); try again",
-                    head.as_deref().unwrap_or("?"),
-                    &base_sha[..12.min(base_sha.len())]
-                )));
-            }
             candidates.push(Candidate {
                 label,
                 session_id: view.record.id.clone(),
@@ -768,7 +822,8 @@ impl Fanouts {
             commit_instruction: request.commit_instruction,
             graders: valid.graders,
             timeout_secs: valid.timeout_secs,
-            protect: valid.protect,
+            protect,
+            pins,
             created_at: Utc::now(),
             candidates,
             winner: None,
@@ -810,10 +865,10 @@ impl Fanouts {
 
     // --- views --------------------------------------------------------------
 
-    /// A worktree's status, reused for [`TREE_CACHE`].
-    fn tree(&self, dir: &Path) -> Result<TreeState, String> {
+    /// A worktree's status, reused for `max_age`.
+    fn tree(&self, dir: &Path, max_age: Duration) -> Result<TreeState, String> {
         if let Some((at, state)) = self.inner().trees.get(dir)
-            && at.elapsed() < TREE_CACHE
+            && at.elapsed() < max_age
         {
             return state.clone();
         }
@@ -825,15 +880,20 @@ impl Fanouts {
     }
 
     /// Why `grade` no longer describes the worktree (`None`: it does).
-    fn staleness(&self, candidate: &Candidate, grade: &Grade, fresh: bool) -> Option<String> {
+    /// `max_age`: how old a cached status read may be (`None`: read now).
+    fn staleness(
+        &self,
+        candidate: &Candidate,
+        grade: &Grade,
+        max_age: Option<Duration>,
+    ) -> Option<String> {
         if grade.moved {
             return Some("it changed while its graders ran".into());
         }
         let dir = &candidate.worktree.path;
-        let now = if fresh {
-            facts::tree_state(&self.tools, dir)
-        } else {
-            self.tree(dir)
+        let now = match max_age {
+            None => facts::tree_state(&self.tools, dir),
+            Some(age) => self.tree(dir, age),
         };
         match now {
             Err(e) => Some(format!("its worktree cannot be read: {e}")),
@@ -843,7 +903,8 @@ impl Fanouts {
         }
     }
 
-    /// Every fan-out, newest first.
+    /// Every fan-out, newest first, as summaries: no grader output (fetch
+    /// one board for it) and worktree reads reused for [`LIST_TREE_CACHE`].
     pub fn list(&self) -> Result<Vec<FanoutView>, HubError> {
         let hub = self.hub()?;
         let fanouts: Vec<Fanout> = hub.store().fanouts().to_vec();
@@ -851,7 +912,11 @@ impl Fanouts {
         let workspaces = hub.workspaces();
         let mut views: Vec<FanoutView> = fanouts
             .iter()
-            .map(|f| self.build(f, &sessions, &workspaces))
+            .map(|f| {
+                let mut view = self.build(f, &sessions, &workspaces, LIST_TREE_CACHE);
+                view.summarize();
+                view
+            })
             .collect();
         views.reverse();
         Ok(views)
@@ -861,7 +926,7 @@ impl Fanouts {
     pub fn view(&self, id: &str) -> Result<FanoutView, HubError> {
         let hub = self.hub()?;
         let fanout = hub.store().fanout(id)?.clone();
-        Ok(self.build(&fanout, &session_map(&hub), &hub.workspaces()))
+        Ok(self.build(&fanout, &session_map(&hub), &hub.workspaces(), TREE_CACHE))
     }
 
     fn build(
@@ -869,6 +934,7 @@ impl Fanouts {
         fanout: &Fanout,
         sessions: &HashMap<String, SessionView>,
         workspaces: &[crate::state::Workspace],
+        tree_age: Duration,
     ) -> FanoutView {
         let mut views: Vec<super::CandidateView> = fanout
             .candidates
@@ -876,7 +942,7 @@ impl Fanouts {
             .map(|c| {
                 let session = sessions.get(&c.session_id);
                 let stale = match (&c.grade, &c.pending, &c.cleaned) {
-                    (Some(grade), None, None) => self.staleness(c, grade, false),
+                    (Some(grade), None, None) => self.staleness(c, grade, Some(tree_age)),
                     _ => None,
                 };
                 let phase = phase_of(
@@ -903,7 +969,9 @@ impl Fanouts {
                 let head = if c.cleaned.is_some() {
                     None
                 } else {
-                    self.tree(&c.worktree.path).ok().and_then(|t| t.head)
+                    self.tree(&c.worktree.path, tree_age)
+                        .ok()
+                        .and_then(|t| t.head)
                 };
                 let winner = fanout.winner.as_ref().is_some_and(|w| w.label == c.label);
                 super::CandidateView {
@@ -919,11 +987,20 @@ impl Fanouts {
                     rank: 0,
                     why: Vec::new(),
                     agent: session.and_then(|s| s.agent.clone()),
-                    session_state: session.map(|s| session_state(&s.record.state).to_owned()),
+                    session_state: session.map(|s| {
+                        if s.record.state.is_running() && !s.record.runs_agent() {
+                            // Restored without its agent (a fresh shell).
+                            "shell".to_owned()
+                        } else {
+                            session_state(&s.record.state).to_owned()
+                        }
+                    }),
                     pickable: verdict == Verdict::Pass
                         && fanout.winner.is_none()
                         && session.is_some()
-                        && c.grade.as_ref().is_some_and(Grade::clean),
+                        && c.grade
+                            .as_ref()
+                            .is_some_and(|g| g.clean() && !g.no_change()),
                     grade: c.grade.clone(),
                     stale,
                     pending: c.pending.clone(),
@@ -952,6 +1029,17 @@ impl Fanouts {
             if matches!(v.phase, Phase::Working | Phase::Blocked | Phase::Waiting) {
                 counts.running += 1;
             }
+        }
+        let mut warnings = Vec::new();
+        if let Some(noop) = views.iter().find(|v| {
+            v.verdict == Verdict::Pass
+                && v.grade.as_ref().is_some_and(|g| g.clean() && g.no_change())
+        }) {
+            warnings.push(format!(
+                "the graders pass on {} unchanged ({} changes nothing and passes): they do not \
+                 tell the candidates apart",
+                fanout.base, noop.label
+            ));
         }
         let settled = views.iter().all(|v| {
             matches!(v.verdict, Verdict::Pass | Verdict::Fail)
@@ -984,6 +1072,8 @@ impl Fanouts {
             settled,
             graded_at: fanout.graded_at(),
             runner: self.runner_name(),
+            warnings,
+            summary: false,
         }
     }
 
@@ -1038,6 +1128,13 @@ impl Fanouts {
         let prompt =
             fix_prompt(grade).ok_or_else(|| conflict(format!("{label} passes: nothing to fix")))?;
         let session = hub.session(&candidate.session_id)?;
+        if session.record.state.is_running() && !session.record.runs_agent() {
+            return Err(conflict(format!(
+                "{label}'s agent did not come back after the hub restarted ({} runs a plain shell \
+                 now): relaunch the agent from its session, then ask again",
+                session.record.name
+            )));
+        }
         if !session.record.runs_agent() || !session.record.state.is_running() {
             return Err(conflict(format!(
                 "{label}'s agent ({}) is not running: relaunch it first",
@@ -1095,10 +1192,54 @@ impl Fanouts {
                     .into(),
             );
         }
-        if let Some(why) = self.staleness(candidate, grade, true) {
+        if grade.no_change() {
+            return Some(format!(
+                "it changes nothing against {}: there is nothing to merge",
+                fanout.base
+            ));
+        }
+        if let Some(why) = self.staleness(candidate, grade, None) {
             return Some(format!("{why}: re-grade it first"));
         }
+        // The merge lands the candidate's branch: it must be the commit
+        // that passed, checked out in its worktree.
+        let dir = &candidate.worktree.path;
+        let branch = &candidate.worktree.branch;
+        match facts::current_branch(&self.tools, dir) {
+            Some(on) if on == *branch => {}
+            on => {
+                return Some(format!(
+                    "its worktree is on {}, not its fan-out branch {branch}: what passed is not \
+                     what would be merged (git switch {branch} there, then re-grade)",
+                    on.as_deref().unwrap_or("a detached HEAD")
+                ));
+            }
+        }
+        let tip = facts::resolve_commit(&self.tools, dir, &format!("refs/heads/{branch}"));
+        if tip.is_none() || tip != grade.head {
+            return Some(format!(
+                "branch {branch} is at {}, not the commit that passed ({}): re-grade it first",
+                tip.as_deref().map_or("nothing", short_sha),
+                grade.head.as_deref().map_or("none", short_sha)
+            ));
+        }
+        if let Some(why) = super::pins_broken(&fanout.pins) {
+            return Some(why);
+        }
         None
+    }
+
+    /// The merge plan's refusal when it would not land exactly `head`.
+    fn merges_graded(merge: &Plan, head: Option<&str>) -> Option<String> {
+        let planned = planned_merge(merge);
+        if planned.is_some() && planned == head {
+            return None;
+        }
+        Some(format!(
+            "the merge would land {}, not the commit that passed ({}): re-grade it first",
+            planned.map_or("nothing", short_sha),
+            head.map_or("none", short_sha)
+        ))
     }
 
     fn losers(&self, hub: &Hub, fanout: &Fanout, winner: &str) -> Vec<CleanupItem> {
@@ -1132,10 +1273,13 @@ impl Fanouts {
         }
         let merge = hub.review_plan(&self.tools, &candidate.session_id, &Action::Merge)?;
         plan.needs_rebase = merge.needs_rebase;
-        plan.refusal = merge.refusal.clone().or_else(|| {
-            // The plan merges the HEAD it read: the one that passed?
-            self.pick_refusal(&fanout, &candidate)
-        });
+        let graded = candidate.grade.as_ref().and_then(|g| g.head.as_deref());
+        plan.refusal = merge
+            .refusal
+            .clone()
+            .or_else(|| self.pick_refusal(&fanout, &candidate))
+            // The plan merges the commit it read: the one that passed?
+            .or_else(|| Self::merges_graded(&merge, graded));
         plan.merge = Some(merge);
         Ok(plan)
     }
@@ -1153,6 +1297,19 @@ impl Fanouts {
             .as_ref()
             .and_then(|g| g.head.clone())
             .ok_or_else(|| conflict(format!("{label} has no commit to merge")))?;
+        // `confirm` must be a plan that merges exactly the graded commit: the
+        // run below re-plans and refuses any other fingerprint, and equal
+        // fingerprints plan the same commit.
+        let planned = hub.review_plan(&self.tools, &candidate.session_id, &Action::Merge)?;
+        if planned.fingerprint != confirm {
+            return Err(conflict(format!(
+                "{label}'s merge plan changed since it was shown: look again (fw hub fanout pick \
+                 without --yes, or reopen the dialog)"
+            )));
+        }
+        if let Some(why) = Self::merges_graded(&planned, Some(&head)) {
+            return Err(conflict(format!("cannot pick {label}: {why}")));
+        }
         let merge = hub.review_run(&self.tools, &candidate.session_id, &Action::Merge, confirm)?;
         if merge.outcome.ok {
             let winner = Winner {
@@ -1192,6 +1349,11 @@ impl Fanouts {
         if candidate.cleaned.is_some() {
             return Err(conflict(format!("{label}'s worktree was removed")));
         }
+        if candidate.pending.is_some() {
+            return Err(conflict(format!(
+                "{label} is being graded: wait for it to finish, then rebase"
+            )));
+        }
         let Some(confirm) = confirm else {
             let plan = hub.review_plan(&self.tools, &candidate.session_id, &Action::Rebase)?;
             return Ok(RebaseReport {
@@ -1204,7 +1366,11 @@ impl Fanouts {
             hub.review_run(&self.tools, &candidate.session_id, &Action::Rebase, confirm)?;
         if report.outcome.ok {
             self.inner().trees.remove(&candidate.worktree.path);
-            let _ = self.queue(&hub, id, label, Trigger::Rebase);
+            if !self.queue(&hub, id, label, Trigger::Rebase)? {
+                // A grading was queued meanwhile (a finished turn): it may
+                // read the tree from before the rebase, so grade again after.
+                self.inner().again.insert(candidate.session_id.clone());
+            }
         }
         Ok(RebaseReport {
             plan: None,
@@ -1250,22 +1416,29 @@ impl Fanouts {
             }
             return item;
         }
+        // Unique work in a candidate's worktree is that candidate's attempt:
+        // keep it, or let it go knowingly.
+        let unique = || {
+            if !candidate.worktree.path.is_dir() {
+                return None;
+            }
+            match crate::git::removal_check(&candidate.worktree) {
+                Ok(check) => {
+                    check.refusal_advising("force the removal if that attempt is not wanted")
+                }
+                Err(e) => Some(e),
+            }
+        };
         let refusal = match &session {
             Some(_) => match hub.worktree_info(&candidate.session_id) {
                 Ok(info) => info
                     .blocking
                     .first()
                     .map(|other| format!("session {other:?} also uses it"))
-                    .or(info.refusal),
+                    .or_else(|| info.refusal.and_then(|_| unique())),
                 Err(e) => Some(e.to_string()),
             },
-            None if candidate.worktree.path.is_dir() => {
-                match crate::git::removal_check(&candidate.worktree) {
-                    Ok(check) => check.refusal(),
-                    Err(e) => Some(e),
-                }
-            }
-            None => None,
+            None => unique(),
         };
         item.refusal = refusal.clone();
         if dry_run {
@@ -1274,6 +1447,8 @@ impl Fanouts {
         if refusal.is_some() && !force {
             return item;
         }
+        // Hanging up its agent must not grade a worktree being removed.
+        self.inner().retiring.insert(candidate.session_id.clone());
         let removed = match &session {
             Some(_) => hub
                 .remove_session_with(
@@ -1321,7 +1496,10 @@ impl Fanouts {
                     }
                 );
             }
-            Err(e) => item.error = Some(e.to_string()),
+            Err(e) => {
+                self.inner().retiring.remove(&candidate.session_id);
+                item.error = Some(e.to_string());
+            }
         }
         item
     }
@@ -1379,6 +1557,21 @@ impl Fanouts {
             fanout: self.view(id)?,
         })
     }
+}
+
+fn short_sha(sha: &str) -> &str {
+    &sha[..12.min(sha.len())]
+}
+
+/// The commit a review merge plan fast-forwards to (`git merge --ff-only
+/// <sha>`).
+fn planned_merge(plan: &Plan) -> Option<&str> {
+    plan.commands
+        .iter()
+        .find(|c| c.args.first().is_some_and(|a| a == "merge"))
+        .and_then(|c| c.args.last())
+        .map(String::as_str)
+        .filter(|sha| !sha.is_empty() && !sha.starts_with('-'))
 }
 
 fn session_map(hub: &Hub) -> HashMap<String, SessionView> {

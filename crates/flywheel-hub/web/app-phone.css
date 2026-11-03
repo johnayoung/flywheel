@@ -76,6 +76,8 @@
 }
 .attn-head {
   display: flex;
+  flex-wrap: wrap;
+  gap: .2rem .6rem;
   align-items: baseline;
   justify-content: space-between;
   padding: .45rem .7rem .3rem;
@@ -85,7 +87,7 @@
   letter-spacing: .06em;
   text-transform: uppercase;
 }
-.attn-count { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
+.attn-count { min-width: 0; text-align: right; font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
 .attn-list { list-style: none; margin: 0; padding: 0 0 .25rem; max-height: 40vh; overflow-y: auto; }
 .attn-row {
   display: grid;

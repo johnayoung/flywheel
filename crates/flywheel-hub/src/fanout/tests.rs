@@ -273,6 +273,99 @@ fn ranking_puts_passing_first_then_smaller_diffs_then_lower_cost() {
 }
 
 #[test]
+fn a_pass_that_changes_nothing_ranks_after_real_passes() {
+    let pass = |files, lines| {
+        let mut g = grade(
+            true,
+            lines,
+            vec![run("unit", GraderStatus::Passed, Some(0))],
+        );
+        g.diff.files = files;
+        g
+    };
+    let mut views = vec![
+        view("c1", Verdict::Pass, Phase::Graded, Some(pass(0, 0)), None),
+        view("c2", Verdict::Pass, Phase::Graded, Some(pass(1, 9)), None),
+    ];
+    rank(&mut views);
+    assert_eq!(views[0].label, "c2");
+    assert!(
+        views[0]
+            .why
+            .join(" | ")
+            .contains("ahead of c1: c1 changes nothing")
+    );
+    let why = views[1].why.join(" | ");
+    assert!(why.contains("nothing to merge"), "{why}");
+    assert!(why.contains("below c2: it changes nothing"), "{why}");
+}
+
+#[test]
+fn grader_scripts_are_pinned_or_protected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join("scripts")).unwrap();
+    std::fs::write(repo.join("scripts/check.sh"), "exit 0\n").unwrap();
+    let outside = root.join("held-out.sh");
+    std::fs::write(&outside, "exit 1\n").unwrap();
+    let graders = vec![
+        GraderSpec {
+            run: format!("sh '{}' && ./scripts/check.sh", outside.display()),
+            name: None,
+        },
+        GraderSpec {
+            run: format!("CHECK={} cargo test -p x", outside.display()),
+            name: None,
+        },
+    ];
+    let (pins, protect) = pin_graders(&graders, &repo, vec!["tests".into()]).unwrap();
+    assert_eq!(pins.len(), 1, "{pins:?}");
+    assert_eq!(pins[0].path, outside);
+    assert_eq!(protect, ["tests", "scripts/check.sh"]);
+    assert_eq!(pins_broken(&pins), None);
+    std::fs::write(&outside, "exit 0\n").unwrap();
+    let broken = pins_broken(&pins).unwrap();
+    assert!(broken.contains("held-out.sh"), "{broken}");
+    std::fs::remove_file(&outside).unwrap();
+    assert!(pins_broken(&pins).is_some());
+}
+
+#[test]
+fn summaries_carry_no_grader_output() {
+    let g = grade(false, 1, vec![run("unit", GraderStatus::Failed, Some(1))]);
+    let mut fanout = FanoutView {
+        id: "f".into(),
+        name: "f".into(),
+        workspace_id: "w".into(),
+        workspace: None,
+        repo: PathBuf::from("/r"),
+        base: "main".into(),
+        base_sha: "b".into(),
+        prompt: "p".into(),
+        sent_prompt: "p".into(),
+        graders: vec![],
+        timeout_secs: 1,
+        protect: vec![],
+        created_at: Utc::now(),
+        winner: None,
+        candidates: vec![view("c1", Verdict::Fail, Phase::Graded, Some(g), None)],
+        counts: Counts::default(),
+        leader: None,
+        settled: true,
+        graded_at: None,
+        runner: None,
+        warnings: vec![],
+        summary: false,
+    };
+    fanout.summarize();
+    assert!(fanout.summary);
+    let run = &fanout.candidates[0].grade.as_ref().unwrap().graders[0];
+    assert!(run.stdout.is_empty() && run.stderr.is_empty());
+    assert_eq!(run.status, GraderStatus::Failed);
+}
+
+#[test]
 fn verdicts_and_phases_follow_the_record() {
     let wt = WorktreeRef {
         repo: PathBuf::from("/r"),
@@ -429,6 +522,7 @@ fn state_files_from_before_fanouts_load_and_fanouts_round_trip() {
         }],
         timeout_secs: 60,
         protect: vec![],
+        pins: vec![],
         created_at: Utc::now(),
         candidates: vec![],
         winner: None,

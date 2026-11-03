@@ -70,6 +70,8 @@
   font-size: 12px;
 }
 .fo-banner.lost { border-left-color: var(--alert); color: var(--ink-2); }
+.fo-banner.warn { border-left-color: var(--brass); color: var(--ink-2); }
+.fo-banner.warn p { margin: 0; }
 
 /* --- candidate cards ---------------------------------------------------- */
 

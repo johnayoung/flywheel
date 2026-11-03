@@ -184,6 +184,11 @@ pub struct CreateSession {
 pub struct NewWorktree {
     pub task: String,
     pub base: Option<String>,
+    /// Cut it at this commit of `base` instead of `base`'s tip (set by
+    /// fan-outs, so every candidate starts at exactly one commit; not part
+    /// of the API).
+    #[serde(skip)]
+    pub at: Option<String>,
 }
 
 /// How long a new companion shell gets to draw its prompt before a paste
@@ -519,12 +524,12 @@ impl Hub {
         &self.commands
     }
 
-    /// Full-text search state.
     /// What pauses and stops fan-out gradings (see [`crate::fanout`]).
     pub fn grading(&self) -> &Arc<crate::fanout::GradingControl> {
         &self.grading
     }
 
+    /// Full-text search state.
     pub fn search_index(&self) -> &crate::search::SearchIndex {
         &self.search
     }

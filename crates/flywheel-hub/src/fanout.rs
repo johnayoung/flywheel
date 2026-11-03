@@ -3,15 +3,23 @@
 //! base commit, plus grader commands the hub runs itself -- out of band, in
 //! every candidate's worktree, once its agent reports a finished turn. The
 //! agent's report only *triggers* grading (agent claims are untrusted); the
-//! graders' exit codes are the verdict, and the agents are never shown the
-//! graders (they are not in the prompt and live in the hub's state).
+//! graders' exit codes are the verdict. The graders are held out of the
+//! prompt only: an agent runs as the same user as the hub, so it could read
+//! them from the hub's state or API, and "ask to fix" shows it the failing
+//! command. What the hub enforces is that the checks themselves stay put:
+//! protected paths are compared by content against the base, tracked files
+//! hidden from git status (skip-worktree, assume-unchanged) fail a
+//! grading, and grader scripts named by absolute path are pinned by hash
+//! at launch (a changed one fails every grading after it); a script named
+//! by a path inside the repo is protected.
 //!
 //! The board ranks candidates: every grader passing first, then the smaller
 //! diff against the base, then the lower cost, and says why. The winner
 //! lands through the review merge path (`git merge --ff-only` of its
 //! planned commit into the base in the main checkout, a rebase offered when
-//! the base moved, which re-grades) -- only while its worktree is exactly
-//! the commit that passed, clean. Losing worktrees are then removed on
+//! the base moved, which re-grades) -- only while its fan-out branch is
+//! checked out at exactly the commit that passed, clean, and that commit
+//! changes something. Losing worktrees are then removed on
 //! request (refused while they hold unique work unless forced).
 //!
 //! Graders run through a [`GraderRunner`] the embedding binary injects (the
@@ -55,7 +63,11 @@ pub const MAX_FANOUTS: usize = 50;
 /// Protected paths per fan-out.
 pub const MAX_PROTECT: usize = 32;
 /// Captured tail of each grader's stdout and of its stderr.
-pub const TAIL_BYTES: usize = 16 * 1024;
+/// Only a failing grader keeps it (a pass's output is dropped).
+pub const TAIL_BYTES: usize = 8 * 1024;
+/// A grader command's absolute-path argument up to this size is pinned by
+/// hash (a script; larger files are taken to be installed programs).
+pub const MAX_PIN_BYTES: u64 = 1024 * 1024;
 /// Gradings running at once, hub-wide (graders are usually builds).
 pub const MAX_GRADING: usize = 2;
 /// Appended to the prompt unless turned off: the merge path lands commits,
@@ -265,6 +277,12 @@ impl Grade {
         self.dirty == 0 && self.untracked == 0
     }
 
+    /// It changed no file against where it left the base: picking it
+    /// would merge nothing.
+    pub fn no_change(&self) -> bool {
+        self.diff.files == 0
+    }
+
     pub fn graders_passed(&self) -> usize {
         self.graders.iter().filter(|g| g.passed()).count()
     }
@@ -337,6 +355,14 @@ pub struct Winner {
     pub at: DateTime<Utc>,
 }
 
+/// A grader script outside the worktrees, pinned at launch: a grading only
+/// runs while it still hashes the same.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pin {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
 /// A fan-out as stored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fanout {
@@ -357,6 +383,9 @@ pub struct Fanout {
     /// Paths (relative to the repo) a candidate must leave unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub protect: Vec<String>,
+    /// Grader scripts pinned by hash (see [`pin_graders`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pins: Vec<Pin>,
     pub created_at: DateTime<Utc>,
     pub candidates: Vec<Candidate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -730,6 +759,115 @@ fn validate_protect(raw: &str) -> Result<String, String> {
     Ok(parts.join("/"))
 }
 
+/// The words of a grader command that could name a file: whitespace-split,
+/// quotes and a leading `NAME=` assignment stripped.
+fn path_words(run: &str) -> impl Iterator<Item = &str> {
+    run.split_whitespace()
+        .map(|w| w.trim_matches(|c| c == '\'' || c == '"' || c == ';' || c == '('))
+        .map(|w| match w.split_once('=') {
+            Some((name, value))
+                if !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                value
+            }
+            _ => w,
+        })
+        .filter(|w| !w.is_empty())
+}
+
+fn sha256_file(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
+/// What a fan-out's graders lean on that a candidate could change: every
+/// absolute path a command names that is a regular file of at most
+/// [`MAX_PIN_BYTES`] (a script) is pinned by its hash; every relative path
+/// (with a `/`) naming a file in `repo` joins `protect` (each worktree has
+/// its own copy, compared against the base like any protected path).
+pub fn pin_graders(
+    graders: &[GraderSpec],
+    repo: &Path,
+    mut protect: Vec<String>,
+) -> Result<(Vec<Pin>, Vec<String>), String> {
+    let mut pins: Vec<Pin> = Vec::new();
+    for grader in graders {
+        for word in path_words(&grader.run) {
+            let path = Path::new(word);
+            if path.is_absolute() {
+                let Ok(meta) = std::fs::metadata(path) else {
+                    continue;
+                };
+                if !meta.is_file() || meta.len() > MAX_PIN_BYTES {
+                    continue;
+                }
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                if pins.iter().any(|p| p.path == canonical) {
+                    continue;
+                }
+                let sha256 = sha256_file(&canonical)
+                    .ok_or_else(|| format!("grader script {word}: cannot be read"))?;
+                pins.push(Pin {
+                    path: canonical,
+                    sha256,
+                });
+            } else if word.contains('/')
+                && repo.join(path).is_file()
+                && let Ok(relative) = validate_protect(word)
+                && !protect.contains(&relative)
+                && protect.len() < MAX_PROTECT
+            {
+                protect.push(relative);
+            }
+        }
+    }
+    Ok((pins, protect))
+}
+
+/// Why the pinned grader scripts no longer are what the fan-out started
+/// with (`None`: every one hashes the same).
+pub fn pins_broken(pins: &[Pin]) -> Option<String> {
+    let changed: Vec<String> = pins
+        .iter()
+        .filter(|p| sha256_file(&p.path).as_deref() != Some(p.sha256.as_str()))
+        .map(|p| p.path.display().to_string())
+        .collect();
+    if changed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "grader script{} {} changed (or went) since the fan-out started: the check is no longer \
+         the one every candidate is held to; restore it, or start a new fan-out",
+        if changed.len() == 1 { "" } else { "s" },
+        changed.join(", ")
+    ))
+}
+
+/// The grading error for tracked files flagged out of git status's sight.
+pub fn hidden_error(hidden: &[String]) -> String {
+    let shown: Vec<&str> = hidden.iter().take(5).map(String::as_str).collect();
+    format!(
+        "{} tracked file{} hidden from git status (skip-worktree or assume-unchanged): {}{}; \
+         clear the flags (git update-index --no-skip-worktree --no-assume-unchanged <path>) \
+         and commit",
+        hidden.len(),
+        if hidden.len() == 1 { " is" } else { "s are" },
+        shown.join(", "),
+        if hidden.len() > shown.len() {
+            ", ..."
+        } else {
+            ""
+        }
+    )
+}
+
 /// The protected paths `changed` touches (a protected directory covers
 /// everything under it).
 pub fn tampered(protect: &[String], changed: &[String]) -> Vec<String> {
@@ -976,6 +1114,27 @@ pub struct FanoutView {
     pub graded_at: Option<DateTime<Utc>>,
     /// What runs the graders (`None`: this hub cannot grade).
     pub runner: Option<String>,
+    /// What the board should say of the fan-out as a whole (the graders
+    /// pass on the base unchanged, ...).
+    pub warnings: Vec<String>,
+    /// A list entry: no grader output, worktree reads up to
+    /// half a minute old (`GET /api/fanouts/{id}` has the full board).
+    pub summary: bool,
+}
+
+impl FanoutView {
+    /// Drop what only a board needs (grader output).
+    pub fn summarize(&mut self) {
+        for candidate in &mut self.candidates {
+            if let Some(grade) = &mut candidate.grade {
+                for run in &mut grade.graders {
+                    run.stdout.clear();
+                    run.stderr.clear();
+                }
+            }
+        }
+        self.summary = true;
+    }
 }
 
 /// A candidate's phase from its record and session.
@@ -1030,6 +1189,7 @@ fn money(cost: Option<f64>) -> String {
 /// and `why`.
 pub fn rank(views: &mut [CandidateView]) {
     let diff = |v: &CandidateView| v.grade.as_ref().map_or(u64::MAX, |g| g.diff.lines());
+    let noop = |v: &CandidateView| v.grade.as_ref().is_some_and(Grade::no_change);
     let passed = |v: &CandidateView| v.grade.as_ref().map_or(0, Grade::graders_passed);
     let cost = |v: &CandidateView| v.cost_usd.unwrap_or(f64::INFINITY);
     let launch = |v: &CandidateView| {
@@ -1042,8 +1202,10 @@ pub fn rank(views: &mut [CandidateView]) {
         a.verdict
             .cmp(&b.verdict)
             .then_with(|| match a.verdict {
-                Verdict::Pass => diff(a)
-                    .cmp(&diff(b))
+                // A pass that changes nothing has nothing to merge: last.
+                Verdict::Pass => noop(a)
+                    .cmp(&noop(b))
+                    .then_with(|| diff(a).cmp(&diff(b)))
                     .then_with(|| cost(a).total_cmp(&cost(b))),
                 Verdict::Fail => passed(b)
                     .cmp(&passed(a))
@@ -1059,10 +1221,15 @@ pub fn rank(views: &mut [CandidateView]) {
         let v = &views[i];
         let graders = v.grade.as_ref().map_or(0, |g| g.graders.len());
         match v.verdict {
-            Verdict::Pass => why.push(format!(
-                "passes all {graders} grader{}",
-                if graders == 1 { "" } else { "s" }
-            )),
+            Verdict::Pass => {
+                why.push(format!(
+                    "passes all {graders} grader{}",
+                    if graders == 1 { "" } else { "s" }
+                ));
+                if noop(v) {
+                    why.push("changes nothing vs base: nothing to merge".to_owned());
+                }
+            }
             Verdict::Fail => {
                 if let Some(failure) = v.grade.as_ref().and_then(Grade::failure) {
                     why.push(failure);
@@ -1137,6 +1304,14 @@ fn versus(
     passed: &dyn Fn(&CandidateView) -> usize,
 ) -> String {
     let who = &other.label;
+    let noop = |c: &CandidateView| c.grade.as_ref().is_some_and(Grade::no_change);
+    if v.verdict == Verdict::Pass && noop(v) != noop(other) {
+        return if noop(v) {
+            format!("{relation} {who}: it changes nothing")
+        } else {
+            format!("{relation} {who}: {who} changes nothing")
+        };
+    }
     if v.verdict == Verdict::Fail && passed(v) != passed(other) {
         let word = if passed(v) > passed(other) {
             "more"

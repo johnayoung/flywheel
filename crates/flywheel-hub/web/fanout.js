@@ -51,6 +51,7 @@ window.FwHubFanout = function (ctx) {
     runner: null,
     list: [],
     open: null, // id of the fan-out the board shows
+    full: null, // its full board (GET /api/fanouts/{id}); the list holds summaries
     error: "",
     busy: new Set(), // "<id>/<label>/<action>" running now
     seq: 0,
@@ -71,6 +72,8 @@ window.FwHubFanout = function (ctx) {
   }
 
   const byId = (id) => ui.list.find((f) => f.id === id) || null;
+  // The board's fan-out: its full view once fetched, else its summary.
+  const shownFanout = () => (ui.full && ui.full.id === ui.open ? ui.full : byId(ui.open));
   const short = (sha) => (sha || "").slice(0, 10);
   const money = (usd) => (usd === null || usd === undefined ? null : usd < 0.01 && usd > 0 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`);
   const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${n}`);
@@ -94,6 +97,7 @@ window.FwHubFanout = function (ctx) {
   const act = sheet("dlg-fanout-act", "narrow fo-act", "Fan-out action");
   board.addEventListener("close", () => {
     ui.open = null;
+    ui.full = null;
   });
 
   const closeButton = (what) =>
@@ -159,8 +163,23 @@ window.FwHubFanout = function (ctx) {
       const shown = byId(ui.open);
       if (shown && shown.graded_at) markSeen(shown);
       renderBoard();
+      await loadFull(ui.open);
     }
     ctx.onChange();
+  }
+
+  // The open board's full view (grader output, fresh worktree reads).
+  async function loadFull(id) {
+    if (!id || !byId(id)) return;
+    let full;
+    try {
+      full = await api("GET", `/api/fanouts/${id}`);
+    } catch (_) {
+      return;
+    }
+    if (ui.open !== id) return;
+    ui.full = full;
+    if (board.open) renderBoard();
   }
 
   let reloadTimer = null;
@@ -196,6 +215,14 @@ window.FwHubFanout = function (ctx) {
   // that have no winner yet), newest first.
   function attention() {
     return ui.list.filter((f) => !f.winner && f.graded_at && seen[f.id] !== f.graded_at);
+  }
+
+  // Sessions that are some fan-out's candidates (the hub grades their
+  // finished turns: Needs you lists the fan-out instead).
+  function candidateSessions() {
+    const ids = new Set();
+    for (const f of ui.list) for (const c of f.candidates) if (c.phase !== "removed") ids.add(c.session_id);
+    return ids;
   }
 
   function attentionRow(f) {
@@ -236,6 +263,7 @@ window.FwHubFanout = function (ctx) {
       openLaunch();
       return;
     }
+    if (ui.open !== target.id) ui.full = null;
     ui.open = target.id;
     markSeen(target);
     document.body.classList.remove("side-open");
@@ -304,6 +332,24 @@ window.FwHubFanout = function (ctx) {
     });
   }
 
+  const whenText = (at, rest) => `graded ${age(at)} ago${rest || ""}`;
+  // Ages on the board tick (without a re-render, which would fold open
+  // grader output).
+  setInterval(() => {
+    if (!board.open || document.visibilityState !== "visible") return;
+    for (const node of board.querySelectorAll(".fo-when[data-at]")) node.textContent = whenText(node.dataset.at, node.dataset.rest);
+  }, 10000);
+
+  // Why a passing candidate cannot be picked (the hub says exactly why
+  // when asked; this is the button's hint).
+  function unpickable(c) {
+    const g = c.grade;
+    if (!g) return "Not graded";
+    if (g.diff.files === 0) return "It changes nothing against the base: there is nothing to merge";
+    if (g.dirty || g.untracked) return "Graded with uncommitted changes: commit, then re-grade";
+    return "It cannot be picked now";
+  }
+
   function card(f, c) {
     const g = c.grade;
     const session = sessionById(c.session_id);
@@ -319,7 +365,10 @@ window.FwHubFanout = function (ctx) {
     }
     const cost = money(c.cost_usd);
     if (cost || c.tokens) meta.push(el("span", { className: "fo-cost", textContent: [cost || (c.tokens ? "unpriced" : null), c.tokens ? `${tokens(c.tokens)} tok` : null].filter(Boolean).join(" · ") }));
-    if (g) meta.push(el("span", { className: "fo-when", textContent: `graded ${age(g.finished_at)} ago${c.gradings > 1 ? ` · ${c.gradings}×` : ""}${c.fixes ? ` · ${c.fixes} fix${c.fixes === 1 ? "" : "es"} asked` : ""}`, title: `trigger: ${g.trigger}` }));
+    if (g) {
+      const rest = `${c.gradings > 1 ? ` · ${c.gradings}×` : ""}${c.fixes ? ` · ${c.fixes} fix${c.fixes === 1 ? "" : "es"} asked` : ""}`;
+      meta.push(el("span", { className: "fo-when", dataset: { at: g.finished_at, rest }, textContent: whenText(g.finished_at, rest), title: `trigger: ${g.trigger}` }));
+    }
 
     const actions = [];
     if (c.phase !== "removed") {
@@ -331,7 +380,7 @@ window.FwHubFanout = function (ctx) {
           actions.push(actionButton("Ask to fix", "Paste what failed into its agent; it is graded again when it finishes", () => fix(f, c), { pending: isBusy(f, c, "fix") }));
         }
         if (c.verdict === "pass") {
-          actions.push(actionButton("Pick winner", c.pickable ? `Merge ${c.branch} into ${f.base}` : "Graded with uncommitted changes: commit, then re-grade", () => pick(f, c), { tone: "", pending: isBusy(f, c, "pick"), disabled: !c.pickable }));
+          actions.push(actionButton("Pick winner", c.pickable ? `Merge ${c.branch} into ${f.base}` : unpickable(c), () => pick(f, c), { tone: "", pending: isBusy(f, c, "pick"), disabled: !c.pickable }));
         }
       }
     }
@@ -364,7 +413,7 @@ window.FwHubFanout = function (ctx) {
 
   function renderBoard() {
     if (!board.open && !ui.open) return;
-    const f = byId(ui.open);
+    const f = shownFanout();
     const switcher = ui.list.length > 1
       ? el(
         "select",
@@ -407,9 +456,13 @@ window.FwHubFanout = function (ctx) {
       { className: "fo-graders" },
       el("span", { className: "field-label", textContent: "graders" }),
       f.graders.map((g, i) => el("code", { className: "fo-grader", title: g.run, textContent: `${i + 1}. ${g.name ? `${g.name}: ` : ""}${g.run}` })),
-      el("span", { className: "fo-note", textContent: `run by the hub (${f.runner || "no runner"}) in each worktree, ${f.timeout_secs}s each; the agents never see them` }),
+      el("span", { className: "fo-note", textContent: `run by the hub (${f.runner || "no runner"}) in each worktree, ${f.timeout_secs}s each; held out of the prompt` }),
       f.protect.length ? el("span", { className: "fo-note", textContent: `protected: ${f.protect.join(", ")}` }) : null,
     );
+    const warnings = (f.warnings || []).length
+      ? el("div", { className: "fo-banner warn" }, f.warnings.map((w) => el("p", { textContent: w })))
+      : null;
+    const winner = f.winner ? f.candidates.find((c) => c.label === f.winner.label) : null;
     const banner = f.winner
       ? el(
         "div",
@@ -417,7 +470,9 @@ window.FwHubFanout = function (ctx) {
         el("span", { textContent: `${f.winner.label} merged into ${f.winner.base} at ${short(f.winner.head)} (${age(f.winner.at)} ago).` }),
         f.candidates.some((c) => !c.winner && c.phase !== "removed")
           ? actionButton("Clean up the others", "Remove the losing worktrees and their sessions", () => cleanup(f), { tone: "", pending: isBusy(f, null, "cleanup") })
-          : null,
+          : winner && winner.phase !== "removed"
+            ? actionButton(`Remove ${winner.label}'s worktree`, `It is merged into ${f.base}: remove its worktree and session`, () => cleanupWinner(f, winner), { pending: isBusy(f, null, "cleanup") })
+            : null,
       )
       : f.settled && !f.leader
         ? el("div", { className: "fo-banner lost", textContent: "Nothing passes. Ask a candidate to fix, or re-grade after changes." })
@@ -447,6 +502,7 @@ window.FwHubFanout = function (ctx) {
         { className: "fo-body" },
         ui.error ? el("p", { className: "fo-error", textContent: ui.error }) : null,
         banner,
+        warnings,
         graders,
         el("ol", { className: "fo-cards" }, f.candidates.map((c) => card(f, c))),
         prompt,
@@ -556,57 +612,81 @@ window.FwHubFanout = function (ctx) {
   }
 
   // Remove (or stop) the losers: each with a box; unique work needs force.
+  function cleanupWinner(f, winner) {
+    return busy(f, null, "cleanup", async () => {
+      const items = (await post(f, "cleanup", { candidates: [winner.label], dry_run: true })).items;
+      await cleanupItems(f, items, `${winner.label}'s merged worktree`);
+    });
+  }
+
   function cleanup(f, preview) {
     return busy(f, null, "cleanup", async () => {
       const items = preview || (await post(f, "cleanup", { dry_run: true })).items;
-      if (!items.length) {
-        toast("Nothing to clean up.");
-        return;
-      }
-      const boxes = new Map();
-      const rows = items.map((i) => {
-        const box = el("input", { type: "checkbox", checked: true });
-        boxes.set(i.candidate, box);
-        return el(
-          "li",
-          {},
-          el("label", { className: "fo-pickrow" }, box, el("b", { textContent: i.candidate }), el("span", { className: "fo-path", textContent: i.path })),
-          el("span", { className: `fo-loser-state${i.refusal ? " keep" : ""}`, textContent: i.refusal ? `holds unique work: ${i.refusal}` : "nothing unique: removable" }),
-        );
-      });
-      const unique = items.some((i) => i.refusal);
-      const force = el("input", { type: "checkbox" });
-      const go = await ask({
-        kicker: "clean up",
-        title: `The others of ${f.name}`,
-        body: [
-          el("ul", { className: "fo-losers" }, rows),
-          unique
-            ? el("label", { className: "fo-force" }, force, " remove even those holding unique work (their commits stay on their branches; uncommitted work is lost)")
-            : null,
-        ],
-        buttons: [
-          { label: "Stop sessions only", value: "stop" },
-          { label: "Remove worktrees", value: "remove", tone: "danger" },
-        ],
-      });
-      if (!go) return;
-      const candidates = items.map((i) => i.candidate).filter((label) => boxes.get(label).checked);
-      if (!candidates.length) return;
-      const report = await post(f, "cleanup", {
-        candidates,
-        remove_worktrees: go === "remove",
-        force: go === "remove" && force.checked,
-      });
-      const kept = report.items.filter((i) => !i.done);
-      await reload();
-      if (kept.length) {
-        toast(`Kept ${kept.map((i) => i.candidate).join(", ")}: ${kept.map((i) => i.error || i.refusal).filter(Boolean)[0] || "not removed"}.`, { tone: "bad", timeout: 8000 });
-      } else {
-        toast(go === "remove" ? `Removed ${candidates.length} worktree${candidates.length === 1 ? "" : "s"}.` : `Stopped ${candidates.length} session${candidates.length === 1 ? "" : "s"}.`);
-      }
-      ctx.refresh();
+      await cleanupItems(f, items, `The others of ${f.name}`);
     });
+  }
+
+  async function cleanupItems(f, items, title) {
+    if (!items.length) {
+      toast("Nothing to clean up.");
+      return;
+    }
+    const boxes = new Map();
+    const rows = items.map((i) => {
+      const box = el("input", { type: "checkbox", checked: true });
+      boxes.set(i.candidate, box);
+      return el(
+        "li",
+        {},
+        el("label", { className: "fo-pickrow" }, box, el("b", { textContent: i.candidate }), el("span", { className: "fo-path", textContent: i.path })),
+        el("span", { className: `fo-loser-state${i.refusal ? " keep" : ""}`, textContent: i.refusal ? `holds unique work: ${i.refusal}` : "nothing unique: removable" }),
+      );
+    });
+    const unique = items.some((i) => i.refusal);
+    const force = el("input", { type: "checkbox" });
+    const go = await ask({
+      kicker: "clean up",
+      title,
+      body: [
+        el("ul", { className: "fo-losers" }, rows),
+        unique
+          ? el("label", { className: "fo-force" }, force, " remove even those holding unique work (their commits stay on their branches; uncommitted work is lost)")
+          : null,
+      ],
+      buttons: [
+        { label: "Stop sessions only", value: "stop" },
+        { label: "Remove worktrees", value: "remove", tone: "danger" },
+      ],
+    });
+    if (!go) return;
+    const candidates = items.map((i) => i.candidate).filter((label) => boxes.get(label).checked);
+    if (!candidates.length) return;
+    const report = await post(f, "cleanup", {
+      candidates,
+      remove_worktrees: go === "remove",
+      force: go === "remove" && force.checked,
+    });
+    const kept = report.items.filter((i) => !i.done);
+    await reload();
+    ctx.refresh();
+    const carried = candidates.length - kept.length;
+    if (kept.length) {
+      // Said in a dialog of its own: the reasons matter, and the board
+      // is modal.
+      await ask({
+        kicker: "clean up",
+        title: `Kept ${kept.map((i) => i.candidate).join(", ")}`,
+        body: [
+          carried ? el("p", { className: "sheet-body", textContent: `${go === "remove" ? "Removed" : "Stopped"} ${carried}; these were kept:` }) : null,
+          el("ul", { className: "fo-losers" }, kept.map((i) =>
+            el("li", {}, el("b", { textContent: i.candidate }), el("span", { className: "fo-loser-state keep", textContent: i.error || i.refusal || "not removed" })))),
+          el("p", { className: "fo-note", textContent: "Clean up again with \"remove even those holding unique work\" ticked to remove them anyway." }),
+        ],
+        buttons: [],
+      });
+    } else {
+      toast(go === "remove" ? `Removed ${candidates.length} worktree${candidates.length === 1 ? "" : "s"}.` : `Stopped ${candidates.length} session${candidates.length === 1 ? "" : "s"}.`);
+    }
   }
 
   async function forget(f) {
@@ -640,8 +720,8 @@ window.FwHubFanout = function (ctx) {
     return !kinds.length || !k || k.available;
   };
 
-  function selectOf(options, value) {
-    return el("select", {}, options.map(([v, label]) => el("option", { value: v, textContent: label, selected: v === (value || "") })));
+  function selectOf(options, value, label) {
+    return el("select", { "aria-label": label }, options.map(([v, label]) => el("option", { value: v, textContent: label, selected: v === (value || "") })));
   }
 
   function candidateRow(kind, model) {
@@ -743,9 +823,9 @@ window.FwHubFanout = function (ctx) {
     } }, icon("plus"), "agent");
     const graders = el("ol", { className: "fo-grader-rows" }, graderRow("", ""));
     const addGrader = el("button", { type: "button", className: "text-btn", onclick: () => graders.append(graderRow("", "")) }, icon("plus"), "grader");
-    const mode = selectOf(CLAUDE_MODES, "");
-    const approval = selectOf(CODEX_APPROVALS, "");
-    const sandbox = selectOf(CODEX_SANDBOXES, "");
+    const mode = selectOf(CLAUDE_MODES, "", "Claude permission mode");
+    const approval = selectOf(CODEX_APPROVALS, "", "Codex approval");
+    const sandbox = selectOf(CODEX_SANDBOXES, "", "Codex sandbox");
     const timeout = el("input", { type: "number", min: 1, max: 14400, value: 900, "aria-label": "Grader timeout (seconds)" });
     const protect = el("textarea", { rows: 2, placeholder: "tests/\nscripts/check.sh", spellcheck: false });
     const commit = el("input", { type: "checkbox", checked: true });
@@ -764,7 +844,7 @@ window.FwHubFanout = function (ctx) {
       el("div", { className: "fo-two" }, field("Base branch", "every worktree starts here", base, bases), field("Name", "", name)),
       field("Prompt", "", prompt),
       group("Agents", `${MIN}-${MAX}, a model each`, cands, addCand),
-      group("Graders", "run by the hub with /bin/sh -c in each worktree; never shown to the agents. A script outside the repo cannot be edited by them.", graders, addGrader),
+      group("Graders", "run by the hub with /bin/sh -c in each worktree, held out of the prompt. A script named by absolute path is pinned (changed, it fails every grading); one inside the repo is protected.", graders, addGrader),
       el("details", { className: "fo-more" },
         el("summary", { textContent: "options: permissions, timeout, protected paths" }),
         el("div", { className: "fo-two" }, field("Claude permission mode", "", mode), field("Grader timeout", "seconds, each", timeout)),
@@ -859,6 +939,7 @@ window.FwHubFanout = function (ctx) {
     onEvent,
     attention,
     attentionRow,
+    candidateSessions,
     open,
     openLaunch,
     paletteItems,

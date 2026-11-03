@@ -144,13 +144,14 @@ impl Hub {
         // Everything else checked: only now cut the worktree (git work).
         let worktree = match &request.worktree {
             Some(new) => {
-                let plan = git::plan(
+                let mut plan = git::plan(
                     &cwd,
                     &new.task,
                     &self.options.worktree_branch_prefix,
                     new.base.as_deref(),
                 )
                 .map_err(StateError::Invalid)?;
+                plan.start = new.at.clone();
                 Some(git::create(&cwd, &plan).map_err(HubError::Internal)?)
             }
             None => None,

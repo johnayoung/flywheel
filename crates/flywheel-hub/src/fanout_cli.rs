@@ -209,8 +209,48 @@ struct CleanupArgs {
     endpoint: EndpointArgs,
 }
 
+/// Output whose reader may go away (`| head`): from then on writes are
+/// dropped, and the command ends quietly.
+struct Piped<'a> {
+    inner: &'a mut dyn Write,
+    closed: bool,
+}
+
+impl Write for Piped<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.closed {
+            return Ok(buf.len());
+        }
+        match self.inner.write(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                self.closed = true;
+                Ok(buf.len())
+            }
+            other => other,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        match self.inner.flush() {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                self.closed = true;
+                Ok(())
+            }
+            other => other,
+        }
+    }
+}
+
 /// Run `fw hub fanout`.
 pub(crate) fn main(args: &FanoutArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let mut piped = Piped {
+        inner: out,
+        closed: false,
+    };
+    let out: &mut dyn Write = &mut piped;
     let result = match &args.command {
         FanoutCommand::New(a) => new(a, out, err),
         FanoutCommand::Ls(a) => ls(a, out),
@@ -222,8 +262,10 @@ pub(crate) fn main(args: &FanoutArgs, out: &mut dyn Write, err: &mut dyn Write) 
         FanoutCommand::Cleanup(a) => cleanup(a, out, err),
         FanoutCommand::Rm(a) => rm(a, out),
     };
+    let _ = out.flush();
     match result {
         Ok(code) => code,
+        Err(_) if piped.closed => 0,
         Err(message) => fail(err, &message),
     }
 }
@@ -960,22 +1002,31 @@ fn cleanup(args: &CleanupArgs, out: &mut dyn Write, err: &mut dyn Write) -> Resu
     }
     body["dry_run"] = json!(false);
     let done = conn.blocking_call("POST", &url, Some(&body))?;
+    let (carried, kept): (Vec<Value>, Vec<Value>) =
+        list(&done, "items").iter().cloned().partition(|i| {
+            i.get("done").and_then(Value::as_bool) == Some(true) || i.get("error").is_some()
+        });
     if args.json {
         print_json(out, &done)?;
-    } else {
+    } else if !carried.is_empty() {
+        // The refused ones were listed above, reasons and all.
         writeln!(out).map_err(io)?;
-        render_cleanup(list(&done, "items"), out).map_err(io)?;
+        render_cleanup(&carried, out).map_err(io)?;
     }
-    let refused = list(&done, "items")
+    let failed = carried
         .iter()
         .any(|i| i.get("done").and_then(Value::as_bool) != Some(true));
-    if refused && !args.json {
+    if !kept.is_empty() && !args.json {
         let _ = writeln!(
             err,
-            "fw hub: some were kept (unique work); --force removes them anyway"
+            "fw hub: kept {} (work nothing else has, listed above); --force removes them anyway",
+            kept.iter()
+                .map(|i| str_field(i, "candidate"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
-    Ok(if refused { 1 } else { 0 })
+    Ok(if failed || !kept.is_empty() { 1 } else { 0 })
 }
 
 fn rm(args: &FanoutRef, out: &mut dyn Write) -> Result<i32, String> {

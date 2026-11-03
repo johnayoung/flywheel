@@ -1,23 +1,27 @@
 // flywheel hub: the attention list. Every agent that needs you, across all
 // workspaces, at the top of the sidebar (the phone's session switcher):
-// blocked ones first (longest waiting first), then finished turns this
-// browser has not looked at (newest first), then flywheel tasks that
-// failed, stranded, stopped, or wait on a gate (flywheel.js; a folder
-// with many is one row, and alerts marked seen in its panel drop out),
-// and fan-outs whose graders finished since this browser looked
-// (fanout.js). Tap one to open it (a flywheel row opens its folder's
+// blocked ones first (longest waiting first), then fan-outs whose graders
+// finished since this browser looked (fanout.js; their candidates' own
+// finished turns are not listed), then finished turns this browser has
+// not looked at (newest first), then flywheel tasks that failed,
+// stranded, stopped, or wait on a gate (flywheel.js; a folder with many
+// is one row, and alerts marked seen in its panel drop out). Tap one to open it (a flywheel row opens its folder's
 // Flywheel panel, a fan-out row its board).
 "use strict";
 
 window.FwHubAttention = function (ctx) {
   const { $, el, icon, age, state, workspaceById, agentStatus, openSession, flywheel, fanout } = ctx;
 
-  // Agents that need this browser, most urgent first.
+  // Agents that need this browser, most urgent first. A fan-out
+  // candidate's finished turn is not one: the hub grades it, and its
+  // fan-out's row says when the verdicts are in.
   function entries() {
     const out = [];
+    const graded = fanout ? fanout.candidateSessions() : new Set();
     for (const session of state.sessions) {
       const agent = agentStatus(session);
       if (!agent || (agent.status !== "blocked" && agent.status !== "done")) continue;
+      if (agent.status === "done" && graded.has(session.id)) continue;
       out.push({ session, agent });
     }
     const time = (e) => Date.parse(e.agent.since) || 0;
@@ -153,7 +157,15 @@ window.FwHubAttention = function (ctx) {
             .join(" / "),
         }),
       ),
-      el("ul", { className: "attn-list" }, list.map(row), graded.map((f) => fanout.attentionRow(f)), loop.map(flywheelRow)),
+      // Blocked agents, then fan-out verdicts, then finished turns.
+      el(
+        "ul",
+        { className: "attn-list" },
+        list.filter((e) => e.agent.status === "blocked").map(row),
+        graded.map((f) => fanout.attentionRow(f)),
+        list.filter((e) => e.agent.status !== "blocked").map(row),
+        loop.map(flywheelRow),
+      ),
     ];
   }
 

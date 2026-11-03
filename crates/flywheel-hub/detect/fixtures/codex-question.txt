@@ -1,0 +1,10 @@
+• I need one decision before continuing.
+
+  Question 1/2 (2 unanswered)
+  Which database should the service use?
+
+  › 1. Postgres  Matches production.
+    2. SQLite    Simpler for local runs.
+    3. Other     Type your own answer.
+
+  tab to add notes | enter to submit answer | ←/→ to navigate questions | esc to interrupt

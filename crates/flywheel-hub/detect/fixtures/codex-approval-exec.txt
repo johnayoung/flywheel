@@ -1,0 +1,17 @@
+› fix the failing test in parser.rs
+
+• I'll run the test suite to reproduce it.
+
+
+  Would you like to run the following command?
+
+  Reason: run the parser tests to reproduce the failure
+
+  $ cargo test -p parser
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `cargo test -p parser` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

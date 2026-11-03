@@ -67,6 +67,11 @@ enum HubCommand {
     Send(script::SendArgs),
     /// Print a session's screen text.
     Read(script::ReadArgs),
+    /// Why a session shows its status: what set it (hook, detection
+    /// manifest rule, heuristic), the rule its live screen matches now
+    /// with the evidence lines, and every rule tried. --file explains a
+    /// saved screen against this machine's manifests (no hub needed).
+    Explain(crate::detect::explain::ExplainArgs),
     /// Wait until a session is done, blocked, idle, working, or has
     /// exited. Exit code 0 met, 124 --timeout, 1 error.
     Wait(crate::wait::WaitArgs),
@@ -391,6 +396,7 @@ pub fn run_with(
         HubCommand::New(args) => script::new(&args, out, err),
         HubCommand::Send(args) => script::send(&args, out, err),
         HubCommand::Read(args) => script::read(&args, out, err),
+        HubCommand::Explain(args) => crate::detect::explain::run(&args, out, err),
         HubCommand::Wait(args) => crate::wait::wait(&args, out, err),
         HubCommand::Attach(args) => crate::attach::attach(&args, out, err),
         HubCommand::Kill(args) => script::kill(&args, out, err),

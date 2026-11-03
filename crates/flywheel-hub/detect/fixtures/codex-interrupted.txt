@@ -1,0 +1,8 @@
+• Explored
+  └ Read parser.rs
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+
+› Ask Codex to do anything
+
+  ? for shortcuts                                                                 97% context left

@@ -1,0 +1,30 @@
+  that nothing stays, that all things move,
+  and that letting go is how we love.
+
+✻ Worked for 10s · done 10:00 PM
+
+❯ Use the AskUserQuestion tool to ask me whether I prefer red or blue. Nothing else.
+
+● User declined to answer questions
+  ⎿  · Do you prefer red or blue? (Red / Blue)
+
+✻ Cogitated for 1s · done 10:00 PM
+
+❯ Use the Write tool to create notes.txt containing hello. Nothing else.
+
+● Write(notes.txt)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Create file
+ notes.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+  1 hello
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to create notes.txt?
+ ❯ 1. Yes
+   2. Yes, and switch to accept edits (auto-approve file edits and common file commands) for this
+      session (shift+tab)
+   3. No
+
+ Esc to cancel · Tab to amend
+

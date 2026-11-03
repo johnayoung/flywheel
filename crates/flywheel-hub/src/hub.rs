@@ -1,11 +1,10 @@
 //! The hub: persisted workspaces and session records plus the live PTY
 //! sessions the server owns.
 
-use crate::agent::{
-    self, AgentPrograms, ClaudeScreen, CodexActivity, SessionKind, claude_signal, codex_signal,
-    which,
-};
+use crate::agent::{self, AgentPrograms, SessionKind, claude_signal, codex_signal, which};
 use crate::auth::{LoginCodes, Logins, Token, TokenError, unix_now};
+use crate::detect::Detection;
+use crate::detect::tracker::{Look, ScreenTracker};
 use crate::git::{self, BadgeKey, BadgeSource, GitStatus, GitWatch, WorktreeRef};
 use crate::paths::ensure_private_dir;
 use crate::pty::{ExitInfo, PtySession, SessionEvent, SpawnError, SpawnSpec};
@@ -16,7 +15,9 @@ use crate::state::{
     FolderSpec, HubStore, SessionRecord, SessionState, StateError, Workspace, WorkspaceInput,
     expand_home, new_id, validate_folder, validate_name,
 };
-use crate::status::{AgentStatus, Audience, Signal, Snapshot, StatusBoard, StatusView};
+use crate::status::{
+    AgentStatus, Audience, Signal, Snapshot, StatusBoard, StatusSource, StatusView,
+};
 use crate::transcript::CommandBook;
 use crate::vscode;
 use crate::vt::{DEFAULT_SCROLLBACK_LINES, TextSource};
@@ -36,9 +37,12 @@ pub(crate) mod handoff;
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
 /// Hub-wide event broadcast depth; a subscriber further behind resyncs.
 const EVENT_DEPTH: usize = 256;
-/// How often an agent activity monitor re-checks for quiet.
+/// How often an agent screen monitor wakes with no output (a settle or
+/// stall may be due).
 const MONITOR_POLL: Duration = Duration::from_millis(100);
-/// Least time between two looks at a Claude session's screen.
+/// Least time between two looks at an agent session's screen: output
+/// marks the screen dirty, and it is read at most this often (and once
+/// more after the output stops).
 const SCREEN_LOOK: Duration = Duration::from_millis(250);
 /// Default terminal size for sessions created without one.
 pub const DEFAULT_COLS: u16 = 120;
@@ -58,7 +62,7 @@ pub struct HubOptions {
     pub agents: AgentPrograms,
     /// argv prefix that reaches `fw hub` (e.g. `[/path/to/fw, hub]`); agent
     /// hooks run it with `report ...`. `None` launches agents without
-    /// status hooks (their status stays unknown, bar the Codex heuristic).
+    /// status hooks (their status comes from the screen alone: detection manifests).
     pub report_command: Option<Vec<String>>,
     /// Claude Code's config dir (where its transcripts live), for resuming
     /// a relaunched conversation. Defaults to `$CLAUDE_CONFIG_DIR`, else
@@ -359,6 +363,8 @@ pub struct Hub {
     git: GitWatch,
     /// Serializes companion shell creation (one per agent).
     companion_lock: Mutex<()>,
+    /// Screen detection manifests (bundled + state-dir overrides).
+    detection: Arc<Detection>,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -410,6 +416,7 @@ impl Hub {
         let token = Token::load_or_create(&options.state_dir)?;
         let logins = Logins::load(&options.state_dir, unix_now());
         let (events, _) = broadcast::channel(EVENT_DEPTH);
+        let options_state_dir = options.state_dir.clone();
         Ok(Arc::new(Self {
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),
@@ -430,6 +437,7 @@ impl Hub {
             monitored: Mutex::new(HashMap::new()),
             git: GitWatch::default(),
             companion_lock: Mutex::new(()),
+            detection: Arc::new(Detection::with_overrides(&options_state_dir)),
             _serve_lock: serve_lock,
         }))
     }
@@ -1327,11 +1335,12 @@ impl Hub {
             .is_some()
     }
 
-    /// Watch an agent session's terminal for what its reports miss: Codex's
-    /// busy indicator (it has no "turn started" hook), and for Claude Code
-    /// an interrupted turn (Esc fires no hook) and the folder-trust dialog
-    /// (shown before any hook). Runs until the process exits or the PTY
-    /// is dropped.
+    /// Watch an agent session's screen for what its reports miss (see
+    /// [`crate::detect::tracker`]): Codex's turns and approval prompts,
+    /// Claude Code's interrupts (Esc fires no hook) and folder-trust
+    /// dialog (shown before any hook). The kind's detection manifest reads
+    /// the server's emulator after output, at most every [`SCREEN_LOOK`].
+    /// Runs until the process exits or the PTY is dropped.
     fn monitor_agent(
         self: &Arc<Self>,
         kind: SessionKind,
@@ -1355,33 +1364,28 @@ impl Hub {
             .name("hub-agent-monitor".into())
             .spawn(move || {
                 let id = thread_id;
-                let mut codex = CodexActivity::default();
-                let mut claude = ClaudeScreen::default();
-                // Claude: look at the screen after output, at most every
-                // SCREEN_LOOK, and while a settle is pending.
+                let mut tracker = ScreenTracker::new(kind);
                 let mut dirty = true;
                 let mut looked: Option<Instant> = None;
+                let mut last_output: Option<Instant> = Some(Instant::now());
                 let mut last_spell: Option<u64> = None;
                 loop {
-                    let mut signal = None;
                     match events.try_recv() {
-                        Ok(SessionEvent::Output(bytes)) => {
+                        Ok(SessionEvent::Output(_)) => {
                             dirty = true;
-                            if kind == SessionKind::Codex {
-                                signal = codex.feed(&bytes, Instant::now());
-                            }
+                            last_output = Some(Instant::now());
                         }
                         // A resize redraws: look again.
                         Ok(SessionEvent::Resize { .. }) => dirty = true,
                         Ok(SessionEvent::Exit(_)) | Err(broadcast::error::TryRecvError::Closed) => {
                             break;
                         }
-                        Err(broadcast::error::TryRecvError::Lagged(_)) => dirty = true,
+                        Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                            dirty = true;
+                            last_output = Some(Instant::now());
+                        }
                         Err(broadcast::error::TryRecvError::Empty) => {
                             std::thread::sleep(MONITOR_POLL);
-                            if kind == SessionKind::Codex {
-                                signal = codex.tick(Instant::now());
-                            }
                         }
                     }
                     let Some(hub) = weak.upgrade() else {
@@ -1389,31 +1393,37 @@ impl Hub {
                     };
                     let now = Instant::now();
                     let due = looked.is_none_or(|at| now.duration_since(at) >= SCREEN_LOOK);
-                    if kind == SessionKind::Claude {
-                        let raw = hub.board().raw_status(&id, generation);
-                        let Some((status, spell)) = raw else {
-                            break;
-                        };
-                        // A report started a new spell: look again even if
-                        // the screen did not change (its markers may
-                        // already be up).
-                        dirty |= last_spell != Some(spell);
-                        last_spell = Some(spell);
-                        if !((dirty || claude.pending()) && due) {
-                            continue;
-                        }
-                        let Some(pty) = pty.upgrade() else {
-                            break;
-                        };
-                        looked = Some(now);
-                        dirty = false;
-                        let screen = pty.screen_text(TextSource::Visible);
-                        signal = claude.observe(status, spell, &screen.lines, now);
+                    let Some((status, spell, reported)) = hub.board().raw_status(&id, generation)
+                    else {
+                        break;
+                    };
+                    // A report started a new spell: look again even if the
+                    // screen did not change (its markers may be up).
+                    dirty |= last_spell != Some(spell);
+                    last_spell = Some(spell);
+                    if !((dirty || tracker.pending()) && due) {
+                        continue;
                     }
-                    if let Some(signal) = signal {
-                        let detail =
-                            (signal == Signal::Dialog).then_some(agent::CLAUDE_TRUST_DETAIL);
-                        hub.apply_signal(&id, generation, signal, detail);
+                    let Some(pty) = pty.upgrade() else {
+                        break;
+                    };
+                    looked = Some(now);
+                    dirty = false;
+                    let screen = pty.screen_text(TextSource::Visible);
+                    drop(pty);
+                    let manifest = hub.detection.manifest(kind);
+                    let verdict = manifest.evaluate(&screen.lines);
+                    let decision = tracker.observe(Look {
+                        status,
+                        reported,
+                        spell,
+                        verdict: &verdict,
+                        file: manifest.file(),
+                        now,
+                        last_output,
+                    });
+                    if let Some(decision) = decision {
+                        hub.apply_screen(&id, generation, spell, decision);
                     }
                 }
                 if let Some(hub) = weak.upgrade() {
@@ -1428,19 +1438,82 @@ impl Hub {
         }
     }
 
-    /// Apply a status signal; push the change if there was one.
-    fn apply_signal(&self, id: &str, generation: u64, signal: Signal, detail: Option<&str>) {
-        let changed = self.board().apply(id, generation, signal, detail);
+    /// Apply what the screen calls for, unless a report landed since it
+    /// was read; push the change if there was one.
+    fn apply_screen(
+        &self,
+        id: &str,
+        generation: u64,
+        spell: u64,
+        decision: crate::detect::tracker::Decision,
+    ) {
+        let changed = self.board().apply_screen(
+            id,
+            generation,
+            spell,
+            decision.status,
+            decision.detail.as_deref(),
+            decision.source,
+        );
         if changed {
-            // A turn started or ended: its files may have changed.
-            let key = self.store().session(id).ok().map(badge_key);
-            if let Some(key) = key {
-                self.git.nudge(key);
-            }
-            self.emit(HubEvent::Status {
-                session_id: id.to_owned(),
-            });
+            self.status_changed(id);
         }
+    }
+
+    /// The detection manifests in force.
+    pub fn detection(&self) -> &Arc<Detection> {
+        &self.detection
+    }
+
+    /// Why session `id` shows its status: what set it, and a fresh read
+    /// of its live screen with its kind's manifest (`fw hub explain`).
+    pub fn explain(&self, id: &str) -> Result<crate::detect::explain::Explanation, HubError> {
+        let record = self.store().session(id)?.clone();
+        let screen = self
+            .live_session(id)
+            .map(|pty| pty.screen_text(TextSource::Visible).lines);
+        let mut explanation =
+            crate::detect::explain::explain_screen(&self.detection, record.kind, screen.as_deref());
+        explanation.session = Some(crate::detect::explain::SessionInfo {
+            id: record.id.clone(),
+            name: record.name.clone(),
+        });
+        if record.kind.is_agent() {
+            let board = self.board();
+            explanation.status = board.status(id, Audience::Anyone);
+            explanation.source = board.source(id).cloned();
+            explanation.source_label = explanation.source.as_ref().map(StatusSource::label);
+        }
+        Ok(explanation)
+    }
+
+    /// Apply a status signal; push the change if there was one.
+    fn apply_signal(
+        &self,
+        id: &str,
+        generation: u64,
+        signal: Signal,
+        detail: Option<&str>,
+        source: StatusSource,
+    ) {
+        let changed = self
+            .board()
+            .apply_report(id, generation, signal, detail, source);
+        if changed {
+            self.status_changed(id);
+        }
+    }
+
+    /// A session's status changed: refresh its badge, tell clients.
+    fn status_changed(&self, id: &str) {
+        // A turn started or ended: its files may have changed.
+        let key = self.store().session(id).ok().map(badge_key);
+        if let Some(key) = key {
+            self.git.nudge(key);
+        }
+        self.emit(HubEvent::Status {
+            session_id: id.to_owned(),
+        });
     }
 
     /// Handle one agent report from the report socket: authenticate it
@@ -1475,7 +1548,20 @@ impl Hub {
             _ => (None, None),
         };
         if let Some(signal) = signal {
-            self.apply_signal(&report.session, generation, signal, detail.as_deref());
+            let source = StatusSource::Hook {
+                agent: report.source.clone(),
+                event: match &report.detail {
+                    Some(qualifier) => format!("{} {qualifier}", report.event),
+                    None => report.event.clone(),
+                },
+            };
+            self.apply_signal(
+                &report.session,
+                generation,
+                signal,
+                detail.as_deref(),
+                source,
+            );
         }
         if let Some(reported) = agent::reported_conversation(kind, &payload)
             && conversation.as_deref() != Some(reported.as_str())
@@ -1840,7 +1926,10 @@ impl Hub {
     fn on_session_exit(&self, id: &str, generation: Option<u64>, exit: ExitInfo) {
         let _ = self.store().mark_exited(id, exit);
         if let Some(generation) = generation {
-            self.apply_signal(id, generation, Signal::Ended, None);
+            let source = StatusSource::Hub {
+                reason: "the agent's process exited".into(),
+            };
+            self.apply_signal(id, generation, Signal::Ended, None, source);
         }
         self.emit(HubEvent::Sessions);
     }

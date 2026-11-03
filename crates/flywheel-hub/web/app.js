@@ -327,8 +327,11 @@
     onOpen: () => {
       if (commands.isOpen()) commands.toggle();
       flywheel.close();
+      explain.close();
     },
   });
+  // The "why?" beside the status pill (explain.js).
+  const explain = window.FwHubExplain({ $, el, api });
 
   // `force` re-renders even when nothing changed. The periodic refresh
   // passes false and also holds off while a sidebar field has focus, so a
@@ -2690,6 +2693,7 @@
       pill.className = `agent-pill ${agent.status}`;
       pill.title = agent.detail || "";
     }
+    explain.render(session, agent);
 
     commands.render();
     commands.prefetch();

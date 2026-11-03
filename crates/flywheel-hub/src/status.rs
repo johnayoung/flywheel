@@ -1,6 +1,7 @@
 //! Agent status: what each agent session is doing, as reported by its
-//! hooks (Claude Code), its turn-complete notifier (Codex), or a screen
-//! heuristic -- and whether each client has seen a finished turn yet.
+//! hooks (Claude Code), its turn-complete notifier (Codex), or its screen
+//! ([`crate::detect`] manifests) -- and whether each client has seen a
+//! finished turn yet.
 //!
 //! States (herdr's model):
 //!
@@ -87,20 +88,40 @@ pub enum Signal {
     Done,
     /// The agent ended (its session closed or its process exited).
     Ended,
-    /// Screen heuristic: the agent shows it is busy.
-    Busy,
-    /// Screen heuristic: the busy indicator went quiet.
-    Quiet,
-    /// Screen heuristic: a dialog waits on a person before the agent has
-    /// reported anything (Claude's folder-trust prompt).
-    Dialog,
-    /// Screen heuristic: the turn a report said was running (or blocked)
-    /// left the screen with no report -- the user interrupted it.
-    Settled,
+}
+
+/// What set a session's status (`fw hub explain`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StatusSource {
+    /// Nothing yet.
+    #[default]
+    None,
+    /// The agent's integration: a Claude Code hook or Codex's `notify`.
+    Hook { agent: String, event: String },
+    /// A detection manifest rule read off the screen.
+    Manifest { file: String, rule: String },
+    /// A screen fallback with no rule behind it.
+    Heuristic { reason: String },
+    /// The hub itself (the process ended).
+    Hub { reason: String },
+}
+
+impl StatusSource {
+    /// `hook`, `manifest:<file>#<rule>`, `heuristic`, `hub`, or `none`.
+    pub fn label(&self) -> String {
+        match self {
+            Self::None => "none".into(),
+            Self::Hook { .. } => "hook".into(),
+            Self::Manifest { file, rule } => format!("manifest:{file}#{rule}"),
+            Self::Heuristic { .. } => "heuristic".into(),
+            Self::Hub { .. } => "hub".into(),
+        }
+    }
 }
 
 /// The status an entry holds before per-client `seen` is applied, and
-/// whether a heuristic (not a report) set it.
+/// whether the screen (not a report) set it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Raw {
     status: AgentStatus,
@@ -125,33 +146,6 @@ fn transition(raw: Raw, signal: Signal) -> Option<Raw> {
         Signal::AwaitingInput => None,
         Signal::Done => reported(AgentStatus::Done),
         Signal::Ended => reported(AgentStatus::Unknown),
-        // A heuristic never overrides a reported working or blocked.
-        Signal::Busy => match raw.status {
-            AgentStatus::Working | AgentStatus::Blocked => None,
-            _ => Some(Raw {
-                status: AgentStatus::Working,
-                heuristic: true,
-            }),
-        },
-        // Quiet only undoes what the heuristic itself claimed: the agent
-        // may be finished or waiting, and nothing says which.
-        Signal::Quiet if raw.heuristic && raw.status == AgentStatus::Working => {
-            reported(AgentStatus::Unknown)
-        }
-        Signal::Quiet => None,
-        Signal::Dialog if raw.status == AgentStatus::Unknown => Some(Raw {
-            status: AgentStatus::Blocked,
-            heuristic: true,
-        }),
-        Signal::Dialog => None,
-        // Interrupted: back at the prompt, nothing new to see.
-        Signal::Settled if matches!(raw.status, AgentStatus::Working | AgentStatus::Blocked) => {
-            Some(Raw {
-                status: AgentStatus::Idle,
-                heuristic: true,
-            })
-        }
-        Signal::Settled => None,
     };
     next.filter(|n| *n != raw)
 }
@@ -196,6 +190,8 @@ struct Entry {
     key: SpawnKey,
     /// Status changes so far (tells one spell of a status from the next).
     changes: u64,
+    /// What set the current status.
+    source: StatusSource,
 }
 
 impl Entry {
@@ -281,6 +277,7 @@ impl StatusBoard {
                 seen_by: HashSet::new(),
                 key: key.clone(),
                 changes: 0,
+                source: StatusSource::None,
             },
         );
         Ok(key)
@@ -304,14 +301,28 @@ impl StatusBoard {
             .then_some(entry.key.generation)
     }
 
-    /// Apply `signal` from spawn `generation` of a session. Returns whether
-    /// anything changed. Signals from a replaced spawn are ignored.
-    pub fn apply(
+    /// [`StatusBoard::apply_report`] with no source (tests).
+    #[cfg(test)]
+    pub(crate) fn apply(
         &mut self,
         session_id: &str,
         generation: u64,
         signal: Signal,
         detail: Option<&str>,
+    ) -> bool {
+        self.apply_report(session_id, generation, signal, detail, StatusSource::None)
+    }
+
+    /// Apply `signal` from spawn `generation` of a session, as set by
+    /// `source`. Returns whether anything changed. Signals from a replaced
+    /// spawn are ignored.
+    pub fn apply_report(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        signal: Signal,
+        detail: Option<&str>,
+        source: StatusSource,
     ) -> bool {
         let Some(entry) = self.entries.get_mut(session_id) else {
             return false;
@@ -325,6 +336,7 @@ impl StatusBoard {
         entry.raw = next;
         entry.changes += 1;
         entry.since = Utc::now();
+        entry.source = source;
         entry.detail = match next.status {
             AgentStatus::Blocked => detail.map(bounded_detail),
             _ => None,
@@ -340,6 +352,48 @@ impl StatusBoard {
                 .collect();
         }
         true
+    }
+
+    /// Set the status the screen calls for -- only while the status is
+    /// still spell `spell` of spawn `generation` (a report that landed
+    /// since the screen was read wins). The screen never sets `done`.
+    /// Returns whether anything changed.
+    pub fn apply_screen(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        spell: u64,
+        status: AgentStatus,
+        detail: Option<&str>,
+        source: StatusSource,
+    ) -> bool {
+        let Some(entry) = self.entries.get_mut(session_id) else {
+            return false;
+        };
+        if entry.key.generation != generation
+            || entry.changes != spell
+            || entry.raw.status == status
+            || status == AgentStatus::Done
+        {
+            return false;
+        }
+        entry.raw = Raw {
+            status,
+            heuristic: true,
+        };
+        entry.changes += 1;
+        entry.since = Utc::now();
+        entry.source = source;
+        entry.detail = match status {
+            AgentStatus::Blocked => detail.map(bounded_detail),
+            _ => None,
+        };
+        true
+    }
+
+    /// What set a session's current status.
+    pub fn source(&self, session_id: &str) -> Option<&StatusSource> {
+        self.entries.get(session_id).map(|e| &e.source)
     }
 
     /// Register a client connection; returns its viewer id.
@@ -419,13 +473,18 @@ impl StatusBoard {
             .collect()
     }
 
-    /// Spawn `generation`'s status before seen tracking, and how many
-    /// times it changed (`None` once the session or spawn is gone).
-    pub fn raw_status(&self, session_id: &str, generation: u64) -> Option<(AgentStatus, u64)> {
+    /// Spawn `generation`'s status before seen tracking, how many times
+    /// it changed, and whether a report (not the screen) set it (`None`
+    /// once the session or spawn is gone).
+    pub fn raw_status(
+        &self,
+        session_id: &str,
+        generation: u64,
+    ) -> Option<(AgentStatus, u64, bool)> {
         self.entries
             .get(session_id)
             .filter(|e| e.key.generation == generation)
-            .map(|e| (e.raw.status, e.changes))
+            .map(|e| (e.raw.status, e.changes, !e.raw.heuristic))
     }
 
     /// The facts a push notification about `session_id` is decided on.
@@ -550,58 +609,44 @@ mod tests {
     }
 
     #[test]
-    fn heuristics_never_override_reports_and_quiet_only_undoes_busy() {
+    fn the_screen_sets_status_only_on_the_spell_it_read() {
         let (mut board, g) = board_with("s", "w");
-        assert!(board.apply("s", g, Signal::Busy, None));
-        assert_eq!(status(&board, "s", "a"), AgentStatus::Working);
-        assert!(board.apply("s", g, Signal::Quiet, None));
-        assert_eq!(status(&board, "s", "a"), AgentStatus::Unknown);
-
-        // Busy then a real report: Quiet no longer applies.
-        board.apply("s", g, Signal::Busy, None);
-        board.apply("s", g, Signal::Done, None);
-        assert!(!board.apply("s", g, Signal::Quiet, None));
-        assert_eq!(status(&board, "s", "a"), AgentStatus::Done);
-        // Busy after done: the next turn started.
-        assert!(board.apply("s", g, Signal::Busy, None));
-        // A reported working stays put through quiet.
-        board.apply("s", g, Signal::Working, None);
-        assert!(!board.apply("s", g, Signal::Quiet, None));
-        board.apply("s", g, Signal::Blocked, None);
-        assert!(!board.apply("s", g, Signal::Busy, None));
-        assert_eq!(status(&board, "s", "a"), AgentStatus::Blocked);
-    }
-
-    #[test]
-    fn settled_ends_an_interrupted_turn_and_dialog_blocks_only_before_reports() {
-        let (mut board, g) = board_with("s", "w");
-        assert_eq!(board.raw_status("s", g), Some((AgentStatus::Unknown, 0)));
+        let rule = || StatusSource::Manifest {
+            file: "codex.toml".into(),
+            rule: "approval".into(),
+        };
+        assert_eq!(
+            board.raw_status("s", g),
+            Some((AgentStatus::Unknown, 0, true))
+        );
         assert_eq!(board.raw_status("s", g + 1), None);
-        // Nothing to settle before a turn.
-        assert!(!board.apply("s", g, Signal::Settled, None));
-        // The trust dialog before any report.
-        assert!(board.apply("s", g, Signal::Dialog, Some("trust?")));
-        assert_eq!(status(&board, "s", "a"), AgentStatus::Blocked);
-        assert!(board.apply("s", g, Signal::Ready, None));
-        assert!(!board.apply("s", g, Signal::Dialog, None));
-        assert_eq!(status(&board, "s", "a"), AgentStatus::Idle);
-
-        board.apply("s", g, Signal::Working, None);
-        let (_, spell) = board.raw_status("s", g).unwrap();
-        assert!(board.apply("s", g, Signal::Settled, None));
-        assert_eq!(status(&board, "s", "a"), AgentStatus::Idle);
-        assert!(board.raw_status("s", g).unwrap().1 > spell);
-        // A late idle_prompt for the interrupted turn is not a question.
-        assert!(!board.apply("s", g, Signal::AwaitingInput, None));
-        assert_eq!(status(&board, "s", "a"), AgentStatus::Idle);
-        // An interrupted permission prompt settles too; a finished turn
-        // does not.
-        board.apply("s", g, Signal::Blocked, Some("permission to use Bash"));
-        assert!(board.apply("s", g, Signal::Settled, None));
+        // A stale spell or spawn, the same status, or done: refused.
+        assert!(!board.apply_screen("s", g, 1, AgentStatus::Blocked, None, rule()));
+        assert!(!board.apply_screen("s", g + 1, 0, AgentStatus::Blocked, None, rule()));
+        assert!(!board.apply_screen("s", g, 0, AgentStatus::Unknown, None, rule()));
+        assert!(!board.apply_screen("s", g, 0, AgentStatus::Done, None, rule()));
+        assert!(board.apply_screen("s", g, 0, AgentStatus::Blocked, Some("run  ls?"), rule()));
+        assert_eq!(
+            board.raw_status("s", g),
+            Some((AgentStatus::Blocked, 1, false))
+        );
+        let view = board.status("s", Audience::Anyone).unwrap();
+        assert_eq!(view.detail.as_deref(), Some("run ls?"));
+        assert_eq!(
+            board.source("s").unwrap().label(),
+            "manifest:codex.toml#approval"
+        );
+        // A report wins over a look taken before it.
+        let hook = StatusSource::Hook {
+            agent: "codex".into(),
+            event: "notify".into(),
+        };
+        assert!(board.apply_report("s", g, Signal::Done, None, hook.clone()));
+        assert!(!board.apply_screen("s", g, 1, AgentStatus::Idle, None, rule()));
+        assert_eq!(board.source("s"), Some(&hook));
+        assert_eq!(board.raw_status("s", g), Some((AgentStatus::Done, 2, true)));
+        assert!(board.apply_screen("s", g, 2, AgentStatus::Working, None, rule()));
         assert_eq!(board.status("s", Audience::Anyone).unwrap().detail, None);
-        board.apply("s", g, Signal::Done, None);
-        assert!(!board.apply("s", g, Signal::Settled, None));
-        assert_eq!(status(&board, "s", "a"), AgentStatus::Done);
     }
 
     #[test]

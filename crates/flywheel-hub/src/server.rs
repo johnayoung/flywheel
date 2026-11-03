@@ -53,6 +53,7 @@
 //! * Rotating the token closes it with code 4001 too, a login ending 4002.
 
 mod commands_api;
+mod detect_api;
 mod flywheel_api;
 mod import_api;
 mod listen;
@@ -193,6 +194,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         // The route's first name, kept for older clients.
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))
+        .route("/api/sessions/{id}/explain", get(detect_api::explain))
         .route("/api/sessions/{id}/input", post(session_input))
         .route(
             "/api/sessions/{id}/commands",

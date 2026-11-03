@@ -885,6 +885,7 @@ dependencies = [
  "portable-pty",
  "qrcode",
  "ratatui",
+ "regex",
  "reqwest",
  "rqrr",
  "rustls",

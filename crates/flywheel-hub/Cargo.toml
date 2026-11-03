@@ -49,6 +49,8 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 url = "2"
 percent-encoding = "2"
 toml.workspace = true
+# Detection manifests (`detect.rs`): linear-time, size-capped screen rules.
+regex.workspace = true
 # `fw hub attach` (terminal client) and `fw hub wait`: the hub's WebSocket
 # API as a client (TLS for a remote https hub via tokio-rustls on ring),
 # and the session picker UI.

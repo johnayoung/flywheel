@@ -33,6 +33,8 @@ fw hub ls [--json]                                         # workspaces > sessio
 fw hub new WS [--kind shell|claude|codex] [--folder PATH|LABEL] [--name N] [--create] [--worktree TASK [--base REF]] [--json] [-- ARGV...]   # prints the id; a taken --name is refused (--repo = --folder)
 fw hub send SESSION TEXT|- [--enter] [--raw]               # pasted: newlines -> CR, bracketed when the program enabled it
 fw hub read SESSION [--source visible|recent] [--lines N] [--json]
+fw hub explain SESSION [--json]                            # why its status: hook | manifest:<file>#<rule> | heuristic, + screen rule, evidence rows, rules tried
+fw hub explain --file SCREEN.txt --kind claude|codex|shell [--json]   # a saved screen (`read > f`, `-` = stdin) vs this machine's manifests; no hub
 fw hub wait SESSION --until done|blocked|idle|working|exit [--timeout SECS] [--changed]   # exit 0 met, 124 timeout, 1 error
 fw hub attach [SESSION] [--prefix C-b] [--no-status]      # this terminal on a session (picker without SESSION); see Terminal client
 fw hub kill SESSION [--rm [--remove-worktree [--force]]]   # hang up (record kept, as exited); --rm also forgets it; see Worktrees
@@ -221,19 +223,46 @@ Each workspace has a **layout**: named tabs, each a tree of splits (side by side
 
 | Status | Meaning | Claude Code | Codex |
 |---|---|---|---|
-| `working` | busy | `UserPromptSubmit`, `PreToolUse`, `PostToolUse[Failure]` | its busy line ("esc to interrupt") is drawn |
-| `blocked` | waits on a person | `PermissionRequest` (detail: the question, for `AskUserQuestion`); `Notification` `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input`; `idle_prompt` while working; the folder-trust dialog on screen before any hook | -- (approval prompts are not detected) |
+| `working` | busy | `UserPromptSubmit`, `PreToolUse`, `PostToolUse[Failure]` | screen: its status line (`Working (12s • esc to interrupt)`) |
+| `blocked` | waits on a person | `PermissionRequest` (detail: the question, for `AskUserQuestion`); `Notification` `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input`; `idle_prompt` while working; screen: the folder-trust dialog before any hook, a known dialog 3 s with no hook | screen: exec / edit / permission / network approvals, `request_user_input` questions, folder trust, legacy `Allow command?` (detail: the dialog's question) |
 | `done` | finished a turn **this client** has not viewed | `Stop`, `StopFailure` | `notify` `agent-turn-complete` |
-| `idle` | finished and seen, or waiting for a first prompt | `SessionStart`; `done` once viewed; an interrupted turn (below) | `done` once viewed |
-| `unknown` | no signal yet, agent ended, or Codex's busy line went quiet 5 s with no turn-complete | `SessionEnd`, exit | exit |
+| `idle` | finished and seen, or waiting for a first prompt | `SessionStart`; `done` once viewed; an interrupted turn (below) | `done` once viewed; screen: the composer (`›`) |
+| `unknown` | no signal yet, agent ended | `SessionEnd`, exit | exit; a screen-driven turn whose status line froze 5 s, or whose screen matches no rule for 3 s |
 
-- **Interrupts** (Esc) fire no Claude hook. The hub watches the session's screen: once a `working`/`blocked` spell has drawn Claude's `esc to interrupt` footer or a dialog's `Esc to cancel`, and both are then gone for 3 s with no hook, the turn reads as interrupted (`idle`). A permission dialog that closes onto the busy footer was approved: `working` again (its `PostToolUse` only comes when the tool finishes). A spell whose footer never showed (a narrow terminal cuts it) is left alone; viewing the transcript (`ctrl+o`) mid-turn for 3 s reads as idle until the next hook.
+- **Interrupts** (Esc) fire no Claude hook. Once a reported `working`/`blocked` spell has shown a running turn or a dialog on screen, and then shows the prompt (or nothing the rules know) for 3 s with no hook, the turn reads as interrupted (`idle`). A reported `blocked` whose dialog closes onto a running turn was approved: `working` again (its `PostToolUse` only comes when the tool finishes). A spell that never showed a turn (a narrow terminal cuts the footer) is left alone; the transcript viewer (`ctrl+o`) holds the status.
+- **Precedence**: hook / `notify` reports win; a report landing while the screen is being read wins over that read. The screen fills only what reports miss (rows above). Shells have no status.
+- **Idle is not authorization.** It means the screen shows no running turn and no prompt the rules know -- never that anything was approved or is safe to approve. A prompt the rules do not know reads as idle or unknown, never blocked.
 - **Seen is per client** (a browser keeps an id in local storage): viewing a session (attached, page visible and focused) turns its `done` into `idle` for that client only; a turn that finishes while a client watches is `idle` for it at once. The REST API counts a turn seen once any client viewed it.
 - **Rollup**: a workspace shows its most urgent session: blocked > working > done > idle.
 - **Claude**: the hub assigns `--session-id <uuid>` (stored as `agent_session_id`; follows `/clear`) and injects hooks with `--settings '<json>'` (merged with your own settings; `args` form, no shell) that run `<this binary> hub report ...`. Relaunching resumes the conversation (`--resume <id>`) once Claude has a transcript for it (`$CLAUDE_CONFIG_DIR` or `~/.claude`, `projects/*/<id>.jsonl`).
 - **Codex**: launched with `-c notify=["<this binary>","hub","report","--source","codex","--event","notify"]`; its `thread-id` becomes `agent_session_id`.
 - **Channel**: hooks report over `<state-dir>/report.sock` (unix socket, 0600, never on the network whatever `--bind` says; a state dir too long for a socket path uses `$TMPDIR/flywheel-hub-<uid>/<digest>.sock`, dir 0700) with a per-spawn random secret that authorizes status for that one session only. Reports are advisory UI state: they cannot start, stop, or change a session.
 - **Not a sandbox**: the hub's token is never handed to agents (argv or env), but agents run as your user and can read `<state-dir>/token` like any of your files. Run untrusted agents under another user or in a container.
+
+## Detection manifests
+
+Per-kind TOML screen rules (herdr's model), read against the **live bottom** of the server's emulator screen (never a client's scrolled view). Bundled: `crates/flywheel-hub/detect/{claude,codex,shell}.toml` (embedded). Override: `<state-dir>/agent-detection/<kind>.toml` replaces that kind's file wholesale; validated at load, re-read within 1 s of a change (no restart); an invalid file is logged and listed by `explain` / the UI, and the bundled one stays in force.
+
+```toml
+kind = "codex"            # must match the file name
+version = 2               # yours; shown by explain
+[[rule]]                  # tried in order; the first whose every condition holds wins
+id = "approval"           # [a-z0-9_-]
+state = "blocked"         # working | blocked | idle | hold (keep the status, e.g. a transcript viewer)
+detail = "asks for approval"                        # blocked only
+detail_line = '(?i)^\s*(would you like to .+\?)$'   # blocked only: capture 1 of the first matching line wins over detail
+[[rule.when]]             # all clauses must hold (or put the keys on the rule itself: one clause)
+lines = 1                 # the last N non-empty rows (1-100, default 30)
+line = ['(?i)^\s*press enter to confirm or esc to cancel\s*$']   # each regex matches some row
+[[rule.when]]
+lines = 24
+any = ["would you like to run the following command?"]   # also: all, none (substrings, case-insensitive, one row), not_line (regex)
+```
+
+- **Strict blocked**: bundled `blocked` rules pin a dialog's footer to the last row plus its question/options; quoted dialog text in an answer or prompt does not match. Write overrides the same way.
+- **Cost**: read only after output (at most every 250 ms, once more when it stops) and while a settle is pending, by one thread per agent session; patterns compiled once per load (`regex`: linear time, 256 KiB program cap); a rule reads at most 100 rows of 512 chars; at most 64 rules, 8 clauses each, 16 patterns per list, 400 chars each, 64 KiB per file.
+- **Claude** rules are from Claude Code 2.1.306 screens (fixtures in `detect/fixtures/`); **Codex** rules from the codex TUI's own strings and snapshot tests (`codex-rs/tui`). **Shell** rules (password / `[y/N]` / prompt on the last row) only answer `explain`.
+- **Explain**: `fw hub explain S` (`GET /api/sessions/{id}/explain`, the UI's `why?` beside the status pill) gives the status, what set it (`source`: `hook` + agent event, `manifest` + file + rule, `heuristic` + reason, `hub` (process exit)), a fresh read of the screen (rule, detail, evidence rows), every rule with why it did not match, the manifest's origin and version, and override problems.
 
 ## Suggested commands
 
@@ -305,6 +334,7 @@ All under `/api`, JSON, token required. Errors are `{"error":"..."}` (unknown en
 | POST | `/sessions/{id}/kill` | 202: SIGHUP the session (SIGKILL after 3s); record kept. 409 when nothing is left to kill |
 | POST | `/sessions/{id}/relaunch` | relaunch an ended (`exited`/`stopped`) session in place: same id, name, command, folder; fresh PTY + scrollback. Body `{"cols"?,"rows"?}`. 409 while it runs. `/restart` is its old name |
 | GET | `/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered plain text (below) |
+| GET | `/sessions/{id}/explain` | `{"session","kind","status"\|null,"source":{"kind":"hook\|manifest\|heuristic\|hub\|none",...},"source_label","screen":{"state","rule","detail","evidence":[{"row","text","matched"}],"fallback"}\|null,"manifest":{"file","version","origin","path"?,"rules":[{"id","state","matched","reason"}]},"problems":[{"path","error"}],"note"}` (see Detection manifests) |
 | POST | `/sessions/{id}/input` | `{"data","paste"?,"enter"?}` -> `{"bytes","bracketed"}`: type into it (`paste`: as `fw hub send`). 409 when it has no running terminal or is not reading |
 | GET | `/sessions/{id}/commands[?limit=N&all=true]` | suggested code blocks, newest first (shell only unless `all`; `limit` 1..500, default 50): `{"session_id","conversation","transcript","commands":[{"seq","conversation","message_id","timestamp","block_index","lang","shell","text","command","source"}]}` |
 | POST | `/sessions/{id}/paste` | `{"text","run"?}` -> `{"bracketed","ran","bytes"}`: paste a suggested command (as `/input` with `paste`, plus: trailing newlines dropped, at most 1 MiB, whitespace-only is a 400); 409 when not running, not reading, or unsafe multi-line |

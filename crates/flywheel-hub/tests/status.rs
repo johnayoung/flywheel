@@ -506,15 +506,15 @@ async fn claude_hooks_drive_status_with_per_client_seen_tracking() {
     hub.shutdown().await;
 }
 
-/// A Claude Code stand-in that draws what the real TUI draws: the
-/// folder-trust dialog first, then per typed line a running turn's footer
-/// (`work`), a permission dialog (`dialog`), or the bare prompt it returns
-/// to after an Esc interrupt (`stop`).
-const CLAUDE_TUI: &str = r#"printf 'Quick safety check: Is this a project you created or one you trust?\r\n'
+/// A Claude Code stand-in that draws what the real TUI (2.1.306) draws:
+/// the folder-trust dialog first, then per typed line a running turn's
+/// footer (`work`), a permission dialog (`dialog`), or the bare prompt it
+/// returns to after an Esc interrupt (`stop`).
+const CLAUDE_TUI: &str = r#"printf ' Accessing workspace:\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \342\235\257 No, exit\r\n   Yes, I trust this folder\r\n\r\n Enter to confirm \302\267 Esc to cancel\r\n'
 while read line; do
   case "$line" in
-    work) printf '\033[2J\033[H> fix it\r\n  manual mode on \302\267 esc to interrupt\r\n' ;;
-    dialog) printf '\033[2J\033[H Do you want to proceed?\r\n Esc to cancel \302\267 Tab to amend\r\n' ;;
+    work) printf '\033[2J\033[H> fix it\r\n\342\235\257\r\n  manual mode on \302\267 esc to interrupt\r\n' ;;
+    dialog) printf '\033[2J\033[H Do you want to proceed?\r\n \342\235\257 1. Yes\r\n   2. No\r\n Esc to cancel \302\267 Tab to amend\r\n' ;;
     stop) printf '\033[2J\033[H  Interrupted\r\n\342\235\257 \r\n' ;;
   esac
 done"#;
@@ -547,8 +547,11 @@ async fn claude_interrupts_and_the_trust_dialog_read_from_the_screen() {
     let blocked = status_becomes(&mut events, &sid, "blocked").await;
     assert_eq!(
         blocked["status"]["detail"],
-        flywheel_hub::agent::CLAUDE_TRUST_DETAIL
+        "asks whether to trust this folder"
     );
+    let why = hub.get(&format!("/api/sessions/{sid}/explain")).await;
+    assert_eq!(why["source_label"], "manifest:claude.toml#folder_trust");
+    assert_eq!(why["screen"]["rule"], "folder_trust");
     // The screen monitor is not a viewer.
     assert_eq!(
         hub.get(&format!("/api/sessions/{sid}")).await["live"]["clients"],
@@ -623,7 +626,7 @@ async fn claude_interrupts_and_the_trust_dialog_read_from_the_screen() {
     claude.fire("UserPromptSubmit", None, json!({})).unwrap();
     status_becomes(&mut events, &sid, "working").await;
     type_line("stop\r").await;
-    tokio::time::sleep(flywheel_hub::agent::CLAUDE_SETTLE_AFTER + Duration::from_secs(1)).await;
+    tokio::time::sleep(flywheel_hub::detect::tracker::SETTLE_AFTER + Duration::from_secs(1)).await;
     assert_eq!(api_status(&hub).await, "working");
     drop(term);
     hub.shutdown().await;
@@ -697,16 +700,34 @@ async fn wait_exited(hub: &TestHub, sid: &str) {
     }
 }
 
-/// Codex's busy line as its TUI draws it: styled, with cursor moves.
-const CODEX_TURN: &str = r#"while read line; do
-  printf '\033[2K\r\033[1mWorking\033[0m (0s \342\200\242 esc to \033[2minterrupt\033[0m)'
-  i=1; while [ $i -le 4 ]; do sleep 0.3; printf '\033[10G%ss' $i; i=$((i+1)); done
-  printf '\r\n'
+/// A Codex stand-in that draws what the codex TUI draws (its strings from
+/// openai/codex `codex-rs/tui`): the composer at start; per typed line a
+/// turn (`work`: the styled, cursor-moved status line redrawn with its
+/// timer, then the composer again), a status line that freezes (`stall`),
+/// an exec approval (`approve`), and the running turn an answer (`y`)
+/// resumes.
+const CODEX_TUI: &str = r#"composer() {
+  printf '\033[2J\033[H\342\200\272 Ask Codex to do anything\r\n\r\n  ? for shortcuts      100%% context left\r\n'
+}
+busy() {
+  printf '\033[2J\033[H\342\200\242 \033[1mWorking\033[0m (0s \342\200\242 esc to \033[2minterrupt\033[0m)\r\n\r\n\342\200\272 \r\n'
+}
+composer
+while read line; do
+  case "$line" in
+    work)
+      busy
+      i=1; while [ $i -le 4 ]; do sleep 0.3; printf '\033[1;12H%ss' $i; i=$((i+1)); done
+      composer ;;
+    stall) busy ;;
+    approve) printf '\033[2J\033[H\342\200\242 I will run the tests.\r\n\r\n  Would you like to run the following command?\r\n\r\n  $ cargo test\r\n\r\n\342\200\272 1. Yes, proceed (y)\r\n  2. No, and tell Codex what to do differently (esc)\r\n\r\n  Press enter to confirm or esc to cancel\r\n' ;;
+    y) busy; i=1; while [ $i -le 6 ]; do sleep 0.3; printf '\033[1;12H%ss' $i; i=$((i+1)); done ;;
+  esac
 done"#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_status_from_its_busy_line_and_turn_complete_notify() {
-    let hub = TestHub::start("exec cat", CODEX_TURN).await;
+async fn codex_status_from_its_screen_and_turn_complete_notify() {
+    let hub = TestHub::start("exec cat", CODEX_TUI).await;
     let workspace = hub
         .post(
             "/api/workspaces",
@@ -736,7 +757,9 @@ async fn codex_status_from_its_busy_line_and_turn_complete_notify() {
             )
         ]
     );
-    // The activity monitor is not a viewer.
+    // The composer: idle before any turn.
+    status_becomes(&mut events, &sid, "idle").await;
+    // The screen monitor is not a viewer.
     let view: Value = hub.get(&format!("/api/sessions/{sid}")).await;
     assert_eq!(view["live"]["clients"], 0, "{view}");
 
@@ -748,8 +771,10 @@ async fn codex_status_from_its_busy_line_and_turn_complete_notify() {
         .await
         .unwrap();
     };
-    type_line("fix the bug\r").await;
+    type_line("work\r").await;
     status_becomes(&mut events, &sid, "working").await;
+    let why = hub.get(&format!("/api/sessions/{sid}/explain")).await;
+    assert_eq!(why["source_label"], "manifest:codex.toml#turn_status");
     // Codex runs `notify` with the payload as its last argument.
     let notify = json!({
         "type": "agent-turn-complete",
@@ -765,16 +790,22 @@ async fn codex_status_from_its_busy_line_and_turn_complete_notify() {
         hub.get(&format!("/api/sessions/{sid}")).await["agent_session_id"],
         "thr_123"
     );
+    let why = hub.get(&format!("/api/sessions/{sid}/explain")).await;
+    assert_eq!(
+        why["source"],
+        json!({"kind": "hook", "agent": "codex", "event": "notify"})
+    );
 
-    // Typing alone never reads as working; the busy line does, and a busy
-    // line that goes quiet with no turn-complete is honestly unknown.
+    // Typing into the composer never reads as working, and the composer
+    // after the turn does not undo done; a busy line that freezes with no
+    // turn-complete is honestly unknown.
     type_line("plain typing").await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         hub.get(&format!("/api/sessions/{sid}")).await["agent"]["status"],
         "done"
     );
-    type_line("\r").await;
+    type_line("\u{15}stall\r").await;
     status_becomes(&mut events, &sid, "working").await;
     let quiet = Instant::now();
     status_becomes(&mut events, &sid, "unknown").await;
@@ -783,6 +814,108 @@ async fn codex_status_from_its_busy_line_and_turn_complete_notify() {
         "{:?}",
         quiet.elapsed()
     );
+    let why = hub.get(&format!("/api/sessions/{sid}/explain")).await;
+    assert_eq!(why["source_label"], "heuristic");
+    drop(term);
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_approval_prompts_block_until_answered() {
+    let hub = TestHub::start("exec cat", CODEX_TUI).await;
+    let workspace = hub
+        .post(
+            "/api/workspaces",
+            json!({ "name": "codex", "repos": [hub.repo()] }),
+        )
+        .await;
+    let wid = workspace["id"].as_str().unwrap().to_owned();
+    let mut events = hub.events("phone").await;
+    next_event(&mut events, "snapshot").await;
+    let session = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": wid, "kind": "codex", "cols": 100, "rows": 30 }),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let (_, env) = launched(&hub, "codex").await;
+    status_becomes(&mut events, &sid, "idle").await;
+    let mut term = hub.ws(&format!("/api/sessions/{sid}/ws")).await.unwrap();
+    let mut type_line = async |text: &str| {
+        term.send(Message::Text(
+            json!({ "type": "input", "data": text }).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    };
+
+    // The approval overlay: blocked, with its question as the detail, and
+    // the workspace rolls up blocked.
+    type_line("approve\r").await;
+    let blocked = status_becomes(&mut events, &sid, "blocked").await;
+    assert_eq!(
+        blocked["status"]["detail"],
+        "Would you like to run the following command?"
+    );
+    assert_eq!(blocked["workspace_status"], "blocked");
+    let why = hub.get(&format!("/api/sessions/{sid}/explain")).await;
+    assert_eq!(why["status"]["status"], "blocked");
+    assert_eq!(why["source_label"], "manifest:codex.toml#approval");
+    assert_eq!(why["screen"]["state"], "blocked");
+    let evidence: Vec<&str> = why["screen"]["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["text"].as_str().unwrap().trim())
+        .collect();
+    assert!(
+        evidence.contains(&"Would you like to run the following command?")
+            && evidence.contains(&"Press enter to confirm or esc to cancel"),
+        "{why}"
+    );
+    assert!(
+        why["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("idle is not authorization")
+    );
+
+    // Answered: the turn runs on at once, then notify ends it.
+    type_line("y\r").await;
+    status_becomes(&mut events, &sid, "working").await;
+    send(
+        &env,
+        "codex",
+        "notify",
+        None,
+        Some(json!({ "type": "agent-turn-complete", "thread-id": "thr_9" })),
+    )
+    .unwrap();
+    status_becomes(&mut events, &sid, "done").await;
+
+    // A shell session explains with the shell manifest and has no status.
+    let shell = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": wid, "command": ["cat"] }),
+        )
+        .await;
+    let why = hub
+        .get(&format!(
+            "/api/sessions/{}/explain",
+            shell["id"].as_str().unwrap()
+        ))
+        .await;
+    assert_eq!(why["kind"], "shell");
+    assert_eq!(why["manifest"]["file"], "shell.toml");
+    assert!(why["status"].is_null(), "{why}");
+    let missing = hub
+        .authed(reqwest::Method::GET, "/api/sessions/nope/explain")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     drop(term);
     hub.shutdown().await;
 }

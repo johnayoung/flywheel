@@ -1,0 +1,86 @@
+# Claude Code screen rules (fw hub detection manifest).
+#
+# Read against the live bottom of the session's screen. Claude Code's
+# hooks are its status authority; these rules fill what they miss: the
+# folder-trust dialog before the first hook, an Esc interrupt (no hook
+# fires), a dialog closing onto a running tool, a transcript viewer over
+# a turn. Copy to <state-dir>/agent-detection/claude.toml to override
+# (the whole file is replaced). Strings match case-insensitively within
+# one line; `line` / `not_line` are regexes (one line each). Rules are
+# tried in order; the first match wins. Captured from Claude Code 2.1.306.
+
+kind = "claude"
+version = 1
+description = "Claude Code 2.1.x TUI"
+
+# ctrl+o: the transcript covers the screen; nothing below it is live.
+[[rule]]
+id = "transcript_viewer"
+state = "hold"
+lines = 3
+any = ["showing detailed transcript"]
+
+# First run in a folder: "Quick safety check: Is this a project you
+# created or one you trust?" ... "Enter to confirm · Esc to cancel".
+[[rule]]
+id = "folder_trust"
+state = "blocked"
+detail = "asks whether to trust this folder"
+[[rule.when]]
+lines = 1
+line = ['(?i)^\s*enter to confirm\s*·\s*esc to cancel\s*$']
+[[rule.when]]
+lines = 20
+any = ["is this a project you created or one you trust"]
+line = ['(?i)^\s*(?:❯\s*)?(?:\d\.\s*)?yes, i trust this folder']
+
+# Bash / Write / Edit / WebFetch ... permission dialogs:
+# "Do you want to proceed?" / "Do you want to create notes.txt?" with
+# "❯ 1. Yes" ... and "Esc to cancel · Tab to amend".
+[[rule]]
+id = "permission_prompt"
+state = "blocked"
+detail = "asks for permission"
+detail_line = '(?i)^\s*(do you want to .{1,120}\?)\s*$'
+[[rule.when]]
+lines = 1
+line = ['(?i)^\s*esc to cancel\b']
+[[rule.when]]
+lines = 14
+line = ['(?i)^\s*do you want to .+\?\s*$', '(?i)^\s*(?:❯\s*)?1\.\s+yes\b']
+
+# AskUserQuestion: a "☐ <header>" tab, numbered options, and
+# "Enter to select · ↑/↓ to navigate · Esc to cancel".
+[[rule]]
+id = "question"
+state = "blocked"
+detail = "asks a question"
+[[rule.when]]
+lines = 1
+line = ['(?i)^\s*enter to select\b.*\besc to cancel\s*$']
+[[rule.when]]
+lines = 24
+line = ['^\s*[☐☒✔✓]\s+\S', '^\s*(?:❯\s*)?1\.\s+\S']
+
+# A running turn: the footer's "esc to interrupt".
+[[rule]]
+id = "turn_footer"
+state = "working"
+lines = 4
+any = ["esc to interrupt"]
+
+# The spinner line of a running turn ("✽ Germinating… (3s · thinking)"),
+# for terminals too narrow for the footer hint.
+[[rule]]
+id = "turn_spinner"
+state = "working"
+lines = 12
+line = ['^\s*[✻✽✶✳✢·*]\s+\S[^(]*…\s*\(\d+[smh]\b']
+
+# Back at the prompt box: "❯" between rules, no dialog or running turn.
+[[rule]]
+id = "prompt"
+state = "idle"
+lines = 8
+line = ['^❯(?:\s|$)']
+none = ["esc to interrupt", "esc to cancel", "enter to select"]

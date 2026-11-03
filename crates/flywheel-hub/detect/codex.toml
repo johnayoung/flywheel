@@ -1,0 +1,90 @@
+# Codex screen rules (fw hub detection manifest).
+#
+# Codex reports only a finished turn (`notify`), so the screen is its
+# signal for working and blocked. Strings follow the codex TUI
+# (openai/codex codex-rs/tui: approval_overlay.rs, request_user_input,
+# onboarding/trust_directory.rs, status_indicator_widget.rs, and their
+# snapshot tests), plus the "Allow command?" dialog of older releases.
+# Copy to <state-dir>/agent-detection/codex.toml to override (the whole
+# file is replaced). Strings match case-insensitively within one line;
+# `line` / `not_line` are regexes (one line each). Rules are tried in
+# order; the first match wins.
+
+kind = "codex"
+version = 1
+description = "Codex TUI (codex-rs)"
+
+# Startup: "Folder access" / "Trust this folder? Codex can read, edit, and
+# run files here ..." with "› 1. Trust and continue" and
+# "enter continue · esc cancel"; older: "Do you trust the contents of this
+# directory?" ... "Press Enter to continue".
+[[rule]]
+id = "folder_trust"
+state = "blocked"
+detail = "asks whether to trust this folder"
+[[rule.when]]
+lines = 1
+line = ['(?i)^\s*(?:enter continue\b|press enter to continue\b)']
+[[rule.when]]
+lines = 30
+any = ["trust this folder?", "do you trust the contents of this directory?"]
+
+# Exec, patch, permission, network, and terminal-input approvals:
+# "Would you like to run the following command?" ... "› 1. Yes, proceed (y)"
+# ... "Press enter to confirm or esc to cancel".
+[[rule]]
+id = "approval"
+state = "blocked"
+detail = "asks for approval"
+detail_line = '(?i)^\s*((?:would you like to|do you want to) .{1,120}\?)\s*$'
+[[rule.when]]
+lines = 1
+line = ['(?i)^\s*press enter to confirm or esc to cancel\s*$']
+[[rule.when]]
+lines = 24
+any = [
+  "would you like to run the following command?",
+  "would you like to make the following edits?",
+  "would you like to grant these permissions?",
+  "would you like to send input to",
+  "do you want to approve network access",
+]
+
+# Older releases: "Allow command?" with "Yes (y)" / "No (n)" choices.
+[[rule]]
+id = "legacy_approval"
+state = "blocked"
+detail = "asks to allow a command"
+lines = 20
+any = ["allow command?"]
+line = ['(?i)\byes\b.*\(y\)']
+
+# request_user_input: "Question 1/2 (2 unanswered)" ... options ...
+# "enter to submit answer | esc to interrupt".
+[[rule]]
+id = "question"
+state = "blocked"
+detail = "asks a question"
+[[rule.when]]
+lines = 1
+any = ["enter to submit answer", "enter to submit all"]
+[[rule.when]]
+lines = 24
+line = ['(?i)^\s*question \d+/\d+']
+
+# A running turn's status line: "• Working (12s • esc to interrupt)".
+[[rule]]
+id = "turn_status"
+state = "working"
+lines = 8
+line = ['(?i)\((?:\d+[hm] )*\d+s\s*•\s*[^)]*to interrupt\)']
+
+# The composer: "› Ask Codex to do anything" above "? for shortcuts",
+# no running turn, no numbered picker.
+[[rule]]
+id = "composer"
+state = "idle"
+lines = 6
+line = ['^›(?:\s|$)']
+none = ["to interrupt"]
+not_line = ['^\s*›\s*\d+\.']

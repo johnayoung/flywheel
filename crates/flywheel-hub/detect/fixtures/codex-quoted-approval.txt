@@ -1,0 +1,6 @@
+• Done. The approval dialog text is "Would you like to run the following command?" and the
+  footer reads "Press enter to confirm or esc to cancel".
+
+› why does it say Would you like to run the following command?
+
+  ? for shortcuts                                                                 95% context left

@@ -1,0 +1,30 @@
+# Generic shell screen rules (fw hub detection manifest).
+#
+# Shell sessions have no agent status: these rules only answer
+# `fw hub explain` (is a command waiting on a password or a yes/no?).
+# Each reads the last non-empty line only, where an interactive prompt
+# waits. Copy to <state-dir>/agent-detection/shell.toml to override.
+
+kind = "shell"
+version = 1
+description = "interactive shells (bash, zsh, fish, sh)"
+
+[[rule]]
+id = "password"
+state = "blocked"
+detail = "asks for a password"
+lines = 1
+line = ['(?i)(?:password|passphrase|pin)(?: for [^:]{1,80})?:\s*$']
+
+[[rule]]
+id = "confirm"
+state = "blocked"
+detail = "asks to confirm"
+lines = 1
+line = ['(?i)(?:\[y/n\]|\(y/n\)|\(yes/no(?:/\[fingerprint\])?\))\s*\??:?\s*$']
+
+[[rule]]
+id = "prompt"
+state = "idle"
+lines = 1
+line = ['[$#%>❯]$']

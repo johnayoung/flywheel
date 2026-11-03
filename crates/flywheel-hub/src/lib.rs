@@ -18,6 +18,7 @@ pub mod cli;
 pub mod commands;
 pub mod commands_cli;
 pub mod daemon;
+pub mod detect;
 pub mod endpoint;
 pub mod flywheel;
 pub mod git;

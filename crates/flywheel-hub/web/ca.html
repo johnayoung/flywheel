@@ -21,6 +21,7 @@
       warnings &mdash; which a phone needs for the installable app, notifications, and copy.</p>
   </header>
 
+  {{PUBLIC}}
   <section id="status" class="status" data-state="checking" aria-live="polite">
     <span class="dot" aria-hidden="true"></span>
     <span id="status-text">Checking whether this device trusts the hub&hellip;</span>
@@ -95,8 +96,8 @@
   <section class="scope">
     <h2>What you are trusting</h2>
     <p>The CA is <b>name-constrained</b>: it can only vouch for these names (each with the names under it) and
-      addresses, so even if its key were stolen it could not impersonate your bank or any other site on this
-      device.</p>
+      addresses, so even if its key were stolen it could not impersonate any site outside this list (your bank,
+      say) on this device.</p>
     <ul class="names">{{CONSTRAINTS}}</ul>
     <p class="small">Created {{CREATED}}; valid until {{EXPIRES}}. <code>fw hub tls rotate</code> replaces it
       (devices then install the new one and should remove this one).</p>

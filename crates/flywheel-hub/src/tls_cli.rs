@@ -4,7 +4,7 @@
 use crate::cli::{StateDirArg, resolve_state_dir};
 use crate::endpoint::Endpoint;
 use crate::machines::display_fingerprint;
-use crate::tls::{LocalCa, NameSpec, discover_names};
+use crate::tls::{ExtraNames, LocalCa, discover_names};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -67,7 +67,7 @@ pub(crate) fn main(args: &TlsArgs, out: &mut dyn Write, err: &mut dyn Write) -> 
 
 /// Where the hub listens (the running one's address, else hub.toml's) and
 /// its extra TLS names.
-fn hub_listen(state_dir: &Path) -> Result<(SocketAddr, Vec<NameSpec>), String> {
+fn hub_listen(state_dir: &Path) -> Result<(SocketAddr, ExtraNames), String> {
     let effective = crate::config::load(
         state_dir,
         &crate::config::Flags::default(),
@@ -80,7 +80,13 @@ fn hub_listen(state_dir: &Path) -> Result<(SocketAddr, Vec<NameSpec>), String> {
     Ok((listen, effective.tls_names))
 }
 
-fn describe(ca: &LocalCa, state_dir: &Path, out: &mut dyn Write) {
+fn describe(
+    ca: &LocalCa,
+    state_dir: &Path,
+    names: &crate::tls::Names,
+    extra: &ExtraNames,
+    out: &mut dyn Write,
+) {
     let date = |t| chrono::DateTime::<chrono::Utc>::from(t).format("%Y-%m-%d");
     let _ = writeln!(
         out,
@@ -105,8 +111,12 @@ fn describe(ca: &LocalCa, state_dir: &Path, out: &mut dyn Write) {
     );
     let _ = writeln!(
         out,
-        "  (a device that installs it trusts it for these names only: it cannot vouch for any other site)"
+        "  (a device that installs it trusts it for these names, and names under them, only: it \
+         cannot vouch for any other site)"
     );
+    for line in crate::tls::public_warnings(&ca.constraints().public(names, extra), extra) {
+        let _ = writeln!(out, "{line}");
+    }
 }
 
 fn ca(args: &CaArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
@@ -119,7 +129,27 @@ fn ca(args: &CaArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, St
     if created {
         let _ = writeln!(err, "fw hub: made a local CA for this hub's names");
     }
-    describe(&ca, &state_dir, out);
+    // A running hub knows its opt-ins (serve flags included); hub.toml
+    // alone may not.
+    let status = running_tls(&state_dir);
+    let allowed = status
+        .as_ref()
+        .and_then(|s| s["public_names"].as_array())
+        .and_then(|list| {
+            let specs: Vec<_> = list
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|raw| crate::tls::parse_name(raw).ok())
+                .collect();
+            ExtraNames::new(specs.clone(), specs).ok()
+        });
+    describe(
+        &ca,
+        &state_dir,
+        &names,
+        allowed.as_ref().unwrap_or(&extra),
+        out,
+    );
     if let Some(path) = &args.out {
         let bytes = if args.der {
             ca.cert_der().as_ref().to_vec()
@@ -129,7 +159,7 @@ fn ca(args: &CaArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, St
         std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         let _ = writeln!(out, "wrote the CA certificate to {}", path.display());
     }
-    match running_tls(&state_dir) {
+    match status {
         Some(status) if status["mode"] == "auto" => {
             let outside = status["outside"].as_array().map_or(0, Vec::len);
             let urls = crate::tls::ca_page_urls(listen);
@@ -190,7 +220,7 @@ fn rotate(args: &RotateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result
             display_fingerprint(old.fingerprint())
         );
     }
-    describe(&ca, &state_dir, out);
+    describe(&ca, &state_dir, &names, &extra, out);
     match Endpoint::running(&state_dir)? {
         Some(hub) => {
             let status =

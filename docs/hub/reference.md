@@ -141,7 +141,8 @@ Taken by `serve`, `start`, `install-service`. All but `--notify-url` are also `h
 | `--allow-origin` | none | extra browser origin accepted; repeatable; same-origin always allowed |
 | `--trusted-proxy` | none | proxy on another machine whose `X-Forwarded-*` are believed (loopback always is); repeatable |
 | `--tls` | `off` | `auto` (local name-constrained CA), `off`, or `CERT,KEY` (PEM files you supply) |
-| `--tls-name` | none | extra name, IP, or network (at most /8) for the local CA; repeatable; later additions need `fw hub tls rotate` |
+| `--tls-name` | none | extra private name, IP, or network (at most /8) for the local CA ([hub-security](security.md#https-without-tailscale)); repeatable; later additions need `fw hub tls rotate` |
+| `--tls-allow-public-name` | none | opt in to this public `--tls-name` (one you own); repeatable; `tls ca`, `/ca`, `doctor` warn |
 | `--scrollback-lines` | `5000` | per session, capped at 1M cells; 24 B a cell (~14 MiB for 5000 x 120) |
 | `--no-restore` | off | drop pending restores for good |
 | `--no-agent-resume` | off | restore agents as fresh shells |
@@ -170,6 +171,7 @@ allow_origins = []
 trusted_proxies = []
 tls = "off"                       # auto: local name-constrained CA; or "/path/cert.pem,/path/key.pem"
 tls_names = []                    # extra names/IPs/networks for it, e.g. ["192.168.0.0/16"]
+tls_public_names = []             # public tls_names entries you own and opt in to (a warning)
 
 [sessions]
 scrollback_lines = 5000           # live: sessions started from now on
@@ -220,7 +222,8 @@ typing_quiet = "8s"               # no typing in a session this long before its 
 | `server.allow_origins` | `--allow-origin` | `[]` | restart |
 | `server.trusted_proxies` | `--trusted-proxy` | `[]` | restart |
 | `server.tls` | `--tls` | `"off"` (CERT,KEY paths absolute) | restart |
-| `server.tls_names` | `--tls-name` | `[]` (no single-label names) | restart |
+| `server.tls_names` | `--tls-name` | `[]` (private names only) | restart |
+| `server.tls_public_names` | `--tls-allow-public-name` | `[]` | restart |
 | `sessions.scrollback_lines` | `--scrollback-lines` | `5000` (sessions started from now on) | live |
 | `sessions.restore` | `--no-restore` | `true` | restart |
 | `sessions.agent_resume` | `--no-agent-resume` | `true` | restart |

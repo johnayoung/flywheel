@@ -9,7 +9,7 @@ mod support;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use flywheel_hub::server::Peer;
-use flywheel_hub::tls::{LocalCa, Names, TlsMode, TlsServing, hub_names};
+use flywheel_hub::tls::{ExtraNames, LocalCa, Names, TlsMode, TlsServing, hub_names};
 use flywheel_hub::{Hub, HubOptions, ServerOptions, router, serve};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -32,11 +32,15 @@ struct TlsHub {
 }
 
 fn names(addr: SocketAddr) -> Names {
-    hub_names(addr, "hubbox", &[], None, &[])
+    hub_names(addr, "hubbox", &[], None, &ExtraNames::default())
 }
 
 impl TlsHub {
     async fn start() -> Self {
+        Self::start_with(ExtraNames::default()).await
+    }
+
+    async fn start_with(extra: ExtraNames) -> Self {
         flywheel_hub::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("state");
@@ -45,7 +49,8 @@ impl TlsHub {
         let hub = support::open_hub(options);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let tls = TlsServing::start(&TlsMode::Auto, &state_dir, addr, &names(addr), &[])
+        let names = hub_names(addr, "hubbox", &[], None, &extra);
+        let tls = TlsServing::start(&TlsMode::Auto, &state_dir, addr, &names, &extra)
             .unwrap()
             .unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
@@ -143,7 +148,7 @@ async fn https_and_http_share_the_port_and_the_ca_alone_is_trusted() {
     }
     // Without the CA there is no trust.
     let other = LocalCa::generate(
-        flywheel_hub::tls::Constraints::for_names(&names(hub.addr), &[]),
+        flywheel_hub::tls::Constraints::for_names(&names(hub.addr), &ExtraNames::default()),
         SystemTime::now(),
     )
     .unwrap();
@@ -318,6 +323,7 @@ async fn plain_http_from_the_network_reaches_the_ca_page_and_nothing_else() {
         html.contains(&fingerprint.replace(':', ":<wbr>")),
         "the page shows the fingerprint"
     );
+    assert!(!html.contains("{{PUBLIC}}") && !html.contains("Warning: public names"));
     assert!(html.contains("Certificate Trust Settings"));
     assert!(html.contains("<li>hubbox.local</li>"), "the constraints");
     let der = send("GET", "/ca/hub-ca.crt").await.unwrap();
@@ -432,7 +438,8 @@ async fn rotation_switches_the_served_ca_and_drops_the_old_one() {
         .await
         .unwrap();
     assert_eq!(signed_in.status(), StatusCode::OK);
-    let rotated = LocalCa::rotate(&hub.state_dir, &names(hub.addr), &[]).unwrap();
+    let rotated =
+        LocalCa::rotate(&hub.state_dir, &names(hub.addr), &ExtraNames::default()).unwrap();
     let new_client = client_trusting(&[rotated.cert_der().clone()], hub.addr);
     // A machine pinned to the old CA, on fresh connections each time (so
     // only a resumed session could carry it past the rotation).
@@ -623,4 +630,102 @@ fn the_tls_ca_verb_prints_the_fingerprint_and_writes_the_certificate() {
     assert!(out.contains(&flywheel_hub::machines::display_fingerprint(
         rotated.fingerprint()
     )));
+}
+
+#[test]
+fn a_public_tls_name_needs_an_opt_in_and_the_ca_verb_warns_of_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let run = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = flywheel_hub::cli::run(&args, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    };
+    let state_arg = state.to_str().unwrap();
+    let toml = state.join("hub.toml");
+    std::fs::write(&toml, "[server]\ntls_names = [\"hub.example.com\"]\n").unwrap();
+    let (code, _, err) = run(&["tls", "ca", "--state-dir", state_arg]);
+    assert_ne!(code, 0);
+    assert!(
+        err.contains("\"hub.example.com\" is a public name"),
+        "{err}"
+    );
+    assert!(LocalCa::load(&state).unwrap().is_none(), "no CA made");
+    // Opted in: made, constrained to it, and said so in the output.
+    std::fs::write(
+        &toml,
+        "[server]\ntls_names = [\"hub.example.com\"]\ntls_public_names = [\"hub.example.com\"]\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(&["tls", "ca", "--state-dir", state_arg]);
+    assert_eq!(code, 0, "{err}");
+    let ca = LocalCa::load(&state).unwrap().unwrap();
+    assert!(ca.constraints().permits_dns("hub.example.com"));
+    assert!(
+        out.contains("WARNING: this CA may also sign for the public hub.example.com"),
+        "{out}"
+    );
+    // The opt-in dropped: the CA it made is flagged for rotation.
+    std::fs::write(&toml, "[server]\n").unwrap();
+    let (code, out, _) = run(&["tls", "ca", "--state-dir", state_arg]);
+    assert_eq!(code, 0);
+    assert!(out.contains("do not opt in"), "{out}");
+    // A private-only CA says nothing of the kind.
+    let (code, out, _) = run(&["tls", "rotate", "--state-dir", state_arg]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("WARNING"), "{out}");
+    assert!(
+        !LocalCa::load(&state)
+            .unwrap()
+            .unwrap()
+            .constraints()
+            .permits_dns("hub.example.com")
+    );
+}
+
+#[tokio::test]
+async fn the_ca_page_warns_of_an_opted_in_public_name() {
+    let name = flywheel_hub::tls::parse_name("hub.example.com").unwrap();
+    let extra = ExtraNames::new(vec![name.clone()], vec![name]).unwrap();
+    let hub = TlsHub::start_with(extra).await;
+    assert!(hub.ca().constraints().permits_dns("hub.example.com"));
+    let (_tx, rx) = watch::channel(false);
+    let app = router(
+        Arc::clone(&hub.hub),
+        ServerOptions {
+            tls: Some(Arc::clone(&hub.tls)),
+            ..ServerOptions::default()
+        },
+        rx,
+    );
+    let page = app
+        .oneshot(from_network("GET", "/ca", "192.0.2.1:7600"))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        axum::body::to_bytes(page.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let warning = html
+        .split("<section class=\"public\" role=\"alert\">")
+        .nth(1)
+        .expect("a warning section")
+        .split("</section>")
+        .next()
+        .unwrap();
+    assert!(warning.contains("Warning: public names"), "{warning}");
+    assert!(warning.contains("<li>hub.example.com</li>"), "{warning}");
+    assert!(warning.contains("--tls-allow-public-name"), "{warning}");
+    // Above the install steps, not after them.
+    assert!(html.find("Warning: public names") < html.find("Install it"));
 }

@@ -13,12 +13,16 @@ fn lan_names() -> Names {
             ips: vec!["100.101.102.103".parse().unwrap()],
             serve_urls: Vec::new(),
         }),
-        &[NameSpec::Dns("hub.example.test".into())],
+        &ExtraNames::new(vec![NameSpec::Dns("hub.example.lan".into())], Vec::new()).unwrap(),
     )
 }
 
 fn ca_for(names: &Names) -> LocalCa {
-    LocalCa::generate(Constraints::for_names(names, &[]), SystemTime::now()).unwrap()
+    LocalCa::generate(
+        Constraints::for_names(names, &ExtraNames::default()),
+        SystemTime::now(),
+    )
+    .unwrap()
 }
 
 /// A verifier trusting only `ca`, as a phone that installed it does.
@@ -96,7 +100,7 @@ fn the_hub_is_named_for_every_address_it_prints() {
         [
             "box.local",
             "box.tail1234.ts.net",
-            "hub.example.test",
+            "hub.example.lan",
             "localhost"
         ]
     );
@@ -122,7 +126,7 @@ fn the_ca_is_a_name_constrained_p256_root() {
         .expect("nameConstraints present");
     assert!(ext.critical, "nameConstraints must be critical");
     let read = parsed_constraints(&cert).unwrap().unwrap();
-    assert_eq!(read, Constraints::for_names(&names, &[]));
+    assert_eq!(read, Constraints::for_names(&names, &ExtraNames::default()));
     assert!(read.dns.contains(&"box.tail1234.ts.net".to_owned()));
     assert!(read.nets.contains(&("192.168.1.20".parse().unwrap(), 32)));
     assert!(read.nets.contains(&("127.0.0.0".parse().unwrap(), 8)));
@@ -148,7 +152,7 @@ fn leaves_carry_the_hub_names_and_verify_against_the_ca_alone() {
         "localhost",
         "box.local",
         "box.tail1234.ts.net",
-        "hub.example.test",
+        "hub.example.lan",
         "127.0.0.1",
         "::1",
         "192.168.1.20",
@@ -193,9 +197,9 @@ fn the_ca_cannot_vouch_for_another_site() {
     // A subdomain of a permitted name is inside, as X.509 reads dNSName
     // constraints.
     let mut sub = Names::default();
-    sub.dns.insert("api.hub.example.test".into());
+    sub.dns.insert("api.hub.example.lan".into());
     let leaf = ca.issue(&sub, SystemTime::now()).unwrap();
-    verify(&ca, &leaf, "api.hub.example.test").unwrap();
+    verify(&ca, &leaf, "api.hub.example.lan").unwrap();
 }
 
 #[test]
@@ -215,7 +219,10 @@ fn names_outside_the_constraints_are_left_out_not_fatal() {
     verify(&ca, &leaf, "box.local").unwrap();
     // A network in tls_names covers future leases.
     let wide = LocalCa::generate(
-        Constraints::for_names(&names, &[parse_name("192.168.0.0/16").unwrap()]),
+        Constraints::for_names(
+            &names,
+            &ExtraNames::new(vec![parse_name("192.168.0.0/16").unwrap()], Vec::new()).unwrap(),
+        ),
         SystemTime::now(),
     )
     .unwrap();
@@ -228,9 +235,11 @@ fn names_outside_the_constraints_are_left_out_not_fatal() {
 fn the_ca_round_trips_with_a_private_key_file() {
     let dir = tempfile::tempdir().unwrap();
     let names = lan_names();
-    let (ca, created) = LocalCa::load_or_create(dir.path(), &names, &[]).unwrap();
+    let (ca, created) =
+        LocalCa::load_or_create(dir.path(), &names, &ExtraNames::default()).unwrap();
     assert!(created);
-    let (again, created) = LocalCa::load_or_create(dir.path(), &names, &[]).unwrap();
+    let (again, created) =
+        LocalCa::load_or_create(dir.path(), &names, &ExtraNames::default()).unwrap();
     assert!(!created);
     assert_eq!(again.fingerprint(), ca.fingerprint());
     assert_eq!(again.constraints(), ca.constraints());
@@ -264,7 +273,7 @@ fn serving_renews_on_new_names_expiry_and_rotation() {
         dir.path(),
         "0.0.0.0:0".parse().unwrap(),
         &names,
-        &[],
+        &ExtraNames::default(),
     )
     .unwrap()
     .unwrap();
@@ -294,7 +303,7 @@ fn serving_renews_on_new_names_expiry_and_rotation() {
     assert!(serving.refresh(None, later, false).unwrap().reissued);
     assert_ne!(serving.chain(), second);
     // `fw hub tls rotate` on disk: a new CA and a leaf chained to it.
-    let rotated = LocalCa::rotate(dir.path(), &moved, &[]).unwrap();
+    let rotated = LocalCa::rotate(dir.path(), &moved, &ExtraNames::default()).unwrap();
     assert_ne!(rotated.fingerprint(), ca.fingerprint());
     let done = serving.refresh(None, now, false).unwrap();
     assert!(done.new_ca && done.reissued);
@@ -336,9 +345,15 @@ fn operator_files_are_served_and_reloaded() {
         cert: dir.path().join("cert.pem"),
         key: dir.path().join("key.pem"),
     };
-    let serving = TlsServing::start(&mode, dir.path(), "0.0.0.0:0".parse().unwrap(), &names, &[])
-        .unwrap()
-        .unwrap();
+    let serving = TlsServing::start(
+        &mode,
+        dir.path(),
+        "0.0.0.0:0".parse().unwrap(),
+        &names,
+        &ExtraNames::default(),
+    )
+    .unwrap()
+    .unwrap();
     assert!(serving.ca().is_none());
     assert_eq!(serving.chain()[0], *cert.der());
     assert!(
@@ -386,14 +401,19 @@ fn a_host_named_like_a_tld_does_not_constrain_the_ca_to_that_tld() {
         "dev",
         &[("eth0".into(), "192.168.1.20".parse().unwrap())],
         None,
-        &[],
+        &ExtraNames::default(),
     );
     assert!(!names.dns.contains("dev"));
     assert!(names.dns.contains("dev.local"));
     // Even a bare label handed in directly is not made a constraint.
     let mut sneaky = names.clone();
     sneaky.dns.insert("app".into());
-    let constraints = Constraints::for_names(&sneaky, &[NameSpec::Dns("box".into())]);
+    // (Not through ExtraNames::new, which refuses it outright.)
+    let bare = ExtraNames {
+        names: vec![NameSpec::Dns("box".into())],
+        public: vec![NameSpec::Dns("box".into())],
+    };
+    let constraints = Constraints::for_names(&sneaky, &bare);
     assert_eq!(constraints.dns, ["dev.local", "localhost"]);
     assert!(constraints.too_wide().is_empty());
     let ca = LocalCa::generate(constraints, SystemTime::now()).unwrap();
@@ -416,4 +436,155 @@ fn a_host_named_like_a_tld_does_not_constrain_the_ca_to_that_tld() {
         nets: Vec::new(),
     };
     assert_eq!(old.too_wide(), ["dev"]);
+}
+
+#[test]
+fn only_private_names_are_taken_without_an_opt_in() {
+    let spec = |raw: &str| parse_name(raw).unwrap();
+    for private in [
+        "hub.local",
+        "box.lan",
+        "nas.home.arpa",
+        "ci.corp.internal",
+        "app.localhost",
+        "box.tail1234.ts.net",
+        "tail1234.ts.net",
+        "10.1.2.3",
+        "172.20.0.0/16",
+        "192.168.0.0/16",
+        "127.0.0.1",
+        "169.254.10.1",
+        "100.101.102.103",
+        "100.64.0.0/10",
+        "::1",
+        "fe80::1",
+        "fd7a:115c:a1e0::1",
+        "fd00::/16",
+        "::ffff:10.0.0.1",
+    ] {
+        assert!(is_private(&spec(private)), "{private}");
+        ExtraNames::new(vec![spec(private)], Vec::new()).unwrap();
+    }
+    for public in [
+        "google.com",
+        "example.co.uk",
+        "hub.example.test",
+        "ts.net",
+        "local.example.com",
+        "lan.com",
+        "evil-local",
+        "8.8.8.8",
+        "1.2.3.0/24",
+        "100.0.0.0/8",
+        "10.0.0.0/8x",
+        "172.0.0.0/8",
+        "2001:db8::1",
+        "fc00::/6",
+    ] {
+        let Ok(parsed) = parse_name(public) else {
+            continue;
+        };
+        assert!(!is_private(&parsed), "{public}");
+        let refused = ExtraNames::new(vec![parsed.clone()], Vec::new()).unwrap_err();
+        assert_eq!(refused.len(), 1, "{public}: {refused:?}");
+        assert!(refused[0].contains("public name"), "{refused:?}");
+        assert!(
+            refused[0].contains(".home.arpa"),
+            "the rule is named: {refused:?}"
+        );
+        assert!(
+            refused[0].contains(&format!("--tls-allow-public-name {parsed}")),
+            "the opt-in is named: {refused:?}"
+        );
+        // Opted in by name: taken, and reported as public.
+        let allowed = ExtraNames::new(vec![parsed.clone()], vec![parsed.clone()]).unwrap();
+        assert_eq!(allowed.public(), [parsed]);
+    }
+    // An opt-in for a name that is not a tls_names entry adds nothing.
+    let stray = ExtraNames::new(vec![spec("hub.lan")], vec![spec("google.com")]).unwrap_err();
+    assert!(stray[0].contains("not a --tls-name"), "{stray:?}");
+    // An opt-in for another name does not cover this one.
+    assert!(
+        ExtraNames::new(
+            vec![spec("google.com"), spec("example.com")],
+            vec![spec("example.com")]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_public_name_without_an_opt_in_never_reaches_the_ca() {
+    let listen: SocketAddr = "0.0.0.0:7600".parse().unwrap();
+    let interfaces = [("eth0".to_owned(), "192.168.1.20".parse().unwrap())];
+    // Even an ExtraNames built around the checks (not via new) gets no
+    // public name into the leaf's names or the CA's constraints.
+    let sneaky = ExtraNames {
+        names: vec![
+            NameSpec::Dns("google.com".into()),
+            NameSpec::Net("8.8.0.0".parse().unwrap(), 16),
+            NameSpec::Dns("hub.lan".into()),
+        ],
+        public: Vec::new(),
+    };
+    let names = hub_names(listen, "box", &interfaces, None, &sneaky);
+    assert!(!names.dns.contains("google.com"));
+    assert!(names.dns.contains("hub.lan"));
+    let constraints = Constraints::for_names(&names, &sneaky);
+    assert!(!constraints.permits_dns("google.com"));
+    assert!(!constraints.permits_dns("mail.google.com"));
+    assert!(!constraints.permits_ip("8.8.8.8".parse().unwrap()));
+    assert!(constraints.public(&names, &sneaky).is_empty());
+    let ca = LocalCa::generate(constraints, SystemTime::now()).unwrap();
+    for other in ["google.com", "mail.google.com", "8.8.8.8"] {
+        let mut wanted = Names::default();
+        match other.parse::<IpAddr>() {
+            Ok(ip) => wanted.ips.insert(ip),
+            Err(_) => wanted.dns.insert(other.to_owned()),
+        };
+        let forged = ca.sign_unchecked(&wanted, SystemTime::now()).unwrap();
+        let refused = verify(&ca, &forged, other).expect_err(other);
+        assert!(
+            format!("{refused:?}").contains("NameConstraint"),
+            "{other}: {refused:?}"
+        );
+    }
+    let leaf = ca.issue(&names, SystemTime::now()).unwrap();
+    verify(&ca, &leaf, "hub.lan").unwrap();
+
+    // Opted in: the CA may sign for it, and says so.
+    let owned = NameSpec::Dns("hub.example.com".into());
+    let extra = ExtraNames::new(vec![owned.clone()], vec![owned.clone()]).unwrap();
+    let names = hub_names(listen, "box", &interfaces, None, &extra);
+    let ca = LocalCa::generate(Constraints::for_names(&names, &extra), SystemTime::now()).unwrap();
+    let leaf = ca.issue(&names, SystemTime::now()).unwrap();
+    verify(&ca, &leaf, "hub.example.com").unwrap();
+    // An extra name is not the machine's own, even in the leaf's names.
+    let public = ca.constraints().public(&names, &extra);
+    assert_eq!(public, std::slice::from_ref(&owned));
+    let warnings = public_warnings(&public, &extra);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("hub.example.com") && warnings[0].contains("allowed"));
+    // The same CA once the opt-in is gone: flagged for rotation.
+    let mut own = names.clone();
+    own.dns.remove("hub.example.com");
+    let public = ca.constraints().public(&own, &ExtraNames::default());
+    assert_eq!(public, [owned]);
+    let warnings = public_warnings(&public, &ExtraNames::default());
+    assert!(warnings[0].contains("do not opt in") && warnings[0].contains("rotate"));
+    // A public address of the machine's own (a global IPv6 one) is not.
+    let mine: IpAddr = "2001:db8::20".parse().unwrap();
+    let names = hub_names(
+        listen,
+        "box",
+        &[("eth0".into(), mine)],
+        None,
+        &ExtraNames::default(),
+    );
+    let ca = ca_for(&names);
+    assert!(
+        ca.constraints()
+            .public(&names, &ExtraNames::default())
+            .is_empty()
+    );
 }

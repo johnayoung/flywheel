@@ -46,7 +46,8 @@ fw hub tls rotate                          # new CA, old key deleted; every devi
 ```
 
 - **The local CA is name-constrained**: a critical `nameConstraints` extension permits only this hub's names and addresses, so even a stolen CA key cannot impersonate other sites. Bare single-label hosts become `<host>.local` (a label constraint would cover a whole TLD). Install it only after checking the fingerprint against `fw hub tls ca`.
-- A `--tls-name` domain is trusted with every name under it: add only names you own, never a public domain.
+- `--tls-name` takes private names only: under `.local` `.lan` `.home.arpa` `.internal` `.localhost` `<tailnet>.ts.net`, or private, loopback, link-local, CGNAT and ULA addresses.
+- A public name (with every name under it) would let this box's CA key mint certs all CA-installed devices trust. For one you own: add `--tls-allow-public-name NAME` (`tls_public_names`); `tls ca`, `/ca`, `doctor` warn.
 - One port, both schemes. With TLS on, plain http from the network reaches only `/ca`; everything else 308s to https. Local and `--trusted-proxy` peers keep plain http.
 - Files `<state-dir>/tls/`: `ca-key.pem` (never leaves it), `ca-cert.pem`. ECDSA P-256; CA 10 years; leaf 14 days, re-issued 5 days before expiry or when names change.
 - A name outside the constraints (new DHCP lease) is left out of the leaf with a warning. Cover leases with `tls_names = ["192.168.0.0/16"]` (at most /8), then `tls rotate`.

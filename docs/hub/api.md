@@ -131,7 +131,7 @@ Fan-out view: `{"id","name","base_sha","graders","winner","counts","leader","set
 | POST | `/api/plugins/{name}/actions/{action}` | `{"session_id"?}` -> `{"ok","toast","paste","log"}`; 404 unknown, 409 disabled / plugins off / needs a session |
 | GET | `/api/notify` | `{"push":null}` or `{"push":{"host","events","debounce_secs","settle_secs","detail"}}` |
 | POST | `/api/notify/test` | 204 sent; 409 push off; 502 `{"error"}` refused / unreachable |
-| GET | `/api/tls` | `{"mode","ca_fingerprint","constraints","names","outside","expires"}` |
+| GET | `/api/tls` | `{"mode","ca_fingerprint","constraints","names","outside","public_names","expires"}` |
 | POST | `/api/tls/reload` | re-read the CA (`fw hub tls rotate` calls it) and re-issue now; closes TLS connections made under the old CA; 409 TLS off |
 
 ## Auth, machines, peers

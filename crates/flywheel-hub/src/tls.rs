@@ -9,7 +9,10 @@
 //! this machine's host name (`<host>.local` for a single-label one: a bare
 //! label as a constraint would cover a whole TLD), its LAN addresses, its
 //! tailnet name and addresses, and `[server] tls_names`. The leaf is
-//! re-issued when those change and before it expires.
+//! re-issued when those change and before it expires. `tls_names` takes
+//! private names only ([`PRIVATE_RULE`]); a public one needs an opt-in by
+//! name (`--tls-allow-public-name`, `[server] tls_public_names`), and
+//! everything that shows the CA then warns of it.
 //!
 //! **The CA is name-constrained** (X.509 nameConstraints, critical) to
 //! exactly those names and addresses as they were when it was created:
@@ -196,6 +199,137 @@ pub fn dns_name(raw: &str) -> Option<String> {
     ok.then_some(name)
 }
 
+/// The DNS suffixes `tls_names` takes without an opt-in: names under them
+/// are private (mDNS, home and internal networks, loopback, a tailnet's
+/// MagicDNS), so a CA constrained to one cannot vouch for a public site.
+pub const PRIVATE_DNS_SUFFIXES: &[&str] = &[
+    "local",
+    "lan",
+    "home.arpa",
+    "internal",
+    "localhost",
+    "ts.net",
+];
+
+/// The networks `tls_names` takes without an opt-in: RFC 1918, loopback,
+/// link-local, CGNAT (100.64/10, Tailscale), and IPv6 loopback, link-local
+/// and ULA (fc00::/7, Tailscale's included).
+const PRIVATE_NETS: &[(IpAddr, u8)] = &[
+    (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
+    (IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
+    (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+    (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
+    (IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7),
+];
+
+/// The private-namespace rule, as error messages name it.
+pub const PRIVATE_RULE: &str = "names under .local, .lan, .home.arpa, .internal, .localhost or \
+     <tailnet>.ts.net, and private (10/8, 172.16/12, 192.168/16), loopback, link-local, CGNAT \
+     (100.64/10) or ULA (fc00::/7) addresses and networks";
+
+/// Whether a DNS name is in a private namespace: `localhost`, or at least
+/// one label under a [`PRIVATE_DNS_SUFFIXES`] entry (never `ts.net`
+/// itself: that would cover every tailnet).
+pub fn private_dns(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "localhost"
+        || PRIVATE_DNS_SUFFIXES.iter().any(|suffix| {
+            name.strip_suffix(suffix)
+                .and_then(|rest| rest.strip_suffix('.'))
+                .is_some_and(|rest| !rest.is_empty())
+        })
+}
+
+/// Whether the network `ip/prefix` lies wholly inside a private range.
+pub fn private_net(ip: IpAddr, prefix: u8) -> bool {
+    let ip = ip.to_canonical();
+    // An IPv4-mapped address stands for its IPv4 one (prefix shifted).
+    let prefix = if ip.is_ipv4() && prefix > 32 {
+        prefix.saturating_sub(96)
+    } else {
+        prefix
+    };
+    PRIVATE_NETS.iter().any(|(net, wider)| {
+        net.is_ipv4() == ip.is_ipv4() && prefix >= *wider && mask(ip, *wider) == *net
+    })
+}
+
+/// Whether `spec` is in a private namespace (see [`PRIVATE_RULE`]).
+pub fn is_private(spec: &NameSpec) -> bool {
+    match spec {
+        NameSpec::Dns(name) => private_dns(name),
+        NameSpec::Ip(ip) => private_net(*ip, if ip.is_ipv4() { 32 } else { 128 }),
+        NameSpec::Net(ip, prefix) => private_net(*ip, *prefix),
+    }
+}
+
+/// The extra names the local CA and its leaf are for (`--tls-name`,
+/// `[server] tls_names`), checked: each is private (see [`PRIVATE_RULE`])
+/// or opted in by name (`--tls-allow-public-name`, `[server]
+/// tls_public_names`). The only way extra names reach a CA.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtraNames {
+    names: Vec<NameSpec>,
+    public: Vec<NameSpec>,
+}
+
+impl ExtraNames {
+    /// `names`, refusing a public one not in `allow_public`, and an
+    /// opt-in for a name that is not in `names`. One message per problem.
+    pub fn new(names: Vec<NameSpec>, allow_public: Vec<NameSpec>) -> Result<Self, Vec<String>> {
+        let mut errors = Vec::new();
+        for spec in &names {
+            if !is_private(spec) && !allow_public.contains(spec) {
+                let name = spec.to_string();
+                errors.push(format!(
+                    "{name:?} is a public name: the hub's CA (its key on this machine) could then \
+                     mint certificates for it that every device with the CA installed trusts. \
+                     Without an opt-in only private names are taken: {PRIVATE_RULE}. If {name} \
+                     is yours and you mean it, also pass --tls-allow-public-name {name} (hub.toml \
+                     [server] tls_public_names)"
+                ));
+            }
+        }
+        for spec in &allow_public {
+            if !names.contains(spec) {
+                errors.push(format!(
+                    "{spec} is opted in as public (--tls-allow-public-name, tls_public_names) but \
+                     is not a --tls-name (tls_names) entry: the opt-in allows a name listed \
+                     there, it does not add one"
+                ));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let public = names.iter().filter(|s| !is_private(s)).cloned().collect();
+        Ok(Self { names, public })
+    }
+
+    /// Every extra name.
+    pub fn names(&self) -> &[NameSpec] {
+        &self.names
+    }
+
+    /// The extra names a CA or leaf may take: each private or opted in.
+    /// [`ExtraNames::new`] refuses any other, so this is all of them; the
+    /// filter holds the line should one ever get in some other way.
+    fn permitted(&self) -> impl Iterator<Item = &NameSpec> {
+        self.names
+            .iter()
+            .filter(|spec| is_private(spec) || self.public.contains(spec))
+    }
+
+    /// The public ones among them (each opted in).
+    pub fn public(&self) -> &[NameSpec] {
+        &self.public
+    }
+}
+
 /// The names a certificate is for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Names {
@@ -227,7 +361,7 @@ pub fn hub_names(
     host: &str,
     interfaces: &[(String, IpAddr)],
     tailscale: Option<&Tailscale>,
-    extra: &[NameSpec],
+    extra: &ExtraNames,
 ) -> Names {
     let mut names = Names::default();
     names.dns.insert("localhost".to_owned());
@@ -254,7 +388,7 @@ pub fn hub_names(
         }
         names.ips.extend(ts.ips.iter().copied());
     }
-    for spec in extra {
+    for spec in extra.permitted() {
         match spec {
             NameSpec::Dns(name) => {
                 names.dns.insert(name.clone());
@@ -270,7 +404,7 @@ pub fn hub_names(
 
 /// [`hub_names`] for this machine now (asks `tailscale`, so it may take a
 /// few seconds: call it off the async runtime).
-pub fn discover_names(listen: SocketAddr, extra: &[NameSpec]) -> Names {
+pub fn discover_names(listen: SocketAddr, extra: &ExtraNames) -> Names {
     let tailscale = crate::remote::tailscale_program()
         .and_then(|p| crate::remote::detect_tailscale(&p, listen.port()));
     hub_names(
@@ -295,7 +429,7 @@ pub struct Constraints {
 impl Constraints {
     /// The constraints a new CA gets for `names` and the extra networks:
     /// each name, each address exactly, and all of loopback.
-    pub fn for_names(names: &Names, extra: &[NameSpec]) -> Self {
+    pub fn for_names(names: &Names, extra: &ExtraNames) -> Self {
         let mut dns: BTreeSet<String> = names
             .dns
             .iter()
@@ -310,7 +444,7 @@ impl Constraints {
             .collect();
         nets.insert((IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8));
         nets.insert((IpAddr::V6(Ipv6Addr::LOCALHOST), 128));
-        for spec in extra {
+        for spec in extra.permitted() {
             match spec {
                 NameSpec::Dns(name) => {
                     if constrainable(name) {
@@ -362,6 +496,43 @@ impl Constraints {
             .filter(|name| !constrainable(name))
             .cloned()
             .collect()
+    }
+
+    /// The constraints outside the private namespaces (see
+    /// [`PRIVATE_RULE`]) other than this machine's own names and addresses
+    /// (its host name, a public address of its own: those in `names` that
+    /// are not `extra` names): what a device installing the CA would trust
+    /// it for beyond this network. Each as the [`NameSpec`] that names it
+    /// (`ip/32` reads as the address).
+    pub fn public(&self, names: &Names, extra: &ExtraNames) -> Vec<NameSpec> {
+        let mut own = names.clone();
+        for spec in extra.names() {
+            match spec {
+                NameSpec::Dns(name) => {
+                    own.dns.remove(name);
+                }
+                NameSpec::Ip(ip) => {
+                    own.ips.remove(ip);
+                }
+                NameSpec::Net(..) => {}
+            }
+        }
+        let dns = self
+            .dns
+            .iter()
+            .filter(|name| !private_dns(name) && !own.dns.contains(*name))
+            .map(|name| NameSpec::Dns(name.clone()));
+        let nets = self.nets.iter().filter_map(|(ip, prefix)| {
+            let full = if ip.is_ipv4() { 32 } else { 128 };
+            let spec = if *prefix == full {
+                NameSpec::Ip(*ip)
+            } else {
+                NameSpec::Net(*ip, *prefix)
+            };
+            let own_ip = *prefix == full && own.ips.contains(ip);
+            (!private_net(*ip, *prefix) && !own_ip).then_some(spec)
+        });
+        dns.chain(nets).collect()
     }
 
     pub fn permits_ip(&self, ip: IpAddr) -> bool {
@@ -640,7 +811,7 @@ impl LocalCa {
     pub fn load_or_create(
         state_dir: &Path,
         names: &Names,
-        extra: &[NameSpec],
+        extra: &ExtraNames,
     ) -> Result<(Self, bool), String> {
         if let Some(ca) = Self::load(state_dir)? {
             return Ok((ca, false));
@@ -653,7 +824,7 @@ impl LocalCa {
     /// Replace `state_dir`'s CA with a new one for `names`: every device
     /// that trusted the old one must install this one, and the old key is
     /// gone (nothing new is ever signed by it).
-    pub fn rotate(state_dir: &Path, names: &Names, extra: &[NameSpec]) -> Result<Self, String> {
+    pub fn rotate(state_dir: &Path, names: &Names, extra: &ExtraNames) -> Result<Self, String> {
         let ca = Self::generate(Constraints::for_names(names, extra), SystemTime::now())?;
         ca.save(state_dir)?;
         Ok(ca)
@@ -972,7 +1143,7 @@ pub struct TlsServing {
     ca_epoch: tokio::sync::watch::Sender<u64>,
     resolver: Arc<Resolver>,
     source: Mutex<Source>,
-    extra: Vec<NameSpec>,
+    extra: ExtraNames,
     /// Where the hub listens (its names follow from it).
     listen: SocketAddr,
 }
@@ -1028,7 +1199,7 @@ impl TlsServing {
         state_dir: &Path,
         listen: SocketAddr,
         names: &Names,
-        extra: &[NameSpec],
+        extra: &ExtraNames,
     ) -> Result<Option<Arc<Self>>, String> {
         let (certified, source) = match mode {
             TlsMode::Off => return Ok(None),
@@ -1065,7 +1236,7 @@ impl TlsServing {
             ca_epoch: tokio::sync::watch::Sender::new(0),
             resolver,
             source: Mutex::new(source),
-            extra: extra.to_vec(),
+            extra: extra.clone(),
             listen,
         })))
     }
@@ -1090,7 +1261,7 @@ impl TlsServing {
     }
 
     /// The extra names it was started with.
-    pub fn extra_names(&self) -> &[NameSpec] {
+    pub fn extra_names(&self) -> &ExtraNames {
         &self.extra
     }
 
@@ -1280,6 +1451,39 @@ pub fn outside_warning(outside: &Names) -> String {
     )
 }
 
+/// What the CA's public constraints (see [`Constraints::public`]) mean, one
+/// line each for the opted-in ones and the others (empty when none).
+pub fn public_warnings(public: &[NameSpec], extra: &ExtraNames) -> Vec<String> {
+    let list = |specs: Vec<&NameSpec>| {
+        specs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (allowed, other): (Vec<&NameSpec>, Vec<&NameSpec>) =
+        public.iter().partition(|s| extra.public().contains(s));
+    let mut lines = Vec::new();
+    if !allowed.is_empty() {
+        lines.push(format!(
+            "WARNING: this CA may also sign for the public {} (allowed with \
+             --tls-allow-public-name): every device that installs it trusts this machine's CA key \
+             for them and every name under them; drop the opt-in and `fw hub tls rotate` unless \
+             you own them and mean it",
+            list(allowed)
+        ));
+    }
+    if !other.is_empty() {
+        lines.push(format!(
+            "WARNING: this CA may also sign for the public {}, which the current settings do \
+             not opt in to (--tls-allow-public-name): a CA from before the opt-in was needed or \
+             was dropped; run `fw hub tls rotate` and remove the old CA from every device",
+            list(other)
+        ));
+    }
+    lines
+}
+
 /// The warning for a CA (made by an earlier version) constrained to a
 /// single-label name, which X.509 reads as that whole TLD.
 pub fn too_wide_warning(wide: &[String]) -> String {
@@ -1307,6 +1511,12 @@ pub fn summary(serving: Option<&TlsServing>) -> serde_json::Value {
             "constraints": ca.constraints().list(),
             "names": names.list(),
             "outside": outside.list(),
+            "public_names": serving
+                .extra_names()
+                .public()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
             "expires": expires,
         }),
         _ => json!({ "mode": "files", "expires": expires }),

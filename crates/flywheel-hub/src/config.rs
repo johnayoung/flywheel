@@ -82,6 +82,8 @@ pub struct ServerSection {
     pub tls: Option<String>,
     /// Extra names (DNS, IP, or IP/prefix) for the local CA and its leaf.
     pub tls_names: Option<Vec<String>>,
+    /// The public ones among `tls_names` the operator opted in to.
+    pub tls_public_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -265,6 +267,7 @@ pub struct Flags {
     pub trusted_proxies: Vec<IpAddr>,
     pub tls: Option<crate::tls::TlsMode>,
     pub tls_names: Vec<crate::tls::NameSpec>,
+    pub tls_public_names: Vec<crate::tls::NameSpec>,
     pub scrollback_lines: Option<usize>,
     pub no_restore: bool,
     pub no_agent_resume: bool,
@@ -363,7 +366,8 @@ pub struct Effective {
     pub allow_origins: Vec<String>,
     pub trusted_proxies: Vec<IpAddr>,
     pub tls: crate::tls::TlsMode,
-    pub tls_names: Vec<crate::tls::NameSpec>,
+    /// `tls_names`, each private or opted in (`tls_public_names`).
+    pub tls_names: crate::tls::ExtraNames,
     pub scrollback_lines: usize,
     pub restore: bool,
     pub agent_resume: bool,
@@ -398,6 +402,7 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("server.trusted_proxies", Apply::Restart),
     ("server.tls", Apply::Restart),
     ("server.tls_names", Apply::Restart),
+    ("server.tls_public_names", Apply::Restart),
     ("sessions.scrollback_lines", Apply::Live),
     ("sessions.restore", Apply::Restart),
     ("sessions.agent_resume", Apply::Restart),
@@ -458,6 +463,14 @@ impl Effective {
             "server.tls" => json!(self.tls.to_string()),
             "server.tls_names" => json!(
                 self.tls_names
+                    .names()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            ),
+            "server.tls_public_names" => json!(
+                self.tls_names
+                    .public()
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
@@ -679,17 +692,22 @@ pub fn resolve(
         file_tls,
         crate::tls::TlsMode::Off
     );
-    let file_tls_names = file.server.tls_names.as_ref().map(|list| {
+    let names_in = |key: &str, list: &[String], errors: &mut Vec<String>| {
         list.iter()
             .filter_map(|raw| match crate::tls::parse_name(raw) {
                 Ok(name) => Some(name),
                 Err(message) => {
-                    errors.push(format!("server.tls_names: {message}"));
+                    errors.push(format!("{key}: {message}"));
                     None
                 }
             })
             .collect::<Vec<_>>()
-    });
+    };
+    let file_tls_names = file
+        .server
+        .tls_names
+        .as_ref()
+        .map(|list| names_in("server.tls_names", list, &mut errors));
     let flag_tls_names = (!flags.tls_names.is_empty()).then(|| flags.tls_names.clone());
     let tls_names = pick!(
         "server.tls_names",
@@ -697,6 +715,28 @@ pub fn resolve(
         file_tls_names,
         Vec::new()
     );
+    let file_public_names = file
+        .server
+        .tls_public_names
+        .as_ref()
+        .map(|list| names_in("server.tls_public_names", list, &mut errors));
+    let flag_public_names =
+        (!flags.tls_public_names.is_empty()).then(|| flags.tls_public_names.clone());
+    let tls_public_names = pick!(
+        "server.tls_public_names",
+        flag_public_names,
+        file_public_names,
+        Vec::new()
+    );
+    let tls_key = if flags.tls_names.is_empty() && flags.tls_public_names.is_empty() {
+        "server.tls_names"
+    } else {
+        "--tls-name"
+    };
+    let tls_names = crate::tls::ExtraNames::new(tls_names, tls_public_names).unwrap_or_else(|e| {
+        errors.extend(e.into_iter().map(|m| format!("{tls_key}: {m}")));
+        crate::tls::ExtraNames::default()
+    });
     let file_scrollback = file.sessions.scrollback_lines.and_then(|n| {
         if (1..=MAX_SCROLLBACK_LINES).contains(&n) {
             Some(n)
@@ -1293,6 +1333,7 @@ allow_origins = []
 trusted_proxies = []
 tls = "off"                       # auto: local name-constrained CA; or "/path/cert.pem,/path/key.pem"
 tls_names = []                    # extra names/IPs/networks for it, e.g. ["192.168.0.0/16"]
+tls_public_names = []             # public tls_names entries you own and opt in to (a warning)
 
 [sessions]
 scrollback_lines = 5000           # live: sessions started from now on
@@ -1360,6 +1401,73 @@ mod tests {
             let leaf = key.rsplit('.').next().unwrap();
             assert!(EXAMPLE.contains(&format!("{leaf} =")), "{key}");
         }
+    }
+
+    #[test]
+    fn tls_names_take_public_names_only_by_name() {
+        let spec = |raw: &str| crate::tls::parse_name(raw).unwrap();
+        let file = parse("[server]\ntls_names = [\"hub.lan\", \"192.168.0.0/16\"]\n").unwrap();
+        let e = resolve(&file, &Flags::default(), home()).unwrap();
+        assert_eq!(
+            e.tls_names.names(),
+            [spec("hub.lan"), spec("192.168.0.0/16")]
+        );
+        assert!(e.tls_names.public().is_empty());
+        // A public one from the file or a flag: refused, naming the rule
+        // and the opt-in.
+        for (file, flags) in [
+            (
+                parse("[server]\ntls_names = [\"hub.lan\", \"google.com\"]\n").unwrap(),
+                Flags::default(),
+            ),
+            (
+                FileConfig::default(),
+                Flags {
+                    tls_names: vec![spec("example.co.uk")],
+                    ..Flags::default()
+                },
+            ),
+        ] {
+            let errors = resolve(&file, &flags, home()).unwrap_err();
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            let key = if flags.tls_names.is_empty() {
+                "server.tls_names: "
+            } else {
+                "--tls-name: "
+            };
+            assert!(errors[0].starts_with(key), "{errors:?}");
+            assert!(
+                errors[0].contains("public name") && errors[0].contains(".ts.net"),
+                "{errors:?}"
+            );
+            assert!(errors[0].contains("--tls-allow-public-name"), "{errors:?}");
+        }
+        // Opted in (file or flag): taken, and shown as public.
+        let file = parse(
+            "[server]\ntls_names = [\"hub.example.com\"]\ntls_public_names = [\"hub.example.com\"]\n",
+        )
+        .unwrap();
+        let e = resolve(&file, &Flags::default(), home()).unwrap();
+        assert_eq!(e.tls_names.public(), [spec("hub.example.com")]);
+        assert_eq!(
+            e.value("server.tls_public_names"),
+            json!(["hub.example.com"])
+        );
+        assert_eq!(e.source("server.tls_public_names"), Source::File);
+        let flags = Flags {
+            tls_names: vec![spec("8.8.8.8")],
+            tls_public_names: vec![spec("8.8.8.8")],
+            ..Flags::default()
+        };
+        let e = resolve(&FileConfig::default(), &flags, home()).unwrap();
+        assert_eq!(e.tls_names.public(), [spec("8.8.8.8")]);
+        // A stray opt-in is an error too.
+        let flags = Flags {
+            tls_public_names: vec![spec("google.com")],
+            ..Flags::default()
+        };
+        let errors = resolve(&FileConfig::default(), &flags, home()).unwrap_err();
+        assert!(errors[0].contains("not a --tls-name"), "{errors:?}");
     }
 
     #[test]

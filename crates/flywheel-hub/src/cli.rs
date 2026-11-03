@@ -286,12 +286,19 @@ pub(crate) struct HubArgs {
     /// https, except /ca; loopback keeps http.
     #[arg(long, value_name = "auto|off|CERT,KEY", value_parser = parse_tls_mode)]
     tls: Option<crate::tls::TlsMode>,
-    /// An extra name for the local CA and its certificate: a DNS name, an
-    /// IP address, or an IP network the CA may sign for (e.g.
-    /// 192.168.0.0/16, so a new DHCP lease is covered); repeatable. Names
-    /// added after the CA was made need `fw hub tls rotate`.
+    /// An extra name for the local CA and its certificate: a private DNS
+    /// name (under .local, .lan, .home.arpa, .internal, .localhost, or
+    /// <tailnet>.ts.net), a private IP address, or a private IP network the
+    /// CA may sign for (e.g. 192.168.0.0/16, so a new DHCP lease is
+    /// covered); repeatable. Names added after the CA was made need `fw hub
+    /// tls rotate`.
     #[arg(long = "tls-name", value_name = "NAME", value_parser = crate::tls::parse_name)]
     tls_names: Vec<crate::tls::NameSpec>,
+    /// Allow this public --tls-name (a domain or address you own): every
+    /// device that installs the CA then trusts this machine's CA key for
+    /// it; `fw hub tls ca` and /ca say so. Repeatable, one per name.
+    #[arg(long = "tls-allow-public-name", value_name = "NAME", value_parser = crate::tls::parse_name)]
+    tls_public_names: Vec<crate::tls::NameSpec>,
     /// Per-session scrollback kept by the server's terminal emulator, in
     /// lines (capped at 1M cells, so wide terminals keep fewer)
     /// [default: 5000, or hub.toml sessions.scrollback_lines].
@@ -392,6 +399,9 @@ impl HubArgs {
         for name in &self.tls_names {
             argv.extend(["--tls-name".to_owned(), name.to_string()]);
         }
+        for name in &self.tls_public_names {
+            argv.extend(["--tls-allow-public-name".to_owned(), name.to_string()]);
+        }
         if let Some(lines) = self.scrollback_lines {
             argv.extend(["--scrollback-lines".to_owned(), lines.to_string()]);
         }
@@ -450,6 +460,7 @@ impl HubArgs {
             trusted_proxies: self.trusted_proxies.clone(),
             tls: self.tls.clone(),
             tls_names: self.tls_names.clone(),
+            tls_public_names: self.tls_public_names.clone(),
             scrollback_lines: self.scrollback_lines,
             no_restore: self.no_restore,
             no_agent_resume: self.no_agent_resume,

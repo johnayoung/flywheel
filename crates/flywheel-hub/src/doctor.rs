@@ -224,11 +224,24 @@ fn run_checks(
     let tailscale = tailscale_check(hub.as_ref().map_or(port, |h| h.port));
     let tailscale_serves = tailscale.level == Level::Ok;
     checks.push(tailscale);
+    let no_extra = crate::tls::ExtraNames::default();
+    let extra = effective.as_ref().map_or(&no_extra, |e| &e.tls_names);
+    // This machine's own names and addresses (not the tailnet's: those
+    // are private anyway): a public one of them is not a warning.
+    let own = crate::tls::hub_names(
+        std::net::SocketAddr::new(bind, port),
+        &crate::machines::host_name(),
+        &crate::remote::interface_addresses(),
+        None,
+        &no_extra,
+    );
     checks.push(tls_check(
         dir,
         effective
             .as_ref()
             .map_or(&crate::tls::TlsMode::Off, |e| &e.tls),
+        extra,
+        &own,
         tailscale_serves,
     ));
     checks.push(browser_check());
@@ -1237,9 +1250,16 @@ fn tailscale_check(port: u16) -> Check {
 
 /// Built-in TLS: off (and whether a phone then gets https any other way),
 /// or the local CA's state (key mode, expiry), or the operator's files.
-fn tls_check(dir: &Path, mode: &crate::tls::TlsMode, tailscale_serves: bool) -> Check {
+fn tls_check(
+    dir: &Path,
+    mode: &crate::tls::TlsMode,
+    extra: &crate::tls::ExtraNames,
+    own: &crate::tls::Names,
+    tailscale_serves: bool,
+) -> Check {
     use crate::tls::{LocalCa, TlsMode};
     let id = "tls";
+    let allowed: Vec<String> = extra.public().iter().map(ToString::to_string).collect();
     match mode {
         TlsMode::Off if tailscale_serves => Check::new(
             id,
@@ -1278,6 +1298,17 @@ fn tls_check(dir: &Path, mode: &crate::tls::TlsMode, tailscale_serves: bool) -> 
             }
         }
         TlsMode::Auto => match LocalCa::load(dir) {
+            Ok(None) if !allowed.is_empty() => Check::new(
+                id,
+                Level::Warn,
+                format!(
+                    "auto: the local CA made at the next start may sign for the public {} \
+                     (--tls-allow-public-name): every device with it installed trusts this \
+                     machine's CA key for them",
+                    allowed.join(", ")
+                ),
+            )
+            .fix("only for names you own; else drop them from tls_names and tls_public_names"),
             Ok(None) => Check::new(
                 id,
                 Level::Info,
@@ -1314,6 +1345,12 @@ fn tls_check(dir: &Path, mode: &crate::tls::TlsMode, tailscale_serves: bool) -> 
                     crate::machines::display_fingerprint(ca.fingerprint())
                 );
                 let wide = ca.constraints().too_wide();
+                let public = ca.constraints().public(own, extra);
+                let unallowed: Vec<String> = public
+                    .iter()
+                    .filter(|s| !extra.public().contains(s))
+                    .map(ToString::to_string)
+                    .collect();
                 let check = if !wide.is_empty() {
                     Check::new(
                         id,
@@ -1324,6 +1361,45 @@ fn tls_check(dir: &Path, mode: &crate::tls::TlsMode, tailscale_serves: bool) -> 
                         ),
                     )
                     .fix("`fw hub tls rotate`, then re-install the CA on every device")
+                } else if !unallowed.is_empty() {
+                    Check::new(
+                        id,
+                        Level::Warn,
+                        format!(
+                            "{summary} may sign for the public {}, which hub.toml does not opt \
+                             in to (tls_public_names): every device with it installed trusts \
+                             this machine's CA key for them",
+                            unallowed.join(", ")
+                        ),
+                    )
+                    .fix(
+                        "unless you own them and opted in on the serve command line: `fw hub \
+                         tls rotate`, then remove the old CA from every device",
+                    )
+                } else if !public.is_empty() || !allowed.is_empty() {
+                    let signs: Vec<String> = public.iter().map(ToString::to_string).collect();
+                    Check::new(
+                        id,
+                        Level::Warn,
+                        if signs.is_empty() {
+                            format!(
+                                "{summary}: public names allowed ({}): the CA made by the next \
+                                 `fw hub tls rotate` signs for them",
+                                allowed.join(", ")
+                            )
+                        } else {
+                            format!(
+                                "{summary} may sign for the public {} (--tls-allow-public-name): \
+                                 every device with it installed trusts this machine's CA key \
+                                 for them",
+                                signs.join(", ")
+                            )
+                        },
+                    )
+                    .fix(
+                        "only for names you own; else drop them from tls_names and \
+                         tls_public_names, then `fw hub tls rotate`",
+                    )
                 } else if left < Duration::from_secs(30 * 24 * 3600) {
                     Check::new(id, Level::Warn, format!("{summary} expires within 30 days"))
                         .fix("`fw hub tls rotate` (devices re-install it)")
@@ -1663,6 +1739,62 @@ mod tests {
         let check = on_path_check("fw", &found, Some(&exe));
         assert_eq!(check.level, Level::Ok, "{check:?}");
         assert!(check.details[0].contains("venv/bin/fw"));
+    }
+
+    #[test]
+    fn the_tls_check_warns_of_public_names() {
+        use crate::tls::{ExtraNames, LocalCa, TlsMode, hub_names, parse_name};
+        let dir = tempfile::tempdir().unwrap();
+        let listen = "0.0.0.0:7600".parse().unwrap();
+        let interfaces = [("eth0".to_owned(), "192.168.1.20".parse().unwrap())];
+        let own = hub_names(listen, "box", &interfaces, None, &ExtraNames::default());
+        let name = parse_name("hub.example.com").unwrap();
+        let allowed = ExtraNames::new(vec![name.clone()], vec![name]).unwrap();
+        // Allowed, no CA yet: a warning before one is made.
+        let check = tls_check(dir.path(), &TlsMode::Auto, &allowed, &own, false);
+        assert_eq!(check.level, Level::Warn, "{}", check.summary);
+        assert!(
+            check.summary.contains("public hub.example.com"),
+            "{}",
+            check.summary
+        );
+        // A CA that signs for it: a warning while the opt-in stands ...
+        let names = hub_names(listen, "box", &interfaces, None, &allowed);
+        LocalCa::load_or_create(dir.path(), &names, &allowed).unwrap();
+        let check = tls_check(dir.path(), &TlsMode::Auto, &allowed, &own, false);
+        assert_eq!(check.level, Level::Warn, "{}", check.summary);
+        assert!(
+            check
+                .summary
+                .contains("may sign for the public hub.example.com"),
+            "{}",
+            check.summary
+        );
+        // ... and still once it is gone, now pointing at rotation.
+        let check = tls_check(
+            dir.path(),
+            &TlsMode::Auto,
+            &ExtraNames::default(),
+            &own,
+            false,
+        );
+        assert_eq!(check.level, Level::Warn, "{}", check.summary);
+        assert!(
+            check.summary.contains("does not opt in"),
+            "{}",
+            check.summary
+        );
+        assert!(check.fix.unwrap().contains("rotate"));
+        // A private-only CA is fine (the machine's own addresses included).
+        LocalCa::rotate(dir.path(), &own, &ExtraNames::default()).unwrap();
+        let check = tls_check(
+            dir.path(),
+            &TlsMode::Auto,
+            &ExtraNames::default(),
+            &own,
+            false,
+        );
+        assert_eq!(check.level, Level::Ok, "{}", check.summary);
     }
 
     #[test]

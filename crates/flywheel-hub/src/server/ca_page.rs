@@ -54,11 +54,43 @@ fn fixed(mut response: Response, content_type: &'static str) -> Response {
 
 /// `GET /ca`.
 pub(super) async fn page(State(app): State<AppState>) -> Response {
-    let Some(ca) = app.options.tls.as_ref().and_then(|t| t.ca()) else {
+    let Some(tls) = app.options.tls.as_ref() else {
+        return no_ca();
+    };
+    let Some(ca) = tls.ca() else {
         return no_ca();
     };
     let esc = crate::web::escape_html;
     let host = crate::machines::host_name();
+    // This hub's own names (its leaf's, in or out of the constraints, but
+    // not the extra ones) are not what a device is warned about; any other
+    // public one is.
+    let names = tls
+        .names()
+        .map_or_else(crate::tls::Names::default, |(mut inside, outside)| {
+            inside.dns.extend(outside.dns);
+            inside.ips.extend(outside.ips);
+            inside
+        });
+    let public = ca.constraints().public(&names, tls.extra_names());
+    let public_warning = if public.is_empty() {
+        String::new()
+    } else {
+        let list: String = public
+            .iter()
+            .map(|spec| format!("<li>{}</li>", esc(&spec.to_string())))
+            .collect();
+        let lines: String = crate::tls::public_warnings(&public, tls.extra_names())
+            .iter()
+            .map(|line| format!("<p>{}</p>", esc(line)))
+            .collect();
+        format!(
+            "<section class=\"public\" role=\"alert\"><h2>Warning: public names</h2><p>This CA \
+             can also vouch for these <b>public</b> names (and every name under them). Install it \
+             only if you run them and trust this machine's key with them: whoever holds it can \
+             impersonate them to this device.</p><ul class=\"names\">{list}</ul>{lines}</section>"
+        )
+    };
     let constraints: String = ca
         .constraints()
         .list()
@@ -84,6 +116,7 @@ pub(super) async fn page(State(app): State<AppState>) -> Response {
             &esc(&crate::machines::display_fingerprint(ca.fingerprint())).replace(':', ":<wbr>"),
         )
         .replace("{{CONSTRAINTS}}", &constraints)
+        .replace("{{PUBLIC}}", &public_warning)
         .replace("{{CREATED}}", &date(ca.created()))
         .replace("{{EXPIRES}}", &date(ca.expires()));
     let mut response = fixed(Html(html).into_response(), "text/html; charset=utf-8");

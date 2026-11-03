@@ -595,6 +595,58 @@ where
     }
 }
 
+/// `Query` for the pages (`/`, `/login`): a query string serde cannot
+/// read answers like [`ApiQuery`]'s, as `{"error": ...}` to a client that
+/// asks for JSON and as a page to a browser, never axum's plain text.
+struct PageQuery<T>(T);
+
+impl<S, T> axum::extract::FromRequestParts<S> for PageQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Response> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(Self(value)),
+            Err(rejection) => {
+                let message =
+                    bounded_message(&query_message(&rejection_message(&rejection.body_text())));
+                let mut response = if wants_json(&parts.headers) {
+                    error_response(rejection.status(), &message)
+                } else {
+                    let mut page = axum::response::Html(crate::web::notice_page(
+                        "That link is not valid",
+                        &message,
+                        "Open the hub",
+                    ))
+                    .into_response();
+                    *page.status_mut() = rejection.status();
+                    page
+                };
+                response
+                    .headers_mut()
+                    .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                Err(response)
+            }
+        }
+    }
+}
+
+/// Whether a request asks for JSON rather than a page: its `Accept` names
+/// `application/json` (or `+json`) and not `text/html`.
+fn wants_json(headers: &HeaderMap) -> bool {
+    let accept = header_str(headers, header::ACCEPT)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    (accept.contains("application/json") || accept.contains("+json"))
+        && !accept.contains("text/html")
+}
+
 /// A boolean query flag: absent or `false`/`0` is false; `true`/`1`/empty
 /// (`?all`) is true; anything else is an error naming `name`.
 fn query_flag(name: &str, raw: Option<&str>) -> Result<bool, String> {

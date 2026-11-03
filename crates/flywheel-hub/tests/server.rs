@@ -352,6 +352,75 @@ async fn everything_but_login_requires_the_token() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pages_refuse_unreadable_query_strings_as_a_page_or_json() {
+    let hub = TestHub::start().await;
+    for path in [
+        "/login?token=a&token=b",
+        "/?signed_out=rotated&signed_out=ended",
+    ] {
+        let name = if path.starts_with("/login") {
+            "token"
+        } else {
+            "signed_out"
+        };
+        // A browser gets a page saying what is wrong, with a way back.
+        let page = hub
+            .http
+            .get(hub.url(path))
+            .header(
+                reqwest::header::ACCEPT,
+                "text/html,application/xhtml+xml,*/*;q=0.8",
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(page.headers()["cache-control"], "no-store", "{path}");
+        assert!(
+            page.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"),
+            "{path}"
+        );
+        let body = page.text().await.unwrap();
+        assert!(
+            body.contains(&format!("{name} is given twice")),
+            "{path}: {body}"
+        );
+        assert!(body.contains("href=\"/\""), "{path}: {body}");
+        assert!(!body.contains("Failed to"), "{path}: {body}");
+        // A client asking for JSON gets the API's form; one asking for
+        // nothing in particular gets the page.
+        let json = hub
+            .http
+            .get(hub.url(path))
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(json.status(), StatusCode::BAD_REQUEST, "{path}");
+        let error: Value = json.json().await.expect("JSON error body");
+        assert_eq!(error["error"], format!("{name} is given twice"), "{path}");
+        let bare = hub.http.get(hub.url(path)).send().await.unwrap();
+        assert_eq!(bare.status(), StatusCode::BAD_REQUEST, "{path}");
+        assert!(
+            bare.text().await.unwrap().contains("<!doctype html>"),
+            "{path}"
+        );
+    }
+    // A readable query string still works.
+    let ok = hub
+        .http
+        .get(hub.url(&format!("/login?token={}", hub.token)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn login_trades_the_token_for_a_strict_http_only_cookie() {
     let hub = TestHub::start().await;
     let wrong = hub

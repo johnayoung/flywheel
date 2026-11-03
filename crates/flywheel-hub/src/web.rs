@@ -337,6 +337,34 @@ pub fn viewer_page(credential: &str) -> String {
 
 /// A share link that opens nothing (invalid, revoked, expired).
 pub fn share_refused_page(message: &str) -> String {
+    notice(
+        Some("Share link"),
+        &escape_html(message),
+        "<p>Ask whoever shared it for a new link.</p>",
+    )
+}
+
+/// A page saying what went wrong: `heading`, the `message` under it, and
+/// a link labelled `back` to the hub's start page.
+pub fn notice_page(heading: &str, message: &str, back: &str) -> String {
+    notice(
+        None,
+        &escape_html(heading),
+        &format!(
+            "<p>{}</p>\n  <p><a href=\"/\">{}</a></p>",
+            escape_html(message),
+            escape_html(back)
+        ),
+    )
+}
+
+/// The notice page: titled `what` (plain text) before the hub's name,
+/// with `heading_html` and `body_html` (already escaped).
+fn notice(what: Option<&str>, heading_html: &str, body_html: &str) -> String {
+    let title = match what {
+        Some(what) => format!("{what} - flywheel hub"),
+        None => "flywheel hub".to_owned(),
+    };
     format!(
         r##"<!doctype html>
 <html lang="en">
@@ -345,7 +373,7 @@ pub fn share_refused_page(message: &str) -> String {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <meta name="robots" content="noindex, nofollow">
-<title>Share link - flywheel hub</title>
+<title>{}</title>
 <style>
   :root {{ color-scheme: dark; --bg: #0c0d0c; --ink: #ece6d6; --ink-2: #a8a291; --signal: #ff5a1f; }}
   @media (prefers-color-scheme: light) {{ :root {{ color-scheme: light; --bg: #f2eee4; --ink: #1b1c18; --ink-2: #57544b; --signal: #e2470c; }} }}
@@ -353,17 +381,20 @@ pub fn share_refused_page(message: &str) -> String {
          font: 14px/1.6 ui-monospace, monospace; }}
   main {{ max-width: 32rem; padding: 2rem; border-top: 4px solid var(--signal); }}
   p {{ color: var(--ink-2); }}
+  a {{ color: var(--signal); }}
 </style>
 </head>
 <body>
 <main>
   <h1>{}</h1>
-  <p>Ask whoever shared it for a new link.</p>
+  {}
 </main>
 </body>
 </html>
 "##,
-        escape_html(message)
+        escape_html(&title),
+        heading_html,
+        body_html
     )
 }
 
@@ -805,6 +836,11 @@ mod tests {
             assert!(!is_viewer_asset(app_code), "{app_code}");
         }
         assert!(share_refused_page("<b>").contains("&lt;b&gt;"));
+        assert!(share_refused_page("x").contains("<title>Share link - flywheel hub</title>"));
+        let notice = notice_page("<h>", "<m>", "<back>");
+        assert!(notice.contains("<h1>&lt;h&gt;</h1>"), "{notice}");
+        assert!(notice.contains("&lt;m&gt;") && notice.contains("&lt;back&gt;</a>"));
+        assert!(!notice.contains("<m>") && !notice.contains("<back>"));
         for reference in PLAYER_HTML.split("/assets/").skip(1) {
             let path = reference.split('"').next().unwrap();
             assert!(

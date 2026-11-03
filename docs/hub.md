@@ -570,7 +570,7 @@ Workspace folders that are flywheel-adopted repos (a `flywheel.toml` or a `.flyw
 
 ## API
 
-All under `/api`, JSON, token required. Errors are `{"error":"..."}` (unknown endpoints 404 and wrong methods 405 too); a malformed body is 400, a JSON body of the wrong shape 422. `cols`/`rows` of 0 mean the default (120x32).
+All under `/api`, JSON, token required. Errors are `{"error":"..."}` (unknown endpoints 404 and wrong methods 405 too); a malformed body is 400, a JSON body of the wrong shape 422, an unreadable query string 400 in the caller's words (`limit must be a number`). The pages (`/`, `/login`) answer an unreadable query string with 400 as a page, or as `{"error"}` to `Accept: application/json`. `cols`/`rows` of 0 mean the default (120x32).
 
 | Method | Path | |
 |---|---|---|

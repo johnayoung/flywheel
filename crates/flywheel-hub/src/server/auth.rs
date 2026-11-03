@@ -5,7 +5,7 @@
 //! sign a browser in and out.
 
 use super::{
-    ApiResult, AppState, Peer, ServerOptions, WS_CLOSE_PEER_REVOKED, WS_CLOSE_ROTATED,
+    ApiResult, AppState, PageQuery, Peer, ServerOptions, WS_CLOSE_PEER_REVOKED, WS_CLOSE_ROTATED,
     WS_CLOSE_SIGNED_OUT, blocking, error_response, header_str,
 };
 use crate::auth::{
@@ -16,7 +16,7 @@ use crate::hub::Hub;
 use crate::web;
 use axum::Json;
 use axum::extract::ws::CloseFrame;
-use axum::extract::{ConnectInfo, Form, FromRequestParts, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, Form, FromRequestParts, Path, Request, State};
 use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
@@ -473,7 +473,7 @@ pub(super) async fn index(
     State(app): State<AppState>,
     client: Client,
     headers: HeaderMap,
-    Query(query): Query<IndexQuery>,
+    PageQuery(query): PageQuery<IndexQuery>,
 ) -> Response {
     match authenticate(&app, &headers, client) {
         Auth::Granted(_) => {
@@ -525,7 +525,7 @@ pub(super) async fn login_query(
     State(app): State<AppState>,
     client: Client,
     headers: HeaderMap,
-    Query(param): Query<LoginParam>,
+    PageQuery(param): PageQuery<LoginParam>,
 ) -> Response {
     login(&app, &headers, client, param.presented())
 }

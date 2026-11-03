@@ -39,6 +39,7 @@ function paletteCommands() {
   for (const name of machines.names()) {
     if (machines.linkOf(name) !== "online") cmd(`Reconnect to ${name}`, machines.linkOf(name), () => machines.reconnect(name), "redo");
   }
+  for (const item of sharing.paletteItems(attached)) cmd(item.label, item.hint, item.run, item.glyph);
   cmd("Import VS Code workspace", ".code-workspace files", () => {
     openWorkspaceDialog();
     importer.open();
@@ -485,6 +486,12 @@ const actions = {
   machines: () => {
     document.body.classList.remove("side-open");
     machines.openDialog();
+  },
+  share: () => sharing.open(state.attached),
+  "toggle-record": () => sharing.toggleRecord(state.attached),
+  sharing: () => {
+    document.body.classList.remove("side-open");
+    sharing.open(null);
   },
 };
 document.addEventListener("click", (event) => {

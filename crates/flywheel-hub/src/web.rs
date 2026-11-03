@@ -122,6 +122,20 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ("panes.js", include_bytes!("../web/panes.js"), JS),
     ("search.js", include_bytes!("../web/search.js"), JS),
     ("settings.js", include_bytes!("../web/settings.js"), JS),
+    ("sharing.js", include_bytes!("../web/sharing.js"), JS),
+    ("term-view.js", include_bytes!("../web/term-view.js"), JS),
+    ("viewer.js", include_bytes!("../web/viewer.js"), JS),
+    ("player.js", include_bytes!("../web/player.js"), JS),
+    (
+        "viewer.css",
+        include_bytes!("../web/viewer.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-sharing.css",
+        include_bytes!("../web/app-sharing.css"),
+        "text/css; charset=utf-8",
+    ),
     ("login.js", include_bytes!("../web/login.js"), JS),
     (
         "app.css",
@@ -254,6 +268,147 @@ pub fn is_public_asset(path: &str) -> bool {
         .strip_prefix("vendor/fonts/")
         .is_some_and(|f| f.ends_with(".woff2") && !f.contains('/'))
 }
+
+/// What a share link's viewer page loads under
+/// `/share/<credential>/assets/`: its own script and styles and the
+/// terminal emulator -- none of the app's code.
+pub fn is_viewer_asset(path: &str) -> bool {
+    matches!(
+        path,
+        "viewer.js"
+            | "term-view.js"
+            | "viewer.css"
+            | "vendor/xterm/xterm.js"
+            | "vendor/xterm/xterm.css"
+    )
+}
+
+/// The page a share link opens: a terminal, its title and status, nothing
+/// else. `credential` is a validated share credential (hex and `_`).
+pub fn viewer_page(credential: &str) -> String {
+    let base = format!("/share/{}/assets", escape_html(credential));
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex, nofollow">
+<title>Shared terminal - flywheel hub</title>
+<link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
+<link rel="stylesheet" href="{base}/vendor/xterm/xterm.css">
+<link rel="stylesheet" href="{base}/viewer.css">
+<script src="{base}/vendor/xterm/xterm.js" defer></script>
+<script src="{base}/term-view.js" defer></script>
+<script src="{base}/viewer.js" defer></script>
+</head>
+<body class="vw">
+<header class="vw-head">
+  <div class="vw-titles">
+    <span class="vw-kicker">flywheel hub &middot; <b>read-only view</b></span>
+    <h1 id="vw-title">Shared terminal</h1>
+  </div>
+  <div class="vw-pills">
+    <span id="vw-status" class="vw-pill" hidden></span>
+    <span id="vw-link" class="vw-pill" data-link="connecting">connecting</span>
+  </div>
+</header>
+<main id="vw-stage" class="vw-stage">
+  <div id="vw-term" class="vw-term"></div>
+  <div id="vw-note" class="vw-note" role="status" hidden></div>
+</main>
+<footer class="vw-foot">
+  <span>Watching a live terminal: you cannot type into it.</span>
+  <span id="vw-meta" class="vw-meta"></span>
+</footer>
+</body>
+</html>
+"##
+    )
+}
+
+/// A share link that opens nothing (invalid, revoked, expired).
+pub fn share_refused_page(message: &str) -> String {
+    format!(
+        r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="robots" content="noindex, nofollow">
+<title>Share link - flywheel hub</title>
+<style>
+  :root {{ color-scheme: dark; --bg: #0c0d0c; --ink: #ece6d6; --ink-2: #a8a291; --signal: #ff5a1f; }}
+  @media (prefers-color-scheme: light) {{ :root {{ color-scheme: light; --bg: #f2eee4; --ink: #1b1c18; --ink-2: #57544b; --signal: #e2470c; }} }}
+  body {{ margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--ink);
+         font: 14px/1.6 ui-monospace, monospace; }}
+  main {{ max-width: 32rem; padding: 2rem; border-top: 4px solid var(--signal); }}
+  p {{ color: var(--ink-2); }}
+</style>
+</head>
+<body>
+<main>
+  <h1>{}</h1>
+  <p>Ask whoever shared it for a new link.</p>
+</main>
+</body>
+</html>
+"##,
+        escape_html(message)
+    )
+}
+
+/// The replay player (served at `/replay#<recording>` to a signed-in
+/// browser).
+pub const PLAYER_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>Replay - flywheel hub</title>
+<link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
+<link rel="stylesheet" href="/assets/vendor/xterm/xterm.css">
+<link rel="stylesheet" href="/assets/viewer.css">
+<script src="/assets/vendor/xterm/xterm.js" defer></script>
+<script src="/assets/term-view.js" defer></script>
+<script src="/assets/player.js" defer></script>
+</head>
+<body class="vw pl">
+<header class="vw-head">
+  <div class="vw-titles">
+    <span class="vw-kicker">flywheel hub &middot; <b>replay</b></span>
+    <h1 id="vw-title">Recording</h1>
+  </div>
+  <div class="vw-pills">
+    <a class="vw-pill" id="pl-download" href="#" download>download .cast</a>
+    <a class="vw-pill" href="/">hub</a>
+  </div>
+</header>
+<main id="vw-stage" class="vw-stage">
+  <div id="vw-term" class="vw-term"></div>
+  <div id="vw-note" class="vw-note" role="status" hidden></div>
+</main>
+<footer class="pl-bar">
+  <button type="button" id="pl-play" class="pl-btn" disabled>Play</button>
+  <input type="range" id="pl-seek" class="pl-seek" min="0" max="1000" step="1" value="0" disabled aria-label="Position">
+  <span id="pl-time" class="pl-time">0:00 / 0:00</span>
+  <label class="pl-opt">speed
+    <select id="pl-speed">
+      <option value="0.5">0.5x</option>
+      <option value="1" selected>1x</option>
+      <option value="2">2x</option>
+      <option value="4">4x</option>
+      <option value="8">8x</option>
+    </select>
+  </label>
+  <label class="pl-opt"><input type="checkbox" id="pl-idle" checked> skip idle</label>
+</footer>
+</body>
+</html>
+"##;
 
 fn escape_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -585,6 +740,42 @@ mod tests {
         for reference in LOGGED_IN_HTML.split("/assets/").skip(1) {
             let path = reference.split('"').next().unwrap();
             assert!(is_public_asset(path) && asset(path).is_some(), "{path}");
+        }
+    }
+
+    #[test]
+    fn the_viewer_page_loads_only_viewer_assets() {
+        let credential = format!("fwview_{}_{}", "a".repeat(12), "b".repeat(64));
+        let page = viewer_page(&credential);
+        let prefix = format!("/share/{credential}/assets/");
+        let mut seen = 0;
+        for reference in page.split(prefix.as_str()).skip(1) {
+            let path = reference.split('"').next().unwrap();
+            assert!(is_viewer_asset(path) && asset(path).is_some(), "{path}");
+            seen += 1;
+        }
+        assert_eq!(seen, 5);
+        // Other assets it names are public (the icon).
+        for reference in page.split("\"/assets/").skip(1) {
+            let path = reference.split('"').next().unwrap();
+            assert!(is_public_asset(path), "{path}");
+        }
+        for app_code in [
+            "app.js",
+            "app-base.js",
+            "sharing.js",
+            "player.js",
+            "app.css",
+        ] {
+            assert!(!is_viewer_asset(app_code), "{app_code}");
+        }
+        assert!(share_refused_page("<b>").contains("&lt;b&gt;"));
+        for reference in PLAYER_HTML.split("/assets/").skip(1) {
+            let path = reference.split('"').next().unwrap();
+            assert!(
+                asset(path).is_some(),
+                "player.html references missing {path}"
+            );
         }
     }
 

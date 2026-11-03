@@ -259,6 +259,7 @@ pub fn peer_forbidden(path: &str) -> bool {
         || under("/api/plugins")
         || under("/api/settings")
         || under("/api/config")
+        || under("/api/shares")
         || under("/m")
         || !path.starts_with("/api")
 }
@@ -485,6 +486,8 @@ mod tests {
             "/api/plugins/p/actions/a",
             "/api/settings",
             "/api/config",
+            "/api/shares",
+            "/api/shares/abc",
             "/m/b/api/sessions",
             "/",
             "/login",

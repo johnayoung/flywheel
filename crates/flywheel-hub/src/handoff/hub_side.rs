@@ -105,6 +105,9 @@ impl Hub {
                 )
             });
         }
+        // Every recorder writes out what the paused sessions output and
+        // lets go of its file (the next hub appends to it).
+        self.recordings.freeze();
         let sessions = live
             .into_iter()
             .map(|(id, session)| FrozenSession {
@@ -126,6 +129,8 @@ impl Hub {
             eprintln!("fw hub: {e}");
         }
         self.grading.resume();
+        // Before the sessions run again: no output goes unrecorded.
+        self.resume_recordings();
         let live: Vec<Arc<PtySession>> = self.live().values().cloned().collect();
         for session in live {
             if forget_held {
@@ -217,6 +222,10 @@ impl Hub {
     /// The old hub let go: start reading and writing every adopted
     /// session, taking agent reports, and following transcripts.
     pub(crate) fn handoff_commit(self: &Arc<Self>) {
+        // The old hub's recordings carry on in their files, subscribed
+        // before the sessions resume.
+        self.recordings.load_active();
+        self.resume_recordings();
         let live: Vec<Arc<PtySession>> = self.live().values().cloned().collect();
         for session in live {
             session.resume();

@@ -13,15 +13,32 @@ use super::slots::Admission;
 use super::{AppState, Client, header_str, login_cookies};
 use crate::auth::{bearer_value, cookie_name};
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::sync::PoisonError;
 use std::time::Instant;
 
-/// Whether `headers` carry a live login cookie, the token, or a peer
-/// credential.
-fn presents_credential(app: &AppState, headers: &HeaderMap, client: Client) -> bool {
+/// Whether the request carries a live login cookie, the token, a peer
+/// credential, or (in its `/share/` path) a live share link's credential.
+fn presents_credential(app: &AppState, request: &Request, client: Client) -> bool {
+    let headers = request.headers();
+    let locked = || {
+        !client.same_machine
+            && app
+                .failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .locked(client.ip, Instant::now())
+                .is_some()
+    };
+    if let Some((credential, _)) = crate::share::credential_in_path(request.uri().path()) {
+        return !locked()
+            && matches!(
+                app.hub.shares().verify(credential),
+                crate::share::Verdict::Live(_)
+            );
+    }
     let token = app.hub.token();
     let cookies = login_cookies(headers, &cookie_name(token.expose()));
     if cookies.iter().any(|c| app.hub.login_valid(c)) {
@@ -30,11 +47,8 @@ fn presents_credential(app: &AppState, headers: &HeaderMap, client: Client) -> b
     let Some(bearer) = header_str(headers, header::AUTHORIZATION).and_then(bearer_value) else {
         return false;
     };
-    if !client.same_machine {
-        let mut failures = app.failures.lock().unwrap_or_else(PoisonError::into_inner);
-        if failures.locked(client.ip, Instant::now()).is_some() {
-            return false;
-        }
+    if locked() {
+        return false;
     }
     token.matches(bearer) || app.peers.verify(bearer).is_some()
 }
@@ -55,7 +69,7 @@ pub(super) async fn admit(State(app): State<AppState>, request: Request, next: N
         return next.run(request).await;
     };
     let client = Client::of(request.extensions(), request.headers(), &app.options);
-    if presents_credential(&app, request.headers(), client) {
+    if presents_credential(&app, &request, client) {
         if !admission.authenticated().await {
             return closing(
                 StatusCode::SERVICE_UNAVAILABLE,

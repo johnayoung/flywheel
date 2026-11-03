@@ -36,7 +36,12 @@ impl Hub {
     }
 
     pub(super) fn view(&self, record: SessionRecord) -> SessionView {
-        let monitors = usize::from(self.monitored().contains_key(&record.id));
+        // Subscribers that are not viewers: the agent screen monitor, a
+        // recorder, and read-only share-link viewers.
+        let monitors = usize::from(self.monitored().contains_key(&record.id))
+            + usize::from(self.recordings().is_recording(&record.id));
+        let link_viewers = self.shares().session_viewers(&record.id);
+        let recording = self.recordings().active_file(&record.id);
         let live = self.live_session(&record.id).map(|s| {
             let (cols, rows) = s.size();
             let pid = s.pid().filter(|_| s.exit_info().is_none());
@@ -44,7 +49,8 @@ impl Hub {
                 pid,
                 cols,
                 rows,
-                clients: s.subscriber_count().saturating_sub(monitors),
+                clients: s.subscriber_count().saturating_sub(monitors + link_viewers),
+                link_viewers,
                 scrollback_lines: s.scrollback_lines(),
                 cwd: pid.and_then(process_cwd),
             }
@@ -68,6 +74,7 @@ impl Hub {
             git,
             usage,
             unchecked,
+            recording,
         }
     }
 

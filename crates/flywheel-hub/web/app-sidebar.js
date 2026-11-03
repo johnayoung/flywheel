@@ -513,6 +513,7 @@ function renderMain() {
   $("#meter-cwd").textContent = session ? `\u200e${session.cwd}\u200e` : "";
   $("#meter-cwd").title = session ? session.cwd : "";
   launcher.renderHeader(session);
+  sharing.renderHeader(session);
   renderFlip(session);
   updateMeters();
   const counts = attentionCounts();
@@ -604,7 +605,10 @@ function updateMeters() {
   const term = focusedTerm();
   $("#meter-size").textContent = session && term ? `${term.cols}×${term.rows}` : "";
   const viewers = session && session.live ? session.live.clients : 0;
-  $("#meter-viewers").textContent = viewers > 1 ? `${viewers} viewers` : "";
+  const links = session && session.live ? session.live.link_viewers || 0 : 0;
+  $("#meter-viewers").textContent = [viewers > 1 ? `${viewers} viewers` : "", links ? `${links} via link` : ""]
+    .filter(Boolean)
+    .join(" + ");
 }
 
 function showError(error) {

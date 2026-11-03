@@ -30,6 +30,7 @@
 <link rel="stylesheet" href="/assets/app-settings.css">
 <link rel="stylesheet" href="/assets/app-priority.css">
 <link rel="stylesheet" href="/assets/app-fanout.css">
+<link rel="stylesheet" href="/assets/app-sharing.css">
 </head>
 <body>
 <svg class="sprite" aria-hidden="true" focusable="false">
@@ -104,6 +105,7 @@
       </button>
       <button type="button" class="chip alerts" id="alerts-toggle" aria-pressed="false"><span class="alerts-dot" aria-hidden="true"></span><span id="alerts-label">alerts off</span></button>
       <button type="button" class="chip" data-action="machines" title="Other machines' hubs">machines</button>
+      <button type="button" class="chip" data-action="sharing" title="Share links and recordings">sharing</button>
       <button type="button" class="chip settings-gear" id="settings-gear" data-action="settings" title="Settings" aria-label="Settings"><svg aria-hidden="true"><use href="#i-gear"/></svg><span>settings</span></button>
       <button type="button" class="chip" data-action="logout">sign out</button>
     </footer>
@@ -125,6 +127,8 @@
         <button type="button" id="meter-usage" class="meter usage" hidden></button>
         <span id="meter-size" class="meter"></span>
         <span id="meter-viewers" class="meter"></span>
+        <button type="button" id="share-toggle" class="cmd-pill share-pill" data-action="share" aria-haspopup="dialog" aria-controls="dlg-sharing" hidden><svg><use href="#i-send"/></svg>share<b id="share-count" hidden></b></button>
+        <button type="button" id="rec-toggle" class="cmd-pill rec-pill" data-action="toggle-record" aria-pressed="false" hidden><span class="rec-dot" aria-hidden="true"></span><span id="rec-label">rec</span></button>
         <button type="button" id="search-toggle" class="cmd-pill search-pill" data-action="search" data-key-title="search.open" data-title="Search every session" title="Search every session (Ctrl Shift F)" aria-controls="search"><svg><use href="#i-search"/></svg>search</button>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
         <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" data-key-title="commands.toggle" data-title="Suggested commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
@@ -394,6 +398,51 @@
   </form>
 </dialog>
 
+<dialog id="dlg-sharing" class="sheet" aria-labelledby="sharing-title">
+  <form method="dialog" id="sharing-form" novalidate>
+    <header class="sheet-head">
+      <span class="sheet-kicker">sharing</span>
+      <h2 id="sharing-title">Share &amp; record</h2>
+    </header>
+    <section id="share-new" class="sh-new" hidden>
+      <p class="sheet-body">A read-only live link to <strong id="share-session"></strong>. Whoever opens it watches this terminal &mdash; <strong>everything it shows, nothing redacted</strong> &mdash; and cannot type, resize, or reach anything else. It stops working when it expires or you revoke it.</p>
+      <div class="sh-grid">
+        <label class="field">
+          <span class="field-label">Label <span class="field-hint">optional</span></span>
+          <input id="share-name" maxlength="64" autocomplete="off" spellcheck="false" placeholder="e.g. pairing with sam">
+        </label>
+        <label class="field">
+          <span class="field-label">Expires after</span>
+          <select id="share-expires">
+            <option value="900">15 minutes</option>
+            <option value="3600" selected>1 hour</option>
+            <option value="28800">8 hours</option>
+            <option value="86400">1 day</option>
+            <option value="604800">7 days</option>
+          </select>
+        </label>
+      </div>
+      <div class="sh-result" id="share-result" hidden>
+        <input id="share-url" readonly aria-label="Share link" spellcheck="false">
+        <button type="button" class="slab" id="share-copy"><svg><use href="#i-copy"/></svg>Copy</button>
+      </div>
+      <p class="form-error" id="share-error" role="alert"></p>
+      <div class="sh-make"><button type="button" class="slab" id="share-create"><svg><use href="#i-send"/></svg>Create link</button></div>
+    </section>
+    <section class="sh-sec" aria-labelledby="share-list-title">
+      <h3 class="field-label" id="share-list-title">Live share links</h3>
+      <ol id="share-list" class="sh-list"></ol>
+    </section>
+    <section class="sh-sec" aria-labelledby="rec-list-title">
+      <h3 class="field-label" id="rec-list-title">Recordings <span class="field-hint" id="rec-usage"></span></h3>
+      <ol id="rec-list" class="sh-list"></ol>
+    </section>
+    <footer class="sheet-foot">
+      <button type="button" class="slab ghost" value="cancel" data-close>Close</button>
+    </footer>
+  </form>
+</dialog>
+
 <dialog id="dlg-confirm" class="sheet narrow" aria-labelledby="confirm-title">
   <form method="dialog">
     <header class="sheet-head">
@@ -561,6 +610,7 @@
 <script src="/assets/panes.js"></script>
 <script src="/assets/search.js"></script>
 <script src="/assets/settings.js"></script>
+<script src="/assets/sharing.js"></script>
 <script src="/assets/app-base.js"></script>
 <script src="/assets/app-layout.js"></script>
 <script src="/assets/app-stage.js"></script>

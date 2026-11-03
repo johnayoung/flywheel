@@ -93,12 +93,15 @@ impl FromRequestParts<AppState> for Client {
 }
 
 /// The outcome of checking a request's credentials.
-enum Auth {
+pub(super) enum Auth {
     /// Admitted: by a login cookie (its secret) or by the token (`None`).
     Granted(Option<String>),
     /// Admitted with a peer credential (another hub): the API only, within
     /// the peer scope (`peers::peer_forbidden`).
     Peer(crate::peers::PeerInfo),
+    /// A share link's credential, presented outside its `/share/` path:
+    /// it reaches nothing else (403).
+    View,
     /// No credential presented.
     Anonymous,
     /// A wrong credential (counted against the client).
@@ -124,7 +127,7 @@ pub(super) fn login_cookies<'a>(headers: &'a HeaderMap, name: &str) -> Vec<&'a s
 /// and refusing it would let one attacker sharing a NAT or proxy address
 /// with real users lock them all out. Everything else from a locked-out
 /// address is refused unchecked.
-fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
+pub(super) fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
     let token = app.hub.token();
     let cookies = login_cookies(headers, &cookie_name(token.expose()));
     let bearer = header_str(headers, header::AUTHORIZATION).and_then(bearer_value);
@@ -141,7 +144,15 @@ fn authenticate(app: &AppState, headers: &HeaderMap, client: Client) -> Auth {
         if bearer_ok() {
             return Some(Auth::Granted(None));
         }
-        bearer.and_then(|b| app.peers.verify(b)).map(Auth::Peer)
+        let bearer = bearer?;
+        if let Some(peer) = app.peers.verify(bearer) {
+            return Some(Auth::Peer(peer));
+        }
+        matches!(
+            app.hub.shares().verify(bearer),
+            crate::share::Verdict::Live(_)
+        )
+        .then_some(Auth::View)
     };
     if client.same_machine {
         return check().unwrap_or(Auth::Denied);
@@ -176,7 +187,7 @@ pub(super) fn origin_ok(headers: &HeaderMap, client: Client, options: &ServerOpt
     )
 }
 
-fn too_many_attempts(wait: Duration) -> Response {
+pub(super) fn too_many_attempts(wait: Duration) -> Response {
     let mut response = error_response(
         StatusCode::TOO_MANY_REQUESTS,
         "too many failed login attempts from this address; try again later",
@@ -365,10 +376,19 @@ pub(super) async fn require_auth(
             next.run(request).await
         }
         Auth::Limited(wait) => too_many_attempts(wait),
+        Auth::View => view_only(),
         Auth::Anonymous | Auth::Denied => {
             error_response(StatusCode::UNAUTHORIZED, "authentication required")
         }
     }
+}
+
+/// A share link's credential used anywhere but its own view.
+pub(super) fn view_only() -> Response {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "a share link reaches only its read-only view (/share/...)",
+    )
 }
 
 /// Cross-origin browser requests may not change state.
@@ -467,6 +487,7 @@ pub(super) async fn index(
             response
         }
         Auth::Limited(wait) => login_refused(wait),
+        Auth::View => view_only(),
         Auth::Anonymous | Auth::Denied | Auth::Peer(_) => {
             let notice = match query.signed_out.as_deref() {
                 Some("rotated") => Some(
@@ -604,6 +625,7 @@ pub(super) async fn asset(
         match authenticate(&app, &headers, client) {
             Auth::Granted(_) => {}
             Auth::Limited(wait) => return too_many_attempts(wait),
+            Auth::View => return view_only(),
             Auth::Anonymous | Auth::Denied | Auth::Peer(_) => {
                 return error_response(StatusCode::UNAUTHORIZED, "authentication required");
             }
@@ -622,7 +644,7 @@ pub(super) async fn asset(
     }
 }
 
-fn no_store(mut response: Response) -> Response {
+pub(super) fn no_store(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

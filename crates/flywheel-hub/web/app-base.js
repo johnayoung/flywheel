@@ -474,6 +474,15 @@ const search = window.FwHubSearch({
   onOpen: () => explain.close(),
 });
 
+// Read-only share links and recordings (sharing.js).
+const sharing = window.FwHubSharing({
+  $, el, rawApi, sessionById, span,
+  toast: (...args) => commands.toast(...args),
+  copyText: (text) => commands.copyText(text),
+  confirmDialog: (options) => confirmDialog(options),
+  refresh: () => refresh().catch(() => {}),
+});
+
 // `force` re-renders even when nothing changed. The periodic refresh
 // passes false and also holds off while a sidebar field has focus, so a
 // half-typed rename is never torn down under the user.

@@ -85,6 +85,8 @@ pub struct HubOptions {
     /// Agent launch defaults per kind (`hub.toml` `[agents.*]`): fill
     /// the fields a launch leaves unset.
     pub agent_defaults: crate::config::AgentDefaults,
+    /// Session recordings' size caps (see [`crate::record`]).
+    pub record_limits: crate::record::RecordLimits,
 }
 
 impl HubOptions {
@@ -114,6 +116,7 @@ impl HubOptions {
                 .map(|h| PathBuf::from(h).join("code")),
             worktree_branch_prefix: String::new(),
             agent_defaults: crate::config::AgentDefaults::default(),
+            record_limits: crate::record::RecordLimits::default(),
         }
     }
 }
@@ -295,6 +298,14 @@ pub struct SessionView {
     /// bypassPermissions, or Codex with no sandbox and no approvals).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub unchecked: bool,
+    /// The recording being written (`fw hub record start`): its file name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording: Option<String>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes &T
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// A launch template with the workspace it belongs to.
@@ -370,6 +381,10 @@ pub struct LiveView {
     pub cols: u16,
     pub rows: u16,
     pub clients: usize,
+    /// Read-only share-link viewers watching it (not in `clients`: they
+    /// never size the terminal).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub link_viewers: usize,
     /// Scrollback lines retained by the active screen.
     pub scrollback_lines: usize,
     /// The running process's working directory (where its shell `cd`'d
@@ -437,6 +452,10 @@ pub struct Hub {
     /// The settings `hub.toml` can change while the hub runs (seeded
     /// from the options; see [`crate::config`]).
     tunables: RwLock<crate::config::Tunables>,
+    /// Read-only share links (`fw hub share`).
+    shares: crate::share::ShareStore,
+    /// Session recordings (`fw hub record`).
+    recordings: Arc<crate::record::Recordings>,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -470,6 +489,8 @@ impl Hub {
         };
         let store = HubStore::open(&options.state_dir)?;
         let hub = Self::assemble(options, serve_lock, store, StatusBoard::default())?;
+        // Recordings a previous hub left active ended with its processes.
+        hub.recordings.clear_stale();
         let server = ReportServer::bind(&hub.options.state_dir, hub.report_handler())?;
         *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
         crate::transcript::spawn_watcher(&hub);
@@ -495,6 +516,7 @@ impl Hub {
             import_root: options.import_root.clone(),
             agent_defaults: options.agent_defaults.clone(),
         };
+        let record_limits = options.record_limits;
         Ok(Arc::new(Self {
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),
@@ -520,6 +542,11 @@ impl Hub {
             search: crate::search::SearchIndex::default(),
             grading: Arc::default(),
             tunables: RwLock::new(tunables),
+            shares: crate::share::ShareStore::load(&options_state_dir),
+            recordings: Arc::new(crate::record::Recordings::new(
+                &options_state_dir,
+                record_limits,
+            )),
             _serve_lock: serve_lock,
         }))
     }
@@ -586,6 +613,16 @@ impl Hub {
     /// What pauses and stops fan-out gradings (see [`crate::fanout`]).
     pub fn grading(&self) -> &Arc<crate::fanout::GradingControl> {
         &self.grading
+    }
+
+    /// Read-only share links.
+    pub fn shares(&self) -> &crate::share::ShareStore {
+        &self.shares
+    }
+
+    /// Session recordings.
+    pub fn recordings(&self) -> &Arc<crate::record::Recordings> {
+        &self.recordings
     }
 
     /// Full-text search state.
@@ -762,6 +799,8 @@ impl Hub {
         // outlive it.
         let grace = timeout / 2;
         PtySession::terminate_all(&sessions, grace, timeout - grace);
+        // Their exits are written out; every recording is closed.
+        self.recordings.stop_all();
         for session in &sessions {
             session.release();
         }

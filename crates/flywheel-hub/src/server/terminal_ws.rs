@@ -85,7 +85,7 @@ enum ClientMessage {
     },
 }
 
-fn exit_message(info: &ExitInfo) -> Message {
+pub(super) fn exit_message(info: &ExitInfo) -> Message {
     Message::Text(
         json!({ "type": "exit", "code": info.code, "signal": info.signal })
             .to_string()
@@ -94,7 +94,7 @@ fn exit_message(info: &ExitInfo) -> Message {
 }
 
 /// Snapshot a session (and subscribe) off the async workers.
-async fn attach(session: &Arc<PtySession>, history_budget: usize) -> Option<Attachment> {
+pub(super) async fn attach(session: &Arc<PtySession>, history_budget: usize) -> Option<Attachment> {
     let session = Arc::clone(session);
     tokio::task::spawn_blocking(move || session.attach_with(history_budget))
         .await
@@ -103,7 +103,7 @@ async fn attach(session: &Arc<PtySession>, history_budget: usize) -> Option<Atta
 
 /// Send an attachment's snapshot (and exit, if already exited), returning
 /// its live receiver. The snapshot is released once sent.
-async fn send_attachment(
+pub(super) async fn send_attachment(
     socket: &mut WebSocket,
     attachment: Attachment,
 ) -> Option<broadcast::Receiver<SessionEvent>> {

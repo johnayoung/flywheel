@@ -65,10 +65,12 @@ mod notify_api;
 mod plugins_api;
 mod proxy;
 mod pwa;
+mod record_api;
 mod review_api;
 mod search_api;
 mod sessions_api;
 mod settings_api;
+mod share_api;
 mod slots;
 mod templates_api;
 mod terminal_ws;
@@ -134,6 +136,9 @@ pub const WS_CLOSE_SIGNED_OUT: u16 = 4002;
 /// WebSocket close code sent when the peer credential that opened the
 /// socket was revoked (`fw hub peer revoke`).
 pub const WS_CLOSE_PEER_REVOKED: u16 = 4003;
+/// WebSocket close code sent to a share link's viewer when the link was
+/// revoked or expired.
+pub const WS_CLOSE_SHARE_ENDED: u16 = 4004;
 /// How long [`serve`] waits for sessions to exit on shutdown.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -305,6 +310,21 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/fanouts/{id}/pick", post(fanout_api::pick))
         .route("/api/fanouts/{id}/rebase", post(fanout_api::rebase))
         .route("/api/fanouts/{id}/cleanup", post(fanout_api::cleanup))
+        // Read-only share links and session recordings.
+        .route(
+            "/api/shares",
+            get(share_api::list)
+                .post(share_api::create)
+                .delete(share_api::revoke_all),
+        )
+        .route("/api/shares/{which}", delete(share_api::revoke))
+        .route("/api/recordings", get(record_api::list))
+        .route(
+            "/api/recordings/{name}",
+            get(record_api::download).delete(record_api::delete),
+        )
+        .route("/api/sessions/{id}/record/start", post(record_api::start))
+        .route("/api/sessions/{id}/record/stop", post(record_api::stop))
         // Multiple machines: this hub's peers (remote side) and machines
         // (local side), and the proxy to them.
         .route("/api/whoami", get(proxy::whoami))
@@ -334,6 +354,16 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/assets/{*path}", get(asset))
         .route("/manifest.webmanifest", get(pwa::manifest))
         .route("/sw.js", get(pwa::service_worker))
+        .route("/replay", get(record_api::player))
+        // A share link: its credential in the path is its only key.
+        .route("/share/{credential}", get(share_api::viewer_page))
+        .route("/share/{credential}/info", get(share_api::info))
+        .route("/share/{credential}/ws", get(share_api::viewer_ws))
+        .route(
+            "/share/{credential}/assets/{*path}",
+            get(share_api::viewer_asset),
+        )
+        .route("/share/{credential}/{*rest}", any(share_api::elsewhere))
         .route_layer(middleware::from_fn_with_state(
             BodyBound::PUBLIC,
             bound_body,

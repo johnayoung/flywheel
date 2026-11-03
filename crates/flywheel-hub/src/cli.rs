@@ -137,6 +137,13 @@ enum HubCommand {
     /// Local plugins (<state-dir>/plugins/<name>/plugin.toml) run on hub
     /// events and as palette actions: ls, enable, disable, logs.
     Plugin(crate::plugin_cli::PluginArgs),
+    /// A read-only live view link to a session (expiring, revocable):
+    /// whoever opens it watches that terminal -- everything it shows --
+    /// and cannot type. `share ls`, `share revoke ID|NAME|--all`.
+    Share(crate::share_cli::ShareArgs),
+    /// Record a session to an asciinema v2 .cast file (start, stop), and
+    /// list, download (get), and delete recordings.
+    Record(crate::share_cli::RecordArgs),
 }
 
 // `--machine` is refused here (a peer credential mints no login codes):
@@ -462,6 +469,8 @@ pub fn run_with(
         HubCommand::Peer(args) => crate::machine_cli::peer(&args, out, err),
         HubCommand::Config(args) => crate::config_cli::main(&args, out, err),
         HubCommand::Plugin(args) => crate::plugin_cli::main(&args, out, err),
+        HubCommand::Share(args) => crate::share_cli::share(&args, out, err),
+        HubCommand::Record(args) => crate::share_cli::record(&args, out, err),
     }
 }
 
@@ -662,6 +671,18 @@ pub(crate) fn show_login(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) {
+    let (targets, tailscale) = hub_targets(info);
+    let qr = match qr {
+        Qr::Auto => auto_qr(&targets),
+        qr => qr,
+    };
+    print_login(out, err, &targets, code, qr);
+    print_tailscale_hint(err, tailscale.as_ref(), &targets, info.listen.port());
+}
+
+/// Every origin the hub `info` describes is reached at, most remote-friendly
+/// first, and the tailnet it found.
+pub(crate) fn hub_targets(info: &RuntimeInfo) -> (Vec<LoginTarget>, Option<Tailscale>) {
     let tailscale = tailscale_program().and_then(|p| detect_tailscale(&p, info.listen.port()));
     let targets = login_targets(
         info.listen,
@@ -669,12 +690,7 @@ pub(crate) fn show_login(
         tailscale.as_ref(),
         &local_interfaces(info.listen),
     );
-    let qr = match qr {
-        Qr::Auto => auto_qr(&targets),
-        qr => qr,
-    };
-    print_login(out, err, &targets, code, qr);
-    print_tailscale_hint(err, tailscale.as_ref(), &targets, info.listen.port());
+    (targets, tailscale)
 }
 
 /// Draw a QR code when a remote device could use it and stdout can show it.

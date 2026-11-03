@@ -326,6 +326,33 @@ impl Endpoint {
             .map_err(|e| format!("the hub sent invalid JSON for {path}: {e}"))
     }
 
+    /// `GET path`: the answer's raw bytes on 2xx (a download), else the
+    /// API's error.
+    pub async fn download(&self, path: &str) -> Result<Vec<u8>, String> {
+        let response = self
+            .http
+            .get(self.url(path)?)
+            .timeout(self.timeout)
+            .bearer_auth(self.token())
+            .send()
+            .await
+            .map_err(|e| self.unreachable(&describe(&e)))?;
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| format!("reading the hub's answer: {}", describe(&e)))?;
+        if !(200..300).contains(&status) {
+            return Err(api_error(status, &error_message(&body)));
+        }
+        Ok(body.to_vec())
+    }
+
+    /// [`Endpoint::download`], blocking.
+    pub fn blocking_download(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.block_on(self.download(path))?
+    }
+
     /// `GET /api/{what}` -> its `what` array.
     async fn list(&self, what: &str) -> Result<Vec<Value>, String> {
         let mut value = self.request("GET", &format!("/api/{what}"), None).await?;

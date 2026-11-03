@@ -144,6 +144,12 @@ enum HubCommand {
     /// Record a session to an asciinema v2 .cast file (start, stop), and
     /// list, download (get), and delete recordings.
     Record(crate::share_cli::RecordArgs),
+    /// Check this machine for the hub: fw/flywheel on PATH (a stale or
+    /// foreign `fw` shadowing this one), claude/codex and the status
+    /// hooks, state dir permissions, config files, the port, tailscale,
+    /// the browser opener, systemd --user, the clock, and disk space; each
+    /// finding with a fix. Read-only. Exit 0 nothing failed, 1 otherwise.
+    Doctor(crate::doctor::DoctorArgs),
 }
 
 // `--machine` is refused here (a peer credential mints no login codes):
@@ -418,6 +424,21 @@ pub(crate) fn resolve_state_dir(arg: &StateDirArg) -> Result<PathBuf, String> {
     }
 }
 
+/// Most async worker threads the hub runs. Its async work is many small
+/// wakeups (terminal output frames, pushes, short requests; anything slow
+/// runs on the blocking pool): measured with 50 sessions and 3 browsers,
+/// a worker per core (32 here) spent more time parking and waking workers
+/// than serving, and its per-thread malloc arenas grew the RSS.
+pub const MAX_RUNTIME_WORKERS: usize = 4;
+
+/// Async workers for this machine: one per core, at most
+/// [`MAX_RUNTIME_WORKERS`].
+fn runtime_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .clamp(1, MAX_RUNTIME_WORKERS)
+}
+
 /// Route `fw hub <args>` (`args` excludes `hub`); returns the exit code.
 pub fn main(args: &[String]) -> i32 {
     let mut out = std::io::stdout();
@@ -512,6 +533,7 @@ pub fn run_with(
         HubCommand::Plugin(args) => crate::plugin_cli::main(&args, out, err),
         HubCommand::Share(args) => crate::share_cli::share(&args, out, err),
         HubCommand::Record(args) => crate::share_cli::record(&args, out, err),
+        HubCommand::Doctor(args) => crate::doctor::doctor(&args, out, err),
     }
 }
 
@@ -1032,6 +1054,7 @@ fn serve_cmd(
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .worker_threads(runtime_workers())
         .thread_name("hub-http")
         .build()
     {

@@ -209,6 +209,16 @@ pub const PREFS: &[PrefSpec] = &[
         device_only: false,
     },
     PrefSpec {
+        id: "keyboard.tour",
+        section: "keyboard",
+        label: "Shortcut tour",
+        help: "offer the 30-second tour of the key shortcuts on the start screen (finishing or \
+               dismissing it turns this off)",
+        kind: PrefKind::Bool,
+        default: PrefDefault::Bool(true),
+        device_only: false,
+    },
+    PrefSpec {
         id: "notifications.alerts",
         section: "notifications",
         label: "System notifications",
@@ -513,7 +523,7 @@ impl SettingsStore {
     }
 }
 
-fn read(path: &Path) -> Result<Settings, String> {
+pub(crate) fn read(path: &Path) -> Result<Settings, String> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),

@@ -166,7 +166,21 @@ function sendView(force) {
 
 // A status push repaints the sidebar -- except under an inline rename,
 // which must not be torn down mid-typing (it repaints when it ends).
+// Pushes come in bursts (a turn ending: Stop, then the badge, then the
+// usage; many agents at once): they repaint once per STATUS_COALESCE_MS.
+// A timer rather than a frame, so a background tab's title and favicon
+// counts still follow (frames do not run there).
+const STATUS_COALESCE_MS = 50;
+let statusTimer = 0;
 function renderStatus() {
+  if (statusTimer) return;
+  statusTimer = setTimeout(() => {
+    statusTimer = 0;
+    renderStatusNow();
+  }, STATUS_COALESCE_MS);
+}
+
+function renderStatusNow() {
   if (state.renaming) {
     attention.render();
     renderMain();

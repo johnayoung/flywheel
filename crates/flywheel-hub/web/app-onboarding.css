@@ -1,0 +1,162 @@
+/* flywheel hub -- The first run (onboarding.js): the start screen's ways in
+ * (import a VS Code workspace, start from a folder) and the shortcut tour.
+ * Loaded after app-dialogs.css (the tour is a .sheet). */
+
+/* --- the start screen ------------------------------------------------------- */
+
+.first-run {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1rem;
+  width: min(62rem, 100%);
+  margin-top: .6rem;
+}
+
+.first-run[hidden] { display: none; }
+
+.first-run-card {
+  display: grid;
+  align-content: start;
+  gap: .6rem;
+  padding: 1rem 1.1rem 1.1rem;
+  border: 1px solid var(--rule-2);
+  border-top: 3px solid var(--signal);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--bg-3) 88%, transparent);
+}
+
+.first-run-card h2 {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  margin: 0;
+  font: 800 1.35rem/1 var(--display);
+  letter-spacing: .02em;
+  text-transform: uppercase;
+}
+
+.first-run-card h2 svg { width: 1rem; height: 1rem; color: var(--signal); flex: none; }
+
+.empty .first-run-card p { max-width: none; font-size: 11.5px; line-height: 1.5; }
+
+.first-run-row { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+
+.first-run-row input {
+  flex: 1 1 10rem;
+  min-width: 0;
+  padding: .45rem .55rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+}
+
+.first-run-row input:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+
+.first-run-files { display: grid; gap: .35rem; margin: 0; padding: 0; list-style: none; }
+
+.first-run-files li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6rem;
+  padding: .4rem .5rem;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+}
+
+.first-run-file { display: grid; min-width: 0; }
+.first-run-file b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.first-run-file small { color: var(--ink-3); font-size: 10.5px; }
+.first-run-files .slab { padding: .3rem .65rem; }
+.first-run-done { color: var(--ink-3); font-size: 10.5px; letter-spacing: .12em; text-transform: uppercase; }
+.first-run-files .first-run-more { border-style: dashed; color: var(--ink-3); font-size: 10.5px; }
+
+.empty .first-run-note { color: var(--ink-3); font-size: 11px; }
+.empty .first-run-note.bad { color: var(--alert); }
+
+.first-run-link {
+  justify-self: start;
+  text-align: left;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-2);
+  font: inherit;
+  font-size: 11px;
+  text-decoration: underline;
+  text-decoration-color: var(--rule-2);
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.first-run-link:hover { color: var(--signal); }
+
+.first-run-tour { border-top-color: var(--brass); }
+.first-run-tour h2 svg { color: var(--brass); }
+
+/* The generic start screen's buttons and key list give way to the cards. */
+.empty.first { align-content: start; padding-top: clamp(2rem, 8vh, 5rem); overflow: auto; }
+.empty.first .empty-actions,
+.empty.first .keys { display: none; }
+
+/* --- the tour ---------------------------------------------------------------- */
+
+.tour { padding: 0 1.4rem 1.2rem; }
+
+.tour-head { display: flex; align-items: center; justify-content: space-between; }
+
+.tour-close {
+  display: grid;
+  place-items: center;
+  width: 1.8rem;
+  height: 1.8rem;
+  padding: 0;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+}
+
+.tour-close svg { width: .8rem; height: .8rem; }
+.tour-close:hover { color: var(--signal); border-color: var(--signal); }
+
+.tour-key {
+  display: inline-block;
+  margin: 1.2rem 0 .2rem;
+  padding: .45rem .7rem;
+  border: 1px solid var(--signal);
+  border-bottom-width: 3px;
+  border-radius: 3px;
+  background: var(--signal-soft);
+  color: var(--ink);
+  font: 600 1.1rem/1.2 var(--mono);
+}
+
+.tour h2 { margin: .6rem 0 .3rem; font: 800 2rem/1 var(--display); text-transform: uppercase; }
+.tour p { margin: 0; min-height: 3.2em; color: var(--ink-2); line-height: 1.6; }
+
+.tour-progress { height: 2px; margin: 1.1rem 0 .9rem; background: var(--rule); overflow: hidden; }
+
+.tour-bar {
+  display: block;
+  height: 100%;
+  background: var(--signal);
+  transform: scaleX(0);
+  transform-origin: left;
+}
+
+.tour-foot { display: flex; align-items: center; gap: .5rem; }
+
+.tour-dots { display: flex; gap: .35rem; margin: 0 auto 0 0; padding: 0; list-style: none; }
+.tour-dots li { width: .5rem; height: .5rem; border: 1px solid var(--rule-2); border-radius: 50%; }
+.tour-dots li.seen { background: var(--rule-2); }
+.tour-dots li.on { background: var(--signal); border-color: var(--signal); }
+
+@media (prefers-reduced-motion: reduce) {
+  .tour-bar { transition: none !important; }
+}

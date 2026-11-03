@@ -923,11 +923,21 @@ window.FwHubMobile = function (ctx) {
 
   // Toasts rise from just above the bar (quick answers, compose, keys), not
   // over it: a blocked agent's answers stay tappable while one shows.
+  // Every render calls this: with the bar hidden (a desktop) it reads no
+  // geometry (each read forces a layout of the page just re-rendered), and
+  // an unchanged value is not written (a root custom property restyles
+  // the whole document).
+  let barAbove = null;
   function placeToasts() {
     const bar = $("#mobilebar");
-    const top = bar.hidden ? 0 : bar.getBoundingClientRect().top;
-    const viewport = window.visualViewport ? window.visualViewport.height : window.innerHeight;
-    const above = top > 0 ? Math.max(0, Math.round(viewport - top)) : 0;
+    let above = 0;
+    if (!bar.hidden) {
+      const top = bar.getBoundingClientRect().top;
+      const viewport = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+      above = top > 0 ? Math.max(0, Math.round(viewport - top)) : 0;
+    }
+    if (above === barAbove) return;
+    barAbove = above;
     document.documentElement.style.setProperty("--bar-above", `${above}px`);
   }
   if (window.ResizeObserver) new ResizeObserver(placeToasts).observe($("#mobilebar"));

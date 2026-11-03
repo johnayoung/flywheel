@@ -336,16 +336,96 @@ fn upstream(git: &Git<'_>) -> Option<UpstreamView> {
     })
 }
 
-/// Read the review of `target`.
+/// The work tree's own state: what is staged, unstaged, untracked, and
+/// conflicted (independent of the base).
+struct WorkTreeState {
+    staged: FileSet,
+    unstaged: FileSet,
+    untracked: Vec<String>,
+    conflicts: Vec<String>,
+}
+
+/// Read [`WorkTreeState`]: its four reads run at once (each is a
+/// read-only git command, `--no-optional-locks`).
+fn work_tree_state(git: &Git<'_>) -> Result<WorkTreeState, String> {
+    std::thread::scope(|scope| {
+        let staged = scope.spawn(|| file_set(git, &["--cached"]));
+        let unstaged = scope.spawn(|| file_set(git, &[]));
+        let untracked = scope.spawn(|| {
+            git.raw(
+                &["ls-files", "-z", "--others", "--exclude-standard"],
+                READ_LIMIT,
+            )
+            .map(|out| nul_list(&out.stdout))
+        });
+        let conflicts = git
+            .raw(
+                &["diff", "--name-only", "-z", "--diff-filter=U"],
+                READ_LIMIT,
+            )
+            .map(|out| nul_list(&out.stdout));
+        Ok(WorkTreeState {
+            staged: join(staged)?,
+            unstaged: join(unstaged)?,
+            untracked: join(untracked)?,
+            conflicts: conflicts?,
+        })
+    })
+}
+
+/// Read the review of `target`. The work tree's state is read alongside
+/// the branch and base (independent git commands, run at once: a review
+/// is a dozen git processes, and its latency their sum otherwise).
 pub fn read(tools: &Tools, target: &Target) -> Result<Review, String> {
     let git = Git::new(tools, &target.dir);
+    let (review, work_tree) = std::thread::scope(|scope| {
+        let work_tree = scope.spawn(|| work_tree_state(&git));
+        let review = read_branch(&git, target);
+        (review, join(work_tree))
+    });
+    let mut review = review?;
+    let work_tree = work_tree?;
+    review.staged = work_tree.staged;
+    review.unstaged = work_tree.unstaged;
+    let mut untracked = work_tree.untracked;
+    review.untracked_truncated = untracked.len() > MAX_FILES;
+    untracked.truncate(MAX_FILES);
+    review.untracked = untracked
+        .into_iter()
+        .map(|path| Untracked { path })
+        .collect();
+    review.conflicts = work_tree.conflicts;
+    // An unmerged path shows in both sets; it is listed once, as a
+    // conflict.
+    let conflicted: HashSet<&String> = review.conflicts.iter().collect();
+    review
+        .unstaged
+        .files
+        .retain(|f| !conflicted.contains(&f.path));
+    review
+        .staged
+        .files
+        .retain(|f| !conflicted.contains(&f.path));
+    Ok(review)
+}
+
+/// A scoped git read's result (a panic in it is an error, not a crash).
+fn join<T>(handle: std::thread::ScopedJoinHandle<'_, Result<T, String>>) -> Result<T, String> {
+    handle
+        .join()
+        .unwrap_or_else(|_| Err("a git read panicked".to_owned()))
+}
+
+/// The review's branch half: HEAD, branch, upstream, remotes, and the
+/// base with its commits and committed changes (work-tree sets empty).
+fn read_branch(git: &Git<'_>, target: &Target) -> Result<Review, String> {
     let head = git.maybe(&["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
     let branch = git.maybe(&["symbolic-ref", "-q", "--short", "HEAD"]);
     let git_dir = git
         .out(&["rev-parse", "--absolute-git-dir"])
         .map(PathBuf::from)
         .map_err(|e| format!("{} is not a git work tree: {e}", target.dir.display()))?;
-    let upstream = upstream(&git);
+    let upstream = upstream(git);
     let base_name = match (&target.base, target.base_source) {
         (Some(base), _) => Some((base.clone(), target.base_source)),
         (None, _) => upstream
@@ -361,7 +441,7 @@ pub fn read(tools: &Tools, target: &Target) -> Result<Review, String> {
         ahead: 0,
         behind: 0,
         upstream,
-        remotes: remotes(&git),
+        remotes: remotes(git),
         commits: Vec::new(),
         committed: FileSet::default(),
         staged: FileSet::default(),
@@ -390,7 +470,7 @@ pub fn read(tools: &Tools, target: &Target) -> Result<Review, String> {
             )
             .is_ok_and(|o| o.success());
         if let (Some(sha), Some(_)) = (&sha, &head) {
-            let (behind, ahead) = left_right(&git, &format!("{sha}...HEAD"));
+            let (behind, ahead) = left_right(git, &format!("{sha}...HEAD"));
             review.ahead = ahead;
             review.behind = behind;
             let log = git.raw(
@@ -419,7 +499,7 @@ pub fn read(tools: &Tools, target: &Target) -> Result<Review, String> {
                 .collect();
         }
         if let Some(from) = &merge_base {
-            review.committed = file_set(&git, &[from, "HEAD"])?;
+            review.committed = file_set(git, &[from, "HEAD"])?;
         }
         review.base = Some(BaseView {
             name,
@@ -429,35 +509,6 @@ pub fn read(tools: &Tools, target: &Target) -> Result<Review, String> {
             is_branch,
         });
     }
-    review.staged = file_set(&git, &["--cached"])?;
-    review.unstaged = file_set(&git, &[])?;
-    let untracked = git.raw(
-        &["ls-files", "-z", "--others", "--exclude-standard"],
-        READ_LIMIT,
-    )?;
-    let mut untracked = nul_list(&untracked.stdout);
-    review.untracked_truncated = untracked.len() > MAX_FILES;
-    untracked.truncate(MAX_FILES);
-    review.untracked = untracked
-        .into_iter()
-        .map(|path| Untracked { path })
-        .collect();
-    let conflicts = git.raw(
-        &["diff", "--name-only", "-z", "--diff-filter=U"],
-        READ_LIMIT,
-    )?;
-    review.conflicts = nul_list(&conflicts.stdout);
-    // An unmerged path shows in both sets; it is listed once, as a
-    // conflict.
-    let conflicted: HashSet<&String> = review.conflicts.iter().collect();
-    review
-        .unstaged
-        .files
-        .retain(|f| !conflicted.contains(&f.path));
-    review
-        .staged
-        .files
-        .retain(|f| !conflicted.contains(&f.path));
     Ok(review)
 }
 

@@ -106,6 +106,7 @@ function paletteCommands() {
   }
   cmd("Keyboard shortcuts", settings.keyOf("keys.show"), () => settings.showKeys(), "chev");
   settings.paletteItems(cmd);
+  onboarding.paletteItems(cmd);
   cmd("Sign out", "", logout, "x");
   return items;
 }

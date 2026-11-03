@@ -112,6 +112,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ),
     ("commands.js", include_bytes!("../web/commands.js"), JS),
     ("import.js", include_bytes!("../web/import.js"), JS),
+    ("onboarding.js", include_bytes!("../web/onboarding.js"), JS),
     ("worktree.js", include_bytes!("../web/worktree.js"), JS),
     ("fmt.js", include_bytes!("../web/fmt.js"), JS),
     ("launcher.js", include_bytes!("../web/launcher.js"), JS),
@@ -150,6 +151,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "app-stage.css",
         include_bytes!("../web/app-stage.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-onboarding.css",
+        include_bytes!("../web/app-onboarding.css"),
         "text/css; charset=utf-8",
     ),
     (

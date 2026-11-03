@@ -223,7 +223,7 @@ pub(crate) struct Host {
 }
 
 impl Host {
-    fn current() -> Self {
+    pub(crate) fn current() -> Self {
         let wsl = is_wsl();
         let found = ["wslview", "cmd.exe", "xdg-open", "open"]
             .into_iter()
@@ -238,6 +238,11 @@ impl Host {
             found,
             wsl_cmd: (wsl && Path::new(WSL_CMD).is_file()).then(|| PathBuf::from(WSL_CMD)),
         }
+    }
+
+    /// Running under WSL.
+    pub(crate) fn wsl(&self) -> bool {
+        self.wsl
     }
 
     fn has(&self, name: &str) -> Option<String> {

@@ -81,6 +81,7 @@ use auth::{
     Client, CredentialWatch, asset, index, login_cookies, login_form, login_query, login_recheck,
     logout, mint_login_code, origin_guard, origin_ok, require_auth, rotate_token, security_headers,
 };
+pub use events_ws::SESSIONS_PUSH_INTERVAL;
 use events_ws::{events_ws, text};
 use sessions_api::{
     check_folder, create_session, get_session, kill_session, list_kinds, list_sessions,

@@ -557,6 +557,8 @@ function renderMain() {
   mobile.render();
 
   const actions = $("#empty-actions");
+  // No workspace yet (and no machine's): the first run's cards.
+  let first = false;
   if (!session && emptyTab && !state.notice) {
     const others = state.sessions.filter((s) => s.workspace_id === workspace.id && s.live);
     $("#empty-title").textContent = "Empty pane.";
@@ -578,6 +580,7 @@ function renderMain() {
     );
   } else if (!session) {
     const hasWorkspace = state.workspaces.length > 0;
+    first = !hasWorkspace && !machines.any();
     // Sessions running but none on screen (a phone's start screen, a
     // fresh browser): say so, not "nothing".
     const running = state.sessions.filter((s) => s.live).length;
@@ -605,6 +608,9 @@ function renderMain() {
       )].filter(Boolean),
     );
   }
+  $("#empty").classList.toggle("first", first);
+  $("#first-run").hidden = !first;
+  if (first) onboarding.render($("#first-run"));
 }
 
 function updateMeters() {

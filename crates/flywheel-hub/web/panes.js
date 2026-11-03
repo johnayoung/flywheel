@@ -93,8 +93,10 @@ window.FwHubPanes = function (ctx) {
         ctx.onResize(pane);
         scheduleClip();
       });
-      term.onCursorMove(scheduleClip);
-      term.onScroll(scheduleClip);
+      // The cursor moving or the view scrolling only moves the clip
+      // window: the box and terminal heights measured last still hold.
+      term.onCursorMove(() => scheduleClip(true));
+      term.onScroll(() => scheduleClip(true));
       // Typing or clicking in a pane focuses it (its xterm took the focus).
       term.textarea.addEventListener("focus", () => ctx.onFocusIn(pane));
       pane.term = term;
@@ -115,7 +117,16 @@ window.FwHubPanes = function (ctx) {
     // a prompt at the top of a fresh shell stays in view as well as one at
     // the bottom of a busy agent. Rows cut off are flagged above/below.
     let clipFrame = 0;
-    function scheduleClip() {
+    // The box's usable height and the terminal's, measured by the last
+    // clip; `null`: measure again. Measuring forces a layout, and the
+    // cursor moves on nearly every write of a busy session: only a resize
+    // or a size/class change (every other caller) measures anew.
+    let clipGeom = null;
+    // What the last clip wrote (unchanged writes are skipped, so a clip
+    // leaves the layout clean for the next pane's).
+    let clipShown = { el: null };
+    function scheduleClip(cursorOnly) {
+      if (!cursorOnly) clipGeom = null;
       if (clipFrame) return;
       clipFrame = requestAnimationFrame(() => {
         clipFrame = 0;
@@ -128,9 +139,11 @@ window.FwHubPanes = function (ctx) {
       let shift = 0;
       let overflow = 0;
       if (host.classList.contains("following") || host.classList.contains("floored")) {
-        const pad = parseFloat(getComputedStyle(host).paddingTop) || 0;
-        const avail = host.clientHeight - pad;
-        const height = xt.offsetHeight;
+        if (!clipGeom) {
+          const pad = parseFloat(getComputedStyle(host).paddingTop) || 0;
+          clipGeom = { avail: host.clientHeight - pad, height: xt.offsetHeight };
+        }
+        const { avail, height } = clipGeom;
         overflow = Math.max(0, height - avail);
         if (overflow > 0 && pane.term.rows > 0) {
           const rowH = height / pane.term.rows;
@@ -138,10 +151,20 @@ window.FwHubPanes = function (ctx) {
           const row = buf.cursorY + buf.baseY - buf.viewportY;
           shift = Math.min(overflow, Math.max(0, (row + 1) * rowH - avail));
         }
+      } else {
+        clipGeom = null;
       }
-      xt.style.transform = shift > 0 ? `translateY(${-shift}px)` : "";
-      host.classList.toggle("clip-above", shift > 0.5);
-      host.classList.toggle("clip-below", overflow - shift > 0.5);
+      if (clipShown.el !== xt) clipShown = { el: xt, transform: null, above: null, below: null };
+      const shown = {
+        el: xt,
+        transform: shift > 0 ? `translateY(${-shift}px)` : "",
+        above: shift > 0.5,
+        below: overflow - shift > 0.5,
+      };
+      if (shown.transform !== clipShown.transform) xt.style.transform = shown.transform;
+      if (shown.above !== clipShown.above) host.classList.toggle("clip-above", shown.above);
+      if (shown.below !== clipShown.below) host.classList.toggle("clip-below", shown.below);
+      clipShown = shown;
     }
 
     // Size the terminal: to the box while claiming (the PTY follows),

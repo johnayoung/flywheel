@@ -18,7 +18,17 @@ use futures_util::SinkExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, watch};
+use tokio::time::Instant;
+
+/// Sleep until `at`; never, without one.
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
 
 #[derive(Deserialize)]
 pub(super) struct EventsQuery {
@@ -129,6 +139,115 @@ fn status_message(hub: &Hub, client: &str, session_id: &str) -> Message {
     }
 }
 
+/// Least time between two `sessions` pushes to one client: each makes it
+/// re-list every workspace and session, and changes come in bursts (a
+/// fan-out's launch, badges after a turn, an import). One that comes
+/// sooner is sent when the interval is up (never dropped).
+pub const SESSIONS_PUSH_INTERVAL: Duration = Duration::from_millis(250);
+/// Most queued events read in one batch.
+const BATCH: usize = 512;
+
+/// What one batch of hub events comes to for one client: the events
+/// queued together, with repeats folded. A `status`, `usage`, or `fanout`
+/// push carries (or makes the client fetch) the current state, so one per
+/// session or fan-out says all that repeats would; `sessions` is a re-list
+/// signal, sent once (and paced, see [`SESSIONS_PUSH_INTERVAL`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct Batch {
+    /// In order, repeats folded into their first place.
+    pub(crate) events: Vec<HubEvent>,
+    /// Some event in it said to re-list.
+    pub(crate) sessions: bool,
+    /// The queue overflowed: what was lost is unknown.
+    pub(crate) lagged: bool,
+}
+
+impl Batch {
+    pub(crate) fn push(&mut self, event: HubEvent) {
+        let repeat = match &event {
+            HubEvent::Sessions => {
+                self.sessions = true;
+                return;
+            }
+            // Nothing for clients.
+            HubEvent::Unwatched { .. } | HubEvent::Lifecycle { .. } => return,
+            HubEvent::Status { session_id } => self
+                .events
+                .iter()
+                .any(|e| matches!(e, HubEvent::Status { session_id: s } if s == session_id)),
+            HubEvent::Usage { session_id } => self
+                .events
+                .iter()
+                .any(|e| matches!(e, HubEvent::Usage { session_id: s } if s == session_id)),
+            HubEvent::Fanout { id } => self
+                .events
+                .iter()
+                .any(|e| matches!(e, HubEvent::Fanout { id: f } if f == id)),
+            HubEvent::Plugins => self.events.contains(&HubEvent::Plugins),
+            _ => false,
+        };
+        if !repeat {
+            self.events.push(event);
+        }
+    }
+
+    /// The first event and whatever is queued behind it (at most
+    /// [`BATCH`]).
+    pub(crate) fn drain(
+        first: Result<HubEvent, broadcast::error::RecvError>,
+        events: &mut broadcast::Receiver<HubEvent>,
+    ) -> Result<Self, ()> {
+        let mut batch = Self::default();
+        match first {
+            Ok(event) => batch.push(event),
+            Err(broadcast::error::RecvError::Lagged(_)) => batch.lagged = true,
+            Err(broadcast::error::RecvError::Closed) => return Err(()),
+        }
+        for _ in 1..BATCH {
+            match events.try_recv() {
+                Ok(event) => batch.push(event),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => batch.lagged = true,
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(broadcast::error::TryRecvError::Closed) => return Err(()),
+            }
+        }
+        Ok(batch)
+    }
+}
+
+/// The message for one (folded) event; `None`: nothing to send.
+fn event_message(hub: &Hub, client: &str, event: HubEvent) -> Option<Message> {
+    Some(match event {
+        HubEvent::Status { session_id } => status_message(hub, client, &session_id),
+        HubEvent::Commands { session_id, added } => commands_api::event_message(&session_id, added),
+        HubEvent::Usage { session_id } => {
+            let usage = hub.session(&session_id).ok().and_then(|v| v.usage);
+            text(json!({ "type": "usage", "session_id": session_id, "usage": usage }))
+        }
+        HubEvent::Fanout { id } => text(json!({ "type": "fanout", "id": id })),
+        HubEvent::Settings { rev } => text(json!({ "type": "settings", "rev": rev })),
+        HubEvent::Config { rev } => text(json!({ "type": "config", "rev": rev })),
+        HubEvent::Plugins => text(json!({ "type": "plugins" })),
+        HubEvent::PluginToast {
+            plugin,
+            message,
+            tone,
+        } => text(
+            json!({ "type": "plugin_toast", "plugin": plugin, "message": message, "tone": tone }),
+        ),
+        HubEvent::Layout { workspace_id, rev } => {
+            text(json!({ "type": "layout", "workspace_id": workspace_id, "rev": rev }))
+        }
+        HubEvent::Sessions | HubEvent::Unwatched { .. } | HubEvent::Lifecycle { .. } => {
+            return None;
+        }
+    })
+}
+
+fn sessions_message() -> Message {
+    text(json!({ "type": "sessions" }))
+}
+
 async fn events_pump(
     mut socket: WebSocket,
     hub: Arc<Hub>,
@@ -149,56 +268,52 @@ async fn events_pump(
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.reset();
     let mut recheck = login_recheck();
+    // When the last `sessions` push went out, and whether one waits for
+    // the interval to pass.
+    let mut sessions_sent: Option<Instant> = None;
+    let mut sessions_due = false;
     loop {
+        let sessions_at = sessions_sent
+            .filter(|_| sessions_due)
+            .map(|at| at + SESSIONS_PUSH_INTERVAL);
         tokio::select! {
-            event = events.recv() => {
-                let sent = match event {
-                    Ok(HubEvent::Status { session_id }) => {
-                        socket.send(status_message(&hub, &client, &session_id)).await.is_ok()
-                    }
-                    Ok(HubEvent::Sessions) => {
-                        socket.send(text(json!({ "type": "sessions" }))).await.is_ok()
-                    }
-                    Ok(HubEvent::Commands { session_id, added }) => {
-                        socket.send(commands_api::event_message(&session_id, added)).await.is_ok()
-                    }
-                    Ok(HubEvent::Unwatched { .. }) => true,
-                    Ok(HubEvent::Usage { session_id }) => {
-                        let usage = hub.session(&session_id).ok().and_then(|v| v.usage);
-                        socket
-                            .send(text(json!({ "type": "usage", "session_id": session_id, "usage": usage })))
-                            .await
-                            .is_ok()
-                    }
-                    Ok(HubEvent::Fanout { id }) => {
-                        socket.send(text(json!({ "type": "fanout", "id": id }))).await.is_ok()
-                    }
-                    Ok(HubEvent::Settings { rev }) => {
-                        socket.send(text(json!({ "type": "settings", "rev": rev }))).await.is_ok()
-                    }
-                    Ok(HubEvent::Config { rev }) => {
-                        socket.send(text(json!({ "type": "config", "rev": rev }))).await.is_ok()
-                    }
-                    Ok(HubEvent::Plugins) => {
-                        socket.send(text(json!({ "type": "plugins" }))).await.is_ok()
-                    }
-                    Ok(HubEvent::PluginToast { plugin, message, tone }) => {
-                        socket
-                            .send(text(json!({ "type": "plugin_toast", "plugin": plugin, "message": message, "tone": tone })))
-                            .await
-                            .is_ok()
-                    }
-                    Ok(HubEvent::Lifecycle { .. }) => true,
-                    Ok(HubEvent::Layout { workspace_id, rev }) => {
-                        socket.send(text(json!({ "type": "layout", "workspace_id": workspace_id, "rev": rev }))).await.is_ok()
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        socket.send(snapshot_message(&hub, &client)).await.is_ok()
-                            && socket.send(text(json!({ "type": "sessions" }))).await.is_ok()
-                    }
-                    Err(broadcast::error::RecvError::Closed) => false,
+            first = events.recv() => {
+                let Ok(batch) = Batch::drain(first, &mut events) else {
+                    break;
                 };
+                let mut sent = true;
+                if batch.lagged {
+                    // What was lost is unknown: everything afresh.
+                    sent = socket.send(snapshot_message(&hub, &client)).await.is_ok()
+                        && socket.send(sessions_message()).await.is_ok();
+                    sessions_sent = Some(Instant::now());
+                    sessions_due = false;
+                }
+                for event in batch.events {
+                    if !sent {
+                        break;
+                    }
+                    if let Some(message) = event_message(&hub, &client, event) {
+                        sent = socket.send(message).await.is_ok();
+                    }
+                }
+                if sent && batch.sessions && !batch.lagged {
+                    if sessions_sent.is_none_or(|at| at.elapsed() >= SESSIONS_PUSH_INTERVAL) {
+                        sent = socket.send(sessions_message()).await.is_ok();
+                        sessions_sent = Some(Instant::now());
+                        sessions_due = false;
+                    } else {
+                        sessions_due = true;
+                    }
+                }
                 if !sent {
+                    break;
+                }
+            }
+            () = sleep_until(sessions_at) => {
+                sessions_sent = Some(Instant::now());
+                sessions_due = false;
+                if socket.send(sessions_message()).await.is_err() {
                     break;
                 }
             }
@@ -257,4 +372,82 @@ async fn events_pump(
         }
     }
     drop(guard);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status(id: &str) -> HubEvent {
+        HubEvent::Status {
+            session_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn a_batch_folds_repeats_into_their_first_place_and_keeps_payloads() {
+        let mut batch = Batch::default();
+        let added = HubEvent::Commands {
+            session_id: "a".into(),
+            added: Vec::new(),
+        };
+        for _ in 0..1000 {
+            batch.push(status("a"));
+            batch.push(HubEvent::Sessions);
+        }
+        batch.push(added.clone());
+        batch.push(status("b"));
+        batch.push(status("a"));
+        batch.push(HubEvent::Usage {
+            session_id: "a".into(),
+        });
+        batch.push(HubEvent::Usage {
+            session_id: "a".into(),
+        });
+        batch.push(HubEvent::Fanout { id: "f".into() });
+        batch.push(HubEvent::Fanout { id: "f".into() });
+        batch.push(HubEvent::Plugins);
+        batch.push(HubEvent::Plugins);
+        batch.push(added.clone());
+        batch.push(HubEvent::Unwatched {
+            session_id: "a".into(),
+        });
+        assert!(batch.sessions);
+        assert!(!batch.lagged);
+        assert_eq!(
+            batch.events,
+            vec![
+                status("a"),
+                added.clone(),
+                status("b"),
+                HubEvent::Usage {
+                    session_id: "a".into()
+                },
+                HubEvent::Fanout { id: "f".into() },
+                HubEvent::Plugins,
+                // Suggested commands carry what was added: none folded.
+                added,
+            ]
+        );
+    }
+
+    #[test]
+    fn draining_takes_what_is_queued_and_reports_an_overflow() {
+        let (tx, mut rx) = broadcast::channel(8);
+        for i in 0..5 {
+            tx.send(status(&format!("s{i}"))).unwrap();
+            tx.send(status("s0")).unwrap();
+        }
+        // 10 sent into 8 slots: the first read reports the overflow.
+        let first = rx.try_recv().map_err(|e| match e {
+            broadcast::error::TryRecvError::Lagged(n) => broadcast::error::RecvError::Lagged(n),
+            other => panic!("{other:?}"),
+        });
+        let batch = Batch::drain(first, &mut rx).unwrap();
+        assert!(batch.lagged);
+        assert_eq!(batch.events.len(), 5, "{:?}", batch.events);
+        assert!(rx.try_recv().is_err(), "everything queued was drained");
+        drop(tx);
+        assert!(Batch::drain(Err(broadcast::error::RecvError::Closed), &mut rx).is_err());
+    }
 }

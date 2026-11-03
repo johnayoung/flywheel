@@ -43,6 +43,19 @@ function returnFocus() {
 const wsForm = $("#workspace-form");
 // "Import VS Code workspace" (import.js), inside this dialog.
 const importer = window.FwHubImport({ $, el, api, refresh, rememberWorkspace, basename, workspaceById });
+// The first run (onboarding.js): the start screen's ways in, the tour.
+const onboarding = window.FwHubOnboarding({
+  $, el, icon, api, refresh, rememberWorkspace, basename,
+  prefs: settings,
+  openWorkspaceDialog: () => openWorkspaceDialog(),
+  toast: (...args) => commands.toast(...args),
+  keyOf: (id) => settings.keyOf(id),
+  rerender: () => renderMain(),
+  focusTerminal: () => focusTerminal(),
+});
+settings.onChange((ids) => {
+  if (ids.includes("keyboard.tour")) renderMain();
+});
 let wsEditing = null; // workspace being edited, or null for create
 let checkSeq = 0;
 

@@ -22,6 +22,7 @@
 <link rel="stylesheet" href="/assets/app-sidebar.css">
 <link rel="stylesheet" href="/assets/app-stage.css">
 <link rel="stylesheet" href="/assets/app-dialogs.css">
+<link rel="stylesheet" href="/assets/app-onboarding.css">
 <link rel="stylesheet" href="/assets/app-phone.css">
 <link rel="stylesheet" href="/assets/app-worktrees.css">
 <link rel="stylesheet" href="/assets/app-drawers.css">
@@ -198,6 +199,7 @@
         <h1 id="empty-title">Nothing on the wheel.</h1>
         <p id="empty-body">Pick a session, or start one.</p>
         <div class="empty-actions" id="empty-actions"></div>
+        <div id="first-run" class="first-run" hidden></div>
         <dl class="keys">
           <div data-key-row><dt><kbd data-key="palette.open">Ctrl K</kbd></dt><dd>command palette</dd></div>
           <div data-key-row><dt><kbd data-key="session.new">Alt N</kbd></dt><dd>new session</dd></div>
@@ -595,6 +597,7 @@
 <script src="/assets/fmt.js"></script>
 <script src="/assets/commands.js"></script>
 <script src="/assets/import.js"></script>
+<script src="/assets/onboarding.js"></script>
 <script src="/assets/pwa.js"></script>
 <script src="/assets/flywheel.js"></script>
 <script src="/assets/fanout.js"></script>

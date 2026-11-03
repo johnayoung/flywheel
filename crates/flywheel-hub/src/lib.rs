@@ -21,6 +21,7 @@ pub mod config;
 pub mod config_cli;
 pub mod daemon;
 pub mod detect;
+pub mod doctor;
 pub mod endpoint;
 pub mod fanout;
 pub mod fanout_cli;

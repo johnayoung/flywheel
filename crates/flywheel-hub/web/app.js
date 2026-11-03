@@ -188,8 +188,14 @@
     idle: { dot: "idle", label: "idle", tone: "" },
   };
 
+  // A session this hub can reach now: its own, or one on a machine that
+  // is not offline or refusing this hub (an unreachable machine's lists
+  // are its last known ones).
+  const reachable = (session) => !session.machine || machines.reachable(session.machine);
+
   function agentStatus(session) {
     if (session.kind === "shell" || session.state !== "running" || !session.live) return null;
+    if (!reachable(session)) return null;
     const pushed = state.agent[session.id];
     return pushed && AGENT_LOOK[pushed.status] ? pushed : null;
   }
@@ -198,6 +204,15 @@
   // terminal on this hub still shows how it ended); a running agent shows
   // what it is doing instead.
   function status(session) {
+    if (!reachable(session)) {
+      const link = machines.linkOf(session.machine) || "offline";
+      return {
+        dot: "gone",
+        label: link,
+        tone: "",
+        title: `machine ${session.machine} is ${link}: this is its last known state`,
+      };
+    }
     const agent = agentStatus(session);
     if (agent) {
       const look = AGENT_LOOK[agent.status];
@@ -707,6 +722,12 @@
     el, state, sessionById, TERM_FONT, status, goneText, exitHow,
     // A machine's session attaches through this hub's proxy.
     socketPath: (id) => machines.route("GET", `/api/sessions/${id}/ws`),
+    // The machine a session is on and how this hub fares with it (null:
+    // this hub's own).
+    machineLink: (id) => {
+      const name = machines.machineOf(id);
+      return name ? { name, link: machines.linkOf(name) } : null;
+    },
     fontSize: () => mobile.fontSize(),
     termTheme: () => ({ theme: TERM_THEMES[resolvedTheme()], minimumContrastRatio: contrastFloor() }),
     transformInput: (data) => mobile.transformInput(data),
@@ -2636,7 +2657,7 @@
 
   function renderWorkspace(workspace, i, numbering) {
     const sessions = state.sessions.filter((s) => s.workspace_id === workspace.id);
-    const live = sessions.filter((s) => s.live && s.state === "running").length;
+    const live = sessions.filter((s) => s.live && s.state === "running" && reachable(s)).length;
     const collapsed = state.collapsed.has(workspace.id);
     const attachedHere = sessionById(state.attached)?.workspace_id === workspace.id;
     const toggle = () => {
@@ -2768,7 +2789,7 @@
     });
     state.painted = true;
 
-    const running = state.sessions.filter((s) => s.live && s.state === "running").length;
+    const running = state.sessions.filter((s) => s.live && s.state === "running" && reachable(s)).length;
     const tach = $("#tach");
     tach.textContent = `${pad2(running)} live`;
     tach.classList.toggle("on", running > 0);
@@ -2808,10 +2829,11 @@
     const emptyTab = !session && !phone() && state.view && workspaceById(state.view) && activeTab() ? focusedLeaf() : null;
     const workspace = session ? workspaceById(session.workspace_id) : emptyTab ? workspaceById(state.view) : null;
     $("#empty").hidden = !!session;
-    $("#crumb-workspace").replaceChildren(
-      ...(workspace && workspace.machine ? [machineBadge(workspace.machine), " "] : []),
-      workspace ? workspace.name : "",
-    );
+    $("#crumb-workspace").textContent = workspace ? workspace.name : "";
+    // Its own element: it stays when a phone hides the workspace name.
+    const onMachine = workspace && workspace.machine;
+    $("#crumb-machine").hidden = !onMachine;
+    $("#crumb-machine").replaceChildren(...(onMachine ? [machineBadge(workspace.machine)] : []));
     $("#crumb-session").textContent = session ? session.name : emptyTab ? "Empty pane" : "No session";
     // Without a session the header's session controls mean nothing.
     $("#cmd-toggle").hidden = !session;
@@ -2853,7 +2875,7 @@
     if (agent) {
       pill.textContent = agent.status;
       pill.className = `agent-pill ${agent.status}`;
-      pill.title = agent.detail || "";
+      pill.title = agent.detail ? `${agent.status}: ${agent.detail}` : agent.status;
     }
     explain.render(session, agent);
 

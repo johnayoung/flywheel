@@ -403,6 +403,12 @@ window.FwHubPanes = function (ctx) {
           pane.retryTimer = setTimeout(() => pane.reconnectNow(), 300);
           return;
         }
+        if (event.code === 4011 && ctx.machineLink && ctx.machineLink(id)) {
+          // Its machine was re-paired (still registered): reconnect
+          // through the new registration.
+          scheduleReconnect(id, event.code);
+          return;
+        }
         if (event.code === 4010 || event.code === 4011) {
           // A machine's session: that machine refused this hub's
           // credential (revoked there) or was removed from this hub. The
@@ -410,7 +416,7 @@ window.FwHubPanes = function (ctx) {
           setLink("lost", event.code === 4010 ? "machine refused" : "machine removed");
           showBanner(
             event.code === 4010
-              ? `${event.reason || "The machine refused this hub's credential"}. Re-add the machine (Machines in the palette), then reconnect.`
+              ? `${event.reason || "The machine refused this hub's credential"}. Re-pair it (Machines in the palette), then reconnect.`
               : "This session's machine was removed from this hub.",
             event.code === 4010
               ? [el("button", { type: "button", className: "slab", onclick: () => pane.reconnectNow() }, "Reconnect")]
@@ -443,9 +449,12 @@ window.FwHubPanes = function (ctx) {
       const now = el("button", { type: "button", className: "slab", onclick: () => pane.reconnectNow() }, "Reconnect now");
       const tick = () => {
         const seconds = Math.max(0, Math.ceil((due - Date.now()) / 1000));
+        const machine = ctx.machineLink ? ctx.machineLink(id) : null;
         const why = state.offline
           ? "The hub is unreachable."
-          : `Link lost (code ${code}); the session keeps running on the hub.`;
+          : machine && (code === 1011 || (machine.link !== "online" && machine.link !== "connecting"))
+            ? `Machine ${machine.name} is ${machine.link === "refused" ? "refusing this hub" : "unreachable"}; this is its last screen.`
+            : `Link lost (code ${code}); the session keeps running on the hub.`;
         const dropped = pane.dropped
           ? ` ${pane.dropped} keystroke${pane.dropped === 1 ? "" : "s"} not sent.`
           : "";

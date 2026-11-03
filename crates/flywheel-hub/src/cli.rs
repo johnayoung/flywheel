@@ -572,6 +572,16 @@ fn rotate(state_dir: &Path) -> Result<String, String> {
 }
 
 fn url_cmd(args: &UrlArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    if let Some(machine) = &args.endpoint.machine {
+        // This hub holds only a peer credential there, which never mints
+        // login codes.
+        let _ = writeln!(
+            err,
+            "fw hub: url has no --machine: a login code for {machine} comes from that machine \
+             (`fw hub url` there); in this hub's browser UI its sessions are already here"
+        );
+        return 2;
+    }
     let minted = Endpoint::resolve(&args.endpoint).and_then(|hub| {
         let hub = hub.with_timeout(CLIENT_TIMEOUT);
         let code = mint_login_code(&hub)?;

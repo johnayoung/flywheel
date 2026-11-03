@@ -343,6 +343,52 @@ async fn a_hub_drives_another_through_its_proxy() {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    // One hub is registered once: the same URL, or the same hub under
+    // another URL, is refused; so is this hub itself (and what was minted
+    // for that is revoked again).
+    let (status, dup) = a
+        .post(
+            "/api/machines",
+            json!({ "name": "b2", "url": b.base(), "credential": credential }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{dup}");
+    assert!(
+        dup["error"].as_str().unwrap().contains("machine b"),
+        "{dup}"
+    );
+    let (status, dup) = a
+        .post(
+            "/api/machines",
+            json!({
+                "name": "b3",
+                "url": format!("http://localhost:{}", b.addr.port()),
+                "credential": credential,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{dup}");
+    let (status, me) = a
+        .post(
+            "/api/machines",
+            json!({ "name": "me", "url": a.base(), "token": a.token() }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{me}");
+    assert!(me["error"].as_str().unwrap().contains("this hub"), "{me}");
+    let (_, peers) = a.get("/api/peers").await;
+    assert_eq!(peers["peers"].as_array().unwrap().len(), 0, "{peers}");
+    let (status, bad) = a
+        .post(
+            "/api/machines",
+            json!({ "name": "c", "url": "127.0.0.1:1", "credential": credential }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    assert!(bad["error"].as_str().unwrap().contains("http://"), "{bad}");
+    let (_, list) = a.get("/api/machines").await;
+    assert_eq!(list["machines"].as_array().unwrap().len(), 1, "{list}");
+
     // B's sessions, through A, with A's own token only.
     let (status, sessions) = a.get("/m/b/api/sessions").await;
     assert_eq!(status, StatusCode::OK, "{sessions}");
@@ -353,6 +399,24 @@ async fn a_hub_drives_another_through_its_proxy() {
             .iter()
             .any(|s| s["id"] == session.as_str()),
         "{sessions}"
+    );
+    // A machine's answer never runs as A's page.
+    let raw = a
+        .http
+        .get(a.url("/m/b/api/sessions"))
+        .bearer_auth(a.token())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.headers()["content-type"], "application/json");
+    assert_eq!(raw.headers()["content-disposition"], "attachment");
+    assert!(
+        raw.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .starts_with("sandbox"),
+        "{:?}",
+        raw.headers()
     );
     let (status, _) = a.get("/m/nope/api/sessions").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -470,18 +534,26 @@ async fn a_hub_drives_another_through_its_proxy() {
     let (status, _) = a.get("/api/sessions").await;
     assert_eq!(status, StatusCode::OK);
 
-    // Re-pair by minting with B's token: only the minted credential is kept.
-    let (status, _) = a
-        .call(reqwest::Method::DELETE, "/api/machines/b", None, None)
-        .await;
-    assert_eq!(status, StatusCode::OK);
+    // Re-pair in place by minting with B's token: only the minted
+    // credential is kept.
     let (status, view) = a
         .post(
             "/api/machines",
             json!({ "name": "b", "url": b.base(), "token": b.token(), "peer_name": "hub-a2" }),
         )
         .await;
-    assert_eq!(status, StatusCode::CREATED, "{view}");
+    assert_eq!(status, StatusCode::CONFLICT, "{view}");
+    let (status, view) = a
+        .post(
+            "/api/machines",
+            json!({
+                "name": "b", "url": b.base(), "token": b.token(),
+                "peer_name": "hub-a2", "replace": true,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["status"]["state"], "online");
     assert_eq!(view["peer"]["name"], "hub-a2");
     let stored = std::fs::read_to_string(a.state_dir.join("machines.json")).unwrap();
     assert!(!stored.contains(&b.token()), "the token is never stored");

@@ -45,6 +45,10 @@ const WS_MAX_MESSAGE: usize = 4 * 1024 * 1024;
 /// it without asking (each refusal counts against this hub's address in
 /// the machine's failure limit).
 pub const REFUSED_BACKOFF: Duration = Duration::from_secs(90);
+/// This hub's id file inside the state dir (`whoami`'s `hub_id`).
+pub const HUB_ID_FILE: &str = "hub-id";
+/// Largest probe answer (`whoami`, minting, revoking) read from a machine.
+const MAX_PROBE_BODY: usize = 1024 * 1024;
 
 /// Machine registry failures.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +84,9 @@ pub struct MachineRecord {
     pub peer_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_name: Option<String>,
+    /// The remote hub's id (`whoami`): one hub is registered once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_id: Option<String>,
     /// Unix seconds.
     pub added: u64,
 }
@@ -126,6 +133,12 @@ pub fn validate_machine_name(raw: &str) -> Result<String, MachineError> {
 /// credentials), normalized without a trailing slash.
 pub fn parse_machine_url(raw: &str) -> Result<Url, MachineError> {
     let bad = |why: &str| MachineError::Invalid(format!("machine URL {raw:?}: {why}"));
+    if !raw.contains("://") {
+        return Err(bad(&format!(
+            "start it with http:// or https:// (http://{0} or https://{0})",
+            raw.trim()
+        )));
+    }
     let url = Url::parse(raw.trim()).map_err(|e| bad(&e.to_string()))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(bad("expected http:// or https://"));
@@ -369,6 +382,9 @@ pub struct Whoami {
     pub version: String,
     #[serde(default)]
     pub host: String,
+    /// The hub's id (stable across restarts; absent on older hubs).
+    #[serde(default)]
+    pub hub_id: Option<String>,
 }
 
 /// A registered machine and its connection to the remote hub.
@@ -480,6 +496,15 @@ impl Machine {
         self.epoch
     }
 
+    /// Whether `other` reaches the same hub: the same URL, or the same hub
+    /// id or peer id learned from `whoami`.
+    pub fn same_hub(&self, other: &Machine) -> bool {
+        let same = |a: &Option<String>, b: &Option<String>| a.is_some() && a == b;
+        self.record.url == other.record.url
+            || same(&self.record.hub_id, &other.record.hub_id)
+            || same(&self.record.peer_id, &other.record.peer_id)
+    }
+
     pub fn status(&self) -> LinkStatus {
         self.status
             .lock()
@@ -495,6 +520,7 @@ impl Machine {
             "name": self.record.name,
             "url": self.record.url,
             "fingerprint": self.record.fingerprint.as_deref().map(display_fingerprint),
+            "hub_id": self.record.hub_id,
             "peer": self.record.peer_id.as_ref().map(|id| serde_json::json!({
                 "id": id,
                 "name": self.record.peer_name,
@@ -574,8 +600,8 @@ impl Machine {
     fn refused_message(&self) -> String {
         format!(
             "machine {} refused this hub's peer credential (revoked there?): \
-             re-pair it with `fw hub machine rm {0}` and `fw hub machine add`",
-            self.record.name
+             re-pair it with `fw hub machine add {0} {1} --replace`",
+            self.record.name, self.record.url
         )
     }
 
@@ -639,10 +665,9 @@ impl Machine {
             .send(reqwest::Method::GET, "/api/whoami", None, PROBE_TIMEOUT)
             .await?;
         let status = response.status();
-        let body = response
-            .bytes()
+        let body = read_capped(response, MAX_PROBE_BODY)
             .await
-            .map_err(|e| self.unreachable(&describe(&e)))?;
+            .map_err(|e| self.unreachable(&e))?;
         if !status.is_success() {
             let error = LinkError::Unreachable(format!(
                 "machine {} answered HTTP {} to whoami: {} (is it a flywheel hub new enough for machines?)",
@@ -686,7 +711,7 @@ impl Machine {
                 other => other.to_string(),
             })?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|e| describe(&e))?;
+        let bytes = read_capped(response, MAX_PROBE_BODY).await?;
         if !status.is_success() {
             return Err(format!(
                 "machine {} would not mint a peer credential: {} (HTTP {})",
@@ -718,7 +743,9 @@ impl Machine {
             Ok(())
         } else {
             let status = response.status().as_u16();
-            let body = response.bytes().await.unwrap_or_default();
+            let body = read_capped(response, MAX_PROBE_BODY)
+                .await
+                .unwrap_or_default();
             Err(LinkError::Unreachable(format!(
                 "machine {} did not revoke the credential: {} (HTTP {status})",
                 self.record.name,
@@ -807,6 +834,25 @@ impl Machine {
     }
 }
 
+/// A response's body, refused once it passes `limit` bytes (a machine
+/// cannot fill this hub's memory).
+pub async fn read_capped(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|n| usize::try_from(n).map_or(true, |n| n > limit))
+    {
+        return Err(format!("its answer is larger than {limit} bytes: refused"));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| describe(&e))? {
+        if body.len() + chunk.len() > limit {
+            return Err(format!("its answer is larger than {limit} bytes: refused"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 fn looks_like_tls(why: &str) -> bool {
     let why = why.to_ascii_lowercase();
     why.contains("certificate") || why.contains("tls") || why.contains("unknownissuer")
@@ -856,6 +902,8 @@ fn describe(error: &reqwest::Error) -> String {
 /// This hub's machines, persisted in the state dir.
 pub struct Machines {
     state_dir: PathBuf,
+    /// This hub's own id (`whoami`), kept in [`HUB_ID_FILE`].
+    hub_id: String,
     machines: RwLock<Vec<Arc<Machine>>>,
     /// Why the file could not be read (then nothing is saved over it).
     broken: Option<String>,
@@ -894,10 +942,17 @@ impl Machines {
         };
         Self {
             state_dir: state_dir.to_owned(),
+            hub_id: load_hub_id(state_dir),
             machines: RwLock::new(machines),
             broken,
             changes: watch::Sender::new(0),
         }
+    }
+
+    /// This hub's id: a hub refuses to register itself, and one hub is
+    /// registered once.
+    pub fn hub_id(&self) -> &str {
+        &self.hub_id
     }
 
     pub fn list(&self) -> Vec<Arc<Machine>> {
@@ -941,9 +996,12 @@ impl Machines {
                 .unwrap_or_else(PoisonError::into_inner);
             if machines.iter().any(|m| m.name() == machine.name()) {
                 return Err(MachineError::Conflict(format!(
-                    "a machine named {} exists (fw hub machine rm it first)",
+                    "a machine named {0} exists (re-pair it with --replace, or fw hub machine rm {0})",
                     machine.name()
                 )));
+            }
+            if let Some(other) = machines.iter().find(|m| m.same_hub(&machine)) {
+                return Err(duplicate(other.name()));
             }
             if machines.len() >= MAX_MACHINES {
                 return Err(MachineError::Conflict(format!(
@@ -955,6 +1013,49 @@ impl Machines {
         }
         self.changes.send_modify(|n| *n += 1);
         Ok(machine)
+    }
+
+    /// Swap machine `name`'s registration for `machine` (same name: a new
+    /// credential, URL, or pin) and save; the old one, returned, is no
+    /// longer alive (its proxied sockets close).
+    pub fn replace(&self, machine: Machine) -> Result<Arc<Machine>, MachineError> {
+        self.writable()?;
+        let machine = Arc::new(machine);
+        let old = {
+            let mut machines = self
+                .machines
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            let index = machines
+                .iter()
+                .position(|m| m.name() == machine.name())
+                .ok_or_else(|| {
+                    MachineError::NotFound(format!("no machine named {}", machine.name()))
+                })?;
+            if let Some(other) = machines
+                .iter()
+                .find(|m| m.name() != machine.name() && m.same_hub(&machine))
+            {
+                return Err(duplicate(other.name()));
+            }
+            let old = std::mem::replace(&mut machines[index], Arc::clone(&machine));
+            if let Err(e) = self.save(&machines) {
+                machines[index] = old;
+                return Err(e);
+            }
+            old
+        };
+        self.changes.send_modify(|n| *n += 1);
+        Ok(old)
+    }
+
+    /// The registered machine that is the same hub as `machine` would be
+    /// (same URL, hub id, or peer there), if any (besides `except`).
+    pub fn duplicate_of(&self, machine: &Machine, except: Option<&str>) -> Option<String> {
+        self.list()
+            .iter()
+            .find(|m| Some(m.name()) != except && m.same_hub(machine))
+            .map(|m| m.name().to_owned())
     }
 
     /// Forget machine `name` and save.
@@ -1021,8 +1122,35 @@ pub fn record(name: &str, url: &str, credential: &str, fingerprint: Option<&str>
         fingerprint: fingerprint.map(str::to_owned),
         peer_id: None,
         peer_name: None,
+        hub_id: None,
         added: unix_now(),
     }
+}
+
+fn duplicate(name: &str) -> MachineError {
+    MachineError::Conflict(format!(
+        "that hub is already registered as machine {name} (one hub is registered once; \
+         re-pair it with `fw hub machine add {name} <url> --replace`)"
+    ))
+}
+
+/// This hub's id in `state_dir` (made on first use). Unreadable or
+/// unwritable: a fresh one for this process.
+fn load_hub_id(state_dir: &Path) -> String {
+    let path = state_dir.join(HUB_ID_FILE);
+    if let Ok(text) = fs::read_to_string(&path) {
+        let id = text.trim();
+        if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return id.to_ascii_lowercase();
+        }
+    }
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    if fs::create_dir_all(state_dir).is_ok()
+        && let Err(e) = write_private(&path, id.as_bytes())
+    {
+        eprintln!("fw hub: cannot save {}: {e}", path.display());
+    }
+    id
 }
 
 #[cfg(test)]
@@ -1127,6 +1255,64 @@ mod tests {
         reloaded.remove("b").unwrap();
         assert!(!reloaded.alive(epoch));
         assert!(Machines::load(dir.path()).list().is_empty());
+    }
+
+    /// An answer past the limit is refused, announced (Content-Length) or
+    /// streamed (chunked) -- never held whole.
+    #[tokio::test]
+    async fn answers_past_the_limit_are_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for announced in [true, false, true] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                if announced {
+                    let small = request.starts_with(b"GET /small");
+                    let body: &[u8] = if small { b"ok" } else { b"" };
+                    let length = if small { 2 } else { 1 << 30 };
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {length}\r\n\r\n");
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body).await;
+                } else {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n")
+                        .await;
+                    let chunk = vec![b'x'; 64 * 1024];
+                    let frame = [
+                        format!("{:x}\r\n", chunk.len()).into_bytes(),
+                        chunk,
+                        b"\r\n".to_vec(),
+                    ]
+                    .concat();
+                    // Far past the limit, unless the reader stops.
+                    for _ in 0..1024 {
+                        if socket.write_all(&frame).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        crate::install_crypto_provider();
+        let http = reqwest::Client::new();
+        for path in ["/announced", "/chunked"] {
+            let response = http
+                .get(format!("http://{addr}{path}"))
+                .send()
+                .await
+                .unwrap();
+            let error = read_capped(response, 1024 * 1024).await.unwrap_err();
+            assert!(error.contains("larger than"), "{path}: {error}");
+        }
+        let response = http
+            .get(format!("http://{addr}/small"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_capped(response, 1024).await.unwrap(), b"ok");
     }
 
     #[test]

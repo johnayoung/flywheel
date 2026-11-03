@@ -78,6 +78,10 @@ struct AddArgs {
     /// self-signed hub; `openssl x509 -noout -fingerprint -sha256`).
     #[arg(long, value_name = "SHA256")]
     fingerprint: Option<String>,
+    /// Re-pair the registered machine NAME in place (a new credential,
+    /// URL, or pin; its name, and the layouts naming it, stay).
+    #[arg(long)]
+    replace: bool,
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -213,6 +217,9 @@ fn add(args: &AddArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, 
     if let Some(fingerprint) = &args.fingerprint {
         body["fingerprint"] = json!(fingerprint);
     }
+    if args.replace {
+        body["replace"] = json!(true);
+    }
     let view = hub.blocking_call("POST", "/api/machines", Some(&body))?;
     if args.json {
         let _ = writeln!(out, "{view}");
@@ -221,7 +228,8 @@ fn add(args: &AddArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, 
     let status = &view["status"];
     let _ = writeln!(
         out,
-        "added machine {} ({}): {}{}",
+        "{} machine {} ({}): {}{}",
+        if args.replace { "re-paired" } else { "added" },
         str_field(&view, "name"),
         str_field(&view, "url"),
         str_field(status, "state"),

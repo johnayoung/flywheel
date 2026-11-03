@@ -538,11 +538,18 @@ impl CredentialWatch {
         }
     }
 
-    fn for_peer(mut self, store: &Arc<crate::peers::PeerStore>, id: String) -> Self {
+    /// `changes` must be subscribed before the credential was verified, so
+    /// a revocation racing the check is still seen.
+    fn for_peer(
+        mut self,
+        store: &Arc<crate::peers::PeerStore>,
+        changes: watch::Receiver<u64>,
+        id: String,
+    ) -> Self {
         self.peer = Some(PeerWatch {
             id,
             store: Arc::clone(store),
-            changes: store.subscribe(),
+            changes,
         });
         self
     }
@@ -635,7 +642,10 @@ async fn require_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // Both subscribed before the check: a rotation or a peer revocation
+    // racing it is still seen by the socket it opens.
     let watch = CredentialWatch::new(&app.hub);
+    let peer_changes = app.peers.subscribe();
     match authenticate(&app, request.headers(), client) {
         Auth::Granted(login) => {
             request
@@ -651,7 +661,7 @@ async fn require_auth(
                      administer this hub)",
                 );
             }
-            let watch = watch.for_peer(&app.peers, peer.id.clone());
+            let watch = watch.for_peer(&app.peers, peer_changes, peer.id.clone());
             request.extensions_mut().insert(watch);
             request.extensions_mut().insert(peer);
             next.run(request).await
@@ -2029,5 +2039,24 @@ mod tests {
         // This host connecting to its own LAN address is this machine.
         let own = client("10.0.0.5:5000", "10.0.0.5:7420", None, &options);
         assert!(own.same_machine && !own.trusted_peer);
+    }
+    /// A peer revoked after its credential was checked but before its
+    /// socket's watch existed still has that socket closed.
+    #[tokio::test]
+    async fn a_revocation_racing_the_check_still_closes_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::open(crate::HubOptions::new(dir.path().join("state"))).unwrap();
+        let store = Arc::new(crate::peers::PeerStore::load(&dir.path().join("state")));
+        let (peer, credential) = store.issue("box").unwrap();
+        // As require_auth: subscribe, verify, (revoked here), watch.
+        let changes = store.subscribe();
+        assert!(store.verify(&credential).is_some());
+        store.revoke(&peer.id).unwrap();
+        let mut watch = CredentialWatch::new(&hub).for_peer(&store, changes, peer.id.clone());
+        let mut recheck = login_recheck();
+        let close = tokio::time::timeout(Duration::from_secs(5), watch.revoked(&hub, &mut recheck))
+            .await
+            .expect("the racing revocation is seen");
+        assert_eq!(close.code, WS_CLOSE_PEER_REVOKED);
     }
 }

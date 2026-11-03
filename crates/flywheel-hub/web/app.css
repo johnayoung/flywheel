@@ -3427,8 +3427,8 @@ button.meter.usage[hidden] { display: none; }
   color: var(--ink-3);
 }
 .machine-name {
-  flex: 0 1 auto;
-  min-width: 3ch;
+  flex: 1 1 auto;
+  min-width: 4ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3437,7 +3437,7 @@ button.meter.usage[hidden] { display: none; }
   color: var(--ink-2);
 }
 .machine-state {
-  flex: 0 100 auto;
+  flex: 0 0 auto;
   min-width: 0;
   margin-left: auto;
   overflow: hidden;
@@ -3448,7 +3448,7 @@ button.meter.usage[hidden] { display: none; }
 .machine-retry { flex: none; }
 .machine-head.link-refused .machine-state { color: var(--alert); }
 .machine-head.link-offline .machine-state { color: var(--brass); }
-.machine-retry { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--signal); }
+.machine-retry { font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--signal); padding: 0 .15rem; }
 .machine-dot {
   flex: none;
   width: .5rem;
@@ -3481,7 +3481,25 @@ button.meter.usage[hidden] { display: none; }
   color: var(--ink-2);
   background: var(--bg-3);
 }
-.crumb-ws .machine-badge { vertical-align: 1px; }
+.crumb-machine { flex: none; align-self: center; display: inline-flex; }
+.crumb-machine[hidden] { display: none; }
+/* A narrow header: the session name keeps a readable share. */
+@media (max-width: 760px) {
+  .crumb-session { flex: 1 1 auto; min-width: 7ch; }
+  .crumb-machine .machine-badge { max-width: 4.5rem; }
+  .crumbs .agent-pill, .crumbs .why-btn { flex: none; }
+}
+/* A phone: the status pill is its colored dot (its word is the title and
+   the sidebar's), the companion-shell button its icon. */
+@media (max-width: 480px) {
+  .crumbs .agent-pill { font-size: 0; gap: 0; padding: .3rem; }
+  .crumbs .agent-pill::before { width: .55rem; height: .55rem; }
+  #flip-label { display: none; }
+  .crumbs { gap: .3rem; }
+  .crumb-session { min-width: 4.5ch; }
+  .crumbs .why-btn { min-width: 0; padding: .1rem .2rem; font-size: 10px; letter-spacing: 0; }
+  .crumb-machine .machine-badge { max-width: 3.8rem; padding: .05rem .2rem; }
+}
 
 /* The machines dialog. */
 .machines-intro { font-size: 11.5px; }

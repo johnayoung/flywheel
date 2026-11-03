@@ -32,12 +32,23 @@ window.FwHubMachines = function (ctx) {
   // --- routing -----------------------------------------------------------
 
   const ID_PATH = /^\/api\/(?:sessions|workspaces)\/([0-9a-f]{8,64})(?=[/?]|$)/;
+  // What a machine's workspace and session ids must look like: they go
+  // into API paths, so anything else (dot segments, slashes, queries) is
+  // dropped, never routed.
+  const ID = /^[0-9a-f]{8,64}$/;
+
+  // This hub's own workspaces and sessions: their ids are never a
+  // machine's (a machine cannot take one over).
+  const isLocal = (id) =>
+    (state.localSessions || []).some((s) => s.id === id) ||
+    (state.localWorkspaces || []).some((w) => w.id === id);
   // Calls about "where": they follow the dialog's machine.
   const CONTEXT_GET = /^\/api\/(?:kinds|folders\/check|repos\/check|worktrees\/plan)(?=[/?]|$)/;
 
   function route(method, path, body) {
     if (path.startsWith("/m/")) return path;
     const match = ID_PATH.exec(path);
+    if (match && isLocal(match[1])) return path;
     let machine = match ? ui.owner.get(match[1]) : null;
     if (!machine && !match && body && typeof body === "object") {
       machine = ui.owner.get(body.workspace_id) || ui.owner.get(body.session_id) || null;
@@ -70,6 +81,7 @@ window.FwHubMachines = function (ctx) {
       loaded: false,
       agentKeys: new Set(),
       rollupKeys: new Set(),
+      peer: view.peer ? view.peer.id : null,
       seq: 0,
       viewing: undefined,
     };
@@ -94,11 +106,19 @@ window.FwHubMachines = function (ctx) {
     for (const view of data.machines || []) {
       seen.add(view.name);
       const known = ui.machines.get(view.name);
-      if (known && known.url === view.url) {
+      const peer = view.peer ? view.peer.id : null;
+      if (known && known.url === view.url && known.peer === peer) {
         known.view = view;
         continue;
       }
-      if (known) drop(known);
+      if (known) {
+        // Re-paired (a new credential, URL, or pin; same name): a new
+        // socket and fresh lists, but its sessions stay on screen
+        // meanwhile (open panes reconnect instead of closing).
+        rebind(known, view);
+        fresh.push(known);
+        continue;
+      }
       const m = runtime(view);
       ui.machines.set(view.name, m);
       fresh.push(m);
@@ -115,6 +135,23 @@ window.FwHubMachines = function (ctx) {
   const withTimeout = (promise, ms) =>
     Promise.race([promise.catch(() => {}), new Promise((resolve) => setTimeout(resolve, ms))]);
 
+  function rebind(m, view) {
+    clearTimeout(m.timer);
+    m.view = view;
+    m.url = view.url;
+    m.peer = view.peer ? view.peer.id : null;
+    m.retry = 0;
+    m.due = 0;
+    m.seq += 1;
+    if (m.socket) {
+      const socket = m.socket;
+      m.socket = null;
+      socket.close();
+    }
+    m.link = "connecting";
+    m.error = "";
+  }
+
   function drop(m) {
     ui.machines.delete(m.name);
     clearTimeout(m.timer);
@@ -123,10 +160,19 @@ window.FwHubMachines = function (ctx) {
       m.socket = null;
       socket.close();
     }
-    for (const key of m.agentKeys) delete state.agent[key];
-    for (const key of m.rollupKeys) delete state.rollup[key];
+    // Only the statuses of what this machine showed: an id another
+    // machine (or this hub) shows keeps its status.
+    for (const key of m.agentKeys) if (mine(m, key)) delete state.agent[key];
+    for (const key of m.rollupKeys) if (mine(m, key)) delete state.rollup[key];
     forget(m);
     bump();
+  }
+
+  // Whether `id` may be `m`'s: not this hub's, and not another machine's.
+  function mine(m, id) {
+    if (!ID.test(id) || isLocal(id)) return false;
+    const owner = ui.owner.get(id);
+    return !owner || owner === m.name;
   }
 
   function forget(m) {
@@ -150,10 +196,14 @@ window.FwHubMachines = function (ctx) {
       throw error;
     }
     if (seq !== m.seq || !ui.machines.has(m.name)) return;
-    m.workspaces = ws.workspaces.map((w) => ({ ...w, machine: m.name }));
-    m.sessions = ss.sessions.map((s) => ({ ...s, machine: m.name }));
-    m.loaded = true;
     forget(m);
+    const keep = (item) => item && typeof item.id === "string" && mine(m, item.id);
+    m.workspaces = (ws.workspaces || []).filter(keep).map((w) => ({ ...w, machine: m.name }));
+    const known = new Set(m.workspaces.map((w) => w.id));
+    m.sessions = (ss.sessions || [])
+      .filter((s) => keep(s) && known.has(s.workspace_id))
+      .map((s) => ({ ...s, machine: m.name }));
+    m.loaded = true;
     for (const w of m.workspaces) ui.owner.set(w.id, m.name);
     for (const s of m.sessions) ui.owner.set(s.id, m.name);
     if (m.link !== "online" && m.socket && m.socket.readyState === WebSocket.OPEN) setLink(m, "online", "");
@@ -215,7 +265,9 @@ window.FwHubMachines = function (ctx) {
       `${scheme}://${window.location.host}${prefix(m.name)}/api/events?client=${encodeURIComponent(clientId)}`,
     );
     m.socket = socket;
-    if (m.link !== "refused") setLink(m, "connecting", m.error);
+    // An unreachable machine stays so until it answers (its last known
+    // lists never flash back to live on each retry).
+    if (m.link !== "refused" && m.link !== "offline") setLink(m, "connecting", m.error);
     socket.onopen = () => {
       if (m.socket !== socket) return;
       m.retry = 0;
@@ -246,11 +298,15 @@ window.FwHubMachines = function (ctx) {
         return;
       }
       if (event.code === 4011) {
-        sync().then(() => ctx.onChange());
+        // Removed, or re-paired (then it reconnects).
+        sync().then(() => {
+          if (ui.machines.get(m.name) === m && !m.socket) connect(m);
+          ctx.onChange();
+        });
         return;
       }
       if (event.code === 4010) {
-        setLink(m, "refused", `${m.name} refused this hub's credential (revoked there?). Remove and re-add the machine.`);
+        setLink(m, "refused", `${m.name} refused this hub's credential (revoked there?). Re-pair it in Machines.`);
       } else if (event.code === 1012) {
         // That hub is being upgraded: back in a moment.
         m.timer = setTimeout(() => connect(m), 300);
@@ -289,16 +345,27 @@ window.FwHubMachines = function (ctx) {
     }
   }
 
+  // Only the keys a machine may set (see `mine`).
+  function claimed(m, map) {
+    const out = {};
+    for (const [key, value] of Object.entries(map || {})) if (mine(m, key)) out[key] = value;
+    return out;
+  }
+
   function onMessage(m, message) {
     if (message.type === "snapshot") {
-      for (const key of m.agentKeys) delete state.agent[key];
-      for (const key of m.rollupKeys) delete state.rollup[key];
-      m.agentKeys = new Set(Object.keys(message.sessions || {}));
-      m.rollupKeys = new Set(Object.keys(message.workspaces || {}));
-      Object.assign(state.agent, message.sessions || {});
-      Object.assign(state.rollup, message.workspaces || {});
+      for (const key of m.agentKeys) if (mine(m, key)) delete state.agent[key];
+      for (const key of m.rollupKeys) if (mine(m, key)) delete state.rollup[key];
+      const sessions = claimed(m, message.sessions);
+      const workspaces = claimed(m, message.workspaces);
+      m.agentKeys = new Set(Object.keys(sessions));
+      m.rollupKeys = new Set(Object.keys(workspaces));
+      Object.assign(state.agent, sessions);
+      Object.assign(state.rollup, workspaces);
       ctx.onStatusChange();
     } else if (message.type === "status") {
+      if (typeof message.session_id !== "string" || !mine(m, message.session_id)) return;
+      if (message.workspace_id && (typeof message.workspace_id !== "string" || !mine(m, message.workspace_id))) return;
       ctx.onStatus(message);
       if (message.status) m.agentKeys.add(message.session_id);
       else m.agentKeys.delete(message.session_id);
@@ -365,7 +432,8 @@ window.FwHubMachines = function (ctx) {
       el("span", { className: "machine-name", textContent: name }),
       el("span", {
         className: "machine-state",
-        textContent: waiting && link !== "online" ? `${LINK_TEXT[link]} · retry ${waiting}s` : LINK_TEXT[link],
+        textContent: waiting && link === "offline" ? `${LINK_TEXT[link]} · ${waiting}s` : LINK_TEXT[link],
+        title: waiting && link === "offline" ? `retrying in ${waiting}s` : undefined,
       }),
       link === "online" || link === "connecting"
         ? null
@@ -394,6 +462,11 @@ window.FwHubMachines = function (ctx) {
   const names = () => [...ui.machines.keys()];
   const any = () => ui.machines.size > 0;
   const linkOf = (name) => (ui.machines.get(name) || {}).link || null;
+  // Unknown machines (removed) count as unreachable.
+  const reachable = (name) => {
+    const link = linkOf(name);
+    return link === "online" || link === "connecting";
+  };
 
   // --- the machines dialog ----------------------------------------------------
 
@@ -421,6 +494,13 @@ window.FwHubMachines = function (ctx) {
             className: "slab ghost",
             textContent: "Test",
             onclick: () => test(m.name),
+          }),
+          el("button", {
+            type: "button",
+            className: "slab ghost",
+            textContent: "Re-pair",
+            title: `Give ${m.name} a new credential (or URL, or pin), keeping its name`,
+            onclick: () => repair(m),
           }),
           el("button", {
             type: "button",
@@ -479,6 +559,25 @@ window.FwHubMachines = function (ctx) {
     ctx.onChange();
   }
 
+  // Re-pair: the form, filled with the machine's name and URL, replaces
+  // its registration in place.
+  let repairing = null;
+
+  function setRepairing(name) {
+    repairing = name;
+    $("#machine-name").readOnly = !!name;
+    $("#machine-submit").textContent = name ? `Re-pair ${name}` : "Add machine";
+  }
+
+  function repair(m) {
+    setRepairing(m.name);
+    $("#machine-name").value = m.name;
+    $("#machine-url").value = m.url;
+    $("#machine-fp").value = m.view.fingerprint || "";
+    $("#machine-error").textContent = "";
+    $("#machine-secret").focus();
+  }
+
   async function add(event) {
     event.preventDefault();
     const name = $("#machine-name").value.trim();
@@ -496,6 +595,8 @@ window.FwHubMachines = function (ctx) {
     if (mint) body.token = secret;
     else body.credential = secret;
     if (fingerprint) body.fingerprint = fingerprint;
+    const replacing = repairing === name;
+    if (replacing) body.replace = true;
     const submit = $("#machine-submit");
     submit.disabled = true;
     try {
@@ -506,10 +607,11 @@ window.FwHubMachines = function (ctx) {
       $("#machine-url").value = "";
       $("#machine-fp").value = "";
       $("#machine-mint").checked = false;
+      setRepairing(null);
       await sync();
       renderList();
       ctx.onChange();
-      ctx.toast(`Added ${name}.`, { timeout: 2500 });
+      ctx.toast(replacing ? `Re-paired ${name}.` : `Added ${name}.`, { timeout: 2500 });
     } catch (e) {
       error.textContent = e.message;
     } finally {
@@ -519,6 +621,7 @@ window.FwHubMachines = function (ctx) {
 
   function openDialog() {
     $("#machine-error").textContent = "";
+    setRepairing(null);
     renderList();
     $("#dlg-machines").showModal();
     sync().then(renderList);
@@ -552,6 +655,7 @@ window.FwHubMachines = function (ctx) {
     names,
     any,
     linkOf,
+    reachable,
     openDialog,
     setContext: (fn) => {
       ui.context = fn;

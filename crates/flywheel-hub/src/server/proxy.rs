@@ -35,6 +35,12 @@ use tokio_tungstenite::tungstenite;
 
 /// Largest request body forwarded to a machine.
 const MAX_FORWARD_BODY: usize = 8 * 1024 * 1024;
+/// Largest response body read from a machine.
+const MAX_FORWARD_RESPONSE: usize = 32 * 1024 * 1024;
+/// On every proxied answer: it is the machine's, served from this hub's
+/// origin, so it may never run as this hub's page (no scripts, no
+/// rendering a navigation).
+const PROXIED_CSP: &str = "sandbox; default-src 'none'; frame-ancestors 'none'";
 /// How long removing a machine waits for it to revoke its credential.
 const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Close code: the machine refused this hub's credential (revoked there).
@@ -47,13 +53,17 @@ pub const WS_CLOSE_MACHINE_LOST: u16 = 1011;
 // --- the remote side: who am I, peers ---------------------------------------
 
 /// `GET /api/whoami`: what the presented credential is here.
-pub(super) async fn whoami(peer: Option<axum::Extension<PeerInfo>>) -> Response {
+pub(super) async fn whoami(
+    State(app): State<AppState>,
+    peer: Option<axum::Extension<PeerInfo>>,
+) -> Response {
     let peer = peer.map(|axum::Extension(p)| p);
     Json(json!({
         "scope": if peer.is_some() { "peer" } else { "full" },
         "peer": peer,
         "version": env!("CARGO_PKG_VERSION"),
         "host": host_name(),
+        "hub_id": app.machines.hub_id(),
     }))
     .into_response()
 }
@@ -188,6 +198,10 @@ pub(super) struct AddMachine {
     /// The peer's name on the remote when minting (default: this host).
     peer_name: Option<String>,
     fingerprint: Option<String>,
+    /// Re-pair the machine named `name` in place (a new credential, URL,
+    /// or pin), keeping its name.
+    #[serde(default)]
+    replace: bool,
 }
 
 /// A peer name for this hub on another: its host name, as a peer name.
@@ -210,13 +224,36 @@ pub(super) async fn add_machine(
         Ok(name) => name,
         Err(e) => return machine_error(&e),
     };
-    if app.machines.get(&name).is_some() {
-        return error_response(
-            StatusCode::CONFLICT,
-            &format!("a machine named {name} exists (remove it first)"),
-        );
+    let existing = app.machines.get(&name);
+    match (&existing, body.replace) {
+        (Some(_), false) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                &format!(
+                    "a machine named {name} exists (re-pair it with `replace`, --replace on \
+                     the CLI, or remove it first)"
+                ),
+            );
+        }
+        (None, true) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                &format!("no machine named {name} to re-pair (add it instead)"),
+            );
+        }
+        _ => {}
     }
     let fingerprint = body.fingerprint.as_deref().filter(|f| !f.trim().is_empty());
+    // One hub is registered once: the same URL is refused before anything
+    // is minted there.
+    match Machine::new(record(&name, &body.url, "probe", fingerprint)) {
+        Ok(probe) => {
+            if let Some(other) = app.machines.duplicate_of(&probe, Some(&name)) {
+                return already_registered(&other);
+            }
+        }
+        Err(e) => return machine_error(&e),
+    }
     let given = |v: &Option<String>| {
         v.as_deref()
             .map(str::trim)
@@ -254,9 +291,22 @@ pub(super) async fn add_machine(
         Ok(m) => m,
         Err(e) => return machine_error(&e),
     };
+    // From here a refusal revokes what was minted for it (a plain retry
+    // then mints afresh instead of finding the peer name taken).
+    let discard = |response: Response| {
+        let orphan = minted.then(|| record(&name, &body.url, &credential, fingerprint));
+        async move {
+            if let Some(orphan) = orphan
+                && let Ok(orphan) = Machine::new(orphan)
+            {
+                let _ = tokio::time::timeout(REVOKE_TIMEOUT, orphan.revoke_self()).await;
+            }
+            response
+        }
+    };
     let who = match machine.whoami().await {
         Ok(who) => who,
-        Err(e) => return link_error(&name, &e),
+        Err(e) => return discard(link_error(&name, &e)).await,
     };
     if who.scope != "peer" {
         return error_response(
@@ -266,31 +316,65 @@ pub(super) async fn add_machine(
              or run `fw hub peer issue --name <this hub>` there",
         );
     }
+    if who.hub_id.as_deref() == Some(app.machines.hub_id()) {
+        return discard(error_response(
+            StatusCode::BAD_REQUEST,
+            "that URL is this hub itself: its sessions are already here",
+        ))
+        .await;
+    }
     let mut stored = machine.record().clone();
     if let Some(peer) = &who.peer {
         stored.peer_id = Some(peer.id.clone());
         stored.peer_name = Some(peer.name.clone());
     }
+    stored.hub_id = who.hub_id.clone();
+    if let Some(added) = &existing {
+        stored.added = added.record().added;
+    }
     let machine = match Machine::new(stored) {
         Ok(m) => m,
-        Err(e) => return machine_error(&e),
+        Err(e) => return discard(machine_error(&e)).await,
     };
+    if let Some(other) = app.machines.duplicate_of(&machine, Some(&name)) {
+        return discard(already_registered(&other)).await;
+    }
     // Carry over what the check learned.
     let _ = machine.whoami().await;
-    match app.machines.insert(machine) {
-        Ok(machine) => {
+    let outcome = if existing.is_some() {
+        app.machines.replace(machine).map(|old| (old, true))
+    } else {
+        app.machines.insert(machine).map(|new| (new, false))
+    };
+    match outcome {
+        Ok((machine, false)) => {
             app.hub.emit(HubEvent::Sessions);
             (StatusCode::CREATED, Json(machine.view())).into_response()
         }
-        Err(e) => {
-            if minted
-                && let Ok(orphan) = Machine::new(record(&name, &body.url, &credential, fingerprint))
-            {
-                let _ = tokio::time::timeout(REVOKE_TIMEOUT, orphan.revoke_self()).await;
+        Ok((old, true)) => {
+            app.hub.emit(HubEvent::Sessions);
+            // The old credential, when it differs and still works there,
+            // is revoked (best effort).
+            if old.record().credential != credential {
+                let _ = tokio::time::timeout(REVOKE_TIMEOUT, old.revoke_self()).await;
             }
-            machine_error(&e)
+            match app.machines.get(&name) {
+                Some(machine) => Json(machine.view()).into_response(),
+                None => no_machine(&name),
+            }
         }
+        Err(e) => discard(machine_error(&e)).await,
     }
+}
+
+fn already_registered(other: &str) -> Response {
+    error_response(
+        StatusCode::CONFLICT,
+        &format!(
+            "that hub is already registered as machine {other} (one hub is registered once; \
+             re-pair {other} instead)"
+        ),
+    )
 }
 
 /// `DELETE /api/machines/{name}`: forget it, and ask it to revoke the
@@ -427,7 +511,7 @@ pub(super) async fn forward(
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .cloned();
-    let bytes = match response.bytes().await {
+    let bytes = match crate::machines::read_capped(response, MAX_FORWARD_RESPONSE).await {
         Ok(bytes) => bytes,
         Err(e) => {
             return link_error(
@@ -436,12 +520,24 @@ pub(super) async fn forward(
             );
         }
     };
-    let mut out = (status, Bytes::from(bytes.to_vec())).into_response();
+    let mut out = (status, Bytes::from(bytes)).into_response();
     let headers = out.headers_mut();
-    // Only what the API's clients read: never cookies or redirects.
-    if let Some(value) = content_type.and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok()) {
-        headers.insert(header::CONTENT_TYPE, value);
-    }
+    // Only what the API's clients read: never cookies or redirects, and
+    // never a type a browser would render or run from this origin.
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(proxied_type(
+            content_type.as_ref().and_then(|v| v.to_str().ok()),
+        )),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(PROXIED_CSP),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
+    );
     if let Some(value) = retry_after.and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok()) {
         headers.insert(header::RETRY_AFTER, value);
     }
@@ -455,6 +551,19 @@ pub(super) async fn forward(
         );
     }
     out
+}
+
+/// The content type a proxied answer is served with: JSON or plain text
+/// as the machine said, anything else as opaque bytes.
+fn proxied_type(upstream: Option<&str>) -> &'static str {
+    let essence = upstream
+        .and_then(|v| v.split(';').next())
+        .map(|v| v.trim().to_ascii_lowercase());
+    match essence.as_deref() {
+        Some("application/json") => "application/json",
+        Some("text/plain") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn forward_socket(
@@ -674,5 +783,33 @@ mod tests {
         }
         assert_eq!(browser_close("b", Some((1012, String::new()))).code, 1012);
         assert_eq!(browser_close("b", None).code, WS_CLOSE_MACHINE_LOST);
+    }
+
+    #[test]
+    fn proxied_answers_are_never_pages_or_scripts() {
+        assert_eq!(proxied_type(Some("application/json")), "application/json");
+        assert_eq!(
+            proxied_type(Some("Application/JSON; charset=utf-8")),
+            "application/json"
+        );
+        assert_eq!(
+            proxied_type(Some("text/plain")),
+            "text/plain; charset=utf-8"
+        );
+        for hostile in [
+            Some("text/html"),
+            Some("text/javascript"),
+            Some("application/javascript"),
+            Some("image/svg+xml"),
+            Some("application/xhtml+xml"),
+            Some("application/json+html"),
+            None,
+        ] {
+            assert_eq!(
+                proxied_type(hostile),
+                "application/octet-stream",
+                "{hostile:?}"
+            );
+        }
     }
 }

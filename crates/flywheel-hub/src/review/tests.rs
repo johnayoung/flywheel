@@ -384,12 +384,15 @@ fn push_goes_to_the_bare_remote_with_upstream_and_is_never_forced() {
 
     let plan = plan_push(&tools(), &t, None).unwrap();
     assert_eq!(plan.refusal, None);
+    let head = run_git(wt, &["rev-parse", "HEAD"]);
+    // The planned commit, then the upstream (push -u sets none for an id).
     assert_eq!(
         plan.commands[0].display,
-        format!(
-            "git -C {} push -u origin refs/heads/feat:refs/heads/feat",
-            wt.display()
-        )
+        format!("git -C {} push origin {head}:refs/heads/feat", wt.display())
+    );
+    assert_eq!(
+        plan.commands[1].args,
+        ["branch", "--set-upstream-to=origin/feat", "feat"]
     );
     assert!(
         plan.details[0].contains("creates origin/feat"),
@@ -437,10 +440,12 @@ fn push_goes_to_the_bare_remote_with_upstream_and_is_never_forced() {
     run_git(&other, &["push", "-q", "origin", "feat"]);
     run_git(wt, &["fetch", "-q", "origin"]);
     let plan = plan_push(&tools(), &t, None).unwrap();
+    let head = run_git(wt, &["rev-parse", "HEAD"]);
     assert_eq!(
         plan.commands[0].args,
-        ["push", "origin", "refs/heads/feat:refs/heads/feat"]
+        ["push", "origin", &format!("{head}:refs/heads/feat")]
     );
+    assert_eq!(plan.commands.len(), 1, "tracked already: no upstream step");
     assert!(
         plan.details.iter().any(|d| d.contains("never forced")),
         "{:?}",
@@ -645,8 +650,9 @@ fn merge_fast_forwards_the_base_in_the_main_checkout() {
     assert_eq!(
         plan.commands[0].display,
         format!(
-            "git -C {} merge --ff-only refs/heads/feat",
-            f.repo.display()
+            "git -C {} merge --ff-only {}",
+            f.repo.display(),
+            run_git(&f.repo, &["rev-parse", "refs/heads/feat"])
         )
     );
     assert_eq!(plan.details.len(), 2);
@@ -856,9 +862,14 @@ fn a_branch_tracking_another_name_is_pushed_to_its_own_name() {
     let t = f.target();
     let plan = plan_push(&tools(), &t, None).unwrap();
     assert_eq!(plan.refusal, None, "{plan:?}");
+    let head = run_git(wt, &["rev-parse", "HEAD"]);
     assert_eq!(
         plan.commands[0].args,
-        ["push", "-u", "origin", "refs/heads/feat:refs/heads/feat"]
+        ["push", "origin", &format!("{head}:refs/heads/feat")]
+    );
+    assert_eq!(
+        plan.commands[1].args,
+        ["branch", "--set-upstream-to=origin/feat", "feat"]
     );
     assert!(
         plan.details
@@ -889,10 +900,12 @@ fn a_branch_tracking_another_name_is_pushed_to_its_own_name() {
         &["remote", "add", "backup", backup.to_str().unwrap()],
     );
     let plan = plan_push(&tools(), &t, Some("backup")).unwrap();
+    let head = run_git(wt, &["rev-parse", "HEAD"]);
     assert_eq!(
         plan.commands[0].args,
-        ["push", "backup", "refs/heads/feat:refs/heads/feat"]
+        ["push", "backup", &format!("{head}:refs/heads/feat")]
     );
+    assert_eq!(plan.commands.len(), 1, "the upstream is kept");
     assert!(
         plan.details
             .iter()
@@ -1004,4 +1017,59 @@ fn status_paths_cover_every_entry_kind() {
         status_paths(status),
         ["sub dir/one file", "new name", "both", "fresh one"]
     );
+}
+
+/// A change landing after the confirm's re-plan but before `git add -A`
+/// (an agent still writing) is not committed: the index goes back as it
+/// was and nothing is committed.
+#[test]
+fn a_change_racing_the_staging_is_never_committed() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    write(wt, "README", "reviewed\n");
+    write(wt, "staged.txt", "staged\n");
+    run_git(wt, &["add", "staged.txt"]);
+    let plan = plan_commit(&tools(), &t, "feat: reviewed").unwrap();
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    let index_before = run_git(wt, &["write-tree"]);
+    // The race: after the plan was checked, before staging.
+    write(wt, "README", "unreviewed\n");
+    let err = run_staged_as_planned(&tools(), &t, &plan).unwrap_err();
+    assert!(err.to_string().contains("nothing was committed"), "{err}");
+    assert_eq!(run_git(wt, &["rev-list", "--count", "main..HEAD"]), "0");
+    assert_eq!(
+        run_git(wt, &["write-tree"]),
+        index_before,
+        "the index is put back"
+    );
+    // A file appearing meanwhile is caught the same way.
+    write(wt, "README", "reviewed\n");
+    let plan = plan_commit(&tools(), &t, "feat: reviewed").unwrap();
+    write(wt, "late.txt", "late\n");
+    assert!(run_staged_as_planned(&tools(), &t, &plan).is_err());
+    assert_eq!(run_git(wt, &["rev-list", "--count", "main..HEAD"]), "0");
+    // Unraced, the plan commits exactly what it named.
+    std::fs::remove_file(wt.join("late.txt")).unwrap();
+    let plan = plan_commit(&tools(), &t, "feat: reviewed").unwrap();
+    run_staged_as_planned(&tools(), &t, &plan).unwrap();
+    assert_eq!(run_git(wt, &["rev-list", "--count", "main..HEAD"]), "1");
+    assert_eq!(run_git(wt, &["status", "--porcelain"]), "");
+}
+
+/// A commit landing on the branch after the merge plan is not merged:
+/// the plan fast-forwards to the commit it named.
+#[test]
+fn merge_runs_the_planned_commit_not_the_moving_branch() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    commit_file(wt, "a.txt", "a\n", "feat: a");
+    let planned = run_git(wt, &["rev-parse", "HEAD"]);
+    let plan = plan_merge(&tools(), &t).unwrap();
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    commit_file(wt, "b.txt", "b\n", "unreviewed");
+    // Run the plan as planned (what a confirm racing the commit runs).
+    run_plan(&plan.commands).unwrap();
+    assert_eq!(run_git(&f.repo, &["rev-parse", "HEAD"]), planned);
 }

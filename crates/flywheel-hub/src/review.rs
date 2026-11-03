@@ -923,6 +923,9 @@ pub struct Plan {
     /// Pull request: the title and body offered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defaults: Option<PrDefaults>,
+    /// Commit: the changed paths and what each held when planned.
+    #[serde(skip)]
+    pub contents: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -976,30 +979,78 @@ fn fingerprint(parts: &[&str]) -> String {
 /// now, so an edit after the review -- even one keeping the same line
 /// counts -- makes the plan stale.
 fn tree_state(git: &Git<'_>) -> Result<String, String> {
-    let status = git.raw(
-        &[
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--branch",
-            "--untracked-files=all",
-        ],
-        READ_LIMIT,
-    )?;
+    Ok(tree_snapshot(git)?.0)
+}
+
+/// [`tree_state`], and the changed paths with what each holds (a commit
+/// checks what it staged against these).
+fn tree_snapshot(git: &Git<'_>) -> Result<(String, Vec<(String, String)>), String> {
+    let status = porcelain(git, &["--branch"])?;
+    let mut state = String::from_utf8_lossy(&status).into_owned();
+    let contents = path_contents(git, &status);
+    for (path, hash) in &contents {
+        state.push('\u{1}');
+        state.push_str(path);
+        state.push('\u{2}');
+        state.push_str(hash);
+    }
+    Ok((state, contents))
+}
+
+/// `git status --porcelain=v2 -z` with untracked files, renames off (each
+/// changed path is its own entry, staged or not).
+fn porcelain(git: &Git<'_>, extra: &[&str]) -> Result<Vec<u8>, String> {
+    let mut args = vec![
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--no-renames",
+    ];
+    args.extend_from_slice(extra);
+    let status = git.raw(&args, READ_LIMIT)?;
     if !status.success() {
         return Err(status.error_text());
     }
     if status.truncated {
         return Err("too many changes to plan against (git status is cut)".into());
     }
-    let mut state = String::from_utf8_lossy(&status.stdout).into_owned();
-    for path in status_paths(&status.stdout) {
-        state.push('\u{1}');
-        state.push_str(&path);
-        state.push('\u{2}');
-        state.push_str(&content_hash(&git.dir.join(&path)));
+    Ok(status.stdout)
+}
+
+/// Each path `status` names, with what the work tree holds there.
+fn path_contents(git: &Git<'_>, status: &[u8]) -> Vec<(String, String)> {
+    status_paths(status)
+        .into_iter()
+        .map(|path| {
+            let hash = content_hash(&git.dir.join(&path));
+            (path, hash)
+        })
+        .collect()
+}
+
+/// After `git add -A`: the index holds exactly what the commit was
+/// planned with -- the same paths changed, each file's content as planned,
+/// nothing left unstaged or untracked. A change landing between the plan
+/// and the staging (an agent still at work) fails this.
+fn staged_as_planned(git: &Git<'_>, planned: &[(String, String)]) -> Result<bool, String> {
+    let status = porcelain(git, &[])?;
+    let fully_staged = status
+        .split(|b| *b == 0)
+        .filter(|t| !t.is_empty())
+        .all(|entry| match entry.first() {
+            // "1 XY ...": Y is the work tree against the index.
+            Some(b'1') => entry.get(3) == Some(&b'.'),
+            _ => false,
+        });
+    if !fully_staged {
+        return Ok(false);
     }
-    Ok(state)
+    let mut now = path_contents(git, &status);
+    let mut planned = planned.to_vec();
+    now.sort();
+    planned.sort();
+    Ok(now == planned)
 }
 
 /// The work-tree paths `git status --porcelain=v2 -z` names (changed,
@@ -1095,7 +1146,7 @@ fn change_line(prefix: &str, f: &FileChange) -> String {
 pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan, String> {
     let git = Git::new(tools, &target.dir);
     let review = read(tools, target)?;
-    let state = tree_state(&git)?;
+    let (state, contents) = tree_snapshot(&git)?;
     let mut refusal = None;
     if let Some(op) = &review.operation {
         refusal = Some(format!(
@@ -1173,6 +1224,7 @@ pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan
         refusal,
         needs_rebase: false,
         defaults: None,
+        contents,
     })
 }
 
@@ -1261,13 +1313,28 @@ pub fn plan_push(tools: &Tools, target: &Target, remote: Option<&str>) -> Result
             Err(why) => refusal = Some(why),
             Ok(to) => {
                 let name = &to.remote;
-                let mut args = vec!["push".to_owned()];
-                if to.set_upstream {
-                    args.push("-u".into());
-                }
-                args.push(name.clone());
-                args.push(format!("refs/heads/{branch}:{}", to.dest));
+                // The commit planned, not the branch: one the agent adds
+                // after the plan is not pushed unreviewed.
+                let args = vec![
+                    "push".to_owned(),
+                    name.clone(),
+                    format!("{head}:{}", to.dest),
+                ];
                 commands.push(Planned::new(&tools.git, &target.dir, args, PUSH_TIMEOUT));
+                if to.set_upstream {
+                    // `push -u` sets no upstream for a commit id: the
+                    // branch is pointed at what it was pushed to.
+                    commands.push(Planned::new(
+                        &tools.git,
+                        &target.dir,
+                        vec![
+                            "branch".into(),
+                            format!("--set-upstream-to={name}/{branch}"),
+                            branch.clone(),
+                        ],
+                        COMMIT_TIMEOUT,
+                    ));
+                }
                 let url = review
                     .remotes
                     .iter()
@@ -1335,13 +1402,14 @@ pub fn plan_push(tools: &Tools, target: &Target, remote: Option<&str>) -> Result
         refusal,
         needs_rebase: false,
         defaults: None,
+        contents: Vec::new(),
     })
 }
 
 /// Whether `gh` is installed and signed in for `host`: `(installed,
 /// authenticated, why not)`.
 pub fn gh_status(tools: &Tools, dir: &Path, host: Option<&str>) -> (bool, bool, Option<String>) {
-    let Some(program) = runner::find_program(&tools.gh) else {
+    let Some(program) = crate::agent::which(&tools.gh) else {
         return (
             false,
             false,
@@ -1510,7 +1578,7 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
             refusal = why;
         }
     }
-    let program = runner::find_program(&tools.gh)
+    let program = crate::agent::which(&tools.gh)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| tools.gh.clone());
     let mut args = vec![
@@ -1565,6 +1633,7 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
         refusal,
         needs_rebase: false,
         defaults: Some(defaults),
+        contents: Vec::new(),
     })
 }
 
@@ -1648,6 +1717,7 @@ pub fn plan_rebase(tools: &Tools, target: &Target) -> Result<Plan, String> {
         refusal,
         needs_rebase: false,
         defaults: None,
+        contents: Vec::new(),
     })
 }
 
@@ -1685,6 +1755,7 @@ pub fn plan_abort(tools: &Tools, target: &Target) -> Result<Plan, String> {
         refusal,
         needs_rebase: false,
         defaults: None,
+        contents: Vec::new(),
     })
 }
 
@@ -1792,11 +1863,9 @@ pub fn plan_merge(tools: &Tools, target: &Target) -> Result<Plan, String> {
     let command = Planned::new(
         &tools.git,
         &main,
-        vec![
-            "merge".into(),
-            "--ff-only".into(),
-            format!("refs/heads/{branch}"),
-        ],
+        // The commit planned, not the branch: a commit landing on it after
+        // the plan is not merged unreviewed.
+        vec!["merge".into(), "--ff-only".into(), branch_sha.clone()],
         MERGE_TIMEOUT,
     );
     Ok(Plan {
@@ -1823,6 +1892,7 @@ pub fn plan_merge(tools: &Tools, target: &Target) -> Result<Plan, String> {
         refusal,
         needs_rebase,
         defaults: None,
+        contents: Vec::new(),
     })
 }
 
@@ -1837,6 +1907,7 @@ fn refused(action: &'static str, why: &str) -> Plan {
         refusal: Some(why.to_owned()),
         needs_rebase: false,
         defaults: None,
+        contents: Vec::new(),
     }
 }
 
@@ -1929,9 +2000,9 @@ fn exec(command: &Planned) -> Result<Output, RunError> {
 
 /// Run `plan`'s commands in order, stopping at the first failure (an
 /// error naming the command and what it said).
-fn run_plan(plan: &Plan) -> Result<Vec<(Ran, Output)>, ActionError> {
+fn run_plan(commands: &[Planned]) -> Result<Vec<(Ran, Output)>, ActionError> {
     let mut done = Vec::new();
-    for command in &plan.commands {
+    for command in commands {
         let output = exec(command)?;
         let record = ran(command, &output);
         if !output.success() {
@@ -1982,7 +2053,7 @@ pub fn commit(
     let _lock = RepoLock::take(tools, &target.dir)?;
     let plan = plan_commit(tools, target, message).map_err(unplannable)?;
     confirmed(&plan, confirm)?;
-    let done = run_plan(&plan)?;
+    let done = run_staged_as_planned(tools, target, &plan)?;
     let head = head_of(tools, &target.dir);
     let short = head.as_deref().map_or("?", |h| &h[..h.len().min(10)]);
     // What the commit holds, as git recorded it.
@@ -2012,6 +2083,38 @@ pub fn commit(
     })
 }
 
+/// Run a commit plan (`git add -A`, then `git commit`), committing only
+/// what was planned: what `add` staged is checked against the plan's
+/// contents first, and on a mismatch the index is put back as it was and
+/// nothing is committed.
+fn run_staged_as_planned(
+    tools: &Tools,
+    target: &Target,
+    plan: &Plan,
+) -> Result<Vec<(Ran, Output)>, ActionError> {
+    let git = Git::new(tools, &target.dir);
+    let (add, rest) = plan
+        .commands
+        .split_first()
+        .ok_or_else(|| ActionError::Conflict("the commit plan runs nothing".into()))?;
+    let saved = git.out(&["write-tree"]).map_err(unplannable)?;
+    let mut done = run_plan(std::slice::from_ref(add))?;
+    let as_planned = staged_as_planned(&git, &plan.contents);
+    if !matches!(as_planned, Ok(true)) {
+        let restored = git.out(&["read-tree", &saved]).is_ok();
+        return Err(ActionError::Conflict(format!(
+            "the work tree changed while committing (after the plan was checked): nothing was committed{}; review it again and confirm the new plan",
+            if restored {
+                ""
+            } else {
+                ", but the index could not be put back (git reset to unstage)"
+            }
+        )));
+    }
+    done.extend(run_plan(rest)?);
+    Ok(done)
+}
+
 pub fn check_message(message: &str) -> Result<(), ActionError> {
     if message.len() > MAX_MESSAGE_BYTES {
         return Err(ActionError::Invalid(format!(
@@ -2035,7 +2138,7 @@ pub fn push(
     let _lock = RepoLock::take(tools, &target.dir)?;
     let plan = plan_push(tools, target, remote).map_err(unplannable)?;
     confirmed(&plan, confirm)?;
-    let done = run_plan(&plan)?;
+    let done = run_plan(&plan.commands)?;
     Ok(Outcome {
         action: "push",
         ok: true,
@@ -2067,7 +2170,7 @@ pub fn pr(
     let _lock = RepoLock::take(tools, &target.dir)?;
     let plan = plan_pr(tools, target, request).map_err(unplannable)?;
     confirmed(&plan, confirm)?;
-    let done = run_plan(&plan)?;
+    let done = run_plan(&plan.commands)?;
     let url = done.last().and_then(|(_, o)| {
         o.stdout_text()
             .lines()
@@ -2153,7 +2256,7 @@ pub fn abort(tools: &Tools, target: &Target, confirm: &str) -> Result<Outcome, A
     let _lock = RepoLock::take(tools, &target.dir)?;
     let plan = plan_abort(tools, target).map_err(unplannable)?;
     confirmed(&plan, confirm)?;
-    let done = run_plan(&plan)?;
+    let done = run_plan(&plan.commands)?;
     Ok(Outcome {
         action: "abort",
         ok: true,
@@ -2170,7 +2273,7 @@ pub fn merge(tools: &Tools, target: &Target, confirm: &str) -> Result<Outcome, A
     let _lock = RepoLock::take(tools, &target.dir)?;
     let plan = plan_merge(tools, target).map_err(unplannable)?;
     confirmed(&plan, confirm)?;
-    let done = run_plan(&plan)?;
+    let done = run_plan(&plan.commands)?;
     let main = plan.commands[0].dir.clone();
     Ok(Outcome {
         action: "merge",

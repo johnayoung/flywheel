@@ -433,7 +433,15 @@ async fn a_worktree_session_is_reviewed_committed_pushed_merged_and_removed() {
     assert_eq!(
         plan["commands"][0]["display"],
         format!(
-            "git -C {} push -u origin refs/heads/feat:refs/heads/feat",
+            "git -C {} push origin {}:refs/heads/feat",
+            wt.display(),
+            git(&wt, &["rev-parse", "HEAD"])
+        )
+    );
+    assert_eq!(
+        plan["commands"][1]["display"],
+        format!(
+            "git -C {} branch --set-upstream-to=origin/feat feat",
             wt.display()
         )
     );
@@ -539,8 +547,9 @@ async fn a_worktree_session_is_reviewed_committed_pushed_merged_and_removed() {
     );
     assert!(
         out.contains(&format!(
-            "$ git -C {} merge --ff-only refs/heads/feat",
-            hub.repo().display()
+            "$ git -C {} merge --ff-only {}",
+            hub.repo().display(),
+            git(&hub.repo(), &["rev-parse", "main"])
         )),
         "{out}"
     );

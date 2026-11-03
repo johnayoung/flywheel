@@ -24,6 +24,10 @@ async fn a_burst_of_list_changes_reaches_events_clients_as_few_paced_signals() {
     std::fs::create_dir_all(&repo).unwrap();
     let mut options = HubOptions::new(dir.path().join("state"));
     options.default_shell = vec!["/bin/sh".into()];
+    // Hermetic: never the developer's ~/.claude, ~/.codex, or ~/code.
+    options.claude_config_dir = Some(dir.path().join("claude-config"));
+    options.codex_home = Some(dir.path().join("codex-home"));
+    options.import_root = Some(dir.path().join("home/code"));
     let hub = support::open_hub(options);
     let token = hub.token().expose().to_owned();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

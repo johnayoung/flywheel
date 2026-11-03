@@ -295,7 +295,7 @@ window.FwHubOnboarding = function (ctx) {
     {
       keys: ["palette.open"],
       title: "Command palette",
-      body: "Every action, session, and workspace by name: start typing. Press the key again while the palette is open to send it to the terminal instead.",
+      body: "Every action, session, and workspace by name: start typing (\"Share\" makes a read-only live link to a session, \"Record\" saves it as a .cast). Press the key again while the palette is open to send it to the terminal instead.",
     },
     {
       keys: ["session.new"],

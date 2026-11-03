@@ -201,8 +201,9 @@ fn run_checks(
     checks.push(hooks_check(claude_program.as_deref(), exe));
     checks.push(agent_check(SessionKind::Codex, path, hub_path.as_deref()));
     checks.extend(state_dir_checks(dir));
-    checks.extend(config_checks(dir));
-    // Where the next `fw hub start` would listen: --port, else hub.toml,
+    let home = crate::config::home_dir();
+    checks.extend(config_checks(dir, home.as_deref()));
+    // What the next `fw hub start` would run with: --port, else hub.toml,
     // else the defaults (a bad file: the defaults).
     let flags = crate::config::Flags {
         port,
@@ -210,8 +211,8 @@ fn run_checks(
     };
     let effective = crate::config::read_file(&dir.join(crate::config::CONFIG_FILE))
         .ok()
-        .flatten()
-        .and_then(|file| crate::config::resolve(&file, &flags, None).ok());
+        .map(Option::unwrap_or_default)
+        .and_then(|file| crate::config::resolve(&file, &flags, home.as_deref()).ok());
     let bind = effective
         .as_ref()
         .map_or(IpAddr::V4(Ipv4Addr::LOCALHOST), |e| e.bind);
@@ -224,6 +225,10 @@ fn run_checks(
     checks.extend(systemd_checks());
     checks.push(clock_check());
     checks.push(disk_check(dir, DISK_WARN_BYTES, DISK_FAIL_BYTES));
+    let limits = effective
+        .as_ref()
+        .map_or_else(crate::record::RecordLimits::default, |e| e.record_limits);
+    checks.push(recordings_check(dir, limits));
     checks
 }
 
@@ -255,8 +260,10 @@ pub enum Found {
     This,
     /// A script: its `#!` interpreter line.
     Script(String),
-    /// A flywheel with `fw hub`, but another build.
-    OtherFlywheel,
+    /// A flywheel with `fw hub`, but another build: its version, from
+    /// `--version`, when it answers one (builds before `fw --version` do
+    /// not).
+    OtherFlywheel(Option<String>),
     /// Some other program.
     Other,
 }
@@ -290,11 +297,27 @@ pub fn classify(candidate: &Path, exe: Option<&Path>) -> Found {
             if exe.is_some_and(|exe| installed_together(&real, exe)) {
                 Found::This
             } else {
-                Found::OtherFlywheel
+                Found::OtherFlywheel(
+                    bounded(&real, &["--version"])
+                        .filter(runner::Output::success)
+                        .and_then(|out| parse_version(&out.stdout_text())),
+                )
             }
         }
         _ => Found::Other,
     }
+}
+
+/// The version in a `fw --version` answer (`fw 0.6.1`, `flywheel 0.6.1`).
+pub fn parse_version(text: &str) -> Option<String> {
+    let line = first_line(text);
+    let mut words = line.split_whitespace();
+    let prog = words.next()?;
+    let version = words.next()?;
+    let looks_like = ["fw", "flywheel"].contains(&prog)
+        && words.next().is_none()
+        && version.starts_with(|c: char| c.is_ascii_digit());
+    looks_like.then(|| version.to_owned())
 }
 
 /// Binaries one build writes side by side: `fw` and `flywheel` are two
@@ -389,13 +412,26 @@ fn on_path_check_with(
     let kind = classify(first);
     let mut check = match &kind {
         Found::This => Check::new(id, Level::Ok, format!("{} is this binary", first.display())),
-        Found::OtherFlywheel => Check::new(
+        Found::OtherFlywheel(version) => Check::new(
             id,
             Level::Warn,
-            format!(
-                "{} is another flywheel build than this one ({this})",
-                first.display()
-            ),
+            match version.as_deref() {
+                Some(v) if v != env!("CARGO_PKG_VERSION") => format!(
+                    "{} is flywheel {v}, not this one ({this}, flywheel {})",
+                    first.display(),
+                    env!("CARGO_PKG_VERSION")
+                ),
+                Some(v) => format!(
+                    "{} is another flywheel {v} build than this one ({this})",
+                    first.display()
+                ),
+                None => format!(
+                    "{} is an older flywheel build (no `--version`) than this one ({this}, \
+                     flywheel {})",
+                    first.display(),
+                    env!("CARGO_PKG_VERSION")
+                ),
+            },
         )
         .fix(format!(
             "reinstall one build (`cargo install --path crates/flywheel`), or put {exe_dir} \
@@ -410,7 +446,7 @@ fn on_path_check_with(
             // directory is the one to move up.
             let shadowed = found[1..]
                 .iter()
-                .find(|p| matches!(classify(p), Found::This | Found::OtherFlywheel))
+                .find(|p| matches!(classify(p), Found::This | Found::OtherFlywheel(_)))
                 .and_then(|p| p.parent())
                 .map_or_else(|| exe_dir.clone(), |d| d.display().to_string());
             // What usually puts it there, when that is known.
@@ -924,13 +960,15 @@ fn writable(dir: &Path) -> bool {
 // --- config files -------------------------------------------------------------------
 
 /// `hub.toml`, `notify.toml`, `settings.json`, and plugin manifests parse.
-pub fn config_checks(dir: &Path) -> Vec<Check> {
+/// `hub.toml` is checked by the validation `fw hub config check` and the
+/// hub's start run (every key, `[recordings]` and `[shares]` included).
+pub fn config_checks(dir: &Path, home: Option<&Path>) -> Vec<Check> {
     let mut checks = Vec::new();
     let hub_toml = dir.join(crate::config::CONFIG_FILE);
     checks.push(match crate::config::read_file(&hub_toml) {
         Ok(None) => Check::new("hub.toml", Level::Ok, "none (every setting is its default)"),
         Ok(Some(file)) => {
-            match crate::config::resolve(&file, &crate::config::Flags::default(), None) {
+            match crate::config::resolve(&file, &crate::config::Flags::default(), home) {
                 Ok(_) => Check::new("hub.toml", Level::Ok, format!("{} is valid", hub_toml.display())),
                 Err(errors) => errors.into_iter().fold(
                     Check::new("hub.toml", Level::Fail, format!("{} has bad values", hub_toml.display()))
@@ -1345,6 +1383,46 @@ pub fn disk_check(dir: &Path, warn_below: u64, fail_below: u64) -> Check {
     }
 }
 
+/// What the recordings take against `[recordings]
+/// dir_cap` (past it, the oldest finished ones are deleted).
+pub fn recordings_check(dir: &Path, limits: crate::record::RecordLimits) -> Check {
+    let id = "recordings";
+    let recordings = crate::record::Recordings::new(dir, limits);
+    let cap = limits.max_total_bytes;
+    let cap_text = crate::record::format_size(cap);
+    let list = match recordings.list() {
+        Ok(list) => list,
+        Err(e) => {
+            return Check::new(id, Level::Warn, e.to_string()).fix(format!(
+                "make {} readable by this user (chmod 700)",
+                recordings.dir().display()
+            ));
+        }
+    };
+    let used: u64 = list.iter().map(|r| r.size).sum();
+    let summary = format!(
+        "{} of dir_cap {cap_text} in {} file{}",
+        human_bytes(used),
+        list.len(),
+        if list.len() == 1 { "" } else { "s" }
+    );
+    let check = if used > cap {
+        Check::new(id, Level::Warn, summary).fix(format!(
+            "over the cap: the next recording start or rotation deletes the oldest finished \
+             ones; `fw hub record ls` / `fw hub record rm NAME` to choose, or raise \
+             [recordings] dir_cap (now {cap_text})"
+        ))
+    } else if used.saturating_mul(10) >= cap.saturating_mul(9) {
+        Check::new(id, Level::Info, summary).fix(format!(
+            "near the cap: the oldest finished recordings go first past it; keep any with \
+             `fw hub record get NAME`, or raise [recordings] dir_cap (now {cap_text})"
+        ))
+    } else {
+        Check::new(id, Level::Ok, summary)
+    };
+    check.detail(format!("in {}", recordings.dir().display()))
+}
+
 fn free_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -1447,7 +1525,7 @@ mod tests {
         write_script(&dir.path().join("fw"), "#!/bin/sh\necho same\n");
         let exe = dir.path().join("flywheel").canonicalize().unwrap();
         assert_eq!(classify(&dir.path().join("fw"), Some(&exe)), Found::This);
-        let other = |_: &Path| Found::OtherFlywheel;
+        let other = |_: &Path| Found::OtherFlywheel(None);
         let check = on_path_check_with("fw", &[dir.path().join("fw")], Some(&exe), &other);
         assert_eq!(check.level, Level::Warn);
         assert!(check.fix.unwrap().contains("cargo install"));
@@ -1486,6 +1564,8 @@ mod tests {
         assert!(!installed_together(&fw, &flywheel));
     }
 
+    // `/proc/<pid>/fd` and `fdinfo`: elsewhere `hub_holds_lock` is `None`.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_held_lock_is_seen_without_taking_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -1504,7 +1584,10 @@ mod tests {
         other.unlock().unwrap();
         // A process without the file open holds nothing.
         assert!(!hub_holds_lock(1, &path).unwrap_or(false));
+    }
 
+    #[test]
+    fn an_fdinfo_flock_line_is_told_from_other_locks() {
         assert!(fdinfo_has_flock(
             "pos:\t0\nflags:\t02100002\nmnt_id:\t1363\nino:\t4366546\nlock:\t1: FLOCK  ADVISORY  WRITE 0 08:30:4366546 0 EOF\n"
         ));
@@ -1605,7 +1688,7 @@ mod tests {
     #[test]
     fn bad_config_files_fail_and_absent_ones_pass() {
         let dir = tempfile::tempdir().unwrap();
-        let checks = config_checks(dir.path());
+        let checks = config_checks(dir.path(), None);
         assert!(checks.iter().all(|c| c.level == Level::Ok), "{checks:?}");
         std::fs::write(dir.path().join("hub.toml"), "[server]\nport = \"x\"\n").unwrap();
         std::fs::write(dir.path().join("notify.toml"), "url = 3\n").unwrap();
@@ -1615,7 +1698,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("settings.json"), "{nope").unwrap();
-        let checks = config_checks(dir.path());
+        let checks = config_checks(dir.path(), None);
         let level = |id: &str| checks.iter().find(|c| c.id == id).map(|c| c.level);
         assert_eq!(level("hub.toml"), Some(Level::Fail), "{checks:?}");
         assert_eq!(level("notify.toml"), Some(Level::Fail), "{checks:?}");
@@ -1630,7 +1713,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o644),
         )
         .unwrap();
-        let notify: Vec<Check> = config_checks(dir.path())
+        let notify: Vec<Check> = config_checks(dir.path(), None)
             .into_iter()
             .filter(|c| c.id == "notify.toml")
             .collect();
@@ -1642,6 +1725,119 @@ mod tests {
             .collect();
         assert_eq!(secrets.len(), 1, "{secrets:?}");
         assert!(secrets[0].fix.as_deref().unwrap().contains("ignores it"));
+    }
+
+    #[test]
+    fn version_answers_parse_and_others_do_not() {
+        assert_eq!(parse_version("fw 0.6.1\n"), Some("0.6.1".to_owned()));
+        assert_eq!(
+            parse_version("flywheel 1.2.3-rc1"),
+            Some("1.2.3-rc1".to_owned())
+        );
+        assert_eq!(
+            parse_version("error: unexpected argument '--version' found"),
+            None
+        );
+        assert_eq!(parse_version("fw"), None);
+        assert_eq!(parse_version("claude 0.6.1"), None);
+    }
+
+    #[test]
+    fn another_flywheel_names_its_version_against_this_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_script(&dir.path().join("fw"), "#!/bin/sh\nexit 0\n");
+        let found = [dir.path().join("fw")];
+        let older = |_: &Path| Found::OtherFlywheel(Some("0.0.1".to_owned()));
+        let check = on_path_check_with("fw", &found, None, &older);
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.summary.contains("is flywheel 0.0.1, not this one"),
+            "{}",
+            check.summary
+        );
+        assert!(
+            check.summary.contains(env!("CARGO_PKG_VERSION")),
+            "{}",
+            check.summary
+        );
+        let same = |_: &Path| Found::OtherFlywheel(Some(env!("CARGO_PKG_VERSION").to_owned()));
+        let check = on_path_check_with("fw", &found, None, &same);
+        assert!(
+            check.summary.contains("another flywheel"),
+            "{}",
+            check.summary
+        );
+        let unknown = |_: &Path| Found::OtherFlywheel(None);
+        let check = on_path_check_with("fw", &found, None, &unknown);
+        assert!(
+            check.summary.contains("no `--version`"),
+            "{}",
+            check.summary
+        );
+    }
+
+    #[test]
+    fn bad_recordings_and_shares_keys_fail_the_hub_toml_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let level = |checks: &[Check]| checks.iter().find(|c| c.id == "hub.toml").map(|c| c.level);
+        std::fs::write(
+            dir.path().join("hub.toml"),
+            "[recordings]\npart_cap = \"8MiB\"\ndir_cap = \"64MiB\"\n\
+             [shares]\ndefault_expiry = \"1h\"\nmax_expiry = \"7d\"\n",
+        )
+        .unwrap();
+        let checks = config_checks(dir.path(), None);
+        assert_eq!(level(&checks), Some(Level::Ok), "{checks:?}");
+        for bad in [
+            "[recordings]\npart_cap = \"lots\"\n",
+            "[recordings]\npart_cap = \"64MiB\"\ndir_cap = \"1MiB\"\n",
+            "[shares]\ndefault_expiry = \"30d\"\nmax_expiry = \"1d\"\n",
+        ] {
+            std::fs::write(dir.path().join("hub.toml"), bad).unwrap();
+            let checks = config_checks(dir.path(), None);
+            assert_eq!(level(&checks), Some(Level::Fail), "{bad}: {checks:?}");
+            let check = checks.iter().find(|c| c.id == "hub.toml").unwrap();
+            assert!(
+                check
+                    .details
+                    .iter()
+                    .any(|d| d.contains("recordings.") || d.contains("shares.")),
+                "{bad}: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recordings_usage_is_measured_against_dir_cap() {
+        use crate::record::{MIN_PART_BYTES, RecordLimits};
+        let dir = tempfile::tempdir().unwrap();
+        let limits = RecordLimits {
+            max_file_bytes: MIN_PART_BYTES,
+            max_total_bytes: 10 * 1024,
+        };
+        let check = recordings_check(dir.path(), limits);
+        assert_eq!(check.level, Level::Ok, "{check:?}");
+        assert!(
+            check.summary.contains("0 B of dir_cap"),
+            "{}",
+            check.summary
+        );
+        let recs = dir.path().join(crate::record::RECORDINGS_DIR);
+        std::fs::create_dir_all(&recs).unwrap();
+        std::fs::write(recs.join("a-1.cast"), vec![b'x'; 4 * 1024]).unwrap();
+        // Not a recording: not counted.
+        std::fs::write(recs.join("active.json"), vec![b'x'; 64 * 1024]).unwrap();
+        let check = recordings_check(dir.path(), limits);
+        assert_eq!(check.level, Level::Ok, "{check:?}");
+        assert!(check.summary.contains("in 1 file"), "{}", check.summary);
+        std::fs::write(recs.join("b-2.cast"), vec![b'x'; 5 * 1024 + 512]).unwrap();
+        let check = recordings_check(dir.path(), limits);
+        assert_eq!(check.level, Level::Info, "{check:?}");
+        assert!(check.fix.as_deref().unwrap().contains("near the cap"));
+        std::fs::write(recs.join("c-3.part2.cast"), vec![b'x'; 1024]).unwrap();
+        let check = recordings_check(dir.path(), limits);
+        assert_eq!(check.level, Level::Warn, "{check:?}");
+        assert!(check.fix.as_deref().unwrap().contains("dir_cap"));
     }
 
     #[test]

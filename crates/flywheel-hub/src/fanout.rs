@@ -979,6 +979,23 @@ pub fn tampered(protect: &[String], changed: &[String]) -> Vec<String> {
     hit
 }
 
+/// `name`, or `name-2`, `name-3`, ... when `taken` has it already.
+pub(crate) fn unique_name(name: &str, taken: &[&str]) -> String {
+    if !taken.contains(&name) {
+        return name.to_owned();
+    }
+    (2..)
+        .map(|n| {
+            let suffix = format!("-{n}");
+            // Within the name limit, the number kept.
+            let keep = crate::state::MAX_NAME_CHARS.saturating_sub(suffix.len());
+            let stem: String = name.chars().take(keep).collect();
+            format!("{stem}{suffix}")
+        })
+        .find(|candidate| !taken.contains(&candidate.as_str()))
+        .unwrap_or_else(|| name.to_owned())
+}
+
 /// A fan-out named after its prompt's first words.
 fn default_name(prompt: &str) -> String {
     let mut name = String::new();

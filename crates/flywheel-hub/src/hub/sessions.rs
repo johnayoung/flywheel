@@ -578,9 +578,12 @@ impl Hub {
         // send <name>`).
         let store = self.store();
         let sessions = store.sessions();
+        // Numbered per program: the first Claude session is `claude 1`
+        // even after two shells.
+        let prefix = format!("{program} ");
         let count = sessions
             .iter()
-            .filter(|s| s.workspace_id == workspace_id)
+            .filter(|s| s.workspace_id == workspace_id && s.name.starts_with(&prefix))
             .count();
         (count + 1..)
             .map(|n| format!("{program} {n}"))

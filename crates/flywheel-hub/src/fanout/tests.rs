@@ -652,3 +652,10 @@ fn the_finished_event_carries_the_ranked_board_and_only_a_short_tail() {
     assert!(tail.ends_with("line 400"), "{tail}");
     assert!(!tail.contains("line 1\n"), "{tail}");
 }
+
+#[test]
+fn a_taken_fan_out_name_gets_a_number() {
+    assert_eq!(super::unique_name("t1", &[]), "t1");
+    assert_eq!(super::unique_name("t1", &["t1"]), "t1-2");
+    assert_eq!(super::unique_name("t1", &["t1", "t1-2", "x"]), "t1-3");
+}

@@ -860,9 +860,16 @@ impl Fanouts {
                 cleaned: None,
             });
         }
+        // Names resolve fan-outs (`fw hub fanout show NAME`): a second
+        // fan-out of the same task or prompt gets `<name>-2`, and so on.
+        let name = {
+            let store = hub.store();
+            let taken: Vec<&str> = store.fanouts().iter().map(|f| f.name.as_str()).collect();
+            super::unique_name(&valid.name, &taken)
+        };
         let fanout = Fanout {
             id: id.clone(),
-            name: valid.name,
+            name,
             workspace_id: workspace.id.clone(),
             repo: folder,
             base,

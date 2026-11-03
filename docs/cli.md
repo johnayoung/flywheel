@@ -13,7 +13,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Daemons | `fw worker` / `autopilot` / `triage` | Drain the queue (worker), keep it full (autopilot), or triage the intake board (triage) |
 | Audit | `fw audit RUN_ID` | Stream the totally-ordered telemetry for one run |
 | Setup | `fw init` | Scaffold `.flywheel/` and a `flywheel.toml` work policy |
-| Hub | `fw hub start` / `stop` / `upgrade` / `status` / `logs` / `serve` / `install-service` / `ls` / `new` / `send` / `read` / `wait` / `attach` / `kill` / `relaunch` / `import` / `open` / `commands` / `template` / `explain` / `search` / `review` / `merge` / `machine` / `peer` / `url` / `token` (and `report`, for agent status hooks only; `fw hub --help` is the full list) | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
+| Hub | `fw hub start` / `stop` / `upgrade` / `status` / `logs` / `serve` / `install-service` / `ls` / `new` / `send` / `read` / `wait` / `attach` / `kill` / `relaunch` / `import` / `open` / `commands` / `template` / `explain` / `search` / `review` / `merge` / `machine` / `peer` / `share` / `record` / `url` / `token` (and `report`, for agent status hooks only; `fw hub --help` is the full list) | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
 | One-shot | `fw exec [PROMPT]` | Run one agent call from any project: no tasks, store, worktree, or config |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.

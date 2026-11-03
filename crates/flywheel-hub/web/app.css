@@ -808,7 +808,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   border: 1px dashed var(--rule-2);
   border-radius: 2px;
   background: transparent;
-  color: var(--ink-3);
+  color: var(--ink-2);
   font: 500 9.5px/1.3 var(--mono);
   letter-spacing: .06em;
   cursor: pointer;
@@ -2847,7 +2847,7 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   .commands .cmd-head > .icon, .cmd-list .slab, .compose-actions .slab, .fw-start, .why-btn {
     min-height: 44px;
   }
-  .why-btn { min-width: 44px; border-style: solid; border-color: var(--rule); }
+  .why-btn { min-width: 44px; border-style: solid; border-color: var(--rule-2); color: var(--ink); font-size: 11px; }
   .cmd-pill, .menu-toggle, .commands .cmd-head > .icon, .qa-esc { min-width: 44px; }
   .pane-chip, .qa-esc { display: inline-flex; align-items: center; justify-content: center; }
   .cmd-pill { justify-content: center; }

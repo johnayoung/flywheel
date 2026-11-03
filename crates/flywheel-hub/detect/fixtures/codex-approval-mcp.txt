@@ -1,0 +1,15 @@
+• Creating the issue.
+
+
+  github needs your approval.
+
+  Server: github
+
+  Allow the github MCP server to run tool "create_issue"?
+
+
+› 1. Yes, provide the requested info (y)
+  2. No, but continue without it (n)
+  3. Cancel this request (esc)
+
+  Press enter to confirm or esc to cancel

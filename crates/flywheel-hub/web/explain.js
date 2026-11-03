@@ -17,7 +17,9 @@ window.FwHubExplain = function (ctx) {
     session: null, // the attached session's id
     stamp: "", // status + since the open popover was drawn for
     seq: 0, // drops answers to superseded requests
+    timer: 0, // re-reads an open popover (the screen and overrides change without a status change)
   };
+  const REFRESH_MS = 2000;
 
   const sourceText = (source, label) => {
     if (!source) return "nothing yet";
@@ -73,12 +75,20 @@ window.FwHubExplain = function (ctx) {
     ].filter(Boolean));
   }
 
+  // Below the button. On a wide window it keeps to the right edge, off
+  // the terminal's left side, where the prompt it explains is drawn.
   function place() {
     const box = button.getBoundingClientRect();
     const width = Math.min(440, window.innerWidth - 16);
     pop.style.width = `${width}px`;
-    pop.style.left = `${Math.max(8, Math.min(box.left, window.innerWidth - width - 8))}px`;
+    const left = window.innerWidth >= 900 ? window.innerWidth - width - 8 : Math.min(box.left, window.innerWidth - width - 8);
+    pop.style.left = `${Math.max(8, left)}px`;
     pop.style.top = `${box.bottom + 6}px`;
+  }
+
+  function schedule() {
+    clearTimeout(view.timer);
+    if (!pop.hidden) view.timer = setTimeout(load, REFRESH_MS);
   }
 
   async function load() {
@@ -87,12 +97,16 @@ window.FwHubExplain = function (ctx) {
     try {
       const data = await api("GET", `/api/sessions/${encodeURIComponent(id)}/explain`);
       if (seq !== view.seq || pop.hidden) return;
+      // Keep the rule list's open/closed state across a refresh.
+      const rulesOpen = !!pop.querySelector(".why-rules[open]");
       draw(data);
+      if (rulesOpen) pop.querySelector(".why-rules")?.setAttribute("open", "");
       place();
     } catch (e) {
       if (seq !== view.seq || pop.hidden) return;
       pop.replaceChildren(el("p", { className: "why-note" }, `Could not explain: ${e.message}`));
     }
+    schedule();
   }
 
   function open() {
@@ -108,6 +122,7 @@ window.FwHubExplain = function (ctx) {
     if (pop.hidden) return;
     pop.hidden = true;
     view.seq++;
+    clearTimeout(view.timer);
     button.setAttribute("aria-expanded", "false");
   }
 

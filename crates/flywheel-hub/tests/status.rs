@@ -816,6 +816,13 @@ async fn codex_status_from_its_screen_and_turn_complete_notify() {
     );
     let why = hub.get(&format!("/api/sessions/{sid}/explain")).await;
     assert_eq!(why["source_label"], "heuristic");
+    // And it stays unknown while the frozen line holds: no flipping back
+    // to working (each flip would push a status event and a git run).
+    let since = hub.get(&format!("/api/sessions/{sid}")).await["agent"]["since"].clone();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let agent = hub.get(&format!("/api/sessions/{sid}")).await["agent"].clone();
+    assert_eq!(agent["status"], "unknown", "{agent}");
+    assert_eq!(agent["since"], since, "{agent}");
     drop(term);
     hub.shutdown().await;
 }
@@ -856,7 +863,7 @@ async fn codex_approval_prompts_block_until_answered() {
     let blocked = status_becomes(&mut events, &sid, "blocked").await;
     assert_eq!(
         blocked["status"]["detail"],
-        "Would you like to run the following command?"
+        "Would you like to run the following command? $ cargo test"
     );
     assert_eq!(blocked["workspace_status"], "blocked");
     let why = hub.get(&format!("/api/sessions/{sid}/explain")).await;

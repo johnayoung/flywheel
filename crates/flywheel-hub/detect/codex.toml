@@ -29,25 +29,34 @@ line = ['(?i)^\s*(?:enter continue\b|press enter to continue\b)']
 lines = 30
 any = ["trust this folder?", "do you trust the contents of this directory?"]
 
-# Exec, patch, permission, network, and terminal-input approvals:
-# "Would you like to run the following command?" ... "› 1. Yes, proceed (y)"
-# ... "Press enter to confirm or esc to cancel".
+# Exec, patch, permission, network, terminal-input, and MCP approvals
+# (approval_overlay.rs): a title ("Would you like to run the following
+# command?", "<server> needs your approval.") ... "› 1. Yes, proceed (y)"
+# ... "Press enter to confirm or esc to cancel" (a subagent's adds
+# " or o to open thread"). A patch or a long command sits between title
+# and options, so the title may be far up the screen. The detail is the
+# title plus the command ("$ cargo test") or the patched file.
+# Snapshot: approval_overlay_cross_thread_prompt.snap.
 [[rule]]
 id = "approval"
 state = "blocked"
 detail = "asks for approval"
-detail_line = '(?i)^\s*((?:would you like to|do you want to) .{1,120}\?)\s*$'
+detail_line = [
+  '(?i)^\s*((?:would you like to|do you want to) .+\?|\S.* needs your approval\.)\s*$',
+  '^\s*(\$ .+|Destination: .+|\S+ \(\+\d+ -\d+\))\s*$',
+]
 [[rule.when]]
 lines = 1
-line = ['(?i)^\s*press enter to confirm or esc to cancel\s*$']
+line = ['(?i)^\s*press \S.{0,24} to confirm or \S.{0,24} to cancel(?: or \S.{0,24} to open thread)?\s*$']
 [[rule.when]]
-lines = 24
+lines = 100
 any = [
   "would you like to run the following command?",
   "would you like to make the following edits?",
   "would you like to grant these permissions?",
   "would you like to send input to",
   "do you want to approve network access",
+  "needs your approval.",
 ]
 
 # Older releases: "Allow command?" with "Yes (y)" / "No (n)" choices.
@@ -71,6 +80,22 @@ any = ["enter to submit answer", "enter to submit all"]
 [[rule.when]]
 lines = 24
 line = ['(?i)^\s*question \d+/\d+']
+
+# MCP server elicitation form (mcp_server_elicitation.rs): "Field 1/1"
+# above the request ("Allow this request?") and its options, footer
+# "enter to submit | esc to cancel" ("enter to submit all | ... | esc to
+# cancel" with several fields).
+[[rule]]
+id = "mcp_form"
+state = "blocked"
+detail = "an MCP server asks for input"
+detail_line = ['(?i)^\s*field \d+/\d+', '^\s*(\S.*)$']
+[[rule.when]]
+lines = 1
+line = ['(?i)\bto submit\b.*\besc to cancel\s*$']
+[[rule.when]]
+lines = 30
+line = ['(?i)^\s*field \d+/\d+(?:\s|$)']
 
 # A running turn's status line: "• Working (12s • esc to interrupt)".
 [[rule]]

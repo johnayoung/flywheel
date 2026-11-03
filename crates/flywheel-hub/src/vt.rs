@@ -765,12 +765,40 @@ impl Emulator {
 
     /// Resize (reflowing the primary screen) and re-derive the history
     /// bound for the new width.
+    ///
+    /// Growing taller follows xterm.js (the browser's terminal), so the
+    /// rows here stay the rows a viewer sees: scrollback is pulled back
+    /// into view only while the cursor is on the bottom row; otherwise the
+    /// new rows are blank, below. (`Term` always pulls scrollback, which
+    /// put old lines -- an answered approval, a stale busy line -- on this
+    /// screen but not on the viewer's, shifting every row number.)
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.flush();
         let size = Size {
             cols: usize::from(cols.max(1)),
             rows: usize::from(rows.max(1)),
         };
+        let (old_cols, old_rows) = self.size();
+        if size.rows > old_rows && !self.alt_screen() {
+            let grid = self.term.grid();
+            let at_bottom = grid.cursor.point.line.0 + 1 >= old_rows as i32;
+            let pulled = grid.history_size().min(size.rows - old_rows);
+            // Rows first, as `Term` itself does (then columns, below).
+            self.term.resize(Size {
+                cols: old_cols,
+                rows: size.rows,
+            });
+            if !at_bottom && pulled > 0 {
+                let grid = self.term.grid_mut();
+                // Blank rows, like `Term`'s own resize (not the pen's colors).
+                let template = std::mem::take(&mut grid.cursor.template);
+                grid.scroll_up(&(Line(0)..Line(size.rows as i32)), pulled);
+                grid.cursor.template = template;
+                let back = pulled as i32;
+                grid.cursor.point.line = Line((grid.cursor.point.line.0 - back).max(0));
+                grid.saved_cursor.point.line = Line((grid.saved_cursor.point.line.0 - back).max(0));
+            }
+        }
         self.term.resize(size);
         self.tracked.resize(size.rows);
         let limit = history_limit(self.scrollback_lines, size.cols);
@@ -1603,6 +1631,54 @@ mod tests {
         assert_eq!(wide.history_lines(), HISTORY_CELL_BUDGET / 1000);
         wide.resize(2000, ROWS);
         assert!(wide.history_lines() <= HISTORY_CELL_BUDGET / 2000);
+    }
+
+    #[test]
+    fn growing_taller_pulls_scrollback_only_with_the_cursor_on_the_bottom_row() {
+        let visible = |e: &mut Emulator| e.text(TextSource::Visible).lines;
+        let mut lines = String::new();
+        for i in 0..30 {
+            lines.push_str(&format!("line {i}\r\n"));
+        }
+        // An inline TUI: its cursor sits above a footer row, not at the
+        // bottom. xterm.js adds blank rows below; the screen must match.
+        let mut e = emulator();
+        e.process(lines.as_bytes());
+        e.process(b"\x1b[3;1H");
+        let before = visible(&mut e);
+        let history = e.history_lines();
+        e.resize(COLS, ROWS + 5);
+        let after = visible(&mut e);
+        assert_eq!(after[..usize::from(ROWS)], before[..], "{after:#?}");
+        assert!(
+            after[usize::from(ROWS)..]
+                .iter()
+                .all(|r| r.trim().is_empty())
+        );
+        assert_eq!(e.history_lines(), history);
+        e.process(b"X");
+        assert!(
+            visible(&mut e)[2].starts_with('X'),
+            "{:#?}",
+            visible(&mut e)
+        );
+        // Cursor on the bottom row (a shell prompt): scrollback comes
+        // back above, as in xterm.js.
+        let mut e = emulator();
+        e.process(lines.as_bytes());
+        let before = visible(&mut e);
+        e.resize(COLS, ROWS + 5);
+        let after = visible(&mut e);
+        assert_eq!(after[5..], before[..], "{after:#?}");
+        assert_eq!(after[0], "line 16");
+        assert_eq!(e.history_lines(), history - 5);
+        // Taller and wider at once keeps the same rows.
+        let mut e = emulator();
+        e.process(lines.as_bytes());
+        e.process(b"\x1b[3;1H");
+        let before = visible(&mut e);
+        e.resize(COLS + 10, ROWS + 5);
+        assert_eq!(visible(&mut e)[..usize::from(ROWS)], before[..]);
     }
 
     #[test]

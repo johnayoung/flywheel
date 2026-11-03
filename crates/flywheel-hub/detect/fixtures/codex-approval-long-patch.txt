@@ -1,0 +1,43 @@
+• Patching the generated table.
+
+
+  Would you like to make the following edits?
+
+  src/lib.rs (+30 -0)
+    1 +    let x1 = 1;
+    2 +    let x2 = 2;
+    3 +    let x3 = 3;
+    4 +    let x4 = 4;
+    5 +    let x5 = 5;
+    6 +    let x6 = 6;
+    7 +    let x7 = 7;
+    8 +    let x8 = 8;
+    9 +    let x9 = 9;
+    10 +    let x10 = 10;
+    11 +    let x11 = 11;
+    12 +    let x12 = 12;
+    13 +    let x13 = 13;
+    14 +    let x14 = 14;
+    15 +    let x15 = 15;
+    16 +    let x16 = 16;
+    17 +    let x17 = 17;
+    18 +    let x18 = 18;
+    19 +    let x19 = 19;
+    20 +    let x20 = 20;
+    21 +    let x21 = 21;
+    22 +    let x22 = 22;
+    23 +    let x23 = 23;
+    24 +    let x24 = 24;
+    25 +    let x25 = 25;
+    26 +    let x26 = 26;
+    27 +    let x27 = 27;
+    28 +    let x28 = 28;
+    29 +    let x29 = 29;
+    30 +    let x30 = 30;
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for these files (a)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

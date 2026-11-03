@@ -227,7 +227,7 @@ Each workspace has a **layout**: named tabs, each a tree of splits (side by side
 | `blocked` | waits on a person | `PermissionRequest` (detail: the question, for `AskUserQuestion`); `Notification` `permission_prompt` / `elicitation_dialog` / `elicitation_url_dialog` / `agent_needs_input`; `idle_prompt` while working; screen: the folder-trust dialog before any hook, a known dialog 3 s with no hook | screen: exec / edit / permission / network approvals, `request_user_input` questions, folder trust, legacy `Allow command?` (detail: the dialog's question) |
 | `done` | finished a turn **this client** has not viewed | `Stop`, `StopFailure` | `notify` `agent-turn-complete` |
 | `idle` | finished and seen, or waiting for a first prompt | `SessionStart`; `done` once viewed; an interrupted turn (below) | `done` once viewed; screen: the composer (`›`) |
-| `unknown` | no signal yet, agent ended | `SessionEnd`, exit | exit; a screen-driven turn whose status line froze 5 s, or whose screen matches no rule for 3 s |
+| `unknown` | no signal yet, agent ended | `SessionEnd`, exit | exit; a screen-driven turn whose status line froze 5 s (it stays unknown until the agent outputs again), or whose screen matches no rule for 3 s |
 
 - **Interrupts** (Esc) fire no Claude hook. Once a reported `working`/`blocked` spell has shown a running turn or a dialog on screen, and then shows the prompt (or nothing the rules know) for 3 s with no hook, the turn reads as interrupted (`idle`). A reported `blocked` whose dialog closes onto a running turn was approved: `working` again (its `PostToolUse` only comes when the tool finishes). A spell that never showed a turn (a narrow terminal cuts the footer) is left alone; the transcript viewer (`ctrl+o`) holds the status.
 - **Precedence**: hook / `notify` reports win; a report landing while the screen is being read wins over that read. The screen fills only what reports miss (rows above). Shells have no status.
@@ -250,19 +250,20 @@ version = 2               # yours; shown by explain
 id = "approval"           # [a-z0-9_-]
 state = "blocked"         # working | blocked | idle | hold (keep the status, e.g. a transcript viewer)
 detail = "asks for approval"                        # blocked only
-detail_line = '(?i)^\s*(would you like to .+\?)$'   # blocked only: capture 1 of the first matching line wins over detail
+detail_line = ['(?i)^\s*(would you like to .+\?)$', '^\s*(\$ .+)$']   # blocked only, wins over detail: read in turn down the screen, each below the last; capture 1 of each is joined (a pattern with no group only marks a row)
 [[rule.when]]             # all clauses must hold (or put the keys on the rule itself: one clause)
 lines = 1                 # the last N non-empty rows (1-100, default 30)
 line = ['(?i)^\s*press enter to confirm or esc to cancel\s*$']   # each regex matches some row
 [[rule.when]]
-lines = 24
+lines = 100
 any = ["would you like to run the following command?"]   # also: all, none (substrings, case-insensitive, one row), not_line (regex)
 ```
 
+- **Rows**: the server's screen grows taller the way xterm.js does (scrollback comes back only with the cursor on the bottom row), so evidence row numbers are the rows a viewer sees.
 - **Strict blocked**: bundled `blocked` rules pin a dialog's footer to the last row plus its question/options; quoted dialog text in an answer or prompt does not match. Write overrides the same way.
 - **Cost**: read only after output (at most every 250 ms, once more when it stops) and while a settle is pending, by one thread per agent session; patterns compiled once per load (`regex`: linear time, 256 KiB program cap); a rule reads at most 100 rows of 512 chars; at most 64 rules, 8 clauses each, 16 patterns per list, 400 chars each, 64 KiB per file.
 - **Claude** rules are from Claude Code 2.1.306 screens (fixtures in `detect/fixtures/`); **Codex** rules from the codex TUI's own strings and snapshot tests (`codex-rs/tui`). **Shell** rules (password / `[y/N]` / prompt on the last row) only answer `explain`.
-- **Explain**: `fw hub explain S` (`GET /api/sessions/{id}/explain`, the UI's `why?` beside the status pill) gives the status, what set it (`source`: `hook` + agent event, `manifest` + file + rule, `heuristic` + reason, `hub` (process exit)), a fresh read of the screen (rule, detail, evidence rows), every rule with why it did not match, the manifest's origin and version, and override problems.
+- **Explain**: `fw hub explain S` (`GET /api/sessions/{id}/explain`, the UI's `why?` beside the status pill) gives the status, what set it (`source`: `hook` + agent event, `manifest` + file (`codex.toml` bundled, `agent-detection/codex.toml` override) + rule, `heuristic` + reason, `hub` (process exit)), a fresh read of the screen (rule, detail, evidence rows), every rule with why it did not match, the manifest's origin and version, and override problems.
 
 ## Suggested commands
 

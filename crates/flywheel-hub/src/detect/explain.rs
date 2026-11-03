@@ -313,7 +313,7 @@ pub fn render(value: &Value, out: &mut dyn Write) {
                 if matched {
                     "matched".to_owned()
                 } else {
-                    cut(reason, 100)
+                    reason.to_owned()
                 }
             );
         }

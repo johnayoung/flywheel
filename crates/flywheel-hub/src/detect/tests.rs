@@ -167,9 +167,45 @@ fn codex_rules_read_codex_tui_screens() {
     assert_reads(codex, "codex-working", Some(Working), Some("turn_status"));
     assert_reads(codex, "codex-idle", Some(Idle), Some("composer"));
     assert_reads(codex, "codex-interrupted", Some(Idle), Some("composer"));
+    // A subagent's approval (footer adds "or o to open thread"), an MCP
+    // server's (approval overlay and elicitation form), and approvals
+    // whose diff or command pushes the title far above the footer.
+    for name in [
+        "codex-approval-cross-thread",
+        "codex-approval-mcp",
+        "codex-approval-long-patch",
+        "codex-approval-long-command",
+    ] {
+        assert_reads(codex, name, Some(Blocked), Some("approval"));
+    }
+    assert_reads(codex, "codex-mcp-form", Some(Blocked), Some("mcp_form"));
+    // The detail names what is approved, not just the question.
+    let detail = |name| read(codex, name).detail;
     assert_eq!(
-        read(codex, "codex-approval-exec").detail.as_deref(),
-        Some("Would you like to run the following command?")
+        detail("codex-approval-exec").as_deref(),
+        Some("Would you like to run the following command? $ cargo test -p parser")
+    );
+    assert_eq!(
+        detail("codex-approval-cross-thread").as_deref(),
+        Some("Would you like to run the following command? $ echo hi")
+    );
+    assert_eq!(
+        detail("codex-approval-patch").as_deref(),
+        Some(
+            "Would you like to make the following edits? Destination: /home/me/code/app/src/parser.rs"
+        )
+    );
+    assert_eq!(
+        detail("codex-approval-long-patch").as_deref(),
+        Some("Would you like to make the following edits? src/lib.rs (+30 -0)")
+    );
+    assert_eq!(
+        detail("codex-approval-mcp").as_deref(),
+        Some("github needs your approval.")
+    );
+    assert_eq!(
+        detail("codex-mcp-form").as_deref(),
+        Some("Allow this request?")
     );
     assert_eq!(
         read(codex, "codex-approval-network").detail.as_deref(),
@@ -547,6 +583,13 @@ fn fw_hub_explain_reads_a_saved_screen_against_local_overrides() {
         out.contains("Press enter to confirm or esc to cancel"),
         "{out}"
     );
+    // Each rule's reason is printed whole (its regex is what to fix).
+    assert!(
+        out.contains(
+            "- folder_trust     blocked  condition 1: no line matches '(?i)^\\s*(?:enter continue\\b|press enter to continue\\b)' in the last 1 lines"
+        ),
+        "{out}"
+    );
     // An override for codex is used (and a broken one for claude is
     // reported, not used).
     write(
@@ -565,6 +608,16 @@ fn fw_hub_explain_reads_a_saved_screen_against_local_overrides() {
     assert_eq!(json["screen"]["rule"], "edits");
     assert_eq!(json["manifest"]["origin"], "override");
     assert_eq!(json["manifest"]["version"], 3);
+    // A status it sets names the override, not the bundled file.
+    let detection = Detection::with_overrides_quiet(state.path());
+    assert_eq!(
+        detection.manifest(SessionKind::Codex).source_file(),
+        "agent-detection/codex.toml"
+    );
+    assert_eq!(
+        Manifest::bundled(SessionKind::Codex).source_file(),
+        "codex.toml"
+    );
     assert!(
         json["problems"][0]["path"]
             .as_str()

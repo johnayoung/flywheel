@@ -171,7 +171,7 @@ struct RawRule {
     id: String,
     state: String,
     detail: Option<String>,
-    detail_line: Option<String>,
+    detail_line: Option<OneOrMany>,
     lines: Option<usize>,
     #[serde(default)]
     all: Vec<String>,
@@ -185,6 +185,23 @@ struct RawRule {
     not_line: Vec<String>,
     #[serde(default)]
     when: Vec<RawClause>,
+}
+
+/// `detail_line = "re"` or `detail_line = ["re", "re"]`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(s) => vec![s],
+            Self::Many(v) => v,
+        }
+    }
 }
 
 // --- compiled ----------------------------------------------------------------
@@ -211,7 +228,9 @@ struct Rule {
     id: String,
     state: ScreenState,
     detail: Option<String>,
-    detail_line: Option<Pattern>,
+    /// Read in turn down the screen, each below the last one's line; the
+    /// pieces found are joined into the detail.
+    detail_line: Vec<Pattern>,
     clauses: Vec<Clause>,
 }
 
@@ -383,11 +402,10 @@ impl Manifest {
             if clauses.is_empty() {
                 return Err(ManifestError(format!("{what}: no conditions")));
             }
-            let detail_line = r
-                .detail_line
-                .as_deref()
-                .map(|s| compile(s, &format!("{what}: detail_line")))
-                .transpose()?;
+            let detail_line = regexes(
+                r.detail_line.map(OneOrMany::into_vec).unwrap_or_default(),
+                &format!("{what}: detail_line"),
+            )?;
             rules.push(Rule {
                 id: r.id,
                 state,
@@ -423,6 +441,15 @@ impl Manifest {
 
     pub fn file(&self) -> &'static str {
         file_name(self.kind)
+    }
+
+    /// The file as a status source names it: `codex.toml` (bundled) or
+    /// `agent-detection/codex.toml` (the state dir's override).
+    pub fn source_file(&self) -> String {
+        match self.origin {
+            Origin::Bundled => self.file().to_owned(),
+            Origin::Override { .. } => format!("{OVERRIDE_DIR}/{}", self.file()),
+        }
     }
 
     /// The rule ids, in evaluation order.
@@ -619,13 +646,39 @@ impl Rule {
     }
 
     fn verdict(&self, screen: &Screen, evidence: Vec<Evidence>) -> Verdict {
-        let from_line = self.detail_line.as_ref().and_then(|pattern| {
-            let region = screen.region(MAX_REGION_LINES);
-            region.iter().find_map(|l| {
+        let region = screen.region(MAX_REGION_LINES);
+        let mut from = 0;
+        let mut pieces: Vec<&str> = Vec::new();
+        for (n, pattern) in self.detail_line.iter().enumerate() {
+            // A pattern with a group adds its capture 1; one without only
+            // marks where the next one starts reading.
+            let anchor = pattern.regex.captures_len() == 1;
+            let hit = region[from..].iter().enumerate().find_map(|(i, l)| {
                 let captures = pattern.regex.captures(&l.1)?;
-                let text = captures.get(1).or_else(|| captures.get(0))?.as_str().trim();
-                (!text.is_empty()).then(|| text.chars().take(MAX_DETAIL_CHARS).collect())
-            })
+                if anchor {
+                    return Some((i, None));
+                }
+                let text = captures.get(1)?.as_str().trim();
+                (!text.is_empty()).then_some((i, Some(text)))
+            });
+            match hit {
+                Some((i, text)) => {
+                    from += i + 1;
+                    pieces.extend(text);
+                }
+                // The first names the detail; later ones only add to it.
+                None if n == 0 => break,
+                None => {}
+            }
+        }
+        let from_line = (!pieces.is_empty()).then(|| {
+            let joined = pieces.join(" ");
+            let mut detail: String = joined.chars().take(MAX_DETAIL_CHARS).collect();
+            if joined.chars().count() > MAX_DETAIL_CHARS {
+                detail.pop();
+                detail.push('\u{2026}');
+            }
+            detail
         });
         Verdict {
             state: Some(self.state),

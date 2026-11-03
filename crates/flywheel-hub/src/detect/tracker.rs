@@ -72,6 +72,11 @@ pub struct ScreenTracker {
     pending: Option<(AgentStatus, Instant)>,
     /// A screen-driven `working` is being watched for a stall.
     watch_quiet: bool,
+    /// A screen-driven turn stalled (its busy line stayed drawn with no
+    /// output): the session's last output then. The screen starts a turn
+    /// again only after newer output, so a frozen busy line cannot flip
+    /// `working` / `unknown` forever.
+    stalled: Option<Option<Instant>>,
 }
 
 impl ScreenTracker {
@@ -84,6 +89,19 @@ impl ScreenTracker {
             carry_marker: false,
             pending: None,
             watch_quiet: false,
+            stalled: None,
+        }
+    }
+
+    /// Whether the screen may start a turn (`working`): not from the busy
+    /// line of a turn that stalled, until the session outputs again.
+    fn may_work(&mut self, look: &Look<'_>) -> bool {
+        match self.stalled {
+            Some(at) if look.last_output <= at => false,
+            _ => {
+                self.stalled = None;
+                true
+            }
         }
     }
 
@@ -114,13 +132,19 @@ impl ScreenTracker {
             (Unknown, _) => match state {
                 Some(S::Blocked) => now(Blocked),
                 Some(S::Idle) => now(Idle),
-                Some(S::Working) if !self.hooks_cover_turns => now(Working),
+                Some(S::Working) if !self.hooks_cover_turns && self.may_work(&look) => now(Working),
                 _ => None,
             },
             // The screen set this status: it may change it.
             (Working | Blocked, false) => match state {
                 Some(S::Blocked) if look.status == Working => now(Blocked),
-                Some(S::Working) if look.status == Blocked => now(Working),
+                Some(S::Working) if look.status == Blocked => {
+                    if self.may_work(&look) {
+                        now(Working)
+                    } else {
+                        None
+                    }
+                }
                 Some(S::Blocked) => {
                     self.pending = None;
                     None
@@ -131,6 +155,7 @@ impl ScreenTracker {
                         .last_output
                         .is_none_or(|at| look.now.saturating_duration_since(at) >= QUIET_AFTER);
                     if quiet {
+                        self.stalled = Some(look.last_output);
                         return Some(Decision {
                             status: Unknown,
                             detail: None,
@@ -160,7 +185,7 @@ impl ScreenTracker {
             },
             (Idle, false) => match state {
                 Some(S::Blocked) => now(Blocked),
-                Some(S::Working) if !self.hooks_cover_turns => now(Working),
+                Some(S::Working) if !self.hooks_cover_turns && self.may_work(&look) => now(Working),
                 _ => None,
             },
             // A report set this status: fill only what reports miss.
@@ -203,7 +228,7 @@ impl ScreenTracker {
                 _ => None,
             },
             (Done | Idle, true) | (Done, false) if !self.hooks_cover_turns => match state {
-                Some(S::Working) => now(Working),
+                Some(S::Working) if self.may_work(&look) => now(Working),
                 Some(S::Blocked) => now(Blocked),
                 _ => None,
             },
@@ -370,6 +395,24 @@ mod tests {
             run.look_quiet(QUIET_AFTER.as_millis() as u64, W, 0),
             Some(AgentStatus::Unknown)
         );
+        // It stays unknown while the busy line holds with no output (no
+        // working/unknown flapping), and runs again on fresh output.
+        for ms in (5_250..20_000).step_by(250) {
+            assert_eq!(run.look_quiet(ms, W, 0), None, "at {ms} ms");
+        }
+        assert_eq!(
+            run.look_quiet(20_000, W, 19_900),
+            Some(AgentStatus::Working)
+        );
+        // A dialog over a stalled line still blocks; approving it with no
+        // output yet does not restart the turn from the stale line.
+        let mut run = Run::new(SessionKind::Codex);
+        run.look(0, W);
+        run.look_quiet(QUIET_AFTER.as_millis() as u64, W, 0);
+        assert_eq!(run.status, AgentStatus::Unknown);
+        assert_eq!(run.look_quiet(6_000, B, 0), Some(AgentStatus::Blocked));
+        assert_eq!(run.look_quiet(6_500, W, 0), None);
+        assert_eq!(run.look_quiet(7_000, W, 6_900), Some(AgentStatus::Working));
         let mut run = Run::new(SessionKind::Codex);
         run.look(0, W);
         assert_eq!(run.look(100, None), None);

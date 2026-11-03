@@ -1413,12 +1413,13 @@ impl Hub {
                     drop(pty);
                     let manifest = hub.detection.manifest(kind);
                     let verdict = manifest.evaluate(&screen.lines);
+                    let file = manifest.source_file();
                     let decision = tracker.observe(Look {
                         status,
                         reported,
                         spell,
                         verdict: &verdict,
-                        file: manifest.file(),
+                        file: &file,
                         now,
                         last_output,
                     });

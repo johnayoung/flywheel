@@ -1,0 +1,49 @@
+• Regenerating the fixtures.
+
+
+  Would you like to run the following command?
+
+  Reason: write the fixture table
+
+  $ cat > fixtures/table.txt <<'EOT'
+  row 01  alpha beta gamma
+  row 02  alpha beta gamma
+  row 03  alpha beta gamma
+  row 04  alpha beta gamma
+  row 05  alpha beta gamma
+  row 06  alpha beta gamma
+  row 07  alpha beta gamma
+  row 08  alpha beta gamma
+  row 09  alpha beta gamma
+  row 10  alpha beta gamma
+  row 11  alpha beta gamma
+  row 12  alpha beta gamma
+  row 13  alpha beta gamma
+  row 14  alpha beta gamma
+  row 15  alpha beta gamma
+  row 16  alpha beta gamma
+  row 17  alpha beta gamma
+  row 18  alpha beta gamma
+  row 19  alpha beta gamma
+  row 20  alpha beta gamma
+  row 21  alpha beta gamma
+  row 22  alpha beta gamma
+  row 23  alpha beta gamma
+  row 24  alpha beta gamma
+  row 25  alpha beta gamma
+  row 26  alpha beta gamma
+  row 27  alpha beta gamma
+  row 28  alpha beta gamma
+  row 29  alpha beta gamma
+  row 30  alpha beta gamma
+  row 31  alpha beta gamma
+  row 32  alpha beta gamma
+  row 33  alpha beta gamma
+  row 34  alpha beta gamma
+  EOT
+
+
+› 1. Yes, proceed (y)
+  2. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel

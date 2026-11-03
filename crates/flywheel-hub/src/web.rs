@@ -382,6 +382,143 @@ mod tests {
         assert!(shell <= 64, "{shell} shell assets");
     }
 
+    /// The names a classic script declares at its top level (column 0):
+    /// what it adds to the page's one global scope.
+    fn top_level_names(js: &str) -> Vec<&str> {
+        js.lines()
+            .filter_map(|line| {
+                let line = line.strip_prefix("async ").unwrap_or(line);
+                [
+                    "function* ",
+                    "function ",
+                    "const ",
+                    "let ",
+                    "var ",
+                    "class ",
+                ]
+                .iter()
+                .find_map(|kw| line.strip_prefix(kw))
+            })
+            .map(|rest| {
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect()
+    }
+
+    /// The app's parts share the page's global scope, so a top-level name
+    /// in one is a page global: no two scripts may declare the same name
+    /// (a redeclared const/let is a SyntaxError that stops the boot), the
+    /// feature modules and vendor scripts declare none, and no app name
+    /// takes a browser global's (window.status, window.name, ...).
+    #[test]
+    fn page_scripts_keep_the_global_scope_clean() {
+        const WINDOW: &[&str] = &[
+            "alert",
+            "atob",
+            "blur",
+            "btoa",
+            "chrome",
+            "clientInformation",
+            "close",
+            "closed",
+            "confirm",
+            "console",
+            "crypto",
+            "customElements",
+            "document",
+            "escape",
+            "eval",
+            "event",
+            "external",
+            "fetch",
+            "find",
+            "focus",
+            "frameElement",
+            "frames",
+            "getComputedStyle",
+            "getSelection",
+            "globalThis",
+            "history",
+            "indexedDB",
+            "innerHeight",
+            "innerWidth",
+            "length",
+            "localStorage",
+            "location",
+            "locationbar",
+            "matchMedia",
+            "menubar",
+            "moveBy",
+            "moveTo",
+            "name",
+            "navigation",
+            "navigator",
+            "open",
+            "opener",
+            "origin",
+            "outerHeight",
+            "outerWidth",
+            "parent",
+            "performance",
+            "personalbar",
+            "postMessage",
+            "print",
+            "prompt",
+            "queueMicrotask",
+            "reportError",
+            "resizeBy",
+            "resizeTo",
+            "scheduler",
+            "screen",
+            "scroll",
+            "scrollBy",
+            "scrollTo",
+            "scrollX",
+            "scrollY",
+            "scrollbars",
+            "self",
+            "sessionStorage",
+            "speechSynthesis",
+            "status",
+            "statusbar",
+            "stop",
+            "structuredClone",
+            "toolbar",
+            "top",
+            "unescape",
+            "viewport",
+            "visualViewport",
+            "when",
+            "window",
+        ];
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for (path, bytes, kind) in ASSETS {
+            if *kind != JS {
+                continue;
+            }
+            let js = std::str::from_utf8(bytes).unwrap();
+            let names = top_level_names(js);
+            if !path.starts_with("app") {
+                assert!(names.is_empty(), "{path} declares top-level {names:?}");
+                continue;
+            }
+            for name in names {
+                assert!(
+                    !WINDOW.contains(&name),
+                    "{path} declares {name}, a browser global"
+                );
+                if let Some((other, _)) = seen.iter().find(|(_, n)| *n == name) {
+                    panic!("{name} is declared by both {other} and {path}");
+                }
+                seen.push((path, name));
+            }
+        }
+        assert!(seen.len() > 100, "found only {} app names", seen.len());
+    }
+
     #[test]
     fn stylesheet_fonts_are_embedded() {
         let (css, _) = asset("app.css").unwrap();

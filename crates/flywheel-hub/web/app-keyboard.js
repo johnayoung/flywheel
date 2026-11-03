@@ -21,7 +21,7 @@ function paletteCommands() {
       group: "Sessions",
       glyph: glyphFor(session.kind),
       label: session.name,
-      hint: `${session.machine ? `${session.machine} · ` : ""}${workspace ? workspace.name : ""} · ${status(session).label}${n < 9 ? ` · ${MOD} ${n + 1}` : ""}${session.live ? "" : " · no terminal"}`,
+      hint: `${session.machine ? `${session.machine} · ` : ""}${workspace ? workspace.name : ""} · ${statusLook(session).label}${n < 9 ? ` · ${MOD} ${n + 1}` : ""}${session.live ? "" : " · no terminal"}`,
       run: () => openSession(session.id),
     });
   }

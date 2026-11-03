@@ -11,9 +11,9 @@
 // this file, which boots. index.html loads them in that order, after the
 // feature modules (window.FwHub*) they wire. Their top-level const/let are
 // shared bindings; their top-level functions are also window properties,
-// so a new one must not take a browser global's name (`status` shadows
-// the obsolete window.status, harmlessly). A file's top-level
-// code runs as it loads and may use only what the files before it (and
+// so a new one must not take a browser global's name, and the feature
+// modules and vendor scripts declare no top-level names of their own
+// (web.rs tests both). A file's top-level code runs as it loads and may use only what the files before it (and
 // its own earlier lines) declare; function bodies run later and see all.
 "use strict";
 

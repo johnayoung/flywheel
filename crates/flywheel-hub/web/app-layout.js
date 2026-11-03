@@ -62,7 +62,7 @@ function claimsSize(pane) {
 }
 
 const panes = window.FwHubPanes({
-  el, state, sessionById, TERM_FONT, status, goneText, exitHow,
+  el, state, sessionById, TERM_FONT, status: statusLook, goneText, exitHow,
   // A machine's session attaches through this hub's proxy.
   socketPath: (id) => machines.route("GET", `/api/sessions/${id}/ws`),
   // The machine a session is on and how this hub fares with it (null:

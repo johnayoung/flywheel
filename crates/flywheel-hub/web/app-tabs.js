@@ -201,7 +201,7 @@ function renderSwitcher(bar, layout) {
         const session = sessionById(leaf.session);
         if (!session || seen.has(session.id)) continue;
         seen.add(session.id);
-        const st = status(session);
+        const st = statusLook(session);
         const on = leaf.session === state.solo.sessionId;
         // The agent whose companion shell is on screen.
         const shown = sessionById(state.solo.sessionId);

@@ -201,7 +201,7 @@ async function deleteWorkspace(workspace) {
 // --- sidebar ---------------------------------------------------------
 
 function renderSession(session, index) {
-  const st = status(session);
+  const st = statusLook(session);
   const active = state.attached === session.id;
   // In another pane on screen.
   const shown = !active && livePanes().some((p) => p.sessionId === session.id && onStage(p));
@@ -472,7 +472,7 @@ function renderFlip(session) {
   $("#flip-label").textContent = parent ? "agent" : "shell";
   // On the companion shell: the agent's status rides on the way back
   // (it can turn blocked while you are in its shell).
-  const agentState = parent ? status(parent) : null;
+  const agentState = parent ? statusLook(parent) : null;
   let dot = button.querySelector(".flip-dot");
   if (agentState && !dot) dot = button.appendChild(el("span", { className: "flip-dot", "aria-hidden": "true" }));
   if (dot && !agentState) dot.remove();

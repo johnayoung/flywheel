@@ -201,7 +201,7 @@ function agentStatus(session) {
 // The record's own state, kept across hub restarts (a session without a
 // terminal on this hub still shows how it ended); a running agent shows
 // what it is doing instead.
-function status(session) {
+function statusLook(session) {
   if (!reachable(session)) {
     const link = machines.linkOf(session.machine) || "offline";
     return {

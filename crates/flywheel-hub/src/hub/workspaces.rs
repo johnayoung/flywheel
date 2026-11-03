@@ -196,7 +196,7 @@ impl Hub {
     }
 
     /// Save a workspace's layout written against revision `rev` (see
-    /// [`HubStore::set_layout`]); every events client hears of it.
+    /// [`crate::state::HubStore::set_layout`]); every events client hears of it.
     pub fn set_layout(
         &self,
         workspace_id: &str,

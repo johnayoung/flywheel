@@ -250,7 +250,7 @@ function renderPaneHead(pane) {
     pane.head.replaceChildren();
     return;
   }
-  const st = status(session);
+  const st = statusLook(session);
   const tab = activeTab();
   const zoomed = tab && zoomedIn(tab) === pane.id;
   const size = pane.term ? `${pane.term.cols}×${pane.term.rows}` : "";

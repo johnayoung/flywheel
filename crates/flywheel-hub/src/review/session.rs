@@ -23,6 +23,10 @@ pub struct SessionReview {
     pub agent: Option<AgentRef>,
     /// Merging into the base applies (a worktree session).
     pub mergeable: bool,
+    /// The fan-out this worktree is a candidate of: it lands through the
+    /// fan-out's Pick winner, never this review's merge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fanout: Option<FanoutRef>,
     #[serde(flatten)]
     pub review: Review,
 }
@@ -31,6 +35,53 @@ pub struct SessionReview {
 pub struct AgentRef {
     pub id: String,
     pub name: String,
+}
+
+/// A fan-out candidate a review is of.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FanoutRef {
+    pub id: String,
+    pub name: String,
+    /// The candidate's label (`c1`, ...).
+    pub candidate: String,
+    /// The candidate picked (merged) already, if any.
+    pub winner: Option<String>,
+}
+
+impl FanoutRef {
+    /// Why this review's merge refuses: an unpicked fan-out lands only
+    /// through Pick winner, which merges exactly what passed its graders.
+    fn merge_refusal(&self) -> Option<String> {
+        if self.winner.is_some() {
+            return None;
+        }
+        Some(format!(
+            "this worktree is candidate {} of the fan-out \"{}\": land it with Pick winner on \
+             the fan-out board (fw hub fanout pick {} {}), which merges only the commit that \
+             passed its graders",
+            self.candidate, self.name, self.id, self.candidate
+        ))
+    }
+
+    /// What a merge after the fan-out was decided is worth knowing.
+    fn merge_warning(&self) -> Option<String> {
+        match &self.winner {
+            Some(w) if *w != self.candidate => Some(format!(
+                "the fan-out \"{}\" already landed {w}: this also merges its candidate {}, \
+                 which was not picked",
+                self.name, self.candidate
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// Who asks for a merge: the review (refused on an unpicked fan-out
+/// candidate) or the fan-out's own Pick winner, which checked it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeVia {
+    Review,
+    FanoutPick,
 }
 
 /// An action and what it needs.
@@ -200,6 +251,26 @@ impl Hub {
         }
     }
 
+    /// The fan-out candidate whose worktree `target` reads, if any (a
+    /// candidate whose worktree was cleaned up is not).
+    fn review_fanout(&self, target: &Target) -> Option<FanoutRef> {
+        let worktree = target.worktree.as_ref()?;
+        self.store().fanouts().iter().find_map(|f| {
+            let candidate = f.candidates.iter().find(|c| {
+                c.cleaned.is_none()
+                    && (c.worktree.path == worktree.path
+                        || (c.worktree.repo == worktree.repo
+                            && c.worktree.branch == worktree.branch))
+            })?;
+            Some(FanoutRef {
+                id: f.id.clone(),
+                name: f.name.clone(),
+                candidate: candidate.label.clone(),
+                winner: f.winner.as_ref().map(|w| w.label.clone()),
+            })
+        })
+    }
+
     /// A session's review (runs git now).
     pub fn review(
         &self,
@@ -214,6 +285,7 @@ impl Hub {
             session: record.name.clone(),
             agent: self.review_agent(&record, &target.dir),
             mergeable: target.worktree.is_some(),
+            fanout: self.review_fanout(&target),
             review,
         })
     }
@@ -237,6 +309,18 @@ impl Hub {
 
     /// What `action` would do (nothing runs).
     pub fn review_plan(&self, tools: &Tools, id: &str, action: &Action) -> Result<Plan, HubError> {
+        self.review_plan_via(tools, id, action, MergeVia::Review)
+    }
+
+    /// [`Hub::review_plan`], saying who asks: a fan-out candidate's merge
+    /// is refused unless it comes from the fan-out's Pick winner.
+    pub(crate) fn review_plan_via(
+        &self,
+        tools: &Tools,
+        id: &str,
+        action: &Action,
+        via: MergeVia,
+    ) -> Result<Plan, HubError> {
         let (record, target) = self.review_target(tools, id, None)?;
         let plan = match action {
             Action::Commit { message } => {
@@ -249,7 +333,17 @@ impl Hub {
             Action::Abort => super::plan_abort(tools, &target),
             Action::Merge => super::plan_merge(tools, &target),
         };
-        let plan = plan.map_err(|e| HubError::from(StateError::Conflict(e)))?;
+        let mut plan = plan.map_err(|e| HubError::from(StateError::Conflict(e)))?;
+        if matches!(action, Action::Merge)
+            && via == MergeVia::Review
+            && let Some(fanout) = self.review_fanout(&target)
+        {
+            if let Some(why) = fanout.merge_refusal() {
+                plan.refusal = Some(why);
+                plan.needs_rebase = false;
+            }
+            plan.warnings.extend(fanout.merge_warning());
+        }
         self.log_refusal(&record, action.name(), plan.refusal.as_deref());
         Ok(plan)
     }
@@ -286,7 +380,30 @@ impl Hub {
         action: &Action,
         confirm: &str,
     ) -> Result<ActionReport, HubError> {
+        self.review_run_via(tools, id, action, confirm, MergeVia::Review)
+    }
+
+    /// [`Hub::review_run`], saying who asks (see [`Hub::review_plan_via`]).
+    pub(crate) fn review_run_via(
+        &self,
+        tools: &Tools,
+        id: &str,
+        action: &Action,
+        confirm: &str,
+        via: MergeVia,
+    ) -> Result<ActionReport, HubError> {
         let (record, target) = self.review_target(tools, id, None)?;
+        if matches!(action, Action::Merge)
+            && via == MergeVia::Review
+            && let Some(why) = self.review_fanout(&target).and_then(|f| f.merge_refusal())
+        {
+            eprintln!(
+                "fw hub: review {}: merge: refused: {}",
+                record.label(),
+                one_line(&why)
+            );
+            return Err(StateError::Conflict(why).into());
+        }
         let result = match action {
             Action::Commit { message } => super::commit(tools, &target, message, confirm),
             Action::Push { remote } => super::push(tools, &target, remote.as_deref(), confirm),

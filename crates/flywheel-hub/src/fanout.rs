@@ -1093,6 +1093,10 @@ pub struct FanoutView {
     pub name: String,
     pub workspace_id: String,
     pub workspace: Option<String>,
+    /// The workspace folder the worktrees were cut from (what a launch
+    /// names `folder`).
+    pub folder: PathBuf,
+    /// Deprecated mirror of `folder`.
     pub repo: PathBuf,
     pub base: String,
     pub base_sha: String,
@@ -1178,7 +1182,7 @@ pub fn verdict_of(candidate: &Candidate, stale: Option<&str>) -> Verdict {
 
 fn money(cost: Option<f64>) -> String {
     match cost {
-        Some(cost) => format!("${cost:.2}"),
+        Some(cost) => crate::script::dollars(cost),
         None => "unpriced".to_owned(),
     }
 }
@@ -1418,6 +1422,7 @@ pub fn finished_payload(view: &FanoutView) -> serde_json::Value {
             "name": view.name,
             "workspace_id": view.workspace_id,
             "workspace": view.workspace,
+            "folder": view.folder,
             "repo": view.repo,
             "base": view.base,
             "base_sha": view.base_sha,

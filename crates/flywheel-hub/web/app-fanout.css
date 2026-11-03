@@ -159,7 +159,8 @@
 }
 .fo-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .15rem; }
 .fo-actions .slab { padding: .4rem .7rem; }
-.fo-actions .slab:disabled { opacity: .4; }
+.fo-actions .slab:disabled { opacity: 1; background: transparent; color: var(--ink-3); border: 1px dashed var(--ink-3); }
+.fo-blocked { margin: .1rem 0 0; color: var(--brass); font-size: 11.5px; line-height: 1.45; }
 .slab.busy { cursor: progress; }
 
 .fo-prompt summary { cursor: pointer; color: var(--ink-3); font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; }

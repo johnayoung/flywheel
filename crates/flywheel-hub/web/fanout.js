@@ -75,8 +75,8 @@ window.FwHubFanout = function (ctx) {
   // The board's fan-out: its full view once fetched, else its summary.
   const shownFanout = () => (ui.full && ui.full.id === ui.open ? ui.full : byId(ui.open));
   const short = (sha) => (sha || "").slice(0, 10);
-  const money = (usd) => (usd === null || usd === undefined ? null : usd < 0.01 && usd > 0 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`);
-  const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : `${n}`);
+  const { tokens, dollars } = window.FwHubFmt;
+  const money = (usd) => (usd === null || usd === undefined ? null : dollars(usd));
   const agentLabel = (c) => (c.model ? `${c.kind}:${c.model}` : c.kind);
 
   // --- dialogs (built once) -------------------------------------------
@@ -344,10 +344,11 @@ window.FwHubFanout = function (ctx) {
   // when asked; this is the button's hint).
   function unpickable(c) {
     const g = c.grade;
-    if (!g) return "Not graded";
-    if (g.diff.files === 0) return "It changes nothing against the base: there is nothing to merge";
-    if (g.dirty || g.untracked) return "Graded with uncommitted changes: commit, then re-grade";
-    return "It cannot be picked now";
+    if (!g) return "it has not been graded";
+    if (g.diff.files === 0) return "it changes nothing against the base: there is nothing to merge";
+    if (g.dirty || g.untracked) return "it was graded with uncommitted changes: commit them (Commit in Review), then Re-grade";
+    if (c.stale) return `${c.stale}: Re-grade it`;
+    return "it cannot be picked now";
   }
 
   function card(f, c) {
@@ -371,6 +372,8 @@ window.FwHubFanout = function (ctx) {
     }
 
     const actions = [];
+    // Why a passing candidate's Pick winner is off, on the card.
+    let blocked = "";
     if (c.phase !== "removed") {
       if (session && session.live) actions.push(actionButton("Open", "Show its terminal", () => { board.close(); openSession(c.session_id); }));
       if (session) actions.push(actionButton("Review", "Its commits and diffs (review drawer)", () => { board.close(); ctx.openReview(c.session_id); }));
@@ -381,6 +384,10 @@ window.FwHubFanout = function (ctx) {
         }
         if (c.verdict === "pass") {
           actions.push(actionButton("Pick winner", c.pickable ? `Merge ${c.branch} into ${f.base}` : unpickable(c), () => pick(f, c), { tone: "", pending: isBusy(f, c, "pick"), disabled: !c.pickable }));
+          if (!c.pickable) blocked = unpickable(c);
+          if (!c.pickable && g && (g.dirty || g.untracked) && session) {
+            actions.push(actionButton("Commit in Review…", "Commit its changes (Review, Commit all), then Re-grade", () => { board.close(); ctx.openReview(c.session_id); }, { tone: "" }));
+          }
         }
       }
     }
@@ -406,6 +413,7 @@ window.FwHubFanout = function (ctx) {
         el("ul", { className: "fo-why" }, (c.why || []).map((w) => el("li", { textContent: w }))),
         g && g.graders.length ? el("ul", { className: "fo-rcpts" }, g.graders.map(receipt)) : null,
         g && g.error ? el("p", { className: "fo-error", textContent: `grading failed: ${g.error}` }) : null,
+        blocked ? el("p", { className: "fo-blocked", textContent: `Not pickable yet: ${blocked}.` }) : null,
         actions.length ? el("div", { className: "fo-actions" }, actions) : null,
       ),
     );
@@ -486,7 +494,7 @@ window.FwHubFanout = function (ctx) {
     const foot = el(
       "footer",
       { className: "fo-foot" },
-      el("span", { className: "fo-note", textContent: `created ${age(f.created_at)} ago · ${f.repo}` }),
+      el("span", { className: "fo-note", textContent: `created ${age(f.created_at)} ago · ${f.folder || f.repo}` }),
       el("button", {
         type: "button",
         className: "text-btn danger",

@@ -373,6 +373,25 @@ fn fan_out_grades_ranks_fixes_survives_restart_and_merges_the_winner() {
     let refused = env.fw(&["fanout", "pick", &id, "c2", "--yes"]);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("does not pass"));
+    // Nor merged around the board: the review's merge of a candidate (any
+    // of them, passing or not) points at Pick winner and lands nothing.
+    let main_before = env.git(&env.repo, &["rev-parse", "main"]);
+    for label in ["c2", "c1"] {
+        let session = candidate(&board, label)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let side = env.fw(&["merge", &session, "--yes"]);
+        let said = String::from_utf8_lossy(&side.stderr).into_owned()
+            + &String::from_utf8_lossy(&side.stdout);
+        assert!(!side.status.success(), "{label}: {said}");
+        assert!(said.contains("Pick winner"), "{label}: {said}");
+        assert!(
+            said.contains(&format!("fw hub fanout pick {id} {label}")),
+            "{said}"
+        );
+    }
+    assert_eq!(env.git(&env.repo, &["rev-parse", "main"]), main_before);
 
     // Ask c5 to fix: the grader's output goes to its agent, it commits a
     // fix, finishes, and is graded again by the hub.

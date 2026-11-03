@@ -15,7 +15,7 @@ use super::{
 };
 use crate::agent::SessionKind;
 use crate::hub::{CreateSession, Hub, HubError, HubEvent, NewWorktree, RemoveOptions, SessionView};
-use crate::review::{Action, ActionReport, Plan, Tools};
+use crate::review::{Action, ActionReport, MergeVia, Plan, Tools};
 use crate::state::{SessionState, StateError, new_id};
 use crate::status::AgentStatus;
 use crate::transcript::PasteOutcome;
@@ -1090,6 +1090,7 @@ impl Fanouts {
                 .iter()
                 .find(|w| w.id == fanout.workspace_id)
                 .map(|w| w.name.clone()),
+            folder: fanout.repo.clone(),
             repo: fanout.repo.clone(),
             base: fanout.base.clone(),
             base_sha: fanout.base_sha.clone(),
@@ -1312,7 +1313,12 @@ impl Fanouts {
             plan.refusal = Some("its session was removed: merge it from the main checkout".into());
             return Ok(plan);
         }
-        let merge = hub.review_plan(&self.tools, &candidate.session_id, &Action::Merge)?;
+        let merge = hub.review_plan_via(
+            &self.tools,
+            &candidate.session_id,
+            &Action::Merge,
+            MergeVia::FanoutPick,
+        )?;
         plan.needs_rebase = merge.needs_rebase;
         let graded = candidate.grade.as_ref().and_then(|g| g.head.as_deref());
         plan.refusal = merge
@@ -1341,7 +1347,12 @@ impl Fanouts {
         // `confirm` must be a plan that merges exactly the graded commit: the
         // run below re-plans and refuses any other fingerprint, and equal
         // fingerprints plan the same commit.
-        let planned = hub.review_plan(&self.tools, &candidate.session_id, &Action::Merge)?;
+        let planned = hub.review_plan_via(
+            &self.tools,
+            &candidate.session_id,
+            &Action::Merge,
+            MergeVia::FanoutPick,
+        )?;
         if planned.fingerprint != confirm {
             return Err(conflict(format!(
                 "{label}'s merge plan changed since it was shown: look again (fw hub fanout pick \
@@ -1351,7 +1362,13 @@ impl Fanouts {
         if let Some(why) = Self::merges_graded(&planned, Some(&head)) {
             return Err(conflict(format!("cannot pick {label}: {why}")));
         }
-        let merge = hub.review_run(&self.tools, &candidate.session_id, &Action::Merge, confirm)?;
+        let merge = hub.review_run_via(
+            &self.tools,
+            &candidate.session_id,
+            &Action::Merge,
+            confirm,
+            MergeVia::FanoutPick,
+        )?;
         if merge.outcome.ok {
             let winner = Winner {
                 label: label.to_owned(),

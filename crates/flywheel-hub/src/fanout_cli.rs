@@ -486,7 +486,10 @@ fn render(view: &Value, verbose: bool, out: &mut dyn Write) -> std::io::Result<(
         str_field(view, "id"),
         str_field(view, "base"),
         short(str_field(view, "base_sha")),
-        str_field(view, "repo"),
+        // `repo` from a hub older than `folder`.
+        Some(str_field(view, "folder"))
+            .filter(|f| !f.is_empty())
+            .unwrap_or_else(|| str_field(view, "repo")),
     )?;
     let graders: Vec<String> = list(view, "graders")
         .iter()
@@ -541,7 +544,7 @@ fn render(view: &Value, verbose: bool, out: &mut dyn Write) -> std::io::Result<(
             })
             .unwrap_or_else(|| "-".to_owned());
         let cost = match c.get("cost_usd").and_then(Value::as_f64) {
-            Some(usd) => format!("${usd:.2}"),
+            Some(usd) => crate::script::dollars(usd),
             None if c.get("tokens").and_then(Value::as_u64).unwrap_or(0) > 0 => {
                 "unpriced".to_owned()
             }

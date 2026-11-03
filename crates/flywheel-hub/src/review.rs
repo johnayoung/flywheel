@@ -30,7 +30,8 @@ pub use model::{
     UpstreamView, diff, read,
 };
 pub use plan::{Outcome, Plan, Planned, PrDefaults, Ran, plan_commit, plan_push};
-pub use session::{Action, ActionReport, AgentRef, AskKind, AskPlan, SessionReview};
+pub(crate) use session::MergeVia;
+pub use session::{Action, ActionReport, AgentRef, AskKind, AskPlan, FanoutRef, SessionReview};
 
 use crate::git::WorktreeRef;
 use runner::{Output, RunError, Spec};

@@ -162,6 +162,7 @@ fn link_targets(hub: &Endpoint) -> Vec<LoginTarget> {
             label: "url".to_owned(),
             base: hub.base().trim_end_matches('/').to_owned(),
             remote: true,
+            ca_page: false,
         }],
     }
 }

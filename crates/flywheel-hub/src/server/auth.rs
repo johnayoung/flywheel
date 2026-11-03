@@ -41,6 +41,8 @@ pub(super) struct Client {
     /// local browser): exempt from the failure lockout, which guards
     /// against the network.
     pub(super) same_machine: bool,
+    /// Over the hub's own TLS (`--tls`).
+    pub(super) tls: bool,
 }
 
 impl Client {
@@ -77,6 +79,7 @@ impl Client {
             ip: forwarded.unwrap_or(peer),
             trusted_peer,
             same_machine: from_here && forwarded_for.is_none(),
+            tls: super::tls_listen::over_tls(extensions),
         }
     }
 }
@@ -180,11 +183,24 @@ pub(super) fn origin_ok(headers: &HeaderMap, client: Client, options: &ServerOpt
         .into_iter()
         .chain(forwarded_host)
         .collect();
-    origin_allowed(
-        header_str(headers, header::ORIGIN),
-        &hosts,
-        &options.allowed_origins,
-    )
+    // Over the hub's own TLS its pages are an https origin: an http page
+    // on the same host and port is another origin.
+    let origin = header_str(headers, header::ORIGIN);
+    if client.tls
+        && forwarded_host.is_none()
+        && origin.is_some_and(|o| {
+            let o = o.trim().trim_end_matches('/');
+            o.get(..7)
+                .is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+                && !options
+                    .allowed_origins
+                    .iter()
+                    .any(|a| a.trim_end_matches('/').eq_ignore_ascii_case(o))
+        })
+    {
+        return false;
+    }
+    origin_allowed(origin, &hosts, &options.allowed_origins)
 }
 
 pub(super) fn too_many_attempts(wait: Duration) -> Response {
@@ -432,10 +448,13 @@ pub(super) async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// Whether the browser reached the hub over HTTPS (through a TLS proxy):
-/// an `X-Forwarded-Proto: https` from a local proxy, or a `Host` that is
-/// one of the configured `https://` origins.
+/// Whether the browser reached the hub over HTTPS: the hub's own TLS, an
+/// `X-Forwarded-Proto: https` from a local proxy, or a `Host` that is one
+/// of the configured `https://` origins.
 fn browser_https(headers: &HeaderMap, client: Client, options: &ServerOptions) -> bool {
+    if client.tls {
+        return true;
+    }
     let proto = client
         .trusted_peer
         .then(|| {

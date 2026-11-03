@@ -709,6 +709,7 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
         public_urls: vec!["https://box.tail1234.ts.net".into()],
         started_at: None,
         log_file: None,
+        tls: None,
     }
     .write(&hub.state_dir)
     .unwrap();
@@ -786,6 +787,7 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
         public_urls: Vec::new(),
         started_at: None,
         log_file: None,
+        tls: None,
     }
     .write(&dead)
     .unwrap();
@@ -804,6 +806,7 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
         public_urls: Vec::new(),
         started_at: None,
         log_file: None,
+        tls: None,
     }
     .write(&dead)
     .unwrap();

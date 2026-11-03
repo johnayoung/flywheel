@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="referrer" content="no-referrer">
+<title>flywheel hub - trust this hub</title>
+<meta name="theme-color" content="#0c0d0c">
+<link rel="icon" type="image/svg+xml" href="/assets/icon.svg">
+<link rel="stylesheet" href="/ca/ca.css">
+<script src="/ca/ca.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <span class="kicker">flywheel hub &middot; https</span>
+    <h1>Trust this hub</h1>
+    <p class="lede">This hub signs its own certificates with a private CA that lives only on
+      <b>{{HOST}}</b>. Install that CA once on this device and the hub opens over https with no
+      warnings &mdash; which a phone needs for the installable app, notifications, and copy.</p>
+  </header>
+
+  <section id="status" class="status" data-state="checking" aria-live="polite">
+    <span class="dot" aria-hidden="true"></span>
+    <span id="status-text">Checking whether this device trusts the hub&hellip;</span>
+    <button id="continue" type="button" hidden>Continue</button>
+    <button id="recheck" type="button" class="ghost" hidden>I installed it &mdash; check again</button>
+  </section>
+
+  <section class="fp">
+    <h2>1 &middot; Check the fingerprint</h2>
+    <p>Before you install anything, compare this with <code>fw hub tls ca</code> on the hub's machine.
+      They must match exactly; if they do not, someone is between you and the hub &mdash; stop.</p>
+    <code id="fingerprint" class="fingerprint">{{FINGERPRINT}}</code>
+  </section>
+
+  <section>
+    <h2>2 &middot; Install it</h2>
+    <div class="downloads">
+      <a class="dl" href="/ca/hub-ca.mobileconfig" data-for="ios">iPhone / iPad profile</a>
+      <a class="dl" href="/ca/hub-ca.crt" download="flywheel-hub-ca.crt" data-for="android windows mac linux">Certificate (.crt)</a>
+      <a class="dl ghost" href="/ca/hub-ca.pem" download="flywheel-hub-ca.pem">PEM</a>
+    </div>
+
+    <details data-os="ios">
+      <summary>iPhone / iPad</summary>
+      <ol>
+        <li>Open this page in <b>Safari</b> and tap <b>iPhone / iPad profile</b>; allow the download.</li>
+        <li>Settings &rsaquo; <b>Profile Downloaded</b> &rsaquo; Install (enter your passcode).</li>
+        <li>Settings &rsaquo; General &rsaquo; About &rsaquo; <b>Certificate Trust Settings</b> &rsaquo; turn on
+          full trust for <i>{{NAME}}</i>.</li>
+        <li>Come back here and tap <b>check again</b>.</li>
+      </ol>
+    </details>
+    <details data-os="android">
+      <summary>Android</summary>
+      <ol>
+        <li>Tap <b>Certificate (.crt)</b> to download it.</li>
+        <li>Settings &rsaquo; Security &amp; privacy &rsaquo; More security settings &rsaquo; Encryption &amp;
+          credentials &rsaquo; <b>Install a certificate</b> &rsaquo; <b>CA certificate</b> &rsaquo; Install anyway,
+          then pick the downloaded file. (Menu names vary by maker: search Settings for &ldquo;CA certificate&rdquo;.)</li>
+        <li>Chrome trusts user CAs; come back here and tap <b>check again</b>.</li>
+      </ol>
+    </details>
+    <details data-os="windows">
+      <summary>Windows (and browsers for WSL)</summary>
+      <ol>
+        <li>Download <b>Certificate (.crt)</b> and open it &rsaquo; <b>Install Certificate</b> &rsaquo; Current User.</li>
+        <li>Choose <b>Place all certificates in the following store</b> &rsaquo; <b>Trusted Root Certification
+          Authorities</b> &rsaquo; Finish, and accept the warning.</li>
+        <li>Restart Edge or Chrome. Firefox: Settings &rsaquo; Privacy &amp; Security &rsaquo; Certificates &rsaquo;
+          View Certificates &rsaquo; Authorities &rsaquo; Import.</li>
+        <li>A hub inside WSL is reached from Windows browsers the same way; <code>fw hub</code> inside WSL trusts
+          its own CA already.</li>
+      </ol>
+    </details>
+    <details data-os="mac">
+      <summary>macOS</summary>
+      <ol>
+        <li>Download <b>Certificate (.crt)</b> and open it: Keychain Access adds it to <b>login</b>.</li>
+        <li>Double-click <i>{{NAME}}</i> &rsaquo; Trust &rsaquo; <b>When using this certificate: Always Trust</b>.</li>
+        <li>Or in a terminal: <code>security add-trusted-cert -r trustRoot -k ~/Library/Keychains/login.keychain-db flywheel-hub-ca.crt</code></li>
+      </ol>
+    </details>
+    <details data-os="linux">
+      <summary>Linux</summary>
+      <ol>
+        <li>Chrome / Chromium: <code>certutil -d sql:$HOME/.pki/nssdb -A -t C,, -n flywheel-hub -i flywheel-hub-ca.crt</code></li>
+        <li>System-wide (curl, Firefox with enterprise roots): <code>sudo cp flywheel-hub-ca.crt /usr/local/share/ca-certificates/ &amp;&amp; sudo update-ca-certificates</code></li>
+      </ol>
+    </details>
+  </section>
+
+  <section class="scope">
+    <h2>What you are trusting</h2>
+    <p>The CA is <b>name-constrained</b>: it can only vouch for these names and addresses, so even if its key
+      were stolen it could not impersonate your bank or any other site on this device.</p>
+    <ul class="names">{{CONSTRAINTS}}</ul>
+    <p class="small">Created {{CREATED}}; valid until {{EXPIRES}}. <code>fw hub tls rotate</code> replaces it
+      (devices then install the new one and should remove this one).</p>
+  </section>
+</main>
+</body>
+</html>

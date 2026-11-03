@@ -260,6 +260,7 @@ pub fn peer_forbidden(path: &str) -> bool {
         || under("/api/plugins")
         || under("/api/settings")
         || under("/api/config")
+        || under("/api/tls")
         || under("/api/shares")
         || under("/api/recordings")
         || is_record_control(path)
@@ -496,6 +497,8 @@ mod tests {
             "/api/plugins/p/actions/a",
             "/api/settings",
             "/api/config",
+            "/api/tls",
+            "/api/tls/reload",
             "/api/shares",
             "/api/shares/abc",
             "/api/recordings",

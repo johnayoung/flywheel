@@ -8,8 +8,8 @@ use crate::hub::{Hub, HubError, HubOptions, RestoreOutcome};
 use crate::notify::{Notifier, NotifyConfig};
 use crate::paths::default_state_dir;
 use crate::remote::{
-    LoginTarget, RuntimeInfo, Tailscale, detect_tailscale, interface_addresses, login_targets,
-    normalize_public_url, qr_lines, tailscale_program,
+    LoginTarget, RuntimeInfo, Served, Tailscale, detect_tailscale, interface_addresses,
+    login_targets_served, normalize_public_url, qr_lines, tailscale_program,
 };
 use crate::server::{ServerOptions, code_login_url, serve_gated};
 use crate::{browser, lifecycle, script};
@@ -99,6 +99,10 @@ enum HubCommand {
     Url(UrlArgs),
     /// Print the hub's access token (created on first use), or rotate it.
     Token(TokenArgs),
+    /// Built-in https (`serve --tls auto`): `tls ca` prints the local CA's
+    /// fingerprint and constraints (and writes its certificate), `tls
+    /// rotate` replaces it.
+    Tls(crate::tls_cli::TlsArgs),
     /// Report an agent session's status to its hub (run by the agent's
     /// hooks inside a hub session; reads FLYWHEEL_HUB_SESSION,
     /// FLYWHEEL_HUB_REPORT_SOCKET, FLYWHEEL_HUB_REPORT_SECRET).
@@ -269,6 +273,20 @@ pub(crate) struct HubArgs {
     /// address; repeatable.
     #[arg(long = "trusted-proxy", value_name = "IP")]
     trusted_proxies: Vec<IpAddr>,
+    /// Built-in https on the same port: `auto` (a local CA, name-constrained
+    /// to this hub's names and addresses, signs short-lived certificates;
+    /// phones install it from http://<lan-address>:<port>/ca), `off`, or
+    /// `CERT,KEY` (PEM files you supply) [default: off, or hub.toml
+    /// server.tls]. Plain http from the network is then redirected to
+    /// https, except /ca; loopback keeps http.
+    #[arg(long, value_name = "auto|off|CERT,KEY", value_parser = parse_tls_mode)]
+    tls: Option<crate::tls::TlsMode>,
+    /// An extra name for the local CA and its certificate: a DNS name, an
+    /// IP address, or an IP network the CA may sign for (e.g.
+    /// 192.168.0.0/16, so a new DHCP lease is covered); repeatable. Names
+    /// added after the CA was made need `fw hub tls rotate`.
+    #[arg(long = "tls-name", value_name = "NAME", value_parser = crate::tls::parse_name)]
+    tls_names: Vec<crate::tls::NameSpec>,
     /// Per-session scrollback kept by the server's terminal emulator, in
     /// lines (capped at 1M cells, so wide terminals keep fewer)
     /// [default: 5000, or hub.toml sessions.scrollback_lines].
@@ -322,6 +340,17 @@ pub(crate) struct HubArgs {
     pub(crate) state: StateDirArg,
 }
 
+fn parse_tls_mode(raw: &str) -> Result<crate::tls::TlsMode, String> {
+    Ok(match crate::tls::parse_mode(raw)? {
+        // Absolute: a detached hub runs from `/`.
+        crate::tls::TlsMode::Files { cert, key } => crate::tls::TlsMode::Files {
+            cert: std::path::absolute(&cert).unwrap_or(cert),
+            key: std::path::absolute(&key).unwrap_or(key),
+        },
+        mode => mode,
+    })
+}
+
 fn parse_branch_prefix(raw: &str) -> Result<String, String> {
     crate::git::validate_prefix(raw)
 }
@@ -351,6 +380,12 @@ impl HubArgs {
         }
         for proxy in &self.trusted_proxies {
             argv.extend(["--trusted-proxy".to_owned(), proxy.to_string()]);
+        }
+        if let Some(mode) = &self.tls {
+            argv.extend(["--tls".to_owned(), mode.to_string()]);
+        }
+        for name in &self.tls_names {
+            argv.extend(["--tls-name".to_owned(), name.to_string()]);
         }
         if let Some(lines) = self.scrollback_lines {
             argv.extend(["--scrollback-lines".to_owned(), lines.to_string()]);
@@ -408,6 +443,8 @@ impl HubArgs {
             public_urls: self.public_urls.clone(),
             allow_origins: self.allow_origins.clone(),
             trusted_proxies: self.trusted_proxies.clone(),
+            tls: self.tls.clone(),
+            tls_names: self.tls_names.clone(),
             scrollback_lines: self.scrollback_lines,
             no_restore: self.no_restore,
             no_agent_resume: self.no_agent_resume,
@@ -515,6 +552,7 @@ pub fn run_with(
     };
     match cli.command {
         HubCommand::Token(args) => token(&args, out, err),
+        HubCommand::Tls(args) => crate::tls_cli::main(&args, out, err),
         HubCommand::Url(args) => url_cmd(&args, out, err),
         HubCommand::Serve(args) => serve_cmd(args, out, err, extensions),
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),
@@ -734,6 +772,7 @@ fn url_cmd(args: &UrlArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 label: "url".to_owned(),
                 base: hub.base().to_owned(),
                 remote: true,
+                ca_page: false,
             };
             print_login(out, err, &[target], &code, qr);
         }
@@ -764,11 +803,12 @@ pub(crate) fn show_login(
 /// first, and the tailnet it found.
 pub(crate) fn hub_targets(info: &RuntimeInfo) -> (Vec<LoginTarget>, Option<Tailscale>) {
     let tailscale = tailscale_program().and_then(|p| detect_tailscale(&p, info.listen.port()));
-    let targets = login_targets(
+    let targets = login_targets_served(
         info.listen,
         &info.public_urls,
         tailscale.as_ref(),
         &local_interfaces(info.listen),
+        info.served(),
     );
     (targets, tailscale)
 }
@@ -856,13 +896,23 @@ fn print_login(
         );
         return;
     }
-    let url = code_login_url(&remote.base, code);
+    // The hub's own TLS with a local CA: the phone starts at the CA page
+    // (plain http: it may not trust the CA yet), which signs it in over
+    // https once it does. The code rides in the fragment, which is never
+    // sent over the network.
+    let (url, how) = match remote.ca_base() {
+        Some(ca) => (
+            format!("{ca}/ca#code={code}"),
+            "; it installs this hub's CA first if the phone does not trust it yet",
+        ),
+        None => (code_login_url(&remote.base, code), ""),
+    };
     match qr_lines(&url) {
         Ok(lines) => {
             let _ = writeln!(
                 out,
                 "
-scan to log in ({}):",
+scan to log in ({}{how}):",
                 remote.label
             );
             for line in lines {
@@ -872,6 +922,46 @@ scan to log in ({}):",
         Err(e) => {
             let _ = writeln!(err, "fw hub: {e}");
         }
+    }
+}
+
+/// What built-in TLS serves: the CA's fingerprint and where a device gets
+/// it, or the operator's files; names left out of the certificate.
+fn print_tls(
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    tls: &crate::tls::TlsServing,
+    local: SocketAddr,
+) {
+    let Some(ca) = tls.ca() else {
+        let _ = writeln!(
+            out,
+            "https: on this port with your certificate (plain http from the network redirects to https)"
+        );
+        return;
+    };
+    let _ = writeln!(
+        out,
+        "https: on this port, local CA SHA-256 {} (name-constrained to this hub)",
+        crate::machines::display_fingerprint(ca.fingerprint())
+    );
+    let urls = crate::tls::ca_page_urls(local);
+    if urls.is_empty() {
+        let _ = writeln!(
+            out,
+            "  listening on loopback only: bind a LAN address (--bind 0.0.0.0) for devices to reach /ca"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "  devices install it once from {} (`fw hub url --qr` leads a phone there)",
+            urls.join(" or ")
+        );
+    }
+    if let Some((_, outside)) = tls.names()
+        && !outside.is_empty()
+    {
+        let _ = writeln!(err, "{}", crate::tls::outside_warning(&outside));
     }
 }
 
@@ -1096,11 +1186,16 @@ fn serve_cmd(
     };
     let local = listener.local_addr().unwrap_or(bind);
     if !effective.bind.is_loopback() {
+        let advice = if effective.tls.is_on() {
+            "Traffic from the network is https (--tls); plain http from it reaches only /ca."
+        } else {
+            "Traffic is plain http: prefer the default loopback bind plus `tailscale serve`, \
+             or add --tls auto."
+        };
         let _ = writeln!(
             err,
             "fw hub: WARNING: listening on {local}, reachable beyond this machine. \
-             Anyone with the token gets a shell; prefer the default loopback bind \
-             plus `tailscale serve`."
+             Anyone with the token gets a shell. {advice}"
         );
     }
     // Taken before anything is restored: a SIGTERM from here on (`fw hub
@@ -1129,6 +1224,38 @@ fn serve_cmd(
         None => None,
     };
     let tailscale = tailscale_program().and_then(|p| detect_tailscale(&p, local.port()));
+    // Built-in TLS: the CA and a leaf for every name this hub is reached
+    // at, before anything listens for it.
+    let tls = match &effective.tls {
+        crate::tls::TlsMode::Off => None,
+        mode => {
+            let names = crate::tls::hub_names(
+                local,
+                &crate::machines::host_name(),
+                &interface_addresses(),
+                tailscale.as_ref(),
+                &effective.tls_names,
+            );
+            match crate::tls::TlsServing::start(
+                mode,
+                hub.state_dir(),
+                local,
+                &names,
+                &effective.tls_names,
+            ) {
+                Ok(tls) => tls,
+                Err(e) => {
+                    let _ = writeln!(err, "fw hub: tls: {e}");
+                    return 1;
+                }
+            }
+        }
+    };
+    let served = match (&tls, &effective.tls) {
+        (None, _) => Served::Http,
+        (Some(_), crate::tls::TlsMode::Auto) => Served::Https { ca_page: true },
+        (Some(_), _) => Served::Https { ca_page: false },
+    };
     let base = format!("http://{}", browse_host(local));
     if local.ip().is_unspecified() {
         let _ = writeln!(
@@ -1139,6 +1266,9 @@ fn serve_cmd(
         let _ = writeln!(out, "flywheel hub listening on {base}");
     }
     let _ = writeln!(out, "state dir: {}", hub.state_dir().display());
+    if let Some(tls) = &tls {
+        print_tls(out, err, tls, local);
+    }
     if let Some(said) = handed_over {
         // Sessions came along running: nothing to restore.
         let _ = writeln!(out, "{said}");
@@ -1170,11 +1300,12 @@ fn serve_cmd(
             "log in with a one-time URL from `fw hub url` (or `fw hub url --qr` for a phone)"
         );
     } else {
-        let targets = login_targets(
+        let targets = login_targets_served(
             local,
             &public_urls,
             tailscale.as_ref(),
             &local_interfaces(local),
+            served,
         );
         match hub.mint_login_code() {
             Ok(code) => print_login(out, err, &targets, &code, auto_qr(&targets)),
@@ -1215,6 +1346,11 @@ fn serve_cmd(
         public_urls: public_urls.clone(),
         started_at: Some(Utc::now()),
         log_file: args.log_file.clone(),
+        tls: match served {
+            Served::Http => None,
+            Served::Https { ca_page: true } => Some("auto".to_owned()),
+            Served::Https { ca_page: false } => Some("files".to_owned()),
+        },
     };
     if let Err(e) = runtime_info.write(hub.state_dir()) {
         let _ = writeln!(
@@ -1310,7 +1446,12 @@ fn serve_cmd(
         fanouts,
         config: Some(Arc::clone(&config)),
         plugins: Some(plugins),
+        tls: tls.clone(),
     };
+    if let Some(tls) = &tls {
+        let _enter = runtime.enter();
+        tls.watch();
+    }
     let state_dir = hub.state_dir().to_path_buf();
     let result = runtime.block_on(serve_gated(
         crate::handoff::GatedListener::new(listener, gate),
@@ -1682,6 +1823,7 @@ mod tests {
             public_urls: Vec::new(),
             started_at: None,
             log_file: None,
+            tls: None,
         }
         .write(&state)
         .unwrap();

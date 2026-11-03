@@ -76,6 +76,10 @@ pub struct ServerSection {
     pub public_urls: Option<Vec<String>>,
     pub allow_origins: Option<Vec<String>>,
     pub trusted_proxies: Option<Vec<String>>,
+    /// `auto`, `off`, or `CERT,KEY` (built-in https, `crate::tls`).
+    pub tls: Option<String>,
+    /// Extra names (DNS, IP, or IP/prefix) for the local CA and its leaf.
+    pub tls_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -248,6 +252,8 @@ pub struct Flags {
     pub public_urls: Vec<String>,
     pub allow_origins: Vec<String>,
     pub trusted_proxies: Vec<IpAddr>,
+    pub tls: Option<crate::tls::TlsMode>,
+    pub tls_names: Vec<crate::tls::NameSpec>,
     pub scrollback_lines: Option<usize>,
     pub no_restore: bool,
     pub no_agent_resume: bool,
@@ -343,6 +349,8 @@ pub struct Effective {
     pub public_urls: Vec<String>,
     pub allow_origins: Vec<String>,
     pub trusted_proxies: Vec<IpAddr>,
+    pub tls: crate::tls::TlsMode,
+    pub tls_names: Vec<crate::tls::NameSpec>,
     pub scrollback_lines: usize,
     pub restore: bool,
     pub agent_resume: bool,
@@ -374,6 +382,8 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("server.public_urls", Apply::Restart),
     ("server.allow_origins", Apply::Restart),
     ("server.trusted_proxies", Apply::Restart),
+    ("server.tls", Apply::Restart),
+    ("server.tls_names", Apply::Restart),
     ("sessions.scrollback_lines", Apply::Live),
     ("sessions.restore", Apply::Restart),
     ("sessions.agent_resume", Apply::Restart),
@@ -425,6 +435,13 @@ impl Effective {
             "server.allow_origins" => json!(self.allow_origins),
             "server.trusted_proxies" => json!(
                 self.trusted_proxies
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            ),
+            "server.tls" => json!(self.tls.to_string()),
+            "server.tls_names" => json!(
+                self.tls_names
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
@@ -615,6 +632,54 @@ pub fn resolve(
         file_proxies,
         Vec::new()
     );
+    let file_tls = file.server.tls.as_deref().and_then(|raw| {
+        match crate::tls::parse_mode(raw) {
+            Ok(crate::tls::TlsMode::Files { cert, key }) => {
+                let fix = |p: PathBuf| {
+                    let p = crate::state::expand_home(&p, home);
+                    p.is_absolute().then_some(p)
+                };
+                match (fix(cert), fix(key)) {
+                    (Some(cert), Some(key)) => Some(crate::tls::TlsMode::Files { cert, key }),
+                    _ => {
+                        errors.push(format!(
+                            "server.tls: {raw:?}: the certificate and key paths must be absolute (or ~/...)"
+                        ));
+                        None
+                    }
+                }
+            }
+            Ok(mode) => Some(mode),
+            Err(message) => {
+                errors.push(format!("server.tls: {message}"));
+                None
+            }
+        }
+    });
+    let tls = pick!(
+        "server.tls",
+        flags.tls.clone(),
+        file_tls,
+        crate::tls::TlsMode::Off
+    );
+    let file_tls_names = file.server.tls_names.as_ref().map(|list| {
+        list.iter()
+            .filter_map(|raw| match crate::tls::parse_name(raw) {
+                Ok(name) => Some(name),
+                Err(message) => {
+                    errors.push(format!("server.tls_names: {message}"));
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    });
+    let flag_tls_names = (!flags.tls_names.is_empty()).then(|| flags.tls_names.clone());
+    let tls_names = pick!(
+        "server.tls_names",
+        flag_tls_names,
+        file_tls_names,
+        Vec::new()
+    );
     let file_scrollback = file.sessions.scrollback_lines.and_then(|n| {
         if (1..=MAX_SCROLLBACK_LINES).contains(&n) {
             Some(n)
@@ -765,6 +830,8 @@ pub fn resolve(
         public_urls,
         allow_origins,
         trusted_proxies,
+        tls,
+        tls_names,
         scrollback_lines,
         restore,
         agent_resume,
@@ -1191,6 +1258,8 @@ port = 7420
 public_urls = ["https://box.tailnet.ts.net"]
 allow_origins = []
 trusted_proxies = []
+tls = "off"                       # auto: local name-constrained CA; or "/path/cert.pem,/path/key.pem"
+tls_names = []                    # extra names/IPs/networks for it, e.g. ["192.168.0.0/16"]
 
 [sessions]
 scrollback_lines = 5000           # live: sessions started from now on

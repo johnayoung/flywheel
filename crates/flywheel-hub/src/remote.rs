@@ -36,6 +36,9 @@ pub struct RuntimeInfo {
     /// Where its output goes when it runs detached (`fw hub start`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<PathBuf>,
+    /// Built-in TLS in force (`--tls`): `auto` (a local CA) or `files`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<String>,
 }
 
 impl RuntimeInfo {
@@ -47,6 +50,15 @@ impl RuntimeInfo {
             ip => ip,
         };
         SocketAddr::new(ip, self.listen.port())
+    }
+
+    /// How its own port serves browsers.
+    pub fn served(&self) -> Served {
+        match self.tls.as_deref() {
+            Some("auto") => Served::Https { ca_page: true },
+            Some(_) => Served::Https { ca_page: false },
+            None => Served::Http,
+        }
     }
 
     /// Record `self` (0600) in `state_dir`.
@@ -394,6 +406,18 @@ fn raw_interface_addresses() -> Vec<(String, IpAddr)> {
     Vec::new()
 }
 
+/// How the hub's own port serves browsers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Served {
+    Http,
+    /// Built-in TLS: https for other devices (loopback keeps http, a
+    /// secure context already); `ca_page`: a local CA they install from
+    /// `/ca` over plain http first.
+    Https {
+        ca_page: bool,
+    },
+}
+
 /// A URL to log in at, and where it reaches from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginTarget {
@@ -403,12 +427,29 @@ pub struct LoginTarget {
     pub base: String,
     /// Reachable from another device (QR-worthy).
     pub remote: bool,
+    /// Served by the hub's own TLS with a local CA: a device that does not
+    /// trust it yet starts at `/ca` (over http, [`LoginTarget::ca_base`]).
+    pub ca_page: bool,
 }
 
-fn http_base(ip: IpAddr, port: u16) -> String {
+impl LoginTarget {
+    /// The plain-http origin of a [`LoginTarget::ca_page`] target.
+    pub fn ca_base(&self) -> Option<String> {
+        self.ca_page
+            .then(|| self.base.strip_prefix("https://"))
+            .flatten()
+            .map(|authority| format!("http://{authority}"))
+    }
+}
+
+fn origin(scheme: &str, host: &str, port: u16) -> String {
+    format!("{scheme}://{host}:{port}")
+}
+
+fn ip_host(ip: IpAddr) -> String {
     match ip {
-        IpAddr::V4(v4) => format!("http://{v4}:{port}"),
-        IpAddr::V6(v6) => format!("http://[{v6}]:{port}"),
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
     }
 }
 
@@ -421,22 +462,46 @@ pub fn login_targets(
     tailscale: Option<&Tailscale>,
     interfaces: &[(String, IpAddr)],
 ) -> Vec<LoginTarget> {
+    login_targets_served(listen, public_urls, tailscale, interfaces, Served::Http)
+}
+
+/// [`login_targets`] for a hub serving its port as `served`: with TLS, the
+/// tailnet and LAN addresses are https.
+pub fn login_targets_served(
+    listen: SocketAddr,
+    public_urls: &[String],
+    tailscale: Option<&Tailscale>,
+    interfaces: &[(String, IpAddr)],
+    served: Served,
+) -> Vec<LoginTarget> {
+    let (scheme, own_ca) = match served {
+        Served::Http => ("http", false),
+        Served::Https { ca_page } => ("https", ca_page),
+    };
     let mut targets: Vec<LoginTarget> = Vec::new();
-    let mut push = |label: String, base: String, remote: bool| {
+    // `own`: served by the hub's own port (with TLS, its own certificate),
+    // not a proxy in front of it.
+    let mut push = |label: String, base: String, remote: bool, own: bool| {
         if !targets.iter().any(|t| t.base == base) {
             targets.push(LoginTarget {
                 label,
                 base,
                 remote,
+                ca_page: own && own_ca && remote,
             });
         }
     };
     for url in public_urls {
-        push("public".into(), url.clone(), true);
+        push("public".into(), url.clone(), true, false);
     }
     if let Some(ts) = tailscale {
         for url in &ts.serve_urls {
-            push("tailnet https (tailscale serve)".into(), url.clone(), true);
+            push(
+                "tailnet https (tailscale serve)".into(),
+                url.clone(),
+                true,
+                false,
+            );
         }
     }
     let port = listen.port();
@@ -471,14 +536,25 @@ pub fn login_targets(
             if let Some(name) = tailscale.and_then(|t| t.dns_name.as_deref()) {
                 push(
                     "tailnet (MagicDNS)".into(),
-                    format!("http://{name}:{port}"),
+                    origin(scheme, name.trim_end_matches('.'), port),
+                    true,
                     true,
                 );
             }
-            push("tailnet".into(), http_base(*address, port), true);
+            push(
+                "tailnet".into(),
+                origin(scheme, &ip_host(*address), port),
+                true,
+                true,
+            );
         }
         for (name, address) in lan {
-            push(format!("lan ({name})"), http_base(address, port), true);
+            push(
+                format!("lan ({name})"),
+                origin(scheme, &ip_host(address), port),
+                true,
+                true,
+            );
         }
     }
     if ip.is_loopback() || ip.is_unspecified() {
@@ -487,7 +563,14 @@ pub fn login_targets(
         } else {
             IpAddr::V4(Ipv4Addr::LOCALHOST)
         };
-        push("this machine".into(), http_base(local, port), false);
+        // Loopback keeps http: a secure context already, and it needs no
+        // trust in the CA.
+        push(
+            "this machine".into(),
+            origin("http", &ip_host(local), port),
+            false,
+            true,
+        );
     }
     targets
 }
@@ -541,6 +624,7 @@ mod tests {
             public_urls: vec!["https://box.ts.net".into()],
             started_at: None,
             log_file: None,
+            tls: None,
         };
         info.write(dir.path()).unwrap();
         assert_eq!(RuntimeInfo::read(dir.path()).unwrap(), Some(info.clone()));
@@ -568,6 +652,7 @@ mod tests {
             public_urls: Vec::new(),
             started_at: None,
             log_file: None,
+            tls: None,
         };
         // A runtime file nobody holds the lock for is stale: ignored and
         // removed (a crashed hub, even if its pid was reused).
@@ -770,6 +855,70 @@ esac
                 "tailnet"
             ]
         );
+    }
+
+    #[test]
+    fn built_in_tls_serves_the_network_over_https_and_loopback_over_http() {
+        let ts = Tailscale {
+            dns_name: Some("box.t.ts.net".into()),
+            ips: vec!["100.64.0.5".parse().unwrap()],
+            serve_urls: Vec::new(),
+        };
+        let interfaces = vec![
+            ("eth0".to_owned(), "192.168.1.5".parse().unwrap()),
+            ("tailscale0".to_owned(), "100.64.0.5".parse().unwrap()),
+        ];
+        let targets = login_targets_served(
+            "0.0.0.0:7600".parse().unwrap(),
+            &["https://hub.example.com".to_owned()],
+            Some(&ts),
+            &interfaces,
+            Served::Https { ca_page: true },
+        );
+        let bases: Vec<(&str, bool)> = targets
+            .iter()
+            .map(|t| (t.base.as_str(), t.ca_page))
+            .collect();
+        assert_eq!(
+            bases,
+            [
+                // A proxy in front has its own certificate: no CA page.
+                ("https://hub.example.com", false),
+                ("https://box.t.ts.net:7600", true),
+                ("https://100.64.0.5:7600", true),
+                ("https://192.168.1.5:7600", true),
+                ("http://127.0.0.1:7600", false),
+            ]
+        );
+        assert_eq!(
+            targets[3].ca_base().as_deref(),
+            Some("http://192.168.1.5:7600")
+        );
+        assert_eq!(targets[0].ca_base(), None);
+        // The operator's certificate: https, no CA page.
+        let files = login_targets_served(
+            "192.168.1.5:7600".parse().unwrap(),
+            &[],
+            None,
+            &interfaces,
+            Served::Https { ca_page: false },
+        );
+        assert_eq!(files[0].base, "https://192.168.1.5:7600");
+        assert!(!files[0].ca_page);
+        let info = RuntimeInfo {
+            pid: 1,
+            listen: "0.0.0.0:7600".parse().unwrap(),
+            public_urls: Vec::new(),
+            started_at: None,
+            log_file: None,
+            tls: Some("auto".into()),
+        };
+        assert_eq!(info.served(), Served::Https { ca_page: true });
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"tls\":\"auto\""), "{json}");
+        let old: RuntimeInfo =
+            serde_json::from_str(r#"{"pid":1,"listen":"127.0.0.1:7420"}"#).unwrap();
+        assert_eq!(old.served(), Served::Http);
     }
 
     #[test]

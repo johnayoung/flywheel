@@ -16,7 +16,6 @@ use crate::auth::{unix_now, write_private};
 use crate::net::Socket;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -181,13 +180,6 @@ pub fn display_fingerprint(hex: &str) -> String {
         .join(":")
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
 /// This machine's host name (`whoami`, a default peer name).
 pub fn host_name() -> String {
     let mut name = [0u8; 256];
@@ -201,102 +193,18 @@ pub fn host_name() -> String {
 
 // --- TLS --------------------------------------------------------------------
 
-/// Verifies a machine's certificate: against the system roots, or -- with
-/// a pin -- by its SHA-256 alone (a self-signed hub: like an SSH host key,
-/// the pin is the trust; names and expiry are not checked). Either way it
-/// records what was presented, so a refusal can name the fingerprint.
-#[derive(Debug)]
-struct Verifier {
-    roots: Option<Arc<rustls::client::WebPkiServerVerifier>>,
-    pin: Option<String>,
-    observed: Arc<Mutex<Option<String>>>,
-    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
-}
-
-impl rustls::client::danger::ServerCertVerifier for Verifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        server_name: &rustls::pki_types::ServerName<'_>,
-        ocsp_response: &[u8],
-        now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let presented = sha256_hex(end_entity.as_ref());
-        *self.observed.lock().unwrap_or_else(PoisonError::into_inner) = Some(presented.clone());
-        match (&self.pin, &self.roots) {
-            (Some(pin), _) => {
-                if bool::from(subtle::ConstantTimeEq::ct_eq(
-                    pin.as_bytes(),
-                    presented.as_bytes(),
-                )) {
-                    Ok(rustls::client::danger::ServerCertVerified::assertion())
-                } else {
-                    Err(rustls::Error::General(format!(
-                        "certificate fingerprint {} does not match the pinned {}",
-                        display_fingerprint(&presented),
-                        display_fingerprint(pin)
-                    )))
-                }
-            }
-            (None, Some(roots)) => {
-                roots.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-            }
-            (None, None) => Err(rustls::Error::General("no trust anchors".into())),
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.algorithms.supported_schemes()
-    }
-}
-
+/// A machine's TLS: the system roots, or the pinned fingerprint (its own
+/// certificate, or the CA it chains to -- a hub's `fw hub tls ca`).
 fn tls_config(
     pin: Option<&str>,
     observed: Arc<Mutex<Option<String>>>,
 ) -> Result<rustls::ClientConfig, String> {
-    let provider = crate::net::provider();
-    let roots = match pin {
-        Some(_) => None,
-        None => {
-            let store = crate::net::native_roots(
-                "an https machine (pin its certificate with --fingerprint)",
-            )?;
-            Some(
-                rustls::client::WebPkiServerVerifier::builder_with_provider(
-                    Arc::new(store),
-                    Arc::clone(&provider),
-                )
-                .build()
-                .map_err(|e| format!("TLS setup failed: {e}"))?,
-            )
-        }
-    };
-    let verifier = Verifier {
-        roots,
-        pin: pin.map(str::to_owned),
+    crate::net::pinned_config(
+        pin,
+        &[],
         observed,
-        algorithms: provider.signature_verification_algorithms,
-    };
-    crate::net::verifier_config(provider, Arc::new(verifier))
+        "an https machine (pin its certificate with --fingerprint)",
+    )
 }
 
 // --- one machine --------------------------------------------------------------
@@ -594,7 +502,8 @@ impl Machine {
             if let Some(seen) = seen {
                 message.push_str(&format!(
                     "; it presented a certificate with SHA-256 fingerprint {} -- if that is \
-                     its own (self-signed) certificate, pin it with --fingerprint",
+                     its own (self-signed) certificate or its hub's local CA (`fw hub tls ca` \
+                     there prints it), pin it with --fingerprint",
                     display_fingerprint(&seen)
                 ));
             }

@@ -55,8 +55,35 @@ pub(crate) struct EndpointArgs {
     /// keeps for it.
     #[arg(long, value_name = "NAME")]
     pub(crate) machine: Option<String>,
+    /// With an https --url: trust the hub by the SHA-256 fingerprint of its
+    /// certificate or of the CA it chains to (`fw hub tls ca` on its
+    /// machine prints that one, which outlives certificate renewals).
+    /// Default: the system roots plus this state dir's local CA.
+    #[arg(long, value_name = "SHA256")]
+    pub(crate) fingerprint: Option<String>,
     #[command(flatten)]
     pub(crate) state: StateDirArg,
+}
+
+/// What an https hub is trusted by.
+#[derive(Debug, Clone, Default)]
+struct Trust {
+    /// A pinned fingerprint (lowercase hex).
+    pin: Option<String>,
+    /// Roots trusted beside the system's (this state dir's local CA).
+    extra: Vec<rustls::pki_types::CertificateDer<'static>>,
+}
+
+impl Trust {
+    /// The system roots plus `state_dir`'s local CA (when it has one).
+    fn local(state_dir: &Path) -> Self {
+        let extra = crate::tls::LocalCa::load(state_dir)
+            .ok()
+            .flatten()
+            .map(|ca| vec![ca.cert_der().clone()])
+            .unwrap_or_default();
+        Self { pin: None, extra }
+    }
 }
 
 pub use crate::net::{Io, Socket};
@@ -128,13 +155,29 @@ impl Endpoint {
             return Self::for_state_dir(&dir, explicit)?.ok_or_else(|| no_hub_message(&dir));
         };
         let base = parse_base(raw)?;
+        let mut trust = resolve_state_dir(&args.state)
+            .map(|dir| Trust::local(&dir))
+            .unwrap_or_default();
+        if let Some(raw) = &args.fingerprint {
+            if base.scheme() != "https" {
+                return Err(
+                    "--fingerprint pins an https hub's certificate; this URL is http".into(),
+                );
+            }
+            trust.pin = Some(
+                crate::machines::parse_fingerprint(raw)
+                    .map_err(|e| format!("--fingerprint: {e}"))?,
+            );
+        }
         if let Some(token) = explicit {
-            return Self::new(base, token, None, None);
+            return Self::new(base, token, None, None, trust);
         }
         // Never hand this machine's credential to another host: the local
         // token only goes to the local hub.
         let dir = resolve_state_dir(&args.state)?;
-        let Some(info) = running_hub(&dir)?.filter(|info| is_local_hub(&base, info.listen)) else {
+        let Some(info) =
+            running_hub(&dir)?.filter(|info| is_local_hub(&base, info.listen, info.tls.is_some()))
+        else {
             return Err(format!(
                 "--url needs the hub's token: set {TOKEN_ENV} (or --token) to the output of \
                  `fw hub token` on its machine (the local token is only sent to the hub \
@@ -143,7 +186,7 @@ impl Endpoint {
             ));
         };
         let token = local_token(&dir)?;
-        Self::new(base, token, Some(dir), Some(info))
+        Self::new(base, token, Some(dir), Some(info), trust)
     }
 
     /// The hub running for `state_dir` with its own token, or why there is
@@ -163,15 +206,25 @@ impl Endpoint {
         let Some(info) = running_hub(state_dir)? else {
             return Ok(None);
         };
-        let base = Url::parse(&format!("http://{}", info.connect_addr()))
+        // Loopback keeps plain http under built-in TLS; any other address
+        // (a specific --bind) is https, trusted by the state dir's CA.
+        let addr = info.connect_addr();
+        let scheme = if info.tls.is_some() && !addr.ip().is_loopback() {
+            "https"
+        } else {
+            "http"
+        };
+        let base = Url::parse(&format!("{scheme}://{addr}"))
             .map_err(|e| format!("bad hub address: {e}"))?;
+        let trust = Trust::local(state_dir);
         let endpoint = match token {
-            Some(token) => Self::new(base, token, None, Some(info))?,
+            Some(token) => Self::new(base, token, None, Some(info), trust)?,
             None => Self::new(
                 base,
                 local_token(state_dir)?,
                 Some(state_dir.to_owned()),
                 Some(info),
+                trust,
             )?,
         };
         Ok(Some(endpoint))
@@ -220,13 +273,14 @@ impl Endpoint {
         token: String,
         token_dir: Option<PathBuf>,
         local: Option<RuntimeInfo>,
+        trust: Trust,
     ) -> Result<Self, String> {
         let token = token.trim().to_owned();
         if token.is_empty() || token.bytes().any(|b| !b.is_ascii_graphic()) {
             return Err("the token must be printable ASCII without spaces".into());
         }
         let https = base.scheme() == "https";
-        let tls = https.then(tls_config).transpose()?.map(Arc::new);
+        let tls = https.then(|| tls_config(&trust)).transpose()?.map(Arc::new);
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
@@ -510,11 +564,12 @@ fn parse_base(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
-/// Whether `base` (a `--url`) is the hub listening on `listen` here: plain
-/// http to its port at its address, or at loopback when it listens on
-/// loopback or every address.
-fn is_local_hub(base: &Url, listen: SocketAddr) -> bool {
-    if base.scheme() != "http" || base.port_or_known_default() != Some(listen.port()) {
+/// Whether `base` (a `--url`) is the hub listening on `listen` here: http
+/// (or https, when it serves `tls`) to its port at its address, or at
+/// loopback when it listens on loopback or every address.
+fn is_local_hub(base: &Url, listen: SocketAddr, tls: bool) -> bool {
+    let scheme_ok = base.scheme() == "http" || (tls && base.scheme() == "https");
+    if !scheme_ok || base.port_or_known_default() != Some(listen.port()) {
         return false;
     }
     let host: Option<IpAddr> = match base.host() {
@@ -532,9 +587,15 @@ fn is_local_hub(base: &Url, listen: SocketAddr) -> bool {
     host == listen || (host.is_loopback() && (listen.is_loopback() || listen.is_unspecified()))
 }
 
-/// rustls on ring with the system's roots (an https hub).
-fn tls_config() -> Result<rustls::ClientConfig, String> {
-    crate::net::roots_config(crate::net::native_roots("an https hub")?)
+/// rustls on ring for an https hub: its pin, else the system roots and
+/// the local CA.
+fn tls_config(trust: &Trust) -> Result<rustls::ClientConfig, String> {
+    crate::net::pinned_config(
+        trust.pin.as_deref(),
+        &trust.extra,
+        Arc::new(std::sync::Mutex::new(None)),
+        "an https hub (pin it with --fingerprint)",
+    )
 }
 
 /// A fresh client id for the events socket (`[A-Za-z0-9_-]`, unique per
@@ -620,14 +681,18 @@ mod tests {
         let lo: SocketAddr = "127.0.0.1:7420".parse().unwrap();
         let any: SocketAddr = "0.0.0.0:7420".parse().unwrap();
         let lan: SocketAddr = "192.168.1.5:7420".parse().unwrap();
-        assert!(is_local_hub(&url("http://127.0.0.1:7420"), lo));
-        assert!(is_local_hub(&url("http://localhost:7420"), lo));
-        assert!(is_local_hub(&url("http://127.0.0.1:7420"), any));
-        assert!(is_local_hub(&url("http://192.168.1.5:7420"), lan));
-        assert!(!is_local_hub(&url("http://127.0.0.1:7421"), lo));
-        assert!(!is_local_hub(&url("http://other-box:7420"), lo));
-        assert!(!is_local_hub(&url("http://10.0.0.9:7420"), any));
-        assert!(!is_local_hub(&url("https://127.0.0.1:7420"), lo));
+        assert!(is_local_hub(&url("http://127.0.0.1:7420"), lo, false));
+        assert!(is_local_hub(&url("http://localhost:7420"), lo, false));
+        assert!(is_local_hub(&url("http://127.0.0.1:7420"), any, false));
+        assert!(is_local_hub(&url("http://192.168.1.5:7420"), lan, false));
+        assert!(!is_local_hub(&url("http://127.0.0.1:7421"), lo, false));
+        assert!(!is_local_hub(&url("http://other-box:7420"), lo, false));
+        assert!(!is_local_hub(&url("http://10.0.0.9:7420"), any, false));
+        assert!(!is_local_hub(&url("https://127.0.0.1:7420"), lo, false));
+        // A hub serving its own TLS is the local one over https too.
+        assert!(is_local_hub(&url("https://192.168.1.5:7420"), lan, true));
+        assert!(is_local_hub(&url("https://127.0.0.1:7420"), any, true));
+        assert!(!is_local_hub(&url("https://10.0.0.9:7420"), any, true));
     }
 
     #[test]
@@ -637,6 +702,7 @@ mod tests {
             "s3cr3t-token".into(),
             None,
             None,
+            Trust::default(),
         )
         .unwrap();
         assert!(!format!("{endpoint:?}").contains("s3cr3t"));

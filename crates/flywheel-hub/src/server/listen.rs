@@ -14,6 +14,7 @@
 
 use super::Peer;
 use super::slots::{Admission, Phase, Slots, UNAUTH_PER_CLIENT, unauthenticated_cap};
+use super::tls_listen::{Sniffed, Transport};
 use crate::handoff::GatedListener;
 use axum::Router;
 use axum::body::Body;
@@ -114,12 +115,14 @@ async fn closed(close: &mut watch::Receiver<bool>) {
 /// connection task has, or after [`CLOSE_GRACE`]. `cap` sizes the main
 /// pool (see [`super::slots`]); `trusted_proxies` (loopback always) are
 /// counted per client by the `X-Forwarded-For` of their requests, not as
-/// one address.
+/// one address. With `tls`, each connection is https or http by its first
+/// byte (`server/tls_listen.rs`); its requests say which.
 pub async fn run(
     mut listener: GatedListener,
     app: Router,
     cap: usize,
     trusted_proxies: Vec<IpAddr>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
     shutdown: impl Future<Output = ()> + Send + 'static,
     closing: watch::Sender<bool>,
 ) {
@@ -147,19 +150,23 @@ pub async fn run(
         let admission = Admission::new(Arc::clone(&slots), Arc::clone(&conn));
         let request_slots = Arc::clone(&slots);
         let request_conn = Arc::clone(&conn);
+        let fd = stream.as_raw_fd();
+        let (stream, secure) = Sniffed::new(stream, tls.clone());
         let service = app
             .clone()
             .map_request(move |mut request: hyper::Request<Incoming>| {
                 request_slots.request_started(&request_conn);
                 request.extensions_mut().insert(ConnectInfo(peer));
                 request.extensions_mut().insert(admission.clone());
+                request.extensions_mut().insert(Transport {
+                    tls: secure.get().copied().unwrap_or(false),
+                });
                 request.map(Body::new)
             });
         let mut close = closing.subscribe();
         let gate = gate.clone();
         let slots = Arc::clone(&slots);
         let done = done_tx.clone();
-        let fd = stream.as_raw_fd();
         let accepted = Instant::now();
         tokio::spawn(async move {
             let mut builder = hyper::server::conn::http1::Builder::new();

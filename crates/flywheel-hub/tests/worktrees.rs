@@ -84,6 +84,7 @@ impl TestHub {
             public_urls: Vec::new(),
             started_at: None,
             log_file: None,
+            tls: None,
         }
         .write(&dir.path().join("state"))
         .unwrap();

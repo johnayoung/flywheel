@@ -818,6 +818,7 @@ mod tests {
             public_urls: vec!["https://box.example".into()],
             started_at: None,
             log_file: None,
+            tls: None,
         };
         assert_eq!(
             old_serve_args(Path::new("/abs/state"), &info),

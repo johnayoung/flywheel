@@ -461,7 +461,7 @@ pub const PLAYER_HTML: &str = r##"<!doctype html>
 </html>
 "##;
 
-fn escape_html(text: &str) -> String {
+pub(crate) fn escape_html(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {

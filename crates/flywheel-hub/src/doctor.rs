@@ -221,7 +221,16 @@ fn run_checks(
         .as_ref()
         .map_or(port.unwrap_or(DEFAULT_PORT), |e| e.port);
     checks.push(port_check(bind, port, hub.as_ref()));
-    checks.push(tailscale_check(hub.as_ref().map_or(port, |h| h.port)));
+    let tailscale = tailscale_check(hub.as_ref().map_or(port, |h| h.port));
+    let tailscale_serves = tailscale.level == Level::Ok;
+    checks.push(tailscale);
+    checks.push(tls_check(
+        dir,
+        effective
+            .as_ref()
+            .map_or(&crate::tls::TlsMode::Off, |e| &e.tls),
+        tailscale_serves,
+    ));
     checks.push(browser_check());
     checks.extend(systemd_checks());
     checks.push(clock_check());
@@ -1200,7 +1209,10 @@ fn tailscale_check(port: u16) -> Check {
             Level::Info,
             "not installed: the hub is reachable from this machine only (or with --bind)",
         )
-        .fix("for a phone or another machine: install Tailscale, then `tailscale serve`");
+        .fix(
+            "for a phone or another machine: install Tailscale, then `tailscale serve`; or \
+             `--bind 0.0.0.0 --tls auto` (see the tls check)",
+        );
     };
     match crate::remote::detect_tailscale(&program, port) {
         None => Check::new(
@@ -1229,6 +1241,99 @@ fn tailscale_check(port: u16) -> Check {
         .fix(format!(
             "for remote access: `tailscale serve --bg http://127.0.0.1:{port}`"
         )),
+    }
+}
+
+/// Built-in TLS: off (and whether a phone then gets https any other way),
+/// or the local CA's state (key mode, expiry), or the operator's files.
+fn tls_check(dir: &Path, mode: &crate::tls::TlsMode, tailscale_serves: bool) -> Check {
+    use crate::tls::{LocalCa, TlsMode};
+    let id = "tls";
+    match mode {
+        TlsMode::Off if tailscale_serves => Check::new(
+            id,
+            Level::Ok,
+            "built-in TLS off; `tailscale serve` gives phones https",
+        ),
+        TlsMode::Off => Check::new(
+            id,
+            Level::Info,
+            "built-in TLS off: phones on the LAN get plain http (no app install, notifications, \
+             or clipboard)",
+        )
+        .fix(
+            "`fw hub serve --bind 0.0.0.0 --tls auto` (hub.toml [server] tls = \"auto\"): a local \
+             CA name-constrained to this hub; phones install it from /ca",
+        ),
+        TlsMode::Files { cert, key } => {
+            let missing: Vec<String> = [cert, key]
+                .iter()
+                .filter(|p| !p.is_file())
+                .map(|p| p.display().to_string())
+                .collect();
+            if missing.is_empty() {
+                Check::new(
+                    id,
+                    Level::Ok,
+                    format!("your certificate {}", cert.display()),
+                )
+            } else {
+                Check::new(
+                    id,
+                    Level::Fail,
+                    format!("--tls files missing: {}", missing.join(", ")),
+                )
+                .fix("fix server.tls in hub.toml (absolute paths), or use `auto`")
+            }
+        }
+        TlsMode::Auto => match LocalCa::load(dir) {
+            Ok(None) => Check::new(
+                id,
+                Level::Info,
+                "auto: the local CA is made at the next start (or now: `fw hub tls ca`)",
+            ),
+            Err(e) => Check::new(id, Level::Fail, format!("auto: the local CA: {e}"))
+                .fix("`fw hub tls rotate` makes a new one (devices re-install it)"),
+            Ok(Some(ca)) => {
+                let key = dir.join(crate::tls::TLS_DIR).join(crate::tls::CA_KEY_FILE);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = std::fs::metadata(&key)
+                        .map(|m| m.permissions().mode() & 0o777)
+                        .unwrap_or(0);
+                    if mode & 0o077 != 0 {
+                        return Check::new(
+                            id,
+                            Level::Fail,
+                            format!("the CA key {} is mode {mode:o}", key.display()),
+                        )
+                        .fix(format!(
+                            "`chmod 600 {}`, then `fw hub tls rotate` (it may have been read)",
+                            key.display()
+                        ));
+                    }
+                }
+                let left = ca
+                    .expires()
+                    .duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default();
+                let summary = format!(
+                    "auto: local CA {}",
+                    crate::machines::display_fingerprint(ca.fingerprint())
+                );
+                let check = if left < Duration::from_secs(30 * 24 * 3600) {
+                    Check::new(id, Level::Warn, format!("{summary} expires within 30 days"))
+                        .fix("`fw hub tls rotate` (devices re-install it)")
+                } else {
+                    Check::new(id, Level::Ok, summary)
+                };
+                check.detail(format!(
+                    "name-constrained to: {}",
+                    ca.constraints().list().join(", ")
+                ))
+            }
+        },
     }
 }
 

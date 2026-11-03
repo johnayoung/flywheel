@@ -54,6 +54,7 @@
 
 mod admission;
 mod auth;
+mod ca_page;
 mod commands_api;
 mod detect_api;
 mod events_ws;
@@ -75,6 +76,7 @@ mod share_api;
 mod slots;
 mod templates_api;
 mod terminal_ws;
+mod tls_listen;
 mod workspaces_api;
 mod worktree_api;
 
@@ -172,6 +174,10 @@ pub struct ServerOptions {
     pub config: Option<Arc<crate::config::ConfigWatch>>,
     /// The plugin host (`/api/plugins*`); `None`: no plugins run.
     pub plugins: Option<Arc<crate::plugins::PluginHost>>,
+    /// Built-in TLS (`--tls`): https on the same port, `Secure` cookies,
+    /// the `/ca` onboarding page, and plain http from the network
+    /// redirected to https. `None`: plain http only.
+    pub tls: Option<Arc<crate::tls::TlsServing>>,
 }
 
 #[derive(Clone)]
@@ -302,6 +308,8 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         )
         .route("/api/settings/keys/check", post(settings_api::check_keys))
         .route("/api/config", get(settings_api::get_config))
+        .route("/api/tls", get(ca_page::status))
+        .route("/api/tls/reload", post(ca_page::reload))
         .route("/api/plugins", get(plugins_api::list))
         .route(
             "/api/plugins/{name}",
@@ -374,6 +382,15 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/manifest.webmanifest", get(pwa::manifest))
         .route("/sw.js", get(pwa::service_worker))
         .route("/replay", get(record_api::player))
+        // Built-in TLS onboarding: the local CA for a device to trust.
+        .route("/ca", get(ca_page::page))
+        .route("/ca/", get(ca_page::page))
+        .route("/ca/hub-ca.crt", get(ca_page::der))
+        .route("/ca/hub-ca.pem", get(ca_page::pem))
+        .route("/ca/hub-ca.mobileconfig", get(ca_page::mobileconfig))
+        .route("/ca/probe", get(ca_page::probe))
+        .route("/ca/ca.js", get(ca_page::script))
+        .route("/ca/ca.css", get(ca_page::style))
         // A share link: its credential in the path is its only key.
         .route("/share/{credential}", get(share_api::viewer_page))
         .route("/share/{credential}/info", get(share_api::info))
@@ -390,6 +407,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
     public
         .merge(protected)
         .layer(middleware::from_fn_with_state(state.clone(), origin_guard))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            tls_listen::plain_http_policy,
+        ))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -424,6 +445,7 @@ pub async fn serve_gated(
     let (tx, rx) = watch::channel(false);
     let gate = listener.gate().clone();
     let trusted_proxies = options.trusted_proxies.clone();
+    let tls = options.tls.as_ref().map(|t| t.acceptor());
     let app = router(Arc::clone(&hub), options, rx).layer(middleware::from_fn_with_state(
         gate.clone(),
         crate::handoff::gate_requests,
@@ -440,6 +462,7 @@ pub async fn serve_gated(
         app,
         listen::connection_cap(),
         trusted_proxies,
+        tls,
         shutdown_signal,
         tx,
     )
@@ -824,6 +847,7 @@ mod tests {
             app,
             4,
             Vec::new(),
+            None,
             std::future::pending(),
             closing,
         ));
@@ -911,6 +935,7 @@ mod tests {
             app,
             cap,
             Vec::new(),
+            None,
             std::future::pending(),
             closing,
         ));

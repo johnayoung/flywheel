@@ -67,8 +67,9 @@ struct AddArgs {
     /// With --mint: this hub's peer name there [default: this host name].
     #[arg(long, value_name = "NAME", requires = "mint")]
     peer_name: Option<String>,
-    /// Pin the https machine's certificate by its SHA-256 fingerprint (a
-    /// self-signed hub; `openssl x509 -noout -fingerprint -sha256`).
+    /// Pin the https machine by a SHA-256 fingerprint: its hub's local CA
+    /// (`fw hub tls ca` there; survives certificate renewals), or a
+    /// self-signed certificate (`openssl x509 -noout -fingerprint -sha256`).
     #[arg(long, value_name = "SHA256")]
     fingerprint: Option<String>,
     /// Re-pair the registered machine NAME in place (a new credential,

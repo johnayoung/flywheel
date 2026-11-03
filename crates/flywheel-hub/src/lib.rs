@@ -59,6 +59,8 @@ pub mod share_cli;
 pub mod state;
 pub mod status;
 pub mod template_cli;
+pub mod tls;
+pub mod tls_cli;
 pub mod transcript;
 pub mod upgrade;
 pub mod usage;

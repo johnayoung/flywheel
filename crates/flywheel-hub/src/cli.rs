@@ -165,6 +165,10 @@ struct ServeArgs {
     /// listening socket is kept, so --bind/--port are ignored.
     #[arg(long)]
     handoff: bool,
+    /// With --handoff: how long the old hub may stay frozen waiting for
+    /// each step of this one, in seconds (`fw hub upgrade --timeout`).
+    #[arg(long, value_name = "SECS", hide = true, requires = "handoff")]
+    handoff_timeout: Option<u64>,
 }
 
 /// How the hub serves: shared by `serve`, `start`, and `install-service`.
@@ -840,7 +844,8 @@ fn serve_cmd(
     );
     let mut taken_over = None;
     let opened = if args.handoff {
-        match crate::upgrade::take_over(options, err) {
+        let step = args.handoff_timeout.map(Duration::from_secs);
+        match crate::upgrade::take_over(options, step, err) {
             Ok((hub, taken)) => {
                 taken_over = Some(taken);
                 Ok(hub)
@@ -902,17 +907,6 @@ fn serve_cmd(
              plus `tailscale serve`."
         );
     }
-    let tailscale = tailscale_program().and_then(|p| detect_tailscale(&p, local.port()));
-    let base = format!("http://{}", browse_host(local));
-    if local.ip().is_unspecified() {
-        let _ = writeln!(
-            out,
-            "flywheel hub listening on {local} (all interfaces; {base} from this machine)"
-        );
-    } else {
-        let _ = writeln!(out, "flywheel hub listening on {base}");
-    }
-    let _ = writeln!(out, "state dir: {}", hub.state_dir().display());
     // Taken before anything is restored: a SIGTERM from here on (`fw hub
     // start` giving up, `systemctl stop`) shuts down gracefully -- every
     // restored session recorded stopped again -- instead of killing the
@@ -927,12 +921,31 @@ fn serve_cmd(
             }
         }
     };
-    if let Some(taken) = taken_over.take() {
+    // A handoff completes first: the old hub is frozen until then.
+    let handed_over = match taken_over.take() {
+        Some(taken) => match taken.finish(&hub) {
+            Ok(said) => Some(said),
+            Err(message) => {
+                let _ = writeln!(err, "fw hub: {message}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let tailscale = tailscale_program().and_then(|p| detect_tailscale(&p, local.port()));
+    let base = format!("http://{}", browse_host(local));
+    if local.ip().is_unspecified() {
+        let _ = writeln!(
+            out,
+            "flywheel hub listening on {local} (all interfaces; {base} from this machine)"
+        );
+    } else {
+        let _ = writeln!(out, "flywheel hub listening on {base}");
+    }
+    let _ = writeln!(out, "state dir: {}", hub.state_dir().display());
+    if let Some(said) = handed_over {
         // Sessions came along running: nothing to restore.
-        if let Err(message) = taken.finish(&hub, out) {
-            let _ = writeln!(err, "fw hub: {message}");
-            return 1;
-        }
+        let _ = writeln!(out, "{said}");
     } else if hub_args.no_restore {
         match hub.forgo_restore() {
             Ok(0) => {

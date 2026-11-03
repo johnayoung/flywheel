@@ -71,6 +71,8 @@ const EVENTS_RETRY: Duration = Duration::from_secs(2);
 const OUTPUT_CREDIT: usize = 256 * 1024;
 /// The hub's close code for a rotated token.
 const CLOSE_ROTATED: u16 = crate::server::WS_CLOSE_ROTATED;
+/// How long a restarting hub (`fw hub upgrade`) gets to come back.
+const RESTART_WINDOW: Duration = Duration::from_secs(120);
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct AttachArgs {
@@ -143,6 +145,8 @@ pub enum SessionMsg {
     Closed(String),
     /// The hub rotated its token and closed the connection.
     Rotated,
+    /// The hub process is being replaced (`fw hub upgrade`): reconnect.
+    Restart,
 }
 
 pub(crate) fn attach(args: &AttachArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -486,7 +490,10 @@ impl Client<'_> {
                     let step = if screen.help
                         && !matches!(
                             msg,
-                            SessionMsg::Exit(_) | SessionMsg::Closed(_) | SessionMsg::Rotated
+                            SessionMsg::Exit(_)
+                                | SessionMsg::Closed(_)
+                                | SessionMsg::Rotated
+                                | SessionMsg::Restart
                         ) {
                         // Under the key table: dropped (redrawn after).
                         Ok(())
@@ -616,6 +623,29 @@ impl Client<'_> {
                 screen.flush_bar(self)
             }
             SessionMsg::Closed(why) => Err(Leave::Failed(why)),
+            SessionMsg::Restart => {
+                screen.flash("the hub is restarting (upgrade); reconnecting".into());
+                screen.bar_dirty = true;
+                let _ = screen.flush_bar(self);
+                // The next process answers once the handoff completes (or
+                // this one again after a rollback).
+                let deadline = Instant::now() + RESTART_WINDOW;
+                let mut delay = Duration::from_millis(200);
+                loop {
+                    match self.reattach(id, screen) {
+                        Ok(()) => return Ok(()),
+                        Err(e) if Instant::now() >= deadline => {
+                            return Err(Leave::Failed(format!(
+                                "the hub restarted and did not come back: {e}"
+                            )));
+                        }
+                        Err(_) => {
+                            std::thread::sleep(delay);
+                            delay = (delay * 2).min(Duration::from_secs(2));
+                        }
+                    }
+                }
+            }
             SessionMsg::Rotated => {
                 if self.endpoint.reload_token().is_some() {
                     // The token came from the state dir: the new one is
@@ -1075,6 +1105,7 @@ impl Link {
 fn close_reason(frame: Option<&CloseFrame>) -> SessionMsg {
     match frame {
         Some(f) if u16::from(f.code) == CLOSE_ROTATED => SessionMsg::Rotated,
+        Some(f) if u16::from(f.code) == crate::server::WS_CLOSE_RESTART => SessionMsg::Restart,
         Some(f) if !f.reason.is_empty() => {
             SessionMsg::Closed(format!("the hub closed the session: {}", f.reason))
         }

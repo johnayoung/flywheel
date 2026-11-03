@@ -959,6 +959,11 @@ impl Hub {
                 record.name
             ))
             .into()),
+            WriteOutcome::HandingOff => Err(StateError::Conflict(format!(
+                "the hub is handing {:?} over to a new process; nothing was sent, retry",
+                record.name
+            ))
+            .into()),
         }
     }
 }

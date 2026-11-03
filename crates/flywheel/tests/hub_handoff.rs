@@ -265,7 +265,21 @@ struct Setup {
 
 fn setup(env: &Env) -> Setup {
     fake_claude(env);
-    let started = env.ok(&["start", "--port", "0"]);
+    // Only the first hub's environment carries the marker: an upgrade
+    // passes the old hub's environment on, not the caller's.
+    let started = env
+        .command(&[
+            "start",
+            "--port",
+            "0",
+            "--public-url",
+            "https://box.example",
+        ])
+        .env("HUB_ENV_MARKER", "from-the-first-hub")
+        .output()
+        .unwrap();
+    assert!(started.status.success(), "{started:?}");
+    let started = String::from_utf8_lossy(&started.stdout);
     assert!(started.contains("flywheel hub started"), "{started}");
     let repo = env.root.join("repo");
     let repo = repo.to_str().unwrap();
@@ -351,9 +365,18 @@ fn upgrade_hands_every_session_to_the_new_process_alive() {
     });
     let (_, scroll_before) = attach(&env, setup.port, &setup.scroll);
     let (_, sleeper_before) = attach(&env, setup.port, &setup.sleeper);
-    // A browser attached across the handoff: its socket ends with the old
-    // process, and it reconnects to the new one.
+    // A browser attached across the handoff: its socket closes with 1012
+    // (service restart), and it reconnects to the new one.
     let (mut open, _) = attach(&env, setup.port, &setup.scroll);
+    // A scripted wait across the handoff: it reconnects and still sees
+    // the turn finish.
+    let waiting = env
+        .command(&["wait", &setup.agent, "--until", "done", "--timeout", "60"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
     let records_before: Vec<(Value, Value)> = env.state_doc()["sessions"]
         .as_array()
         .unwrap()
@@ -375,14 +398,29 @@ fn upgrade_hands_every_session_to_the_new_process_alive() {
     assert!(!alive(old_pid), "the old process exited");
     assert_eq!(env.port(), setup.port, "same port");
     assert!(healthz(setup.port));
-    // The old socket closed with the old process.
-    let closed = loop {
+    // The old socket was closed for the restart, not dropped.
+    let code = loop {
         match open.read() {
-            Ok(tungstenite::Message::Close(_)) | Err(_) => break true,
+            Ok(tungstenite::Message::Close(frame)) => break frame.map(|f| u16::from(f.code)),
             Ok(_) => {}
+            Err(e) => panic!("the socket was dropped without a close: {e}"),
         }
     };
-    assert!(closed);
+    assert_eq!(code, Some(1012));
+    let new_env = std::fs::read(format!("/proc/{new_pid}/environ")).unwrap();
+    assert!(
+        String::from_utf8_lossy(&new_env).contains("HUB_ENV_MARKER=from-the-first-hub"),
+        "the new hub runs in the old one's environment"
+    );
+    assert_eq!(env.status()["public_urls"], json!(["https://box.example"]));
+    let status = env.ok(&["status"]);
+    assert!(
+        status.contains(&format!(
+            "version:    flywheel {}",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{status}"
+    );
 
     // The same processes, still running.
     assert!(alive(setup.sleeper_pid), "sleep survived");
@@ -417,6 +455,11 @@ fn upgrade_hands_every_session_to_the_new_process_alive() {
     wait_for("done", Duration::from_secs(5), || {
         matches!(agent_status(&env, &setup.agent).as_str(), "done" | "idle")
     });
+    let waited = waiting.wait_with_output().unwrap();
+    assert!(
+        waited.status.success(),
+        "fw hub wait across the upgrade: {waited:?}"
+    );
     let wrong = Command::new(env!("CARGO_BIN_EXE_fw"))
         .args(["hub", "report", "--source", "claude", "--event", "Stop"])
         .env("FLYWHEEL_HUB_SESSION", &setup.agent)
@@ -571,41 +614,121 @@ fn a_refused_or_abandoned_handoff_leaves_the_old_hub_serving() {
     wait_for("the thaw", Duration::from_secs(10), || healthz(setup.port));
     assert_still_serving(&env, &setup, old_pid, "failed");
 
-    // Input typed while frozen is held, not lost.
+    // A frozen hub closes its terminal sockets for the restart (1012)
+    // rather than taking input it could no longer hand over.
     let (mut socket, _) = attach(&env, setup.port, &setup.scroll);
     let mut vanishing = FakeSuccessor::connect(&env);
     vanishing.take_offer();
-    socket
-        .send(tungstenite::Message::Text(
-            json!({"type": "input", "data": "echo held-$((3+4))\r"})
-                .to_string()
-                .into(),
-        ))
-        .unwrap();
+    let code = loop {
+        match socket.read() {
+            Ok(tungstenite::Message::Close(frame)) => break frame.map(|f| u16::from(f.code)),
+            Ok(_) => {}
+            Err(e) => panic!("the socket was dropped without a close: {e}"),
+        }
+    };
+    assert_eq!(code, Some(1012));
+    // Meanwhile a second handoff is refused as busy (never a restart).
+    let mut second = FakeSuccessor::connect(&env);
+    second.hello(1);
+    let refused = second.recv();
+    assert_eq!(refused["type"], "refused", "{refused}");
+    assert_eq!(refused["kind"], "busy", "{refused}");
     // The new hub dies before answering.
     drop(vanishing);
-    let mut seen = String::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !seen.contains("held-7") {
-        assert!(Instant::now() < deadline, "held input never ran: {seen:?}");
-        if let tungstenite::Message::Binary(bytes) = socket.read().unwrap() {
-            seen.push_str(&String::from_utf8_lossy(&bytes));
-        }
-    }
+    wait_for("the thaw", Duration::from_secs(10), || healthz(setup.port));
     assert_still_serving(&env, &setup, old_pid, "vanished");
 
-    // `upgrade` with a binary that cannot take over: refused (exit 4),
-    // nothing changes.
+    // The new hub dies after it said `resuming`: the old one rolls back
+    // (without typing held input a second time) and serves on.
+    let mut resuming = FakeSuccessor::connect(&env);
+    resuming.take_offer();
+    resuming.send(&json!({"type": "ready"}));
+    assert_eq!(resuming.recv()["type"], "commit");
+    resuming.send(&json!({"type": "resuming"}));
+    drop(resuming);
+    wait_for("the rollback", Duration::from_secs(10), || {
+        healthz(setup.port)
+    });
+    assert_still_serving(&env, &setup, old_pid, "resumed");
+
+    // A new hub that goes silent is given up on after the time it asked
+    // for, not the protocol's minute.
+    let mut silent = FakeSuccessor::connect(&env);
+    silent.send(&json!({
+        "type": "hello",
+        "protocol": 1,
+        "version": "test",
+        "pid": std::process::id(),
+        "step_secs": 5,
+    }));
+    let offer = silent.recv();
+    for _ in 0..offer["sessions"].as_u64().unwrap() {
+        silent.recv();
+    }
+    let frozen_at = Instant::now();
+    wait_for("the rollback", Duration::from_secs(20), || {
+        healthz(setup.port)
+    });
+    assert!(
+        frozen_at.elapsed() < Duration::from_secs(15),
+        "frozen for {:?}",
+        frozen_at.elapsed()
+    );
+    drop(silent);
+    assert_still_serving(&env, &setup, old_pid, "silent");
+
+    // `upgrade` with a flywheel from before live handoff: refused (exit
+    // 4), nothing changes.
     let stub = env.root.join("old-fw");
     write_script(
         &stub,
-        "#!/bin/sh\necho 'error: unexpected argument --handoff' >&2\nexit 2\n",
+        "#!/bin/sh\nif [ \"$*\" = 'hub start --help' ]; then\n  echo 'Usage: fw hub start [OPTIONS]'\n  echo '      --state-dir <DIR>'\n  exit 0\nfi\necho 'error: unexpected argument' >&2\nexit 2\n",
     );
     let upgraded = env.fw(&["upgrade", "--binary", stub.to_str().unwrap()]);
     assert_eq!(upgraded.status.code(), Some(4), "{upgraded:?}");
     let said = String::from_utf8_lossy(&upgraded.stderr);
+    assert!(said.contains("predates live handoff"), "{said}");
     assert!(said.contains("--allow-restart"), "{said}");
     assert_still_serving(&env, &setup, old_pid, "stub");
+
+    // A binary that is no flywheel at all: refused before anything is
+    // asked of the hub.
+    let upgraded = env.fw(&["upgrade", "--binary", "/bin/false"]);
+    assert_eq!(upgraded.status.code(), Some(1), "{upgraded:?}");
+    let said = String::from_utf8_lossy(&upgraded.stderr);
+    assert!(said.contains("not a flywheel binary"), "{said}");
+    assert!(said.contains("carries on"), "{said}");
+    assert_still_serving(&env, &setup, old_pid, "false");
+}
+
+#[test]
+fn a_restart_fallback_keeps_the_old_hubs_port_and_flags() {
+    let env = Env::new();
+    let setup = setup(&env);
+    let old_pid = env.status()["pid"].as_u64().unwrap();
+    // A hub that cannot hand off (one from before live handoff answers no
+    // handoff socket).
+    std::fs::remove_file(env.state.join("handoff.sock")).unwrap();
+    let refused = env.fw(&["upgrade", "--binary", env!("CARGO_BIN_EXE_fw")]);
+    assert_eq!(refused.status.code(), Some(4), "{refused:?}");
+    assert_eq!(env.status()["pid"].as_u64(), Some(old_pid));
+    let restarted = env.fw(&[
+        "upgrade",
+        "--binary",
+        env!("CARGO_BIN_EXE_fw"),
+        "--allow-restart",
+    ]);
+    assert!(restarted.status.success(), "{restarted:?}");
+    let status = env.status();
+    assert_ne!(status["pid"].as_u64(), Some(old_pid));
+    assert_eq!(
+        env.port(),
+        setup.port,
+        "same port (it was picked by --port 0)"
+    );
+    assert_eq!(status["public_urls"], json!(["https://box.example"]));
+    // Restored (a shell comes back; its process is new).
+    env.read_until(&setup.scroll, "$");
 }
 
 #[test]

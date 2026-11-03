@@ -29,6 +29,20 @@ pub const TIMED_OUT: i32 = 124;
 
 /// How long the first check may take whatever `--timeout` says.
 pub const CHECK_FLOOR: Duration = Duration::from_secs(1);
+/// How long a wait keeps reconnecting after the hub closed its events
+/// socket for a restart (`fw hub upgrade`).
+const RECONNECT_WINDOW: Duration = Duration::from_secs(120);
+
+/// Why the events socket ended.
+enum Ended {
+    /// The hub process is being replaced (close code 1012): reconnect.
+    Restart,
+    Failed(String),
+}
+
+fn events_path() -> String {
+    format!("/api/events?client={}", client_id("wait"))
+}
 
 /// What to wait for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -214,13 +228,14 @@ async fn run(
 ) -> Outcome {
     let setup = async {
         // Subscribe before reading the record, so no change falls between.
-        let mut socket = endpoint
-            .websocket(&format!("/api/events?client={}", client_id("wait")))
-            .await?;
+        let mut socket = endpoint.websocket(&events_path()).await?;
         let sessions = endpoint.sessions().await?;
         // The hub's first message is every session's status for this client.
         let snapshot = loop {
-            match next_event(&mut socket).await? {
+            match next_event(&mut socket).await.map_err(|e| match e {
+                Ended::Restart => "the hub restarted while the wait was starting".to_owned(),
+                Ended::Failed(message) => message,
+            })? {
                 Some(event) if event.get("type").and_then(Value::as_str) == Some("snapshot") => {
                     break event;
                 }
@@ -304,7 +319,26 @@ async fn watch(
         let event = match next_event(socket).await {
             Ok(Some(event)) => event,
             Ok(None) => continue,
-            Err(message) => return Outcome::Failed(message),
+            Err(Ended::Failed(message)) => return Outcome::Failed(message),
+            Err(Ended::Restart) => {
+                // A live handoff: the session carries on in the next hub
+                // process; its first message (a snapshot) and a re-read
+                // record catch up on what happened meanwhile.
+                match reconnect(endpoint, id).await {
+                    Ok((fresh, Some(read))) => {
+                        *socket = fresh;
+                        *record = read;
+                    }
+                    Ok((_, None)) => {
+                        return Outcome::Failed(format!("session {} was removed", tracker.name));
+                    }
+                    Err(message) => return Outcome::Failed(message),
+                }
+                if let Some(outcome) = tracker.on_record(record, false) {
+                    return outcome;
+                }
+                continue;
+            }
         };
         let reread = match event.get("type").and_then(Value::as_str) {
             Some("snapshot") => {
@@ -340,23 +374,57 @@ async fn watch(
     }
 }
 
+/// Connect the events socket again after a restart and re-read session
+/// `id` (`None`: removed), retrying while the next hub process comes up
+/// (the frozen one answers 503 meanwhile).
+async fn reconnect(endpoint: &Endpoint, id: &str) -> Result<(Socket, Option<Value>), String> {
+    let deadline = Instant::now() + RECONNECT_WINDOW;
+    let mut delay = Duration::from_millis(200);
+    loop {
+        let attempt = async {
+            let socket = endpoint.websocket(&events_path()).await?;
+            let record = refresh(endpoint, id).await?;
+            Ok::<_, String>((socket, record))
+        };
+        match attempt.await {
+            Ok(done) => return Ok(done),
+            Err(message) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "the hub restarted and did not come back within {}s: {message}",
+                    RECONNECT_WINDOW.as_secs()
+                ));
+            }
+            Err(_) => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
 /// The next JSON event of the events socket (`None`: not one), or why the
 /// socket ended.
-async fn next_event(socket: &mut Socket) -> Result<Option<Value>, String> {
+async fn next_event(socket: &mut Socket) -> Result<Option<Value>, Ended> {
     let text = match socket.next().await {
         Some(Ok(Message::Text(text))) => text,
         Some(Ok(Message::Close(frame))) => {
+            if frame
+                .as_ref()
+                .is_some_and(|f| u16::from(f.code) == crate::server::WS_CLOSE_RESTART)
+            {
+                return Err(Ended::Restart);
+            }
             let why = frame
                 .map(|f| f.reason.to_string())
                 .filter(|r| !r.is_empty());
-            return Err(format!(
+            return Err(Ended::Failed(format!(
                 "the hub closed the events connection{}",
                 why.map(|w| format!(": {w}")).unwrap_or_default()
-            ));
+            )));
         }
         Some(Ok(_)) => return Ok(None),
-        Some(Err(e)) => return Err(format!("events connection failed: {e}")),
-        None => return Err("the hub closed the events connection".into()),
+        Some(Err(e)) => return Err(Ended::Failed(format!("events connection failed: {e}"))),
+        None => return Err(Ended::Failed("the hub closed the events connection".into())),
     };
     Ok(serde_json::from_str::<Value>(text.as_str()).ok())
 }

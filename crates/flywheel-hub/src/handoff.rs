@@ -22,16 +22,24 @@
 //!    input) + its PTY master and pidfd.
 //! 4. The new hub builds itself from the state file and these, every
 //!    session paused, and answers `ready` (or `failed`).
-//! 5. old -> new `commit`; the new hub resumes the sessions, serves, and
-//!    answers `started`; the old process exits without touching any
-//!    session (or the socket files, now the new hub's).
+//! 5. old -> new `commit`; the new hub says `resuming`, resumes the
+//!    sessions, serves, and answers `started`; the old process exits
+//!    without touching any session (or the socket files, now the new
+//!    hub's).
 //!
 //! Any failure before `commit` (a refusal, an error, a timeout, the new
 //! hub dying) thaws the old hub: it carries on serving as if nothing
 //! happened. After `commit` the old hub exits once the new one has
-//! started or died -- or rolls back when the new one died before
-//! starting. The new hub, finding the old one gone after `ready`, takes
-//! over (the descriptors it holds are then the only ones).
+//! started -- or rolls back when the new one died before starting
+//! (dropping the held input when it had said `resuming`: it may have
+//! been typed already, and is never typed twice). The new hub, finding
+//! the old one gone after `ready`, takes over (the descriptors it holds
+//! are then the only ones).
+//!
+//! From the freeze on, the old hub closes its WebSockets with 1012
+//! (service restart; clients reconnect) and refuses input it could no
+//! longer hand over ([`crate::pty::WriteOutcome::HandingOff`]): nothing
+//! typed is silently lost.
 //!
 //! Children of the old hub are not the new one's: their exit is seen
 //! through the pidfd (Linux), else by polling the pid, and recorded with an
@@ -40,7 +48,8 @@
 
 use crate::hub::Hub;
 use crate::hub::handoff::{Frozen, Incoming, IncomingSession};
-use crate::pty::handoff::{Adopt, PtyExport, PtyMeta, process_alive};
+pub(crate) use crate::pty::handoff::process_alive;
+use crate::pty::handoff::{Adopt, PtyExport, PtyMeta};
 use crate::status::handoff::BoardExport;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -59,8 +68,14 @@ pub const PROTOCOL: u32 = 1;
 /// The socket's name in the state dir.
 pub const SOCKET_FILE: &str = "handoff.sock";
 /// `fw hub serve --handoff` exit code when the running hub refused the
-/// handoff (version skew, systemd) -- nothing changed.
+/// handoff as incompatible (version skew) -- nothing changed; a restart
+/// (`--allow-restart`) is the way forward.
 pub const EXIT_REFUSED: i32 = 4;
+/// `fw hub serve --handoff` exit code when the running hub refused the
+/// handoff for now (another handoff under way, requests or sessions that
+/// would not settle, a systemd service) -- nothing changed; never a
+/// reason to restart instead.
+pub const EXIT_BUSY: i32 = 5;
 /// `fw hub serve --handoff` exit code when no hub was there to hand off.
 pub const EXIT_NO_HUB: i32 = 3;
 
@@ -72,8 +87,11 @@ const MAX_BIN: usize = 512 * 1024 * 1024;
 const MAX_FDS: usize = 4;
 /// How long the old hub may take to freeze.
 const FREEZE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long either side waits for the other's next step.
+/// How long either side waits for the other's next step (the new hub may
+/// ask for less: `fw hub upgrade --timeout`).
 const STEP_TIMEOUT: Duration = Duration::from_secs(60);
+/// The least step time a new hub may ask for.
+const MIN_STEP_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a client may take to say what it wants.
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -93,9 +111,15 @@ enum Msg {
         protocol: u32,
         version: String,
         pid: u32,
+        /// How long the old hub may stay frozen waiting for each of this
+        /// hub's steps, in seconds (capped at [`STEP_TIMEOUT`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        step_secs: Option<u64>,
     },
     Refused {
         reason: String,
+        #[serde(default)]
+        kind: Refusal,
     },
     /// Descriptors: the listening TCP socket, the serve lock, and (when
     /// `report_path`) the report socket.
@@ -120,6 +144,9 @@ enum Msg {
         reason: String,
     },
     Commit,
+    /// The new hub is about to resume the sessions (from here it may have
+    /// written their held input).
+    Resuming,
     Abort {
         reason: String,
     },
@@ -139,9 +166,27 @@ pub struct Description {
     /// Its `serve` options (absolute state dir included).
     pub serve_args: Vec<String>,
     pub log_file: Option<PathBuf>,
+    /// The program it runs (`fw hub status`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<PathBuf>,
     /// Why it cannot hand off at all (a systemd service), if so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unsupported: Option<String>,
+}
+
+/// Why a running hub refused a handoff.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Refusal {
+    /// The two hubs speak different protocol versions: only a restart
+    /// gets the new binary in.
+    Protocol,
+    /// Not now: another handoff is under way, or requests or sessions
+    /// would not settle (retry).
+    #[default]
+    Busy,
+    /// Never by handoff: a systemd service (restart the unit).
+    Unsupported,
 }
 
 /// Handoff failures.
@@ -152,8 +197,8 @@ pub enum HandoffError {
     #[error("{0}")]
     NoHub(String),
     /// The running hub refused; it carries on unchanged.
-    #[error("the running hub refused the handoff: {0}")]
-    Refused(String),
+    #[error("the running hub refused the handoff: {reason}")]
+    Refused { reason: String, kind: Refusal },
     #[error("{0}")]
     Failed(String),
 }
@@ -398,6 +443,10 @@ struct GateInner {
     in_flight: AtomicUsize,
     /// A handoff is under way (a shutdown waits for it) or done.
     handing_off: tokio::sync::watch::Sender<bool>,
+    /// The hub is frozen for a handoff: open WebSockets close with
+    /// [`crate::server::WS_CLOSE_RESTART`] so clients reconnect (to the
+    /// new process, or to this one after a rollback).
+    restarting: tokio::sync::watch::Sender<bool>,
 }
 
 impl Default for Gate {
@@ -413,6 +462,7 @@ impl Gate {
                 open: tokio::sync::watch::Sender::new(true),
                 in_flight: AtomicUsize::new(0),
                 handing_off: tokio::sync::watch::Sender::new(false),
+                restarting: tokio::sync::watch::Sender::new(false),
             }),
         }
     }
@@ -427,6 +477,17 @@ impl Gate {
 
     fn set_handing_off(&self, on: bool) {
         self.inner.handing_off.send_replace(on);
+    }
+
+    fn set_restarting(&self, on: bool) {
+        self.inner.restarting.send_replace(on);
+    }
+
+    /// Resolves once a handoff has frozen the hub (a WebSocket then closes
+    /// with [`crate::server::WS_CLOSE_RESTART`]).
+    pub async fn restarting(&self) {
+        let mut rx = self.inner.restarting.subscribe();
+        let _ = rx.wait_for(|on| *on).await;
     }
 
     /// Resolves once no handoff is under way.
@@ -459,10 +520,11 @@ impl Drop for InFlight {
 }
 
 /// Middleware: while a handoff has the hub frozen, refuse requests (503,
-/// retry in a second: the new hub answers then); count the others.
+/// retry in a second: the new hub answers then); count the others, and
+/// hand them the [`Gate`] (an extension: WebSockets watch it).
 pub async fn gate_requests(
     axum::extract::State(gate): axum::extract::State<Gate>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -477,6 +539,7 @@ pub async fn gate_requests(
         )
             .into_response();
     }
+    request.extensions_mut().insert(gate.clone());
     let response = next.run(request).await;
     drop(guard);
     response
@@ -625,6 +688,32 @@ fn systemd_service(detached: bool) -> Option<String> {
     })
 }
 
+/// The systemd unit process `pid` is the main process of, when it is one
+/// (Linux: `INVOCATION_ID` in its environment, systemd its parent, the
+/// unit from its cgroup) -- for a hub that cannot say so itself.
+pub fn systemd_unit(pid: u32) -> Option<String> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    if !environ
+        .split(|&b| b == 0)
+        .any(|entry| entry.starts_with(b"INVOCATION_ID="))
+    {
+        return None;
+    }
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid ...`: comm may hold spaces and parentheses.
+    let ppid = stat.rsplit_once(')')?.1.split_whitespace().nth(1)?;
+    let comm = std::fs::read_to_string(format!("/proc/{ppid}/comm")).ok()?;
+    if comm.trim() != "systemd" {
+        return None;
+    }
+    let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    cgroup
+        .lines()
+        .filter_map(|line| line.rsplit('/').next())
+        .find(|unit| unit.ends_with(".service"))
+        .map(str::to_owned)
+}
+
 fn serve_peer(source: &Source, busy: &Mutex<()>, stream: &UnixStream) {
     if let Err(e) = same_user(stream) {
         eprintln!("fw hub: handoff connection refused: {e}");
@@ -643,6 +732,7 @@ fn serve_peer(source: &Source, busy: &Mutex<()>, stream: &UnixStream) {
                 pid: std::process::id(),
                 serve_args: source.serve_args.clone(),
                 log_file: source.log_file.clone(),
+                binary: std::env::current_exe().ok(),
                 unsupported: systemd_service(source.log_file.is_some()),
             };
             let _ = send_frame(stream, &Msg::Description(description), &[], &[]);
@@ -651,26 +741,33 @@ fn serve_peer(source: &Source, busy: &Mutex<()>, stream: &UnixStream) {
             protocol,
             version: theirs,
             pid,
+            step_secs,
         } => {
-            let refuse = |reason: String| {
+            let refuse = |reason: String, kind: Refusal| {
                 eprintln!("fw hub: refused a handoff to pid {pid}: {reason}");
-                let _ = send_frame(stream, &Msg::Refused { reason }, &[], &[]);
+                let _ = send_frame(stream, &Msg::Refused { reason, kind }, &[], &[]);
             };
             if protocol != PROTOCOL {
-                return refuse(format!(
-                    "this hub (pid {}, flywheel {}) speaks handoff protocol {PROTOCOL}; the new one \
+                return refuse(
+                    format!(
+                        "this hub (pid {}, flywheel {}) speaks handoff protocol {PROTOCOL}; the new one \
                      (flywheel {theirs}) speaks {protocol}",
-                    std::process::id(),
-                    version()
-                ));
+                        std::process::id(),
+                        version()
+                    ),
+                    Refusal::Protocol,
+                );
             }
             if let Some(reason) = systemd_service(source.log_file.is_some()) {
-                return refuse(reason);
+                return refuse(reason, Refusal::Unsupported);
             }
             let Ok(_one) = busy.try_lock() else {
-                return refuse("another handoff is under way".into());
+                return refuse("another handoff is under way".into(), Refusal::Busy);
             };
-            hand_off(source, stream, pid);
+            let step = step_secs.map_or(STEP_TIMEOUT, |secs| {
+                Duration::from_secs(secs).clamp(MIN_STEP_TIMEOUT, STEP_TIMEOUT)
+            });
+            hand_off(source, stream, pid, step);
         }
         _ => {}
     }
@@ -679,14 +776,16 @@ fn serve_peer(source: &Source, busy: &Mutex<()>, stream: &UnixStream) {
 /// Run one handoff to the hub at the other end of `stream` (pid `peer`).
 /// Returns only when it failed and this hub carries on; on success the
 /// process exits.
-fn hand_off(source: &Source, stream: &UnixStream, peer: u32) {
+fn hand_off(source: &Source, stream: &UnixStream, peer: u32, step: Duration) {
     eprintln!("fw hub: handing off to pid {peer}");
     source.gate.set_handing_off(true);
     source.gate.set_open(false);
-    let rollback = |reason: &str, frozen: bool| {
+    // `resumed`: the new hub may have written the held input already.
+    let rollback = |reason: &str, frozen: bool, resumed: bool| {
         if frozen {
-            source.hub.handoff_thaw();
+            source.hub.handoff_thaw(resumed);
         }
+        source.gate.set_restarting(false);
         source.gate.set_open(true);
         source.gate.set_handing_off(false);
         eprintln!("fw hub: handoff to pid {peer} failed, still serving: {reason}");
@@ -697,12 +796,16 @@ fn hand_off(source: &Source, stream: &UnixStream, peer: u32) {
             stream,
             &Msg::Refused {
                 reason: reason.into(),
+                kind: Refusal::Busy,
             },
             &[],
             &[],
         );
-        return rollback(reason, false);
+        return rollback(reason, false, false);
     }
+    // Clients reconnect (and wait in the backlog) instead of typing into
+    // a hub that is about to go.
+    source.gate.set_restarting(true);
     let frozen = match source.hub.handoff_freeze(FREEZE_TIMEOUT) {
         Ok(frozen) => frozen,
         Err(reason) => {
@@ -710,22 +813,23 @@ fn hand_off(source: &Source, stream: &UnixStream, peer: u32) {
                 stream,
                 &Msg::Refused {
                     reason: reason.clone(),
+                    kind: Refusal::Busy,
                 },
                 &[],
                 &[],
             );
             // The freeze thawed what it had frozen.
-            return rollback(&reason, false);
+            return rollback(&reason, false, false);
         }
     };
     if let Err(e) = send_offer(source, stream, &frozen) {
-        return rollback(&format!("sending the sessions: {e}"), true);
+        return rollback(&format!("sending the sessions: {e}"), true, false);
     }
-    let _ = stream.set_read_timeout(Some(STEP_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(step));
     match recv_frame(stream) {
         Ok((Msg::Ready, _, _)) => {}
         Ok((Msg::Failed { reason }, _, _)) => {
-            return rollback(&format!("the new hub failed: {reason}"), true);
+            return rollback(&format!("the new hub failed: {reason}"), true, false);
         }
         Ok((other, _, _)) => {
             let reason = format!("unexpected answer {other:?}");
@@ -737,10 +841,10 @@ fn hand_off(source: &Source, stream: &UnixStream, peer: u32) {
                 &[],
                 &[],
             );
-            return rollback(&reason, true);
+            return rollback(&reason, true, false);
         }
         Err(e) => {
-            let reason = format!("no answer from the new hub: {e}");
+            let reason = format!("no answer from the new hub within {}s: {e}", step.as_secs());
             let _ = send_frame(
                 stream,
                 &Msg::Abort {
@@ -749,30 +853,35 @@ fn hand_off(source: &Source, stream: &UnixStream, peer: u32) {
                 &[],
                 &[],
             );
-            return rollback(&reason, true);
+            return rollback(&reason, true, false);
         }
     }
     if let Err(e) = send_frame(stream, &Msg::Commit, &[], &[]) {
-        return rollback(&format!("the new hub went away: {e}"), true);
+        return rollback(&format!("the new hub went away: {e}"), true, false);
     }
     // From here the new hub may be reading the sessions. It closes the
     // link without `started` only when it never committed (it gave up
-    // waiting) or died: resume then. A new hub still silent at the timeout
-    // may be mid-commit: never resume while it lives.
-    let started = match recv_frame(stream) {
-        Ok((Msg::Started { .. }, _, _)) => true,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            process_alive(peer)
+    // waiting) or died: resume then -- without the held input once it said
+    // `resuming`. A new hub still silent at the timeout may be mid-commit:
+    // never resume while it lives.
+    let mut resumed = false;
+    let started = loop {
+        match recv_frame(stream) {
+            Ok((Msg::Resuming, _, _)) => resumed = true,
+            Ok((Msg::Started { .. }, _, _)) => break true,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break process_alive(peer);
+            }
+            _ => break false,
         }
-        _ => false,
     };
     if !started {
-        return rollback("the new hub died while starting", true);
+        return rollback("the new hub died while starting", true, resumed);
     }
     source.hub.handoff_release();
     eprintln!(
@@ -857,9 +966,14 @@ pub struct Received {
 
 /// Ask the hub serving `state_dir` how it runs (`fw hub upgrade`).
 pub fn describe(state_dir: &Path) -> Result<Description, HandoffError> {
+    describe_within(state_dir, FIRST_FRAME_TIMEOUT)
+}
+
+/// [`describe`], waiting at most `timeout` for the answer.
+pub fn describe_within(state_dir: &Path, timeout: Duration) -> Result<Description, HandoffError> {
     let stream = connect(state_dir)?;
-    let _ = stream.set_read_timeout(Some(FIRST_FRAME_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(FIRST_FRAME_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
     send_frame(&stream, &Msg::Describe, &[], &[]).map_err(io_failed("asking the hub"))?;
     match recv_frame(&stream) {
         Ok((Msg::Description(description), _, _)) => Ok(description),
@@ -887,7 +1001,11 @@ fn connect(state_dir: &Path) -> Result<UnixStream, HandoffError> {
 /// Take over from the hub serving `state_dir`: say hello and receive its
 /// sockets, state, and sessions. The old hub is frozen from here until
 /// [`Received::ready`] (or the connection drops: it then thaws).
-pub fn receive(state_dir: &Path, scrollback_lines: usize) -> Result<Received, HandoffError> {
+pub fn receive(
+    state_dir: &Path,
+    scrollback_lines: usize,
+    step: Option<Duration>,
+) -> Result<Received, HandoffError> {
     let stream = connect(state_dir)?;
     let _ = stream.set_write_timeout(Some(STEP_TIMEOUT));
     let _ = stream.set_read_timeout(Some(STEP_TIMEOUT));
@@ -897,6 +1015,7 @@ pub fn receive(state_dir: &Path, scrollback_lines: usize) -> Result<Received, Ha
             protocol: PROTOCOL,
             version: version(),
             pid: std::process::id(),
+            step_secs: step.map(|step| step.as_secs()),
         },
         &[],
         &[],
@@ -912,7 +1031,7 @@ pub fn receive(state_dir: &Path, scrollback_lines: usize) -> Result<Received, Ha
             sessions,
             ..
         } => (version, pid, report_path, board, sessions),
-        Msg::Refused { reason } => return Err(HandoffError::Refused(reason)),
+        Msg::Refused { reason, kind } => return Err(HandoffError::Refused { reason, kind }),
         other => {
             return Err(HandoffError::Failed(format!(
                 "unexpected message from the running hub: {other:?}"
@@ -1002,6 +1121,15 @@ pub struct Link {
 }
 
 impl Received {
+    /// How many of the sessions' processes still ran.
+    pub fn running(&self) -> usize {
+        self.incoming
+            .sessions
+            .iter()
+            .filter(|s| s.adopt.export.meta.exit.is_none())
+            .count()
+    }
+
     /// Split off what [`Hub`] construction consumes.
     pub(crate) fn take(self) -> (Incoming, std::net::TcpListener, Link) {
         (
@@ -1058,6 +1186,7 @@ impl Link {
                 );
             }
         }
+        let _ = send_frame(&self.stream, &Msg::Resuming, &[], &[]);
         hub.handoff_commit();
         let _ = send_frame(
             &self.stream,

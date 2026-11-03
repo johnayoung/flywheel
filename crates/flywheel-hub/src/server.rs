@@ -32,7 +32,8 @@
 //! Events WebSocket (`GET /api/events?client=<id>`), hub-wide, text JSON:
 //!
 //! * server -> client: `{"type":"snapshot","sessions":{id:status},
-//!   "workspaces":{id:rollup}}` on connect (and after falling behind);
+//!   "workspaces":{id:rollup},"version":V}` on connect (and after falling
+//!   behind; `version`: the serving flywheel's);
 //!   `{"type":"status","session_id","status":status|null,"workspace_id",
 //!   "workspace_status"}` on each change; `{"type":"sessions"}` when the
 //!   session or workspace list changed (re-list over REST);
@@ -106,6 +107,10 @@ const MAX_SCREEN_LINES: usize = 100_000;
 /// WebSocket close code sent when the token rotates (the client must log
 /// in again).
 pub const WS_CLOSE_ROTATED: u16 = 4001;
+/// WebSocket close code when the hub process is being replaced (a live
+/// handoff, `fw hub upgrade`): RFC 6455 "service restart". Reconnect: the
+/// sessions carry on.
+pub const WS_CLOSE_RESTART: u16 = 1012;
 /// WebSocket close code sent when the browser login that opened the socket
 /// ended (logout, expiry, eviction).
 pub const WS_CLOSE_SIGNED_OUT: u16 = 4002;
@@ -1213,6 +1218,10 @@ fn input_refused(outcome: WriteOutcome, label: &str) -> Option<Response> {
             StatusCode::CONFLICT,
             "input dropped: the terminal is not reading its input",
         )),
+        WriteOutcome::HandingOff => Some(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "input dropped: the hub is handing over to a new process; retry",
+        )),
     }
 }
 
@@ -1297,11 +1306,13 @@ async fn session_ws(
     client: Client,
     headers: HeaderMap,
     credential: Option<axum::Extension<CredentialWatch>>,
+    gate: Option<axum::Extension<crate::handoff::Gate>>,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     if !origin_ok(&headers, client, &app.options) {
         return error_response(StatusCode::FORBIDDEN, "cross-origin WebSocket refused");
     }
+    let gate = gate.map(|axum::Extension(gate)| gate);
     let Some(session) = app.hub.live_session(&id) else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -1321,7 +1332,15 @@ async fn session_ws(
     let hub = Arc::clone(&app.hub);
     ws.max_message_size(WS_MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
-            pump(socket, Arc::clone(&session), shutdown, credential, &hub).await;
+            pump(
+                socket,
+                Arc::clone(&session),
+                shutdown,
+                credential,
+                gate,
+                &hub,
+            )
+            .await;
             // One viewer fewer: panes that follow another's size may now be
             // the only viewer and fit themselves (re-list for `live.clients`).
             drop(session);
@@ -1410,10 +1429,15 @@ async fn send_attachment(
 async fn forward_input(socket: &mut WebSocket, session: &PtySession, bytes: Vec<u8>) -> bool {
     match session.write(bytes) {
         WriteOutcome::Queued | WriteOutcome::Closed => true,
-        WriteOutcome::Backlogged => {
+        outcome @ (WriteOutcome::Backlogged | WriteOutcome::HandingOff) => {
+            let message = if outcome == WriteOutcome::HandingOff {
+                "input dropped: the hub is handing over to a new process; type it again once reconnected"
+            } else {
+                "input dropped: the terminal is not reading its input"
+            };
             let error = json!({
                 "type": "error",
-                "message": "input dropped: the terminal is not reading its input",
+                "message": message,
             });
             socket
                 .send(Message::Text(error.to_string().into()))
@@ -1428,6 +1452,7 @@ async fn pump(
     session: Arc<PtySession>,
     mut shutdown: watch::Receiver<bool>,
     mut credential: CredentialWatch,
+    gate: Option<crate::handoff::Gate>,
     hub: &Hub,
 ) {
     let Some(attachment) = attach(&session, SNAPSHOT_HISTORY_BYTES).await else {
@@ -1531,6 +1556,10 @@ async fn pump(
                 let _ = socket.send(Message::Close(Some(close))).await;
                 break;
             }
+            () = handoff_restarting(gate.as_ref()) => {
+                close_for_restart(&mut socket).await;
+                break;
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     let _ = socket.send(Message::Close(None)).await;
@@ -1539,6 +1568,25 @@ async fn pump(
             }
         }
     }
+}
+
+/// Resolves once a live handoff froze the hub (never without a gate).
+async fn handoff_restarting(gate: Option<&crate::handoff::Gate>) {
+    match gate {
+        Some(gate) => gate.restarting().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Close a WebSocket for a live handoff: clients reconnect to whichever
+/// process serves next.
+async fn close_for_restart(socket: &mut WebSocket) {
+    let close = CloseFrame {
+        code: WS_CLOSE_RESTART,
+        reason: "the hub is restarting (upgrade); reconnect".into(),
+    };
+    let _ = socket.send(Message::Close(Some(close))).await;
+    let _ = socket.flush().await;
 }
 
 // --- events -------------------------------------------------------------------
@@ -1563,11 +1611,13 @@ async fn events_ws(
     client: Client,
     headers: HeaderMap,
     credential: Option<axum::Extension<CredentialWatch>>,
+    gate: Option<axum::Extension<crate::handoff::Gate>>,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     if !origin_ok(&headers, client, &app.options) {
         return error_response(StatusCode::FORBIDDEN, "cross-origin WebSocket refused");
     }
+    let gate = gate.map(|axum::Extension(gate)| gate);
     let client = match query.client {
         Some(id) if valid_client_id(&id) => id,
         Some(_) => {
@@ -1590,8 +1640,9 @@ async fn events_ws(
         Some(axum::Extension(watch)) => watch,
         None => CredentialWatch::new(&app.hub),
     };
-    ws.max_message_size(64 * 1024)
-        .on_upgrade(move |socket| events_pump(socket, hub, client, shutdown, credential, flywheel))
+    ws.max_message_size(64 * 1024).on_upgrade(move |socket| {
+        events_pump(socket, hub, client, shutdown, credential, gate, flywheel)
+    })
 }
 
 #[derive(Deserialize)]
@@ -1628,6 +1679,7 @@ fn snapshot_message(hub: &Hub, client: &str) -> Message {
         "type": "snapshot",
         "sessions": snapshot.sessions,
         "workspaces": snapshot.workspaces,
+        "version": env!("CARGO_PKG_VERSION"),
     }))
 }
 
@@ -1654,6 +1706,7 @@ async fn events_pump(
     client: String,
     mut shutdown: watch::Receiver<bool>,
     mut credential: CredentialWatch,
+    gate: Option<crate::handoff::Gate>,
     mut flywheel: Option<broadcast::Receiver<crate::flywheel::FlywheelEvent>>,
 ) {
     let mut events = hub.subscribe();
@@ -1734,6 +1787,10 @@ async fn events_pump(
             }
             close = credential.revoked(&hub, &mut recheck) => {
                 let _ = socket.send(Message::Close(Some(close))).await;
+                break;
+            }
+            () = handoff_restarting(gate.as_ref()) => {
+                close_for_restart(&mut socket).await;
                 break;
             }
             changed = shutdown.changed() => {

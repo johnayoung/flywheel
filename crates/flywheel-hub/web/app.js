@@ -141,6 +141,10 @@
     rollup: {}, // workspace id -> most urgent agent status
     events: null, // the hub-wide events socket
     eventsRetry: 0,
+    // The events socket closed for a hub restart (1012); the version it served.
+    restarted: false,
+    hubVersion: null,
+    refreshRetry: null, // a failed refresh's retry while the events socket is up
     eventsTimer: null,
     poller: null, // REST polling, only while the events socket is down
     viewing: undefined, // last view sent on the events socket
@@ -326,6 +330,14 @@
       if (seq < state.refreshApplied) return;
       state.offline += 1;
       $("#offline").hidden = state.offline < 2;
+      // No poller runs while the events socket is up, and no push may come
+      // to retry (a request that met a hub mid-restart got a 503): retry.
+      if (state.events && !state.refreshRetry) {
+        state.refreshRetry = setTimeout(() => {
+          state.refreshRetry = null;
+          refresh(false).catch(() => {});
+        }, 1000);
+      }
       throw error;
     }
     if (seq < state.refreshApplied) return;
@@ -2026,6 +2038,13 @@
       if (message.type === "snapshot") {
         state.agent = message.sessions || {};
         state.rollup = message.workspaces || {};
+        if (state.restarted) {
+          // Back after a live handoff (`fw hub upgrade`, close 1012).
+          state.restarted = false;
+          const was = state.hubVersion && state.hubVersion !== message.version ? ` (was ${state.hubVersion})` : "";
+          commands.toast(`Hub upgraded to flywheel ${message.version}${was}; every session kept running.`, { timeout: 5000 });
+        }
+        if (message.version) state.hubVersion = message.version;
         renderStatus();
       } else if (message.type === "status") {
         notify.onStatus(message.session_id, state.agent[message.session_id], message.status);
@@ -2055,6 +2074,13 @@
       if (event.code === 4001 || event.code === 4002) {
         const why = event.code === 4001 ? "rotated" : "ended";
         window.location.replace("/?signed_out=" + why + window.location.hash);
+        return;
+      }
+      if (event.code === 1012) {
+        // The hub process is being replaced: back in a moment.
+        state.restarted = true;
+        state.eventsRetry = 0;
+        state.eventsTimer = setTimeout(connectEvents, 300);
         return;
       }
       startPolling();

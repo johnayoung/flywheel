@@ -88,7 +88,7 @@ impl Hub {
             }
         }
         if !reports_idle || !stuck.is_empty() {
-            self.handoff_thaw();
+            self.handoff_thaw(false);
             return Err(if reports_idle {
                 format!(
                     "session {} did not pause within {}s",
@@ -115,12 +115,18 @@ impl Hub {
     }
 
     /// Undo [`Hub::handoff_freeze`] (also safe after a partial freeze).
-    pub(crate) fn handoff_thaw(self: &Arc<Self>) {
+    /// `forget_held`: the new hub may already have written the input held
+    /// during the freeze (it said `resuming`), so drop it rather than type
+    /// it twice.
+    pub(crate) fn handoff_thaw(self: &Arc<Self>, forget_held: bool) {
         if let Err(e) = self.store().set_read_only(false) {
             eprintln!("fw hub: {e}");
         }
         let live: Vec<Arc<PtySession>> = self.live().values().cloned().collect();
         for session in live {
+            if forget_held {
+                session.handoff_forget_held();
+            }
             session.resume();
         }
         if let Some(server) = &*self.report.lock().unwrap_or_else(PoisonError::into_inner) {

@@ -397,12 +397,18 @@ pub(crate) fn status(args: &StatusArgs, out: &mut dyn Write, err: &mut dyn Write
         }
     };
     let counts = session_counts(&sessions);
+    // Which build serves (it changes under `fw hub upgrade`).
+    let build = crate::handoff::describe_within(&dir, PROBE_TIMEOUT).ok();
+    let version = build.as_ref().map(|d| d.version.clone());
+    let binary = build.and_then(|d| d.binary);
     if args.json {
         let by_state: serde_json::Map<String, Value> =
             counts.iter().map(|(k, n)| (k.clone(), json!(n))).collect();
         let body = json!({
             "running": true,
             "pid": info.pid,
+            "version": version,
+            "binary": binary,
             "url": local_url(&info),
             "listen": info.listen.to_string(),
             "public_urls": info.public_urls,
@@ -423,6 +429,13 @@ pub(crate) fn status(args: &StatusArgs, out: &mut dyn Write, err: &mut dyn Write
     }
     let up = uptime.map_or_else(|| "unknown".to_owned(), human_duration);
     let _ = writeln!(out, "flywheel hub is running (pid {}, up {up})", info.pid);
+    if let Some(version) = &version {
+        let at = binary
+            .as_ref()
+            .map(|b| format!(" ({})", b.display()))
+            .unwrap_or_default();
+        let _ = writeln!(out, "  version:    flywheel {version}{at}");
+    }
     let _ = writeln!(out, "  url:        {}", local_url(&info));
     for url in &info.public_urls {
         let _ = writeln!(out, "  public:     {url}");

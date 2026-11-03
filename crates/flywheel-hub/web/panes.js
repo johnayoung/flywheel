@@ -312,6 +312,11 @@ window.FwHubPanes = function (ctx) {
         pane.sendTheme();
         pane.hideBanner();
         ctx.onAttached(pane);
+        // Typing when the hub restarted: carry on typing here.
+        if (pane.refocus) {
+          pane.refocus = false;
+          if (!document.querySelector("dialog[open]")) term.focus();
+        }
       };
       // The snapshot is drawn at the session's size: replay exactly its
       // bytes at that size, then size the terminal by the rules (a
@@ -381,6 +386,15 @@ window.FwHubPanes = function (ctx) {
           return;
         }
         if (pane.exited || pane.sessionId !== id || pane.disposed) return;
+        if (event.code === 1012) {
+          // A live handoff (`fw hub upgrade`): the session carries on in
+          // the next hub process; reconnect at once, quietly.
+          pane.refocus = host.contains(document.activeElement);
+          setLink("connecting", "hub restarting");
+          showBanner("The hub is restarting (upgrade); the session keeps running. Reconnecting…", [], true);
+          pane.retryTimer = setTimeout(() => pane.reconnectNow(), 300);
+          return;
+        }
         scheduleReconnect(id, event.code);
       };
     }

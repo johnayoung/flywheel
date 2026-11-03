@@ -166,9 +166,15 @@ pub(crate) struct Adopt {
 impl PtySession {
     /// The state to hand over. Call while paused (so nothing moves): the
     /// held input is copied, not taken, so a rolled-back handoff resumes
-    /// with it.
+    /// with it. From here until [`PtySession::resume`] input is refused
+    /// ([`WriteOutcome::HandingOff`](super::WriteOutcome::HandingOff)):
+    /// what is typed after the copy would reach neither hub.
     pub(crate) fn handoff_export(&self) -> PtyExport {
-        let held_input = self.queue.pause_state().held.clone();
+        let held_input = {
+            let mut pause = self.queue.pause_state();
+            pause.sealed = true;
+            pause.held.clone()
+        };
         let mut shared = self.lock();
         PtyExport {
             meta: PtyMeta {
@@ -181,6 +187,15 @@ impl PtySession {
             snapshot: shared.screen.snapshot(usize::MAX),
             held_input,
         }
+    }
+
+    /// Drop the held input (a rollback after the new hub may already have
+    /// written it: never type it twice).
+    pub(crate) fn handoff_forget_held(&self) {
+        let mut pause = self.queue.pause_state();
+        let len = pause.held.len();
+        pause.held.clear();
+        self.queue.queued.fetch_sub(len, Ordering::AcqRel);
     }
 
     /// The master's descriptor (valid while the session lives).
@@ -325,9 +340,36 @@ mod tests {
         thread::sleep(Duration::from_millis(300));
         assert!(!screen_has_now(&session, "one-two"));
         assert_eq!(session.handoff_export().held_input, b"echo one-two\r");
+        // Exported: what is typed now would reach neither hub.
+        assert_eq!(session.write(b"lost".to_vec()), WriteOutcome::HandingOff);
+        assert_eq!(session.queued_input(), b"echo one-two\r".len());
         session.resume();
         assert!(screen_has(&session, "one-two"));
         assert_eq!(session.queued_input(), 0);
+        session.kill(Duration::ZERO);
+        session.release();
+    }
+
+    #[test]
+    fn a_rollback_after_the_new_hub_resumed_never_types_held_input_twice() {
+        let session = shell();
+        assert!(screen_has(&session, "$"));
+        assert!(session.pause(Duration::from_secs(5)));
+        assert_eq!(
+            session.write(b"echo twice-$((1+1))\r".to_vec()),
+            WriteOutcome::Queued
+        );
+        assert!(!session.handoff_export().held_input.is_empty());
+        // The new hub said `resuming` (it may have typed it), then died.
+        session.handoff_forget_held();
+        assert_eq!(session.queued_input(), 0);
+        session.resume();
+        assert_eq!(
+            session.write(b"echo after\r".to_vec()),
+            WriteOutcome::Queued
+        );
+        assert!(screen_has(&session, "after"));
+        assert!(!screen_has_now(&session, "twice-2"));
         session.kill(Duration::ZERO);
         session.release();
     }

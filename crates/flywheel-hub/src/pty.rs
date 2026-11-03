@@ -135,6 +135,9 @@ pub enum WriteOutcome {
     /// The child has [`INPUT_QUEUE_LIMIT`] bytes of unread input queued;
     /// this input was discarded.
     Backlogged,
+    /// The hub is handing this session over to a new hub process (a live
+    /// handoff): the input was discarded; send it again once reconnected.
+    HandingOff,
 }
 
 /// A point-in-time attach: a snapshot of the terminal plus a live receiver
@@ -184,6 +187,9 @@ struct PauseState {
     /// parked, then what was queued behind it, then input taken while
     /// paused.
     held: Vec<u8>,
+    /// `held` was handed to another hub process: input is refused
+    /// ([`WriteOutcome::HandingOff`]) until [`PtySession::resume`].
+    sealed: bool,
 }
 
 impl InputQueue {
@@ -508,6 +514,11 @@ impl PtySession {
         // Under the pause lock: input either reaches the channel before a
         // pausing writer drains it, or joins what the pause holds.
         let mut pause = self.queue.pause_state();
+        if pause.sealed {
+            drop(pause);
+            self.queue.queued.fetch_sub(len, Ordering::AcqRel);
+            return WriteOutcome::HandingOff;
+        }
         if pause.requested {
             pause.held.extend_from_slice(&bytes);
             return WriteOutcome::Queued;
@@ -686,6 +697,7 @@ impl PtySession {
     pub fn resume(&self) {
         let mut state = self.queue.pause_state();
         state.requested = false;
+        state.sealed = false;
         self.queue.pausing.store(false, Ordering::Release);
         drop(state);
         self.queue.pause_changed.notify_all();

@@ -9,6 +9,7 @@
 
 use crate::cli::{StateDirArg, resolve_state_dir};
 use crate::endpoint::Endpoint;
+use crate::machines::MACHINES_FILE;
 use crate::peers::PeerStore;
 use crate::script::query_escape;
 use crate::util::{fail, str_field};
@@ -292,8 +293,33 @@ fn print_machine(out: &mut dyn Write, view: &Value, probe: Option<&Value>) {
     }
 }
 
+/// Where the peer credentials are kept: always the state dir's plaintext
+/// machines file (no OS keyring; docs/hub.md says why), with its mode
+/// when it exists.
+fn credential_store(state: &StateDirArg) -> Result<Value, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = resolve_state_dir(state)?.join(MACHINES_FILE);
+    let mode = std::fs::metadata(&path)
+        .ok()
+        .map(|m| format!("{:04o}", m.permissions().mode() & 0o7777));
+    Ok(json!({ "kind": "file", "path": path.display().to_string(), "mode": mode }))
+}
+
+fn print_store(out: &mut dyn Write, store: &Value) {
+    let _ = writeln!(
+        out,
+        "credentials: {} (plaintext file{})",
+        str_field(store, "path"),
+        store["mode"]
+            .as_str()
+            .map(|m| format!(", mode {m}"))
+            .unwrap_or_default()
+    );
+}
+
 fn ls(args: &LsArgs, out: &mut dyn Write) -> Result<i32, String> {
     let hub = local_hub(&args.state)?;
+    let store = credential_store(&args.state)?;
     let list = hub.blocking_call("GET", "/api/machines", None)?;
     let machines = list["machines"].as_array().cloned().unwrap_or_default();
     let mut shown = Vec::new();
@@ -314,7 +340,7 @@ fn ls(args: &LsArgs, out: &mut dyn Write) -> Result<i32, String> {
         let _ = writeln!(
             out,
             "{}",
-            json!({ "host": list["host"], "machines": machines })
+            json!({ "host": list["host"], "machines": machines, "credential_store": store })
         );
         return Ok(0);
     }
@@ -327,11 +353,13 @@ fn ls(args: &LsArgs, out: &mut dyn Write) -> Result<i32, String> {
                 .filter(|h| !h.is_empty())
                 .unwrap_or("<this hub>")
         );
+        print_store(out, &store);
         return Ok(0);
     }
     for (view, probed) in &shown {
         print_machine(out, view, probed.as_ref());
     }
+    print_store(out, &store);
     Ok(0)
 }
 

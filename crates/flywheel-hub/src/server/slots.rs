@@ -4,15 +4,32 @@
 //!   request carried a valid credential (token, login cookie, peer
 //!   credential). Kept alive; a stop lets their requests finish.
 //! * **Unauthenticated** (`pending_cap`, much smaller): every connection
-//!   starts here and stays until a request on it authenticates. Each has a
-//!   deadline -- its first request head within [`UNAUTH_HEADER_TIMEOUT`],
+//!   starts here -- nothing is known about it before its first request
+//!   head -- and leaves the moment a head carries a valid credential (it
+//!   is then never evicted, even while it waits for a main slot). Each has
+//!   a deadline -- its first request head within [`UNAUTH_HEADER_TIMEOUT`],
 //!   then that request done within [`UNAUTH_REQUEST_TIMEOUT`] -- and closes
-//!   after its one response. At most `per_client` are held per client (by
-//!   the TCP peer, or for a trusted proxy by the `X-Forwarded-For` client
-//!   its request names; IPv6 by /64). When the pool is full, a new
-//!   connection evicts the oldest: a flood can churn the pool but never
-//!   keep a client whose request head arrives promptly out of it. A stop
-//!   or a handoff freeze drops them at once.
+//!   after its one response. A stop or a handoff freeze drops them at once.
+//!
+//! Clients are keyed by the TCP peer, or -- for loopback, a trusted proxy,
+//! or this machine's own address -- by the `X-Forwarded-For` client a
+//! request names (none until its head arrives); IPv6 by /64. Nothing is
+//! refused at accept (that would lock out a credential-carrying client
+//! sharing an address with a flood). Instead:
+//!
+//! * A client over [`UNAUTH_PER_CLIENT`] loses its own oldest connection
+//!   that has not sent a head yet; a request head without a credential
+//!   from a client already holding its share of requests gets 429.
+//! * A full pool evicts from the client holding the most connections
+//!   (each not yet keyed counts as its own); among equals, one that has
+//!   sent no head, then one whose head is not sorted yet, then one
+//!   mid-request; oldest first. An evicted connection whose head arrived
+//!   or is arriving (or was accepted moments ago) gets a moment for it:
+//!   a credential still moves it to the main pool, none has it compete
+//!   for a slot again ([`super::listen`]).
+//!   A flood from a few addresses only churns itself; one with more
+//!   addresses than the pool has slots can still reset strangers' logins,
+//!   never an authenticated client's request.
 
 use crate::auth::client_key;
 use std::collections::{BTreeMap, HashMap};
@@ -50,7 +67,11 @@ pub enum Phase {
     Pending,
     /// Holding a main slot.
     Main,
-    /// Evicted, expired, or dropped by a stop or freeze: its task closes it.
+    /// Evicted from the pending pool: its task closes it, unless a request
+    /// head already in its socket buffer authenticates first (it would
+    /// have, but for the race).
+    Evicted,
+    /// Expired, or dropped by a stop or freeze: its task closes it.
     Closed,
 }
 
@@ -68,8 +89,9 @@ struct Pool {
     next: u64,
     /// Pending connections, oldest first.
     order: BTreeMap<u64, Arc<Conn>>,
-    /// Pending connections per client key.
-    clients: HashMap<IpAddr, usize>,
+    /// Pending connections per client key (`None`: not known yet, or this
+    /// machine -- never capped, and each its own client for eviction).
+    clients: HashMap<Option<IpAddr>, usize>,
 }
 
 /// One connection's standing, shared by its task and its requests.
@@ -87,6 +109,10 @@ struct ConnState {
     seq: u64,
     /// The client key it counts against while pending.
     client: Option<IpAddr>,
+    /// A request head arrived on it.
+    head: bool,
+    /// A request without a credential was sorted (keyed by its client).
+    sorted: bool,
     /// When a pending connection is dropped.
     deadline: Instant,
     main: Option<OwnedSemaphorePermit>,
@@ -103,6 +129,11 @@ impl Conn {
         (state.phase, state.deadline)
     }
 
+    /// Whether a request head arrived on it.
+    pub fn has_head(&self) -> bool {
+        self.lock().head
+    }
+
     pub fn is_pending(&self) -> bool {
         self.lock().phase == Phase::Pending
     }
@@ -110,17 +141,14 @@ impl Conn {
 
 impl Pool {
     fn count(&self, key: Option<IpAddr>) -> usize {
-        key.and_then(|k| self.clients.get(&k).copied()).unwrap_or(0)
+        self.clients.get(&key).copied().unwrap_or(0)
     }
 
     fn add_client(&mut self, key: Option<IpAddr>) {
-        if let Some(key) = key {
-            *self.clients.entry(key).or_default() += 1;
-        }
+        *self.clients.entry(key).or_default() += 1;
     }
 
     fn drop_client(&mut self, key: Option<IpAddr>) {
-        let Some(key) = key else { return };
         if let Some(n) = self.clients.get_mut(&key) {
             *n = n.saturating_sub(1);
             if *n == 0 {
@@ -129,26 +157,80 @@ impl Pool {
         }
     }
 
-    /// Take `conn` (whose locked state is `state`) out of the pool.
+    /// Take the connection whose locked state is `state` out of the pool
+    /// (a no-op when it is not in it).
     fn remove(&mut self, state: &ConnState) {
         if self.order.remove(&state.seq).is_some() {
             self.drop_client(state.client);
         }
     }
 
-    /// Make room for one more: close the oldest pending connections until
-    /// fewer than `cap` remain. Called with no connection lock held but
-    /// possibly the newcomer's, which is never in `order` yet.
-    fn make_room(&mut self, cap: usize) {
+    /// Close the pending connection `seq`. Called with no connection lock
+    /// held but possibly the caller's own, which is never the victim.
+    fn evict(&mut self, seq: u64) {
+        let Some(victim) = self.order.remove(&seq) else {
+            return;
+        };
+        let mut state = victim.lock();
+        self.drop_client(state.client);
+        state.phase = Phase::Evicted;
+        drop(state);
+        victim.wake.notify_one();
+    }
+
+    /// The oldest connection of `key` that has sent no request head.
+    /// `skip`: the caller's own (locked) connection.
+    fn oldest_silent(&self, key: Option<IpAddr>, skip: u64) -> Option<u64> {
+        self.order.iter().find_map(|(&seq, conn)| {
+            if seq == skip {
+                return None;
+            }
+            let state = conn.lock();
+            (state.client == key && !state.head).then_some(seq)
+        })
+    }
+
+    /// Who a full pool evicts: from the client holding the most
+    /// connections; then one that sent no head, then one whose head is not
+    /// sorted yet (it is given a moment to re-compete), then one mid-request;
+    /// the oldest.
+    fn victim(&self, skip: u64) -> Option<u64> {
+        let mut best: Option<((usize, u8), u64)> = None;
+        for (&seq, conn) in &self.order {
+            if seq == skip {
+                continue;
+            }
+            let (client, class) = {
+                let state = conn.lock();
+                let class = match (state.head, state.sorted) {
+                    (false, _) => 2u8,
+                    (true, false) => 1,
+                    (true, true) => 0,
+                };
+                (state.client, class)
+            };
+            // Connections not keyed yet are strangers to each other: one
+            // proxy carries many clients, the operator among them.
+            let held = if client.is_some() {
+                self.count(client)
+            } else {
+                1
+            };
+            let rank = (held, class);
+            if best.is_none_or(|(top, _)| rank > top) {
+                best = Some((rank, seq));
+            }
+        }
+        best.map(|(_, seq)| seq)
+    }
+
+    /// Make room for one more: evict until fewer than `cap` remain.
+    fn make_room(&mut self, cap: usize, skip: u64) {
         while self.order.len() >= cap.max(1) {
-            let Some((_, victim)) = self.order.pop_first() else {
+            let Some(seq) = self.victim(skip) else {
                 return;
             };
-            let mut state = victim.lock();
-            self.drop_client(state.client);
-            state.phase = Phase::Closed;
-            drop(state);
-            victim.wake.notify_one();
+            self.evict(seq);
         }
     }
 
@@ -177,21 +259,33 @@ impl Slots {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Admit a new connection as pending, counted against `client` (`None`:
-    /// a trusted proxy, whose requests name their clients); `None` when
-    /// that client already holds its share.
-    pub fn admit(&self, client: Option<IpAddr>) -> Option<Arc<Conn>> {
+    /// Room for one more connection of `key` (`Some`: capped per client):
+    /// over its share, its own oldest silent connection goes first; then a
+    /// full pool evicts fairly. `skip`: the caller's own connection.
+    fn make_room_for(&self, pool: &mut Pool, key: Option<IpAddr>, skip: u64) {
+        if key.is_some()
+            && pool.count(key) >= self.per_client
+            && let Some(seq) = pool.oldest_silent(key, skip)
+        {
+            pool.evict(seq);
+        }
+        pool.make_room(self.pending_cap, skip);
+    }
+
+    /// Admit a new connection as pending, counted against `client`
+    /// (`None`: loopback, a trusted proxy, or this machine, whose requests
+    /// name their clients). Never refused: see the module doc.
+    pub fn admit(&self, client: Option<IpAddr>) -> Arc<Conn> {
         let key = client.map(client_key);
         let mut pool = self.pool();
-        if pool.count(key) >= self.per_client {
-            return None;
-        }
-        pool.make_room(self.pending_cap);
+        self.make_room_for(&mut pool, key, 0);
         let conn = Arc::new(Conn {
             state: Mutex::new(ConnState {
                 phase: Phase::Pending,
                 seq: 0,
                 client: None,
+                head: false,
+                sorted: false,
                 deadline: Instant::now() + UNAUTH_HEADER_TIMEOUT,
                 main: None,
             }),
@@ -201,13 +295,15 @@ impl Slots {
             let mut state = conn.lock();
             pool.insert(&conn, &mut state, key);
         }
-        Some(conn)
+        conn
     }
 
     /// A request head arrived on `conn`: a pending one now has
-    /// [`UNAUTH_REQUEST_TIMEOUT`] to finish it.
+    /// [`UNAUTH_REQUEST_TIMEOUT`] to finish it, and a full pool evicts
+    /// silent connections before it.
     pub fn request_started(&self, conn: &Conn) {
         let mut state = conn.lock();
+        state.head = true;
         if state.phase == Phase::Pending {
             state.deadline = Instant::now() + UNAUTH_REQUEST_TIMEOUT;
             drop(state);
@@ -215,22 +311,26 @@ impl Slots {
         }
     }
 
-    /// A request on `conn` authenticated: move it to the main pool (waiting
-    /// for a main slot). False once the connection was closed meanwhile.
+    /// A request on `conn` authenticated: take it out of the pending pool
+    /// at once (nothing evicts it from here on) and into the main pool
+    /// once a main slot is free. False once the connection was closed.
     pub async fn authenticated(&self, conn: &Conn) -> bool {
-        match conn.lock().phase {
-            Phase::Main => return true,
-            Phase::Closed => return false,
-            Phase::Pending => {}
+        {
+            let mut pool = self.pool();
+            let mut state = conn.lock();
+            match state.phase {
+                Phase::Main => return true,
+                Phase::Closed => return false,
+                Phase::Pending => pool.remove(&state),
+                Phase::Evicted => state.phase = Phase::Pending,
+            }
         }
         let Ok(permit) = Arc::clone(&self.main).acquire_owned().await else {
             return false;
         };
-        let mut pool = self.pool();
         let mut state = conn.lock();
         match state.phase {
             Phase::Pending => {
-                pool.remove(&state);
                 state.phase = Phase::Main;
                 state.main = Some(permit);
                 drop(state);
@@ -238,39 +338,48 @@ impl Slots {
                 true
             }
             Phase::Main => true,
-            Phase::Closed => false,
+            Phase::Evicted | Phase::Closed => false,
         }
     }
 
     /// A request on `conn` did not authenticate: it counts (from now on)
     /// against `client` (`None`: this machine, uncounted) in the pending
-    /// pool, leaving the main pool if it held a slot there. False when
-    /// that client already holds its share or the connection was closed.
+    /// pool, leaving the main pool if it held a slot there (or re-entering
+    /// it if evicted as this request arrived). False when
+    /// that client already holds its share of connections with a request
+    /// head (silent ones of its own make way), or the connection was
+    /// closed.
     pub fn unauthenticated(&self, conn: &Arc<Conn>, client: Option<IpAddr>) -> bool {
         let key = client.map(client_key);
         let mut pool = self.pool();
         let mut state = conn.lock();
+        if state.phase == Phase::Closed {
+            return false;
+        }
+        let in_pool = state.phase == Phase::Pending && pool.order.contains_key(&state.seq);
+        // Others of `key` it would sit beside.
+        let others = pool.count(key) - usize::from(in_pool && state.client == key);
+        if key.is_some() && others >= self.per_client {
+            match pool.oldest_silent(key, state.seq) {
+                Some(seq) => pool.evict(seq),
+                None => return false,
+            }
+        }
         match state.phase {
-            Phase::Closed => false,
-            Phase::Pending => {
-                if state.client == key {
-                    return true;
-                }
-                if pool.count(key) >= self.per_client {
-                    return false;
-                }
+            Phase::Pending if in_pool => {
                 pool.drop_client(state.client);
                 pool.add_client(key);
                 state.client = key;
+                state.sorted = true;
                 true
             }
-            Phase::Main => {
-                if pool.count(key) >= self.per_client {
-                    return false;
-                }
-                pool.make_room(self.pending_cap);
+            _ => {
+                // Back from the main pool, or evicted as its head arrived
+                // (it competes for a slot again, fairly, now it is keyed).
+                pool.make_room(self.pending_cap, state.seq);
                 pool.insert(conn, &mut state, key);
                 state.phase = Phase::Pending;
+                state.sorted = true;
                 state.main = None;
                 state.deadline = Instant::now() + UNAUTH_REQUEST_TIMEOUT;
                 drop(state);
@@ -288,7 +397,7 @@ impl Slots {
         match state.phase {
             Phase::Main => false,
             Phase::Closed => true,
-            Phase::Pending => {
+            Phase::Evicted | Phase::Pending => {
                 pool.remove(&state);
                 state.phase = Phase::Closed;
                 true
@@ -366,34 +475,135 @@ mod tests {
         assert!(super::super::BodyBound::PUBLIC.timeout < UNAUTH_REQUEST_TIMEOUT);
     }
 
-    #[test]
-    fn one_client_holds_at_most_its_share() {
-        let slots = Slots::new(4, 16, 2);
-        let a = slots.admit(ip("198.51.100.1")).unwrap();
-        let _b = slots.admit(ip("198.51.100.1")).unwrap();
-        assert!(slots.admit(ip("198.51.100.1")).is_none());
-        // Another client is unaffected; an unkeyed (proxy) one too.
-        assert!(slots.admit(ip("198.51.100.2")).is_some());
-        assert!(slots.admit(None).is_some());
-        // IPv6 counts by /64.
-        let _c = slots.admit(ip("2001:db8::1")).unwrap();
-        let _d = slots.admit(ip("2001:db8::2")).unwrap();
-        assert!(slots.admit(ip("2001:db8::3")).is_none());
-        // A slot freed is a slot back.
-        slots.release(&a);
-        assert!(slots.admit(ip("198.51.100.1")).is_some());
+    /// A connection whose request head arrived.
+    fn with_head(slots: &Slots, client: Option<IpAddr>) -> Arc<Conn> {
+        let conn = slots.admit(client);
+        slots.request_started(&conn);
+        conn
+    }
+
+    fn phase(conn: &Conn) -> Phase {
+        conn.standing().0
     }
 
     #[test]
-    fn a_full_pool_evicts_its_oldest_connection() {
+    fn a_client_over_its_share_loses_its_own_silent_connections_never_the_newcomer() {
+        let slots = Slots::new(4, 16, 2);
+        let a = slots.admit(ip("198.51.100.1"));
+        let b = slots.admit(ip("198.51.100.1"));
+        // A third from the same address is admitted (it may carry a
+        // credential); the address's oldest silent one makes way.
+        let c = slots.admit(ip("198.51.100.1"));
+        assert_eq!(phase(&a), Phase::Evicted);
+        assert_eq!((phase(&b), phase(&c)), (Phase::Pending, Phase::Pending));
+        // Another client is unaffected.
+        let other = slots.admit(ip("198.51.100.2"));
+        assert_eq!(phase(&other), Phase::Pending);
+        // IPv6 counts by /64.
+        let d = slots.admit(ip("2001:db8::1"));
+        let _e = slots.admit(ip("2001:db8::2"));
+        let _f = slots.admit(ip("2001:db8::3"));
+        assert_eq!(phase(&d), Phase::Evicted);
+        assert_eq!(slots.pending_len(), 5);
+    }
+
+    #[test]
+    fn requests_without_a_credential_are_capped_per_client() {
+        let slots = Slots::new(4, 16, 2);
+        let a = with_head(&slots, ip("198.51.100.1"));
+        assert!(slots.unauthenticated(&a, ip("198.51.100.1")));
+        let b = with_head(&slots, ip("198.51.100.1"));
+        assert!(slots.unauthenticated(&b, ip("198.51.100.1")));
+        // Two requests in flight: a third is refused, and nothing of the
+        // two is evicted for it.
+        let c = with_head(&slots, ip("198.51.100.1"));
+        assert!(!slots.unauthenticated(&c, ip("198.51.100.1")));
+        assert_eq!((phase(&a), phase(&b)), (Phase::Pending, Phase::Pending));
+        // A slot freed is a slot back.
+        slots.release(&a);
+        slots.release(&c);
+        let d = with_head(&slots, ip("198.51.100.1"));
+        assert!(slots.unauthenticated(&d, ip("198.51.100.1")));
+    }
+
+    #[tokio::test]
+    async fn a_flood_from_one_address_never_locks_out_a_credential_from_it() {
+        let slots = Slots::new(4, 16, 8);
+        let flood: Vec<_> = (0..8).map(|_| slots.admit(ip("198.51.100.1"))).collect();
+        // The operator, behind the same NAT, reconnects again and again.
+        for _ in 0..20 {
+            let operator = with_head(&slots, ip("198.51.100.1"));
+            assert!(slots.authenticated(&operator).await);
+            slots.release(&operator);
+        }
+        drop(flood);
+    }
+
+    #[test]
+    fn a_full_pool_evicts_from_the_client_holding_the_most() {
+        let slots = Slots::new(4, 4, 8);
+        // A stranger's slow login, mid-request.
+        let login = with_head(&slots, ip("203.0.113.5"));
+        assert!(slots.unauthenticated(&login, ip("203.0.113.5")));
+        // One forwarded client churning fast requests behind a proxy.
+        for _ in 0..50 {
+            let churn = with_head(&slots, None);
+            assert!(slots.unauthenticated(&churn, ip("198.51.100.66")));
+        }
+        assert_eq!(phase(&login), Phase::Pending);
+        assert_eq!(slots.pending_len(), 4);
+    }
+
+    #[test]
+    fn silent_connections_go_before_ones_with_a_request() {
         let slots = Slots::new(4, 3, 8);
-        let first = slots.admit(None).unwrap();
-        let second = slots.admit(None).unwrap();
-        let third = slots.admit(None).unwrap();
-        let fourth = slots.admit(None).unwrap();
-        assert_eq!(first.standing().0, Phase::Closed);
+        let login = with_head(&slots, ip("203.0.113.5"));
+        assert!(slots.unauthenticated(&login, ip("203.0.113.5")));
+        // Many addresses, one silent connection each: as many as the pool
+        // holds, so no client holds more than the login's.
+        let silent: Vec<_> = (1..=10u8)
+            .map(|n| slots.admit(Some(IpAddr::from([198, 51, 100, n]))))
+            .collect();
+        assert_eq!(phase(&login), Phase::Pending);
+        assert_eq!(
+            silent.iter().filter(|c| phase(c) == Phase::Pending).count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn an_authenticating_connection_is_never_evicted() {
+        // No main slot free: the credential-carrying one waits for one,
+        // out of the pending pool.
+        let slots = Arc::new(Slots::new(1, 2, 8));
+        let holder = slots.admit(None);
+        assert!(slots.authenticated(&holder).await);
+        let waiting = with_head(&slots, None);
+        let task = {
+            let (slots, waiting) = (Arc::clone(&slots), Arc::clone(&waiting));
+            tokio::spawn(async move { slots.authenticated(&waiting).await })
+        };
+        tokio::task::yield_now().await;
+        while slots.pending_len() != 0 {
+            tokio::task::yield_now().await;
+        }
+        let _flood: Vec<_> = (0..10).map(|_| slots.admit(None)).collect();
+        assert_eq!(phase(&waiting), Phase::Pending);
+        slots.release(&holder);
+        assert!(task.await.unwrap());
+        assert_eq!(phase(&waiting), Phase::Main);
+    }
+
+    #[test]
+    fn a_full_pool_evicts_its_oldest_among_equals() {
+        let slots = Slots::new(4, 3, 8);
+        let first = slots.admit(None);
+        let second = slots.admit(None);
+        let third = slots.admit(None);
+        let fourth = slots.admit(None);
+        assert_eq!(phase(&first), Phase::Evicted);
         for live in [&second, &third, &fourth] {
-            assert_eq!(live.standing().0, Phase::Pending);
+            assert_eq!(phase(live), Phase::Pending);
         }
         assert_eq!(slots.pending_len(), 3);
         // Releasing the evicted one does not free a live one's slot.
@@ -404,15 +614,15 @@ mod tests {
     #[tokio::test]
     async fn authenticating_moves_a_connection_to_the_main_pool() {
         let slots = Slots::new(2, 2, 1);
-        let conn = slots.admit(ip("198.51.100.1")).unwrap();
+        let conn = slots.admit(ip("198.51.100.1"));
         assert!(slots.authenticated(&conn).await);
         assert_eq!(conn.standing().0, Phase::Main);
         assert_eq!(slots.pending_len(), 0);
         assert_eq!(slots.main_available(), 1);
         // Its client's share is free again, and nothing evicts it.
-        let others: Vec<_> = (0..4).map(|_| slots.admit(None).unwrap()).collect();
+        let others: Vec<_> = (0..4).map(|_| slots.admit(None)).collect();
         assert_eq!(conn.standing().0, Phase::Main);
-        assert!(slots.admit(ip("198.51.100.1")).is_some());
+        assert_eq!(phase(&slots.admit(ip("198.51.100.1"))), Phase::Pending);
         // A stop or freeze leaves it alone.
         assert!(!slots.close_if_pending(&conn));
         slots.release(&conn);
@@ -421,25 +631,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_evicted_connection_cannot_authenticate_afterwards() {
+    async fn an_evicted_connection_closes_unless_it_authenticates_first() {
         let slots = Slots::new(2, 1, 8);
-        let old = slots.admit(None).unwrap();
-        let _new = slots.admit(None).unwrap();
+        // Its head was already buffered when it was evicted: honoured.
+        let raced = slots.admit(None);
+        let _new = slots.admit(None);
+        assert_eq!(phase(&raced), Phase::Evicted);
+        assert!(slots.authenticated(&raced).await);
+        assert_eq!(phase(&raced), Phase::Main);
+        assert_eq!(slots.pending_len(), 1);
+        // A request without a credential on one competes for a slot again.
+        let old = slots.admit(None);
+        assert_eq!(phase(&_new), Phase::Evicted);
+        assert!(slots.unauthenticated(&_new, ip("203.0.113.5")));
+        assert_eq!(
+            (phase(&_new), phase(&old)),
+            (Phase::Pending, Phase::Evicted)
+        );
+        assert_eq!(slots.pending_len(), 1);
+        // Once its task closed it, nothing brings it back.
+        slots.release(&old);
+        assert!(!slots.unauthenticated(&old, None));
         assert!(!slots.authenticated(&old).await);
-        assert_eq!(slots.main_available(), 2);
+        assert_eq!(slots.main_available(), 1);
     }
 
     #[tokio::test]
     async fn an_unauthenticated_request_demotes_and_rekeys() {
         let slots = Slots::new(2, 4, 1);
         // A proxy's connection: its request names the client.
-        let proxied = slots.admit(None).unwrap();
+        let proxied = with_head(&slots, None);
         assert!(slots.unauthenticated(&proxied, ip("203.0.113.9")));
-        let again = slots.admit(None).unwrap();
+        let again = with_head(&slots, None);
         assert!(!slots.unauthenticated(&again, ip("203.0.113.9")));
         // A connection that authenticated before, then sends a request
         // without a credential, leaves the main pool.
-        let conn = slots.admit(ip("198.51.100.1")).unwrap();
+        let conn = with_head(&slots, ip("198.51.100.1"));
         assert!(slots.authenticated(&conn).await);
         assert_eq!(slots.main_available(), 1);
         assert!(slots.unauthenticated(&conn, ip("198.51.100.1")));

@@ -3,7 +3,8 @@
 //! clients trickling request heads and login bodies never starve the
 //! operator -- authenticated requests, `fw hub upgrade`, and `fw hub stop`
 //! all still go through promptly -- and one client address (as a trusted
-//! proxy's `X-Forwarded-For` names it) holds at most its share.
+//! proxy's `X-Forwarded-For` names it) holds at most its share, churns
+//! only itself, and never locks out a credential from the same address.
 
 #![cfg(target_os = "linux")]
 
@@ -23,6 +24,9 @@ const SLOW_BODIES: usize = 6;
 /// Slow heads beside the bodies when the point is requests in flight: few
 /// enough that the unauthenticated pool keeps every body.
 const FEW_SLOW_HEADS: usize = 8;
+/// Threads churning connections from one forwarded client: twice the 16
+/// unauthenticated slots, so new connections keep evicting.
+const CHURNERS: usize = 32;
 /// "Promptly": well under the 10 s header deadline the flood exploited.
 const PROMPT: Duration = Duration::from_secs(3);
 
@@ -107,10 +111,14 @@ impl Env {
 
     /// Start a hub with 256 descriptors; its port.
     fn start(&self) -> u16 {
-        let started = self
-            .command(&["start", "--port", "0", "--no-flywheel"], Some(256))
-            .output()
-            .unwrap();
+        self.start_with(&[])
+    }
+
+    /// [`Env::start`] with more `start` flags.
+    fn start_with(&self, extra: &[&str]) -> u16 {
+        let mut args = vec!["start", "--port", "0", "--no-flywheel"];
+        args.extend_from_slice(extra);
+        let started = self.command(&args, Some(256)).output().unwrap();
         assert!(started.status.success(), "{started:?}");
         let status: serde_json::Value =
             serde_json::from_str(&self.ok(&["status", "--json"])).unwrap();
@@ -143,9 +151,14 @@ impl Flood {
     /// `heads` sending a request head a header line at a time, each half a
     /// second apart; `extra` goes into every head (e.g. a forwarded-for).
     fn start(port: u16, heads: usize, bodies: usize, extra: &str) -> Self {
+        Self::start_on("127.0.0.1", port, heads, bodies, extra)
+    }
+
+    /// [`Flood::start`] against `host`.
+    fn start_on(host: &str, port: u16, heads: usize, bodies: usize, extra: &str) -> Self {
         let mut streams = Vec::new();
         for _ in 0..bodies {
-            let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+            let Ok(mut stream) = TcpStream::connect((host, port)) else {
                 continue;
             };
             let head = format!(
@@ -156,7 +169,7 @@ impl Flood {
             streams.push((stream, b"a".to_vec()));
         }
         for _ in 0..heads {
-            let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+            let Ok(mut stream) = TcpStream::connect((host, port)) else {
                 continue;
             };
             let head = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra}");
@@ -194,7 +207,12 @@ impl Drop for Flood {
 /// Send `request` on a fresh connection; the status line ("" when none
 /// came within `wait`).
 fn status_line(port: u16, request: &str, wait: Duration) -> String {
-    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+    status_line_on("127.0.0.1", port, request, wait)
+}
+
+/// [`status_line`] against `host`.
+fn status_line_on(host: &str, port: u16, request: &str, wait: Duration) -> String {
+    let Ok(mut stream) = TcpStream::connect((host, port)) else {
         return String::new();
     };
     let _ = stream.set_read_timeout(Some(wait));
@@ -217,7 +235,12 @@ fn status_line(port: u16, request: &str, wait: Duration) -> String {
 }
 
 fn authenticated_get(port: u16, token: &str) -> String {
-    status_line(
+    authenticated_get_on("127.0.0.1", port, token)
+}
+
+fn authenticated_get_on(host: &str, port: u16, token: &str) -> String {
+    status_line_on(
+        host,
         port,
         &format!(
             "GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer \
@@ -319,4 +342,149 @@ fn one_forwarded_client_holds_at_most_its_share() {
         PROMPT,
     );
     assert!(other.contains(" 200 "), "{other:?}");
+}
+
+/// One forwarded client churning fast unauthenticated requests on fresh
+/// connections (each answer is `Connection: close`), on a few threads,
+/// until dropped.
+struct Churn {
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl Churn {
+    fn start(port: u16, threads: usize, forwarded_for: &'static str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let threads = (0..threads)
+            .map(|_| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = status_line(
+                            port,
+                            &format!(
+                                "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                                 X-Forwarded-For: {forwarded_for}\r\n\r\n"
+                            ),
+                            Duration::from_secs(2),
+                        );
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(300));
+        Self { stop, threads }
+    }
+}
+
+impl Drop for Churn {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A login form (a wrong token) from `forwarded_for`, its body spread over
+/// `over`; the status line, or what went wrong.
+fn slow_login(port: u16, forwarded_for: &str, over: Duration) -> String {
+    let body = format!("token={}", "0".repeat(64));
+    let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+        return "connect failed".into();
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    let head = format!(
+        "POST /login HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Forwarded-For: \
+         {forwarded_for}\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    if let Err(e) = stream.write_all(head.as_bytes()) {
+        return format!("head: {e}");
+    }
+    let chunks: Vec<&[u8]> = body.as_bytes().chunks(8).collect();
+    let pause = over / u32::try_from(chunks.len()).unwrap();
+    for chunk in chunks {
+        std::thread::sleep(pause);
+        if let Err(e) = stream.write_all(chunk) {
+            return format!("body: {e}");
+        }
+    }
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !answer.windows(2).any(|w| w == b"\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) => return "closed without an answer".into(),
+            Err(e) => return format!("read: {e}"),
+            Ok(n) => answer.extend_from_slice(&buf[..n]),
+        }
+    }
+    String::from_utf8_lossy(&answer)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+fn a_churning_forwarded_client_does_not_reset_another_clients_login() {
+    let env = Env::new();
+    let port = env.start();
+    let baseline = slow_login(port, "203.0.113.5", Duration::from_millis(1500));
+    assert!(baseline.contains(" 401 "), "{baseline:?}");
+
+    // Behind the trusted proxy (loopback), one client opens a fresh
+    // connection per request, far over its share of the pool.
+    let _churn = Churn::start(port, CHURNERS, "198.51.100.66");
+    for attempt in 0..3 {
+        let login = slow_login(port, "203.0.113.5", Duration::from_millis(1500));
+        assert!(login.contains(" 401 "), "attempt {attempt}: {login:?}");
+    }
+    // The operator's fresh connections get through too, every time.
+    let token = env.token();
+    for attempt in 0..20 {
+        let status = authenticated_get(port, &token);
+        assert!(status.contains(" 200 "), "attempt {attempt}: {status:?}");
+    }
+}
+
+/// This host's first non-loopback IPv4 address, if any (the route a
+/// datagram socket would take; nothing is sent).
+fn lan_address() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
+}
+
+#[test]
+fn a_slow_flood_from_this_hosts_own_address_does_not_lock_out_the_operator() {
+    let Some(lan) = lan_address() else {
+        eprintln!("skipped: no non-loopback address");
+        return;
+    };
+    let env = Env::new();
+    let port = env.start_with(&["--bind", &lan]);
+    let token = env.token();
+    // More slow heads than one address's share, from the address the CLI
+    // also connects from.
+    let _flood = Flood::start_on(&lan, port, 12, 0, "");
+    for _ in 0..3 {
+        let started = Instant::now();
+        let status = authenticated_get_on(&lan, port, &token);
+        assert!(
+            status.contains(" 200 "),
+            "{status:?} after {:?}",
+            started.elapsed()
+        );
+        assert!(started.elapsed() < PROMPT, "{:?}", started.elapsed());
+    }
+    let started = Instant::now();
+    env.ok(&["ls", "--json"]);
+    assert!(
+        started.elapsed() < PROMPT,
+        "`fw hub ls` took {:?}",
+        started.elapsed()
+    );
 }

@@ -509,6 +509,10 @@ async fn a_hub_drives_another_through_its_proxy() {
     let (code, out, err) = run_cli(&["machine", "ls", "--state-dir", &state_a]).await;
     assert_eq!(code, 0, "{err}");
     assert!(out.contains('b') && out.contains("online"), "{out}");
+    assert!(
+        out.contains("credentials: ") && out.contains("machines.json (plaintext file, mode 0600)"),
+        "{out}"
+    );
     let (code, out, err) =
         run_cli(&["read", &session, "--machine", "b", "--state-dir", &state_a]).await;
     assert_eq!(code, 0, "{err}");

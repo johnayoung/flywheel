@@ -23,10 +23,12 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use std::future::Future;
 use std::net::IpAddr;
+use std::os::fd::{AsRawFd, RawFd};
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use tower::ServiceExt;
 
 /// How long a client has to send a complete request head, and how long an
@@ -36,6 +38,12 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// their connections go (a client that never finishes must not hold the
 /// hub's exit past `fw hub stop`'s wait).
 pub const CLOSE_GRACE: Duration = Duration::from_secs(10);
+/// How long an evicted unauthenticated connection with bytes already
+/// waiting is kept, for a credential in them to move it to the main pool.
+const EVICTED_GRACE: Duration = Duration::from_millis(250);
+/// How long after its accept an evicted connection that has sent nothing
+/// yet waits for its head (an honest client's follows the handshake).
+const SETTLE: Duration = Duration::from_millis(100);
 /// Bounds of [`connection_cap`].
 const MIN_CONNECTIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 1024;
@@ -78,6 +86,23 @@ pub fn raise_fd_limit() {
     let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) };
 }
 
+/// Whether bytes wait unread on socket `fd` (its connection task owns the
+/// stream, so the descriptor is open).
+fn bytes_waiting(fd: RawFd) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: recv peeks at most one byte into a valid buffer, without
+    // blocking or consuming it.
+    let n = unsafe {
+        libc::recv(
+            fd,
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n > 0
+}
+
 /// Resolves once the server is closing (or its sender is gone).
 async fn closed(close: &mut watch::Receiver<bool>) {
     let _ = close.wait_for(|closing| *closing).await;
@@ -110,15 +135,15 @@ pub async fn run(
             () = &mut shutdown => break,
         };
         let ip = remote.ip().to_canonical();
-        let proxy = ip.is_loopback() || trusted_proxies.contains(&ip);
-        // Over its share of unauthenticated connections: hung up at once.
-        let Some(conn) = slots.admit((!proxy).then_some(ip)) else {
-            continue;
-        };
-        let peer = Peer {
-            remote,
-            local: stream.local_addr().ok(),
-        };
+        let local = stream.local_addr().ok();
+        // Loopback, a trusted proxy, or this machine's own address (a LAN
+        // bind reached from this host): its requests say who the client
+        // is, so it is keyed only once one arrives.
+        let named_later = ip.is_loopback()
+            || trusted_proxies.contains(&ip)
+            || local.is_some_and(|l| l.ip().to_canonical() == ip);
+        let conn = slots.admit((!named_later).then_some(ip));
+        let peer = Peer { remote, local };
         let admission = Admission::new(Arc::clone(&slots), Arc::clone(&conn));
         let request_slots = Arc::clone(&slots);
         let request_conn = Arc::clone(&conn);
@@ -134,6 +159,8 @@ pub async fn run(
         let gate = gate.clone();
         let slots = Arc::clone(&slots);
         let done = done_tx.clone();
+        let fd = stream.as_raw_fd();
+        let accepted = Instant::now();
         tokio::spawn(async move {
             let mut builder = hyper::server::conn::http1::Builder::new();
             builder
@@ -144,14 +171,35 @@ pub async fn run(
                     .serve_connection(TokioIo::new(stream), TowerToHyperService::new(service))
                     .with_upgrades()
             );
+            // Set once evicted with a request already arriving.
+            let mut grace = None;
             loop {
-                let (phase, deadline) = conn.standing();
-                if phase == Phase::Closed {
-                    // Evicted, past its deadline, or dropped by a stop or
-                    // freeze: hang up mid-request.
-                    break;
+                let (phase, mut deadline) = conn.standing();
+                match phase {
+                    Phase::Closed => break,
+                    Phase::Evicted => match grace {
+                        Some(until) => deadline = until,
+                        // A request head that arrived (or is arriving)
+                        // as it was evicted is still sorted: a credential
+                        // moves it to the main pool, none has it compete
+                        // for a slot again. A moment more for that, and
+                        // for a connection just accepted whose head is on
+                        // its way; one silent longer hangs up.
+                        None => {
+                            let now = Instant::now();
+                            deadline = if conn.has_head() || bytes_waiting(fd) {
+                                now + EVICTED_GRACE
+                            } else if now < accepted + SETTLE {
+                                accepted + SETTLE
+                            } else {
+                                break;
+                            };
+                            grace = Some(deadline);
+                        }
+                    },
+                    Phase::Pending | Phase::Main => {}
                 }
-                let pending = phase == Phase::Pending;
+                let pending = phase != Phase::Main;
                 tokio::select! {
                     _ = served.as_mut() => break,
                     () = closed(&mut close) => {

@@ -284,6 +284,7 @@ function applyStatus(message) {
     else delete state.rollup[message.workspace_id];
   }
   renderStatus();
+  handoff.onStatus();
 }
 
 // The other pushes; `machine`: the machine that sent it (null: here).

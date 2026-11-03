@@ -282,7 +282,7 @@ function renderSession(session, index) {
     el(
       "span",
       { className: "session-meta" },
-      session.machine ? machineBadge(session.machine) : null,
+      // No machine badge: a machine's rows sit under its own head.
       recBadge(session),
       el("span", { className: `session-state ${st.tone}`, textContent: st.label, title: st.title || undefined }),
       launcher.rowChip(session),

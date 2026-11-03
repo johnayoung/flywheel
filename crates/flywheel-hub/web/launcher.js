@@ -272,12 +272,15 @@ window.FwHubLauncher = function (ctx) {
     box.dataset.kind = kind;
     // A template starts an agent: a shell has nothing to save.
     $("#tpl-save-toggle").hidden = !agent;
-    if (!agent) tplSave.hidden = true;
+    if (!agent) {
+      tplSave.hidden = true;
+      $("#tpl-save-toggle").textContent = "save as template";
+    }
     models.replaceChildren(...(MODELS[kind] || []).map((m) => el("option", { value: m })));
     const fromHub = agent && ctx.hubDefault ? ctx.hubDefault(`agents.${kind}.model`) : null;
     modelInput.placeholder = fromHub !== null
       ? `hub default: ${fromHub}`
-      : kind === "codex" ? "CLI default (e.g. gpt-5-codex)" : "CLI default (e.g. opus, sonnet)";
+      : "CLI default";
     prefill();
     updateWarning();
   }
@@ -351,6 +354,7 @@ window.FwHubLauncher = function (ctx) {
     filled = null;
     prefill();
     tplSave.hidden = true;
+    $("#tpl-save-toggle").textContent = "save as template";
     tplName.value = "";
     tplError.textContent = "";
     note("");
@@ -462,6 +466,7 @@ window.FwHubLauncher = function (ctx) {
       await ctx.refresh();
       renderTemplates(name);
       tplSave.hidden = true;
+      $("#tpl-save-toggle").textContent = "save as template";
       note(`${exists ? "Replaced" : "Saved"} template ${name}.`);
     } catch (error) {
       tplError.textContent = error.message;
@@ -482,8 +487,13 @@ window.FwHubLauncher = function (ctx) {
     }
   }
 
+  // Open, the template form's own link closes it (not a second "save").
+  const tplToggleLabel = () => {
+    $("#tpl-save-toggle").textContent = tplSave.hidden ? "save as template" : "cancel template";
+  };
   $("#tpl-save-toggle").addEventListener("click", () => {
     tplSave.hidden = !tplSave.hidden;
+    tplToggleLabel();
     tplError.textContent = "";
     note("");
     disarm(tplSaveGo);

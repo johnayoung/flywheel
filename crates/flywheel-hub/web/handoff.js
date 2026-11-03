@@ -529,6 +529,22 @@ window.FwHubHandoff = function (ctx) {
     panel.node.replaceChildren(...parts);
   }
 
+  // A status push: a shown panel whose reviewer's status changed is
+  // repainted now (its chip matches the sidebar), and re-reads the
+  // findings once the reviewer has finished.
+  function onStatus() {
+    for (const [authorId, panel] of panels) {
+      if (!panel.node.isConnected) continue;
+      const author = sessionById(authorId);
+      const reviewer = author && author.reviewer ? sessionById(author.reviewer) : null;
+      const now = reviewer ? (ctx.agentStatus(reviewer) || {}).status || "" : "";
+      if (now === panel.status) continue;
+      panel.status = now;
+      paint(authorId);
+      if (reviewer && (now === "done" || now === "idle")) loadFindings(authorId);
+    }
+  }
+
   // The panel for the Review drawer of `session` (null: nothing to pair).
   function reviewPanel(session) {
     const author = authorOf(session);
@@ -644,6 +660,7 @@ window.FwHubHandoff = function (ctx) {
     sendTranscript,
     askReview,
     reviewPanel,
+    onStatus,
     pairChip,
     paletteItems,
     targets,

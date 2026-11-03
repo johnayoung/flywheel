@@ -750,6 +750,7 @@ window.FwHubSearch = function (ctx) {
     } else if (viewer.first > 0) {
       nodes.push(el("p", { className: "tx-note", textContent: `The ${viewer.first} oldest messages are past what the hub keeps of this transcript.` }));
     }
+    const canSend = !!ctx.handoff && ctx.handoff().targets(viewer.session.session_id).length > 0;
     for (const m of list) {
       const who = m.kind === "tool" ? `tool · ${m.tool || ""}` : m.role;
       nodes.push(el(
@@ -767,7 +768,11 @@ window.FwHubSearch = function (ctx) {
               type: "button",
               className: "text-btn tx-send",
               textContent: "To agent…",
-              title: "Send this message (or the part of it selected) to another agent session",
+              // Nothing to send to: say so here, and keep the transcript open.
+              disabled: !canSend,
+              title: canSend
+                ? "Send this message (or the part of it selected) to another agent session"
+                : "No other agent session is running to send it to",
               onclick: (event) => {
                 const article = event.currentTarget.closest("article");
                 const chosen = window.getSelection();

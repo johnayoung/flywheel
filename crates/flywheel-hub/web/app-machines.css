@@ -9,13 +9,17 @@
 .machine-group + .machine-group { margin-top: .35rem; border-top: 1px solid var(--rule); }
 .machine-head {
   position: sticky;
-  top: 0;
+  /* Flush with #workspaces' top edge (past its .4rem padding), so no
+     scrolled row shows above the head. */
+  top: -.4rem;
   z-index: 2;
   display: flex;
   align-items: center;
   gap: .5rem;
   padding: .5rem .8rem .35rem .85rem;
-  background: linear-gradient(var(--bg-2) 70%, transparent);
+  /* Opaque: rows scrolled under the sticky head never show through. */
+  background: var(--bg-2);
+  box-shadow: 0 1px 0 var(--rule);
   font-size: 9.5px;
   letter-spacing: .14em;
   text-transform: uppercase;
@@ -59,6 +63,9 @@
 @media (prefers-reduced-motion: reduce) { .machine-dot.link-connecting { animation: none; } }
 .machine-head.link-offline ~ .workspace, .machine-head.link-refused ~ .workspace { opacity: .62; }
 .machine-empty { padding-left: 1.35rem; }
+/* What is scrolled into view (the active row, a keyboard move) stops
+   below the sticky head instead of under it. */
+.machine-group .ws-head-row, .machine-group .session { scroll-margin-top: 2.4rem; }
 
 /* A machine's name on its sessions: a stamped tag. */
 .machine-badge {
@@ -92,7 +99,7 @@
   #flip-label { display: none; }
   .crumbs { gap: .3rem; }
   .crumb-session { min-width: 4.5ch; }
-  .crumbs .why-btn { min-width: 0; padding: .1rem .2rem; font-size: 10px; letter-spacing: 0; }
+  .crumbs .why-btn { min-width: 2.75rem; padding: .1rem .2rem; font-size: 10px; letter-spacing: 0; }
   .crumb-machine .machine-badge { max-width: 3.8rem; padding: .05rem .2rem; }
 }
 

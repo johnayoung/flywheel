@@ -442,6 +442,7 @@ window.FwHubQueue = function (ctx) {
     try {
       await add(id, prompt, when.value);
       text.value = "";
+      text.style.height = "";
     } catch (error) {
       toast(`Not queued: ${error.message}`, { tone: "bad", timeout: 7000 });
     } finally {
@@ -455,6 +456,13 @@ window.FwHubQueue = function (ctx) {
       $("#q-form").requestSubmit();
     }
   });
+  // Grows with what is typed (up to its CSS max), so no line scrolls out
+  // of sight above.
+  const fit = () => {
+    text.style.height = "auto";
+    text.style.height = `${text.scrollHeight + 2}px`;
+  };
+  text.addEventListener("input", fit);
   $("#q-pause").addEventListener("click", () => {
     if (ui.view) setPaused(!ui.view.paused);
   });

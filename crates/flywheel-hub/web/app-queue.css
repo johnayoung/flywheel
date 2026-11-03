@@ -83,6 +83,8 @@
 .q-when-field { flex: 1 1 auto; min-width: 0; }
 .q-when-field select { min-width: 0; width: 100%; }
 .q-form-row .slab { flex: none; }
+.q-hint { flex: none; font-size: 10.5px; color: var(--ink-3); white-space: nowrap; }
+@media (pointer: coarse) { .q-hint { display: none; } }
 .q-edit-row select {
   flex: 1;
   min-width: 0;

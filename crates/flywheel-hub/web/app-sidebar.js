@@ -517,9 +517,8 @@ function renderMain() {
     kind.textContent = (session.kind || "shell") + (session.fallback_command ? " (as shell)" : "");
     kind.className = `kind-tag ${session.kind || "shell"}`;
   }
-  // The LRMs keep a path's slashes in place under the start-ellipsis
-  // (direction: rtl) styling.
-  $("#meter-cwd").textContent = session ? `\u200e${session.cwd}\u200e` : "";
+  // Cut from its start (the .path-tail styling).
+  $("#meter-cwd").textContent = session ? window.FwHubFmt.pathTail(session.cwd) : "";
   $("#meter-cwd").title = session ? session.cwd : "";
   launcher.renderHeader(session);
   sharing.renderHeader(session);

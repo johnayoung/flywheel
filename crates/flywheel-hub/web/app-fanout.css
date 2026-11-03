@@ -41,6 +41,8 @@
 }
 .fo-empty { color: var(--ink-2); margin: 2rem 0; }
 .fo-note { color: var(--ink-3); font-size: 10.5px; }
+.fo-where { display: flex; flex: 1 1 0; min-width: 12rem; white-space: pre; }
+.fo-where .path-tail { flex: 1 1 0; }
 .fo-error { margin: 0; color: var(--alert); font-size: 11.5px; overflow-wrap: anywhere; }
 
 .fo-graders { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .6rem; }
@@ -185,7 +187,8 @@
 .fo-pickrow .fo-path { min-width: 0; }
 .fo-pickrow b { flex: none; }
 .fo-losers li > * { min-width: 0; overflow-wrap: anywhere; }
-.fo-path { color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
+.fo-path { color: var(--ink-3); font-size: 10.5px; }
+.fo-pickrow .fo-path { flex: 1 1 0; }
 .fo-loser-state { color: var(--fw-ok); font-size: 10.5px; }
 .fo-loser-state.keep { color: var(--brass); }
 .fo-force, .fo-check { display: flex; align-items: flex-start; gap: .5rem; color: var(--ink-2); font-size: 11.5px; line-height: 1.45; }

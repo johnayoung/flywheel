@@ -693,9 +693,8 @@ window.FwHubFlywheel = function (ctx) {
     const folder = ui.folder;
     const panel = ui.panel && ui.panel.folder === folder ? ui.panel : null;
     $("#fw-title").textContent = labelFor(folder);
-    // The LRMs keep the path's slashes in place under the start-ellipsis
-    // (direction: rtl) styling, as the header's cwd meter does.
-    $("#fw-path").textContent = `\u200e${pathOf(folder)}\u200e`;
+    // Cut from its start, as the header's cwd meter is.
+    $("#fw-path").textContent = window.FwHubFmt.pathTail(pathOf(folder));
     $("#fw-path").title = machineOfKey(folder) ? `${pathOf(folder)} on ${machineOfKey(folder)}` : folder;
     const workers = workerSessions(folder);
     const body = $("#fw-body");

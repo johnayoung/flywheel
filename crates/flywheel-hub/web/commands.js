@@ -122,8 +122,77 @@ window.FwHubCommands = function (ctx) {
 
   // --- toasts ----------------------------------------------------------
 
+  // One toast layer for the whole page, newest last, at most three. It is
+  // a manual popover, so it shows in the top layer, over any dialog. A
+  // modal dialog makes everything outside it inert (a toast's buttons
+  // would not take clicks), so while one is open the layer moves into the
+  // topmost and is shown again there; it returns to the page when the
+  // dialogs close. An open dialog never sits under the toasts either:
+  // while both show, the dialog ends above the stack (`--toast-room`, read
+  // by the dialog rules in app-dialogs.css).
+  const toastRoot = $("#toasts");
+  const modals = []; // open modal dialogs, the most recently opened last
+
+  const hostWatch = new MutationObserver(() => {
+    if (!toastRoot.isConnected) raiseToasts();
+  });
+
+  const isModal = (dialog) => {
+    try {
+      return dialog.matches(":modal");
+    } catch (_) {
+      return true;
+    }
+  };
+
+  function raiseToasts() {
+    for (let i = modals.length - 1; i >= 0; i--) {
+      if (!modals[i].isConnected || !modals[i].open) modals.splice(i, 1);
+    }
+    const host = modals[modals.length - 1] || document.body;
+    const showing = typeof toastRoot.showPopover === "function";
+    if (toastRoot.parentElement !== host) {
+      host.append(toastRoot);
+      // A dialog that redraws itself (replaceChildren) drops the layer:
+      // it is put back.
+      hostWatch.disconnect();
+      if (host !== document.body) hostWatch.observe(host, { childList: true });
+    }
+    if (!toastRoot.children.length || !showing) return;
+    try {
+      if (toastRoot.matches(":popover-open")) toastRoot.hidePopover();
+      toastRoot.showPopover();
+    } catch (_) {
+      // No popover support: toasts stay in the page.
+    }
+  }
+
+  function dockToasts() {
+    const box = toastRoot.children.length ? toastRoot.getBoundingClientRect() : null;
+    const room = box && box.height > 0 && modals.length ? Math.ceil(window.innerHeight - box.top + 12) : 0;
+    document.documentElement.style.setProperty("--toast-room", `${room}px`);
+    document.body.classList.toggle("toast-docked", room > 0);
+  }
+
+  new MutationObserver((changes) => {
+    let moved = false;
+    for (const change of changes) {
+      const dialog = change.target;
+      if (dialog.tagName !== "DIALOG") continue;
+      const at = modals.indexOf(dialog);
+      if (at >= 0) modals.splice(at, 1);
+      if (dialog.open && isModal(dialog)) modals.push(dialog);
+      moved = true;
+    }
+    if (moved) raiseToasts();
+    dockToasts();
+  }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["open"] });
+  if (typeof ResizeObserver === "function") new ResizeObserver(dockToasts).observe(toastRoot);
+  new MutationObserver(dockToasts).observe(toastRoot, { childList: true });
+  window.addEventListener("resize", dockToasts);
+
   function toast(message, { actions = [], timeout = 4500, tone = "" } = {}) {
-    const root = $("#toasts");
+    const root = toastRoot;
     const node = el(
       "div",
       { className: `toast${tone ? ` ${tone}` : ""}` },
@@ -139,16 +208,8 @@ window.FwHubCommands = function (ctx) {
     });
     root.append(node);
     while (root.children.length > 3) root.firstElementChild.remove();
-    // A modal dialog sits in the top layer, over everything else: the
-    // toasts (a manual popover) are shown again so they rise above it.
-    if (typeof root.showPopover === "function") {
-      try {
-        if (root.matches(":popover-open")) root.hidePopover();
-        root.showPopover();
-      } catch (_) {
-        // No popover support: toasts stay in the page.
-      }
-    }
+    raiseToasts();
+    dockToasts();
     // A phone's open sessions drawer hides the toasts (they would cover
     // its footer): the clock waits until it closes, so none goes unseen.
     const hiddenNow = () =>

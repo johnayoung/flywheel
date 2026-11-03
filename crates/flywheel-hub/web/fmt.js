@@ -1,6 +1,8 @@
 // Shared formats: token counts, dollar amounts, sizes, counted words, and
 // shortcut hints read the same on every surface (the header's usage meter,
-// the launcher, the sidebar, the Flywheel panel, the fan-out board, ...).
+// the launcher, the sidebar, the Flywheel panel, the fan-out board, ...);
+// paths cut from their start; and where a popover opened from a button
+// goes.
 "use strict";
 
 window.FwHubFmt = (() => {
@@ -40,5 +42,27 @@ window.FwHubFmt = (() => {
     return key ? `${text} (${key})` : text;
   }
 
-  return { tokens, dollars, plural, bytes, withKey };
+  // A path for a `.path-tail` element (cut from its start, so the end --
+  // the repo, the worktree's task -- stays): the LRMs keep its slashes in
+  // place under that styling's `direction: rtl`.
+  function pathTail(path) {
+    return `\u200e${path || ""}\u200e`;
+  }
+
+  // Put `pop` (position: fixed) under `trigger`: `gap` below it, its left
+  // edge at the trigger's (moved left as far as it takes to stay `margin`
+  // inside the window), at most `width` wide and no taller than the room
+  // left below.
+  function placeUnder(pop, trigger, width, { margin = 8, gap = 6 } = {}) {
+    const box = trigger.getBoundingClientRect();
+    const w = Math.min(width, window.innerWidth - 2 * margin);
+    const left = Math.max(margin, Math.min(box.left, window.innerWidth - w - margin));
+    const top = box.bottom + gap;
+    pop.style.width = `${w}px`;
+    pop.style.left = `${Math.round(left)}px`;
+    pop.style.top = `${Math.round(top)}px`;
+    pop.style.maxHeight = `min(70vh, 34rem, ${Math.max(120, Math.floor(window.innerHeight - top - margin))}px)`;
+  }
+
+  return { tokens, dollars, plural, bytes, withKey, pathTail, placeUnder };
 })();

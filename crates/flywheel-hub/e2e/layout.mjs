@@ -1,5 +1,7 @@
-// End-to-end check of the hub's tabs + split panes in a real browser
-// (opt-in; not part of scripts/check.sh, which has no node step).
+// End-to-end check of the hub's layout in a real browser: tabs + split
+// panes, the desktop sidebar, popovers, toasts over dialogs, long paths,
+// and phone tap targets (opt-in; not part of scripts/check.sh, which has
+// no node step).
 //
 //   node crates/flywheel-hub/e2e/layout.mjs [OUT_DIR]
 //
@@ -7,10 +9,10 @@
 // the playwright package; default: resolved from node's paths), CHROMIUM
 // (a browser executable, when playwright's own is not installed), PORT (the
 // hub's port; default: a free one). Runs a hub on a temp state dir and a
-// port with a fake `claude` first on PATH;
+// port with a fake `claude` first on PATH (and git for one real repo);
 // never touches the default state dir or port 7420. Screenshots go to
 // OUT_DIR (default: a temp dir, printed). Exit 0 = every check passed.
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import net from "node:net";
@@ -46,9 +48,25 @@ function freePort() {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // A fake Claude Code: prints a banner and a prompt, then echoes input.
+// Asked to "polish", it also writes a transcript with usage (the header's
+// meter) and reports itself blocked (the why? button).
 const bin = path.join(tmp, "bin");
 fs.mkdirSync(bin);
-fs.writeFileSync(path.join(bin, "claude"), "#!/bin/sh\necho 'fake claude'\nprintf '> '\nexec cat\n", { mode: 0o755 });
+const claudeConfig = path.join(tmp, "claude-config");
+fs.mkdirSync(path.join(claudeConfig, "projects", "e2e"), { recursive: true });
+fs.writeFileSync(path.join(bin, "claude"), `#!/bin/sh
+case "$*" in
+*polish*)
+  id=""
+  for a in "$@"; do [ "$prev" = "--session-id" ] && id="$a"; prev="$a"; done
+  printf '%s\\n' '{"type":"assistant","uuid":"u1","timestamp":"2026-11-03T10:00:00.000Z","message":{"id":"m1","model":"claude-sonnet-5-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1200,"output_tokens":300,"cache_read_input_tokens":40000}}}' > "$CLAUDE_CONFIG_DIR/projects/e2e/$id.jsonl"
+  "$FW_BIN" hub report --source claude --event Notification --detail permission_prompt </dev/null >/dev/null 2>&1
+  ;;
+esac
+echo 'fake claude'
+printf '> '
+exec cat
+`, { mode: 0o755 });
 const repo = path.join(tmp, "repo");
 fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
 const state = path.join(tmp, "state");
@@ -56,7 +74,7 @@ const state = path.join(tmp, "state");
 const port = process.env.PORT ? Number(process.env.PORT) : await freePort();
 const base = `http://127.0.0.1:${port}`;
 const hub = spawn(fw, ["hub", "serve", "--state-dir", state, "--port", String(port), "--no-flywheel"], {
-  env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SHELL: "/bin/sh" },
+  env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SHELL: "/bin/sh", CLAUDE_CONFIG_DIR: claudeConfig, FW_BIN: fw },
   stdio: ["ignore", "ignore", "inherit"],
 });
 
@@ -268,6 +286,123 @@ try {
   check(widened >= 1, `phone -> desktop width restores the layout (${widened} panes)`);
   await desk.close();
 
+  // --- desktop 1440x900: sidebar, popovers, toasts, long paths --------------
+  // A real git repo at a long path: a worktree agent and a fan-out.
+  const repo3 = path.join(tmp, "code", "an-unusually-long-repository-directory-name-for-layout");
+  fs.mkdirSync(repo3, { recursive: true });
+  const git = (...args) => execFileSync("git", ["-C", repo3, ...args], {
+    stdio: "ignore",
+    env: { ...process.env, GIT_AUTHOR_NAME: "e2e", GIT_AUTHOR_EMAIL: "e2e@example.invalid", GIT_COMMITTER_NAME: "e2e", GIT_COMMITTER_EMAIL: "e2e@example.invalid" },
+  });
+  git("init", "-q", "-b", "main");
+  fs.writeFileSync(path.join(repo3, "README"), "e2e\n");
+  git("add", "README");
+  git("commit", "-qm", "init");
+  const ws3 = await api("POST", "/api/workspaces", { name: "polish", folders: [repo3] });
+  const task = "a-deliberately-long-task-name-for-the-path";
+  const agent = await api("POST", "/api/sessions", { workspace_id: ws3.id, kind: "claude", prompt: "polish", worktree: { task }, cols: 100, rows: 30 });
+  await api("POST", "/api/fanouts", { workspace_id: ws3.id, prompt: "do it", candidates: [{ kind: "claude" }, { kind: "claude" }], graders: ["true"] });
+  const pol = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const pp = await pol.newPage();
+  await pp.goto(`${base}/login?token=${token}#session=${agent.id}`);
+  await pp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
+  await pp.waitForFunction(() => !document.querySelector("#crumb-why").hidden && !document.querySelector("#meter-usage").hidden, null, { timeout: 15000 })
+    .catch(() => {});
+  const rectOf = (sel) => pp.evaluate((sel) => {
+    const n = document.querySelector(sel);
+    if (!n || n.hidden) return null;
+    const r = n.getBoundingClientRect();
+    return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+  }, sel);
+  // The sidebar's footer (actions + utilities) keeps to a strip, its
+  // utilities whole, named, and not covered.
+  const foot = await pp.evaluate(() => {
+    const top = document.querySelector(".side-actions").getBoundingClientRect().top;
+    const bad = [];
+    for (const n of document.querySelectorAll(".side-foot .chip")) {
+      const r = n.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!hit || !n.contains(hit)) bad.push(`${n.id || n.dataset.action} covered`);
+      if (r.bottom > innerHeight || r.right > document.querySelector("#sidebar").getBoundingClientRect().right) bad.push(`${n.id || n.dataset.action} cut off`);
+      if (!n.textContent.trim()) bad.push(`${n.id || n.dataset.action} has no name`);
+    }
+    return { height: Math.round(innerHeight - top), bad };
+  });
+  check(foot.height <= 180 && foot.bad.length === 0, `desktop: sidebar footer is ${foot.height}px (at most 180), every utility whole and named (${foot.bad.join(", ")})`);
+  // why? and usage open under their buttons.
+  const anchored = async (trigger, pop) => {
+    await pp.locator(trigger).click();
+    await pp.waitForTimeout(400);
+    const t = await rectOf(trigger);
+    const p = await rectOf(pop);
+    await pp.keyboard.press("Escape");
+    await pp.waitForTimeout(200);
+    const ok = !!(t && p) && p.top >= t.bottom && p.top - t.bottom <= 12 && p.left <= t.left + t.width / 2 && p.right >= t.left + t.width / 2 && p.right <= 1440;
+    return { ok, t, p };
+  };
+  for (const [trigger, pop] of [["#crumb-why", "#why-pop"], ["#meter-usage", "#usage-pop"]]) {
+    const a = await anchored(trigger, pop);
+    check(a.ok, `desktop: ${pop} opens anchored under ${trigger} (${JSON.stringify(a)})`);
+  }
+  // A long worktree path is cut from its start: its end (the task) shows.
+  const tail = (sel) => pp.evaluate(({ sel, task }) => {
+    const n = document.querySelector(sel);
+    if (!n) return { ok: false, why: "missing" };
+    const text = n.firstChild;
+    const range = document.createRange();
+    const box = n.getBoundingClientRect();
+    const at = (i) => { range.setStart(text, i); range.setEnd(text, i + 1); return range.getBoundingClientRect(); };
+    const end = text.data.lastIndexOf(task.slice(-1));
+    const first = at(1);
+    const last = at(end);
+    return {
+      ok: n.scrollWidth > n.clientWidth && getComputedStyle(n).textOverflow === "ellipsis" && last.right <= box.right + 1 && last.left >= box.left && first.left < box.left,
+      text: text.data.trim().slice(-30),
+    };
+  }, { sel, task });
+  const meterTail = await tail("#meter-cwd");
+  check(meterTail.ok, `desktop: the header's worktree path is cut from its start (${JSON.stringify(meterTail)})`);
+  await pp.locator(`.session[data-id="${agent.id}"]`).hover();
+  await pp.locator(`.session[data-id="${agent.id}"] [aria-label="Close session"]`).click();
+  await pp.waitForSelector("#dlg-close-wt[open] #cwt-where .path-tail", { timeout: 5000 });
+  await pp.waitForTimeout(300);
+  const dialogTail = await tail("#cwt-where .path-tail");
+  check(dialogTail.ok, `desktop: the close dialog's worktree path is cut from its start (${JSON.stringify(dialogTail)})`);
+  await pp.screenshot({ path: path.join(out, "desktop-close-worktree.png") });
+  await pp.keyboard.press("Escape");
+  await pp.waitForTimeout(300);
+  // A toast while the fan-out board is open: above the board, clickable,
+  // and never over it.
+  await pp.locator('[data-action="fanouts"]').click();
+  await pp.waitForSelector("#dlg-fanout[open] .fo-card, #dlg-fanout[open] button", { timeout: 10000 });
+  await pp.locator("#dlg-fanout button", { hasText: "Re-grade" }).first().click();
+  await pp.waitForSelector(".toast", { timeout: 5000 });
+  await pp.waitForTimeout(400);
+  const overBoard = async (dialog) => pp.evaluate((dialog) => {
+    const d = document.querySelector(dialog).getBoundingClientRect();
+    const bad = [];
+    for (const t of document.querySelectorAll(".toast")) {
+      const r = t.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!hit || !t.contains(hit)) bad.push(`under ${hit ? hit.tagName + "." + hit.className : "nothing"}`);
+      if (r.left < d.right && r.right > d.left && r.top < d.bottom && r.bottom > d.top) bad.push("overlaps the dialog");
+    }
+    return { toasts: document.querySelectorAll(".toast").length, bad };
+  }, dialog);
+  const board = await overBoard("#dlg-fanout");
+  check(board.toasts > 0 && board.bad.length === 0, `desktop: a toast over the fan-out board is on top, clickable, never over it (${JSON.stringify(board)})`);
+  await pp.screenshot({ path: path.join(out, "desktop-board-toast.png") });
+  await pp.keyboard.press("Escape");
+  await pp.waitForTimeout(300);
+  // ... and over a dialog opened while it shows.
+  await pp.locator('.side-actions [data-action="new-session"]').click();
+  await pp.waitForSelector("#dlg-session[open]");
+  await pp.waitForTimeout(300);
+  const sheet = await overBoard("#dlg-session");
+  check(sheet.toasts > 0 && sheet.bad.length === 0, `desktop: a toast stays on top of a dialog opened after it, never over it (${JSON.stringify(sheet)})`);
+  await pp.keyboard.press("Escape");
+  await pol.close();
+
   // --- phone 390x844 ------------------------------------------------------
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
   const mp = await phone.newPage();
@@ -402,6 +537,35 @@ try {
     () => check(false, "phone: menu opens the sessions sidebar"),
   );
   await mp.screenshot({ path: path.join(out, "phone-sidebar.png") });
+  // The replay player and a share link's view: every control at least
+  // 44x44 (a checkbox counts by its label).
+  await api("POST", `/api/sessions/${sids[1]}/record/start`);
+  await api("POST", `/api/sessions/${sids[1]}/input`, { data: "echo recorded\r" });
+  await sleep(800);
+  const recording = (await api("POST", `/api/sessions/${sids[1]}/record/stop`)).recording;
+  const share = await api("POST", "/api/shares", { session_id: sids[1], expires_in: 600 });
+  const tapTargets = (page) => page.evaluate(() => [
+    ...document.querySelectorAll("button, a[href], input, select, summary, [role=button]"),
+  ].filter((n) => n.offsetParent !== null || getComputedStyle(n).position === "fixed")
+    .map((n) => {
+      const target = n.closest("label") || n;
+      const r = target.getBoundingClientRect();
+      return [n.id || n.className || n.tagName, Math.round(r.width), Math.round(r.height)];
+    })
+    .filter(([, w, h]) => w > 0 && (w < 44 || h < 44)));
+  await mp.goto(`${base}/replay#${encodeURIComponent(recording.name)}`);
+  await mp.waitForSelector(".xterm", { timeout: 15000 });
+  await mp.waitForTimeout(800);
+  const replaySmall = await tapTargets(mp);
+  check(replaySmall.length === 0, `phone: /replay tap targets at least 44x44 (${JSON.stringify(replaySmall)})`);
+  await mp.screenshot({ path: path.join(out, "phone-replay.png") });
+  const viewer = await phone.newPage();
+  await viewer.goto(`${base}/share/${share.credential}`);
+  await viewer.waitForSelector(".xterm", { timeout: 15000 });
+  await viewer.waitForTimeout(800);
+  const shareSmall = await tapTargets(viewer);
+  check(shareSmall.length === 0, `phone: /share tap targets at least 44x44 (${JSON.stringify(shareSmall)})`);
+  await viewer.screenshot({ path: path.join(out, "phone-share.png") });
   await phone.close();
 } finally {
   if (browser) await browser.close();

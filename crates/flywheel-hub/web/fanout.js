@@ -75,7 +75,7 @@ window.FwHubFanout = function (ctx) {
   // The board's fan-out: its full view once fetched, else its summary.
   const shownFanout = () => (ui.full && ui.full.id === ui.open ? ui.full : byId(ui.open));
   const short = (sha) => (sha || "").slice(0, 10);
-  const { tokens, dollars } = window.FwHubFmt;
+  const { tokens, dollars, pathTail } = window.FwHubFmt;
   const money = (usd) => (usd === null || usd === undefined ? null : dollars(usd));
   const agentLabel = (c) => (c.model ? `${c.kind}:${c.model}` : c.kind);
 
@@ -494,7 +494,9 @@ window.FwHubFanout = function (ctx) {
     const foot = el(
       "footer",
       { className: "fo-foot" },
-      el("span", { className: "fo-note", textContent: `created ${age(f.created_at)} ago · ${f.folder || f.repo}` }),
+      el("span", { className: "fo-note fo-where" },
+        `created ${age(f.created_at)} ago · `,
+        el("span", { className: "path-tail", textContent: pathTail(f.folder || f.repo), title: f.folder || f.repo })),
       el("button", {
         type: "button",
         className: "text-btn danger",
@@ -557,7 +559,7 @@ window.FwHubFanout = function (ctx) {
       items.map((i) =>
         el("li", {},
           el("b", { textContent: i.candidate }),
-          el("span", { className: "fo-path", textContent: i.path }),
+          el("span", { className: "fo-path path-tail", textContent: pathTail(i.path), title: i.path }),
           el("span", { className: `fo-loser-state${i.refusal ? " keep" : ""}`, textContent: i.refusal ? `holds unique work: ${i.refusal}` : "nothing unique: removable" }))),
     );
   }
@@ -646,7 +648,7 @@ window.FwHubFanout = function (ctx) {
       return el(
         "li",
         {},
-        el("label", { className: "fo-pickrow" }, box, el("b", { textContent: i.candidate }), el("span", { className: "fo-path", textContent: i.path })),
+        el("label", { className: "fo-pickrow" }, box, el("b", { textContent: i.candidate }), el("span", { className: "fo-path path-tail", textContent: pathTail(i.path), title: i.path })),
         el("span", { className: `fo-loser-state${i.refusal ? " keep" : ""}`, textContent: i.refusal ? `holds unique work: ${i.refusal}` : "nothing unique: removable" }),
       );
     });

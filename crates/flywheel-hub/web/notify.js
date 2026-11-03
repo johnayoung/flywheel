@@ -33,12 +33,17 @@ window.FwHubNotify = function (ctx) {
     const on = isOn();
     const denied = permission() === "denied";
     chip.classList.toggle("on", on);
+    chip.classList.toggle("blocked", !on && denied);
     chip.setAttribute("aria-pressed", String(on));
-    $("#alerts-label").textContent = on ? "alerts on" : denied ? "alerts blocked" : "alerts off";
+    const label = on ? "alerts on" : denied ? "alerts blocked" : "alerts off";
+    $("#alerts-label").textContent = label;
     const server = push ? `; push to ${push.host} (${push.events.join(", ")}) is on for the hub` : "";
+    // The title leads with the state: a desktop sidebar shows only the dot.
     chip.title = on
-      ? `This device is notified when an agent is blocked or done while the hub is in the background${server}`
-      : `Notify this device when an agent is blocked or done${server}`;
+      ? `Alerts on: this device is notified when an agent is blocked or done while the hub is in the background${server}`
+      : denied
+        ? `Alerts blocked: this browser refused notifications for the hub (allow them in its site settings)${server}`
+        : `Alerts off: notify this device when an agent is blocked or done${server}`;
   }
 
   async function toggle() {

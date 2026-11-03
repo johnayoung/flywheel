@@ -700,6 +700,7 @@ function applyTheme(next, persist = true) {
   if (persist && next !== themePref()) settings.set("appearance.theme", next);
   document.documentElement.dataset.theme = theme;
   $("#theme-label").textContent = theme;
+  $("#theme-toggle").title = `Theme: ${theme} (click for the next)`;
   for (const pane of livePanes()) {
     if (!pane.term) continue;
     pane.term.options.theme = TERM_THEMES[resolvedTheme()];

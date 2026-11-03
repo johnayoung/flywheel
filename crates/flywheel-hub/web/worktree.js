@@ -27,12 +27,16 @@ window.FwHubWorktree = function (ctx) {
     blocked: false, // the last check found the worktree cannot be cut
   };
 
-  const { plural } = window.FwHubFmt;
+  const { plural, pathTail } = window.FwHubFmt;
 
-  function setNote(text, tone) {
-    note.textContent = text || "";
+  // `content`: text, or nodes.
+  function setNote(content, tone) {
+    note.replaceChildren(...(Array.isArray(content) ? content : content ? [content] : []));
     note.className = `wt-note${tone ? ` ${tone}` : ""}`;
   }
+
+  // A worktree path as a line of its own, cut from its start.
+  const pathLine = (path) => el("code", { className: "path-tail", textContent: pathTail(path), title: path });
 
   // Launch is held while the live check shows the worktree cannot be cut.
   function setBlocked(blocked) {
@@ -111,13 +115,13 @@ window.FwHubWorktree = function (ctx) {
     baseInput.placeholder = form.defaultBase ? `${form.defaultBase} (current branch)` : "HEAD";
     bases.replaceChildren(...(view.branches || []).map((b) => el("option", { value: b })));
     if (!toggle.checked) {
-      setNote(view.dir ? `Sibling worktrees go in ${view.dir}/` : view.error || "", view.dir ? "" : "bad");
+      setNote(view.dir ? ["Sibling worktrees go in", pathLine(`${view.dir}/`)] : view.error || "", view.dir ? "" : "bad");
     } else if (view.plan) {
-      setNote(`${view.plan.path}  on new branch ${view.plan.branch}, from ${view.plan.base}`, "ok");
+      setNote([pathLine(view.plan.path), `on new branch ${view.plan.branch}, from ${view.plan.base}`], "ok");
     } else if (view.error) {
       setNote(view.error, "bad");
     } else {
-      setNote(`Name a task: ${view.dir}/<task> on a new branch of that name.`, "");
+      setNote(["Name a task: it runs in", pathLine(`${view.dir}/<task>`), "on a new branch of that name."], "");
     }
   }
 
@@ -235,8 +239,8 @@ window.FwHubWorktree = function (ctx) {
     $("#cwt-title").textContent = `Close ${session.name}?`;
     $("#cwt-where").replaceChildren(
       "Runs in worktree ",
-      el("code", { textContent: worktree.path }),
-      " on branch ",
+      pathLine(worktree.path),
+      "on branch ",
       el("code", { textContent: worktree.branch }),
       ` (from ${worktree.base}).`,
       session.state === "running" && session.live ? " Its process is hung up either way." : "",

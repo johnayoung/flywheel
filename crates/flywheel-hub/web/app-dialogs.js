@@ -391,7 +391,7 @@ function renderRepoPicker() {
         disabled: !!folder.missing,
       }),
       el("b", {}, folderLabel(folder), tag ? el("span", { className: "folder-tag", textContent: tag }) : null),
-      el("small", { textContent: folder.path }),
+      el("small", { className: "path-tail", textContent: window.FwHubFmt.pathTail(folder.path) }),
     );
     choice.dataset.match = `${folderLabel(folder)} ${folder.path}`.toLowerCase();
     return choice;

@@ -116,6 +116,7 @@ window.FwHubLauncher = function (ctx) {
     const meter = $("#meter-usage");
     const usage = session && session.usage;
     meter.hidden = !usage;
+    if (!usagePop.hidden) drawUsagePop(session);
     if (!usage) return;
     const models = [...new Set((usage.models || []).map((m) => m.model).filter(Boolean))];
     const primary = (usage.last_turn && usage.last_turn.model) || models[0];
@@ -129,11 +130,60 @@ window.FwHubLauncher = function (ctx) {
     meter.setAttribute("aria-label", `usage: ${meter.textContent}. Show the breakdown`);
   }
 
-  // Touch screens have no tooltips: a tap shows the breakdown.
-  $("#meter-usage").addEventListener("click", () => {
+  // The breakdown, in a popover under the meter (touch screens have no
+  // tooltips): opened and closed by the meter, closed by Escape or a
+  // press elsewhere; it follows the attached session's usage while open.
+  const usagePop = el("div", { className: "why-pop usage-pop", id: "usage-pop", role: "dialog", "aria-label": "Usage" });
+  usagePop.hidden = true;
+  document.body.append(usagePop);
+  const usageMeter = $("#meter-usage");
+  usageMeter.setAttribute("aria-haspopup", "dialog");
+  usageMeter.setAttribute("aria-controls", "usage-pop");
+  usageMeter.setAttribute("aria-expanded", "false");
+
+  function drawUsagePop(session) {
+    if (!session || !session.usage) {
+      closeUsagePop();
+      return;
+    }
+    usagePop.replaceChildren(
+      el("div", { className: "why-head" },
+        el("span", { className: "why-title", textContent: `usage · ${session.name}` }),
+        el("button", { type: "button", className: "why-close", "aria-label": "Close", onclick: closeUsagePop }, "×")),
+      el("div", { className: "usage-lines", textContent: usageTitle(session.usage) }),
+    );
+    window.FwHubFmt.placeUnder(usagePop, usageMeter, 460);
+  }
+
+  function closeUsagePop() {
+    if (usagePop.hidden) return;
+    usagePop.hidden = true;
+    usageMeter.setAttribute("aria-expanded", "false");
+  }
+
+  usageMeter.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (!usagePop.hidden) {
+      closeUsagePop();
+      return;
+    }
     const session = ctx.sessionById(state.attached);
     if (!session || !session.usage) return;
-    toast(el("div", { className: "toast-pre", textContent: usageTitle(session.usage) }), { timeout: 9000 });
+    usagePop.hidden = false;
+    usageMeter.setAttribute("aria-expanded", "true");
+    drawUsagePop(session);
+  });
+  document.addEventListener("pointerdown", (event) => {
+    if (!usagePop.hidden && !usagePop.contains(event.target) && !usageMeter.contains(event.target)) closeUsagePop();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !usagePop.hidden) {
+      closeUsagePop();
+      usageMeter.focus();
+    }
+  });
+  window.addEventListener("resize", () => {
+    if (!usagePop.hidden) window.FwHubFmt.placeUnder(usagePop, usageMeter, 460);
   });
 
   // The cost chip of a sidebar row (agent sessions with usage).

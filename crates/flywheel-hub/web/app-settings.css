@@ -103,7 +103,6 @@
 .config-table .src-file { color: var(--brass); }
 .config-table .src-default { color: var(--ink-3); }
 
-.chip.settings-gear svg { width: .8rem; height: .8rem; }
 .chip.settings-gear.warn { color: var(--alert); border-color: var(--alert); }
 
 /* Density: compact tightens the sidebar rows and pane title bars. */

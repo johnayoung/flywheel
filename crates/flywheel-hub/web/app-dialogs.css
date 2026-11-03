@@ -338,7 +338,7 @@
 
 .repo-choice input { accent-color: var(--signal); grid-row: span 2; margin: 0; }
 .repo-choice b { font-weight: 600; font-size: 12px; }
-.repo-choice small { font-size: 10px; color: var(--ink-3); overflow-wrap: anywhere; }
+.repo-choice small { font-size: 10px; color: var(--ink-3); }
 .repo-choice:has(input:checked) { border-color: var(--signal); }
 .repo-choice[hidden] { display: none; }
 .repo-choice.missing { cursor: not-allowed; opacity: .6; }
@@ -646,6 +646,16 @@
   overflow: visible;
   background: transparent;
   color: inherit;
+}
+/* Toasts while a dialog is open: the dialog ends above the stack
+   (commands.js sets --toast-room and .toast-docked), so no toast covers
+   its controls. */
+body.toast-docked dialog.sheet:modal {
+  bottom: var(--toast-room, 0px);
+  max-height: calc(100dvh - var(--toast-room, 0px) - 1.5rem);
+}
+@media (max-width: 760px) {
+  body.toast-docked dialog.sheet:modal { max-height: calc(100dvh - var(--toast-room, 0px)); }
 }
 /* A drawer open: toasts sit above its key-hint footer, not over it. */
 @media (min-width: 761px) {

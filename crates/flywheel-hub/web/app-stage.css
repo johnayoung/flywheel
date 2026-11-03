@@ -84,6 +84,27 @@
   padding: .6rem 1.1rem .9rem;
   border-top: 1px solid var(--rule);
 }
+/* The utilities (theme, alerts, machines, sharing, settings, sign out):
+   chips like the rest where there is room to read them (phones, touch),
+   one row of icon buttons on a desktop sidebar. */
+.side-tools { display: contents; }
+.chip svg { width: .8rem; height: .8rem; flex: none; }
+@media (min-width: 761px) and (pointer: fine) {
+  .side-foot { gap: .3rem; padding: .5rem 1.1rem .6rem; }
+  .side-foot .chip { gap: .3rem; padding: .28rem .42rem; }
+  .side-tools { display: flex; flex-wrap: wrap; gap: .3rem; flex-basis: 100%; }
+  .side-foot .chip.tool { width: 1.8rem; height: 1.8rem; padding: 0; justify-content: center; }
+  .side-foot .chip-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .side-actions { padding: .6rem 1.1rem; }
+}
+.chip.alerts.blocked .alerts-dot { border-style: dashed; color: var(--alert); }
 
 .chip {
   display: inline-flex;
@@ -272,6 +293,9 @@
 .why-problems { margin-top: .4rem; color: var(--alert); }
 .why-problems ul { margin: .2rem 0 0; padding-left: 1.1rem; }
 .why-note { margin: .5rem 0 0; color: var(--ink-3); font-size: 10px; }
+/* The usage meter's breakdown: the why? popover's frame, its lines as
+   written. */
+.usage-lines { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); }
 
 .meters { display: flex; align-items: center; gap: .9rem; min-width: 0; }
 /* The session name keeps room; the cwd meter gives way first. */
@@ -283,6 +307,22 @@
   color: var(--ink-3);
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+
+/* A path cut from its start (FwHubFmt.pathTail supplies the text): the
+   end -- the repo, the worktree's task -- stays in view. */
+.path-tail {
+  display: block;
+  /* Sized by its container, never by the path (a grid or flex parent
+     would otherwise widen to the whole path). */
+  contain: inline-size;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
 }
 
 .meter.cwd {

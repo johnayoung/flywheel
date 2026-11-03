@@ -75,15 +75,9 @@ window.FwHubExplain = function (ctx) {
     ].filter(Boolean));
   }
 
-  // Below the button. On a wide window it keeps to the right edge, off
-  // the terminal's left side, where the prompt it explains is drawn.
+  // Under the button, anchored to it.
   function place() {
-    const box = button.getBoundingClientRect();
-    const width = Math.min(440, window.innerWidth - 16);
-    pop.style.width = `${width}px`;
-    const left = window.innerWidth >= 900 ? window.innerWidth - width - 8 : Math.min(box.left, window.innerWidth - width - 8);
-    pop.style.left = `${Math.max(8, left)}px`;
-    pop.style.top = `${box.bottom + 6}px`;
+    window.FwHubFmt.placeUnder(pop, button, 440);
   }
 
   function schedule() {

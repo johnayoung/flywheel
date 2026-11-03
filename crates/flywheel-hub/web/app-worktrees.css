@@ -68,6 +68,7 @@
 .wt-field input:focus { outline: none; border-color: var(--signal); }
 .wt-note { margin: 0; font-size: 10.5px; color: var(--ink-3); overflow-wrap: anywhere; font-family: var(--term); }
 .wt-note:empty { display: none; }
+.wt-note .path-tail { color: inherit; font: inherit; }
 .wt-note.ok { color: var(--ink-2); }
 .wt-note.bad { color: var(--alert); }
 @media (max-width: 520px) { .wt-fields { grid-template-columns: 1fr; } }

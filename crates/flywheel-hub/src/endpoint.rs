@@ -488,8 +488,6 @@ pub fn no_hub_message(state_dir: &Path) -> String {
     )
 }
 
-/// `word` as one shell word (single-quoted when it needs to be).
-
 /// `--url`: an http(s) origin, no path, query, or credentials.
 fn parse_base(raw: &str) -> Result<Url, String> {
     let url = Url::parse(raw.trim()).map_err(|e| format!("--url {raw:?}: {e}"))?;

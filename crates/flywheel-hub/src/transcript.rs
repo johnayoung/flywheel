@@ -899,7 +899,7 @@ impl CommandBook {
         }
         let entry = self.entry(&record.id);
         let hinted = {
-            let log = entry.lock().unwrap_or_else(PoisonError::into_inner);
+            let log = entry.log();
             if let Some(tail) = log
                 .tail
                 .as_ref()
@@ -916,7 +916,7 @@ impl CommandBook {
     /// returns false.
     pub(crate) fn visit_commands(&self, id: &str, mut visit: impl FnMut(&Command) -> bool) {
         let entry = self.entry(id);
-        let log = entry.lock().unwrap_or_else(PoisonError::into_inner);
+        let log = entry.log();
         for command in log.entries.iter().rev() {
             if !visit(command) {
                 break;
@@ -1232,7 +1232,8 @@ pub fn is_fresh(command: &Command) -> bool {
 }
 
 /// Start the thread that follows running agent sessions' transcripts
-/// every [`POLL_INTERVAL`] (and at once when a report nudges it). It ends
+/// every [`POLL_INTERVAL`] (and at once when a report nudges it), and
+/// sweeps search's idle transcript indexes ([`crate::search::SearchIndex::sweep`]). It ends
 /// when the hub is dropped or [`CommandBook::stop`] is called.
 pub fn spawn_watcher(hub: &Arc<Hub>) {
     let (wake, woken) = mpsc::channel::<()>();
@@ -1262,6 +1263,8 @@ pub fn spawn_watcher(hub: &Arc<Hub>) {
                         hub.refresh_commands(&view.record);
                     }
                 }
+                // Search's transcript indexes: drop the idle ones.
+                hub.search_index().sweep();
             }
         });
 }

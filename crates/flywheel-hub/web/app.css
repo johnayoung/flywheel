@@ -3322,7 +3322,8 @@ button.meter.usage[hidden] { display: none; }
 }
 .search-sources { display: inline-flex; flex-wrap: wrap; gap: .3rem .8rem; }
 .search-status { margin: 0; padding: .45rem 1rem; color: var(--ink-3); font-size: 11px; border-bottom: 1px solid var(--rule); }
-.search-status.bad { color: var(--alert); }
+/* A regex error keeps its caret line under the pattern. */
+.search-status.bad { color: var(--alert); white-space: pre-wrap; font: 400 11px/1.4 var(--term); overflow-x: auto; }
 .search-results { flex: 1; min-height: 0; overflow-y: auto; padding: .2rem 0 .5rem; scrollbar-width: thin; }
 .search-group + .search-group { border-top: 1px solid var(--rule); }
 .search-group.gone { opacity: .55; }
@@ -3360,13 +3361,23 @@ button.meter.usage[hidden] { display: none; }
 .search-more { color: var(--ink-2); }
 .search-when { margin-left: auto; font-variant-numeric: tabular-nums; }
 .search-snippet {
+  display: flex;
+  min-width: 0;
   overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  white-space: pre;
   color: var(--ink-2);
   font: 400 12px/1.45 var(--term);
   font-variant-ligatures: none;
 }
+/* Before the match: right-aligned, so a cut takes its left end. */
+.sn-before { flex: 0 1 auto; min-width: 0; overflow: hidden; display: flex; justify-content: flex-end; }
+.sn-before > span { flex: none; }
+.search-snippet mark { flex: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+/* After it: gives way first. */
+.sn-after { flex: 0 100000 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sn-after:not(:empty) { min-width: min(8ch, 20%); }
+.search-group-more { padding: .15rem 1rem .4rem 1.6rem; }
+.search-more-btn { font-size: 11px; }
 .search-snippet mark, .tx-text mark { background: var(--signal-soft); color: var(--ink); box-shadow: 0 0 0 1px var(--signal); border-radius: 1px; }
 .search-none { margin: 0; padding: 1.2rem 1rem; color: var(--ink-3); }
 .search-keys { padding: .4rem 1rem; border-top: 1px solid var(--rule); }
@@ -3390,4 +3401,7 @@ button.meter.usage[hidden] { display: none; }
   .search-hit { grid-template-columns: 1fr; gap: .1rem; padding-left: 1rem; }
   .search-filters select { max-width: 42vw; }
   .search-keys { display: none; }
+  /* The header needs its room for the session name: on a phone search
+     opens from the sidebar's search chip and the palette. */
+  #search-toggle { display: none; }
 }

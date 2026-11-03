@@ -16,7 +16,9 @@ window.FwHubSearch = function (ctx) {
   const SOURCES = ["scrollback", "transcript", "commands"];
   const SOURCE_LABEL = { scrollback: "terminal", transcript: "transcript", commands: "command" };
   const PER_SESSION = 8;
-  const MORE_PER_SESSION = 200;
+  // Hits per source fetched by each "more" of one session (paged with
+  // the API's offset until the session has none left).
+  const MORE_PAGE = 100;
   const DEBOUNCE_MS = 220;
   // How far from the expected line a terminal hit is looked for, when
   // output arrived since the search (logical lines).
@@ -35,7 +37,8 @@ window.FwHubSearch = function (ctx) {
     loading: false,
     error: "",
     answer: null,
-    // session id -> its own answer (a "show all" fetch for one group)
+    // session id -> {group, window, loading}: a session paged past the
+    // first answer (`window`: hits per source fetched so far).
     expanded: {},
     selected: 0,
     // The parameters the answer shown was asked with.
@@ -197,18 +200,42 @@ window.FwHubSearch = function (ctx) {
     render();
   }
 
-  // Every hit of one session (up to MORE_PER_SESSION per source).
-  async function expand(group) {
+  const bySource = (hits) => SOURCES.flatMap((source) => hits.filter((h) => h.source === source));
+
+  // The next page of one session's hits (MORE_PAGE per source). Each
+  // source's hits come newest first and `offset` skips the ones already
+  // shown, so the window is the same for every source -- unless the
+  // first answer cut this group at the request's limit: then it starts
+  // over from the newest.
+  async function more(shown) {
+    const id = shown.session_id;
+    let entry = ui.expanded[id];
+    if (!entry) {
+      const counts = shown.counts;
+      const whole = SOURCES.reduce((n, source) => n + Math.min(counts[source] || 0, PER_SESSION), 0);
+      entry = whole === shown.hits.length && shown.hits.length
+        ? { group: shown, window: PER_SESSION }
+        : { group: { ...shown, hits: [] }, window: 0 };
+      ui.expanded[id] = entry;
+    }
+    if (entry.loading) return;
+    entry.loading = true;
+    render();
     const seq = ui.seq;
     try {
-      const answer = await api("GET", `/api/search?${params({ session: group.session_id, per_session: MORE_PER_SESSION, limit: MORE_PER_SESSION * 3 })}`);
+      const answer = await api("GET", `/api/search?${params({ session: id, per_session: MORE_PAGE, offset: entry.window, limit: MORE_PAGE * SOURCES.length })}`);
       if (seq !== ui.seq) return;
-      const full = answer.groups.find((g) => g.session_id === group.session_id);
-      if (full) ui.expanded[group.session_id] = full;
-      render();
+      const page = answer.groups.find((g) => g.session_id === id);
+      entry.window += MORE_PAGE;
+      entry.group = page
+        ? { ...page, hits: bySource([...entry.group.hits, ...page.hits]) }
+        : { ...entry.group, more: false };
     } catch (error) {
       toast(error.message, { tone: "bad" });
+    } finally {
+      entry.loading = false;
     }
+    if (seq === ui.seq) render();
   }
 
   function renderStatus() {
@@ -219,11 +246,16 @@ window.FwHubSearch = function (ctx) {
     else if (!input.value.trim()) text = `Every terminal's scrollback, agent transcripts, and suggested commands. ${ui.regex ? "Regex (Rust syntax)." : "Literal text."} ${ui.caseSensitive ? "Case-sensitive." : "Any case."}`;
     else if (!ui.sources.size) text = "Pick at least one source.";
     else if (a) {
-      const sessions = a.groups.length;
+      const sessions = a.groups.filter((g) => g.hits.length).length;
+      const counted = a.groups.length - sessions;
       text = a.hits
         ? `${a.hits} hit${a.hits === 1 ? "" : "s"} in ${sessions} session${sessions === 1 ? "" : "s"} · ${a.elapsed_ms} ms`
         : `No match in ${a.searched.sessions} session${a.searched.sessions === 1 ? "" : "s"} · ${a.elapsed_ms} ms`;
-      if (a.truncated) text += " · more not shown (narrow it)";
+      if (a.truncated) {
+        text += counted
+          ? ` · limit reached: ${counted} more matching session${counted === 1 ? "" : "s"} counted below (show its hits, or narrow the search)`
+          : " · limit reached (narrow the search)";
+      }
       if (a.partial) text += " · time ran out: not every session was searched";
       if (a.notes && a.notes.length) text += ` · ${a.notes.join("; ")}`;
     }
@@ -269,12 +301,14 @@ window.FwHubSearch = function (ctx) {
         extra ? el("span", { className: "search-more", textContent: extra, title: `${hit.matches} matches here` }) : null,
         when ? el("span", { className: "search-when", textContent: when, title: hit.timestamp }) : null,
       ),
+      // The match stays in view: the context before it gives way from
+      // its left end, the rest of the line from its right.
       el(
         "div",
         { className: "search-snippet" },
-        hit.before,
+        el("span", { className: "sn-before" }, el("span", { textContent: hit.before })),
         el("mark", { textContent: hit.match }),
-        hit.after,
+        el("span", { className: "sn-after", textContent: hit.after }),
       ),
     );
   }
@@ -288,7 +322,8 @@ window.FwHubSearch = function (ctx) {
     }
     const nodes = [];
     for (const shown of ui.answer.groups) {
-      const group = ui.expanded[shown.session_id] || shown;
+      const entry = ui.expanded[shown.session_id];
+      const group = entry ? entry.group : shown;
       const session = sessionById(group.session_id);
       const counts = group.counts;
       const total = counts.scrollback + counts.transcript + counts.commands;
@@ -300,19 +335,36 @@ window.FwHubSearch = function (ctx) {
         el("b", { className: "search-session", textContent: group.session }),
         el("span", { className: `search-state st-${group.state}`, textContent: group.terminal ? group.state : `${group.state} · no terminal` }),
         el("span", { className: "search-count", textContent: `${total} match${total === 1 ? "" : "es"}` }),
-        group.more && !ui.expanded[group.session_id]
-          ? el("button", { type: "button", className: "text-btn", textContent: "show all", onclick: (event) => {
-            event.stopPropagation();
-            expand(group);
-          } })
-          : null,
       );
+      const left = total - group.hits.length;
+      const moreButton = group.more
+        ? el("button", {
+          type: "button",
+          className: "text-btn search-more-btn",
+          disabled: !!(entry && entry.loading),
+          textContent: entry && entry.loading
+            ? "loading…"
+            : group.hits.length
+              ? `more (${left} not shown)`
+              : `past the limit: show its hits`,
+          onclick: (event) => {
+            event.stopPropagation();
+            more(shown);
+          },
+        })
+        : null;
       const items = group.hits.map((hit) => {
         const i = flat.length;
         flat.push({ group, hit });
         return renderHit(group, hit, i);
       });
-      nodes.push(el("section", { className: `search-group${session ? "" : " gone"}` }, head, el("ul", { className: "search-hits" }, items)));
+      nodes.push(el(
+        "section",
+        { className: `search-group${session ? "" : " gone"}` },
+        head,
+        items.length ? el("ul", { className: "search-hits" }, items) : null,
+        moreButton ? el("div", { className: "search-group-more" }, moreButton) : null,
+      ));
     }
     if (!nodes.length) nodes.push(el("p", { className: "search-none", textContent: "Nothing found." }));
     results.replaceChildren(...nodes);
@@ -412,6 +464,23 @@ window.FwHubSearch = function (ctx) {
     return candidates[0];
   }
 
+  // Keep toasts off a pane's banner (an exited session's Relaunch and
+  // Close) for `ms`: they sit just above it instead of over it.
+  let liftTimer = 0;
+  function liftToastsAbove(banner, ms) {
+    const toasts = $("#toasts");
+    clearTimeout(liftTimer);
+    if (!banner) {
+      toasts.style.bottom = "";
+      return;
+    }
+    const top = banner.getBoundingClientRect().top;
+    toasts.style.bottom = `${Math.max(0, window.innerHeight - top + 8)}px`;
+    liftTimer = setTimeout(() => {
+      toasts.style.bottom = "";
+    }, ms + 400);
+  }
+
   async function jumpToLine(group, hit) {
     if (!group.terminal) {
       toast(`${group.session} has no terminal on this hub any more.`, { tone: "bad" });
@@ -452,6 +521,7 @@ window.FwHubSearch = function (ctx) {
       if (forward) addon.findNext(hit.match_text, options);
       else addon.findPrevious(hit.match_text, options);
     };
+    liftToastsAbove(pane.el.querySelector(".pane-banner:not([hidden])"), 8000);
     toast(el("span", {}, "Found in ", el("b", { textContent: group.session }), el("code", { className: "toast-code", textContent: hit.match_text })), {
       actions: [
         el("button", { type: "button", className: "text-btn", textContent: "previous", onclick: (e) => { e.stopPropagation(); step(false); } }),

@@ -5,7 +5,7 @@
 use super::{ApiResult, AppState, blocking, error_response};
 use crate::agent::SessionKind;
 use crate::search::{
-    DEFAULT_LIMIT, DEFAULT_PER_SESSION, MAX_LIMIT, MAX_PAGE_MESSAGES, MAX_PER_SESSION,
+    DEFAULT_LIMIT, DEFAULT_PER_SESSION, MAX_LIMIT, MAX_OFFSET, MAX_PAGE_MESSAGES, MAX_PER_SESSION,
     SearchRequest, Source,
 };
 use axum::Json;
@@ -26,6 +26,7 @@ pub(super) struct SearchQuery {
     source: Option<String>,
     limit: Option<String>,
     per_session: Option<String>,
+    offset: Option<String>,
 }
 
 fn flag(name: &str, raw: Option<&str>) -> Result<bool, String> {
@@ -86,6 +87,17 @@ fn request_of(query: &SearchQuery) -> Result<SearchRequest, String> {
         DEFAULT_PER_SESSION,
         MAX_PER_SESSION,
     )?;
+    request.offset = match query.offset.as_deref() {
+        None => 0,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if n <= MAX_OFFSET => n,
+            _ => {
+                return Err(format!(
+                    "offset must be an integer between 0 and {MAX_OFFSET}"
+                ));
+            }
+        },
+    };
     Ok(request)
 }
 

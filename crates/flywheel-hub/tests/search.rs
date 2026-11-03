@@ -785,3 +785,123 @@ async fn twenty_sessions_of_five_thousand_lines_answer_within_the_budget() {
     }
     hub.shutdown().await;
 }
+
+/// Past `limit`, later sessions are still listed with their counts; a
+/// session's hits page through with `offset` until none are left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_past_the_limit_are_counted_and_hits_page_with_offset() {
+    let hub = TestHub::start().await;
+    let ws = hub
+        .post(
+            "/api/workspaces",
+            json!({ "name": "w", "folders": [hub.repo()] }),
+        )
+        .await;
+    let wid = ws["id"].as_str().unwrap();
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let script = format!(
+            "awk 'BEGIN {{ for (i = 1; i <= 300; i++) printf \"needle-%d\\n\", i }}'; echo p{i}-ready; exec cat"
+        );
+        let id = hub
+            .post(
+                "/api/sessions",
+                json!({ "workspace_id": wid, "name": format!("p{i}"), "command": ["/bin/sh", "-c", script] }),
+            )
+            .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        ids.push(id);
+    }
+    for (i, id) in ids.iter().enumerate() {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !hub
+            .get(&format!("/api/sessions/{id}/screen?source=recent&lines=3"))
+            .await["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l == &json!(format!("p{i}-ready")))
+        {
+            assert!(Instant::now() < deadline, "session {i} never finished");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // 100 lines match per session; a limit of 15 fills two sessions, and
+    // the other two are listed by count, not left out.
+    let answer = hub
+        .search("q=needle-1%5Cd%5Cd%24&regex=true&limit=15&per_session=10")
+        .await;
+    assert_eq!(answer["hits"], 15);
+    assert_eq!(answer["truncated"], true);
+    let groups = answer["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 4, "{answer}");
+    for (group, shown) in groups.iter().zip([10, 5, 0, 0]) {
+        assert_eq!(group["hits"].as_array().unwrap().len(), shown);
+        assert_eq!(group["counts"]["scrollback"], 100);
+        assert_eq!(group["more"], true);
+    }
+    assert_eq!(answer["searched"]["sessions"], 4);
+
+    // Paging one session: every hit once, newest first, then nothing.
+    let mut seen = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = hub
+            .search(&format!(
+                "q=needle-&session={}&per_session=120&offset={offset}",
+                ids[2]
+            ))
+            .await;
+        assert_eq!(page["offset"], offset);
+        let Some(group) = page["groups"].as_array().unwrap().first() else {
+            break;
+        };
+        let hits = group["hits"].as_array().unwrap();
+        seen.extend(hits.iter().map(|h| {
+            format!(
+                "{}{}",
+                h["match"].as_str().unwrap(),
+                h["after"].as_str().unwrap()
+            )
+        }));
+        offset += hits.len();
+        assert_eq!(group["more"], offset < 300, "at {offset}");
+        assert!(offset <= 300);
+    }
+    assert_eq!(seen.len(), 300);
+    let newest: Vec<String> = (1..=300).rev().map(|n| format!("needle-{n}")).collect();
+    assert_eq!(seen, newest, "every hit once, newest first");
+    let (status, body) = hub
+        .call(reqwest::Method::GET, "/api/search?q=a&offset=100001", None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // The CLI lists the counted sessions too.
+    let state = hub.state_dir();
+    let (code, out, err) = tokio::task::spawn_blocking(move || {
+        cli(vec![
+            "search".into(),
+            "needle-1\\d\\d$".into(),
+            "--regex".into(),
+            "--limit".into(),
+            "15".into(),
+            "--per-session".into(),
+            "10".into(),
+            "--state-dir".into(),
+            state,
+        ])
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("w/p3"), "{out}");
+    assert!(out.contains("not shown, past --limit"), "{out}");
+    assert!(
+        err.contains("2 more matching sessions only counted"),
+        "{err}"
+    );
+    hub.shutdown().await;
+}

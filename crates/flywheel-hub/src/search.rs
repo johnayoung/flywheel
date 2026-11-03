@@ -39,7 +39,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Longest query accepted, in bytes.
@@ -62,12 +63,22 @@ pub const MAX_CONCURRENT: usize = 2;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Text kept per transcript, in bytes (oldest messages dropped first).
 pub const MAX_TRANSCRIPT_BYTES: usize = 32 * 1024 * 1024;
+/// Memory all transcript indexes together may hold; past it the least
+/// recently searched are dropped (and re-read from their file when
+/// searched again).
+pub const MAX_INDEX_BYTES: usize = 256 * 1024 * 1024;
+/// A transcript index not searched for this long is dropped.
+pub const TRANSCRIPT_IDLE: Duration = Duration::from_secs(10 * 60);
+/// Most hits per session and source one request may skip (paging).
+pub const MAX_OFFSET: usize = 100_000;
 /// Most messages one transcript page returns.
 pub const MAX_PAGE_MESSAGES: usize = 200;
-/// Characters of context before a match in a snippet.
-const BEFORE_CHARS: usize = 60;
+/// Characters of context before a match in a snippet (enough for a wide
+/// row to show where a long line starts; narrow clients cut it from the
+/// left).
+const BEFORE_CHARS: usize = 160;
 /// Characters of a snippet (before + match + after), at least.
-const SNIPPET_CHARS: usize = 200;
+const SNIPPET_CHARS: usize = 320;
 /// Characters of the match itself shown in a snippet.
 const MATCH_CHARS: usize = 200;
 /// Characters of a scrollback match handed to the browser's terminal
@@ -150,6 +161,20 @@ impl Matcher {
             .find_iter(text)
             .filter(|m| !m.is_empty())
             .map(|m| (m.start(), m.end()))
+    }
+
+    /// The first non-empty match in `text` starting at or after byte `at`
+    /// (anchors and word boundaries see the text before `at`).
+    pub fn find_at(&self, text: &str, mut at: usize) -> Option<(usize, usize)> {
+        while at <= text.len() {
+            let m = self.re.find_at(text, at)?;
+            if !m.is_empty() {
+                return Some((m.start(), m.end()));
+            }
+            // Step over the empty match by one character.
+            at = m.start() + text[m.start()..].chars().next()?.len_utf8();
+        }
+        None
     }
 
     /// Whether `text` has a non-empty match.
@@ -244,23 +269,22 @@ struct Scan {
 }
 
 /// Scan `corpus`, keeping the last `keep` matched units.
+///
+/// A match never runs across units: one that would (a pattern with `\n`
+/// or `\s` spanning the separator) is retried inside its unit alone, so
+/// what is reported is a match the unit itself holds.
 fn scan(corpus: &Corpus, matcher: &Matcher, keep: usize, deadline: Instant) -> Scan {
     let mut found = Scan {
         complete: true,
         ..Scan::default()
     };
     let mut last: Option<UnitHit> = None;
-    for (n, (start, end)) in matcher.find_iter(&corpus.text).enumerate() {
-        if n % CLOCK_EVERY == CLOCK_EVERY - 1 && Instant::now() >= deadline {
-            found.complete = false;
-            break;
-        }
-        let unit = corpus.unit_of(start);
+    let mut record = |found: &mut Scan, unit: usize, start: usize, end: usize| {
         if let Some(hit) = last.as_mut()
             && hit.unit == unit
         {
             hit.matches += 1;
-            continue;
+            return;
         }
         if let Some(done) = last.take() {
             keep_last(&mut found.hits, done, keep);
@@ -269,10 +293,40 @@ fn scan(corpus: &Corpus, matcher: &Matcher, keep: usize, deadline: Instant) -> S
         last = Some(UnitHit {
             unit,
             start: start - base,
-            end: end.min(corpus.end_of(unit)) - base,
+            end: end - base,
             matches: 1,
         });
         found.units += 1;
+    };
+    let text = corpus.text.as_str();
+    let mut pos = 0;
+    let mut steps = 0usize;
+    while pos <= text.len() {
+        steps += 1;
+        if steps.is_multiple_of(CLOCK_EVERY) && Instant::now() >= deadline {
+            found.complete = false;
+            break;
+        }
+        let Some((start, end)) = matcher.find_at(text, pos) else {
+            break;
+        };
+        let unit = corpus.unit_of(start);
+        let unit_end = corpus.end_of(unit);
+        if end <= unit_end {
+            record(&mut found, unit, start, end);
+            pos = end;
+            continue;
+        }
+        // The match crosses into the next unit: look again inside this one.
+        let mut inner = start;
+        while inner < unit_end {
+            let Some((s, e)) = matcher.find_at(&text[..unit_end], inner) else {
+                break;
+            };
+            record(&mut found, unit, s, e);
+            inner = e;
+        }
+        pos = unit_end + 1;
     }
     if let Some(done) = last {
         keep_last(&mut found.hits, done, keep);
@@ -463,7 +517,9 @@ pub struct SessionGroup {
     pub conversation: Option<String>,
     pub hits: Vec<Hit>,
     pub counts: Counts,
-    /// Some source had more matches than `hits` holds.
+    /// Some source has matches past this page (`counts` minus `offset`
+    /// minus `hits`). A group past the request's `limit` has `hits`
+    /// empty and only its `counts`.
     pub more: bool,
 }
 
@@ -486,8 +542,11 @@ pub struct SearchResponse {
     pub groups: Vec<SessionGroup>,
     /// Hits returned.
     pub hits: usize,
-    /// The request's `limit` was reached: more sessions or hits may match.
+    /// The request's `limit` was reached: the sessions after it are only
+    /// counted (groups with `counts` and no `hits`).
     pub truncated: bool,
+    /// Hits skipped per session and source (the request's `offset`).
+    pub offset: usize,
     /// The time budget ran out (or a transcript is still being indexed):
     /// what was searched is complete, the rest was not reached.
     pub partial: bool,
@@ -513,6 +572,9 @@ pub struct SearchRequest {
     pub limit: usize,
     /// Most hits per session and source.
     pub per_session: usize,
+    /// Hits per session and source to skip, newest first (the next page
+    /// of a session: the same query with `offset` = hits seen so far).
+    pub offset: usize,
     pub budget: Duration,
 }
 
@@ -529,6 +591,7 @@ impl SearchRequest {
             sources: Source::ALL.to_vec(),
             limit: DEFAULT_LIMIT,
             per_session: DEFAULT_PER_SESSION,
+            offset: 0,
             budget: TIME_BUDGET,
         }
     }
@@ -790,7 +853,19 @@ struct TranscriptIndex {
     next_index: u64,
     /// Why the file could not be read last time.
     error: Option<String>,
-    used: Instant,
+    /// Heap held by `messages` (see [`meta_cost`]).
+    meta_bytes: usize,
+    /// Most bytes it holds ([`MAX_TRANSCRIPT_BYTES`]).
+    cap: usize,
+}
+
+/// Memory one message's metadata takes, counted toward
+/// [`MAX_TRANSCRIPT_BYTES`] with its text.
+fn meta_cost(meta: &MessageMeta) -> usize {
+    std::mem::size_of::<MessageMeta>()
+        + meta.message_id.len()
+        + meta.tool.as_ref().map_or(0, String::len)
+        + meta.timestamp.as_ref().map_or(0, String::len)
 }
 
 impl TranscriptIndex {
@@ -806,19 +881,20 @@ impl TranscriptIndex {
             corpus: Corpus::default(),
             next_index: 0,
             error: None,
-            used: Instant::now(),
+            meta_bytes: 0,
+            cap: MAX_TRANSCRIPT_BYTES,
         }
     }
 
     fn reset(&mut self) {
-        let (path, format) = (self.path.clone(), self.format);
+        let (path, format, cap) = (self.path.clone(), self.format, self.cap);
         *self = Self::new(path, format);
+        self.cap = cap;
     }
 
     /// Read what the file has new, until `deadline`; returns whether it
     /// was read to its end.
     fn update(&mut self, deadline: Instant) -> bool {
-        self.used = Instant::now();
         match self.read(deadline) {
             Ok(complete) => {
                 self.error = None;
@@ -890,7 +966,7 @@ impl TranscriptIndex {
         for mut message in messages {
             let truncated = cut_to(&mut message.text, MAX_MESSAGE_BYTES);
             self.corpus.push(&message.text);
-            self.messages.push_back(MessageMeta {
+            let meta = MessageMeta {
                 index: self.next_index,
                 message_id: message.id,
                 role: message.role,
@@ -898,16 +974,41 @@ impl TranscriptIndex {
                 tool: message.tool,
                 timestamp: message.timestamp,
                 truncated,
-            });
+            };
+            self.meta_bytes += meta_cost(&meta);
+            self.messages.push_back(meta);
             self.next_index += 1;
         }
-        if self.corpus.text.len() > MAX_TRANSCRIPT_BYTES {
+        if self.footprint() > self.cap {
             // Drop the oldest down to three quarters, so trimming is rare.
-            let target = self.corpus.text.len() - MAX_TRANSCRIPT_BYTES * 3 / 4;
-            let n = self.corpus.starts.partition_point(|&s| s < target).max(1);
+            let excess = self.footprint() - self.cap * 3 / 4;
+            let (mut freed, mut n) = (0, 0);
+            while freed < excess && n < self.messages.len() {
+                freed += self.unit_cost(n);
+                n += 1;
+            }
             self.corpus.drop_front(n);
-            self.messages.drain(..n.min(self.messages.len()));
+            for meta in self.messages.drain(..n) {
+                self.meta_bytes -= meta_cost(&meta);
+            }
         }
+    }
+
+    /// Memory message `unit` takes: its text, separator, start, metadata.
+    fn unit_cost(&self, unit: usize) -> usize {
+        self.corpus.unit(unit).len()
+            + 1
+            + std::mem::size_of::<usize>()
+            + meta_cost(&self.messages[unit])
+    }
+
+    /// Memory the index holds (text, unit starts, message metadata, the
+    /// incomplete last line), as counted toward [`MAX_TRANSCRIPT_BYTES`].
+    fn footprint(&self) -> usize {
+        self.corpus.text.len()
+            + self.corpus.starts.len() * std::mem::size_of::<usize>()
+            + self.meta_bytes
+            + self.pending.len()
     }
 
     /// Oldest index still held.
@@ -917,6 +1018,34 @@ impl TranscriptIndex {
 }
 
 // --- the index --------------------------------------------------------
+
+/// A transcript index with what eviction needs without locking it.
+#[derive(Debug)]
+struct TranscriptSlot {
+    format: Format,
+    index: Mutex<TranscriptIndex>,
+    /// [`TranscriptIndex::footprint`] after its last update.
+    bytes: AtomicUsize,
+    /// When it was last searched or paged.
+    used: Mutex<Instant>,
+}
+
+impl TranscriptSlot {
+    /// The index, marked used now.
+    fn lock(&self) -> MutexGuard<'_, TranscriptIndex> {
+        *self.used.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        self.index.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Record `index`'s size after an update.
+    fn settle(&self, index: &TranscriptIndex) {
+        self.bytes.store(index.footprint(), Ordering::Relaxed);
+    }
+
+    fn used(&self) -> Instant {
+        *self.used.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// A session's terminal text as last extracted.
 #[derive(Debug)]
@@ -942,7 +1071,7 @@ pub struct SearchIndex {
     permits: Arc<tokio::sync::Semaphore>,
     scroll: Mutex<HashMap<String, Arc<ScrollEntry>>>,
     located: Mutex<HashMap<String, Located>>,
-    transcripts: Mutex<HashMap<PathBuf, Arc<Mutex<TranscriptIndex>>>>,
+    transcripts: Mutex<HashMap<PathBuf, Arc<TranscriptSlot>>>,
 }
 
 impl Default for SearchIndex {
@@ -990,20 +1119,85 @@ impl SearchIndex {
         entry
     }
 
-    fn transcript(&self, path: &Path, format: Format) -> Arc<Mutex<TranscriptIndex>> {
+    fn transcript(&self, path: &Path, format: Format) -> Arc<TranscriptSlot> {
         let mut transcripts = self
             .transcripts
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(index) = transcripts.get(path) {
-            let same_format = index.lock().unwrap_or_else(PoisonError::into_inner).format == format;
-            if same_format {
-                return Arc::clone(index);
-            }
+        if let Some(slot) = transcripts.get(path).filter(|s| s.format == format) {
+            return Arc::clone(slot);
         }
-        let index = Arc::new(Mutex::new(TranscriptIndex::new(path.to_path_buf(), format)));
-        transcripts.insert(path.to_path_buf(), Arc::clone(&index));
-        index
+        let slot = Arc::new(TranscriptSlot {
+            format,
+            index: Mutex::new(TranscriptIndex::new(path.to_path_buf(), format)),
+            bytes: AtomicUsize::new(0),
+            used: Mutex::new(Instant::now()),
+        });
+        transcripts.insert(path.to_path_buf(), Arc::clone(&slot));
+        slot
+    }
+
+    /// Bytes all transcript indexes hold.
+    pub fn transcript_bytes(&self) -> usize {
+        self.transcripts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .map(|s| s.bytes.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Transcript indexes held.
+    pub fn transcript_count(&self) -> usize {
+        self.transcripts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Drop transcript indexes idle for [`TRANSCRIPT_IDLE`], then the
+    /// least recently used until all hold at most [`MAX_INDEX_BYTES`].
+    /// One in use by a search right now is kept. Cheap (no file work):
+    /// the transcript watcher calls it every poll, searches after each
+    /// transcript.
+    pub fn sweep(&self) {
+        self.sweep_with(MAX_INDEX_BYTES, TRANSCRIPT_IDLE);
+    }
+
+    fn sweep_with(&self, cap: usize, idle: Duration) {
+        let mut transcripts = self
+            .transcripts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Held only by the map: no search is using it.
+        let free = |slot: &Arc<TranscriptSlot>| Arc::strong_count(slot) == 1;
+        transcripts.retain(|_, slot| !free(slot) || slot.used().elapsed() < idle);
+        let mut total: usize = transcripts
+            .values()
+            .map(|s| s.bytes.load(Ordering::Relaxed))
+            .sum();
+        if total <= cap {
+            return;
+        }
+        let mut oldest: Vec<(Instant, PathBuf, usize)> = transcripts
+            .iter()
+            .filter(|(_, slot)| free(slot))
+            .map(|(path, slot)| {
+                (
+                    slot.used(),
+                    path.clone(),
+                    slot.bytes.load(Ordering::Relaxed),
+                )
+            })
+            .collect();
+        oldest.sort();
+        for (_, path, bytes) in oldest {
+            if total <= cap {
+                break;
+            }
+            transcripts.remove(&path);
+            total -= bytes;
+        }
     }
 
     /// Forget what belongs to sessions no longer there (`sessions`: every
@@ -1024,6 +1218,20 @@ impl SearchIndex {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|path, _| used.contains(path));
+    }
+}
+
+/// Which of a session's hits (per source, newest first) a request shows.
+#[derive(Debug, Clone, Copy)]
+struct Page {
+    skip: usize,
+    take: usize,
+}
+
+impl Page {
+    /// Newest matched units to keep while scanning.
+    fn keep(self) -> usize {
+        self.skip + self.take
     }
 }
 
@@ -1108,6 +1316,7 @@ impl Hub {
             .map_err(StateError::Invalid)?;
         let limit = request.limit.clamp(1, MAX_LIMIT);
         let per_session = request.per_session.clamp(1, MAX_PER_SESSION);
+        let offset = request.offset.min(MAX_OFFSET);
         let sources: Vec<Source> = Source::ALL
             .into_iter()
             .filter(|s| request.sources.contains(s))
@@ -1140,6 +1349,7 @@ impl Hub {
             groups: Vec::new(),
             hits: 0,
             truncated: false,
+            offset,
             partial: false,
             elapsed_ms: 0,
             searched: Searched::default(),
@@ -1159,10 +1369,20 @@ impl Hub {
                 response.partial = true;
                 break;
             }
-            if response.hits >= limit {
+            // Past the limit, sessions are still searched but only
+            // counted, so every one that matches is listed.
+            let counting = response.hits >= limit;
+            if counting {
                 response.truncated = true;
-                break;
             }
+            let page = if counting {
+                Page { skip: 0, take: 0 }
+            } else {
+                Page {
+                    skip: offset,
+                    take: per_session,
+                }
+            };
             response.searched.sessions += 1;
             let record = &view.record;
             let mut group = SessionGroup {
@@ -1190,7 +1410,7 @@ impl Hub {
                     Source::Scrollback => self.search_scrollback(
                         &view,
                         &matcher,
-                        per_session,
+                        page,
                         deadline,
                         &mut group,
                         &mut response.searched,
@@ -1198,7 +1418,7 @@ impl Hub {
                     Source::Transcript => self.search_transcript(
                         &view,
                         &matcher,
-                        per_session,
+                        page,
                         deadline,
                         &mut group,
                         &mut response,
@@ -1207,7 +1427,7 @@ impl Hub {
                         self.search_commands(
                             &view,
                             &matcher,
-                            per_session,
+                            page,
                             &mut group,
                             &mut response.searched,
                         );
@@ -1218,10 +1438,10 @@ impl Hub {
                     response.partial = true;
                 }
             }
-            if group.hits.is_empty() {
+            if group.hits.is_empty() && !group.more {
                 continue;
             }
-            let room = limit - response.hits;
+            let room = limit.saturating_sub(response.hits);
             if group.hits.len() > room {
                 group.hits.truncate(room);
                 group.more = true;
@@ -1238,11 +1458,12 @@ impl Hub {
         &self,
         view: &SessionView,
         matcher: &Matcher,
-        keep: usize,
+        page: Page,
         deadline: Instant,
         group: &mut SessionGroup,
         searched: &mut Searched,
     ) -> bool {
+        let keep = page.keep();
         let Some(pty) = self.live_session(&view.record.id) else {
             return true;
         };
@@ -1280,7 +1501,7 @@ impl Hub {
             }
         }
         group.more |= group.counts.scrollback > hits.len();
-        group.hits.extend(hits);
+        group.hits.extend(hits.into_iter().skip(page.skip));
         complete
     }
 
@@ -1288,7 +1509,7 @@ impl Hub {
         &self,
         view: &SessionView,
         matcher: &Matcher,
-        keep: usize,
+        page: Page,
         deadline: Instant,
         group: &mut SessionGroup,
         response: &mut SearchResponse,
@@ -1296,19 +1517,20 @@ impl Hub {
         let Some((path, format)) = self.transcript_of(view) else {
             return true;
         };
-        let index = self.search_index().transcript(&path, format);
-        let mut index = index.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = self.search_index().transcript(&path, format);
+        let mut index = slot.lock();
         let read = index.update(deadline);
+        slot.settle(&index);
         if let Some(error) = &index.error {
             response
                 .notes
                 .push(format!("{}: {error}", view.record.label()));
         }
         response.searched.messages += index.messages.len();
-        let found = scan(&index.corpus, matcher, keep, deadline);
+        let found = scan(&index.corpus, matcher, page.keep(), deadline);
         group.counts.transcript += found.units;
         group.more |= found.units > found.hits.len();
-        for hit in found.hits.iter().rev() {
+        for hit in found.hits.iter().rev().skip(page.skip) {
             let meta = &index.messages[hit.unit];
             let text = index.corpus.unit(hit.unit);
             group.hits.push(Hit::Transcript {
@@ -1322,6 +1544,9 @@ impl Hub {
                 snippet: snippet(text, hit.start, hit.end),
             });
         }
+        drop(index);
+        drop(slot);
+        self.search_index().sweep();
         read && found.complete
     }
 
@@ -1329,10 +1554,11 @@ impl Hub {
         &self,
         view: &SessionView,
         matcher: &Matcher,
-        keep: usize,
+        page: Page,
         group: &mut SessionGroup,
         searched: &mut Searched,
     ) {
+        let keep = page.keep();
         if !view.record.kind.is_agent() {
             return;
         }
@@ -1365,7 +1591,7 @@ impl Hub {
             });
         group.counts.commands += count;
         group.more |= count > hits.len();
-        group.hits.extend(hits);
+        group.hits.extend(hits.into_iter().skip(page.skip));
     }
 
     /// Messages of session `id`'s current conversation: `before` up to
@@ -1401,9 +1627,10 @@ impl Hub {
         let Some((path, format)) = self.transcript_of(&view) else {
             return Ok(page);
         };
-        let index = self.search_index().transcript(&path, format);
-        let mut index = index.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = self.search_index().transcript(&path, format);
+        let mut index = slot.lock();
         page.complete = index.update(Instant::now() + TIME_BUDGET);
+        slot.settle(&index);
         page.transcript = Some(path);
         page.first = index.first_index();
         page.next = index.next_index;
@@ -1428,6 +1655,9 @@ impl Hub {
                 text: index.corpus.unit(unit).to_owned(),
             });
         }
+        drop(index);
+        drop(slot);
+        self.search_index().sweep();
         Ok(page)
     }
 }
@@ -1514,18 +1744,39 @@ mod tests {
     }
 
     #[test]
-    fn matches_spanning_units_are_cut_at_the_unit() {
-        let corpus = Corpus::from_units(["alpha", "beta"]);
-        let found = scan(
-            &corpus,
-            &Matcher::new(r"pha\sbe", true, false).unwrap(),
-            5,
-            far(),
+    fn matches_never_run_across_units() {
+        let corpus = Corpus::from_units(["build done", "next step"]);
+        let spanning = Matcher::new(r"done\s+next", true, false).unwrap();
+        let found = scan(&corpus, &spanning, 5, far());
+        assert_eq!(found.units, 0, "neither unit holds the pattern");
+        // A separator-only match is no hit (no empty match text).
+        for pattern in [r"\s+$", r"\n", r"\s"] {
+            let m = Matcher::new(pattern, true, false).unwrap();
+            let found = scan(&Corpus::from_units(["ab", "cd", "ef"]), &m, 5, far());
+            assert_eq!(found.units, 0, "{pattern}");
+        }
+        // A crossing match is retried inside the unit: `o\s\w+` crosses
+        // from "go" into "on" but "do it" holds its own match later on.
+        let corpus = Corpus::from_units(["do it go", "on", "multi\nline x"]);
+        let m = Matcher::new(r"o\s\w+", true, false).unwrap();
+        let found = scan(&corpus, &m, 5, far());
+        let hits: Vec<(usize, &str)> = found
+            .hits
+            .iter()
+            .map(|h| (h.unit, &corpus.unit(h.unit)[h.start..h.end]))
+            .collect();
+        assert_eq!(hits, [(0, "o it")]);
+        assert_eq!(
+            found.hits[0].matches, 1,
+            "the crossing \"o\\non\" is not counted"
         );
-        assert_eq!(found.units, 1);
-        let hit = found.hits[0];
-        assert_eq!(hit.unit, 0);
-        assert_eq!(&corpus.unit(0)[hit.start..hit.end], "pha");
+        // Newlines inside one unit (a message, a block) still match.
+        let m = Matcher::new(r"multi\nline", true, false).unwrap();
+        let found = scan(&corpus, &m, 5, far());
+        assert_eq!(found.hits[0].unit, 2);
+        // `^`/`$` still see unit edges.
+        let m = Matcher::new(r"^on$", true, false).unwrap();
+        assert_eq!(scan(&corpus, &m, 5, far()).hits[0].unit, 1);
     }
 
     #[test]
@@ -1659,6 +1910,71 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         index.update(far());
         assert!(index.error.as_deref().unwrap().contains("cannot read"));
+    }
+
+    #[test]
+    fn the_transcript_cap_counts_message_metadata_not_only_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        // Tool calls with a one-character name and no input: next to no
+        // text, but a uuid, timestamp, and tool name each.
+        let mut text = String::new();
+        for i in 0..2000 {
+            text.push_str(
+                &json!({"type": "assistant", "uuid": format!("{i:036}"),
+                    "timestamp": "2026-11-02T10:11:12.000Z",
+                    "message": {"content": [{"type": "tool_use", "name": "x", "input": {}}]}})
+                .to_string(),
+            );
+            text.push('\n');
+        }
+        std::fs::write(&path, text).unwrap();
+        let mut index = TranscriptIndex::new(path, Format::Claude);
+        index.cap = 64 * 1024;
+        assert!(index.update(far()));
+        assert!(
+            index.corpus.text.len() < 16 * 1024,
+            "the text alone is far under the cap"
+        );
+        assert!(
+            index.footprint() <= index.cap,
+            "{} > {}",
+            index.footprint(),
+            index.cap
+        );
+        assert!(index.first_index() > 0, "the oldest were dropped");
+        assert_eq!(index.next_index, 2000);
+        assert_eq!(index.messages.len(), index.corpus.len());
+        let counted: usize = index.messages.iter().map(meta_cost).sum();
+        assert_eq!(index.meta_bytes, counted);
+    }
+
+    #[test]
+    fn idle_and_least_recently_used_transcript_indexes_are_evicted() {
+        let search = SearchIndex::default();
+        let slot = |name: &str, bytes: usize, ago: u64| {
+            let slot = search.transcript(Path::new(name), Format::Claude);
+            slot.bytes.store(bytes, Ordering::Relaxed);
+            *slot.used.lock().unwrap() = Instant::now() - Duration::from_secs(ago);
+            slot
+        };
+        drop(slot("/a", 100, 50));
+        drop(slot("/b", 100, 40));
+        drop(slot("/c", 100, 30));
+        drop(slot("/idle", 100, 1000));
+        // One a search holds right now is never dropped, however old.
+        let busy = slot("/busy", 100, 2000);
+        assert_eq!(search.transcript_count(), 5);
+        search.sweep_with(1000, Duration::from_secs(600));
+        assert_eq!(search.transcript_count(), 4, "the idle one went");
+        // Over the cap: the least recently used go first.
+        search.sweep_with(250, Duration::from_secs(600));
+        let left: HashSet<PathBuf> = search.transcripts.lock().unwrap().keys().cloned().collect();
+        assert_eq!(left, HashSet::from(["/c".into(), "/busy".into()]));
+        assert_eq!(search.transcript_bytes(), 200);
+        drop(busy);
+        search.sweep_with(250, Duration::from_secs(600));
+        assert_eq!(search.transcript_count(), 1, "the idle busy one, now free");
     }
 
     #[test]

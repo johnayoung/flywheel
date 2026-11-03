@@ -735,9 +735,27 @@ where
     async fn from_request(request: Request, state: &S) -> Result<Self, Response> {
         match Json::<T>::from_request(request, state).await {
             Ok(Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(error_response(rejection.status(), &rejection.body_text())),
+            Err(rejection) => Err(error_response(
+                rejection.status(),
+                &bounded_message(&rejection.body_text()),
+            )),
         }
     }
+}
+
+/// Longest body-rejection message echoed back. serde's error names the
+/// path to the bad field, which for a deeply nested body (a layout tree)
+/// is the whole nesting; the head and the reason at the end are kept.
+const MAX_REJECTION_MESSAGE: usize = 240;
+
+fn bounded_message(message: &str) -> String {
+    let chars: Vec<char> = message.chars().collect();
+    if chars.len() <= MAX_REJECTION_MESSAGE {
+        return message.to_string();
+    }
+    let head: String = chars[..120].iter().collect();
+    let tail: String = chars[chars.len() - 100..].iter().collect();
+    format!("{head} ... {tail}")
 }
 
 /// Run a blocking hub call (state-file writes, PTY spawns) off the async

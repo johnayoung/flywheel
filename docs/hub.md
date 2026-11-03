@@ -136,8 +136,11 @@ Each workspace has a **layout**: named tabs, each a tree of splits (side by side
 - **Companion flip** (``Alt ` ``) on screens over 1100 px opens the companion beside the agent (focuses it when on screen); palette "Companion shell: in place" restores the old swap.
 - **Closing**: a pane (`Alt X`) only leaves the layout; its session keeps running. The last pane closes its tab (an only tab stays, empty). Closing or removing a session closes every pane showing it (the hub prunes layouts; pushed as `layout`).
 - **Cost**: only the active tab's panes are attached (other tabs: no socket, no terminal; switching re-attaches from the snapshot); panes behind a zoom stay attached but are not drawn. xterm's DOM renderer, no WebGL/canvas contexts. At most 12 tabs per workspace and 12 panes per tab.
-- **Phones** (under 760 px): no splits. One pane full screen; a chip row switches between the layout's panes (`tab session`); phones never change layouts.
-- **Seen**: every pane on screen counts as viewed (`view` carries `visible`).
+- **Phones** (under 760 px): no splits. One pane full screen; a chip row switches between the layout's sessions (one chip per session, `tab session`, the current one scrolled into view); phones never change layouts.
+- **Seen**: every pane on screen counts as viewed (`view` carries `visible`); panes behind a zoom or in other tabs do not.
+- **PTY size** (last resizer wins): a pane resizes its session's PTY only while focused or while it is the session's only viewer, once a divider drag ends (not per move). Otherwise it follows the other viewer's size (`NNxNN` badge), clipped to its box with the window kept on the cursor and `rows above` / `rows below` marks.
+- **Restore**: a page opened without `#session=` reopens the last workspace this browser viewed (else the first with a saved layout) at its focused pane. An empty pane (new tab) offers the workspace's sessions and a new shell.
+- **Browser check** (opt-in, not in `scripts/check.sh`): `node crates/flywheel-hub/e2e/layout.mjs [OUT_DIR]` -- temp state dir, free port, fake `claude`; 1440x900 3 panes + 2 tabs + reload, a second smaller viewer, 390x844 phone tap targets; screenshots in `OUT_DIR`. Env `FW`, `PLAYWRIGHT` (package path), `CHROMIUM` (executable).
 
 | Key | |
 |---|---|
@@ -190,7 +193,7 @@ Agents draw suggested commands with margins and wrapping, so copying them off th
 Built for driving Claude Code and Codex from a phone (tested at 390x844 and 430x932 under iPhone 14 emulation):
 
 - **Viewport**: the app is pinned to the visual viewport, so the on-screen keyboard shrinks the terminal instead of covering it (no page scroll or zoom on focus: fields are 16 px on touch screens); safe-area insets respected.
-- **Row floor**: the PTY size is shared, so a page never sizes it below 16 rows; a shorter terminal box (keyboard up, Compose open) shows the bottom rows. With the keyboard up the quick answers shrink to one row and Compose hides the rest.
+- **Row floor** (phones only): the PTY size is shared, so a phone never sizes it below 16 rows; a shorter terminal box (keyboard up, Compose open) is clipped around the cursor. Desktop panes fit their box exactly. With the keyboard up the quick answers shrink to one row and Compose hides the rest.
 - **Needs you**: blocked and done agents of every workspace head the sidebar (the phone's switcher: drawer button, badge counts them) and are the phone's start screen; blocked first, longest-waiting first; worktree sessions show their branch (so do their browser notifications). Tap to open. Below 760 px the sidebar is a drawer; tablets get a narrower one.
 - **Key bar** (touch screens; palette "Key bar: on/off/auto"), two rows. First, always in view: `esc` `tab` `shift-tab` (Claude's permission-mode cycle), sticky `ctrl` (tap: next key, twice: locked; applied to what the keyboard types), arrows (repeat when held; honour app cursor mode), `enter`, `^c`. Second, scrolls: sticky `alt`, `/ | ~ -`, `pgup` `pgdn`, text size; then `kbd` (show/hide the keyboard), `compose`.
 - **Quick answers**: while the attached agent is blocked, the options of the prompt on the live screen (never the scrollback in view) become buttons: numbered lists (Claude's permission dialogs: sends the digit; an option ending `(y)` sends that key) or a `(y/n)` line (sends the letter + Enter); `esc` cancels. The status detail heads it.

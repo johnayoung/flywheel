@@ -88,7 +88,10 @@ window.FwHubPanes = function (ctx) {
         // server's size must not echo it back.
         if (!pane.following && pane.claims()) pane.send(JSON.stringify({ type: "resize", cols, rows }));
         ctx.onResize(pane);
+        scheduleClip();
       });
+      term.onCursorMove(scheduleClip);
+      term.onScroll(scheduleClip);
       // Typing or clicking in a pane focuses it (its xterm took the focus).
       term.textarea.addEventListener("focus", () => ctx.onFocusIn(pane));
       pane.term = term;
@@ -104,10 +107,48 @@ window.FwHubPanes = function (ctx) {
 
     pane.claims = () => ctx.claims(pane);
 
+    // A terminal taller than its box (following another viewer's size, or
+    // a phone's row floor) is clipped. The clip window follows the cursor:
+    // a prompt at the top of a fresh shell stays in view as well as one at
+    // the bottom of a busy agent. Rows cut off are flagged above/below.
+    let clipFrame = 0;
+    function scheduleClip() {
+      if (clipFrame) return;
+      clipFrame = requestAnimationFrame(() => {
+        clipFrame = 0;
+        placeClip();
+      });
+    }
+    function placeClip() {
+      const xt = pane.term && pane.term.element;
+      if (!xt || pane.disposed) return;
+      let shift = 0;
+      let overflow = 0;
+      if (host.classList.contains("following") || host.classList.contains("floored")) {
+        const pad = parseFloat(getComputedStyle(host).paddingTop) || 0;
+        const avail = host.clientHeight - pad;
+        const height = xt.offsetHeight;
+        overflow = Math.max(0, height - avail);
+        if (overflow > 0 && pane.term.rows > 0) {
+          const rowH = height / pane.term.rows;
+          const buf = pane.term.buffer.active;
+          const row = buf.cursorY + buf.baseY - buf.viewportY;
+          shift = Math.min(overflow, Math.max(0, (row + 1) * rowH - avail));
+        }
+      }
+      xt.style.transform = shift > 0 ? `translateY(${-shift}px)` : "";
+      host.classList.toggle("clip-above", shift > 0.5);
+      host.classList.toggle("clip-below", overflow - shift > 0.5);
+    }
+
     // Size the terminal: to the box while claiming (the PTY follows),
     // else to the PTY's size (clipped, bottom rows in view).
     pane.refit = () => {
       if (!pane.term || pane.replaying || pane.disposed) return;
+      // A divider is being dragged: fit once on release (app.js), not on
+      // every pointer move -- each fit would resize the PTY, and every
+      // SIGWINCH makes the shell or agent redraw.
+      if (ctx.holdFit()) return;
       if (pane.claims() || !pane.size) {
         pane.following = false;
         host.classList.remove("following");
@@ -122,6 +163,7 @@ window.FwHubPanes = function (ctx) {
         pane.following = true;
       }
       ctx.onResize(pane);
+      scheduleClip();
     };
 
     // This pane now claims the size (it got focus): fit and tell the PTY,
@@ -307,6 +349,7 @@ window.FwHubPanes = function (ctx) {
             host.classList.toggle("following", pane.following);
           }
           ctx.onResize(pane);
+          scheduleClip();
         } else if (message.type === "reset") {
           term.reset();
         } else if (message.type === "exit") {

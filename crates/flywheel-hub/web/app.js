@@ -114,6 +114,7 @@
     offline: 0, // consecutive failed refreshes
     notice: "", // why the last session detached, shown on the empty stage
     noticeTitle: "", // headline for that notice (e.g. "Session removed")
+    dividerHeld: new Set(), // dividers being dragged or key-resized (terminal fits wait)
     attachedMeta: null, // {name, workspaceId, workspaceName} of the attached session, kept to explain its removal
     closing: new Set(), // session ids this browser is removing (no "removed elsewhere" notice)
     refreshSeq: 0, // refreshes started (each response is tagged with its number)
@@ -530,6 +531,7 @@
     term: () => focusedTerm(),
     pane: () => focusedPane(),
     panes: () => livePanes(),
+    phone: () => phone(),
     sendData: (data) => {
       const pane = focusedPane();
       if (pane) pane.sendInput(JSON.stringify({ type: "input", data }));
@@ -559,6 +561,9 @@
     attachTerminal: (pane) => mobile.attachTerminal(pane.term),
     themeMessage: () => themeMessage(),
     claims: (pane) => claimsSize(pane),
+    // Only dividers still on the stage hold (one removed mid-drag, by a
+    // rebuild, never fires its release).
+    holdFit: () => [...state.dividerHeld].some((d) => d.isConnected),
     onResize: (pane) => {
       if (pane === focusedPane()) updateMeters();
       renderPaneHead(pane);
@@ -630,6 +635,10 @@
     const queue = state.layoutQueue[workspaceId];
     // A write in flight settles it (its answer, or a 409 carrying it).
     if (queue && queue.length) return layoutOf(workspaceId);
+    // A GET that started before this page's own save but answered after
+    // it is older than what this page already has: keep the newer one.
+    const have = state.confirmed[workspaceId];
+    if (have && layout && typeof layout.rev === "number" && layout.rev < have.rev) return layoutOf(workspaceId);
     state.confirmed[workspaceId] = layout;
     state.layouts[workspaceId] = L.clone(layout);
     return layout;
@@ -987,8 +996,22 @@
       const r = dir === "right" ? (event.clientX - box.left) / box.width : (event.clientY - box.top) / box.height;
       return L.clampRatio(r);
     };
-    // Restyled only: the layout changes (and is saved) on commit.
+    // Restyled only: the layout changes (and is saved) on commit. While a
+    // divider is held the panes keep their terminal size (panes.js refit);
+    // letting go fits them once.
     const preview = (ratio) => styleSplit(divider.parentElement, { ratio });
+    const hold = () => {
+      state.dividerHeld.add(divider);
+    };
+    const release = () => {
+      state.dividerHeld.delete(divider);
+      for (const d of state.dividerHeld) if (!d.isConnected) state.dividerHeld.delete(d);
+      if (!state.dividerHeld.size) {
+        requestAnimationFrame(() => {
+          for (const pane of livePanes()) pane.refit();
+        });
+      }
+    };
     const commit = (ratio) => {
       const tab = activeTab();
       if (!tab) return;
@@ -1005,6 +1028,7 @@
       divider.setPointerCapture(event.pointerId);
       divider.classList.add("dragging");
       document.body.classList.add(dir === "right" ? "resizing-x" : "resizing-y");
+      hold();
       let last = null;
       const move = (e) => {
         last = ratioAt(e);
@@ -1015,6 +1039,7 @@
         divider.classList.remove("dragging");
         document.body.classList.remove("resizing-x", "resizing-y");
         if (last !== null) commit(last);
+        release();
       };
       divider.addEventListener("pointermove", move);
       divider.addEventListener("pointerup", up, { once: true });
@@ -1046,12 +1071,14 @@
       event.preventDefault();
       event.stopPropagation();
       next = L.clampRatio(next);
+      if (divider.pending === undefined) hold();
       divider.pending = next;
       preview(next);
       clearTimeout(divider.saveTimer);
       divider.saveTimer = setTimeout(() => {
         divider.pending = undefined;
         commit(next);
+        release();
       }, 400);
     });
   }
@@ -1090,15 +1117,14 @@
       pane.following
         ? el("span", {
           className: "pane-follow",
-          textContent: `${size} · another viewer's size`,
           title: "This pane follows the size another viewer set; focus it to fit the terminal to this pane.",
-        })
+        }, size, el("span", { className: "long", textContent: " · another viewer's size" }))
         : null,
       el(
         "span",
         { className: "pane-tools" },
-        iconButton("split-right", `Split right: new shell (${MOD} \\)`, () => splitWithShell(pane, "right")),
-        iconButton("split-down", `Split down: new shell (${MOD} -)`, () => splitWithShell(pane, "down")),
+        splitTool(iconButton("split-right", `Split right: new shell (${MOD} \\)`, () => splitWithShell(pane, "right"))),
+        splitTool(iconButton("split-down", `Split down: new shell (${MOD} -)`, () => splitWithShell(pane, "down"))),
         iconButton(zoomed ? "unzoom" : "zoom", zoomed ? `Unzoom (${MOD} Z)` : `Zoom (${MOD} Z)`, () => toggleZoom(pane.id)),
         iconButton("dots", "Pane menu", (event) => {
           const box = event.currentTarget.getBoundingClientRect();
@@ -1107,6 +1133,11 @@
         iconButton("x", `Close pane: the session keeps running (${MOD} X)`, () => closePane(pane.id)),
       ),
     ].filter(Boolean));
+  }
+
+  function splitTool(button) {
+    button.classList.add("split-tool");
+    return button;
   }
 
   // The phone's one pane.
@@ -1165,7 +1196,7 @@
     const cy = from.top + from.height / 2;
     let best = null;
     for (const pane of state.panes.values()) {
-      if (pane === current || !pane.el.isConnected) continue;
+      if (pane === current || !onStage(pane)) continue;
       const r = pane.el.getBoundingClientRect();
       const ok = direction === "left" ? r.right <= from.left + 2
         : direction === "right" ? r.left >= from.right - 2
@@ -1487,15 +1518,20 @@
     ].filter(Boolean));
   }
 
-  // Phones: tabs and panes of the viewed workspace as one row of chips.
+  // Phones: the sessions laid out in the viewed workspace as one row of
+  // chips -- one per session (a session shown in several tabs is one
+  // terminal), labelled with the first tab showing it.
   function renderSwitcher(bar, layout) {
     const chips = [];
+    let activeChip = null;
     if (layout && state.solo && state.solo.sessionId) {
       const multiTab = layout.tabs.length > 1;
+      const seen = new Set();
       for (const t of layout.tabs) {
         for (const leaf of L.panes(t.root)) {
           const session = sessionById(leaf.session);
-          if (!session) continue;
+          if (!session || seen.has(session.id)) continue;
+          seen.add(session.id);
           const st = status(session);
           const on = leaf.session === state.solo.sessionId;
           chips.push(el(
@@ -1516,11 +1552,22 @@
             multiTab ? el("small", { textContent: `${t.name}` }) : null,
             session.name,
           ));
+          if (on) activeChip = chips[chips.length - 1];
         }
       }
     }
     bar.hidden = chips.length < 2;
-    bar.replaceChildren(...(chips.length < 2 ? [] : [el("div", { className: "pane-switch", role: "toolbar", "aria-label": "Panes" }, chips)]));
+    const row = chips.length < 2 ? null : el("div", { className: "pane-switch", role: "toolbar", "aria-label": "Panes" }, chips);
+    bar.replaceChildren(...(row ? [row] : []));
+    // The chip on screen is in view (the row scrolls sideways).
+    if (row && activeChip) {
+      requestAnimationFrame(() => {
+        const left = activeChip.offsetLeft - row.offsetLeft;
+        const right = left + activeChip.offsetWidth;
+        if (left < row.scrollLeft) row.scrollLeft = Math.max(0, left - 8);
+        else if (right > row.scrollLeft + row.clientWidth) row.scrollLeft = right - row.clientWidth + 8;
+      });
+    }
   }
 
   // --- menus -----------------------------------------------------------
@@ -1734,12 +1781,29 @@
   });
 
   // Crossing the phone breakpoint swaps the solo pane and the layout.
+  // `state.attached` already reads the new side of the breakpoint here, so
+  // the session on screen is taken from the side being left.
   window.matchMedia(NARROW).addEventListener("change", () => {
-    const shown = state.attached;
     if (phone()) {
+      const was = state.panes.get(state.focusId);
+      const shown = was && was.sessionId;
       renderStage();
-      if (shown) showSolo(shown);
+      if (shown && sessionById(shown)) showSolo(shown);
     } else {
+      const shown = state.solo && state.solo.sessionId;
+      if (state.solo) state.solo.dispose();
+      state.solo = null;
+      const layout = viewLayout();
+      const hit = shown && layout && layout.tabs
+        .map((t) => ({ tab: t, leaf: L.paneShowing(t.root, shown) }))
+        .find((h) => h.leaf);
+      if (hit) {
+        const view = viewOf(state.view);
+        view.tab = hit.tab.id;
+        view.focus[hit.tab.id] = hit.leaf.id;
+        saveViews();
+      }
+      state.stageKey = "";
       renderStage();
     }
   });
@@ -1780,12 +1844,19 @@
   // there stays "done").
   // Every pane on screen counts (a split shows several sessions at once;
   // panes behind a zoom or in other tabs do not).
+  // On stage = inside #terminal. Panes behind a zoom or in another tab are
+  // parked in the hidden #pane-park, which is still connected to the
+  // document, so isConnected cannot tell them apart.
+  function onStage(pane) {
+    return $("#terminal").contains(pane.el);
+  }
+
   function currentView() {
     if (!present()) return { session_id: null, visible: [] };
     const session = sessionById(state.attached);
     const focused = session && session.live ? session.id : null;
     const visible = livePanes()
-      .filter((p) => p.sessionId && p.sessionId !== focused && p.el.isConnected && sessionById(p.sessionId)?.live)
+      .filter((p) => p.sessionId && p.sessionId !== focused && onStage(p) && sessionById(p.sessionId)?.live)
       .map((p) => p.sessionId);
     return { session_id: focused, visible };
   }
@@ -2156,7 +2227,7 @@
     const st = status(session);
     const active = state.attached === session.id;
     // In another pane on screen.
-    const shown = !active && livePanes().some((p) => p.sessionId === session.id && p.el.isConnected);
+    const shown = !active && livePanes().some((p) => p.sessionId === session.id && onStage(p));
     const nameNode = state.renaming === session.id
       ? el("input", {
         className: "rename",
@@ -2400,10 +2471,13 @@
 
   function renderMain() {
     const session = sessionById(state.attached);
-    const workspace = session ? workspaceById(session.workspace_id) : null;
+    // An empty tab of a workspace that is open (a new tab, its sessions
+    // closed): the stage offers that workspace's sessions.
+    const emptyTab = !session && !phone() && state.view && workspaceById(state.view) && activeTab() ? focusedLeaf() : null;
+    const workspace = session ? workspaceById(session.workspace_id) : emptyTab ? workspaceById(state.view) : null;
     $("#empty").hidden = !!session;
     $("#crumb-workspace").textContent = workspace ? workspace.name : "";
-    $("#crumb-session").textContent = session ? session.name : "No session";
+    $("#crumb-session").textContent = session ? session.name : emptyTab ? "Empty pane" : "No session";
     // Without a session the header's session controls mean nothing.
     $("#cmd-toggle").hidden = !session;
     $("#link").hidden = !session;
@@ -2452,7 +2526,26 @@
     mobile.render();
 
     const actions = $("#empty-actions");
-    if (!session) {
+    if (!session && emptyTab && !state.notice) {
+      const others = state.sessions.filter((s) => s.workspace_id === workspace.id && s.live);
+      $("#empty-title").textContent = "Empty pane.";
+      $("#empty-body").textContent = others.length
+        ? `Show one of ${workspace.name}'s sessions here, drag one in from the sidebar, or start a shell.`
+        : `Start a shell in ${workspace.name}, or drag a session in from the sidebar.`;
+      actions.replaceChildren(
+        el("button", {
+          type: "button",
+          className: "slab",
+          onclick: () => createSession({ workspace_id: workspace.id, kind: "shell" }, { pane: emptyTab.id })
+            .catch((error) => commands.toast(error.message, { timeout: 5000 })),
+        }, icon("plus"), "New shell"),
+        ...others.slice(0, 8).map((other) => el("button", {
+          type: "button",
+          className: "slab ghost",
+          onclick: () => openSession(other.id, { pane: emptyTab.id }),
+        }, other.name)),
+      );
+    } else if (!session) {
       const hasWorkspace = state.workspaces.length > 0;
       $("#empty-title").textContent = state.noticeTitle ||
         (hasWorkspace ? "Nothing on the wheel." : "Set up a workspace.");
@@ -3403,6 +3496,34 @@
 
   // --- boot ------------------------------------------------------------
 
+  // No #session (a fresh tab, a restart): bring back the last workspace
+  // this browser had open -- else the first with a saved layout -- at
+  // its active tab's focused pane.
+  async function restoreWorkspace() {
+    const remembered = workspaceById(state.currentWorkspace);
+    const order = [remembered, ...state.workspaces.filter((w) => w !== remembered)].filter(Boolean);
+    for (const workspace of order) {
+      let layout;
+      try {
+        layout = await ensureLayout(workspace.id);
+      } catch (_) {
+        continue;
+      }
+      if (state.attached || window.location.hash) return;
+      if (!layout || !layout.tabs.length) continue;
+      const view = viewOf(workspace.id);
+      const tab = layout.tabs.find((t) => t.id === view.tab) || layout.tabs[0];
+      const leaves = L.panes(tab.root).filter((leaf) => leaf.session && sessionById(leaf.session));
+      const leaf = leaves.find((p) => p.id === view.focus[tab.id]) || leaves[0];
+      const session = leaf ? leaf.session
+        : layout.tabs.flatMap((t) => L.sessionsOf(t.root)).find((id) => sessionById(id));
+      if (session) {
+        await openSession(session);
+        return;
+      }
+    }
+  }
+
   async function boot() {
     // Measure terminal cells with the real font, not a fallback.
     const fonts = document.fonts
@@ -3431,6 +3552,8 @@
     if (match) {
       if (sessionById(match[1])) openSession(match[1]);
       else detach(STALE_LINK, "Session removed.");
+    } else {
+      await restoreWorkspace().catch(() => {});
     }
     // Follow an edited or navigated #session= (replaceState fires no
     // hashchange, so this sees only the user's own changes).

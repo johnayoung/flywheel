@@ -258,6 +258,27 @@ async fn layouts_save_validate_push_prune_and_survive_a_restart() {
         )
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    // A tree nested past serde's recursion limit is refused with a short
+    // message (the field path is not echoed in full).
+    let mut deep = pane("p0", None);
+    for i in 1..200 {
+        deep = split("right", 0.5, deep, pane(&format!("p{i}"), None));
+    }
+    let (status, body) = hub
+        .call(
+            Method::PUT,
+            &path,
+            Some(json!({ "rev": 1, "tabs": [{ "id": "t1", "name": "a", "root": deep }] })),
+        )
+        .await;
+    assert!(status.is_client_error(), "{status} {body}");
+    let message = body["error"].as_str().unwrap();
+    assert!(
+        message.chars().count() <= 260,
+        "{} chars: {message}",
+        message.len()
+    );
+    assert!(message.contains("recursion limit"), "{message}");
     let (_, read) = hub.call(Method::GET, &path, None).await;
     assert_eq!(read["rev"], 1);
 

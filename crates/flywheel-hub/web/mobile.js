@@ -15,9 +15,11 @@
 // * Touch on the terminal: swipe scrolls (with momentum; in full-screen
 //   programs it scrolls them), long-press selects (drag to extend) with a
 //   Copy button, pinch sets the font size (kept per device).
-// * A row floor: the PTY is shared by every viewer and sized by the last
-//   one to resize, so a short phone viewport (keyboard up) never shrinks it
-//   below MIN_ROWS; the terminal is then bottom-aligned and clipped.
+// * A row floor (phones only): the PTY is shared by every viewer and sized
+//   by the last one to resize, so a short phone viewport (keyboard up) never
+//   shrinks it below MIN_ROWS; the terminal is then clipped around the
+//   cursor. A desktop pane fits its box exactly (a short split pane must
+//   not hide its top rows under the title bar).
 "use strict";
 
 window.FwHubMobile = function (ctx) {
@@ -289,8 +291,10 @@ window.FwHubMobile = function (ctx) {
   // Fit a pane's terminal to its box, but never below MIN_ROWS: the PTY's
   // size is every viewer's, and a phone with its keyboard up (or Compose
   // open) would otherwise squeeze the agent's real terminal to a row or
-  // two. A floored terminal is bottom-aligned (where prompts are) and
-  // clipped. `pane`: {term, fit, host} (panes.js); the focused one if none.
+  // two. A floored terminal is clipped around the cursor (panes.js).
+  // Desktop panes are not floored: a short split pane is a layout
+  // the user chose, and clipping it would hide its top rows.
+  // `pane`: {term, fit, host} (panes.js); the focused one if none.
   function fitTerminal(pane = ctx.pane()) {
     const t = pane && pane.term;
     const f = pane && pane.fit;
@@ -298,7 +302,7 @@ window.FwHubMobile = function (ctx) {
     const dims = f.proposeDimensions();
     if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows)) return;
     const cols = Math.max(2, dims.cols);
-    const rows = Math.max(MIN_ROWS, dims.rows);
+    const rows = ctx.phone() ? Math.max(MIN_ROWS, dims.rows) : Math.max(2, dims.rows);
     pane.host.classList.toggle("floored", rows > dims.rows);
     if (t.cols !== cols || t.rows !== rows) t.resize(cols, rows);
   }

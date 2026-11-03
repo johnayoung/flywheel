@@ -494,7 +494,7 @@ const search = window.FwHubSearch({
 // from a selection, a transcript message, a suggested block, or a diff,
 // and the read-only reviewer of the other kind.
 const handoff = window.FwHubHandoff({
-  $, el, icon, api, state, sessionById, workspaceById, isAgent, agentStatus,
+  $, el, icon, api, age, state, sessionById, workspaceById, isAgent, agentStatus,
   toast: (...args) => commands.toast(...args),
   copyText: (text) => commands.copyText(text),
   keyOf: (id) => settings.keyOf(id),

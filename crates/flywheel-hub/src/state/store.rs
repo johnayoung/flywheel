@@ -508,8 +508,14 @@ impl HubStore {
     }
 
     /// Pair `author` with the reviewer agent `reviewer` (both records
-    /// say so: the author's `reviewer`, the reviewer's `review_of`).
-    pub fn set_review_pair(&mut self, author: &str, reviewer: &str) -> Result<(), StateError> {
+    /// say so: the author's `reviewer`, the reviewer's `review_of`). The
+    /// reviewer it replaces, if any, no longer says it reviews `author`:
+    /// its id is returned.
+    pub fn set_review_pair(
+        &mut self,
+        author: &str,
+        reviewer: &str,
+    ) -> Result<Option<String>, StateError> {
         if author == reviewer {
             return Err(StateError::Invalid(
                 "a session cannot review its own work".into(),
@@ -527,12 +533,27 @@ impl HubStore {
             self.doc.sessions[a].reviewer.clone(),
             self.doc.sessions[r].review_of.clone(),
         );
+        // The replaced reviewer, when it still says it reviews `author`.
+        let replaced = before
+            .0
+            .as_deref()
+            .filter(|old| *old != reviewer)
+            .and_then(|old| self.doc.sessions.iter().position(|s| s.id == old))
+            .filter(|&o| self.doc.sessions[o].review_of.as_deref() == Some(author));
         self.doc.sessions[a].reviewer = Some(reviewer.to_owned());
         self.doc.sessions[r].review_of = Some(author.to_owned());
+        if let Some(o) = replaced {
+            self.doc.sessions[o].review_of = None;
+        }
+        let author_id = author.to_owned();
         self.save_or_rollback(|doc| {
             doc.sessions[a].reviewer = before.0;
             doc.sessions[r].review_of = before.1;
-        })
+            if let Some(o) = replaced {
+                doc.sessions[o].review_of = Some(author_id);
+            }
+        })?;
+        Ok(replaced.map(|o| self.doc.sessions[o].id.clone()))
     }
 
     /// Forget a session record, closing the panes that showed it (and

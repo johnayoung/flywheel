@@ -16,7 +16,7 @@
 "use strict";
 
 window.FwHubHandoff = function (ctx) {
-  const { $, el, icon, api, state, sessionById, workspaceById, isAgent } = ctx;
+  const { $, el, icon, api, age, state, sessionById, workspaceById, isAgent } = ctx;
   const toast = (...args) => ctx.toast(...args);
 
   // How often an open findings panel re-reads the reviewer's answer.
@@ -36,6 +36,7 @@ window.FwHubHandoff = function (ctx) {
     composed: null, // the hub's answer
     findingsFor: null, // author id (findings mode)
     composedText: "", // the prompt as composed (edited when it differs)
+    composingCross: null, // the cross-machine flag of the newest compose
     seq: 0,
     busy: false,
   };
@@ -104,14 +105,31 @@ window.FwHubHandoff = function (ctx) {
 
   // --- the dialog ----------------------------------------------------------
 
-  // Open "Send to agent" for `source` of session `from`.
-  function open(from, source) {
+  // Open "Send to agent" for `source` of session `from`. With `probe`,
+  // the prompt is composed before the dialog opens: a source that may
+  // have nothing (the last command) is a toast, not an empty dialog.
+  async function open(from, source, probe) {
     const session = sessionById(from);
     if (!session) return;
     const pool = targets(from);
     if (!pool.length) {
       toast("No other agent session is running to send it to: start a Claude Code or Codex session first.", { tone: "bad" });
       return;
+    }
+    const chosen = defaultTarget(session, pool);
+    let early = null;
+    if (probe) {
+      const to = sessionById(chosen);
+      const cross = !!to && machineOf(to) !== machineOf(session);
+      try {
+        early = {
+          composed: await api("POST", `/api/sessions/${session.id}/handoff/compose`, { source, cross_machine: cross }),
+          cross,
+        };
+      } catch (error) {
+        toast(error.message, { tone: "bad" });
+        return;
+      }
     }
     ui.mode = "handoff";
     ui.from = from;
@@ -121,41 +139,68 @@ window.FwHubHandoff = function (ctx) {
     $("#ho-kicker").textContent = "send to agent";
     $("#ho-title").textContent = "Send to another agent";
     $("#ho-from").textContent = `From ${session.name}${machineOf(session) ? ` on ${session.machine}` : ""}`;
-    fillTargets(pool, defaultTarget(session, pool));
+    fillTargets(pool, chosen);
     text.value = "";
     renderSize();
     setNote("Composing…");
     sendButton.disabled = true;
     sendButton.textContent = "Paste & send";
     if (!dialog.open) dialog.showModal();
-    compose();
+    // The probe's prompt holds unless the target moved machines since.
+    if (early && early.cross === crossNow()) {
+      ui.seq++;
+      ui.composingCross = early.cross;
+      applyComposed(early.composed, early.cross);
+    } else {
+      compose();
+    }
+  }
+
+  // Whether the picked target is on another machine than the source.
+  function crossNow() {
+    const from = sessionById(ui.from);
+    const to = sessionById(pick.value);
+    return !!from && !!to && machineOf(to) !== machineOf(from);
+  }
+
+  // The prompt shows from its first line: the provenance header.
+  function showFromTop() {
+    text.focus();
+    text.setSelectionRange(0, 0);
+    text.scrollTop = 0;
+  }
+
+  function applyComposed(composed, cross) {
+    ui.composed = { ...composed, cross };
+    // Never over what the user typed.
+    if (!ui.composedText || text.value === ui.composedText) text.value = composed.prompt;
+    ui.composedText = composed.prompt;
+    renderSize();
+    setNote(
+      composed.truncated
+        ? `Cut to ${bytes(composed.kept_bytes)} of ${bytes(composed.content_bytes)}: the prompt says so. Edit it freely; it is pasted, then Enter.`
+        : `${composed.what.charAt(0).toUpperCase()}${composed.what.slice(1)}. Edit it freely; it is pasted into the agent, then Enter.`,
+      composed.truncated ? "warn" : "",
+    );
+    sendButton.disabled = false;
+    showFromTop();
   }
 
   async function compose() {
     const from = sessionById(ui.from);
-    const to = sessionById(pick.value);
     if (!from) return;
     const seq = ++ui.seq;
-    const cross = !!to && machineOf(to) !== machineOf(from);
+    const cross = crossNow();
+    // Composed for one machine, never sent to another: Send waits.
+    ui.composingCross = cross;
+    sendButton.disabled = true;
     try {
       const composed = await api("POST", `/api/sessions/${from.id}/handoff/compose`, {
         source: ui.source,
         cross_machine: cross,
       });
       if (seq !== ui.seq || !dialog.open) return;
-      ui.composed = { ...composed, cross };
-      // Never over what the user typed.
-      if (!ui.composedText || text.value === ui.composedText) text.value = composed.prompt;
-      ui.composedText = composed.prompt;
-      renderSize();
-      setNote(
-        composed.truncated
-          ? `Cut to ${bytes(composed.kept_bytes)} of ${bytes(composed.content_bytes)}: the prompt says so. Edit it freely; it is pasted, then Enter.`
-          : `${composed.what.charAt(0).toUpperCase()}${composed.what.slice(1)}. Edit it freely; it is pasted into the agent, then Enter.`,
-        composed.truncated ? "warn" : "",
-      );
-      sendButton.disabled = false;
-      text.focus();
+      applyComposed(composed, cross);
     } catch (error) {
       if (seq !== ui.seq) return;
       setNote(error.message, "bad");
@@ -168,11 +213,9 @@ window.FwHubHandoff = function (ctx) {
     } catch (_) {
       // Private mode: the pick lasts this dialog.
     }
-    // The header names this machine only for a target elsewhere.
-    const from = sessionById(ui.from);
-    const to = sessionById(pick.value);
-    const cross = !!from && !!to && machineOf(to) !== machineOf(from);
-    if (ui.mode === "handoff" && ui.composed && cross !== ui.composed.cross) compose();
+    // The header names this machine only for a target elsewhere: a
+    // compose (done or still running) for the other side is redone.
+    if (ui.mode === "handoff" && crossNow() !== ui.composingCross) compose();
   });
   text.addEventListener("input", renderSize);
   text.addEventListener("keydown", (event) => {
@@ -197,6 +240,10 @@ window.FwHubHandoff = function (ctx) {
     const to = sessionById(pick.value);
     if (!to) {
       setNote("Pick the agent to send it to.", "bad");
+      return;
+    }
+    if (ui.mode === "handoff" && (!ui.composed || ui.composed.cross !== crossNow())) {
+      setNote("Composing for that agent's machine…");
       return;
     }
     ui.busy = true;
@@ -238,7 +285,7 @@ window.FwHubHandoff = function (ctx) {
     return true;
   }
 
-  const sendLastCommand = (id) => open(id, { kind: "last_command" });
+  const sendLastCommand = (id) => open(id, { kind: "last_command" }, true);
   const sendCommand = (id, seq) => open(id, { kind: "command", seq });
   const sendDiff = (id, path, oldPath) => open(id, { kind: "diff", path: path || null, old_path: oldPath || null });
   // A transcript message, or the part of it selected in the viewer.
@@ -257,9 +304,15 @@ window.FwHubHandoff = function (ctx) {
     return session;
   }
 
+  // Authors with a review request in flight (one at a time each).
+  const asking = new Set();
+
   async function askReview(id, kind) {
     const author = authorOf(sessionById(id));
     if (!author) return false;
+    if (asking.has(author.id)) return true;
+    asking.add(author.id);
+    paint(author.id);
     try {
       const launched = await api("POST", `/api/sessions/${author.id}/review/reviewer`, kind ? { kind } : {});
       const reviewer = launched.reviewer;
@@ -267,10 +320,14 @@ window.FwHubHandoff = function (ctx) {
       toast(`${how} ${reviewer ? reviewer.name : "the reviewer"} (${launched.kind}, read-only: ${launched.flags.join(" ")}) on ${launched.branch || "HEAD"} vs ${launched.base}.${launched.fallback ? ` ${launched.fallback}.` : ""}${launched.diff_truncated ? " The diff in its prompt is cut; it reads the rest itself." : ""}`);
       const panel = panels.get(author.id);
       if (panel) panel.data = null;
+      if (launched.replaced) toast(`${launched.replaced.name} (${launched.replaced.kind}) is replaced by ${reviewer ? reviewer.name : "the new reviewer"}: it is closed.`);
       await ctx.refresh();
       loadFindings(author.id);
     } catch (error) {
       toast(error.message, { tone: "bad" });
+    } finally {
+      asking.delete(author.id);
+      paint(author.id);
     }
     return true;
   }
@@ -326,6 +383,67 @@ window.FwHubHandoff = function (ctx) {
     );
   }
 
+  // The reply's lines outside code fences and its fenced blocks, in
+  // order (the fences as commands.rs reads them; blocks with nothing in
+  // them are dropped, as the hub drops them).
+  function splitReply(reply) {
+    const parts = [];
+    let prose = [];
+    let open = null; // {ch, len, indent, lines}
+    const flush = () => {
+      if (prose.join("\n").trim()) parts.push({ prose: prose.join("\n").replace(/^\n+|\n+$/g, "") });
+      prose = [];
+    };
+    for (const raw of reply.split("\n")) {
+      const line = raw.replace(/\r$/, "");
+      if (!open) {
+        const m = /^( *)(`{3,}|~{3,})(.*)$/.exec(line);
+        if (m && !(m[2][0] === "`" && m[3].includes("`"))) {
+          flush();
+          open = { ch: m[2][0], len: m[2].length, indent: m[1].length, lines: [] };
+        } else {
+          prose.push(raw);
+        }
+        continue;
+      }
+      const rest = line.replace(/^ +/, "");
+      let n = 0;
+      while (rest[n] === open.ch) n++;
+      if (n >= open.len && !rest.slice(n).trim()) {
+        parts.push({ text: open.lines.join("\n") });
+        open = null;
+      } else {
+        const spaces = raw.length - raw.replace(/^ +/, "").length;
+        open.lines.push(raw.slice(Math.min(spaces, open.indent)));
+      }
+    }
+    if (open) {
+      if (open.lines.length && open.lines[open.lines.length - 1] === "") open.lines.pop();
+      parts.push({ text: open.lines.join("\n") });
+    }
+    flush();
+    return parts.filter((p) => p.prose !== undefined || p.text.trim());
+  }
+
+  // The reply as prose with its code blocks as cards in place (each block
+  // once); the raw reply and the cards below it when the split does not
+  // match the hub's blocks.
+  function replyView(data, author) {
+    const parts = splitReply(data.reply);
+    const blocks = parts.filter((p) => p.prose === undefined);
+    const matches = blocks.length === data.blocks.length && blocks.every((b, i) => b.text === data.blocks[i].text);
+    if (!matches) {
+      return el("div", { className: "ho-reply-wrap" },
+        el("pre", { className: "ho-reply" }, el("code", { textContent: data.reply })),
+        data.blocks.length ? el("ul", { className: "ho-blocks" }, ...data.blocks.map((b) => blockCard(b, author))) : null);
+    }
+    let next = 0;
+    return el("div", { className: "ho-reply rich" },
+      ...parts.map((part) => (part.prose !== undefined
+        ? el("p", { className: "ho-prose", textContent: part.prose })
+        : el("ul", { className: "ho-blocks" }, blockCard(data.blocks[next++], author)))));
+  }
+
   function paint(authorId) {
     const panel = panels.get(authorId);
     if (!panel) return;
@@ -339,11 +457,16 @@ window.FwHubHandoff = function (ctx) {
       el("option", { value: "claude", textContent: "claude" }),
       el("option", { value: "codex", textContent: "codex" }),
     );
-    kindPick.value = panel.kind || "";
+    // "Ask again" asks the paired reviewer unless another kind is picked.
+    kindPick.value = panel.kind || (reviewer ? reviewer.kind : "");
     kindPick.addEventListener("change", () => {
       panel.kind = kindPick.value;
     });
-    const status = reviewer ? ctx.agentStatus(reviewer) : null;
+    // Its pushed status, else the one the findings read.
+    const status = reviewer
+      ? ctx.agentStatus(reviewer) || (data && data.reviewer && data.reviewer.status ? { status: data.reviewer.status } : null)
+      : null;
+    const pending = asking.has(authorId);
     const head = el(
       "div",
       { className: "ho-review-head" },
@@ -363,7 +486,8 @@ window.FwHubHandoff = function (ctx) {
         el("button", {
           type: "button",
           className: "slab ghost",
-          textContent: reviewer ? "Ask again" : "Ask for a review",
+          textContent: pending ? "Asking…" : reviewer ? "Ask again" : "Ask for a review",
+          disabled: pending,
           title: "Launch (or ask again) a reviewer agent in this worktree, read-only, with the branch diff",
           onclick: () => askReview(authorId, kindPick.value || null),
         }),
@@ -373,16 +497,28 @@ window.FwHubHandoff = function (ctx) {
     if (panel.error) parts.push(el("p", { className: "ho-review-note bad", textContent: panel.error }));
     if (reviewer && data) {
       if (data.reply) {
-        parts.push(el("pre", { className: "ho-reply" }, el("code", { textContent: data.reply })));
-        if (data.blocks.length) {
-          parts.push(el("ul", { className: "ho-blocks" }, ...data.blocks.map((b) => blockCard(b, author && isAgent(author) ? author : null))));
-        }
+        const working = status && status.status === "working";
+        const when = data.timestamp ? age(data.timestamp) : "";
+        parts.push(el("p", {
+          className: "ho-review-meta",
+          textContent: [
+            when ? `Answered ${when} ago` : "Answered",
+            working ? `${reviewer.name} is still working: this is its reply so far` : "",
+          ].filter(Boolean).join(" · "),
+          title: data.timestamp || "",
+        }));
+        const canSend = !!(author && isAgent(author) && author.live && author.state === "running" && !author.fallback_command);
+        parts.push(replyView(data, canSend ? author : null));
         parts.push(el("div", { className: "ho-review-foot" },
           el("button", {
             type: "button",
             className: "slab",
-            disabled: !(author && isAgent(author) && author.live && author.state === "running"),
-            title: author && isAgent(author) ? `Paste the findings into ${author.name} (editable first), then Enter` : "The author is not an agent session",
+            disabled: !canSend,
+            title: !author || !isAgent(author)
+              ? "The author is not an agent session"
+              : author.fallback_command
+                ? `${author.name} came back as a plain shell after a restart: kill and relaunch it to start ${author.kind} again, then send`
+                : canSend ? `Paste the findings into ${author.name} (editable first), then Enter` : `${author.name} is not running`,
             onclick: () => openFindings(authorId),
           }, icon("send"), `Send findings to ${author ? author.name : "the author"}…`),
         ));
@@ -453,7 +589,7 @@ window.FwHubHandoff = function (ctx) {
     sendButton.disabled = false;
     sendButton.textContent = "Paste & send";
     if (!dialog.open) dialog.showModal();
-    text.focus();
+    showFromTop();
   }
 
   // --- the sidebar ---------------------------------------------------------------

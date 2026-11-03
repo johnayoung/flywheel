@@ -451,6 +451,8 @@ pub struct Hub {
     git: GitWatch,
     /// Serializes companion shell creation (one per agent).
     companion_lock: Mutex<()>,
+    /// Serializes "ask for a review" (one reviewer per author).
+    pub(crate) review_lock: Mutex<()>,
     /// Screen detection manifests (bundled + state-dir overrides).
     detection: Arc<Detection>,
     /// Full-text search caches (see [`crate::search`]).
@@ -549,6 +551,7 @@ impl Hub {
             monitored: Mutex::new(HashMap::new()),
             git: GitWatch::default(),
             companion_lock: Mutex::new(()),
+            review_lock: Mutex::new(()),
             detection: Arc::new(Detection::with_overrides(&options_state_dir)),
             search: crate::search::SearchIndex::default(),
             grading: Arc::default(),

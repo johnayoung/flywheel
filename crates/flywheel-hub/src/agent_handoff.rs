@@ -180,8 +180,12 @@ pub fn cut(text: &str, max: usize) -> (&str, bool) {
         end -= 1;
     }
     let kept = &text[..end];
+    // The cap ends right before a line break: every kept line is whole.
+    if text.as_bytes()[end] == b'\n' && end > 0 {
+        return (kept.trim_end_matches('\r'), true);
+    }
     match kept.rfind('\n') {
-        Some(at) if at > 0 => (&kept[..at], true),
+        Some(at) if at > 0 => (kept[..at].trim_end_matches('\r'), true),
         _ => (kept, true),
     }
 }
@@ -347,8 +351,8 @@ impl Hub {
                     .find(|m| m.meta.index == *index)
                     .ok_or_else(|| {
                         StateError::NotFound(format!(
-                            "message {index} of {}'s transcript (gone, or not written yet)",
-                            record.label()
+                            "message {index} of {}'s transcript",
+                            record.name
                         ))
                     })?;
                 let role = match message.meta.role {
@@ -387,7 +391,8 @@ impl Hub {
                     .lang
                     .clone()
                     .unwrap_or_else(|| if command.shell { "sh" } else { "text" }.to_owned());
-                Ok((what.to_owned(), lang, command.text))
+                // What Copy pastes: `$ ` prompts and output lines out.
+                Ok((what.to_owned(), lang, command.command))
             }
             Source::LastCommand => {
                 let list = self.commands(
@@ -400,14 +405,14 @@ impl Hub {
                 let command = list.commands.into_iter().next().ok_or_else(|| {
                     StateError::Conflict(format!(
                         "{} has suggested no shell command yet",
-                        record.label()
+                        record.name
                     ))
                 })?;
                 let lang = command.lang.clone().unwrap_or_else(|| "sh".to_owned());
                 Ok((
                     "the last command it suggested".to_owned(),
                     lang,
-                    command.text,
+                    command.command,
                 ))
             }
             Source::Diff {
@@ -450,6 +455,17 @@ impl Hub {
     pub fn handoff_deliver(&self, to: &str, delivery: &Delivery) -> Result<Delivered, HubError> {
         let view = self.session(to)?;
         let record = &view.record;
+        if record.kind.is_agent() && !record.runs_agent() {
+            let kind = record.kind.as_str();
+            return Err(StateError::Conflict(format!(
+                "{name} is a {kind} session, but {kind} is not running in it: it came back as a \
+                 plain shell after a restart ({kind} had no conversation to resume). Start {kind} \
+                 again (`fw hub kill {name}`, then `fw hub relaunch {name}`, or Relaunch in the \
+                 UI), then send",
+                name = record.name
+            ))
+            .into());
+        }
         if !record.runs_agent() {
             return Err(StateError::Invalid(format!(
                 "{} is not an agent session: hand off to a Claude Code or Codex session (fw hub send types into any)",
@@ -576,6 +592,10 @@ mod tests {
     fn cutting_keeps_whole_lines_and_characters() {
         assert_eq!(cut("short", 10), ("short", false));
         assert_eq!(cut("one\ntwo\nthree", 9), ("one\ntwo", true));
+        // The cap lands on a line break: the line before it is whole.
+        assert_eq!(cut("one\ntwo\nthree", 7), ("one\ntwo", true));
+        assert_eq!(cut("one\r\ntwo\r\nthree", 9), ("one\r\ntwo", true));
+        assert_eq!(cut("one\ntwo\nthree", 6), ("one", true));
         // No line break inside the cap: cut on a character boundary.
         let (kept, cut_) = cut("ééééé", 5);
         assert!(cut_);

@@ -69,6 +69,10 @@ pub struct ReviewLaunch {
     /// installed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
+    /// The earlier reviewer this one replaces (stopped, or of another
+    /// kind): closed, so one reviewer is paired with the author.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replaced: Option<PairRef>,
     /// The read-only flags it runs with.
     pub flags: Vec<String>,
     pub base: String,
@@ -244,6 +248,13 @@ impl Hub {
         id: &str,
         request: &ReviewRequest,
     ) -> Result<ReviewLaunch, HubError> {
+        // One request at a time: a second one (a double click, two CLIs)
+        // sees the reviewer the first paired and asks it again instead of
+        // starting another.
+        let _one = self
+            .review_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let asked = self.session(id)?.record;
         let id = asked.review_of.clone().unwrap_or_else(|| asked.id.clone());
         let (record, target) = self.review_target(tools, &id, request.base.as_deref())?;
@@ -325,12 +336,24 @@ impl Hub {
                     && r.record.review_of.as_deref() == Some(author.record.id.as_str())
                     && self.pair_ref(r).running
             });
+        // A paired reviewer not asked again is replaced (and closed).
+        let replaced = match &reusable {
+            Some(_) => None,
+            None => author
+                .record
+                .reviewer
+                .as_deref()
+                .and_then(|r| self.session(r).ok())
+                .filter(|r| r.record.review_of.as_deref() == Some(author.record.id.as_str()))
+                .map(|r| self.pair_ref(&r)),
+        };
         let mut outcome = ReviewLaunch {
             author: self.pair_ref(&author),
             reviewer: reusable.clone(),
             kind,
             reused: reusable.is_some(),
             fallback,
+            replaced,
             flags,
             base: diff.base.clone(),
             branch: branch.clone(),
@@ -417,7 +440,33 @@ impl Hub {
             review_of: Some(author.id.clone()),
         };
         let view = self.launch(record, None, None, prompt.as_deref())?;
-        self.store().set_review_pair(&author.id, &view.record.id)?;
+        let paired = self.store().set_review_pair(&author.id, &view.record.id);
+        let replaced = match paired {
+            Ok(replaced) => replaced,
+            Err(e) => {
+                // Not paired: the reviewer just started goes again, so a
+                // retry does not leave a second agent running.
+                if let Err(undo) = self.remove_session(&view.record.id) {
+                    eprintln!(
+                        "fw hub: review {}: closing unpaired reviewer {}: {undo}",
+                        author.label(),
+                        view.record.label()
+                    );
+                }
+                return Err(e.into());
+            }
+        };
+        if let Some(old) = replaced {
+            // One reviewer per author: the one replaced is closed (its
+            // transcript stays where its CLI wrote it).
+            match self.remove_session(&old) {
+                Ok(()) | Err(HubError::State(StateError::NotFound(_))) => {}
+                Err(e) => eprintln!(
+                    "fw hub: review {}: closing replaced reviewer {old}: {e}",
+                    author.label()
+                ),
+            }
+        }
         self.emit(crate::hub::HubEvent::Sessions);
         self.session(&view.record.id)
     }

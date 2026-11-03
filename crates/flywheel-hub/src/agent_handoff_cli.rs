@@ -45,7 +45,8 @@ pub(crate) struct HandoffArgs {
     #[arg(long, value_name = "N")]
     message: Option<u64>,
     /// TO is on this machine (registered on the hub): reached through
-    /// its proxy. Default: where FROM is.
+    /// its proxy; `local`: this hub (FROM on --machine, TO here).
+    /// Default: where FROM is.
     #[arg(long, value_name = "NAME")]
     to_machine: Option<String>,
     /// Keep at most this many bytes of the content (default 32768).
@@ -193,10 +194,16 @@ fn run_handoff(
     };
     let conn = Endpoint::resolve(&args.endpoint)?;
     let (from_id, _) = find_session(&conn, &args.from)?;
-    let cross = args.to_machine.is_some() && args.to_machine != args.endpoint.machine;
+    // Where TO is: a machine, this hub (`local`), or where FROM is.
+    let to_machine = match args.to_machine.as_deref().map(str::trim) {
+        Some("local") => None,
+        Some(name) => Some(name.to_owned()),
+        None => args.endpoint.machine.clone(),
+    };
+    let cross = to_machine != args.endpoint.machine;
     let elsewhere = if cross {
         Some(Endpoint::resolve(&EndpointArgs {
-            machine: args.to_machine.clone(),
+            machine: to_machine.clone(),
             ..args.endpoint.clone()
         })?)
     } else {
@@ -265,11 +272,11 @@ fn run_handoff(
             "handed {} to {}{} ({} bytes)",
             str_field(&composed, "what"),
             session_label(&to),
-            args.to_machine
-                .as_deref()
-                .filter(|_| cross)
-                .map(|m| format!(" on {m}"))
-                .unwrap_or_default(),
+            if cross {
+                format!(" on {}", to_machine.as_deref().unwrap_or("this hub"))
+            } else {
+                String::new()
+            },
             prompt.len()
         );
     }
@@ -360,15 +367,25 @@ fn run_ask_review(
             .unwrap_or_default();
         let what = format!(
             "{} vs {}",
-            launched["branch"].as_str().unwrap_or("HEAD"),
+            launched["branch"]
+                .as_str()
+                .map_or_else(|| "HEAD".to_owned(), |b| format!("branch {b}")),
             str_field(&launched, "base")
         );
         let author = str_field(&launched["author"], "name");
+        if let Some(old) = launched.get("replaced").filter(|r| r.is_object()) {
+            let _ = writeln!(
+                err,
+                "fw hub: {} ({}) is replaced: it is closed",
+                str_field(old, "name"),
+                str_field(old, "kind")
+            );
+        }
         let kind = str_field(&launched, "kind");
         if args.dry_run {
             let _ = writeln!(
                 out,
-                "would {} a {kind} reviewer ({flags}) of {author}'s {what}; its prompt:\n\n{}",
+                "would {} a {kind} reviewer ({flags}) of {author} ({what}); its prompt:\n\n{}",
                 if launched["reused"] == true {
                     "ask again"
                 } else {
@@ -379,7 +396,7 @@ fn run_ask_review(
         } else {
             let _ = writeln!(
                 out,
-                "{} {kind} reviewer {} ({flags}) on {author}'s {what}",
+                "{} {kind} reviewer {} ({flags}) for {author} ({what})",
                 if launched["reused"] == true {
                     "asked"
                 } else {

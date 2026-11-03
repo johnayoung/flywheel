@@ -506,6 +506,46 @@ async fn handoffs_reach_another_agent_exactly_under_their_provenance() {
             "From {claude_name} on feat: a reply from its transcript\n\n````text\nRun:\n```bash\nmake check\n```\n````\n"
         )
     );
+    // A message that is not there names the session, not its id.
+    let (status, why) = hub
+        .refused(
+            &format!("/api/sessions/{claude}/handoff/compose"),
+            json!({ "source": { "kind": "transcript", "index": 999 } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        why,
+        format!("message 999 of {claude_name}'s transcript not found")
+    );
+    // A suggested command goes in its copyable form: no `$ ` prompt.
+    append(
+        &transcript,
+        &claude_line("u2", "assistant", "Then:\n```sh\n$ cargo test\n```"),
+    );
+    let deadline = Instant::now() + WAIT;
+    let last = loop {
+        let (status, last) = hub
+            .call(
+                reqwest::Method::POST,
+                &format!("/api/sessions/{claude}/handoff/compose"),
+                Some(json!({ "source": { "kind": "last_command" } })),
+            )
+            .await;
+        assert!(status.is_success(), "{last}");
+        if last["prompt"].as_str().unwrap().contains("cargo test") {
+            break last;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new block was never read: {last}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(
+        last["prompt"],
+        format!("{header}\n\n```sh\ncargo test\n```\n")
+    );
     // A selection from a file, the CLI's way.
     let file = hub.root.join("sel.txt");
     std::fs::write(&file, "picked\n").unwrap();
@@ -919,6 +959,128 @@ async fn a_handoff_crosses_machines_through_the_proxy() {
         "From {source_name} on main (machine {host}): selected terminal text\n\n```text\nby cli\n```\n"
     )));
     typed(&b.root, "codex", &target, &sent).await;
+
+    // And back: FROM on machine b (--machine), TO on this hub (`local`).
+    std::fs::write(&file, "from b\n").unwrap();
+    let (code, out, err) = run_cli(&[
+        "handoff",
+        &target_name,
+        &source_name,
+        "--machine",
+        "b",
+        "--to-machine",
+        "local",
+        "--selection-file",
+        file.to_str().unwrap(),
+        "--state-dir",
+        &a.state_dir(),
+    ])
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains(&format!("to {source_name}")) && out.contains("on this hub"),
+        "{out}"
+    );
+    typed(
+        &a.root,
+        "claude",
+        &source,
+        &pasted(&format!(
+            "From {target_name} on main (machine {host}): selected terminal text\n\n```text\nfrom b\n```\n"
+        )),
+    )
+    .await;
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn asking_twice_at_once_starts_one_reviewer_and_a_new_kind_replaces_it() {
+    let hub = TestHub::start(true).await;
+    let wid = hub.workspace().await;
+    let (author, author_name) = hub
+        .spawn(json!({ "workspace_id": wid, "kind": "codex", "worktree": { "task": "dup" } }))
+        .await;
+    let (_, worktree) = hub.started("codex", &author).await;
+    commit(&worktree, &[("d.txt", "d\n")], "d");
+
+    // A double click: two requests at once, one reviewer.
+    let path = format!("/api/sessions/{author}/review/reviewer");
+    let (one, two) = tokio::join!(hub.post(&path, json!({})), hub.post(&path, json!({})));
+    let first = one["reviewer"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(two["reviewer"]["id"], first.as_str(), "{one} {two}");
+    let mut reused = [one["reused"].as_bool(), two["reused"].as_bool()];
+    reused.sort();
+    assert_eq!(reused, [Some(false), Some(true)]);
+    hub.started("claude", &first).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let claudes = std::fs::read_dir(hub.root.join("log"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("claude-") && name.ends_with(".argv")
+        })
+        .count();
+    assert_eq!(claudes, 1, "one claude reviewer was started");
+    let list = hub.get("/api/sessions").await;
+    let reviewers = |list: &Value| {
+        list["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["review_of"] == author.as_str())
+            .map(|s| s["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(reviewers(&list), vec![first.clone()]);
+
+    // Another kind replaces it: the first is closed, the pair is one-to-one.
+    let codex = hub.post(&path, json!({ "kind": "codex" })).await;
+    assert_eq!(codex["reused"], false);
+    assert_eq!(codex["replaced"]["id"], first.as_str());
+    let second = codex["reviewer"]["id"].as_str().unwrap().to_owned();
+    let (argv, cwd) = hub.started("codex", &second).await;
+    assert_eq!(cwd, worktree);
+    assert!(
+        argv.windows(4)
+            .any(|w| w == ["-a", "never", "-s", "read-only"]),
+        "{argv:?}"
+    );
+    assert!(
+        hub.session(&first).await.is_null(),
+        "the replaced reviewer is closed"
+    );
+    assert_eq!(hub.session(&author).await["reviewer"], second.as_str());
+    assert_eq!(
+        reviewers(&hub.get("/api/sessions").await),
+        vec![second.clone()]
+    );
+    hub.as_running();
+    let (code, out, err) = run_cli(&["ls", "--state-dir", &hub.state_dir()]).await;
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.matches("(reviews ").count(), 1, "{out}");
+    assert!(out.contains(&format!("(reviews {author_name})")), "{out}");
+
+    // After a restart without a conversation to resume, Codex comes back
+    // as a plain shell: a handoff to it says why and what to do.
+    let (dir, root) = hub.shutdown().await;
+    let hub = TestHub::open(dir, root, true).await;
+    let a = hub.session(&author).await;
+    assert!(!a["fallback_command"].is_null(), "{a}");
+    assert_eq!(a["reviewer"], second.as_str());
+    let (status, why) = hub
+        .refused(
+            &format!("/api/sessions/{author}/handoff"),
+            json!({ "prompt": "x" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        why.contains(&format!(
+            "{author_name} is a codex session, but codex is not running in it"
+        )) && why.contains(&format!("fw hub relaunch {author_name}")),
+        "{why}"
+    );
+    hub.shutdown().await;
 }

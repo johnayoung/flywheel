@@ -13,7 +13,7 @@ A Cargo workspace of seven crates under `crates/`, each with its source in `crat
 - **`flywheel-orchestrator`** — built on core: drives **many** tasks (selection over a prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon). Owns its own store (`task_claims`). Library only.
 - **`flywheel-worktree`** — built on the orchestrator: the git-worktree submit strategy + daemon, one worked example of a consumer. Library only; spawned via `flywheel worker`.
 - **`flywheel-container`** — built on the orchestrator: the Docker sandbox execution backend (the agent CLI in headless stream-json via `docker exec` against a bind-mounted worktree, driven through the `flywheel-agents` claude-code adapter under `DockerExecHost`). A sibling consumer of the orchestrator like `flywheel-worktree`. Library only; activated via `[sandbox] backend = "container"`.
-- **`flywheel-hub`** — `fw hub`: the web workspace for AI coding agents (axum server owning one PTY per session, workspaces of git repos, token auth, REST + WebSocket API, the embedded plain-JS web UI under `crates/flywheel-hub/web/`). Depends on no other flywheel crate; nothing below `flywheel` depends on it. Doc: `docs/hub.md`.
+- **`flywheel-hub`** — `fw hub`: the web workspace for AI coding agents (axum server owning one PTY per session, workspaces of git repos, token auth, REST + WebSocket API, the embedded plain-JS web UI under `crates/flywheel-hub/web/`). Depends on no other flywheel crate; nothing below `flywheel` depends on it. Docs: `docs/hub.md` (front door: security, quickstart, feature map) + `docs/hub/{reference,api,security,workflows,internals}.md`; `crates/flywheel-hub/src/docs_drift.rs` fails the build when they drift from the CLI, `hub.toml` keys, keymap, routes, or plugin events.
 - **`flywheel`** — top of stack: the unified product shell. Binaries `flywheel` and `fw` (one implementation, two entries) route every operator verb and own the operator console.
 
 Cross-task concepts (prerequisites/DAG, scheduling, claims) live in the orchestrator, never in core. When adding to core, ask: would a single `run_task(task, lifecycle, store)` invocation — one task, no scheduler — need it? If not, it belongs above the line.
@@ -38,7 +38,7 @@ Authoritative specs in `docs/` override any inferred behavior. Full index: `docs
 - `docs/autopilot.md` — the autopilot intake daemon (tiers, scoring, CLI, console)
 - `docs/workflow.md` — how flywheel develops itself: the spec-driven authoring pipeline and the runtime loop
 
-Curated docs (`cli`, `configuration`, `task-schema`, `loop`, `workflow`, `strategy`, `sandbox`, `held-out-gate`, `autopilot`, `team-mode`, `hub`) are embedded in the binary for `fw docs` (`crates/flywheel/src/docs.rs`); a rebuild picks up edits.
+Curated docs (`cli`, `configuration`, `task-schema`, `loop`, `workflow`, `strategy`, `sandbox`, `held-out-gate`, `autopilot`, `team-mode`, `hub`, `hub-reference`, `hub-api`, `hub-security`, `hub-workflows`, `hub-internals`) are embedded in the binary for `fw docs` (`crates/flywheel/src/docs.rs`); a rebuild picks up edits.
 
 New feature work is specced under `.flywheel/specs/` (there is no `docs/roadmap.md`).
 

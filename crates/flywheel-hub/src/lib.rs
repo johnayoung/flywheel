@@ -8,7 +8,7 @@
 //!
 //! A sibling consumer like `flywheel-worktree`: the `flywheel` crate routes
 //! `fw hub <verb>` to [`cli::main`]; nothing below depends on this crate.
-//! Operator doc: `docs/hub.md`.
+//! Operator docs: `docs/hub.md` (front door) and `docs/hub/*.md`.
 
 pub mod agent;
 pub mod agent_handoff;
@@ -70,6 +70,9 @@ pub mod vt;
 pub mod wait;
 pub mod web;
 
+/// `docs/hub/*.md` checked against the CLI, hub.toml, keymap, and routes.
+#[cfg(test)]
+mod docs_drift;
 /// The integration tests' helpers (stand-in scripts), for unit tests too.
 #[cfg(test)]
 mod test_golden;

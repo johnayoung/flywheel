@@ -1042,7 +1042,7 @@ pub fn config_checks(dir: &Path, home: Option<&Path>) -> Vec<Check> {
             }
         }
         Err(message) => Check::new("hub.toml", Level::Fail, message).fix(
-            "correct it where the error points (`fw hub config check` re-checks, `fw docs hub` \
+            "correct it where the error points (`fw hub config check` re-checks, `fw docs hub-reference` \
              lists the keys); the hub refuses to start until then",
         ),
     });

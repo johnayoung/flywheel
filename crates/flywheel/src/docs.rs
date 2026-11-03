@@ -2,7 +2,8 @@
 //!
 //! The curated topics are embedded at build time (`include_str!`) from
 //! `crates/flywheel/doc_pages/<topic>.md`, each a relative symlink to the
-//! canonical repo-root `docs/<topic>.md`. Repo-root `docs/` stays the single
+//! canonical repo-root doc ([`source_path`]: `docs/<topic>.md`, and for
+//! the hub's reference pages `hub-<page>` -> `docs/hub/<page>.md`). Repo-root `docs/` stays the single
 //! source of truth for humans; the in-crate symlinks keep every
 //! `include_str!` path inside the crate, so `cargo package` (which
 //! dereferences them into regular files) and `cargo install --git` both
@@ -14,7 +15,7 @@
 //! one constant -- there is no second copy of the topic names anywhere.
 //! Adding or renaming a curated doc is a one-line edit here (plus the
 //! matching `include_str!` arm in [`render_topic`] and its
-//! `doc_pages/<topic>.md -> ../../../docs/<topic>.md` symlink).
+//! `doc_pages/<topic>.md -> ../../../docs/<source_path>` symlink).
 //!
 //! Docs are knowledge, not policy: this verb loads no `flywheel.toml` and
 //! touches no store, so it works in a bare directory with nothing
@@ -29,7 +30,7 @@ const PROG: &str = "fw";
 /// Topic names are the canonical `docs/<topic>.md` basenames; descriptions
 /// are the one-line summaries shown in the bare listing, condensed from
 /// `docs/README.md`.
-pub const TOPICS: [(&str, &str); 11] = [
+pub const TOPICS: [(&str, &str); 16] = [
     (
         "cli",
         "every verb, the interactive operator console, slash commands, and init.",
@@ -69,9 +70,39 @@ pub const TOPICS: [(&str, &str); 11] = [
     ),
     (
         "hub",
-        "the web workspace of server-owned agent terminals: verbs, remote access, auth, and the API.",
+        "the web workspace of server-owned agent terminals: security, quickstart, feature map.",
+    ),
+    (
+        "hub-reference",
+        "every fw hub verb and flag, the serve flags, hub.toml, plugin.toml, keys, state-dir files.",
+    ),
+    (
+        "hub-api",
+        "the hub's REST routes, terminal and events WebSockets, and plugin payloads.",
+    ),
+    (
+        "hub-security",
+        "hub auth, remote access, built-in TLS, machines and peers, share links.",
+    ),
+    (
+        "hub-workflows",
+        "hub scripting, agent launcher, suggested commands, worktrees, review, handoff, fan-out.",
+    ),
+    (
+        "hub-internals",
+        "hub model, lifecycle and live handoff, status detection, layout, phone, search, recording.",
     ),
 ];
+
+/// The canonical doc a topic serves, relative to the repo-root `docs/`:
+/// `<topic>.md`, except the hub's reference pages (`hub-<page>` ->
+/// `hub/<page>.md`).
+pub fn source_path(topic: &str) -> String {
+    match topic.strip_prefix("hub-") {
+        Some(page) => format!("hub/{page}.md"),
+        None => format!("{topic}.md"),
+    }
+}
 
 /// The topic names alone, in listing order.
 pub fn topic_names() -> impl Iterator<Item = &'static str> {
@@ -85,7 +116,7 @@ pub fn is_topic(topic: &str) -> bool {
 
 /// The byte-for-byte content of one curated doc, or `None` for an unknown
 /// topic. Every arm embeds `doc_pages/<topic>.md` (a symlink to the
-/// canonical `docs/<topic>.md`) at build time.
+/// canonical `docs/` file, [`source_path`]) at build time.
 pub fn render_topic(topic: &str) -> Option<&'static str> {
     let page = match topic {
         "cli" => include_str!("../doc_pages/cli.md"),
@@ -99,6 +130,11 @@ pub fn render_topic(topic: &str) -> Option<&'static str> {
         "autopilot" => include_str!("../doc_pages/autopilot.md"),
         "team-mode" => include_str!("../doc_pages/team-mode.md"),
         "hub" => include_str!("../doc_pages/hub.md"),
+        "hub-reference" => include_str!("../doc_pages/hub-reference.md"),
+        "hub-api" => include_str!("../doc_pages/hub-api.md"),
+        "hub-security" => include_str!("../doc_pages/hub-security.md"),
+        "hub-workflows" => include_str!("../doc_pages/hub-workflows.md"),
+        "hub-internals" => include_str!("../doc_pages/hub-internals.md"),
         _ => return None,
     };
     Some(page)
@@ -186,7 +222,7 @@ mod tests {
     #[test]
     fn served_doc_matches_canonical_source_for_every_topic() {
         for topic in topic_names() {
-            let canonical = repo_root().join("docs").join(format!("{topic}.md"));
+            let canonical = repo_root().join("docs").join(source_path(topic));
             let source = std::fs::read(&canonical)
                 .unwrap_or_else(|err| panic!("{}: {err}", canonical.display()));
             let served = render_topic(topic).unwrap_or_else(|| panic!("unserved topic {topic}"));
@@ -245,6 +281,23 @@ mod tests {
             assert_eq!(*line, format!("{topic:<width$}{description}"));
         }
         assert!(listing.contains("cli            every verb"));
+    }
+
+    #[test]
+    fn doc_pages_symlinks_point_at_their_source() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("doc_pages");
+        for topic in topic_names() {
+            let link = dir.join(format!("{topic}.md"));
+            let target =
+                std::fs::read_link(&link).unwrap_or_else(|err| panic!("{}: {err}", link.display()));
+            assert_eq!(
+                target,
+                Path::new("../../../docs").join(source_path(topic)),
+                "{topic}"
+            );
+        }
+        assert_eq!(source_path("hub"), "hub.md");
+        assert_eq!(source_path("hub-api"), "hub/api.md");
     }
 
     #[test]

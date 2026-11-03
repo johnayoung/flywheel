@@ -453,7 +453,7 @@ fn history_is_bounded_by_lines_and_by_cells() {
     assert_eq!(wide.history_lines(), HISTORY_CELL_BUDGET / 1000);
     wide.resize(2000, ROWS);
     assert!(wide.history_lines() <= HISTORY_CELL_BUDGET / 2000);
-    // What docs/hub.md sizes memory by (24 B a cell): a session's grid
+    // What docs/hub/reference.md sizes memory by (24 B a cell): a session's grid
     // stays under the budget's bytes whatever it prints.
     assert_eq!(std::mem::size_of::<Cell>(), 24);
 }

@@ -36,7 +36,12 @@ Driving many tasks over a prerequisite DAG, landing the results, and isolating t
 - [team-mode.md](team-mode.md) — the multi-operator runbook: GitHub App worker identity, ruleset requirements, and the merge queue as the distributed merge lock.
 - [autopilot.md](autopilot.md) — the autopilot intake daemon: tier model, scoring, CLI, and console activation.
 - [workflow.md](workflow.md) — how flywheel develops itself: the spec-driven authoring pipeline (the `fw-*` skills) and the runtime loop.
-- [hub.md](hub.md) — `fw hub`: the web workspace of server-owned agent terminals (workspaces of folders, git or plain, tabs and split panes, phone UI and push notifications, remote access, auth, REST + WebSocket API).
+- [hub.md](hub.md) — `fw hub`: the web workspace of server-owned agent terminals. Front door: security, quickstart, feature map, verbs. Details:
+  - [hub/reference.md](hub/reference.md) — every verb and flag, serve flags, `hub.toml`, `notify.toml`, `plugin.toml`, keys, state-dir files.
+  - [hub/api.md](hub/api.md) — REST routes, terminal and events WebSockets, plugin payloads.
+  - [hub/security.md](hub/security.md) — auth, remote access, built-in TLS, machines and peers, share links.
+  - [hub/workflows.md](hub/workflows.md) — scripting, launcher, suggested commands, usage, worktrees, review, handoff, fan-out, Flywheel panel.
+  - [hub/internals.md](hub/internals.md) — model, lifecycle and live handoff, status detection, layout, web UI, phone, search, recording, push, doctor.
 
 ## Design rationale
 

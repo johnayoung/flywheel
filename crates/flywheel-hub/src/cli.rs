@@ -491,6 +491,13 @@ fn runtime_workers() -> usize {
         .clamp(1, MAX_RUNTIME_WORKERS)
 }
 
+/// The `fw hub` command tree as clap builds it (the docs drift check walks
+/// it: every verb and flag must be in `docs/hub/reference.md`).
+#[cfg(test)]
+pub(crate) fn command() -> clap::Command {
+    <HubCli as clap::CommandFactory>::command()
+}
+
 /// Route `fw hub <args>` (`args` excludes `hub`); returns the exit code.
 pub fn main(args: &[String]) -> i32 {
     let mut out = std::io::stdout();

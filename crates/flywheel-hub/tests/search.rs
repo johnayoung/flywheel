@@ -702,7 +702,7 @@ async fn exited_sessions_and_full_screen_programs_are_searched() {
 }
 
 /// The size the task asks to measure: 20 sessions x 5k lines. Prints the
-/// latency (debug build here; `docs/hub.md` quotes the release numbers).
+/// latency (debug build here; `docs/hub/internals.md` quotes the release numbers).
 /// An answer is complete inside the budget, or partial having spent it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn twenty_sessions_of_five_thousand_lines_answer_within_the_budget() {

@@ -960,7 +960,7 @@ window.FwHubSettings = function (ctx) {
         " on the hub's machine (re-read within a second; ",
         el("code", { textContent: "fw hub config check" }),
         " validates it). A flag given to fw hub serve beats the file, the file beats the default. ",
-        el("a", { href: "https://github.com/johnayoung/flywheel/blob/main/docs/hub.md#settings-and-hubtoml", target: "_blank", rel: "noopener", textContent: "Reference" }),
+        el("a", { href: "https://github.com/johnayoung/flywheel/blob/main/docs/hub/reference.md#hubtoml", target: "_blank", rel: "noopener", textContent: "Reference" }),
       ),
     ];
     if (file.error) nodes.push(el("p", { className: "form-error", textContent: `Invalid, not in force (the last good settings stay): ${file.error}` }));

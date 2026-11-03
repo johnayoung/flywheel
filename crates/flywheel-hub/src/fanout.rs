@@ -28,7 +28,7 @@
 //! the group, the first failure skips the rest), so this crate never
 //! depends on the loop's crates. Fan-outs persist in `state.json` (schema
 //! 4); a grading cut short by a stop or a live handoff runs again on the
-//! next start. Operator doc: `docs/hub.md` (Verified fan-out).
+//! next start. Operator doc: `docs/hub/workflows.md` (Verified fan-out).
 
 mod engine;
 mod facts;

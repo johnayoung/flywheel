@@ -295,7 +295,7 @@ fn print_machine(out: &mut dyn Write, view: &Value, probe: Option<&Value>) {
 }
 
 /// Where the peer credentials are kept: always the state dir's plaintext
-/// machines file (no OS keyring; docs/hub.md says why), with its mode
+/// machines file (no OS keyring; docs/hub/security.md says why), with its mode
 /// when it exists.
 fn credential_store(state: &StateDirArg) -> Result<Value, String> {
     use std::os::unix::fs::PermissionsExt;

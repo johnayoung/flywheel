@@ -846,6 +846,21 @@ impl Emulator {
         w.out
     }
 
+    /// Escape sequences that put a terminal mirroring this one (same
+    /// screen contents) back into this one's cursor, saved cursor,
+    /// charsets, scroll region, SGR pen, and DEC modes -- after a client
+    /// drew over it (`fw hub attach` drawing its status bar). Ends showing
+    /// the cursor when the program shows it.
+    pub fn restore_sequence(&mut self) -> Vec<u8> {
+        self.flush();
+        let mut w = Writer::default();
+        self.write_state(&mut w);
+        if self.term.mode().contains(TermMode::SHOW_CURSOR) {
+            w.raw(b"\x1b[?25h");
+        }
+        w.out
+    }
+
     fn write_state(&self, w: &mut Writer) {
         let grid = self.term.grid();
         let mode = *self.term.mode();

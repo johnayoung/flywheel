@@ -63,6 +63,12 @@ enum HubCommand {
     Send(script::SendArgs),
     /// Print a session's screen text.
     Read(script::ReadArgs),
+    /// Wait until a session is done, blocked, idle, working, or has
+    /// exited. Exit code 0 met, 124 --timeout, 1 error.
+    Wait(crate::wait::WaitArgs),
+    /// Attach this terminal to a session (a picker without SESSION):
+    /// raw passthrough, prefix C-b then d detach, s switch, t status bar.
+    Attach(crate::attach::AttachArgs),
     /// Hang up a session's processes (the record stays, as exited).
     Kill(script::KillArgs),
     /// Start an ended or stopped session again in place (same id, name,
@@ -359,6 +365,8 @@ pub fn run_with(
         HubCommand::New(args) => script::new(&args, out, err),
         HubCommand::Send(args) => script::send(&args, out, err),
         HubCommand::Read(args) => script::read(&args, out, err),
+        HubCommand::Wait(args) => crate::wait::wait(&args, out, err),
+        HubCommand::Attach(args) => crate::attach::attach(&args, out, err),
         HubCommand::Kill(args) => script::kill(&args, out, err),
         HubCommand::Relaunch(args) => script::relaunch(&args, out, err),
         HubCommand::Import(args) => script::import(&args, out, err),

@@ -11,6 +11,7 @@
 //! Operator doc: `docs/hub.md`.
 
 pub mod agent;
+pub mod attach;
 pub mod auth;
 pub mod browser;
 pub mod cli;
@@ -18,6 +19,7 @@ pub mod client;
 pub mod commands;
 pub mod commands_cli;
 pub mod daemon;
+pub mod endpoint;
 pub mod flywheel;
 pub mod git;
 pub mod hub;
@@ -36,6 +38,7 @@ pub mod status;
 pub mod transcript;
 pub mod vscode;
 pub mod vt;
+pub mod wait;
 pub mod web;
 
 /// The integration tests' helpers (stand-in scripts), for unit tests too.

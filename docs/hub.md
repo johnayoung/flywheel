@@ -29,6 +29,9 @@ fw hub ls [--json]                                         # workspaces > sessio
 fw hub new WS [--kind shell|claude|codex] [--folder PATH|LABEL] [--name N] [--create] [--worktree TASK [--base REF]] [--json] [-- ARGV...]   # prints the id; a taken --name is refused (--repo = --folder)
 fw hub send SESSION TEXT|- [--enter] [--raw]               # pasted: newlines -> CR, bracketed when the program enabled it
 fw hub read SESSION [--source visible|recent] [--lines N] [--json]
+fw hub wait SESSION --until done|blocked|idle|working|exit [--timeout SECS] [--changed]   # exit 0 met, 124 timeout, 1 error
+fw hub attach [SESSION] [--prefix C-b] [--no-status]      # this terminal on a session (picker without SESSION); see Terminal client
+# wait/attach also take [--url URL] [--token T] (a remote hub; token prefer FW_HUB_TOKEN)
 fw hub kill SESSION [--rm [--remove-worktree [--force]]]   # hang up (record kept, as exited); --rm also forgets it; see Worktrees
 fw hub relaunch SESSION                                    # start an exited/stopped session again in place
 fw hub import FILE.code-workspace... [--name N] [--update] [--json]   # VS Code multi-root workspaces -> workspaces
@@ -39,6 +42,32 @@ fw hub import FILE.code-workspace... [--name N] [--update] [--json]   # VS Code 
 `open` mints a one-time code for `http://<loopback>:<port>/login?code=...[#session=<id>]`, prints that URL, and writes a 0600 redirect page (`open-<id>.html` in the state dir; expired ones are swept) that forwards to it -- the code never goes on an opener's argv (`/proc/*/cmdline` is world-readable). The page goes to `$BROWSER` (`:`-separated commands, `%s` = its `file://` URL) when set, else on WSL `wslview`, else `cmd.exe /c start` (its `\\wsl.localhost\...` path, `^`-escaped), else `xdg-open` (macOS: `open`). Only an opener that cannot start falls through to the next; one that runs and fails ends it (exit 1: it may have opened a tab, and the code is single-use).
 
 `new --create` makes workspace `WS` (with `--folder`) when none matches; `--folder` is a path (relative to the caller's directory) or one of the workspace's folder labels or directory names (`--folder john-finances`). `send` wraps text in `ESC[200~ ... ESC[201~` only when the program set bracketed paste (markers inside the text are stripped, repeatedly, so split markers cannot reassemble), a final newline becomes that Enter (`printf 'make\n' | fw hub send s -` runs it), and sends Enter 50 ms later as its own keypress; `--raw` sends bytes untouched (`fw hub send s $'\x03' --raw` is Ctrl-C).
+
+## Terminal client: `fw hub attach`
+
+Any terminal (local, over SSH, or a remote hub via `--url https://box.tailnet.ts.net` + `FW_HUB_TOKEN`) attaches to the same server-owned sessions the browser does.
+
+- No SESSION: a picker of workspaces > sessions with live status (`j`/`k`, Enter, `q`; Esc returns to the session it was opened from). Stopped sessions are listed but not attachable (`fw hub relaunch`).
+- Attached: the hub's snapshot, then raw live bytes; typed bytes go verbatim (keys, mouse, bracketed paste). The PTY follows this terminal's size (SIGWINCH; typing takes the size back from another viewer). Counts as viewing (a finished turn is `idle` for it, as for a browser tab).
+- Prefix (`C-b`, `--prefix C-a`): `d` detach (session keeps running), `s` switch (picker), `t` status bar on/off, `r` redraw (fresh snapshot), `?` help, prefix twice sends it. Inside a bracketed paste the prefix is pasted.
+- Status bar (last row; the session gets one row less, below its scroll region): `workspace/session [status]`, hub-wide `N blocked  N done`. `--no-status` starts without it.
+- Terminal queries in the output (DA, DSR/CPR, DECRQM, DECRQSS, XTVERSION, XTGETTCAP, OSC 4/10-19/52 reads, size reports, ENQ, kitty keyboard) are not passed to this terminal: the hub answers them.
+- The terminal is restored on detach, errors, hub stop or token rotation, SIGTERM/SIGHUP, and panics.
+
+## Scripting agents
+
+`send` types, `wait` blocks on the events socket (no polling), `read` / `commands` read back. `wait --until idle` accepts `done`; `--changed` ignores the state current at start (the previous turn's `done`); an agent wait fails (1) if the session ends first; `--until exit` prints `exited N` / `killed (SIG)`.
+
+```bash
+id=$(fw hub new demo --kind claude --name fixer)
+fw hub wait "$id" --until idle --timeout 60           # agent up, waiting for a prompt
+fw hub send "$id" $'Fix the failing test in src/lib.rs\n'
+fw hub wait "$id" --until done --changed --timeout 900 || { fw hub read "$id"; exit 1; }
+fw hub commands "$id" --last > next.sh                # the newest shell block it suggested, exactly
+fw hub send build "$(cat next.sh)" --enter            # run it in a shell session
+fw hub wait build --until exit --timeout 600          # a one-shot shell session: wait for it to end
+fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"   # 0: it waits on a permission prompt
+```
 
 ## Lifecycle and restore
 

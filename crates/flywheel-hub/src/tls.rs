@@ -6,7 +6,8 @@
 //! `auto` keeps a **local CA** in `<state-dir>/tls/` (ECDSA P-256; its key
 //! is 0600 and never leaves that directory) and serves a short-lived leaf
 //! it signs for every name the hub is reached at: loopback, `localhost`,
-//! this machine's host name (and `<host>.local`), its LAN addresses, its
+//! this machine's host name (`<host>.local` for a single-label one: a bare
+//! label as a constraint would cover a whole TLD), its LAN addresses, its
 //! tailnet name and addresses, and `[server] tls_names`. The leaf is
 //! re-issued when those change and before it expires.
 //!
@@ -155,9 +156,24 @@ pub fn parse_name(raw: &str) -> Result<NameSpec, String> {
     if let Ok(ip) = raw.parse::<IpAddr>() {
         return Ok(NameSpec::Ip(ip));
     }
-    dns_name(raw)
-        .map(NameSpec::Dns)
-        .ok_or_else(|| format!("{raw:?}: not a DNS name, IP address, or IP network"))
+    let name = dns_name(raw)
+        .ok_or_else(|| format!("{raw:?}: not a DNS name, IP address, or IP network"))?;
+    if !constrainable(&name) {
+        return Err(format!(
+            "{raw:?}: a single-label name would let the CA vouch for every name under it (a whole \
+             TLD, as X.509 name constraints read it); use a dotted name such as {name}.lan or \
+             {name}.local"
+        ));
+    }
+    Ok(NameSpec::Dns(name))
+}
+
+/// Whether a CA may be name-constrained to `name` (and so to every name
+/// under it): anything with a dot, and `localhost` (reserved for loopback,
+/// subdomains included). A single label such as `dev` or `box` would cover
+/// a public TLD.
+pub fn constrainable(name: &str) -> bool {
+    name == "localhost" || name.contains('.')
 }
 
 /// `raw` as a lowercase DNS name (letters, digits, hyphens; dot-separated
@@ -202,8 +218,8 @@ impl Names {
     }
 }
 
-/// The names this hub is reached at: loopback and `localhost`, `host` (and
-/// `<host>.local` when it has no dot), every address in `interfaces`, the
+/// The names this hub is reached at: loopback and `localhost`, `host` when
+/// it has a dot (`<host>.local` when it has none), every address in `interfaces`, the
 /// bound address when specific, the tailnet's name and addresses, and the
 /// extra names (an extra network adds no name).
 pub fn hub_names(
@@ -217,11 +233,15 @@ pub fn hub_names(
     names.dns.insert("localhost".to_owned());
     names.ips.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
     names.ips.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
+    // A bare single-label host name is left out: as a dNSName constraint it
+    // would cover every name under it -- a whole TLD when the machine is
+    // called `dev` or `box`. `<host>.local` (mDNS, reserved) stands in.
     if let Some(host) = dns_name(host) {
-        if !host.contains('.') {
+        if host.contains('.') {
+            names.dns.insert(host);
+        } else {
             names.dns.insert(format!("{host}.local"));
         }
-        names.dns.insert(host);
     }
     names.ips.extend(interfaces.iter().map(|(_, ip)| *ip));
     let ip = listen.ip().to_canonical();
@@ -276,7 +296,12 @@ impl Constraints {
     /// The constraints a new CA gets for `names` and the extra networks:
     /// each name, each address exactly, and all of loopback.
     pub fn for_names(names: &Names, extra: &[NameSpec]) -> Self {
-        let mut dns: BTreeSet<String> = names.dns.clone();
+        let mut dns: BTreeSet<String> = names
+            .dns
+            .iter()
+            .filter(|name| constrainable(name))
+            .cloned()
+            .collect();
         dns.insert("localhost".to_owned());
         let mut nets: BTreeSet<(IpAddr, u8)> = names
             .ips
@@ -288,7 +313,9 @@ impl Constraints {
         for spec in extra {
             match spec {
                 NameSpec::Dns(name) => {
-                    dns.insert(name.clone());
+                    if constrainable(name) {
+                        dns.insert(name.clone());
+                    }
                 }
                 NameSpec::Ip(ip) => {
                     nets.insert((*ip, if ip.is_ipv4() { 32 } else { 128 }));
@@ -325,6 +352,16 @@ impl Constraints {
                     .strip_suffix(c.as_str())
                     .is_some_and(|rest| rest.ends_with('.'))
         })
+    }
+
+    /// DNS constraints that cover a whole TLD (a single label other than
+    /// `localhost`): a CA made before such names were refused.
+    pub fn too_wide(&self) -> Vec<String> {
+        self.dns
+            .iter()
+            .filter(|name| !constrainable(name))
+            .cloned()
+            .collect()
     }
 
     pub fn permits_ip(&self, ip: IpAddr) -> bool {
@@ -929,6 +966,9 @@ pub struct Refreshed {
 /// certificate behind it, kept current.
 pub struct TlsServing {
     config: Arc<rustls::ServerConfig>,
+    /// Bumped when the CA changes (a rotation): connections made under the
+    /// old one are closed, so rotation revokes them too.
+    ca_epoch: tokio::sync::watch::Sender<u64>,
     resolver: Arc<Resolver>,
     source: Mutex<Source>,
     extra: Vec<NameSpec>,
@@ -949,6 +989,12 @@ fn server_config(resolver: Arc<Resolver>) -> Result<Arc<rustls::ServerConfig>, S
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // No session resumption: every connection presents the current
+    // certificate, so a rotated CA is never vouched for by a session from
+    // before the rotation. (A P-256 handshake costs well under a
+    // millisecond.)
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     Ok(Arc::new(config))
 }
 
@@ -1015,6 +1061,7 @@ impl TlsServing {
         });
         Ok(Some(Arc::new(Self {
             config: server_config(Arc::clone(&resolver))?,
+            ca_epoch: tokio::sync::watch::Sender::new(0),
             resolver,
             source: Mutex::new(source),
             extra: extra.to_vec(),
@@ -1029,6 +1076,11 @@ impl TlsServing {
 
     pub fn acceptor(&self) -> tokio_rustls::TlsAcceptor {
         tokio_rustls::TlsAcceptor::from(self.server_config())
+    }
+
+    /// The CA generation, bumped by every rotation the hub picks up.
+    pub fn ca_epoch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ca_epoch.subscribe()
     }
 
     /// Where the hub listens.
@@ -1135,6 +1187,9 @@ impl TlsServing {
                     *leaf = fresh;
                     done.reissued = true;
                 }
+                if done.new_ca {
+                    self.ca_epoch.send_modify(|epoch| *epoch += 1);
+                }
             }
             Source::Files {
                 cert,
@@ -1221,6 +1276,17 @@ pub fn outside_warning(outside: &Names) -> String {
         } else {
             "them"
         }
+    )
+}
+
+/// The warning for a CA (made by an earlier version) constrained to a
+/// single-label name, which X.509 reads as that whole TLD.
+pub fn too_wide_warning(wide: &[String]) -> String {
+    format!(
+        "fw hub: tls: WARNING: this hub's CA is name-constrained to {}, which covers every name \
+         under it (a whole TLD): run `fw hub tls rotate` (every device then re-installs the CA) \
+         and remove the old CA from devices",
+        wide.join(", ")
     )
 }
 

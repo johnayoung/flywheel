@@ -206,16 +206,13 @@ impl Endpoint {
         let Some(info) = running_hub(state_dir)? else {
             return Ok(None);
         };
-        // Loopback keeps plain http under built-in TLS; any other address
-        // (a specific --bind) is https, trusted by the state dir's CA.
+        // Plain http even under built-in TLS: the address is loopback or
+        // this machine's own (a specific --bind), which the hub serves
+        // plain http to as it never leaves the machine -- whatever names
+        // the served certificate carries, and across a CA rotation.
         let addr = info.connect_addr();
-        let scheme = if info.tls.is_some() && !addr.ip().is_loopback() {
-            "https"
-        } else {
-            "http"
-        };
-        let base = Url::parse(&format!("{scheme}://{addr}"))
-            .map_err(|e| format!("bad hub address: {e}"))?;
+        let base =
+            Url::parse(&format!("http://{addr}")).map_err(|e| format!("bad hub address: {e}"))?;
         let trust = Trust::local(state_dir);
         let endpoint = match token {
             Some(token) => Self::new(base, token, None, Some(info), trust)?,

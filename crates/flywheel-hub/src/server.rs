@@ -445,7 +445,10 @@ pub async fn serve_gated(
     let (tx, rx) = watch::channel(false);
     let gate = listener.gate().clone();
     let trusted_proxies = options.trusted_proxies.clone();
-    let tls = options.tls.as_ref().map(|t| t.acceptor());
+    let tls = options
+        .tls
+        .as_ref()
+        .map(|t| tls_listen::TlsAccept::new(t.acceptor(), t.ca_epoch()));
     let app = router(Arc::clone(&hub), options, rx).layer(middleware::from_fn_with_state(
         gate.clone(),
         crate::handoff::gate_requests,

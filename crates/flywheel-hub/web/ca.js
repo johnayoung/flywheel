@@ -1,19 +1,14 @@
 // The CA onboarding page (/ca): is this device trusting the hub's CA yet?
-// Probe the same host over https; trusted -> continue (with the one-time
-// login code a QR carried in the URL fragment, which never reaches the
-// network), else show the steps for this device's OS.
+// Probe the same host over https; trusted -> offer the hub, else show the
+// steps for this device's OS. No credential ever comes here: this page is
+// plain http, which an active attacker on the LAN could rewrite, so the
+// login code goes only to the https login (its own QR). The page never
+// navigates away by itself, so a trusting device can still compare the
+// fingerprint.
 (function () {
   "use strict";
-  const KEY = "fw-hub-ca-code";
-  const params = new URLSearchParams(location.hash.slice(1));
-  let code = params.get("code");
-  if (code) {
-    try { sessionStorage.setItem(KEY, code); } catch (_) { /* private mode */ }
-    // Out of the address bar and history at once.
-    history.replaceState(null, "", location.pathname);
-  } else {
-    try { code = sessionStorage.getItem(KEY); } catch (_) { code = null; }
-  }
+  // An older QR carried a code in the fragment: drop it unread.
+  if (location.hash) history.replaceState(null, "", location.pathname);
   const httpsBase = "https://" + location.host;
   const status = document.getElementById("status");
   const text = document.getElementById("status-text");
@@ -54,13 +49,8 @@
     }
   }
 
-  function target() {
-    return code ? httpsBase + "/login?code=" + encodeURIComponent(code) : httpsBase + "/";
-  }
-
   function go() {
-    try { sessionStorage.removeItem(KEY); } catch (_) { /* private mode */ }
-    location.replace(target());
+    location.assign(httpsBase + "/");
   }
 
   function show(state, message) {
@@ -68,17 +58,14 @@
     text.textContent = message;
   }
 
-  async function check(auto) {
+  async function check() {
     show("checking", "Checking whether this device trusts the hub…");
     recheck.hidden = true;
     proceed.hidden = true;
     if (await trusted()) {
-      show("trusted", code
-        ? "This device trusts the hub. Signing you in over https…"
-        : "This device trusts the hub.");
-      proceed.textContent = code ? "Sign in" : "Open the hub";
+      show("trusted", "This device trusts the hub. Scan the login QR (or open the hub and enter the code).");
+      proceed.textContent = "Open the hub";
       proceed.hidden = false;
-      if (auto && location.protocol === "http:") go();
       return;
     }
     show("untrusted", "Not trusted yet: check the fingerprint, then install the CA below.");
@@ -87,7 +74,7 @@
   }
 
   proceed.addEventListener("click", go);
-  recheck.addEventListener("click", () => check(true));
+  recheck.addEventListener("click", check);
   openSteps();
-  check(true);
+  check();
 })();

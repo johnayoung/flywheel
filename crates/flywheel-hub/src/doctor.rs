@@ -1322,7 +1322,18 @@ fn tls_check(dir: &Path, mode: &crate::tls::TlsMode, tailscale_serves: bool) -> 
                     "auto: local CA {}",
                     crate::machines::display_fingerprint(ca.fingerprint())
                 );
-                let check = if left < Duration::from_secs(30 * 24 * 3600) {
+                let wide = ca.constraints().too_wide();
+                let check = if !wide.is_empty() {
+                    Check::new(
+                        id,
+                        Level::Fail,
+                        format!(
+                            "{summary} is constrained to {}, which covers a whole TLD",
+                            wide.join(", ")
+                        ),
+                    )
+                    .fix("`fw hub tls rotate`, then re-install the CA on every device")
+                } else if left < Duration::from_secs(30 * 24 * 3600) {
                     Check::new(id, Level::Warn, format!("{summary} expires within 30 days"))
                         .fix("`fw hub tls rotate` (devices re-install it)")
                 } else {

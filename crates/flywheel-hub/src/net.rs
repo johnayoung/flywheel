@@ -145,7 +145,7 @@ impl rustls::client::danger::ServerCertVerifier for PinVerifier {
         let top = intermediates
             .last()
             .map_or_else(|| presented.clone(), |c| sha256_hex(c.as_ref()));
-        *self.observed.lock().unwrap_or_else(PoisonError::into_inner) = Some(top);
+        *self.observed.lock().unwrap_or_else(PoisonError::into_inner) = Some(top.clone());
         let matches = |pin: &str, hex: &str| {
             bool::from(subtle::ConstantTimeEq::ct_eq(
                 pin.as_bytes(),
@@ -161,9 +161,16 @@ impl rustls::client::danger::ServerCertVerifier for PinVerifier {
                     .iter()
                     .find(|c| matches(pin, &sha256_hex(c.as_ref())))
                 else {
+                    // Name what to pin: the CA a short-lived leaf chains
+                    // to, not the leaf (it changes at every renewal).
+                    let what = if intermediates.is_empty() {
+                        "certificate fingerprint"
+                    } else {
+                        "its CA's fingerprint"
+                    };
                     return Err(rustls::Error::General(format!(
-                        "certificate fingerprint {} does not match the pinned {}",
-                        crate::machines::display_fingerprint(&presented),
+                        "{what} {} does not match the pinned {}",
+                        crate::machines::display_fingerprint(&top),
                         crate::machines::display_fingerprint(pin)
                     )));
                 };
@@ -278,7 +285,12 @@ pub fn pinned_config(
         observed,
         provider: Arc::clone(&provider),
     };
-    verifier_config(provider, Arc::new(verifier))
+    let mut config = verifier_config(provider, Arc::new(verifier))?;
+    // No session resumption: a resumed session skips the certificate (and
+    // so the pin) altogether, which would keep a hub "online" under a pin
+    // its rotated CA no longer matches.
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
 }
 
 /// The config reqwest wants even for plain http (never used to verify).

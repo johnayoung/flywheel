@@ -119,7 +119,6 @@ async fn https_and_http_share_the_port_and_the_ca_alone_is_trusted() {
     // https at every name the leaf carries.
     for url in [
         hub.https("/healthz"),
-        format!("https://hubbox:{}/healthz", hub.addr.port()),
         format!("https://hubbox.local:{}/healthz", hub.addr.port()),
     ] {
         let response = client.get(&url).send().await.unwrap_or_else(|e| {
@@ -128,20 +127,20 @@ async fn https_and_http_share_the_port_and_the_ca_alone_is_trusted() {
         assert_eq!(response.status(), StatusCode::OK, "{url}");
         assert_eq!(response.text().await.unwrap(), "ok");
     }
-    // A name the leaf does not carry (and the CA may not sign for).
-    let wrong = client
-        .get(format!(
-            "https://elsewhere.example:{}/healthz",
-            hub.addr.port()
-        ))
-        .send()
-        .await
-        .expect_err("a name outside the certificate");
-    assert!(
-        flywheel_hub::net::describe(&wrong).contains("certificate"),
-        "{}",
-        flywheel_hub::net::describe(&wrong)
-    );
+    // A name the leaf does not carry (and the CA may not sign for): the
+    // bare single-label host too, which as a constraint would cover a TLD.
+    for host in ["elsewhere.example", "hubbox"] {
+        let wrong = client
+            .get(format!("https://{host}:{}/healthz", hub.addr.port()))
+            .send()
+            .await
+            .expect_err("a name outside the certificate");
+        assert!(
+            flywheel_hub::net::describe(&wrong).contains("certificate"),
+            "{host}: {}",
+            flywheel_hub::net::describe(&wrong)
+        );
+    }
     // Without the CA there is no trust.
     let other = LocalCa::generate(
         flywheel_hub::tls::Constraints::for_names(&names(hub.addr), &[]),
@@ -314,8 +313,9 @@ async fn plain_http_from_the_network_reaches_the_ca_page_and_nothing_else() {
     )
     .unwrap();
     let fingerprint = flywheel_hub::machines::display_fingerprint(ca.fingerprint());
+    // Breakable after a colon only, never inside a byte.
     assert!(
-        html.contains(&fingerprint),
+        html.contains(&fingerprint.replace(':', ":<wbr>")),
         "the page shows the fingerprint"
     );
     assert!(html.contains("Certificate Trust Settings"));
@@ -386,6 +386,19 @@ async fn plain_http_from_the_network_reaches_the_ca_page_and_nothing_else() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // This machine reaching its own LAN bind (the CLI, whatever names the
+    // certificate carries): plain http, as loopback is.
+    let mut from_here = from_network("GET", "/api/sessions", "192.0.2.1:7600");
+    from_here.extensions_mut().insert(ConnectInfo(Peer {
+        remote: "192.0.2.1:51000".parse().unwrap(),
+        local: Some("192.0.2.1:7600".parse().unwrap()),
+    }));
+    from_here.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", hub.token()).parse().unwrap(),
+    );
+    let response = app.clone().oneshot(from_here).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -411,12 +424,39 @@ async fn rotation_switches_the_served_ca_and_drops_the_old_one() {
     let hub = TlsHub::start().await;
     let old = hub.ca();
     let old_client = client_trusting(&[old.cert_der().clone()], hub.addr);
-    assert!(old_client.get(hub.https("/healthz")).send().await.is_ok());
+    // Signed in, so the hub keeps the connection alive for the next one.
+    let signed_in = old_client
+        .get(hub.https("/api/tls"))
+        .bearer_auth(hub.token())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed_in.status(), StatusCode::OK);
     let rotated = LocalCa::rotate(&hub.state_dir, &names(hub.addr), &[]).unwrap();
     let new_client = client_trusting(&[rotated.cert_der().clone()], hub.addr);
-    // The reload (what `fw hub tls rotate` asks a running hub for).
-    let status: Value = old_client
-        .post(hub.https("/api/tls/reload"))
+    // A machine pinned to the old CA, on fresh connections each time (so
+    // only a resumed session could carry it past the rotation).
+    let pinned_old = reqwest::Client::builder()
+        .tls_backend_preconfigured(
+            flywheel_hub::net::pinned_config(
+                Some(old.fingerprint()),
+                &[],
+                Arc::new(Mutex::new(None)),
+                "test",
+            )
+            .unwrap(),
+        )
+        .pool_max_idle_per_host(0)
+        .no_proxy()
+        .build()
+        .unwrap();
+    for _ in 0..2 {
+        assert!(pinned_old.get(hub.https("/healthz")).send().await.is_ok());
+    }
+    // The reload (what `fw hub tls rotate` asks a running hub for, over
+    // plain http from this machine).
+    let status: Value = plain_client()
+        .post(hub.http("/api/tls/reload"))
         .bearer_auth(hub.token())
         .send()
         .await
@@ -433,6 +473,29 @@ async fn rotation_switches_the_served_ca_and_drops_the_old_one() {
     // A fresh connection from a device still trusting only the old CA.
     let stale = client_trusting(&[old.cert_der().clone()], hub.addr);
     assert!(stale.get(hub.https("/healthz")).send().await.is_err());
+    // Nor does a connection made before the rotation live on: the old
+    // client's pooled one was closed, and a new one fails the handshake.
+    let reused = old_client
+        .get(hub.https("/api/tls"))
+        .bearer_auth(hub.token())
+        .send()
+        .await;
+    assert!(reused.is_err(), "a pre-rotation connection still served");
+    // The pin to the old CA no longer holds (no resumed session).
+    let refused = pinned_old
+        .get(hub.https("/healthz"))
+        .send()
+        .await
+        .expect_err("a pin to the rotated-out CA");
+    let refused = flywheel_hub::net::describe(&refused);
+    // It names the CA to pin, not the short-lived leaf.
+    assert!(
+        refused.contains(&format!(
+            "its CA's fingerprint {} does not match",
+            flywheel_hub::machines::display_fingerprint(rotated.fingerprint())
+        )),
+        "{refused}"
+    );
     // The old key is gone from the state dir.
     let on_disk = LocalCa::load(&hub.state_dir).unwrap().unwrap();
     assert_eq!(on_disk.fingerprint(), rotated.fingerprint());

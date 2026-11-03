@@ -14,7 +14,7 @@
 
 use super::Peer;
 use super::slots::{Admission, Phase, Slots, UNAUTH_PER_CLIENT, unauthenticated_cap};
-use super::tls_listen::{Sniffed, Transport};
+use super::tls_listen::{Sniffed, TlsAccept, Transport};
 use crate::handoff::GatedListener;
 use axum::Router;
 use axum::body::Body;
@@ -122,7 +122,7 @@ pub async fn run(
     app: Router,
     cap: usize,
     trusted_proxies: Vec<IpAddr>,
-    tls: Option<tokio_rustls::TlsAcceptor>,
+    tls: Option<TlsAccept>,
     shutdown: impl Future<Output = ()> + Send + 'static,
     closing: watch::Sender<bool>,
 ) {

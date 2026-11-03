@@ -1,10 +1,10 @@
 //! The CA onboarding page (`/ca`): public and read-only, over http and
 //! https alike, so a phone that does not trust the hub yet can fetch its
 //! CA certificate (DER, PEM, or an iOS `.mobileconfig` profile), compare
-//! the fingerprint out of band, and follow its OS's install steps. A
-//! one-time login code rides in the URL fragment (`/ca#code=...`, what
-//! `fw hub url --qr` encodes with TLS on): the page's script hands it to
-//! the https login once the device trusts the CA.
+//! the fingerprint out of band, and follow its OS's install steps. No
+//! credential ever comes here: the page is plain http to a device that
+//! does not trust the CA yet, so `fw hub url --qr` gives it a QR of its
+//! own and puts the login code only in the https login QR.
 //!
 //! Also `GET /api/tls` (the TLS status, signed in) and `POST
 //! /api/tls/reload` (re-read the CA and re-issue the leaf now; `fw hub tls
@@ -80,7 +80,8 @@ pub(super) async fn page(State(app): State<AppState>) -> Response {
         )
         .replace(
             "{{FINGERPRINT}}",
-            &esc(&crate::machines::display_fingerprint(ca.fingerprint())),
+            // Lines may break after a colon only, never inside a byte.
+            &esc(&crate::machines::display_fingerprint(ca.fingerprint())).replace(':', ":<wbr>"),
         )
         .replace("{{CONSTRAINTS}}", &constraints)
         .replace("{{CREATED}}", &date(ca.created()))

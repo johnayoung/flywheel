@@ -74,6 +74,8 @@ fn modes_and_names_parse() {
         NameSpec::Net("10.1.0.0".parse().unwrap(), 16)
     );
     for bad in [
+        "dev",
+        "box",
         "*.example.com",
         "10.0.0.0/4",
         "1.2.3.4/33",
@@ -92,7 +94,6 @@ fn the_hub_is_named_for_every_address_it_prints() {
     assert_eq!(
         dns,
         [
-            "box",
             "box.local",
             "box.tail1234.ts.net",
             "hub.example.test",
@@ -140,12 +141,11 @@ fn leaves_carry_the_hub_names_and_verify_against_the_ca_alone() {
     let (_, cert) = x509_parser::parse_x509_certificate(leaf.chain()[0].as_ref()).unwrap();
     assert!(!cert.is_ca());
     let sans = cert.subject_alternative_name().unwrap().unwrap();
-    assert_eq!(sans.value.general_names.len(), 9);
+    assert_eq!(sans.value.general_names.len(), 8);
     let left = leaf.expires.duration_since(SystemTime::now()).unwrap();
     assert!(left <= LEAF_VALIDITY && left > LEAF_VALIDITY - Duration::from_secs(60));
     for name in [
         "localhost",
-        "box",
         "box.local",
         "box.tail1234.ts.net",
         "hub.example.test",
@@ -171,6 +171,10 @@ fn the_ca_cannot_vouch_for_another_site() {
         "8.8.8.8",
         "box.evil.com",
         "192.168.1.21",
+        // The host is `box`: the bare label is not a constraint, or it
+        // would cover the whole `.box` TLD.
+        "box",
+        "shop.box",
     ] {
         let mut wanted = Names::default();
         match other.parse::<IpAddr>() {
@@ -239,7 +243,7 @@ fn the_ca_round_trips_with_a_private_key_file() {
     }
     // A leaf from the reloaded CA chains to the original certificate.
     let leaf = again.issue(&names, SystemTime::now()).unwrap();
-    verify(&ca, &leaf, "box").unwrap();
+    verify(&ca, &leaf, "box.local").unwrap();
     // A key that is not the certificate's is refused.
     let other = ca_for(&names);
     std::fs::write(
@@ -373,4 +377,43 @@ fn the_ios_profile_installs_the_ca_as_a_root() {
     assert!(profile.contains(&crate::machines::display_fingerprint(ca.fingerprint())));
     // Deterministic per CA (a re-download replaces, not duplicates).
     assert_eq!(profile, ca.mobileconfig());
+}
+
+#[test]
+fn a_host_named_like_a_tld_does_not_constrain_the_ca_to_that_tld() {
+    let names = hub_names(
+        "0.0.0.0:7600".parse().unwrap(),
+        "dev",
+        &[("eth0".into(), "192.168.1.20".parse().unwrap())],
+        None,
+        &[],
+    );
+    assert!(!names.dns.contains("dev"));
+    assert!(names.dns.contains("dev.local"));
+    // Even a bare label handed in directly is not made a constraint.
+    let mut sneaky = names.clone();
+    sneaky.dns.insert("app".into());
+    let constraints = Constraints::for_names(&sneaky, &[NameSpec::Dns("box".into())]);
+    assert_eq!(constraints.dns, ["dev.local", "localhost"]);
+    assert!(constraints.too_wide().is_empty());
+    let ca = LocalCa::generate(constraints, SystemTime::now()).unwrap();
+    for other in ["mail.google.dev", "web.dev", "dev", "x.app"] {
+        let mut wanted = Names::default();
+        wanted.dns.insert(other.to_owned());
+        let forged = ca.sign_unchecked(&wanted, SystemTime::now()).unwrap();
+        let refused = verify(&ca, &forged, other).expect_err(other);
+        assert!(
+            format!("{refused:?}").contains("NameConstraint"),
+            "{other}: {refused:?}"
+        );
+    }
+    let leaf = ca.issue(&names, SystemTime::now()).unwrap();
+    assert!(leaf.outside.is_empty());
+    verify(&ca, &leaf, "dev.local").unwrap();
+    // A CA made before the bare label was refused is flagged.
+    let old = Constraints {
+        dns: vec!["dev".into(), "localhost".into()],
+        nets: Vec::new(),
+    };
+    assert_eq!(old.too_wide(), ["dev"]);
 }

@@ -28,7 +28,9 @@ section { margin-top: 1.2rem; padding: 1rem 1rem .4rem; background: var(--panel)
 .status #status-text { flex: 1 1 14rem; color: var(--ink); }
 @keyframes pulse { to { opacity: .25; } }
 .fingerprint { display: block; padding: .7rem .8rem; margin-bottom: .8rem; border: 1px dashed var(--rule);
-               background: var(--bg); font-size: 12px; letter-spacing: .02em; line-height: 1.7; }
+               background: var(--bg); font-size: 12px; letter-spacing: .02em; line-height: 1.7;
+               /* Break only after a colon (the page puts <wbr> there), never inside a byte. */
+               word-break: keep-all; overflow-wrap: normal; }
 .downloads { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .9rem; }
 button, .dl { display: inline-block; padding: .7rem 1rem; border: 0; border-radius: 2px; background: var(--rule);
               color: var(--ink); font: 600 11px "FW Mono", ui-monospace, monospace; letter-spacing: .12em;

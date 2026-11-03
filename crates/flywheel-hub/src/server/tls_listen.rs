@@ -5,8 +5,9 @@
 //!
 //! With TLS on, plain http from the network reaches only the CA onboarding
 //! page (`/ca`, `server/ca_page.rs`); everything else is redirected to the
-//! same URL over https. Loopback (a local browser, the CLI, `tailscale
-//! serve`) and trusted proxies keep plain http: loopback is already a
+//! same URL over https. This machine (loopback, or its own address as the
+//! source: a local browser, the CLI, `tailscale serve`) and trusted proxies
+//! keep plain http: loopback is already a
 //! secure context, and a proxy terminates TLS itself.
 
 use super::{AppState, Peer};
@@ -21,6 +22,7 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 
 /// The first byte of a TLS handshake record.
 const TLS_HANDSHAKE: u8 = 0x16;
@@ -38,12 +40,64 @@ pub(crate) fn over_tls(extensions: &axum::http::Extensions) -> bool {
     extensions.get::<Transport>().is_some_and(|t| t.tls)
 }
 
+/// How the listener accepts TLS: the acceptor, and the CA generation
+/// (`TlsServing::ca_epoch`) a connection is bound to.
+#[derive(Clone)]
+pub(crate) struct TlsAccept {
+    acceptor: tokio_rustls::TlsAcceptor,
+    ca_epoch: watch::Receiver<u64>,
+}
+
+impl TlsAccept {
+    pub(crate) fn new(acceptor: tokio_rustls::TlsAcceptor, ca_epoch: watch::Receiver<u64>) -> Self {
+        Self { acceptor, ca_epoch }
+    }
+}
+
+/// A TLS connection and the CA generation it was made under: once the CA
+/// rotates, it fails (and so closes) at once, idle or not, so whoever
+/// trusted the old CA must handshake again -- against the new one.
+struct Secured {
+    stream: tokio_rustls::server::TlsStream<TcpStream>,
+    /// Resolves when the CA generation moves on from the connection's.
+    rotated: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl Secured {
+    fn new(
+        stream: tokio_rustls::server::TlsStream<TcpStream>,
+        mut ca_epoch: watch::Receiver<u64>,
+    ) -> Self {
+        // The generation as of now: a rotation between the handshake and
+        // here only costs a reconnect.
+        let epoch = *ca_epoch.borrow_and_update();
+        let rotated = Box::pin(async move {
+            // A dropped sender (the hub going away) is no rotation.
+            if ca_epoch.wait_for(|now| *now != epoch).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        });
+        Self { stream, rotated }
+    }
+
+    /// An error once the CA has rotated; otherwise wakes `cx` when it does.
+    fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        match self.rotated.as_mut().poll(cx) {
+            Poll::Ready(()) => Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "the hub's CA was rotated: reconnect",
+            )),
+            Poll::Pending => Ok(()),
+        }
+    }
+}
+
 enum Stage {
     /// Waiting for the first byte.
-    Sniffing(TcpStream, tokio_rustls::TlsAcceptor),
-    Handshake(Box<tokio_rustls::Accept<TcpStream>>),
+    Sniffing(TcpStream, TlsAccept),
+    Handshake(Box<tokio_rustls::Accept<TcpStream>>, watch::Receiver<u64>),
     Plain(TcpStream),
-    Tls(Box<tokio_rustls::server::TlsStream<TcpStream>>),
+    Tls(Box<Secured>),
     /// The handshake failed (reported once; every later call fails too).
     Failed,
 }
@@ -61,7 +115,7 @@ impl Sniffed {
     /// starts a handshake.
     pub(crate) fn new(
         stream: TcpStream,
-        acceptor: Option<tokio_rustls::TlsAcceptor>,
+        acceptor: Option<TlsAccept>,
     ) -> (Self, Arc<OnceLock<bool>>) {
         let secure = Arc::new(OnceLock::new());
         let state = match acceptor {
@@ -96,28 +150,31 @@ impl Sniffed {
                     let mut buf = ReadBuf::new(&mut byte);
                     ready!(stream.poll_peek(cx, &mut buf))?;
                     let tls = buf.filled() == [TLS_HANDSHAKE];
-                    let Stage::Sniffing(stream, acceptor) =
+                    let Stage::Sniffing(stream, accept) =
                         std::mem::replace(&mut self.state, Stage::Failed)
                     else {
                         unreachable!("matched above");
                     };
                     self.state = if tls {
-                        Stage::Handshake(Box::new(acceptor.accept(stream)))
+                        Stage::Handshake(Box::new(accept.acceptor.accept(stream)), accept.ca_epoch)
                     } else {
                         let _ = self.secure.set(false);
                         Stage::Plain(stream)
                     };
                 }
-                Stage::Handshake(accept) => match ready!(Pin::new(accept.as_mut()).poll(cx)) {
-                    Ok(stream) => {
-                        let _ = self.secure.set(true);
-                        self.state = Stage::Tls(Box::new(stream));
+                Stage::Handshake(accept, ca_epoch) => {
+                    match ready!(Pin::new(accept.as_mut()).poll(cx)) {
+                        Ok(stream) => {
+                            let _ = self.secure.set(true);
+                            self.state =
+                                Stage::Tls(Box::new(Secured::new(stream, ca_epoch.clone())));
+                        }
+                        Err(e) => {
+                            self.state = Stage::Failed;
+                            return Poll::Ready(Err(e));
+                        }
                     }
-                    Err(e) => {
-                        self.state = Stage::Failed;
-                        return Poll::Ready(Err(e));
-                    }
-                },
+                }
             }
         }
     }
@@ -133,7 +190,10 @@ impl AsyncRead for Sniffed {
         ready!(this.poll_ready(cx))?;
         match &mut this.state {
             Stage::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            Stage::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+            Stage::Tls(s) => {
+                s.check(cx)?;
+                Pin::new(&mut s.stream).poll_read(cx, buf)
+            }
             _ => unreachable!("ready"),
         }
     }
@@ -149,7 +209,10 @@ impl AsyncWrite for Sniffed {
         ready!(this.poll_ready(cx))?;
         match &mut this.state {
             Stage::Plain(s) => Pin::new(s).poll_write(cx, data),
-            Stage::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, data),
+            Stage::Tls(s) => {
+                s.check(cx)?;
+                Pin::new(&mut s.stream).poll_write(cx, data)
+            }
             _ => unreachable!("ready"),
         }
     }
@@ -158,7 +221,7 @@ impl AsyncWrite for Sniffed {
         let this = self.get_mut();
         match &mut this.state {
             Stage::Plain(s) => Pin::new(s).poll_flush(cx),
-            Stage::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            Stage::Tls(s) => Pin::new(&mut s.stream).poll_flush(cx),
             _ => Poll::Ready(Ok(())),
         }
     }
@@ -167,9 +230,9 @@ impl AsyncWrite for Sniffed {
         let this = self.get_mut();
         match &mut this.state {
             Stage::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            Stage::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            Stage::Tls(s) => Pin::new(&mut s.stream).poll_shutdown(cx),
             Stage::Sniffing(s, _) => Pin::new(s).poll_shutdown(cx),
-            Stage::Handshake(_) | Stage::Failed => Poll::Ready(Ok(())),
+            Stage::Handshake(..) | Stage::Failed => Poll::Ready(Ok(())),
         }
     }
 }
@@ -197,9 +260,18 @@ pub(super) async fn plain_http_policy(
     let peer = request
         .extensions()
         .get::<ConnectInfo<Peer>>()
-        .map(|ConnectInfo(p)| p.remote.ip().to_canonical());
-    // No connect info: an in-process caller, this machine.
-    let local = peer.is_none_or(|ip| ip.is_loopback() || app.options.trusted_proxies.contains(&ip));
+        .map(|ConnectInfo(p)| {
+            (
+                p.remote.ip().to_canonical(),
+                p.local.map(|l| l.ip().to_canonical()),
+            )
+        });
+    // No connect info: an in-process caller, this machine. Our own address
+    // as the source is this machine too (the CLI reaching a LAN bind): that
+    // traffic never leaves it.
+    let local = peer.is_none_or(|(ip, own)| {
+        ip.is_loopback() || own == Some(ip) || app.options.trusted_proxies.contains(&ip)
+    });
     if local || plain_http_allowed(request.uri().path()) {
         return next.run(request).await;
     }

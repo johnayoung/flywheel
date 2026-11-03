@@ -896,25 +896,43 @@ fn print_login(
         );
         return;
     }
-    // The hub's own TLS with a local CA: the phone starts at the CA page
-    // (plain http: it may not trust the CA yet), which signs it in over
-    // https once it does. The code rides in the fragment, which is never
-    // sent over the network.
-    let (url, how) = match remote.ca_base() {
-        Some(ca) => (
-            format!("{ca}/ca#code={code}"),
-            "; it installs this hub's CA first if the phone does not trust it yet",
-        ),
-        None => (code_login_url(&remote.base, code), ""),
-    };
-    match qr_lines(&url) {
-        Ok(lines) => {
-            let _ = writeln!(
-                out,
-                "
-scan to log in ({}{how}):",
+    // The hub's own TLS with a local CA: a phone that does not trust the CA
+    // yet installs it from the CA page, which is plain http (it cannot be
+    // https before the trust exists) -- so the login code never goes there:
+    // an active attacker on the LAN could rewrite that page and spend the
+    // code first. The CA page gets a QR of its own, without the code; the
+    // login QR is https only.
+    for (url, title) in login_qrs(remote, code) {
+        draw_qr(out, err, &url, &title);
+    }
+}
+
+/// The QR codes (URL, title) that log a phone in at `remote` with `code`.
+/// With the hub's local CA, a CA-page QR without the code comes first.
+fn login_qrs(remote: &LoginTarget, code: &str) -> Vec<(String, String)> {
+    let mut qrs = Vec::new();
+    if let Some(ca) = remote.ca_base() {
+        qrs.push((
+            format!("{ca}/ca"),
+            format!(
+                "first time on this device? scan to install this hub's CA ({}, plain http: \
+                 compare the fingerprint with `fw hub tls ca`; no login code in it)",
                 remote.label
-            );
+            ),
+        ));
+    }
+    qrs.push((
+        code_login_url(&remote.base, code),
+        format!("scan to log in ({})", remote.label),
+    ));
+    qrs
+}
+
+/// `url` as a QR code under `title`.
+fn draw_qr(out: &mut dyn Write, err: &mut dyn Write, url: &str, title: &str) {
+    match qr_lines(url) {
+        Ok(lines) => {
+            let _ = writeln!(out, "\n{title}:");
             for line in lines {
                 let _ = writeln!(out, "  {line}");
             }
@@ -962,6 +980,10 @@ fn print_tls(
         && !outside.is_empty()
     {
         let _ = writeln!(err, "{}", crate::tls::outside_warning(&outside));
+    }
+    let wide = ca.constraints().too_wide();
+    if !wide.is_empty() {
+        let _ = writeln!(err, "{}", crate::tls::too_wide_warning(&wide));
     }
 }
 
@@ -1571,6 +1593,43 @@ mod tests {
             String::from_utf8(out).unwrap(),
             String::from_utf8(err).unwrap(),
         )
+    }
+
+    #[test]
+    fn the_login_code_never_rides_a_plain_http_qr() {
+        let targets = crate::remote::login_targets_served(
+            "0.0.0.0:7600".parse().unwrap(),
+            &[],
+            None,
+            &[("eth0".into(), "192.168.1.5".parse().unwrap())],
+            Served::Https { ca_page: true },
+        );
+        let lan = targets.iter().find(|t| t.remote).unwrap();
+        let qrs = login_qrs(lan, "SECRETCODE");
+        let urls: Vec<&str> = qrs.iter().map(|(url, _)| url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "http://192.168.1.5:7600/ca",
+                "https://192.168.1.5:7600/login?code=SECRETCODE"
+            ]
+        );
+        for (url, _) in &qrs {
+            assert!(
+                !url.contains("SECRETCODE") || url.starts_with("https://"),
+                "{url}"
+            );
+        }
+        // Without the local CA: one QR, the login itself.
+        let plain = crate::remote::login_targets_served(
+            "0.0.0.0:7600".parse().unwrap(),
+            &[],
+            None,
+            &[("eth0".into(), "192.168.1.5".parse().unwrap())],
+            Served::Http,
+        );
+        let lan = plain.iter().find(|t| t.remote).unwrap();
+        assert_eq!(login_qrs(lan, "C").len(), 1);
     }
 
     #[test]

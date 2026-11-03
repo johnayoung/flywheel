@@ -63,7 +63,7 @@ button#meter-usage { max-width: 16rem; text-align: left; }
 /* --- touch tap targets (pointer: coarse) ------------------------------------- */
 /* Every control a finger uses is at least 44px tall, icon-only ones 44px
    wide too (WCAG 2.5.5). The first key-bar row is the exception in width:
-   its ten keys share the phone's width so every one stays in view. */
+   its seven keys share the phone's width so every one stays in view. */
 @media (pointer: coarse) {
   .slab, .chip, .qa, .qa-esc, .kb-key, .fw-chip, .sel-pop .slab,
   .commands select, .cmd-check, .cmd-field, .sheet select, .empty-actions button, .ws-head {

@@ -228,11 +228,11 @@ window.FwHubMobile = function (ctx) {
   // --- key bar ---------------------------------------------------------
 
   // The first row holds what driving an agent takes most (menus: arrows
-  // and Enter; Esc, ^C) in eight keys, each a full 44px tap target on a
-  // phone; the second (Tab and Shift+Tab first) scrolls sideways.
+  // and Enter; Esc, ^C) in seven keys, so each is a full 44px tap target
+  // even on a 360px phone; the second (Tab, Shift+Tab, then the sticky
+  // modifiers) scrolls sideways.
   const PRIMARY = [
     { label: "esc", title: "Escape", seq: () => withAlt("\x1b") },
-    { label: "ctrl", title: "Ctrl (sticky: tap for the next key, twice to lock)", mod: "ctrl" },
     { label: "←", title: "Left", seq: () => arrow("D"), repeat: true },
     { label: "↑", title: "Up", seq: () => arrow("A"), repeat: true },
     { label: "↓", title: "Down", seq: () => arrow("B"), repeat: true },
@@ -243,6 +243,7 @@ window.FwHubMobile = function (ctx) {
   const SECONDARY = [
     { label: "tab", title: "Tab", seq: () => (mods.alt ? "\x1b\t" : "\t") },
     { label: "⇧tab", title: "Shift+Tab (Claude: cycle permission mode)", seq: () => withAlt("\x1b[Z") },
+    { label: "ctrl", title: "Ctrl (sticky: tap for the next key, twice to lock)", mod: "ctrl" },
     { label: "alt", title: "Alt (sticky: tap for the next key, twice to lock)", mod: "alt" },
     // Characters take the armed ctrl/alt as a typed one does.
     { label: "/", title: "Slash", seq: () => transformInput("/") },

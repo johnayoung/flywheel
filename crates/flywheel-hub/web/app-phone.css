@@ -194,7 +194,7 @@ body.kb-open .mobilebar { padding-bottom: .35rem; }
   flex: 1 1 8rem;
   min-width: 0;
   max-width: 100%;
-  min-height: 2.5rem;
+  min-height: 2.75rem;
   padding: .45rem .7rem;
   border: 1px solid var(--rule-2);
   border-radius: 2px;
@@ -255,7 +255,8 @@ body.kb-open .mobilebar { padding-bottom: .35rem; }
 
 .keybar { display: grid; gap: .3rem; min-width: 0; }
 .kb-row { display: flex; gap: .3rem; min-width: 0; }
-/* Always fits: the keys share the width. */
+/* Always fits: seven keys share the width, each at least 44px even at
+   360px (8 would not: 8 x 44 plus gaps is wider than a 375px row). */
 .kb-primary .kb-key { flex: 1 1 0; min-width: 2.75rem; padding: 0; }
 .kb-primary .kb-key.wide { flex-grow: 1.3; }
 @media (max-width: 480px) { .kb-primary .kb-key { font-size: 11px; letter-spacing: 0; } .kb-primary .kb-key.wide { flex-grow: 1; } .kb-primary { gap: .2rem; } }
@@ -311,7 +312,7 @@ body.kb-open.composing #quick, body.kb-open.composing #keybar { display: none; }
 body.kb-open .qa-head { display: none; }
 body.kb-open .quick { padding: .3rem .4rem; }
 body.kb-open .qa-options { display: flex; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
-body.kb-open .qa { flex: none; max-width: 75vw; min-height: 2.2rem; }
+body.kb-open .qa { flex: none; max-width: 75vw; min-height: 2.75rem; }
 body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 
 /* --- selection popover ------------------------------------------------- */

@@ -207,7 +207,7 @@ try {
     const want = key === "Alt+4" ? h.ws === "e2e-two" && h.panes === 1 : h.ws === "e2e" && h.panes === 3;
     if (!want || /Empty pane/.test(h.crumb)) jumps.push(`${key}: ${JSON.stringify(h)}`);
   }
-  await page.locator(".session", { hasText: "sh 1" }).last().click();
+  await page.locator(`.session[data-id="${other.id}"]`).click();
   await page.waitForTimeout(600);
   const clicked = await header();
   if (clicked.ws !== "e2e-two" || clicked.panes !== 1) jumps.push(`sidebar: ${JSON.stringify(clicked)}`);
@@ -267,7 +267,9 @@ try {
     .then(() => check(true, "desktop: a new tab offers this workspace's sessions"), () => check(false, "desktop: a new tab offers this workspace's sessions"));
   const offered = await page.locator("#empty-actions button").count();
   check(offered === 4, `desktop: New shell + 3 sessions offered (${offered})`);
-  await page.locator("#empty-actions button", { hasText: "sh 3" }).click();
+  // Default names count per program (claude 1, sh 1, sh 2): pick the last shell.
+  const lastShell = (await api("GET", `/api/sessions/${sids[2]}`)).name;
+  await page.locator("#empty-actions button", { hasText: lastShell }).click();
   await page.waitForFunction(() => document.querySelectorAll("#terminal .pane .xterm").length === 1 && document.querySelector("#empty").hidden, null, { timeout: 10000 })
     .then(() => check(true, "desktop: picking one shows it in the new tab"), () => check(false, "desktop: picking one shows it in the new tab"));
   await page.screenshot({ path: path.join(out, "desktop-new-tab.png") });
@@ -511,6 +513,46 @@ try {
     .map((n) => [n.id || n.className.split(" ")[0], Math.round(n.getBoundingClientRect().width), Math.round(n.getBoundingClientRect().height)])
     .filter(([, w, h]) => w < 44 || h < 44));
   check(narrowTargets.length === 0, `phone: icon and second-row targets at least 44x44 (${JSON.stringify(narrowTargets)})`);
+  // The first key row fits the narrowest phones: no key past the row's
+  // edge (nor the screen's), every key 44x44; and the quick answers (shown
+  // here with a stand-in prompt) are 44px targets, keyboard up or down.
+  for (const width of [360, 375, 390, 430]) {
+    await mp.setViewportSize({ width, height: 844 });
+    await mp.waitForTimeout(300);
+    const fit = await mp.evaluate(() => {
+      const bad = [];
+      const row = document.querySelector("#keybar .kb-primary");
+      const box = row.getBoundingClientRect();
+      if (row.scrollWidth > row.clientWidth + 0.5) bad.push(`row scrolls ${row.scrollWidth} > ${row.clientWidth}`);
+      if (box.right > innerWidth + 0.5) bad.push(`row ends at ${Math.round(box.right)} past ${innerWidth}`);
+      for (const key of row.querySelectorAll(".kb-key")) {
+        const r = key.getBoundingClientRect();
+        const name = key.textContent.trim();
+        if (r.left < box.left - 0.5 || r.right > box.right + 0.5) bad.push(`${name} outside the row (${Math.round(r.left)}..${Math.round(r.right)})`);
+        if (r.width < 44 || r.height < 44) bad.push(`${name} ${r.width.toFixed(1)}x${r.height.toFixed(1)}`);
+      }
+      const quick = document.querySelector("#quick");
+      const was = { hidden: quick.hidden, html: quick.innerHTML };
+      quick.hidden = false;
+      quick.innerHTML = '<div class="qa-head"><div class="qa-question"><b>blocked</b> Run rm?</div><button type="button" class="qa-esc">esc</button></div>'
+        + '<div class="qa-options"><button type="button" class="qa">1. Yes</button><button type="button" class="qa">2. Yes, and don\'t ask again</button><button type="button" class="qa">3. No</button></div>';
+      for (const open of [false, true]) {
+        document.body.classList.toggle("kb-open", open);
+        for (const node of quick.querySelectorAll(".qa, .qa-esc")) {
+          if (node.offsetParent === null) continue;
+          const r = node.getBoundingClientRect();
+          if (r.width < 44 || r.height < 44) bad.push(`${open ? "kb-open " : ""}${node.className} ${r.width.toFixed(1)}x${r.height.toFixed(1)}`);
+        }
+      }
+      document.body.classList.remove("kb-open");
+      quick.innerHTML = was.html;
+      quick.hidden = was.hidden;
+      return bad;
+    });
+    check(fit.length === 0, `phone ${width}: the first key row fits, keys and quick answers at least 44x44 (${fit.join(", ")})`);
+    if (width === 360) await mp.screenshot({ path: path.join(out, "phone-360-keys.png") });
+  }
+  await mp.setViewportSize({ width: 390, height: 844 });
   // The header with a usage meter and a status pill (as an agent with
   // spend shows): the name, pill and why? keep their room, nothing is
   // covered or pushed off the screen.

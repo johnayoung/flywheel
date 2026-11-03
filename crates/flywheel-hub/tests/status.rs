@@ -775,6 +775,11 @@ async fn codex_status_from_its_screen_and_turn_complete_notify() {
     status_becomes(&mut events, &sid, "working").await;
     let why = hub.get(&format!("/api/sessions/{sid}/explain")).await;
     assert_eq!(why["source_label"], "manifest:codex.toml#turn_status");
+    // Codex runs `notify` once the turn has ended (its status line gone,
+    // the composer back): the stand-in's turn redraws for 1.2 s. A notify
+    // sent while it still draws "Working" would be followed by screens
+    // that honestly read as working again.
+    tokio::time::sleep(Duration::from_millis(1600)).await;
     // Codex runs `notify` with the payload as its last argument.
     let notify = json!({
         "type": "agent-turn-complete",

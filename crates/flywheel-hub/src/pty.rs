@@ -866,6 +866,14 @@ fn write_loop(
                 }
                 continue;
             }
+            // Input a pause held that no park handed back -- resumed before
+            // this thread ever parked, as an adopted session can be -- goes
+            // before anything queued since.
+            let left = std::mem::take(&mut queue.pause_state().held);
+            if !left.is_empty() {
+                pending = left;
+                continue;
+            }
             match input.recv_timeout(RELEASE_POLL) {
                 Ok(bytes) => bytes,
                 Err(std_mpsc::RecvTimeoutError::Timeout) => continue,

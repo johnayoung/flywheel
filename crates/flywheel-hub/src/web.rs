@@ -528,10 +528,10 @@ pub fn login_page(error: Option<&str>) -> String {
   h1 {{ margin: .1rem 0 .8rem; font: 800 3.2rem/.9 "FW Display", "Arial Narrow", sans-serif; text-transform: uppercase; }}
   p {{ margin: 0 0 1.3rem; color: var(--ink-2); }}
   code {{ color: var(--signal); }}
-  input {{ width: 100%; padding: .7rem .8rem; border: 1px solid var(--rule); border-radius: 2px; background: var(--bg);
+  input {{ width: 100%; min-height: 2.75rem; box-sizing: border-box; padding: .7rem .8rem; border: 1px solid var(--rule); border-radius: 2px; background: var(--bg);
           color: inherit; font: 16px ui-monospace, monospace; }}
   input:focus {{ outline: none; border-color: var(--signal); }}
-  button {{ margin-top: 1rem; width: 100%; padding: .75rem; border: 0; border-radius: 2px; background: var(--signal);
+  button {{ margin-top: 1rem; width: 100%; min-height: 2.75rem; padding: .75rem; border: 0; border-radius: 2px; background: var(--signal);
            color: #150904; font: 600 11px "FW Mono", ui-monospace, monospace; letter-spacing: .14em; text-transform: uppercase; cursor: pointer; }}
   .err {{ color: var(--alert); margin: .9rem 0 0; }}
   @media (prefers-reduced-motion: reduce) {{ .wheel {{ animation: none; }} }}

@@ -111,7 +111,7 @@
 
 /* Touch screens have no hover: the tools sit on their own line under an
    open workspace's name (which wraps rather than shrink to nothing), and
-   the attached row's actions replace its state label. */
+   the attached row's actions sit on a line under it. */
 @media (hover: none) {
   .ws-head-row { flex-wrap: wrap; }
   .ws-tools {
@@ -125,8 +125,11 @@
     visibility: visible;
   }
   .workspace.collapsed .ws-tools { display: none; }
+  /* The attached row keeps its whole name: its state and actions take a
+     line of their own under it. */
+  .session.active .session-meta { grid-column: 3 / -1; justify-content: flex-end; }
   .session.active .session-actions { display: inline-flex; }
-  .session.active .session-state { display: none; }
+  .session.active .session-meta .session-state { display: inline; }
 }
 
 /* A workspace's folders: one inline list, each chip marked by kind --

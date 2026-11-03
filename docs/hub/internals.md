@@ -149,7 +149,7 @@ Tested at 390x844 and 430x932 (iPhone 14 emulation).
 
 - The app is pinned to the visual viewport: the keyboard shrinks the terminal. Phones never size the PTY under 16 rows (shorter boxes clip around the cursor).
 - **Needs you**: blocked and done agents of every workspace, blocked and longest-waiting first, head the sidebar and are the phone's start screen.
-- **Key bar** (touch screens): row 1 `esc` `tab` `shift-tab` sticky `ctrl` arrows `enter` `^c`; row 2 sticky `alt`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd`, `compose`. Modifiers apply to key-bar keys too.
+- **Key bar** (touch screens): row 1 `esc` sticky `ctrl` arrows `enter` `^c` (44px keys); row 2 `tab` `shift-tab` sticky `alt`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd`, `compose`. Modifiers apply to key-bar keys too.
 - **Quick answers**: while blocked, the live dialog's options become buttons (numbered lists send the digit; `(y/n)` sends the letter + Enter).
 - **Compose**: multi-line text (dictation) sent as one bracketed paste + Enter; per-device history, per-session drafts; sign-out clears both.
 - Touch: swipe scrolls with momentum, long-press selects, pinch sets the text size.

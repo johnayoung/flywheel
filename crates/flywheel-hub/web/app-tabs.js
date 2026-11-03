@@ -228,6 +228,18 @@ function renderSwitcher(bar, layout) {
         if (on) activeChip = chips[chips.length - 1];
       }
     }
+    // The open session is in no tab's panes: it leads the row, marked
+    // as the one on screen, so the row always says where you are.
+    const current = sessionById(state.solo.sessionId);
+    if (chips.length && !activeChip && current) {
+      activeChip = el(
+        "button",
+        { type: "button", className: "pane-chip active", "aria-pressed": "true", title: `${current.name} (not in a tab)` },
+        el("span", { className: `dot ${statusLook(current).dot}` }),
+        current.name,
+      );
+      chips.unshift(activeChip);
+    }
   }
   bar.hidden = chips.length < 2;
   const row = chips.length < 2 ? null : el("div", { className: "pane-switch", role: "toolbar", "aria-label": "Panes" }, chips);

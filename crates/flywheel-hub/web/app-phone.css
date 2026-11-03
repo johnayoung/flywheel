@@ -256,9 +256,9 @@ body.kb-open .mobilebar { padding-bottom: .35rem; }
 .keybar { display: grid; gap: .3rem; min-width: 0; }
 .kb-row { display: flex; gap: .3rem; min-width: 0; }
 /* Always fits: the keys share the width. */
-.kb-primary .kb-key { flex: 1 1 0; min-width: 0; padding: 0; }
+.kb-primary .kb-key { flex: 1 1 0; min-width: 2.75rem; padding: 0; }
 .kb-primary .kb-key.wide { flex-grow: 1.3; }
-@media (max-width: 480px) { .kb-primary .kb-key { font-size: 11px; letter-spacing: 0; } .kb-primary { gap: .2rem; } }
+@media (max-width: 480px) { .kb-primary .kb-key { font-size: 11px; letter-spacing: 0; } .kb-primary .kb-key.wide { flex-grow: 1; } .kb-primary { gap: .2rem; } }
 .kb-second { align-items: stretch; }
 .kb-keys {
   flex: 1;

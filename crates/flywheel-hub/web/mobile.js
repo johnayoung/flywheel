@@ -228,12 +228,10 @@ window.FwHubMobile = function (ctx) {
   // --- key bar ---------------------------------------------------------
 
   // The first row holds what driving an agent takes most (menus: arrows
-  // and Enter; Esc, ^C, Shift+Tab) and always fits a phone's width; the
-  // second scrolls sideways.
+  // and Enter; Esc, ^C) in eight keys, each a full 44px tap target on a
+  // phone; the second (Tab and Shift+Tab first) scrolls sideways.
   const PRIMARY = [
     { label: "esc", title: "Escape", seq: () => withAlt("\x1b") },
-    { label: "tab", title: "Tab", seq: () => (mods.alt ? "\x1b\t" : "\t") },
-    { label: "⇧tab", title: "Shift+Tab (Claude: cycle permission mode)", seq: () => withAlt("\x1b[Z") },
     { label: "ctrl", title: "Ctrl (sticky: tap for the next key, twice to lock)", mod: "ctrl" },
     { label: "←", title: "Left", seq: () => arrow("D"), repeat: true },
     { label: "↑", title: "Up", seq: () => arrow("A"), repeat: true },
@@ -243,6 +241,8 @@ window.FwHubMobile = function (ctx) {
     { label: "^c", title: "Ctrl+C (interrupt)", seq: () => "\x03", danger: true },
   ];
   const SECONDARY = [
+    { label: "tab", title: "Tab", seq: () => (mods.alt ? "\x1b\t" : "\t") },
+    { label: "⇧tab", title: "Shift+Tab (Claude: cycle permission mode)", seq: () => withAlt("\x1b[Z") },
     { label: "alt", title: "Alt (sticky: tap for the next key, twice to lock)", mod: "alt" },
     // Characters take the armed ctrl/alt as a typed one does.
     { label: "/", title: "Slash", seq: () => transformInput("/") },
@@ -429,6 +429,8 @@ window.FwHubMobile = function (ctx) {
   }
 
   let quickKey = "";
+  // The question last answered from the bar (see renderQuick).
+  let answeredKey = "";
   function renderQuick() {
     const bar = $("#quick");
     const session = sessionById(state.attached);
@@ -436,6 +438,8 @@ window.FwHubMobile = function (ctx) {
     // the bar takes rows from the terminal every viewer shares.
     const agent = session && !state.exited && keybarWanted() ? agentStatus(session) : null;
     if (!agent || agent.status !== "blocked") {
+      // Out of blocked: the same question may be asked (and answered) again.
+      answeredKey = "";
       if (!bar.hidden) {
         bar.hidden = true;
         quickKey = "";
@@ -447,9 +451,22 @@ window.FwHubMobile = function (ctx) {
     const options = prompt ? prompt.options : [];
     const question = agent.detail || (prompt && prompt.question) || "waiting on you";
     const key = JSON.stringify([state.attached, question, options]);
+    // Answered already: the status lags the answer (until the agent's
+    // next hook), and a second tap would type it twice.
+    if (key === answeredKey) {
+      if (!bar.hidden) {
+        bar.hidden = true;
+        updateBar();
+      }
+      return;
+    }
     if (key === quickKey && !bar.hidden) return;
     quickKey = key;
     const answer = (seq) => () => {
+      if (answeredKey === key) return;
+      answeredKey = key;
+      bar.hidden = true;
+      updateBar();
       send(seq);
       ctx.onKey();
     };

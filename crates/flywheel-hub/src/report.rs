@@ -2,10 +2,12 @@
 //! socket in the (0700) state dir, mode 0600, so it is reachable only by
 //! the hub's own user and never from the network, whatever `--bind` says.
 //!
-//! Agent sessions do not get the hub's access token. Each spawn of an
+//! Agent sessions are not handed the hub's access token. Each spawn of an
 //! agent session gets its own random secret (in its environment, never on
 //! a command line) that authorizes status reports for that one session and
-//! nothing else -- not the API, not other sessions.
+//! nothing else -- not the API, not other sessions. That is not isolation:
+//! a session runs as the hub's user and can read the state dir (the token,
+//! `machines.json`'s peer credentials) like any process of that user.
 //!
 //! Protocol: the client connects, writes one JSON [`Report`] line, and
 //! reads one JSON line back: `{"ok":true}` or `{"ok":false,"error":"..."}`.

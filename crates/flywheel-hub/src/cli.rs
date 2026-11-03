@@ -123,13 +123,16 @@ enum HubCommand {
     /// rebases it onto the base first).
     Merge(crate::review_cli::MergeArgs),
     /// Other hubs shown and proxied by this one: add, ls, rm, test.
-    /// Every scripting verb takes --machine NAME to reach one.
+    /// Every scripting verb but `url` takes --machine NAME to reach one.
     Machine(crate::machine_cli::MachineArgs),
     /// Credentials other hubs hold to reach this one: issue, ls, revoke.
     Peer(crate::machine_cli::PeerArgs),
 }
 
+// `--machine` is refused here (a peer credential mints no login codes):
+// hidden from help so help matches what the verb takes.
 #[derive(Debug, clap::Args)]
+#[command(mut_arg("machine", |arg| arg.hide(true)))]
 struct UrlArgs {
     /// Also draw the most remote-friendly URL as a QR code.
     #[arg(long)]
@@ -1318,6 +1321,10 @@ mod tests {
         assert!(out.contains("serve") && out.contains("token"));
         let (code, _, _) = run_args(&["serve", "--port", "notaport"]);
         assert_eq!(code, 2);
+        // `url` refuses --machine, so its help does not offer it.
+        let (code, out, _) = run_args(&["url", "--help"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("--url") && !out.contains("--machine"), "{out}");
     }
 
     struct FakeEnv(Vec<(&'static str, String)>);

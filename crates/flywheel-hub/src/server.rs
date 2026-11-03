@@ -719,8 +719,8 @@ async fn require_auth(
             if crate::peers::peer_forbidden(request.uri().path()) {
                 return error_response(
                     StatusCode::FORBIDDEN,
-                    "not allowed with a peer credential (it drives sessions; it cannot \
-                     administer this hub)",
+                    "not allowed with a peer credential (this endpoint takes the hub's \
+                     token)",
                 );
             }
             let watch = watch.for_peer(&app.peers, peer_changes, peer.id.clone());

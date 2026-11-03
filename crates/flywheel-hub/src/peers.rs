@@ -240,10 +240,12 @@ fn info(entry: &PeerEntry) -> PeerInfo {
 }
 
 /// Whether a peer credential may not use `path` (`method` aside: the
-/// refused endpoints are refused whatever the method). A peer drives
-/// sessions and workspaces like the owner does, but never administers the
-/// hub (token, login codes, peers), never reaches further machines through
-/// it (machines, `/m/` proxy), and never imports files from this machine.
+/// refused endpoints are refused whatever the method). Defense in depth,
+/// not a boundary: a peer starts sessions running any command as this
+/// hub's user, so it can read the token file (and anything else that user
+/// can) through one. The refusals keep the credential itself off the
+/// token, login codes, peers, machines and the `/m/` proxy, and off the
+/// file import.
 pub fn peer_forbidden(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));

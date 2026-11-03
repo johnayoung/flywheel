@@ -74,6 +74,7 @@ struct AddArgs {
     /// URL, or pin; its name, and the layouts naming it, stay).
     #[arg(long)]
     replace: bool,
+    /// Print the registered machine as JSON.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -85,6 +86,7 @@ struct LsArgs {
     /// Show the last known state without probing.
     #[arg(long)]
     no_probe: bool,
+    /// Print JSON: the machines and their link state.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -93,7 +95,9 @@ struct LsArgs {
 
 #[derive(Debug, clap::Args)]
 struct RmArgs {
+    /// The machine's name (as `fw hub machine ls` lists it).
     name: String,
+    /// Print JSON: what was removed and revoked.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -102,7 +106,9 @@ struct RmArgs {
 
 #[derive(Debug, clap::Args)]
 struct TestArgs {
+    /// The machine to probe (default: every one).
     name: Option<String>,
+    /// Print JSON: each machine's probe result.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -421,6 +427,7 @@ struct IssueArgs {
 
 #[derive(Debug, clap::Args)]
 struct PeerLsArgs {
+    /// Print JSON: the peers (never their credentials).
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -476,7 +483,8 @@ fn issue(args: &IssueArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i
     let _ = writeln!(out, "{}", str_field(&issued, "credential"));
     let _ = writeln!(
         err,
-        "fw hub: peer {} ({}): shown once. On the other hub: \
+        "fw hub: peer {} ({}): shown once. It runs any command as this hub's user \
+         (treat it like the token). On the other hub: \
          printf %s '<credential>' | fw hub machine add <name> <this hub's URL>",
         str_field(&issued["peer"], "name"),
         str_field(&issued["peer"], "id"),

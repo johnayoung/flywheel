@@ -2,7 +2,7 @@
 
 `fw hub` is a web workspace for AI coding agents. The hub server owns every terminal: each session is a real PTY (shell, prompts, running processes, scrollback) that browsers attach to and detach from without disturbing it. Many clients can watch one session. Crate: `crates/flywheel-hub`.
 
-**Security first:** a hub serves shells over HTTP -- anyone with the token has a shell as you. It binds `127.0.0.1` by default; for remote access put it behind `tailscale serve` rather than `--bind 0.0.0.0`.
+**Security first:** a hub serves shells over HTTP -- anyone with the token, a peer credential for it, or a shell in one of its sessions has a shell as you. An agent session runs as you and can read the state dir: the token, and `machines.json`'s peer credentials for every registered machine (so a hijacked agent reaches them too). It binds `127.0.0.1` by default; for remote access put it behind `tailscale serve` rather than `--bind 0.0.0.0`.
 
 ## Verbs
 
@@ -26,7 +26,7 @@ fw hub machine add NAME URL [--mint [--peer-name N]] [--fingerprint SHA256] [--r
 fw hub machine ls [--no-probe] | rm NAME | test [NAME]     # [--json]
 fw hub peer issue --name X | ls | revoke NAME|ID           # credentials other hubs hold to reach this one
 # every verb but report (hooks only) takes --state-dir DIR
-# ls/new/send/read/wait/attach/kill/relaunch/commands/search/template/review/merge/open/url also take [--url URL] [--token T]: a hub elsewhere
+# ls/new/send/read/wait/attach/kill/relaunch/commands/search/template/explain/review/merge/open/url also take [--url URL] [--token T]: a hub elsewhere
 #   and (all but url) [--machine NAME]: a machine registered on that hub, through its proxy (`fw hub ls --machine desktop`)
 #   (token: prefer FW_HUB_TOKEN; without one, the state dir's token goes only to that state dir's running hub)
 ```
@@ -153,7 +153,7 @@ FW_HUB_MACHINE_SECRET=$(ssh desktop fw hub token) fw hub machine add desktop URL
 fw hub ls --machine desktop; fw hub attach --machine desktop SESSION
 ```
 
-- **Peer credential** (`fwpeer_<id>_<secret>`, 256 bits; digests in B's `peers.json`, 0600): API and WebSockets only -- never a browser login. Allowed: what drives sessions, search and transcripts, templates, and usage included. Refused (403): `/api/token/rotate`, `/api/login-codes`, `/api/peers*`, `/api/machines*`, `/api/workspaces/import`, `/api/code-workspaces`, `/m/*`, and every non-`/api` page. Survives B's token rotation; `fw hub peer revoke` ends its requests at once and closes its sockets (4003). `peer issue/ls/revoke` go through B's running hub, else edit the file (a running hub re-reads it on change).
+- **Peer credential** (`fwpeer_<id>_<secret>`, 256 bits; digests in B's `peers.json`, 0600): API and WebSockets only -- never a browser login. **Equivalent to B's token**: it starts sessions running any command as B's user, so it can read B's token file. Allowed: what drives sessions, search and transcripts, templates, and usage included. Refused (403, defense in depth, not a boundary): `/api/token/rotate`, `/api/login-codes`, `/api/peers*`, `/api/machines*`, `/api/workspaces/import`, `/api/code-workspaces`, `/m/*`, and every non-`/api` page. Survives B's token rotation; `fw hub peer revoke` ends its requests at once and closes its sockets (4003). `peer issue/ls/revoke` go through B's running hub, else edit the file (a running hub re-reads it on change).
 - **A's side**: `machines.json` (0600) holds name, URL, peer credential, optional pin. `add` checks the credential with `GET /api/whoami` there and refuses a hub token, this hub itself, and a hub already registered (same URL, hub id, or peer; a credential it minted for a refused add is revoked). `add --replace` (UI: Re-pair) swaps a machine's credential, URL, or pin keeping its name, and revokes the old credential. `rm` asks B to revoke the credential (`DELETE /api/peer`; else it says how). Names: `[a-z0-9-]`, 1-32, not `local`.
 - **Proxy**: only `/api/...` on a registered machine's base URL (SSRF guard; redirects, cookies refused/stripped). Request bodies up to 8 MiB, answers up to 32 MiB, 120 s per call; answers are served as JSON, plain text, or opaque bytes only, with `Content-Disposition: attachment` and CSP `sandbox` (a machine's answer never runs as this hub's page). A machine's 401 becomes 502 `{"error","machine","machine_state":"refused"}` (never signs the browser out); unreachable is 502 `offline`. After a refusal A answers for 90 s without asking (B's failure limit counts A's address). WebSockets relay frame by frame with backpressure; B's 4001-4003 reach the browser as 4010, a removed machine closes with 4011, a lost link 1011.
 - **TLS**: https machines are verified against the system roots, or by `--fingerprint` (SHA-256 of the leaf certificate, `openssl x509 -noout -fingerprint -sha256`; names and expiry not checked, like an SSH host key). An untrusted certificate's refusal names the fingerprint it saw.

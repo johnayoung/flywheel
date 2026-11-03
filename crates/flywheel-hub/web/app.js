@@ -122,6 +122,7 @@
     focusId: null, // the focused pane's id (desktop)
     solo: null, // the phone's one pane
     stageKey: "", // shape of the tree on the stage
+    stageView: null, // the workspace the desktop stage was last built for
     currentWorkspace: store.get("workspace", null), // last workspace touched
     collapsed: new Set(store.get("collapsed", [])),
     repoChoice: store.get("repo-choice", {}), // workspace id -> repo
@@ -325,7 +326,17 @@
     refresh: () => refresh(),
     termSize: () => sizeHint(),
     focusTerminal: () => focusTerminal(),
+    onOpen: () => closeOverlays("commands"),
   });
+
+  // One overlay over the terminal at a time: opening a drawer closes the
+  // others and the "why?" popover (which would cover the drawer's top).
+  function closeOverlays(keep) {
+    if (keep !== "commands" && commands.isOpen()) commands.toggle();
+    if (keep !== "flywheel") flywheel.close();
+    if (keep !== "review") review.close();
+    explain.close();
+  }
 
   // The Flywheel panel (flywheel.js): verified-loop state for the
   // flywheel-adopted folders.
@@ -337,10 +348,7 @@
     confirmDialog: (options) => confirmDialog(options),
     refresh: () => refresh(),
     rerender: () => render(),
-    onOpen: () => {
-      if (commands.isOpen()) commands.toggle();
-      review.close();
-    },
+    onOpen: () => closeOverlays("flywheel"),
     focusTerminal: () => focusTerminal(),
   });
 
@@ -407,11 +415,7 @@
     closeSession: (id) => closeSession(id),
     refresh: () => refresh(),
     focusTerminal: () => focusTerminal(),
-    onOpen: () => {
-      if (commands.isOpen()) commands.toggle();
-      flywheel.close();
-      explain.close();
-    },
+    onOpen: () => closeOverlays("review"),
   });
   // The "why?" beside the status pill (explain.js).
   const explain = window.FwHubExplain({ $, el, api });
@@ -427,6 +431,7 @@
     },
     livePanes: () => livePanes(),
     focusTerminal: () => focusTerminal(),
+    onOpen: () => explain.close(),
   });
 
   // `force` re-renders even when nothing changed. The periodic refresh
@@ -1050,7 +1055,9 @@
   // only), focusing `paneId` when given.
   function selectTab(tabId, paneId) {
     const view = viewOf(state.view);
-    const switching = (activeTab() || {}).id !== tabId;
+    // The stage may still hold another workspace's panes (openSession
+    // moves `state.view` first): its tab id says nothing about this one.
+    const switching = (activeTab() || {}).id !== tabId || state.stageView !== state.view;
     view.tab = tabId;
     if (paneId) view.focus[tabId] = paneId;
     saveViews();
@@ -1072,6 +1079,7 @@
         state.panes.delete(id);
       }
       state.stageKey = "";
+      state.stageView = null;
       if (state.solo && state.solo.el.parentNode !== host) host.replaceChildren(state.solo.el);
       if (!state.solo) host.replaceChildren();
       renderTabs();
@@ -1113,7 +1121,8 @@
     const tree = !tab ? null : zoom ? { type: "pane", id: zoom } : tab.root;
     // Rebuild only when the shape changed (a moved xterm loses focus);
     // a ratio alone is restyled in place.
-    const key = JSON.stringify([tab && tab.id, shape(tree)]);
+    const key = JSON.stringify([state.view, tab && tab.id, shape(tree)]);
+    state.stageView = state.view;
     if (key !== state.stageKey) {
       state.stageKey = key;
       const park = $("#pane-park");
@@ -1791,11 +1800,14 @@
           seen.add(session.id);
           const st = status(session);
           const on = leaf.session === state.solo.sessionId;
+          // The agent whose companion shell is on screen.
+          const shown = sessionById(state.solo.sessionId);
+          const parentOf = !on && shown && shown.companion_of === session.id;
           chips.push(el(
             "button",
             {
               type: "button",
-              className: `pane-chip${on ? " active" : ""}`,
+              className: `pane-chip${on ? " active" : ""}${parentOf ? " parent" : ""}`,
               "aria-pressed": String(on),
               title: multiTab ? `${session.name} (tab ${t.name})` : session.name,
               onclick: () => {
@@ -1995,6 +2007,8 @@
     const pill = $("#link");
     pill.dataset.link = kind;
     pill.textContent = text || kind;
+    // A narrow header shows the pill as its dot: the word stays its tooltip.
+    pill.title = `connection: ${text || kind}`;
   }
 
   // Hub-wide messages (an error not about one pane).
@@ -2013,6 +2027,7 @@
     state.focusId = null;
     state.view = null;
     state.stageKey = "";
+    state.stageView = null;
     $("#terminal").replaceChildren();
     state.attachedMeta = null;
     history.replaceState(null, "", window.location.pathname);
@@ -2818,8 +2833,15 @@
     const running = agent ? state.sessions.find((s) => s.companion_of === session.id && s.state === "running") : null;
     button.querySelector("use").setAttribute("href", parent ? `#i-${parent.kind}` : "#i-shell");
     $("#flip-label").textContent = parent ? "agent" : "shell";
+    // On the companion shell: the agent's status rides on the way back
+    // (it can turn blocked while you are in its shell).
+    const agentState = parent ? status(parent) : null;
+    let dot = button.querySelector(".flip-dot");
+    if (agentState && !dot) dot = button.appendChild(el("span", { className: "flip-dot", "aria-hidden": "true" }));
+    if (dot && !agentState) dot.remove();
+    if (dot && agentState) dot.className = `flip-dot dot ${agentState.dot}`;
     button.title = parent
-      ? `Back to agent ${parent.name} (${MOD} \`)`
+      ? `Back to agent ${parent.name}${agentState && agentState.label ? `, ${agentState.label}` : ""} (${MOD} \`)`
       : running
         ? `Companion shell ${running.name} (${MOD} \`)`
         : `Open a companion shell in ${session.name}'s directory (${MOD} \`)`;
@@ -2911,12 +2933,20 @@
       );
     } else if (!session) {
       const hasWorkspace = state.workspaces.length > 0;
+      // Sessions running but none on screen (a phone's start screen, a
+      // fresh browser): say so, not "nothing".
+      const running = state.sessions.filter((s) => s.live).length;
+      const narrow = window.matchMedia(NARROW).matches;
       $("#empty-title").textContent = state.noticeTitle ||
-        (hasWorkspace ? "Nothing on the wheel." : "Set up a workspace.");
+        (!hasWorkspace ? "Set up a workspace." : running ? `${running} session${running === 1 ? "" : "s"} running.` : "Nothing on the wheel.");
       $("#empty-body").textContent = state.notice || (hasWorkspace
-        ? (window.matchMedia(NARROW).matches
-          ? "Open the menu for every session, or launch a shell, Claude Code, or Codex in one of your folders."
-          : "Pick a session from the left, or launch a shell, Claude Code, or Codex in one of your folders.")
+        ? (running
+          ? (narrow
+            ? "Open the menu to pick one, or launch a new shell, Claude Code, or Codex session."
+            : "Pick one from the left, or launch a new shell, Claude Code, or Codex session.")
+          : narrow
+            ? "Open the menu for every session, or launch a shell, Claude Code, or Codex in one of your folders."
+            : "Pick a session from the left, or launch a shell, Claude Code, or Codex in one of your folders.")
         : "Group the folders you work on together (or import a VS Code workspace), then launch shells and agents inside them. Every terminal lives on the hub: close the tab, come back from your phone, it is still there.");
       actions.replaceChildren(
         ...[hasWorkspace
@@ -2967,8 +2997,18 @@
       // A click on the backdrop lands on the dialog element itself.
       if (event.target === dialog) dialog.close("cancel");
     });
-    dialog.addEventListener("close", () => focusTerminal());
+    dialog.addEventListener("close", () => returnFocus());
   });
+
+  // Where keys go once a dialog closes: back into the drawer it was opened
+  // from while that drawer stays open (keys typed into the terminal behind
+  // it would go unseen, and Esc must close the drawer), else the terminal.
+  function returnFocus() {
+    if (document.querySelector("dialog[open]")) return;
+    const drawer = review.isOpen() ? $("#review") : flywheel.isOpen() ? $("#flywheel") : commands.isOpen() ? $("#commands") : null;
+    if (drawer) drawer.focus({ preventScroll: true });
+    else focusTerminal();
+  }
 
   // --- dialogs: workspace ----------------------------------------------
 
@@ -3364,11 +3404,24 @@
     updateSessionPlaceholder();
   }
 
+  // The name the hub gives a session started without one (hub.rs
+  // default_session_name): its program's file name and the first free
+  // number from the workspace's session count + 1.
+  function defaultSessionName(workspaceId, kind) {
+    const workspace = workspaceById(workspaceId);
+    const kinds = (state.kindsBy && state.kindsBy[(workspace && workspace.machine) || ""]) || state.kinds || [];
+    const found = kinds.find((k) => k.kind === kind);
+    const program = found && found.program ? basename(found.program) : kind;
+    const sessions = state.sessions;
+    let n = sessions.filter((s) => s.workspace_id === workspaceId).length + 1;
+    while (sessions.some((s) => s.name === `${program} ${n}`)) n++;
+    return `${program} ${n}`;
+  }
+
   function updateSessionPlaceholder() {
     const kind = selectedKind();
     const workspaceId = $("#session-workspace").value;
-    const count = state.sessions.filter((s) => s.workspace_id === workspaceId).length;
-    $("#session-name").placeholder = worktrees.taskName() || `${kind} ${count + 1}`;
+    $("#session-name").placeholder = worktrees.taskName() || defaultSessionName(workspaceId, kind);
   }
 
   // `place`: preset "Show in" ("pane", "right", "down", "tab").
@@ -3682,6 +3735,7 @@
   // `query`: a filter to start from. `items`: a list of its own (the
   // quick-launch list) instead of every command, with `placeholder`.
   function openPalette(query, items, placeholder) {
+    explain.close();
     palette.items = items || paletteCommands();
     palette.index = 0;
     $("#palette-input").placeholder = placeholder || "Jump to a session or run a command";

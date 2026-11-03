@@ -140,16 +140,18 @@ fn placeholder() -> Node {
 
 impl Layout {
     /// Close every pane showing `session_id`: its sibling takes the
-    /// split's place, and a tab left without panes keeps one, empty.
-    /// Returns whether the layout changed (the caller bumps `rev`).
+    /// split's place, and a tab left without panes closes -- as closing
+    /// its last pane does in the UI -- unless it is the workspace's only
+    /// tab, which stays as one empty pane. Returns whether the layout
+    /// changed (the caller bumps `rev`).
     pub fn prune_session(&mut self, session_id: &str) -> bool {
         let mut changed = false;
-        for tab in &mut self.tabs {
+        let mut emptied = Vec::new();
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
             match tab.root.prune(session_id) {
                 Pruned::Unchanged => {}
                 Pruned::Changed => changed = true,
                 Pruned::Closed => {
-                    // The tab stays, as one empty pane.
                     let id = tab
                         .root
                         .panes()
@@ -157,9 +159,15 @@ impl Layout {
                         .map(|(id, _)| (*id).to_owned())
                         .unwrap_or_default();
                     tab.root = Node::Pane { id, session: None };
+                    emptied.push(index);
                     changed = true;
                 }
             }
+        }
+        // Emptied tabs go, the first one staying when nothing else would.
+        let keep_one = emptied.len() == self.tabs.len();
+        for index in emptied.into_iter().skip(usize::from(keep_one)).rev() {
+            self.tabs.remove(index);
         }
         changed
     }
@@ -417,8 +425,24 @@ mod tests {
             layout.tabs[0].root.panes(),
             vec![("p1", Some("s1")), ("p3", None)]
         );
-        assert_eq!(layout.tabs[1].root, pane("p4", None));
+        // t2 showed only s2: it closes, like its last pane closed in the UI.
+        assert_eq!(layout.tabs.len(), 1);
         assert!(layout.prune_session("s1"));
         assert_eq!(layout.tabs[0].root, pane("p3", None));
+    }
+
+    #[test]
+    fn pruning_the_only_tabs_session_keeps_one_empty_tab() {
+        let mut layout = Layout {
+            rev: 1,
+            tabs: vec![
+                tab("t1", "a", pane("p1", Some("s1"))),
+                tab("t2", "b", pane("p2", Some("s1"))),
+            ],
+        };
+        assert!(layout.prune_session("s1"));
+        assert_eq!(layout.tabs.len(), 1);
+        assert_eq!(layout.tabs[0].id, "t1");
+        assert_eq!(layout.tabs[0].root, pane("p1", None));
     }
 }

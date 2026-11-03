@@ -395,7 +395,7 @@ window.FwHubCommands = function (ctx) {
       ));
   }
 
-  function renderItem(command, source, target) {
+  function renderItem(command, source, target, position) {
     const lang = command.lang || (command.shell ? "shell" : "text");
     const lines = command.text.split("\n").length;
     return el(
@@ -416,7 +416,9 @@ window.FwHubCommands = function (ctx) {
             ? el("span", { className: "cmd-note", textContent: "commands only", title: "Copy and Send take the commands without $ prompts, and leave the output lines out" })
             : el("span", { className: "cmd-note", textContent: "prompts stripped", title: "Copy and Send leave out the $ prompts" })
           : null,
-        el("span", { className: "cmd-seq", textContent: `#${command.seq}` }),
+        // Its place in the list (the 1-9 key that copies it); the block's
+        // id in the transcript is the tooltip.
+        el("span", { className: "cmd-seq", textContent: position <= 9 ? `${position}` : "", title: `block #${command.seq}${position <= 9 ? `: key ${position} copies it` : ""}` }),
       ),
       el("pre", { className: "cmd-code", tabIndex: -1 }, el("code", { textContent: command.text })),
       el(
@@ -515,7 +517,7 @@ window.FwHubCommands = function (ctx) {
     list.replaceChildren(
       ...(empty
         ? [el("li", { className: "cmd-empty", textContent: empty })]
-        : items.map((c) => renderItem(c, source, target))),
+        : items.map((c, i) => renderItem(c, source, target, i + 1))),
     );
     markOverflow();
     if (reveal) {
@@ -590,6 +592,7 @@ window.FwHubCommands = function (ctx) {
 
   function setOpen(open) {
     const wasOpen = ui.open;
+    if (open && !wasOpen && ctx.onOpen) ctx.onOpen();
     ui.open = open;
     if (open) {
       // Keys go to the drawer at once (not the terminal behind it), and

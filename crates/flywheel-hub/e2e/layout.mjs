@@ -94,6 +94,15 @@ try {
     ],
   });
 
+  // A second workspace with one shell, laid out on its own: jumping to it
+  // and back must show its pane, never an empty one (the stage once kept
+  // the other workspace's panes and skipped the rebuild).
+  const repo2 = path.join(tmp, "repo2");
+  fs.mkdirSync(path.join(repo2, ".git"), { recursive: true });
+  const ws2 = await api("POST", "/api/workspaces", { name: "e2e-two", folders: [repo2] });
+  const other = await api("POST", "/api/sessions", { workspace_id: ws2.id, kind: "shell", cols: 100, rows: 30 });
+  await api("PUT", `/api/workspaces/${ws2.id}/layout`, { rev: 0, tabs: [{ id: "w1", name: "main", root: pane("q1", other.id) }] });
+
   browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: process.env.CHROMIUM } : {});
 
   // --- desktop 1440x900 ---------------------------------------------------
@@ -164,6 +173,28 @@ try {
   check(parkedOnStage === 2, `desktop: zoom parks the other 2 panes (${parkedOnStage})`);
   await page.keyboard.press("Alt+z");
   await page.waitForFunction(() => document.querySelectorAll("#terminal .pane").length === 3);
+
+  // Jumps between the two workspaces (Alt 1-9 and the sidebar).
+  const header = () => page.evaluate(() => ({
+    crumb: document.querySelector("#crumb-session").textContent,
+    ws: document.querySelector("#crumb-workspace").textContent,
+    panes: document.querySelectorAll("#terminal .pane .xterm").length,
+  }));
+  const jumps = [];
+  for (const key of ["Alt+4", "Alt+1", "Alt+4", "Alt+2", "Alt+4", "Alt+1"]) {
+    await page.keyboard.press(key);
+    await page.waitForTimeout(600);
+    const h = await header();
+    const want = key === "Alt+4" ? h.ws === "e2e-two" && h.panes === 1 : h.ws === "e2e" && h.panes === 3;
+    if (!want || /Empty pane/.test(h.crumb)) jumps.push(`${key}: ${JSON.stringify(h)}`);
+  }
+  await page.locator(".session", { hasText: "sh 1" }).last().click();
+  await page.waitForTimeout(600);
+  const clicked = await header();
+  if (clicked.ws !== "e2e-two" || clicked.panes !== 1) jumps.push(`sidebar: ${JSON.stringify(clicked)}`);
+  check(jumps.length === 0, `desktop: jumping between workspaces shows their panes (${jumps.join("; ")})`);
+  await page.keyboard.press("Alt+1");
+  await page.waitForFunction(() => document.querySelectorAll("#terminal .pane .xterm").length === 3, null, { timeout: 5000 });
 
   // Reload restores the same layout.
   await page.reload();
@@ -278,6 +309,13 @@ try {
       const x = r.left + r.width / 2;
       const y = r.top + r.height / 2;
       if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) continue;
+      // A key scrolled out of its row's view (the row scrolls sideways) is
+      // not covered, just not on screen yet.
+      const row = node.closest(".kb-keys");
+      if (row) {
+        const box = row.getBoundingClientRect();
+        if (x < box.left || x > box.right) continue;
+      }
       const hit = document.elementFromPoint(x, y);
       // A key scrolled under the bar's pinned keys (kbd, compose) is fine.
       const ok = hit && (node.contains(hit) || (node.matches(".kb-key") && hit.closest(".kb-key") && !hit.closest(".dot")));
@@ -293,6 +331,40 @@ try {
     .map((n) => [n.className.split(" ")[0] || n.id, Math.round(n.getBoundingClientRect().height)])
     .filter(([, h]) => h < 44));
   check(undersized.length === 0, `phone: tap targets at least 44px tall (${JSON.stringify(undersized)})`);
+  // Icon-only and second-row controls are 44px wide too (the first key row
+  // shares the width so every key stays in view).
+  const narrowTargets = await mp.evaluate(() => [
+    ...document.querySelectorAll(".menu-toggle, #cmd-toggle, #flip-toggle, #rv-toggle, #keybar .kb-second .kb-key, .qa, .qa-esc"),
+  ].filter((n) => n.offsetParent !== null)
+    .map((n) => [n.id || n.className.split(" ")[0], Math.round(n.getBoundingClientRect().width), Math.round(n.getBoundingClientRect().height)])
+    .filter(([, w, h]) => w < 44 || h < 44));
+  check(narrowTargets.length === 0, `phone: icon and second-row targets at least 44x44 (${JSON.stringify(narrowTargets)})`);
+  // The header with a usage meter and a status pill (as an agent with
+  // spend shows): the name, pill and why? keep their room, nothing is
+  // covered or pushed off the screen.
+  await mp.evaluate(() => {
+    const set = (sel, text) => { const n = document.querySelector(sel); n.hidden = false; if (text) n.textContent = text; };
+    set("#meter-usage", "65.0k tok · $0.51 · sonnet-5-5");
+    set("#crumb-status", "blocked");
+    document.querySelector("#crumb-status").className = "agent-pill blocked";
+    set("#crumb-why");
+  });
+  await mp.waitForTimeout(300);
+  const headerHits = await mp.evaluate(() => {
+    const bad = [];
+    for (const sel of ["#crumb-session", "#crumb-status", "#crumb-why", ".menu-toggle", "#cmd-toggle"]) {
+      const node = document.querySelector(sel);
+      if (!node || node.offsetParent === null) continue;
+      const r = node.getBoundingClientRect();
+      for (const x of [r.left + 2, r.left + r.width / 2, r.right - 2]) {
+        const hit = document.elementFromPoint(x, r.top + r.height / 2);
+        if (!hit || !(node === hit || node.contains(hit))) bad.push(`${sel} @${Math.round(x)} under ${hit ? hit.id || hit.className : "nothing"}`);
+      }
+      if (r.right > innerWidth + 1) bad.push(`${sel} off screen`);
+    }
+    return bad;
+  });
+  check(headerHits.length === 0, `phone: header with usage keeps name, status and why? whole (${headerHits.join(", ")})`);
   await mp.screenshot({ path: path.join(out, "phone-solo.png") });
   // The menu opens the sidebar.
   await mp.locator(".menu-toggle").tap();

@@ -138,6 +138,7 @@ window.FwHubSearch = function (ctx) {
   }
 
   function open(prefill) {
+    if (ctx.onOpen) ctx.onOpen();
     ui.open = true;
     root.hidden = false;
     document.body.classList.remove("side-open");

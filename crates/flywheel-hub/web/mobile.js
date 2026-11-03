@@ -917,7 +917,21 @@ window.FwHubMobile = function (ctx) {
   function updateBar() {
     const empty = $("#keybar").hidden && $("#compose").hidden && $("#quick").hidden;
     $("#mobilebar").hidden = empty;
+    placeToasts();
   }
+
+  // Toasts rise from just above the bar (quick answers, compose, keys), not
+  // over it: a blocked agent's answers stay tappable while one shows.
+  function placeToasts() {
+    const bar = $("#mobilebar");
+    const top = bar.hidden ? 0 : bar.getBoundingClientRect().top;
+    const viewport = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+    const above = top > 0 ? Math.max(0, Math.round(viewport - top)) : 0;
+    document.documentElement.style.setProperty("--bar-above", `${above}px`);
+  }
+  if (window.ResizeObserver) new ResizeObserver(placeToasts).observe($("#mobilebar"));
+  if (window.visualViewport) window.visualViewport.addEventListener("resize", placeToasts);
+  window.addEventListener("resize", placeToasts);
 
   function render() {
     const session = sessionById(state.attached);

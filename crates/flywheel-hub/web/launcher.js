@@ -220,6 +220,9 @@ window.FwHubLauncher = function (ctx) {
     const agent = kind === "claude" || kind === "codex";
     box.hidden = !agent;
     box.dataset.kind = kind;
+    // A template starts an agent: a shell has nothing to save.
+    $("#tpl-save-toggle").hidden = !agent;
+    if (!agent) tplSave.hidden = true;
     models.replaceChildren(...(MODELS[kind] || []).map((m) => el("option", { value: m })));
     modelInput.placeholder = kind === "codex" ? "default: gpt-5-codex..." : "default: opus, sonnet...";
     updateWarning();

@@ -1119,11 +1119,11 @@ impl Hub {
             state: ItemState::Pending,
         };
         let added = new.clone();
+        let label = record.label();
         self.store().update_queue(id, move |queue| {
             if queue.pending_count() >= MAX_PENDING {
                 return Err(StateError::Conflict(format!(
-                    "{} has {MAX_PENDING} prompts queued already: remove some first",
-                    record.label()
+                    "{label} has {MAX_PENDING} prompts queued already: remove some first"
                 )));
             }
             queue.items.push(new);
@@ -1135,6 +1135,15 @@ impl Hub {
             added.when.as_str(),
             added.text.len()
         );
+        // An agent that is not there (exited, or back as a plain shell
+        // after a restart) stalls the queue now, so the answer says why
+        // nothing will be sent, rather than on the next tick.
+        let (stalled, head) = self.store().queue(id).map_or((false, None), |q| {
+            (q.stalled.is_some(), q.head().map(|i| i.id.clone()))
+        });
+        if !stalled && let Presence::Gone(why) = self.presence(&record) {
+            self.stall_queue(id, &why, head.as_deref());
+        }
         self.queue_changed();
         Ok((added, self.queue_view(id)?))
     }

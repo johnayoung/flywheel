@@ -826,6 +826,21 @@ async fn pause_resume_holds_and_stalls_that_surface() {
             .contains("exited"),
         "{row}"
     );
+    // Resumed while the agent is still gone, a prompt added says so at
+    // once: the answer carries the stall, not a pending item that never
+    // goes.
+    hub.post(
+        &format!("/api/sessions/{}/queue/resume", agent.id),
+        json!({}),
+    )
+    .await;
+    let added = hub.add(&agent.id, "and this one", None).await;
+    assert!(
+        added["queue"]["stalled"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("exited")),
+        "{added}"
+    );
 
     // Relaunched, it goes once the new agent is at rest.
     let previous = agent.env(None).await[report::SECRET_ENV].clone();
@@ -837,6 +852,9 @@ async fn pause_resume_holds_and_stalls_that_surface() {
     agent.stays(&want).await;
     agent.fire("SessionStart", None).await;
     want.extend(pasted("never typed into a dead agent"));
+    agent.typed_becomes(&want).await;
+    agent.turn().await;
+    want.extend(pasted("and this one"));
     agent.typed_becomes(&want).await;
 }
 

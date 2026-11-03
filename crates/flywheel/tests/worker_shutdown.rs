@@ -589,3 +589,107 @@ fn sigkilled_pool_member_leaves_no_orphaned_agent() {
     every_member.extend(respawned);
     fx.assert_clean_shutdown(&every_member);
 }
+
+impl Fixture {
+    /// Put a `git` on the worker's PATH whose first run (the worker's repo
+    /// lookup, before any handler of its own is armed) blocks reading
+    /// `gate.fifo`; [`GitGate::reached`] returns once that run is parked
+    /// there, [`GitGate::open`] lets it go on to the real git.
+    fn install_git_gate(&self) -> GitGate {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let real = std::env::split_paths(&path)
+            .map(|dir| dir.join("git"))
+            .find(|git| git.is_file())
+            .expect("git on PATH");
+        let fifo = self.root.join("gate.fifo");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo(3) on a NUL-terminated path this test owns.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        write_script(
+            &self.root.join("bin").join("git"),
+            &format!(
+                "#!/bin/sh\n\
+                 if mkdir '{taken}' 2>/dev/null; then read _ < '{fifo}'; fi\n\
+                 exec '{real}' \"$@\"\n",
+                taken = self.root.join("gate.taken").display(),
+                fifo = fifo.display(),
+                real = real.display(),
+            ),
+        );
+        GitGate { fifo, writer: None }
+    }
+}
+
+struct GitGate {
+    fifo: PathBuf,
+    writer: Option<std::fs::File>,
+}
+
+impl GitGate {
+    /// Block until the gated git has opened the fifo (opening a fifo for
+    /// writing waits for its reader).
+    fn reached(&mut self) {
+        let fifo = self.fifo.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(std::fs::OpenOptions::new().write(true).open(fifo));
+        });
+        let writer = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the worker never ran git")
+            .unwrap();
+        self.writer = Some(writer);
+    }
+
+    fn open(&mut self) {
+        let mut writer = self.writer.take().expect("reached first");
+        writer.write_all(b"go\n").unwrap();
+    }
+}
+
+/// A stop signal while the worker is still starting -- here parked in its
+/// first `git` run, before the policy loads or any store opens -- is an
+/// orderly stop once it is up, not the default action: exit 0, nothing
+/// claimed, no agent started.
+#[test]
+fn a_signal_during_startup_is_an_orderly_stop() {
+    for (concurrency, said) in [
+        (1, "Shutdown requested (signal 15 during startup)"),
+        (
+            2,
+            "pool shutdown requested (signal 15) before any member started",
+        ),
+    ] {
+        let mut fx = Fixture::new();
+        let mut gate = fx.install_git_gate();
+        let mut worker = fx.spawn_worker(concurrency);
+        gate.reached();
+        signal(worker.id() as i32, libc::SIGTERM);
+        gate.open();
+        let status = wait_exit(&mut worker, SHUTDOWN_DEADLINE);
+        let log = fx.worker_log();
+        let status = status.unwrap_or_else(|| panic!("the worker never exited\n{log}"));
+        assert_eq!(status.code(), Some(0), "{status:?}\n{log}");
+        assert!(log.contains(said), "{log}");
+        assert_eq!(fx.agents(), Vec::<i32>::new(), "{log}");
+        // The store may not even hold its tables yet: none is no claim.
+        let has = |table: &str| {
+            fx.repo.join(".flywheel/flywheel.sqlite").exists()
+                && fx
+                    .db()
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                        [table],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                    == 1
+        };
+        if has("task_claims") {
+            assert_eq!(fx.claims(), Vec::new(), "{log}");
+        }
+        if has("lifecycles") {
+            assert_eq!(fx.lifecycle_statuses(), Vec::new(), "{log}");
+        }
+    }
+}

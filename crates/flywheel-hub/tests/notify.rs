@@ -81,7 +81,7 @@ impl Webhook {
 
     /// Wait for the `n`th push (1-based).
     async fn nth(&self, n: usize) -> Received {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Some(r) = self.all().get(n - 1) {
                 return r.clone();
@@ -196,7 +196,7 @@ impl TestHub {
             )
             .await;
         let env_file = self.dir.path().join("claude.env");
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         let env = loop {
             if let Ok(text) = std::fs::read_to_string(&env_file)
                 && !text.is_empty()

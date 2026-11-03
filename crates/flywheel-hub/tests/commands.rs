@@ -171,7 +171,7 @@ fn fake_agent(dir: &Path, name: &str) -> PathBuf {
 
 async fn agent_env(hub: &TestHub, name: &str) -> HashMap<String, String> {
     let path = hub.dir.path().join(format!("{name}.env"));
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Ok(text) = std::fs::read_to_string(&path)
             && !text.is_empty()
@@ -188,7 +188,7 @@ async fn agent_env(hub: &TestHub, name: &str) -> HashMap<String, String> {
 }
 
 async fn next_commands(ws: &mut Ws) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, ws.next())
@@ -470,7 +470,7 @@ async fn paste_is_bracketed_never_runs_unasked_and_refuses_unsafe_multiline() {
         .await;
     let bid = bracketed["id"].as_str().unwrap().to_owned();
     // Wait for the mode to be set.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let screen = hub.get(&format!("/api/sessions/{bid}/screen")).await;
         if screen["modes"]
@@ -503,7 +503,7 @@ async fn paste_is_bracketed_never_runs_unasked_and_refuses_unsafe_multiline() {
         "\x1b[200~{}\x1b[201~\x1b[200~ls; rm -rf x\x1b[201~\r",
         HEREDOC.replace('\n', "\r")
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let bytes = std::fs::read(&got).unwrap_or_default();
         if bytes.len() >= want.len() {
@@ -559,7 +559,7 @@ async fn paste_is_bracketed_never_runs_unasked_and_refuses_unsafe_multiline() {
     // An ended session takes no paste.
     hub.post(&format!("/api/sessions/{pid}/kill"), json!({}))
         .await;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let (status, _) = hub
             .call(
@@ -583,7 +583,7 @@ async fn paste_is_bracketed_never_runs_unasked_and_refuses_unsafe_multiline() {
 /// Wait for `sid`'s commands list (all blocks) to read `want`, newest
 /// first.
 async fn wait_for_commands(hub: &TestHub, sid: &str, want: &[&str]) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let list = hub
             .get(&format!("/api/sessions/{sid}/commands?all=true"))

@@ -1200,14 +1200,31 @@ impl Docker {
         active: &BTreeSet<String>,
         timeout: Option<Duration>,
     ) -> Result<Vec<String>, DockerError> {
-        let local_host = local_hostname();
-        let local_namespace = local_pid_namespace().unwrap_or_default();
+        self.reap_orphan_containers_in(
+            active,
+            timeout,
+            &local_hostname(),
+            &local_pid_namespace().unwrap_or_default(),
+        )
+    }
+
+    /// [`Docker::reap_orphan_containers`] judging ownership as host
+    /// `local_host`, pid namespace `local_namespace` (liveness is still read
+    /// from this host's processes). Containers labelled with any other host
+    /// or namespace are foreign and left alone.
+    fn reap_orphan_containers_in(
+        &self,
+        active: &BTreeSet<String>,
+        timeout: Option<Duration>,
+        local_host: &str,
+        local_namespace: &str,
+    ) -> Result<Vec<String>, DockerError> {
         let mut reaped = Vec::new();
         for container in self.list_owned_container_owners(timeout)? {
             if active.contains(&container.name)
                 || !container.owner_is_dead(
-                    &local_host,
-                    &local_namespace,
+                    local_host,
+                    local_namespace,
                     &pid_alive,
                     &process_start_time,
                 )
@@ -3029,6 +3046,12 @@ esac"#,
         let docker = Docker::new();
         let timeout = default_management_timeout();
         let host = local_hostname();
+        // This test's owners live in a pid namespace of its own: every
+        // other reaper on this daemon (a concurrent `fw worker` starting up,
+        // another test binary) judges them foreign and leaves them alone,
+        // and this test's reap judges every other container foreign. Their
+        // liveness is still read from this host's real processes.
+        let namespace = format!("flywheel-test-pidns:{}", unique_name("reap"));
         // A live foreign owner: another process on this host.
         let mut sibling = std::process::Command::new("sleep")
             .arg("60")
@@ -3039,12 +3062,14 @@ esac"#,
                 host: host.clone(),
                 pid,
                 start,
-                pid_namespace: local_pid_namespace(),
+                pid_namespace: Some(namespace.clone()),
             }
             .labels()
         };
         let live_foreign = unique_name("flywheel-test");
         let dead_owner = unique_name("flywheel-test");
+        let dead_but_active = unique_name("flywheel-test");
+        let live_self = unique_name("flywheel-test");
         let mine = unique_name("flywheel-test");
         let start = |name: &str, labels: BTreeMap<String, String>| {
             docker
@@ -3056,42 +3081,44 @@ esac"#,
                 )
                 .unwrap();
         };
+        let me = std::process::id();
         start(
             &live_foreign,
             owned_by(sibling.id(), process_start_time(sibling.id())),
         );
         start(&dead_owner, owned_by(dead_pid(), None));
+        start(&dead_but_active, owned_by(dead_pid(), None));
+        start(&live_self, owned_by(me, process_start_time(me)));
+        // Labelled by start_container itself: this process, its namespace.
         start(&mine, BTreeMap::new());
 
         let owners = docker.list_owned_container_owners(timeout).unwrap();
         let ours = |name: &str| owners.iter().find(|c| c.name == name).cloned().unwrap();
-        assert_eq!(ours(&mine).owner_pid, std::process::id().to_string());
+        assert_eq!(ours(&mine).owner_pid, me.to_string());
         assert_eq!(ours(&mine).owner_host, host);
         assert_eq!(ours(&live_foreign).owner_pid, sibling.id().to_string());
+        assert_eq!(ours(&dead_owner).owner_pid_namespace, namespace);
 
-        // Every other process's container stays out of this reap, whatever
-        // code started it, so a concurrent run on this daemon is untouched.
-        let test_names = [&live_foreign, &dead_owner, &mine];
-        let active: BTreeSet<String> = owners
-            .iter()
-            .map(|c| c.name.clone())
-            .filter(|n| !test_names.contains(&n))
-            .collect();
-        // A concurrent run's container whose owner died after the listing
-        // may legitimately be reaped too, so assert on this test's own three.
-        let reaped = docker.reap_orphan_containers(&active, timeout).unwrap();
+        let active = BTreeSet::from([dead_but_active.clone()]);
+        let reaped = docker
+            .reap_orphan_containers_in(&active, timeout, &host, &namespace)
+            .unwrap();
+        // The one provably dead, inactive owner in this namespace (a legacy
+        // container with no owner labels anywhere on the daemon is reaped
+        // too, by design).
         assert!(reaped.contains(&dead_owner), "{reaped:?}");
-        assert!(!reaped.contains(&live_foreign), "{reaped:?}");
-        assert!(!reaped.contains(&mine), "{reaped:?}");
         let remaining = docker.list_owned_containers(timeout).unwrap();
-        assert!(remaining.contains(&live_foreign));
-        assert!(remaining.contains(&mine));
+        for kept in [&live_foreign, &dead_but_active, &live_self, &mine] {
+            assert!(!reaped.contains(kept), "{kept}: {reaped:?}");
+            assert!(remaining.contains(kept), "{kept}: {remaining:?}");
+        }
         assert!(!remaining.contains(&dead_owner));
 
         let _ = sibling.kill();
         let _ = sibling.wait();
-        docker.remove_container(&live_foreign, timeout).unwrap();
-        docker.remove_container(&mine, timeout).unwrap();
+        for name in [&live_foreign, &dead_but_active, &live_self, &mine] {
+            docker.remove_container(name, timeout).unwrap();
+        }
         // remove_container on an already-gone container is a clean no-op.
         docker.remove_container(&dead_owner, timeout).unwrap();
     }

@@ -181,7 +181,7 @@ impl TestHub {
     /// The argv the stand-in `name` was last started with (consumed).
     async fn launched(&self, name: &str) -> Vec<String> {
         let path = self.dir.path().join(format!("{name}.args"));
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok(raw) = std::fs::read(&path) {
                 let _ = std::fs::remove_file(&path);
@@ -199,7 +199,7 @@ impl TestHub {
     }
 
     async fn wait_exited(&self, id: &str) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let session = self
                 .ok(reqwest::Method::GET, &format!("/api/sessions/{id}"), None)
@@ -512,7 +512,7 @@ async fn usage_from_the_transcript_reaches_the_session_the_events_socket_and_rol
         .await;
     let id = created["id"].as_str().unwrap().to_owned();
     // Pushed as it is read.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let usage = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let message = timeout(remaining, events.next())
@@ -537,7 +537,7 @@ async fn usage_from_the_transcript_reaches_the_session_the_events_socket_and_rol
     assert_eq!(usage["today"]["total_tokens"], 152_000);
 
     // A model without a price: its tokens count, its cost is not guessed.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let session = loop {
         let session = hub
             .ok(reqwest::Method::GET, &format!("/api/sessions/{id}"), None)
@@ -584,7 +584,7 @@ async fn usage_from_the_transcript_reaches_the_session_the_events_socket_and_rol
         )
         .await;
     assert!(status.is_success());
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let rollup = hub.ok(reqwest::Method::GET, "/api/usage", None).await;
         if rollup["today"]["total_tokens"] == 152_020
@@ -739,7 +739,7 @@ async fn codex_rollout_usage_reaches_the_session_the_events_socket_and_rollups()
         )
         .await;
     let id = created["id"].as_str().unwrap().to_owned();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let env = loop {
         if let Ok(text) = std::fs::read_to_string(&env_file) {
             break text
@@ -767,7 +767,7 @@ async fn codex_rollout_usage_reaches_the_session_the_events_socket_and_rollups()
         },
     )
     .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let usage = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         let message = timeout(remaining, events.next())

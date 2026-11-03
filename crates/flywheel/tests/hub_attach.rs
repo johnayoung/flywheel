@@ -665,24 +665,21 @@ fn wait_returns_when_the_agent_reports_done_and_times_out_with_124() {
     assert_eq!(code, Some(124), "{stderr}");
     assert!(stderr.contains("timed out"), "{stderr}");
 
-    // A wait started now returns once a turn finishes. Nothing says when
-    // the wait has read its starting state, and a turn that finished
-    // before then is (rightly) not a change to it, so turns repeat until
-    // one lands after: each is a fresh change.
-    let mut waiting = wait_cmd(
+    // A wait started now returns once a turn finishes -- even one that
+    // finishes before the wait has read the session: it is held stopped
+    // (SIGSTOP right after the spawn) across a whole turn, so the first
+    // status it reads is that turn's `done`.
+    let waiting = wait_cmd(
         &dir,
         &["agent", "--until", "done", "--changed", "--timeout", "60"],
     );
-    let deadline = Instant::now() + WAIT;
-    while waiting.try_wait().unwrap().is_none() {
-        assert!(Instant::now() < deadline, "the wait never returned");
-        run_hook(&settings, "UserPromptSubmit", &env, &payload);
-        run_hook(&settings, "Stop", &env, &payload);
-        let turn = Instant::now();
-        while turn.elapsed() < Duration::from_secs(1) && waiting.try_wait().unwrap().is_none() {
-            std::thread::sleep(Duration::from_millis(40));
-        }
-    }
+    let pid = libc::pid_t::try_from(waiting.id()).unwrap();
+    // SAFETY: signalling our own child, which has not been reaped.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    run_hook(&settings, "UserPromptSubmit", &env, &payload);
+    run_hook(&settings, "Stop", &env, &payload);
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
     let (code, stdout, stderr) = finish(waiting);
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(stdout, "done");
@@ -761,8 +758,9 @@ fn wait_returns_when_the_agent_reports_done_and_times_out_with_124() {
     let (code, _, stderr) = finish(wait_cmd(&dir, &["sh", "--until", "done"]));
     assert_eq!(code, Some(1));
     assert!(stderr.contains("not an agent session"), "{stderr}");
+    // Met whether the exit lands before or after the wait reads the
+    // session (a plain wait counts the state it finds).
     let exiting = wait_cmd(&dir, &["sh", "--until", "exit", "--timeout", "30"]);
-    std::thread::sleep(Duration::from_millis(500));
     let sid = shell["id"].as_str().unwrap();
     http(
         &server,

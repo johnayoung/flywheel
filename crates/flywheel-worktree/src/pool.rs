@@ -346,9 +346,14 @@ extern "C" fn on_stop_signal(signum: libc::c_int) {
 /// detached it deliberately) is left in place: the operator asked for the
 /// worker to outlive its terminal, and the members inherit the same
 /// disposition.
+///
+/// Also the startup recorder: `fw worker` arms it first thing
+/// ([`crate::daemon::main`]), so a signal while the policy loads and the
+/// stores open is kept (not the default action, instant death) and acted
+/// on once the worker's own handlers exist. Arming again keeps a recorded
+/// signal.
 #[cfg(unix)]
-fn arm_stop_signals() {
-    STOP_SIGNAL.store(0, Ordering::SeqCst);
+pub(crate) fn arm_stop_signals() {
     let hangup = (!hangup_ignored()).then_some(libc::SIGHUP);
     for sig in [libc::SIGTERM, libc::SIGINT].into_iter().chain(hangup) {
         // SAFETY: installing a handler that only stores into an atomic; the
@@ -376,12 +381,10 @@ pub(crate) fn hangup_ignored() -> bool {
 }
 
 #[cfg(not(unix))]
-fn arm_stop_signals() {
-    STOP_SIGNAL.store(0, Ordering::SeqCst);
-}
+pub(crate) fn arm_stop_signals() {}
 
 /// The pending stop signal, consuming it.
-fn take_stop_signal() -> Option<i32> {
+pub(crate) fn take_stop_signal() -> Option<i32> {
     match STOP_SIGNAL.swap(0, Ordering::SeqCst) {
         0 => None,
         signum => Some(signum),
@@ -691,6 +694,15 @@ impl WorkerPool {
     }
 
     fn supervise(&mut self) -> i32 {
+        // A signal recorded while the invocation was starting: no member
+        // is spawned at all.
+        if let Some(signum) = take_stop_signal() {
+            self.stop_requested = true;
+            (self.log)(&format!(
+                "pool shutdown requested (signal {signum}) before any member started."
+            ));
+            return self.exit_code;
+        }
         if let Err(err) = self.start() {
             (self.log)(&format!("pool start failed ({err}); stopping members."));
             self.exit_code = 1;

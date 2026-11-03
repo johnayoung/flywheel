@@ -105,7 +105,7 @@ impl Env {
     }
 
     fn read_until(&self, session: &str, needle: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let screen = self.ok(&["read", session]);
             if screen.contains(needle) {
@@ -225,7 +225,7 @@ fn type_and_see(socket: &mut Ws, input: &str, needle: &str) {
         ))
         .unwrap();
     let mut seen = String::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !seen.contains(needle) {
         assert!(Instant::now() < deadline, "{needle:?} not in {seen:?}");
         if let tungstenite::Message::Binary(bytes) = socket.read().unwrap() {

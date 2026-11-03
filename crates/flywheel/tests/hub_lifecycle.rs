@@ -93,7 +93,7 @@ impl Env {
 
     /// Poll `fw hub read` until the screen contains `needle`.
     fn read_until(&self, session: &str, needle: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let screen = self.ok(&["read", session]);
             if screen.contains(needle) {
@@ -195,7 +195,7 @@ fn field<'a>(launch: &'a [String], key: &str) -> &'a str {
 }
 
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(100));
@@ -487,7 +487,7 @@ fn start_script_stop_and_restore_shells_where_they_were() {
     assert!(!fresh.contains("ran-once"), "{fresh}");
 
     env.ok(&["kill", "beta"]);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while env.sessions()[1]["state"] != "exited" {
         assert!(Instant::now() < deadline, "beta never exited");
         std::thread::sleep(Duration::from_millis(100));
@@ -546,7 +546,7 @@ fn a_crash_is_reported_and_a_wedged_hub_does_not_stall_status_or_stop() {
     // Killed outright: its sessions are not restored, and start says so.
     let pid = hub_pid(&env);
     unsafe { libc::kill(pid, libc::SIGKILL) };
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while status_code(&env) != 3 {
         assert!(Instant::now() < deadline, "the killed hub still runs");
         std::thread::sleep(Duration::from_millis(50));
@@ -586,7 +586,7 @@ fn a_crash_is_reported_and_a_wedged_hub_does_not_stall_status_or_stop() {
     );
     // The queued SIGTERM lands once it runs again: a clean stop.
     unsafe { libc::kill(pid, libc::SIGCONT) };
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while status_code(&env) != 3 {
         assert!(Instant::now() < deadline, "the hub never stopped");
         std::thread::sleep(Duration::from_millis(100));

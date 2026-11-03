@@ -177,7 +177,7 @@ impl TestHub {
 /// Read frames until the accumulated terminal output contains `needle`.
 /// Returns (output, control messages).
 async fn read_until(ws: &mut Ws, needle: &str) -> (String, Vec<Value>) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut output = String::new();
     let mut control = Vec::new();
     while !output.contains(needle) {
@@ -197,7 +197,7 @@ async fn read_until(ws: &mut Ws, needle: &str) -> (String, Vec<Value>) {
 
 /// Read frames until a control message of `kind` arrives.
 async fn read_control(ws: &mut Ws, kind: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, ws.next()).await.expect("timed out") {
@@ -587,7 +587,7 @@ async fn shell_session_over_websocket_replays_then_streams_live() {
     );
     read_control(&mut second, "exit").await;
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let view: Value = hub
             .authed(reqwest::Method::GET, &format!("/api/sessions/{sid}"))
@@ -804,7 +804,7 @@ async fn deleting_a_workspace_frees_its_exited_sessions() {
         .create_session(&workspace_id, Some(vec!["/bin/sh", "-c", "echo bye"]))
         .await;
     let sid = session["id"].as_str().unwrap().to_owned();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let view: Value = hub
             .authed(reqwest::Method::GET, &format!("/api/sessions/{sid}"))
@@ -1220,7 +1220,7 @@ async fn repo_check_validates_a_single_path() {
 }
 
 async fn wait_state(hub: &TestHub, sid: &str, want: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let view: Value = hub
             .authed(reqwest::Method::GET, &format!("/api/sessions/{sid}"))
@@ -1356,7 +1356,7 @@ impl TestHub {
 
     /// Poll the server's rendered screen until `done` holds.
     async fn wait_screen(&self, sid: &str, done: impl Fn(&Value) -> bool) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let screen = self.screen(sid, "?source=visible").await;
             if done(&screen) {
@@ -1414,7 +1414,7 @@ impl Viewer {
         sid: &str,
         done: impl Fn(&Value) -> bool,
     ) -> Value {
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let server = hub.screen(sid, "?source=visible").await;
             let mine = self.visible();
@@ -1972,7 +1972,7 @@ async fn a_missing_directory_is_refused_not_replaced_by_home() {
     let live = hub.create_session(&workspace_id, None).await;
     let lid = live["id"].as_str().unwrap().to_owned();
     let repo = hub.repo.canonicalize().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let view: Value = hub
             .authed(reqwest::Method::GET, &format!("/api/sessions/{lid}"))

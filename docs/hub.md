@@ -73,7 +73,7 @@ Any terminal (local, over SSH, or a remote hub via `--url https://box.tailnet.ts
 
 ## Scripting agents
 
-`send` types, `wait` blocks on the events socket (no polling), `read` / `commands` read back. `wait --until idle` accepts `done`; `--changed` ignores the state current at start (the previous turn's `done`); an agent wait fails (1) if the session ends first; `--until exit` prints `exited N` / `killed (SIG)`. `--timeout` bounds everything, connecting included, but the state is always checked once (`--timeout 0`: check and return; reaching the hub may take up to 1 s).
+`send` types, `wait` blocks on the events socket (no polling), `read` / `commands` read back. `wait --until idle` accepts `done`; `--changed` ignores the state current at start (the previous turn's `done`), but against this machine's hub counts any status that began after the wait process started (Linux: to the 10 ms tick), so `fw hub wait --changed &` then a prompt cannot miss a fast turn; an agent wait fails (1) if the session ends first; `--until exit` prints `exited N` / `killed (SIG)`. `--timeout` bounds everything, connecting included, but the state is always checked once (`--timeout 0`: check and return; reaching the hub may take up to 1 s).
 
 ```bash
 id=$(fw hub new demo --kind claude --name fixer)

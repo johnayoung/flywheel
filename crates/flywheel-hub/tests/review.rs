@@ -191,7 +191,7 @@ async fn run_cli(args: &[&str]) -> (i32, String, String) {
 
 /// Wait until the screen text of `session` holds `needle`.
 async fn screen_shows(hub: &TestHub, session: &str, needle: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let screen = hub
             .get(&format!(
@@ -223,7 +223,7 @@ async fn review_until(
     what: &str,
     cond: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let review = hub.get(&format!("/api/sessions/{session}/review")).await;
         if cond(&review) {

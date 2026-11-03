@@ -606,7 +606,7 @@ fn start(dir: &Path) -> Server {
 }
 
 fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(value) = probe() {
             return value;

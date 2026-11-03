@@ -1852,6 +1852,9 @@ fn describe_cycle_error(err: &CycleError) -> String {
 /// log line forever -- the heartbeat thread and the signal watcher (whose
 /// runtime worker then never parks, so the runtime drop at exit hangs).
 pub fn main(argv: &[String]) -> i32 {
+    // Before anything else: a stop signal from here on is recorded, never
+    // the default action (see `arm_stop_signals`).
+    crate::pool::arm_stop_signals();
     let mut out = std::io::stdout();
     let mut err = std::io::stderr();
     let code = main_with(argv, &mut out, &mut err);
@@ -2135,6 +2138,17 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     let stop = StopFlag::new();
     let shutdown = ShutdownSignal::new();
     arm_signals(&runtime, stop.clone(), shutdown.clone(), Arc::clone(&log));
+    // A signal that landed while the worker was starting (recorded by
+    // `main`'s startup handler) stops it now, before the first claim.
+    if let Some(signum) = crate::pool::take_stop_signal() {
+        let _context = runtime.enter();
+        begin_shutdown(
+            &stop,
+            &shutdown,
+            &log,
+            &format!("signal {signum} during startup"),
+        );
+    }
     if let Some(lifeline) = lifeline {
         arm_supervisor_lifeline(
             &runtime,

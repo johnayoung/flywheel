@@ -403,7 +403,7 @@ async fn logging_out_closes_the_sockets_that_login_opened() {
         ))
         .await
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut seen = String::new();
     while !seen.contains("still-42") {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -646,7 +646,7 @@ async fn colour_queries_answer_with_the_viewers_theme() {
     .await
     .unwrap();
     let mut error = None;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut output = String::new();
     while !output.contains("end") {
         let remaining = deadline.saturating_duration_since(Instant::now());

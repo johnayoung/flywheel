@@ -10,9 +10,15 @@
 //!
 //! The wait is its own events client: it never views a session, so a turn
 //! that finishes reads `done` to it whoever else looked.
+//!
+//! `--changed` against this machine's hub counts any status that began
+//! after the wait process started (Linux: its start time, to the 10 ms
+//! clock tick), so `fw hub wait --changed & fw hub send ...` cannot miss a
+//! turn that finished before the wait had read the starting state.
 
 use crate::endpoint::{Endpoint, EndpointArgs, Socket, client_id};
 use crate::script::resolve;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::io::Write;
@@ -140,6 +146,7 @@ pub(crate) fn wait(args: &WaitArgs, out: &mut dyn Write, err: &mut dyn Write) ->
             return FAILED;
         }
     };
+    let started = process_started();
     let start = Instant::now();
     let deadline = timeout.map(|t| start + t);
     let outcome = runtime.block_on(async {
@@ -148,11 +155,16 @@ pub(crate) fn wait(args: &WaitArgs, out: &mut dyn Write, err: &mut dyn Write) ->
             Err(message) => return Outcome::Failed(message),
         };
         let setup_deadline = deadline.map(|d| d.max(start + CHECK_FLOOR));
+        // Only this machine's hub shares the wait's clock.
+        let started = endpoint.local_info().map(|_| started);
         run(
             &endpoint,
             &args.session,
             args.until,
-            args.changed,
+            Changed {
+                after_baseline: args.changed,
+                started,
+            },
             deadline,
             setup_deadline,
         )
@@ -218,11 +230,71 @@ fn status_of(view: &Value) -> Option<(String, String)> {
     Some((status, since))
 }
 
+/// When the wait process started: from the kernel's record of it on Linux
+/// (so a status set by anything run after this process was spawned is
+/// later), else now.
+fn process_started() -> DateTime<Utc> {
+    process_age().map_or_else(Utc::now, |age| {
+        Utc::now() - chrono::Duration::from_std(age).unwrap_or_default()
+    })
+}
+
+/// How long ago this process started (`/proc/self/stat` start time, in
+/// clock ticks since boot, against `CLOCK_BOOTTIME`).
+#[cfg(target_os = "linux")]
+fn process_age() -> Option<Duration> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // Field 22; the command name (field 2) may hold spaces, so count from
+    // its closing parenthesis (field 3 is the first after it).
+    let ticks: u64 = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf only reads a constant.
+    let hz = u64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).ok()?;
+    if hz == 0 {
+        return None;
+    }
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid timespec for clock_gettime to fill.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 {
+        return None;
+    }
+    let up = Duration::new(
+        u64::try_from(now.tv_sec).ok()?,
+        u32::try_from(now.tv_nsec).ok()?,
+    );
+    let began =
+        Duration::from_secs(ticks / hz) + Duration::from_nanos((ticks % hz) * 1_000_000_000 / hz);
+    up.checked_sub(began)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_age() -> Option<Duration> {
+    None
+}
+
+/// What `--changed` counts as a change.
+#[derive(Debug, Clone, Copy)]
+struct Changed {
+    /// `--changed`: the status the wait first reads does not count...
+    after_baseline: bool,
+    /// ...unless it began at or after this (the wait's start, on the
+    /// hub's clock; `None`: another machine's hub).
+    started: Option<DateTime<Utc>>,
+}
+
 async fn run(
     endpoint: &Endpoint,
     query: &str,
     until: Until,
-    changed: bool,
+    changed: Changed,
     deadline: Option<Instant>,
     setup_deadline: Option<Instant>,
 ) -> Outcome {
@@ -440,7 +512,7 @@ async fn refresh(endpoint: &Endpoint, id: &str) -> Result<Option<Value>, String>
 /// Decides, from what the hub says, whether the wait is over.
 struct Tracker {
     until: Until,
-    changed: bool,
+    changed: Changed,
     name: String,
     /// The status when the wait started (`--changed` ignores it).
     baseline: Option<Option<(String, String)>>,
@@ -454,7 +526,7 @@ impl Tracker {
     fn on_record(&mut self, record: &Value, initial: bool) -> Option<Outcome> {
         let ended = ended(record)?;
         if self.until == Until::Exit {
-            if self.changed && initial {
+            if self.changed.after_baseline && initial {
                 return Some(Outcome::Failed(format!(
                     "session {} has already ended ({ended}); nothing to wait for",
                     self.name
@@ -484,9 +556,14 @@ impl Tracker {
         if !self.until.met_by(&status) {
             return None;
         }
-        if self.changed {
+        if self.changed.after_baseline {
             let unchanged = matches!(&self.baseline, Some(Some((_, s))) if *s == since);
-            if first || unchanged {
+            let began = DateTime::parse_from_rfc3339(&since).ok();
+            let since_start = matches!(
+                (began, self.changed.started),
+                (Some(began), Some(started)) if began >= started
+            );
+            if (first || unchanged) && !since_start {
                 return None;
             }
         }
@@ -502,7 +579,10 @@ mod tests {
     fn tracker(until: Until, changed: bool) -> Tracker {
         Tracker {
             until,
-            changed,
+            changed: Changed {
+                after_baseline: changed,
+                started: None,
+            },
             name: "s".into(),
             baseline: None,
             last: None,
@@ -544,6 +624,48 @@ mod tests {
             t.on_status(Some(&view("done", "t3"))),
             Some(Outcome::Met("done".into()))
         );
+    }
+
+    #[test]
+    fn changed_counts_a_status_that_began_after_the_wait_started() {
+        let started = DateTime::parse_from_rfc3339("2026-11-03T10:00:00.500Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut t = tracker(Until::Done, true);
+        t.changed.started = Some(started);
+        // The previous turn, done before the wait started: not a change.
+        assert_eq!(
+            t.on_status(Some(&view("done", "2026-11-03T10:00:00.499Z"))),
+            None
+        );
+        // A turn that finished after the wait started but before it read
+        // the session is the first status it sees: a change all the same.
+        let mut t = tracker(Until::Done, true);
+        t.changed.started = Some(started);
+        assert_eq!(
+            t.on_status(Some(&view("done", "2026-11-03T10:00:00.500Z"))),
+            Some(Outcome::Met("done".into()))
+        );
+        // Another machine's hub (no shared clock): the baseline rule alone.
+        let mut t = tracker(Until::Done, true);
+        assert_eq!(
+            t.on_status(Some(&view("done", "2026-11-03T10:00:01Z"))),
+            None
+        );
+    }
+
+    #[test]
+    fn the_process_start_is_no_later_than_anything_this_process_did() {
+        let earlier = std::time::Instant::now();
+        let before = Utc::now();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(process_started() <= before);
+        #[cfg(target_os = "linux")]
+        {
+            let age = process_age().expect("/proc/self/stat start time");
+            assert!(age >= earlier.elapsed(), "{age:?}");
+            assert!(age < Duration::from_secs(24 * 3600), "{age:?}");
+        }
     }
 
     #[test]

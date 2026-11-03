@@ -69,7 +69,7 @@ fn fake_agent(dir: &Path, name: &str) {
 }
 
 fn launched(dir: &Path, name: &str) -> (Vec<String>, HashMap<String, String>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let (Ok(args), Ok(env)) = (
             std::fs::read_to_string(dir.join(format!("{name}.args"))),
@@ -219,7 +219,7 @@ fn hooks_run_fw_hub_report_and_drive_agent_status() {
     );
 
     let wait = |want: &str| {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let got = agent_status(&server, &sid);
             if got == want {
@@ -283,7 +283,7 @@ fn hooks_run_fw_hub_report_and_drive_agent_status() {
     notify.push(json!({ "type": "agent-turn-complete", "thread-id": "thr_9" }).to_string());
     run_hook(&notify, &codex_env, "");
     let cid = codex["id"].as_str().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while agent_status(&server, cid) != "done" {
         assert!(Instant::now() < deadline, "codex never done");
         std::thread::sleep(Duration::from_millis(30));

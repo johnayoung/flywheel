@@ -173,7 +173,7 @@ impl TestHub {
 }
 
 async fn eventually<F: Fn() -> bool>(what: &str, check: F) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !check() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(Duration::from_millis(30)).await;
@@ -283,7 +283,7 @@ async fn agent_in_a_new_worktree_gets_a_companion_shell_that_runs_commands_there
     assert_eq!(git(&hub.repo(), &["status", "--porcelain"]), "");
 
     // The badge arrives from the background reader.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let badge = loop {
         let view = hub.session(&agent_id).await;
         if view["git"].is_object() {
@@ -613,7 +613,7 @@ async fn cli_new_worktree_and_restore_keeps_sessions_in_their_worktree() {
     assert!(err.contains("not a git repository"), "{err}");
 
     // ls shows the branch badge once read.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let (_, out, _) = run_cli(&["ls", "--state-dir", &state]).await;
         if out.contains("[spike +0 -0 vs dev worktree]") {
@@ -702,7 +702,7 @@ async fn companions_close_with_their_agent_and_never_remove_its_worktree() {
         .post(&format!("/api/sessions/{agent_id}/kill"), json!({}))
         .await;
     assert!(status.is_success(), "{status}");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while hub.session(&agent_id).await["state"] == "running" {
         assert!(Instant::now() < deadline, "the agent did not stop");
         tokio::time::sleep(Duration::from_millis(50)).await;

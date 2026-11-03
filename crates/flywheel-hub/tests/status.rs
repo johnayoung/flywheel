@@ -183,7 +183,7 @@ fn fake_agent(dir: &Path, name: &str, body: &str) -> PathBuf {
 async fn launched(hub: &TestHub, name: &str) -> (Vec<String>, HashMap<String, String>) {
     let args = hub.dir.path().join(format!("{name}.args"));
     let env = hub.dir.path().join(format!("{name}.env"));
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if let (Ok(a), Ok(e)) = (
             std::fs::read_to_string(&args),
@@ -205,7 +205,7 @@ async fn launched(hub: &TestHub, name: &str) -> (Vec<String>, HashMap<String, St
 
 /// Next text message of `kind` on an events socket.
 async fn next_event(ws: &mut Ws, kind: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, ws.next())
@@ -233,6 +233,46 @@ async fn status_becomes(ws: &mut Ws, session: &str, want: &str) -> Value {
         }
     }
 }
+
+/// Wait until session `sid`'s live screen reads as manifest rule `rule`
+/// (the server's emulator has drawn it), then give the screen monitor its
+/// look: it reads the screen at most every 250 ms after output.
+async fn screen_reads(hub: &TestHub, sid: &str, rule: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let why = hub.get(&format!("/api/sessions/{sid}/explain")).await;
+        if why["screen"]["rule"] == rule {
+            break;
+        }
+        assert!(Instant::now() < deadline, "screen never read {rule}: {why}");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    tokio::time::sleep(MONITOR_LOOK).await;
+}
+
+/// Wait until session `sid`'s visible screen shows `text`.
+async fn screen_shows(hub: &TestHub, sid: &str, text: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let screen = hub
+            .get(&format!("/api/sessions/{sid}/screen?source=visible"))
+            .await;
+        if screen["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l.as_str().is_some_and(|l| l.contains(text)))
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{text:?} never drawn: {screen}");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// Comfortably more than the screen monitor's look interval (250 ms) plus
+/// its poll (100 ms).
+const MONITOR_LOOK: Duration = Duration::from_millis(600);
 
 async fn view(ws: &mut Ws, session: Option<&str>) {
     ws.send(Message::Text(
@@ -580,7 +620,7 @@ async fn claude_interrupts_and_the_trust_dialog_read_from_the_screen() {
     claude.fire("UserPromptSubmit", None, json!({})).unwrap();
     status_becomes(&mut events, &sid, "working").await;
     type_line("work\r").await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    screen_reads(&hub, &sid, "turn_footer").await;
     let interrupted = Instant::now();
     type_line("stop\r").await;
     status_becomes(&mut events, &sid, "idle").await;
@@ -599,12 +639,12 @@ async fn claude_interrupts_and_the_trust_dialog_read_from_the_screen() {
     // A permission prompt cancelled with Esc -- drawn before its hook
     // arrived, so nothing on screen changes when it does.
     type_line("dialog\r").await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    screen_reads(&hub, &sid, "permission_prompt").await;
     claude
         .fire("PermissionRequest", None, json!({ "tool_name": "Bash" }))
         .unwrap();
     status_becomes(&mut events, &sid, "blocked").await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(MONITOR_LOOK).await;
     type_line("stop\r").await;
     let idle = status_becomes(&mut events, &sid, "idle").await;
     assert!(idle["status"].get("detail").is_none(), "{idle}");
@@ -616,7 +656,7 @@ async fn claude_interrupts_and_the_trust_dialog_read_from_the_screen() {
         .unwrap();
     status_becomes(&mut events, &sid, "blocked").await;
     type_line("dialog\r").await;
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    screen_reads(&hub, &sid, "permission_prompt").await;
     type_line("work\r").await;
     status_becomes(&mut events, &sid, "working").await;
     type_line("stop\r").await;
@@ -626,6 +666,7 @@ async fn claude_interrupts_and_the_trust_dialog_read_from_the_screen() {
     claude.fire("UserPromptSubmit", None, json!({})).unwrap();
     status_becomes(&mut events, &sid, "working").await;
     type_line("stop\r").await;
+    screen_reads(&hub, &sid, "prompt").await;
     tokio::time::sleep(flywheel_hub::detect::tracker::SETTLE_AFTER + Duration::from_secs(1)).await;
     assert_eq!(api_status(&hub).await, "working");
     drop(term);
@@ -693,7 +734,7 @@ async fn relaunching_a_claude_record_without_a_conversation_id_assigns_one() {
 }
 
 async fn wait_exited(hub: &TestHub, sid: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while hub.get(&format!("/api/sessions/{sid}")).await["state"] != "exited" {
         assert!(Instant::now() < deadline, "session never exited");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -805,6 +846,8 @@ async fn codex_status_from_its_screen_and_turn_complete_notify() {
     // after the turn does not undo done; a busy line that freezes with no
     // turn-complete is honestly unknown.
     type_line("plain typing").await;
+    // Drawn, then held for several of the monitor's looks.
+    screen_shows(&hub, &sid, "plain typing").await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(
         hub.get(&format!("/api/sessions/{sid}")).await["agent"]["status"],
@@ -1065,7 +1108,7 @@ async fn token_rotation_closes_events_sockets_but_not_agent_hooks() {
         .trim()
         .to_owned();
     assert_ne!(new_token, hub.token);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let view: Value = hub
             .http

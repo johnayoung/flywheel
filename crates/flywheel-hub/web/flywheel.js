@@ -397,9 +397,11 @@ window.FwHubFlywheel = function (ctx) {
     const fresh = unseen(folder, s).length;
     badge.hidden = !fresh;
     badge.textContent = String(fresh);
+    const key = ctx.keyOf ? ctx.keyOf("flywheel.toggle") : "";
+    const hint = key ? ` (${key})` : "";
     pill.title = viaWorktree(session, folder)
-      ? `Flywheel panel for ${labelFor(folder)}, this worktree's base checkout (Alt F)`
-      : `Flywheel panel for ${labelFor(folder)} (Alt F)`;
+      ? `Flywheel panel for ${labelFor(folder)}, this worktree's base checkout${hint}`
+      : `Flywheel panel for ${labelFor(folder)}${hint}`;
   }
 
   function togglePill() {

@@ -222,7 +222,7 @@ impl Hub {
         let (signal, detail) = match kind {
             SessionKind::Claude => (
                 claude_signal(&report.event, report.detail.as_deref()),
-                agent::claude_detail(&report.event, &payload),
+                agent::claude_detail(&report.event, report.detail.as_deref(), &payload),
             ),
             SessionKind::Codex if report.event == "notify" => (codex_signal(&payload), None),
             _ => (None, None),

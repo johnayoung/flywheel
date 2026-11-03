@@ -93,7 +93,10 @@
 
 .config-table { width: 100%; border-collapse: collapse; font-size: 11px; }
 .config-table th { text-align: left; color: var(--ink-3); font-weight: 600; letter-spacing: .12em; text-transform: uppercase; font-size: 9.5px; padding: .3rem .4rem; border-bottom: 1px solid var(--rule-2); }
-.config-table td { padding: .3rem .4rem; border-bottom: 1px solid var(--rule); overflow-wrap: anywhere; vertical-align: top; }
+.config-table td { padding: .3rem .4rem; border-bottom: 1px solid var(--rule); overflow-wrap: break-word; vertical-align: top; }
+/* Keys break only at their dots (<wbr>), source and timing never. */
+.config-table td:first-child code { overflow-wrap: normal; }
+.config-table td:nth-child(3), .config-table td:nth-child(4) { white-space: nowrap; }
 .config-table .src-flag { color: var(--signal); }
 .config-table .src-file { color: var(--brass); }
 .config-table .src-default { color: var(--ink-3); }
@@ -119,5 +122,9 @@ body:not(.ligatures) :is(.tx-body, #cmd-list, #run-body, .rv-diff, #search-resul
   .pref-scope { grid-column: 1 / -1; justify-content: flex-start; }
   .key-row { grid-template-columns: minmax(0, 1fr) auto; }
   .key-actions { grid-column: 1 / -1; justify-content: flex-end; }
-  .settings-tab { padding: .55rem .7rem; }
+  .settings-tab { padding: .55rem .7rem; flex: none; }
+  /* One row of tabs that scrolls sideways, not three rows. */
+  .settings-nav { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin: 0; padding-bottom: .1rem; }
+  .settings-nav::-webkit-scrollbar { display: none; }
+  .config-table { display: block; overflow-x: auto; }
 }

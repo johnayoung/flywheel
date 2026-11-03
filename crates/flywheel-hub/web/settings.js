@@ -18,12 +18,15 @@ window.FwHubSettings = function (ctx) {
 
   const SERVER_KEY = "prefs.server"; // the last GET /api/settings
   const DEVICE_KEY = "prefs.device"; // id -> value (this device only)
+  // Per hub (`@<hub id>`): another hub served later on this origin does
+  // not inherit them.
   const DEVICE_KEYS = "keys.device"; // action -> [bindings] (this device only)
   const KEYS_SCOPE = "keys.scope"; // "user" | "device": where key edits go
 
   let server = store.get(SERVER_KEY, null) || { rev: 0, values: {}, keys: {}, keymap: {}, prefs: [], actions: [], rules: {} };
   let device = store.get(DEVICE_KEY, {}) || {};
-  let deviceKeys = store.get(DEVICE_KEYS, {}) || {};
+  const perHub = (name) => `${name}@${server.hub_id || "?"}`;
+  let deviceKeys = (server.hub_id && store.get(perHub(DEVICE_KEYS), {})) || {};
   let config = null; // last GET /api/config
   let plugins = null; // last GET /api/plugins
   let configError = ""; // the hub.toml error last toasted
@@ -50,6 +53,12 @@ window.FwHubSettings = function (ctx) {
   }
 
   const spec = (id) => (server.prefs || []).find((p) => p.id === id);
+  // What hub.toml (or a flag) sets for `id` ([agents.*] share the
+  // preferences' ids): what a launch naming none gets. null: unset.
+  function hubDefault(id) {
+    const entry = config && (config.values || []).find((v) => v.key === id);
+    return entry && entry.value !== null && entry.value !== "" ? entry.value : null;
+  }
   const action = (id) => (server.actions || []).find((a) => a.id === id);
 
   // The value in force: this device's, else the hub's, else the default.
@@ -83,6 +92,26 @@ window.FwHubSettings = function (ctx) {
     return map;
   }
 
+  // Key hints in the page (index.html: data-key="<action>" shows the
+  // action's first binding, hidden when unbound; data-key-title="<action>"
+  // with data-title: the title plus the key).
+  function renderHints() {
+    for (const node of document.querySelectorAll("[data-key]")) {
+      const text = keyOf(node.dataset.key);
+      node.textContent = text;
+      node.hidden = !text;
+    }
+    for (const row of document.querySelectorAll("[data-key-row]")) {
+      row.hidden = ![...row.querySelectorAll("[data-key]")].some((k) => !k.hidden);
+    }
+    for (const node of document.querySelectorAll("[data-key-title]")) {
+      const text = keyOf(node.dataset.keyTitle);
+      const base = node.dataset.title || "";
+      node.title = text ? `${base} (${text})` : base;
+    }
+    renderBadge();
+  }
+
   function rebuild() {
     index = { global: new Map(), prefix: new Map() };
     for (const [id, keys] of Object.entries(keymap())) {
@@ -98,6 +127,7 @@ window.FwHubSettings = function (ctx) {
         }
       }
     }
+    renderHints();
   }
 
   // The key name a binding uses for this physical key ("" for none).
@@ -238,8 +268,10 @@ window.FwHubSettings = function (ctx) {
   // --- loading and saving ----------------------------------------------------
 
   function adopt(view) {
-    const before = { values: server.values || {}, keymap: JSON.stringify(server.keymap || {}) };
+    const before = { values: server.values || {}, keymap: JSON.stringify(keymap()) };
+    const hubChanged = (view.hub_id || "") !== (server.hub_id || "");
     server = {
+      hub_id: view.hub_id || "",
       rev: view.rev,
       values: view.values || {},
       keys: view.keys || {},
@@ -251,11 +283,12 @@ window.FwHubSettings = function (ctx) {
       file: view.file || "",
     };
     store.set(SERVER_KEY, server);
+    if (hubChanged) deviceKeys = store.get(perHub(DEVICE_KEYS), {}) || {};
     rebuild();
     const ids = new Set([...Object.keys(before.values), ...Object.keys(server.values)]);
     for (const p of server.prefs) ids.add(p.id);
     changed([...ids]);
-    if (before.keymap !== JSON.stringify(server.keymap)) changed(["keys"]);
+    if (before.keymap !== JSON.stringify(keymap())) changed(["keys"]);
   }
 
   async function load() {
@@ -314,7 +347,7 @@ window.FwHubSettings = function (ctx) {
     changed([id]);
   }
 
-  const keysScope = () => (store.get(KEYS_SCOPE, "user") === "device" ? "device" : "user");
+  const keysScope = () => (store.get(perHub(KEYS_SCOPE), "user") === "device" ? "device" : "user");
 
   // Ask the hub whether a keymap (overrides) is valid.
   async function checkKeys(overrides) {
@@ -346,18 +379,18 @@ window.FwHubSettings = function (ctx) {
     } catch (error) {
       return { ok: false, errors: [{ action: id, key: "", message: error.message }], warnings: [] };
     }
-    if (check.errors.length) return { ok: false, errors: check.errors, warnings: check.warnings };
+    if (check.errors.length) return { ok: false, errors: check.errors, warnings: check.warnings.filter((w) => w.action === id) };
     if (keysScope() === "device") {
       if (keys === null) delete deviceKeys[id];
       else deviceKeys[id] = check.keys[id] || [];
-      store.set(DEVICE_KEYS, deviceKeys);
+      store.set(perHub(DEVICE_KEYS), deviceKeys);
       rebuild();
       changed(["keys"]);
-      return { ok: true, errors: [], warnings: check.warnings };
+      return { ok: true, errors: [], warnings: check.warnings.filter((w) => w.action === id) };
     }
     try {
       const saved = await save({ keys: { [id]: keys } });
-      return { ok: true, errors: [], warnings: (saved && saved.warnings) || [] };
+      return { ok: true, errors: [], warnings: ((saved && saved.warnings) || []).filter((w) => w.action === id) };
     } catch (error) {
       return { ok: false, errors: error.errors || [{ action: id, key: "", message: error.message }], warnings: [] };
     }
@@ -379,7 +412,7 @@ window.FwHubSettings = function (ctx) {
     }
     configError = error;
     renderBadge();
-    if (dialog.open && view.section === "server") renderSection();
+    if (dialog.open && (view.section === "server" || view.section === "agents")) renderSection();
   }
 
   async function loadPlugins() {
@@ -457,11 +490,13 @@ window.FwHubSettings = function (ctx) {
           "aria-selected": String(view.section === id),
           dataset: { section: id },
           textContent: name,
-          onclick: () => {
+          onclick: (e) => {
             view.section = id;
             view.capturing = null;
             renderNav();
             renderSection();
+            const tab = nav.querySelector(`[data-section="${e.currentTarget.dataset.section}"]`);
+            if (tab) tab.scrollIntoView({ block: "nearest", inline: "nearest" });
           },
         }),
       ),
@@ -474,12 +509,17 @@ window.FwHubSettings = function (ctx) {
 
   function control(s) {
     const value = get(s.id);
+    const fromHub = s.section === "agents" ? hubDefault(s.id) : null;
     const commit = (next) => set(s.id, next).then(() => renderSection());
     if (s.type === "choice") {
       return el(
         "select",
         { id: `pref-${s.id}`, onchange: (e) => commit(e.target.value) },
-        s.choices.map((c) => el("option", { value: c, textContent: CHOICE_LABEL[c] || c, selected: c === value })),
+        s.choices.map((c) => el("option", {
+          value: c,
+          textContent: c === "" && fromHub !== null ? `hub default (${fromHub}, hub.toml)` : CHOICE_LABEL[c] || c,
+          selected: c === value,
+        })),
       );
     }
     if (s.type === "bool") {
@@ -518,7 +558,7 @@ window.FwHubSettings = function (ctx) {
       value: value || "",
       spellcheck: false,
       autocomplete: "off",
-      placeholder: "CLI default",
+      placeholder: fromHub !== null ? `hub default: ${fromHub} (hub.toml)` : "CLI default",
       onchange: (e) => commit(e.target.value.trim() || null),
     });
   }
@@ -600,7 +640,7 @@ window.FwHubSettings = function (ctx) {
             value,
             checked: scope === value,
             onchange: () => {
-              store.set(KEYS_SCOPE, value);
+              store.set(perHub(KEYS_SCOPE), value);
               renderSection();
             },
           }),
@@ -614,7 +654,7 @@ window.FwHubSettings = function (ctx) {
           textContent: `drop this device's ${Object.keys(deviceKeys).length} override${Object.keys(deviceKeys).length === 1 ? "" : "s"}`,
           onclick: () => {
             deviceKeys = {};
-            store.set(DEVICE_KEYS, deviceKeys);
+            store.set(perHub(DEVICE_KEYS), deviceKeys);
             rebuild();
             changed(["keys"]);
             renderSection();
@@ -833,8 +873,8 @@ window.FwHubSettings = function (ctx) {
             el("button", {
               type: "button",
               className: "slab ghost",
-              disabled: !p.enabled || !p.valid,
-              title: a.context === "session" ? "Runs for the attached session" : "",
+              disabled: !p.enabled || !p.valid || (a.context === "session" && !ctx.attachedLocal()),
+              title: a.context === "session" ? (ctx.attachedLocal() ? "Runs for the attached session" : "Needs a session: attach one on this hub first") : "",
               textContent: a.title,
               onclick: () => runPlugin(p.name, a),
             }),
@@ -925,7 +965,7 @@ window.FwHubSettings = function (ctx) {
             el(
               "tr",
               { dataset: { key: e.key } },
-              el("td", {}, el("code", { textContent: e.key })),
+              el("td", {}, el("code", {}, ...e.key.split(".").flatMap((part, i) => (i ? [el("wbr"), `.${part}`] : [part])))),
               el("td", { textContent: show(e.value) }),
               el("td", { className: `src-${e.source}`, textContent: e.source }),
               el("td", { textContent: e.apply === "live" ? "live" : "at restart" }),
@@ -954,9 +994,9 @@ window.FwHubSettings = function (ctx) {
   async function open(section) {
     if (section) view.section = section;
     view.capturing = null;
-    config = null;
     renderNav();
     loadPlugins();
+    loadConfig();
     if (!dialog.open) dialog.showModal();
     renderSection();
     load().then(() => renderSection());
@@ -1006,13 +1046,16 @@ window.FwHubSettings = function (ctx) {
     for (const [id, name] of SECTIONS) cmd(`Settings: ${name}`, "", () => open(id), "gear");
     for (const p of (plugins && plugins.plugins) || []) {
       if (!p.enabled || !p.valid) continue;
-      for (const a of p.actions || []) cmd(`Plugin: ${a.title}`, `${p.name}${a.context === "session" ? " · this session" : ""}`, () => runPlugin(p.name, a), "chev");
+      for (const a of p.actions || []) {
+        if (a.context === "session" && !ctx.attachedLocal()) continue;
+        cmd(`Plugin: ${a.title}`, `${p.name}${a.context === "session" ? " · this session" : ""}`, () => runPlugin(p.name, a), "chev");
+      }
     }
   }
 
   rebuild();
   return {
-    get, set, isDevice, onChange, keymap, match, matchPrefix, label, keyOf, open, onPush, paletteItems, showKeys,
+    get, set, isDevice, onChange, keymap, match, matchPrefix, label, keyOf, open, onPush, paletteItems, showKeys, hubDefault,
     start: async () => {
       await load();
       loadConfig();

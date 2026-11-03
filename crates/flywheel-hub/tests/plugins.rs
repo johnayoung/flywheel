@@ -620,3 +620,133 @@ async fn invalid_manifests_are_listed_not_run() {
     assert!(err.contains("invalid"), "{err}");
     hub.stop().await;
 }
+
+/// A plugin that daemonizes, prints too much, or whose caller hangs up:
+/// every run still ends on time, is killed, and is logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runs_are_bounded_whatever_the_plugin_or_its_caller_does() {
+    let hub = TestHub::start().await;
+    let dir = hub.state().join("plugins/esc");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        r#"command = ["./esc.sh"]
+timeout_secs = 2
+[[actions]]
+id = "escape"
+title = "Leave the group"
+command = ["./esc.sh", "escape"]
+[[actions]]
+id = "hang"
+title = "Hang"
+command = ["./esc.sh", "hang"]
+[[actions]]
+id = "big"
+title = "Too big"
+command = ["./esc.sh", "big"]
+"#,
+    )
+    .unwrap();
+    support::write_script(
+        &dir.join("esc.sh"),
+        r#"#!/bin/sh
+cat > /dev/null
+case "$1" in
+  escape) setsid sh -c 'echo $$ > "$FW_HUB_PLUGIN_DIR/escaped.pid"; exec sleep 20' & sleep 0.3; echo '{"toast":"hi"}' ;;
+  hang) echo $$ > "$FW_HUB_PLUGIN_DIR/hang.pid"; sleep 25 & echo $! > "$FW_HUB_PLUGIN_DIR/hangchild.pid"; wait ;;
+  big) printf '{"paste":{"text":"'; head -c 200000 /dev/zero | tr '\0' x; printf '"}}' ;;
+esac
+"#,
+    );
+    let (code, out, err) = hub.cli(&["plugin", "enable", "esc"]).await;
+    assert_eq!(code, 0, "{out}{err}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, listed) = hub.call(reqwest::Method::GET, "/api/plugins", None).await;
+        if listed["plugins"][0]["enabled"] == true {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never enabled: {listed}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // A descendant that left the process group keeps the pipes open: the
+    // run still ends right after its command, with its response.
+    let started = Instant::now();
+    let escaped = hub.post("/api/plugins/esc/actions/escape", json!({})).await;
+    let took = started.elapsed();
+    let pid: i32 = std::fs::read_to_string(dir.join("escaped.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    assert!(took < Duration::from_secs(3), "{took:?}: {escaped}");
+    assert_eq!(escaped["toast"]["message"], "hi", "{escaped}");
+    assert_eq!(escaped["ok"], false);
+    assert!(
+        escaped["log"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("left its process group"),
+        "{escaped}"
+    );
+
+    // Output over the cap is said to be, not a JSON parse error.
+    let big = hub.post("/api/plugins/esc/actions/big", json!({})).await;
+    assert_eq!(big["ok"], false);
+    assert!(
+        big["log"]["error"].as_str().unwrap().contains("output cap"),
+        "{big}"
+    );
+
+    // The caller hangs up: the run keeps its deadline, its group dies,
+    // and it is logged.
+    let logged = |state: &Path| {
+        std::fs::read_to_string(state.join("plugin-logs/esc.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = logged(&hub.state());
+    let gave_up = hub
+        .http
+        .post(format!("http://{}/api/plugins/esc/actions/hang", hub.addr))
+        .bearer_auth(&hub.token)
+        .json(&json!({}))
+        .timeout(Duration::from_millis(400))
+        .send()
+        .await;
+    assert!(gave_up.is_err(), "the client was meant to time out");
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while logged(&hub.state()) == before {
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned run was never logged"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let runs: Vec<Value> = std::fs::read_to_string(hub.state().join("plugin-logs/esc.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let last = runs.last().unwrap();
+    assert_eq!(last["trigger"], "action:hang");
+    assert_eq!(last["timed_out"], true, "{last}");
+    for file in ["hang.pid", "hangchild.pid"] {
+        let pid: i32 = std::fs::read_to_string(dir.join(file))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while alive(pid) {
+            assert!(Instant::now() < deadline, "{file} {pid} outlived the run");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    hub.stop().await;
+}

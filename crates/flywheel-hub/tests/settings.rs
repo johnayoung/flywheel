@@ -411,6 +411,15 @@ async fn hub_toml_precedence_hot_reload_and_errors() {
     let (code, out, _) = cli_in(&state, &["config", "check"]).await;
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("ok (3 settings from the file)"), "{out}");
+    // A --file that does not exist is a mistyped path, not "all defaults".
+    let missing = dir.path().join("nope.toml");
+    let (code, _, err) = cli_in(
+        &state,
+        &["config", "check", "--file", missing.to_str().unwrap()],
+    )
+    .await;
+    assert_eq!(code, 1, "{err}");
+    assert!(err.contains("no such file"), "{err}");
     // Offline show: the file over the defaults.
     let (code, out, _) = cli_in(&state, &["config", "show", "--json"]).await;
     assert_eq!(code, 0);

@@ -868,7 +868,8 @@ window.FwHubSearch = function (ctx) {
   }
 
   function paletteItems(cmd) {
-    cmd("Search sessions", `Ctrl Shift F · scrollback, transcripts, commands`, () => open(), "search");
+    const key = ctx.keyOf ? ctx.keyOf("search.open") : "";
+    cmd("Search sessions", `${key ? `${key} · ` : ""}scrollback, transcripts, commands`, () => open(), "search");
     const attached = sessionById(state.attached);
     if (attached) {
       cmd(`Search in ${attached.name}`, "this session only", () => {

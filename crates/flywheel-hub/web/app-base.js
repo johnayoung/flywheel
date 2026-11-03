@@ -354,6 +354,7 @@ function closeOverlays(keep) {
 // flywheel-adopted folders.
 const flywheel = window.FwHubFlywheel({
   $, el, icon, api, age, span, state, workspaceById, sessionById, folderLabel,
+  keyOf: (id) => settings.keyOf(id),
   machinePrefix: (machine) => machines.prefix(machine),
   openSession: (id, place) => openSession(id, place),
   toast: commands.toast,
@@ -407,6 +408,8 @@ const launcher = window.FwHubLauncher({
     approval: kind === "codex" ? settings.get("agents.codex.approval", "") || "" : "",
     sandbox: kind === "codex" ? settings.get("agents.codex.sandbox", "") || "" : "",
   }),
+  // What hub.toml's [agents.*] gives a launch naming none.
+  hubDefault: (id) => settings.hubDefault(id),
   remoteUsage: () => machines.usage(),
   // The spend strip counts this hub only: named so once machines show.
   localLabel: () => (machines.any() ? machines.host() || "this hub" : ""),
@@ -458,6 +461,7 @@ const explain = window.FwHubExplain({ $, el, api });
 // Search across sessions (search.js): scrollback, transcripts, commands.
 const search = window.FwHubSearch({
   $, el, icon, api, rawApi, machines, state, sessionById, workspaceById, age, glyphFor,
+  keyOf: (id) => settings.keyOf(id),
   toast: commands.toast,
   openSession: (id) => openSession(id),
   openCommandsAt: (id, seq, all) => {

@@ -18,7 +18,8 @@ pub(crate) struct ConfigArgs {
 
 #[derive(Debug, clap::Subcommand)]
 enum ConfigCommand {
-    /// Validate hub.toml (or --file): exit 0 valid or absent, 1 invalid.
+    /// Validate hub.toml (or --file): exit 0 valid or absent, 1 invalid
+    /// (or a --file that does not exist).
     Check(CheckArgs),
     /// The settings in force: every key, its value, and whether it came
     /// from a flag, hub.toml, or the default (the running hub's view;
@@ -62,6 +63,11 @@ fn check(args: &CheckArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     let file = match config::read_file(&path) {
         Ok(Some(file)) => file,
+        Ok(None) if args.file.is_some() => {
+            // Named on purpose: a missing file is a mistyped path.
+            let _ = writeln!(err, "{}: no such file", path.display());
+            return 1;
+        }
         Ok(None) => {
             let _ = writeln!(
                 out,

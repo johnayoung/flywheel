@@ -69,7 +69,6 @@ pub const EVENTS: &[&str] = &[
     "review.pr_opened",
     "review.rebased",
     "review.merged",
-    "fanout.finished",
 ];
 const STATUSES: &[&str] = &["working", "blocked", "done", "idle", "unknown"];
 const KINDS: &[&str] = &["shell", "claude", "codex"];
@@ -465,30 +464,41 @@ struct Ran {
     exit_code: Option<i32>,
     signal: Option<i32>,
     timed_out: bool,
+    /// The command ended but something it started (outside its process
+    /// group, so not killed) kept stdout/stderr open: the run was cut.
+    held_open: bool,
     stdout: String,
     stderr: String,
+    /// Stdout went past [`OUTPUT_CAP`] (the rest was dropped).
+    stdout_cut: bool,
     truncated: bool,
     spawn_error: Option<String>,
 }
 
-/// Read `stream` to its end, keeping the first `cap` bytes.
-async fn capped(mut stream: impl tokio::io::AsyncRead + Unpin, cap: usize) -> (Vec<u8>, bool) {
-    let mut kept = Vec::new();
-    let mut truncated = false;
+/// What a reader kept: the first bytes, and whether it dropped any.
+type Sink = Arc<Mutex<(Vec<u8>, bool)>>;
+
+/// Read `stream` to its end into `sink`, keeping the first `cap` bytes
+/// (what was read so far stays in `sink` if the read is aborted).
+async fn capped(mut stream: impl tokio::io::AsyncRead + Unpin, cap: usize, sink: Sink) {
     let mut buf = [0u8; 8192];
     loop {
         match stream.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let room = cap.saturating_sub(kept.len());
+                let mut kept = sink.lock().unwrap_or_else(PoisonError::into_inner);
+                let room = cap.saturating_sub(kept.0.len());
                 if n > room {
-                    truncated = true;
+                    kept.1 = true;
                 }
-                kept.extend_from_slice(&buf[..n.min(room)]);
+                kept.0.extend_from_slice(&buf[..n.min(room)]);
             }
         }
     }
-    (kept, truncated)
+}
+
+fn take(sink: &Sink) -> (Vec<u8>, bool) {
+    std::mem::take(&mut *sink.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 #[cfg(unix)]
@@ -501,7 +511,31 @@ fn signal_group(pid: Option<u32>, signal: libc::c_int) {
     }
 }
 
+/// Kills a run's process group and stops its pipe tasks if the run is
+/// dropped before it finished (the caller went away, the runtime shut
+/// down): nothing a plugin started outlives the run that way.
+struct RunGuard {
+    /// The group to kill; `None` once the child is reaped (its pid may
+    /// then be reused).
+    pid: Option<u32>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        signal_group(self.pid, libc::SIGKILL);
+        // Finished tasks ignore this.
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 /// Run `argv` in `dir` with `env`, `input` on stdin, killed at `timeout`.
+/// The whole run is bounded: `timeout` for the command, then a grace for
+/// its group to die and its pipes to close; output still held open past
+/// that (by a process that left the group) is cut, and the run ends.
 async fn run_command(
     dir: &Path,
     argv: &[String],
@@ -529,8 +563,10 @@ async fn run_command(
                 exit_code: None,
                 signal: None,
                 timed_out: false,
+                held_open: false,
                 stdout: String::new(),
                 stderr: String::new(),
+                stdout_cut: false,
                 truncated: false,
                 spawn_error: Some(format!("cannot run {}: {e}", program.display())),
             };
@@ -545,20 +581,34 @@ async fn run_command(
             let _ = stdin.shutdown().await;
         }
     });
+    let out_sink: Sink = Arc::default();
+    let err_sink: Sink = Arc::default();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out = tokio::spawn(async move {
-        match stdout {
-            Some(s) => capped(s, OUTPUT_CAP).await,
-            None => (Vec::new(), false),
+    let mut out = tokio::spawn({
+        let sink = Arc::clone(&out_sink);
+        async move {
+            if let Some(s) = stdout {
+                capped(s, OUTPUT_CAP, sink).await;
+            }
         }
     });
-    let err = tokio::spawn(async move {
-        match stderr {
-            Some(s) => capped(s, OUTPUT_CAP).await,
-            None => (Vec::new(), false),
+    let mut err = tokio::spawn({
+        let sink = Arc::clone(&err_sink);
+        async move {
+            if let Some(s) = stderr {
+                capped(s, OUTPUT_CAP, sink).await;
+            }
         }
     });
+    let mut guard = RunGuard {
+        pid,
+        tasks: vec![
+            writer.abort_handle(),
+            out.abort_handle(),
+            err.abort_handle(),
+        ],
+    };
     let mut timed_out = false;
     let status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(status) => status.ok(),
@@ -579,12 +629,25 @@ async fn run_command(
         }
     };
     // Whatever is left of the group (a backgrounded grandchild holding
-    // the pipes) goes too, so the readers end.
+    // the pipes) goes too, so the readers end. A process that left the
+    // group (setsid) is out of reach: its pipes get a grace, then the
+    // readers are stopped with what they have.
     #[cfg(unix)]
     signal_group(pid, libc::SIGKILL);
+    guard.pid = None;
     writer.abort();
-    let (stdout, out_cut) = out.await.unwrap_or_default();
-    let (stderr, err_cut) = err.await.unwrap_or_default();
+    let drained = tokio::time::timeout(KILL_GRACE, async {
+        let _ = (&mut out).await;
+        let _ = (&mut err).await;
+    })
+    .await
+    .is_ok();
+    if !drained {
+        out.abort();
+        err.abort();
+    }
+    let (stdout, out_cut) = take(&out_sink);
+    let (stderr, err_cut) = take(&err_sink);
     #[cfg(unix)]
     let signal = {
         use std::os::unix::process::ExitStatusExt;
@@ -596,8 +659,10 @@ async fn run_command(
         exit_code: status.and_then(|s| s.code()),
         signal,
         timed_out,
+        held_open: !drained,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout_cut: out_cut,
         truncated: out_cut || err_cut,
         spawn_error: None,
     }
@@ -864,8 +929,21 @@ impl PluginHost {
         let mut error = ran.spawn_error.clone();
         if ran.timed_out {
             error = Some(format!("timed out after {}s; killed", timeout.as_secs()));
+        } else if ran.held_open {
+            error = Some(
+                "its output stayed open after it exited: a process it started left its \
+                 process group (setsid, a daemon) and is not the hub's to kill; the run was cut"
+                    .into(),
+            );
         }
-        let parsed = parse_response(&ran.stdout);
+        let parsed = if ran.stdout_cut && ran.stdout.trim_start().starts_with('{') {
+            Err(format!(
+                "response is over the {} KiB output cap",
+                OUTPUT_CAP / 1024
+            ))
+        } else {
+            parse_response(&ran.stdout)
+        };
         let response = match parsed {
             Ok(response) => response,
             Err(message) => {
@@ -997,7 +1075,29 @@ impl PluginHost {
     }
 
     /// Run `name`'s action `id` (for `session`, when given or needed).
+    /// The run is its own task: a caller that goes away (an HTTP client
+    /// that hung up) does not cut it short -- it still keeps its
+    /// deadline, kills its group, and is logged.
     pub async fn run_action(
+        self: &Arc<Self>,
+        hub: &Arc<Hub>,
+        name: &str,
+        id: &str,
+        session: Option<String>,
+    ) -> Result<ActionResult, ActionError> {
+        let host = Arc::clone(self);
+        let hub = Arc::clone(hub);
+        let (name, id) = (name.to_owned(), id.to_owned());
+        tokio::spawn(async move { host.run_action_here(&hub, &name, &id, session).await })
+            .await
+            .unwrap_or_else(|e| {
+                Err(ActionError::Refused(format!(
+                    "the action's run failed: {e}"
+                )))
+            })
+    }
+
+    async fn run_action_here(
         self: &Arc<Self>,
         hub: &Arc<Hub>,
         name: &str,
@@ -1129,6 +1229,14 @@ impl PluginHost {
                 let Some(hub) = weak.upgrade() else { break };
                 match event {
                     HubEvent::Lifecycle { event, payload } => {
+                        if event == "session.removed"
+                            && let Some(id) = payload.pointer("/session/id").and_then(Value::as_str)
+                        {
+                            host.statuses
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .remove(id);
+                        }
                         host.dispatch(&hub, event, payload);
                     }
                     HubEvent::Status { session_id } => {
@@ -1369,6 +1477,11 @@ context = "session"
         for (text, needle) in [
             (
                 "command=[\"x\"]\n[[events]]\non=\"nope\"\n",
+                "unknown event",
+            ),
+            (
+                // Nothing emits it yet (fan-out has not shipped).
+                "command=[\"x\"]\n[[events]]\non=\"fanout.finished\"\n",
                 "unknown event",
             ),
             ("[[events]]\non=\"session.created\"\n", "no command"),

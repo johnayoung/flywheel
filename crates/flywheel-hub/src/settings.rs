@@ -505,6 +505,7 @@ impl SettingsStore {
                 "reserved": keys::RESERVED.iter().map(|(k, why)| json!({"key": k, "why": why})).collect::<Vec<_>>(),
                 "terminal": keys::TERMINAL.iter().map(|(k, why)| json!({"key": k, "why": why})).collect::<Vec<_>>(),
                 "shadowed": keys::SHADOWED.iter().map(|(k, why)| json!({"key": k, "why": why})).collect::<Vec<_>>(),
+                "desktop": keys::DESKTOP.iter().map(|(k, why)| json!({"key": k, "why": why})).collect::<Vec<_>>(),
             },
             "load_error": self.load_error,
             "file": self.path.to_string_lossy(),

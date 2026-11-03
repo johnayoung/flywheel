@@ -151,7 +151,7 @@ function renderTabs() {
       el("button", {
         type: "button",
         className: "tab-pick",
-        title: `${t.name}: ${count} pane${count === 1 ? "" : "s"}${i < 9 ? ` (Ctrl B ${i + 1} with the prefix on)` : ""}; double-click to rename`,
+        title: `${t.name}: ${count} pane${count === 1 ? "" : "s"}${i < 9 && settings.keyOf("prefix.arm") && settings.keyOf("prefix.tab") ? ` (${settings.keyOf("prefix.arm")} ${settings.keyOf("prefix.tab").replace("1-9", String(i + 1))} with the prefix on)` : ""}; double-click to rename`,
         // The first click of a double-click on another tab switches to
         // it and rebuilds the bar, so the second lands on a new button:
         // a click's `detail` (2 on the second) starts the rename either way.

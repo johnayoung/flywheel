@@ -548,11 +548,35 @@ pub fn claude_signal(event: &str, detail: Option<&str>) -> Option<Signal> {
     })
 }
 
-/// A human line for a blocked Claude Code session, from its hook payload.
-pub fn claude_detail(event: &str, payload: &serde_json::Value) -> Option<String> {
-    let text = |key: &str| payload.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+/// A human line for a blocked Claude Code session, from its hook payload
+/// (a notification without a message: from its type, `qualifier`).
+pub fn claude_detail(
+    event: &str,
+    qualifier: Option<&str>,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.trim().is_empty())
+            .map(str::to_owned)
+    };
     match event {
-        "Notification" => text("message"),
+        "Notification" => text("message").or_else(|| {
+            Some(
+                match qualifier? {
+                    "permission_prompt" => "Claude needs your permission",
+                    "elicitation_dialog" | "elicitation_url_dialog" => {
+                        "Claude is asking a question"
+                    }
+                    "agent_needs_input" => "Claude needs your input",
+                    "idle_prompt" => "Claude is waiting for your input",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
+        }),
         "PermissionRequest" => {
             let tool = text("tool_name")?;
             // A question tool asks its question; the permission is moot.
@@ -877,20 +901,31 @@ mod tests {
         assert_eq!(claude_signal("FileChanged", None), None);
         let payload = serde_json::json!({ "message": "needs you", "tool_name": "Bash" });
         assert_eq!(
-            claude_detail("Notification", &payload).as_deref(),
+            claude_detail("Notification", Some("permission_prompt"), &payload).as_deref(),
             Some("needs you")
         );
         assert_eq!(
-            claude_detail("PermissionRequest", &payload).as_deref(),
+            claude_detail("PermissionRequest", None, &payload).as_deref(),
             Some("permission to use Bash")
         );
-        assert_eq!(claude_detail("Stop", &payload), None);
+        assert_eq!(claude_detail("Stop", None, &payload), None);
+        // No message: the notification type says what it is.
+        let bare = serde_json::json!({});
+        assert_eq!(
+            claude_detail("Notification", Some("permission_prompt"), &bare).as_deref(),
+            Some("Claude needs your permission")
+        );
+        assert_eq!(
+            claude_detail("Notification", Some("auth_success"), &bare),
+            None
+        );
+        assert_eq!(claude_detail("Notification", None, &bare), None);
         let question = serde_json::json!({
             "tool_name": "AskUserQuestion",
             "tool_input": { "questions": [{ "question": "Which color do you prefer?" }] },
         });
         assert_eq!(
-            claude_detail("PermissionRequest", &question).as_deref(),
+            claude_detail("PermissionRequest", None, &question).as_deref(),
             Some("Which color do you prefer?")
         );
         for matcher in ["elicitation_url_dialog", "agent_needs_input"] {

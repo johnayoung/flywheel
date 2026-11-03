@@ -15,8 +15,16 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// The settings view plus this hub's id (a browser keys its per-device
+/// overrides by it: another hub later on the same origin starts clean).
+fn settings_view(app: &AppState) -> serde_json::Value {
+    let mut view = app.settings.view();
+    view["hub_id"] = json!(app.machines.hub_id());
+    view
+}
+
 pub(super) async fn get_settings(State(app): State<AppState>) -> Response {
-    Json(app.settings.view()).into_response()
+    Json(settings_view(&app)).into_response()
 }
 
 /// Save a patch written against `rev`: 200 the settings (+ warnings),
@@ -32,7 +40,7 @@ pub(super) async fn put_settings(
             app.hub.emit(HubEvent::Settings {
                 rev: saved.settings.rev,
             });
-            let mut view = app.settings.view();
+            let mut view = settings_view(&app);
             view["warnings"] = json!(saved.warnings);
             Json(view).into_response()
         }
@@ -40,7 +48,7 @@ pub(super) async fn put_settings(
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "settings changed elsewhere; re-read and apply again",
-                "settings": app.settings.view(),
+                "settings": settings_view(&app),
             })),
         )
             .into_response(),

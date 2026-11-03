@@ -87,17 +87,17 @@
     <nav id="workspaces" aria-label="Workspaces"></nav>
     <div id="spend" class="spend" hidden aria-label="Agent spend"></div>
     <div class="side-actions">
-      <button type="button" class="slab" data-action="new-session" title="New session (Alt N)"><svg><use href="#i-plus"/></svg>Session</button>
-      <button type="button" class="slab ghost" data-action="new-workspace" title="New workspace (Alt Shift N)"><svg><use href="#i-plus"/></svg>Workspace</button>
+      <button type="button" class="slab" data-action="new-session" data-key-title="session.new" data-title="New session" title="New session (Alt N)"><svg><use href="#i-plus"/></svg>Session</button>
+      <button type="button" class="slab ghost" data-action="new-workspace" data-key-title="workspace.new" data-title="New workspace" title="New workspace (Alt Shift N)"><svg><use href="#i-plus"/></svg>Workspace</button>
       <button type="button" class="slab ghost" id="from-template" data-action="from-template" title="New agent from a saved template" hidden><svg><use href="#i-plus"/></svg>From template</button>
       <button type="button" class="slab ghost" data-action="fanouts" title="Verified fan-out: one prompt to several agents, graded and ranked"><svg><use href="#i-branch"/></svg>Fan-out</button>
     </div>
     <footer class="side-foot">
-      <button type="button" class="chip" data-action="palette" title="Command palette">
-        <kbd>Ctrl K</kbd><span>palette</span>
+      <button type="button" class="chip" data-action="palette" data-key-title="palette.open" data-title="Command palette" title="Command palette (Ctrl K)">
+        <kbd data-key="palette.open">Ctrl K</kbd><span>palette</span>
       </button>
-      <button type="button" class="chip" data-action="search" title="Search every session (Ctrl Shift F)">
-        <kbd>Ctrl Shift F</kbd><span>search</span>
+      <button type="button" class="chip" data-action="search" data-key-title="search.open" data-title="Search every session" title="Search every session (Ctrl Shift F)">
+        <kbd data-key="search.open">Ctrl Shift F</kbd><span>search</span>
       </button>
       <button type="button" class="chip" id="theme-toggle" data-action="cycle-theme" title="Theme">
         <span class="theme-swatch" aria-hidden="true"></span><span id="theme-label">auto</span>
@@ -125,9 +125,9 @@
         <button type="button" id="meter-usage" class="meter usage" hidden></button>
         <span id="meter-size" class="meter"></span>
         <span id="meter-viewers" class="meter"></span>
-        <button type="button" id="search-toggle" class="cmd-pill search-pill" data-action="search" title="Search every session (Ctrl Shift F)" aria-controls="search"><svg><use href="#i-search"/></svg>search</button>
+        <button type="button" id="search-toggle" class="cmd-pill search-pill" data-action="search" data-key-title="search.open" data-title="Search every session" title="Search every session (Ctrl Shift F)" aria-controls="search"><svg><use href="#i-search"/></svg>search</button>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
-        <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
+        <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" data-key-title="commands.toggle" data-title="Suggested commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
         <button type="button" id="rv-toggle" class="cmd-pill rv-pill" data-action="toggle-review" aria-pressed="false" aria-controls="review" hidden><svg><use href="#i-branch"/></svg>review<b id="rv-count" hidden></b></button>
         <button type="button" id="fw-toggle" class="cmd-pill fw-pill" data-action="toggle-flywheel" aria-pressed="false" aria-controls="flywheel" hidden><svg><use href="#i-wheel"/></svg>flywheel<b id="fw-count" hidden></b></button>
         <span id="prefix-pill" class="prefix-pill" hidden title="Pane prefix: press a key (% &quot; arrows z x c n p 1-9 , &amp; ?), Esc to cancel">ctrl b</span>
@@ -195,10 +195,10 @@
         <p id="empty-body">Pick a session, or start one.</p>
         <div class="empty-actions" id="empty-actions"></div>
         <dl class="keys">
-          <div><dt><kbd>Ctrl</kbd><kbd>K</kbd></dt><dd>command palette</dd></div>
-          <div><dt><kbd>Alt</kbd><kbd>N</kbd></dt><dd>new session</dd></div>
-          <div><dt><kbd>Alt</kbd><kbd>1</kbd>&ndash;<kbd>9</kbd></dt><dd>jump to session</dd></div>
-          <div><dt><kbd>Alt</kbd><kbd>&uarr;</kbd><kbd>&darr;</kbd></dt><dd>previous / next</dd></div>
+          <div data-key-row><dt><kbd data-key="palette.open">Ctrl K</kbd></dt><dd>command palette</dd></div>
+          <div data-key-row><dt><kbd data-key="session.new">Alt N</kbd></dt><dd>new session</dd></div>
+          <div data-key-row><dt><kbd data-key="session.jump">Alt 1-9</kbd></dt><dd>jump to session</dd></div>
+          <div data-key-row><dt><kbd data-key="session.prev">Alt &uarr;</kbd><kbd data-key="session.next">Alt &darr;</kbd></dt><dd>previous / next</dd></div>
         </dl>
       </div>
     </section>

@@ -83,7 +83,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     global(
         "palette.open",
         "General",
-        "Command palette (again inside it: a literal ^K)",
+        "Command palette (pressed again inside it: the key goes to the terminal)",
         &["mod+k"],
     ),
     global(
@@ -281,11 +281,43 @@ pub const RESERVED: &[(&str, &str)] = &[
     ("ctrl+pagedown", "the browser switches tabs"),
     ("ctrl+shift+i", "the browser opens its developer tools"),
     ("ctrl+shift+j", "the browser opens its developer tools"),
+    ("ctrl+shift+c", "the browser opens its element inspector"),
+    ("ctrl+shift+delete", "the browser clears browsing data"),
+    ("ctrl+alt+delete", "the OS takes Ctrl Alt Delete"),
+    ("ctrl+alt+backspace", "some X11 desktops kill the session"),
     ("alt+f4", "the OS closes the window"),
     ("alt+tab", "the OS switches windows"),
     ("alt+shift+tab", "the OS switches windows"),
     ("alt+space", "the OS opens the window menu"),
     ("f11", "the browser goes full screen"),
+];
+
+/// Keys that may never reach the page on some desktops or setups (it
+/// depends on the machine, so they are warnings, not refusals).
+pub const DESKTOP: &[(&str, &str)] = &[
+    (
+        "ctrl+alt+t",
+        "Ubuntu and other Linux desktops open a terminal on it",
+    ),
+    ("ctrl+alt+l", "Linux desktops lock the screen on it"),
+    ("ctrl+alt+d", "some Linux desktops show the desktop on it"),
+    ("ctrl+alt+left", "Linux desktops switch workspaces on it"),
+    ("ctrl+alt+right", "Linux desktops switch workspaces on it"),
+    ("ctrl+alt+up", "Linux desktops switch workspaces on it"),
+    ("ctrl+alt+down", "Linux desktops switch workspaces on it"),
+    (
+        "ctrl+space",
+        "input-method switching takes it on many systems, and terminals lose ^@ (NUL: set-mark in emacs and shells)",
+    ),
+    (
+        "ctrl+shift+space",
+        "input-method switching takes it on some systems",
+    ),
+    (
+        "ctrl+shift+v",
+        "the browser pastes plain text on it, and terminals paste with it",
+    ),
+    ("ctrl+shift+b", "the browser toggles its bookmarks bar"),
 ];
 
 /// Keys a terminal needs: binding one globally takes it from every
@@ -645,7 +677,10 @@ pub fn check(overrides: &BTreeMap<String, Vec<String>>) -> Check {
                 ));
                 continue;
             }
-            if let Some((_, why)) = SHADOWED
+            if let Some((_, why)) = DESKTOP.iter().find(|(k, _)| samples.iter().any(|s| s == k)) {
+                out.warnings
+                    .push(finding(spec.id, &key, format!("may never arrive: {why}")));
+            } else if let Some((_, why)) = SHADOWED
                 .iter()
                 .find(|(k, _)| samples.iter().any(|s| s == k))
             {
@@ -670,6 +705,28 @@ pub fn check(overrides: &BTreeMap<String, Vec<String>>) -> Check {
                     spec.id,
                     &key,
                     "browsers open their developer tools on F12".into(),
+                ));
+            }
+        }
+    }
+    // After the prefix, the prefix key itself is taken: pressed twice it
+    // goes to the terminal.
+    let arm: Vec<String> = out
+        .keys
+        .get("prefix.arm")
+        .into_iter()
+        .flatten()
+        .filter_map(|k| parse(k, Scope::Global).ok().map(|p| p.as_ctrl()))
+        .collect();
+    for spec in ACTIONS.iter().filter(|a| a.scope == Scope::Prefix) {
+        for key in out.keys.get(spec.id).into_iter().flatten() {
+            if arm.contains(key) {
+                out.errors.push(finding(
+                    spec.id,
+                    key,
+                    format!(
+                        "{key} is the pane prefix key: pressed after the prefix it goes to the terminal"
+                    ),
                 ));
             }
         }
@@ -761,6 +818,17 @@ mod tests {
                     .errors
                     .iter()
                     .any(|f| f.action == "pane.zoom" && f.message.contains(needle)),
+                "{key}: {:?}",
+                check.errors
+            );
+        }
+        for key in ["ctrl+shift+c", "mod+shift+c", "ctrl+alt+delete"] {
+            let check = check(&map(&[("palette.open", &[key])]));
+            assert!(
+                check
+                    .errors
+                    .iter()
+                    .any(|f| f.action == "palette.open" && f.message.contains("reserved")),
                 "{key}: {:?}",
                 check.errors
             );
@@ -858,6 +926,46 @@ mod tests {
                 .iter()
                 .any(|w| w.key == "mod+y" && w.message.contains("^Y"))
         );
+    }
+
+    #[test]
+    fn desktop_keys_are_warnings() {
+        for key in ["ctrl+alt+t", "ctrl+space", "mod+space", "ctrl+shift+v"] {
+            let check = check(&map(&[("palette.open", &[key])]));
+            assert!(check.errors.is_empty(), "{key}: {:?}", check.errors);
+            assert!(
+                check
+                    .warnings
+                    .iter()
+                    .any(|w| w.action == "palette.open" && w.message.contains("may never arrive")),
+                "{key}: {:?}",
+                check.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_action_cannot_take_the_prefix_key() {
+        let check = check(&map(&[("prefix.zoom", &["ctrl+b"])]));
+        assert!(
+            check
+                .errors
+                .iter()
+                .any(|f| f.action == "prefix.zoom" && f.message.contains("pane prefix key")),
+            "{:?}",
+            check.errors
+        );
+        // Follows a rebound prefix.
+        let moved = super::check(&map(&[
+            ("prefix.arm", &["mod+a"]),
+            ("prefix.zoom", &["ctrl+b"]),
+        ]));
+        assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+        let clash = super::check(&map(&[
+            ("prefix.arm", &["mod+a"]),
+            ("prefix.zoom", &["ctrl+a"]),
+        ]));
+        assert!(!clash.errors.is_empty());
     }
 
     #[test]

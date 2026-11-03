@@ -224,7 +224,10 @@ window.FwHubLauncher = function (ctx) {
     $("#tpl-save-toggle").hidden = !agent;
     if (!agent) tplSave.hidden = true;
     models.replaceChildren(...(MODELS[kind] || []).map((m) => el("option", { value: m })));
-    modelInput.placeholder = kind === "codex" ? "default: gpt-5-codex..." : "default: opus, sonnet...";
+    const fromHub = agent && ctx.hubDefault ? ctx.hubDefault(`agents.${kind}.model`) : null;
+    modelInput.placeholder = fromHub !== null
+      ? `hub default: ${fromHub}`
+      : kind === "codex" ? "CLI default (e.g. gpt-5-codex)" : "CLI default (e.g. opus, sonnet)";
     prefill();
     updateWarning();
   }

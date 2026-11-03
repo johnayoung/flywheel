@@ -145,6 +145,15 @@ fn start_daemon(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) -> R
     );
     let _ = writeln!(out, "state dir: {}", dir.display());
     let _ = writeln!(out, "log: {} (`fw hub logs -f`)", log.display());
+    // The daemon's startup warnings (a non-loopback bind, from a flag or
+    // hub.toml) belong on this terminal too, not only in its log.
+    for line in daemon::read_from(&log, offset)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("fw hub: WARNING:"))
+    {
+        let _ = writeln!(err, "{line}");
+    }
     // A fresh hub runs exactly the sessions it restored.
     if let Ok(sessions) =
         Endpoint::local(&dir).and_then(|c| c.with_timeout(PROBE_TIMEOUT).blocking_sessions())

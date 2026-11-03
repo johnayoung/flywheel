@@ -20,9 +20,11 @@ fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N]   # agent
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]   # agent hooks only
 # SERVE FLAGS: [--bind ADDR] [--port N] [--public-url URL]... [--allow-origin ORIGIN]... [--trusted-proxy IP]... [--scrollback-lines N] [--no-restore] [--no-agent-resume] [--no-flywheel] [--import-root DIR] [--notify-url URL] [--worktree-branch-prefix P]
 # every verb but report (hooks only) takes --state-dir DIR
+# ls/new/send/read/wait/attach/kill/relaunch/commands/open/url also take [--url URL] [--token T]: a hub elsewhere
+#   (token: prefer FW_HUB_TOKEN; without one, the state dir's token goes only to that state dir's running hub)
 ```
 
-Scripting the running hub (sessions/workspaces by id, unique id prefix, or name; exact name beats prefix; ambiguity is an error):
+Scripting the running hub, or the one `--url` names (sessions/workspaces by id, unique id prefix, or name; exact name beats prefix; ambiguity is an error):
 
 ```bash
 fw hub ls [--json]                                         # workspaces > sessions: short id, kind, state (+ agent status), name, live cwd [branch +ahead -behind ~changed ?untracked]
@@ -31,7 +33,6 @@ fw hub send SESSION TEXT|- [--enter] [--raw]               # pasted: newlines ->
 fw hub read SESSION [--source visible|recent] [--lines N] [--json]
 fw hub wait SESSION --until done|blocked|idle|working|exit [--timeout SECS] [--changed]   # exit 0 met, 124 timeout, 1 error
 fw hub attach [SESSION] [--prefix C-b] [--no-status]      # this terminal on a session (picker without SESSION); see Terminal client
-# wait/attach also take [--url URL] [--token T] (a remote hub; token prefer FW_HUB_TOKEN)
 fw hub kill SESSION [--rm [--remove-worktree [--force]]]   # hang up (record kept, as exited); --rm also forgets it; see Worktrees
 fw hub relaunch SESSION                                    # start an exited/stopped session again in place
 fw hub import FILE.code-workspace... [--name N] [--update] [--json]   # VS Code multi-root workspaces -> workspaces
@@ -39,9 +40,9 @@ fw hub import FILE.code-workspace... [--name N] [--update] [--json]   # VS Code 
 
 `import` reads VS Code workspace files (JSONC: comments, trailing commas): each `folders` entry's `path` (relative to the file's directory, absolute, or `~/`) or `file://` `uri` (and, on WSL, `vscode-remote://wsl+<this distro>/...`) becomes a folder, its `name` the folder's label. The workspace is named after the file (`personal.code-workspace` -> `personal`) unless `--name` (one file only). Missing folders and entries naming no local directory (other remotes, Windows paths) are listed as skipped (stderr summarizes); a file with nothing importable fails. An existing workspace of that name is refused unless `--update`, which replaces its folders and labels (refused when that drops a folder a running session is in). Every file is tried; exit 1 if any failed.
 
-`open` mints a one-time code for `http://<loopback>:<port>/login?code=...[#session=<id>]`, prints that URL, and writes a 0600 redirect page (`open-<id>.html` in the state dir; expired ones are swept) that forwards to it -- the code never goes on an opener's argv (`/proc/*/cmdline` is world-readable). The page goes to `$BROWSER` (`:`-separated commands, `%s` = its `file://` URL) when set, else on WSL `wslview`, else `cmd.exe /c start` (its `\\wsl.localhost\...` path, `^`-escaped), else `xdg-open` (macOS: `open`). Only an opener that cannot start falls through to the next; one that runs and fails ends it (exit 1: it may have opened a tab, and the code is single-use).
+`open` mints a one-time code for `http://<loopback>:<port>/login?code=...[#session=<id>]` (under `--url`: that URL's `/login?code=...`; `url --url` prints the same), prints that URL, and writes a 0600 redirect page (`open-<id>.html` in the state dir; expired ones are swept) that forwards to it -- the code never goes on an opener's argv (`/proc/*/cmdline` is world-readable). The page goes to `$BROWSER` (`:`-separated commands, `%s` = its `file://` URL) when set, else on WSL `wslview`, else `cmd.exe /c start` (its `\\wsl.localhost\...` path, `^`-escaped), else `xdg-open` (macOS: `open`). Only an opener that cannot start falls through to the next; one that runs and fails ends it (exit 1: it may have opened a tab, and the code is single-use).
 
-`new --create` makes workspace `WS` (with `--folder`) when none matches; `--folder` is a path (relative to the caller's directory) or one of the workspace's folder labels or directory names (`--folder john-finances`). `send` wraps text in `ESC[200~ ... ESC[201~` only when the program set bracketed paste (markers inside the text are stripped, repeatedly, so split markers cannot reassemble), a final newline becomes that Enter (`printf 'make\n' | fw hub send s -` runs it), and sends Enter 50 ms later as its own keypress; `--raw` sends bytes untouched (`fw hub send s $'\x03' --raw` is Ctrl-C).
+`new --create` makes workspace `WS` (with `--folder`) when none matches; `--folder` is a path (relative to the caller's directory, and on the hub's machine under `--url`) or one of the workspace's folder labels or directory names (`--folder john-finances`). `send` wraps text in `ESC[200~ ... ESC[201~` only when the program set bracketed paste (markers inside the text are stripped, repeatedly, so split markers cannot reassemble), a final newline becomes that Enter (`printf 'make\n' | fw hub send s -` runs it), and sends Enter 50 ms later as its own keypress; `--raw` sends bytes untouched (`fw hub send s $'\x03' --raw` is Ctrl-C).
 
 ## Terminal client: `fw hub attach`
 

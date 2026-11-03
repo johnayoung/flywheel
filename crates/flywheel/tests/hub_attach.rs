@@ -746,6 +746,90 @@ fn wait_returns_when_the_agent_reports_done_and_times_out_with_124() {
     assert!(stderr.contains("no session matches"), "{stderr}");
 }
 
+/// `fw hub VERB ARGS` against `dir`'s state dir, with `token` as
+/// FW_HUB_TOKEN (none: unset).
+fn hub_verb(dir: &Path, args: &[&str], token: Option<&str>) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(FW);
+    cmd.arg("hub")
+        .args(args)
+        .arg("--state-dir")
+        .arg(dir.join("state"))
+        .env_remove("FW_HUB_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(token) = token {
+        cmd.env("FW_HUB_TOKEN", token);
+    }
+    finish(cmd.spawn().unwrap())
+}
+
+#[test]
+fn scripting_verbs_reach_a_hub_by_url_with_the_same_token_rule() {
+    let (_tmp, dir, server, ws) = setup();
+    let (code, session) = http(
+        &server,
+        "POST",
+        "/api/sessions",
+        Some(json!({ "workspace_id": ws, "name": "sh", "command": ["/bin/sh"] })),
+    );
+    assert_eq!(code, 201, "{session}");
+    let url = format!("http://127.0.0.1:{}", server.port);
+    let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = format!(
+        "http://127.0.0.1:{}",
+        elsewhere.local_addr().unwrap().port()
+    );
+
+    // --url + FW_HUB_TOKEN (an empty state dir would do: nothing local is read).
+    let (code, stdout, stderr) = hub_verb(&dir, &["ls", "--url", &url], Some(&server.token));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("demo") && stdout.contains("sh"), "{stdout}");
+    let (code, _, stderr) = hub_verb(
+        &dir,
+        &["send", "sh", "echo via-url\n", "--url", &url],
+        Some(&server.token),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    wait_until("the sent line on screen", || {
+        screen_text(&server, session["id"].as_str().unwrap()).contains("via-url")
+    });
+    let (code, stdout, stderr) =
+        hub_verb(&dir, &["read", "sh", "--url", &url], Some(&server.token));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("via-url"), "{stdout}");
+
+    // The local hub by --url, no token given: its own state-dir token.
+    let (code, _, stderr) = hub_verb(&dir, &["ls", "--url", &url], None);
+    assert_eq!(code, Some(0), "{stderr}");
+
+    // Any other host without a token: refused before contacting it.
+    for verb in [&["ls"][..], &["read", "sh"], &["url"], &["commands", "sh"]] {
+        let mut args = verb.to_vec();
+        args.extend(["--url", other.as_str()]);
+        let (code, _, stderr) = hub_verb(&dir, &args, None);
+        assert_eq!(code, Some(1), "{verb:?}: {stderr}");
+        assert!(
+            stderr.contains("--url needs the hub's token"),
+            "{verb:?}: {stderr}"
+        );
+    }
+    elsewhere.set_nonblocking(true).unwrap();
+    assert!(
+        elsewhere.accept().is_err(),
+        "the other address was contacted"
+    );
+
+    // A wrong token: the hub's refusal, said plainly.
+    let (code, _, stderr) = hub_verb(&dir, &["ls", "--url", &url], Some("not-the-token"));
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("the hub refused the token"), "{stderr}");
+
+    // `url --url`: a login link at that URL.
+    let (code, stdout, stderr) = hub_verb(&dir, &["url", "--url", &url], Some(&server.token));
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains(&format!("{url}/login?code=")), "{stdout}");
+}
+
 #[test]
 fn a_turn_seen_in_one_attach_stays_seen_in_the_next() {
     let (_tmp, dir, server, ws) = setup();

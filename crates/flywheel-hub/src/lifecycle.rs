@@ -6,8 +6,8 @@ use crate::cli::{
     show_login,
 };
 use crate::daemon::{self, LOG_FILE};
+use crate::endpoint::Endpoint;
 use crate::remote::{RuntimeInfo, ServeLock};
-use crate::script::HubConn;
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -139,7 +139,7 @@ fn start_daemon(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) -> R
     let _ = writeln!(out, "log: {} (`fw hub logs -f`)", log.display());
     // A fresh hub runs exactly the sessions it restored.
     if let Ok(sessions) =
-        HubConn::connect(&dir).and_then(|c| c.with_timeout(PROBE_TIMEOUT).sessions())
+        Endpoint::local(&dir).and_then(|c| c.with_timeout(PROBE_TIMEOUT).blocking_sessions())
     {
         report_sessions(&sessions, out, err);
     }
@@ -369,9 +369,9 @@ pub(crate) fn status(args: &StatusArgs, out: &mut dyn Write, err: &mut dyn Write
     let uptime = info
         .started_at
         .map(|at| (Utc::now() - at).num_seconds().max(0));
-    let listed = HubConn::connect(&dir)
+    let listed = Endpoint::local(&dir)
         .map(|c| c.with_timeout(PROBE_TIMEOUT))
-        .and_then(|c| Ok((c.workspaces()?, c.sessions()?)));
+        .and_then(|c| Ok((c.blocking_workspaces()?, c.blocking_sessions()?)));
     let (workspaces, sessions) = match listed {
         Ok(lists) => lists,
         Err(message) => {

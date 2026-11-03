@@ -1,18 +1,28 @@
-//! Where a terminal client (`fw hub attach`, `fw hub wait`) reaches a hub:
-//! the one running for this machine's state dir (address from its runtime
-//! file, token from its token file), or any hub by `--url` and token (a
-//! remote one behind `tailscale serve`, over https).
+//! The one hub client: every `fw hub` verb that talks to a running hub
+//! (`ls`, `new`, `send`, `read`, `kill`, `relaunch`, `import`, `commands`,
+//! `open`, `url`, `token --rotate`, `status`, `wait`, `attach`) resolves
+//! it here and speaks to it through [`Endpoint`].
+//!
+//! A hub is either the one running for this machine's state dir (address
+//! from its runtime file, token from its token file), or, for the verbs
+//! that take [`EndpointArgs`], any hub by `--url` and token (a remote one
+//! behind `tailscale serve`, over https). The state dir's token is never
+//! sent to a `--url` host unless that URL is the state dir's own running
+//! hub; any other needs `--token` / FW_HUB_TOKEN.
 //!
 //! Speaks the same API the browser does: bearer-authenticated JSON over
 //! HTTP and the `/api/sessions/{id}/ws` and `/api/events` WebSockets. No
-//! `Origin` is sent: the hub's cross-origin checks are for browsers.
+//! `Origin` is sent: the hub's cross-origin checks are for browsers. The
+//! transport is async; the scripting verbs use its `blocking_*` forms.
 
 use crate::auth::Token;
 use crate::cli::{StateDirArg, resolve_state_dir, running_hub};
+use crate::paths::default_state_dir;
+use crate::remote::RuntimeInfo;
 use serde_json::Value;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
@@ -22,11 +32,12 @@ use url::Url;
 
 /// How long connecting (TCP, TLS, WebSocket handshake) may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long one REST call may take.
+/// How long one REST call may take by default (session spawns included);
+/// [`Endpoint::with_timeout`] changes it.
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest WebSocket message accepted (the hub sends at most 256 KiB).
 const WS_MAX_MESSAGE: usize = 4 * 1024 * 1024;
-/// The environment variable holding a remote hub's token.
+/// The environment variable holding a hub's token (for `--url`).
 pub const TOKEN_ENV: &str = "FW_HUB_TOKEN";
 
 /// Which hub to talk to.
@@ -53,14 +64,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 /// A WebSocket to the hub.
 pub type Socket = WebSocketStream<Box<dyn Io>>;
 
-/// Where the token comes from.
-enum TokenFrom {
-    /// `--token` / FW_HUB_TOKEN.
-    Given(String),
-    /// The state dir's token file.
-    StateDir(PathBuf),
-}
-
 /// A resolved hub: base URL and credential.
 pub struct Endpoint {
     base: Url,
@@ -68,8 +71,15 @@ pub struct Endpoint {
     /// The state dir the token was read from (re-read after a rotation);
     /// `None` for a token given by hand.
     token_dir: Option<PathBuf>,
+    /// The hub running for this machine's state dir, when that is the one
+    /// reached.
+    local: Option<RuntimeInfo>,
+    /// Per-call limit of REST calls.
+    timeout: Duration,
     tls: Option<Arc<rustls::ClientConfig>>,
     http: reqwest::Client,
+    /// Drives the `blocking_*` calls (built on first use).
+    blocking: OnceLock<tokio::runtime::Runtime>,
 }
 
 impl std::fmt::Debug for Endpoint {
@@ -77,72 +87,87 @@ impl std::fmt::Debug for Endpoint {
         // Never the token.
         f.debug_struct("Endpoint")
             .field("base", &self.base.as_str())
-            .finish()
+            .field("local", &self.local.as_ref().map(|info| info.pid))
+            .finish_non_exhaustive()
     }
 }
 
 impl Endpoint {
     /// Resolve `args`: `--url` (with `--token` or FW_HUB_TOKEN; the state
     /// dir's token only when the URL is that state dir's running hub), else
-    /// the hub running for the state dir.
+    /// the hub running for the state dir (`--token` / FW_HUB_TOKEN, else
+    /// its token file).
     pub(crate) fn resolve(args: &EndpointArgs) -> Result<Self, String> {
-        let env_token = std::env::var(TOKEN_ENV)
-            .ok()
-            .filter(|t| !t.trim().is_empty());
-        let explicit = args.token.clone().or(env_token);
-        let dir = || resolve_state_dir(&args.state);
-        let local_token = |dir: &std::path::Path| {
-            Token::load(dir)
-                .map_err(|e| e.to_string())?
-                .map(|t| t.expose().to_owned())
-                .ok_or_else(|| "the running hub's token file is missing".to_owned())
+        let explicit = args.token.clone().or_else(|| {
+            std::env::var(TOKEN_ENV)
+                .ok()
+                .filter(|t| !t.trim().is_empty())
+        });
+        let Some(raw) = &args.url else {
+            let dir = resolve_state_dir(&args.state)?;
+            return Self::for_state_dir(&dir, explicit)?.ok_or_else(|| no_hub_message(&dir));
         };
-        let (base, from) = match &args.url {
-            Some(raw) => {
-                let base = parse_base(raw)?;
-                if let Some(token) = explicit {
-                    (base, TokenFrom::Given(token))
-                } else {
-                    // Never hand this machine's credential to another host:
-                    // the local token only goes to the local hub.
-                    let dir = dir()?;
-                    let listen = running_hub(&dir)?.map(|info| info.listen);
-                    if !listen.is_some_and(|listen| is_local_hub(&base, listen)) {
-                        return Err(format!(
-                            "--url needs the hub's token: set {TOKEN_ENV} (or --token) to the \
-                             output of `fw hub token` on its machine (the local token is only \
-                             sent to the hub running for {})",
-                            dir.display()
-                        ));
-                    }
-                    (base, TokenFrom::StateDir(dir))
-                }
-            }
-            None => {
-                let dir = dir()?;
-                let info = running_hub(&dir)?.ok_or_else(|| {
-                    format!(
-                        "no hub is running for state dir {} (start one with `fw hub start`, \
-                         or pass --url)",
-                        dir.display()
-                    )
-                })?;
-                let base = Url::parse(&format!("http://{}", info.connect_addr()))
-                    .map_err(|e| format!("bad hub address: {e}"))?;
-                match explicit {
-                    Some(token) => (base, TokenFrom::Given(token)),
-                    None => (base, TokenFrom::StateDir(dir)),
-                }
-            }
-        };
-        match from {
-            TokenFrom::Given(token) => Self::new(base, token),
-            TokenFrom::StateDir(dir) => {
-                let mut endpoint = Self::new(base, local_token(&dir)?)?;
-                endpoint.token_dir = Some(dir);
-                Ok(endpoint)
-            }
+        let base = parse_base(raw)?;
+        if let Some(token) = explicit {
+            return Self::new(base, token, None, None);
         }
+        // Never hand this machine's credential to another host: the local
+        // token only goes to the local hub.
+        let dir = resolve_state_dir(&args.state)?;
+        let Some(info) = running_hub(&dir)?.filter(|info| is_local_hub(&base, info.listen)) else {
+            return Err(format!(
+                "--url needs the hub's token: set {TOKEN_ENV} (or --token) to the output of \
+                 `fw hub token` on its machine (the local token is only sent to the hub \
+                 running for {})",
+                dir.display()
+            ));
+        };
+        let token = local_token(&dir)?;
+        Self::new(base, token, Some(dir), Some(info))
+    }
+
+    /// The hub running for `state_dir` with its own token, or why there is
+    /// none (how to start one).
+    pub fn local(state_dir: &Path) -> Result<Self, String> {
+        Self::running(state_dir)?.ok_or_else(|| no_hub_message(state_dir))
+    }
+
+    /// The hub running for `state_dir` with its own token, or `None` when
+    /// none runs.
+    pub fn running(state_dir: &Path) -> Result<Option<Self>, String> {
+        Self::for_state_dir(state_dir, None)
+    }
+
+    /// The hub running for `state_dir`, with `token` or the state dir's.
+    fn for_state_dir(state_dir: &Path, token: Option<String>) -> Result<Option<Self>, String> {
+        let Some(info) = running_hub(state_dir)? else {
+            return Ok(None);
+        };
+        let base = Url::parse(&format!("http://{}", info.connect_addr()))
+            .map_err(|e| format!("bad hub address: {e}"))?;
+        let endpoint = match token {
+            Some(token) => Self::new(base, token, None, Some(info))?,
+            None => Self::new(
+                base,
+                local_token(state_dir)?,
+                Some(state_dir.to_owned()),
+                Some(info),
+            )?,
+        };
+        Ok(Some(endpoint))
+    }
+
+    /// The same hub, each REST call waited on for at most `timeout` (a
+    /// probe of a hub that may be wedged).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The hub running for this machine's state dir, when that is the one
+    /// reached (its pid, listen address, public URLs).
+    pub fn local_info(&self) -> Option<&RuntimeInfo> {
+        self.local.as_ref()
     }
 
     /// Re-read a token that came from the state dir (the hub rotated it):
@@ -170,7 +195,12 @@ impl Endpoint {
             .clone()
     }
 
-    fn new(base: Url, token: String) -> Result<Self, String> {
+    fn new(
+        base: Url,
+        token: String,
+        token_dir: Option<PathBuf>,
+        local: Option<RuntimeInfo>,
+    ) -> Result<Self, String> {
         let token = token.trim().to_owned();
         if token.is_empty() || token.bytes().any(|b| !b.is_ascii_graphic()) {
             return Err("the token must be printable ASCII without spaces".into());
@@ -182,7 +212,6 @@ impl Endpoint {
             .no_proxy()
             .http1_only()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(CALL_TIMEOUT)
             .user_agent(concat!("flywheel-hub/", env!("CARGO_PKG_VERSION")));
         builder = match &tls {
             Some(config) => builder.tls_backend_preconfigured(config.as_ref().clone()),
@@ -194,9 +223,12 @@ impl Endpoint {
         Ok(Self {
             base,
             token: RwLock::new(token),
-            token_dir: None,
+            token_dir,
+            local,
+            timeout: CALL_TIMEOUT,
             tls,
             http,
+            blocking: OnceLock::new(),
         })
     }
 
@@ -211,47 +243,110 @@ impl Endpoint {
             .map_err(|e| format!("bad API path {path:?}: {e}"))
     }
 
-    /// `GET path` -> JSON (`null` when empty), or the API's error.
-    pub async fn get(&self, path: &str) -> Result<Value, String> {
-        let request = self.http.get(self.url(path)?);
-        self.send(request).await
+    /// Why the hub could not be reached: `why`, naming the hub.
+    fn unreachable(&self, why: &str) -> String {
+        match &self.local {
+            Some(info) => format!(
+                "cannot reach the running hub (pid {}) at {}: {why}",
+                info.pid,
+                info.connect_addr()
+            ),
+            None => format!("cannot reach the hub at {}: {why}", self.base()),
+        }
     }
 
-    async fn send(&self, request: reqwest::RequestBuilder) -> Result<Value, String> {
+    /// `method path` with an optional JSON body: the parsed JSON response
+    /// (`null` when empty) on 2xx, else the API's error.
+    pub async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, String> {
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|_| format!("bad HTTP method {method:?}"))?;
+        let mut request = self
+            .http
+            .request(method, self.url(path)?)
+            .timeout(self.timeout)
+            .bearer_auth(self.token());
+        if let Some(body) = body {
+            request = request
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_string());
+        }
         let response = request
-            .bearer_auth(self.token())
             .send()
             .await
-            .map_err(|e| format!("cannot reach the hub at {}: {}", self.base(), describe(&e)))?;
+            .map_err(|e| self.unreachable(&describe(&e)))?;
         let status = response.status().as_u16();
         let body = response
             .bytes()
             .await
             .map_err(|e| format!("reading the hub's answer: {}", describe(&e)))?;
         if !(200..300).contains(&status) {
-            let message = serde_json::from_slice::<Value>(&body)
-                .ok()
-                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
-                .unwrap_or_else(|| String::from_utf8_lossy(&body).trim().to_owned());
-            return Err(match status {
-                401 => format!("the hub refused the token ({message})"),
-                _ => message,
-            });
+            return Err(api_error(status, &error_message(&body)));
         }
         if body.is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_slice(&body).map_err(|e| format!("the hub sent bad JSON: {e}"))
+        serde_json::from_slice(&body)
+            .map_err(|e| format!("the hub sent invalid JSON for {path}: {e}"))
+    }
+
+    /// `GET /api/{what}` -> its `what` array.
+    async fn list(&self, what: &str) -> Result<Vec<Value>, String> {
+        let mut value = self.request("GET", &format!("/api/{what}"), None).await?;
+        match value.get_mut(what).map(Value::take) {
+            Some(Value::Array(items)) => Ok(items),
+            _ => Err(format!("the hub sent no {what} list")),
+        }
     }
 
     /// Every session record (`GET /api/sessions`).
     pub async fn sessions(&self) -> Result<Vec<Value>, String> {
-        list(self.get("/api/sessions").await?, "sessions")
+        self.list("sessions").await
     }
 
     /// Every workspace (`GET /api/workspaces`).
     pub async fn workspaces(&self) -> Result<Vec<Value>, String> {
-        list(self.get("/api/workspaces").await?, "workspaces")
+        self.list("workspaces").await
+    }
+
+    /// Run `future` to completion on this endpoint's own runtime (never
+    /// from inside an async context).
+    fn block_on<F: std::future::Future>(&self, future: F) -> Result<F::Output, String> {
+        let runtime = match self.blocking.get() {
+            Some(runtime) => runtime,
+            None => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("cannot start the hub client: {e}"))?;
+                self.blocking.get_or_init(|| runtime)
+            }
+        };
+        Ok(runtime.block_on(future))
+    }
+
+    /// [`Endpoint::request`], blocking.
+    pub fn blocking_call(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, String> {
+        self.block_on(self.request(method, path, body))?
+    }
+
+    /// [`Endpoint::sessions`], blocking.
+    pub fn blocking_sessions(&self) -> Result<Vec<Value>, String> {
+        self.block_on(self.sessions())?
+    }
+
+    /// [`Endpoint::workspaces`], blocking.
+    pub fn blocking_workspaces(&self) -> Result<Vec<Value>, String> {
+        self.block_on(self.workspaces())?
     }
 
     /// Open the WebSocket at `path` (`/api/events?client=...`,
@@ -281,7 +376,7 @@ impl Endpoint {
         let connect = async {
             let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
                 .await
-                .map_err(|e| format!("cannot reach the hub at {}: {e}", self.base()))?;
+                .map_err(|e| self.unreachable(&e.to_string()))?;
             let _ = tcp.set_nodelay(true);
             let stream: Box<dyn Io> = match &self.tls {
                 Some(config) => {
@@ -314,12 +409,11 @@ fn ws_error(error: &tokio_tungstenite::tungstenite::Error) -> String {
     use tokio_tungstenite::tungstenite::Error;
     match error {
         Error::Http(response) => {
-            let status = response.status().as_u16();
             let message = response
                 .body()
                 .as_deref()
-                .and_then(|b| serde_json::from_slice::<Value>(b).ok())
-                .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
+                .map(error_message)
+                .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| {
                     response
                         .status()
@@ -327,20 +421,69 @@ fn ws_error(error: &tokio_tungstenite::tungstenite::Error) -> String {
                         .unwrap_or("refused")
                         .to_owned()
                 });
-            match status {
-                401 => format!("the hub refused the token ({message})"),
-                _ => message,
-            }
+            api_error(response.status().as_u16(), &message)
         }
         other => format!("WebSocket handshake failed: {other}"),
     }
 }
 
-/// The `{"<what>": [...]}` list of an answer.
-fn list(mut value: Value, what: &str) -> Result<Vec<Value>, String> {
-    match value.get_mut(what).map(Value::take) {
-        Some(Value::Array(items)) => Ok(items),
-        _ => Err(format!("the hub sent no {what} list")),
+/// The API's `{"error": ...}` message of a refusal, or its raw body.
+fn error_message(body: &[u8]) -> String {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_owned())
+}
+
+/// An API failure for humans: a bad token says so; a request the hub
+/// refused (4xx) says why in its own words; anything else keeps the HTTP
+/// status to go on.
+fn api_error(status: u16, message: &str) -> String {
+    match (status, message.is_empty()) {
+        (401, false) => format!("the hub refused the token ({message})"),
+        (401, true) => "the hub refused the token".to_owned(),
+        (400..500, false) => message.to_owned(),
+        (_, true) => format!("the hub answered HTTP {status}"),
+        _ => format!("{message} (HTTP {status})"),
+    }
+}
+
+/// The state dir's token (for its own running hub).
+fn local_token(state_dir: &Path) -> Result<String, String> {
+    Token::load(state_dir)
+        .map_err(|e| e.to_string())?
+        .map(|t| t.expose().to_owned())
+        .ok_or_else(|| "the running hub's token file is missing".to_owned())
+}
+
+/// What a verb that needs the running hub says when there is none: how to
+/// start one for the same state dir (`--state-dir` spelled out unless it
+/// is the default).
+pub fn no_hub_message(state_dir: &Path) -> String {
+    let flag = if default_state_dir().as_deref() == Some(state_dir) {
+        String::new()
+    } else {
+        format!(
+            " --state-dir {}",
+            shell_word(&state_dir.display().to_string())
+        )
+    };
+    format!(
+        "no hub is running for state dir {} (start one with `fw hub start{flag}`)",
+        state_dir.display()
+    )
+}
+
+/// `word` as one shell word (single-quoted when it needs to be).
+fn shell_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%=,".contains(&b))
+    {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
     }
 }
 
@@ -527,8 +670,35 @@ mod tests {
         let endpoint = Endpoint::new(
             Url::parse("http://127.0.0.1:1").unwrap(),
             "s3cr3t-token".into(),
+            None,
+            None,
         )
         .unwrap();
         assert!(!format!("{endpoint:?}").contains("s3cr3t"));
+    }
+
+    #[test]
+    fn the_no_hub_hint_starts_a_hub_for_the_same_state_dir() {
+        let message = no_hub_message(Path::new("/tmp/hub state"));
+        assert!(
+            message.ends_with("(start one with `fw hub start --state-dir '/tmp/hub state'`)"),
+            "{message}"
+        );
+        assert_eq!(shell_word("/a/b-c.d"), "/a/b-c.d");
+        assert_eq!(shell_word("it's"), "'it'\\''s'");
+        if let Some(default) = default_state_dir() {
+            assert!(no_hub_message(&default).ends_with("(start one with `fw hub start`)"));
+        }
+    }
+
+    #[test]
+    fn api_refusals_read_without_http_codes() {
+        assert_eq!(api_error(409, "taken"), "taken");
+        assert_eq!(api_error(500, "boom"), "boom (HTTP 500)");
+        assert_eq!(api_error(502, ""), "the hub answered HTTP 502");
+        assert_eq!(
+            api_error(401, "unauthorized"),
+            "the hub refused the token (unauthorized)"
+        );
     }
 }

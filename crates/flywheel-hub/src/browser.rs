@@ -1,5 +1,6 @@
-//! `fw hub open`: sign a browser on this machine into the running hub with
-//! a fresh one-time code (optionally straight onto a session) and open it.
+//! `fw hub open`: sign a browser on this machine into the running hub (or
+//! the one `--url` names) with a fresh one-time code (optionally straight
+//! onto a session) and open it.
 //!
 //! The code never goes on an opener's command line (any local user can
 //! read `/proc/<pid>/cmdline`, and a browser keeps its argv for life): the
@@ -15,8 +16,9 @@
 //! something to click.
 
 use crate::auth::{LOGIN_CODE_TTL, write_private};
-use crate::cli::{StateDirArg, browse_host, resolve_state_dir};
-use crate::script::{HubConn, resolve};
+use crate::cli::{browse_host, resolve_state_dir};
+use crate::endpoint::{Endpoint, EndpointArgs};
+use crate::script::resolve;
 use crate::server::code_login_url;
 use serde_json::Value;
 use std::io::Write;
@@ -39,12 +41,12 @@ pub(crate) struct OpenArgs {
     #[arg(long)]
     session: Option<String>,
     #[command(flatten)]
-    state: StateDirArg,
+    endpoint: EndpointArgs,
 }
 
 pub(crate) fn open(args: &OpenArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let prepared = resolve_state_dir(&args.state).and_then(|state_dir| {
-        let url = login_url(&state_dir, args)?;
+    let prepared = resolve_state_dir(&args.endpoint.state).and_then(|state_dir| {
+        let url = login_url(&Endpoint::resolve(&args.endpoint)?, args)?;
         Ok((state_dir, url))
     });
     let (state_dir, url) = match prepared {
@@ -56,7 +58,10 @@ pub(crate) fn open(args: &OpenArgs, out: &mut dyn Write, err: &mut dyn Write) ->
     };
     let _ = writeln!(out, "{url}");
     let _ = out.flush();
-    let page = match write_redirect_page(&state_dir, &url) {
+    // A `--url` hub's page still goes in this machine's state dir.
+    let written = crate::paths::ensure_private_dir(&state_dir)
+        .and_then(|()| write_redirect_page(&state_dir, &url));
+    let page = match written {
         Ok(page) => page,
         Err(e) => {
             let _ = writeln!(
@@ -182,26 +187,25 @@ fn windows_path(path: &Path) -> Option<String> {
     (output.status.success() && !text.is_empty()).then(|| text.to_owned())
 }
 
-/// A one-time login URL for the hub on this machine (loopback when it
-/// listens everywhere), onto `--session` when given.
-fn login_url(state_dir: &Path, args: &OpenArgs) -> Result<String, String> {
-    let conn = HubConn::connect(state_dir)?;
+/// A one-time login URL for `conn` (the hub on this machine: loopback
+/// when it listens everywhere; else its `--url`), onto `--session` when
+/// given.
+fn login_url(conn: &Endpoint, args: &OpenArgs) -> Result<String, String> {
     let fragment = match &args.session {
         Some(query) => {
-            let sessions = conn.sessions()?;
+            let sessions = conn.blocking_sessions()?;
             let session = resolve(&sessions, query, "session")?;
             let id = session.get("id").and_then(Value::as_str).unwrap_or("");
             format!("#session={id}")
         }
         None => String::new(),
     };
-    let minted = conn.call("POST", "/api/login-codes", None)?;
-    let code = minted
-        .get("code")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "the running hub sent no login code".to_owned())?;
-    let base = format!("http://{}", browse_host(conn.info.listen));
-    Ok(format!("{}{fragment}", code_login_url(&base, code)))
+    let code = crate::cli::mint_login_code(conn)?;
+    let base = match conn.local_info() {
+        Some(info) => format!("http://{}", browse_host(info.listen)),
+        None => conn.base().to_owned(),
+    };
+    Ok(format!("{}{fragment}", code_login_url(&base, &code)))
 }
 
 /// What choosing an opener looks at.

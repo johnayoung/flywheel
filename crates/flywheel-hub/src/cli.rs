@@ -2,6 +2,7 @@
 //! status hook agent sessions run).
 
 use crate::auth::{LOGIN_CODE_TTL, Token};
+use crate::endpoint::Endpoint;
 use crate::flywheel::{FlywheelMonitor, MonitorTiming};
 use crate::hub::{Hub, HubError, HubOptions, RestoreOutcome};
 use crate::notify::{Notifier, NotifyConfig};
@@ -102,7 +103,7 @@ struct UrlArgs {
     #[arg(long)]
     qr: bool,
     #[command(flatten)]
-    state: StateDirArg,
+    endpoint: crate::endpoint::EndpointArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -509,9 +510,9 @@ pub(crate) fn running_hub(state_dir: &Path) -> Result<Option<RuntimeInfo>, Strin
 /// Rotate through the running hub (so it switches without a restart), or
 /// in the token file when none runs.
 fn rotate(state_dir: &Path) -> Result<String, String> {
-    if let Some(hub) = script::HubConn::running(state_dir)? {
+    if let Some(hub) = Endpoint::running(state_dir)? {
         hub.with_timeout(CLIENT_TIMEOUT)
-            .call("POST", "/api/token/rotate", None)?;
+            .blocking_call("POST", "/api/token/rotate", None)?;
         return Ok(
             "token rotated; the running hub signed out every browser and closed every terminal connection (log in again via `fw hub url`)"
                 .to_owned(),
@@ -522,18 +523,32 @@ fn rotate(state_dir: &Path) -> Result<String, String> {
 }
 
 fn url_cmd(args: &UrlArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let minted = resolve_state_dir(&args.state).and_then(|dir| mint_remote_code(&dir));
-    match minted {
-        Ok((info, code)) => {
-            let qr = if args.qr { Qr::Draw } else { Qr::No };
-            show_login(&info, &code, qr, out, err);
-            0
-        }
+    let minted = Endpoint::resolve(&args.endpoint).and_then(|hub| {
+        let hub = hub.with_timeout(CLIENT_TIMEOUT);
+        let code = mint_login_code(&hub)?;
+        Ok((hub, code))
+    });
+    let (hub, code) = match minted {
+        Ok(minted) => minted,
         Err(message) => {
             let _ = writeln!(err, "fw hub: {message}");
-            1
+            return 1;
+        }
+    };
+    let qr = if args.qr { Qr::Draw } else { Qr::No };
+    match hub.local_info() {
+        Some(info) => show_login(info, &code, qr, out, err),
+        // A hub elsewhere: its own URL is the one to log in at.
+        None => {
+            let target = LoginTarget {
+                label: "url".to_owned(),
+                base: hub.base().to_owned(),
+                remote: true,
+            };
+            print_login(out, err, &[target], &code, qr);
         }
     }
+    0
 }
 
 /// Print the login URLs for `code` on the hub `info` describes (`qr`:
@@ -574,14 +589,22 @@ fn auto_qr(targets: &[LoginTarget]) -> Qr {
 
 /// Ask the hub serving `dir` for a one-time login code.
 pub(crate) fn mint_remote_code(dir: &Path) -> Result<(RuntimeInfo, String), String> {
-    let hub = script::HubConn::connect(dir)?.with_timeout(CLIENT_TIMEOUT);
-    let body = hub.call("POST", "/api/login-codes", None)?;
-    let code = body
-        .get("code")
+    let hub = Endpoint::local(dir)?.with_timeout(CLIENT_TIMEOUT);
+    let code = mint_login_code(&hub)?;
+    let info = hub
+        .local_info()
+        .cloned()
+        .ok_or_else(|| "the hub's runtime file vanished".to_owned())?;
+    Ok((info, code))
+}
+
+/// A one-time login code from `hub`.
+pub(crate) fn mint_login_code(hub: &Endpoint) -> Result<String, String> {
+    let body = hub.blocking_call("POST", "/api/login-codes", None)?;
+    body.get("code")
         .and_then(|c| c.as_str())
         .map(str::to_owned)
-        .ok_or_else(|| "the running hub sent no login code".to_owned())?;
-    Ok((hub.info, code))
+        .ok_or_else(|| "the hub sent no login code".to_owned())
 }
 
 /// Whether [`print_login`] draws the QR code.

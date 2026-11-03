@@ -1,8 +1,8 @@
 //! `fw hub commands <session>`: the code blocks an agent session suggested,
 //! exactly as written, from the running hub.
 
-use crate::cli::{StateDirArg, resolve_state_dir};
-use crate::script::{HubConn, resolve};
+use crate::endpoint::{Endpoint, EndpointArgs};
+use crate::script::resolve;
 use std::io::{IsTerminal, Write};
 
 /// Commonly the most a terminal accepts in one OSC 52 sequence (xterm's
@@ -33,7 +33,7 @@ pub struct CommandsArgs {
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=500))]
     limit: u16,
     #[command(flatten)]
-    state: StateDirArg,
+    endpoint: EndpointArgs,
 }
 
 /// Run `fw hub commands`.
@@ -109,8 +109,8 @@ fn fetch(
     args: &CommandsArgs,
     err: &mut dyn Write,
 ) -> Result<(String, Vec<serde_json::Value>), String> {
-    let conn = HubConn::connect(&resolve_state_dir(&args.state)?)?;
-    let sessions = conn.sessions()?;
+    let conn = Endpoint::resolve(&args.endpoint)?;
+    let sessions = conn.blocking_sessions()?;
     let (id, name, note) = resolve_agent(&sessions, &args.session)?;
     if let Some(note) = note {
         let _ = writeln!(err, "fw hub: {note}");
@@ -121,7 +121,7 @@ fn fetch(
         args.limit
     };
     let path = format!("/api/sessions/{id}/commands?limit={limit}&all={}", args.all);
-    let list = conn.call("GET", &path, None)?;
+    let list = conn.blocking_call("GET", &path, None)?;
     let commands = list
         .get("commands")
         .and_then(|c| c.as_array())

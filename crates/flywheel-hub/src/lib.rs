@@ -15,7 +15,6 @@ pub mod attach;
 pub mod auth;
 pub mod browser;
 pub mod cli;
-pub mod client;
 pub mod commands;
 pub mod commands_cli;
 pub mod daemon;

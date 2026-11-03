@@ -1,147 +1,19 @@
-//! Scripting the running hub from a shell or another agent: `fw hub ls`,
-//! `new`, `send`, `read`, `kill`, `import`, all over its HTTP API (bearer
-//! token from the state dir, address from its runtime file).
+//! Scripting a running hub from a shell or another agent: `fw hub ls`,
+//! `new`, `send`, `read`, `kill`, `relaunch`, `import`, all over its HTTP
+//! API through the one hub client ([`crate::endpoint`]): the hub running
+//! for the state dir, or any by `--url` (all but `import`, whose files the
+//! hub reads on its own machine).
 //!
 //! Sessions and workspaces are addressed by id, unique id prefix, or name.
 
-use crate::auth::Token;
-use crate::cli::{StateDirArg, resolve_state_dir, running_hub};
-use crate::client;
-use crate::paths::default_state_dir;
-use crate::remote::RuntimeInfo;
+use crate::cli::{StateDirArg, resolve_state_dir};
+use crate::endpoint::{Endpoint, EndpointArgs};
 use serde_json::{Value, json};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-/// How long a scripting call waits for the hub (session spawns included).
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Characters of an id shown by `ls` (any unique prefix addresses it).
 pub const SHORT_ID: usize = 8;
-
-/// The running hub, ready to call.
-#[derive(Debug)]
-pub struct HubConn {
-    pub info: RuntimeInfo,
-    token: Token,
-    timeout: Duration,
-}
-
-impl HubConn {
-    /// Connect to the hub serving `state_dir`.
-    pub fn connect(state_dir: &Path) -> Result<Self, String> {
-        Self::running(state_dir)?.ok_or_else(|| no_hub_message(state_dir))
-    }
-
-    /// The hub serving `state_dir`, or `None` when none runs.
-    pub fn running(state_dir: &Path) -> Result<Option<Self>, String> {
-        let Some(info) = running_hub(state_dir)? else {
-            return Ok(None);
-        };
-        let token = Token::load(state_dir)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "the running hub's token file is missing".to_owned())?;
-        Ok(Some(Self {
-            info,
-            token,
-            timeout: CALL_TIMEOUT,
-        }))
-    }
-
-    /// The same hub, waited on for at most `timeout` per call (a probe of
-    /// a hub that may be wedged).
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// `method path` with an optional JSON body; the parsed JSON response
-    /// (`null` when empty) on 2xx, else the API's error.
-    pub fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value, String> {
-        let body = body.map(Value::to_string);
-        let response = client::request(
-            self.info.connect_addr(),
-            method,
-            path,
-            self.token.expose(),
-            body.as_deref(),
-            self.timeout,
-        )
-        .map_err(|e| {
-            format!(
-                "cannot reach the running hub (pid {}) at {}: {e}",
-                self.info.pid,
-                self.info.connect_addr()
-            )
-        })?;
-        if !(200..300).contains(&response.status) {
-            return Err(api_error(response.status, &response.error_message()));
-        }
-        if response.body.is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_slice(&response.body)
-            .map_err(|e| format!("the hub sent invalid JSON for {path}: {e}"))
-    }
-
-    /// `GET /api/{what}` -> its `what` array.
-    fn list(&self, what: &str) -> Result<Vec<Value>, String> {
-        let body = self.call("GET", &format!("/api/{what}"), None)?;
-        match body.get(what) {
-            Some(Value::Array(items)) => Ok(items.clone()),
-            _ => Err(format!("the hub sent no {what} list")),
-        }
-    }
-
-    pub fn workspaces(&self) -> Result<Vec<Value>, String> {
-        self.list("workspaces")
-    }
-
-    pub fn sessions(&self) -> Result<Vec<Value>, String> {
-        self.list("sessions")
-    }
-}
-
-/// An API failure for humans: a request the hub refused (4xx) says why
-/// in its own words; anything else keeps the HTTP status to go on.
-/// What a verb that needs the running hub says when there is none: how to
-/// start one for the same state dir (`--state-dir` spelled out unless it
-/// is the default).
-pub fn no_hub_message(state_dir: &Path) -> String {
-    let flag = if default_state_dir().as_deref() == Some(state_dir) {
-        String::new()
-    } else {
-        format!(
-            " --state-dir {}",
-            shell_word(&state_dir.display().to_string())
-        )
-    };
-    format!(
-        "no hub is running for state dir {} (start one with `fw hub start{flag}`)",
-        state_dir.display()
-    )
-}
-
-/// `word` as one shell word (single-quoted when it needs to be).
-fn shell_word(word: &str) -> String {
-    if !word.is_empty()
-        && word
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%=,".contains(&b))
-    {
-        word.to_owned()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
-
-fn api_error(status: u16, message: &str) -> String {
-    match (status, message.is_empty()) {
-        (400..500, false) => message.to_owned(),
-        (_, true) => format!("the hub answered HTTP {status}"),
-        _ => format!("{message} (HTTP {status})"),
-    }
-}
 
 fn str_field<'a>(item: &'a Value, field: &str) -> &'a str {
     item.get(field).and_then(Value::as_str).unwrap_or("")
@@ -331,8 +203,8 @@ fn fail(err: &mut dyn Write, message: &str) -> i32 {
     1
 }
 
-fn connect(state: &StateDirArg) -> Result<HubConn, String> {
-    HubConn::connect(&resolve_state_dir(state)?)
+fn connect(endpoint: &EndpointArgs) -> Result<Endpoint, String> {
+    Endpoint::resolve(endpoint)
 }
 
 fn print_json(out: &mut dyn Write, value: &Value) {
@@ -420,11 +292,12 @@ pub(crate) struct LsArgs {
     #[arg(long)]
     json: bool,
     #[command(flatten)]
-    state: StateDirArg,
+    endpoint: EndpointArgs,
 }
 
 pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let listed = connect(&args.state).and_then(|conn| Ok((conn.workspaces()?, conn.sessions()?)));
+    let listed = connect(&args.endpoint)
+        .and_then(|conn| Ok((conn.blocking_workspaces()?, conn.blocking_sessions()?)));
     let (workspaces, sessions) = match listed {
         Ok(lists) => lists,
         Err(message) => return fail(err, &message),
@@ -557,7 +430,7 @@ pub(crate) struct NewArgs {
     #[arg(last = true, value_name = "COMMAND")]
     command: Vec<String>,
     #[command(flatten)]
-    state: StateDirArg,
+    endpoint: EndpointArgs,
 }
 
 /// `path` made absolute against this process's directory (the hub runs
@@ -583,11 +456,11 @@ pub(crate) fn new(args: &NewArgs, out: &mut dyn Write, err: &mut dyn Write) -> i
 }
 
 fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
-    let conn = connect(&args.state)?;
+    let conn = connect(&args.endpoint)?;
     // Names address sessions in every other verb: a duplicate would make
     // both unreachable by name.
     if let Some(name) = &args.name {
-        let sessions = conn.sessions()?;
+        let sessions = conn.blocking_sessions()?;
         if let Some(taken) = sessions
             .iter()
             .find(|s| str_field(s, "name") == name.trim())
@@ -598,7 +471,7 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
             ));
         }
     }
-    let workspaces = conn.workspaces()?;
+    let workspaces = conn.blocking_workspaces()?;
     let (workspace_id, folder) = match resolve(&workspaces, &args.workspace, "workspace") {
         Ok(workspace) => {
             let folder = args
@@ -626,12 +499,13 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
                 if let Some(base) = &args.base {
                     query.push_str(&format!("&base={}", query_escape(base)));
                 }
-                let plan = conn.call("GET", &format!("/api/worktrees/plan?{query}"), None)?;
+                let plan =
+                    conn.blocking_call("GET", &format!("/api/worktrees/plan?{query}"), None)?;
                 if let Some(error) = plan.get("error").and_then(Value::as_str) {
                     return Err(error.to_owned());
                 }
             }
-            let created = conn.call(
+            let created = conn.blocking_call(
                 "POST",
                 "/api/workspaces",
                 Some(&json!({ "name": args.workspace, "folders": [folder] })),
@@ -658,7 +532,7 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
     if let Some(task) = &args.worktree {
         body["worktree"] = json!({ "task": task, "base": args.base });
     }
-    let view = conn.call("POST", "/api/sessions", Some(&body))?;
+    let view = conn.blocking_call("POST", "/api/sessions", Some(&body))?;
     if let Some(worktree) = view.get("worktree") {
         let _ = writeln!(
             err,
@@ -750,7 +624,7 @@ pub(crate) fn import(args: &ImportArgs, out: &mut dyn Write, err: &mut dyn Write
     if args.name.is_some() && args.files.len() > 1 {
         return fail(err, "--name names one workspace: give a single file");
     }
-    let conn = match connect(&args.state) {
+    let conn = match resolve_state_dir(&args.state).and_then(|dir| Endpoint::local(&dir)) {
         Ok(conn) => conn,
         Err(message) => return fail(err, &message),
     };
@@ -762,7 +636,7 @@ pub(crate) fn import(args: &ImportArgs, out: &mut dyn Write, err: &mut dyn Write
             if let Some(name) = &args.name {
                 body["name"] = json!(name);
             }
-            conn.call("POST", "/api/workspaces/import", Some(&body))
+            conn.blocking_call("POST", "/api/workspaces/import", Some(&body))
         });
         match report {
             Ok(report) if args.json => {
@@ -852,8 +726,8 @@ pub(crate) struct SessionArg {
 }
 
 /// The session `query` names, as `(id, record)`.
-fn find_session(conn: &HubConn, query: &str) -> Result<(String, Value), String> {
-    let sessions = conn.sessions()?;
+fn find_session(conn: &Endpoint, query: &str) -> Result<(String, Value), String> {
+    let sessions = conn.blocking_sessions()?;
     let session = resolve(&sessions, query, "session")?;
     Ok((str_field(session, "id").to_owned(), session.clone()))
 }
@@ -877,7 +751,7 @@ pub(crate) struct SendArgs {
     #[arg(long)]
     raw: bool,
     #[command(flatten)]
-    state: StateDirArg,
+    endpoint: EndpointArgs,
 }
 
 pub(crate) fn send(args: &SendArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -899,9 +773,9 @@ pub(crate) fn send(args: &SendArgs, out: &mut dyn Write, err: &mut dyn Write) ->
     } else {
         split_final_enter(text, args.enter)
     };
-    let result = connect(&args.state).and_then(|conn| {
+    let result = connect(&args.endpoint).and_then(|conn| {
         let (id, _) = find_session(&conn, &args.target.session)?;
-        conn.call(
+        conn.blocking_call(
             "POST",
             &format!("/api/sessions/{id}/input"),
             Some(&json!({ "data": text, "paste": !args.raw, "enter": enter })),
@@ -941,20 +815,20 @@ pub(crate) struct ReadArgs {
     #[arg(long)]
     json: bool,
     #[command(flatten)]
-    state: StateDirArg,
+    endpoint: EndpointArgs,
 }
 
 pub(crate) fn read(args: &ReadArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     if args.lines.is_some() && args.source != "recent" {
         return fail(err, "--lines applies to --source recent");
     }
-    let result = connect(&args.state).and_then(|conn| {
+    let result = connect(&args.endpoint).and_then(|conn| {
         let (id, _) = find_session(&conn, &args.target.session)?;
         let mut path = format!("/api/sessions/{id}/screen?source={}", args.source);
         if let Some(lines) = args.lines {
             path.push_str(&format!("&lines={lines}"));
         }
-        conn.call("GET", &path, None)
+        conn.blocking_call("GET", &path, None)
     });
     let screen = match result {
         Ok(screen) => screen,
@@ -995,14 +869,14 @@ pub(crate) struct KillArgs {
     #[arg(long, requires = "remove_worktree")]
     force: bool,
     #[command(flatten)]
-    state: StateDirArg,
+    endpoint: EndpointArgs,
 }
 
 pub(crate) fn kill(args: &KillArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let result = connect(&args.state).and_then(|conn| {
+    let result = connect(&args.endpoint).and_then(|conn| {
         let (id, session) = find_session(&conn, &args.target.session)?;
         if args.remove_worktree {
-            let outcome = conn.call(
+            let outcome = conn.blocking_call(
                 "DELETE",
                 &format!(
                     "/api/sessions/{id}?remove_worktree=true&force={}",
@@ -1033,13 +907,13 @@ pub(crate) fn kill(args: &KillArgs, out: &mut dyn Write, err: &mut dyn Write) ->
             ));
         }
         if args.rm {
-            conn.call("DELETE", &format!("/api/sessions/{id}"), None)?;
+            conn.blocking_call("DELETE", &format!("/api/sessions/{id}"), None)?;
             return Ok(format!(
                 "removed session {:?} ({id})",
                 str_field(&session, "name")
             ));
         }
-        conn.call("POST", &format!("/api/sessions/{id}/kill"), None)?;
+        conn.blocking_call("POST", &format!("/api/sessions/{id}/kill"), None)?;
         Ok(format!(
             "hung up session {:?} ({id})",
             str_field(&session, "name")
@@ -1059,13 +933,13 @@ pub(crate) struct RelaunchArgs {
     #[command(flatten)]
     target: SessionArg,
     #[command(flatten)]
-    state: StateDirArg,
+    endpoint: EndpointArgs,
 }
 
 pub(crate) fn relaunch(args: &RelaunchArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let result = connect(&args.state).and_then(|conn| {
+    let result = connect(&args.endpoint).and_then(|conn| {
         let (id, _) = find_session(&conn, &args.target.session)?;
-        conn.call(
+        conn.blocking_call(
             "POST",
             &format!("/api/sessions/{id}/relaunch"),
             Some(&json!({})),
@@ -1089,20 +963,6 @@ pub(crate) fn relaunch(args: &RelaunchArgs, out: &mut dyn Write, err: &mut dyn W
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_no_hub_hint_starts_a_hub_for_the_same_state_dir() {
-        let message = no_hub_message(Path::new("/tmp/hub state"));
-        assert!(
-            message.ends_with("(start one with `fw hub start --state-dir '/tmp/hub state'`)"),
-            "{message}"
-        );
-        assert_eq!(shell_word("/a/b-c.d"), "/a/b-c.d");
-        assert_eq!(shell_word("it's"), "'it'\\''s'");
-        if let Some(default) = default_state_dir() {
-            assert!(no_hub_message(&default).ends_with("(start one with `fw hub start`)"));
-        }
-    }
 
     fn items() -> Vec<Value> {
         vec![
@@ -1219,13 +1079,6 @@ mod tests {
                 .unwrap_err()
                 .contains("ambiguous")
         );
-    }
-
-    #[test]
-    fn api_refusals_read_without_http_codes() {
-        assert_eq!(api_error(409, "taken"), "taken");
-        assert_eq!(api_error(500, "boom"), "boom (HTTP 500)");
-        assert_eq!(api_error(502, ""), "the hub answered HTTP 502");
     }
 
     #[test]

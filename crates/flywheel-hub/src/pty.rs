@@ -701,9 +701,25 @@ impl PtySession {
     /// parked (or have ended), or false after `timeout` -- still paused;
     /// [`PtySession::resume`] undoes either.
     pub fn pause(&self, timeout: Duration) -> bool {
+        self.request_pause();
+        self.wait_paused(timeout)
+    }
+
+    /// The first half of [`PtySession::pause`]: ask the I/O threads to
+    /// park without waiting for them. Pausing many sessions requests all
+    /// of them first, then waits ([`PtySession::wait_paused`]), so the
+    /// threads park in parallel -- one [`RELEASE_POLL`] in all, not one
+    /// per session.
+    pub fn request_pause(&self) {
         let mut state = self.queue.pause_state();
         state.requested = true;
         self.queue.pausing.store(true, Ordering::Release);
+    }
+
+    /// The second half of [`PtySession::pause`]: wait up to `timeout` for
+    /// both I/O threads to park (or end) after [`PtySession::request_pause`].
+    pub fn wait_paused(&self, timeout: Duration) -> bool {
+        let state = self.queue.pause_state();
         let (state, _) = self
             .queue
             .pause_changed

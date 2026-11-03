@@ -98,9 +98,14 @@ impl Hub {
             .filter(|(_, s)| !s.is_released())
             .map(|(id, s)| (id.clone(), Arc::clone(s)))
             .collect();
+        // Ask every session first, then wait: the I/O threads park in
+        // parallel, so the freeze costs one poll interval, not one each.
+        for (_, session) in &live {
+            session.request_pause();
+        }
         let mut stuck = Vec::new();
         for (id, session) in &live {
-            if !session.pause(left()) {
+            if !session.wait_paused(left()) {
                 stuck.push(id.clone());
             }
         }
@@ -259,5 +264,50 @@ impl Hub {
         crate::transcript::spawn_watcher(self);
         self.start_queues();
         self.emit(super::HubEvent::Sessions);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{CreateSession, Hub, HubOptions};
+    use std::time::{Duration, Instant};
+
+    /// Freezing pauses every session in parallel: a hub with many running
+    /// sessions freezes in about one poll interval, not one per session
+    /// (sequential pauses ran a hub with ~65 sessions past the deadline).
+    #[test]
+    fn a_hub_with_many_sessions_freezes_in_one_poll_interval() {
+        const SESSIONS: usize = 120;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("repo");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut options = HubOptions::new(dir.path().join("state"));
+        options.default_shell = vec!["/bin/sh".into()];
+        options.claude_config_dir = Some(dir.path().join("claude-config"));
+        options.codex_home = Some(dir.path().join("codex-home"));
+        options.import_root = Some(dir.path().join("home/code"));
+        let hub = Hub::open(options).unwrap();
+        let workspace = hub
+            .create_workspace(
+                serde_json::from_value(serde_json::json!({ "name": "w", "folders": [folder] }))
+                    .unwrap(),
+            )
+            .unwrap();
+        for _ in 0..SESSIONS {
+            let request: CreateSession = serde_json::from_value(serde_json::json!({
+                "workspace_id": workspace.id,
+                "command": ["/bin/sh", "-c", "while :; do sleep 1; done"],
+            }))
+            .unwrap();
+            hub.create_session(request).unwrap();
+        }
+        let started = Instant::now();
+        let frozen = hub.handoff_freeze(Duration::from_secs(10));
+        let took = started.elapsed();
+        let frozen = frozen.expect("every session pauses");
+        assert_eq!(frozen.sessions.len(), SESSIONS);
+        assert!(took < Duration::from_secs(3), "froze in {took:?}");
+        hub.handoff_thaw(false);
+        hub.shutdown(Duration::from_secs(5));
     }
 }

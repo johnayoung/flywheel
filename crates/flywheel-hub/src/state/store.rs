@@ -871,6 +871,27 @@ impl HubStore {
         Ok(result)
     }
 
+    /// [`HubStore::update_queue`] for an edit that records what already
+    /// happened (a paste went, or was refused): a failed save keeps it in
+    /// memory (the next save writes it) and is still reported.
+    pub fn update_queue_keeping<R>(
+        &mut self,
+        id: &str,
+        edit: impl FnOnce(&mut SessionQueue) -> R,
+    ) -> Result<R, StateError> {
+        self.session(id)?;
+        let previous = self.doc.queues.get(id).cloned();
+        let queue = self.doc.queues.entry(id.to_owned()).or_default();
+        let result = edit(queue);
+        if queue.is_vacant() {
+            self.doc.queues.remove(id);
+        }
+        if self.doc.queues.get(id) != previous.as_ref() {
+            self.save()?;
+        }
+        Ok(result)
+    }
+
     fn workspace_index(&self, id: &str) -> Result<usize, StateError> {
         self.doc
             .workspaces

@@ -1,7 +1,7 @@
 //! Prompt queues (see [`crate::queue`]): `GET /api/queues`, `GET|POST
 //! /api/sessions/{id}/queue`, `POST .../queue/clear|pause|resume`,
 //! `PATCH|DELETE .../queue/items/{item}`, `POST
-//! .../queue/items/{item}/move`.
+//! .../queue/items/{item}/move|editing`.
 
 use super::{ApiJson, ApiResult, AppState, blocking};
 use crate::queue::{ItemEdit, NewItem};
@@ -114,4 +114,23 @@ pub(super) async fn move_item(
     let hub = Arc::clone(&app.hub);
     let view = blocking(move || hub.queue_move(&id, &item, request.position)).await?;
     Ok(Json(view).into_response())
+}
+
+#[derive(Deserialize)]
+pub(super) struct EditingRequest {
+    /// An editor has the item open (renew within the lease), or closed it.
+    editing: bool,
+}
+
+/// Keep a pending item back while an editor has it open:
+/// `{"editing":true}` (renewed by the editor; it lapses on its own), then
+/// `{"editing":false}`. Answers 204.
+pub(super) async fn editing(
+    State(app): State<AppState>,
+    Path((id, item)): Path<(String, String)>,
+    ApiJson(request): ApiJson<EditingRequest>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    blocking(move || hub.queue_editing(&id, &item, request.editing)).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }

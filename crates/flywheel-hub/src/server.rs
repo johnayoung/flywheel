@@ -312,6 +312,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             "/api/sessions/{id}/queue/items/{item}/move",
             post(queue_api::move_item),
         )
+        .route(
+            "/api/sessions/{id}/queue/items/{item}/editing",
+            post(queue_api::editing),
+        )
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/search", get(search_api::search))
         .route("/api/sessions/{id}/transcript", get(search_api::transcript))

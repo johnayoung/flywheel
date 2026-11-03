@@ -634,10 +634,14 @@ impl Hub {
         let queued = store
             .queue(id)
             .map_or(0, crate::queue::SessionQueue::pending_count);
+        let next = store
+            .queue(id)
+            .and_then(|q| q.head().map(|i| crate::queue::event_item(i, None)));
         let relaid = store.remove_session(id)?;
         let live = self.live().remove(id);
         drop(store);
         self.board().untrack(id);
+        self.queue_runtime().forget(id);
         if let Some(session) = live {
             forget(&session);
         }
@@ -668,7 +672,7 @@ impl Hub {
                     serde_json::json!({
                         "session": session.clone(),
                         "reason": "the session was removed",
-                        "item": null,
+                        "item": next,
                         "pending": queued,
                     }),
                 );

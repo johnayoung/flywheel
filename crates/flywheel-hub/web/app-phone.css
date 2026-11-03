@@ -226,7 +226,7 @@ body.kb-open .mobilebar { padding-bottom: .35rem; }
   .qa-options { display: grid; grid-template-columns: minmax(0, 1fr); }
 }
 
-.compose { display: grid; gap: .4rem; }
+.compose { display: grid; grid-template-columns: minmax(0, 1fr); gap: .4rem; min-width: 0; }
 .compose textarea {
   width: 100%;
   min-height: 4.5rem;
@@ -244,6 +244,14 @@ body.kb-open .mobilebar { padding-bottom: .35rem; }
 .compose-actions .slab { padding: .6rem .9rem; }
 .compose-actions #compose-close { margin-left: auto; }
 .compose-pos { font-size: 10px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.compose-pos:empty { display: none; }
+/* Close, Paste, Queue, and Send beside the recall arrows: tighter on a
+   phone, and never past its edge (they wrap before they would). */
+.compose-actions { flex-wrap: wrap; min-width: 0; }
+@media (max-width: 480px) {
+  .compose-actions { gap: .25rem; }
+  .compose-actions .slab { padding: .6rem .6rem; letter-spacing: .04em; }
+}
 
 .keybar { display: grid; gap: .3rem; min-width: 0; }
 .kb-row { display: flex; gap: .3rem; min-width: 0; }

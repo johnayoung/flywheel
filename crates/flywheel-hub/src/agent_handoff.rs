@@ -505,7 +505,11 @@ impl Hub {
                 .contains(s)
             })
             .map(str::to_owned);
+        // Its queue sends nothing while this types in (and, noted as
+        // typing, for queue.typing_quiet after).
+        let held = self.hold_sessions(vec![record.id.clone()], "a handoff");
         let pasted = self.paste(&record.id, &delivery.prompt, true);
+        drop(held);
         let from_label = delivery
             .from
             .as_ref()

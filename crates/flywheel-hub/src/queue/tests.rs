@@ -38,6 +38,8 @@ fn facts(status_now: Option<StatusView>) -> Facts {
         presence: Presence::Ready,
         status: status_now,
         typed_ago: None,
+        draft: 0,
+        editing: false,
         quiet: Duration::from_secs(8),
         owner: None,
     }
@@ -272,4 +274,86 @@ fn prompts_are_trimmed_and_bounded() {
     assert!(validate_text(" \n ").is_err());
     assert!(validate_text(&"x".repeat(MAX_TEXT_BYTES + 1)).is_err());
     assert_eq!(normalized("a\n  b\tc "), "a b c");
+}
+
+#[test]
+fn a_draft_left_in_the_input_or_an_open_editor_holds_it_back() {
+    let q = queue(vec![item("a1", When::Done)]);
+    let mut f = facts(status(AgentStatus::Done, 10));
+    // Typed long ago, but never sent: pasting now would merge into it.
+    f.typed_ago = Some(Duration::from_secs(600));
+    f.draft = 1;
+    waits(&decide(&q, &f), "never sent");
+    f.draft = 0;
+    assert_eq!(decide(&q, &f), Decision::Deliver("a1".into()));
+    f.editing = true;
+    waits(&decide(&q, &f), "editor");
+}
+
+#[test]
+fn the_draft_model_follows_typing_editing_and_sending() {
+    let mut d = Draft::default();
+    d.feed(b"x");
+    assert_eq!(d.chars(), 1);
+    // Backspace (DEL and ^H) takes a character, multi-byte ones whole.
+    d.feed("\u{e9}".as_bytes());
+    assert_eq!(d.chars(), 2);
+    d.feed(b"\x7f\x08");
+    assert_eq!(d.chars(), 0);
+    // Arrows, focus, and SGR mouse reports are not text.
+    d.feed(b"\x1b[A\x1b[I\x1b[<0;3;4M\x1bOB");
+    assert_eq!(d.chars(), 0);
+    // Enter sends it; ^U and ^C clear it; ^W takes a word.
+    d.feed(b"fix the bug\x17");
+    assert_eq!(d.text(), "fix the ");
+    d.feed(b"\x15");
+    assert_eq!(d.chars(), 0);
+    d.feed(b"abc\x03");
+    assert_eq!(d.chars(), 0);
+    d.feed(b"run it\r");
+    assert_eq!(d.chars(), 0);
+    // Escape twice running (one key per feed, as a browser sends them).
+    d.feed(b"draft");
+    d.feed(b"\x1b");
+    assert_eq!(d.chars(), 5);
+    d.feed(b"\x1b");
+    assert_eq!(d.chars(), 0);
+    d.feed(b"a\x1bb\x1b");
+    assert_eq!(d.text(), "a");
+    d.feed(b"\x15");
+    // A bracketed paste is text, its line breaks included; Enter after
+    // it sends it.
+    d.feed(b"\x1b[200~one\rtwo\x1b[201~");
+    assert_eq!(d.text(), "one\rtwo");
+    d.feed(b"\r");
+    assert_eq!(d.chars(), 0);
+}
+
+#[test]
+fn typing_and_drafts_carry_across_a_handoff() {
+    let old = QueueRuntime::default();
+    old.note("s1", b"half a prom", true);
+    old.note("s2", b"sent\r", true);
+    let exported = old.typing_export();
+    let json = serde_json::to_string(&exported).unwrap();
+    let new = QueueRuntime::default();
+    new.typing_import(serde_json::from_str(&json).unwrap());
+    assert_eq!(new.draft_chars("s1"), 11);
+    assert_eq!(new.draft_chars("s2"), 0);
+    assert!(new.typed_ago("s1").unwrap() < Duration::from_secs(5));
+    assert!(new.typed_ago("s2").is_some());
+    new.clear_draft("s1");
+    assert_eq!(new.draft_chars("s1"), 0);
+    new.forget("s1");
+    assert!(new.typed_ago("s1").is_none());
+}
+
+#[test]
+fn an_editor_lease_lapses_or_is_let_go() {
+    let rt = QueueRuntime::default();
+    assert!(!rt.is_editing("i1"));
+    rt.set_editing("i1", true);
+    assert!(rt.is_editing("i1"));
+    rt.set_editing("i1", false);
+    assert!(!rt.is_editing("i1"));
 }

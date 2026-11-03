@@ -244,7 +244,7 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `handoff.sent` | `{"from","to","source","bytes","truncated"}` (on the target's hub; findings: `source` `review_findings`) |
 | `fanout.finished` | `fanout` (below); no `session` |
 | `queue.delivered` | `item` `{"id","text" (first 2000 chars),"bytes","when","added_at","delivered_at"}`, `pending` |
-| `queue.stalled` | `reason`, `item`, `pending` |
+| `queue.stalled` | `reason`, `item` (the next, same shape, `delivered_at` null; or null), `pending` |
 | `share.created` | `share` `{"id","session_id","name","created","expires"}` (unix seconds); never the credential, its digest, or a link |
 | `share.revoked` | as above; one per link a revoke ends; expiry sends none |
 | `record.started` | `recording` `{"name","session_id","title","part","size","started","modified","cols","rows","active"}` (no path); `session` `null` once removed |
@@ -270,6 +270,7 @@ Behaviour: [hub-workflows: Prompt queue](workflows.md#prompt-queue). `{item}` = 
 | GET / POST | `/api/sessions/{id}/queue` | GET `{"session_id","session","paused","stalled"?:{"at","reason","item"?},"last_delivered_at"?,"pending","items","waiting"?,"typing_quiet_secs"}` (400 a shell); POST `{"text","when"?}` -> 201 `{"item","queue"}` |
 | PATCH / DELETE | `/api/sessions/{id}/queue/items/{item}` | PATCH `{"text"?,"when"?}`; 409 one being sent |
 | POST | `/api/sessions/{id}/queue/items/{item}/move` | `{"position"}` (1-based among the pending) |
+| POST | `/api/sessions/{id}/queue/items/{item}/editing` | `{"editing"}`: an editor has it open (held back; renew within 30 s) or closed it -> 204 |
 | POST | `/api/sessions/{id}/queue/pause` | |
 | POST | `/api/sessions/{id}/queue/resume` | also clears a stall |
 | POST | `/api/sessions/{id}/queue/clear` | `{"all"?}`: the delivered history too |

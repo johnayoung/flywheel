@@ -3,7 +3,8 @@
 //! Code's `--settings` hooks would) and writes its transcript. Prompts
 //! queued with `fw hub queue add` go one finished turn at a time, and each
 //! is typed exactly once across `fw hub upgrade` (live handoff) and `fw
-//! hub stop` / `fw hub start` (restore with `--resume`).
+//! hub stop` / `fw hub start` (restore with `--resume`); a draft left in
+//! the input line holds the queue across an upgrade.
 
 #![cfg(target_os = "linux")]
 
@@ -267,6 +268,31 @@ fn queued_prompts_are_typed_exactly_once_across_upgrade_and_restart() {
     assert_eq!(done["pending"], 0);
     let all = env.json(&["queue", "ls", "--json"]);
     assert_eq!(all.as_array().unwrap().len(), 1);
+
+    // Text left unsent in its input line holds the queue (the paste and
+    // its Enter would send the two merged), and still does after a live
+    // handoff: the new hub carries the draft over.
+    env.ok(&["send", "agent", "half typed"]);
+    env.ok(&["queue", "add", "agent", "step 6 of the plan"]);
+    env.ok(&["upgrade", "--binary", env!("CARGO_BIN_EXE_fw")]);
+    // First the typing window (its time carried over too), then the
+    // draft, however long: never the prompt.
+    let waiting = || {
+        env.json(&["queue", "ls", "agent", "--json"])["waiting"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(waiting().contains("typed"), "{}", waiting());
+    wait_for("the typing window to pass", WAIT, || {
+        waiting().contains("10 characters")
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(env.taken(&agent), prompts(1..=5));
+    // Cleared (Ctrl-U): it goes, alone, once the typing window passes.
+    env.ok(&["send", "agent", "\u{15}", "--raw"]);
+    wait_for("step 6", WAIT, || env.taken(&agent).len() == 6);
+    assert_eq!(env.taken(&agent), prompts(1..=6));
 
     // A shell has no queue.
     env.ok(&["new", "--name", "sh", "ws"]);

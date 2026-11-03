@@ -6,6 +6,7 @@
 use super::{Hub, HubError, HubOptions, ServeLock, badge_key};
 use crate::pty::PtySession;
 use crate::pty::handoff::{Adopt, PtyExport};
+use crate::queue::TypingExport;
 use crate::report::ReportServer;
 use crate::state::HubStore;
 use crate::status::StatusBoard;
@@ -28,6 +29,9 @@ pub(crate) struct FrozenSession {
 pub(crate) struct Frozen {
     pub sessions: Vec<FrozenSession>,
     pub board: BoardExport,
+    /// Prompt queues' typing times and drafts (the next hub keeps waiting
+    /// them out).
+    pub typing: Vec<TypingExport>,
 }
 
 /// The descriptors a frozen hub hands over (valid while it lives).
@@ -53,6 +57,7 @@ pub(crate) struct Incoming {
     pub report: Option<(PathBuf, UnixListener)>,
     pub board: BoardExport,
     pub sessions: Vec<IncomingSession>,
+    pub typing: Vec<TypingExport>,
 }
 
 impl Hub {
@@ -126,7 +131,12 @@ impl Hub {
             })
             .collect();
         let board = self.board().handoff_export();
-        Ok(Frozen { sessions, board })
+        let typing = self.queue.typing_export();
+        Ok(Frozen {
+            sessions,
+            board,
+            typing,
+        })
     }
 
     /// Undo [`Hub::handoff_freeze`] (also safe after a partial freeze).
@@ -188,6 +198,7 @@ impl Hub {
             report,
             board,
             sessions,
+            typing,
         } = incoming;
         let ids: HashSet<String> = sessions.iter().map(|s| s.id.clone()).collect();
         let store = HubStore::open_keeping(&options.state_dir, &ids)?;
@@ -197,6 +208,7 @@ impl Hub {
             store,
             StatusBoard::handoff_import(board),
         )?;
+        hub.queue.typing_import(typing);
         if let Some((path, listener)) = report {
             let server = ReportServer::adopt(path, listener, hub.report_handler(), true)?;
             *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);

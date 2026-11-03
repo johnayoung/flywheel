@@ -20,25 +20,34 @@
 //!   start a turn and finish it before the next goes) and at least
 //!   [`SETTLE`] ago;
 //! * nobody typed into the session for `queue.typing_quiet` (input from a
-//!   browser, `fw hub attach`, `fw hub send`, or Compose);
+//!   browser, `fw hub attach`, `fw hub send`, Compose, or any paste the
+//!   hub makes: a handoff, send findings, a plugin action);
+//! * nothing typed into the agent's input line sits there unsent (a
+//!   [`Draft`] someone left half-typed: the paste and its Enter would send
+//!   the two merged) -- keys answering a blocked prompt do not count;
+//! * no editor has the item open (a lease the drawer renews);
 //! * no fan-out grading is queued or running on it, and no review action
-//!   (commit, push, merge, ask for a review, send findings) is running in
-//!   its directory.
+//!   (commit, push, merge, ask for a review, send findings) or handoff is
+//!   running on it.
 //!
-//! Delivery is the same path as every paste (bracketed paste, then Enter).
+//! Delivery is the same path as every paste (bracketed paste, then Enter),
+//! under the paste turn every paste takes, so no other paste writes
+//! between its text and its Enter; the decision is taken again under it.
 //! It is exactly-once: the item is recorded `sending` in `state.json`
 //! before the paste and `delivered` (with its time) after; a hub that died
 //! in between finds `sending` on its next start and looks in the agent's
-//! transcript: a user message carrying the text since then means it went
+//! transcript: a user message that is the text since then means it went
 //! (marked delivered, never typed again), else it is sent again. A live
-//! handoff (`fw hub upgrade`) waits for a delivery in progress and starts
-//! none until the new hub has taken over.
+//! handoff (`fw hub upgrade`) waits for a delivery in progress, starts
+//! none until the new hub has taken over, and carries typing times and
+//! drafts over to it.
 //!
 //! A failure -- the agent exited, the session was not restored, the paste
 //! was refused, a delivered prompt never started a turn -- stalls the
 //! queue (nothing more is sent) until it is resumed; stalled queues show
-//! in Needs you and announce `queue.stalled` to plugins. Each delivery
-//! announces `queue.delivered`.
+//! in Needs you and announce `queue.stalled` to plugins (a relaunch of the
+//! session clears the stall too). Each delivery announces
+//! `queue.delivered`; both events carry the item in one shape.
 //!
 //! The queue lives on the hub that owns the session; other hubs reach it
 //! through their `/m/<machine>` proxy like every session call.
@@ -383,12 +392,155 @@ struct Holds {
     held: HashMap<u64, (Vec<String>, String)>,
 }
 
-/// The queues' in-memory side: typing times, holds, and the delivery gate.
+/// Most bytes of a draft kept (past this only "there is one" matters).
+const MAX_DRAFT_BYTES: usize = 16 * 1024;
+/// How long an open editor keeps its item from going without renewing.
+pub const EDIT_LEASE: Duration = Duration::from_secs(30);
+
+/// Input typed into one session: when, and what of it sits unsent in the
+/// agent's input line (a draft someone left half-typed).
+#[derive(Debug, Clone)]
+struct Typed {
+    at: Instant,
+    draft: Draft,
+}
+
+/// A model of the agent's input line, fed every byte typed into the
+/// session: printable text (and pasted text) adds, Backspace, Ctrl-W,
+/// Ctrl-U, Ctrl-C, Escape twice, and Enter take away; escape sequences (arrows, focus,
+/// mouse) do not count. Not exact (history recall, tab completion), but
+/// it knows when someone typed and walked away without sending.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Draft {
+    bytes: Vec<u8>,
+    in_paste: bool,
+    /// The last key was a lone Escape.
+    escaped: bool,
+}
+
+impl Draft {
+    pub(crate) fn from_text(text: &str) -> Self {
+        let mut draft = Self::default();
+        draft.push(text.as_bytes());
+        draft
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+        if self.bytes.len() > MAX_DRAFT_BYTES {
+            let cut = self.bytes.len() - MAX_DRAFT_BYTES;
+            self.bytes.drain(..cut);
+        }
+    }
+
+    fn pop_char(&mut self) {
+        while let Some(b) = self.bytes.pop() {
+            if b & 0xC0 != 0x80 {
+                break;
+            }
+        }
+    }
+
+    fn pop_word(&mut self) {
+        while self.bytes.last().is_some_and(u8::is_ascii_whitespace) {
+            self.bytes.pop();
+        }
+        while self.bytes.last().is_some_and(|b| !b.is_ascii_whitespace()) {
+            self.bytes.pop();
+        }
+    }
+
+    /// Apply `input` as the terminal sends it.
+    pub(crate) fn feed(&mut self, input: &[u8]) {
+        let mut i = 0;
+        while i < input.len() {
+            let b = input[i];
+            if b == 0x1b {
+                match input.get(i + 1) {
+                    Some(b'[') => {
+                        let mut end = i + 2;
+                        while end < input.len() && !(0x40..=0x7e).contains(&input[end]) {
+                            end += 1;
+                        }
+                        let seq = &input[i..(end + 1).min(input.len())];
+                        match seq {
+                            b"\x1b[200~" => self.in_paste = true,
+                            b"\x1b[201~" => self.in_paste = false,
+                            _ => {}
+                        }
+                        // X10 mouse: three raw bytes follow.
+                        i = end + 1 + if seq == b"\x1b[M" { 3 } else { 0 };
+                    }
+                    Some(b'O') => i += 3,
+                    // Alt+Enter: a line break in the draft.
+                    Some(b'\r') => {
+                        self.push(b"\n");
+                        i += 2;
+                    }
+                    // A lone Escape; twice running clears the line.
+                    Some(0x1b) | None => {
+                        if self.escaped {
+                            self.bytes.clear();
+                        }
+                        self.escaped = !self.escaped;
+                        i += 1;
+                        continue;
+                    }
+                    Some(_) => i += 2,
+                }
+                self.escaped = false;
+                continue;
+            }
+            self.escaped = false;
+            if self.in_paste {
+                self.push(&[b]);
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\r' | b'\n' | 0x03 | 0x15 => self.bytes.clear(),
+                0x7f | 0x08 => self.pop_char(),
+                0x17 => self.pop_word(),
+                0x00..=0x1f => {}
+                _ => self.push(&[b]),
+            }
+            i += 1;
+        }
+    }
+
+    /// Characters left unsent.
+    pub(crate) fn chars(&self) -> usize {
+        String::from_utf8_lossy(&self.bytes).chars().count()
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
+}
+
+/// One session's typing as a live handoff carries it to the next hub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypingExport {
+    pub session_id: String,
+    /// Milliseconds since the last input.
+    pub ago_ms: u64,
+    /// What sits unsent in its input line.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub draft: String,
+}
+
+/// The queues' in-memory side: typing times and drafts, holds, edits
+/// open on items, the paste turn, and the delivery gate.
 #[derive(Debug, Default)]
 pub struct QueueRuntime {
-    /// Session id -> when input was last typed into it.
-    typing: Mutex<HashMap<String, Instant>>,
+    /// Session id -> input last typed into it.
+    typing: Mutex<HashMap<String, Typed>>,
     holds: Mutex<Holds>,
+    /// Item id -> until when an open editor keeps it back.
+    editing: Mutex<HashMap<String, Instant>>,
+    /// Taken by every paste for its text and Enter, so two never
+    /// interleave (a queued prompt merged into another's Enter).
+    paste_turn: Mutex<()>,
     gate: Mutex<Gate>,
     gate_changed: Condvar,
     started: AtomicBool,
@@ -460,7 +612,89 @@ impl QueueRuntime {
     }
 
     fn typed_ago(&self, id: &str) -> Option<Duration> {
-        lock(&self.typing).get(id).map(Instant::elapsed)
+        lock(&self.typing).get(id).map(|t| t.at.elapsed())
+    }
+
+    /// Characters left unsent in session `id`'s input line.
+    fn draft_chars(&self, id: &str) -> usize {
+        lock(&self.typing).get(id).map_or(0, |t| t.draft.chars())
+    }
+
+    fn note(&self, id: &str, bytes: &[u8], count_draft: bool) {
+        let mut typing = lock(&self.typing);
+        let typed = typing.entry(id.to_owned()).or_insert_with(|| Typed {
+            at: Instant::now(),
+            draft: Draft::default(),
+        });
+        typed.at = Instant::now();
+        if count_draft {
+            typed.draft.feed(bytes);
+        }
+    }
+
+    /// A turn started: whatever sat in the input line was sent.
+    pub(crate) fn clear_draft(&self, id: &str) {
+        if let Some(typed) = lock(&self.typing).get_mut(id) {
+            typed.draft = Draft::default();
+        }
+    }
+
+    /// Forget a removed session.
+    pub(crate) fn forget(&self, id: &str) {
+        lock(&self.typing).remove(id);
+    }
+
+    /// Keep item `item` back for an open editor (`false`: let it go).
+    pub(crate) fn set_editing(&self, item: &str, editing: bool) {
+        let mut map = lock(&self.editing);
+        let now = Instant::now();
+        map.retain(|_, until| *until > now);
+        if editing {
+            map.insert(item.to_owned(), now + EDIT_LEASE);
+        } else {
+            map.remove(item);
+        }
+    }
+
+    fn is_editing(&self, item: &str) -> bool {
+        lock(&self.editing)
+            .get(item)
+            .is_some_and(|until| *until > Instant::now())
+    }
+
+    /// Take the paste turn (held while text and Enter are written).
+    pub(crate) fn paste_turn(&self) -> MutexGuard<'_, ()> {
+        lock(&self.paste_turn)
+    }
+
+    /// Every session's typing, for a live handoff's next hub.
+    pub(crate) fn typing_export(&self) -> Vec<TypingExport> {
+        lock(&self.typing)
+            .iter()
+            .map(|(id, t)| TypingExport {
+                session_id: id.clone(),
+                ago_ms: u64::try_from(t.at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                draft: t.draft.text(),
+            })
+            .collect()
+    }
+
+    /// Take over what [`QueueRuntime::typing_export`] gave.
+    pub(crate) fn typing_import(&self, exported: Vec<TypingExport>) {
+        let now = Instant::now();
+        let mut typing = lock(&self.typing);
+        for e in exported {
+            let at = now
+                .checked_sub(Duration::from_millis(e.ago_ms))
+                .unwrap_or(now);
+            typing.insert(
+                e.session_id,
+                Typed {
+                    at,
+                    draft: Draft::from_text(&e.draft),
+                },
+            );
+        }
     }
 
     fn holder(&self, id: &str) -> Option<String> {
@@ -517,6 +751,10 @@ pub(crate) struct Facts {
     pub status: Option<StatusView>,
     /// Since input was last typed into it.
     pub typed_ago: Option<Duration>,
+    /// Characters typed into its input line and never sent.
+    pub draft: usize,
+    /// The head item is open in an editor.
+    pub editing: bool,
     pub quiet: Duration,
     /// What holds it now (a review action, a fan-out grading).
     pub owner: Option<String>,
@@ -616,6 +854,16 @@ pub(crate) fn decide(queue: &SessionQueue, facts: &Facts) -> Decision {
             facts.quiet.as_secs()
         ));
     }
+    if facts.draft > 0 {
+        return Decision::Wait(format!(
+            "{} character{} typed into its input never sent: send or clear them (Ctrl-U), then it goes",
+            facts.draft,
+            if facts.draft == 1 { "" } else { "s" }
+        ));
+    }
+    if facts.editing {
+        return wait("the next prompt is open in an editor");
+    }
     Decision::Deliver(head.id.clone())
 }
 
@@ -635,6 +883,22 @@ fn one_line(text: &str, max: usize) -> String {
     }
 }
 
+/// An item in a plugin event (`queue.delivered`, `queue.stalled`): one
+/// shape for both.
+pub(crate) fn event_item(
+    item: &QueueItem,
+    delivered_at: Option<DateTime<Utc>>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": item.id,
+        "text": one_line(&item.text, EVENT_TEXT_CHARS),
+        "bytes": item.text.len(),
+        "when": item.when,
+        "added_at": item.added_at,
+        "delivered_at": delivered_at,
+    })
+}
+
 /// Text compared for a reconcile: whitespace runs as one space.
 fn normalized(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -644,12 +908,32 @@ fn normalized(text: &str) -> String {
 
 impl Hub {
     /// Record that input was typed into session `id` (a browser, `fw hub
-    /// attach`, `fw hub send`, Compose). A lone focus report is not typing.
+    /// attach`, `fw hub send`, Compose, any paste the hub makes): its time,
+    /// and what it leaves unsent in the agent's input line -- except keys
+    /// answering a prompt the agent blocked on (a permission dialog), which
+    /// never reach that line. A lone focus report is not typing. Call it
+    /// only for a session that exists.
     pub fn note_typing(&self, id: &str, bytes: &[u8]) {
         if bytes.is_empty() || bytes == b"\x1b[I" || bytes == b"\x1b[O" {
             return;
         }
-        lock(&self.queue_runtime().typing).insert(id.to_owned(), Instant::now());
+        let blocked = self
+            .agent_status(id)
+            .is_some_and(|s| s.status == AgentStatus::Blocked);
+        self.queue_runtime().note(id, bytes, !blocked);
+    }
+
+    /// Keep pending item `item` of session `id` back while an editor has
+    /// it open (renewed by the editor; it lapses after [`EDIT_LEASE`]).
+    pub fn queue_editing(&self, id: &str, item: &str, editing: bool) -> Result<(), HubError> {
+        self.queue_record(id)?;
+        let item_id = {
+            let store = self.store();
+            let queue = store.queue(id).cloned().unwrap_or_default();
+            Self::queue_item_id(&queue, item)?
+        };
+        self.queue_runtime().set_editing(&item_id, editing);
+        Ok(())
     }
 
     /// Hold sessions `ids` for `what` (a review action) until the guard
@@ -721,14 +1005,14 @@ impl Hub {
                     }
                     None if record.runs_agent() => Presence::Ready,
                     None => Presence::Gone(format!(
-                        "{} came back as a plain shell after a restart: relaunch it, then resume the queue",
+                        "{} came back as a plain shell after a restart: relaunch it and the queue carries on",
                         record.kind.as_str()
                     )),
                 },
                 None => Presence::Starting("its terminal is not up yet"),
             },
             SessionState::Exited { exit, .. } => Presence::Gone(format!(
-                "its agent exited ({}): relaunch it, then resume the queue",
+                "its agent exited ({}): relaunch it and the queue carries on",
                 exit_text(exit)
             )),
             SessionState::Stopped {
@@ -741,12 +1025,12 @@ impl Hub {
                 ..
             } => Presence::Gone(format!("it could not be restored: {why}")),
             SessionState::Stopped { .. } => Presence::Gone(
-                "it is stopped (not restored): relaunch it, then resume the queue".into(),
+                "it is stopped (not restored): relaunch it and the queue carries on".into(),
             ),
         }
     }
 
-    fn queue_facts(&self, record: &SessionRecord) -> Facts {
+    fn queue_facts(&self, record: &SessionRecord, queue: &SessionQueue) -> Facts {
         let runtime = self.queue_runtime();
         let owner = runtime.holder(&record.id).or_else(|| {
             self.grading_owns(&record.id)
@@ -761,6 +1045,8 @@ impl Hub {
                 None
             },
             typed_ago: runtime.typed_ago(&record.id),
+            draft: runtime.draft_chars(&record.id),
+            editing: queue.head().is_some_and(|h| runtime.is_editing(&h.id)),
             quiet: self.tunables().queue_typing_quiet,
             owner,
         }
@@ -773,7 +1059,7 @@ impl Hub {
         let waiting = if queue.head().is_none() {
             None
         } else {
-            match decide(&queue, &self.queue_facts(&record)) {
+            match decide(&queue, &self.queue_facts(&record, &queue)) {
                 Decision::Wait(why) => Some(why),
                 Decision::Stall(why) => Some(format!("about to stall: {why}")),
                 Decision::NoteBlocked { .. } => {
@@ -1119,8 +1405,8 @@ impl Hub {
         }
     }
 
-    /// Whether `record`'s agent transcript holds a user message with
-    /// `text` written from about `since` on.
+    /// Whether `record`'s agent transcript holds a user message that is
+    /// `text` (whitespace runs aside) written from about `since` on.
     fn transcript_has(&self, record: &SessionRecord, text: &str, since: DateTime<Utc>) -> bool {
         let Some((path, format)) = self.command_book().transcript_file(record) else {
             return false;
@@ -1155,7 +1441,9 @@ impl Hub {
                     ..
                 } => {
                     let joined: Vec<&str> = parts.iter().map(|p| p.text.as_str()).collect();
-                    normalized(&joined.join("\n")).contains(&needle)
+                    // The whole message, not a part of one: a short
+                    // prompt ("continue") inside another is not it.
+                    normalized(&joined.join("\n")) == needle
                 }
                 _ => false,
             });
@@ -1175,7 +1463,7 @@ impl Hub {
                 .collect()
         };
         for (queue, record) in candidates {
-            let facts = self.queue_facts(&record);
+            let facts = self.queue_facts(&record, &queue);
             match decide(&queue, &facts) {
                 Decision::Wait(_) => {}
                 Decision::NoteBlocked { item, at } => {
@@ -1200,11 +1488,15 @@ impl Hub {
             reason: reason.to_owned(),
             item: item.map(str::to_owned),
         };
-        let pending = match self.store().update_queue(id, |queue| {
+        let saved = self.store().update_queue(id, |queue| {
             queue.stalled = Some(stall.clone());
-            queue.pending_count()
-        }) {
-            Ok(pending) => pending,
+            let item = item
+                .and_then(|i| queue.items.iter().find(|q| q.id == i))
+                .cloned();
+            (queue.pending_count(), item)
+        });
+        let (pending, item) = match saved {
+            Ok(saved) => saved,
             Err(e) => {
                 eprintln!("fw hub: queue {id}: stalling: {e}");
                 return;
@@ -1218,7 +1510,7 @@ impl Hub {
                 serde_json::json!({
                     "session": session,
                     "reason": reason,
-                    "item": item,
+                    "item": item.as_ref().map(|i| event_item(i, None)),
                     "pending": pending,
                 }),
             );
@@ -1234,6 +1526,23 @@ impl Hub {
             return;
         }
         let _delivering = Delivering(runtime);
+        // No other paste writes from here to the Enter, and the decision is
+        // taken again under the turn: a paste that noted its typing while
+        // this one waited for the turn keeps the item back.
+        let _turn = runtime.paste_turn();
+        let fresh = {
+            let store = self.store();
+            store
+                .queue(id)
+                .cloned()
+                .zip(store.session(id).ok().cloned())
+        };
+        let Some((queue, record)) = fresh else {
+            return;
+        };
+        if decide(&queue, &self.queue_facts(&record, &queue)) != Decision::Deliver(item_id.into()) {
+            return;
+        }
         let now = Utc::now();
         let claimed = self.store().update_queue(id, |queue| {
             if queue.paused || queue.stalled.is_some() {
@@ -1254,11 +1563,14 @@ impl Hub {
                 return;
             }
         };
-        let pasted = self.paste(id, &item.text, true);
+        let pasted = self.paste_turn_held(id, &item.text, true, false);
         let delivered_at = Utc::now();
         match pasted {
             Ok(_) => {
-                let saved = self.store().update_queue(id, |queue| {
+                // Kept in memory even when the save fails: the paste
+                // happened, and the file's `sending` is settled from the
+                // transcript on the next start.
+                let saved = self.store().update_queue_keeping(id, |queue| {
                     if let Some(i) = queue.item_mut(item_id) {
                         i.state = ItemState::Delivered {
                             delivered_at,
@@ -1289,25 +1601,23 @@ impl Hub {
                         "queue.delivered",
                         serde_json::json!({
                             "session": session,
-                            "item": {
-                                "id": item.id,
-                                "text": one_line(&item.text, EVENT_TEXT_CHARS),
-                                "bytes": item.text.len(),
-                                "when": item.when,
-                                "added_at": item.added_at,
-                                "delivered_at": delivered_at,
-                            },
+                            "item": event_item(&item, Some(delivered_at)),
                             "pending": pending,
                         }),
                     );
                 }
             }
             Err(e) => {
-                let _ = self.store().update_queue(id, |queue| {
+                // Nothing was typed: pending again, in memory even when
+                // the save fails (the file's `sending` is settled from the
+                // transcript on the next start).
+                if let Err(e) = self.store().update_queue_keeping(id, |queue| {
                     if let Some(i) = queue.item_mut(item_id) {
                         i.state = ItemState::Pending;
                     }
-                });
+                }) {
+                    eprintln!("fw hub: queue {id}: not recorded: {e}");
+                }
                 self.stall_queue(id, &format!("delivery failed: {e}"), Some(item_id));
             }
         }

@@ -127,6 +127,7 @@ impl Hub {
         spell: u64,
         decision: crate::detect::tracker::Decision,
     ) {
+        let before = self.agent_status(id).map(|s| s.status);
         let changed = self.board().apply_screen(
             id,
             generation,
@@ -136,7 +137,7 @@ impl Hub {
             decision.source,
         );
         if changed {
-            self.status_changed(id);
+            self.status_changed(id, before);
         }
     }
 
@@ -176,16 +177,26 @@ impl Hub {
         detail: Option<&str>,
         source: StatusSource,
     ) {
+        let before = self.agent_status(id).map(|s| s.status);
         let changed = self
             .board()
             .apply_report(id, generation, signal, detail, source);
         if changed {
-            self.status_changed(id);
+            self.status_changed(id, before);
         }
     }
 
     /// A session's status changed: refresh its badge, tell clients.
-    fn status_changed(&self, id: &str) {
+    fn status_changed(&self, id: &str, before: Option<AgentStatus>) {
+        // A turn started from rest (not a blocked prompt answered): what
+        // sat in the agent's input line was sent.
+        if !matches!(before, Some(AgentStatus::Blocked | AgentStatus::Working))
+            && self
+                .agent_status(id)
+                .is_some_and(|s| s.status == AgentStatus::Working)
+        {
+            self.queue_runtime().clear_draft(id);
+        }
         // A turn started or ended: its files may have changed.
         let key = self.store().session(id).ok().map(badge_key);
         if let Some(key) = key {

@@ -251,29 +251,52 @@ pub(super) async fn session_input(
             "nothing to send: give data and/or enter",
         ));
     }
-    app.hub.note_typing(&id, b"input");
     let bracketed = request.paste && session.bracketed_paste();
     let bytes = if request.paste {
         crate::pty::paste_bytes(&request.data, bracketed)
     } else {
         request.data.into_bytes()
     };
-    let mut sent = bytes.len();
-    if !bytes.is_empty()
-        && let Some(refused) = input_refused(session.write(bytes), &label)
-    {
-        return Ok(refused);
-    }
+    app.hub.note_typing(&id, &bytes);
     if request.enter {
-        if sent > 0 {
-            tokio::time::sleep(crate::pty::ENTER_DELAY).await;
-        }
-        if let Some(refused) = input_refused(session.write(b"\r".to_vec()), &label) {
-            return Ok(refused);
-        }
-        sent += 1;
-        // A command may have run: its git badge is looked at shortly.
-        app.hub.nudge_badge_soon(&view.record);
+        app.hub.note_typing(&id, b"\r");
     }
+    // Text and Enter under the paste turn: no queued prompt (or other
+    // paste) writes between them.
+    let hub = Arc::clone(&app.hub);
+    let record = view.record.clone();
+    let enter = request.enter;
+    let written = blocking(move || {
+        let _turn = hub.queue_runtime().paste_turn();
+        let mut sent = bytes.len();
+        if !bytes.is_empty() {
+            let outcome = session.write(bytes);
+            if outcome != WriteOutcome::Queued {
+                return Ok(Err(outcome));
+            }
+        }
+        if enter {
+            if sent > 0 {
+                std::thread::sleep(crate::pty::ENTER_DELAY);
+            }
+            let outcome = session.write(b"\r".to_vec());
+            if outcome != WriteOutcome::Queued {
+                return Ok(Err(outcome));
+            }
+            sent += 1;
+            // A command may have run: its git badge is looked at shortly.
+            hub.nudge_badge_soon(&record);
+        }
+        Ok(Ok(sent))
+    })
+    .await?;
+    let sent = match written {
+        Ok(sent) => sent,
+        Err(outcome) => {
+            return Ok(input_refused(outcome, &label).unwrap_or_else(|| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "input not written")
+            }));
+        }
+    };
     Ok(Json(json!({ "bytes": sent, "bracketed": bracketed })).into_response())
 }

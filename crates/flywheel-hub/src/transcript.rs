@@ -1256,8 +1256,23 @@ impl Hub {
     /// Paste `text` into a running session's terminal, as a bracketed
     /// paste when its program enabled that; Enter only when `run`. A
     /// multi-line paste into a terminal without bracketed paste would run
-    /// each line, so it is refused unless `run`.
+    /// each line, so it is refused unless `run`. It counts as typing into
+    /// the session (a prompt queue waits it out), and no other paste
+    /// writes between its text and its Enter.
     pub fn paste(&self, id: &str, text: &str, run: bool) -> Result<PasteOutcome, HubError> {
+        let _turn = self.queue_runtime().paste_turn();
+        self.paste_turn_held(id, text, run, true)
+    }
+
+    /// [`Hub::paste`] with the paste turn already taken; `typing`: note
+    /// it as typing (a queue's own delivery is not).
+    pub(crate) fn paste_turn_held(
+        &self,
+        id: &str,
+        text: &str,
+        run: bool,
+        typing: bool,
+    ) -> Result<PasteOutcome, HubError> {
         let record = self.session(id)?.record;
         check_paste(text)?;
         let session = self
@@ -1277,6 +1292,12 @@ impl Hub {
         }
         // A trailing newline is never an implicit Enter: only `run` runs.
         let bytes = paste_bytes(text.trim_end_matches(['\n', '\r']), bracketed);
+        if typing {
+            self.note_typing(id, &bytes);
+            if run {
+                self.note_typing(id, b"\r");
+            }
+        }
         let mut len = bytes.len();
         let mut outcome = session.write(bytes);
         if run && outcome == WriteOutcome::Queued {

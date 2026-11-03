@@ -53,7 +53,7 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 - Agents spawned earlier keep hooks pointing at the old binary path: upgrade in place (`cargo install`) or keep it until they relaunch.
 - Mechanism: over `handoff.sock` (same-user only) the old hub freezes (listener stays open, open requests get 503, PTYs paused), closes WebSockets with **1012**, and passes listener, locks, PTY masters, pidfds, emulator snapshots, and held input via `SCM_RIGHTS`. It exits only after the new hub acks.
 - Input reaching the old hub after handover is refused (503), never lost or typed twice.
-- A prompt-queue delivery under way finishes first; none starts until the new hub took over.
+- A prompt-queue delivery under way finishes first; none starts until the new hub took over. Typing times and unsent drafts carry over.
 - Failure before commit thaws the old hub (it keeps serving); a stuck new hub is killed after `--timeout`.
 - Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; for these `--allow-restart` falls back to stop + start with the same flags and env (sessions restored, not kept). Another handoff in progress: retry. A systemd unit's hub: `systemctl --user restart <unit>`.
 - Handed-over processes are no longer children: exits are seen via pidfd with **unknown exit code** (`exited ?`). The new hub runs no restore pass.

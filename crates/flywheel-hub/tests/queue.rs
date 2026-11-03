@@ -578,9 +578,26 @@ async fn never_while_someone_types_and_idle_waits_for_a_look() {
             .unwrap();
         want.push(b'!');
     }
-    let last_key = Instant::now();
     agent.typed_becomes(&want).await;
     assert!(typed_at.elapsed() > QUIET);
+    // Quiet now, but "hey!!!!" sits unsent in its input: pasting the
+    // prompt and Enter would send the two merged. It waits for that
+    // draft to be sent or cleared, however long that takes.
+    agent.stays(&want).await;
+    let waiting = hub.queue(&agent.id).await["waiting"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(waiting.contains("7 characters"), "{waiting}");
+    // Cleared with Backspace: the quiet window still applies from it.
+    for _ in 0..7 {
+        term.send(Message::Binary(b"\x7f".to_vec().into()))
+            .await
+            .unwrap();
+        want.push(0x7f);
+    }
+    let last_key = Instant::now();
+    agent.typed_becomes(&want).await;
     want.extend(pasted("while you type"));
     agent.typed_becomes(&want).await;
     assert!(
@@ -613,6 +630,138 @@ async fn never_while_someone_types_and_idle_waits_for_a_look() {
         .unwrap();
     want.extend(pasted("after you read it"));
     agent.typed_becomes(&want).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hubs_own_pastes_count_as_typing_and_a_draft_is_kept_across_an_answer() {
+    let hub = TestHub::start().await;
+    let agent = hub.claude().await;
+    agent.fire("SessionStart", None).await;
+    status_is(&hub, &agent.id, "idle").await;
+    sleep(Duration::from_secs(2)).await;
+    hub.add(&agent.id, "queued meanwhile", None).await;
+    hub.post(
+        &format!("/api/sessions/{}/queue/pause", agent.id),
+        json!({}),
+    )
+    .await;
+    // A paste the hub makes (handoff, send findings, a plugin action, the
+    // paste API) types into the agent: the queue waits it out like keys.
+    hub.post(
+        &format!("/api/sessions/{}/paste", agent.id),
+        json!({ "text": "a handoff", "run": true }),
+    )
+    .await;
+    let pasted_at = Instant::now();
+    let mut want = pasted("a handoff");
+    agent.typed_becomes(&want).await;
+    let resumed = hub
+        .post(
+            &format!("/api/sessions/{}/queue/resume", agent.id),
+            json!({}),
+        )
+        .await;
+    assert!(
+        resumed["waiting"].as_str().unwrap().contains("typed"),
+        "{resumed}"
+    );
+    want.extend(pasted("queued meanwhile"));
+    agent.typed_becomes(&want).await;
+    assert!(pasted_at.elapsed() >= QUIET, "{:?}", pasted_at.elapsed());
+
+    // A paste without Enter leaves a draft: nothing goes on top of it.
+    agent.turn().await;
+    hub.add(&agent.id, "not onto a draft", None).await;
+    hub.post(
+        &format!("/api/sessions/{}/paste", agent.id),
+        json!({ "text": "half", "run": false }),
+    )
+    .await;
+    want.extend(flywheel_hub::pty::paste_bytes("half", true));
+    agent.typed_becomes(&want).await;
+    agent.stays(&want).await;
+    assert!(
+        hub.queue(&agent.id).await["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("4 characters"),
+    );
+    // Cleared (Ctrl-U): it goes once the quiet window passes.
+    let mut term = hub.ws(&format!("/api/sessions/{}/ws", agent.id)).await;
+    term.send(Message::Binary(b"\x15".to_vec().into()))
+        .await
+        .unwrap();
+    want.push(0x15);
+    want.extend(pasted("not onto a draft"));
+    agent.typed_becomes(&want).await;
+
+    // Keys answering a permission prompt never reach the input line: not
+    // a draft, so the turn's end lets the next one go.
+    agent.fire("UserPromptSubmit", None).await;
+    hub.add(&agent.id, "after the answer", None).await;
+    agent.fire("Notification", Some("permission_prompt")).await;
+    status_is(&hub, &agent.id, "blocked").await;
+    term.send(Message::Binary(b"1".to_vec().into()))
+        .await
+        .unwrap();
+    want.push(b'1');
+    agent.typed_becomes(&want).await;
+    agent.fire("PreToolUse", None).await;
+    status_is(&hub, &agent.id, "working").await;
+    agent.fire("Stop", None).await;
+    want.extend(pasted("after the answer"));
+    agent.typed_becomes(&want).await;
+    drop(term);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_item_open_in_an_editor_waits_and_stall_events_carry_the_item() {
+    let hub = TestHub::start().await;
+    let agent = hub.claude().await;
+    let mut events = hub.hub.subscribe();
+    agent.fire("UserPromptSubmit", None).await;
+    let added = hub.add(&agent.id, "being edited", None).await;
+    let item = added["item"]["id"].as_str().unwrap().to_owned();
+    let editing = format!("/api/sessions/{}/queue/items/{item}/editing", agent.id);
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &editing,
+            Some(json!({ "editing": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    agent.fire("Stop", None).await;
+    agent.stays(b"").await;
+    assert!(
+        hub.queue(&agent.id).await["waiting"]
+            .as_str()
+            .unwrap()
+            .contains("editor")
+    );
+    let (status, _) = hub
+        .call(
+            reqwest::Method::PATCH,
+            &format!("/api/sessions/{}/queue/items/{item}", agent.id),
+            Some(json!({ "text": "edited" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    hub.post(&editing, json!({ "editing": false })).await;
+    let want = pasted("edited");
+    agent.typed_becomes(&want).await;
+    let delivered = lifecycle(&mut events, "queue.delivered").await;
+    assert_eq!(delivered["item"]["text"], "edited");
+
+    // queue.stalled names its item the same way.
+    agent.turn().await;
+    hub.add(&agent.id, "to a dead agent", Some("idle")).await;
+    hub.post(&format!("/api/sessions/{}/kill", agent.id), json!({}))
+        .await;
+    let stalled = lifecycle(&mut events, "queue.stalled").await;
+    assert_eq!(stalled["item"]["text"], "to a dead agent", "{stalled}");
+    assert_eq!(stalled["item"]["when"], "idle");
+    assert!(stalled["item"]["id"].is_string());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -678,16 +827,13 @@ async fn pause_resume_holds_and_stalls_that_surface() {
         "{row}"
     );
 
-    // Relaunched and resumed, it goes once the new agent is at rest.
+    // Relaunched, it goes once the new agent is at rest.
     let previous = agent.env(None).await[report::SECRET_ENV].clone();
     hub.post(&format!("/api/sessions/{}/restart", agent.id), json!({}))
         .await;
     agent.env(Some(&previous)).await;
-    hub.post(
-        &format!("/api/sessions/{}/queue/resume", agent.id),
-        json!({}),
-    )
-    .await;
+    // The relaunch the stall asked for clears it: no separate resume.
+    assert!(hub.queue(&agent.id).await["stalled"].is_null());
     agent.stays(&want).await;
     agent.fire("SessionStart", None).await;
     want.extend(pasted("never typed into a dead agent"));

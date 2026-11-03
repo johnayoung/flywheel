@@ -62,6 +62,14 @@ impl Hub {
                 return Err(e.into());
             }
         };
+        // Relaunching is what a stalled queue asked for: it carries on
+        // once the new agent is at rest.
+        if store.queue(id).is_some_and(|q| q.stalled.is_some()) {
+            match store.update_queue(id, |q| q.stalled = None) {
+                Ok(()) => eprintln!("fw hub: queue {id}: relaunched, so its stall is cleared"),
+                Err(e) => eprintln!("fw hub: queue {id}: stall not cleared: {e}"),
+            }
+        }
         let previous = self.live().insert(record.id.clone(), session);
         drop(store);
         if let Some(previous) = previous {

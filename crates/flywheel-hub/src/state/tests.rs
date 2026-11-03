@@ -1087,3 +1087,54 @@ fn a_version_4_file_with_promoted_fanouts_migrates_to_queues_losing_neither() {
     assert_eq!(queue.items.len(), 1);
     assert_eq!(queue.items[0].text, "then write the changelog");
 }
+
+#[test]
+fn a_queue_edit_that_records_what_happened_survives_a_failed_save() {
+    use crate::queue::{ItemState, QueueItem, When};
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo(dir.path(), "r");
+    let mut store = HubStore::open(dir.path()).unwrap();
+    let ws = store
+        .create_workspace(input("w", vec![repo.clone()]))
+        .unwrap();
+    let session = running_session(&ws.id, &repo);
+    store.insert_session(session.clone()).unwrap();
+    let sending_at = Utc::now();
+    store
+        .update_queue(&session.id, |q| {
+            q.items.push(QueueItem {
+                id: "item-1".into(),
+                text: "go".into(),
+                when: When::Done,
+                added_at: sending_at,
+                blocked_at: None,
+                state: ItemState::Sending { sending_at },
+            });
+        })
+        .unwrap();
+    // Every save fails from here: its temp file cannot be created.
+    let tmp = dir.path().join(STATE_FILE).with_extension("tmp");
+    fs::create_dir(&tmp).unwrap();
+    let delivered = |q: &mut crate::queue::SessionQueue| {
+        q.items[0].state = ItemState::Delivered {
+            delivered_at: sending_at,
+            reconciled: false,
+        };
+    };
+    // The ordinary update rolls back (still `sending`) ...
+    assert!(store.update_queue(&session.id, delivered).is_err());
+    assert!(matches!(
+        store.queue(&session.id).unwrap().items[0].state,
+        ItemState::Sending { .. }
+    ));
+    // ... the keeping one reports the failure but is not stuck there.
+    assert!(store.update_queue_keeping(&session.id, delivered).is_err());
+    assert!(store.queue(&session.id).unwrap().items[0].is_delivered());
+    // The next save that works writes it.
+    fs::remove_dir(&tmp).unwrap();
+    store
+        .update_queue(&session.id, |q| q.paused = true)
+        .unwrap();
+    let reopened = HubStore::open(dir.path()).unwrap();
+    assert!(reopened.queue(&session.id).unwrap().items[0].is_delivered());
+}

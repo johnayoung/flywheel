@@ -111,7 +111,7 @@ Prompt queues ([hub-workflows: Prompt queue](workflows.md#prompt-queue)); `ITEM`
 
 ```bash
 fw hub queue add SESSION TEXT|- [--when done|idle|blocked-cleared] [--json] {remote} {machine}   # typed in once the turn is done
-fw hub queue ls [SESSION] [--json] {remote} {machine}
+fw hub queue ls [SESSION] [--json] {remote} {machine}   # no SESSION: each one's latest 3 sent too
 fw hub queue rm SESSION ITEM [--json] {remote} {machine}
 fw hub queue clear SESSION [--all] [--json] {remote} {machine}   # --all: the delivered history too
 fw hub queue move SESSION ITEM POS [--json] {remote} {machine}   # POS among the pending (1 = next)

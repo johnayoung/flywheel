@@ -21,9 +21,9 @@ enum QueueCommand {
     /// a prompt, someone types into it, or a fan-out grading or review
     /// action uses it.
     Add(AddArgs),
-    /// A session's queue (or, without SESSION, every queue): pending
-    /// items in order, delivered ones with their time, and why the next
-    /// one waits.
+    /// A session's queue (or, without SESSION, every queue, each with its
+    /// latest 3 sent): pending items in order, delivered ones with their
+    /// time, and why the next one waits.
     Ls(LsArgs),
     /// Remove an item (by position or id prefix).
     Rm(ItemArgs),
@@ -161,8 +161,12 @@ fn first_line(text: &str, max: usize) -> String {
     crate::commands_cli::visible_controls(&shown)
 }
 
-/// A queue for a terminal.
-fn print_queue(out: &mut dyn Write, view: &Value) {
+/// Sent items each queue shows in the every-queue listing.
+const OVERVIEW_SENT: usize = 3;
+
+/// A queue for a terminal: every sent item, or (`sent_shown`) only the
+/// latest few.
+fn print_queue(out: &mut dyn Write, view: &Value, sent_shown: Option<usize>) {
     let pending = view["pending"].as_u64().unwrap_or(0);
     let mut head = format!("{} -- {pending} pending", str_field(view, "session"));
     if view["paused"] == true {
@@ -179,7 +183,21 @@ fn print_queue(out: &mut dyn Write, view: &Value) {
     } else if let Some(why) = view.get("waiting").and_then(Value::as_str) {
         let _ = writeln!(out, "  next: {why}");
     }
-    for item in view["items"].as_array().into_iter().flatten() {
+    let items: Vec<&Value> = view["items"].as_array().into_iter().flatten().collect();
+    let sent = items.iter().filter(|i| i["state"] == "delivered").count();
+    let mut skip = sent_shown.map_or(0, |n| sent.saturating_sub(n));
+    if skip > 0 {
+        let _ = writeln!(
+            out,
+            "  ... {skip} sent before (fw hub queue ls {} shows them)",
+            str_field(view, "session")
+        );
+    }
+    for item in items {
+        if skip > 0 && item["state"] == "delivered" {
+            skip -= 1;
+            continue;
+        }
         let id = str_field(item, "id");
         let short = &id[..id.len().min(8)];
         let text = first_line(str_field(item, "text"), 60);
@@ -208,7 +226,7 @@ fn finish(out: &mut dyn Write, json_out: bool, view: &Value) -> Result<i32, Stri
     if json_out {
         print_json(out, view);
     } else {
-        print_queue(out, view);
+        print_queue(out, view, None);
     }
     Ok(0)
 }
@@ -273,7 +291,7 @@ fn run(args: &QueueArgs, out: &mut dyn Write) -> Result<i32, String> {
                         let _ = writeln!(out, "no queues");
                     }
                     for view in &queues {
-                        print_queue(out, view);
+                        print_queue(out, view, Some(OVERVIEW_SENT));
                     }
                     Ok(0)
                 }

@@ -553,6 +553,35 @@ async fn an_expiring_link_closes_its_views_and_then_answers_gone() {
         closed_with(&mut viewer, Duration::from_secs(5)).await.0,
         4004
     );
+
+    // Removing a session revokes its links (they would still hold a slot
+    // of the live-link cap and answer for a session that is gone).
+    let (third, credential) = hub
+        .hub
+        .shares()
+        .issue(&sid, Duration::from_secs(600), Some("three"))
+        .unwrap();
+    let removed = hub
+        .authed(reqwest::Method::DELETE, &format!("/api/sessions/{sid}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(removed.status().is_success(), "{}", removed.status());
+    assert!(
+        hub.get("/api/shares").await["shares"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["id"] != third.id.as_str()),
+        "the removed session's link is no longer listed"
+    );
+    let gone = hub
+        .http
+        .get(hub.url(&format!("/share/{credential}/info")))
+        .send()
+        .await
+        .unwrap();
+    assert!(gone.status().is_client_error(), "{}", gone.status());
     hub.shutdown().await;
 }
 

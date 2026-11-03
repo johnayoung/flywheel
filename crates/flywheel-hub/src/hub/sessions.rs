@@ -638,6 +638,19 @@ impl Hub {
         if let Some((workspace_id, rev)) = relaid {
             self.emit(HubEvent::Layout { workspace_id, rev });
         }
+        // Its share links end with it: a link to nothing would still count
+        // against the live-link cap and answer for a session that is gone.
+        match self.shares().revoke_all(Some(id)) {
+            Ok(revoked) => {
+                for info in revoked {
+                    self.emit_lifecycle(
+                        "share.revoked",
+                        serde_json::json!({ "session": described.clone(), "share": info.event() }),
+                    );
+                }
+            }
+            Err(e) => eprintln!("fw hub: removing session {id}: its share links stay: {e}"),
+        }
         if let Some(session) = described {
             self.emit_lifecycle("session.removed", serde_json::json!({ "session": session }));
         }

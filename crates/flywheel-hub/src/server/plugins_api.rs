@@ -2,11 +2,12 @@
 //! running their palette actions. Nothing here installs a plugin: they
 //! come only from `<state-dir>/plugins/` on the hub's machine.
 
+use super::ApiQuery;
 use super::{ApiJson, AppState, error_response};
 use crate::hub::HubEvent;
 use crate::plugins::{self, ActionError};
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -82,7 +83,7 @@ pub(super) struct LogsQuery {
 pub(super) async fn logs(
     State(app): State<AppState>,
     Path(name): Path<String>,
-    Query(query): Query<LogsQuery>,
+    ApiQuery(query): ApiQuery<LogsQuery>,
 ) -> Response {
     if !plugins::valid_name(&name) {
         return error_response(StatusCode::BAD_REQUEST, "not a plugin name");

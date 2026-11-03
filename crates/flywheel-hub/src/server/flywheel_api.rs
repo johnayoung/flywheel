@@ -12,6 +12,7 @@
 //!
 //! Only folders of the hub's workspaces are served, and only adopted ones.
 
+use super::ApiQuery;
 use super::{AppState, error_response};
 use crate::flywheel::{
     FlywheelEvent, FlywheelMonitor, FlywheelSummary, runs_worker, valid_run_id,
@@ -20,8 +21,8 @@ use crate::flywheel::{
 use crate::hub::{CreateSession, Hub};
 use crate::state::Workspace;
 use axum::Json;
+use axum::extract::State;
 use axum::extract::ws::Message;
-use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -165,7 +166,7 @@ pub(super) struct PanelQuery {
 
 pub(super) async fn panel(
     State(app): State<AppState>,
-    Query(query): Query<PanelQuery>,
+    ApiQuery(query): ApiQuery<PanelQuery>,
 ) -> Response {
     let monitor = match monitor(&app) {
         Ok(m) => m,
@@ -205,7 +206,7 @@ pub(super) struct RunQuery {
 
 pub(super) async fn run_output(
     State(app): State<AppState>,
-    Query(query): Query<RunQuery>,
+    ApiQuery(query): ApiQuery<RunQuery>,
 ) -> Response {
     let monitor = match monitor(&app) {
         Ok(m) => m,

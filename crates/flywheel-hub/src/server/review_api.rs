@@ -3,13 +3,13 @@
 //! .../review/{commit,push,pr,rebase,abort,merge}`: `dry_run` plans, `confirm`
 //! runs the plan with that fingerprint) and `POST .../review/ask`.
 
+use super::ApiQuery;
 use super::{ApiJson, ApiResult, AppState, blocking, error_response};
 use crate::hub::HubError;
 use crate::review::{Action, AskKind, PrRequest, Scope};
 use crate::state::StateError;
 use axum::Json;
-use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -24,12 +24,8 @@ pub(super) struct ReviewQuery {
 pub(super) async fn review(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    query: Result<Query<ReviewQuery>, QueryRejection>,
+    ApiQuery(query): ApiQuery<ReviewQuery>,
 ) -> ApiResult<Response> {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(rejection) => return Ok(error_response(rejection.status(), &rejection.body_text())),
-    };
     let hub = Arc::clone(&app.hub);
     let tools = app.options.review_tools.clone();
     let view = blocking(move || hub.review(&tools, &id, query.base.as_deref())).await?;
@@ -49,12 +45,8 @@ pub(super) struct DiffQuery {
 pub(super) async fn diff(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    query: Result<Query<DiffQuery>, QueryRejection>,
+    ApiQuery(query): ApiQuery<DiffQuery>,
 ) -> ApiResult<Response> {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(rejection) => return Ok(error_response(rejection.status(), &rejection.body_text())),
-    };
     let scope = match Scope::parse(query.scope.as_deref().unwrap_or("committed")) {
         Ok(scope) => scope,
         Err(message) => return Ok(error_response(StatusCode::BAD_REQUEST, &message)),

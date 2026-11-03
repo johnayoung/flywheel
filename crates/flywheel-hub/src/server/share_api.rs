@@ -6,6 +6,7 @@
 //! other path under it is 403, and the credential presented anywhere else
 //! is refused by `require_auth` (403).
 
+use super::ApiQuery;
 use super::terminal_ws::{
     attach, close_for_restart, exit_message, handoff_restarting, send_attachment,
 };
@@ -21,7 +22,7 @@ use crate::vt::{SNAPSHOT_HISTORY_BYTES, TextSource};
 use crate::web;
 use axum::Json;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use futures_util::SinkExt;
@@ -129,16 +130,9 @@ pub(super) async fn create(
     Ok(response)
 }
 
-/// A share as plugin events carry it: never the credential, its digest, or
-/// a link (the link is the credential).
+/// A share as plugin events carry it (see [`ShareInfo::event`]).
 fn share_event(info: &ShareInfo) -> Value {
-    json!({
-        "id": info.id,
-        "session_id": info.session_id,
-        "name": info.name,
-        "created": info.created,
-        "expires": info.expires,
-    })
+    info.event()
 }
 
 /// `share.revoked` for each of `revoked`.
@@ -192,7 +186,7 @@ pub(super) struct RevokeAll {
 
 pub(super) async fn revoke_all(
     State(app): State<AppState>,
-    Query(query): Query<RevokeAll>,
+    ApiQuery(query): ApiQuery<RevokeAll>,
 ) -> ApiResult<Json<Value>> {
     let hub = Arc::clone(&app.hub);
     let revoked = blocking(move || {

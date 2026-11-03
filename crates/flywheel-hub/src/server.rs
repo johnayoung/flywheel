@@ -569,6 +569,82 @@ where
     }
 }
 
+/// `Query` whose rejections (a number that is not one, a missing or
+/// repeated parameter) answer in the API's `{"error": ...}` form, worded
+/// for the caller rather than in serde's terms.
+struct ApiQuery<T>(T);
+
+impl<S, T> axum::extract::FromRequestParts<S> for ApiQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Response> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(Self(value)),
+            Err(rejection) => Err(error_response(
+                rejection.status(),
+                &bounded_message(&query_message(&rejection_message(&rejection.body_text()))),
+            )),
+        }
+    }
+}
+
+/// A boolean query flag: absent or `false`/`0` is false; `true`/`1`/empty
+/// (`?all`) is true; anything else is an error naming `name`.
+fn query_flag(name: &str, raw: Option<&str>) -> Result<bool, String> {
+    match raw {
+        None | Some("false" | "0") => Ok(false),
+        Some("true" | "1" | "") => Ok(true),
+        Some(other) => Err(format!("{name} must be true or false, not {other:?}")),
+    }
+}
+
+/// serde's query-string errors in the caller's words: `limit: invalid
+/// digit found in string` -> `limit must be a number`, ``missing field
+/// `folder` `` -> `folder is required`, ``duplicate field `x` `` -> `x is
+/// given twice`.
+fn query_message(text: &str) -> String {
+    let quoted = |rest: &str| {
+        rest.strip_prefix('`')
+            .and_then(|r| r.split_once('`'))
+            .map(|(name, _)| name.to_owned())
+    };
+    if let Some(name) = text.strip_prefix("missing field ").and_then(quoted) {
+        return format!("{name} is required");
+    }
+    if let Some(name) = text.strip_prefix("duplicate field ").and_then(quoted) {
+        return format!("{name} is given twice");
+    }
+    if let Some((field, reason)) = text.split_once(": ")
+        && !field.is_empty()
+        && field
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+    {
+        let number = [
+            "invalid digit found in string",
+            "cannot parse integer from empty string",
+            "number too large to fit in target type",
+            "number too small to fit in target type",
+            "invalid float literal",
+        ];
+        if number.contains(&reason) {
+            return format!("{field} must be a number");
+        }
+        if reason.starts_with("provided string was not `true` or `false`") {
+            return format!("{field} must be true or false");
+        }
+        return format!("{field}: {reason}");
+    }
+    text.to_owned()
+}
+
 /// An extractor rejection's text without axum's boilerplate lead-in
 /// ("Failed to deserialize the JSON body into the target type: kind:
 /// unknown variant ..." -> "kind: unknown variant ...").

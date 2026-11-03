@@ -1,16 +1,14 @@
 //! Sessions: `/api/sessions` (list, get, create, rename, kill, restart),
 //! the agent kinds, folder checks, a session's screen text, and typed input.
 
-use super::{
-    ApiError, ApiJson, ApiResult, AppState, MAX_SCREEN_LINES, blocking, error_response,
-    rejection_message,
-};
+use super::ApiQuery;
+use super::{ApiError, ApiJson, ApiResult, AppState, MAX_SCREEN_LINES, blocking, error_response};
 use crate::hub::{CreateSession, HubError};
 use crate::pty::WriteOutcome;
 use crate::state::{is_git_root, validate_folder};
 use crate::vt::{DEFAULT_RECENT_LINES, TextSource};
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -24,7 +22,7 @@ pub(super) struct SessionFilter {
 
 pub(super) async fn list_sessions(
     State(app): State<AppState>,
-    Query(filter): Query<SessionFilter>,
+    ApiQuery(filter): ApiQuery<SessionFilter>,
 ) -> Response {
     Json(json!({ "sessions": app.hub.sessions(filter.workspace_id.as_deref()) })).into_response()
 }
@@ -83,7 +81,7 @@ pub(super) struct RepoQuery {
 /// Validate one candidate folder path for the workspace form: always 200,
 /// `{"ok":true,"path":canonical,"git":bool}` or `{"ok":false,"error":...}`
 /// (a missing or blank `path` included).
-pub(super) async fn check_folder(Query(query): Query<RepoQuery>) -> Response {
+pub(super) async fn check_folder(ApiQuery(query): ApiQuery<RepoQuery>) -> Response {
     let Some(path) = query.path.filter(|p| !p.trim().is_empty()) else {
         return Json(json!({ "ok": false, "error": "path is required" })).into_response();
     };
@@ -145,17 +143,8 @@ pub(super) struct ScreenQuery {
 pub(super) async fn session_screen(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    query: Result<Query<ScreenQuery>, axum::extract::rejection::QueryRejection>,
+    ApiQuery(query): ApiQuery<ScreenQuery>,
 ) -> ApiResult<Response> {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(rejection) => {
-            return Ok(error_response(
-                rejection.status(),
-                &rejection_message(&rejection.body_text()),
-            ));
-        }
-    };
     // An unknown session is a 404 whatever the options say.
     let label = app.hub.session(&id)?.record.label();
     let lines = match query.lines.as_deref() {

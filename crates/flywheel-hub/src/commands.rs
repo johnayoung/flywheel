@@ -398,12 +398,20 @@ fn is_assignment(word: &str) -> bool {
 pub fn copyable(lang: Option<&str>, text: &str) -> String {
     let prompted = |l: &str| l == "$" || l.starts_with("$ ");
     let lines: Vec<&str> = text.split('\n').collect();
-    let console = match lang {
-        Some(lang) => CONSOLE_LANGS.contains(&lang),
-        None => lines
+    // A session block, or an untagged or shell-tagged one (```sh) whose
+    // first line is behind a `$ ` prompt: a `$` is never part of the
+    // command (`$ git status` run verbatim is "$: command not found").
+    let first_prompted = || {
+        lines
             .iter()
             .find(|l| !l.trim().is_empty())
-            .is_some_and(|l| prompted(l)),
+            .is_some_and(|l| prompted(l))
+    };
+    let console = match lang {
+        Some(lang) if CONSOLE_LANGS.contains(&lang) => true,
+        Some(lang) if SHELL_LANGS.contains(&lang) => first_prompted(),
+        Some(_) => false,
+        None => first_prompted(),
     };
     if !console || !lines.iter().any(|l| prompted(l)) {
         return text.to_owned();
@@ -617,9 +625,18 @@ mod tests {
             ),
             "cargo build \\\n    --release\ncat <<EOF > f\na b\nEOF\nwc -l f"
         );
-        // No prompt at all, or not a console language: exactly as written.
+        // A shell-tagged block behind prompts (agents write ```sh then
+        // `$ cmd`): the prompts go, or Send + Run would run `$`.
+        assert_eq!(
+            copyable(Some("sh"), "$ git status --short"),
+            "git status --short"
+        );
+        assert_eq!(copyable(Some("bash"), "$ ls\nx\n$ pwd"), "ls\npwd");
+        // No prompt at all, a shell block whose first line has none, or
+        // not a shell language: exactly as written.
         assert_eq!(copyable(Some("console"), "ls\nfile"), "ls\nfile");
-        assert_eq!(copyable(Some("bash"), "$ ls\nx"), "$ ls\nx");
+        assert_eq!(copyable(Some("bash"), "ls\n$ pwd"), "ls\n$ pwd");
+        assert_eq!(copyable(Some("python"), "$ ls"), "$ ls");
         assert_eq!(copyable(None, "ls\n$ pwd"), "ls\n$ pwd");
         // `$HOME` is not a prompt.
         assert_eq!(copyable(None, "$HOME/bin/x"), "$HOME/bin/x");

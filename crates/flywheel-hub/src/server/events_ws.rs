@@ -2,6 +2,7 @@
 //! list changes, and suggested commands; what each page shows, for
 //! seen-tracking.
 
+use super::ApiQuery;
 use super::commands_api;
 use super::flywheel_api;
 use super::terminal_ws::{close_for_restart, handoff_restarting};
@@ -10,8 +11,8 @@ use super::{
     upgrade_refused,
 };
 use crate::hub::{Hub, HubEvent};
+use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use futures_util::SinkExt;
@@ -46,7 +47,7 @@ fn valid_client_id(id: &str) -> bool {
 
 pub(super) async fn events_ws(
     State(app): State<AppState>,
-    Query(query): Query<EventsQuery>,
+    ApiQuery(query): ApiQuery<EventsQuery>,
     client: Client,
     headers: HeaderMap,
     credential: Option<axum::Extension<CredentialWatch>>,

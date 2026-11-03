@@ -2,11 +2,12 @@
 //! `POST /api/workspaces/{id}/templates`,
 //! `DELETE /api/workspaces/{id}/templates/{name}`, and `GET /api/usage`.
 
+use super::ApiQuery;
 use super::{ApiJson, ApiResult, AppState, blocking};
 use crate::agent::{AgentLaunch, SessionKind};
 use crate::state::LaunchTemplate;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -21,7 +22,7 @@ pub(super) struct TemplatesQuery {
 /// Every workspace's templates, or one's (`workspace_id`).
 pub(super) async fn list(
     State(app): State<AppState>,
-    Query(query): Query<TemplatesQuery>,
+    ApiQuery(query): ApiQuery<TemplatesQuery>,
 ) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
     let templates = blocking(move || hub.templates(query.workspace_id.as_deref())).await?;

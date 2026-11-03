@@ -16,9 +16,7 @@ use super::{
     handoff_restarting, login_recheck, origin_ok, upgrade_refused,
 };
 use crate::hub::HubEvent;
-use crate::machines::{
-    CALL_TIMEOUT, LinkError, Machine, MachineError, error_text, host_name, record,
-};
+use crate::machines::{CALL_TIMEOUT, LinkError, Machine, MachineError, host_name, record};
 use crate::peers::{PeerError, PeerInfo};
 use axum::Json;
 use axum::body::Bytes;
@@ -592,7 +590,7 @@ async fn forward_socket(
             let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
             return (
                 status,
-                Json(json!({ "error": error_text(&body), "machine": name })),
+                Json(json!({ "error": crate::net::error_text(&body), "machine": name })),
             )
                 .into_response();
         }

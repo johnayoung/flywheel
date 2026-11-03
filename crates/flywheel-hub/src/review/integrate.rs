@@ -150,6 +150,16 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
         .unwrap_or_else(|| defaults.body.clone());
     match (&branch, &pushed, &base) {
         (None, _, _) => refusal = Some("HEAD is detached: a pull request needs a branch".into()),
+        (Some(_), None, _) if review.remotes.is_empty() => {
+            refusal = Some(
+                "the repository has no remotes: add one (git remote add), push, then open the \
+                 pull request"
+                    .into(),
+            );
+        }
+        (Some(_), _, Some(base)) if base.starts_with('-') || base.contains(char::is_whitespace) => {
+            refusal = Some(format!("base {base:?} is not a branch name"));
+        }
         (Some(b), None, _) => {
             refusal = Some(format!(
                 "{b} is not pushed to {remote} yet: push it first (the pull request is opened from the pushed branch)"

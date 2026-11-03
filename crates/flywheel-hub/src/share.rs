@@ -80,6 +80,20 @@ pub struct ShareInfo {
     pub expires: u64,
 }
 
+impl ShareInfo {
+    /// A share as plugin events carry it: never the credential, its digest, or
+    /// a link (the link is the credential).
+    pub fn event(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "session_id": self.session_id,
+            "name": self.name,
+            "created": self.created,
+            "expires": self.expires,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ShareEntry {
     #[serde(flatten)]

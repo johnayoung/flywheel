@@ -963,6 +963,28 @@ async fn api_errors_are_json_and_edge_inputs_are_handled() {
             StatusCode::NOT_FOUND,
             "zzz",
         ),
+        // Query strings serde cannot read: JSON, in the caller's words.
+        (
+            reqwest::Method::GET,
+            "/api/plugins/x/logs?limit=abc",
+            None,
+            StatusCode::BAD_REQUEST,
+            "limit must be a number",
+        ),
+        (
+            reqwest::Method::GET,
+            "/api/flywheel/panel",
+            None,
+            StatusCode::BAD_REQUEST,
+            "folder is required",
+        ),
+        (
+            reqwest::Method::GET,
+            "/api/templates?workspace_id=1&workspace_id=2",
+            None,
+            StatusCode::BAD_REQUEST,
+            "workspace_id is given twice",
+        ),
     ] {
         let mut request = hub.authed(method, path);
         if let Some(body) = body {

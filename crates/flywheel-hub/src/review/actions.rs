@@ -2,7 +2,7 @@
 //! fingerprint re-checked, every command's output kept.
 
 use super::integrate::{PrRequest, plan_abort, plan_merge, plan_pr, plan_rebase};
-use super::model::{nul_list, operation};
+use super::model::{nul_list, operation, read};
 use super::plan::{Outcome, Plan, Planned, Ran, plan_commit, plan_push, staged_as_planned};
 use super::runner;
 use super::runner::{Output, RunError, Spec};
@@ -299,15 +299,17 @@ pub fn rebase(tools: &Tools, target: &Target, confirm: &str) -> Result<Outcome, 
     let _lock = RepoLock::take(tools, &target.dir)?;
     let plan = plan_rebase(tools, target).map_err(unplannable)?;
     confirmed(&plan, confirm)?;
+    let ahead_before = read(tools, target).map(|r| r.ahead).ok();
     let command = &plan.commands[0];
     let output = exec(command)?;
     let record = ran(command, &output);
     let head = head_of(tools, &target.dir);
     if output.success() {
+        let ahead_after = read(tools, target).map(|r| r.ahead).ok();
         return Ok(Outcome {
             action: "rebase",
             ok: true,
-            summary: plan.summary.replacen("Replay ", "Replayed ", 1),
+            summary: rebased_summary(&plan.summary, ahead_before, ahead_after, target),
             ran: vec![record],
             conflicts: Vec::new(),
             url: None,
@@ -350,6 +352,45 @@ pub fn rebase(tools: &Tools, target: &Target, confirm: &str) -> Result<Outcome, 
         url: None,
         head,
     })
+}
+
+/// What a rebase that went through did: git drops a commit whose change
+/// the base already has, so "replayed N" is said only of what is left.
+fn rebased_summary(
+    planned: &str,
+    before: Option<u32>,
+    after: Option<u32>,
+    target: &Target,
+) -> String {
+    let done = planned.replacen("Replay ", "Replayed ", 1);
+    let (Some(before), Some(after)) = (before, after) else {
+        return done;
+    };
+    if after >= before {
+        return done;
+    }
+    let base = target
+        .worktree
+        .as_ref()
+        .map_or("the base", |w| w.base.as_str());
+    let dropped = before - after;
+    let already = format!(
+        "{} already in {base} and {} dropped",
+        if dropped == 1 {
+            "1 commit was".to_owned()
+        } else {
+            format!("{dropped} commits were")
+        },
+        if dropped == 1 { "was" } else { "were" }
+    );
+    if after == 0 {
+        format!("Rebased onto {base}: {already}; the branch now equals {base}")
+    } else {
+        format!(
+            "Rebased onto {base}: {already}; {} replayed",
+            plural(after as usize, "commit")
+        )
+    }
 }
 
 /// Abort the stopped rebase, as confirmed.

@@ -1,12 +1,13 @@
 //! `GET /api/sessions/{id}/commands`, `POST /api/sessions/{id}/paste`, and
 //! the events socket's `commands` message.
 
+use super::ApiQuery;
 use super::{ApiJson, ApiResult, AppState, blocking, error_response, text};
 use crate::commands::Command;
 use crate::transcript::{CommandFilter, MAX_COMMANDS, is_fresh};
 use axum::Json;
 use axum::extract::ws::Message;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -28,12 +29,8 @@ pub(super) struct CommandsQuery {
 pub(super) async fn list_commands(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    query: Result<Query<CommandsQuery>, axum::extract::rejection::QueryRejection>,
+    ApiQuery(query): ApiQuery<CommandsQuery>,
 ) -> ApiResult<Response> {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(rejection) => return Ok(error_response(rejection.status(), &rejection.body_text())),
-    };
     let limit = match query.limit.as_deref() {
         None => DEFAULT_LIMIT,
         Some(raw) => match raw.parse::<usize>() {
@@ -46,15 +43,9 @@ pub(super) async fn list_commands(
             }
         },
     };
-    let all = match query.all.as_deref() {
-        None | Some("false" | "0") => false,
-        Some("true" | "1" | "") => true,
-        Some(other) => {
-            return Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                &format!("all must be true or false, not {other:?}"),
-            ));
-        }
+    let all = match super::query_flag("all", query.all.as_deref()) {
+        Ok(all) => all,
+        Err(message) => return Ok(error_response(StatusCode::BAD_REQUEST, &message)),
     };
     let hub = Arc::clone(&app.hub);
     let list = blocking(move || hub.commands(&id, CommandFilter { all, limit })).await?;

@@ -2,6 +2,8 @@
 //! `GET /api/sessions/{id}/transcript` (a window of an agent session's
 //! conversation, where a transcript hit opens).
 
+use super::ApiQuery;
+use super::query_flag as flag;
 use super::{ApiResult, AppState, blocking, error_response};
 use crate::agent::SessionKind;
 use crate::search::{
@@ -9,7 +11,7 @@ use crate::search::{
     SearchRequest, Source,
 };
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -27,14 +29,6 @@ pub(super) struct SearchQuery {
     limit: Option<String>,
     per_session: Option<String>,
     offset: Option<String>,
-}
-
-fn flag(name: &str, raw: Option<&str>) -> Result<bool, String> {
-    match raw {
-        None | Some("false" | "0") => Ok(false),
-        Some("true" | "1" | "") => Ok(true),
-        Some(other) => Err(format!("{name} must be true or false, not {other:?}")),
-    }
 }
 
 fn number(name: &str, raw: Option<&str>, default: usize, max: usize) -> Result<usize, String> {
@@ -105,12 +99,8 @@ fn request_of(query: &SearchQuery) -> Result<SearchRequest, String> {
 /// (filters narrow it); see `crate::search` for the bounds.
 pub(super) async fn search(
     State(app): State<AppState>,
-    query: Result<Query<SearchQuery>, axum::extract::rejection::QueryRejection>,
+    ApiQuery(query): ApiQuery<SearchQuery>,
 ) -> ApiResult<Response> {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(rejection) => return Ok(error_response(rejection.status(), &rejection.body_text())),
-    };
     let request = match request_of(&query) {
         Ok(request) => request,
         Err(message) => return Ok(error_response(StatusCode::BAD_REQUEST, &message)),
@@ -136,12 +126,8 @@ pub(super) struct TranscriptQuery {
 pub(super) async fn transcript(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    query: Result<Query<TranscriptQuery>, axum::extract::rejection::QueryRejection>,
+    ApiQuery(query): ApiQuery<TranscriptQuery>,
 ) -> ApiResult<Response> {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(rejection) => return Ok(error_response(rejection.status(), &rejection.body_text())),
-    };
     let around = match query.around.as_deref() {
         None => None,
         Some(raw) => match raw.parse::<u64>() {

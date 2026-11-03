@@ -2,11 +2,12 @@
 //! picker's `GET /api/code-workspaces` listing of `*.code-workspace` files
 //! on the hub's machine.
 
+use super::ApiQuery;
 use super::{ApiJson, ApiResult, AppState, blocking, error_response};
 use crate::state::expand_home;
 use crate::vscode::{self, DEFAULT_SEARCH_DEPTH, ResolveEnv};
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -54,7 +55,7 @@ pub(super) struct FindQuery {
 /// workspace already named like it (an import would need `update`).
 pub(super) async fn find_code_workspaces(
     State(app): State<AppState>,
-    Query(query): Query<FindQuery>,
+    ApiQuery(query): ApiQuery<FindQuery>,
 ) -> Response {
     let env = ResolveEnv::current();
     let root = match query

@@ -3,27 +3,18 @@
 //! `POST /api/sessions/{id}/companion`, and the new-session form's
 //! `GET /api/worktrees/plan`.
 
+use super::ApiQuery;
+use super::query_flag;
 use super::{ApiJson, ApiResult, AppState, blocking, error_response};
 use crate::hub::RemoveOptions;
 use crate::state::expand_home;
 use axum::Json;
-use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-
-/// A boolean query flag: absent or `false`/`0` is false; `true`/`1`/empty
-/// is true; anything else is an error naming `name`.
-fn flag(raw: Option<&str>, name: &str) -> Result<bool, String> {
-    match raw {
-        None | Some("false" | "0") => Ok(false),
-        Some("true" | "1" | "") => Ok(true),
-        Some(other) => Err(format!("{name} must be true or false, not {other:?}")),
-    }
-}
 
 #[derive(Deserialize)]
 pub(super) struct RemoveQuery {
@@ -37,15 +28,11 @@ pub(super) struct RemoveQuery {
 pub(super) async fn remove_session(
     State(app): State<AppState>,
     Path(id): Path<String>,
-    query: Result<Query<RemoveQuery>, QueryRejection>,
+    ApiQuery(query): ApiQuery<RemoveQuery>,
 ) -> ApiResult<Response> {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(rejection) => return Ok(error_response(rejection.status(), &rejection.body_text())),
-    };
     let options = match (
-        flag(query.remove_worktree.as_deref(), "remove_worktree"),
-        flag(query.force.as_deref(), "force"),
+        query_flag("remove_worktree", query.remove_worktree.as_deref()),
+        query_flag("force", query.force.as_deref()),
     ) {
         (Ok(remove_worktree), Ok(force)) => RemoveOptions {
             remove_worktree,
@@ -162,12 +149,8 @@ pub(super) struct PlanQuery {
 /// once `folder` is given (the form checks as you type).
 pub(super) async fn plan(
     State(app): State<AppState>,
-    query: Result<Query<PlanQuery>, QueryRejection>,
+    ApiQuery(query): ApiQuery<PlanQuery>,
 ) -> ApiResult<Response> {
-    let Query(query) = match query {
-        Ok(query) => query,
-        Err(rejection) => return Ok(error_response(rejection.status(), &rejection.body_text())),
-    };
     let Some(folder) = query.folder.filter(|f| !f.trim().is_empty()) else {
         return Ok(error_response(
             StatusCode::BAD_REQUEST,

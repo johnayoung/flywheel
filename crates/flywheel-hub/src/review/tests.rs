@@ -498,11 +498,34 @@ fn fake_gh(dir: &Path, auth: u8) -> String {
 #[test]
 fn a_pull_request_needs_gh_signed_in_and_the_branch_pushed() {
     let f = Fixture::new();
-    f.remote();
     let wt = &f.wt.path;
     let t = f.target();
     commit_file(wt, "a.txt", "a\n", "feat: one thing");
     let request = PrRequest::default();
+
+    // No remote at all: said so (never "not pushed to  yet").
+    let plan = plan_pr(&tools(), &t, &request).unwrap();
+    assert!(
+        plan.refusal.as_deref().unwrap().contains("no remotes"),
+        "{:?}",
+        plan.refusal
+    );
+    f.remote();
+    let t = f.target();
+    // An option-looking base is no branch name.
+    let dashed = PrRequest {
+        base: Some("--help".into()),
+        ..PrRequest::default()
+    };
+    let plan = plan_pr(&tools(), &t, &dashed).unwrap();
+    assert!(
+        plan.refusal
+            .as_deref()
+            .unwrap_or_default()
+            .contains("not a branch name"),
+        "{:?}",
+        plan.refusal
+    );
 
     // Not pushed yet.
     let plan = plan_pr(&tools(), &t, &request).unwrap();
@@ -698,6 +721,32 @@ fn merge_fast_forwards_the_base_in_the_main_checkout() {
     // Nothing lost by removing it now.
     let check = git::removal_check(&f.wt).unwrap();
     assert_eq!(check.refusal(), None);
+}
+
+#[test]
+fn a_rebase_says_which_commits_the_base_already_had() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    // The branch's change is in the base already, inside a larger commit
+    // (not the same patch): the replayed commit is empty, and git drops it.
+    commit_file(wt, "same.txt", "x\n", "edit 1");
+    write(&f.repo, "other.txt", "y\n");
+    run_git(&f.repo, &["add", "--", "other.txt"]);
+    commit_file(&f.repo, "same.txt", "x\n", "edit 1 and more");
+    let plan = plan_rebase(&tools(), &t).unwrap();
+    assert_eq!(plan.refusal, None);
+    assert!(plan.summary.contains("1 commit"), "{}", plan.summary);
+    let done = rebase(&tools(), &t, &plan.fingerprint).unwrap();
+    assert!(done.ok, "{done:?}");
+    assert!(
+        done.summary
+            .contains("1 commit was already in main and was dropped")
+            && done.summary.contains("now equals main"),
+        "{}",
+        done.summary
+    );
+    assert!(!done.summary.contains("Replayed"), "{}", done.summary);
 }
 
 #[test]

@@ -514,6 +514,85 @@ async fn a_hub_drives_another_through_its_proxy() {
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("after-25-rot"), "{out}");
 
+    // Search, launch templates, and usage reach B through A (the web's
+    // fan-out and launcher, the CLI's --machine) and answer for B's
+    // sessions only; a peer may call them on B directly.
+    let (_, listed) = b.get("/api/sessions").await;
+    let workspace = listed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == session.as_str())
+        .unwrap()["workspace_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (status, found) = a.get("/m/b/api/search?q=after-25-rot").await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    let groups = found["groups"].as_array().unwrap();
+    assert!(
+        groups.iter().any(|g| g["session_id"] == session.as_str()
+            && g["hits"].as_array().is_some_and(|h| !h.is_empty())),
+        "{found}"
+    );
+    let (_, here) = a.get("/api/search?q=after-25-rot").await;
+    assert_eq!(here["hits"], 0, "A's own search holds none of B's: {here}");
+    let (code, out, err) = run_cli(&[
+        "search",
+        "after-25-rot",
+        "--machine",
+        "b",
+        "--state-dir",
+        &state_a,
+    ])
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("bsh") && out.contains("after-25-rot"), "{out}");
+    let (status, saved) = a
+        .post(
+            &format!("/m/b/api/workspaces/{workspace}/templates"),
+            json!({ "name": "via-a", "kind": "claude", "model": "sonnet" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let (status, templates) = a
+        .get(&format!("/m/b/api/templates?workspace_id={workspace}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{templates}");
+    assert!(templates.to_string().contains("via-a"), "{templates}");
+    let (_, local_templates) = a.get("/api/templates").await;
+    assert!(!local_templates.to_string().contains("via-a"));
+    let (code, out, err) =
+        run_cli(&["template", "ls", "--machine", "b", "--state-dir", &state_a]).await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("via-a"), "{out}");
+    let (status, usage) = a.get("/m/b/api/usage").await;
+    assert_eq!(status, StatusCode::OK, "{usage}");
+    assert!(usage["workspaces"].is_array(), "{usage}");
+    for path in [
+        "/api/search?q=x".to_owned(),
+        format!("/api/sessions/{session}/transcript"),
+        "/api/templates".to_owned(),
+        "/api/usage".to_owned(),
+    ] {
+        let (status, body) = b
+            .call(reqwest::Method::GET, &path, Some(&credential), None)
+            .await;
+        assert!(
+            status == StatusCode::OK || status == StatusCode::BAD_REQUEST,
+            "{path}: {status} {body}"
+        );
+    }
+    let (status, removed) = b
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/workspaces/{workspace}/templates/via-a"),
+            Some(&credential),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{removed}");
+
     // Revoking the peer on B cuts A off: the open sockets close (as a
     // machine refusal, never a sign-out of A), and calls are refused.
     let (status, _) = b

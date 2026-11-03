@@ -6,12 +6,18 @@
 //                 select the match (xterm's search addon);
 //   transcript -> the transcript viewer at that message;
 //   commands   -> the Commands drawer at that block.
+// With other machines registered (machines.js) one search asks this hub
+// and every reachable machine at once, each through the proxy
+// (/m/<machine>/api/search) with its own time limit; results come back
+// under a head per machine, and a machine that is offline, refused, or
+// too slow says so there (the answer is then partial). A hit on a
+// machine opens on that machine.
 // app.js creates it with its helpers; protocol: GET /api/search,
 // GET /api/sessions/{id}/transcript (crates/flywheel-hub/src/search.rs).
 "use strict";
 
 window.FwHubSearch = function (ctx) {
-  const { $, el, icon, api, state, sessionById, workspaceById, age, toast } = ctx;
+  const { $, el, icon, rawApi, machines, state, sessionById, workspaceById, age, toast } = ctx;
 
   const SOURCES = ["scrollback", "transcript", "commands"];
   const SOURCE_LABEL = { scrollback: "terminal", transcript: "transcript", commands: "command" };
@@ -23,6 +29,10 @@ window.FwHubSearch = function (ctx) {
   // How far from the expected line a terminal hit is looked for, when
   // output arrived since the search (logical lines).
   const DRIFT = 400;
+  // How long a machine's answer is waited for: its own search answers
+  // within 1.5 s, the rest is the link. Past it the machine is reported
+  // as not searched (this hub's own answer is always waited for).
+  const MACHINE_TIMEOUT_MS = 6000;
 
   const ui = {
     open: false,
@@ -37,7 +47,7 @@ window.FwHubSearch = function (ctx) {
     loading: false,
     error: "",
     answer: null,
-    // session id -> {group, window, loading}: a session paged past the
+    // groupKey -> {group, window, loading}: a session paged past the
     // first answer (`window`: hits per source fetched so far).
     expanded: {},
     selected: 0,
@@ -105,9 +115,10 @@ window.FwHubSearch = function (ctx) {
 
   function renderFilters() {
     const wsPick = $("#search-ws");
+    const where = (item) => (machines.any() ? ` · ${item.machine || machines.host() || "this hub"}` : "");
     wsPick.replaceChildren(
       el("option", { value: "", textContent: "all workspaces" }),
-      ...state.workspaces.map((w) => el("option", { value: w.id, textContent: w.name, selected: w.id === ui.ws })),
+      ...state.workspaces.map((w) => el("option", { value: w.id, textContent: `${w.name}${where(w)}`, selected: w.id === ui.ws })),
     );
     if (ui.ws && !workspaceById(ui.ws)) ui.ws = "";
     const pool = state.sessions.filter((s) => !ui.ws || s.workspace_id === ui.ws);
@@ -116,7 +127,8 @@ window.FwHubSearch = function (ctx) {
       el("option", { value: "", textContent: "all sessions" }),
       ...pool.map((s) => {
         const w = workspaceById(s.workspace_id);
-        return el("option", { value: s.id, textContent: ui.ws || !w ? s.name : `${w.name} / ${s.name}`, selected: s.id === ui.session });
+        const label = ui.ws || !w ? s.name : `${w.name} / ${s.name}`;
+        return el("option", { value: s.id, textContent: ui.ws ? label : `${label}${where(s)}`, selected: s.id === ui.session });
       }),
     );
     $("#search-kind").value = ui.kind;
@@ -183,22 +195,90 @@ window.FwHubSearch = function (ctx) {
     }
     ui.loading = true;
     renderStatus();
-    try {
-      const answer = await api("GET", `/api/search?${params()}`);
-      if (seq !== ui.seq) return;
-      ui.answer = answer;
+    const p = params();
+    const parts = await Promise.all(targets().map((machine) => ask(machine, p)));
+    if (seq !== ui.seq) return;
+    ui.loading = false;
+    // This hub's own failure (a bad pattern, a bad filter) is the
+    // search's; so is the only target's. A machine's stays under its head.
+    const failed = parts.find((part) => part.error && (!part.machine || parts.length === 1));
+    if (failed) {
+      ui.answer = null;
+      ui.error = failed.machine ? `${failed.machine}: ${failed.error}` : failed.error;
+    } else {
+      ui.answer = merge(parts);
       ui.answeredFor = asked;
       ui.error = "";
       ui.selected = 0;
-    } catch (error) {
-      if (seq !== ui.seq) return;
-      ui.answer = null;
-      ui.error = error.message;
-    } finally {
-      if (seq === ui.seq) ui.loading = false;
     }
     render();
   }
+
+  // Where a search goes: the hub of the picked session or workspace,
+  // else this hub (null) and every machine.
+  function targets() {
+    if (ui.session) return [machines.machineOf(ui.session)];
+    if (ui.ws) return [machines.machineOf(ui.ws)];
+    return [null, ...machines.names()];
+  }
+
+  const searchPath = (machine, p) => `${machines.prefix(machine)}/api/search?${p}`;
+
+  // GET `path` on `machine` (null: this hub), a machine's bounded by
+  // MACHINE_TIMEOUT_MS. {answer} or {missed: why it was not asked or
+  // did not answer} or {error}.
+  async function fetchFrom(machine, path) {
+    if (machine && !machines.reachable(machine)) return { missed: machines.linkOf(machine) || "offline" };
+    const abort = new AbortController();
+    const timer = machine ? setTimeout(() => abort.abort(), MACHINE_TIMEOUT_MS) : 0;
+    try {
+      return { answer: await rawApi("GET", path, undefined, abort.signal) };
+    } catch (error) {
+      if (abort.signal.aborted) return { missed: "timeout" };
+      if (error.machineState) return { missed: error.machineState, error: error.message };
+      const older = machine && error.status === 404 && !ui.session && !ui.ws;
+      return { error: older ? "no search there (an older flywheel hub?)" : error.message };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // A machine's groups, each tagged with it; one naming a session it
+  // may not speak for (this hub's, another machine's) is dropped.
+  function claimed(machine, answer) {
+    const groups = (answer.groups || [])
+      .filter((g) => !machine || machines.claims(machine, g.session_id))
+      .map((g) => ({ ...g, machine }));
+    return { ...answer, groups, hits: groups.reduce((n, g) => n + g.hits.length, 0) };
+  }
+
+  async function ask(machine, p) {
+    const got = await fetchFrom(machine, searchPath(machine, p));
+    return got.answer ? { machine, answer: claimed(machine, got.answer) } : { machine, ...got };
+  }
+
+  // Every hub's answer as one: groups in machine order (this hub first),
+  // `parts` for the machine heads; partial when a machine was not
+  // searched.
+  function merge(parts) {
+    const answered = parts.filter((part) => part.answer).map((part) => part.answer);
+    const sum = (f) => answered.reduce((n, a) => n + f(a), 0);
+    const missed = parts.filter((part) => !part.answer);
+    return {
+      groups: answered.flatMap((a) => a.groups),
+      hits: sum((a) => a.hits),
+      truncated: answered.some((a) => a.truncated),
+      partial: answered.some((a) => a.partial),
+      elapsed_ms: Math.max(0, ...answered.map((a) => a.elapsed_ms || 0)),
+      searched: { sessions: sum((a) => (a.searched ? a.searched.sessions : 0)) },
+      notes: parts.flatMap((part) =>
+        (part.answer && part.answer.notes ? part.answer.notes : []).map((n) => (part.machine ? `${part.machine}: ${n}` : n))),
+      parts,
+      unsearched: missed.map((part) => part.machine),
+    };
+  }
+
+  const groupKey = (g) => `${g.machine || ""}/${g.session_id}`;
 
   const bySource = (hits) => SOURCES.flatMap((source) => hits.filter((h) => h.source === source));
 
@@ -209,21 +289,25 @@ window.FwHubSearch = function (ctx) {
   // over from the newest.
   async function more(shown) {
     const id = shown.session_id;
-    let entry = ui.expanded[id];
+    const key = groupKey(shown);
+    let entry = ui.expanded[key];
     if (!entry) {
       const counts = shown.counts;
       const whole = SOURCES.reduce((n, source) => n + Math.min(counts[source] || 0, PER_SESSION), 0);
       entry = whole === shown.hits.length && shown.hits.length
         ? { group: shown, window: PER_SESSION }
         : { group: { ...shown, hits: [] }, window: 0 };
-      ui.expanded[id] = entry;
+      ui.expanded[key] = entry;
     }
     if (entry.loading) return;
     entry.loading = true;
     render();
     const seq = ui.seq;
     try {
-      const answer = await api("GET", `/api/search?${params({ session: id, per_session: MORE_PAGE, offset: entry.window, limit: MORE_PAGE * SOURCES.length })}`);
+      const p = params({ session: id, per_session: MORE_PAGE, offset: entry.window, limit: MORE_PAGE * SOURCES.length });
+      const got = await fetchFrom(shown.machine, searchPath(shown.machine, p));
+      if (!got.answer) throw new Error(`${shown.machine}: ${got.error || (got.missed === "timeout" ? "no answer in time" : got.missed)}`);
+      const answer = claimed(shown.machine, got.answer);
       if (seq !== ui.seq) return;
       const page = answer.groups.find((g) => g.session_id === id);
       entry.window += MORE_PAGE;
@@ -243,7 +327,7 @@ window.FwHubSearch = function (ctx) {
     let text = "";
     if (ui.loading) text = "Searching…";
     else if (ui.error) text = ui.error;
-    else if (!input.value.trim()) text = `Every terminal's scrollback, agent transcripts, and suggested commands. ${ui.regex ? "Regex (Rust syntax)." : "Literal text."} ${ui.caseSensitive ? "Case-sensitive." : "Any case."}`;
+    else if (!input.value.trim()) text = `Every terminal's scrollback, agent transcripts, and suggested commands${machines.any() ? ", on this hub and every reachable machine" : ""}. ${ui.regex ? "Regex (Rust syntax)." : "Literal text."} ${ui.caseSensitive ? "Case-sensitive." : "Any case."}`;
     else if (!ui.sources.size) text = "Pick at least one source.";
     else if (a) {
       const sessions = a.groups.filter((g) => g.hits.length).length;
@@ -257,6 +341,9 @@ window.FwHubSearch = function (ctx) {
           : " · limit reached (narrow the search)";
       }
       if (a.partial) text += " · time ran out: not every session was searched";
+      const errored = a.parts.filter((part) => part.error && !part.missed).map((part) => part.machine);
+      if (a.unsearched.length) text += ` · not searched: ${a.unsearched.map((m) => `${m} (${partState(a.parts.find((part) => part.machine === m))})`).join(", ")}`;
+      else if (errored.length) text += ` · failed on ${errored.join(", ")}`;
       if (a.notes && a.notes.length) text += ` · ${a.notes.join("; ")}`;
     }
     status.textContent = text;
@@ -272,6 +359,41 @@ window.FwHubSearch = function (ctx) {
       return `#${hit.index} ${who}`;
     }
     return `#${hit.seq} ${hit.lang || (hit.shell ? "shell" : "text")}${hit.line ? ` · line ${hit.line + 1}` : ""}`;
+  }
+
+  // Why a machine has no answer, in a word or two.
+  function partState(part) {
+    if (!part) return "";
+    if (part.missed === "timeout") return `no answer in ${MACHINE_TIMEOUT_MS / 1000} s`;
+    if (part.missed) return part.missed;
+    return "error";
+  }
+
+  // A machine's head over its groups: its link lamp, name, and what its
+  // search did (hits, or why it was not searched).
+  function machineHead(part) {
+    const a = part.answer;
+    let link = "online";
+    let text;
+    if (a) {
+      const sessions = a.groups.filter((g) => g.hits.length).length;
+      text = a.hits ? `${a.hits} hit${a.hits === 1 ? "" : "s"} in ${sessions} session${sessions === 1 ? "" : "s"} · ${a.elapsed_ms} ms` : "no match";
+      if (a.truncated) text += " · limit reached";
+      if (a.partial) text += " · time ran out";
+    } else if (part.missed) {
+      link = part.missed === "refused" ? "refused" : part.missed === "connecting" ? "connecting" : "offline";
+      text = `${partState(part)}: not searched`;
+    } else {
+      link = "refused";
+      text = part.error;
+    }
+    return el(
+      "div",
+      { className: `search-machine link-${link}`, title: part.error || "" },
+      el("span", { className: `machine-dot link-${link}`, "aria-hidden": "true" }),
+      el("span", { className: "search-machine-name", textContent: part.machine || machines.host() || "this hub" }),
+      el("span", { className: "search-machine-state", textContent: text }),
+    );
   }
 
   // The flat list of hits shown, in order (keyboard navigation).
@@ -321,8 +443,16 @@ window.FwHubSearch = function (ctx) {
       return;
     }
     const nodes = [];
+    const heads = machines.any() && ui.answer.parts.length > 0;
+    let lastMachine;
+    const headFor = (machine) => {
+      if (!heads || machine === lastMachine) return;
+      lastMachine = machine;
+      nodes.push(machineHead(ui.answer.parts.find((part) => part.machine === machine)));
+    };
     for (const shown of ui.answer.groups) {
-      const entry = ui.expanded[shown.session_id];
+      headFor(shown.machine);
+      const entry = ui.expanded[groupKey(shown)];
       const group = entry ? entry.group : shown;
       const session = sessionById(group.session_id);
       const counts = group.counts;
@@ -331,6 +461,7 @@ window.FwHubSearch = function (ctx) {
         "header",
         { className: "search-group-head" },
         icon(ctx.glyphFor(group.kind)),
+        group.machine ? el("span", { className: "machine-badge", textContent: group.machine, title: `on ${group.machine}` }) : null,
         el("span", { className: "search-ws", textContent: group.workspace }),
         el("b", { className: "search-session", textContent: group.session }),
         el("span", { className: `search-state st-${group.state}`, textContent: group.terminal ? group.state : `${group.state} · no terminal` }),
@@ -366,7 +497,14 @@ window.FwHubSearch = function (ctx) {
         moreButton ? el("div", { className: "search-group-more" }, moreButton) : null,
       ));
     }
-    if (!nodes.length) nodes.push(el("p", { className: "search-none", textContent: "Nothing found." }));
+    // Machines with nothing to show still say what their search did.
+    if (heads) {
+      const shownMachines = new Set(ui.answer.groups.map((g) => g.machine));
+      for (const part of ui.answer.parts) {
+        if (!shownMachines.has(part.machine)) nodes.push(machineHead(part));
+      }
+    }
+    if (!ui.answer.groups.length) nodes.push(el("p", { className: "search-none", textContent: "Nothing found." }));
     results.replaceChildren(...nodes);
     if (ui.selected >= flat.length) ui.selected = Math.max(0, flat.length - 1);
     input.setAttribute("aria-activedescendant", flat.length ? `search-hit-${ui.selected}` : "");
@@ -389,6 +527,10 @@ window.FwHubSearch = function (ctx) {
     const entry = flat[i];
     if (!entry) return;
     const { group, hit } = entry;
+    if (group.machine && !machines.reachable(group.machine)) {
+      toast(`${group.machine} is ${machines.linkOf(group.machine) || "no longer registered"}: ${group.session} cannot be opened now.`, { tone: "bad" });
+      return;
+    }
     if (!sessionById(group.session_id)) {
       toast(`${group.session} was removed.`, { tone: "bad" });
       return;
@@ -483,7 +625,7 @@ window.FwHubSearch = function (ctx) {
 
   async function jumpToLine(group, hit) {
     if (!group.terminal) {
-      toast(`${group.session} has no terminal on this hub any more.`, { tone: "bad" });
+      toast(`${group.session} has no terminal on ${group.machine || "this hub"} any more.`, { tone: "bad" });
       return;
     }
     await ctx.openSession(group.session_id);
@@ -547,7 +689,8 @@ window.FwHubSearch = function (ctx) {
   async function loadPage(around, before, after) {
     const p = new URLSearchParams({ before: String(before), after: String(after) });
     if (around !== null) p.set("around", String(around));
-    const page = await api("GET", `/api/sessions/${viewer.session.session_id}/transcript?${p}`);
+    // On the session's own hub (a machine's through the proxy).
+    const page = await rawApi("GET", `${machines.prefix(viewer.session.machine)}/api/sessions/${viewer.session.session_id}/transcript?${p}`);
     viewer.first = page.first;
     viewer.next = page.next;
     for (const m of page.messages) viewer.messages.set(m.index, m);
@@ -562,7 +705,7 @@ window.FwHubSearch = function (ctx) {
     viewer.literal = query.regex ? "" : query.text;
     const dialog = $("#dlg-transcript");
     $("#tx-title").textContent = group.session;
-    $("#tx-meta").textContent = `${group.workspace} · ${group.kind} · ${group.state}${group.conversation ? ` · conversation ${group.conversation}` : ""}`;
+    $("#tx-meta").textContent = `${group.machine ? `${group.machine} · ` : ""}${group.workspace} · ${group.kind} · ${group.state}${group.conversation ? ` · conversation ${group.conversation}` : ""}`;
     $("#tx-body").replaceChildren(el("p", { className: "tx-note", textContent: "Reading the transcript…" }));
     if (!dialog.open) dialog.showModal();
     try {

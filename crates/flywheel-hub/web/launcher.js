@@ -195,18 +195,23 @@ window.FwHubLauncher = function (ctx) {
     const any = hub && hub.total && hub.total.total_tokens > 0;
     strip.hidden = !any;
     if (!any) return;
+    // With machines, the strip is this hub's spend only (each machine's
+    // workspaces carry their own chips): it says so.
+    const here = ctx.localLabel ? ctx.localLabel() : "";
     strip.replaceChildren(
+      here ? el("span", { className: "spend-k spend-here", textContent: here }) : "",
       el("span", { className: "spend-k", textContent: "today" }),
       el("b", { textContent: costText(hub.today) }),
       el("span", { className: "spend-k", textContent: "week" }),
       el("b", { textContent: costText(hub.week) }),
     );
     strip.title = [
+      here ? `${here} only: other machines' spend is on their workspaces` : "",
       costTitle(`today (${hub.day})`, hub.today),
       costTitle(`this week (since ${hub.week_start})`, hub.week),
       costTitle("all time", hub.total),
       `prices: ${hub.price_source}`,
-    ].join("\n");
+    ].filter(Boolean).join("\n");
   }
 
   // A workspace's today cost for its sidebar head (null when nothing).
@@ -512,6 +517,8 @@ window.FwHubLauncher = function (ctx) {
   // With the sidebar: its From template button.
   function render() {
     $("#from-template").hidden = !anyTemplates();
+    // Machines came or went: the strip's label follows.
+    if (rollups) renderSpend();
   }
 
   // An events-socket usage push: the session's usage changed.

@@ -247,11 +247,19 @@ window.FwHubMachines = function (ctx) {
   }
 
   // Per-workspace token usage on every reachable machine (GET
-  // /api/usage there): its workspaces' rollups.
+  // /api/usage there): its workspaces' rollups, only those of its own
+  // workspaces, each machine given USAGE_MS (a slow one never holds the
+  // others' chips or this hub's strip back).
+  const USAGE_MS = 5000;
   async function usage() {
     const live = [...ui.machines.values()].filter((m) => m.link === "online");
-    const lists = await Promise.all(live.map((m) =>
-      ctx.rawApi("GET", `${prefix(m.name)}/api/usage`).then((u) => u.workspaces || [], () => [])));
+    const lists = await Promise.all(live.map((m) => {
+      const abort = new AbortController();
+      const timer = setTimeout(() => abort.abort(), USAGE_MS);
+      return ctx.rawApi("GET", `${prefix(m.name)}/api/usage`, undefined, abort.signal)
+        .then((u) => (u.workspaces || []).filter((w) => w && ui.owner.get(w.workspace_id) === m.name), () => [])
+        .finally(() => clearTimeout(timer));
+    }));
     return lists.flat();
   }
 
@@ -460,6 +468,12 @@ window.FwHubMachines = function (ctx) {
   }, 1000);
 
   const names = () => [...ui.machines.keys()];
+  // Whether machine `name` may speak for id `id` (its answers naming one
+  // of this hub's ids, or another machine's, are dropped).
+  const claims = (name, id) => {
+    const m = ui.machines.get(name);
+    return !!m && typeof id === "string" && mine(m, id);
+  };
   const any = () => ui.machines.size > 0;
   const linkOf = (name) => (ui.machines.get(name) || {}).link || null;
   // Unknown machines (removed) count as unreachable.
@@ -656,6 +670,7 @@ window.FwHubMachines = function (ctx) {
     any,
     linkOf,
     reachable,
+    claims,
     openDialog,
     setContext: (fn) => {
       ui.context = fn;

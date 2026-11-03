@@ -259,8 +259,9 @@
   // --- API -------------------------------------------------------------
 
   // `path` as given (a machine's calls already under /m/<machine>).
-  async function rawApi(method, path, body) {
-    const init = { method, credentials: "same-origin", headers: {} };
+  // `signal` aborts it (a search fanned out to machines gives up on one).
+  async function rawApi(method, path, body, signal) {
+    const init = { method, credentials: "same-origin", headers: {}, signal };
     if (body !== undefined) {
       init.headers["Content-Type"] = "application/json";
       init.body = JSON.stringify(body);
@@ -280,6 +281,7 @@
     }
     if (!response.ok) {
       const error = new Error((data && data.error) || response.statusText);
+      error.status = response.status;
       if (data && data.machine_state) error.machineState = data.machine_state;
       throw error;
     }
@@ -362,6 +364,8 @@
   const launcher = window.FwHubLauncher({
     $, el, api, state, worktrees,
     remoteUsage: () => machines.usage(),
+    // The spend strip counts this hub only: named so once machines show.
+    localLabel: () => (machines.any() ? machines.host() || "this hub" : ""),
     toast: (...args) => commands.toast(...args),
     sessionById: (id) => sessionById(id),
     workspaceById: (id) => workspaceById(id),
@@ -413,7 +417,7 @@
   const explain = window.FwHubExplain({ $, el, api });
   // Search across sessions (search.js): scrollback, transcripts, commands.
   const search = window.FwHubSearch({
-    $, el, icon, api, state, sessionById, workspaceById, age, glyphFor,
+    $, el, icon, api, rawApi, machines, state, sessionById, workspaceById, age, glyphFor,
     toast: commands.toast,
     openSession: (id) => openSession(id),
     openCommandsAt: (id, seq, all) => {

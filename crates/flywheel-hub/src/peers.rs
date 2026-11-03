@@ -490,6 +490,14 @@ mod tests {
             "/api/whoami",
             "/api/peer",
             "/api/flywheel/panel",
+            // Search, transcripts, templates, and usage: a machine's
+            // search overlay, launcher, and cost chips through the proxy.
+            "/api/search",
+            "/api/sessions/abc/transcript",
+            "/api/templates",
+            "/api/workspaces/abc/templates",
+            "/api/workspaces/abc/templates/review",
+            "/api/usage",
         ] {
             assert!(!peer_forbidden(allowed), "{allowed}");
         }

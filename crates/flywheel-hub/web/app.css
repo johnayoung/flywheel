@@ -3261,6 +3261,7 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .spend[hidden] { display: none; }
 .spend .spend-k { font-size: 8.5px; letter-spacing: .18em; text-transform: uppercase; color: var(--ink-3); }
 .spend b { color: var(--brass); font-weight: 600; margin-right: .5rem; }
+.spend .spend-here { color: var(--ink-2); max-width: 9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: .2rem; }
 #from-template { grid-column: 1 / -1; }
 #from-template[hidden] { display: none; }
 /* A button (a tap shows the breakdown on touch screens). */
@@ -3381,6 +3382,24 @@ button.meter.usage[hidden] { display: none; }
 .search-snippet mark, .tx-text mark { background: var(--signal-soft); color: var(--ink); box-shadow: 0 0 0 1px var(--signal); border-radius: 1px; }
 .search-none { margin: 0; padding: 1.2rem 1rem; color: var(--ink-3); }
 .search-keys { padding: .4rem 1rem; border-top: 1px solid var(--rule); }
+/* With machines: a head per machine over its groups. */
+.search-machine {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  padding: .55rem 1rem .35rem;
+  border-top: 1px solid var(--rule-2);
+  font-size: 10px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.search-results > .search-machine:first-child { border-top: 0; }
+.search-machine-name { font: 700 .9rem/1 var(--display); letter-spacing: .08em; color: var(--ink-2); }
+.search-machine-state { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; letter-spacing: .06em; }
+.search-machine.link-offline .search-machine-state, .search-machine.link-connecting .search-machine-state { color: var(--brass); }
+.search-machine.link-refused .search-machine-state { color: var(--alert); }
+.search-group-head .machine-badge { font-size: 8px; }
 
 .tx-body { display: flex; flex-direction: column; gap: .7rem; }
 .tx-msg { border-left: 2px solid var(--rule-2); padding: .1rem 0 .1rem .8rem; }

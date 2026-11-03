@@ -504,7 +504,9 @@ function renderMain() {
   const onMachine = workspace && workspace.machine;
   $("#crumb-machine").hidden = !onMachine;
   $("#crumb-machine").replaceChildren(...(onMachine ? [machineBadge(workspace.machine)] : []));
-  $("#crumb-session").textContent = session ? session.name : emptyTab ? "Empty pane" : "No session";
+  // A hub with nothing yet: the start screen, not a missing session.
+  const nothingYet = !session && !emptyTab && !state.workspaces.length && !machines.any();
+  $("#crumb-session").textContent = session ? session.name : emptyTab ? "Empty pane" : nothingYet ? "Get started" : "No session";
   // Without a session the header's session controls mean nothing.
   $("#cmd-toggle").hidden = !session;
   $("#link").hidden = !session;

@@ -146,19 +146,28 @@ pub(crate) fn doctor(args: &DoctorArgs, out: &mut dyn Write, err: &mut dyn Write
 pub fn render(checks: &[Check]) -> String {
     let width = checks.iter().map(|c| c.id.len()).max().unwrap_or(0);
     let mut text = String::new();
+    let pad = " ".repeat(width + 10);
+    // Every line of a multi-line text (a TOML error's caret diagram)
+    // indented under its row.
+    let block = |text: &mut String, first: &str, body: &str| {
+        let mut lines = body.lines();
+        text.push_str(first);
+        text.push_str(lines.next().unwrap_or_default());
+        text.push('\n');
+        for line in lines {
+            text.push_str(&pad);
+            text.push_str(line);
+            text.push('\n');
+        }
+    };
     for check in checks {
-        text.push_str(&format!(
-            "  {:<4}  {:<width$}  {}\n",
-            check.level.label(),
-            check.id,
-            check.summary
-        ));
-        let pad = " ".repeat(width + 10);
+        let row = format!("  {:<4}  {:<width$}  ", check.level.label(), check.id);
+        block(&mut text, &row, &check.summary);
         for detail in &check.details {
-            text.push_str(&format!("{pad}{detail}\n"));
+            block(&mut text, &pad, detail);
         }
         if let Some(fix) = &check.fix {
-            text.push_str(&format!("{pad}fix: {fix}\n"));
+            block(&mut text, &format!("{pad}fix: "), fix);
         }
     }
     let count = |level| checks.iter().filter(|c| c.level == level).count();
@@ -278,10 +287,45 @@ pub fn classify(candidate: &Path, exe: Option<&Path>) -> Found {
     let help = bounded(&real, &["hub", "--help"]);
     match help {
         Some(out) if out.success() && out.stdout_text().contains("The flywheel hub") => {
-            Found::OtherFlywheel
+            if exe.is_some_and(|exe| installed_together(&real, exe)) {
+                Found::This
+            } else {
+                Found::OtherFlywheel
+            }
         }
         _ => Found::Other,
     }
+}
+
+/// Binaries one build writes side by side: `fw` and `flywheel` are two
+/// bin targets, so never byte-identical, but one `cargo install` (or
+/// `cargo build`) puts both in one directory within moments, at about the
+/// same size. A copy from another build differs in time (and usually
+/// size).
+const SIBLING_NAMES: [&str; 2] = ["fw", "flywheel"];
+/// How far apart one build writes its two binaries, at most.
+const SIBLING_WRITE_WINDOW: Duration = Duration::from_secs(600);
+
+pub fn installed_together(candidate: &Path, exe: &Path) -> bool {
+    let name = |p: &Path| p.file_name().and_then(OsStr::to_str).map(str::to_owned);
+    let (Some(a), Some(b)) = (name(candidate), name(exe)) else {
+        return false;
+    };
+    if a == b || !SIBLING_NAMES.contains(&a.as_str()) || !SIBLING_NAMES.contains(&b.as_str()) {
+        return false;
+    }
+    if candidate.parent() != exe.parent() {
+        return false;
+    }
+    let (Ok(ma), Ok(mb)) = (std::fs::metadata(candidate), std::fs::metadata(exe)) else {
+        return false;
+    };
+    let (Ok(ta), Ok(tb)) = (ma.modified(), mb.modified()) else {
+        return false;
+    };
+    let apart = ta.duration_since(tb).or_else(|_| tb.duration_since(ta));
+    let (big, small) = (ma.len().max(mb.len()), ma.len().min(mb.len()));
+    apart.is_ok_and(|d| d <= SIBLING_WRITE_WINDOW) && big - small <= big / 100
 }
 
 fn same_contents(a: &Path, b: &Path) -> bool {
@@ -369,6 +413,19 @@ fn on_path_check_with(
                 .find(|p| matches!(classify(p), Found::This | Found::OtherFlywheel))
                 .and_then(|p| p.parent())
                 .map_or_else(|| exe_dir.clone(), |d| d.display().to_string());
+            // What usually puts it there, when that is known.
+            let origin = match &kind {
+                Found::Script(interpreter) if interpreter.contains("python") => {
+                    if first.parent().is_some_and(in_python_venv) {
+                        " (a Python venv's entry point: deactivate the venv, or uninstall the \
+                         package that installs it)"
+                    } else {
+                        " (a Python package's entry point: uninstall the package that \
+                         installs it)"
+                    }
+                }
+                _ => "",
+            };
             Check::new(
                 id,
                 Level::Fail,
@@ -380,9 +437,8 @@ fn on_path_check_with(
             )
             .detail(format!("this flywheel: {this}"))
             .fix(format!(
-                "remove or rename {} (a Python venv's entry point: deactivate the venv or \
-                 uninstall the package that installs it), or put {shadowed} before {} on PATH; \
-                 then `hash -r`",
+                "remove or rename {}{origin}, or put {shadowed} before {} on PATH; then \
+                 `hash -r`",
                 first.display(),
                 first
                     .parent()
@@ -394,6 +450,13 @@ fn on_path_check_with(
         check = check.detail(format!("also on PATH (shadowed): {}", later.display()));
     }
     check
+}
+
+/// A `bin` directory of a Python virtual environment (`pyvenv.cfg` beside
+/// it).
+fn in_python_venv(bin: &Path) -> bool {
+    bin.parent()
+        .is_some_and(|root| root.join("pyvenv.cfg").is_file())
 }
 
 // --- the running hub -----------------------------------------------------------------
@@ -411,18 +474,18 @@ pub struct Running {
 }
 
 /// The hub serving `dir`: its runtime file, believed only while its serve
-/// lock is held (tested on the existing file, never created or removed).
+/// lock is held. Observed, never taken: a probe lock (even a shared one)
+/// would make a `fw hub start` racing it think another hub holds the dir.
 fn running_hub(dir: &Path) -> Option<Running> {
     let info = crate::remote::RuntimeInfo::read(dir).ok().flatten()?;
-    let lock = std::fs::File::open(dir.join(crate::remote::LOCK_FILE)).ok()?;
-    match lock.try_lock_shared() {
-        // Nobody holds it: a stale file from a hub that died.
-        Ok(()) => {
-            let _ = lock.unlock();
-            return None;
-        }
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        Err(std::fs::TryLockError::Error(_)) => return None,
+    let held = match hub_holds_lock(info.pid, &dir.join(crate::remote::LOCK_FILE)) {
+        Some(held) => held,
+        // No `/proc` to read: the recorded process being alive.
+        None => process_alive(info.pid),
+    };
+    if !held {
+        // A stale file from a hub that died.
+        return None;
     }
     let description = crate::handoff::describe_within(dir, Duration::from_secs(2)).ok();
     Some(Running {
@@ -433,6 +496,50 @@ fn running_hub(dir: &Path) -> Option<Running> {
         binary: description.and_then(|d| d.binary),
         path: process_path(info.pid),
     })
+}
+
+/// Whether process `pid` holds a `flock` on `path`: one of its open files
+/// is `path` and its `fdinfo` lists a lock (Linux). `None` where `/proc`
+/// cannot tell. (`/proc/locks` will not do: it hides a lock whose taker
+/// has exited, and a handed-off hub holds the lock its predecessor took.)
+fn hub_holds_lock(pid: u32, path: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let target = std::fs::metadata(path).ok()?;
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for fd in fds.flatten() {
+        let Ok(meta) = std::fs::metadata(fd.path()) else {
+            continue;
+        };
+        if meta.dev() != target.dev() || meta.ino() != target.ino() {
+            continue;
+        }
+        let info = std::fs::read_to_string(format!(
+            "/proc/{pid}/fdinfo/{}",
+            fd.file_name().to_string_lossy()
+        ))
+        .ok()?;
+        if fdinfo_has_flock(&info) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Whether an `fdinfo` text lists a `flock` (`lock:\t1: FLOCK ...`).
+pub fn fdinfo_has_flock(info: &str) -> bool {
+    info.lines().any(|line| {
+        line.strip_prefix("lock:")
+            .is_some_and(|rest| rest.split_whitespace().nth(1) == Some("FLOCK"))
+    })
+}
+
+fn process_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only checks that the process exists.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// `PATH` from `/proc/<pid>/environ` (Linux; same user).
@@ -598,20 +705,33 @@ fn hooks_check(claude: Option<&Path>, exe: Option<&Path>) -> Check {
     let Some(claude) = claude else {
         return Check::new(id, Level::Info, "skipped (no claude)");
     };
-    let settings = agent::claude_settings(&report).to_string();
-    match bounded(claude, &["--settings", &settings, "--version"]) {
+    let value = agent::claude_settings(&report);
+    if let Err(problem) = hooks_shape(&value) {
+        return Check::new(
+            id,
+            Level::Fail,
+            format!("the hub's --settings are malformed: {problem}"),
+        )
+        .fix("a flywheel bug: reinstall a released build and report it");
+    }
+    let events = value["hooks"].as_object().map_or(0, serde_json::Map::len);
+    // `--version` makes claude read --settings as JSON and stop; it checks
+    // hook entries only when a session starts, and has no dry run. So this
+    // shows the JSON is taken and well-formed, not that every hook loads.
+    match bounded(claude, &["--settings", &value.to_string(), "--version"]) {
         Some(out) if out.success() => Check::new(
             id,
             Level::Ok,
-            "claude accepts the hub's --settings; hooks run `fw hub report`",
+            format!(
+                "claude takes the hub's --settings JSON ({events} hook events, each running `{} \
+                 hub report`)",
+                exe.display()
+            ),
         )
-        .detail(format!(
-            "{} hook events -> {} hub report",
-            agent::claude_settings(&report)["hooks"]
-                .as_object()
-                .map_or(0, serde_json::Map::len),
-            exe.display()
-        )),
+        .detail(
+            "claude checks hook entries only when a session starts: a Claude session's dot \
+             turning to working on its first prompt confirms them",
+        ),
         Some(out) => Check::new(
             id,
             Level::Fail,
@@ -621,8 +741,52 @@ fn hooks_check(claude: Option<&Path>, exe: Option<&Path>) -> Check {
             ),
         )
         .fix("update Claude Code (`claude update`); status would fall back to screen reading"),
-        None => Check::new(id, Level::Warn, "claude --settings did not answer in time"),
+        None => Check::new(id, Level::Warn, "claude --settings did not answer in time")
+            .fix("run `claude --version` by hand: a first run may wait on a prompt or an update"),
     }
+}
+
+/// The shape Claude Code's settings give hooks: `hooks` maps each event to
+/// matcher groups, each a `hooks` list of `{"type":"command","command"}`.
+pub fn hooks_shape(settings: &serde_json::Value) -> Result<(), String> {
+    let hooks = settings["hooks"]
+        .as_object()
+        .ok_or("`hooks` is not an object")?;
+    if hooks.is_empty() {
+        return Err("no hook events".into());
+    }
+    for (event, groups) in hooks {
+        let groups = groups
+            .as_array()
+            .ok_or(format!("`{event}` is not a list"))?;
+        for group in groups {
+            if group.get("matcher").is_some_and(|m| !m.is_string()) {
+                return Err(format!("a `{event}` matcher is not a string"));
+            }
+            let entries = group["hooks"]
+                .as_array()
+                .filter(|e| !e.is_empty())
+                .ok_or(format!("a `{event}` group has no `hooks` list"))?;
+            for entry in entries {
+                if entry["type"] != "command" {
+                    return Err(format!("a `{event}` hook is not of type command"));
+                }
+                if entry["command"].as_str().is_none_or(str::is_empty) {
+                    return Err(format!("a `{event}` hook has no command"));
+                }
+                if entry.get("args").is_some_and(|a| {
+                    !a.as_array()
+                        .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
+                }) {
+                    return Err(format!("a `{event}` hook's args are not strings"));
+                }
+                if entry.get("timeout").is_some_and(|t| !t.is_u64()) {
+                    return Err(format!("a `{event}` hook's timeout is not a number"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // --- state dir -------------------------------------------------------------------
@@ -730,6 +894,8 @@ pub fn state_dir_checks(dir: &Path) -> Vec<Check> {
                         path.display(),
                         if secret == crate::auth::TOKEN_FILE {
                             "; then `fw hub token --rotate` (it may have been read)"
+                        } else if secret == crate::notify::CONFIG_FILE {
+                            "; the hub ignores it (no push notifications) until then"
                         } else {
                             ""
                         }
@@ -773,19 +939,49 @@ pub fn config_checks(dir: &Path) -> Vec<Check> {
                 ),
             }
         }
-        Err(message) => Check::new("hub.toml", Level::Fail, message)
-            .fix("fix it (`fw hub config check` re-checks); the hub refuses to start until then"),
+        Err(message) => Check::new("hub.toml", Level::Fail, message).fix(
+            "correct it where the error points (`fw hub config check` re-checks, `fw docs hub` \
+             lists the keys); the hub refuses to start until then",
+        ),
     });
-    checks.push(match crate::notify::NotifyConfig::load(dir, None) {
-        Ok(None) => Check::new("notify.toml", Level::Ok, "none (no push notifications)"),
-        Ok(Some(config)) => Check::new(
+    // Its content only: a mode that is not private is the secrets check's
+    // finding (and does not hide a parse error here).
+    let notify_path = dir.join(crate::notify::CONFIG_FILE);
+    match std::fs::read_to_string(&notify_path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => checks.push(Check::new(
             "notify.toml",
             Level::Ok,
-            format!("pushes to {}", config.host()),
+            "none (no push notifications)",
+        )),
+        Err(e) => checks.push(
+            Check::new(
+                "notify.toml",
+                Level::Fail,
+                format!("{}: {e}", notify_path.display()),
+            )
+            .fix(format!("chmod 600 {}", notify_path.display())),
         ),
-        Err(message) => Check::new("notify.toml", Level::Fail, message)
-            .fix("fix it; until then the hub starts without push notifications"),
-    });
+        Ok(text) => checks.push(
+            match crate::notify::NotifyConfig::from_parts(Some(&text), None) {
+                Ok(Some(config)) => Check::new(
+                    "notify.toml",
+                    Level::Ok,
+                    format!("pushes to {}", config.host()),
+                ),
+                Ok(None) => Check::new("notify.toml", Level::Ok, "no push notifications"),
+                Err(message) => Check::new(
+                    "notify.toml",
+                    Level::Fail,
+                    format!("{}: {message}", notify_path.display()),
+                )
+                .fix(
+                    "correct it: url = \"https://ntfy.sh/<topic>\" (required), token = \"...\", \
+                 events = [\"blocked\", \"done\"]; until then the hub starts without push \
+                 notifications",
+                ),
+            },
+        ),
+    }
     match crate::settings::read(&dir.join(crate::settings::SETTINGS_FILE)) {
         Ok(_) => {}
         Err(message) => checks.push(
@@ -843,6 +1039,23 @@ pub fn port_check(bind: IpAddr, port: u16, hub: Option<&Running>) -> Check {
                 ),
                 None => "stop what listens there, or pick another port with --port".to_owned(),
             };
+            if is_flywheel_hub(bind, port) {
+                return Check::new(
+                    id,
+                    Level::Fail,
+                    format!(
+                        "{bind}:{port} is taken by another flywheel hub (one for another state \
+                         dir)"
+                    ),
+                )
+                .fix(format!(
+                    "stop it (`fw hub stop --state-dir <its dir>`), or give this one another \
+                     port{}",
+                    free.map_or_else(String::new, |p| format!(
+                        ": `fw hub start --port {p}` (or [server] port = {p} in hub.toml)"
+                    ))
+                ));
+            }
             Check::new(
                 id,
                 Level::Fail,
@@ -851,6 +1064,39 @@ pub fn port_check(bind: IpAddr, port: u16, hub: Option<&Running>) -> Check {
             .fix(fix)
         }
     }
+}
+
+/// Whether what listens on `bind:port` answers as a flywheel hub (its web
+/// manifest, served without login).
+fn is_flywheel_hub(bind: IpAddr, port: u16) -> bool {
+    use std::net::TcpStream;
+    let host = if bind.is_unspecified() {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+        bind
+    };
+    let timeout = Duration::from_secs(1);
+    let Ok(mut stream) = TcpStream::connect_timeout(&SocketAddr::new(host, port), timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let request = format!(
+        "GET /manifest.webmanifest HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        SocketAddr::new(host, port)
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut body = Vec::new();
+    let _ = stream.take(64 * 1024).read_to_end(&mut body);
+    let text = String::from_utf8_lossy(&body);
+    let Some((head, json)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    head.starts_with("HTTP/1.")
+        && serde_json::from_str::<serde_json::Value>(json)
+            .is_ok_and(|manifest| manifest["name"] == "flywheel hub")
 }
 
 fn tailscale_check(port: u16) -> Check {
@@ -1165,6 +1411,21 @@ mod tests {
             fix.contains("hash -r") && fix.contains("cargo/bin"),
             "{fix}"
         );
+        // No pyvenv.cfg: a Python package's entry point, not a venv's.
+        assert!(fix.contains("a Python package's entry point"), "{fix}");
+        std::fs::write(dir.path().join("venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+        let fix = on_path_check("fw", &found, Some(&exe)).fix.unwrap();
+        assert!(fix.contains("a Python venv's entry point"), "{fix}");
+        // A shell script: no Python advice at all.
+        write_script(&venv.join("fw"), "#!/bin/bash\necho hi\n");
+        let check = on_path_check("fw", &found, Some(&exe));
+        assert_eq!(check.level, Level::Fail);
+        assert!(
+            check.summary.contains("a script run by /bin/bash"),
+            "{}",
+            check.summary
+        );
+        assert!(!check.fix.unwrap().contains("Python"));
         assert!(
             check.details.iter().any(|d| d.contains("shadowed")),
             "{:?}",
@@ -1200,6 +1461,103 @@ mod tests {
     }
 
     #[test]
+    fn fw_and_flywheel_written_together_are_one_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let fw = dir.path().join("fw");
+        let flywheel = dir.path().join("flywheel");
+        std::fs::write(&fw, vec![1u8; 10_000]).unwrap();
+        std::fs::write(&flywheel, vec![2u8; 10_050]).unwrap();
+        assert!(installed_together(&fw, &flywheel));
+        assert!(installed_together(&flywheel, &fw));
+        // Not a pair: the same name, another name, another directory.
+        assert!(!installed_together(&fw, &fw));
+        let other = dir.path().join("sub");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(other.join("fw"), vec![1u8; 10_000]).unwrap();
+        assert!(!installed_together(&other.join("fw"), &flywheel));
+        std::fs::write(dir.path().join("fwx"), vec![1u8; 10_000]).unwrap();
+        assert!(!installed_together(&dir.path().join("fwx"), &flywheel));
+        // Another build: written an hour apart, or a different size.
+        let file = std::fs::File::options().write(true).open(&fw).unwrap();
+        file.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        assert!(!installed_together(&fw, &flywheel));
+        std::fs::write(&fw, vec![1u8; 20_000]).unwrap();
+        assert!(!installed_together(&fw, &flywheel));
+    }
+
+    #[test]
+    fn a_held_lock_is_seen_without_taking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.lock");
+        let holder = std::fs::File::create(&path).unwrap();
+        let me = std::process::id();
+        assert_eq!(hub_holds_lock(me, &path), Some(false));
+        holder.lock().unwrap();
+        assert_eq!(hub_holds_lock(me, &path), Some(true));
+        // Looking took nothing: once the holder lets go, an exclusive lock
+        // is granted at once.
+        holder.unlock().unwrap();
+        assert_eq!(hub_holds_lock(me, &path), Some(false));
+        let other = std::fs::File::open(&path).unwrap();
+        other.try_lock().unwrap();
+        other.unlock().unwrap();
+        // A process without the file open holds nothing.
+        assert!(!hub_holds_lock(1, &path).unwrap_or(false));
+
+        assert!(fdinfo_has_flock(
+            "pos:\t0\nflags:\t02100002\nmnt_id:\t1363\nino:\t4366546\nlock:\t1: FLOCK  ADVISORY  WRITE 0 08:30:4366546 0 EOF\n"
+        ));
+        assert!(!fdinfo_has_flock("pos:\t0\nflags:\t02\n"));
+        assert!(!fdinfo_has_flock(
+            "lock:\t1: POSIX  ADVISORY  WRITE 7 08:30:5 0 EOF\n"
+        ));
+    }
+
+    #[test]
+    fn the_hubs_hook_settings_have_claudes_shape() {
+        let report = vec!["/x/fw".to_owned(), "hub".to_owned()];
+        assert_eq!(hooks_shape(&agent::claude_settings(&report)), Ok(()));
+        let bad = |v: serde_json::Value| hooks_shape(&v).unwrap_err();
+        assert!(bad(serde_json::json!({ "hooks": "notanobject" })).contains("not an object"));
+        assert!(bad(serde_json::json!({ "hooks": { "Stop": {} } })).contains("not a list"));
+        assert!(
+            bad(serde_json::json!({ "hooks": { "Stop": [{ "hooks": [{ "type": "command" }] }] } }))
+                .contains("no command")
+        );
+        assert!(
+            bad(serde_json::json!({ "hooks": { "Stop": [{ "hooks": [
+                { "type": "command", "command": "x", "args": [1] }
+            ] }] } }))
+            .contains("args")
+        );
+    }
+
+    #[test]
+    fn a_port_held_by_another_hub_is_named() {
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = taken.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = crate::web::MANIFEST;
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            taken
+        });
+        let check = port_check(IpAddr::V4(Ipv4Addr::LOCALHOST), port, None);
+        let taken = server.join().unwrap();
+        assert_eq!(check.level, Level::Fail, "{check:?}");
+        assert!(check.summary.contains("another flywheel hub"), "{check:?}");
+        assert!(check.fix.unwrap().contains("fw hub stop"));
+        drop(taken);
+    }
+
+    #[test]
     fn a_taken_port_fails_and_suggests_a_free_one() {
         let taken = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = taken.local_addr().unwrap().port();
@@ -1207,8 +1565,17 @@ mod tests {
         assert_eq!(check.level, Level::Fail, "{check:?}");
         assert!(check.fix.unwrap().contains("--port"));
         drop(taken);
-        let check = port_check(IpAddr::V4(Ipv4Addr::LOCALHOST), port, None);
-        assert_eq!(check.level, Level::Ok, "{check:?}");
+        // A free port is ok. (Retried on fresh ports: once freed, a port
+        // can be taken at once by a parallel test's connection.)
+        let free = (0..10).any(|_| {
+            let port = TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            port_check(IpAddr::V4(Ipv4Addr::LOCALHOST), port, None).level == Level::Ok
+        });
+        assert!(free);
     }
 
     #[test]
@@ -1253,6 +1620,28 @@ mod tests {
         assert_eq!(level("hub.toml"), Some(Level::Fail), "{checks:?}");
         assert_eq!(level("notify.toml"), Some(Level::Fail), "{checks:?}");
         assert_eq!(level("settings.json"), Some(Level::Fail), "{checks:?}");
+        assert!(checks.iter().all(|c| c.fix.as_deref() != Some("fix it")));
+
+        // A garbage notify.toml readable by others: the mode is the secrets
+        // check's (once), the parse error still shows here.
+        std::fs::write(dir.path().join("notify.toml"), "garbage[[\n").unwrap();
+        std::fs::set_permissions(
+            dir.path().join("notify.toml"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let notify: Vec<Check> = config_checks(dir.path())
+            .into_iter()
+            .filter(|c| c.id == "notify.toml")
+            .collect();
+        assert_eq!(notify.len(), 1, "{notify:?}");
+        assert!(!notify[0].summary.contains("mode"), "{notify:?}");
+        let secrets: Vec<Check> = state_dir_checks(dir.path())
+            .into_iter()
+            .filter(|c| c.id == "secrets")
+            .collect();
+        assert_eq!(secrets.len(), 1, "{secrets:?}");
+        assert!(secrets[0].fix.as_deref().unwrap().contains("ignores it"));
     }
 
     #[test]
@@ -1305,6 +1694,19 @@ mod tests {
         ];
         let text = render(&checks);
         assert!(text.contains("  FAIL  fw on PATH  bad\n"), "{text}");
+        // A multi-line summary stays in its column.
+        let multi = render(&[Check::new(
+            "hub.toml",
+            Level::Fail,
+            "TOML parse error\n  |\n1 | x\n",
+        )]);
+        let pad = " ".repeat("hub.toml".len() + 10);
+        assert!(
+            multi.starts_with(&format!(
+                "  FAIL  hub.toml  TOML parse error\n{pad}  |\n{pad}1 | x\n"
+            )),
+            "{multi}"
+        );
         assert!(text.contains("fix: do x"), "{text}");
         assert!(text.ends_with("1 ok, 0 info, 0 warn, 1 fail\n"), "{text}");
     }

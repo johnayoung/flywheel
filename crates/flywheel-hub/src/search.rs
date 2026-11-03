@@ -1047,11 +1047,9 @@ impl TranscriptSlot {
     }
 }
 
-/// A session's terminal text as last extracted.
+/// A session's terminal text, read for one search.
 #[derive(Debug)]
 struct ScrollEntry {
-    /// (terminal identity, output bytes, size) it reflects.
-    key: (usize, u64, (u16, u16)),
     primary: Corpus,
     alternate: Option<Corpus>,
 }
@@ -1069,7 +1067,6 @@ struct Located {
 #[derive(Debug)]
 pub struct SearchIndex {
     permits: Arc<tokio::sync::Semaphore>,
-    scroll: Mutex<HashMap<String, Arc<ScrollEntry>>>,
     located: Mutex<HashMap<String, Located>>,
     transcripts: Mutex<HashMap<PathBuf, Arc<TranscriptSlot>>>,
 }
@@ -1078,7 +1075,6 @@ impl Default for SearchIndex {
     fn default() -> Self {
         Self {
             permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT)),
-            scroll: Mutex::new(HashMap::new()),
             located: Mutex::new(HashMap::new()),
             transcripts: Mutex::new(HashMap::new()),
         }
@@ -1094,29 +1090,19 @@ impl SearchIndex {
             .expect("the search semaphore is never closed")
     }
 
-    fn scroll_entry(&self, id: &str, pty: &Arc<PtySession>) -> Arc<ScrollEntry> {
-        let identity = Arc::as_ptr(pty) as usize;
-        let current = (identity, pty.output_bytes(), pty.size());
-        if let Some(entry) = self
-            .scroll
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(id)
-            .filter(|e| e.key == current)
-        {
-            return Arc::clone(entry);
-        }
-        let (bytes, size, text) = pty.search_text();
-        let entry = Arc::new(ScrollEntry {
-            key: (identity, bytes, size),
-            primary: Corpus::from_units(&text.primary),
+    /// A session's terminal text now. Not kept here: the emulator keeps
+    /// what it read last and re-reads only rows scrolled in since (see
+    /// [`crate::vt::Emulator::search_text`]), so this is a copy, cheap to
+    /// take, and no second copy of every scrollback stays in memory.
+    fn scroll_entry(pty: &PtySession) -> ScrollEntry {
+        let text = pty.search_text();
+        ScrollEntry {
+            primary: Corpus {
+                text: text.primary.text,
+                starts: text.primary.starts,
+            },
             alternate: text.alternate.as_ref().map(Corpus::from_units),
-        });
-        self.scroll
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(id.to_owned(), Arc::clone(&entry));
-        entry
+        }
     }
 
     fn transcript(&self, path: &Path, format: Format) -> Arc<TranscriptSlot> {
@@ -1201,12 +1187,8 @@ impl SearchIndex {
     }
 
     /// Forget what belongs to sessions no longer there (`sessions`: every
-    /// session the hub has; `live`: those with a terminal).
-    fn prune(&self, sessions: &HashSet<String>, live: &HashSet<String>) {
-        self.scroll
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|id, _| live.contains(id));
+    /// session the hub has).
+    fn prune(&self, sessions: &HashSet<String>) {
         let mut located = self.located.lock().unwrap_or_else(PoisonError::into_inner);
         located.retain(|id, _| sessions.contains(id));
         let used: HashSet<PathBuf> = located
@@ -1334,12 +1316,7 @@ impl Hub {
             .collect();
         let all = self.sessions(None);
         let ids: HashSet<String> = all.iter().map(|s| s.record.id.clone()).collect();
-        let live: HashSet<String> = all
-            .iter()
-            .filter(|s| s.live.is_some())
-            .map(|s| s.record.id.clone())
-            .collect();
-        self.search_index().prune(&ids, &live);
+        self.search_index().prune(&ids);
 
         let mut response = SearchResponse {
             query: request.query.clone(),
@@ -1467,7 +1444,7 @@ impl Hub {
         let Some(pty) = self.live_session(&view.record.id) else {
             return true;
         };
-        let entry = self.search_index().scroll_entry(&view.record.id, &pty);
+        let entry = SearchIndex::scroll_entry(&pty);
         let mut complete = true;
         let mut hits = Vec::new();
         // The screen in view first (the alternate one, when up), then

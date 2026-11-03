@@ -75,7 +75,66 @@ async fn a_burst_of_list_changes_reaches_events_clients_as_few_paced_signals() {
     let settle = Instant::now() + 2 * SESSIONS_PUSH_INTERVAL;
     while let Ok(Some(_)) = tokio::time::timeout_at(settle.into(), ws.next()).await {}
 
-    // 40 renames, each a list change.
+    // Read the socket while the burst runs: each `sessions` signal is
+    // answered the way a browser answers it, by fetching the session, so
+    // what a client last saw is known. (Reading only after the burst would
+    // pass with no trailing push at all: the first rename's immediate one
+    // would still be queued.)
+    let (burst_done, mut burst_done_rx) = oneshot::channel::<()>();
+    let reader = {
+        let http = http.clone();
+        let token = token.clone();
+        let id = id.clone();
+        tokio::spawn(async move {
+            let mut seen: Vec<(Instant, String, String)> = Vec::new();
+            let mut deadline: Option<Instant> = None;
+            loop {
+                let next = match deadline {
+                    Some(at) => match tokio::time::timeout_at(at.into(), ws.next()).await {
+                        Ok(next) => next,
+                        Err(_) => break,
+                    },
+                    None => tokio::select! {
+                        next = ws.next() => next,
+                        _ = &mut burst_done_rx => {
+                            deadline = Some(Instant::now() + 3 * SESSIONS_PUSH_INTERVAL);
+                            continue;
+                        }
+                    },
+                };
+                let Some(Ok(Message::Text(text))) = next else {
+                    if next.is_none() {
+                        break;
+                    }
+                    continue;
+                };
+                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                if value["type"] != "sessions" {
+                    continue;
+                }
+                let at = Instant::now();
+                let got: Value = http
+                    .get(format!("http://{addr}/api/sessions/{id}"))
+                    .bearer_auth(&token)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                seen.push((
+                    at,
+                    text.as_str().to_owned(),
+                    got["name"].as_str().unwrap_or_default().to_owned(),
+                ));
+            }
+            seen
+        })
+    };
+
+    // 40 renames, each a list change; spaced so the burst spans several
+    // pacing intervals and its last rename lands inside one (where only
+    // the trailing push can carry it).
     const RENAMES: usize = 40;
     let started = Instant::now();
     for n in 1..=RENAMES {
@@ -85,45 +144,44 @@ async fn a_burst_of_list_changes_reaches_events_clients_as_few_paced_signals() {
             json!({ "name": format!("s{n}") }),
         )
         .await;
+        tokio::time::sleep(SESSIONS_PUSH_INTERVAL / 16).await;
     }
     let burst = started.elapsed();
-    let ended = Instant::now();
+    let _ = burst_done.send(());
+    let signals = timeout(Duration::from_secs(30), reader)
+        .await
+        .expect("reader finished")
+        .unwrap();
 
-    let mut signals: Vec<(Instant, String)> = Vec::new();
-    let collect_until = Instant::now() + 3 * SESSIONS_PUSH_INTERVAL;
-    while let Ok(Some(message)) = tokio::time::timeout_at(collect_until.into(), ws.next()).await {
-        if let Ok(Message::Text(text)) = message {
-            let value: Value = serde_json::from_str(text.as_str()).unwrap();
-            if value["type"] == "sessions" {
-                signals.push((Instant::now(), text.as_str().to_owned()));
-            }
-        }
-    }
     // Paced: at most one per interval over the burst, plus the trailing
     // one (one per rename without pacing).
     let bound = 2 + (burst.as_millis() / SESSIONS_PUSH_INTERVAL.as_millis()) as usize;
     assert!(
-        !signals.is_empty() && signals.len() <= bound && signals.len() < RENAMES,
+        signals.len() >= 2 && signals.len() <= bound && signals.len() < RENAMES,
         "{} sessions pushes for {RENAMES} renames in {burst:?} (bound {bound})",
         signals.len()
     );
-    // Nothing is lost: a signal came after the last change.
-    assert!(
-        signals.iter().any(|(at, _)| *at >= ended),
-        "no sessions push after the burst"
-    );
     // Each is the bare signal (the list is fetched, never pushed).
-    for (_, text) in &signals {
+    for (_, text, _) in &signals {
         assert_eq!(text, r#"{"type":"sessions"}"#);
     }
-    // And the list it points at is current.
-    let listed = call(
-        reqwest::Method::GET,
-        &format!("/api/sessions/{id}"),
-        Value::Null,
-    )
-    .await;
-    assert_eq!(listed["name"], format!("s{RENAMES}"));
+    // Nothing is lost: what a client fetched after the last signal is the
+    // final state (without the trailing push it is a rename mid-burst).
+    let (_, _, last_name) = signals.last().unwrap();
+    assert_eq!(
+        last_name,
+        &format!("s{RENAMES}"),
+        "the last sessions push left a client with a stale list: {:?}",
+        signals.iter().map(|(_, _, n)| n).collect::<Vec<_>>()
+    );
+    // Paced in time too: consecutive pushes are an interval apart.
+    for pair in signals.windows(2) {
+        let gap = pair[1].0 - pair[0].0;
+        assert!(
+            gap >= SESSIONS_PUSH_INTERVAL.mul_f64(0.5),
+            "two sessions pushes {gap:?} apart"
+        );
+    }
 
     let _ = stop.send(());
     timeout(Duration::from_secs(15), server)

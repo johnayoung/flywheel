@@ -297,6 +297,112 @@ struct Guarded<'a> {
     titles: &'a mut Vec<Option<String>>,
     listener: &'a Listener,
     colors: &'a ViewerColors,
+    history: &'a mut HistoryWatch,
+}
+
+/// What may have changed the primary screen's history, counted where the
+/// handler sees it, so [`Emulator::search_text`] can reuse the history rows
+/// it read last time (history rows never change once there; they only
+/// scroll in at the bottom and out at the top).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HistoryWatch {
+    /// Bumped where history may be rewritten or dropped (reset, ED 3, a
+    /// resize): rows read before it are not reused.
+    epoch: u64,
+    /// An upper bound on rows scrolled into history: every linefeed, wrap,
+    /// scroll and screen clear counts, also off the bottom of a scroll
+    /// region or on the alternate screen (where nothing scrolls).
+    scrolls: u64,
+}
+
+impl HistoryWatch {
+    fn scrolled(&mut self, rows: usize) {
+        self.scrolls = self.scrolls.saturating_add(rows as u64);
+    }
+}
+
+/// The primary screen's history as search text, kept between
+/// [`Emulator::search_text`] calls: only rows scrolled in since are read.
+#[derive(Debug, Default)]
+struct HistoryText {
+    /// The logical lines wholly in history (trimmed), oldest first.
+    lines: Lines,
+    /// How many rows each of `lines` spans.
+    line_rows: std::collections::VecDeque<usize>,
+    /// The rows of the logical line still open at the bottom of history
+    /// (each soft-wraps into the next; it ends on screen or later).
+    open: Vec<String>,
+    /// Every history row's fingerprint (text and wrap), oldest first:
+    /// `line_rows` plus `open` rows.
+    rows: std::collections::VecDeque<u64>,
+    /// The newest row's cell storage (rows move through history as
+    /// buffers, so this finds where it went).
+    anchor: usize,
+    /// The [`HistoryWatch`] when read, and the grid size.
+    watch: HistoryWatch,
+    size: (usize, usize),
+    /// Rows read by the last update (the test of the reuse).
+    read: usize,
+}
+
+impl HistoryText {
+    fn clear(&mut self) {
+        self.lines = Lines::default();
+        self.line_rows.clear();
+        self.open.clear();
+        self.rows.clear();
+    }
+
+    /// Add history row `line` (the newest so far).
+    fn push_row(&mut self, grid: &Grid<Cell>, line: Line) {
+        let (text, wraps) = (row_text(grid, line), wrapped(grid, line));
+        self.rows.push_back(fingerprint(&text, wraps));
+        self.open.push(text);
+        if !wraps {
+            let joined = self.open.concat();
+            self.lines.push(joined.trim_end());
+            self.line_rows.push_back(self.open.len());
+            self.open.clear();
+        }
+        self.read += 1;
+    }
+
+    /// Forget the `n` oldest rows (scrolled out of history). A logical line
+    /// losing only some of its rows is read again from what is left.
+    fn drop_rows(&mut self, grid: &Grid<Cell>, mut n: usize) {
+        self.rows.drain(..n.min(self.rows.len()));
+        // Whole lines first, in one cut.
+        let mut whole = 0;
+        while let Some(&first) = self.line_rows.get(whole)
+            && first <= n
+        {
+            n -= first;
+            whole += 1;
+        }
+        self.lines.drop_front(whole);
+        self.line_rows.drain(..whole);
+        if n > 0 {
+            if self.line_rows.is_empty() {
+                self.open.drain(..n.min(self.open.len()));
+                return;
+            }
+            let first = self.line_rows[0];
+            let left = first - n;
+            let top = grid.topmost_line();
+            let text: String = (0..left as i32).map(|i| row_text(grid, top + i)).collect();
+            self.lines.replace_front(text.trim_end());
+            self.line_rows[0] = left;
+            self.read += left;
+        }
+    }
+}
+
+fn fingerprint(text: &str, wraps: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    wraps.hash(&mut hasher);
+    hasher.finish()
 }
 
 macro_rules! forward {
@@ -330,10 +436,43 @@ impl Handler for Guarded<'_> {
 
     fn reset_state(&mut self) {
         self.titles.clear();
+        self.history.epoch += 1;
         <Term<Listener> as Handler>::reset_state(self.term);
     }
 
+    fn linefeed(&mut self) {
+        self.history.scrolled(1);
+        <Term<Listener> as Handler>::linefeed(self.term);
+    }
+
+    fn newline(&mut self) {
+        self.history.scrolled(1);
+        <Term<Listener> as Handler>::newline(self.term);
+    }
+
+    fn scroll_up(&mut self, count: usize) {
+        self.history.scrolled(count.min(self.term.screen_lines()));
+        <Term<Listener> as Handler>::scroll_up(self.term, count);
+    }
+
+    fn delete_lines(&mut self, count: usize) {
+        self.history.scrolled(count.min(self.term.screen_lines()));
+        <Term<Listener> as Handler>::delete_lines(self.term, count);
+    }
+
+    fn clear_screen(&mut self, mode: ClearMode) {
+        match mode {
+            ClearMode::Saved => self.history.epoch += 1,
+            // On the primary screen, ED 2 scrolls the screen into history.
+            _ => self.history.scrolled(self.term.screen_lines()),
+        }
+        <Term<Listener> as Handler>::clear_screen(self.term, mode);
+    }
+
     fn input(&mut self, c: char) {
+        if self.term.grid().cursor.input_needs_wrap {
+            self.history.scrolled(1);
+        }
         if c.width() == Some(0) {
             // The cell `Term::input` attaches a zero-width character to.
             let grid = self.term.grid();
@@ -393,15 +532,11 @@ impl Handler for Guarded<'_> {
         put_tab(count: u16);
         backspace();
         carriage_return();
-        linefeed();
         bell();
         substitute();
-        newline();
         set_horizontal_tabstop();
-        scroll_up(count: usize);
         scroll_down(count: usize);
         insert_blank_lines(count: usize);
-        delete_lines(count: usize);
         erase_chars(count: usize);
         delete_chars(count: usize);
         move_backward_tabs(count: u16);
@@ -409,7 +544,6 @@ impl Handler for Guarded<'_> {
         save_cursor_position();
         restore_cursor_position();
         clear_line(mode: LineClearMode);
-        clear_screen(mode: ClearMode);
         clear_tabs(mode: TabulationClearMode);
         set_tabs(interval: u16);
         reverse_index();
@@ -637,6 +771,8 @@ pub struct Emulator {
     osc: OscScan,
     config: Config,
     scrollback_lines: usize,
+    history: HistoryWatch,
+    history_text: HistoryText,
 }
 
 impl std::fmt::Debug for Emulator {
@@ -680,6 +816,8 @@ impl Emulator {
             osc: OscScan::default(),
             config,
             scrollback_lines,
+            history: HistoryWatch::default(),
+            history_text: HistoryText::default(),
         }
     }
 
@@ -719,6 +857,7 @@ impl Emulator {
                 titles: &mut self.titles,
                 listener: &self.listener,
                 colors: &self.colors,
+                history: &mut self.history,
             });
         }
     }
@@ -731,6 +870,7 @@ impl Emulator {
                 titles: &mut self.titles,
                 listener: &self.listener,
                 colors: &self.colors,
+                history: &mut self.history,
             },
             bytes,
         );
@@ -759,6 +899,7 @@ impl Emulator {
                 titles: &mut self.titles,
                 listener: &self.listener,
                 colors: &self.colors,
+                history: &mut self.history,
             });
         }
     }
@@ -801,6 +942,8 @@ impl Emulator {
         }
         self.term.resize(size);
         self.tracked.resize(size.rows);
+        // Reflowed (and maybe pulled back into view or cut): read afresh.
+        self.history.epoch += 1;
         let limit = history_limit(self.scrollback_lines, size.cols);
         if limit != self.config.scrolling_history {
             self.config.scrolling_history = limit;
@@ -1046,12 +1189,16 @@ impl Emulator {
     /// up), oldest first, trailing blank lines dropped -- the same lines,
     /// counted from the bottom, a client replaying [`Emulator::snapshot`]
     /// holds -- and the alternate screen's rows when it is up.
+    ///
+    /// History rows read by an earlier call are reused (output only adds
+    /// rows at the bottom of history and drops them at the top), so a
+    /// session printing steadily costs the rows it printed, not its whole
+    /// scrollback, per search.
     pub fn search_text(&mut self) -> SearchText {
         self.flush();
         if !self.alt_screen() {
-            let grid = self.term.grid();
             return SearchText {
-                primary: recent_lines(grid, usize::MAX),
+                primary: self.primary_lines(),
                 alternate: None,
             };
         }
@@ -1060,7 +1207,7 @@ impl Emulator {
         let alt = self.term.grid().clone();
         let alternate = recent_lines(&alt, usize::MAX);
         self.term.swap_alt();
-        let primary = recent_lines(self.term.grid(), usize::MAX);
+        let primary = self.primary_lines();
         self.term.swap_alt();
         *self.term.grid_mut() = alt;
         SearchText {
@@ -1068,13 +1215,225 @@ impl Emulator {
             alternate: Some(alternate),
         }
     }
+
+    /// [`recent_lines`] of the primary grid (the active one when called),
+    /// through [`HistoryText`].
+    fn primary_lines(&mut self) -> Lines {
+        let limit = self.config.scrolling_history;
+        let grid = self.term.grid();
+        let cache = &mut self.history_text;
+        update_history_text(cache, grid, self.history, limit);
+        let mut out = cache.lines.clone();
+        let mut pending = cache.open.concat();
+        let mut open = !cache.open.is_empty();
+        for line in 0..grid.screen_lines() as i32 {
+            let line = Line(line);
+            pending.push_str(&row_text(grid, line));
+            open = true;
+            if !wrapped(grid, line) {
+                out.push(pending.trim_end());
+                pending.clear();
+                open = false;
+            }
+        }
+        if open {
+            out.push(pending.trim_end());
+        }
+        // Blank rows below the last output (back into history, after a
+        // clear).
+        while out.last().is_some_and(str::is_empty) {
+            out.pop();
+        }
+        out
+    }
+}
+
+/// The address of a row's cells: stable while the row moves through the
+/// grid's ring (rows are swapped and rotated, not copied).
+fn row_address(grid: &Grid<Cell>, line: Line) -> usize {
+    std::ptr::from_ref(&grid[line][Column(0)]) as usize
+}
+
+/// Bring `cache` up to `grid`'s history: reuse what was read before when
+/// its newest row is found again (and its oldest kept row checks out),
+/// reading only the rows that scrolled in since; else read them all.
+fn update_history_text(
+    cache: &mut HistoryText,
+    grid: &Grid<Cell>,
+    watch: HistoryWatch,
+    limit: usize,
+) {
+    let history = grid.history_size();
+    let size = (grid.columns(), grid.screen_lines());
+    let shift = (cache.watch.epoch == watch.epoch && cache.size == size)
+        .then(|| history_shift(cache, grid, watch.scrolls - cache.watch.scrolls, limit))
+        .flatten();
+    cache.read = 0;
+    let scrolled = match shift {
+        Some(scrolled) => {
+            let dropped = cache.rows.len() + scrolled - history;
+            cache.drop_rows(grid, dropped);
+            scrolled
+        }
+        None => {
+            cache.clear();
+            history
+        }
+    };
+    for back in (1..=scrolled).rev() {
+        cache.push_row(grid, Line(-(back as i32)));
+    }
+    cache.anchor = if history > 0 {
+        row_address(grid, Line(-1))
+    } else {
+        0
+    };
+    cache.watch = watch;
+    cache.size = size;
+}
+
+/// Rows scrolled into history since `cache` was read, when that can be
+/// told: at most `bound`, and fewer than history holds (past that a
+/// recycled row could be taken for the anchor).
+fn history_shift(
+    cache: &HistoryText,
+    grid: &Grid<Cell>,
+    bound: u64,
+    limit: usize,
+) -> Option<usize> {
+    let history = grid.history_size();
+    if cache.rows.is_empty() {
+        // Nothing was in history: everything there now is new.
+        return Some(history);
+    }
+    if bound >= limit as u64 || history == 0 {
+        return None;
+    }
+    let bound = usize::try_from(bound).unwrap_or(usize::MAX);
+    let scrolled = (0..=bound.min(history - 1))
+        .find(|&s| row_address(grid, Line(-1 - s as i32)) == cache.anchor)?;
+    let dropped = (cache.rows.len() + scrolled).checked_sub(history)?;
+    // The newest row kept and the oldest kept must read as they did.
+    let reads_as = |line: Line, expected: Option<&u64>| {
+        expected.is_some_and(|&e| fingerprint(&row_text(grid, line), wrapped(grid, line)) == e)
+    };
+    if !reads_as(Line(-1 - scrolled as i32), cache.rows.back()) {
+        return None;
+    }
+    if dropped < cache.rows.len() && !reads_as(grid.topmost_line(), cache.rows.get(dropped)) {
+        return None;
+    }
+    Some(scrolled)
+}
+
+/// Logical lines joined by `\n`, with where each starts: the form search
+/// scans (one regex pass over `text`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Lines {
+    pub text: String,
+    /// Where each line starts in `text`.
+    pub starts: Vec<usize>,
+}
+
+impl Lines {
+    pub fn len(&self) -> usize {
+        self.starts.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+
+    /// Line `i`.
+    pub fn get(&self, i: usize) -> Option<&str> {
+        let start = *self.starts.get(i)?;
+        let end = self
+            .starts
+            .get(i + 1)
+            .map_or(self.text.len(), |next| next - 1);
+        Some(&self.text[start..end])
+    }
+
+    pub fn last(&self) -> Option<&str> {
+        self.len().checked_sub(1).and_then(|i| self.get(i))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        (0..self.len()).filter_map(|i| self.get(i))
+    }
+
+    pub fn push(&mut self, line: &str) {
+        if !self.starts.is_empty() {
+            self.text.push('\n');
+        }
+        self.starts.push(self.text.len());
+        self.text.push_str(line);
+    }
+
+    /// Drop the last line.
+    pub fn pop(&mut self) {
+        let Some(start) = self.starts.pop() else {
+            return;
+        };
+        // With its separator.
+        self.text.truncate(start.saturating_sub(1));
+        if self.starts.is_empty() {
+            self.text.clear();
+        }
+    }
+
+    /// Drop the first `n` lines.
+    pub fn drop_front(&mut self, n: usize) {
+        if n >= self.starts.len() {
+            self.text.clear();
+            self.starts.clear();
+            return;
+        }
+        let cut = self.starts[n];
+        self.text.drain(..cut);
+        self.starts.drain(..n);
+        for start in &mut self.starts {
+            *start -= cut;
+        }
+    }
+
+    /// Replace the first line.
+    fn replace_front(&mut self, line: &str) {
+        let Some(old) = self.get(0).map(str::len) else {
+            self.push(line);
+            return;
+        };
+        self.text.replace_range(..old, line);
+        let delta = line.len() as isize - old as isize;
+        for start in self.starts.iter_mut().skip(1) {
+            *start = start.saturating_add_signed(delta);
+        }
+    }
+}
+
+impl std::ops::Index<usize> for Lines {
+    type Output = str;
+
+    fn index(&self, i: usize) -> &str {
+        self.get(i).expect("line index in range")
+    }
+}
+
+impl<S: AsRef<str>> FromIterator<S> for Lines {
+    fn from_iter<I: IntoIterator<Item = S>>(lines: I) -> Self {
+        let mut out = Self::default();
+        for line in lines {
+            out.push(line.as_ref());
+        }
+        out
+    }
 }
 
 /// What [`Emulator::search_text`] returns.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchText {
     /// The primary screen's logical lines: scrollback then rows.
-    pub primary: Vec<String>,
+    pub primary: Lines,
     /// The alternate screen's rows, when it is up.
     pub alternate: Option<Vec<String>>,
 }
@@ -1664,12 +2023,12 @@ mod tests {
         let text = e.search_text();
         assert_eq!(text.alternate, None);
         assert_eq!(text.primary.len(), 21, "{:?}", text.primary);
-        assert_eq!(text.primary[0], "row 0");
-        assert_eq!(text.primary[20], "0123456789abcdef");
+        assert_eq!(&text.primary[0], "row 0");
+        assert_eq!(&text.primary[20], "0123456789abcdef");
         e.process(b"\x1b[?1049h\x1b[Hfull screen app");
         let text = e.search_text();
         assert_eq!(text.primary.len(), 21);
-        assert_eq!(text.primary[20], "0123456789abcdef");
+        assert_eq!(&text.primary[20], "0123456789abcdef");
         assert_eq!(text.alternate.unwrap()[0], "full screen app");
         // Reading it changed nothing on screen.
         assert_eq!(
@@ -1679,6 +2038,190 @@ mod tests {
         assert!(e.alt_screen());
         e.process(b"\x1b[?1049l");
         assert_eq!(e.search_text().primary.len(), 21);
+    }
+
+    /// [`Emulator::search_text`] read from scratch (no reuse).
+    fn search_text_afresh(e: &mut Emulator) -> SearchText {
+        e.flush();
+        if !e.alt_screen() {
+            return SearchText {
+                primary: recent_lines(e.term.grid(), usize::MAX)
+                    .into_iter()
+                    .collect(),
+                alternate: None,
+            };
+        }
+        let alt = e.term.grid().clone();
+        let alternate = recent_lines(&alt, usize::MAX);
+        e.term.swap_alt();
+        let primary = recent_lines(e.term.grid(), usize::MAX)
+            .into_iter()
+            .collect();
+        e.term.swap_alt();
+        *e.term.grid_mut() = alt;
+        SearchText {
+            primary,
+            alternate: Some(alternate),
+        }
+    }
+
+    #[test]
+    fn search_text_reuses_history_and_matches_a_fresh_read_through_any_output() {
+        // A fixed xorshift: the same run every time.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut e = Emulator::new(12, 5, 30);
+        let mut counter = 0u32;
+        let (mut reused_reads, mut full_reads) = (0, 0);
+        for step in 0..3000 {
+            let op = next(100);
+            let mut out = String::new();
+            match op {
+                // Lines: short, wrapping, wide, blank.
+                0..=49 => {
+                    for _ in 0..=next(12) {
+                        counter += 1;
+                        match next(5) {
+                            0 => out.push_str(&format!(
+                                "{counter} {}\r\n",
+                                "w".repeat(next(30) as usize)
+                            )),
+                            1 => out.push_str(&format!(
+                                "{counter} \u{6f22}\u{5b57}\u{6f22}\u{5b57}\u{6f22}\u{5b57}\r\n"
+                            )),
+                            2 => out.push_str("\r\n"),
+                            3 => out.push_str(&format!("{counter}   \r\n")),
+                            _ => out.push_str(&format!("line {counter}\r\n")),
+                        }
+                    }
+                }
+                // A partial line, then an overwrite of it.
+                50..=57 => out.push_str(&format!("part {counter}\rPART")),
+                58..=61 => out.push_str(&format!("\x1b[{}S", 1 + next(8))),
+                62..=64 => out.push_str(&format!("\x1b[H\x1b[{}M", 1 + next(4))),
+                65..=68 => out.push_str(&format!(
+                    "\x1b[1;{}r\x1b[5;1Hregion {counter}\r\n\r\n",
+                    2 + next(3)
+                )),
+                69..=72 => out.push_str("\x1b[r\x1b[5;1H"),
+                73..=75 => out.push_str("\x1b[2J"),
+                76 => out.push_str("\x1b[3J"),
+                77 => out.push_str("\x1bc"),
+                78..=80 => out.push_str(&format!("\x1b[?1049h\x1b[Halt {counter}\r\nmore\r\n")),
+                81..=83 => out.push_str("\x1b[?1049l"),
+                84..=86 => out.push_str("\x1b[A\x1b[2Kup"),
+                87..=88 => {
+                    let (cols, rows) = (8 + next(8) as u16, 3 + next(5) as u16);
+                    e.resize(cols, rows);
+                }
+                // A flood: more than the history holds.
+                89..=90 => {
+                    for _ in 0..40 {
+                        counter += 1;
+                        out.push_str(&format!("flood {counter}\r\n"));
+                    }
+                }
+                _ => {}
+            }
+            e.process(out.as_bytes());
+            if next(3) == 0 || step % 50 == 0 {
+                let reused = e.search_text();
+                if e.history_lines() > e.history_text.read {
+                    reused_reads += 1;
+                } else if e.history_lines() > 0 {
+                    full_reads += 1;
+                }
+                let fresh = search_text_afresh(&mut e);
+                assert_eq!(reused, fresh, "step {step} (op {op}, {out:?})");
+            }
+        }
+        // Both paths ran, many times.
+        assert!(
+            reused_reads > 200 && full_reads > 50,
+            "{reused_reads} reused, {full_reads} full"
+        );
+    }
+
+    #[test]
+    fn search_text_reads_only_rows_scrolled_in_since_the_last_read() {
+        let mut e = Emulator::new(80, 24, 5000);
+        for i in 0..6000 {
+            e.process(format!("line {i} of a long build log\r\n").as_bytes());
+        }
+        let first = e.search_text();
+        assert_eq!(e.history_text.read, 5000);
+        assert_eq!(
+            first.primary.last().unwrap(),
+            "line 5999 of a long build log"
+        );
+        // Nothing new: nothing read (the screen is always read).
+        e.search_text();
+        assert_eq!(e.history_text.read, 0);
+        for i in 6000..6010 {
+            e.process(format!("line {i} of a long build log\r\n").as_bytes());
+        }
+        let text = e.search_text();
+        assert_eq!(e.history_text.read, 10);
+        assert_eq!(text, search_text_afresh(&mut e));
+        // 5000 history rows plus 23 screen rows above the empty cursor row.
+        assert_eq!(&text.primary[0], "line 987 of a long build log");
+        // A resize reflows: everything is read again.
+        e.resize(100, 24);
+        e.search_text();
+        assert!(e.history_text.read > 4000, "{}", e.history_text.read);
+    }
+
+    /// Timing of a search read over a full scrollback, from scratch and
+    /// reused: `cargo test --release -p flywheel-hub --lib
+    /// bench_search_text -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark: run by hand in release"]
+    fn bench_search_text() {
+        let mut e = Emulator::new(120, 40, DEFAULT_SCROLLBACK_LINES);
+        let line = |i: usize| {
+            format!(
+                "compiling crate foo v0.1.{i} (/src/foo) {}\r\n",
+                "x".repeat(i % 60)
+            )
+        };
+        for i in 0..6000 {
+            e.process(line(i).as_bytes());
+        }
+        let rounds = 50u32;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(search_text_afresh(&mut e));
+        }
+        let fresh = started.elapsed() / rounds;
+        let mut i = 6000;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            // About what a chatty build prints between two searches.
+            for _ in 0..100 {
+                e.process(line(i).as_bytes());
+                i += 1;
+            }
+            std::hint::black_box(e.search_text());
+        }
+        let reused = started.elapsed() / rounds;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            for _ in 0..100 {
+                e.process(line(i).as_bytes());
+                i += 1;
+            }
+        }
+        let printing = started.elapsed() / rounds;
+        eprintln!(
+            "search text over {DEFAULT_SCROLLBACK_LINES} lines: afresh {fresh:?}; after 100 new \
+             lines, reused {:?} (printing them alone {printing:?})",
+            reused.saturating_sub(printing)
+        );
     }
 
     #[test]
@@ -1696,6 +2239,9 @@ mod tests {
         assert_eq!(wide.history_lines(), HISTORY_CELL_BUDGET / 1000);
         wide.resize(2000, ROWS);
         assert!(wide.history_lines() <= HISTORY_CELL_BUDGET / 2000);
+        // What docs/hub.md sizes memory by (24 B a cell): a session's grid
+        // stays under the budget's bytes whatever it prints.
+        assert_eq!(std::mem::size_of::<Cell>(), 24);
     }
 
     #[test]

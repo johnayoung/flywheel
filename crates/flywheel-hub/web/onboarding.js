@@ -68,6 +68,30 @@ window.FwHubOnboarding = function (ctx) {
     }
   }
 
+  // Every listed file not imported yet, one after another (each its own
+  // workspace); stops at the first failure, which stays shown.
+  async function importAll(paths) {
+    if (ui.busy || !paths.length) return;
+    ui.busy = true;
+    ui.importError = "";
+    ctx.rerender();
+    let done = 0;
+    try {
+      for (const path of paths) {
+        const result = await api("POST", "/api/workspaces/import", { path, update: false });
+        if (!done) rememberWorkspace(result.workspace.id);
+        done += 1;
+      }
+    } catch (error) {
+      ui.importError = error.message;
+    } finally {
+      if (done) toast(`Imported ${plural(done, "workspace")}.`, { timeout: 5000 });
+      await refresh().catch(() => {});
+      ui.busy = false;
+      ctx.rerender();
+    }
+  }
+
   async function createFromFolder(raw) {
     const path = raw.trim();
     if (!path || ui.busy) return;
@@ -94,6 +118,7 @@ window.FwHubOnboarding = function (ctx) {
 
   function importCard() {
     const found = ui.scan;
+    const pending = found ? found.files.filter((f) => !f.error && !f.workspace_id).map((f) => f.path) : [];
     let list;
     if (ui.scanError) {
       list = el("p", { className: "first-run-note bad", textContent: ui.scanError });
@@ -163,6 +188,14 @@ window.FwHubOnboarding = function (ctx) {
             if (toggle && toggle.getAttribute("aria-expanded") !== "true") toggle.click();
           },
         }),
+        pending.length > 1 ? el("button", {
+          type: "button",
+          className: "slab",
+          textContent: `Import all ${pending.length}`,
+          title: "One workspace per file",
+          disabled: ui.busy,
+          onclick: () => importAll(pending),
+        }) : null,
         found ? el("button", {
           type: "button",
           className: "slab ghost",
@@ -246,7 +279,8 @@ window.FwHubOnboarding = function (ctx) {
     const typed = root.querySelector("#first-run-folder");
     const value = typed ? typed.value : "";
     const hadFocus = typed && document.activeElement === typed;
-    root.replaceChildren(importCard(), folderCard(), tour ? tourCard() : null);
+    // replaceChildren takes nodes only (a null would show as "null").
+    root.replaceChildren(importCard(), folderCard(), ...(tour ? [tourCard()] : []));
     const input = root.querySelector("#first-run-folder");
     if (input) {
       input.value = value;
@@ -261,7 +295,7 @@ window.FwHubOnboarding = function (ctx) {
     {
       keys: ["palette.open"],
       title: "Command palette",
-      body: "Every action, session, and workspace by name: start typing. Pressed inside it, the key goes to the terminal.",
+      body: "Every action, session, and workspace by name: start typing. Press the key again while the palette is open to send it to the terminal instead.",
     },
     {
       keys: ["session.new"],

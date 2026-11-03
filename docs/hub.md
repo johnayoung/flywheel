@@ -67,14 +67,14 @@ fw hub fanout ls | show FANOUT [-v] | wait FANOUT [--timeout SECS] | grade FANOU
 
 ## Doctor
 
-`fw hub doctor` checks what a hub here depends on and prints `ok | info | warn | FAIL` per finding, each with a `fix:`. Read-only: nothing is created, removed, or rewritten (the port is bound for a moment; programs are asked `--version`/`--help`; scripts found on PATH are read, never run).
+`fw hub doctor` checks what a hub here depends on and prints `ok | info | warn | FAIL` per finding, each with a `fix:`. Read-only: nothing is created, removed, rewritten, or locked (the port is bound for a moment; programs are asked `--version`/`--help`; scripts found on PATH are read, never run; the serve lock is seen in the recorded hub process's `/proc/<pid>/fdinfo`, never taken).
 
-- `fw` / `flywheel` on PATH: the first match must be this binary (same file or byte-identical copy). A script there (e.g. a Python venv's `fw` entry point ahead of `~/.cargo/bin`) is FAIL with its interpreter named; another flywheel build is warn; shadowed matches are listed.
+- `fw` / `flywheel` on PATH: the first match must be this binary (same file, a byte-identical copy, or its `fw`/`flywheel` sibling from the same install: same directory, written within 10 minutes, same size within 1%). A script there (e.g. a Python venv's `fw` entry point ahead of `~/.cargo/bin`) is FAIL with its interpreter named; another flywheel build is warn; shadowed matches are listed.
 - `hub`: the state dir's running hub (pid, version, binary; never trusts a stale `server.json`); a version other than this CLI's suggests `fw hub upgrade`.
-- `claude` / `codex`: found and `--version` answers; also resolved on the running hub's own PATH (`/proc/<pid>/environ`). `claude hooks`: `claude --settings <the hub's hook JSON> --version` is accepted and `fw hub report` runs.
+- `claude` / `codex`: found and `--version` answers; also resolved on the running hub's own PATH (`/proc/<pid>/environ`). `claude hooks`: the hub's hook JSON has Claude Code's hooks shape, `claude --settings <it> --version` takes it (claude only parses the JSON there; it checks hook entries when a session starts, so a Claude session turning `working` on its first prompt is the full proof), and `fw hub report` runs.
 - `state dir` (yours, mode 700, writable) and secrets (`token`, `logins.json`, `notify.toml`, `machines.json` not group/other readable).
 - `hub.toml` (parsed and resolved), `notify.toml`, `settings.json`, plugin manifests.
-- `port` (free, or this state dir's hub; a taken one suggests a free one), `tailscale` (installed, connected, `tailscale serve` for the port), `browser` (what `fw hub open` would run), `systemd --user` + `linger` (for `install-service`; WSL: `/etc/wsl.conf` `systemd=true`), `clock` (NTP sync; WSL drift fix), `disk` (free space at the state dir: warn < 2 GiB, fail < 512 MiB; log size).
+- `port` (free, or this state dir's hub; one taken by another flywheel hub is named as such; a taken one suggests a free one), `tailscale` (installed, connected, `tailscale serve` for the port), `browser` (what `fw hub open` would run), `systemd --user` + `linger` (for `install-service`; WSL: `/etc/wsl.conf` `systemd=true`), `clock` (NTP sync; WSL drift fix), `disk` (free space at the state dir: warn < 2 GiB, fail < 512 MiB; log size).
 
 ## Terminal client: `fw hub attach`
 
@@ -141,7 +141,7 @@ Every flag below but `--notify-url` and `--state-dir` is also a `hub.toml` key (
 | `--trusted-proxy` | none | proxy on another machine whose `X-Forwarded-*` are believed (loopback always is), so its clients are rate-limited per client, not as one address |
 | `--allow-origin` | none | extra browser origin accepted without being listed; same-origin always allowed |
 | `--notify-url` | none | ntfy-compatible push on blocked/done (below); overrides `url` in `<state-dir>/notify.toml` |
-| `--scrollback-lines` | `5000` | per-session scrollback; capped at 1M cells (lines x cols), so wide terminals keep fewer |
+| `--scrollback-lines` | `5000` | per-session scrollback; capped at 1M cells (lines x cols), so wide terminals keep fewer. Memory: 24 B per cell, so a full 5000 x 120 session holds ~14 MiB (50 such sessions ~700 MiB); lower it for many sessions |
 | `--worktree-branch-prefix` | none | session worktree branches are `<prefix><task>` (e.g. `agent/`) |
 | `--import-root` | `~/code` | where the UI's VS Code import looks for `*.code-workspace` (3 levels deep; hidden, `node_modules`/`target`/... and symlinked dirs skipped) |
 | `--record-part-cap` | `64MiB` | a recording part past it rotates (`64KiB`-`4GiB`; bytes or `KiB`/`MiB`/`GiB`) |

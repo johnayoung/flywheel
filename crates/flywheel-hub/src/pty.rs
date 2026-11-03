@@ -633,12 +633,9 @@ impl PtySession {
         self.lock().screen.text(source)
     }
 
-    /// Every line the terminal retains (see [`Emulator::search_text`]),
-    /// with the [`PtySession::output_bytes`] and size it reflects.
-    pub fn search_text(&self) -> (u64, (u16, u16), crate::vt::SearchText) {
-        let mut shared = self.lock();
-        let size = (shared.size.cols, shared.size.rows);
-        (shared.output_bytes, size, shared.screen.search_text())
+    /// Every line the terminal retains (see [`Emulator::search_text`]).
+    pub fn search_text(&self) -> crate::vt::SearchText {
+        self.lock().screen.search_text()
     }
 
     /// Hang up the session -- the leader's process group and every process

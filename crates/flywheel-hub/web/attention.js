@@ -3,12 +3,14 @@
 // blocked ones first (longest waiting first), then finished turns this
 // browser has not looked at (newest first), then flywheel tasks that
 // failed, stranded, stopped, or wait on a gate (flywheel.js; a folder
-// with many is one row, and alerts marked seen in its panel drop out).
-// Tap one to open it (a flywheel row opens its folder's Flywheel panel).
+// with many is one row, and alerts marked seen in its panel drop out),
+// and fan-outs whose graders finished since this browser looked
+// (fanout.js). Tap one to open it (a flywheel row opens its folder's
+// Flywheel panel, a fan-out row its board).
 "use strict";
 
 window.FwHubAttention = function (ctx) {
-  const { $, el, icon, age, state, workspaceById, agentStatus, openSession, flywheel } = ctx;
+  const { $, el, icon, age, state, workspaceById, agentStatus, openSession, flywheel, fanout } = ctx;
 
   // Agents that need this browser, most urgent first.
   function entries() {
@@ -122,14 +124,16 @@ window.FwHubAttention = function (ctx) {
   function render() {
     const list = entries();
     const loop = flywheel ? flywheel.attention() : [];
+    const graded = fanout ? fanout.attention() : [];
     for (const root of [$("#attention"), $("#empty-attention")]) {
       if (!root) continue;
-      root.hidden = list.length === 0 && loop.length === 0;
-      root.replaceChildren(...(list.length || loop.length ? content(list, loop) : []));
+      const any = list.length || loop.length || graded.length;
+      root.hidden = !any;
+      root.replaceChildren(...(any ? content(list, loop, graded) : []));
     }
   }
 
-  function content(list, loop) {
+  function content(list, loop, graded) {
     const blocked = list.filter((e) => e.agent.status === "blocked").length;
     const alerts = loop.reduce((n, e) => n + (e.count || 1), 0);
     return [
@@ -143,12 +147,13 @@ window.FwHubAttention = function (ctx) {
             blocked ? `${blocked} blocked` : "",
             list.length - blocked ? `${list.length - blocked} done` : "",
             alerts ? `${alerts} flywheel` : "",
+            graded.length ? `${graded.length} fan-out${graded.length === 1 ? "" : "s"}` : "",
           ]
             .filter(Boolean)
             .join(" / "),
         }),
       ),
-      el("ul", { className: "attn-list" }, list.map(row), loop.map(flywheelRow)),
+      el("ul", { className: "attn-list" }, list.map(row), graded.map((f) => fanout.attentionRow(f)), loop.map(flywheelRow)),
     ];
   }
 

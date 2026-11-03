@@ -200,6 +200,7 @@ function connectEvents() {
     // Anything that changed while the socket was down.
     refresh(false).catch(() => {});
     flywheel.reload();
+    fanout.reload();
   };
   socket.onmessage = (event) => {
     let message;
@@ -281,6 +282,8 @@ function onPush(message, machine) {
     flywheel.onEvent(message, machine);
   } else if (message.type === "layout") {
     onLayoutEvent(message);
+  } else if (message.type === "fanout" && !machine) {
+    fanout.onEvent(message);
   }
 }
 

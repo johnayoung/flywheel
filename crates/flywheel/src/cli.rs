@@ -353,11 +353,14 @@ pub fn route(
     }
     if verb == HUB_VERB {
         // The hub's Flywheel panel reads each adopted folder through this
-        // crate's store and snapshot code (the hub sits below it).
+        // crate's store and snapshot code, and fan-outs grade through core's
+        // command-grader runner (the hub sits below both).
         let extensions = flywheel_hub::cli::HubExtensions {
             flywheel: Some(std::sync::Arc::new(
                 crate::hub_flywheel::HubFlywheel::for_current_exe(),
             )),
+            // Verified fan-outs grade with flywheel-core's command graders.
+            graders: Some(std::sync::Arc::new(crate::hub_graders::CoreGraderRunner)),
         };
         return flywheel_hub::cli::run_with(rest, out, err, &extensions);
     }

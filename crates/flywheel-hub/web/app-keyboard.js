@@ -89,6 +89,7 @@ function paletteCommands() {
   search.paletteItems(cmd);
   commands.paletteItems(cmd);
   flywheel.paletteItems(cmd);
+  fanout.paletteItems(cmd);
   review.paletteItems(cmd);
   mobile.paletteItems(cmd);
   notify.paletteItems(cmd);
@@ -449,6 +450,10 @@ const actions = {
   "from-template": () => {
     document.body.classList.remove("side-open");
     openPalette("", launcher.templateItems(), "Launch from a template");
+  },
+  fanouts: () => {
+    document.body.classList.remove("side-open");
+    fanout.open();
   },
   "cycle-theme": () => applyTheme(THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]),
   logout,

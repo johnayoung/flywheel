@@ -322,6 +322,12 @@ impl Hub {
         })
     }
 
+    /// An agent session's status before seen tracking, and its spell (a
+    /// new spell of `done` is a new finished turn); `None` once untracked.
+    pub fn turn_state(&self, id: &str) -> Option<(AgentStatus, u64)> {
+        self.board().alert(id).map(|a| (a.status, a.spell))
+    }
+
     /// Every agent session's status and workspace rollup, for one client.
     pub fn status_snapshot(&self, client: &str) -> Snapshot {
         self.board().snapshot(Audience::Client(client))

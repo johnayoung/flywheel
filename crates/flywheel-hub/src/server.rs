@@ -57,6 +57,7 @@ mod auth;
 mod commands_api;
 mod detect_api;
 mod events_ws;
+mod fanout_api;
 mod flywheel_api;
 mod import_api;
 mod listen;
@@ -154,6 +155,9 @@ pub struct ServerOptions {
     pub flywheel: Option<Arc<crate::flywheel::FlywheelMonitor>>,
     /// The `git` and `gh` the review endpoints run.
     pub review_tools: crate::review::Tools,
+    /// Verified fan-outs (`/api/fanouts*`, the events socket's `fanout`
+    /// messages); `None` turns them off.
+    pub fanouts: Option<Arc<crate::fanout::Fanouts>>,
 }
 
 #[derive(Clone)]
@@ -261,6 +265,19 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/flywheel/panel", get(flywheel_api::panel))
         .route("/api/flywheel/run", get(flywheel_api::run_output))
         .route("/api/flywheel/worker", post(flywheel_api::start_worker))
+        .route(
+            "/api/fanouts",
+            get(fanout_api::list).post(fanout_api::create),
+        )
+        .route(
+            "/api/fanouts/{id}",
+            get(fanout_api::get_one).delete(fanout_api::remove),
+        )
+        .route("/api/fanouts/{id}/grade", post(fanout_api::grade))
+        .route("/api/fanouts/{id}/fix", post(fanout_api::fix))
+        .route("/api/fanouts/{id}/pick", post(fanout_api::pick))
+        .route("/api/fanouts/{id}/rebase", post(fanout_api::rebase))
+        .route("/api/fanouts/{id}/cleanup", post(fanout_api::cleanup))
         // Multiple machines: this hub's peers (remote side) and machines
         // (local side), and the proxy to them.
         .route("/api/whoami", get(proxy::whoami))

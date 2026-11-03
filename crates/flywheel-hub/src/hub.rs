@@ -330,6 +330,9 @@ pub enum HubEvent {
     Layout { workspace_id: String, rev: u64 },
     /// An agent session's token usage grew (re-read its usage).
     Usage { session_id: String },
+    /// A verified fan-out changed (launched, graded, picked, removed):
+    /// re-read it.
+    Fanout { id: String },
 }
 
 /// Facts about the server-owned PTY (present until the session is removed
@@ -402,6 +405,8 @@ pub struct Hub {
     detection: Arc<Detection>,
     /// Full-text search caches (see [`crate::search`]).
     search: crate::search::SearchIndex,
+    /// Pauses (a handoff) and stops (a shutdown) fan-out gradings.
+    grading: Arc<crate::fanout::GradingControl>,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -477,6 +482,7 @@ impl Hub {
             companion_lock: Mutex::new(()),
             detection: Arc::new(Detection::with_overrides(&options_state_dir)),
             search: crate::search::SearchIndex::default(),
+            grading: Arc::default(),
             _serve_lock: serve_lock,
         }))
     }
@@ -514,6 +520,11 @@ impl Hub {
     }
 
     /// Full-text search state.
+    /// What pauses and stops fan-out gradings (see [`crate::fanout`]).
+    pub fn grading(&self) -> &Arc<crate::fanout::GradingControl> {
+        &self.grading
+    }
+
     pub fn search_index(&self) -> &crate::search::SearchIndex {
         &self.search
     }
@@ -645,6 +656,8 @@ impl Hub {
     /// `timeout` for them to exit, and release their PTYs. (Stopped is
     /// recorded first: the hangup's own exit must not read as a crash.)
     pub fn shutdown(&self, timeout: Duration) {
+        // Graders running now are killed; they run again on the next start.
+        self.grading.stop();
         if let Some(mut server) = self
             .report
             .lock()

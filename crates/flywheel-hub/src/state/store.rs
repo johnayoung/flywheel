@@ -7,6 +7,7 @@ use super::{
     new_id, validate_folders, validate_name,
 };
 use crate::auth::write_private;
+use crate::fanout::{Fanout, MAX_FANOUTS};
 use crate::layout::{Layout, Tab};
 use crate::pty::ExitInfo;
 use chrono::Utc;
@@ -66,6 +67,7 @@ impl HubStore {
                 sessions,
                 layouts,
                 templates,
+                fanouts,
                 ..
             } = &mut doc;
             let before = layouts.len();
@@ -74,6 +76,9 @@ impl HubStore {
             let before = templates.len();
             templates.retain(|id, _| workspaces.iter().any(|w| &w.id == id));
             pruned |= templates.len() != before;
+            let before = fanouts.len();
+            fanouts.retain(|f| workspaces.iter().any(|w| w.id == f.workspace_id));
+            pruned |= fanouts.len() != before;
             for (workspace_id, layout) in layouts.iter_mut() {
                 let mut stale: Vec<String> = Vec::new();
                 for tab in &layout.tabs {
@@ -294,6 +299,7 @@ impl HubStore {
         self.doc.sessions.retain(|s| s.workspace_id != id);
         self.doc.layouts.remove(id);
         self.doc.templates.remove(id);
+        self.doc.fanouts.retain(|f| f.workspace_id != id);
         self.save_or_rollback(|doc| *doc = previous)?;
         Ok(removed)
     }
@@ -667,6 +673,78 @@ impl HubStore {
             let list = doc.templates.entry(workspace_id.to_owned()).or_default();
             list.insert(at.min(list.len()), removed);
         })
+    }
+
+    // --- fan-outs ------------------------------------------------------------
+
+    /// Every fan-out, oldest first.
+    pub fn fanouts(&self) -> &[Fanout] {
+        &self.doc.fanouts
+    }
+
+    pub fn fanout(&self, id: &str) -> Result<&Fanout, StateError> {
+        self.doc
+            .fanouts
+            .iter()
+            .find(|f| f.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("fan-out {id}")))
+    }
+
+    /// Record a new fan-out (its workspace must exist).
+    pub fn insert_fanout(&mut self, fanout: Fanout) -> Result<(), StateError> {
+        self.workspace(&fanout.workspace_id)?;
+        if self.doc.fanouts.iter().any(|f| f.id == fanout.id) {
+            return Err(StateError::Conflict(format!(
+                "fan-out {} exists already",
+                fanout.id
+            )));
+        }
+        if self.doc.fanouts.len() >= MAX_FANOUTS {
+            return Err(StateError::Conflict(format!(
+                "the hub keeps at most {MAX_FANOUTS} fan-outs; remove finished ones first \
+                 (fw hub fanout rm)"
+            )));
+        }
+        self.doc.fanouts.push(fanout);
+        self.save_or_rollback(|doc| {
+            doc.fanouts.pop();
+        })
+    }
+
+    /// Change fan-out `id` with `edit` and save (put back as it was when
+    /// the save fails).
+    pub fn update_fanout<R>(
+        &mut self,
+        id: &str,
+        edit: impl FnOnce(&mut Fanout) -> R,
+    ) -> Result<R, StateError> {
+        let index = self
+            .doc
+            .fanouts
+            .iter()
+            .position(|f| f.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("fan-out {id}")))?;
+        let previous = self.doc.fanouts[index].clone();
+        let result = edit(&mut self.doc.fanouts[index]);
+        if self.doc.fanouts[index] == previous {
+            return Ok(result);
+        }
+        self.save_or_rollback(|doc| doc.fanouts[index] = previous)?;
+        Ok(result)
+    }
+
+    /// Forget fan-out `id` (its sessions and worktrees are left alone).
+    pub fn remove_fanout(&mut self, id: &str) -> Result<Fanout, StateError> {
+        let index = self
+            .doc
+            .fanouts
+            .iter()
+            .position(|f| f.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("fan-out {id}")))?;
+        let removed = self.doc.fanouts.remove(index);
+        let kept = removed.clone();
+        self.save_or_rollback(|doc| doc.fanouts.insert(index, kept))?;
+        Ok(removed)
     }
 
     fn workspace_index(&self, id: &str) -> Result<usize, StateError> {

@@ -72,6 +72,9 @@ impl Hub {
             .is_none_or(|server| server.pause(left()));
         self.commands.stop();
         self.commands.save_all();
+        // Gradings running now are cut short and stay pending: whichever
+        // hub carries on runs them again.
+        self.grading.pause();
         // The next hub reads the state file from here on; what changes
         // meanwhile (a session exiting) is written on a thaw.
         let _ = self.store().set_read_only(true);
@@ -122,6 +125,7 @@ impl Hub {
         if let Err(e) = self.store().set_read_only(false) {
             eprintln!("fw hub: {e}");
         }
+        self.grading.resume();
         let live: Vec<Arc<PtySession>> = self.live().values().cloned().collect();
         for session in live {
             if forget_held {

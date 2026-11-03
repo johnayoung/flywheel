@@ -122,6 +122,10 @@ enum HubCommand {
     /// uncommitted changes, or the branch is not a fast-forward (--rebase
     /// rebases it onto the base first).
     Merge(crate::review_cli::MergeArgs),
+    /// Verified fan-out: one prompt to 2-6 agents in sibling worktrees cut
+    /// from one commit, graded by commands the hub runs out of band;
+    /// ranked board, pick the winner (merged into the base), clean up.
+    Fanout(crate::fanout_cli::FanoutArgs),
     /// Other hubs shown and proxied by this one: add, ls, rm, test.
     /// Every scripting verb but `url` takes --machine NAME to reach one.
     Machine(crate::machine_cli::MachineArgs),
@@ -353,12 +357,16 @@ pub fn main(args: &[String]) -> i32 {
 pub struct HubExtensions {
     /// Reads flywheel state for the Flywheel panel (`None`: no panel).
     pub flywheel: Option<Arc<dyn crate::flywheel::FlywheelProvider>>,
+    /// Runs verified fan-outs' graders (`None`: fan-outs cannot start or
+    /// grade).
+    pub graders: Option<Arc<dyn crate::fanout::GraderRunner>>,
 }
 
 impl std::fmt::Debug for HubExtensions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HubExtensions")
             .field("flywheel", &self.flywheel.is_some())
+            .field("graders", &self.graders.as_ref().map(|g| g.name()))
             .finish()
     }
 }
@@ -401,6 +409,7 @@ pub fn run_with(
         HubCommand::Search(args) => crate::search_cli::run(&args, out, err),
         HubCommand::Review(args) => crate::review_cli::review(&args, out, err),
         HubCommand::Merge(args) => crate::review_cli::merge(&args, out, err),
+        HubCommand::Fanout(args) => crate::fanout_cli::main(&args, out, err),
         // Routed before parsing (see `report_main`); reached only via help.
         HubCommand::Report(_) => 0,
         HubCommand::Start(args) => lifecycle::start(&args, out, err),
@@ -1122,12 +1131,23 @@ fn serve_cmd(
         }
         _ => None,
     };
+    let review_tools = crate::review::Tools::default();
+    let fanouts =
+        crate::fanout::Fanouts::new(&hub, extensions.graders.clone(), review_tools.clone());
+    let fanouts = match fanouts.start() {
+        Ok(()) => Some(fanouts),
+        Err(e) => {
+            let _ = writeln!(err, "fw hub: fan-outs off: {e}");
+            None
+        }
+    };
     let server_options = ServerOptions {
         allowed_origins,
         trusted_proxies: hub_args.trusted_proxies,
         notifier,
         flywheel,
-        review_tools: crate::review::Tools::default(),
+        review_tools,
+        fanouts,
     };
     let state_dir = hub.state_dir().to_path_buf();
     let result = runtime.block_on(serve_gated(

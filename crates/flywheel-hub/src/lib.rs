@@ -20,6 +20,8 @@ pub mod commands_cli;
 pub mod daemon;
 pub mod detect;
 pub mod endpoint;
+pub mod fanout;
+pub mod fanout_cli;
 pub mod flywheel;
 pub mod git;
 pub mod handoff;

@@ -99,11 +99,11 @@ fn templates_are_saved_replaced_removed_and_go_with_their_workspace() {
         store.save_template("nope", template("x", "opus"), false),
         Err(StateError::NotFound(_))
     ));
-    // Persisted (schema 3), and loaded back.
+    // Persisted (the current schema), and loaded back.
     drop(store);
     let raw: serde_json::Value =
         serde_json::from_slice(&fs::read(dir.path().join(STATE_FILE)).unwrap()).unwrap();
-    assert_eq!(raw["version"], 3);
+    assert_eq!(raw["version"], STATE_VERSION);
     assert_eq!(raw["templates"][&ws.id][1]["permission_mode"], "plan");
     let mut store = HubStore::open(dir.path()).unwrap();
     assert_eq!(names(&store).len(), 2);

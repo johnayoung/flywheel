@@ -349,12 +349,29 @@ const flywheel = window.FwHubFlywheel({
   focusTerminal: () => focusTerminal(),
 });
 
+// Verified fan-outs (fanout.js): one prompt to several agents in
+// worktrees, graded by the hub, ranked, the winner merged.
+const fanout = window.FwHubFanout({
+  $, el, icon, api, state, age, sessionById, workspaceById, folderLabel,
+  openSession: (id) => openSession(id),
+  openReview: async (id) => {
+    await openSession(id);
+    review.open(id);
+  },
+  toast: (...args) => commands.toast(...args),
+  refresh: () => refresh().catch(() => {}),
+  termSize: () => sizeHint(),
+  focusTerminal: () => focusTerminal(),
+  onChange: () => attention.render(),
+});
+
 // The phone and alerts modules (pwa.js, attention.js, notify.js,
 // mobile.js).
 const pwa = window.FwHubPwa();
 const attention = window.FwHubAttention({
   $, el, icon, age, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
   flywheel,
+  fanout,
 });
 const notify = window.FwHubNotify({
   $, state, store, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,

@@ -1,0 +1,262 @@
+/* flywheel hub -- Verified fan-out (fanout.js): the board, its candidate
+ * cards, the launch form, and the action sheet. A scoreboard: big rank
+ * numerals, a verdict stripe per card (pass = the loop's green, fail =
+ * alert, pending = brass), grader receipts as an instrument row.
+ * Loaded last (after app-priority.css), in index.html's order. */
+
+/* --- the board ---------------------------------------------------------- */
+
+.fo-sheet {
+  width: min(70rem, calc(100vw - 2rem));
+  height: calc(100dvh - 4rem);
+  display: none;
+  overflow: hidden;
+}
+.fo-sheet[open] { display: flex; flex-direction: column; }
+.fo-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin: 0; }
+.fo-head .sheet-kicker { color: var(--fw-ok); }
+.fo-title { display: grid; gap: .15rem; min-width: 0; }
+.fo-title h2 { overflow-wrap: anywhere; }
+.fo-sub { color: var(--ink-2); font-size: 11px; overflow-wrap: anywhere; }
+.fo-head-actions { display: flex; align-items: center; gap: .5rem; flex: none; }
+.fo-switch {
+  max-width: 16rem;
+  padding: .45rem .5rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 11px var(--mono);
+}
+.fo-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: grid;
+  align-content: start;
+  gap: .9rem;
+  padding: .9rem 1.4rem 1.4rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-2) transparent;
+}
+.fo-empty { color: var(--ink-2); margin: 2rem 0; }
+.fo-note { color: var(--ink-3); font-size: 10.5px; }
+.fo-error { margin: 0; color: var(--alert); font-size: 11.5px; overflow-wrap: anywhere; }
+
+.fo-graders { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .6rem; }
+.fo-grader {
+  max-width: 100%;
+  padding: .2rem .45rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 11px/1.4 var(--term);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fo-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6rem;
+  padding: .65rem .85rem;
+  border: 1px solid var(--rule-2);
+  border-left: 4px solid var(--fw-ok);
+  background: var(--bg-2);
+  font-size: 12px;
+}
+.fo-banner.lost { border-left-color: var(--alert); color: var(--ink-2); }
+
+/* --- candidate cards ---------------------------------------------------- */
+
+.fo-cards { list-style: none; margin: 0; padding: 0; display: grid; gap: .6rem; }
+.fo-card {
+  display: grid;
+  grid-template-columns: 3.4rem minmax(0, 1fr);
+  border: 1px solid var(--rule);
+  border-left: 4px solid var(--rule-2);
+  background: var(--bg-2);
+}
+.fo-card.pass { border-left-color: var(--fw-ok); }
+.fo-card.fail { border-left-color: var(--alert); }
+.fo-card.pending, .fo-card.stale { border-left-color: var(--brass); }
+.fo-card.winner { border-color: var(--fw-ok); box-shadow: 0 0 0 1px var(--fw-ok) inset; }
+.fo-card.gone { opacity: .55; }
+.fo-rank {
+  display: grid;
+  place-items: center;
+  border-right: 1px solid var(--rule);
+  background:
+    repeating-linear-gradient(0deg, var(--rule) 0 1px, transparent 1px 7px) right / 4px 100% no-repeat;
+  font: 800 2.4rem/1 var(--display);
+  color: var(--ink-3);
+}
+.fo-card.pass .fo-rank { color: var(--fw-ok); }
+.fo-card.winner .fo-rank { color: var(--fw-ok-ink); background: var(--fw-ok); }
+.fo-main { display: grid; gap: .4rem; padding: .6rem .8rem .7rem; min-width: 0; }
+.fo-line { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .55rem; min-width: 0; }
+.fo-label { font: 800 1.15rem/1 var(--display); letter-spacing: .03em; }
+.fo-line .glyph { display: inline-grid; place-items: center; width: 1rem; height: 1rem; }
+.fo-line .glyph svg { width: .85rem; height: .85rem; }
+.fo-agent { color: var(--ink); font-size: 11.5px; }
+.fo-session { color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
+.fo-verdict, .fo-phase {
+  padding: .1rem .4rem;
+  border-radius: 2px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.fo-verdict { background: var(--bg-4); color: var(--ink-2); }
+.fo-verdict.pass { background: var(--fw-ok); color: var(--fw-ok-ink); }
+.fo-verdict.fail { background: var(--alert); color: #fff; }
+.fo-verdict.pending, .fo-verdict.stale { background: var(--brass); color: var(--signal-ink); }
+.fo-card.winner .fo-verdict { background: var(--fw-ok); color: var(--fw-ok-ink); }
+.fo-phase { border: 1px solid var(--rule-2); color: var(--ink-3); }
+.fo-phase.working, .fo-phase.grading { color: var(--signal); border-color: var(--signal); }
+.fo-phase.blocked { color: var(--alert); border-color: var(--alert); }
+.fo-meta { display: flex; flex-wrap: wrap; align-items: center; gap: .25rem .9rem; color: var(--ink-2); font-size: 11px; }
+.fo-branch { display: inline-flex; align-items: center; gap: .3rem; min-width: 0; overflow-wrap: anywhere; }
+.fo-branch svg { width: .75rem; height: .75rem; flex: none; }
+.fo-diff { display: inline-flex; gap: .35rem; font-variant-numeric: tabular-nums; }
+.fo-diff .ins { color: var(--fw-ok); }
+.fo-diff .del { color: var(--alert); }
+.fo-cost, .fo-when { font-variant-numeric: tabular-nums; }
+.fo-why { margin: 0; padding: 0 0 0 1rem; display: grid; gap: .1rem; color: var(--ink); font-size: 11.5px; line-height: 1.45; }
+.fo-why li::marker { color: var(--ink-3); }
+
+.fo-rcpts { list-style: none; margin: 0; padding: 0; display: grid; gap: .2rem; }
+.fo-rcpt summary { cursor: pointer; list-style: none; }
+.fo-rcpt summary::-webkit-details-marker { display: none; }
+.fo-rcpt-line { display: flex; flex-wrap: wrap; align-items: center; gap: .2rem .5rem; font-size: 11px; min-width: 0; }
+.fo-rcpt-line b { font-weight: 600; overflow-wrap: anywhere; }
+.fo-rcpt-state { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.fo-rcpt-dot { width: .55rem; height: .55rem; border-radius: 50%; flex: none; background: var(--rule-2); }
+.fo-rcpt-dot.passed { background: var(--fw-ok); }
+.fo-rcpt-dot.failed, .fo-rcpt-dot.timeout, .fo-rcpt-dot.signal, .fo-rcpt-dot.spawn_failure { background: var(--alert); }
+.fo-rcpt-dot.skipped { background: transparent; border: 1px solid var(--ink-3); }
+.fo-rcpt details[open] .fo-rcpt-state { color: var(--ink-2); }
+.fo-rcpt.failed .fo-rcpt-line b, .fo-rcpt.timeout .fo-rcpt-line b { color: var(--alert); }
+.fo-out, .fo-cmds {
+  margin: .3rem 0 0;
+  max-height: 22rem;
+  overflow: auto;
+  padding: .55rem .7rem;
+  border: 1px solid var(--rule);
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 11.5px/1.45 var(--term);
+  font-variant-ligatures: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.fo-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .15rem; }
+.fo-actions .slab { padding: .4rem .7rem; }
+.fo-actions .slab:disabled { opacity: .4; }
+.slab.busy { cursor: progress; }
+
+.fo-prompt summary { cursor: pointer; color: var(--ink-3); font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; }
+.fo-prompt pre { margin: .4rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); font: 400 12px/1.5 var(--term); }
+.fo-foot { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: .5rem; padding-top: .4rem; border-top: 1px solid var(--rule); }
+.text-btn.danger { color: var(--alert); }
+
+/* --- the action sheet and losers --------------------------------------- */
+
+.fo-act { width: min(36rem, calc(100vw - 2rem)); }
+.fo-act form > *, .fo-act-body > * { min-width: 0; }
+.fo-act-body { display: grid; gap: .6rem; min-width: 0; }
+.fo-act .sheet-foot { flex-wrap: wrap; }
+.fo-plan { display: grid; gap: .3rem; }
+.fo-plan-summary { margin: 0; color: var(--ink); font-weight: 600; }
+.fo-plan-detail { margin: 0; color: var(--ink-2); font-size: 11.5px; overflow-wrap: anywhere; }
+.fo-plan-warn { margin: 0; color: var(--brass); font-size: 11.5px; }
+.fo-prompt-text { max-height: 18rem; }
+.fo-losers { list-style: none; margin: 0; padding: 0; display: grid; gap: .35rem; }
+.fo-losers li { display: grid; gap: .1rem; padding: .35rem .5rem; border: 1px solid var(--rule); background: var(--bg-2); font-size: 11.5px; }
+.fo-pickrow { display: flex; align-items: center; gap: .5rem; min-width: 0; }
+.fo-pickrow .fo-path { min-width: 0; }
+.fo-pickrow b { flex: none; }
+.fo-losers li > * { min-width: 0; overflow-wrap: anywhere; }
+.fo-path { color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
+.fo-loser-state { color: var(--fw-ok); font-size: 10.5px; }
+.fo-loser-state.keep { color: var(--brass); }
+.fo-force, .fo-check { display: flex; align-items: flex-start; gap: .5rem; color: var(--ink-2); font-size: 11.5px; line-height: 1.45; }
+
+/* --- the launch form ---------------------------------------------------- */
+
+.fo-new { width: min(46rem, calc(100vw - 2rem)); }
+.fo-two { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; }
+.fo-new textarea {
+  width: 100%;
+  padding: .6rem .7rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 12.5px/1.5 var(--term);
+  resize: vertical;
+}
+.fo-new textarea:focus, .fo-new select:focus { outline: none; border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-soft); }
+.fo-new select {
+  width: 100%;
+  padding: .55rem .6rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 12px var(--mono);
+}
+.fo-cands, .fo-grader-rows { list-style: none; margin: 0; padding: 0; display: grid; gap: .4rem; counter-reset: cand; }
+.fo-cand-row { display: grid; grid-template-columns: 1.6rem 7rem minmax(0, 1fr) 1.6rem; align-items: center; gap: .4rem; counter-increment: cand; }
+.fo-cand-row::before { content: "c" counter(cand); color: var(--ink-3); font-size: 10.5px; }
+.fo-grader-row { display: grid; grid-template-columns: 8rem minmax(0, 1fr) 1.6rem; align-items: center; gap: .4rem; }
+.fo-cand-row input, .fo-grader-row input {
+  width: 100%;
+  padding: .55rem .6rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 12px var(--term);
+}
+.fo-cand-row input:focus, .fo-grader-row input:focus { outline: none; border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-soft); }
+.fo-more summary { cursor: pointer; color: var(--ink-3); font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; }
+.fo-more[open] { display: grid; gap: .8rem; }
+
+/* --- Needs you ---------------------------------------------------------- */
+
+.attn-row.fo { border-left-color: var(--alert); }
+.attn-row.fo.pass { border-left-color: var(--fw-ok); }
+.attn-row .glyph.fo svg { width: .85rem; height: .85rem; color: var(--fw-ok); }
+.attn-status.fo { background: var(--alert); color: #fff; }
+.attn-status.fo.pass { background: var(--fw-ok); color: var(--fw-ok-ink); }
+
+/* The sidebar's buttons: Fan-out shares the second row. */
+.side-actions [data-action="fanouts"] { grid-column: span 1; }
+
+/* --- phones ------------------------------------------------------------- */
+
+@media (max-width: 760px) {
+  .fo-sheet, .fo-new { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; margin: 0; border-radius: 0; }
+  .fo-head { flex-direction: column; }
+  .fo-head-actions { flex-wrap: wrap; }
+  .fo-head-actions { width: 100%; }
+  .fo-switch { flex: 1; max-width: none; }
+  .fo-body { padding: .7rem .8rem 1.2rem; }
+  .fo-card { grid-template-columns: 2.4rem minmax(0, 1fr); }
+  .fo-rank { font-size: 1.7rem; }
+  .fo-two { grid-template-columns: 1fr; }
+  .fo-cand-row { grid-template-columns: 1.6rem 5.5rem minmax(0, 1fr) 2.75rem; }
+  .fo-grader-row { grid-template-columns: 5.5rem minmax(0, 1fr) 2.75rem; }
+}
+@media (pointer: coarse), (max-width: 760px) {
+  .fo-actions .slab, .fo-head-actions .slab, .fo-head-actions .icon { min-height: 44px; min-width: 44px; }
+  .fo-actions .slab { flex: 1 1 auto; }
+  .fo-rcpt summary { min-height: 32px; display: flex; align-items: center; }
+  .fo-cand-row .icon, .fo-grader-row .icon { min-height: 44px; min-width: 44px; }
+}

@@ -28,6 +28,7 @@
 <link rel="stylesheet" href="/assets/app-search.css">
 <link rel="stylesheet" href="/assets/app-machines.css">
 <link rel="stylesheet" href="/assets/app-priority.css">
+<link rel="stylesheet" href="/assets/app-fanout.css">
 </head>
 <body>
 <svg class="sprite" aria-hidden="true" focusable="false">
@@ -88,6 +89,7 @@
       <button type="button" class="slab" data-action="new-session" title="New session (Alt N)"><svg><use href="#i-plus"/></svg>Session</button>
       <button type="button" class="slab ghost" data-action="new-workspace" title="New workspace (Alt Shift N)"><svg><use href="#i-plus"/></svg>Workspace</button>
       <button type="button" class="slab ghost" id="from-template" data-action="from-template" title="New agent from a saved template" hidden><svg><use href="#i-plus"/></svg>From template</button>
+      <button type="button" class="slab ghost" data-action="fanouts" title="Verified fan-out: one prompt to several agents, graded and ranked"><svg><use href="#i-branch"/></svg>Fan-out</button>
     </div>
     <footer class="side-foot">
       <button type="button" class="chip" data-action="palette" title="Command palette">
@@ -553,6 +555,7 @@
 <script src="/assets/import.js"></script>
 <script src="/assets/pwa.js"></script>
 <script src="/assets/flywheel.js"></script>
+<script src="/assets/fanout.js"></script>
 <script src="/assets/attention.js"></script>
 <script src="/assets/notify.js"></script>
 <script src="/assets/mobile.js"></script>

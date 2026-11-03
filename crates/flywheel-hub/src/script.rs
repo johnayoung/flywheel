@@ -715,7 +715,7 @@ pub(crate) fn query_escape(raw: &str) -> String {
 /// directory) that is one of its folders, else a folder's label or
 /// directory name (unique). A path naming none of them is passed on for
 /// the hub to refuse.
-fn pick_folder(workspace: &Value, query: &Path) -> Result<PathBuf, String> {
+pub(crate) fn pick_folder(workspace: &Value, query: &Path) -> Result<PathBuf, String> {
     let folders = folders_of(workspace);
     let path = absolute(query)?;
     if folders.iter().any(|f| f.path == path) {

@@ -170,6 +170,9 @@ async fn events_pump(
                             .await
                             .is_ok()
                     }
+                    Ok(HubEvent::Fanout { id }) => {
+                        socket.send(text(json!({ "type": "fanout", "id": id }))).await.is_ok()
+                    }
                     Ok(HubEvent::Layout { workspace_id, rev }) => {
                         socket.send(text(json!({ "type": "layout", "workspace_id": workspace_id, "rev": rev }))).await.is_ok()
                     }

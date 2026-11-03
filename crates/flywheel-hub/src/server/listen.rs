@@ -26,6 +26,10 @@ use tower::ServiceExt;
 /// How long a client has to send a complete request head, and how long an
 /// idle keep-alive connection is kept.
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a stopping server waits for requests in flight before it lets
+/// their connections go (a client that never finishes must not hold the
+/// hub's exit past `fw hub stop`'s wait).
+pub const CLOSE_GRACE: Duration = Duration::from_secs(10);
 /// Bounds of [`connection_cap`].
 const MIN_CONNECTIONS: usize = 16;
 const MAX_CONNECTIONS: usize = 1024;
@@ -70,7 +74,7 @@ pub fn raise_fd_limit() {
 
 /// Serve `app` on `listener` until `shutdown` resolves; then set `closing`
 /// (WebSockets watch it), let in-flight requests finish, and return once
-/// every connection task has.
+/// every connection task has, or after [`CLOSE_GRACE`].
 pub async fn run(
     mut listener: GatedListener,
     app: Router,
@@ -135,5 +139,5 @@ pub async fn run(
     drop(listener);
     let _ = closing.send(true);
     drop(done_tx);
-    let _ = done_rx.recv().await;
+    let _ = tokio::time::timeout(CLOSE_GRACE, done_rx.recv()).await;
 }

@@ -270,7 +270,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api", any(api_not_found))
         .method_not_allowed_fallback(api_method_not_allowed)
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
-    Router::new()
+    // Reachable without a credential: a body must arrive whole, small, and
+    // soon, so a client trickling one cannot hold a connection slot (or a
+    // handoff's or shutdown's wait for requests to settle) indefinitely.
+    let public = Router::new()
         .route("/", get(index))
         .route("/login", get(login_query).post(login_form))
         .route("/logout", post(logout))
@@ -278,6 +281,11 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/assets/{*path}", get(asset))
         .route("/manifest.webmanifest", get(pwa::manifest))
         .route("/sw.js", get(pwa::service_worker))
+        .route_layer(middleware::from_fn_with_state(
+            BodyBound::PUBLIC,
+            bound_body,
+        ));
+    public
         .merge(protected)
         .layer(middleware::from_fn_with_state(state.clone(), origin_guard))
         .layer(middleware::from_fn(security_headers))
@@ -323,6 +331,60 @@ pub async fn serve_gated(
     listen::run(listener, app, listen::connection_cap(), shutdown_signal, tx).await;
     let _ = tokio::task::spawn_blocking(move || hub.shutdown(SHUTDOWN_TIMEOUT)).await;
     Ok(())
+}
+
+// --- bounded bodies ---------------------------------------------------------
+
+/// How much body a request may send, and how long it has to send it all.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BodyBound {
+    pub limit: usize,
+    pub timeout: Duration,
+}
+
+impl BodyBound {
+    /// The unauthenticated routes: a login form is a few hundred bytes.
+    /// Shorter than the handoff's freeze wait ([`crate::handoff`]) and
+    /// [`listen::CLOSE_GRACE`], so a slow client never makes either give up.
+    pub const PUBLIC: Self = Self {
+        limit: 4 * 1024,
+        timeout: Duration::from_secs(5),
+    };
+}
+
+/// Middleware: read the whole body within `bound` (408 when too slow, 413
+/// when too big; the connection closes either way), then hand the handler
+/// the buffered bytes.
+pub(crate) async fn bound_body(
+    State(bound): State<BodyBound>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let read = tokio::time::timeout(bound.timeout, axum::body::to_bytes(body, bound.limit)).await;
+    let refused = match read {
+        Ok(Ok(bytes)) => {
+            return next
+                .run(axum::extract::Request::from_parts(
+                    parts,
+                    axum::body::Body::from(bytes),
+                ))
+                .await;
+        }
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            "the request body was too slow\n",
+        ),
+        Ok(Err(_)) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the request body is too large\n",
+        ),
+    };
+    let mut response = refused.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    response
 }
 
 // --- auth -------------------------------------------------------------------
@@ -2040,6 +2102,89 @@ mod tests {
         let own = client("10.0.0.5:5000", "10.0.0.5:7420", None, &options);
         assert!(own.same_machine && !own.trusted_peer);
     }
+    /// Serve `bound_body` over `bound` on a real socket; send a head
+    /// promising `length` bytes, then `body` (one byte at a time, `pause`
+    /// apart, or at once); return the status line.
+    async fn bounded(bound: BodyBound, length: usize, body: &[u8], pause: Duration) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let app = Router::new()
+            .route(
+                "/login",
+                post(|body: Bytes| async move { body.len().to_string() }),
+            )
+            .route_layer(middleware::from_fn_with_state(bound, bound_body));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The hub's own accept loop (its hyper settings decide the close).
+        let listener = crate::handoff::GatedListener::new(listener, crate::handoff::Gate::new());
+        let (closing, _) = watch::channel(false);
+        tokio::spawn(listen::run(
+            listener,
+            app,
+            4,
+            std::future::pending(),
+            closing,
+        ));
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+        let head = format!(
+            "POST /login HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: {length}\r\n\r\n"
+        );
+        write.write_all(head.as_bytes()).await.unwrap();
+        let body = body.to_vec();
+        // The trickle goes on while the answer is read (as a slow client's).
+        let writer = tokio::spawn(async move {
+            if pause.is_zero() {
+                let _ = write.write_all(&body).await;
+                return write;
+            }
+            for byte in body {
+                if write.write_all(&[byte]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(pause).await;
+            }
+            write
+        });
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), read.read_to_end(&mut answer)).await;
+        writer.abort();
+        String::from_utf8_lossy(&answer)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_trickled_public_body_times_out_and_closes() {
+        let bound = BodyBound {
+            limit: 4096,
+            timeout: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        // 100 bytes promised, one sent every 100 ms: over the deadline.
+        let status = bounded(bound, 100, &[b'a'; 100], Duration::from_millis(100)).await;
+        assert!(status.contains("408"), "{status}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        // A prompt body passes through whole.
+        let ok = bounded(bound, 5, b"token", Duration::ZERO).await;
+        assert!(ok.contains("200"), "{ok}");
+        // Too big is refused before the handler.
+        let big = bounded(bound, 5000, &[b'a'; 5000], Duration::ZERO).await;
+        assert!(big.contains("413"), "{big}");
+    }
+
+    #[test]
+    fn the_public_body_deadline_is_inside_the_settle_waits() {
+        assert!(BodyBound::PUBLIC.timeout < crate::handoff::FREEZE_TIMEOUT);
+        assert!(BodyBound::PUBLIC.timeout < listen::CLOSE_GRACE);
+    }
+
     /// A peer revoked after its credential was checked but before its
     /// socket's watch existed still has that socket closed.
     #[tokio::test]

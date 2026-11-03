@@ -86,7 +86,7 @@ const MAX_BIN: usize = 512 * 1024 * 1024;
 /// Most descriptors one frame carries.
 const MAX_FDS: usize = 4;
 /// How long the old hub may take to freeze.
-const FREEZE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const FREEZE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long either side waits for the other's next step (the new hub may
 /// ask for less: `fw hub upgrade --timeout`).
 const STEP_TIMEOUT: Duration = Duration::from_secs(60);

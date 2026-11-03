@@ -711,6 +711,11 @@ fn a_settled_fan_out_tells_plugins_once_with_its_ranked_board() {
         ])
         .trim()
         .to_owned();
+    // `wait` follows the events socket until the fan-out settles.
+    let waited: Value =
+        serde_json::from_str(&env.ok(&["fanout", "wait", &id, "--timeout", "60", "--json"]))
+            .unwrap();
+    assert_eq!(waited["settled"], true, "{waited}");
     let board = env.board_until(&id, "both graded and settled", |b| {
         graded(b, "c1", 1) && graded(b, "c2", 1) && b["settled"] == true
     });

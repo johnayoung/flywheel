@@ -346,8 +346,11 @@ impl Endpoint {
     }
 
     /// Run `future` to completion on this endpoint's own runtime (never
-    /// from inside an async context).
-    fn block_on<F: std::future::Future>(&self, future: F) -> Result<F::Output, String> {
+    /// from inside an async context). Every call on one endpoint must use
+    /// this runtime: its HTTP client pools connections that are bound to
+    /// the runtime that opened them (another runtime's call reusing one
+    /// hangs until its timeout).
+    pub fn block_on<F: std::future::Future>(&self, future: F) -> Result<F::Output, String> {
         let runtime = match self.blocking.get() {
             Some(runtime) => runtime,
             None => {

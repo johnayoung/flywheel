@@ -724,16 +724,13 @@ async fn wait_settled(
 fn wait(args: &WaitArgs, out: &mut dyn Write) -> Result<i32, String> {
     let conn = Endpoint::resolve(&args.endpoint)?;
     let (id, _) = find(&conn, &args.fanout)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("cannot start the hub client: {e}"))?;
-    let end = runtime.block_on(async {
+    // On the endpoint's runtime: `find` left a pooled connection bound to it.
+    let end = conn.block_on(async {
         let deadline = args
             .timeout
             .map(|secs| tokio::time::Instant::now() + Duration::from_secs(secs));
         wait_settled(&conn, &id, deadline).await
-    });
+    })?;
     match end {
         WaitEnd::Settled(view) => {
             if args.json {

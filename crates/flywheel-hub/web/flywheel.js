@@ -421,8 +421,9 @@ window.FwHubFlywheel = function (ctx) {
     ctx.onOpen();
     renderDrawer();
     $("#flywheel").focus({ preventScroll: true });
-    loadPanel();
+    const loaded = loadPanel();
     changed();
+    return loaded;
   }
 
   function close() {
@@ -605,11 +606,26 @@ window.FwHubFlywheel = function (ctx) {
     });
   }
 
-  // "Run with worker here" from elsewhere (a promoted fan-out): the
-  // folder's panel, then its Start worker.
-  function startWorkerIn(folder, workspaceId) {
-    open(folder, workspaceId);
+  // "Run fw worker here" from elsewhere (a promoted fan-out): the
+  // folder's panel, then its Start worker -- once the panel is read, so a
+  // worker already holding leases there (one started outside the hub
+  // too) is asked about first.
+  async function startWorkerIn(folder, workspaceId) {
+    await open(folder, workspaceId);
     return startWorker();
+  }
+
+  // The active tasks in `folder` not verified yet, other than `except`:
+  // what `fw worker` there drains besides it (it takes no task).
+  async function pendingTasks(folder, except) {
+    const panel = await api("GET", `${via(folder)}/api/flywheel/panel?folder=${encodeURIComponent(pathOf(folder))}`);
+    const ids = [];
+    for (const phase of panel.phases || []) {
+      for (const t of phase.tasks || []) {
+        if (t.id !== except && t.state !== "verified" && !ids.includes(t.id)) ids.push(t.id);
+      }
+    }
+    return ids;
   }
 
   function graderChips(graders) {
@@ -1039,5 +1055,6 @@ window.FwHubFlywheel = function (ctx) {
     isOpen: () => !!ui.folder,
     openRun,
     startWorkerIn,
+    pendingTasks,
   };
 };

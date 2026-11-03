@@ -410,6 +410,7 @@ const fanoutTask = window.FwHubFanoutTask({
     fanout.close();
     return flywheel.startWorkerIn(folder, workspaceId);
   },
+  pendingTasks: (folder, except) => flywheel.pendingTasks(folder, except),
   onPromoted: () => fanout.reload(),
 });
 

@@ -122,10 +122,10 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 
 - **Promote**: goal (`--goal`, else the seeding task's, else the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, the winner's commit -> a reference. Written through core's task loader; refused for an existing file, id, or an id with runs.
 - `--protect` paths become constraints only: only flywheel.toml `[submit] protected_paths` refuses a landing, and the hub never edits flywheel.toml.
-- The file is left **uncommitted** in the main checkout; then **Run with worker here**. `fw worker` drains every active task, so others may run first.
+- The file is left **uncommitted** in the main checkout; then **Run fw worker here**. `fw worker` takes no task: it drains every active task, so others may run first (the dialog lists them).
 - **Fan out this task** (Flywheel panel): prompt from the task's goal and context; graders = its command graders plus its **held-out** graders, added server-side. A task with no command grader is refused; an unreadable held-out registry fails closed.
 - Held-out graders never reach an agent through the hub: a prompt naming one is refused, and Ask to fix says only that a held-out check failed. Not a sandbox (agents run as you).
-- Promoting a task-seeded fan-out offers **Run `<task>` with worker here**; a new task needs `--task-id`.
+- Promoting a task-seeded fan-out offers **Run fw worker here** (the task is already durable); a new task needs `--task-id`.
 
 ## Flywheel panel
 

@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -98,6 +98,22 @@ pub struct ReportServer {
     path: PathBuf,
     stopping: Arc<AtomicBool>,
     accept: Option<JoinHandle<()>>,
+    listener: Arc<UnixListener>,
+    control: Arc<Control>,
+}
+
+/// Pausing the server for a live handoff, and whether stopping it removes
+/// the socket file.
+#[derive(Debug)]
+struct Control {
+    /// Held while a connection is accepted and its handler counted, so a
+    /// pause sees every accepted report.
+    paused: Mutex<bool>,
+    in_flight: Mutex<usize>,
+    idle: Condvar,
+    /// [`ReportServer::stop`] removes the socket file (off while another
+    /// hub process may own it).
+    unlink: AtomicBool,
 }
 
 impl std::fmt::Debug for ReportServer {
@@ -132,16 +148,53 @@ impl ReportServer {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
         }
+        Self::serve(path, listener, handler, false, true)
+    }
+
+    /// Serve an already listening socket at `path` (one a live handoff
+    /// passed over), paused or not; stopping it never removes the file
+    /// until [`ReportServer::set_unlink`] says so.
+    pub(crate) fn adopt(
+        path: PathBuf,
+        listener: UnixListener,
+        handler: Arc<Handler>,
+        paused: bool,
+    ) -> Result<Self, ReportError> {
+        Self::serve(path, listener, handler, paused, false)
+    }
+
+    fn serve(
+        path: PathBuf,
+        listener: UnixListener,
+        handler: Arc<Handler>,
+        paused: bool,
+        unlink: bool,
+    ) -> Result<Self, ReportError> {
+        let io = |source| ReportError::Io {
+            path: path.clone(),
+            source,
+        };
+        let listener = Arc::new(listener);
+        let control = Arc::new(Control {
+            paused: Mutex::new(paused),
+            in_flight: Mutex::new(0),
+            idle: Condvar::new(),
+            unlink: AtomicBool::new(unlink),
+        });
         let stopping = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stopping);
+        let accepting = Arc::clone(&listener);
+        let accept_control = Arc::clone(&control);
         let accept = std::thread::Builder::new()
             .name("hub-report".into())
-            .spawn(move || accept_loop(listener, handler, stop_flag))
+            .spawn(move || accept_loop(&accepting, handler, &stop_flag, &accept_control))
             .map_err(io)?;
         Ok(Self {
             path,
             stopping,
             accept: Some(accept),
+            listener,
+            control,
         })
     }
 
@@ -149,8 +202,52 @@ impl ReportServer {
         &self.path
     }
 
-    /// Stop accepting and remove the socket file. Does not depend on the
-    /// socket file still existing (a removed state dir must not wedge it).
+    /// The listening socket's descriptor (valid while the server lives).
+    pub(crate) fn listener_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.listener.as_raw_fd()
+    }
+
+    /// Stop accepting reports (connections wait in the backlog) and wait
+    /// up to `timeout` for the ones being handled; returns whether they
+    /// all finished. Undone by [`ReportServer::resume`].
+    pub(crate) fn pause(&self, timeout: Duration) -> bool {
+        *self
+            .control
+            .paused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = true;
+        let in_flight = self
+            .control
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (in_flight, _) = self
+            .control
+            .idle
+            .wait_timeout_while(in_flight, timeout, |n| *n > 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        *in_flight == 0
+    }
+
+    pub(crate) fn resume(&self) {
+        *self
+            .control
+            .paused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = false;
+    }
+
+    /// Whether [`ReportServer::stop`] (and dropping it) removes the
+    /// socket file.
+    pub(crate) fn set_unlink(&self, unlink: bool) {
+        self.control.unlink.store(unlink, Ordering::SeqCst);
+    }
+
+    /// Stop accepting and remove the socket file (unless another hub
+    /// process owns it, see [`ReportServer::set_unlink`]). Does not depend
+    /// on the socket file still existing (a removed state dir must not
+    /// wedge it).
     pub fn stop(&mut self) {
         if self.stopping.swap(true, Ordering::SeqCst) {
             return;
@@ -158,7 +255,9 @@ impl ReportServer {
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
-        let _ = std::fs::remove_file(&self.path);
+        if self.control.unlink.load(Ordering::SeqCst) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -173,8 +272,18 @@ impl Drop for ReportServer {
 /// socket -- `<tmp>/flywheel-hub-<uid>/<digest of state_dir>.sock`, in a
 /// directory this user owns and nobody else can enter (created 0700).
 pub fn socket_path(state_dir: &Path) -> std::io::Result<PathBuf> {
+    private_socket_path(state_dir, SOCKET_FILE, "")
+}
+
+/// [`socket_path`] for another of the state dir's sockets: `file` in it,
+/// or `<digest><suffix>.sock` in the private temp dir.
+pub(crate) fn private_socket_path(
+    state_dir: &Path,
+    file: &str,
+    suffix: &str,
+) -> std::io::Result<PathBuf> {
     use std::os::unix::ffi::OsStrExt;
-    let direct = state_dir.join(SOCKET_FILE);
+    let direct = state_dir.join(file);
     if direct.as_os_str().as_bytes().len() <= MAX_SOCKET_PATH {
         return Ok(direct);
     }
@@ -182,7 +291,7 @@ pub fn socket_path(state_dir: &Path) -> std::io::Result<PathBuf> {
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(state_dir.as_os_str().as_bytes());
         let hex: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
-        format!("{hex}.sock")
+        format!("{hex}{suffix}.sock")
     };
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
@@ -239,25 +348,66 @@ fn readable(listener: &UnixListener) -> bool {
     ready > 0 && fd.revents & libc::POLLIN != 0
 }
 
-fn accept_loop(listener: UnixListener, handler: Arc<Handler>, stopping: Arc<AtomicBool>) {
+fn accept_loop(
+    listener: &UnixListener,
+    handler: Arc<Handler>,
+    stopping: &AtomicBool,
+    control: &Arc<Control>,
+) {
     // Poll rather than block in accept, so `stop` never needs to connect.
     while !stopping.load(Ordering::SeqCst) {
-        if !readable(&listener) {
+        if !readable(listener) {
+            continue;
+        }
+        let paused = control
+            .paused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *paused {
+            // Paused for a handoff: the connection waits in the backlog
+            // for whichever hub carries on.
+            drop(paused);
+            std::thread::sleep(STOP_POLL);
             continue;
         }
         let Ok((stream, _)) = listener.accept() else {
+            drop(paused);
             std::thread::sleep(ACCEPT_BACKOFF);
             continue;
         };
+        *control
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        drop(paused);
         // Accepted sockets must block (the listener's mode is not inherited
         // on every platform, but be explicit).
         let _ = stream.set_nonblocking(false);
         let handler = Arc::clone(&handler);
+        let finished = Arc::clone(control);
         let spawned = std::thread::Builder::new()
             .name("hub-report-conn".into())
-            .spawn(move || serve_connection(stream, &*handler));
-        // Out of threads: the report is lost, the hub carries on.
-        drop(spawned);
+            .spawn(move || {
+                serve_connection(stream, &*handler);
+                finished.finish();
+            });
+        if spawned.is_err() {
+            // Out of threads: the report is lost, the hub carries on.
+            control.finish();
+        }
+    }
+}
+
+impl Control {
+    fn finish(&self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *in_flight = in_flight.saturating_sub(1);
+        if *in_flight == 0 {
+            self.idle.notify_all();
+        }
     }
 }
 

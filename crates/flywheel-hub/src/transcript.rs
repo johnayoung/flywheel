@@ -781,6 +781,21 @@ impl CommandBook {
         }
     }
 
+    /// Save every loaded session's log now, with where reading stopped (a
+    /// live handoff: the next hub process reads on from there).
+    pub(crate) fn save_all(&self) {
+        let entries: Vec<Arc<Mutex<SessionCommands>>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect();
+        for entry in entries {
+            entry.lock().unwrap_or_else(PoisonError::into_inner).save();
+        }
+    }
+
     /// Stop the watcher (it exits at its next wake).
     pub fn stop(&self) {
         self.wake

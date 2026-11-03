@@ -63,6 +63,10 @@ pub(crate) struct StartArgs {
     /// Seconds to wait for the hub to be serving.
     #[arg(long, value_name = "SECS", default_value_t = 30)]
     timeout: u64,
+    /// Take over from the running hub without ending its sessions (live
+    /// handoff to this binary; `fw hub upgrade` runs this).
+    #[arg(long)]
+    handoff: bool,
 }
 
 pub(crate) fn start(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -73,6 +77,14 @@ pub(crate) fn start(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) 
 }
 
 fn start_daemon(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
+    if args.handoff {
+        return Ok(crate::upgrade::start_handoff(
+            &args.hub,
+            Duration::from_secs(args.timeout),
+            out,
+            err,
+        ));
+    }
     // Refuse bad options here, not in a log nobody is reading.
     args.hub.public_url_origins()?;
     let dir = prepare_state_dir(&args.hub.state)?;

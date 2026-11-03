@@ -25,6 +25,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+/// Handing the board to another hub process (a live handoff).
+#[path = "handoff/status_side.rs"]
+pub(crate) mod handoff;
+
 /// Longest status detail kept (characters).
 pub const MAX_DETAIL_CHARS: usize = 200;
 

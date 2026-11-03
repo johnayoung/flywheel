@@ -340,12 +340,21 @@ impl WorkspaceInput {
 pub struct HubStore {
     path: PathBuf,
     doc: StateDoc,
+    /// Changes stay in memory (a live handoff: another hub process owns
+    /// the file from the freeze on).
+    read_only: bool,
 }
 
 impl HubStore {
     /// Load `state.json` from `state_dir` (empty when absent), demoting
     /// sessions left `running` to `stopped`.
     pub fn open(state_dir: &Path) -> Result<Self, StateError> {
+        Self::open_keeping(state_dir, &HashSet::new())
+    }
+
+    /// [`HubStore::open`], except that the sessions in `live` stay
+    /// `running`: a live handoff brings their processes along.
+    pub fn open_keeping(state_dir: &Path, live: &HashSet<String>) -> Result<Self, StateError> {
         let path = state_dir.join(STATE_FILE);
         let persist_err = |message: String| StateError::Persist {
             path: path.clone(),
@@ -413,7 +422,7 @@ impl HubStore {
         let now = Utc::now();
         let mut demoted = false;
         for session in &mut doc.sessions {
-            if session.state.is_running() {
+            if session.state.is_running() && !live.contains(&session.id) {
                 session.state = SessionState::Stopped {
                     at: now,
                     clean: false,
@@ -423,14 +432,31 @@ impl HubStore {
                 demoted = true;
             }
         }
-        let store = Self { path, doc };
+        let store = Self {
+            path,
+            doc,
+            read_only: false,
+        };
         if demoted || migrated || pruned {
             store.save()?;
         }
         Ok(store)
     }
 
+    /// Keep changes in memory only (`true`), or write them again
+    /// (`false`, saving what changed meanwhile).
+    pub(crate) fn set_read_only(&mut self, read_only: bool) -> Result<(), StateError> {
+        let was = std::mem::replace(&mut self.read_only, read_only);
+        if was && !read_only {
+            self.save()?;
+        }
+        Ok(())
+    }
+
     fn save(&self) -> Result<(), StateError> {
+        if self.read_only {
+            return Ok(());
+        }
         let bytes = serde_json::to_vec_pretty(&self.doc).map_err(|e| StateError::Persist {
             path: self.path.clone(),
             message: e.to_string(),

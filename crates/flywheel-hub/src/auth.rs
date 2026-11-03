@@ -73,6 +73,11 @@ impl Token {
         random_hex(TOKEN_BYTES).map(Self)
     }
 
+    /// A secret handed over by another hub process (a live handoff).
+    pub(crate) fn from_secret(secret: String) -> Self {
+        Self(secret)
+    }
+
     /// The token text (for the login URL and `fw hub token`).
     pub fn expose(&self) -> &str {
         &self.0

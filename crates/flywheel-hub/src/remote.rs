@@ -97,6 +97,29 @@ fn open_lock_file(state_dir: &Path) -> std::io::Result<std::fs::File> {
 }
 
 impl ServeLock {
+    /// The lock file's descriptor (a live handoff passes it on: the lock
+    /// belongs to the open file, so the next hub process holds it too).
+    #[cfg(unix)]
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self._file.as_raw_fd()
+    }
+
+    /// Hold the lock through a descriptor another hub process passed over.
+    /// Refused when it is not locked by this open file (taking it would
+    /// race a third hub).
+    pub(crate) fn adopt(file: std::fs::File) -> std::io::Result<Self> {
+        // Locking an open file that holds the lock already succeeds; one
+        // that does not (and the lock is someone else's) would block.
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::other(
+                "the handed-over serve lock is held by another hub",
+            )),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
     /// Take the lock; `None` when another hub holds it.
     pub fn acquire(state_dir: &Path) -> std::io::Result<Option<Self>> {
         let file = open_lock_file(state_dir)?;

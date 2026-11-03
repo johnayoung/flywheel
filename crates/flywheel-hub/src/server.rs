@@ -239,9 +239,32 @@ pub async fn serve(
     options: ServerOptions,
     shutdown_signal: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    let listener = crate::handoff::GatedListener::new(listener, crate::handoff::Gate::new());
+    serve_gated(listener, hub, options, shutdown_signal).await
+}
+
+/// [`serve`] behind a live-handoff [`crate::handoff::Gate`]: while a
+/// handoff has the hub frozen, connections wait in the backlog and
+/// requests get 503; a shutdown signal waits for a handoff under way.
+pub async fn serve_gated(
+    listener: crate::handoff::GatedListener,
+    hub: Arc<Hub>,
+    options: ServerOptions,
+    shutdown_signal: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let (tx, rx) = watch::channel(false);
-    let app = router(Arc::clone(&hub), options, rx);
+    let gate = listener.gate().clone();
+    let app = router(Arc::clone(&hub), options, rx).layer(middleware::from_fn_with_state(
+        gate.clone(),
+        crate::handoff::gate_requests,
+    ));
     listen::raise_fd_limit();
+    let shutdown_signal = async move {
+        shutdown_signal.await;
+        // A handoff under way finishes (exiting this process) or rolls
+        // back first.
+        gate.handoff_settled().await;
+    };
     listen::run(listener, app, listen::connection_cap(), shutdown_signal, tx).await;
     let _ = tokio::task::spawn_blocking(move || hub.shutdown(SHUTDOWN_TIMEOUT)).await;
     Ok(())

@@ -28,6 +28,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
+/// Handing the hub's live state to another hub process (a live handoff).
+#[path = "handoff/hub_side.rs"]
+pub(crate) mod handoff;
+
 /// SIGHUP-to-SIGKILL grace when killing a session.
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
 /// Hub-wide event broadcast depth; a subscriber further behind resyncs.
@@ -386,11 +390,27 @@ impl Hub {
                 });
             }
         };
+        let store = HubStore::open(&options.state_dir)?;
+        let hub = Self::assemble(options, serve_lock, store, StatusBoard::default())?;
+        let server = ReportServer::bind(&hub.options.state_dir, hub.report_handler())?;
+        *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
+        crate::transcript::spawn_watcher(&hub);
+        git::spawn_watcher(&hub);
+        Ok(hub)
+    }
+
+    /// The hub over an opened store and status board, holding the serve
+    /// lock; no report server or watchers yet.
+    fn assemble(
+        options: HubOptions,
+        serve_lock: ServeLock,
+        store: HubStore,
+        board: StatusBoard,
+    ) -> Result<Arc<Self>, HubError> {
         let token = Token::load_or_create(&options.state_dir)?;
         let logins = Logins::load(&options.state_dir, unix_now());
-        let store = HubStore::open(&options.state_dir)?;
         let (events, _) = broadcast::channel(EVENT_DEPTH);
-        let hub = Arc::new(Self {
+        Ok(Arc::new(Self {
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),
                 options.codex_home.clone(),
@@ -404,26 +424,23 @@ impl Hub {
             login_changes: tokio::sync::watch::Sender::new(0),
             store: Mutex::new(store),
             live: Mutex::new(HashMap::new()),
-            board: Mutex::new(StatusBoard::default()),
+            board: Mutex::new(board),
             events,
             report: Mutex::new(None),
             monitored: Mutex::new(HashMap::new()),
             git: GitWatch::default(),
             companion_lock: Mutex::new(()),
             _serve_lock: serve_lock,
-        });
-        let weak = Arc::downgrade(&hub);
-        let server = ReportServer::bind(
-            &hub.options.state_dir,
-            Arc::new(move |report: Report| match weak.upgrade() {
-                Some(hub) => hub.handle_report(report),
-                None => Err("the hub is shutting down".into()),
-            }),
-        )?;
-        *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
-        crate::transcript::spawn_watcher(&hub);
-        git::spawn_watcher(&hub);
-        Ok(hub)
+        }))
+    }
+
+    /// What the report server hands each report to.
+    fn report_handler(self: &Arc<Self>) -> Arc<report::Handler> {
+        let weak = Arc::downgrade(self);
+        Arc::new(move |report: Report| match weak.upgrade() {
+            Some(hub) => hub.handle_report(report),
+            None => Err("the hub is shutting down".into()),
+        })
     }
 
     /// The report socket agent sessions send status to.

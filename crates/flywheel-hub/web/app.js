@@ -210,6 +210,8 @@
     }
     if (session.state === "exited") {
       if (session.signal) return { dot: "bad", label: session.signal, tone: "bad" };
+      // Code unknown: it exited after a live handoff (not our child).
+      if (session.code == null) return { dot: "done", label: "exited", tone: "" };
       return session.code === 0
         ? { dot: "done", label: "done", tone: "" }
         : { dot: "bad", label: `exit ${session.code}`, tone: "bad" };
@@ -218,7 +220,8 @@
     return { dot: "stopped", label: "stopped", tone: "" };
   }
 
-  const exitHow = (info) => (info.signal ? `killed by ${info.signal}` : `exit code ${info.code}`);
+  const exitHow = (info) =>
+    info.signal ? `killed by ${info.signal}` : info.code == null ? "exit code unknown" : `exit code ${info.code}`;
 
   // Why a session has no terminal on this hub.
   function goneText(session) {

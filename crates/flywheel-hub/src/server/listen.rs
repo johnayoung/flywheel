@@ -9,6 +9,7 @@
 //! * [`raise_fd_limit`] lifts the soft `RLIMIT_NOFILE` to the hard one.
 
 use super::Peer;
+use crate::handoff::GatedListener;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -19,7 +20,6 @@ use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, watch};
 use tower::ServiceExt;
 
@@ -68,23 +68,11 @@ pub fn raise_fd_limit() {
     let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) };
 }
 
-/// Accept errors that concern one connection only (retry at once); any
-/// other (EMFILE, ENFILE, ENOBUFS) backs off a moment, as `axum::serve`
-/// does.
-fn connection_error(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::ConnectionReset
-    )
-}
-
 /// Serve `app` on `listener` until `shutdown` resolves; then set `closing`
 /// (WebSockets watch it), let in-flight requests finish, and return once
 /// every connection task has.
 pub async fn run(
-    listener: TcpListener,
+    mut listener: GatedListener,
     app: Router,
     cap: usize,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -101,15 +89,10 @@ pub async fn run(
             },
             () = &mut shutdown => break,
         };
+        // Accept errors are retried (or backed off) inside; a frozen gate
+        // (a live handoff) leaves connections in the backlog.
         let (stream, remote) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(e) if connection_error(&e) => continue,
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-            },
+            accepted = axum::serve::Listener::accept(&mut listener) => accepted,
             () = &mut shutdown => break,
         };
         let peer = Peer {

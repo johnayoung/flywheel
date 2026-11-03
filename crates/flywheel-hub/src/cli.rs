@@ -11,7 +11,7 @@ use crate::remote::{
     LoginTarget, RuntimeInfo, Tailscale, detect_tailscale, interface_addresses, login_targets,
     normalize_public_url, qr_lines, tailscale_program,
 };
-use crate::server::{ServerOptions, code_login_url, serve};
+use crate::server::{ServerOptions, code_login_url, serve_gated};
 use crate::{browser, lifecycle, script};
 use chrono::{SecondsFormat, Utc};
 use clap::{Parser, Subcommand};
@@ -47,6 +47,10 @@ enum HubCommand {
     /// Stop the running hub gracefully; its running sessions are recorded
     /// stopped and come back on the next start.
     Stop(lifecycle::StopArgs),
+    /// Replace the running hub with a new process (binary) without ending
+    /// any session: a live handoff of every terminal, its screen, and its
+    /// state. Exit code 0 handed off, 4 refused (nothing changed).
+    Upgrade(crate::upgrade::UpgradeArgs),
     /// Is the hub running: pid, uptime, URL, workspace and session counts.
     /// Exit code 0 running, 3 not running, 1 running but unreachable.
     Status(lifecycle::StatusArgs),
@@ -156,6 +160,11 @@ struct ServeArgs {
     /// `fw hub url` mints one (`install-service` passes it).
     #[arg(long, hide = true)]
     no_login_code: bool,
+    /// Take over from the hub running for this state dir without ending
+    /// its sessions (live handoff; `fw hub upgrade` runs this). Its
+    /// listening socket is kept, so --bind/--port are ignored.
+    #[arg(long)]
+    handoff: bool,
 }
 
 /// How the hub serves: shared by `serve`, `start`, and `install-service`.
@@ -358,6 +367,7 @@ pub fn run_with(
         HubCommand::Report(_) => 0,
         HubCommand::Start(args) => lifecycle::start(&args, out, err),
         HubCommand::Stop(args) => lifecycle::stop(&args, out, err),
+        HubCommand::Upgrade(args) => crate::upgrade::upgrade(&args, out, err),
         HubCommand::Status(args) => lifecycle::status(&args, out, err),
         HubCommand::Logs(args) => lifecycle::logs(&args, out, err),
         HubCommand::InstallService(args) => lifecycle::install_service(&args, out, err),
@@ -825,7 +835,22 @@ fn serve_cmd(
     // its whole life (a second would overwrite the first's runtime file and
     // report socket, leaving `url` / `token --rotate` and agent hooks unable
     // to reach the first).
-    let hub = match Hub::open(options) {
+    let serve_args = hub_args.to_argv(
+        &std::path::absolute(&options.state_dir).unwrap_or_else(|_| options.state_dir.clone()),
+    );
+    let mut taken_over = None;
+    let opened = if args.handoff {
+        match crate::upgrade::take_over(options, err) {
+            Ok((hub, taken)) => {
+                taken_over = Some(taken);
+                Ok(hub)
+            }
+            Err(code) => return code,
+        }
+    } else {
+        Hub::open(options)
+    };
+    let hub = match opened {
         Ok(hub) => hub,
         Err(HubError::InUse(dir)) => {
             let at = RuntimeInfo::read(&dir)
@@ -857,7 +882,11 @@ fn serve_cmd(
         }
     };
     let bind = SocketAddr::new(hub_args.bind, hub_args.port);
-    let listener = match runtime.block_on(tokio::net::TcpListener::bind(bind)) {
+    let listening = match taken_over.as_mut() {
+        Some(taken) => taken.listener(&runtime),
+        None => runtime.block_on(tokio::net::TcpListener::bind(bind)),
+    };
+    let listener = match listening {
         Ok(listener) => listener,
         Err(e) => {
             let _ = writeln!(err, "fw hub: cannot listen on {bind}: {e}");
@@ -898,7 +927,13 @@ fn serve_cmd(
             }
         }
     };
-    if hub_args.no_restore {
+    if let Some(taken) = taken_over.take() {
+        // Sessions came along running: nothing to restore.
+        if let Err(message) = taken.finish(&hub, out) {
+            let _ = writeln!(err, "fw hub: {message}");
+            return 1;
+        }
+    } else if hub_args.no_restore {
         match hub.forgo_restore() {
             Ok(0) => {
                 let _ = writeln!(out, "session restore off (--no-restore)");
@@ -942,6 +977,28 @@ fn serve_cmd(
     }
     let _ = out.flush();
 
+    let gate = crate::handoff::Gate::new();
+    let handoff_server = {
+        use std::os::fd::AsRawFd;
+        crate::handoff::HandoffServer::start(crate::handoff::Source {
+            hub: Arc::clone(&hub),
+            gate: gate.clone(),
+            listener_fd: listener.as_raw_fd(),
+            listen: local,
+            serve_args,
+            log_file: args.log_file.clone(),
+        })
+    };
+    let handoff_server = match handoff_server {
+        Ok(server) => Some(server),
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "fw hub: live handoff off (`fw hub upgrade` will restart instead): {e}"
+            );
+            None
+        }
+    };
     // Written last: `fw hub start` treats it as the hub being ready.
     let runtime_info = RuntimeInfo {
         pid: std::process::id(),
@@ -1011,12 +1068,15 @@ fn serve_cmd(
         flywheel,
     };
     let state_dir = hub.state_dir().to_path_buf();
-    let result = runtime.block_on(serve(
-        listener,
+    let result = runtime.block_on(serve_gated(
+        crate::handoff::GatedListener::new(listener, gate),
         Arc::clone(&hub),
         server_options,
         shutdown.wait(),
     ));
+    if let Some(server) = &handoff_server {
+        server.remove();
+    }
     // Still under the serve lock (the hub holds it until dropped).
     RuntimeInfo::remove_if_owned(&state_dir, runtime_info.pid);
     drop(hub);

@@ -656,6 +656,7 @@ mod tests {
 
     #[test]
     fn the_process_start_is_no_later_than_anything_this_process_did() {
+        #[cfg(target_os = "linux")]
         let earlier = std::time::Instant::now();
         let before = Utc::now();
         std::thread::sleep(Duration::from_millis(30));

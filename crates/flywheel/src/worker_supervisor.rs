@@ -897,6 +897,7 @@ pub(crate) mod test_support {
     //! the ownership / quit-path behaviour is exercised without launching a
     //! real daemon.
 
+    #[cfg(target_os = "linux")]
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -927,6 +928,7 @@ pub(crate) mod test_support {
     /// A child that ignores SIGTERM and spawns a grandchild that does too,
     /// writing the grandchild's pid to `pidfile`. Only the escalation to
     /// SIGKILL (which cannot be caught) can end them.
+    #[cfg(target_os = "linux")]
     pub fn ignore_term_with_child_argv(pidfile: &Path) -> Vec<String> {
         let script = format!(
             "trap '' TERM\nsh -c 'trap \"\" TERM; sleep 300' &\necho $! > '{}'\nsleep 300\n",
@@ -961,6 +963,7 @@ pub(crate) mod test_support {
         !process_alive(pid)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn read_pid(pidfile: &Path, timeout: Duration) -> u32 {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {

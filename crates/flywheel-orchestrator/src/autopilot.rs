@@ -3197,6 +3197,7 @@ sleep 60"#;
 
     /// Records a graceful SIGTERM, and leaves a grandchild that ignores
     /// SIGTERM (an MCP server / Bash tool child stand-in).
+    #[cfg(target_os = "linux")]
     const PROCESS_TREE_BODY: &str = r#"init
 trap 'echo graceful > terminated.marker; exit 143' TERM
 (trap '' TERM; exec sleep 300) &
@@ -3205,6 +3206,7 @@ sleep 60 &
 wait $!"#;
 
     /// Gone, or a zombie awaiting its reaper (Linux `/proc`).
+    #[cfg(target_os = "linux")]
     fn process_gone(pid: &str) -> bool {
         match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat
@@ -3218,6 +3220,7 @@ wait $!"#;
     /// The deadline reached the agent through the runtime (a graceful
     /// SIGTERM the fake recorded, not a bare drop) and the whole tree,
     /// SIGTERM-ignoring grandchild included, is dead.
+    #[cfg(target_os = "linux")]
     async fn assert_tree_terminated(dir: &Path) {
         assert!(
             dir.join("terminated.marker").exists(),

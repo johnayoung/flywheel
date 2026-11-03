@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 /// A fake `claude --output-format stream-json`: records its argv (NUL
@@ -285,6 +286,7 @@ fn usage_errors_exit_two_with_empty_stdout() {
 }
 
 /// Gone, or a zombie awaiting its reaper (Linux `/proc`).
+#[cfg(target_os = "linux")]
 fn process_gone(pid: &str) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat

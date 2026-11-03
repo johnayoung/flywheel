@@ -8,10 +8,10 @@
 //! thread refreshes (on agent status reports and on a slow timer), so
 //! listing sessions never runs git.
 
+use crate::review::runner;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
@@ -127,57 +127,52 @@ pub struct Removed {
 }
 
 fn plural(n: u32, word: &str) -> String {
-    format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+    crate::util::plural(n as usize, word)
 }
 
-/// Run `git -C dir args...`: its trimmed stdout, or its stderr as the
-/// error. Never prompts (no terminal, no credential helpers asking).
+/// How long one git call may take: a hung network filesystem or a stuck
+/// lock must not hang a worktree's creation or the badge watcher.
+const GIT_TIMEOUT: Duration = Duration::from_secs(300);
+/// stdout kept per call.
+const GIT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Run `git -C dir args...` through the review runner (bounded in time
+/// and output, never prompting, at most a few at once): its trimmed
+/// stdout, or its stderr as the error.
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|e| format!("cannot run git: {e}"))?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .trim_end()
-            .to_owned())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let message = stderr
-            .lines()
-            .map(|l| {
-                l.trim()
-                    .trim_start_matches("fatal: ")
-                    .trim_start_matches("error: ")
-            })
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join("; ");
-        Err(if message.is_empty() {
-            format!("git {} failed ({})", args.join(" "), output.status)
-        } else {
-            message
-        })
+    let mut full = vec!["-C".to_owned(), dir.to_string_lossy().into_owned()];
+    full.extend(args.iter().map(|a| (*a).to_owned()));
+    let output = runner::run(&runner::Spec {
+        program: "git",
+        // `-C` names the directory, so a missing one is git's error.
+        dir: Path::new("/"),
+        args: full,
+        stdin: None,
+        timeout: GIT_TIMEOUT,
+        limit: GIT_OUTPUT_LIMIT,
+    })
+    .map_err(|e| format!("cannot run git: {e}"))?;
+    if output.success() {
+        return Ok(output.stdout_text().trim_end().to_owned());
     }
+    if output.timed_out {
+        return Err(format!(
+            "git {} timed out after {}s",
+            args.join(" "),
+            GIT_TIMEOUT.as_secs()
+        ));
+    }
+    let message = output.error_text().replace('\n', "; ");
+    Err(if message.is_empty() {
+        format!("git {} failed ({:?})", args.join(" "), output.code)
+    } else {
+        message
+    })
 }
 
 /// Whether `git -C dir args...` succeeds (its output discarded).
 fn git_ok(dir: &Path, args: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    git(dir, args).is_ok()
 }
 
 /// Check a task name: it becomes a directory and (after the prefix) a
@@ -235,34 +230,98 @@ pub fn validate_prefix(raw: &str) -> Result<String, String> {
     Ok(prefix.to_owned())
 }
 
+/// The main working tree of the repository `dir` belongs to, and whether
+/// that is a bare repository. From the main checkout itself: its top
+/// directory (wherever the git dir lives, as with `--separate-git-dir`).
+/// From a linked worktree: the directory holding the `.git` the worktree
+/// shares, else the git dir of a bare repository, else `core.worktree`.
+/// A linked worktree of a repository whose git dir is kept apart from its
+/// checkout is refused: git records no way back to that checkout (`git
+/// worktree list` names the git dir there, not the folder).
+pub fn main_worktree(dir: &Path) -> Result<(PathBuf, bool), String> {
+    let not_git = |e: String| format!("{} is not a git repository: {e}", dir.display());
+    let out = git(
+        dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .map_err(not_git)?;
+    let mut lines = out.lines().map(|l| {
+        let path = PathBuf::from(l.trim());
+        path.canonicalize().unwrap_or(path)
+    });
+    let (Some(git_dir), Some(common)) = (lines.next(), lines.next()) else {
+        return Err(not_git("git named no git dir".into()));
+    };
+    let bare = |config: &Path| {
+        git(
+            dir,
+            &[
+                "config",
+                "-f",
+                &config.to_string_lossy(),
+                "--bool",
+                "--get",
+                "core.bare",
+            ],
+        )
+        .is_ok_and(|v| v == "true")
+    };
+    let config = common.join("config");
+    if git_dir == common {
+        if bare(&config) {
+            return Ok((common, true));
+        }
+        let top = git(dir, &["rev-parse", "--show-toplevel"]).map_err(not_git)?;
+        let top = PathBuf::from(top);
+        return Ok((top.canonicalize().unwrap_or(top), false));
+    }
+    if common.file_name().is_some_and(|n| n == ".git") {
+        let main = common
+            .parent()
+            .ok_or_else(|| format!("git dir {} has no parent", common.display()))?;
+        return Ok((main.to_path_buf(), false));
+    }
+    if bare(&config) {
+        return Ok((common, true));
+    }
+    if let Ok(worktree) = git(
+        dir,
+        &[
+            "config",
+            "-f",
+            &config.to_string_lossy(),
+            "--get",
+            "core.worktree",
+        ],
+    ) {
+        let worktree = common.join(worktree);
+        return Ok((worktree.canonicalize().unwrap_or(worktree), false));
+    }
+    Err(format!(
+        "cannot find the main checkout of {}: its git dir {} is kept apart from the checkout (--separate-git-dir), and git records no way back to it",
+        dir.display(),
+        common.display()
+    ))
+}
+
 /// The main checkout of the repo `repo` belongs to (also for a linked
 /// worktree), as `(parent dir, repo name)`: worktrees go to
 /// `<parent>/<name>.worktrees/`. A bare main repo (`x.git`) counts as `x`.
 fn main_checkout(repo: &Path) -> Result<(PathBuf, String), String> {
-    let common = git(
-        repo,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .map_err(|e| format!("{} is not a git repository: {e}", repo.display()))?;
-    let common = PathBuf::from(common);
-    let common = common.canonicalize().unwrap_or(common);
-    let (root, name) = if common.file_name().is_some_and(|n| n == ".git") {
-        let root = common
-            .parent()
-            .ok_or_else(|| format!("git dir {} has no parent", common.display()))?
-            .to_path_buf();
-        let name = root
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .ok_or_else(|| format!("repo {} has no name", root.display()))?;
-        (root, name)
+    let (root, bare) = main_worktree(repo)?;
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("repo {} has no name", root.display()))?;
+    let name = if bare {
+        name.strip_suffix(".git").unwrap_or(&name).to_owned()
     } else {
-        let name = common
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .ok_or_else(|| format!("git dir {} has no name", common.display()))?;
-        let name = name.strip_suffix(".git").unwrap_or(&name).to_owned();
-        (common.clone(), name)
+        name
     };
     let parent = root
         .parent()
@@ -299,11 +358,7 @@ pub fn linked_worktree_main(dir: &Path) -> Option<PathBuf> {
     if git_dir == common {
         return None;
     }
-    if common.file_name().is_some_and(|n| n == ".git") {
-        common.parent().map(Path::to_path_buf)
-    } else {
-        Some(common)
-    }
+    main_worktree(dir).ok().map(|(main, _)| main)
 }
 
 /// Resolve a new worktree for `task` in `repo` without creating it: the
@@ -877,7 +932,7 @@ mod tests {
     use super::*;
 
     fn run(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        let status = std::process::Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -916,6 +971,69 @@ mod tests {
         assert_eq!(linked_worktree_main(&linked), Some(main.clone()));
         assert_eq!(linked_worktree_main(&main.join("sub-missing")), None);
         assert_eq!(linked_worktree_main(tmp.path()), None);
+    }
+
+    /// `git init --separate-git-dir`: the git dir lives elsewhere (not
+    /// named `.git`); worktrees still go beside the folder, and a linked
+    /// one names the folder as its main checkout.
+    #[test]
+    fn a_separate_git_dir_keeps_worktrees_beside_the_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("gitdirs").join("proj.git");
+        let folder = tmp.path().join("sep").join("proj");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        run(
+            &folder,
+            &[
+                "init",
+                "-q",
+                "-b",
+                "main",
+                "--separate-git-dir",
+                store.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(folder.join("README"), "hi\n").unwrap();
+        run(&folder, &["add", "README"]);
+        run(&folder, &["commit", "-q", "-m", "init"]);
+        let folder = folder.canonicalize().unwrap();
+        let sep = folder.parent().unwrap().to_path_buf();
+        assert_eq!(worktrees_dir(&folder).unwrap(), sep.join("proj.worktrees"));
+        let plan = plan(&folder, "t1", "", None).unwrap();
+        assert_eq!(plan.path, sep.join("proj.worktrees").join("t1"));
+        let wt = create(&folder, &plan).unwrap();
+        assert_eq!(main_worktree(&folder).unwrap(), (folder.clone(), false));
+        // From the linked worktree git cannot tell where the folder is:
+        // refused, never the git dir taken for it.
+        let err = main_worktree(&wt.path).unwrap_err();
+        assert!(err.contains("separate-git-dir"), "{err}");
+        assert_eq!(linked_worktree_main(&wt.path), None);
+        assert!(super::plan(&wt.path, "t2", "", None).is_err());
+    }
+
+    #[test]
+    fn a_bare_repos_worktrees_go_beside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = repo(tmp.path());
+        let bare = tmp.path().join("srv").join("app.git");
+        std::fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        run(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                src.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        );
+        let bare = bare.canonicalize().unwrap();
+        assert_eq!(main_worktree(&bare).unwrap(), (bare.clone(), true));
+        assert_eq!(
+            worktrees_dir(&bare).unwrap(),
+            bare.parent().unwrap().join("app.worktrees")
+        );
     }
 
     #[test]

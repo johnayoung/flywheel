@@ -8,7 +8,7 @@
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -186,32 +186,6 @@ fn drain(mut from: impl Read, limit: usize) -> (Vec<u8>, bool) {
         }
     }
     (kept, truncated)
-}
-
-/// Whether `program` can be found: a path that exists, or a name on
-/// `PATH`.
-pub fn find_program(program: &str) -> Option<PathBuf> {
-    if program.contains('/') {
-        let path = PathBuf::from(program);
-        return is_executable(&path).then_some(path);
-    }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        path.metadata()
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
 }
 
 /// Run `spec` to its end or its deadline.
@@ -438,8 +412,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, RunError::NotFound("fw-hub-no-such-program".into()));
         assert!(err.to_string().contains("not installed"));
-        assert!(find_program("fw-hub-no-such-program").is_none());
-        assert!(find_program("sh").is_some());
     }
 
     #[test]

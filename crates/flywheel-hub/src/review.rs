@@ -1639,19 +1639,12 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
 
 /// The main checkout of the repository `dir` belongs to.
 fn main_checkout(git: &Git<'_>) -> Result<PathBuf, String> {
-    let list = git.out(&["worktree", "list", "--porcelain"])?;
-    let mut blocks = list.split("\n\n");
-    let first = blocks.next().unwrap_or_default();
-    if first.lines().any(|l| l == "bare") {
-        return Err(
-            "the repository's main checkout is bare: there is no checkout to merge in".into(),
-        );
+    match crate::git::main_worktree(git.dir)? {
+        (_, true) => {
+            Err("the repository's main checkout is bare: there is no checkout to merge in".into())
+        }
+        (main, false) => Ok(main),
     }
-    first
-        .lines()
-        .find_map(|l| l.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .ok_or_else(|| "git listed no main checkout".into())
 }
 
 /// Plan rebasing a worktree's branch onto its base, in the worktree. A

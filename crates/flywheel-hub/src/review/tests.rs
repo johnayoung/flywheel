@@ -2,7 +2,9 @@
 //! as the push remote; scripted stand-ins for `gh`).
 
 use super::*;
+use super::{actions::*, integrate::*, model::*, plan::*};
 use crate::git;
+use std::collections::HashMap;
 use std::process::Command;
 
 fn run_git(dir: &Path, args: &[&str]) -> String {

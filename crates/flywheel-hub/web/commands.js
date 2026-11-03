@@ -3,7 +3,7 @@
 // or wrapping), with Copy, Send (paste into a shell session, never Enter)
 // and Send + Run. With no shell running where the agent works, "Open shell
 // & send" starts the agent's companion shell (same directory) and pastes
-// once its prompt is up. app.js creates it with its helpers; protocol:
+// once its prompt is up. app-base.js creates it with its helpers; protocol:
 // GET /api/sessions/{id}/commands, POST /api/sessions/{id}/paste,
 // POST /api/sessions/{id}/companion, and the events socket's
 // {"type":"commands"} pushes.

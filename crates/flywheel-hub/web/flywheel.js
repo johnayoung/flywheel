@@ -4,7 +4,7 @@
 // autopilot liveness, claims, and the stop / strand alerts -- read-only,
 // beside the terminals. Actions: start `fw worker` in a hub shell session
 // there, and open a run's output (its `fw show` summary and redacted
-// agent transcript). app.js creates it with its helpers; protocol:
+// agent transcript). app-base.js creates it with its helpers; protocol:
 // GET /api/flywheel, /api/flywheel/panel, /api/flywheel/run, POST
 // /api/flywheel/worker, and the events socket's {"type":"flywheel"} and
 // {"type":"flywheel_reset"} pushes. Another machine's folders

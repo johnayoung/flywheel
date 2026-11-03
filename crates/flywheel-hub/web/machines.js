@@ -6,7 +6,7 @@
 // the others or this hub. Ids are UUIDs, so a remote workspace or session
 // keeps its own id here; `route()` sends every call naming one to its
 // machine, and calls with no id (kinds, folder checks, worktree plans, a
-// new workspace) to the machine the open dialog is about. app.js creates
+// new workspace) to the machine the open dialog is about. app-base.js creates
 // it with its helpers.
 "use strict";
 

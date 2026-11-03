@@ -186,7 +186,7 @@ const fn rgb(v: u32) -> Rgb {
 
 impl ViewerColors {
     /// The web app's dark terminal theme (`TERM_THEMES.dark` in
-    /// `web/app.js`): what a session answers before any viewer reported.
+    /// `web/app-base.js`): what a session answers before any viewer reported.
     pub const DARK: Self = Self {
         ansi: [
             rgb(0x22241f),

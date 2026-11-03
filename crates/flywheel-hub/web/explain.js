@@ -2,7 +2,7 @@
 // a popover with GET /api/sessions/{id}/explain: what set the status (a
 // hook, a detection manifest rule, a heuristic), the rule the live screen
 // matches now with its evidence lines, every rule tried, and the note
-// that idle is not authorization. app.js creates it with its helpers.
+// that idle is not authorization. app-base.js creates it with its helpers.
 "use strict";
 
 window.FwHubExplain = function (ctx) {

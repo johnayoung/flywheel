@@ -3,8 +3,8 @@
 // (GET /api/code-workspaces[?root=]), or takes a pasted path, and imports
 // one (POST /api/workspaces/import): its folders, git repos or plain
 // directories, with their names. What could not be imported (missing
-// folders, remote ones) is listed, never dropped silently. app.js creates
-// it with its helpers.
+// folders, remote ones) is listed, never dropped silently. app-dialogs.js
+// creates it with its helpers.
 "use strict";
 
 window.FwHubImport = function (ctx) {

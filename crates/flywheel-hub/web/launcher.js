@@ -5,7 +5,7 @@
 // from a template (palette and the sidebar's "From template"), and token
 // usage: a session's tokens and cost in the header and its sidebar row,
 // each workspace's today cost, and the hub's today / this week strip
-// (GET /api/usage). app.js creates it with its helpers.
+// (GET /api/usage). app-base.js creates it with its helpers.
 "use strict";
 
 window.FwHubLauncher = function (ctx) {

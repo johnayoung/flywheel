@@ -1,0 +1,68 @@
+/* flywheel hub -- Last in the cascade: what the header gives up first as it narrows,
+ * and touch tap targets.
+ * Loaded after app.css, in index.html's order (the cascade depends on it). */
+
+/* --- header priority -------------------------------------------------------- */
+/* The crumbs (name, status, why?) take what they need and shrink only once
+   the meters are down to their pills: the cwd and usage text has no width
+   of its own (inline-size containment), it fills the room left over, up to
+   a cap. The row never overflows. */
+#term-header > .crumbs { flex: 0 1 auto; }
+.meters { flex: 1 1 auto; justify-content: flex-end; min-width: auto; }
+.meters > .cmd-pill, .meters > #link, #meter-size, #meter-viewers { flex: none; }
+#meter-cwd, button#meter-usage { contain: inline-size; flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button#meter-usage { max-width: 16rem; text-align: left; }
+.cmd-pill b, .cmd-pill .cmd-from { white-space: nowrap; }
+.cmd-pill .cmd-from { display: inline-block; max-width: 9rem; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+@media (min-width: 821px) {
+  .crumb-session { flex: 0 1 auto; min-width: 8ch; }
+  .crumbs .why-btn, .crumb-machine { flex-shrink: 0; }
+}
+/* Below a wide desktop: the pills are their icons (the label is still their
+   accessible name and tooltip), the link pill its dot, the size meter goes. */
+@media (max-width: 1599px) {
+  .meters { gap: .55rem; }
+  .meters .cmd-pill { font-size: 0; gap: 0; padding: .3rem .4rem; }
+  .meters .cmd-pill svg { width: .8rem; height: .8rem; }
+  .meters .cmd-pill b { font-size: 10px; margin-left: .3rem; }
+  #meter-size { display: none; }
+  #link { font-size: 0; gap: 0; padding: .3rem; }
+}
+/* A phone: the cost is on the session's sidebar row; the header keeps the
+   name, status pill and why? whole. */
+@media (max-width: 480px) {
+  button.meter.usage:not([hidden]) { display: none; }
+}
+@media (max-width: 820px) {
+  .crumbs .agent-pill, .crumbs .why-btn { flex: none; }
+  /* Cramped: the machine badge gives way before the name, the name before
+     the status and why?. */
+  .crumb-machine { flex: 0 100 auto; min-width: 0; overflow: hidden; }
+  .crumbs .crumb-session { min-width: 4ch; }
+  #meter-viewers { display: none; }
+}
+/* The sidebar beside a narrow header: the kind tag goes (the sidebar's
+   glyph says it). */
+@media (min-width: 761px) and (max-width: 820px) {
+  .crumb-session { flex: 1 1 auto; }
+  .crumbs .kind-tag { display: none; }
+}
+
+/* --- touch tap targets (pointer: coarse) ------------------------------------- */
+/* Every control a finger uses is at least 44px tall, icon-only ones 44px
+   wide too (WCAG 2.5.5). The first key-bar row is the exception in width:
+   its ten keys share the phone's width so every one stays in view. */
+@media (pointer: coarse) {
+  .slab, .chip, .qa, .qa-esc, .kb-key, .fw-chip, .sel-pop .slab,
+  .commands select, .cmd-check, .cmd-field, .sheet select, .empty-actions button, .ws-head {
+    min-height: 44px;
+  }
+  .icon, .kb-second .kb-key, #compose-prev, #compose-next { min-width: 44px; min-height: 44px; }
+  .chip, .fw-chip, .cmd-check { display: inline-flex; align-items: center; }
+  .cmd-check input { width: 22px; height: 22px; }
+}
+
+/* The companion shell on screen: its agent's chip is marked, and the
+   flip-back pill carries the agent's status dot. */
+.pane-chip.parent { border-color: var(--signal); border-style: dashed; color: var(--ink); }
+.flip-pill .flip-dot { flex: none; width: .5rem; height: .5rem; margin-left: .35rem; }

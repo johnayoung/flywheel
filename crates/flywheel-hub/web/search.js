@@ -12,7 +12,7 @@
 // under a head per machine, and a machine that is offline, refused, or
 // too slow says so there (the answer is then partial). A hit on a
 // machine opens on that machine.
-// app.js creates it with its helpers; protocol: GET /api/search,
+// app-base.js creates it with its helpers; protocol: GET /api/search,
 // GET /api/sessions/{id}/transcript (crates/flywheel-hub/src/search.rs).
 "use strict";
 

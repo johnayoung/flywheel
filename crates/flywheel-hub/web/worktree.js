@@ -2,7 +2,7 @@
 // "new worktree" fields (GET /api/worktrees/plan checks as you type), the
 // branch / changes / ahead badge under a session row, and the close
 // dialog that keeps or removes a worktree (GET /api/sessions/{id}/worktree,
-// DELETE /api/sessions/{id}?remove_worktree=true[&force=true]). app.js
+// DELETE /api/sessions/{id}?remove_worktree=true[&force=true]). app-base.js
 // creates it with its helpers.
 "use strict";
 

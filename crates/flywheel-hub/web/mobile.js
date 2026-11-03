@@ -1,5 +1,5 @@
 // flywheel hub: the phone. Everything that makes a terminal usable by
-// thumb, created by app.js with its helpers:
+// thumb, created by app-layout.js with its helpers:
 //
 // * Viewport: the app is sized to the visual viewport, so the on-screen
 //   keyboard shrinks the terminal instead of covering it or scrolling the

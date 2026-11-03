@@ -64,6 +64,26 @@ const JS: &str = "text/javascript; charset=utf-8";
 /// Every embedded asset under `/assets/`: `(path, bytes, content type)`.
 const ASSETS: &[(&str, &[u8], &str)] = &[
     ("app.js", include_bytes!("../web/app.js"), JS),
+    ("app-base.js", include_bytes!("../web/app-base.js"), JS),
+    ("app-layout.js", include_bytes!("../web/app-layout.js"), JS),
+    ("app-stage.js", include_bytes!("../web/app-stage.js"), JS),
+    ("app-tabs.js", include_bytes!("../web/app-tabs.js"), JS),
+    ("app-events.js", include_bytes!("../web/app-events.js"), JS),
+    (
+        "app-sidebar.js",
+        include_bytes!("../web/app-sidebar.js"),
+        JS,
+    ),
+    (
+        "app-dialogs.js",
+        include_bytes!("../web/app-dialogs.js"),
+        JS,
+    ),
+    (
+        "app-keyboard.js",
+        include_bytes!("../web/app-keyboard.js"),
+        JS,
+    ),
     ("attention.js", include_bytes!("../web/attention.js"), JS),
     ("flywheel.js", include_bytes!("../web/flywheel.js"), JS),
     ("mobile.js", include_bytes!("../web/mobile.js"), JS),
@@ -104,6 +124,51 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "app.css",
         include_bytes!("../web/app.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-sidebar.css",
+        include_bytes!("../web/app-sidebar.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-stage.css",
+        include_bytes!("../web/app-stage.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-dialogs.css",
+        include_bytes!("../web/app-dialogs.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-phone.css",
+        include_bytes!("../web/app-phone.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-worktrees.css",
+        include_bytes!("../web/app-worktrees.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-drawers.css",
+        include_bytes!("../web/app-drawers.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-search.css",
+        include_bytes!("../web/app-search.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-machines.css",
+        include_bytes!("../web/app-machines.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-priority.css",
+        include_bytes!("../web/app-priority.css"),
         "text/css; charset=utf-8",
     ),
     (
@@ -282,6 +347,39 @@ mod tests {
                 "index.html references missing {path}"
             );
         }
+    }
+
+    /// The app's split scripts and stylesheets share one scope and one
+    /// cascade: index.html loads every embedded part, the base first and
+    /// the booting `app.js` last.
+    #[test]
+    fn index_loads_every_app_part_in_order() {
+        let loaded = |prefix: &str, suffix: &str| -> Vec<String> {
+            INDEX_HTML
+                .split(prefix)
+                .skip(1)
+                .map(|r| r.split('"').next().unwrap().to_owned())
+                .filter(|p| p.ends_with(suffix))
+                .collect()
+        };
+        let scripts = loaded("<script src=\"/assets/", ".js");
+        let sheets = loaded("<link rel=\"stylesheet\" href=\"/assets/", ".css");
+        for (path, _, _) in ASSETS {
+            if path.starts_with("app") && (path.ends_with(".js") || path.ends_with(".css")) {
+                assert!(
+                    scripts.iter().chain(&sheets).any(|p| p == path),
+                    "index.html does not load {path}"
+                );
+            }
+        }
+        let parts: Vec<_> = scripts.iter().filter(|p| p.starts_with("app")).collect();
+        assert_eq!(parts.first().unwrap().as_str(), "app-base.js");
+        assert_eq!(scripts.last().unwrap(), "app.js");
+        let sheets: Vec<_> = sheets.iter().filter(|p| p.starts_with("app")).collect();
+        assert_eq!(sheets.first().unwrap().as_str(), "app.css");
+        // The service worker keeps at most 64 of the shell's URLs.
+        let shell = INDEX_HTML.matches("=\"/assets/").count();
+        assert!(shell <= 64, "{shell} shell assets");
     }
 
     #[test]

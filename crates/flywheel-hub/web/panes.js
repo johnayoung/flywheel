@@ -1,6 +1,6 @@
 // flywheel hub: one pane = one xterm attached to one session over its own
 // WebSocket (protocol: crates/flywheel-hub/src/server.rs), with its own
-// fit, reconnect-with-backoff, banner, and link state. app.js lays panes
+// fit, reconnect-with-backoff, banner, and link state. app-stage.js lays panes
 // out (tabs, splits) and decides which one has focus.
 //
 // Sizing: a session's PTY has one size, the last one a viewer asked for.
@@ -150,7 +150,7 @@ window.FwHubPanes = function (ctx) {
     // else to the PTY's size (clipped, bottom rows in view).
     pane.refit = () => {
       if (!pane.term || pane.replaying || pane.disposed) return;
-      // A divider is being dragged: fit once on release (app.js), not on
+      // A divider is being dragged: fit once on release (app-stage.js), not on
       // every pointer move -- each fit would resize the PTY, and every
       // SIGWINCH makes the shell or agent redraw.
       if (ctx.holdFit()) return;

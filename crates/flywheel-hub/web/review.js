@@ -6,7 +6,7 @@
 // the main checkout, then remove the worktree. Every action is planned
 // first (dry run: the exact commands, what they touch, why not) and runs
 // only with that plan's fingerprint. A drawer over the terminal on
-// desktop, a full-screen sheet on phones. app.js creates it with its
+// desktop, a full-screen sheet on phones. app-base.js creates it with its
 // helpers; protocol: GET /api/sessions/{id}/review, .../review/diff,
 // POST .../review/{commit,push,pr,rebase,merge,ask}.
 "use strict";

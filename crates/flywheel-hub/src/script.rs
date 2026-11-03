@@ -19,6 +19,16 @@ fn str_field<'a>(item: &'a Value, field: &str) -> &'a str {
     item.get(field).and_then(Value::as_str).unwrap_or("")
 }
 
+/// How messages name a session record: `name (id)`, as the hub's own
+/// errors do.
+pub fn session_label(session: &Value) -> String {
+    format!(
+        "{} ({})",
+        str_field(session, "name"),
+        str_field(session, "id")
+    )
+}
+
 /// Find the item `query` names among `items` (each with `id` and
 /// `name`): an exact id, else an exact name, else a unique id prefix.
 /// Ambiguity is an error listing the candidates (`what` names the kind).

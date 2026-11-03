@@ -254,14 +254,10 @@ async fn run(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let name = record
-        .get("name")
-        .and_then(Value::as_str)
-        .unwrap_or(&id)
-        .to_owned();
+    let name = crate::script::session_label(&record);
     if until != Until::Exit && !is_agent(&record) {
         return Outcome::Failed(format!(
-            "session {name:?} is not an agent session (no status to wait for); \
+            "session {name} is not an agent session (no status to wait for); \
              --until exit works for any session"
         ));
     }
@@ -289,7 +285,7 @@ async fn run(
             |(status, _)| status.clone(),
         );
         Outcome::TimedOut(format!(
-            "timed out waiting for {:?} to {} (now {now})",
+            "timed out waiting for {} to {} (now {now})",
             tracker.name,
             until.goal()
         ))
@@ -333,7 +329,7 @@ async fn watch(
             match refresh(endpoint, id).await {
                 Ok(Some(fresh)) => *record = fresh,
                 Ok(None) => {
-                    return Outcome::Failed(format!("session {:?} was removed", tracker.name));
+                    return Outcome::Failed(format!("session {} was removed", tracker.name));
                 }
                 Err(message) => return Outcome::Failed(message),
             }
@@ -392,14 +388,14 @@ impl Tracker {
         if self.until == Until::Exit {
             if self.changed && initial {
                 return Some(Outcome::Failed(format!(
-                    "session {:?} has already ended ({ended}); nothing to wait for",
+                    "session {} has already ended ({ended}); nothing to wait for",
                     self.name
                 )));
             }
             return Some(Outcome::Met(ended));
         }
         Some(Outcome::Failed(format!(
-            "session {:?} ended ({ended}) before it was {}",
+            "session {} ended ({ended}) before it was {}",
             self.name,
             self.until.as_str()
         )))

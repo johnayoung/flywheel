@@ -190,8 +190,8 @@ pub(crate) fn attach(args: &AttachArgs, out: &mut dyn Write, err: &mut dyn Write
                 return fail(
                     err,
                     &format!(
-                        "session {:?} has no terminal on the hub ({}); `fw hub relaunch` starts it again",
-                        str_of(session, "name"),
+                        "session {} has no terminal on the hub ({}); `fw hub relaunch` starts it again",
+                        crate::script::session_label(session),
                         crate::script::state_label(session)
                     ),
                 );

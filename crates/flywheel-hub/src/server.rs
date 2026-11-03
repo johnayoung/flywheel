@@ -52,6 +52,7 @@
 //!   seen-tracking; without one, the connection gets its own.
 //! * Rotating the token closes it with code 4001 too, a login ending 4002.
 
+mod admission;
 mod commands_api;
 mod detect_api;
 mod events_ws;
@@ -64,6 +65,7 @@ mod pwa;
 mod review_api;
 mod search_api;
 mod sessions_api;
+mod slots;
 mod templates_api;
 mod terminal_ws;
 mod workspaces_api;
@@ -300,6 +302,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .merge(protected)
         .layer(middleware::from_fn_with_state(state.clone(), origin_guard))
         .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            admission::admit,
+        ))
         .with_state(state)
 }
 
@@ -328,6 +334,7 @@ pub async fn serve_gated(
 ) -> std::io::Result<()> {
     let (tx, rx) = watch::channel(false);
     let gate = listener.gate().clone();
+    let trusted_proxies = options.trusted_proxies.clone();
     let app = router(Arc::clone(&hub), options, rx).layer(middleware::from_fn_with_state(
         gate.clone(),
         crate::handoff::gate_requests,
@@ -339,7 +346,15 @@ pub async fn serve_gated(
         // back first.
         gate.handoff_settled().await;
     };
-    listen::run(listener, app, listen::connection_cap(), shutdown_signal, tx).await;
+    listen::run(
+        listener,
+        app,
+        listen::connection_cap(),
+        trusted_proxies,
+        shutdown_signal,
+        tx,
+    )
+    .await;
     let _ = tokio::task::spawn_blocking(move || hub.shutdown(SHUTDOWN_TIMEOUT)).await;
     Ok(())
 }
@@ -1252,6 +1267,7 @@ mod tests {
             listener,
             app,
             4,
+            Vec::new(),
             std::future::pending(),
             closing,
         ));

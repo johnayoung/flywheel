@@ -367,7 +367,7 @@ pub struct FailureLimiter {
     clients: HashMap<IpAddr, VecDeque<Instant>>,
 }
 
-fn client_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn client_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),

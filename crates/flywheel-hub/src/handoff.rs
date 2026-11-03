@@ -490,6 +490,14 @@ impl Gate {
         let _ = rx.wait_for(|on| *on).await;
     }
 
+    /// Resolves once a handoff has closed the gate (at once while it is
+    /// closed): the accept loop drops connections no request has
+    /// authenticated, so the freeze never waits on them.
+    pub async fn frozen(&self) {
+        let mut rx = self.inner.open.subscribe();
+        gate_becomes(&mut rx, false).await;
+    }
+
     /// Resolves once no handoff is under way.
     pub async fn handoff_settled(&self) {
         let mut rx = self.inner.handing_off.subscribe();

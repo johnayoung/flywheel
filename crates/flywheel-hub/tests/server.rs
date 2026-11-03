@@ -237,13 +237,60 @@ async fn a_client_that_never_finishes_its_request_is_dropped() {
         .await
         .expect("the hub must close a stalled request");
     assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
-    assert!(
-        started.elapsed() >= Duration::from_secs(5),
-        "closed too early"
-    );
+    // Unauthenticated: 3 s for its first head, not the 10 s an
+    // authenticated connection gets.
+    let took = started.elapsed();
+    assert!(took >= Duration::from_secs(2), "closed too early: {took:?}");
+    assert!(took < Duration::from_secs(8), "closed too late: {took:?}");
     // A real request is served meanwhile and after.
     let ok = hub.http.get(hub.url("/healthz")).send().await.unwrap();
     assert_eq!(ok.status(), StatusCode::OK);
+    hub.shutdown().await;
+}
+
+/// A connection stays open only while its requests authenticate: an
+/// unauthenticated answer closes it (its slot is the small pool's); a
+/// token or login cookie keeps it alive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_authenticated_connections_are_kept_alive() {
+    let hub = TestHub::start().await;
+    let connection = |r: &reqwest::Response| {
+        r.headers()
+            .get("connection")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    for path in ["/healthz", "/", "/api/sessions"] {
+        let anonymous = hub.http.get(hub.url(path)).send().await.unwrap();
+        assert_eq!(connection(&anonymous), "close", "{path}");
+    }
+    let wrong = hub
+        .http
+        .get(hub.url("/healthz"))
+        .bearer_auth("0".repeat(64))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(connection(&wrong), "close");
+    let bearer = hub
+        .http
+        .get(hub.url("/api/sessions"))
+        .bearer_auth(&hub.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bearer.status(), StatusCode::OK);
+    assert_eq!(connection(&bearer), "");
+    // A signed-in browser's public pages too.
+    let page = hub
+        .http
+        .get(hub.url("/healthz"))
+        .header("cookie", &hub.cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(connection(&page), "");
     hub.shutdown().await;
 }
 

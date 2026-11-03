@@ -123,6 +123,7 @@ struct NewArgs {
 
 #[derive(Debug, clap::Args)]
 struct ListArgs {
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -144,6 +145,7 @@ struct ShowArgs {
     /// Also print each grader's output tail.
     #[arg(long, short = 'v')]
     verbose: bool,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -176,12 +178,15 @@ struct CandidateArgs {
 
 #[derive(Debug, clap::Args)]
 struct ConfirmArgs {
+    /// Fan-out id, unique id prefix, or name.
     fanout: String,
+    /// Candidate label (c1) or session name.
     candidate: String,
     /// Run without asking (what runs is still printed). Without it a
     /// terminal is asked; anything else only prints it.
     #[arg(long, short = 'y')]
     yes: bool,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -190,14 +195,19 @@ struct ConfirmArgs {
 
 #[derive(Debug, clap::Args)]
 struct PickArgs {
+    /// Fan-out id, unique id prefix, or name.
     fanout: String,
+    /// Candidate label (c1) or session name.
     candidate: String,
+    /// Do it without asking (what runs is still printed). Without it a
+    /// terminal is asked; anything else only prints it.
     #[arg(long, short = 'y')]
     yes: bool,
     /// When the base moved, rebase the candidate onto it first; it is
     /// graded again and must pass before it can be picked (run pick again).
     #[arg(long)]
     rebase: bool,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -206,6 +216,7 @@ struct PickArgs {
 
 #[derive(Debug, clap::Args)]
 struct PromoteArgs {
+    /// Fan-out id, unique id prefix, or name.
     fanout: String,
     /// The task id (default: the fan-out's name and tag).
     #[arg(long, value_name = "ID")]
@@ -221,8 +232,11 @@ struct PromoteArgs {
     /// winner); `none` for no reference.
     #[arg(long, value_name = "LABEL|none")]
     reference: Option<String>,
+    /// Do it without asking (what runs is still printed). Without it a
+    /// terminal is asked; anything else only prints it.
     #[arg(long, short = 'y')]
     yes: bool,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -231,6 +245,7 @@ struct PromoteArgs {
 
 #[derive(Debug, clap::Args)]
 struct CleanupArgs {
+    /// Fan-out id, unique id prefix, or name.
     fanout: String,
     /// Candidates (labels or session names); default: all but the winner.
     candidates: Vec<String>,
@@ -241,8 +256,11 @@ struct CleanupArgs {
     /// base, uncommitted changes).
     #[arg(long)]
     force: bool,
+    /// Do it without asking (what runs is still printed). Without it a
+    /// terminal is asked; anything else only prints it.
     #[arg(long, short = 'y')]
     yes: bool,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]

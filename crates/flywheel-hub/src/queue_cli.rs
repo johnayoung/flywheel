@@ -49,6 +49,7 @@ struct AddArgs {
     /// prompt it hits is answered and that turn finished.
     #[arg(long, value_parser = ["done", "idle", "blocked-cleared"], default_value = "done")]
     when: String,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -57,7 +58,10 @@ struct AddArgs {
 
 #[derive(Debug, clap::Args)]
 struct LsArgs {
+    /// The agent session (id, unique id prefix, or name); default: every
+    /// session with a queue.
     session: Option<String>,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -66,9 +70,11 @@ struct LsArgs {
 
 #[derive(Debug, clap::Args)]
 struct ItemArgs {
+    /// The agent session (id, unique id prefix, or name).
     session: String,
     /// A pending item's position (1 = next) or any item's id prefix.
     item: String,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -77,10 +83,12 @@ struct ItemArgs {
 
 #[derive(Debug, clap::Args)]
 struct ClearArgs {
+    /// The agent session (id, unique id prefix, or name).
     session: String,
     /// Also forget the delivered items.
     #[arg(long)]
     all: bool,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -89,11 +97,14 @@ struct ClearArgs {
 
 #[derive(Debug, clap::Args)]
 struct MoveArgs {
+    /// The agent session (id, unique id prefix, or name).
     session: String,
+    /// A pending item's position (1 = next) or any item's id prefix.
     item: String,
     /// Where it goes among the pending items (1 = next; past the end =
     /// last).
     position: usize,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -102,7 +113,9 @@ struct MoveArgs {
 
 #[derive(Debug, clap::Args)]
 struct SessionOnly {
+    /// The agent session (id, unique id prefix, or name).
     session: String,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]

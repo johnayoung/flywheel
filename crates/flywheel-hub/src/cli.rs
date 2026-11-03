@@ -1598,6 +1598,37 @@ impl ShutdownSignal {
 mod tests {
     use super::*;
 
+    /// Every flag and positional of every verb says what it is in
+    /// `--help` (a blank line there is a doc comment forgotten).
+    #[test]
+    fn every_argument_has_help_text() {
+        fn walk(cmd: &clap::Command, path: &str, blank: &mut Vec<String>) {
+            for arg in cmd.get_arguments() {
+                let id = arg.get_id().as_str();
+                if id == "help" || id == "version" || arg.is_hide_set() {
+                    continue;
+                }
+                let help = arg.get_help().or(arg.get_long_help());
+                if help.is_none_or(|h| h.to_string().trim().is_empty()) {
+                    blank.push(format!("{path} {id}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                if sub.is_hide_set() {
+                    continue;
+                }
+                walk(sub, &format!("{path} {}", sub.get_name()), blank);
+            }
+        }
+        let mut blank = Vec::new();
+        walk(&command(), "fw hub", &mut blank);
+        assert!(
+            blank.is_empty(),
+            "arguments with no help:\n{}",
+            blank.join("\n")
+        );
+    }
+
     fn run_args(args: &[&str]) -> (i32, String, String) {
         let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
         let (mut out, mut err) = (Vec::new(), Vec::new());

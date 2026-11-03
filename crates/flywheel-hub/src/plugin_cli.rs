@@ -47,6 +47,7 @@ struct NameArgs {
 
 #[derive(Debug, clap::Args)]
 struct LogsArgs {
+    /// The plugin (its directory name).
     name: String,
     /// How many runs (newest last).
     #[arg(short = 'n', long, default_value_t = 20)]

@@ -89,6 +89,7 @@ pub(crate) struct AskReviewArgs {
     /// Paste the reviewer's findings into the author agent, then Enter.
     #[arg(long)]
     send_findings: bool,
+    /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
     #[command(flatten)]

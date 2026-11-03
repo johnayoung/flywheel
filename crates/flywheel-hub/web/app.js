@@ -367,6 +367,19 @@
   });
   // The "why?" beside the status pill (explain.js).
   const explain = window.FwHubExplain({ $, el, api });
+  // Search across sessions (search.js): scrollback, transcripts, commands.
+  const search = window.FwHubSearch({
+    $, el, icon, api, state, sessionById, workspaceById, age, glyphFor,
+    toast: commands.toast,
+    openSession: (id) => openSession(id),
+    openCommandsAt: (id, seq, all) => {
+      review.close();
+      flywheel.close();
+      commands.openAt(id, seq, all);
+    },
+    livePanes: () => livePanes(),
+    focusTerminal: () => focusTerminal(),
+  });
 
   // `force` re-renders even when nothing changed. The periodic refresh
   // passes false and also holds off while a sidebar field has focus, so a
@@ -2352,13 +2365,13 @@
 
   function focusTerminal() {
     const term = focusedTerm();
-    if (term && !document.querySelector("dialog[open]") && !paletteOpen() && !$("#ctx-menu")) term.focus();
+    if (term && !document.querySelector("dialog[open]") && !paletteOpen() && !search.isOpen() && !$("#ctx-menu")) term.focus();
   }
 
   // Something over the terminal that owns the keys: a dialog, the
   // palette, a menu, the Commands drawer, the Flywheel panel, Compose.
   function overlayOpen() {
-    return !!document.querySelector("dialog[open]") || paletteOpen() || !!$("#ctx-menu") ||
+    return !!document.querySelector("dialog[open]") || paletteOpen() || search.isOpen() || !!$("#ctx-menu") ||
       commands.isOpen() || flywheel.isOpen() || review.isOpen() || !$("#compose").hidden;
   }
 
@@ -2632,6 +2645,7 @@
   }
 
   function render() {
+    search.refreshFilters();
     const numbering = new Map(attachable().map((s, i) => [s.id, i]));
     const root = $("#workspaces");
     if (state.workspaces.length === 0) {
@@ -3367,6 +3381,7 @@
       store.set("companion", beside ? "swap" : "split");
     }, "gear");
     launcher.paletteItems(cmd);
+    search.paletteItems(cmd);
     commands.paletteItems(cmd);
     flywheel.paletteItems(cmd);
     review.paletteItems(cmd);
@@ -3635,11 +3650,20 @@
           closePalette();
           if (focusedPane()) focusedPane().send(JSON.stringify({ type: "input", data: "\x0b" }));
         } else if (!document.querySelector("dialog[open]")) {
+          search.close(false);
           openPalette();
         }
         return;
       }
-      if (paletteOpen() || document.querySelector("dialog[open]") || $("#ctx-menu")) return;
+      // Ctrl Shift F (Cmd Shift F on macOS): search every session.
+      if (mod && event.shiftKey && !event.altKey && event.code === "KeyF") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (paletteOpen()) closePalette();
+        if (!document.querySelector("dialog[open]")) search.toggle();
+        return;
+      }
+      if (paletteOpen() || search.isOpen() || document.querySelector("dialog[open]") || $("#ctx-menu")) return;
       if (prefixKey(event)) return;
       if (!hubChord(event)) return;
       let handled = true;
@@ -3730,6 +3754,7 @@
     "flip-companion": () => commands.flipCompanion(),
     "toggle-flywheel": () => flywheel.togglePill(),
     "toggle-review": () => review.togglePill(),
+    search: () => search.open(),
   };
   document.addEventListener("click", (event) => {
     const target = event.target.closest("[data-action]");

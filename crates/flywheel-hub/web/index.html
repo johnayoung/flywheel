@@ -58,6 +58,7 @@
   <symbol id="i-split-down" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M2 8h12" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-zoom" viewBox="0 0 16 16"><path d="M2.5 6V2.5H6M10 2.5h3.5V6M13.5 10v3.5H10M6 13.5H2.5V10" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-unzoom" viewBox="0 0 16 16"><path d="M6 2.5V6H2.5M13.5 6H10V2.5M10 13.5V10h3.5M2.5 10H6v3.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><circle cx="6.8" cy="6.8" r="4.3" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10 10 4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="square"/></symbol>
   <symbol id="i-dots" viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/></symbol>
 </svg>
 
@@ -83,6 +84,9 @@
       <button type="button" class="chip" data-action="palette" title="Command palette">
         <kbd>Ctrl K</kbd><span>palette</span>
       </button>
+      <button type="button" class="chip" data-action="search" title="Search every session (Ctrl Shift F)">
+        <kbd>Ctrl Shift F</kbd><span>search</span>
+      </button>
       <button type="button" class="chip" id="theme-toggle" data-action="cycle-theme" title="Theme">
         <span class="theme-swatch" aria-hidden="true"></span><span id="theme-label">auto</span>
       </button>
@@ -106,6 +110,7 @@
         <button type="button" id="meter-usage" class="meter usage" hidden></button>
         <span id="meter-size" class="meter"></span>
         <span id="meter-viewers" class="meter"></span>
+        <button type="button" id="search-toggle" class="cmd-pill search-pill" data-action="search" title="Search every session (Ctrl Shift F)" aria-controls="search"><svg><use href="#i-search"/></svg>search</button>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
         <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
         <button type="button" id="rv-toggle" class="cmd-pill rv-pill" data-action="toggle-review" aria-pressed="false" aria-controls="review" hidden><svg><use href="#i-branch"/></svg>review<b id="rv-count" hidden></b></button>
@@ -403,6 +408,7 @@
     </header>
     <dl class="keys wide">
       <div><dt><kbd>Ctrl</kbd><kbd>K</kbd></dt><dd>command palette (press again inside it to send a literal <code>^K</code>)</dd></div>
+      <div><dt><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>F</kbd></dt><dd>search every session: scrollback, agent transcripts, suggested commands</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>N</kbd></dt><dd>new session</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>Shift</kbd><kbd>N</kbd></dt><dd>new workspace</dd></div>
       <div><dt><kbd>Alt</kbd><kbd>1</kbd>&ndash;<kbd>9</kbd></dt><dd>jump to the nth session</dd></div>
@@ -430,7 +436,49 @@
   </form>
 </dialog>
 
+<dialog id="dlg-transcript" class="sheet fw-run-sheet tx-sheet" aria-labelledby="tx-title">
+  <header class="sheet-head run-head">
+    <div>
+      <span class="sheet-kicker">transcript</span>
+      <h2 id="tx-title"></h2>
+      <span id="tx-meta" class="fw-path"></span>
+    </div>
+    <button type="button" class="icon" data-close title="Close (Esc)" aria-label="Close the transcript"><svg><use href="#i-x"/></svg></button>
+  </header>
+  <div id="tx-body" class="run-body tx-body" tabindex="0"></div>
+</dialog>
+
 <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+<div id="search" class="palette search" hidden>
+  <div class="palette-box search-box" role="dialog" aria-modal="true" aria-label="Search every session">
+    <div class="palette-input search-line">
+      <svg aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="search-input" type="search" autocomplete="off" spellcheck="false" autocapitalize="off" enterkeyhint="search" placeholder="Search scrollback, transcripts, commands" aria-label="Search" aria-controls="search-results" role="combobox" aria-expanded="true">
+      <button type="button" class="search-opt" id="search-regex" aria-pressed="false" title="Regular expression (Alt R)">.*</button>
+      <button type="button" class="search-opt" id="search-case" aria-pressed="false" title="Match case (Alt C)">Aa</button>
+      <button type="button" class="icon" id="search-close" title="Close (Esc)" aria-label="Close search"><svg><use href="#i-x"/></svg></button>
+    </div>
+    <div class="search-filters">
+      <select id="search-ws" aria-label="Workspace"></select>
+      <select id="search-session" aria-label="Session"></select>
+      <select id="search-kind" aria-label="Kind">
+        <option value="">any kind</option>
+        <option value="shell">shells</option>
+        <option value="claude">claude</option>
+        <option value="codex">codex</option>
+      </select>
+      <span class="search-sources" role="group" aria-label="Sources">
+        <label class="cmd-check"><input type="checkbox" id="search-src-scrollback" checked> terminal</label>
+        <label class="cmd-check"><input type="checkbox" id="search-src-transcript" checked> transcript</label>
+        <label class="cmd-check"><input type="checkbox" id="search-src-commands" checked> commands</label>
+      </span>
+    </div>
+    <p id="search-status" class="search-status" aria-live="polite"></p>
+    <div id="search-results" class="search-results" role="listbox" aria-label="Results"></div>
+    <footer class="cmd-keys search-keys" aria-hidden="true"><kbd>&uarr;</kbd><kbd>&darr;</kbd> pick <kbd>Enter</kbd> open <kbd>Alt R</kbd> regex <kbd>Alt C</kbd> case <kbd>Esc</kbd> close</footer>
+  </div>
+</div>
 
 <div id="palette" class="palette" hidden>
   <div class="palette-box" role="dialog" aria-modal="true" aria-label="Command palette">
@@ -446,6 +494,7 @@
 <script src="/assets/vendor/xterm/xterm.js"></script>
 <script src="/assets/vendor/addon-fit/addon-fit.js"></script>
 <script src="/assets/vendor/addon-web-links/addon-web-links.js"></script>
+<script src="/assets/vendor/addon-search/addon-search.js"></script>
 <script src="/assets/commands.js"></script>
 <script src="/assets/import.js"></script>
 <script src="/assets/pwa.js"></script>
@@ -459,6 +508,7 @@
 <script src="/assets/explain.js"></script>
 <script src="/assets/layout.js"></script>
 <script src="/assets/panes.js"></script>
+<script src="/assets/search.js"></script>
 <script src="/assets/app.js"></script>
 </body>
 </html>

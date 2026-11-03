@@ -401,6 +401,8 @@ pub struct Hub {
     companion_lock: Mutex<()>,
     /// Screen detection manifests (bundled + state-dir overrides).
     detection: Arc<Detection>,
+    /// Full-text search caches (see [`crate::search`]).
+    search: crate::search::SearchIndex,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -475,6 +477,7 @@ impl Hub {
             git: GitWatch::default(),
             companion_lock: Mutex::new(()),
             detection: Arc::new(Detection::with_overrides(&options_state_dir)),
+            search: crate::search::SearchIndex::default(),
             _serve_lock: serve_lock,
         }))
     }
@@ -509,6 +512,11 @@ impl Hub {
     /// Suggested commands read from agent transcripts.
     pub(crate) fn command_book(&self) -> &CommandBook {
         &self.commands
+    }
+
+    /// Full-text search state.
+    pub fn search_index(&self) -> &crate::search::SearchIndex {
+        &self.search
     }
 
     /// The current token.

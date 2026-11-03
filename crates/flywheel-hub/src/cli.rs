@@ -107,6 +107,11 @@ enum HubCommand {
     /// written (shell commands unless --all), newest first; or copy the
     /// newest with OSC 52.
     Commands(crate::commands_cli::CommandsArgs),
+    /// Full-text search across sessions: every terminal's scrollback and
+    /// screen, agent transcripts (prompts, replies, tool calls), and
+    /// suggested commands; hits grouped by session, newest first. Exit 0
+    /// with hits, 1 with none.
+    Search(crate::search_cli::SearchArgs),
     /// A session's git work: its branch against its base (commits,
     /// changed files with +/- counts), and staged, unstaged, and untracked
     /// changes apart; --diff PATH prints one file's diff.
@@ -385,6 +390,7 @@ pub fn run_with(
         HubCommand::Url(args) => url_cmd(&args, out, err),
         HubCommand::Serve(args) => serve_cmd(args, out, err, extensions),
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),
+        HubCommand::Search(args) => crate::search_cli::run(&args, out, err),
         HubCommand::Review(args) => crate::review_cli::review(&args, out, err),
         HubCommand::Merge(args) => crate::review_cli::merge(&args, out, err),
         // Routed before parsing (see `report_main`); reached only via help.

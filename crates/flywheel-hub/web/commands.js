@@ -25,6 +25,7 @@ window.FwHubCommands = function (ctx) {
     error: "",
     unseen: {}, // agent session id -> shell commands not yet seen in the drawer
     selected: null, // seq of the card the keyboard acts on
+    wanted: null, // seq to select and show once the list has it (a search hit)
     focusPending: false, // opened: focus the selected card once it renders
   };
 
@@ -487,6 +488,12 @@ window.FwHubCommands = function (ctx) {
 
     const list = $("#cmd-list");
     const items = shown(source);
+    let reveal = false;
+    if (ui.wanted !== null && items.some((c) => c.seq === ui.wanted)) {
+      ui.selected = ui.wanted;
+      ui.wanted = null;
+      reveal = true;
+    }
     if (!items.some((c) => c.seq === ui.selected)) ui.selected = items.length ? items[0].seq : null;
     // Re-rendering replaces the cards: note where focus was, to put it
     // back (a lost focus lands on <body>, where no key reaches the drawer).
@@ -511,6 +518,15 @@ window.FwHubCommands = function (ctx) {
         : items.map((c) => renderItem(c, source, target))),
     );
     markOverflow();
+    if (reveal) {
+      const card = selectedCard();
+      if (card) {
+        card.scrollIntoView({ block: "center" });
+        card.classList.add("arrived");
+        card.focus({ preventScroll: true });
+        ui.focusPending = false;
+      }
+    }
     if (focusedCard || (ui.focusPending && drawer.contains(document.activeElement))) {
       const card = selectedCard();
       const button = card && focusedAction >= 0 ? card.querySelectorAll("button")[focusedAction] : null;
@@ -595,6 +611,20 @@ window.FwHubCommands = function (ctx) {
   }
 
   const toggle = () => setOpen(!ui.open);
+
+  // Open the drawer on session `id`'s block `seq` (a search hit; `all`:
+  // it is not a shell block, so every block is listed).
+  function openAt(id, seq, all) {
+    ui.source = id;
+    if (all) ui.all = true;
+    ui.wanted = seq;
+    if (ui.open) {
+      const source = currentSource();
+      if (source) load(source.id);
+    } else {
+      setOpen(true);
+    }
+  }
 
   $("#cmd-source").addEventListener("change", (event) => {
     ui.source = event.target.value || null;
@@ -738,5 +768,5 @@ window.FwHubCommands = function (ctx) {
     if (source && !cache[source.id] && ui.loading !== source.id) load(source.id);
   }
 
-  return { onEvent, toggle, copyLast, flipCompanion, paletteItems, render, prefetch, copyText, toast, isOpen: () => ui.open };
+  return { onEvent, toggle, openAt, copyLast, flipCompanion, paletteItems, render, prefetch, copyText, toast, isOpen: () => ui.open };
 };

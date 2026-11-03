@@ -3,7 +3,8 @@
 //!
 //! Vendored third-party code lives under `web/vendor/<package>/` with its
 //! license file (xterm.js 6.0.0, @xterm/addon-fit 0.11.0,
-//! @xterm/addon-web-links 0.12.0; sourcemap comments stripped) and the
+//! @xterm/addon-web-links 0.12.0, @xterm/addon-search 0.16.0; sourcemap
+//! comments stripped) and the
 //! UI fonts under `web/vendor/fonts/` (Big Shoulders Display, Martian Mono,
 //! JetBrains Mono: latin variable subsets from @fontsource-variable 5.3.0,
 //! SIL OFL 1.1).
@@ -96,6 +97,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ("explain.js", include_bytes!("../web/explain.js"), JS),
     ("layout.js", include_bytes!("../web/layout.js"), JS),
     ("panes.js", include_bytes!("../web/panes.js"), JS),
+    ("search.js", include_bytes!("../web/search.js"), JS),
     ("login.js", include_bytes!("../web/login.js"), JS),
     (
         "app.css",
@@ -140,6 +142,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "vendor/addon-web-links/addon-web-links.js",
         include_bytes!("../web/vendor/addon-web-links/addon-web-links.js"),
+        JS,
+    ),
+    (
+        "vendor/addon-search/addon-search.js",
+        include_bytes!("../web/vendor/addon-search/addon-search.js"),
         JS,
     ),
 ];

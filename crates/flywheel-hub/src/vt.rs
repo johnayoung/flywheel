@@ -1040,6 +1040,43 @@ impl Emulator {
             lines,
         }
     }
+
+    /// Every logical line the terminal retains, for search: the primary
+    /// screen's scrollback plus rows (also while the alternate screen is
+    /// up), oldest first, trailing blank lines dropped -- the same lines,
+    /// counted from the bottom, a client replaying [`Emulator::snapshot`]
+    /// holds -- and the alternate screen's rows when it is up.
+    pub fn search_text(&mut self) -> SearchText {
+        self.flush();
+        if !self.alt_screen() {
+            let grid = self.term.grid();
+            return SearchText {
+                primary: recent_lines(grid, usize::MAX),
+                alternate: None,
+            };
+        }
+        // The primary grid is private while the alternate screen is up:
+        // swap to it and back, as `snapshot` does.
+        let alt = self.term.grid().clone();
+        let alternate = recent_lines(&alt, usize::MAX);
+        self.term.swap_alt();
+        let primary = recent_lines(self.term.grid(), usize::MAX);
+        self.term.swap_alt();
+        *self.term.grid_mut() = alt;
+        SearchText {
+            primary,
+            alternate: Some(alternate),
+        }
+    }
+}
+
+/// What [`Emulator::search_text`] returns.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchText {
+    /// The primary screen's logical lines: scrollback then rows.
+    pub primary: Vec<String>,
+    /// The alternate screen's rows, when it is up.
+    pub alternate: Option<Vec<String>>,
 }
 
 /// A title without control characters (it is replayed inside an OSC).
@@ -1614,6 +1651,34 @@ mod tests {
             }
         );
         assert!(!visible.alt_screen);
+    }
+
+    #[test]
+    fn search_text_holds_every_primary_line_also_under_the_alternate_screen() {
+        let mut e = Emulator::new(10, 4, 100);
+        for i in 0..20 {
+            e.process(format!("row {i}\r\n").as_bytes());
+        }
+        // A soft-wrapped line is one logical line.
+        e.process(b"0123456789abcdef\r\n");
+        let text = e.search_text();
+        assert_eq!(text.alternate, None);
+        assert_eq!(text.primary.len(), 21, "{:?}", text.primary);
+        assert_eq!(text.primary[0], "row 0");
+        assert_eq!(text.primary[20], "0123456789abcdef");
+        e.process(b"\x1b[?1049h\x1b[Hfull screen app");
+        let text = e.search_text();
+        assert_eq!(text.primary.len(), 21);
+        assert_eq!(text.primary[20], "0123456789abcdef");
+        assert_eq!(text.alternate.unwrap()[0], "full screen app");
+        // Reading it changed nothing on screen.
+        assert_eq!(
+            e.text(TextSource::Visible).lines[..2],
+            ["full scree", "n app"]
+        );
+        assert!(e.alt_screen());
+        e.process(b"\x1b[?1049l");
+        assert_eq!(e.search_text().primary.len(), 21);
     }
 
     #[test]

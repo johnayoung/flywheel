@@ -71,7 +71,7 @@ const MAX_PARKED_TAILS: usize = 512;
 /// Which agent's file format a tail reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Format {
+pub(crate) enum Format {
     Claude,
     Codex,
 }
@@ -887,6 +887,40 @@ impl CommandBook {
                 codex_rollout(self.codex_home.as_deref()?, thread).map(|p| (p, Format::Codex))
             }
             SessionKind::Shell => None,
+        }
+    }
+
+    /// The file of `record`'s current conversation, for search and the
+    /// transcript viewer: the one being followed, else the one found
+    /// (`None` for shells and while the agent has written none).
+    pub(crate) fn transcript_file(&self, record: &SessionRecord) -> Option<(PathBuf, Format)> {
+        if !record.kind.is_agent() {
+            return None;
+        }
+        let entry = self.entry(&record.id);
+        let hinted = {
+            let log = entry.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(tail) = log
+                .tail
+                .as_ref()
+                .filter(|t| t.conversation == record.agent_session_id)
+            {
+                return Some((tail.path.clone(), tail.format));
+            }
+            log.hinted.clone()
+        };
+        self.locate(record, hinted.as_deref())
+    }
+
+    /// Hand `id`'s saved commands to `visit`, newest first, until it
+    /// returns false.
+    pub(crate) fn visit_commands(&self, id: &str, mut visit: impl FnMut(&Command) -> bool) {
+        let entry = self.entry(id);
+        let log = entry.lock().unwrap_or_else(PoisonError::into_inner);
+        for command in log.entries.iter().rev() {
+            if !visit(command) {
+                break;
+            }
         }
     }
 

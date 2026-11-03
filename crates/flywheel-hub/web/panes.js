@@ -51,6 +51,8 @@ window.FwHubPanes = function (ctx) {
       socket: null,
       exited: null, // exit info of its process ({gone:true}: no terminal on this hub)
       replaying: false, // a snapshot is being replayed at the session's size
+      drawn: false, // this connection's snapshot has been replayed
+      search: null, // xterm's search addon (search.js jumps to hits with it)
       size: null, // {cols, rows} the PTY has, as the server last said
       following: false, // sized to the PTY, not to its box (another viewer's size)
       retry: 0,
@@ -75,6 +77,9 @@ window.FwHubPanes = function (ctx) {
       const fit = new window.FitAddon.FitAddon();
       term.loadAddon(fit);
       term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
+      const search = new window.SearchAddon.SearchAddon();
+      term.loadAddon(search);
+      pane.search = search;
       term.open(host);
       muteQueries(term);
       term.onData((data) => pane.sendInput(JSON.stringify({ type: "input", data: ctx.transformInput(data) })));
@@ -301,6 +306,7 @@ window.FwHubPanes = function (ctx) {
       socket.binaryType = "arraybuffer";
       pane.socket = socket;
       pane.replaying = false;
+      pane.drawn = false;
       const term = pane.term;
       socket.onopen = () => {
         // The snapshot follows; clear only now, so a dead link keeps the
@@ -325,6 +331,7 @@ window.FwHubPanes = function (ctx) {
       const replayed = () => {
         if (pane.socket !== socket) return;
         pane.replaying = false;
+        pane.drawn = true;
         initCursor();
         pane.claim();
       };

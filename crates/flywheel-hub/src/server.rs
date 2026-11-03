@@ -60,6 +60,7 @@ mod listen;
 mod notify_api;
 mod pwa;
 mod review_api;
+mod search_api;
 mod templates_api;
 mod worktree_api;
 
@@ -228,6 +229,8 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions/{id}/review/merge", post(review_api::merge))
         .route("/api/sessions/{id}/review/ask", post(review_api::ask))
         .route("/api/sessions/{id}/ws", get(session_ws))
+        .route("/api/search", get(search_api::search))
+        .route("/api/sessions/{id}/transcript", get(search_api::transcript))
         .route("/api/login-codes", post(mint_login_code))
         .route("/api/token/rotate", post(rotate_token))
         .route("/api/events", get(events_ws))

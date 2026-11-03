@@ -1330,9 +1330,18 @@ pub fn interruptible_sleep(seconds: f64, should_stop: &dyn Fn() -> bool) {
 /// sends its foreground job, so it is an orderly stop too, never the
 /// default instant death that would strand the claim and orphan the
 /// agents -- unless SIGHUP was inherited ignored (`nohup`), which is left
-/// alone. Spawned on `runtime`; a no-op off unix.
+/// alone. The handlers are installed before this returns -- a signal that
+/// lands the instant after (while the first cycle claims a task) is caught,
+/// never the default action that would strand the claim -- and the watcher
+/// that acts on them runs on `runtime`. A no-op off unix.
 pub fn arm_signals(runtime: &Runtime, stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
-    runtime.spawn(watch_signals(stop, shutdown, log));
+    let streams = {
+        let _context = runtime.enter();
+        install_signal_streams(&log)
+    };
+    if let Some(streams) = streams {
+        runtime.spawn(watch_signals(streams, stop, shutdown, log));
+    }
 }
 
 /// The orderly-shutdown request every stop trigger funnels into (a signal,
@@ -1347,8 +1356,23 @@ fn begin_shutdown(stop: &StopFlag, shutdown: &ShutdownSignal, log: &Logger, why:
     ));
 }
 
+/// The installed SIGTERM/SIGINT(/SIGHUP) handlers [`watch_signals`] waits on.
 #[cfg(unix)]
-async fn watch_signals(stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
+struct SignalStreams {
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    /// `None` when SIGHUP was inherited ignored.
+    hup: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(not(unix))]
+struct SignalStreams;
+
+/// Install the shutdown signal handlers (tokio registers the process-wide
+/// handler synchronously, inside the caller's runtime context). `None`,
+/// logged, if one could not be installed.
+#[cfg(unix)]
+fn install_signal_streams(log: &Logger) -> Option<SignalStreams> {
     use tokio::signal::unix::{SignalKind, signal};
     let install = |name: &str, kind: SignalKind| match signal(kind) {
         Ok(stream) => Some(stream),
@@ -1357,23 +1381,37 @@ async fn watch_signals(stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
             None
         }
     };
-    let Some(mut term) = install("SIGTERM", SignalKind::terminate()) else {
-        return;
-    };
-    let Some(mut int) = install("SIGINT", SignalKind::interrupt()) else {
-        return;
-    };
+    let term = install("SIGTERM", SignalKind::terminate())?;
+    let int = install("SIGINT", SignalKind::interrupt())?;
     // An inherited SIG_IGN (`nohup`, or a pool supervisor started that way)
     // stays: installing a handler would turn a terminal closing into the
     // very shutdown the operator opted out of.
-    let mut hup = if crate::pool::hangup_ignored() {
+    let hup = if crate::pool::hangup_ignored() {
         None
     } else {
-        let Some(stream) = install("SIGHUP", SignalKind::hangup()) else {
-            return;
-        };
-        Some(stream)
+        Some(install("SIGHUP", SignalKind::hangup())?)
     };
+    Some(SignalStreams { term, int, hup })
+}
+
+#[cfg(not(unix))]
+fn install_signal_streams(_log: &Logger) -> Option<SignalStreams> {
+    None
+}
+
+#[cfg(unix)]
+async fn watch_signals(
+    streams: SignalStreams,
+    stop: StopFlag,
+    shutdown: ShutdownSignal,
+    log: Logger,
+) {
+    use tokio::signal::unix::SignalKind;
+    let SignalStreams {
+        mut term,
+        mut int,
+        mut hup,
+    } = streams;
     loop {
         let hangup = async {
             match hup.as_mut() {
@@ -1391,7 +1429,13 @@ async fn watch_signals(stop: StopFlag, shutdown: ShutdownSignal, log: Logger) {
 }
 
 #[cfg(not(unix))]
-async fn watch_signals(_stop: StopFlag, _shutdown: ShutdownSignal, _log: Logger) {}
+async fn watch_signals(
+    _streams: SignalStreams,
+    _stop: StopFlag,
+    _shutdown: ShutdownSignal,
+    _log: Logger,
+) {
+}
 
 /// Watch the pool supervisor's lifeline (the read end of a pipe whose only
 /// write end the supervisor holds; see [`crate::pool`]): end-of-file means

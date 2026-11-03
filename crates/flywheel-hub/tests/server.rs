@@ -554,8 +554,7 @@ async fn shell_session_over_websocket_replays_then_streams_live() {
         ))
         .await
         .unwrap();
-    // Give the resize a moment to land before asking the tty.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The hub applies a socket's resize before input sent after it.
     input(&mut second, "stty size\r").await;
     read_until(&mut first, "41 101").await;
     read_until(&mut second, "41 101").await;

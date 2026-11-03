@@ -10,7 +10,7 @@ use axum::routing::post;
 use flywheel_hub::notify::{Notifier, NotifyConfig};
 use flywheel_hub::report::{self, Report};
 use flywheel_hub::{HubOptions, ServerOptions, serve};
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -379,15 +379,7 @@ async fn a_watched_session_or_a_spell_shorter_than_settle_does_not_push() {
         .headers_mut()
         .insert("cookie", hub.cookie.parse().unwrap());
     let (mut events, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-    events
-        .send(Message::Text(
-            json!({ "type": "view", "session_id": sid })
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    look_at(&mut events, Some(&sid)).await;
     fire(
         &env,
         "PermissionRequest",
@@ -400,15 +392,7 @@ async fn a_watched_session_or_a_spell_shorter_than_settle_does_not_push() {
     assert!(webhook.all().is_empty(), "{:?}", webhook.all());
 
     // It looks away: the next blocked spell pushes.
-    events
-        .send(Message::Text(
-            json!({ "type": "view", "session_id": null })
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    look_at(&mut events, None).await;
     fire(&env, "UserPromptSubmit", None, json!({}));
     fire(
         &env,
@@ -438,10 +422,16 @@ async fn viewer(
     tokio_tungstenite::connect_async(request).await.unwrap().0
 }
 
+/// Tell the hub this client looks at `session` (or nothing), and return
+/// once the hub has applied it: the hub handles a socket's messages in
+/// order, answering a ping only when it reads the next frame after it, so
+/// the pong for a ping sent behind the view proves the view landed.
 async fn look_at<S>(events: &mut S, session: Option<&str>)
 where
-    S: futures_util::Sink<Message> + Unpin,
-    S::Error: std::fmt::Debug,
+    S: futures_util::Sink<Message>
+        + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
+    <S as futures_util::Sink<Message>>::Error: std::fmt::Debug,
 {
     events
         .send(Message::Text(
@@ -451,7 +441,22 @@ where
         ))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let marker = format!("view-{}", session.unwrap_or("none"));
+    events
+        .send(Message::Ping(marker.clone().into_bytes().into()))
+        .await
+        .unwrap();
+    let synced = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match events.next().await {
+                Some(Ok(Message::Pong(payload))) if payload.as_ref() == marker.as_bytes() => break,
+                Some(Ok(_)) => {}
+                other => panic!("events socket ended: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(synced.is_ok(), "the hub never applied the view");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -614,10 +619,13 @@ async fn redirects_are_not_followed_and_errors_never_name_the_topic() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(target.all().is_empty(), "the redirect was followed");
 
-    // Nothing listens: the error names the host only.
-    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // Nothing listens: the error names the host only. The port is held by
+    // a socket bound but never listening -- connecting is refused, and no
+    // parallel test can be handed the port meanwhile (a dropped listener's
+    // port can be, and then answers).
+    let closed = tokio::net::TcpSocket::new_v4().unwrap();
+    closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let dead = closed.local_addr().unwrap();
-    drop(closed);
     let notifier = Notifier::new(
         NotifyConfig::from_parts(None, Some(&format!("http://me:pw@{dead}/{TOPIC}")))
             .unwrap()

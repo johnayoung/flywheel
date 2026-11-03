@@ -223,6 +223,29 @@ impl Attached {
         self.writer.flush().unwrap();
     }
 
+    /// Type `bytes` and wait for `needle`, retyping every second until it
+    /// shows (within [`WAIT`]): for input that may be dropped while the
+    /// client reconnects.
+    fn retype_until(&mut self, bytes: &[u8], needle: &str) -> Vec<String> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            self.type_bytes(bytes);
+            let attempt = Instant::now();
+            while attempt.elapsed() < Duration::from_secs(1) {
+                let lines = self.lines();
+                if lines.iter().any(|l| l.contains(needle)) {
+                    return lines;
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            assert!(
+                Instant::now() < deadline,
+                "never saw {needle}; screen:\n{}",
+                self.lines().join("\n")
+            );
+        }
+    }
+
     fn resize(&self, cols: u16, rows: u16) {
         self.screen.lock().unwrap().resize(cols, rows);
         self.master
@@ -344,18 +367,18 @@ fn attach_shows_the_snapshot_forwards_input_and_detaches_leaving_the_session_run
     term.wait_text("29 100");
 
     // Prefix twice sends the prefix itself (Ctrl+B = 0x02).
+    // Typed ahead of od starting: the tty queues it for od to read.
     term.type_bytes(b"od -An -c\r");
-    std::thread::sleep(Duration::from_millis(300));
     term.type_bytes(b"\x02\x02\r\x04");
     term.wait_text("002");
 
     // The bar toggles off: the session gets every row.
+    // The client sends the resize down the same ordered link as the input
+    // typed after it, and the hub applies it first: no wait needed between.
     term.type_bytes(b"\x02t");
-    std::thread::sleep(Duration::from_millis(300));
     term.type_bytes(b"clear; stty size\r");
     term.wait_text("30 100");
     term.type_bytes(b"\x02t");
-    std::thread::sleep(Duration::from_millis(300));
     term.type_bytes(b"clear; stty size\r");
     term.wait_text("29 100");
 
@@ -479,9 +502,10 @@ fn the_client_ends_with_its_session_shows_the_key_table_and_survives_rotation() 
         .output()
         .unwrap();
     assert!(rotated.status.success(), "{rotated:?}");
-    std::thread::sleep(Duration::from_millis(500));
-    term.type_bytes(b"echo after-$((3*3))\r");
-    term.wait_text("after-9");
+    // Input sent down the old connection before the client sees it closed
+    // is lost with it, and nothing on screen marks the reconnect: retype
+    // (the line killed first) until a command runs on the new connection.
+    term.retype_until(b"\x15echo after-$((3*3))\r", "after-9");
     assert!(term.child.try_wait().unwrap().is_none(), "client ended");
 
     // The session's process ends: so does the client, its last screen kept.
@@ -641,14 +665,24 @@ fn wait_returns_when_the_agent_reports_done_and_times_out_with_124() {
     assert_eq!(code, Some(124), "{stderr}");
     assert!(stderr.contains("timed out"), "{stderr}");
 
-    // A wait started now returns once the turn finishes.
-    let waiting = wait_cmd(
+    // A wait started now returns once a turn finishes. Nothing says when
+    // the wait has read its starting state, and a turn that finished
+    // before then is (rightly) not a change to it, so turns repeat until
+    // one lands after: each is a fresh change.
+    let mut waiting = wait_cmd(
         &dir,
-        &["agent", "--until", "done", "--changed", "--timeout", "30"],
+        &["agent", "--until", "done", "--changed", "--timeout", "60"],
     );
-    std::thread::sleep(Duration::from_millis(500));
-    run_hook(&settings, "UserPromptSubmit", &env, &payload);
-    run_hook(&settings, "Stop", &env, &payload);
+    let deadline = Instant::now() + WAIT;
+    while waiting.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the wait never returned");
+        run_hook(&settings, "UserPromptSubmit", &env, &payload);
+        run_hook(&settings, "Stop", &env, &payload);
+        let turn = Instant::now();
+        while turn.elapsed() < Duration::from_secs(1) && waiting.try_wait().unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
     let (code, stdout, stderr) = finish(waiting);
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(stdout, "done");
@@ -657,7 +691,7 @@ fn wait_returns_when_the_agent_reports_done_and_times_out_with_124() {
     // next turn instead.
     let (code, stdout, _) = finish(wait_cmd(
         &dir,
-        &["agent", "--until", "idle", "--timeout", "5"],
+        &["agent", "--until", "idle", "--timeout", "30"],
     ));
     assert_eq!((code, stdout.as_str()), (Some(0), "done"));
     let (code, _, _) = finish(wait_cmd(
@@ -688,7 +722,7 @@ fn wait_returns_when_the_agent_reports_done_and_times_out_with_124() {
             "--until",
             "done",
             "--timeout",
-            "5",
+            "30",
             "--url",
             &url(server.port),
         ],
@@ -846,8 +880,9 @@ fn a_turn_seen_in_one_attach_stays_seen_in_the_next() {
     let mut term = Attached::spawn(&dir, &["agent"], 80, 24);
     term.wait_text("fake-claude-ready");
     term.wait_for("the status bar", |l| l[23].contains("demo/agent"));
-    std::thread::sleep(Duration::from_millis(300));
-    // A turn finishes while this client watches: idle for it.
+    // A turn finishes while this client watches: idle for it. (Should the
+    // client's view reach the hub only after the turn, viewing a finished
+    // turn marks it seen just the same.)
     run_hook(&settings, "UserPromptSubmit", &env, &payload);
     run_hook(&settings, "Stop", &env, &payload);
     term.wait_for("idle on the bar", |l| {

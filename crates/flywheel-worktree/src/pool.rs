@@ -870,6 +870,11 @@ impl WorkerPool {
             if let Some(member) = self.members.get_mut(slot)
                 && member.is_running()
             {
+                (self.log)(&format!(
+                    "pool member {} did not exit within {}s of SIGTERM; killing its group",
+                    member.worker_id,
+                    format_g(window.as_secs_f64())
+                ));
                 signal_group(member.pid, KILL_SIGNAL);
                 member.wait_for_exit(window);
             }
@@ -1601,7 +1606,9 @@ mod tests {
         ]);
         let files = pidfiles.clone();
         let spawn: SpawnMember = Arc::new(move |id: &str| ignore_term_argv(&files[id]));
-        let mut pool = pool(2, spawn, false, "k");
+        let (log, lines) = capture();
+        let mut pool =
+            WorkerPool::new(PoolOptions::new(2, spawn, log, false).with_prefix("k")).unwrap();
         pool.start().unwrap();
         let member_pids = pool.live_member_pids();
         let grandchild_pids: Vec<u32> = ["k-0", "k-1"]
@@ -1619,11 +1626,40 @@ mod tests {
         // window and take down every member's whole process group.
         pool.stop(Some(0.5));
         assert!(member_pids.iter().all(|p| !alive(*p)));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // The escalation is reported, once per member it had to kill.
+        let escalations: Vec<String> = lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.contains("did not exit within 0.5s of SIGTERM; killing its group"))
+            .cloned()
+            .collect();
+        assert_eq!(escalations.len(), 2, "{escalations:?}");
+        assert!(escalations.iter().any(|l| l.contains("pool member k-0 ")));
+        assert!(escalations.iter().any(|l| l.contains("pool member k-1 ")));
+        let deadline = Instant::now() + Duration::from_secs(30);
         while grandchild_pids.iter().any(|p| alive(*p)) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(grandchild_pids.iter().all(|p| !alive(*p)));
+    }
+
+    #[test]
+    fn pool_stop_reports_no_escalation_when_members_exit_on_sigterm() {
+        let (log, lines) = capture();
+        let mut pool =
+            WorkerPool::new(PoolOptions::new(2, sleep_argv(), log, false).with_prefix("c"))
+                .unwrap();
+        pool.start().unwrap();
+        let member_pids = pool.live_member_pids();
+        assert_eq!(member_pids.len(), 2);
+        pool.stop(Some(30.0));
+        assert!(member_pids.iter().all(|p| !alive(*p)));
+        let lines = lines.lock().unwrap();
+        assert!(
+            !lines.iter().any(|l| l.contains("killing its group")),
+            "{lines:?}"
+        );
     }
 
     #[test]

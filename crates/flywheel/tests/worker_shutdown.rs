@@ -66,6 +66,18 @@ fn process_gone(pid: i32) -> bool {
     }
 }
 
+/// Whether `sig` is ignored (SIG_IGN) by `pid`, from `/proc/<pid>/status`.
+/// The kernel discards an ignored signal when it is sent, so a signal
+/// sent while this holds can have no later effect.
+fn ignores(pid: i32, sig: libc::c_int) -> bool {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        .is_some_and(|mask| mask & (1 << (sig - 1)) != 0)
+}
+
 /// Live (non-zombie) children of `parent`.
 fn children_of(parent: i32) -> Vec<i32> {
     let mut out = Vec::new();
@@ -228,8 +240,13 @@ impl Fixture {
         pids_in(&self.root.join("grandchildren.pids"))
     }
 
+    /// A reader on the worker's store. WAL readers rarely block, but one
+    /// can still meet a transient lock (WAL recovery, the last writer's
+    /// close-time checkpoint), so wait it out instead of failing the read.
     fn db(&self) -> rusqlite::Connection {
-        rusqlite::Connection::open(self.repo.join(".flywheel/flywheel.sqlite")).unwrap()
+        let db = rusqlite::Connection::open(self.repo.join(".flywheel/flywheel.sqlite")).unwrap();
+        db.busy_timeout(SHUTDOWN_DEADLINE).unwrap();
+        db
     }
 
     fn claims(&self) -> Vec<(String, String)> {
@@ -373,7 +390,6 @@ fn sigterm_drains_the_pool_without_kill_escalation() {
     let mut fx = Fixture::new();
     let mut worker = fx.spawn_worker(2);
     let members = fx.wait_in_flight(&worker, 2, 2);
-    let started = Instant::now();
     signal(worker.id() as i32, libc::SIGTERM);
     let status = wait_exit(&mut worker, SHUTDOWN_DEADLINE);
     assert!(
@@ -382,13 +398,18 @@ fn sigterm_drains_the_pool_without_kill_escalation() {
         fx.worker_log()
     );
     fx.assert_clean_shutdown(&members);
-    // The pool's stop window is 10s before it SIGKILLs a member that has
-    // not exited; an orderly member drain never gets near it.
+    // The pool SIGKILLs (and logs) any member still alive when its stop
+    // window closes; an orderly drain has every member exit on its own.
+    let log = fx.worker_log();
     assert!(
-        started.elapsed() < Duration::from_secs(8),
-        "members hung after SIGTERM until the kill escalation ({:?})\n{}",
-        started.elapsed(),
-        fx.worker_log()
+        !log.contains("of SIGTERM; killing its group"),
+        "members hung after SIGTERM until the kill escalation\n{log}"
+    );
+    assert_eq!(
+        log.matches("in-flight task finalized to interrupted")
+            .count(),
+        2,
+        "{log}"
     );
     let interrupted = fx
         .lifecycle_statuses()
@@ -443,11 +464,20 @@ fn nohup_pool_ignores_sighup_and_still_drains_on_sigterm() {
     let mut fx = Fixture::new();
     let mut worker = fx.spawn_worker_with(2, true);
     let members = fx.wait_in_flight(&worker, 2, 2);
+    // SIGHUP stays ignored (no handler installed over the inherited
+    // SIG_IGN), so the kernel drops the signals below on sending: once they
+    // are sent, nothing can still be on its way to stop the pool.
+    for pid in std::iter::once(worker.id() as i32).chain(members.iter().copied()) {
+        assert!(
+            ignores(pid, libc::SIGHUP),
+            "{pid} does not ignore SIGHUP\n{}",
+            fx.worker_log()
+        );
+    }
     signal(-(worker.id() as i32), libc::SIGHUP);
     for member in &members {
         signal(*member, libc::SIGHUP);
     }
-    std::thread::sleep(Duration::from_secs(3));
     assert!(
         worker.try_wait().unwrap().is_none(),
         "the nohup'd pool supervisor stopped on SIGHUP\n{}",
@@ -473,8 +503,13 @@ fn nohup_single_worker_ignores_sighup_and_still_stops_on_sigterm() {
     let mut fx = Fixture::new();
     let mut worker = fx.spawn_worker_with(1, true);
     let members = fx.wait_in_flight(&worker, 1, 0);
+    // As above: an ignored signal is dropped on sending.
+    assert!(
+        ignores(worker.id() as i32, libc::SIGHUP),
+        "the worker does not ignore SIGHUP\n{}",
+        fx.worker_log()
+    );
     signal(-(worker.id() as i32), libc::SIGHUP);
-    std::thread::sleep(Duration::from_secs(3));
     assert!(
         worker.try_wait().unwrap().is_none(),
         "the nohup'd worker stopped on SIGHUP\n{}",
@@ -506,7 +541,7 @@ fn sigkilled_pool_member_leaves_no_orphaned_agent() {
         .collect();
     assert_eq!(orphans.len(), 2, "agent + grandchild in {victim}'s session");
     signal(victim, libc::SIGKILL);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + SHUTDOWN_DEADLINE;
     while Instant::now() < deadline && !orphans.iter().all(|pid| process_gone(*pid)) {
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -522,10 +557,35 @@ fn sigkilled_pool_member_leaves_no_orphaned_agent() {
         fx.worker_log()
     );
     assert!(worker.try_wait().unwrap().is_none(), "{}", fx.worker_log());
+    // The SIGKILLed member never released its claim; its respawn (same
+    // worker id) re-acquires that task straight away and runs a fresh
+    // agent. Stop only once it has, so the shutdown below covers a pool
+    // that is whole again rather than racing the respawn's startup.
+    let respawned = {
+        let pid = worker.id() as i32;
+        let mut respawned = Vec::new();
+        wait_until(
+            "the respawned member to re-run its task",
+            Duration::from_secs(60),
+            || {
+                respawned = children_of(pid)
+                    .into_iter()
+                    .filter(|child| !members.contains(child))
+                    .collect();
+                respawned.len() == 1
+                    && fx.agents().len() >= 3
+                    && fx.grandchildren().len() >= 3
+                    && fx.claims().len() == 2
+            },
+        );
+        respawned
+    };
+    fx.tracked.extend(&respawned);
+    let late: Vec<i32> = fx.agents().into_iter().chain(fx.grandchildren()).collect();
+    fx.tracked.extend(late);
     signal(worker.id() as i32, libc::SIGTERM);
     assert!(wait_exit(&mut worker, SHUTDOWN_DEADLINE).is_some());
-    // The respawned member may have started its own agents meanwhile.
     let mut every_member = members.clone();
-    every_member.extend(children_of(worker.id() as i32));
+    every_member.extend(respawned);
     fx.assert_clean_shutdown(&every_member);
 }

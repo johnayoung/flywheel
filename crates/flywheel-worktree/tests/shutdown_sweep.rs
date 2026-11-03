@@ -32,11 +32,6 @@ fn worker_sigterm_terminates_agent_process_groups() {
             .build()
             .unwrap(),
     );
-    // Install tokio's process-wide SIGTERM handler before anything can
-    // deliver the signal, so it can never take the default (fatal) action.
-    let _guard = runtime.block_on(async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap()
-    });
     let stop = StopFlag::new();
     let shutdown = ShutdownSignal::new();
     arm_signals(
@@ -68,19 +63,20 @@ fn worker_sigterm_terminates_agent_process_groups() {
     });
     assert!(!process_gone(grandchild));
 
-    // Re-send until the watcher (armed on a runtime task) has observed it.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !stop.is_set() {
-        assert!(Instant::now() < deadline, "the worker never saw SIGTERM");
-        // SAFETY: signalling our own pid with a handled signal.
-        unsafe {
-            libc::kill(libc::getpid(), libc::SIGTERM);
-        }
-        std::thread::sleep(Duration::from_millis(50));
+    // `arm_signals` installed the handler before returning, so one SIGTERM
+    // is caught (tests/signal_arming.rs pins that).
+    // SAFETY: signalling our own pid with a handled signal.
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGTERM);
     }
-    assert!(shutdown.is_triggered());
+    // The watcher sets `stop`, then triggers `shutdown`: wait on the last.
+    let seen = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(60), shutdown.triggered()).await
+    });
+    assert!(seen.is_ok(), "the worker never saw SIGTERM");
+    assert!(stop.is_set());
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline && !process_gone(grandchild) {
         std::thread::sleep(Duration::from_millis(50));
     }

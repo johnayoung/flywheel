@@ -25,7 +25,7 @@ pub const PRICE_AS_OF: &str = "2026-10-06";
 /// Per-day totals kept per session (the week rollup needs 7).
 pub const KEEP_DAYS: i64 = 62;
 /// Responses remembered per session to replace a repeated one.
-const RECENT_TURNS: usize = 512;
+pub(crate) const RECENT_TURNS: usize = 512;
 /// The archive file in the state dir.
 pub const ARCHIVE_FILE: &str = "usage-archive.json";
 

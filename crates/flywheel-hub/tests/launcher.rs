@@ -78,6 +78,11 @@ async fn cli(hub: &TestHub, args: &[&str]) -> (i32, String, String) {
 
 impl TestHub {
     async fn start(dir: tempfile::TempDir, claude: &str) -> Self {
+        Self::start_agents(dir, claude, "exec sleep 600").await
+    }
+
+    /// With stand-ins running `claude` and `codex` (shell bodies).
+    async fn start_agents(dir: tempfile::TempDir, claude: &str, codex: &str) -> Self {
         flywheel_hub::install_crypto_provider();
         let repo = dir.path().join("repo");
         if !repo.exists() {
@@ -88,7 +93,7 @@ impl TestHub {
             git(&repo, &["commit", "-q", "-m", "init"]);
         }
         let claude = fake_agent(dir.path(), "claude", claude);
-        let codex = fake_agent(dir.path(), "codex", "exec sleep 600");
+        let codex = fake_agent(dir.path(), "codex", codex);
         let mut options = HubOptions::new(dir.path().join("state"));
         options.default_shell = vec!["/bin/sh".into()];
         options.agents.claude = claude.to_string_lossy().into_owned();
@@ -359,13 +364,45 @@ async fn templates_are_saved_listed_replaced_and_removed_and_survive_a_restart()
         Some(json!({ "name": "Review", "kind": "codex", "approval": "never", "sandbox": "read-only" })),
     )
     .await;
-    // Same name again: replaced.
+    // Same name again: refused unless it says to replace.
+    let (status, error) = hub
+        .call(
+            reqwest::Method::POST,
+            &path,
+            Some(json!({ "name": " Fix tests ", "kind": "claude", "model": "opus" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
     hub.ok(
         reqwest::Method::POST,
         &path,
-        Some(json!({ "name": "Fix tests", "kind": "claude", "model": "opus" })),
+        Some(json!({ "name": "Fix tests", "kind": "claude", "model": "opus", "replace": true })),
     )
     .await;
+    // A typo is refused, not saved without the option it meant; so is a
+    // shell (templates start agents).
+    for body in [
+        json!({ "name": "typo", "kind": "claude", "promt": "hi" }),
+        json!({ "name": "sh", "kind": "shell" }),
+    ] {
+        let (status, error) = hub
+            .call(reqwest::Method::POST, &path, Some(body.clone()))
+            .await;
+        assert!(status.is_client_error(), "{body}: {status} {error}");
+    }
+    // One that switches the checks off says so.
+    let danger = hub
+        .ok(
+            reqwest::Method::POST,
+            &path,
+            Some(json!({ "name": "Danger", "kind": "claude", "permission_mode": "bypassPermissions" })),
+        )
+        .await;
+    assert_eq!(danger["unchecked"], true);
+    let (status, _) = hub
+        .call(reqwest::Method::DELETE, &format!("{path}/Danger"), None)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     let listed = hub.ok(reqwest::Method::GET, "/api/templates", None).await;
     let templates = listed["templates"].as_array().unwrap();
     assert_eq!(templates.len(), 2);
@@ -656,5 +693,113 @@ async fn cli_templates_and_new_from_a_template() {
     assert_eq!(code, 0);
     let (_, out, _) = cli(&hub, &["template", "ls", "w"]).await;
     assert!(out.starts_with("no templates"), "{out}");
+    hub.stop().await;
+}
+
+#[tokio::test]
+async fn codex_rollout_usage_reaches_the_session_the_events_socket_and_rollups() {
+    // The stand-in writes its rollout where Codex would (by its thread
+    // id, under CODEX_HOME's sessions/), and the test sends its notify.
+    let dir = tempfile::tempdir().unwrap();
+    let thread = "01a07c85-9201-7123-8801-041350ceed6a";
+    let day = dir.path().join("codex-home/sessions/2026/11/02");
+    let now = chrono::Utc::now().to_rfc3339();
+    let context =
+        json!({"timestamp": now, "type": "turn_context", "payload": {"model": "gpt-5-codex"}});
+    let count = |input: u64, cached: u64, output: u64| {
+        json!({"timestamp": now, "type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": input, "cached_input_tokens": cached, "output_tokens": output},
+        }}})
+    };
+    let env_file = dir.path().join("codex.env");
+    let codex = format!(
+        "env > '{env}.tmp' && mv '{env}.tmp' '{env}'\nmkdir -p '{day}'\n\
+         printf '%s\\n' '{context}' '{first}' '{first}' '{second}' >> '{day}/rollout-2026-11-02T10-00-00-{thread}.jsonl'\n\
+         exec sleep 600",
+        env = env_file.display(),
+        day = day.display(),
+        first = count(2000, 500, 100),
+        second = count(5000, 2500, 300),
+    );
+    let hub = TestHub::start_agents(dir, "exec sleep 600", &codex).await;
+    let wid = hub.workspace().await;
+    let mut request = format!("ws://{}/api/events?client=t", hub.addr)
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", hub.token).parse().unwrap(),
+    );
+    let (mut events, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let created = hub
+        .ok(
+            reqwest::Method::POST,
+            "/api/sessions",
+            Some(json!({ "workspace_id": wid, "kind": "codex" })),
+        )
+        .await;
+    let id = created["id"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let env = loop {
+        if let Ok(text) = std::fs::read_to_string(&env_file) {
+            break text
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect::<std::collections::HashMap<_, _>>();
+        }
+        assert!(Instant::now() < deadline, "codex never launched");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    };
+    // Its turn-complete notify names the thread, so the rollout is found.
+    flywheel_hub::report::send(
+        Path::new(&env[flywheel_hub::report::SOCKET_ENV]),
+        &flywheel_hub::report::Report {
+            session: id.clone(),
+            secret: env[flywheel_hub::report::SECRET_ENV].clone(),
+            source: "codex".into(),
+            event: "notify".into(),
+            detail: None,
+            payload: Some(json!({
+                "type": "agent-turn-complete", "thread-id": thread, "turn-id": "t1",
+                "last-assistant-message": "done",
+            })),
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let usage = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let message = timeout(remaining, events.next())
+            .await
+            .expect("no usage event")
+            .unwrap()
+            .unwrap();
+        if let Message::Text(text) = message {
+            let value: Value = serde_json::from_str(text.as_str()).unwrap();
+            if value["type"] == "usage" && value["session_id"] == json!(id) {
+                break value["usage"].clone();
+            }
+        }
+    };
+    // Totals counted by their growth (the repeat adds nothing): 2500
+    // uncached input, 2500 cached, 300 output at gpt-5-codex's prices.
+    assert_eq!(usage["turns"], 2);
+    assert_eq!(usage["tokens"]["input"], 2500);
+    assert_eq!(usage["tokens"]["cache_read"], 2500);
+    assert_eq!(usage["tokens"]["output"], 300);
+    let expected = (2500.0 * 1.25 + 2500.0 * 0.125 + 300.0 * 10.0) / 1e6;
+    assert!((usage["cost_usd"].as_f64().unwrap() - expected).abs() < 1e-9);
+    assert_eq!(usage["priced"], true);
+    let rollup = hub.ok(reqwest::Method::GET, "/api/usage", None).await;
+    assert_eq!(rollup["today"]["total_tokens"], 5300);
+    assert_eq!(rollup["workspaces"][0]["total"]["total_tokens"], 5300);
+    let (code, out, err) = cli(&hub, &["ls", "--json"]).await;
+    assert_eq!(code, 0, "{err}");
+    let listed: Value = serde_json::from_str(&out).unwrap();
+    let row = &listed["workspaces"][0]["sessions"][0];
+    assert_eq!(row["id"], json!(id));
+    assert_eq!(row["usage"]["total_tokens"], 5300);
+    assert_eq!(listed["usage"]["today"]["total_tokens"], 5300);
     hub.stop().await;
 }

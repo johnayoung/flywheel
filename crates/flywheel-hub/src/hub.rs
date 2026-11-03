@@ -283,6 +283,10 @@ pub struct SessionView {
     /// An agent session's tokens and cost, from its transcript (absent
     /// before its first counted call).
     pub usage: Option<crate::usage::UsageView>,
+    /// Its agent runs with its safety checks off (Claude
+    /// bypassPermissions, or Codex with no sandbox and no approvals).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unchecked: bool,
 }
 
 /// A launch template with the workspace it belongs to.
@@ -291,6 +295,19 @@ pub struct TemplateView {
     pub workspace_id: String,
     #[serde(flatten)]
     pub template: crate::state::LaunchTemplate,
+    /// It starts an agent with its safety checks off.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub unchecked: bool,
+}
+
+impl TemplateView {
+    fn new(workspace_id: String, template: crate::state::LaunchTemplate) -> Self {
+        Self {
+            unchecked: template.launch.bypasses_permissions(),
+            workspace_id,
+            template,
+        }
+    }
 }
 
 /// A hub-wide change, pushed to every events subscriber.
@@ -791,12 +808,17 @@ impl Hub {
         let usage = self
             .commands
             .usage(&record, chrono::Local::now().date_naive());
+        let unchecked = record
+            .launch
+            .as_ref()
+            .is_some_and(agent::AgentLaunch::bypasses_permissions);
         SessionView {
             record,
             live,
             agent,
             git,
             usage,
+            unchecked,
         }
     }
 
@@ -913,6 +935,19 @@ impl Hub {
             companion_of: None,
             launch: (!options.is_empty()).then_some(options),
         };
+        if record
+            .launch
+            .as_ref()
+            .is_some_and(agent::AgentLaunch::bypasses_permissions)
+        {
+            // Said where the operator's hub logs go, not only in a browser.
+            eprintln!(
+                "fw hub: session {} ({}) starts {} with its permission checks off",
+                record.name,
+                record.id,
+                record.kind.as_str()
+            );
+        }
         let launched = self.launch(record, request.cols, request.rows, prompt.as_deref());
         if launched.is_err()
             && let Some(worktree) = &worktree
@@ -2040,27 +2075,25 @@ impl Hub {
         let mut views = Vec::new();
         for id in ids {
             for template in store.templates(&id)? {
-                views.push(TemplateView {
-                    workspace_id: id.clone(),
-                    template,
-                });
+                views.push(TemplateView::new(id.clone(), template));
             }
         }
         Ok(views)
     }
 
-    /// Save (create or replace by name) a workspace's launch template.
+    /// Save a workspace's launch template (replacing one of the same name
+    /// only when `replace`).
     pub fn save_template(
         &self,
         workspace_id: &str,
         template: crate::state::LaunchTemplate,
+        replace: bool,
     ) -> Result<TemplateView, HubError> {
-        let template = self.store().save_template(workspace_id, template)?;
+        let template = self
+            .store()
+            .save_template(workspace_id, template, replace)?;
         self.emit(HubEvent::Sessions);
-        Ok(TemplateView {
-            workspace_id: workspace_id.to_owned(),
-            template,
-        })
+        Ok(TemplateView::new(workspace_id.to_owned(), template))
     }
 
     /// Remove a workspace's launch template.

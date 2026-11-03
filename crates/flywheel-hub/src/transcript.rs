@@ -64,6 +64,9 @@ pub const FRESH_WITHIN: Duration = Duration::from_secs(120);
 pub const MAX_PASTE_BYTES: usize = 1024 * 1024;
 /// Subagent transcripts followed per session (for usage).
 const MAX_SUBAGENT_TAILS: usize = 256;
+/// Files left behind by a conversation switch whose read positions are
+/// kept (going back reads on from there instead of counting them again).
+const MAX_PARKED_TAILS: usize = 512;
 
 /// Which agent's file format a tail reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,10 +375,13 @@ struct Saved {
     /// Claude subagent transcripts being read for usage.
     #[serde(default)]
     subagents: Vec<SavedTail>,
+    /// Where earlier conversations' files were left.
+    #[serde(default)]
+    parked: Vec<SavedTail>,
 }
 
 /// Where a tail stopped.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SavedTail {
     path: PathBuf,
     format: Format,
@@ -408,12 +414,17 @@ struct SessionCommands {
     file: Option<PathBuf>,
     /// Why the last save failed.
     save_error: Option<String>,
-    /// Tokens and cost so far.
-    usage: SessionUsage,
+    /// Tokens and cost so far (its own lock: listings read it while a
+    /// long transcript is being drained).
+    usage: Arc<Mutex<SessionUsage>>,
     /// Claude subagent transcripts of the current conversation.
     subagents: Vec<Tail>,
+    /// Where files of earlier conversations were left, oldest first.
+    parked: VecDeque<SavedTail>,
     /// Usage changed since the last refresh reported it.
     usage_changed: bool,
+    /// The session was removed: nothing is read or saved any more.
+    gone: bool,
 }
 
 impl SessionCommands {
@@ -444,13 +455,46 @@ impl SessionCommands {
         }
         log.next_seq = log.next_seq.max(saved.next_seq);
         log.tail = saved.tail.map(Tail::resume);
-        log.usage = saved.usage;
+        log.usage = Arc::new(Mutex::new(saved.usage));
         log.subagents = saved.subagents.into_iter().map(Tail::resume).collect();
+        log.parked = saved.parked.into_iter().collect();
         log
+    }
+
+    fn usage(&self) -> std::sync::MutexGuard<'_, SessionUsage> {
+        self.usage.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keep where `tail` stopped, for a return to its file.
+    fn park(&mut self, tail: &Tail) {
+        self.parked.retain(|p| p.path != tail.path);
+        if self.parked.len() == MAX_PARKED_TAILS {
+            self.parked.pop_front();
+        }
+        self.parked.push_back(tail.saved());
+    }
+
+    /// A tail of `path`: on from where it was left, if it was read before.
+    fn reopen(&mut self, path: PathBuf, format: Format, conversation: Option<String>) -> Tail {
+        match self
+            .parked
+            .iter()
+            .position(|p| p.path == path && p.format == format)
+            .and_then(|at| self.parked.remove(at))
+        {
+            Some(saved) => Tail {
+                conversation,
+                ..Tail::resume(saved)
+            },
+            None => Tail::new(path, format, conversation),
+        }
     }
 
     /// Write the log to its file (atomically, owner-only).
     fn save(&mut self) {
+        if self.gone {
+            return;
+        }
         let Some(file) = self.file.as_deref() else {
             return;
         };
@@ -458,8 +502,9 @@ impl SessionCommands {
             next_seq: self.next_seq,
             tail: self.tail.as_ref().map(Tail::saved),
             commands: self.entries.iter().cloned().collect(),
-            usage: self.usage.clone(),
+            usage: self.usage().clone(),
             subagents: self.subagents.iter().map(Tail::saved).collect(),
+            parked: self.parked.iter().cloned().collect(),
         };
         let result = serde_json::to_vec(&saved)
             .map_err(std::io::Error::other)
@@ -556,7 +601,8 @@ impl SessionCommands {
                 push_bounded(added, more);
             }
             Item::Usage(turn) => {
-                self.usage_changed |= self.usage.observe(&turn);
+                let changed = self.usage().observe(&turn);
+                self.usage_changed |= changed;
             }
         });
         tail
@@ -585,8 +631,13 @@ impl SessionCommands {
                 break;
             }
             if !self.subagents.iter().any(|t| t.path == path) {
-                self.subagents
-                    .push(Tail::usage_only(path, conversation.map(str::to_owned)));
+                let conversation = conversation.map(str::to_owned);
+                let tail = if self.parked.iter().any(|p| p.path == path) {
+                    self.reopen(path, Format::Claude, conversation)
+                } else {
+                    Tail::usage_only(path, conversation)
+                };
+                self.subagents.push(tail);
             }
         }
     }
@@ -622,11 +673,50 @@ pub struct CommandBook {
     dir: Option<PathBuf>,
     /// Logs of sessions deleted while no hub ran have been removed.
     swept: std::sync::atomic::AtomicBool,
-    sessions: Mutex<HashMap<String, Arc<Mutex<SessionCommands>>>>,
+    sessions: Mutex<HashMap<String, Arc<Slot>>>,
+    /// Sessions removed in this process: never followed again (a refresh
+    /// racing the removal would read the transcript from the start and
+    /// count it twice).
+    forgotten: Mutex<HashSet<String>>,
+    /// Held across a removal ([`CommandBook::retain`] and
+    /// [`CommandBook::forget`]), so one session is archived once.
+    removing: Mutex<()>,
     wake: Mutex<Option<mpsc::Sender<()>>>,
     /// Usage of removed sessions, and where it is saved.
     archive: Mutex<UsageArchive>,
     archive_file: Option<PathBuf>,
+}
+
+/// One session's log, and its usage (also reachable without the log's
+/// lock, which a transcript drain holds).
+#[derive(Debug)]
+struct Slot {
+    log: Mutex<SessionCommands>,
+    usage: Arc<Mutex<SessionUsage>>,
+}
+
+impl Slot {
+    fn new(log: SessionCommands) -> Self {
+        Self {
+            usage: Arc::clone(&log.usage),
+            log: Mutex::new(log),
+        }
+    }
+
+    fn log(&self) -> std::sync::MutexGuard<'_, SessionCommands> {
+        self.log.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn usage(&self) -> std::sync::MutexGuard<'_, SessionUsage> {
+        self.usage.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stop the log (a refresh holding it saves and reads nothing more)
+    /// and take its usage.
+    fn close(&self) -> SessionUsage {
+        self.log().gone = true;
+        std::mem::take(&mut *self.usage())
+    }
 }
 
 /// What [`CommandBook::refresh_all`] found.
@@ -674,6 +764,8 @@ impl CommandBook {
             dir,
             swept: std::sync::atomic::AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
+            forgotten: Mutex::new(HashSet::new()),
+            removing: Mutex::new(()),
             wake: Mutex::new(None),
             archive: Mutex::new(UsageArchive::default()),
             archive_file: None,
@@ -694,14 +786,28 @@ impl CommandBook {
             .map(|d| d.join(format!("{id}.json")))
     }
 
-    fn entry(&self, id: &str) -> Arc<Mutex<SessionCommands>> {
+    fn entry(&self, id: &str) -> Arc<Slot> {
+        if self.is_forgotten(id) {
+            // Removed: an empty log of its own, never saved or kept.
+            return Arc::new(Slot::new(SessionCommands {
+                gone: true,
+                ..SessionCommands::default()
+            }));
+        }
         let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(entry) = sessions.get(id) {
             return Arc::clone(entry);
         }
-        let entry = Arc::new(Mutex::new(SessionCommands::load(self.file_of(id))));
+        let entry = Arc::new(Slot::new(SessionCommands::load(self.file_of(id))));
         sessions.insert(id.to_owned(), Arc::clone(&entry));
         entry
+    }
+
+    fn is_forgotten(&self, id: &str) -> bool {
+        self.forgotten
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(id)
     }
 
     /// Note what an agent report says about its transcript (Claude hooks
@@ -716,7 +822,7 @@ impl CommandBook {
     ) {
         let entry = self.entry(session_id);
         {
-            let mut log = entry.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut log = entry.log();
             // The agent is active: its file may exist now.
             log.missed = None;
             match kind {
@@ -798,9 +904,15 @@ impl CommandBook {
             return Refreshed::default();
         }
         let entry = self.entry(&record.id);
-        let mut log = entry.lock().unwrap_or_else(PoisonError::into_inner);
-        if log.usage.workspace_id.as_deref() != Some(record.workspace_id.as_str()) {
-            log.usage.workspace_id = Some(record.workspace_id.clone());
+        let mut log = entry.log();
+        if log.gone {
+            return Refreshed::default();
+        }
+        {
+            let mut usage = log.usage();
+            if usage.workspace_id.as_deref() != Some(record.workspace_id.as_str()) {
+                usage.workspace_id = Some(record.workspace_id.clone());
+            }
         }
         let conversation = record.agent_session_id.clone();
         let mut added = Vec::new();
@@ -819,14 +931,19 @@ impl CommandBook {
                     Some((path, format)) => {
                         // Finish the old file first: its last reply may
                         // have landed after the previous look.
+                        // Where each stops is kept: going back to that
+                        // conversation reads on from there.
                         if let Some(old) = log.tail.take() {
-                            log.drain(old, &mut added);
+                            let old = log.drain(old, &mut added);
+                            log.park(&old);
                         }
                         // ...and its subagents' (they belong to it).
                         for old in std::mem::take(&mut log.subagents) {
-                            log.drain(old, &mut added);
+                            let old = log.drain(old, &mut added);
+                            log.park(&old);
                         }
-                        log.tail = Some(Tail::new(path, format, conversation.clone()));
+                        let tail = log.reopen(path, format, conversation.clone());
+                        log.tail = Some(tail);
                         log.missed = None;
                         switched = true;
                     }
@@ -877,8 +994,8 @@ impl CommandBook {
             return None;
         }
         let entry = self.entry(&record.id);
-        let log = entry.lock().unwrap_or_else(PoisonError::into_inner);
-        (!log.usage.is_empty()).then(|| log.usage.view(today))
+        let usage = entry.usage();
+        (!usage.is_empty()).then(|| usage.view(today))
     }
 
     /// Add `record`'s usage to `rollup`.
@@ -892,8 +1009,7 @@ impl CommandBook {
             return;
         }
         let entry = self.entry(&record.id);
-        let log = entry.lock().unwrap_or_else(PoisonError::into_inner);
-        rollup.add_session(&log.usage, today);
+        rollup.add_session(&entry.usage(), today);
     }
 
     /// Usage of removed sessions.
@@ -932,7 +1048,7 @@ impl CommandBook {
     /// A session's commands, newest first.
     pub fn list(&self, record: &SessionRecord, filter: CommandFilter) -> CommandList {
         let entry = self.entry(&record.id);
-        let log = entry.lock().unwrap_or_else(PoisonError::into_inner);
+        let log = entry.log();
         CommandList {
             session_id: record.id.clone(),
             conversation: record.agent_session_id.clone(),
@@ -953,25 +1069,26 @@ impl CommandBook {
     /// `keep`, which must be every session the hub has. The first call
     /// also removes files left by sessions deleted while no hub ran.
     pub fn retain(&self, keep: &HashSet<String>) {
-        let mut gone = Vec::new();
-        self.sessions
+        self.retain_existing(&|id| keep.contains(id));
+    }
+
+    /// [`Self::retain`], asking `exists` (the hub's store, now) about each
+    /// session not followed any more. A session is only ever looked up
+    /// after its record exists, so one created since a snapshot of the
+    /// store is never taken for removed.
+    pub fn retain_existing(&self, exists: &dyn Fn(&str) -> bool) {
+        let _removing = self.removing.lock().unwrap_or_else(PoisonError::into_inner);
+        let candidates: Vec<String> = self
+            .sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|id, entry| {
-                let kept = keep.contains(id);
-                if !kept {
-                    gone.push((id.clone(), Arc::clone(entry)));
-                }
-                kept
-            });
+            .keys()
+            .cloned()
+            .collect();
+        let gone: Vec<String> = candidates.into_iter().filter(|id| !exists(id)).collect();
         let mut removed = Vec::new();
-        for (id, entry) in gone {
-            removed.push(std::mem::take(
-                &mut entry.lock().unwrap_or_else(PoisonError::into_inner).usage,
-            ));
-            if let Some(file) = self.file_of(&id) {
-                let _ = std::fs::remove_file(file);
-            }
+        for id in gone {
+            removed.push(self.close(&id));
         }
         if let Some(dir) = self.dir.as_deref()
             && !self.swept.swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -982,7 +1099,7 @@ impl CommandBook {
                     && path
                         .file_stem()
                         .and_then(|s| s.to_str())
-                        .is_some_and(|id| !keep.contains(id));
+                        .is_some_and(|id| !exists(id));
                 if stale {
                     // Removed while no hub ran: its usage is archived too.
                     if let Some(saved) = std::fs::read(&path)
@@ -1001,31 +1118,43 @@ impl CommandBook {
     /// Forget removed sessions now: their logs go, their usage moves to
     /// the archive (what [`Self::retain`] does on its next round).
     pub fn forget(&self, ids: &[String]) {
-        let mut removed = Vec::new();
-        for id in ids {
-            let entry = self
-                .sessions
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(id);
-            let usage = match entry {
-                Some(entry) => {
-                    std::mem::take(&mut entry.lock().unwrap_or_else(PoisonError::into_inner).usage)
-                }
-                None => SessionCommands::load(self.file_of(id)).usage,
-            };
-            removed.push(usage);
-            if let Some(file) = self.file_of(id) {
-                let _ = std::fs::remove_file(file);
-            }
-        }
+        let _removing = self.removing.lock().unwrap_or_else(PoisonError::into_inner);
+        let removed: Vec<SessionUsage> = ids.iter().map(|id| self.close(id)).collect();
         self.archive_usage(&removed);
+    }
+
+    /// Mark `id` removed, stop its log and delete its file; its usage (to
+    /// archive). Called with `removing` held; a second call for one id
+    /// returns nothing, so its usage is archived once.
+    fn close(&self, id: &str) -> SessionUsage {
+        if !self
+            .forgotten
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_owned())
+        {
+            return SessionUsage::default();
+        }
+        let entry = self
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id);
+        let usage = match entry {
+            Some(entry) => entry.close(),
+            // Never loaded by this process: what its file says.
+            None => SessionCommands::load(self.file_of(id)).usage().clone(),
+        };
+        if let Some(file) = self.file_of(id) {
+            let _ = std::fs::remove_file(file);
+        }
+        usage
     }
 
     /// Save every loaded session's log now, with where reading stopped (a
     /// live handoff: the next hub process reads on from there).
     pub(crate) fn save_all(&self) {
-        let entries: Vec<Arc<Mutex<SessionCommands>>> = self
+        let entries: Vec<Arc<Slot>> = self
             .sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1033,7 +1162,7 @@ impl CommandBook {
             .cloned()
             .collect();
         for entry in entries {
-            entry.lock().unwrap_or_else(PoisonError::into_inner).save();
+            entry.log().save();
         }
     }
 
@@ -1091,8 +1220,8 @@ pub fn spawn_watcher(hub: &Arc<Hub>) {
                     break;
                 };
                 let sessions = hub.sessions(None);
-                let keep: HashSet<String> = sessions.iter().map(|s| s.record.id.clone()).collect();
-                hub.command_book().retain(&keep);
+                hub.command_book()
+                    .retain_existing(&|id| hub.store().session(id).is_ok());
                 for view in sessions {
                     let running = view.live.as_ref().is_some_and(|l| l.pid.is_some());
                     if view.record.runs_agent() && running {
@@ -1333,7 +1462,7 @@ mod tests {
         append(&path, head);
         // The first refresh missed the file; a miss is retried only after
         // LOOKUP_RETRY, so forget it rather than wait.
-        book.entry("s1").lock().unwrap().missed = None;
+        book.entry("s1").log().missed = None;
         assert!(book.refresh(&record).is_empty());
         append(&path, rest);
         let added = book.refresh(&record);
@@ -1441,15 +1570,7 @@ mod tests {
         );
         let entry = book.entry("s1");
         assert!(
-            entry
-                .lock()
-                .unwrap()
-                .tail
-                .as_ref()
-                .unwrap()
-                .pending
-                .capacity()
-                <= MAX_LINE_BYTES + READ_CHUNK
+            entry.log().tail.as_ref().unwrap().pending.capacity() <= MAX_LINE_BYTES + READ_CHUNK
         );
 
         for i in 0..(MAX_COMMANDS + 20) {
@@ -1541,7 +1662,7 @@ mod tests {
             codex_rollout(&home, thread).as_deref(),
             Some(rollout.as_path())
         );
-        book.entry("s1").lock().unwrap().missed = None;
+        book.entry("s1").log().missed = None;
         let added = book.refresh(&record);
         assert_eq!(
             added.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
@@ -1753,6 +1874,132 @@ mod tests {
         let expected = (2500.0 * 1.25 + 2500.0 * 0.125 + 300.0 * 10.0) / 1e6;
         assert!((usage.total.cost_usd - expected).abs() < 1e-12);
         assert!(usage.total.priced);
+    }
+
+    #[test]
+    fn a_refresh_racing_a_removal_does_not_count_the_session_twice() {
+        let (dir, _, record, path) = claude_setup("c1");
+        let config = dir.path().join("claude");
+        let store = dir.path().join("state").join(COMMANDS_DIR);
+        let archive_file = dir.path().join("state").join(crate::usage::ARCHIVE_FILE);
+        let book =
+            CommandBook::new(Some(config), None, Some(store.clone())).with_archive(archive_file);
+        append(&path, &usage_line("m1", "claude-sonnet-5-5", 1000, 100));
+        assert!(book.refresh_all(&record).usage_changed);
+        // A refresh already holding the session's log when it is removed.
+        let held = book.entry(&record.id);
+        book.forget(std::slice::from_ref(&record.id));
+        assert!(held.log().gone, "the held log is stopped");
+        held.log().save();
+        // The watcher, working from a snapshot taken before the removal.
+        let refreshed = book.refresh_all(&record);
+        assert!(!refreshed.usage_changed && refreshed.commands.is_empty());
+        assert!(
+            !store.join("s1.json").exists(),
+            "a removed session's log is not saved again"
+        );
+        book.retain(&HashSet::from([record.id.clone()]));
+        book.retain(&HashSet::new());
+        book.forget(std::slice::from_ref(&record.id));
+        assert!(
+            book.usage(&record, chrono::Local::now().date_naive())
+                .is_none()
+        );
+        let mut hub = RollupBuilder::default();
+        hub.add_archive(&book.archive(), None, chrono::Local::now().date_naive());
+        let total = hub.build().total;
+        assert_eq!(total.tokens.input, 1000, "archived once");
+        assert_eq!(total.tokens.output, 100);
+    }
+
+    #[test]
+    fn going_back_to_a_conversation_reads_on_instead_of_counting_it_again() {
+        let (dir, _, mut record, first) = claude_setup("c1");
+        let config = dir.path().join("claude");
+        let store = dir.path().join("state").join(COMMANDS_DIR);
+        let open = || CommandBook::new(Some(config.clone()), None, Some(store.clone()));
+        let book = open();
+        let today = chrono::Local::now().date_naive();
+        // More responses than are remembered to replace a repeat.
+        let mut backlog = String::new();
+        for i in 0..(crate::usage::RECENT_TURNS + 100) {
+            backlog.push_str(&usage_line(&format!("a{i}"), "claude-sonnet-5-5", 10, 1));
+        }
+        append(&first, &backlog);
+        book.refresh_all(&record);
+        let counted = book.usage(&record, today).unwrap().turns;
+        assert_eq!(counted, (crate::usage::RECENT_TURNS + 100) as u64);
+        // /clear into c2, then back to c1 (the restarted hub too).
+        let second = first.with_file_name("c2.jsonl");
+        append(&second, &usage_line("b1", "claude-sonnet-5-5", 10, 1));
+        record.agent_session_id = Some("c2".into());
+        book.refresh_all(&record);
+        assert_eq!(book.usage(&record, today).unwrap().turns, counted + 1);
+        drop(book);
+        let book = open();
+        record.agent_session_id = Some("c1".into());
+        book.refresh_all(&record);
+        assert_eq!(book.usage(&record, today).unwrap().turns, counted + 1);
+        // What c1 adds after the return still counts.
+        append(&first, &usage_line("a-new", "claude-sonnet-5-5", 10, 1));
+        assert!(book.refresh_all(&record).usage_changed);
+        assert_eq!(book.usage(&record, today).unwrap().turns, counted + 2);
+        record.agent_session_id = Some("c2".into());
+        assert!(!book.refresh_all(&record).usage_changed);
+    }
+
+    #[test]
+    fn a_codex_rollout_followed_again_adds_only_its_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("codex");
+        let a = "01a07c85-9201-7123-8801-041350ceed6a";
+        let b = "01a07c85-9201-7123-8801-041350ceed6b";
+        let book = CommandBook::new(None, Some(home.clone()), None);
+        let mut record = record(SessionKind::Codex, dir.path(), a);
+        let day = home.join("sessions/2026/11/02");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout =
+            |thread: &str| day.join(format!("rollout-2026-11-02T10-00-00-{thread}.jsonl"));
+        let count = |input: u64, output: u64| {
+            json!({"timestamp": chrono::Utc::now().to_rfc3339(), "type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": input, "cached_input_tokens": 0, "output_tokens": output},
+            }}})
+            .to_string()
+                + "\n"
+        };
+        append(&rollout(a), &count(1000, 100));
+        append(&rollout(b), &count(50, 5));
+        let today = chrono::Local::now().date_naive();
+        book.refresh_all(&record);
+        record.agent_session_id = Some(b.into());
+        book.refresh_all(&record);
+        record.agent_session_id = Some(a.into());
+        assert!(!book.refresh_all(&record).usage_changed, "a's total again");
+        append(&rollout(a), &count(1200, 150));
+        assert!(book.refresh_all(&record).usage_changed);
+        let usage = book.usage(&record, today).unwrap();
+        assert_eq!(usage.total.tokens.input, 1250);
+        assert_eq!(usage.total.tokens.output, 155);
+    }
+
+    #[test]
+    fn usage_is_read_while_a_drain_holds_the_log() {
+        let (_dir, book, record, path) = claude_setup("c1");
+        append(&path, &usage_line("m1", "claude-sonnet-5-5", 1000, 100));
+        book.refresh_all(&record);
+        let book = Arc::new(book);
+        let slot = book.entry(&record.id);
+        let _draining = slot.log();
+        let (tx, rx) = mpsc::channel();
+        let reader = Arc::clone(&book);
+        let listed = record.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(reader.usage(&listed, chrono::Local::now().date_naive()));
+        });
+        let usage = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("usage waited on the transcript lock");
+        assert_eq!(usage.unwrap().turns, 1);
     }
 
     #[test]

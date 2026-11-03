@@ -28,20 +28,32 @@ pub(super) async fn list(
     Ok(Json(json!({ "templates": templates })).into_response())
 }
 
-/// A template as the API takes it.
+/// A template as the API takes it (an unknown field is refused: a typo
+/// must not save a template without the option it meant).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct TemplateBody {
     name: String,
     kind: SessionKind,
     #[serde(default)]
     prompt: Option<String>,
-    #[serde(flatten)]
-    launch: AgentLaunch,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    permission_mode: Option<String>,
+    #[serde(default)]
+    approval: Option<String>,
+    #[serde(default)]
+    sandbox: Option<String>,
     #[serde(default)]
     worktree: bool,
+    /// Overwrite the workspace's template of this name (else 409).
+    #[serde(default)]
+    replace: bool,
 }
 
-/// Create a template, or replace the workspace's one of the same name.
+/// Create a template; replace the workspace's one of the same name only
+/// with `replace`.
 pub(super) async fn save(
     State(app): State<AppState>,
     Path(workspace_id): Path<String>,
@@ -52,11 +64,17 @@ pub(super) async fn save(
         name: body.name,
         kind: body.kind,
         prompt: body.prompt,
-        launch: body.launch,
+        launch: AgentLaunch {
+            model: body.model,
+            permission_mode: body.permission_mode,
+            approval: body.approval,
+            sandbox: body.sandbox,
+        },
         worktree: body.worktree,
         updated_at: chrono::Utc::now(),
     };
-    let saved = blocking(move || hub.save_template(&workspace_id, template)).await?;
+    let replace = body.replace;
+    let saved = blocking(move || hub.save_template(&workspace_id, template, replace)).await?;
     Ok(Json(saved).into_response())
 }
 

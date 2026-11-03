@@ -641,13 +641,18 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
         .unwrap_or_else(|| "shell".to_owned());
     let mut body = json!({ "workspace_id": workspace_id, "kind": kind });
     if let Some(template) = &template {
-        for key in ["prompt", "model", "permission_mode", "approval", "sandbox"] {
-            if let Some(value) = template.get(key).filter(|v| v.is_string()) {
-                body[key] = value.clone();
-            }
-        }
+        template_options(template, &kind, &mut body);
     }
     args.launch.apply(&mut body, args.launch.prompt_text()?);
+    if body.get("permission_mode").and_then(Value::as_str) == Some("bypassPermissions")
+        || (body.get("approval").and_then(Value::as_str) == Some("never")
+            && body.get("sandbox").and_then(Value::as_str) == Some("danger-full-access"))
+    {
+        let _ = writeln!(
+            err,
+            "fw hub: warning: this agent runs every tool (shell, edits, network) without asking"
+        );
+    }
     // A template that runs in a worktree gets one named after it, unless
     // --worktree names it.
     let worktree = args.worktree.clone().or_else(|| {
@@ -679,6 +684,25 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
         );
     }
     Ok(view)
+}
+
+/// Copy `template`'s launch options into `body`: only those a `kind`
+/// session takes. `--kind` may override the template's kind; then only
+/// the prompt carries over (a Claude model or permission mode is not
+/// Codex's, and a shell takes neither).
+fn template_options(template: &Value, kind: &str, body: &mut Value) {
+    let same = template.get("kind").and_then(Value::as_str) == Some(kind);
+    let keys: &[&str] = match kind {
+        "claude" if same => &["prompt", "model", "permission_mode"],
+        "codex" if same => &["prompt", "model", "approval", "sandbox"],
+        "claude" | "codex" => &["prompt"],
+        _ => &[],
+    };
+    for key in keys {
+        if let Some(value) = template.get(*key).filter(|v| v.is_string()) {
+            body[*key] = value.clone();
+        }
+    }
 }
 
 /// `raw` percent-escaped for a URL query value (RFC 3986 unreserved
@@ -1099,6 +1123,24 @@ pub(crate) fn relaunch(args: &RelaunchArgs, out: &mut dyn Write, err: &mut dyn W
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kind_override_takes_only_the_template_options_that_kind_has() {
+        let template = json!({"kind": "claude", "prompt": "go", "model": "opus",
+            "permission_mode": "plan", "worktree": true});
+        let mut body = json!({});
+        template_options(&template, "codex", &mut body);
+        assert_eq!(body, json!({"prompt": "go"}));
+        let mut body = json!({});
+        template_options(&template, "shell", &mut body);
+        assert_eq!(body, json!({}));
+        let mut body = json!({});
+        template_options(&template, "claude", &mut body);
+        assert_eq!(
+            body,
+            json!({"prompt": "go", "model": "opus", "permission_mode": "plan"})
+        );
+    }
 
     fn items() -> Vec<Value> {
         vec![

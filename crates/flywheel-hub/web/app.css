@@ -3263,4 +3263,24 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .spend b { color: var(--brass); font-weight: 600; margin-right: .5rem; }
 #from-template { grid-column: 1 / -1; }
 #from-template[hidden] { display: none; }
-@media (max-width: 760px) { .meter.usage { display: none; } }
+/* A button (a tap shows the breakdown on touch screens). */
+button.meter.usage { border: 0; padding: 0; background: none; font: inherit; font-size: 10.5px; }
+button.meter.usage[hidden] { display: none; }
+.meter.usage .usage-model { color: var(--ink-3); }
+/* Phone: the cost alone stays in the header. */
+@media (max-width: 760px) {
+  button.meter.usage:not([hidden]) { display: inline; font-size: 10px; }
+  .meter.usage .usage-tok, .meter.usage .usage-model { display: none; }
+}
+.toast-pre { white-space: pre-line; font-size: 11px; }
+.tpl-note { margin: 0; font-size: 11px; color: var(--ink-2); }
+.tpl-note:empty { display: none; }
+.text-btn.armed, .slab.armed { color: var(--alert); }
+.slab.ghost.armed { border-color: var(--alert); }
+/* Quick launch of a template with its checks off. */
+.palette-item.warn .hint { color: var(--alert); }
+/* Narrow: an item's hint goes under its label, so names are never cut. */
+@media (max-width: 640px) {
+  .palette-item { grid-template-columns: 1.1rem 1fr; row-gap: .1rem; }
+  .palette-item .hint { grid-column: 2; white-space: normal; overflow-wrap: anywhere; }
+}

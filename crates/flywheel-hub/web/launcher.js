@@ -51,6 +51,9 @@ window.FwHubLauncher = function (ctx) {
   const tplSave = $("#tpl-save");
   const tplName = $("#tpl-name");
   const tplError = $("#tpl-error");
+  const tplNote = $("#tpl-note");
+  const tplDelete = $("#tpl-delete");
+  const tplSaveGo = $("#tpl-save-go");
 
   const options = (select, list) =>
     select.replaceChildren(...list.map(([value, label]) => el("option", { value, textContent: label })));
@@ -100,6 +103,7 @@ window.FwHubLauncher = function (ctx) {
   function usageTitle(usage) {
     if (!usage) return "";
     const lines = [costTitle(`${usage.turns} API call${usage.turns === 1 ? "" : "s"}`, usage)];
+    lines.push("  at API list prices (a subscription plan bills differently)");
     if (usage.today && usage.today.total_tokens !== usage.total_tokens) lines.push(costTitle("today", usage.today));
     for (const m of usage.models || []) {
       lines.push(`${m.label}: ${tokens(totalOf(m.tokens))} tok${m.cost_usd == null ? " (no price)" : `, ${dollars(m.cost_usd)}`}`);
@@ -115,14 +119,34 @@ window.FwHubLauncher = function (ctx) {
 
   // --- the session header and sidebar ---------------------------------------
 
+  // A model id as the header shows it ("claude-sonnet-5-5" -> "sonnet-5-5").
+  const shortModel = (id) => String(id || "").replace(/^claude-/, "").replace(/-\d{8}$/, "");
+
+  // "30k tok · $0.08 · sonnet-5-5": the model the transcript says was
+  // billed (which can differ from the one asked for), or "+N" for more.
   function renderHeader(session) {
     const meter = $("#meter-usage");
     const usage = session && session.usage;
     meter.hidden = !usage;
     if (!usage) return;
-    meter.textContent = `${tokens(usage.total_tokens)} tok · ${costText(usage)}`;
+    const models = [...new Set((usage.models || []).map((m) => m.model).filter(Boolean))];
+    const primary = (usage.last_turn && usage.last_turn.model) || models[0];
+    const model = primary ? `${shortModel(primary)}${models.length > 1 ? ` +${models.length - 1}` : ""}` : "";
+    meter.replaceChildren(
+      el("span", { className: "usage-tok", textContent: `${tokens(usage.total_tokens)} tok · ` }),
+      el("span", { textContent: costText(usage) }),
+      model ? el("span", { className: "usage-model", textContent: ` · ${model}` }) : "",
+    );
     meter.title = usageTitle(usage);
+    meter.setAttribute("aria-label", `usage: ${meter.textContent}. Show the breakdown`);
   }
+
+  // Touch screens have no tooltips: a tap shows the breakdown.
+  $("#meter-usage").addEventListener("click", () => {
+    const session = ctx.sessionById(state.attached);
+    if (!session || !session.usage) return;
+    toast(el("div", { className: "toast-pre", textContent: usageTitle(session.usage) }), { timeout: 9000 });
+  });
 
   // The cost chip of a sidebar row (agent sessions with usage).
   function rowChip(session) {
@@ -199,7 +223,7 @@ window.FwHubLauncher = function (ctx) {
     box.hidden = !agent;
     box.dataset.kind = kind;
     models.replaceChildren(...(MODELS[kind] || []).map((m) => el("option", { value: m })));
-    modelInput.placeholder = kind === "codex" ? "CLI default (e.g. gpt-5-codex)" : "CLI default (e.g. opus, sonnet)";
+    modelInput.placeholder = kind === "codex" ? "default: gpt-5-codex..." : "default: opus, sonnet...";
     updateWarning();
   }
 
@@ -212,8 +236,11 @@ window.FwHubLauncher = function (ctx) {
         ? "No sandbox and no approvals: Codex runs anything, anywhere, without asking."
         : "No sandbox: Codex commands can touch anything your user can.";
     }
+    const shown = !warn.hidden;
     warn.textContent = text;
     warn.hidden = !text;
+    // Below the fold of a tall form: bring it into view as it appears.
+    if (text && !shown) warn.scrollIntoView({ block: "nearest" });
   }
   modeSelect.addEventListener("change", updateWarning);
   approvalSelect.addEventListener("change", updateWarning);
@@ -246,8 +273,39 @@ window.FwHubLauncher = function (ctx) {
     tplSave.hidden = true;
     tplName.value = "";
     tplError.textContent = "";
+    note("");
     renderTemplates();
     updateWarning();
+  }
+
+  // What a save or delete did, said inside the dialog (a toast sits
+  // under the modal's backdrop).
+  function note(text) {
+    tplNote.textContent = text;
+  }
+
+  // A click that needs a second one: the first arms `button` (its text
+  // `armedText`) for a few seconds; returns whether this click confirms.
+  function armed(button, armedText) {
+    if (button.dataset.armed === "1") {
+      disarm(button);
+      return true;
+    }
+    button.dataset.label = button.dataset.label || button.textContent;
+    button.dataset.armed = "1";
+    button.textContent = armedText;
+    button.classList.add("armed");
+    clearTimeout(button._disarm);
+    button._disarm = setTimeout(() => disarm(button), 5000);
+    return false;
+  }
+
+  function disarm(button) {
+    clearTimeout(button._disarm);
+    if (button.dataset.armed !== "1") return;
+    button.dataset.armed = "";
+    button.textContent = button.dataset.label;
+    button.classList.remove("armed");
   }
 
   const templatesOf = (id) => (ctx.workspaceById(id)?.templates || []);
@@ -263,13 +321,16 @@ window.FwHubLauncher = function (ctx) {
         selected: t.name === selected,
       })),
     );
-    $("#tpl-delete").hidden = !tplSelect.value;
+    disarm(tplDelete);
+    tplDelete.hidden = !tplSelect.value;
   }
 
   // Fill the form from template `name`.
   function apply(name) {
     const template = templatesOf(workspaceId).find((t) => t.name === name);
-    $("#tpl-delete").hidden = !template;
+    disarm(tplDelete);
+    tplDelete.hidden = !template;
+    note("");
     if (!template) return;
     ctx.selectKind(template.kind);
     setKind(template.kind);
@@ -304,13 +365,24 @@ window.FwHubLauncher = function (ctx) {
       tplError.textContent = "Name the template.";
       return;
     }
-    const body = { name, kind: ctx.selectedKind(), worktree: $("#wt-on").checked, ...request() };
+    const kindNow = ctx.selectedKind();
+    if (kindNow !== "claude" && kindNow !== "codex") {
+      tplError.textContent = "A template starts an agent: pick Claude or Codex.";
+      return;
+    }
+    // Saving over one of the same name replaces all of it: say so first.
+    const exists = templatesOf(workspaceId).some((t) => t.name === name);
+    if (exists && !armed(tplSaveGo, `Replace ${name}`)) {
+      note(`A template named ${name} exists. Click Replace to overwrite every option it has with this form's.`);
+      return;
+    }
+    const body = { name, kind: kindNow, worktree: $("#wt-on").checked, replace: exists, ...request() };
     try {
       await api("POST", `/api/workspaces/${workspaceId}/templates`, body);
       await ctx.refresh();
       renderTemplates(name);
       tplSave.hidden = true;
-      toast(`Saved template ${name}.`, { timeout: 2500 });
+      note(`${exists ? "Replaced" : "Saved"} template ${name}.`);
     } catch (error) {
       tplError.textContent = error.message;
     }
@@ -319,11 +391,12 @@ window.FwHubLauncher = function (ctx) {
   async function deleteTemplate() {
     const name = tplSelect.value;
     if (!name) return;
+    if (!armed(tplDelete, `delete ${name}? click again`)) return;
     try {
       await api("DELETE", `/api/workspaces/${workspaceId}/templates/${encodeURIComponent(name)}`);
       await ctx.refresh();
       renderTemplates();
-      toast(`Deleted template ${name}.`, { timeout: 2500 });
+      note(`Deleted template ${name}.`);
     } catch (error) {
       tplError.textContent = error.message;
     }
@@ -332,12 +405,15 @@ window.FwHubLauncher = function (ctx) {
   $("#tpl-save-toggle").addEventListener("click", () => {
     tplSave.hidden = !tplSave.hidden;
     tplError.textContent = "";
+    note("");
+    disarm(tplSaveGo);
     if (!tplSave.hidden) {
       tplName.value = tplSelect.value || "";
       tplName.focus();
     }
   });
   $("#tpl-save-go").addEventListener("click", saveTemplate);
+  tplName.addEventListener("input", () => disarm(tplSaveGo));
   tplName.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
       event.preventDefault();
@@ -345,13 +421,28 @@ window.FwHubLauncher = function (ctx) {
       saveTemplate();
     }
   });
-  $("#tpl-delete").addEventListener("click", deleteTemplate);
+  tplDelete.addEventListener("click", deleteTemplate);
 
   // --- quick launch -------------------------------------------------------------
 
   // Launch `template` of `workspace` as is: its folder the last picked
   // (a git one when it runs in a worktree).
+  // Whether `template` starts its agent with the safety checks off.
+  const unchecked = (t) => t.unchecked === true || t.permission_mode === "bypassPermissions" ||
+    (t.approval === "never" && t.sandbox === "danger-full-access");
+
   async function quickLaunch(workspace, template) {
+    if (unchecked(template)) {
+      const ok = await ctx.confirmDialog({
+        kicker: "no permission checks",
+        title: `Launch ${template.name} unchecked?`,
+        body: template.kind === "codex"
+          ? "This template runs Codex with no sandbox and no approvals: it runs anything, anywhere, without asking."
+          : "This template runs Claude with bypassPermissions: every tool -- shell commands, file edits, network -- runs without asking.",
+        ok: "Launch unchecked",
+      });
+      if (!ok) return;
+    }
     const folders = workspace.folders.filter((f) => !f.missing);
     const last = folders.find((f) => f.path === state.repoChoice[workspace.id]);
     const folder = template.worktree
@@ -378,13 +469,37 @@ window.FwHubLauncher = function (ctx) {
 
   const PALETTE_PREFIX = "New agent from template";
 
-  function paletteItems(cmd) {
+  // Every template, with its workspace and a short line of its options
+  // (an unchecked one says so, first).
+  function eachTemplate(each) {
     for (const workspace of state.workspaces) {
       for (const template of workspace.templates || []) {
-        const opts = [template.kind, template.model, template.permission_mode, template.worktree ? "worktree" : null].filter(Boolean);
-        cmd(`${PALETTE_PREFIX}: ${template.name}`, `${workspace.name} · ${opts.join(" · ")}`, () => quickLaunch(workspace, template), "plus");
+        if (template.kind !== "claude" && template.kind !== "codex") continue;
+        const opts = [template.kind, template.model, template.worktree ? "worktree" : null].filter(Boolean);
+        const hint = `${unchecked(template) ? "NO CHECKS · " : ""}${workspace.name} · ${opts.join(" · ")}`;
+        each(workspace, template, hint);
       }
     }
+  }
+
+  function paletteItems(cmd) {
+    eachTemplate((workspace, template, hint) => {
+      cmd(`${PALETTE_PREFIX}: ${template.name}`, hint, () => quickLaunch(workspace, template), "plus", { warn: unchecked(template) });
+    });
+  }
+
+  // The quick-launch list ("From template"): items named by the template
+  // alone (a phone has no room for a prefix); unchecked ones last, so the
+  // highlighted first row is never one.
+  function templateItems() {
+    const items = [];
+    eachTemplate((workspace, template, hint) => {
+      items.push({
+        group: "Templates", glyph: "plus", label: template.name, hint,
+        warn: unchecked(template), run: () => quickLaunch(workspace, template),
+      });
+    });
+    return items.sort((a, b) => Number(a.warn) - Number(b.warn));
   }
 
   const anyTemplates = () => state.workspaces.some((w) => (w.templates || []).length);
@@ -403,7 +518,7 @@ window.FwHubLauncher = function (ctx) {
   }
 
   return {
-    setKind, reset, request, renderHeader, rowChip, workspaceChip, paletteItems, render, onUsage,
+    setKind, reset, request, renderHeader, rowChip, workspaceChip, paletteItems, templateItems, render, onUsage,
     loadRollups, rollupsSoon, PALETTE_PREFIX, tokens, costText, taskFrom,
   };
 };

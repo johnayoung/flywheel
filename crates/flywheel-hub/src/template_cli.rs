@@ -26,7 +26,8 @@ pub(crate) struct TemplateArgs {
 enum TemplateCommand {
     /// List launch templates (every workspace's, or one's).
     Ls(LsArgs),
-    /// Save a launch template (replacing the workspace's one of that name).
+    /// Save a launch template (--replace overwrites one of that name,
+    /// --edit changes only the options given).
     Save(SaveArgs),
     /// Remove a launch template.
     Rm(RmArgs),
@@ -103,15 +104,26 @@ struct SaveArgs {
     workspace: String,
     /// Template name (unique in the workspace).
     name: String,
-    /// claude, codex, or shell.
-    #[arg(long, value_parser = ["claude", "codex", "shell"])]
-    kind: String,
+    /// claude or codex (required unless --edit).
+    #[arg(long, value_parser = ["claude", "codex"], required_unless_present = "edit")]
+    kind: Option<String>,
     #[command(flatten)]
     launch: LaunchFlags,
     /// Launch it in a new sibling worktree (of a git folder; the task name
     /// is made from the template's name unless `new --worktree` gives one).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_worktree")]
     worktree: bool,
+    /// With --edit: launch it in its folder, not a new worktree.
+    #[arg(long, requires = "edit")]
+    no_worktree: bool,
+    /// Overwrite the template of this name (every option not given here is
+    /// cleared).
+    #[arg(long, conflicts_with = "edit")]
+    replace: bool,
+    /// Change only the options given on the existing template of this
+    /// name (an empty value, e.g. --model '', clears that option).
+    #[arg(long)]
+    edit: bool,
     #[command(flatten)]
     endpoint: EndpointArgs,
 }
@@ -298,15 +310,70 @@ fn ls(args: &LsArgs, out: &mut dyn Write) -> Result<(), String> {
 fn save(args: &SaveArgs, out: &mut dyn Write) -> Result<(), String> {
     let conn = Endpoint::resolve(&args.endpoint)?;
     let id = workspace_id(&conn, &args.workspace)?;
-    let mut body = json!({ "name": args.name, "kind": args.kind, "worktree": args.worktree });
-    args.launch.apply(&mut body, args.launch.prompt_text()?);
+    let existing = list(&conn, Some(&id))?
+        .into_iter()
+        .find(|t| str_field(t, "name") == args.name.trim());
+    let body = save_body(args, existing.as_ref(), args.launch.prompt_text()?)?;
     let saved = conn.blocking_call(
         "POST",
         &format!("/api/workspaces/{}/templates", query_escape(&id)),
         Some(&body),
     )?;
-    let _ = writeln!(out, "saved template {:?}", str_field(&saved, "name"));
+    let verb = match (&existing, args.edit) {
+        (Some(_), true) => "updated",
+        (Some(_), false) => "replaced",
+        (None, _) => "saved",
+    };
+    let _ = writeln!(out, "{verb} template {:?}", str_field(&saved, "name"));
     Ok(())
+}
+
+/// The request `template save` sends, given the template of that name
+/// the workspace has now (if any).
+fn save_body(
+    args: &SaveArgs,
+    existing: Option<&Value>,
+    prompt: Option<String>,
+) -> Result<Value, String> {
+    let name = args.name.trim();
+    let mut body = if args.edit {
+        let existing = existing.ok_or_else(|| {
+            format!("no template named {name:?} to edit (save it without --edit first)")
+        })?;
+        let mut body = json!({ "name": name });
+        for key in [
+            "kind",
+            "prompt",
+            "model",
+            "permission_mode",
+            "approval",
+            "sandbox",
+            "worktree",
+        ] {
+            if let Some(value) = existing.get(key).filter(|v| !v.is_null()) {
+                body[key] = value.clone();
+            }
+        }
+        if let Some(kind) = &args.kind {
+            body["kind"] = json!(kind);
+        }
+        body["replace"] = json!(true);
+        body
+    } else {
+        if existing.is_some() && !args.replace {
+            return Err(format!(
+                "a template named {name:?} already exists: --replace overwrites it (clearing every option not given), --edit changes only the options given"
+            ));
+        }
+        json!({ "name": name, "kind": args.kind, "replace": args.replace })
+    };
+    if args.worktree {
+        body["worktree"] = json!(true);
+    } else if args.no_worktree || !args.edit {
+        body["worktree"] = json!(false);
+    }
+    args.launch.apply(&mut body, prompt);
+    Ok(body)
 }
 
 fn rm(args: &RmArgs, out: &mut dyn Write) -> Result<(), String> {
@@ -337,6 +404,74 @@ mod tests {
         assert!(crate::git::validate_task(&task).is_ok());
         assert!(task_from("***").starts_with("agent-"));
         assert!(crate::git::validate_task(&task_from(&"x".repeat(200))).is_ok());
+    }
+
+    fn save_args(argv: &[&str]) -> SaveArgs {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            save: SaveArgs,
+        }
+        let mut full = vec!["save"];
+        full.extend_from_slice(argv);
+        <Cli as clap::Parser>::try_parse_from(full).unwrap().save
+    }
+
+    #[test]
+    fn saving_over_a_template_needs_replace_and_edit_keeps_the_rest() {
+        let existing = json!({"name": "demo", "kind": "claude", "prompt": "Say hi",
+            "model": "haiku", "permission_mode": "plan", "worktree": true,
+            "workspace_id": "w1", "updated_at": "2026-11-02T00:00:00Z"});
+        // A plain save over it is refused, naming both ways out.
+        let args = save_args(&["W", " demo ", "--kind", "claude"]);
+        let refused = save_body(&args, Some(&existing), None).unwrap_err();
+        assert!(
+            refused.contains("--replace") && refused.contains("--edit"),
+            "{refused}"
+        );
+        // --replace: exactly what was given.
+        let args = save_args(&["W", "demo", "--kind", "claude", "--replace"]);
+        assert_eq!(
+            save_body(&args, Some(&existing), None).unwrap(),
+            json!({"name": "demo", "kind": "claude", "replace": true, "worktree": false})
+        );
+        // --edit: one option changed (and one cleared), the rest kept.
+        let args = save_args(&[
+            "W",
+            "demo",
+            "--edit",
+            "--model",
+            "opus",
+            "--permission-mode",
+            "",
+        ]);
+        assert_eq!(
+            save_body(&args, Some(&existing), None).unwrap(),
+            json!({"name": "demo", "kind": "claude", "prompt": "Say hi", "model": "opus",
+                "permission_mode": "", "worktree": true, "replace": true})
+        );
+        let args = save_args(&["W", "demo", "--edit", "--no-worktree"]);
+        assert_eq!(
+            save_body(&args, Some(&existing), None).unwrap()["worktree"],
+            false
+        );
+        assert!(
+            save_body(&args, None, None)
+                .unwrap_err()
+                .contains("no template")
+        );
+        // New: saved as given.
+        let args = save_args(&["W", "new", "--kind", "codex", "--worktree"]);
+        assert_eq!(
+            save_body(&args, None, Some("go".into())).unwrap(),
+            json!({"name": "new", "kind": "codex", "replace": false, "worktree": true, "prompt": "go"})
+        );
+        assert!(
+            <SaveArgs as clap::Args>::augment_args(clap::Command::new("x"))
+                .try_get_matches_from(["x", "W", "n"])
+                .is_err(),
+            "--kind is needed without --edit"
+        );
     }
 
     #[test]

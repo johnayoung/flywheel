@@ -103,7 +103,7 @@
       </div>
       <div class="meters">
         <span id="meter-cwd" class="meter cwd"></span>
-        <span id="meter-usage" class="meter usage" hidden></span>
+        <button type="button" id="meter-usage" class="meter usage" hidden></button>
         <span id="meter-size" class="meter"></span>
         <span id="meter-viewers" class="meter"></span>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
@@ -322,6 +322,7 @@
       <button type="button" class="slab ghost" id="tpl-save-go">Save template</button>
     </div>
     <p class="form-error" id="tpl-error" role="alert"></p>
+    <p class="tpl-note" id="tpl-note" aria-live="polite"></p>
     <p class="form-error" id="session-error" role="alert"></p>
     <footer class="sheet-foot">
       <button type="button" class="text-btn tpl-save-toggle" id="tpl-save-toggle" title="Save these settings (kind, prompt, model, permissions, worktree) as a template of this workspace">save as template</button>

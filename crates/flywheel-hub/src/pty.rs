@@ -611,6 +611,23 @@ impl PtySession {
         self.lock().screen.bracketed_paste()
     }
 
+    /// Whether the terminal is in cooked mode with echo on (nothing has
+    /// taken it raw yet, e.g. an agent TUI still starting): what is typed
+    /// is echoed back as text.
+    pub fn echoes_input(&self) -> bool {
+        let Some(fd) = self.master_fd() else {
+            return false;
+        };
+        // SAFETY: tcgetattr writes one `termios`, valid for the call; `fd`
+        // is this live session's master (on Linux it reports the slave's
+        // settings).
+        let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &raw mut termios) } != 0 {
+            return false;
+        }
+        termios.c_lflag & libc::ECHO != 0 && termios.c_lflag & libc::ICANON != 0
+    }
+
     /// The terminal's rendered plain text.
     pub fn screen_text(&self, source: TextSource) -> ScreenText {
         self.lock().screen.text(source)
@@ -1086,6 +1103,20 @@ mod tests {
             session.kill(Duration::from_secs(2));
             assert!(session.wait_exit(Duration::from_secs(10)));
         }
+    }
+
+    #[test]
+    fn echoes_input_tells_a_cooked_terminal_from_a_raw_one() {
+        let cooked = PtySession::spawn(spec("sleep 30"), |_| {}).unwrap();
+        assert!(cooked.echoes_input());
+        let raw = PtySession::spawn(spec("stty raw -echo; sleep 30"), |_| {}).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while raw.echoes_input() {
+            assert!(std::time::Instant::now() < deadline, "never went raw");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cooked.kill(Duration::ZERO);
+        raw.kill(Duration::ZERO);
     }
 
     #[test]

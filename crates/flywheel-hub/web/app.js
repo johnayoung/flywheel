@@ -336,10 +336,18 @@
         document.activeElement.matches("input, select, textarea");
       if (!busy) render();
     },
+    // The push carries the usage (set on the session already): redraw
+    // from it, never refetch every list per push.
     onSessionUsage: (id) => {
       if (state.attached === id) launcher.renderHeader(sessionById(id));
-      refresh(false).catch(() => {});
+      clearTimeout(state.usageRender);
+      state.usageRender = setTimeout(() => {
+        const busy = $("#sidebar").contains(document.activeElement) &&
+          document.activeElement.matches("input, select, textarea");
+        if (!busy) render();
+      }, 300);
     },
+    confirmDialog: (options) => confirmDialog(options),
   });
   // Review (review.js): a session's commits, diffs, and the guarded
   // commit / push / PR / rebase / merge actions.
@@ -3302,7 +3310,7 @@
         run: () => openSession(session.id),
       });
     }
-    const cmd = (label, hint, run, glyph = "chev") => items.push({ group: "Commands", glyph, label, hint, run });
+    const cmd = (label, hint, run, glyph = "chev", extra = {}) => items.push({ group: "Commands", glyph, label, hint, run, ...extra });
     cmd("New session", `${MOD} N`, () => openSessionDialog(), "plus");
     for (const workspace of state.workspaces) {
       cmd(`New session in ${workspace.name}`, "", () => openSessionDialog(workspace.id), "plus");
@@ -3440,7 +3448,7 @@
         el(
           "li",
           {
-            className: "palette-item",
+            className: `palette-item${item.warn ? " warn" : ""}`,
             role: "option",
             id: `palette-${i}`,
             "aria-selected": String(i === palette.index),
@@ -3474,10 +3482,12 @@
 
   const paletteOpen = () => !$("#palette").hidden;
 
-  // `query`: a filter to start from.
-  function openPalette(query) {
-    palette.items = paletteCommands();
+  // `query`: a filter to start from. `items`: a list of its own (the
+  // quick-launch list) instead of every command, with `placeholder`.
+  function openPalette(query, items, placeholder) {
+    palette.items = items || paletteCommands();
     palette.index = 0;
+    $("#palette-input").placeholder = placeholder || "Jump to a session or run a command";
     $("#palette-input").value = typeof query === "string" ? query : "";
     $("#palette").hidden = false;
     renderPalette();
@@ -3708,7 +3718,7 @@
     palette: () => openPalette(),
     "from-template": () => {
       document.body.classList.remove("side-open");
-      openPalette(launcher.PALETTE_PREFIX);
+      openPalette("", launcher.templateItems(), "Launch from a template");
     },
     "cycle-theme": () => applyTheme(THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length]),
     logout,

@@ -272,17 +272,17 @@ impl LaunchTemplate {
     /// a bounded prompt.
     pub fn validated(mut self) -> Result<Self, StateError> {
         self.name = validate_name(&self.name)?;
+        if !self.kind.is_agent() {
+            return Err(StateError::Invalid(
+                "a template starts an agent: kind claude or codex".into(),
+            ));
+        }
         self.launch = self
             .launch
             .validated(self.kind)
             .map_err(StateError::Invalid)?;
         self.prompt =
             crate::agent::validate_prompt(self.prompt.as_deref()).map_err(StateError::Invalid)?;
-        if self.prompt.is_some() && !self.kind.is_agent() {
-            return Err(StateError::Invalid(
-                "a shell template takes no prompt".into(),
-            ));
-        }
         Ok(self)
     }
 }
@@ -968,11 +968,14 @@ impl HubStore {
         &self.doc.templates
     }
 
-    /// Save a template, replacing the workspace's one of the same name.
+    /// Save a template. One of the same name is replaced only when
+    /// `replace` (otherwise: a conflict, so a save never silently drops
+    /// another's options).
     pub fn save_template(
         &mut self,
         workspace_id: &str,
         template: LaunchTemplate,
+        replace: bool,
     ) -> Result<LaunchTemplate, StateError> {
         self.workspace(workspace_id)?;
         let mut template = template.validated()?;
@@ -984,6 +987,12 @@ impl HubStore {
             .entry(workspace_id.to_owned())
             .or_default();
         match list.iter().position(|t| t.name == template.name) {
+            Some(_) if !replace => {
+                return Err(StateError::Conflict(format!(
+                    "a template named {:?} already exists; replace it (every option it had is overwritten) or pick another name",
+                    template.name
+                )));
+            }
             Some(at) => list[at] = template.clone(),
             None if list.len() >= MAX_TEMPLATES => {
                 return Err(StateError::Conflict(format!(
@@ -1244,7 +1253,7 @@ mod tests {
             updated_at: Utc::now(),
         };
         let saved = store
-            .save_template(&ws.id, template(" fix ", "opus"))
+            .save_template(&ws.id, template(" fix ", "opus"), false)
             .unwrap();
         assert_eq!(saved.name, "fix");
         assert_eq!(
@@ -1252,11 +1261,15 @@ mod tests {
             Some("Fix the flaky test.\nThen run it.")
         );
         store
-            .save_template(&ws.id, template("Audit", "sonnet"))
+            .save_template(&ws.id, template("Audit", "sonnet"), false)
             .unwrap();
-        // Same name: replaced, not added.
+        // Same name: refused unless replacing, then replaced, not added.
+        assert!(matches!(
+            store.save_template(&ws.id, template("fix ", "haiku"), false),
+            Err(StateError::Conflict(_))
+        ));
         store
-            .save_template(&ws.id, template("fix", "haiku"))
+            .save_template(&ws.id, template("fix", "haiku"), true)
             .unwrap();
         let names = |store: &HubStore| -> Vec<(String, Option<String>)> {
             store
@@ -1276,18 +1289,20 @@ mod tests {
         // Checked like a launch.
         let mut bad = template("bad", "opus");
         bad.kind = SessionKind::Shell;
+        bad.prompt = None;
+        bad.launch = AgentLaunch::default();
         assert!(matches!(
-            store.save_template(&ws.id, bad),
+            store.save_template(&ws.id, bad, false),
             Err(StateError::Invalid(_))
         ));
         let mut bad = template("bad", "opus");
         bad.launch.approval = Some("never".into());
         assert!(matches!(
-            store.save_template(&ws.id, bad),
+            store.save_template(&ws.id, bad, false),
             Err(StateError::Invalid(_))
         ));
         assert!(matches!(
-            store.save_template("nope", template("x", "opus")),
+            store.save_template("nope", template("x", "opus"), false),
             Err(StateError::NotFound(_))
         ));
         // Persisted (schema 3), and loaded back.

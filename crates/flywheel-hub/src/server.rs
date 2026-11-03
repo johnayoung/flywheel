@@ -1461,9 +1461,21 @@ async fn send_attachment(
     Some(events)
 }
 
+/// A terminal focus-in or focus-out report, alone.
+fn is_focus_report(bytes: &[u8]) -> bool {
+    bytes == b"\x1b[I" || bytes == b"\x1b[O"
+}
+
 /// Queue client input; tell the client when it was dropped because the
 /// terminal is not reading. Returns false when the socket is gone.
 async fn forward_input(socket: &mut WebSocket, session: &PtySession, bytes: Vec<u8>) -> bool {
+    // A browser's focus report (sent once a program asked for them) that
+    // reaches a terminal still in cooked mode -- an agent TUI enables
+    // focus reports before it takes the terminal raw -- would only be
+    // echoed onto the screen as `^[[I`.
+    if is_focus_report(&bytes) && session.echoes_input() {
+        return true;
+    }
     match session.write(bytes) {
         WriteOutcome::Queued | WriteOutcome::Closed => true,
         outcome @ (WriteOutcome::Backlogged | WriteOutcome::HandingOff) => {

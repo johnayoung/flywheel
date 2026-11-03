@@ -10,8 +10,17 @@
 //! (SIGWINCH). The prefix key (Ctrl+B unless `--prefix`) then:
 //!
 //! * `d` detach (the session keeps running), `s` switch session (picker),
-//!   `t` status bar on/off, `r` redraw (fresh snapshot), `?` help;
+//!   `t` status bar on/off, `r` redraw (fresh snapshot), `?` the key table;
 //! * the prefix again sends it once.
+//!
+//! When the attached session's process ends the client ends too (as tmux
+//! does), its final screen left in place. A session that had already ended
+//! stays attached, to read its last screen.
+//!
+//! Output is flow-controlled: at most [`OUTPUT_CREDIT`] bytes are between
+//! the socket and this terminal, so a terminal slower than the session
+//! (a slow SSH link) stalls the socket, and the hub's own handling of a
+//! lagging viewer (a fresh snapshot) takes over instead of a backlog here.
 //!
 //! The status bar (one row under the session, which gets one row less)
 //! names the session and its status and counts blocked / done sessions
@@ -20,7 +29,12 @@
 //! mirror of the session's terminal ([`crate::vt::Emulator`]).
 //!
 //! Attached counts as viewing the session, as a browser tab does: a turn
-//! that finishes is `idle` for this client, not `done`.
+//! that finishes is `idle` for this client, not `done`. The client id is
+//! the same on every run for this user on this machine, so what one
+//! attach saw stays seen in the next.
+//!
+//! With the token from the state dir, a rotation (`fw hub token --rotate`)
+//! re-reads it and reconnects.
 //!
 //! The terminal is restored on every way out: detach, errors, the hub
 //! going away, SIGTERM/SIGHUP, and panics (a hook).
@@ -30,7 +44,7 @@ mod keys;
 mod picker;
 mod term;
 
-use crate::endpoint::{Endpoint, EndpointArgs, Socket, client_id};
+use crate::endpoint::{Endpoint, EndpointArgs, Socket, stable_client_id};
 use crate::vt::Emulator;
 use filter::OutputFilter;
 use futures_util::{SinkExt, StreamExt};
@@ -43,7 +57,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 use term::{Input, StdinReader};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
@@ -53,6 +67,8 @@ const MESSAGE_FOR: Duration = Duration::from_secs(4);
 const SIZE_WAIT: Duration = Duration::from_secs(2);
 /// Wait between reconnects of the events socket.
 const EVENTS_RETRY: Duration = Duration::from_secs(2);
+/// Most session output bytes received but not yet written to the terminal.
+const OUTPUT_CREDIT: usize = 256 * 1024;
 /// The hub's close code for a rotated token.
 const CLOSE_ROTATED: u16 = crate::server::WS_CLOSE_ROTATED;
 
@@ -92,10 +108,12 @@ pub fn status_counts(view: &HubView) -> (usize, usize) {
 /// Everything the attach loop waits on.
 pub enum Ev {
     Input(Input),
-    /// Traffic of the session connection `generation`.
+    /// Traffic of the session connection `generation`; `credit`: output
+    /// bytes to give back to it once handled.
     Session {
         generation: u64,
         msg: SessionMsg,
+        credit: u32,
     },
     /// The hub view changed.
     Hub,
@@ -121,7 +139,10 @@ pub enum SessionMsg {
     },
     Exit(String),
     Error(String),
+    /// The connection ended: why.
     Closed(String),
+    /// The hub rotated its token and closed the connection.
+    Rotated,
 }
 
 pub(crate) fn attach(args: &AttachArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -129,13 +150,13 @@ pub(crate) fn attach(args: &AttachArgs, out: &mut dyn Write, err: &mut dyn Write
         let _ = writeln!(err, "fw hub attach: {message}");
         1
     };
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return fail(err, "needs a terminal (stdin and stdout)");
-    }
     let prefix = match Prefix::parse(&args.prefix) {
         Ok(prefix) => prefix,
         Err(message) => return fail(err, &message),
     };
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return fail(err, "needs a terminal (stdin and stdout)");
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("fw-hub-attach")
@@ -220,6 +241,11 @@ pub(crate) fn attach(args: &AttachArgs, out: &mut dyn Write, err: &mut dyn Write
             let _ = writeln!(out, "[detached from {name}]");
             0
         }
+        Ending::Ended { label, how, park } => {
+            let _ = term::write(park.as_bytes());
+            let _ = writeln!(out, "[{label} {how}]");
+            0
+        }
         Ending::Quit => 0,
         Ending::Failed(message) => {
             let _ = term::write(b"\x1b[H\x1b[2J");
@@ -236,6 +262,13 @@ fn str_of<'a>(v: &'a Value, field: &str) -> &'a str {
 enum Ending {
     /// Detached from this session (`workspace/name`).
     Detached(String),
+    /// The attached session's process ended: its name, how, and where to
+    /// put the cursor for the goodbye.
+    Ended {
+        label: String,
+        how: String,
+        park: String,
+    },
     /// Left the picker.
     Quit,
     Failed(String),
@@ -245,6 +278,12 @@ enum Ending {
 enum Leave {
     Detach,
     Switch,
+    /// The session's process ended while attached: how, and where the
+    /// cursor goes for the goodbye (set on the way out).
+    Exited {
+        how: String,
+        park: String,
+    },
     Failed(String),
 }
 
@@ -275,7 +314,12 @@ impl Client<'_> {
                             Some(id) => id,
                             None => return Ending::Quit,
                         },
-                        Picked::Quit => return Ending::Quit,
+                        // Quit from the switch picker: as a detach from the
+                        // session it was opened on.
+                        Picked::Quit => match from {
+                            Some(id) => return Ending::Detached(self.label(&id)),
+                            None => return Ending::Quit,
+                        },
                         Picked::Abort(why) => return Ending::Failed(why),
                     }
                 }
@@ -284,6 +328,7 @@ impl Client<'_> {
             match self.attached(&id) {
                 Leave::Detach => return Ending::Detached(label),
                 Leave::Switch => from = Some(id),
+                Leave::Exited { how, park } => return Ending::Ended { label, how, park },
                 Leave::Failed(message) => return Ending::Failed(message),
             }
         }
@@ -331,12 +376,32 @@ impl Client<'_> {
             Err(message) => return Leave::Failed(message),
         };
         let reader = StdinReader::start(self.tx.clone(), Ev::Input);
-        let mut screen = Screen::new(self.bar, link, self.label(id));
+        let running = {
+            let view = self.view.lock().unwrap_or_else(PoisonError::into_inner);
+            view.sessions
+                .iter()
+                .find(|s| str_of(s, "id") == id)
+                .and_then(|s| s.get("live")?.get("pid"))
+                .is_some_and(|pid| !pid.is_null())
+        };
+        let mut screen = Screen::new(self.bar, link, self.label(id), running);
         let leave = self.pump(id, &mut screen);
         drop(reader);
         screen.link.close();
         // Leave the terminal clean for the picker or the shell.
         let _ = term::write(term::RESET);
+        if let Leave::Exited { how, .. } = leave {
+            // The session's last screen stays; the bar row (or a new last
+            // line) takes the client's goodbye, once the terminal is
+            // restored (which homes the cursor).
+            let rows = screen.term.1;
+            let park = if screen.bar_shown() {
+                format!("\x1b[{rows};1H\x1b[2K")
+            } else {
+                format!("\x1b[{rows};1H\r\n")
+            };
+            return Leave::Exited { how, park };
+        }
         leave
     }
 
@@ -379,6 +444,16 @@ impl Client<'_> {
                 }
             };
             let step = match ev {
+                Ev::Input(Input::Bytes(_)) if screen.help => {
+                    // Any key leaves the key table; a fresh snapshot
+                    // repaints the session under it.
+                    screen.help = false;
+                    let _ = term::write(b"\x1b[0m\x1b[H\x1b[2J");
+                    if let Err(message) = self.reattach(id, screen) {
+                        return Leave::Failed(message);
+                    }
+                    Ok(())
+                }
                 Ev::Input(Input::Bytes(bytes)) => {
                     let was_armed = keys.armed();
                     let mut step = Ok(());
@@ -400,11 +475,27 @@ impl Client<'_> {
                     step
                 }
                 Ev::Input(Input::Closed(why)) => return Leave::Failed(why),
-                Ev::Session { generation, msg } => {
+                Ev::Session {
+                    generation,
+                    msg,
+                    credit,
+                } => {
                     if generation != screen.link.generation {
                         continue;
                     }
-                    self.session_msg(id, screen, msg)
+                    let step = if screen.help
+                        && !matches!(
+                            msg,
+                            SessionMsg::Exit(_) | SessionMsg::Closed(_) | SessionMsg::Rotated
+                        ) {
+                        // Under the key table: dropped (redrawn after).
+                        Ok(())
+                    } else {
+                        self.session_msg(id, screen, msg)
+                    };
+                    // Written (or dropped): the socket may read on.
+                    screen.link.credit.add_permits(credit as usize);
+                    step
                 }
                 Ev::Hub => {
                     screen.label = self.label(id);
@@ -438,14 +529,12 @@ impl Client<'_> {
                 }
             }
             Command::Help => {
-                let p = self.prefix.label();
-                screen.flash(format!(
-                    "{p} d detach  {p} s switch  {p} t bar  {p} r redraw  {p} {p} send {p}"
-                ));
-                if !screen.bar {
-                    self.bar = true;
-                    screen.set_bar(true);
+                screen.help = true;
+                let out = help_bytes(screen.term, &self.prefix.label());
+                if let Err(e) = term::write(&out) {
+                    return Some(Leave::Failed(format!("terminal: {e}")));
                 }
+                return None;
             }
             Command::Unbound(byte) => {
                 screen.flash(format!(
@@ -495,6 +584,13 @@ impl Client<'_> {
                 screen.flush_bar(self)
             }
             SessionMsg::Exit(how) => {
+                if screen.running {
+                    // It ended while attached: so does the client.
+                    return Err(Leave::Exited {
+                        how,
+                        park: String::new(),
+                    });
+                }
                 // An ended session's PTY is not resized: no size will come.
                 screen.awaiting_size = None;
                 screen.exited = Some(how.clone());
@@ -520,6 +616,17 @@ impl Client<'_> {
                 screen.flush_bar(self)
             }
             SessionMsg::Closed(why) => Err(Leave::Failed(why)),
+            SessionMsg::Rotated => {
+                if self.endpoint.reload_token().is_some() {
+                    // The token came from the state dir: the new one is
+                    // there; carry on with it.
+                    self.reattach(id, screen).map_err(Leave::Failed)
+                } else {
+                    Err(Leave::Failed(
+                        "the hub's token was rotated: get the new one with `fw hub token`".into(),
+                    ))
+                }
+            }
         }
     }
 }
@@ -553,12 +660,16 @@ struct Screen {
     resized_for_snapshot: bool,
     armed: bool,
     exited: Option<String>,
+    /// The session's process ran when attached (its exit ends the client).
+    running: bool,
+    /// The key table is up.
+    help: bool,
     message: Option<(String, Instant)>,
     label: String,
 }
 
 impl Screen {
-    fn new(bar: bool, link: Link, label: String) -> Self {
+    fn new(bar: bool, link: Link, label: String, running: bool) -> Self {
         let term = term::size();
         Self {
             link,
@@ -573,6 +684,8 @@ impl Screen {
             resized_for_snapshot: false,
             armed: false,
             exited: None,
+            running,
+            help: false,
             message: None,
             label,
         }
@@ -693,7 +806,11 @@ impl Screen {
             self.bar_dirty = false;
             return Ok(());
         }
-        if self.snapshot_left > 0 || self.awaiting_size.is_some() || !self.filter.at_boundary() {
+        if self.help
+            || self.snapshot_left > 0
+            || self.awaiting_size.is_some()
+            || !self.filter.at_boundary()
+        {
             return Ok(());
         }
         self.bar_dirty = false;
@@ -810,6 +927,28 @@ fn bar_bytes(out: &mut Vec<u8>, (cols, rows): (u16, u16), region: u16, text: &Ba
     out.extend_from_slice(s.as_bytes());
 }
 
+/// The key table (`prefix ?`), one binding a line, clipped to the terminal.
+fn help_bytes((cols, rows): (u16, u16), p: &str) -> Vec<u8> {
+    let lines = [
+        format!("fw hub attach: keys (prefix {p})"),
+        String::new(),
+        format!("  {p} d   detach (the session keeps running)"),
+        format!("  {p} s   switch session"),
+        format!("  {p} t   status bar on/off"),
+        format!("  {p} r   redraw"),
+        format!("  {p} ?   this table"),
+        format!("  {p} {p}   send {p}"),
+        String::new(),
+        "any key to return".to_owned(),
+    ];
+    let mut out = b"\x1b[r\x1b[0m\x1b[?25l\x1b[H\x1b[2J".to_vec();
+    for (i, line) in lines.iter().take(usize::from(rows)).enumerate() {
+        out.extend(format!("\x1b[{};2H", i + 1).into_bytes());
+        out.extend(truncate(line, usize::from(cols.saturating_sub(1))).into_bytes());
+    }
+    out
+}
+
 fn display_width(s: &str) -> usize {
     use unicode_width::UnicodeWidthStr;
     s.width()
@@ -838,6 +977,8 @@ struct Link {
     session: String,
     out: mpsc::UnboundedSender<Message>,
     reader: tokio::task::JoinHandle<()>,
+    /// Output bytes the reader may still pass on ([`OUTPUT_CREDIT`]).
+    credit: Arc<Semaphore>,
 }
 
 impl Link {
@@ -859,13 +1000,24 @@ impl Link {
             }
             let _ = sink.close().await;
         });
+        let credit = Arc::new(Semaphore::new(OUTPUT_CREDIT));
+        let budget = Arc::clone(&credit);
         let reader = runtime.spawn(async move {
-            let send = |msg| tx.send(Ev::Session { generation, msg }).is_ok();
+            let send = |msg, credit| {
+                tx.send(Ev::Session {
+                    generation,
+                    msg,
+                    credit,
+                })
+                .is_ok()
+            };
             let closed = loop {
                 let message = match stream.next().await {
                     Some(Ok(message)) => message,
-                    Some(Err(e)) => break format!("connection to the hub lost: {e}"),
-                    None => break "the hub closed the connection".into(),
+                    Some(Err(e)) => {
+                        break SessionMsg::Closed(format!("connection to the hub lost: {e}"));
+                    }
+                    None => break SessionMsg::Closed("the hub closed the connection".into()),
                 };
                 let msg = match message {
                     Message::Binary(bytes) => SessionMsg::Bytes(bytes.to_vec()),
@@ -876,17 +1028,32 @@ impl Link {
                     Message::Close(frame) => break close_reason(frame.as_ref()),
                     _ => continue,
                 };
-                if !send(msg) {
+                // Wait for the terminal to take earlier output first: the
+                // socket is not read meanwhile, so a slow terminal slows
+                // the hub's sending to it.
+                let cost = match &msg {
+                    SessionMsg::Bytes(bytes) => bytes.len().min(OUTPUT_CREDIT),
+                    _ => 0,
+                };
+                let cost = u32::try_from(cost).unwrap_or(u32::MAX);
+                if cost > 0 {
+                    match budget.acquire_many(cost).await {
+                        Ok(permit) => permit.forget(),
+                        Err(_) => return,
+                    }
+                }
+                if !send(msg, cost) {
                     return;
                 }
             };
-            let _ = send(SessionMsg::Closed(closed));
+            let _ = send(closed, 0);
         });
         Self {
             generation,
             session,
             out,
             reader,
+            credit,
         }
     }
 
@@ -905,13 +1072,13 @@ impl Link {
     }
 }
 
-fn close_reason(frame: Option<&CloseFrame>) -> String {
+fn close_reason(frame: Option<&CloseFrame>) -> SessionMsg {
     match frame {
-        Some(f) if u16::from(f.code) == CLOSE_ROTATED => {
-            "the hub's token was rotated: get the new one with `fw hub token`".into()
+        Some(f) if u16::from(f.code) == CLOSE_ROTATED => SessionMsg::Rotated,
+        Some(f) if !f.reason.is_empty() => {
+            SessionMsg::Closed(format!("the hub closed the session: {}", f.reason))
         }
-        Some(f) if !f.reason.is_empty() => format!("the hub closed the session: {}", f.reason),
-        _ => "the hub closed the connection (stopped?)".into(),
+        _ => SessionMsg::Closed("the hub closed the connection (stopped?)".into()),
     }
 }
 
@@ -965,7 +1132,7 @@ async fn events_task(
     tx: Sender<Ev>,
     mut viewing: watch::Receiver<Option<String>>,
 ) {
-    let client = client_id("attach");
+    let client = stable_client_id("attach");
     let path = format!("/api/events?client={client}");
     let update = |change: &dyn Fn(&mut HubView)| {
         let mut v = view.lock().unwrap_or_else(PoisonError::into_inner);
@@ -983,7 +1150,9 @@ async fn events_task(
                 }) {
                     return;
                 }
-                tokio::time::sleep(EVENTS_RETRY).await;
+                if endpoint.reload_token() != Some(true) {
+                    tokio::time::sleep(EVENTS_RETRY).await;
+                }
                 continue;
             }
         };
@@ -1044,7 +1213,11 @@ async fn events_task(
         }) {
             return;
         }
-        tokio::time::sleep(EVENTS_RETRY).await;
+        // A rotated token (read from the state dir): reconnect with the
+        // new one at once.
+        if endpoint.reload_token() != Some(true) {
+            tokio::time::sleep(EVENTS_RETRY).await;
+        }
     }
 }
 

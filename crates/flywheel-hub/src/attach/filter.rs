@@ -18,12 +18,16 @@
 //!   `DECALN`, `DECCOLM`) marks it damaged so it is redrawn.
 //!
 //! The filter is a streaming parser: a sequence split across reads is held
-//! until it completes (bounded: an over-long control string is passed
-//! through as it comes), and so is a trailing partial UTF-8 character, so
+//! until it completes, and so is a trailing partial UTF-8 character. Held
+//! bytes are bounded: an over-long CSI or escape sequence is consumed and
+//! dropped (no real one is that long, and passing its tail would let a
+//! padded query through), an over-long control string is dropped when it
+//! may be a query (colour and clipboard reads, DCS headers) and passed
+//! through as it comes otherwise (a large clipboard write, a title). So
 //! between feeds the terminal is always at a character boundary -- where
 //! the bar can be drawn.
 
-/// Longest CSI / escape sequence held (longer: passed through as is).
+/// Longest CSI / escape sequence held (longer: consumed and dropped).
 const MAX_SEQUENCE: usize = 512;
 /// Longest control string (OSC, DCS header) held to decide on it.
 const MAX_STRING: usize = 4096;
@@ -58,6 +62,11 @@ enum State {
     },
     /// ESC seen inside a held string.
     HeldEsc(Str),
+    /// An over-long CSI (`csi`) or escape sequence, consumed to its final
+    /// byte and dropped.
+    Discard {
+        csi: bool,
+    },
 }
 
 /// The bytes to write, and whether the status bar's row may have been
@@ -145,7 +154,7 @@ impl OutputFilter {
                     f.out.append(&mut self.held);
                     self.state = State::Passing { drop: false };
                 }
-                0x20..=0x2f => self.hold(byte, f),
+                0x20..=0x2f => self.hold(byte),
                 0x30..=0x7e => {
                     self.held.push(byte);
                     self.escape_done(f);
@@ -167,7 +176,7 @@ impl OutputFilter {
                     self.held.push(byte);
                     self.csi_done(f);
                 }
-                0x20..=0x3f => self.hold(byte, f),
+                0x20..=0x3f => self.hold(byte),
                 ESC => {
                     f.out.append(&mut self.held);
                     self.start(byte, State::Escape);
@@ -205,8 +214,13 @@ impl OutputFilter {
                         }
                         self.state = State::Passing { drop };
                     } else if self.held.len() > MAX_STRING {
-                        f.out.append(&mut self.held);
-                        self.state = State::Passing { drop: false };
+                        let drop = kind == Str::Dcs || long_osc_may_query(&self.held[2..]);
+                        if drop {
+                            self.held.clear();
+                        } else {
+                            f.out.append(&mut self.held);
+                        }
+                        self.state = State::Passing { drop };
                     }
                 }
             },
@@ -223,6 +237,17 @@ impl OutputFilter {
                     self.byte(byte, f);
                 }
             }
+            State::Discard { csi } => match byte {
+                0x20..=0x2f => {}
+                0x30..=0x3f if csi => {}
+                0x30..=0x7e => self.state = State::Ground,
+                ESC => self.start(byte, State::Escape),
+                CAN | SUB => {
+                    f.out.push(byte);
+                    self.state = State::Ground;
+                }
+                _ => f.out.push(byte),
+            },
             State::Passing { drop } => match byte {
                 BEL => {
                     if !drop {
@@ -271,12 +296,14 @@ impl OutputFilter {
         self.state = State::Held(kind);
     }
 
-    /// Add to a held sequence; one grown absurdly long goes through as is.
-    fn hold(&mut self, byte: u8, f: &mut Filtered) {
+    /// Add to a held sequence; one grown absurdly long is dropped.
+    fn hold(&mut self, byte: u8) {
         self.held.push(byte);
         if self.held.len() > MAX_SEQUENCE {
-            f.out.append(&mut self.held);
-            self.state = State::Ground;
+            self.held.clear();
+            self.state = State::Discard {
+                csi: self.state == State::Csi,
+            };
         }
     }
 
@@ -411,6 +438,31 @@ fn osc_is_query(body: &[u8]) -> bool {
         10..=19 => !rest.is_empty() && rest.iter().all(|s| *s == "?"),
         52 => rest.len() == 2 && rest[1] == "?",
         _ => false,
+    }
+}
+
+/// Whether an OSC too long to hold (`body` after `ESC ]`, so far) may be a
+/// colour or clipboard read: codes 4 and 10-19 (sets are short; a long one
+/// is dropped), and 52 unless its data has begun (`52;sel;` then base64,
+/// which never holds the `?` of a read).
+fn long_osc_may_query(body: &[u8]) -> bool {
+    let code_end = body.iter().position(|b| *b == b';').unwrap_or(body.len());
+    let code = std::str::from_utf8(&body[..code_end])
+        .ok()
+        .and_then(|c| c.parse::<u32>().ok());
+    match code {
+        Some(4 | 10..=19) => true,
+        Some(52) => {
+            let rest = body.get(code_end + 1..).unwrap_or_default();
+            match rest.iter().position(|b| *b == b';') {
+                Some(at) => rest.get(at + 1) == Some(&b'?'),
+                // Still in the selection field.
+                None => true,
+            }
+        }
+        // Unparsed so far (all digits, or no code): it may yet be one.
+        None => body[..code_end].iter().all(u8::is_ascii_digit),
+        Some(_) => false,
     }
 }
 
@@ -596,6 +648,50 @@ mod tests {
         // An APC (kitty graphics) is never inspected.
         let apc = b"\x1b_Gf=24;AAAA\x1b\\x";
         assert_eq!(run(&mut f, apc), apc);
+    }
+
+    #[test]
+    fn padded_queries_are_dropped_not_passed() {
+        let mut f = OutputFilter::new(None);
+        // A DSR (cursor position) padded past the sequence limit.
+        let mut dsr = b"a\x1b[".to_vec();
+        dsr.extend(std::iter::repeat_n(b'0', MAX_SEQUENCE + 100));
+        dsr.extend(b"6nb");
+        assert_eq!(run(&mut f, &dsr), b"ab");
+        assert!(f.at_boundary());
+        // The same split byte by byte.
+        let mut out = Vec::new();
+        for b in &dsr {
+            out.extend(run(&mut f, std::slice::from_ref(b)));
+        }
+        assert_eq!(out, b"ab");
+        // An escape sequence with absurd intermediates.
+        let mut esc = b"\x1b".to_vec();
+        esc.extend(std::iter::repeat_n(b' ', MAX_SEQUENCE + 10));
+        esc.extend(b"Fz");
+        assert_eq!(run(&mut f, &esc), b"z");
+        // An OSC 4 colour read longer than a held string.
+        let mut osc = b"\x1b]4".to_vec();
+        while osc.len() <= MAX_STRING + 10 {
+            osc.extend(b";1;?");
+        }
+        osc.extend(b"\x07c");
+        assert_eq!(run(&mut f, &osc), b"c");
+        // An OSC 52 read with a padded selection.
+        let mut clip = b"\x1b]52;".to_vec();
+        clip.extend(std::iter::repeat_n(b'c', MAX_STRING + 10));
+        clip.extend(b";?\x1b\\d");
+        assert_eq!(run(&mut f, &clip), b"d");
+        // An over-long DCS header.
+        let mut dcs = b"\x1bP".to_vec();
+        dcs.extend(std::iter::repeat_n(b'1', MAX_STRING + 10));
+        dcs.extend(b"$qm\x1b\\e");
+        assert_eq!(run(&mut f, &dcs), b"e");
+        // A long title still goes through.
+        let mut title = b"\x1b]0;".to_vec();
+        title.extend(std::iter::repeat_n(b't', MAX_STRING + 10));
+        title.extend(b"\x07");
+        assert_eq!(run(&mut f, &title), title);
     }
 
     #[test]

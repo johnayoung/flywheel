@@ -1,5 +1,8 @@
 //! The session picker of `fw hub attach`: workspaces > sessions with live
-//! agent status, on the alternate screen (ratatui).
+//! agent status, on the alternate screen (ratatui). `/` filters by session,
+//! kind, or workspace name; scrolled, the selected rows' workspace stays
+//! pinned on top. Sessions are made, ended, and relaunched with `fw hub
+//! new|kill|relaunch` or in the web UI.
 
 use super::{Ev, HubView, status_counts};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -8,7 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::Paragraph;
 use serde_json::Value;
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -94,6 +97,42 @@ pub fn rows(view: &HubView) -> Vec<Row> {
     rows
 }
 
+/// `rows` narrowed to those matching `query` (case-insensitive): sessions
+/// whose name or kind matches, and every session of a workspace whose name
+/// does; each under its workspace's header.
+pub fn filter_rows(rows: Vec<Row>, query: &str) -> Vec<Row> {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return rows;
+    }
+    let hit = |s: &str| s.to_lowercase().contains(&query);
+    let mut out = Vec::new();
+    // The current header: the row, whether its name matches, whether it
+    // is in `out` yet.
+    let mut header: Option<(Row, bool, bool)> = None;
+    for row in rows {
+        match &row {
+            Row::Workspace { name, .. } => {
+                let matched = hit(name);
+                header = Some((row, matched, false));
+            }
+            Row::Session { name, kind, .. } => {
+                let ws_match = header.as_ref().is_some_and(|(_, m, _)| *m);
+                if ws_match || hit(name) || hit(kind) {
+                    if let Some((h, _, placed)) = &mut header
+                        && !*placed
+                    {
+                        out.push(h.clone());
+                        *placed = true;
+                    }
+                    out.push(row);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `running`, `exited 0`, `killed (Hangup)`, `stopped`, ...
 fn process_state(session: &Value) -> String {
     let label = crate::script::state_label(session);
@@ -123,17 +162,24 @@ fn selectable(row: &Row) -> bool {
 }
 
 /// The picker's state between draws.
+#[derive(Default)]
 struct Picker {
     rows: Vec<Row>,
     selected: Option<usize>,
     want: Option<String>,
     message: Option<String>,
+    /// The `/` filter.
+    query: String,
+    /// Typing the filter.
+    editing: bool,
+    /// The first row on screen.
+    offset: usize,
 }
 
 impl Picker {
     fn refresh(&mut self, view: &HubView) {
         let keep = self.selected_id().or_else(|| self.want.clone());
-        self.rows = rows(view);
+        self.rows = filter_rows(rows(view), &self.query);
         self.selected = keep
             .and_then(|id| {
                 self.rows
@@ -216,10 +262,8 @@ fn run(
     };
     let _ = terminal.hide_cursor();
     let mut picker = Picker {
-        rows: Vec::new(),
-        selected: None,
         want: current.map(str::to_owned),
-        message: None,
+        ..Picker::default()
     };
     let lock = |v: &Arc<Mutex<HubView>>| {
         let guard = v.lock().unwrap_or_else(PoisonError::into_inner);
@@ -227,18 +271,9 @@ fn run(
     };
     let mut snapshot = lock(view);
     picker.refresh(&snapshot);
-    let mut list_state = ListState::default();
     loop {
-        list_state.select(picker.selected);
         let drawn = terminal.draw(|frame| {
-            draw(
-                frame,
-                &picker,
-                &snapshot,
-                &mut list_state,
-                base,
-                current.is_some(),
-            );
+            draw(frame, &mut picker, &snapshot, base, current.is_some());
         });
         if let Err(e) = drawn {
             return Picked::Abort(format!("cannot draw: {e}"));
@@ -269,17 +304,43 @@ fn run(
             Err(e) => return Picked::Abort(format!("reading keys: {e}")),
         };
         picker.message = None;
+        let query = picker.query.clone();
         if let Some(done) = on_key(&mut picker, key, current.is_some()) {
             return done;
+        }
+        if picker.query != query {
+            picker.refresh(&snapshot);
         }
     }
 }
 
 fn on_key(picker: &mut Picker, key: KeyEvent, can_go_back: bool) -> Option<Picked> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if picker.editing && !ctrl {
+        match key.code {
+            KeyCode::Char(c) => {
+                picker.query.push(c);
+                return None;
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                return None;
+            }
+            KeyCode::Esc => {
+                picker.editing = false;
+                picker.query.clear();
+                return None;
+            }
+            KeyCode::Enter => picker.editing = false,
+            _ => {}
+        }
+    }
     match key.code {
         KeyCode::Char('c' | 'd') if ctrl => return Some(Picked::Quit),
+        KeyCode::Char('u') if ctrl && picker.editing => picker.query.clear(),
+        KeyCode::Char('/') => picker.editing = true,
         KeyCode::Char('q') => return Some(Picked::Quit),
+        KeyCode::Esc if !picker.query.is_empty() => picker.query.clear(),
         KeyCode::Esc if can_go_back => return Some(Picked::Back),
         KeyCode::Esc => return Some(Picked::Quit),
         KeyCode::Up | KeyCode::Char('k') => picker.step(-1),
@@ -309,11 +370,141 @@ fn on_key(picker: &mut Picker, key: KeyEvent, can_go_back: bool) -> Option<Picke
     None
 }
 
+/// `s` cut to `max` columns, an ellipsis marking the cut, padded to
+/// `max`.
+fn fit(s: &str, max: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let mut out = String::new();
+    if s.width() <= max {
+        out.push_str(s);
+    } else if max > 0 {
+        let mut used = 0;
+        for c in s.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > max - 1 {
+                break;
+            }
+            used += w;
+            out.push(c);
+        }
+        out.push('\u{2026}');
+    }
+    let pad = max.saturating_sub(out.width());
+    out.extend(std::iter::repeat_n(' ', pad));
+    out
+}
+
+/// Column widths `(name, kind, state)`: each as wide as its widest entry,
+/// within a cap.
+fn columns(rows: &[Row]) -> (usize, usize, usize) {
+    use unicode_width::UnicodeWidthStr;
+    let mut widths = (4, 4, 5);
+    for row in rows {
+        if let Row::Session {
+            name, kind, state, ..
+        } = row
+        {
+            widths.0 = widths.0.max(name.width());
+            widths.1 = widths.1.max(kind.width());
+            widths.2 = widths.2.max(state.width());
+        }
+    }
+    (widths.0.min(32), widths.1.min(20), widths.2.min(18))
+}
+
+/// The rows on screen in `height` lines: the first row index, and the
+/// header pinned above them (the selected rows' workspace, scrolled off).
+fn window(picker: &mut Picker, height: usize) -> (usize, Option<usize>) {
+    let len = picker.rows.len();
+    let height = height.max(1);
+    let selected = picker.selected.unwrap_or(0).min(len.saturating_sub(1));
+    let mut offset = picker.offset.min(len.saturating_sub(1));
+    // A selected first session shows its header too.
+    let top =
+        if selected > 0 && matches!(picker.rows.get(selected - 1), Some(Row::Workspace { .. })) {
+            selected - 1
+        } else {
+            selected
+        };
+    offset = offset.min(top);
+    loop {
+        let pinned = header_above(&picker.rows, offset);
+        let room = if pinned.is_some() {
+            height.saturating_sub(1).max(1)
+        } else {
+            height
+        };
+        if selected >= offset + room {
+            offset = selected + 1 - room;
+            continue;
+        }
+        picker.offset = offset;
+        return (offset, pinned);
+    }
+}
+
+/// The header of the workspace row `at` belongs to, when `at` is not it.
+fn header_above(rows: &[Row], at: usize) -> Option<usize> {
+    if !matches!(rows.get(at), Some(Row::Session { .. })) {
+        return None;
+    }
+    rows[..at]
+        .iter()
+        .rposition(|r| matches!(r, Row::Workspace { .. }))
+}
+
+fn row_line(row: &Row, widths: (usize, usize, usize), selected: bool) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut line = match row {
+        Row::Workspace { name, status } => Line::from(vec![
+            Span::raw("  "),
+            Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(
+                status.clone().map(|s| format!("[{s}]")).unwrap_or_default(),
+                status_style(status.as_deref()),
+            ),
+        ]),
+        Row::Session {
+            name,
+            kind,
+            state,
+            status,
+            live,
+            ..
+        } => {
+            let style = if *live { Style::default() } else { dim };
+            Line::from(vec![
+                Span::raw(if selected { "> " } else { "  " }),
+                Span::raw("  "),
+                Span::styled("\u{25cf} ", status_style(status.as_deref())),
+                Span::styled(fit(name, widths.0), style),
+                Span::raw("  "),
+                Span::styled(fit(kind, widths.1), dim),
+                Span::raw("  "),
+                Span::styled(fit(state, widths.2), style),
+                Span::raw("  "),
+                Span::styled(
+                    status.clone().unwrap_or_default(),
+                    status_style(status.as_deref()),
+                ),
+            ])
+        }
+    };
+    if selected {
+        line = line.style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    line
+}
+
 fn draw(
     frame: &mut ratatui::Frame,
-    picker: &Picker,
+    picker: &mut Picker,
     view: &HubView,
-    list_state: &mut ListState,
     base: &str,
     can_go_back: bool,
 ) {
@@ -358,61 +549,48 @@ fn draw(
     }
     frame.render_widget(Paragraph::new(Line::from(title)), head);
 
-    let items: Vec<ListItem> = if picker.rows.is_empty() {
-        vec![ListItem::new(Line::styled(
-            "  no sessions yet: open one in the web UI or with `fw hub new WS`",
-            dim,
-        ))]
+    let lines: Vec<Line> = if picker.rows.is_empty() {
+        let text = if picker.query.is_empty() {
+            "  no sessions yet: open one in the web UI or with `fw hub new WS`".to_owned()
+        } else {
+            format!("  nothing matches {:?}", picker.query)
+        };
+        vec![Line::styled(text, dim)]
     } else {
-        picker
-            .rows
-            .iter()
-            .map(|row| match row {
-                Row::Workspace { name, status } => ListItem::new(Line::from(vec![
-                    Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(" "),
-                    Span::styled(
-                        status.clone().map(|s| format!("[{s}]")).unwrap_or_default(),
-                        status_style(status.as_deref()),
-                    ),
-                ])),
-                Row::Session {
-                    name,
-                    kind,
-                    state,
-                    status,
-                    live,
-                    ..
-                } => {
-                    let style = if *live { Style::default() } else { dim };
-                    ListItem::new(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled("\u{25cf} ", status_style(status.as_deref())),
-                        Span::styled(format!("{name:<24}"), style),
-                        Span::styled(format!(" {kind:<16}"), dim),
-                        Span::styled(format!(" {state:<16}"), style),
-                        Span::styled(
-                            status.clone().unwrap_or_default(),
-                            status_style(status.as_deref()),
-                        ),
-                    ]))
-                }
-            })
-            .collect()
+        let height = usize::from(body.height);
+        let (offset, pinned) = window(picker, height);
+        let widths = columns(&picker.rows);
+        let mut lines = Vec::new();
+        if let Some(at) = pinned {
+            lines.push(row_line(&picker.rows[at], widths, false));
+        }
+        for (i, row) in picker.rows.iter().enumerate().skip(offset) {
+            if lines.len() >= height {
+                break;
+            }
+            lines.push(row_line(row, widths, picker.selected == Some(i)));
+        }
+        lines
     };
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-    frame.render_stateful_widget(list, body, list_state);
+    frame.render_widget(Paragraph::new(lines), body);
 
-    let keys = if can_go_back {
-        "Enter attach   j/k move   Esc back   q quit"
-    } else {
-        "Enter attach   j/k move   q quit"
+    let keys = match (picker.editing, can_go_back) {
+        (true, _) => format!("/{}_   Enter attach   Esc clear", picker.query),
+        (false, back) => {
+            let filter = if picker.query.is_empty() {
+                String::new()
+            } else {
+                format!("[/{}]   ", picker.query)
+            };
+            let esc = if !picker.query.is_empty() {
+                "Esc clear   "
+            } else if back {
+                "Esc back   "
+            } else {
+                ""
+            };
+            format!("{filter}Enter attach   j/k move   / filter   {esc}q quit")
+        }
     };
     let mut lines = vec![Line::styled(keys, dim)];
     if let Some(message) = &picker.message {
@@ -478,10 +656,8 @@ mod tests {
     #[test]
     fn selection_skips_headers_and_keeps_its_session() {
         let mut picker = Picker {
-            rows: Vec::new(),
-            selected: None,
             want: Some("s2".into()),
-            message: None,
+            ..Picker::default()
         };
         picker.refresh(&view());
         assert_eq!(picker.selected_id().as_deref(), Some("s2"));
@@ -503,5 +679,99 @@ mod tests {
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(on_key(&mut picker, esc, true), Some(Picked::Back));
         assert_eq!(on_key(&mut picker, esc, false), Some(Picked::Quit));
+    }
+
+    #[test]
+    fn the_filter_keeps_matches_under_their_headers() {
+        let names = |rows: &[Row]| -> Vec<String> {
+            rows.iter()
+                .map(|r| match r {
+                    Row::Workspace { name, .. } => format!("# {name}"),
+                    Row::Session { name, .. } => name.clone(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            names(&filter_rows(rows(&view()), "AG")),
+            ["# beta", "agent"]
+        );
+        assert_eq!(
+            names(&filter_rows(rows(&view()), "beta")),
+            ["# beta", "agent", "old"]
+        );
+        assert_eq!(
+            names(&filter_rows(rows(&view()), "shell")),
+            ["# alpha", "shell", "# beta", "old"]
+        );
+        assert!(filter_rows(rows(&view()), "zzz").is_empty());
+        // Typed with `/`; Esc clears it before it means back.
+        let mut picker = Picker::default();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        on_key(&mut picker, key('/'), true);
+        on_key(&mut picker, key('q'), true);
+        assert_eq!(picker.query, "q");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        on_key(&mut picker, enter, true);
+        assert!(!picker.editing);
+        assert_eq!(on_key(&mut picker, esc, true), None);
+        assert!(picker.query.is_empty());
+        assert_eq!(on_key(&mut picker, esc, true), Some(Picked::Back));
+    }
+
+    #[test]
+    fn columns_align_and_long_names_are_cut() {
+        assert_eq!(fit("abcdef", 4), "abc\u{2026}");
+        assert_eq!(fit("ab", 4), "ab  ");
+        let mut view = view();
+        view.sessions.push(json!({ "id": "s4", "workspace_id": "w1",
+            "name": "a-very-long-session-name-that-keeps-going-and-going", "kind": "shell",
+            "state": "running", "live": { "pid": 3 } }));
+        let rows = rows(&view);
+        let widths = columns(&rows);
+        assert_eq!(widths.0, 32);
+        let text = |row: &Row| -> String {
+            row_line(row, widths, false)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        let lines: Vec<String> = rows
+            .iter()
+            .filter(|r| matches!(r, Row::Session { .. }))
+            .map(text)
+            .collect();
+        // The state column starts at the same place on every line.
+        let at: Vec<usize> = lines
+            .iter()
+            .map(|l| {
+                use unicode_width::UnicodeWidthStr;
+                let i = l.find("running").or_else(|| l.find("stopped")).unwrap();
+                l[..i].width()
+            })
+            .collect();
+        assert!(at.windows(2).all(|w| w[0] == w[1]), "{lines:#?}");
+    }
+
+    #[test]
+    fn scrolled_rows_keep_their_workspace_header_pinned() {
+        let mut view = HubView {
+            workspaces: vec![json!({ "id": "w", "name": "big" })],
+            ..HubView::default()
+        };
+        for i in 0..30 {
+            view.sessions.push(json!({ "id": format!("s{i}"), "workspace_id": "w",
+                "name": format!("s{i}"), "kind": "shell", "state": "running", "live": { "pid": 1 } }));
+        }
+        let mut picker = Picker::default();
+        picker.refresh(&view);
+        assert_eq!(window(&mut picker, 10), (0, None));
+        picker.step(27);
+        let (offset, pinned) = window(&mut picker, 10);
+        assert_eq!(pinned, Some(0));
+        assert!(offset > 0 && picker.selected.unwrap() < offset + 9);
+        picker.edge(false);
+        assert_eq!(window(&mut picker, 10), (0, None));
     }
 }

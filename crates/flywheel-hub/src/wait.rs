@@ -3,10 +3,15 @@
 //! polling). Exit 0 when met, 124 on `--timeout`, 1 on any error (the
 //! session ended before reaching an agent state, the hub went away, ...).
 //!
+//! The session's state is always checked once, however short `--timeout`
+//! (`--timeout 0`: check and return): reaching the hub and reading that
+//! first state may take up to [`CHECK_FLOOR`] or the timeout, whichever is
+//! longer; past it the wait times out (124).
+//!
 //! The wait is its own events client: it never views a session, so a turn
 //! that finishes reads `done` to it whoever else looked.
 
-use crate::endpoint::{Endpoint, EndpointArgs, client_id};
+use crate::endpoint::{Endpoint, EndpointArgs, Socket, client_id};
 use crate::script::resolve;
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -21,6 +26,9 @@ pub const MET: i32 = 0;
 pub const FAILED: i32 = 1;
 /// Exit code: `--timeout` passed first (as `timeout(1)`).
 pub const TIMED_OUT: i32 = 124;
+
+/// How long the first check may take whatever `--timeout` says.
+pub const CHECK_FLOOR: Duration = Duration::from_secs(1);
 
 /// What to wait for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -45,6 +53,14 @@ impl Until {
             Self::Idle => "idle",
             Self::Working => "working",
             Self::Exit => "exit",
+        }
+    }
+
+    /// What is awaited, for messages (`be done`, `exit`).
+    fn goal(self) -> String {
+        match self {
+            Self::Exit => "exit".into(),
+            other => format!("be {}", other.as_str()),
         }
     }
 
@@ -110,13 +126,23 @@ pub(crate) fn wait(args: &WaitArgs, out: &mut dyn Write, err: &mut dyn Write) ->
             return FAILED;
         }
     };
+    let start = Instant::now();
+    let deadline = timeout.map(|t| start + t);
     let outcome = runtime.block_on(async {
         let endpoint = match Endpoint::resolve(&args.endpoint) {
             Ok(endpoint) => endpoint,
             Err(message) => return Outcome::Failed(message),
         };
-        let deadline = timeout.map(|t| Instant::now() + t);
-        run(&endpoint, &args.session, args.until, args.changed, deadline).await
+        let setup_deadline = deadline.map(|d| d.max(start + CHECK_FLOOR));
+        run(
+            &endpoint,
+            &args.session,
+            args.until,
+            args.changed,
+            deadline,
+            setup_deadline,
+        )
+        .await
     });
     match outcome {
         Outcome::Met(what) => {
@@ -184,17 +210,39 @@ async fn run(
     until: Until,
     changed: bool,
     deadline: Option<Instant>,
+    setup_deadline: Option<Instant>,
 ) -> Outcome {
-    // Subscribe before reading the record, so no change falls between.
-    let mut socket = match endpoint
-        .websocket(&format!("/api/events?client={}", client_id("wait")))
-        .await
-    {
-        Ok(socket) => socket,
-        Err(message) => return Outcome::Failed(message),
+    let setup = async {
+        // Subscribe before reading the record, so no change falls between.
+        let mut socket = endpoint
+            .websocket(&format!("/api/events?client={}", client_id("wait")))
+            .await?;
+        let sessions = endpoint.sessions().await?;
+        // The hub's first message is every session's status for this client.
+        let snapshot = loop {
+            match next_event(&mut socket).await? {
+                Some(event) if event.get("type").and_then(Value::as_str) == Some("snapshot") => {
+                    break event;
+                }
+                _ => {}
+            }
+        };
+        Ok::<_, String>((socket, sessions, snapshot))
     };
-    let sessions = match endpoint.sessions().await {
-        Ok(sessions) => sessions,
+    let setup = match setup_deadline {
+        Some(at) => match tokio::time::timeout_at(at, setup).await {
+            Ok(result) => result,
+            Err(_) => {
+                return Outcome::TimedOut(format!(
+                    "timed out reaching the hub at {} to wait for {query:?}",
+                    endpoint.base()
+                ));
+            }
+        },
+        None => setup.await,
+    };
+    let (mut socket, sessions, snapshot) = match setup {
+        Ok(parts) => parts,
         Err(message) => return Outcome::Failed(message),
     };
     let mut record = match resolve(&sessions, query, "session") {
@@ -227,82 +275,94 @@ async fn run(
     if let Some(outcome) = tracker.on_record(&record, true) {
         return outcome;
     }
-    let sleep = async {
-        match deadline {
-            Some(at) => tokio::time::sleep_until(at).await,
-            None => std::future::pending().await,
-        }
+    if let Some(outcome) = tracker.on_status(snapshot.get("sessions").and_then(|s| s.get(&id))) {
+        return outcome;
+    }
+    let watched = watch(endpoint, &mut socket, &id, &mut tracker, &mut record);
+    let outcome = match deadline {
+        Some(at) => tokio::time::timeout_at(at, watched).await.ok(),
+        None => Some(watched.await),
     };
-    tokio::pin!(sleep);
+    outcome.unwrap_or_else(|| {
+        let now = tracker.last.as_ref().map_or_else(
+            || ended(&record).unwrap_or_else(|| "running".into()),
+            |(status, _)| status.clone(),
+        );
+        Outcome::TimedOut(format!(
+            "timed out waiting for {:?} to {} (now {now})",
+            tracker.name,
+            until.goal()
+        ))
+    })
+}
+
+/// Follow the events socket until the tracker decides.
+async fn watch(
+    endpoint: &Endpoint,
+    socket: &mut Socket,
+    id: &str,
+    tracker: &mut Tracker,
+    record: &mut Value,
+) -> Outcome {
     loop {
-        tokio::select! {
-            () = &mut sleep => {
-                let now = tracker.last.as_ref().map_or_else(
-                    || ended(&record).unwrap_or_else(|| "running".into()),
-                    |(status, _)| status.clone(),
-                );
-                return Outcome::TimedOut(format!(
-                    "timed out waiting for {:?} to be {} (now {now})",
-                    tracker.name,
-                    until.as_str()
-                ));
-            }
-            message = socket.next() => {
-                let text = match message {
-                    Some(Ok(Message::Text(text))) => text,
-                    Some(Ok(Message::Close(frame))) => {
-                        let why = frame.map(|f| f.reason.to_string()).filter(|r| !r.is_empty());
-                        return Outcome::Failed(format!(
-                            "the hub closed the events connection{}",
-                            why.map(|w| format!(": {w}")).unwrap_or_default()
-                        ));
-                    }
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => return Outcome::Failed(format!("events connection failed: {e}")),
-                    None => return Outcome::Failed("the hub closed the events connection".into()),
-                };
-                let Ok(event) = serde_json::from_str::<Value>(text.as_str()) else {
-                    continue;
-                };
-                match event.get("type").and_then(Value::as_str) {
-                    Some("snapshot") => {
-                        let view = event.get("sessions").and_then(|s| s.get(&id));
-                        if let Some(outcome) = tracker.on_status(view) {
-                            return outcome;
-                        }
-                    }
-                    Some("status") if event.get("session_id").and_then(Value::as_str) == Some(id.as_str()) => {
-                        let view = event.get("status").filter(|v| !v.is_null());
-                        if let Some(outcome) = tracker.on_status(view) {
-                            return outcome;
-                        }
-                        if view.is_none() {
-                            // No longer tracked: ended or removed.
-                            match refresh(endpoint, &id).await {
-                                Ok(Some(fresh)) => record = fresh,
-                                Ok(None) => return Outcome::Failed(format!("session {:?} was removed", tracker.name)),
-                                Err(message) => return Outcome::Failed(message),
-                            }
-                            if let Some(outcome) = tracker.on_record(&record, false) {
-                                return outcome;
-                            }
-                        }
-                    }
-                    Some("sessions") => {
-                        match refresh(endpoint, &id).await {
-                            Ok(Some(fresh)) => record = fresh,
-                            Ok(None) => return Outcome::Failed(format!("session {:?} was removed", tracker.name)),
-                            Err(message) => return Outcome::Failed(message),
-                        }
-                        if let Some(outcome) = tracker.on_record(&record, false) {
-                            return outcome;
-                        }
-                    }
-                    _ => {}
+        let event = match next_event(socket).await {
+            Ok(Some(event)) => event,
+            Ok(None) => continue,
+            Err(message) => return Outcome::Failed(message),
+        };
+        let reread = match event.get("type").and_then(Value::as_str) {
+            Some("snapshot") => {
+                let view = event.get("sessions").and_then(|s| s.get(id));
+                if let Some(outcome) = tracker.on_status(view) {
+                    return outcome;
                 }
+                false
+            }
+            Some("status") if event.get("session_id").and_then(Value::as_str) == Some(id) => {
+                let view = event.get("status").filter(|v| !v.is_null());
+                if let Some(outcome) = tracker.on_status(view) {
+                    return outcome;
+                }
+                // No longer tracked: ended or removed.
+                view.is_none()
+            }
+            Some("sessions") => true,
+            _ => false,
+        };
+        if reread {
+            match refresh(endpoint, id).await {
+                Ok(Some(fresh)) => *record = fresh,
+                Ok(None) => {
+                    return Outcome::Failed(format!("session {:?} was removed", tracker.name));
+                }
+                Err(message) => return Outcome::Failed(message),
+            }
+            if let Some(outcome) = tracker.on_record(record, false) {
+                return outcome;
             }
         }
     }
+}
+
+/// The next JSON event of the events socket (`None`: not one), or why the
+/// socket ended.
+async fn next_event(socket: &mut Socket) -> Result<Option<Value>, String> {
+    let text = match socket.next().await {
+        Some(Ok(Message::Text(text))) => text,
+        Some(Ok(Message::Close(frame))) => {
+            let why = frame
+                .map(|f| f.reason.to_string())
+                .filter(|r| !r.is_empty());
+            return Err(format!(
+                "the hub closed the events connection{}",
+                why.map(|w| format!(": {w}")).unwrap_or_default()
+            ));
+        }
+        Some(Ok(_)) => return Ok(None),
+        Some(Err(e)) => return Err(format!("events connection failed: {e}")),
+        None => return Err("the hub closed the events connection".into()),
+    };
+    Ok(serde_json::from_str::<Value>(text.as_str()).ok())
 }
 
 /// Re-read one session (`None`: it was removed).

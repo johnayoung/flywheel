@@ -45,18 +45,20 @@ fw hub import FILE.code-workspace... [--name N] [--update] [--json]   # VS Code 
 
 ## Terminal client: `fw hub attach`
 
-Any terminal (local, over SSH, or a remote hub via `--url https://box.tailnet.ts.net` + `FW_HUB_TOKEN`) attaches to the same server-owned sessions the browser does.
+Any terminal (local, over SSH, or a remote hub via `--url https://box.tailnet.ts.net` + `FW_HUB_TOKEN`) attaches to the same server-owned sessions the browser does. `--url` needs `--token`/`FW_HUB_TOKEN`; the state dir's token is only sent when `--url` is that state dir's running hub.
 
-- No SESSION: a picker of workspaces > sessions with live status (`j`/`k`, Enter, `q`; Esc returns to the session it was opened from). Stopped sessions are listed but not attachable (`fw hub relaunch`).
-- Attached: the hub's snapshot, then raw live bytes; typed bytes go verbatim (keys, mouse, bracketed paste). The PTY follows this terminal's size (SIGWINCH; typing takes the size back from another viewer). Counts as viewing (a finished turn is `idle` for it, as for a browser tab).
-- Prefix (`C-b`, `--prefix C-a`): `d` detach (session keeps running), `s` switch (picker), `t` status bar on/off, `r` redraw (fresh snapshot), `?` help, prefix twice sends it. Inside a bracketed paste the prefix is pasted.
+- No SESSION: a picker of workspaces > sessions with live status (`j`/`k`, Enter, `/` filter by name, kind, or workspace, `q`; Esc clears a filter, else returns to the session it was opened from; `q` there detaches). Stopped sessions are listed but not attachable (`fw hub relaunch`); make and end sessions with `fw hub new|kill` or the web UI.
+- Attached: the hub's snapshot, then raw live bytes; typed bytes go verbatim (keys, mouse, bracketed paste). The PTY follows this terminal's size (SIGWINCH; typing takes the size back from another viewer). Counts as viewing (a finished turn is `idle` for it, as for a browser tab); the client id is stable per user and machine, so a turn seen in one attach stays seen in the next. Output is flow-controlled (at most 256 KiB in flight): a slow terminal makes the hub skip ahead with a fresh snapshot rather than queue.
+- The session's process ending while attached ends the client (exit 0, `[ws/name exited N]`, its last screen left in place); attaching to an already-ended session shows its last screen until `C-b d`.
+- Prefix (`C-b`, `--prefix C-a`): `d` detach (session keeps running), `s` switch (picker), `t` status bar on/off, `r` redraw (fresh snapshot), `?` key table (full screen; any key returns), prefix twice sends it. Inside a bracketed paste the prefix is pasted.
 - Status bar (last row; the session gets one row less, below its scroll region): `workspace/session [status]`, hub-wide `N blocked  N done`. `--no-status` starts without it.
 - Terminal queries in the output (DA, DSR/CPR, DECRQM, DECRQSS, XTVERSION, XTGETTCAP, OSC 4/10-19/52 reads, size reports, ENQ, kitty keyboard) are not passed to this terminal: the hub answers them.
-- The terminal is restored on detach, errors, hub stop or token rotation, SIGTERM/SIGHUP, and panics.
+- Token rotation: with the token from the state dir the client re-reads it and reconnects; a hand-given token ends it (exit 1).
+- The terminal is restored on detach, errors, hub stop, SIGTERM/SIGHUP, and panics.
 
 ## Scripting agents
 
-`send` types, `wait` blocks on the events socket (no polling), `read` / `commands` read back. `wait --until idle` accepts `done`; `--changed` ignores the state current at start (the previous turn's `done`); an agent wait fails (1) if the session ends first; `--until exit` prints `exited N` / `killed (SIG)`.
+`send` types, `wait` blocks on the events socket (no polling), `read` / `commands` read back. `wait --until idle` accepts `done`; `--changed` ignores the state current at start (the previous turn's `done`); an agent wait fails (1) if the session ends first; `--until exit` prints `exited N` / `killed (SIG)`. `--timeout` bounds everything, connecting included, but the state is always checked once (`--timeout 0`: check and return; reaching the hub may take up to 1 s).
 
 ```bash
 id=$(fw hub new demo --kind claude --name fixer)
@@ -64,8 +66,9 @@ fw hub wait "$id" --until idle --timeout 60           # agent up, waiting for a 
 fw hub send "$id" $'Fix the failing test in src/lib.rs\n'
 fw hub wait "$id" --until done --changed --timeout 900 || { fw hub read "$id"; exit 1; }
 fw hub commands "$id" --last > next.sh                # the newest shell block it suggested, exactly
-fw hub send build "$(cat next.sh)" --enter            # run it in a shell session
-fw hub wait build --until exit --timeout 600          # a one-shot shell session: wait for it to end
+fw hub send sh "$(cat next.sh)" --enter               # run it in an interactive shell session
+fw hub new demo --name build -- sh -c "$(cat next.sh)"   # or as a one-shot session...
+fw hub wait build --until exit --timeout 600          # ...and wait for it to end (prints `exited N`)
 fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"   # 0: it waits on a permission prompt
 ```
 

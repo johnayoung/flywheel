@@ -121,6 +121,8 @@ struct Attached {
     writer: Box<dyn Write + Send>,
     screen: Arc<Mutex<Emulator>>,
     raw: Arc<Mutex<Vec<u8>>>,
+    /// Stop reading the client's output (a terminal that cannot keep up).
+    paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Attached {
@@ -148,10 +150,17 @@ impl Attached {
         let writer = pair.master.take_writer().unwrap();
         let screen = Arc::new(Mutex::new(Emulator::new(cols, rows, 1000)));
         let raw = Arc::new(Mutex::new(Vec::new()));
-        let (s, r) = (Arc::clone(&screen), Arc::clone(&raw));
+        let paused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (s, r, p) = (Arc::clone(&screen), Arc::clone(&raw), Arc::clone(&paused));
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
-            while let Ok(n) = reader.read(&mut buf) {
+            loop {
+                while p.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let Ok(n) = reader.read(&mut buf) else {
+                    break;
+                };
                 if n == 0 {
                     break;
                 }
@@ -165,7 +174,24 @@ impl Attached {
             writer,
             screen,
             raw,
+            paused,
         }
+    }
+
+    fn pause(&self, on: bool) {
+        self.paused.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The client's resident memory (KiB).
+    fn rss_kib(&self) -> u64 {
+        let pid = self.child.process_id().unwrap();
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .unwrap()
     }
 
     fn lines(&self) -> Vec<String> {
@@ -404,10 +430,118 @@ fn the_picker_lists_sessions_and_switches_between_them() {
     term.wait_text("Esc back");
     term.type_bytes(b"\x1b");
     term.wait_for("back on beta", |l| l[23].contains("demo/beta"));
+    // q from the switch picker detaches from the session it came from,
+    // leaving none of it (nor the bar) on the shell's screen.
     term.type_bytes(b"\x02s");
     term.wait_text("Esc back");
     term.type_bytes(b"q");
     assert_eq!(term.exit_code(), 0);
+    assert!(term.raw_text().contains("[detached from demo/beta]"));
+    let lines = term.wait_text("[detached from demo/beta]");
+    let all = lines.join("\n");
+    assert!(
+        !all.contains("in-beta") && !all.contains("blocked"),
+        "left on screen:\n{all}"
+    );
+}
+
+#[test]
+fn the_client_ends_with_its_session_shows_the_key_table_and_survives_rotation() {
+    let (_tmp, dir, server, ws) = setup();
+    let (code, session) = http(
+        &server,
+        "POST",
+        "/api/sessions",
+        Some(json!({ "workspace_id": ws, "name": "work", "command": ["/bin/sh"] })),
+    );
+    assert_eq!(code, 201, "{session}");
+    let mut term = Attached::spawn(&dir, &["work"], 60, 24);
+    term.wait_for("the status bar", |l| l[23].contains("demo/work"));
+
+    // Prefix ?: the key table, a binding a line (a narrow terminal shows
+    // every one); any key returns to the session.
+    term.type_bytes(b"echo marker-$((2+3))\r");
+    term.wait_text("marker-5");
+    term.type_bytes(b"\x02?");
+    let lines = term.wait_text("this table");
+    let all = lines.join("\n");
+    for binding in ["C-b d", "C-b s", "C-b t", "C-b r", "C-b C-b"] {
+        assert!(all.contains(binding), "{binding} missing:\n{all}");
+    }
+    term.type_bytes(b"x");
+    term.wait_text("marker-5");
+    term.wait_for("the table gone", |l| !l.join("\n").contains("this table"));
+
+    // A rotated token (read from the state dir): the client reconnects.
+    let rotated = Command::new(FW)
+        .args(["hub", "token", "--rotate", "--state-dir"])
+        .arg(dir.join("state"))
+        .output()
+        .unwrap();
+    assert!(rotated.status.success(), "{rotated:?}");
+    std::thread::sleep(Duration::from_millis(500));
+    term.type_bytes(b"echo after-$((3*3))\r");
+    term.wait_text("after-9");
+    assert!(term.child.try_wait().unwrap().is_none(), "client ended");
+
+    // The session's process ends: so does the client, its last screen kept.
+    term.type_bytes(b"exit 7\r");
+    assert_eq!(term.exit_code(), 0);
+    let lines = term.wait_text("[demo/work exited 7]");
+    let all = lines.join("\n");
+    assert!(all.contains("after-9"), "{all}");
+    // The goodbye goes at the bottom (the bar's row), not over the session.
+    let at = lines
+        .iter()
+        .position(|l| l.contains("[demo/work exited 7]"))
+        .unwrap();
+    assert!(at >= 21 && !lines[at].contains("$"), "{all}");
+}
+
+#[test]
+fn a_slow_terminal_stalls_the_socket_instead_of_queueing_in_the_client() {
+    let (_tmp, dir, server, ws) = setup();
+    let (code, session) = http(
+        &server,
+        "POST",
+        "/api/sessions",
+        Some(json!({ "workspace_id": ws, "name": "flood", "command": ["/bin/sh"] })),
+    );
+    assert_eq!(code, 201, "{session}");
+    let mut term = Attached::spawn(&dir, &["flood"], 80, 24);
+    term.wait_for("the status bar", |l| l[23].contains("demo/flood"));
+    let before = term.rss_kib();
+    // The terminal stops reading while the session floods.
+    term.pause(true);
+    term.type_bytes(
+        b"yes 0123456789012345678901234567890123456789012345678901234567890123456789\r",
+    );
+    // Unbounded, the client grew by the hub's rate (~10 MiB/s here);
+    // flow-controlled, by little more than its credit.
+    std::thread::sleep(Duration::from_secs(5));
+    let during = term.rss_kib();
+    assert!(
+        during < before + 16 * 1024,
+        "the client grew from {before} KiB to {during} KiB"
+    );
+    // The terminal catches up: detach is acted on promptly.
+    term.pause(false);
+    std::thread::sleep(Duration::from_millis(300));
+    let asked = Instant::now();
+    term.type_bytes(b"\x02d");
+    assert_eq!(term.exit_code(), 0);
+    assert!(
+        asked.elapsed() < Duration::from_secs(10),
+        "detach took {:?}",
+        asked.elapsed()
+    );
+    let sid = session["id"].as_str().unwrap();
+    http(
+        &server,
+        "POST",
+        &format!("/api/sessions/{sid}/input"),
+        Some(json!({ "data": "\u{3}" })),
+    );
 }
 
 fn launched(dir: &Path) -> (Vec<String>, HashMap<String, String>) {
@@ -532,6 +666,56 @@ fn wait_returns_when_the_agent_reports_done_and_times_out_with_124() {
     ));
     assert_eq!(code, Some(124));
 
+    // --timeout 0 checks once: met now, so 0.
+    let (code, stdout, stderr) = finish(wait_cmd(
+        &dir,
+        &["agent", "--until", "done", "--timeout", "0"],
+    ));
+    assert_eq!((code, stdout.as_str()), (Some(0), "done"), "{stderr}");
+    let (code, _, stderr) = finish(wait_cmd(
+        &dir,
+        &["agent", "--until", "blocked", "--timeout", "0"],
+    ));
+    assert_eq!(code, Some(124), "{stderr}");
+    assert!(stderr.contains("(now done)"), "{stderr}");
+
+    // --url without a token: the local token goes only to the local hub.
+    let url = |port: u16| format!("http://127.0.0.1:{port}");
+    let (code, stdout, stderr) = finish(wait_cmd(
+        &dir,
+        &[
+            "agent",
+            "--until",
+            "done",
+            "--timeout",
+            "5",
+            "--url",
+            &url(server.port),
+        ],
+    ));
+    assert_eq!((code, stdout.as_str()), (Some(0), "done"), "{stderr}");
+    let elsewhere = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = elsewhere.local_addr().unwrap().port();
+    let (code, _, stderr) = finish(wait_cmd(
+        &dir,
+        &[
+            "agent",
+            "--until",
+            "done",
+            "--timeout",
+            "5",
+            "--url",
+            &url(other),
+        ],
+    ));
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("--url needs the hub's token"), "{stderr}");
+    elsewhere.set_nonblocking(true).unwrap();
+    assert!(
+        elsewhere.accept().is_err(),
+        "the other address was contacted"
+    );
+
     // A shell has no agent status; --until exit works for it.
     let (code, shell) = http(
         &server,
@@ -560,4 +744,48 @@ fn wait_returns_when_the_agent_reports_done_and_times_out_with_124() {
     let (code, _, stderr) = finish(wait_cmd(&dir, &["nope", "--until", "exit"]));
     assert_eq!(code, Some(1));
     assert!(stderr.contains("no session named"), "{stderr}");
+}
+
+#[test]
+fn a_turn_seen_in_one_attach_stays_seen_in_the_next() {
+    let (_tmp, dir, server, ws) = setup();
+    let (code, session) = http(
+        &server,
+        "POST",
+        "/api/sessions",
+        Some(json!({ "workspace_id": ws, "kind": "claude", "name": "agent" })),
+    );
+    assert_eq!(code, 201, "{session}");
+    let (args, env) = launched(&dir);
+    let settings: Value = serde_json::from_str(&args[3]).unwrap();
+    let payload = json!({ "session_id": args[1] }).to_string();
+    let mut term = Attached::spawn(&dir, &["agent"], 80, 24);
+    term.wait_text("fake-claude-ready");
+    term.wait_for("the status bar", |l| l[23].contains("demo/agent"));
+    std::thread::sleep(Duration::from_millis(300));
+    // A turn finishes while this client watches: idle for it.
+    run_hook(&settings, "UserPromptSubmit", &env, &payload);
+    run_hook(&settings, "Stop", &env, &payload);
+    term.wait_for("idle on the bar", |l| {
+        l[23].contains("[idle]") && l[23].contains("0 done")
+    });
+    term.type_bytes(b"\x02d");
+    assert_eq!(term.exit_code(), 0);
+    // A new attach (the picker) has seen it too.
+    let picker = Attached::spawn(&dir, &[], 80, 24);
+    let agent_row = |l: &[String]| {
+        l.iter()
+            .skip(1)
+            .find(|r| r.contains("agent"))
+            .cloned()
+            .unwrap_or_default()
+    };
+    // Live status arrives on the events socket: wait for it.
+    let lines = picker.wait_for("the agent's status", |l| {
+        let row = agent_row(l);
+        row.contains("idle") || row.contains("done")
+    });
+    assert!(lines[0].contains("0 done"), "{}", lines[0]);
+    let row = agent_row(&lines);
+    assert!(row.contains("idle") && !row.contains("done"), "{row}");
 }

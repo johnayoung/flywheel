@@ -10,7 +10,9 @@
 use crate::auth::Token;
 use crate::cli::{StateDirArg, resolve_state_dir, running_hub};
 use serde_json::Value;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::WebSocketStream;
@@ -36,7 +38,8 @@ pub(crate) struct EndpointArgs {
     pub(crate) url: Option<String>,
     /// The hub's access token (`fw hub token` on its machine). Prefer the
     /// FW_HUB_TOKEN environment variable: argv is visible to other users.
-    /// Default: FW_HUB_TOKEN, else the state dir's token file.
+    /// Default: FW_HUB_TOKEN, else the state dir's token file (with --url:
+    /// only when it names the hub running for that state dir).
     #[arg(long, value_name = "TOKEN")]
     pub(crate) token: Option<String>,
     #[command(flatten)]
@@ -50,10 +53,21 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> Io for T {}
 /// A WebSocket to the hub.
 pub type Socket = WebSocketStream<Box<dyn Io>>;
 
+/// Where the token comes from.
+enum TokenFrom {
+    /// `--token` / FW_HUB_TOKEN.
+    Given(String),
+    /// The state dir's token file.
+    StateDir(PathBuf),
+}
+
 /// A resolved hub: base URL and credential.
 pub struct Endpoint {
     base: Url,
-    token: String,
+    token: RwLock<String>,
+    /// The state dir the token was read from (re-read after a rotation);
+    /// `None` for a token given by hand.
+    token_dir: Option<PathBuf>,
     tls: Option<Arc<rustls::ClientConfig>>,
     http: reqwest::Client,
 }
@@ -68,35 +82,44 @@ impl std::fmt::Debug for Endpoint {
 }
 
 impl Endpoint {
-    /// Resolve `args`: `--url` (with `--token`, FW_HUB_TOKEN, or the state
-    /// dir's token), else the hub running for the state dir.
+    /// Resolve `args`: `--url` (with `--token` or FW_HUB_TOKEN; the state
+    /// dir's token only when the URL is that state dir's running hub), else
+    /// the hub running for the state dir.
     pub(crate) fn resolve(args: &EndpointArgs) -> Result<Self, String> {
         let env_token = std::env::var(TOKEN_ENV)
             .ok()
             .filter(|t| !t.trim().is_empty());
         let explicit = args.token.clone().or(env_token);
-        match &args.url {
+        let dir = || resolve_state_dir(&args.state);
+        let local_token = |dir: &std::path::Path| {
+            Token::load(dir)
+                .map_err(|e| e.to_string())?
+                .map(|t| t.expose().to_owned())
+                .ok_or_else(|| "the running hub's token file is missing".to_owned())
+        };
+        let (base, from) = match &args.url {
             Some(raw) => {
                 let base = parse_base(raw)?;
-                let token = match explicit {
-                    Some(token) => token,
-                    None => {
-                        let dir = resolve_state_dir(&args.state)?;
-                        Token::load(&dir)
-                            .map_err(|e| e.to_string())?
-                            .map(|t| t.expose().to_owned())
-                            .ok_or_else(|| {
-                                format!(
-                                    "--url needs the hub's token: set {TOKEN_ENV} (or --token) \
-                                     to the output of `fw hub token` on its machine"
-                                )
-                            })?
+                if let Some(token) = explicit {
+                    (base, TokenFrom::Given(token))
+                } else {
+                    // Never hand this machine's credential to another host:
+                    // the local token only goes to the local hub.
+                    let dir = dir()?;
+                    let listen = running_hub(&dir)?.map(|info| info.listen);
+                    if !listen.is_some_and(|listen| is_local_hub(&base, listen)) {
+                        return Err(format!(
+                            "--url needs the hub's token: set {TOKEN_ENV} (or --token) to the \
+                             output of `fw hub token` on its machine (the local token is only \
+                             sent to the hub running for {})",
+                            dir.display()
+                        ));
                     }
-                };
-                Self::new(base, token)
+                    (base, TokenFrom::StateDir(dir))
+                }
             }
             None => {
-                let dir = resolve_state_dir(&args.state)?;
+                let dir = dir()?;
                 let info = running_hub(&dir)?.ok_or_else(|| {
                     format!(
                         "no hub is running for state dir {} (start one with `fw hub start`, \
@@ -104,18 +127,47 @@ impl Endpoint {
                         dir.display()
                     )
                 })?;
-                let token = match explicit {
-                    Some(token) => token,
-                    None => Token::load(&dir)
-                        .map_err(|e| e.to_string())?
-                        .map(|t| t.expose().to_owned())
-                        .ok_or_else(|| "the running hub's token file is missing".to_owned())?,
-                };
                 let base = Url::parse(&format!("http://{}", info.connect_addr()))
                     .map_err(|e| format!("bad hub address: {e}"))?;
-                Self::new(base, token)
+                match explicit {
+                    Some(token) => (base, TokenFrom::Given(token)),
+                    None => (base, TokenFrom::StateDir(dir)),
+                }
+            }
+        };
+        match from {
+            TokenFrom::Given(token) => Self::new(base, token),
+            TokenFrom::StateDir(dir) => {
+                let mut endpoint = Self::new(base, local_token(&dir)?)?;
+                endpoint.token_dir = Some(dir);
+                Ok(endpoint)
             }
         }
+    }
+
+    /// Re-read a token that came from the state dir (the hub rotated it):
+    /// `None` when it was given by hand (or the file is unreadable), else
+    /// whether it changed. Several connections may race to re-read it;
+    /// each then uses the file's current token.
+    pub fn reload_token(&self) -> Option<bool> {
+        let dir = self.token_dir.as_ref()?;
+        let fresh = Token::load(dir).ok()??.expose().trim().to_owned();
+        if fresh.is_empty() {
+            return None;
+        }
+        let mut token = self.token.write().unwrap_or_else(PoisonError::into_inner);
+        if *token == fresh {
+            return Some(false);
+        }
+        *token = fresh;
+        Some(true)
+    }
+
+    fn token(&self) -> String {
+        self.token
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn new(base: Url, token: String) -> Result<Self, String> {
@@ -141,7 +193,8 @@ impl Endpoint {
             .map_err(|e| format!("HTTP client setup failed: {e}"))?;
         Ok(Self {
             base,
-            token,
+            token: RwLock::new(token),
+            token_dir: None,
             tls,
             http,
         })
@@ -165,10 +218,11 @@ impl Endpoint {
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<Value, String> {
-        let response =
-            request.bearer_auth(&self.token).send().await.map_err(|e| {
-                format!("cannot reach the hub at {}: {}", self.base(), describe(&e))
-            })?;
+        let response = request
+            .bearer_auth(self.token())
+            .send()
+            .await
+            .map_err(|e| format!("cannot reach the hub at {}: {}", self.base(), describe(&e)))?;
         let status = response.status().as_u16();
         let body = response
             .bytes()
@@ -220,7 +274,7 @@ impl Endpoint {
             .as_str()
             .into_client_request()
             .map_err(|e| format!("bad WebSocket request: {e}"))?;
-        let bearer = format!("Bearer {}", self.token)
+        let bearer = format!("Bearer {}", self.token())
             .parse()
             .map_err(|_| "the token is not a valid header value".to_owned())?;
         request.headers_mut().insert("authorization", bearer);
@@ -312,6 +366,28 @@ fn parse_base(raw: &str) -> Result<Url, String> {
     Ok(url)
 }
 
+/// Whether `base` (a `--url`) is the hub listening on `listen` here: plain
+/// http to its port at its address, or at loopback when it listens on
+/// loopback or every address.
+fn is_local_hub(base: &Url, listen: SocketAddr) -> bool {
+    if base.scheme() != "http" || base.port_or_known_default() != Some(listen.port()) {
+        return false;
+    }
+    let host: Option<IpAddr> = match base.host() {
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        Some(url::Host::Domain(name)) if name.eq_ignore_ascii_case("localhost") => {
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        }
+        _ => None,
+    };
+    let Some(host) = host else {
+        return false;
+    };
+    let listen = listen.ip();
+    host == listen || (host.is_loopback() && (listen.is_loopback() || listen.is_unspecified()))
+}
+
 /// rustls on ring with the system's roots (an https hub).
 fn tls_config() -> Result<rustls::ClientConfig, String> {
     let mut roots = rustls::RootCertStore::empty();
@@ -356,12 +432,31 @@ fn describe(error: &reqwest::Error) -> String {
 /// A fresh client id for the events socket (`[A-Za-z0-9_-]`, unique per
 /// process): its own `done`/`idle` view of every session.
 pub fn client_id(prefix: &str) -> String {
-    let id = crate::state::new_id();
-    let id: String = id
-        .chars()
+    format!("{prefix}-{}", sanitize_id(&crate::state::new_id()))
+}
+
+/// The same client id every run for this user on this machine (as a
+/// browser keeps one): a turn seen in one `fw hub attach` stays seen in
+/// the next.
+pub fn stable_client_id(prefix: &str) -> String {
+    let mut name = [0u8; 256];
+    // SAFETY: writes at most `name.len()` bytes into an owned buffer.
+    let host = if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } == 0 {
+        let end = name.iter().position(|b| *b == 0).unwrap_or(name.len());
+        String::from_utf8_lossy(&name[..end]).into_owned()
+    } else {
+        String::new()
+    };
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let host: String = sanitize_id(&host).chars().take(40).collect();
+    format!("{prefix}-{uid}-{host}").chars().take(64).collect()
+}
+
+fn sanitize_id(id: &str) -> String {
+    id.chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    format!("{prefix}-{id}")
+        .collect()
 }
 
 #[cfg(test)]
@@ -398,6 +493,33 @@ mod tests {
             a.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         );
+    }
+
+    #[test]
+    fn stable_client_ids_repeat_and_are_valid() {
+        let a = stable_client_id("attach");
+        assert_eq!(a, stable_client_id("attach"));
+        assert!(a.len() <= 64 && a.starts_with("attach-"));
+        assert!(
+            a.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        );
+    }
+
+    #[test]
+    fn the_local_token_only_goes_to_the_local_hub() {
+        let url = |s: &str| parse_base(s).unwrap();
+        let lo: SocketAddr = "127.0.0.1:7420".parse().unwrap();
+        let any: SocketAddr = "0.0.0.0:7420".parse().unwrap();
+        let lan: SocketAddr = "192.168.1.5:7420".parse().unwrap();
+        assert!(is_local_hub(&url("http://127.0.0.1:7420"), lo));
+        assert!(is_local_hub(&url("http://localhost:7420"), lo));
+        assert!(is_local_hub(&url("http://127.0.0.1:7420"), any));
+        assert!(is_local_hub(&url("http://192.168.1.5:7420"), lan));
+        assert!(!is_local_hub(&url("http://127.0.0.1:7421"), lo));
+        assert!(!is_local_hub(&url("http://other-box:7420"), lo));
+        assert!(!is_local_hub(&url("http://10.0.0.9:7420"), any));
+        assert!(!is_local_hub(&url("https://127.0.0.1:7420"), lo));
     }
 
     #[test]

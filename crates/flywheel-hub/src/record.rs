@@ -875,26 +875,43 @@ impl Worker {
             }
             match self.events.try_recv() {
                 Ok(SessionEvent::Output(bytes)) => {
-                    let line = match self.writer.output_line(&bytes) {
-                        Ok(Some(line)) => line,
-                        Ok(None) => continue,
+                    let text = self.writer.output_text(&bytes);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let line = match self.writer.text_line(&text) {
+                        Ok(line) => line,
                         Err(e) => break self.failed(&e),
                     };
-                    // An event that would cross the cap opens the next
-                    // part instead (its fresh snapshot shows this output).
-                    if !self.room_for(line.len()) {
-                        if !self.rotate() {
-                            break true;
+                    if self.room_for(line.len()) {
+                        if let Err(e) = self.writer.line(&line) {
+                            break self.failed(&e);
                         }
                         continue;
                     }
-                    if let Err(e) = self.writer.line(&line) {
-                        break self.failed(&e);
+                    // An event that would cross the cap opens the next
+                    // part instead (its fresh snapshot shows this output).
+                    // One too big for even a fresh part (a PTY read is up
+                    // to 64 KiB, more once escaped) is cut: what fits goes
+                    // here, and the next part's snapshot shows the rest.
+                    if self.fresh() {
+                        let budget = self.room_left().saturating_sub(EVENT_OVERHEAD);
+                        let head = fitting_prefix(&text, budget);
+                        let wrote = self
+                            .writer
+                            .text_line(head)
+                            .and_then(|line| self.writer.line(&line));
+                        if let Err(e) = wrote {
+                            break self.failed(&e);
+                        }
+                    }
+                    if !self.rotate() {
+                        break true;
                     }
                 }
                 Ok(SessionEvent::Resize { cols, rows }) => {
                     // `[t,"r","65535x65535"]`: inside the overhead.
-                    if !self.room_for(0) {
+                    if !self.room_for(0) && !self.fresh() {
                         if !self.rotate() {
                             break true;
                         }
@@ -917,7 +934,9 @@ impl Worker {
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     // Output was lost: carry on from the screen as it is
                     // (in the next part when the screen would not fit).
-                    let carried = if self.room_for(self.screen_estimate().saturating_mul(6)) {
+                    let carried = if self.fresh()
+                        || self.room_for(self.screen_estimate().saturating_mul(6))
+                    {
                         self.resync()
                     } else {
                         self.rotate()
@@ -952,17 +971,21 @@ impl Worker {
     /// Whether `len` more bytes still fit the part, leaving room for the
     /// marker that ends it.
     fn room_for(&self, len: usize) -> bool {
-        // Nothing but the header and snapshot yet: write it regardless
-        // (a part must make progress).
-        if self.writer.bytes <= self.writer.opening {
-            return true;
-        }
-        let len = u64::try_from(len).unwrap_or(u64::MAX);
-        self.writer
-            .bytes
-            .saturating_add(len)
-            .saturating_add(1 + EVENT_OVERHEAD + END_RESERVE)
-            <= self.max_file_bytes()
+        u64::try_from(len).is_ok_and(|len| len <= self.room_left())
+    }
+
+    /// Bytes an event line can still take, leaving room for the marker
+    /// that ends the part.
+    fn room_left(&self) -> u64 {
+        self.max_file_bytes()
+            .saturating_sub(self.writer.bytes)
+            .saturating_sub(1 + EVENT_OVERHEAD + END_RESERVE)
+    }
+
+    /// Nothing but the header and snapshot yet: rotating again would make
+    /// no progress.
+    fn fresh(&self) -> bool {
+        self.writer.bytes <= self.writer.opening
     }
 
     /// An upper bound on a screen-only snapshot of the session.
@@ -1002,11 +1025,25 @@ impl Worker {
                 None => Ok(()),
             }
         });
-        wrote.is_ok()
+        wrote.is_ok() && !self.ended_meanwhile(attachment.exit.as_ref())
+    }
+
+    /// After re-subscribing: a process that had already exited sends no
+    /// exit event to the new receiver, so its marker is written here and
+    /// the recording ends (true).
+    fn ended_meanwhile(&mut self, exit: Option<&crate::pty::ExitInfo>) -> bool {
+        let Some(info) = exit else {
+            return false;
+        };
+        let _ = self
+            .writer
+            .marker(&exit_label(info.code, info.signal.as_deref()));
+        true
     }
 
     /// The file reached its cap: carry on in the next part, from a fresh
-    /// snapshot.
+    /// snapshot. False when the recording ends here (it failed, or the
+    /// process had exited meanwhile).
     fn rotate(&mut self) -> bool {
         let (Some(owner), Some(session)) = (self.owner.upgrade(), self.session.upgrade()) else {
             return false;
@@ -1039,7 +1076,7 @@ impl Worker {
                 *self.entry.lock().unwrap_or_else(PoisonError::into_inner) = next;
                 owner.save_active();
                 owner.sweep();
-                true
+                !self.ended_meanwhile(attachment.exit.as_ref())
             }
             Err(e) => {
                 self.failed(&e);
@@ -1047,6 +1084,25 @@ impl Worker {
             }
         }
     }
+}
+
+/// The longest prefix of `text` whose JSON-escaped form takes at most
+/// `budget` bytes -- never empty, so a part always makes progress.
+fn fitting_prefix(text: &str, budget: u64) -> &str {
+    let mut used = 0u64;
+    for (at, c) in text.char_indices() {
+        let escaped = match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            c if u32::from(c) < 0x20 => 6,
+            c => c.len_utf8() as u64,
+        };
+        used += escaped;
+        if used > budget {
+            let end = if at == 0 { c.len_utf8() } else { at };
+            return &text[..end];
+        }
+    }
+    text
 }
 
 /// An asciinema v2 file being written.
@@ -1160,14 +1216,23 @@ impl CastWriter {
     /// The event line for `bytes` of output, not yet written (`None`: it
     /// only began a UTF-8 sequence).
     fn output_line(&mut self, bytes: &[u8]) -> std::io::Result<Option<String>> {
-        let text = take_text(&mut self.pending, bytes);
+        let text = self.output_text(bytes);
         if text.is_empty() {
             return Ok(None);
         }
+        self.text_line(&text).map(Some)
+    }
+
+    /// The text of `bytes` of output, a UTF-8 sequence they begin held
+    /// back for the next.
+    fn output_text(&mut self, bytes: &[u8]) -> String {
+        take_text(&mut self.pending, bytes)
+    }
+
+    /// The output event line for `text`, timed now.
+    fn text_line(&mut self, text: &str) -> std::io::Result<String> {
         let t = self.time();
-        serde_json::to_string(&(t, "o", text))
-            .map(Some)
-            .map_err(std::io::Error::other)
+        serde_json::to_string(&(t, "o", text)).map_err(std::io::Error::other)
     }
 
     /// The screen the recording opens on, at t=0 (the moment its part
@@ -1507,6 +1572,69 @@ mod tests {
         thread.join().unwrap();
         let cast = parse_cast(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(cast.output().contains("line 1\n"));
+    }
+
+    #[test]
+    fn a_prefix_fits_its_escaped_budget_and_always_makes_progress() {
+        assert_eq!(fitting_prefix("abcdef", 3), "abc");
+        assert_eq!(fitting_prefix("a\"b", 3), "a\"");
+        assert_eq!(fitting_prefix("\u{1}\u{1}x", 7), "\u{1}");
+        assert_eq!(fitting_prefix("\u{20ac}\u{20ac}", 4), "\u{20ac}");
+        assert_eq!(fitting_prefix("\u{1}x", 0), "\u{1}", "never empty");
+        assert_eq!(fitting_prefix("short", 100), "short");
+        let text = "\u{1}".repeat(1000);
+        let cut = fitting_prefix(&text, 600);
+        assert!(serde_json::to_string(cut).unwrap().len() <= 602);
+    }
+
+    /// Every part holds its cap, even when one PTY read escapes to more
+    /// than a whole part (control bytes take six bytes each in JSON).
+    #[test]
+    fn output_bigger_than_a_part_is_cut_to_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = RecordLimits {
+            max_file_bytes: 8 * 1024,
+            max_total_bytes: 1 << 30,
+        };
+        let recordings = Arc::new(Recordings::new(dir.path(), limits));
+        let session = PtySession::spawn(
+            crate::pty::SpawnSpec {
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "read go; head -c 300000 /dev/zero | tr '\\0' '\\001'; echo; echo all-out"
+                        .into(),
+                ],
+                cwd: std::env::temp_dir(),
+                env: Vec::new(),
+                env_remove: Vec::new(),
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+            },
+            |_| {},
+        )
+        .unwrap();
+        let (ended_tx, ended) = std::sync::mpsc::channel::<()>();
+        let ended_tx = Mutex::new(ended_tx);
+        let notice: EndNotice = Arc::new(move |_: &str, _: &str| {
+            let _ = ended_tx.lock().unwrap().send(());
+        });
+        recordings
+            .start("s", "big", "big", &session, notice)
+            .unwrap();
+        session.write(b"go\r".to_vec());
+        assert!(session.wait_exit(Duration::from_secs(20)));
+        ended
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the recording ends with the process");
+        let parts = recordings.list().unwrap();
+        assert!(parts.len() > 3, "rotated: {}", parts.len());
+        for part in &parts {
+            assert!(part.size <= limits.max_file_bytes, "{part:?}");
+            let text = fs::read_to_string(recordings.path_of(&part.name).unwrap()).unwrap();
+            assert!(parse_cast(&text).is_ok(), "{}", part.name);
+        }
     }
 
     #[test]

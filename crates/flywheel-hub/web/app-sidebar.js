@@ -572,7 +572,7 @@ function renderMain() {
   explain.render(session, agent);
 
   commands.render();
-  commands.prefetch();
+  net.defer("commands", () => commands.prefetch());
   flywheel.render();
   review.render();
   mobile.render();

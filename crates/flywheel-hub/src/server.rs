@@ -28,6 +28,11 @@
 //!   are raw input.
 //! * Rotating the token closes every socket with code 4001; the end of the
 //!   browser login that opened it (logout, expiry, eviction), with 4002.
+//! * Protocol 2 (`?proto=2`, `server/terminal_ws.rs`; docs/hub/api.md):
+//!   output offsets (`seq`, `epoch`) and resuming from one (`since`),
+//!   paced screen frames for slow viewers (`lite`, `mode`), deflated binary
+//!   messages (`z`), and input ids acknowledged and never typed twice
+//!   (`client`, `ack`).
 //!
 //! Events WebSocket (`GET /api/events?client=<id>`), hub-wide, text JSON:
 //!
@@ -57,6 +62,7 @@ mod admission;
 mod auth;
 mod ca_page;
 mod commands_api;
+mod deflate;
 mod detect_api;
 mod events_ws;
 mod fanout_api;

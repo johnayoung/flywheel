@@ -95,6 +95,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ("mobile.js", include_bytes!("../web/mobile.js"), JS),
     ("notify.js", include_bytes!("../web/notify.js"), JS),
     ("pwa.js", include_bytes!("../web/pwa.js"), JS),
+    ("netlink.js", include_bytes!("../web/netlink.js"), JS),
     (
         "icon-192.png",
         include_bytes!("../web/icon-192.png"),
@@ -279,6 +280,83 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
         .iter()
         .find(|(name, _, _)| *name == path)
         .map(|(_, bytes, content_type)| (*bytes, *content_type))
+}
+
+/// An embedded asset, with its gzip form when it compresses (text:
+/// scripts, styles, SVG); fonts and PNGs are compressed already.
+pub struct Asset {
+    pub bytes: &'static [u8],
+    pub content_type: &'static str,
+    pub gzip: Option<&'static [u8]>,
+}
+
+/// [`asset`] with its gzip form (made on first use, then kept).
+pub fn asset_entry(path: &str) -> Option<Asset> {
+    static GZIP: std::sync::OnceLock<Vec<std::sync::OnceLock<Option<Vec<u8>>>>> =
+        std::sync::OnceLock::new();
+    let index = ASSETS.iter().position(|(name, _, _)| *name == path)?;
+    let (_, bytes, content_type) = ASSETS[index];
+    let slots = GZIP.get_or_init(|| ASSETS.iter().map(|_| std::sync::OnceLock::new()).collect());
+    let gzip = slots[index]
+        .get_or_init(|| compressible(content_type).then(|| gzip(bytes)))
+        .as_deref();
+    Some(Asset {
+        bytes,
+        content_type,
+        gzip,
+    })
+}
+
+fn compressible(content_type: &str) -> bool {
+    content_type.starts_with("text/") || content_type.starts_with("image/svg")
+}
+
+/// `bytes` gzipped (best compression: done once per asset).
+pub fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::GzEncoder::new(
+        Vec::with_capacity(bytes.len() / 3),
+        flate2::Compression::best(),
+    );
+    // Writing to a Vec cannot fail.
+    let _ = encoder.write_all(bytes);
+    encoder.finish().unwrap_or_default()
+}
+
+/// The app shell with its scripts and stylesheets addressed by build
+/// (`/assets/app.js?v=<build>`): those URLs can be cached for good, so a
+/// reload fetches only this page. Fonts and icons keep their plain URLs
+/// (the stylesheets name them) and revalidate.
+pub fn index_html() -> &'static str {
+    static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| stamp_assets(INDEX_HTML, build_id()))
+}
+
+/// [`index_html`] gzipped.
+pub fn index_html_gzip() -> &'static [u8] {
+    static PAGE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    PAGE.get_or_init(|| gzip(index_html().as_bytes()))
+}
+
+/// Every `"/assets/<path>.js"` and `.css` URL in `html`, with
+/// `?v=<build>` appended.
+fn stamp_assets(html: &str, build: &str) -> String {
+    let mut out = String::with_capacity(html.len() + 2048);
+    let mut rest = html;
+    while let Some(at) = rest.find("\"/assets/") {
+        let (head, tail) = rest.split_at(at + 1);
+        out.push_str(head);
+        let end = tail.find('"').unwrap_or(tail.len());
+        let url = &tail[..end];
+        out.push_str(url);
+        if (url.ends_with(".js") || url.ends_with(".css")) && !url.contains('?') {
+            out.push_str("?v=");
+            out.push_str(build);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Assets served without the token: what the login page uses -- the fonts,
@@ -562,6 +640,48 @@ pub fn login_page(error: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_served_page_stamps_scripts_and_styles_with_the_build() {
+        let page = index_html();
+        let build = build_id();
+        let mut stamped = 0;
+        for piece in page.split("\"/assets/").skip(1) {
+            let url = &piece[..piece.find('"').unwrap()];
+            let path = url.split('?').next().unwrap();
+            assert!(asset(path).is_some(), "{url} is embedded");
+            if path.ends_with(".js") || path.ends_with(".css") {
+                assert!(url.ends_with(&format!("?v={build}")), "{url}");
+                stamped += 1;
+            } else {
+                assert!(!url.contains('?'), "{url} keeps its plain URL");
+            }
+        }
+        assert!(stamped > 40, "{stamped}");
+        // Otherwise the page is the file.
+        assert_eq!(page.replace(&format!("?v={build}"), ""), INDEX_HTML);
+    }
+
+    #[test]
+    fn text_assets_have_a_gzip_form_that_inflates_to_them() {
+        use std::io::Read as _;
+        let js = asset_entry("app.js").unwrap();
+        let gz = js.gzip.expect("scripts compress");
+        let mut back = Vec::new();
+        flate2::read::GzDecoder::new(gz)
+            .read_to_end(&mut back)
+            .unwrap();
+        assert_eq!(back, js.bytes);
+        assert!(gz.len() * 2 < js.bytes.len());
+        assert!(
+            asset_entry("vendor/fonts/jetbrains-mono.woff2")
+                .unwrap()
+                .gzip
+                .is_none()
+        );
+        assert!(asset_entry("icon-192.png").unwrap().gzip.is_none());
+        assert!(asset_entry("nope.js").is_none());
+    }
 
     #[test]
     fn every_asset_resolves_and_unknown_paths_do_not() {

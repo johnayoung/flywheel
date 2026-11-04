@@ -26,7 +26,13 @@
 //! some escaped process (one that `setsid`ed away but kept the terminal open)
 //! still holds the PTY, so a removed session's fds and threads are freed.
 
-use crate::vt::{Emulator, SNAPSHOT_HISTORY_BYTES, ScreenText, TextSource, ViewerColors};
+use crate::vt::{
+    Emulator, FrameCursor, SNAPSHOT_HISTORY_BYTES, ScreenText, TextSource, ViewerColors,
+};
+
+mod recent;
+use recent::Recent;
+pub use recent::{RECENT_BYTES, RecentItem, output_len};
 
 /// Adopting a PTY handed over by another hub process, and exporting one.
 #[path = "handoff/pty_side.rs"]
@@ -146,6 +152,10 @@ pub struct Attachment {
     /// Escape sequences rebuilding the terminal (scrollback, screens,
     /// cursor, modes) in a freshly reset client.
     pub replay: Vec<u8>,
+    /// Output offset the snapshot reflects (see [`View`]).
+    pub seq: u64,
+    /// This session's output stream (see [`PtySession::epoch`]).
+    pub epoch: u64,
     /// The terminal size the snapshot was taken at.
     pub cols: u16,
     pub rows: u16,
@@ -162,6 +172,62 @@ struct Shared {
     /// Output bytes read from the child so far.
     output_bytes: u64,
     size: PtySize,
+    /// Names this output stream: offsets (`output_bytes`) only compare
+    /// within one epoch (a relaunch starts another).
+    epoch: u64,
+    /// The latest output, for resuming viewers.
+    recent: Recent,
+}
+
+/// A fresh output-stream epoch.
+fn new_epoch() -> u64 {
+    // Without randomness: the time, still unlikely to collide.
+    getrandom::u64().unwrap_or_else(|_| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos() as u64)
+    })
+}
+
+/// Where a viewer is: the output offset its terminal reflects, and what a
+/// frame last drew there (see [`PtySession::update`]).
+#[derive(Debug, Default)]
+pub struct View {
+    pub seq: u64,
+    pub frame: FrameCursor,
+}
+
+/// What brings a viewer up to date ([`PtySession::update`]).
+#[derive(Debug)]
+pub enum Update {
+    /// It is.
+    Current,
+    /// The output since, as it came (bytes and resizes, in order).
+    Raw(Vec<RecentItem>),
+    /// A frame, drawn at `cols` x `rows`.
+    Frame {
+        bytes: Vec<u8>,
+        cols: u16,
+        rows: u16,
+    },
+}
+
+/// A viewer coming back at an offset ([`PtySession::reattach`]).
+pub enum Reattach {
+    /// The output since that offset (at most the delta asked for): the
+    /// viewer's terminal plus these is this one. `events` follows them.
+    Delta {
+        items: Vec<RecentItem>,
+        cols: u16,
+        rows: u16,
+        exit: Option<ExitInfo>,
+        events: broadcast::Receiver<SessionEvent>,
+    },
+    /// Not that: `continued` when the offset is this output's (more was
+    /// written since than the delta allows or than is kept), false when
+    /// the session is not the one the viewer saw (relaunched, another
+    /// hub's) -- what it typed against it no longer applies.
+    Fresh { continued: bool },
 }
 
 /// State shared with the writer thread.
@@ -283,7 +349,13 @@ pub struct PtySession {
     /// it: what a live handoff passes on so the next hub can tell when it
     /// exits. Closed with the master.
     pidfd: Mutex<Option<std::os::fd::OwnedFd>>,
+    /// The last input id taken from each viewer key (see
+    /// [`PtySession::take_input`]).
+    inputs_seen: Mutex<std::collections::HashMap<String, u64>>,
 }
+
+/// Viewer keys whose last input id a session remembers.
+const INPUT_KEYS: usize = 64;
 
 impl std::fmt::Debug for PtySession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -364,6 +436,8 @@ impl PtySession {
                 reaped: false,
                 output_bytes: 0,
                 size,
+                epoch: new_epoch(),
+                recent: Recent::new(0),
             }),
             exited: Condvar::new(),
             events,
@@ -372,6 +446,7 @@ impl PtySession {
             master: Mutex::new(Some(handoff::Master::Spawned(pair.master))),
             pid,
             pidfd: Mutex::new(pidfd),
+            inputs_seen: Mutex::default(),
         });
 
         let drained_rx = session
@@ -458,6 +533,8 @@ impl PtySession {
                     let replies = {
                         let mut shared = self.lock();
                         shared.screen.process(&chunk);
+                        let seq = shared.output_bytes;
+                        shared.recent.push(seq, RecentItem::Output(chunk.clone()));
                         shared.output_bytes += chunk.len() as u64;
                         // No receivers is not an error: output is retained.
                         let _ = self.events.send(SessionEvent::Output(chunk));
@@ -542,15 +619,119 @@ impl PtySession {
     /// [`PtySession::attach`] with a scrollback byte budget for the
     /// snapshot (0: the screen only).
     pub fn attach_with(&self, history_budget: usize) -> Attachment {
+        self.attach_view(history_budget, None)
+    }
+
+    /// [`PtySession::attach_with`], also bringing `view` to the snapshot
+    /// (a viewer replaying it holds this screen at this offset).
+    pub fn attach_view(&self, history_budget: usize, view: Option<&mut View>) -> Attachment {
         let mut shared = self.lock();
+        let replay = shared.screen.snapshot(history_budget);
+        if let Some(view) = view {
+            view.seq = shared.output_bytes;
+            shared.screen.sync_cursor(&mut view.frame);
+        }
         Attachment {
-            replay: shared.screen.snapshot(history_budget),
+            replay,
+            seq: shared.output_bytes,
+            epoch: shared.epoch,
             cols: shared.size.cols,
             rows: shared.size.rows,
             alt_screen: shared.screen.alt_screen(),
             exit: shared.exit.clone(),
             events: self.events.subscribe(),
         }
+    }
+
+    /// This output stream's epoch: offsets from another (a relaunched
+    /// session, a hub that lost it) mean nothing here.
+    pub fn epoch(&self) -> u64 {
+        self.lock().epoch
+    }
+
+    /// Subscribe to live events (from now on).
+    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+        self.events.subscribe()
+    }
+
+    /// A viewer that had this session's output up to offset `seq` of
+    /// stream `epoch` is back: the output since, when it is kept and at
+    /// most `max_delta` bytes, and `view` brought to the end of it (its
+    /// frame cursor to this screen) -- else whether `seq` is still this
+    /// stream's (see [`Reattach::Fresh`]).
+    pub fn reattach(&self, seq: u64, epoch: u64, max_delta: usize, view: &mut View) -> Reattach {
+        let mut shared = self.lock();
+        let end = shared.output_bytes;
+        let ours = epoch == shared.epoch && seq <= end;
+        if !ours {
+            return Reattach::Fresh { continued: false };
+        }
+        let Some(items) = shared.recent.since(seq, end) else {
+            return Reattach::Fresh { continued: true };
+        };
+        if output_len(&items) > max_delta {
+            return Reattach::Fresh { continued: true };
+        }
+        view.seq = end;
+        shared.screen.sync_cursor(&mut view.frame);
+        Reattach::Delta {
+            items,
+            cols: shared.size.cols,
+            rows: shared.size.rows,
+            exit: shared.exit.clone(),
+            events: self.events.subscribe(),
+        }
+    }
+
+    /// Bring a viewer at `view` up to date: the output since as it came
+    /// when it is kept and at most `raw_max` bytes (exact, and cheap when
+    /// little changed), else a frame of what changed on screen (bounded
+    /// however much was written). Leaves `view` at the end of the output.
+    pub fn update(&self, view: &mut View, raw_max: usize) -> Update {
+        self.update_inner(view, raw_max, false).0
+    }
+
+    /// [`PtySession::update`], subscribing to live events right after it
+    /// (a viewer switching to the raw stream continues there exactly).
+    pub fn update_and_subscribe(
+        &self,
+        view: &mut View,
+        raw_max: usize,
+    ) -> (Update, broadcast::Receiver<SessionEvent>) {
+        let (update, events) = self.update_inner(view, raw_max, true);
+        (update, events.unwrap_or_else(|| self.events.subscribe()))
+    }
+
+    fn update_inner(
+        &self,
+        view: &mut View,
+        raw_max: usize,
+        subscribe: bool,
+    ) -> (Update, Option<broadcast::Receiver<SessionEvent>>) {
+        let mut shared = self.lock();
+        let end = shared.output_bytes;
+        let events = subscribe.then(|| self.events.subscribe());
+        let raw = shared
+            .recent
+            .since(view.seq, end)
+            .filter(|items| output_len(items) <= raw_max);
+        view.seq = end;
+        let update = match raw {
+            Some(items) if items.is_empty() => Update::Current,
+            Some(items) => {
+                shared.screen.sync_cursor(&mut view.frame);
+                Update::Raw(items)
+            }
+            None => match shared.screen.frame(&mut view.frame) {
+                Some(bytes) => Update::Frame {
+                    bytes,
+                    cols: shared.size.cols,
+                    rows: shared.size.rows,
+                },
+                None => Update::Current,
+            },
+        };
+        (update, events)
     }
 
     /// Queue `bytes` for the child's stdin, refusing (and discarding) input
@@ -595,6 +776,31 @@ impl PtySession {
         WriteOutcome::Queued
     }
 
+    /// Whether input `id` from viewer `key` is new: a viewer whose link
+    /// dropped sends again what was not acknowledged, in order, and what
+    /// got here already must not be typed twice. Ids only grow per key.
+    pub fn take_input(&self, key: &str, id: u64) -> bool {
+        let mut seen = self
+            .inputs_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(last) = seen.get_mut(key) {
+            if id <= *last {
+                return false;
+            }
+            *last = id;
+            return true;
+        }
+        if seen.len() >= INPUT_KEYS {
+            // The quietest is as good as any: a key is one browser pane.
+            if let Some(oldest) = seen.keys().next().cloned() {
+                seen.remove(&oldest);
+            }
+        }
+        seen.insert(key.to_owned(), id);
+        true
+    }
+
     /// Input bytes queued but not yet written to the PTY.
     pub fn queued_input(&self) -> usize {
         self.queue.queued.load(Ordering::Acquire)
@@ -618,6 +824,14 @@ impl PtySession {
             shared.size = size;
             shared.screen.resize(size.cols, size.rows);
             if changed {
+                let seq = shared.output_bytes;
+                shared.recent.push(
+                    seq,
+                    RecentItem::Resize {
+                        cols: size.cols,
+                        rows: size.rows,
+                    },
+                );
                 // Under the lock, like output, so every viewer hears of it
                 // between the same two chunks.
                 let _ = self.events.send(SessionEvent::Resize {

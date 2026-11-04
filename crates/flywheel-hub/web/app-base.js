@@ -116,6 +116,9 @@ const settings = window.FwHubSettings({
     return session && !session.machine ? session.id : null;
   },
 });
+// The link to the hub and lite mode (netlink.js): weak links get paced
+// terminals, paused hidden panes, and deferred fetches.
+const net = window.FwHubNet({ prefs: settings });
 // A shortcut hint from the keymap (never a hardcoded key: a rebind or
 // unbind in Settings shows everywhere). `keyHint(id)`: the key, "" when
 // unbound; `withKey(text, id)`: "text (key)", or just text.
@@ -451,6 +454,8 @@ const worktrees = window.FwHubWorktree({ $, el, icon, api });
 // fields, launch templates, quick launch, and token usage.
 const launcher = window.FwHubLauncher({
   $, el, api, state, worktrees,
+  // Usage rollups wait while lite (netlink.js).
+  defer: (key, fn) => net.defer(key, fn),
   // The new-session form's pre-filled agent options (Settings: agents).
   agentDefaults: (kind) => ({
     model: settings.get(`agents.${kind}.model`, "") || "",
@@ -655,7 +660,7 @@ async function refresh(force = true) {
   }
   state.snapshot = snapshot;
   render();
-  launcher.rollupsSoon();
+  net.defer("usage", () => launcher.rollupsSoon());
 }
 
 // Panes whose session was removed (closed in another browser or by the

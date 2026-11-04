@@ -1,29 +1,56 @@
 //! A session's terminal WebSocket (`/api/sessions/{id}/ws`): the replay
 //! on attach, then output, input, resizes, and theme reports both ways.
 
+use super::deflate::Deflater;
 use super::{
     AppState, Client, CredentialWatch, LAGGED_SNAPSHOT_HISTORY, SNAPSHOT_FRAME, WS_CLOSE_RESTART,
     WS_MAX_MESSAGE, WS_PING_INTERVAL, error_response, login_recheck, origin_ok, upgrade_refused,
 };
 use crate::hub::{Hub, HubEvent};
-use crate::pty::{Attachment, ExitInfo, PtySession, SessionEvent, WriteOutcome};
+use crate::pty::{
+    Attachment, ExitInfo, PtySession, Reattach, RecentItem, SessionEvent, Update, View,
+    WriteOutcome,
+};
 use crate::vt::{SNAPSHOT_HISTORY_BYTES, ViewerColors};
 use axum::body::Bytes;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use futures_util::SinkExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, watch};
+use tokio::time::Instant;
 
+/// Options a terminal socket's URL may carry (all optional): see the
+/// module docs of `server.rs` and docs/hub/api.md.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct TermQuery {
+    /// `2`: offsets, resume, frames, acks.
+    proto: Option<u8>,
+    /// `1`: lite pacing from the start (`fps` updates a second at most).
+    lite: Option<u8>,
+    fps: Option<u32>,
+    /// `1`: deflated binary messages.
+    z: Option<u8>,
+    /// Resume after output offset `since` of stream `epoch`.
+    since: Option<u64>,
+    epoch: Option<String>,
+    /// Names this viewer's input ids (1-64 of `[A-Za-z0-9_-]`).
+    client: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn session_ws(
     State(app): State<AppState>,
     Path(id): Path<String>,
     client: Client,
     headers: HeaderMap,
+    query: Result<Query<TermQuery>, QueryRejection>,
     credential: Option<axum::Extension<CredentialWatch>>,
     gate: Option<axum::Extension<crate::handoff::Gate>>,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
@@ -31,6 +58,13 @@ pub(super) async fn session_ws(
     if !origin_ok(&headers, client, &app.options) {
         return error_response(StatusCode::FORBIDDEN, "cross-origin WebSocket refused");
     }
+    let Ok(Query(query)) = query else {
+        return error_response(StatusCode::BAD_REQUEST, "bad terminal socket options");
+    };
+    let options = match Options::from_query(&query) {
+        Ok(options) => options,
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
     let gate = gate.map(|axum::Extension(gate)| gate);
     let Some(session) = app.hub.live_session(&id) else {
         return error_response(
@@ -51,16 +85,12 @@ pub(super) async fn session_ws(
     let hub = Arc::clone(&app.hub);
     ws.max_message_size(WS_MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
-            pump(
-                socket,
-                Arc::clone(&session),
+            let ends = Ends {
                 shutdown,
                 credential,
                 gate,
-                &hub,
-                &id,
-            )
-            .await;
+            };
+            pump(socket, Arc::clone(&session), ends, &hub, &id, options).await;
             // One viewer fewer: panes that follow another's size may now be
             // the only viewer and fit themselves (re-list for `live.clients`).
             drop(session);
@@ -73,6 +103,9 @@ pub(super) async fn session_ws(
 enum ClientMessage {
     Input {
         data: String,
+        /// Protocol 2: this viewer key's input number (acknowledged; a
+        /// number taken already is dropped).
+        id: Option<u64>,
     },
     Resize {
         cols: u16,
@@ -83,6 +116,13 @@ enum ClientMessage {
         background: String,
         cursor: String,
         ansi: Vec<String>,
+    },
+    /// Pacing (protocol 2): lite updates at most `fps` a second, or the raw
+    /// stream; `paused` (lite): none until unpaused (a hidden pane).
+    Mode {
+        lite: bool,
+        fps: Option<u32>,
+        paused: Option<bool>,
     },
 }
 
@@ -115,6 +155,7 @@ pub(super) async fn send_attachment(
         alt_screen,
         exit,
         events,
+        ..
     } = attachment;
     let header = json!({
         "type": "snapshot",
@@ -179,19 +220,342 @@ async fn forward_input(socket: &mut WebSocket, session: &PtySession, bytes: Vec<
     }
 }
 
-async fn pump(
-    mut socket: WebSocket,
-    session: Arc<PtySession>,
-    mut shutdown: watch::Receiver<bool>,
-    mut credential: CredentialWatch,
+/// Lite updates a second unless the viewer says otherwise.
+const LITE_FPS: u32 = 4;
+/// Most lite updates a second a viewer may ask for.
+const MAX_FPS: u32 = 30;
+/// A lite update sends the output since the last one as it came while it
+/// is at most this many bytes (exact, and as cheap as a frame), else a
+/// frame of what changed on screen.
+const LITE_RAW_MAX: usize = 1024;
+/// A lite viewer resuming gets the output it missed while it is at most
+/// this many bytes, else a frame (its scrollback keeps what it had).
+const LITE_RESUME_MAX: usize = 16 * 1024;
+/// Live events queued for a raw (protocol 2) viewer before it is behind:
+/// it then gets one update in their place (a frame when they are many
+/// bytes) and the raw stream from there.
+const BEHIND_EVENTS: usize = 64;
+/// A behind viewer's update is the raw output while it is at most this.
+const CATCH_UP_RAW_MAX: usize = 64 * 1024;
+
+/// A socket's options (from its URL).
+#[derive(Debug, Clone, Default)]
+struct Options {
+    v2: bool,
+    lite: Option<u32>,
+    deflate: bool,
+    since: Option<(u64, u64)>,
+    client: Option<String>,
+}
+
+impl Options {
+    fn from_query(query: &TermQuery) -> Result<Self, &'static str> {
+        let v2 = query.proto == Some(2);
+        let epoch = match &query.epoch {
+            Some(hex) => Some(u64::from_str_radix(hex, 16).map_err(|_| "bad epoch")?),
+            None => None,
+        };
+        let since = match (query.since, epoch) {
+            (Some(seq), Some(epoch)) => Some((seq, epoch)),
+            (None, None) => None,
+            _ => return Err("since and epoch go together"),
+        };
+        if !v2
+            && (query.lite.is_some()
+                || query.z.is_some()
+                || since.is_some()
+                || query.client.is_some())
+        {
+            return Err("lite, z, since and client need proto=2");
+        }
+        let client = match &query.client {
+            Some(key)
+                if (1..=64).contains(&key.len())
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+            {
+                Some(key.clone())
+            }
+            Some(_) => return Err("bad client"),
+            None => None,
+        };
+        Ok(Self {
+            v2,
+            lite: (query.lite == Some(1)).then(|| clamp_fps(query.fps)),
+            deflate: query.z == Some(1),
+            since,
+            client,
+        })
+    }
+}
+
+fn clamp_fps(fps: Option<u32>) -> u32 {
+    fps.unwrap_or(LITE_FPS).clamp(1, MAX_FPS)
+}
+
+/// How a viewer's output is paced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pace {
+    /// Every byte as it comes.
+    Raw,
+    /// At most one update per `every`; none while `paused`.
+    Lite { every: Duration, paused: bool },
+}
+
+impl Pace {
+    fn lite(fps: u32, paused: bool) -> Self {
+        Pace::Lite {
+            every: Duration::from_millis(u64::from(1000 / fps.max(1))),
+            paused,
+        }
+    }
+}
+
+/// One viewer's socket, sending binary messages deflated when it asked.
+struct Viewer {
+    socket: WebSocket,
+    deflate: Option<Deflater>,
+}
+
+impl Viewer {
+    async fn text(&mut self, value: &serde_json::Value) -> bool {
+        self.socket
+            .send(Message::Text(value.to_string().into()))
+            .await
+            .is_ok()
+    }
+
+    async fn binary(&mut self, bytes: Bytes) -> bool {
+        let payload = match &mut self.deflate {
+            Some(deflate) => Bytes::from(deflate.message(&bytes)),
+            None => bytes,
+        };
+        self.socket.send(Message::Binary(payload)).await.is_ok()
+    }
+
+    /// Output and resizes as they came; the output between two resizes
+    /// in one message.
+    async fn items(&mut self, items: Vec<RecentItem>) -> bool {
+        let mut run: Vec<u8> = Vec::new();
+        for item in items {
+            match item {
+                RecentItem::Output(bytes) => run.extend_from_slice(&bytes),
+                RecentItem::Resize { cols, rows } => {
+                    if !run.is_empty() && !self.binary(Bytes::from(std::mem::take(&mut run))).await
+                    {
+                        return false;
+                    }
+                    let size = json!({ "type": "size", "cols": cols, "rows": rows });
+                    if !self.text(&size).await {
+                        return false;
+                    }
+                }
+            }
+        }
+        run.is_empty() || self.binary(Bytes::from(run)).await
+    }
+
+    /// What brings the viewer to offset `seq`.
+    async fn update(&mut self, update: Update, seq: u64) -> bool {
+        match update {
+            Update::Current => true,
+            Update::Raw(items) => self.items(items).await,
+            Update::Frame { bytes, cols, rows } => {
+                let header = json!({
+                    "type": "frame",
+                    "seq": seq,
+                    "cols": cols,
+                    "rows": rows,
+                    "bytes": bytes.len(),
+                });
+                self.text(&header).await && self.binary(Bytes::from(bytes)).await
+            }
+        }
+    }
+
+    /// A snapshot (header with the offset and stream, then its bytes) and
+    /// the exit when there is one; returns the live receiver.
+    async fn snapshot(
+        &mut self,
+        attachment: Attachment,
+        continued: Option<bool>,
+    ) -> Option<broadcast::Receiver<SessionEvent>> {
+        let Attachment {
+            replay,
+            seq,
+            epoch,
+            cols,
+            rows,
+            alt_screen,
+            exit,
+            events,
+        } = attachment;
+        let mut header = json!({
+            "type": "snapshot",
+            "cols": cols,
+            "rows": rows,
+            "alt_screen": alt_screen,
+            "bytes": replay.len(),
+            "seq": seq,
+            "epoch": format!("{epoch:x}"),
+        });
+        if let Some(continued) = continued {
+            header["continued"] = json!(continued);
+        }
+        if !self.text(&header).await {
+            return None;
+        }
+        let replay = Bytes::from(replay);
+        let mut start = 0;
+        while start < replay.len() {
+            let end = replay.len().min(start + SNAPSHOT_FRAME);
+            if !self.binary(replay.slice(start..end)).await {
+                return None;
+            }
+            start = end;
+        }
+        drop(replay);
+        if let Some(info) = &exit {
+            self.socket.send(exit_message(info)).await.ok()?;
+        }
+        Some(events)
+    }
+}
+
+/// What ends a socket besides its viewer: the hub stopping, the
+/// credential going, a live handoff.
+struct Ends {
+    shutdown: watch::Receiver<bool>,
+    credential: CredentialWatch,
     gate: Option<crate::handoff::Gate>,
+}
+
+/// Run blocking session work (a snapshot, a frame) off the async workers,
+/// with the viewer's state moved in and back.
+async fn off_runtime<T: Send + 'static>(
+    session: &Arc<PtySession>,
+    view: View,
+    work: impl FnOnce(&PtySession, &mut View) -> T + Send + 'static,
+) -> Option<(View, T)> {
+    let session = Arc::clone(session);
+    tokio::task::spawn_blocking(move || {
+        let mut view = view;
+        let out = work(&session, &mut view);
+        (view, out)
+    })
+    .await
+    .ok()
+}
+
+/// The first messages: a resume when the viewer is back at an offset the
+/// session still has (or, lite, any offset of this output: a frame then),
+/// else a snapshot. Returns the live receiver.
+async fn open(
+    viewer: &mut Viewer,
+    session: &Arc<PtySession>,
+    view: &mut View,
+    since: Option<(u64, u64)>,
+    lite: bool,
+) -> Option<broadcast::Receiver<SessionEvent>> {
+    let mut continued = None;
+    if let Some((since, epoch)) = since {
+        let max = if lite { LITE_RESUME_MAX } else { usize::MAX };
+        let (back, reattach) = off_runtime(session, std::mem::take(view), move |s, v| {
+            s.reattach(since, epoch, max, v)
+        })
+        .await?;
+        *view = back;
+        let resumed = json!({ "type": "resume", "seq": since, "epoch": format!("{epoch:x}") });
+        match reattach {
+            Reattach::Delta {
+                items,
+                cols,
+                rows,
+                exit,
+                events,
+            } => {
+                let size = json!({ "type": "size", "cols": cols, "rows": rows });
+                if !viewer.text(&resumed).await || !viewer.items(items).await {
+                    return None;
+                }
+                // A resize the viewer already had is not in what was kept.
+                if !viewer.text(&size).await {
+                    return None;
+                }
+                if let Some(info) = &exit {
+                    viewer.socket.send(exit_message(info)).await.ok()?;
+                }
+                return Some(events);
+            }
+            Reattach::Fresh { continued: true } if lite => {
+                // Its screen is this output's: repaint it (no reset, so
+                // its scrollback stays), from a cursor that knows nothing.
+                let events = session.subscribe();
+                let mut fresh = View {
+                    seq: since,
+                    ..View::default()
+                };
+                let (back, update) = off_runtime(session, fresh, |s, v| s.update(v, 0)).await?;
+                fresh = back;
+                *view = fresh;
+                if !viewer.text(&resumed).await || !viewer.update(update, view.seq).await {
+                    return None;
+                }
+                if let Some(info) = session.exit_info() {
+                    viewer.socket.send(exit_message(&info)).await.ok()?;
+                }
+                return Some(events);
+            }
+            Reattach::Fresh { continued: c } => continued = Some(c),
+        }
+    }
+    let (back, attachment) = off_runtime(session, std::mem::take(view), |s, v| {
+        s.attach_view(SNAPSHOT_HISTORY_BYTES, Some(v))
+    })
+    .await?;
+    *view = back;
+    viewer.snapshot(attachment, continued).await
+}
+
+async fn pump(
+    socket: WebSocket,
+    session: Arc<PtySession>,
+    ends: Ends,
     hub: &Hub,
     id: &str,
+    options: Options,
 ) {
-    let Some(attachment) = attach(&session, SNAPSHOT_HISTORY_BYTES).await else {
-        return;
+    let Ends {
+        mut shutdown,
+        mut credential,
+        gate,
+    } = ends;
+    let mut viewer = Viewer {
+        socket,
+        deflate: options.deflate.then(Deflater::new),
     };
-    let Some(mut events) = send_attachment(&mut socket, attachment).await else {
+    let mut pace = match options.lite {
+        Some(fps) => Pace::lite(fps, false),
+        None => Pace::Raw,
+    };
+    let mut view = View::default();
+    let events = if options.v2 {
+        open(
+            &mut viewer,
+            &session,
+            &mut view,
+            options.since,
+            pace != Pace::Raw,
+        )
+        .await
+    } else {
+        match attach(&session, SNAPSHOT_HISTORY_BYTES).await {
+            Some(attachment) => send_attachment(&mut viewer.socket, attachment).await,
+            None => None,
+        }
+    };
+    let Some(mut events) = events else {
         return;
     };
     // One viewer more (`live.clients` in session listings).
@@ -199,28 +563,70 @@ async fn pump(
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.reset();
     let mut recheck = login_recheck();
+    // Lite: output came since the last update; the exit, to send after
+    // the update that carries the last output; the earliest next update.
+    let mut dirty = false;
+    let mut exit: Option<ExitInfo> = None;
+    let mut next = Instant::now();
     loop {
+        // An exit goes out at once (after the output before it), paused
+        // or not: a hidden pane still hears that its process ended.
+        let due = match pace {
+            Pace::Lite { paused, .. } => exit.is_some() || (dirty && !paused),
+            Pace::Raw => false,
+        };
         tokio::select! {
             event = events.recv() => {
+                if let Pace::Lite { .. } = pace {
+                    match event {
+                        Ok(SessionEvent::Exit(info)) => exit = Some(info),
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => dirty = true,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                    continue;
+                }
+                let behind = options.v2
+                    && (events.len() > BEHIND_EVENTS
+                        || matches!(event, Err(broadcast::error::RecvError::Lagged(_))));
+                if behind {
+                    // One update for all it missed (the raw output when it
+                    // is little, else a frame), then the stream from there.
+                    drop(events);
+                    let Some((back, (update, fresh))) = off_runtime(&session, std::mem::take(&mut view), |s, v| {
+                        v.frame.forget();
+                        s.update_and_subscribe(v, CATCH_UP_RAW_MAX)
+                    })
+                    .await else {
+                        break;
+                    };
+                    view = back;
+                    events = fresh;
+                    if !viewer.update(update, view.seq).await {
+                        break;
+                    }
+                    continue;
+                }
                 let sent = match event {
-                    Ok(SessionEvent::Output(bytes)) => socket.send(Message::Binary(bytes)).await.is_ok(),
-                    Ok(SessionEvent::Exit(info)) => socket.send(exit_message(&info)).await.is_ok(),
+                    Ok(SessionEvent::Output(bytes)) => {
+                        view.seq += bytes.len() as u64;
+                        viewer.binary(bytes).await
+                    }
+                    Ok(SessionEvent::Exit(info)) => viewer.socket.send(exit_message(&info)).await.is_ok(),
                     Ok(SessionEvent::Resize { cols, rows }) => {
-                        let size = json!({ "type": "size", "cols": cols, "rows": rows });
-                        socket.send(Message::Text(size.to_string().into())).await.is_ok()
+                        viewer.text(&json!({ "type": "size", "cols": cols, "rows": rows })).await
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // Unsubscribe first, so the backlog this client
                         // will never read is not kept alive for it.
                         drop(events);
                         let reset = Message::Text(json!({ "type": "reset" }).to_string().into());
-                        if socket.send(reset).await.is_err() {
+                        if viewer.socket.send(reset).await.is_err() {
                             break;
                         }
                         let Some(fresh) = attach(&session, LAGGED_SNAPSHOT_HISTORY).await else {
                             break;
                         };
-                        let Some(fresh) = send_attachment(&mut socket, fresh).await else {
+                        let Some(fresh) = send_attachment(&mut viewer.socket, fresh).await else {
                             break;
                         };
                         events = fresh;
@@ -232,13 +638,55 @@ async fn pump(
                     break;
                 }
             }
-            message = socket.recv() => {
+            () = tokio::time::sleep_until(next), if due => {
+                if dirty {
+                    // Everything queued is covered by this update.
+                    while events.try_recv().is_ok_and(|e| {
+                        if let SessionEvent::Exit(info) = e {
+                            exit = Some(info);
+                        }
+                        true
+                    }) {}
+                    let Some((back, update)) = off_runtime(&session, std::mem::take(&mut view), |s, v| {
+                        s.update(v, LITE_RAW_MAX)
+                    })
+                    .await else {
+                        break;
+                    };
+                    view = back;
+                    dirty = false;
+                    if !viewer.update(update, view.seq).await {
+                        break;
+                    }
+                }
+                if let Some(info) = exit.take()
+                    && viewer.socket.send(exit_message(&info)).await.is_err()
+                {
+                    break;
+                }
+                if let Pace::Lite { every, .. } = pace {
+                    next = Instant::now() + every;
+                }
+            }
+            message = viewer.socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(text.as_str()) {
-                            Ok(ClientMessage::Input { data }) => {
-                                hub.note_typing(id, data.as_bytes());
-                                if !forward_input(&mut socket, &session, data.into_bytes()).await {
+                            Ok(ClientMessage::Input { data, id: input }) => {
+                                // Sent again after a drop and here already: not twice.
+                                let fresh = match (&options.client, input) {
+                                    (Some(key), Some(n)) if options.v2 => session.take_input(key, n),
+                                    _ => true,
+                                };
+                                if fresh {
+                                    hub.note_typing(id, data.as_bytes());
+                                    if !forward_input(&mut viewer.socket, &session, data.into_bytes()).await {
+                                        break;
+                                    }
+                                }
+                                if let Some(n) = input.filter(|_| options.v2)
+                                    && !viewer.text(&json!({ "type": "ack", "id": n })).await
+                                {
                                     break;
                                 }
                             }
@@ -250,15 +698,62 @@ async fn pump(
                                     Ok(colors) => session.set_viewer_colors(colors),
                                     Err(e) => {
                                         let error = json!({ "type": "error", "message": format!("bad theme: {e}") });
-                                        if socket.send(Message::Text(error.to_string().into())).await.is_err() {
+                                        if !viewer.text(&error).await {
                                             break;
                                         }
                                     }
                                 }
                             }
+                            Ok(ClientMessage::Mode { lite, fps, paused }) if options.v2 => {
+                                let paused = paused.unwrap_or(false);
+                                match (pace, lite) {
+                                    (Pace::Raw, true) => {
+                                        pace = Pace::lite(clamp_fps(fps), paused);
+                                        // What is queued goes by the next update.
+                                        dirty = true;
+                                    }
+                                    (Pace::Lite { .. }, false) => {
+                                        // Up to date, then the raw stream from there.
+                                        drop(events);
+                                        let Some((back, (update, fresh))) = off_runtime(&session, std::mem::take(&mut view), |s, v| {
+                                            s.update_and_subscribe(v, usize::MAX)
+                                        })
+                                        .await else {
+                                            break;
+                                        };
+                                        view = back;
+                                        events = fresh;
+                                        pace = Pace::Raw;
+                                        dirty = false;
+                                        if !viewer.update(update, view.seq).await {
+                                            break;
+                                        }
+                                        if let Some(info) = exit.take()
+                                            && viewer.socket.send(exit_message(&info)).await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    (Pace::Lite { paused: was, .. }, true) => {
+                                        pace = Pace::lite(clamp_fps(fps), paused);
+                                        if was && !paused {
+                                            // Back on screen: what changed, now.
+                                            dirty = true;
+                                            next = Instant::now();
+                                        }
+                                    }
+                                    (Pace::Raw, false) => {}
+                                }
+                            }
+                            Ok(ClientMessage::Mode { .. }) => {
+                                let error = json!({ "type": "error", "message": "bad message: mode needs proto=2" });
+                                if !viewer.text(&error).await {
+                                    break;
+                                }
+                            }
                             Err(e) => {
                                 let error = json!({ "type": "error", "message": format!("bad message: {e}") });
-                                if socket.send(Message::Text(error.to_string().into())).await.is_err() {
+                                if !viewer.text(&error).await {
                                     break;
                                 }
                             }
@@ -266,7 +761,7 @@ async fn pump(
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         hub.note_typing(id, &bytes);
-                        if !forward_input(&mut socket, &session, bytes.to_vec()).await {
+                        if !forward_input(&mut viewer.socket, &session, bytes.to_vec()).await {
                             break;
                         }
                     }
@@ -276,28 +771,28 @@ async fn pump(
                         // the reply Close on receipt but only writes it on a
                         // flush (a send would be refused after closing), so
                         // the client sees a clean close instead of 1006.
-                        let _ = socket.flush().await;
+                        let _ = viewer.socket.flush().await;
                         break;
                     }
                     Some(Err(_)) | None => break,
                 }
             }
             _ = ping.tick() => {
-                if socket.send(Message::Ping(Default::default())).await.is_err() {
+                if viewer.socket.send(Message::Ping(Default::default())).await.is_err() {
                     break;
                 }
             }
             close = credential.revoked(hub, &mut recheck) => {
-                let _ = socket.send(Message::Close(Some(close))).await;
+                let _ = viewer.socket.send(Message::Close(Some(close))).await;
                 break;
             }
             () = handoff_restarting(gate.as_ref()) => {
-                close_for_restart(&mut socket).await;
+                close_for_restart(&mut viewer.socket).await;
                 break;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    let _ = socket.send(Message::Close(None)).await;
+                    let _ = viewer.socket.send(Message::Close(None)).await;
                     break;
                 }
             }

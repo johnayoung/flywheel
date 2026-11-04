@@ -497,7 +497,26 @@ body.resizing-y, body.resizing-y * { cursor: row-resize !important; user-select:
 .pane-tools .icon { width: 1.35rem; height: 1.35rem; }
 .pane-tools .icon svg { width: .7rem; height: .7rem; }
 
-.pane-body { flex: 1; min-width: 0; min-height: 0; display: flex; }
+.pane-body { flex: 1; min-width: 0; min-height: 0; display: flex; position: relative; }
+/* Input not with the hub yet (panes.js): "sending…" past 500 ms, or
+   keystrokes queued while the link is down. Never over the keys. */
+.pane-pending {
+  position: absolute;
+  top: .35rem;
+  right: .5rem;
+  z-index: 3;
+  padding: .28rem .5rem;
+  border: 1px solid var(--brass);
+  border-radius: 99px;
+  background: var(--bg);
+  color: var(--brass);
+  font: 600 9.5px/1 var(--mono);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+.pane-pending.queued { color: var(--alert); border-color: var(--alert); }
+.pane-pending[hidden] { display: none; }
 .pane-term {
   flex: 1;
   min-width: 0;

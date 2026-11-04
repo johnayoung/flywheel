@@ -244,6 +244,30 @@ impl Writer {
     }
 }
 
+impl Writer {
+    /// One screen row drawn alone (a frame's row): like a one-row logical
+    /// line, but a wide character's leading spacer (it did not fit at the
+    /// end, so it starts the next row) is drawn as the blank it shows.
+    pub(crate) fn screen_row(&mut self, grid: &Grid<Cell>, line: Line) {
+        let row = &grid[line];
+        for col in 0..row_end(grid, line) {
+            let cell = &row[Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                let mut blank = cell.clone();
+                blank.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                blank.c = ' ';
+                self.cell(&blank);
+                continue;
+            }
+            self.cell(cell);
+        }
+        self.plain();
+    }
+}
+
 /// Cells of a row worth writing: all of a soft-wrapped row, else up to the
 /// last non-blank one.
 fn row_end(grid: &Grid<Cell>, line: Line) -> usize {

@@ -178,6 +178,17 @@ pub const PREFS: &[PrefSpec] = &[
         device_only: false,
     },
     PrefSpec {
+        id: "terminal.lite",
+        section: "terminal",
+        label: "Lite mode",
+        help: "for slow links: paced screen updates, hidden panes paused, side fetches wait; auto: when the link measures slow",
+        kind: PrefKind::Choice {
+            choices: &["auto", "on", "off"],
+        },
+        default: PrefDefault::Str("auto"),
+        device_only: true,
+    },
+    PrefSpec {
         id: "keyboard.pane_prefix",
         section: "keyboard",
         label: "Pane prefix (tmux-style)",

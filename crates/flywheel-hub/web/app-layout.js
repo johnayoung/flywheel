@@ -107,6 +107,9 @@ function claimsSize(pane) {
 
 const panes = window.FwHubPanes({
   el, state, sessionById, TERM_FONT, status: statusLook, goneText, exitHow,
+  net,
+  // Off screen: the page hidden, or the pane parked (another tab, a zoom).
+  paneHidden: (pane) => document.visibilityState !== "visible" || !onStage(pane),
   // A machine's session attaches through this hub's proxy.
   socketPath: (id) => machines.route("GET", `/api/sessions/${id}/ws`),
   // The machine a session is on and how this hub fares with it (null:

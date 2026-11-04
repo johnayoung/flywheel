@@ -43,11 +43,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 mod colors;
+mod frame;
 mod guard;
 mod snapshot;
 mod text;
 
 pub use colors::ViewerColors;
+pub use frame::{FRAME_HISTORY_ROWS, FrameCursor};
 pub use text::{Lines, SearchText};
 
 use guard::{Guarded, OscScan, Tracked};
@@ -494,19 +496,29 @@ impl Emulator {
     }
 
     fn write_state(&self, w: &mut Writer) {
-        let grid = self.term.grid();
-        let mode = *self.term.mode();
-        let cols = grid.columns();
+        self.write_saved(w);
+        self.write_cursor(w);
+        self.write_modes(w);
+    }
 
-        // Saved cursor (DECSC: position, pen, charsets).
-        let saved = &grid.saved_cursor;
+    /// The saved cursor (DECSC: position, pen, charsets), then plain
+    /// charsets (cells hold mapped characters: re-print them through
+    /// ASCII).
+    fn write_saved(&self, w: &mut Writer) {
+        let saved = &self.term.grid().saved_cursor;
         w.cup(saved.point);
         w.pen(&saved.template);
         w.charsets(&saved.charsets);
         w.raw(b"\x1b7");
-        // Cells hold mapped characters: re-print them through ASCII.
         w.charsets(&alacritty_terminal::grid::Charsets::default());
+    }
 
+    /// Scroll region, origin mode, the cursor (and its pending wrap),
+    /// charsets, SO, SGR pen, and hyperlink.
+    fn write_cursor(&self, w: &mut Writer) {
+        let grid = self.term.grid();
+        let mode = *self.term.mode();
+        let cols = grid.columns();
         let (top, bottom) = self.tracked.region;
         if (top, bottom) != (0, grid.screen_lines()) {
             let _ = write!(w.out, "\x1b[{};{}r", top + 1, bottom);
@@ -539,7 +551,12 @@ impl Emulator {
         }
         w.pen(&grid.cursor.template);
         w.link(grid.cursor.template.hyperlink());
+    }
 
+    /// DEC modes (only those differing from a reset terminal), cursor
+    /// style, title, and palette changes.
+    fn write_modes(&self, w: &mut Writer) {
+        let mode = *self.term.mode();
         // Modes (only those differing from a reset terminal).
         let decset = [
             (TermMode::APP_CURSOR, 1),

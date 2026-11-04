@@ -36,6 +36,9 @@ getrandom = "0.3"
 subtle = "2.6"
 libc = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+# Deflated terminal frames for viewers that ask (`z=1`; browsers inflate
+# with DecompressionStream). Pure Rust (miniz_oxide): no C, musl-friendly.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 # Terminal QR codes for `fw hub url --qr` (encoder only; no image backends).
 qrcode = { version = "0.14", default-features = false }
 # Push notifications (ntfy-style webhooks): one HTTP/1.1 POST over

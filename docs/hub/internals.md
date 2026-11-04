@@ -13,7 +13,8 @@ How the hub behaves underneath the UI. Front door: [hub](../hub.md).
 
 ## Terminal emulation
 
-- One `alacritty_terminal` emulator per session; attach = a **snapshot** (scrollback, screens, cursor, pen, modes, title, palette), then live bytes, no gap or overlap. Snapshots hold 2 MiB of scrollback; a client that falls behind gets a screen-only one (`reset`).
+- One `alacritty_terminal` emulator per session; attach = a **snapshot** (scrollback, screens, cursor, pen, modes, title, palette), then live bytes, no gap or overlap. Snapshots hold 2 MiB of scrollback; a client that falls behind gets a screen-only one (`reset`; protocol 2: one frame of what changed).
+- Weak links ([hub-api: Terminal WebSocket](api.md#terminal-websocket)): the last 512 KiB of output are kept per session, so a dropped viewer resumes with what it missed; frames (row diffs from the emulator) pace slow viewers.
 - Not replayed: custom tab stops, blink/overline. Not emulated: `?47`/`?1047` alt screens, kitty keyboard protocol.
 - The server answers terminal queries (DA, DSR, DECRQM, OSC 4/10/11/12) once; clients must not. Colours follow the last viewer-reported theme (dark first).
 - Bounds: OSC strings 64 KiB, titles 4 KiB (stack 10), hyperlinks over 2 KiB dropped, 8 combining marks per cell.
@@ -113,7 +114,9 @@ Keys: [hub-reference](reference.md#keyboard-shortcuts).
 ## Web UI
 
 - Sidebar: machines > workspaces (rollup chip) > sessions (status dot, `↑ahead ↓behind ~changed ?untracked`); companions under their agent; blocked rows show the question. Folder chips: filled = git, hollow = plain, struck = missing.
-- Title and favicon count blocked and done. Updates come over the events socket (polling only while it is down). `#session=<id>` survives reloads; a dropped socket keeps the screen and reconnects (backoff; at once on `online`).
+- Title and favicon count blocked and done. Updates come over the events socket (polling only while it is down). `#session=<id>` survives reloads; a dropped socket keeps the screen and reconnects (retries every 2 s or sooner for 30 s, then backoff to 10 s; at once on `online`) with only what it missed.
+- Keystrokes typed while a pane's link is down wait (`N queued`) and go in order once it is back; dropped, and said, only if the session changed underneath (relaunched). Never echoed locally: input unacknowledged for 500 ms shows `sending…`.
+- Assets are gzipped; scripts and styles are addressed by build (`?v=`) and cached for good, so a reload fetches only the page.
 - Drawers (Commands, Flywheel, Review, Queue) share one width (`--drawer-w`) at the stage's right edge, over the terminal; on phones each is a full-screen sheet. Toasts never cover a dialog or drawer: a dialog ends above the stack, a drawer lifts its content above it.
 - Ended sessions offer Relaunch and Close; one removed elsewhere leaves its pane with a toast.
 - New workspace: folder paths (checked live) or **Import VS Code workspace**. New session: kind, folder (default: the attached one's), optional worktree with a live preview. First run: import offers and a 30-second tour (palette "Shortcut tour").
@@ -130,6 +133,8 @@ Tested at 390x844 and 430x932.
 - **Quick answers**: a blocked dialog's options as buttons (lists send the digit, `(y/n)` the letter + Enter). **Compose**: multi-line text sent as one bracketed paste + Enter; per-device history, per-session drafts (sign-out clears both).
 - Touch: swipe scrolls, long-press selects, pinch sizes text.
 - **Alerts** (per device): a notification when an agent becomes blocked or done while the page is hidden or idle 5 min (https or localhost; iOS only from the Home Screen).
+- **Lite mode** (Settings > Terminal, the header's signal pill; per device; `auto`: when the browser says the connection is slow or round trips reach 300 ms or transfers fall under 64 KB/s): terminals update at most 4 times a second (screen diffs, deflated), hidden panes not at all; usage rollups, flywheel summaries, and suggested commands wait (60 s), session lists re-read at most every 3 s.
+- Network check (opt-in): `node crates/flywheel-hub/e2e/network.mjs [--baseline] [--full]`: 390x844 behind a shaping proxy (400/150 kbps, 300 ms RTT, a 10 s drop) on a temp hub; asserts load, attach, bytes per minute, echo, reconnect, and queued input.
 - **Install**: PWA; the service worker never touches `/api` or sockets and serves the cached page only when the hub is unreachable. iOS Home Screen apps sign in themselves (`fw hub url --qr`).
 
 ## Search

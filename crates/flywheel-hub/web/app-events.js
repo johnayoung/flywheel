@@ -70,6 +70,24 @@ document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") wakeUp();
 });
 
+// Lite mode (netlink.js): every pane's socket is paced as lite mode and
+// its visibility say (a hidden pane gets no updates), and the header's
+// lite pill (always on a phone; elsewhere while lite is on) shows it.
+function syncLite() {
+  for (const pane of livePanes()) pane.syncMode();
+  const pill = $("#lite-toggle");
+  if (!pill) return;
+  const on = net.lite();
+  pill.hidden = !(on || phone());
+  pill.setAttribute("aria-pressed", String(on));
+  pill.classList.toggle("on", on);
+  pill.title = `${net.describe()}. Tap to turn it ${on ? "off" : "on"} on this device (Settings > Terminal: auto).`;
+}
+net.onChange(syncLite);
+document.addEventListener("visibilitychange", syncLite);
+// Panes park and unpark (tabs, zoom) without an event of their own.
+setInterval(syncLite, 1000);
+
 // Crossing the phone breakpoint swaps the solo pane and the layout.
 // `state.attached` already reads the new side of the breakpoint here, so
 // the session on screen is taken from the side being left.
@@ -214,7 +232,7 @@ function connectEvents() {
     sendView(true);
     // Anything that changed while the socket was down.
     refresh(false).catch(() => {});
-    flywheel.reload();
+    net.defer("flywheel", () => flywheel.reload());
     fanout.reload();
   };
   socket.onmessage = (event) => {
@@ -243,7 +261,7 @@ function connectEvents() {
     } else if (message.type === "status") {
       applyStatus(message);
     } else if (message.type === "sessions") {
-      refresh(false).catch(() => {});
+      net.relist(() => refresh(false).catch(() => {}));
       // Machines added or removed here.
       machines.sync().then(() => renderSoon());
     } else {

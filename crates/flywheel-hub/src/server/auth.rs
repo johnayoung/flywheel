@@ -16,7 +16,7 @@ use crate::hub::Hub;
 use crate::web;
 use axum::Json;
 use axum::extract::ws::CloseFrame;
-use axum::extract::{ConnectInfo, FromRequestParts, Path, Request, State};
+use axum::extract::{ConnectInfo, FromRequestParts, Path, RawQuery, Request, State};
 use axum::http::request::Parts;
 use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
@@ -496,7 +496,7 @@ pub(super) async fn index(
 ) -> Response {
     match authenticate(&app, &headers, client) {
         Auth::Granted(_) => {
-            let mut response = no_store(Html(web::INDEX_HTML).into_response());
+            let mut response = no_store(index_page(&headers));
             // The service worker keeps only this page (never the sign-in
             // page) as the offline app shell.
             response.headers_mut().insert(
@@ -639,6 +639,7 @@ pub(super) async fn asset(
     client: Client,
     headers: HeaderMap,
     Path(path): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     if !web::is_public_asset(&path) {
         match authenticate(&app, &headers, client) {
@@ -650,17 +651,105 @@ pub(super) async fn asset(
             }
         }
     }
-    match web::asset(&path) {
-        Some((bytes, content_type)) => (
-            [
-                (header::CONTENT_TYPE, content_type),
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            bytes,
-        )
-            .into_response(),
+    match web::asset_entry(&path) {
+        Some(asset) => asset_response(&headers, query.as_deref(), &asset),
         None => error_response(StatusCode::NOT_FOUND, "no such asset"),
     }
+}
+
+/// Whether the request takes gzip (`Accept-Encoding`, not at q=0).
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|coding| {
+            let mut parts = coding.split(';').map(str::trim);
+            let name = parts.next().unwrap_or("");
+            let refused = parts.any(|p| {
+                p.strip_prefix("q=")
+                    .and_then(|q| q.trim().parse::<f32>().ok())
+                    .is_some_and(|q| q <= 0.0)
+            });
+            (name.eq_ignore_ascii_case("gzip") || name == "*") && !refused
+        })
+}
+
+/// The app page, gzipped when the browser takes it (it is `no-store`:
+/// every load fetches it, and it names everything else by build).
+fn index_page(headers: &HeaderMap) -> Response {
+    let mut response = if accepts_gzip(headers) {
+        let mut response = (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            web::index_html_gzip(),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        response
+    } else {
+        Html(web::index_html()).into_response()
+    };
+    response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+    response
+}
+
+/// An embedded asset: gzipped when it compresses and the browser takes
+/// it; tagged by build (`ETag`, answered 304 when it matches); and, when
+/// asked for by build (`?v=<build>`, as the app page names its scripts and
+/// styles), cacheable for good -- a new build names new URLs.
+pub(super) fn asset_response(
+    headers: &HeaderMap,
+    query: Option<&str>,
+    asset: &web::Asset,
+) -> Response {
+    let build = web::build_id();
+    let gzip = asset.gzip.filter(|_| accepts_gzip(headers));
+    let etag = if gzip.is_some() {
+        format!("\"{build}-gz\"")
+    } else {
+        format!("\"{build}\"")
+    };
+    let pinned = query.is_some_and(|q| q.split('&').any(|p| p.strip_prefix("v=") == Some(build)));
+    let cache = if pinned {
+        "private, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    let fresh = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|tag| {
+            let tag = tag.trim();
+            tag == "*" || tag.trim_start_matches("W/") == etag
+        });
+    let mut response = if fresh {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let body: &'static [u8] = gzip.unwrap_or(asset.bytes);
+        let mut response = ([(header::CONTENT_TYPE, asset.content_type)], body).into_response();
+        if gzip.is_some() {
+            response
+                .headers_mut()
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        }
+        response
+    };
+    let out = response.headers_mut();
+    out.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        out.insert(header::ETAG, value);
+    }
+    if asset.gzip.is_some() {
+        out.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
+    }
+    response
 }
 
 pub(super) fn no_store(mut response: Response) -> Response {

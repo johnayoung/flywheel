@@ -8,7 +8,8 @@
 //! no code or signal (unknown).
 
 use super::{
-    BROADCAST_DEPTH, DRAIN_AFTER_EXIT, Emulator, ExitInfo, InputQueue, PtySession, Shared, pty_size,
+    BROADCAST_DEPTH, DRAIN_AFTER_EXIT, Emulator, ExitInfo, InputQueue, PtySession, Recent, Shared,
+    new_epoch, pty_size,
 };
 use portable_pty::{MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -141,6 +142,10 @@ pub(crate) struct PtyMeta {
     pub cols: u16,
     pub rows: u16,
     pub output_bytes: u64,
+    /// The output stream's epoch, so viewers resume across the handoff
+    /// (absent from hubs before resuming existed: a fresh one).
+    #[serde(default)]
+    pub epoch: Option<u64>,
     /// Set when the leader had already exited.
     pub exit: Option<ExitInfo>,
 }
@@ -184,6 +189,7 @@ impl PtySession {
                 cols: shared.size.cols,
                 rows: shared.size.rows,
                 output_bytes: shared.output_bytes,
+                epoch: Some(shared.epoch),
                 exit: shared.exit.clone(),
             },
             snapshot: shared.screen.snapshot(usize::MAX),
@@ -277,6 +283,8 @@ impl PtySession {
                     reaped: true,
                     output_bytes: export.meta.output_bytes,
                     size,
+                    epoch: export.meta.epoch.unwrap_or_else(new_epoch),
+                    recent: Recent::new(export.meta.output_bytes),
                 }),
                 exited: Condvar::new(),
                 events,
@@ -285,6 +293,7 @@ impl PtySession {
                 master: Mutex::new(None),
                 pid: export.meta.pid,
                 pidfd: Mutex::new(None),
+                inputs_seen: Mutex::default(),
             }));
         };
         let fd = master.as_raw_fd();
@@ -298,6 +307,8 @@ impl PtySession {
                 reaped: exited.is_some(),
                 output_bytes: export.meta.output_bytes,
                 size,
+                epoch: export.meta.epoch.unwrap_or_else(new_epoch),
+                recent: Recent::new(export.meta.output_bytes),
             }),
             exited: Condvar::new(),
             events,
@@ -306,6 +317,7 @@ impl PtySession {
             master: Mutex::new(Some(Master::Adopted(master))),
             pid: export.meta.pid,
             pidfd: Mutex::new(pidfd),
+            inputs_seen: Mutex::default(),
         });
         let drained_rx = session.start_io(fd, Box::new(reader), Box::new(writer), input_rx)?;
         if exited.is_some() {
@@ -532,6 +544,13 @@ mod tests {
         let mut after = adopted.attach();
         assert_eq!(before.replay, after.replay, "same snapshot");
         assert_eq!((after.cols, after.rows), (80, 24));
+        // Viewers resume across it: the same stream, at the same offset.
+        assert_eq!((after.epoch, after.seq), (before.epoch, before.seq));
+        let mut view = crate::pty::View::default();
+        assert!(matches!(
+            adopted.reattach(before.seq, before.epoch, usize::MAX, &mut view),
+            crate::pty::Reattach::Delta { .. }
+        ));
         assert!(adopted.scrollback_lines() > 150);
         adopted.resume();
         assert_eq!(adopted.write(b"42\r".to_vec()), WriteOutcome::Queued);

@@ -109,6 +109,8 @@ async function keepShell(urls) {
   for (const raw of urls) {
     const url = new URL(raw, self.location.origin);
     if (url.origin !== self.location.origin || !url.pathname.startsWith("/assets/")) continue;
+    // Kept already (this build's cache): not fetched again on every load.
+    if (await cache.match(url)) continue;
     const response = await fetch(url, { credentials: "same-origin" });
     if (response.ok) await cache.put(url, response);
   }

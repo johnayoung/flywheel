@@ -722,3 +722,278 @@ fn the_snapshot_keeps_the_newest_history_within_its_budget() {
     client.process(&full);
     assert_same(&mut source, &mut client);
 }
+
+// --- frames -----------------------------------------------------------------
+
+/// The screen as a viewer sees it: every cell of the active screen (soft
+/// wraps aside: frames draw rows alone), the cursor, pen, modes, region,
+/// cursor style, title (empty is none), and palette.
+fn assert_same_view(a: &mut Emulator, b: &mut Emulator) {
+    a.flush();
+    b.flush();
+    let (ga, gb) = (a.term.grid(), b.term.grid());
+    assert_eq!(
+        (ga.columns(), ga.screen_lines()),
+        (gb.columns(), gb.screen_lines())
+    );
+    for line in 0..ga.screen_lines() as i32 {
+        for col in 0..ga.columns() {
+            let (ca, cb) = (&ga[Line(line)][Column(col)], &gb[Line(line)][Column(col)]);
+            let strip = |k: CellKey| {
+                k.map(|(c, fg, bg, f, z, u, l)| {
+                    (
+                        c,
+                        fg,
+                        bg,
+                        f - Flags::WRAPLINE - Flags::LEADING_WIDE_CHAR_SPACER,
+                        z,
+                        u,
+                        l,
+                    )
+                })
+            };
+            assert_eq!(
+                strip(cell_key(ca)),
+                strip(cell_key(cb)),
+                "cell {line},{col}"
+            );
+        }
+    }
+    assert_eq!(ga.cursor.point, gb.cursor.point, "cursor");
+    assert_eq!(
+        ga.cursor.input_needs_wrap, gb.cursor.input_needs_wrap,
+        "pending wrap"
+    );
+    assert_eq!(
+        Pen::of(&ga.cursor.template),
+        Pen::of(&gb.cursor.template),
+        "pen"
+    );
+    assert_eq!(ga.cursor.charsets, gb.cursor.charsets, "charsets");
+    assert_eq!(ga.saved_cursor.point, gb.saved_cursor.point, "saved cursor");
+    assert_eq!(*a.term.mode(), *b.term.mode(), "modes");
+    assert_eq!(a.tracked, b.tracked, "scroll region / shift state");
+    assert_eq!(a.term.cursor_style(), b.term.cursor_style(), "cursor style");
+    let title = |e: &Emulator| e.title().filter(|t| !t.is_empty());
+    assert_eq!(title(a), title(b), "title");
+    for i in 0..259 {
+        assert_eq!(a.term.colors()[i], b.term.colors()[i], "colour {i}");
+    }
+}
+
+/// Feed `steps` to a source, sending a frame to a viewer after each; the
+/// viewer must show what the source does after every frame. Returns both
+/// and the frame bytes sent.
+fn framed(steps: &[Vec<u8>]) -> (Emulator, Emulator, usize) {
+    let mut source = Emulator::new(COLS, ROWS, 1000);
+    let mut viewer = Emulator::new(COLS, ROWS, 1000);
+    let mut cursor = FrameCursor::default();
+    let mut sent = 0;
+    for (i, step) in steps.iter().enumerate() {
+        source.process(step);
+        if let Some(frame) = source.frame(&mut cursor) {
+            sent += frame.len();
+            viewer.process(&frame);
+        }
+        let _ = viewer.take_replies();
+        assert!(cursor.known());
+        assert_same_view(&mut source, &mut viewer);
+        let _ = i;
+    }
+    (source, viewer, sent)
+}
+
+fn recent(e: &mut Emulator) -> Vec<String> {
+    e.text(TextSource::Recent { lines: 10_000 }).lines
+}
+
+#[test]
+fn frames_carry_scrolling_output_into_the_viewers_history() {
+    // A log a line or a few at a time (the rows scroll in place), then
+    // bursts taller than the screen (written out whole).
+    let mut steps = Vec::new();
+    for i in 0..60 {
+        steps.push(format!("\x1b[32mline {i}\x1b[0m tail\r\n").into_bytes());
+        if i % 7 == 0 {
+            steps.push(format!("a{i}\r\nb{i}\r\nc{i}\r\n").into_bytes());
+        }
+    }
+    let mut burst = Vec::new();
+    for i in 0..25 {
+        burst.extend(format!("burst {i}\r\n").as_bytes());
+    }
+    steps.push(burst);
+    steps.push(b"$ ".to_vec());
+    let (mut source, mut viewer, _) = framed(&steps);
+    assert_eq!(recent(&mut viewer), recent(&mut source));
+    assert_eq!(viewer.history_lines(), source.history_lines());
+}
+
+#[test]
+fn an_unchanged_screen_sends_no_frame_and_a_spinner_one_row() {
+    let mut source = Emulator::new(COLS, ROWS, 1000);
+    let mut viewer = Emulator::new(COLS, ROWS, 1000);
+    let mut cursor = FrameCursor::default();
+    source.process(b"\x1b[1mtitle\x1b[0m\r\nsome text\r\n\r\n");
+    viewer.process(&source.frame(&mut cursor).expect("first frame"));
+    assert!(source.frame(&mut cursor).is_none(), "nothing changed");
+    let mut sizes = Vec::new();
+    for s in ["|", "/", "-", "\\"] {
+        source.process(format!("\r\x1b[2K\x1b[38;5;208m{s}\x1b[0m Working... (3s)").as_bytes());
+        let frame = source.frame(&mut cursor).expect("a spinner frame");
+        sizes.push(frame.len());
+        viewer.process(&frame);
+        assert_same_view(&mut source, &mut viewer);
+    }
+    // The prefix, one row and the cursor: far less than the screen.
+    assert!(sizes.iter().all(|&n| n < 200), "{sizes:?}");
+}
+
+#[test]
+fn frames_follow_screens_modes_regions_titles_and_resets() {
+    let steps: Vec<Vec<u8>> = vec![
+        b"prompt $ ls\r\nfile1 file2\r\n".to_vec(),
+        // A full-screen program: alternate screen, modes, a title.
+        b"\x1b[?1049h\x1b[?1h\x1b=\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b]2;vim\x07\x1b[H\x1b[2Jvim buffer\x1b[5;3H\x1b[7mstatus\x1b[0m".to_vec(),
+        b"\x1b[2;10r\x1b[10;1Hscrolled\nin region\n".to_vec(),
+        b"\x1b[?25l\x1b[3 q\x1b]4;1;rgb:12/34/56\x07".to_vec(),
+        // Back: modes off again, the primary screen as it was.
+        b"\x1b[r\x1b[?25h\x1b[0 q\x1b[?1000l\x1b[?1006l\x1b[?2004l\x1b>\x1b[?1l\x1b[?1049l\x1b]104\x07\x1b]2;shell\x07".to_vec(),
+        b"\x1b7\x1b[4;4H\x1b[31msaved\x1b8 after\r\n".to_vec(),
+        b"\x1b(0lqqk\x1b(B \x0e\x0f done\r\n".to_vec(),
+        b"\x1b[4hinsert\x1b[4l".to_vec(),
+        // A full-width row leaves the cursor pending a wrap.
+        "x".repeat(usize::from(COLS)).into_bytes(),
+        // A reset clears history too.
+        b"\x1bcafter reset\r\n".to_vec(),
+        "\u{4f60}\u{597d} e\u{301} \x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\\r\n".as_bytes().to_vec(),
+    ];
+    let (_source, viewer, _) = framed(&steps);
+    assert_eq!(
+        viewer.history_lines(),
+        0,
+        "the reset cleared the viewer's history"
+    );
+}
+
+#[test]
+fn a_frame_after_a_resize_or_a_forgotten_viewer_repaints_without_a_reset() {
+    let mut source = Emulator::new(COLS, ROWS, 1000);
+    let mut viewer = Emulator::new(COLS, ROWS, 1000);
+    let mut cursor = FrameCursor::default();
+    for i in 0..30 {
+        source.process(format!("old {i}\r\n").as_bytes());
+    }
+    viewer.process(&source.snapshot(SNAPSHOT_HISTORY_BYTES));
+    // The viewer has the screen by a snapshot: a cursor that never drew
+    // repaints it, keeping the history the viewer had.
+    source.process(b"new\r\n");
+    viewer.process(&source.frame(&mut cursor).expect("repaint"));
+    assert_same_view(&mut source, &mut viewer);
+    assert!(viewer.history_lines() >= 20, "{}", viewer.history_lines());
+    source.resize(30, 12);
+    viewer.resize(30, 12);
+    source.process(b"wider no, taller\r\n");
+    viewer.process(&source.frame(&mut cursor).expect("resized"));
+    assert_same_view(&mut source, &mut viewer);
+    cursor.forget();
+    viewer.process(b"\x1b[5;5Hscribble\x1b[?25l");
+    viewer.process(&source.frame(&mut cursor).expect("forgotten"));
+    assert_same_view(&mut source, &mut viewer);
+}
+
+#[test]
+fn raw_bytes_then_a_synced_cursor_keep_frames_exact() {
+    // A viewer that got the raw bytes (a quiet link): the cursor is
+    // brought along without drawing, and later frames diff against it.
+    let mut source = Emulator::new(COLS, ROWS, 1000);
+    let mut viewer = Emulator::new(COLS, ROWS, 1000);
+    let mut cursor = FrameCursor::default();
+    viewer.process(&source.snapshot(SNAPSHOT_HISTORY_BYTES));
+    source.sync_cursor(&mut cursor);
+    for i in 0..40 {
+        let bytes = format!("raw {i}\r\n\x1b[2;2Hx{i}\x1b[{};1H", 10).into_bytes();
+        source.process(&bytes);
+        if i % 3 == 0 {
+            viewer.process(&bytes);
+            source.sync_cursor(&mut cursor);
+        } else if let Some(frame) = source.frame(&mut cursor) {
+            viewer.process(&frame);
+        }
+        assert_same_view(&mut source, &mut viewer);
+    }
+}
+
+#[test]
+fn frames_track_random_output() {
+    // Pseudo-random mixes of text, colours, cursor moves, erases, scroll
+    // regions, inserts and deletes, wide characters and line feeds.
+    let mut seed: u64 = 0x5eed_f00d;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let pieces: &[&str] = &[
+        "hello",
+        "\r\n",
+        "\n",
+        "\x1b[31m",
+        "\x1b[0m",
+        "\x1b[1;44m",
+        "\x1b[K",
+        "\x1b[2J",
+        "\x1b[H",
+        "\x1b[3;7H",
+        "\x1b[L",
+        "\x1b[M",
+        "\x1b[@",
+        "\x1b[P",
+        "\x1b[2;8r",
+        "\x1b[r",
+        "\u{4f60}",
+        "\t",
+        "\x1b[S",
+        "\x1b[T",
+        "\x1b[?25l",
+        "\x1b[?25h",
+        "\x1b[10;40H",
+        "wrap me around please",
+        "\x1bM",
+        "\x1b[J",
+        "\x1b[1K",
+        "\x1b[38;2;1;2;3m",
+        "\x1b[?1049h",
+        "\x1b[?1049l",
+        "\x08",
+    ];
+    for _ in 0..8 {
+        let mut steps = Vec::new();
+        for _ in 0..60 {
+            let mut step = Vec::new();
+            for _ in 0..=next(6) {
+                step.extend_from_slice(pieces[next(pieces.len() as u64) as usize].as_bytes());
+            }
+            steps.push(step);
+        }
+        framed(&steps);
+    }
+}
+
+#[test]
+fn frames_of_a_busy_screen_cost_less_than_its_bytes() {
+    // An agent redrawing its status line many times between frames: the
+    // frame carries the last state only.
+    let mut steps = Vec::new();
+    for i in 0..20 {
+        let mut step = Vec::new();
+        for j in 0..50 {
+            step.extend(format!("\r\x1b[2K\x1b[38;5;208m*\x1b[0m Working {i}.{j} \x1b[2m(esc to interrupt)\x1b[0m").as_bytes());
+        }
+        steps.push(step);
+    }
+    let raw: usize = steps.iter().map(Vec::len).sum();
+    let (_, _, sent) = framed(&steps);
+    assert!(sent * 10 < raw, "frames {sent} B vs raw {raw} B");
+}

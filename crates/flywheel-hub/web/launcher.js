@@ -606,7 +606,7 @@ window.FwHubLauncher = function (ctx) {
     const session = ctx.sessionById(message.session_id);
     if (session) session.usage = message.usage;
     ctx.onSessionUsage(message.session_id);
-    rollupsSoon();
+    ctx.defer("usage", () => rollupsSoon());
   }
 
   return {

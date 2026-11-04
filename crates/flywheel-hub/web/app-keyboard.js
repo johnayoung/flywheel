@@ -355,7 +355,7 @@ function prefixKey(event) {
   if (isPrefixKey(event)) {
     const pane = focusedPane();
     const literal = controlChar(event);
-    if (pane && literal) pane.send(JSON.stringify({ type: "input", data: literal }));
+    if (pane && literal) pane.input(literal);
     return true;
   }
   const hit = settings.matchPrefix(event);
@@ -432,7 +432,7 @@ window.addEventListener(
         // Again inside the palette: the key itself, to the terminal.
         closePalette();
         const literal = controlChar(event);
-        if (focusedPane() && literal) focusedPane().send(JSON.stringify({ type: "input", data: literal }));
+        if (focusedPane() && literal) focusedPane().input(literal);
       } else if (!document.querySelector("dialog[open]")) {
         search.close(false);
         openPalette();
@@ -500,6 +500,7 @@ const actions = {
   },
   share: () => sharing.open(state.attached),
   "toggle-record": () => sharing.toggleRecord(state.attached),
+  "toggle-lite": () => net.toggle(),
   sharing: () => {
     document.body.classList.remove("side-open");
     sharing.open(null);

@@ -203,6 +203,16 @@ Unreadable queries (or `POST /login` bodies) get a 4xx page, or `{"error"}` for 
 
 Client sends `input` `{"data"}`, `resize` `{"cols","rows"}`, `theme` `{"foreground","background","cursor","ansi"}` (answers colour queries), or binary input.
 
+**Protocol 2** (`?proto=2`, what the web UI uses; weak links). Options: `lite=1&fps=N` (1-30, default 4), `z=1`, `since=S&epoch=E`, `client=KEY` (1-64 of `[A-Za-z0-9_-]`).
+
+- `snapshot` adds `seq` (output offset it reflects) and `epoch` (hex: the output stream; a relaunch starts another). Each later raw binary byte is one offset.
+- `since`/`epoch`: back at offset S of E -> `{"type":"resume","seq":S,"epoch"}`, then what was missed (raw, from the last 512 KiB, plus a `size`), no reset; lite and over 16 KiB: one frame instead. Else a snapshot with `continued`: `false` = not this output (typed input no longer applies).
+- `{"type":"frame","seq","cols","rows","bytes"}` + one binary: escape sequences repainting what changed (rows, history rows scrolled in, cursor, modes); the screen is then at `seq`.
+- Lite: at most `fps` updates a second, the first at once; an update is the raw output since when 1 KiB or less, else a frame. A raw viewer 64+ chunks behind gets one update then raw again.
+- `z=1`: binary = tag `0` + bytes, or `1` + u32 BE inflated length + raw deflate, one stream per socket, sync-flushed per message (`DecompressionStream("deflate-raw")`).
+- `input` may carry `id` (growing per `client`): acked `{"type":"ack","id"}`; an id already taken is not typed again (resend after a drop).
+- `{"type":"mode","lite","fps"?,"paused"?}`: switch pacing; `paused` (lite) sends nothing until unpaused (hidden pane).
+
 Close codes: **4001** token rotated, **4002** logout / login expired, **4003** peer revoked, **4004** share ended, **1012** live handoff (reconnect). Via a machine proxy: **4010** (its 4001-4003), **4011** machine removed, **1011** link lost.
 
 ## Events WebSocket

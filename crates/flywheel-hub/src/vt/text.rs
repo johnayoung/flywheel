@@ -24,6 +24,11 @@ impl HistoryWatch {
     pub(crate) fn scrolled(&mut self, rows: usize) {
         self.scrolls = self.scrolls.saturating_add(rows as u64);
     }
+
+    /// The upper bound on rows scrolled so far (see the field).
+    pub(crate) fn scrolls(&self) -> u64 {
+        self.scrolls
+    }
 }
 
 /// The primary screen's history as search text, kept between
@@ -102,7 +107,7 @@ impl HistoryText {
     }
 }
 
-fn fingerprint(text: &str, wraps: bool) -> u64 {
+pub(crate) fn fingerprint(text: &str, wraps: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
@@ -111,7 +116,7 @@ fn fingerprint(text: &str, wraps: bool) -> u64 {
 }
 /// The address of a row's cells: stable while the row moves through the
 /// grid's ring (rows are swapped and rotated, not copied).
-fn row_address(grid: &Grid<Cell>, line: Line) -> usize {
+pub(crate) fn row_address(grid: &Grid<Cell>, line: Line) -> usize {
     std::ptr::from_ref(&grid[line][Column(0)]) as usize
 }
 

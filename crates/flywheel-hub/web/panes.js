@@ -1,7 +1,20 @@
 // flywheel hub: one pane = one xterm attached to one session over its own
-// WebSocket (protocol: crates/flywheel-hub/src/server.rs), with its own
-// fit, reconnect-with-backoff, banner, and link state. app-stage.js lays panes
-// out (tabs, splits) and decides which one has focus.
+// WebSocket (protocol: crates/flywheel-hub/src/server.rs, docs/hub/api.md),
+// with its own fit, reconnect-with-backoff, banner, and link state.
+// app-stage.js lays panes out (tabs, splits) and decides which one has
+// focus.
+//
+// Weak links (protocol 2): the pane knows the output offset its screen
+// reflects, so a dropped socket comes back with what it missed instead of
+// a snapshot; keystrokes typed while the link is down wait, in order, and
+// go once it is back (each carries an id the hub acknowledges and drops
+// when it has it already) -- unless the session changed underneath (the
+// hub no longer has that output: relaunched, another hub), which the
+// banner then says. Typed text is never echoed locally (the program owns
+// the screen): input unacknowledged for SENDING_MS shows "sending".
+// Binary messages may come deflated (z=1, one DecompressionStream per
+// socket); messages are then handled strictly in order. Lite mode
+// (netlink.js) asks for paced updates, and none while the pane is hidden.
 //
 // Sizing: a session's PTY has one size, the last one a viewer asked for.
 // A pane asks (fits the terminal to its box and resizes the PTY) only
@@ -13,6 +26,67 @@
 
 window.FwHubPanes = function (ctx) {
   const { el, state, sessionById } = ctx;
+  // Unacknowledged input older than this shows "sending".
+  const SENDING_MS = 500;
+  // Keystrokes kept while the link is down (beyond: refused, and said).
+  const QUEUE_MAX = 4096;
+  const QUEUE_BYTES = 256 * 1024;
+  // Reconnect attempts back off to RETRY_FAST_MS for the first
+  // RETRY_FAST_FOR of a drop (a cellular blip), then to 10 s.
+  const RETRY_FAST_MS = 2000;
+  const RETRY_FAST_FOR = 30000;
+
+  // Deflated binary messages: whether this browser inflates raw deflate.
+  const canInflate = (() => {
+    try {
+      new DecompressionStream("deflate-raw"); // eslint-disable-line no-new
+      return true;
+    } catch (_) {
+      return false;
+    }
+  })();
+
+  // One socket's inflater: messages tagged 0 (as is) or 1 (u32 length,
+  // then deflate data flushed at the message's end).
+  function makeInflater() {
+    const stream = new DecompressionStream("deflate-raw");
+    const writer = stream.writable.getWriter();
+    const reader = stream.readable.getReader();
+    let spare = null;
+    return {
+      async take(bytes) {
+        if (bytes[0] === 0) return bytes.subarray(1);
+        const len = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(1);
+        writer.write(bytes.subarray(5)).catch(() => {});
+        const out = new Uint8Array(len);
+        let got = 0;
+        while (got < len) {
+          let piece = spare;
+          spare = null;
+          if (!piece) {
+            const next = await reader.read();
+            if (next.done) throw new Error("inflater closed");
+            piece = next.value;
+          }
+          const n = Math.min(piece.length, len - got);
+          out.set(piece.subarray(0, n), got);
+          got += n;
+          if (n < piece.length) spare = piece.subarray(n);
+        }
+        return out;
+      },
+      close() {
+        writer.abort().catch(() => {});
+        reader.cancel().catch(() => {});
+      },
+    };
+  }
+
+  const randomKey = () => {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  };
 
   // The server's emulator answers terminal queries for every session, so
   // the browser must not: a second viewer would answer twice.
@@ -36,9 +110,11 @@ window.FwHubPanes = function (ctx) {
     const head = el("header", { className: "pane-head" });
     const host = el("div", { className: "pane-term" });
     const bannerText = el("span", { className: "banner-text" });
+    // "sending" / "N queued": input not yet with the hub.
+    const pendingBadge = el("span", { className: "pane-pending", hidden: true, role: "status" });
     const bannerActions = el("span", { className: "banner-actions" });
     const banner = el("div", { className: "banner pane-banner", hidden: true, role: "status" }, bannerText, bannerActions);
-    const root = el("section", { className: "pane", dataset: { pane: paneId } }, head, el("div", { className: "pane-body" }, host), banner);
+    const root = el("section", { className: "pane", dataset: { pane: paneId } }, head, el("div", { className: "pane-body" }, host, pendingBadge), banner);
 
     const pane = {
       id: paneId,
@@ -59,9 +135,22 @@ window.FwHubPanes = function (ctx) {
       retryTimer: null,
       countdown: null,
       tick: null,
-      dropped: 0, // keystrokes typed while the link was down
       link: { kind: "idle", text: "idle" },
       disposed: false,
+      // Protocol 2 (the hub said so in its first message): the output
+      // offset the screen reflects, in the hub's stream `epoch`.
+      v2: false,
+      seq: null,
+      epoch: null,
+      ready: false, // this socket's first message (snapshot or resume) handled
+      queue: [], // [{id, data}] typed while the link was not ready, in order
+      inflight: [], // [{id, data, at}] sent, not acknowledged yet
+      nextId: 1,
+      key: randomKey(), // names this pane's input ids to the hub
+      refused: 0, // keystrokes refused (queue full) during this drop
+      lite: false, // the socket's pacing, as last asked
+      paused: false,
+      lostAt: 0, // when the current drop began
     };
 
     function makeTerm() {
@@ -80,11 +169,12 @@ window.FwHubPanes = function (ctx) {
       pane.search = search;
       term.open(host);
       muteQueries(term);
-      term.onData((data) => pane.sendInput(JSON.stringify({ type: "input", data: ctx.transformInput(data) })));
+      term.onData((data) => pane.input(ctx.transformInput(data)));
       term.onBinary((data) => {
+        // Legacy mouse reports only: sent when the link is up, never queued.
         const bytes = new Uint8Array(data.length);
         for (let i = 0; i < data.length; i++) bytes[i] = data.charCodeAt(i) & 0xff;
-        pane.sendInput(bytes);
+        if (pane.ready) pane.send(bytes);
       });
       term.onResize(({ cols, rows }) => {
         // Only a claiming pane's own fit resizes the PTY; following the
@@ -211,12 +301,109 @@ window.FwHubPanes = function (ctx) {
       return false;
     };
 
-    // Keystrokes cannot be queued safely (a reconnect replays a screen they
-    // were not typed against), so they are dropped -- and the banner says so.
-    pane.sendInput = (message) => {
-      if (pane.send(message) || !pane.sessionId || pane.exited) return;
-      pane.dropped += 1;
+    // Typed text (or a key bar key, a compose box's paste): to the hub
+    // now, or queued while the link is not ready (see the module docs).
+    pane.input = (data) => {
+      if (!pane.sessionId || pane.exited || !data) return;
+      const item = { id: pane.nextId++, data };
+      if (pane.ready && pane.socket && pane.socket.readyState === WebSocket.OPEN) {
+        transmit(item);
+      } else if (pane.queue.length < QUEUE_MAX && queuedBytes() + data.length <= QUEUE_BYTES) {
+        pane.queue.push(item);
+      } else {
+        pane.refused += 1;
+      }
+      renderPending();
       if (pane.tick) pane.tick();
+    };
+    // A `{"type":"input","data"}` message (key bar, prefix keys).
+    pane.sendInput = (message) => {
+      let parsed = null;
+      try {
+        parsed = typeof message === "string" ? JSON.parse(message) : null;
+      } catch (_) {
+        parsed = null;
+      }
+      if (parsed && parsed.type === "input" && typeof parsed.data === "string") pane.input(parsed.data);
+      else pane.send(message);
+    };
+
+    const queuedBytes = () => pane.queue.reduce((n, item) => n + item.data.length, 0);
+
+    function transmit(item) {
+      const message = pane.v2 ? { type: "input", data: item.data, id: item.id } : { type: "input", data: item.data };
+      pane.socket.send(JSON.stringify(message));
+      if (pane.v2) pane.inflight.push({ ...item, at: performance.now() });
+    }
+
+    // The hub has every input up to `id`.
+    function acked(id) {
+      let last = null;
+      while (pane.inflight.length && pane.inflight[0].id <= id) last = pane.inflight.shift();
+      if (last && ctx.net) ctx.net.noteRtt(performance.now() - last.at);
+      renderPending();
+    }
+
+    // Send what waited, in order (the link is back on the same output).
+    function flushQueue() {
+      const waiting = pane.queue;
+      pane.queue = [];
+      pane.refused = 0;
+      for (const item of waiting) transmit(item);
+      renderPending();
+    }
+
+    // What waited was typed against a screen the session no longer has.
+    function dropQueue(why) {
+      const n = pane.queue.length + pane.refused;
+      pane.queue = [];
+      pane.inflight = [];
+      pane.refused = 0;
+      renderPending();
+      if (n) showBanner(`${n} keystroke${n === 1 ? "" : "s"} not sent: ${why}.`, [], true);
+    }
+
+    // The link went: what was sent but not acknowledged may not have
+    // arrived; it goes again first (the hub drops what it has).
+    function requeueInflight() {
+      if (!pane.inflight.length) return;
+      pane.queue = [...pane.inflight.map(({ id, data }) => ({ id, data })), ...pane.queue];
+      pane.inflight = [];
+    }
+
+    let pendingTimer = 0;
+    function renderPending() {
+      const queued = pane.queue.length;
+      const oldest = pane.inflight.length ? performance.now() - pane.inflight[0].at : 0;
+      let text = "";
+      if (queued) text = `${queued} queued`;
+      else if (pane.inflight.length && oldest >= SENDING_MS) text = "sending…";
+      pendingBadge.hidden = !text;
+      if (text) {
+        pendingBadge.textContent = text;
+        pendingBadge.title = queued
+          ? `${queued} keystroke${queued === 1 ? "" : "s"} wait for the link; they go, in order, once it is back`
+          : "The hub has not acknowledged what you typed yet";
+      }
+      pendingBadge.classList.toggle("queued", !!queued);
+      const watch = pane.inflight.length > 0 || queued > 0;
+      if (watch && !pendingTimer) {
+        pendingTimer = setInterval(renderPending, 200);
+      } else if (!watch && pendingTimer) {
+        clearInterval(pendingTimer);
+        pendingTimer = 0;
+      }
+    }
+
+    // Lite pacing for this socket: asked when it opens and whenever lite
+    // mode or the pane's visibility changes.
+    pane.syncMode = () => {
+      const lite = !!(ctx.net && ctx.net.lite());
+      const paused = lite && ctx.paneHidden(pane);
+      if (!pane.v2 || !pane.ready || (lite === pane.lite && paused === pane.paused)) return;
+      pane.lite = lite;
+      pane.paused = paused;
+      pane.send(JSON.stringify({ type: "mode", lite, fps: ctx.net.FPS, paused }));
     };
 
     pane.sendTheme = () => pane.send(ctx.themeMessage());
@@ -249,10 +436,27 @@ window.FwHubPanes = function (ctx) {
       stopRetry();
       if (pane.socket) {
         pane.socket.onclose = null;
+        pane.socket.onmessage = null;
         pane.socket.close(1000);
         pane.socket = null;
       }
+      if (pane.inflater) pane.inflater.close();
+      pane.inflater = null;
+      pane.ready = false;
       endReplay();
+    }
+
+    // Forget the link's state: another session (or none) is shown.
+    function forgetLink() {
+      pane.seq = null;
+      pane.epoch = null;
+      pane.v2 = false;
+      pane.queue = [];
+      pane.inflight = [];
+      pane.refused = 0;
+      pane.lostAt = 0;
+      pane.attachedOnce = false;
+      renderPending();
     }
 
     // xterm draws no cursor at all -- not even the inactive outline --
@@ -290,7 +494,7 @@ window.FwHubPanes = function (ctx) {
       closeSocket();
       pane.sessionId = id;
       pane.retry = 0;
-      pane.dropped = 0;
+      forgetLink();
       pane.hideBanner();
       if (session.live) {
         pane.exited = null;
@@ -309,6 +513,7 @@ window.FwHubPanes = function (ctx) {
     // Let go of the session (the pane stays, empty).
     pane.clear = () => {
       closeSocket();
+      forgetLink();
       pane.sessionId = null;
       pane.exited = null;
       pane.size = null;
@@ -317,25 +522,43 @@ window.FwHubPanes = function (ctx) {
       setLink("idle");
     };
 
-    // Open (or re-open) the socket. Each connect replays a snapshot of the
-    // session's terminal, so the terminal is reset first.
+    // The socket's URL: protocol 2 options, lite pacing, and the offset
+    // to resume from when this pane has the session's screen.
+    function socketUrl(id) {
+      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+      const path = ctx.socketPath ? ctx.socketPath(id) : `/api/sessions/${id}/ws`;
+      const params = new URLSearchParams({ proto: "2", client: pane.key });
+      if (canInflate) params.set("z", "1");
+      if (ctx.net && ctx.net.lite()) {
+        params.set("lite", "1");
+        params.set("fps", String(ctx.net.FPS));
+      }
+      if (pane.v2 && pane.seq !== null && pane.epoch) {
+        params.set("since", String(pane.seq));
+        params.set("epoch", pane.epoch);
+      }
+      return `${scheme}://${window.location.host}${path}${path.includes("?") ? "&" : "?"}${params}`;
+    }
+
+    // Open (or re-open) the socket: a snapshot of the session's terminal
+    // (the terminal is reset for it), or -- back on the same output -- what
+    // it missed, drawn on the screen it has.
     function connect(id) {
       stopRetry();
       setLink("connecting", pane.retry ? `retry ${pane.retry}` : "connecting");
-      const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-      const path = ctx.socketPath ? ctx.socketPath(id) : `/api/sessions/${id}/ws`;
-      const socket = new WebSocket(`${scheme}://${window.location.host}${path}`);
+      const socket = new WebSocket(socketUrl(id));
       socket.binaryType = "arraybuffer";
       pane.socket = socket;
       pane.replaying = false;
       pane.drawn = false;
+      pane.ready = false;
+      pane.lite = !!(ctx.net && ctx.net.lite());
+      pane.paused = false;
       const term = pane.term;
+      let openedAt = 0;
       socket.onopen = () => {
-        // The snapshot follows; clear only now, so a dead link keeps the
-        // last screen visible while it retries.
-        term.reset();
+        openedAt = performance.now();
         pane.retry = 0;
-        pane.dropped = 0;
         setLink("attached");
         pane.sendTheme();
         pane.hideBanner();
@@ -346,10 +569,24 @@ window.FwHubPanes = function (ctx) {
           if (!document.querySelector("dialog[open]")) term.focus();
         }
       };
-      // The snapshot is drawn at the session's size: replay exactly its
+      // The link is usable: what waited goes (or, the session having
+      // changed underneath, is dropped and said), pacing is asked.
+      const settle = (why) => {
+        pane.ready = true;
+        pane.lostAt = 0;
+        if (why) dropQueue(why);
+        else flushQueue();
+        pane.attachedOnce = true;
+        pane.syncMode();
+      };
+      // A snapshot is drawn at the session's size: replay exactly its
       // bytes at that size, then size the terminal by the rules (a
-      // claiming pane resizes the session; the program redraws).
-      let pending = 0;
+      // claiming pane resizes the session; the program redraws). A frame
+      // (lite) is drawn at the size it names.
+      let owed = 0;
+      let owedDone = null;
+      let snapshotWire = 0;
+      let snapshotAt = 0;
       const replayed = () => {
         if (pane.socket !== socket) return;
         pane.replaying = false;
@@ -357,44 +594,92 @@ window.FwHubPanes = function (ctx) {
         initCursor();
         pane.claim();
       };
-      socket.onmessage = (event) => {
-        if (typeof event.data !== "string") {
-          const bytes = new Uint8Array(event.data);
-          if (pending > 0) {
-            pending -= bytes.length;
-            term.write(bytes, pending <= 0 ? replayed : undefined);
-          } else {
-            term.write(bytes);
-          }
-          return;
+      const follow = (cols, rows) => {
+        pane.size = { cols, rows };
+        if (!pane.replaying && (term.cols !== cols || term.rows !== rows)) {
+          pane.following = true;
+          term.resize(cols, rows);
+          pane.following = !pane.claims();
+          host.classList.toggle("following", pane.following);
         }
+        ctx.onResize(pane);
+        scheduleClip();
+      };
+      const onBinary = async (data) => {
+        let bytes = new Uint8Array(data);
+        const wire = bytes.length;
+        if (pane.inflater) bytes = await pane.inflater.take(bytes);
+        if (pane.socket !== socket) return;
+        if (owed > 0) {
+          owed -= bytes.length;
+          if (owedDone === replayed) snapshotWire += wire;
+          const done = owed <= 0 ? owedDone : null;
+          if (done === replayed && ctx.net) ctx.net.noteTransfer(snapshotWire, performance.now() - snapshotAt);
+          term.write(bytes, done || undefined);
+        } else {
+          if (pane.seq !== null) pane.seq += bytes.length;
+          term.write(bytes);
+        }
+      };
+      const onText = (raw) => {
         let message;
         try {
-          message = JSON.parse(event.data);
+          message = JSON.parse(raw);
         } catch (_) {
           return;
         }
+        if (message.type === "snapshot" || message.type === "resume") {
+          // The first message says which protocol the hub speaks.
+          if (!pane.ready && openedAt && ctx.net) ctx.net.noteRtt(performance.now() - openedAt);
+          const v2 = message.type === "resume" || typeof message.seq === "number";
+          if (v2 && canInflate && !pane.inflater) pane.inflater = makeInflater();
+        }
         if (message.type === "snapshot") {
+          const v2 = typeof message.seq === "number";
+          const wasReady = pane.ready;
+          term.reset();
+          pane.v2 = v2;
+          pane.seq = v2 ? message.seq : null;
+          pane.epoch = v2 ? message.epoch : null;
           pane.replaying = true;
           pane.size = { cols: message.cols, rows: message.rows };
           pane.following = true;
           term.resize(message.cols, message.rows);
           pane.following = false;
-          pending = message.bytes;
-          if (!(pending > 0)) replayed();
+          owed = message.bytes;
+          owedDone = replayed;
+          snapshotWire = 0;
+          snapshotAt = performance.now();
+          if (!(owed > 0)) replayed();
+          // (A snapshot mid-socket: a v1 hub's catch-up after `reset`.)
+          if (!wasReady) {
+            settle(
+              v2 && message.continued === false
+                ? "the session changed while the link was down (relaunched, or another hub)"
+                : !v2 && pane.attachedOnce
+                  ? "this hub cannot tell whether the session changed meanwhile"
+                  : "",
+            );
+          }
+        } else if (message.type === "resume") {
+          pane.v2 = true;
+          pane.epoch = message.epoch;
+          pane.drawn = true;
+          initCursor();
+          settle("");
+          pane.claim();
+        } else if (message.type === "frame") {
+          pane.seq = message.seq;
+          follow(message.cols, message.rows);
+          owed = message.bytes;
+          owedDone = () => scheduleClip(true);
+        } else if (message.type === "ack") {
+          acked(message.id);
         } else if (message.type === "size") {
           // Another viewer (or this pane) resized the PTY: what follows is
           // drawn at that size. Panes that do not claim it follow; a
           // claiming one too (last resizer wins) until it fits again.
-          pane.size = { cols: message.cols, rows: message.rows };
-          if (!pane.replaying && (term.cols !== message.cols || term.rows !== message.rows)) {
-            pane.following = true;
-            term.resize(message.cols, message.rows);
-            pane.following = !pane.claims();
-            host.classList.toggle("following", pane.following);
-          }
-          ctx.onResize(pane);
-          scheduleClip();
+          follow(message.cols, message.rows);
         } else if (message.type === "reset") {
           term.reset();
         } else if (message.type === "exit") {
@@ -403,10 +688,34 @@ window.FwHubPanes = function (ctx) {
           showBanner(message.message, [], true);
         }
       };
+      // Strictly in order: an inflated message resolves later than a
+      // text one after it would otherwise run.
+      let chain = Promise.resolve();
+      socket.onmessage = (event) => {
+        const data = event.data;
+        chain = chain
+          .then(() => (pane.socket !== socket ? null : typeof data === "string" ? onText(data) : onBinary(data)))
+          .catch((error) => {
+            // A message that does not decode: this link's state is lost;
+            // a fresh socket starts over with a snapshot.
+            if (pane.socket !== socket) return;
+            console.error(error);
+            pane.seq = null;
+            socket.close(4000);
+          });
+      };
       socket.onclose = (event) => {
         if (pane.socket !== socket) return;
         pane.socket = null;
+        pane.ready = false;
+        if (pane.inflater) pane.inflater.close();
+        pane.inflater = null;
+        requeueInflight();
+        renderPending();
+        if (!pane.lostAt) pane.lostAt = Date.now();
         endReplay();
+        // A snapshot or frame cut short: the screen is not at `seq`.
+        if (owed > 0) pane.seq = null;
         // 4001: the hub's token was rotated; 4002: this browser's login
         // ended (signed out elsewhere, expired). Either way: sign in again.
         if (event.code === 4001 || event.code === 4002) {
@@ -464,9 +773,13 @@ window.FwHubPanes = function (ctx) {
 
     function scheduleReconnect(id, code) {
       pane.retry += 1;
-      const delay = Math.min(10000, 500 * 2 ** Math.min(pane.retry - 1, 5));
+      // A blip first: retried every RETRY_FAST_MS or sooner for a while,
+      // then backing off to 10 s.
+      const fast = Date.now() - (pane.lostAt || Date.now()) < RETRY_FAST_FOR;
+      const cap = fast ? RETRY_FAST_MS : 10000;
+      const delay = Math.min(cap, 500 * 2 ** Math.min(pane.retry - 1, 5));
       const due = Date.now() + delay;
-      setLink("lost", "link lost");
+      setLink("lost", pane.queue.length ? `link lost · ${pane.queue.length} queued` : "link lost");
       const now = el("button", { type: "button", className: "slab", onclick: () => pane.reconnectNow() }, "Reconnect now");
       const tick = () => {
         const seconds = Math.max(0, Math.ceil((due - Date.now()) / 1000));
@@ -476,10 +789,13 @@ window.FwHubPanes = function (ctx) {
           : machine && (code === 1011 || (machine.link !== "online" && machine.link !== "connecting"))
             ? `Machine ${machine.name} is ${machine.link === "refused" ? "refusing this hub" : "unreachable"}; this is its last screen.`
             : `Link lost (code ${code}); the session keeps running on the hub.`;
-        const dropped = pane.dropped
-          ? ` ${pane.dropped} keystroke${pane.dropped === 1 ? "" : "s"} not sent.`
+        const queued = pane.queue.length;
+        const waiting = queued
+          ? ` ${queued} keystroke${queued === 1 ? "" : "s"} queued: sent once the link is back.`
           : "";
-        bannerText.textContent = `${why} Reconnecting in ${seconds}s.${dropped}`;
+        const refused = pane.refused ? ` ${pane.refused} more not kept (the queue is full).` : "";
+        bannerText.textContent = `${why} Reconnecting in ${seconds}s.${waiting}${refused}`;
+        setLink("lost", queued ? `link lost · ${queued} queued` : "link lost");
       };
       pane.tick = tick;
       showBanner("", [now]);
@@ -492,6 +808,14 @@ window.FwHubPanes = function (ctx) {
       stopRetry();
       const id = pane.sessionId;
       if (!id || pane.socket || pane.disposed) return;
+      const known = sessionById(id);
+      if (state.offline === 0 && known && known.live) {
+        // Live when last listed: the socket at once (a round trip saved
+        // on a slow link); the re-list settles a session gone meanwhile.
+        ctx.refresh().catch(() => {});
+        connect(id);
+        return;
+      }
       try {
         await ctx.refresh();
       } catch (_) {
@@ -523,6 +847,7 @@ window.FwHubPanes = function (ctx) {
     pane.dispose = () => {
       pane.disposed = true;
       closeSocket();
+      forgetLink();
       if (pane.term) pane.term.dispose();
       pane.term = null;
       pane.fit = null;

@@ -285,6 +285,7 @@ pub(super) async fn viewer_page(
 pub(super) async fn viewer_asset(
     State(app): State<AppState>,
     client: Client,
+    headers: HeaderMap,
     Path((credential, path)): Path<(String, String)>,
 ) -> Response {
     if let Err(response) = share_auth(&app, client, &credential, false) {
@@ -293,15 +294,8 @@ pub(super) async fn viewer_asset(
     if !web::is_viewer_asset(&path) {
         return error_response(StatusCode::FORBIDDEN, "not reachable with a share link");
     }
-    match web::asset(&path) {
-        Some((bytes, content_type)) => (
-            [
-                (header::CONTENT_TYPE, content_type),
-                (header::CACHE_CONTROL, "no-cache"),
-            ],
-            bytes,
-        )
-            .into_response(),
+    match web::asset_entry(&path) {
+        Some(asset) => super::auth::asset_response(&headers, None, &asset),
         None => error_response(StatusCode::NOT_FOUND, "no such asset"),
     }
 }

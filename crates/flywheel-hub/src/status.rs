@@ -24,7 +24,7 @@
 use crate::auth::Token;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Handing the board to another hub process (a live handoff).
 #[path = "handoff/status_side.rs"]
@@ -72,15 +72,33 @@ pub fn rollup(statuses: impl IntoIterator<Item = AgentStatus>) -> Option<AgentSt
     statuses.into_iter().max_by_key(|s| s.urgency())
 }
 
-/// What a session adds to its workspace's rollup. A finished turn the hub
-/// grades itself (a fan-out candidate's, `graded`) is no person's to read:
-/// it rolls up as `idle`, as Needs you leaves it out (the fan-out's own
-/// row says when its verdicts are in). Its own status stays `done`.
-fn rolled(status: AgentStatus, graded: bool) -> AgentStatus {
-    if graded && status == AgentStatus::Done {
-        AgentStatus::Idle
-    } else {
-        status
+/// What the hub grades itself, which no person has to read: one rule for
+/// the rollup, Needs you, and every client's done count.
+///
+/// * `sessions`: candidates of an open fan-out (no winner picked, worktree
+///   kept). Their finished turns roll up as `idle` (their own status stays
+///   `done`); Needs you leaves them out.
+/// * `fanouts`: per workspace, the open fan-outs whose latest grading
+///   nobody has looked at yet. Each is one `done` there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Graded {
+    pub sessions: HashSet<String>,
+    pub fanouts: HashMap<String, usize>,
+}
+
+impl Graded {
+    /// What a session adds to its workspace's rollup.
+    fn rolled(&self, session_id: &str, status: AgentStatus) -> AgentStatus {
+        if status == AgentStatus::Done && self.sessions.contains(session_id) {
+            AgentStatus::Idle
+        } else {
+            status
+        }
+    }
+
+    /// What a workspace's fan-outs add to its rollup.
+    fn fanouts_in(&self, workspace_id: &str) -> Option<AgentStatus> {
+        (self.fanouts.get(workspace_id).copied().unwrap_or(0) > 0).then_some(AgentStatus::Done)
     }
 }
 
@@ -264,6 +282,10 @@ pub struct Alert {
 pub struct Snapshot {
     pub sessions: BTreeMap<String, StatusView>,
     pub workspaces: BTreeMap<String, AgentStatus>,
+    /// [`Graded::sessions`]: their `done` is not counted.
+    pub graded: BTreeSet<String>,
+    /// [`Graded::fanouts`]: each is one `done` in its workspace.
+    pub fanouts: BTreeMap<String, usize>,
 }
 
 impl StatusBoard {
@@ -523,28 +545,43 @@ impl StatusBoard {
             .map(|e| e.workspace_id.as_str())
     }
 
-    /// A workspace's rollup for `audience` (`None` without agent sessions);
-    /// `graded` sessions' finished turns count as `idle` (see [`rolled`]).
+    /// A workspace's rollup for `audience` (`None` without agent sessions
+    /// or a fan-out needing you), counted as [`Graded`] says.
     pub fn workspace_status(
         &self,
         workspace_id: &str,
         audience: Audience<'_>,
-        graded: &HashSet<String>,
+        graded: &Graded,
     ) -> Option<AgentStatus> {
         rollup(
             self.entries
                 .iter()
                 .filter(|(_, e)| e.workspace_id == workspace_id)
-                .map(|(id, e)| rolled(e.view(audience).status, graded.contains(id))),
+                .map(|(id, e)| graded.rolled(id, e.view(audience).status))
+                .chain(graded.fanouts_in(workspace_id)),
         )
     }
 
     /// Everything, for `audience`; rollups as [`StatusBoard::workspace_status`].
-    pub fn snapshot(&self, audience: Audience<'_>, graded: &HashSet<String>) -> Snapshot {
-        let mut snapshot = Snapshot::default();
+    pub fn snapshot(&self, audience: Audience<'_>, graded: &Graded) -> Snapshot {
+        let mut snapshot = Snapshot {
+            graded: graded.sessions.iter().cloned().collect(),
+            fanouts: graded
+                .fanouts
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(w, n)| (w.clone(), *n))
+                .collect(),
+            ..Snapshot::default()
+        };
+        for workspace in snapshot.fanouts.keys() {
+            snapshot
+                .workspaces
+                .insert(workspace.clone(), AgentStatus::Done);
+        }
         for (id, entry) in &self.entries {
             let view = entry.view(audience);
-            let status = rolled(view.status, graded.contains(id));
+            let status = graded.rolled(id, view.status);
             let rolled = snapshot
                 .workspaces
                 .entry(entry.workspace_id.clone())
@@ -711,7 +748,7 @@ mod tests {
         board.apply("b", b, Signal::Ready, None);
         board.apply("c", c, Signal::Working, None);
         let anyone = Audience::Anyone;
-        let none = HashSet::new();
+        let none = Graded::default();
         assert_eq!(
             board.workspace_status("w1", anyone, &none),
             Some(AgentStatus::Done)
@@ -746,7 +783,10 @@ mod tests {
         board.apply("a", a, Signal::Done, None);
         board.apply("b", b, Signal::Ready, None);
         let anyone = Audience::Anyone;
-        let graded: HashSet<String> = ["a".to_owned()].into();
+        let graded = Graded {
+            sessions: ["a".to_owned()].into(),
+            ..Graded::default()
+        };
         assert_eq!(
             board.workspace_status("w", anyone, &graded),
             Some(AgentStatus::Idle)
@@ -754,6 +794,7 @@ mod tests {
         let snap = board.snapshot(anyone, &graded);
         assert_eq!(snap.workspaces["w"], AgentStatus::Idle);
         assert_eq!(snap.sessions["a"].status, AgentStatus::Done);
+        assert_eq!(snap.graded, ["a".to_owned()].into());
         // An ungraded finished turn beside it still rolls up done, and a
         // graded one that blocks is blocked.
         board.apply("b", b, Signal::Done, None);
@@ -765,6 +806,38 @@ mod tests {
         assert_eq!(
             board.snapshot(anyone, &graded).workspaces["w"],
             AgentStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn a_fanout_needing_you_is_one_done_in_its_workspace() {
+        let mut board = StatusBoard::default();
+        let a = board.track("a", "w").unwrap().generation;
+        board.apply("a", a, Signal::Done, None);
+        let anyone = Audience::Anyone;
+        let graded = Graded {
+            sessions: ["a".to_owned()].into(),
+            fanouts: [("w".to_owned(), 1), ("empty".to_owned(), 1)].into(),
+        };
+        // Its candidate's turn is the hub's; the fan-out itself is done,
+        // in a workspace with no agent session of its own too.
+        assert_eq!(
+            board.workspace_status("w", anyone, &graded),
+            Some(AgentStatus::Done)
+        );
+        assert_eq!(
+            board.workspace_status("empty", anyone, &graded),
+            Some(AgentStatus::Done)
+        );
+        let snap = board.snapshot(anyone, &graded);
+        assert_eq!(snap.workspaces["w"], AgentStatus::Done);
+        assert_eq!(snap.workspaces["empty"], AgentStatus::Done);
+        assert_eq!(snap.fanouts["w"], 1);
+        // A working agent there still outranks it.
+        board.apply("a", a, Signal::Working, None);
+        assert_eq!(
+            board.snapshot(anyone, &graded).workspaces["w"],
+            AgentStatus::Working
         );
     }
 

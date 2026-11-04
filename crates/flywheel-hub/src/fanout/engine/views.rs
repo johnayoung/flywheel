@@ -234,6 +234,7 @@ impl Fanouts {
             counts,
             settled,
             graded_at: fanout.graded_at(),
+            needs_you: fanout.needs_you(),
             runner: self.runner_name(),
             warnings,
             summary: false,
@@ -253,6 +254,18 @@ impl Fanouts {
         }
         eprintln!("fw hub: fan-out {} ({id}) forgotten", removed.name);
         hub.emit(HubEvent::Fanout { id: id.to_owned() });
+        Ok(())
+    }
+
+    /// Someone looked at the board's grading of `graded_at` (the board's
+    /// `graded_at` when they opened it): it no longer needs you, unless a
+    /// later grading finished since. An earlier mark never undoes a later.
+    pub fn seen(&self, id: &str, graded_at: chrono::DateTime<chrono::Utc>) -> Result<(), HubError> {
+        let hub = self.hub()?;
+        let changed = hub.store().update_fanout(id, |f| f.mark_seen(graded_at))?;
+        if changed {
+            hub.emit(HubEvent::Fanout { id: id.to_owned() });
+        }
         Ok(())
     }
 

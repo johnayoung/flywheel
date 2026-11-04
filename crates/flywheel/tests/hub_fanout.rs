@@ -785,3 +785,171 @@ fn a_settled_fan_out_tells_plugins_once_with_its_ranked_board() {
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(finished_events(&plugin).len(), 1);
 }
+
+/// The hub's events socket for client `client`, authorized by token.
+fn events(env: &Env, client: &str) -> tungstenite::WebSocket<std::net::TcpStream> {
+    use tungstenite::client::IntoClientRequest;
+    let port = env.port();
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut request = format!("ws://127.0.0.1:{port}/api/events?client={client}")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {}", env.token()).parse().unwrap(),
+    );
+    tungstenite::client(request, stream).unwrap().0
+}
+
+/// The next `snapshot` on the events socket for which `want` holds.
+fn snapshot_until(
+    socket: &mut tungstenite::WebSocket<std::net::TcpStream>,
+    what: &str,
+    want: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        assert!(Instant::now() < deadline, "no snapshot with {what}");
+        if let tungstenite::Message::Text(text) = socket.read().unwrap() {
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if value["type"] == "snapshot" && want(&value) {
+                return value;
+            }
+        }
+    }
+}
+
+impl Env {
+    fn port(&self) -> u16 {
+        let status: Value = serde_json::from_str(&self.ok(&["status", "--json"])).unwrap();
+        let listen = status["listen"].as_str().unwrap().to_owned();
+        listen.rsplit(':').next().unwrap().parse().unwrap()
+    }
+
+    fn token(&self) -> String {
+        std::fs::read_to_string(self.state.join("token"))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    /// `POST path` with a JSON body over plain HTTP: the status code.
+    fn post(&self, path: &str, body: &Value) -> u16 {
+        use std::io::{Read, Write};
+        let port = self.port();
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let body = body.to_string();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.token(),
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in {response:?}"))
+    }
+}
+
+/// One rule for "done" on a fan-out, the same for the rollup, Needs you,
+/// and `fw hub attach`: an open fan-out's candidates' finished turns are
+/// the hub's to grade (never done), the fan-out with an unseen grading is
+/// one done in its workspace until someone looks at its board, and once a
+/// winner is picked its candidates are ordinary sessions again.
+#[test]
+fn a_fan_out_is_one_done_until_seen_and_its_candidates_are_the_hubs_until_picked() {
+    let env = Env::new();
+    fake_agents(&env);
+    env.ok(&["start", "--port", "0"]);
+    let repo = env.repo.to_str().unwrap().to_owned();
+    env.ok(&["new", "demo", "--create", "--folder", &repo, "--name", "sh"]);
+    let check = env.root.join("check-answer.sh");
+    let check_grader = format!("answer={}", check.display());
+    let id = env
+        .ok(&[
+            "fanout",
+            "new",
+            "demo",
+            "--name",
+            "rule",
+            "--prompt",
+            "Answer",
+            "--agent",
+            "claude:pass",
+            "--agent",
+            "claude:fail",
+            "--grader",
+            &check_grader,
+            "--timeout",
+            "60",
+        ])
+        .trim()
+        .to_owned();
+    let board = env.board_until(&id, "both graded", |b| {
+        graded(b, "c1", 1) && graded(b, "c2", 1)
+    });
+    assert_eq!(board["needs_you"], true, "{board}");
+    let workspace = board["workspace_id"].as_str().unwrap().to_owned();
+    let sessions: Vec<String> = ["c1", "c2"]
+        .iter()
+        .map(|l| {
+            candidate(&board, l)["session_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+
+    // Both candidates finished a turn nobody viewed, yet the workspace's
+    // one done is the fan-out: the snapshot says so for every client.
+    let mut socket = events(&env, "rule-test");
+    let snap = snapshot_until(&mut socket, "the fan-out needing you", |s| {
+        s["fanouts"][&workspace] == 1
+    });
+    assert_eq!(snap["workspaces"][&workspace], "done", "{snap}");
+    for sid in &sessions {
+        assert_eq!(snap["sessions"][sid]["status"], "done", "{snap}");
+        assert!(
+            snap["graded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|g| g == sid.as_str()),
+            "{snap}"
+        );
+    }
+
+    // Looking at the board (an earlier grading than the latest never
+    // undoes a later one) clears it: the rollup drops to idle.
+    assert_eq!(
+        env.post(
+            &format!("/api/fanouts/{id}/seen"),
+            &serde_json::json!({ "graded_at": board["graded_at"] })
+        ),
+        204
+    );
+    let snap = snapshot_until(&mut socket, "no fan-out needing you", |s| {
+        s["fanouts"]
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
+    });
+    assert_eq!(snap["workspaces"][&workspace], "idle", "{snap}");
+    assert_eq!(env.board(&id)["needs_you"], false);
+
+    // Picked: the hub stops grading its candidates, so their unseen
+    // finished turns are done again.
+    env.ok(&["fanout", "pick", &id, "c1", "--yes"]);
+    let snap = snapshot_until(&mut socket, "nothing graded after the pick", |s| {
+        s["graded"].as_array().is_some_and(Vec::is_empty)
+    });
+    assert_eq!(snap["workspaces"][&workspace], "done", "{snap}");
+    assert_eq!(env.board(&id)["needs_you"], false);
+}

@@ -135,6 +135,9 @@ pub struct FanoutView {
     /// Nothing is left to wait for: no agent at work, no grading queued.
     pub settled: bool,
     pub graded_at: Option<DateTime<Utc>>,
+    /// Its latest grading is unseen: Needs you lists it, and it counts as
+    /// one done in its workspace ([`crate::fanout::Fanout::needs_you`]).
+    pub needs_you: bool,
     /// What runs the graders (`None`: this hub cannot grade).
     pub runner: Option<String>,
     /// What the board should say of the fan-out as a whole (the graders

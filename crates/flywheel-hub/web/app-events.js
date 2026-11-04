@@ -324,9 +324,9 @@ const favicon = {
 };
 
 // Blocked and done agents (optionally all but one session).
-// What needs you elsewhere, counted as Needs you lists it: a fan-out's
-// finished candidates are one item, its row (until its board is opened),
-// not one per candidate.
+// What needs you elsewhere, counted as Needs you lists it: an open
+// fan-out's finished candidates are one item, its row (until someone opens
+// its board), not one per candidate.
 function attentionCounts(except) {
   let blocked = 0;
   let done = 0;

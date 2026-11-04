@@ -97,6 +97,7 @@ Review actions (commit, push, pr, rebase, abort, merge) are two-step: `{"dry_run
 | POST | `/api/fanouts/{id}/fix` | `{"candidate","dry_run"?}` -> `{"prompt","paste"?}` |
 | POST | `/api/fanouts/{id}/pick` | `{"candidate","dry_run":true}` -> `{"refusal","needs_rebase","merge":plan,"losers"}`, then `{"confirm"}` |
 | POST | `/api/fanouts/{id}/rebase` | `{"candidate","dry_run":true}` -> plan, then `{"confirm"}` |
+| POST | `/api/fanouts/{id}/seen` | `{"graded_at"}` -> 204: that grading was looked at (`needs_you` false unless a later one finished) |
 | POST | `/api/fanouts/{id}/cleanup` | `{"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}` -> per-candidate `items` |
 | POST | `/api/fanouts/{id}/promote` | `{"task_id"?,"goal"?,...,"dry_run":true}` -> `{"plan":{"path","contents"},"fingerprint"}`, then `{"confirm"}`; 404 not a flywheel repo, 409 exists / changed |
 | GET | `/api/flywheel` | `{"enabled","folders":[summary]}`; summary `{"folder","counts":{state:n},"alerts","live_runs","worker_live","problem"}` |
@@ -105,7 +106,7 @@ Review actions (commit, push, pr, rebase, abort, merge) are two-step: `{"dry_run
 | GET | `/api/flywheel/task?folder=&task=` | the task as a fan-out seed (`prompt`, `graders`, `held_out` names) |
 | POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"cols"?,"rows"?}` -> 201 the `fw worker` session (`--task` per id in `tasks`, 400 bad id); 409 `{"running"}` while a hub-started worker runs there, unless `another` |
 
-Fan-out view: `{"id","base_sha","winner","counts","leader","settled","candidates":[{"label","session_id","verdict","rank","why","pickable"}]}` (lists carry no grader output). 503 fan-outs off.
+Fan-out view: `{"id","base_sha","winner","counts","leader","settled","graded_at","needs_you","candidates":[{"label","session_id","verdict","rank","why","pickable"}]}` (lists carry no grader output). 503 fan-outs off.
 
 ## Shares and recordings
 
@@ -199,7 +200,7 @@ Close codes: **4001** token rotated, **4002** logout / login expired, **4003** p
 
 | Message | When |
 |---|---|
-| `{"type":"snapshot","sessions":{id:status},"workspaces":{id:rollup}}` | on connect and after falling behind |
+| `{"type":"snapshot","sessions":{id:status},"workspaces":{id:rollup},"graded":[id],"fanouts":{workspace:n}}` | on connect, after falling behind, and after a fan-out change |
 | `{"type":"status","session_id","status"\|null,"workspace_id","workspace_status"}` | per change, as this client sees it |
 | `{"type":"sessions"}` | sessions, workspaces, or attached sockets (`live.clients`) changed: re-list |
 | `{"type":"usage", ...}` | a session's usage changed |

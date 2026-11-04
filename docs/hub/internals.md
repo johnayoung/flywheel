@@ -61,7 +61,8 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 - **Idle is not authorization**: no running turn, no known prompt on screen. An unknown prompt reads idle or unknown, never blocked.
 - Hook / `notify` reports win; screen rules fill gaps; shells have none. Esc fires no Claude hook: a seen turn showing the prompt 3 s reads `idle`, a dialog closing onto a running turn `working`.
 - Seen is per client id (browser storage, or the attach client); the REST API counts a turn seen once anyone viewed it.
-- Rollup: a workspace's most urgent session, blocked > working > done > idle. A fan-out candidate's finished turn is the hub's to grade: it rolls up `idle` and Needs you skips it; the fan-out's row (graders finished, unseen) is the one `done`, in Needs you and the sidebar chip alike.
+- Rollup: a workspace's most urgent session, blocked > working > done > idle.
+- Fan-out done, one rule for the rollup, Needs you, the chip, and `fw hub attach`: until a winner is picked, candidates' finished turns are the hub's (rolled up `idle`); a fan-out with an unseen grading (`needs_you`) is one `done` until anyone opens its board (`POST .../seen`).
 - Claude gets `--session-id <uuid>` (`agent_session_id`, follows `/clear`) and hooks via `--settings` (merged with yours) running `<this binary> hub report`. Codex gets `-c notify=["<this binary>","hub","report","--source","codex","--event","notify"]`; its `thread-id` is `agent_session_id`. Trust: [hub-security](security.md#trust-model).
 
 ## Detection manifests
@@ -105,7 +106,7 @@ Per workspace: tabs of split trees, one session per pane. Stored on the hub (sha
 - A new-shell split (`Alt \`, `Alt -`) opens an agent's companion shell first; ``Alt ` `` opens it beside its agent above 1100 px.
 - Panes stay 40x8 cells or more (else a new tab). Closing a pane (`Alt X`) leaves its session running; removing a session closes its panes and empty tabs. Only the active tab attaches; 12 tabs, 12 panes per tab.
 - Phones (< 760 px): one pane, a chip row switches sessions; layouts unchanged.
-- Browser check (opt-in, not in `scripts/check.sh`): `node crates/flywheel-hub/e2e/layout.mjs [OUT_DIR]`: layouts, phone landing, header pills, drawers, toasts, rollups, tap targets at 1440x900 and 390x844, on a temp hub with a fake `claude` (env `FW`, `PLAYWRIGHT`, `CHROMIUM`, `PORT`).
+- Browser check (opt-in, not in `scripts/check.sh`): `node crates/flywheel-hub/e2e/layout.mjs [OUT_DIR]`: layouts, pills, drawers, toasts, rollups, tap targets at 1440x900 and 390x844 on a temp hub with a fake `claude` (env `FW`, `PLAYWRIGHT`, `CHROMIUM`, `PORT`).
 
 Keys: [hub-reference](reference.md#keyboard-shortcuts).
 

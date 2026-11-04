@@ -361,6 +361,7 @@ fn summaries_carry_no_grader_output() {
         leader: None,
         settled: true,
         graded_at: None,
+        needs_you: false,
         runner: None,
         warnings: vec![],
         summary: false,
@@ -539,6 +540,7 @@ fn state_files_from_before_fanouts_load_and_fanouts_round_trip() {
         winner: None,
         origin: None,
         promoted: Vec::new(),
+        seen_graded_at: None,
     };
     store.insert_fanout(fanout.clone()).unwrap();
     assert!(
@@ -609,6 +611,7 @@ fn the_finished_event_carries_the_ranked_board_and_only_a_short_tail() {
         },
         settled: true,
         graded_at: None,
+        needs_you: false,
         runner: None,
         warnings: vec![],
         summary: false,
@@ -660,4 +663,90 @@ fn a_taken_fan_out_name_gets_a_number() {
     assert_eq!(super::unique_name("t1", &[]), "t1");
     assert_eq!(super::unique_name("t1", &["t1"]), "t1-2");
     assert_eq!(super::unique_name("t1", &["t1", "t1-2", "x"]), "t1-3");
+}
+
+#[test]
+fn a_fan_out_needs_you_until_seen_and_grades_its_candidates_until_picked() {
+    let wt = WorktreeRef {
+        repo: PathBuf::from("/r"),
+        path: PathBuf::from("/r.worktrees/t"),
+        branch: "t".into(),
+        base: "main".into(),
+    };
+    let candidate = |label: &str| Candidate {
+        label: label.into(),
+        session_id: format!("s-{label}"),
+        kind: SessionKind::Claude,
+        launch: AgentLaunch::default(),
+        worktree: wt.clone(),
+        pending: None,
+        grade: None,
+        gradings: 0,
+        fixes: 0,
+        cleaned: None,
+    };
+    let mut f = Fanout {
+        id: "f1".into(),
+        name: "demo".into(),
+        workspace_id: "w1".into(),
+        repo: PathBuf::from("/r"),
+        base: "main".into(),
+        base_sha: "b".repeat(40),
+        prompt: "p".into(),
+        commit_instruction: false,
+        graders: vec![],
+        timeout_secs: 60,
+        protect: vec![],
+        pins: vec![],
+        created_at: Utc::now(),
+        candidates: vec![candidate("c1"), candidate("c2")],
+        winner: None,
+        origin: None,
+        promoted: Vec::new(),
+        seen_graded_at: None,
+    };
+    // Nothing graded yet: nothing to look at, but its turns are the hub's.
+    assert!(!f.needs_you());
+    assert!(!f.mark_seen(Utc::now()));
+    assert_eq!(f.graded_sessions().collect::<Vec<_>>(), ["s-c1", "s-c2"]);
+
+    let first = Utc::now() - chrono::Duration::seconds(10);
+    f.candidates[0].grade = Some(Grade {
+        finished_at: first,
+        ..grade(true, 1, vec![])
+    });
+    assert!(f.needs_you());
+    // A look that claims a later grading than exists marks only the latest.
+    assert!(f.mark_seen(first + chrono::Duration::seconds(60)));
+    assert_eq!(f.seen_graded_at, Some(first));
+    assert!(!f.needs_you());
+
+    // A later grading needs you again; an older look does not undo it.
+    let second = first + chrono::Duration::seconds(5);
+    f.candidates[1].grade = Some(Grade {
+        finished_at: second,
+        ..grade(false, 1, vec![])
+    });
+    assert!(f.needs_you());
+    assert!(!f.mark_seen(first));
+    assert!(f.needs_you());
+    assert!(f.mark_seen(second));
+    assert!(!f.needs_you());
+
+    // A cleaned-up candidate is not graded; after the pick none is, and
+    // an unseen grading no longer needs you.
+    f.candidates[1].cleaned = Some(Cleaned {
+        at: Utc::now(),
+        branch_deleted: true,
+    });
+    assert_eq!(f.graded_sessions().collect::<Vec<_>>(), ["s-c1"]);
+    f.seen_graded_at = None;
+    f.winner = Some(Winner {
+        label: "c1".into(),
+        head: "a".repeat(40),
+        base: "main".into(),
+        at: Utc::now(),
+    });
+    assert!(!f.needs_you());
+    assert_eq!(f.graded_sessions().count(), 0);
 }

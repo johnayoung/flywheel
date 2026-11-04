@@ -661,6 +661,11 @@ body.toast-docked dialog.sheet:modal {
    and footer above the stack (commands.js sets its --toast-room and
    .toast-docked), so no toast covers a drawer's controls either. */
 .commands.toast-docked { padding-bottom: var(--toast-room, 0px); }
+/* Desktop: the stack sits inside an open drawer's frame, not on its edge
+   (the drawer ends where the stack's 1.2rem margin does). */
+@media (min-width: 761px) {
+  body:has(aside.commands:not([hidden])) .toasts { right: 2rem; }
+}
 .toast {
   pointer-events: auto;
   display: flex;

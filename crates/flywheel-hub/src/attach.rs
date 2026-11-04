@@ -52,7 +52,7 @@ use futures_util::{SinkExt, StreamExt};
 use keys::{Action, Command, Keys, Prefix};
 use picker::Picked;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IsTerminal, Write};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -97,15 +97,28 @@ pub struct HubView {
     /// Agent status per session id, as this client sees it.
     pub status: HashMap<String, String>,
     pub workspace_status: HashMap<String, String>,
+    /// Sessions the hub grades itself (open fan-outs' candidates): their
+    /// finished turns are not counted done.
+    pub graded: HashSet<String>,
+    /// Open fan-outs whose latest grading nobody has looked at: one done
+    /// each.
+    pub fanouts: usize,
     /// The events socket is connected.
     pub online: bool,
     pub error: Option<String>,
 }
 
-/// Blocked and done sessions, hub-wide.
+/// Blocked and done, hub-wide, counted as the browser's Needs you lists
+/// them: a graded session's finished turn is the hub's, and a fan-out
+/// needing you is one done.
 pub fn status_counts(view: &HubView) -> (usize, usize) {
-    let count = |want: &str| view.status.values().filter(|s| *s == want).count();
-    (count("blocked"), count("done"))
+    let blocked = view.status.values().filter(|s| *s == "blocked").count();
+    let done = view
+        .status
+        .iter()
+        .filter(|(id, s)| *s == "done" && !view.graded.contains(*id))
+        .count();
+    (blocked, done + view.fanouts)
 }
 
 /// Everything the attach loop waits on.
@@ -1284,6 +1297,22 @@ fn apply_snapshot(v: &mut HubView, event: &Value) {
                 .collect()
         })
         .unwrap_or_default();
+    v.graded = event
+        .get("graded")
+        .and_then(Value::as_array)
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.fanouts = event
+        .get("fanouts")
+        .and_then(Value::as_object)
+        .map(|m| m.values().filter_map(Value::as_u64).sum::<u64>())
+        .unwrap_or(0)
+        .try_into()
+        .unwrap_or(usize::MAX);
 }
 
 fn apply_status(v: &mut HubView, event: &Value) {
@@ -1358,6 +1387,34 @@ mod tests {
         apply_status(
             &mut v,
             &json!({ "type": "status", "session_id": "b", "status": null }),
+        );
+        assert_eq!(status_counts(&v), (0, 0));
+    }
+
+    #[test]
+    fn graded_sessions_and_fanouts_count_as_needs_you_lists_them() {
+        let mut v = HubView::default();
+        // Two candidates finished (the hub's to grade), one plain session
+        // finished, and the fan-out's grading is unseen: two done.
+        apply_snapshot(
+            &mut v,
+            &json!({ "type": "snapshot",
+                "sessions": { "c1": { "status": "done" }, "c2": { "status": "done" },
+                    "s": { "status": "done" } },
+                "workspaces": { "w": "done" },
+                "graded": ["c1", "c2"],
+                "fanouts": { "w": 1 } }),
+        );
+        assert_eq!(status_counts(&v), (0, 2));
+        // Looked at: the next snapshot no longer lists it.
+        apply_snapshot(
+            &mut v,
+            &json!({ "type": "snapshot",
+                "sessions": { "c1": { "status": "done" }, "c2": { "status": "done" },
+                    "s": { "status": "idle" } },
+                "workspaces": { "w": "idle" },
+                "graded": ["c1", "c2"],
+                "fanouts": {} }),
         );
         assert_eq!(status_counts(&v), (0, 0));
     }

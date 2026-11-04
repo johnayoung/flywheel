@@ -1047,6 +1047,7 @@ fn a_version_4_file_with_promoted_fanouts_migrates_to_queues_losing_neither() {
         winner: None,
         origin: Some(origin),
         promoted: vec![promotion],
+        seen_graded_at: None,
     };
     store.insert_fanout(fanout.clone()).unwrap();
     drop(store);

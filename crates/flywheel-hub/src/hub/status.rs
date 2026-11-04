@@ -7,9 +7,8 @@ use crate::detect::Detection;
 use crate::detect::tracker::{Look, ScreenTracker};
 use crate::pty::{PtySession, SessionEvent};
 use crate::report::Report;
-use crate::status::{AgentStatus, Audience, Signal, Snapshot, StatusSource, StatusView};
+use crate::status::{AgentStatus, Audience, Graded, Signal, Snapshot, StatusSource, StatusView};
 use crate::vt::TextSource;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
@@ -346,21 +345,27 @@ impl Hub {
         self.board().status(id, Audience::Anyone)
     }
 
-    /// Sessions whose finished turns the hub grades itself: the candidates
-    /// of fan-outs not cleaned up. Their `done` rolls up as `idle`.
-    fn graded_sessions(&self) -> HashSet<String> {
-        self.store()
-            .fanouts()
-            .iter()
-            .flat_map(|f| &f.candidates)
-            .filter(|c| c.cleaned.is_none())
-            .map(|c| c.session_id.clone())
-            .collect()
+    /// What the hub grades itself (see [`Graded`]).
+    fn graded(&self) -> Graded {
+        let store = self.store();
+        let mut graded = Graded::default();
+        for fanout in store.fanouts() {
+            graded
+                .sessions
+                .extend(fanout.graded_sessions().map(str::to_owned));
+            if fanout.needs_you() {
+                *graded
+                    .fanouts
+                    .entry(fanout.workspace_id.clone())
+                    .or_default() += 1;
+            }
+        }
+        graded
     }
 
     /// Every agent session's status and workspace rollup, for one client.
     pub fn status_snapshot(&self, client: &str) -> Snapshot {
-        let graded = self.graded_sessions();
+        let graded = self.graded();
         self.board().snapshot(Audience::Client(client), &graded)
     }
 
@@ -371,7 +376,7 @@ impl Hub {
         client: &str,
         session_id: &str,
     ) -> Option<(StatusView, String, Option<AgentStatus>)> {
-        let graded = self.graded_sessions();
+        let graded = self.graded();
         let board = self.board();
         let view = board.status(session_id, Audience::Client(client))?;
         let workspace = board.workspace_of(session_id)?.to_owned();

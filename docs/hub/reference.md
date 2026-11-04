@@ -157,7 +157,7 @@ Taken by `serve`, `start`, `install-service`. All but `--notify-url` are also `h
 
 ## hub.toml
 
-`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors; `serve` refuses an invalid file (exit 2). Edits are re-read within 1 s: live keys apply, the rest show as pending restart; an invalid edit keeps the last good settings and is reported (log, toast, `config check`).
+`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors; `serve` refuses an invalid file (exit 2). Edits are re-read within 1 s: live keys apply, the rest wait for a restart; an invalid edit keeps the last good settings (reported in log, toast, `config check`).
 
 ```toml
 [server]                          # restart to apply
@@ -258,7 +258,7 @@ detail = false                 # leave out what a blocked agent asks (default tr
 
 ## plugin.toml
 
-**A plugin runs as you, unsandboxed; the hub reviews nothing.** Install = copy a directory to `<state-dir>/plugins/<name>/` (the UI and API never download one); **disabled** until `fw hub plugin enable NAME`; re-scanned every 2 s. Sample: `crates/flywheel-hub/plugins/hello`. Protocol: [hub-api](api.md#plugins).
+**A plugin runs as you, unsandboxed; the hub reviews nothing.** Install = copy a directory to `<state-dir>/plugins/<name>/` (nothing downloads one); **disabled** until `fw hub plugin enable NAME`; re-scanned every 2 s. Sample: `crates/flywheel-hub/plugins/hello`. Protocol: [hub-api](api.md#plugins).
 
 ```toml
 description = "Ping me when an agent is stuck"
@@ -289,7 +289,7 @@ command = ["./summarize.py"]       # optional: else the top-level one
 | Plugins | per plugin: enable, events, actions, last run / error, logs |
 | Server | read-only: effective hub.toml, sources, errors, pending restart |
 
-**Key bindings**: up to 4 per action, `mod+...+key` (`mod` = Ctrl, Cmd on macOS). Refused (422): keys the browser or OS keeps (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: keys shells lose (`alt+b/f`, `ctrl+<letter>`) or desktops take (`ctrl+alt+t`).
+**Key bindings**: up to 4 per action, `mod+...+key` (`mod` = Ctrl, Cmd on macOS). Refused (422): keys the browser or OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: keys shells lose (`alt+b/f`, `ctrl+<letter>`) or desktops take (`ctrl+alt+t`).
 
 ## Keyboard shortcuts
 

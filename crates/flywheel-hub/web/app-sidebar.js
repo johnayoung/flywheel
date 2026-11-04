@@ -312,10 +312,10 @@ function recBadge(session) {
 const machineBadge = (name) => el("span", { className: "machine-badge", textContent: name, title: `on machine ${name}` });
 
 // The workspace's most urgent agent status (idle and unknown stay quiet),
-// counted the way Needs you lists it: a fan-out candidate's finished turn
-// is the hub's to grade, not done (the hub rolls it up idle too), and a
-// fan-out here whose graders finished since this browser looked is one
-// done.
+// counted by the hub's one rule for done (docs/hub/internals.md): an open
+// fan-out's candidates' finished turns are the hub's to grade, and a
+// fan-out whose latest grading nobody has looked at is one done. The hub's
+// rollup, Needs you, and `fw hub attach` count the same way.
 function rollupChip(workspace) {
   let rolled = state.rollup[workspace.id];
   const graded = fanout.candidateSessions();

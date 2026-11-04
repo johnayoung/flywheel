@@ -119,6 +119,8 @@ fn snapshot_message(hub: &Hub, client: &str) -> Message {
         "type": "snapshot",
         "sessions": snapshot.sessions,
         "workspaces": snapshot.workspaces,
+        "graded": snapshot.graded,
+        "fanouts": snapshot.fanouts,
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
@@ -290,6 +292,11 @@ async fn events_pump(
                     sessions_sent = Some(Instant::now());
                     sessions_due = false;
                 }
+                // A fan-out change can change what the hub grades (a pick,
+                // a cleanup) and what needs you (a grading, a look): every
+                // rollup afresh after it.
+                let fanout = !batch.lagged
+                    && batch.events.iter().any(|e| matches!(e, HubEvent::Fanout { .. }));
                 for event in batch.events {
                     if !sent {
                         break;
@@ -297,6 +304,9 @@ async fn events_pump(
                     if let Some(message) = event_message(&hub, &client, event) {
                         sent = socket.send(message).await.is_ok();
                     }
+                }
+                if sent && fanout {
+                    sent = socket.send(snapshot_message(&hub, &client)).await.is_ok();
                 }
                 if sent && batch.sessions && !batch.lagged {
                     if sessions_sent.is_none_or(|at| at.elapsed() >= SESSIONS_PUSH_INTERVAL) {

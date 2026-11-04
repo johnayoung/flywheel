@@ -11,6 +11,8 @@
 //! * `POST .../rebase {"candidate","dry_run"|"confirm"}` -- rebase onto
 //!   the base (it is graded again);
 //! * `POST .../cleanup {"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}`;
+//! * `POST .../seen {"graded_at"}` -- that grading was looked at: the
+//!   fan-out leaves Needs you and its workspace's done count;
 //! * `POST .../promote` -- write it as a flywheel task (`promote_api`);
 //! * `{"type":"fanout","id"}` on the events socket when one changes.
 
@@ -82,6 +84,24 @@ pub(super) async fn remove(
         return Ok(off());
     };
     blocking(move || engine.remove(&id)).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Deserialize)]
+pub(super) struct SeenBody {
+    graded_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The board's grading of `graded_at` was looked at.
+pub(super) async fn seen(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(body): ApiJson<SeenBody>,
+) -> ApiResult<Response> {
+    let Some(engine) = engine(&app) else {
+        return Ok(off());
+    };
+    blocking(move || engine.seen(&id, body.graded_at)).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 

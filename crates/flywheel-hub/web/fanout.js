@@ -20,7 +20,6 @@
 window.FwHubFanout = function (ctx) {
   const { $, el, icon, api, state, age, sessionById, workspaceById, folderLabel, openSession, toast } = ctx;
 
-  const SEEN_KEY = "fw-hub.fanout-seen";
   const MIN = 2;
   const MAX = 6;
   const MODELS = {
@@ -59,18 +58,12 @@ window.FwHubFanout = function (ctx) {
     seq: 0,
   };
 
-  let seen = {};
+  // Seen gradings live on the hub now (POST .../seen), shared by every
+  // client: drop this browser's old marks.
   try {
-    seen = JSON.parse(window.localStorage.getItem(SEEN_KEY) || "{}") || {};
+    window.localStorage.removeItem("fw-hub.fanout-seen");
   } catch (_) {
-    seen = {};
-  }
-  function saveSeen() {
-    try {
-      window.localStorage.setItem(SEEN_KEY, JSON.stringify(seen));
-    } catch (_) {
-      // Private mode: marks last this page only.
-    }
+    // Private mode: nothing kept.
   }
 
   const byId = (id) => ui.list.find((f) => f.id === id) || null;
@@ -159,8 +152,6 @@ window.FwHubFanout = function (ctx) {
     ui.enabled = listed.enabled !== false;
     ui.runner = listed.runner || null;
     ui.list = listed.fanouts || [];
-    for (const id of Object.keys(seen)) if (!byId(id)) delete seen[id];
-    saveSeen();
     if (board.open) {
       const shown = byId(ui.open);
       if (shown && shown.graded_at) markSeen(shown);
@@ -196,11 +187,14 @@ window.FwHubFanout = function (ctx) {
 
   // --- Needs you ------------------------------------------------------
 
+  // The board shows this grading: the hub drops the fan-out from Needs
+  // you and its workspace's done count, for every client.
   function markSeen(f) {
-    if (f.graded_at && seen[f.id] !== f.graded_at) {
-      seen[f.id] = f.graded_at;
-      saveSeen();
-    }
+    if (!f.needs_you || !f.graded_at) return;
+    f.needs_you = false;
+    api("POST", `/api/fanouts/${f.id}/seen`, { graded_at: f.graded_at }).catch(() => {
+      // Still listed by the hub: the next reload shows it again.
+    });
   }
 
   function headline(f) {
@@ -213,17 +207,21 @@ window.FwHubFanout = function (ctx) {
     return [lead, `${c.passing}/${c.candidates} pass`, ...rest].filter(Boolean).join(" · ");
   }
 
-  // Fan-outs whose graders finished since this browser last looked (and
-  // that have no winner yet), newest first.
+  // Fan-outs with no winner yet whose latest grading nobody has looked
+  // at (the hub's `needs_you`), newest first. Each is one done.
   function attention() {
-    return ui.list.filter((f) => !f.winner && f.graded_at && seen[f.id] !== f.graded_at);
+    return ui.list.filter((f) => f.needs_you);
   }
 
-  // Sessions that are some fan-out's candidates (the hub grades their
-  // finished turns: Needs you lists the fan-out instead).
+  // Sessions the hub grades: candidates of a fan-out with no winner yet,
+  // worktree kept. Their finished turns are not done (Needs you lists the
+  // fan-out instead); once a winner is picked they are ordinary sessions.
   function candidateSessions() {
     const ids = new Set();
-    for (const f of ui.list) for (const c of f.candidates) if (c.phase !== "removed") ids.add(c.session_id);
+    for (const f of ui.list) {
+      if (f.winner) continue;
+      for (const c of f.candidates) if (c.phase !== "removed") ids.add(c.session_id);
+    }
     return ids;
   }
 
@@ -719,8 +717,6 @@ window.FwHubFanout = function (ctx) {
       toast(error.message, { tone: "bad" });
       return;
     }
-    delete seen[f.id];
-    saveSeen();
     ui.open = null;
     await reload();
     const next = ui.list[0];

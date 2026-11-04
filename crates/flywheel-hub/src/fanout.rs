@@ -429,6 +429,10 @@ pub struct Fanout {
     /// task"), oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub promoted: Vec<Promotion>,
+    /// The grading someone last looked at on the board (see
+    /// [`Fanout::needs_you`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_graded_at: Option<DateTime<Utc>>,
 }
 
 impl Fanout {
@@ -451,6 +455,47 @@ impl Fanout {
             .iter()
             .filter_map(|c| c.grade.as_ref().map(|g| g.finished_at))
             .max()
+    }
+
+    /// The hub grades its candidates' finished turns: no winner picked
+    /// yet. Once one is, they are ordinary sessions again.
+    pub fn open(&self) -> bool {
+        self.winner.is_none()
+    }
+
+    /// Sessions whose finished turns the hub grades (not a person's to
+    /// read): the candidates of an open fan-out whose worktrees remain.
+    pub fn graded_sessions(&self) -> impl Iterator<Item = &str> {
+        self.candidates
+            .iter()
+            .filter(|c| self.open() && c.cleaned.is_none())
+            .map(|c| c.session_id.as_str())
+    }
+
+    /// The fan-out's own "done": an open fan-out whose latest grading
+    /// finished after the one someone last looked at on its board. It
+    /// counts as one done in its workspace (every client alike), in place
+    /// of its candidates' finished turns.
+    pub fn needs_you(&self) -> bool {
+        self.open()
+            && self
+                .graded_at()
+                .is_some_and(|at| self.seen_graded_at.is_none_or(|seen| seen < at))
+    }
+
+    /// Someone looked at the board's grading of `graded_at`; whether that
+    /// changed anything. A mark never runs past the latest grading (one
+    /// that finishes later still needs you) and never goes back.
+    pub fn mark_seen(&mut self, graded_at: DateTime<Utc>) -> bool {
+        let Some(latest) = self.graded_at() else {
+            return false;
+        };
+        let mark = graded_at.min(latest);
+        if self.seen_graded_at.is_some_and(|seen| seen >= mark) {
+            return false;
+        }
+        self.seen_graded_at = Some(mark);
+        true
     }
 }
 

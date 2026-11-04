@@ -194,6 +194,7 @@ impl Fanouts {
             winner: None,
             origin: request.origin.clone(),
             promoted: Vec::new(),
+            seen_graded_at: None,
         };
         if let Err(e) = hub.store().insert_fanout(fanout.clone()) {
             undo(&started);

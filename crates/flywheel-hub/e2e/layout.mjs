@@ -47,18 +47,24 @@ function freePort() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// The drawers over the terminal (Commands, Review, Queue; Flywheel needs a
-// flywheel folder): on desktop one width and one edge; on a phone a
+// The drawers over the terminal (Commands, Review, Queue, Flywheel: this
+// hub runs --no-flywheel, so its drawer opens on the attached session's
+// folder and says it cannot read it, which is enough for its box): on
+// desktop one width and one edge; on a phone a
 // full-screen sheet no terminal shows around; and a toast never covers a
 // drawer's controls (the drawer lifts them above the stack, its frame
 // stays put, and drops the room once the toasts go).
 async function drawerChecks(page, label, phone) {
   const boxes = {};
-  for (const which of ["commands", "review", "queue"]) {
+  for (const which of ["commands", "review", "queue", "flywheel"]) {
     await page.evaluate((w) => {
       if (w === "commands") commands.toggle(true);
       if (w === "review") review.open(state.attached);
       if (w === "queue") promptQueue.open(state.attached);
+      if (w === "flywheel") {
+        const s = sessionById(state.attached);
+        flywheel.open(s.cwd || "/", s.workspace_id);
+      }
     }, which);
     await page.waitForSelector(`#${which}:not([hidden])`, { timeout: 5000 }).catch(() => {});
     await page.waitForTimeout(600);
@@ -400,9 +406,10 @@ try {
   await pp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
   await pp.waitForFunction(() => !document.querySelector("#crumb-why").hidden && !document.querySelector("#meter-usage").hidden, null, { timeout: 15000 })
     .catch(() => {});
-  // Needs you and the workspace rollup agree on a fan-out candidate's
-  // finished turn: the hub grades it, so neither counts it done; the
-  // fan-out's own row (its graders finished) is the one done item.
+  // Needs you, the chip, and the hub's own rollup agree on a fan-out
+  // candidate's finished turn: the hub grades it, so none counts it done;
+  // the fan-out's unseen grading is the one done item, until its board is
+  // opened (then it is gone from all three).
   const candidates = new Set(fo.candidates.map((c) => c.session_id));
   for (let i = 0; i < 100; i++) {
     const listed = await api("GET", "/api/fanouts");
@@ -430,8 +437,24 @@ try {
   }, { ws: "fanned", ids: [...candidates] });
   check(
     agree.done.every((s) => s === "done") && agree.fanoutRow && agree.candidateRows === 0 && agree.listed === 1 &&
-      agree.chip === "done" && agree.server !== "done",
-    `desktop: Needs you and the rollup count a fan-out's finished candidates as its one row (${JSON.stringify(agree)})`,
+      agree.chip === "done" && agree.server === "done",
+    `desktop: Needs you, the chip and the hub's rollup count a fan-out's finished candidates as its one done (${JSON.stringify(agree)})`,
+  );
+  await pp.locator("#attention .attn-row.fo").first().click();
+  await pp.waitForSelector("#dlg-fanout[open]", { timeout: 10000 }).catch(() => {});
+  await pp.keyboard.press("Escape");
+  await pp.waitForSelector("#dlg-fanout[open]", { state: "detached", timeout: 5000 }).catch(() => {});
+  const fannedId = await pp.evaluate((ws) => state.workspaces.find((w) => w.name === ws).id, "fanned");
+  await pp.waitForFunction((id) => state.rollup[id] !== "done", fannedId, { timeout: 10000 }).catch(() => {});
+  const looked = await pp.evaluate((id) => ({
+    rows: [...document.querySelectorAll("#attention .attn-row.fo")].length,
+    chip: document.querySelector(`section.workspace[data-id="${id}"] .ws-status`)?.textContent || null,
+    server: state.rollup[id] || null,
+  }), fannedId);
+  const listedAfter = (await api("GET", "/api/fanouts")).fanouts.find((x) => x.id === fo.id);
+  check(
+    looked.rows === 0 && looked.chip === null && looked.server !== "done" && listedAfter && listedAfter.needs_you === false,
+    `desktop: opening the fan-out's board clears it from Needs you, the chip and the hub's rollup (${JSON.stringify({ ...looked, needs_you: listedAfter?.needs_you })})`,
   );
   const rectOf = (sel) => pp.evaluate((sel) => {
     const n = document.querySelector(sel);

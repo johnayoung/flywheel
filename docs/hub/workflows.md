@@ -15,7 +15,7 @@ fw hub new demo --name build -- sh -c "$(cat next.sh)" && fw hub wait build --un
 fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"   # 0: it waits on a prompt
 ```
 
-- `wait` listens on the events socket: 0 met, 124 timeout, 1 error (also when the session ends first). `--changed` skips the state at start but counts any status begun after the process started, so `wait --changed &` then a prompt cannot miss a fast turn. `--until idle` accepts `done`; `--until exit` prints `exited N` / `killed (SIG)`; `--timeout 0` checks once.
+- `wait` listens on the events socket: 0 met, 124 timeout, 1 error (also when the session ends first). `--changed` counts only statuses begun after it started (so `wait --changed &` then a prompt never misses a fast turn). `--until idle` accepts `done`; `--until exit` prints `exited N` / `killed (SIG)`; `--timeout 0` checks once.
 
 ## Agent launcher
 
@@ -35,11 +35,11 @@ Agents wrap commands for the screen, so copying them off the terminal breaks the
 - Shell blocks: `bash sh zsh shell console fish ksh ...`, or untagged ones that start like a command; `console` blocks keep only the commands (`$ ` stripped).
 - Send pastes (bracketed when enabled), Send + Run adds Enter; a multi-line paste without bracketed paste is refused (409): use Copy.
 - `fw hub commands S --copy`: OSC 52, over SSH too (tmux: `set -g set-clipboard on`; some terminals drop copies over ~75 KB).
-- **Commands drawer** (`Alt C`): the agent's blocks newest first with Copy, Send, Send + Run. Send targets its companion shell (else the attached shell), opening one first if needed. Keys: `j`/`k`, `Enter`/`c` copy, `1`-`9` copy that card, `s` send, `Shift S` send + run.
+- **Commands drawer** (`Alt C`): the agent's blocks newest first with Copy, Send, Send + Run. Send targets its companion shell (else the attached one), opened if needed. Keys: `j`/`k`, `Enter`/`c` copy, `1`-`9` copy that card, `s` send, `Shift S` send + run.
 
 ## Usage and cost
 
-- From transcripts (Claude `message.usage` incl. subagents, Codex `token_count`), priced by the recorded model: `usage.rs` `PRICES` (Anthropic list prices 2026-10-06, OpenAI GPT-5 2025-11). Unknown models: tokens only; server-tool fees not counted; list-price equivalents even on subscriptions.
+- From transcripts (Claude `message.usage` incl. subagents, Codex `token_count`), priced by the recorded model: `usage.rs` `PRICES` (Anthropic list prices 2026-10-06, OpenAI GPT-5 2025-11). Unknown models: tokens only; no server-tool fees; list prices even on subscriptions.
 - Header meter, sidebar rows, `fw hub ls`, `GET /api/usage`. 62 days of daily totals per session; a removed session's move to `usage-archive.json`.
 
 ## Worktrees and companion shells
@@ -74,8 +74,8 @@ Any session in a git folder: header pill `review`, `Alt G`, or `fw hub review`. 
 
 ## Handoff and peer review
 
-- **Send to agent** (`fw hub handoff FROM TO`, palette, `handoff.send`): a selection, transcript message, block, or diff to another agent (any workspace or machine) as one prompt, `From <session> on <branch>:` + one fence; 32 KiB by default, editable first.
-- **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`. One per author; asking again reuses it.
+- **Send to agent** (`fw hub handoff FROM TO`, palette, `handoff.send`): a selection, transcript message, block, or diff to another agent (any workspace or machine) as one prompt (`From <session> on <branch>:` + one fence; 32 KiB default, editable).
+- **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author, reused.
 - Findings: the reviewer's latest reply and code blocks; **Send findings to <author>** pastes them back. Pairing survives restarts; closing the author closes its reviewers. Events: `review.requested`, `handoff.sent`.
 
 ## Verified fan-out
@@ -92,8 +92,8 @@ fw hub fanout pick "$id" c1 --yes [--rebase]
 fw hub fanout cleanup "$id" [--force] --yes
 ```
 
-- **Agent claims are untrusted**: a finished turn only queues grading; the verdict is the graders' exit codes.
-- **Graders are held out of the prompt only** (agents run as you). A tracked grader is editable: `--protect` its inputs (a candidate changing one fails) or keep the oracle outside the repo ([held-out gate](../held-out-gate.md)); absolute-path scripts are pinned by hash.
+- **Agent claims are untrusted**: a finished turn only queues grading; the verdict is the graders' exit codes. Needs you lists the fan-out once per unseen grading, not its candidates ([hub-internals: Agent status](internals.md#agent-status)).
+- **Graders are held out of the prompt only** (agents run as you). A tracked grader is editable: `--protect` its inputs (changing one fails) or keep the oracle outside the repo ([held-out gate](../held-out-gate.md)); absolute-path scripts are pinned by hash.
 - Grading = flywheel-core's command-grader runner (in order, `/bin/sh -c`, pass = exit 0, `--timeout` 900 s each, first failure stops, 8 KiB tails); 2 at once hub-wide.
 - Ranking: passing (smaller diff, then lower cost), failing, stale, grading, ungraded. A pass that changes nothing cannot be picked (the graders pass on the base).
 - **Pick** needs a fresh pass on a clean tree at exactly the graded commit, then ff-merges it (plan + fingerprint); base moved: `--rebase`, which grades again.
@@ -111,10 +111,10 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 
 - **Promote**: goal (`--goal`, the seeding task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, the winner's commit -> a reference; via core's task loader, refused for an existing file, id, or an id with runs.
 - `--protect` becomes constraints only: only flywheel.toml `[submit] protected_paths` refuses a landing, and the hub never edits flywheel.toml.
-- The file is left **uncommitted** in the main checkout; then **Run <id> with worker here**: `fw worker --task <id>` runs that task alone and exits with its outcome (the dialog lists what stays queued).
-- **Fan out this task** (Flywheel panel): prompt from the task's goal and context; graders = its command graders plus its **held-out** graders, added server-side. No command grader: refused; an unreadable held-out registry fails closed.
+- The file is left **uncommitted** in the main checkout; **Run <id> with worker here** runs `fw worker --task <id>` (that task alone; the dialog lists what stays queued).
+- **Fan out this task** (Flywheel panel): prompt from the task's goal and context; graders = its command plus **held-out** graders, added server-side. No command grader: refused; an unreadable held-out registry fails closed.
 - Held-out graders never reach an agent via the hub: a prompt naming one is refused; Ask to fix only says one failed (and is not offered for a changed pinned script). Not a sandbox.
-- Promoting a task-seeded fan-out offers **Run <id> with worker here** (the task is durable already); a new task needs `--task-id`.
+- A task-seeded fan-out offers **Run <id> with worker here** at once (already durable); a new task needs `--task-id`.
 
 ## Flywheel panel
 
@@ -124,7 +124,7 @@ Workspace folders with a `flywheel.toml` or `.flywheel/` get the verified loop b
 
 - Phases and tasks (`fw status --json` states), live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (in **Needs you** until **Mark seen**, per browser).
 - Opened from the folder chip's `verified/total` badge, the `flywheel` pill (`Alt F`), or the palette.
-- **Start worker here**: a hub shell running `fw worker` (the whole queue) in a split below the focused pane; a task row's **run** starts `fw worker --task <id>` (asks before adding unmet prerequisites). A second is refused (409) unless confirmed. A finished worker shows its outcome (`verified`, `not verified`, `refused`, `worker exit N`), not `live`.
+- **Start worker here**: a hub shell running `fw worker` (the whole queue) in a split below the focused pane; a task's **run** starts `fw worker --task <id>` (asks before adding unmet prerequisites). A second needs confirming (409). A finished worker shows its outcome (`verified`, `not verified`, `refused`, `worker exit N`).
 - **Output** on a run: its `fw show` summary and redacted transcript, followed live.
 - A linked worktree reads its own store; `github*` sources are not listed. One watcher per folder (stat 2 s, re-read on change or 15 s); a missing SQLite store is never created.
 - Seam: `flywheel-hub` defines `flywheel::FlywheelProvider`, the `flywheel` crate implements it (`hub_flywheel.rs`), so the hub never depends on the loop's crates.
@@ -141,9 +141,9 @@ fw hub queue ls api
 
 - Add from Compose (**Queue**), the drawer (`Alt Q`), the palette, or `queue add`.
 - **Triggers** (`--when`): `done` (default): at rest (turn finished, or awaiting a first prompt); `idle`: at rest and the turn was viewed; `blocked-cleared`: once at the front, the agent blocked, was answered, and finished.
-- **Never** while `working`, `blocked`, or `unknown`; within 1.5 s of the rest starting; within `queue.typing_quiet` of any typing (terminal, `attach`, `send`, Compose, hub pastes; not focus reports); while a grading, handoff, or review action holds it or an editor has the item open.
+- **Never** while `working`, `blocked`, or `unknown`; within 1.5 s of the rest starting; within `queue.typing_quiet` of any typing (terminal, `attach`, `send`, Compose, hub pastes; not focus reports); while a grading, handoff, or review action holds it or the item is being edited.
 - **Unsent drafts** hold it however long: text left in the agent's input line (send or clear it: Ctrl-U, Backspace, Esc Esc); keys answering a blocked prompt do not count. No other paste lands between a delivery's text and its Enter.
 - **One at a time**: the next waits for a rest begun after the last delivery (bracketed paste, then Enter); the newest 20 delivered stay.
-- **Exactly once**: `sending` is saved before the paste, `delivered` after; a hub that died between checks the transcript on start: the text as a user message -> `delivered` (`reconciled`), else pending again. `fw hub upgrade` finishes one under way, starts none until the takeover, and carries typing times and drafts.
-- **Stalls** stop it until resumed (`queue resume`, the drawer, Needs you) or relaunched: the agent exited or came back a shell, the paste was refused, or a delivered prompt started no turn in 120 s. Removing a session drops its queue (`queue.stalled`).
+- **Exactly once**: `sending` is saved before the paste, `delivered` after; after a crash between, the transcript decides (`delivered`, `reconciled`) or it is pending again. `fw hub upgrade` finishes one under way, starts none until the takeover, and carries typing times and drafts.
+- **Stalls** stop it until resumed (`queue resume`, the drawer, Needs you) or relaunched: the agent exited or came back a shell, the paste was refused, or a delivered prompt started no turn in 120 s (`queue.stalled`). Removing a session drops its queue.
 - **Order**: drag, up/down, `queue move`; pending items can be edited or removed (not one being sent). 50 pending, 64 KiB each. Events: `queue.delivered`, `queue.stalled` ([hub-api: Plugin events](api.md#plugin-events)).

@@ -166,6 +166,8 @@ struct Viewer {
     resumed: bool,
     continued: Option<bool>,
     acks: u64,
+    /// Inputs refused: (id, retry).
+    nacks: Vec<(u64, bool)>,
     exits: usize,
     pongs: usize,
     /// Binary bytes on the wire.
@@ -187,6 +189,7 @@ impl Viewer {
             resumed: false,
             continued: None,
             acks: 0,
+            nacks: Vec::new(),
             exits: 0,
             pongs: 0,
             wire: 0,
@@ -261,6 +264,10 @@ impl Viewer {
                         let n = value["id"].as_u64().unwrap();
                         assert_eq!(n, self.acks + 1, "every input acknowledged, in order");
                         self.acks = n;
+                    }
+                    "nack" => {
+                        let n = value["id"].as_u64().unwrap();
+                        self.nacks.push((n, value["retry"].as_bool().unwrap()));
                     }
                     "exit" => self.exits += 1,
                     "pong" => self.pongs += 1,
@@ -639,6 +646,111 @@ async fn leaving_lite_as_the_session_ends_says_the_exit_once() {
         assert!(viewer.visible().iter().any(|l| l.contains("bye")));
         viewer.close().await;
     }
+    hub.shutdown().await;
+}
+
+/// The close code a socket ends with (skipping whatever comes first).
+async fn close_code(ws: &mut Ws) -> Option<u16> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left, ws.next()).await {
+            Ok(Some(Ok(Message::Close(frame)))) => return frame.map(|f| u16::from(f.code)),
+            Ok(Some(Ok(_))) => {}
+            other => panic!("socket ended without a close: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relaunch_closes_every_view_of_the_ended_process_so_it_reattaches() {
+    let hub = TestHub::start().await;
+    let id = hub.session("exec cat").await;
+    let mut pane = hub.connect(&id, "proto=2&client=p").await;
+    let mut old = hub.connect(&id, "").await;
+    let share: Value = hub
+        .http
+        .post(format!("http://{}/api/shares", hub.addr))
+        .bearer_auth(&hub.token)
+        .json(&json!({ "session_id": id }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = format!("ws://{}{}/ws", hub.addr, share["path"].as_str().unwrap());
+    let mut link = tokio_tungstenite::connect_async(url).await.unwrap().0;
+    let post = |path: String| {
+        hub.http
+            .post(format!("http://{}{path}", hub.addr))
+            .bearer_auth(&hub.token)
+            .json(&json!({}))
+            .send()
+    };
+    assert!(
+        post(format!("/api/sessions/{id}/kill"))
+            .await
+            .unwrap()
+            .status()
+            .is_success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = post(format!("/api/sessions/{id}/relaunch")).await.unwrap();
+        if response.status().is_success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never relaunched: {}",
+            response.status()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Every view of the old process is told to reconnect (pane, protocol
+    // 1 client, share link), and a reconnect sees the new stream.
+    for ws in [&mut pane, &mut old, &mut link] {
+        assert_eq!(close_code(ws).await, Some(4005));
+    }
+    let mut back = Viewer::new(hub.connect(&id, "proto=2&client=p").await, false);
+    back.send(json!({ "type": "input", "data": "again\r", "id": 1 }))
+        .await;
+    back.until("again").await;
+    assert_eq!(back.exits, 0);
+    back.close().await;
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn input_the_terminal_dropped_is_refused_by_id_never_acknowledged() {
+    let hub = TestHub::start().await;
+    // Never reads its input: the queue fills and later input is dropped.
+    let id = hub.session("exec sleep 100000").await;
+    let mut viewer = Viewer::new(hub.connect(&id, "proto=2&client=flood").await, false);
+    viewer.settle(Duration::from_millis(300)).await;
+    let big = "x".repeat(900 * 1024);
+    for n in 1..=8u64 {
+        viewer
+            .send(json!({ "type": "input", "data": big, "id": n }))
+            .await;
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while viewer.acks + (viewer.nacks.len() as u64) < 8 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !left.is_zero(),
+            "acks {} nacks {:?}",
+            viewer.acks,
+            viewer.nacks
+        );
+        assert_eq!(viewer.step(left).await, Some(true), "socket ended");
+    }
+    assert!(!viewer.nacks.is_empty(), "the queue never filled");
+    // Acknowledged means taken: a prefix, then refusals (no retry).
+    let refused: Vec<_> = (viewer.acks + 1..=8).map(|n| (n, false)).collect();
+    assert_eq!(viewer.nacks, refused);
+    viewer.close().await;
     hub.shutdown().await;
 }
 

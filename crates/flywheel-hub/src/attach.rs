@@ -161,6 +161,8 @@ pub enum SessionMsg {
     Rotated,
     /// The hub process is being replaced (`fw hub upgrade`): reconnect.
     Restart,
+    /// The ended session was relaunched in place: attach the new process.
+    Relaunched,
 }
 
 pub(crate) fn attach(args: &AttachArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -504,6 +506,7 @@ impl Client<'_> {
                                 | SessionMsg::Closed(_)
                                 | SessionMsg::Rotated
                                 | SessionMsg::Restart
+                                | SessionMsg::Relaunched
                         ) {
                         // Under the key table: dropped (redrawn after).
                         Ok(())
@@ -655,6 +658,12 @@ impl Client<'_> {
                         }
                     }
                 }
+            }
+            SessionMsg::Relaunched => {
+                // Running again: its exit ends this client, as any other's.
+                screen.running = true;
+                screen.flash("the session was relaunched".into());
+                self.reattach(id, screen).map_err(Leave::Failed)
             }
             SessionMsg::Rotated => {
                 if self.endpoint.reload_token().is_some() {
@@ -1116,6 +1125,9 @@ fn close_reason(frame: Option<&CloseFrame>) -> SessionMsg {
     match frame {
         Some(f) if u16::from(f.code) == CLOSE_ROTATED => SessionMsg::Rotated,
         Some(f) if u16::from(f.code) == crate::server::WS_CLOSE_RESTART => SessionMsg::Restart,
+        Some(f) if u16::from(f.code) == crate::server::WS_CLOSE_RELAUNCHED => {
+            SessionMsg::Relaunched
+        }
         Some(f) if !f.reason.is_empty() => {
             SessionMsg::Closed(format!("the hub closed the session: {}", f.reason))
         }

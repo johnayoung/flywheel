@@ -152,6 +152,10 @@ pub const WS_CLOSE_PEER_REVOKED: u16 = 4003;
 /// WebSocket close code sent to a share link's viewer when the link was
 /// revoked or expired.
 pub const WS_CLOSE_SHARE_ENDED: u16 = 4004;
+/// WebSocket close code sent to a terminal viewer of a session that was
+/// relaunched in place (another process, another output stream):
+/// reconnect.
+pub const WS_CLOSE_RELAUNCHED: u16 = 4005;
 /// How long [`serve`] waits for sessions to exit on shutdown.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 

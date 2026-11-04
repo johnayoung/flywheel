@@ -420,6 +420,9 @@ pub struct LiveView {
     /// to), where the platform exposes it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// The output stream (hex; as terminal sockets' `epoch`): another
+    /// one once relaunched.
+    pub epoch: String,
 }
 
 /// What [`Hub::restore_sessions`] did with one session.

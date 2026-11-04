@@ -8,11 +8,11 @@
 
 use super::ApiQuery;
 use super::terminal_ws::{
-    attach, close_for_restart, exit_message, handoff_restarting, send_attachment,
+    Viewer, attach, close_for_relaunch, close_for_restart, handoff_restarting, relaunched,
 };
 use super::{
-    ApiJson, ApiResult, AppState, Client, LAGGED_SNAPSHOT_HISTORY, WS_CLOSE_SHARE_ENDED,
-    WS_MAX_MESSAGE, WS_PING_INTERVAL, blocking, error_response, origin_ok, upgrade_refused,
+    ApiJson, ApiResult, AppState, Client, WS_CLOSE_SHARE_ENDED, WS_MAX_MESSAGE, WS_PING_INTERVAL,
+    blocking, error_response, origin_ok, upgrade_refused,
 };
 use crate::hub::{Hub, HubError, HubEvent};
 use crate::pty::{PtySession, SessionEvent};
@@ -456,7 +456,7 @@ const READ_ONLY: &str = "read-only view: input, resize, and paste are refused";
 /// changes, and the exit -- never input, resizes, or theme reports (each
 /// answered with an error), and never counted as viewing.
 async fn read_only_pump(
-    mut socket: WebSocket,
+    socket: WebSocket,
     session: &Arc<PtySession>,
     share: &ShareInfo,
     mut changes: watch::Receiver<u64>,
@@ -464,35 +464,28 @@ async fn read_only_pump(
     gate: Option<crate::handoff::Gate>,
     hub: &Hub,
 ) {
+    let mut viewer = Viewer::new(socket, false);
     let Some(attachment) = attach(session, SNAPSHOT_HISTORY_BYTES).await else {
         return;
     };
-    let Some(mut events) = send_attachment(&mut socket, attachment).await else {
+    let Some(mut events) = viewer.snapshot(attachment, false, None).await else {
         return;
     };
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.reset();
     let expires = expiry(share);
+    let mut relaunches = None;
     loop {
         tokio::select! {
             event = events.recv() => {
                 let sent = match event {
-                    Ok(SessionEvent::Output(bytes)) => socket.send(Message::Binary(bytes)).await.is_ok(),
-                    Ok(SessionEvent::Exit(info)) => socket.send(exit_message(&info)).await.is_ok(),
+                    Ok(SessionEvent::Output(bytes)) => viewer.binary(bytes).await,
+                    Ok(SessionEvent::Exit(info)) => viewer.exit(&info).await,
                     Ok(SessionEvent::Resize { cols, rows }) => {
-                        let size = json!({ "type": "size", "cols": cols, "rows": rows });
-                        socket.send(Message::Text(size.to_string().into())).await.is_ok()
+                        viewer.text(&json!({ "type": "size", "cols": cols, "rows": rows })).await
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        drop(events);
-                        let reset = Message::Text(json!({ "type": "reset" }).to_string().into());
-                        if socket.send(reset).await.is_err() {
-                            break;
-                        }
-                        let Some(fresh) = attach(session, LAGGED_SNAPSHOT_HISTORY).await else {
-                            break;
-                        };
-                        let Some(fresh) = send_attachment(&mut socket, fresh).await else {
+                        let Some(fresh) = viewer.resnapshot(session, events).await else {
                             break;
                         };
                         events = fresh;
@@ -504,42 +497,45 @@ async fn read_only_pump(
                     break;
                 }
             }
-            message = socket.recv() => {
+            message = viewer.socket.recv() => {
                 match message {
                     Some(Ok(Message::Text(_) | Message::Binary(_))) => {
-                        let error = json!({ "type": "error", "message": READ_ONLY });
-                        if socket.send(Message::Text(error.to_string().into())).await.is_err() {
+                        if !viewer.text(&json!({ "type": "error", "message": READ_ONLY })).await {
                             break;
                         }
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) => {
-                        let _ = socket.flush().await;
+                        let _ = viewer.socket.flush().await;
                         break;
                     }
                     Some(Err(_)) | None => break,
                 }
             }
             _ = ping.tick() => {
-                if socket.send(Message::Ping(Default::default())).await.is_err() {
+                if !viewer.send(Message::Ping(Default::default())).await {
                     break;
                 }
             }
             () = revoked(&mut changes, hub, &share.id) => {
-                let _ = socket.send(Message::Close(Some(ended("share link revoked")))).await;
+                viewer.send(Message::Close(Some(ended("share link revoked")))).await;
                 break;
             }
             () = tokio::time::sleep_until(expires) => {
-                let _ = socket.send(Message::Close(Some(ended("share link expired")))).await;
+                viewer.send(Message::Close(Some(ended("share link expired")))).await;
+                break;
+            }
+            () = relaunched(&mut relaunches, hub, &share.session_id, session), if viewer.exited() => {
+                close_for_relaunch(&mut viewer).await;
                 break;
             }
             () = handoff_restarting(gate.as_ref()) => {
-                close_for_restart(&mut socket).await;
+                close_for_restart(&mut viewer.socket).await;
                 break;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    let _ = socket.send(Message::Close(None)).await;
+                    viewer.send(Message::Close(None)).await;
                     break;
                 }
             }

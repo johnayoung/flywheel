@@ -53,6 +53,7 @@ impl Hub {
                 link_viewers,
                 scrollback_lines: s.scrollback_lines(),
                 cwd: pid.and_then(process_cwd),
+                epoch: format!("{:x}", s.epoch()),
             }
         });
         let agent = record

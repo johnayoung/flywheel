@@ -32,6 +32,9 @@ window.FwHubPanes = function (ctx) {
   // Keystrokes kept while the link is down (beyond: refused, and said).
   const QUEUE_MAX = 4096;
   const QUEUE_BYTES = 256 * 1024;
+  // Input the hub refused mid-handoff goes again after this (or at the
+  // reconnect the handoff ends in).
+  const RETRY_INPUT_MS = 500;
   // Reconnect attempts back off to RETRY_FAST_MS for the first
   // RETRY_FAST_FOR of a drop (a cellular blip), then to 10 s.
   const RETRY_FAST_MS = 2000;
@@ -206,7 +209,8 @@ window.FwHubPanes = function (ctx) {
         cancelAnimationFrame(pending);
         pending = requestAnimationFrame(() => pane.refit());
       };
-      new ResizeObserver(refit).observe(host);
+      pane.resizeObserver = new ResizeObserver(refit);
+      pane.resizeObserver.observe(host);
     }
 
     pane.claims = () => ctx.claims(pane);
@@ -315,7 +319,8 @@ window.FwHubPanes = function (ctx) {
     pane.input = (data) => {
       if (!pane.sessionId || pane.exited || !data) return;
       const item = { id: pane.nextId++, data };
-      if (pane.ready && pane.socket && pane.socket.readyState === WebSocket.OPEN) {
+      // Behind what waits (a retry pending): in order, after it.
+      if (pane.ready && !pane.queue.length && pane.socket && pane.socket.readyState === WebSocket.OPEN) {
         transmit(item);
       } else if (pane.queue.length < QUEUE_MAX && queuedBytes() + data.length <= QUEUE_BYTES) {
         pane.queue.push(item);
@@ -351,6 +356,28 @@ window.FwHubPanes = function (ctx) {
       while (pane.inflight.length && pane.inflight[0].id <= id) last = pane.inflight.shift();
       if (last && ctx.net) ctx.net.noteRtt(performance.now() - last.at);
       renderPending();
+    }
+
+    // The hub refused input `id`: mid-handoff (`retry`) it and what came
+    // after go again shortly -- or, the socket closing for the handoff,
+    // once reconnected; else it was dropped (the hub says why).
+    let retryTimer = 0;
+    function refused(id, retry) {
+      if (!retry) {
+        pane.inflight = pane.inflight.filter((item) => item.id !== id);
+        renderPending();
+        return;
+      }
+      const at = pane.inflight.findIndex((item) => item.id >= id);
+      if (at < 0) return;
+      const again = pane.inflight.splice(at).map(({ id, data }) => ({ id, data }));
+      pane.queue = [...again, ...pane.queue];
+      renderPending();
+      const socket = pane.socket;
+      clearTimeout(retryTimer);
+      retryTimer = setTimeout(() => {
+        if (pane.socket === socket && pane.ready && pane.queue.length) flushQueue();
+      }, RETRY_INPUT_MS);
     }
 
     // Send what waited, in order (the link is back on the same output).
@@ -724,6 +751,8 @@ window.FwHubPanes = function (ctx) {
           // Liveness only (heardAt).
         } else if (message.type === "ack") {
           acked(message.id);
+        } else if (message.type === "nack") {
+          refused(message.id, !!message.retry);
         } else if (message.type === "size") {
           // Another viewer (or this pane) resized the PTY: what follows is
           // drawn at that size. Panes that do not claim it follow; a
@@ -775,7 +804,16 @@ window.FwHubPanes = function (ctx) {
           window.location.replace("/?signed_out=" + why + window.location.hash);
           return;
         }
-        if (pane.exited || pane.sessionId !== id || pane.disposed) return;
+        if (pane.sessionId !== id || pane.disposed) return;
+        if (event.code === 4005) {
+          // Relaunched in place (here, elsewhere, or by the CLI): a new
+          // process and stream; attach it.
+          ctx.refresh().catch(() => {}).finally(() => {
+            if (pane.sessionId === id && !pane.socket && !pane.disposed) pane.show(id);
+          });
+          return;
+        }
+        if (pane.exited) return;
         if (event.code === 1012) {
           // A live handoff (`fw hub upgrade`): the session carries on in
           // the next hub process; reconnect at once, quietly.
@@ -901,6 +939,9 @@ window.FwHubPanes = function (ctx) {
 
     pane.dispose = () => {
       pane.disposed = true;
+      if (pane.resizeObserver) pane.resizeObserver.disconnect();
+      pane.resizeObserver = null;
+      clearTimeout(retryTimer);
       closeSocket();
       forgetLink();
       if (pane.term) pane.term.dispose();

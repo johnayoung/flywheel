@@ -676,6 +676,12 @@ function settleRemoved(seq, ws, ss) {
   for (const pane of shown) {
     const session = sessionById(pane.sessionId);
     if (session && !session.live && !pane.socket && !pane.exited) pane.show(session.id, true);
+    // Ended here, with no socket left to hear of it, and relaunched
+    // since (another stream): attach the new process.
+    else if (session && session.live && session.live.epoch && pane.exited && !pane.socket &&
+      session.live.epoch !== pane.epoch) {
+      pane.show(session.id);
+    }
   }
   if (!gone.length) return false;
   state.snapshot = JSON.stringify([ws, ss, machines.version()]);

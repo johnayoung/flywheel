@@ -966,6 +966,7 @@ version = "0.6.1"
 dependencies = [
  "alacritty_terminal",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "crossterm",

@@ -8,8 +8,8 @@
 //! no code or signal (unknown).
 
 use super::{
-    BROADCAST_DEPTH, DRAIN_AFTER_EXIT, Emulator, ExitInfo, InputQueue, PtySession, Recent, Shared,
-    new_epoch, pty_size,
+    BROADCAST_DEPTH, DRAIN_AFTER_EXIT, Emulator, ExitInfo, InputQueue, InputsSeen, PtySession,
+    Recent, RecentExport, Shared, new_epoch, pty_size,
 };
 use portable_pty::{MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,14 @@ pub(crate) struct PtyMeta {
     /// (absent from hubs before resuming existed: a fresh one).
     #[serde(default)]
     pub epoch: Option<u64>,
+    /// Each viewer key's last input id, least recently used first, so
+    /// input sent again after the handoff is not typed twice (absent from
+    /// older hubs: none).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<(String, u64)>,
+    /// The recent output kept for resuming (absent from older hubs: none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent: Option<RecentExport>,
     /// Set when the leader had already exited.
     pub exit: Option<ExitInfo>,
 }
@@ -182,6 +190,13 @@ impl PtySession {
             pause.sealed = true;
             pause.held.clone()
         };
+        // After the seal (no input is taken from here) and before the
+        // other locks (the order [`PtySession::write_input`] takes them).
+        let inputs = self
+            .inputs_seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .export();
         let mut shared = self.lock();
         PtyExport {
             meta: PtyMeta {
@@ -190,6 +205,8 @@ impl PtySession {
                 rows: shared.size.rows,
                 output_bytes: shared.output_bytes,
                 epoch: Some(shared.epoch),
+                inputs,
+                recent: Some(shared.recent.export()),
                 exit: shared.exit.clone(),
             },
             snapshot: shared.screen.snapshot(usize::MAX),
@@ -284,7 +301,7 @@ impl PtySession {
                     output_bytes: export.meta.output_bytes,
                     size,
                     epoch: export.meta.epoch.unwrap_or_else(new_epoch),
-                    recent: Recent::new(export.meta.output_bytes),
+                    recent: Recent::restore(export.meta.recent.clone(), export.meta.output_bytes),
                 }),
                 exited: Condvar::new(),
                 events,
@@ -293,7 +310,7 @@ impl PtySession {
                 master: Mutex::new(None),
                 pid: export.meta.pid,
                 pidfd: Mutex::new(None),
-                inputs_seen: Mutex::default(),
+                inputs_seen: Mutex::new(InputsSeen::restore(export.meta.inputs.clone())),
             }));
         };
         let fd = master.as_raw_fd();
@@ -308,7 +325,7 @@ impl PtySession {
                 output_bytes: export.meta.output_bytes,
                 size,
                 epoch: export.meta.epoch.unwrap_or_else(new_epoch),
-                recent: Recent::new(export.meta.output_bytes),
+                recent: Recent::restore(export.meta.recent.clone(), export.meta.output_bytes),
             }),
             exited: Condvar::new(),
             events,
@@ -317,7 +334,7 @@ impl PtySession {
             master: Mutex::new(Some(Master::Adopted(master))),
             pid: export.meta.pid,
             pidfd: Mutex::new(pidfd),
-            inputs_seen: Mutex::default(),
+            inputs_seen: Mutex::new(InputsSeen::restore(export.meta.inputs.clone())),
         });
         let drained_rx = session.start_io(fd, Box::new(reader), Box::new(writer), input_rx)?;
         if exited.is_some() {
@@ -513,9 +530,15 @@ mod tests {
     #[test]
     fn an_adopted_session_shows_the_same_screen_and_takes_input() {
         let original = shell();
+        assert!(screen_has(&original, "$"));
+        let early = original.attach().seq;
+        // Numbered input (a protocol 2 viewer's), taken before the handoff.
         assert_eq!(
-            original.write(b"for i in $(seq 1 200); do echo row-$i; done\r".to_vec()),
-            WriteOutcome::Queued
+            original.write_input(
+                Some(("pane", 1)),
+                Some(b"for i in $(seq 1 200); do echo row-$i; done\r".to_vec())
+            ),
+            Some(WriteOutcome::Queued)
         );
         assert!(screen_has(&original, "row-200"));
         assert!(original.pause(Duration::from_secs(5)));
@@ -524,6 +547,11 @@ mod tests {
             WriteOutcome::Queued
         );
         let export = original.handoff_export();
+        // Refused once exported: not taken, so it may come again.
+        assert_eq!(
+            original.write_input(Some(("pane", 2)), Some(b"echo again-".to_vec())),
+            Some(WriteOutcome::HandingOff)
+        );
         let master = dup(original.master_fd().unwrap());
         let pidfd = original.pidfd().map(dup);
         let (exit_tx, exit_rx) = std_mpsc::channel();
@@ -551,8 +579,32 @@ mod tests {
             adopted.reattach(before.seq, before.epoch, usize::MAX, &mut view),
             crate::pty::Reattach::Delta { .. }
         ));
+        // From before the rows: what it missed, not a snapshot.
+        let crate::pty::Reattach::Delta { items, .. } =
+            adopted.reattach(early, before.epoch, usize::MAX, &mut view)
+        else {
+            panic!("the resume ring did not survive the handoff");
+        };
+        let missed: Vec<u8> = items
+            .iter()
+            .filter_map(|item| match item {
+                crate::pty::RecentItem::Output(bytes) => Some(bytes.to_vec()),
+                crate::pty::RecentItem::Resize { .. } => None,
+            })
+            .flatten()
+            .collect();
+        assert!(String::from_utf8_lossy(&missed).contains("row-200"));
         assert!(adopted.scrollback_lines() > 150);
         adopted.resume();
+        // Sent again after the handoff: typed once.
+        assert_eq!(
+            adopted.write_input(Some(("pane", 1)), Some(b"echo twice\r".to_vec())),
+            None
+        );
+        assert_eq!(
+            adopted.write_input(Some(("pane", 2)), Some(Vec::new())),
+            Some(WriteOutcome::Queued)
+        );
         assert_eq!(adopted.write(b"42\r".to_vec()), WriteOutcome::Queued);
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = String::new();

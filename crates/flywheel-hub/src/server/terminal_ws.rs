@@ -3,8 +3,9 @@
 
 use super::deflate::Deflater;
 use super::{
-    AppState, Client, CredentialWatch, LAGGED_SNAPSHOT_HISTORY, SNAPSHOT_FRAME, WS_CLOSE_RESTART,
-    WS_MAX_MESSAGE, WS_PING_INTERVAL, error_response, login_recheck, origin_ok, upgrade_refused,
+    AppState, Client, CredentialWatch, LAGGED_SNAPSHOT_HISTORY, SNAPSHOT_FRAME,
+    WS_CLOSE_RELAUNCHED, WS_CLOSE_RESTART, WS_MAX_MESSAGE, WS_PING_INTERVAL, error_response,
+    login_recheck, origin_ok, upgrade_refused,
 };
 use crate::hub::{Hub, HubEvent};
 use crate::pty::{
@@ -146,80 +147,71 @@ pub(super) async fn attach(session: &Arc<PtySession>, history_budget: usize) -> 
         .ok()
 }
 
-/// Send an attachment's snapshot (and exit, if already exited), returning
-/// its live receiver. The snapshot is released once sent.
-pub(super) async fn send_attachment(
-    socket: &mut WebSocket,
-    attachment: Attachment,
-) -> Option<broadcast::Receiver<SessionEvent>> {
-    let Attachment {
-        replay,
-        cols,
-        rows,
-        alt_screen,
-        exit,
-        events,
-        ..
-    } = attachment;
-    let header = json!({
-        "type": "snapshot",
-        "cols": cols,
-        "rows": rows,
-        "alt_screen": alt_screen,
-        "bytes": replay.len(),
-    });
-    socket
-        .send(Message::Text(header.to_string().into()))
-        .await
-        .ok()?;
-    let replay = Bytes::from(replay);
-    let mut start = 0;
-    while start < replay.len() {
-        let end = replay.len().min(start + SNAPSHOT_FRAME);
-        socket
-            .send(Message::Binary(replay.slice(start..end)))
-            .await
-            .ok()?;
-        start = end;
-    }
-    drop(replay);
-    if let Some(info) = &exit {
-        socket.send(exit_message(info)).await.ok()?;
-    }
-    Some(events)
-}
-
 /// A terminal focus-in or focus-out report, alone.
 fn is_focus_report(bytes: &[u8]) -> bool {
     bytes == b"\x1b[I" || bytes == b"\x1b[O"
 }
 
-/// Queue client input; tell the client when it was dropped because the
-/// terminal is not reading. Returns false when the socket is gone.
-async fn forward_input(socket: &mut WebSocket, session: &PtySession, bytes: Vec<u8>) -> bool {
+/// Type client input. A protocol 2 viewer numbers its input (`n`): it is
+/// acknowledged once the session took it (or, the viewer naming itself
+/// with `key`, had it already: sent again after a drop, not typed twice);
+/// dropped, it is refused by id (`nack`; `retry` mid-handoff: the viewer
+/// sends it again and the next hub takes it). Returns false when the
+/// socket is gone.
+async fn forward_input(
+    viewer: &mut Viewer,
+    session: &PtySession,
+    hub: &Hub,
+    id: &str,
+    (key, n): (Option<&str>, Option<u64>),
+    bytes: Vec<u8>,
+) -> bool {
     // A browser's focus report (sent once a program asked for them) that
     // reaches a terminal still in cooked mode -- an agent TUI enables
     // focus reports before it takes the terminal raw -- would only be
     // echoed onto the screen as `^[[I`.
-    if is_focus_report(&bytes) && session.echoes_input() {
-        return true;
-    }
-    match session.write(bytes) {
-        WriteOutcome::Queued | WriteOutcome::Closed => true,
-        outcome @ (WriteOutcome::Backlogged | WriteOutcome::HandingOff) => {
+    let typed = !(is_focus_report(&bytes) && session.echoes_input());
+    let noted = typed.then(|| bytes.clone());
+    let outcome = session.write_input(key.zip(n), typed.then_some(bytes));
+    let ack = |id: u64, ok: bool| match (ok, outcome) {
+        (true, _) => json!({ "type": "ack", "id": id }),
+        (false, o) => {
+            json!({ "type": "nack", "id": id, "retry": o == Some(WriteOutcome::HandingOff) })
+        }
+    };
+    match outcome {
+        // Here already: its ack was lost.
+        None => match n {
+            Some(n) => viewer.text(&ack(n, true)).await,
+            None => true,
+        },
+        Some(WriteOutcome::Queued | WriteOutcome::Closed) => {
+            if let Some(bytes) = &noted {
+                hub.note_typing(id, bytes);
+            }
+            match n {
+                Some(n) => viewer.text(&ack(n, true)).await,
+                None => true,
+            }
+        }
+        Some(outcome) => {
+            if let Some(n) = n
+                && !viewer.text(&ack(n, false)).await
+            {
+                return false;
+            }
             let message = if outcome == WriteOutcome::HandingOff {
+                if n.is_some() {
+                    // Sent again once the next hub has the session.
+                    return true;
+                }
                 "input dropped: the hub is handing over to a new process; type it again once reconnected"
             } else {
                 "input dropped: the terminal is not reading its input"
             };
-            let error = json!({
-                "type": "error",
-                "message": message,
-            });
-            socket
-                .send(Message::Text(error.to_string().into()))
+            viewer
+                .text(&json!({ "type": "error", "message": message }))
                 .await
-                .is_ok()
         }
     }
 }
@@ -254,7 +246,11 @@ struct Options {
 
 impl Options {
     fn from_query(query: &TermQuery) -> Result<Self, &'static str> {
-        let v2 = query.proto == Some(2);
+        let v2 = match query.proto {
+            None | Some(1) => false,
+            Some(2) => true,
+            Some(_) => return Err("unsupported proto (1 or 2)"),
+        };
         let epoch = match &query.epoch {
             Some(hex) => Some(u64::from_str_radix(hex, 16).map_err(|_| "bad epoch")?),
             None => None,
@@ -316,9 +312,14 @@ impl Pace {
     }
 }
 
+/// How long one message may take to reach a viewer's socket: a reader
+/// that stopped reading must not hold the socket (and what it would
+/// close it: a revoked credential, shutdown, a handoff) forever.
+const SEND_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One viewer's socket, sending binary messages deflated when it asked.
-struct Viewer {
-    socket: WebSocket,
+pub(super) struct Viewer {
+    pub(super) socket: WebSocket,
     deflate: Option<Deflater>,
     /// The exit was sent: it is heard once, whichever path (a snapshot, a
     /// resume, the live stream, a catch-up) brought it.
@@ -326,29 +327,48 @@ struct Viewer {
 }
 
 impl Viewer {
+    pub(super) fn new(socket: WebSocket, deflate: bool) -> Self {
+        Self {
+            socket,
+            deflate: deflate.then(Deflater::new),
+            exit_said: false,
+        }
+    }
+
+    /// Send one message within [`SEND_TIMEOUT`]; false when the socket is
+    /// gone (or stalled).
+    pub(super) async fn send(&mut self, message: Message) -> bool {
+        matches!(
+            tokio::time::timeout(SEND_TIMEOUT, self.socket.send(message)).await,
+            Ok(Ok(()))
+        )
+    }
+
     /// Say that the process ended (once per socket); false when the
     /// socket is gone.
-    async fn exit(&mut self, info: &ExitInfo) -> bool {
+    pub(super) async fn exit(&mut self, info: &ExitInfo) -> bool {
         if self.exit_said {
             return true;
         }
         self.exit_said = true;
-        self.socket.send(exit_message(info)).await.is_ok()
+        self.send(exit_message(info)).await
     }
 
-    async fn text(&mut self, value: &serde_json::Value) -> bool {
-        self.socket
-            .send(Message::Text(value.to_string().into()))
-            .await
-            .is_ok()
+    /// Whether the exit was sent.
+    pub(super) fn exited(&self) -> bool {
+        self.exit_said
     }
 
-    async fn binary(&mut self, bytes: Bytes) -> bool {
+    pub(super) async fn text(&mut self, value: &serde_json::Value) -> bool {
+        self.send(Message::Text(value.to_string().into())).await
+    }
+
+    pub(super) async fn binary(&mut self, bytes: Bytes) -> bool {
         let payload = match &mut self.deflate {
             Some(deflate) => Bytes::from(deflate.message(&bytes)),
             None => bytes,
         };
-        self.socket.send(Message::Binary(payload)).await.is_ok()
+        self.send(Message::Binary(payload)).await
     }
 
     /// Output and resizes as they came; the output between two resizes
@@ -391,11 +411,13 @@ impl Viewer {
         }
     }
 
-    /// A snapshot (header with the offset and stream, then its bytes) and
-    /// the exit when there is one; returns the live receiver.
-    async fn snapshot(
+    /// A snapshot (its header -- with the offset and stream on protocol 2,
+    /// `v2` -- then its bytes) and the exit when there is one; returns the
+    /// live receiver. The snapshot is released once sent.
+    pub(super) async fn snapshot(
         &mut self,
         attachment: Attachment,
+        v2: bool,
         continued: Option<bool>,
     ) -> Option<broadcast::Receiver<SessionEvent>> {
         let Attachment {
@@ -414,9 +436,11 @@ impl Viewer {
             "rows": rows,
             "alt_screen": alt_screen,
             "bytes": replay.len(),
-            "seq": seq,
-            "epoch": format!("{epoch:x}"),
         });
+        if v2 {
+            header["seq"] = json!(seq);
+            header["epoch"] = json!(format!("{epoch:x}"));
+        }
         if let Some(continued) = continued {
             header["continued"] = json!(continued);
         }
@@ -440,6 +464,56 @@ impl Viewer {
         }
         Some(events)
     }
+
+    /// A protocol 1 viewer fell behind: `reset`, then a screen-only
+    /// snapshot (the live stream from there). Its events are dropped
+    /// first, so the backlog it will never read is not kept for it.
+    pub(super) async fn resnapshot(
+        &mut self,
+        session: &Arc<PtySession>,
+        events: broadcast::Receiver<SessionEvent>,
+    ) -> Option<broadcast::Receiver<SessionEvent>> {
+        drop(events);
+        if !self.text(&json!({ "type": "reset" })).await {
+            return None;
+        }
+        let fresh = attach(session, LAGGED_SNAPSHOT_HISTORY).await?;
+        self.snapshot(fresh, false, None).await
+    }
+}
+
+/// Resolves once session `id` was relaunched in place: the hub's live
+/// session for it is another process than `session` (never when it was
+/// removed). `events` subscribes on first use. Cancel-safe.
+pub(super) async fn relaunched(
+    events: &mut Option<broadcast::Receiver<HubEvent>>,
+    hub: &Hub,
+    id: &str,
+    session: &Arc<PtySession>,
+) {
+    let events = events.get_or_insert_with(|| hub.subscribe());
+    loop {
+        if hub
+            .live_session(id)
+            .is_some_and(|now| !Arc::ptr_eq(&now, session))
+        {
+            return;
+        }
+        if let Err(broadcast::error::RecvError::Closed) = events.recv().await {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Close a viewer of a session that was relaunched in place: it
+/// reconnects to the new process.
+pub(super) async fn close_for_relaunch(viewer: &mut Viewer) {
+    let close = CloseFrame {
+        code: WS_CLOSE_RELAUNCHED,
+        reason: "the session was relaunched; reconnect".into(),
+    };
+    viewer.send(Message::Close(Some(close))).await;
+    let _ = tokio::time::timeout(SEND_TIMEOUT, viewer.socket.flush()).await;
 }
 
 /// What ends a socket besides its viewer: the hub stopping, the
@@ -538,7 +612,7 @@ async fn open(
     })
     .await?;
     *view = back;
-    viewer.snapshot(attachment, continued).await
+    viewer.snapshot(attachment, true, continued).await
 }
 
 async fn pump(
@@ -554,11 +628,7 @@ async fn pump(
         mut credential,
         gate,
     } = ends;
-    let mut viewer = Viewer {
-        socket,
-        deflate: options.deflate.then(Deflater::new),
-        exit_said: false,
-    };
+    let mut viewer = Viewer::new(socket, options.deflate);
     let mut pace = match options.lite {
         Some(fps) => Pace::lite(fps, false),
         None => Pace::Raw,
@@ -575,7 +645,7 @@ async fn pump(
         .await
     } else {
         match attach(&session, SNAPSHOT_HISTORY_BYTES).await {
-            Some(attachment) => send_attachment(&mut viewer.socket, attachment).await,
+            Some(attachment) => viewer.snapshot(attachment, false, None).await,
             None => None,
         }
     };
@@ -592,6 +662,7 @@ async fn pump(
     let mut dirty = false;
     let mut exit: Option<ExitInfo> = None;
     let mut next = Instant::now();
+    let mut relaunches = None;
     loop {
         // An exit goes out at once (after the output before it), paused
         // or not: a hidden pane still hears that its process ended.
@@ -646,17 +717,7 @@ async fn pump(
                         viewer.text(&json!({ "type": "size", "cols": cols, "rows": rows })).await
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Unsubscribe first, so the backlog this client
-                        // will never read is not kept alive for it.
-                        drop(events);
-                        let reset = Message::Text(json!({ "type": "reset" }).to_string().into());
-                        if viewer.socket.send(reset).await.is_err() {
-                            break;
-                        }
-                        let Some(fresh) = attach(&session, LAGGED_SNAPSHOT_HISTORY).await else {
-                            break;
-                        };
-                        let Some(fresh) = send_attachment(&mut viewer.socket, fresh).await else {
+                        let Some(fresh) = viewer.resnapshot(&session, events).await else {
                             break;
                         };
                         events = fresh;
@@ -703,20 +764,11 @@ async fn pump(
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<ClientMessage>(text.as_str()) {
                             Ok(ClientMessage::Input { data, id: input }) => {
-                                // Sent again after a drop and here already: not twice.
-                                let fresh = match (&options.client, input) {
-                                    (Some(key), Some(n)) if options.v2 => session.take_input(key, n),
-                                    _ => true,
+                                let input = match input.filter(|_| options.v2) {
+                                    Some(n) => (options.client.as_deref(), Some(n)),
+                                    None => (None, None),
                                 };
-                                if fresh {
-                                    hub.note_typing(id, data.as_bytes());
-                                    if !forward_input(&mut viewer.socket, &session, data.into_bytes()).await {
-                                        break;
-                                    }
-                                }
-                                if let Some(n) = input.filter(|_| options.v2)
-                                    && !viewer.text(&json!({ "type": "ack", "id": n })).await
-                                {
+                                if !forward_input(&mut viewer, &session, hub, id, input, data.into_bytes()).await {
                                     break;
                                 }
                             }
@@ -803,8 +855,7 @@ async fn pump(
                         }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
-                        hub.note_typing(id, &bytes);
-                        if !forward_input(&mut viewer.socket, &session, bytes.to_vec()).await {
+                        if !forward_input(&mut viewer, &session, hub, id, (None, None), bytes.to_vec()).await {
                             break;
                         }
                     }
@@ -821,12 +872,16 @@ async fn pump(
                 }
             }
             _ = ping.tick() => {
-                if viewer.socket.send(Message::Ping(Default::default())).await.is_err() {
+                if !viewer.send(Message::Ping(Default::default())).await {
                     break;
                 }
             }
             close = credential.revoked(hub, &mut recheck) => {
-                let _ = viewer.socket.send(Message::Close(Some(close))).await;
+                viewer.send(Message::Close(Some(close))).await;
+                break;
+            }
+            () = relaunched(&mut relaunches, hub, id, &session), if viewer.exited() => {
+                close_for_relaunch(&mut viewer).await;
                 break;
             }
             () = handoff_restarting(gate.as_ref()) => {
@@ -835,7 +890,7 @@ async fn pump(
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    let _ = viewer.socket.send(Message::Close(None)).await;
+                    viewer.send(Message::Close(None)).await;
                     break;
                 }
             }
@@ -858,6 +913,9 @@ pub(super) async fn close_for_restart(socket: &mut WebSocket) {
         code: WS_CLOSE_RESTART,
         reason: "the hub is restarting (upgrade); reconnect".into(),
     };
-    let _ = socket.send(Message::Close(Some(close))).await;
-    let _ = socket.flush().await;
+    let _ = tokio::time::timeout(SEND_TIMEOUT, async {
+        let _ = socket.send(Message::Close(Some(close))).await;
+        let _ = socket.flush().await;
+    })
+    .await;
 }

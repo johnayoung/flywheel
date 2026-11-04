@@ -34,6 +34,7 @@ mod inputs;
 mod recent;
 use inputs::InputsSeen;
 use recent::Recent;
+pub(crate) use recent::RecentExport;
 pub use recent::{RECENT_BYTES, RecentItem, output_len};
 
 /// Adopting a PTY handed over by another hub process, and exporting one.
@@ -352,7 +353,7 @@ pub struct PtySession {
     /// exits. Closed with the master.
     pidfd: Mutex<Option<std::os::fd::OwnedFd>>,
     /// The last input id taken from each viewer key (see
-    /// [`PtySession::take_input`]).
+    /// [`PtySession::write_input`]).
     inputs_seen: Mutex<InputsSeen>,
 }
 
@@ -788,14 +789,35 @@ impl PtySession {
         WriteOutcome::Queued
     }
 
-    /// Whether input `id` from viewer `key` is new: a viewer whose link
-    /// dropped sends again what was not acknowledged, in order, and what
-    /// got here already must not be typed twice. Ids only grow per key.
-    pub fn take_input(&self, key: &str, id: u64) -> bool {
-        self.inputs_seen
+    /// Type viewer input numbered `id` by viewer `key` (`input`, when it
+    /// numbers its input; `bytes` `None`: nothing to type) unless it got
+    /// here already -- `None` then: a viewer whose link dropped sends again
+    /// what was not acknowledged, in order, and ids only grow per key. The
+    /// id counts as taken only when the input was (queued, or the session
+    /// is over): input refused (backlogged, mid-handoff) can come again.
+    pub fn write_input(
+        &self,
+        input: Option<(&str, u64)>,
+        bytes: Option<Vec<u8>>,
+    ) -> Option<WriteOutcome> {
+        let write = |bytes: Option<Vec<u8>>| bytes.map_or(WriteOutcome::Queued, |b| self.write(b));
+        let Some((key, id)) = input else {
+            return Some(write(bytes));
+        };
+        // Held across the write, so a resend racing it is seen (always
+        // taken before the session's other locks).
+        let mut seen = self
+            .inputs_seen
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take(key, id)
+            .unwrap_or_else(PoisonError::into_inner);
+        if seen.seen(key, id) {
+            return None;
+        }
+        let outcome = write(bytes);
+        if matches!(outcome, WriteOutcome::Queued | WriteOutcome::Closed) {
+            seen.take(key, id);
+        }
+        Some(outcome)
     }
 
     /// Input bytes queued but not yet written to the PTY.

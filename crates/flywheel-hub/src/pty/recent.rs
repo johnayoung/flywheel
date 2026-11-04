@@ -4,6 +4,8 @@
 //! sent the bytes since its last update when they are few.
 
 use axum::body::Bytes;
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// Output bytes kept per session for resuming.
@@ -96,6 +98,88 @@ impl Recent {
     }
 }
 
+/// [`Recent`] as a live handoff carries it: its items, the output of all
+/// of them in one base64 string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RecentExport {
+    start: u64,
+    items: Vec<ExportItem>,
+    output: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ExportItem {
+    Output { seq: u64, len: usize },
+    Resize { seq: u64, cols: u16, rows: u16 },
+}
+
+impl Recent {
+    pub(crate) fn export(&self) -> RecentExport {
+        let mut output = Vec::new();
+        let items = self
+            .items
+            .iter()
+            .map(|(seq, item)| match item {
+                RecentItem::Output(bytes) => {
+                    output.extend_from_slice(bytes);
+                    ExportItem::Output {
+                        seq: *seq,
+                        len: bytes.len(),
+                    }
+                }
+                RecentItem::Resize { cols, rows } => ExportItem::Resize {
+                    seq: *seq,
+                    cols: *cols,
+                    rows: *rows,
+                },
+            })
+            .collect();
+        RecentExport {
+            start: self.start,
+            items,
+            output: base64::engine::general_purpose::STANDARD.encode(output),
+        }
+    }
+
+    /// What [`Recent::export`] gave, for output ending at `end`; nothing
+    /// kept (as [`Recent::new`]) when it is absent or does not add up.
+    pub(crate) fn restore(export: Option<RecentExport>, end: u64) -> Self {
+        export
+            .and_then(|export| Self::rebuild(export, end))
+            .unwrap_or_else(|| Self::new(end))
+    }
+
+    fn rebuild(export: RecentExport, end: u64) -> Option<Self> {
+        let output = Bytes::from(
+            base64::engine::general_purpose::STANDARD
+                .decode(export.output)
+                .ok()?,
+        );
+        let mut recent = Self::new(export.start);
+        let mut taken = 0usize;
+        // Where the output kept so far ends: each item starts there.
+        let mut at = None;
+        for item in export.items {
+            let (seq, item) = match item {
+                ExportItem::Output { seq, len } => {
+                    let bytes = output.get(taken..taken.checked_add(len)?)?;
+                    taken += len;
+                    (seq, RecentItem::Output(output.slice_ref(bytes)))
+                }
+                ExportItem::Resize { seq, cols, rows } => (seq, RecentItem::Resize { cols, rows }),
+            };
+            if at.is_some_and(|at| seq != at) || seq > end {
+                return None;
+            }
+            let next = seq + output_len(std::slice::from_ref(&item)) as u64;
+            at = Some(next);
+            recent.push(seq, item);
+        }
+        (taken == output.len() && at.unwrap_or(end) == end && recent.start <= end).then_some(recent)
+    }
+}
+
 fn cost(item: &RecentItem) -> usize {
     match item {
         RecentItem::Output(bytes) => bytes.len(),
@@ -149,6 +233,25 @@ mod tests {
         assert_eq!(joined(&recent.since(111, end).unwrap()), "");
         assert!(recent.since(99, end).is_none(), "before what is kept");
         assert!(recent.since(112, end).is_none(), "past the output");
+    }
+
+    #[test]
+    fn export_restores_what_a_viewer_resumes_from() {
+        let mut recent = Recent::new(100);
+        recent.push(100, out("hello "));
+        recent.push(106, RecentItem::Resize { cols: 80, rows: 24 });
+        recent.push(106, out("world"));
+        let back = Recent::restore(Some(recent.export()), 111);
+        assert_eq!(joined(&back.since(103, 111).unwrap()), "lo [80x24]world");
+        assert!(back.since(99, 111).is_none());
+        // One that does not end where the output does: nothing kept.
+        let off = Recent::restore(Some(recent.export()), 120);
+        assert!(off.since(103, 120).is_none());
+        assert_eq!(joined(&off.since(120, 120).unwrap()), "");
+        let mut bad = recent.export();
+        bad.output.push('!');
+        assert!(Recent::restore(Some(bad), 111).since(103, 111).is_none());
+        assert!(Recent::restore(None, 111).since(103, 111).is_none());
     }
 
     #[test]

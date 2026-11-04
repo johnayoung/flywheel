@@ -137,10 +137,13 @@
       }
       switch (message.type) {
         case "snapshot":
-          // A fresh replay: the screen as it is, at its size.
+          // A fresh replay: the screen as it is, at its size (an exit, if
+          // it is still over, follows).
           view.reset();
           view.resize(message.cols, message.rows);
-          if (!state.exited) note("");
+          state.exited = false;
+          note("");
+          link("live", "live");
           break;
         case "size":
           view.resize(message.cols, message.rows);
@@ -150,6 +153,7 @@
           break;
         case "exit":
           state.exited = true;
+          link("exited", "ended");
           note(`The process ended (${exitText(message.code, message.signal)}).`);
           info();
           break;
@@ -166,10 +170,12 @@
         end(event.reason === "share link expired" ? "This share link has expired." : "This share link was revoked.");
         return;
       }
-      // 1012: the hub is being upgraded -- back at once. Else back off.
-      const wait = event.code === 1012 ? 150 : state.backoff;
-      state.backoff = Math.min(state.backoff * 2, 15000);
-      link("connecting", event.code === 1012 ? "hub upgrading" : "reconnecting");
+      // 1012: the hub is being upgraded; 4005: the session was
+      // relaunched -- back at once. Else back off.
+      const now = event.code === 1012 || event.code === 4005;
+      const wait = now ? 150 : state.backoff;
+      if (!now) state.backoff = Math.min(state.backoff * 2, 15000);
+      link("connecting", event.code === 1012 ? "hub upgrading" : event.code === 4005 ? "relaunched" : "reconnecting");
       clearTimeout(state.retry);
       state.retry = setTimeout(() => {
         info().finally(connect);

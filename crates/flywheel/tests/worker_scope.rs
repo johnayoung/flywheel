@@ -226,7 +226,7 @@ fn unmet_prerequisites_refuse_and_with_prereqs_runs_them_first() {
     assert_eq!(refused.code, 2, "{}{}", refused.stdout, refused.stderr);
     assert_eq!(
         refused.stderr.trim(),
-        "flywheel worker: task delta waits on unmet prerequisite alpha (fresh). \
+        "flywheel worker: task delta waits on unmet prerequisite alpha (pending). \
          Run them first, or pass --with-prereqs to run them in this scope."
     );
     assert!(repo.ran().is_empty());
@@ -324,7 +324,10 @@ fn a_claim_another_worker_holds_is_waited_out_never_stolen() {
 
     let once = repo.worker(&["--task", "beta", "--once"]);
     assert_eq!(once.code, 1, "{}{}", once.stdout, once.stderr);
-    assert_eq!(summary(&once), "scope: 0/1 verified -- beta pending");
+    assert_eq!(
+        summary(&once),
+        "scope: 0/1 verified -- beta pending (claimed by peer-worker)"
+    );
     assert!(repo.ran().is_empty());
     assert_eq!(
         claims.load_claim("beta").unwrap().unwrap().worker_id,
@@ -347,6 +350,9 @@ fn a_claim_another_worker_holds_is_waited_out_never_stolen() {
     let run = finish(daemon, DEADLINE);
     assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
     assert_eq!(summary(&run), "scope: 1/1 verified -- beta verified");
+    // While it waited it said so, once (not every poll).
+    let waiting = "scope: waiting -- beta pending (claimed by peer-worker)";
+    assert_eq!(run.stderr.matches(waiting).count(), 1, "{}", run.stderr);
     assert_eq!(repo.ran(), ["beta"]);
     assert_eq!(repo.touched(), ["beta"]);
 }
@@ -377,4 +383,71 @@ fn a_held_out_gate_block_parks_the_task_and_exits_one() {
     );
     assert_eq!(repo.ran(), ["gamma"]);
     assert_eq!(repo.landed(), ["gate", "init"]);
+}
+
+#[test]
+fn a_sandbox_that_will_not_prepare_settles_parked_instead_of_idling() {
+    let repo = Repo::new();
+    // A stray directory where gamma's worktree goes: the merge strategy
+    // refuses to clobber it on every attempt.
+    std::fs::create_dir_all(repo.repo.join(".flywheel/worktrees/gamma")).unwrap();
+    let run = repo.worker(&["--task", "gamma"]);
+    assert_eq!(run.code, 1, "{}{}", run.stdout, run.stderr);
+    assert!(
+        summary(&run).starts_with(
+            "scope: 0/1 verified -- gamma parked (its sandbox failed to prepare 3 times: PrepareError:"
+        ),
+        "{}",
+        summary(&run)
+    );
+    assert!(
+        run.stderr
+            .contains("scope: waiting -- gamma pending (sandbox failed to prepare: PrepareError:"),
+        "{}",
+        run.stderr
+    );
+    assert!(repo.ran().is_empty());
+}
+
+#[test]
+fn a_dependent_held_behind_an_unmerged_phase_is_refused_at_start() {
+    let repo = Repo::new();
+    let next = repo.repo.join(".flywheel/tasks/active/02-next");
+    std::fs::create_dir_all(&next).unwrap();
+    let omega = serde_json::json!({
+        "id": "omega",
+        "goal": "Goal omega.",
+        "graders": [{"type": "command", "name": "unit", "run": "true"}],
+        "prerequisites": ["alpha"],
+    });
+    std::fs::write(next.join("omega.json"), omega.to_string()).unwrap();
+    let alpha = repo.worker(&["--task", "alpha"]);
+    assert_eq!(alpha.code, 0, "{}{}", alpha.stdout, alpha.stderr);
+    // Phase 01-scope's integration branch carries work main cannot see.
+    git(
+        &repo.repo,
+        &["checkout", "-q", "-b", "flywheel/phase/01-scope"],
+    );
+    std::fs::write(repo.repo.join("phase.txt"), "phase work\n").unwrap();
+    git(&repo.repo, &["add", "phase.txt"]);
+    git(&repo.repo, &["commit", "-qm", "phase work"]);
+    git(&repo.repo, &["checkout", "-q", "main"]);
+
+    let held = repo.worker(&["--task", "omega"]);
+    assert_eq!(held.code, 2, "{}{}", held.stdout, held.stderr);
+    assert_eq!(
+        held.stderr.trim(),
+        "flywheel worker: task omega waits for done prerequisite alpha to reach HEAD: \
+         merge flywheel/phase/01-scope first"
+    );
+    assert_eq!(repo.ran(), ["alpha"]);
+
+    // Once the phase merges the same command runs it.
+    git(
+        &repo.repo,
+        &["merge", "-q", "--no-edit", "flywheel/phase/01-scope"],
+    );
+    let run = repo.worker(&["--task", "omega"]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+    assert_eq!(repo.ran(), ["alpha", "omega"]);
 }

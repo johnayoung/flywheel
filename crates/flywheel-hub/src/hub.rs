@@ -316,6 +316,9 @@ pub struct SessionView {
     /// Its prompt queue (see [`crate::queue`]), when it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queue: Option<crate::queue::QueueBrief>,
+    /// A worker session's worker: running, or how it ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<crate::flywheel::WorkerRun>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes &T

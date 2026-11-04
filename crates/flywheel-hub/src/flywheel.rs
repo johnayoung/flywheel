@@ -720,10 +720,12 @@ impl FlywheelMonitor {
 /// never re-run; see `restore`). The wrapper traps Ctrl-C/Ctrl-\ with a
 /// no-op rather than ignoring them, so the worker (which execs with default
 /// handlers) still gets the signal while the wrapper -- in the same
-/// foreground group -- survives it and goes on to the shell.
+/// foreground group -- survives it and goes on to the shell. The shell
+/// is exec'd with [`WORKER_EXIT_ENV`] set to the worker's exit status, so
+/// the hub can read how it ended from the process (see [`worker_run`]).
 pub fn worker_session_command(worker: &[String]) -> Vec<String> {
     let script = "trap : INT QUIT; \"$@\"; status=$?; printf '\\n[fw worker exited with status %s]\\n' \"$status\"; \
-                  exec \"${SHELL:-/bin/sh}\"";
+                  FLYWHEEL_WORKER_EXIT=$status exec \"${SHELL:-/bin/sh}\"";
     let mut argv = vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
@@ -736,6 +738,66 @@ pub fn worker_session_command(worker: &[String]) -> Vec<String> {
 
 /// The marker argv[0] of `$@` in [`worker_session_command`]'s script.
 pub const WORKER_MARKER: &str = "fw-worker";
+/// The variable the shell a finished worker leaves behind carries its
+/// exit status in.
+pub const WORKER_EXIT_ENV: &str = "FLYWHEEL_WORKER_EXIT";
+
+/// How a "Start worker here" / "Run <id>" session's worker stands: still
+/// running, or exited (with its status when the platform shows it). The
+/// panel counts only running ones; the sidebar shows how a finished one
+/// ended instead of `live`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WorkerRun {
+    pub running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i32>,
+}
+
+/// Whether `record` is a worker session (started by the hub, not a plain
+/// shell restored after a restart).
+fn is_worker_session(record: &crate::state::SessionRecord) -> bool {
+    record.fallback_command.is_none()
+        && record.command.get(3).map(String::as_str) == Some(WORKER_MARKER)
+}
+
+/// The worker state of a worker session whose process is `pid` (`None`
+/// once the session's process is gone); `None` for any other session.
+pub fn worker_run(record: &crate::state::SessionRecord, pid: Option<u32>) -> Option<WorkerRun> {
+    if !is_worker_session(record) {
+        return None;
+    }
+    Some(match pid {
+        Some(pid) if process_runs_worker(pid) => WorkerRun {
+            running: true,
+            exit_status: None,
+        },
+        Some(pid) => WorkerRun {
+            running: false,
+            exit_status: process_worker_exit(pid),
+        },
+        None => WorkerRun {
+            running: false,
+            exit_status: None,
+        },
+    })
+}
+
+/// The exit status a finished worker's shell was exec'd with.
+#[cfg(target_os = "linux")]
+fn process_worker_exit(pid: u32) -> Option<i32> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{WORKER_EXIT_ENV}=");
+    environ
+        .split(|b| *b == 0)
+        .filter_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+        .next_back()
+        .and_then(|value| std::str::from_utf8(value).ok()?.parse().ok())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_worker_exit(_pid: u32) -> Option<i32> {
+    None
+}
 /// The name a started worker's session gets (numbered when taken).
 pub const WORKER_SESSION_NAME: &str = "fw worker";
 
@@ -755,7 +817,10 @@ impl WorkerScope {
     pub const MAX_TASKS: usize = 50;
 
     /// A scope over `tasks` (validated: non-empty printable ids without
-    /// whitespace, deduplicated, bounded), or why it is refused.
+    /// whitespace that do not start with `-`, deduplicated, bounded), or
+    /// why it is refused. The flags spell `--task=<id>` anyway; refusing a
+    /// dash-led id here answers 400 instead of starting a worker that only
+    /// exits 2 on an id like `--once`.
     pub fn new(tasks: Vec<String>, with_prereqs: bool) -> Result<Self, String> {
         if with_prereqs && tasks.is_empty() {
             return Err("with_prereqs needs at least one task".into());
@@ -766,6 +831,7 @@ impl WorkerScope {
         let mut unique: Vec<String> = Vec::new();
         for id in tasks {
             if id.is_empty()
+                || id.starts_with('-')
                 || id.len() > Self::MAX_ID
                 || id.chars().any(|c| c.is_control() || c.is_whitespace())
             {
@@ -814,10 +880,7 @@ impl WorkerScope {
 /// counts.
 pub fn runs_worker(view: &SessionView, folder: &Path) -> bool {
     let record = &view.record;
-    if record.cwd != folder
-        || record.fallback_command.is_some()
-        || record.command.get(3).map(String::as_str) != Some(WORKER_MARKER)
-    {
+    if record.cwd != folder || !is_worker_session(record) {
         return false;
     }
     let Some(pid) = view.live.as_ref().and_then(|l| l.pid) else {
@@ -1038,11 +1101,11 @@ mod tests {
 
     #[test]
     fn worker_scopes_validate_ids_and_render_safe_flags() {
-        let scope = WorkerScope::new(vec!["-a".into(), "b".into(), "-a".into()], true).unwrap();
-        assert_eq!(scope.tasks, ["-a", "b"]);
-        assert_eq!(scope.flags(), ["--task=-a", "--task=b", "--with-prereqs"]);
+        let scope = WorkerScope::new(vec!["a-1".into(), "b".into(), "a-1".into()], true).unwrap();
+        assert_eq!(scope.tasks, ["a-1", "b"]);
+        assert_eq!(scope.flags(), ["--task=a-1", "--task=b", "--with-prereqs"]);
         assert!(WorkerScope::default().flags().is_empty());
-        for bad in ["", "a b", "a\nb", "a\0b"] {
+        for bad in ["", "a b", "a\nb", "a\0b", "--once", "-a"] {
             assert!(
                 WorkerScope::new(vec![bad.into()], false).is_err(),
                 "{bad:?}"
@@ -1098,6 +1161,9 @@ mod tests {
         let comm = || std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
         until("the shell to exec its sleep", &|| comm().trim() == "sleep");
         assert!(!process_runs_worker(pid));
+        // The shell carries the worker's exit status (the sleep it exec'd
+        // inherited it).
+        assert_eq!(process_worker_exit(pid), Some(0));
         drop(child);
         assert!(!process_runs_worker(pid), "a gone process runs nothing");
     }

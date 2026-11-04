@@ -2254,6 +2254,10 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     let cycle_log = Arc::clone(&log);
     let retention_days = clamp_u64(args.worktree_retention_days);
     let run_log_retention = clamp_usize(args.run_log_retention);
+    // A scoped run that is not settled says why it is waiting (a peer's
+    // claim, a sandbox that will not prepare, a running member), once per
+    // change, so a pane never looks frozen.
+    let mut last_waiting: Option<String> = None;
     let mut run_cycle = || -> Result<CycleOutcome, CycleError> {
         // Default-on run-log retention: hold .flywheel/logs/runs/ at or under
         // the configured bound before draining. Worktree retention runs every
@@ -2292,7 +2296,14 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
             Ok(_) => match &scope {
                 Some(scope) => match scope.verdict() {
                     Ok(verdict) if verdict.settled() => Ok(CycleOutcome::Settled),
-                    Ok(_) => Ok(CycleOutcome::Completed),
+                    Ok(verdict) => {
+                        let waiting = verdict.waiting_line();
+                        if last_waiting.as_deref() != Some(waiting.as_str()) {
+                            log(&waiting);
+                            last_waiting = Some(waiting);
+                        }
+                        Ok(CycleOutcome::Completed)
+                    }
                     Err(failure) => Err(Box::new(failure) as CycleError),
                 },
                 None => Ok(CycleOutcome::Completed),

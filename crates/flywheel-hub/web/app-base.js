@@ -240,6 +240,18 @@ function statusLook(session) {
       title: agent.detail ? `${look.label}: ${agent.detail}` : look.label,
     };
   }
+  // A worker session whose worker exited is its shell now: say how the
+  // worker ended (a scoped run's 0 = every named task verified, 2 = refused).
+  const worker = session.worker;
+  if (session.state === "running" && session.live && worker && !worker.running) {
+    const scoped = Array.isArray(session.command) && session.command.some((a) => String(a).startsWith("--task="));
+    const code = worker.exit_status;
+    const title = code == null ? "fw worker exited" : `fw worker exited with status ${code}; its shell is still open`;
+    if (code === 0) return { dot: "done", label: scoped ? "verified" : "worker done", tone: "", title };
+    if (code == null) return { dot: "done", label: "worker exited", tone: "", title };
+    const label = scoped && code === 1 ? "not verified" : scoped && code === 2 ? "refused" : `worker exit ${code}`;
+    return { dot: "bad", label, tone: "bad", title };
+  }
   if (session.state === "running") {
     return session.live
       ? { dot: "live", label: "live", tone: "live" }

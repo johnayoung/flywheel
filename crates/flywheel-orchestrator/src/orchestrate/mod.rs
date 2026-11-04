@@ -56,8 +56,8 @@ pub use run_task::{
     AgentPrimitives, RunMode, RunTask, RunTaskError, RunTaskFuture, RunTaskRequest, SharedRunTask,
 };
 pub use scope::{
-    ScopeError, ScopeOutcome, ScopePlan, ScopeRequest, ScopeVerdict, TaskScope, UnmetPrerequisite,
-    evaluate_scope, plan_scope,
+    PREPARE_SKIPS_TO_SETTLE, ScopeEnv, ScopeError, ScopeOutcome, ScopePlan, ScopeRequest,
+    ScopeVerdict, TaskScope, UnmetPrerequisite, evaluate_scope, plan_scope,
 };
 pub use sweep::{
     assemble_graph_snapshot_items, reconcile_live_runs, recover_claimable_stranded,

@@ -9,12 +9,20 @@
 //! skips it, never stolen.
 //!
 //! [`plan_scope`] is the start-up gate: it refuses an unknown id, an
-//! unrunnable task, and (unless prerequisites are pulled in) a named task
-//! whose prerequisites are not done. [`evaluate_scope`] is the exit test:
-//! once every named task is settled -- verified, failed after the scope
-//! started, parked, or blocked behind a member that settled unverified --
-//! the scoped worker stops instead of idling.
+//! unrunnable task, (unless prerequisites are pulled in) a named task
+//! whose prerequisites are not done, and one held behind a done
+//! prerequisite whose phase has not reached the base. [`evaluate_scope`]
+//! is the exit test: once every named task is settled -- verified, failed
+//! after the scope started, parked (including a sandbox that would not
+//! prepare [`PREPARE_SKIPS_TO_SETTLE`] times, a reachability hold, or a
+//! definition that went invalid), or blocked behind a member that settled
+//! unverified -- the scoped worker stops instead of idling.
 
+use super::prereqs::reachability_held_prerequisites;
+use crate::claims::{
+    ClaimStore, ClaimStoreError, RESOLUTION_ATTRIBUTION_PROBE, RESOLUTION_ATTRIBUTIONS,
+    STOP_PREPARE_SKIP, STOP_RESOLVED,
+};
 use crate::rollup::{TaskState, TaskStatusRow, status_rows_for_items, task_state};
 use crate::sources::{WorkItem, WorkSource, WorkSourceError};
 use crate::work_graph::WorkGraph;
@@ -70,6 +78,26 @@ pub(crate) fn in_scope(scope: Option<&TaskScope>, task_id: &str) -> bool {
     scope.is_none_or(|scope| scope.contains(task_id))
 }
 
+/// Consecutive prepare/preflight skips (with no run in between) under one
+/// scope after which a member counts as parked: the sandbox will not come
+/// up, and retrying every poll would idle forever.
+pub const PREPARE_SKIPS_TO_SETTLE: usize = 3;
+
+/// What the scope gate and exit test may consult beyond the listing and the
+/// core store. Every field is optional; an absent one skips its check.
+#[derive(Clone, Copy, Default)]
+pub struct ScopeEnv<'a> {
+    /// The repository root: the static task validation and the phase
+    /// reachability probe run against it.
+    pub repo_root: Option<&'a Path>,
+    /// The base a dependent branches from (the configured submit base, else
+    /// `HEAD`), for the phase-prerequisite reachability hold.
+    pub true_base: Option<&'a str>,
+    /// The orchestrator store: prepare skips, resolution markers, and the
+    /// claims a peer holds.
+    pub claims: Option<&'a dyn ClaimStore>,
+}
+
 /// Whether the member's latest lifecycle failed at or after the scope
 /// began: it was attempted under this scope (by this worker or a peer
 /// sharing it) and must not be run again.
@@ -110,8 +138,9 @@ pub struct ScopeRequest {
 pub struct UnmetPrerequisite {
     pub task_id: String,
     pub prerequisite: String,
-    /// The prerequisite's state (`fresh`, `retryable`, ...), or
-    /// `unlisted` for one no work source lists and the store never finished.
+    /// The prerequisite's state (`pending` for one never run, `retryable`,
+    /// ...), or `unlisted` for one no work source lists and the store never
+    /// finished.
     pub state: String,
 }
 
@@ -126,8 +155,12 @@ pub enum ScopeError {
     UnmetPrerequisites(Vec<UnmetPrerequisite>),
     #[error("{}", render_unrunnable(.0))]
     Unrunnable(Vec<(String, String)>),
+    #[error("{}", render_held(.0))]
+    Held(Vec<(String, String)>),
     #[error("reading the store: {0}")]
     Store(#[from] StoreError),
+    #[error("reading the orchestrator store: {0}")]
+    Claims(#[from] ClaimStoreError),
     #[error("listing the work source: {0}")]
     Source(#[from] WorkSourceError),
 }
@@ -149,6 +182,14 @@ fn render_unmet(unmet: &[UnmetPrerequisite]) -> String {
                 prereqs.join(", ")
             )
         })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn render_held(tasks: &[(String, String)]) -> String {
+    tasks
+        .iter()
+        .map(|(task, why)| format!("task {task} {why}"))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -188,6 +229,7 @@ struct Listing {
     items: HashMap<String, WorkItem>,
     order: Vec<String>,
     rows: HashMap<String, TaskStatusRow>,
+    row_list: Vec<TaskStatusRow>,
     excluded: HashMap<String, String>,
 }
 
@@ -198,7 +240,11 @@ impl Listing {
         let validation = WorkGraph::build(items.iter().cloned());
         Ok(Self {
             order: items.iter().map(|i| i.task.id.clone()).collect(),
-            rows: rows.into_iter().map(|r| (r.task_id.clone(), r)).collect(),
+            rows: rows
+                .iter()
+                .map(|r| (r.task_id.clone(), r.clone()))
+                .collect(),
+            row_list: rows,
             excluded: validation
                 .excluded
                 .into_iter()
@@ -211,6 +257,25 @@ impl Listing {
     /// `Some(state)` for a listed task; `None` for an unlisted one.
     fn state(&self, task_id: &str) -> Option<TaskState> {
         self.rows.get(task_id).map(|r| r.state)
+    }
+
+    /// Dependents fresh selection withholds because a done cross-phase
+    /// prerequisite's phase has not reached the base, with the operator
+    /// sentence naming why.
+    fn reachability_holds(&self, env: &ScopeEnv<'_>) -> HashMap<String, String> {
+        let base = env.true_base.unwrap_or("HEAD");
+        reachability_held_prerequisites(&self.row_list, env.repo_root, env.true_base)
+            .into_iter()
+            .map(|(task_id, hold)| {
+                let why = format!(
+                    "waits for done prerequisite{} {} to reach {base}: merge flywheel/phase/{} first",
+                    if hold.held_by.len() == 1 { "" } else { "s" },
+                    hold.held_by.join(", "),
+                    hold.blocking_phase
+                );
+                (task_id, why)
+            })
+            .collect()
     }
 }
 
@@ -227,12 +292,15 @@ fn store_done(control: &dyn HarnessStore, task_id: &str) -> Result<bool, StoreEr
 /// whose capabilities the worker lacks, or whose graders are statically
 /// broken, and -- without `with_prerequisites` -- a named task with a
 /// prerequisite that is not done. With it, every not-done prerequisite is
-/// added (transitively); one no source lists is still refused.
+/// added (transitively); one no source lists is still refused. A member
+/// held behind a done prerequisite whose phase has not reached the base
+/// (see [`ScopeEnv::true_base`]) is refused too: selection would never pick
+/// it until that phase merges.
 pub fn plan_scope(
     source: &dyn WorkSource,
     control: &dyn HarnessStore,
     request: &ScopeRequest,
-    repo_root: Option<&Path>,
+    env: &ScopeEnv<'_>,
 ) -> Result<ScopePlan, ScopeError> {
     let mut named: Vec<String> = Vec::new();
     for id in &request.tasks {
@@ -268,6 +336,7 @@ pub fn plan_scope(
         for prereq in &item.prerequisites {
             let state = match listing.state(prereq) {
                 Some(TaskState::Done) => continue,
+                Some(TaskState::Fresh) => "pending".to_owned(),
                 Some(state) => state.as_str().to_owned(),
                 None if store_done(control, prereq)? => continue,
                 None => "unlisted".to_owned(),
@@ -319,7 +388,7 @@ pub fn plan_scope(
             ));
             continue;
         }
-        if let Some(root) = repo_root {
+        if let Some(root) = env.repo_root {
             let defects = validate_task(&item.task, root);
             if !defects.is_empty() {
                 let details: Vec<String> = defects.into_iter().map(|d| d.detail).collect();
@@ -332,6 +401,16 @@ pub fn plan_scope(
     }
     if !unrunnable.is_empty() {
         return Err(ScopeError::Unrunnable(unrunnable));
+    }
+    let holds = listing.reachability_holds(env);
+    let held: Vec<(String, String)> = listing
+        .order
+        .iter()
+        .filter(|id| members.contains(*id))
+        .filter_map(|id| holds.get(id).map(|why| (id.clone(), why.clone())))
+        .collect();
+    if !held.is_empty() {
+        return Err(ScopeError::Held(held));
     }
     Ok(ScopePlan {
         named,
@@ -356,13 +435,14 @@ pub enum ScopeOutcome {
     Parked { reason: String },
     /// Waits on a scope member that settled without being verified.
     Blocked { prerequisite: String },
-    /// Not settled yet (not run, running, or interrupted and resumable).
-    Pending,
+    /// Not settled yet: `detail` says why (empty for never run; running,
+    /// interrupted and resumable, claimed by a peer, ...).
+    Pending { detail: String },
 }
 
 impl ScopeOutcome {
     pub fn is_settled(&self) -> bool {
-        !matches!(self, ScopeOutcome::Pending)
+        !matches!(self, ScopeOutcome::Pending { .. })
     }
 
     pub fn label(&self) -> &'static str {
@@ -371,7 +451,7 @@ impl ScopeOutcome {
             ScopeOutcome::Failed { .. } => "failed",
             ScopeOutcome::Parked { .. } => "parked",
             ScopeOutcome::Blocked { .. } => "blocked",
-            ScopeOutcome::Pending => "pending",
+            ScopeOutcome::Pending { .. } => "pending",
         }
     }
 }
@@ -379,8 +459,10 @@ impl ScopeOutcome {
 impl fmt::Display for ScopeOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ScopeOutcome::Verified | ScopeOutcome::Pending => f.write_str(self.label()),
-            ScopeOutcome::Failed { reason } | ScopeOutcome::Parked { reason } => {
+            ScopeOutcome::Verified => f.write_str(self.label()),
+            ScopeOutcome::Failed { reason }
+            | ScopeOutcome::Parked { reason }
+            | ScopeOutcome::Pending { detail: reason } => {
                 if reason.is_empty() {
                     f.write_str(self.label())
                 } else {
@@ -432,6 +514,20 @@ impl ScopeVerdict {
     }
 }
 
+impl ScopeVerdict {
+    /// The line a scoped worker logs while it waits: the members not yet
+    /// settled and why (`waiting -- b pending (claimed by w2 until ...)`).
+    pub fn waiting_line(&self) -> String {
+        let parts: Vec<String> = self
+            .outcomes
+            .iter()
+            .filter(|(_, o)| !o.is_settled())
+            .map(|(id, outcome)| format!("{id} {}", one_line(&outcome.to_string())))
+            .collect();
+        format!("scope: waiting -- {}", parts.join("; "))
+    }
+}
+
 /// Collapse whitespace runs (an error message's newlines) and cap the
 /// length so the summary stays one readable line.
 fn one_line(text: &str) -> String {
@@ -444,9 +540,38 @@ fn one_line(text: &str) -> String {
     format!("{cut}...")
 }
 
+/// The latest attributed `stop-resolved` marker for `task_id`: its instant
+/// and attribution (`probe` = the archive probe confirmed it landed;
+/// `operator` = `fw resolve` abandoned the strand).
+fn latest_resolution(
+    claims: Option<&dyn ClaimStore>,
+    task_id: &str,
+) -> Result<Option<(DateTime<Utc>, String)>, ClaimStoreError> {
+    let Some(claims) = claims else {
+        return Ok(None);
+    };
+    Ok(claims
+        .list_subject_stop_events(task_id)?
+        .into_iter()
+        .filter(|event| {
+            event.kind == STOP_RESOLVED
+                && RESOLUTION_ATTRIBUTIONS.contains(&event.attribution.as_str())
+        })
+        .map(|event| (event.occurred_at, event.attribution))
+        .next_back())
+}
+
 /// The landing verdict of a DONE task's latest DONE run: parked when its
-/// most recent landing record is a park (no later `Landed`).
-fn landing_park(control: &dyn HarnessStore, task_id: &str) -> Result<Option<String>, StoreError> {
+/// most recent landing record is a park with no later `Landed` and no
+/// attributed resolution marker at least as recent (the rule `fw status`
+/// and the landing re-drive apply). A probe resolution means the work
+/// landed; an operator one abandoned the strand, which stays parked with
+/// that reason.
+fn landing_park(
+    control: &dyn HarnessStore,
+    claims: Option<&dyn ClaimStore>,
+    task_id: &str,
+) -> Result<Option<String>, ScopeError> {
     let filter = LifecycleFilter::default()
         .with_task_id(task_id)
         .with_statuses([Status::Done]);
@@ -464,6 +589,15 @@ fn landing_park(control: &dyn HarnessStore, task_id: &str) -> Result<Option<Stri
     if landed_after {
         return Ok(None);
     }
+    if let Some((resolved_at, attribution)) = latest_resolution(claims, task_id)?
+        && park.ts <= resolved_at
+    {
+        return Ok(if attribution == RESOLUTION_ATTRIBUTION_PROBE {
+            None
+        } else {
+            Some("landing parked, then resolved by the operator without landing".to_owned())
+        });
+    }
     Ok(match &park.payload {
         DomainEventPayload::LandingParked(parked) if parked.detail.is_empty() => {
             Some(format!("landing parked: {}", parked.park_kind))
@@ -476,12 +610,71 @@ fn landing_park(control: &dyn HarnessStore, task_id: &str) -> Result<Option<Stri
     })
 }
 
+/// The latest instant `run_id`'s lifecycle moved (its newest transition).
+fn last_transition(
+    control: &dyn HarnessStore,
+    run_id: Option<&String>,
+) -> Result<Option<DateTime<Utc>>, StoreError> {
+    let Some(run_id) = run_id else {
+        return Ok(None);
+    };
+    Ok(control
+        .load_lifecycle(run_id)?
+        .and_then(|lifecycle| lifecycle.timestamps.values().max().copied()))
+}
+
+/// The prepare/preflight skips recorded for `row` under `scope` since its
+/// latest run last moved, newest last.
+fn prepare_skips(
+    control: &dyn HarnessStore,
+    claims: Option<&dyn ClaimStore>,
+    row: &TaskStatusRow,
+    scope: &TaskScope,
+) -> Result<Vec<String>, ScopeError> {
+    let Some(claims) = claims else {
+        return Ok(Vec::new());
+    };
+    let floor = match last_transition(control, row.latest_run_id.as_ref())? {
+        Some(moved) if moved > scope.since => moved,
+        _ => scope.since,
+    };
+    Ok(claims
+        .list_subject_stop_events(&row.task_id)?
+        .into_iter()
+        .filter(|event| event.kind == STOP_PREPARE_SKIP && event.occurred_at >= floor)
+        .map(|event| event.detail)
+        .collect())
+}
+
+/// Why a member still pending is not running, for the summary.
+fn pending_detail(
+    claims: Option<&dyn ClaimStore>,
+    row: &TaskStatusRow,
+) -> Result<String, ClaimStoreError> {
+    if let Some(claims) = claims
+        && let Some(claim) = claims.load_claim(&row.task_id)?
+    {
+        // No lease instant: a live peer's heartbeat moves it every few
+        // seconds, and the waiting line is logged once per change.
+        return Ok(format!("claimed by {}", claim.worker_id));
+    }
+    Ok(match row.state {
+        TaskState::Fresh => String::new(),
+        TaskState::InProgress => "running".to_owned(),
+        TaskState::Interrupted => "interrupted; resumes when a worker picks it up".to_owned(),
+        TaskState::Retryable => "retryable".to_owned(),
+        TaskState::AwaitingApproval | TaskState::Done => row.state.as_str().to_owned(),
+    })
+}
+
 fn own_outcome(
     control: &dyn HarnessStore,
     listing: &Listing,
     scope: &TaskScope,
+    env: &ScopeEnv<'_>,
+    holds: &HashMap<String, String>,
     task_id: &str,
-) -> Result<ScopeOutcome, StoreError> {
+) -> Result<ScopeOutcome, ScopeError> {
     let Some(row) = listing.rows.get(task_id) else {
         return Ok(if store_done(control, task_id)? {
             ScopeOutcome::Verified
@@ -492,7 +685,7 @@ fn own_outcome(
         });
     };
     Ok(match row.state {
-        TaskState::Done => match landing_park(control, task_id)? {
+        TaskState::Done => match landing_park(control, env.claims, task_id)? {
             Some(reason) => ScopeOutcome::Parked { reason },
             None => ScopeOutcome::Verified,
         },
@@ -505,8 +698,58 @@ fn own_outcome(
         TaskState::Retryable if failed_under_scope(control, row, scope)? => ScopeOutcome::Failed {
             reason: row.latest_error.clone(),
         },
-        _ => ScopeOutcome::Pending,
+        _ => return pending_outcome(control, listing, scope, env, holds, row),
     })
+}
+
+/// A member selection could still pick -- unless its sandbox keeps failing
+/// to prepare, its done prerequisite's phase has not reached the base, or
+/// its definition went invalid since start-up: each of those parks it
+/// (selection would skip it every poll, so waiting would idle forever).
+fn pending_outcome(
+    control: &dyn HarnessStore,
+    listing: &Listing,
+    scope: &TaskScope,
+    env: &ScopeEnv<'_>,
+    holds: &HashMap<String, String>,
+    row: &TaskStatusRow,
+) -> Result<ScopeOutcome, ScopeError> {
+    let skips = prepare_skips(control, env.claims, row, scope)?;
+    if skips.len() >= PREPARE_SKIPS_TO_SETTLE {
+        let last = skips.last().map(String::as_str).unwrap_or_default();
+        return Ok(ScopeOutcome::Parked {
+            reason: format!(
+                "its sandbox failed to prepare {} times: {last}",
+                skips.len()
+            ),
+        });
+    }
+    if row.state != TaskState::InProgress {
+        if let Some(why) = holds.get(&row.task_id) {
+            return Ok(ScopeOutcome::Parked {
+                reason: why.clone(),
+            });
+        }
+        if let (Some(root), Some(item)) = (env.repo_root, listing.items.get(&row.task_id)) {
+            let defects = validate_task(&item.task, root);
+            if !defects.is_empty() {
+                let details: Vec<String> = defects.into_iter().map(|d| d.detail).collect();
+                return Ok(ScopeOutcome::Parked {
+                    reason: format!("invalid task definition ({})", details.join("; ")),
+                });
+            }
+        }
+    }
+    let mut detail = pending_detail(env.claims, row)?;
+    if let Some(last) = skips.last() {
+        let note = format!("sandbox failed to prepare: {last}");
+        detail = if detail.is_empty() {
+            note
+        } else {
+            format!("{detail}; {note}")
+        };
+    }
+    Ok(ScopeOutcome::Pending { detail })
 }
 
 /// Where every named task of `plan` stands under `scope`.
@@ -519,11 +762,16 @@ pub fn evaluate_scope(
     control: &dyn HarnessStore,
     plan: &ScopePlan,
     scope: &TaskScope,
+    env: &ScopeEnv<'_>,
 ) -> Result<ScopeVerdict, ScopeError> {
     let listing = Listing::read(source, control)?;
+    let holds = listing.reachability_holds(env);
     let mut own: HashMap<String, ScopeOutcome> = HashMap::new();
     for id in scope.ids() {
-        own.insert(id.clone(), own_outcome(control, &listing, scope, id)?);
+        own.insert(
+            id.clone(),
+            own_outcome(control, &listing, scope, env, &holds, id)?,
+        );
     }
     let blocker = |start: &str| -> Option<String> {
         let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -538,7 +786,7 @@ pub fn evaluate_scope(
                 }
                 match own.get(prereq) {
                     Some(ScopeOutcome::Verified) => {}
-                    Some(ScopeOutcome::Pending) | None => stack.push(prereq.clone()),
+                    Some(ScopeOutcome::Pending { .. }) | None => stack.push(prereq.clone()),
                     Some(_) => return Some(prereq.clone()),
                 }
             }
@@ -549,10 +797,13 @@ pub fn evaluate_scope(
         .named
         .iter()
         .map(|id| {
-            let outcome = match own.get(id).cloned().unwrap_or(ScopeOutcome::Pending) {
-                ScopeOutcome::Pending => match blocker(id) {
+            let own_outcome = own.get(id).cloned().unwrap_or(ScopeOutcome::Pending {
+                detail: String::new(),
+            });
+            let outcome = match own_outcome {
+                pending @ ScopeOutcome::Pending { .. } => match blocker(id) {
                     Some(prerequisite) => ScopeOutcome::Blocked { prerequisite },
-                    None => ScopeOutcome::Pending,
+                    None => pending,
                 },
                 settled => settled,
             };

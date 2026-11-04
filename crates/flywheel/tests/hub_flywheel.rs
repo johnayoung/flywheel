@@ -1043,6 +1043,7 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     for bad in [
         json!({ "folder": root, "tasks": ["a b"] }),
         json!({ "folder": root, "tasks": [""] }),
+        json!({ "folder": root, "tasks": ["--once"], "another": true }),
         json!({ "folder": root, "with_prereqs": true }),
     ] {
         let (code, refused) = start_worker(bad);
@@ -1073,6 +1074,13 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
         screen.contains("fw worker exited with status 0"),
         "{screen}"
     );
+    // The session is its shell now: the view says the worker ended, and
+    // how, so the sidebar and panel stop counting it as a live worker.
+    let worker = wait_for("the session's worker to read as ended", || {
+        let (_, view) = http(&server, "GET", &format!("/api/sessions/{sid}"), None);
+        (view["worker"]["running"] == false).then(|| view["worker"].clone())
+    });
+    assert_eq!(worker, json!({ "running": false, "exit_status": 0 }));
     assert_eq!(std::fs::read_to_string(&ran).unwrap(), "beta\n");
     let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{sid}"), None);
     assert_eq!(code, 204);

@@ -3631,7 +3631,7 @@ async fn a_scoped_session_runs_only_its_members_and_touches_nothing_else() {
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["second"], false),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap();
     assert_eq!(plan.named, ["second"]);
@@ -3647,6 +3647,7 @@ async fn a_scoped_session_runs_only_its_members_and_touches_nothing_else() {
         f.control.as_ref(),
         &plan,
         &plan.scope(t0()),
+        &ScopeEnv::default(),
     )
     .unwrap();
     assert!(verdict.settled() && verdict.all_verified());
@@ -3666,19 +3667,19 @@ async fn unmet_prerequisites_refuse_unless_pulled_in_and_then_run_first() {
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["child"], false),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap_err();
     assert!(matches!(&err, ScopeError::UnmetPrerequisites(u) if u.len() == 1));
     assert_eq!(
         err.to_string(),
-        "task child waits on unmet prerequisite parent (fresh)"
+        "task child waits on unmet prerequisite parent (pending)"
     );
     let plan = plan_scope(
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["child"], true),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap();
     assert_eq!(plan.named, ["child"]);
@@ -3692,7 +3693,7 @@ async fn unmet_prerequisites_refuse_unless_pulled_in_and_then_run_first() {
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["child"], false),
-        None,
+        &ScopeEnv::default(),
     );
     assert!(plain.is_ok());
 }
@@ -3711,7 +3712,7 @@ async fn unknown_and_unrunnable_tasks_are_refused_by_name() {
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["known", "nope"], false),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap_err();
     assert_eq!(
@@ -3722,7 +3723,7 @@ async fn unknown_and_unrunnable_tasks_are_refused_by_name() {
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["gpu"], false),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap_err();
     assert!(
@@ -3735,7 +3736,7 @@ async fn unknown_and_unrunnable_tasks_are_refused_by_name() {
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["orphan"], true),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap_err();
     assert_eq!(
@@ -3747,7 +3748,7 @@ async fn unknown_and_unrunnable_tasks_are_refused_by_name() {
             source.as_ref(),
             f.control.as_ref(),
             &scope_request(&[], false),
-            None
+            &ScopeEnv::default()
         ),
         Err(ScopeError::Empty)
     ));
@@ -3757,7 +3758,7 @@ async fn unknown_and_unrunnable_tasks_are_refused_by_name() {
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["archived"], false),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap();
     let verdict = evaluate_scope(
@@ -3765,6 +3766,7 @@ async fn unknown_and_unrunnable_tasks_are_refused_by_name() {
         f.control.as_ref(),
         &plan,
         &plan.scope(t0()),
+        &ScopeEnv::default(),
     )
     .unwrap();
     assert!(verdict.all_verified());
@@ -3782,7 +3784,7 @@ async fn a_scoped_session_never_steals_a_peer_claim() {
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["held"], false),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap();
     let mut req = f.request(source.clone());
@@ -3799,10 +3801,27 @@ async fn a_scoped_session_never_steals_a_peer_claim() {
         f.control.as_ref(),
         &plan,
         &plan.scope(t0()),
+        &ScopeEnv::default(),
     )
     .unwrap();
     assert!(!verdict.settled());
     assert_eq!(verdict.summary(), "scope: 0/1 verified -- held pending");
+    let env = ScopeEnv {
+        claims: Some(f.claims.as_ref()),
+        ..ScopeEnv::default()
+    };
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &plan.scope(t0()),
+        &env,
+    )
+    .unwrap();
+    assert_eq!(
+        verdict.summary(),
+        "scope: 0/1 verified -- held pending (claimed by other-worker)"
+    );
 }
 
 #[tokio::test]
@@ -3823,7 +3842,7 @@ async fn a_member_failed_before_the_scope_reruns_and_one_failed_under_it_does_no
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["flaky", "child"], false),
-        None,
+        &ScopeEnv::default(),
     );
     // child waits on flaky (retryable): refused without pulling it in.
     assert!(plan.is_err());
@@ -3831,7 +3850,7 @@ async fn a_member_failed_before_the_scope_reruns_and_one_failed_under_it_does_no
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["child"], true),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap();
     let scope = plan.scope(t0());
@@ -3841,7 +3860,14 @@ async fn a_member_failed_before_the_scope_reruns_and_one_failed_under_it_does_no
     // A second session under the same scope does not run it again.
     assert!(run(req).await.runs.is_empty());
     assert_eq!(lifecycles_of(&f, "flaky").len(), 2);
-    let verdict = evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &scope).unwrap();
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &scope,
+        &ScopeEnv::default(),
+    )
+    .unwrap();
     assert!(verdict.settled() && !verdict.all_verified());
     assert_eq!(
         verdict.outcomes,
@@ -3917,6 +3943,7 @@ async fn parked_landings_and_approval_gates_settle_as_parked() {
         f.control.as_ref(),
         &plan,
         &plan.scope(t0()),
+        &ScopeEnv::default(),
     )
     .unwrap();
     let labels: Vec<&str> = verdict.outcomes.iter().map(|(_, o)| o.label()).collect();
@@ -3932,8 +3959,20 @@ async fn parked_landings_and_approval_gates_settle_as_parked() {
     // The same failure seen by a scope that began after it is not settled:
     // the scoped worker will run it.
     let later = plan.scope(t0() + ChronoDuration::seconds(1));
-    let verdict = evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &later).unwrap();
-    assert_eq!(verdict.outcomes[3].1, ScopeOutcome::Pending);
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &later,
+        &ScopeEnv::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        verdict.outcomes[3].1,
+        ScopeOutcome::Pending {
+            detail: "retryable".into()
+        }
+    );
 }
 
 #[tokio::test]
@@ -3945,7 +3984,7 @@ async fn a_scoped_session_leaves_an_out_of_scope_strand_alone() {
         source.as_ref(),
         f.control.as_ref(),
         &scope_request(&["mine"], false),
-        None,
+        &ScopeEnv::default(),
     )
     .unwrap();
     let mut req = f.request(source);
@@ -3954,4 +3993,172 @@ async fn a_scoped_session_leaves_an_out_of_scope_strand_alone() {
     assert_eq!(ids(&report), ["mine"]);
     assert!(report.recovered.is_empty());
     assert_eq!(f.lifecycle("run-stranded").status, Status::Running);
+}
+
+#[tokio::test]
+async fn a_sandbox_that_keeps_failing_to_prepare_settles_the_member_as_parked() {
+    let f = Fixture::new();
+    let strategy = f.strategy().fail_prepare("broken");
+    let source = MemorySource::new(vec![item("broken"), item("fine")]);
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["broken"], false),
+        &ScopeEnv::default(),
+    )
+    .unwrap();
+    let scope = plan.scope(t0());
+    let env = ScopeEnv {
+        claims: Some(f.claims.as_ref()),
+        ..ScopeEnv::default()
+    };
+    for attempt in 1..=PREPARE_SKIPS_TO_SETTLE {
+        let mut req = f.request(source.clone());
+        req.strategy = Some(strategy.clone());
+        req.scope = Some(scope.clone());
+        assert!(run(req).await.runs.is_empty());
+        let verdict =
+            evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &scope, &env).unwrap();
+        if attempt < PREPARE_SKIPS_TO_SETTLE {
+            // Still pending, but the waiting line says why.
+            assert!(!verdict.settled(), "{}", verdict.summary());
+            assert!(
+                verdict
+                    .waiting_line()
+                    .contains("broken pending (sandbox failed to prepare: PrepareError: cannot provision broken)"),
+                "{}",
+                verdict.waiting_line()
+            );
+        } else {
+            assert!(verdict.settled(), "{}", verdict.summary());
+            assert_eq!(
+                verdict.summary(),
+                "scope: 0/1 verified -- broken parked (its sandbox failed to prepare 3 times: \
+                 PrepareError: cannot provision broken)"
+            );
+        }
+    }
+    assert!(lifecycles_of(&f, "fine").is_empty());
+    // Skips recorded before the scope began do not count against it.
+    let later = plan.scope(t0() + ChronoDuration::seconds(1));
+    let verdict = evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &later, &env).unwrap();
+    assert_eq!(
+        verdict.outcomes[0].1,
+        ScopeOutcome::Pending {
+            detail: String::new()
+        }
+    );
+}
+
+#[tokio::test]
+async fn an_attributed_resolution_clears_a_landing_park_the_way_status_does() {
+    let f = Fixture::new();
+    for id in ["probed", "abandoned", "reparked"] {
+        let lc = f.seed(id, &format!("run-{id}"), Status::Done, "");
+        f.control
+            .append_domain_event(
+                &DomainEvent::new(
+                    format!("run-{id}"),
+                    t0(),
+                    DomainEventPayload::LandingParked(LandingParked {
+                        park_kind: PARK_KIND_DIVERGENT_BASE.into(),
+                        detail: "base moved".into(),
+                        ..LandingParked::default()
+                    }),
+                ),
+                lc.version,
+            )
+            .unwrap();
+    }
+    let later = t0() + ChronoDuration::seconds(5);
+    f.claims
+        .record_stop_event(STOP_RESOLVED, "probed", "landed", later, "probe")
+        .unwrap();
+    f.claims
+        .record_stop_event(
+            STOP_RESOLVED,
+            "abandoned",
+            "",
+            later,
+            RESOLUTION_ATTRIBUTION_OPERATOR,
+        )
+        .unwrap();
+    // A marker older than the park does not clear it.
+    f.claims
+        .record_stop_event(
+            STOP_RESOLVED,
+            "reparked",
+            "",
+            t0() - ChronoDuration::seconds(5),
+            "probe",
+        )
+        .unwrap();
+    let source = MemorySource::new(vec![item("probed"), item("abandoned"), item("reparked")]);
+    let plan = ScopePlan {
+        named: ["probed", "abandoned", "reparked"]
+            .map(str::to_owned)
+            .to_vec(),
+        added: Vec::new(),
+    };
+    let env = ScopeEnv {
+        claims: Some(f.claims.as_ref()),
+        ..ScopeEnv::default()
+    };
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &plan.scope(t0()),
+        &env,
+    )
+    .unwrap();
+    assert_eq!(
+        verdict.summary(),
+        "scope: 1/3 verified -- probed verified; abandoned parked (landing parked, then \
+         resolved by the operator without landing); reparked parked (landing parked: \
+         divergent-base -- base moved)"
+    );
+    // Without the orchestrator store the park is all the scope can see.
+    let blind = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &plan.scope(t0()),
+        &ScopeEnv::default(),
+    )
+    .unwrap();
+    assert_eq!(blind.outcomes[0].1.label(), "parked");
+}
+
+#[tokio::test]
+async fn pending_members_say_why_they_wait() {
+    let f = Fixture::new();
+    f.seed("paused", "run-paused", Status::Interrupted, "");
+    f.claims
+        .acquire_claim("held", "peer-worker", t0(), 3600.0, &BTreeSet::new())
+        .unwrap()
+        .unwrap();
+    let source = MemorySource::new(vec![item("paused"), item("held"), item("fresh")]);
+    let plan = ScopePlan {
+        named: ["paused", "held", "fresh"].map(str::to_owned).to_vec(),
+        added: Vec::new(),
+    };
+    let env = ScopeEnv {
+        claims: Some(f.claims.as_ref()),
+        ..ScopeEnv::default()
+    };
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &plan.scope(t0()),
+        &env,
+    )
+    .unwrap();
+    assert!(!verdict.settled());
+    assert_eq!(
+        verdict.waiting_line(),
+        "scope: waiting -- paused pending (interrupted; resumes when a worker picks it up); \
+         held pending (claimed by peer-worker); fresh pending"
+    );
 }

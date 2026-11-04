@@ -136,7 +136,7 @@ Workspace folders with a `flywheel.toml` or `.flywheel/` get the verified loop b
 - Shows active phases and tasks (`pending | running | verified | failed | parked | awaiting | blocked`, from `fw status --json`), live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, and alerts.
 - Alerts join the sidebar's **Needs you**; **Mark seen** drops them in this browser until they change.
 - Open it from the folder chip's `verified/total` badge, the `flywheel` header pill (`Alt F`), or the palette.
-- **Start worker here**: a hub shell running `fw worker` (the whole queue) in a split below the focused pane; a task row's **run** starts `fw worker --task <id>` (asks before adding unmet prerequisites). A second is refused (409) unless confirmed.
+- **Start worker here**: a hub shell running `fw worker` (the whole queue) in a split below the focused pane; a task row's **run** starts `fw worker --task <id>` (asks before adding unmet prerequisites). A second is refused (409) unless confirmed. A finished worker's session shows its outcome (`verified`, `not verified`, `refused`, `worker exit N`), not `live`.
 - **Output** on a run: its `fw show` summary and redacted agent transcript, followed live.
 - A linked worktree reads its own store (`Linked worktree of <main>`). Tracker sources (`github*`) are not listed.
 - Each adopted folder has one watcher (stat every 2 s, re-read on change or every 15 s). A missing SQLite store is never created.

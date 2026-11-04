@@ -11,14 +11,16 @@
 use crate::daemon::WorkerArgs;
 use chrono::{DateTime, DurationRound, SecondsFormat, TimeDelta, Utc};
 use flywheel_core::store::HarnessStore;
+use flywheel_orchestrator::claims::ClaimStore;
 use flywheel_orchestrator::orchestrate::{
-    ScopeError, ScopePlan, ScopeRequest, ScopeVerdict, TaskScope, evaluate_scope, plan_scope,
+    ScopeEnv, ScopeError, ScopePlan, ScopeRequest, ScopeVerdict, TaskScope, evaluate_scope,
+    plan_scope,
 };
 use flywheel_orchestrator::policy::WorkPolicy;
 use flywheel_orchestrator::sources::DirectoryWorkSource;
 use flywheel_orchestrator::store_registry::environ_from_process;
 use flywheel_orchestrator::workflow::{default_store_registries, open_stores_for};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The internal flag a pool member receives its supervisor's scope start
@@ -31,6 +33,9 @@ pub struct WorkerScope {
     pub scope: TaskScope,
     source: DirectoryWorkSource,
     control: Arc<dyn HarnessStore>,
+    claims: Arc<dyn ClaimStore>,
+    repo_root: PathBuf,
+    true_base: String,
 }
 
 impl std::fmt::Debug for WorkerScope {
@@ -84,20 +89,32 @@ impl WorkerScope {
                 .map(|p| p.execution_capabilities.clone())
                 .unwrap_or_default(),
         };
-        let plan = plan_scope(&source, stores.core.as_ref(), &request, Some(repo_root)).map_err(
-            |err| match err {
+        // The base a dependent branches from, exactly as the orchestrator's
+        // reachability hold reads it: the configured submit base, else HEAD.
+        let true_base = policy
+            .and_then(|p| p.submit_base.clone())
+            .unwrap_or_else(|| "HEAD".to_owned());
+        let env = ScopeEnv {
+            repo_root: Some(repo_root),
+            true_base: Some(&true_base),
+            claims: Some(stores.claims.as_ref()),
+        };
+        let plan =
+            plan_scope(&source, stores.core.as_ref(), &request, &env).map_err(|err| match err {
                 ScopeError::UnmetPrerequisites(_) => format!(
                     "{err}. Run them first, or pass --with-prereqs to run them in this scope."
                 ),
                 other => other.to_string(),
-            },
-        )?;
+            })?;
         let scope = plan.scope(since);
         Ok(Some(Self {
             plan,
             scope,
             source,
             control: stores.core,
+            claims: stores.claims,
+            repo_root: repo_root.to_path_buf(),
+            true_base,
         }))
     }
 
@@ -124,7 +141,18 @@ impl WorkerScope {
 
     /// Where every named task stands now.
     pub fn verdict(&self) -> Result<ScopeVerdict, ScopeError> {
-        evaluate_scope(&self.source, self.control.as_ref(), &self.plan, &self.scope)
+        let env = ScopeEnv {
+            repo_root: Some(&self.repo_root),
+            true_base: Some(&self.true_base),
+            claims: Some(self.claims.as_ref()),
+        };
+        evaluate_scope(
+            &self.source,
+            self.control.as_ref(),
+            &self.plan,
+            &self.scope,
+            &env,
+        )
     }
 
     /// The flags that hand this scope to a pool member: the named tasks

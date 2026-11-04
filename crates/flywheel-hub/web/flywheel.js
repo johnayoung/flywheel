@@ -274,12 +274,13 @@ window.FwHubFlywheel = function (ctx) {
   }
 
   // Hub sessions running a worker in `folder` (started from this panel;
-  // one restored after a hub restart is a plain shell).
+  // one restored after a hub restart is a plain shell, and one whose
+  // worker exited is its shell now).
   function workerSessions(key) {
     const folder = pathOf(key);
     return state.sessions.filter((s) =>
       sameMachine(s, key) && s.cwd === folder && s.live && s.live.pid && s.state === "running" && !s.fallback_command &&
-      Array.isArray(s.command) && s.command[3] === "fw-worker");
+      Array.isArray(s.command) && s.command[3] === "fw-worker" && (!s.worker || s.worker.running));
   }
 
   function workspaceFor(key) {
@@ -502,11 +503,24 @@ window.FwHubFlywheel = function (ctx) {
 
   // A panel task's prerequisites not verified yet (one the panel does not
   // list is archived, so done).
+  // The prerequisites a scoped run would pull in, transitively: the ones
+  // not done. A `parked` task is done (its graders passed; only its landing
+  // parked), so the worker counts it as met, and so does this.
   function unmetPrerequisites(panel, taskId) {
     const tasks = new Map(panel.phases.flatMap((p) => p.tasks).map((t) => [t.id, t]));
-    const task = tasks.get(taskId);
-    if (!task) return [];
-    return task.prerequisites.filter((id) => tasks.has(id) && tasks.get(id).state !== "verified");
+    const done = (id) => ["verified", "parked"].includes(tasks.get(id).state);
+    const unmet = [];
+    const stack = [taskId];
+    while (stack.length) {
+      const task = tasks.get(stack.pop());
+      if (!task) continue;
+      for (const id of task.prerequisites) {
+        if (!tasks.has(id) || done(id) || unmet.includes(id)) continue;
+        unmet.push(id);
+        stack.push(id);
+      }
+    }
+    return unmet;
   }
 
   // Start a worker in the open panel's folder: the whole queue, or only

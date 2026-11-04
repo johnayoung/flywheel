@@ -517,7 +517,7 @@ const review = window.FwHubReview({
   handoff: () => handoff,
 });
 // The "why?" beside the status pill (explain.js).
-const explain = window.FwHubExplain({ $, el, api });
+const explain = window.FwHubExplain({ $, el, api, allowAlways: (id) => perms.allowFor(id) });
 // Search across sessions (search.js): scrollback, transcripts, commands.
 const search = window.FwHubSearch({
   $, el, icon, api, rawApi, machines, state, sessionById, workspaceById, age, glyphFor,
@@ -584,6 +584,13 @@ const activity = window.FwHubActivity({
     if (search.isOpen()) search.close(false);
     explain.close();
   },
+});
+
+// Agent permission rules (perms.js): the Permissions sheet and "Always
+// allow" for a blocked session's request.
+const perms = window.FwHubPerms({
+  el, rawApi, state, sessionById, workspaceById,
+  toast: (...args) => commands.toast(...args),
 });
 
 // Read-only share links and recordings (sharing.js).

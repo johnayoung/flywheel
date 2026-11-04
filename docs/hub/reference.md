@@ -107,6 +107,10 @@ fw hub plugin enable NAME
 fw hub plugin disable NAME
 fw hub plugin logs NAME [--lines|-n N] [--json]
 fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]
+fw hub perms show FOLDER|SESSION [--json] {remote}
+fw hub perms allow FOLDER|SESSION RULE... [--file local|project|user] [--agent claude|codex] [--yes] [--json] {remote}
+fw hub perms suggest FOLDER|SESSION [--days N] [--json] {remote}
+fw hub perms codex FOLDER|SESSION trust_level|approval_policy|sandbox_mode VALUE [--yes] [--json] {remote}
 ```
 
 Prompt queues; `ITEM` = a position (1 = next) or an id prefix:

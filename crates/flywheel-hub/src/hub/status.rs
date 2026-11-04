@@ -237,6 +237,11 @@ impl Hub {
     fn status_changed(&self, id: &str, transition: Transition) {
         self.announce_status(id, &transition);
         let before = transition.before.shown();
+        if before != Some(AgentStatus::Blocked)
+            && transition.after.view.as_ref().map(|v| v.status) == Some(AgentStatus::Blocked)
+        {
+            self.perms_note_blocked(id);
+        }
         // A turn started from rest (not a blocked prompt answered): what
         // sat in the agent's input line was sent.
         if !matches!(before, Some(AgentStatus::Blocked | AgentStatus::Working))
@@ -287,6 +292,9 @@ impl Hub {
             SessionKind::Codex if report.event == "notify" => (codex_signal(&payload), None),
             _ => (None, None),
         };
+        if kind == SessionKind::Claude {
+            self.perms_note_report(&report.session, &report.event, signal, &payload);
+        }
         if let Some(signal) = signal {
             let source = StatusSource::Hook {
                 agent: report.source.clone(),

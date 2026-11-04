@@ -6,7 +6,7 @@
 "use strict";
 
 window.FwHubExplain = function (ctx) {
-  const { $, el, api } = ctx;
+  const { $, el, api, allowAlways } = ctx;
 
   const button = $("#crumb-why");
   const pop = el("div", { className: "why-pop", id: "why-pop", role: "dialog", "aria-label": "Why this status" });
@@ -72,6 +72,20 @@ window.FwHubExplain = function (ctx) {
       rules.length ? el("details", { className: "why-rules" }, el("summary", {}, `${rules.length} rules, in order`), el("ol", {}, rules)) : null,
       problems.length ? el("div", { className: "why-problems" }, el("b", {}, "overrides not in force"), el("ul", {}, problems)) : null,
       el("p", { className: "why-note" }, data.note || ""),
+      // Blocked on a permission: write the narrowest rule (perms.js).
+      status === "blocked" && allowAlways && view.session
+        ? el("button", {
+            type: "button",
+            className: "slab ghost why-allow",
+            textContent: "Always allow this…",
+            title: "Preview the narrowest rule that stops this prompt",
+            onclick: () => {
+              const id = view.session;
+              close();
+              allowAlways(id);
+            },
+          })
+        : null,
     ].filter(Boolean));
   }
 

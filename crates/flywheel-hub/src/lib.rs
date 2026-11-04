@@ -42,6 +42,8 @@ pub mod net;
 pub mod notify;
 pub mod paths;
 pub mod peers;
+pub mod perms;
+pub mod perms_cli;
 pub mod plugin_cli;
 pub mod plugins;
 pub mod pty;

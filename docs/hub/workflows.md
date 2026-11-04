@@ -153,3 +153,15 @@ fw hub activity --since 2h --workspace api --kind review --json
 - **Kept** in `activity.jsonl`: rotated at 1 MiB or a week (`activity.1..5.jsonl`), 30 days. Only kind, ids, names, short facts: never terminal output, prompts, command text, grader output, paths; token-shaped words (long hex too) are `[redacted]`, in machines' rows as well.
 - **While you were away**: a browser back after 10+ min gets one card: turns finished, blocked now, fan-outs graded, commands suggested, cost.
 - **Machines**: asked at once (4 s each), merged, labelled; one not answering makes it `partial`.
+
+## Permissions
+
+Fewer prompts without handing agents more than they asked for. Palette **Permissions: FOLDER**, `fw hub perms show`.
+
+- **View**: Claude Code sources highest first (managed `/etc/claude-code` + `managed-settings.d`, the hub's `--settings` + `--permission-mode`, local at the main checkout's root, project, user) with each rule and file; Codex trust (`[projects."<repo>"]`), `approval_policy`, `sandbox_mode` and where each comes from, `rules/*.rules`.
+- **Always allow** (why?, quick answers' `always`, the sheet): the request from the `PermissionRequest` hook, else the dialog on screen; the narrowest rule (`Bash(cargo test -p app *)`: program, subcommand, scoping flags; else the exact command; one per command of a line).
+- Default file `.claude/settings.local.json` (warned when tracked or not ignored); user is opt-in. Preview: file, diff, "This lets the agent ...". Atomic, keys and layout kept; then the prompt is answered Yes.
+- **Never proposed**: every command, `rm`, `sudo`, `curl`/`wget`, interpreters, `git push`, `git *`, pipes into a shell, substitutions, edits outside the repo or of `.claude/` `.git/`. Writing one takes the rule typed back (CLI: on a terminal).
+- **Suggestions**: `permission-requests.jsonl` (0600, 30 days; rules proposed, never commands) per repo, most frequent first, minus what a rule allows.
+- **Codex**: prefix rules to `.codex/rules/default.rules` (loaded once trusted) or `~/.codex`; `trust_level` in `$CODEX_HOME/config.toml`, `approval_policy` / `sandbox_mode` in `.codex/config.toml`; `never` and `danger-full-access` are typed back.
+- Writes: hub log line and `perms.allowed` (activity: agent, file, count).

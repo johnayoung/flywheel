@@ -489,11 +489,22 @@ window.FwHubMobile = function (ctx) {
     }
     const cancel = el("button", { type: "button", className: "qa-esc", textContent: "esc", title: "Escape (cancel)", onclick: answer("\x1b") });
     holdFocus(cancel);
+    // "Always allow": the narrowest rule for this prompt, previewed (perms.js).
+    const always = ctx.allowAlways
+      ? el("button", {
+          type: "button",
+          className: "qa-esc qa-always",
+          textContent: "always…",
+          title: "Always allow this: preview the narrowest rule",
+          onclick: () => ctx.allowAlways(state.attached),
+        })
+      : null;
     bar.replaceChildren(
       el(
         "div",
         { className: "qa-head" },
         el("div", { className: "qa-question" }, el("b", { textContent: "blocked" }), " ", question),
+        always,
         cancel,
       ),
       el("div", { className: "qa-options" }, buttons),

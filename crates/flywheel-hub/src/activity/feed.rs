@@ -680,6 +680,31 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
             })
             .with_id("share_id", str_at(payload, "/share/id"))
         }
+        "perms.allowed" => {
+            // Kind, agent, file scope, and a count: never the rules (they
+            // are command text) or paths.
+            let agent = str_at(payload, "/agent").unwrap_or("an agent");
+            let file = str_at(payload, "/file").unwrap_or("a settings file");
+            let n = payload
+                .get("rules")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let text = format!(
+                "allowed {n} permission rule{} for {agent} ({file} settings){}",
+                if n == 1 { "" } else { "s" },
+                if payload.get("dangerous") == Some(&Value::Bool(true)) {
+                    ", typed-confirmed as dangerous"
+                } else {
+                    ""
+                }
+            );
+            let row = if session.is_object() {
+                draft(text)
+            } else {
+                Draft::new(event, text)
+            };
+            row.with("agent", agent).with("file", file).with("count", n)
+        }
         "record.started" => draft("started recording".to_owned())
             .with_id("recording", str_at(payload, "/recording/name")),
         "record.stopped" => draft("stopped recording".to_owned())

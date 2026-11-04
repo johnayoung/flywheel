@@ -168,6 +168,12 @@ enum HubCommand {
     /// <state-dir>/hub.toml: check validates it, show prints the settings
     /// in force and where each came from (flag, file, default).
     Config(crate::config_cli::ConfigArgs),
+    /// Agent permission rules for a folder or session: show every Claude
+    /// Code and Codex source with where each rule comes from, allow a
+    /// narrow rule (previewed, confirmed, dangerous ones typed back),
+    /// suggest rules for the prompts a repo blocks on most, set Codex's
+    /// trust and approval settings.
+    Perms(crate::perms_cli::PermsArgs),
     /// Local plugins (<state-dir>/plugins/<name>/plugin.toml) run on hub
     /// events and as palette actions: ls, enable, disable, logs.
     Plugin(crate::plugin_cli::PluginArgs),
@@ -633,6 +639,7 @@ fn dispatch(
         HubCommand::Peer(args) => crate::machine_cli::peer(&args, out, err),
         HubCommand::Config(args) => crate::config_cli::main(&args, out, err),
         HubCommand::Plugin(args) => crate::plugin_cli::main(&args, out, err),
+        HubCommand::Perms(args) => crate::perms_cli::main(&args, out, err),
         HubCommand::Share(args) => crate::share_cli::share(&args, out, err),
         HubCommand::Record(args) => crate::share_cli::record(&args, out, err),
         HubCommand::Doctor(args) => crate::doctor::doctor(&args, out, err),

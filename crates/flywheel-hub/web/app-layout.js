@@ -93,6 +93,8 @@ const mobile = window.FwHubMobile({
   // Compose's "Queue" (queue.js).
   canQueue: (session) => promptQueue.canQueue(session),
   queuePrompt: (id, text) => promptQueue.add(id, text),
+  // Quick answers' "always": the narrowest rule for the prompt (perms.js).
+  allowAlways: (id) => perms.allowFor(id),
 });
 
 // A pane resizes its session's PTY (fits it to its box) only while it

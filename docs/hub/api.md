@@ -145,6 +145,17 @@ Times: RFC 3339, unix ms, an age (`90m`, `1h30m`), or `last-seen` (with `client`
 | GET | `/api/tls` | `{"mode","ca_fingerprint","constraints","names","expires"}` |
 | POST | `/api/tls/reload` | re-read the CA (`tls rotate`), re-issue, drop old-CA connections; 409 TLS off |
 
+## Permissions
+
+Behaviour: [hub-workflows](workflows.md#permissions). `?folder=` (absolute, in a workspace folder or session dir) or `?session=`; body the same keys. Token or login only (peers 403).
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/perms` | `{"folder","repo","session"?,"claude":{"sources","managed_only","targets"},"codex","pending"?:{"request","summary","claude"\|"codex":{"rules","candidates","notes"},"decision"?}}` |
+| GET | `/api/perms/suggest` | `days` 1-30 (14) -> `{"suggestions":[{"agent","tool","rules","count","sessions","last_at"}],"skipped_dangerous"}` |
+| POST | `/api/perms/preview` | `{"rules"}` (Claude) \| `{"patterns"}` (Codex) \| `{"setting","value"}`, `"file"?` -> `{"path","diff","sentence","warning","rules","added","base","type_to_confirm"?,"notes"}` |
+| POST | `/api/perms/allow` | preview's body + `"confirm":true`, `"base"?` (409 changed), `"typed"?`, `"answer"?`, `"request_key"?` -> preview + `"written","answered"?` |
+
 ## Auth, machines, peers
 
 | Method | Path | |
@@ -269,6 +280,7 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `share.created` | `share` `{"id","session_id","name","created","expires"}`; never the credential or link |
 | `share.revoked` | as above, per link revoked (not on expiry) |
 | `record.started` | `recording` (as `/record/start`, no path); `session` `null` once removed |
+| `perms.allowed` | `agent`, `file`, `path`, `rules` (as written), `tools`, `folder`, `dangerous` |
 | `record.stopped` | + `reason` `stopped` / `ended` (exit, write failure); not on hub stop or handoff |
 
 `fanout.finished`: each time a grading leaves a fan-out settled (no agent working, nothing queued):

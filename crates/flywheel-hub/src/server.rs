@@ -71,6 +71,7 @@ mod handoff_api;
 mod import_api;
 mod listen;
 mod notify_api;
+mod perms_api;
 mod plugins_api;
 mod promote_api;
 mod proxy;
@@ -374,6 +375,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/config", get(settings_api::get_config))
         .route("/api/tls", get(ca_page::status))
         .route("/api/tls/reload", post(ca_page::reload))
+        .route("/api/perms", get(perms_api::view))
+        .route("/api/perms/suggest", get(perms_api::suggest))
+        .route("/api/perms/preview", post(perms_api::preview))
+        .route("/api/perms/allow", post(perms_api::allow))
         .route("/api/plugins", get(plugins_api::list))
         .route(
             "/api/plugins/{name}",

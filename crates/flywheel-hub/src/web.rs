@@ -130,6 +130,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ("search.js", include_bytes!("../web/search.js"), JS),
     ("settings.js", include_bytes!("../web/settings.js"), JS),
     ("sharing.js", include_bytes!("../web/sharing.js"), JS),
+    ("perms.js", include_bytes!("../web/perms.js"), JS),
     ("term-view.js", include_bytes!("../web/term-view.js"), JS),
     ("viewer.js", include_bytes!("../web/viewer.js"), JS),
     ("player.js", include_bytes!("../web/player.js"), JS),
@@ -205,6 +206,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "app-search.css",
         include_bytes!("../web/app-search.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-perms.css",
+        include_bytes!("../web/app-perms.css"),
         "text/css; charset=utf-8",
     ),
     (

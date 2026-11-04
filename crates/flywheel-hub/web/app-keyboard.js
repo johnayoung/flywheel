@@ -99,6 +99,7 @@ function paletteCommands() {
   review.paletteItems(cmd);
   handoff.paletteItems(cmd);
   promptQueue.paletteItems(cmd);
+  perms.paletteItems(cmd);
   mobile.paletteItems(cmd);
   notify.paletteItems(cmd);
   for (const workspace of state.workspaces) {

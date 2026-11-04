@@ -246,8 +246,10 @@ fn info(entry: &PeerEntry) -> PeerInfo {
 /// can) through one. The refusals keep the credential itself off the
 /// token, login codes, peers, machines and the `/m/` proxy, off the file
 /// import, off this hub's plugins, settings, and config (a machine's
-/// UI is its own hub's), and off its share links and recordings (a
-/// machine's sessions are shared and recorded from that machine).
+/// UI is its own hub's), off its share links and recordings (a
+/// machine's sessions are shared and recorded from that machine), and off
+/// agent permission rules (agent-controlling config: changed only with
+/// this hub's own token or login).
 pub fn peer_forbidden(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));
@@ -263,6 +265,7 @@ pub fn peer_forbidden(path: &str) -> bool {
         || under("/api/tls")
         || under("/api/shares")
         || under("/api/recordings")
+        || under("/api/perms")
         || is_record_control(path)
         || under("/m")
         || !path.starts_with("/api")
@@ -503,6 +506,8 @@ mod tests {
             "/api/shares/abc",
             "/api/recordings",
             "/api/recordings/x.cast",
+            "/api/perms",
+            "/api/perms/allow",
             "/api/sessions/abc/record/start",
             "/api/sessions/abc/record/stop",
             "/m/b/api/sessions",

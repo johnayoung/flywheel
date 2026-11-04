@@ -66,6 +66,7 @@ Read with `fw docs <topic>`; the anchor is the section.
 | API | REST + terminal and events WebSockets | [hub-api](hub/api.md) |
 | Prompt queue | prompts typed in once the agent is done | [hub-workflows](hub/workflows.md#prompt-queue) |
 | Activity | timeline, "while you were away" | [hub-workflows](hub/workflows.md#activity) |
+| Permissions | rules per folder, "Always allow", suggestions | [hub-workflows](hub/workflows.md#permissions) |
 
 ## Verbs
 
@@ -78,6 +79,6 @@ Full syntax, flags, and files: [hub-reference](hub/reference.md). `fw hub <verb>
 | Sessions | `ls` `new` `send` `read` `wait` `attach` `kill` `relaunch` `explain` `import` `template` `queue` |
 | Agent output | `commands` `search` `activity` `record` |
 | Git and agents together | `review` `merge` `handoff` `ask-review` `fanout` |
-| Settings | `config` `plugin` |
+| Settings | `config` `plugin` `perms` |
 | Hooks | `report` (agent status hooks) |
 

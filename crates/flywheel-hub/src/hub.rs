@@ -494,6 +494,8 @@ pub struct Hub {
     queue: crate::queue::QueueRuntime,
     /// The activity journal and each client's presence.
     activity: crate::activity::Activity,
+    /// Pending permission requests and their journal (`crate::perms`).
+    perms: crate::perms::Runtime,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -561,6 +563,14 @@ impl Hub {
             queue_typing_quiet: options.queue_typing_quiet,
         };
         let record_limits = options.record_limits;
+        let perms_env = crate::perms::Env::new(
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/")),
+            options.claude_config_dir.clone(),
+            options.codex_home.clone(),
+        );
         Ok(Arc::new(Self {
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),
@@ -594,6 +604,7 @@ impl Hub {
             )),
             queue: crate::queue::QueueRuntime::default(),
             activity: crate::activity::Activity::open(&options_state_dir),
+            perms: crate::perms::Runtime::new(&options_state_dir, perms_env),
             _serve_lock: serve_lock,
         }))
     }
@@ -778,6 +789,11 @@ impl Hub {
 
     pub fn state_dir(&self) -> &std::path::Path {
         &self.options.state_dir
+    }
+
+    /// Agent permission rules: pending requests and their journal.
+    pub(crate) fn perms(&self) -> &crate::perms::Runtime {
+        &self.perms
     }
 
     /// The default root the import picker searches.

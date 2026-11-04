@@ -78,6 +78,7 @@ pub const EVENTS: &[&str] = &[
     "record.stopped",
     "queue.delivered",
     "queue.stalled",
+    "perms.allowed",
 ];
 const STATUSES: &[&str] = &["working", "blocked", "done", "idle", "unknown"];
 const KINDS: &[&str] = &["shell", "claude", "codex"];

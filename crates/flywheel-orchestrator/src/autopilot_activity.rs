@@ -38,12 +38,54 @@ pub const ACTIVITY_SCHEMA_VERSION: u64 = 1;
 pub const PHASE_STARTING: &str = "starting";
 pub const PHASE_RUNNING: &str = "running";
 pub const PHASE_IDLE: &str = "idle";
+/// Held between cycles by the operator's pause marker
+/// ([`pause_marker_path`]): no discovery, no authoring, no emit; the
+/// record stays fresh so the daemon still reads live.
+pub const PHASE_PAUSED: &str = "paused";
+/// Written once on a graceful exit with an already-lapsed deadline, so a
+/// stopped daemon reads not-live at once instead of after its grace.
+pub const PHASE_STOPPED: &str = "stopped";
+
+/// The most dropped findings a record keeps (the first ones of the cycle).
+pub const MAX_DROPPED_SUMMARIES: usize = 20;
+/// A dropped finding's reason is cut past this many characters.
+pub const MAX_DROPPED_REASON_CHARS: usize = 300;
 
 /// One emitted task's id and tier, for the status line's breakdown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmittedSummary {
     pub task_id: String,
     pub tier: u8,
+}
+
+/// One finding the last cycle could not compile into a task, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroppedSummary {
+    pub finding_id: String,
+    pub tier: u8,
+    pub title: String,
+    pub reason: String,
+}
+
+impl DroppedSummary {
+    /// `reason` cut to [`MAX_DROPPED_REASON_CHARS`] characters.
+    pub fn new(finding_id: &str, tier: u8, title: &str, reason: &str) -> Self {
+        let cut = |text: &str| -> String {
+            if text.chars().count() <= MAX_DROPPED_REASON_CHARS {
+                text.to_owned()
+            } else {
+                let mut kept: String = text.chars().take(MAX_DROPPED_REASON_CHARS).collect();
+                kept.push_str("...");
+                kept
+            }
+        };
+        Self {
+            finding_id: finding_id.to_owned(),
+            tier,
+            title: cut(title),
+            reason: cut(reason),
+        }
+    }
 }
 
 /// What the autopilot daemon is doing right now, for the status surface.
@@ -91,6 +133,10 @@ pub struct AutopilotActivity {
     /// `partial (...)`, `disabled (...)`, `not consulted`).
     #[serde(default)]
     pub last_discovery_cache: String,
+    /// The last cycle's dropped findings with their reasons (at most
+    /// [`MAX_DROPPED_SUMMARIES`]; `last_dropped` is the full count).
+    #[serde(default)]
+    pub last_dropped_findings: Vec<DroppedSummary>,
 }
 
 impl AutopilotActivity {
@@ -117,6 +163,7 @@ impl AutopilotActivity {
             last_emitted_tasks: Vec::new(),
             last_prefiltered_tiers: Vec::new(),
             last_discovery_cache: String::new(),
+            last_dropped_findings: Vec::new(),
         }
     }
 }
@@ -138,6 +185,7 @@ fn to_value(activity: &AutopilotActivity) -> Value {
         "last_emitted_tasks": activity.last_emitted_tasks,
         "last_prefiltered_tiers": activity.last_prefiltered_tiers,
         "last_discovery_cache": activity.last_discovery_cache,
+        "last_dropped_findings": activity.last_dropped_findings,
     })
 }
 
@@ -215,6 +263,35 @@ fn from_value(data: &Value) -> Option<AutopilotActivity> {
         }
     }
 
+    let mut dropped = Vec::new();
+    if let Some(Value::Array(raw_dropped)) = data.get("last_dropped_findings") {
+        for entry in raw_dropped {
+            let Value::Object(entry) = entry else {
+                continue;
+            };
+            let (Some(finding_id), Some(tier)) =
+                (as_text(entry.get("finding_id")), as_int(entry.get("tier")))
+            else {
+                continue;
+            };
+            let Ok(tier) = u8::try_from(tier) else {
+                continue;
+            };
+            let text = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(|v| as_text(Some(v)))
+                    .unwrap_or_default()
+            };
+            dropped.push(DroppedSummary {
+                finding_id,
+                tier,
+                title: text("title"),
+                reason: text("reason"),
+            });
+        }
+    }
+
     let tier_list = |key: &str| -> Vec<u8> {
         match data.get(key) {
             Some(Value::Array(raw_tiers)) => raw_tiers
@@ -247,6 +324,7 @@ fn from_value(data: &Value) -> Option<AutopilotActivity> {
             .get("last_discovery_cache")
             .and_then(|v| as_text(Some(v)))
             .unwrap_or_default(),
+        last_dropped_findings: dropped,
     })
 }
 
@@ -302,6 +380,45 @@ pub fn is_record_live(activity: Option<&AutopilotActivity>, now: f64) -> bool {
         .is_some_and(|expires_at| expires_at > now)
 }
 
+/// The operator's pause marker for the daemon whose activity record is
+/// `activity_path`: `<activity_path>.paused`. While it exists the daemon
+/// runs no refill pass (see `autopilot_run`); removing it resumes.
+pub fn pause_marker_path(activity_path: &Path) -> std::path::PathBuf {
+    let mut name = activity_path.as_os_str().to_owned();
+    name.push(".paused");
+    std::path::PathBuf::from(name)
+}
+
+/// Whether the daemon recording to `activity_path` is held by its pause
+/// marker.
+pub fn is_paused(activity_path: &Path) -> bool {
+    pause_marker_path(activity_path).is_file()
+}
+
+/// Pause (`true`: write the marker) or resume (`false`: remove it) the
+/// daemon recording to `activity_path`. Returns whether anything changed.
+/// Takes effect at the daemon's next cycle boundary: a running pass
+/// finishes first.
+pub fn set_paused(activity_path: &Path, paused: bool) -> std::io::Result<bool> {
+    let marker = pause_marker_path(activity_path);
+    if paused {
+        if marker.is_file() {
+            return Ok(false);
+        }
+        if let Some(parent) = marker.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&marker, format!("paused at {}\n", epoch_now()))?;
+        Ok(true)
+    } else {
+        match std::fs::remove_file(&marker) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+}
+
 /// The shared machine clock, in epoch seconds.
 pub fn epoch_now() -> f64 {
     SystemTime::now()
@@ -354,7 +471,37 @@ mod tests {
             ],
             last_prefiltered_tiers: vec![1],
             last_discovery_cache: "hit".to_owned(),
+            last_dropped_findings: vec![DroppedSummary::new(
+                "t10-readme",
+                10,
+                "Document the CLI",
+                "no out-of-band grader",
+            )],
         }
+    }
+
+    #[test]
+    fn the_pause_marker_sits_beside_the_record_and_toggles_idempotently() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("logs/activity.json");
+        assert_eq!(
+            pause_marker_path(&path),
+            tmp.path().join("logs/activity.json.paused")
+        );
+        assert!(!is_paused(&path));
+        assert!(set_paused(&path, true).unwrap());
+        assert!(is_paused(&path));
+        assert!(!set_paused(&path, true).unwrap());
+        assert!(set_paused(&path, false).unwrap());
+        assert!(!is_paused(&path));
+        assert!(!set_paused(&path, false).unwrap());
+    }
+
+    #[test]
+    fn a_long_dropped_reason_is_cut() {
+        let long = "x".repeat(MAX_DROPPED_REASON_CHARS + 50);
+        let summary = DroppedSummary::new("f", 7, "t", &long);
+        assert_eq!(summary.reason.chars().count(), MAX_DROPPED_REASON_CHARS + 3);
     }
 
     // --- on-disk round-trip ----------------------------------------------------------

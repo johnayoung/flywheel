@@ -734,6 +734,43 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
                 .with("url", str_at(payload, "/pr/url"))
                 .with("branch", branch)
         }
+        "autopilot.started"
+        | "autopilot.stopped"
+        | "autopilot.decision"
+        | "autopilot.approval_needed" => {
+            let name = str_at(payload, "/name").unwrap_or("a folder");
+            let row = |text: String| Draft::new(event, text).with("folder", name);
+            match event {
+                "autopilot.started" => row(format!("autopilot started in {name}"))
+                    .with("pid", payload.get("pid").cloned()),
+                "autopilot.stopped" => row(format!("autopilot stopped in {name}"))
+                    .with("state", str_at(payload, "/state")),
+                "autopilot.decision" => {
+                    let emitted = payload.get("emitted").and_then(Value::as_i64).unwrap_or(0);
+                    let dropped = payload.get("dropped").and_then(Value::as_i64).unwrap_or(0);
+                    let reason = str_at(payload, "/reason").unwrap_or("");
+                    row(format!(
+                        "autopilot in {name}: emitted {emitted}, dropped {dropped}{}",
+                        if reason.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" -- {reason}")
+                        }
+                    ))
+                    .with("cycle", payload.get("cycle").cloned())
+                    .with("emitted", emitted)
+                    .with("dropped", dropped)
+                }
+                _ => {
+                    let task = str_at(payload, "/task_id").unwrap_or("a task");
+                    row(format!(
+                        "autopilot task {task} in {name} awaits your approval"
+                    ))
+                    .with("task_id", task)
+                    .with("run_id", str_at(payload, "/run_id"))
+                }
+            }
+        }
         "record.started" => draft("started recording".to_owned())
             .with_id("recording", str_at(payload, "/recording/name")),
         "record.stopped" => draft("stopped recording".to_owned())

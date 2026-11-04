@@ -166,8 +166,43 @@ window.FwHubNotify = function (ctx) {
     if (typeof sessionId === "string" && sessionById(sessionId)) openSession(sessionId);
   }
 
+  // Autopilot work in `folder` newly waits on a manual gate: a
+  // notification that opens its Flywheel panel (where approve / deny are).
+  async function gate(folder, label, count) {
+    if (!isOn() || looking()) return;
+    const key = `gate:${folder}`;
+    if ((recent.get(key) || 0) + DEBOUNCE_MS > Date.now()) return;
+    recent.set(key, Date.now());
+    const title = `Autopilot in ${label} needs approval`;
+    const options = {
+      body: `${count} task${count === 1 ? "" : "s"} it emitted wait${count === 1 ? "s" : ""} on a manual gate: approve or deny in its Flywheel panel.`,
+      tag: `fw-hub-gate-${label}`,
+      renotify: true,
+      icon: "/assets/icon-192.png",
+      data: { folder },
+      requireInteraction: true,
+    };
+    try {
+      const registration = await pwa.register();
+      if (registration && registration.showNotification) {
+        await registration.showNotification(title, options);
+        return;
+      }
+      const note = new Notification(title, options);
+      note.onclick = () => {
+        window.focus();
+        note.close();
+        ctx.openFolder(folder);
+      };
+    } catch (_) {
+      // A browser that refuses this one: the Needs-you list still has it.
+    }
+  }
+
   pwa.onMessage((data) => {
-    if (data.type === "fw-hub-open") open(data.session);
+    if (data.type !== "fw-hub-open") return;
+    if (typeof data.folder === "string" && ctx.openFolder) ctx.openFolder(data.folder);
+    else open(data.session);
   });
 
   async function loadPush() {
@@ -203,5 +238,5 @@ window.FwHubNotify = function (ctx) {
   renderChip();
   loadPush();
 
-  return { onStatus, alert, toggle, paletteItems, isOn, renderChip };
+  return { onStatus, alert, gate, toggle, paletteItems, isOn, renderChip };
 };

@@ -43,13 +43,16 @@ use flywheel_core::audit::run_file_path;
 use flywheel_core::lifecycle::{Lifecycle, Status};
 use flywheel_core::store::{HarnessStore, LifecycleFilter};
 use flywheel_core::store_memory::InMemoryStore;
+use flywheel_hub::autopilot::{GateDecided, GateDecision, GateRefused};
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome, LiveRun, Note,
     PanelClaim, PanelPhase, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight, WorkerScope,
 };
 use flywheel_hub::util::path_identity as file_identity;
-use flywheel_orchestrator::autopilot_activity::{epoch_now, is_record_live, read_activity};
+use flywheel_orchestrator::autopilot_activity::{
+    PHASE_STOPPED, epoch_now, is_paused, is_record_live, read_activity, set_paused,
+};
 use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore};
 use flywheel_orchestrator::pg_preflight::dsn_target;
 use flywheel_orchestrator::policy::{
@@ -771,19 +774,23 @@ fn claims_and_worker(
     Ok((rows, worker))
 }
 
-fn autopilot_state(root: &Path) -> DaemonState {
-    let Some(activity) = read_activity(Some(&root.join(AUTOPILOT_ACTIVITY))) else {
+/// The daemon's liveness for the panel's row; `running`: its pid still
+/// runs (false once the intake read found it gone).
+fn autopilot_state(root: &Path, running: bool) -> DaemonState {
+    let path = root.join(AUTOPILOT_ACTIVITY);
+    let Some(activity) = read_activity(Some(&path)) else {
         return DaemonState {
             live: false,
             detail: "no activity record (not running here)".into(),
         };
     };
     let now = epoch_now();
-    if is_record_live(Some(&activity), now) {
+    let held = if is_paused(&path) { ", paused" } else { "" };
+    if running && activity.phase != PHASE_STOPPED && is_record_live(Some(&activity), now) {
         DaemonState {
             live: true,
             detail: format!(
-                "pid {}, {} (cycle {})",
+                "pid {}, {} (cycle {}){held}",
                 activity.pid, activity.phase, activity.cycle_index
             ),
         }
@@ -792,7 +799,7 @@ fn autopilot_state(root: &Path) -> DaemonState {
         DaemonState {
             live: false,
             detail: format!(
-                "stopped (last seen {} ago, pid {})",
+                "stopped (last seen {} ago, pid {}){held}",
                 human_seconds(ago),
                 activity.pid
             ),
@@ -920,7 +927,7 @@ impl FlywheelProvider for HubFlywheel {
     fn panel(&self, folder: &Path) -> FlywheelPanel {
         let now = Utc::now();
         let mut panel = FlywheelPanel::empty(folder.to_path_buf(), now);
-        panel.autopilot = autopilot_state(folder);
+        panel.autopilot = autopilot_state(folder, true);
         let state = self.folder(folder);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
         panel.worktree_of = state.worktree_of(folder);
@@ -955,6 +962,8 @@ impl FlywheelProvider for HubFlywheel {
                     )
                 }
             };
+        let policy = resolved.policy.clone();
+        let tasks_dir = resolved.tasks_dir.clone();
         let items = match &resolved.source {
             Some(source) => match source.list_work() {
                 Ok(items) => items,
@@ -993,6 +1002,19 @@ impl FlywheelProvider for HubFlywheel {
             }
             Err(message) => problems.push(message),
         }
+        let intake = crate::hub_autopilot::read_view(
+            folder,
+            policy.as_ref(),
+            tasks_dir.as_deref(),
+            core.as_ref(),
+            &panel,
+        );
+        // The record lapses with time, but a daemon that died (or was
+        // stopped) on this machine is gone now: the panel says so at once.
+        if panel.autopilot.live && !intake.live {
+            panel.autopilot = autopilot_state(folder, false);
+        }
+        panel.intake = Some(intake);
         if problems.len() > opened {
             // A store read failed (a restarted database, a dropped
             // connection): reopen on the next read rather than keep a dead
@@ -1098,6 +1120,43 @@ impl FlywheelProvider for HubFlywheel {
 
     fn task_seed(&self, folder: &Path, task_id: &str) -> Result<TaskSeed, String> {
         crate::hub_tasks::task_seed(self, folder, task_id)
+    }
+
+    fn autopilot_command(&self, _folder: &Path) -> Vec<String> {
+        vec![
+            self.program.to_string_lossy().into_owned(),
+            "autopilot".to_owned(),
+        ]
+    }
+
+    fn set_autopilot_paused(&self, folder: &Path, paused: bool) -> Result<bool, String> {
+        set_paused(&folder.join(AUTOPILOT_ACTIVITY), paused).map_err(|e| {
+            format!(
+                "cannot {} autopilot in {}: {e}",
+                if paused { "pause" } else { "resume" },
+                folder.display()
+            )
+        })
+    }
+
+    fn decide_gate(
+        &self,
+        folder: &Path,
+        decision: &GateDecision,
+    ) -> Result<GateDecided, GateRefused> {
+        let state = self.folder(folder);
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let resolved = state.resolve(folder).map_err(GateRefused::Store)?;
+        let core = match resolved.stores(folder).map_err(GateRefused::Store)? {
+            Some(bundle) => Arc::clone(&bundle.core),
+            None => {
+                return Err(GateRefused::UnknownRun(
+                    "this repo has no store yet: no runs were recorded".into(),
+                ));
+            }
+        };
+        drop(state);
+        crate::hub_autopilot::decide(core.as_ref(), decision)
     }
 }
 

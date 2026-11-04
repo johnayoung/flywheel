@@ -4,8 +4,8 @@
 // autopilot liveness, claims, and the stop / strand alerts -- read-only,
 // beside the terminals. Actions: start `fw worker` in a hub shell session
 // there (the whole queue, or one task: `fw worker --task ID`, which runs
-// only it and exits once it settles), and open a run's output (its `fw show` summary and redacted
-// agent transcript). app-base.js creates it with its helpers; protocol:
+// only it and exits once it settles), open a run's output (its `fw show` summary and redacted
+// agent transcript), and drive autopilot (autopilot.js). app-base.js creates it with its helpers; protocol:
 // GET /api/flywheel, /api/flywheel/panel, /api/flywheel/run, POST
 // /api/flywheel/worker, and the events socket's {"type":"flywheel"} and
 // {"type":"flywheel_reset"} pushes. Another machine's folders
@@ -102,8 +102,14 @@ window.FwHubFlywheel = function (ctx) {
     const key = keyOf(machine, message.folder);
     if (message.summary) {
       const kept = keyed(machine, message.summary);
+      const before = ui.summaries.get(key);
       ui.summaries.set(key, kept);
       prune(key, kept);
+      // Autopilot work newly waiting on a gate: this device hears it
+      // (notify.js decides whether to show it).
+      if (before && (kept.autopilot_gates || 0) > (before.autopilot_gates || 0) && ctx.notifyGate) {
+        ctx.notifyGate(key, labelFor(key), kept.autopilot_gates);
+      }
     } else {
       ui.summaries.delete(key);
     }
@@ -508,6 +514,19 @@ window.FwHubFlywheel = function (ctx) {
     return { status: response.status, ok: response.ok, data };
   }
 
+  // Autopilot's row, section, and gate actions (autopilot.js).
+  const pilot = window.FwHubAutopilot({
+    el, icon, state, toast, confirmDialog, openSession, post,
+    ago, span,
+    pathOf, machineOfKey, labelFor, workspaceFor,
+    section, outputButton,
+    termSize: () => (ctx.termSize ? ctx.termSize() : {}),
+    refresh: () => ctx.refresh(),
+    close: () => close(),
+    reload: () => loadPanel(),
+    render: () => renderDrawer(),
+  });
+
   // A panel task's prerequisites not verified yet (one the panel does not
   // list is archived, so done).
   // The prerequisites a scoped run would pull in, transitively: the ones
@@ -811,7 +830,12 @@ window.FwHubFlywheel = function (ctx) {
         el("b", { textContent: alert.subject }),
         el("small", { textContent: alert.detail, title: alert.detail }),
       ),
-      outputButton(alert.run_id, alert.subject),
+      el(
+        "span",
+        { className: "fw-task-meta" },
+        ui.panel ? pilot.alertActions(ui.folder, ui.panel, alert) : null,
+        outputButton(alert.run_id, alert.subject),
+      ),
     );
   }
 
@@ -878,7 +902,7 @@ window.FwHubFlywheel = function (ctx) {
         "div",
         { className: "fw-daemons" },
         daemonRow("worker", panel.worker, el("span", { className: "fw-daemon-actions" }, goto, start)),
-        daemonRow("autopilot", panel.autopilot),
+        panel.intake ? pilot.row(folder, panel, daemonRow) : daemonRow("autopilot", panel.autopilot),
         el("div", { className: "fw-where" }, el("span", { textContent: panel.source }), el("span", { textContent: panel.store })),
       ),
     ];
@@ -887,6 +911,8 @@ window.FwHubFlywheel = function (ctx) {
     if (note) children.push(el("p", { className: "fw-note", textContent: note }));
     if (panel.problem) children.push(el("p", { className: "fw-problem", textContent: panel.problem }));
     if (panel.alerts.length) children.push(alertsSection(folder, panel.alerts));
+    const autopilot = pilot.section(folder, panel);
+    if (autopilot) children.push(autopilot);
     if (panel.live.length) {
       children.push(section("In flight", panel.live.length, el("ul", { className: "fw-list" }, panel.live.map(liveRow))));
     }

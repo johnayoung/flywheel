@@ -107,12 +107,14 @@ fn walk<'a>(cmd: &'a clap::Command, path: &str, out: &mut Vec<(String, &'a clap:
 }
 
 /// A verb is documented by its own line unless it only groups others
-/// (`fw hub fanout`), i.e. has subcommands and nothing of its own.
+/// (`fw hub fanout`), i.e. has subcommands and no flag of its own (an
+/// operand before the action, `fw hub autopilot FOLDER status`, is part
+/// of each action's line).
 fn needs_entry(cmd: &clap::Command) -> bool {
     cmd.get_subcommands().next().is_none()
-        || cmd
-            .get_arguments()
-            .any(|arg| !arg.is_hide_set() && arg.get_id().as_str() != "help")
+        || cmd.get_arguments().any(|arg| {
+            !arg.is_hide_set() && !arg.is_positional() && arg.get_id().as_str() != "help"
+        })
 }
 
 /// Every `--flag` named in `text`.
@@ -165,6 +167,13 @@ fn entries(text: &str, tree: &clap::Command) -> Vec<(String, String)> {
                     Some(sub) if token != "help" => {
                         path.push(token);
                         cmd = sub;
+                    }
+                    // A positional before the action (`fw hub autopilot
+                    // FOLDER status`): the path goes on after it.
+                    _ if cmd.has_subcommands()
+                        && token.bytes().all(|b| b.is_ascii_uppercase() || b == b'_') =>
+                    {
+                        continue;
                     }
                     _ => break,
                 }

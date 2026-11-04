@@ -132,6 +132,18 @@ fw hub queue pause SESSION [--json] {where}
 fw hub queue resume SESSION [--json] {where}
 ```
 
+A flywheel folder's autopilot (asks before `start`, `approve`, `deny`; `--yes` skips):
+
+```bash
+fw hub autopilot FOLDER status [--json] {where}
+fw hub autopilot FOLDER start [--workspace ID] [--yes|-y] [--json] {where}
+fw hub autopilot FOLDER stop [--json] {where}  # Ctrl-C to this session
+fw hub autopilot FOLDER pause [--json] {where}  # fw autopilot --pause
+fw hub autopilot FOLDER resume [--json] {where}
+fw hub autopilot FOLDER approve RUN [--gate N] [--attempt N] [--yes] [--json] {where}
+fw hub autopilot FOLDER deny RUN [--feedback TEXT] [--gate N] [--attempt N] [--yes] [--json] {where}
+```
+
 ### Verb notes
 
 | Verb | |

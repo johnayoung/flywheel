@@ -86,12 +86,14 @@ self.addEventListener("notificationclick", (event) => {
   event.notification.close();
   const data = event.notification.data || {};
   const session = typeof data.session === "string" && /^[0-9a-f]+$/.test(data.session) ? data.session : null;
+  // An autopilot gate's notification opens its folder's Flywheel panel.
+  const folder = typeof data.folder === "string" ? data.folder : null;
   event.waitUntil((async () => {
     const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     for (const client of windows) {
       if (new URL(client.url).origin !== self.location.origin) continue;
       await client.focus();
-      client.postMessage({ type: "fw-hub-open", session });
+      client.postMessage({ type: "fw-hub-open", session, folder });
       return;
     }
     await self.clients.openWindow(session ? `/#session=${session}` : "/");

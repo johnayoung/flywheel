@@ -13,7 +13,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Daemons | `fw worker` / `autopilot` / `triage` | Drain the queue (worker), keep it full (autopilot), or triage the intake board (triage) |
 | Audit | `fw audit RUN_ID` | Stream the totally-ordered telemetry for one run |
 | Setup | `fw init` | Scaffold `.flywheel/` and a `flywheel.toml` work policy |
-| Hub | `fw hub` server: `start` / `stop` / `upgrade` / `status` / `logs` / `serve` / `install-service` / `doctor`; access: `open` / `url` / `token` / `tls` / `peer` / `machine` / `share`; sessions: `ls` / `new` / `send` / `read` / `wait` / `attach` / `kill` / `relaunch` / `explain` / `import` / `template` / `queue`; output: `commands` / `search` / `activity` / `record`; git: `review` / `merge` / `pr` / `handoff` / `ask-review` / `fanout`; settings: `config` / `plugin` / `perms`; hooks only: `report` | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
+| Hub | `fw hub` server: `start` / `stop` / `upgrade` / `status` / `logs` / `serve` / `install-service` / `doctor`; access: `open` / `url` / `token` / `tls` / `peer` / `machine` / `share`; sessions: `ls` / `new` / `send` / `read` / `wait` / `attach` / `kill` / `relaunch` / `explain` / `import` / `template` / `queue`; output: `commands` / `search` / `activity` / `record`; git: `review` / `merge` / `pr` / `handoff` / `ask-review` / `fanout` / `autopilot`; settings: `config` / `plugin` / `perms`; hooks only: `report` | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
 | One-shot | `fw exec [PROMPT]` | Run one agent call from any project: no tasks, store, worktree, or config |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.
@@ -142,6 +142,7 @@ Keeps the work queue full with verifiable, tier-prioritized tasks. Delegated to 
 | `--tasks-dir`, `--model` | standard inputs |
 | `--target-depth N` | fill the queue to depth N (overrides `[autopilot]` config; default 5) |
 | `--interval SECONDS` | daemon cycle interval (overrides config; default 300.0) |
+| `--pause` / `--resume` | write / remove `<activity file>.paused` and exit: a running daemon holds between cycles (phase `paused`, still live) until resumed |
 
 Landing strategy and scoring weights come from policy (`autopilot_landing` default `merge`, `autopilot_weights`). See [autopilot.md](autopilot.md) for the tier and scoring model.
 

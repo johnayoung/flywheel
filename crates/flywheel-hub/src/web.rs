@@ -94,6 +94,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         JS,
     ),
     ("attention.js", include_bytes!("../web/attention.js"), JS),
+    ("autopilot.js", include_bytes!("../web/autopilot.js"), JS),
     ("flywheel.js", include_bytes!("../web/flywheel.js"), JS),
     ("fanout.js", include_bytes!("../web/fanout.js"), JS),
     (
@@ -226,6 +227,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "app-pr.css",
         include_bytes!("../web/app-pr.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-autopilot.css",
+        include_bytes!("../web/app-autopilot.css"),
         "text/css; charset=utf-8",
     ),
     (
@@ -766,6 +772,10 @@ mod tests {
         // The service worker keeps at most 96 of the shell's URLs.
         let shell = INDEX_HTML.matches("=\"/assets/").count();
         assert!(shell <= 96, "{shell} shell assets");
+        assert!(
+            SERVICE_WORKER.contains("data.urls.slice(0, 96)"),
+            "the service worker's bound moved: keep this test's in step"
+        );
     }
 
     /// The names a classic script declares at its top level (column 0):

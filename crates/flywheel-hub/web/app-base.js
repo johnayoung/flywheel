@@ -395,6 +395,9 @@ const flywheel = window.FwHubFlywheel({
   focusTerminal: () => focusTerminal(),
   // "Fan out this task" (fanout-task.js, below).
   fanOutTask: (folder, workspaceId, taskId) => fanoutTask.fanOutTask(folder, workspaceId, taskId),
+  termSize: () => sizeHint(),
+  // Autopilot work newly waiting on a gate (notify.js, below).
+  notifyGate: (folder, label, count) => notify.gate(folder, label, count),
 });
 
 // Verified fan-outs (fanout.js): one prompt to several agents in
@@ -456,6 +459,7 @@ const attention = window.FwHubAttention({
 const notify = window.FwHubNotify({
   $, state, store, prefs: settings, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,
   openSession: (id) => openSession(id),
+  openFolder: (folder) => flywheel.open(folder),
   present: () => present(),
 });
 // Sibling worktrees (worktree.js): the new-session fields, row badges,

@@ -20,6 +20,7 @@
 //! Changes reach browsers as `{"type":"flywheel"}` messages on
 //! `/api/events`.
 
+use crate::autopilot::{AutopilotView, GateDecided, GateDecision, GateRefused};
 use crate::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use crate::hub::{Hub, SessionView};
 use chrono::{DateTime, Utc};
@@ -242,6 +243,10 @@ pub struct FlywheelPanel {
     pub autopilot: DaemonState,
     pub claims: Vec<PanelClaim>,
     pub alerts: Vec<Alert>,
+    /// The autopilot's intake (see [`crate::autopilot`]); absent from a
+    /// hub that predates it.
+    #[serde(default)]
+    pub intake: Option<AutopilotView>,
 }
 
 impl FlywheelPanel {
@@ -268,6 +273,7 @@ impl FlywheelPanel {
             },
             claims: Vec::new(),
             alerts: Vec::new(),
+            intake: None,
         }
     }
 
@@ -287,6 +293,11 @@ impl FlywheelPanel {
             live_runs: self.live.len(),
             worker_live: self.worker.live,
             autopilot_live: self.autopilot.live,
+            autopilot_paused: self.intake.as_ref().is_some_and(|i| i.paused),
+            autopilot_gates: self
+                .intake
+                .as_ref()
+                .map_or(0, |i| i.autopilot_gates().count()),
             problem: self.problem.clone(),
             worktree_of: self.worktree_of.clone(),
         }
@@ -321,6 +332,12 @@ pub struct FlywheelSummary {
     pub live_runs: usize,
     pub worker_live: bool,
     pub autopilot_live: bool,
+    /// Its pause marker is set.
+    #[serde(default)]
+    pub autopilot_paused: bool,
+    /// Manual gates parked on work autopilot emitted.
+    #[serde(default)]
+    pub autopilot_gates: usize,
     pub problem: Option<String>,
     /// See [`FlywheelPanel::worktree_of`].
     #[serde(default)]
@@ -409,6 +426,23 @@ pub trait FlywheelProvider: Send + Sync + 'static {
     /// seed, with its held-out graders (failing closed: a configured
     /// held-out registry that cannot be read is an error, never "none").
     fn task_seed(&self, folder: &Path, task_id: &str) -> Result<TaskSeed, String>;
+
+    /// The argv that runs the autopilot daemon for `folder` (run there),
+    /// e.g. `[/path/to/fw, autopilot]`: never `--once`.
+    fn autopilot_command(&self, folder: &Path) -> Vec<String>;
+
+    /// Pause (`true`) or resume `folder`'s autopilot as `fw autopilot
+    /// --pause` / `--resume` do; whether anything changed.
+    fn set_autopilot_paused(&self, folder: &Path, paused: bool) -> Result<bool, String>;
+
+    /// Enqueue `decision` on its run's parked manual gate as `fw approve`
+    /// / `fw reject` do (bound to the gate parked now, refused when the
+    /// pinned gate or attempt is not that one).
+    fn decide_gate(
+        &self,
+        folder: &Path,
+        decision: &GateDecision,
+    ) -> Result<GateDecided, GateRefused>;
 }
 
 /// What a browser hears about a folder.
@@ -635,7 +669,7 @@ impl FlywheelMonitor {
                 .into_iter()
                 .filter(|f| self.provider.adopted(f))
                 .collect();
-            self.reconcile(&adopted);
+            self.reconcile(&adopted, &hub);
             std::thread::sleep(self.timing.poll);
         }
         let slots: Vec<Arc<FolderSlot>> = self.folders().drain().map(|(_, s)| s).collect();
@@ -647,7 +681,7 @@ impl FlywheelMonitor {
 
     /// Watch exactly `adopted`: start watchers for new folders, stop (and
     /// announce) the ones that left.
-    fn reconcile(self: &Arc<Self>, adopted: &BTreeSet<PathBuf>) {
+    fn reconcile(self: &Arc<Self>, adopted: &BTreeSet<PathBuf>, hub: &Weak<Hub>) {
         let mut added = Vec::new();
         {
             // Removals are announced under the map lock: a watcher sends
@@ -674,9 +708,10 @@ impl FlywheelMonitor {
         for (path, slot) in added {
             let monitor = Arc::clone(self);
             let watched = path.clone();
+            let hub = hub.clone();
             let spawned = std::thread::Builder::new()
                 .name("fw-hub-flywheel-folder".into())
-                .spawn(move || monitor.watch_folder(&watched, &slot));
+                .spawn(move || monitor.watch_folder(&watched, &slot, &hub));
             if spawned.is_err() {
                 // Out of threads: try again on the next tick.
                 self.folders().remove(&path);
@@ -684,7 +719,7 @@ impl FlywheelMonitor {
         }
     }
 
-    fn watch_folder(&self, folder: &Path, slot: &FolderSlot) {
+    fn watch_folder(&self, folder: &Path, slot: &FolderSlot, hub: &Weak<Hub>) {
         let mut last_print: Option<u64> = None;
         let mut last_read: Option<Instant> = None;
         let mut forced = false;
@@ -698,13 +733,21 @@ impl FlywheelMonitor {
                 if slot.stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let changed = {
+                let (changed, events) = {
                     let mut current = slot.panel.lock().unwrap_or_else(PoisonError::into_inner);
                     let changed = current.as_ref().is_none_or(|old| !old.same_content(&panel));
+                    let events = crate::autopilot::events_between(current.as_deref(), &panel);
                     let summary = panel.summary();
                     *current = Some(Arc::new(panel));
-                    changed.then_some(summary)
+                    (changed.then_some(summary), events)
                 };
+                if !events.is_empty()
+                    && let Some(hub) = hub.upgrade()
+                {
+                    for (event, payload) in events {
+                        hub.emit_lifecycle(event, payload);
+                    }
+                }
                 if let Some(summary) = changed {
                     let folders = self.folders();
                     if slot.stop.load(Ordering::SeqCst) {
@@ -735,20 +778,30 @@ impl FlywheelMonitor {
 /// is exec'd with [`WORKER_EXIT_ENV`] set to the worker's exit status, so
 /// the hub can read how it ended from the process (see [`worker_run`]).
 pub fn worker_session_command(worker: &[String]) -> Vec<String> {
-    let script = "trap : INT QUIT; \"$@\"; status=$?; printf '\\n[fw worker exited with status %s]\\n' \"$status\"; \
-                  FLYWHEEL_WORKER_EXIT=$status exec \"${SHELL:-/bin/sh}\"";
-    let mut argv = vec![
+    daemon_session_command(WORKER_MARKER, "fw worker", worker)
+}
+
+/// [`worker_session_command`] for any daemon verb: `marker` names it in
+/// the wrapper's argv, `label` in its last words.
+pub(crate) fn daemon_session_command(marker: &str, label: &str, argv: &[String]) -> Vec<String> {
+    let script = format!(
+        "trap : INT QUIT; \"$@\"; status=$?; printf '\\n[{label} exited with status %s]\\n' \"$status\"; \
+         FLYWHEEL_WORKER_EXIT=$status exec \"${{SHELL:-/bin/sh}}\""
+    );
+    let mut command = vec![
         "/bin/sh".to_owned(),
         "-c".to_owned(),
-        script.to_owned(),
-        WORKER_MARKER.to_owned(),
+        script,
+        marker.to_owned(),
     ];
-    argv.extend(worker.iter().cloned());
-    argv
+    command.extend(argv.iter().cloned());
+    command
 }
 
 /// The marker argv[0] of `$@` in [`worker_session_command`]'s script.
 pub const WORKER_MARKER: &str = "fw-worker";
+/// The same for an autopilot session (`crate::autopilot`).
+pub const AUTOPILOT_MARKER: &str = "fw-autopilot";
 /// The variable the shell a finished worker leaves behind carries its
 /// exit status in.
 pub const WORKER_EXIT_ENV: &str = "FLYWHEEL_WORKER_EXIT";
@@ -756,7 +809,7 @@ pub const WORKER_EXIT_ENV: &str = "FLYWHEEL_WORKER_EXIT";
 /// How a "Start worker here" / "Run <id>" session's worker stands: still
 /// running, or exited (with its status when the platform shows it). The
 /// panel counts only running ones; the sidebar shows how a finished one
-/// ended instead of `live`.
+/// ended instead of `live`. An autopilot session reports the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct WorkerRun {
     pub running: bool,
@@ -764,21 +817,32 @@ pub struct WorkerRun {
     pub exit_status: Option<i32>,
 }
 
+/// The daemon marker of a worker or autopilot session (started by the
+/// hub, not a plain shell restored after a restart).
+fn daemon_marker(record: &crate::state::SessionRecord) -> Option<&'static str> {
+    if record.fallback_command.is_some() {
+        return None;
+    }
+    match record.command.get(3).map(String::as_str) {
+        Some(WORKER_MARKER) => Some(WORKER_MARKER),
+        Some(AUTOPILOT_MARKER) => Some(AUTOPILOT_MARKER),
+        _ => None,
+    }
+}
+
 /// Whether `record` is a worker session (started by the hub, not a plain
 /// shell restored after a restart).
 fn is_worker_session(record: &crate::state::SessionRecord) -> bool {
-    record.fallback_command.is_none()
-        && record.command.get(3).map(String::as_str) == Some(WORKER_MARKER)
+    daemon_marker(record) == Some(WORKER_MARKER)
 }
 
-/// The worker state of a worker session whose process is `pid` (`None`
-/// once the session's process is gone); `None` for any other session.
+/// The daemon state of a worker or autopilot session whose process is
+/// `pid` (`None` once the session's process is gone); `None` for any
+/// other session.
 pub fn worker_run(record: &crate::state::SessionRecord, pid: Option<u32>) -> Option<WorkerRun> {
-    if !is_worker_session(record) {
-        return None;
-    }
+    let marker = daemon_marker(record)?;
     Some(match pid {
-        Some(pid) if process_runs_worker(pid) => WorkerRun {
+        Some(pid) if process_runs(pid, marker) => WorkerRun {
             running: true,
             exit_status: None,
         },
@@ -949,18 +1013,30 @@ pub fn runs_worker(view: &SessionView, folder: &Path) -> bool {
     let Some(pid) = view.live.as_ref().and_then(|l| l.pid) else {
         return false;
     };
-    process_runs_worker(pid)
+    process_runs(pid, WORKER_MARKER)
 }
 
+/// Whether `view` is a hub autopilot session in `folder` whose `fw
+/// autopilot` still runs (see [`runs_worker`]).
+pub fn runs_autopilot(view: &SessionView, folder: &Path) -> bool {
+    let record = &view.record;
+    if record.cwd != folder || daemon_marker(record) != Some(AUTOPILOT_MARKER) {
+        return false;
+    }
+    let Some(pid) = view.live.as_ref().and_then(|l| l.pid) else {
+        return false;
+    };
+    process_runs(pid, AUTOPILOT_MARKER)
+}
+
+/// Whether session process `pid` is still the daemon wrapper carrying
+/// `marker` (not yet the shell it leaves behind).
 #[cfg(target_os = "linux")]
-fn process_runs_worker(pid: u32) -> bool {
+fn process_runs(pid: u32, marker: &str) -> bool {
     let Ok(argv) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
-    if argv
-        .split(|b| *b == 0)
-        .any(|arg| arg == WORKER_MARKER.as_bytes())
-    {
+    if argv.split(|b| *b == 0).any(|arg| arg == marker.as_bytes()) {
         return true;
     }
     // Forked but not yet exec'd (a session created a moment ago): still
@@ -970,7 +1046,7 @@ fn process_runs_worker(pid: u32) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_runs_worker(_pid: u32) -> bool {
+fn process_runs(_pid: u32, _marker: &str) -> bool {
     true
 }
 
@@ -1280,20 +1356,25 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let child = Reap(child);
-        until("the worker to start", &|| process_runs_worker(pid));
+        until("the worker to start", &|| process_runs(pid, WORKER_MARKER));
         std::fs::write(&gate, "").unwrap();
-        until("the shell to take over", &|| !process_runs_worker(pid));
+        until("the shell to take over", &|| {
+            !process_runs(pid, WORKER_MARKER)
+        });
         // The same live process becomes the shell (whose script then execs
         // `sleep`: wait for that second exec, not just the first), and is
         // no longer a worker.
         let comm = || std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
         until("the shell to exec its sleep", &|| comm().trim() == "sleep");
-        assert!(!process_runs_worker(pid));
+        assert!(!process_runs(pid, WORKER_MARKER));
         // The shell carries the worker's exit status (the sleep it exec'd
         // inherited it).
         assert_eq!(process_worker_exit(pid), Some(0));
         drop(child);
-        assert!(!process_runs_worker(pid), "a gone process runs nothing");
+        assert!(
+            !process_runs(pid, WORKER_MARKER),
+            "a gone process runs nothing"
+        );
     }
 
     #[test]

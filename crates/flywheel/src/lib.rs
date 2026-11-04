@@ -12,6 +12,7 @@ pub mod dashboard;
 pub mod docs;
 pub mod exec;
 pub mod history_screen;
+pub mod hub_autopilot;
 pub mod hub_flywheel;
 pub mod hub_graders;
 pub mod hub_tasks;

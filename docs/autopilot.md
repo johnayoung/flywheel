@@ -68,10 +68,11 @@ flywheel autopilot --interval 120       # 120s between daemon cycles
 | `--target-depth` | int | Fill the queue to this depth (overrides `[autopilot].target_depth`) |
 | `--interval` | float | Seconds between daemon cycles (overrides `[autopilot].interval_seconds`) |
 | `--once` | flag | Run one refill pass and exit; no daemon loop |
+| `--pause` / `--resume` | flag | Hold / release a running daemon between cycles (marker `<activity file>.paused`), then exit |
 
 Flag precedence is CLI flag > policy > code default (`resolve_runtime`, `crates/flywheel-orchestrator/src/autopilot_run.rs`). `landing` and the score weights come from policy only (no CLI flag).
 
-**The daemon never terminates on an idle cycle.** An empty pass writes nothing and the loop continues; it exits only on SIGTERM or SIGINT, finishing the current cycle first (`run_daemon_loop`, `autopilot_run.rs`). A policy error exits 2 before the loop starts.
+**The daemon never terminates on an idle cycle.** An empty pass writes nothing and the loop continues; it exits only on SIGTERM or SIGINT, finishing the current cycle first (`run_daemon_loop`, `autopilot_run.rs`). A policy error exits 2 before the loop starts. A graceful exit writes a `stopped` record that reads not-live at once. While paused it runs no pass (no breaker or back-off strikes) and keeps its record fresh (phase `paused`). The hub drives the same verbs: [hub-workflows](hub/workflows.md#flywheel-panel).
 
 ## Configuration
 

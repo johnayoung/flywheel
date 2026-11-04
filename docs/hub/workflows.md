@@ -124,6 +124,8 @@ Folders with a `flywheel.toml` or `.flywheel/` get the verified loop beside the 
 
 - Phases and tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (in **Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
 - **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks before adding unmet prerequisites); a second needs confirming (409); `queued in <session>` marks a task a scoped worker will run. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: a run's `fw show` summary and redacted transcript, live.
+- **Autopilot** (`fw hub autopilot`): **Start** (confirmed: work lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`. Peers: read-only.
+- Shown: tier verdicts, the last cycle's decision (emitted, dropped with reasons), emitted tasks with score and run, parked gates (in Needs you, alerts). **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate shown (confirmed; the worker applies it). Held-out gate, risk tiers, team reviews: shown only.
 - A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is never created. One watcher per folder (stat 2 s, re-read 15 s). Seam: `flywheel::FlywheelProvider`, implemented in `hub_flywheel.rs`.
 
 ## Prompt queue

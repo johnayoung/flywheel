@@ -83,6 +83,10 @@ pub const EVENTS: &[&str] = &[
     "pr.checks_passed",
     "pr.review_changes_requested",
     "pr.merged",
+    "autopilot.started",
+    "autopilot.stopped",
+    "autopilot.decision",
+    "autopilot.approval_needed",
 ];
 const STATUSES: &[&str] = &["working", "blocked", "done", "idle", "unknown"];
 const KINDS: &[&str] = &["shell", "claude", "codex"];

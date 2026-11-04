@@ -42,13 +42,13 @@ const PANEL_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A refused request: its status and message (kept small, unlike a
 /// built `Response`, so `Result`s carrying it stay cheap).
-struct Refusal {
+pub(super) struct Refusal {
     status: StatusCode,
     message: String,
 }
 
 impl Refusal {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(super) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
@@ -64,14 +64,14 @@ impl IntoResponse for Refusal {
 
 /// The answer while an earlier read with the same key is still blocked
 /// (on a slow or unreachable store).
-fn still_reading(what: &str) -> Response {
+pub(super) fn still_reading(what: &str) -> Response {
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         &format!("an earlier {what} is still waiting on the store; try again shortly"),
     )
 }
 
-fn monitor(app: &AppState) -> Result<Arc<FlywheelMonitor>, Refusal> {
+pub(super) fn monitor(app: &AppState) -> Result<Arc<FlywheelMonitor>, Refusal> {
     app.options.flywheel.clone().ok_or_else(|| {
         Refusal::new(
             StatusCode::NOT_FOUND,
@@ -109,7 +109,7 @@ fn workspace_folder(hub: &Hub, folder: &str) -> Result<(PathBuf, Vec<Workspace>)
     Ok((path, found))
 }
 
-async fn off_runtime<T: Send + 'static>(
+pub(super) async fn off_runtime<T: Send + 'static>(
     limit: Duration,
     what: &str,
     f: impl FnOnce() -> T + Send + 'static,
@@ -129,7 +129,7 @@ async fn off_runtime<T: Send + 'static>(
 
 /// Resolve and check `folder` (a workspace folder, adopted) off the
 /// runtime.
-async fn adopted_folder(
+pub(super) async fn adopted_folder(
     app: &AppState,
     monitor: &Arc<FlywheelMonitor>,
     folder: String,

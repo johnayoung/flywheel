@@ -327,6 +327,27 @@ pub fn compose(subject: &Subject, click_base: Option<&str>, detail: bool) -> Opt
     })
 }
 
+/// The push for an `autopilot.approval_needed` event: the folder's name
+/// and the task (the gate's instruction with `detail`), never a path.
+pub fn compose_gate(payload: &serde_json::Value, click_base: Option<&str>, detail: bool) -> Push {
+    let field = |key: &str| clean(payload.get(key).and_then(|v| v.as_str()).unwrap_or(""));
+    let task = field("task_id");
+    let folder = field("name");
+    let instruction = field("instruction");
+    let message = if detail && !instruction.is_empty() {
+        format!("autopilot work in {folder} waits on your approval: {instruction}")
+    } else {
+        format!("autopilot work in {folder} waits on your approval.")
+    };
+    Push {
+        title: bounded(&format!("{task} needs approval"), MAX_TITLE_CHARS),
+        message: bounded(&message, MAX_MESSAGE_CHARS),
+        priority: "high",
+        tags: "flywheel,autopilot".into(),
+        click: click_base.map(|base| format!("{}/", base.trim_end_matches('/'))),
+    }
+}
+
 /// Control characters out, whitespace runs to one space.
 fn clean(text: &str) -> String {
     text.split(|c: char| c.is_whitespace() || c.is_control())
@@ -563,6 +584,25 @@ impl Notifier {
                 let session_id = match events.recv().await {
                     Ok(HubEvent::Status { session_id } | HubEvent::Unwatched { session_id }) => {
                         session_id
+                    }
+                    Ok(HubEvent::Lifecycle {
+                        event: "autopilot.approval_needed",
+                        payload,
+                    }) => {
+                        if notifier.config.blocked {
+                            let push = compose_gate(
+                                &payload,
+                                notifier.config.click_base.as_deref(),
+                                notifier.config.detail,
+                            );
+                            let notifier = Arc::clone(&notifier);
+                            tokio::spawn(async move {
+                                if let Err(e) = notifier.send(&push).await {
+                                    eprintln!("fw hub: push notification failed: {e}");
+                                }
+                            });
+                        }
+                        continue;
                     }
                     Ok(_) | Err(RecvError::Lagged(_)) => continue,
                     Err(RecvError::Closed) => break,
@@ -804,6 +844,27 @@ mod tests {
             compose(&worktree, None, true).unwrap().message,
             "infrared / claude 1 (claude on agent/fix-login) finished its turn."
         );
+    }
+
+    #[test]
+    fn a_gate_push_names_the_folder_and_task_never_a_path() {
+        let payload = serde_json::json!({
+            "folder": "/home/me/code/repo",
+            "name": "repo",
+            "task_id": "add-tests",
+            "instruction": "Confirm the\nfixture",
+        });
+        let push = compose_gate(&payload, Some("https://hub.ts.net/"), true);
+        assert_eq!(push.title, "add-tests needs approval");
+        assert_eq!(
+            push.message,
+            "autopilot work in repo waits on your approval: Confirm the fixture"
+        );
+        assert_eq!(push.priority, "high");
+        assert_eq!(push.click.as_deref(), Some("https://hub.ts.net/"));
+        let bare = compose_gate(&payload, None, false);
+        assert!(!bare.message.contains("Confirm"));
+        assert!(!bare.message.contains("/home"));
     }
 
     #[test]

@@ -21,7 +21,8 @@ use crate::autopilot::{
     RefillPassOptions, ScoreWeights, actionable_queue_depth, run_refill_pass,
 };
 use crate::autopilot_activity::{
-    AutopilotActivity, EmittedSummary, PHASE_IDLE, PHASE_RUNNING, PHASE_STARTING, epoch_now,
+    AutopilotActivity, DroppedSummary, EmittedSummary, MAX_DROPPED_SUMMARIES, PHASE_IDLE,
+    PHASE_PAUSED, PHASE_RUNNING, PHASE_STARTING, PHASE_STOPPED, epoch_now, is_paused, set_paused,
     write_activity,
 };
 use crate::autopilot_context::{DiscoveryCacheStatus, default_discovery_cache_path};
@@ -60,11 +61,13 @@ pub const LOG_PREFIX: &str = "[autopilot]";
 /// The usage block argparse prints on a bad argument (80-column wrap).
 pub const USAGE: &str = "usage: flywheel autopilot [-h] [--tasks-dir TASKS_DIR] [--model MODEL]
                           [--target-depth TARGET_DEPTH] [--interval INTERVAL]
-                          [--once] [--activity-file ACTIVITY_FILE]";
+                          [--once] [--activity-file ACTIVITY_FILE] [--pause]
+                          [--resume]";
 
 const HELP: &str = "usage: flywheel autopilot [-h] [--tasks-dir TASKS_DIR] [--model MODEL]
                           [--target-depth TARGET_DEPTH] [--interval INTERVAL]
-                          [--once] [--activity-file ACTIVITY_FILE]
+                          [--once] [--activity-file ACTIVITY_FILE] [--pause]
+                          [--resume]
 
 Keep the work queue full with verifiable, tier-prioritized tasks. Runs as a
 neverending daemon by default; --once runs a single refill pass and exits.
@@ -82,11 +85,14 @@ options:
   --activity-file ACTIVITY_FILE
                         Path to write the live activity snapshot the console
                         reads (defaults to
-                        <repo>/.flywheel/logs/autopilot/activity.json).";
+                        <repo>/.flywheel/logs/autopilot/activity.json).
+  --pause               Hold the running daemon between cycles (writes
+                        <activity file>.paused) and exit.
+  --resume              Let a paused daemon run cycles again and exit.";
 
 /// The long options in argparse declaration order (abbreviation matching
 /// reports ambiguities in this order).
-const LONG_OPTIONS: [&str; 7] = [
+const LONG_OPTIONS: [&str; 9] = [
     "--help",
     "--tasks-dir",
     "--model",
@@ -94,6 +100,8 @@ const LONG_OPTIONS: [&str; 7] = [
     "--interval",
     "--once",
     "--activity-file",
+    "--pause",
+    "--resume",
 ];
 
 // --- Arguments ------------------------------------------------------------------------
@@ -107,6 +115,10 @@ pub struct AutopilotArgs {
     pub interval: Option<f64>,
     pub once: bool,
     pub activity_file: Option<String>,
+    /// Write the pause marker and exit (no pass, no daemon).
+    pub pause: bool,
+    /// Remove the pause marker and exit.
+    pub resume: bool,
     pub help: bool,
 }
 
@@ -254,6 +266,14 @@ pub fn parse_args(argv: &[String]) -> Result<AutopilotArgs, String> {
                 reject_inline(option, inline)?;
                 args.once = true;
             }
+            "--pause" => {
+                reject_inline(option, inline)?;
+                args.pause = true;
+            }
+            "--resume" => {
+                reject_inline(option, inline)?;
+                args.resume = true;
+            }
             "--tasks-dir" => args.tasks_dir = Some(take_value(option, inline, &mut iter)?),
             "--model" => args.model = Some(take_value(option, inline, &mut iter)?),
             "--activity-file" => {
@@ -274,6 +294,18 @@ pub fn parse_args(argv: &[String]) -> Result<AutopilotArgs, String> {
         return Err(format!(
             "unrecognized arguments: {}",
             unrecognized.join(" ")
+        ));
+    }
+    let modes = [
+        ("--once", args.once),
+        ("--pause", args.pause),
+        ("--resume", args.resume),
+    ];
+    let chosen: Vec<&str> = modes.iter().filter(|m| m.1).map(|m| m.0).collect();
+    if chosen.len() > 1 {
+        return Err(format!(
+            "argument {}: not allowed with argument {}",
+            chosen[1], chosen[0]
         ));
     }
     Ok(args)
@@ -667,7 +699,17 @@ pub struct DaemonHooks<'a> {
     /// A test-only safety bound on attempted cycles; production leaves it
     /// `None` (truly neverending).
     pub max_cycles: Option<u32>,
+    /// Whether the operator's pause marker holds the loop: checked before
+    /// every cycle; while true no cycle runs (nothing counts toward the
+    /// circuit breaker or the no-progress back-off).
+    pub paused: Option<&'a dyn Fn() -> bool>,
+    /// Runs on every held check while paused (keeps the record fresh).
+    pub on_paused: Option<&'a dyn Fn()>,
 }
+
+/// How often a paused daemon looks at its marker again (at most; a
+/// shorter interval is used as is).
+pub const PAUSE_POLL_SECONDS: f64 = 2.0;
 
 impl fmt::Debug for DaemonHooks<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -678,6 +720,8 @@ impl fmt::Debug for DaemonHooks<'_> {
             .field("on_give_up", &self.on_give_up.is_some())
             .field("on_permanent_stop", &self.on_permanent_stop.is_some())
             .field("max_cycles", &self.max_cycles)
+            .field("paused", &self.paused.is_some())
+            .field("on_paused", &self.on_paused.is_some())
             .finish()
     }
 }
@@ -721,6 +765,13 @@ pub fn run_daemon_loop(
     let mut cycles = 0u32;
     let mut consecutive_failures = 0u32;
     while !should_stop() {
+        if hooks.paused.is_some_and(|paused| paused()) {
+            if let Some(on_paused) = hooks.on_paused {
+                on_paused();
+            }
+            sleep(PAUSE_POLL_SECONDS.min(interval_seconds), should_stop);
+            continue;
+        }
         if let Some(before_cycle) = hooks.before_cycle {
             before_cycle();
         }
@@ -799,6 +850,7 @@ struct LastCycle {
     emitted_tasks: Vec<EmittedSummary>,
     prefiltered_tiers: Vec<u8>,
     discovery_cache: String,
+    dropped_findings: Vec<DroppedSummary>,
 }
 
 impl LastCycle {
@@ -822,6 +874,19 @@ impl LastCycle {
                 .map(|s| u8::from(s.tier))
                 .collect(),
             discovery_cache: result.discovery_cache.to_string(),
+            dropped_findings: result
+                .dropped
+                .iter()
+                .take(MAX_DROPPED_SUMMARIES)
+                .map(|d| {
+                    DroppedSummary::new(
+                        &d.finding.id,
+                        u8::from(d.finding.tier),
+                        &d.finding.title,
+                        &d.reason,
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -891,6 +956,15 @@ impl ActivityRecorder {
     }
 
     fn write(&self, phase: &str, now: f64, next_cycle_at: Option<f64>) {
+        self.write_until(
+            phase,
+            now,
+            next_cycle_at,
+            now + self.interval + LIVENESS_GRACE_SECONDS,
+        );
+    }
+
+    fn write_until(&self, phase: &str, now: f64, next_cycle_at: Option<f64>, expires_at: f64) {
         let (cycle_index, last) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (state.cycle_index, state.last.clone().unwrap_or_default())
@@ -902,7 +976,7 @@ impl ActivityRecorder {
             updated_at: now,
             interval_seconds: self.interval,
             next_cycle_at,
-            expires_at: Some(now + self.interval + LIVENESS_GRACE_SECONDS),
+            expires_at: Some(expires_at),
             last_emitted: last.emitted,
             last_dropped: last.dropped,
             last_reason: last.reason,
@@ -910,6 +984,7 @@ impl ActivityRecorder {
             last_emitted_tasks: last.emitted_tasks,
             last_prefiltered_tiers: last.prefiltered_tiers,
             last_discovery_cache: last.discovery_cache,
+            last_dropped_findings: last.dropped_findings,
         };
         // Best-effort by contract: a snapshot write failure never crashes a cycle.
         let _ = write_activity(&self.path, &activity);
@@ -927,6 +1002,19 @@ impl ActivityRecorder {
             state.cycle_index += 1;
         }
         self.write(PHASE_RUNNING, (self.clock)(), None);
+    }
+
+    /// The `paused` snapshot while the pause marker holds the loop (the
+    /// last cycle's summary kept; the deadline pushed forward).
+    pub fn paused(&self) {
+        self.write(PHASE_PAUSED, (self.clock)(), None);
+    }
+
+    /// The `stopped` snapshot on a graceful exit: its deadline is already
+    /// past, so the record reads not-live at once.
+    pub fn stopped(&self) {
+        let now = (self.clock)();
+        self.write_until(PHASE_STOPPED, now, None, now);
     }
 
     /// The `idle` snapshot after a cycle, carrying its summary.
@@ -1184,6 +1272,45 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         }
     };
     let log = make_logger(LOG_PREFIX, stderr.clone());
+    let activity_path = match args.activity_file.as_deref().filter(|p| !p.is_empty()) {
+        Some(path) => PathBuf::from(path),
+        None => repo_root
+            .join(".flywheel")
+            .join("logs")
+            .join("autopilot")
+            .join("activity.json"),
+    };
+    if args.pause || args.resume {
+        return match set_paused(&activity_path, args.pause) {
+            Ok(changed) => {
+                let (verb, how) = if args.pause {
+                    ("paused", "it finishes a running cycle, then holds")
+                } else {
+                    ("resumed", "it runs its next cycle within seconds")
+                };
+                let state = if changed { verb } else { "already" };
+                let state = if changed {
+                    state.to_owned()
+                } else {
+                    format!("{state} {verb}")
+                };
+                println!(
+                    "autopilot {state} ({}); a running daemon picks it up: {how}",
+                    python_path_str(&crate::autopilot_activity::pause_marker_path(
+                        &activity_path
+                    ))
+                );
+                0
+            }
+            Err(err) => {
+                stderr(&format!(
+                    "flywheel autopilot: cannot {} autopilot: {err}",
+                    if args.pause { "pause" } else { "resume" }
+                ));
+                1
+            }
+        };
+    }
 
     let policy = match load_effective_policy(host.policy_path().as_deref()) {
         Ok(policy) => policy,
@@ -1268,15 +1395,8 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         std::process::id()
     ));
 
-    let activity_path = match args.activity_file.as_deref().filter(|p| !p.is_empty()) {
-        Some(path) => PathBuf::from(path),
-        None => repo_root
-            .join(".flywheel")
-            .join("logs")
-            .join("autopilot")
-            .join("activity.json"),
-    };
-    let recorder = ActivityRecorder::new(activity_path, interval).with_clock(host.epoch_clock());
+    let recorder =
+        ActivityRecorder::new(activity_path.clone(), interval).with_clock(host.epoch_clock());
     recorder.starting();
 
     let stop = StopFlag::new();
@@ -1294,7 +1414,25 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
 
     let should_stop = || stop.is_set();
     let sleep = |seconds: f64, _should_stop: &dyn Fn() -> bool| host.sleep(&stop, seconds);
-    let before_cycle = || recorder.before_cycle();
+    let held = Cell::new(false);
+    let before_cycle = || {
+        if held.replace(false) {
+            log("resumed: the pause marker is gone");
+        }
+        recorder.before_cycle();
+    };
+    let paused = || is_paused(&activity_path);
+    let on_paused = || {
+        if !held.replace(true) {
+            log(&format!(
+                "paused by the operator ({} exists); no cycles until it is removed",
+                python_path_str(&crate::autopilot_activity::pause_marker_path(
+                    &activity_path
+                ))
+            ));
+        }
+        recorder.paused();
+    };
     let on_cycle = |result: &AutopilotPassResult| {
         log_result(&log, result);
         recorder.on_cycle(result);
@@ -1358,8 +1496,11 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
             on_give_up: Some(&on_give_up),
             on_permanent_stop: Some(&on_permanent_stop),
             max_cycles: None,
+            paused: Some(&paused),
+            on_paused: Some(&on_paused),
         },
     );
+    recorder.stopped();
     log(&format!("daemon stopped after {cycles} cycle(s)"));
     if gave_up.get() { 1 } else { 0 }
 }
@@ -1480,6 +1621,8 @@ mod tests {
                 interval: Some(2.5),
                 once: true,
                 activity_file: Some("a.json".into()),
+                pause: false,
+                resume: false,
                 help: false,
             }
         );
@@ -2510,9 +2653,11 @@ mod tests {
              operator inspection."
         );
         assert_eq!(lines[7], "[autopilot] daemon stopped after 5 cycle(s)");
-        // The activity record reports the last cycle as running with the pid.
+        // The activity record says the daemon stopped (not live), with the
+        // last cycle's index and the pid.
         let activity = read_activity(Some(&activity)).unwrap();
-        assert_eq!(activity.phase, PHASE_RUNNING);
+        assert_eq!(activity.phase, PHASE_STOPPED);
+        assert!(!is_record_live(Some(&activity), activity.updated_at));
         assert_eq!(activity.cycle_index, 5);
         assert_eq!(activity.pid, i64::from(std::process::id()));
     }
@@ -2564,15 +2709,95 @@ mod tests {
             lines.last().unwrap(),
             "[autopilot] daemon stopped after 2 cycle(s)"
         );
+        // A graceful stop leaves a `stopped` record whose deadline is
+        // already past: it reads not-live at once.
         let activity = read_activity(Some(&activity)).unwrap();
-        assert_eq!(activity.phase, PHASE_IDLE);
+        assert_eq!(activity.phase, PHASE_STOPPED);
         assert_eq!(activity.cycle_index, 2);
         assert_eq!(activity.interval_seconds, 42.0);
-        assert_eq!(activity.next_cycle_at, Some(1042.0));
-        assert_eq!(
-            activity.expires_at,
-            Some(1000.0 + 42.0 + LIVENESS_GRACE_SECONDS)
+        assert_eq!(activity.next_cycle_at, None);
+        assert_eq!(activity.expires_at, Some(activity.updated_at));
+        assert!(!is_record_live(Some(&activity), activity.updated_at));
+    }
+
+    #[test]
+    fn a_paused_loop_runs_no_cycle_until_resumed() {
+        let ran = Cell::new(0u32);
+        let checks = Cell::new(0u32);
+        let held_for = Cell::new(0u32);
+        let mut run_cycle = || {
+            ran.set(ran.get() + 1);
+            Ok(idle("nothing"))
+        };
+        // Paused for the first three checks, then resumed.
+        let paused = || {
+            checks.set(checks.get() + 1);
+            checks.get() <= 3
+        };
+        let on_paused = || held_for.set(held_for.get() + 1);
+        let slept = Mutex::new(Vec::new());
+        let sleep = |seconds: f64, _: &dyn Fn() -> bool| slept.lock().unwrap().push(seconds);
+        let cycles = run_daemon_loop(
+            &mut run_cycle,
+            300.0,
+            &|| ran.get() >= 1,
+            &sleep,
+            DaemonHooks {
+                paused: Some(&paused),
+                on_paused: Some(&on_paused),
+                ..DaemonHooks::default()
+            },
         );
+        assert_eq!(cycles, 1, "held checks are not cycles");
+        assert_eq!(held_for.get(), 3);
+        assert_eq!(
+            *slept.lock().unwrap(),
+            vec![PAUSE_POLL_SECONDS; 3],
+            "a held loop polls the marker, never waits a whole interval"
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_write_and_remove_the_marker_and_exit() {
+        let dir = TempDir::new().unwrap();
+        let activity = dir.path().join("logs").join("act.json");
+        let marker = crate::autopilot_activity::pause_marker_path(&activity);
+        let file = activity.to_str().unwrap();
+        let host = host(&dir, "");
+        assert_eq!(
+            run_main(&argv(&["--pause", "--activity-file", file]), &host),
+            0
+        );
+        assert!(marker.is_file());
+        assert_eq!(
+            run_main(&argv(&["--pause", "--activity-file", file]), &host),
+            0
+        );
+        assert_eq!(
+            run_main(&argv(&["--resume", "--activity-file", file]), &host),
+            0
+        );
+        assert!(!marker.exists());
+        assert!(!activity.exists(), "no daemon ran");
+        assert!(parse_args(&argv(&["--pause", "--once"])).is_err());
+        assert!(parse_args(&argv(&["--pause", "--resume"])).is_err());
+    }
+
+    #[test]
+    fn the_recorder_marks_paused_live_and_stopped_lapsed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("act.json");
+        let recorder = ActivityRecorder::new(&path, 30.0).with_clock(Arc::new(|| 500.0));
+        recorder.before_cycle();
+        recorder.paused();
+        let paused = read_activity(Some(&path)).unwrap();
+        assert_eq!(paused.phase, PHASE_PAUSED);
+        assert_eq!(paused.cycle_index, 1);
+        assert!(is_record_live(Some(&paused), 500.0));
+        recorder.stopped();
+        let stopped = read_activity(Some(&path)).unwrap();
+        assert_eq!(stopped.phase, PHASE_STOPPED);
+        assert!(!is_record_live(Some(&stopped), 500.0));
     }
 
     #[test]

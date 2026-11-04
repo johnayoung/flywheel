@@ -267,6 +267,7 @@ pub fn peer_forbidden(path: &str) -> bool {
         || under("/api/shares")
         || under("/api/recordings")
         || under("/api/perms")
+        || path.starts_with("/api/flywheel/autopilot/")
         || is_record_control(path)
         || under("/m")
         || !path.starts_with("/api")
@@ -511,6 +512,9 @@ mod tests {
             "/api/perms/allow",
             "/api/sessions/abc/record/start",
             "/api/sessions/abc/record/stop",
+            // Autopilot is read-only for peers.
+            "/api/flywheel/autopilot/start",
+            "/api/flywheel/autopilot/decide",
             "/m/b/api/sessions",
             "/",
             "/login",
@@ -526,6 +530,7 @@ mod tests {
             "/api/whoami",
             "/api/peer",
             "/api/flywheel/panel",
+            "/api/flywheel/autopilot",
             // Search, transcripts, templates, and usage: a machine's
             // search overlay, launcher, and cost chips through the proxy.
             "/api/search",

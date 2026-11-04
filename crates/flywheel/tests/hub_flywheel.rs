@@ -215,7 +215,9 @@ fn adopted_repo(root: &Path) {
         sink.append_telemetry(&record).unwrap();
     }
 
-    let mut activity = AutopilotActivity::new(4242, "idle", 3, epoch_now(), 60.0);
+    // This test process stands in for the daemon: its pid runs.
+    let mut activity =
+        AutopilotActivity::new(i64::from(std::process::id()), "idle", 3, epoch_now(), 60.0);
     activity.expires_at = Some(epoch_now() + 120.0);
     let path = root.join(AUTOPILOT_ACTIVITY);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -307,7 +309,12 @@ fn panel_reads_phases_runs_graders_claims_daemons_and_alerts() {
     assert!(panel.worker.live, "{:?}", panel.worker);
     assert!(panel.worker.detail.contains("worker-7"));
     assert!(panel.autopilot.live, "{:?}", panel.autopilot);
-    assert!(panel.autopilot.detail.contains("pid 4242"));
+    assert!(
+        panel
+            .autopilot
+            .detail
+            .contains(&format!("pid {}", std::process::id()))
+    );
 }
 
 #[test]

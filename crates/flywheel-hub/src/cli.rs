@@ -158,6 +158,11 @@ enum HubCommand {
     /// works), rerun, ready, and merge act on GitHub after printing what
     /// runs.
     Pr(crate::pr_cli::PrArgs),
+    /// A flywheel folder's autopilot (intake daemon): status, start (`fw
+    /// autopilot` in a hub session), stop, pause, resume, and approve /
+    /// deny the manual gates its work waits on (`fw approve` / `fw
+    /// reject`, pinned to the gate shown).
+    Autopilot(crate::autopilot_cli::AutopilotArgs),
     /// Fast-forward a worktree session's base onto its branch in the main
     /// checkout (git merge --ff-only), after printing exactly what runs.
     /// Refused when the main checkout is not on the base or has
@@ -707,6 +712,7 @@ fn dispatch_verb(
         HubCommand::AskReview(args) => crate::agent_handoff_cli::ask_review(&args, out, err),
         HubCommand::Queue(args) => crate::queue_cli::main(&args, out, err),
         HubCommand::Pr(args) => crate::pr_cli::main(&args, out, err),
+        HubCommand::Autopilot(args) => crate::autopilot_cli::main(&args, out, err),
     }
 }
 

@@ -60,6 +60,7 @@
 mod activity_api;
 mod admission;
 mod auth;
+mod autopilot_api;
 mod ca_page;
 mod commands_api;
 mod deflate;
@@ -400,6 +401,18 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/flywheel/panel", get(flywheel_api::panel))
         .route("/api/flywheel/run", get(flywheel_api::run_output))
         .route("/api/flywheel/worker", post(flywheel_api::start_worker))
+        .route("/api/flywheel/autopilot", get(autopilot_api::view))
+        .route("/api/flywheel/autopilot/start", post(autopilot_api::start))
+        .route("/api/flywheel/autopilot/stop", post(autopilot_api::stop))
+        .route("/api/flywheel/autopilot/pause", post(autopilot_api::pause))
+        .route(
+            "/api/flywheel/autopilot/resume",
+            post(autopilot_api::resume),
+        )
+        .route(
+            "/api/flywheel/autopilot/decide",
+            post(autopilot_api::decide),
+        )
         .route(
             "/api/fanouts",
             get(fanout_api::list).post(fanout_api::create),

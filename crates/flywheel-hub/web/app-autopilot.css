@@ -1,0 +1,81 @@
+/* flywheel hub: autopilot in the Flywheel panel (autopilot.js). */
+
+.ap-config { margin: 0 0 .5rem; color: var(--ink-3); font-size: 10.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.ap-sub {
+  margin: .85rem 0 .35rem;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+}
+
+/* The tier model: 1-3 preemptive, a cell per tier with its last verdict. */
+.ap-tiers { display: grid; grid-template-columns: repeat(11, minmax(0, 1fr)); gap: 2px; margin: 0 0 .55rem; }
+.ap-tier {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-height: 1.6rem;
+  border: 1px solid var(--rule-2);
+  font: 600 10px/1 var(--mono);
+  color: var(--ink-3);
+  background: var(--bg);
+}
+.ap-tier.pre { border-top: 2px solid var(--alert); }
+.ap-tier.relevant { background: color-mix(in srgb, var(--fw-ok) 22%, var(--bg)); color: var(--ink); border-color: color-mix(in srgb, var(--fw-ok) 55%, var(--rule-2)); }
+.ap-tier.prefiltered { background: repeating-linear-gradient(135deg, var(--bg) 0 3px, var(--bg-3) 3px 6px); }
+.ap-tier.not-relevant { opacity: .7; }
+.ap-tier i {
+  position: absolute;
+  top: -.4rem;
+  right: -.2rem;
+  padding: 0 .2rem;
+  border-radius: 2px;
+  background: var(--fw-ok);
+  color: var(--fw-ok-ink);
+  font: 700 9px/1.3 var(--mono);
+}
+
+.ap-decision { border-left: 3px solid var(--fw-ok); padding: .35rem .6rem; background: var(--bg); }
+.ap-why { margin: 0; line-height: 1.5; color: var(--ink-2); overflow-wrap: anywhere; }
+.ap-why b { color: var(--ink); }
+.ap-meta { margin: .25rem 0 0; color: var(--ink-3); font-size: 10px; }
+.ap-drops { list-style: none; margin: .35rem 0 0; padding: 0; display: grid; gap: .25rem; }
+.ap-drops li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0 .5rem; align-items: baseline; }
+.ap-drops b { font-weight: 600; overflow-wrap: anywhere; }
+.ap-drops small { grid-column: 2; color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
+
+.ap-chip {
+  padding: 0 .3rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  font: 600 9.5px/1.5 var(--mono);
+  color: var(--ink-2);
+}
+.ap-chip.hot { border-color: var(--alert); color: var(--alert); }
+.ap-score { font-variant-numeric: tabular-nums; color: var(--ink-2); }
+
+.ap-cand {
+  display: grid;
+  grid-template-columns: 5.6rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: .6rem;
+  padding: .38rem .6rem;
+}
+
+.ap-gate { padding: .4rem .6rem; border-left: 3px solid var(--rule-2); background: var(--bg); }
+.ap-gate.ours { border-left-color: var(--brass); }
+.ap-gate-line { display: grid; grid-template-columns: 5.6rem minmax(0, 1fr) auto; align-items: center; gap: .6rem; }
+.ap-gate-actions, .ap-deny-actions { display: flex; justify-content: flex-end; align-items: center; gap: .8rem; margin-top: .35rem; }
+.ap-approve { padding: .3rem .8rem; }
+.ap-deny { margin-top: .35rem; display: grid; gap: .3rem; }
+.ap-deny textarea { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; font-size: 12px; }
+.ap-alert-actions { display: inline-flex; gap: .6rem; }
+
+@media (max-width: 760px) {
+  .ap-cand, .ap-gate-line { grid-template-columns: 4.6rem minmax(0, 1fr); }
+  .ap-cand > .fw-task-meta, .ap-gate-line > .fw-task-meta { grid-column: 1 / -1; justify-content: flex-end; }
+  .ap-tier { min-height: 2rem; }
+  .ap-gate-actions button, .ap-deny-actions button, .ap-alert-actions button { min-height: 2.75rem; min-width: 2.75rem; }
+}

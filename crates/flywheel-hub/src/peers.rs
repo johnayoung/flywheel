@@ -248,8 +248,9 @@ fn info(entry: &PeerEntry) -> PeerInfo {
 /// import, off this hub's plugins, settings, and config (a machine's
 /// UI is its own hub's), off its share links and recordings (a
 /// machine's sessions are shared and recorded from that machine), and off
-/// agent permission rules (agent-controlling config: changed only with
-/// this hub's own token or login).
+/// the permissions view and writes (they are guarded for this hub's own
+/// user; a peer could still write a settings file from a shell session,
+/// so this is not a boundary either).
 pub fn peer_forbidden(path: &str) -> bool {
     let path = path.trim_end_matches('/');
     let under = |prefix: &str| path == prefix || path.starts_with(&format!("{prefix}/"));

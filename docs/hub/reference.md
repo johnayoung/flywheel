@@ -16,9 +16,9 @@ Every `fw hub` verb and flag and the hub's files (`docs_drift.rs` fails the buil
 Server and lifecycle:
 
 ```bash
-fw hub start {serve} [--timeout SECS] [--handoff]  # detached; prints login URLs
+fw hub start {serve} [--timeout SECS] [--handoff]  # detached; prints login URLs; --handoff exits as upgrade
 fw hub stop [--timeout SECS] [--force]
-fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS]  # exit 4 refused, 3 no hub
+fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS]  # exit 3 no hub, 4 incompatible, 5 busy (retry)
 fw hub status [--json]  # exit 3 not running
 fw hub logs [--follow|-f] [--lines|-n N]  # -n 0: all
 fw hub serve {serve} [--handoff]  # foreground

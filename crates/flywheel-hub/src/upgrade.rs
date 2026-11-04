@@ -142,7 +142,7 @@ impl TakenOver {
 /// over from the running one; returns once it serves and the old process
 /// is gone. Exit codes: 0 handed off, [`EXIT_REFUSED`] refused as
 /// incompatible, [`EXIT_BUSY`] refused for now (nothing changed either
-/// way), 1 failed.
+/// way), [`EXIT_NO_HUB`] no hub running, 1 failed.
 pub(crate) fn start_handoff(
     hub: &HubArgs,
     timeout: Duration,
@@ -165,10 +165,8 @@ fn run_start_handoff(
     let dir = resolve_state_dir(&hub.state)?;
     let dir = std::path::absolute(&dir).map_err(|e| format!("state dir {}: {e}", dir.display()))?;
     let Some(old) = running_hub(&dir)? else {
-        return Err(format!(
-            "no hub is running for state dir {} (`fw hub start` starts one)",
-            dir.display()
-        ));
+        let _ = writeln!(err, "fw hub: {}", crate::endpoint::no_hub_message(&dir));
+        return Ok(EXIT_NO_HUB);
     };
     let log = dir.join(LOG_FILE);
     let offset = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
@@ -448,12 +446,8 @@ fn run_upgrade(
     let dir = resolve_state_dir(&args.state)?;
     let dir = std::path::absolute(&dir).map_err(|e| format!("state dir {}: {e}", dir.display()))?;
     let Some(info) = running_hub(&dir)? else {
-        let _ = writeln!(
-            err,
-            "fw hub: no hub is running for state dir {} (`fw hub start` starts one)",
-            dir.display()
-        );
-        return Ok(crate::lifecycle::EXIT_NOT_RUNNING);
+        let _ = writeln!(err, "fw hub: {}", crate::endpoint::no_hub_message(&dir));
+        return Ok(EXIT_NO_HUB);
     };
     let (binary, support) = upgrade_binary(args.binary.as_deref(), err)?;
     let mut old = OldHub {
@@ -541,7 +535,7 @@ fn run_upgrade(
                 "fw hub: the running hub cannot hand off right now (see above); nothing changed, \
                  retry shortly"
             );
-            Ok(EXIT_REFUSED)
+            Ok(EXIT_BUSY)
         }
         Some(EXIT_NO_HUB) => Ok(EXIT_NO_HUB),
         // `start --handoff` said what happened.

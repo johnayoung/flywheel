@@ -906,6 +906,8 @@ fn env_in(dir: &Path) -> Env {
         codex_home: dir.join("home/.codex"),
         managed_dir: dir.join("etc/claude-code"),
         state_dir: None,
+        no_claude_user: false,
+        no_codex_user: false,
     }
 }
 
@@ -1373,4 +1375,14 @@ fn hub_cli_and_bare_wrappers_are_never_offered() {
     let words = vec!["timeout".into(), "5".into(), "cargo".into(), "test".into()];
     let c = synth::codex_candidate(words, "exact", &a, Path::new(REPO)).unwrap();
     assert!(!c.risk.dangerous);
+}
+
+#[test]
+fn no_home_means_no_user_layer_to_write() {
+    let env = Env::new(None, None, None);
+    assert!(env.user_layer(false).unwrap_err().contains("HOME"));
+    assert!(env.user_layer(true).unwrap_err().contains("CODEX_HOME"));
+    assert!(!env.claude_dir.starts_with("/.claude"));
+    let env = Env::new(None, Some(PathBuf::from("/cfg/claude")), None);
+    assert!(env.user_layer(false).is_ok());
 }

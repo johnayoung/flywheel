@@ -668,6 +668,11 @@ async fn codex_trust_and_symlinks_keep_the_typed_gate() {
     let hub = TestHub::start().await;
     let repo = hub.repo();
     hub.agent("codex").await;
+    // A workspace folder by its directory name (resolved by the hub, as
+    // for another machine's).
+    let (code, out, err) = run_cli(&hub, &["perms", "show", "repo"]).await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains(&format!("folder {}", repo.display())), "{out}");
     // A planted project config: trusting it turns these on.
     std::fs::create_dir_all(repo.join(".codex/rules")).unwrap();
     std::fs::write(

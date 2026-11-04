@@ -566,8 +566,7 @@ impl Hub {
         let perms_env = crate::perms::Env::new(
             std::env::var_os("HOME")
                 .filter(|h| !h.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/")),
+                .map(PathBuf::from),
             options.claude_config_dir.clone(),
             options.codex_home.clone(),
         );

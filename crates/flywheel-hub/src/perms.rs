@@ -19,8 +19,9 @@
 //!   days ([`journal`]).
 //!
 //! Rules are agent-controlling config: writes take the hub's token or a
-//! login (peers are refused), are logged to the hub log, and land in the
-//! activity journal (`perms.allowed`).
+//! login, are logged to the hub log, and land in the activity journal
+//! (`perms.allowed`). Peers are refused as defense in depth only: a peer
+//! runs any command in a session, so it can edit a settings file anyway.
 
 pub mod claude;
 pub mod codex;
@@ -57,6 +58,10 @@ pub struct Env {
     pub managed_dir: PathBuf,
     /// The hub's state dir (its token): a secret root wherever it lives.
     pub state_dir: Option<PathBuf>,
+    /// Neither `$HOME` nor `$CLAUDE_CONFIG_DIR` / `$CODEX_HOME` is set:
+    /// there is no user layer to write (the paths above are placeholders).
+    pub no_claude_user: bool,
+    pub no_codex_user: bool,
 }
 
 /// The managed settings directory Claude Code reads on this OS.
@@ -69,14 +74,40 @@ pub fn managed_dir() -> PathBuf {
 }
 
 impl Env {
-    pub fn new(home: PathBuf, claude_dir: Option<PathBuf>, codex_home: Option<PathBuf>) -> Self {
+    /// `home`: `$HOME`, `None` when unset; the config dirs as
+    /// [`crate::agent::claude_config_dir`] and [`crate::agent::codex_home`]
+    /// resolve them (`None`: neither they nor `$HOME` is set).
+    pub fn new(
+        home: Option<PathBuf>,
+        claude_dir: Option<PathBuf>,
+        codex_home: Option<PathBuf>,
+    ) -> Self {
+        let (no_claude_user, no_codex_user) = (claude_dir.is_none(), codex_home.is_none());
+        let home = home.unwrap_or_else(|| PathBuf::from("/nonexistent"));
         Self {
             claude_dir: claude_dir.unwrap_or_else(|| home.join(".claude")),
             codex_home: codex_home.unwrap_or_else(|| home.join(".codex")),
             managed_dir: managed_dir(),
             state_dir: None,
+            no_claude_user,
+            no_codex_user,
             home,
         }
+    }
+
+    /// Refuse a write to a user layer that has no home.
+    pub fn user_layer(&self, codex: bool) -> Result<(), String> {
+        let (missing, var) = if codex {
+            (self.no_codex_user, "CODEX_HOME")
+        } else {
+            (self.no_claude_user, "CLAUDE_CONFIG_DIR")
+        };
+        if missing {
+            return Err(format!(
+                "the hub runs with neither HOME nor {var} set: there is no user settings file to write"
+            ));
+        }
+        Ok(())
     }
 }
 

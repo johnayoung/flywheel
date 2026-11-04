@@ -349,6 +349,9 @@ impl Hub {
             return Err(invalid(format!("at most {MAX_RULES} rules at once")));
         }
         let file = claude::File::parse(body.file.as_deref().unwrap_or("local")).map_err(invalid)?;
+        if file == claude::File::User {
+            env.user_layer(false).map_err(invalid)?;
+        }
         let anchors = folder.anchors(env, file);
         let mut rules = Vec::new();
         let mut views = Vec::new();
@@ -489,6 +492,9 @@ impl Hub {
                 "write dangerous rules one at a time (each is typed to confirm)",
             ));
         }
+        if user {
+            env.user_layer(true).map_err(invalid)?;
+        }
         let path = codex::rules_path(user, folder, env);
         if !user {
             codex::no_symlink_in_project(folder, &path).map_err(invalid)?;
@@ -571,6 +577,9 @@ impl Hub {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .ok_or_else(|| invalid("give the setting's value"))?;
+        if setting == codex::Setting::TrustLevel {
+            env.user_layer(true).map_err(invalid)?;
+        }
         let (path, old, new_text) =
             codex::plan_setting(setting, value, folder, env).map_err(invalid)?;
         let project = codex::project_key(folder);

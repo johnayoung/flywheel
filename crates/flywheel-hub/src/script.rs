@@ -779,6 +779,21 @@ pub(crate) fn query_escape(raw: &str) -> String {
 /// directory) that is one of its folders, else a folder's label or
 /// directory name (unique). A path naming none of them is passed on for
 /// the hub to refuse.
+/// The folders of this hub's own workspaces (not other machines') whose
+/// label or directory name is `name`.
+pub(crate) fn folders_named(workspaces: &[Value], name: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = workspaces
+        .iter()
+        .filter(|w| w.get("machine").is_none_or(Value::is_null))
+        .flat_map(folders_of)
+        .filter(|f| f.label.as_deref() == Some(name) || f.dir_name() == Some(name))
+        .map(|f| f.path)
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
 pub(crate) fn pick_folder(workspace: &Value, query: &Path) -> Result<PathBuf, String> {
     let folders = folders_of(workspace);
     let path = absolute(query)?;

@@ -145,22 +145,51 @@ fn connect(endpoint: &EndpointArgs) -> Result<Endpoint, String> {
     Endpoint::resolve(endpoint)
 }
 
-/// The target as API fields: `{"folder": ...}` for an existing directory,
-/// else `{"session": id}`.
+/// The target as API fields: `{"folder": ...}` or `{"session": id}`. A
+/// folder is an absolute path (resolved by the hub, on its machine), a
+/// local relative path to this machine's hub, or a workspace folder's
+/// label or directory name; anything else names a session.
 fn target(conn: &Endpoint, raw: &str) -> Result<(String, Value), String> {
-    let path = Path::new(raw);
-    if (raw.contains('/') || raw == "." || raw == "..") && path.is_dir() {
-        let abs = path.canonicalize().map_err(|e| format!("{raw}: {e}"))?;
-        let abs = abs.to_string_lossy().into_owned();
-        return Ok((
+    let folder = |abs: String| {
+        (
             format!("folder={}", utf8_percent_encode(&abs, NON_ALPHANUMERIC)),
             json!({ "folder": abs }),
-        ));
+        )
+    };
+    let path = Path::new(raw);
+    let local = conn.local_info().is_some();
+    if local && (raw.contains('/') || raw == "." || raw == "..") && path.is_dir() {
+        let abs = path.canonicalize().map_err(|e| format!("{raw}: {e}"))?;
+        return Ok(folder(abs.to_string_lossy().into_owned()));
     }
-    let (id, _) = find_session(conn, raw)?;
+    if path.is_absolute() {
+        // The hub resolves it where it runs (another machine for --url).
+        return Ok(folder(raw.to_owned()));
+    }
+    let session = match find_session(conn, raw) {
+        Ok((id, _)) => id,
+        Err(not_a_session) => {
+            let named = crate::script::folders_named(&conn.blocking_workspaces()?, raw);
+            return match named.as_slice() {
+                [one] => Ok(folder(one.to_string_lossy().into_owned())),
+                [] => Err(not_a_session),
+                many => Err(format!(
+                    "{raw:?} names {} workspace folders: give the path ({})",
+                    many.len(),
+                    many.iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            };
+        }
+    };
     Ok((
-        format!("session={}", utf8_percent_encode(&id, NON_ALPHANUMERIC)),
-        json!({ "session": id }),
+        format!(
+            "session={}",
+            utf8_percent_encode(&session, NON_ALPHANUMERIC)
+        ),
+        json!({ "session": session }),
     ))
 }
 

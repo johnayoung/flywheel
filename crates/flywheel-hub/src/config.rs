@@ -1325,31 +1325,31 @@ pub fn offline_view(state_dir: &Path, home: Option<&Path>) -> Result<Value, Stri
 
 /// A commented example of every key, for the docs and `config show`'s
 /// pointer.
-pub const EXAMPLE: &str = r#"[server]                          # restart to apply
+pub const EXAMPLE: &str = r#"[server]
 bind = "127.0.0.1"
 port = 7420
 public_urls = ["https://box.tailnet.ts.net"]
 allow_origins = []
 trusted_proxies = []
-tls = "off"                       # auto: local name-constrained CA; or "/path/cert.pem,/path/key.pem"
-tls_names = []                    # extra names/IPs/networks for it, e.g. ["192.168.0.0/16"]
-tls_public_names = []             # public tls_names entries you own and opt in to (a warning)
+tls = "off"                # "auto", or "/path/cert.pem,/path/key.pem"
+tls_names = []             # e.g. ["192.168.0.0/16"]
+tls_public_names = []
 
 [sessions]
-scrollback_lines = 5000           # live: sessions started from now on
-restore = true                    # restart
-agent_resume = true               # restart
+scrollback_lines = 5000
+restore = true
+agent_resume = true
 
 [worktrees]
-branch_prefix = "agent/"          # live
+branch_prefix = "agent/"
 
 [import]
-root = "~/code"                   # live
+root = "~/code"
 
 [flywheel]
-enabled = true                    # restart
+enabled = true
 
-[agents.claude]                   # live: a launch naming none gets these
+[agents.claude]            # a launch naming none gets these
 model = "opus"
 permission_mode = "acceptEdits"
 [agents.codex]
@@ -1358,22 +1358,22 @@ approval = "on-request"
 sandbox = "workspace-write"
 
 [plugins]
-enabled = true                    # live: off runs no plugin
-max_concurrent = 4                # restart
+enabled = true
+max_concurrent = 4
 
-[recordings]                      # live: running recordings too
-part_cap = "64MiB"                # a part past it rotates (64KiB..4GiB)
-dir_cap = "1GiB"                  # oldest finished recordings go past it
+[recordings]
+part_cap = "64MiB"
+dir_cap = "1GiB"
 
-[shares]                          # live: links made from now on
-default_expiry = "1h"             # a link naming no expiry
-max_expiry = "30d"                # the longest one may name (60s..30d)
+[shares]
+default_expiry = "1h"
+max_expiry = "30d"
 
-[review]                          # live: "ask for a review"
-reviewer = "other"                # other (claude <-> codex) | same | claude | codex
+[review]
+reviewer = "other"         # other (claude <-> codex) | same | claude | codex
 
-[queue]                           # live: prompt queues
-typing_quiet = "8s"               # no typing in a session this long before its queue delivers (1s..10m)
+[queue]
+typing_quiet = "8s"        # no typing this long before a queue delivers
 "#;
 
 #[cfg(test)]

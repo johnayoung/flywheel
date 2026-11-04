@@ -1,6 +1,6 @@
 # Hub reference
 
-Every `fw hub` verb and flag, the serve flags, the hub's files. `--help` is authoritative; `crates/flywheel-hub/src/docs_drift.rs` fails the build when this page drifts from the CLI or `hub.toml`. Front door: [hub](../hub.md).
+Every `fw hub` verb and flag, the serve flags, the hub's files (`docs_drift.rs` fails the build on drift). Front door: [hub](../hub.md).
 
 ## Conventions
 
@@ -15,28 +15,28 @@ Every `fw hub` verb and flag, the serve flags, the hub's files. `--help` is auth
 Server and lifecycle:
 
 ```bash
-fw hub start {serve} [--timeout SECS] [--handoff]   # detached; returns once serving, prints login URLs
-fw hub stop [--timeout SECS] [--force]              # graceful; --force SIGKILLs after --timeout
-fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS]   # live handoff; exit 0 done, 4 refused, 3 no hub, 1 failed
-fw hub status [--json]                              # exit 0 running, 3 not, 1 unreachable
-fw hub logs [--follow|-f] [--lines|-n N]            # hub.log; -n 0 whole file, default 100
-fw hub serve {serve} [--handoff]                    # foreground; --handoff takes over the running hub
-fw hub install-service {serve} [--name N] [--force] [--print]   # systemd --user unit (default flywheel-hub), not enabled
-fw hub doctor [--port N] [--json]                   # read-only check, a fix per finding; exit 1 on a FAIL
+fw hub start {serve} [--timeout SECS] [--handoff]   # detached; prints login URLs
+fw hub stop [--timeout SECS] [--force]
+fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS]   # exit 4 refused, 3 no hub
+fw hub status [--json]                              # exit 3 not running
+fw hub logs [--follow|-f] [--lines|-n N]            # -n 0: all
+fw hub serve {serve} [--handoff]                    # foreground
+fw hub install-service {serve} [--name N] [--force] [--print]   # systemd --user unit
+fw hub doctor [--port N] [--json]                   # exit 1 on a FAIL
 ```
 
 Sign-in, access, other hubs:
 
 ```bash
 fw hub open [--session S] {remote} {machine}
-fw hub url [--qr] {remote}                          # one-time login URLs; --qr for a phone
+fw hub url [--qr] {remote}
 fw hub token [--rotate]
-fw hub tls ca [--out FILE] [--der]                  # local CA fingerprint, constraints; --out a copy
-fw hub tls rotate                                   # new CA; every device re-installs
+fw hub tls ca [--out FILE] [--der]
+fw hub tls rotate
 fw hub peer issue --name X [--json]
 fw hub peer ls [--json]
 fw hub peer revoke NAME|ID
-fw hub machine add NAME URL [--mint] [--peer-name N] [--fingerprint SHA256] [--replace] [--json]   # secret: FW_HUB_MACHINE_SECRET or stdin
+fw hub machine add NAME URL [--mint] [--peer-name N] [--fingerprint SHA256] [--replace] [--json]   # secret: env or stdin
 fw hub machine ls [--no-probe] [--json]
 fw hub machine rm NAME [--json]
 fw hub machine test [NAME] [--json]
@@ -56,11 +56,11 @@ fw hub template save WS NAME [--kind claude|codex] [--prompt TEXT|-] [--model M]
 fw hub template rm WS NAME {remote} {machine}
 fw hub send SESSION TEXT|- [--enter] [--raw] {remote} {machine}
 fw hub read SESSION [--source visible|recent] [--lines N] [--json] {remote} {machine}
-fw hub wait SESSION --until done|blocked|idle|working|exit [--timeout SECS] [--changed] {remote} {machine}   # 0 met, 124 timeout, 1 error
+fw hub wait SESSION --until done|blocked|idle|working|exit [--timeout SECS] [--changed] {remote} {machine}
 fw hub attach [SESSION] [--prefix C-b] [--no-status] {remote} {machine}
-fw hub kill SESSION [--rm] [--remove-worktree] [--force] {remote} {machine}   # --rm forgets; --remove-worktree needs --rm
+fw hub kill SESSION [--rm] [--remove-worktree] [--force] {remote} {machine}   # --rm forgets
 fw hub relaunch SESSION {remote} {machine}
-fw hub explain [SESSION] [--file SCREEN.txt|-] [--kind claude|codex|shell] [--json] {remote} {machine}   # why its status; --file: a saved screen
+fw hub explain [SESSION] [--file SCREEN.txt|-] [--kind claude|codex|shell] [--json] {remote} {machine}
 fw hub import FILE.code-workspace... [--name N] [--update] [--json]
 ```
 
@@ -81,7 +81,7 @@ Git and agents together:
 
 ```bash
 fw hub review SESSION [--base REF] [--diff PATH] [--scope committed|staged|unstaged|untracked] [--json] {remote} {machine}
-fw hub merge SESSION [--yes|-y] [--rebase] [--remove-worktree] [--abort-rebase] [--json] {remote} {machine}   # ff the base to a worktree branch
+fw hub merge SESSION [--yes|-y] [--rebase] [--remove-worktree] [--abort-rebase] [--json] {remote} {machine}
 fw hub handoff FROM TO (--selection-file F|- | --diff [--path P] [--base REF] | --last-command | --command SEQ | --message N) [--to-machine M] [--max-bytes N] [--edit] [--dry-run] [--json] {remote} {machine}
 fw hub ask-review SESSION [--kind claude|codex] [--base REF] [--dry-run] [--findings] [--send-findings] [--json] {remote} {machine}
 fw hub fanout new WS (--prompt TEXT|- --grader [name=]CMD... | --from-task ID) --agent KIND[:MODEL]... [--folder F] [--base BRANCH] [--name N] [--timeout SECS] [--protect PATH]... [--permission-mode M] [--approval A] [--sandbox S] [--no-commit-instruction] [--json] {remote} {machine}
@@ -99,7 +99,7 @@ fw hub fanout rm FANOUT {remote} {machine}
 Settings and hooks:
 
 ```bash
-fw hub config check [--file PATH]                   # exit 1 invalid
+fw hub config check [--file PATH]
 fw hub config show [--json]
 fw hub plugin ls [--json]
 fw hub plugin enable NAME
@@ -122,11 +122,11 @@ fw hub queue resume SESSION [--json] {remote} {machine}
 
 ### Verb notes
 
-- **`new`**: `--create` makes `WS` (with `--folder`) if none matches. `--folder` (alias `--repo`): a path, label, or dir name. Shell `ARGV` replaces `$SHELL`.
+- **`new`**: `--create` makes `WS` (with `--folder`: a path, label, or dir name; alias `--repo`). Shell `ARGV` replaces `$SHELL`.
 - **`send`**: bracketed only when the program enabled it; a final newline is Enter, 50 ms later. `--raw` sends bytes as is (`$'\x03'` is Ctrl-C).
-- **`import`**: VS Code `*.code-workspace` (JSONC); each `folders` entry a folder, `name` its label; missing / non-local entries skipped and listed. `--update` replaces a workspace's folders.
-- **`open`**: a one-time code via a 0600 redirect page in the state dir (never on argv). Opener: `$BROWSER`, else `wslview`, `cmd.exe /c start`, `xdg-open` / `open`.
-- **`url`**: a fresh code under every URL reaching the hub (public, tailnet https, tailnet, lan, this machine); `--qr` draws the first remote one; never the token.
+- **`import`**: VS Code `*.code-workspace` (JSONC): `folders` entries become folders (non-local skipped, listed); `--update` replaces them.
+- **`open`**: a one-time code via a 0600 redirect page (never on argv); opener `$BROWSER`, else `wslview`, `cmd.exe /c start`, `xdg-open` / `open`.
+- **`url`**: a fresh code under every URL reaching the hub; `--qr` draws the first remote one; never the token.
 - **`report`**: the hook entry point; needs the session's env, prints nothing, fails with 1 (never 2, which would stop a Claude `Stop`).
 - The rest: [hub-workflows](workflows.md) (`wait`, `kill`, `review`, `merge`, `handoff`, `fanout`), [hub-internals](internals.md) (`attach`, `explain`, `upgrade`, `doctor`).
 
@@ -138,13 +138,13 @@ Taken by `serve`, `start`, `install-service`. All but `--notify-url` are also `h
 |---|---|---|
 | `--bind` | `127.0.0.1` | non-loopback warns |
 | `--port` | `7420` | `0` picks a free port |
-| `--public-url` | none | origin browsers reach the hub at via a proxy (no path); repeatable; `url` lists it first |
+| `--public-url` | none | origin browsers reach the hub at via a proxy; repeatable |
 | `--allow-origin` | none | extra accepted origin; repeatable |
 | `--trusted-proxy` | none | a proxy elsewhere whose `X-Forwarded-*` are believed (loopback always); repeatable |
 | `--tls` | `off` | `auto` (local name-constrained CA), `off`, or `CERT,KEY` (your PEM files) |
-| `--tls-name` | none | extra private name, IP, or network (at most /8) for the local CA; repeatable; added later: `fw hub tls rotate` |
+| `--tls-name` | none | extra private name, IP, or network (at most /8) for the local CA; repeatable |
 | `--tls-allow-public-name` | none | opt in to a public `--tls-name` you own; repeatable; warned |
-| `--scrollback-lines` | `5000` | per session, max 1M cells (24 B each: ~14 MiB at 5000 x 120) |
+| `--scrollback-lines` | `5000` | per session, max 1M cells (~14 MiB at 5000 x 120) |
 | `--no-restore` | off | drop pending restores for good |
 | `--no-agent-resume` | off | restore agents as fresh shells |
 | `--no-flywheel` | off | no Flywheel panel, Promote, or task fan-out |
@@ -158,34 +158,34 @@ Taken by `serve`, `start`, `install-service`. All but `--notify-url` are also `h
 
 ## hub.toml
 
-`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors; `serve` refuses an invalid file (exit 2). Edits are re-read within 1 s: live keys apply, the rest at restart; an invalid edit keeps the last good settings (log, toast, `config check`).
+`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors (`serve` exits 2). Edits are re-read within 1 s: live keys apply, the rest at restart; an invalid edit keeps the last good settings.
 
 ```toml
-[server]                          # restart to apply
+[server]
 bind = "127.0.0.1"
 port = 7420
 public_urls = ["https://box.tailnet.ts.net"]
 allow_origins = []
 trusted_proxies = []
-tls = "off"                       # auto: local name-constrained CA; or "/path/cert.pem,/path/key.pem"
-tls_names = []                    # extra names/IPs/networks for it, e.g. ["192.168.0.0/16"]
-tls_public_names = []             # public tls_names entries you own and opt in to (a warning)
+tls = "off"                # "auto", or "/path/cert.pem,/path/key.pem"
+tls_names = []             # e.g. ["192.168.0.0/16"]
+tls_public_names = []
 
 [sessions]
-scrollback_lines = 5000           # live: sessions started from now on
-restore = true                    # restart
-agent_resume = true               # restart
+scrollback_lines = 5000
+restore = true
+agent_resume = true
 
 [worktrees]
-branch_prefix = "agent/"          # live
+branch_prefix = "agent/"
 
 [import]
-root = "~/code"                   # live
+root = "~/code"
 
 [flywheel]
-enabled = true                    # restart
+enabled = true
 
-[agents.claude]                   # live: a launch naming none gets these
+[agents.claude]            # a launch naming none gets these
 model = "opus"
 permission_mode = "acceptEdits"
 [agents.codex]
@@ -194,22 +194,22 @@ approval = "on-request"
 sandbox = "workspace-write"
 
 [plugins]
-enabled = true                    # live: off runs no plugin
-max_concurrent = 4                # restart
+enabled = true
+max_concurrent = 4
 
-[recordings]                      # live: running recordings too
-part_cap = "64MiB"                # a part past it rotates (64KiB..4GiB)
-dir_cap = "1GiB"                  # oldest finished recordings go past it
+[recordings]
+part_cap = "64MiB"
+dir_cap = "1GiB"
 
-[shares]                          # live: links made from now on
-default_expiry = "1h"             # a link naming no expiry
-max_expiry = "30d"                # the longest one may name (60s..30d)
+[shares]
+default_expiry = "1h"
+max_expiry = "30d"
 
-[review]                          # live: "ask for a review"
-reviewer = "other"                # other (claude <-> codex) | same | claude | codex
+[review]
+reviewer = "other"         # other (claude <-> codex) | same | claude | codex
 
-[queue]                           # live: prompt queues
-typing_quiet = "8s"               # no typing in a session this long before its queue delivers (1s..10m)
+[queue]
+typing_quiet = "8s"        # no typing this long before a queue delivers
 ```
 
 | Key | Flag | Default | Applies |
@@ -259,7 +259,7 @@ detail = false                 # leave out what a blocked agent asks (default tr
 
 ## plugin.toml
 
-**A plugin runs as you, unsandboxed; the hub reviews nothing.** Install = copy a directory to `<state-dir>/plugins/<name>/` (nothing downloads one); **disabled** until `fw hub plugin enable NAME`; re-scanned every 2 s. Sample: `crates/flywheel-hub/plugins/hello`. Protocol: [hub-api](api.md#plugins).
+**A plugin runs as you, unsandboxed.** Install: copy a directory to `<state-dir>/plugins/<name>/`; **disabled** until `fw hub plugin enable NAME`; re-scanned every 2 s. Sample: `crates/flywheel-hub/plugins/hello`. Protocol: [hub-api](api.md#plugins).
 
 ```toml
 description = "Ping me when an agent is stuck"
@@ -278,7 +278,7 @@ command = ["./summarize.py"]       # optional: else the top-level one
 
 ## UI settings
 
-`Alt ,` or the sidebar gear. Stored by the hub (`settings.json`), so they follow you; any can be kept for **this device** only.
+`Alt ,` or the sidebar gear. Stored by the hub (`settings.json`); any can be kept for **this device** only.
 
 | Section | |
 |---|---|
@@ -290,7 +290,7 @@ command = ["./summarize.py"]       # optional: else the top-level one
 | Plugins | per plugin: enable, events, actions, last run / error, logs |
 | Server | read-only: effective hub.toml, sources, errors, pending restart |
 
-**Key bindings**: up to 4 per action, `mod+...+key` (`mod` = Ctrl, Cmd on macOS). Refused (422): keys the browser/OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: keys shells lose (`alt+b/f`, `ctrl+<letter>`) or desktops take.
+**Key bindings**: up to 4 per action, `mod+...+key`. Refused (422): keys the browser/OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: keys shells lose (`alt+b/f`, `ctrl+<letter>`).
 
 ## Keyboard shortcuts
 
@@ -386,6 +386,6 @@ All files 0600, the dir 0700.
 | `hub.log`, `hub.log.1..3` | detached hub log |
 | `machines.json`, `peers.json`, `shares.json` | machines (plaintext credentials), peer and share digests |
 | `commands/<id>.json`, `usage-archive.json` | suggested blocks + usage per session; removed sessions' usage |
-| `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` | recordings, plugins (+ enablement, logs), detection overrides, local CA |
+| `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` | recordings, plugins, detection overrides, local CA |
 | `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` | activity journal; each client's last-active time |
 | `open-<id>.html` | `open` redirect pages |

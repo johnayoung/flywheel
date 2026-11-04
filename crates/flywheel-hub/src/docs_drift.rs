@@ -635,10 +635,9 @@ const PAGES: [(&str, &str); 6] = [
 ];
 
 /// The hub docs' size budget, all pages together: condensed, not moved.
-/// The pages were condensed to about 85,400 bytes (83.4 KiB); with the
-/// activity journal they are about 88,300, leaving about 1.8 KiB before
-/// the next condensing pass.
-const HUB_DOCS_MAX_BYTES: usize = 88 * 1024;
+/// Condensed again to about 82,000 bytes (80 KiB), leaving about 4 KiB
+/// before the next pass.
+const HUB_DOCS_MAX_BYTES: usize = 84 * 1024;
 /// One reference page's budget.
 const PAGE_MAX_BYTES: usize = 24 * 1024;
 /// The longest line any hub page may hold: a line longer than this is a

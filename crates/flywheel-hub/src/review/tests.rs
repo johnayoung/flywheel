@@ -1477,11 +1477,17 @@ fn merge_refuses_suspect_files_unless_landed_on_purpose() {
         "{why}"
     );
     assert!(!why.contains("src/a.rs"), "{why}");
+    // Named as the review sheet and the fan-out pick both label it.
+    assert!(why.contains("\"Land them anyway\""), "{why}");
     let refused = merge(&tools(), &t, false, &plan.fingerprint);
     assert!(refused.is_err());
     let plan = plan_merge(&tools(), &t, true).unwrap();
     assert_eq!(plan.refusal, None, "{plan:?}");
-    assert!(plan.warnings.iter().any(|w| w.contains("landed anyway")));
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.contains("they land anyway, as asked"))
+    );
     // A fingerprint from the refusing plan does not run the other.
     let done = merge(&tools(), &t, true, &plan.fingerprint).unwrap();
     assert!(done.ok);
@@ -1513,4 +1519,43 @@ fn a_failed_commit_puts_the_index_back_and_no_identity_is_refused_first() {
     run_git(wt, &["config", "user.name", ""]);
     let plan = plan_commit(&tools(), &t, "feat: new", None).unwrap();
     assert!(plan.refusal.unwrap().contains("no identity"));
+}
+
+#[test]
+fn committed_files_carry_commit_alls_suspect_marks() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    commit_file(wt, "src/lib.rs", "fn a() {}\n", "feat: lib");
+    // Forced: a global excludes file may ignore these.
+    for (file, text) in [
+        (".env", "TOKEN=x\n"),
+        (".claude/settings.local.json", "{}\n"),
+        ("node_modules/x/index.js", "1\n"),
+    ] {
+        write(wt, file, text);
+        run_git(wt, &["add", "-f", "--", file]);
+    }
+    run_git(wt, &["commit", "-qm", "chore: leftovers"]);
+    write(wt, "README", "changed\n");
+    run_git(wt, &["commit", "-qam", "docs: readme"]);
+    let r = read(&tools(), &f.target()).unwrap();
+    let marks: HashMap<&str, Option<&str>> = r
+        .committed
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.suspect))
+        .collect();
+    assert_eq!(marks["src/lib.rs"], None);
+    assert_eq!(
+        marks["README"], None,
+        "a modified file is not one the branch adds"
+    );
+    assert_eq!(marks[".env"], Some("secret"));
+    assert_eq!(marks[".claude/settings.local.json"], Some("personal"));
+    assert_eq!(marks["node_modules/x/index.js"], Some("generated"));
+    // The work tree's sets are not marked (commit all lists those itself).
+    write(wt, "id_rsa", "x\n");
+    run_git(wt, &["add", "-f", "id_rsa"]);
+    let r = read(&tools(), &f.target()).unwrap();
+    assert!(r.staged.files.iter().all(|f| f.suspect.is_none()));
 }

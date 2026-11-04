@@ -606,6 +606,8 @@
 .rva-suspect-kind { color: var(--ink-3); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
 .rva-suspect.secret .rva-suspect-kind, .rva-suspect.personal .rva-suspect-kind { color: var(--alert); }
 .rva-suspect.build .rva-suspect-kind { color: var(--ink-2); }
+.rv-suspect { flex: none; color: var(--ink-3); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
+.rv-suspect.secret, .rv-suspect.personal { color: var(--alert); }
 .rva-hint { margin: 0; color: var(--ink-3); font-size: 11.5px; line-height: 1.5; }
 .rva-refusal, .rva-outcome { white-space: pre-line; overflow-wrap: anywhere; }
 .rva-refusal, .rva-outcome.bad { margin: 0; padding: .55rem .7rem; border-left: 3px solid var(--alert); background: color-mix(in srgb, var(--alert) 10%, transparent); color: var(--ink); line-height: 1.5; }

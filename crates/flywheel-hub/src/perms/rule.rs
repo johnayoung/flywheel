@@ -4,7 +4,7 @@
 //! says what it lets the agent do.
 
 use super::shell::{self, Word};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 /// Longest rule the hub writes.
@@ -316,7 +316,7 @@ pub fn normalize(path: &Path) -> PathBuf {
 }
 
 /// A pending request, as rules see it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Target {
     /// A shell command line.
@@ -1378,13 +1378,20 @@ fn path_risk(rule: &Rule, anchors: &Anchors, repo: &Path) -> Risk {
         ));
     }
     if tool == "Read" {
-        let secret = SECRET_DIRS
-            .iter()
-            .map(|d| home.join(d))
-            .chain(anchors.secrets.iter().cloned())
-            .any(|dir| root.starts_with(&dir) || (globbed && dir.starts_with(&root)));
-        if secret {
-            return Risk::danger("covers credentials or agent settings under your home");
+        let hits = |dir: &PathBuf| root.starts_with(dir) || (globbed && dir.starts_with(&root));
+        if let Some(dir) = SECRET_DIRS.iter().map(|d| home.join(d)).find(hits) {
+            return Risk::danger(format!(
+                "covers credentials or settings under your home ({})",
+                dir.display()
+            ));
+        }
+        // The agents' config dirs and the hub's state dir, wherever they
+        // are (not necessarily under home).
+        if let Some(dir) = anchors.secrets.iter().find(|d| hits(d)) {
+            return Risk::danger(format!(
+                "covers {}, which holds the hub's token or an agent's credentials and settings",
+                dir.display()
+            ));
         }
         return Risk::ok();
     }

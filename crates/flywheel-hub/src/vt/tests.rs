@@ -997,3 +997,106 @@ fn frames_of_a_busy_screen_cost_less_than_its_bytes() {
     let (_, _, sent) = framed(&steps);
     assert!(sent * 10 < raw, "frames {sent} B vs raw {raw} B");
 }
+
+/// Narrowing reflows the primary screen the way `alacritty_terminal`
+/// does: each logical line is re-wrapped, the cursor keeps its screen row,
+/// and the rows that no longer fit go to scrollback -- so the screen's top
+/// row can be the tail of a line whose head is now history ("torn"). That
+/// is the emulator's behavior, not a snapshot fault: pinned here exactly,
+/// with the snapshot (any history budget, 0 included) starting that line
+/// at its head so a client re-wraps it to the same rows.
+#[test]
+fn a_shrink_can_leave_a_wrapped_lines_tail_on_the_top_row() {
+    let screen = |e: &mut Emulator| -> Vec<String> {
+        e.flush();
+        let g = e.term.grid();
+        (g.topmost_line().0..g.screen_lines() as i32)
+            .map(|l| {
+                let row = &g[Line(l)];
+                let mut text: String = (0..g.columns()).map(|c| row[Column(c)].c).collect();
+                text.truncate(text.trim_end().len());
+                if row[Column(g.columns() - 1)].flags.contains(Flags::WRAPLINE) {
+                    text.push('+');
+                }
+                format!("{l:>3} {text}").trim_end().to_owned()
+            })
+            .collect()
+    };
+    let mut e = Emulator::new(40, 6, 200);
+    for i in 0..4 {
+        e.process(format!("{i}{}\r\n", "abcdefghij".repeat(3)).as_bytes());
+    }
+    e.process(b"$ ");
+    e.resize(13, 6);
+    // `+`: the row wraps into the next. Line 0 (the screen's top) is the
+    // tail of "2abc...": its head went to scrollback, the cursor stayed on
+    // row 4.
+    assert_eq!(
+        screen(&mut e),
+        [
+            " -8 0abcdefghijab+",
+            " -7 cdefghijabcde+",
+            " -6 fghij",
+            " -5 1abcdefghijab+",
+            " -4 cdefghijabcde+",
+            " -3 fghij",
+            " -2 2abcdefghijab+",
+            " -1 cdefghijabcde+",
+            "  0 fghij",
+            "  1 3abcdefghijab+",
+            "  2 cdefghijabcde+",
+            "  3 fghij",
+            "  4 $",
+            "  5",
+        ]
+    );
+    assert_eq!(
+        e.term.grid().cursor.point,
+        alacritty_terminal::index::Point::new(Line(4), Column(2))
+    );
+    // The rows read for status rules and `read` are the screen's: the
+    // fragment first; logical lines join the head back.
+    assert_eq!(e.text(TextSource::Visible).lines[0], "fghij");
+    let recent = e.text(TextSource::Recent { lines: 3 });
+    assert_eq!(recent.lines[0], format!("2{}", "abcdefghij".repeat(3)));
+    // A replay is the same, cell for cell.
+    let mut client = replayed(&mut e);
+    assert_same(&mut e, &mut client);
+    // With no history budget the torn line still arrives whole: its head
+    // rows are the client's only history, and its screen rows match.
+    let mut bare = Emulator::new(13, 6, 200);
+    bare.process(&e.snapshot(0));
+    assert_eq!(
+        screen(&mut bare),
+        [
+            " -2 2abcdefghijab+",
+            " -1 cdefghijabcde+",
+            "  0 fghij",
+            "  1 3abcdefghijab+",
+            "  2 cdefghijabcde+",
+            "  3 fghij",
+            "  4 $",
+            "  5",
+        ]
+    );
+    // Narrowing a line that already wrapped tears it the same way.
+    let mut e = Emulator::new(40, 6, 200);
+    for i in 0..3 {
+        e.process(format!("{i}{}\r\n", "x".repeat(55)).as_bytes());
+    }
+    e.process(b"$ ");
+    e.resize(13, 4);
+    assert_eq!(
+        screen(&mut e)[10..],
+        [
+            " -2 2xxxxxxxxxxxx+",
+            " -1 xxxxxxxxxxxxx+",
+            "  0 xxxxxxxxxxxxx+",
+            "  1 xxxxxxxxxxxxx+",
+            "  2 xxxx",
+            "  3 $",
+        ]
+    );
+    let mut client = replayed(&mut e);
+    assert_same(&mut e, &mut client);
+}

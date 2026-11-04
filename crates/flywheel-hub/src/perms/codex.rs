@@ -187,52 +187,287 @@ fn project_dirs(folder: &Folder) -> Vec<PathBuf> {
     dirs
 }
 
-/// What trusting `folder`'s project turns on that the hub writes only after
-/// a typed confirmation: the project's `.codex/` layers' dangerous
-/// settings, dangerous allow rules, and anything that runs programs
-/// (`notify`, `mcp_servers`, hooks). One line each.
-pub fn trust_activates(folder: &Folder, anchors: &super::rule::Anchors) -> Vec<String> {
+/// What trusting a project turns on: every `.codex/` directory under the
+/// trusted root (each applies once a session runs in or below its folder)
+/// and, of those, what the hub writes only after a typed confirmation.
+#[derive(Debug, Clone, Default)]
+pub struct Activation {
+    /// The `.codex/` directories trust would load, outermost first.
+    pub dirs: Vec<PathBuf>,
+    /// One line per setting that disables a safeguard, runs a program,
+    /// or sends data or credentials somewhere; any line means typing.
+    pub dangers: Vec<String>,
+}
+
+/// Directories skipped when looking for nested `.codex/`: git's own data
+/// and dependency/build trees no session is started in.
+const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target"];
+/// Bounds on the walk: past either, the preview says the scan stopped
+/// (which itself needs the typed confirmation).
+const SCAN_MAX_DEPTH: usize = 12;
+const SCAN_MAX_DIRS: usize = 20_000;
+
+/// Every `.codex/` directory under `root` (not following symlinks),
+/// sorted; `Err` carries the ones found when a bound stopped the walk.
+fn codex_dirs_under(root: &Path) -> Result<Vec<PathBuf>, (Vec<PathBuf>, String)> {
+    let mut found = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    let mut stopped = None;
+    while let Some((dir, depth)) = stack.pop() {
+        visited += 1;
+        if visited > SCAN_MAX_DIRS {
+            stopped = Some(format!("stopped after {SCAN_MAX_DIRS} folders"));
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
+            if name == ".codex" && (kind.is_dir() || kind.is_symlink()) {
+                found.push(entry.path());
+                continue;
+            }
+            if !kind.is_dir() || SKIP_DIRS.iter().any(|s| name == *s) {
+                continue;
+            }
+            if depth + 1 > SCAN_MAX_DEPTH {
+                stopped = Some(format!("not looked below {SCAN_MAX_DEPTH} levels"));
+                continue;
+            }
+            stack.push((entry.path(), depth + 1));
+        }
+    }
+    found.sort();
+    match stopped {
+        None => Ok(found),
+        Some(why) => Err((found, why)),
+    }
+}
+
+fn str_list(value: Option<&toml::Value>) -> Option<String> {
+    let value = value?;
+    Some(match value {
+        toml::Value::Array(items) => items.iter().map(value_text).collect::<Vec<_>>().join(" "),
+        other => value_text(other),
+    })
+}
+
+/// The dangers in one table of a Codex config: the top level (`scope`
+/// empty) or a `[profiles.<name>]` table. `providers` resolves a
+/// `model_provider` to its `[model_providers.<id>]` entry.
+fn table_dangers(
+    at: &str,
+    scope: &str,
+    table: &toml::Table,
+    providers: Option<&toml::Table>,
+    out: &mut Vec<String>,
+) {
+    for (setting, key) in [
+        (Setting::ApprovalPolicy, "approval_policy"),
+        (Setting::SandboxMode, "sandbox_mode"),
+    ] {
+        if let Some(value) = table.get(key).map(value_text)
+            && let Some(why) = setting.danger(&value)
+        {
+            out.push(format!("{at}: {scope}{key} = {value} ({why})"));
+        }
+    }
+    if let Some(write) = table
+        .get("sandbox_workspace_write")
+        .and_then(|v| v.as_table())
+    {
+        if write.get("network_access").and_then(|v| v.as_bool()) == Some(true) {
+            out.push(format!(
+                "{at}: {scope}sandbox_workspace_write.network_access = true (sandboxed commands reach the network)"
+            ));
+        }
+        if let Some(roots) = str_list(write.get("writable_roots")).filter(|r| !r.is_empty()) {
+            out.push(format!(
+                "{at}: {scope}sandbox_workspace_write.writable_roots = {roots} (writes outside the workspace without asking)"
+            ));
+        }
+    }
+    if let Some(id) = table.get("model_provider").map(value_text) {
+        let entry = providers
+            .and_then(|p| p.get(&id))
+            .and_then(|v| v.as_table());
+        let target = entry
+            .and_then(|e| e.get("base_url"))
+            .map(value_text)
+            .map(|u| format!(" at {u}"))
+            .unwrap_or_default();
+        out.push(format!(
+            "{at}: {scope}model_provider = {id} (sends every prompt and the code it reads to that provider{target})"
+        ));
+    }
+}
+
+/// Everything in one `.codex/config.toml` that trust would turn on and
+/// that needs typing. `user` (the user's config) resolves a `profile` or
+/// `model_provider` the project names but does not define.
+fn config_dangers(at: &str, table: &toml::Table, user: Option<&toml::Table>) -> Vec<String> {
     let mut out = Vec::new();
-    for dir in project_dirs(folder) {
-        let codex = dir.join(".codex");
+    let mut providers = user
+        .and_then(|u| u.get("model_providers"))
+        .and_then(|v| v.as_table())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(own) = table.get("model_providers").and_then(|v| v.as_table()) {
+        providers.extend(own.clone());
+    }
+    table_dangers(at, "", table, Some(&providers), &mut out);
+    let profiles = table.get("profiles").and_then(|v| v.as_table());
+    let selected = table.get("profile").map(value_text);
+    if let Some(name) = &selected
+        && profiles.and_then(|p| p.get(name)).is_none()
+        && let Some(theirs) = user
+            .and_then(|u| u.get("profiles"))
+            .and_then(|p| p.get(name))
+            .and_then(|v| v.as_table())
+    {
+        let how = format!("profile = {name} selects the user's [profiles.{name}], whose ");
+        table_dangers(at, &how, theirs, Some(&providers), &mut out);
+    }
+    for (name, profile) in profiles.into_iter().flatten() {
+        let Some(profile) = profile.as_table() else {
+            continue;
+        };
+        let how = if selected.as_deref() == Some(name.as_str()) {
+            format!("[profiles.{name}] (selected) ")
+        } else {
+            format!("[profiles.{name}] (with --profile {name}) ")
+        };
+        table_dangers(at, &how, profile, Some(&providers), &mut out);
+    }
+    let own = table.get("model_providers").and_then(|v| v.as_table());
+    for (id, provider) in own.into_iter().flatten() {
+        let Some(provider) = provider.as_table() else {
+            continue;
+        };
+        let url = provider
+            .get("base_url")
+            .map(value_text)
+            .unwrap_or_else(|| "its default URL".to_owned());
+        let mut creds: Vec<String> = Vec::new();
+        if let Some(key) = provider.get("env_key").map(value_text) {
+            creds.push(format!("${key}"));
+        }
+        if let Some(headers) = provider.get("env_http_headers").and_then(|v| v.as_table()) {
+            creds.extend(headers.values().map(|v| format!("${}", value_text(v))));
+        }
+        let creds = if creds.is_empty() {
+            String::new()
+        } else {
+            format!(", with {} from the environment", creds.join(", "))
+        };
+        out.push(format!(
+            "{at}: model_providers.{id} (sends prompts and code to {url}{creds})"
+        ));
+    }
+    if let Some(command) = str_list(table.get("notify")) {
+        out.push(format!("{at}: notify runs `{command}` after every turn"));
+    }
+    for (name, server) in table
+        .get("mcp_servers")
+        .and_then(|v| v.as_table())
+        .into_iter()
+        .flatten()
+    {
+        let server = server.as_table();
+        let command = server.and_then(|s| str_list(s.get("command")));
+        let args = server
+            .and_then(|s| str_list(s.get("args")))
+            .filter(|a| !a.is_empty());
+        let url = server.and_then(|s| s.get("url")).map(value_text);
+        let what = match (command, url) {
+            (Some(c), _) => match args {
+                Some(a) => format!("runs `{c} {a}`"),
+                None => format!("runs `{c}`"),
+            },
+            (None, Some(u)) => format!("connects to {u}"),
+            (None, None) => "an MCP server".to_owned(),
+        };
+        let token = server
+            .and_then(|s| s.get("bearer_token_env_var"))
+            .map(|v| format!(", sending ${}", value_text(v)))
+            .unwrap_or_default();
+        out.push(format!("{at}: mcp_servers.{name} {what}{token}"));
+    }
+    if table.contains_key("hooks") {
+        out.push(format!("{at}: hooks (run programs they name)"));
+    }
+    out
+}
+
+/// What trusting `folder`'s project turns on: the `.codex/` directories
+/// from the git top down to the folder and every other one under the
+/// trusted root (the same trust covers a session started there), with the
+/// dangerous settings, program-running and data-sending entries
+/// (`profile`/`[profiles.*]`, `model_provider`/`[model_providers.*]`,
+/// `[mcp_servers.*]`, `notify`, hooks), and dangerous allow rules.
+pub fn trust_activates(folder: &Folder, env: &Env, anchors: &super::rule::Anchors) -> Activation {
+    let root = project_key(folder);
+    let (_, user) = read_layer("user", env.codex_home.join("config.toml"));
+    let mut act = Activation::default();
+    let mut dirs: Vec<PathBuf> = project_dirs(folder)
+        .into_iter()
+        .map(|d| d.join(".codex"))
+        .filter(|d| d.exists())
+        .collect();
+    match codex_dirs_under(&root) {
+        Ok(found) => dirs.extend(found),
+        Err((found, why)) => {
+            dirs.extend(found);
+            act.dangers.push(format!(
+                "{}: the scan for nested .codex/ directories {why}, so trust may turn on more than listed",
+                root.display()
+            ));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    for codex in &dirs {
+        if std::fs::symlink_metadata(codex).is_ok_and(|m| m.file_type().is_symlink()) {
+            act.dangers.push(format!(
+                "{}: a symlink (to {}), so its contents can change after this preview",
+                codex.display(),
+                std::fs::read_link(codex)
+                    .map(|t| t.display().to_string())
+                    .unwrap_or_else(|_| "?".into())
+            ));
+        }
         let config = codex.join("config.toml");
         let (layer, table) = read_layer("project", config.clone());
-        let at = config.display();
+        let at = config.display().to_string();
         if let Some(e) = &layer.error {
-            out.push(format!(
+            act.dangers.push(format!(
                 "{at}: cannot be read ({e}), so the hub cannot judge it"
             ));
         }
-        for (setting, value) in [
-            (Setting::ApprovalPolicy, &layer.approval_policy),
-            (Setting::SandboxMode, &layer.sandbox_mode),
-        ] {
-            if let Some(value) = value
-                && let Some(why) = setting.danger(value)
-            {
-                let key = match setting {
-                    Setting::ApprovalPolicy => "approval_policy",
-                    _ => "sandbox_mode",
-                };
-                out.push(format!("{at}: {key} = {value} ({why})"));
-            }
-        }
         if let Some(table) = &table {
-            for key in ["notify", "mcp_servers", "hooks"] {
-                if table.contains_key(key) {
-                    out.push(format!("{at}: {key} (runs programs it names)"));
-                }
-            }
+            act.dangers
+                .extend(config_dangers(&at, table, user.as_ref()));
         }
         if codex.join("hooks.json").exists() {
-            out.push(format!(
-                "{}: hooks (run programs it names)",
+            act.dangers.push(format!(
+                "{}: hooks (run programs they name)",
                 codex.join("hooks.json").display()
             ));
         }
         let mut files = Vec::new();
         read_rules("project", &codex.join("rules"), &mut files);
         for file in files {
+            if let Some(e) = &file.error {
+                act.dangers.push(format!(
+                    "{}: cannot be read ({e}), so the hub cannot judge it",
+                    file.path.display()
+                ));
+            }
             for rule in file.rules.iter().filter(|r| r.decision == "allow") {
                 let risk = super::synth::codex_candidate(
                     rule.pattern.clone(),
@@ -246,7 +481,7 @@ pub fn trust_activates(folder: &Folder, anchors: &super::rule::Anchors) -> Vec<S
                     reason: e,
                 });
                 if risk.dangerous {
-                    out.push(format!(
+                    act.dangers.push(format!(
                         "{}: allow {:?} ({})",
                         file.path.display(),
                         rule.pattern,
@@ -256,7 +491,8 @@ pub fn trust_activates(folder: &Folder, anchors: &super::rule::Anchors) -> Vec<S
             }
         }
     }
-    out
+    act.dirs = dirs;
+    act
 }
 
 /// The project key trust is recorded under.

@@ -171,7 +171,22 @@ fn file_line(f: &Value) -> String {
         Some(old) => format!("{old} -> {}", str_field(f, "path")),
         None => str_field(f, "path").to_owned(),
     };
-    format!("  {status} {:>12}  {path}", counts(f))
+    let flag = match f.get("suspect").and_then(Value::as_str) {
+        Some(kind) => format!("  [{}]", suspect_label(kind)),
+        None => String::new(),
+    };
+    format!("  {status} {:>12}  {path}{flag}", counts(f))
+}
+
+/// What a suspect kind means, as the commit dialog words it.
+fn suspect_label(kind: &str) -> &str {
+    match kind {
+        "generated" => "build output",
+        "build" => "maybe build output",
+        "personal" => "personal agent settings",
+        "large" => "5 MiB or more",
+        other => other,
+    }
 }
 
 fn render_set(out: &mut dyn Write, title: &str, set: &Value) -> std::io::Result<()> {
@@ -523,4 +538,23 @@ fn abort_rebase(
         writeln!(out, "{}", str_field(&done, "summary")).map_err(io)?;
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn committed_suspects_are_flagged_in_the_file_list() {
+        let secret = json!({ "path": ".env", "status": "added", "insertions": 1, "deletions": 0, "binary": false, "suspect": "secret" });
+        assert!(
+            file_line(&secret).ends_with(".env  [secret]"),
+            "{}",
+            file_line(&secret)
+        );
+        let built = json!({ "path": "dist/a.js", "status": "added", "insertions": 1, "deletions": 0, "binary": false, "suspect": "generated" });
+        assert!(file_line(&built).ends_with("[build output]"));
+        let plain = json!({ "path": "src/a.rs", "status": "added", "insertions": 1, "deletions": 0, "binary": false });
+        assert!(file_line(&plain).ends_with("src/a.rs"));
+    }
 }

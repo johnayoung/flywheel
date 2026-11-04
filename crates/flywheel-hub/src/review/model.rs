@@ -32,6 +32,11 @@ pub struct FileChange {
     pub insertions: Option<u32>,
     pub deletions: Option<u32>,
     pub binary: bool,
+    /// Committed files only: what commit all would flag it as (`secret`,
+    /// `personal`, `generated`, `build`, `large`; see
+    /// `review::suspects`), for a file the branch adds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspect: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -211,9 +216,37 @@ fn parse_changes(numstat: &[u8], name_status: &[u8]) -> Vec<FileChange> {
                 old_path,
                 insertions,
                 deletions,
+                suspect: None,
             }
         })
         .collect()
+}
+
+/// Mark the files a branch adds (renames and copies included: a new path
+/// either way) that commit all would flag, with the same classifier.
+fn mark_suspects(dir: &Path, set: &mut FileSet) {
+    let added: Vec<&str> = set
+        .files
+        .iter()
+        .filter(|f| matches!(f.status.as_str(), "added" | "renamed" | "copied"))
+        .map(|f| f.path.as_str())
+        .collect();
+    if added.is_empty() {
+        return;
+    }
+    let found = super::suspects::suspects(dir, &added, None);
+    for file in &mut set.files {
+        if !matches!(file.status.as_str(), "added" | "renamed" | "copied") {
+            continue;
+        }
+        // A file, or a directory entry (`dist/`) standing for its files.
+        file.suspect = found
+            .iter()
+            .find(|s| {
+                s.path == file.path || (s.path.ends_with('/') && file.path.starts_with(&s.path))
+            })
+            .map(|s| s.kind);
+    }
 }
 
 const DIFF_FLAGS: &[&str] = &["--no-color", "--no-ext-diff", "--no-textconv", "-M"];
@@ -500,6 +533,7 @@ fn read_branch(git: &Git<'_>, target: &Target) -> Result<Review, String> {
         }
         if let Some(from) = &merge_base {
             review.committed = file_set(git, &[from, "HEAD"])?;
+            mark_suspects(&target.dir, &mut review.committed);
         }
         review.base = Some(BaseView {
             name,

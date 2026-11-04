@@ -535,10 +535,10 @@ pub fn plan_merge(tools: &Tools, target: &Target, include_suspects: bool) -> Res
             held.join(", ")
         );
         if include_suspects {
-            warnings.push(format!("{what} (landed anyway, as asked)"));
+            warnings.push(format!("{what} (they land anyway, as asked)"));
         } else if refusal.is_none() {
             refusal = Some(format!(
-                "{what}. Remove them from the branch (git rm --cached, commit), or land them anyway (--include-suspects, or tick it in the dialog)"
+                "{what}. Remove them from the branch (git rm --cached, commit), or land them anyway (--include-suspects; in the hub, \"Land them anyway\")"
             ));
         }
     }

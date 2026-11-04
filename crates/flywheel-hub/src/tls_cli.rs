@@ -250,7 +250,8 @@ fn rotate(args: &RotateArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result
         None => {
             let _ = writeln!(
                 out,
-                "no hub is running; the next `--tls auto` start uses it"
+                "{}; it serves from the new CA when started with `--tls auto`",
+                crate::endpoint::no_hub_message(&state_dir)
             );
         }
     }

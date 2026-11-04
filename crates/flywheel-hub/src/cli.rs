@@ -51,11 +51,15 @@ enum HubCommand {
     /// hub.log); returns once it is serving and prints the login URLs.
     Start(lifecycle::StartArgs),
     /// Stop the running hub gracefully; its running sessions are recorded
-    /// stopped and come back on the next start.
+    /// stopped and come back on the next start. Exit code 3 when no hub
+    /// runs.
     Stop(lifecycle::StopArgs),
     /// Replace the running hub with a new process (binary) without ending
     /// any session: a live handoff of every terminal, its screen, and its
-    /// state. Exit code 0 handed off, 4 refused (nothing changed).
+    /// state. Exit codes: 0 handed off (or restarted with
+    /// --allow-restart), 1 failed (the hub carries on or was rolled back),
+    /// 3 no hub running, 4 refused as incompatible (nothing changed), 5
+    /// busy (nothing changed; retry).
     Upgrade(crate::upgrade::UpgradeArgs),
     /// Is the hub running: pid, uptime, URL, workspace and session counts.
     /// Exit code 0 running, 3 not running, 1 running but unreachable.

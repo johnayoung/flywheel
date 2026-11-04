@@ -214,7 +214,7 @@ fn run_checks(
         checks.push(on_path_check(name, &executables_named(name, path), exe));
     }
     let hub = running_hub(dir);
-    checks.push(hub_check(&hub, exe));
+    checks.push(hub_check(&hub, exe, dir));
     let hub_path = hub.as_ref().and_then(|h| h.path.clone());
     let claude = agent_check(SessionKind::Claude, path, hub_path.as_deref());
     let claude_program = agent::resolve_program("claude", path);

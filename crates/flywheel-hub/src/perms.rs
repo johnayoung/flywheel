@@ -39,7 +39,7 @@ pub use hub_side::{AllowBody, Where};
 
 use crate::agent::SessionKind;
 use rule::{Anchors, Rule, Target};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -197,6 +197,30 @@ impl Folder {
     }
 }
 
+/// The format of [`PendingExport`]; bump it on any change a hub reading
+/// the previous one would misread.
+pub const PENDING_EXPORT_VERSION: u32 = 1;
+
+/// Pending permission requests handed to the next hub process.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingExport {
+    /// [`PENDING_EXPORT_VERSION`] (0: none carried, an older hub).
+    pub version: u32,
+    pub requests: Vec<PendingRequestExport>,
+}
+
+/// One session's pending request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRequestExport {
+    pub session: String,
+    pub agent: String,
+    pub tool: String,
+    pub target: rule::Target,
+    pub source: String,
+    /// Already journaled (the next hub must not journal it again).
+    pub journaled: bool,
+}
+
 /// The hub's permissions state: each blocked session's pending request
 /// (from its hook) and the request journal.
 #[derive(Debug)]
@@ -251,6 +275,66 @@ impl Runtime {
 
     pub fn pending_for(&self, session: &str) -> Option<Request> {
         self.pending().get(session).cloned()
+    }
+
+    /// Every blocked session's pending request, for the next hub process
+    /// (a live handoff); sorted by session.
+    pub fn handoff_export(&self) -> PendingExport {
+        let journaled = self
+            .journaled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut requests: Vec<PendingRequestExport> = self
+            .pending()
+            .iter()
+            .map(|(session, r)| PendingRequestExport {
+                session: session.clone(),
+                agent: r.agent.to_owned(),
+                tool: r.tool.clone(),
+                target: r.target.clone(),
+                source: r.source.to_owned(),
+                journaled: journaled.get(session) == Some(&r.key),
+            })
+            .collect();
+        requests.sort_by(|a, b| a.session.cmp(&b.session));
+        PendingExport {
+            version: PENDING_EXPORT_VERSION,
+            requests,
+        }
+    }
+
+    /// Take over what [`Runtime::handoff_export`] carried. An export in
+    /// another format is refused whole (its sessions fall back to their
+    /// screens, as after a restart); a request this hub cannot read is
+    /// skipped. Returns how many were taken.
+    pub fn handoff_import(&self, export: PendingExport) -> Result<usize, String> {
+        if export.version != PENDING_EXPORT_VERSION {
+            if export.version == 0 && export.requests.is_empty() {
+                return Ok(0);
+            }
+            return Err(format!(
+                "pending permission requests in format v{} (this hub reads v{PENDING_EXPORT_VERSION}) were dropped",
+                export.version
+            ));
+        }
+        let mut taken = 0;
+        let mut pending = self.pending();
+        let mut journaled = self
+            .journaled
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for r in export.requests {
+            let Some(request) = Request::restore(&r.agent, r.tool, r.target, &r.source) else {
+                continue;
+            };
+            if r.journaled {
+                journaled.insert(r.session.clone(), request.key.clone());
+            }
+            pending.insert(r.session, request);
+            taken += 1;
+        }
+        Ok(taken)
     }
 
     /// Record `request` (once per prompt) with its default proposal.

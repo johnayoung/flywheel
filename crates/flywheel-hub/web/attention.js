@@ -42,6 +42,7 @@ window.FwHubAttention = function (ctx) {
     const workspace = workspaceById(session.workspace_id);
     const active = state.attached === session.id;
     const branch = branchOf(session);
+    const num = ctx.numberOf ? ctx.numberOf(session.id) : null;
     return el(
       "li",
       {},
@@ -49,11 +50,12 @@ window.FwHubAttention = function (ctx) {
         "button",
         {
           type: "button",
-          className: `attn-row ${agent.status}${active ? " active" : ""}`,
+          className: `attn-row ${agent.status}${active ? " active" : ""}${num ? " numbered" : ""}`,
           dataset: { id: session.id },
           "aria-current": active ? "true" : undefined,
           onclick: () => openSession(session.id),
         },
+        num ? el("span", { className: "attn-num", textContent: num }) : null,
         el("span", { className: `glyph ${session.kind}` }, icon(session.kind === "codex" ? "codex" : "claude")),
         el(
           "span",

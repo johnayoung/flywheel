@@ -467,6 +467,9 @@ window.FwHubReview = function (ctx) {
         slash >= 0 ? el("span", { className: "rv-dir", textContent: f.path.slice(0, slash + 1) }) : null,
         el("b", { textContent: f.path.slice(slash + 1) }),
       ),
+      f.suspect
+        ? el("span", { className: `rv-suspect ${f.suspect}`, title: "Commit all would flag this file too", textContent: SUSPECT[f.suspect] || f.suspect })
+        : null,
       f.binary
         ? el("span", { className: "rv-counts", textContent: "binary" })
         : f.status === "untracked"

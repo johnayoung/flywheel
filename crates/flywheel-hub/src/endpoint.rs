@@ -524,6 +524,18 @@ fn local_token(state_dir: &Path) -> Result<String, String> {
         .ok_or_else(|| "the running hub's token file is missing".to_owned())
 }
 
+/// The exit code of every lifecycle verb that needs the running hub and
+/// finds none (`status`, `stop`, `upgrade`, `start|serve --handoff`): the
+/// LSB "not running".
+pub const EXIT_NOT_RUNNING: i32 = 3;
+
+/// Say on `to` that no hub runs for `state_dir` (the one wording every verb
+/// uses) and return [`EXIT_NOT_RUNNING`].
+pub fn not_running(state_dir: &Path, to: &mut dyn std::io::Write) -> i32 {
+    let _ = writeln!(to, "fw hub: {}", no_hub_message(state_dir));
+    EXIT_NOT_RUNNING
+}
+
 /// What a verb that needs the running hub says when there is none: how to
 /// start one for the same state dir (`--state-dir` spelled out unless it
 /// is the default).

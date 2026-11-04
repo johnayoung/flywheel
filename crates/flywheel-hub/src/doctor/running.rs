@@ -89,10 +89,10 @@ fn process_path(pid: u32) -> Option<OsString> {
         .map(|value| OsStr::from_bytes(value).to_os_string())
 }
 
-pub(crate) fn hub_check(hub: &Option<Running>, exe: Option<&Path>) -> Check {
+pub(crate) fn hub_check(hub: &Option<Running>, exe: Option<&Path>, dir: &Path) -> Check {
     let id = "hub";
     let Some(hub) = hub else {
-        return Check::new(id, Level::Info, "not running for this state dir")
+        return Check::new(id, Level::Info, crate::endpoint::no_hub_message(dir))
             .fix("`fw hub start` (detached) or `fw hub serve` (foreground)");
     };
     let version = hub

@@ -376,6 +376,14 @@ impl Emulator {
     /// new rows are blank, below. (`Term` always pulls scrollback, which
     /// put old lines -- an answered approval, a stale busy line -- on this
     /// screen but not on the viewer's, shifting every row number.)
+    ///
+    /// Narrowing is `Term`'s reflow as is: every logical line re-wraps,
+    /// the cursor keeps its screen row, and rows that no longer fit above
+    /// it go to scrollback -- so the top screen row may be the tail of a
+    /// line whose head is now history. Snapshots start such a line at its
+    /// head (whatever the history budget), so a client holds the same
+    /// rows; `TextSource::Visible` reads the tail alone (pinned by
+    /// `a_shrink_can_leave_a_wrapped_lines_tail_on_the_top_row`).
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.flush();
         let size = Size {

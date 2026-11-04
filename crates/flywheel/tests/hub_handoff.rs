@@ -35,8 +35,11 @@ impl Env {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        // Right after the verb: anything after `--` is a session's argv.
-        let mut argv: Vec<&str> = vec!["hub", args[0], "--state-dir", self.state.to_str().unwrap()];
+        // Right after the verb (`perms show`: both words): anything after
+        // `--` is a session's argv.
+        let mut argv: Vec<&str> = vec!["hub"];
+        argv.extend(args[0].split(' '));
+        argv.extend(["--state-dir", self.state.to_str().unwrap()]);
         argv.extend_from_slice(&args[1..]);
         let mut command = Command::new(env!("CARGO_BIN_EXE_fw"));
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -752,4 +755,97 @@ fn handoff_without_a_running_hub_is_refused_cleanly() {
         String::from_utf8_lossy(&serve.stderr).contains("cannot hand off"),
         "{serve:?}"
     );
+    // One wording and exit code for every lifecycle verb that needs a hub.
+    let said = format!(
+        "fw hub: no hub is running for state dir {} (start one with `fw hub start --state-dir {}`)",
+        env.state.display(),
+        env.state.display()
+    );
+    for verb in [
+        &["upgrade"][..],
+        &["stop"],
+        &["status"],
+        &["start", "--handoff"],
+    ] {
+        let output = env.fw(verb);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(3), "{verb:?}: {text}");
+        assert_eq!(text.trim(), said, "{verb:?}");
+    }
+    // Verbs that work without a hub say so the same way.
+    // (exit 1 here: the test box lacks the agents it checks for)
+    let doctor: Value = serde_json::from_slice(&env.fw(&["doctor", "--json"]).stdout).unwrap();
+    let hub = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "hub")
+        .unwrap()
+        .clone();
+    assert!(said.ends_with(hub["summary"].as_str().unwrap()), "{hub}");
+}
+
+#[test]
+fn a_blocked_session_keeps_its_always_allow_candidates_across_an_upgrade() {
+    let env = Env::new();
+    let setup = setup(&env);
+    // The hook's PermissionRequest names the request; the fake claude's
+    // screen shows no dialog, so only the carried request can answer.
+    let secret = std::fs::read_to_string(env.root.join("claude.secret")).unwrap();
+    let secret = secret.trim().strip_prefix("secret=").unwrap().to_owned();
+    let mut hook = Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args([
+            "hub",
+            "report",
+            "--source",
+            "claude",
+            "--event",
+            "PermissionRequest",
+            "--stdin",
+        ])
+        .env("FLYWHEEL_HUB_SESSION", &setup.agent)
+        .env("FLYWHEEL_HUB_REPORT_SOCKET", env.state.join("report.sock"))
+        .env("FLYWHEEL_HUB_REPORT_SECRET", secret)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    hook.stdin
+        .take()
+        .unwrap()
+        .write_all(
+            json!({ "tool_name": "Bash", "tool_input": { "command": "cargo test -p parser" } })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+    assert!(hook.wait().unwrap().success());
+    wait_for("blocked", Duration::from_secs(5), || {
+        agent_status(&env, &setup.agent) == "blocked"
+    });
+    let pending = || -> Value {
+        let shown: Value =
+            serde_json::from_str(&env.ok(&["perms show", &setup.agent, "--json"])).unwrap();
+        shown["pending"].clone()
+    };
+    let before = pending();
+    assert_eq!(before["request"]["source"], "hook", "{before}");
+    let candidates = before["claude"]["candidates"].clone();
+    assert!(
+        candidates.as_array().is_some_and(|c| !c.is_empty()),
+        "{before}"
+    );
+
+    env.ok(&["upgrade", "--binary", env!("CARGO_BIN_EXE_fw")]);
+    assert_eq!(agent_status(&env, &setup.agent), "blocked");
+    let after = pending();
+    assert_eq!(
+        after["request"], before["request"],
+        "the same request, same key"
+    );
+    assert_eq!(after["claude"]["candidates"], candidates);
 }

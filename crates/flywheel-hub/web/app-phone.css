@@ -101,6 +101,8 @@
   background: none;
   text-align: left;
 }
+.attn-row.numbered { grid-template-columns: auto auto 1fr auto; padding-left: .45rem; }
+.attn-num { font-size: 9px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .attn-row:hover, .attn-row.active { background: var(--bg-4); }
 .attn-row.blocked { border-left-color: var(--alert); }
 .attn-row.done { border-left-color: var(--brass); }

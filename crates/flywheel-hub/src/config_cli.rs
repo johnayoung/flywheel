@@ -132,11 +132,11 @@ fn show(args: &ShowArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         print_json(out, &view);
         return 0;
     }
-    print_view(&view, out);
+    print_view(&view, &dir, out);
     0
 }
 
-fn print_view(view: &Value, out: &mut dyn Write) {
+fn print_view(view: &Value, dir: &std::path::Path, out: &mut dyn Write) {
     let file = &view["file"];
     let path = file["path"].as_str().unwrap_or("");
     let state = if !file["error"].is_null() {
@@ -153,7 +153,8 @@ fn print_view(view: &Value, out: &mut dyn Write) {
     if view["running"].as_bool() != Some(true) {
         let _ = writeln!(
             out,
-            "no hub running: the file over the defaults (flags of a start are not known)"
+            "{}; showing the file over the defaults (a start's flags are not known)",
+            crate::endpoint::no_hub_message(dir)
         );
     }
     let rows: Vec<(String, String, String, String)> = view["values"]

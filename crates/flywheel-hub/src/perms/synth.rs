@@ -26,6 +26,14 @@ pub struct Request {
 }
 
 impl Request {
+    /// A request as another hub process held it (a live handoff): `None`
+    /// for an agent or source this hub does not know.
+    pub fn restore(agent: &str, tool: String, target: Target, source: &str) -> Option<Self> {
+        let agent = ["claude", "codex"].into_iter().find(|a| *a == agent)?;
+        let source = ["hook", "screen"].into_iter().find(|s| *s == source)?;
+        Some(Self::new(agent, tool, target, source))
+    }
+
     fn new(agent: &'static str, tool: String, target: Target, source: &'static str) -> Self {
         let digest = Sha256::new()
             .chain_update(agent.as_bytes())

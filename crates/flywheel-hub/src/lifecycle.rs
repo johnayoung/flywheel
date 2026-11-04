@@ -15,8 +15,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// `fw hub status` exit code when no hub runs (the LSB "not running").
-pub const EXIT_NOT_RUNNING: i32 = 3;
+pub use crate::endpoint::EXIT_NOT_RUNNING;
 /// How long `status` (a health probe) and `start`'s report wait for the hub
 /// to answer: a hub that is alive but wedged must not stall them.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -236,10 +235,7 @@ pub(crate) fn stop(args: &StopArgs, out: &mut dyn Write, err: &mut dyn Write) ->
     };
     let info = match running_hub(&dir) {
         Ok(Some(info)) => info,
-        Ok(None) => {
-            let _ = writeln!(out, "no hub is running for state dir {}", dir.display());
-            return 0;
-        }
+        Ok(None) => return crate::endpoint::not_running(&dir, err),
         Err(message) => return fail(err, &message),
     };
     stop_running(&dir, &info, args, out, err)
@@ -372,14 +368,9 @@ pub(crate) fn status(args: &StatusArgs, out: &mut dyn Write, err: &mut dyn Write
         Ok(None) => {
             if args.json {
                 let _ = writeln!(out, "{}", json!({ "running": false, "state_dir": dir }));
-            } else {
-                let _ = writeln!(
-                    out,
-                    "flywheel hub is not running (state dir {})",
-                    dir.display()
-                );
+                return EXIT_NOT_RUNNING;
             }
-            return EXIT_NOT_RUNNING;
+            return crate::endpoint::not_running(&dir, out);
         }
         Err(message) => return fail(err, &message),
     };

@@ -1151,6 +1151,54 @@ try {
   await viewer.screenshot({ path: path.join(out, "phone-share.png") });
   await phone.close();
 
+  // --- phone-width companion rows -----------------------------------------
+  // With a finger or a mouse: every session row and row action is a 44px
+  // target; a companion's actions stay on its one line; and with its
+  // agent in Needs you (an orphaned companion) the numbers run on without
+  // a gap (the Needs you row carries the agent's).
+  const compAgent = await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", name: "comp agent", prompt: "polish", cols: 100, rows: 30 });
+  const comp = await api("POST", `/api/sessions/${compAgent.id}/companion`, { cols: 100, rows: 30 });
+  for (const touch of [true, false]) {
+    const label = touch ? "phone" : "phone width, mouse";
+    const cc = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: touch, hasTouch: touch, deviceScaleFactor: 2 });
+    const cp = await cc.newPage();
+    await cp.goto(`${base}/login?token=${token}#session=${comp.id}`);
+    await cp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
+    await cp.waitForSelector(`#attention .attn-row[data-id="${compAgent.id}"]`, { timeout: 10000 }).catch(() => {});
+    await cp.locator(".menu-toggle").click();
+    await cp.waitForFunction(() => document.body.classList.contains("side-open"), null, { timeout: 5000 });
+    await cp.waitForTimeout(300);
+    const row = cp.locator(`#workspaces .session[data-id="${comp.id}"]`);
+    await row.scrollIntoViewIfNeeded();
+    if (!touch) await row.hover();
+    const got = await cp.evaluate((id) => {
+      const short = [...document.querySelectorAll("#workspaces .session")].filter((n) => n.offsetParent !== null)
+        .map((n) => [n.querySelector(".session-name")?.textContent, Math.round(n.getBoundingClientRect().height)]).filter(([, h]) => h < 44);
+      const r = document.querySelector(`#workspaces .session[data-id="${id}"]`);
+      const name = r.querySelector(".session-name").getBoundingClientRect();
+      const mid = (b) => b.top + b.height / 2;
+      const buttons = [...r.querySelectorAll(".session-actions button")].filter((n) => n.offsetParent !== null).map((n) => n.getBoundingClientRect());
+      const nums = [...document.querySelectorAll("#attention .attn-num, #workspaces .session .num")].map((n) => Number(n.textContent)).sort((a, b) => a - b);
+      return {
+        short,
+        orphan: r.classList.contains("orphan"),
+        buttons: buttons.length,
+        small: buttons.filter((b) => b.width < 44 || b.height < 44).length,
+        offLine: buttons.filter((b) => Math.abs(mid(b) - mid(name)) > 6).length,
+        height: Math.round(r.getBoundingClientRect().height),
+        nums,
+      };
+    }, comp.id);
+    check(got.short.length === 0, `${label}: every session row at least 44px tall (${JSON.stringify(got.short)})`);
+    check(got.orphan && got.buttons === 3 && got.small === 0 && got.offLine === 0 && got.height < 60,
+      `${label}: a companion's actions are 44x44 on its one line (${JSON.stringify(got)})`);
+    check(got.nums.length > 1 && got.nums.every((n, i) => n === i + 1), `${label}: an orphaned companion's numbers run on from Needs you (${JSON.stringify(got.nums)})`);
+    await cp.screenshot({ path: path.join(out, `phone-companion-${touch ? "touch" : "mouse"}.png`) });
+    await cc.close();
+  }
+  await api("DELETE", `/api/sessions/${comp.id}`);
+  await api("DELETE", `/api/sessions/${compAgent.id}`);
+
   // --- seen on view: a finished turn someone is looking at is seen -------
   // On a page that is visible and focused, attached to the agent: a turn
   // that ends after minutes without input (someone watched it work) is

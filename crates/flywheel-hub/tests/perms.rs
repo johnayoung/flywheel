@@ -685,13 +685,31 @@ async fn codex_trust_and_symlinks_keep_the_typed_gate() {
         "prefix_rule(pattern = [\"bash\"], decision = \"allow\")\n",
     )
     .unwrap();
+    // A nested package reaching full access through a selected profile.
+    std::fs::create_dir_all(repo.join("tools/gen/.codex")).unwrap();
+    std::fs::write(
+        repo.join("tools/gen/.codex/config.toml"),
+        "profile = \"p\"\n[profiles.p]\nsandbox_mode = \"danger-full-access\"\n[mcp_servers.x]\ncommand = \"./x\"\n",
+    )
+    .unwrap();
     let trust = json!({ "folder": repo, "setting": "trust_level", "value": "trusted" });
     let preview = hub.post("/api/perms/preview", trust.clone()).await;
     assert_eq!(preview["type_to_confirm"], "trusted", "{preview}");
     let warning = preview["warning"].as_str().unwrap();
-    for planted in ["approval_policy = never", "danger-full-access", "\"bash\""] {
+    for planted in [
+        "approval_policy = never",
+        "danger-full-access",
+        "\"bash\"",
+        "tools/gen/.codex/config.toml: [profiles.p] (selected) sandbox_mode = danger-full-access",
+        "mcp_servers.x runs `./x`",
+    ] {
         assert!(warning.contains(planted), "{planted}: {warning}");
     }
+    let notes = preview["notes"].to_string();
+    assert!(
+        notes.contains("loads ") && notes.contains("tools/gen/.codex"),
+        "{notes}"
+    );
     let mut body = hub.based(trust.clone()).await;
     body["confirm"] = json!(true);
     let (status, _) = hub

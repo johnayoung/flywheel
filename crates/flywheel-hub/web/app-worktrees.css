@@ -113,8 +113,14 @@
 .attn-branch svg { flex: none; width: .7rem; height: .7rem; }
 .attn-branch span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-@media (pointer: coarse) {
-  .session.companion { min-height: 44px; }
+/* Phone width or a finger: every row and row action is a 44px target,
+   and a companion keeps one line (its name gives way to the actions:
+   its agent's row above says whose it is). */
+@media (pointer: coarse), (max-width: 760px) {
+  .session, .session.companion { min-height: 44px; }
+  .session-actions .icon { min-width: 44px; min-height: 44px; }
+  .session.companion .session-meta { grid-column: auto; flex-wrap: nowrap; }
+  .session.companion.active .session-meta .session-state { display: none; }
 }
 
 /* The agent / shell flip keeps its word on phones: an icon alone does not

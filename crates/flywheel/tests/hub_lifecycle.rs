@@ -502,9 +502,12 @@ fn start_script_stop_and_restore_shells_where_they_were() {
 
     let stopped = env.ok(&["stop"]);
     assert!(stopped.contains("flywheel hub stopped"), "{stopped}");
+    // Nothing to stop: the one "not running" exit code and wording.
     let output = env.fw(&["stop"]);
-    assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("no hub is running"));
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("fw hub: no hub is running for state dir")
+    );
 
     // --no-restore leaves them stopped, on later starts too.
     env.ok(&["start", "--port", "0", "--no-restore"]);

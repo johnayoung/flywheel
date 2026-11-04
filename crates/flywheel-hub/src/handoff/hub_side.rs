@@ -4,6 +4,7 @@
 //! old hub handed over.
 
 use super::{Hub, HubError, HubOptions, ServeLock, badge_key};
+use crate::perms::PendingExport;
 use crate::pty::PtySession;
 use crate::pty::handoff::{Adopt, PtyExport};
 use crate::queue::TypingExport;
@@ -32,6 +33,8 @@ pub(crate) struct Frozen {
     /// Prompt queues' typing times and drafts (the next hub keeps waiting
     /// them out).
     pub typing: Vec<TypingExport>,
+    /// Blocked sessions' pending permission requests ("Always allow").
+    pub perms: PendingExport,
 }
 
 /// The descriptors a frozen hub hands over (valid while it lives).
@@ -58,6 +61,7 @@ pub(crate) struct Incoming {
     pub board: BoardExport,
     pub sessions: Vec<IncomingSession>,
     pub typing: Vec<TypingExport>,
+    pub perms: PendingExport,
 }
 
 impl Hub {
@@ -140,10 +144,12 @@ impl Hub {
             .collect();
         let board = self.board().handoff_export();
         let typing = self.queue.typing_export();
+        let perms = self.perms().handoff_export();
         Ok(Frozen {
             sessions,
             board,
             typing,
+            perms,
         })
     }
 
@@ -212,6 +218,7 @@ impl Hub {
             board,
             sessions,
             typing,
+            perms,
         } = incoming;
         let ids: HashSet<String> = sessions.iter().map(|s| s.id.clone()).collect();
         let store = HubStore::open_keeping(&options.state_dir, &ids)?;
@@ -222,6 +229,9 @@ impl Hub {
             StatusBoard::handoff_import(board),
         )?;
         hub.queue.typing_import(typing);
+        if let Err(e) = hub.perms().handoff_import(perms) {
+            eprintln!("fw hub: {e}");
+        }
         hub.activity.mark_handed_over();
         if let Some((path, listener)) = report {
             let server = ReportServer::adopt(path, listener, hub.report_handler(), true)?;

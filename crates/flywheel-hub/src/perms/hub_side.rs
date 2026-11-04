@@ -586,11 +586,12 @@ impl Hub {
         let changed = old.as_deref() != Some(new_text.as_str());
         // Trusting a project turns on its own .codex/ layers: whatever
         // there would need typing if written here needs typing to trust.
-        let activates = if setting == codex::Setting::TrustLevel && value == "trusted" {
-            codex::trust_activates(folder, &folder.anchors(env, claude::File::Local))
+        let activation = if setting == codex::Setting::TrustLevel && value == "trusted" {
+            codex::trust_activates(folder, env, &folder.anchors(env, claude::File::Local))
         } else {
-            Vec::new()
+            codex::Activation::default()
         };
+        let activates = &activation.dangers;
         let danger: Option<String> = setting.danger(value).map(str::to_owned).or_else(|| {
             (!activates.is_empty()).then(|| {
                 format!(
@@ -635,9 +636,11 @@ impl Hub {
             sentence: format!("{}.", setting.sentence(value, &project)),
             type_to_confirm: danger.map(|_| value.to_owned()),
             notes: if changed {
-                activates
+                activation
+                    .dirs
                     .iter()
-                    .map(|a| format!("turns on {a}"))
+                    .map(|d| format!("loads {}", d.display()))
+                    .chain(activates.iter().map(|a| format!("turns on {a}")))
                     .chain(["Codex reads its config when it starts: restart the session for it to apply".to_owned()])
                     .collect()
             } else {

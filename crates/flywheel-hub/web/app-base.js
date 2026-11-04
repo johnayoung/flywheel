@@ -440,6 +440,14 @@ const fanoutTask = window.FwHubFanoutTask({
 const pwa = window.FwHubPwa();
 const attention = window.FwHubAttention({
   $, el, icon, age, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
+  // A phone lists these rows here instead of under their workspace: they
+  // carry their number (Alt+N) there, so the workspace's list (an
+  // orphaned companion's included) does not start past a gap.
+  numberOf: (id) => {
+    if (!phone()) return null;
+    const i = attachable().findIndex((s) => s.id === id);
+    return i >= 0 && i < 9 ? i + 1 : null;
+  },
   flywheel,
   fanout,
   // Stalled prompt queues (queue.js).

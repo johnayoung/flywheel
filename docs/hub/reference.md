@@ -6,6 +6,7 @@ Every `fw hub` verb and flag and the hub's files (`docs_drift.rs` fails the buil
 
 - `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; ambiguous or none: error; `activity` also takes names its journal or a machine knows).
 - A closed output pipe (`| head -1`) ends a verb quietly, exit 0.
+- Exit codes: 0 ok, 1 failed, 2 bad usage/config, 3 no hub running (`status`, `stop`, `upgrade`, `start|serve --handoff`; one wording: `no hub is running for state dir D`), 4 handoff refused as incompatible, 5 hub busy (retry). `doctor`, `tls`, `config` work without a hub and say so in that wording.
 - Every verb but `report` takes `--state-dir DIR` (default `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub`).
 - `{remote}` = `[--url URL] [--token T] [--fingerprint SHA256]`: a hub elsewhere; prefer `FW_HUB_TOKEN` (argv is world-readable).
 - `{machine}` = `[--machine NAME]`: a machine registered on that hub, via its proxy; `{where}` = `{remote} {machine}`.
@@ -17,9 +18,9 @@ Server and lifecycle:
 
 ```bash
 fw hub start {serve} [--timeout SECS] [--handoff]  # detached; prints login URLs; --handoff exits as upgrade
-fw hub stop [--timeout SECS] [--force]
-fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS]  # exit 3 no hub, 4 incompatible, 5 busy (retry)
-fw hub status [--json]  # exit 3 not running
+fw hub stop [--timeout SECS] [--force]  # exit 3 none running
+fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS]  # exit 1 failed (hub carries on), 3, 4, 5
+fw hub status [--json]  # exit 3 not running, 1 not answering
 fw hub logs [--follow|-f] [--lines|-n N]  # -n 0: all
 fw hub serve {serve} [--handoff]  # foreground
 fw hub install-service {serve} [--name N] [--force] [--print]  # systemd user unit

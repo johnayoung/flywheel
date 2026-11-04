@@ -77,7 +77,7 @@ pub const EXIT_REFUSED: i32 = 4;
 /// reason to restart instead.
 pub const EXIT_BUSY: i32 = 5;
 /// `fw hub serve --handoff` exit code when no hub was there to hand off.
-pub const EXIT_NO_HUB: i32 = 3;
+pub const EXIT_NO_HUB: i32 = crate::endpoint::EXIT_NOT_RUNNING;
 
 /// Largest JSON part of a frame.
 const MAX_JSON: usize = 64 * 1024 * 1024;
@@ -134,6 +134,10 @@ enum Msg {
         /// hub: none carried).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         typing: Vec<crate::queue::TypingExport>,
+        /// Blocked sessions' pending permission requests, versioned on
+        /// their own (absent from an older hub: none carried).
+        #[serde(default)]
+        perms: crate::perms::PendingExport,
     },
     /// Binary: the snapshot (`snapshot_len` bytes), then held input.
     /// Descriptors: the PTY master, then (when `pidfd`) the leader's pidfd.
@@ -925,6 +929,7 @@ fn send_offer(source: &Source, stream: &UnixStream, frozen: &Frozen) -> std::io:
             board: frozen.board.clone(),
             sessions: frozen.sessions.len(),
             typing: frozen.typing.clone(),
+            perms: frozen.perms.clone(),
         },
         &[],
         &passed,
@@ -1038,7 +1043,7 @@ pub fn receive(
     )
     .map_err(io_failed("greeting the running hub"))?;
     let (msg, _, fds) = recv_frame(&stream).map_err(io_failed("waiting for the running hub"))?;
-    let (old_version, old_pid, report_path, board, count, typing) = match msg {
+    let (old_version, old_pid, report_path, board, count, typing, perms) = match msg {
         Msg::Offer {
             version,
             pid,
@@ -1046,8 +1051,9 @@ pub fn receive(
             board,
             sessions,
             typing,
+            perms,
             ..
-        } => (version, pid, report_path, board, sessions, typing),
+        } => (version, pid, report_path, board, sessions, typing, perms),
         Msg::Refused { reason, kind } => return Err(HandoffError::Refused { reason, kind }),
         other => {
             return Err(HandoffError::Failed(format!(
@@ -1123,6 +1129,7 @@ pub fn receive(
             board,
             sessions,
             typing,
+            perms,
         },
         listener,
         old_pid,

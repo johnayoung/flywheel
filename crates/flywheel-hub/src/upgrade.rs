@@ -165,8 +165,7 @@ fn run_start_handoff(
     let dir = resolve_state_dir(&hub.state)?;
     let dir = std::path::absolute(&dir).map_err(|e| format!("state dir {}: {e}", dir.display()))?;
     let Some(old) = running_hub(&dir)? else {
-        let _ = writeln!(err, "fw hub: {}", crate::endpoint::no_hub_message(&dir));
-        return Ok(EXIT_NO_HUB);
+        return Ok(crate::endpoint::not_running(&dir, err));
     };
     let log = dir.join(LOG_FILE);
     let offset = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
@@ -319,7 +318,11 @@ pub(crate) struct UpgradeArgs {
     #[arg(long)]
     allow_restart: bool,
     /// Seconds to wait for the new hub to be serving (the old hub stays
-    /// frozen at most this long waiting for it, then rolls back).
+    /// frozen at most this long waiting for it, then rolls back). Exit
+    /// codes: 0 handed off (or, with --allow-restart, restarted), 1
+    /// failed (the hub carries on, or was rolled back), 3 no hub running,
+    /// 4 refused as incompatible (nothing changed; --allow-restart), 5
+    /// busy (nothing changed; retry).
     #[arg(long, value_name = "SECS", default_value_t = 90)]
     timeout: u64,
     #[command(flatten)]
@@ -446,8 +449,7 @@ fn run_upgrade(
     let dir = resolve_state_dir(&args.state)?;
     let dir = std::path::absolute(&dir).map_err(|e| format!("state dir {}: {e}", dir.display()))?;
     let Some(info) = running_hub(&dir)? else {
-        let _ = writeln!(err, "fw hub: {}", crate::endpoint::no_hub_message(&dir));
-        return Ok(EXIT_NO_HUB);
+        return Ok(crate::endpoint::not_running(&dir, err));
     };
     let (binary, support) = upgrade_binary(args.binary.as_deref(), err)?;
     let mut old = OldHub {
@@ -596,7 +598,9 @@ fn restart_or_refuse(
         out,
         err,
     )?;
-    if stopped != 0 {
+    // Gone meanwhile (EXIT_NO_HUB; an older binary said 0): start it all
+    // the same.
+    if stopped != 0 && stopped != EXIT_NO_HUB {
         return Ok(stopped);
     }
     let mut start_args = vec!["--timeout".to_owned(), args.timeout.to_string()];

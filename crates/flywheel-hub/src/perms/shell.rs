@@ -253,10 +253,16 @@ pub fn is_assignment(word: &Word) -> bool {
 /// wrapper list: `timeout`, `time`, `nice`, `nohup`, `stdbuf`, `command`,
 /// `builtin`, `noglob`, and bare `xargs`): how many there are.
 pub fn wrapper_len(words: &[Word]) -> usize {
+    wrapper_scan(words).0
+}
+
+/// [`wrapper_len`], and whether the next wrapper would take every word
+/// left (so nothing after it is the program).
+fn wrapper_scan(words: &[Word]) -> (usize, bool) {
     let mut at = 0;
     loop {
         let Some(word) = words.get(at) else {
-            return at;
+            return (at, false);
         };
         let consumed = match word.text.as_str() {
             "time" | "nohup" | "builtin" | "noglob" => 1,
@@ -280,7 +286,7 @@ pub fn wrapper_len(words: &[Word]) -> usize {
                 {
                     j + 1 - at
                 } else {
-                    return at;
+                    return (at, false);
                 }
             }
             "nice" => {
@@ -299,13 +305,50 @@ pub fn wrapper_len(words: &[Word]) -> usize {
                 }
                 j - at
             }
-            _ => return at,
+            _ => return (at, false),
         };
         if at + consumed >= words.len() {
-            return at;
+            return (at, true);
         }
         at += consumed;
     }
+}
+
+/// The wrapper programs [`wrapper_len`] strips.
+const WRAPPERS: &[&str] = &[
+    "time", "nohup", "builtin", "noglob", "command", "xargs", "timeout", "nice", "stdbuf",
+];
+
+/// Whether `words` (a rule's literal words before its wildcard) are only
+/// wrappers, so the wildcard stands where the program goes: `timeout 5 *`,
+/// `nohup *`, `stdbuf -oL *`, `nice -n 5 *`, `tim*`. `partial`: the last
+/// word is cut short by the wildcard.
+pub fn only_wrappers(words: &[Word], partial: bool) -> bool {
+    let Some(first) = words.first() else {
+        return false;
+    };
+    if partial && words.len() == 1 {
+        return WRAPPERS.iter().any(|w| w.starts_with(first.text.as_str()));
+    }
+    if !WRAPPERS.contains(&first.text.as_str()) {
+        return false;
+    }
+    let (at, exhausted) = wrapper_scan(words);
+    if exhausted {
+        return true;
+    }
+    let rest = &words[at..];
+    let Some(last) = rest.first().map(|w| w.text.as_str()) else {
+        return true;
+    };
+    // The last wrapper and only its own words reach the end (`command -v`
+    // looks a command up; it runs nothing).
+    WRAPPERS.contains(&last)
+        && rest[1..].iter().all(|w| {
+            let w = w.text.as_str();
+            (w.starts_with('-') || w.starts_with(|c: char| c.is_ascii_digit()))
+                && !(last == "command" && matches!(w, "-v" | "-V"))
+        })
 }
 
 /// The words a rule is matched against: leading wrappers stripped.

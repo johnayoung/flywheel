@@ -55,6 +55,8 @@ pub struct Env {
     /// The managed settings directory (`/etc/claude-code` on Linux and
     /// WSL, `/Library/Application Support/ClaudeCode` on macOS).
     pub managed_dir: PathBuf,
+    /// The hub's state dir (its token): a secret root wherever it lives.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// The managed settings directory Claude Code reads on this OS.
@@ -72,6 +74,7 @@ impl Env {
             claude_dir: claude_dir.unwrap_or_else(|| home.join(".claude")),
             codex_home: codex_home.unwrap_or_else(|| home.join(".codex")),
             managed_dir: managed_dir(),
+            state_dir: None,
             home,
         }
     }
@@ -150,6 +153,15 @@ impl Folder {
                 _ => self.dir.clone(),
             },
             home: env.home.clone(),
+            secrets: [
+                Some(&env.claude_dir),
+                Some(&env.codex_home),
+                env.state_dir.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect(),
         }
     }
 }
@@ -170,7 +182,8 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new(state_dir: &Path, env: Env) -> Self {
+    pub fn new(state_dir: &Path, mut env: Env) -> Self {
+        env.state_dir = Some(state_dir.to_path_buf());
         Self {
             env,
             pending: Mutex::default(),

@@ -251,6 +251,9 @@ pub struct Anchors {
     /// What a single leading `/` means in the file the rule is in.
     pub slash: PathBuf,
     pub home: PathBuf,
+    /// Secret directories wherever they live: the agents' config dirs and
+    /// the hub's state dir (its token).
+    pub secrets: Vec<PathBuf>,
 }
 
 /// The absolute glob a path specifier stands for.
@@ -800,7 +803,163 @@ const DANGEROUS: &[(&[&str], Reach, bool, &str)] = &[
         true,
         "publishes a package",
     ),
+    // The hub's own CLI: starts any process, types into other sessions,
+    // prints the hub's token, and edits these very rules.
+    (&["fw"], Reach::Family, true, HUB_CLI),
+    (&["flywheel"], Reach::Family, true, HUB_CLI),
+    // Programs and subcommands that run any command they are given.
+    (&["find"], Reach::Family, false, FIND_WHY),
+    (
+        &["git", "submodule", "foreach"],
+        Reach::Family,
+        true,
+        "runs any command in each submodule",
+    ),
+    (
+        &["git", "rebase"],
+        Reach::Family,
+        false,
+        "runs any command (-x/--exec) and rewrites history",
+    ),
+    (
+        &["git", "bisect", "run"],
+        Reach::Family,
+        true,
+        "runs any command",
+    ),
+    (
+        &["npm", "exec"],
+        Reach::Family,
+        false,
+        "downloads and runs any package",
+    ),
+    (
+        &["npm", "x"],
+        Reach::Family,
+        false,
+        "downloads and runs any package",
+    ),
+    (
+        &["pnpm", "dlx"],
+        Reach::Family,
+        false,
+        "downloads and runs any package",
+    ),
+    (&["pnpm", "exec"], Reach::Family, false, "runs any command"),
+    (
+        &["yarn", "dlx"],
+        Reach::Family,
+        false,
+        "downloads and runs any package",
+    ),
+    (&["yarn", "exec"], Reach::Family, false, "runs any command"),
+    (&["bun"], Reach::Covers, false, "runs any JavaScript"),
+    (
+        &["bun", "x"],
+        Reach::Family,
+        false,
+        "downloads and runs any package",
+    ),
+    (&["bun", "-e"], Reach::Family, false, "runs any JavaScript"),
+    (&["deno"], Reach::Covers, false, "runs any JavaScript"),
+    (
+        &["deno", "eval"],
+        Reach::Family,
+        false,
+        "runs any JavaScript",
+    ),
+    (&["pypy"], Reach::Covers, false, "runs any Python code"),
+    (
+        &["docker", "container", "run"],
+        Reach::Family,
+        false,
+        "runs any container (with any host mount)",
+    ),
+    (
+        &["docker", "container", "exec"],
+        Reach::Family,
+        false,
+        "runs anything in a container",
+    ),
+    (
+        &["podman", "run"],
+        Reach::Family,
+        false,
+        "runs any container (with any host mount)",
+    ),
+    (
+        &["podman", "exec"],
+        Reach::Family,
+        false,
+        "runs anything in a container",
+    ),
+    (&["busybox"], Reach::Family, false, "runs any command"),
+    (&["script"], Reach::Family, false, "runs any command"),
+    (&["parallel"], Reach::Family, false, "runs any command"),
+    (
+        &["tar"],
+        Reach::Family,
+        false,
+        "can run commands (--to-command) and overwrite any file",
+    ),
+    (
+        &["vi"],
+        Reach::Family,
+        false,
+        "edits any file and runs commands",
+    ),
+    (
+        &["vim"],
+        Reach::Family,
+        false,
+        "edits any file and runs commands",
+    ),
+    (
+        &["nvim"],
+        Reach::Family,
+        false,
+        "edits any file and runs commands",
+    ),
+    (
+        &["emacs"],
+        Reach::Family,
+        false,
+        "edits any file and runs commands",
+    ),
 ];
+
+/// Why the hub's own CLI is never auto-allowed.
+const HUB_CLI: &str =
+    "controls the hub: starts any process, types into other sessions, prints the hub's token";
+/// Why a `find` wildcard is never auto-allowed.
+const FIND_WHY: &str = "deletes, writes, or runs commands on what it finds";
+
+/// Interpreters whose versioned names (`python3.12`, `perl5.36`) run the
+/// same code: judged by their base name.
+const VERSIONED: &[&str] = &["python", "pypy", "perl", "ruby", "node", "php"];
+
+/// A program word judged by name: `/usr/bin/rm` and `./rm` are rm,
+/// `python3.12` is python.
+fn program_name(word: &str) -> String {
+    let name = word.rsplit('/').next().unwrap_or(word);
+    let base = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if base != name && VERSIONED.contains(&base) {
+        return base.to_owned();
+    }
+    name.to_owned()
+}
+
+/// This hub's own executable name (`fw`, `flywheel`, or however it was
+/// installed): judged like the hub CLI.
+fn hub_exe_name() -> Option<&'static str> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    })
+    .as_deref()
+}
 
 /// `git push` flags that rewrite or delete what others have.
 const FORCE_FLAGS: &[&str] = &[
@@ -830,6 +989,11 @@ fn literal_words(spec: &str) -> Option<(Vec<String>, bool, bool)> {
     // command before matching; judge what runs.
     let skip = words.iter().take_while(|w| shell::is_assignment(w)).count();
     words.drain(..skip);
+    // Only wrappers before the wildcard (`timeout 5 *`, `nohup *`): the
+    // wildcard stands where the program goes.
+    if wildcard && shell::only_wrappers(&words, partial) {
+        return Some((Vec::new(), false, wildcard));
+    }
     let wrappers = shell::wrapper_len(&words);
     words.drain(..wrappers);
     Some((
@@ -1041,15 +1205,22 @@ fn bash_risk(spec: Option<&str>, anchors: &Anchors, repo: &Path) -> Risk {
         return Risk::danger("cannot be read as a command");
     };
     if words.is_empty() {
-        return Risk::danger("a wildcard before the program matches any program");
+        return Risk::danger("the wildcard stands where the program goes: it matches any program");
     }
-    // The program by name (`/usr/bin/rm` is rm).
+    // The program by name (`/usr/bin/rm` is rm, `python3.12` is python).
     let mut words = words;
-    if let Some(first) = words.first_mut()
-        && let Some(name) = first.rsplit('/').next()
-        && first.starts_with('/')
-    {
-        *first = name.to_owned();
+    if let Some(first) = words.first_mut() {
+        *first = program_name(first);
+    }
+    let hub_exe = hub_exe_name().is_some_and(|exe| {
+        if partial && words.len() == 1 {
+            exe.starts_with(words[0].as_str())
+        } else {
+            words[0] == exe
+        }
+    });
+    if hub_exe {
+        return Risk::danger(format!("runs this hub's own CLI, which {HUB_CLI}"));
     }
     if let Err(risk) = strip_git_globals(&mut words, &mut partial) {
         return risk;
@@ -1107,7 +1278,17 @@ fn bash_risk(spec: Option<&str>, anchors: &Anchors, repo: &Path) -> Risk {
                     .iter()
                     .any(|w| FIND_ACTIONS.contains(&w.as_str())) =>
             {
-                return Risk::danger("deletes, writes, or runs commands on what it finds");
+                return Risk::danger(FIND_WHY);
+            }
+            Some("git")
+                if words.get(1).map(String::as_str) == Some("rebase")
+                    && words[2..].iter().any(|w| {
+                        w == "-x"
+                            || w.starts_with("--exec")
+                            || (w.starts_with("-x") && !w.starts_with("--"))
+                    }) =>
+            {
+                return Risk::danger("runs any command (-x/--exec)");
             }
             Some("sed")
                 if words[1..]
@@ -1154,6 +1335,15 @@ const SECRET_DIRS: &[&str] = &[
     ".netrc",
     ".git-credentials",
     ".local/state",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".gem/credentials",
+    ".terraform.d",
+    ".bash_history",
+    ".zsh_history",
 ];
 
 fn protected_what(p: &str) -> &'static str {
@@ -1188,10 +1378,11 @@ fn path_risk(rule: &Rule, anchors: &Anchors, repo: &Path) -> Risk {
         ));
     }
     if tool == "Read" {
-        let secret = SECRET_DIRS.iter().any(|d| {
-            let dir = home.join(d);
-            root.starts_with(&dir) || (globbed && dir.starts_with(&root))
-        });
+        let secret = SECRET_DIRS
+            .iter()
+            .map(|d| home.join(d))
+            .chain(anchors.secrets.iter().cloned())
+            .any(|dir| root.starts_with(&dir) || (globbed && dir.starts_with(&root)));
         if secret {
             return Risk::danger("covers credentials or agent settings under your home");
         }

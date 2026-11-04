@@ -19,6 +19,7 @@ fn anchors(cwd: &str) -> Anchors {
         cwd: PathBuf::from(cwd),
         slash: PathBuf::from(cwd),
         home: PathBuf::from("/home/me"),
+        secrets: vec![PathBuf::from("/srv/hub-state")],
     }
 }
 
@@ -292,6 +293,54 @@ fn dangerous_rules_are_flagged() {
         "Bash(gh pr merge *)",
         "Bash(perl -i *)",
         "Bash(python -u *)",
+        // The hub's own CLI runs anything and prints the token.
+        "Bash(fw *)",
+        "Bash(fw hub ls)",
+        "Bash(fw hub token)",
+        "Bash(flywheel *)",
+        "Bash(/usr/local/bin/fw hub new w1 -- sh -c x)",
+        // Exec-capable programs and subcommands.
+        "Bash(find *)",
+        "Bash(find:*)",
+        "Bash(find . -name x -exec:*)",
+        "Bash(git submodule foreach 'rm -rf ~')",
+        "Bash(git submodule:*)",
+        "Bash(git rebase:*)",
+        "Bash(git rebase -x 'make' main)",
+        "Bash(git bisect run:*)",
+        "Bash(npm exec:*)",
+        "Bash(npm x:*)",
+        "Bash(pnpm dlx:*)",
+        "Bash(yarn dlx:*)",
+        "Bash(docker container run:*)",
+        "Bash(podman run:*)",
+        "Bash(python3.12:*)",
+        "Bash(perl5.36 -e:*)",
+        "Bash(deno:*)",
+        "Bash(bun:*)",
+        "Bash(busybox:*)",
+        "Bash(tar:*)",
+        "Bash(vim:*)",
+        "Bash(script:*)",
+        "Bash(parallel:*)",
+        // A wildcard right after a wrapper stands where the program goes.
+        "Bash(timeout:*)",
+        "Bash(timeout 5:*)",
+        "Bash(timeout -s KILL 5 *)",
+        "Bash(nohup:*)",
+        "Bash(nice:*)",
+        "Bash(nice -n 5 *)",
+        "Bash(time *)",
+        "Bash(stdbuf -oL *)",
+        "Bash(command *)",
+        "Bash(tim*)",
+        // Credentials under home.
+        "Read(~/.npmrc)",
+        "Read(~/.cargo/credentials.toml)",
+        "Read(~/.pgpass)",
+        "Read(~/.pypirc)",
+        "Read(~/.bash_history)",
+        "Read(//srv/hub-state/token)",
         "mcp__github",
         "mcp__github__*",
     ] {
@@ -310,8 +359,12 @@ fn dangerous_rules_are_flagged() {
         "Bash(git -C crates/app log *)",
         "Bash(git -C /home/me/code/app push origin main)",
         "Bash(cp src/a.rs src/b.rs)",
-        "Bash(find *)",
         "Bash(find . -name x)",
+        "Bash(timeout 5 cargo test *)",
+        "Bash(nice cargo build *)",
+        "Bash(command -v *)",
+        "Bash(git rebase main)",
+        "Bash(python3.12 -m pytest *)",
         "Bash(sed -n 1,5p src/main.rs)",
         "Bash(cat .gitignore)",
         "Edit(/src/**)",
@@ -852,6 +905,7 @@ fn env_in(dir: &Path) -> Env {
         claude_dir: dir.join("home/.claude"),
         codex_home: dir.join("home/.codex"),
         managed_dir: dir.join("etc/claude-code"),
+        state_dir: None,
     }
 }
 
@@ -1290,4 +1344,33 @@ fn claude_doctor_accepts_a_written_local_settings_file() {
     std::fs::write(&path, bad).unwrap();
     let report = doctor(&root);
     assert!(report.contains("Invalid permission rule"), "{report}");
+}
+
+#[test]
+fn hub_cli_and_bare_wrappers_are_never_offered() {
+    let p = propose("fw hub ls");
+    assert!(p.rules.is_empty(), "proposed {:?}", p.rules);
+    assert!(
+        p.candidates.iter().all(|c| c.risk.dangerous),
+        "{:?}",
+        p.candidates
+    );
+    let a = anchors(REPO);
+    for pattern in [
+        &["timeout"][..],
+        &["nohup"],
+        &["nice"],
+        &["time"],
+        &["stdbuf", "-oL"],
+        &["command"],
+        &["fw"],
+        &["find"],
+    ] {
+        let words = pattern.iter().map(|w| w.to_string()).collect();
+        let c = synth::codex_candidate(words, "program", &a, Path::new(REPO)).unwrap();
+        assert!(c.risk.dangerous, "{pattern:?} not flagged");
+    }
+    let words = vec!["timeout".into(), "5".into(), "cargo".into(), "test".into()];
+    let c = synth::codex_candidate(words, "exact", &a, Path::new(REPO)).unwrap();
+    assert!(!c.risk.dangerous);
 }

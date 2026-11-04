@@ -664,6 +664,62 @@ async fn codex_prompts_rules_and_settings() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codex_trust_and_symlinks_keep_the_typed_gate() {
+    let hub = TestHub::start().await;
+    let repo = hub.repo();
+    hub.agent("codex").await;
+    // A planted project config: trusting it turns these on.
+    std::fs::create_dir_all(repo.join(".codex/rules")).unwrap();
+    std::fs::write(
+        repo.join(".codex/config.toml"),
+        "approval_policy = \"never\"\nsandbox_mode = \"danger-full-access\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".codex/rules/default.rules"),
+        "prefix_rule(pattern = [\"bash\"], decision = \"allow\")\n",
+    )
+    .unwrap();
+    let trust = json!({ "folder": repo, "setting": "trust_level", "value": "trusted" });
+    let preview = hub.post("/api/perms/preview", trust.clone()).await;
+    assert_eq!(preview["type_to_confirm"], "trusted", "{preview}");
+    let warning = preview["warning"].as_str().unwrap();
+    for planted in ["approval_policy = never", "danger-full-access", "\"bash\""] {
+        assert!(warning.contains(planted), "{planted}: {warning}");
+    }
+    let mut body = hub.based(trust.clone()).await;
+    body["confirm"] = json!(true);
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/perms/allow",
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    body["typed"] = json!("trusted");
+    assert_eq!(hub.post("/api/perms/allow", body).await["written"], true);
+
+    // A project .codex that is a symlink (to the user's) is refused.
+    let elsewhere = hub.dir.path().join("elsewhere-codex");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::remove_dir_all(repo.join(".codex")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, repo.join(".codex")).unwrap();
+    for body in [
+        json!({ "folder": repo, "patterns": [["cargo", "test"]] }),
+        json!({ "folder": repo, "setting": "sandbox_mode", "value": "read-only" }),
+    ] {
+        let (status, err) = hub
+            .call(reqwest::Method::POST, "/api/perms/preview", Some(body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+    assert!(!elsewhere.join("rules").exists());
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_race_safely_and_answers_check_the_screen() {
     let hub = TestHub::start().await;
     let repo = hub.repo();

@@ -187,6 +187,78 @@ fn project_dirs(folder: &Folder) -> Vec<PathBuf> {
     dirs
 }
 
+/// What trusting `folder`'s project turns on that the hub writes only after
+/// a typed confirmation: the project's `.codex/` layers' dangerous
+/// settings, dangerous allow rules, and anything that runs programs
+/// (`notify`, `mcp_servers`, hooks). One line each.
+pub fn trust_activates(folder: &Folder, anchors: &super::rule::Anchors) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in project_dirs(folder) {
+        let codex = dir.join(".codex");
+        let config = codex.join("config.toml");
+        let (layer, table) = read_layer("project", config.clone());
+        let at = config.display();
+        if let Some(e) = &layer.error {
+            out.push(format!(
+                "{at}: cannot be read ({e}), so the hub cannot judge it"
+            ));
+        }
+        for (setting, value) in [
+            (Setting::ApprovalPolicy, &layer.approval_policy),
+            (Setting::SandboxMode, &layer.sandbox_mode),
+        ] {
+            if let Some(value) = value
+                && let Some(why) = setting.danger(value)
+            {
+                let key = match setting {
+                    Setting::ApprovalPolicy => "approval_policy",
+                    _ => "sandbox_mode",
+                };
+                out.push(format!("{at}: {key} = {value} ({why})"));
+            }
+        }
+        if let Some(table) = &table {
+            for key in ["notify", "mcp_servers", "hooks"] {
+                if table.contains_key(key) {
+                    out.push(format!("{at}: {key} (runs programs it names)"));
+                }
+            }
+        }
+        if codex.join("hooks.json").exists() {
+            out.push(format!(
+                "{}: hooks (run programs it names)",
+                codex.join("hooks.json").display()
+            ));
+        }
+        let mut files = Vec::new();
+        read_rules("project", &codex.join("rules"), &mut files);
+        for file in files {
+            for rule in file.rules.iter().filter(|r| r.decision == "allow") {
+                let risk = super::synth::codex_candidate(
+                    rule.pattern.clone(),
+                    "custom",
+                    anchors,
+                    folder.repo(),
+                )
+                .map(|c| c.risk)
+                .unwrap_or_else(|e| super::rule::Risk {
+                    dangerous: true,
+                    reason: e,
+                });
+                if risk.dangerous {
+                    out.push(format!(
+                        "{}: allow {:?} ({})",
+                        file.path.display(),
+                        rule.pattern,
+                        risk.reason
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The project key trust is recorded under.
 pub fn project_key(folder: &Folder) -> PathBuf {
     folder.top.clone().unwrap_or_else(|| folder.dir.clone())
@@ -391,6 +463,9 @@ pub fn plan_setting(
         ));
     }
     let (path, table, key) = setting_place(setting, folder, env);
+    if setting != Setting::TrustLevel {
+        no_symlink_in_project(folder, &path)?;
+    }
     let old = read_for_edit(&path)?;
     let new = edit::set_toml_key(
         old.as_deref().unwrap_or(""),
@@ -400,6 +475,23 @@ pub fn plan_setting(
     )
     .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok((path, old, new))
+}
+
+/// Refuse a project path reached through a symlink (`.codex -> ~/.codex`
+/// would turn a project write into a user-wide one).
+pub fn no_symlink_in_project(folder: &Folder, path: &Path) -> Result<(), String> {
+    let root = project_key(folder);
+    let Ok(rest) = path.strip_prefix(&root) else {
+        return Err(format!("{} is outside {}", path.display(), root.display()));
+    };
+    let mut at = root.clone();
+    for part in rest.components() {
+        at.push(part);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("{} is a symlink: edit it by hand", at.display()));
+        }
+    }
+    Ok(())
 }
 
 /// Where a prefix rule goes: the project's (`project`) or the user's

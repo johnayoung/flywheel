@@ -127,7 +127,7 @@ impl Hub {
                     });
                 if !known {
                     return Err(invalid(format!(
-                        "{} is not in any workspace folder or session directory (add it to a workspace first: `fw hub new <workspace> --folder {} --create`, or the web UI)",
+                        "{} is not in any workspace folder or session directory: make a workspace for it (`fw hub new <new-name> --folder {} --create`) or add it to an existing one in the web UI",
                         folder.dir.display(),
                         folder.dir.display()
                     )));
@@ -490,6 +490,9 @@ impl Hub {
             ));
         }
         let path = codex::rules_path(user, folder, env);
+        if !user {
+            codex::no_symlink_in_project(folder, &path).map_err(invalid)?;
+        }
         let (old, new_text, added) = codex::plan_rules(&path, &lines).map_err(invalid)?;
         let view = codex::view(folder, env, None);
         let mut notes = Vec::new();
@@ -572,7 +575,21 @@ impl Hub {
             codex::plan_setting(setting, value, folder, env).map_err(invalid)?;
         let project = codex::project_key(folder);
         let changed = old.as_deref() != Some(new_text.as_str());
-        let danger = setting.danger(value);
+        // Trusting a project turns on its own .codex/ layers: whatever
+        // there would need typing if written here needs typing to trust.
+        let activates = if setting == codex::Setting::TrustLevel && value == "trusted" {
+            codex::trust_activates(folder, &folder.anchors(env, claude::File::Local))
+        } else {
+            Vec::new()
+        };
+        let danger: Option<String> = setting.danger(value).map(str::to_owned).or_else(|| {
+            (!activates.is_empty()).then(|| {
+                format!(
+                    "trusting it turns on its .codex/ settings: {}",
+                    activates.join("; ")
+                )
+            })
+        });
         let (_, table, key) = codex::setting_place(setting, folder, env);
         let shown = if table.is_empty() {
             format!("{key} = {value}")
@@ -592,7 +609,7 @@ impl Hub {
             exists: old.is_some(),
             tracked,
             ignored,
-            warning: danger.map(str::to_owned).or_else(|| {
+            warning: danger.clone().or_else(|| {
                 (setting != codex::Setting::TrustLevel).then(|| {
                     "a project setting applies only once the project is trusted, and is shared once committed".to_owned()
                 })
@@ -601,7 +618,7 @@ impl Hub {
                 rule: shown.clone(),
                 risk: rule::Risk {
                     dangerous: danger.is_some(),
-                    reason: danger.unwrap_or("").to_owned(),
+                    reason: danger.clone().unwrap_or_default(),
                 },
                 sentence: setting.sentence(value, &project),
             }],
@@ -609,7 +626,11 @@ impl Hub {
             sentence: format!("{}.", setting.sentence(value, &project)),
             type_to_confirm: danger.map(|_| value.to_owned()),
             notes: if changed {
-                vec!["Codex reads its config when it starts: restart the session for it to apply".to_owned()]
+                activates
+                    .iter()
+                    .map(|a| format!("turns on {a}"))
+                    .chain(["Codex reads its config when it starts: restart the session for it to apply".to_owned()])
+                    .collect()
             } else {
                 vec!["already set".to_owned()]
             },

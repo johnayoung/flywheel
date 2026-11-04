@@ -295,15 +295,20 @@ impl Hub {
         if kind == SessionKind::Claude {
             self.perms_note_report(&report.session, &report.event, signal, &payload);
         }
+        // A conversation that cannot be saved still has its status applied
+        // (a `done` lost to a full disk would hang `fw hub wait`); the
+        // report fails after that.
+        let mut saved = Ok(());
         if let Some(reported) = agent::reported_conversation(kind, &payload)
             && conversation.as_deref() != Some(reported.as_str())
         {
-            let changed = self
+            match self
                 .store()
                 .set_agent_session_id(&report.session, &reported)
-                .map_err(|e| e.to_string())?;
-            if changed {
-                self.emit(HubEvent::Sessions);
+            {
+                Ok(true) => self.emit(HubEvent::Sessions),
+                Ok(false) => {}
+                Err(e) => saved = Err(e.to_string()),
             }
         }
         self.commands
@@ -345,7 +350,7 @@ impl Hub {
                 source,
             );
         }
-        Ok(())
+        saved
     }
 
     /// Register an events client (a browser, by its persistent client id).

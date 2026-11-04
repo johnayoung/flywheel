@@ -337,7 +337,7 @@ pub struct PromoteRequest {
     #[serde(default)]
     pub goal: Option<String>,
     /// A candidate label whose passing commit to reference; `""` / `none`
-    /// for none. Default: the winner, if any.
+    /// for none. Default: the winner, else the board's leader.
     #[serde(default)]
     pub reference: Option<String>,
     #[serde(default)]
@@ -392,18 +392,22 @@ fn cut_words(text: &str) -> String {
 }
 
 /// The candidate whose passing commit `request` references: `(label,
-/// commit)`.
+/// commit)`. Default: the winner, else the board's `leader`.
 fn reference_of(
     fanout: &Fanout,
     request: &PromoteRequest,
+    leader: Option<&str>,
 ) -> Result<Option<(String, String)>, String> {
     let named = request.reference.as_deref().map(str::trim);
     let label = match named {
         Some("" | "none") => return Ok(None),
         Some(label) => label.to_owned(),
-        None => match &fanout.winner {
-            Some(winner) => return Ok(Some((winner.label.clone(), winner.head.clone()))),
-            None => return Ok(None),
+        None => match (&fanout.winner, leader) {
+            (Some(winner), _) => {
+                return Ok(Some((winner.label.clone(), winner.head.clone())));
+            }
+            (None, Some(leader)) => leader.to_owned(),
+            (None, None) => return Ok(None),
         },
     };
     if let Some(winner) = fanout.winner.as_ref().filter(|w| w.label == label) {
@@ -434,8 +438,13 @@ fn reference_of(
 }
 
 /// The task a promotion of `fanout` writes, before the provider validates
-/// it (see the module doc).
-pub fn draft(fanout: &Fanout, request: &PromoteRequest) -> Result<Drafted, String> {
+/// it (see the module doc). `leader`: the board's leader (the default
+/// reference when no winner was picked).
+pub fn draft(
+    fanout: &Fanout,
+    request: &PromoteRequest,
+    leader: Option<&str>,
+) -> Result<Drafted, String> {
     let origin = fanout.origin.as_ref();
     let named_id = request
         .task_id
@@ -526,7 +535,16 @@ pub fn draft(fanout: &Fanout, request: &PromoteRequest) -> Result<Drafted, Strin
             origin.not_run.join(", ")
         ));
     }
-    let reference = reference_of(fanout, request)?;
+    let reference = reference_of(fanout, request, leader)?;
+    if fanout.winner.is_none()
+        && request.reference.is_none()
+        && let Some((label, _)) = &reference
+    {
+        warnings.push(format!(
+            "no winner picked: the reference is the leader, {label} (name another with \
+             --reference, or --reference none)"
+        ));
+    }
     if reference.is_none() && request.reference.is_none() {
         let passing: Vec<&str> = fanout
             .candidates

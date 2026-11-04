@@ -215,7 +215,10 @@ fn view(
         why: Vec::new(),
         agent: None,
         session_state: Some("running".into()),
-        grade,
+        grade: grade.map(|mut g| {
+            g.cost_usd = cost;
+            g
+        }),
         stale: None,
         pending: None,
         head: None,
@@ -279,7 +282,7 @@ fn ranking_puts_passing_first_then_smaller_diffs_then_lower_cost() {
     let why = |i: usize| views[i].why.join(" | ");
     assert!(why(0).contains("passes all 1 grader"), "{}", why(0));
     assert!(
-        why(0).contains("ahead of c4: same diff, cheaper ($0.20 vs $0.90)"),
+        why(0).contains("ahead of c4: same diff, cheaper when graded ($0.20 vs $0.90)"),
         "{}",
         why(0)
     );
@@ -328,14 +331,41 @@ fn a_cost_tie_under_a_cent_is_told_apart_where_it_decides() {
     assert_eq!(views[0].label, "c2");
     let why = |i: usize| views[i].why.join(" | ");
     assert!(
-        why(0).contains("ahead of c1: same diff, cheaper ($0.00597 vs $0.00598)"),
+        why(0).contains("ahead of c1: same diff, cheaper when graded ($0.00597 vs $0.00598)"),
         "{}",
         why(0)
     );
     assert!(
-        why(1).contains("below c2: same diff, costs more ($0.00598 vs $0.00597)"),
+        why(1).contains("below c2: same diff, costs more when graded ($0.00598 vs $0.00597)"),
         "{}",
         why(1)
+    );
+}
+
+#[test]
+fn the_leader_follows_the_cost_recorded_with_the_grade_not_late_usage() {
+    // Two real claude:haiku candidates: graded at $0.0059 (c1) and $0.0061
+    // (c2), then usage still arriving put c2's live cost below c1's. The
+    // leader `fanout.finished` named must stay the board's.
+    let pass = |cost: f64| {
+        let mut g = grade(true, 4, vec![run("unit", GraderStatus::Passed, Some(0))]);
+        g.cost_usd = Some(cost);
+        g
+    };
+    let mut c1 = view("c1", Verdict::Pass, Phase::Graded, None, Some(0.0063));
+    c1.grade = Some(pass(0.0059));
+    let mut c2 = view("c2", Verdict::Pass, Phase::Graded, None, Some(0.0062));
+    c2.grade = Some(pass(0.0061));
+    let mut views = vec![c2, c1];
+    rank(&mut views);
+    assert_eq!(views[0].label, "c1");
+    assert!(
+        views[0]
+            .why
+            .join(" | ")
+            .contains("ahead of c2: same diff, cheaper when graded ($0.0059 vs $0.0061)"),
+        "{:?}",
+        views[0].why
     );
 }
 

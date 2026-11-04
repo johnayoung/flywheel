@@ -71,7 +71,7 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 - **Send to agent** (`fw hub handoff FROM TO`, `handoff.send`): a selection, message, block, or diff to another agent (any workspace or machine) as one prompt (`From <session> on <branch>:` + a fence; 32 KiB, editable).
 - **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author, reused.
-- Reviewer model: `--model`, else the author's when the same kind, else `agents.<kind>.model` (Claude plans haiku on sonnet anyway).
+- Reviewer model: `--model`, else the author's when the same kind, else `agents.<kind>.model`. Plan mode runs an alias (`haiku`) on a larger model, so it is pinned to the author's full id.
 - **Send findings to <author>** pastes the reviewer's latest reply back. Pairing survives restarts; closing the author closes its reviewers.
 
 ## Verified fan-out
@@ -92,7 +92,7 @@ fw hub fanout cleanup "$id" [--force] --yes
 - **Agent claims are untrusted**: a finished turn only queues grading; the verdict is the graders' exit codes. Needs you lists the fan-out once per unseen grading.
 - **Graders are held out of the prompt only** (agents run as you). A tracked grader is editable: `--protect` its inputs (changing one fails) or keep the oracle outside the repo ([held-out gate](../held-out-gate.md)); absolute-path scripts are pinned by hash.
 - Grading: flywheel-core's runner (in order, `/bin/sh -c`, exit 0 passes, `--timeout` 900 s each, first failure stops); 2 at once.
-- Ranking: passing (smaller diff, then lower cost), failing, stale, grading, ungraded. A pass that changes nothing cannot be picked (the graders pass on the base).
+- Ranking: passing (smaller diff, then lower cost when graded), failing, stale, grading, ungraded. A pass that changes nothing cannot be picked (the graders pass on the base).
 - **Pick** needs a fresh pass on a clean tree at exactly the graded commit, then ff-merges it (plan + fingerprint); base moved: `--rebase`, which grades again.
 - **Cleanup** removes losers' worktrees and sessions (unique work: `--force`; `--stop-only` keeps worktrees); `rm` forgets. Max 50; gradings cut short by stop or upgrade rerun.
 
@@ -106,8 +106,8 @@ fw hub fanout promote "$id" --reference c1 --yes  # writes .flywheel/tasks/activ
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote instead of picking** to land via `fw worker`; after a pick it is refused (nothing left to do).
-- **Promote**: goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints (only `[submit] protected_paths` refuses a landing), `--reference` candidate -> a reference; refused for an existing file or id.
+- **Promote instead of picking** to land via `fw worker`; after a pick it is refused; a pick after it warns.
+- **Promote**: goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints (only `[submit] protected_paths` refuses a landing), `--reference` (default: winner, else leader) -> a reference; refused for an existing file or id.
 - The file is left **uncommitted**; **Run <id> with worker here** (a task-seeded fan-out offers it at once) runs `fw worker --task <id>` alone.
 - **Fan out this task** (Flywheel panel): prompt from its goal and context; graders = its command plus **held-out** graders, added server-side (none: refused; an unreadable registry fails closed).
 - Held-out graders never reach an agent via the hub: a prompt naming one is refused; Ask to fix only says one failed. Not a sandbox.

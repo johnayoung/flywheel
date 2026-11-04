@@ -117,6 +117,9 @@ pub struct PickPlan {
     pub merge: Option<Plan>,
     /// What cleaning up the others would do afterwards.
     pub losers: Vec<CleanupItem>,
+    /// What the merge does besides (a promoted flywheel task still active
+    /// would find this work on the base, and its worker stop).
+    pub warnings: Vec<String>,
 }
 
 /// What picking did.

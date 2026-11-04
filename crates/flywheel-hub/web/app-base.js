@@ -213,6 +213,9 @@ const AGENT_LOOK = {
 // is not offline or refusing this hub (an unreachable machine's lists
 // are its last known ones).
 const reachable = (session) => !session.machine || machines.reachable(session.machine);
+// Running now, on a machine this page reaches (the header's "NN live"):
+// an exited session keeps its `live` record.
+const runningNow = (session) => !!session.live && session.state === "running" && reachable(session);
 
 function agentStatus(session) {
   if (session.kind === "shell" || session.state !== "running" || !session.live) return null;

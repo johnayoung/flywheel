@@ -46,7 +46,7 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 - Over `handoff.sock` (same user) the old hub freezes (503, PTYs paused), closes WebSockets with **1012**, passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids taken, the resume ring, and exits once the new hub acks. Input refused meanwhile is `nack`ed for a resend: never lost or doubled.
 - Failure before commit thaws the old hub; a stuck new hub is killed at `--timeout`.
 - Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` then restarts (sessions restored, not kept). systemd: `systemctl --user restart <unit>`.
-- Handed-over processes are not children: exits come via pidfd, code unknown (`exited ?`); no restore pass. Clients reconnect on 1012 (browsers at once, `attach` / `wait` within 2 min).
+- Handed-over processes are not children: exits come via pidfd, code unknown; no restore pass. Clients reconnect on 1012 (browsers at once, `attach` / `wait` within 2 min).
 
 ## Agent status
 

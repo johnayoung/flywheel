@@ -119,13 +119,12 @@ pub fn state_label(session: &Value) -> String {
         "running" => "gone".into(),
         "exited" => match session.get("signal").and_then(Value::as_str) {
             Some(signal) => format!("killed ({signal})"),
-            None => format!(
-                "exited {}",
-                session
-                    .get("code")
-                    .and_then(Value::as_i64)
-                    .map_or_else(|| "?".to_owned(), |c| c.to_string())
-            ),
+            // No code: a process an earlier hub started (handed over by
+            // an upgrade) is not this hub's child, so its code is unknown.
+            None => match session.get("code").and_then(Value::as_i64) {
+                Some(code) => format!("exited {code}"),
+                None => "exited (code unknown)".to_owned(),
+            },
         },
         "stopped" if restore_error(session).is_some() => "not restored".into(),
         "stopped" => "stopped".into(),
@@ -1274,6 +1273,10 @@ mod tests {
         assert_eq!(
             label(json!({"state": "exited", "code": 0, "signal": null})),
             "exited 0"
+        );
+        assert_eq!(
+            label(json!({"state": "exited", "code": null, "signal": null})),
+            "exited (code unknown)"
         );
         assert_eq!(
             label(json!({"state": "exited", "code": null, "signal": "Hangup"})),

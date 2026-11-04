@@ -559,6 +559,14 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
     // Picked, the work is on the base: a task for it would have nothing
     // to do (a real worker's agent stops: "already on the base"), so it
     // is not written.
+    // Picking a promoted fan-out says what it does to the task.
+    let shown = env.fw(&["fanout", "pick", &id, "c1"]);
+    let shown = String::from_utf8_lossy(&shown.stderr);
+    assert!(
+        shown.contains(&format!("promoted to flywheel task {task_id}"))
+            && shown.contains("its worker finds nothing left to do"),
+        "{shown}"
+    );
     env.git(&["stash", "push", "-q", "--include-untracked"]);
     env.ok(&["fanout", "pick", &id, "c1", "--yes"]);
     assert_eq!(env.git(&["rev-parse", "main"]), head);

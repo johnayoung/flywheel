@@ -517,7 +517,7 @@ function render() {
   });
   state.painted = true;
 
-  const running = state.sessions.filter((s) => s.live && s.state === "running" && reachable(s)).length;
+  const running = state.sessions.filter(runningNow).length;
   const tach = $("#tach");
   tach.textContent = `${pad2(running)} live`;
   tach.classList.toggle("on", running > 0);
@@ -650,7 +650,7 @@ function renderMain() {
     first = !hasWorkspace && !machines.any();
     // Sessions running but none on screen (a phone's start screen, a
     // fresh browser): say so, not "nothing".
-    const running = state.sessions.filter((s) => s.live).length;
+    const running = state.sessions.filter(runningNow).length;
     const narrow = window.matchMedia(NARROW).matches;
     $("#empty-title").textContent = state.noticeTitle ||
       (!hasWorkspace ? "Set up a workspace." : running ? `${running} session${running === 1 ? "" : "s"} running.` : "Nothing on the wheel.");

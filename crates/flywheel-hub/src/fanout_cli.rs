@@ -231,7 +231,7 @@ struct PromoteArgs {
     #[arg(long, value_name = "TEXT")]
     goal: Option<String>,
     /// The candidate whose passing commit is referenced (default: the
-    /// winner); `none` for no reference.
+    /// winner, else the board's leader); `none` for no reference.
     #[arg(long, value_name = "LABEL|none")]
     reference: Option<String>,
     /// Do it without asking (what runs is still printed). Without it a
@@ -903,6 +903,15 @@ fn pick(args: &PickArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
             }
         }
         return Ok(if ok { 0 } else { 1 });
+    }
+    for warning in plan
+        .get("warnings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let _ = writeln!(err, "warning: {warning}");
     }
     if let Some(why) = plan.get("refusal").and_then(Value::as_str) {
         if args.json {

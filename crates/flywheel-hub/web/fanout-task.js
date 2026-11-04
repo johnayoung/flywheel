@@ -32,14 +32,16 @@ window.FwHubFanoutTask = function (ctx) {
   const field = (label, hint, ...children) =>
     el("label", { className: "field" }, el("span", { className: "field-label" }, label, hint ? el("span", { className: "field-hint", textContent: ` ${hint}` }) : null), ...children);
 
-  // The reference choices: the default (the winner, if any), each other
-  // passing candidate, none.
+  // The reference choices: the default (the winner, else the leader, if
+  // any), each other passing candidate, none.
   function referenceOptions(f) {
-    const options = [["", f.winner ? `the winner, ${f.winner.label} (default)` : "none: no winner yet (default)"]];
+    const chosen = f.winner ? f.winner.label : f.leader;
+    const label = f.winner ? `the winner, ${chosen} (default)` : chosen ? `the leader, ${chosen} (default)` : "none: no candidate passes (default)";
+    const options = [["", label]];
     for (const c of f.candidates) {
-      if (c.verdict === "pass" && (!f.winner || c.label !== f.winner.label)) options.push([c.label, `${c.label}: passes (${c.kind}${c.model ? `:${c.model}` : ""})`]);
+      if (c.verdict === "pass" && c.label !== chosen) options.push([c.label, `${c.label}: passes (${c.kind}${c.model ? `:${c.model}` : ""})`]);
     }
-    if (f.winner) options.push(["none", "none"]);
+    if (chosen) options.push(["none", "none"]);
     return options;
   }
 

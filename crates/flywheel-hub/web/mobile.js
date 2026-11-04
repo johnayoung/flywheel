@@ -101,6 +101,55 @@ window.FwHubPrompt = (function () {
     return null;
   }
 
+  const bare = (line) => line.replace(/[─-╿|]/g, "").trim();
+
+  // The question a cursor menu answers: the nearest sentence ending in
+  // "?" above it, its wrapped lines joined ("Quick safety check: Is this a
+  // project you created or / one you trust?"), not a link or note between
+  // them ("Security guide"); else the nearest line above.
+  function askedAbove(lines, first) {
+    for (let i = first - 1; i >= Math.max(0, first - 12); i--) {
+      const text = bare(lines[i]);
+      if (!text.includes("?")) continue;
+      let start = i;
+      while (start > 0 && i - start < 6 && bare(lines[start - 1])) start -= 1;
+      const joined = lines.slice(start, i + 1).map(bare).join(" ");
+      const end = joined.lastIndexOf("?");
+      const head = joined.slice(0, end + 1);
+      // The sentence holding it: from after the previous sentence's end.
+      const from = Math.max(head.lastIndexOf(". ", end), head.lastIndexOf("! ", end));
+      return (from >= 0 ? head.slice(from + 2) : head).trim();
+    }
+    for (let i = first - 1; i >= Math.max(0, first - 4); i--) {
+      const text = bare(lines[i]);
+      if (text) return text;
+    }
+    return "";
+  }
+
+  // Whether a blocked agent's prompt is one an "Always allow" rule can
+  // answer (a tool permission or approval), from its status `detail` and
+  // the screen: not a folder-trust dialog, a question, or an MCP form.
+  // Screen-read details name the dialog ("Do you want to create
+  // notes.txt?", "Would you like to run the following command? $ ..."),
+  // so only the known others are ruled out.
+  const NOT_PERMISSION_DETAIL = /^(?:asks whether to trust this folder|asks a question|an MCP server asks for input|Claude is asking a question|Claude needs your input|Claude is waiting for your input)$/i;
+  const NOT_PERMISSION_FOOTER = [
+    /^\s*enter to confirm\s*·\s*esc to cancel\s*$/i, // Claude folder trust
+    /^\s*(?:enter continue\b|press enter to continue\b)/i, // Codex folder trust
+    /\benter to select\b.*\besc to cancel\s*$/i, // Claude question
+    /\benter to submit (?:answer|all)\b/i, // Codex question
+    /\bto submit\b.*\besc to cancel\s*$/i, // Codex MCP form
+  ];
+  function asksPermission(detail, lines) {
+    if (NOT_PERMISSION_DETAIL.test((detail || "").trim())) return false;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      return !NOT_PERMISSION_FOOTER.some((re) => re.test(lines[i]));
+    }
+    return true;
+  }
+
   function parse(lines) {
     const run = numberedRun(lines);
     const yn = yesNoLine(lines);
@@ -114,14 +163,7 @@ window.FwHubPrompt = (function () {
       };
     }
     if (menu) {
-      let question = "";
-      for (let i = menu.first - 1; i >= Math.max(0, menu.first - 4); i--) {
-        const text = lines[i].replace(/[─-╿|]/g, "").trim();
-        if (text) {
-          question = text;
-          break;
-        }
-      }
+      const question = askedAbove(lines, menu.first);
       return {
         question,
         options: menu.options.map(({ label, seq, index }) => ({ label: index === menu.cursor ? `❯ ${label}` : label, seq })),
@@ -156,7 +198,7 @@ window.FwHubPrompt = (function () {
     };
   }
 
-  return { parse };
+  return { parse, asksPermission };
 })();
 
 window.FwHubMobile = function (ctx) {
@@ -544,7 +586,7 @@ window.FwHubMobile = function (ctx) {
     // "Always allow": the narrowest rule for this prompt, previewed
     // (perms.js). Permission prompts only: a folder-trust dialog or a
     // question has no rule to write.
-    const always = ctx.allowAlways && /permission/i.test(agent.detail || "")
+    const always = ctx.allowAlways && window.FwHubPrompt.asksPermission(agent.detail, screenLines(true))
       ? el("button", {
           type: "button",
           className: "qa-esc qa-always",

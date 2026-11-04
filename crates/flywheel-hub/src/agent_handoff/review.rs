@@ -78,6 +78,12 @@ pub struct ReviewLaunch {
     /// kind): closed, so one reviewer is paired with the author.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replaced: Option<PairRef>,
+    /// The model alias it was given and what it runs instead: Claude
+    /// Code's plan mode runs a bare alias (`haiku`) on a larger model
+    /// (`claude-sonnet-5-5`, ~13x the cost), so the alias is pinned to the
+    /// id the author ran, or this says it could not be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_note: Option<String>,
     /// The read-only flags it runs with.
     pub flags: Vec<String>,
     pub base: String,
@@ -158,6 +164,49 @@ fn reviewer_model(
             .filter(|m| !m.trim().is_empty()),
         None => None,
     }
+}
+
+/// A Claude model alias (`haiku`, `sonnet[1m]`, `opus`): not a full id.
+fn claude_alias(model: &str) -> Option<&str> {
+    let family = model.split('[').next().unwrap_or(model).trim();
+    (!family.is_empty() && !family.starts_with("claude-") && !family.contains('-'))
+        .then_some(family)
+}
+
+/// A Claude plan-mode `launch` whose model is a bare alias: Claude Code
+/// (2.1.306, verified) runs plan mode on a larger model than the alias
+/// names unless the model is a full id. The alias is pinned to the one
+/// model of its family the author's transcript shows (`models`); else the
+/// launch keeps it and the note says what it may cost.
+fn pin_plan_model(
+    kind: SessionKind,
+    launch: &mut AgentLaunch,
+    models: &[crate::usage::ModelUsage],
+) -> Option<String> {
+    if kind != SessionKind::Claude || launch.permission_mode.as_deref() != Some("plan") {
+        return None;
+    }
+    let alias = launch.model.clone()?;
+    let family = claude_alias(&alias)?;
+    let mut ids: Vec<&str> = models
+        .iter()
+        .map(|m| m.model.as_str())
+        .filter(|id| id.split('-').any(|part| part == family))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if let [id] = ids[..] {
+        launch.model = Some(id.to_owned());
+        return Some(format!(
+            "--model {alias} is pinned to {id} (the author's): plan mode runs a bare alias on a \
+             larger model"
+        ));
+    }
+    Some(format!(
+        "--model {alias} may not hold: Claude Code's plan mode runs a bare alias on a larger \
+         model (haiku ran as sonnet, ~13x the cost); name a full id (--model claude-{family}-...) \
+         to keep it"
+    ))
 }
 
 fn other(kind: SessionKind) -> SessionKind {
@@ -356,11 +405,16 @@ impl Hub {
         let tunables = self.tunables();
         let mut read_only = read_only_launch(kind);
         read_only.model = reviewer_model(request, &author.record, kind);
-        let launch = tunables
+        let mut launch = tunables
             .agent_defaults
             .fill(kind, &read_only)
             .validated(kind)
             .map_err(StateError::Invalid)?;
+        let model_note = pin_plan_model(
+            kind,
+            &mut launch,
+            author.usage.as_ref().map_or(&[][..], |u| &u.models[..]),
+        );
         let flags = launch.args(kind);
         // The paired reviewer, running as the kind wanted: asked again.
         let reusable = author
@@ -391,6 +445,7 @@ impl Hub {
             reused: reusable.is_some(),
             fallback,
             replaced,
+            model_note,
             flags,
             base: diff.base.clone(),
             branch: branch.clone(),
@@ -667,6 +722,60 @@ mod tests {
         assert_eq!(ReviewerChoice::Same.preferred(Claude), Claude);
         assert_eq!(ReviewerChoice::Codex.preferred(Codex), Codex);
         assert_eq!(ReviewerChoice::Claude.preferred(Claude), Claude);
+    }
+
+    fn used(model: &str) -> crate::usage::ModelUsage {
+        crate::usage::ModelUsage {
+            model: model.to_owned(),
+            label: model.to_owned(),
+            tokens: crate::usage::Tokens::default(),
+            cost_usd: Some(0.01),
+        }
+    }
+
+    #[test]
+    fn a_plan_mode_reviewer_s_model_alias_is_pinned_to_the_author_s_id() {
+        // Claude Code 2.1.306: `--model haiku --permission-mode plan` ran
+        // every turn on claude-sonnet-5-5; `--model claude-haiku-5-5` kept
+        // haiku.
+        let plan = |model: &str| AgentLaunch {
+            model: Some(model.to_owned()),
+            ..read_only_launch(SessionKind::Claude)
+        };
+        let mut launch = plan("haiku");
+        let note = pin_plan_model(
+            SessionKind::Claude,
+            &mut launch,
+            &[used("claude-haiku-5-5")],
+        );
+        assert_eq!(launch.model.as_deref(), Some("claude-haiku-5-5"));
+        assert!(note.unwrap().contains("pinned to claude-haiku-5-5"));
+        assert_eq!(
+            launch.args(SessionKind::Claude),
+            ["--model", "claude-haiku-5-5", "--permission-mode", "plan"]
+        );
+
+        // Nothing to pin it to: kept, and said.
+        let mut launch = plan("haiku");
+        let note = pin_plan_model(
+            SessionKind::Claude,
+            &mut launch,
+            &[used("claude-sonnet-5-5")],
+        );
+        assert_eq!(launch.model.as_deref(), Some("haiku"));
+        assert!(note.unwrap().contains("name a full id"));
+
+        // A full id, no model, or not plan mode: untouched.
+        let mut launch = plan("claude-haiku-5-5");
+        assert_eq!(pin_plan_model(SessionKind::Claude, &mut launch, &[]), None);
+        let mut launch = read_only_launch(SessionKind::Claude);
+        assert_eq!(pin_plan_model(SessionKind::Claude, &mut launch, &[]), None);
+        let mut launch = AgentLaunch {
+            model: Some("haiku".into()),
+            ..AgentLaunch::default()
+        };
+        assert_eq!(pin_plan_model(SessionKind::Claude, &mut launch, &[]), None);
+        assert_eq!(launch.model.as_deref(), Some("haiku"));
     }
 
     #[test]

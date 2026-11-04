@@ -632,6 +632,31 @@ try {
     trust && trust.options.length === 2 && trust.options[0].label === "❯ No, exit" && trust.options[0].seq === "\r" && trust.options[1].label === "Yes, I trust this folder" && trust.options[1].seq === "\x1b[B\r",
     `phone: the trust dialog's quick answers are its menu, reached by arrows (${JSON.stringify(trust)})`,
   );
+  check(
+    trust && trust.question === "Quick safety check: Is this a project you created or one you trust?",
+    `phone: the trust dialog's question is its question, not the link below it (${JSON.stringify(trust && trust.question)})`,
+  );
+  // "Always allow" is offered for every tool permission or approval, as
+  // its status detail reads it (screen-read details do not say
+  // "permission"), and for no trust dialog, question, or MCP form.
+  const fixture = (name) => fs.readFileSync(path.join(root, `crates/flywheel-hub/detect/fixtures/${name}.txt`), "utf8").split("\n");
+  const allowCases = [
+    ["codex-approval-exec", "Would you like to run the following command? $ cargo test -p parser", true],
+    ["codex-approval-patch", "Would you like to make the following edits? Destination: /home/me/code/app/src/parser.rs", true],
+    ["codex-approval-mcp", "github needs your approval.", true],
+    ["codex-approval-network", "Do you want to approve network access to example.com?", true],
+    ["claude-permission-write", "Do you want to create notes.txt?", true],
+    ["claude-permission-bash", "permission to use Bash", true],
+    ["claude-trust-narrow", "asks whether to trust this folder", false],
+    ["claude-ask-question", "Do you prefer red or blue?", false],
+    ["codex-question", "asks a question", false],
+    ["codex-trust", "asks whether to trust this folder", false],
+    ["codex-mcp-form", "Approve the pending action.", false],
+  ];
+  const allowed = await mp.evaluate((cases) => cases.map(([name, detail, lines]) => [name, window.FwHubPrompt.asksPermission(detail, lines)]),
+    allowCases.map(([name, detail]) => [name, detail, fixture(name)]));
+  const wrong = allowed.filter(([name, got]) => got !== allowCases.find((c) => c[0] === name)[2]);
+  check(!wrong.length, `phone: Always allow is offered for permission prompts only (${JSON.stringify(wrong)})`);
   await mp.goto(`${base}/login?token=${token}#session=${sids[1]}`);
   await mp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
   await mp.waitForTimeout(800);

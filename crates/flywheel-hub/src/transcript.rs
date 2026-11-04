@@ -261,6 +261,12 @@ struct Saved {
     /// Where earlier conversations' files were left.
     #[serde(default)]
     parked: Vec<SavedTail>,
+    /// See [`SessionCommands::from_hook`].
+    #[serde(default)]
+    from_hook: Vec<(Option<String>, String)>,
+    /// See [`SessionCommands::last_reply`].
+    #[serde(default)]
+    last_reply: Option<(Option<String>, Vec<String>)>,
 }
 
 /// Where a tail stopped.
@@ -295,8 +301,14 @@ struct SessionCommands {
     notified: VecDeque<(String, String)>,
     /// Blocks of the last Claude Stop hook reply (conversation, text) its
     /// transcript has not written yet: that line, when it comes, adds
-    /// nothing again.
+    /// nothing again. Only the next transcript reply is that line: one
+    /// matching none of these clears them (a later turn's identical block
+    /// is a new command).
     from_hook: Vec<(Option<String>, String)>,
+    /// Every fence (in order) of the last Claude transcript reply read, and
+    /// its conversation: a Stop hook's reply that is a prefix of it (the
+    /// hook's payload may be cut short) was read already.
+    last_reply: Option<(Option<String>, Vec<String>)>,
     /// Where the log is saved (`None`: kept in memory only).
     file: Option<PathBuf>,
     /// Why the last save failed.
@@ -345,6 +357,8 @@ impl SessionCommands {
         log.usage = Arc::new(Mutex::new(saved.usage));
         log.subagents = saved.subagents.into_iter().map(Tail::resume).collect();
         log.parked = saved.parked.into_iter().collect();
+        log.from_hook = saved.from_hook;
+        log.last_reply = saved.last_reply;
         log
     }
 
@@ -392,6 +406,8 @@ impl SessionCommands {
             usage: self.usage().clone(),
             subagents: self.subagents.iter().map(Tail::saved).collect(),
             parked: self.parked.iter().cloned().collect(),
+            from_hook: self.from_hook.clone(),
+            last_reply: self.last_reply.clone(),
         };
         let result = serde_json::to_vec(&saved)
             .map_err(std::io::Error::other)
@@ -417,10 +433,15 @@ impl SessionCommands {
     ) -> Vec<Command> {
         let mut added = Vec::new();
         let mut index = 0;
+        let mut fences = Vec::new();
+        let mut matched_hook = false;
         for text in &reply.texts {
             for block in fenced_blocks(text) {
                 let block_index = index;
                 index += 1;
+                if source == CommandSource::Transcript {
+                    fences.push(block.text.clone());
+                }
                 if (closed_only && !block.closed) || block.text.len() > MAX_BLOCK_BYTES {
                     continue;
                 }
@@ -436,6 +457,7 @@ impl SessionCommands {
                         .position(|(c, t)| c.as_deref() == conversation && *t == block.text)
                 {
                     self.from_hook.remove(at);
+                    matched_hook = true;
                     continue;
                 }
                 // A rollout found after its notify fallback was used: the
@@ -470,6 +492,15 @@ impl SessionCommands {
                 self.entries.push_back(command.clone());
                 added.push(command);
             }
+        }
+        if source == CommandSource::Transcript && !fences.is_empty() {
+            // Not the line of the hook's reply: what is left of it never
+            // comes (the hook's text differed), and must not swallow a
+            // later turn's identical block.
+            if !matched_hook {
+                self.from_hook.clear();
+            }
+            self.last_reply = Some((conversation.map(str::to_owned), fences));
         }
         added
     }
@@ -774,12 +805,12 @@ impl CommandBook {
         }
         let conversation = record.agent_session_id.clone();
         // Closed fences only: a long payload is cut to fit a report.
-        let blocks: Vec<String> = fenced_blocks(text)
+        let closed: Vec<String> = fenced_blocks(text)
             .into_iter()
-            .filter(|b| b.closed && b.text.len() <= MAX_BLOCK_BYTES)
+            .filter(|b| b.closed)
             .map(|b| b.text)
             .collect();
-        if blocks.is_empty() {
+        if !closed.iter().any(|b| b.len() <= MAX_BLOCK_BYTES) {
             return Vec::new();
         }
         let entry = self.entry(&record.id);
@@ -788,16 +819,15 @@ impl CommandBook {
             return Vec::new();
         }
         log.from_hook.clear();
-        // Read already (the newest blocks of the conversation are these).
-        let newest: Vec<&str> = log
-            .entries
-            .iter()
-            .rev()
-            .filter(|c| c.conversation == conversation)
-            .take(blocks.len())
-            .map(|c| c.text.as_str())
-            .collect();
-        if newest.len() == blocks.len() && newest.iter().rev().zip(&blocks).all(|(a, b)| a == b) {
+        // Read already: the last transcript reply begins with these blocks
+        // (the hook's text may be cut short, and its unclosed fences are
+        // left out).
+        let read = log.last_reply.as_ref().is_some_and(|(c, fences)| {
+            *c == conversation
+                && closed.len() <= fences.len()
+                && closed.iter().zip(fences).all(|(a, b)| a == b)
+        });
+        if read {
             return Vec::new();
         }
         let turn = payload

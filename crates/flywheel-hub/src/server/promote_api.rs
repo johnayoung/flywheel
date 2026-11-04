@@ -87,7 +87,8 @@ pub(super) async fn promote(
         if let Some(refusal) = engine.promotion_refusal(&fanout) {
             return Err(conflict(refusal));
         }
-        let drafted = promote::draft(&fanout, &body).map_err(invalid)?;
+        let leader = engine.view(&id)?.leader;
+        let drafted = promote::draft(&fanout, &body, leader.as_deref()).map_err(invalid)?;
         let plan = provider
             .plan_task(&fanout.repo, &drafted.draft)
             .map_err(invalid)?;

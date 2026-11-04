@@ -182,6 +182,7 @@ impl Fanouts {
             needs_rebase: false,
             merge: None,
             losers: self.losers(&hub, &fanout, label),
+            warnings: promoted_warnings(&fanout, label),
         };
         if plan.refusal.is_some() {
             return Ok(plan);
@@ -492,4 +493,27 @@ impl Fanouts {
             fanout: self.view(id)?,
         })
     }
+}
+
+/// What picking `label` does to the fan-out's promoted flywheel tasks still
+/// active: their work lands on the base outside them, so each one's worker
+/// finds nothing to do and stops.
+fn promoted_warnings(fanout: &Fanout, label: &str) -> Vec<String> {
+    fanout
+        .promoted
+        .iter()
+        .map(crate::fanout::Promotion::view)
+        .filter(|p| p.state == crate::fanout::promote::PromotedState::Active)
+        .map(|p| {
+            format!(
+                "this fan-out was promoted to flywheel task {id} ({path}): merging {label} puts \
+                 its work on {base} outside that task, so its worker finds nothing left to do \
+                 and stops. Pick only if you mean to drop the task (remove its file), or leave \
+                 the landing to `fw worker`",
+                id = p.promotion.task_id,
+                path = p.promotion.path.display(),
+                base = fanout.base,
+            )
+        })
+        .collect()
 }

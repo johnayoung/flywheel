@@ -11,6 +11,11 @@ function confirmDialog({ kicker, title, body, ok }) {
   $("#confirm-body").textContent = body;
   $("#confirm-ok").textContent = ok || "Confirm";
   dialog.returnValue = "";
+  // Last in the document, as it is in the top layer: opened over another
+  // modal (the Commit dialog's "Ask the agent"), tools that take the
+  // topmost modal from document order (Playwright, some assistive tech)
+  // otherwise treat its buttons as inert.
+  if (document.body.lastElementChild !== dialog) document.body.append(dialog);
   dialog.showModal();
   $("#confirm-ok").focus();
   return new Promise((resolve) => {

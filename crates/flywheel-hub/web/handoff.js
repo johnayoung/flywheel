@@ -317,7 +317,7 @@ window.FwHubHandoff = function (ctx) {
       const launched = await api("POST", `/api/sessions/${author.id}/review/reviewer`, kind ? { kind } : {});
       const reviewer = launched.reviewer;
       const how = launched.reused ? "Asked" : "Launched";
-      toast(`${how} ${reviewer ? reviewer.name : "the reviewer"} (${launched.kind}, read-only: ${launched.flags.join(" ")}) on ${launched.branch || "HEAD"} vs ${launched.base}.${launched.fallback ? ` ${launched.fallback}.` : ""}${launched.diff_truncated ? " The diff in its prompt is cut; it reads the rest itself." : ""}`);
+      toast(`${how} ${reviewer ? reviewer.name : "the reviewer"} (${launched.kind}, read-only: ${launched.flags.join(" ")}) on ${launched.branch || "HEAD"} vs ${launched.base}.${launched.fallback ? ` ${launched.fallback}.` : ""}${launched.model_note ? ` ${launched.model_note}.` : ""}${launched.diff_truncated ? " The diff in its prompt is cut; it reads the rest itself." : ""}`);
       const panel = panels.get(author.id);
       if (panel) panel.data = null;
       if (launched.replaced) toast(`${launched.replaced.name} (${launched.replaced.kind}) is replaced by ${reviewer ? reviewer.name : "the new reviewer"}: it is closed.`);

@@ -352,8 +352,10 @@ fn run_ask_review(
                 "dry_run": args.dry_run,
             })),
         )?;
-        if let Some(note) = launched.get("fallback").and_then(Value::as_str) {
-            let _ = writeln!(err, "fw hub: {note}");
+        for key in ["fallback", "model_note"] {
+            if let Some(note) = launched.get(key).and_then(Value::as_str) {
+                let _ = writeln!(err, "fw hub: {note}");
+            }
         }
         if args.json {
             print_json(out, &launched);

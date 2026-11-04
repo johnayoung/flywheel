@@ -27,6 +27,7 @@ window.FwHubReview = function (ctx) {
 
   const ui = {
     id: null, // the session whose review is open
+    attachedAt: null, // the attached session when it opened
     data: null,
     error: "",
     loading: false,
@@ -125,6 +126,10 @@ window.FwHubReview = function (ctx) {
       ui.files = new Map();
     }
     ui.id = id;
+    // What was attached when it opened: leaving that for the start screen
+    // closes it (opened with nothing attached, from a fan-out board, it
+    // stays).
+    ui.attachedAt = state.attached;
     ui.error = "";
     ctx.onOpen();
     renderDrawer();
@@ -185,6 +190,10 @@ window.FwHubReview = function (ctx) {
     if (state.attached && state.attached !== ui.id) {
       if (!phone() && reviewable(sessionById(state.attached))) open(state.attached, true);
       else close();
+      return;
+    }
+    if (!state.attached && ui.attachedAt) {
+      close();
       return;
     }
     const session = sessionById(ui.id);

@@ -90,7 +90,7 @@ fn fanout() -> Fanout {
 #[test]
 fn a_draft_maps_prompt_graders_protect_and_the_winner() {
     let mut f = fanout();
-    let none = draft(&f, &PromoteRequest::default()).unwrap();
+    let none = draft(&f, &PromoteRequest::default(), None).unwrap();
     assert_eq!(none.draft.goal, "Make answer.txt say 42");
     assert_eq!(none.draft.task_id, "answer-42-abcd");
     assert!(none.draft.notes.ends_with("Write 42 into answer.txt."));
@@ -115,13 +115,29 @@ fn a_draft_maps_prompt_graders_protect_and_the_winner() {
     assert!(none.draft.references.is_empty());
     assert_eq!(none.draft.tags, vec![PROMOTED_TAG.to_owned()]);
 
+    // No winner: the board's leader is the default reference.
+    let led = draft(&f, &PromoteRequest::default(), Some("c1")).unwrap();
+    assert_eq!(led.reference.as_deref(), Some("1111111111111111"));
+    assert!(
+        led.warnings
+            .iter()
+            .any(|w| w.contains("the reference is the leader, c1")),
+        "{:?}",
+        led.warnings
+    );
+    assert!(
+        !led.warnings
+            .iter()
+            .any(|w| w.contains("no reference commit"))
+    );
+
     f.winner = Some(Winner {
         label: "c1".into(),
         head: "1111111111111111".into(),
         base: "main".into(),
         at: Utc::now(),
     });
-    let won = draft(&f, &PromoteRequest::default()).unwrap();
+    let won = draft(&f, &PromoteRequest::default(), None).unwrap();
     assert_eq!(won.reference.as_deref(), Some("1111111111111111"));
     let line = &won.draft.references[0];
     assert!(
@@ -137,7 +153,7 @@ fn a_draft_maps_prompt_graders_protect_and_the_winner() {
         phase: Some("07-x".into()),
         ..PromoteRequest::default()
     };
-    let plain = draft(&f, &skip).unwrap();
+    let plain = draft(&f, &skip, None).unwrap();
     assert_eq!(plain.reference, None);
     assert_eq!(plain.draft.goal, "Answer is 42.");
     assert_eq!(plain.draft.task_id, "answer");
@@ -148,7 +164,7 @@ fn a_draft_maps_prompt_graders_protect_and_the_winner() {
         ..PromoteRequest::default()
     };
     assert!(
-        draft(&f, &failing)
+        draft(&f, &failing, None)
             .unwrap_err()
             .contains("no passing grading")
     );
@@ -156,11 +172,15 @@ fn a_draft_maps_prompt_graders_protect_and_the_winner() {
         reference: Some("c9".into()),
         ..PromoteRequest::default()
     };
-    assert!(draft(&f, &missing).unwrap_err().contains("no candidate"));
+    assert!(
+        draft(&f, &missing, None)
+            .unwrap_err()
+            .contains("no candidate")
+    );
 
     f.graders.retain(|g| g.held_out);
     assert!(
-        draft(&f, &PromoteRequest::default())
+        draft(&f, &PromoteRequest::default(), None)
             .unwrap_err()
             .contains("held out")
     );
@@ -390,7 +410,7 @@ fn promoting_a_seeded_fan_out_keeps_the_task_structure() {
     f.origin = r.origin.clone();
 
     // The task it came from is the durable one: no duplicate by default.
-    let refused = draft(&f, &PromoteRequest::default()).unwrap_err();
+    let refused = draft(&f, &PromoteRequest::default(), None).unwrap_err();
     assert!(
         refused.contains("came from flywheel task answer") && refused.contains("fw worker"),
         "{refused}"
@@ -400,7 +420,7 @@ fn promoting_a_seeded_fan_out_keeps_the_task_structure() {
         task_id: Some("answer-two".into()),
         ..PromoteRequest::default()
     };
-    let d = draft(&f, &named).unwrap().draft;
+    let d = draft(&f, &named, None).unwrap().draft;
     assert_eq!(d.goal, "Answer 42");
     assert_eq!(d.relevant, ["answer.txt"]);
     assert_eq!(
@@ -420,7 +440,7 @@ fn promoting_a_seeded_fan_out_keeps_the_task_structure() {
     // An edited prompt is what the agents got: it becomes the notes.
     f.origin.as_mut().unwrap().prompt_seeded = false;
     f.prompt = "Do it my way.".into();
-    let edited = draft(&f, &named).unwrap().draft;
+    let edited = draft(&f, &named, None).unwrap().draft;
     assert!(edited.notes.ends_with("Do it my way."), "{}", edited.notes);
     assert_eq!(edited.relevant, ["answer.txt"]);
 }

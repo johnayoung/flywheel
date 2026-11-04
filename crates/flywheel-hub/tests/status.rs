@@ -546,6 +546,51 @@ async fn claude_hooks_drive_status_with_per_client_seen_tracking() {
     hub.shutdown().await;
 }
 
+/// A Stop report whose new conversation id cannot be saved (the state dir
+/// is read-only) still ends the turn: the report fails, the status is
+/// `done` (else `fw hub wait --until done` would hang).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_report_whose_conversation_cannot_be_saved_still_moves_the_status() {
+    use std::os::unix::fs::PermissionsExt;
+    let hub = TestHub::start("exec cat", "exec cat").await;
+    let workspace = hub
+        .post(
+            "/api/workspaces",
+            json!({ "name": "agents", "repos": [hub.repo()] }),
+        )
+        .await;
+    let mut events = hub.events("laptop").await;
+    next_event(&mut events, "snapshot").await;
+    let session = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": workspace["id"], "kind": "claude" }),
+        )
+        .await;
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let (args, env) = launched(&hub, "claude").await;
+    let claude = Claude {
+        settings: serde_json::from_str(&args[3]).unwrap(),
+        env,
+    };
+    claude
+        .fire("UserPromptSubmit", None, json!({ "prompt": "go" }))
+        .unwrap();
+    status_becomes(&mut events, &sid, "working").await;
+    let state = hub.dir.path().join("state");
+    let mode = std::fs::metadata(&state).unwrap().permissions().mode();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let sent = claude.fire(
+        "Stop",
+        None,
+        json!({ "session_id": "6f1d1c8e-25a8-4c0e-9d0c-4e7f3f1a2b3c" }),
+    );
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(mode)).unwrap();
+    assert!(sent.is_err(), "the unsaved conversation is reported");
+    status_becomes(&mut events, &sid, "done").await;
+    hub.shutdown().await;
+}
+
 /// A Claude Code stand-in that draws what the real TUI (2.1.306) draws:
 /// the folder-trust dialog first, then per typed line a running turn's
 /// footer (`work`), a permission dialog (`dialog`), or the bare prompt it

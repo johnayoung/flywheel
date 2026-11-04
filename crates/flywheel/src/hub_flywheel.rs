@@ -629,7 +629,15 @@ fn fold_status(entries: Vec<StatusEntry>, panel: &mut FlywheelPanel) {
             alert(AlertKind::Stranded, joined(&park.park_kind, &park.detail));
         }
         if let Some(stop) = &entry.stopped {
-            alert(AlertKind::Stopped, joined(&stop.kind, &stop.detail));
+            // The run's own error says why (an abort's reason: "already
+            // present on the base"); the stop's detail opens with the run
+            // id, all a narrow card would show of it.
+            let why = if entry.latest_error.is_empty() {
+                &stop.detail
+            } else {
+                &entry.latest_error
+            };
+            alert(AlertKind::Stopped, joined(&stop.kind, why));
         }
         phases.entry(phase_of(&entry)).or_default().push(task);
     }
@@ -1090,5 +1098,37 @@ impl FlywheelProvider for HubFlywheel {
 
     fn task_seed(&self, folder: &Path, task_id: &str) -> Result<TaskSeed, String> {
         crate::hub_tasks::task_seed(self, folder, task_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stopped_task_s_alert_says_why_its_run_stopped() {
+        let entries: Vec<StatusEntry> = serde_json::from_value(serde_json::json!([{
+            "task_id": "calc-ed4c21-abc5",
+            "state": "retryable",
+            "latest_run_id": "run-6e5c7a",
+            "latest_status": "failed",
+            "latest_error": "The safe_div(a, b) implementation is already present on the base",
+            "stopped": {
+                "kind": "abort",
+                "detail": "run \"run-6e5c7a\" ended via intent=abort (The safe_div...); routed for a human, never re-dispatched"
+            }
+        }]))
+        .unwrap();
+        let mut panel = FlywheelPanel::empty(PathBuf::from("/repo"), Utc::now());
+        fold_status(entries, &mut panel);
+        let stopped = panel
+            .alerts
+            .iter()
+            .find(|a| a.kind == AlertKind::Stopped)
+            .unwrap();
+        assert_eq!(
+            stopped.detail,
+            "abort -- The safe_div(a, b) implementation is already present on the base"
+        );
     }
 }

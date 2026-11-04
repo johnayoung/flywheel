@@ -231,15 +231,24 @@ fn money_apart(a: Option<f64>, b: Option<f64>) -> (String, String) {
         .unwrap_or((format!("${x:.8}"), format!("${y:.8}")))
 }
 
+/// What `v` had cost when it was graded (what ranking compares).
+fn graded_cost(v: &CandidateView) -> Option<f64> {
+    v.grade.as_ref().and_then(|g| g.cost_usd)
+}
+
 /// Order the board and say why: passing first (smaller diff, then lower
-/// cost), then failing (more graders passed, smaller diff, lower cost),
+/// cost when graded), then failing (more graders passed, smaller diff,
+/// lower cost),
 /// then stale, pending, and ungraded ones in launch order. Fills `rank`
 /// and `why`.
 pub fn rank(views: &mut [CandidateView]) {
     let diff = |v: &CandidateView| v.grade.as_ref().map_or(u64::MAX, |g| g.diff.lines());
     let noop = |v: &CandidateView| v.grade.as_ref().is_some_and(Grade::no_change);
     let passed = |v: &CandidateView| v.grade.as_ref().map_or(0, Grade::graders_passed);
-    let cost = |v: &CandidateView| v.cost_usd.unwrap_or(f64::INFINITY);
+    // The cost recorded with its grade, not the live one: usage keeps
+    // arriving after a turn ends, and a leader must not change (after
+    // `fanout.finished` named it) until a grading changes.
+    let cost = |v: &CandidateView| graded_cost(v).unwrap_or(f64::INFINITY);
     let launch = |v: &CandidateView| {
         v.label
             .trim_start_matches('c')
@@ -390,8 +399,8 @@ fn versus(
         } else {
             "costs more"
         };
-        let (mine, theirs) = money_apart(v.cost_usd, other.cost_usd);
-        return format!("{relation} {who}: same diff, {word} ({mine} vs {theirs})");
+        let (mine, theirs) = money_apart(graded_cost(v), graded_cost(other));
+        return format!("{relation} {who}: same diff, {word} when graded ({mine} vs {theirs})");
     }
     format!("{relation} {who}: same diff and cost (launch order)")
 }

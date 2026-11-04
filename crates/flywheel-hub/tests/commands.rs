@@ -798,3 +798,102 @@ async fn a_finished_turn_s_commands_are_in_before_it_reads_done() {
     assert_eq!(commands[0]["source"], "transcript");
     hub.shutdown().await;
 }
+
+/// A Stop hook whose reply is not exactly the transcript's (cut to fit a
+/// report, or a different text): read already when it is a prefix of the
+/// last transcript reply; else added once, and what is left of it never
+/// swallows a later turn's identical block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_hook_reply_that_differs_from_the_transcript_adds_nothing_twice() {
+    let hub = TestHub::start().await;
+    let ws = hub
+        .post(
+            "/api/workspaces",
+            json!({ "name": "w", "repos": [hub.repo()] }),
+        )
+        .await;
+    let claude = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws["id"], "kind": "claude", "name": "agent" }),
+        )
+        .await;
+    let sid = claude["id"].as_str().unwrap().to_owned();
+    let conversation = claude["agent_session_id"].as_str().unwrap().to_owned();
+    let env = agent_env(&hub, "claude").await;
+    let elsewhere = hub.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let transcript = elsewhere.join(format!("{conversation}.jsonl"));
+    let socket = PathBuf::from(&env[report::SOCKET_ENV]);
+    let line = |uuid: &str, text: &str| {
+        json!({
+            "type": "assistant", "uuid": uuid, "timestamp": chrono::Utc::now().to_rfc3339(),
+            "sessionId": conversation,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+        })
+    };
+    let stop = |message: &str| {
+        let mut payload: Value = serde_json::from_str(STOP_HOOK).unwrap();
+        payload["session_id"] = json!(conversation);
+        payload["transcript_path"] = json!(transcript);
+        payload["cwd"] = json!(hub.repo());
+        payload["last_assistant_message"] = json!(message);
+        let report = Report {
+            session: sid.clone(),
+            secret: env[report::SECRET_ENV].clone(),
+            source: "claude".into(),
+            event: "Stop".into(),
+            detail: None,
+            payload: Some(payload),
+        };
+        let to = socket.clone();
+        async move {
+            tokio::task::spawn_blocking(move || report::send(&to, &report))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    };
+    let texts = |list: &Value| -> Vec<String> {
+        list["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["text"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Three blocks on disk; the hook's copy was cut inside the third.
+    let full = "```bash\necho one\n```\n```bash\necho two\n```\n```bash\necho three\n```";
+    append(&transcript, &line("a1", full));
+    stop("```bash\necho one\n```\n```bash\necho two\n```\n```bash\necho thr").await;
+    let list = hub.get(&format!("/api/sessions/{sid}/commands")).await;
+    assert_eq!(
+        texts(&list),
+        ["echo three", "echo two", "echo one"],
+        "a cut hook reply added again: {list}"
+    );
+
+    // The hook's reply is not what the transcript writes: added once from
+    // the hook; the transcript's line adds its own block.
+    stop("```bash\necho hooked\n```").await;
+    append(&transcript, &line("a2", "```bash\necho written\n```"));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    // A later turn suggests the hook's block again: a new command.
+    append(&transcript, &line("a3", "```bash\necho hooked\n```"));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let list = hub.get(&format!("/api/sessions/{sid}/commands")).await;
+    assert_eq!(
+        texts(&list),
+        [
+            "echo hooked",
+            "echo written",
+            "echo hooked",
+            "echo three",
+            "echo two",
+            "echo one"
+        ],
+        "{list}"
+    );
+    hub.shutdown().await;
+}

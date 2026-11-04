@@ -445,7 +445,7 @@ window.FwHubFanout = function (ctx) {
         el("h2", { id: "fo-title", textContent: f ? f.name : "Fan-outs" }),
         f
           ? el("span", { className: "fo-sub" },
-            el("span", { textContent: `${f.workspace || "?"} · ${f.base} @ ${short(f.base_sha)}` }),
+            el("span", { textContent: `${f.workspace || "?"} · cut from ${f.base} at ${short(f.base_sha)}`, title: `The candidates' worktrees were cut from ${f.base} at ${f.base_sha}; a rebased one is on a newer ${f.base}.` }),
             el("span", { textContent: ` · ${f.candidates.length} agents · ${headline(f)}` }))
           : null,
       ),
@@ -572,16 +572,22 @@ window.FwHubFanout = function (ctx) {
     return busy(f, c, "pick", async () => {
       const plan = await post(f, "pick", { candidate: c.label, dry_run: true });
       if (plan.needs_rebase) {
+        // One confirm: the rebase's own commands are shown here.
+        const rebasing = (await post(f, "rebase", { candidate: c.label, dry_run: true })).plan;
+        if (rebasing.refusal) {
+          await ask({ kicker: "pick winner", title: `${c.label} cannot be rebased now`, body: [el("p", { className: "sheet-body", textContent: rebasing.refusal })], buttons: [] });
+          return;
+        }
         const go = await ask({
           kicker: "pick winner",
           title: `Rebase ${c.label} first`,
           body: [
             el("p", { className: "sheet-body", textContent: `${f.base} moved since ${c.label} was cut, so it is not a fast-forward. Rebase it onto ${f.base}: the hub grades it again, and it can be picked once it passes.` }),
-            plan.refusal ? el("p", { className: "fo-plan-detail", textContent: plan.refusal }) : null,
+            commandList(rebasing),
           ],
           buttons: [{ label: "Rebase and re-grade", value: "rebase" }],
         });
-        if (go === "rebase") await rebase(f, c);
+        if (go === "rebase") await runRebase(f, c, rebasing);
         return;
       }
       if (plan.refusal) {
@@ -592,6 +598,7 @@ window.FwHubFanout = function (ctx) {
         kicker: "pick winner",
         title: `Merge ${c.label} into ${f.base}`,
         body: [
+          ...(plan.warnings || []).map((w) => el("p", { className: "fo-plan-warn", textContent: `warning: ${w}` })),
           commandList(plan.merge),
           plan.losers.length ? el("p", { className: "field-label", textContent: "then, the others" }) : null,
           plan.losers.length ? loserList(plan.losers) : null,
@@ -619,6 +626,11 @@ window.FwHubFanout = function (ctx) {
     }
     const go = await ask({ kicker: "rebase", title: `Rebase ${c.label} onto ${f.base}`, body: [commandList(plan)], buttons: [{ label: "Rebase", value: "go" }] });
     if (go !== "go") return;
+    await runRebase(f, c, plan);
+  }
+
+  // Run the rebase `plan` (confirmed by its fingerprint).
+  async function runRebase(f, c, plan) {
     const done = await post(f, "rebase", { candidate: c.label, confirm: plan.fingerprint });
     await reload();
     if (done.rebase && done.rebase.ok) toast(`${c.label} rebased onto ${f.base}; grading it again.`, { timeout: 6000 });

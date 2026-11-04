@@ -69,6 +69,7 @@ Agent output:
 ```bash
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N] {remote} {machine}
 fw hub search QUERY [--regex] [--case] [--session S] [--workspace W] [--kind K]... [--source scrollback|transcript|commands]... [--limit N] [--per-session N] [--offset N] [--json] {remote} {machine}   # 1: no hits
+fw hub activity [--since AGE|TIME|last-seen] [--until T] [--workspace W] [--session S] [--kind K]... [--limit N] [--json] {remote} {machine}
 fw hub record start SESSION [--json] {remote}
 fw hub record stop SESSION [--json] {remote}
 fw hub record ls [--json] {remote}
@@ -386,4 +387,5 @@ All files 0600, the dir 0700.
 | `machines.json`, `peers.json`, `shares.json` | machines (plaintext credentials), peer and share digests |
 | `commands/<id>.json`, `usage-archive.json` | suggested blocks + usage per session; removed sessions' usage |
 | `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` | recordings, plugins (+ enablement, logs), detection overrides, local CA |
+| `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` | activity journal; each client's last-active time |
 | `open-<id>.html` | `open` redirect pages |

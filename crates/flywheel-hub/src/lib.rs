@@ -10,6 +10,8 @@
 //! `fw hub <verb>` to [`cli::main`]; nothing below depends on this crate.
 //! Operator docs: `docs/hub.md` (front door) and `docs/hub/*.md`.
 
+pub mod activity;
+pub mod activity_cli;
 pub mod agent;
 pub mod agent_handoff;
 pub mod agent_handoff_cli;

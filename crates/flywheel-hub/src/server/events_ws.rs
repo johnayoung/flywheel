@@ -90,23 +90,39 @@ pub(super) async fn events_ws(
 enum EventsClientMessage {
     /// `session_id`: the focused pane's session; `visible`: the other
     /// panes on screen (a split layout), which count as viewed too.
+    /// `present`: someone is at the page (visible, focused, touched
+    /// lately); absent, it is present while it shows a session.
     View {
         session_id: Option<String>,
         #[serde(default)]
         visible: Vec<String>,
+        #[serde(default)]
+        present: Option<bool>,
     },
 }
 
-/// Unregisters a viewer however the pump ends.
+/// Unregisters a viewer (and its presence) however the pump ends.
 struct ViewerGuard {
     hub: Arc<Hub>,
     viewer: u64,
+    client: String,
 }
 
 impl Drop for ViewerGuard {
     fn drop(&mut self) {
         self.hub.disconnect_viewer(self.viewer);
+        self.hub.activity().disconnect(&self.client, self.viewer);
     }
+}
+
+/// The `away` message: this client is back after a while; its digest
+/// (`GET /api/activity/digest?since=&until=`) covers the span.
+fn away_message(back: crate::activity::Return) -> Message {
+    text(json!({
+        "type": "away",
+        "since": back.since,
+        "until": back.until,
+    }))
 }
 
 pub(super) fn text(value: serde_json::Value) -> Message {
@@ -173,7 +189,10 @@ impl Batch {
                 return;
             }
             // Nothing for clients.
-            HubEvent::Unwatched { .. } | HubEvent::Lifecycle { .. } => return,
+            HubEvent::Unwatched { .. }
+            | HubEvent::Lifecycle { .. }
+            | HubEvent::TurnFinished { .. }
+            | HubEvent::PluginRan { .. } => return,
             HubEvent::Status { session_id } => self
                 .events
                 .iter()
@@ -241,7 +260,12 @@ fn event_message(hub: &Hub, client: &str, event: HubEvent) -> Option<Message> {
         HubEvent::Layout { workspace_id, rev } => {
             text(json!({ "type": "layout", "workspace_id": workspace_id, "rev": rev }))
         }
-        HubEvent::Sessions | HubEvent::Unwatched { .. } | HubEvent::Lifecycle { .. } => {
+        HubEvent::Activity { row } => text(json!({ "type": "activity", "row": row })),
+        HubEvent::Sessions
+        | HubEvent::Unwatched { .. }
+        | HubEvent::Lifecycle { .. }
+        | HubEvent::TurnFinished { .. }
+        | HubEvent::PluginRan { .. } => {
             return None;
         }
     })
@@ -264,6 +288,7 @@ async fn events_pump(
     let guard = ViewerGuard {
         viewer: hub.connect_viewer(&client),
         hub: Arc::clone(&hub),
+        client: client.clone(),
     };
     if socket.send(snapshot_message(&hub, &client)).await.is_err() {
         return;
@@ -337,13 +362,20 @@ async fn events_pump(
                 match message {
                     Some(Ok(Message::Text(body))) => {
                         match serde_json::from_str::<EventsClientMessage>(body.as_str()) {
-                            Ok(EventsClientMessage::View { session_id, visible }) => {
+                            Ok(EventsClientMessage::View { session_id, visible, present }) => {
                                 let ids: Vec<&str> = session_id
                                     .iter()
                                     .chain(visible.iter())
                                     .map(String::as_str)
                                     .collect();
                                 hub.set_viewing_many(guard.viewer, &ids);
+                                let present = present.unwrap_or(!ids.is_empty());
+                                let back = hub.activity().set_present(&client, guard.viewer, present);
+                                if let Some(back) = back
+                                    && socket.send(away_message(back)).await.is_err()
+                                {
+                                    break;
+                                }
                             }
                             Err(e) => {
                                 let error = json!({ "type": "error", "message": format!("bad message: {e}") });

@@ -1,0 +1,167 @@
+/* flywheel hub -- the Activity view and the "while you were away" card
+ * (activity.js). Loaded after app.css, in index.html's order. */
+
+/* --- the timeline (a sheet; full screen on phones) ---------------------- */
+
+#dlg-activity { width: min(52rem, calc(100vw - 2rem)); height: min(48rem, calc(100dvh - 3rem)); overflow: hidden; }
+.act-frame { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.act-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0;
+}
+.act-filters select { max-width: 16rem; }
+.act-status:empty { display: none; }
+.act-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0 0 1rem;
+  scrollbar-width: thin;
+}
+.act-day {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: .6rem 1.4rem .35rem;
+  background: var(--bg-3);
+  color: var(--signal);
+  font: 800 1.15rem/1 var(--display);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--rule);
+}
+.act-group { padding: .35rem 0 .2rem; }
+.act-head {
+  display: flex;
+  align-items: baseline;
+  gap: .5rem;
+  padding: .25rem 1.4rem .2rem;
+  font-size: 9.5px;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.act-ws { color: var(--ink-2); }
+.act-machine {
+  padding: 0 .35rem;
+  border: 1px solid var(--rule-2);
+  letter-spacing: .08em;
+  color: var(--brass);
+}
+.act-rows { list-style: none; margin: 0; padding: 0; }
+.act-row {
+  display: grid;
+  grid-template-columns: 3.4rem 4.6rem minmax(0, 1fr) auto;
+  align-items: center;
+  gap: .6rem;
+  padding: .32rem 1.4rem;
+  border-left: 3px solid transparent;
+  font-size: 11.5px;
+}
+.act-row.linked { cursor: pointer; }
+.act-row.linked:hover, .act-row.linked:focus-visible { background: var(--bg-4); border-left-color: var(--signal); outline: none; }
+.act-time { color: var(--ink-3); font: 400 11px var(--term); }
+.act-tag {
+  justify-self: start;
+  padding: .05rem .35rem;
+  border: 1px solid var(--rule-2);
+  color: var(--ink-2);
+  font-size: 9.5px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.act-what { display: flex; align-items: center; gap: .4rem; min-width: 0; }
+.act-what svg { width: .75rem; height: .75rem; flex: none; color: var(--ink-3); }
+.act-who { color: var(--ink); font-weight: 600; white-space: nowrap; max-width: 12rem; overflow: hidden; text-overflow: ellipsis; }
+.act-text { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.act-go {
+  padding: .15rem .45rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: none;
+  color: var(--ink-3);
+  font: 600 10px var(--mono);
+  letter-spacing: .06em;
+}
+.act-go.none { border: 0; }
+.act-row.linked:hover .act-go { color: var(--signal); border-color: var(--signal); }
+.k-turn-finished .act-tag { color: var(--brass); border-color: var(--brass); }
+.k-status-changed .act-tag { color: var(--alert); border-color: var(--alert); }
+.k-fanout-finished .act-tag, .k-review-merged .act-tag { color: var(--signal); border-color: var(--signal); }
+.k-usage .act-text { font-family: var(--term); }
+.act-empty { padding: 2rem 1.4rem; color: var(--ink-3); }
+.act-more { display: flex; justify-content: center; padding: .8rem; }
+.act-pill b { margin-left: .25rem; }
+
+/* --- while you were away ------------------------------------------------ */
+
+.away {
+  position: absolute;
+  top: .8rem;
+  right: 1rem;
+  z-index: 30;
+  width: min(25rem, calc(100% - 2rem));
+  padding: 0 1rem .9rem;
+  border-top: 4px solid var(--signal);
+  background: var(--bg-3);
+  box-shadow: var(--shadow);
+  animation: sheet-in .28s var(--ease);
+}
+.away-head { display: flex; align-items: baseline; gap: .6rem; padding: .7rem 0 .5rem; border-bottom: 1px solid var(--rule); }
+.away-head h3 { margin: 0; flex: 1; font: 800 1.5rem/1 var(--display); }
+.away-head .icon { align-self: center; }
+.away-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .4rem; padding: .7rem 0 .5rem; }
+.away-stat { display: grid; gap: .15rem; }
+.away-stat b { font: 800 1.45rem/1 var(--display); color: var(--ink); }
+.away-stat span { font-size: 9px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); }
+.away-stat.bad:not(.zero) b { color: var(--alert); }
+.away-stat.zero b { color: var(--ink-3); }
+.away-list { list-style: none; margin: 0; padding: .3rem 0; display: grid; gap: .25rem; border-top: 1px solid var(--rule); }
+.away-link {
+  width: 100%;
+  padding: .3rem .4rem;
+  border: 0;
+  border-left: 2px solid var(--rule-2);
+  background: none;
+  color: var(--ink-2);
+  font: 11px var(--mono);
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.away-link b { color: var(--ink); }
+.away-link.blocked { border-left-color: var(--alert); }
+.away-link:not(:disabled):hover { background: var(--bg-4); color: var(--ink); }
+.away-note { margin: .3rem 0 0; color: var(--ink-3); font-size: 10.5px; }
+.away-foot { display: flex; gap: .5rem; justify-content: flex-end; padding-top: .6rem; }
+
+@media (max-width: 760px) {
+  #dlg-activity { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; }
+  .act-day, .act-head, .act-row { padding-left: .8rem; padding-right: .8rem; }
+  .act-row {
+    grid-template-columns: 3.6rem minmax(0, 1fr) auto;
+    grid-template-areas: "time what go" "time tag go";
+    row-gap: .1rem;
+    padding-top: .5rem;
+    padding-bottom: .5rem;
+  }
+  .act-time { grid-area: time; align-self: start; white-space: nowrap; font-size: 10.5px; }
+  .act-what { flex-wrap: wrap; row-gap: .1rem; }
+  .act-who { max-width: 100%; }
+  .act-text { white-space: normal; overflow-wrap: anywhere; }
+  .act-tag { grid-area: tag; }
+  .act-what { grid-area: what; }
+  .act-go { grid-area: go; min-height: 2.2rem; min-width: 2.75rem; }
+  .act-filters select { max-width: none; flex: 1 1 8rem; min-height: 2.2rem; }
+  .away { left: .5rem; right: .5rem; top: .5rem; width: auto; }
+  .away-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .away-link { min-height: 2.2rem; }
+  .away-foot .slab { flex: 1; min-height: 2.6rem; }
+}

@@ -907,5 +907,9 @@ window.FwHubSearch = function (ctx) {
     if (ui.open) renderFilters();
   }
 
-  return { open, close, toggle, isOpen: () => ui.open, paletteItems, refreshFilters };
+  return {
+    open, close, toggle, isOpen: () => ui.open, paletteItems, refreshFilters,
+    // The transcript viewer at message `index` (activity.js: a finished turn).
+    openTranscript: (group, index) => openTranscript(group, index, { text: "", regex: false, caseSensitive: false }),
+  };
 };

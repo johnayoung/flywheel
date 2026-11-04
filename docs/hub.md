@@ -67,6 +67,7 @@ Docs: `topic: section`, read with `fw docs <topic>`.
 | Doctor | machine check with fixes | [hub-internals: Doctor](hub/internals.md#doctor) |
 | API | REST + terminal and events WebSockets | [hub-api](hub/api.md) |
 | Prompt queue | prompts typed in once the agent is done | [hub-workflows: Prompt queue](hub/workflows.md#prompt-queue) |
+| Activity | timeline, "while you were away" | [hub-workflows: Activity](hub/workflows.md#activity) |
 
 ## Verbs
 
@@ -77,7 +78,7 @@ Full syntax, flags, and files: [hub-reference](hub/reference.md). `fw hub <verb>
 | Server | `start` `stop` `upgrade` `status` `logs` `serve` `install-service` `doctor` |
 | Sign-in and access | `open` `url` `token` `tls` `peer` `machine` `share` |
 | Sessions | `ls` `new` `send` `read` `wait` `attach` `kill` `relaunch` `explain` `import` `template` `queue` |
-| Agent output | `commands` `search` `record` |
+| Agent output | `commands` `search` `activity` `record` |
 | Git and agents together | `review` `merge` `handoff` `ask-review` `fanout` |
 | Settings | `config` `plugin` |
 | Hooks | `report` (agent status hooks) |

@@ -34,6 +34,7 @@
 <link rel="stylesheet" href="/assets/app-sharing.css">
 <link rel="stylesheet" href="/assets/app-handoff.css">
 <link rel="stylesheet" href="/assets/app-queue.css">
+<link rel="stylesheet" href="/assets/app-activity.css">
 </head>
 <body>
 <svg class="sprite" aria-hidden="true" focusable="false">
@@ -79,6 +80,7 @@
   <symbol id="i-exit" viewBox="0 0 16 16"><path d="M9.5 2.5h-6v11h6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6.8 8h7.2M11.4 5.4 14 8l-2.6 2.6" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-queue" viewBox="0 0 16 16"><path d="M2.5 4h7M2.5 8h7M2.5 12h4.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M11 9.5 13.5 12 11 14.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M12.5 3v9" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
   <symbol id="i-grip" viewBox="0 0 16 16"><circle cx="6" cy="4" r="1.1" fill="currentColor"/><circle cx="10" cy="4" r="1.1" fill="currentColor"/><circle cx="6" cy="8" r="1.1" fill="currentColor"/><circle cx="10" cy="8" r="1.1" fill="currentColor"/><circle cx="6" cy="12" r="1.1" fill="currentColor"/><circle cx="10" cy="12" r="1.1" fill="currentColor"/></symbol>
+  <symbol id="i-activity" viewBox="0 0 16 16"><path d="M1.5 8.5h3l2-5 3 9 2-4h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></symbol>
   <symbol id="i-dots" viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/></symbol>
 </svg>
 
@@ -113,6 +115,7 @@
           <span class="theme-swatch" aria-hidden="true"></span><span id="theme-label" class="chip-label">auto</span>
         </button>
         <button type="button" class="chip tool alerts" id="alerts-toggle" aria-pressed="false"><span class="alerts-dot" aria-hidden="true"></span><span id="alerts-label" class="chip-label">alerts off</span></button>
+        <button type="button" class="chip tool" data-action="activity" title="Activity: what happened, on every machine"><svg aria-hidden="true"><use href="#i-activity"/></svg><span class="chip-label">activity</span></button>
         <button type="button" class="chip tool" data-action="machines" title="Other machines' hubs"><svg aria-hidden="true"><use href="#i-machines"/></svg><span class="chip-label">machines</span></button>
         <button type="button" class="chip tool" data-action="sharing" title="Share links and recordings"><svg aria-hidden="true"><use href="#i-link"/></svg><span class="chip-label">sharing</span></button>
         <button type="button" class="chip tool settings-gear" id="settings-gear" data-action="settings" title="Settings"><svg aria-hidden="true"><use href="#i-gear"/></svg><span class="chip-label">settings</span></button>
@@ -140,6 +143,7 @@
         <button type="button" id="queue-toggle" class="cmd-pill queue-pill" data-action="toggle-queue" data-key-title="queue.toggle" data-title="Prompt queue: prompts typed in once the agent is done" title="Prompt queue: prompts typed in once the agent is done (Alt Q)" aria-pressed="false" aria-controls="queue" hidden><svg><use href="#i-queue"/></svg>queue<b id="queue-count" hidden></b></button>
         <button type="button" id="share-toggle" class="cmd-pill share-pill" data-action="share" aria-haspopup="dialog" aria-controls="dlg-sharing" hidden><svg><use href="#i-send"/></svg>share<b id="share-count" hidden></b></button>
         <button type="button" id="rec-toggle" class="cmd-pill rec-pill" data-action="toggle-record" aria-pressed="false" hidden><span class="rec-dot" aria-hidden="true"></span><span id="rec-label">rec</span></button>
+        <button type="button" id="act-toggle" class="cmd-pill act-pill" data-action="activity" title="Activity: what happened, on every machine" aria-controls="dlg-activity"><svg><use href="#i-activity"/></svg>activity<b id="act-count" hidden></b></button>
         <button type="button" id="search-toggle" class="cmd-pill search-pill" data-action="search" data-key-title="search.open" data-title="Search every session" title="Search every session (Ctrl Shift F)" aria-controls="search"><svg><use href="#i-search"/></svg>search</button>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
         <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" data-key-title="commands.toggle" data-title="Suggested commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
@@ -155,6 +159,7 @@
       <div id="terminal"></div>
       <div id="pane-park" hidden></div>
       <div id="sel-pop" class="sel-pop" hidden role="toolbar" aria-label="Selection"></div>
+      <aside id="away" class="away" hidden tabindex="-1" aria-label="While you were away"></aside>
       <div id="banner" class="banner" hidden role="status">
         <span id="banner-text"></span>
         <span class="banner-actions" id="banner-actions"></span>
@@ -616,6 +621,25 @@
 
 <div id="toasts" class="toasts" popover="manual" role="status" aria-live="polite"></div>
 
+<dialog id="dlg-activity" class="sheet act-sheet" aria-labelledby="act-title">
+  <div class="act-frame">
+    <header class="sheet-head act-top">
+      <div>
+        <span class="sheet-kicker">activity</span>
+        <h2 id="act-title">What happened</h2>
+      </div>
+      <button type="button" class="icon" id="act-close" title="Close (Esc)" aria-label="Close activity"><svg><use href="#i-x"/></svg></button>
+    </header>
+    <div class="search-filters act-filters">
+      <select id="act-ws" aria-label="Workspace"></select>
+      <select id="act-session" aria-label="Session"></select>
+      <select id="act-kind" aria-label="Kind"></select>
+    </div>
+    <p id="act-status" class="search-status act-status" aria-live="polite"></p>
+    <ol id="act-list" class="act-list" aria-label="Timeline"></ol>
+  </div>
+</dialog>
+
 <div id="search" class="palette search" hidden>
   <div class="palette-box search-box" role="dialog" aria-modal="true" aria-label="Search every session">
     <div class="palette-input search-line">
@@ -684,6 +708,7 @@
 <script src="/assets/sharing.js"></script>
 <script src="/assets/handoff.js"></script>
 <script src="/assets/queue.js"></script>
+<script src="/assets/activity.js"></script>
 <script src="/assets/app-base.js"></script>
 <script src="/assets/app-layout.js"></script>
 <script src="/assets/app-stage.js"></script>

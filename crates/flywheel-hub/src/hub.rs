@@ -389,6 +389,17 @@ pub enum HubEvent {
         event: &'static str,
         payload: serde_json::Value,
     },
+    /// An agent finished a turn (its status before seen tracking became
+    /// `done`), whether or not anyone was looking.
+    TurnFinished { session_id: String },
+    /// A plugin ran (on an event or as an action).
+    PluginRan {
+        plugin: String,
+        trigger: String,
+        ok: bool,
+    },
+    /// A row was added to the activity journal (see [`crate::activity`]).
+    Activity { row: serde_json::Value },
 }
 
 /// Facts about the server-owned PTY (present until the session is removed
@@ -478,6 +489,8 @@ pub struct Hub {
     recordings: Arc<crate::record::Recordings>,
     /// Prompt queues' typing times, holds, and delivery gate.
     queue: crate::queue::QueueRuntime,
+    /// The activity journal and each client's presence.
+    activity: crate::activity::Activity,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -518,6 +531,7 @@ impl Hub {
         crate::transcript::spawn_watcher(&hub);
         git::spawn_watcher(&hub);
         hub.start_queues();
+        hub.start_activity();
         Ok(hub)
     }
 
@@ -576,6 +590,7 @@ impl Hub {
                 record_limits,
             )),
             queue: crate::queue::QueueRuntime::default(),
+            activity: crate::activity::Activity::open(&options_state_dir),
             _serve_lock: serve_lock,
         }))
     }
@@ -639,6 +654,11 @@ impl Hub {
     /// Suggested commands read from agent transcripts.
     pub(crate) fn command_book(&self) -> &CommandBook {
         &self.commands
+    }
+
+    /// The activity journal (see [`crate::activity`]).
+    pub fn activity(&self) -> &crate::activity::Activity {
+        &self.activity
     }
 
     /// What pauses and stops fan-out gradings (see [`crate::fanout`]).
@@ -827,6 +847,7 @@ impl Hub {
         }
         self.commands.stop();
         self.git.stop();
+        self.activity.shutdown();
         let last_cwds: HashMap<String, PathBuf> = self
             .live()
             .iter()

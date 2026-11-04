@@ -157,7 +157,8 @@ function sendView(force) {
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   const all = currentView();
   const here = (id) => id && !machines.machineOf(id);
-  const view = { session_id: here(all.session_id) ? all.session_id : null, visible: all.visible.filter(here) };
+  // `present`: someone is at the page (the hub's "while you were away").
+  const view = { session_id: here(all.session_id) ? all.session_id : null, visible: all.visible.filter(here), present: present() };
   const key = JSON.stringify(view);
   if (!force && key === state.viewing) return;
   state.viewing = key;
@@ -299,6 +300,11 @@ function onPush(message, machine) {
     onLayoutEvent(message);
   } else if (message.type === "fanout" && !machine) {
     fanout.onEvent(message);
+  } else if (message.type === "activity" && !machine) {
+    // A machine's rows reach this hub's journal view through its merge.
+    activity.onRow(message.row);
+  } else if (message.type === "away" && !machine) {
+    activity.onAway(message);
   } else if (!machine && ["settings", "config", "plugins", "plugin_toast"].includes(message.type)) {
     settings.onPush(message);
   }

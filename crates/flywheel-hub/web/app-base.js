@@ -558,6 +558,26 @@ const promptQueue = window.FwHubQueue({
   onOpen: () => closeOverlays("queue"),
 });
 
+// The activity timeline and "while you were away" (activity.js).
+const activity = window.FwHubActivity({
+  $, el, icon, rawApi, state, sessionById, workspaceById,
+  toast: (...args) => commands.toast(...args),
+  openSession: (id) => openSession(id),
+  openCommandsAt: (id, seq, all) => {
+    review.close();
+    flywheel.close();
+    commands.openAt(id, seq, all);
+  },
+  openReview: (id) => review.open(id),
+  openQueue: (id) => promptQueue.open(id),
+  openFanout: (id) => fanout.open(id),
+  openTranscript: (group, index) => search.openTranscript(group, index),
+  onOpen: () => {
+    if (search.isOpen()) search.close(false);
+    explain.close();
+  },
+});
+
 // Read-only share links and recordings (sharing.js).
 const sharing = window.FwHubSharing({
   $, el, rawApi, sessionById, span,

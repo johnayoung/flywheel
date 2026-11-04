@@ -13,6 +13,14 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
 
+/// A session's status ahead of a change: as anyone sees it, and before
+/// seen tracking with its spell (a new spell of `done` is a new turn).
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct StatusBefore {
+    shown: Option<AgentStatus>,
+    turn: Option<(AgentStatus, u64)>,
+}
+
 impl Hub {
     /// Watch an agent session's screen for what its reports miss (see
     /// [`crate::detect::tracker`]): Codex's turns and approval prompts,
@@ -127,7 +135,7 @@ impl Hub {
         spell: u64,
         decision: crate::detect::tracker::Decision,
     ) {
-        let before = self.agent_status(id).map(|s| s.status);
+        let before = self.status_before(id);
         let changed = self.board().apply_screen(
             id,
             generation,
@@ -177,7 +185,7 @@ impl Hub {
         detail: Option<&str>,
         source: StatusSource,
     ) {
-        let before = self.agent_status(id).map(|s| s.status);
+        let before = self.status_before(id);
         let changed = self
             .board()
             .apply_report(id, generation, signal, detail, source);
@@ -186,8 +194,23 @@ impl Hub {
         }
     }
 
-    /// A session's status changed: refresh its badge, tell clients.
-    fn status_changed(&self, id: &str, before: Option<AgentStatus>) {
+    /// Session `id`'s status as anyone sees it, and before seen tracking
+    /// with its spell, ahead of a change (see [`Hub::status_changed`]).
+    fn status_before(&self, id: &str) -> StatusBefore {
+        let board = self.board();
+        StatusBefore {
+            shown: board.status(id, Audience::Anyone).map(|s| s.status),
+            turn: board.alert(id).map(|a| (a.status, a.spell)),
+        }
+    }
+
+    /// A session's status changed: refresh its badge, tell clients, and
+    /// announce it: `status.changed` when what anyone sees changed (the
+    /// one place plugins, the activity journal, and the rest hear of it),
+    /// and a finished turn when its raw status became `done`.
+    fn status_changed(&self, id: &str, before: StatusBefore) {
+        self.announce_status(id, &before);
+        let before = before.shown;
         // A turn started from rest (not a blocked prompt answered): what
         // sat in the agent's input line was sent.
         if !matches!(before, Some(AgentStatus::Blocked | AgentStatus::Working))
@@ -288,7 +311,27 @@ impl Hub {
         let (seen, left) = {
             let mut board = self.board();
             let before = board.viewing(viewer).to_vec();
-            let seen = board.view_many(viewer, session_ids);
+            let earlier: Vec<(String, StatusBefore)> = session_ids
+                .iter()
+                .map(|id| {
+                    let before = StatusBefore {
+                        shown: board.status(id, Audience::Anyone).map(|s| s.status),
+                        turn: board.alert(id).map(|a| (a.status, a.spell)),
+                    };
+                    ((*id).to_owned(), before)
+                })
+                .collect();
+            let seen: Vec<(String, StatusBefore)> = board
+                .view_many(viewer, session_ids)
+                .into_iter()
+                .map(|id| {
+                    let before = earlier
+                        .iter()
+                        .find(|(e, _)| *e == id)
+                        .map_or(StatusBefore::default(), |(_, b)| *b);
+                    (id, before)
+                })
+                .collect();
             let left: Vec<String> = before
                 .into_iter()
                 .filter(|b| !board.is_watched(b))
@@ -298,9 +341,45 @@ impl Hub {
         for session_id in left {
             self.emit(HubEvent::Unwatched { session_id });
         }
-        for session_id in seen {
+        for (session_id, before) in seen {
+            self.announce_status(&session_id, &before);
             self.emit(HubEvent::Status { session_id });
         }
+    }
+
+    /// The lifecycle side of a status change (see [`Hub::status_changed`]).
+    fn announce_status(&self, id: &str, before: &StatusBefore) {
+        let (view, turn) = {
+            let board = self.board();
+            (
+                board.status(id, Audience::Anyone),
+                board.alert(id).map(|a| (a.status, a.spell)),
+            )
+        };
+        let Some(view) = view else { return };
+        if turn.is_some_and(|(status, spell)| {
+            status == AgentStatus::Done && before.turn != Some((status, spell))
+        }) {
+            self.emit(HubEvent::TurnFinished {
+                session_id: id.to_owned(),
+            });
+        }
+        if before.shown == Some(view.status) {
+            return;
+        }
+        let Some(session) = self.event_session(id) else {
+            return;
+        };
+        self.emit_lifecycle(
+            "status.changed",
+            serde_json::json!({
+                "session": session,
+                "status": view.status,
+                "previous": before.shown,
+                "detail": view.detail,
+                "since": view.since,
+            }),
+        );
     }
 
     /// What a push notification about session `id` would say, and the

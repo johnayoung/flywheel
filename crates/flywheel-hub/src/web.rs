@@ -154,6 +154,12 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         "text/css; charset=utf-8",
     ),
     ("queue.js", include_bytes!("../web/queue.js"), JS),
+    (
+        "app-activity.css",
+        include_bytes!("../web/app-activity.css"),
+        "text/css; charset=utf-8",
+    ),
+    ("activity.js", include_bytes!("../web/activity.js"), JS),
     ("login.js", include_bytes!("../web/login.js"), JS),
     (
         "app.css",

@@ -116,6 +116,10 @@ enum HubCommand {
     /// suggested commands; hits grouped by session, newest first. Exit 0
     /// with hits, 1 with none.
     Search(crate::search_cli::SearchArgs),
+    /// What happened while you were away: turns finished, agents blocked
+    /// now, fan-outs graded, commands suggested, cost; then the activity
+    /// timeline (this hub and its machines), newest first.
+    Activity(crate::activity_cli::ActivityArgs),
     /// A session's git work: its branch against its base (commits,
     /// changed files with +/- counts), and staged, unstaged, and untracked
     /// changes apart; --diff PATH prints one file's diff.
@@ -580,6 +584,7 @@ pub fn run_with(
         HubCommand::Serve(args) => serve_cmd(args, out, err, extensions),
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),
         HubCommand::Search(args) => crate::search_cli::run(&args, out, err),
+        HubCommand::Activity(args) => crate::activity_cli::run(&args, out, err),
         HubCommand::Review(args) => crate::review_cli::review(&args, out, err),
         HubCommand::Merge(args) => crate::review_cli::merge(&args, out, err),
         HubCommand::Fanout(args) => crate::fanout_cli::main(&args, out, err),

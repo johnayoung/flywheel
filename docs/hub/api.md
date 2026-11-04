@@ -119,6 +119,16 @@ Fan-out view: `{"id","base_sha","winner","counts","leader","settled","graded_at"
 | GET | `/api/recordings` | `{"limits","total_bytes","recordings"}` newest first, parts in order |
 | GET / DELETE | `/api/recordings/{name}` | the `.cast` (`application/x-asciicast`, attachment) / 204 (409 while active) |
 
+## Activity
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/activity[?since=&until=&ws=&session=&kind=&limit=&cursor=&machines=none]` | `{"rows":[{"id","at","kind","session_id","workspace_id","text","data","machine"?}],"next","partial","machines"}` newest first; `next`: the next page's `cursor` |
+| GET | `/api/activity/digest[?since=&client=&until=&ws=&session=]` | `{"since","until","turns_finished","blocked_now","fanouts_graded","commands_suggested","cost_usd","workspaces","empty","partial"}`; `since=last-seen` needs `client` |
+| POST | `/api/activity/seen` | `{"client"}` -> 204: its `last-seen` is now |
+
+Times: RFC 3339, unix ms, or an age (`30m`, `2h`, `7d`). `kind`: a comma list, `review` covers `review.*`. Kinds beyond the plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`. A peer's request, or `machines=none`, answers for that hub alone.
+
 ## Settings, config, plugins, notify, TLS
 
 | Method | Path | |
@@ -210,8 +220,10 @@ Close codes: **4001** token rotated, **4002** logout / login expired, **4003** p
 | `{"type":"fanout","id"}` | a fan-out changed |
 | `{"type":"settings","rev"}` / `{"type":"config","rev"}` | UI settings / hub.toml re-read |
 | `{"type":"plugins"}` / `{"type":"plugin_toast","plugin","message","tone"}` | plugins changed / a plugin's toast |
+| `{"type":"activity","row"}` | a journal row was written |
+| `{"type":"away","since","until"}` | this client is back after 10 min away (once): its digest span |
 
-`sessions` is paced to one per 250 ms (repeats fold, never dropped). Client sends `view` `{"session_id","visible"?:[ids]}`: the sessions on screen count as viewed (none while hidden).
+`sessions` is paced to one per 250 ms (repeats fold, never dropped). Client sends `view` `{"session_id","visible"?:[ids],"present"?}`: the sessions on screen count as viewed (none while hidden); `present`: someone is at the page (default: it shows one).
 
 ## Plugins
 

@@ -147,3 +147,18 @@ fw hub queue ls api
 - **Exactly once**: `sending` is saved before the paste, `delivered` after; after a crash between, the transcript decides (`delivered`, `reconciled`) or it is pending again. `fw hub upgrade` finishes one under way, starts none until the takeover, and carries typing times and drafts.
 - **Stalls** stop it until resumed (`queue resume`, the drawer, Needs you) or relaunched: the agent exited or came back a shell, the paste was refused, or a delivered prompt started no turn in 120 s (`queue.stalled`). Removing a session drops its queue.
 - **Order**: drag, up/down, `queue move`; pending items can be edited or removed (not one being sent). 50 pending, 64 KiB each. Events: `queue.delivered`, `queue.stalled` ([hub-api: Plugin events](api.md#plugin-events)).
+
+## Activity
+
+What happened, newest first: palette **Activity**, the sidebar's `activity` chip, the header's `activity` pill (phones: its icon).
+
+```bash
+fw hub activity                         # last 24 h: the digest, then the timeline
+fw hub activity --since last-seen       # since this CLI last looked (marks now)
+fw hub activity --since 2h --workspace api --kind review --json
+```
+
+- **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished` (seen or not), `commands.suggested`, `usage` (a turn's tokens, cost), `plugin.ran`. A row opens its object: the transcript at the reply, Commands at the block, Review, the fan-out board, the queue, the replay; else it attaches.
+- **Kept** in `activity.jsonl`: rotated at 1 MiB or a day (`activity.1..4.jsonl`), 30 days; survives restarts and `upgrade`. Only kind, ids, names, short facts (status, branch, counts, cost): never terminal output, prompts, command text, grader output, paths; token-shaped words are `[redacted]`.
+- **While you were away**: a browser (per-device id) back after 10 min or more gets one dismissible card: turns finished, blocked now, fan-outs graded (winner), commands suggested, cost.
+- **Machines**: asked at once (4 s each), merged and machine-labelled; one not answering is named and the answer is `partial`.

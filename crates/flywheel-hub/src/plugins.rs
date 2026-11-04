@@ -39,7 +39,7 @@ use crate::hub::{Hub, HubEvent};
 use crate::util::file_identity;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -762,8 +762,6 @@ pub struct PluginHost {
     base_env: Vec<(OsString, OsString)>,
     scanned: Mutex<Scanned>,
     log_lock: Mutex<()>,
-    /// Each agent session's last status, for `status.changed`.
-    statuses: Mutex<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for PluginHost {
@@ -784,7 +782,6 @@ impl PluginHost {
             base_env: options.base_env,
             scanned: Mutex::new(Scanned::default()),
             log_lock: Mutex::new(()),
-            statuses: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1074,6 +1071,11 @@ impl PluginHost {
                     }
                     host.append_log(&log);
                     if let Some(hub) = hub {
+                        hub.emit(HubEvent::PluginRan {
+                            plugin: log.plugin.clone(),
+                            trigger: log.trigger.clone(),
+                            ok: log.ok,
+                        });
                         hub.emit(HubEvent::Plugins);
                     }
                 });
@@ -1196,6 +1198,11 @@ impl PluginHost {
             }
         }
         self.append_log(&log);
+        hub.emit(HubEvent::PluginRan {
+            plugin: log.plugin.clone(),
+            trigger: log.trigger.clone(),
+            ok: log.ok,
+        });
         hub.emit(HubEvent::Plugins);
         Ok(ActionResult {
             ok: log.ok,
@@ -1207,24 +1214,16 @@ impl PluginHost {
 
     /// Follow the hub's events and run subscriptions (on the current
     /// tokio runtime) until the hub goes away; announces `hub.started`
-    /// first. Re-scans the plugins dir every [`SCAN_POLL`] (pushing
-    /// `plugins` to the UI on a change).
+    /// first (on the bus, so the activity journal hears it too). Re-scans
+    /// the plugins dir every [`SCAN_POLL`] (pushing `plugins` to the UI on
+    /// a change). `status.changed` comes from the hub
+    /// (`Hub::status_changed`), like every other lifecycle event.
     pub fn watch(self: &Arc<Self>, hub: &Arc<Hub>) {
         let mut events = hub.subscribe();
         let weak: Weak<Hub> = Arc::downgrade(hub);
         let host = Arc::clone(self);
-        // Seed the last statuses so the first change is a change.
-        for view in hub.sessions(None) {
-            if let Some(agent) = &view.agent {
-                host.statuses
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(view.record.id.clone(), status_name(agent.status));
-            }
-        }
         let sessions = hub.sessions(None).len();
-        self.dispatch(
-            hub,
+        hub.emit_lifecycle(
             "hub.started",
             json!({"version": env!("CARGO_PKG_VERSION"), "sessions": sessions}),
         );
@@ -1236,22 +1235,8 @@ impl PluginHost {
                     Err(RecvError::Closed) => break,
                 };
                 let Some(hub) = weak.upgrade() else { break };
-                match event {
-                    HubEvent::Lifecycle { event, payload } => {
-                        if event == "session.removed"
-                            && let Some(id) = payload.pointer("/session/id").and_then(Value::as_str)
-                        {
-                            host.statuses
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .remove(id);
-                        }
-                        host.dispatch(&hub, event, payload);
-                    }
-                    HubEvent::Status { session_id } => {
-                        host.status_changed(&hub, &session_id);
-                    }
-                    _ => {}
+                if let HubEvent::Lifecycle { event, payload } = event {
+                    host.dispatch(&hub, event, payload);
                 }
             }
         });
@@ -1271,45 +1256,6 @@ impl PluginHost {
             }
         });
     }
-
-    fn status_changed(self: &Arc<Self>, hub: &Arc<Hub>, session_id: &str) {
-        let Some(session) = hub.event_session(session_id) else {
-            self.statuses
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(session_id);
-            return;
-        };
-        let view = hub.session(session_id).ok().and_then(|v| v.agent);
-        let Some(view) = view else { return };
-        let now = status_name(view.status);
-        let previous = self
-            .statuses
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(session_id.to_owned(), now.clone());
-        if previous.as_deref() == Some(now.as_str()) {
-            return;
-        }
-        self.dispatch(
-            hub,
-            "status.changed",
-            json!({
-                "session": session,
-                "status": now,
-                "previous": previous,
-                "detail": view.detail,
-                "since": view.since,
-            }),
-        );
-    }
-}
-
-fn status_name(status: crate::status::AgentStatus) -> String {
-    serde_json::to_value(status)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default()
 }
 
 fn read_manifest(path: &Path) -> Result<String, String> {

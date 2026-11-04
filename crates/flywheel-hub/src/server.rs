@@ -52,6 +52,7 @@
 //!   seen-tracking; without one, the connection gets its own.
 //! * Rotating the token closes it with code 4001 too, a login ending 4002.
 
+mod activity_api;
 mod admission;
 mod auth;
 mod ca_page;
@@ -318,6 +319,9 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         )
         .route("/api/sessions/{id}/ws", get(session_ws))
         .route("/api/search", get(search_api::search))
+        .route("/api/activity", get(activity_api::list))
+        .route("/api/activity/digest", get(activity_api::digest))
+        .route("/api/activity/seen", post(activity_api::seen))
         .route("/api/sessions/{id}/transcript", get(search_api::transcript))
         .route("/api/login-codes", post(mint_login_code))
         .route("/api/token/rotate", post(rotate_token))

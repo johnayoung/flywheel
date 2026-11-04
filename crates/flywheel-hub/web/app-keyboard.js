@@ -92,6 +92,7 @@ function paletteCommands() {
   }, "gear");
   launcher.paletteItems(cmd);
   search.paletteItems(cmd);
+  activity.paletteItems(cmd);
   commands.paletteItems(cmd);
   flywheel.paletteItems(cmd);
   fanout.paletteItems(cmd);
@@ -488,6 +489,7 @@ const actions = {
   "toggle-review": () => review.togglePill(),
   "toggle-queue": () => promptQueue.togglePill(),
   search: () => search.open(),
+  activity: () => activity.open(),
   settings: () => {
     document.body.classList.remove("side-open");
     settings.open();

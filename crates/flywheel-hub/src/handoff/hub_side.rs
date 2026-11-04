@@ -77,6 +77,9 @@ impl Hub {
             .is_none_or(|server| server.pause(left()));
         self.commands.stop();
         self.commands.save_all();
+        // The journal is the next hub's from here on (gathered usage is
+        // written first).
+        self.activity.pause();
         // Gradings running now are cut short and stay pending: whichever
         // hub carries on runs them again.
         self.grading.pause();
@@ -154,6 +157,7 @@ impl Hub {
         }
         self.grading.resume();
         self.queue.resume();
+        self.activity.resume();
         // Before the sessions run again: no output goes unrecorded.
         self.resume_recordings();
         let live: Vec<Arc<PtySession>> = self.live().values().cloned().collect();
@@ -263,6 +267,7 @@ impl Hub {
         }
         crate::transcript::spawn_watcher(self);
         self.start_queues();
+        self.start_activity();
         self.emit(super::HubEvent::Sessions);
     }
 }

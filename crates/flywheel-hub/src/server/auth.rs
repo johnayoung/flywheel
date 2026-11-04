@@ -657,23 +657,32 @@ pub(super) async fn asset(
     }
 }
 
-/// Whether the request takes gzip (`Accept-Encoding`, not at q=0).
+/// Whether the request takes gzip (`Accept-Encoding`): named, or `*`
+/// when gzip is not named; never at q=0.
 fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
+    // (named gzip, its verdict), (`*`, its verdict)
+    let mut gzip = None;
+    let mut any = None;
+    for coding in headers
         .get_all(header::ACCEPT_ENCODING)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(','))
-        .any(|coding| {
-            let mut parts = coding.split(';').map(str::trim);
-            let name = parts.next().unwrap_or("");
-            let refused = parts.any(|p| {
-                p.strip_prefix("q=")
-                    .and_then(|q| q.trim().parse::<f32>().ok())
-                    .is_some_and(|q| q <= 0.0)
-            });
-            (name.eq_ignore_ascii_case("gzip") || name == "*") && !refused
-        })
+    {
+        let mut parts = coding.split(';').map(str::trim);
+        let name = parts.next().unwrap_or("");
+        let refused = parts.any(|p| {
+            p.strip_prefix("q=")
+                .and_then(|q| q.trim().parse::<f32>().ok())
+                .is_some_and(|q| q <= 0.0)
+        });
+        if name.eq_ignore_ascii_case("gzip") {
+            gzip = Some(!refused);
+        } else if name == "*" {
+            any = Some(!refused);
+        }
+    }
+    gzip.or(any).unwrap_or(false)
 }
 
 /// The app page, gzipped when the browser takes it (it is `no-store`:
@@ -781,6 +790,22 @@ pub(super) async fn rotate_token(State(app): State<AppState>) -> ApiResult<Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_is_taken_unless_refused_by_name() {
+        let takes = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT_ENCODING, value.parse().unwrap());
+            accepts_gzip(&headers)
+        };
+        assert!(takes("gzip, deflate, br"));
+        assert!(takes("*"));
+        assert!(takes("br;q=1, *;q=0.5"));
+        assert!(!takes("gzip;q=0, *"), "refused by name beats *");
+        assert!(!takes("identity"));
+        assert!(!takes("*;q=0"));
+        assert!(!accepts_gzip(&HeaderMap::new()));
+    }
 
     fn client(remote: &str, local: &str, xff: Option<&str>, options: &ServerOptions) -> Client {
         let mut extensions = Extensions::new();

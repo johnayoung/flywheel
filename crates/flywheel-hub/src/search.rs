@@ -393,6 +393,7 @@ impl SearchIndex {
         slot
     }
 
+    #[cfg(test)]
     /// Bytes all transcript indexes hold.
     pub fn transcript_bytes(&self) -> usize {
         self.transcripts
@@ -403,6 +404,7 @@ impl SearchIndex {
             .sum()
     }
 
+    #[cfg(test)]
     /// Transcript indexes held.
     pub fn transcript_count(&self) -> usize {
         self.transcripts

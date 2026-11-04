@@ -171,38 +171,11 @@ pub fn validate_share_name(raw: &str) -> Result<String, ShareError> {
 /// Parse an expiry: `90s`, `30m`, `1h`, `2d`, `1w`, combinations
 /// (`1h30m`), or plain seconds. Must lie within [`MIN_TTL`]..=[`MAX_TTL`].
 pub fn parse_ttl(raw: &str) -> Result<Duration, String> {
-    let text = raw.trim().to_ascii_lowercase();
-    if text.is_empty() {
+    if raw.trim().is_empty() {
         return Err("an expiry is a duration like 30m, 1h, or 2d".into());
     }
-    let mut total: u64 = 0;
-    if let Ok(seconds) = text.parse::<u64>() {
-        total = seconds;
-    } else {
-        let mut digits = String::new();
-        for c in text.chars() {
-            if c.is_ascii_digit() {
-                digits.push(c);
-                continue;
-            }
-            let unit = match c {
-                's' => 1,
-                'm' => 60,
-                'h' => 3600,
-                'd' => 86_400,
-                'w' => 7 * 86_400,
-                _ => return Err(format!("bad expiry {raw:?}: units are s, m, h, d, w")),
-            };
-            let n: u64 = digits
-                .parse()
-                .map_err(|_| format!("bad expiry {raw:?}: a number comes before each unit"))?;
-            digits.clear();
-            total = total.saturating_add(n.saturating_mul(unit));
-        }
-        if !digits.is_empty() {
-            return Err(format!("bad expiry {raw:?}: the last number has no unit"));
-        }
-    }
+    let total =
+        crate::util::parse_duration(raw).map_err(|why| format!("bad expiry {raw:?}: {why}"))?;
     let ttl = Duration::from_secs(total);
     if ttl < MIN_TTL || ttl > MAX_TTL {
         return Err(format!(

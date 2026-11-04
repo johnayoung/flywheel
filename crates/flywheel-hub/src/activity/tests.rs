@@ -251,6 +251,9 @@ fn times_parse_as_rfc3339_unix_ms_and_ages() {
     assert_eq!(parse_time("90s", now).unwrap(), now - Span::seconds(90));
     assert_eq!(parse_time("7d", now).unwrap(), now - Span::days(7));
     assert_eq!(parse_time("1w", now).unwrap(), now - Span::days(7));
+    // The grammar share expiries take: compound, any case.
+    assert_eq!(parse_time("1h30m", now).unwrap(), at(510));
+    assert_eq!(parse_time("2H", now).unwrap(), at(480));
     assert_eq!(parse_time("2026-11-03T08:00:00Z", now).unwrap(), at(0));
     assert_eq!(
         parse_time(&at(5).timestamp_millis().to_string(), now).unwrap(),
@@ -289,6 +292,9 @@ fn scrub_redacts_token_shaped_words_and_caps_length() {
     );
     assert_eq!(scrub("token hunter2"), "token [redacted]");
     assert_eq!(scrub("Q2xhdWRlQ29kZTEyMzQ1Njc4OTBhYmNkZWY"), "[redacted]");
+    // The hub's own token: 64 lowercase hex.
+    let token = "7f7df99d6fe8ccd92e959f45f54dd2996c108fd931141f408e499a364c30ab27";
+    assert_eq!(scrub(&format!("deploy {token}")), "deploy [redacted]");
     // Names, branches, commits, and the hub's ids are not secrets.
     for keep in [
         "merged hub/41 into main",
@@ -304,6 +310,34 @@ fn scrub_redacts_token_shaped_words_and_caps_length() {
     let cut = scrub(&long);
     assert_eq!(cut.chars().count(), TEXT_CAP);
     assert!(cut.ends_with('…'));
+}
+
+#[test]
+fn rows_from_another_hub_are_scrubbed_again() {
+    let token = "7f7df99d6fe8ccd92e959f45f54dd2996c108fd931141f408e499a364c30ab27";
+    let mut data = serde_json::Map::new();
+    data.insert("name".into(), json!(format!("x {token}")));
+    data.insert("nested".into(), json!({"prompt": "everything"}));
+    data.insert("count".into(), json!(3));
+    let row = Row {
+        id: 1,
+        at: at(0),
+        kind: "session.exited".into(),
+        session_id: Some("s1".into()),
+        session: Some(format!("deploy {token}")),
+        session_kind: None,
+        workspace_id: None,
+        workspace: Some("w".repeat(300)),
+        text: format!("exited {token}"),
+        data,
+    }
+    .scrubbed();
+    assert_eq!(row.session.as_deref(), Some("deploy [redacted]"));
+    assert_eq!(row.text, "exited [redacted]");
+    assert_eq!(row.workspace.unwrap().chars().count(), TEXT_CAP);
+    assert_eq!(row.data["name"], json!("x [redacted]"));
+    assert_eq!(row.data["nested"], json!(null));
+    assert_eq!(row.data["count"], json!(3));
 }
 
 #[test]

@@ -304,7 +304,11 @@ impl Activity {
                 let cost = super::digest::round_cents(p.cost_usd);
                 Draft::new(
                     "usage",
-                    format!("used {} tokens, ${cost:.2}", short_count(p.tokens)),
+                    format!(
+                        "used {} tokens, {}",
+                        short_count(p.tokens),
+                        crate::util::dollars(p.cost_usd)
+                    ),
                 )
                 .about(&p.about)
                 .with("cost_usd", cost)
@@ -322,7 +326,11 @@ impl Activity {
         Some(
             Draft::new(
                 "usage",
-                format!("used {} tokens, ${cost:.2}", short_count(p.tokens)),
+                format!(
+                    "used {} tokens, {}",
+                    short_count(p.tokens),
+                    crate::util::dollars(p.cost_usd)
+                ),
             )
             .about(&p.about)
             .with("cost_usd", cost)

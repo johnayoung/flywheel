@@ -10,7 +10,8 @@ use std::io::Write;
 
 #[derive(Debug, clap::Args)]
 pub struct ActivityArgs {
-    /// From when: an age (`30m`, `2h`, `7d`), an RFC 3339 time, or
+    /// From when: an age (`30m`, `1h30m`, `7d`), an RFC 3339 time, unix
+    /// ms, or
     /// `last-seen` (since this CLI last ran with it on this machine; the
     /// last 24 hours the first time), which then marks now as seen.
     #[arg(long, default_value = "24h", value_name = "WHEN")]

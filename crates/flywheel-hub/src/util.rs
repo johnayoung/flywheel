@@ -103,6 +103,58 @@ pub fn human_bytes(bytes: u64) -> String {
 }
 
 /// `"1 file"`, `"3 files"`.
+/// A duration in seconds: plain seconds, or numbers each with a unit
+/// (`s m h d w`, any case), summed (`1h30m`). `Err` says what is wrong;
+/// callers check the range.
+pub fn parse_duration(raw: &str) -> Result<u64, String> {
+    let text = raw.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return Err("empty".into());
+    }
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Ok(seconds);
+    }
+    let mut total: u64 = 0;
+    let mut digits = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        let unit = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            'w' => 7 * 86_400,
+            _ => return Err("units are s, m, h, d, w".into()),
+        };
+        let n: u64 = digits
+            .parse()
+            .map_err(|_| "a number comes before each unit".to_owned())?;
+        digits.clear();
+        total = total.saturating_add(n.saturating_mul(unit));
+    }
+    if !digits.is_empty() {
+        return Err("the last number has no unit".into());
+    }
+    Ok(total)
+}
+
+/// A dollar amount as the web UI writes it (`fmt.js` `dollars`): `$0`,
+/// `$0.0040` (sub-cent spend stays visible), `$0.42`, `$120`.
+pub fn dollars(usd: f64) -> String {
+    if usd <= 0.0 || !usd.is_finite() {
+        "$0".to_owned()
+    } else if usd < 0.01 {
+        format!("${usd:.4}")
+    } else if usd < 100.0 {
+        format!("${usd:.2}")
+    } else {
+        format!("${usd:.0}")
+    }
+}
+
 pub(crate) fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }

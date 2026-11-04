@@ -681,6 +681,7 @@ impl HubStore {
             .unwrap_or_default())
     }
 
+    #[cfg(test)]
     /// Every workspace's templates (workspace id -> templates).
     pub fn all_templates(&self) -> &BTreeMap<String, Vec<LaunchTemplate>> {
         &self.doc.templates

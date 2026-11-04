@@ -121,13 +121,14 @@ window.FwHubActivity = function (ctx) {
 
   function renderSummary(digest) {
     const n = (v) => Number(v || 0);
+    const { dollars } = window.FwHubFmt;
     const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
     const bits = [
       plural(n(digest.turns_finished), "turn", "turns"),
       `${(digest.blocked_now || []).length} blocked now`,
       plural((digest.fanouts_graded || []).length, "fan-out graded", "fan-outs graded"),
       plural(n(digest.commands_suggested), "command", "commands"),
-      `$${n(digest.cost_usd).toFixed(2)}`,
+      dollars(n(digest.cost_usd)),
     ];
     $("#act-sum").replaceChildren(
       el("b", { textContent: ui.since ? "since then" : "last 24 h" }),
@@ -503,7 +504,7 @@ window.FwHubActivity = function (ctx) {
         stat(blocked.length, "blocked now", "bad"),
         stat(fanouts.length, "fan-outs graded"),
         stat(digest.commands_suggested || 0, "commands"),
-        el("div", { className: `away-stat${cost ? "" : " zero"}` }, el("b", { textContent: `$${cost.toFixed(2)}` }), el("span", { textContent: "spent" })),
+        el("div", { className: `away-stat${cost ? "" : " zero"}` }, el("b", { textContent: window.FwHubFmt.dollars(cost) }), el("span", { textContent: "spent" })),
       ),
       lines.length ? el("ul", { className: "away-list" }, lines) : null,
       missed.length ? el("p", { className: "away-note", textContent: `Not included: ${missed.map((m) => m.name).join(", ")} (unreachable).` }) : null,

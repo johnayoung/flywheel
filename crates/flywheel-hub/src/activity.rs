@@ -101,6 +101,32 @@ pub struct Row {
     pub data: Map<String, Value>,
 }
 
+impl Row {
+    /// The row with its free text scrubbed again (see [`scrub`]): what
+    /// another hub sent is held to this hub's rule, whatever its version.
+    #[must_use]
+    pub fn scrubbed(mut self) -> Self {
+        let again = |text: &mut Option<String>| {
+            if let Some(t) = text {
+                *t = scrub(t);
+            }
+        };
+        again(&mut self.session);
+        again(&mut self.session_kind);
+        again(&mut self.workspace);
+        self.text = scrub(&self.text);
+        for value in self.data.values_mut() {
+            match value {
+                Value::String(s) => *s = scrub(s),
+                Value::Number(_) | Value::Bool(_) | Value::Null => {}
+                // Facts are scalars; anything else is not this hub's.
+                other => *other = Value::Null,
+            }
+        }
+        self
+    }
+}
+
 /// A row before the journal numbers and dates it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Draft {
@@ -258,25 +284,18 @@ pub fn parse_time(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String
     Ok(now - age)
 }
 
-/// `90s`, `30m`, `2h`, `7d`, `1w` (at most a year).
+/// An age: `90s`, `30m`, `1h30m`, `7d`, `1w` (any case; at most 366
+/// days). A plain number is not one (it is unix ms to [`parse_time`]).
 pub fn parse_age(raw: &str) -> Result<Span, String> {
-    let bad = || format!("{raw}: want an RFC 3339 time, unix ms, or an age like 30m, 2h, 7d");
-    let unit = raw.chars().last().ok_or_else(bad)?;
-    let n: i64 = raw[..raw.len() - unit.len_utf8()]
-        .parse()
-        .map_err(|_| bad())?;
-    let seconds = match unit {
-        's' => n,
-        'm' => n.checked_mul(60).ok_or_else(bad)?,
-        'h' => n.checked_mul(3600).ok_or_else(bad)?,
-        'd' => n.checked_mul(86_400).ok_or_else(bad)?,
-        'w' => n.checked_mul(7 * 86_400).ok_or_else(bad)?,
-        _ => return Err(bad()),
-    };
-    if !(0..=366 * 86_400).contains(&seconds) {
+    let bad = || format!("{raw}: want an RFC 3339 time, unix ms, or an age like 30m, 1h30m, 7d");
+    if raw.trim().bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad());
     }
-    Ok(Span::seconds(seconds))
+    let seconds = crate::util::parse_duration(raw).map_err(|_| bad())?;
+    if seconds > 366 * 86_400 {
+        return Err(bad());
+    }
+    Ok(Span::seconds(i64::try_from(seconds).map_err(|_| bad())?))
 }
 
 /// The paging cursor across this hub and its machines: where each source
@@ -393,8 +412,11 @@ fn secret_like(word: &str) -> bool {
     if core.len() >= 16 && PREFIXES.iter().any(|p| core.starts_with(p)) {
         return true;
     }
-    // Lowercase hex (git commits, the hub's own ids) is not a credential
-    // the timeline could leak: it names things.
+    // Long unbroken hex is a key or a digest (the hub's own token is 64
+    // hex); shorter (a git commit's 40, the hub's ids) names things.
+    if core.len() > 40 && core.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
     if core.len() < 24
         || core
             .chars()

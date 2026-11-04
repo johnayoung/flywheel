@@ -282,7 +282,7 @@ fn machine_rows(answer: &Value, name: &str, limit: usize) -> Vec<Value> {
         .filter_map(|r| serde_json::from_value::<Row>(r.clone()).ok())
         .take(limit)
         .map(|r| {
-            let mut r = json!(r);
+            let mut r = json!(r.scrubbed());
             r["machine"] = Value::String(name.to_owned());
             r
         })

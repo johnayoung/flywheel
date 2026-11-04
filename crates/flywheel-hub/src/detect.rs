@@ -452,6 +452,7 @@ impl Manifest {
         }
     }
 
+    #[cfg(test)]
     /// The rule ids, in evaluation order.
     pub fn rule_ids(&self) -> impl Iterator<Item = &str> {
         self.rules.iter().map(|r| r.id.as_str())

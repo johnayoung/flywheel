@@ -696,6 +696,15 @@ async fn codex_trust_and_symlinks_keep_the_typed_gate() {
     let preview = hub.post("/api/perms/preview", trust.clone()).await;
     assert_eq!(preview["type_to_confirm"], "trusted", "{preview}");
     let warning = preview["warning"].as_str().unwrap();
+    // The warning counts them; the notes list each once.
+    assert!(warning.contains("turns on 5 .codex/ settings"), "{warning}");
+    let listed: Vec<&str> = preview["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let listed = listed.join("\n");
     for planted in [
         "approval_policy = never",
         "danger-full-access",
@@ -703,12 +712,41 @@ async fn codex_trust_and_symlinks_keep_the_typed_gate() {
         "tools/gen/.codex/config.toml: [profiles.p] (selected) sandbox_mode = danger-full-access",
         "mcp_servers.x runs `./x`",
     ] {
-        assert!(warning.contains(planted), "{planted}: {warning}");
+        assert!(listed.contains(planted), "{planted}: {listed}");
+        assert!(!warning.contains(planted), "listed once: {warning}");
     }
-    let notes = preview["notes"].to_string();
     assert!(
-        notes.contains("loads ") && notes.contains("tools/gen/.codex"),
-        "{notes}"
+        listed.contains("loads ") && listed.contains("tools/gen/.codex"),
+        "{listed}"
+    );
+    // A .codex/ that gains an entry after the preview (an agent in the
+    // repo can write one) is not trusted unseen: the base covers it.
+    let mut stale = hub.based(trust.clone()).await;
+    stale["confirm"] = json!(true);
+    stale["typed"] = json!("trusted");
+    std::fs::write(
+        repo.join("tools/gen/.codex/config.toml"),
+        "profile = \"p\"\n[profiles.p]\nsandbox_mode = \"danger-full-access\"\n[mcp_servers.x]\ncommand = \"./x\"\n[mcp_servers.z]\ncommand = \"/tmp/added-after-preview\"\n",
+    )
+    .unwrap();
+    let (status, err) = hub
+        .call(reqwest::Method::POST, "/api/perms/allow", Some(stale))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    assert!(
+        err.to_string()
+            .contains(".codex/ under the project changed"),
+        "{err}"
+    );
+    let user_config =
+        std::fs::read_to_string(hub.dir.path().join("codex-home/config.toml")).unwrap_or_default();
+    assert!(!user_config.contains("trust_level"), "{user_config}");
+    let again = hub.post("/api/perms/preview", trust.clone()).await;
+    assert!(
+        again["notes"]
+            .to_string()
+            .contains("/tmp/added-after-preview"),
+        "{again}"
     );
     let mut body = hub.based(trust.clone()).await;
     body["confirm"] = json!(true);

@@ -210,7 +210,8 @@ struct PickArgs {
     #[arg(long)]
     rebase: bool,
     /// Land files the candidate adds that look like secrets, an agent's
-    /// personal settings, or build output (refused otherwise).
+    /// personal settings, build output, or OS or log files (refused
+    /// otherwise).
     #[arg(long)]
     include_suspects: bool,
     /// Print JSON instead of text.

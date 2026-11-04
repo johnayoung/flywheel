@@ -295,6 +295,33 @@ fn print_view(out: &mut dyn Write, view: &Value) {
         };
         let _ = writeln!(out, "  {key:<16} {shown}");
     }
+    let trusted = codex.get("trust_level").and_then(Value::as_str) == Some("trusted");
+    for layer in list(&codex["layers"]) {
+        let scope = str_field(layer, "scope");
+        let profile = layer.get("profile").and_then(Value::as_str);
+        let in_force = list(&layer["in_force"]);
+        if in_force.is_empty() && (profile.is_none() || scope == "profile") {
+            continue;
+        }
+        let unloaded = scope == "project" && !trusted;
+        let _ = writeln!(
+            out,
+            "  config ({scope}) {}{}{}",
+            str_field(layer, "path"),
+            profile
+                .filter(|_| scope != "profile")
+                .map(|p| format!("  profile = {p}"))
+                .unwrap_or_default(),
+            if unloaded {
+                "  (not loaded: project not trusted)"
+            } else {
+                ""
+            }
+        );
+        for line in in_force {
+            let _ = writeln!(out, "      {}", line.as_str().unwrap_or(""));
+        }
+    }
     for file in list(&codex["rules"]) {
         let _ = writeln!(
             out,

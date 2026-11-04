@@ -553,6 +553,7 @@ pub fn plan_commit(
         let looks = match first.kind {
             "secret" => "like a secret",
             "personal" => "like an agent's personal settings",
+            "junk" => "like an OS or log file",
             "generated" => "generated",
             "build" => "like build output",
             _ => "large (5 MiB or more)",

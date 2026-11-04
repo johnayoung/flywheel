@@ -418,6 +418,8 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   .banner-actions { width: 100%; }
   .empty h1 { font-size: clamp(2.6rem, 13vw, 4rem); }
   .empty .keys { display: none; }
+  /* The start screen's actions are 44px targets too. */
+  .empty-actions button, .empty .first-run button { min-height: 44px; }
   .empty:has(.empty-attention:not([hidden])) { align-content: start; padding-top: .6rem; overflow-y: auto; }
   .empty-attention { display: block; position: relative; z-index: 1; width: 100%; margin: 0; }
   .empty-attention .attn-list { max-height: none; }

@@ -58,10 +58,10 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 | Rebase onto base | `git rebase <base>` in the worktree | uncommitted changes (conflicts stop; Abort) |
 | Merge into base | `git -C <main checkout> merge --ff-only <planned commit>` | main checkout dirty or off base, not a fast-forward |
 
-- **Commit all** checks every changed path, not just the 1000 listed. Ticked: `generated` (`node_modules/`, `__pycache__/`, `.venv/`, `*.egg-info/`, `.pyc`, a dir with `CACHEDIR.TAG` or `pyvenv.cfg`, `target/` by `Cargo.toml`); `secret` (`.env*`, keys by name or content, credentials files, `*.tfvars`), `personal` (`.claude/settings.local.json`, `CLAUDE.local.md`).
+- **Commit all** checks every changed path, not just the 1000 shown. Ticked: `generated` (`node_modules/`, `__pycache__/`, `.venv/`, `*.egg-info/`, `.pyc`, a dir with `CACHEDIR.TAG` or `pyvenv.cfg`, `target/` by `Cargo.toml`); `secret` (`.env*`, keys by name or content, credentials, `*.tfvars`), `personal` (`.claude/settings.local.json`, `CLAUDE.local.md`), `junk` (`.DS_Store`, `*.log`).
 - Unticked: `build` (`dist/`, `build/`, `coverage/`, `venv/`, other Cargo-shaped `target/`), `large` (5 MiB+).
 - No git identity: refused before staging; a failed step puts the index back.
-- **Merge** and fan-out **pick** refuse a branch that adds a `generated`/`secret`/`personal` file unless `--include-suspects` (the dialog's box).
+- **Merge** and fan-out **pick** refuse a branch that adds a `generated`/`secret`/`personal`/`junk` file unless `--include-suspects` (the dialog's box).
 - "Ask the agent" pastes a commit-message or conflict prompt. Runner: argv, no shell or prompts, deadlines, 4 git/gh at once, one action per repo, logged.
 
 ## Handoff and peer review

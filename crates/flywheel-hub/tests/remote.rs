@@ -694,7 +694,7 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
     let (code, _, err) = tokio::task::spawn_blocking(move || cli(&["url", "--state-dir", &state]))
         .await
         .unwrap();
-    assert_eq!(code, 1);
+    assert_eq!(code, 3, "no hub: the not-running exit");
     assert!(err.contains("no hub is running"), "{err}");
 
     // The hub holds the serve lock; `fw hub serve` records this. Do it for
@@ -797,7 +797,7 @@ async fn url_and_rotate_verbs_drive_the_running_hub() {
             .await
             .unwrap()
     };
-    assert_eq!(code, 1);
+    assert_eq!(code, 3, "no hub: the not-running exit");
     assert!(err.contains("no hub is running"), "{err}");
     assert!(!dead.join("server.json").exists(), "stale file removed");
     RuntimeInfo {

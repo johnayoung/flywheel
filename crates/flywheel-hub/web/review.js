@@ -356,7 +356,7 @@ window.FwHubReview = function (ctx) {
         section(
           "Untracked",
           data.untracked.length,
-          data.untracked.map((u) => fileCard("untracked", { path: u.path, status: "untracked", insertions: null, deletions: null, binary: false })),
+          data.untracked.map((u) => fileCard("untracked", { path: u.path, status: "untracked", insertions: null, deletions: null, binary: false, suspect: u.suspect })),
         ),
       );
     }
@@ -1053,7 +1053,7 @@ window.FwHubReview = function (ctx) {
   // Commit all: files that look like build output or secrets (left out
   // unless unchecked) or may be build output (dist/, build/) or are large
   // (kept unless checked), one box each.
-  const SUSPECT = { generated: "build output", build: "maybe build output", secret: "secret", personal: "personal agent settings", large: "5 MiB or more" };
+  const SUSPECT = { generated: "build output", build: "maybe build output", secret: "secret", personal: "personal agent settings", junk: "OS or log file", large: "5 MiB or more" };
   function suspectList(plan) {
     const suspects = plan.suspects || [];
     if (act.action === "merge") return landSuspects(suspects);

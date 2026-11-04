@@ -32,9 +32,9 @@ pub struct FileChange {
     pub insertions: Option<u32>,
     pub deletions: Option<u32>,
     pub binary: bool,
-    /// Committed files only: what commit all would flag it as (`secret`,
-    /// `personal`, `generated`, `build`, `large`; see
-    /// `review::suspects`), for a file the branch adds.
+    /// What commit all would flag it as (`secret`, `personal`, `junk`,
+    /// `generated`, `build`, `large`; see `review::suspects`), for a file
+    /// the change adds (committed, staged, or unstaged).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suspect: Option<&'static str>,
 }
@@ -79,6 +79,9 @@ pub struct Remote {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Untracked {
     pub path: String,
+    /// What commit all would flag it as (see [`FileChange::suspect`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suspect: Option<&'static str>,
 }
 
 /// A work tree's review.
@@ -239,14 +242,17 @@ fn mark_suspects(dir: &Path, set: &mut FileSet) {
         if !matches!(file.status.as_str(), "added" | "renamed" | "copied") {
             continue;
         }
-        // A file, or a directory entry (`dist/`) standing for its files.
-        file.suspect = found
-            .iter()
-            .find(|s| {
-                s.path == file.path || (s.path.ends_with('/') && file.path.starts_with(&s.path))
-            })
-            .map(|s| s.kind);
+        file.suspect = suspect_of(&found, &file.path);
     }
+}
+
+/// `path`'s suspect kind: its own entry, or a directory entry (`dist/`)
+/// standing for its files.
+fn suspect_of(found: &[super::suspects::Suspect], path: &str) -> Option<&'static str> {
+    found
+        .iter()
+        .find(|s| s.path == path || (s.path.ends_with('/') && path.starts_with(&s.path)))
+        .map(|s| s.kind)
 }
 
 const DIFF_FLAGS: &[&str] = &["--no-color", "--no-ext-diff", "--no-textconv", "-M"];
@@ -420,12 +426,22 @@ pub fn read(tools: &Tools, target: &Target) -> Result<Review, String> {
     let work_tree = work_tree?;
     review.staged = work_tree.staged;
     review.unstaged = work_tree.unstaged;
+    // What commit all would take is marked as it would mark it.
+    mark_suspects(&target.dir, &mut review.staged);
+    mark_suspects(&target.dir, &mut review.unstaged);
     let mut untracked = work_tree.untracked;
     review.untracked_truncated = untracked.len() > MAX_FILES;
     untracked.truncate(MAX_FILES);
+    let found = {
+        let paths: Vec<&str> = untracked.iter().map(String::as_str).collect();
+        super::suspects::suspects(&target.dir, &paths, None)
+    };
     review.untracked = untracked
         .into_iter()
-        .map(|path| Untracked { path })
+        .map(|path| Untracked {
+            suspect: suspect_of(&found, &path),
+            path,
+        })
         .collect();
     review.conflicts = work_tree.conflicts;
     // An unmerged path shows in both sets; it is listed once, as a

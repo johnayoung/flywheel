@@ -59,7 +59,8 @@ pub struct MergeArgs {
     #[arg(long, conflicts_with_all = ["rebase", "remove_worktree"])]
     abort_rebase: bool,
     /// Land files the branch adds that look like secrets, an agent's
-    /// personal settings, or build output (refused otherwise).
+    /// personal settings, build output, or OS or log files (refused
+    /// otherwise).
     #[arg(long)]
     include_suspects: bool,
     /// Print the plan / outcome as JSON.
@@ -184,6 +185,7 @@ fn suspect_label(kind: &str) -> &str {
         "generated" => "build output",
         "build" => "maybe build output",
         "personal" => "personal agent settings",
+        "junk" => "OS or log file",
         "large" => "5 MiB or more",
         other => other,
     }
@@ -302,7 +304,11 @@ fn render_review(r: &Value, out: &mut dyn Write) -> std::io::Result<()> {
         gap(out)?;
         writeln!(out, "untracked ({}):", untracked.len())?;
         for u in untracked {
-            writeln!(out, "  ? {}", str_field(u, "path"))?;
+            let flag = match u.get("suspect").and_then(Value::as_str) {
+                Some(kind) => format!("  [{}]", suspect_label(kind)),
+                None => String::new(),
+            };
+            writeln!(out, "  ? {}{flag}", str_field(u, "path"))?;
         }
     }
     let conflicts = list(r, "conflicts");

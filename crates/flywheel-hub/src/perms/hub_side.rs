@@ -592,11 +592,14 @@ impl Hub {
             codex::Activation::default()
         };
         let activates = &activation.dangers;
+        // The settings themselves are the notes ("turns on ..."); the
+        // warning only counts them.
         let danger: Option<String> = setting.danger(value).map(str::to_owned).or_else(|| {
             (!activates.is_empty()).then(|| {
+                let n = activates.len();
                 format!(
-                    "trusting it turns on its .codex/ settings: {}",
-                    activates.join("; ")
+                    "trusting it turns on {n} .codex/ setting{} that run a program, send data, or drop a safeguard, each listed as \"turns on\"",
+                    if n == 1 { "" } else { "s" }
                 )
             })
         });
@@ -615,7 +618,14 @@ impl Hub {
             agent: "codex",
             file: if setting == codex::Setting::TrustLevel { "user" } else { "project" }.to_owned(),
             diff: edit::unified_diff(&path.display().to_string(), old.as_deref().unwrap_or(""), &new_text),
-            base: claude::digest(old.as_deref()),
+            // Trust's base also covers what it activates: a .codex/ that
+            // changes after the preview (an agent in the repo can write
+            // one) fails the write instead of being trusted unseen.
+            base: if activation == codex::Activation::default() {
+                claude::digest(old.as_deref())
+            } else {
+                format!("{}-{}", claude::digest(old.as_deref()), activation.digest())
+            },
             exists: old.is_some(),
             tracked,
             ignored,
@@ -679,6 +689,23 @@ impl Hub {
         let guard = self.perms().write_lock();
         let (plan, folder, record) = self.perms_plan(body)?;
         let mut preview = plan.preview;
+        // Checked first: a changed file (or, for trust, a changed .codex/)
+        // can change what needs typing.
+        if base != preview.base {
+            return Err(conflict(
+                if plan.tools.first().map(String::as_str) == Some("trust_level") {
+                    format!(
+                        "{} or a .codex/ under the project changed since the preview: preview it again",
+                        preview.path.display()
+                    )
+                } else {
+                    format!(
+                        "{} changed since the preview: preview it again",
+                        preview.path.display()
+                    )
+                },
+            ));
+        }
         if let Some(expected) = &preview.type_to_confirm
             && body.typed.as_deref().map(str::trim) != Some(expected.as_str())
         {
@@ -696,12 +723,6 @@ impl Hub {
             return Err(invalid(
                 "gitignore: the file is already ignored, tracked, or not the local one",
             ));
-        }
-        if base != preview.base {
-            return Err(conflict(format!(
-                "{} changed since the preview: preview it again",
-                preview.path.display()
-            )));
         }
         if !preview.added.is_empty() {
             claude::write_atomic(&preview.path, &plan.new_text).map_err(HubError::Internal)?;

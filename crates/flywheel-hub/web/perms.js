@@ -157,13 +157,22 @@ window.FwHubPerms = function (ctx) {
       setting("sandbox_mode", "sandbox", pair(codex.sandbox_mode), ["read-only", "workspace-write", "danger-full-access"]),
       (codex.layers || []).map((layer) => {
         const unloaded = layer.scope === "project" && !trusted;
-        const values = [layer.approval_policy && `approval_policy = ${layer.approval_policy}`, layer.sandbox_mode && `sandbox_mode = ${layer.sandbox_mode}`].filter(Boolean);
+        const isProfile = layer.scope === "profile";
+        const values = [
+          layer.profile && !isProfile && `profile = ${layer.profile}`,
+          layer.approval_policy && `approval_policy = ${layer.approval_policy}`,
+          layer.sandbox_mode && `sandbox_mode = ${layer.sandbox_mode}`,
+        ].filter(Boolean);
+        const label = isProfile ? `profile ${layer.profile}` : layer.scope;
         return el(
           "div",
           { className: `pm-codex-layer${unloaded ? " unloaded" : ""}${layer.exists ? "" : " absent"}` },
-          el("span", { className: "pm-scope", textContent: layer.scope }),
+          el("span", { className: "pm-scope", textContent: label }),
           pathText(layer.path ? `${layer.path}` : "the session's flags", "pm-path"),
           el("span", { className: "pm-state", textContent: [layer.error ? `error: ${layer.error}` : !layer.exists ? "none" : values.join(" · ") || "no approval or sandbox keys", unloaded ? "not loaded: project not trusted" : ""].filter(Boolean).join(" · ") }),
+          (layer.in_force || []).length
+            ? el("ul", { className: "pm-in-force" }, layer.in_force.map((line) => el("li", { textContent: line })))
+            : null,
         );
       }),
       (codex.rules || []).map((file) =>
@@ -409,6 +418,7 @@ window.FwHubPerms = function (ctx) {
         gitignoreLabel.hidden = !p.can_gitignore;
         const wasHidden = typedWrap.hidden;
         typedWrap.hidden = !p.type_to_confirm;
+        typed.placeholder = p.type_to_confirm || "";
         if (!p.type_to_confirm) typed.value = "";
         else if (wasHidden) typedWrap.scrollIntoView({ block: "nearest" });
         fill(out, 
@@ -478,7 +488,8 @@ window.FwHubPerms = function (ctx) {
   function openSetting(where, setting, value) {
     const out = el("div", { className: "pm-preview" });
     const typed = el("input", { className: "pm-typed", spellcheck: false, autocomplete: "off", "aria-label": "Type the value to confirm", oninput: () => gate() });
-    const typedWrap = el("label", { className: "field", hidden: true }, el("span", { className: "field-label", textContent: "Dangerous: type the value to confirm" }), typed);
+    const typedLabel = el("span", { className: "field-label", textContent: "Dangerous: type the value to confirm" });
+    const typedWrap = el("label", { className: "field", hidden: true }, typedLabel, typed);
     const error = el("p", { className: "form-error", role: "alert" });
     const ok = el("button", { type: "button", className: "slab", disabled: true, textContent: "Write it", onclick: () => write() });
     let preview = null;
@@ -508,6 +519,10 @@ window.FwHubPerms = function (ctx) {
       .then((p) => {
         preview = p;
         typedWrap.hidden = !p.type_to_confirm;
+        if (p.type_to_confirm) {
+          typed.placeholder = p.type_to_confirm;
+          typedLabel.textContent = `Dangerous: type "${p.type_to_confirm}" to confirm`;
+        }
         fill(out, 
           el("p", { className: "pm-sentence", textContent: p.sentence }),
           el("p", { className: "pm-file" }, "Edits ", el("code", { textContent: p.path })),

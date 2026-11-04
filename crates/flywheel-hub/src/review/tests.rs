@@ -161,7 +161,8 @@ fn a_review_lists_commits_files_and_the_working_tree_apart() {
     assert_eq!(
         r.untracked,
         [Untracked {
-            path: "notes/todo.md".into()
+            path: "notes/todo.md".into(),
+            suspect: None,
         }]
     );
     assert!(r.conflicts.is_empty());
@@ -1479,6 +1480,10 @@ fn merge_refuses_suspect_files_unless_landed_on_purpose() {
     assert!(!why.contains("src/a.rs"), "{why}");
     // Named as the review sheet and the fan-out pick both label it.
     assert!(why.contains("\"Land them anyway\""), "{why}");
+    // A removal commit on top still lands the adding one: the advice is to
+    // rewrite the branch, not to commit a removal.
+    assert!(why.contains("git rebase -i"), "{why}");
+    assert!(!why.contains("(git rm --cached, commit)"), "{why}");
     let refused = merge(&tools(), &t, false, &plan.fingerprint);
     assert!(refused.is_err());
     let plan = plan_merge(&tools(), &t, true).unwrap();
@@ -1531,6 +1536,8 @@ fn committed_files_carry_commit_alls_suspect_marks() {
         (".env", "TOKEN=x\n"),
         (".claude/settings.local.json", "{}\n"),
         ("node_modules/x/index.js", "1\n"),
+        (".DS_Store", "x\n"),
+        ("debug.log", "x\n"),
     ] {
         write(wt, file, text);
         run_git(wt, &["add", "-f", "--", file]);
@@ -1553,9 +1560,29 @@ fn committed_files_carry_commit_alls_suspect_marks() {
     assert_eq!(marks[".env"], Some("secret"));
     assert_eq!(marks[".claude/settings.local.json"], Some("personal"));
     assert_eq!(marks["node_modules/x/index.js"], Some("generated"));
-    // The work tree's sets are not marked (commit all lists those itself).
+    // A machine's leftovers: their own kind, not build output.
+    assert_eq!(marks[".DS_Store"], Some("junk"));
+    assert_eq!(marks["debug.log"], Some("junk"));
+    // What commit all would take is marked too: staged, untracked.
     write(wt, "id_rsa", "x\n");
     run_git(wt, &["add", "-f", "id_rsa"]);
+    // The user's global excludes must not hide it.
+    run_git(wt, &["config", "core.excludesFile", "/dev/null"]);
+    write(wt, ".env.local", "TOKEN=y\n");
+    write(wt, "notes.txt", "plain\n");
     let r = read(&tools(), &f.target()).unwrap();
-    assert!(r.staged.files.iter().all(|f| f.suspect.is_none()));
+    let staged: HashMap<&str, Option<&str>> = r
+        .staged
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.suspect))
+        .collect();
+    assert_eq!(staged["id_rsa"], Some("secret"));
+    let untracked: HashMap<&str, Option<&str>> = r
+        .untracked
+        .iter()
+        .map(|u| (u.path.as_str(), u.suspect))
+        .collect();
+    assert_eq!(untracked[".env.local"], Some("secret"));
+    assert_eq!(untracked["notes.txt"], None);
 }

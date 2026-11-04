@@ -524,10 +524,14 @@ fn local_token(state_dir: &Path) -> Result<String, String> {
         .ok_or_else(|| "the running hub's token file is missing".to_owned())
 }
 
-/// The exit code of every lifecycle verb that needs the running hub and
-/// finds none (`status`, `stop`, `upgrade`, `start|serve --handoff`): the
-/// LSB "not running".
+/// The exit code of every verb that needs the running hub and finds none:
+/// the LSB "not running". The lifecycle verbs return it themselves; for a
+/// client verb that fails with [`no_hub_message`], `fw hub`'s dispatch
+/// turns its exit 1 into this one.
 pub const EXIT_NOT_RUNNING: i32 = 3;
+
+/// How [`no_hub_message`] starts: what the dispatch looks for.
+pub const NO_HUB_PREFIX: &str = "no hub is running for state dir ";
 
 /// Say on `to` that no hub runs for `state_dir` (the one wording every verb
 /// uses) and return [`EXIT_NOT_RUNNING`].
@@ -546,7 +550,7 @@ pub fn no_hub_message(state_dir: &Path) -> String {
         format!(" --state-dir {}", crate::util::shell_path(state_dir))
     };
     format!(
-        "no hub is running for state dir {} (start one with `fw hub start{flag}`)",
+        "{NO_HUB_PREFIX}{} (start one with `fw hub start{flag}`)",
         state_dir.display()
     )
 }

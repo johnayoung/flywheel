@@ -602,7 +602,57 @@ pub fn run_with(
     })
 }
 
+/// Passes stderr through, noting whether a verb said no hub is running
+/// (only the start of the stream is kept to look in).
+struct NoHubWatch<'a> {
+    inner: &'a mut dyn Write,
+    seen: Vec<u8>,
+}
+
+impl NoHubWatch<'_> {
+    const KEEP: usize = 64 * 1024;
+
+    fn said_no_hub(&self) -> bool {
+        let needle = crate::endpoint::NO_HUB_PREFIX.as_bytes();
+        self.seen.windows(needle.len()).any(|w| w == needle)
+    }
+}
+
+impl Write for NoHubWatch<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        let room = Self::KEEP.saturating_sub(self.seen.len());
+        self.seen.extend_from_slice(&buf[..n.min(room)]);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Run a verb; a failure (exit 1) that said no hub is running exits
+/// [`crate::endpoint::EXIT_NOT_RUNNING`] instead, whichever verb it was,
+/// so a script can tell "no hub" from a real failure.
 fn dispatch(
+    command: HubCommand,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    extensions: &HubExtensions,
+) -> i32 {
+    let mut watch = NoHubWatch {
+        inner: err,
+        seen: Vec::new(),
+    };
+    let code = dispatch_verb(command, out, &mut watch, extensions);
+    if code == 1 && watch.said_no_hub() {
+        crate::endpoint::EXIT_NOT_RUNNING
+    } else {
+        code
+    }
+}
+
+fn dispatch_verb(
     command: HubCommand,
     out: &mut dyn Write,
     err: &mut dyn Write,
@@ -786,6 +836,49 @@ mod tests {
             "arguments with no help:\n{}",
             blank.join("\n")
         );
+    }
+
+    /// Every verb that needs the running hub and finds none exits 3 with
+    /// the one wording, client verbs included; a verb failing otherwise
+    /// keeps exit 1.
+    #[test]
+    fn no_hub_is_exit_three_for_every_verb_that_needs_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().to_str().unwrap();
+        for verb in [
+            &["status"][..],
+            &["stop"],
+            &["upgrade"],
+            &["url"],
+            &["ls"],
+            &["open"],
+            &["read", "x"],
+            &["send", "x", "hi"],
+            &["kill", "x"],
+            &["activity"],
+        ] {
+            let mut args = verb.to_vec();
+            args.extend(["--state-dir", state]);
+            let (code, out, err) = run_args(&args);
+            let said = format!("{out}{err}");
+            assert_eq!(code, crate::endpoint::EXIT_NOT_RUNNING, "{verb:?}: {said}");
+            assert!(
+                said.contains(crate::endpoint::NO_HUB_PREFIX),
+                "{verb:?}: {said}"
+            );
+        }
+        // Offline verbs succeed and say so; failures that are not "no
+        // hub" keep exit 1.
+        let (code, out, _) = run_args(&["config", "show", "--state-dir", state]);
+        assert_eq!(code, 0);
+        assert!(out.contains(crate::endpoint::NO_HUB_PREFIX), "{out}");
+        let mut sink = Vec::new();
+        let mut watch = NoHubWatch {
+            inner: &mut sink,
+            seen: Vec::new(),
+        };
+        let _ = writeln!(watch, "fw hub: something else failed");
+        assert!(!watch.said_no_hub());
     }
 
     fn run_args(args: &[&str]) -> (i32, String, String) {

@@ -107,7 +107,18 @@
   visibility: hidden;
   transition: opacity .15s, visibility 0s .15s;
 }
-.workspace:hover .ws-tools, .workspace:focus-within .ws-tools { opacity: 1; visibility: visible; transition: opacity .15s; }
+/* Shown, they take their room in the row (the name gives it up), so the
+   status pill and count beside it are never drawn over or clipped. */
+.workspace:hover .ws-tools, .workspace:focus-within .ws-tools {
+  position: static;
+  transform: none;
+  flex: none;
+  padding-left: .2rem;
+  background: none;
+  opacity: 1;
+  visibility: visible;
+  transition: opacity .15s;
+}
 
 /* Touch screens have no hover: the tools sit on their own line under an
    open workspace's name (which wraps rather than shrink to nothing), and

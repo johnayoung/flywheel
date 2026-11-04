@@ -185,13 +185,21 @@ impl Folder {
             },
             home: env.home.clone(),
             secrets: [
-                Some(&env.claude_dir),
-                Some(&env.codex_home),
-                env.state_dir.as_ref(),
+                Some((
+                    &env.claude_dir,
+                    "Claude Code's config: its credentials and settings",
+                )),
+                Some((
+                    &env.codex_home,
+                    "Codex's config: its credentials and settings",
+                )),
+                env.state_dir
+                    .as_ref()
+                    .map(|d| (d, "the hub's state dir: its login token")),
             ]
             .into_iter()
             .flatten()
-            .cloned()
+            .map(|(d, what)| (d.clone(), what))
             .collect(),
         }
     }

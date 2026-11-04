@@ -13,9 +13,10 @@ pub struct Suspect {
     pub path: String,
     /// `generated` (build or tool output), `build` (a directory that may
     /// be build output: `dist/`, `build/`, ...), `secret` (keys, `.env`,
-    /// credentials), `personal` (an agent's per-user settings), or `large`
-    /// (over [`LARGE_FILE_BYTES`]). `generated`, `secret`, and `personal`
-    /// are left out by default.
+    /// credentials), `personal` (an agent's per-user settings), `junk` (OS
+    /// folder metadata, logs), or `large` (over [`LARGE_FILE_BYTES`]).
+    /// `generated`, `secret`, `personal`, and `junk` are left out by
+    /// default.
     pub kind: &'static str,
     /// Left out of the commit.
     pub excluded: bool,
@@ -148,10 +149,27 @@ impl<'a> Classifier<'a> {
 fn looks_generated(path: &str) -> bool {
     const EXTENSIONS: &[&str] = &["pyc", "pyo", "o", "obj", "class"];
     let name = path.rsplit('/').next().unwrap_or(path);
-    name == ".DS_Store"
+    name.rsplit_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && EXTENSIONS.contains(&ext))
+}
+
+/// Whether a file is an operating system's folder metadata or a log: a
+/// machine's leftovers, not the change (`.DS_Store`, `Thumbs.db`,
+/// `debug.log`, `npm-debug.log.1`).
+fn looks_junk(path: &str) -> bool {
+    const OS: &[&str] = &[
+        ".DS_Store",
+        "Thumbs.db",
+        "ehthumbs.db",
+        "desktop.ini",
+        ".directory",
+    ];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let log = name.ends_with(".log")
         || name
-            .rsplit_once('.')
-            .is_some_and(|(stem, ext)| !stem.is_empty() && EXTENSIONS.contains(&ext))
+            .rsplit_once(".log.")
+            .is_some_and(|(stem, n)| !stem.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    OS.contains(&name) || name.starts_with("._") || (log && name.len() > ".log".len())
 }
 
 /// Whether a file looks like a secret by its name: a dotenv file (not a
@@ -279,6 +297,7 @@ pub(super) fn suspects(dir: &Path, paths: &[&str], exclude: Option<&[String]>) -
             Some((under, Generated::Surely)) => (under, "generated"),
             _ if secret => ((*path).to_owned(), "secret"),
             _ if meta.is_some() && looks_personal(path) => ((*path).to_owned(), "personal"),
+            _ if meta.is_some() && looks_junk(path) => ((*path).to_owned(), "junk"),
             _ if meta.is_some() && looks_generated(path) => ((*path).to_owned(), "generated"),
             Some((under, Generated::Maybe)) => (under, "build"),
             None => match &meta {
@@ -304,7 +323,7 @@ pub(super) fn suspects(dir: &Path, paths: &[&str], exclude: Option<&[String]>) -
     for s in &mut found {
         s.excluded = match exclude {
             Some(list) => list.contains(&s.path),
-            None => matches!(s.kind, "generated" | "secret" | "personal"),
+            None => matches!(s.kind, "generated" | "secret" | "personal" | "junk"),
         };
     }
     found
@@ -357,8 +376,29 @@ mod tests {
                 "{path}"
             );
         }
-        for path in ["Main.class", "src/lib.o", ".DS_Store"] {
+        for path in ["Main.class", "src/lib.o"] {
             assert!(looks_generated(path), "{path}");
+        }
+        // A machine's leftovers are their own kind, not build output.
+        for path in [
+            ".DS_Store",
+            "web/Thumbs.db",
+            "debug.log",
+            "logs/npm-debug.log.1",
+            "._a.rs",
+        ] {
+            assert!(looks_junk(path), "{path}");
+            assert!(!looks_generated(path), "{path}");
+        }
+        for path in [
+            ".log",
+            "src/log.rs",
+            "catalog",
+            "changelog.md",
+            "blog/post.md",
+            "a.log.md",
+        ] {
+            assert!(!looks_junk(path), "{path}");
         }
         for path in [
             "calc.py",

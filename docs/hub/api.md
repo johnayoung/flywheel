@@ -64,7 +64,7 @@ Session views: `agent` `{"status","detail"?,"since","questions"?}` (AskUserQuest
 |---|---|---|
 | GET | `/api/sessions/{id}/review[?base=]` | `{"branch","base","ahead","behind","commits","committed","staged","unstaged","untracked","conflicts"}` (file sets) |
 | GET | `/api/sessions/{id}/review/diff?scope=committed\|staged\|unstaged\|untracked&path=[&old_path=&offset=&base=]` | one file's diff, paged |
-| POST | `/api/sessions/{id}/review/commit` | `message`, `exclude`? (paths, `dir/`; default: `suspects` of kind `generated` / `secret`) |
+| POST | `/api/sessions/{id}/review/commit` | `message`, `exclude`? (paths, `dir/`; default: `suspects` of kind `generated` / `secret` / `personal` / `junk`) |
 | POST | `/api/sessions/{id}/review/push` | `remote` |
 | POST | `/api/sessions/{id}/review/pr` | `title`, `body`, `base`, `draft` |
 | POST | `/api/sessions/{id}/review/rebase` | |

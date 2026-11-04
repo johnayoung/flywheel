@@ -116,6 +116,31 @@ async function glyphChecks(page, label) {
 // characters. Each place's computed features say so, and that text drawn
 // in the terminal's own style matches it drawn with the features off,
 // not on (on, JetBrains Mono joins "->" and "!=").
+// A workspace header's status pill and count: never under its shown
+// tools, never clipped.
+async function wsHeadClear(page) {
+  return page.evaluate(() => {
+    const bad = [];
+    for (const wsNode of document.querySelectorAll("#workspaces .workspace")) {
+      if (wsNode.offsetParent === null) continue;
+      const toolsNode = wsNode.querySelector(".ws-tools");
+      // Visible counts even mid fade-in (opacity still rising).
+      const shown = toolsNode && getComputedStyle(toolsNode).visibility === "visible";
+      const tools = shown ? [...toolsNode.querySelectorAll("button")].map((b) => b.getBoundingClientRect()) : [];
+      for (const sel of [".ws-status", ".ws-count"]) {
+        const n = wsNode.querySelector(sel);
+        if (!n || n.offsetParent === null) continue;
+        const r = n.getBoundingClientRect();
+        if (n.scrollWidth > n.clientWidth + 1) bad.push(`${sel} clipped`);
+        for (const t of tools) {
+          if (t.left < r.right - 0.5 && t.right > r.left + 0.5 && t.top < r.bottom - 0.5 && t.bottom > r.top + 0.5) bad.push(`${sel} "${n.textContent}" under a tool`);
+        }
+      }
+    }
+    return bad;
+  });
+}
+
 async function exactTextChecks(page, label, selectors) {
   const styles = await page.evaluate((sels) => sels.map((sel) => {
     const node = document.querySelector(sel);
@@ -1193,11 +1218,43 @@ try {
     check(got.orphan && got.buttons === 3 && got.small === 0 && got.offLine === 0 && got.height < 60,
       `${label}: a companion's actions are 44x44 on its one line (${JSON.stringify(got)})`);
     check(got.nums.length > 1 && got.nums.every((n, i) => n === i + 1), `${label}: an orphaned companion's numbers run on from Needs you (${JSON.stringify(got.nums)})`);
+    const headBad = await wsHeadClear(cp);
+    check(headBad.length === 0, `${label}: workspace status pills and counts are not under its tools (${JSON.stringify(headBad)})`);
     await cp.screenshot({ path: path.join(out, `phone-companion-${touch ? "touch" : "mouse"}.png`) });
     await cc.close();
   }
+  // Desktop: the workspace holding the attached row (its tools shown,
+  // hovered or focused) keeps its BLOCKED pill and count whole.
+  {
+    const dc = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const dp = await dc.newPage();
+    await dp.goto(`${base}/login?token=${token}#session=${comp.id}`);
+    await dp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
+    await dp.locator(`#workspaces .session[data-id="${comp.id}"]`).click();
+    await dp.locator(`#workspaces .workspace[data-id="${ws.id}"] .ws-head`).hover();
+    await dp.waitForTimeout(250);
+    const bad = await wsHeadClear(dp);
+    const pill = await dp.evaluate((id) => document.querySelector(`#workspaces .workspace[data-id="${id}"] .ws-status`)?.textContent || "", ws.id);
+    check(bad.length === 0 && pill.length > 1, `desktop: a hovered workspace's ${pill || "status"} pill and count are whole beside its tools (${JSON.stringify(bad)})`);
+    await dp.screenshot({ path: path.join(out, "desktop-ws-tools.png") });
+    await dc.close();
+  }
   await api("DELETE", `/api/sessions/${comp.id}`);
   await api("DELETE", `/api/sessions/${compAgent.id}`);
+
+  // Phone-width start screen (nothing attached), finger or mouse: its
+  // buttons are 44px targets.
+  for (const touch of [true, false]) {
+    const sc = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: touch, hasTouch: touch, deviceScaleFactor: 2 });
+    const sp = await sc.newPage();
+    await sp.goto(`${base}/login?token=${token}`);
+    await sp.waitForSelector("#empty:not([hidden]) .empty-actions button", { timeout: 15000 });
+    const small = await sp.evaluate(() => [...document.querySelectorAll("#empty button")].filter((b) => b.offsetParent !== null)
+      .map((b) => [b.textContent.trim(), Math.round(b.getBoundingClientRect().height)]).filter(([, h]) => h < 44));
+    check(small.length === 0, `${touch ? "phone" : "phone width, mouse"}: start screen buttons at least 44px tall (${JSON.stringify(small)})`);
+    await sp.screenshot({ path: path.join(out, `phone-start-${touch ? "touch" : "mouse"}.png`) });
+    await sc.close();
+  }
 
   // --- seen on view: a finished turn someone is looking at is seen -------
   // On a page that is visible and focused, attached to the agent: a turn

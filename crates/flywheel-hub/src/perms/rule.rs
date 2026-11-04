@@ -251,9 +251,9 @@ pub struct Anchors {
     /// What a single leading `/` means in the file the rule is in.
     pub slash: PathBuf,
     pub home: PathBuf,
-    /// Secret directories wherever they live: the agents' config dirs and
-    /// the hub's state dir (its token).
-    pub secrets: Vec<PathBuf>,
+    /// Secret directories wherever they live, each with what it holds:
+    /// the agents' config dirs and the hub's state dir (its token).
+    pub secrets: Vec<(PathBuf, &'static str)>,
 }
 
 /// The absolute glob a path specifier stands for.
@@ -1387,11 +1387,14 @@ fn path_risk(rule: &Rule, anchors: &Anchors, repo: &Path) -> Risk {
         }
         // The agents' config dirs and the hub's state dir, wherever they
         // are (not necessarily under home).
-        if let Some(dir) = anchors.secrets.iter().find(|d| hits(d)) {
-            return Risk::danger(format!(
-                "covers {}, which holds the hub's token or an agent's credentials and settings",
-                dir.display()
-            ));
+        let covered: Vec<String> = anchors
+            .secrets
+            .iter()
+            .filter(|(d, _)| hits(d))
+            .map(|(d, what)| format!("{} ({what})", d.display()))
+            .collect();
+        if !covered.is_empty() {
+            return Risk::danger(format!("covers {}", covered.join(" and ")));
         }
         return Risk::ok();
     }

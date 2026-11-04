@@ -33,6 +33,7 @@
 .pm-h-path { text-transform: none; letter-spacing: normal; font: 400 11px var(--mono); color: var(--ink-2); overflow-wrap: break-word; }
 .pm-codex-layer { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .55rem; min-width: 0; }
 .pm-codex-layer.absent, .unloaded { opacity: .62; }
+.pm-in-force { flex-basis: 100%; margin: .1rem 0 0; padding-left: 1.1rem; font: 400 10.5px var(--mono); color: var(--ink-2); overflow-wrap: anywhere; }
 .pm-rule.overridden code { text-decoration: line-through; color: var(--ink-3); }
 .pm-over { font-size: 10.5px; color: var(--alert); overflow-wrap: anywhere; }
 .pm-state { flex: none; font-size: 10px; color: var(--ink-3); }

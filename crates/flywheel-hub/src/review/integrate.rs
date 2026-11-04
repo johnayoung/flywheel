@@ -529,7 +529,7 @@ pub fn plan_merge(tools: &Tools, target: &Target, include_suspects: bool) -> Res
         .collect();
     if !held.is_empty() {
         let what = format!(
-            "{branch} adds {} that look{} like a secret, an agent's personal settings, or build output: {}",
+            "{branch} adds {} that look{} like a secret, an agent's personal settings, build output, or an OS or log file: {}",
             plural(held.len(), "path"),
             if held.len() == 1 { "s" } else { "" },
             held.join(", ")
@@ -538,7 +538,7 @@ pub fn plan_merge(tools: &Tools, target: &Target, include_suspects: bool) -> Res
             warnings.push(format!("{what} (they land anyway, as asked)"));
         } else if refusal.is_none() {
             refusal = Some(format!(
-                "{what}. Remove them from the branch (git rm --cached, commit), or land them anyway (--include-suspects; in the hub, \"Land them anyway\")"
+                "{what}. A fast-forward lands every commit, so a later commit removing them still lands the one adding them: rewrite the branch without them (git rebase -i to edit that commit, or squash the branch after git rm --cached), or land them anyway (--include-suspects; in the hub, \"Land them anyway\")"
             ));
         }
     }

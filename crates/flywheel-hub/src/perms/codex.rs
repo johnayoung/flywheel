@@ -30,6 +30,15 @@ pub struct Layer {
     pub approval_policy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_mode: Option<String>,
+    /// The `profile` this layer selects (`profile` scope: the profile
+    /// whose values these are).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// What this layer turns on that runs a program, sends data, or
+    /// disables a safeguard (MCP servers, notify, providers, hooks, the
+    /// selected profile's values, ...).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub in_force: Vec<String>,
 }
 
 /// One rules file and the prefix rules read from it.
@@ -82,6 +91,21 @@ fn value_text(value: &toml::Value) -> String {
     }
 }
 
+/// A TOML parse error on one line: where and what (the parser's own
+/// rendering spans several lines with a source excerpt).
+fn toml_error(text: &str, e: &toml::de::Error) -> String {
+    let message = e.message().trim().replace('\n', " ");
+    match e.span() {
+        Some(span) => {
+            let before = &text[..span.start.min(text.len())];
+            let line = before.matches('\n').count() + 1;
+            let column = before.len() - before.rfind('\n').map_or(0, |n| n + 1) + 1;
+            format!("not valid TOML: line {line}, column {column}: {message}")
+        }
+        None => format!("not valid TOML: {message}"),
+    }
+}
+
 fn read_layer(scope: &'static str, path: PathBuf) -> (Layer, Option<toml::Table>) {
     let mut layer = Layer {
         scope,
@@ -94,10 +118,8 @@ fn read_layer(scope: &'static str, path: PathBuf) -> (Layer, Option<toml::Table>
     }
     let table = match std::fs::read_to_string(&layer.path)
         .map_err(|e| e.to_string())
-        .and_then(|t| {
-            t.parse::<toml::Table>()
-                .map_err(|e| format!("not valid TOML: {e}"))
-        }) {
+        .and_then(|t| t.parse::<toml::Table>().map_err(|e| toml_error(&t, &e)))
+    {
         Ok(t) => t,
         Err(e) => {
             layer.error = Some(e);
@@ -106,6 +128,7 @@ fn read_layer(scope: &'static str, path: PathBuf) -> (Layer, Option<toml::Table>
     };
     layer.approval_policy = table.get("approval_policy").map(value_text);
     layer.sandbox_mode = table.get("sandbox_mode").map(value_text);
+    layer.profile = table.get("profile").map(value_text);
     (layer, Some(table))
 }
 
@@ -190,7 +213,7 @@ fn project_dirs(folder: &Folder) -> Vec<PathBuf> {
 /// What trusting a project turns on: every `.codex/` directory under the
 /// trusted root (each applies once a session runs in or below its folder)
 /// and, of those, what the hub writes only after a typed confirmation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Activation {
     /// The `.codex/` directories trust would load, outermost first.
     pub dirs: Vec<PathBuf>,
@@ -199,8 +222,28 @@ pub struct Activation {
     pub dangers: Vec<String>,
 }
 
-/// Directories skipped when looking for nested `.codex/`: git's own data
-/// and dependency/build trees no session is started in.
+impl Activation {
+    /// A digest of everything listed: a preview's base covers it, so a
+    /// `.codex/` that changes after the preview is not trusted unseen.
+    pub fn digest(&self) -> String {
+        let mut text = String::new();
+        for d in &self.dirs {
+            text.push_str(&d.to_string_lossy());
+            text.push('\0');
+        }
+        text.push('\u{1}');
+        for d in &self.dangers {
+            text.push_str(d);
+            text.push('\0');
+        }
+        super::claude::digest(Some(&text))
+    }
+}
+
+/// Directories the walk does not enter: git's own data and
+/// dependency/build trees. A `.codex/` under one is still found when git
+/// tracks it or would add it ([`codex_dirs_in_git`]); only an untracked,
+/// ignored one there is not.
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target"];
 /// Bounds on the walk: past either, the preview says the scan stopped
 /// (which itself needs the typed confirmation).
@@ -249,6 +292,48 @@ fn codex_dirs_under(root: &Path) -> Result<Vec<PathBuf>, (Vec<PathBuf>, String)>
     }
 }
 
+/// The `.codex/` directories (or symlinks) git tracks or would add under
+/// `root`, wherever they sit -- including the trees the walk skips.
+fn codex_dirs_in_git(root: &Path) -> Vec<PathBuf> {
+    let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ":(glob)**/.codex",
+            ":(glob)**/.codex/**",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let mut dirs = Vec::new();
+    for raw in out.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let rel = PathBuf::from(String::from_utf8_lossy(raw).into_owned());
+        let mut at = root.to_path_buf();
+        for part in rel.components() {
+            at.push(part);
+            if part.as_os_str() == ".codex" {
+                if std::fs::symlink_metadata(&at).is_ok() {
+                    dirs.push(at.clone());
+                }
+                break;
+            }
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
 fn str_list(value: Option<&toml::Value>) -> Option<String> {
     let value = value?;
     Some(match value {
@@ -257,11 +342,28 @@ fn str_list(value: Option<&toml::Value>) -> Option<String> {
     })
 }
 
+/// `K=V, ...` for a table of strings.
+fn pairs(table: &toml::Table) -> String {
+    table
+        .iter()
+        .map(|(k, v)| format!("{k}={}", value_text(v)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The first `endpoint` anywhere in `value`.
+fn find_endpoint(value: &toml::Value) -> Option<String> {
+    let table = value.as_table()?;
+    if let Some(e) = table.get("endpoint") {
+        return Some(value_text(e));
+    }
+    table.values().find_map(find_endpoint)
+}
+
 /// The dangers in one table of a Codex config: the top level (`scope`
 /// empty) or a `[profiles.<name>]` table. `providers` resolves a
 /// `model_provider` to its `[model_providers.<id>]` entry.
 fn table_dangers(
-    at: &str,
     scope: &str,
     table: &toml::Table,
     providers: Option<&toml::Table>,
@@ -274,7 +376,7 @@ fn table_dangers(
         if let Some(value) = table.get(key).map(value_text)
             && let Some(why) = setting.danger(&value)
         {
-            out.push(format!("{at}: {scope}{key} = {value} ({why})"));
+            out.push(format!("{scope}{key} = {value} ({why})"));
         }
     }
     if let Some(write) = table
@@ -283,12 +385,42 @@ fn table_dangers(
     {
         if write.get("network_access").and_then(|v| v.as_bool()) == Some(true) {
             out.push(format!(
-                "{at}: {scope}sandbox_workspace_write.network_access = true (sandboxed commands reach the network)"
+                "{scope}sandbox_workspace_write.network_access = true (sandboxed commands reach the network)"
             ));
         }
         if let Some(roots) = str_list(write.get("writable_roots")).filter(|r| !r.is_empty()) {
             out.push(format!(
-                "{at}: {scope}sandbox_workspace_write.writable_roots = {roots} (writes outside the workspace without asking)"
+                "{scope}sandbox_workspace_write.writable_roots = {roots} (writes outside the workspace without asking)"
+            ));
+        }
+    }
+    if let Some(policy) = table
+        .get("shell_environment_policy")
+        .and_then(|v| v.as_table())
+    {
+        let key = format!("{scope}shell_environment_policy");
+        if policy.get("inherit").map(value_text).as_deref() == Some("all") {
+            out.push(format!(
+                "{key}.inherit = all (every command sees all of the session's environment variables)"
+            ));
+        }
+        if policy
+            .get("ignore_default_excludes")
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            out.push(format!(
+                "{key}.ignore_default_excludes = true (variables named *KEY*, *SECRET*, *TOKEN* reach every command)"
+            ));
+        }
+        if let Some(set) = policy
+            .get("set")
+            .and_then(|v| v.as_table())
+            .filter(|t| !t.is_empty())
+        {
+            out.push(format!(
+                "{key}.set {} (in every command's environment)",
+                pairs(set)
             ));
         }
     }
@@ -302,15 +434,20 @@ fn table_dangers(
             .map(|u| format!(" at {u}"))
             .unwrap_or_default();
         out.push(format!(
-            "{at}: {scope}model_provider = {id} (sends every prompt and the code it reads to that provider{target})"
+            "{scope}model_provider = {id} (sends every prompt and the code it reads to that provider{target})"
         ));
     }
 }
 
-/// Everything in one `.codex/config.toml` that trust would turn on and
-/// that needs typing. `user` (the user's config) resolves a `profile` or
-/// `model_provider` the project names but does not define.
-fn config_dangers(at: &str, table: &toml::Table, user: Option<&toml::Table>) -> Vec<String> {
+/// Everything in one `.codex/config.toml` that runs a program, sends
+/// data, or disables a safeguard. `user` (the user's config) resolves a
+/// `profile` or `model_provider` the file names but does not define;
+/// `every_profile` also lists profiles only `--profile` selects.
+fn config_dangers(
+    table: &toml::Table,
+    user: Option<&toml::Table>,
+    every_profile: bool,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut providers = user
         .and_then(|u| u.get("model_providers"))
@@ -320,7 +457,7 @@ fn config_dangers(at: &str, table: &toml::Table, user: Option<&toml::Table>) -> 
     if let Some(own) = table.get("model_providers").and_then(|v| v.as_table()) {
         providers.extend(own.clone());
     }
-    table_dangers(at, "", table, Some(&providers), &mut out);
+    table_dangers("", table, Some(&providers), &mut out);
     let profiles = table.get("profiles").and_then(|v| v.as_table());
     let selected = table.get("profile").map(value_text);
     if let Some(name) = &selected
@@ -331,7 +468,7 @@ fn config_dangers(at: &str, table: &toml::Table, user: Option<&toml::Table>) -> 
             .and_then(|v| v.as_table())
     {
         let how = format!("profile = {name} selects the user's [profiles.{name}], whose ");
-        table_dangers(at, &how, theirs, Some(&providers), &mut out);
+        table_dangers(&how, theirs, Some(&providers), &mut out);
     }
     for (name, profile) in profiles.into_iter().flatten() {
         let Some(profile) = profile.as_table() else {
@@ -339,10 +476,12 @@ fn config_dangers(at: &str, table: &toml::Table, user: Option<&toml::Table>) -> 
         };
         let how = if selected.as_deref() == Some(name.as_str()) {
             format!("[profiles.{name}] (selected) ")
-        } else {
+        } else if every_profile {
             format!("[profiles.{name}] (with --profile {name}) ")
+        } else {
+            continue;
         };
-        table_dangers(at, &how, profile, Some(&providers), &mut out);
+        table_dangers(&how, profile, Some(&providers), &mut out);
     }
     let own = table.get("model_providers").and_then(|v| v.as_table());
     for (id, provider) in own.into_iter().flatten() {
@@ -366,11 +505,11 @@ fn config_dangers(at: &str, table: &toml::Table, user: Option<&toml::Table>) -> 
             format!(", with {} from the environment", creds.join(", "))
         };
         out.push(format!(
-            "{at}: model_providers.{id} (sends prompts and code to {url}{creds})"
+            "model_providers.{id} (sends prompts and code to {url}{creds})"
         ));
     }
     if let Some(command) = str_list(table.get("notify")) {
-        out.push(format!("{at}: notify runs `{command}` after every turn"));
+        out.push(format!("notify runs `{command}` after every turn"));
     }
     for (name, server) in table
         .get("mcp_servers")
@@ -392,14 +531,44 @@ fn config_dangers(at: &str, table: &toml::Table, user: Option<&toml::Table>) -> 
             (None, Some(u)) => format!("connects to {u}"),
             (None, None) => "an MCP server".to_owned(),
         };
-        let token = server
-            .and_then(|s| s.get("bearer_token_env_var"))
-            .map(|v| format!(", sending ${}", value_text(v)))
-            .unwrap_or_default();
-        out.push(format!("{at}: mcp_servers.{name} {what}{token}"));
+        let mut extra = String::new();
+        if let Some(env) = server
+            .and_then(|s| s.get("env"))
+            .and_then(|v| v.as_table())
+            .filter(|t| !t.is_empty())
+        {
+            extra.push_str(&format!(" with env {}", pairs(env)));
+        }
+        if let Some(vars) = server
+            .and_then(|s| s.get("env_vars"))
+            .and_then(|v| v.as_array())
+            .filter(|a| !a.is_empty())
+        {
+            let vars: Vec<String> = vars.iter().map(|v| format!("${}", value_text(v))).collect();
+            extra.push_str(&format!(", passing {}", vars.join(", ")));
+        }
+        if let Some(token) = server.and_then(|s| s.get("bearer_token_env_var")) {
+            extra.push_str(&format!(", sending ${}", value_text(token)));
+        }
+        out.push(format!("mcp_servers.{name} {what}{extra}"));
     }
     if table.contains_key("hooks") {
-        out.push(format!("{at}: hooks (run programs they name)"));
+        out.push("hooks (run programs they name)".to_owned());
+    }
+    if let Some(otel) = table.get("otel").and_then(|v| v.as_table()) {
+        let off = otel.get("exporter").is_none_or(|e| value_text(e) == "none");
+        if !off {
+            let to = otel
+                .get("exporter")
+                .and_then(find_endpoint)
+                .unwrap_or_else(|| "its exporter".to_owned());
+            let prompts = if otel.get("log_user_prompt").and_then(|v| v.as_bool()) == Some(true) {
+                ", prompts included"
+            } else {
+                ""
+            };
+            out.push(format!("otel sends session telemetry to {to}{prompts}"));
+        }
     }
     out
 }
@@ -409,7 +578,8 @@ fn config_dangers(at: &str, table: &toml::Table, user: Option<&toml::Table>) -> 
 /// trusted root (the same trust covers a session started there), with the
 /// dangerous settings, program-running and data-sending entries
 /// (`profile`/`[profiles.*]`, `model_provider`/`[model_providers.*]`,
-/// `[mcp_servers.*]`, `notify`, hooks), and dangerous allow rules.
+/// `[mcp_servers.*]` and their env, `notify`, hooks,
+/// `shell_environment_policy`, `[otel]`), and dangerous allow rules.
 pub fn trust_activates(folder: &Folder, env: &Env, anchors: &super::rule::Anchors) -> Activation {
     let root = project_key(folder);
     let (_, user) = read_layer("user", env.codex_home.join("config.toml"));
@@ -419,16 +589,21 @@ pub fn trust_activates(folder: &Folder, env: &Env, anchors: &super::rule::Anchor
         .map(|d| d.join(".codex"))
         .filter(|d| d.exists())
         .collect();
-    match codex_dirs_under(&root) {
-        Ok(found) => dirs.extend(found),
+    let mut nested = match codex_dirs_under(&root) {
+        Ok(found) => found,
         Err((found, why)) => {
-            dirs.extend(found);
             act.dangers.push(format!(
                 "{}: the scan for nested .codex/ directories {why}, so trust may turn on more than listed",
                 root.display()
             ));
+            found
         }
+    };
+    if folder.top.is_some() {
+        nested.extend(codex_dirs_in_git(&root));
     }
+    nested.sort();
+    dirs.extend(nested);
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|d| seen.insert(d.clone()));
     for codex in &dirs {
@@ -450,8 +625,11 @@ pub fn trust_activates(folder: &Folder, env: &Env, anchors: &super::rule::Anchor
             ));
         }
         if let Some(table) = &table {
-            act.dangers
-                .extend(config_dangers(&at, table, user.as_ref()));
+            act.dangers.extend(
+                config_dangers(table, user.as_ref(), true)
+                    .into_iter()
+                    .map(|d| format!("{at}: {d}")),
+            );
         }
         if codex.join("hooks.json").exists() {
             act.dangers.push(format!(
@@ -546,10 +724,10 @@ pub fn view(folder: &Folder, env: &Env, launch: Option<(Option<&str>, Option<&st
         });
     }
     // Project layers: the one closest to the folder wins.
-    let mut project_layers: Vec<Layer> = project_dirs(folder)
+    let mut project_layers: Vec<(Layer, Option<toml::Table>)> = project_dirs(folder)
         .into_iter()
-        .map(|dir| read_layer("project", dir.join(".codex/config.toml")).0)
-        .filter(|l| l.exists)
+        .map(|dir| read_layer("project", dir.join(".codex/config.toml")))
+        .filter(|(l, _)| l.exists)
         .collect();
     project_layers.reverse();
     if !project_layers.is_empty() && !trusted {
@@ -558,14 +736,56 @@ pub fn view(folder: &Folder, env: &Env, launch: Option<(Option<&str>, Option<&st
                 .into(),
         );
     }
-    view.layers.extend(project_layers);
-    view.layers.push(user);
+    let mut files: Vec<(Layer, Option<toml::Table>)> = project_layers;
+    files.push((user, user_table.clone()));
+    for (layer, table) in &mut files {
+        if let Some(table) = table {
+            layer.in_force = config_dangers(table, user_table.as_ref(), false);
+        }
+    }
+    // The selected profile overrides every file's top level (not the
+    // session's flags): the highest loaded `profile` key names it, the
+    // highest loaded file defining `[profiles.<name>]` gives its values.
+    let loaded: Vec<&(Layer, Option<toml::Table>)> = files
+        .iter()
+        .filter(|(l, t)| t.is_some() && (l.scope != "project" || trusted))
+        .collect();
+    let selected = loaded.iter().find_map(|(l, _)| l.profile.clone());
+    if let Some(name) = selected {
+        let defined = loaded.iter().find_map(|(l, t)| {
+            t.as_ref()?
+                .get("profiles")?
+                .get(&name)?
+                .as_table()
+                .map(|p| (l.path.clone(), p))
+        });
+        match defined {
+            Some((path, profile)) => view.layers.push(Layer {
+                scope: "profile",
+                path,
+                exists: true,
+                approval_policy: profile.get("approval_policy").map(value_text),
+                sandbox_mode: profile.get("sandbox_mode").map(value_text),
+                profile: Some(name),
+                ..Layer::default()
+            }),
+            None => view.notes.push(format!(
+                "profile = {name} names a profile no loaded config defines"
+            )),
+        }
+    }
+    view.layers.extend(files.into_iter().map(|(l, _)| l));
     for layer in &view.layers {
         if layer.scope == "project" && !trusted {
             continue;
         }
         let from = || match layer.scope {
             "command line" => "the session's flags".to_owned(),
+            "profile" => format!(
+                "[profiles.{}] in {}",
+                layer.profile.as_deref().unwrap_or(""),
+                layer.path.display()
+            ),
             _ => layer.path.display().to_string(),
         };
         if view.approval_policy.is_none()

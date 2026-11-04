@@ -22,6 +22,8 @@ any = ["showing detailed transcript"]
 
 # First run in a folder: "Quick safety check: Is this a project you
 # created or one you trust?" ... "Enter to confirm · Esc to cancel".
+# Claude Code wraps that question to the terminal's width (a phone's 55
+# columns break it after "created or"): match its short head instead.
 [[rule]]
 id = "folder_trust"
 state = "blocked"
@@ -31,7 +33,7 @@ lines = 1
 line = ['(?i)^\s*enter to confirm\s*·\s*esc to cancel\s*$']
 [[rule.when]]
 lines = 20
-any = ["is this a project you created or one you trust"]
+any = ["quick safety check"]
 line = ['(?i)^\s*(?:❯\s*)?(?:\d\.\s*)?yes, i trust this folder']
 
 # Bash / Write / Edit / WebFetch ... permission dialogs:

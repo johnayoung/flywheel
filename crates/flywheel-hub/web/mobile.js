@@ -69,13 +69,62 @@ window.FwHubPrompt = (function () {
     return -1;
   }
 
+  // The lowest unnumbered cursor menu: one line marked "❯ " and its
+  // siblings, adjacent and with their text in the marked line's column
+  // (Claude's folder-trust dialog: "❯ No, exit" / "  Yes, I trust this
+  // folder"). Enter picks the marked line, so each option is reached with
+  // arrow keys first. Only near the bottom of the screen: an echoed
+  // multi-line prompt higher up is not a menu.
+  const CURSOR = /^(\s*)[❯›>▶➤]\s+(\S.*?)\s*$/;
+  function cursorMenu(lines) {
+    let seen = 0;
+    for (let i = lines.length - 1; i >= 0 && seen < 8; i--) {
+      if (!lines[i].trim()) continue;
+      seen += 1;
+      const mark = CURSOR.exec(lines[i]);
+      if (!mark || OPTION.test(lines[i])) continue;
+      const column = lines[i].indexOf(mark[2]);
+      const sibling = (text) =>
+        text.trim() && !CURSOR.test(text) && text.length > column && !text.slice(0, column).trim() && text[column] !== " ";
+      let first = i;
+      while (first > 0 && sibling(lines[first - 1])) first -= 1;
+      let last = i;
+      while (last + 1 < lines.length && sibling(lines[last + 1])) last += 1;
+      if (first === last) return null;
+      const options = [];
+      for (let j = first; j <= last; j++) {
+        const moves = j < i ? "\x1b[A".repeat(i - j) : "\x1b[B".repeat(j - i);
+        options.push({ label: lines[j].slice(column).trim(), seq: `${moves}\r`, index: j });
+      }
+      return { cursor: i, first, last, options };
+    }
+    return null;
+  }
+
   function parse(lines) {
     const run = numberedRun(lines);
     const yn = yesNoLine(lines);
-    if (yn >= 0 && (!run || yn > run[run.length - 1].index)) {
+    let menu = cursorMenu(lines);
+    // Whichever is lowest on the screen is the one asked now.
+    if (menu && run && run[run.length - 1].index > menu.last) menu = null;
+    if (yn >= 0 && (!run || yn > run[run.length - 1].index) && (!menu || yn > menu.last)) {
       return {
         question: lines[yn].trim(),
         options: [{ label: "y  yes", seq: "y\r" }, { label: "n  no", seq: "n\r" }],
+      };
+    }
+    if (menu) {
+      let question = "";
+      for (let i = menu.first - 1; i >= Math.max(0, menu.first - 4); i--) {
+        const text = lines[i].replace(/[─-╿|]/g, "").trim();
+        if (text) {
+          question = text;
+          break;
+        }
+      }
+      return {
+        question,
+        options: menu.options.map(({ label, seq, index }) => ({ label: index === menu.cursor ? `❯ ${label}` : label, seq })),
       };
     }
     if (!run) return null;
@@ -492,8 +541,10 @@ window.FwHubMobile = function (ctx) {
     }
     const cancel = el("button", { type: "button", className: "qa-esc", textContent: "esc", title: "Escape (cancel)", onclick: answer("\x1b") });
     holdFocus(cancel);
-    // "Always allow": the narrowest rule for this prompt, previewed (perms.js).
-    const always = ctx.allowAlways
+    // "Always allow": the narrowest rule for this prompt, previewed
+    // (perms.js). Permission prompts only: a folder-trust dialog or a
+    // question has no rule to write.
+    const always = ctx.allowAlways && /permission/i.test(agent.detail || "")
       ? el("button", {
           type: "button",
           className: "qa-esc qa-always",

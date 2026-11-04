@@ -45,6 +45,13 @@ fn bundled_manifests_parse_and_name_their_files() {
 fn claude_rules_read_real_claude_code_screens() {
     let claude = SessionKind::Claude;
     assert_reads(claude, "claude-trust", Some(Blocked), Some("folder_trust"));
+    // The same dialog at a phone's 55 columns: its question wraps.
+    assert_reads(
+        claude,
+        "claude-trust-narrow",
+        Some(Blocked),
+        Some("folder_trust"),
+    );
     assert_reads(
         claude,
         "claude-permission-bash",

@@ -623,6 +623,15 @@ try {
     "Overwrite existing file config.toml? (y/n)",
   ]).options.map((o) => o.seq));
   check(quick[0] === "y\r", `phone: quick answers pick the newer y/n prompt (${JSON.stringify(quick)})`);
+  // Claude's folder-trust dialog (captured at a phone's 55 columns) is an
+  // unnumbered cursor menu with "No, exit" marked: Enter alone would exit,
+  // so every option is offered, reached by arrow keys.
+  const trustScreen = fs.readFileSync(path.join(root, "crates/flywheel-hub/detect/fixtures/claude-trust-narrow.txt"), "utf8").split("\n");
+  const trust = await mp.evaluate((lines) => window.FwHubPrompt.parse(lines), trustScreen);
+  check(
+    trust && trust.options.length === 2 && trust.options[0].label === "❯ No, exit" && trust.options[0].seq === "\r" && trust.options[1].label === "Yes, I trust this folder" && trust.options[1].seq === "\x1b[B\r",
+    `phone: the trust dialog's quick answers are its menu, reached by arrows (${JSON.stringify(trust)})`,
+  );
   await mp.goto(`${base}/login?token=${token}#session=${sids[1]}`);
   await mp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
   await mp.waitForTimeout(800);

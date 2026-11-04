@@ -7,12 +7,12 @@
   Session("45e7bccc-889d-471a-942e-c00859549c20")
   Model("claude-haiku-5-5")
   Usage(Turn { id: Some("msg_011CggNMb3sFdkWAbG5z6Cn6"), model: "claude-haiku-5-5", fast: false, timestamp: Some("2026-11-03T17:13:06.521Z"), tokens: Tokens { input: 2, output: 198, cache_read: 10579, cache_write_5m: 0, cache_write_1h: 21594 } })
-  ToolCall { id: "0c75a96f-a719-4d66-a57a-e58d62a0b0b6#tool0", name: "Bash", input: "command: ls -la /tmp/fw-capture-7EmE/demo\ndescription: List files in the demo directory", call: Some("toolu_01TT59Gky9WKwovzoNTH27C2") }
+  ToolCall { id: "0c75a96f-a719-4d66-a57a-e58d62a0b0b6#tool0", name: "Bash", input: "command: ls -la /tmp/fw-capture-7EmE/demo\ndescription: List files in the demo directory", call: Some("toolu_01TT59Gky9WKwovzoNTH27C2"), subject: Some("ls -la /tmp/fw-capture-7EmE/demo") }
 @2363 Some("2026-11-03T17:13:06.744Z")
   Session("45e7bccc-889d-471a-942e-c00859549c20")
   Model("claude-haiku-5-5")
   Usage(Turn { id: Some("msg_011CggNMb3sFdkWAbG5z6Cn6"), model: "claude-haiku-5-5", fast: false, timestamp: Some("2026-11-03T17:13:06.744Z"), tokens: Tokens { input: 2, output: 198, cache_read: 10579, cache_write_5m: 0, cache_write_1h: 21594 } })
-  ToolCall { id: "206e6c22-40e1-484a-9d25-0962629513e1#tool0", name: "Bash", input: "command: cat /tmp/fw-capture-7EmE/demo/Cargo.toml\ndescription: Print Cargo.toml contents", call: Some("toolu_01EGtr1BxKfM7dXsrN2urmpL") }
+  ToolCall { id: "206e6c22-40e1-484a-9d25-0962629513e1#tool0", name: "Bash", input: "command: cat /tmp/fw-capture-7EmE/demo/Cargo.toml\ndescription: Print Cargo.toml contents", call: Some("toolu_01EGtr1BxKfM7dXsrN2urmpL"), subject: Some("cat /tmp/fw-capture-7EmE/demo/Cargo.toml") }
 @3804 Some("2026-11-03T17:13:06.801Z")
   Session("45e7bccc-889d-471a-942e-c00859549c20")
   ToolResult { id: "ded11cb6-01d5-4b7c-a39f-8c9952625dcf#result0", call: "toolu_01EGtr1BxKfM7dXsrN2urmpL", output: "[package]\nname=\"demo\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[[bin]]\nname=\"demo\"\npath=\"main.rs\"", error: false }

@@ -94,6 +94,9 @@ pub enum Event {
         name: String,
         input: String,
         call: Option<String>,
+        /// What the call is about, from its input as given (see
+        /// [`tool_subject`]): a command, a file, a pattern, a question.
+        subject: Option<String>,
     },
     /// What a tool call returned (Claude's `tool_result`, Codex's
     /// `function_call_output`): its output as text, for call `call`.
@@ -159,6 +162,60 @@ pub fn tool_text(input: &Value) -> String {
         Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// The input keys that say what a call does, most telling first.
+const SUBJECT_KEYS: &[&str] = &[
+    "command",
+    "cmd",
+    "file_path",
+    "notebook_path",
+    "pattern",
+    "url",
+    "query",
+    "path",
+    "description",
+    "prompt",
+];
+
+/// What a tool call is about, read from its input object (a JSON string
+/// of one too): the top-level value of the most telling key in
+/// [`SUBJECT_KEYS`] (a non-string, such as an argv, as JSON), a
+/// question's first question, else the first top-level string. Only the
+/// object's own keys count: a `command:` line inside a file's content is
+/// not the call's command. `None` for input that is not an object.
+pub fn tool_subject(input: &Value) -> Option<String> {
+    let fields = match input {
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(fields)) => fields,
+            _ => return None,
+        },
+        Value::Object(fields) => fields.clone(),
+        _ => return None,
+    };
+    let given = |value: &Value| match value {
+        Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        Value::Array(items) if !items.is_empty() => Some(value.to_string()),
+        _ => None,
+    };
+    let question = || {
+        fields
+            .get("questions")?
+            .as_array()?
+            .first()?
+            .get("question")
+            .and_then(given)
+    };
+    SUBJECT_KEYS
+        .iter()
+        .find_map(|k| fields.get(*k).and_then(given))
+        .or_else(question)
+        .or_else(|| {
+            fields.values().find_map(|v| match v {
+                Value::String(_) => given(v),
+                _ => None,
+            })
+        })
 }
 
 /// Nesting deeper than this is written as JSON.
@@ -259,6 +316,7 @@ fn claude(value: &Value, events: &mut Vec<Event>) {
             name: str_of(part, "name").unwrap_or("tool").to_owned(),
             input: part.get("input").map(tool_text).unwrap_or_default(),
             call: str_of(part, "id").map(str::to_owned),
+            subject: part.get("input").and_then(tool_subject),
         });
     }
     for (i, part) in results.into_iter().enumerate() {
@@ -369,11 +427,12 @@ fn codex(value: &Value, offset: u64, events: &mut Vec<Event>) {
             .or_else(|| str_of(item, "call_id"))
             .map_or_else(|| format!("@{offset}"), str::to_owned)
     };
-    let call = |name: &str, input: String| Event::ToolCall {
+    let call = |name: &str, input: Option<&Value>| Event::ToolCall {
         id: id(),
         name: name.to_owned(),
-        input,
+        input: input.map(tool_text).unwrap_or_default(),
         call: str_of(item, "call_id").map(str::to_owned),
+        subject: input.and_then(tool_subject),
     };
     let event = match str_of(item, "type") {
         Some("message") => {
@@ -410,12 +469,9 @@ fn codex(value: &Value, offset: u64, events: &mut Vec<Event>) {
         }
         Some("function_call") => call(
             str_of(item, "name").unwrap_or("function"),
-            item.get("arguments").map(tool_text).unwrap_or_default(),
+            item.get("arguments"),
         ),
-        Some("custom_tool_call") => call(
-            str_of(item, "name").unwrap_or("tool"),
-            item.get("input").map(tool_text).unwrap_or_default(),
-        ),
+        Some("custom_tool_call") => call(str_of(item, "name").unwrap_or("tool"), item.get("input")),
         Some("local_shell_call") => {
             let command = item
                 .get("action")
@@ -428,7 +484,7 @@ fn codex(value: &Value, offset: u64, events: &mut Vec<Event>) {
                         .join(" ")
                 })
                 .unwrap_or_default();
-            call("shell", command)
+            call("shell", Some(&Value::String(command)))
         }
         Some("function_call_output" | "custom_tool_call_output") => {
             let Some(call) = str_of(item, "call_id") else {

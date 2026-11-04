@@ -25,6 +25,8 @@ pub struct Extracted {
     pub call: Option<String>,
     /// A tool result that reports a failure.
     pub error: bool,
+    /// A tool call: what it is about (see [`agentlog::tool_subject`]).
+    pub subject: Option<String>,
 }
 
 fn tool_message(
@@ -32,9 +34,11 @@ fn tool_message(
     name: &str,
     input: String,
     call: Option<String>,
+    subject: Option<String>,
     timestamp: Option<String>,
 ) -> Extracted {
     Extracted {
+        subject,
         id,
         role: Role::Assistant,
         kind: MessageKind::Tool,
@@ -79,6 +83,7 @@ pub fn messages_of(format: Format, line: Line) -> Vec<Extracted> {
                         text,
                         call: None,
                         error: false,
+                        subject: None,
                     });
                 }
             }
@@ -87,8 +92,16 @@ pub fn messages_of(format: Format, line: Line) -> Vec<Extracted> {
                 name,
                 input,
                 call,
+                subject,
             } => {
-                out.push(tool_message(id, &name, input, call, line.timestamp.clone()));
+                out.push(tool_message(
+                    id,
+                    &name,
+                    input,
+                    call,
+                    subject,
+                    line.timestamp.clone(),
+                ));
             }
             Event::ToolResult {
                 id,
@@ -104,6 +117,7 @@ pub fn messages_of(format: Format, line: Line) -> Vec<Extracted> {
                 text: output,
                 call: Some(call),
                 error,
+                subject: None,
             }),
             Event::Session(_) | Event::Model(_) | Event::Usage(_) | Event::TokenCount { .. } => {}
         }
@@ -157,56 +171,39 @@ pub struct MessageMeta {
 /// Longest [`call_label`] input part, in characters.
 const CALL_LABEL_CHARS: usize = 80;
 
-/// A tool call, short: its tool and the one input value that says what it
-/// does (a command, a file, a pattern, ...; else the first value), cut to
-/// [`CALL_LABEL_CHARS`]. `text` is the call's message text: the tool's
-/// name, then its input as `key: value` lines (see
-/// [`agentlog::tool_text`]) or as written (Codex's patch, a bare command).
-pub fn call_label(text: &str) -> String {
-    const KEYS: &[&str] = &[
-        "command",
-        "cmd",
-        "file_path",
-        "notebook_path",
-        "pattern",
-        "url",
-        "query",
-        "path",
-        "question",
-        "description",
-        "prompt",
-    ];
+/// A tool call, short: its tool and what it is about -- `subject` (the
+/// call's input value that says what it does, see
+/// [`agentlog::tool_subject`]), else for input that is not key-value a
+/// patch's file or the first line -- cut to [`CALL_LABEL_CHARS`]. A path
+/// is cut from its start, so its file name stays. `text` is the call's
+/// message text: the tool's name, then its input.
+pub fn call_label(text: &str, subject: Option<&str>) -> String {
     let mut lines = text.lines();
     let name = lines.next().unwrap_or_default().trim();
-    let input: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
-    let field = |line: &str| -> Option<(String, String)> {
-        let (key, value) = line.split_once(": ")?;
-        let key = key.trim_start_matches([' ', '-']);
-        (!key.is_empty()
-            && key
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-'))
-        .then(|| (key.to_owned(), value.trim().to_owned()))
-    };
-    let fields: Vec<(String, String)> = input.iter().filter_map(|l| field(l)).collect();
-    let value = KEYS
-        .iter()
-        .find_map(|k| fields.iter().find(|(key, v)| key == k && !v.is_empty()))
-        .or_else(|| fields.iter().find(|(_, v)| !v.is_empty()))
-        .map(|(_, v)| argv_text(v))
-        .or_else(|| {
-            // Not key-value: a patch names its file; else the first line.
-            let file = input
-                .iter()
-                .find_map(|l| l.strip_prefix("*** ").and_then(|l| l.split_once("File: ")))
-                .map(|(_, f)| f.trim().to_owned());
-            file.or_else(|| input.first().map(|l| l.trim().to_owned()))
-        })
-        .unwrap_or_default();
+    let value = subject.map(argv_text).unwrap_or_else(|| {
+        let input: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
+        // Not key-value: a patch names its file; else the first line.
+        input
+            .iter()
+            .find_map(|l| l.strip_prefix("*** ").and_then(|l| l.split_once("File: ")))
+            .map(|(_, f)| f.trim().to_owned())
+            .or_else(|| input.first().map(|l| l.trim().to_owned()))
+            .unwrap_or_default()
+    });
     let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let value = match value.char_indices().nth(CALL_LABEL_CHARS) {
-        Some((at, _)) => format!("{}\u{2026}", &value[..at]),
-        None => value,
+    let chars = value.chars().count();
+    let value = if chars <= CALL_LABEL_CHARS {
+        value
+    } else if !value.contains(' ') && value.contains('/') {
+        let skip = chars - (CALL_LABEL_CHARS - 1);
+        let at = value.char_indices().nth(skip).map_or(0, |(at, _)| at);
+        format!("\u{2026}{}", &value[at..])
+    } else {
+        let at = value
+            .char_indices()
+            .nth(CALL_LABEL_CHARS)
+            .map_or(value.len(), |(at, _)| at);
+        format!("{}\u{2026}", &value[..at])
     };
     match (name.is_empty(), value.is_empty()) {
         (_, true) => name.to_owned(),
@@ -337,7 +334,7 @@ impl TranscriptIndex {
                         self.calls.pop_front();
                     }
                     let name = message.tool.clone().unwrap_or_default();
-                    let label = call_label(&message.text);
+                    let label = call_label(&message.text, message.subject.as_deref());
                     self.calls
                         .push_back((call.clone(), name, self.next_index, label));
                 }

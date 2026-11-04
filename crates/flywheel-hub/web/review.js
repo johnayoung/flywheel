@@ -1063,14 +1063,14 @@ window.FwHubReview = function (ctx) {
       });
       // The tail of a long path tells rows apart: the directory part
       // gives way from its start ("…/deep/dir/"), the name stays whole.
-      // (Right-to-left only to put the cut at the start; the marks keep
-      // its slashes in place.)
+      // (Right-to-left only to put the cut at the start; generated marks
+      // keep its slashes in place, and out of a copy.)
       const cut = s.path.replace(/\/$/, "").lastIndexOf("/") + 1;
       const kind = (SUSPECT[s.kind] || s.kind) + (s.files > 1 ? ` · ${s.files} files` : "");
       const path = el(
         "span",
         { className: "rva-suspect-path", title: s.path },
-        el("span", { className: "rva-suspect-dir", textContent: s.path.slice(0, cut) ? `\u200e${s.path.slice(0, cut)}\u200e` : "" }),
+        el("span", { className: "rva-suspect-dir", textContent: s.path.slice(0, cut) }),
         el("span", { className: "rva-suspect-name", textContent: s.path.slice(cut) }),
       );
       return { box, path: s.path, row: el("label", { className: `rva-suspect ${s.kind}` }, box, path, el("span", { className: "rva-suspect-kind", textContent: kind })) };

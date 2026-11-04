@@ -256,7 +256,7 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `session.created` | - |
 | `session.exited` | `exit`, `hub_stopping` (`fw hub stop` hung it up) |
 | `session.removed` | - |
-| `status.changed` | `status`, `previous`, `detail`; each finished turn: one `done` (`seen`: watched). Deprecated, removed in 0.8: `turn_finished` (true on it) and `statuses = ["done"]` matching it |
+| `status.changed` | `status`, `previous`, `detail`; each finished turn: one `done` (`seen`: watched). Deprecated, removed in 0.8: `turn_finished`, true on the status the turn shows (`done`; watched: the `idle` after it) |
 | `review.committed` | `dir`, `head`, `branch`, `base`, `url`, `summary` (every `review.*`) |
 | `review.pushed` | as above |
 | `review.pr_opened` | as above |

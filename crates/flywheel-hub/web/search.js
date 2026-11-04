@@ -754,7 +754,7 @@ window.FwHubSearch = function (ctx) {
       ? el("button", { type: "button", className: "text-btn tx-expand", onclick: () => { whole = !whole; fill(); } })
       : null;
     function fill() {
-      pre.replaceChildren(marked(whole ? m.text : lines.slice(0, RESULT_LINES).join("\n"), viewer.re, viewer.literal));
+      pre.replaceChildren(...marked(whole ? m.text : lines.slice(0, RESULT_LINES).join("\n"), viewer.re, viewer.literal));
       if (more) more.textContent = whole ? "Show less" : `Show all ${lines.length} lines`;
     }
     fill();
@@ -806,7 +806,7 @@ window.FwHubSearch = function (ctx) {
           "header",
           { className: "tx-msg-head" },
           el("span", { className: "tx-who", textContent: who }),
-          // As written (a command keeps its case), the whole on hover.
+          // As written (a command keeps its case); on hover too, where the row cuts it.
           call ? el("span", { className: "tx-call", textContent: call, title: call }) : null,
           el("span", { className: "tx-index", textContent: `#${m.index}` }),
           m.timestamp ? el("span", { className: "tx-when", textContent: `${age(m.timestamp)} ago`, title: m.timestamp }) : null,
@@ -958,6 +958,6 @@ window.FwHubSearch = function (ctx) {
   return {
     open, close, toggle, isOpen: () => ui.open, paletteItems, refreshFilters,
     // The transcript viewer at message `index` (activity.js: a finished turn).
-    openTranscript: (group, index) => openTranscript(group, index, { text: "", regex: false, caseSensitive: false }),
+    openTranscript: (group, index, query) => openTranscript(group, index, query || { text: "", regex: false, caseSensitive: false }),
   };
 };

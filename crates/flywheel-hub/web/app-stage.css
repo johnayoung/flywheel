@@ -334,7 +334,8 @@
 .path-tail::before, .path-tail::after, .meter.cwd::before, .meter.cwd::after,
 .import-what small::before, .import-what small::after,
 .kind-card .kind-prog::before, .kind-card .kind-prog::after,
-.fw-path::before, .fw-path::after { content: "\200e"; }
+.fw-path::before, .fw-path::after,
+.rva-suspect-dir::before, .rva-suspect-dir::after { content: "\200e"; }
 
 .meter.cwd {
   max-width: 28vw;

@@ -1377,6 +1377,7 @@ fn commit_all_past_the_review_cut_says_what_it_lists_and_leaves_a_late_secret_ou
         write(wt, &format!("src/m{i:04}.rs"), "pub fn f() {}\n");
     }
     write(wt, "zz/.env", "TOKEN=hunter2\n");
+    write(wt, "zz/prod.env", "TOKEN=hunter3\n");
     let plan = plan_commit(&tools(), &t, "feat: many", None).unwrap();
     assert_eq!(plan.refusal, None, "{:?}", plan.refusal);
     let kinds: Vec<(&str, &str, bool)> = plan
@@ -1384,7 +1385,10 @@ fn commit_all_past_the_review_cut_says_what_it_lists_and_leaves_a_late_secret_ou
         .iter()
         .map(|s| (s.path.as_str(), s.kind, s.excluded))
         .collect();
-    assert_eq!(kinds, [("zz/.env", "secret", true)]);
+    assert_eq!(
+        kinds,
+        [("zz/.env", "secret", true), ("zz/prod.env", "secret", true)]
+    );
     assert_eq!(
         plan.files,
         Some(FileCount {
@@ -1396,13 +1400,13 @@ fn commit_all_past_the_review_cut_says_what_it_lists_and_leaves_a_late_secret_ou
     assert!(
         plan.warnings
             .iter()
-            .any(|w| w.starts_with(&format!("1500 files committed; the list names {MAX_FILES}"))),
+            .any(|w| w.starts_with(&format!("1500 files to commit, {MAX_FILES} of them listed"))),
         "{:?}",
         plan.warnings
     );
     assert_eq!(
         plan.summary,
-        "Stage 1500 files (leaving 1 out) and commit them on feat"
+        "Stage 1500 files (leaving 2 out) and commit them on feat"
     );
     let done = commit(&tools(), &t, "feat: many", None, &plan.fingerprint).unwrap();
     assert!(done.ok, "{done:?}");
@@ -1412,4 +1416,45 @@ fn commit_all_past_the_review_cut_says_what_it_lists_and_leaves_a_late_secret_ou
     assert!(
         run_git(wt, &["status", "--porcelain", "--untracked-files=all"]).contains("?? zz/.env")
     );
+}
+
+#[test]
+fn a_listed_rename_past_a_cut_set_is_not_called_missing() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    commit_file(wt, "a.rs", "pub fn a() {}\n", "add a");
+    run_git(wt, &["mv", "a.rs", "b.rs"]);
+    // Untracked past the cut, every one of them left out.
+    for i in 0..(MAX_FILES + 200) {
+        write(wt, &format!("node_modules/p{i:04}.js"), "x\n");
+    }
+    let plan = plan_commit(&tools(), &t, "refactor: rename", None).unwrap();
+    assert_eq!(plan.refusal, None, "{:?}", plan.refusal);
+    assert_eq!(plan.excluded, ["node_modules/"]);
+    assert_eq!(
+        plan.files,
+        Some(FileCount {
+            total: 2,
+            listed: 2
+        })
+    );
+    assert!(
+        !plan.warnings.iter().any(|w| w.contains("listed (cut")),
+        "{:?}",
+        plan.warnings
+    );
+}
+
+#[test]
+fn too_many_changes_names_the_untracked_directories() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    write(wt, "node_modules/@scope/pkg/index.js", "x\n");
+    write(wt, "dist/app.js", "x\n");
+    write(wt, "app.js", "x\n");
+    let tools = tools();
+    let why = too_many_changes(&Git::new(&tools, wt));
+    assert!(why.starts_with("too many changes to plan against (git status is over 64 MiB): untracked directories dist/, node_modules/;"), "{why}");
+    assert!(why.contains(".gitignore"), "{why}");
 }

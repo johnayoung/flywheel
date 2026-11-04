@@ -170,6 +170,7 @@ fn ids_fall_back_in_order() {
             name: "shell".into(),
             input: String::new(),
             call: Some("c".into()),
+            subject: None,
         }]
     );
     let bare = codex(json!({"type": "custom_tool_call"}));

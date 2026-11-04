@@ -178,21 +178,15 @@ pub struct Subscription {
 impl Subscription {
     /// Whether an event with `payload` is one this subscription takes:
     /// its `statuses` (when set) name the payload's `status`, its `kinds`
-    /// the session's kind. Deprecated alias, kept until 0.8: `"done"`
-    /// also takes a payload marked `turn_finished` (every finished turn
-    /// is a `done` now, so it matches nothing more; plugins written
-    /// against it keep working).
+    /// the session's kind. (`"done"` hears every finished turn, watched or
+    /// not, once: the `done` each one says. It no longer also takes a
+    /// shown `idle` marked `turn_finished`: that one follows its turn's
+    /// `done`, and taking it too would say the turn twice.)
     pub fn takes(&self, payload: &Value) -> bool {
         let status = payload.get("status").and_then(Value::as_str);
         let kind = payload.pointer("/session/kind").and_then(Value::as_str);
-        let turn_finished = payload
-            .get("turn_finished")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let wanted = |s: &str| self.statuses.iter().any(|w| w == s);
         let status_ok = self.statuses.is_empty()
-            || status.is_some_and(wanted)
-            || (turn_finished && wanted("done"));
+            || status.is_some_and(|s| self.statuses.iter().any(|w| w == s));
         let kind_ok =
             self.kinds.is_empty() || kind.is_some_and(|k| self.kinds.iter().any(|w| w == k));
         status_ok && kind_ok
@@ -1408,7 +1402,7 @@ pub fn plugin_view(state_dir: &Path, plugin: &Plugin) -> Value {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn subscriptions_filter_by_status_and_kind_and_keep_the_turn_finished_alias() {
+    fn subscriptions_filter_by_status_and_kind() {
         let sub = |statuses: &[&str], kinds: &[&str]| super::Subscription {
             on: "status.changed".into(),
             statuses: statuses.iter().map(|s| (*s).to_owned()).collect(),
@@ -1421,9 +1415,10 @@ mod tests {
         assert!(!sub(&["blocked"], &[]).takes(&event("working", "claude", false)));
         assert!(!sub(&[], &["codex"]).takes(&event("done", "claude", true)));
         assert!(sub(&["done"], &["claude"]).takes(&event("done", "claude", true)));
-        // Deprecated: a payload marked turn_finished is a `done`.
-        assert!(sub(&["done"], &[]).takes(&event("idle", "claude", true)));
-        assert!(!sub(&["done"], &[]).takes(&event("idle", "claude", false)));
+        // A watched turn's idle (turn_finished) follows its done: "done"
+        // takes the done only, "idle" the idle.
+        assert!(!sub(&["done"], &[]).takes(&event("idle", "claude", true)));
+        assert!(sub(&["idle"], &[]).takes(&event("idle", "claude", true)));
     }
 
     use super::*;

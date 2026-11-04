@@ -400,36 +400,83 @@ fn transcript_reading_stops_at_the_deadline_and_resumes() {
 #[test]
 fn a_tool_call_is_labelled_by_what_it_does() {
     use super::transcripts::call_label;
-    for (text, want) in [
+    use crate::agentlog::{tool_subject, tool_text};
+    use serde_json::json;
+    // As the transcript gives it: the tool and its input.
+    let label = |name: &str, input: serde_json::Value| {
+        let text = format!("{name}\n{}", tool_text(&input));
+        call_label(&text, tool_subject(&input).as_deref())
+    };
+    for (name, input, want) in [
         (
-            "Bash\ncommand: cargo test -p x\ndescription: Run the tests",
+            "Bash",
+            json!({"command": "cargo test -p x", "description": "Run the tests"}),
             "Bash: cargo test -p x",
         ),
         (
-            "Edit\nreplace_all: false\nfile_path: /src/lib.rs\nold_string: a",
+            "Edit",
+            json!({"replace_all": false, "file_path": "/src/lib.rs", "old_string": "a"}),
             "Edit: /src/lib.rs",
         ),
-        ("Grep\npattern: fn main\npath: src", "Grep: fn main"),
         (
-            "shell\ncommand: [\"bash\",\"-lc\",\"cargo test\"]\nworkdir: /w",
+            "Grep",
+            json!({"pattern": "fn main", "path": "src"}),
+            "Grep: fn main",
+        ),
+        (
+            "shell",
+            json!({"command": ["bash", "-lc", "cargo test"], "workdir": "/w"}),
             "shell: cargo test",
         ),
-        ("shell\ncommand: [\"git\",\"status\"]", "shell: git status"),
         (
-            "apply_patch\n*** Begin Patch\n*** Update File: src/lib.rs\n@@",
+            "shell",
+            json!("{\"command\":[\"git\",\"status\"]}"),
+            "shell: git status",
+        ),
+        (
+            "apply_patch",
+            json!("*** Begin Patch\n*** Update File: src/lib.rs\n@@"),
             "apply_patch: src/lib.rs",
         ),
-        ("shell\nls -la", "shell: ls -la"),
+        ("shell", json!("ls -la"), "shell: ls -la"),
         (
-            "AskUserQuestion\nquestions:\n  - question: Which color?\n    options:\n      - label: Red\n        description: Warm",
+            "AskUserQuestion",
+            json!({"questions": [{"question": "Which color?", "options": [{"label": "Red", "description": "Warm"}]}]}),
             "AskUserQuestion: Which color?",
         ),
-        ("TodoRead", "TodoRead"),
+        // A file's content naming a command (YAML) is not the call's.
+        (
+            "Write",
+            json!({"file_path": "/app/docker-compose.yml", "content": "services:\n  web:\ncommand: npm start\n    command: npm start\n"}),
+            "Write: /app/docker-compose.yml",
+        ),
+        (
+            "Edit",
+            json!({"old_string": "cmd: a\ncommand: b", "file_path": "/ci.yml", "new_string": "command: c"}),
+            "Edit: /ci.yml",
+        ),
+        // A many-line command is one line, all of it.
+        (
+            "Bash",
+            json!({"command": "cat > /tmp/x <<'EOF'\ncargo build\nEOF"}),
+            "Bash: cat > /tmp/x <<'EOF' cargo build EOF",
+        ),
+        ("TodoRead", json!({}), "TodoRead"),
     ] {
-        assert_eq!(call_label(text), want, "{text}");
+        assert_eq!(label(name, input.clone()), want, "{input}");
     }
-    let long = format!("Bash\ncommand: {}", "x".repeat(200));
-    let label = call_label(&long);
-    assert!(label.ends_with('\u{2026}'), "{label}");
-    assert_eq!(label.chars().count(), "Bash: ".len() + 81);
+    let long = label("Bash", json!({"command": "x ".repeat(100)}));
+    assert!(long.ends_with('\u{2026}'), "{long}");
+    assert_eq!(long.chars().count(), "Bash: ".len() + 81);
+    // A long path keeps its file name: cut from the start.
+    let path = format!(
+        "/home/u/code/{}/file_with_long_name_that_goes_on.rs",
+        "deep/".repeat(20)
+    );
+    let cut = label("Edit", json!({"file_path": path}));
+    assert!(
+        cut.starts_with("Edit: \u{2026}") && cut.ends_with("/file_with_long_name_that_goes_on.rs"),
+        "{cut}"
+    );
+    assert_eq!(cut.chars().count(), "Edit: ".len() + 80);
 }

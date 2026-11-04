@@ -1306,6 +1306,29 @@ try {
   shownResults = await results();
   check(!shownResults[0].open, "transcript: a result block collapses");
   await seenPage.screenshot({ path: path.join(out, "desktop-transcript-results.png") });
+  // Opened from a search hit, a result's match is marked in place (not
+  // the array of nodes stringified).
+  await seenPage.evaluate((id) => search.openTranscript({ session_id: id, session: "watch", workspace: "e2e", kind: "claude", state: "running" }, 2, { text: "line 1", regex: false, caseSensitive: false }), watch.id);
+  await seenPage.waitForSelector("#tx-body .tx-result pre mark", { timeout: 10000 });
+  const markedResult = await seenPage.evaluate(() => {
+    const pre = document.querySelector("#tx-body .tx-msg.kind-result .tx-result pre");
+    return { text: pre.textContent, marks: [...pre.querySelectorAll("mark")].map((m) => m.textContent) };
+  });
+  check(markedResult.text.startsWith("line 1\nline 2") && !markedResult.text.includes("[object") && markedResult.marks[0] === "line 1",
+    `transcript: a search hit's result marks its match (${JSON.stringify(markedResult)})`);
+  // On a phone the call label gets its own line, whole, and the header
+  // stays inside the message.
+  await seenPage.setViewportSize({ width: 390, height: 844 });
+  await seenPage.waitForTimeout(200);
+  const phoneHeads = await seenPage.evaluate(() => [...document.querySelectorAll("#tx-body .tx-msg.kind-result")].map((a) => {
+    const c = a.querySelector(".tx-call");
+    const head = a.querySelector(".tx-msg-head");
+    const right = Math.max(...[...head.children].map((n) => n.getBoundingClientRect().right));
+    return { call: c.textContent, cut: c.scrollWidth > c.clientWidth, over: right > a.getBoundingClientRect().right + 1 };
+  }));
+  check(phoneHeads.length === 2 && phoneHeads.every((h) => !h.cut && !h.over), `transcript: on a phone call labels show whole, the header fits (${JSON.stringify(phoneHeads)})`);
+  await seenPage.screenshot({ path: path.join(out, "phone-transcript-results.png") });
+  await seenPage.setViewportSize({ width: 1440, height: 900 });
   await seenCtx.close();
 } finally {
   if (browser) await browser.close();

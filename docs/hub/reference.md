@@ -296,69 +296,69 @@ command = ["./summarize.py"]  # optional: else the top-level one
 
 ## Keyboard shortcuts
 
-Defaults, all rebindable (Settings > Keyboard names each). `mod` = Ctrl (Cmd on macOS); `alt` = Alt (Ctrl Option on macOS); `prefix.*` keys follow `prefix.arm` when the pane prefix is on (twice sends `^B`); `palette.open` pressed inside the palette goes to the terminal.
+Defaults, all rebindable in Settings > Keyboard. `mod` = Ctrl (Cmd on macOS); `alt` = Alt (Ctrl Option on macOS); `prefix.*` keys follow `prefix.arm` when the pane prefix is on (twice sends `^B`); `palette.open` pressed inside the palette goes to the terminal.
 
-| Action | Default |
-|---|---|
-| `palette.open` | `mod+k` |
-| `search.open` | `mod+shift+f` |
-| `settings.open` | `alt+,` |
-| `keys.show` | - |
-| `session.new` | `alt+n` |
-| `workspace.new` | `alt+shift+n` |
-| `session.jump` | `alt+1..9` |
-| `session.prev` | `alt+up` |
-| `session.next` | `alt+down` |
-| `session.rename` | `alt+r` |
-| `session.close` | `alt+w` |
-| `share.open` | - |
-| `record.toggle` | - |
-| `commands.toggle` | `alt+c` |
-| `commands.copy_last` | `alt+shift+c` |
-| `companion.flip` | `` alt+` `` |
-| `flywheel.toggle` | `alt+f` |
-| `review.toggle` | `alt+g` |
-| `handoff.send` | - |
-| `review.ask` | - |
-| `queue.toggle` | `alt+q` |
-| `fanout.open` | - |
-| `fanout.new` | - |
-| `pane.split_right` | `alt+\` |
-| `pane.split_down` | `alt+-` |
-| `pane.focus_left` | `alt+shift+left` |
-| `pane.focus_down` | `alt+shift+down` |
-| `pane.focus_up` | `alt+shift+up` |
-| `pane.focus_right` | `alt+shift+right` |
-| `pane.resize_left` | `alt+shift+h` |
-| `pane.resize_down` | `alt+shift+j` |
-| `pane.resize_up` | `alt+shift+k` |
-| `pane.resize_right` | `alt+shift+l` |
-| `pane.zoom` | `alt+z` |
-| `pane.close` | `alt+x` |
-| `tab.new` | `alt+t` |
-| `tab.prev` | `alt+pageup` |
-| `tab.next` | `alt+pagedown` |
-| `prefix.arm` | `ctrl+b` |
-| `prefix.split_right` | `%` |
-| `prefix.split_down` | `"` |
-| `prefix.focus_left` | `left` |
-| `prefix.focus_down` | `down` |
-| `prefix.focus_up` | `up` |
-| `prefix.focus_right` | `right` |
-| `prefix.resize_left` | `ctrl+left` |
-| `prefix.resize_down` | `ctrl+down` |
-| `prefix.resize_up` | `ctrl+up` |
-| `prefix.resize_right` | `ctrl+right` |
-| `prefix.zoom` | `z` |
-| `prefix.close_pane` | `x` |
-| `prefix.new_tab` | `c` |
-| `prefix.next_tab` | `n` |
-| `prefix.prev_tab` | `p` |
-| `prefix.tab` | `1..9` |
-| `prefix.rename_tab` | `,` |
-| `prefix.close_tab` | `&` |
-| `prefix.next_pane` | `o` |
-| `prefix.help` | `?` |
+| Action | Default | Does |
+|---|---|---|
+| `palette.open` | `mod+k` | Command palette (pressed again inside it: the key goes to the terminal) |
+| `search.open` | `mod+shift+f` | Search every session |
+| `settings.open` | `alt+,` | Settings |
+| `keys.show` | - | Keyboard shortcuts |
+| `session.new` | `alt+n` | New session |
+| `workspace.new` | `alt+shift+n` | New workspace |
+| `session.jump` | `alt+1..9` | Jump to the nth session |
+| `session.prev` | `alt+up` | Previous session |
+| `session.next` | `alt+down` | Next session |
+| `session.rename` | `alt+r` | Rename the attached session |
+| `session.close` | `alt+w` | Close the attached session |
+| `share.open` | - | Share the attached session (read-only link) |
+| `record.toggle` | - | Start or stop recording the attached session |
+| `commands.toggle` | `alt+c` | Suggested commands drawer |
+| `commands.copy_last` | `alt+shift+c` | Copy the last suggested shell command |
+| `companion.flip` | `` alt+` `` | Flip between an agent and its companion shell |
+| `flywheel.toggle` | `alt+f` | Flywheel panel |
+| `review.toggle` | `alt+g` | Review the attached session's git work |
+| `handoff.send` | - | Send the terminal selection to another agent |
+| `review.ask` | - | Ask an agent of the other kind to review the attached session |
+| `queue.toggle` | `alt+q` | Prompt queue of the attached agent |
+| `fanout.open` | - | Verified fan-outs |
+| `fanout.new` | - | New verified fan-out |
+| `pane.split_right` | `alt+\` | Split right with a new shell |
+| `pane.split_down` | `alt+-` | Split down with a new shell |
+| `pane.focus_left` | `alt+shift+left` | Focus the pane to the left |
+| `pane.focus_down` | `alt+shift+down` | Focus the pane below |
+| `pane.focus_up` | `alt+shift+up` | Focus the pane above |
+| `pane.focus_right` | `alt+shift+right` | Focus the pane to the right |
+| `pane.resize_left` | `alt+shift+h` | Move the nearest divider left |
+| `pane.resize_down` | `alt+shift+j` | Move the nearest divider down |
+| `pane.resize_up` | `alt+shift+k` | Move the nearest divider up |
+| `pane.resize_right` | `alt+shift+l` | Move the nearest divider right |
+| `pane.zoom` | `alt+z` | Zoom the focused pane |
+| `pane.close` | `alt+x` | Close the focused pane |
+| `tab.new` | `alt+t` | New tab |
+| `tab.prev` | `alt+pageup` | Previous tab |
+| `tab.next` | `alt+pagedown` | Next tab |
+| `prefix.arm` | `ctrl+b` | The pane prefix key (with the prefix on) |
+| `prefix.split_right` | `%` | Split right |
+| `prefix.split_down` | `"` | Split down |
+| `prefix.focus_left` | `left` | Focus left |
+| `prefix.focus_down` | `down` | Focus down |
+| `prefix.focus_up` | `up` | Focus up |
+| `prefix.focus_right` | `right` | Focus right |
+| `prefix.resize_left` | `ctrl+left` | Move the divider left |
+| `prefix.resize_down` | `ctrl+down` | Move the divider down |
+| `prefix.resize_up` | `ctrl+up` | Move the divider up |
+| `prefix.resize_right` | `ctrl+right` | Move the divider right |
+| `prefix.zoom` | `z` | Zoom |
+| `prefix.close_pane` | `x` | Close the pane |
+| `prefix.new_tab` | `c` | New tab |
+| `prefix.next_tab` | `n` | Next tab |
+| `prefix.prev_tab` | `p` | Previous tab |
+| `prefix.tab` | `1..9` | The nth tab |
+| `prefix.rename_tab` | `,` | Rename the tab |
+| `prefix.close_tab` | `&` | Close the tab |
+| `prefix.next_pane` | `o` | Next pane |
+| `prefix.help` | `?` | Keyboard shortcuts |
 
 Also: `F2` / double-click renames and `Delete` closes a focused sidebar row.
 

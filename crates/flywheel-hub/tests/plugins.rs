@@ -467,7 +467,9 @@ async fn plugins_receive_events_answer_actions_and_are_bounded() {
     })
     .await;
     assert_eq!(finished["payload"]["previous"], "working", "{finished}");
-    assert_eq!(finished["payload"]["turn_finished"], true, "{finished}");
+    // Deprecated turn_finished marks what the turn shows (the idle that
+    // follows, not delivered here), as it always did.
+    assert_eq!(finished["payload"]["turn_finished"], false, "{finished}");
     let (_, view) = hub.call(reqwest::Method::GET, &path, None).await;
     assert_eq!(view["agent"]["status"], "idle", "seen at once: {view}");
     tokio::time::sleep(Duration::from_millis(300)).await;

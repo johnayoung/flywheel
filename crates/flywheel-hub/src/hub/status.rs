@@ -436,36 +436,19 @@ impl Hub {
         let Some(session) = self.event_session(id) else {
             return;
         };
-        // `seen` (on a finished turn's `done` only): someone watched it
-        // finish. `turn_finished` (deprecated, same events; removed in
-        // 0.8): kept for plugins written against it, as is `statuses =
-        // ["done"]` taking it (see `Subscription::takes`).
-        let changed = |status: AgentStatus, previous: Option<AgentStatus>, seen: Option<bool>| {
+        for change in status_changes(finished, before.shown(), view.status) {
             self.emit_lifecycle(
                 "status.changed",
                 serde_json::json!({
                     "session": session,
-                    "status": status,
-                    "previous": previous,
+                    "status": change.status,
+                    "previous": change.previous,
                     "detail": view.detail,
                     "since": view.since,
-                    "seen": seen,
-                    "turn_finished": seen.is_some(),
+                    "seen": change.seen,
+                    "turn_finished": change.turn_finished,
                 }),
             );
-        };
-        let mut previous = before.shown();
-        // Every finished turn says `done` once, as the activity journal's
-        // `turn.finished` does -- also one shown `idle` at once (ended
-        // while someone watched: `seen`, then `idle` follows) or one the
-        // board already showed `done` (an unseen turn, then another).
-        if finished {
-            let seen = view.status != AgentStatus::Done;
-            changed(AgentStatus::Done, previous, Some(seen));
-            previous = Some(AgentStatus::Done);
-        }
-        if previous != Some(view.status) {
-            changed(view.status, previous, None);
         }
     }
 
@@ -548,5 +531,99 @@ impl Hub {
         let workspace = board.workspace_of(session_id)?.to_owned();
         let rollup = board.workspace_status(&workspace, Audience::Client(client), &graded);
         Some((view, workspace, rollup))
+    }
+}
+
+/// One `status.changed` a status change announces to plugins.
+#[derive(Debug, PartialEq, Eq)]
+struct StatusChange {
+    status: AgentStatus,
+    previous: Option<AgentStatus>,
+    /// On a finished turn's `done` only: someone watched it finish.
+    seen: Option<bool>,
+    /// Deprecated, removed in 0.8, meaning what it always did: the event
+    /// whose status is what the finished turn shows -- `done`, or `idle`
+    /// when someone watched it end. A seen turn's announced `done` is not.
+    turn_finished: bool,
+}
+
+/// The `status.changed` events for a change from shown status `previous`
+/// to `shown` (`finished`: a turn finished in it). Every finished turn
+/// says `done` once, as the activity journal's `turn.finished` does --
+/// also one shown `idle` at once (ended while someone watched: `seen`,
+/// then `idle` follows) or one the board already showed `done` (an unseen
+/// turn, then another). Else only a change of what is shown.
+fn status_changes(
+    finished: bool,
+    mut previous: Option<AgentStatus>,
+    shown: AgentStatus,
+) -> Vec<StatusChange> {
+    let mut out = Vec::new();
+    if finished {
+        let seen = shown != AgentStatus::Done;
+        out.push(StatusChange {
+            status: AgentStatus::Done,
+            previous,
+            seen: Some(seen),
+            turn_finished: !seen,
+        });
+        previous = Some(AgentStatus::Done);
+    }
+    if previous != Some(shown) {
+        out.push(StatusChange {
+            status: shown,
+            previous,
+            seen: None,
+            turn_finished: finished,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentStatus::*, StatusChange, status_changes};
+
+    fn change(
+        status: crate::status::AgentStatus,
+        previous: Option<crate::status::AgentStatus>,
+        seen: Option<bool>,
+        turn_finished: bool,
+    ) -> StatusChange {
+        StatusChange {
+            status,
+            previous,
+            seen,
+            turn_finished,
+        }
+    }
+
+    #[test]
+    fn a_finished_turn_says_done_once_and_turn_finished_marks_what_it_shows() {
+        // Unseen: one done, the turn's.
+        assert_eq!(
+            status_changes(true, Some(Working), Done),
+            [change(Done, Some(Working), Some(false), true)]
+        );
+        // Watched: done (seen), then idle, the shown one, turn_finished as
+        // it always was (an `idle` subscriber still hears the finish).
+        assert_eq!(
+            status_changes(true, Some(Working), Idle),
+            [
+                change(Done, Some(Working), Some(true), false),
+                change(Idle, Some(Done), None, true),
+            ]
+        );
+        // Done already shown, another turn unseen: still one done.
+        assert_eq!(
+            status_changes(true, Some(Done), Done),
+            [change(Done, Some(Done), Some(false), true)]
+        );
+        // No turn finished: only a change of what is shown.
+        assert_eq!(
+            status_changes(false, Some(Working), Blocked),
+            [change(Blocked, Some(Working), None, false)]
+        );
+        assert!(status_changes(false, Some(Idle), Idle).is_empty());
     }
 }

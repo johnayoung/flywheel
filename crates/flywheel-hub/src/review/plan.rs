@@ -213,14 +213,64 @@ fn porcelain(git: &Git<'_>, extra: &[&str]) -> Result<Vec<u8>, String> {
         "--no-renames",
     ];
     args.extend_from_slice(extra);
-    let status = git.raw(&args, READ_LIMIT)?;
+    let status = git.raw(&args, STATUS_LIMIT)?;
     if !status.success() {
         return Err(status.error_text());
     }
     if status.truncated {
-        return Err("too many changes to plan against (git status is cut)".into());
+        return Err(too_many_changes(git));
     }
     Ok(status.stdout)
+}
+
+/// How much of `git status` a plan reads (every changed path, one entry
+/// each): far past the review's cut, bounded all the same.
+const STATUS_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Why a work tree is past planning: its `git status` is over
+/// [`STATUS_LIMIT`]. Names the untracked directories (each one entry in a
+/// collapsed read), which are almost always what holds it: a
+/// `node_modules/` or a build directory with no `.gitignore`.
+pub(super) fn too_many_changes(git: &Git<'_>) -> String {
+    let base = format!(
+        "too many changes to plan against (git status is over {} MiB)",
+        STATUS_LIMIT / (1024 * 1024)
+    );
+    let collapsed = git.raw(
+        &[
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=normal",
+            "--no-renames",
+        ],
+        READ_LIMIT,
+    );
+    let dirs: Vec<String> = match collapsed {
+        Ok(out) if out.success() => status_entries(&out.stdout)
+            .into_iter()
+            .filter(|(entry, path)| entry.first() == Some(&b'?') && path.ends_with('/'))
+            .map(|(_, path)| path)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if dirs.is_empty() {
+        return format!("{base}; commit in the terminal");
+    }
+    let shown: Vec<&str> = dirs.iter().take(3).map(String::as_str).collect();
+    let more = match dirs.len() {
+        n if n > 3 => format!(" and {} more", n - 3),
+        _ => String::new(),
+    };
+    format!(
+        "{base}: untracked {} {}{more}; list what is not source (node_modules/, build output) in .gitignore",
+        if dirs.len() == 1 {
+            "directory"
+        } else {
+            "directories"
+        },
+        shown.join(", ")
+    )
 }
 
 /// Each path `status` names, with what the work tree holds there.
@@ -533,10 +583,14 @@ fn looks_secret(path: &str) -> bool {
     ];
     const EXAMPLES: &[&str] = &["example", "sample", "template", "dist"];
     let name = path.rsplit('/').next().unwrap_or(path);
+    // `.env`, `.env.local`, `prod.env`; not `.env.example`, `sample.env`.
     let dotenv = name == ".env"
         || name
             .strip_prefix(".env.")
-            .is_some_and(|rest| !EXAMPLES.contains(&rest.rsplit('.').next().unwrap_or(rest)));
+            .is_some_and(|rest| !EXAMPLES.contains(&rest.rsplit('.').next().unwrap_or(rest)))
+        || name.strip_suffix(".env").is_some_and(|stem| {
+            !stem.is_empty() && !EXAMPLES.contains(&stem.rsplit('.').next().unwrap_or(stem))
+        });
     dotenv
         || NAMES.contains(&name)
         || name
@@ -668,23 +722,23 @@ pub fn plan_commit(
     };
     let left_out = |path: &str| excluded.iter().any(|e| covers(e, path));
     let mut details = Vec::new();
-    let mut listed = std::collections::HashSet::new();
-    for f in review.staged.files.iter().filter(|f| !left_out(&f.path)) {
-        details.push(change_line("staged ", f));
-        listed.insert(f.path.as_str());
-    }
-    for f in review.unstaged.files.iter().filter(|f| !left_out(&f.path)) {
-        details.push(change_line("", f));
-        listed.insert(f.path.as_str());
+    // The paths the lines name: a rename's line names both its paths,
+    // each a change of its own in `changed` (renames off there).
+    let mut named = std::collections::HashSet::new();
+    for (prefix, set) in [("staged ", &review.staged), ("", &review.unstaged)] {
+        for f in set.files.iter().filter(|f| !left_out(&f.path)) {
+            details.push(change_line(prefix, f));
+            named.insert(f.path.as_str());
+            named.extend(f.old_path.as_deref());
+        }
     }
     for u in review.untracked.iter().filter(|u| !left_out(&u.path)) {
         details.push(format!("new {}", u.path));
-        listed.insert(u.path.as_str());
+        named.insert(u.path.as_str());
     }
-    let files = changed.iter().filter(|p| !left_out(p)).count();
-    // A rename's old path is a change of its own in `changed` (renames
-    // off), one line here: never list more than there are.
-    let listed = listed.len().min(files);
+    let committed: Vec<&str> = changed.iter().copied().filter(|p| !left_out(p)).collect();
+    let files = committed.len();
+    let listed = committed.iter().filter(|p| named.contains(*p)).count();
     let out = changed.len() - files;
     if files == 0 && refusal.is_none() {
         refusal = Some("every change is left out: nothing to commit".into());
@@ -701,7 +755,7 @@ pub fn plan_commit(
         && (review.untracked_truncated || review.unstaged.truncated || review.staged.truncated)
     {
         warnings.push(format!(
-            "{} committed; the list names {listed} (cut at {MAX_FILES} per set; what is left out was checked against all)",
+            "{} to commit, {listed} of them listed (cut at {MAX_FILES} per set; what is left out was checked against all)",
             plural(files, "file")
         ));
     }
@@ -1078,6 +1132,9 @@ mod tests {
             "store.p12",
             "home/id_ed25519",
             ".netrc",
+            "zz.env",
+            "deploy/prod.env",
+            "secrets.env",
         ] {
             assert!(looks_secret(path), "{path}");
         }
@@ -1089,6 +1146,9 @@ mod tests {
             "keys.md",
             "src/env.rs",
             ".key",
+            "sample.env",
+            "config/example.env",
+            "env",
         ] {
             assert!(!looks_secret(path), "{path}");
         }

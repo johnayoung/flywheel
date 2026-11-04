@@ -288,7 +288,7 @@ command = ["./summarize.py"]       # optional: else the top-level one
 | Section | |
 |---|---|
 | Appearance | theme, terminal font, text size (13, phones 11), density |
-| Terminal | client scrollback (the hub's: `sessions.scrollback_lines`), cursor style / blink, ligatures outside terminals (off), lite mode (auto; per device) |
+| Terminal | client scrollback (the hub's: `sessions.scrollback_lines`), cursor style / blink, ligatures (off), lite mode (auto; per device) |
 | Keyboard | pane prefix, key bar, companion key mode, tour; every shortcut |
 | Notifications | system notifications (device), command toasts |
 | Agents | the new-session form's defaults per kind |

@@ -266,7 +266,7 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `session.created` | - |
 | `session.exited` | `exit`, `hub_stopping` (`fw hub stop` hung it up) |
 | `session.removed` | - |
-| `status.changed` | `status`, `previous`, `detail` |
+| `status.changed` | `status`, `previous`, `detail`, `turn_finished` (`"done"` matches it) |
 | `review.committed` | `dir`, `head`, `branch`, `base`, `url`, `summary` (every `review.*`) |
 | `review.pushed` | as above |
 | `review.pr_opened` | as above |

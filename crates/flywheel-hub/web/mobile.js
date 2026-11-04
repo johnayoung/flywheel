@@ -179,24 +179,34 @@ window.FwHubPrompt = (function () {
       }
     }
     // Programs that wrap their own lines (Claude's TUI) continue an
-    // option on indented lines before the next one.
+    // option on indented lines before the next one: more of its label
+    // while the line above was wrapped (filled to the screen's width, the
+    // widest line), its description (AskUserQuestion's) from the first
+    // line that starts where a short one left room.
+    const width = Math.max(...lines.map((l) => l.trimEnd().length));
     run.forEach((option, i) => {
       const next = run[i + 1];
+      option.detail = "";
       if (!next) return;
+      let above = lines[option.index].trimEnd().length;
       for (let j = option.index + 1; j < next.index; j++) {
         // A rule between options (Claude's question puts one above "Chat
         // about this") is not more of the option.
         if (!bare(lines[j])) continue;
         const more = lines[j].replace(/[│┃|]/g, "").trim();
-        if (more) option.text += ` ${more}`;
+        if (!more) continue;
+        const wrapped = !option.detail && above + 1 + more.split(/\s/)[0].length > width;
+        if (wrapped) option.text += ` ${more}`;
+        else option.detail += `${option.detail ? " " : ""}${more}`;
+        above = lines[j].trimEnd().length;
       }
     });
     return {
       question,
-      options: run.map(({ n, text }) => {
+      options: run.map(({ n, text, detail }) => {
         const hotkey = HOTKEY.exec(text);
         const label = text.replace(HOTKEY, "").replace(HINT, "").trim();
-        return { label: `${n}  ${label}`, seq: hotkey ? hotkey[1].toLowerCase() : String(n) };
+        return { label: `${n}  ${label}`, detail, seq: hotkey ? hotkey[1].toLowerCase() : String(n) };
       }),
     };
   }
@@ -573,9 +583,10 @@ window.FwHubMobile = function (ctx) {
         type: "button",
         className: "qa",
         textContent: option.label,
-        title: `Answer: ${option.label}`,
+        title: `Answer: ${option.label}${option.detail ? ` (${option.detail})` : ""}`,
         onclick: answer(option.seq),
       });
+      if (option.detail) button.append(el("span", { className: "qa-detail", textContent: option.detail }));
       holdFocus(button);
       return button;
     });

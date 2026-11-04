@@ -41,7 +41,7 @@
     U+25D0-25D3, U+25D6-25E5, U+25EC-25EE, U+25F0-25F5, U+25F7-266C,
     U+266E, U+2670-2686, U+2688-269F, U+26A2-2712, U+2714, U+2716,
     U+2718-2735, U+2737-276D, U+2772-2793, U+2795-279B, U+279F-27BF,
-    U+27F0-27F4, U+27F8-28FF;
+    U+27F0-27F4, U+27F8-28FF, U+29C9;
 }
 @font-face {
   font-family: "FW Symbols";
@@ -58,7 +58,8 @@
     U+22A6-22B3, U+22B5-22B7, U+22B9-22BA, U+22BE-22C1, U+22C5, U+22C7,
     U+22CB-22CD, U+22CF, U+22D1-22E1, U+22E3-22ED, U+22F2-22FF,
     U+27C0-27C4, U+27C7-27DB, U+27DD-27E5, U+27EC-27EF, U+2900-2915,
-    U+2917-2949, U+294B-297F, U+2B00-2B57, U+2B59-2B73, U+2B76-2BFF,
+    U+2917-2949, U+294B-2986, U+2989-29C8, U+29CA-29FF, U+2B00-2B57,
+    U+2B59-2B73, U+2B76-2BFF,
     U+1FB00-1FB92, U+1FB94-1FBFA;
 }
 
@@ -171,6 +172,12 @@ a.vw-pill::before, .vw-btn::before { display: none; }
 }
 .vw-term { padding: .5rem; width: max-content; min-width: 100%; }
 .vw-term .xterm { cursor: default; }
+/* Exact text, as in the hub's terminals: no ligatures or contextual forms
+   (JetBrains Mono raises a run of backticks into Claude's prompt bar). */
+.vw-term .xterm-rows {
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+}
 .vw-note {
   position: absolute;
   left: 50%;

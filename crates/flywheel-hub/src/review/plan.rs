@@ -306,6 +306,51 @@ fn change_line(prefix: &str, f: &FileChange) -> String {
     }
 }
 
+/// Whether a new file looks like a build or tool artifact (bytecode,
+/// objects, dependency and cache directories) rather than source.
+fn looks_generated(path: &str) -> bool {
+    const DIRS: &[&str] = &[
+        "__pycache__",
+        "node_modules",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        ".gradle",
+        ".next",
+    ];
+    const EXTENSIONS: &[&str] = &["pyc", "pyo", "o", "obj", "class"];
+    let parts: Vec<&str> = path.split('/').collect();
+    let name = parts.last().copied().unwrap_or(path);
+    parts[..parts.len() - 1].iter().any(|d| DIRS.contains(d))
+        || name == ".DS_Store"
+        || name
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && EXTENSIONS.contains(&ext))
+        || path.starts_with("target/debug/")
+        || path.starts_with("target/release/")
+}
+
+/// A commit plan's warning about new files that look generated (they are
+/// staged with the rest): the first few named.
+fn generated_warning<'a>(new_files: impl Iterator<Item = &'a str>) -> Option<String> {
+    let generated: Vec<&str> = new_files.filter(|p| looks_generated(p)).collect();
+    let first = generated.first()?;
+    let more = match generated.len() {
+        1 => String::new(),
+        n => format!(" and {} more", n - 1),
+    };
+    Some(format!(
+        "{} {first}{more} look{} generated and will be committed too; \
+         list {} in .gitignore to leave {} out",
+        plural(generated.len(), "new file"),
+        if generated.len() == 1 { "s" } else { "" },
+        if generated.len() == 1 { "it" } else { "them" },
+        if generated.len() == 1 { "it" } else { "them" },
+    ))
+}
+
 /// Plan committing every change (staged, unstaged, untracked) with
 /// `message`.
 pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan, String> {
@@ -362,6 +407,9 @@ pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan
             "more than {MAX_FILES} files change; the list is cut"
         ));
     }
+    warnings.extend(generated_warning(
+        review.untracked.iter().map(|u| u.path.as_str()),
+    ));
     let dir = &target.dir;
     let add = Planned::new(
         &tools.git,
@@ -583,5 +631,46 @@ pub(super) fn refused(action: &'static str, why: &str) -> Plan {
         needs_rebase: false,
         defaults: None,
         contents: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_build_artifacts_are_warned_about() {
+        for path in [
+            "__pycache__/calc.cpython-313.pyc",
+            "pkg/__pycache__/x.txt",
+            "web/node_modules/a/index.js",
+            "Main.class",
+            "src/lib.o",
+            ".DS_Store",
+            "target/debug/app",
+        ] {
+            assert!(looks_generated(path), "{path}");
+        }
+        for path in [
+            "calc.py",
+            "src/target.rs",
+            "build.rs",
+            "docs/obj.md",
+            ".o",
+            "target/README.md",
+        ] {
+            assert!(!looks_generated(path), "{path}");
+        }
+        assert_eq!(generated_warning(["calc.py", "notes.md"].into_iter()), None);
+        assert_eq!(
+            generated_warning(["calc.py", "__pycache__/calc.cpython-313.pyc"].into_iter()).unwrap(),
+            "1 new file __pycache__/calc.cpython-313.pyc looks generated and will be committed \
+             too; list it in .gitignore to leave it out"
+        );
+        let two = generated_warning(["a.pyc", "b.pyc"].into_iter()).unwrap();
+        assert!(
+            two.starts_with("2 new files a.pyc and 1 more look generated"),
+            "{two}"
+        );
     }
 }

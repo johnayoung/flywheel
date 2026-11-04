@@ -418,6 +418,61 @@ async fn plugins_receive_events_answer_actions_and_are_bounded() {
             .any(|e| e["payload"]["status"] == "working"),
         "working is filtered out"
     );
+    // A turn that ends while a client views the session shows idle at
+    // once (never done), and a "done" subscription still hears it.
+    let mut request = format!("ws://{}/api/events?client=watcher", hub.addr)
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {}", hub.token).parse().unwrap(),
+    );
+    let (mut watcher, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    futures_util::SinkExt::send(
+        &mut watcher,
+        Message::Text(
+            json!({"type": "view", "session_id": claude["id"]})
+                .to_string()
+                .into(),
+        ),
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (_, view) = hub.call(reqwest::Method::GET, &path, None).await;
+        if view["agent"]["status"] == "idle" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never seen: {view}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let before = recorded(&hello).len();
+    fire(&env, "UserPromptSubmit", json!({"prompt": "again"}));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (_, view) = hub.call(reqwest::Method::GET, &path, None).await;
+        if view["agent"]["status"] == "working" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never working: {view}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    fire(&env, "Stop", json!({}));
+    let finished = wait_event(&hello, |e| {
+        e["event"] == "status.changed"
+            && e["payload"]["turn_finished"] == true
+            && e["payload"]["status"] == "idle"
+    })
+    .await;
+    assert_eq!(finished["payload"]["previous"], "working", "{finished}");
+    assert_eq!(
+        recorded(&hello).len(),
+        before + 1,
+        "only the finished turn reached the plugin (not working, not seen)"
+    );
+    drop(watcher);
 
     // An action's toast.
     let said = hub

@@ -526,6 +526,11 @@
   letter-spacing: 0;
   text-transform: none;
 }
+/* A phone: each picker's label above it, so the select has the sheet's
+   width ("new shell in repo1 (companion)" whole at 16px). */
+@media (max-width: 760px) {
+  .cmd-field { flex-basis: 100%; flex-direction: column; align-items: stretch; gap: .25rem; }
+}
 .cmd-check { display: inline-flex; align-items: center; gap: .35rem; color: var(--ink-2); font-size: 11px; }
 .cmd-check input { accent-color: var(--signal); }
 

@@ -110,9 +110,11 @@ body.density-compact .session { min-height: 1.6rem; padding-top: .05rem; padding
 body.density-compact .side-foot, body.density-compact .side-actions { gap: .25rem; }
 body.density-compact .pane-head { height: 1.35rem; }
 
-/* Transcripts, suggested commands, run output, and diffs show text exactly
-   as written: no ligatures (-> != ===) unless Settings turns them on. */
-body:not(.ligatures) :is(.tx-body, #cmd-list, #run-body, .rv-diff, #search-results, .fw-run-sheet) {
+/* Transcripts, suggested commands, run output, diffs, terminals, and the
+   handoff text show text exactly as written: no ligatures (-> != ===) or
+   contextual forms (JetBrains Mono raises a run of backticks above the
+   line, into Claude's prompt bar) unless Settings turns them on. */
+body:not(.ligatures) :is(.tx-body, #cmd-list, #run-body, .rv-diff, #search-results, .fw-run-sheet, .xterm-rows, #ho-text) {
   font-variant-ligatures: none;
   font-feature-settings: "liga" 0, "calt" 0;
 }

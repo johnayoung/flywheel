@@ -112,12 +112,12 @@ Keys: [hub-reference](reference.md#keyboard-shortcuts).
 ## Web UI
 
 - Sidebar: machines > workspaces (rollup chip) > sessions (status dot, `↑ahead ↓behind ~changed ?untracked`); companions under their agent; blocked rows show the question. Folder chips: filled = git, hollow = plain, struck = missing.
-- Title and favicon count blocked and done. `#session=<id>` survives reloads; a dropped or silent (no pong 6 s after a ping) socket keeps the screen and reconnects (2 s for 30 s, then up to 10 s) with what it missed.
+- Title and favicon count blocked and done. `#session=<id>` survives reloads; a dropped or silent (no pong in 6 s) socket keeps the screen and reconnects (2 s for 30 s, then up to 10 s) with what it missed.
 - Keys typed while down wait (`N queued`), sent in order once back; dropped, and said, if the session changed (epoch). No local echo; unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
-- Drawers (Commands, Flywheel, Review, Queue): one width at the stage's right edge; phone: full-screen sheets (Flywheel closes on switching folders).
+- Drawers (Commands, Flywheel, Review, Queue): one width, stage's right edge; phone: full-screen sheets (Flywheel closes on switching folders).
 - Ended sessions: Relaunch, Close; relaunched elsewhere: reattaches; removed elsewhere: pane goes (toast).
-- New workspace: paths or **Import VS Code workspace**. New session: kind, folder, worktree. First run: import offers, a 30-second tour.
-- Themes: auto, dark, light (low-contrast TUI colours lifted to 4.5:1).
+- New workspace: paths or **Import VS Code workspace**. New session: kind, folder, worktree. First run: import offers, a 30 s tour.
+- Themes: auto, dark, light (dim TUI colours lifted to 4.5:1).
 - Embedded (licenses in `web/vendor/`): xterm.js 6.0.0 (+ fit, web-links, search); OFL fonts. Terminal: JetBrains Mono 2.304, then JuliaMono for its gaps (`tests/glyphs.rs`).
 
 ## Phone

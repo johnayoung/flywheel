@@ -171,8 +171,8 @@ pub const PREFS: &[PrefSpec] = &[
     PrefSpec {
         id: "terminal.transcript_ligatures",
         section: "terminal",
-        label: "Ligatures in transcripts and commands",
-        help: "off keeps -> != === exactly as typed",
+        label: "Ligatures in terminals, transcripts and commands",
+        help: "off keeps -> != === and ``` exactly as typed",
         kind: PrefKind::Bool,
         default: PrefDefault::Bool(false),
         device_only: false,

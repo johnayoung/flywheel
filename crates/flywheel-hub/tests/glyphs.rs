@@ -5,7 +5,10 @@
 //! dingbats), is in a vendored font's character map -- never left to
 //! whatever a device has (a tofu box on most phones). Read from the
 //! embedded woff2 files themselves; the stylesheets' "FW Symbols"
-//! unicode-range is checked against its font's real map.
+//! unicode-range is checked against its font's real map, and coverage is
+//! what the browser uses: JetBrains Mono's map plus those ranges (a
+//! character in a subset's map but outside its face's range is never
+//! drawn from it).
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -174,52 +177,71 @@ fn symbol_faces_name_only_what_their_fonts_draw() {
     }
 }
 
+/// What a stylesheet's terminal stack draws from vendored fonts:
+/// JetBrains Mono's map plus each "FW Symbols" face's unicode-range
+/// (`core` = the preloaded first face only). The ranges, not the subsets'
+/// maps: the browser picks a face by its range.
+fn drawn(css: &str, core: bool) -> BTreeSet<u32> {
+    let mut drawn = woff2_codepoints(TERM);
+    let faces = symbol_faces(css);
+    let take = if core { 1 } else { faces.len() };
+    for (_, range) in faces.into_iter().take(take) {
+        drawn.extend(range);
+    }
+    drawn
+}
+
 #[test]
 fn every_character_real_claude_sessions_print_is_drawn() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-glyphs.txt");
     let text = std::fs::read_to_string(&fixture).unwrap();
-    let term = woff2_codepoints(TERM);
-    // The face every agent's first screen needs is preloaded: these must
-    // not wait for the lazily fetched extended face.
-    let core = woff2_codepoints("juliamono-symbols.woff2");
-    let mut missing = Vec::new();
-    let mut seen = 0;
+    let mut cps = Vec::new();
     for line in text.lines().filter(|l| l.starts_with("U+")) {
         let hex = line[2..].split_whitespace().next().unwrap();
-        let cp = u32::from_str_radix(hex, 16).unwrap();
-        seen += 1;
-        if !term.contains(&cp) && !core.contains(&cp) {
-            missing.push(line.to_owned());
-        }
+        cps.push((u32::from_str_radix(hex, 16).unwrap(), line.to_owned()));
     }
-    assert!(seen >= 30, "fixture holds {seen} characters");
-    assert!(
-        missing.is_empty(),
-        "no vendored glyph for:\n{}",
-        missing.join("\n")
-    );
+    assert!(cps.len() >= 30, "fixture holds {} characters", cps.len());
+    for css in ["app.css", "viewer.css"] {
+        // The face every agent's first screen needs is preloaded: these
+        // must not wait for the lazily fetched extended face.
+        let drawn = drawn(css, true);
+        let missing: Vec<&str> = cps
+            .iter()
+            .filter(|(cp, _)| !drawn.contains(cp))
+            .map(|(_, line)| line.as_str())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{css}: no vendored glyph for:\n{}",
+            missing.join("\n")
+        );
+    }
 }
 
 #[test]
 fn tui_blocks_are_covered_whole() {
-    let mut drawn = woff2_codepoints(TERM);
-    drawn.extend(woff2_codepoints("juliamono-symbols.woff2"));
-    drawn.extend(woff2_codepoints("juliamono-symbols-ext.woff2"));
-    for (name, from, to) in [
-        ("Arrows", 0x2190, 0x21FF),
-        ("Miscellaneous Technical", 0x2300, 0x23FF),
-        ("Box Drawing", 0x2500, 0x257F),
-        ("Block Elements", 0x2580, 0x259F),
-        ("Geometric Shapes", 0x25A0, 0x25FF),
-        ("Miscellaneous Symbols", 0x2600, 0x26FF),
-        ("Dingbats", 0x2700, 0x27BF),
-        ("Braille Patterns", 0x2800, 0x28FF),
-    ] {
-        let missing: Vec<String> = (from..=to)
-            .filter(|cp| !drawn.contains(cp))
-            .map(|cp| format!("U+{cp:04X}"))
-            .collect();
-        assert!(missing.is_empty(), "{name}: no glyph for {missing:?}");
+    for css in ["app.css", "viewer.css"] {
+        let drawn = drawn(css, false);
+        for (name, from, to) in [
+            ("Arrows", 0x2190, 0x21FF),
+            ("Miscellaneous Technical", 0x2300, 0x23FF),
+            ("Box Drawing", 0x2500, 0x257F),
+            ("Block Elements", 0x2580, 0x259F),
+            ("Geometric Shapes", 0x25A0, 0x25FF),
+            ("Miscellaneous Symbols", 0x2600, 0x26FF),
+            ("Dingbats", 0x2700, 0x27BF),
+            ("Braille Patterns", 0x2800, 0x28FF),
+            ("Miscellaneous Mathematical Symbols-B", 0x2980, 0x29FF),
+        ] {
+            let missing: Vec<String> = (from..=to)
+                .filter(|cp| !drawn.contains(cp))
+                .map(|cp| format!("U+{cp:04X}"))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{css}: {name}: no glyph for {missing:?}"
+            );
+        }
     }
 }
 

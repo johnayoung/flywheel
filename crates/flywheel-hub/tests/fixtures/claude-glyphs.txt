@@ -43,3 +43,6 @@ U+2736 ✶ SIX POINTED BLACK STAR
 U+273B ✻ TEARDROP-SPOKED ASTERISK
 U+273D ✽ HEAVY TEARDROP-SPOKED ASTERISK
 U+276F ❯ HEAVY RIGHT-POINTING ANGLE QUOTATION MARK ORNAMENT
+# Drawn by the same 2.1.306 build outside these sessions (its IDE
+# selection indicator, "⧉ open files"; found in the binary).
+U+29C9 ⧉ TWO JOINED SQUARES

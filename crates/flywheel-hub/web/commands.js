@@ -367,7 +367,9 @@ window.FwHubCommands = function (ctx) {
         : "";
     }
     if (target.open) {
-      return `No shell runs in ${placeOf(target.open)} yet. Open shell starts ${target.open.name}'s companion shell there, waits for its prompt, then pastes (Run also presses Enter).${flipKey() ? ` ${flipKey()} flips between them.` : ""}`;
+      // The flip's key only where there is a keyboard to press it.
+      const flip = flipKey() && !window.matchMedia("(pointer: coarse)").matches ? ` ${flipKey()} flips between them.` : "";
+      return `No shell runs in ${placeOf(target.open)} yet. Open shell starts ${target.open.name}'s companion shell there, waits for its prompt, then pastes (Run also presses Enter).${flip}`;
     }
     const where = target.session.cwd ? ` in ${placeOf(target.session)}` : "";
     const own = source && target.session.companion_of === source.id ? ` (${source.name}'s companion)` : "";

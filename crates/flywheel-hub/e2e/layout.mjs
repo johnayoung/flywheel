@@ -59,11 +59,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Mono, then the JuliaMono "FW Symbols"), never a device font or a tofu
 // box: each in a span in the terminal's own font stack, asked which
 // platform font Chromium drew it with (and the same for the live rows).
+// That answer names the stack's first font even for a character no font
+// has (the box is its .notdef), so tofu is caught apart: each character,
+// and every non-ASCII one on the live rows, drawn on a canvas in the
+// stack must not match the drawing of an unassigned codepoint (U+0378,
+// in no font: the .notdef box).
 const GLYPHS = fs.readFileSync(path.join(root, "crates/flywheel-hub/tests/fixtures/claude-glyphs.txt"), "utf8")
   .split("\n").filter((l) => l.startsWith("U+")).map((l) => parseInt(l.slice(2).split(" ")[0], 16))
   .filter((cp) => cp !== 0xa0);
 async function glyphChecks(page, label) {
-  const stack = await page.evaluate(async (cps) => {
+  const { stack, tofu, probes } = await page.evaluate(async (cps) => {
     const rows = document.querySelector(".xterm-rows");
     const stack = getComputedStyle(rows).fontFamily;
     const box = document.createElement("div");
@@ -76,9 +81,24 @@ async function glyphChecks(page, label) {
       box.append(span);
     }
     document.body.append(box);
-    await document.fonts.load(`14px ${stack}`, box.textContent);
+    const live = [...new Set(rows.textContent)].filter((ch) => ch.codePointAt(0) > 0x7f && ch !== "\u00a0");
+    const probes = [...new Set([...cps.map((cp) => String.fromCodePoint(cp)), ...live])];
+    await document.fonts.load(`14px ${stack}`, box.textContent + live.join(""));
     await document.fonts.ready;
-    return stack;
+    const canvas = document.createElement("canvas");
+    canvas.width = 48;
+    canvas.height = 40;
+    const g = canvas.getContext("2d", { willReadFrequently: true });
+    g.font = `24px ${stack}`;
+    const draw = (ch) => {
+      g.clearRect(0, 0, 48, 40);
+      g.fillText(ch, 4, 30);
+      return g.getImageData(0, 0, 48, 40).data.join(",");
+    };
+    const notdef = draw("\u0378");
+    const tofu = probes.filter((ch) => draw(ch) === notdef)
+      .map((ch) => `U+${ch.codePointAt(0).toString(16).toUpperCase()}`);
+    return { stack, tofu, probes: probes.length };
   }, GLYPHS);
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("DOM.enable");
@@ -99,6 +119,7 @@ async function glyphChecks(page, label) {
   await cdp.detach();
   check(stack.includes('"FW Symbols"'), `${label}: the terminal falls back to the vendored symbols (${stack})`);
   check(!fallback.length, `${label}: ${GLYPHS.length} Claude Code characters drawn by vendored fonts (${JSON.stringify(fallback)})`);
+  check(!tofu.length, `${label}: none of ${probes} characters (fixture + live rows) is a tofu box (${JSON.stringify(tofu)})`);
 }
 
 async function drawerChecks(page, label, phone) {
@@ -650,6 +671,27 @@ try {
   await pp.waitForTimeout(300);
   await drawerChecks(pp, "desktop", false);
   await pol.close();
+  // A finished turn is seen by looking at it, even after a long break
+  // with no input (a session link opened, not a click): the page's idle
+  // clock jumps past the 5-minute away mark, then the hash attaches it.
+  const wsSeen = await api("POST", "/api/workspaces", { name: "seen", folders: [repo3] });
+  const finished = await api("POST", "/api/sessions", { workspace_id: wsSeen.id, kind: "claude", prompt: "do it" });
+  for (let i = 0; i < 100 && (await api("GET", `/api/sessions/${finished.id}`)).agent?.status !== "done"; i++) await sleep(100);
+  const away = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const ap = await away.newPage();
+  await ap.clock.install();
+  await ap.goto(`${base}/login?token=${token}#session=${agent.id}`);
+  await ap.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
+  const unseen = (await api("GET", `/api/sessions/${finished.id}`)).agent?.status;
+  await ap.clock.fastForward("06:00");
+  await ap.evaluate((id) => { location.hash = `#session=${id}`; }, finished.id);
+  let seenAs = unseen;
+  for (let i = 0; i < 50 && seenAs === "done"; i++) {
+    await sleep(100);
+    seenAs = (await api("GET", `/api/sessions/${finished.id}`)).agent?.status;
+  }
+  check(unseen === "done" && seenAs === "idle", `desktop: a done turn opened by link after 6 idle minutes is seen (${unseen} -> ${seenAs})`);
+  await away.close();
 
   // --- phone 390x844 ------------------------------------------------------
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
@@ -693,6 +735,20 @@ try {
     check(typed && /^\d+ {2}Type something\.$/.test(typed.label) && asked.options.every((o) => !/[─━]/.test(o.label)),
       `phone: ${name}: no rule in the quick answers (${JSON.stringify(asked && asked.options.map((o) => o.label))})`);
   }
+  // An option's description is not part of its label (a real phone showed
+  // "2  Green Green"); a wrapped label is (Codex's long "don't ask again").
+  const described = await mp.evaluate((l) => window.FwHubPrompt.parse(l),
+    fs.readFileSync(path.join(root, "crates/flywheel-hub/detect/fixtures/claude-ask-question-narrow.txt"), "utf8").split("\n"));
+  check(described && described.options[0].label === "1  Blue (Recommended)",
+    `phone: a question's option label is its label (${JSON.stringify(described && described.options[0])})`);
+  check(described && described.options[0].detail === "Neutral and widely readable, a common safe default for UI accents." && described.options[3].detail === "",
+    `phone: a question's option description is its detail (${JSON.stringify(described && described.options.map((o) => o.detail))})`);
+  const wrappedLines = ["Would you like to run the following command?", "", "  $ cargo test -p parser", "",
+    "› 1. Yes, proceed (y)", "  2. Yes, and don't ask again for commands that start with", "     `cargo test -p parser` (p)",
+    "  3. No, and tell Codex what to do differently (esc)", "", "  Press enter to confirm or esc to cancel"];
+  const wrappedAsk = await mp.evaluate((l) => window.FwHubPrompt.parse(l), wrappedLines);
+  check(wrappedAsk && wrappedAsk.options[1].label === "2  Yes, and don't ask again for commands that start with `cargo test -p parser`" && wrappedAsk.options[1].seq === "p" && !wrappedAsk.options[1].detail,
+    `phone: a wrapped option label stays whole (${JSON.stringify(wrappedAsk && wrappedAsk.options[1])})`);
   // "Always allow" is offered for every tool permission or approval, as
   // its status detail reads it (screen-read details do not say
   // "permission"), and for no trust dialog, question, or MCP form.

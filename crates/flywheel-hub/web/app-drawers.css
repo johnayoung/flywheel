@@ -353,6 +353,9 @@
   /* Long answers wrap (up to three lines) instead of losing the words that
      tell "Yes" from "Yes, and don't ask again ...". */
   .qa { white-space: normal; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; line-height: 1.3; }
+  /* With a description: the label on top, the description clamped. */
+  .qa:has(.qa-detail) { display: block; }
+  .qa-detail { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 }
 /* The narrowest phones: the session name needs the header more than the
    kind tag does (the glyph in the sidebar and chips still says it). */

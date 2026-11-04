@@ -1013,15 +1013,23 @@ impl PluginHost {
             .get("status")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let turn_finished = payload
+            .get("turn_finished")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let mut started = 0;
         for plugin in self.plugins().iter().filter(|p| p.enabled) {
             let Ok(manifest) = &plugin.manifest else {
                 continue;
             };
             for sub in manifest.events.iter().filter(|s| s.on == event) {
-                if !sub.statuses.is_empty()
-                    && !status.as_ref().is_some_and(|s| sub.statuses.contains(s))
-                {
+                // `done` also takes a turn that finished in view (shown
+                // `idle` at once, `turn_finished`).
+                let wanted = |s: &str| sub.statuses.iter().any(|w| w == s);
+                let matches = sub.statuses.is_empty()
+                    || status.as_deref().is_some_and(wanted)
+                    || (turn_finished && wanted("done"));
+                if !matches {
                     continue;
                 }
                 if !sub.kinds.is_empty() && !kind.as_ref().is_some_and(|k| sub.kinds.contains(k)) {

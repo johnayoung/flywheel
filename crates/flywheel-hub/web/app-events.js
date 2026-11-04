@@ -152,6 +152,13 @@ for (const type of ["keydown", "pointerdown", "pointermove", "wheel", "touchstar
   window.addEventListener(type, noteInput, { capture: true, passive: true });
 }
 armIdle();
+// Coming back to the page counts too: its tab shown, its window focused,
+// a session link opened (each is someone's doing). A look at a finished
+// turn after a long break marks it seen without a click.
+function arrive() {
+  lastInput = Date.now();
+  armIdle();
+}
 
 // What this page shows, for seen-tracking: the attached session while
 // someone is at the page (above), else nothing (a window left visible
@@ -340,10 +347,20 @@ const eventsWake = () => {
 };
 window.addEventListener("online", eventsWake);
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") eventsWake();
+  if (document.visibilityState === "visible") {
+    eventsWake();
+    arrive();
+  }
   sendView();
 });
-window.addEventListener("focus", () => sendView());
+window.addEventListener("focus", () => {
+  arrive();
+  sendView();
+});
+window.addEventListener("hashchange", () => {
+  arrive();
+  sendView();
+});
 window.addEventListener("blur", () => sendView());
 
 // Tab title and favicon carry what needs you: blocked and done counts.

@@ -409,9 +409,10 @@ impl Hub {
         let Some(view) = &transition.after.view else {
             return;
         };
-        if transition.after.turn.is_some_and(|(status, spell)| {
+        let finished = transition.after.turn.is_some_and(|(status, spell)| {
             status == AgentStatus::Done && before.turn != Some((status, spell))
-        }) {
+        });
+        if finished {
             self.emit(HubEvent::TurnFinished {
                 session_id: id.to_owned(),
             });
@@ -430,6 +431,9 @@ impl Hub {
                 "previous": before.shown(),
                 "detail": view.detail,
                 "since": view.since,
+                // A turn that ended while someone watched shows `idle`
+                // (seen), never `done`: this says it finished.
+                "turn_finished": finished,
             }),
         );
     }

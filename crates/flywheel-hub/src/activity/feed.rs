@@ -738,7 +738,8 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
         | "autopilot.stopped"
         | "autopilot.decision"
         | "autopilot.approval_needed"
-        | "autopilot.gate_decided" => {
+        | "autopilot.approved"
+        | "autopilot.denied" => {
             let name = str_at(payload, "/name").unwrap_or("a folder");
             let row = |text: String| Draft::new(event, text).with("folder", name);
             match event {
@@ -812,29 +813,30 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
                     }
                     draft
                 }
-                "autopilot.gate_decided" => {
+                "autopilot.approved" | "autopilot.denied" => {
                     let task = str_at(payload, "/task_id").unwrap_or("a task");
-                    let kind = str_at(payload, "/kind").unwrap_or("decision");
-                    let verb = if kind == "approve" {
+                    let verb = if event == "autopilot.approved" {
                         "approved"
                     } else {
                         "denied"
                     };
+                    let who = str_at(payload, "/who").unwrap_or("hub");
                     let feedback = payload
                         .get("feedback")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
                     row(format!(
-                        "{verb} gate {} of autopilot task {task} in {name} from the hub{}",
+                        "{verb} gate {} of autopilot task {task} in {name} from the {who}{}",
                         payload.get("gate").and_then(Value::as_u64).unwrap_or(0),
                         if feedback { " (with feedback)" } else { "" }
                     ))
                     .with("task_id", task)
                     .with("run_id", str_at(payload, "/run_id"))
-                    .with("decision", kind)
+                    .with("who", who)
                     .with("gate", payload.get("gate").cloned())
                     .with("attempt", payload.get("attempt").cloned())
                     .with("command_id", payload.get("command_id").cloned())
+                    .with("feedback", feedback)
                 }
                 _ => {
                     let task = str_at(payload, "/task_id").unwrap_or("a task");
@@ -843,6 +845,8 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
                     ))
                     .with("task_id", task)
                     .with("run_id", str_at(payload, "/run_id"))
+                    .with("gate", payload.get("gate").cloned())
+                    .with("attempt", payload.get("attempt").cloned())
                 }
             }
         }

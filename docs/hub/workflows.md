@@ -122,11 +122,11 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 
 Folders with a `flywheel.toml` or `.flywheel/` get the verified loop beside the terminals, read-only (workers it starts are hub shells); `--no-flywheel` turns it off.
 
-- Phases and tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (in **Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
+- Phases and tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
 - **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks to add unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) = `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`. Peers: read-only.
-- Shown: tier verdicts, the newest deciding cycle (emitted, dropped with reasons), emitted tasks with score and run, parked gates (Needs you). **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate shown (confirmed; one queued per gate; deny retries with the feedback). Held-out gate, risk tiers, team reviews: shown only.
-- A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is never created. One watcher per folder (stat 2 s, re-read 15 s). Seam: `flywheel::FlywheelProvider`, implemented in `hub_flywheel.rs`.
+- Shown: tier verdicts (tap one: its name), the newest deciding cycle (emitted, dropped with reasons), the 20 newest decisions, emitted tasks (score, run), parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate shown (confirmed; one per gate, then `decision pending`, off Needs you; deny retries with feedback). Held-out gate, risk tiers, team reviews: shown.
+- A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is not created. One watcher per folder (stat 2 s, re-read 15 s). Seam: `flywheel::FlywheelProvider`, implemented in `hub_flywheel.rs`.
 
 ## Prompt queue
 

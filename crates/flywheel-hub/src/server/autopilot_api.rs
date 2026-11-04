@@ -1,8 +1,9 @@
 //! Autopilot from the hub (see `crate::autopilot`):
 //!
 //! * `GET /api/flywheel/autopilot?folder=P` -- `{"folder", "view",
-//!   "sessions"}`: the folder's [`AutopilotView`] and the hub sessions
-//!   running its daemon;
+//!   "sessions"}`: the folder's [`AutopilotView`] (with its decision
+//!   history from the activity journal) and the hub sessions running its
+//!   daemon;
 //! * `POST /api/flywheel/autopilot/start {"folder", "confirm": true,
 //!   "workspace_id"?, "cols"?, "rows"?}` -- `fw autopilot` in a new hub
 //!   shell session (201, the session); 409 while one runs there (this
@@ -15,7 +16,7 @@
 //! * `POST .../decide {"folder", "run", "decision": "approve"|"deny",
 //!   "confirm": true, "gate"?, "attempt"?, "feedback"?}` -- `fw approve` /
 //!   `fw reject` bound to the gate shown (200, the enqueued command, and an
-//!   `autopilot.gate_decided` event); 409 when that gate is not the one
+//!   `autopilot.approved` / `autopilot.denied` event); 409 when that gate is not the one
 //!   parked or already has a decision queued, 404 for an unknown run.
 //!
 //! Actions are refused to peers (`peers::peer_forbidden`): read-only.
@@ -24,7 +25,7 @@ use super::flywheel_api::{Refusal, adopted_folder, monitor, off_runtime, still_r
 use super::{ApiJson, ApiQuery, AppState, error_response};
 use crate::autopilot::{
     AutopilotView, GateDecision, GateRefused, MAX_FEEDBACK_CHARS, autopilot_session_command,
-    autopilot_session_name, gate_decided_payload,
+    autopilot_session_name, gate_decided_event, with_history,
 };
 use crate::flywheel::{FlywheelMonitor, runs_autopilot, valid_run_id};
 use crate::hub::CreateSession;
@@ -120,6 +121,7 @@ pub(super) async fn view(
         Ok(sessions) => sessions,
         Err(refusal) => return refusal.into_response(),
     };
+    let view = with_history(view, app.hub.activity(), &path);
     Json(json!({ "folder": path, "view": view, "sessions": session_list(&sessions) }))
         .into_response()
 }
@@ -415,10 +417,8 @@ pub(super) async fn decide(
         Ok(Ok(done)) => {
             // The hub's own audit trail of the human's decision (the store
             // has the command; this is the timeline's and plugins' copy).
-            app.hub.emit_lifecycle(
-                "autopilot.gate_decided",
-                gate_decided_payload(&path, &done, with_feedback),
-            );
+            let (event, payload) = gate_decided_event(&path, &done, with_feedback);
+            app.hub.emit_lifecycle(event, payload);
             monitor.refresh(&path);
             Json(done).into_response()
         }

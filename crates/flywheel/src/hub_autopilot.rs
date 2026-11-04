@@ -558,6 +558,7 @@ pub(crate) fn read_view(
         gates,
         holds,
         problem: (!problems.is_empty()).then(|| problems.join("; ")),
+        history: Vec::new(),
     }
 }
 

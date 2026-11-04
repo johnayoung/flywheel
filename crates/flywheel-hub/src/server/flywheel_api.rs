@@ -206,6 +206,13 @@ pub(super) async fn panel(
     let marked = off_runtime(Duration::from_secs(5), "reading the workers", move || {
         let mut panel = panel;
         mark_queued(&mut panel, &path, &hub.sessions(None));
+        if let Some(intake) = panel.intake.take() {
+            panel.intake = Some(crate::autopilot::with_history(
+                intake,
+                hub.activity(),
+                &path,
+            ));
+        }
         panel
     })
     .await;

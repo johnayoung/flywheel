@@ -502,7 +502,7 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
             .as_array()
             .into_iter()
             .flatten()
-            .find(|r| r["kind"] == "autopilot.gate_decided")
+            .find(|r| r["kind"] == "autopilot.denied")
             .cloned()
     });
     assert_eq!(
@@ -510,7 +510,43 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
         json!(run_id),
         "a run id is not a secret"
     );
-    assert_eq!(row["data"]["decision"], "reject");
+    assert_eq!(row["data"]["who"], "hub");
+    assert_eq!(row["data"]["gate"], json!(ordinal));
+    assert_eq!(row["data"]["attempt"], 1);
+    assert_eq!(row["data"]["feedback"], true);
+    assert!(
+        !row.to_string().contains("use real parser samples"),
+        "the feedback stays in the store: {row}"
+    );
+    // Decided: Needs you lets go of it (the panel still shows it, marked).
+    wait_for("Needs you to drop the decided gate", || {
+        let (_, list) = http(&server, "GET", "/api/flywheel", None);
+        let folder = &list["folders"][0];
+        let awaiting = folder["alerts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|a| a["kind"] == "awaiting");
+        (folder["autopilot_gates"] == 0 && !awaiting).then_some(())
+    });
+    // The panel's history keeps it with the cycle decision before it.
+    let kinds_of = |answer: &Value| -> Vec<String> {
+        answer["view"]["history"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r["kind"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let history = wait_for("the history to hold the deny", || {
+        let answer = view();
+        let kinds = kinds_of(&answer);
+        (kinds.first().map(String::as_str) == Some("autopilot.denied")).then_some(kinds)
+    });
+    assert!(
+        history.iter().any(|k| k == "autopilot.decision"),
+        "{history:?}"
+    );
 
     // The next worker run applies the deny and retries the task on the
     // same run (the feedback in its prompt): it parks on the gate again,
@@ -568,6 +604,13 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
         )],
         "exactly what `fw approve --gate --attempt` enqueues"
     );
+
+    wait_for("the approve row", || {
+        kinds_of(&view())
+            .first()
+            .is_some_and(|k| k == "autopilot.approved")
+            .then_some(())
+    });
 
     // Plugin events, journaled as activity rows.
     let kinds = wait_for("the approval row", || {
@@ -676,6 +719,12 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
         text.contains("verified   tier  6 score     90.0  cover-parser  (run run-"),
         "{text}"
     );
+    // Its decision history: the gate decisions after the cycle's.
+    let history = text.split("decisions (newest first):").nth(1).unwrap_or("");
+    let approved = history.find("approved gate").expect(&text);
+    let denied = history.find("denied gate").expect(&text);
+    let cycle = history.find("emitted 1, dropped 1").expect(&text);
+    assert!(approved < denied && denied < cycle, "{text}");
     let unconfirmed = cli(&["start"]);
     assert_eq!(unconfirmed.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&unconfirmed.stderr).contains("not started"));

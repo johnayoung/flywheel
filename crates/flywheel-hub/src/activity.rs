@@ -34,6 +34,8 @@ mod tests;
 
 pub use digest::{Digest, DigestFanout, DigestSession, DigestWorkspace};
 pub use feed::Activity;
+#[cfg(test)]
+pub(crate) use feed::draft_for;
 pub use journal::{Journal, Limits};
 pub use marks::{Marks, Return};
 

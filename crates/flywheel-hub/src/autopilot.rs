@@ -241,6 +241,55 @@ pub struct AutopilotView {
     pub holds: Vec<PilotHold>,
     /// What could not be read (a malformed task file, a store error).
     pub problem: Option<String>,
+    /// Its newest [`HISTORY_ROWS`] decisions as this hub's activity journal
+    /// has them (cycle decisions, gate approvals and denials), newest
+    /// first: filled in by the hub's API ([`with_history`]), never by a
+    /// provider.
+    #[serde(default)]
+    pub history: Vec<crate::activity::Row>,
+}
+
+/// The autopilot decisions a folder's view keeps.
+pub const HISTORY_ROWS: usize = 20;
+
+/// The activity row kinds that are autopilot decisions.
+pub const HISTORY_KINDS: [&str; 3] = [
+    "autopilot.decision",
+    "autopilot.approved",
+    "autopilot.denied",
+];
+
+/// `view` with `folder`'s newest decisions from `activity` (rows name a
+/// folder by [`folder_name`]: the journal never holds paths).
+pub fn with_history(
+    mut view: AutopilotView,
+    activity: &crate::activity::Activity,
+    folder: &Path,
+) -> AutopilotView {
+    let name = folder_name(folder);
+    let filter = crate::activity::Filter {
+        kinds: HISTORY_KINDS.iter().map(|k| (*k).to_owned()).collect(),
+        ..crate::activity::Filter::default()
+    };
+    let mut out = Vec::new();
+    let mut before = None;
+    loop {
+        let (rows, more) = activity.page(&filter, before, crate::activity::MAX_LIMIT);
+        before = rows.last().map(|r| r.id);
+        for row in rows {
+            if row.data.get("folder").and_then(Value::as_str) == Some(name.as_str()) {
+                out.push(row);
+                if out.len() == HISTORY_ROWS {
+                    view.history = out;
+                    return view;
+                }
+            }
+        }
+        if !more || before.is_none() {
+            view.history = out;
+            return view;
+        }
+    }
 }
 
 impl AutopilotView {
@@ -262,6 +311,7 @@ impl AutopilotView {
             gates: Vec::new(),
             holds: Vec::new(),
             problem: None,
+            history: Vec::new(),
         }
     }
 
@@ -372,19 +422,33 @@ pub fn folder_payload(folder: &Path, extra: Value) -> Value {
     payload
 }
 
-/// The `autopilot.gate_decided` payload for a decision the hub enqueued.
-pub fn gate_decided_payload(folder: &Path, decided: &GateDecided, feedback: bool) -> Value {
-    folder_payload(
-        folder,
-        json!({
-            "task_id": decided.task_id,
-            "run_id": decided.run_id,
-            "kind": decided.kind,
-            "gate": decided.gate,
-            "attempt": decided.attempt,
-            "command_id": decided.command_id,
-            "feedback": feedback,
-        }),
+/// The event a decision the hub enqueued raises (`autopilot.approved` /
+/// `autopilot.denied`) and its payload: who decided, which gate and
+/// attempt, whether feedback went with it (never the feedback itself).
+pub fn gate_decided_event(
+    folder: &Path,
+    decided: &GateDecided,
+    feedback: bool,
+) -> (&'static str, Value) {
+    let event = if decided.kind == "approve" {
+        "autopilot.approved"
+    } else {
+        "autopilot.denied"
+    };
+    (
+        event,
+        folder_payload(
+            folder,
+            json!({
+                "who": "hub",
+                "task_id": decided.task_id,
+                "run_id": decided.run_id,
+                "gate": decided.gate,
+                "attempt": decided.attempt,
+                "command_id": decided.command_id,
+                "feedback": feedback,
+            }),
+        ),
     )
 }
 
@@ -406,26 +470,27 @@ fn approval_needed(folder: &Path, gate: &PilotGate) -> (&'static str, Value) {
 
 /// The plugin events between two reads of `folder`'s panel. The first
 /// read (`old` = `None`: a folder just added, or the hub restarted) is a
-/// baseline: it announces only the gates on autopilot work parked at or
-/// after `baseline_since` (when this hub began watching), so a gate that
-/// parked while the folder was being added is not lost, and a hub restart
-/// does not repeat the ones it announced before.
+/// baseline: with `announced` (whether a gate's `approval_needed` was
+/// raised before, e.g. by an earlier hub run, as its activity journal
+/// says) it raises one for every gate on autopilot work parked now and not
+/// announced yet -- once per gate and attempt, across restarts; without
+/// it, nothing.
 pub fn events_between(
     old: Option<&FlywheelPanel>,
     new: &FlywheelPanel,
-    baseline_since: Option<DateTime<Utc>>,
+    announced: Option<&dyn Fn(&PilotGate) -> bool>,
 ) -> Vec<(&'static str, Value)> {
     let Some(now) = new.intake.as_ref() else {
         return Vec::new();
     };
     let folder = &new.folder;
     let Some(old) = old.and_then(|p| p.intake.as_ref()) else {
-        let Some(since) = baseline_since else {
+        let Some(announced) = announced else {
             return Vec::new();
         };
         return now
             .autopilot_gates()
-            .filter(|g| g.since.is_some_and(|parked| parked >= since))
+            .filter(|g| !announced(g))
             .map(|g| approval_needed(folder, g))
             .collect();
     };
@@ -554,20 +619,67 @@ mod tests {
     }
 
     #[test]
-    fn the_first_read_is_a_baseline_but_keeps_gates_parked_since_the_watch_began() {
-        assert!(events_between(None, &panel(Some(live(1, 1))), None).is_empty());
-        assert!(events_between(Some(&panel(None)), &panel(Some(live(1, 1))), None).is_empty());
-        let watched = Utc::now() - chrono::Duration::minutes(5);
+    fn the_first_read_announces_each_parked_gate_once() {
+        let none = |_: &PilotGate| false;
+        assert!(events_between(None, &panel(Some(live(1, 1))), Some(&none)).is_empty());
+        assert!(
+            events_between(Some(&panel(None)), &panel(Some(live(1, 1))), Some(&none)).is_empty()
+        );
         let mut parked = live(1, 1);
-        let mut fresh = gate("run-new", 1, true);
-        fresh.since = Some(watched + chrono::Duration::minutes(1));
-        let mut old = gate("run-old", 1, true);
-        old.since = Some(watched - chrono::Duration::minutes(1));
-        parked.gates = vec![fresh, old, gate("run-unknown", 1, true)];
-        let events = events_between(None, &panel(Some(parked.clone())), Some(watched));
-        assert_eq!(names(&events), ["autopilot.approval_needed"]);
+        let mut retried = gate("run-old", 1, true);
+        retried.attempt = 2;
+        parked.gates = vec![
+            gate("run-new", 1, true),
+            gate("run-old", 1, true),
+            retried,
+            gate("run-theirs", 1, false),
+        ];
+        // An earlier hub announced run-old's first attempt: its retry, and
+        // a gate parked before this hub ever ran, are still news.
+        let journal = |g: &PilotGate| g.run_id == "run-old" && g.attempt == 1;
+        let events = events_between(None, &panel(Some(parked.clone())), Some(&journal));
+        assert_eq!(
+            names(&events),
+            ["autopilot.approval_needed", "autopilot.approval_needed"]
+        );
         assert_eq!(events[0].1["run_id"], "run-new");
+        assert_eq!(
+            (
+                events[1].1["run_id"].clone(),
+                events[1].1["attempt"].clone()
+            ),
+            (json!("run-old"), json!(2))
+        );
+        // Without the journal the first read stays silent.
         assert!(events_between(None, &panel(Some(parked)), None).is_empty());
+    }
+
+    #[test]
+    fn a_decision_names_who_and_which_gate_never_the_feedback() {
+        let decided = GateDecided {
+            run_id: "run-1".into(),
+            task_id: "add-tests".into(),
+            kind: "reject".into(),
+            command_id: 4,
+            gate: 2,
+            attempt: 1,
+        };
+        let (event, payload) = gate_decided_event(Path::new("/code/repo"), &decided, true);
+        assert_eq!(event, "autopilot.denied");
+        assert_eq!(payload["who"], "hub");
+        assert_eq!(
+            (payload["gate"].clone(), payload["attempt"].clone()),
+            (json!(2), json!(1))
+        );
+        assert_eq!(payload["feedback"], true, "whether, not what");
+        let approved = GateDecided {
+            kind: "approve".into(),
+            ..decided
+        };
+        assert_eq!(
+            gate_decided_event(Path::new("/code/repo"), &approved, false).0,
+            "autopilot.approved"
+        );
     }
 
     #[test]
@@ -686,6 +798,49 @@ mod tests {
                 "autopilot.decision"
             ]
         );
+    }
+
+    #[test]
+    fn the_history_keeps_a_folders_newest_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let activity = crate::activity::Activity::open(dir.path());
+        let repo = Path::new("/code/repo");
+        let record = |folder: &Path, event: &str, extra: Value| {
+            let payload = folder_payload(folder, extra);
+            let draft = crate::activity::draft_for(event, &payload).unwrap();
+            activity.record(draft).unwrap();
+        };
+        for cycle in 1..=25 {
+            record(
+                repo,
+                "autopilot.decision",
+                json!({ "cycle": cycle, "emitted": 1 }),
+            );
+            record(
+                Path::new("/code/other"),
+                "autopilot.decision",
+                json!({ "cycle": cycle }),
+            );
+        }
+        record(repo, "autopilot.started", json!({ "pid": 3 }));
+        let decided = GateDecided {
+            run_id: "run-1".into(),
+            task_id: "t".into(),
+            kind: "approve".into(),
+            command_id: 1,
+            gate: 1,
+            attempt: 1,
+        };
+        let (event, payload) = gate_decided_event(repo, &decided, false);
+        activity
+            .record(crate::activity::draft_for(event, &payload).unwrap())
+            .unwrap();
+        let view = with_history(AutopilotView::absent(), &activity, repo);
+        assert_eq!(view.history.len(), HISTORY_ROWS);
+        assert_eq!(view.history[0].kind, "autopilot.approved");
+        assert_eq!(view.history[1].data["cycle"], 25);
+        assert_eq!(view.history[HISTORY_ROWS - 1].data["cycle"], 7);
+        assert!(view.history.iter().all(|r| r.data["folder"] == "code/repo"));
     }
 
     #[test]

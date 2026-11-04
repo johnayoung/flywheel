@@ -284,20 +284,37 @@ impl FlywheelPanel {
         for task in self.phases.iter().flat_map(|p| &p.tasks) {
             *counts.entry(task.state.as_str().to_owned()).or_default() += 1;
         }
+        // A gate with a decision queued no longer needs anyone: it waits
+        // on a worker to apply it (the panel still shows it, marked).
+        let decided: HashSet<&str> = self
+            .intake
+            .iter()
+            .flat_map(|i| &i.gates)
+            .filter(|g| g.pending.is_some())
+            .map(|g| g.run_id.as_str())
+            .collect();
+        let alerts = self
+            .alerts
+            .iter()
+            .filter(|a| {
+                a.kind != AlertKind::Awaiting
+                    || a.run_id.as_deref().is_none_or(|run| !decided.contains(run))
+            })
+            .cloned()
+            .collect();
         FlywheelSummary {
             folder: self.folder.clone(),
             generated_at: self.generated_at,
             phases: self.phases.iter().map(|p| p.name.clone()).collect(),
             counts,
-            alerts: self.alerts.clone(),
+            alerts,
             live_runs: self.live.len(),
             worker_live: self.worker.live,
             autopilot_live: self.autopilot.live,
             autopilot_paused: self.intake.as_ref().is_some_and(|i| i.paused),
-            autopilot_gates: self
-                .intake
-                .as_ref()
-                .map_or(0, |i| i.autopilot_gates().count()),
+            autopilot_gates: self.intake.as_ref().map_or(0, |i| {
+                i.autopilot_gates().filter(|g| g.pending.is_none()).count()
+            }),
             problem: self.problem.clone(),
             worktree_of: self.worktree_of.clone(),
         }
@@ -529,9 +546,6 @@ pub struct FlywheelMonitor {
     starting: Mutex<()>,
     /// Blocking reads still running (see [`FlywheelMonitor::begin_read`]).
     reads: Arc<ReadGate>,
-    /// When this monitor began: a folder's first read announces the gates
-    /// parked since (see [`crate::autopilot::events_between`]).
-    since: DateTime<Utc>,
 }
 
 /// The keys of blocking reads in flight.
@@ -586,7 +600,6 @@ impl FlywheelMonitor {
             events,
             starting: Mutex::new(()),
             reads: Arc::default(),
-            since: Utc::now(),
         })
     }
 
@@ -737,13 +750,34 @@ impl FlywheelMonitor {
                 if slot.stop.load(Ordering::SeqCst) {
                     break;
                 }
+                // A first read announces the parked gates no hub run
+                // announced before (the journal remembers them).
+                let first = slot
+                    .panel
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_none();
+                let journal = if first {
+                    hub.upgrade()
+                        .map(|hub| announced_gates(hub.activity(), folder))
+                } else {
+                    None
+                };
+                let announced = journal.as_ref().map(|keys| {
+                    move |g: &crate::autopilot::PilotGate| {
+                        keys.contains(&(g.run_id.clone(), None))
+                            || keys.contains(&(g.run_id.clone(), Some((g.gate, g.attempt))))
+                    }
+                });
                 let (changed, events) = {
                     let mut current = slot.panel.lock().unwrap_or_else(PoisonError::into_inner);
                     let changed = current.as_ref().is_none_or(|old| !old.same_content(&panel));
                     let events = crate::autopilot::events_between(
                         current.as_deref(),
                         &panel,
-                        Some(self.since),
+                        announced
+                            .as_ref()
+                            .map(|f| f as &dyn Fn(&crate::autopilot::PilotGate) -> bool),
                     );
                     let summary = panel.summary();
                     *current = Some(Arc::new(panel));
@@ -773,6 +807,38 @@ impl FlywheelMonitor {
             self.provider.forget(folder);
         }
     }
+}
+
+/// The gates of `folder` the activity journal says an `approval_needed`
+/// was raised for: (run id, (gate, attempt)), `None` for a row that does
+/// not name them (any gate of that run).
+fn announced_gates(
+    activity: &crate::activity::Activity,
+    folder: &Path,
+) -> HashSet<(String, Option<(u32, u32)>)> {
+    let name = crate::autopilot::folder_name(folder);
+    let filter = crate::activity::Filter {
+        kinds: vec!["autopilot.approval_needed".to_owned()],
+        ..crate::activity::Filter::default()
+    };
+    let number = |row: &crate::activity::Row, key: &str| {
+        row.data
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    activity
+        .rows(&filter)
+        .iter()
+        .filter(|row| {
+            row.data.get("folder").and_then(serde_json::Value::as_str) == Some(name.as_str())
+        })
+        .filter_map(|row| {
+            let run = row.data.get("run_id")?.as_str()?.to_owned();
+            let gate = number(row, "gate").zip(number(row, "attempt"));
+            Some((run, gate))
+        })
+        .collect()
 }
 
 /// The argv a hub shell session runs to start a worker: `worker` (the
@@ -1116,6 +1182,36 @@ pub fn valid_run_id(run_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_journal_names_the_gates_announced_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let activity = crate::activity::Activity::open(dir.path());
+        let folder = Path::new("/code/repo");
+        let raise = |folder: &Path, run: &str, gate: Option<(u32, u32)>| {
+            let mut payload = crate::autopilot::folder_payload(
+                folder,
+                serde_json::json!({ "task_id": "t", "run_id": run }),
+            );
+            if let Some((g, a)) = gate {
+                payload["gate"] = g.into();
+                payload["attempt"] = a.into();
+            }
+            let draft = crate::activity::draft_for("autopilot.approval_needed", &payload).unwrap();
+            activity.record(draft).unwrap();
+        };
+        raise(folder, "run-1", Some((1, 2)));
+        raise(folder, "run-old", None);
+        raise(Path::new("/code/other"), "run-9", Some((1, 1)));
+        let keys = announced_gates(&activity, folder);
+        assert_eq!(
+            keys,
+            HashSet::from([
+                ("run-1".to_owned(), Some((1, 2))),
+                ("run-old".to_owned(), None),
+            ])
+        );
+    }
 
     fn task(id: &str, state: TaskLight) -> PanelTask {
         PanelTask {

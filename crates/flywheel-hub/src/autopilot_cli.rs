@@ -458,4 +458,19 @@ fn print_status(out: &mut dyn Write, answer: &Value) {
             );
         }
     }
+    // The newest decisions here, from the hub's activity journal.
+    let history = list(view, "history");
+    if !history.is_empty() {
+        let _ = writeln!(out, "decisions (newest first):");
+        for row in history {
+            let _ = writeln!(
+                out,
+                "  {}  {}",
+                str_field(row, "at")
+                    .get(..16)
+                    .unwrap_or(str_field(row, "at")),
+                str_field(row, "text")
+            );
+        }
+    }
 }

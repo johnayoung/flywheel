@@ -102,7 +102,7 @@ Review actions are two-step: `{"dry_run":true}` -> plan `{"summary","details","w
 | GET | `/api/flywheel/panel?folder=` | the panel (`queued_in {session_id,name}`: a scoped worker will run it); 404 not an adopted folder |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next"}` (poll `since=next`); 503 a read still waits |
 | GET | `/api/flywheel/task?folder=&task=` | the task as a fan-out seed (`prompt`, `graders`, `held_out` names) |
-| GET | `/api/flywheel/autopilot?folder=` | `{"folder","view","sessions"}`: the panel's `intake` and this hub's autopilot sessions |
+| GET | `/api/flywheel/autopilot?folder=` | `{"folder","view","sessions"}`: `intake` (+ `history`: 20 newest decision rows), this hub's autopilot sessions |
 | POST | `/api/flywheel/autopilot/start` | `{"folder","confirm":true,"workspace_id"?,"cols"?,"rows"?}` -> 201 the `fw autopilot` session; 400 unconfirmed; 409 `{"running"}` or a live daemon from elsewhere |
 | POST | `/api/flywheel/autopilot/stop` | `{"folder"}` -> 202 `{"stopping"}` (Ctrl-C); 409 none of this hub's |
 | POST | `/api/flywheel/autopilot/pause` | `{"folder"}` -> `{"paused","changed"}` (`resume` alike) |
@@ -288,11 +288,12 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `pr.review_changes_requested` | as above |
 | `pr.merged` | as above |
 | `record.stopped` | + `reason` `stopped` / `ended` (exit, write failure); not on hub stop, handoff |
-| `autopilot.started` | `folder`, `name`, `pid`; no `session` (all `autopilot.*`) |
-| `autopilot.stopped` | `folder`, `name`, `pid`, `state` |
-| `autopilot.decision` | `folder`, `name`, `cycle`, `emitted`, `dropped`, `reason`, `tasks`, `dropped_findings`, `relevant_tiers`, `prefiltered_tiers`; once per deciding cycle |
-| `autopilot.approval_needed` | `folder`, `name`, `task_id`, `run_id`, `instruction`, `gate`, `attempt` (its own work; first read: gates parked since hub start) |
-| `autopilot.gate_decided` | `folder`, `name`, `task_id`, `run_id`, `kind`, `gate`, `attempt`, `command_id`, `feedback` (bool): a decision made through the hub |
+| `autopilot.started` | `folder`, `name`, `pid`; no `session` (all `autopilot.*`: `folder`, `name`) |
+| `autopilot.stopped` | + `state` |
+| `autopilot.decision` | `cycle`, `emitted`, `dropped`, `reason`, `tasks`, `dropped_findings`, `relevant_tiers`, `prefiltered_tiers`; once per deciding cycle |
+| `autopilot.approval_needed` | `task_id`, `run_id`, `instruction`, `gate`, `attempt` (own work; once per gate, attempt) |
+| `autopilot.approved` | `who` `hub`, `task_id`, `run_id`, `gate`, `attempt`, `command_id`, `feedback` (bool, not the text) |
+| `autopilot.denied` | as `approved` |
 
 `fanout.finished`: a grading left the fan-out settled (no agent working, nothing queued); candidates best first, `tail` the first failing grader's last 400 stderr chars:
 

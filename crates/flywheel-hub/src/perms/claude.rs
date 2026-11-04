@@ -525,11 +525,9 @@ pub fn plan(
     Ok((old, new, added))
 }
 
-/// Replace `path` with `text` atomically (a temp file beside it, synced,
-/// renamed over it), keeping its permission bits (new files: 0644, the
-/// directory created 0755).
+/// Replace `path` with `text` atomically ([`crate::util::write_atomic`]),
+/// keeping its permission bits (new files: 0644, the directory created).
 pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
-    use std::io::Write;
     let dir = path
         .parent()
         .ok_or_else(|| format!("{} has no directory", path.display()))?;
@@ -537,47 +535,6 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     }
-    let mode = {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(path)
-                .map(|m| m.permissions().mode() & 0o7777)
-                .unwrap_or(0o644)
-        }
-    };
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    // Unique per write (two writers in one hub must not share it).
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{name}.fw-hub-{}-{seq}.tmp", std::process::id()));
-    let result = (|| -> std::io::Result<()> {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(mode);
-        }
-        let mut file = options.open(&tmp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
-        }
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result.map_err(|e| format!("cannot write {}: {e}", path.display()))
+    crate::util::write_atomic(path, text.as_bytes(), crate::util::FileMode::KeepOr(0o644))
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }

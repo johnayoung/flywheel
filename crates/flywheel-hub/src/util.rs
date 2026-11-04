@@ -366,3 +366,73 @@ mod tests {
         assert_eq!(path_identity(&dir.path().join("missing")), None);
     }
 }
+
+/// The permission bits [`write_atomic`] gives the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileMode {
+    /// 0600, whatever the file had (tokens, logs, state).
+    Private,
+    /// The file's own bits, else (a new file) these.
+    KeepOr(u32),
+}
+
+/// Replace `path` with `bytes` atomically: a temp file beside it (unique
+/// per write, so two writers never share one; removed on failure),
+/// synced, renamed over it, then the directory synced.
+pub fn write_atomic(path: &Path, bytes: &[u8], mode: FileMode) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    let bits = match mode {
+        FileMode::Private => 0o600,
+        FileMode::KeepOr(default) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(path)
+                    .map(|m| m.permissions().mode() & 0o7777)
+                    .unwrap_or(default)
+            }
+            #[cfg(not(unix))]
+            {
+                default
+            }
+        }
+    };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.fw-hub-{}-{seq}.tmp", std::process::id()));
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(bits);
+        }
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            // The umask may have taken bits away: set exactly these.
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(bits))?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}

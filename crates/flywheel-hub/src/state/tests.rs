@@ -1113,9 +1113,21 @@ fn a_queue_edit_that_records_what_happened_survives_a_failed_save() {
             });
         })
         .unwrap();
-    // Every save fails from here: its temp file cannot be created.
-    let tmp = dir.path().join(STATE_FILE).with_extension("tmp");
-    fs::create_dir(&tmp).unwrap();
+    // Every save fails from here: its temp file cannot be created (the
+    // directory is read-only; root ignores that, so the test checks).
+    let writable = |on: bool| {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            dir.path(),
+            fs::Permissions::from_mode(if on { 0o700 } else { 0o500 }),
+        )
+        .unwrap();
+    };
+    writable(false);
+    if fs::write(dir.path().join("probe"), "x").is_ok() {
+        writable(true);
+        return;
+    }
     let delivered = |q: &mut crate::queue::SessionQueue| {
         q.items[0].state = ItemState::Delivered {
             delivered_at: sending_at,
@@ -1132,7 +1144,7 @@ fn a_queue_edit_that_records_what_happened_survives_a_failed_save() {
     assert!(store.update_queue_keeping(&session.id, delivered).is_err());
     assert!(store.queue(&session.id).unwrap().items[0].is_delivered());
     // The next save that works writes it.
-    fs::remove_dir(&tmp).unwrap();
+    writable(true);
     store
         .update_queue(&session.id, |q| q.paused = true)
         .unwrap();

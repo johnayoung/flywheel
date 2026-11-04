@@ -462,16 +462,44 @@ async fn plugins_receive_events_answer_actions_and_are_bounded() {
     fire(&env, "Stop", json!({}));
     let finished = wait_event(&hello, |e| {
         e["event"] == "status.changed"
-            && e["payload"]["turn_finished"] == true
-            && e["payload"]["status"] == "idle"
+            && e["payload"]["status"] == "done"
+            && e["payload"]["seen"] == true
     })
     .await;
     assert_eq!(finished["payload"]["previous"], "working", "{finished}");
+    let (_, view) = hub.call(reqwest::Method::GET, &path, None).await;
+    assert_eq!(view["agent"]["status"], "idle", "seen at once: {view}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         recorded(&hello).len(),
         before + 1,
-        "only the finished turn reached the plugin (not working, not seen)"
+        "only the finished turn reached the plugin (not working, not idle)"
     );
+    // Watched from rest (idle, no working reported: a resumed session's
+    // SessionStart, then Stop): idle before and after, still one done.
+    let (_, seen) = hub.call(reqwest::Method::GET, &path, None).await;
+    fire(&env, "SessionStart", json!({}));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (_, view) = hub.call(reqwest::Method::GET, &path, None).await;
+        if view["agent"]["status"] == "idle" && view["agent"]["since"] != seen["agent"]["since"] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never ready: {view}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = recorded(&hello).len();
+    fire(&env, "Stop", json!({}));
+    let again = wait_event(&hello, |e| {
+        e["event"] == "status.changed"
+            && e["payload"]["status"] == "done"
+            && e["payload"]["previous"] == "idle"
+    })
+    .await;
+    assert_eq!(again["payload"]["seen"], true, "{again}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(recorded(&hello).len(), before + 1);
     drop(watcher);
 
     // An action's toast.

@@ -59,7 +59,7 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 | Action | Runs | Refused when |
 |---|---|---|
-| Commit all | `git add -A`; `git commit -F -` (hooks run) | what `add` staged differs from the plan |
+| Commit all | `git add -A` (but ticked generated / secret files); `git commit -F -` (hooks run) | what `add` staged differs from the plan |
 | Push | `git push <remote> <planned HEAD>:refs/heads/<B>` | no remote; never forced |
 | Open PR | `gh pr create --base --head B --body-file -` | not pushed / out of sync, no `gh` auth for the host |
 | Rebase onto base | `git rebase <base>` in the worktree | uncommitted changes (a conflict stops there; Abort) |
@@ -119,7 +119,7 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 Folders with a `flywheel.toml` or `.flywheel/` get the verified loop beside the terminals. It reads the store, never writes it (workers it starts are hub shells); `--no-flywheel` turns it off.
 
 - Phases and tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (in **Needs you** until **Mark seen**). Opened from the folder chip's `verified/total` badge, `Alt F`, or the palette.
-- **Start worker here**: a hub shell running `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks before adding unmet prerequisites). A second needs confirming (409). A pending task a running scoped worker will run says `queued in <session>`. Outcome: `verified`, `not verified`, `refused`, `worker exit N`.
+- **Start worker here**: a hub shell running `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks before adding unmet prerequisites); a second needs confirming (409). A task a scoped worker will run says `queued in <session>`. Outcome: `verified`, `not verified`, `refused`, `worker exit N`.
 - **Output** on a run: its `fw show` summary and redacted transcript, followed live.
 - A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is never created. One watcher per folder (stat 2 s, re-read 15 s).
 - Seam: `flywheel::FlywheelProvider` (hub), implemented by the `flywheel` crate (`hub_flywheel.rs`).
@@ -153,18 +153,18 @@ fw hub activity --since 2h --workspace api --kind review --json
 ```
 
 - **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A row opens its object, else attaches.
-- **Kept** in `activity.jsonl`: rotated at 1 MiB or a week (`activity.1..5.jsonl`), 30 days. Only kind, ids, names, short facts: never terminal output, prompts, command text, grader output, paths; token-shaped words (long hex too) are `[redacted]`, in machines' rows as well.
+- **Kept** in `activity.jsonl`: rotated at 1 MiB or a week (`activity.1..5.jsonl`), 30 days. Only kind, ids, names, short facts: never terminal output, prompts, command text, grader output, paths; token-shaped words (long hex too) are `[redacted]`, machines' rows too.
 - **While you were away**: a browser back after 10+ min gets one card: turns finished, blocked now, fan-outs graded, commands suggested, cost.
-- **Machines**: asked at once (4 s each), merged, labelled; one not answering makes it `partial`.
+- **Machines**: asked at once (4 s each), merged, labelled; one silent makes it `partial`.
 
 ## Permissions
 
-Fewer prompts without handing agents more than they asked for. Palette **Permissions: FOLDER**, `fw hub perms show`.
+Palette **Permissions: FOLDER**, `fw hub perms show`.
 
 - **View**: Claude Code sources highest first (managed `/etc/claude-code` + `managed-settings.d`, the hub's `--settings` + `--permission-mode`, local at the main checkout's root, project, user) with each rule and file; Codex trust (`[projects."<repo>"]`), `approval_policy`, `sandbox_mode` and where each comes from, `rules/*.rules`.
 - **Always allow** (why?, quick answers' `always`, the sheet): the request from the `PermissionRequest` hook, else the dialog on screen; the narrowest rule (`Bash(cargo test -p app *)`: program, subcommand, scoping flags; else the exact command; one per command of a line).
 - Default file `.claude/settings.local.json` (warned when tracked; not ignored: `--gitignore` / the box adds it); user is opt-in. Preview: file, diff, "This lets the agent ...", a deny/ask that overrides it. Atomic, serialized, keys and layout kept; then Yes is typed only if the dialog on screen is that request.
-- **Never proposed**: every command, `rm`, `sudo`, `curl`/`wget`, interpreters, `git push` (also `git -C dir push`), `git *`, `cp`/`mv`/`tee`/`sed`/`awk *`, `gh pr merge`, whole MCP servers, pipes into a shell, substitutions, writes outside the repo or to `.claude/` `.git/`. Writing one takes the rule typed back (CLI: on a terminal). Rules holding `&&` `;` `|` are refused (never match).
+- **Never proposed**: every command, `rm`, `sudo`, `curl`/`wget`, interpreters, `git push` (also `git -C dir push`), `git *`, `cp`/`mv`/`tee`/`sed`/`awk *`, `gh pr merge`, whole MCP servers, pipes into a shell, substitutions, writes outside the repo or to `.claude/` `.git/`. Writing one takes the rule typed back (CLI: on a terminal). Rules with `&&` `;` `|` are refused.
 - **Suggestions**: `permission-requests.jsonl` (0600, 30 days; rules proposed, never commands) per repo, most frequent first, minus what a rule covers.
 - **Codex**: prefix rules to `.codex/rules/default.rules` (loaded once trusted) or `~/.codex`; `trust_level` in `$CODEX_HOME/config.toml`, `approval_policy` / `sandbox_mode` in `.codex/config.toml`; `never` and `danger-full-access` are typed back.
 - Writes: hub log line and `perms.allowed` (activity: agent, file, count).

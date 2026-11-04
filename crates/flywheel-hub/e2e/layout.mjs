@@ -55,71 +55,99 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // drawer's controls (the drawer lifts them above the stack, its frame
 // stays put, and drops the room once the toasts go).
 // Every character real Claude Code sessions print (tests/fixtures/
-// claude-glyphs.txt) is drawn by the vendored terminal fonts (JetBrains
+// claude-glyphs.txt), and every non-ASCII one on the live rows, is drawn
+// by the vendored terminal fonts (the stack's "FW ..." faces: JetBrains
 // Mono, then the JuliaMono "FW Symbols"), never a device font or a tofu
-// box: each in a span in the terminal's own font stack, asked which
-// platform font Chromium drew it with (and the same for the live rows).
-// That answer names the stack's first font even for a character no font
-// has (the box is its .notdef), so tofu is caught apart: each character,
-// and every non-ASCII one on the live rows, drawn on a canvas in the
-// stack must not match the drawing of an unassigned codepoint (U+0378,
-// in no font: the .notdef box).
+// box. Asked of the fonts alone, on a canvas (Chromium's platform-font
+// report names the stack's first font even for a box, and a device font
+// can fill any gap): a character the vendored faces lack draws the same
+// with them in front of a reference font as the reference alone (serif,
+// and again monospace), and one no font has draws the .notdef box of an
+// unassigned codepoint (U+0378). Characters known to be in no vendored
+// face must be caught, or the check is blind.
 const GLYPHS = fs.readFileSync(path.join(root, "crates/flywheel-hub/tests/fixtures/claude-glyphs.txt"), "utf8")
   .split("\n").filter((l) => l.startsWith("U+")).map((l) => parseInt(l.slice(2).split(" ")[0], 16))
   .filter((cp) => cp !== 0xa0);
+// CJK, an emoji, Cyrillic: in no vendored face (the subsets are Latin and
+// symbols), whatever the device has.
+const ABSENT = [0x4e2d, 0x1f916, 0x0436];
 async function glyphChecks(page, label) {
-  const { stack, tofu, probes } = await page.evaluate(async (cps) => {
+  const { stack, vendored, missing, caught, probes } = await page.evaluate(async ({ cps, absent }) => {
     const rows = document.querySelector(".xterm-rows");
     const stack = getComputedStyle(rows).fontFamily;
-    const box = document.createElement("div");
-    box.id = "e2e-glyphs";
-    box.style.cssText = `position:fixed;left:0;top:0;opacity:0;pointer-events:none;font-family:${stack};font-size:14px`;
-    for (const cp of cps) {
-      const span = document.createElement("span");
-      span.dataset.cp = cp.toString(16);
-      span.textContent = String.fromCodePoint(cp);
-      box.append(span);
-    }
-    document.body.append(box);
+    const vendored = stack.split(",").map((f) => f.trim()).filter((f) => /^"?FW /.test(f)).join(", ");
     const live = [...new Set(rows.textContent)].filter((ch) => ch.codePointAt(0) > 0x7f && ch !== "\u00a0");
     const probes = [...new Set([...cps.map((cp) => String.fromCodePoint(cp)), ...live])];
-    await document.fonts.load(`14px ${stack}`, box.textContent + live.join(""));
+    const all = probes.join("") + absent.map((cp) => String.fromCodePoint(cp)).join("");
+    // Every face a probe needs (the lazy symbols one by unicode-range).
+    await document.fonts.load(`24px ${vendored}`, all);
     await document.fonts.ready;
     const canvas = document.createElement("canvas");
     canvas.width = 48;
     canvas.height = 40;
     const g = canvas.getContext("2d", { willReadFrequently: true });
-    g.font = `24px ${stack}`;
-    const draw = (ch) => {
+    const draw = (font, ch) => {
+      g.font = `24px ${font}`;
       g.clearRect(0, 0, 48, 40);
       g.fillText(ch, 4, 30);
       return g.getImageData(0, 0, 48, 40).data.join(",");
     };
-    const notdef = draw("\u0378");
-    const tofu = probes.filter((ch) => draw(ch) === notdef)
-      .map((ch) => `U+${ch.codePointAt(0).toString(16).toUpperCase()}`);
-    return { stack, tofu, probes: probes.length };
-  }, GLYPHS);
-  const cdp = await page.context().newCDPSession(page);
-  await cdp.send("DOM.enable");
-  await cdp.send("CSS.enable");
-  const { root: doc } = await cdp.send("DOM.getDocument", { depth: -1 });
-  const vendored = (f) => /^(JetBrains Mono|JuliaMono)$/.test(f.familyName);
-  const fallback = [];
-  for (const selector of ["#e2e-glyphs span", ".xterm-rows > div"]) {
-    const { nodeIds } = await cdp.send("DOM.querySelectorAll", { nodeId: doc.nodeId, selector });
-    for (const nodeId of nodeIds) {
-      const { fonts } = await cdp.send("CSS.getPlatformFontsForNode", { nodeId });
-      const { attributes } = await cdp.send("DOM.getAttributes", { nodeId });
-      const cp = attributes.includes("data-cp") ? attributes[attributes.indexOf("data-cp") + 1] : "row";
-      for (const f of fonts.filter((f) => !vendored(f))) fallback.push(`${cp}:${f.familyName}`);
-    }
-  }
-  await page.evaluate(() => document.getElementById("e2e-glyphs").remove());
-  await cdp.detach();
+    const notdef = draw(vendored, "\u0378");
+    const lacks = (ch) =>
+      draw(vendored, ch) === notdef ||
+      ["serif", "monospace"].every((ref) => draw(`${vendored}, ${ref}`, ch) === draw(ref, ch));
+    const hex = (ch) => `U+${ch.codePointAt(0).toString(16).toUpperCase()}`;
+    return {
+      stack,
+      vendored,
+      missing: probes.filter(lacks).map(hex),
+      caught: absent.map((cp) => String.fromCodePoint(cp)).filter(lacks).length,
+      probes: probes.length,
+    };
+  }, { cps: GLYPHS, absent: ABSENT });
   check(stack.includes('"FW Symbols"'), `${label}: the terminal falls back to the vendored symbols (${stack})`);
-  check(!fallback.length, `${label}: ${GLYPHS.length} Claude Code characters drawn by vendored fonts (${JSON.stringify(fallback)})`);
-  check(!tofu.length, `${label}: none of ${probes} characters (fixture + live rows) is a tofu box (${JSON.stringify(tofu)})`);
+  check(caught === ABSENT.length, `${label}: the glyph check sees a character no vendored font has (${caught}/${ABSENT.length})`);
+  check(!missing.length, `${label}: all ${probes} characters (${GLYPHS.length} Claude Code + live rows) drawn by ${vendored} (missing ${JSON.stringify(missing)})`);
+}
+
+// Text shown exactly as written: JetBrains Mono's contextual forms and
+// ligatures are off where terminals, transcripts, suggested commands,
+// and the handoff text are drawn: "```", "->", "!=" stay their
+// characters. Each place's computed features say so, and that text drawn
+// in the terminal's own style matches it drawn with the features off,
+// not on (on, JetBrains Mono joins "->" and "!=").
+async function exactTextChecks(page, label, selectors) {
+  const styles = await page.evaluate((sels) => sels.map((sel) => {
+    const node = document.querySelector(sel);
+    if (!node) return [sel, null];
+    const cs = getComputedStyle(node);
+    return [sel, `${cs.fontVariantLigatures} ${cs.fontFeatureSettings}`];
+  }), selectors);
+  const loose = styles.filter(([, style]) => !style || !/^none\b/.test(style) || !/"calt" 0/.test(style) || !/"liga" 0/.test(style));
+  check(!loose.length, `${label}: no ligatures or contextual forms in ${selectors.join(" ")} (${JSON.stringify(loose)})`);
+  if (!selectors.includes(".xterm-rows")) return;
+  // Drawn over everything, in the terminal rows' font and (null) their
+  // computed features, or the features given.
+  const probe = async (features) => {
+    await page.evaluate((f) => {
+      const cs = getComputedStyle(document.querySelector(".xterm-rows"));
+      const span = document.createElement("span");
+      span.id = "e2e-ticks";
+      span.textContent = "x```-> != y";
+      span.style.cssText = `position:fixed;left:0;top:0;z-index:2147483647;display:inline-block;line-height:1.2;padding:4px;background:#000;color:#fff;font-size:28px;font-family:${cs.fontFamily}`;
+      span.style.fontVariantLigatures = f ? "normal" : cs.fontVariantLigatures;
+      span.style.fontFeatureSettings = f || cs.fontFeatureSettings;
+      document.body.append(span);
+    }, features);
+    const shot = await page.locator("#e2e-ticks").screenshot();
+    await page.evaluate(() => document.getElementById("e2e-ticks").remove());
+    return shot.toString("base64");
+  };
+  const shown = await probe(null);
+  const off = await probe('"calt" 0, "liga" 0');
+  const on = await probe('"calt" 1, "liga" 1');
+  check(on !== off, `${label}: JetBrains Mono's ligatures change "->" (the check can see them)`);
+  check(shown === off, `${label}: the terminal draws "\`\`\`-> !=" character by character`);
 }
 
 async function drawerChecks(page, label, phone) {
@@ -178,6 +206,24 @@ async function drawerChecks(page, label, phone) {
       return { open: true, box: [box.left, box.top, box.right, box.bottom].map(Math.round), bad };
     }, { w: which, phone });
     await page.screenshot({ path: path.join(out, `${label}-drawer-${which}-toast.png`) });
+    if (which === "commands") {
+      // The pickers show their choice whole, and a phone's hint names no
+      // keyboard shortcut.
+      const fit = await page.evaluate(() => [...document.querySelectorAll("#commands .cmd-field select")].map((select) => {
+        const cs = getComputedStyle(select);
+        const g = document.createElement("canvas").getContext("2d");
+        g.font = `${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+        const text = select.selectedOptions[0] ? select.selectedOptions[0].textContent : "";
+        const room = select.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 20;
+        return { id: select.id, text, fits: g.measureText(text).width <= room };
+      }));
+      const target = fit.find((f) => f.id === "cmd-target");
+      check(target && target.fits, `${label}: the commands drawer's send-to choice is shown whole (${JSON.stringify(target)})`);
+      if (phone) {
+        const hint = await page.evaluate(() => document.querySelector("#commands").textContent);
+        check(!/\bAlt\b|Ctrl|⌘/.test(hint), `${label}: the commands drawer names no keyboard shortcut on a phone`);
+      }
+    }
     const after = await page.evaluate(async (w) => {
       for (const n of [...document.querySelectorAll("#toasts .toast")]) n.remove();
       await new Promise((res) => setTimeout(res, 300));
@@ -218,7 +264,14 @@ case "$*" in
 esac
 echo 'fake claude'
 printf '> '
-exec cat
+# Typed "e2e-go" / "e2e-stop": a turn starts / finishes (seen-on-view).
+while IFS= read -r line; do
+  case "$line" in
+  *e2e-go*) "$FW_BIN" hub report --source claude --event UserPromptSubmit </dev/null >/dev/null 2>&1 ;;
+  *e2e-stop*) "$FW_BIN" hub report --source claude --event Stop </dev/null >/dev/null 2>&1 ;;
+  esac
+  printf '%s\n' "$line"
+done
 `, { mode: 0o755 });
 const repo = path.join(tmp, "repo");
 fs.mkdirSync(path.join(repo, ".git"), { recursive: true });
@@ -302,6 +355,13 @@ try {
   check(!s.empty, "desktop: no empty hero with a saved layout");
   check(s.floored === 0, "desktop: no pane held at the phone row floor");
   await glyphChecks(page, "desktop");
+  await exactTextChecks(page, "desktop", [".xterm-rows", "#cmd-list", "#tx-body", "#ho-text"]);
+  // Session and workspace names in a face that tells 1 from l and 0 from
+  // O ("c1" and "cl" read alike in the condensed display face).
+  const nameFaces = await page.evaluate(() => [".ws-name", ".session-name", ".crumb-session", ".crumb-ws", ".pane-name", ".tab-list [role=tab]", "#rv-title", "#q-title", "#tx-title"]
+    .map((sel) => [sel, document.querySelector(sel) && getComputedStyle(document.querySelector(sel)).fontFamily]));
+  const displayed = nameFaces.filter(([, face]) => !face || !/^"FW (Mono|Term)"/.test(face));
+  check(!displayed.length, `desktop: names in the UI mono (${JSON.stringify(displayed)})`);
   // The shells' prompts (top rows) are on screen, not clipped under the title.
   await page.waitForTimeout(800);
   const prompts = await page.evaluate(() => [...document.querySelectorAll("#terminal .pane-term")].map((host) => {
@@ -743,6 +803,28 @@ try {
     `phone: a question's option label is its label (${JSON.stringify(described && described.options[0])})`);
   check(described && described.options[0].detail === "Neutral and widely readable, a common safe default for UI accents." && described.options[3].detail === "",
     `phone: a question's option description is its detail (${JSON.stringify(described && described.options.map((o) => o.detail))})`);
+  // The real 55-column screen: option 1's description wraps, option 2's
+  // label wraps; read apart from the screen alone.
+  const realWrapped = fs.readFileSync(path.join(root, "crates/flywheel-hub/tests/fixtures/claude-ask-question-wrapped.txt"), "utf8").split("\n");
+  const fromScreen = await mp.evaluate((l) => window.FwHubPrompt.parse(l), realWrapped);
+  check(fromScreen && fromScreen.options[0].label === "1  Red" && fromScreen.options[0].detail === "A warm color that stands out on dark and light backgrounds alike"
+    && fromScreen.options[1].label === "2  A calm and deep ocean-like blue that suits documentation headings well" && fromScreen.options[1].detail === "Cool and quiet",
+    `phone: a real wrapped label and wrapped description stay apart (${JSON.stringify(fromScreen && fromScreen.options.slice(0, 3))})`);
+  // A whole label the screen cannot tell from a wrapped one (its
+  // description's first word would not have fit after it): the agent's
+  // own options (its status's questions) keep them apart.
+  const ambiguous = ["Which config?", "", "❯ 1. Use the existing configuration file in the repository root",
+    "     Supercalifragilistic defaults stay as they are", "  2. Start fresh", "     Writes a new file", "  3. Type something.",
+    "──────────────────────────────────────────────────────────────────────", "  4. Chat about this", "", "Enter to select · ↑/↓ to navigate · Esc to cancel"];
+  const questions = [{ question: "Which config should the setup use?", options: [
+    { label: "Use the existing configuration file in the repository root", description: "Supercalifragilistic defaults stay as they are" },
+    { label: "Start fresh", description: "Writes a new file" }] }];
+  const guessed = await mp.evaluate((l) => window.FwHubPrompt.parse(l), ambiguous);
+  const told = await mp.evaluate(([l, q]) => window.FwHubPrompt.parse(l, q), [ambiguous, questions]);
+  check(guessed && guessed.options[0].detail === "", `phone: the screen alone takes that description for more label (${JSON.stringify(guessed && guessed.options[0])})`);
+  check(told && told.options[0].label === "1  Use the existing configuration file in the repository root" && told.options[0].detail === "Supercalifragilistic defaults stay as they are"
+    && told.options[1].detail === "Writes a new file" && told.options[2].label === "3  Type something." && told.question === "Which config should the setup use?",
+    `phone: the agent's own options keep label and description apart (${JSON.stringify(told)})`);
   const wrappedLines = ["Would you like to run the following command?", "", "  $ cargo test -p parser", "",
     "› 1. Yes, proceed (y)", "  2. Yes, and don't ask again for commands that start with", "     `cargo test -p parser` (p)",
     "  3. No, and tell Codex what to do differently (esc)", "", "  Press enter to confirm or esc to cancel"];
@@ -1033,6 +1115,7 @@ try {
   await mp.waitForSelector(".xterm", { timeout: 15000 });
   await mp.waitForTimeout(800);
   await glyphChecks(mp, "phone /replay");
+  await exactTextChecks(mp, "phone /replay", [".xterm-rows"]);
   const replaySmall = await tapTargets(mp);
   check(replaySmall.length === 0, `phone: /replay tap targets at least 44x44 (${JSON.stringify(replaySmall)})`);
   await mp.screenshot({ path: path.join(out, "phone-replay.png") });
@@ -1041,10 +1124,108 @@ try {
   await viewer.waitForSelector(".xterm", { timeout: 15000 });
   await viewer.waitForTimeout(800);
   await glyphChecks(viewer, "phone /share");
+  await exactTextChecks(viewer, "phone /share", [".xterm-rows"]);
   const shareSmall = await tapTargets(viewer);
   check(shareSmall.length === 0, `phone: /share tap targets at least 44x44 (${JSON.stringify(shareSmall)})`);
   await viewer.screenshot({ path: path.join(out, "phone-share.png") });
   await phone.close();
+
+  // --- seen on view: a finished turn someone is looking at is seen -------
+  // On a page that is visible and focused, attached to the agent: a turn
+  // that ends after minutes without input (someone watched it work) is
+  // seen at once; one that started while nobody was here stays done until
+  // someone is back; one watched past WATCH_MS (30 min) counts as away.
+  const watch = await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", name: "watch", cols: 100, rows: 30 });
+  const seenCtx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const seenPage = await seenCtx.newPage();
+  await seenPage.clock.install();
+  await seenPage.goto(`${base}/login?token=${token}`);
+  await seenPage.waitForURL(`${base}/`);
+  await seenPage.goto(`${base}/#session=${watch.id}`);
+  await seenPage.waitForSelector("#terminal .pane.focused .xterm", { timeout: 15000 });
+  await seenPage.waitForTimeout(1500);
+  const say = (text) => execFileSync(fw, ["hub", "send", "--state-dir", state, watch.id, `${text}\n`]);
+  const statusOf = async () => ((await api("GET", `/api/sessions/${watch.id}`)).agent || {}).status;
+  const until = async (want) => {
+    for (let i = 0; i < 100; i++) {
+      const now = await statusOf();
+      if (now === want) return now;
+      await sleep(50);
+    }
+    return statusOf();
+  };
+  say("e2e-go");
+  await until("working");
+  await seenPage.clock.fastForward("06:00");
+  await seenPage.waitForTimeout(500);
+  say("e2e-stop");
+  let got = await until("idle");
+  check(got === "idle", `seen: a turn watched for 6 quiet minutes is seen when it ends (${got})`);
+  await seenPage.clock.fastForward("06:00");
+  await seenPage.waitForTimeout(500);
+  say("e2e-go");
+  await until("working");
+  await seenPage.waitForTimeout(500);
+  say("e2e-stop");
+  got = await until("done");
+  await seenPage.waitForTimeout(500);
+  got = await statusOf();
+  check(got === "done", `seen: a turn that started and ended while nobody was here stays done (${got})`);
+  await seenPage.mouse.move(700, 400);
+  await seenPage.mouse.move(720, 420);
+  got = await until("idle");
+  check(got === "idle", `seen: someone back at the page sees it (${got})`);
+  say("e2e-go");
+  await until("working");
+  await seenPage.waitForTimeout(500);
+  await seenPage.clock.fastForward("31:00");
+  await seenPage.waitForTimeout(500);
+  say("e2e-stop");
+  await until("done");
+  await seenPage.waitForTimeout(500);
+  got = await statusOf();
+  check(got === "done", `seen: a turn watched past 30 quiet minutes counts as away (${got})`);
+  await seenPage.evaluate(() => window.dispatchEvent(new Event("focus")));
+  got = await until("idle");
+  check(got === "idle", `seen: focusing the window counts as back (${got})`);
+
+  // Transcript viewer: tool results are collapsible blocks under their
+  // calls (named for the call's tool): a long Bash output shows its first
+  // lines until expanded, a question's answers whole.
+  const conversation = (await api("GET", `/api/sessions/${watch.id}`)).agent_session_id;
+  const bashOut = Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n");
+  const tline = (o) => JSON.stringify({ sessionId: conversation, timestamp: "2026-11-04T10:00:00.000Z", ...o });
+  fs.writeFileSync(path.join(claudeConfig, "projects", "e2e", `${conversation}.jsonl`), [
+    tline({ type: "user", uuid: "t-u1", message: { role: "user", content: "run it" } }),
+    tline({ type: "assistant", uuid: "t-a1", message: { id: "m-t1", role: "assistant", content: [{ type: "tool_use", id: "toolu_b", name: "Bash", input: { command: "seq 20" } }] } }),
+    tline({ type: "user", uuid: "t-u2", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_b", content: bashOut }] } }),
+    tline({ type: "assistant", uuid: "t-a2", message: { id: "m-t2", role: "assistant", content: [{ type: "tool_use", id: "toolu_q", name: "AskUserQuestion", input: { questions: [{ question: "Which color?", options: [{ label: "Red", description: "Warm" }, { label: "Blue", description: "Calm" }] }] } }] } }),
+    tline({ type: "user", uuid: "t-u3", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_q", content: 'User has answered your questions: "Which color?"="Red". You can now continue with the user\'s answers in mind.' }] } }),
+    tline({ type: "assistant", uuid: "t-a3", message: { id: "m-t3", role: "assistant", content: [{ type: "text", text: "Red it is." }] } }),
+  ].join("\n") + "\n");
+  // The hub finds a new conversation's file on its next look.
+  for (let i = 0; i < 100 && !(await api("GET", `/api/sessions/${watch.id}/transcript?before=1&after=1`)).transcript; i++) await sleep(100);
+  await seenPage.evaluate((id) => search.openTranscript({ session_id: id, session: "watch", workspace: "e2e", kind: "claude", state: "running" }, 0), watch.id);
+  await seenPage.waitForSelector("#tx-body .tx-msg.kind-result", { timeout: 10000 });
+  const results = () => seenPage.evaluate(() => [...document.querySelectorAll("#tx-body .tx-msg.kind-result")].map((a) => ({
+    who: a.querySelector(".tx-who").textContent,
+    open: a.querySelector("details.tx-result").open,
+    lines: a.querySelector(".tx-result pre").textContent.split("\n").length,
+    more: (a.querySelector(".tx-expand") || {}).textContent || "",
+  })));
+  let shownResults = await results();
+  check(shownResults.length === 2 && shownResults[0].who === "Bash result" && shownResults[0].open && shownResults[0].lines === 8 && shownResults[0].more === "Show all 20 lines",
+    `transcript: a long Bash output is a block cut to 8 lines with an expand (${JSON.stringify(shownResults)})`);
+  check(shownResults[1] && shownResults[1].who === "AskUserQuestion result" && shownResults[1].lines === 1 && !shownResults[1].more,
+    `transcript: a question's answers show whole (${JSON.stringify(shownResults[1])})`);
+  await seenPage.locator("#tx-body .tx-expand").first().click();
+  shownResults = await results();
+  check(shownResults[0].lines === 20 && shownResults[0].more === "Show less", `transcript: expanded, the whole output (${JSON.stringify(shownResults[0])})`);
+  await seenPage.locator("#tx-body .tx-result > summary").first().click();
+  shownResults = await results();
+  check(!shownResults[0].open, "transcript: a result block collapses");
+  await seenPage.screenshot({ path: path.join(out, "desktop-transcript-results.png") });
+  await seenCtx.close();
 } finally {
   if (browser) await browser.close();
   hub.kill("SIGTERM");

@@ -198,7 +198,7 @@ fn snippets_show_the_match_line_in_bounded_context() {
 }
 
 #[test]
-fn claude_lines_give_text_and_tool_calls_but_not_thinking_or_results() {
+fn claude_lines_give_text_tool_calls_and_results_but_not_thinking() {
     let line = json!({
         "type": "assistant", "uuid": "a1", "timestamp": "2026-11-02T10:00:00Z",
         "message": {"role": "assistant", "content": [
@@ -219,7 +219,11 @@ fn claude_lines_give_text_and_tool_calls_but_not_thinking_or_results() {
     assert_eq!(claude_messages(&user)[0].role, Role::User);
     let result = json!({"type": "user", "uuid": "u2", "message": {"role": "user", "content": [
         {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}});
-    assert!(claude_messages(&result).is_empty());
+    let results = claude_messages(&result);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].kind, MessageKind::Result);
+    assert_eq!(results[0].call.as_deref(), Some("t1"));
+    assert_eq!(results[0].text, "ok");
     let side = json!({"type": "assistant", "uuid": "s", "isSidechain": true,
         "message": {"content": "subagent"}});
     assert!(claude_messages(&side).is_empty());

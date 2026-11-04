@@ -334,6 +334,22 @@ impl Hub {
                 }
             }
         }
+        // A permission prompt's question tool (AskUserQuestion): its
+        // options as written, before the status that shows them is pushed.
+        if kind == SessionKind::Claude && report.event == "PermissionRequest" {
+            let questions = payload
+                .get("tool_input")
+                .map(crate::status::questions_of)
+                .unwrap_or_default();
+            let changed = self
+                .board()
+                .note_questions(&report.session, generation, questions);
+            if changed {
+                self.emit(HubEvent::Status {
+                    session_id: report.session.clone(),
+                });
+            }
+        }
         if let Some(signal) = signal {
             let source = StatusSource::Hook {
                 agent: report.source.clone(),
@@ -417,25 +433,36 @@ impl Hub {
                 session_id: id.to_owned(),
             });
         }
-        if before.shown() == Some(view.status) {
-            return;
-        }
         let Some(session) = self.event_session(id) else {
             return;
         };
-        self.emit_lifecycle(
-            "status.changed",
-            serde_json::json!({
-                "session": session,
-                "status": view.status,
-                "previous": before.shown(),
-                "detail": view.detail,
-                "since": view.since,
-                // A turn that ended while someone watched shows `idle`
-                // (seen), never `done`: this says it finished.
-                "turn_finished": finished,
-            }),
-        );
+        // `seen` (on `done` only): someone watched it finish.
+        let changed = |status: AgentStatus, previous: Option<AgentStatus>, seen: Option<bool>| {
+            self.emit_lifecycle(
+                "status.changed",
+                serde_json::json!({
+                    "session": session,
+                    "status": status,
+                    "previous": previous,
+                    "detail": view.detail,
+                    "since": view.since,
+                    "seen": seen,
+                }),
+            );
+        };
+        let mut previous = before.shown();
+        // Every finished turn says `done` once, as the activity journal's
+        // `turn.finished` does -- also one shown `idle` at once (ended
+        // while someone watched: `seen`, then `idle` follows) or one the
+        // board already showed `done` (an unseen turn, then another).
+        if finished {
+            let seen = view.status != AgentStatus::Done;
+            changed(AgentStatus::Done, previous, Some(seen));
+            previous = Some(AgentStatus::Done);
+        }
+        if previous != Some(view.status) {
+            changed(view.status, previous, None);
+        }
     }
 
     /// What a push notification about session `id` would say, and the

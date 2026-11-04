@@ -1,7 +1,8 @@
 # Every non-ASCII character Claude Code 2.1.306 (haiku) printed in real hub
 # sessions: splash, trust dialog, turns with edits/diffs, Bash permission
-# prompts, AskUserQuestion, markdown tables, spinners, mode footers
-# (recordings' output events plus screens; tests/glyphs.rs).
+# prompts, AskUserQuestion (wrapped), markdown tables, spinners, mode
+# footers, plan mode and its approval prompt (recordings' output events
+# plus screens; tests/glyphs.rs).
 U+00A0   NO-BREAK SPACE
 U+00B7 · MIDDLE DOT
 U+00E9 é LATIN SMALL LETTER E WITH ACUTE
@@ -27,6 +28,10 @@ U+252C ┬ BOX DRAWINGS LIGHT DOWN AND HORIZONTAL
 U+2534 ┴ BOX DRAWINGS LIGHT UP AND HORIZONTAL
 U+253C ┼ BOX DRAWINGS LIGHT VERTICAL AND HORIZONTAL
 U+254C ╌ BOX DRAWINGS LIGHT DOUBLE DASH HORIZONTAL
+U+256D ╭ BOX DRAWINGS LIGHT ARC DOWN AND RIGHT
+U+256E ╮ BOX DRAWINGS LIGHT ARC DOWN AND LEFT
+U+256F ╯ BOX DRAWINGS LIGHT ARC UP AND LEFT
+U+2570 ╰ BOX DRAWINGS LIGHT ARC UP AND RIGHT
 U+2580 ▀ UPPER HALF BLOCK
 U+2588 █ FULL BLOCK
 U+2590 ▐ RIGHT HALF BLOCK

@@ -139,6 +139,9 @@ pub enum MessageKind {
     Text,
     /// A tool call: the tool's name and its input.
     Tool,
+    /// What a tool call returned (its output; `tool` names the call's
+    /// tool when the index saw it).
+    Result,
 }
 
 /// One hit.

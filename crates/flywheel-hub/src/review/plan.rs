@@ -6,7 +6,6 @@ use super::runner;
 use super::{COMMIT_TIMEOUT, Git, MAX_FILES, PUSH_TIMEOUT, READ_LIMIT, Target, Tools};
 use crate::util::plural;
 use serde::Serialize;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -87,10 +86,32 @@ pub struct Plan {
     /// Pull request: the title and body offered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub defaults: Option<PrDefaults>,
-    /// Commit: the changed paths and what each held when planned.
+    /// Commit: the changed paths and what each held when planned (not
+    /// the ones left out).
     #[serde(skip)]
     pub contents: Vec<(String, String)>,
+    /// Commit: changed files that look like build output, secrets, or are
+    /// large, each with whether it is left out (`exclude`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suspects: Vec<Suspect>,
+    /// Commit: the changed paths left out (staged ones unstaged again).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<String>,
 }
+
+/// A changed file a commit-all may not want.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Suspect {
+    pub path: String,
+    /// `generated` (build or tool output), `secret` (keys, `.env`), or
+    /// `large` (over [`LARGE_FILE_BYTES`]).
+    pub kind: &'static str,
+    /// Left out of the commit.
+    pub excluded: bool,
+}
+
+/// A changed file at least this big is named before it is committed.
+pub const LARGE_FILE_BYTES: u64 = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PrDefaults {
@@ -200,20 +221,27 @@ fn path_contents(git: &Git<'_>, status: &[u8]) -> Vec<(String, String)> {
 pub(super) fn staged_as_planned(
     git: &Git<'_>,
     planned: &[(String, String)],
+    excluded: &[String],
 ) -> Result<bool, String> {
     let status = porcelain(git, &[])?;
-    let fully_staged = status
-        .split(|b| *b == 0)
-        .filter(|t| !t.is_empty())
-        .all(|entry| match entry.first() {
-            // "1 XY ...": Y is the work tree against the index.
-            Some(b'1') => entry.get(3) == Some(&b'.'),
-            _ => false,
-        });
+    let left_out = |path: &str| excluded.iter().any(|e| e == path);
+    let fully_staged = status_entries(&status).into_iter().all(|(entry, path)| {
+        left_out(&path)
+            || match entry.first() {
+                // "1 XY ...": Y is the work tree against the index.
+                Some(b'1') => entry.get(3) == Some(&b'.'),
+                _ => false,
+            }
+    });
     if !fully_staged {
         return Ok(false);
     }
-    let mut now = path_contents(git, &status);
+    // A left-out path still changed in the work tree: neither staged
+    // (checked above) nor part of the comparison.
+    let mut now: Vec<(String, String)> = path_contents(git, &status)
+        .into_iter()
+        .filter(|(path, _)| !left_out(path))
+        .collect();
     let mut planned = planned.to_vec();
     now.sort();
     planned.sort();
@@ -223,10 +251,19 @@ pub(super) fn staged_as_planned(
 /// The work-tree paths `git status --porcelain=v2 -z` names (changed,
 /// unmerged, untracked).
 pub(super) fn status_paths(status: &[u8]) -> Vec<String> {
+    status_entries(status)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
+}
+
+/// Each entry of `git status --porcelain=v2 -z` (changed, unmerged,
+/// untracked) with its work-tree path.
+fn status_entries(status: &[u8]) -> Vec<(&[u8], String)> {
     let mut paths = Vec::new();
     let mut tokens = status.split(|b| *b == 0).filter(|t| !t.is_empty());
-    while let Some(entry) = tokens.next() {
-        let entry = String::from_utf8_lossy(entry);
+    while let Some(raw) = tokens.next() {
+        let entry = String::from_utf8_lossy(raw);
         // Fields before the path: 1 -> 8, 2 -> 9 (then the source path as
         // its own token), u -> 10, ? -> 1.
         let (fields, renamed) = match entry.as_bytes().first() {
@@ -237,7 +274,7 @@ pub(super) fn status_paths(status: &[u8]) -> Vec<String> {
             _ => continue,
         };
         if let Some(path) = entry.splitn(fields + 1, ' ').nth(fields) {
-            paths.push(path.to_owned());
+            paths.push((raw, path.to_owned()));
         }
         if renamed {
             tokens.next();
@@ -332,28 +369,88 @@ fn looks_generated(path: &str) -> bool {
         || path.starts_with("target/release/")
 }
 
-/// A commit plan's warning about new files that look generated (they are
-/// staged with the rest): the first few named.
-fn generated_warning<'a>(new_files: impl Iterator<Item = &'a str>) -> Option<String> {
-    let generated: Vec<&str> = new_files.filter(|p| looks_generated(p)).collect();
-    let first = generated.first()?;
-    let more = match generated.len() {
-        1 => String::new(),
-        n => format!(" and {} more", n - 1),
-    };
-    Some(format!(
-        "{} {first}{more} look{} generated and will be committed too; \
-         list {} in .gitignore to leave {} out",
-        plural(generated.len(), "new file"),
-        if generated.len() == 1 { "s" } else { "" },
-        if generated.len() == 1 { "it" } else { "them" },
-        if generated.len() == 1 { "it" } else { "them" },
-    ))
+/// Whether a file looks like a secret: a dotenv file (not a checked-in
+/// example), a private key or certificate store, credentials.
+fn looks_secret(path: &str) -> bool {
+    const EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks", "keystore", "ppk"];
+    const NAMES: &[&str] = &[
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+        ".netrc",
+        ".pgpass",
+        "credentials.json",
+    ];
+    const EXAMPLES: &[&str] = &["example", "sample", "template", "dist"];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let dotenv = name == ".env"
+        || name
+            .strip_prefix(".env.")
+            .is_some_and(|rest| !EXAMPLES.contains(&rest.rsplit('.').next().unwrap_or(rest)));
+    dotenv
+        || NAMES.contains(&name)
+        || name
+            .rsplit_once('.')
+            .is_some_and(|(stem, ext)| !stem.is_empty() && EXTENSIONS.contains(&ext))
+}
+
+/// What a commit-all would take that may not be wanted: each changed file
+/// still in the work tree that looks generated or secret (left out unless
+/// `exclude` says otherwise) or is large (kept unless excluded). `exclude`
+/// (`None`: those defaults) names exactly what is left out.
+fn suspects(dir: &Path, paths: &[&str], exclude: Option<&[String]>) -> Vec<Suspect> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let meta = dir.join(path).symlink_metadata().ok()?;
+            let kind = if looks_secret(path) {
+                "secret"
+            } else if looks_generated(path) {
+                "generated"
+            } else if meta.is_file() && meta.len() >= LARGE_FILE_BYTES {
+                "large"
+            } else {
+                return None;
+            };
+            let excluded = match exclude {
+                Some(list) => list.iter().any(|e| e == path),
+                None => kind != "large",
+            };
+            Some(Suspect {
+                path: (*path).to_owned(),
+                kind,
+                excluded,
+            })
+        })
+        .collect()
+}
+
+/// `git add -A` of the whole work tree, but for `excluded` (each path
+/// exactly, from the top: `:(top,literal,exclude)`).
+fn add_args(excluded: &[String]) -> Vec<String> {
+    let mut args = vec!["add".to_owned(), "-A".to_owned()];
+    if !excluded.is_empty() {
+        args.push("--".into());
+        args.push(":/".into());
+        args.extend(
+            excluded
+                .iter()
+                .map(|p| format!(":(top,literal,exclude){p}")),
+        );
+    }
+    args
 }
 
 /// Plan committing every change (staged, unstaged, untracked) with
-/// `message`.
-pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan, String> {
+/// `message`, but for what `exclude` leaves out (`None`: the files that
+/// look generated or secret; see [`Suspect`]).
+pub fn plan_commit(
+    tools: &Tools,
+    target: &Target,
+    message: &str,
+    exclude: Option<&[String]>,
+) -> Result<Plan, String> {
     let git = Git::new(tools, &target.dir);
     let review = read(tools, target)?;
     let (state, contents) = tree_snapshot(&git)?;
@@ -374,26 +471,51 @@ pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan
     } else if message.trim().is_empty() {
         refusal = Some("write a commit message".into());
     }
-    let mut details = Vec::new();
-    for f in &review.staged.files {
-        details.push(change_line("staged ", f));
-    }
-    for f in &review.unstaged.files {
-        details.push(change_line("", f));
-    }
-    for u in &review.untracked {
-        details.push(format!("new {}", u.path));
-    }
     // A file both staged and changed again since is one file.
-    let files = review
+    let mut changed: Vec<&str> = Vec::new();
+    for path in review
         .staged
         .files
         .iter()
         .chain(&review.unstaged.files)
         .map(|f| f.path.as_str())
         .chain(review.untracked.iter().map(|u| u.path.as_str()))
-        .collect::<HashSet<_>>()
-        .len();
+    {
+        if !changed.contains(&path) {
+            changed.push(path);
+        }
+    }
+    if let Some(unknown) = exclude
+        .unwrap_or_default()
+        .iter()
+        .find(|e| !changed.contains(&e.as_str()))
+    {
+        refusal.get_or_insert_with(|| format!("{unknown} has no change to leave out"));
+    }
+    let suspects = suspects(&target.dir, &changed, exclude);
+    let excluded: Vec<String> = match exclude {
+        Some(list) => list.to_vec(),
+        None => suspects
+            .iter()
+            .filter(|s| s.excluded)
+            .map(|s| s.path.clone())
+            .collect(),
+    };
+    let left_out = |path: &str| excluded.iter().any(|e| e == path);
+    let mut details = Vec::new();
+    for f in review.staged.files.iter().filter(|f| !left_out(&f.path)) {
+        details.push(change_line("staged ", f));
+    }
+    for f in review.unstaged.files.iter().filter(|f| !left_out(&f.path)) {
+        details.push(change_line("", f));
+    }
+    for u in review.untracked.iter().filter(|u| !left_out(&u.path)) {
+        details.push(format!("new {}", u.path));
+    }
+    let files = changed.iter().filter(|p| !left_out(p)).count();
+    if files == 0 && refusal.is_none() {
+        refusal = Some("every change is left out: nothing to commit".into());
+    }
     let branch = review
         .branch
         .clone()
@@ -407,16 +529,61 @@ pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan
             "more than {MAX_FILES} files change; the list is cut"
         ));
     }
-    warnings.extend(generated_warning(
-        review.untracked.iter().map(|u| u.path.as_str()),
-    ));
+    if !excluded.is_empty() {
+        warnings.push(format!(
+            "{} left out (still in the work tree; list {} in .gitignore to keep {} out)",
+            plural(excluded.len(), "file"),
+            if excluded.len() == 1 { "it" } else { "them" },
+            if excluded.len() == 1 { "it" } else { "them" },
+        ));
+    }
+    let kept: Vec<&Suspect> = suspects.iter().filter(|s| !s.excluded).collect();
+    if let Some(first) = kept.first() {
+        let looks = match first.kind {
+            "secret" => "like a secret",
+            "generated" => "generated",
+            _ => "large (5 MiB or more)",
+        };
+        let more = match kept.len() {
+            1 => String::new(),
+            n => format!(" ({} more like it)", n - 1),
+        };
+        warnings.push(format!(
+            "{} looks {looks} and is committed{more}",
+            first.path
+        ));
+    }
     let dir = &target.dir;
-    let add = Planned::new(
+    let mut add = vec![Planned::new(
         &tools.git,
         dir,
-        vec!["add".into(), "-A".into()],
+        add_args(&excluded),
         COMMIT_TIMEOUT,
-    );
+    )];
+    // Left out but staged already: unstaged again (no HEAD yet: dropped
+    // from the index), the work tree untouched.
+    let staged_out: Vec<String> = review
+        .staged
+        .files
+        .iter()
+        .filter(|f| left_out(&f.path))
+        .map(|f| format!(":(top,literal){}", f.path))
+        .collect();
+    if !staged_out.is_empty() {
+        let mut args: Vec<String> = if review.head.is_some() {
+            vec!["reset".into(), "-q".into(), "--".into()]
+        } else {
+            vec![
+                "rm".into(),
+                "--cached".into(),
+                "-q".into(),
+                "-r".into(),
+                "--".into(),
+            ]
+        };
+        args.extend(staged_out);
+        add.push(Planned::new(&tools.git, dir, args, COMMIT_TIMEOUT));
+    }
     let commit = Planned::new(
         &tools.git,
         dir,
@@ -424,20 +591,35 @@ pub fn plan_commit(tools: &Tools, target: &Target, message: &str) -> Result<Plan
         COMMIT_TIMEOUT,
     )
     .with_stdin(message.as_bytes().to_vec(), "the message");
+    let contents: Vec<(String, String)> = contents
+        .into_iter()
+        .filter(|(path, _)| !left_out(path))
+        .collect();
+    add.push(commit);
+    let excluded_key = excluded.join("\u{0}");
     Ok(Plan {
         action: "commit",
-        summary: format!(
-            "Stage all {} and commit them on {branch}",
-            plural(files, "file")
-        ),
+        summary: match (excluded.len(), files) {
+            (0, _) => format!(
+                "Stage all {} and commit them on {branch}",
+                plural(files, "file")
+            ),
+            (out, 1) => format!("Stage 1 file (leaving {out} out) and commit it on {branch}"),
+            (out, _) => format!(
+                "Stage {} (leaving {out} out) and commit them on {branch}",
+                plural(files, "file")
+            ),
+        },
         details,
         warnings,
-        commands: vec![add, commit],
-        fingerprint: fingerprint(&["commit", &state, message]),
+        commands: add,
+        fingerprint: fingerprint(&["commit", &state, message, &excluded_key]),
         refusal,
         needs_rebase: false,
         defaults: None,
         contents,
+        suspects,
+        excluded,
     })
 }
 
@@ -616,6 +798,8 @@ pub fn plan_push(tools: &Tools, target: &Target, remote: Option<&str>) -> Result
         needs_rebase: false,
         defaults: None,
         contents: Vec::new(),
+        suspects: Vec::new(),
+        excluded: Vec::new(),
     })
 }
 
@@ -631,6 +815,8 @@ pub(super) fn refused(action: &'static str, why: &str) -> Plan {
         needs_rebase: false,
         defaults: None,
         contents: Vec::new(),
+        suspects: Vec::new(),
+        excluded: Vec::new(),
     }
 }
 
@@ -661,16 +847,28 @@ mod tests {
         ] {
             assert!(!looks_generated(path), "{path}");
         }
-        assert_eq!(generated_warning(["calc.py", "notes.md"].into_iter()), None);
-        assert_eq!(
-            generated_warning(["calc.py", "__pycache__/calc.cpython-313.pyc"].into_iter()).unwrap(),
-            "1 new file __pycache__/calc.cpython-313.pyc looks generated and will be committed \
-             too; list it in .gitignore to leave it out"
-        );
-        let two = generated_warning(["a.pyc", "b.pyc"].into_iter()).unwrap();
-        assert!(
-            two.starts_with("2 new files a.pyc and 1 more look generated"),
-            "{two}"
-        );
+        for path in [
+            ".env",
+            "app/.env.local",
+            ".env.production",
+            "certs/server.pem",
+            "tls.key",
+            "store.p12",
+            "home/id_ed25519",
+            ".netrc",
+        ] {
+            assert!(looks_secret(path), "{path}");
+        }
+        for path in [
+            ".env.example",
+            "config/.env.sample",
+            ".env.local.template",
+            "id_ed25519.pub",
+            "keys.md",
+            "src/env.rs",
+            ".key",
+        ] {
+            assert!(!looks_secret(path), "{path}");
+        }
     }
 }

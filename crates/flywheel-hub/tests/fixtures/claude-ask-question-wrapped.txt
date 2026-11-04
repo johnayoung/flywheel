@@ -1,0 +1,17 @@
+ ☐ Heading color
+
+Which color should be used for the README heading?
+
+❯ 1. Red
+     A warm color that stands out on dark and light
+     backgrounds alike
+  2. A calm and deep ocean-like blue that suits
+     documentation headings well
+     Cool and quiet
+  3. Green
+     Fresh
+  4. Type something.
+───────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

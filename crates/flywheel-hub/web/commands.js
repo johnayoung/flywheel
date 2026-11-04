@@ -606,9 +606,12 @@ window.FwHubCommands = function (ctx) {
         selected: !!(target && target.session && s.id === target.session.id),
       }));
     if (canOpenCompanion(source)) {
+      // The picker says what it is (a worktree's branch would not fit,
+      // least of all on a phone); the hint under it says where.
       options.push(el("option", {
         value: NEW_COMPANION,
-        textContent: `new shell in ${placeOf(source)} (companion)`,
+        textContent: "new companion shell",
+        title: `new shell in ${placeOf(source)} (companion)`,
         selected: !!(target && target.open),
       }));
     }

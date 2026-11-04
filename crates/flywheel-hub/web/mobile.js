@@ -150,7 +150,29 @@ window.FwHubPrompt = (function () {
     return true;
   }
 
-  function parse(lines) {
+  // The agent's own question (its tool call, from the status) whose
+  // options are the run's first ones, label for label: the screen wraps a
+  // long label and a description alike, the tool input never mixes them.
+  const norm = (text) => text.replace(/\s+/g, " ").trim();
+  // A multi-select option's box ("[ ] ", "[✔] ", "☐ ").
+  const BOX = /^(?:\[[ x✓✔]?\]|[☐☒✓✔])\s*/i;
+  function written(run, questions) {
+    for (const q of questions || []) {
+      const options = q.options || [];
+      if (!options.length || options.length > run.length) continue;
+      const same = options.every((choice, i) => {
+        const shown = norm(run[i].first.replace(BOX, "").replace(HOTKEY, ""));
+        const label = norm(choice.label || "");
+        return !!shown && !!label && (label.startsWith(shown) || shown.startsWith(label));
+      });
+      if (same) return q;
+    }
+    return null;
+  }
+
+  // `questions` (optional): the blocked agent's question tool input, as
+  // its status carries it ([{question, options:[{label, description}]}]).
+  function parse(lines, questions) {
     const run = numberedRun(lines);
     const yn = yesNoLine(lines);
     let menu = cursorMenu(lines);
@@ -184,6 +206,7 @@ window.FwHubPrompt = (function () {
     // widest line), its description (AskUserQuestion's) from the first
     // line that starts where a short one left room.
     const width = Math.max(...lines.map((l) => l.trimEnd().length));
+    for (const option of run) option.first = option.text;
     run.forEach((option, i) => {
       const next = run[i + 1];
       option.detail = "";
@@ -201,6 +224,16 @@ window.FwHubPrompt = (function () {
         above = lines[j].trimEnd().length;
       }
     });
+    // As the agent wrote them, when it says (Claude's AskUserQuestion).
+    const asked = written(run, questions);
+    if (asked) {
+      asked.options.forEach((choice, i) => {
+        const box = BOX.exec(run[i].first);
+        run[i].text = `${box ? box[0] : ""}${choice.label}`;
+        run[i].detail = choice.description || "";
+      });
+      question = asked.question;
+    }
     return {
       question,
       options: run.map(({ n, text, detail }) => {
@@ -552,7 +585,7 @@ window.FwHubMobile = function (ctx) {
       }
       return;
     }
-    const prompt = window.FwHubPrompt.parse(screenLines(true));
+    const prompt = window.FwHubPrompt.parse(screenLines(true), agent.questions);
     const options = prompt ? prompt.options : [];
     // Claude's "permission to use Bash" names the tool only: add the
     // command its dialog shows between its dashed rules.
@@ -579,13 +612,18 @@ window.FwHubMobile = function (ctx) {
       ctx.onKey();
     };
     const buttons = options.map((option) => {
-      const button = el("button", {
-        type: "button",
-        className: "qa",
-        textContent: option.label,
-        title: `Answer: ${option.label}${option.detail ? ` (${option.detail})` : ""}`,
-        onclick: answer(option.seq),
-      });
+      // The label is the button; a description (AskUserQuestion's) is
+      // the secondary line under it, never part of the label.
+      const button = el(
+        "button",
+        {
+          type: "button",
+          className: "qa",
+          title: `Answer: ${option.label}${option.detail ? ` (${option.detail})` : ""}`,
+          onclick: answer(option.seq),
+        },
+        el("span", { className: "qa-label", textContent: option.label }),
+      );
       if (option.detail) button.append(el("span", { className: "qa-detail", textContent: option.detail }));
       holdFocus(button);
       return button;

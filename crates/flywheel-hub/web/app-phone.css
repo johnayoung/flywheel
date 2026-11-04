@@ -32,7 +32,7 @@
   .menu-toggle { display: inline-grid; }
   #term-header { padding: .5rem .7rem; gap: .5rem; }
   .crumb-ws { display: none; }
-  .crumb-session { font-size: 1.4rem; }
+  .crumb-session { font-size: 1.05rem; }
   .meter { display: none; }
   .ruler { margin: 0 .7rem; }
   #stage { margin: .3rem .4rem .4rem; }
@@ -207,7 +207,9 @@ body.kb-open .mobilebar { padding-bottom: .35rem; }
   font: 500 12px/1.2 var(--mono);
   touch-action: manipulation;
 }
-/* An option's description (AskUserQuestion's), under its label. */
+/* An option's label (the answer), then its description (AskUserQuestion's)
+   on a quieter line under it: never one string. */
+.qa-label { display: block; overflow: hidden; text-overflow: ellipsis; }
 .qa-detail {
   display: block;
   margin-top: .2rem;
@@ -431,7 +433,7 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   .cmd-pill { font-size: 0; gap: 0; padding: .45rem; }
   .cmd-pill svg { width: .95rem; height: .95rem; }
   .cmd-pill b { font-size: 10px; margin-left: .3rem; }
-  .crumb-session { font-size: 1.25rem; }
+  .crumb-session { font-size: 1rem; }
   .meters { gap: .4rem; }
   #link { display: none; }
   #stage { margin: .25rem .2rem .2rem; }

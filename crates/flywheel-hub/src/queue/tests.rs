@@ -30,6 +30,7 @@ fn status(status: AgentStatus, since: i64) -> Option<StatusView> {
         status,
         detail: None,
         since: at(since),
+        questions: Vec::new(),
     })
 }
 

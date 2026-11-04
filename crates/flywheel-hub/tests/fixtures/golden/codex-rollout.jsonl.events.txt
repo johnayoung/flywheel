@@ -10,14 +10,15 @@
 @1246 Some("2026-11-03T05:00:02.000Z")
 @1370 Some("2026-11-03T05:00:02.500Z")
 @1546 Some("2026-11-03T05:00:03.000Z")
-  ToolCall { id: "call_A1", name: "shell", input: "command: [\"bash\",\"-lc\",\"cargo test\"]\nworkdir: /home/dev/code/demo" }
+  ToolCall { id: "call_A1", name: "shell", input: "command: [\"bash\",\"-lc\",\"cargo test\"]\nworkdir: /home/dev/code/demo", call: Some("call_A1") }
 @1778 Some("2026-11-03T05:00:04.000Z")
+  ToolResult { id: "call_A1#result", call: "call_A1", output: "test result: ok\n```\nnot a reply\n```", error: false }
 @2005 Some("2026-11-03T05:00:04.500Z")
   TokenCount { total: Some(CodexTotals { input: 4000, cached: 1000, output: 200 }), last: Some(CodexTotals { input: 4000, cached: 1000, output: 200 }) }
 @2431 Some("2026-11-03T05:00:05.000Z")
-  ToolCall { id: "call_B2", name: "apply_patch", input: "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** End Patch" }
+  ToolCall { id: "call_B2", name: "apply_patch", input: "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** End Patch", call: Some("call_B2") }
 @2677 Some("2026-11-03T05:00:05.500Z")
-  ToolCall { id: "call_C3", name: "shell", input: "ls -la" }
+  ToolCall { id: "call_C3", name: "shell", input: "ls -la", call: Some("call_C3") }
 @2934 Some("2026-11-03T05:00:06.000Z")
   Text { role: Assistant, id: "@2934", parts: [Part { kind: Output, text: "Tests pass. Run them with:\n\n```bash\ncargo test\n" }, Part { kind: Output, text: "```\n\nOr one crate:\n```sh\ncargo test -p demo\n```" }] }
 @3227 Some("2026-11-03T05:00:06.100Z")

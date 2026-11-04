@@ -741,6 +741,33 @@ window.FwHubSearch = function (ctx) {
     }
   }
 
+  // A tool's result (Bash output, a question's answers): a collapsible
+  // block, open, its first RESULT_LINES lines until expanded. The message
+  // a search hit opened on shows whole, its match in view.
+  const RESULT_LINES = 8;
+  function resultBlock(m) {
+    const lines = m.text.split("\n");
+    const pre = el("pre", { className: "tx-text" });
+    const long = lines.length > RESULT_LINES;
+    let whole = !long || m.index === viewer.focus;
+    const more = long
+      ? el("button", { type: "button", className: "text-btn tx-expand", onclick: () => { whole = !whole; fill(); } })
+      : null;
+    function fill() {
+      pre.replaceChildren(marked(whole ? m.text : lines.slice(0, RESULT_LINES).join("\n"), viewer.re, viewer.literal));
+      if (more) more.textContent = whole ? "Show less" : `Show all ${lines.length} lines`;
+    }
+    fill();
+    const count = m.text ? `${lines.length} line${lines.length === 1 ? "" : "s"}` : "no output";
+    return el(
+      "details",
+      { className: `tx-result${m.error ? " error" : ""}`, open: true },
+      el("summary", { textContent: `output · ${count}` }),
+      pre,
+      more,
+    );
+  }
+
   function renderTranscript(scrollToFocus) {
     const body = $("#tx-body");
     const list = [...viewer.messages.values()].sort((a, b) => a.index - b.index);
@@ -752,7 +779,9 @@ window.FwHubSearch = function (ctx) {
     }
     const canSend = !!ctx.handoff && ctx.handoff().targets(viewer.session.session_id).length > 0;
     for (const m of list) {
-      const who = m.kind === "tool" ? `tool · ${m.tool || ""}` : m.role;
+      const who = m.kind === "tool" ? `tool · ${m.tool || ""}`
+        : m.kind === "result" ? `${m.tool || "tool"} result${m.error ? " · error" : ""}`
+        : m.role;
       nodes.push(el(
         "article",
         { className: `tx-msg role-${m.role} kind-${m.kind}${m.index === viewer.focus ? " focus" : ""}`, dataset: { index: String(m.index) } },
@@ -785,7 +814,7 @@ window.FwHubSearch = function (ctx) {
             })
             : null,
         ),
-        el("pre", { className: "tx-text" }, marked(m.text, viewer.re, viewer.literal)),
+        m.kind === "result" ? resultBlock(m) : el("pre", { className: "tx-text" }, marked(m.text, viewer.re, viewer.literal)),
       ));
     }
     const last = list[list.length - 1];

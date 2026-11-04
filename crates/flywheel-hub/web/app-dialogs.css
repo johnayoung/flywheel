@@ -527,7 +527,7 @@
   text-transform: none;
 }
 /* A phone: each picker's label above it, so the select has the sheet's
-   width ("new shell in repo1 (companion)" whole at 16px). */
+   width (its choice whole at 16px). */
 @media (max-width: 760px) {
   .cmd-field { flex-basis: 100%; flex-direction: column; align-items: stretch; gap: .25rem; }
 }
@@ -729,4 +729,15 @@ body.toast-docked dialog.sheet:modal {
   .toasts, .toasts[popover] { right: .6rem; left: .6rem; justify-items: stretch; }
   .toasts { bottom: .6rem; }
   .toast { max-width: none; }
+}
+
+/* Titles that are a session's name: the UI mono, which tells 1 from l and
+   0 from O ("c1" and "cl" read alike in the display face). */
+#rv-title, #q-title, #tx-title {
+  font-family: var(--mono);
+  font-size: 1.3rem;
+  font-weight: 700;
+  font-stretch: 87.5%;
+  letter-spacing: 0;
+  text-transform: none;
 }

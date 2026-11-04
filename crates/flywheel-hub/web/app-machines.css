@@ -31,7 +31,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font: 700 .92rem/1 var(--display);
+  font: 700 12px/1 var(--mono);
   letter-spacing: .08em;
   color: var(--ink-2);
 }
@@ -117,7 +117,7 @@
 }
 .machine-row .machine-dot { margin-top: .3rem; }
 .machine-row-text { display: grid; gap: .15rem; min-width: 0; }
-.machine-row-text b { font: 700 1rem/1 var(--display); letter-spacing: .06em; text-transform: uppercase; }
+.machine-row-text b { font: 700 12px/1 var(--mono); }
 .machine-row-text small { color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
 .machine-row-text .machine-err { color: var(--alert); }
 .machine-row-text .machine-fp { font-size: 9.5px; }

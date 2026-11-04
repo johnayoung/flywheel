@@ -89,6 +89,8 @@ pub(crate) enum MergeVia {
 pub enum Action {
     Commit {
         message: String,
+        /// What is left out (`None`: what looks generated or secret).
+        exclude: Option<Vec<String>>,
     },
     Push {
         remote: Option<String>,
@@ -326,9 +328,9 @@ impl Hub {
     ) -> Result<Plan, HubError> {
         let (record, target) = self.review_target(tools, id, None)?;
         let plan = match action {
-            Action::Commit { message } => {
+            Action::Commit { message, exclude } => {
                 super::check_message(message).map_err(action_error)?;
-                super::plan_commit(tools, &target, message)
+                super::plan_commit(tools, &target, message, exclude.as_deref())
             }
             Action::Push { remote } => super::plan_push(tools, &target, remote.as_deref()),
             Action::Pr(request) => super::plan_pr(tools, &target, request),
@@ -411,7 +413,9 @@ impl Hub {
             return Err(StateError::Conflict(why).into());
         }
         let result = match action {
-            Action::Commit { message } => super::commit(tools, &target, message, confirm),
+            Action::Commit { message, exclude } => {
+                super::commit(tools, &target, message, exclude.as_deref(), confirm)
+            }
             Action::Push { remote } => super::push(tools, &target, remote.as_deref(), confirm),
             Action::Pr(request) => super::pr(tools, &target, request, confirm),
             Action::Rebase => super::rebase(tools, &target, confirm),

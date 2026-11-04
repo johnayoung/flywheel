@@ -168,7 +168,8 @@ fn ids_fall_back_in_order() {
         [Event::ToolCall {
             id: "c".into(),
             name: "shell".into(),
-            input: String::new()
+            input: String::new(),
+            call: Some("c".into()),
         }]
     );
     let bare = codex(json!({"type": "custom_tool_call"}));
@@ -283,4 +284,54 @@ fn tails_stop_at_the_deadline_and_report_missing_files() {
         .unwrap()
     );
     assert_eq!(lines, 1);
+}
+
+#[test]
+fn tool_results_pair_with_their_calls() {
+    let claude = |line: Value| parse(Format::Claude, &line, 0).events;
+    let used = claude(
+        json!({"type": "assistant", "uuid": "a", "message": {"content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}]}}),
+    );
+    assert!(matches!(&used[0], Event::ToolCall { call: Some(c), .. } if c == "toolu_1"));
+    let results = claude(json!({"type": "user", "uuid": "u", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a\nb"},
+        {"type": "tool_result", "tool_use_id": "toolu_2", "is_error": true,
+         "content": [{"type": "text", "text": "Exit code 1"}, {"type": "image", "source": {}}, {"type": "text", "text": "boom"}]},
+    ]}}));
+    assert_eq!(
+        results,
+        [
+            Event::ToolResult {
+                id: "u#result0".into(),
+                call: "toolu_1".into(),
+                output: "a\nb".into(),
+                error: false
+            },
+            Event::ToolResult {
+                id: "u#result1".into(),
+                call: "toolu_2".into(),
+                output: "Exit code 1\n[image]\nboom".into(),
+                error: true
+            },
+        ]
+    );
+    let codex = |line: Value| parse(Format::Codex, &line, 3).events;
+    let wrapped = codex(
+        json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "call_9",
+        "output": "{\"output\":\"total 0\\n\",\"metadata\":{\"exit_code\":0}}"}}),
+    );
+    assert_eq!(
+        wrapped,
+        [Event::ToolResult {
+            id: "call_9#result".into(),
+            call: "call_9".into(),
+            output: "total 0\n".into(),
+            error: false
+        }]
+    );
+    let plain =
+        codex(json!({"type": "custom_tool_call_output", "call_id": "c2", "output": "Done!"}));
+    assert!(matches!(&plain[0], Event::ToolResult { output, .. } if output == "Done!"));
+    assert!(codex(json!({"type": "function_call_output", "output": "orphan"})).is_empty());
 }

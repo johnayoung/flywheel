@@ -382,6 +382,32 @@ async fn a_worktree_session_is_reviewed_committed_pushed_merged_and_removed() {
     assert_eq!(ask["paste"]["ran"], true);
     screen_shows(&hub, &agent_id, "Write a commit message").await;
 
+    // Commit all names a secret it leaves out by default; `exclude` (here
+    // none) says exactly what is left out.
+    std::fs::write(wt.join(".env"), "TOKEN=x\n").unwrap();
+    let (status, plan) = hub
+        .post(
+            &format!("/api/sessions/{agent_id}/review/commit"),
+            json!({ "message": "x", "dry_run": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(
+        plan["suspects"],
+        json!([{ "path": ".env", "kind": "secret", "excluded": true }])
+    );
+    assert_eq!(plan["excluded"], json!([".env"]));
+    let (status, plan) = hub
+        .post(
+            &format!("/api/sessions/{agent_id}/review/commit"),
+            json!({ "message": "x", "dry_run": true, "exclude": [] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["suspects"][0]["excluded"], false, "{plan}");
+    assert!(plan.get("excluded").is_none(), "{plan}");
+    std::fs::remove_file(wt.join(".env")).unwrap();
+
     // Commit all: no fingerprint, nothing runs; a stale one is refused.
     let (status, refused) = hub
         .post(

@@ -79,6 +79,9 @@ pub(super) struct ActionBody {
     dry_run: bool,
     confirm: Option<String>,
     message: Option<String>,
+    /// Commit: the changed paths left out (absent: what looks generated
+    /// or secret).
+    exclude: Option<Vec<String>>,
     remote: Option<String>,
     title: Option<String>,
     body: Option<String>,
@@ -91,6 +94,7 @@ fn action(name: &str, body: &ActionBody) -> Action {
     match name {
         "commit" => Action::Commit {
             message: body.message.clone().unwrap_or_default(),
+            exclude: body.exclude.clone(),
         },
         "push" => Action::Push {
             remote: body.remote.clone(),

@@ -86,11 +86,22 @@ pub enum Event {
         id: String,
         parts: Vec<Part>,
     },
-    /// A tool call: the tool's name and its input as text ([`tool_text`]).
+    /// A tool call: the tool's name and its input as text ([`tool_text`]);
+    /// `call` names it for its result (Claude's `tool_use` id, Codex's
+    /// `call_id`).
     ToolCall {
         id: String,
         name: String,
         input: String,
+        call: Option<String>,
+    },
+    /// What a tool call returned (Claude's `tool_result`, Codex's
+    /// `function_call_output`): its output as text, for call `call`.
+    ToolResult {
+        id: String,
+        call: String,
+        output: String,
+        error: bool,
     },
     /// One Claude API response's usage.
     Usage(Turn),
@@ -181,6 +192,7 @@ fn claude(value: &Value, events: &mut Vec<Event>) {
     };
     let mut parts = Vec::new();
     let mut tools = Vec::new();
+    let mut results = Vec::new();
     match message.get("content") {
         Some(Value::String(text)) => parts.push(Part {
             kind: PartKind::Text,
@@ -194,6 +206,7 @@ fn claude(value: &Value, events: &mut Vec<Event>) {
                         text: text.to_owned(),
                     })),
                     Some("tool_use") => tools.push(part),
+                    Some("tool_result") => results.push(part),
                     _ => {}
                 }
             }
@@ -212,7 +225,35 @@ fn claude(value: &Value, events: &mut Vec<Event>) {
             id: format!("{id}#tool{i}"),
             name: str_of(part, "name").unwrap_or("tool").to_owned(),
             input: part.get("input").map(tool_text).unwrap_or_default(),
+            call: str_of(part, "id").map(str::to_owned),
         });
+    }
+    for (i, part) in results.into_iter().enumerate() {
+        events.push(Event::ToolResult {
+            id: format!("{id}#result{i}"),
+            call: str_of(part, "tool_use_id").unwrap_or_default().to_owned(),
+            output: part.get("content").map(result_text).unwrap_or_default(),
+            error: part.get("is_error").and_then(Value::as_bool) == Some(true),
+        });
+    }
+}
+
+/// A tool result's content as text: a string as written, or its text
+/// parts joined by newlines (an image part says so).
+fn result_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| match str_of(p, "type") {
+                Some("text") => str_of(p, "text").map(str::to_owned),
+                Some("image") => Some("[image]".to_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -299,6 +340,7 @@ fn codex(value: &Value, offset: u64, events: &mut Vec<Event>) {
         id: id(),
         name: name.to_owned(),
         input,
+        call: str_of(item, "call_id").map(str::to_owned),
     };
     let event = match str_of(item, "type") {
         Some("message") => {
@@ -354,6 +396,26 @@ fn codex(value: &Value, offset: u64, events: &mut Vec<Event>) {
                 })
                 .unwrap_or_default();
             call("shell", command)
+        }
+        Some("function_call_output" | "custom_tool_call_output") => {
+            let Some(call) = str_of(item, "call_id") else {
+                return;
+            };
+            // A JSON string `{"output": ..., "metadata": ...}`, or the text.
+            let output = match item.get("output") {
+                Some(Value::String(text)) => serde_json::from_str::<Value>(text)
+                    .ok()
+                    .and_then(|v| v.get("output").and_then(Value::as_str).map(str::to_owned))
+                    .unwrap_or_else(|| text.clone()),
+                Some(other) => result_text(other),
+                None => String::new(),
+            };
+            Event::ToolResult {
+                id: format!("{}#result", id()),
+                call: call.to_owned(),
+                output,
+                error: false,
+            }
         }
         _ => return,
     };

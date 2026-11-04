@@ -129,16 +129,37 @@ window.matchMedia(NARROW).addEventListener("change", () => {
 // typed into, or pointed at in the last IDLE_MS. A tab left focused on a
 // desk monitor while its user is away must not count as watching (it
 // would hold off every push about the session it shows).
+// A turn on screen that someone was here for is watched to its end,
+// though: whoever sat through an agent's work without touching anything
+// is reading the reply when it finishes (seen, not "done"), up to
+// WATCH_MS since their last input (past that, they have gone). One that
+// started while nobody was here (a queued prompt) is not.
 const IDLE_MS = 5 * 60 * 1000;
+const WATCH_MS = 30 * 60 * 1000;
 let lastInput = Date.now();
-let idleTimer = 0;
-const idle = () => Date.now() - lastInput >= IDLE_MS;
+let idleTimers = [];
+let watched = false;
+function workingOnScreen() {
+  const ids = [state.attached, ...livePanes().filter((p) => onStage(p)).map((p) => p.sessionId)];
+  return ids.some((id) => {
+    const session = id && sessionById(id);
+    const status = session && agentStatus(session);
+    return !!status && status.status === "working";
+  });
+}
+function idle() {
+  const quiet = Date.now() - lastInput;
+  const working = workingOnScreen();
+  if (!working) watched = false;
+  else if (quiet < IDLE_MS) watched = true;
+  return quiet >= IDLE_MS && !(watched && working && quiet < WATCH_MS);
+}
 function present() {
   return document.visibilityState === "visible" && document.hasFocus() && !idle();
 }
 function armIdle() {
-  clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => sendView(), IDLE_MS + 100);
+  for (const timer of idleTimers) clearTimeout(timer);
+  idleTimers = [IDLE_MS, WATCH_MS].map((ms) => setTimeout(() => sendView(), ms + 100));
 }
 function noteInput(event) {
   // Pointer moves are many: one a second is plenty.
@@ -318,6 +339,8 @@ function applyStatus(message) {
   }
   renderStatus();
   handoff.onStatus();
+  // A watched turn that ended may end the watch (see present()).
+  sendView();
 }
 
 // The other pushes; `machine`: the machine that sent it (null: here).

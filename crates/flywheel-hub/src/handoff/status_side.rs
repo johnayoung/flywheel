@@ -25,6 +25,9 @@ pub(crate) struct EntryExport {
     /// Absent from hubs before detection manifests.
     #[serde(default)]
     pub source: StatusSource,
+    /// Absent from hubs before question options.
+    #[serde(default)]
+    pub questions: Vec<super::Question>,
 }
 
 /// The whole board, minus viewers.
@@ -54,6 +57,7 @@ impl StatusBoard {
                     generation: e.key.generation,
                     changes: e.changes,
                     source: e.source.clone(),
+                    questions: e.questions.clone(),
                 }
             })
             .collect();
@@ -89,6 +93,7 @@ impl StatusBoard {
                     },
                     changes: e.changes,
                     source: e.source,
+                    questions: e.questions,
                 },
             );
         }

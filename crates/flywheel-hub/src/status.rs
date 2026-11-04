@@ -189,6 +189,66 @@ pub struct StatusView {
     pub detail: Option<String>,
     /// When the status last changed.
     pub since: DateTime<Utc>,
+    /// Blocked on a question tool (Claude's AskUserQuestion): its
+    /// questions and options as the agent wrote them, so a quick answer
+    /// shows each option's label and description apart (the screen wraps
+    /// both alike).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<Question>,
+}
+
+/// One question a blocked agent asks, as its tool call wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    pub question: String,
+    pub options: Vec<Choice>,
+}
+
+/// One of a question's options.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Choice {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// At most this many questions (AskUserQuestion takes 1-4) and options
+/// each (2-4, plus slack) are kept, each string bounded like a detail.
+const MAX_QUESTIONS: usize = 4;
+const MAX_CHOICES: usize = 8;
+
+/// The questions of a Claude Code `AskUserQuestion` tool input
+/// (`{"questions":[{"question","options":[{"label","description"}]}]}`);
+/// empty for any other tool.
+pub fn questions_of(tool_input: &serde_json::Value) -> Vec<Question> {
+    let text = |v: &serde_json::Value, key: &str| {
+        v.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(bounded_detail)
+            .unwrap_or_default()
+    };
+    tool_input
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_QUESTIONS)
+        .filter_map(|q| {
+            let options: Vec<Choice> = q
+                .get("options")?
+                .as_array()?
+                .iter()
+                .take(MAX_CHOICES)
+                .map(|o| Choice {
+                    label: text(o, "label"),
+                    description: text(o, "description"),
+                })
+                .filter(|c| !c.label.is_empty())
+                .collect();
+            let question = text(q, "question");
+            (!question.is_empty() && !options.is_empty()).then_some(Question { question, options })
+        })
+        .collect()
 }
 
 /// Who sees a status: one client, or "anyone" (the REST API, where a turn
@@ -222,6 +282,8 @@ struct Entry {
     changes: u64,
     /// What set the current status.
     source: StatusSource,
+    /// While blocked on a question tool: its questions.
+    questions: Vec<Question>,
 }
 
 impl Entry {
@@ -238,6 +300,7 @@ impl Entry {
             status,
             detail: self.detail.clone(),
             since: self.since,
+            questions: self.questions.clone(),
         }
     }
 }
@@ -312,6 +375,7 @@ impl StatusBoard {
                 key: key.clone(),
                 changes: 0,
                 source: StatusSource::None,
+                questions: Vec::new(),
             },
         );
         Ok(key)
@@ -375,6 +439,9 @@ impl StatusBoard {
             AgentStatus::Blocked => detail.map(bounded_detail),
             _ => None,
         };
+        if next.status != AgentStatus::Blocked {
+            entry.questions.clear();
+        }
         if next.status == AgentStatus::Done {
             // A turn finished: unseen by everyone except whoever is
             // looking at it right now.
@@ -422,7 +489,28 @@ impl StatusBoard {
             AgentStatus::Blocked => detail.map(bounded_detail),
             _ => None,
         };
+        if status != AgentStatus::Blocked {
+            entry.questions.clear();
+        }
         true
+    }
+
+    /// Note what spawn `generation`'s permission prompt asks (a question
+    /// tool's questions; empty: none). Kept while the status is blocked.
+    /// Returns whether it changed.
+    pub fn note_questions(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        questions: Vec<Question>,
+    ) -> bool {
+        match self.entries.get_mut(session_id) {
+            Some(entry) if entry.key.generation == generation && entry.questions != questions => {
+                entry.questions = questions;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// What set a session's current status.
@@ -920,5 +1008,78 @@ mod tests {
         assert_eq!(board.viewing(laptop), ["a"]);
         assert_eq!(board.disconnect(laptop), ["a"]);
         assert!(!board.is_watched("a"));
+    }
+
+    #[test]
+    fn a_question_tools_options_are_kept_while_blocked() {
+        let input = serde_json::json!({"questions": [
+            {"question": "Which color?", "header": "Color", "multiSelect": false, "options": [
+                {"label": "Red", "description": "A warm color\nthat stands out"},
+                {"label": "Blue"},
+                {"label": "", "description": "no label: dropped"},
+            ]},
+            {"question": "", "options": [{"label": "unasked"}]},
+            {"question": "No options?"},
+        ]});
+        let questions = questions_of(&input);
+        assert_eq!(
+            questions,
+            [Question {
+                question: "Which color?".into(),
+                options: vec![
+                    Choice {
+                        label: "Red".into(),
+                        description: "A warm color that stands out".into()
+                    },
+                    Choice {
+                        label: "Blue".into(),
+                        description: String::new()
+                    },
+                ],
+            }]
+        );
+        assert!(questions_of(&serde_json::json!({"command": "ls"})).is_empty());
+        let many: Vec<serde_json::Value> = (0..10)
+            .map(|i| serde_json::json!({"question": format!("q{i}"), "options": (0..20).map(|j| serde_json::json!({"label": format!("o{j}")})).collect::<Vec<_>>()}))
+            .collect();
+        let bounded = questions_of(&serde_json::json!({ "questions": many }));
+        assert_eq!(bounded.len(), MAX_QUESTIONS);
+        assert!(bounded.iter().all(|q| q.options.len() == MAX_CHOICES));
+
+        let (mut board, generation) = board_with("a", "w");
+        assert!(
+            !board.note_questions("a", generation + 1, questions.clone()),
+            "a replaced spawn's"
+        );
+        assert!(board.note_questions("a", generation, questions.clone()));
+        assert!(
+            !board.note_questions("a", generation, questions.clone()),
+            "unchanged"
+        );
+        assert!(board.apply("a", generation, Signal::Blocked, Some("Which color?")));
+        let view = board.status("a", Audience::Anyone).unwrap();
+        assert_eq!(view.questions, questions);
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            json["questions"][0]["options"][1],
+            serde_json::json!({"label": "Blue"})
+        );
+        // Answered: the agent works again, and the options go.
+        assert!(board.apply("a", generation, Signal::Working, None));
+        let view = board.status("a", Audience::Anyone).unwrap();
+        assert!(view.questions.is_empty());
+        assert!(
+            serde_json::to_value(&view)
+                .unwrap()
+                .get("questions")
+                .is_none()
+        );
+        // They move with a live handoff.
+        board.note_questions("a", generation, questions.clone());
+        let copy = StatusBoard::handoff_import(board.handoff_export());
+        assert_eq!(
+            copy.status("a", Audience::Anyone).unwrap().questions,
+            questions
+        );
     }
 }

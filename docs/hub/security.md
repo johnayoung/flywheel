@@ -18,7 +18,7 @@ Trust model, auth, remote access, TLS, machines, share links. Front door: [hub](
 - `/login?code=` (or `?token=`) sets an `HttpOnly; SameSite=Strict` cookie holding a fresh per-login secret, never the token (`Secure` under https). 30 days, max 256; `POST /logout` ends one.
 - Scripts: `Authorization: Bearer <token>`; codes are not bearer credentials. Cross-origin `Origin` is refused on WebSocket upgrades and every non-GET request.
 - 10 wrong credentials per client address (IPv6 /64) in 10 minutes -> 429, except with a live login cookie; direct local connections are exempt (a local tunnel such as `ssh -L` looks direct).
-- Authenticated and unauthenticated connections have separate pools; unauthenticated ones get 3 s for a request head and go first, so a flood never locks you out. A WebSocket that stops reading (terminal, share, events, `/m/` relay either way) is dropped after 60 s, nothing more written to it.
+- Authenticated and unauthenticated connections have separate pools; unauthenticated ones get 3 s for a request head, so a flood never locks you out. A WebSocket that stops reading (terminal, share, events, `/m/` relay either way) is dropped after 60 s, nothing more written to it.
 
 ## Remote access
 

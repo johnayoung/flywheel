@@ -202,6 +202,7 @@ pub fn hit_line(hit: &Value, color: bool) -> String {
         "transcript" => {
             let who = match str_field(hit, "kind") {
                 "tool" => format!("tool {}", text(hit, "tool")),
+                "result" => format!("result {}", text(hit, "tool")),
                 _ => text(hit, "role"),
             };
             format!("transcript #{} {who}", n("index"))

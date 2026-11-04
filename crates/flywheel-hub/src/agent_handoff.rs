@@ -363,6 +363,10 @@ impl Hub {
                     (crate::search::MessageKind::Tool, Some(tool)) => {
                         format!("a {tool} tool call from its transcript")
                     }
+                    (crate::search::MessageKind::Result, tool) => format!(
+                        "a {}tool result from its transcript",
+                        tool.as_deref().map(|t| format!("{t} ")).unwrap_or_default()
+                    ),
                     _ => format!("{role} from its transcript"),
                 };
                 Ok((what, "text".to_owned(), message.text))

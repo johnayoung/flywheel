@@ -103,7 +103,7 @@
 .fo-card.winner .fo-rank { color: var(--fw-ok-ink); background: var(--fw-ok); }
 .fo-main { display: grid; gap: .4rem; padding: .6rem .8rem .7rem; min-width: 0; }
 .fo-line { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .55rem; min-width: 0; }
-.fo-label { font: 800 1.15rem/1 var(--display); letter-spacing: .03em; }
+.fo-label { font: 700 14px/1 var(--mono); }
 .fo-line .glyph { display: inline-grid; place-items: center; width: 1rem; height: 1rem; }
 .fo-line .glyph svg { width: .85rem; height: .85rem; }
 .fo-agent { color: var(--ink); font-size: 11.5px; }

@@ -4,7 +4,7 @@ Every `fw hub` verb and flag, the serve flags, the hub's files (`docs_drift.rs` 
 
 ## Conventions
 
-- `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; ambiguity or no match errors; `activity` also takes one only its journal or a machine names).
+- `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; ambiguity or no match errors; `activity` also takes names only its journal or a machine knows).
 - Output into a closed pipe (`| head -1`) ends a verb quietly, exit 0.
 - Every verb but `report` takes `--state-dir DIR` (default `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub`).
 - `{remote}` = `[--url URL] [--token T] [--fingerprint SHA256]`: a hub elsewhere; prefer `FW_HUB_TOKEN` (argv is world-readable). TLS trust: [hub-security](security.md#https-without-tailscale).
@@ -163,7 +163,7 @@ Taken by `serve`, `start`, `install-service`. All but `--notify-url` are also `h
 
 ## hub.toml
 
-`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors (`serve` exits 2). Edits are re-read within 1 s: live keys apply, the rest at restart; an invalid edit keeps the last good ones.
+`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors (`serve` exits 2). Edits are re-read within 1 s: live keys apply, the rest at restart; an invalid edit keeps the last good.
 
 ```toml
 [server]

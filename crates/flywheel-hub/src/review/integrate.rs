@@ -250,6 +250,8 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
         needs_rebase: false,
         defaults: Some(defaults),
         contents: Vec::new(),
+        suspects: Vec::new(),
+        excluded: Vec::new(),
     })
 }
 
@@ -327,6 +329,8 @@ pub fn plan_rebase(tools: &Tools, target: &Target) -> Result<Plan, String> {
         needs_rebase: false,
         defaults: None,
         contents: Vec::new(),
+        suspects: Vec::new(),
+        excluded: Vec::new(),
     })
 }
 
@@ -365,6 +369,8 @@ pub fn plan_abort(tools: &Tools, target: &Target) -> Result<Plan, String> {
         needs_rebase: false,
         defaults: None,
         contents: Vec::new(),
+        suspects: Vec::new(),
+        excluded: Vec::new(),
     })
 }
 
@@ -502,5 +508,7 @@ pub fn plan_merge(tools: &Tools, target: &Target) -> Result<Plan, String> {
         needs_rebase,
         defaults: None,
         contents: Vec::new(),
+        suspects: Vec::new(),
+        excluded: Vec::new(),
     })
 }

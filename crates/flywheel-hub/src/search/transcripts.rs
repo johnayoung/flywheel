@@ -21,15 +21,27 @@ pub struct Extracted {
     pub tool: Option<String>,
     pub timestamp: Option<String>,
     pub text: String,
+    /// A tool call's or result's call id (pairs them up).
+    pub call: Option<String>,
+    /// A tool result that reports a failure.
+    pub error: bool,
 }
 
-fn tool_message(id: String, name: &str, input: String, timestamp: Option<String>) -> Extracted {
+fn tool_message(
+    id: String,
+    name: &str,
+    input: String,
+    call: Option<String>,
+    timestamp: Option<String>,
+) -> Extracted {
     Extracted {
         id,
         role: Role::Assistant,
         kind: MessageKind::Tool,
         tool: Some(name.to_owned()),
         timestamp,
+        call,
+        error: false,
         text: if input.is_empty() {
             name.to_owned()
         } else {
@@ -41,7 +53,8 @@ fn tool_message(id: String, name: &str, input: String, timestamp: Option<String>
 /// The searchable messages in a parsed transcript line (see
 /// [`crate::agentlog`]): its text as one message (Claude's parts joined
 /// by blank lines, Codex's by newlines; blank text left out), each tool
-/// call as another. Thinking, tool results, and images are left out.
+/// call as another, and each tool result (its tool named by the index
+/// that pairs it with its call). Thinking and images are left out.
 pub fn messages_of(format: Format, line: Line) -> Vec<Extracted> {
     let joiner = match format {
         Format::Claude => "\n\n",
@@ -64,12 +77,34 @@ pub fn messages_of(format: Format, line: Line) -> Vec<Extracted> {
                         tool: None,
                         timestamp: line.timestamp.clone(),
                         text,
+                        call: None,
+                        error: false,
                     });
                 }
             }
-            Event::ToolCall { id, name, input } => {
-                out.push(tool_message(id, &name, input, line.timestamp.clone()));
+            Event::ToolCall {
+                id,
+                name,
+                input,
+                call,
+            } => {
+                out.push(tool_message(id, &name, input, call, line.timestamp.clone()));
             }
+            Event::ToolResult {
+                id,
+                call,
+                output,
+                error,
+            } => out.push(Extracted {
+                id,
+                role: Role::User,
+                kind: MessageKind::Result,
+                tool: None,
+                timestamp: line.timestamp.clone(),
+                text: output,
+                call: Some(call),
+                error,
+            }),
             Event::Session(_) | Event::Model(_) | Event::Usage(_) | Event::TokenCount { .. } => {}
         }
     }
@@ -78,8 +113,8 @@ pub fn messages_of(format: Format, line: Line) -> Vec<Extracted> {
 
 /// The messages in a Claude Code transcript line: a user or assistant
 /// line of the main conversation (not a subagent's sidechain) -- its text
-/// parts as one message, each `tool_use` part as another. Thinking, tool
-/// results, and images are left out.
+/// parts as one message, each `tool_use` and `tool_result` part as
+/// another. Thinking and images are left out.
 pub fn claude_messages(value: &Value) -> Vec<Extracted> {
     messages_of(Format::Claude, agentlog::parse(Format::Claude, value, 0))
 }
@@ -105,6 +140,9 @@ pub struct MessageMeta {
     /// Its text was cut at [`MAX_MESSAGE_BYTES`].
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// A tool result reporting a failure.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub error: bool,
 }
 
 /// Cut `text` to at most `max` bytes, on a character boundary.
@@ -134,7 +172,13 @@ pub(crate) struct TranscriptIndex {
     pub(crate) meta_bytes: usize,
     /// Most bytes it holds ([`MAX_TRANSCRIPT_BYTES`]).
     pub(crate) cap: usize,
+    /// The newest tool calls' ids and tool names, to name their results.
+    calls: VecDeque<(String, String)>,
 }
+
+/// Tool calls remembered to name their results (results follow their
+/// calls closely; parallel calls are a handful).
+const CALLS_KEPT: usize = 64;
 
 /// Memory one message's metadata takes, counted toward
 /// [`MAX_TRANSCRIPT_BYTES`] with its text.
@@ -156,6 +200,7 @@ impl TranscriptIndex {
             error: None,
             meta_bytes: 0,
             cap: MAX_TRANSCRIPT_BYTES,
+            calls: VecDeque::new(),
         }
     }
 
@@ -166,6 +211,7 @@ impl TranscriptIndex {
         self.next_index = 0;
         self.error = None;
         self.meta_bytes = 0;
+        self.calls.clear();
     }
 
     /// Read what the file has new, until `deadline`; returns whether it
@@ -195,6 +241,24 @@ impl TranscriptIndex {
         };
         let messages = messages_of(self.format, agentlog::parse(self.format, &value, offset));
         for mut message in messages {
+            match (message.kind, &message.call) {
+                (MessageKind::Tool, Some(call)) => {
+                    if self.calls.len() == CALLS_KEPT {
+                        self.calls.pop_front();
+                    }
+                    let name = message.tool.clone().unwrap_or_default();
+                    self.calls.push_back((call.clone(), name));
+                }
+                (MessageKind::Result, Some(call)) => {
+                    message.tool = self
+                        .calls
+                        .iter()
+                        .rev()
+                        .find(|(id, _)| id == call)
+                        .map(|(_, name)| name.clone());
+                }
+                _ => {}
+            }
             let truncated = cut_to(&mut message.text, MAX_MESSAGE_BYTES);
             self.corpus.push(&message.text);
             let meta = MessageMeta {
@@ -205,6 +269,7 @@ impl TranscriptIndex {
                 tool: message.tool,
                 timestamp: message.timestamp,
                 truncated,
+                error: message.error,
             };
             self.meta_bytes += meta_cost(&meta);
             self.messages.push_back(meta);

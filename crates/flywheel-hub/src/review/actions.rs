@@ -148,11 +148,12 @@ pub fn commit(
     tools: &Tools,
     target: &Target,
     message: &str,
+    exclude: Option<&[String]>,
     confirm: &str,
 ) -> Result<Outcome, ActionError> {
     check_message(message)?;
     let _lock = RepoLock::take(tools, &target.dir)?;
-    let plan = plan_commit(tools, target, message).map_err(unplannable)?;
+    let plan = plan_commit(tools, target, message, exclude).map_err(unplannable)?;
     confirmed(&plan, confirm)?;
     let done = run_staged_as_planned(tools, target, &plan)?;
     let head = head_of(tools, &target.dir);
@@ -194,13 +195,14 @@ pub(super) fn run_staged_as_planned(
     plan: &Plan,
 ) -> Result<Vec<(Ran, Output)>, ActionError> {
     let git = Git::new(tools, &target.dir);
-    let (add, rest) = plan
+    // Staging (add, and unstaging what is left out), then the commit.
+    let (commit, stage) = plan
         .commands
-        .split_first()
+        .split_last()
         .ok_or_else(|| ActionError::Conflict("the commit plan runs nothing".into()))?;
     let saved = git.out(&["write-tree"]).map_err(unplannable)?;
-    let mut done = run_plan(std::slice::from_ref(add))?;
-    let as_planned = staged_as_planned(&git, &plan.contents);
+    let mut done = run_plan(stage)?;
+    let as_planned = staged_as_planned(&git, &plan.contents, &plan.excluded);
     if !matches!(as_planned, Ok(true)) {
         let restored = git.out(&["read-tree", &saved]).is_ok();
         return Err(ActionError::Conflict(format!(
@@ -212,7 +214,7 @@ pub(super) fn run_staged_as_planned(
             }
         )));
     }
-    done.extend(run_plan(rest)?);
+    done.extend(run_plan(std::slice::from_ref(commit))?);
     Ok(done)
 }
 

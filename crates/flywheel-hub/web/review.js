@@ -848,7 +848,9 @@ window.FwHubReview = function (ctx) {
 
   function requestBody(action) {
     const f = act.fields;
-    if (action === "commit") return { message: f.message ? f.message.value : "" };
+    // `exclude` once a box was changed; until then the hub's defaults
+    // (what looks generated or secret is left out).
+    if (action === "commit") return { message: f.message ? f.message.value : "", exclude: act.exclude || undefined };
     if (action === "push") return { remote: f.remote && f.remote.value ? f.remote.value : undefined };
     if (action === "pr") {
       return {
@@ -872,6 +874,7 @@ window.FwHubReview = function (ctx) {
     act.done = false;
     act.after = null;
     act.prFilled = false;
+    act.exclude = null;
     act.fields = {};
     const [kicker, title] = TITLES[action];
     $("#rva-kicker").textContent = kicker;
@@ -1021,6 +1024,7 @@ window.FwHubReview = function (ctx) {
         ? el("ul", { className: "rva-details" }, ...shown.map((d) => el("li", { textContent: d })), details.length > shown.length ? el("li", { className: "more", textContent: `… and ${details.length - shown.length} more` }) : null)
         : null,
       ...(plan.warnings || []).map((w) => el("p", { className: "rva-warn", textContent: w })),
+      suspectList(plan),
       commands
         ? el(
             "div",
@@ -1038,6 +1042,31 @@ window.FwHubReview = function (ctx) {
       plan.needs_rebase
         ? el("button", { type: "button", className: "slab ghost", textContent: "Rebase onto base first…", onclick: () => planLater("rebase") })
         : null,
+    );
+  }
+
+  // Commit all: files that look like build output or secrets (left out
+  // unless unchecked) or are large (kept unless checked), one box each.
+  const SUSPECT = { generated: "build output", secret: "secret", large: "5 MiB or more" };
+  function suspectList(plan) {
+    const suspects = plan.suspects || [];
+    if (act.action !== "commit" || !suspects.length) return null;
+    const boxes = suspects.map((s) => {
+      const box = el("input", {
+        type: "checkbox",
+        checked: s.excluded,
+        onchange: () => {
+          act.exclude = boxes.filter((b) => b.box.checked).map((b) => b.path);
+          replan(0);
+        },
+      });
+      return { box, path: s.path, row: el("label", { className: `rva-suspect ${s.kind}` }, box, el("span", { className: "rva-suspect-path", textContent: s.path }), el("span", { className: "rva-suspect-kind", textContent: SUSPECT[s.kind] || s.kind })) };
+    });
+    return el(
+      "fieldset",
+      { className: "rva-suspects" },
+      el("legend", { className: "field-label", textContent: "Leave out of the commit" }),
+      ...boxes.map((b) => b.row),
     );
   }
 

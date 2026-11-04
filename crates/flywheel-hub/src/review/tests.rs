@@ -287,7 +287,7 @@ fn commit_all_runs_what_was_confirmed_and_refuses_a_moved_tree() {
     let f = Fixture::new();
     let wt = &f.wt.path;
     let t = f.target();
-    let clean = plan_commit(&tools(), &t, "x").unwrap();
+    let clean = plan_commit(&tools(), &t, "x", None).unwrap();
     assert!(
         clean
             .refusal
@@ -295,11 +295,11 @@ fn commit_all_runs_what_was_confirmed_and_refuses_a_moved_tree() {
             .unwrap()
             .contains("nothing to commit")
     );
-    assert!(commit(&tools(), &t, "x", &clean.fingerprint).is_err());
+    assert!(commit(&tools(), &t, "x", None, &clean.fingerprint).is_err());
 
     write(wt, "README", "changed\n");
     write(wt, "added.txt", "a\n");
-    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.").unwrap();
+    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.", None).unwrap();
     assert_eq!(plan.refusal, None);
     let shown: Vec<_> = plan.commands.iter().map(|c| c.display.clone()).collect();
     let dir = wt.display().to_string();
@@ -313,7 +313,7 @@ fn commit_all_runs_what_was_confirmed_and_refuses_a_moved_tree() {
     assert_eq!(plan.details.len(), 2, "{:?}", plan.details);
     // No fingerprint, or another one: nothing runs.
     assert!(matches!(
-        commit(&tools(), &t, "feat: change things\n\nBody line.", ""),
+        commit(&tools(), &t, "feat: change things\n\nBody line.", None, ""),
         Err(ActionError::Invalid(_))
     ));
     // The tree moves after the plan: stale.
@@ -322,6 +322,7 @@ fn commit_all_runs_what_was_confirmed_and_refuses_a_moved_tree() {
         &tools(),
         &t,
         "feat: change things\n\nBody line.",
+        None,
         &plan.fingerprint,
     )
     .unwrap_err();
@@ -330,33 +331,36 @@ fn commit_all_runs_what_was_confirmed_and_refuses_a_moved_tree() {
 
     // An edit keeping the same files and line counts, and an untracked
     // file rewritten, after the plan: stale too (contents are hashed).
-    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.").unwrap();
+    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.", None).unwrap();
     write(wt, "README", "chanGED\n");
     let stale = commit(
         &tools(),
         &t,
         "feat: change things\n\nBody line.",
+        None,
         &plan.fingerprint,
     )
     .unwrap_err();
     assert!(stale.to_string().contains("changed since"), "{stale}");
-    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.").unwrap();
+    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.", None).unwrap();
     write(wt, "late.txt", "LATE\n");
     let stale = commit(
         &tools(),
         &t,
         "feat: change things\n\nBody line.",
+        None,
         &plan.fingerprint,
     )
     .unwrap_err();
     assert!(stale.to_string().contains("changed since"), "{stale}");
     assert_eq!(run_git(wt, &["rev-list", "--count", "main..HEAD"]), "0");
 
-    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.").unwrap();
+    let plan = plan_commit(&tools(), &t, "feat: change things\n\nBody line.", None).unwrap();
     let done = commit(
         &tools(),
         &t,
         "feat: change things\n\nBody line.",
+        None,
         &plan.fingerprint,
     )
     .unwrap();
@@ -770,7 +774,7 @@ fn a_rebase_stops_on_conflict_and_is_left_for_the_agent() {
     assert_eq!(r.operation.as_deref(), Some("rebase"));
     assert_eq!(r.conflicts, ["README"]);
     // Committing is refused mid-rebase; so is another rebase.
-    let commit_plan = plan_commit(&tools(), &t, "x").unwrap();
+    let commit_plan = plan_commit(&tools(), &t, "x", None).unwrap();
     assert!(
         commit_plan
             .refusal
@@ -871,9 +875,9 @@ fn a_partly_staged_file_counts_once() {
     write(wt, "README", "one\ntwo\nthree\nx\n");
     run_git(wt, &["add", "README"]);
     write(wt, "README", "one\ntwo\nthree\nx\ny\n");
-    let plan = plan_commit(&tools(), &t, "fix: one file").unwrap();
+    let plan = plan_commit(&tools(), &t, "fix: one file", None).unwrap();
     assert_eq!(plan.summary, "Stage all 1 file and commit them on feat");
-    let done = commit(&tools(), &t, "fix: one file", &plan.fingerprint).unwrap();
+    let done = commit(&tools(), &t, "fix: one file", None, &plan.fingerprint).unwrap();
     assert!(
         done.summary.starts_with("Committed 1 file as "),
         "{}",
@@ -1081,7 +1085,7 @@ fn a_change_racing_the_staging_is_never_committed() {
     write(wt, "README", "reviewed\n");
     write(wt, "staged.txt", "staged\n");
     run_git(wt, &["add", "staged.txt"]);
-    let plan = plan_commit(&tools(), &t, "feat: reviewed").unwrap();
+    let plan = plan_commit(&tools(), &t, "feat: reviewed", None).unwrap();
     assert_eq!(plan.refusal, None, "{plan:?}");
     let index_before = run_git(wt, &["write-tree"]);
     // The race: after the plan was checked, before staging.
@@ -1096,13 +1100,13 @@ fn a_change_racing_the_staging_is_never_committed() {
     );
     // A file appearing meanwhile is caught the same way.
     write(wt, "README", "reviewed\n");
-    let plan = plan_commit(&tools(), &t, "feat: reviewed").unwrap();
+    let plan = plan_commit(&tools(), &t, "feat: reviewed", None).unwrap();
     write(wt, "late.txt", "late\n");
     assert!(run_staged_as_planned(&tools(), &t, &plan).is_err());
     assert_eq!(run_git(wt, &["rev-list", "--count", "main..HEAD"]), "0");
     // Unraced, the plan commits exactly what it named.
     std::fs::remove_file(wt.join("late.txt")).unwrap();
-    let plan = plan_commit(&tools(), &t, "feat: reviewed").unwrap();
+    let plan = plan_commit(&tools(), &t, "feat: reviewed", None).unwrap();
     run_staged_as_planned(&tools(), &t, &plan).unwrap();
     assert_eq!(run_git(wt, &["rev-list", "--count", "main..HEAD"]), "1");
     assert_eq!(run_git(wt, &["status", "--porcelain"]), "");
@@ -1123,4 +1127,174 @@ fn merge_runs_the_planned_commit_not_the_moving_branch() {
     // Run the plan as planned (what a confirm racing the commit runs).
     run_plan(&plan.commands).unwrap();
     assert_eq!(run_git(&f.repo, &["rev-parse", "HEAD"]), planned);
+}
+
+#[test]
+fn commit_all_leaves_out_build_output_and_secrets_unless_told() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    write(wt, "calc.py", "def add(a, b):\n    return a + b\n");
+    write(wt, "__pycache__/calc.cpython-313.pyc", "bytecode");
+    write(wt, "app/.env", "TOKEN=hunter2\n");
+    write(wt, ".env.example", "TOKEN=\n");
+    std::fs::write(
+        wt.join("big.bin"),
+        vec![7u8; usize::try_from(LARGE_FILE_BYTES).unwrap()],
+    )
+    .unwrap();
+    // A key someone staged by hand is left out too.
+    write(wt, "certs/server.pem", "-----BEGIN PRIVATE KEY-----\n");
+    run_git(wt, &["add", "--", "certs/server.pem"]);
+
+    let plan = plan_commit(&tools(), &t, "feat: add", None).unwrap();
+    assert_eq!(plan.refusal, None);
+    let kinds: Vec<(&str, &str, bool)> = plan
+        .suspects
+        .iter()
+        .map(|s| (s.path.as_str(), s.kind, s.excluded))
+        .collect();
+    let mut sorted = kinds.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        [
+            ("__pycache__/calc.cpython-313.pyc", "generated", true),
+            ("app/.env", "secret", true),
+            ("big.bin", "large", false),
+            ("certs/server.pem", "secret", true),
+        ]
+    );
+    let mut excluded = plan.excluded.clone();
+    excluded.sort();
+    assert_eq!(
+        excluded,
+        [
+            "__pycache__/calc.cpython-313.pyc",
+            "app/.env",
+            "certs/server.pem"
+        ]
+    );
+    assert!(
+        plan.details
+            .iter()
+            .all(|d| !d.contains(".pyc") && !d.contains("app/.env") && !d.contains("server.pem")),
+        "{:?}",
+        plan.details
+    );
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.starts_with("3 files left out")),
+        "{:?}",
+        plan.warnings
+    );
+    assert_eq!(
+        plan.summary,
+        "Stage 3 files (leaving 3 out) and commit them on feat"
+    );
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.starts_with("big.bin looks large")),
+        "{:?}",
+        plan.warnings
+    );
+    let shown: Vec<_> = plan.commands.iter().map(|c| c.display.clone()).collect();
+    assert_eq!(shown.len(), 3, "{shown:?}");
+    assert!(
+        shown[0].contains("add -A -- :/") && shown[0].contains("':(top,literal,exclude)app/.env'"),
+        "{shown:?}"
+    );
+    assert!(
+        shown[1].contains("reset -q -- ':(top,literal)certs/server.pem'"),
+        "{shown:?}"
+    );
+
+    // Another exclusion than planned: another fingerprint.
+    let none: Vec<String> = Vec::new();
+    let all = plan_commit(&tools(), &t, "feat: add", Some(&none)).unwrap();
+    assert_ne!(all.fingerprint, plan.fingerprint);
+    assert!(all.suspects.iter().all(|s| !s.excluded));
+    assert!(commit(&tools(), &t, "feat: add", Some(&none), &plan.fingerprint).is_err());
+    // A path with no change cannot be left out.
+    let odd = plan_commit(&tools(), &t, "feat: add", Some(&["README.md".to_owned()])).unwrap();
+    assert!(
+        odd.refusal
+            .as_deref()
+            .unwrap()
+            .contains("README.md has no change"),
+        "{:?}",
+        odd.refusal
+    );
+
+    let done = commit(&tools(), &t, "feat: add", None, &plan.fingerprint).unwrap();
+    assert!(done.ok, "{done:?}");
+    let committed = run_git(wt, &["show", "--name-only", "--format=", "HEAD"]);
+    let mut committed: Vec<&str> = committed.lines().collect();
+    committed.sort_unstable();
+    assert_eq!(committed, [".env.example", "big.bin", "calc.py"]);
+    // Left in the work tree, untracked: nothing lost.
+    let status = run_git(wt, &["status", "--porcelain", "--untracked-files=all"]);
+    for path in [
+        "__pycache__/calc.cpython-313.pyc",
+        "app/.env",
+        "certs/server.pem",
+    ] {
+        assert!(status.contains(&format!("?? {path}")), "{path}: {status}");
+    }
+
+    // Everything left out: nothing to commit.
+    let only = plan_commit(
+        &tools(),
+        &t,
+        "x",
+        Some(&[
+            "__pycache__/calc.cpython-313.pyc".to_owned(),
+            "app/.env".to_owned(),
+            "certs/server.pem".to_owned(),
+        ]),
+    )
+    .unwrap();
+    assert!(
+        only.refusal
+            .as_deref()
+            .unwrap()
+            .contains("every change is left out"),
+        "{:?}",
+        only.refusal
+    );
+}
+
+#[test]
+fn commit_all_leaves_a_staged_secret_out_of_a_first_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().canonicalize().unwrap();
+    run_git(&repo, &["init", "-q", "-b", "main"]);
+    run_git(&repo, &["config", "user.name", "Hub Test"]);
+    run_git(&repo, &["config", "user.email", "hub@example.com"]);
+    write(&repo, "main.rs", "fn main() {}\n");
+    write(&repo, ".env", "KEY=1\n");
+    run_git(&repo, &["add", "--", ".env"]);
+    let t = Target {
+        dir: repo.clone(),
+        base: None,
+        base_source: BaseSource::None,
+        worktree: None,
+    };
+    let plan = plan_commit(&tools(), &t, "init", None).unwrap();
+    assert_eq!(plan.refusal, None);
+    assert!(
+        plan.commands[1]
+            .display
+            .contains("rm --cached -q -r -- ':(top,literal).env'"),
+        "{:?}",
+        plan.commands
+    );
+    commit(&tools(), &t, "init", None, &plan.fingerprint).unwrap();
+    assert_eq!(
+        run_git(&repo, &["show", "--name-only", "--format=", "HEAD"]),
+        "main.rs"
+    );
+    assert!(run_git(&repo, &["status", "--porcelain"]).contains("?? .env"));
 }

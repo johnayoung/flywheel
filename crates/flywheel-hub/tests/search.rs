@@ -407,16 +407,27 @@ async fn search_finds_scrollback_transcripts_and_commands_across_sessions() {
         "the command line: {terminal}"
     );
 
-    // Claude: the prompt, the reply, and the tool call (newest first);
-    // not thinking, tool results, or a subagent's sidechain. The reply's
-    // shell block is a suggested command too.
+    // Claude: the prompt, the reply, the tool call, and its result (named
+    // for the call's tool; newest first); not thinking or a subagent's
+    // sidechain. The reply's shell block is a suggested command too.
     let agent = group(&answer, &claude);
     assert_eq!(
         sources(agent),
-        ["transcript", "transcript", "transcript", "commands"],
+        [
+            "transcript",
+            "transcript",
+            "transcript",
+            "transcript",
+            "commands"
+        ],
         "{agent}"
     );
     let hits = agent["hits"].as_array().unwrap();
+    assert_eq!(hits[0]["kind"], "result");
+    assert_eq!(hits[0]["tool"], "Bash");
+    assert_eq!(hits[0]["index"], 3);
+    assert_eq!(hits[0]["after"], "-7f9 Running");
+    let hits = &hits[1..];
     assert_eq!(hits[0]["kind"], "tool");
     assert_eq!(hits[0]["tool"], "Bash");
     assert_eq!(hits[0]["index"], 2);
@@ -431,7 +442,7 @@ async fn search_finds_scrollback_transcripts_and_commands_across_sessions() {
     assert_eq!(hits[3]["before"], "kubectl rollout restart deploy/");
     assert_eq!(
         agent["counts"],
-        json!({"scrollback": 0, "transcript": 3, "commands": 1})
+        json!({"scrollback": 0, "transcript": 4, "commands": 1})
     );
 
     // Codex: its rollout's tool call (the user message names a giraffe).
@@ -456,12 +467,16 @@ async fn search_finds_scrollback_transcripts_and_commands_across_sessions() {
     assert_eq!(messages[0]["text"], "please restart the zebra service");
     assert!(messages[1]["text"].as_str().unwrap().contains("```bash"));
     assert_eq!(page["first"], 0);
-    assert_eq!(page["next"], 3);
+    assert_eq!(page["next"], 4);
     assert_eq!(page["complete"], true);
+    // The newest: the tool's result, named for its call.
     let newest = hub
         .get(&format!("/api/sessions/{claude}/transcript?before=1"))
         .await;
-    assert_eq!(newest["messages"][0]["index"], 2);
+    assert_eq!(newest["messages"][0]["index"], 3);
+    assert_eq!(newest["messages"][0]["kind"], "result");
+    assert_eq!(newest["messages"][0]["tool"], "Bash");
+    assert_eq!(newest["messages"][0]["text"], "zebra-7f9 Running");
     let (status, body) = hub
         .call(
             reqwest::Method::GET,
@@ -627,7 +642,7 @@ async fn stopped_agent_sessions_keep_their_transcripts_and_commands_searchable()
     assert_eq!(agent["terminal"], false);
     assert_eq!(
         agent["counts"],
-        json!({"scrollback": 0, "transcript": 3, "commands": 1})
+        json!({"scrollback": 0, "transcript": 4, "commands": 1})
     );
     // No terminal anywhere: no scrollback hits.
     assert!(
@@ -639,7 +654,7 @@ async fn stopped_agent_sessions_keep_their_transcripts_and_commands_searchable()
         "{answer}"
     );
     let page = hub.get(&format!("/api/sessions/{claude}/transcript")).await;
-    assert_eq!(page["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(page["messages"].as_array().unwrap().len(), 4);
     hub.shutdown().await;
 }
 

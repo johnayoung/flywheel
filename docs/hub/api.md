@@ -46,7 +46,7 @@ Workspace `folders: [{"path","name"?,"git","missing"}]` (+ legacy `repos`); inpu
 | POST | `/api/sessions/{id}/input` | `{"data","paste"?,"enter"?}` -> `{"bytes","bracketed"}`; 409 not running / not reading |
 | POST | `/api/sessions/{id}/paste` | `{"text","run"?}`: `/input` with `paste`, trailing newlines dropped, 1 MiB; 409 unsafe multi-line |
 | GET | `/api/sessions/{id}/commands[?limit=N&all=true]` | `{"commands":[{"seq","lang","text","command"}]}` newest first (shell only unless `all`; `limit` 1..500, 50) |
-| GET | `/api/sessions/{id}/transcript[?around=N&before=N&after=N]` | `{"messages":[{"index","role","text"}],"next","complete"}` (30 around `around`, max 200); 400 a shell |
+| GET | `/api/sessions/{id}/transcript[?around=N&before=N&after=N]` | `{"messages":[{"index","role","kind":"text\|tool\|result","tool"?,"text"}],"next","complete"}` (30 around `around`, max 200); 400 a shell |
 | POST | `/api/sessions/{id}/companion` | `{"cols"?,"rows"?,"text"?,"run"?}`: the companion shell (201 / 200 running); `text` pasted once ready |
 | GET | `/api/sessions/{id}/worktree` | `{"path","branch","base","dirty","untracked","unmerged","refusal"}` |
 | GET | `/api/worktrees/plan?folder=&task=&base=` | `{"plan":{"path","branch","base"}\|null,"error"}` |
@@ -55,7 +55,7 @@ Workspace `folders: [{"path","name"?,"git","missing"}]` (+ legacy `repos`); inpu
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | below |
 
-Session views carry `agent` `{"status","detail"?,"since"}`, `agent_session_id`, `launch`, `usage`, `worktree`, `companion_of`, `reviewer` / `review_of`, `recording`, `live` (`epoch`: the output stream), `git`.
+Session views carry `agent` `{"status","detail"?,"since","questions"?}` (blocked on AskUserQuestion: its input), `agent_session_id`, `launch`, `usage`, `worktree`, `companion_of`, `reviewer` / `review_of`, `recording`, `live` (`epoch`: the output stream), `git`.
 
 **Screen**: `visible` (default) = the screen's rows; `recent` = the last `lines` (1..100000, 100) logical lines of scrollback + screen, soft wraps joined.
 
@@ -72,7 +72,7 @@ Session views carry `agent` `{"status","detail"?,"since"}`, `agent_session_id`, 
 |---|---|---|
 | GET | `/api/sessions/{id}/review[?base=]` | `{"branch","base","ahead","behind","commits","committed","staged","unstaged","untracked","conflicts"}` (file sets) |
 | GET | `/api/sessions/{id}/review/diff?scope=committed\|staged\|unstaged\|untracked&path=[&old_path=&offset=&base=]` | one file's diff, paged |
-| POST | `/api/sessions/{id}/review/commit` | body `message` |
+| POST | `/api/sessions/{id}/review/commit` | body `message`, `exclude`? (paths; absent: generated and secret `suspects` `[{"path","kind","excluded"}]`) |
 | POST | `/api/sessions/{id}/review/push` | body `remote` |
 | POST | `/api/sessions/{id}/review/pr` | body `title`, `body`, `base`, `draft` |
 | POST | `/api/sessions/{id}/review/rebase` | |
@@ -127,7 +127,7 @@ Fan-out view: `{"id","base_sha","winner","counts","leader","settled","graded_at"
 | GET | `/api/activity/digest[?since=&client=&until=&ws=&session=]` | `{"since","until","turns_finished","blocked_now","fanouts_graded","commands_suggested","cost_usd","workspaces","empty","partial"}`; `since=last-seen` needs `client` |
 | POST | `/api/activity/seen` | `{"client"}` -> 204: its `last-seen` is now |
 
-Times: RFC 3339, unix ms, an age (`90m`, `1h30m`), or `last-seen` (with `client`). `ws`, `session`: id, 4+ char prefix, or name (per machine). `kind`: comma list (`review` = `review.*`). Beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A peer's request or `machines=none`: this hub alone.
+Times: RFC 3339, unix ms, an age (`90m`), or `last-seen` (with `client`). `ws`, `session`: id, 4+ char prefix, or name (per machine). `kind`: comma list (`review` = `review.*`). Beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A peer's request or `machines=none`: this hub alone.
 
 ## Settings, config, plugins, notify, TLS
 
@@ -266,7 +266,7 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `session.created` | - |
 | `session.exited` | `exit`, `hub_stopping` (`fw hub stop` hung it up) |
 | `session.removed` | - |
-| `status.changed` | `status`, `previous`, `detail`, `turn_finished` (`"done"` matches it) |
+| `status.changed` | `status`, `previous`, `detail`; every finished turn is one `done` (`seen`: watched, `idle` follows) |
 | `review.committed` | `dir`, `head`, `branch`, `base`, `url`, `summary` (every `review.*`) |
 | `review.pushed` | as above |
 | `review.pr_opened` | as above |

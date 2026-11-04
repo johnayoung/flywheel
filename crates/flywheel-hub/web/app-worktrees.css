@@ -44,8 +44,10 @@
   border-bottom: 1px solid var(--rule-2);
   pointer-events: none;
 }
-.session.companion.needs-you::after { border: 0; }
+.session.companion.needs-you::after, .session.companion.orphan::after { border: 0; }
+.session.companion.orphan { padding-left: 1.95rem; }
 .session.companion .num { left: 1.5rem; }
+.session.companion.orphan .num { left: .85rem; }
 
 /* New-session form: the worktree option. */
 .wt-pick { gap: .35rem; }
@@ -112,7 +114,7 @@
 .attn-branch span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (pointer: coarse) {
-  .session.companion { min-height: 2.5rem; }
+  .session.companion { min-height: 44px; }
 }
 
 /* The agent / shell flip keeps its word on phones: an icon alone does not

@@ -367,12 +367,28 @@ window.FwHubPerms = function (ctx) {
       return b;
     }
 
+    // Why Allow is off, beside it (on a phone the reason may be far up).
+    const offWhy = el("span", { className: "pm-off-why", "aria-live": "polite" });
     function gate() {
       const need = preview && preview.type_to_confirm;
-      ok.disabled = !preview || !(preview.added || []).length || (need && typed.value.trim() !== need) || (fileSelect.value === "user" && !userOk.checked && !codex);
+      const why = !preview
+        ? (pick.rules.length ? "checking the rule…" : "")
+        : !(preview.added || []).length
+          ? "nothing new to write"
+          : need && typed.value.trim() !== need
+            ? "type the rule above to confirm"
+            : fileSelect.value === "user" && !userOk.checked && !codex
+              ? "tick the user-settings box"
+              : "";
+      ok.disabled = !!why || !preview;
+      offWhy.textContent = why;
     }
 
     function schedule() {
+      // The preview on screen is for the old text: Allow waits for the new one.
+      ui.previewSeq++;
+      preview = null;
+      gate();
       clearTimeout(timer);
       timer = setTimeout(run, 180);
     }
@@ -391,8 +407,10 @@ window.FwHubPerms = function (ctx) {
         if (seq !== ui.previewSeq) return;
         preview = p;
         gitignoreLabel.hidden = !p.can_gitignore;
+        const wasHidden = typedWrap.hidden;
         typedWrap.hidden = !p.type_to_confirm;
         if (!p.type_to_confirm) typed.value = "";
+        else if (wasHidden) typedWrap.scrollIntoView({ block: "nearest" });
         fill(out, 
           p.sentence ? el("p", { className: "pm-sentence", textContent: p.sentence }) : null,
           el("p", { className: "pm-file" }, "Edits ", el("code", {}, pathText(p.path, "")), p.exists ? "" : " (new file)"),
@@ -444,13 +462,14 @@ window.FwHubPerms = function (ctx) {
         { className: "pm-body pm-allow" },
         choices,
         el("label", { className: "field pm-rule-field" }, el("span", { className: "field-label", textContent: multi ? "Rules (one per command)" : codex ? "Command prefix" : "Rule" }), multi ? el("code", { className: "pm-multi", textContent: pick.rules.join("   ") }) : custom),
+        // Right under the rule it confirms, not below the diff.
+        typedWrap,
         el("label", { className: "field" }, el("span", { className: "field-label", textContent: "Written to" }), fileSelect),
         userLabel,
         out,
-        typedWrap,
         error,
       ),
-      [back, ok],
+      [back, offWhy, ok],
     );
     userOk.closest("label").hidden = true;
     run();
@@ -482,7 +501,7 @@ window.FwHubPerms = function (ctx) {
       "codex",
       `${setting} = ${value}`,
       basename((ui.view && ui.view.folder) || where.folder),
-      el("div", { className: "pm-body" }, out, typedWrap, error),
+      el("div", { className: "pm-body" }, typedWrap, out, error),
       [el("button", { type: "button", className: "slab ghost", textContent: "Back", onclick: () => open(where) }), ok],
     );
     rawApi("POST", "/api/perms/preview", body())

@@ -452,7 +452,14 @@ function renderWorkspace(workspace, i, numbering, needsYou = new Set()) {
         ? el(
           "ul",
           { className: "sessions" },
-          listed.map((s) => renderSession(s, numbering.get(s.id))),
+          listed.map((s) => {
+            const row = renderSession(s, numbering.get(s.id));
+            // Its agent is listed in Needs you: no connector to a row that
+            // is not above it.
+            const parent = s.companion_of || s.review_of;
+            if (parent && needsYou.has(parent)) row.classList.add("orphan");
+            return row;
+          }),
           elsewhere.length ? needsYouLine(elsewhere) : null,
         )
         : el(
@@ -607,7 +614,15 @@ function renderMain() {
     "aria-label",
     urgent ? `Show sessions (${titlePrefix(elsewhere).slice(1, -2)} elsewhere)` : "Show sessions",
   );
-  const agent = session ? agentStatus(session) : null;
+  // An agent whose status is not known yet still gets a pill and why?:
+  // that is when the explanation is wanted most.
+  const pushed = session && state.agent[session.id];
+  const agent = session
+    ? agentStatus(session) ||
+      (session.kind !== "shell" && session.state === "running" && session.live && reachable(session)
+        ? { status: "unknown", detail: "", since: pushed ? pushed.since : "" }
+        : null)
+    : null;
   const pill = $("#crumb-status");
   pill.hidden = !agent;
   if (agent) {

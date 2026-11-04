@@ -885,6 +885,10 @@ window.FwHubFanout = function (ctx) {
       el("header", { className: "sheet-head" }, el("span", { className: "sheet-kicker", textContent: "verified fan-out" }), el("h2", { textContent: seed ? `Fan out flywheel task ${seed.task_id}` : "One prompt, several agents" })),
       el("p", { className: "sheet-body", textContent: "Each agent works in its own sibling worktree cut from the same commit. When one reports a finished turn the hub runs your graders in its worktree; the board ranks them: graders passing first, then the smaller diff, then the lower cost." }),
       el("div", { className: "fo-two" }, field("Workspace", "", workspace), field("Folder", "git", folder)),
+      // Only this hub's workspaces: say where the machines' are.
+      state.workspaces.some((w) => w.machine)
+        ? el("p", { className: "fo-note", textContent: "Fan-outs on another machine: fw hub fanout new --machine NAME, or open that machine's hub." })
+        : null,
       el("div", { className: "fo-two" }, field("Base branch", "every worktree starts here", base, bases), field("Name", "", name)),
       seed ? seedNote(seed) : null,
       field("Prompt", "", prompt),

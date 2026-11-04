@@ -72,8 +72,10 @@ window.FwHubExplain = function (ctx) {
       rules.length ? el("details", { className: "why-rules" }, el("summary", {}, `${rules.length} rules, in order`), el("ol", {}, rules)) : null,
       problems.length ? el("div", { className: "why-problems" }, el("b", {}, "overrides not in force"), el("ul", {}, problems)) : null,
       el("p", { className: "why-note" }, data.note || ""),
-      // Blocked on a permission: write the narrowest rule (perms.js).
-      status === "blocked" && allowAlways && view.session
+      // Blocked on a permission (not a question or a trust dialog: the
+      // quick-answer bar's own test): write the narrowest rule (perms.js).
+      status === "blocked" && allowAlways && view.session &&
+        window.FwHubPrompt.asksPermission(data.status && data.status.detail, ((screen && screen.evidence) || []).map((e) => e.text))
         ? el("button", {
             type: "button",
             className: "slab ghost why-allow",

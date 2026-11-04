@@ -146,7 +146,7 @@ textarea.pm-custom { resize: vertical; min-height: 2.6rem; overflow-wrap: anywhe
 .pm-off-why { flex: 1; align-self: center; color: var(--ink-3); font-size: 10.5px; text-align: right; }
 .pm-off-why:empty { display: none; }
 
-@media (pointer: coarse) {
+@media (pointer: coarse), (max-width: 760px) {
   .pm-optin { min-height: 44px; }
   .pm-optin input { width: 22px; height: 22px; }
 }

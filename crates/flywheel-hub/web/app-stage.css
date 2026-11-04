@@ -292,7 +292,7 @@
 }
 .why-rules { margin-top: .35rem; color: var(--ink-2); }
 .why-rules summary { cursor: pointer; color: var(--ink-3); }
-@media (pointer: coarse) {
+@media (pointer: coarse), (max-width: 760px) {
   .why-close { min-width: 44px; min-height: 44px; }
   .why-rules summary { min-height: 44px; display: flex; align-items: center; }
 }

@@ -191,6 +191,7 @@
   font-size: 10.5px;
 }
 .fw-task.failed .fw-task-text small, .fw-task.parked .fw-task-text small { color: var(--ink-2); }
+.fw-task-text .fw-queued { justify-self: start; color: var(--brass); font-size: 10.5px; text-align: left; }
 .fw-task-meta { display: inline-flex; align-items: center; gap: .6rem; color: var(--ink-3); }
 .fw-task-meta small { font-size: 10px; }
 .fw-out { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; }

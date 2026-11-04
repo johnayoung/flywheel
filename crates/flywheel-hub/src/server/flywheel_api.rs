@@ -1,7 +1,8 @@
 //! The Flywheel panel's API (see `crate::flywheel`):
 //!
 //! * `GET /api/flywheel` -- `{"enabled", "folders": [summary...]}`;
-//! * `GET /api/flywheel/panel?folder=P` -- one folder's whole panel;
+//! * `GET /api/flywheel/panel?folder=P` -- one folder's whole panel, its
+//!   pending tasks a running scoped worker will run marked `queued_in`;
 //! * `GET /api/flywheel/run?folder=P&run=R[&since=N]` -- a run's `fw show`
 //!   summary and its transcript from entry `N` on;
 //! * `POST /api/flywheel/worker {"folder", "workspace_id"?, "another"?,
@@ -16,8 +17,8 @@
 use super::ApiQuery;
 use super::{AppState, error_response};
 use crate::flywheel::{
-    FlywheelEvent, FlywheelMonitor, FlywheelSummary, WorkerScope, runs_worker, valid_run_id,
-    worker_session_command, worker_session_name,
+    FlywheelEvent, FlywheelMonitor, FlywheelSummary, WorkerScope, mark_queued, runs_worker,
+    valid_run_id, worker_session_command, worker_session_name,
 };
 use crate::hub::{CreateSession, Hub};
 use crate::state::Workspace;
@@ -177,21 +178,38 @@ pub(super) async fn panel(
         Ok(found) => found,
         Err(refusal) => return refusal.into_response(),
     };
-    if let Some(panel) = monitor.panel(&path) {
-        return Json(&*panel).into_response();
-    }
-    // Not read yet (the folder was just added): read it for this answer.
-    let Some(guard) = monitor.begin_read(format!("panel\0{}", path.display())) else {
-        return still_reading("panel read");
+    let panel = match monitor.panel(&path) {
+        Some(panel) => (*panel).clone(),
+        None => {
+            // Not read yet (the folder was just added): read it for this
+            // answer.
+            let Some(guard) = monitor.begin_read(format!("panel\0{}", path.display())) else {
+                return still_reading("panel read");
+            };
+            let provider = Arc::clone(monitor.provider());
+            let folder = path.clone();
+            let read = off_runtime(PANEL_TIMEOUT, "reading the panel", move || {
+                let panel = provider.panel(&folder);
+                drop(guard);
+                panel
+            })
+            .await;
+            match read {
+                Ok(panel) => panel,
+                Err(refusal) => return refusal.into_response(),
+            }
+        }
     };
-    let provider = Arc::clone(monitor.provider());
-    let read = off_runtime(PANEL_TIMEOUT, "reading the panel", move || {
-        let panel = provider.panel(&path);
-        drop(guard);
+    // Which pending tasks a running scoped worker here will run (read
+    // from its process, so off the runtime).
+    let hub = Arc::clone(&app.hub);
+    let marked = off_runtime(Duration::from_secs(5), "reading the workers", move || {
+        let mut panel = panel;
+        mark_queued(&mut panel, &path, &hub.sessions(None));
         panel
     })
     .await;
-    match read {
+    match marked {
         Ok(panel) => Json(panel).into_response(),
         Err(refusal) => refusal.into_response(),
     }

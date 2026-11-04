@@ -5,7 +5,7 @@ use super::deflate::Deflater;
 use super::{
     AppState, Client, CredentialWatch, LAGGED_SNAPSHOT_HISTORY, SNAPSHOT_FRAME,
     WS_CLOSE_RELAUNCHED, WS_CLOSE_RESTART, WS_MAX_MESSAGE, WS_PING_INTERVAL, error_response,
-    login_recheck, origin_ok, upgrade_refused,
+    login_recheck, origin_ok, upgrade_refused, write_within,
 };
 use crate::hub::{Hub, HubEvent};
 use crate::pty::{
@@ -84,12 +84,14 @@ pub(super) async fn session_ws(
         None => CredentialWatch::new(&app.hub),
     };
     let hub = Arc::clone(&app.hub);
+    let send_timeout = app.options.send_timeout();
     ws.max_message_size(WS_MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
             let ends = Ends {
                 shutdown,
                 credential,
                 gate,
+                send_timeout,
             };
             pump(socket, Arc::clone(&session), ends, &hub, &id, options).await;
             // One viewer fewer: panes that follow another's size may now be
@@ -312,11 +314,6 @@ impl Pace {
     }
 }
 
-/// How long one message may take to reach a viewer's socket: a reader
-/// that stopped reading must not hold the socket (and what it would
-/// close it: a revoked credential, shutdown, a handoff) forever.
-const SEND_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// One viewer's socket, sending binary messages deflated when it asked.
 pub(super) struct Viewer {
     pub(super) socket: WebSocket,
@@ -324,24 +321,35 @@ pub(super) struct Viewer {
     /// The exit was sent: it is heard once, whichever path (a snapshot, a
     /// resume, the live stream, a catch-up) brought it.
     exit_said: bool,
+    /// How long one message may take to reach the socket
+    /// ([`super::ServerOptions::send_timeout`]).
+    send_timeout: Duration,
 }
 
 impl Viewer {
-    pub(super) fn new(socket: WebSocket, deflate: bool) -> Self {
+    pub(super) fn new(socket: WebSocket, deflate: bool, send_timeout: Duration) -> Self {
         Self {
             socket,
             deflate: deflate.then(Deflater::new),
             exit_said: false,
+            send_timeout,
         }
     }
 
-    /// Send one message within [`SEND_TIMEOUT`]; false when the socket is
+    /// Send one message within the send timeout; false when the socket is
     /// gone (or stalled).
     pub(super) async fn send(&mut self, message: Message) -> bool {
-        matches!(
-            tokio::time::timeout(SEND_TIMEOUT, self.socket.send(message)).await,
-            Ok(Ok(()))
-        )
+        write_within(self.send_timeout, self.socket.send(message)).await
+    }
+
+    /// Flush within the send timeout.
+    pub(super) async fn flush(&mut self) {
+        write_within(self.send_timeout, self.socket.flush()).await;
+    }
+
+    /// Close for a live handoff (see [`close_for_restart`]).
+    pub(super) async fn close_for_restart(&mut self) {
+        close_for_restart(&mut self.socket, self.send_timeout).await;
     }
 
     /// Say that the process ended (once per socket); false when the
@@ -513,7 +521,7 @@ pub(super) async fn close_for_relaunch(viewer: &mut Viewer) {
         reason: "the session was relaunched; reconnect".into(),
     };
     viewer.send(Message::Close(Some(close))).await;
-    let _ = tokio::time::timeout(SEND_TIMEOUT, viewer.socket.flush()).await;
+    viewer.flush().await;
 }
 
 /// What ends a socket besides its viewer: the hub stopping, the
@@ -522,6 +530,7 @@ struct Ends {
     shutdown: watch::Receiver<bool>,
     credential: CredentialWatch,
     gate: Option<crate::handoff::Gate>,
+    send_timeout: Duration,
 }
 
 /// Run blocking session work (a snapshot, a frame) off the async workers,
@@ -627,8 +636,9 @@ async fn pump(
         mut shutdown,
         mut credential,
         gate,
+        send_timeout,
     } = ends;
-    let mut viewer = Viewer::new(socket, options.deflate);
+    let mut viewer = Viewer::new(socket, options.deflate, send_timeout);
     let mut pace = match options.lite {
         Some(fps) => Pace::lite(fps, false),
         None => Pace::Raw,
@@ -885,7 +895,7 @@ async fn pump(
                 break;
             }
             () = handoff_restarting(gate.as_ref()) => {
-                close_for_restart(&mut viewer.socket).await;
+                viewer.close_for_restart().await;
                 break;
             }
             changed = shutdown.changed() => {
@@ -908,12 +918,12 @@ pub(super) async fn handoff_restarting(gate: Option<&crate::handoff::Gate>) {
 
 /// Close a WebSocket for a live handoff: clients reconnect to whichever
 /// process serves next.
-pub(super) async fn close_for_restart(socket: &mut WebSocket) {
+pub(super) async fn close_for_restart(socket: &mut WebSocket, send_timeout: Duration) {
     let close = CloseFrame {
         code: WS_CLOSE_RESTART,
         reason: "the hub is restarting (upgrade); reconnect".into(),
     };
-    let _ = tokio::time::timeout(SEND_TIMEOUT, async {
+    let _ = tokio::time::timeout(send_timeout, async {
         let _ = socket.send(Message::Close(Some(close))).await;
         let _ = socket.flush().await;
     })

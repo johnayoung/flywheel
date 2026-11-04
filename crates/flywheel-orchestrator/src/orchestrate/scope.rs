@@ -476,10 +476,16 @@ impl fmt::Display for ScopeOutcome {
     }
 }
 
-/// Every named task's outcome, in the plan's order.
+/// Every named task's outcome, in the plan's order, and every pulled-in
+/// prerequisite's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScopeVerdict {
     pub outcomes: Vec<(String, ScopeOutcome)>,
+    /// The prerequisites `with_prerequisites` pulled in, in listing order:
+    /// counted in [`Self::summary`]; the named tasks alone decide
+    /// [`Self::settled`] and [`Self::all_verified`] (a named task verifies
+    /// only after its prerequisites did).
+    pub prerequisites: Vec<(String, ScopeOutcome)>,
 }
 
 impl ScopeVerdict {
@@ -494,24 +500,34 @@ impl ScopeVerdict {
             .all(|(_, o)| *o == ScopeOutcome::Verified)
     }
 
-    /// The one-line summary: `scope: 1/2 verified -- a verified; b failed (...)`.
+    /// Every member's outcome: the named tasks, then the prerequisites
+    /// (`true`).
+    fn members(&self) -> impl Iterator<Item = (&String, &ScopeOutcome, bool)> {
+        let named = self.outcomes.iter().map(|(id, o)| (id, o, false));
+        named.chain(self.prerequisites.iter().map(|(id, o)| (id, o, true)))
+    }
+
+    /// The one-line summary over every member, pulled-in prerequisites
+    /// included: `scope: 1/3 verified -- a verified; b failed (...);
+    /// prerequisite p pending`.
     pub fn summary(&self) -> String {
         let verified = self
-            .outcomes
-            .iter()
-            .filter(|(_, o)| *o == ScopeOutcome::Verified)
+            .members()
+            .filter(|(_, o, _)| **o == ScopeOutcome::Verified)
             .count();
-        let parts: Vec<String> = self
-            .outcomes
-            .iter()
-            .map(|(id, outcome)| format!("{id} {}", one_line(&outcome.to_string())))
-            .collect();
+        let parts: Vec<String> = self.members().map(member_part).collect();
         format!(
             "scope: {verified}/{} verified -- {}",
-            self.outcomes.len(),
+            self.outcomes.len() + self.prerequisites.len(),
             parts.join("; ")
         )
     }
+}
+
+/// One member in a summary line: `a verified`, `prerequisite p failed (...)`.
+fn member_part((id, outcome, prerequisite): (&String, &ScopeOutcome, bool)) -> String {
+    let lead = if prerequisite { "prerequisite " } else { "" };
+    format!("{lead}{id} {}", one_line(&outcome.to_string()))
 }
 
 impl ScopeVerdict {
@@ -519,10 +535,9 @@ impl ScopeVerdict {
     /// settled and why (`waiting -- b pending (claimed by w2 until ...)`).
     pub fn waiting_line(&self) -> String {
         let parts: Vec<String> = self
-            .outcomes
-            .iter()
-            .filter(|(_, o)| !o.is_settled())
-            .map(|(id, outcome)| format!("{id} {}", one_line(&outcome.to_string())))
+            .members()
+            .filter(|(_, o, _)| !o.is_settled())
+            .map(member_part)
             .collect();
         format!("scope: waiting -- {}", parts.join("; "))
     }
@@ -793,22 +808,21 @@ pub fn evaluate_scope(
         }
         None
     };
-    let outcomes = plan
-        .named
-        .iter()
-        .map(|id| {
-            let own_outcome = own.get(id).cloned().unwrap_or(ScopeOutcome::Pending {
-                detail: String::new(),
-            });
-            let outcome = match own_outcome {
-                pending @ ScopeOutcome::Pending { .. } => match blocker(id) {
-                    Some(prerequisite) => ScopeOutcome::Blocked { prerequisite },
-                    None => pending,
-                },
-                settled => settled,
-            };
-            (id.clone(), outcome)
-        })
-        .collect();
-    Ok(ScopeVerdict { outcomes })
+    let outcome_of = |id: &String| {
+        let own_outcome = own.get(id).cloned().unwrap_or(ScopeOutcome::Pending {
+            detail: String::new(),
+        });
+        let outcome = match own_outcome {
+            pending @ ScopeOutcome::Pending { .. } => match blocker(id) {
+                Some(prerequisite) => ScopeOutcome::Blocked { prerequisite },
+                None => pending,
+            },
+            settled => settled,
+        };
+        (id.clone(), outcome)
+    };
+    Ok(ScopeVerdict {
+        outcomes: plan.named.iter().map(outcome_of).collect(),
+        prerequisites: plan.added.iter().map(outcome_of).collect(),
+    })
 }

@@ -583,7 +583,22 @@ pub fn run_with(
             return code;
         }
     };
-    match cli.command {
+    // `serve`'s stderr is the daemon's log: never silenced.
+    if matches!(cli.command, HubCommand::Serve(_)) {
+        return dispatch(cli.command, out, err, extensions);
+    }
+    crate::util::quiet_on_closed_pipe(out, err, |out, err| {
+        dispatch(cli.command, out, err, extensions)
+    })
+}
+
+fn dispatch(
+    command: HubCommand,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    extensions: &HubExtensions,
+) -> i32 {
+    match command {
         HubCommand::Token(args) => token(&args, out, err),
         HubCommand::Tls(args) => crate::tls_cli::main(&args, out, err),
         HubCommand::Url(args) => url_cmd(&args, out, err),

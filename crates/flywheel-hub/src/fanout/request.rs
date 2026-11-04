@@ -62,7 +62,8 @@ pub(crate) fn default_true() -> bool {
 /// A [`CreateFanout`] checked: what the engine launches.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Validated {
-    pub name: String,
+    /// As given; `None`: [`default_name`] in the fan-out's workspace.
+    pub name: Option<String>,
     pub prompt: String,
     pub candidates: Vec<(SessionKind, AgentLaunch)>,
     pub graders: Vec<GraderSpec>,
@@ -145,8 +146,8 @@ impl CreateFanout {
             .map(str::trim)
             .filter(|n| !n.is_empty())
         {
-            Some(name) => crate::state::validate_name(name).map_err(|e| e.to_string())?,
-            None => default_name(&prompt),
+            Some(name) => Some(crate::state::validate_name(name).map_err(|e| e.to_string())?),
+            None => None,
         };
         Ok(Validated {
             name,
@@ -413,23 +414,26 @@ pub(crate) fn unique_name(name: &str, taken: &[&str]) -> String {
         .unwrap_or_else(|| name.to_owned())
 }
 
-/// A fan-out named after its prompt's first words.
-fn default_name(prompt: &str) -> String {
-    let mut name = String::new();
-    for word in prompt.split_whitespace().take(8) {
-        let word: String = word.chars().filter(|c| !c.is_control()).collect();
-        if name.chars().count() + word.chars().count() + 1 > 48 {
-            break;
-        }
-        if !name.is_empty() {
-            name.push(' ');
-        }
-        name.push_str(&word);
-    }
-    if name.is_empty() {
-        "fan-out".to_owned()
+/// A fan-out's name when none is given: its workspace's name and a short
+/// hash of the prompt (`api-3f9a2c`), never the prompt's own words, which
+/// would show in every activity row, plugin event, branch, and worktree
+/// directory named after it. One prompt fanned out again in the same
+/// workspace is told apart by [`unique_name`] (`api-3f9a2c-2`).
+pub fn default_name(workspace: &str, prompt: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(prompt.as_bytes());
+    let short: String = hash[..3].iter().map(|b| format!("{b:02x}")).collect();
+    let workspace: String = workspace
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(48)
+        .collect();
+    let workspace = workspace.trim();
+    if workspace.is_empty() {
+        format!("fan-out-{short}")
     } else {
-        name
+        format!("{workspace}-{short}")
     }
 }
 

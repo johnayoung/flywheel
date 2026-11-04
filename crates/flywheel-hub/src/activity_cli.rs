@@ -157,7 +157,7 @@ pub fn digest_lines(digest: &Value) -> Vec<String> {
         lines.push("  nothing happened, nobody is blocked".into());
     } else {
         lines.push(format!(
-            "  {} · {} blocked now · {} · {} · ${cost:.2}",
+            "  {} · {} blocked now · {} · {} · {}",
             plural(
                 count(digest, "turns_finished"),
                 "turn finished",
@@ -170,6 +170,7 @@ pub fn digest_lines(digest: &Value) -> Vec<String> {
                 "command suggested",
                 "commands suggested"
             ),
+            crate::util::dollars(cost),
         ));
     }
     let on = |item: &Value| match item.get("machine").and_then(Value::as_str) {
@@ -317,5 +318,19 @@ mod tests {
         assert!(lines.contains(&"  machine old not included: HTTP 500: boom".to_owned()));
         let seen = json!({ "since": "x", "until": "y", "empty": true, "last_seen": true });
         assert!(!digest_lines(&seen)[0].contains("first look"));
+    }
+
+    #[test]
+    fn the_digest_cost_reads_as_usage_rows_do() {
+        let digest = |cost: f64| {
+            digest_lines(&json!({
+                "since": "x", "until": "y", "turns_finished": 1, "cost_usd": cost,
+            }))[1]
+                .clone()
+        };
+        assert!(digest(0.0042).ends_with(" · $0.0042"), "{}", digest(0.0042));
+        assert!(digest(3.5).ends_with(" · $3.50"));
+        assert!(digest(0.0).ends_with(" · $0"));
+        assert!(digest(1234.4).ends_with(" · $1234"));
     }
 }

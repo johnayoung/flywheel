@@ -93,7 +93,8 @@ struct NewArgs {
     /// Base branch (default: the folder's current branch).
     #[arg(long, value_name = "BRANCH")]
     base: Option<String>,
-    /// Display name (default: the prompt's first words).
+    /// Display name (default: the workspace's name and a short hash of
+    /// the prompt, e.g. `api-3f9a2c`).
     #[arg(long)]
     name: Option<String>,
     /// Per-grader time limit in seconds.
@@ -268,48 +269,8 @@ struct CleanupArgs {
     endpoint: EndpointArgs,
 }
 
-/// Output whose reader may go away (`| head`): from then on writes are
-/// dropped, and the command ends quietly.
-struct Piped<'a> {
-    inner: &'a mut dyn Write,
-    closed: bool,
-}
-
-impl Write for Piped<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if self.closed {
-            return Ok(buf.len());
-        }
-        match self.inner.write(buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                self.closed = true;
-                Ok(buf.len())
-            }
-            other => other,
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.closed {
-            return Ok(());
-        }
-        match self.inner.flush() {
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-                self.closed = true;
-                Ok(())
-            }
-            other => other,
-        }
-    }
-}
-
 /// Run `fw hub fanout`.
 pub(crate) fn main(args: &FanoutArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let mut piped = Piped {
-        inner: out,
-        closed: false,
-    };
-    let out: &mut dyn Write = &mut piped;
     let result = match &args.command {
         FanoutCommand::New(a) => new(a, out, err),
         FanoutCommand::Ls(a) => ls(a, out),
@@ -325,7 +286,6 @@ pub(crate) fn main(args: &FanoutArgs, out: &mut dyn Write, err: &mut dyn Write) 
     let _ = out.flush();
     match result {
         Ok(code) => code,
-        Err(_) if piped.closed => 0,
         Err(message) => fail(err, &message),
     }
 }

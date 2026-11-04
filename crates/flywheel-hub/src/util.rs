@@ -22,6 +22,88 @@ pub(crate) fn print_json<T: Serialize + ?Sized>(out: &mut dyn Write, value: &T) 
     let _ = write_json(out, value);
 }
 
+/// Run a verb whose reader may go away (`fw hub activity | head -1`): once
+/// a write to `out` meets a closed pipe, that write (and every later one)
+/// still fails, so the verb stops writing, but what it then says on `err`
+/// about it is dropped and it exits 0, as a filter killed by SIGPIPE ends
+/// quietly. The one closed-pipe policy of every verb (a daemon's stderr
+/// is its log, so `serve` does not run under it).
+pub(crate) fn quiet_on_closed_pipe(
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    verb: impl FnOnce(&mut dyn Write, &mut dyn Write) -> i32,
+) -> i32 {
+    let closed = std::cell::Cell::new(false);
+    let code = verb(
+        &mut PipeOut {
+            inner: out,
+            closed: &closed,
+        },
+        &mut PipeErr {
+            inner: err,
+            closed: &closed,
+        },
+    );
+    if closed.get() { 0 } else { code }
+}
+
+/// `out` under [`quiet_on_closed_pipe`]: a closed pipe is noted.
+struct PipeOut<'a> {
+    inner: &'a mut dyn Write,
+    closed: &'a std::cell::Cell<bool>,
+}
+
+impl PipeOut<'_> {
+    fn note<T>(&self, result: std::io::Result<T>) -> std::io::Result<T> {
+        if let Err(e) = &result
+            && e.kind() == std::io::ErrorKind::BrokenPipe
+        {
+            self.closed.set(true);
+        }
+        result
+    }
+}
+
+impl Write for PipeOut<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.closed.get() {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        let result = self.inner.write(buf);
+        self.note(result)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.closed.get() {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        let result = self.inner.flush();
+        self.note(result)
+    }
+}
+
+/// `err` under [`quiet_on_closed_pipe`]: silent once `out` is closed.
+struct PipeErr<'a> {
+    inner: &'a mut dyn Write,
+    closed: &'a std::cell::Cell<bool>,
+}
+
+impl Write for PipeErr<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.closed.get() {
+            return Ok(buf.len());
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.closed.get() {
+            return Ok(());
+        }
+        self.inner.flush()
+    }
+}
+
 /// Print `fw hub: <message>` to `err`; the failing exit code (1).
 pub(crate) fn fail(err: &mut dyn Write, message: &str) -> i32 {
     let _ = writeln!(err, "fw hub: {message}");
@@ -186,6 +268,74 @@ pub fn path_identity(path: &Path) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Takes `room` bytes, then reports a closed pipe.
+    struct Pipe {
+        room: usize,
+        got: Vec<u8>,
+    }
+
+    impl Write for Pipe {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.room == 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let n = buf.len().min(self.room);
+            self.room -= n;
+            self.got.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_pipe_ends_a_verb_quietly_and_nothing_else_does() {
+        let verb = |out: &mut dyn Write, err: &mut dyn Write| {
+            for i in 0..100 {
+                if let Err(e) = writeln!(out, "line {i}") {
+                    return fail(err, &e.to_string());
+                }
+            }
+            writeln!(err, "done").unwrap();
+            3
+        };
+        let (mut out, mut err) = (
+            Pipe {
+                room: 12,
+                got: Vec::new(),
+            },
+            Vec::new(),
+        );
+        assert_eq!(quiet_on_closed_pipe(&mut out, &mut err, verb), 0);
+        assert_eq!(out.got, b"line 0\nline ");
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+        // An open pipe: the verb's own code and stderr.
+        let (mut out, mut err) = (
+            Pipe {
+                room: usize::MAX,
+                got: Vec::new(),
+            },
+            Vec::new(),
+        );
+        assert_eq!(quiet_on_closed_pipe(&mut out, &mut err, verb), 3);
+        assert_eq!(err, b"done\n");
+        // Any other write error is the verb's to report.
+        let mut full = std::io::Cursor::new([0u8; 4]);
+        let mut err = Vec::new();
+        assert_eq!(
+            quiet_on_closed_pipe(&mut full, &mut err, |out, err| {
+                match writeln!(out, "too long") {
+                    Ok(()) => 0,
+                    Err(e) => fail(err, &e.to_string()),
+                }
+            }),
+            1
+        );
+        assert!(!err.is_empty());
+    }
 
     #[test]
     fn helpers() {

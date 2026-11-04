@@ -101,7 +101,7 @@ Review actions (commit, push, pr, rebase, abort, merge) are two-step: `{"dry_run
 | POST | `/api/fanouts/{id}/cleanup` | `{"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}` -> per-candidate `items` |
 | POST | `/api/fanouts/{id}/promote` | `{"task_id"?,"goal"?,...,"dry_run":true}` -> `{"plan":{"path","contents"},"fingerprint"}`, then `{"confirm"}`; 409 exists / changed |
 | GET | `/api/flywheel` | `{"enabled","folders":[summary]}`; summary `{"folder","counts":{state:n},"alerts","live_runs","worker_live","problem"}` |
-| GET | `/api/flywheel/panel?folder=` | the whole panel; 404 unless an adopted workspace folder |
+| GET | `/api/flywheel/panel?folder=` | the whole panel (a pending task a running scoped worker will run: `queued_in {session_id,name}`); 404 unless an adopted workspace folder |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next"}`; poll with `since=next`; 503 an earlier read still waits |
 | GET | `/api/flywheel/task?folder=&task=` | the task as a fan-out seed (`prompt`, `graders`, `held_out` names) |
 | POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"cols"?,"rows"?}` -> 201 the `fw worker` session (`--task` per id); 409 `{"running"}` a hub-started worker runs there (unless `another`) |
@@ -123,7 +123,7 @@ Fan-out view: `{"id","base_sha","winner","counts","leader","settled","graded_at"
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/activity[?since=&until=&ws=&session=&kind=&limit=&cursor=&machines=none]` | `{"rows":[{"id","at","kind","session_id","workspace_id","text","data","machine"?}],"next","partial","machines"}` newest first (`next`: a `cursor`) |
+| GET | `/api/activity[?since=&until=&ws=&session=&kind=&limit=&cursor=&machines=none]` | `{"rows":[{"id","at","kind","session_id","workspace_id","text","data","machine"?}],"next","partial","machines"}` newest first (`next`: a `cursor`); `matched {workspace,session}`; a selector found nowhere: 404 |
 | GET | `/api/activity/digest[?since=&client=&until=&ws=&session=]` | `{"since","until","turns_finished","blocked_now","fanouts_graded","commands_suggested","cost_usd","workspaces","empty","partial"}`; `since=last-seen` needs `client` |
 | POST | `/api/activity/seen` | `{"client"}` -> 204: its `last-seen` is now |
 

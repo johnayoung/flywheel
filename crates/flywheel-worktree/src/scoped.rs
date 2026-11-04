@@ -194,6 +194,7 @@ mod tests {
     fn exit_codes_follow_the_verdict_unless_the_loop_failed() {
         let verified = ScopeVerdict {
             outcomes: vec![("a".into(), ScopeOutcome::Verified)],
+            prerequisites: Vec::new(),
         };
         let failed = ScopeVerdict {
             outcomes: vec![
@@ -205,6 +206,7 @@ mod tests {
                     },
                 ),
             ],
+            prerequisites: Vec::new(),
         };
         assert_eq!(exit_code(0, &verified), 0);
         assert_eq!(exit_code(0, &failed), 1);
@@ -212,6 +214,34 @@ mod tests {
         assert_eq!(
             failed.summary(),
             "scope: 1/2 verified -- a verified; b failed (grader unit failed)"
+        );
+        // Pulled-in prerequisites count in the line, not in the verdict.
+        let with_prereqs = ScopeVerdict {
+            outcomes: vec![("a".into(), ScopeOutcome::Verified)],
+            prerequisites: vec![("p".into(), ScopeOutcome::Verified)],
+        };
+        assert_eq!(
+            with_prereqs.summary(),
+            "scope: 2/2 verified -- a verified; prerequisite p verified"
+        );
+        assert_eq!(exit_code(0, &with_prereqs), 0);
+        let waiting = ScopeVerdict {
+            outcomes: vec![(
+                "a".into(),
+                ScopeOutcome::Pending {
+                    detail: String::new(),
+                },
+            )],
+            prerequisites: vec![(
+                "p".into(),
+                ScopeOutcome::Pending {
+                    detail: "running".into(),
+                },
+            )],
+        };
+        assert_eq!(
+            waiting.waiting_line(),
+            "scope: waiting -- a pending; prerequisite p pending (running)"
         );
     }
 

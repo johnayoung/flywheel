@@ -105,6 +105,17 @@ pub struct PanelTask {
     pub awaiting: Option<String>,
     /// The predicates an interrupted run waits on (`type=name, ...`).
     pub blocked_on: Option<String>,
+    /// A pending task a running scoped worker this hub started will run
+    /// (the hub fills it in per answer; see [`mark_queued`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_in: Option<QueuedIn>,
+}
+
+/// The worker session a pending task is queued in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedIn {
+    pub session_id: String,
+    pub name: String,
 }
 
 /// An active phase (a directory under `tasks/active/`) and its tasks in
@@ -857,6 +868,58 @@ impl WorkerScope {
         flags
     }
 
+    /// The scope a worker session's argv (from
+    /// [`worker_session_command`]) runs: `None` for an unscoped worker or
+    /// any other argv.
+    pub fn of_command(command: &[String]) -> Option<Self> {
+        let at = command.iter().position(|a| a == WORKER_MARKER)?;
+        let mut scope = Self::default();
+        for arg in &command[at + 1..] {
+            if let Some(id) = arg.strip_prefix("--task=") {
+                if !scope.tasks.iter().any(|t| t == id) {
+                    scope.tasks.push(id.to_owned());
+                }
+            } else if arg == "--with-prereqs" {
+                scope.with_prereqs = true;
+            }
+        }
+        (!scope.tasks.is_empty()).then_some(scope)
+    }
+
+    /// The tasks of `panel` this scope runs: its own, and with
+    /// prerequisites their unmet ones, transitively (as `fw worker
+    /// --with-prereqs` plans: a prerequisite verified or parked is met, and
+    /// one the panel does not list is archived, so done).
+    pub fn members(&self, panel: &FlywheelPanel) -> Vec<String> {
+        let tasks: HashMap<&str, &PanelTask> = panel
+            .phases
+            .iter()
+            .flat_map(|p| &p.tasks)
+            .map(|t| (t.id.as_str(), t))
+            .collect();
+        let mut members: Vec<String> = self.tasks.clone();
+        if !self.with_prereqs {
+            return members;
+        }
+        let mut stack: Vec<String> = self.tasks.clone();
+        while let Some(id) = stack.pop() {
+            let Some(task) = tasks.get(id.as_str()) else {
+                continue;
+            };
+            for prereq in &task.prerequisites {
+                let met = tasks
+                    .get(prereq.as_str())
+                    .is_none_or(|t| matches!(t.state, TaskLight::Verified | TaskLight::Parked));
+                if met || members.contains(prereq) {
+                    continue;
+                }
+                members.push(prereq.clone());
+                stack.push(prereq.clone());
+            }
+        }
+        members
+    }
+
     /// The session-name base: `fw worker`, or `fw worker <ids>`.
     fn session_base(&self) -> String {
         if self.tasks.is_empty() {
@@ -911,6 +974,33 @@ fn process_runs_worker(_pid: u32) -> bool {
     true
 }
 
+/// Mark each pending task of `panel` (the panel of `folder`) that a
+/// running scoped worker there will run with that worker's session (the
+/// first one, in `sessions` order, when several would).
+pub fn mark_queued(panel: &mut FlywheelPanel, folder: &Path, sessions: &[SessionView]) {
+    let mut queued: HashMap<String, QueuedIn> = HashMap::new();
+    for view in sessions {
+        if !runs_worker(view, folder) {
+            continue;
+        }
+        let Some(scope) = WorkerScope::of_command(&view.record.command) else {
+            continue;
+        };
+        for id in scope.members(panel) {
+            queued.entry(id).or_insert_with(|| QueuedIn {
+                session_id: view.record.id.clone(),
+                name: view.record.name.clone(),
+            });
+        }
+    }
+    for task in panel.phases.iter_mut().flat_map(|p| &mut p.tasks) {
+        task.queued_in = match task.state {
+            TaskLight::Pending => queued.get(&task.id).cloned(),
+            _ => None,
+        };
+    }
+}
+
 /// A worker session name no session has: [`WORKER_SESSION_NAME`], else
 /// `fw worker 2`, `fw worker 3`, ... (names address sessions in `fw hub`
 /// verbs, so they stay unique).
@@ -957,6 +1047,7 @@ mod tests {
             stopped: None,
             awaiting: None,
             blocked_on: None,
+            queued_in: None,
         }
     }
 
@@ -1097,6 +1188,43 @@ mod tests {
             worker_session_name(&long, []),
             "fw worker task-0, task-1, task-2, task-3, task-..."
         );
+    }
+
+    #[test]
+    fn a_worker_session_says_its_scope_and_what_it_will_run() {
+        let scoped = WorkerScope::new(vec!["d".into()], true).unwrap();
+        let argv = worker_session_command(
+            &["/bin/fw".to_owned(), "worker".to_owned()]
+                .into_iter()
+                .chain(scoped.flags())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(WorkerScope::of_command(&argv), Some(scoped.clone()));
+        let unscoped = worker_session_command(&["/bin/fw".to_owned(), "worker".to_owned()]);
+        assert_eq!(WorkerScope::of_command(&unscoped), None);
+        assert_eq!(WorkerScope::of_command(&["--task=x".to_owned()]), None);
+
+        let mut panel = FlywheelPanel::empty("/r".into(), Utc::now());
+        let with = |id: &str, state, prereqs: &[&str]| PanelTask {
+            prerequisites: prereqs.iter().map(|p| (*p).to_owned()).collect(),
+            ..task(id, state)
+        };
+        panel.phases = vec![PanelPhase {
+            name: "01".into(),
+            tasks: vec![
+                with("a", TaskLight::Pending, &[]),
+                with("b", TaskLight::Verified, &[]),
+                with("c", TaskLight::Parked, &["a"]),
+                with("d", TaskLight::Pending, &["b", "c", "e", "archived"]),
+                with("e", TaskLight::Failed, &["a"]),
+                with("x", TaskLight::Pending, &[]),
+            ],
+        }];
+        // Verified, parked and archived prerequisites are met; the rest
+        // come along, transitively.
+        assert_eq!(scoped.members(&panel), ["d", "e", "a"]);
+        let alone = WorkerScope::new(vec!["d".into()], false).unwrap();
+        assert_eq!(alone.members(&panel), ["d"]);
     }
 
     #[test]

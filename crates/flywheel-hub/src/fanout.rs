@@ -45,8 +45,8 @@ pub use promote::{Promotion, TaskOrigin};
 use request::default_true;
 pub(crate) use request::unique_name;
 pub use request::{
-    CandidateSpec, CreateFanout, Validated, fix_prompt, hidden_error, pin_graders, pins_broken,
-    tampered, task_name,
+    CandidateSpec, CreateFanout, Validated, default_name, fix_prompt, hidden_error, pin_graders,
+    pins_broken, tampered, task_name,
 };
 pub use runner::{Cancel, GradeRequest, GraderRunner, GradingControl, RunnerError};
 pub use view::{

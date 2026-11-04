@@ -9,11 +9,13 @@
 //! machine's base URL is ever reached (`Machine::target`). WebSockets are
 //! relayed frame by frame, each direction awaiting the other side's
 //! write, so a slow browser slows the remote socket down (whose own flow
-//! control then skips ahead with a fresh snapshot) instead of queueing.
+//! control then skips ahead with a fresh snapshot) instead of queueing;
+//! a side that stops reading altogether ends the relay after the send
+//! timeout ([`super::ServerOptions::send_timeout`]).
 
 use super::{
     ApiJson, AppState, Client, CredentialWatch, WS_MAX_MESSAGE, WS_PING_INTERVAL, error_response,
-    handoff_restarting, login_recheck, origin_ok, upgrade_refused,
+    handoff_restarting, login_recheck, origin_ok, upgrade_refused, write_within,
 };
 use crate::hub::HubEvent;
 use crate::machines::{CALL_TIMEOUT, LinkError, Machine, MachineError, host_name, record};
@@ -601,6 +603,7 @@ async fn forward_socket(
     let shutdown = app.shutdown.clone();
     let machines = Arc::clone(&app.machines);
     let epoch = machine.epoch();
+    let send_timeout = app.options.send_timeout();
     ws.max_message_size(WS_MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
             relay(
@@ -614,6 +617,7 @@ async fn forward_socket(
                     gate,
                     machines,
                     epoch,
+                    send_timeout,
                 },
             )
             .await;
@@ -628,6 +632,7 @@ struct Relay {
     gate: Option<crate::handoff::Gate>,
     machines: Arc<crate::machines::Machines>,
     epoch: u64,
+    send_timeout: Duration,
 }
 
 /// How a relay ended, and what each side is told.
@@ -677,6 +682,9 @@ async fn relay(browser: WebSocket, upstream: crate::endpoint::Socket, mut ctx: R
     let (mut to_browser, mut from_browser) = browser.split();
     let (mut to_machine, mut from_machine) = upstream.split();
     let mut recheck = login_recheck();
+    // Each write, either way, within this: a stalled reader on one side
+    // ends the relay (both sockets dropped) instead of holding it.
+    let limit = ctx.send_timeout;
     let end = {
         // Machine -> browser, one frame at a time (each awaits the
         // browser's write: backpressure all the way to the machine).
@@ -702,12 +710,12 @@ async fn relay(browser: WebSocket, upstream: crate::endpoint::Socket, mut ctx: R
                             | tungstenite::Message::Pong(_)
                             | tungstenite::Message::Frame(_) => continue,
                         };
-                        if to_browser.send(out).await.is_err() {
+                        if !write_within(limit, to_browser.send(out)).await {
                             return End::Browser;
                         }
                     }
                     _ = ping.tick() => {
-                        if to_browser.send(Message::Ping(Bytes::new())).await.is_err() {
+                        if !write_within(limit, to_browser.send(Message::Ping(Bytes::new()))).await {
                             return End::Browser;
                         }
                     }
@@ -727,7 +735,7 @@ async fn relay(browser: WebSocket, upstream: crate::endpoint::Socket, mut ctx: R
                     Message::Close(_) => return End::Browser,
                     Message::Ping(_) | Message::Pong(_) => continue,
                 };
-                if to_machine.send(out).await.is_err() {
+                if !write_within(limit, to_machine.send(out)).await {
                     return End::Machine(None);
                 }
             }
@@ -760,11 +768,11 @@ async fn relay(browser: WebSocket, upstream: crate::endpoint::Socket, mut ctx: R
         End::Local(frame) => Some(frame),
     };
     if let Some(frame) = browser_frame {
-        let _ = to_browser.send(Message::Close(Some(frame))).await;
+        write_within(limit, to_browser.send(Message::Close(Some(frame)))).await;
     }
-    let _ = to_browser.flush().await;
-    let _ = to_machine.send(tungstenite::Message::Close(None)).await;
-    let _ = to_machine.flush().await;
+    write_within(limit, to_browser.flush()).await;
+    write_within(limit, to_machine.send(tungstenite::Message::Close(None))).await;
+    write_within(limit, to_machine.flush()).await;
 }
 
 #[cfg(test)]

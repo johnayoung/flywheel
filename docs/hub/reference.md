@@ -4,7 +4,8 @@ Every `fw hub` verb and flag, the serve flags, the hub's files (`docs_drift.rs` 
 
 ## Conventions
 
-- `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; ambiguity errors).
+- `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; ambiguity or no match errors; `activity` also takes one only its journal or a machine names).
+- Output into a closed pipe (`| head -1`) ends a verb quietly, exit 0.
 - Every verb but `report` takes `--state-dir DIR` (default `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub`).
 - `{remote}` = `[--url URL] [--token T] [--fingerprint SHA256]`: a hub elsewhere; prefer `FW_HUB_TOKEN` (argv is world-readable). TLS trust: [hub-security](security.md#https-without-tailscale).
 - `{machine}` = `[--machine NAME]`: a machine registered on that hub, via its proxy.

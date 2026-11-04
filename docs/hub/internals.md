@@ -125,7 +125,7 @@ Keys: [hub-reference](reference.md#keyboard-shortcuts).
 Tested at 390x844 and 430x932.
 
 - Pinned to the visual viewport (the keyboard shrinks the terminal); the PTY keeps 16 rows or more (shorter boxes clip around the cursor).
-- **Needs you**: blocked and done agents of every workspace (blocked, longest waiting, first) head the sidebar (it scrolls as one) and the start screen.
+- **Needs you**: blocked and done agents of every workspace (blocked, longest waiting, first) head the sidebar (it scrolls as one) and the start screen; a workspace lists them as one `N in Needs you` row. The footer's utilities are one **More** row.
 - **Key bar** (touch): `esc` arrows `enter` `^c` (44px, fits 360px); then `tab` `shift-tab` sticky `ctrl` `alt`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd`, `compose`. Modifiers apply to key-bar keys too.
 - **Quick answers**: a blocked dialog's options as buttons. **Compose**: multi-line text as one bracketed paste + Enter; per-device history, per-session drafts.
 - Touch: swipe scrolls, long-press selects, pinch zooms.

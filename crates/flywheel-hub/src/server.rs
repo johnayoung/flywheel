@@ -156,6 +156,10 @@ pub const WS_CLOSE_SHARE_ENDED: u16 = 4004;
 /// relaunched in place (another process, another output stream):
 /// reconnect.
 pub const WS_CLOSE_RELAUNCHED: u16 = 4005;
+/// How long one WebSocket write may wait on a reader that stopped
+/// reading before that socket is dropped (see
+/// [`ServerOptions::ws_send_timeout`]).
+pub const WS_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long [`serve`] waits for sessions to exit on shutdown.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 
@@ -191,6 +195,30 @@ pub struct ServerOptions {
     /// the `/ca` onboarding page, and plain http from the network
     /// redirected to https. `None`: plain http only.
     pub tls: Option<Arc<crate::tls::TlsServing>>,
+    /// How long one WebSocket write (terminal, share link, events, the
+    /// machine proxy in both directions) may wait on a reader that stopped
+    /// reading before that socket is dropped and what it holds freed: a
+    /// stalled reader never holds a socket, nor what would close it (a
+    /// revoked credential, shutdown, a handoff), forever. `None`:
+    /// [`WS_SEND_TIMEOUT`].
+    pub ws_send_timeout: Option<Duration>,
+}
+
+impl ServerOptions {
+    /// [`Self::ws_send_timeout`], or its default.
+    pub fn send_timeout(&self) -> Duration {
+        self.ws_send_timeout.unwrap_or(WS_SEND_TIMEOUT)
+    }
+}
+
+/// Await one WebSocket write within `limit` (the one bounded-send policy
+/// of every socket the hub writes to); false when it failed or its reader
+/// stalled past `limit` (the caller drops the socket).
+pub(crate) async fn write_within<E>(
+    limit: Duration,
+    write: impl Future<Output = Result<(), E>>,
+) -> bool {
+    matches!(tokio::time::timeout(limit, write).await, Ok(Ok(())))
 }
 
 #[derive(Clone)]

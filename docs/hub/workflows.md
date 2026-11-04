@@ -86,6 +86,7 @@ fw hub fanout pick "$id" c1 --yes [--rebase]
 fw hub fanout cleanup "$id" [--force] --yes
 ```
 
+- Default name: workspace + prompt hash (`demo-3f9a2c`), never the prompt's words; `--name` wins.
 - **Agent claims are untrusted**: a finished turn only queues grading; the verdict is the graders' exit codes. Needs you lists the fan-out once per unseen grading.
 - **Graders are held out of the prompt only** (agents run as you). A tracked grader is editable: `--protect` its inputs (changing one fails) or keep the oracle outside the repo ([held-out gate](../held-out-gate.md)); absolute-path scripts are pinned by hash.
 - Grading: flywheel-core's runner (in order, `/bin/sh -c`, exit 0 passes, `--timeout` 900 s each, first failure stops); 2 at once.
@@ -115,7 +116,7 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 Folders with a `flywheel.toml` or `.flywheel/` get the verified loop beside the terminals. It reads the store, never writes it (workers it starts are hub shells); `--no-flywheel` turns it off.
 
 - Phases and tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (in **Needs you** until **Mark seen**). Opened from the folder chip's `verified/total` badge, `Alt F`, or the palette.
-- **Start worker here**: a hub shell running `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks before adding unmet prerequisites). A second needs confirming (409). Outcome: `verified`, `not verified`, `refused`, `worker exit N`.
+- **Start worker here**: a hub shell running `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks before adding unmet prerequisites). A second needs confirming (409). A pending task a running scoped worker will run says `queued in <session>`. Outcome: `verified`, `not verified`, `refused`, `worker exit N`.
 - **Output** on a run: its `fw show` summary and redacted transcript, followed live.
 - A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is never created. One watcher per folder (stat 2 s, re-read 15 s).
 - Seam: `flywheel-hub` defines `flywheel::FlywheelProvider`; the `flywheel` crate implements it (`hub_flywheel.rs`).

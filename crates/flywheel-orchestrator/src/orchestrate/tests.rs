@@ -3878,9 +3878,16 @@ async fn a_member_failed_before_the_scope_reruns_and_one_failed_under_it_does_no
             }
         )]
     );
-    assert_eq!(
-        verdict.summary(),
-        "scope: 0/1 verified -- child blocked (prerequisite flaky did not verify)"
+    assert_eq!(verdict.prerequisites.len(), 1);
+    assert_eq!(verdict.prerequisites[0].0, "flaky");
+    assert_eq!(verdict.prerequisites[0].1.label(), "failed");
+    let summary = verdict.summary();
+    assert!(
+        summary.starts_with(
+            "scope: 0/2 verified -- child blocked (prerequisite flaky did not verify); \
+             prerequisite flaky failed"
+        ),
+        "{summary}"
     );
 }
 

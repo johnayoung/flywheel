@@ -11,17 +11,6 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::time::Duration;
 
-/// The reader of our output went away (`| head`): stop quietly.
-const CLOSED_PIPE: &str = "\u{0}closed pipe";
-
-fn io_error(e: std::io::Error) -> String {
-    if e.kind() == std::io::ErrorKind::BrokenPipe {
-        CLOSED_PIPE.to_owned()
-    } else {
-        e.to_string()
-    }
-}
-
 /// Review actions can run commit hooks and push to a slow remote.
 const ACTION_TIMEOUT: Duration = Duration::from_secs(330);
 
@@ -95,7 +84,7 @@ pub fn review(args: &ReviewArgs, out: &mut dyn Write, err: &mut dyn Write) -> i3
             .as_deref()
             .map(|b| format!("&base={}", query_escape(b)))
             .unwrap_or_default();
-        let io = io_error;
+        let io = |e: std::io::Error| e.to_string();
         if let Some(path) = &args.diff {
             let mut offset = 0u64;
             let mut pages = Vec::new();
@@ -150,7 +139,6 @@ pub fn review(args: &ReviewArgs, out: &mut dyn Write, err: &mut dyn Write) -> i3
     })();
     match result {
         Ok(()) => 0,
-        Err(message) if message == CLOSED_PIPE => 0,
         Err(message) => {
             let _ = writeln!(err, "fw hub: {message}");
             1
@@ -327,7 +315,6 @@ pub(crate) fn render_plan(plan: &Value, out: &mut dyn Write) -> std::io::Result<
 pub fn merge(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match merge_inner(args, out, err) {
         Ok(code) => code,
-        Err(message) if message == CLOSED_PIPE => 0,
         Err(message) => {
             let _ = writeln!(err, "fw hub: {message}");
             1
@@ -338,7 +325,7 @@ pub fn merge(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 
 fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     let conn = Endpoint::resolve(&args.endpoint)?.with_timeout(ACTION_TIMEOUT);
     let (id, label) = find(&conn, &args.session)?;
-    let io = io_error;
+    let io = |e: std::io::Error| e.to_string();
     if args.abort_rebase {
         return abort_rebase(args, &conn, &id, &label, out, err);
     }
@@ -493,7 +480,7 @@ fn abort_rebase(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32, String> {
-    let io = io_error;
+    let io = |e: std::io::Error| e.to_string();
     let url = format!("/api/sessions/{id}/review/abort");
     let plan = conn.blocking_call("POST", &url, Some(&json!({ "dry_run": true })))?;
     if let Some(why) = plan.get("refusal").and_then(Value::as_str) {

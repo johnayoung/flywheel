@@ -7,9 +7,7 @@
 //! is refused by `require_auth` (403).
 
 use super::ApiQuery;
-use super::terminal_ws::{
-    Viewer, attach, close_for_relaunch, close_for_restart, handoff_restarting, relaunched,
-};
+use super::terminal_ws::{Viewer, attach, close_for_relaunch, handoff_restarting, relaunched};
 use super::{
     ApiJson, ApiResult, AppState, Client, WS_CLOSE_SHARE_ENDED, WS_MAX_MESSAGE, WS_PING_INTERVAL,
     blocking, error_response, origin_ok, upgrade_refused,
@@ -408,12 +406,13 @@ pub(super) async fn viewer_ws(
         );
     };
     let gate = gate.map(|axum::Extension(gate)| gate);
-    let shutdown = app.shutdown.clone();
+    let ends = (app.shutdown.clone(), gate);
     let hub = Arc::clone(&app.hub);
+    let send_timeout = app.options.send_timeout();
     ws.max_message_size(WS_MAX_MESSAGE)
         .on_upgrade(move |socket| async move {
             hub.emit(HubEvent::Sessions);
-            read_only_pump(socket, &session, &share, changes, shutdown, gate, &hub).await;
+            read_only_pump(socket, &session, &share, changes, ends, &hub, send_timeout).await;
             drop(hold);
             drop(session);
             hub.emit(HubEvent::Sessions);
@@ -460,11 +459,11 @@ async fn read_only_pump(
     session: &Arc<PtySession>,
     share: &ShareInfo,
     mut changes: watch::Receiver<u64>,
-    mut shutdown: watch::Receiver<bool>,
-    gate: Option<crate::handoff::Gate>,
+    (mut shutdown, gate): (watch::Receiver<bool>, Option<crate::handoff::Gate>),
     hub: &Hub,
+    send_timeout: Duration,
 ) {
-    let mut viewer = Viewer::new(socket, false);
+    let mut viewer = Viewer::new(socket, false, send_timeout);
     let Some(attachment) = attach(session, SNAPSHOT_HISTORY_BYTES).await else {
         return;
     };
@@ -530,7 +529,7 @@ async fn read_only_pump(
                 break;
             }
             () = handoff_restarting(gate.as_ref()) => {
-                close_for_restart(&mut viewer.socket).await;
+                viewer.close_for_restart().await;
                 break;
             }
             changed = shutdown.changed() => {

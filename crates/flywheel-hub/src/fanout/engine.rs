@@ -21,8 +21,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use super::{
-    CandidateView, MAX_FANOUTS, Promotion, finished_payload, hidden_error, pin_graders,
-    pins_broken, sent_prompt, unique_name,
+    CandidateView, MAX_FANOUTS, Promotion, default_name, finished_payload, hidden_error,
+    pin_graders, pins_broken, sent_prompt, unique_name,
 };
 
 mod actions;

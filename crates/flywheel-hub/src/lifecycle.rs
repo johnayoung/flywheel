@@ -512,8 +512,6 @@ pub(crate) fn logs(args: &LogsArgs, out: &mut dyn Write, err: &mut dyn Write) ->
     }
     let offset = u64::try_from(text.len()).unwrap_or(0);
     match daemon::follow(&path, offset, out) {
-        // The reader went away (a closed pipe): done.
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => 0,
         Err(e) => fail(err, &format!("{}: {e}", path.display())),
         Ok(()) => 0,
     }

@@ -18,9 +18,36 @@ fn base_request() -> serde_json::Value {
 }
 
 #[test]
+fn a_default_name_is_the_workspace_and_a_prompt_hash_never_its_words() {
+    let name = default_name("api", "Make the answer 42 in answer.txt");
+    assert_eq!(name.len(), "api-".len() + 6, "{name}");
+    assert!(name.starts_with("api-"), "{name}");
+    assert!(name[4..].bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+    assert_eq!(
+        name,
+        default_name("api", "Make the answer 42 in answer.txt")
+    );
+    assert_ne!(
+        name,
+        default_name("api", "Make the answer 43 in answer.txt")
+    );
+    assert!(!name.contains("answer"));
+    assert!(default_name("", "x").starts_with("fan-out-"));
+    let long = default_name(&"w".repeat(200), "x");
+    assert!(long.chars().count() <= crate::state::MAX_NAME_CHARS);
+    assert_eq!(task_name(&name, "3f2a", "c1"), format!("{name}-3f2a-c1"));
+}
+
+#[test]
 fn requests_are_validated_and_normalized() {
     let valid = request(base_request()).validated().unwrap();
-    assert_eq!(valid.name, "Make the answer 42 in answer.txt");
+    assert_eq!(valid.name, None, "named in its workspace at launch");
+    let mut named = base_request();
+    named["name"] = json!("  answer  ");
+    assert_eq!(
+        request(named).validated().unwrap().name.as_deref(),
+        Some("answer")
+    );
     assert_eq!(valid.candidates.len(), 2);
     assert_eq!(valid.candidates[0].1.model.as_deref(), Some("opus"));
     assert_eq!(valid.graders[0].name, None);

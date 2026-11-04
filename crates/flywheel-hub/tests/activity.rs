@@ -370,9 +370,25 @@ async fn the_journal_follows_the_bus_pages_by_cursor_and_survives_a_restart() {
     // Filters and bad queries.
     let (only_ws, _) = hub.all_rows(&format!("&ws={wid}"), 3).await;
     assert_eq!(only_ws.len(), all.len());
-    let none = hub.get("/api/activity?ws=nope").await;
+    // A selector naming nothing (live or in the journal) is an error, as
+    // it is for every other verb; the digest says the same.
+    for path in [
+        "/api/activity?ws=nope",
+        "/api/activity/digest?ws=nope",
+        "/api/activity?session=nope",
+    ] {
+        let (status, body) = hub.call(reqwest::Method::GET, path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+        assert!(
+            body.to_string().contains("matches \\\"nope\\\""),
+            "{path}: {body}"
+        );
+    }
+    // A merging hub's `machines=none` question is answered, with `matched`.
+    let none = hub.get("/api/activity?ws=nope&machines=none").await;
     assert_eq!(none["rows"], json!([]));
     assert_eq!(none["next"], Value::Null);
+    assert_eq!(none["matched"]["workspace"], false);
     for bad in ["limit=0", "limit=501", "since=soon", "cursor=local:x"] {
         let (status, _) = hub
             .call(reqwest::Method::GET, &format!("/api/activity?{bad}"), None)
@@ -619,6 +635,14 @@ async fn a_hub_merges_its_machines_activity_and_says_partial_when_one_is_gone() 
         remote,
         "{digest}"
     );
+    // Named on neither hub: an error, timeline and digest alike.
+    for path in [
+        "/api/activity?ws=elsewhere",
+        "/api/activity/digest?ws=elsewhere",
+    ] {
+        let (status, body) = a.call(reqwest::Method::GET, path, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
     // A kind no row has is a mistake, not an empty timeline.
     let (status, body) = a
         .call(reqwest::Method::GET, "/api/activity?kind=nonsense", None)

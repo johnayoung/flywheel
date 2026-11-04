@@ -9,7 +9,7 @@
 
 use super::{ApiJson, ApiQuery, ApiResult, AppState, error_response};
 use crate::activity::{
-    Cursor, DEFAULT_LIMIT, Digest, Filter, LOCAL, MAX_LIMIT, Row, known_kind, parse_time, selects,
+    Cursor, DEFAULT_LIMIT, Digest, Filter, LOCAL, MAX_LIMIT, Row, known_kind, parse_time,
 };
 use crate::machines::{Machine, read_capped};
 use crate::peers::PeerInfo;
@@ -118,49 +118,70 @@ fn filter_of(
     ))
 }
 
-/// `selector` resolved against this hub's `items` (id, name): an id, one
-/// name, or one id prefix becomes that id; one naming nothing here stays
-/// as it is (rows outlive what they name); one naming several is an error.
-fn resolve_here(selector: &str, items: &[(String, String)], what: &str) -> Result<String, String> {
-    if items.iter().any(|(id, _)| id == selector) {
-        return Ok(selector.to_owned());
-    }
-    for (how, picked) in [
-        (
-            "name",
-            items
-                .iter()
-                .filter(|(_, name)| name == selector)
-                .collect::<Vec<_>>(),
-        ),
-        (
-            "id prefix",
-            items
-                .iter()
-                .filter(|(id, _)| selects(selector, Some(id), None))
-                .collect(),
-        ),
-    ] {
-        match picked.as_slice() {
-            [] => {}
-            [(id, _)] => return Ok(id.clone()),
-            many => {
-                return Err(format!(
-                    "{what} {how} {selector:?} is ambiguous: {}; use the id",
-                    many.iter()
-                        .map(|(id, name)| format!("{id} ({name:?})"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-        }
-    }
-    Ok(selector.to_owned())
+/// What a request's selectors found on this hub.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct Matched {
+    workspace: bool,
+    session: bool,
 }
 
-/// `filter` with its workspace and session resolved against this hub.
-fn localize(app: &AppState, filter: &Filter) -> Result<Filter, String> {
+impl Matched {
+    /// The first selector of `filter` nothing found, as an error.
+    fn error(self, filter: &Filter) -> Option<String> {
+        let none = |what: &str, query: &str| {
+            format!("no {what} matches {query:?} (id, id prefix, or name)")
+        };
+        match (&filter.workspace, &filter.session) {
+            (Some(ws), _) if !self.workspace => Some(none("workspace", ws)),
+            (_, Some(session)) if !self.session => Some(none("session", session)),
+            _ => None,
+        }
+    }
+
+    fn json(self) -> Value {
+        json!({ "workspace": self.workspace, "session": self.session })
+    }
+
+    /// What machine `answer` says its selectors found (a hub from before
+    /// `matched` is taken to have found them).
+    fn of_answer(answer: &Value) -> Self {
+        let found = |key: &str| {
+            answer
+                .get("matched")
+                .and_then(|m| m.get(key))
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+        };
+        Self {
+            workspace: found("workspace"),
+            session: found("session"),
+        }
+    }
+
+    fn or(self, other: Self) -> Self {
+        Self {
+            workspace: self.workspace || other.workspace,
+            session: self.session || other.session,
+        }
+    }
+}
+
+/// `filter` with its workspace and session resolved against this hub by
+/// the one resolver ([`crate::script::find_by`]): a live one becomes its
+/// id. One naming nothing live stays as given (rows outlive what they
+/// name; a machine resolves it for itself) and is found only if a row
+/// here names it. One naming several is an error.
+fn localize(app: &AppState, filter: &Filter) -> Result<(Filter, Matched), String> {
     let mut local = filter.clone();
+    let mut matched = Matched::default();
+    let in_journal = |workspace: Option<&String>, session: Option<&String>| {
+        let probe = Filter {
+            workspace: workspace.cloned(),
+            session: session.cloned(),
+            ..Filter::default()
+        };
+        !app.hub.activity().page(&probe, None, 1).0.is_empty()
+    };
     if let Some(ws) = &filter.workspace {
         let items: Vec<(String, String)> = app
             .hub
@@ -168,7 +189,13 @@ fn localize(app: &AppState, filter: &Filter) -> Result<Filter, String> {
             .into_iter()
             .map(|w| (w.id, w.name))
             .collect();
-        local.workspace = Some(resolve_here(ws, &items, "workspace")?);
+        match crate::script::find_by(&items, |(id, name)| (id, name), ws, "workspace")? {
+            Some((id, _)) => {
+                local.workspace = Some(id.clone());
+                matched.workspace = true;
+            }
+            None => matched.workspace = in_journal(Some(ws), None),
+        }
     }
     if let Some(session) = &filter.session {
         let items: Vec<(String, String)> = app
@@ -177,9 +204,33 @@ fn localize(app: &AppState, filter: &Filter) -> Result<Filter, String> {
             .into_iter()
             .map(|v| (v.record.id, v.record.name))
             .collect();
-        local.session = Some(resolve_here(session, &items, "session")?);
+        match crate::script::find_by(&items, |(id, name)| (id, name), session, "session")? {
+            Some((id, _)) => {
+                local.session = Some(id.clone());
+                matched.session = true;
+            }
+            None => matched.session = in_journal(None, Some(session)),
+        }
     }
-    Ok(local)
+    Ok((local, matched))
+}
+
+/// For a request that asks its machines (`asked`), the error when a
+/// selector found nothing here nor on any machine that answered: none
+/// when one did, or when a machine did not answer (it might have).
+fn unmatched_anywhere(
+    filter: &Filter,
+    here: Matched,
+    answers: &[(String, Result<Value, String>)],
+) -> Option<String> {
+    if answers.iter().any(|(_, a)| a.is_err()) {
+        return None;
+    }
+    let found = answers
+        .iter()
+        .filter_map(|(_, a)| a.as_ref().ok())
+        .fold(here, |m, a| m.or(Matched::of_answer(a)));
+    found.error(filter)
 }
 
 /// The query string asking a machine for the same rows.
@@ -225,6 +276,32 @@ async fn machine_get(machine: &Machine, path: &str) -> Result<Value, String> {
         ));
     }
     serde_json::from_slice(&body).map_err(|e| format!("unexpected answer: {e}"))
+}
+
+/// Whether this hub answers for another (a peer, or a merging hub's
+/// `machines=none`): its selectors finding nothing here is no error, only
+/// said in `matched`.
+fn for_another(query: &ActivityQuery, peer: bool) -> bool {
+    peer || query.machines.as_deref() == Some("none")
+}
+
+/// For a request answered here alone (no machines to ask, and not for
+/// another), the error when a selector found nothing.
+fn unmatched_alone(
+    query: &ActivityQuery,
+    peer: bool,
+    machines: &[Arc<Machine>],
+    filter: &Filter,
+    matched: Matched,
+) -> Option<String> {
+    if for_another(query, peer) || !machines.is_empty() {
+        return None;
+    }
+    matched.error(filter)
+}
+
+fn not_found(message: &str) -> Response {
+    error_response(StatusCode::NOT_FOUND, message)
 }
 
 /// The machines a request fans out to (none for a peer or `machines=none`).
@@ -298,12 +375,16 @@ pub(super) async fn list(
 ) -> ApiResult<Response> {
     let now = Utc::now();
     // As asked (what each machine resolves for itself), and resolved here.
-    let (filter, local) = match filter_of(&app, &query, now)
+    let (filter, local, matched) = match filter_of(&app, &query, now)
         .and_then(|(filter, _)| Ok((localize(&app, &filter)?, filter)))
     {
-        Ok((local, filter)) => (filter, local),
+        Ok(((local, matched), filter)) => (filter, local, matched),
         Err(message) => return Ok(bad(&message)),
     };
+    let machines = targets(&app, &query, peer.is_some());
+    if let Some(message) = unmatched_alone(&query, peer.is_some(), &machines, &filter, matched) {
+        return Ok(not_found(&message));
+    }
     let limit = match query.limit.as_deref() {
         None | Some("") => DEFAULT_LIMIT,
         Some(raw) => match raw.parse::<usize>() {
@@ -326,7 +407,6 @@ pub(super) async fn list(
         let rows = rows.iter().map(|r| json!(r)).collect();
         sources.push((LOCAL.to_owned(), rows, more));
     }
-    let machines = targets(&app, &query, peer.is_some());
     let answers = ask_all(machines, |name| match cursor.before(name) {
         Some(0) => None,
         before => Some(format!(
@@ -335,6 +415,11 @@ pub(super) async fn list(
         )),
     })
     .await;
+    if !for_another(&query, peer.is_some())
+        && let Some(message) = unmatched_anywhere(&filter, matched, &answers)
+    {
+        return Ok(not_found(&message));
+    }
     let mut statuses = Vec::new();
     let mut failed = Vec::new();
     for (name, answer) in answers {
@@ -387,6 +472,7 @@ pub(super) async fn list(
         "next": next,
         "partial": !failed.is_empty(),
         "machines": statuses,
+        "matched": matched.json(),
     }))
     .into_response())
 }
@@ -415,14 +501,17 @@ pub(super) async fn digest(
         .since
         .or_else(|| Some(now - chrono::Duration::days(1)));
     filter.until = filter.until.or(Some(now));
-    let local_filter = match localize(&app, &filter) {
+    let (local_filter, matched) = match localize(&app, &filter) {
         Ok(local) => local,
         Err(message) => return Ok(bad(&message)),
     };
+    let machines = targets(&app, &query, peer.is_some());
+    if let Some(message) = unmatched_alone(&query, peer.is_some(), &machines, &filter, matched) {
+        return Ok(not_found(&message));
+    }
     let hub = Arc::clone(&app.hub);
     let mut digest =
         super::blocking(move || Ok(hub.activity().digest(&hub, &local_filter))).await?;
-    let machines = targets(&app, &query, peer.is_some());
     let path = {
         let mut q = format!(
             "machines=none&since={}&until={}",
@@ -438,6 +527,11 @@ pub(super) async fn digest(
         format!("/api/activity/digest?{q}")
     };
     let answers = ask_all(machines, |_| Some(path.clone())).await;
+    if !for_another(&query, peer.is_some())
+        && let Some(message) = unmatched_anywhere(&filter, matched, &answers)
+    {
+        return Ok(not_found(&message));
+    }
     let mut statuses = Vec::new();
     let mut partial = false;
     for (name, answer) in answers {
@@ -459,6 +553,7 @@ pub(super) async fn digest(
     body["empty"] = json!(digest.is_empty());
     body["partial"] = json!(partial);
     body["machines"] = json!(statuses);
+    body["matched"] = matched.json();
     if let Some(seen_before) = seen_before {
         // Never seen: the last 24 hours stand in.
         body["last_seen"] = json!(seen_before);
@@ -506,37 +601,46 @@ mod tests {
     }
 
     #[test]
-    fn a_selector_resolves_to_one_id_here_or_stays_as_given() {
-        let items = vec![
-            ("aaaa1111".to_owned(), "alpha".to_owned()),
-            ("aaaa2222".to_owned(), "beta".to_owned()),
-            ("bbbb3333".to_owned(), "beta".to_owned()),
-        ];
+    fn a_selector_unmatched_here_and_on_every_machine_is_an_error() {
+        let filter = Filter {
+            workspace: Some("nowhere".into()),
+            ..Filter::default()
+        };
+        let here = Matched::default();
+        let missed = |m: &str| {
+            (
+                m.to_owned(),
+                Ok(json!({ "matched": { "workspace": false } })),
+            )
+        };
+        let found = (
+            "c".to_owned(),
+            Ok(json!({ "matched": { "workspace": true } })),
+        );
+        let old = ("d".to_owned(), Ok(json!({ "rows": [] })));
+        let down = ("e".to_owned(), Err("timed out".to_owned()));
         assert_eq!(
-            resolve_here("alpha", &items, "workspace").unwrap(),
-            "aaaa1111"
+            unmatched_anywhere(&filter, here, &[missed("a"), missed("b")]).as_deref(),
+            Some(r#"no workspace matches "nowhere" (id, id prefix, or name)"#)
         );
+        assert!(unmatched_anywhere(&filter, here, &[]).is_some());
+        assert!(unmatched_anywhere(&filter, here, &[missed("a"), found]).is_none());
+        // A hub from before `matched`, or one that did not answer, might
+        // have it.
+        assert!(unmatched_anywhere(&filter, here, &[missed("a"), old]).is_none());
+        assert!(unmatched_anywhere(&filter, here, &[missed("a"), down]).is_none());
+        let here_found = Matched {
+            workspace: true,
+            session: false,
+        };
+        assert!(unmatched_anywhere(&filter, here_found, &[missed("a")]).is_none());
+        let both = Filter {
+            session: Some("s9".into()),
+            ..filter
+        };
         assert_eq!(
-            resolve_here("bbbb", &items, "workspace").unwrap(),
-            "bbbb3333"
-        );
-        assert_eq!(
-            resolve_here("aaaa2222", &items, "workspace").unwrap(),
-            "aaaa2222"
-        );
-        assert_eq!(
-            resolve_here("elsewhere", &items, "workspace").unwrap(),
-            "elsewhere"
-        );
-        assert!(
-            resolve_here("beta", &items, "workspace")
-                .unwrap_err()
-                .contains("ambiguous")
-        );
-        assert!(
-            resolve_here("aaaa", &items, "workspace")
-                .unwrap_err()
-                .contains("ambiguous")
+            unmatched_anywhere(&both, here_found, &[]).as_deref(),
+            Some(r#"no session matches "s9" (id, id prefix, or name)"#)
         );
     }
 }

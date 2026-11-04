@@ -88,6 +88,9 @@
    chips like the rest where there is room to read them (phones, touch),
    one row of icon buttons on a desktop sidebar. */
 .side-tools { display: contents; }
+/* A phone folds the utilities behind one More row (app-phone.css). */
+.side-more { display: contents; }
+.side-more-toggle { display: none; }
 .chip svg { width: .8rem; height: .8rem; flex: none; }
 @media (min-width: 761px) and (pointer: fine) {
   .side-foot { gap: .3rem; padding: .5rem 1.1rem .6rem; }

@@ -119,6 +119,8 @@ window.matchMedia(NARROW).addEventListener("change", () => {
     state.stageKey = "";
     renderStage();
   }
+  // The sidebar lists differently on each side (see renderWorkspace).
+  render();
 });
 
 // --- events: pushed agent status -------------------------------------

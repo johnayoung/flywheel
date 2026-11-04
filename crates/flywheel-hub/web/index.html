@@ -105,7 +105,9 @@
       <button type="button" class="slab ghost" id="from-template" data-action="from-template" title="New agent from a saved template" hidden><svg><use href="#i-plus"/></svg>From template</button>
       <button type="button" class="slab ghost" data-action="fanouts" title="Verified fan-out: one prompt to several agents, graded and ranked"><svg><use href="#i-branch"/></svg>Fan-out</button>
     </div>
-    <footer class="side-foot">
+    <footer class="side-foot" id="side-foot">
+      <button type="button" class="side-more-toggle" id="side-more-toggle" aria-expanded="false" aria-controls="side-more"><svg aria-hidden="true"><use href="#i-dots"/></svg><span>More</span><span class="side-more-hint">palette, search, theme, alerts, activity, settings&hellip;</span></button>
+      <div class="side-more" id="side-more">
       <button type="button" class="chip" data-action="palette" data-key-title="palette.open" data-title="Command palette" title="Command palette (Ctrl K)">
         <kbd data-key="palette.open">Ctrl K</kbd><span>palette</span>
       </button>
@@ -122,6 +124,7 @@
         <button type="button" class="chip tool" data-action="sharing" title="Share links and recordings"><svg aria-hidden="true"><use href="#i-link"/></svg><span class="chip-label">sharing</span></button>
         <button type="button" class="chip tool settings-gear" id="settings-gear" data-action="settings" title="Settings"><svg aria-hidden="true"><use href="#i-gear"/></svg><span class="chip-label">settings</span></button>
         <button type="button" class="chip tool" data-action="logout" title="Sign out of this browser"><svg aria-hidden="true"><use href="#i-exit"/></svg><span class="chip-label">sign out</span></button>
+      </div>
       </div>
     </footer>
   </aside>

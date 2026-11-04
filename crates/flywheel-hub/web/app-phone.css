@@ -356,6 +356,40 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   #sidebar > #workspaces { overflow: visible; min-height: 40vh; }
   /* Its own short scroll inside that one (about three agents). */
   #sidebar .attn-list { max-height: 11.5rem; }
+  /* A session Needs you lists is one line under its workspace. */
+  .ws-needs {
+    width: 100%;
+    min-height: 44px;
+    padding: 0 1.1rem 0 2.2rem;
+    border: 0;
+    background: none;
+    color: var(--alert);
+    font-size: 12px;
+    letter-spacing: .04em;
+    text-align: left;
+  }
+  /* The footer's utilities: one More row, unfolding into a list of rows. */
+  .side-foot { display: block; padding: .35rem 0 .5rem; }
+  .side-more-toggle {
+    display: flex;
+    align-items: center;
+    gap: .6rem;
+    width: 100%;
+    min-height: 44px;
+    padding: 0 1.1rem;
+    border: 0;
+    background: none;
+    color: var(--ink-2);
+    font-size: 13px;
+    text-align: left;
+  }
+  .side-more-toggle svg { width: 1rem; height: 1rem; flex: none; }
+  .side-more-hint { min-width: 0; overflow: hidden; color: var(--ink-3); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+  .side-more-toggle[aria-expanded="true"] .side-more-hint { display: none; }
+  .side-more { display: none; }
+  .side-foot.more-open .side-more { display: grid; gap: .3rem; padding: .2rem 1.1rem 0; }
+  .side-foot.more-open .side-tools { display: grid; gap: .3rem; }
+  .side-foot.more-open .chip { width: 100%; min-height: 44px; justify-content: flex-start; }
   .menu-toggle { min-width: 2.6rem; min-height: 2.6rem; }
   .crumbs { gap: .45rem; align-items: center; }
   .cmd-pill b { margin-left: .2rem; }

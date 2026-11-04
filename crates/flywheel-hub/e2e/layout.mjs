@@ -477,6 +477,20 @@ try {
     return { height: Math.round(innerHeight - top), bad };
   });
   check(foot.height <= 180 && foot.bad.length === 0, `desktop: sidebar footer is ${foot.height}px (at most 180), every utility whole and named (${foot.bad.join(", ")})`);
+  // The phone's More row is not a desktop thing: the utilities show as they are.
+  const deskMore = await pp.evaluate(() => ({
+    toggle: document.querySelector("#side-more-toggle").offsetParent !== null,
+    hidden: [...document.querySelectorAll(".side-foot .chip")].filter((n) => n.offsetParent === null).length,
+  }));
+  check(!deskMore.toggle && deskMore.hidden === 0, `desktop: no More row, every utility shown (${JSON.stringify(deskMore)})`);
+  // Nor is folding Needs you out of the workspaces: the blocked agent is
+  // listed under its workspace too.
+  const deskListed = await pp.evaluate((id) => ({
+    needs: !!document.querySelector(`#attention .attn-row[data-id="${id}"]`),
+    listed: !!document.querySelector(`#workspaces .session[data-id="${id}"]`),
+    lines: document.querySelectorAll("#workspaces .ws-needs").length,
+  }), agent.id);
+  check(deskListed.needs && deskListed.listed && deskListed.lines === 0, `desktop: a blocked agent stays in its workspace's list (${JSON.stringify(deskListed)})`);
   // A long session name never squeezes the path or the usage button to
   // nothing: both keep a readable, clickable width.
   const meters = await pp.evaluate(() => ["#meter-cwd", "#meter-usage", ".crumb-session"].map((sel) => {
@@ -763,6 +777,52 @@ try {
     () => check(false, "phone: menu opens the sessions sidebar"),
   );
   await mp.screenshot({ path: path.join(out, "phone-sidebar.png") });
+  // Needs you is right above the workspaces: a session it lists is not
+  // listed again, its workspace says "N in Needs you" (a 44px row).
+  const twice = await mp.evaluate((id) => {
+    const needs = [...document.querySelectorAll("#attention .attn-row[data-id]")].map((r) => r.dataset.id);
+    return {
+      needs: needs.includes(id),
+      again: needs.filter((n) => document.querySelector(`#workspaces .session[data-id="${n}"]`)),
+      lines: [...document.querySelectorAll("#workspaces .ws-needs")].map((n) => [n.textContent, Math.round(n.getBoundingClientRect().height)]),
+    };
+  }, agent.id);
+  check(
+    twice.needs && twice.again.length === 0 && twice.lines.some(([t]) => t === "1 in Needs you") && twice.lines.every(([, h]) => h >= 44),
+    `phone: a session in Needs you is one "N in Needs you" line under its workspace (${JSON.stringify(twice)})`,
+  );
+  // The footer's utilities are one More row (44px) ...
+  const folded = await mp.evaluate(() => ({
+    toggle: Math.round(document.querySelector("#side-more-toggle").getBoundingClientRect().height),
+    shown: [...document.querySelectorAll(".side-foot .chip")].filter((n) => n.offsetParent !== null).length,
+  }));
+  check(folded.toggle >= 44 && folded.shown === 0, `phone: the footer is one More row (${JSON.stringify(folded)})`);
+  // ... unfolding into rows, each whole, uncovered and at least 44px.
+  await mp.locator("#side-more-toggle").tap();
+  await mp.waitForTimeout(500);
+  const unfolded = await mp.evaluate(() => {
+    const bad = [];
+    const chips = [...document.querySelectorAll(".side-foot .chip")];
+    for (const n of chips) {
+      if (n.offsetParent === null) { bad.push(`${n.id || n.dataset.action} hidden`); continue; }
+      n.scrollIntoView({ block: "center" });
+      const r = n.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!hit || !n.contains(hit)) bad.push(`${n.id || n.dataset.action} covered`);
+      if (r.height < 44 || r.width < 44) bad.push(`${n.id || n.dataset.action} ${Math.round(r.width)}x${Math.round(r.height)}`);
+      if (!n.textContent.trim()) bad.push(`${n.id || n.dataset.action} has no name`);
+    }
+    return { count: chips.length, expanded: document.querySelector("#side-more-toggle").getAttribute("aria-expanded"), bad };
+  });
+  check(unfolded.count >= 9 && unfolded.expanded === "true" && unfolded.bad.length === 0, `phone: More unfolds every utility as a 44px row (${JSON.stringify(unfolded)})`);
+  await mp.screenshot({ path: path.join(out, "phone-sidebar-more.png") });
+  // Picking one folds them again.
+  await mp.locator('.side-foot [data-action="activity"]').tap();
+  await mp.waitForTimeout(400);
+  const refolded = await mp.evaluate(() => document.querySelector("#side-more-toggle").getAttribute("aria-expanded"));
+  check(refolded === "false", `phone: picking a utility folds More again (${refolded})`);
+  await mp.keyboard.press("Escape");
+  await mp.waitForTimeout(300);
   // Drawers on a phone, over an agent in a real repo (Review needs git).
   await mp.goto(`${base}/login?token=${token}#session=${agent.id}`);
   await mp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });

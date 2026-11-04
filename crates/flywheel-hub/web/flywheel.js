@@ -634,6 +634,7 @@ window.FwHubFlywheel = function (ctx) {
         { className: "fw-task-text" },
         el("b", { textContent: task.id, title: task.id }),
         note ? el("small", { textContent: note, title: note }) : null,
+        queuedIn(task),
       ),
       el(
         "span",
@@ -644,6 +645,26 @@ window.FwHubFlywheel = function (ctx) {
         outputButton(task.run_id, task.id),
       ),
     );
+  }
+
+  // A pending task a running scoped worker will run: "queued in <its
+  // session>" (this hub's: opens it).
+  function queuedIn(task) {
+    const queued = task.state === "pending" ? task.queued_in : null;
+    if (!queued) return null;
+    const text = `queued in ${queued.name}`;
+    if (machineOfKey(ui.folder)) return el("small", { className: "fw-queued", textContent: text, title: text });
+    return el("button", {
+      type: "button",
+      className: "text-btn fw-queued",
+      textContent: text,
+      title: `${queued.name} runs ${task.id} once its turn comes: open its terminal`,
+      onclick: (event) => {
+        event.stopPropagation();
+        close();
+        openSession(queued.session_id);
+      },
+    });
   }
 
   // "Run <id> with worker here": `fw worker --task <id>` in a hub shell

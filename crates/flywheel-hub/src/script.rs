@@ -30,39 +30,70 @@ pub fn session_label(session: &Value) -> String {
 /// `name`): an exact id, else an exact name, else a unique id prefix.
 /// Ambiguity is an error listing the candidates (`what` names the kind).
 pub fn resolve<'a>(items: &'a [Value], query: &str, what: &str) -> Result<&'a Value, String> {
+    resolve_by(
+        items,
+        |i| (str_field(i, "id"), str_field(i, "name")),
+        query,
+        what,
+    )
+}
+
+/// [`resolve`] over any items, `key` giving each one's (id, name): the one
+/// resolver every verb (and the hub's own selectors) addresses things by.
+pub fn resolve_by<'a, T>(
+    items: &'a [T],
+    key: impl Fn(&T) -> (&str, &str),
+    query: &str,
+    what: &str,
+) -> Result<&'a T, String> {
+    find_by(items, key, query, what)?.ok_or_else(|| {
+        format!(
+            "no {what} matches {:?} (id, id prefix, or name)",
+            query.trim()
+        )
+    })
+}
+
+/// [`resolve_by`], with nothing matching `query` as `None` (for a caller
+/// that looks further, as the hub does across its machines).
+pub fn find_by<'a, T>(
+    items: &'a [T],
+    key: impl Fn(&T) -> (&str, &str),
+    query: &str,
+    what: &str,
+) -> Result<Option<&'a T>, String> {
     let query = query.trim();
     if query.is_empty() {
         return Err(format!("empty {what} name"));
     }
-    if let Some(item) = items.iter().find(|i| str_field(i, "id") == query) {
-        return Ok(item);
+    if let Some(item) = items.iter().find(|i| key(i).0 == query) {
+        return Ok(Some(item));
     }
-    let pick = |matches: Vec<&'a Value>, how: &str| -> Result<Option<&'a Value>, String> {
+    let pick = |matches: Vec<&'a T>, how: &str| -> Result<Option<&'a T>, String> {
         match matches.as_slice() {
             [] => Ok(None),
             [one] => Ok(Some(one)),
             many => Err(format!(
                 "{what} {how} {query:?} is ambiguous: {}; use the id",
                 many.iter()
-                    .map(|i| format!("{} ({:?})", str_field(i, "id"), str_field(i, "name")))
+                    .map(|i| {
+                        let (id, name) = key(i);
+                        format!("{id} ({name:?})")
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             )),
         }
     };
-    let named = items
-        .iter()
-        .filter(|i| str_field(i, "name") == query)
-        .collect();
+    let named = items.iter().filter(|i| key(i).1 == query).collect();
     if let Some(item) = pick(named, "name")? {
-        return Ok(item);
+        return Ok(Some(item));
     }
     let prefixed = items
         .iter()
-        .filter(|i| str_field(i, "id").starts_with(query))
+        .filter(|i| key(i).0.starts_with(query))
         .collect();
-    pick(prefixed, "id prefix")?
-        .ok_or_else(|| format!("no {what} matches {query:?} (id, id prefix, or name)"))
+    pick(prefixed, "id prefix")
 }
 
 fn short(id: &str) -> &str {

@@ -1101,7 +1101,7 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
             .then_some(text)
     });
     assert!(
-        screen.contains("scope: 1/1 verified -- gamma verified"),
+        screen.contains("scope: 2/2 verified -- gamma verified; prerequisite alpha verified"),
         "{screen}"
     );
     assert_eq!(
@@ -1119,4 +1119,121 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     let sid = session["id"].as_str().unwrap();
     let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{sid}"), None);
     assert_eq!(code, 204);
+}
+
+/// The panel's pending task's `queued_in` (`null` when none).
+fn queued_in(server: &Server, root: &Path, id: &str) -> (String, Value) {
+    let (code, panel) = http(
+        server,
+        "GET",
+        &format!(
+            "/api/flywheel/panel?folder={}",
+            root.display().to_string().replace('/', "%2F")
+        ),
+        None,
+    );
+    assert_eq!(code, 200, "{panel}");
+    let task = panel["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|p| p["tasks"].as_array().unwrap().clone())
+        .find(|t| t["id"] == id)
+        .unwrap_or_else(|| panic!("no task {id} in {panel}"));
+    (
+        task["state"].as_str().unwrap().to_owned(),
+        task.get("queued_in").cloned().unwrap_or(Value::Null),
+    )
+}
+
+#[test]
+fn pending_tasks_a_running_scoped_worker_will_run_say_which() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let ran = dir.join("ran.log");
+    let gate = dir.join("gate");
+    std::fs::write(&gate, "").unwrap();
+    // The verifying stand-in, held at its start while `gate` exists.
+    verifying_claude(&dir.join("bin/claude-verify"), &ran);
+    write_script(
+        &dir.join("bin/claude"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" != \"--version\" ]; then while [ -e '{gate}' ]; do sleep 0.1; done; fi\n\
+             exec '{verify}' \"$@\"\n",
+            gate = gate.display(),
+            verify = dir.join("bin/claude-verify").display()
+        ),
+    );
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
+    std::fs::write(root.join(".gitignore"), ".flywheel/\n").unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(
+        &root,
+        &["config", "user.email", "hub-queue@example.invalid"],
+    );
+    git(&root, &["config", "user.name", "hub queue"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "adopt"]);
+    write_task(&root, "01-core", "alpha", &[]);
+    write_task(&root, "01-core", "delta", &["alpha"]);
+    write_task(&root, "01-core", "other", &[]);
+    let server = start(&dir);
+    let (code, workspace) = http(
+        &server,
+        "POST",
+        "/api/workspaces",
+        Some(json!({ "name": "queued", "folders": [{"path": root}] })),
+    );
+    assert_eq!(code, 201, "{workspace}");
+    // Nothing runs yet: nothing is queued.
+    assert_eq!(queued_in(&server, &root, "delta").1, Value::Null);
+    let (code, session) = http(
+        &server,
+        "POST",
+        "/api/flywheel/worker",
+        Some(json!({
+            "folder": root, "workspace_id": workspace["id"], "tasks": ["delta"],
+            "with_prereqs": true,
+        })),
+    );
+    assert_eq!(code, 201, "{session}");
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let worker = json!({ "session_id": sid, "name": "fw worker delta" });
+    // While it holds alpha (the prerequisite it runs first), delta waits
+    // in it; a task outside its scope waits in none.
+    let (state, queued) = wait_for("delta to read as queued", || {
+        let found = queued_in(&server, &root, "delta");
+        (found.1 != Value::Null).then_some(found)
+    });
+    assert_eq!(state, "pending");
+    assert_eq!(queued, worker);
+    assert_eq!(
+        queued_in(&server, &root, "other"),
+        ("pending".into(), Value::Null)
+    );
+    std::fs::remove_file(&gate).unwrap();
+    let screen = wait_for("the scoped worker to finish", || {
+        let text = screen_text(&server, &sid);
+        text.contains("fw worker exited with status")
+            .then_some(text)
+    });
+    assert!(
+        screen.contains("scope: 2/2 verified -- delta verified; prerequisite alpha verified"),
+        "{screen}"
+    );
+    // Its worker gone, nothing is queued in it.
+    let (state, queued) = wait_for("delta to read as verified", || {
+        let found = queued_in(&server, &root, "delta");
+        (found.0 == "verified").then_some(found)
+    });
+    assert_eq!((state.as_str(), queued), ("verified", Value::Null));
+    assert_eq!(
+        queued_in(&server, &root, "other"),
+        ("pending".into(), Value::Null)
+    );
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "alpha\ndelta\n");
 }

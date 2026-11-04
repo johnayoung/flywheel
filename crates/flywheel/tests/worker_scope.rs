@@ -242,7 +242,11 @@ fn unmet_prerequisites_refuse_and_with_prereqs_runs_them_first() {
 
     let run = repo.worker(&["--task", "delta", "--with-prereqs"]);
     assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
-    assert_eq!(summary(&run), "scope: 1/1 verified -- delta verified");
+    // The pulled-in prerequisite counts in the line too.
+    assert_eq!(
+        summary(&run),
+        "scope: 2/2 verified -- delta verified; prerequisite alpha verified"
+    );
     assert!(
         run.stderr
             .contains("scoped to delta (with prerequisites alpha)"),

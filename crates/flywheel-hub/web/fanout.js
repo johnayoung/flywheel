@@ -825,7 +825,7 @@ window.FwHubFanout = function (ctx) {
     const bases = el("datalist", { id: "fo-bases" });
     const base = el("input", { type: "text", spellcheck: false, autocomplete: "off", placeholder: "base branch" });
     base.setAttribute("list", "fo-bases");
-    const name = el("input", { type: "text", maxLength: 100, placeholder: "default: the prompt's first words", autocomplete: "off" });
+    const name = el("input", { type: "text", maxLength: 100, placeholder: "default: workspace name + prompt hash", autocomplete: "off" });
     const prompt = el("textarea", { rows: 5, placeholder: "The task every agent gets, word for word", required: true });
     const cands = el("ol", { className: "fo-cands" });
     const defaults = kindAvailable("codex") ? [["claude", "opus"], ["claude", "sonnet"], ["codex", ""]] : [["claude", "opus"], ["claude", "sonnet"]];

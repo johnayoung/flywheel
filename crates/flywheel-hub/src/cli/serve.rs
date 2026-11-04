@@ -416,6 +416,7 @@ pub(super) fn serve_cmd(
         config: Some(Arc::clone(&config)),
         plugins: Some(plugins),
         tls: tls.clone(),
+        ws_send_timeout: None,
     };
     if let Some(tls) = &tls {
         let _enter = runtime.enter();

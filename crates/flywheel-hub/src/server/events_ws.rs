@@ -8,7 +8,7 @@ use super::flywheel_api;
 use super::terminal_ws::{close_for_restart, handoff_restarting};
 use super::{
     AppState, Client, CredentialWatch, WS_PING_INTERVAL, error_response, login_recheck, origin_ok,
-    upgrade_refused,
+    upgrade_refused, write_within,
 };
 use crate::hub::{Hub, HubEvent};
 use axum::extract::State;
@@ -80,9 +80,14 @@ pub(super) async fn events_ws(
         Some(axum::Extension(watch)) => watch,
         None => CredentialWatch::new(&app.hub),
     };
-    ws.max_message_size(64 * 1024).on_upgrade(move |socket| {
-        events_pump(socket, hub, client, shutdown, credential, gate, flywheel)
-    })
+    let ends = Ends {
+        shutdown,
+        credential,
+        gate,
+        limit: app.options.send_timeout(),
+    };
+    ws.max_message_size(64 * 1024)
+        .on_upgrade(move |socket| events_pump(socket, hub, client, ends, flywheel))
 }
 
 #[derive(Deserialize)]
@@ -275,22 +280,35 @@ fn sessions_message() -> Message {
     text(json!({ "type": "sessions" }))
 }
 
+/// What ends an events socket besides its client, and how long one write
+/// to it may take (a reader that stopped reading is dropped after it).
+struct Ends {
+    shutdown: watch::Receiver<bool>,
+    credential: CredentialWatch,
+    gate: Option<crate::handoff::Gate>,
+    limit: Duration,
+}
+
 async fn events_pump(
     mut socket: WebSocket,
     hub: Arc<Hub>,
     client: String,
-    mut shutdown: watch::Receiver<bool>,
-    mut credential: CredentialWatch,
-    gate: Option<crate::handoff::Gate>,
+    ends: Ends,
     mut flywheel: Option<broadcast::Receiver<crate::flywheel::FlywheelEvent>>,
 ) {
+    let Ends {
+        mut shutdown,
+        mut credential,
+        gate,
+        limit,
+    } = ends;
     let mut events = hub.subscribe();
     let guard = ViewerGuard {
         viewer: hub.connect_viewer(&client),
         hub: Arc::clone(&hub),
         client: client.clone(),
     };
-    if socket.send(snapshot_message(&hub, &client)).await.is_err() {
+    if !write_within(limit, socket.send(snapshot_message(&hub, &client))).await {
         return;
     }
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
@@ -312,8 +330,8 @@ async fn events_pump(
                 let mut sent = true;
                 if batch.lagged {
                     // What was lost is unknown: everything afresh.
-                    sent = socket.send(snapshot_message(&hub, &client)).await.is_ok()
-                        && socket.send(sessions_message()).await.is_ok();
+                    sent = write_within(limit, socket.send(snapshot_message(&hub, &client))).await
+                        && write_within(limit, socket.send(sessions_message())).await;
                     sessions_sent = Some(Instant::now());
                     sessions_due = false;
                 }
@@ -327,15 +345,15 @@ async fn events_pump(
                         break;
                     }
                     if let Some(message) = event_message(&hub, &client, event) {
-                        sent = socket.send(message).await.is_ok();
+                        sent = write_within(limit, socket.send(message)).await;
                     }
                 }
                 if sent && fanout {
-                    sent = socket.send(snapshot_message(&hub, &client)).await.is_ok();
+                    sent = write_within(limit, socket.send(snapshot_message(&hub, &client))).await;
                 }
                 if sent && batch.sessions && !batch.lagged {
                     if sessions_sent.is_none_or(|at| at.elapsed() >= SESSIONS_PUSH_INTERVAL) {
-                        sent = socket.send(sessions_message()).await.is_ok();
+                        sent = write_within(limit, socket.send(sessions_message())).await;
                         sessions_sent = Some(Instant::now());
                         sessions_due = false;
                     } else {
@@ -349,12 +367,12 @@ async fn events_pump(
             () = sleep_until(sessions_at) => {
                 sessions_sent = Some(Instant::now());
                 sessions_due = false;
-                if socket.send(sessions_message()).await.is_err() {
+                if !write_within(limit, socket.send(sessions_message())).await {
                     break;
                 }
             }
             event = flywheel_api::next_event(&mut flywheel) => {
-                if socket.send(flywheel_api::event_message(event)).await.is_err() {
+                if !write_within(limit, socket.send(flywheel_api::event_message(event))).await {
                     break;
                 }
             }
@@ -372,14 +390,14 @@ async fn events_pump(
                                 let present = present.unwrap_or(!ids.is_empty());
                                 let back = hub.activity().set_present(&client, guard.viewer, present);
                                 if let Some(back) = back
-                                    && socket.send(away_message(back)).await.is_err()
+                                    && !write_within(limit, socket.send(away_message(back))).await
                                 {
                                     break;
                                 }
                             }
                             Err(e) => {
                                 let error = json!({ "type": "error", "message": format!("bad message: {e}") });
-                                if socket.send(text(error)).await.is_err() {
+                                if !write_within(limit, socket.send(text(error))).await {
                                     break;
                                 }
                             }
@@ -387,28 +405,28 @@ async fn events_pump(
                     }
                     Some(Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) => {
-                        let _ = socket.flush().await;
+                        write_within(limit, socket.flush()).await;
                         break;
                     }
                     Some(Err(_)) | None => break,
                 }
             }
             _ = ping.tick() => {
-                if socket.send(Message::Ping(Default::default())).await.is_err() {
+                if !write_within(limit, socket.send(Message::Ping(Default::default()))).await {
                     break;
                 }
             }
             close = credential.revoked(&hub, &mut recheck) => {
-                let _ = socket.send(Message::Close(Some(close))).await;
+                write_within(limit, socket.send(Message::Close(Some(close)))).await;
                 break;
             }
             () = handoff_restarting(gate.as_ref()) => {
-                close_for_restart(&mut socket).await;
+                close_for_restart(&mut socket, limit).await;
                 break;
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    let _ = socket.send(Message::Close(None)).await;
+                    write_within(limit, socket.send(Message::Close(None))).await;
                     break;
                 }
             }

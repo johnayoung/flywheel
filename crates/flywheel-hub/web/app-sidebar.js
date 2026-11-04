@@ -354,8 +354,34 @@ function rollupChip(workspace) {
   });
 }
 
-function renderWorkspace(workspace, i, numbering) {
+// On a phone the Needs you list (attention.js) sits right above the
+// workspaces in the one scroll: a session it lists is not listed again
+// under its workspace, which says how many it holds there instead.
+function listedInNeedsYou() {
+  return phone() ? new Set(attention.entries().map((e) => e.session.id)) : new Set();
+}
+
+function needsYouLine(count) {
+  return el(
+    "li",
+    {},
+    el("button", {
+      type: "button",
+      className: "ws-needs",
+      textContent: `${count} in Needs you`,
+      title: "Listed in Needs you, at the top",
+      onclick: () => {
+        const list = $("#attention");
+        if (list && !list.hidden) list.scrollIntoView({ block: "start", behavior: "smooth" });
+      },
+    }),
+  );
+}
+
+function renderWorkspace(workspace, i, numbering, needsYou = new Set()) {
   const sessions = state.sessions.filter((s) => s.workspace_id === workspace.id);
+  const listed = sessions.filter((s) => !needsYou.has(s.id));
+  const elsewhere = sessions.length - listed.length;
   const live = sessions.filter((s) => s.live && s.state === "running" && reachable(s)).length;
   const collapsed = state.collapsed.has(workspace.id);
   const attachedHere = sessionById(state.attached)?.workspace_id === workspace.id;
@@ -426,7 +452,12 @@ function renderWorkspace(workspace, i, numbering) {
         })
         : null,
       sessions.length
-        ? el("ul", { className: "sessions" }, sessions.map((s) => renderSession(s, numbering.get(s.id))))
+        ? el(
+          "ul",
+          { className: "sessions" },
+          listed.map((s) => renderSession(s, numbering.get(s.id))),
+          elsewhere ? needsYouLine(elsewhere) : null,
+        )
         : el(
           "div",
           { className: "ws-empty" },
@@ -444,14 +475,14 @@ function renderWorkspace(workspace, i, numbering) {
 
 // With machines: this hub's workspaces, then each machine's, each group
 // under a head with its connection state.
-function machineGroups(numbering) {
+function machineGroups(numbering, needsYou) {
   let i = 0;
   const group = (name, list, empty) => el(
     "section",
     { className: `machine-group${name ? "" : " local"}`, dataset: { machine: name || "" } },
     machines.header(name),
     list.length
-      ? list.map((w) => renderWorkspace(w, i++, numbering))
+      ? list.map((w) => renderWorkspace(w, i++, numbering, needsYou))
       : el("div", { className: "ws-empty machine-empty", textContent: empty }),
   );
   const local = state.workspaces.filter((w) => !w.machine);
@@ -468,9 +499,10 @@ function machineGroups(numbering) {
 function render() {
   search.refreshFilters();
   const numbering = new Map(attachable().map((s, i) => [s.id, i]));
+  const needsYou = listedInNeedsYou();
   const root = $("#workspaces");
   if (machines.any()) {
-    root.replaceChildren(...machineGroups(numbering));
+    root.replaceChildren(...machineGroups(numbering, needsYou));
   } else if (state.workspaces.length === 0) {
     root.replaceChildren(
       el(
@@ -480,7 +512,7 @@ function render() {
       ),
     );
   } else {
-    root.replaceChildren(...state.workspaces.map((w, i) => renderWorkspace(w, i, numbering)));
+    root.replaceChildren(...state.workspaces.map((w, i) => renderWorkspace(w, i, numbering, needsYou)));
   }
   // The workspace animation plays once, on first paint only.
   root.querySelectorAll(".workspace").forEach((node) => {
@@ -665,3 +697,17 @@ function updateMeters() {
 function showError(error) {
   showBanner(`Error: ${error.message}`, [], false);
 }
+
+// The phone footer's More row (app-phone.css): it unfolds the utilities;
+// picking one folds them again, except the theme and alerts toggles,
+// which are tapped through their states.
+function setMore(open) {
+  $("#side-foot").classList.toggle("more-open", open);
+  $("#side-more-toggle").setAttribute("aria-expanded", String(open));
+  if (open) $("#side-foot").scrollIntoView({ block: "end", behavior: "smooth" });
+}
+$("#side-more-toggle").addEventListener("click", () => setMore(!$("#side-foot").classList.contains("more-open")));
+$("#side-more").addEventListener("click", (event) => {
+  const picked = event.target.closest("button");
+  if (picked && picked.dataset.action !== "cycle-theme" && picked.id !== "alerts-toggle") setMore(false);
+});

@@ -587,6 +587,8 @@ fn fold_status(entries: Vec<StatusEntry>, panel: &mut FlywheelPanel) {
                 .as_deref()
                 .filter(|p| !p.is_empty())
                 .map(format_blocked_on),
+            // The hub's to fill in (its running worker sessions).
+            queued_in: None,
         };
         let mut alert = |kind: AlertKind, detail: String| {
             panel.alerts.push(Alert {

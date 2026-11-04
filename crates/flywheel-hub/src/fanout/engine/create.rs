@@ -89,6 +89,10 @@ impl Fanouts {
         }
         let id = new_id();
         let tag = &id[..4];
+        let named = valid
+            .name
+            .clone()
+            .unwrap_or_else(|| super::default_name(&workspace.name, &valid.prompt));
         let sent = super::sent_prompt(&valid.prompt, request.commit_instruction);
         let mut candidates: Vec<Candidate> = Vec::new();
         let mut started: Vec<SessionView> = Vec::new();
@@ -116,7 +120,7 @@ impl Fanouts {
             super::pin_graders(&valid.graders, &folder, valid.protect.clone()).map_err(invalid)?;
         for (i, (kind, launch)) in valid.candidates.iter().enumerate() {
             let label = format!("c{}", i + 1);
-            let task = task_name(&valid.name, tag, &label);
+            let task = task_name(&named, tag, &label);
             // The label first: a sidebar cuts long names at the end.
             let session_name = format!(
                 "{label}-{}",
@@ -174,7 +178,7 @@ impl Fanouts {
         let name = {
             let store = hub.store();
             let taken: Vec<&str> = store.fanouts().iter().map(|f| f.name.as_str()).collect();
-            super::unique_name(&valid.name, &taken)
+            super::unique_name(&named, &taken)
         };
         let fanout = Fanout {
             id: id.clone(),

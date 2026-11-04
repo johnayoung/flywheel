@@ -726,9 +726,16 @@ async fn a_relaunch_closes_every_view_of_the_ended_process_so_it_reattaches() {
 async fn input_the_terminal_dropped_is_refused_by_id_never_acknowledged() {
     let hub = TestHub::start().await;
     // Never reads its input: the queue fills and later input is dropped.
-    let id = hub.session("exec sleep 100000").await;
+    // Raw mode, because a canonical-mode line discipline never pushes back:
+    // once its buffer holds a full line with no newline it discards each
+    // further byte, so the PTY stays writable and the queue drains as fast
+    // as the kernel can throw bytes away (how fast is the host's, not the
+    // hub's). Non-canonical, the buffer fills and the writer blocks.
+    let id = hub
+        .session("stty raw -echo && printf ready && exec sleep 100000")
+        .await;
     let mut viewer = Viewer::new(hub.connect(&id, "proto=2&client=flood").await, false);
-    viewer.settle(Duration::from_millis(300)).await;
+    viewer.until("ready").await;
     let big = "x".repeat(900 * 1024);
     for n in 1..=8u64 {
         viewer

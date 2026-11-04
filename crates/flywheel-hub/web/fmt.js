@@ -36,6 +36,16 @@ window.FwHubFmt = (() => {
     return `${(n / 1024 / 1024 / 1024).toFixed(2)} GiB`;
   }
 
+  // A session's kind; restored as a plain shell, what it was ("claude (now
+  // a shell)", "fw (now a shell)" for a shell's own command).
+  function kindLabel(session) {
+    const kind = session.kind || "shell";
+    if (!session.fallback_command) return kind;
+    const program = kind === "shell" && session.command && session.command[0];
+    const was = kind === "shell" ? (program ? program.split("/").pop() : "command") || "command" : kind;
+    return `${was} (now a shell)`;
+  }
+
   // "Zoom (Alt Z)", or just "Zoom" when the action is unbound (`key`: the
   // keymap's label for it, "" when unbound).
   function withKey(text, key) {
@@ -66,5 +76,5 @@ window.FwHubFmt = (() => {
     pop.style.maxHeight = `min(70vh, 34rem, ${Math.max(120, Math.floor(window.innerHeight - top - margin))}px)`;
   }
 
-  return { tokens, dollars, plural, bytes, withKey, pathTail, placeUnder };
+  return { tokens, dollars, plural, bytes, kindLabel, withKey, pathTail, placeUnder };
 })();

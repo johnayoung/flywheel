@@ -453,8 +453,11 @@ function defaultSessionName(workspaceId, kind) {
   const kinds = (state.kindsBy && state.kindsBy[(workspace && workspace.machine) || ""]) || state.kinds || [];
   const found = kinds.find((k) => k.kind === kind);
   const program = found && found.program ? basename(found.program) : kind;
-  const sessions = state.sessions;
-  let n = sessions.filter((s) => s.workspace_id === workspaceId).length + 1;
+  // As the hub numbers them: per program (`claude 1` after two shells),
+  // unique on its machine.
+  const machine = (workspace && workspace.machine) || "";
+  const sessions = state.sessions.filter((s) => (s.machine || "") === machine);
+  let n = sessions.filter((s) => s.workspace_id === workspaceId && s.name.startsWith(`${program} `)).length + 1;
   while (sessions.some((s) => s.name === `${program} ${n}`)) n++;
   return `${program} ${n}`;
 }

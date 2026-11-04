@@ -28,10 +28,11 @@
 .rec-pill.on #rec-label { font-size: 10px; margin-left: .3rem; font-weight: 700; }
 
 #dlg-sharing { width: min(46rem, calc(100vw - 2rem)); }
-.sh-new { display: grid; gap: .8rem; padding: .8rem .9rem; border: 1px solid var(--rule-2); background: var(--bg-3); }
+.sh-new { display: grid; grid-template-columns: minmax(0, 1fr); gap: .8rem; padding: .8rem .9rem; border: 1px solid var(--rule-2); background: var(--bg-3); }
 .sh-grid { display: grid; grid-template-columns: minmax(0, 1fr) 12rem; gap: .7rem; }
 .sh-grid select, .sh-grid input { width: 100%; }
-.sh-result { display: flex; gap: .5rem; }
+.sh-result { display: flex; gap: .5rem; min-width: 0; }
+.sh-result .slab { flex: none; }
 .sh-result input {
   flex: 1;
   min-width: 0;
@@ -70,7 +71,7 @@
 .sh-empty.bad { color: var(--alert); }
 
 @media (max-width: 600px) {
-  .sh-grid { grid-template-columns: 1fr; }
+  .sh-grid { grid-template-columns: minmax(0, 1fr); }
   .sh-row { grid-template-columns: 1fr; grid-template-areas: "main" "meta" "actions"; }
   .sh-actions { justify-content: flex-start; }
   .sh-list { max-height: none; }

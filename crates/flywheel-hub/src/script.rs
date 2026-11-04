@@ -102,17 +102,26 @@ pub fn state_label(session: &Value) -> String {
     }
 }
 
-/// A session's kind, marked when a restore runs a shell in its place.
+/// A session's kind, marked when a restore runs a shell in its place:
+/// what it was (an agent, or a shell's own command) "now a shell".
 pub fn kind_label(session: &Value) -> String {
     let kind = str_field(session, "kind");
-    if session
-        .get("fallback_command")
-        .is_some_and(|f| !f.is_null())
-    {
-        format!("{kind} (as shell)")
-    } else {
-        kind.to_owned()
+    if session.get("fallback_command").is_none_or(Value::is_null) {
+        return kind.to_owned();
     }
+    let was = if kind == "shell" || kind.is_empty() {
+        session
+            .get("command")
+            .and_then(Value::as_array)
+            .and_then(|argv| argv.first())
+            .and_then(Value::as_str)
+            .map(|program| program.rsplit('/').next().unwrap_or(program))
+            .filter(|program| !program.is_empty())
+            .unwrap_or("command")
+    } else {
+        kind
+    };
+    format!("{was} (now a shell)")
 }
 
 /// Why a stopped session was not restored, when it was not.
@@ -1220,7 +1229,13 @@ mod tests {
         assert_eq!(kind_label(&json!({"kind": "claude"})), "claude");
         assert_eq!(
             kind_label(&json!({"kind": "claude", "fallback_command": ["/bin/sh"]})),
-            "claude (as shell)"
+            "claude (now a shell)"
+        );
+        assert_eq!(
+            kind_label(
+                &json!({"kind": "shell", "command": ["/usr/bin/fw", "worker"], "fallback_command": ["/bin/sh"]})
+            ),
+            "fw (now a shell)"
         );
         assert_eq!(
             label(json!({"state": "exited", "code": 0, "signal": null})),

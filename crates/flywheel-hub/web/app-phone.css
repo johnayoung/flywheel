@@ -347,7 +347,15 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 @media (max-width: 760px) {
   #sidebar {
     padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom) env(safe-area-inset-left);
+    /* One scroll for the whole drawer: blocked agents, the actions and
+       the footer never squeeze the session list into a strip. */
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
+  #sidebar > * { flex: none; }
+  #sidebar > #workspaces { overflow: visible; min-height: 40vh; }
+  /* Its own short scroll inside that one (about three agents). */
+  #sidebar .attn-list { max-height: 11.5rem; }
   .menu-toggle { min-width: 2.6rem; min-height: 2.6rem; }
   .crumbs { gap: .45rem; align-items: center; }
   .cmd-pill b { margin-left: .2rem; }

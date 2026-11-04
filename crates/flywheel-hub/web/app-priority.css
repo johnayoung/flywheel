@@ -51,7 +51,10 @@ button#meter-usage { max-width: 16rem; text-align: left; }
 @media (max-width: 760px) {
   #term-header { flex-wrap: wrap; row-gap: .25rem; }
   #term-header > .crumbs { flex: 1 1 11rem; min-width: min(11rem, calc(100% - 3rem)); overflow: hidden; }
-  .meters { flex: 1 1 auto; flex-wrap: wrap; row-gap: .25rem; }
+  /* The pills' row is one row: more pills than fit scroll sideways
+     instead of wrapping a third header row off the terminal. */
+  .meters { flex: 1 1 auto; flex-wrap: nowrap; justify-content: flex-start; justify-content: safe flex-end; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; }
+  .meters::-webkit-scrollbar { display: none; }
 }
 /* The sidebar beside a narrow header: the kind tag goes (the sidebar's
    glyph says it). */
@@ -70,6 +73,8 @@ button#meter-usage { max-width: 16rem; text-align: left; }
     min-height: 44px;
   }
   .icon, .kb-second .kb-key, #compose-prev, #compose-next { min-width: 44px; min-height: 44px; }
+  .sel-pop .slab { min-width: 44px; }
+  .sheet input:not([type="checkbox"]):not([type="radio"]), .fw-drawer .text-btn { min-height: 44px; }
   .chip, .fw-chip, .cmd-check { display: inline-flex; align-items: center; }
   .cmd-check input { width: 22px; height: 22px; }
 }

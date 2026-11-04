@@ -738,9 +738,14 @@ window.FwHubReview = function (ctx) {
         onclick: () => plan(action),
       });
     const pushed = data.upstream && !data.upstream.ahead && !data.upstream.behind;
+    const noRemote = Array.isArray(data.remotes) && !data.remotes.length;
     const list = [
       button("Commit all…", "commit", { disabled: !dirty(data) || !!data.operation, title: dirty(data) ? "Stage everything and commit it" : "Nothing to commit" }),
-      button("Push…", "push", { ghost: true, disabled: !data.branch || pushed, title: pushed ? `In sync with ${data.upstream.name}` : "Push the branch (never forced)" }),
+      button("Push…", "push", {
+        ghost: true,
+        disabled: !data.branch || pushed || noRemote,
+        title: noRemote ? "No remote to push to: add one (git remote add)" : pushed ? `In sync with ${data.upstream.name}` : "Push the branch (never forced)",
+      }),
       button("Open PR…", "pr", { ghost: true, disabled: !data.branch, title: "gh pr create from the pushed branch" }),
     ];
     if (worktree) {
@@ -999,8 +1004,10 @@ window.FwHubReview = function (ctx) {
     const details = plan.details || [];
     const shown = details.slice(0, 40);
     const commands = plan.commands.map((c) => c.display).join("\n");
+    // A summary that only repeats the dialog's title says nothing.
+    const title = TITLES[act.action] && TITLES[act.action][1];
     fill(box,
-      el("p", { className: "rva-summary", textContent: plan.summary }),
+      plan.summary && plan.summary !== title ? el("p", { className: "rva-summary", textContent: plan.summary }) : null,
       shown.length
         ? el("ul", { className: "rva-details" }, ...shown.map((d) => el("li", { textContent: d })), details.length > shown.length ? el("li", { className: "more", textContent: `… and ${details.length - shown.length} more` }) : null)
         : null,
@@ -1144,7 +1151,7 @@ window.FwHubReview = function (ctx) {
         el(
           "details",
           { className: "rva-ran", open: !report.ok },
-          el("summary", { textContent: `${r.code === 0 ? "ok" : `exit ${r.code === null ? "killed" : r.code}`}  ${r.display}` }),
+          el("summary", { textContent: `${r.code === 0 ? "ok" : `exit ${r.code === null ? "killed" : r.code}`}  ${r.display}`, title: r.display }),
           r.output ? el("pre", { className: "rva-cmd", textContent: r.output }) : null,
         ),
       ),

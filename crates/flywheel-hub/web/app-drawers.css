@@ -344,7 +344,9 @@
   }
   .why-btn { min-width: 44px; border-style: solid; border-color: var(--rule-2); color: var(--ink); font-size: 11px; }
   .cmd-pill, .menu-toggle, .commands .cmd-head > .icon, .qa-esc { min-width: 44px; }
-  .pane-chip, .qa-esc { display: inline-flex; align-items: center; justify-content: center; }
+  .qa-esc { display: inline-flex; align-items: center; justify-content: center; }
+  /* A long name is cut at its end; the status dot stays in view. */
+  .pane-chip { display: inline-flex; align-items: center; justify-content: flex-start; }
   .cmd-pill { justify-content: center; }
   .kb-primary .kb-key { height: 44px; }
   /* Long answers wrap (up to three lines) instead of losing the words that
@@ -556,7 +558,8 @@
 
 /* The action sheet. */
 .rv-sheet { width: min(40rem, calc(100vw - 2rem)); }
-.rva-body { display: grid; gap: .8rem; }
+.rva-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: .8rem; }
+.rva-body > * { min-width: 0; }
 .rva-text {
   width: 100%;
   padding: .6rem .7rem;
@@ -607,7 +610,9 @@
   user-select: text;
   -webkit-user-select: text;
 }
-.rva-ran summary { cursor: pointer; color: var(--ink-2); font: 400 11.5px var(--term); white-space: nowrap; overflow-x: auto; scrollbar-width: none; }
+.rva-ran { min-width: 0; }
+/* As the plan's commands: one line, cut (the full line is in the title). */
+.rva-ran summary { cursor: pointer; color: var(--ink-2); font: 400 11.5px var(--term); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .rva-ran .rva-cmd { margin-top: .35rem; max-height: 14rem; }
 .rva-url { color: var(--signal); font: 500 12px var(--term); overflow-wrap: anywhere; }
 

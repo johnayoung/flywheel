@@ -24,7 +24,9 @@
   from { opacity: 0; transform: translateY(12px) scale(.985); }
 }
 
-.sheet form { display: grid; gap: 1.05rem; padding: 0 1.4rem 1.3rem; }
+.sheet form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.05rem; padding: 0 1.4rem 1.3rem; }
+/* Long unbroken content (a link, a command line) never widens a sheet. */
+.sheet form > * { min-width: 0; }
 
 .sheet-head {
   margin: 0 -1.4rem;

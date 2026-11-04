@@ -36,6 +36,19 @@ async function relaunch(id) {
     }
     render();
   } catch (error) {
+    if (error.status === 409) {
+      // Relaunched already (another browser, the CLI): attach that one.
+      await refresh().catch(() => {});
+      const session = sessionById(id);
+      if (session && session.state === "running" && session.live) {
+        for (const pane of showing) {
+          pane.show(id);
+          pane.shownSeq = state.refreshSeq;
+        }
+        render();
+        return;
+      }
+    }
     const pane = showing[0];
     if (pane) pane.showBanner(`Relaunch failed: ${error.message}`, pane.endedActions(id), false);
     else showBanner(`Relaunch failed: ${error.message}`, [], false);
@@ -274,7 +287,11 @@ function renderSession(session, index) {
     index < 9 ? el("span", { className: "num", textContent: index + 1 }) : null,
     el(
       "span",
-      { className: `glyph ${glyphFor(session.kind)}`, title: session.kind || "shell" },
+      // Restored as a plain shell: the agent's glyph, dimmed, says so.
+      {
+        className: `glyph ${glyphFor(session.kind)}${session.fallback_command ? " as-shell" : ""}`,
+        title: window.FwHubFmt.kindLabel(session),
+      },
       icon(glyphFor(session.kind)),
     ),
     el("span", { className: `dot ${st.dot}`, title: st.title || st.label }),
@@ -533,7 +550,7 @@ function renderMain() {
   kind.hidden = !session;
   if (session) {
     // A restore that could not bring it back as itself runs a shell.
-    kind.textContent = (session.kind || "shell") + (session.fallback_command ? " (as shell)" : "");
+    kind.textContent = window.FwHubFmt.kindLabel(session);
     kind.className = `kind-tag ${session.kind || "shell"}`;
   }
   // Cut from its start (the .path-tail styling).

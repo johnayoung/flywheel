@@ -208,6 +208,7 @@
 .glyph svg { width: .95rem; height: .95rem; }
 .glyph.claude { color: var(--signal); }
 .glyph.codex { color: var(--brass); }
+.glyph.as-shell { color: var(--ink-3); opacity: .6; }
 
 .session > .dot {
   position: relative;

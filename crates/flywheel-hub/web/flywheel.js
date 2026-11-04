@@ -37,6 +37,7 @@ window.FwHubFlywheel = function (ctx) {
     error: "",
     seq: 0,
     run: null, // the run viewer's state
+    pillSession: undefined, // the attached session the pill last showed
   };
 
   const LIGHTS = ["failed", "parked", "awaiting", "blocked", "running", "pending", "verified"];
@@ -390,6 +391,12 @@ window.FwHubFlywheel = function (ctx) {
     if (!pill) return;
     const session = ctx.sessionById(state.attached);
     const folder = folderOf(session);
+    // On a phone the panel covers the session: switching to a session of
+    // another folder (or none) closes it, as its pill would.
+    if (state.attached !== ui.pillSession) {
+      ui.pillSession = state.attached;
+      if (ui.folder && ui.folder !== folder && window.matchMedia("(max-width: 760px)").matches) close();
+    }
     pill.hidden = !folder;
     if (!folder) return;
     const s = summary(folder);
@@ -532,6 +539,8 @@ window.FwHubFlywheel = function (ctx) {
     if (!folder || !workspace) return;
     const scoped = typeof taskId === "string" && taskId !== "";
     let withPrereqs = false;
+    // What this worker runs, in order (for the confirms below).
+    let runs = scoped ? [taskId] : [];
     if (scoped && panel) {
       const unmet = unmetPrerequisites(panel, taskId);
       if (unmet.length) {
@@ -543,6 +552,7 @@ window.FwHubFlywheel = function (ctx) {
         });
         if (!ok) return;
         withPrereqs = true;
+        runs = [...unmet, taskId];
       }
     }
     let another = false;
@@ -551,7 +561,7 @@ window.FwHubFlywheel = function (ctx) {
         kicker: "flywheel",
         title: "Start another worker?",
         body: scoped
-          ? `A worker already holds leases in ${labelFor(folder)} (${panel.worker.detail}). This one runs only ${taskId}; if the other claims it first, this one waits for it, then reports.`
+          ? `A worker already holds leases in ${labelFor(folder)} (${panel.worker.detail}). This one runs ${runs.length > 1 ? `${runs.slice(0, -1).join(", ")}, then ${taskId}` : `only ${taskId}`}; if the other claims ${runs.length > 1 ? "one" : "it"} first, this one waits for it, then reports.`
           : `A worker already holds leases in ${labelFor(folder)} (${panel.worker.detail}). Workers claim tasks, so a second one runs tasks in parallel with it.`,
         ok: "Start another",
       });

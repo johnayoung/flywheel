@@ -161,8 +161,9 @@
   .act-text { white-space: normal; overflow-wrap: anywhere; }
   .act-tag { grid-area: tag; }
   .act-what { grid-area: what; }
-  .act-go { grid-area: go; min-height: 2.2rem; min-width: 2.75rem; }
-  .act-filters select { max-width: none; flex: 1 1 8rem; min-height: 2.2rem; }
+  .act-go { grid-area: go; min-height: 44px; min-width: 44px; }
+  /* A long session name in an option never widens the select. */
+  .act-filters select { max-width: 100%; min-width: 0; width: 100%; flex: 1 1 8rem; min-height: 44px; }
   .away { left: .5rem; right: .5rem; top: .5rem; width: auto; }
   .away-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .away-link { min-height: 2.2rem; }

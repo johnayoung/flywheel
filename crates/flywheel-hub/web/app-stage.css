@@ -675,6 +675,8 @@ body.resizing-y, body.resizing-y * { cursor: row-resize !important; user-select:
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.pane-chip small, .pane-chip .dot { flex: none; }
+.pane-chip .chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .pane-chip small { color: var(--ink-3); font-size: 9.5px; }
 .pane-chip.active { border-color: var(--signal); color: var(--ink); background: var(--signal-soft); }
 .pane-chip .dot { width: .42rem; height: .42rem; box-shadow: none; }

@@ -223,7 +223,7 @@ function renderSwitcher(bar, layout) {
           },
           el("span", { className: `dot ${st.dot}` }),
           multiTab ? el("small", { textContent: `${t.name}` }) : null,
-          session.name,
+          el("span", { className: "chip-name", textContent: session.name }),
         ));
         if (on) activeChip = chips[chips.length - 1];
       }
@@ -236,7 +236,7 @@ function renderSwitcher(bar, layout) {
         "button",
         { type: "button", className: "pane-chip active", "aria-pressed": "true", title: `${current.name} (not in a tab)` },
         el("span", { className: `dot ${statusLook(current).dot}` }),
-        current.name,
+        el("span", { className: "chip-name", textContent: current.name }),
       );
       chips.unshift(activeChip);
     }

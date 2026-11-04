@@ -127,7 +127,8 @@ Fan-out view: `{"id","base_sha","winner","counts","leader","settled","graded_at"
 | GET | `/api/activity/digest[?since=&client=&until=&ws=&session=]` | `{"since","until","turns_finished","blocked_now","fanouts_graded","commands_suggested","cost_usd","workspaces","empty","partial"}`; `since=last-seen` needs `client` |
 | POST | `/api/activity/seen` | `{"client"}` -> 204: its `last-seen` is now |
 
-Times: RFC 3339, unix ms, or an age (`30m`, `2h`, `7d`). `kind`: a comma list, `review` covers `review.*`. Kinds beyond the plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`. A peer's request, or `machines=none`, answers for that hub alone.
+Times: RFC 3339, unix ms, an age (`30m`, `2h`, `7d`), or `last-seen` (with `client`). `ws`, `session`: id, 4+ char id prefix, or name (each machine resolves its own). `kind`: a comma list, `review` covers `review.*`, unknown is 400. Kinds beyond the plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`.
+A peer's request, or `machines=none`, answers for that hub alone.
 
 ## Settings, config, plugins, notify, TLS
 
@@ -243,7 +244,7 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 |---|---|
 | `hub.started` | - |
 | `session.created` | - |
-| `session.exited` | `exit` |
+| `session.exited` | `exit`, `hub_stopping` (`fw hub stop` hung it up) |
 | `session.removed` | - |
 | `status.changed` | `status`, `previous`, `detail` |
 | `review.committed` | `dir`, `head`, `branch`, `base`, `url`, `summary` (every `review.*`) |

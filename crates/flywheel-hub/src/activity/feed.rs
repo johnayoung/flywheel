@@ -44,14 +44,31 @@ struct Spend {
     pending: HashMap<String, Pending>,
 }
 
+/// The most rows held while a live handoff has the hub frozen.
+const HELD_MAX: usize = 1000;
+
+/// The journal, and the rows held while a live handoff froze the hub
+/// (`Some`): written in order if the handoff is called off. One lock, so
+/// no row is written after [`Activity::pause`] returns -- the next hub
+/// numbers its rows from what is on disk then.
+#[derive(Debug)]
+struct Book {
+    journal: Journal,
+    held: Option<Vec<(Draft, DateTime<Utc>)>>,
+}
+
 /// The hub's activity journal, presence marks, and usage gathering.
 #[derive(Debug)]
 pub struct Activity {
-    journal: Mutex<Journal>,
+    book: Mutex<Book>,
     marks: Mutex<Marks>,
     spend: Mutex<Spend>,
-    /// A live handoff froze the hub: rows wait for whichever hub carries on.
-    paused: AtomicBool,
+    /// The hub is stopping: the sessions it hangs up did not end of
+    /// their own (no `session.exited` rows for them).
+    stopping: AtomicBool,
+    /// This hub took over from another (`fw hub upgrade`): its
+    /// `hub.started` row says so.
+    handed_over: AtomicBool,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -65,30 +82,39 @@ impl Activity {
 
     pub fn with_limits(state_dir: &Path, limits: Limits) -> Self {
         Self {
-            journal: Mutex::new(Journal::open(state_dir, limits, Utc::now())),
+            book: Mutex::new(Book {
+                journal: Journal::open(state_dir, limits, Utc::now()),
+                held: None,
+            }),
             marks: Mutex::new(Marks::load(state_dir)),
             spend: Mutex::new(Spend::default()),
-            paused: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            handed_over: AtomicBool::new(false),
         }
     }
 
     /// Rows matching `filter`, newest first, before `before`; and whether
     /// more match.
     pub fn page(&self, filter: &Filter, before: Option<u64>, limit: usize) -> (Vec<Row>, bool) {
-        lock(&self.journal).page(filter, before, limit)
+        lock(&self.book).journal.page(filter, before, limit)
     }
 
     /// The rows over `filter`'s span, oldest first.
     pub fn rows(&self, filter: &Filter) -> Vec<Row> {
-        lock(&self.journal).matching(filter)
+        lock(&self.book).journal.matching(filter)
     }
 
-    /// Write `draft` now (not while frozen for a handoff); `None` then.
+    /// Write `draft` now; `None` while frozen for a handoff (it is held).
     pub fn record(&self, draft: Draft) -> Option<Row> {
-        if self.paused.load(Ordering::SeqCst) {
+        let now = Utc::now();
+        let mut book = lock(&self.book);
+        if let Some(held) = &mut book.held {
+            if held.len() < HELD_MAX {
+                held.push((draft, now));
+            }
             return None;
         }
-        Some(lock(&self.journal).append(draft, Utc::now()))
+        Some(book.journal.append(draft, now))
     }
 
     /// When `client` was last active (now while present).
@@ -140,19 +166,25 @@ impl Activity {
             ..filter.clone()
         };
         let mut digest = Digest::of(&self.rows(&span), since, until);
-        for view in hub.sessions(filter.workspace.as_deref()) {
-            if filter
-                .session
-                .as_ref()
-                .is_some_and(|s| *s != view.record.id)
-            {
-                continue;
-            }
+        for view in hub.sessions(None) {
             let Some(agent) = &view.agent else { continue };
             if agent.status != AgentStatus::Blocked {
                 continue;
             }
             let workspace = hub.workspace(&view.record.workspace_id).ok();
+            let picked = filter.workspace.as_deref().is_none_or(|w| {
+                super::selects(
+                    w,
+                    Some(&view.record.workspace_id),
+                    workspace.as_ref().map(|w| w.name.as_str()),
+                )
+            }) && filter
+                .session
+                .as_deref()
+                .is_none_or(|s| super::selects(s, Some(&view.record.id), Some(&view.record.name)));
+            if !picked {
+                continue;
+            }
             digest.blocked_now.push(DigestSession {
                 session_id: view.record.id.clone(),
                 session: view.record.name.clone(),
@@ -165,28 +197,54 @@ impl Activity {
         digest
     }
 
-    /// Stop writing for a live handoff: gathered usage is written first.
+    /// Stop writing for a live handoff: gathered usage is written first,
+    /// then rows are held (the journal on disk is the next hub's).
     pub fn pause(&self) {
         let drafts = self.take_spend(|_| false, true);
+        let mut book = lock(&self.book);
         for draft in drafts {
-            self.record(draft);
+            book.journal.append(draft, Utc::now());
         }
+        book.held.get_or_insert_with(Vec::new);
+        drop(book);
         lock(&self.marks).save(Utc::now(), true);
-        self.paused.store(true, Ordering::SeqCst);
     }
 
-    /// The handoff was called off: carry on.
-    pub fn resume(&self) {
-        self.paused.store(false, Ordering::SeqCst);
+    /// The handoff was called off: the rows held meanwhile are written
+    /// (returned, to announce), and writing carries on.
+    pub fn resume(&self) -> Vec<Row> {
+        let mut book = lock(&self.book);
+        let held = book.held.take().unwrap_or_default();
+        held.into_iter()
+            .map(|(draft, at)| book.journal.append(draft, at))
+            .collect()
     }
 
-    /// The hub is stopping: write what was gathered, save the marks.
-    pub fn shutdown(&self) {
+    /// This hub took over from another (see [`Activity::handed_over`]).
+    pub fn mark_handed_over(&self) {
+        self.handed_over.store(true, Ordering::SeqCst);
+    }
+
+    /// The hub is stopping and hangs up its `sessions` running ones: write
+    /// what was gathered and one row saying so, save the marks.
+    pub fn shutdown(&self, sessions: usize) {
+        self.stopping.store(true, Ordering::SeqCst);
         let drafts = self.take_spend(|_| false, true);
         for draft in drafts {
             self.record(draft);
         }
+        let text = match sessions {
+            0 => "hub stopped".to_owned(),
+            1 => "hub stopped, hanging up 1 session".to_owned(),
+            n => format!("hub stopped, hanging up {n} sessions"),
+        };
+        self.record(Draft::new("hub.stopped", text).with("sessions", sessions));
         lock(&self.marks).save(Utc::now(), true);
+    }
+
+    /// The hub is stopping (see [`Activity::shutdown`]).
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     /// Remember every session's usage as it stands (growth from here on
@@ -244,10 +302,13 @@ impl Activity {
             .filter_map(|id| spend.pending.remove(&id))
             .map(|p| {
                 let cost = super::digest::round_cents(p.cost_usd);
-                Draft::new("usage", format!("used {} tokens, ${cost:.2}", p.tokens))
-                    .about(&p.about)
-                    .with("cost_usd", cost)
-                    .with("tokens", p.tokens)
+                Draft::new(
+                    "usage",
+                    format!("used {} tokens, ${cost:.2}", short_count(p.tokens)),
+                )
+                .about(&p.about)
+                .with("cost_usd", cost)
+                .with("tokens", p.tokens)
             })
             .collect()
     }
@@ -259,10 +320,13 @@ impl Activity {
         let p = spend.pending.remove(id)?;
         let cost = super::digest::round_cents(p.cost_usd);
         Some(
-            Draft::new("usage", format!("used {} tokens, ${cost:.2}", p.tokens))
-                .about(&p.about)
-                .with("cost_usd", cost)
-                .with("tokens", p.tokens),
+            Draft::new(
+                "usage",
+                format!("used {} tokens, ${cost:.2}", short_count(p.tokens)),
+            )
+            .about(&p.about)
+            .with("cost_usd", cost)
+            .with("tokens", p.tokens),
         )
     }
 
@@ -272,11 +336,11 @@ impl Activity {
 
     /// Rows held.
     pub fn len(&self) -> usize {
-        lock(&self.journal).len()
+        lock(&self.book).journal.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        lock(&self.journal).is_empty()
+        lock(&self.book).journal.is_empty()
     }
 }
 
@@ -353,6 +417,28 @@ impl Hub {
     fn on_activity_event(&self, event: HubEvent) {
         match event {
             HubEvent::Lifecycle { event, payload } => {
+                // Hung up by the hub stopping: not an exit of their own
+                // (the `hub.stopped` row says it).
+                if event == "session.exited"
+                    && payload.get("hub_stopping").and_then(Value::as_bool) == Some(true)
+                {
+                    return;
+                }
+                if event == "hub.started"
+                    && self.activity().handed_over.swap(false, Ordering::SeqCst)
+                {
+                    let version = str_at(&payload, "/version").unwrap_or("?");
+                    let sessions = payload.get("sessions").and_then(Value::as_u64).unwrap_or(0);
+                    self.write_activity(
+                        Draft::new(
+                            event,
+                            format!("hub upgraded to flywheel {version}, {sessions} sessions carried over"),
+                        )
+                        .with("version", version)
+                        .with("upgraded", true),
+                    );
+                    return;
+                }
                 if event == "session.removed"
                     && let Some(id) = payload.pointer("/session/id").and_then(Value::as_str)
                     && let Some(draft) = self.activity().forget(id)
@@ -473,10 +559,11 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
         }
         "session.exited" => {
             let code = payload.pointer("/exit/code").and_then(Value::as_i64);
-            let signal = payload.pointer("/exit/signal").and_then(Value::as_i64);
+            // The signal's name (`Hangup`), as `fw hub ls` shows it.
+            let signal = str_at(payload, "/exit/signal");
             let how = match (code, signal) {
                 (Some(code), _) => format!("exited with code {code}"),
-                (None, Some(signal)) => format!("ended by signal {signal}"),
+                (None, Some(signal)) => format!("was killed ({signal})"),
                 (None, None) => "exited".to_owned(),
             };
             draft(how).with("code", code).with("signal", signal)
@@ -592,4 +679,13 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
             .with("reason", str_at(payload, "/reason")),
         _ => return None,
     })
+}
+
+/// `n` as the sidebar and `fw hub ls` show counts (`950`, `110.0k`, `2.3M`).
+pub(crate) fn short_count(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
 }

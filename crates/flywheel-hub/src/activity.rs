@@ -13,8 +13,10 @@
 //! scrubbed of token-shaped words ([`scrub`]).
 //!
 //! Bounds: the file rotates at [`FILE_CAP`] bytes or once its first row is
-//! [`ROTATE_AGE`] old into `activity.1.jsonl` .. `activity.<KEEP_ROTATED>`
-//! (the oldest dropped); rows older than [`MAX_AGE_DAYS`] are forgotten.
+//! [`ROTATE_AGE`] (a week) old into `activity.1.jsonl` ..
+//! `activity.<KEEP_ROTATED>` (the oldest dropped); rows older than
+//! [`MAX_AGE_DAYS`] are forgotten. So a hub keeps 30 days, or 6 MiB on a
+//! very busy one, whichever is less.
 //! The files outlive restarts and live handoffs (`fw hub upgrade`).
 //!
 //! Presence ([`marks`]): each client id (the browser's per-device id, the
@@ -40,7 +42,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Row kinds besides the plugin events ([`crate::plugins::EVENTS`]).
-pub const EXTRA_KINDS: &[&str] = &["turn.finished", "commands.suggested", "usage", "plugin.ran"];
+pub const EXTRA_KINDS: &[&str] = &[
+    "turn.finished",
+    "commands.suggested",
+    "usage",
+    "plugin.ran",
+    "hub.stopped",
+];
 /// The journal file in the state dir (rotated ones are `activity.N.jsonl`).
 pub const JOURNAL_FILE: &str = "activity.jsonl";
 /// Each client's last-active time.
@@ -48,11 +56,14 @@ pub const MARKS_FILE: &str = "activity-clients.json";
 /// The journal file's size cap before it rotates.
 pub const FILE_CAP: u64 = 1024 * 1024;
 /// Rotated files kept besides the current one.
-pub const KEEP_ROTATED: usize = 4;
+pub const KEEP_ROTATED: usize = 5;
 /// A journal file whose first row is this old rotates on the next row.
-pub const ROTATE_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+pub const ROTATE_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 86_400);
 /// Rows older than this are forgotten.
 pub const MAX_AGE_DAYS: i64 = 30;
+// Age rotation alone never drops a row younger than MAX_AGE_DAYS: at a
+// rotation the kept files span at least KEEP_ROTATED * ROTATE_AGE.
+const _: () = assert!(KEEP_ROTATED as u64 * ROTATE_AGE.as_secs() >= MAX_AGE_DAYS as u64 * 86_400);
 /// Away at least this long: the return gets a digest.
 pub const AWAY_MIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// Rows per page: the default and the most.
@@ -177,10 +188,33 @@ pub struct Filter {
     pub since: Option<DateTime<Utc>>,
     /// Rows before this.
     pub until: Option<DateTime<Utc>>,
+    /// The workspace: its id, an id prefix (4+ characters), or its name
+    /// (see [`selects`]; the API resolves a live one to its id first).
     pub workspace: Option<String>,
+    /// The session, the same way.
     pub session: Option<String>,
     /// Kinds (`review` covers every `review.*`); empty: every kind.
     pub kinds: Vec<String>,
+}
+
+/// Whether `selector` names the thing with `id` and `name`: the id, a
+/// prefix of it of at least 4 characters, or the name. Rows outlive what
+/// they name, so a removed session (or a machine's workspace) is still
+/// picked by its name.
+pub fn selects(selector: &str, id: Option<&str>, name: Option<&str>) -> bool {
+    id == Some(selector)
+        || name == Some(selector)
+        || (selector.len() >= 4 && id.is_some_and(|id| id.starts_with(selector)))
+}
+
+/// Whether `kind` names row kinds: one ([`crate::plugins::EVENTS`],
+/// [`EXTRA_KINDS`]) or a family (`review` for every `review.*`).
+pub fn known_kind(kind: &str) -> bool {
+    crate::plugins::EVENTS.iter().chain(EXTRA_KINDS).any(|k| {
+        *k == kind
+            || k.strip_prefix(kind)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
 }
 
 impl Filter {
@@ -189,12 +223,12 @@ impl Filter {
             && self.until.is_none_or(|until| row.at < until)
             && self
                 .workspace
-                .as_ref()
-                .is_none_or(|w| row.workspace_id.as_ref() == Some(w))
+                .as_deref()
+                .is_none_or(|w| selects(w, row.workspace_id.as_deref(), row.workspace.as_deref()))
             && self
                 .session
-                .as_ref()
-                .is_none_or(|s| row.session_id.as_ref() == Some(s))
+                .as_deref()
+                .is_none_or(|s| selects(s, row.session_id.as_deref(), row.session.as_deref()))
             && (self.kinds.is_empty()
                 || self.kinds.iter().any(|k| {
                     row.kind == *k

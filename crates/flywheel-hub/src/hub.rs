@@ -847,7 +847,12 @@ impl Hub {
         }
         self.commands.stop();
         self.git.stop();
-        self.activity.shutdown();
+        let running = self
+            .live()
+            .values()
+            .filter(|s| s.exit_info().is_none())
+            .count();
+        self.activity.shutdown(running);
         let last_cwds: HashMap<String, PathBuf> = self
             .live()
             .iter()

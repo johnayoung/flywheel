@@ -335,7 +335,10 @@ const machines = window.FwHubMachines({
   onStatusChange: () => renderStatus(),
   onStatus: (message) => applyStatus(message),
   onEvent: (message, machine) => onPush(message, machine),
-  onMachineFlywheel: (machine) => flywheel.reloadMachine(machine),
+  onMachineFlywheel: (machine) => {
+    flywheel.reloadMachine(machine);
+    activity.onMachine(machine);
+  },
   signedOut: (why) => window.location.replace("/?signed_out=" + why + window.location.hash),
 });
 
@@ -560,7 +563,7 @@ const promptQueue = window.FwHubQueue({
 
 // The activity timeline and "while you were away" (activity.js).
 const activity = window.FwHubActivity({
-  $, el, icon, rawApi, state, sessionById, workspaceById,
+  $, el, icon, rawApi, state, sessionById, workspaceById, store,
   toast: (...args) => commands.toast(...args),
   openSession: (id) => openSession(id),
   openCommandsAt: (id, seq, all) => {

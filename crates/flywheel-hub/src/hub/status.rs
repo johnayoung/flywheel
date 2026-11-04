@@ -13,12 +13,34 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
 
-/// A session's status ahead of a change: as anyone sees it, and before
-/// seen tracking with its spell (a new spell of `done` is a new turn).
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct StatusBefore {
-    shown: Option<AgentStatus>,
+/// A session's status at one moment: as anyone sees it, and before seen
+/// tracking with its spell (a new spell of `done` is a new turn).
+#[derive(Debug, Clone, Default)]
+pub(super) struct StatusAt {
+    view: Option<StatusView>,
     turn: Option<(AgentStatus, u64)>,
+}
+
+impl StatusAt {
+    fn of(board: &crate::status::StatusBoard, id: &str) -> Self {
+        Self {
+            view: board.status(id, Audience::Anyone),
+            turn: board.alert(id).map(|a| (a.status, a.spell)),
+        }
+    }
+
+    fn shown(&self) -> Option<AgentStatus> {
+        self.view.as_ref().map(|v| v.status)
+    }
+}
+
+/// One status change, read before and after under the same board lock: two
+/// changes racing (the screen tracker and the report socket) each announce
+/// their own transition, never the same one twice.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Transition {
+    before: StatusAt,
+    after: StatusAt,
 }
 
 impl Hub {
@@ -135,17 +157,25 @@ impl Hub {
         spell: u64,
         decision: crate::detect::tracker::Decision,
     ) {
-        let before = self.status_before(id);
-        let changed = self.board().apply_screen(
-            id,
-            generation,
-            spell,
-            decision.status,
-            decision.detail.as_deref(),
-            decision.source,
-        );
-        if changed {
-            self.status_changed(id, before);
+        let transition = {
+            let mut board = self.board();
+            let before = StatusAt::of(&board, id);
+            board
+                .apply_screen(
+                    id,
+                    generation,
+                    spell,
+                    decision.status,
+                    decision.detail.as_deref(),
+                    decision.source,
+                )
+                .then(|| Transition {
+                    before,
+                    after: StatusAt::of(&board, id),
+                })
+        };
+        if let Some(transition) = transition {
+            self.status_changed(id, transition);
         }
     }
 
@@ -185,22 +215,18 @@ impl Hub {
         detail: Option<&str>,
         source: StatusSource,
     ) {
-        let before = self.status_before(id);
-        let changed = self
-            .board()
-            .apply_report(id, generation, signal, detail, source);
-        if changed {
-            self.status_changed(id, before);
-        }
-    }
-
-    /// Session `id`'s status as anyone sees it, and before seen tracking
-    /// with its spell, ahead of a change (see [`Hub::status_changed`]).
-    fn status_before(&self, id: &str) -> StatusBefore {
-        let board = self.board();
-        StatusBefore {
-            shown: board.status(id, Audience::Anyone).map(|s| s.status),
-            turn: board.alert(id).map(|a| (a.status, a.spell)),
+        let transition = {
+            let mut board = self.board();
+            let before = StatusAt::of(&board, id);
+            board
+                .apply_report(id, generation, signal, detail, source)
+                .then(|| Transition {
+                    before,
+                    after: StatusAt::of(&board, id),
+                })
+        };
+        if let Some(transition) = transition {
+            self.status_changed(id, transition);
         }
     }
 
@@ -208,9 +234,9 @@ impl Hub {
     /// announce it: `status.changed` when what anyone sees changed (the
     /// one place plugins, the activity journal, and the rest hear of it),
     /// and a finished turn when its raw status became `done`.
-    fn status_changed(&self, id: &str, before: StatusBefore) {
-        self.announce_status(id, &before);
-        let before = before.shown;
+    fn status_changed(&self, id: &str, transition: Transition) {
+        self.announce_status(id, &transition);
+        let before = transition.before.shown();
         // A turn started from rest (not a blocked prompt answered): what
         // sat in the agent's input line was sent.
         if !matches!(before, Some(AgentStatus::Blocked | AgentStatus::Working))
@@ -311,25 +337,21 @@ impl Hub {
         let (seen, left) = {
             let mut board = self.board();
             let before = board.viewing(viewer).to_vec();
-            let earlier: Vec<(String, StatusBefore)> = session_ids
+            let mut earlier: Vec<(String, StatusAt)> = session_ids
                 .iter()
-                .map(|id| {
-                    let before = StatusBefore {
-                        shown: board.status(id, Audience::Anyone).map(|s| s.status),
-                        turn: board.alert(id).map(|a| (a.status, a.spell)),
-                    };
-                    ((*id).to_owned(), before)
-                })
+                .map(|id| ((*id).to_owned(), StatusAt::of(&board, id)))
                 .collect();
-            let seen: Vec<(String, StatusBefore)> = board
+            let seen: Vec<(String, Transition)> = board
                 .view_many(viewer, session_ids)
                 .into_iter()
                 .map(|id| {
                     let before = earlier
                         .iter()
-                        .find(|(e, _)| *e == id)
-                        .map_or(StatusBefore::default(), |(_, b)| *b);
-                    (id, before)
+                        .position(|(e, _)| *e == id)
+                        .map(|at| earlier.swap_remove(at).1)
+                        .unwrap_or_default();
+                    let after = StatusAt::of(&board, &id);
+                    (id, Transition { before, after })
                 })
                 .collect();
             let left: Vec<String> = before
@@ -341,30 +363,26 @@ impl Hub {
         for session_id in left {
             self.emit(HubEvent::Unwatched { session_id });
         }
-        for (session_id, before) in seen {
-            self.announce_status(&session_id, &before);
+        for (session_id, transition) in seen {
+            self.announce_status(&session_id, &transition);
             self.emit(HubEvent::Status { session_id });
         }
     }
 
     /// The lifecycle side of a status change (see [`Hub::status_changed`]).
-    fn announce_status(&self, id: &str, before: &StatusBefore) {
-        let (view, turn) = {
-            let board = self.board();
-            (
-                board.status(id, Audience::Anyone),
-                board.alert(id).map(|a| (a.status, a.spell)),
-            )
+    fn announce_status(&self, id: &str, transition: &Transition) {
+        let before = &transition.before;
+        let Some(view) = &transition.after.view else {
+            return;
         };
-        let Some(view) = view else { return };
-        if turn.is_some_and(|(status, spell)| {
+        if transition.after.turn.is_some_and(|(status, spell)| {
             status == AgentStatus::Done && before.turn != Some((status, spell))
         }) {
             self.emit(HubEvent::TurnFinished {
                 session_id: id.to_owned(),
             });
         }
-        if before.shown == Some(view.status) {
+        if before.shown() == Some(view.status) {
             return;
         }
         let Some(session) = self.event_session(id) else {
@@ -375,7 +393,7 @@ impl Hub {
             serde_json::json!({
                 "session": session,
                 "status": view.status,
-                "previous": before.shown,
+                "previous": before.shown(),
                 "detail": view.detail,
                 "since": view.since,
             }),

@@ -300,9 +300,8 @@ function onPush(message, machine) {
     onLayoutEvent(message);
   } else if (message.type === "fanout" && !machine) {
     fanout.onEvent(message);
-  } else if (message.type === "activity" && !machine) {
-    // A machine's rows reach this hub's journal view through its merge.
-    activity.onRow(message.row);
+  } else if (message.type === "activity") {
+    activity.onRow(message.row, machine);
   } else if (message.type === "away" && !machine) {
     activity.onAway(message);
   } else if (!machine && ["settings", "config", "plugins", "plugin_toast"].includes(message.type)) {

@@ -8,7 +8,9 @@
 //! answer `partial`. A peer's request is answered from this hub alone.
 
 use super::{ApiJson, ApiQuery, ApiResult, AppState, error_response};
-use crate::activity::{Cursor, DEFAULT_LIMIT, Digest, Filter, LOCAL, MAX_LIMIT, Row, parse_time};
+use crate::activity::{
+    Cursor, DEFAULT_LIMIT, Digest, Filter, LOCAL, MAX_LIMIT, Row, known_kind, parse_time, selects,
+};
 use crate::machines::{Machine, read_capped};
 use crate::peers::PeerInfo;
 use crate::script::query_escape;
@@ -27,7 +29,7 @@ pub const MACHINE_TIMEOUT: Duration = Duration::from_secs(4);
 /// The most a machine's answer may hold.
 const MAX_MACHINE_BODY: usize = 8 * 1024 * 1024;
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone)]
 pub(super) struct ActivityQuery {
     since: Option<String>,
     until: Option<String>,
@@ -55,8 +57,14 @@ fn valid_client(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// The filter `query` asks for (`since=last-seen` is the digest's).
-fn filter_of(query: &ActivityQuery, now: DateTime<Utc>) -> Result<Filter, String> {
+/// The filter `query` asks for, as given (the selectors a machine
+/// resolves itself), and whether `since=last-seen` found its client's mark
+/// (`None`: not asked; never seen: the last 24 hours stand in).
+fn filter_of(
+    app: &AppState,
+    query: &ActivityQuery,
+    now: DateTime<Utc>,
+) -> Result<(Filter, Option<bool>), String> {
     let time = |raw: &Option<String>| -> Result<Option<DateTime<Utc>>, String> {
         raw.as_deref()
             .filter(|r| !r.is_empty())
@@ -75,14 +83,103 @@ fn filter_of(query: &ActivityQuery, now: DateTime<Utc>) -> Result<Filter, String
     if kinds.len() > 32 || kinds.iter().any(|k| k.len() > 64) {
         return Err("kind takes at most 32 kinds".into());
     }
-    let id = |raw: &Option<String>| raw.clone().filter(|r| !r.is_empty());
-    Ok(Filter {
-        since: time(&query.since)?,
-        until: time(&query.until)?,
-        workspace: id(&query.ws),
-        session: id(&query.session),
-        kinds,
-    })
+    if let Some(unknown) = kinds.iter().find(|k| !known_kind(k)) {
+        return Err(format!(
+            "unknown kind {unknown:?} (a row kind such as turn.finished, or a family such as review)"
+        ));
+    }
+    let id = |raw: &Option<String>| {
+        raw.as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_owned)
+    };
+    let (since, seen) = if query.since.as_deref() == Some("last-seen") {
+        let Some(client) = query.client.as_deref().filter(|c| valid_client(c)) else {
+            return Err("since=last-seen needs client (1-64 of A-Z a-z 0-9 - _)".into());
+        };
+        let mark = app.hub.activity().last_active(client);
+        (
+            Some(mark.unwrap_or(now - chrono::Duration::days(1))),
+            Some(mark.is_some()),
+        )
+    } else {
+        (time(&query.since)?, None)
+    };
+    Ok((
+        Filter {
+            since,
+            until: time(&query.until)?,
+            workspace: id(&query.ws),
+            session: id(&query.session),
+            kinds,
+        },
+        seen,
+    ))
+}
+
+/// `selector` resolved against this hub's `items` (id, name): an id, one
+/// name, or one id prefix becomes that id; one naming nothing here stays
+/// as it is (rows outlive what they name); one naming several is an error.
+fn resolve_here(selector: &str, items: &[(String, String)], what: &str) -> Result<String, String> {
+    if items.iter().any(|(id, _)| id == selector) {
+        return Ok(selector.to_owned());
+    }
+    for (how, picked) in [
+        (
+            "name",
+            items
+                .iter()
+                .filter(|(_, name)| name == selector)
+                .collect::<Vec<_>>(),
+        ),
+        (
+            "id prefix",
+            items
+                .iter()
+                .filter(|(id, _)| selects(selector, Some(id), None))
+                .collect(),
+        ),
+    ] {
+        match picked.as_slice() {
+            [] => {}
+            [(id, _)] => return Ok(id.clone()),
+            many => {
+                return Err(format!(
+                    "{what} {how} {selector:?} is ambiguous: {}; use the id",
+                    many.iter()
+                        .map(|(id, name)| format!("{id} ({name:?})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+    }
+    Ok(selector.to_owned())
+}
+
+/// `filter` with its workspace and session resolved against this hub.
+fn localize(app: &AppState, filter: &Filter) -> Result<Filter, String> {
+    let mut local = filter.clone();
+    if let Some(ws) = &filter.workspace {
+        let items: Vec<(String, String)> = app
+            .hub
+            .workspaces()
+            .into_iter()
+            .map(|w| (w.id, w.name))
+            .collect();
+        local.workspace = Some(resolve_here(ws, &items, "workspace")?);
+    }
+    if let Some(session) = &filter.session {
+        let items: Vec<(String, String)> = app
+            .hub
+            .sessions(None)
+            .into_iter()
+            .map(|v| (v.record.id, v.record.name))
+            .collect();
+        local.session = Some(resolve_here(session, &items, "session")?);
+    }
+    Ok(local)
 }
 
 /// The query string asking a machine for the same rows.
@@ -173,6 +270,25 @@ fn machine_status(name: &str, answer: &Result<Value, String>) -> Value {
     }
 }
 
+/// The first `limit` rows of machine `name`'s answer, labelled with it:
+/// only what parses as a row, written out again from the parse (serde
+/// takes an array in field order as a row too).
+fn machine_rows(answer: &Value, name: &str, limit: usize) -> Vec<Value> {
+    answer
+        .get("rows")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|r| serde_json::from_value::<Row>(r.clone()).ok())
+        .take(limit)
+        .map(|r| {
+            let mut r = json!(r);
+            r["machine"] = Value::String(name.to_owned());
+            r
+        })
+        .collect()
+}
+
 /// `GET /api/activity`: rows newest first across this hub and its
 /// machines; `next` pages on (`cursor=`), `null` at the end.
 pub(super) async fn list(
@@ -181,8 +297,11 @@ pub(super) async fn list(
     ApiQuery(query): ApiQuery<ActivityQuery>,
 ) -> ApiResult<Response> {
     let now = Utc::now();
-    let filter = match filter_of(&query, now) {
-        Ok(filter) => filter,
+    // As asked (what each machine resolves for itself), and resolved here.
+    let (filter, local) = match filter_of(&app, &query, now)
+        .and_then(|(filter, _)| Ok((localize(&app, &filter)?, filter)))
+    {
+        Ok((local, filter)) => (filter, local),
         Err(message) => return Ok(bad(&message)),
     };
     let limit = match query.limit.as_deref() {
@@ -203,7 +322,7 @@ pub(super) async fn list(
     let mut sources: Vec<(String, Vec<Value>, bool)> = Vec::new();
     let local_before = cursor.before(LOCAL);
     if local_before != Some(0) {
-        let (rows, more) = app.hub.activity().page(&filter, local_before, limit);
+        let (rows, more) = app.hub.activity().page(&local, local_before, limit);
         let rows = rows.iter().map(|r| json!(r)).collect();
         sources.push((LOCAL.to_owned(), rows, more));
     }
@@ -222,19 +341,7 @@ pub(super) async fn list(
         statuses.push(machine_status(&name, &answer));
         match answer {
             Ok(answer) => {
-                let rows: Vec<Value> = answer
-                    .get("rows")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|r| serde_json::from_value::<Row>(r.clone()).is_ok())
-                    .map(|mut r| {
-                        r["machine"] = Value::String(name.clone());
-                        r
-                    })
-                    .take(limit)
-                    .collect();
+                let rows = machine_rows(&answer, &name, limit);
                 let more = answer.get("next").is_some_and(|n| !n.is_null());
                 sources.push((name, rows, more));
             }
@@ -293,45 +400,26 @@ pub(super) async fn digest(
     ApiQuery(query): ApiQuery<ActivityQuery>,
 ) -> ApiResult<Response> {
     let now = Utc::now();
-    let last_seen = query.since.as_deref() == Some("last-seen");
-    let mut filter = match filter_of(
+    let (mut filter, seen_before) = match filter_of(
+        &app,
         &ActivityQuery {
-            since: None,
-            until: query.until.clone(),
-            ws: query.ws.clone(),
-            session: query.session.clone(),
-            ..ActivityQuery::default()
+            kind: None,
+            ..query.clone()
         },
         now,
     ) {
-        Ok(filter) => filter,
+        Ok(found) => found,
         Err(message) => return Ok(bad(&message)),
-    };
-    let mut seen_before = false;
-    filter.since = if last_seen {
-        let Some(client) = query.client.as_deref().filter(|c| valid_client(c)) else {
-            return Ok(bad(
-                "since=last-seen needs client (1-64 of A-Z a-z 0-9 - _)",
-            ));
-        };
-        let mark = app.hub.activity().last_active(client);
-        seen_before = mark.is_some();
-        mark
-    } else {
-        match query.since.as_deref().filter(|r| !r.is_empty()) {
-            Some(raw) => match parse_time(raw, now) {
-                Ok(at) => Some(at),
-                Err(message) => return Ok(bad(&message)),
-            },
-            None => None,
-        }
     };
     filter.since = filter
         .since
         .or_else(|| Some(now - chrono::Duration::days(1)));
     filter.until = filter.until.or(Some(now));
+    let local_filter = match localize(&app, &filter) {
+        Ok(local) => local,
+        Err(message) => return Ok(bad(&message)),
+    };
     let hub = Arc::clone(&app.hub);
-    let local_filter = filter.clone();
     let mut digest =
         super::blocking(move || Ok(hub.activity().digest(&hub, &local_filter))).await?;
     let machines = targets(&app, &query, peer.is_some());
@@ -371,7 +459,7 @@ pub(super) async fn digest(
     body["empty"] = json!(digest.is_empty());
     body["partial"] = json!(partial);
     body["machines"] = json!(statuses);
-    if last_seen {
+    if let Some(seen_before) = seen_before {
         // Never seen: the last 24 hours stand in.
         body["last_seen"] = json!(seen_before);
     }
@@ -394,4 +482,61 @@ pub(super) async fn seen(
     }
     app.hub.activity().mark_seen(&request.client);
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_machines_rows_are_relabelled_from_their_parse_and_odd_shapes_are_dropped() {
+        let answer = json!({ "rows": [
+            [1, "2026-11-03T00:00:00Z", "usage", null, null, null, null, null, "x"],
+            { "id": 2, "at": "2026-11-03T00:00:01Z", "kind": "usage", "text": "ok", "extra": 1 },
+            "junk",
+            { "id": 3 },
+        ], "next": null });
+        let rows = machine_rows(&answer, "boxb", 10);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.is_object() && r["machine"] == "boxb"));
+        assert_eq!(rows[1]["text"], "ok");
+        assert!(rows[1].get("extra").is_none(), "only a row's own fields");
+        assert_eq!(machine_rows(&answer, "boxb", 1).len(), 1);
+        assert!(machine_rows(&json!({ "rows": 5 }), "boxb", 10).is_empty());
+    }
+
+    #[test]
+    fn a_selector_resolves_to_one_id_here_or_stays_as_given() {
+        let items = vec![
+            ("aaaa1111".to_owned(), "alpha".to_owned()),
+            ("aaaa2222".to_owned(), "beta".to_owned()),
+            ("bbbb3333".to_owned(), "beta".to_owned()),
+        ];
+        assert_eq!(
+            resolve_here("alpha", &items, "workspace").unwrap(),
+            "aaaa1111"
+        );
+        assert_eq!(
+            resolve_here("bbbb", &items, "workspace").unwrap(),
+            "bbbb3333"
+        );
+        assert_eq!(
+            resolve_here("aaaa2222", &items, "workspace").unwrap(),
+            "aaaa2222"
+        );
+        assert_eq!(
+            resolve_here("elsewhere", &items, "workspace").unwrap(),
+            "elsewhere"
+        );
+        assert!(
+            resolve_here("beta", &items, "workspace")
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+        assert!(
+            resolve_here("aaaa", &items, "workspace")
+                .unwrap_err()
+                .contains("ambiguous")
+        );
+    }
 }

@@ -157,7 +157,11 @@ impl Hub {
         }
         self.grading.resume();
         self.queue.resume();
-        self.activity.resume();
+        for row in self.activity.resume() {
+            self.emit(super::HubEvent::Activity {
+                row: serde_json::to_value(&row).unwrap_or(serde_json::Value::Null),
+            });
+        }
         // Before the sessions run again: no output goes unrecorded.
         self.resume_recordings();
         let live: Vec<Arc<PtySession>> = self.live().values().cloned().collect();
@@ -218,6 +222,7 @@ impl Hub {
             StatusBoard::handoff_import(board),
         )?;
         hub.queue.typing_import(typing);
+        hub.activity.mark_handed_over();
         if let Some((path, listener)) = report {
             let server = ReportServer::adopt(path, listener, hub.report_handler(), true)?;
             *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);

@@ -606,10 +606,12 @@ impl Hub {
         }
         self.emit(HubEvent::Sessions);
         if let Some(session) = self.event_session(id) {
-            self.emit_lifecycle(
-                "session.exited",
-                serde_json::json!({ "session": session, "exit": exit_json }),
-            );
+            let mut payload = serde_json::json!({ "session": session, "exit": exit_json });
+            if self.activity().is_stopping() {
+                // Hung up by `fw hub stop`, not ended of its own.
+                payload["hub_stopping"] = serde_json::Value::Bool(true);
+            }
+            self.emit_lifecycle("session.exited", payload);
         }
     }
 

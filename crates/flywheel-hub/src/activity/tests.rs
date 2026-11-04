@@ -126,6 +126,45 @@ fn the_journal_rotates_by_age_and_drops_rows_past_the_limit() {
 }
 
 #[test]
+fn the_default_limits_keep_thirty_days_of_a_row_every_few_hours() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = at(0);
+    let mut journal = Journal::open(dir.path(), Limits::default(), start);
+    // Six weeks of a row every four hours (well under the size cap).
+    let mut now = start;
+    while now < start + Span::days(42) {
+        journal.append(draft("turn.finished", "a", "s"), now);
+        now += Span::hours(4);
+    }
+    let last = now - Span::hours(4);
+    let oldest = |j: &Journal| {
+        let rows = j.matching(&Filter::default());
+        rows.first().unwrap().at
+    };
+    for j in [
+        &journal,
+        &Journal::open(dir.path(), Limits::default(), last),
+    ] {
+        let kept = last - oldest(j);
+        assert!(
+            kept >= Span::days(30) - Span::hours(4) && kept <= Span::days(30),
+            "kept {} hours",
+            kept.num_hours()
+        );
+    }
+    let since = Filter {
+        since: Some(last - Span::days(14)),
+        ..Filter::default()
+    };
+    assert_eq!(journal.matching(&since).len(), 14 * 6 + 1);
+    assert!(
+        !dir.path()
+            .join(format!("activity.{}.jsonl", KEEP_ROTATED + 1))
+            .exists()
+    );
+}
+
+#[test]
 fn a_gap_in_the_rotated_files_is_closed_on_open() {
     let dir = tempfile::tempdir().unwrap();
     let limits = Limits {
@@ -184,6 +223,19 @@ fn filters_take_workspace_session_kind_prefixes_and_a_span() {
         ..Filter::default()
     };
     assert_eq!(ids(session), [4, 3, 1]);
+    // A name or a 4+ character id prefix picks the same rows (a removed
+    // session's, a machine's workspace); a short prefix picks nothing.
+    let by = |ws: Option<&str>, session: Option<&str>| Filter {
+        workspace: ws.map(str::to_owned),
+        session: session.map(str::to_owned),
+        ..Filter::default()
+    };
+    assert_eq!(ids(by(Some("a"), None)), [4, 2, 1]);
+    assert_eq!(ids(by(None, Some("x"))), [4, 3, 1]);
+    assert_eq!(ids(by(None, Some("id-"))), Vec::<u64>::new());
+    assert_eq!(ids(by(Some("w-a"), Some("x"))), [4, 1]);
+    assert!(known_kind("review") && known_kind("review.merged") && known_kind("usage"));
+    assert!(!known_kind("nonsense") && !known_kind("rev") && !known_kind("review."));
     let span = Filter {
         since: Some(at(2)),
         until: Some(at(4)),
@@ -334,6 +386,7 @@ fn a_digest_counts_turns_commands_cost_fanouts_and_reviews() {
         draft("review.merged", "a", "x"),
         draft("review.requested", "a", "x"),
         draft("session.exited", "b", "z"),
+        Draft::new("plugin.ran", "plugin p ran on hub.started: ok"),
         Draft::new("fanout.finished", "graded")
             .in_workspace(Some("w-a"), Some("a"))
             .with_id("fanout_id", Some("f1"))
@@ -363,7 +416,13 @@ fn a_digest_counts_turns_commands_cost_fanouts_and_reviews() {
     );
     assert_eq!(digest.reviews, 1, "a review request is not a review action");
     assert_eq!(digest.exited, 1);
-    assert_eq!(digest.events, 11);
+    assert_eq!(digest.events, 12);
+    assert!(
+        digest.workspaces.iter().all(|w| !w.workspace.is_empty()),
+        "a hub-level row is no workspace's: {:?}",
+        digest.workspaces
+    );
+    assert_eq!(digest.workspaces.len(), 2);
     assert_eq!(
         digest.fanouts_graded.len(),
         1,
@@ -452,4 +511,63 @@ fn marks_keep_at_most_the_newest_clients() {
     assert_eq!(marks.last_active("c300", at(999)), None);
     let newest = format!("c{}", marks::MAX_CLIENTS + 9);
     assert!(marks.last_active(&newest, at(999)).is_some());
+}
+
+#[test]
+fn rows_written_while_frozen_for_a_handoff_are_held_and_written_if_it_is_called_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let activity = Activity::open(dir.path());
+    let first = activity.record(Draft::new("usage", "before")).unwrap();
+    activity.pause();
+    // Frozen: nothing reaches the file the next hub reads.
+    assert!(
+        activity
+            .record(Draft::new("session.exited", "during"))
+            .is_none()
+    );
+    let next = Journal::open(dir.path(), Limits::default(), Utc::now());
+    assert_eq!(
+        next.next_id(),
+        first.id + 1,
+        "the next hub numbers on from disk"
+    );
+    assert_eq!(next.len(), 1);
+    // Called off: the held row is written, in order, and writing carries on.
+    let replayed = activity.resume();
+    assert_eq!(replayed.len(), 1);
+    assert_eq!(replayed[0].text, "during");
+    assert_eq!(replayed[0].id, first.id + 1);
+    assert!(activity.record(Draft::new("usage", "after")).is_some());
+    assert!(activity.resume().is_empty());
+    assert_eq!(activity.len(), 3);
+}
+
+#[test]
+fn a_stopping_hub_writes_one_row_and_an_exit_says_how() {
+    let dir = tempfile::tempdir().unwrap();
+    let activity = Activity::open(dir.path());
+    assert!(!activity.is_stopping());
+    activity.shutdown(3);
+    assert!(activity.is_stopping());
+    let (rows, _) = activity.page(&Filter::default(), None, 10);
+    assert_eq!(rows[0].kind, "hub.stopped");
+    assert_eq!(rows[0].text, "hub stopped, hanging up 3 sessions");
+    assert!(known_kind("hub.stopped"));
+    let session = json!({"id": "s", "name": "n"});
+    let killed = draft_for(
+        "session.exited",
+        &json!({"session": session, "exit": {"code": null, "signal": "Hangup"}}),
+    )
+    .unwrap();
+    assert_eq!(killed.text, "was killed (Hangup)");
+    assert_eq!(killed.data["signal"], "Hangup");
+    let exited = draft_for(
+        "session.exited",
+        &json!({"session": session, "exit": {"code": 2, "signal": null}}),
+    )
+    .unwrap();
+    assert_eq!(exited.text, "exited with code 2");
+    assert_eq!(super::feed::short_count(950), "950");
+    assert_eq!(super::feed::short_count(110_000), "110.0k");
+    assert_eq!(super::feed::short_count(2_340_000), "2.3M");
 }

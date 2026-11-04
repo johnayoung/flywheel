@@ -19,7 +19,7 @@
 "use strict";
 
 window.FwHubActivity = function (ctx) {
-  const { $, el, icon, rawApi, state, sessionById, workspaceById, toast } = ctx;
+  const { $, el, icon, rawApi, state, sessionById, workspaceById, toast, store } = ctx;
 
   const PAGE = 60;
   const KINDS = [
@@ -59,8 +59,12 @@ window.FwHubActivity = function (ctx) {
     error: "",
     machines: [],
     seq: 0,
-    // Rows pushed since the view was last open (the pill's count).
+    sumSeq: 0,
+    // Rows since the view was last open (the pill's count).
     unread: 0,
+    // The newest of this hub's row ids the view has shown (kept per
+    // browser: a reload still counts what came since).
+    seenId: store.get("activity-seen", null),
   };
 
   const dialog = $("#dlg-activity");
@@ -89,6 +93,7 @@ window.FwHubActivity = function (ctx) {
       ui.rows = more ? ui.rows.concat(page.rows) : page.rows;
       ui.next = page.next;
       ui.machines = page.machines || [];
+      markSeen(ui.rows);
     } catch (error) {
       if (seq !== ui.seq) return;
       ui.error = error.message;
@@ -97,6 +102,61 @@ window.FwHubActivity = function (ctx) {
         ui.loading = false;
         render();
       }
+    }
+  }
+
+  // The view's own digest: what the shown span comes to.
+  async function loadSummary() {
+    const seq = ++ui.sumSeq;
+    const p = new URLSearchParams({ since: ui.since || "24h" });
+    if (ui.ws) p.set("ws", ui.ws);
+    if (ui.session) p.set("session", ui.session);
+    try {
+      const digest = await rawApi("GET", `/api/activity/digest?${p}`);
+      if (seq === ui.sumSeq) renderSummary(digest);
+    } catch (_) {
+      if (seq === ui.sumSeq) $("#act-sum").replaceChildren();
+    }
+  }
+
+  function renderSummary(digest) {
+    const n = (v) => Number(v || 0);
+    const plural = (count, one, many) => `${count} ${count === 1 ? one : many}`;
+    const bits = [
+      plural(n(digest.turns_finished), "turn", "turns"),
+      `${(digest.blocked_now || []).length} blocked now`,
+      plural((digest.fanouts_graded || []).length, "fan-out graded", "fan-outs graded"),
+      plural(n(digest.commands_suggested), "command", "commands"),
+      `$${n(digest.cost_usd).toFixed(2)}`,
+    ];
+    $("#act-sum").replaceChildren(
+      el("b", { textContent: ui.since ? "since then" : "last 24 h" }),
+      ` ${bits.join(" · ")}`,
+    );
+  }
+
+  // This hub's newest row shown: counted as seen.
+  function markSeen(rows) {
+    const newest = rows.reduce((max, r) => (!r.machine && r.id > max ? r.id : max), ui.seenId || 0);
+    if (newest !== ui.seenId) {
+      ui.seenId = newest;
+      store.set("activity-seen", newest);
+    }
+  }
+
+  // On load: the rows since this browser last looked (the pill's count).
+  async function countUnread() {
+    try {
+      const page = await rawApi("GET", "/api/activity?machines=none&limit=100");
+      if (dialog.open) return;
+      if (ui.seenId === null) {
+        markSeen(page.rows);
+        return;
+      }
+      ui.unread = page.rows.filter((r) => r.id > ui.seenId && r.kind !== "usage").length;
+      renderPill();
+    } catch (_) {
+      // The count is a hint; the view still opens.
     }
   }
 
@@ -117,6 +177,7 @@ window.FwHubActivity = function (ctx) {
     if (row.kind === "turn.finished" && Number.isInteger(data.message)) {
       return {
         label: "transcript",
+        back: true,
         run: () => ctx.openTranscript(
           {
             session_id: session.id,
@@ -197,44 +258,62 @@ window.FwHubActivity = function (ctx) {
           title: `Open: ${go.label}`,
           onclick: (event) => {
             event.stopPropagation();
-            close();
-            go.run();
+            follow(go);
           },
         })
         : el("span", { className: "act-go none", textContent: session ? "" : row.session_id ? "gone" : "" }),
     );
     if (go) {
       node.tabIndex = 0;
-      node.addEventListener("click", () => {
-        close();
-        go.run();
-      });
+      node.addEventListener("click", () => follow(go));
       node.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
-          close();
-          go.run();
-        }
+        if (event.key === "Enter") follow(go);
       });
     }
     return node;
   }
 
-  // Rows by day, then runs of one workspace (and machine) under a head.
+  // Open what a row is about; a transcript closed (Esc, its x) comes back
+  // here, filters and place kept.
+  function follow(go) {
+    close();
+    go.run();
+    if (!go.back) return;
+    const shown = $("#dlg-transcript");
+    let cancelled = false;
+    const stop = new AbortController();
+    shown.returnValue = "";
+    shown.addEventListener("cancel", () => { cancelled = true; }, { signal: stop.signal });
+    shown.addEventListener("close", () => {
+      stop.abort();
+      if ((cancelled || shown.returnValue === "cancel") && !dialog.open) dialog.showModal();
+    }, { signal: stop.signal });
+  }
+
+  // Rows by day, then by hour; in an hour, each workspace (and machine)
+  // under one head, newest first.
   function render() {
     renderFilters();
     renderStatus();
     const out = [];
     let day = "";
-    let group = null;
+    let hour = "";
+    let groups = new Map();
     for (const row of ui.rows) {
       const d = dayLabel(row.at);
       if (d !== day) {
         day = d;
-        group = null;
+        hour = "";
         out.push(el("li", { className: "act-day", textContent: d }));
       }
+      const h = String(new Date(row.at).getHours());
+      if (h !== hour) {
+        hour = h;
+        groups = new Map();
+      }
       const key = `${row.machine || ""}/${row.workspace_id || ""}`;
-      if (!group || group.key !== key) {
+      let group = groups.get(key);
+      if (!group) {
         const rows = el("ul", { className: "act-rows" });
         const head = el(
           "div",
@@ -242,7 +321,8 @@ window.FwHubActivity = function (ctx) {
           el("span", { className: "act-ws", textContent: row.workspace || (row.kind === "hub.started" ? "hub" : "no workspace") }),
           row.machine ? el("span", { className: "act-machine", textContent: row.machine }) : null,
         );
-        group = { key, rows };
+        group = { rows };
+        groups.set(key, group);
         out.push(el("li", { className: "act-group" }, head, rows));
       }
       group.rows.append(renderRow(row));
@@ -311,15 +391,19 @@ window.FwHubActivity = function (ctx) {
     render();
     if (!dialog.open) dialog.showModal();
     load(false);
+    loadSummary();
   }
 
   function close() {
     if (dialog.open) dialog.close();
   }
 
-  // A pushed row: on top when it matches the filters.
-  function onRow(row) {
-    if (!row) return;
+  // A pushed row (this hub's, or `machine`'s): on top when it matches the
+  // filters. A row from a machine the view could not reach reloads it:
+  // the machine is back, and what it missed is fetched.
+  function onRow(pushed, machine) {
+    if (!pushed || typeof pushed !== "object") return;
+    const row = machine ? { ...pushed, machine } : pushed;
     if (!dialog.open) {
       if (row.kind !== "usage") {
         ui.unread += 1;
@@ -327,12 +411,27 @@ window.FwHubActivity = function (ctx) {
       }
       return;
     }
+    if (machine && ui.machines.some((m) => m.name === machine && !m.ok)) {
+      load(false);
+      loadSummary();
+      return;
+    }
     if (ui.ws && row.workspace_id !== ui.ws) return;
     if (ui.session && row.session_id !== ui.session) return;
     if (ui.kind && !ui.kind.split(",").some((k) => row.kind === k || row.kind.startsWith(`${k}.`))) return;
-    if (ui.rows.some((r) => !r.machine && r.id === row.id)) return;
+    if (ui.rows.some((r) => (r.machine || null) === (machine || null) && r.id === row.id)) return;
     ui.rows.unshift(row);
+    markSeen([row]);
     render();
+  }
+
+  // A machine's events socket (re)opened: an open view that missed it
+  // asks again.
+  function onMachine(name) {
+    if (dialog.open && ui.machines.some((m) => m.name === name && !m.ok)) {
+      load(false);
+      loadSummary();
+    }
   }
 
   // --- while you were away ------------------------------------------------
@@ -423,18 +522,31 @@ window.FwHubActivity = function (ctx) {
 
   function dismiss() {
     card.hidden = true;
+    store.set("activity-away", null);
   }
 
-  // The events socket's `away`: this browser is back after a while.
+  // The events socket's `away`: this browser is back after a while. The
+  // span is kept until dismissed, so a reload shows the card again.
   async function onAway(message) {
+    if (typeof message.since !== "string" || typeof message.until !== "string") return;
+    store.set("activity-away", { since: message.since, until: message.until });
+    await showAway(message);
+  }
+
+  async function showAway(span) {
     try {
-      const p = new URLSearchParams({ since: message.since, until: message.until });
+      const p = new URLSearchParams({ since: span.since, until: span.until });
       const digest = await rawApi("GET", `/api/activity/digest?${p}`);
-      if (!digest.empty) showDigest(digest);
+      if (digest.empty) store.set("activity-away", null);
+      else showDigest(digest);
     } catch (error) {
       toast(`While you were away: ${error.message}`, { tone: "bad" });
     }
   }
+
+  const pending = store.get("activity-away", null);
+  if (pending && typeof pending.since === "string" && typeof pending.until === "string") showAway(pending);
+  countUnread();
 
   // --- wiring -------------------------------------------------------------
 
@@ -442,10 +554,12 @@ window.FwHubActivity = function (ctx) {
     ui.ws = event.target.value;
     ui.session = "";
     load(false);
+    loadSummary();
   });
   $("#act-session").addEventListener("change", (event) => {
     ui.session = event.target.value;
     load(false);
+    loadSummary();
   });
   $("#act-kind").addEventListener("change", (event) => {
     ui.kind = event.target.value;
@@ -473,5 +587,5 @@ window.FwHubActivity = function (ctx) {
     }, "activity");
   }
 
-  return { open, close, isOpen: () => dialog.open, onRow, onAway, paletteItems, refreshFilters: () => dialog.open && renderFilters() };
+  return { open, close, isOpen: () => dialog.open, onRow, onAway, onMachine, paletteItems, refreshFilters: () => dialog.open && renderFilters() };
 };

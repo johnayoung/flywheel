@@ -148,6 +148,10 @@ impl Digest {
             digest.turns_finished += turns;
             digest.commands_suggested += commands;
             digest.cost_usd += cost;
+            // A hub-level row (hub started, a plugin ran) is no workspace's.
+            if row.workspace_id.is_none() && row.workspace.is_none() {
+                continue;
+            }
             let workspace = row.workspace.clone().unwrap_or_default();
             let at = match digest
                 .workspaces

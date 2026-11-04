@@ -600,6 +600,30 @@ async fn a_hub_merges_its_machines_activity_and_says_partial_when_one_is_gone() 
     // A filter reaches the machine too.
     let (there, _) = a.all_rows(&format!("&ws={b_ws}"), 2).await;
     assert_eq!(there.len(), remote);
+    // So does a name, or an 8-character prefix as `fw hub ls` prints it:
+    // each hub resolves it against its own workspaces.
+    let (there, _) = a.all_rows("&ws=there", 2).await;
+    assert_eq!(there.len(), remote);
+    assert!(there.iter().all(|r| r["machine"] == "b"));
+    let (here, _) = a.all_rows(&format!("&ws={}", &a_ws[..8]), 50).await;
+    assert!(!here.is_empty());
+    assert!(
+        here.iter()
+            .all(|r| r.get("machine").is_none() && r["workspace"] == "here")
+    );
+    let (here_by_name, _) = a.all_rows("&ws=here", 50).await;
+    assert_eq!(here_by_name.len(), here.len());
+    let digest = a.get("/api/activity/digest?since=1h&ws=there").await;
+    assert_eq!(
+        digest["events"].as_u64().unwrap() as usize,
+        remote,
+        "{digest}"
+    );
+    // A kind no row has is a mistake, not an empty timeline.
+    let (status, body) = a
+        .call(reqwest::Method::GET, "/api/activity?kind=nonsense", None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
     // The digest adds the machine's in.
     let digest = a.get("/api/activity/digest?since=1h").await;

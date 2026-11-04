@@ -3,7 +3,7 @@
 //! Activity view shows them.
 
 use crate::endpoint::{Endpoint, EndpointArgs, stable_client_id};
-use crate::script::{query_escape, resolve};
+use crate::script::query_escape;
 use crate::util::str_field;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -51,65 +51,48 @@ pub fn run(args: &ActivityArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
 
 fn fetch(args: &ActivityArgs) -> Result<(Value, Value), String> {
     let conn = Endpoint::resolve(&args.endpoint)?;
-    let workspace = match &args.workspace {
-        Some(wanted) => {
-            let workspaces = conn.blocking_workspaces()?;
-            Some(str_field(resolve(&workspaces, wanted, "workspace")?, "id").to_owned())
-        }
-        None => None,
-    };
-    let session = match &args.session {
-        Some(wanted) => {
-            let sessions = conn.blocking_sessions()?;
-            Some(str_field(resolve(&sessions, wanted, "session")?, "id").to_owned())
-        }
-        None => None,
-    };
     let last_seen = args.since == "last-seen";
     let client = stable_client_id("cli");
-    let mut scope = String::new();
-    if let Some(until) = &args.until {
-        scope.push_str(&format!("&until={}", query_escape(until)));
-    }
-    if let Some(ws) = &workspace {
+    // One `until` for both answers, so the timeline is the digest's span.
+    let until = match &args.until {
+        Some(until) => until.clone(),
+        None => chrono::Utc::now().to_rfc3339(),
+    };
+    // The hub resolves a workspace or session (id, id prefix, or name)
+    // against its own and asks each machine to resolve it against its
+    // own: a machine's workspace is filtered to by its name too.
+    let mut scope = format!("&until={}", query_escape(&until));
+    if let Some(ws) = &args.workspace {
         scope.push_str(&format!("&ws={}", query_escape(ws)));
     }
-    if let Some(session) = &session {
+    if let Some(session) = &args.session {
         scope.push_str(&format!("&session={}", query_escape(session)));
     }
-    let digest_path = if last_seen {
-        format!(
-            "/api/activity/digest?since=last-seen&client={}{scope}",
+    if last_seen {
+        scope.push_str(&format!(
+            "&since=last-seen&client={}",
             query_escape(&client)
-        )
+        ));
     } else {
-        format!(
-            "/api/activity/digest?since={}{scope}",
-            query_escape(&args.since)
-        )
-    };
-    let digest = conn.blocking_call("GET", &digest_path, None)?;
-    let activity = if args.limit == 0 {
-        Value::Null
-    } else {
-        // The timeline over exactly the digest's span.
-        let mut path = format!(
-            "/api/activity?limit={}&since={}{}",
-            args.limit,
-            query_escape(str_field(&digest, "since")),
-            scope
-        );
-        if args.until.is_none() {
-            path.push_str(&format!(
-                "&until={}",
-                query_escape(str_field(&digest, "until"))
-            ));
-        }
-        if !args.kind.is_empty() {
-            path.push_str(&format!("&kind={}", query_escape(&args.kind.join(","))));
-        }
-        conn.blocking_call("GET", &path, None)?
-    };
+        scope.push_str(&format!("&since={}", query_escape(&args.since)));
+    }
+    let digest_path = format!("/api/activity/digest?{}", &scope[1..]);
+    let mut timeline_path = format!("/api/activity?limit={}{scope}", args.limit);
+    if !args.kind.is_empty() {
+        timeline_path.push_str(&format!("&kind={}", query_escape(&args.kind.join(","))));
+    }
+    // At once: a machine that does not answer costs one timeout, not two.
+    let (digest, activity) = conn.block_on(async {
+        let timeline = async {
+            if args.limit == 0 {
+                Ok(Value::Null)
+            } else {
+                conn.request("GET", &timeline_path, None).await
+            }
+        };
+        tokio::join!(conn.request("GET", &digest_path, None), timeline)
+    })?;
+    let (digest, activity) = (digest?, activity?);
     if last_seen {
         conn.blocking_call(
             "POST",
@@ -145,8 +128,13 @@ fn plural(n: u64, one: &str, many: &str) -> String {
 
 /// The digest as a few lines.
 pub fn digest_lines(digest: &Value) -> Vec<String> {
+    let first_look = if digest.get("last_seen").and_then(Value::as_bool) == Some(false) {
+        " (first look from here: the last 24 hours)"
+    } else {
+        ""
+    };
     let mut lines = vec![format!(
-        "since {} until {}",
+        "since {} until {}{first_look}",
         local_time(str_field(digest, "since"), "%Y-%m-%d %H:%M"),
         local_time(str_field(digest, "until"), "%Y-%m-%d %H:%M")
     )];
@@ -224,11 +212,14 @@ pub fn digest_lines(digest: &Value) -> Vec<String> {
         .flatten()
     {
         if machine.get("ok").and_then(Value::as_bool) == Some(false) {
-            lines.push(format!(
-                "  machine {} not included: {}",
-                plain(str_field(machine, "name")),
-                plain(str_field(machine, "error"))
-            ));
+            let name = plain(str_field(machine, "name"));
+            let error = plain(str_field(machine, "error"));
+            // The error often names the machine already.
+            lines.push(if error.starts_with(&format!("machine {name} ")) {
+                format!("  {error} (not included)")
+            } else {
+                format!("  machine {name} not included: {error}")
+            });
         }
     }
     lines
@@ -292,4 +283,38 @@ fn render(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_first_look_says_so_and_a_missing_machine_is_named_once() {
+        let digest = json!({
+            "since": "2026-11-02T22:00:00Z",
+            "until": "2026-11-03T22:00:00Z",
+            "empty": true,
+            "last_seen": false,
+            "machines": [
+                { "name": "boxb", "ok": false,
+                  "error": "machine boxb (http://127.0.0.1:7677) is unreachable: timed out" },
+                { "name": "old", "ok": false, "error": "HTTP 500: boom" },
+            ],
+        });
+        let lines = digest_lines(&digest);
+        assert!(
+            lines[0].ends_with("(first look from here: the last 24 hours)"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(
+                &"  machine boxb (http://127.0.0.1:7677) is unreachable: timed out (not included)"
+                    .to_owned()
+            )
+        );
+        assert!(lines.contains(&"  machine old not included: HTTP 500: boom".to_owned()));
+        let seen = json!({ "since": "x", "until": "y", "empty": true, "last_seen": true });
+        assert!(!digest_lines(&seen)[0].contains("first look"));
+    }
 }

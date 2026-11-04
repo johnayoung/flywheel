@@ -311,13 +311,25 @@ function recBadge(session) {
 
 const machineBadge = (name) => el("span", { className: "machine-badge", textContent: name, title: `on machine ${name}` });
 
-// The workspace's most urgent agent status (idle and unknown stay quiet).
+// The workspace's most urgent agent status (idle and unknown stay quiet),
+// counted the way Needs you lists it: a fan-out candidate's finished turn
+// is the hub's to grade, not done (the hub rolls it up idle too), and a
+// fan-out here whose graders finished since this browser looked is one
+// done.
 function rollupChip(workspace) {
-  const rolled = state.rollup[workspace.id];
+  let rolled = state.rollup[workspace.id];
+  const graded = fanout.candidateSessions();
+  const here = state.sessions.filter((s) => s.workspace_id === workspace.id);
+  const counted = (status) =>
+    here.filter((s) => agentStatus(s)?.status === status && !(status === "done" && graded.has(s.id))).length;
+  let count;
+  if (rolled === "blocked" || rolled === "working") {
+    count = counted(rolled);
+  } else {
+    count = counted("done") + fanout.attention().filter((f) => f.workspace_id === workspace.id).length;
+    rolled = count ? "done" : null;
+  }
   if (!["blocked", "working", "done"].includes(rolled)) return null;
-  const count = state.sessions.filter(
-    (s) => s.workspace_id === workspace.id && agentStatus(s)?.status === rolled,
-  ).length;
   return el("span", {
     className: `ws-status ${rolled}`,
     textContent: count > 1 ? `${count} ${rolled}` : rolled,

@@ -72,6 +72,18 @@ pub fn rollup(statuses: impl IntoIterator<Item = AgentStatus>) -> Option<AgentSt
     statuses.into_iter().max_by_key(|s| s.urgency())
 }
 
+/// What a session adds to its workspace's rollup. A finished turn the hub
+/// grades itself (a fan-out candidate's, `graded`) is no person's to read:
+/// it rolls up as `idle`, as Needs you leaves it out (the fan-out's own
+/// row says when its verdicts are in). Its own status stays `done`.
+fn rolled(status: AgentStatus, graded: bool) -> AgentStatus {
+    if graded && status == AgentStatus::Done {
+        AgentStatus::Idle
+    } else {
+        status
+    }
+}
+
 /// A status change an agent (or the hub) reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
@@ -511,31 +523,34 @@ impl StatusBoard {
             .map(|e| e.workspace_id.as_str())
     }
 
-    /// A workspace's rollup for `audience` (`None` without agent sessions).
+    /// A workspace's rollup for `audience` (`None` without agent sessions);
+    /// `graded` sessions' finished turns count as `idle` (see [`rolled`]).
     pub fn workspace_status(
         &self,
         workspace_id: &str,
         audience: Audience<'_>,
+        graded: &HashSet<String>,
     ) -> Option<AgentStatus> {
         rollup(
             self.entries
-                .values()
-                .filter(|e| e.workspace_id == workspace_id)
-                .map(|e| e.view(audience).status),
+                .iter()
+                .filter(|(_, e)| e.workspace_id == workspace_id)
+                .map(|(id, e)| rolled(e.view(audience).status, graded.contains(id))),
         )
     }
 
-    /// Everything, for `audience`.
-    pub fn snapshot(&self, audience: Audience<'_>) -> Snapshot {
+    /// Everything, for `audience`; rollups as [`StatusBoard::workspace_status`].
+    pub fn snapshot(&self, audience: Audience<'_>, graded: &HashSet<String>) -> Snapshot {
         let mut snapshot = Snapshot::default();
         for (id, entry) in &self.entries {
             let view = entry.view(audience);
+            let status = rolled(view.status, graded.contains(id));
             let rolled = snapshot
                 .workspaces
                 .entry(entry.workspace_id.clone())
-                .or_insert(view.status);
-            if view.status.urgency() > rolled.urgency() {
-                *rolled = view.status;
+                .or_insert(status);
+            if status.urgency() > rolled.urgency() {
+                *rolled = status;
             }
             snapshot.sessions.insert(id.clone(), view);
         }
@@ -696,17 +711,18 @@ mod tests {
         board.apply("b", b, Signal::Ready, None);
         board.apply("c", c, Signal::Working, None);
         let anyone = Audience::Anyone;
+        let none = HashSet::new();
         assert_eq!(
-            board.workspace_status("w1", anyone),
+            board.workspace_status("w1", anyone, &none),
             Some(AgentStatus::Done)
         );
         assert_eq!(
-            board.workspace_status("w2", anyone),
+            board.workspace_status("w2", anyone, &none),
             Some(AgentStatus::Working)
         );
-        assert_eq!(board.workspace_status("w3", anyone), None);
+        assert_eq!(board.workspace_status("w3", anyone, &none), None);
         board.apply("b", b, Signal::Blocked, None);
-        let snap = board.snapshot(anyone);
+        let snap = board.snapshot(anyone, &none);
         assert_eq!(snap.workspaces["w1"], AgentStatus::Blocked);
         assert_eq!(snap.workspaces["w2"], AgentStatus::Working);
         assert_eq!(snap.sessions.len(), 3);
@@ -717,8 +733,38 @@ mod tests {
         assert_eq!(rollup([]), None);
         board.untrack("b");
         assert_eq!(
-            board.workspace_status("w1", anyone),
+            board.workspace_status("w1", anyone, &none),
             Some(AgentStatus::Done)
+        );
+    }
+
+    #[test]
+    fn a_graded_finished_turn_rolls_up_idle_and_keeps_its_own_status() {
+        let mut board = StatusBoard::default();
+        let a = board.track("a", "w").unwrap().generation;
+        let b = board.track("b", "w").unwrap().generation;
+        board.apply("a", a, Signal::Done, None);
+        board.apply("b", b, Signal::Ready, None);
+        let anyone = Audience::Anyone;
+        let graded: HashSet<String> = ["a".to_owned()].into();
+        assert_eq!(
+            board.workspace_status("w", anyone, &graded),
+            Some(AgentStatus::Idle)
+        );
+        let snap = board.snapshot(anyone, &graded);
+        assert_eq!(snap.workspaces["w"], AgentStatus::Idle);
+        assert_eq!(snap.sessions["a"].status, AgentStatus::Done);
+        // An ungraded finished turn beside it still rolls up done, and a
+        // graded one that blocks is blocked.
+        board.apply("b", b, Signal::Done, None);
+        assert_eq!(
+            board.workspace_status("w", anyone, &graded),
+            Some(AgentStatus::Done)
+        );
+        board.apply("a", a, Signal::Blocked, None);
+        assert_eq!(
+            board.snapshot(anyone, &graded).workspaces["w"],
+            AgentStatus::Blocked
         );
     }
 

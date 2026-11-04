@@ -73,7 +73,7 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 - Precedence: hook / `notify` reports win; screen rules fill only what reports miss. Shells have no status.
 - Interrupts (Esc) fire no Claude hook: a turn that was seen on screen and then shows the prompt for 3 s reads `idle`. A `blocked` dialog closing onto a running turn reads `working`.
 - Seen is per client id (browser local storage, or the attach client). The REST API counts a turn seen once any client viewed it.
-- Rollup: a workspace shows its most urgent session, blocked > working > done > idle.
+- Rollup: a workspace shows its most urgent session, blocked > working > done > idle. A fan-out candidate's finished turn is the hub's to grade: it rolls up `idle` and Needs you skips it; the fan-out's own row (graders finished, unseen) is the one `done`, in Needs you and the sidebar chip alike.
 - Claude: hub assigns `--session-id <uuid>` (`agent_session_id`, follows `/clear`) and injects hooks via `--settings` (merged with yours) that run `<this binary> hub report`.
 - Codex: launched with `-c notify=["<this binary>","hub","report","--source","codex","--event","notify"]`; its `thread-id` becomes `agent_session_id`.
 - Report channel and trust: [hub-security](security.md#trust-model).
@@ -126,7 +126,7 @@ Per workspace: named tabs, each a split tree whose panes show one session. Store
 - Closing a pane (`Alt X`) only leaves the layout; the session runs on. Removing a session closes its panes and any tab left empty.
 - Only the active tab's panes are attached. Max 12 tabs per workspace, 12 panes per tab.
 - Phones (< 760 px): no splits; one pane, a chip row switches sessions; phones never change layouts.
-- Browser check (opt-in, not in `scripts/check.sh`): `node crates/flywheel-hub/e2e/layout.mjs [OUT_DIR]` drives layouts, phone landing, header pills, and tap targets at 1440x900 and 390x844 against a temp hub with a fake `claude` (env `FW`, `PLAYWRIGHT`, `CHROMIUM`, `PORT`).
+- Browser check (opt-in, not in `scripts/check.sh`): `node crates/flywheel-hub/e2e/layout.mjs [OUT_DIR]` drives layouts, phone landing, header pills, drawers, toasts, rollups, and tap targets at 1440x900 and 390x844 against a temp hub with a fake `claude` (env `FW`, `PLAYWRIGHT`, `CHROMIUM`, `PORT`).
 
 Keys: [hub-reference](reference.md#keyboard-shortcuts).
 
@@ -136,6 +136,7 @@ Keys: [hub-reference](reference.md#keyboard-shortcuts).
 - Folder chips: filled dot = git, hollow = plain, struck red = missing.
 - Tab title and favicon count blocked and done agents. Updates are pushed over the events socket; the UI polls only while it is down.
 - `#session=<id>` in the URL survives reloads. A dropped socket keeps the last screen and reconnects with backoff (at once on `online` / focus).
+- Drawers (Commands, Flywheel, Review, Queue) share one width (`--drawer-w`) at the stage's right edge, over the terminal; on phones each is a full-screen sheet. Toasts never cover a dialog or drawer: a dialog ends above the stack, a drawer lifts its content above it.
 - An ended session offers Relaunch and Close. A session removed elsewhere leaves its pane with a toast.
 - New workspace: paste folder paths (checked live) or **Import VS Code workspace** (files under the import root, Import / Update with a preview).
 - New session: kind, folder (defaults to the attached session's), optional new sibling worktree with live path / branch / base preview.

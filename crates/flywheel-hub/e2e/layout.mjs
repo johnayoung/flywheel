@@ -47,9 +47,85 @@ function freePort() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// The drawers over the terminal (Commands, Review, Queue; Flywheel needs a
+// flywheel folder): on desktop one width and one edge; on a phone a
+// full-screen sheet no terminal shows around; and a toast never covers a
+// drawer's controls (the drawer lifts them above the stack, its frame
+// stays put, and drops the room once the toasts go).
+async function drawerChecks(page, label, phone) {
+  const boxes = {};
+  for (const which of ["commands", "review", "queue"]) {
+    await page.evaluate((w) => {
+      if (w === "commands") commands.toggle(true);
+      if (w === "review") review.open(state.attached);
+      if (w === "queue") promptQueue.open(state.attached);
+    }, which);
+    await page.waitForSelector(`#${which}:not([hidden])`, { timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(600);
+    const before = await page.evaluate((w) => {
+      const r = document.getElementById(w).getBoundingClientRect();
+      return [r.left, r.top, r.right, r.bottom].map(Math.round);
+    }, which);
+    await page.evaluate(() => {
+      for (let i = 0; i < 2; i++) commands.toast(`drawer toast ${i}, long enough to wrap on a phone`, { timeout: 0 });
+    });
+    await page.waitForTimeout(400);
+    const r = await page.evaluate(({ w, phone }) => {
+      const d = document.getElementById(w);
+      if (d.hidden) return { open: false, bad: ["did not open"] };
+      const box = d.getBoundingClientRect();
+      const toasts = [...document.querySelectorAll(".toast")].map((t) => t.getBoundingClientRect()).filter((t) => t.width);
+      const bad = [];
+      if (!toasts.length) bad.push("no toast shown");
+      for (const t of toasts) {
+        const hit = document.elementFromPoint(t.left + t.width / 2, t.top + t.height / 2);
+        if (!hit || !hit.closest(".toast")) bad.push(`toast under ${hit ? hit.id || hit.className : "nothing"}`);
+      }
+      // Every part of the drawer (head, body, footer) ends above any toast
+      // over it: nothing inside can be under one.
+      for (const part of d.children) {
+        const p = part.getBoundingClientRect();
+        if (!p.width || !p.height) continue;
+        for (const t of toasts) {
+          if (p.left < t.right && p.right > t.left && p.top < t.bottom && p.bottom > t.top + 1) bad.push(`${part.id || part.className} under a toast`);
+        }
+      }
+      if (phone) {
+        if (Math.round(box.left) !== 0 || Math.round(box.top) !== 0 || Math.round(box.right) !== innerWidth || Math.round(box.bottom) !== innerHeight) {
+          bad.push(`not full screen ${JSON.stringify([box.left, box.top, box.right, box.bottom].map(Math.round))}`);
+        }
+        let peeks = 0;
+        for (let y = 0; y < innerHeight; y += 3) for (let x = 0; x < innerWidth; x += 3) {
+          const e = document.elementFromPoint(x, y);
+          if (e && e.closest("#terminal, #keybar, #term-header")) peeks += 1;
+        }
+        if (peeks) bad.push(`terminal or key bar shows at ${peeks} points`);
+      }
+      return { open: true, box: [box.left, box.top, box.right, box.bottom].map(Math.round), bad };
+    }, { w: which, phone });
+    await page.screenshot({ path: path.join(out, `${label}-drawer-${which}-toast.png`) });
+    const after = await page.evaluate(async (w) => {
+      for (const n of [...document.querySelectorAll("#toasts .toast")]) n.remove();
+      await new Promise((res) => setTimeout(res, 300));
+      const d = document.getElementById(w);
+      return { pad: getComputedStyle(d).paddingBottom, docked: d.classList.contains("toast-docked") };
+    }, which);
+    const kept = JSON.stringify(before) === JSON.stringify(r.box);
+    check(r.open && r.bad.length === 0 && kept && !after.docked, `${label}: a toast over the ${which} drawer is on top and covers none of it; the drawer keeps its box (${JSON.stringify({ ...r, before, after })})`);
+    boxes[which] = r.box;
+    await page.evaluate(() => closeOverlays(""));
+    await page.waitForTimeout(300);
+  }
+  if (!phone) {
+    const all = Object.values(boxes).map((b) => JSON.stringify(b));
+    check(all.every((b) => b === all[0]), `desktop: every drawer has one width and one edge (${JSON.stringify(boxes)})`);
+  }
+}
+
 // A fake Claude Code: prints a banner and a prompt, then echoes input.
 // Asked to "polish", it also writes a transcript with usage (the header's
-// meter) and reports itself blocked (the why? button).
+// meter) and reports itself blocked (the why? button). A fan-out's "do it"
+// finishes its turn at once (the hub then grades it).
 const bin = path.join(tmp, "bin");
 fs.mkdirSync(bin);
 const claudeConfig = path.join(tmp, "claude-config");
@@ -61,6 +137,9 @@ case "$*" in
   for a in "$@"; do [ "$prev" = "--session-id" ] && id="$a"; prev="$a"; done
   printf '%s\\n' '{"type":"assistant","uuid":"u1","timestamp":"2026-11-03T10:00:00.000Z","message":{"id":"m1","model":"claude-sonnet-5-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1200,"output_tokens":300,"cache_read_input_tokens":40000}}}' > "$CLAUDE_CONFIG_DIR/projects/e2e/$id.jsonl"
   "$FW_BIN" hub report --source claude --event Notification --detail permission_prompt </dev/null >/dev/null 2>&1
+  ;;
+*"do it"*)
+  "$FW_BIN" hub report --source claude --event Stop </dev/null >/dev/null 2>&1
   ;;
 esac
 echo 'fake claude'
@@ -303,13 +382,57 @@ try {
   const ws3 = await api("POST", "/api/workspaces", { name: "polish", folders: [repo3] });
   const task = "another-deliberately-long-task-name-for-the-path-check";
   const agent = await api("POST", "/api/sessions", { workspace_id: ws3.id, kind: "claude", prompt: "polish", worktree: { task }, cols: 100, rows: 30 });
-  await api("POST", "/api/fanouts", { workspace_id: ws3.id, prompt: "do it", candidates: [{ kind: "claude" }, { kind: "claude" }], graders: ["true"] });
+  // The fan-out in a workspace of its own (another real repo), so its
+  // rollup is the candidates' alone.
+  const repo4 = path.join(tmp, "code", "fanned");
+  fs.mkdirSync(repo4, { recursive: true });
+  for (const args of [["init", "-q", "-b", "main"], ["commit", "-q", "--allow-empty", "-m", "init"]]) {
+    execFileSync("git", ["-C", repo4, ...args], {
+      stdio: "ignore",
+      env: { ...process.env, GIT_AUTHOR_NAME: "e2e", GIT_AUTHOR_EMAIL: "e2e@example.invalid", GIT_COMMITTER_NAME: "e2e", GIT_COMMITTER_EMAIL: "e2e@example.invalid" },
+    });
+  }
+  const ws4 = await api("POST", "/api/workspaces", { name: "fanned", folders: [repo4] });
+  const fo = await api("POST", "/api/fanouts", { workspace_id: ws4.id, prompt: "do it", candidates: [{ kind: "claude" }, { kind: "claude" }], graders: ["true"] });
   const pol = await browser.newContext({ viewport: { width: 1440, height: 900 } });
   const pp = await pol.newPage();
   await pp.goto(`${base}/login?token=${token}#session=${agent.id}`);
   await pp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
   await pp.waitForFunction(() => !document.querySelector("#crumb-why").hidden && !document.querySelector("#meter-usage").hidden, null, { timeout: 15000 })
     .catch(() => {});
+  // Needs you and the workspace rollup agree on a fan-out candidate's
+  // finished turn: the hub grades it, so neither counts it done; the
+  // fan-out's own row (its graders finished) is the one done item.
+  const candidates = new Set(fo.candidates.map((c) => c.session_id));
+  for (let i = 0; i < 100; i++) {
+    const listed = await api("GET", "/api/fanouts");
+    const f = listed.fanouts.find((x) => x.id === fo.id);
+    if (f && f.graded_at && f.candidates.every((c) => c.verdict && c.verdict !== "ungraded")) break;
+    await sleep(200);
+  }
+  await pp.waitForFunction((ids) => ids.every((id) => {
+    const s = state.sessions.find((x) => x.id === id);
+    return s && agentStatus(s)?.status === "done";
+  }), [...candidates], { timeout: 15000 }).catch(() => {});
+  await pp.waitForFunction((ws) => [...document.querySelectorAll("#attention .attn-row.fo .attn-ws")].some((n) => n.textContent === ws), "fanned", { timeout: 10000 }).catch(() => {});
+  const agree = await pp.evaluate(({ ws, ids }) => {
+    const rows = [...document.querySelectorAll("#attention .attn-row")];
+    const here = rows.filter((r) => r.querySelector(".attn-ws")?.textContent === ws);
+    const chip = document.querySelector(`section.workspace[data-id="${state.workspaces.find((w) => w.name === ws).id}"] .ws-status`);
+    return {
+      done: ids.map((id) => agentStatus(state.sessions.find((x) => x.id === id))?.status),
+      listed: here.length,
+      fanoutRow: here.some((r) => r.classList.contains("fo")),
+      candidateRows: rows.filter((r) => ids.includes(r.dataset.id)).length,
+      chip: chip ? chip.textContent : null,
+      server: state.rollup[state.workspaces.find((w) => w.name === ws).id] || null,
+    };
+  }, { ws: "fanned", ids: [...candidates] });
+  check(
+    agree.done.every((s) => s === "done") && agree.fanoutRow && agree.candidateRows === 0 && agree.listed === 1 &&
+      agree.chip === "done" && agree.server !== "done",
+    `desktop: Needs you and the rollup count a fan-out's finished candidates as its one row (${JSON.stringify(agree)})`,
+  );
   const rectOf = (sel) => pp.evaluate((sel) => {
     const n = document.querySelector(sel);
     if (!n || n.hidden) return null;
@@ -439,6 +562,8 @@ try {
   });
   check(still.sideways && (still.after[0] === still.empty[0] && still.after[1] === still.empty[1]), `desktop: toasts beside a dialog do not move it (${JSON.stringify(still)})`);
   await pp.keyboard.press("Escape");
+  await pp.waitForTimeout(300);
+  await drawerChecks(pp, "desktop", false);
   await pol.close();
 
   // --- phone 390x844 ------------------------------------------------------
@@ -615,6 +740,11 @@ try {
     () => check(false, "phone: menu opens the sessions sidebar"),
   );
   await mp.screenshot({ path: path.join(out, "phone-sidebar.png") });
+  // Drawers on a phone, over an agent in a real repo (Review needs git).
+  await mp.goto(`${base}/login?token=${token}#session=${agent.id}`);
+  await mp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
+  await mp.waitForTimeout(800);
+  await drawerChecks(mp, "phone", true);
   // The replay player and a share link's view: every control at least
   // 44x44 (a checkbox counts by its label).
   await api("POST", `/api/sessions/${sids[1]}/record/start`);

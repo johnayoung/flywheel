@@ -127,9 +127,11 @@ window.FwHubCommands = function (ctx) {
   // modal dialog makes everything outside it inert (a toast's buttons
   // would not take clicks), so while one is open the layer moves into the
   // topmost and is shown again there; it returns to the page when the
-  // dialogs close. An open dialog never sits under the toasts either:
-  // while both show, the dialog ends above the stack (`--toast-room`, read
-  // by the dialog rules in app-dialogs.css).
+  // dialogs close. An open dialog or drawer never sits under the toasts
+  // either: while both show, a dialog ends above the stack and a drawer
+  // (Commands, Flywheel, Review, Queue; a full-screen sheet on phones)
+  // keeps its frame but lifts its content and footer above it
+  // (`--toast-room`, read by the rules in app-dialogs.css).
   const toastRoot = $("#toasts");
   const modals = []; // open modal dialogs, the most recently opened last
 
@@ -167,10 +169,15 @@ window.FwHubCommands = function (ctx) {
     }
   }
 
+  // The drawers toasts make room in.
+  const drawers = [...document.querySelectorAll("aside.commands")];
+
   // An open dialog ends above the toast stack only when the stack is in its
   // way: a toast off to the side of a centred dialog leaves it where it is
   // (it would jump as each toast came and went). Docking moves a dialog
-  // vertically only, so the side-by-side test is stable either way.
+  // vertically only, so the side-by-side test is stable either way. A
+  // drawer in the stack's way pads its bottom by the stack's height: its
+  // box does not move, so the test stays stable for it too.
   function dockToasts() {
     let box = null;
     for (const t of toastRoot.children) {
@@ -190,6 +197,13 @@ window.FwHubCommands = function (ctx) {
     const room = inWay ? Math.ceil(window.innerHeight - box.top + 12) : 0;
     document.documentElement.style.setProperty("--toast-room", `${room}px`);
     document.body.classList.toggle("toast-docked", room > 0);
+    for (const drawer of drawers) {
+      const d = drawer.hidden ? null : drawer.getBoundingClientRect();
+      const under = box && d && d.width && box.left < d.right && box.right > d.left && box.top < d.bottom;
+      const pad = under ? Math.ceil(d.bottom - box.top + 8) : 0;
+      drawer.style.setProperty("--toast-room", `${pad}px`);
+      drawer.classList.toggle("toast-docked", pad > 0);
+    }
   }
 
   new MutationObserver((changes) => {
@@ -207,6 +221,7 @@ window.FwHubCommands = function (ctx) {
   }).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["open"] });
   if (typeof ResizeObserver === "function") new ResizeObserver(dockToasts).observe(toastRoot);
   new MutationObserver(dockToasts).observe(toastRoot, { childList: true });
+  for (const drawer of drawers) new MutationObserver(dockToasts).observe(drawer, { attributes: true, attributeFilter: ["hidden"] });
   window.addEventListener("resize", dockToasts);
 
   function toast(message, { actions = [], timeout = 4500, tone = "" } = {}) {

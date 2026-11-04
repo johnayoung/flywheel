@@ -58,7 +58,7 @@
 .fw-pill b { background: var(--alert); color: #fff; }
 
 /* The drawer: the commands drawer's frame, wider, verified green edge. */
-.fw-drawer { width: min(46rem, 100%); border-left-color: var(--fw-ok); z-index: 4; }
+.fw-drawer { border-left-color: var(--fw-ok); }
 .fw-drawer .cmd-head { border-bottom: 1px solid var(--rule-2); padding-bottom: .7rem; }
 .fw-drawer .sheet-kicker { color: var(--fw-ok); }
 .fw-read { margin-left: .5rem; color: var(--ink-3); letter-spacing: .12em; }
@@ -308,6 +308,7 @@
 .run-entry.gate .run-header, .run-entry.error .run-header, .run-entry.error .run-text { color: var(--alert); }
 
 @media (max-width: 760px) {
+  .fw-drawer { border-top-color: var(--fw-ok); }
   .fw-daemon { grid-template-columns: auto 5rem minmax(0, 1fr); }
   .fw-daemon-actions { grid-column: 1 / -1; justify-content: flex-end; }
   .fw-task, .fw-alert { grid-template-columns: 5rem minmax(0, 1fr) auto; }
@@ -366,7 +367,7 @@
 .rv-pill b { color: var(--fw-ok); background: none; padding: 0; font-weight: 700; letter-spacing: 0; }
 .rv-pill[data-dirty="true"]::after { content: ""; width: .38rem; height: .38rem; border-radius: 50%; background: var(--brass); }
 
-.rv-drawer { width: min(60rem, 100%); z-index: 5; border-left-color: var(--brass); }
+.rv-drawer { border-left-color: var(--brass); }
 .rv-drawer .sheet-kicker { color: var(--brass); }
 .rv-drawer .cmd-head { gap: .6rem; }
 .rv-head-actions { display: flex; gap: .2rem; flex: none; }
@@ -610,26 +611,10 @@
 .rva-ran .rva-cmd { margin-top: .35rem; max-height: 14rem; }
 .rva-url { color: var(--signal); font: 500 12px var(--term); overflow-wrap: anywhere; }
 
-/* Desktop: toasts clear the action bar. */
-@media (min-width: 761px) {
-  body:has(#review:not([hidden])) .toasts { bottom: 4.4rem; }
-}
-
-/* Phones: the review is a full-screen sheet over everything, unified
-   diffs, actions in a thumb row at the bottom. */
+/* Phones: the review is a full-screen sheet (as every drawer is),
+   unified diffs, actions in a thumb row at the bottom. */
 @media (max-width: 760px) {
-  .rv-drawer {
-    position: fixed;
-    inset: auto 0 auto 0;
-    top: var(--app-top, 0px);
-    height: var(--app-height, 100dvh);
-    width: 100%;
-    z-index: 40;
-    border: 0;
-    border-top: 3px solid var(--brass);
-    padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
-    animation: rise .22s var(--ease);
-  }
+  .rv-drawer { border-top-color: var(--brass); }
   .rv-drawer .cmd-head { padding: .6rem .8rem .35rem; }
   .rv-drawer .cmd-head > .rv-head-actions .icon { width: 44px; height: 44px; }
   .rv-tabs { padding: 0 .5rem; }

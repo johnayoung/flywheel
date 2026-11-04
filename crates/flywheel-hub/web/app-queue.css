@@ -29,7 +29,7 @@
 .q-chip.stalled { border-color: var(--alert); color: var(--alert); text-transform: uppercase; }
 
 /* --- the drawer ---------------------------------------------------------------- */
-.q-drawer { width: min(34rem, 100%); z-index: 5; border-left-color: var(--brass); }
+.q-drawer { border-left-color: var(--brass); }
 .q-drawer .sheet-kicker { color: var(--brass); }
 .q-drawer .cmd-head { gap: .6rem; }
 .q-drawer .rv-head-actions { display: flex; align-items: center; gap: .4rem; }
@@ -185,18 +185,7 @@
 
 /* --- phones: a full-screen sheet, thumb-sized controls ------------------------- */
 @media (max-width: 760px) {
-  .q-drawer {
-    position: fixed;
-    inset: auto 0 auto 0;
-    top: var(--app-top, 0px);
-    height: var(--app-height, 100dvh);
-    width: 100%;
-    z-index: 40;
-    border: 0;
-    border-top: 3px solid var(--brass);
-    padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
-    animation: rise .22s var(--ease);
-  }
+  .q-drawer { border-top-color: var(--brass); }
   .q-drawer .cmd-head { padding: .6rem .8rem .35rem; }
   .q-drawer .cmd-head .icon, .q-pause, .q-form .slab, .q-stall .slab, .q-paused .slab { min-height: 44px; min-width: 44px; }
   .q-form textarea { font-size: 16px; }

@@ -32,6 +32,9 @@
   --mono: "FW Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --term: "FW Term", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --side: 18.5rem;
+  /* Every drawer over the terminal (Commands, Flywheel, Review, Queue):
+     one width, one edge (the stage's right). */
+  --drawer-w: min(52rem, 100%);
   --ease: cubic-bezier(.2, .7, .2, 1);
   --spin: 0s;
 }

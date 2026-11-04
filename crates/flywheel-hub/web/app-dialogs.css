@@ -477,8 +477,8 @@
 .commands {
   position: absolute;
   inset: 0 0 0 auto;
-  z-index: 3;
-  width: min(40rem, 100%);
+  z-index: 5;
+  width: var(--drawer-w);
   display: flex;
   flex-direction: column;
   border: 1px solid var(--rule-2);
@@ -657,10 +657,10 @@ body.toast-docked dialog.sheet:modal {
 @media (max-width: 760px) {
   body.toast-docked dialog.sheet:modal { max-height: calc(100dvh - var(--toast-room, 0px)); }
 }
-/* A drawer open: toasts sit above its key-hint footer, not over it. */
-@media (min-width: 761px) {
-  body:has(#commands:not([hidden])) .toasts, body:has(#flywheel:not([hidden])) .toasts { bottom: 3.6rem; }
-}
+/* A drawer under the toast stack keeps its frame and lifts its content
+   and footer above the stack (commands.js sets its --toast-room and
+   .toast-docked), so no toast covers a drawer's controls either. */
+.commands.toast-docked { padding-bottom: var(--toast-room, 0px); }
 .toast {
   pointer-events: auto;
   display: flex;
@@ -695,9 +695,26 @@ body.toast-docked dialog.sheet:modal {
   .toast-actions > button, .toast-actions > a { display: inline-flex; align-items: center; min-height: 44px; min-width: 44px; padding: 0 .5rem; }
 }
 
+/* Phones: every drawer is a full-screen sheet over everything (header,
+   key bar), pinned to the visual viewport like the app: no strip of the
+   terminal shows around it. Its edge colour moves to the top. */
 @media (max-width: 760px) {
-  .commands { width: 100%; border-left-width: 1px; }
+  .commands {
+    position: fixed;
+    inset: auto 0 auto 0;
+    top: var(--app-top, 0px);
+    height: var(--app-height, 100dvh);
+    width: 100%;
+    z-index: 40;
+    border: 0;
+    border-top: 3px solid var(--signal);
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+    animation: rise .22s var(--ease);
+  }
+  /* The sheet covers the key bar: toasts drop to the screen's foot. */
+  body:has(.commands:not([hidden])) .toasts { bottom: calc(.6rem + env(safe-area-inset-bottom)); }
   .cmd-pill { padding: .2rem .4rem; }
-  .toasts { right: .6rem; left: .6rem; bottom: .6rem; justify-items: stretch; }
+  .toasts, .toasts[popover] { right: .6rem; left: .6rem; justify-items: stretch; }
+  .toasts { bottom: .6rem; }
   .toast { max-width: none; }
 }

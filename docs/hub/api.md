@@ -127,7 +127,7 @@ Fan-out view: `{"id","base_sha","winner","counts","leader","settled","graded_at"
 | GET | `/api/activity/digest[?since=&client=&until=&ws=&session=]` | `{"since","until","turns_finished","blocked_now","fanouts_graded","commands_suggested","cost_usd","workspaces","empty","partial"}`; `since=last-seen` needs `client` |
 | POST | `/api/activity/seen` | `{"client"}` -> 204: its `last-seen` is now |
 
-Times: RFC 3339, unix ms, an age (`30m`, `2h`, `7d`), or `last-seen` (with `client`). `ws`, `session`: id, 4+ char id prefix, or name (each machine resolves its own). `kind`: a comma list, `review` covers `review.*`, unknown is 400. Kinds beyond the plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`.
+Times: RFC 3339, unix ms, an age (`30m`, `2h`, `7d`), or `last-seen` (with `client`). `ws`, `session`: id, 4+ char prefix, or name (resolved per machine). `kind`: a comma list (`review` = `review.*`; unknown: 400). Beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`.
 A peer's request, or `machines=none`, answers for that hub alone.
 
 ## Settings, config, plugins, notify, TLS
@@ -203,15 +203,15 @@ Unreadable queries (or `POST /login` bodies) get a 4xx page, or `{"error"}` for 
 
 Client sends `input` `{"data"}`, `resize` `{"cols","rows"}`, `theme` `{"foreground","background","cursor","ansi"}` (answers colour queries), or binary input.
 
-**Protocol 2** (`?proto=2`, what the web UI uses; weak links). Options: `lite=1&fps=N` (1-30, default 4), `z=1`, `since=S&epoch=E`, `client=KEY` (1-64 of `[A-Za-z0-9_-]`).
+**Protocol 2** (`?proto=2`, the web UI's). Options: `lite=1&fps=N` (1-30, default 4), `z=1`, `since=S&epoch=E`, `client=KEY` (1-64 `[A-Za-z0-9_-]`).
 
-- `snapshot` adds `seq` (output offset it reflects) and `epoch` (hex: the output stream; a relaunch starts another). Each later raw binary byte is one offset.
-- `since`/`epoch`: back at offset S of E -> `{"type":"resume","seq":S,"epoch"}`, then what was missed (raw, from the last 512 KiB, plus a `size`), no reset; lite and over 16 KiB: one frame instead. Else a snapshot with `continued`: `false` = not this output (typed input no longer applies).
-- `{"type":"frame","seq","cols","rows","bytes"}` + one binary: escape sequences repainting what changed (rows, history rows scrolled in, cursor, modes); the screen is then at `seq`.
-- Lite: at most `fps` updates a second, the first at once; an update is the raw output since when 1 KiB or less, else a frame. A raw viewer 64+ chunks behind gets one update then raw again.
-- `z=1`: binary = tag `0` + bytes, or `1` + u32 BE inflated length + raw deflate, one stream per socket, sync-flushed per message (`DecompressionStream("deflate-raw")`).
-- `input` may carry `id` (growing per `client`): acked `{"type":"ack","id"}`; an id already taken is not typed again (resend after a drop).
-- `{"type":"mode","lite","fps"?,"paused"?}`: switch pacing; `paused` (lite) sends nothing until unpaused (hidden pane).
+- `snapshot` adds `seq` (output offset; one per later raw byte) and `epoch` (hex stream id; a relaunch starts another).
+- `since`/`epoch` kept (512 KiB): `{"type":"resume","seq":S,"epoch"}`, the missed output, a `size` (lite, over 16 KiB: a frame). Else a snapshot with `continued` (`false`: another stream).
+- `{"type":"frame","seq","cols","rows","bytes"}` + one binary repainting what changed.
+- Lite: at most `fps` updates/s (raw output when <= 1 KiB, else a frame). A raw viewer 64+ chunks behind gets one update. Exit: sent once.
+- `z=1`: binary = `0` + bytes, or `1` + u32 BE length + raw deflate (one stream per socket, sync-flushed).
+- `input` may carry `id` (growing per `client`), acked `{"type":"ack","id"}`; a taken id is not typed again.
+- `{"type":"mode","lite","fps"?,"paused"?}` switches pacing (`paused`: nothing until unpaused). `{"type":"ping"}` -> `{"type":"pong"}` (liveness).
 
 Close codes: **4001** token rotated, **4002** logout / login expired, **4003** peer revoked, **4004** share ended, **1012** live handoff (reconnect). Via a machine proxy: **4010** (its 4001-4003), **4011** machine removed, **1011** link lost.
 

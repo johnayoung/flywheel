@@ -82,6 +82,7 @@
   <symbol id="i-grip" viewBox="0 0 16 16"><circle cx="6" cy="4" r="1.1" fill="currentColor"/><circle cx="10" cy="4" r="1.1" fill="currentColor"/><circle cx="6" cy="8" r="1.1" fill="currentColor"/><circle cx="10" cy="8" r="1.1" fill="currentColor"/><circle cx="6" cy="12" r="1.1" fill="currentColor"/><circle cx="10" cy="12" r="1.1" fill="currentColor"/></symbol>
   <symbol id="i-activity" viewBox="0 0 16 16"><path d="M1.5 8.5h3l2-5 3 9 2-4h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></symbol>
   <symbol id="i-signal" viewBox="0 0 16 16"><path d="M3 13.5v-2M6.3 13.5v-4M9.6 13.5v-6.5M13 13.5v-9.5" stroke="currentColor" stroke-width="1.8"/></symbol>
+  <symbol id="i-signal-low" viewBox="0 0 16 16"><path d="M3 13.5v-2M6.3 13.5v-4" stroke="currentColor" stroke-width="1.8"/><path d="M9.6 13.5v-6.5M13 13.5v-9.5" stroke="currentColor" stroke-width="1.8" opacity=".3"/></symbol>
   <symbol id="i-dots" viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/></symbol>
 </svg>
 
@@ -151,7 +152,7 @@
         <button type="button" id="rv-toggle" class="cmd-pill rv-pill" data-action="toggle-review" aria-pressed="false" aria-controls="review" hidden><svg><use href="#i-branch"/></svg>review<b id="rv-count" hidden></b></button>
         <button type="button" id="fw-toggle" class="cmd-pill fw-pill" data-action="toggle-flywheel" aria-pressed="false" aria-controls="flywheel" hidden><svg><use href="#i-wheel"/></svg>flywheel<b id="fw-count" hidden></b></button>
         <span id="prefix-pill" class="prefix-pill" hidden title="Pane prefix: press a key (% &quot; arrows z x c n p 1-9 , &amp; ?), Esc to cancel">ctrl b</span>
-        <button type="button" id="lite-toggle" class="cmd-pill lite-pill" data-action="toggle-lite" aria-pressed="false" hidden><svg><use href="#i-signal"/></svg>lite</button>
+        <button type="button" id="lite-toggle" class="cmd-pill lite-pill" data-action="toggle-lite" aria-pressed="false" aria-label="Lite mode off" hidden><svg aria-hidden="true"><use href="#i-signal"/></svg><span class="lite-word">lite</span></button>
         <span id="link" class="link-pill" data-link="idle">idle</span>
       </div>
     </header>

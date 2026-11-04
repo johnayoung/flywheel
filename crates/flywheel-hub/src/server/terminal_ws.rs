@@ -124,6 +124,10 @@ enum ClientMessage {
         fps: Option<u32>,
         paused: Option<bool>,
     },
+    /// Protocol 2: answered with a `pong` (a browser cannot see WebSocket
+    /// pings; this is how it tells a link that went silent from one that
+    /// is only quiet).
+    Ping,
 }
 
 pub(super) fn exit_message(info: &ExitInfo) -> Message {
@@ -316,9 +320,22 @@ impl Pace {
 struct Viewer {
     socket: WebSocket,
     deflate: Option<Deflater>,
+    /// The exit was sent: it is heard once, whichever path (a snapshot, a
+    /// resume, the live stream, a catch-up) brought it.
+    exit_said: bool,
 }
 
 impl Viewer {
+    /// Say that the process ended (once per socket); false when the
+    /// socket is gone.
+    async fn exit(&mut self, info: &ExitInfo) -> bool {
+        if self.exit_said {
+            return true;
+        }
+        self.exit_said = true;
+        self.socket.send(exit_message(info)).await.is_ok()
+    }
+
     async fn text(&mut self, value: &serde_json::Value) -> bool {
         self.socket
             .send(Message::Text(value.to_string().into()))
@@ -416,8 +433,10 @@ impl Viewer {
             start = end;
         }
         drop(replay);
-        if let Some(info) = &exit {
-            self.socket.send(exit_message(info)).await.ok()?;
+        if let Some(info) = &exit
+            && !self.exit(info).await
+        {
+            return None;
         }
         Some(events)
     }
@@ -483,8 +502,10 @@ async fn open(
                 if !viewer.text(&size).await {
                     return None;
                 }
-                if let Some(info) = &exit {
-                    viewer.socket.send(exit_message(info)).await.ok()?;
+                if let Some(info) = &exit
+                    && !viewer.exit(info).await
+                {
+                    return None;
                 }
                 return Some(events);
             }
@@ -502,8 +523,10 @@ async fn open(
                 if !viewer.text(&resumed).await || !viewer.update(update, view.seq).await {
                     return None;
                 }
-                if let Some(info) = session.exit_info() {
-                    viewer.socket.send(exit_message(&info)).await.ok()?;
+                if let Some(info) = session.exit_info()
+                    && !viewer.exit(&info).await
+                {
+                    return None;
                 }
                 return Some(events);
             }
@@ -534,6 +557,7 @@ async fn pump(
     let mut viewer = Viewer {
         socket,
         deflate: options.deflate.then(Deflater::new),
+        exit_said: false,
     };
     let mut pace = match options.lite {
         Some(fps) => Pace::lite(fps, false),
@@ -592,7 +616,7 @@ async fn pump(
                     // One update for all it missed (the raw output when it
                     // is little, else a frame), then the stream from there.
                     drop(events);
-                    let Some((back, (update, fresh))) = off_runtime(&session, std::mem::take(&mut view), |s, v| {
+                    let Some((back, (update, fresh, ended))) = off_runtime(&session, std::mem::take(&mut view), |s, v| {
                         v.frame.forget();
                         s.update_and_subscribe(v, CATCH_UP_RAW_MAX)
                     })
@@ -604,6 +628,12 @@ async fn pump(
                     if !viewer.update(update, view.seq).await {
                         break;
                     }
+                    // An exit queued in the receiver just dropped: said here.
+                    if let Some(info) = ended
+                        && !viewer.exit(&info).await
+                    {
+                        break;
+                    }
                     continue;
                 }
                 let sent = match event {
@@ -611,7 +641,7 @@ async fn pump(
                         view.seq += bytes.len() as u64;
                         viewer.binary(bytes).await
                     }
-                    Ok(SessionEvent::Exit(info)) => viewer.socket.send(exit_message(&info)).await.is_ok(),
+                    Ok(SessionEvent::Exit(info)) => viewer.exit(&info).await,
                     Ok(SessionEvent::Resize { cols, rows }) => {
                         viewer.text(&json!({ "type": "size", "cols": cols, "rows": rows })).await
                     }
@@ -660,7 +690,7 @@ async fn pump(
                     }
                 }
                 if let Some(info) = exit.take()
-                    && viewer.socket.send(exit_message(&info)).await.is_err()
+                    && !viewer.exit(&info).await
                 {
                     break;
                 }
@@ -715,7 +745,7 @@ async fn pump(
                                     (Pace::Lite { .. }, false) => {
                                         // Up to date, then the raw stream from there.
                                         drop(events);
-                                        let Some((back, (update, fresh))) = off_runtime(&session, std::mem::take(&mut view), |s, v| {
+                                        let Some((back, (update, fresh, ended))) = off_runtime(&session, std::mem::take(&mut view), |s, v| {
                                             s.update_and_subscribe(v, usize::MAX)
                                         })
                                         .await else {
@@ -728,8 +758,10 @@ async fn pump(
                                         if !viewer.update(update, view.seq).await {
                                             break;
                                         }
-                                        if let Some(info) = exit.take()
-                                            && viewer.socket.send(exit_message(&info)).await.is_err()
+                                        // Heard already, or still queued in the
+                                        // receiver just dropped: once either way.
+                                        if let Some(info) = exit.take().or(ended)
+                                            && !viewer.exit(&info).await
                                         {
                                             break;
                                         }
@@ -743,6 +775,17 @@ async fn pump(
                                         }
                                     }
                                     (Pace::Raw, false) => {}
+                                }
+                            }
+                            Ok(ClientMessage::Ping) if options.v2 => {
+                                if !viewer.text(&json!({ "type": "pong" })).await {
+                                    break;
+                                }
+                            }
+                            Ok(ClientMessage::Ping) => {
+                                let error = json!({ "type": "error", "message": "bad message: ping needs proto=2" });
+                                if !viewer.text(&error).await {
+                                    break;
                                 }
                             }
                             Ok(ClientMessage::Mode { .. }) => {

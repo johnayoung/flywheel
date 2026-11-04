@@ -13,8 +13,8 @@ How the hub behaves underneath the UI. Front door: [hub](../hub.md).
 
 ## Terminal emulation
 
-- One `alacritty_terminal` emulator per session; attach = a **snapshot** (scrollback, screens, cursor, pen, modes, title, palette), then live bytes, no gap or overlap. Snapshots hold 2 MiB of scrollback; a client that falls behind gets a screen-only one (`reset`; protocol 2: one frame of what changed).
-- Weak links ([hub-api: Terminal WebSocket](api.md#terminal-websocket)): the last 512 KiB of output are kept per session, so a dropped viewer resumes with what it missed; frames (row diffs from the emulator) pace slow viewers.
+- One `alacritty_terminal` emulator per session; attach = a **snapshot** (scrollback, screens, cursor, pen, modes, title, palette), then live bytes, no gap or overlap. Snapshots hold 2 MiB of scrollback; a client behind gets a screen-only one (`reset`; protocol 2: a frame).
+- Weak links ([hub-api](api.md#terminal-websocket)): 512 KiB of recent output per session lets a dropped viewer resume; row diffs pace slow ones.
 - Not replayed: custom tab stops, blink/overline. Not emulated: `?47`/`?1047` alt screens, kitty keyboard protocol.
 - The server answers terminal queries (DA, DSR, DECRQM, OSC 4/10/11/12) once; clients must not. Colours follow the last viewer-reported theme (dark first).
 - Bounds: OSC strings 64 KiB, titles 4 KiB (stack 10), hyperlinks over 2 KiB dropped, 8 combining marks per cell.
@@ -37,16 +37,16 @@ How the hub behaves underneath the UI. Front door: [hub](../hub.md).
 | folder gone | stays `stopped` with `restore_error`, retried each start |
 | found `running` (crash) | not restored ("not shut down cleanly"); `fw hub relaunch` |
 
-A missing dir is a 400, never a shell in `$HOME`. Decision: `restore::plan`. `install-service` writes `~/.config/systemd/user/<name>.service` (`KillMode=mixed` so sessions are recorded, `--no-login-code` so no code reaches the journal) and prints the enable/linger steps.
+A missing dir is a 400, never a shell in `$HOME`. Decision: `restore::plan`. `install-service` writes `~/.config/systemd/user/<name>.service` (`KillMode=mixed` so sessions are recorded, `--no-login-code` so no code reaches the journal) and prints enable/linger steps.
 
 ## Live handoff (`fw hub upgrade`)
 
 Replaces the hub process **without ending any session**: same pids, screens, scrollback, port, status, hook secrets. Linux only (macOS compiles, untested).
 
 - Binary: `--binary`, else `fw` on `PATH`, else this one; probed with `hub start --help`; it inherits the old hub's environment (`/proc/<pid>/environ`). Agents spawned earlier keep hooks on the old path: upgrade in place or keep it.
-- Over `handoff.sock` (same user) the old hub freezes (requests 503, PTYs paused), closes WebSockets with **1012**, passes listener, locks, PTY masters, pidfds, snapshots and held input (`SCM_RIGHTS`), and exits once the new hub acks; later input is refused (503), never lost or doubled.
+- Over `handoff.sock` (same user) the old hub freezes (503, PTYs paused), closes WebSockets with **1012**, passes listener, locks, PTY masters, pidfds, snapshots, held input (`SCM_RIGHTS`), and exits once the new hub acks; later input gets 503, never lost or doubled.
 - Failure before commit thaws the old hub; a stuck new hub is killed at `--timeout`.
-- Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` then stops and starts with the same flags and env (sessions restored, not kept). A handoff already running: retry. systemd: `systemctl --user restart <unit>`.
+- Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` then restarts with the same flags and env (sessions restored, not kept). One running: retry. systemd: `systemctl --user restart <unit>`.
 - Handed-over processes are not children: exits come via pidfd, code unknown (`exited ?`); no restore pass. Clients reconnect on 1012 (browsers at once, `attach` / `wait` within 2 min).
 
 ## Agent status
@@ -63,7 +63,7 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 - Hook / `notify` reports win; screen rules fill gaps; shells have none. Esc fires no Claude hook: a seen turn showing the prompt 3 s reads `idle`, a dialog closing onto a running turn `working`.
 - Seen is per client id (browser storage, or the attach client); the REST API counts a turn seen once anyone viewed it.
 - Rollup: a workspace's most urgent session, blocked > working > done > idle.
-- Fan-out done, one rule for the rollup, Needs you, the chip, and `fw hub attach`: until a winner is picked, candidates' finished turns are the hub's (rolled up `idle`); a fan-out with an unseen grading (`needs_you`) is one `done` until anyone opens its board (`POST .../seen`).
+- Fan-out done (one rule for rollup, Needs you, chip, `fw hub attach`): until a winner is picked, candidates' finished turns roll up `idle`; an unseen grading (`needs_you`) is one `done` until anyone opens the board (`POST .../seen`).
 - Claude gets `--session-id <uuid>` (`agent_session_id`, follows `/clear`) and hooks via `--settings` (merged with yours) running `<this binary> hub report`. Codex gets `-c notify=["<this binary>","hub","report","--source","codex","--event","notify"]`; its `thread-id` is `agent_session_id`. Trust: [hub-security](security.md#trust-model).
 
 ## Detection manifests
@@ -107,17 +107,16 @@ Per workspace: tabs of split trees, one session per pane. Stored on the hub (sha
 - A new-shell split (`Alt \`, `Alt -`) opens an agent's companion shell first; ``Alt ` `` opens it beside its agent above 1100 px.
 - Panes stay 40x8 cells or more (else a new tab). Closing a pane (`Alt X`) leaves its session running; removing a session closes its panes and empty tabs. Only the active tab attaches; 12 tabs, 12 panes per tab.
 - Phones (< 760 px): one pane, a chip row switches sessions; layouts unchanged.
-- Browser check (opt-in, not in `scripts/check.sh`): `node crates/flywheel-hub/e2e/layout.mjs [OUT_DIR]`: layouts, pills, drawers, toasts, rollups, tap targets at 1440x900 and 390x844 on a temp hub with a fake `claude` (env `FW`, `PLAYWRIGHT`, `CHROMIUM`, `PORT`).
+- Browser checks (opt-in, temp hub, fake `claude`; env `FW`, `PLAYWRIGHT`, `CHROMIUM`, `PORT`): `node crates/flywheel-hub/e2e/layout.mjs [OUT_DIR]` (layouts, drawers, toasts, tap targets at 1440x900 and 390x844); `e2e/network.mjs [--baseline] [--full]` (390x844 via a 400/150 kbps, 300 ms proxy, a drop, a silent link).
 
 Keys: [hub-reference](reference.md#keyboard-shortcuts).
 
 ## Web UI
 
 - Sidebar: machines > workspaces (rollup chip) > sessions (status dot, `↑ahead ↓behind ~changed ?untracked`); companions under their agent; blocked rows show the question. Folder chips: filled = git, hollow = plain, struck = missing.
-- Title and favicon count blocked and done. Updates come over the events socket (polling only while it is down). `#session=<id>` survives reloads; a dropped socket keeps the screen and reconnects (retries every 2 s or sooner for 30 s, then backoff to 10 s; at once on `online`) with only what it missed.
-- Keystrokes typed while a pane's link is down wait (`N queued`) and go in order once it is back; dropped, and said, only if the session changed underneath (relaunched). Never echoed locally: input unacknowledged for 500 ms shows `sending…`.
-- Assets are gzipped; scripts and styles are addressed by build (`?v=`) and cached for good, so a reload fetches only the page.
-- Drawers (Commands, Flywheel, Review, Queue) share one width (`--drawer-w`) at the stage's right edge, over the terminal; on phones each is a full-screen sheet. Toasts never cover a dialog or drawer: a dialog ends above the stack, a drawer lifts its content above it.
+- Title and favicon count blocked and done. Updates: the events socket (polling while down). `#session=<id>` survives reloads; a dropped or silent (no pong 6 s after a ping) socket keeps the screen and reconnects (2 s for 30 s, then up to 10 s) with what it missed.
+- Keys typed while down wait (`N queued`), sent in order once back; dropped, and said, if the session changed (epoch). No local echo; unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
+- Drawers (Commands, Flywheel, Review, Queue): one width (`--drawer-w`) at the stage's right edge, over the terminal; phone: full-screen sheets. Toasts never cover a dialog or drawer.
 - Ended sessions offer Relaunch and Close; one removed elsewhere leaves its pane with a toast.
 - New workspace: folder paths (checked live) or **Import VS Code workspace**. New session: kind, folder (default: the attached one's), optional worktree with a live preview. First run: import offers and a 30-second tour (palette "Shortcut tour").
 - Themes: auto, dark, light (lifts low-contrast TUI colours to 4.5:1).
@@ -133,8 +132,7 @@ Tested at 390x844 and 430x932.
 - **Quick answers**: a blocked dialog's options as buttons (lists send the digit, `(y/n)` the letter + Enter). **Compose**: multi-line text sent as one bracketed paste + Enter; per-device history, per-session drafts (sign-out clears both).
 - Touch: swipe scrolls, long-press selects, pinch sizes text.
 - **Alerts** (per device): a notification when an agent becomes blocked or done while the page is hidden or idle 5 min (https or localhost; iOS only from the Home Screen).
-- **Lite mode** (Settings > Terminal, the header's signal pill; per device; `auto`: when the browser says the connection is slow or round trips reach 300 ms or transfers fall under 64 KB/s): terminals update at most 4 times a second (screen diffs, deflated), hidden panes not at all; usage rollups, flywheel summaries, and suggested commands wait (60 s), session lists re-read at most every 3 s.
-- Network check (opt-in): `node crates/flywheel-hub/e2e/network.mjs [--baseline] [--full]`: 390x844 behind a shaping proxy (400/150 kbps, 300 ms RTT, a 10 s drop) on a temp hub; asserts load, attach, bytes per minute, echo, reconnect, and queued input.
+- **Lite mode** (Settings > Terminal, header `lite` pill; per device; `auto`: browser says slow, transfers under 64 KB/s, or 3+ round trips at 300 ms+ without a fast transfer): terminals at most 4 updates/s, hidden panes none; usage, flywheel, suggested commands wait (60 s); re-lists at most every 3 s.
 - **Install**: PWA; the service worker never touches `/api` or sockets and serves the cached page only when the hub is unreachable. iOS Home Screen apps sign in themselves (`fw hub url --qr`).
 
 ## Search

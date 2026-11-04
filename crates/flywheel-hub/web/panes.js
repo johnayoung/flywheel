@@ -11,7 +11,8 @@
 // when it has it already) -- unless the session changed underneath (the
 // hub no longer has that output: relaunched, another hub), which the
 // banner then says. Typed text is never echoed locally (the program owns
-// the screen): input unacknowledged for SENDING_MS shows "sending".
+// the screen): input unacknowledged for SENDING_MS shows "sending". A
+// link that went silent without closing is found by a ping/pong watchdog.
 // Binary messages may come deflated (z=1, one DecompressionStream per
 // socket); messages are then handled strictly in order. Lite mode
 // (netlink.js) asks for paced updates, and none while the pane is hidden.
@@ -35,6 +36,14 @@ window.FwHubPanes = function (ctx) {
   // RETRY_FAST_FOR of a drop (a cellular blip), then to 10 s.
   const RETRY_FAST_MS = 2000;
   const RETRY_FAST_FOR = 30000;
+  // A link can die without closing (a cellular handover, a NAT rebind):
+  // the hub is asked for a pong when input waits UNACKED_PING_MS for its
+  // ack or nothing came for QUIET_PING_MS; nothing at all for PONG_WAIT_MS
+  // after that and the link is treated as lost (reconnected; what was not
+  // acknowledged goes again).
+  const UNACKED_PING_MS = 2000;
+  const QUIET_PING_MS = 20000;
+  const PONG_WAIT_MS = 6000;
 
   // Deflated binary messages: whether this browser inflates raw deflate.
   const canInflate = (() => {
@@ -556,8 +565,42 @@ window.FwHubPanes = function (ctx) {
       pane.paused = false;
       const term = pane.term;
       let openedAt = 0;
+      // Liveness (see PONG_WAIT_MS): when anything last came, and when a
+      // ping went unanswered so far.
+      let heardAt = 0;
+      let pingAt = 0;
+      const watchdog = setInterval(() => {
+        if (pane.socket !== socket) {
+          clearInterval(watchdog);
+          return;
+        }
+        if (!pane.ready || !pane.v2) return;
+        const now = performance.now();
+        if (pingAt) {
+          if (now - pingAt >= PONG_WAIT_MS && now - heardAt >= PONG_WAIT_MS) {
+            clearInterval(watchdog);
+            console.warn("fw hub: no answer from the hub; reconnecting");
+            socket.onclose = null;
+            socket.onmessage = null;
+            try {
+              socket.close(4000);
+            } catch (_) {
+              // Closing a dead socket may throw nothing or anything.
+            }
+            // Not a close code (4003 is the hub's "peer revoked"): this side's verdict.
+            closed({ code: "silent", reason: "no answer" });
+          }
+          return;
+        }
+        const waiting = pane.inflight.length > 0 && now - pane.inflight[0].at >= UNACKED_PING_MS;
+        if (waiting || now - heardAt >= QUIET_PING_MS) {
+          pingAt = now;
+          pane.send(JSON.stringify({ type: "ping" }));
+        }
+      }, 500);
       socket.onopen = () => {
         openedAt = performance.now();
+        heardAt = openedAt;
         pane.retry = 0;
         setLink("attached");
         pane.sendTheme();
@@ -637,6 +680,9 @@ window.FwHubPanes = function (ctx) {
         if (message.type === "snapshot") {
           const v2 = typeof message.seq === "number";
           const wasReady = pane.ready;
+          // The stream this pane last had (kept across a drop even when
+          // its offset was not: a snapshot cut short).
+          const before = pane.epoch;
           term.reset();
           pane.v2 = v2;
           pane.seq = v2 ? message.seq : null;
@@ -653,8 +699,9 @@ window.FwHubPanes = function (ctx) {
           if (!(owed > 0)) replayed();
           // (A snapshot mid-socket: a v1 hub's catch-up after `reset`.)
           if (!wasReady) {
+            const changed = v2 && (message.continued === false || (before && message.epoch !== before));
             settle(
-              v2 && message.continued === false
+              changed
                 ? "the session changed while the link was down (relaunched, or another hub)"
                 : !v2 && pane.attachedOnce
                   ? "this hub cannot tell whether the session changed meanwhile"
@@ -673,6 +720,8 @@ window.FwHubPanes = function (ctx) {
           follow(message.cols, message.rows);
           owed = message.bytes;
           owedDone = () => scheduleClip(true);
+        } else if (message.type === "pong") {
+          // Liveness only (heardAt).
         } else if (message.type === "ack") {
           acked(message.id);
         } else if (message.type === "size") {
@@ -692,6 +741,8 @@ window.FwHubPanes = function (ctx) {
       // text one after it would otherwise run.
       let chain = Promise.resolve();
       socket.onmessage = (event) => {
+        heardAt = performance.now();
+        pingAt = 0;
         const data = event.data;
         chain = chain
           .then(() => (pane.socket !== socket ? null : typeof data === "string" ? onText(data) : onBinary(data)))
@@ -704,7 +755,8 @@ window.FwHubPanes = function (ctx) {
             socket.close(4000);
           });
       };
-      socket.onclose = (event) => {
+      const closed = (event) => {
+        clearInterval(watchdog);
         if (pane.socket !== socket) return;
         pane.socket = null;
         pane.ready = false;
@@ -756,6 +808,7 @@ window.FwHubPanes = function (ctx) {
         }
         scheduleReconnect(id, event.code);
       };
+      socket.onclose = closed;
     }
 
     function onExit(id, message) {
@@ -788,7 +841,9 @@ window.FwHubPanes = function (ctx) {
           ? "The hub is unreachable."
           : machine && (code === 1011 || (machine.link !== "online" && machine.link !== "connecting"))
             ? `Machine ${machine.name} is ${machine.link === "refused" ? "refusing this hub" : "unreachable"}; this is its last screen.`
-            : `Link lost (code ${code}); the session keeps running on the hub.`;
+            : code === "silent"
+              ? "The link stopped answering; the session keeps running on the hub."
+              : `Link lost (code ${code}); the session keeps running on the hub.`;
         const queued = pane.queue.length;
         const waiting = queued
           ? ` ${queued} keystroke${queued === 1 ? "" : "s"} queued: sent once the link is back.`

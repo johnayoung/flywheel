@@ -30,7 +30,9 @@ use crate::vt::{
     Emulator, FrameCursor, SNAPSHOT_HISTORY_BYTES, ScreenText, TextSource, ViewerColors,
 };
 
+mod inputs;
 mod recent;
+use inputs::InputsSeen;
 use recent::Recent;
 pub use recent::{RECENT_BYTES, RecentItem, output_len};
 
@@ -351,11 +353,8 @@ pub struct PtySession {
     pidfd: Mutex<Option<std::os::fd::OwnedFd>>,
     /// The last input id taken from each viewer key (see
     /// [`PtySession::take_input`]).
-    inputs_seen: Mutex<std::collections::HashMap<String, u64>>,
+    inputs_seen: Mutex<InputsSeen>,
 }
-
-/// Viewer keys whose last input id a session remembers.
-const INPUT_KEYS: usize = 64;
 
 impl std::fmt::Debug for PtySession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -692,14 +691,20 @@ impl PtySession {
     }
 
     /// [`PtySession::update`], subscribing to live events right after it
-    /// (a viewer switching to the raw stream continues there exactly).
+    /// (a viewer switching to the raw stream continues there exactly), and
+    /// the exit when it came before (the new receiver will not hear it:
+    /// what the viewer's old receiver still held is gone with it).
     pub fn update_and_subscribe(
         &self,
         view: &mut View,
         raw_max: usize,
-    ) -> (Update, broadcast::Receiver<SessionEvent>) {
-        let (update, events) = self.update_inner(view, raw_max, true);
-        (update, events.unwrap_or_else(|| self.events.subscribe()))
+    ) -> (Update, broadcast::Receiver<SessionEvent>, Option<ExitInfo>) {
+        let (update, events, exit) = self.update_inner(view, raw_max, true);
+        (
+            update,
+            events.unwrap_or_else(|| self.events.subscribe()),
+            exit,
+        )
     }
 
     fn update_inner(
@@ -707,10 +712,17 @@ impl PtySession {
         view: &mut View,
         raw_max: usize,
         subscribe: bool,
-    ) -> (Update, Option<broadcast::Receiver<SessionEvent>>) {
+    ) -> (
+        Update,
+        Option<broadcast::Receiver<SessionEvent>>,
+        Option<ExitInfo>,
+    ) {
         let mut shared = self.lock();
         let end = shared.output_bytes;
+        // Under the lock the exit is recorded and broadcast under: it is
+        // either in `exit` here or still to come on `events`.
         let events = subscribe.then(|| self.events.subscribe());
+        let exit = shared.exit.clone();
         let raw = shared
             .recent
             .since(view.seq, end)
@@ -731,7 +743,7 @@ impl PtySession {
                 None => Update::Current,
             },
         };
-        (update, events)
+        (update, events, exit)
     }
 
     /// Queue `bytes` for the child's stdin, refusing (and discarding) input
@@ -780,25 +792,10 @@ impl PtySession {
     /// dropped sends again what was not acknowledged, in order, and what
     /// got here already must not be typed twice. Ids only grow per key.
     pub fn take_input(&self, key: &str, id: u64) -> bool {
-        let mut seen = self
-            .inputs_seen
+        self.inputs_seen
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(last) = seen.get_mut(key) {
-            if id <= *last {
-                return false;
-            }
-            *last = id;
-            return true;
-        }
-        if seen.len() >= INPUT_KEYS {
-            // The quietest is as good as any: a key is one browser pane.
-            if let Some(oldest) = seen.keys().next().cloned() {
-                seen.remove(&oldest);
-            }
-        }
-        seen.insert(key.to_owned(), id);
-        true
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(key, id)
     }
 
     /// Input bytes queued but not yet written to the PTY.

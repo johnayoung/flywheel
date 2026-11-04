@@ -166,6 +166,8 @@ struct Viewer {
     resumed: bool,
     continued: Option<bool>,
     acks: u64,
+    exits: usize,
+    pongs: usize,
     /// Binary bytes on the wire.
     wire: usize,
 }
@@ -185,6 +187,8 @@ impl Viewer {
             resumed: false,
             continued: None,
             acks: 0,
+            exits: 0,
+            pongs: 0,
             wire: 0,
         }
     }
@@ -258,7 +262,9 @@ impl Viewer {
                         assert_eq!(n, self.acks + 1, "every input acknowledged, in order");
                         self.acks = n;
                     }
-                    "exit" | "error" => {}
+                    "exit" => self.exits += 1,
+                    "pong" => self.pongs += 1,
+                    "error" => {}
                     other => panic!("unexpected {other}"),
                 }
                 Some(true)
@@ -323,6 +329,13 @@ impl Viewer {
 /// Lines a `sh` loop prints `n` of, numbered (`tag-<i>`).
 fn burst(tag: &str, n: usize) -> String {
     format!("i=0; while [ $i -lt {n} ]; do echo \"{tag}-$i\"; i=$((i+1)); done")
+}
+
+/// `n` numbered lines (`tag-<i>`) as fast as the PTY takes them (a
+/// shell loop is slow enough under a loaded test run that a viewer not
+/// reading may never fall behind).
+fn fast_burst(tag: &str, n: usize) -> String {
+    format!("seq -f '{tag}-%g' 0 {}", n - 1)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -547,7 +560,7 @@ async fn a_raw_viewer_that_fell_behind_catches_up_by_one_update_then_streams() {
     let id = hub
         .session(&format!(
             "read go; {}; echo caught-up-end; exec cat",
-            burst("flood", 200_000)
+            fast_burst("flood", 400_000)
         ))
         .await;
     let mut viewer = Viewer::new(hub.connect(&id, "proto=2").await, false);
@@ -565,6 +578,105 @@ async fn a_raw_viewer_that_fell_behind_catches_up_by_one_update_then_streams() {
     viewer.until("after").await;
     assert_eq!(viewer.frames, frames, "raw again");
     viewer.close().await;
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_raw_viewer_that_fell_behind_still_hears_the_exit() {
+    let hub = TestHub::start().await;
+    let id = hub
+        .session(&format!(
+            "read go; {}; echo the-end; exit 3",
+            fast_burst("flood", 400_000)
+        ))
+        .await;
+    let mut viewer = Viewer::new(hub.connect(&id, "proto=2").await, false);
+    viewer.settle(Duration::from_millis(300)).await;
+    hub.input(&id, "go\r").await;
+    // Not reading while the flood and the exit queue up behind it.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    viewer.until("the-end").await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while viewer.exits == 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !left.is_zero(),
+            "never heard the exit (frames {})",
+            viewer.frames
+        );
+        assert!(viewer.step(left).await.is_some(), "never heard the exit");
+    }
+    assert!(viewer.frames >= 1, "it caught up by a frame");
+    viewer.settle(Duration::from_millis(500)).await;
+    assert_eq!(viewer.exits, 1, "the exit, once");
+    viewer.close().await;
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaving_lite_as_the_session_ends_says_the_exit_once() {
+    let hub = TestHub::start().await;
+    for round in 0..4 {
+        let id = hub.session("read go; echo bye; exit 4").await;
+        let mut viewer = Viewer::new(hub.connect(&id, "proto=2&lite=1&fps=1").await, false);
+        viewer.settle(Duration::from_millis(300)).await;
+        hub.input(&id, "go\r").await;
+        if round % 2 == 1 {
+            tokio::time::sleep(Duration::from_millis(30 * round)).await;
+        }
+        viewer.send(json!({ "type": "mode", "lite": false })).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while viewer.exits == 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(!left.is_zero(), "round {round}: never heard the exit");
+            assert!(
+                viewer.step(left).await.is_some(),
+                "round {round}: never heard the exit"
+            );
+        }
+        viewer.settle(Duration::from_millis(400)).await;
+        assert_eq!(viewer.exits, 1, "round {round}: the exit, once");
+        assert!(viewer.visible().iter().any(|l| l.contains("bye")));
+        viewer.close().await;
+    }
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ping_is_answered_on_protocol_2_only() {
+    let hub = TestHub::start().await;
+    let id = hub.session("exec cat").await;
+    let mut viewer = Viewer::new(hub.connect(&id, "proto=2&lite=1&fps=2").await, false);
+    viewer.settle(Duration::from_millis(300)).await;
+    // Paused and quiet: the pong still comes (the link is alive).
+    viewer
+        .send(json!({ "type": "mode", "lite": true, "fps": 2, "paused": true }))
+        .await;
+    for _ in 0..3 {
+        viewer.send(json!({ "type": "ping" })).await;
+    }
+    viewer.settle(Duration::from_millis(300)).await;
+    assert_eq!(viewer.pongs, 3);
+    viewer.close().await;
+    let mut old = hub.connect(&id, "").await;
+    old.send(Message::Text(json!({ "type": "ping" }).to_string().into()))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let Ok(Some(Ok(message))) = timeout(left, old.next()).await else {
+            panic!("no answer to a protocol-1 ping");
+        };
+        if let Message::Text(text) = message {
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if value["type"] == "error" {
+                assert!(value["message"].as_str().unwrap().contains("proto=2"));
+                break;
+            }
+            assert_ne!(value["type"], "pong");
+        }
+    }
     hub.shutdown().await;
 }
 

@@ -9,6 +9,10 @@ use std::collections::VecDeque;
 /// Output bytes kept per session for resuming.
 pub const RECENT_BYTES: usize = 512 * 1024;
 
+/// What a kept resize counts toward [`RECENT_BYTES`]: a client resizing
+/// over and over between little output must not grow the ring unbounded.
+const RESIZE_COST: usize = 64;
+
 /// One thing a viewer was sent, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecentItem {
@@ -21,6 +25,7 @@ pub enum RecentItem {
 #[derive(Debug)]
 pub(crate) struct Recent {
     items: VecDeque<(u64, RecentItem)>,
+    /// Output bytes kept plus [`RESIZE_COST`] per resize.
     bytes: usize,
     /// The earliest offset a replay can start from.
     start: u64,
@@ -37,19 +42,24 @@ impl Recent {
     }
 
     pub(crate) fn push(&mut self, seq: u64, item: RecentItem) {
-        if let RecentItem::Output(bytes) = &item {
-            self.bytes += bytes.len();
+        // Resizes with no output between: only the last one matters to a
+        // viewer at any offset there.
+        if let RecentItem::Resize { .. } = item
+            && let Some((at, last @ RecentItem::Resize { .. })) = self.items.back_mut()
+            && *at == seq
+        {
+            *last = item;
+            return;
         }
+        self.bytes += cost(&item);
         self.items.push_back((seq, item));
         while self.bytes > RECENT_BYTES {
             let Some((at, dropped)) = self.items.pop_front() else {
                 break;
             };
+            self.bytes -= cost(&dropped);
             let end = match &dropped {
-                RecentItem::Output(bytes) => {
-                    self.bytes -= bytes.len();
-                    at + bytes.len() as u64
-                }
+                RecentItem::Output(bytes) => at + bytes.len() as u64,
                 // A viewer at `at` may not have had this resize yet.
                 RecentItem::Resize { .. } => at + 1,
             };
@@ -83,6 +93,13 @@ impl Recent {
             }
         }
         Some(out)
+    }
+}
+
+fn cost(item: &RecentItem) -> usize {
+    match item {
+        RecentItem::Output(bytes) => bytes.len(),
+        RecentItem::Resize { .. } => RESIZE_COST,
     }
 }
 
@@ -143,10 +160,14 @@ mod tests {
             recent.push(seq, out(&chunk));
             seq += chunk.len() as u64;
         }
-        recent.push(seq, RecentItem::Resize { cols: 10, rows: 5 });
-        assert!(recent.since(0, seq).is_none());
         let kept = recent.since(seq - 4 * chunk.len() as u64, seq).unwrap();
         assert_eq!(output_len(&kept), 4 * chunk.len());
+        // A resize counts too: the budget was full, the oldest chunk goes.
+        recent.push(seq, RecentItem::Resize { cols: 10, rows: 5 });
+        assert!(recent.since(0, seq).is_none());
+        assert!(recent.since(seq - 4 * chunk.len() as u64, seq).is_none());
+        let kept = recent.since(seq - 3 * chunk.len() as u64, seq).unwrap();
+        assert_eq!(output_len(&kept), 3 * chunk.len());
         assert!(recent.bytes <= RECENT_BYTES);
         // A resize falling off the front: a viewer at its offset cannot
         // resume (it may not have had it).
@@ -155,5 +176,41 @@ mod tests {
         recent.push(0, out(&"y".repeat(RECENT_BYTES)));
         recent.push(RECENT_BYTES as u64, out("z"));
         assert!(recent.since(0, RECENT_BYTES as u64 + 1).is_none());
+    }
+
+    #[test]
+    fn resizes_are_bounded_too() {
+        // Resizes back to back (no output between) collapse to the last.
+        let mut recent = Recent::new(0);
+        recent.push(0, out("ab"));
+        for n in 0..10_000u16 {
+            recent.push(
+                2,
+                RecentItem::Resize {
+                    cols: 80 + n % 2,
+                    rows: 24,
+                },
+            );
+        }
+        assert_eq!(recent.items.len(), 2);
+        assert_eq!(joined(&recent.since(0, 2).unwrap()), "ab[81x24]");
+        // Resizes between bytes of output count toward the budget.
+        let mut recent = Recent::new(0);
+        let mut seq = 0;
+        for n in 0..100_000u64 {
+            recent.push(
+                seq,
+                RecentItem::Resize {
+                    cols: 80 + (n % 2) as u16,
+                    rows: 24,
+                },
+            );
+            recent.push(seq, out("x"));
+            seq += 1;
+        }
+        assert!(recent.bytes <= RECENT_BYTES);
+        assert!(recent.items.len() <= RECENT_BYTES / RESIZE_COST * 2);
+        let kept = recent.since(seq - 10, seq).expect("the recent end is kept");
+        assert_eq!(output_len(&kept), 10);
     }
 }

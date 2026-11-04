@@ -7,8 +7,11 @@
 // kbps down, 150 kbps up, 300 ms RTT, one link shared by every connection,
 // with backpressure, and drops on demand -- and attaches to a chatty fake
 // agent and an idle one. Measured: time to first screen, bytes per minute
-// idle and busy, input echo latency, and a 10 s drop (keystrokes typed
-// during it must arrive, in order, once the link is back). The proxy, not
+// idle (steady state, after deferred fetches ran) and busy, input echo
+// latency, a 10 s drop (keystrokes typed during it must arrive, in order,
+// once the link is back), and a link that goes silent without closing (a
+// cellular handover: found by the pane's watchdog, reconnected, the keys
+// typed into it arriving once). The proxy, not
 // DevTools throttling: Chromium's Network.emulateNetworkConditions applies
 // latency but neither throughput nor offline to WebSockets (checked in
 // Chromium 127 and 156), and the hub must feel the slow reader too.
@@ -48,9 +51,12 @@ const LIMITS = {
   reload_first_screen_ms: 6000,
   first_screen_ms: 1500,
   busy_bytes_per_min: 30 * 1024,
-  idle_bytes_per_min: 16 * 1024,
+  // Steady idle (deferred fetches flushed first): 32 B/min measured.
+  idle_bytes_per_min: 2 * 1024,
   echo_ms: 900,
   reconnect_ms: 3500,
+  // Silent link: ~2 s for an ack, 6 s for any answer, then reconnect.
+  stall_recover_ms: 12000,
 };
 
 const failures = [];
@@ -89,6 +95,8 @@ function shapingProxy(target) {
   function pipe(from, to, dir, bps, conn) {
     let inFlight = 0;
     from.on("data", (chunk) => {
+      // Black-holed (`stall()`): open, but nothing gets through.
+      if (conn.dead) return;
       counted[dir] += chunk.length;
       if (dir === "up" && /^(GET|POST|PUT|DELETE) /.test(chunk.toString("latin1", 0, 8))) {
         const line = chunk.toString("latin1").split("\r\n")[0];
@@ -118,11 +126,13 @@ function shapingProxy(target) {
       return;
     }
     const upstream = net.connect(target, "127.0.0.1");
-    const pair = { client, upstream };
+    const conn = { path: "?", dead: false };
+    const pair = { client, upstream, conn };
     live.add(pair);
     // One side closed: the other closes once what is in flight to it
-    // was delivered.
+    // was delivered (a black-holed one never hears of it).
     const closing = (other, dir) => () => {
+      if (conn.dead) return;
       setTimeout(() => {
         live.delete(pair);
         other.destroy();
@@ -130,7 +140,6 @@ function shapingProxy(target) {
     };
     client.on("error", () => {}).on("close", closing(upstream, "up"));
     upstream.on("error", () => {}).on("close", closing(client, "down"));
-    const conn = { path: "?" };
     pipe(upstream, client, "down", LINK.downBps, conn);
     pipe(client, upstream, "up", LINK.upBps, conn);
   });
@@ -157,7 +166,18 @@ function shapingProxy(target) {
     restore() {
       refusing = false;
     },
-    close: () => new Promise((resolve) => server.close(resolve)),
+    // Every connection open now goes silent without closing (no FIN, no
+    // RST: a handover or NAT rebind); new ones work.
+    stall() {
+      for (const pair of live) pair.conn.dead = true;
+    },
+    close: () => new Promise((resolve) => {
+      for (const { client, upstream } of live) {
+        client.destroy();
+        upstream.destroy();
+      }
+      server.close(resolve);
+    }),
   };
 }
 
@@ -299,6 +319,10 @@ try {
   await page.evaluate((id) => showSolo(id), idle.id);
   await page.waitForFunction(() => state.solo && state.solo.link.kind === "attached" && state.solo.drawn, null, { timeout: 60000 });
   await page.waitForTimeout(5000);
+  // Steady state: what lite deferred (usage, flywheel, commands) runs on
+  // its own tick once; that one-off is not the idle cost.
+  await page.waitForFunction(() => net.pending() === 0, null, { timeout: 90000, polling: 500 });
+  await page.waitForTimeout(3000);
   b0 = total();
   p0 = link.paths();
   await page.waitForTimeout(30000);
@@ -368,8 +392,25 @@ try {
   metrics.reconnect_bytes = total() - b0;
   metrics.reconnect_paths = link.paths(p0);
 
-  // 6. The session changes underneath during a drop (it ended and was
-  // relaunched): what was typed meanwhile is not sent, and it says so.
+  // 6. The link goes silent without closing: the pane must notice (it
+  // would otherwise say "attached" forever), reconnect, and deliver the
+  // line typed into the dead link once.
+  metrics.lite_pill = await page.evaluate(() => document.querySelector("#lite-toggle").getAttribute("aria-label"));
+  await page.waitForTimeout(1000);
+  t0 = Date.now();
+  link.stall();
+  await page.keyboard.type("bh7");
+  await page.keyboard.press("Enter");
+  metrics.stall_recovered = await typedBack(/you said: bh7/);
+  metrics.stall_recover_ms = Date.now() - t0;
+  await page.waitForTimeout(1500);
+  metrics.stall_input_once = (await screenText()).split("you said: bh7").length === 2;
+
+  // 7. The session changes underneath during a drop (it ended and was
+  // relaunched): what was typed meanwhile is not sent, and it says so --
+  // also when the pane lost its offset (a frame cut short by the drop),
+  // so the hub cannot say `continued: false` and the stream id tells.
+  await page.evaluate(() => { state.solo.seq = null; });
   link.cut();
   await page.waitForTimeout(1000);
   await page.keyboard.type("lost1");
@@ -414,6 +455,8 @@ if (!baseline) {
   check(metrics.echo_ms <= LIMITS.echo_ms, `echo latency ${metrics.echo_ms} ms (<= ${LIMITS.echo_ms})`);
   check(metrics.reconnect_ms <= LIMITS.reconnect_ms, `reconnect after a 10 s drop in ${metrics.reconnect_ms} ms (<= ${LIMITS.reconnect_ms})`);
   if (!process.argv.includes("--full")) check(metrics.lite === true, "lite mode turned itself on (auto) over the slow link");
+  check(metrics.stall_recovered === true && metrics.stall_input_once === true && metrics.stall_recover_ms <= LIMITS.stall_recover_ms, `a link gone silent is found and reconnected, the key typed into it arriving once, in ${metrics.stall_recover_ms} ms (<= ${LIMITS.stall_recover_ms})`);
+  if (!process.argv.includes("--full")) check(/^Lite mode on/.test(metrics.lite_pill || ""), `the lite pill says what it is (${metrics.lite_pill})`);
   check(/queued/.test(metrics.drop_badge) && /queued/.test(metrics.drop_banner), `the drop shows the keys queued (${metrics.drop_badge} / ${metrics.drop_banner})`);
   check(metrics.drop_input_kept === true && metrics.drop_input_once === true, "keystrokes typed during the drop arrive once the link is back, in order, once");
   check(metrics.changed_input_dropped === true && /not sent/.test(metrics.changed_banner), `a session changed underneath drops what was typed and says so (${metrics.changed_banner})`);

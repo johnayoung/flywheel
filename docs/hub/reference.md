@@ -158,7 +158,7 @@ Taken by `serve`, `start`, `install-service`. All but `--notify-url` are also `h
 
 ## hub.toml
 
-`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors; `serve` refuses an invalid file (exit 2). Edits are re-read within 1 s: live keys apply, the rest wait for a restart; an invalid edit keeps the last good settings (reported in log, toast, `config check`).
+`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors; `serve` refuses an invalid file (exit 2). Edits are re-read within 1 s: live keys apply, the rest at restart; an invalid edit keeps the last good settings (log, toast, `config check`).
 
 ```toml
 [server]                          # restart to apply
@@ -290,7 +290,7 @@ command = ["./summarize.py"]       # optional: else the top-level one
 | Plugins | per plugin: enable, events, actions, last run / error, logs |
 | Server | read-only: effective hub.toml, sources, errors, pending restart |
 
-**Key bindings**: up to 4 per action, `mod+...+key` (`mod` = Ctrl, Cmd on macOS). Refused (422): keys the browser or OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: keys shells lose (`alt+b/f`, `ctrl+<letter>`) or desktops take (`ctrl+alt+t`).
+**Key bindings**: up to 4 per action, `mod+...+key` (`mod` = Ctrl, Cmd on macOS). Refused (422): keys the browser/OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: keys shells lose (`alt+b/f`, `ctrl+<letter>`) or desktops take.
 
 ## Keyboard shortcuts
 

@@ -158,7 +158,7 @@ fw hub activity --since last-seen       # since this CLI last looked (marks now)
 fw hub activity --since 2h --workspace api --kind review --json
 ```
 
-- **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished` (seen or not), `commands.suggested`, `usage` (a turn's tokens, cost), `plugin.ran`, `hub.stopped` (not an exit per session). A row opens its object: the transcript at the reply, Commands at the block, Review, the fan-out board, the queue, the replay; else it attaches.
+- **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage` (tokens, cost), `plugin.ran`, `hub.stopped`. A row opens its object (transcript, Commands, Review, fan-out board, queue, replay), else attaches.
 - **Kept** in `activity.jsonl`: rotated at 1 MiB or a week (`activity.1..5.jsonl`), 30 days (6 MiB at most); survives restarts and `upgrade`. Only kind, ids, names, short facts (status, branch, counts, cost): never terminal output, prompts, command text, grader output, paths; token-shaped words are `[redacted]`.
 - **While you were away**: a browser (per-device id) back after 10 min or more gets one dismissible card: turns finished, blocked now, fan-outs graded (winner), commands suggested, cost.
 - **Machines**: asked at once (4 s each), merged and machine-labelled; one not answering is named and the answer is `partial`.

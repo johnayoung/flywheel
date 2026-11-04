@@ -9,7 +9,9 @@
 // per device; auto turns lite on when the browser says the connection is
 // slow (Network Information API, where there is one) or what this page
 // measures is: round trips (input acknowledged, a socket's first answer)
-// and transfer rates (snapshots, the page itself), with hysteresis.
+// and transfer rates (snapshots, the page itself), with hysteresis. One
+// stall is not a slow link: acks arriving together count once, round
+// trips alone need MIN_RTT_SAMPLES, and a fast transfer rate outvotes them.
 "use strict";
 
 window.FwHubNet = function (ctx) {
@@ -24,6 +26,10 @@ window.FwHubNet = function (ctx) {
   const SLOW_BPS = 64 * 1024;
   const FAST_BPS = 256 * 1024;
   const SAMPLES = 7;
+  const MIN_RTT_SAMPLES = 3;
+  // Round trips ending within this of the one before are one sample
+  // (what a stall acknowledges at once when it ends).
+  const BURST_MS = 100;
   // Deferred fetches run at most this often while lite.
   const DEFERRED_MS = 60000;
   // While lite, session lists are re-read at most this often.
@@ -74,8 +80,12 @@ window.FwHubNet = function (ctx) {
   function remeasure() {
     const rtt = median(rtts);
     if (rate !== null && Date.now() - rateAt > RATE_FOR_MS) rate = null;
-    const slowNow = (rtt !== null && rtts.length >= 2 && rtt >= SLOW_RTT_MS) || (rate !== null && rate < SLOW_BPS);
-    const fastNow = rtt !== null && rtts.length >= 3 && rtt < FAST_RTT_MS && (rate === null || rate > FAST_BPS);
+    const rateSlow = rate !== null && rate < SLOW_BPS;
+    const rateFast = rate !== null && rate > FAST_BPS;
+    const rttSlow = rtt !== null && rtts.length >= MIN_RTT_SAMPLES && rtt >= SLOW_RTT_MS;
+    const rttFast = rtt !== null && rtts.length >= MIN_RTT_SAMPLES && rtt < FAST_RTT_MS;
+    const slowNow = rateSlow || (rttSlow && !rateFast);
+    const fastNow = (rttFast && !rateSlow) || (rateFast && (rtt === null || rtt < SLOW_RTT_MS));
     if (!measuredSlow && slowNow) measuredSlow = true;
     else if (measuredSlow && fastNow && !connectionSlow()) measuredSlow = false;
     if (slowNow || fastNow) remember();
@@ -151,8 +161,13 @@ window.FwHubNet = function (ctx) {
     }, wait);
   }
 
+  let rttAt = -Infinity;
   function noteRtt(ms) {
     if (!(ms >= 0) || ms > 60000) return;
+    const now = performance.now();
+    const burst = now - rttAt < BURST_MS;
+    rttAt = now;
+    if (burst) return;
     rtts.push(ms);
     while (rtts.length > SAMPLES) rtts.shift();
     remeasure();
@@ -218,6 +233,10 @@ window.FwHubNet = function (ctx) {
     relist,
     noteRtt,
     noteTransfer,
+    // Fetches waiting for lite to end (or the next DEFERRED_MS tick).
+    pending: () => deferred.size,
+    // Whether auto would pick lite (what was measured, or the browser says).
+    slowLink: autoSlow,
     onChange: (fn) => listeners.add(fn),
   };
 };

@@ -81,6 +81,11 @@ function syncLite() {
   pill.hidden = !(on || phone());
   pill.setAttribute("aria-pressed", String(on));
   pill.classList.toggle("on", on);
+  // The glyph says what was measured (two bars: a slow link), the word
+  // and the pressed state whether lite is on.
+  const use = pill.querySelector("use");
+  if (use) use.setAttribute("href", net.slowLink() ? "#i-signal-low" : "#i-signal");
+  pill.setAttribute("aria-label", `Lite mode ${on ? "on" : "off"}${net.slowLink() ? " (slow link)" : ""}`);
   pill.title = `${net.describe()}. Tap to turn it ${on ? "off" : "on"} on this device (Settings > Terminal: auto).`;
 }
 net.onChange(syncLite);

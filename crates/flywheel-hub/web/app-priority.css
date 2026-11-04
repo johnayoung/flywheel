@@ -78,3 +78,6 @@ button#meter-usage { max-width: 16rem; text-align: left; }
    flip-back pill carries the agent's status dot. */
 .pane-chip.parent { border-color: var(--signal); border-style: dashed; color: var(--ink); }
 .flip-pill .flip-dot { flex: none; width: .5rem; height: .5rem; margin-left: .35rem; }
+/* The lite pill keeps its word wherever the pills shrink to icons: a bare
+   signal glyph does not say what tapping it does. */
+.meters .lite-pill .lite-word { font-size: 9px; margin-left: .25rem; }

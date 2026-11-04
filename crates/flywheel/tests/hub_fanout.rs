@@ -320,7 +320,7 @@ fn fan_out_grades_ranks_fixes_survives_restart_and_merges_the_winner() {
         board["sent_prompt"]
             .as_str()
             .unwrap()
-            .contains("commit all of your changes")
+            .contains("commit your source changes")
     );
     assert!(
         !board["sent_prompt"]

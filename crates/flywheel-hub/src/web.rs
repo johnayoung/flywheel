@@ -140,6 +140,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ("settings.js", include_bytes!("../web/settings.js"), JS),
     ("sharing.js", include_bytes!("../web/sharing.js"), JS),
     ("perms.js", include_bytes!("../web/perms.js"), JS),
+    ("pr.js", include_bytes!("../web/pr.js"), JS),
     ("term-view.js", include_bytes!("../web/term-view.js"), JS),
     ("viewer.js", include_bytes!("../web/viewer.js"), JS),
     ("player.js", include_bytes!("../web/player.js"), JS),
@@ -220,6 +221,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "app-perms.css",
         include_bytes!("../web/app-perms.css"),
+        "text/css; charset=utf-8",
+    ),
+    (
+        "app-pr.css",
+        include_bytes!("../web/app-pr.css"),
         "text/css; charset=utf-8",
     ),
     (
@@ -757,9 +763,9 @@ mod tests {
         assert_eq!(scripts.last().unwrap(), "app.js");
         let sheets: Vec<_> = sheets.iter().filter(|p| p.starts_with("app")).collect();
         assert_eq!(sheets.first().unwrap().as_str(), "app.css");
-        // The service worker keeps at most 64 of the shell's URLs.
+        // The service worker keeps at most 96 of the shell's URLs.
         let shell = INDEX_HTML.matches("=\"/assets/").count();
-        assert!(shell <= 64, "{shell} shell assets");
+        assert!(shell <= 96, "{shell} shell assets");
     }
 
     /// The names a classic script declares at its top level (column 0):

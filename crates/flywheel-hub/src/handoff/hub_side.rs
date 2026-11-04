@@ -262,6 +262,7 @@ impl Hub {
             hub.git.nudge(badge_key(&record));
         }
         crate::git::spawn_watcher(&hub);
+        crate::pr::spawn_watcher(&hub);
         Ok(hub)
     }
 

@@ -119,7 +119,7 @@ async function keepShell(urls) {
 self.addEventListener("message", (event) => {
   const data = event.data || {};
   if (data.type === "fw-hub-shell" && Array.isArray(data.urls)) {
-    event.waitUntil(keepShell(data.urls.slice(0, 64)).catch(() => {}));
+    event.waitUntil(keepShell(data.urls.slice(0, 96)).catch(() => {}));
   } else if (data.type === "fw-hub-forget") {
     event.waitUntil((async () => {
       for (const key of await caches.keys()) {

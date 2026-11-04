@@ -376,6 +376,7 @@ pub(super) fn serve_cmd(
         _ => None,
     };
     let review_tools = crate::review::Tools::default();
+    hub.pr_watch().set_tools(review_tools.clone());
     let fanouts =
         crate::fanout::Fanouts::new(&hub, extensions.graders.clone(), review_tools.clone());
     let fanouts = match fanouts.start() {

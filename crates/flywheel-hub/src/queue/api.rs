@@ -436,3 +436,88 @@ impl Hub {
         self.queue_view(id)
     }
 }
+
+/// How [`Hub::send_or_queue`] delivered a prompt.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "delivery", rename_all = "snake_case")]
+pub enum Delivery {
+    /// Typed in now (bracketed paste, then Enter).
+    Pasted {
+        paste: crate::transcript::PasteOutcome,
+    },
+    /// Queued: the agent is busy (or prompts are queued before it); it
+    /// goes once the queue's rules let it.
+    Queued {
+        item: String,
+        /// Why it did not go now.
+        why: String,
+        pending: usize,
+    },
+}
+
+impl Hub {
+    /// Type `text` into agent session `id` now when its queue would
+    /// deliver it now (at rest, nobody typing, nothing half-typed, nothing
+    /// queued before it, no review or grading using it); else queue it
+    /// (`done`), so it goes after the agent's turn. Refused when the
+    /// agent is gone (exited, or a plain shell after a restart).
+    pub fn send_or_queue(&self, id: &str, text: &str) -> Result<Delivery, HubError> {
+        let record = self.queue_record(id)?;
+        let text = validate_text(text)?;
+        let current = self.store().queue(id).cloned().unwrap_or_default();
+        let mut alone = SessionQueue {
+            last_delivered_at: current.last_delivered_at,
+            ..SessionQueue::default()
+        };
+        alone.items.push(QueueItem {
+            id: new_id(),
+            text: text.clone(),
+            when: super::When::Done,
+            added_at: Utc::now(),
+            blocked_at: None,
+            state: ItemState::Pending,
+        });
+        let facts = self.queue_facts(&record, &alone);
+        if let Presence::Gone(why) = &facts.presence {
+            return Err(StateError::Conflict(format!("{}: {why}", record.label())).into());
+        }
+        let why = if current.pending_count() > 0 {
+            Some(format!(
+                "{} prompt{} queued before it",
+                current.pending_count(),
+                if current.pending_count() == 1 {
+                    " is"
+                } else {
+                    "s are"
+                }
+            ))
+        } else if current.paused {
+            Some("its queue is paused".to_owned())
+        } else {
+            match decide(&alone, &facts) {
+                Decision::Deliver(_) => None,
+                Decision::Wait(why) | Decision::Stall(why) => Some(why),
+                Decision::NoteBlocked { .. } => Some("blocked on a prompt".to_owned()),
+            }
+        };
+        match why {
+            None => Ok(Delivery::Pasted {
+                paste: self.paste(id, &text, true)?,
+            }),
+            Some(why) => {
+                let (item, view) = self.queue_add(
+                    id,
+                    &NewItem {
+                        text,
+                        when: Some("done".into()),
+                    },
+                )?;
+                Ok(Delivery::Queued {
+                    item: item.id,
+                    why,
+                    pending: view.pending,
+                })
+            }
+        }
+    }
+}

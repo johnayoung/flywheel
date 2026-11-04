@@ -58,7 +58,9 @@ window.FwHubReview = function (ctx) {
   // --- data --------------------------------------------------------------
 
   function badgeOf(session) {
-    return session && session.git ? JSON.stringify(session.git) : "";
+    // Its pull request's number and state too: Open PR follows it.
+    const pr = session && session.pr ? [session.pr.number, session.pr.state] : null;
+    return session && session.git ? JSON.stringify([session.git, pr]) : "";
   }
 
   async function load(quiet) {
@@ -251,7 +253,9 @@ window.FwHubReview = function (ctx) {
     renderActions(data);
     const scroll = body.scrollTop;
     const peer = ctx.handoff && (data.mergeable || data.base) ? ctx.handoff().reviewPanel(session) : null;
-    fill(body, peer, ...renderTab(data));
+    // A branch: its pull request and CI (pr.js).
+    const pr = ctx.pr && data.branch ? ctx.pr().panel(session) : null;
+    fill(body, pr, peer, ...renderTab(data));
     body.scrollTop = scroll;
   }
 
@@ -751,6 +755,15 @@ window.FwHubReview = function (ctx) {
       });
     const pushed = data.upstream && !data.upstream.ahead && !data.upstream.behind;
     const noRemote = Array.isArray(data.remotes) && !data.remotes.length;
+    // A pull request open (or merged) from this branch already: another
+    // would be a duplicate.
+    const brief = (sessionById(ui.id) || {}).pr;
+    const hasPr = !!brief && (brief.state === "open" || brief.state === "draft" || brief.state === "merged");
+    const prTitle = noRemote
+      ? "No remote to open a pull request on: add one (git remote add)"
+      : hasPr
+        ? `Pull request #${brief.number} is ${brief.state === "merged" ? "merged" : "open"} from this branch already (see Pull request above)`
+        : "gh pr create from the pushed branch";
     const list = [
       button("Commit all…", "commit", { disabled: !dirty(data) || !!data.operation, title: dirty(data) ? "Stage everything and commit it" : "Nothing to commit" }),
       button("Push…", "push", {
@@ -758,7 +771,7 @@ window.FwHubReview = function (ctx) {
         disabled: !data.branch || pushed || noRemote,
         title: noRemote ? "No remote to push to: add one (git remote add)" : pushed ? `In sync with ${data.upstream.name}` : "Push the branch (never forced)",
       }),
-      button("Open PR…", "pr", { ghost: true, disabled: !data.branch || noRemote, title: noRemote ? "No remote to open a pull request on: add one (git remote add)" : "gh pr create from the pushed branch" }),
+      button("Open PR…", "pr", { ghost: true, disabled: !data.branch || noRemote || hasPr, title: prTitle }),
     ];
     if (worktree) {
       list.push(button("Rebase onto base…", "rebase", { ghost: true, disabled: !data.behind || !!data.operation, title: data.behind ? `Replay onto ${data.base && data.base.name}` : "Already on top of the base" }));

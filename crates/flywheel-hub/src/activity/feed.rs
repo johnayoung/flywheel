@@ -705,6 +705,35 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
             };
             row.with("agent", agent).with("file", file).with("count", n)
         }
+        "pr.checks_failed" | "pr.checks_passed" | "pr.review_changes_requested" | "pr.merged" => {
+            let number = payload.pointer("/pr/number").and_then(Value::as_u64);
+            let pr = number.map_or_else(|| "a pull request".to_owned(), |n| format!("PR #{n}"));
+            let text = match event {
+                "pr.checks_failed" => {
+                    let names: Vec<&str> = payload
+                        .get("failing")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect();
+                    format!("CI failed on {pr}: {}", names.join(", "))
+                }
+                "pr.checks_passed" => {
+                    let n = payload.pointer("/checks/passing").and_then(Value::as_u64);
+                    format!("CI passed on {pr} ({} checks)", n.unwrap_or(0))
+                }
+                "pr.review_changes_requested" => format!("changes requested on {pr}"),
+                _ => match str_at(payload, "/pr/base") {
+                    Some(base) => format!("{pr} merged into {base}"),
+                    None => format!("{pr} merged"),
+                },
+            };
+            draft(text)
+                .with("number", number)
+                .with("url", str_at(payload, "/pr/url"))
+                .with("branch", branch)
+        }
         "record.started" => draft("started recording".to_owned())
             .with_id("recording", str_at(payload, "/recording/name")),
         "record.stopped" => draft("stopped recording".to_owned())

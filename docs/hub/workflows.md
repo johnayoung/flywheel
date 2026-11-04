@@ -64,6 +64,17 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 - **Merge** and fan-out **pick** refuse a branch that adds a `generated`/`secret`/`personal`/`junk` file unless `--include-suspects` (the dialog's box).
 - "Ask the agent" pastes a commit-message or conflict prompt. Runner: argv, no shell or prompts, deadlines, 4 git/gh at once, one action per repo, logged.
 
+## Pull requests and CI
+
+A session whose branch has a pull request: a badge on its row (`#7`, checks), a PR section in Review, `fw hub pr SESSION`. All through `gh`; missing or signed out: nothing is asked, the section says why.
+
+- **Asked** per (folder, branch) by head (`gh pr list --head B`; a branch named `123` never binds PR #123), pushed and not a default branch: checks running 1 min, open 5 min, merged/closed 30 min, none 5 min; at once after Push, Open PR, its own actions; Refresh (5 s apart). The timer makes 30 gh calls/min at most; GitHub's rate limit pauses asking 15 min (what was known stays, marked stale).
+- **View log**: `gh run view --job J --log-failed`, step headers, the last 400 lines, terminal escapes stripped (also from check names), secrets redacted (Activity's rules, `NAME=value`, `password:`, `--password V`, AWS keys, URL passwords).
+- **Ask agent to fix CI**: the failing checks, the log's last 150 lines under `From fw hub: CI failed on pull request #N ...`; pasted at rest, else queued (`done`) behind its queue. One ask per PR waits (a newer one replaces it); queued asks are dropped once checks stop failing or the PR closes; the same ask is not pasted twice within 5 min.
+- **Re-run failed** (`gh run rerun R --failed`), **Ready** (`gh pr ready`), **Merge** (`gh pr merge N --<method> --match-head-commit SHA`, the repo's default method if allowed): planned, confirmed by fingerprint against GitHub read again (unreadable, e.g. rate limited: refused).
+- Merge refuses closed, draft, conflicting; checks failing or running, changes requested, review required: only with the number typed back (`--force N`). Branch protection still applies.
+- **Events** `pr.checks_failed`, `pr.checks_passed` (from running or red), `pr.review_changes_requested`, `pr.merged`: plugins, Activity, browser alerts. A first look (a hub start) announces nothing.
+
 ## Handoff and peer review
 
 - **Send to agent** (`fw hub handoff FROM TO`, `handoff.send`): a selection, message, block, or diff to another agent (any workspace or machine) as one editable prompt (`From <session> on <branch>:` + a fence; 32 KiB).

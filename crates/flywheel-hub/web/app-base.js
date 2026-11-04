@@ -510,6 +510,17 @@ const launcher = window.FwHubLauncher({
   },
   confirmDialog: (options) => confirmDialog(options),
 });
+// Pull requests and CI (pr.js): the row badge and the Review drawer's PR
+// section (checks, logs, ask the agent to fix CI, re-run, ready, merge).
+const pullRequests = window.FwHubPr({
+  el, icon, api, age, sessionById,
+  toast: (...args) => commands.toast(...args),
+  confirmDialog: (options) => confirmDialog(options),
+  openSession: (id) => openSession(id),
+  openReview: (id) => review.open(id),
+  attached: () => state.attached,
+  notify: () => notify,
+});
 // Review (review.js): a session's commits, diffs, and the guarded
 // commit / push / PR / rebase / merge actions.
 const review = window.FwHubReview({
@@ -526,6 +537,8 @@ const review = window.FwHubReview({
   openFanout: (id) => fanout.open(id),
   // The peer-review panel and "Send diff to agent" (handoff.js).
   handoff: () => handoff,
+  // The PR section (pr.js).
+  pr: () => pullRequests,
 });
 // The "why?" beside the status pill (explain.js).
 const explain = window.FwHubExplain({ $, el, api, allowAlways: (id) => perms.allowFor(id) });

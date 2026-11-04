@@ -84,6 +84,12 @@ Git and agents together:
 ```bash
 fw hub review SESSION [--base REF] [--diff PATH] [--scope committed|staged|unstaged|untracked] [--json] {where}
 fw hub merge SESSION [--yes|-y] [--rebase] [--remove-worktree] [--abort-rebase] [--include-suspects] [--json] {where}
+fw hub pr SESSION [--refresh] [--json] {where}
+fw hub pr log SESSION CHECK [--json] {where}
+fw hub pr fix-ci SESSION [--check NAME] [--yes|-y] [--json] {where}
+fw hub pr rerun SESSION [--yes|-y] [--json] {where}
+fw hub pr ready SESSION [--yes|-y] [--json] {where}
+fw hub pr merge SESSION [--yes|-y] [--force NUMBER] [--json] {where}
 fw hub handoff FROM TO (--selection-file F|- | --diff [--path P] [--base REF] | --last-command | --command SEQ | --message N) [--to-machine M] [--max-bytes N] [--edit] [--dry-run] [--json] {where}
 fw hub ask-review SESSION [--kind claude|codex] [--base REF] [--model M] [--dry-run] [--findings] [--send-findings] [--json] {where}
 fw hub fanout new WS (--prompt TEXT|- --grader [name=]CMD... | --from-task ID) --agent KIND[:MODEL]... [--folder F] [--base BRANCH] [--name N] [--timeout SECS] [--protect PATH]... [--permission-mode M] [--approval A] [--sandbox S] [--no-commit-instruction] [--json] {where}

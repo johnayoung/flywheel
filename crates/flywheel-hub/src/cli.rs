@@ -152,6 +152,12 @@ enum HubCommand {
     /// types into it, or a grading or review uses it): add, ls, rm,
     /// clear, move, pause, resume.
     Queue(crate::queue_cli::QueueArgs),
+    /// A session's pull request: state, review decision, mergeability,
+    /// and CI checks (from gh, cached by the hub); log prints a failing
+    /// check's log, fix-ci asks the agent to fix it (queued while it
+    /// works), rerun, ready, and merge act on GitHub after printing what
+    /// runs.
+    Pr(crate::pr_cli::PrArgs),
     /// Fast-forward a worktree session's base onto its branch in the main
     /// checkout (git merge --ff-only), after printing exactly what runs.
     /// Refused when the main checkout is not on the base or has
@@ -700,6 +706,7 @@ fn dispatch_verb(
         HubCommand::Handoff(args) => crate::agent_handoff_cli::handoff(&args, out, err),
         HubCommand::AskReview(args) => crate::agent_handoff_cli::ask_review(&args, out, err),
         HubCommand::Queue(args) => crate::queue_cli::main(&args, out, err),
+        HubCommand::Pr(args) => crate::pr_cli::main(&args, out, err),
     }
 }
 

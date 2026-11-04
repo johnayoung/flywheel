@@ -369,6 +369,7 @@ function onPush(message, machine) {
     fanout.onEvent(message);
   } else if (message.type === "activity") {
     activity.onRow(message.row, machine);
+    pullRequests.onActivity(message.row);
   } else if (message.type === "away" && !machine) {
     activity.onAway(message);
   } else if (!machine && ["settings", "config", "plugins", "plugin_toast"].includes(message.type)) {

@@ -319,6 +319,9 @@ pub struct SessionView {
     /// A worker session's worker: running, or how it ended.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<crate::flywheel::WorkerRun>,
+    /// Its branch's pull request, when one is known (see [`crate::pr`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr: Option<crate::pr::PrBrief>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes &T
@@ -473,6 +476,8 @@ pub struct Hub {
     commands: CommandBook,
     /// Session git badges.
     git: GitWatch,
+    /// Pull requests and CI checks of session branches (`crate::pr`).
+    pr: crate::pr::PrWatch,
     /// Serializes companion shell creation (one per agent).
     companion_lock: Mutex<()>,
     /// Serializes "ask for a review" (one reviewer per author).
@@ -535,6 +540,7 @@ impl Hub {
         *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
         crate::transcript::spawn_watcher(&hub);
         git::spawn_watcher(&hub);
+        crate::pr::spawn_watcher(&hub);
         hub.start_queues();
         hub.start_activity();
         Ok(hub)
@@ -590,6 +596,7 @@ impl Hub {
             report: Mutex::new(None),
             monitored: Mutex::new(HashMap::new()),
             git: GitWatch::default(),
+            pr: crate::pr::PrWatch::default(),
             companion_lock: Mutex::new(()),
             review_lock: Mutex::new(()),
             detection: Arc::new(Detection::with_overrides(&options_state_dir)),
@@ -667,6 +674,11 @@ impl Hub {
     /// Suggested commands read from agent transcripts.
     pub(crate) fn command_book(&self) -> &CommandBook {
         &self.commands
+    }
+
+    /// Pull requests and CI checks of session branches (see [`crate::pr`]).
+    pub fn pr_watch(&self) -> &crate::pr::PrWatch {
+        &self.pr
     }
 
     /// The activity journal (see [`crate::activity`]).

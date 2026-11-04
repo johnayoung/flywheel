@@ -29,7 +29,7 @@ Phone or another machine: `tailscale serve --bg http://127.0.0.1:7420`, then `fw
 | Page | Covers |
 |---|---|
 | [hub-reference](hub/reference.md) | verbs and flags, `hub.toml`, `notify.toml`, `plugin.toml`, UI settings, keys, environment, state dir |
-| [hub-workflows](hub/workflows.md) | scripting, launcher, suggested commands, cost, worktrees, review (commit / push / PR / rebase / ff-merge), handoff, Claude <-> Codex review, verified fan-out, Flywheel, prompt queue, activity, permissions |
+| [hub-workflows](hub/workflows.md) | scripting, launcher, suggested commands, cost, worktrees, review (commit / push / PR / rebase / ff-merge), PR + CI, handoff, Claude <-> Codex review, verified fan-out, Flywheel, prompt queue, activity, permissions |
 | [hub-internals](hub/internals.md) | model, terminal emulation, lifecycle and restore, live upgrade, agent status, detection, `fw hub attach`, tabs and splits, web UI, phone, search, recording, push, doctor |
 | [hub-security](hub/security.md) | trust model, auth, remote access (tailscale, built-in TLS), machines and peers, share links |
 | [hub-api](hub/api.md) | REST routes, terminal and events WebSockets, plugin protocol and events |
@@ -44,7 +44,7 @@ Full syntax, flags, and files: [hub-reference](hub/reference.md). `fw hub <verb>
 | Sign-in and access | `open` `url` `token` `tls` `peer` `machine` `share` |
 | Sessions | `ls` `new` `send` `read` `wait` `attach` `kill` `relaunch` `explain` `import` `template` `queue` |
 | Agent output | `commands` `search` `activity` `record` |
-| Git and agents together | `review` `merge` `handoff` `ask-review` `fanout` |
+| Git and agents together | `review` `merge` `pr` `handoff` `ask-review` `fanout` |
 | Settings | `config` `plugin` `perms` |
 | Hooks | `report` (agent status hooks) |
 

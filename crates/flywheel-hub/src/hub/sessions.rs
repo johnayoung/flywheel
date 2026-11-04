@@ -70,6 +70,7 @@ impl Hub {
             .is_some_and(agent::AgentLaunch::bypasses_permissions);
         let queue = self.queue_brief(&record.id);
         let worker = crate::flywheel::worker_run(&record, live.as_ref().and_then(|l| l.pid));
+        let pr = self.pr_watch().brief(&record, git.as_ref());
         SessionView {
             record,
             live,
@@ -80,6 +81,7 @@ impl Hub {
             recording,
             queue,
             worker,
+            pr,
         }
     }
 

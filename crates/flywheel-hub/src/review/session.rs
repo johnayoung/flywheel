@@ -458,6 +458,10 @@ impl Hub {
         }
         let outcome = result.map_err(action_error)?;
         self.nudge_review_badges(&target);
+        // A push or a new pull request: its checks are looked for soon.
+        if outcome.ok && matches!(action, Action::Push { .. } | Action::Pr(_)) {
+            self.pr_watch().nudge_dir(&target.dir);
+        }
         if outcome.ok {
             let event = match action {
                 Action::Commit { .. } => "review.committed",

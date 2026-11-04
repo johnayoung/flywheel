@@ -79,6 +79,10 @@ pub const EVENTS: &[&str] = &[
     "queue.delivered",
     "queue.stalled",
     "perms.allowed",
+    "pr.checks_failed",
+    "pr.checks_passed",
+    "pr.review_changes_requested",
+    "pr.merged",
 ];
 const STATUSES: &[&str] = &["working", "blocked", "done", "idle", "unknown"];
 const KINDS: &[&str] = &["shell", "claude", "codex"];

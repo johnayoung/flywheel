@@ -383,6 +383,122 @@ pub fn scrub(text: &str) -> String {
     cut
 }
 
+/// `text` with the credentials [`scrub`] finds replaced by `[redacted]`,
+/// kept as it was otherwise (lines, spacing, length): for text handed on
+/// whole, like a CI log pasted into an agent. Also the value after a
+/// secret's name (`GITHUB_TOKEN=...`, `password: ...`, `Bearer ...`) when
+/// it looks like one (8+ characters, not all letters: `Unexpected token
+/// '}'` stays), and the password in a URL (`https://user:pw@host`).
+pub fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        redact_line(line, &mut out);
+    }
+    out
+}
+
+fn redact_line(line: &str, out: &mut String) {
+    // The word after one of these is redacted when it looks like a value.
+    let mut after_name = false;
+    let mut rest = line;
+    while !rest.is_empty() {
+        let word_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (word, tail) = rest.split_at(word_end);
+        let gap_end = tail
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(tail.len());
+        let (gap, next) = tail.split_at(gap_end);
+        if word.is_empty() {
+            out.push_str(gap);
+            rest = next;
+            continue;
+        }
+        let value_like = |w: &str| {
+            let core = w.trim_matches(|c: char| "\"'`,;()[]{}<>".contains(c));
+            core.len() >= 8 && !core.chars().all(char::is_alphabetic)
+        };
+        if let Some((name, value)) = word.split_once('=')
+            && !value.is_empty()
+            && (secret_like(value) || (secret_name(name) && value_like(value)))
+        {
+            out.push_str(name);
+            out.push_str("=[redacted]");
+            after_name = false;
+        } else if secret_like(word) || (after_name && value_like(word)) {
+            out.push_str("[redacted]");
+            after_name = false;
+        } else if let Some(cut) = url_password(word) {
+            out.push_str(&cut);
+            after_name = false;
+        } else {
+            let bare = word.trim_end_matches(':');
+            // `--password VALUE`, `--client-secret VALUE`.
+            let flag = word.starts_with('-')
+                && word.len() > 2
+                && secret_name(word.trim_start_matches('-'));
+            after_name = word.eq_ignore_ascii_case("bearer")
+                || word.eq_ignore_ascii_case("token")
+                || flag
+                || (word.ends_with(':') && secret_name(bare));
+            out.push_str(word);
+        }
+        out.push_str(gap);
+        rest = next;
+    }
+}
+
+/// A variable or field name that holds a secret (`GH_TOKEN`,
+/// `db_password`, `Authorization`).
+fn secret_name(name: &str) -> bool {
+    let upper = name
+        .trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "API_KEY",
+        "APIKEY",
+        "ACCESS_KEY",
+        "PRIVATE_KEY",
+        "CREDENTIAL",
+        "AUTHORIZATION",
+    ]
+    .iter()
+    .any(|s| upper.contains(s))
+}
+
+/// `word` with the password of a URL's `user:password@` cut, when it has
+/// one.
+fn url_password(word: &str) -> Option<String> {
+    let scheme = word.find("://")? + 3;
+    let host_end = word[scheme..]
+        .find(['/', '?', '#'])
+        .map_or(word.len(), |i| scheme + i);
+    let at = word[scheme..host_end].rfind('@')? + scheme;
+    let colon = word[scheme..at].find(':')? + scheme;
+    if colon + 1 >= at {
+        return None;
+    }
+    Some(format!("{}[redacted]{}", &word[..=colon], &word[at..]))
+}
+
+/// The shape of an AWS secret access key: 40 characters of base64
+/// (letters of both cases, a digit or `+`, a few `/` at most). A git
+/// commit (40 hex, one case) or a path does not have it.
+fn aws_secret_like(core: &str) -> bool {
+    core.len() == 40
+        && core
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '+')
+        && core.chars().any(|c| c.is_ascii_uppercase())
+        && core.chars().any(|c| c.is_ascii_lowercase())
+        && core.chars().any(|c| c.is_ascii_digit() || c == '+')
+        && core.chars().filter(|c| *c == '/').count() <= 4
+        && !core.starts_with('/')
+}
+
 /// A word that looks like a credential: a known key prefix, or a long run
 /// of letters and digits mixed (what a random token is, and a branch or
 /// name is not).
@@ -415,6 +531,9 @@ fn secret_like(word: &str) -> bool {
     // Long unbroken hex is a key or a digest (the hub's own token is 64
     // hex); shorter (a git commit's 40, the hub's ids) names things.
     if core.len() > 40 && core.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    if aws_secret_like(core) {
         return true;
     }
     if core.len() < 24

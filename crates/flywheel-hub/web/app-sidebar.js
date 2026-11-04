@@ -304,6 +304,7 @@ function renderSession(session, index) {
       el("span", { className: `session-state ${st.tone}`, textContent: st.label, title: st.title || undefined }),
       launcher.rowChip(session),
       promptQueue.rowChip(session),
+      pullRequests.rowChip(session),
       actions,
     ),
     // What a blocked agent asks, readable without hover (touch).

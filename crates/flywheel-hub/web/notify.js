@@ -113,6 +113,17 @@ window.FwHubNotify = function (ctx) {
     show(sessionId, agent).catch(() => {});
   }
 
+  // Another kind of news about a session (a pull request's CI): shown
+  // like a status, under the same switch, debounce, and "not while
+  // looking" rule.
+  function alert(sessionId, title, body, urgent) {
+    if (!isOn() || looking() || !sessionById(sessionId)) return;
+    const key = `${sessionId}:${title}`;
+    if ((recent.get(key) || 0) + DEBOUNCE_MS > Date.now()) return;
+    recent.set(key, Date.now());
+    display(sessionId, title, body, urgent).catch(() => {});
+  }
+
   async function show(sessionId, agent) {
     const session = sessionById(sessionId);
     if (!session) return;
@@ -123,13 +134,17 @@ window.FwHubNotify = function (ctx) {
     const body = agent.status === "blocked"
       ? `${where} waits on you${agent.detail ? `: ${agent.detail}` : "."}`
       : `${where} finished its turn.`;
+    await display(sessionId, title, body, agent.status === "blocked");
+  }
+
+  async function display(sessionId, title, body, urgent) {
     const options = {
       body,
       tag: `fw-hub-${sessionId}`,
       renotify: true,
       icon: "/assets/icon-192.png",
       data: { session: sessionId },
-      requireInteraction: agent.status === "blocked",
+      requireInteraction: !!urgent,
     };
     // Mobile Chrome allows notifications only through the service worker
     // (its click is relayed back as a message); desktop browsers without
@@ -188,5 +203,5 @@ window.FwHubNotify = function (ctx) {
   renderChip();
   loadPush();
 
-  return { onStatus, toggle, paletteItems, isOn, renderChip };
+  return { onStatus, alert, toggle, paletteItems, isOn, renderChip };
 };

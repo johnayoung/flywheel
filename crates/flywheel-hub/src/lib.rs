@@ -46,6 +46,8 @@ pub mod perms;
 pub mod perms_cli;
 pub mod plugin_cli;
 pub mod plugins;
+pub mod pr;
+pub mod pr_cli;
 pub mod pty;
 pub mod queue;
 pub mod queue_cli;

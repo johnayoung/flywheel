@@ -62,6 +62,7 @@ mod deciding;
 mod delivery;
 mod runtime;
 
+pub use api::Delivery;
 pub(crate) use deciding::event_item;
 pub use runtime::{EDIT_LEASE, QueueRuntime, SessionHold, TypingExport};
 

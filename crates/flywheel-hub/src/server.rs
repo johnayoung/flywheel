@@ -73,6 +73,7 @@ mod listen;
 mod notify_api;
 mod perms_api;
 mod plugins_api;
+mod pr_api;
 mod promote_api;
 mod proxy;
 mod pwa;
@@ -319,6 +320,12 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions/{id}/review/abort", post(review_api::abort))
         .route("/api/sessions/{id}/review/merge", post(review_api::merge))
         .route("/api/sessions/{id}/review/ask", post(review_api::ask))
+        .route("/api/sessions/{id}/pr", get(pr_api::view))
+        .route("/api/sessions/{id}/pr/log", get(pr_api::log))
+        .route("/api/sessions/{id}/pr/fix", post(pr_api::fix))
+        .route("/api/sessions/{id}/pr/rerun", post(pr_api::rerun))
+        .route("/api/sessions/{id}/pr/ready", post(pr_api::ready))
+        .route("/api/sessions/{id}/pr/merge", post(pr_api::merge))
         .route(
             "/api/sessions/{id}/review/reviewer",
             post(handoff_api::reviewer),

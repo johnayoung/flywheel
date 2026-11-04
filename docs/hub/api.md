@@ -47,7 +47,7 @@ Workspace `folders: [{"path","name"?,"git","missing"}]` (+ legacy `repos`); inpu
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | below |
 
-Session views: `agent` `{"status","detail"?,"since","questions"?}` (AskUserQuestion's input), `agent_session_id`, `launch`, `usage`, `worktree`, `companion_of`, `reviewer` / `review_of`, `recording`, `live` (`epoch`), `git`, `queue`.
+Session views: `agent` `{"status","detail"?,"since","questions"?}` (AskUserQuestion's input), `agent_session_id`, `launch`, `usage`, `worktree`, `companion_of`, `reviewer` / `review_of`, `recording`, `live` (`epoch`), `git`, `queue`, `pr`.
 
 **Screen**: `visible` (default): the rows; `recent`: the last `lines` (1..100000, 100) logical lines, soft wraps joined.
 
@@ -70,6 +70,12 @@ Session views: `agent` `{"status","detail"?,"since","questions"?}` (AskUserQuest
 | POST | `/api/sessions/{id}/review/rebase` | |
 | POST | `/api/sessions/{id}/review/abort` | rebase `--abort` |
 | POST | `/api/sessions/{id}/review/merge` | |
+| GET | `/api/sessions/{id}/pr[?refresh=1]` | `{"branch","pr","checks","summary","problem","note","agent"}` ([hub-workflows](workflows.md#pull-requests-and-ci)) |
+| GET | `/api/sessions/{id}/pr/log?check=` | `{"text","lines","shown","command","truncated"}`: redacted tail |
+| POST | `/api/sessions/{id}/pr/fix` | `{"check"?,"dry_run"?}` -> `{"agent","check","prompt","delivery"?}` (`pasted` / `queued`) |
+| POST | `/api/sessions/{id}/pr/rerun` | two-step, as review actions |
+| POST | `/api/sessions/{id}/pr/ready` | as rerun |
+| POST | `/api/sessions/{id}/pr/merge` | as rerun; plan `forcible`, `force_word`: send `force` (the PR number) |
 | POST | `/api/sessions/{id}/review/ask` | `{"kind":"commit_message\|resolve_conflicts","dry_run"?}` -> `{"agent","prompt","paste"?}` |
 | POST | `/api/sessions/{id}/review/reviewer` | `{"kind"?,"base"?,"model"?,"dry_run"?}`: 201 launched, 200 asked again; 409 nothing |
 | GET | `/api/sessions/{id}/review/findings` | the reviewer's latest `reply`, `blocks` (409 none) |
@@ -271,6 +277,10 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `share.revoked` | as above, per link revoked (not on expiry) |
 | `record.started` | `recording` (as `/record/start`, no path); `session` `null` once removed |
 | `perms.allowed` | `agent`, `file`, `path`, `rules` (as written), `tools`, `folder`, `dangerous` |
+| `pr.checks_failed` | `dir`, `branch`, `pr` `{"number","title","url","state","review","base","head_oid"}`, `checks`, `failing` (every `pr.*`) |
+| `pr.checks_passed` | as above |
+| `pr.review_changes_requested` | as above |
+| `pr.merged` | as above |
 | `record.stopped` | + `reason` `stopped` / `ended` (exit, write failure); not on hub stop, handoff |
 
 `fanout.finished`: a grading left the fan-out settled (no agent working, nothing queued); candidates best first, `tail` the first failing grader's last 400 stderr chars:

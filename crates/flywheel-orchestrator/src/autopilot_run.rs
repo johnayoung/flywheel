@@ -21,9 +21,9 @@ use crate::autopilot::{
     RefillPassOptions, ScoreWeights, actionable_queue_depth, run_refill_pass,
 };
 use crate::autopilot_activity::{
-    AutopilotActivity, DroppedSummary, EmittedSummary, MAX_DROPPED_SUMMARIES, PHASE_IDLE,
-    PHASE_PAUSED, PHASE_RUNNING, PHASE_STARTING, PHASE_STOPPED, epoch_now, is_paused, set_paused,
-    write_activity,
+    AutopilotActivity, CycleSummary, DroppedSummary, EmittedSummary, MAX_DROPPED_SUMMARIES,
+    PHASE_IDLE, PHASE_PAUSED, PHASE_RUNNING, PHASE_STARTING, PHASE_STOPPED, epoch_now, is_paused,
+    set_paused, write_activity,
 };
 use crate::autopilot_context::{DiscoveryCacheStatus, default_discovery_cache_path};
 use crate::claims::{ClaimStore, ClaimStoreError, OrchestratorSchemaError};
@@ -49,7 +49,7 @@ use flywheel_core::deadline_config::DeadlineConfig;
 use flywheel_core::faults::{FaultClass, classify_error};
 use flywheel_core::invoker_client::Clock;
 use flywheel_core::store::{HarnessStore, StoreError, StoreSchemaError};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -402,6 +402,25 @@ pub fn error_type_name(err: &(dyn Error + 'static)) -> &'static str {
     } else {
         "Exception"
     }
+}
+
+/// Whether `result` is a no-op cycle (no discovery, nothing emitted or
+/// dropped) whose reason the previous no-op cycle already logged; tracks
+/// the last no-op reason in `last` (any other cycle clears it).
+fn repeats_noop(last: &mut Option<String>, result: &AutopilotPassResult) -> bool {
+    let noop = result.emitted.is_empty()
+        && result.dropped.is_empty()
+        && result.notes.is_empty()
+        && result.discovery_cache == DiscoveryCacheStatus::NotConsulted;
+    if !noop {
+        *last = None;
+        return false;
+    }
+    if last.as_deref() == Some(result.reason.as_str()) {
+        return true;
+    }
+    *last = Some(result.reason.clone());
+    false
 }
 
 fn log_result(log: &LogSink, result: &AutopilotPassResult) {
@@ -891,10 +910,34 @@ impl LastCycle {
     }
 }
 
+impl LastCycle {
+    fn summary(&self, cycle: i64, at: f64) -> CycleSummary {
+        CycleSummary {
+            cycle,
+            at,
+            emitted: self.emitted,
+            dropped: self.dropped,
+            reason: self.reason.clone(),
+            relevant_tiers: self.relevant_tiers.clone(),
+            emitted_tasks: self.emitted_tasks.clone(),
+            prefiltered_tiers: self.prefiltered_tiers.clone(),
+            discovery_cache: self.discovery_cache.clone(),
+            dropped_findings: self.dropped_findings.clone(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct RecorderState {
     cycle_index: i64,
     last: Option<LastCycle>,
+    /// The cycle `last` came from (a failed cycle records none).
+    last_cycle: i64,
+    /// The newest cycle that decided anything.
+    last_decision: Option<CycleSummary>,
+    /// The phase and time of the last write (a paused daemon rewrites only
+    /// to keep its deadline fresh).
+    written: Option<(String, f64)>,
 }
 
 /// Writes the daemon's per-cycle activity snapshots for the console.
@@ -965,9 +1008,15 @@ impl ActivityRecorder {
     }
 
     fn write_until(&self, phase: &str, now: f64, next_cycle_at: Option<f64>, expires_at: f64) {
-        let (cycle_index, last) = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            (state.cycle_index, state.last.clone().unwrap_or_default())
+        let (cycle_index, last, last_cycle, last_decision) = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.written = Some((phase.to_owned(), now));
+            (
+                state.cycle_index,
+                state.last.clone().unwrap_or_default(),
+                state.last_cycle,
+                state.last_decision.clone(),
+            )
         };
         let activity = AutopilotActivity {
             pid: self.pid,
@@ -985,6 +1034,8 @@ impl ActivityRecorder {
             last_prefiltered_tiers: last.prefiltered_tiers,
             last_discovery_cache: last.discovery_cache,
             last_dropped_findings: last.dropped_findings,
+            last_cycle,
+            last_decision,
         };
         // Best-effort by contract: a snapshot write failure never crashes a cycle.
         let _ = write_activity(&self.path, &activity);
@@ -1005,9 +1056,21 @@ impl ActivityRecorder {
     }
 
     /// The `paused` snapshot while the pause marker holds the loop (the
-    /// last cycle's summary kept; the deadline pushed forward).
+    /// last cycle's summary kept; the deadline pushed forward). Called on
+    /// every held check, it writes on entering the pause and then only
+    /// once half the liveness window has passed, so a paused daemon does
+    /// not churn its record (and every reader of it) each poll.
     pub fn paused(&self) {
-        self.write(PHASE_PAUSED, (self.clock)(), None);
+        let now = (self.clock)();
+        let fresh = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.written.as_ref().is_some_and(|(phase, at)| {
+                phase == PHASE_PAUSED && now - at < (self.interval + LIVENESS_GRACE_SECONDS) / 2.0
+            })
+        };
+        if !fresh {
+            self.write(PHASE_PAUSED, now, None);
+        }
     }
 
     /// The `stopped` snapshot on a graceful exit: its deadline is already
@@ -1019,11 +1082,17 @@ impl ActivityRecorder {
 
     /// The `idle` snapshot after a cycle, carrying its summary.
     pub fn on_cycle(&self, result: &AutopilotPassResult) {
+        let now = (self.clock)();
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.last = Some(LastCycle::from_result(result));
+            let last = LastCycle::from_result(result);
+            let summary = last.summary(state.cycle_index, now);
+            if summary.decided() {
+                state.last_decision = Some(summary);
+            }
+            state.last_cycle = state.cycle_index;
+            state.last = Some(last);
         }
-        let now = (self.clock)();
         self.write(PHASE_IDLE, now, Some(now + self.interval));
     }
 }
@@ -1433,8 +1502,14 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         }
         recorder.paused();
     };
+    let last_noop: RefCell<Option<String>> = RefCell::new(None);
     let on_cycle = |result: &AutopilotPassResult| {
-        log_result(&log, result);
+        if repeats_noop(&mut last_noop.borrow_mut(), result) {
+            // The same "queue at target, nothing emitted" every interval
+            // would fill the scrollback; the record still says it.
+        } else {
+            log_result(&log, result);
+        }
         recorder.on_cycle(result);
         if let Some(claims) = &backoff_claims {
             match apply_no_progress_backoff(
@@ -2551,6 +2626,26 @@ mod tests {
     }
 
     #[test]
+    fn an_identical_noop_cycle_is_logged_once() {
+        let mut last = None;
+        let noop = idle("queue depth 1 already at or above target 1; nothing emitted");
+        assert!(!repeats_noop(&mut last, &noop));
+        assert!(repeats_noop(&mut last, &noop));
+        assert!(repeats_noop(&mut last, &noop));
+        let other = idle("queue depth 0; nothing actionable");
+        assert!(!repeats_noop(&mut last, &other));
+        let decided = AutopilotPassResult {
+            discovery_cache: DiscoveryCacheStatus::Hit,
+            ..idle("queue depth 0; nothing actionable")
+        };
+        assert!(!repeats_noop(&mut last, &decided));
+        assert!(
+            !repeats_noop(&mut last, &noop),
+            "a decision in between resets it"
+        );
+    }
+
+    #[test]
     fn log_result_reports_prefilter_skips_cache_use_and_suppressed_findings() {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let sink_lines = lines.clone();
@@ -2798,6 +2893,73 @@ mod tests {
         let stopped = read_activity(Some(&path)).unwrap();
         assert_eq!(stopped.phase, PHASE_STOPPED);
         assert!(!is_record_live(Some(&stopped), 500.0));
+    }
+
+    #[test]
+    fn the_record_names_the_cycle_its_summary_came_from() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("act.json");
+        let recorder = recorder_at(&path, 5.0, 1, &[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        recorder.before_cycle();
+        let decided = AutopilotPassResult {
+            discovery_cache: DiscoveryCacheStatus::Miss,
+            ..idle("emitted 1 task(s)")
+        };
+        recorder.on_cycle(&decided);
+        // Cycle 2 fails (no summary); cycle 3 starts.
+        recorder.before_cycle();
+        recorder.before_cycle();
+        let running = read_activity(Some(&path)).unwrap();
+        assert_eq!(running.cycle_index, 3);
+        assert_eq!(running.last_cycle, 1, "a failed cycle records no summary");
+        recorder.stopped();
+        assert_eq!(read_activity(Some(&path)).unwrap().last_cycle, 1);
+    }
+
+    #[test]
+    fn a_noop_cycle_keeps_the_last_decision() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("act.json");
+        let recorder = recorder_at(&path, 5.0, 1, &[10.0, 20.0, 30.0, 40.0]);
+        recorder.before_cycle();
+        let decided = AutopilotPassResult {
+            discovery_cache: DiscoveryCacheStatus::Miss,
+            ..idle("emitted 1 task(s)")
+        };
+        recorder.on_cycle(&decided);
+        recorder.before_cycle();
+        recorder.on_cycle(&idle("queue at target; nothing emitted"));
+        let record = read_activity(Some(&path)).unwrap();
+        assert_eq!(record.last_cycle, 2);
+        assert_eq!(record.last_reason, "queue at target; nothing emitted");
+        let kept = record.last_decision.expect("the decision survives");
+        assert_eq!(kept.cycle, 1);
+        assert_eq!(kept.reason, "emitted 1 task(s)");
+        assert_eq!(kept.at, 20.0);
+    }
+
+    #[test]
+    fn a_paused_daemon_rewrites_its_record_only_to_stay_live() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("act.json");
+        let clock = Arc::new(Mutex::new(100.0_f64));
+        let read = clock.clone();
+        let recorder =
+            ActivityRecorder::new(&path, 4.0).with_clock(Arc::new(move || *read.lock().unwrap()));
+        let window = 4.0 + LIVENESS_GRACE_SECONDS;
+        recorder.paused();
+        let first = read_activity(Some(&path)).unwrap().updated_at;
+        *clock.lock().unwrap() = 102.0;
+        recorder.paused();
+        assert_eq!(read_activity(Some(&path)).unwrap().updated_at, first);
+        *clock.lock().unwrap() = 100.0 + window / 2.0;
+        recorder.paused();
+        let again = read_activity(Some(&path)).unwrap();
+        assert_eq!(again.updated_at, 100.0 + window / 2.0);
+        assert!(is_record_live(
+            Some(&again),
+            again.updated_at + window / 2.0
+        ));
     }
 
     #[test]

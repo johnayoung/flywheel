@@ -1089,6 +1089,10 @@ mod tests {
         fn delete_command(&self, _command_id: i64) -> Result<(), StoreError> {
             Ok(())
         }
+
+        fn pending_commands(&self, _run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
+            Err(StoreError::backend(std::io::Error::other("db locked")))
+        }
     }
 
     type AuditLog = Arc<Mutex<Vec<(String, JsonObject)>>>;

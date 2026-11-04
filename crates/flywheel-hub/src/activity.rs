@@ -525,6 +525,13 @@ fn secret_like(word: &str) -> bool {
         "eyJ",
     ];
     let core = word.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || "-_+/=.".contains(c)));
+    // A flywheel run id (`run-` + 32 lowercase hex) names a run; rows link
+    // to it.
+    if core.strip_prefix("run-").is_some_and(|hex| {
+        hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }) {
+        return false;
+    }
     if core.len() >= 16 && PREFIXES.iter().any(|p| core.starts_with(p)) {
         return true;
     }

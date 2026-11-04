@@ -1787,6 +1787,85 @@ async fn awaiting_approval_without_a_command_stays_parked() {
 }
 
 #[tokio::test]
+async fn pending_reject_drives_the_retry_on_the_same_run() {
+    let f = Fixture::new();
+    let mut gated = item("gated");
+    gated.task = gated_task("gated");
+    f.runner
+        .script("gated", vec![Scripted::Await { ordinal: 1 }, done()]);
+    let mut req = f.request(MemorySource::new(vec![gated]));
+    req.max_retries = 2;
+    let first = run(req.clone()).await;
+    let run_id = first.runs[0].run_id.clone();
+    assert_eq!(first.runs[0].status, Status::AwaitingApproval);
+
+    flywheel_core::invoker_client::enqueue_reject(
+        f.control.as_ref(),
+        &run_id,
+        Some("use real samples"),
+        t0(),
+    )
+    .unwrap();
+    let second = run(req).await;
+    assert_eq!(second.runs.len(), 1, "the rejected run is retried");
+    assert_eq!(second.runs[0].run_id, run_id);
+    assert_eq!(second.runs[0].mode, RunMode::Resume);
+    let lc = f.lifecycle(&run_id);
+    assert_eq!(lc.status, Status::Done);
+    assert_eq!(lc.retries, 1, "the reject consumed one retry");
+    assert!(f.claims.list_claims().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_ready_run_nobody_drives_is_resumed() {
+    // A reject resolved by a worker that exited before driving the retry
+    // leaves the run at READY with no claim: the next worker resumes it.
+    let f = Fixture::new();
+    let mut gated = item("gated");
+    gated.task = gated_task("gated");
+    f.runner
+        .script("gated", vec![Scripted::Await { ordinal: 1 }, done()]);
+    let mut req = f.request(MemorySource::new(vec![gated.clone()]));
+    req.max_retries = 2;
+    let first = run(req.clone()).await;
+    let run_id = first.runs[0].run_id.clone();
+    flywheel_core::invoker_client::enqueue_reject(f.control.as_ref(), &run_id, None, t0()).unwrap();
+    let mut lc = f.lifecycle(&run_id);
+    let resolved = flywheel_core::harness::resolve_manual_approval(
+        &mut lc,
+        f.control.clone(),
+        &gated.task,
+        flywheel_core::harness::ResolveApprovalOptions::default().with_max_retries(2),
+    )
+    .unwrap();
+    assert_eq!(resolved.reason, "rejected_retry");
+    assert_eq!(f.lifecycle(&run_id).status, Status::Ready);
+
+    let second = run(req).await;
+    assert_eq!(second.runs.len(), 1);
+    assert_eq!(second.runs[0].run_id, run_id);
+    assert_eq!(second.runs[0].mode, RunMode::Resume);
+    assert_eq!(f.lifecycle(&run_id).status, Status::Done);
+}
+
+#[tokio::test]
+async fn a_ready_run_a_live_peer_holds_is_left_alone() {
+    let f = Fixture::new();
+    f.seed("held", "run-held", Status::FailedValidation, "x");
+    let mut lc = f.lifecycle("run-held");
+    let prev = lc.version;
+    lc.transition_to(Status::Ready, "", Some(t0())).unwrap();
+    f.control.update_lifecycle(&lc, prev).unwrap();
+    f.claims
+        .acquire_claim("held", "worker-b", t0(), 3600.0, &BTreeSet::new())
+        .unwrap()
+        .expect("peer claim");
+    let report = run(f.request(MemorySource::new(vec![item("held")]))).await;
+    assert!(report.runs.is_empty(), "a peer's READY run is not stolen");
+    assert_eq!(f.lifecycle("run-held").status, Status::Ready);
+}
+
+#[tokio::test]
 async fn empty_approval_mark_expires_and_is_reswept_in_the_same_session() {
     let f = Fixture::new();
     let clock_state = Arc::new(Mutex::new(t0()));

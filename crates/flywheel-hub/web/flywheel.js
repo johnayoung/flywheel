@@ -45,7 +45,7 @@ window.FwHubFlywheel = function (ctx) {
     failed: "failed",
     stranded: "stranded",
     stopped: "stopped",
-    awaiting: "awaiting you",
+    awaiting: "needs you",
     blocked: "blocked",
   };
 
@@ -441,6 +441,25 @@ window.FwHubFlywheel = function (ctx) {
     return loaded;
   }
 
+  // Open the panel of this hub's folder whose autopilot gate is `runId`
+  // (a push's link names the run, never a path); false when none has it.
+  async function openGate(runId) {
+    for (const [key, s] of ui.summaries) {
+      if (machineOfKey(key) || !(s.autopilot_gates > 0)) continue;
+      let panel;
+      try {
+        panel = await api("GET", `/api/flywheel/panel?folder=${encodeURIComponent(key)}`);
+      } catch (_) {
+        continue;
+      }
+      if (panel.intake && panel.intake.gates.some((g) => g.run_id === runId)) {
+        await open(key);
+        return true;
+      }
+    }
+    return false;
+  }
+
   function close() {
     if (!ui.folder) return;
     ui.folder = null;
@@ -762,7 +781,8 @@ window.FwHubFlywheel = function (ctx) {
 
   // A run's status in the tasks' vocabulary: a DONE run passed its
   // graders, which is what "verified" means on a task.
-  const runLabel = (status) => (status === "done" ? "verified" : status.replace("_", " "));
+  // (A parked gate is "awaiting": the full word overflows its pill.)
+  const runLabel = (status) => (status === "done" ? "verified" : status === "awaiting_approval" ? "awaiting" : status.replace("_", " "));
 
   function runRow(run) {
     return el(
@@ -797,7 +817,7 @@ window.FwHubFlywheel = function (ctx) {
       el(
         "div",
         { className: "fw-run-line" },
-        el("span", { className: `fw-status ${run.status}`, textContent: run.status.replace("_", " ") }),
+        el("span", { className: `fw-status ${run.status}`, textContent: runLabel(run.status), title: `lifecycle ${run.status}` }),
         el("b", { textContent: run.task_id, title: run.run_id }),
         el("span", {
           className: "fw-run-when",
@@ -1180,6 +1200,7 @@ window.FwHubFlywheel = function (ctx) {
     paletteItems,
     isOpen: () => !!ui.folder,
     openRun,
+    openGate,
     startWorkerIn,
     pendingTasks,
   };

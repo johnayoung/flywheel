@@ -23,14 +23,15 @@ use flywheel_core::invoker_client::{
 use flywheel_core::lifecycle::{Lifecycle, Status};
 use flywheel_core::store::{HarnessStore, LifecycleFilter};
 use flywheel_hub::autopilot::{
-    AutopilotView, GateDecided, GateDecision, GateRefused, PilotCandidate, PilotConfig,
-    PilotDecision, PilotDrop, PilotEmit, PilotGate, PilotHold, PilotState, PilotTier,
+    AutopilotView, GateDecided, GateDecision, GateRefused, PendingDecision, PilotCandidate,
+    PilotConfig, PilotDecision, PilotDrop, PilotEmit, PilotGate, PilotHold, PilotState, PilotTier,
 };
 use flywheel_hub::flywheel::{FlywheelPanel, TaskLight};
 use flywheel_orchestrator::autopilot::{AUTOPILOT_PHASE, Tier};
 use flywheel_orchestrator::autopilot_activity::{
-    AutopilotActivity, PHASE_IDLE, PHASE_PAUSED, PHASE_RUNNING, PHASE_STARTING, PHASE_STOPPED,
-    epoch_now, is_paused, is_record_live, read_activity,
+    AutopilotActivity, CycleSummary, DISCOVERY_NOT_CONSULTED, PHASE_IDLE, PHASE_PAUSED,
+    PHASE_RUNNING, PHASE_STARTING, PHASE_STOPPED, epoch_now, is_paused, is_record_live,
+    read_activity,
 };
 use flywheel_orchestrator::policy::{
     AutopilotWeights, DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY, DEFAULT_AUTOPILOT_INTERVAL_SECONDS,
@@ -85,9 +86,13 @@ fn daemon(activity: Option<&AutopilotActivity>, paused: bool) -> (PilotState, bo
     (state, true)
 }
 
-/// The cycle the record's last-cycle summary describes: the record's
-/// index once that cycle finished, the one before while the next runs.
+/// The cycle the record's last-cycle summary describes: the record says
+/// (`last_cycle`). A record from before that field: its index once that
+/// cycle finished, the one before while the next runs.
 fn decided_cycle(activity: &AutopilotActivity) -> i64 {
+    if activity.last_cycle > 0 {
+        return activity.last_cycle;
+    }
     if activity.phase == PHASE_RUNNING || activity.phase == PHASE_STARTING {
         activity.cycle_index - 1
     } else {
@@ -95,29 +100,26 @@ fn decided_cycle(activity: &AutopilotActivity) -> i64 {
     }
 }
 
-fn decision(activity: &AutopilotActivity) -> Option<PilotDecision> {
-    let cycle = decided_cycle(activity);
-    if cycle <= 0 || activity.last_reason.is_empty() {
-        return None;
-    }
-    Some(PilotDecision {
-        cycle,
-        emitted: activity.last_emitted,
-        dropped: activity.last_dropped,
-        reason: activity.last_reason.clone(),
-        relevant_tiers: activity.last_relevant_tiers.clone(),
-        prefiltered_tiers: activity.last_prefiltered_tiers.clone(),
-        discovery_cache: activity.last_discovery_cache.clone(),
-        emitted_tasks: activity
-            .last_emitted_tasks
+fn pilot_decision(summary: &CycleSummary, at: Option<DateTime<Utc>>) -> PilotDecision {
+    PilotDecision {
+        cycle: summary.cycle,
+        at,
+        emitted: summary.emitted,
+        dropped: summary.dropped,
+        reason: summary.reason.clone(),
+        relevant_tiers: summary.relevant_tiers.clone(),
+        prefiltered_tiers: summary.prefiltered_tiers.clone(),
+        discovery_cache: summary.discovery_cache.clone(),
+        emitted_tasks: summary
+            .emitted_tasks
             .iter()
             .map(|t| PilotEmit {
                 task_id: t.task_id.clone(),
                 tier: t.tier,
             })
             .collect(),
-        dropped_findings: activity
-            .last_dropped_findings
+        dropped_findings: summary
+            .dropped_findings
             .iter()
             .map(|d| PilotDrop {
                 finding_id: d.finding_id.clone(),
@@ -126,7 +128,46 @@ fn decision(activity: &AutopilotActivity) -> Option<PilotDecision> {
                 reason: d.reason.clone(),
             })
             .collect(),
-    })
+    }
+}
+
+/// What the last completed cycle decided.
+fn decision(activity: &AutopilotActivity) -> Option<PilotDecision> {
+    let cycle = decided_cycle(activity);
+    if cycle <= 0 || activity.last_reason.is_empty() {
+        return None;
+    }
+    let summary = CycleSummary {
+        cycle,
+        at: 0.0,
+        emitted: activity.last_emitted,
+        dropped: activity.last_dropped,
+        reason: activity.last_reason.clone(),
+        relevant_tiers: activity.last_relevant_tiers.clone(),
+        emitted_tasks: activity.last_emitted_tasks.clone(),
+        prefiltered_tiers: activity.last_prefiltered_tiers.clone(),
+        discovery_cache: activity.last_discovery_cache.clone(),
+        dropped_findings: activity.last_dropped_findings.clone(),
+    };
+    // The last decision's own time when it is this cycle.
+    let at = activity
+        .last_decision
+        .as_ref()
+        .filter(|d| d.cycle == cycle)
+        .and_then(|d| epoch(d.at));
+    Some(pilot_decision(&summary, at))
+}
+
+/// The newest cycle that decided anything (an older record: the last
+/// cycle, when it did).
+fn last_decided(activity: &AutopilotActivity) -> Option<PilotDecision> {
+    match &activity.last_decision {
+        Some(summary) => Some(pilot_decision(summary, epoch(summary.at))),
+        None if activity.last_cycle == 0 => decision(activity).filter(|d| {
+            d.emitted > 0 || d.dropped > 0 || d.discovery_cache != DISCOVERY_NOT_CONSULTED
+        }),
+        None => None,
+    }
 }
 
 fn tiers(decision: Option<&PilotDecision>) -> Vec<PilotTier> {
@@ -137,7 +178,7 @@ fn tiers(decision: Option<&PilotDecision>) -> Vec<PilotTier> {
             let verdict = match decision {
                 None => "unknown",
                 // A cycle that never reached discovery (queue at target).
-                Some(d) if d.discovery_cache == "not consulted" => "not run",
+                Some(d) if d.discovery_cache == DISCOVERY_NOT_CONSULTED => "not run",
                 Some(d) if d.prefiltered_tiers.contains(&value) => "prefiltered",
                 Some(d) if d.relevant_tiers.contains(&value) => "relevant",
                 Some(_) => "not relevant",
@@ -151,9 +192,36 @@ fn tiers(decision: Option<&PilotDecision>) -> Vec<PilotTier> {
                 emitted: decision.map_or(0, |d| {
                     d.emitted_tasks.iter().filter(|t| t.tier == value).count()
                 }),
+                dropped: decision.map_or(0, |d| {
+                    d.dropped_findings
+                        .iter()
+                        .filter(|f| f.tier == value)
+                        .count()
+                }),
             }
         })
         .collect()
+}
+
+/// The first approve / reject queued on `run_id` and bound to `parked`
+/// (the one the worker's resolver would apply).
+fn pending_decision(
+    core: &dyn HarnessStore,
+    run_id: &str,
+    parked: GateBinding,
+) -> Result<Option<PendingDecision>, String> {
+    let pending = core
+        .pending_commands(run_id)
+        .map_err(|e| format!("reading run {run_id}'s queued decisions: {e}"))?;
+    Ok(pending
+        .into_iter()
+        .filter(|c| c.kind == CONTROL_COMMAND_APPROVE || c.kind == CONTROL_COMMAND_REJECT)
+        .find(|c| GateBinding::of_command(c) == Some(parked))
+        .map(|c| PendingDecision {
+            kind: c.kind,
+            command_id: c.id.unwrap_or_default(),
+            enqueued_at: c.enqueued_at,
+        }))
 }
 
 fn config(policy: Option<&WorkPolicy>) -> PilotConfig {
@@ -356,6 +424,7 @@ pub(crate) fn read_view(
     let paused = is_paused(&activity_path);
     let (state, live) = daemon(activity.as_ref(), paused);
     let decision = activity.as_ref().and_then(decision);
+    let last_decided = activity.as_ref().and_then(last_decided);
     let mut problems: Vec<String> = Vec::new();
 
     let mut candidates = tasks_dir.map(emitted_tasks).unwrap_or_default();
@@ -447,6 +516,13 @@ pub(crate) fn read_view(
             let Some(binding) = GateBinding::of_parked(&lifecycle) else {
                 continue;
             };
+            let pending = match pending_decision(core, run_id, binding) {
+                Ok(pending) => pending,
+                Err(e) => {
+                    problems.push(e);
+                    None
+                }
+            };
             gates.push(PilotGate {
                 task_id: task.id.clone(),
                 run_id: run_id.clone(),
@@ -456,6 +532,7 @@ pub(crate) fn read_view(
                 since: lifecycle.timestamps.get(&Status::AwaitingApproval).copied(),
                 autopilot: ours.contains(task.id.as_str())
                     || phase.name.starts_with(AUTOPILOT_PHASE),
+                pending,
             });
         }
     }
@@ -474,8 +551,9 @@ pub(crate) fn read_view(
             .and_then(|a| a.next_cycle_at)
             .and_then(epoch),
         config: config(policy),
-        tiers: tiers(decision.as_ref()),
+        tiers: tiers(last_decided.as_ref().or(decision.as_ref())),
         decision,
+        last_decided,
         candidates,
         gates,
         holds,
@@ -503,11 +581,29 @@ pub(crate) fn decide(
         attempt_number: decision.attempt,
     };
     pin.stamp(&mut payload);
-    let task_id = core
+    let lifecycle = core
         .load_lifecycle(&decision.run_id)
-        .map_err(|e| GateRefused::Store(format!("reading run {}: {e}", decision.run_id)))?
-        .map(|l| l.task_id)
+        .map_err(|e| GateRefused::Store(format!("reading run {}: {e}", decision.run_id)))?;
+    let task_id = lifecycle
+        .as_ref()
+        .map(|l| l.task_id.clone())
         .unwrap_or_default();
+    // One decision per gate: a second, queued before a worker applied the
+    // first, would only be recorded as superseded -- refuse it here.
+    if let Some(parked) = lifecycle.as_ref().and_then(GateBinding::of_parked)
+        && let Some(queued) =
+            pending_decision(core, &decision.run_id, parked).map_err(GateRefused::Store)?
+    {
+        return Err(GateRefused::AlreadyDecided(format!(
+            "gate {} (attempt {}) of run {} already has a decision queued: {} (command #{}); \
+             a worker applies it on its next pass",
+            parked.awaiting_ordinal,
+            parked.attempt_number,
+            decision.run_id,
+            queued.kind,
+            queued.command_id
+        )));
+    }
     match enqueue_gate_decision(core, &decision.run_id, kind, payload, Utc::now()) {
         Ok((record, binding)) => Ok(GateDecided {
             run_id: decision.run_id.clone(),

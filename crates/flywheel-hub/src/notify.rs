@@ -344,7 +344,16 @@ pub fn compose_gate(payload: &serde_json::Value, click_base: Option<&str>, detai
         message: bounded(&message, MAX_MESSAGE_CHARS),
         priority: "high",
         tags: "flywheel,autopilot".into(),
-        click: click_base.map(|base| format!("{}/", base.trim_end_matches('/'))),
+        // The gate's run (never a path): the hub opens the folder whose
+        // autopilot waits on it.
+        click: click_base.map(|base| {
+            let run = payload.get("run_id").and_then(|v| v.as_str()).unwrap_or("");
+            if crate::flywheel::valid_run_id(run) {
+                format!("{}/#gate={run}", base.trim_end_matches('/'))
+            } else {
+                format!("{}/", base.trim_end_matches('/'))
+            }
+        }),
     }
 }
 
@@ -861,6 +870,17 @@ mod tests {
             "autopilot work in repo waits on your approval: Confirm the fixture"
         );
         assert_eq!(push.priority, "high");
+        assert_eq!(push.click.as_deref(), Some("https://hub.ts.net/"));
+        // With its run: the link opens that gate's folder.
+        let mut with_run = payload.clone();
+        with_run["run_id"] = "run-0123456789abcdef0123456789abcdef".into();
+        let push = compose_gate(&with_run, Some("https://hub.ts.net/"), false);
+        assert_eq!(
+            push.click.as_deref(),
+            Some("https://hub.ts.net/#gate=run-0123456789abcdef0123456789abcdef")
+        );
+        with_run["run_id"] = "../etc".into();
+        let push = compose_gate(&with_run, Some("https://hub.ts.net"), false);
         assert_eq!(push.click.as_deref(), Some("https://hub.ts.net/"));
         let bare = compose_gate(&payload, None, false);
         assert!(!bare.message.contains("Confirm"));

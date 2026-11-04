@@ -14,8 +14,9 @@
 //!   autopilot --pause|--resume` (`{"paused", "changed"}`);
 //! * `POST .../decide {"folder", "run", "decision": "approve"|"deny",
 //!   "confirm": true, "gate"?, "attempt"?, "feedback"?}` -- `fw approve` /
-//!   `fw reject` bound to the gate shown (200, the enqueued command); 409
-//!   when that gate is not the one parked, 404 for an unknown run.
+//!   `fw reject` bound to the gate shown (200, the enqueued command, and an
+//!   `autopilot.gate_decided` event); 409 when that gate is not the one
+//!   parked or already has a decision queued, 404 for an unknown run.
 //!
 //! Actions are refused to peers (`peers::peer_forbidden`): read-only.
 
@@ -23,7 +24,7 @@ use super::flywheel_api::{Refusal, adopted_folder, monitor, off_runtime, still_r
 use super::{ApiJson, ApiQuery, AppState, error_response};
 use crate::autopilot::{
     AutopilotView, GateDecision, GateRefused, MAX_FEEDBACK_CHARS, autopilot_session_command,
-    autopilot_session_name,
+    autopilot_session_name, gate_decided_payload,
 };
 use crate::flywheel::{FlywheelMonitor, runs_autopilot, valid_run_id};
 use crate::hub::CreateSession;
@@ -396,6 +397,7 @@ pub(super) async fn decide(
         Ok(found) => found,
         Err(response) => return response,
     };
+    let with_feedback = feedback.is_some();
     let decision = GateDecision {
         run_id: request.run,
         approve,
@@ -411,11 +413,19 @@ pub(super) async fn decide(
         tokio::task::spawn_blocking(move || provider.decide_gate(&folder, &decision)).await;
     match decided {
         Ok(Ok(done)) => {
+            // The hub's own audit trail of the human's decision (the store
+            // has the command; this is the timeline's and plugins' copy).
+            app.hub.emit_lifecycle(
+                "autopilot.gate_decided",
+                gate_decided_payload(&path, &done, with_feedback),
+            );
             monitor.refresh(&path);
             Json(done).into_response()
         }
         Ok(Err(GateRefused::UnknownRun(m))) => error_response(StatusCode::NOT_FOUND, &m),
-        Ok(Err(GateRefused::NotThatGate(m))) => error_response(StatusCode::CONFLICT, &m),
+        Ok(Err(GateRefused::NotThatGate(m) | GateRefused::AlreadyDecided(m))) => {
+            error_response(StatusCode::CONFLICT, &m)
+        }
         Ok(Err(GateRefused::Store(m))) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &m),
         Err(join) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

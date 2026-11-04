@@ -364,24 +364,30 @@ fn print_status(out: &mut dyn Write, answer: &Value) {
     if let Some(problem) = view["problem"].as_str() {
         let _ = writeln!(out, "problem: {problem}");
     }
-    let decision = &view["decision"];
-    if decision.is_object() {
+    // The newest cycle that decided anything, in full; then the last cycle
+    // when it is a later one (often the queue held at its target).
+    let decided = &view["last_decided"];
+    let last = &view["decision"];
+    let print_decision = |out: &mut dyn Write, label: &str, d: &Value| {
         let _ = writeln!(
             out,
-            "cycle {}: emitted {}, dropped {} -- {}",
-            decision["cycle"],
-            decision["emitted"],
-            decision["dropped"],
-            str_field(decision, "reason")
+            "{label} {}: emitted {}, dropped {} -- {}",
+            d["cycle"],
+            d["emitted"],
+            d["dropped"],
+            str_field(d, "reason")
         );
+    };
+    if decided.is_object() {
+        print_decision(out, "decided in cycle", decided);
         let _ = writeln!(
             out,
             "  relevant tiers {}; prefiltered {}; discovery cache {}",
-            tiers(&decision["relevant_tiers"]),
-            tiers(&decision["prefiltered_tiers"]),
-            str_field(decision, "discovery_cache")
+            tiers(&decided["relevant_tiers"]),
+            tiers(&decided["prefiltered_tiers"]),
+            str_field(decided, "discovery_cache")
         );
-        for drop in list(decision, "dropped_findings") {
+        for drop in list(decided, "dropped_findings") {
             let _ = writeln!(
                 out,
                 "  dropped {} (tier {}): {}",
@@ -390,7 +396,11 @@ fn print_status(out: &mut dyn Write, answer: &Value) {
                 str_field(drop, "reason")
             );
         }
-    } else {
+    }
+    if last.is_object() && (!decided.is_object() || last["cycle"] != decided["cycle"]) {
+        print_decision(out, "last cycle", last);
+    }
+    if !decided.is_object() && !last.is_object() {
         let _ = writeln!(out, "no cycle recorded yet");
     }
     let gates = list(view, "gates");
@@ -411,6 +421,14 @@ fn print_status(out: &mut dyn Write, answer: &Value) {
                 },
                 str_field(gate, "instruction")
             );
+            if gate["pending"].is_object() {
+                let _ = writeln!(
+                    out,
+                    "    {} queued (command #{}): the next worker run applies it",
+                    str_field(&gate["pending"], "kind"),
+                    gate["pending"]["command_id"]
+                );
+            }
         }
     }
     for hold in list(view, "holds") {

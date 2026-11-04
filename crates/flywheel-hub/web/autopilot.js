@@ -5,7 +5,8 @@
 // and latest run, and the manual gates its work waits on with approve /
 // deny -- each confirmed, each the CLI's own code path on the server
 // (`fw autopilot` in a hub session, its pause marker, `fw approve` /
-// `fw reject` pinned to the gate shown). The held-out gate, risk tiers
+// `fw reject` pinned to the gate shown; one decision per gate until a
+// worker applies it). The held-out gate, risk tiers
 // and team-mode reviews are shown, never decided here. Another machine's
 // folders are read-only. flywheel.js renders what this returns; protocol:
 // POST /api/flywheel/autopilot/{start,stop,pause,resume,decide}.
@@ -38,6 +39,13 @@ window.FwHubAutopilot = function (ctx) {
     return out;
   }
 
+  // How emitted work lands, in words (autopilot's `landing`).
+  function landingWords(landing) {
+    if (landing === "pr") return "as pull requests";
+    if (landing === "merge") return "merged into the base branch";
+    return `landing ${landing}`;
+  }
+
   async function act(key, verb, body) {
     if (busy) return null;
     busy = true;
@@ -65,7 +73,7 @@ window.FwHubAutopilot = function (ctx) {
     const ok = await confirmDialog({
       kicker: "autopilot",
       title: `Start autopilot in ${ctx.labelFor(key)}?`,
-      body: `Runs fw autopilot, the neverending intake daemon, in a new shell session here. Every ${config.interval_seconds}s it discovers work, scores it, and writes tasks until ${config.target_depth} are queued; a worker lands them on the base branch (${config.landing}) unattended, through: ${gates(config).join(", ")}.${pilot.paused ? " Its pause marker is set: it starts held until you resume it." : ""}`,
+      body: `Runs fw autopilot, the neverending intake daemon, in a new shell session here. Every ${config.interval_seconds}s it discovers work, scores it, and writes tasks until ${config.target_depth} are queued; a worker then lands them unattended (${landingWords(config.landing)}), through: ${gates(config).join(", ")}.${pilot.paused ? " Its pause marker is set: it starts held until you resume it." : ""}`,
       ok: "Start autopilot",
     });
     if (!ok) return;
@@ -79,6 +87,13 @@ window.FwHubAutopilot = function (ctx) {
   }
 
   async function stop(key) {
+    const ok = await confirmDialog({
+      kicker: "autopilot",
+      title: `Stop autopilot in ${ctx.labelFor(key)}?`,
+      body: "Sends Ctrl-C to its session: it finishes the cycle it is in (an authoring agent may still be writing), stops gracefully, and the session stays open as a shell. Tasks it already emitted stay queued.",
+      ok: "Stop autopilot",
+    });
+    if (!ok) return;
     const out = await act(key, "stop", {});
     if (out) toast(`Stopping autopilot in ${ctx.labelFor(key)}: it finishes gracefully.`, { timeout: 3500 });
   }
@@ -89,9 +104,10 @@ window.FwHubAutopilot = function (ctx) {
       kicker: "autopilot gate",
       title: `${approve ? "Approve" : "Deny"} ${gate.task_id}?`,
       body: approve
-        ? `Approve gate ${gate.gate} (attempt ${gate.attempt}) of run ${gate.run_id}: "${gate.instruction}". Bound to this gate only; the next worker run on ${gate.task_id} applies it (it advances to the next gate, or lands).`
-        : `Deny gate ${gate.gate} (attempt ${gate.attempt}) of run ${gate.run_id}. The run goes to failed validation${feedback ? " and your feedback goes into its next attempt" : " (no feedback given)"}.`,
+        ? `Approve gate ${gate.gate} (attempt ${gate.attempt}) of run ${gate.run_id}: "${gate.instruction}". Bound to this gate only; the next worker run on ${gate.task_id} applies it (it advances to the next gate, or lands through the held-out gate and submit checks as usual).`
+        : `Deny gate ${gate.gate} (attempt ${gate.attempt}) of run ${gate.run_id}. The next worker run on ${gate.task_id} applies it: the run fails validation and is retried on the same run (one retry used), or fails once its retries are spent. ${feedback ? `Your feedback goes into the retry's prompt: "${feedback}"` : "No feedback given: the retry's prompt says so."}`,
       ok: approve ? "Approve" : "Deny",
+      tone: approve ? "plain" : undefined,
     });
     if (!ok) return;
     const body = { run: gate.run_id, decision: approve ? "approve" : "deny", confirm: true, gate: gate.gate, attempt: gate.attempt };
@@ -99,18 +115,20 @@ window.FwHubAutopilot = function (ctx) {
     const done = await act(key, "decide", body);
     if (!done) return;
     denying.delete(gate.run_id);
-    toast(`${approve ? "Approved" : "Denied"} ${gate.task_id} (command #${done.command_id}): the worker applies it on its next run.`, { timeout: 5000 });
+    toast(`${approve ? "Approved" : "Denied"} ${gate.task_id} (command #${done.command_id}): the next worker run applies it.`, { timeout: 5000 });
   }
 
   // --- the daemon row ----------------------------------------------------
 
   function detail(pilot, fallback) {
     if (!pilot) return fallback.detail;
+    if (pilot.state === "absent") return pilot.paused ? "never run here · pause marker set" : "never run here";
     const parts = [pilot.state];
     if (pilot.pid) parts.push(`pid ${pilot.pid}`);
     if (pilot.cycle) parts.push(`cycle ${pilot.cycle}`);
     if (pilot.live && pilot.next_cycle_at && pilot.state === "idle") {
-      parts.push(`next in ${ctx.span(Math.max(0, (Date.parse(pilot.next_cycle_at) - Date.now()) / 1000))}`);
+      const left = (Date.parse(pilot.next_cycle_at) - Date.now()) / 1000;
+      parts.push(left >= 1 ? `next in ${ctx.span(left)}` : "next cycle due");
     }
     if (pilot.paused && pilot.state !== "paused") parts.push("pause marker set");
     return parts.join(" · ");
@@ -125,7 +143,7 @@ window.FwHubAutopilot = function (ctx) {
     const out = [];
     if (ours.length) {
       out.push(button("session", "Open the autopilot's terminal", () => { ctx.close(); openSession(ours[0].id); }));
-      out.push(button("stop", "Stop it: Ctrl-C to its session (it stops gracefully; the session stays a shell)", () => stop(key)));
+      out.push(button("stop", "Stop it: Ctrl-C to its session (asks first; it stops gracefully and the session stays a shell)", () => stop(key)));
     }
     if (pilot.live || pilot.paused) {
       out.push(pilot.paused
@@ -159,7 +177,7 @@ window.FwHubAutopilot = function (ctx) {
 
   function gateRow(key, gate) {
     const readOnly = !!ctx.machineOfKey(key);
-    const open = denying.has(gate.run_id);
+    const open = denying.has(gate.run_id) && !gate.pending;
     const form = open
       ? el(
         "div",
@@ -167,7 +185,7 @@ window.FwHubAutopilot = function (ctx) {
         el("textarea", {
           rows: 2,
           maxLength: 4000,
-          placeholder: "Feedback for the next attempt (optional)",
+          placeholder: "Feedback for the retry (optional; it goes into the agent's prompt)",
           "aria-label": `Feedback denying ${gate.task_id}`,
           value: denying.get(gate.run_id),
           oninput: (event) => denying.set(gate.run_id, event.target.value),
@@ -180,9 +198,15 @@ window.FwHubAutopilot = function (ctx) {
         ),
       )
       : null;
+    const pending = gate.pending
+      ? el("p", {
+        className: "ap-pending",
+        textContent: `${gate.pending.kind === "approve" ? "Approval" : "Deny"} queued (command #${gate.pending.command_id}, ${ctx.ago(gate.pending.enqueued_at)} ago): the next worker run on ${gate.task_id} applies it.`,
+      })
+      : null;
     return el(
       "li",
-      { className: `ap-gate${gate.autopilot ? " ours" : ""}` },
+      { className: `ap-gate${gate.autopilot ? " ours" : ""}${gate.pending ? " decided" : ""}`, id: gateId(gate.run_id) },
       el(
         "div",
         { className: "ap-gate-line" },
@@ -200,7 +224,8 @@ window.FwHubAutopilot = function (ctx) {
           ctx.outputButton(gate.run_id, gate.task_id),
         ),
       ),
-      readOnly
+      pending,
+      readOnly || gate.pending
         ? null
         : el(
           "div",
@@ -210,6 +235,22 @@ window.FwHubAutopilot = function (ctx) {
         ),
       form,
     );
+  }
+
+  const gateId = (runId) => `ap-gate-${runId}`;
+
+  // Open a gate's deny form (from a Needs-you row) and bring it into view.
+  function openDeny(gate) {
+    denying.set(gate.run_id, denying.get(gate.run_id) || "");
+    ctx.render();
+    // After the click settles (the drawer takes focus on clicks inside it).
+    setTimeout(() => {
+      const row = document.getElementById(gateId(gate.run_id));
+      if (!row) return;
+      row.scrollIntoView({ block: "center" });
+      const box = row.querySelector("textarea");
+      if (box) box.focus({ preventScroll: true });
+    }, 0);
   }
 
   function candidateRow(c) {
@@ -237,49 +278,107 @@ window.FwHubAutopilot = function (ctx) {
     );
   }
 
-  function decisionBox(decision) {
-    if (!decision) return el("p", { className: "fw-empty", textContent: "No cycle recorded yet." });
+  function dropList(decision) {
+    if (!decision.dropped_findings.length) return null;
     return el(
-      "div",
-      { className: "ap-decision" },
-      el(
-        "p",
-        { className: "ap-why" },
-        el("b", { textContent: `Cycle ${decision.cycle}: ` }),
-        `emitted ${decision.emitted}, dropped ${decision.dropped}. `,
-        el("span", { textContent: decision.reason }),
-      ),
-      decision.dropped_findings.length
-        ? el(
-          "ul",
-          { className: "ap-drops" },
-          decision.dropped_findings.map((d) => el(
-            "li",
-            {},
-            chip(tierLabel(d.tier)),
-            el("b", { textContent: d.title || d.finding_id, title: d.finding_id }),
-            el("small", { textContent: d.reason }),
-          )),
-        )
-        : null,
-      el("p", { className: "ap-meta", textContent: `discovery cache ${decision.discovery_cache || "-"}` }),
+      "ul",
+      { className: "ap-drops" },
+      decision.dropped_findings.map((d) => el(
+        "li",
+        {},
+        chip(tierLabel(d.tier)),
+        el("b", { textContent: d.title || d.finding_id, title: d.finding_id }),
+        el("small", { textContent: d.reason }),
+      )),
     );
   }
 
-  function tierStrip(tiers) {
-    return el(
+  // What it decided and why: the newest cycle that decided anything (kept
+  // while later cycles only find the queue full), then the last cycle.
+  function decisionBox(pilot) {
+    const decided = pilot.last_decided;
+    const last = pilot.decision;
+    if (!decided && !last) return el("p", { className: "fw-empty", textContent: "No cycle recorded yet." });
+    const when = (d) => (d.at ? ` (${ctx.ago(d.at)} ago)` : "");
+    const box = decided
+      ? el(
+        "div",
+        { className: "ap-decision" },
+        el(
+          "p",
+          { className: "ap-why" },
+          el("b", { textContent: `Cycle ${decided.cycle}${when(decided)}: ` }),
+          `emitted ${decided.emitted}, dropped ${decided.dropped}. `,
+          el("span", { textContent: decided.reason }),
+        ),
+        decided.emitted_tasks.length
+          ? el("p", { className: "ap-meta", textContent: `emitted: ${decided.emitted_tasks.map((t) => `${t.task_id} (${tierLabel(t.tier)})`).join(", ")}` })
+          : null,
+        dropList(decided),
+        el("p", { className: "ap-meta", textContent: `discovery cache ${decided.discovery_cache || "-"}` }),
+      )
+      : null;
+    const since = last && (!decided || last.cycle !== decided.cycle)
+      ? el("p", { className: "ap-last", textContent: `Last cycle ${last.cycle}${when(last)}: ${last.reason}` })
+      : null;
+    return el("div", {}, box, since);
+  }
+
+  const VERDICTS = [
+    ["relevant", "relevant: discovery found work"],
+    ["prefiltered", "skipped before discovery"],
+    ["not-relevant", "nothing found"],
+    ["not-run", "not run (queue full)"],
+  ];
+
+  function tierStrip(pilot) {
+    const tiers = pilot.tiers;
+    const basis = pilot.last_decided || pilot.decision;
+    const cells = el(
       "div",
-      { className: "ap-tiers", role: "list", "aria-label": "Tier verdicts of the last cycle" },
+      { className: "ap-tiers", role: "list", "aria-label": basis ? `Tier verdicts of cycle ${basis.cycle}` : "Tier verdicts (no cycle yet)" },
       tiers.map((t) => el(
         "span",
         {
           role: "listitem",
-          className: `ap-tier ${t.verdict.replace(" ", "-")}${t.preemptive ? " pre" : ""}`,
-          title: `Tier ${t.tier}: ${t.name} (${t.preemptive ? "preemptive" : `scheduled, weight ${t.weight}`}): ${t.verdict}${t.emitted ? `, ${t.emitted} emitted` : ""}`,
+          className: `ap-tier ${t.verdict.replace(" ", "-")}${t.preemptive ? " pre" : ""}${t.dropped ? " dropped" : ""}`,
+          title: `Tier ${t.tier}: ${t.name} (${t.preemptive ? "preemptive" : `scheduled, weight ${t.weight}`}): ${t.verdict}${t.emitted ? `, ${t.emitted} emitted` : ""}${t.dropped ? `, ${t.dropped} dropped` : ""}`,
+          "aria-label": `Tier ${t.tier} ${t.name}: ${t.verdict}${t.emitted ? `, ${t.emitted} emitted` : ""}${t.dropped ? `, ${t.dropped} dropped` : ""}`,
         },
         String(t.tier),
         t.emitted ? el("i", { textContent: String(t.emitted) }) : null,
+        t.dropped ? el("em", { textContent: `\u00d7${t.dropped}` }) : null,
       )),
+    );
+    // The verdicts in words (a phone has no hover): the tiers that found
+    // work, each named, then the rest by verdict.
+    const found = tiers.filter((t) => t.verdict === "relevant" || t.emitted || t.dropped);
+    const rest = (verdict) => tiers.filter((t) => t.verdict === verdict && !found.includes(t)).map((t) => tierLabel(t.tier));
+    const words = [];
+    for (const t of found) {
+      const what = [t.verdict];
+      if (t.emitted) what.push(`${t.emitted} emitted`);
+      if (t.dropped) what.push(`${t.dropped} dropped`);
+      words.push(el("li", {}, chip(tierLabel(t.tier), t.preemptive ? "hot" : ""), el("span", { textContent: `${t.name}: ${what.join(", ")}` })));
+    }
+    const groups = [["prefiltered", "skipped before discovery"], ["not relevant", "nothing found"], ["not run", "not run (queue full)"]]
+      .map(([verdict, label]) => [label, rest(verdict)])
+      .filter(([, list]) => list.length)
+      .map(([label, list]) => `${label}: ${list.join(" ")}`);
+    const legend = el(
+      "div",
+      { className: "ap-legend", "aria-hidden": "true" },
+      VERDICTS.map(([cls, label]) => el("span", {}, el("span", { className: `ap-swatch ${cls}` }), label)),
+      el("span", {}, el("span", { className: "ap-swatch dropped" }), "a finding dropped"),
+    );
+    return el(
+      "div",
+      { className: "ap-tier-block" },
+      el("p", { className: "ap-meta", textContent: basis ? `Tiers, as cycle ${basis.cycle} judged them (1-3 preemptive)` : "Tiers (1-3 preemptive): no cycle yet" }),
+      cells,
+      basis ? legend : null,
+      words.length ? el("ul", { className: "ap-tier-list" }, words) : null,
+      groups.length ? el("p", { className: "ap-meta", textContent: groups.join(" · ") }) : null,
     );
   }
 
@@ -292,8 +391,8 @@ window.FwHubAutopilot = function (ctx) {
     const body = [
       el("p", { className: "ap-config", textContent: `target ${config.target_depth} · every ${config.interval_seconds}s · lands via ${config.landing} · ${gates(config).join(" · ")}` }),
       pilot.problem ? el("p", { className: "fw-problem", textContent: pilot.problem }) : null,
-      tierStrip(pilot.tiers),
-      decisionBox(pilot.decision),
+      tierStrip(pilot),
+      decisionBox(pilot),
     ];
     if (pilot.gates.length) {
       body.push(el("h4", { className: "ap-sub", textContent: `Waiting on you (${pilot.gates.length})` }));
@@ -316,16 +415,20 @@ window.FwHubAutopilot = function (ctx) {
     return ctx.section("Autopilot", ours.length ? `${ours.length} need${ours.length === 1 ? "s" : ""} you` : pilot.state, ...body);
   }
 
-  // Approve / deny on a Needs-you "awaiting" alert, when its gate is read.
+  // Approve / deny on a Needs-you "awaiting" alert, when its gate is read
+  // (deny opens the gate's form, for its feedback).
   function alertActions(key, panel, alert) {
     if (alert.kind !== "awaiting" || !alert.run_id || ctx.machineOfKey(key) || !panel.intake) return null;
     const gate = panel.intake.gates.find((g) => g.run_id === alert.run_id);
     if (!gate) return null;
+    if (gate.pending) {
+      return el("small", { className: "ap-alert-pending", textContent: `${gate.pending.kind === "approve" ? "approval" : "deny"} queued` });
+    }
     return el(
       "span",
       { className: "ap-alert-actions" },
       el("button", { type: "button", className: "text-btn", textContent: "approve", onclick: () => decide(key, gate, true) }),
-      el("button", { type: "button", className: "text-btn", textContent: "deny", onclick: () => decide(key, gate, false) }),
+      el("button", { type: "button", className: "text-btn", textContent: "deny...", onclick: () => openDeny(gate) }),
     );
   }
 

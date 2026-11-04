@@ -840,6 +840,11 @@ pub trait ControlCommandStore {
     ) -> Result<Vec<ControlCommandRecord>, StoreError>;
 
     fn delete_command(&self, command_id: i64) -> Result<(), StoreError>;
+
+    /// Every still-pending (unclaimed) row for `run_id`, ascending `id`,
+    /// without claiming it: a read for status surfaces (a decision already
+    /// queued on a gate).
+    fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError>;
 }
 
 /// Composite store contract the harness requires.
@@ -966,6 +971,9 @@ macro_rules! forward_store_traits {
             }
             fn delete_command(&self, command_id: i64) -> Result<(), StoreError> {
                 (**self).delete_command(command_id)
+            }
+            fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
+                (**self).pending_commands(run_id)
             }
         }
     )*};
@@ -1271,6 +1279,18 @@ mod tests {
                 .unwrap()
                 .retain(|c| c.id != Some(command_id));
             Ok(())
+        }
+        fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
+            let mut rows: Vec<ControlCommandRecord> = self
+                .commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.run_id == run_id && c.is_pending())
+                .cloned()
+                .collect();
+            rows.sort_by_key(|c| c.id);
+            Ok(rows)
         }
     }
 

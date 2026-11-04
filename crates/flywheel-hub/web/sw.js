@@ -96,7 +96,7 @@ self.addEventListener("notificationclick", (event) => {
       client.postMessage({ type: "fw-hub-open", session, folder });
       return;
     }
-    await self.clients.openWindow(session ? `/#session=${session}` : "/");
+    await self.clients.openWindow(session ? `/#session=${session}` : folder ? `/#flywheel=${encodeURIComponent(folder)}` : "/");
   })());
 });
 

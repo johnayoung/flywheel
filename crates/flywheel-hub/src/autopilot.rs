@@ -105,10 +105,13 @@ pub struct PilotEmit {
     pub tier: u8,
 }
 
-/// What the last completed cycle decided.
+/// What one completed cycle decided.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PilotDecision {
     pub cycle: i64,
+    /// When the cycle finished (unknown for an older record's last cycle).
+    #[serde(default)]
+    pub at: Option<DateTime<Utc>>,
     pub emitted: i64,
     pub dropped: i64,
     pub reason: String,
@@ -119,7 +122,8 @@ pub struct PilotDecision {
     pub dropped_findings: Vec<PilotDrop>,
 }
 
-/// One tier of the model, with the last cycle's verdict on it.
+/// One tier of the model, with the verdict of the newest cycle that ran
+/// discovery on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PilotTier {
     pub tier: u8,
@@ -130,8 +134,11 @@ pub struct PilotTier {
     /// relevant`, `not run` (the cycle ran no discovery), or `unknown` (no
     /// cycle recorded).
     pub verdict: String,
-    /// Tasks the last cycle emitted at this tier.
+    /// Tasks that cycle emitted at this tier.
     pub emitted: usize,
+    /// Findings that cycle dropped at this tier.
+    #[serde(default)]
+    pub dropped: usize,
 }
 
 /// A task autopilot emitted (its task file's provenance block) and how
@@ -179,6 +186,20 @@ pub struct PilotGate {
     pub since: Option<DateTime<Utc>>,
     /// The task was emitted by autopilot.
     pub autopilot: bool,
+    /// A decision already queued on this gate (not yet applied by a
+    /// worker): another one is refused.
+    #[serde(default)]
+    pub pending: Option<PendingDecision>,
+}
+
+/// An approve / reject enqueued on a gate and not yet claimed by the
+/// worker's resolver.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingDecision {
+    /// `approve` or `reject`.
+    pub kind: String,
+    pub command_id: i64,
+    pub enqueued_at: DateTime<Utc>,
 }
 
 /// Autopilot work held by a gate the hub only shows (a strand, a stop, a
@@ -204,7 +225,14 @@ pub struct AutopilotView {
     pub updated_at: Option<DateTime<Utc>>,
     pub next_cycle_at: Option<DateTime<Utc>>,
     pub config: PilotConfig,
+    /// What the last completed cycle decided (often "queue at target").
     pub decision: Option<PilotDecision>,
+    /// The newest cycle that decided anything (ran discovery, emitted or
+    /// dropped work): kept when later cycles only find the queue full.
+    #[serde(default)]
+    pub last_decided: Option<PilotDecision>,
+    /// The tier model with the verdicts of `last_decided` (else of
+    /// `decision`).
     pub tiers: Vec<PilotTier>,
     /// Newest first, bounded.
     pub candidates: Vec<PilotCandidate>,
@@ -228,6 +256,7 @@ impl AutopilotView {
             next_cycle_at: None,
             config: PilotConfig::default(),
             decision: None,
+            last_decided: None,
             tiers: Vec::new(),
             candidates: Vec::new(),
             gates: Vec::new(),
@@ -276,6 +305,9 @@ pub enum GateRefused {
     /// Not parked on a gate, or parked on another gate / attempt than the
     /// one named: nothing enqueued.
     NotThatGate(String),
+    /// A decision is already queued on this gate (a worker has not applied
+    /// it yet): a second one would conflict.
+    AlreadyDecided(String),
     /// The store could not be read or written.
     Store(String),
 }
@@ -283,7 +315,10 @@ pub enum GateRefused {
 impl std::fmt::Display for GateRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownRun(m) | Self::NotThatGate(m) | Self::Store(m) => f.write_str(m),
+            Self::UnknownRun(m)
+            | Self::NotThatGate(m)
+            | Self::AlreadyDecided(m)
+            | Self::Store(m) => f.write_str(m),
         }
     }
 }
@@ -310,64 +345,133 @@ pub fn autopilot_session_name<'a>(taken: impl IntoIterator<Item = &'a str>) -> S
         .expect("an unbounded range has a free name")
 }
 
-/// The folder as events name it: its last component (never the path in
-/// activity rows; plugins get the path too).
-fn folder_name(folder: &Path) -> String {
-    folder
+/// The folder as events name it: its parent's name and its own
+/// (`code/repo`), enough to tell two `repo` folders apart without putting
+/// the path in activity rows (plugins get the path too).
+pub fn folder_name(folder: &Path) -> String {
+    let own = folder
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| folder.display().to_string())
+        .unwrap_or_else(|| folder.display().to_string());
+    match folder
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+    {
+        Some(parent) if !parent.is_empty() => format!("{parent}/{own}"),
+        _ => own,
+    }
+}
+
+/// An event's payload about `folder` with `extra` merged in.
+pub fn folder_payload(folder: &Path, extra: Value) -> Value {
+    let mut payload = json!({ "folder": folder, "name": folder_name(folder) });
+    if let (Value::Object(map), Value::Object(more)) = (&mut payload, extra) {
+        map.extend(more);
+    }
+    payload
+}
+
+/// The `autopilot.gate_decided` payload for a decision the hub enqueued.
+pub fn gate_decided_payload(folder: &Path, decided: &GateDecided, feedback: bool) -> Value {
+    folder_payload(
+        folder,
+        json!({
+            "task_id": decided.task_id,
+            "run_id": decided.run_id,
+            "kind": decided.kind,
+            "gate": decided.gate,
+            "attempt": decided.attempt,
+            "command_id": decided.command_id,
+            "feedback": feedback,
+        }),
+    )
+}
+
+fn approval_needed(folder: &Path, gate: &PilotGate) -> (&'static str, Value) {
+    (
+        "autopilot.approval_needed",
+        folder_payload(
+            folder,
+            json!({
+                "task_id": gate.task_id,
+                "run_id": gate.run_id,
+                "instruction": gate.instruction,
+                "gate": gate.gate,
+                "attempt": gate.attempt,
+            }),
+        ),
+    )
 }
 
 /// The plugin events between two reads of `folder`'s panel. The first
-/// read (`old` = `None`, e.g. after a hub restart) announces nothing: it is
-/// a baseline, not a change.
+/// read (`old` = `None`: a folder just added, or the hub restarted) is a
+/// baseline: it announces only the gates on autopilot work parked at or
+/// after `baseline_since` (when this hub began watching), so a gate that
+/// parked while the folder was being added is not lost, and a hub restart
+/// does not repeat the ones it announced before.
 pub fn events_between(
     old: Option<&FlywheelPanel>,
     new: &FlywheelPanel,
+    baseline_since: Option<DateTime<Utc>>,
 ) -> Vec<(&'static str, Value)> {
-    let (Some(old), Some(now)) = (old.and_then(|p| p.intake.as_ref()), new.intake.as_ref()) else {
+    let Some(now) = new.intake.as_ref() else {
         return Vec::new();
     };
     let folder = &new.folder;
-    let base = |extra: Value| -> Value {
-        let mut payload = json!({ "folder": folder, "name": folder_name(folder) });
-        if let (Value::Object(map), Value::Object(more)) = (&mut payload, extra) {
-            map.extend(more);
-        }
-        payload
+    let Some(old) = old.and_then(|p| p.intake.as_ref()) else {
+        let Some(since) = baseline_since else {
+            return Vec::new();
+        };
+        return now
+            .autopilot_gates()
+            .filter(|g| g.since.is_some_and(|parked| parked >= since))
+            .map(|g| approval_needed(folder, g))
+            .collect();
     };
     let mut events = Vec::new();
     let started = now.live && (!old.live || old.pid != now.pid);
     if old.live && (!now.live || old.pid != now.pid) {
         events.push((
             "autopilot.stopped",
-            base(json!({ "pid": old.pid, "state": now.state.as_str() })),
+            folder_payload(
+                folder,
+                json!({ "pid": old.pid, "state": now.state.as_str() }),
+            ),
         ));
     }
     if started {
-        events.push(("autopilot.started", base(json!({ "pid": now.pid }))));
+        events.push((
+            "autopilot.started",
+            folder_payload(folder, json!({ "pid": now.pid })),
+        ));
     }
-    if let Some(decision) = &now.decision {
-        // A new cycle is news when it did something, or decided otherwise
-        // than the last one: a queue held at its target every interval is
-        // not.
-        let fresh = match &old.decision {
+    if let Some(decision) = &now.last_decided {
+        // A cycle that decided something, announced once: the record names
+        // the cycle it came from, so a failed or no-op cycle after it never
+        // makes the same decision news again.
+        let fresh = match &old.last_decided {
             None => true,
-            Some(d) if d.cycle == decision.cycle && old.pid == now.pid => false,
-            Some(d) => decision.emitted > 0 || decision.dropped > 0 || d.reason != decision.reason,
+            Some(d) => d.cycle != decision.cycle || old.pid != now.pid,
         };
         if fresh {
             events.push((
                 "autopilot.decision",
-                base(json!({
-                    "pid": now.pid,
-                    "cycle": decision.cycle,
-                    "emitted": decision.emitted,
-                    "dropped": decision.dropped,
-                    "reason": decision.reason,
-                    "tasks": decision.emitted_tasks.iter().map(|t| &t.task_id).collect::<Vec<_>>(),
-                })),
+                folder_payload(
+                    folder,
+                    json!({
+                        "pid": now.pid,
+                        "cycle": decision.cycle,
+                        "emitted": decision.emitted,
+                        "dropped": decision.dropped,
+                        "reason": decision.reason,
+                        "tasks": decision.emitted_tasks.iter().map(|t| &t.task_id).collect::<Vec<_>>(),
+                        "dropped_findings": decision.dropped_findings,
+                        "relevant_tiers": decision.relevant_tiers,
+                        "prefiltered_tiers": decision.prefiltered_tiers,
+                        "discovery_cache": decision.discovery_cache,
+                    }),
+                ),
             ));
         }
     }
@@ -376,19 +480,9 @@ pub fn events_between(
         .map(|g| (g.run_id.as_str(), g.gate, g.attempt))
         .collect();
     for gate in now.autopilot_gates() {
-        if seen.contains(&(gate.run_id.as_str(), gate.gate, gate.attempt)) {
-            continue;
+        if !seen.contains(&(gate.run_id.as_str(), gate.gate, gate.attempt)) {
+            events.push(approval_needed(folder, gate));
         }
-        events.push((
-            "autopilot.approval_needed",
-            base(json!({
-                "task_id": gate.task_id,
-                "run_id": gate.run_id,
-                "instruction": gate.instruction,
-                "gate": gate.gate,
-                "attempt": gate.attempt,
-            })),
-        ));
     }
     events
 }
@@ -413,9 +507,10 @@ mod tests {
         }
     }
 
-    fn decided(mut view: AutopilotView, cycle: i64) -> AutopilotView {
-        view.decision = Some(PilotDecision {
+    fn decision(cycle: i64) -> PilotDecision {
+        PilotDecision {
             cycle,
+            at: None,
             emitted: 1,
             dropped: 1,
             reason: "emitted 1".into(),
@@ -426,8 +521,18 @@ mod tests {
                 task_id: "add-tests".into(),
                 tier: 6,
             }],
-            dropped_findings: vec![],
-        });
+            dropped_findings: vec![PilotDrop {
+                finding_id: "t10-readme".into(),
+                tier: 10,
+                title: "Document it".into(),
+                reason: "no committed check can grade a README".into(),
+            }],
+        }
+    }
+
+    fn decided(mut view: AutopilotView, cycle: i64) -> AutopilotView {
+        view.decision = Some(decision(cycle));
+        view.last_decided = Some(decision(cycle));
         view
     }
 
@@ -440,6 +545,7 @@ mod tests {
             attempt: 1,
             since: None,
             autopilot,
+            pending: None,
         }
     }
 
@@ -448,31 +554,47 @@ mod tests {
     }
 
     #[test]
-    fn the_first_read_is_a_baseline() {
-        assert!(events_between(None, &panel(Some(live(1, 1)))).is_empty());
-        assert!(events_between(Some(&panel(None)), &panel(Some(live(1, 1)))).is_empty());
+    fn the_first_read_is_a_baseline_but_keeps_gates_parked_since_the_watch_began() {
+        assert!(events_between(None, &panel(Some(live(1, 1))), None).is_empty());
+        assert!(events_between(Some(&panel(None)), &panel(Some(live(1, 1))), None).is_empty());
+        let watched = Utc::now() - chrono::Duration::minutes(5);
+        let mut parked = live(1, 1);
+        let mut fresh = gate("run-new", 1, true);
+        fresh.since = Some(watched + chrono::Duration::minutes(1));
+        let mut old = gate("run-old", 1, true);
+        old.since = Some(watched - chrono::Duration::minutes(1));
+        parked.gates = vec![fresh, old, gate("run-unknown", 1, true)];
+        let events = events_between(None, &panel(Some(parked.clone())), Some(watched));
+        assert_eq!(names(&events), ["autopilot.approval_needed"]);
+        assert_eq!(events[0].1["run_id"], "run-new");
+        assert!(events_between(None, &panel(Some(parked)), None).is_empty());
     }
 
     #[test]
     fn start_decision_gate_and_stop_are_each_announced_once() {
         let absent = panel(Some(AutopilotView::absent()));
         let up = panel(Some(live(7, 1)));
-        let events = events_between(Some(&absent), &up);
+        let events = events_between(Some(&absent), &up, None);
         assert_eq!(names(&events), ["autopilot.started"]);
-        assert_eq!(events[0].1["name"], "repo");
+        assert_eq!(events[0].1["name"], "code/repo");
         assert_eq!(events[0].1["pid"], 7);
 
         let first = panel(Some(decided(live(7, 1), 1)));
-        let events = events_between(Some(&up), &first);
+        let events = events_between(Some(&up), &first, None);
         assert_eq!(names(&events), ["autopilot.decision"]);
         assert_eq!(events[0].1["tasks"], json!(["add-tests"]));
+        assert_eq!(
+            events[0].1["dropped_findings"][0]["reason"],
+            "no committed check can grade a README"
+        );
+        assert_eq!(events[0].1["relevant_tiers"], json!([6]));
         // The same decision read again: nothing new.
-        assert!(events_between(Some(&first), &first).is_empty());
+        assert!(events_between(Some(&first), &first, None).is_empty());
 
         let mut parked = decided(live(7, 1), 1);
         parked.gates = vec![gate("run-1", 0, true), gate("run-x", 0, false)];
         let parked = panel(Some(parked));
-        let events = events_between(Some(&first), &parked);
+        let events = events_between(Some(&first), &parked, None);
         assert_eq!(
             names(&events),
             ["autopilot.approval_needed"],
@@ -484,43 +606,69 @@ mod tests {
         next.gates = vec![gate("run-1", 1, true)];
         let next = panel(Some(next));
         assert_eq!(
-            names(&events_between(Some(&parked), &next)),
+            names(&events_between(Some(&parked), &next, None)),
             ["autopilot.approval_needed"]
         );
 
         let mut down = decided(live(7, 1), 1);
         down.live = false;
         down.state = PilotState::Stopped;
-        let events = events_between(Some(&next), &panel(Some(down)));
+        let events = events_between(Some(&next), &panel(Some(down)), None);
         assert_eq!(names(&events), ["autopilot.stopped"]);
         assert_eq!(events[0].1["state"], "stopped");
     }
 
     #[test]
-    fn a_cycle_that_decides_the_same_nothing_is_not_news() {
-        let mut idle = live(7, 2);
-        idle.decision = Some(PilotDecision {
-            cycle: 2,
+    fn later_cycles_that_fail_or_find_the_queue_full_do_not_repeat_a_decision() {
+        let first = decided(live(7, 1), 1);
+        // Cycle 2 failed, cycle 3 runs: the record still names cycle 1.
+        let mut later = first.clone();
+        later.cycle = 3;
+        later.state = PilotState::Running;
+        assert!(
+            events_between(
+                Some(&panel(Some(first.clone()))),
+                &panel(Some(later.clone())),
+                None
+            )
+            .is_empty()
+        );
+        // A no-op cycle 4: the last cycle changes, the last decision not.
+        let mut noop = later.clone();
+        noop.cycle = 4;
+        noop.decision = Some(PilotDecision {
+            cycle: 4,
             emitted: 0,
             dropped: 0,
             reason: "queue at target".into(),
-            relevant_tiers: vec![],
-            prefiltered_tiers: vec![],
-            discovery_cache: String::new(),
+            discovery_cache: "not consulted".into(),
             emitted_tasks: vec![],
             dropped_findings: vec![],
+            ..decision(4)
         });
-        let mut again = idle.clone();
-        again.cycle = 3;
-        again.decision.as_mut().unwrap().cycle = 3;
-        assert!(events_between(Some(&panel(Some(idle.clone()))), &panel(Some(again))).is_empty());
-        let mut other = idle.clone();
-        other.decision.as_mut().unwrap().cycle = 3;
-        other.decision.as_mut().unwrap().reason = "no actionable finding".into();
+        assert!(
+            events_between(Some(&panel(Some(later))), &panel(Some(noop.clone())), None).is_empty()
+        );
+        // The daemon stops: no decision rides along.
+        let mut down = noop.clone();
+        down.live = false;
+        down.state = PilotState::Stopped;
         assert_eq!(
             names(&events_between(
-                Some(&panel(Some(idle))),
-                &panel(Some(other))
+                Some(&panel(Some(noop))),
+                &panel(Some(down)),
+                None
+            )),
+            ["autopilot.stopped"]
+        );
+        // A new decision (cycle 5) is news.
+        let mut next = decided(live(7, 5), 5);
+        next.last_decided.as_mut().unwrap().reason = "emitted 2".into();
+        assert_eq!(
+            names(&events_between(
+                Some(&panel(Some(first))),
+                &panel(Some(next)),
+                None
             )),
             ["autopilot.decision"]
         );
@@ -531,13 +679,19 @@ mod tests {
         let old = panel(Some(decided(live(7, 4), 4)));
         let new = panel(Some(decided(live(9, 1), 1)));
         assert_eq!(
-            names(&events_between(Some(&old), &new)),
+            names(&events_between(Some(&old), &new, None)),
             [
                 "autopilot.stopped",
                 "autopilot.started",
                 "autopilot.decision"
             ]
         );
+    }
+
+    #[test]
+    fn folders_are_named_with_their_parent() {
+        assert_eq!(folder_name(Path::new("/home/me/code/repo")), "code/repo");
+        assert_eq!(folder_name(Path::new("/repo")), "repo");
     }
 
     #[test]

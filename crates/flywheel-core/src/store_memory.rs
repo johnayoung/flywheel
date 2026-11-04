@@ -664,6 +664,16 @@ impl ControlCommandStore for InMemoryStore {
             .retain(|c| c.id != Some(command_id));
         Ok(())
     }
+
+    fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
+        Ok(self
+            .lock()
+            .control_commands
+            .iter()
+            .filter(|c| c.run_id == run_id && c.is_pending())
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]

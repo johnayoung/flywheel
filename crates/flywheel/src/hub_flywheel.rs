@@ -53,7 +53,7 @@ use flywheel_hub::util::path_identity as file_identity;
 use flywheel_orchestrator::autopilot_activity::{
     PHASE_STOPPED, epoch_now, is_paused, is_record_live, read_activity, set_paused,
 };
-use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore};
+use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore, REASON_AWAITING_APPROVAL};
 use flywheel_orchestrator::pg_preflight::dsn_target;
 use flywheel_orchestrator::policy::{
     DEFAULT_POLICY_FILENAME, DEFAULT_TASKS_DIR, WorkPolicy, load_policy,
@@ -567,6 +567,14 @@ fn fold_status(entries: Vec<StatusEntry>, panel: &mut FlywheelPanel) {
             continue;
         };
         let state = entry.state.clone().unwrap_or_default();
+        // A human-gate stop only mirrors a parked gate: while the gate is
+        // parked the awaiting alert (with approve / deny) says it, and once
+        // decided the stop is history. `fw status` keeps it until `fw
+        // resolve`; the hub does not repeat it.
+        let stopped = entry
+            .stopped
+            .as_ref()
+            .filter(|s| s.kind != REASON_AWAITING_APPROVAL);
         let task = PanelTask {
             id: task_id.clone(),
             state: light(&state, entry.stranded.is_some()),
@@ -580,7 +588,7 @@ fn fold_status(entries: Vec<StatusEntry>, panel: &mut FlywheelPanel) {
                 kind: p.park_kind.clone(),
                 detail: p.detail.clone(),
             }),
-            stopped: entry.stopped.as_ref().map(|s| Note {
+            stopped: stopped.map(|s| Note {
                 kind: s.kind.clone(),
                 detail: s.detail.clone(),
             }),
@@ -631,7 +639,7 @@ fn fold_status(entries: Vec<StatusEntry>, panel: &mut FlywheelPanel) {
         if let Some(park) = &entry.stranded {
             alert(AlertKind::Stranded, joined(&park.park_kind, &park.detail));
         }
-        if let Some(stop) = &entry.stopped {
+        if let Some(stop) = stopped {
             // The run's own error says why (an abort's reason: "already
             // present on the base"); the stop's detail opens with the run
             // id, all a narrow card would show of it.
@@ -1163,6 +1171,41 @@ impl FlywheelProvider for HubFlywheel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_human_gate_stop_is_not_repeated_open_or_decided() {
+        let stop = serde_json::json!({
+            "kind": "awaiting-approval",
+            "detail": "human gate: \"t\" run \"run-1\" is awaiting manual approval"
+        });
+        let entries: Vec<StatusEntry> = serde_json::from_value(serde_json::json!([
+            {
+                "task_id": "open-gate",
+                "state": "awaiting_approval",
+                "latest_run_id": "run-1",
+                "latest_status": "awaiting_approval",
+                "awaiting_on": {"ordinal": 1, "instruction": "Confirm"},
+                "stopped": stop,
+            },
+            {
+                "task_id": "landed",
+                "state": "done",
+                "latest_run_id": "run-2",
+                "latest_status": "done",
+                "stopped": stop,
+            },
+        ]))
+        .unwrap();
+        let mut panel = FlywheelPanel::empty(PathBuf::from("/repo"), Utc::now());
+        fold_status(entries, &mut panel);
+        let kinds: Vec<(AlertKind, &str)> = panel
+            .alerts
+            .iter()
+            .map(|a| (a.kind, a.subject.as_str()))
+            .collect();
+        assert_eq!(kinds, [(AlertKind::Awaiting, "open-gate")]);
+        assert!(panel.phases[0].tasks.iter().all(|t| t.stopped.is_none()));
+    }
 
     #[test]
     fn a_stopped_task_s_alert_says_why_its_run_stopped() {

@@ -429,15 +429,40 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
     );
     let run_id = gate["run_id"].as_str().unwrap().to_owned();
     let ordinal = gate["gate"].as_u64().unwrap();
-    let attempt = gate["attempt"].as_u64().unwrap();
+    assert_eq!(gate["attempt"], 1);
+    assert_eq!(gate["pending"], Value::Null);
     // The folder's summary counts it (sidebar badge, Needs you).
     wait_for("the summary to count the gate", || {
         let (_, list) = http(&server, "GET", "/api/flywheel", None);
         (list["folders"][0]["autopilot_gates"] == 1).then_some(())
     });
+    // Needs you says it once: the awaiting alert, not also the human-gate
+    // stop `fw status` keeps.
+    let (_, panel) = http(
+        &server,
+        "GET",
+        &format!("/api/flywheel/panel?folder={}", query(&root)),
+        None,
+    );
+    let alerts: Vec<&str> = panel["alerts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["kind"].as_str())
+        .collect();
+    assert_eq!(alerts, ["awaiting"], "{panel}");
+    // Cycles since the first held the queue at its target: why it emitted
+    // and dropped is still there.
+    let later = view();
+    let kept = &later["view"]["last_decided"];
+    assert_eq!(kept["cycle"], decision["cycle"], "{later}");
+    assert_eq!(
+        kept["dropped_findings"][0]["reason"],
+        "no committed check can grade a README"
+    );
+    assert_eq!(later["view"]["tiers"][5]["verdict"], "relevant");
+    assert_eq!(later["view"]["tiers"][3]["dropped"], 1);
 
-    // Approve: confirmed, pinned to the gate shown; a stale pin is
-    // refused and enqueues nothing.
     let decide = |body: Value| {
         http(
             &server,
@@ -446,13 +471,81 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
             Some(body),
         )
     };
+    // Deny with feedback: the run goes back for another attempt, and only
+    // one decision can be queued on a gate.
+    let (code, denied) = decide(json!({
+        "folder": root, "run": run_id, "decision": "deny", "confirm": true,
+        "gate": ordinal, "attempt": 1, "feedback": "use real parser samples",
+    }));
+    assert_eq!(code, 200, "{denied}");
+    assert_eq!(denied["kind"], "reject");
+    let pending = wait_for("the gate to show its queued decision", || {
+        let answer = view();
+        let gate = answer["view"]["gates"][0].clone();
+        (gate["pending"]["kind"] == "reject").then_some(gate)
+    });
+    assert_eq!(pending["pending"]["command_id"], denied["command_id"]);
+    let (code, twice) = decide(json!({
+        "folder": root, "run": run_id, "decision": "approve", "confirm": true,
+        "gate": ordinal, "attempt": 1,
+    }));
+    assert_eq!(code, 409, "{twice}");
+    assert_eq!(queued(&db, &run_id).len(), 1, "nothing more enqueued");
+    let row = wait_for("the decision's activity row", || {
+        let (_, page) = http(
+            &server,
+            "GET",
+            "/api/activity?machines=none&limit=200",
+            None,
+        );
+        page["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["kind"] == "autopilot.gate_decided")
+            .cloned()
+    });
+    assert_eq!(
+        row["data"]["run_id"],
+        json!(run_id),
+        "a run id is not a secret"
+    );
+    assert_eq!(row["data"]["decision"], "reject");
+
+    // The next worker run applies the deny and retries the task on the
+    // same run (the feedback in its prompt): it parks on the gate again,
+    // attempt 2.
+    let (code, worker) = http(
+        &server,
+        "POST",
+        "/api/flywheel/worker",
+        Some(json!({ "folder": root, "workspace_id": workspace_id, "tasks": ["cover-parser"] })),
+    );
+    assert_eq!(code, 201, "{worker}");
+    let worker_id = worker["id"].as_str().unwrap().to_owned();
+    wait_for("the retried task to settle", || {
+        screen_text(&server, &worker_id)
+            .contains("fw worker exited with status")
+            .then_some(())
+    });
+    let regated = wait_for("the retry's gate to show", || {
+        let answer = view();
+        let gate = answer["view"]["gates"][0].clone();
+        (gate["attempt"] == 2).then_some(gate)
+    });
+    assert_eq!(regated["run_id"], json!(run_id), "the same run, retried");
+    assert_eq!(regated["pending"], Value::Null);
+    let attempt = 2;
+
+    // Approve: confirmed, pinned to the gate shown; a stale pin is
+    // refused and enqueues nothing.
     let (code, _) = decide(json!({
         "folder": root, "run": run_id, "decision": "approve", "gate": ordinal, "attempt": attempt,
     }));
     assert_eq!(code, 400, "unconfirmed");
     let (code, stale) = decide(json!({
         "folder": root, "run": run_id, "decision": "approve", "confirm": true,
-        "gate": ordinal + 1, "attempt": attempt,
+        "gate": ordinal, "attempt": 1,
     }));
     assert_eq!(code, 409, "{stale}");
     assert!(queued(&db, &run_id).is_empty());
@@ -570,6 +663,13 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
     // task with its score and landed run.
     assert!(
         text.contains("already at or above target 1; nothing emitted"),
+        "{text}"
+    );
+    // ...and, kept since, the cycle that emitted it and why it dropped the
+    // other finding.
+    assert!(text.contains("emitted 1, dropped 1"), "{text}");
+    assert!(
+        text.contains("(tier 4): no committed check can grade a README"),
         "{text}"
     );
     assert!(

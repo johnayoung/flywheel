@@ -1510,6 +1510,26 @@ impl ControlCommandStore for SqliteStore {
             Ok(())
         })
     }
+
+    fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
+        self.with_retry(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, run_id, kind, payload_json, enqueued_at, claimed_at
+                     FROM control_commands WHERE run_id = ?1 AND claimed_at IS NULL
+                     ORDER BY id",
+                )
+                .map_err(db)?;
+            let raws = stmt
+                .query_map(params![run_id], RawControlCommand::read)
+                .map_err(db)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db)?;
+            raws.into_iter()
+                .map(RawControlCommand::decode)
+                .collect::<Result<Vec<_>, _>>()
+        })
+    }
 }
 
 #[cfg(test)]

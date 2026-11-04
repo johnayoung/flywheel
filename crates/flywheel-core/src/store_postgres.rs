@@ -1908,6 +1908,21 @@ impl ControlCommandStore for PostgresStore {
             .map_err(db)?;
         Ok(())
     }
+
+    fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
+        let rows = {
+            let mut client = self.lock()?;
+            client
+                .query(
+                    "SELECT id, run_id, kind, payload_json, enqueued_at, claimed_at
+                     FROM control_commands WHERE run_id = $1 AND claimed_at IS NULL
+                     ORDER BY id",
+                    &[&run_id],
+                )
+                .map_err(db)?
+        };
+        rows.iter().map(control_command_from_row).collect()
+    }
 }
 
 #[cfg(test)]

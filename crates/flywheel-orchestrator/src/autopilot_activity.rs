@@ -88,6 +88,47 @@ impl DroppedSummary {
     }
 }
 
+/// One cycle's decision, kept whole: what it emitted and dropped (with
+/// reasons) and its tier verdicts. The record carries the last cycle that
+/// actually decided something ([`AutopilotActivity::last_decision`]), so a
+/// later cycle that only finds the queue at its target does not erase why
+/// the last tasks were emitted or findings dropped.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct CycleSummary {
+    /// The cycle's index (`cycle_index` when it ran; 1-based).
+    pub cycle: i64,
+    /// When it finished (epoch seconds).
+    pub at: f64,
+    #[serde(default)]
+    pub emitted: i64,
+    #[serde(default)]
+    pub dropped: i64,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub relevant_tiers: Vec<u8>,
+    #[serde(default)]
+    pub emitted_tasks: Vec<EmittedSummary>,
+    #[serde(default)]
+    pub prefiltered_tiers: Vec<u8>,
+    #[serde(default)]
+    pub discovery_cache: String,
+    #[serde(default)]
+    pub dropped_findings: Vec<DroppedSummary>,
+}
+
+/// The discovery-cache wording of a cycle that never reached discovery
+/// (the queue was already at its target).
+pub const DISCOVERY_NOT_CONSULTED: &str = "not consulted";
+
+impl CycleSummary {
+    /// Whether the cycle decided anything: it ran discovery, or emitted or
+    /// dropped work.
+    pub fn decided(&self) -> bool {
+        self.emitted > 0 || self.dropped > 0 || self.discovery_cache != DISCOVERY_NOT_CONSULTED
+    }
+}
+
 /// What the autopilot daemon is doing right now, for the status surface.
 ///
 /// Timestamps are epoch seconds so the reader can compute a countdown
@@ -137,6 +178,15 @@ pub struct AutopilotActivity {
     /// [`MAX_DROPPED_SUMMARIES`]; `last_dropped` is the full count).
     #[serde(default)]
     pub last_dropped_findings: Vec<DroppedSummary>,
+    /// The cycle the `last_*` summary describes (0: none recorded yet, or
+    /// a record from before this field). A failed cycle records no
+    /// summary, so this can trail `cycle_index` by more than one.
+    #[serde(default)]
+    pub last_cycle: i64,
+    /// The newest cycle that decided anything ([`CycleSummary::decided`]),
+    /// kept across later no-op cycles.
+    #[serde(default)]
+    pub last_decision: Option<CycleSummary>,
 }
 
 impl AutopilotActivity {
@@ -164,6 +214,8 @@ impl AutopilotActivity {
             last_prefiltered_tiers: Vec::new(),
             last_discovery_cache: String::new(),
             last_dropped_findings: Vec::new(),
+            last_cycle: 0,
+            last_decision: None,
         }
     }
 }
@@ -186,6 +238,8 @@ fn to_value(activity: &AutopilotActivity) -> Value {
         "last_prefiltered_tiers": activity.last_prefiltered_tiers,
         "last_discovery_cache": activity.last_discovery_cache,
         "last_dropped_findings": activity.last_dropped_findings,
+        "last_cycle": activity.last_cycle,
+        "last_decision": activity.last_decision,
     })
 }
 
@@ -325,6 +379,13 @@ fn from_value(data: &Value) -> Option<AutopilotActivity> {
             .and_then(|v| as_text(Some(v)))
             .unwrap_or_default(),
         last_dropped_findings: dropped,
+        last_cycle: as_int(data.get("last_cycle")).unwrap_or(0),
+        // Lenient: a malformed nested summary reads as none, never as a
+        // missing record.
+        last_decision: data
+            .get("last_decision")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value(v.clone()).ok()),
     })
 }
 
@@ -477,7 +538,55 @@ mod tests {
                 "Document the CLI",
                 "no out-of-band grader",
             )],
+            last_cycle: 7,
+            last_decision: Some(CycleSummary {
+                cycle: 6,
+                at: 900.0,
+                emitted: 1,
+                dropped: 1,
+                reason: "emitted 1".to_owned(),
+                relevant_tiers: vec![10],
+                emitted_tasks: vec![],
+                prefiltered_tiers: vec![1, 2],
+                discovery_cache: "miss".to_owned(),
+                dropped_findings: vec![DroppedSummary::new("t10-x", 10, "x", "why")],
+            }),
         }
+    }
+
+    #[test]
+    fn a_cycle_decided_when_it_ran_discovery_or_moved_work() {
+        let mut summary = CycleSummary {
+            discovery_cache: DISCOVERY_NOT_CONSULTED.to_owned(),
+            ..CycleSummary::default()
+        };
+        assert!(!summary.decided());
+        summary.dropped = 1;
+        assert!(summary.decided());
+        summary.dropped = 0;
+        summary.discovery_cache = "miss".to_owned();
+        assert!(summary.decided());
+    }
+
+    #[test]
+    fn a_malformed_last_decision_reads_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("activity.json");
+        std::fs::write(
+            &path,
+            json!({
+                "schema_version": ACTIVITY_SCHEMA_VERSION,
+                "pid": 1, "phase": "idle", "cycle_index": 3,
+                "updated_at": 1.0, "interval_seconds": 5.0,
+                "last_cycle": 2,
+                "last_decision": {"cycle": "x"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let back = read_activity(Some(&path)).unwrap();
+        assert_eq!(back.last_cycle, 2);
+        assert_eq!(back.last_decision, None);
     }
 
     #[test]

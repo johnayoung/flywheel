@@ -1247,7 +1247,18 @@ fn control_commands_enqueue_claim_once_in_order_scoped_by_run(store: &dyn Harnes
     assert!(third.id.unwrap() > second.id.unwrap());
     assert!(other.id.unwrap() > third.id.unwrap());
 
+    // A pending read is in id order, scoped by run, and claims nothing.
+    let pending = store.pending_commands("r1").unwrap();
+    assert_eq!(
+        pending.iter().map(|c| c.id).collect::<Vec<_>>(),
+        vec![first.id, second.id, third.id]
+    );
+    assert!(pending.iter().all(|c| c.is_pending()));
+    assert_eq!(store.pending_commands("r1").unwrap().len(), 3);
+
     let claimed = store.claim_commands("r1", t(3)).unwrap();
+    assert!(store.pending_commands("r1").unwrap().is_empty());
+    assert_eq!(store.pending_commands("r2").unwrap().len(), 1);
     assert_eq!(
         claimed.iter().map(|c| c.kind.as_str()).collect::<Vec<_>>(),
         vec!["say", "interrupt", "set_model"]

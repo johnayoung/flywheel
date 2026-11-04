@@ -170,6 +170,11 @@
 }
 .fw-light, .fw-kind, .fw-status {
   justify-self: start;
+  /* Never over the task name beside it: a long word is cut. */
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: .1rem .38rem;
   border-radius: 2px;
   font-size: 9px;

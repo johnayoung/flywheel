@@ -268,6 +268,9 @@ impl ControlCommandStore for FailingStore {
     fn delete_command(&self, command_id: i64) -> Result<(), StoreError> {
         self.inner.delete_command(command_id)
     }
+    fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
+        self.inner.pending_commands(run_id)
+    }
 }
 
 // --- Messages and iterations ----------------------------------------------

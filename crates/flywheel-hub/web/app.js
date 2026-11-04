@@ -80,6 +80,20 @@ async function boot() {
   } catch (error) {
     showError(error);
   }
+  // A link to a folder's Flywheel panel (`#flywheel=<path>`, a browser
+  // notification's) or to an autopilot gate (`#gate=<run id>`, a push's):
+  // open that panel, then drop the hash.
+  const panelLink = /^#(flywheel|gate)=(.+)$/.exec(window.location.hash);
+  if (panelLink) {
+    history.replaceState(null, "", window.location.pathname);
+    const value = decodeURIComponent(panelLink[2]);
+    if (panelLink[1] === "flywheel") flywheel.open(value);
+    else if (/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+      flywheel.reload().catch(() => {}).then(() => flywheel.openGate(value)).then((found) => {
+        if (!found) commands.toast("That gate is no longer waiting: it was decided, or its run moved on.", { timeout: 6000 });
+      });
+    }
+  }
   // Re-attach the session named in the URL (survives reloads).
   const match = /^#session=([0-9a-f]+)$/.exec(window.location.hash);
   if (match) {

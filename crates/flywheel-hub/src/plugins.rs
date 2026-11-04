@@ -87,6 +87,7 @@ pub const EVENTS: &[&str] = &[
     "autopilot.stopped",
     "autopilot.decision",
     "autopilot.approval_needed",
+    "autopilot.gate_decided",
 ];
 const STATUSES: &[&str] = &["working", "blocked", "done", "idle", "unknown"];
 const KINDS: &[&str] = &["shell", "claude", "codex"];

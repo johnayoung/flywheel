@@ -899,6 +899,82 @@ pub async fn orchestrate(
             continue;
         }
 
+        // 1b'. Resume a READY run nobody drives: a gate reject resolved
+        //     above (or by a worker that exited before driving it) routes
+        //     the lifecycle `-> ready` for its retry on the same run id, and
+        //     fresh selection never picks an in-progress row. A live peer's
+        //     READY run (between attempts) is skipped: its claim holds.
+        for row in &rows {
+            if claim_pause_until.is_some() {
+                break;
+            }
+            if row.latest_status != Some(Status::Ready) || !in_scope(scope, &row.task_id) {
+                continue;
+            }
+            let Some(run_id) = row.latest_run_id.clone() else {
+                continue;
+            };
+            if attempted_resume.contains(&run_id) {
+                continue;
+            }
+            let Some(item) = item_by_id.get(&row.task_id).copied() else {
+                continue;
+            };
+            let Some(claim) = acquire_with_grace(
+                claims.as_ref(),
+                &row.task_id,
+                &wid,
+                clock(),
+                request.lease_seconds,
+                &item.conflict_keys,
+                steal_grace,
+            )?
+            else {
+                continue;
+            };
+            // Re-read under the claim: the row may be stale by now.
+            if control.load_lifecycle(&run_id)?.map(|lc| lc.status) != Some(Status::Ready) {
+                claims.release_claim(&claim, Some(clock()))?;
+                continue;
+            }
+            attempted_resume.insert(run_id.clone());
+            let handle = match prepare_sandbox_guarded(
+                strategy.as_ref(),
+                &SandboxRequest::resume(item, run_id.clone()),
+            ) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    emit(
+                        log.as_ref(),
+                        format!(
+                            "[orchestrate] {}: prepare failed (PrepareError: {err}); skipping",
+                            row.task_id
+                        ),
+                    );
+                    claims.record_prepare_skip(&claim, &format!("PrepareError: {err}"), clock())?;
+                    continue;
+                }
+            };
+            emit(
+                log.as_ref(),
+                format!("[orchestrate] {}: resuming ready run {run_id}", row.task_id),
+            );
+            match drive_or_relinquish(&ctx, claim, item, handle, Some(&run_id)).await? {
+                DriveDisposition::Recorded(record) => runs.push(record),
+                DriveDisposition::Relinquished => {}
+                DriveDisposition::Shutdown => {
+                    return Err(OrchestrateError::Interrupted {
+                        report: report(&wid, &recovered, &runs),
+                    });
+                }
+            }
+            progressed = true;
+            break;
+        }
+        if progressed {
+            continue;
+        }
+
         // 1c. Bounded re-drive of parked landings (spec 00069), opt-in and
         //     strategy-gated. A re-attempt that lands advanced the base and
         //     may promote dependents, so state is re-read on the next pass.

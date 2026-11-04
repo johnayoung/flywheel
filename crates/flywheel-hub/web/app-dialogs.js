@@ -4,12 +4,15 @@
 
 // --- dialogs: confirm ------------------------------------------------
 
-function confirmDialog({ kicker, title, body, ok }) {
+// `tone: "plain"` for a confirm that destroys nothing (an approval): its
+// button is not styled as a danger.
+function confirmDialog({ kicker, title, body, ok, tone }) {
   const dialog = $("#dlg-confirm");
   $("#confirm-kicker").textContent = kicker || "confirm";
   $("#confirm-title").textContent = title;
   $("#confirm-body").textContent = body;
   $("#confirm-ok").textContent = ok || "Confirm";
+  $("#confirm-ok").classList.toggle("danger", tone !== "plain");
   dialog.returnValue = "";
   // Last in the document, as it is in the top layer: opened over another
   // modal (the Commit dialog's "Ask the agent"), tools that take the

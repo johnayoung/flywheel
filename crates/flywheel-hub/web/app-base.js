@@ -250,6 +250,13 @@ function statusLook(session) {
   // worker ended (a scoped run's 0 = every named task verified, 2 = refused).
   const worker = session.worker;
   if (session.state === "running" && session.live && worker && !worker.running) {
+    // An autopilot session (its wrapper's marker) ended its daemon.
+    if (Array.isArray(session.command) && session.command[3] === "fw-autopilot") {
+      const code = worker.exit_status;
+      const title = code == null ? "fw autopilot exited" : `fw autopilot exited with status ${code}; its shell is still open`;
+      if (code == null || code === 0) return { dot: "done", label: "autopilot stopped", tone: "", title };
+      return { dot: "bad", label: `autopilot exit ${code}`, tone: "bad", title };
+    }
     const scoped = Array.isArray(session.command) && session.command.some((a) => String(a).startsWith("--task="));
     const code = worker.exit_status;
     const title = code == null ? "fw worker exited" : `fw worker exited with status ${code}; its shell is still open`;

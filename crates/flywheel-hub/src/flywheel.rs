@@ -529,6 +529,9 @@ pub struct FlywheelMonitor {
     starting: Mutex<()>,
     /// Blocking reads still running (see [`FlywheelMonitor::begin_read`]).
     reads: Arc<ReadGate>,
+    /// When this monitor began: a folder's first read announces the gates
+    /// parked since (see [`crate::autopilot::events_between`]).
+    since: DateTime<Utc>,
 }
 
 /// The keys of blocking reads in flight.
@@ -583,6 +586,7 @@ impl FlywheelMonitor {
             events,
             starting: Mutex::new(()),
             reads: Arc::default(),
+            since: Utc::now(),
         })
     }
 
@@ -736,7 +740,11 @@ impl FlywheelMonitor {
                 let (changed, events) = {
                     let mut current = slot.panel.lock().unwrap_or_else(PoisonError::into_inner);
                     let changed = current.as_ref().is_none_or(|old| !old.same_content(&panel));
-                    let events = crate::autopilot::events_between(current.as_deref(), &panel);
+                    let events = crate::autopilot::events_between(
+                        current.as_deref(),
+                        &panel,
+                        Some(self.since),
+                    );
                     let summary = panel.summary();
                     *current = Some(Arc::new(panel));
                     (changed.then_some(summary), events)

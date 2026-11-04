@@ -26,6 +26,35 @@
 .ap-tier.relevant { background: color-mix(in srgb, var(--fw-ok) 22%, var(--bg)); color: var(--ink); border-color: color-mix(in srgb, var(--fw-ok) 55%, var(--rule-2)); }
 .ap-tier.prefiltered { background: repeating-linear-gradient(135deg, var(--bg) 0 3px, var(--bg-3) 3px 6px); }
 .ap-tier.not-relevant { opacity: .7; }
+.ap-tier.not-run { opacity: .45; border-style: dashed; }
+.ap-tier.dropped { box-shadow: inset 0 -3px 0 var(--alert); }
+.ap-tier em {
+  position: absolute;
+  bottom: -.45rem;
+  left: -.2rem;
+  padding: 0 .2rem;
+  border-radius: 2px;
+  background: var(--alert);
+  color: #fff;
+  font: 700 9px/1.3 var(--mono);
+  font-style: normal;
+}
+.ap-legend { display: flex; flex-wrap: wrap; gap: .2rem .8rem; margin: .1rem 0 .4rem; color: var(--ink-3); font-size: 10px; }
+.ap-legend > span { display: inline-flex; align-items: center; gap: .3rem; }
+.ap-swatch { display: inline-block; width: .7rem; height: .7rem; border: 1px solid var(--rule-2); background: var(--bg); }
+.ap-swatch.relevant { background: color-mix(in srgb, var(--fw-ok) 22%, var(--bg)); border-color: color-mix(in srgb, var(--fw-ok) 55%, var(--rule-2)); }
+.ap-swatch.prefiltered { background: repeating-linear-gradient(135deg, var(--bg) 0 2px, var(--bg-3) 2px 4px); }
+.ap-swatch.not-relevant { opacity: .7; }
+.ap-swatch.not-run { opacity: .45; border-style: dashed; }
+.ap-swatch.dropped { box-shadow: inset 0 -3px 0 var(--alert); }
+.ap-tier-list { list-style: none; margin: 0 0 .3rem; padding: 0; display: grid; gap: .2rem; font-size: 10.5px; color: var(--ink-2); }
+.ap-tier-list li { display: flex; align-items: baseline; gap: .45rem; overflow-wrap: anywhere; }
+.ap-tier-block { margin: 0 0 .55rem; }
+.ap-tier-block .ap-tiers { margin-bottom: .6rem; }
+.ap-last { margin: .35rem 0 0; color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
+.ap-pending { margin: .35rem 0 0; color: var(--ink-2); font-size: 10.5px; overflow-wrap: anywhere; }
+.ap-gate.decided { border-left-color: var(--rule-2); }
+.ap-alert-pending { color: var(--ink-3); font-size: 10px; white-space: nowrap; }
 .ap-tier i {
   position: absolute;
   top: -.4rem;
@@ -78,4 +107,8 @@
   .ap-cand > .fw-task-meta, .ap-gate-line > .fw-task-meta { grid-column: 1 / -1; justify-content: flex-end; }
   .ap-tier { min-height: 2rem; }
   .ap-gate-actions button, .ap-deny-actions button, .ap-alert-actions button { min-height: 2.75rem; min-width: 2.75rem; }
+  /* The daemon rows' controls (session / stop / pause / resume, worker):
+     44px touch targets, spaced. */
+  .fw-daemon-actions { flex-wrap: wrap; gap: .4rem .6rem; }
+  .fw-daemon-actions button { min-height: 2.75rem; min-width: 2.75rem; }
 }

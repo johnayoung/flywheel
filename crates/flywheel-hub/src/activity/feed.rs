@@ -737,7 +737,8 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
         "autopilot.started"
         | "autopilot.stopped"
         | "autopilot.decision"
-        | "autopilot.approval_needed" => {
+        | "autopilot.approval_needed"
+        | "autopilot.gate_decided" => {
             let name = str_at(payload, "/name").unwrap_or("a folder");
             let row = |text: String| Draft::new(event, text).with("folder", name);
             match event {
@@ -749,17 +750,91 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
                     let emitted = payload.get("emitted").and_then(Value::as_i64).unwrap_or(0);
                     let dropped = payload.get("dropped").and_then(Value::as_i64).unwrap_or(0);
                     let reason = str_at(payload, "/reason").unwrap_or("");
-                    row(format!(
-                        "autopilot in {name}: emitted {emitted}, dropped {dropped}{}",
-                        if reason.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" -- {reason}")
+                    // Why each finding was dropped, and the tier verdicts:
+                    // the row keeps the explanation the next cycle's record
+                    // no longer carries.
+                    let drops: Vec<String> = payload
+                        .get("dropped_findings")
+                        .and_then(Value::as_array)
+                        .map(|list| {
+                            list.iter()
+                                .map(|d| {
+                                    format!(
+                                        "{} (T{}): {}",
+                                        str_at(d, "/finding_id").unwrap_or("?"),
+                                        d.get("tier").and_then(Value::as_u64).unwrap_or(0),
+                                        str_at(d, "/reason").unwrap_or("")
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let tier_list = |key: &str| -> String {
+                        payload
+                            .get(key)
+                            .and_then(Value::as_array)
+                            .map(|t| {
+                                t.iter()
+                                    .filter_map(Value::as_u64)
+                                    .map(|n| n.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                            .unwrap_or_default()
+                    };
+                    let mut verdicts = Vec::new();
+                    for (label, key) in [
+                        ("relevant", "relevant_tiers"),
+                        ("prefiltered", "prefiltered_tiers"),
+                    ] {
+                        let list = tier_list(key);
+                        if !list.is_empty() {
+                            verdicts.push(format!("{label} T{list}"));
                         }
+                    }
+                    let mut text =
+                        format!("autopilot in {name}: emitted {emitted}, dropped {dropped}");
+                    if !reason.is_empty() {
+                        text.push_str(&format!(" -- {reason}"));
+                    }
+                    if !drops.is_empty() {
+                        text.push_str(&format!("; dropped {}", drops.join("; ")));
+                    }
+                    let mut draft = row(text)
+                        .with("cycle", payload.get("cycle").cloned())
+                        .with("emitted", emitted)
+                        .with("dropped", dropped);
+                    if !drops.is_empty() {
+                        draft = draft.with("drops", drops.join("; "));
+                    }
+                    if !verdicts.is_empty() {
+                        draft = draft.with("tiers", verdicts.join("; "));
+                    }
+                    draft
+                }
+                "autopilot.gate_decided" => {
+                    let task = str_at(payload, "/task_id").unwrap_or("a task");
+                    let kind = str_at(payload, "/kind").unwrap_or("decision");
+                    let verb = if kind == "approve" {
+                        "approved"
+                    } else {
+                        "denied"
+                    };
+                    let feedback = payload
+                        .get("feedback")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    row(format!(
+                        "{verb} gate {} of autopilot task {task} in {name} from the hub{}",
+                        payload.get("gate").and_then(Value::as_u64).unwrap_or(0),
+                        if feedback { " (with feedback)" } else { "" }
                     ))
-                    .with("cycle", payload.get("cycle").cloned())
-                    .with("emitted", emitted)
-                    .with("dropped", dropped)
+                    .with("task_id", task)
+                    .with("run_id", str_at(payload, "/run_id"))
+                    .with("decision", kind)
+                    .with("gate", payload.get("gate").cloned())
+                    .with("attempt", payload.get("attempt").cloned())
+                    .with("command_id", payload.get("command_id").cloned())
                 }
                 _ => {
                     let task = str_at(payload, "/task_id").unwrap_or("a task");

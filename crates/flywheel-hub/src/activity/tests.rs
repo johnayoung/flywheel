@@ -292,6 +292,13 @@ fn scrub_redacts_token_shaped_words_and_caps_length() {
     );
     assert_eq!(scrub("token hunter2"), "token [redacted]");
     assert_eq!(scrub("Q2xhdWRlQ29kZTEyMzQ1Njc4OTBhYmNkZWY"), "[redacted]");
+    // A flywheel run id is a name, not a secret.
+    let run = "run-b51a35dbed1a4fbcac5197bd689af9c7";
+    assert_eq!(scrub(&format!("parked {run}")), format!("parked {run}"));
+    assert_eq!(
+        scrub("run-B51A35DBED1A4FBCAC5197BD689AF9C7x9"),
+        "[redacted]"
+    );
     // The hub's own token: 64 lowercase hex.
     let token = "7f7df99d6fe8ccd92e959f45f54dd2996c108fd931141f408e499a364c30ab27";
     assert_eq!(scrub(&format!("deploy {token}")), "deploy [redacted]");

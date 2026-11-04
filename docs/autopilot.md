@@ -72,7 +72,7 @@ flywheel autopilot --interval 120       # 120s between daemon cycles
 
 Flag precedence is CLI flag > policy > code default (`resolve_runtime`, `crates/flywheel-orchestrator/src/autopilot_run.rs`). `landing` and the score weights come from policy only (no CLI flag).
 
-**The daemon never terminates on an idle cycle.** An empty pass writes nothing and the loop continues; it exits only on SIGTERM or SIGINT, finishing the current cycle first (`run_daemon_loop`, `autopilot_run.rs`). A policy error exits 2 before the loop starts. A graceful exit writes a `stopped` record that reads not-live at once. While paused it runs no pass (no breaker or back-off strikes) and keeps its record fresh (phase `paused`). The hub drives the same verbs: [hub-workflows](hub/workflows.md#flywheel-panel).
+**The daemon never terminates on an idle cycle.** An empty pass writes nothing and the loop continues; it exits only on SIGTERM or SIGINT, finishing the current cycle first (`run_daemon_loop`, `autopilot_run.rs`). A policy error exits 2 before the loop starts. A graceful exit writes a `stopped` record that reads not-live at once. The record names the cycle its summary came from (`last_cycle`) and keeps the newest cycle that decided anything (`last_decision`) across later no-op cycles. While paused it runs no pass (no breaker or back-off strikes) and keeps its record fresh (phase `paused`). The hub drives the same verbs: [hub-workflows](hub/workflows.md#flywheel-panel).
 
 ## Configuration
 

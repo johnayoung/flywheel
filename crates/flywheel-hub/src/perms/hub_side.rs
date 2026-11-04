@@ -59,6 +59,10 @@ pub struct AllowBody {
     /// A dangerous rule or setting, typed back exactly.
     #[serde(default)]
     pub typed: Option<String>,
+    /// Also add the local settings file to the checkout's .gitignore
+    /// (when the preview offers `can_gitignore`).
+    #[serde(default)]
+    pub gitignore: bool,
     /// Answer the session's pending prompt with "Yes" after writing.
     #[serde(default)]
     pub answer: bool,
@@ -123,7 +127,8 @@ impl Hub {
                     });
                 if !known {
                     return Err(invalid(format!(
-                        "{} is not in any workspace folder or session directory",
+                        "{} is not in any workspace folder or session directory (add it to a workspace first: `fw hub new <workspace> --folder {} --create`, or the web UI)",
+                        folder.dir.display(),
                         folder.dir.display()
                     )));
                 }
@@ -171,13 +176,24 @@ impl Hub {
             let Ok(record) = self.store().session(session).cloned() else {
                 return;
             };
-            let Ok(folder) = Folder::resolve(&record.cwd) else {
-                return;
-            };
-            match synth::from_hook(payload, &folder.dir) {
+            // Cheap here (the hook waits on this report); the journal
+            // needs the repo (git) and is written off this thread.
+            let cwd = record.cwd.canonicalize().unwrap_or(record.cwd);
+            match synth::from_hook(payload, &cwd) {
                 Some(request) => {
-                    self.perms().journal_request(session, &folder, &request);
-                    self.perms().set_pending(session, request);
+                    self.perms().set_pending(session, request.clone());
+                    let runtime = std::sync::Arc::clone(self.perms());
+                    let session = session.to_owned();
+                    let spawned = std::thread::Builder::new()
+                        .name("fw-hub-perms-journal".into())
+                        .spawn(move || {
+                            if let Ok(folder) = Folder::resolve(&cwd) {
+                                runtime.journal_request(&session, &folder, &request);
+                            }
+                        });
+                    if let Err(e) = spawned {
+                        eprintln!("fw hub: cannot journal a permission request: {e}");
+                    }
                 }
                 None => self.perms().clear_pending(session),
             }
@@ -222,12 +238,13 @@ impl Hub {
         let is_claude_session = record
             .as_ref()
             .is_some_and(|r| r.kind == SessionKind::Claude);
-        let (sources, managed_only) = claude::sources(
+        let (mut sources, managed_only) = claude::sources(
             &folder,
             &env,
             is_claude_session,
             launch.permission_mode.as_deref(),
         );
+        claude::mark_overridden(&mut sources, &folder.anchors(&env, claude::File::Local));
         let codex_launch = record
             .as_ref()
             .filter(|r| r.kind == SessionKind::Codex)
@@ -361,6 +378,12 @@ impl Hub {
         if added.is_empty() {
             notes.push("every rule is already in this file".to_owned());
         }
+        let (all_sources, _) = claude::sources(folder, env, false, None);
+        for raw in &added {
+            if let Some(o) = claude::overriding(&all_sources, raw, &anchors) {
+                notes.push(o.text());
+            }
+        }
         // How the pending request fares with these rules.
         if let Some(record) = record
             && let Some(request) = self.perms_request(record, folder)
@@ -408,6 +431,9 @@ impl Hub {
             base: claude::digest(old.as_deref()),
             exists: old.is_some(),
             path: target.path,
+            can_gitignore: file == claude::File::Local
+                && target.ignored == Some(false)
+                && target.tracked == Some(false),
             tracked: target.tracked,
             ignored: target.ignored,
             warning: target.warning,
@@ -610,6 +636,14 @@ impl Hub {
                 "not confirmed: preview it, then send confirm: true",
             ));
         }
+        let Some(base) = body.base.as_deref() else {
+            return Err(invalid(
+                "give the preview's base: the file is written only if it has not changed since",
+            ));
+        };
+        // Held until written: a write that read the file before another
+        // wrote it would drop the other's rule.
+        let guard = self.perms().write_lock();
         let (plan, folder, record) = self.perms_plan(body)?;
         let mut preview = plan.preview;
         if let Some(expected) = &preview.type_to_confirm
@@ -625,9 +659,12 @@ impl Hub {
                     .unwrap_or("dangerous")
             )));
         }
-        if let Some(base) = &body.base
-            && *base != preview.base
-        {
+        if body.gitignore && !preview.can_gitignore {
+            return Err(invalid(
+                "gitignore: the file is already ignored, tracked, or not the local one",
+            ));
+        }
+        if base != preview.base {
             return Err(conflict(format!(
                 "{} changed since the preview: preview it again",
                 preview.path.display()
@@ -659,6 +696,13 @@ impl Hub {
                 }),
             );
         }
+        if body.gitignore {
+            match self.perms_gitignore(&folder, &preview.path) {
+                Ok(ignore) => preview.gitignored = Some(ignore),
+                Err(e) => preview.notes.push(format!("not added to .gitignore: {e}")),
+            }
+        }
+        drop(guard);
         if body.answer {
             let (answered, note) = match &record {
                 Some(record) => self.perms_answer(record, &folder, body.request_key.as_deref()),
@@ -668,6 +712,30 @@ impl Hub {
             preview.answer_note = Some(note);
         }
         Ok(preview)
+    }
+
+    /// Add the local settings file at `path` to its checkout's
+    /// .gitignore: the path added.
+    fn perms_gitignore(&self, folder: &Folder, path: &Path) -> Result<std::path::PathBuf, String> {
+        let root = folder.local_root(self.perms().env());
+        let line = path
+            .strip_prefix(&root)
+            .map_err(|_| "the local settings file is outside its checkout".to_owned())?
+            .to_string_lossy()
+            .into_owned();
+        let ignore = root.join(".gitignore");
+        let mut text = match std::fs::read_to_string(&ignore) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("{}: {e}", ignore.display())),
+        };
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("/{line}\n"));
+        claude::write_atomic(&ignore, &text)?;
+        eprintln!("fw hub: perms: added /{line} to {}", ignore.display());
+        Ok(ignore)
     }
 
     /// Answer a blocked session's permission prompt "Yes" (once), if it
@@ -694,6 +762,22 @@ impl Hub {
             return (false, "the session has no terminal on this hub".into());
         };
         let rows = pty.screen_text(TextSource::Visible).lines;
+        // The dialog on screen must be the request approved (a hook's
+        // request can be stale, or reported by the agent itself).
+        let on_screen = match record.kind {
+            SessionKind::Claude => synth::from_claude_screen(&rows, &folder.dir),
+            SessionKind::Codex => synth::from_codex_screen(&rows, &folder.dir),
+            SessionKind::Shell => None,
+        };
+        if !on_screen
+            .as_ref()
+            .is_some_and(|s| same_request(s, &request))
+        {
+            return (
+                false,
+                "the dialog on screen is not the request these rules were written for: answer it yourself".into(),
+            );
+        }
         let Some(keys) = yes_key(record.kind, &rows) else {
             return (
                 false,
@@ -721,18 +805,25 @@ impl Hub {
         let codex_view = codex::view(&folder, &env, None);
         let anchors = folder.anchors(&env, claude::File::Local);
         let since = chrono::Utc::now().timestamp() - days * 86_400;
-        let allowed_claude = |rule: &str| {
+        // Handled: an allow rule covers it, or a deny / ask rule decides
+        // it (the user chose to be refused or asked).
+        let allowed_claude = |raw: &str| {
+            let Some(wanted) = rule::Rule::parse_any(raw) else {
+                return false;
+            };
             sources
                 .iter()
-                .flat_map(|s| s.allow.iter())
-                .any(|a| rule::same(a, rule))
+                .filter(|s| s.error.is_none())
+                .flat_map(|s| s.allow.iter().chain(&s.ask).chain(&s.deny))
+                .filter_map(|a| rule::Rule::parse_any(a))
+                .any(|have| rule::subsumes(&have, &wanted, &anchors))
         };
         let allowed_codex = |pattern: &[String]| {
             codex_view
                 .rules
                 .iter()
                 .flat_map(|f| f.rules.iter())
-                .any(|r| r.decision == "allow" && pattern.starts_with(&r.pattern))
+                .any(|r| pattern.starts_with(&r.pattern))
         };
         let mut skipped = 0usize;
         let suggestions = self
@@ -798,6 +889,23 @@ impl Hub {
 
 /// The keys that answer a permission prompt's plain "Yes" (Claude Code:
 /// its option 1; Codex: `y`), when the screen shows one.
+/// Whether the request read off the screen is `request` (a dialog may
+/// wrap or cut a long command: one must start the other, spaces aside).
+fn same_request(screen: &synth::Request, request: &synth::Request) -> bool {
+    use super::rule::Target;
+    if screen.key == request.key {
+        return true;
+    }
+    match (&screen.target, &request.target) {
+        (Target::Command { command: a }, Target::Command { command: b }) => {
+            let squash = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let (a, b) = (squash(a), squash(b));
+            !a.is_empty() && (a == b || (a.len() >= 8 && b.starts_with(&a)))
+        }
+        (a, b) => a == b,
+    }
+}
+
 pub fn yes_key(kind: SessionKind, rows: &[String]) -> Option<&'static str> {
     let options: Vec<String> = rows
         .iter()

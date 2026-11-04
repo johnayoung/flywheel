@@ -148,6 +148,39 @@ impl TestHub {
         answer
     }
 
+    /// The folder's suggestions, once there are `n` of them.
+    async fn suggestions(&self, folder: &Path, n: usize) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let found = self
+                .get(&format!("/api/perms/suggest?folder={}", folder.display()))
+                .await;
+            if found["suggestions"]
+                .as_array()
+                .is_some_and(|a| a.len() == n)
+            {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "never {n} suggestions: {found}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// `body` with the base of its preview (as every client sends it).
+    async fn based(&self, mut body: Value) -> Value {
+        let (status, preview) = self
+            .call(
+                reqwest::Method::POST,
+                "/api/perms/preview",
+                Some(body.clone()),
+            )
+            .await;
+        if status.is_success() {
+            body["base"] = preview["base"].clone();
+        }
+        body
+    }
+
     async fn agent(&self, kind: &str) -> (String, HashMap<String, String>) {
         let ws = self
             .post(
@@ -325,10 +358,9 @@ async fn always_allow_from_a_blocked_claude_prompt() {
             .contains("not git-ignored")
     );
 
-    // Suggested from the journal before anything is allowed.
-    let suggested = hub
-        .get(&format!("/api/perms/suggest?folder={}", repo.display()))
-        .await;
+    // Suggested from the journal before anything is allowed (journaled
+    // off the report's thread).
+    let suggested = hub.suggestions(&repo, 1).await;
     assert_eq!(
         suggested["suggestions"][0]["rules"][0]["rule"],
         "Bash(cargo test -p flywheel-hub *)"
@@ -408,7 +440,9 @@ async fn always_allow_from_a_blocked_claude_prompt() {
     assert_eq!(status, StatusCode::CONFLICT, "{stale}");
 
     // Dangerous: written only after it is typed back.
-    let danger = json!({ "folder": repo, "rules": ["Bash(rm:*)"], "confirm": true });
+    let danger = hub
+        .based(json!({ "folder": repo, "rules": ["Bash(rm:*)"], "confirm": true }))
+        .await;
     let (status, refused) = hub
         .call(
             reqwest::Method::POST,
@@ -554,7 +588,7 @@ async fn codex_prompts_rules_and_settings() {
         "session": sid, "patterns": [["cargo", "test", "-p", "parser"]],
         "confirm": true, "answer": true, "request_key": pending["request"]["key"],
     });
-    let done = hub.post("/api/perms/allow", body).await;
+    let done = hub.post("/api/perms/allow", hub.based(body).await).await;
     assert_eq!(done["written"], true);
     assert!(
         done["warning"].as_str().unwrap().contains("trusted"),
@@ -572,7 +606,10 @@ async fn codex_prompts_rules_and_settings() {
     std::fs::write(codex_home.join("config.toml"), "model = \"gpt-5-codex\"\n").unwrap();
     let trust =
         json!({ "folder": repo, "setting": "trust_level", "value": "trusted", "confirm": true });
-    assert_eq!(hub.post("/api/perms/allow", trust).await["written"], true);
+    assert_eq!(
+        hub.post("/api/perms/allow", hub.based(trust).await).await["written"],
+        true
+    );
     let config: toml::Table = std::fs::read_to_string(codex_home.join("config.toml"))
         .unwrap()
         .parse()
@@ -583,7 +620,7 @@ async fn codex_prompts_rules_and_settings() {
         Some("trusted")
     );
     // Full access needs the value typed back; undocumented values are refused.
-    let full = json!({ "folder": repo, "setting": "sandbox_mode", "value": "danger-full-access", "confirm": true });
+    let full = hub.based(json!({ "folder": repo, "setting": "sandbox_mode", "value": "danger-full-access", "confirm": true })).await;
     let (status, _) = hub
         .call(
             reqwest::Method::POST,
@@ -624,4 +661,223 @@ async fn codex_prompts_rules_and_settings() {
     assert_eq!(view["codex"]["trust_level"], "trusted");
     assert_eq!(view["codex"]["sandbox_mode"][0], "workspace-write");
     hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_race_safely_and_answers_check_the_screen() {
+    let hub = TestHub::start().await;
+    let repo = hub.repo();
+    let local = repo.join(".claude/settings.local.json");
+    let (sid, env) = hub.agent("claude").await;
+    hub.screen_shows(&sid, "Do you want to proceed?").await;
+
+    // Concurrent writes from one preview: one lands, the others are told
+    // the file changed; no rule a response reports written is lost.
+    for round in 0..6 {
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "{}\n").unwrap();
+        let bodies: Vec<Value> = (0..4)
+            .map(|i| json!({ "folder": repo, "rules": [format!("Bash(cargo test -p c{round}x{i} *)")], "confirm": true }))
+            .collect();
+        let mut based = Vec::new();
+        for b in bodies {
+            based.push(hub.based(b).await);
+        }
+        let calls = based.iter().map(|b| {
+            let (http, url, token, b) = (
+                hub.http.clone(),
+                format!("http://{}/api/perms/allow", hub.addr),
+                hub.token.clone(),
+                b.clone(),
+            );
+            async move {
+                let response = http
+                    .post(url)
+                    .bearer_auth(token)
+                    .json(&b)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                (
+                    status,
+                    response.json::<Value>().await.unwrap_or(Value::Null),
+                )
+            }
+        });
+        let results = futures_join(calls).await;
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(&local).unwrap()).unwrap();
+        let present = written["permissions"]["allow"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut wrote = 0;
+        for ((status, answer), body) in results.iter().zip(&based) {
+            if status.is_success() {
+                assert_eq!(answer["written"], true, "{answer}");
+                assert!(
+                    present.contains(&body["rules"][0]),
+                    "round {round}: {answer} lost: {written}"
+                );
+                wrote += 1;
+            } else {
+                assert_eq!(*status, StatusCode::CONFLICT, "round {round}: {answer}");
+            }
+        }
+        assert_eq!(wrote, present.len(), "round {round}: {written}");
+        assert!(wrote >= 1);
+    }
+    std::fs::remove_file(&local).unwrap();
+    // Without the preview's base: refused.
+    let (status, refused) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/perms/allow",
+            Some(json!({ "folder": repo, "rules": ["Bash(cargo test *)"], "confirm": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+
+    // A deny elsewhere overrides the allow: said before writing, marked after.
+    std::fs::write(
+        repo.join(".claude/settings.json"),
+        "{\"permissions\":{\"deny\":[\"Bash(cargo bench *)\"]}}\n",
+    )
+    .unwrap();
+    let bench = json!({ "folder": repo, "rules": ["Bash(cargo bench -p app)"] });
+    let preview = hub.post("/api/perms/preview", bench.clone()).await;
+    assert!(
+        preview["notes"]
+            .to_string()
+            .contains("the deny rule Bash(cargo bench *) (project) overrides"),
+        "{preview}"
+    );
+    let mut confirmed = bench.clone();
+    confirmed["confirm"] = json!(true);
+    confirmed["base"] = preview["base"].clone();
+    hub.post("/api/perms/allow", confirmed).await;
+    let view = hub
+        .get(&format!("/api/perms?folder={}", repo.display()))
+        .await;
+    let local_source = view["claude"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["scope"] == "local")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        local_source["overridden"][0]["by"], "Bash(cargo bench *)",
+        "{local_source}"
+    );
+
+    // A hook request that is not the dialog on screen is never answered.
+    hook(
+        &env,
+        "PermissionRequest",
+        json!({ "tool_name": "Bash", "tool_input": { "command": "cargo build -p other" } }),
+    );
+    hub.status_is(&sid, "blocked").await;
+    let view = hub.get(&format!("/api/perms?session={sid}")).await;
+    let stale = hub
+        .based(json!({
+            "session": sid, "rules": ["Bash(cargo build -p other *)"], "confirm": true,
+            "answer": true, "request_key": view["pending"]["request"]["key"],
+        }))
+        .await;
+    let done = hub.post("/api/perms/allow", stale).await;
+    assert_eq!(done["answered"], false, "{done}");
+    assert!(
+        done["answer_note"]
+            .as_str()
+            .unwrap()
+            .contains("not the request"),
+        "{done}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !hub.dir.path().join("claude.answer").exists(),
+        "a key was typed"
+    );
+
+    // The CLI on a session answers the prompt its rule covers.
+    let command = "cargo test -p flywheel-hub --lib perms::x";
+    hook(
+        &env,
+        "PermissionRequest",
+        json!({ "tool_name": "Bash", "tool_input": { "command": command } }),
+    );
+    // Journaled: one suggestion more than the stale request's.
+    let suggested = hub.suggestions(&repo, 2).await;
+    assert!(suggested.to_string().contains("--lib"), "{suggested}");
+    // The screen shows the session's original command; make the hook's
+    // request match it (the dialog is what gets answered).
+    hook(
+        &env,
+        "PermissionRequest",
+        json!({ "tool_name": "Bash", "tool_input": { "command": "cargo test -p flywheel-hub perms::x" } }),
+    );
+    let (code, out, err) = run_cli(
+        &hub,
+        &[
+            "perms",
+            "allow",
+            &sid,
+            "Bash(cargo test -p flywheel-hub *)",
+            "--yes",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("answered the pending prompt: Yes"), "{out}");
+    assert_eq!(hub.answer("claude").await, "1");
+
+    // A broader rule now covers the `--lib` request: no longer suggested.
+    let found = hub
+        .get(&format!("/api/perms/suggest?folder={}", repo.display()))
+        .await;
+    assert!(!found.to_string().contains("--lib"), "{found}");
+
+    // --gitignore: the local file is added to the checkout's .gitignore.
+    let (code, out, err) = run_cli(
+        &hub,
+        &[
+            "perms",
+            "allow",
+            repo.to_str().unwrap(),
+            "Bash(make test)",
+            "--yes",
+            "--gitignore",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("added it to"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".gitignore")).unwrap(),
+        "/.claude/settings.local.json\n"
+    );
+    let ignored = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["check-ignore", "-q", ".claude/settings.local.json"])
+        .status()
+        .unwrap();
+    assert!(ignored.success());
+    hub.shutdown().await;
+}
+
+/// Run every call at once and collect the answers in order.
+async fn futures_join<F>(calls: impl Iterator<Item = F>) -> Vec<F::Output>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let handles: Vec<_> = calls.map(tokio::spawn).collect();
+    let mut out = Vec::new();
+    for h in handles {
+        out.push(h.await.unwrap());
+    }
+    out
 }

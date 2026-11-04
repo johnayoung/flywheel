@@ -164,6 +164,9 @@ pub struct Runtime {
     /// blocked prompt).
     journaled: Mutex<HashMap<String, String>>,
     journal: journal::Journal,
+    /// Held from reading a file to writing it: two writes at once must not
+    /// lose one's rule.
+    writes: Mutex<()>,
 }
 
 impl Runtime {
@@ -173,7 +176,13 @@ impl Runtime {
             pending: Mutex::default(),
             journaled: Mutex::default(),
             journal: journal::Journal::new(state_dir),
+            writes: Mutex::default(),
         }
+    }
+
+    /// Serializes read-plan-write of a settings or rules file.
+    pub fn write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.writes.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn env(&self) -> &Env {
@@ -442,6 +451,13 @@ pub struct Preview {
     /// The digest of the file the diff was made from: `allow` refuses if
     /// the file changed since.
     pub base: String,
+    /// The local settings file is neither ignored nor tracked: `allow`
+    /// with `gitignore: true` also adds it to the checkout's .gitignore.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub can_gitignore: bool,
+    /// After a write: the .gitignore line was added there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gitignored: Option<PathBuf>,
     /// A dangerous rule or setting: the exact text to type to confirm.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub type_to_confirm: Option<String>,

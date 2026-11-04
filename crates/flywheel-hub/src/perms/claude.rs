@@ -2,8 +2,8 @@
 //! (managed > command line > local > project > user), the permission rules
 //! each holds, and the hub's writes to the three a user owns.
 
-use super::edit;
 use super::{Env, Folder};
+use super::{edit, rule};
 use crate::review::runner;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -101,6 +101,86 @@ pub struct Source {
     pub file: Option<File>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Allow rules here that a deny or ask rule (in any source) overrides
+    /// whole: they never stop a prompt.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub overridden: Vec<Override>,
+}
+
+/// An allow rule a deny or ask rule overrides: Claude Code checks deny,
+/// then ask, then allow, whatever file each is in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Override {
+    /// The allow rule.
+    pub rule: String,
+    /// The rule that wins.
+    pub by: String,
+    /// `deny` or `ask`.
+    pub decision: &'static str,
+    /// The source the winning rule is in.
+    pub scope: &'static str,
+}
+
+impl Override {
+    /// "deny rule Bash(x *) (project) overrides it: the agent is refused".
+    pub fn text(&self) -> String {
+        format!(
+            "the {} rule {} ({}) overrides {}: {}",
+            self.decision,
+            self.by,
+            self.scope,
+            self.rule,
+            if self.decision == "deny" {
+                "the agent is still refused"
+            } else {
+                "the agent still asks"
+            }
+        )
+    }
+}
+
+/// The deny or ask rule that overrides allow rule `allow`, if any (deny
+/// first, as Claude Code checks them).
+pub fn overriding(sources: &[Source], allow: &str, anchors: &rule::Anchors) -> Option<Override> {
+    let allow_rule = rule::Rule::parse_any(allow)?;
+    for decision in ["deny", "ask"] {
+        for source in sources.iter().filter(|s| s.error.is_none()) {
+            let list = if decision == "deny" {
+                &source.deny
+            } else {
+                &source.ask
+            };
+            for raw in list {
+                if let Some(by) = rule::Rule::parse_any(raw)
+                    && rule::subsumes(&by, &allow_rule, anchors)
+                {
+                    return Some(Override {
+                        rule: allow.to_owned(),
+                        by: raw.clone(),
+                        decision,
+                        scope: source.scope,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Mark every source's overridden allow rules.
+pub fn mark_overridden(sources: &mut [Source], anchors: &rule::Anchors) {
+    let marks: Vec<Vec<Override>> = sources
+        .iter()
+        .map(|s| {
+            s.allow
+                .iter()
+                .filter_map(|a| overriding(sources, a, anchors))
+                .collect()
+        })
+        .collect();
+    for (source, marks) in sources.iter_mut().zip(marks) {
+        source.overridden = marks;
+    }
 }
 
 fn strings(value: Option<&serde_json::Value>) -> Vec<String> {
@@ -376,7 +456,7 @@ pub fn target(file: File, folder: &Folder, env: &Env) -> Target {
             "this local settings file is tracked by git: the rule would be committed for everyone, and Claude Code holds a tracked local file's allow rules until the folder is trusted".to_owned(),
         ),
         File::Local if tracked == Some(false) && ignored == Some(false) => Some(
-            "this local settings file is not git-ignored: `git add -A` would commit it (add .claude/settings.local.json to .gitignore)".to_owned(),
+            "this local settings file is not git-ignored: `git add -A` would commit it (the hub can add it to .gitignore: `--gitignore`, or the box in the preview)".to_owned(),
         ),
         File::Project => Some(
             "the project file is shared: once committed, everyone who uses the repo gets the rule (after they trust the folder)".to_owned(),
@@ -470,7 +550,10 @@ pub fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.fw-hub-{}.tmp", std::process::id()));
+    // Unique per write (two writers in one hub must not share it).
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.fw-hub-{}-{seq}.tmp", std::process::id()));
     let result = (|| -> std::io::Result<()> {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);

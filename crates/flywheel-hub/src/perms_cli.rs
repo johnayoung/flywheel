@@ -76,6 +76,14 @@ struct AllowArgs {
     /// terminal).
     #[arg(long)]
     yes: bool,
+    /// Also add .claude/settings.local.json to the checkout's .gitignore
+    /// (when it is neither ignored nor tracked).
+    #[arg(long)]
+    gitignore: bool,
+    /// A session target blocked on a prompt the rules cover: leave the
+    /// prompt waiting (default: answer it "Yes" once written).
+    #[arg(long)]
+    no_answer: bool,
     /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
@@ -198,7 +206,24 @@ fn print_view(out: &mut dyn Write, view: &Value) {
         let _ = writeln!(out, "  {:<12} {place}{state}", str_field(source, "scope"));
         for kind in ["deny", "ask", "allow"] {
             for rule in list(&source[kind]) {
-                let _ = writeln!(out, "      {kind:<5} {}", rule.as_str().unwrap_or(""));
+                let rule = rule.as_str().unwrap_or("");
+                let over = (kind == "allow")
+                    .then(|| {
+                        list(&source["overridden"])
+                            .into_iter()
+                            .find(|o| str_field(o, "rule") == rule)
+                    })
+                    .flatten()
+                    .map(|o| {
+                        format!(
+                            "  (overridden by {} {} in {})",
+                            str_field(o, "decision"),
+                            str_field(o, "by"),
+                            str_field(o, "scope")
+                        )
+                    })
+                    .unwrap_or_default();
+                let _ = writeln!(out, "      {kind:<5} {rule}{over}");
             }
         }
         if let Some(mode) = source.get("default_mode").and_then(Value::as_str) {
@@ -395,12 +420,50 @@ fn preview_then_write(
     let done = conn.blocking_call("POST", "/api/perms/allow", Some(&body))?;
     if json_out {
         print_json(out, &done);
-    } else if done["written"] == true {
+        return Ok(0);
+    }
+    if done["written"] == true {
         let _ = writeln!(out, "wrote {}", str_field(&done, "path"));
     } else {
         let _ = writeln!(out, "nothing written");
     }
+    if let Some(ignore) = done.get("gitignored").and_then(Value::as_str) {
+        let _ = writeln!(out, "added it to {ignore}");
+    }
+    for note in list(&done["notes"]).iter().filter(|n| {
+        n.as_str()
+            .is_some_and(|n| n.starts_with("not added to .gitignore"))
+    }) {
+        let _ = writeln!(out, "note: {}", note.as_str().unwrap_or(""));
+    }
+    match done.get("answered").and_then(Value::as_bool) {
+        Some(true) => {
+            let _ = writeln!(out, "answered the pending prompt: Yes");
+        }
+        Some(false) => {
+            let _ = writeln!(
+                out,
+                "the session is still waiting: {}",
+                str_field(&done, "answer_note")
+            );
+        }
+        None => {}
+    }
     Ok(0)
+}
+
+/// For a session target blocked on a prompt: ask the write to answer it
+/// (only while it still shows the request the rules are for).
+fn answer_pending(conn: &Endpoint, query: &str, body: &mut Value) -> Result<(), String> {
+    if body.get("session").is_none() {
+        return Ok(());
+    }
+    let view = conn.blocking_call("GET", &format!("/api/perms?{query}"), None)?;
+    if let Some(key) = view["pending"]["request"]["key"].as_str() {
+        body["answer"] = json!(true);
+        body["request_key"] = json!(key);
+    }
+    Ok(())
 }
 
 fn run(args: &PermsArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
@@ -418,7 +481,7 @@ fn run(args: &PermsArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
         }
         PermsCommand::Allow(a) => {
             let conn = connect(&a.endpoint)?;
-            let (_, mut body) = target(&conn, &a.target)?;
+            let (query, mut body) = target(&conn, &a.target)?;
             if a.agent.as_deref() == Some("codex") {
                 let mut patterns = Vec::new();
                 for raw in &a.rules {
@@ -441,6 +504,12 @@ fn run(args: &PermsArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
             }
             if let Some(file) = &a.file {
                 body["file"] = json!(file);
+            }
+            if a.gitignore {
+                body["gitignore"] = json!(true);
+            }
+            if !a.no_answer {
+                answer_pending(&conn, &query, &mut body)?;
             }
             preview_then_write(&conn, body, a.yes, a.json, out, err)
         }

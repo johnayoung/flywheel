@@ -98,6 +98,11 @@ impl Rule {
                     "{raw:?}: allow rules use the command itself, not command:..., e.g. Bash(npm test *)"
                 ));
             }
+            if tool == "Bash" && compound(spec) {
+                return Err(format!(
+                    "{raw:?}: Claude Code matches each command of a line on its own (split at &&, ||, ;, |, &), so a rule holding one never matches; allow each command separately"
+                ));
+            }
         }
         Ok(Self {
             tool: tool.to_owned(),
@@ -126,6 +131,11 @@ impl Rule {
 fn param_form(spec: &str) -> bool {
     spec.split_once(':')
         .is_some_and(|(name, _)| name.trim() == "command" || name.trim() == "run_in_background")
+}
+
+/// A Bash specifier holding more than one simple command.
+fn compound(spec: &str) -> bool {
+    shell::split(&bash_pattern(spec)).is_ok_and(|parts| parts.len() > 1)
 }
 
 /// A Bash specifier with a trailing `:*` written the way the dialog does
@@ -393,6 +403,48 @@ pub fn covers(rule: &Rule, target: &Target, anchors: &Anchors) -> bool {
     }
 }
 
+/// Whether everything `narrow` matches, `broad` matches too (read with
+/// `narrow`'s `*` as text `broad` must cover): an allow rule that makes
+/// another redundant, or a deny / ask rule that overrides an allow.
+pub fn subsumes(broad: &Rule, narrow: &Rule, anchors: &Anchors) -> bool {
+    if broad.tool != narrow.tool {
+        // `mcp__github` covers `mcp__github__x` and `mcp__github__*`.
+        return broad.spec.is_none()
+            && narrow.spec.is_none()
+            && broad.tool.starts_with("mcp__")
+            && covers(
+                broad,
+                &Target::Tool {
+                    name: narrow.tool.clone(),
+                },
+                anchors,
+            );
+    }
+    if broad.canonical() == narrow.canonical() {
+        return true;
+    }
+    let (Some(b), Some(n)) = (&broad.spec, &narrow.spec) else {
+        return broad.spec.is_none() || broad.canonical() == "Bash";
+    };
+    match broad.tool.as_str() {
+        "Bash" => bash_matches(b, &bash_pattern(n)),
+        "Edit" | "Read" => {
+            let (b, n) = (absolute_pattern(b, anchors), absolute_pattern(n, anchors));
+            path_glob(&b, &n) || path_glob(&format!("{}/**", b.trim_end_matches('/')), &n)
+        }
+        "WebFetch" => match (b.strip_prefix("domain:"), n.strip_prefix("domain:")) {
+            (Some(b), Some(n)) => {
+                domain_matches(b, n.trim().trim_start_matches("*.")) && {
+                    // `*.x.com` is covered by `*.x.com` (above) or a broader glob.
+                    !n.trim().starts_with("*.") || b.trim().starts_with("*.") || b.trim() == "*"
+                }
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Words as written, one space apart.
 pub fn words_raw(words: &[Word]) -> String {
     words
@@ -556,6 +608,61 @@ const DANGEROUS: &[(&[&str], Reach, bool, &str)] = &[
         "downloads and runs any package",
     ),
     (
+        &["cp"],
+        Reach::Family,
+        false,
+        "can overwrite any file, the agent's own settings too",
+    ),
+    (
+        &["mv"],
+        Reach::Family,
+        false,
+        "can overwrite any file, the agent's own settings too",
+    ),
+    (
+        &["tee"],
+        Reach::Family,
+        false,
+        "can overwrite any file, the agent's own settings too",
+    ),
+    (
+        &["ln"],
+        Reach::Family,
+        false,
+        "can replace any file with a link",
+    ),
+    (
+        &["install"],
+        Reach::Family,
+        false,
+        "can overwrite any file, the agent's own settings too",
+    ),
+    (&["truncate"], Reach::Family, false, "can empty any file"),
+    (
+        &["sed"],
+        Reach::Family,
+        false,
+        "edits any file in place (-i) and can run commands",
+    ),
+    (
+        &["awk"],
+        Reach::Family,
+        false,
+        "can run any command (system())",
+    ),
+    (
+        &["gawk"],
+        Reach::Family,
+        false,
+        "can run any command (system())",
+    ),
+    (
+        &["mawk"],
+        Reach::Family,
+        false,
+        "can run any command (system())",
+    ),
+    (
         &["git", "push"],
         Reach::Family,
         false,
@@ -620,6 +727,24 @@ const DANGEROUS: &[(&[&str], Reach, bool, &str)] = &[
         Reach::Family,
         false,
         "calls any GitHub API with your credentials",
+    ),
+    (
+        &["gh", "pr", "merge"],
+        Reach::Family,
+        false,
+        "merges pull requests",
+    ),
+    (
+        &["gh", "release", "create"],
+        Reach::Family,
+        false,
+        "publishes releases",
+    ),
+    (
+        &["gh", "workflow", "run"],
+        Reach::Family,
+        false,
+        "starts CI workflows with your credentials",
     ),
     (
         &["gh", "repo", "delete"],
@@ -744,7 +869,158 @@ pub fn pipes_to_shell(spec: &str) -> bool {
     })
 }
 
-fn bash_risk(spec: Option<&str>) -> Risk {
+/// git's global options that take the next word as their value.
+const GIT_VALUE_OPTIONS: &[&str] = &[
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--super-prefix",
+];
+/// git's global options that take no value.
+const GIT_FLAG_OPTIONS: &[&str] = &[
+    "-p",
+    "-P",
+    "--paginate",
+    "--no-pager",
+    "--bare",
+    "--no-replace-objects",
+    "--no-lazy-fetch",
+    "--no-optional-locks",
+    "--no-advice",
+    "--literal-pathspecs",
+    "--glob-pathspecs",
+    "--noglob-pathspecs",
+    "--icase-pathspecs",
+];
+
+/// Strip git's global options (`git -C dir push` runs `git push`), so the
+/// subcommand is judged. A wildcard inside them reaches every subcommand:
+/// the words become just `git`. `Err` for an option that can make git run
+/// any program, or one the hub does not know.
+fn strip_git_globals(words: &mut Vec<String>, partial: &mut bool) -> Result<(), Risk> {
+    if words.first().map(String::as_str) != Some("git") {
+        return Ok(());
+    }
+    let run_anything = || {
+        Risk::danger(
+            "sets git config or helpers on the command line, which can make git run any program",
+        )
+    };
+    // Each option found is removed, so the next word is again at 1.
+    const I: usize = 1;
+    while words.len() > I {
+        let i = I;
+        let w = words[i].as_str();
+        let last_partial = *partial && i == words.len() - 1;
+        if last_partial && (w.starts_with('-') || w.is_empty()) {
+            // `git -C *`, `git --no-p*`: any option, then any subcommand.
+            words.truncate(1);
+            *partial = false;
+            return Ok(());
+        }
+        if !w.starts_with('-') {
+            break;
+        }
+        if w == "-c" || w.starts_with("--config-env") || w.starts_with("--exec-path") {
+            return Err(run_anything());
+        }
+        let name = w.split_once('=').map_or(w, |(name, _)| name);
+        if GIT_VALUE_OPTIONS.contains(&name) && !w.contains('=') {
+            if i + 1 >= words.len() || (*partial && i + 1 == words.len() - 1) {
+                // The value is cut by the wildcard: what follows is anything.
+                words.truncate(1);
+                *partial = false;
+                return Ok(());
+            }
+            words.drain(i..i + 2);
+        } else if GIT_VALUE_OPTIONS.contains(&name) || GIT_FLAG_OPTIONS.contains(&w) {
+            words.remove(i);
+        } else {
+            return Err(Risk::danger(format!(
+                "`{w}` before git's subcommand is an option the hub cannot judge"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The path components a word names (`--out=.claude/x` names `.claude/x`).
+fn word_paths(word: &str) -> impl Iterator<Item = &str> {
+    let value = word.split_once('=').map(|(_, v)| v);
+    std::iter::once(word).chain(value)
+}
+
+/// What a command argument names that the agent must not be let change
+/// without a typed confirmation: `.claude/`, `.git/`, ... (any program),
+/// or (for a program that writes files) a path outside the repo.
+fn argument_risk(words: &[String], anchors: &Anchors, repo: &Path) -> Option<Risk> {
+    let program = words.first()?.as_str();
+    let writes = matches!(
+        program,
+        "cp" | "mv"
+            | "tee"
+            | "ln"
+            | "install"
+            | "truncate"
+            | "rsync"
+            | "rm"
+            | "rmdir"
+            | "mkdir"
+            | "unzip"
+            | "tar"
+            | "patch"
+            | "dd"
+            | "shred"
+    );
+    for word in &words[1..] {
+        for text in word_paths(word) {
+            if let Some(p) = PROTECTED.iter().find(|p| text.split('/').any(|c| c == **p)) {
+                return Some(Risk::danger(format!(
+                    "names {p} (the agent could change {})",
+                    protected_what(p)
+                )));
+            }
+            if !writes || text.starts_with('-') || text.is_empty() {
+                continue;
+            }
+            let path = if let Some(rest) = text.strip_prefix("~/") {
+                anchors.home.join(rest)
+            } else if text == "~" {
+                anchors.home.clone()
+            } else if text.starts_with('/') {
+                PathBuf::from(text)
+            } else {
+                anchors.cwd.join(text)
+            };
+            let path = normalize(&path);
+            if !path.starts_with(repo) && path != Path::new("/dev/null") {
+                return Some(Risk::danger(format!(
+                    "{program} touches {}, outside the repo ({})",
+                    path.display(),
+                    repo.display()
+                )));
+            }
+        }
+    }
+    None
+}
+
+/// `find` actions that delete, write, or run commands.
+const FIND_ACTIONS: &[&str] = &[
+    "-delete",
+    "-exec",
+    "-execdir",
+    "-ok",
+    "-okdir",
+    "-fprint",
+    "-fprint0",
+    "-fprintf",
+    "-fls",
+    "-files0-from",
+];
+
+fn bash_risk(spec: Option<&str>, anchors: &Anchors, repo: &Path) -> Risk {
     let Some(spec) = spec else {
         return Risk::danger("lets the agent run every shell command");
     };
@@ -758,7 +1034,10 @@ fn bash_risk(spec: Option<&str>) -> Risk {
     if pipes_to_shell(&pattern) {
         return Risk::danger("pipes into a shell or interpreter");
     }
-    let Some((words, partial, wildcard)) = literal_words(&pattern) else {
+    if compound(&pattern) {
+        return Risk::danger("holds more than one command");
+    }
+    let Some((words, mut partial, wildcard)) = literal_words(&pattern) else {
         return Risk::danger("cannot be read as a command");
     };
     if words.is_empty() {
@@ -771,6 +1050,9 @@ fn bash_risk(spec: Option<&str>) -> Risk {
         && first.starts_with('/')
     {
         *first = name.to_owned();
+    }
+    if let Err(risk) = strip_git_globals(&mut words, &mut partial) {
+        return risk;
     }
     let mkfs = |w: &str| w.starts_with("mkfs");
     for (entry, reach, exact_too, why) in DANGEROUS {
@@ -787,7 +1069,10 @@ fn bash_risk(spec: Option<&str>) -> Risk {
         if !compatible {
             continue;
         }
-        let as_broad = words.len() <= entry.len();
+        // An interpreter given only options before the wildcard
+        // (`python -u *`, `perl -i *`) still runs any code.
+        let as_broad =
+            words.len() <= entry.len() || words[entry.len()..].iter().all(|w| w.starts_with('-'));
         let hit = if wildcard {
             match reach {
                 Reach::Family => true,
@@ -800,6 +1085,9 @@ fn bash_risk(spec: Option<&str>) -> Risk {
             let verb = if wildcard { "covers" } else { "runs" };
             return Risk::danger(format!("{verb} `{}`, which {why}", entry.join(" ")));
         }
+    }
+    if let Some(risk) = argument_risk(&words, anchors, repo) {
+        return risk;
     }
     // Exact forms that are dangerous by their arguments.
     if !wildcard {
@@ -814,12 +1102,31 @@ fn bash_risk(spec: Option<&str>) -> Risk {
             {
                 return Risk::danger("deletes directories recursively");
             }
+            Some("find")
+                if words[1..]
+                    .iter()
+                    .any(|w| FIND_ACTIONS.contains(&w.as_str())) =>
+            {
+                return Risk::danger("deletes, writes, or runs commands on what it finds");
+            }
+            Some("sed")
+                if words[1..]
+                    .iter()
+                    .any(|w| w.starts_with("-i") || w.starts_with("--in-place")) =>
+            {
+                return Risk::danger("edits files in place");
+            }
             Some("git")
                 if words.get(1).map(String::as_str) == Some("push")
                     && words[2..].iter().any(|w| {
                         FORCE_FLAGS.contains(&w.as_str())
                             || w.starts_with('+')
                             || w.starts_with("--force")
+                            // `git push origin :main` deletes main.
+                            || w.starts_with(':')
+                            || (w.starts_with('-')
+                                && !w.starts_with("--")
+                                && (w.contains('f') || w.contains('d')))
                     }) =>
             {
                 return Risk::danger("force-pushes or deletes remote branches");
@@ -848,6 +1155,15 @@ const SECRET_DIRS: &[&str] = &[
     ".git-credentials",
     ".local/state",
 ];
+
+fn protected_what(p: &str) -> &'static str {
+    match p {
+        ".claude" => "its own permissions and hooks",
+        ".codex" => "Codex's config and rules",
+        ".mcp.json" => "which MCP servers it loads",
+        _ => "git's internals and hooks",
+    }
+}
 
 fn path_risk(rule: &Rule, anchors: &Anchors, repo: &Path) -> Risk {
     let tool = rule.tool.as_str();
@@ -891,12 +1207,7 @@ fn path_risk(rule: &Rule, anchors: &Anchors, repo: &Path) -> Risk {
     if let Some(p) = touches {
         return Risk::danger(format!(
             "covers {p} (the agent could change {})",
-            match *p {
-                ".claude" => "its own permissions and hooks",
-                ".codex" => "Codex's config and rules",
-                ".mcp.json" => "which MCP servers it loads",
-                _ => "git's internals and hooks",
-            }
+            protected_what(p)
         ));
     }
     Risk::ok()
@@ -905,7 +1216,7 @@ fn path_risk(rule: &Rule, anchors: &Anchors, repo: &Path) -> Risk {
 /// How dangerous `rule` is for a session in `anchors.cwd` of `repo`.
 pub fn risk(rule: &Rule, anchors: &Anchors, repo: &Path) -> Risk {
     match rule.tool.as_str() {
-        "Bash" => bash_risk(rule.spec.as_deref()),
+        "Bash" => bash_risk(rule.spec.as_deref(), anchors, repo),
         "Edit" | "Read" => path_risk(rule, anchors, repo),
         "Write" | "NotebookEdit" | "MultiEdit" => {
             Risk::danger("lets the agent write every file on this machine")
@@ -922,6 +1233,16 @@ pub fn risk(rule: &Rule, anchors: &Anchors, repo: &Path) -> Risk {
                 }
             }
         },
+        tool if tool.starts_with("mcp__") => {
+            let rest = &tool[5..];
+            match rest.split_once("__") {
+                Some((_, name)) if !name.is_empty() && name != "*" => Risk::ok(),
+                _ => Risk::danger(format!(
+                    "lets the agent use every tool of the {} MCP server, including any it adds later",
+                    rest.split("__").next().unwrap_or(rest)
+                )),
+            }
+        }
         _ => Risk::ok(),
     }
 }

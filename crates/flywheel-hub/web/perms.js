@@ -82,11 +82,32 @@ window.FwHubPerms = function (ctx) {
     const items = [];
     for (const kind of ["deny", "ask", "allow"]) {
       for (const rule of source[kind] || []) {
-        items.push(el("li", { className: `pm-rule ${kind}` }, el("span", { className: "pm-chip", textContent: kind }), el("code", { textContent: rule })));
+        const over = kind === "allow" ? (source.overridden || []).find((o) => o.rule === rule) : null;
+        items.push(
+          el(
+            "li",
+            { className: `pm-rule ${kind}${over ? " overridden" : ""}` },
+            el("span", { className: "pm-chip", textContent: kind }),
+            el("code", { textContent: rule }),
+            over ? el("span", { className: "pm-over", textContent: `overridden: ${over.decision} ${over.by} (${over.scope}) wins` }) : null,
+          ),
+        );
       }
     }
     if (source.default_mode) items.push(el("li", { className: "pm-rule mode" }, el("span", { className: "pm-chip", textContent: "mode" }), el("code", { textContent: source.default_mode })));
     return items.length ? el("ul", { className: "pm-rules" }, items) : null;
+  }
+
+  // A path that wraps only after a "/" (not mid-name) when it must.
+  function pathText(text, className, title) {
+    const span = el("span", { className, title: title || "" });
+    String(text || "")
+      .split(/(?<=\/)/)
+      .forEach((part, i) => {
+        if (i) span.append(el("wbr"));
+        span.append(document.createTextNode(part));
+      });
+    return span;
   }
 
   function sourceRow(source) {
@@ -98,7 +119,7 @@ window.FwHubPerms = function (ctx) {
         "div",
         { className: "pm-source-head" },
         el("span", { className: "pm-scope", textContent: source.scope }),
-        el("span", { className: "pm-path", textContent: source.path || source.label, title: source.path || "" }),
+        pathText(source.path || source.label, "pm-path", source.path || ""),
         state ? el("span", { className: "pm-state", textContent: state }) : null,
       ),
       ruleList(source),
@@ -107,6 +128,7 @@ window.FwHubPerms = function (ctx) {
   }
 
   function codexSection(codex, where) {
+    const trusted = codex.trust_level === "trusted";
     const pair = (p) => (p ? `${p[0]}  ·  from ${p[1]}` : "Codex's default");
     const setting = (key, label, value, choices) =>
       el(
@@ -129,15 +151,26 @@ window.FwHubPerms = function (ctx) {
     return el(
       "section",
       { className: "pm-sec" },
-      el("h3", { className: "field-label", textContent: `Codex · ${codex.home}` }),
+      el("h3", { className: "field-label" }, "Codex · ", pathText(codex.home, "pm-h-path")),
       setting("trust_level", "trust", codex.trust_level ? `${codex.trust_level}  ·  [projects."${codex.trust_from}"]` : "not set (Codex asks)", ["trusted", "untrusted"]),
       setting("approval_policy", "approval", pair(codex.approval_policy), ["on-request", "never"]),
       setting("sandbox_mode", "sandbox", pair(codex.sandbox_mode), ["read-only", "workspace-write", "danger-full-access"]),
+      (codex.layers || []).map((layer) => {
+        const unloaded = layer.scope === "project" && !trusted;
+        const values = [layer.approval_policy && `approval_policy = ${layer.approval_policy}`, layer.sandbox_mode && `sandbox_mode = ${layer.sandbox_mode}`].filter(Boolean);
+        return el(
+          "div",
+          { className: `pm-codex-layer${unloaded ? " unloaded" : ""}${layer.exists ? "" : " absent"}` },
+          el("span", { className: "pm-scope", textContent: layer.scope }),
+          pathText(layer.path ? `${layer.path}` : "the session's flags", "pm-path"),
+          el("span", { className: "pm-state", textContent: [layer.error ? `error: ${layer.error}` : !layer.exists ? "none" : values.join(" · ") || "no approval or sandbox keys", unloaded ? "not loaded: project not trusted" : ""].filter(Boolean).join(" · ") }),
+        );
+      }),
       (codex.rules || []).map((file) =>
         el(
           "div",
-          { className: "pm-codex-rules" },
-          el("span", { className: "pm-path", textContent: `${file.scope} rules: ${file.path}` }),
+          { className: `pm-codex-rules${file.scope === "project" && !trusted ? " unloaded" : ""}` },
+          pathText(`${file.scope} rules: ${file.path}${file.scope === "project" && !trusted ? " (not loaded: project not trusted)" : ""}`, "pm-path"),
           el("ul", { className: "pm-rules" }, (file.rules || []).map((r) => el("li", { className: `pm-rule ${r.decision === "allow" ? "allow" : "deny"}` }, el("span", { className: "pm-chip", textContent: r.decision }), el("code", { textContent: r.pattern.join(" ") })))),
         ),
       ),
@@ -164,7 +197,7 @@ window.FwHubPerms = function (ctx) {
       const found = await rawApi("GET", `/api/perms/suggest?${query(where)}&days=14`);
       const list = found.suggestions || [];
       fill(into, 
-        el("h3", { className: "field-label", textContent: `Blocked most · last ${found.days} days · ${found.repo}` }),
+        el("h3", { className: "field-label" }, `Blocked most · last ${found.days} days · `, pathText(found.repo, "pm-h-path")),
         list.length
           ? el(
               "ol",
@@ -253,8 +286,13 @@ window.FwHubPerms = function (ctx) {
     const multi = defaults.length > 1;
     const pick = { rules: multi ? defaults : defaults.slice(0, 1) };
     if (suggestion) pick.rules = candidates.map((c) => c.text);
-    const custom = el("input", {
+    const custom = el("textarea", {
       className: "pm-custom",
+      rows: 2,
+      // One line: it wraps to show a long rule, Enter adds nothing.
+      onkeydown: (e) => {
+        if (e.key === "Enter") e.preventDefault();
+      },
       spellcheck: false,
       autocomplete: "off",
       placeholder: codex ? "cargo test -p app" : "Bash(cargo test -p app *)",
@@ -306,6 +344,8 @@ window.FwHubPerms = function (ctx) {
     const userOk = el("input", { type: "checkbox", onchange: () => schedule() });
     const userLabel = el("label", { className: "pm-optin", hidden: true }, userOk, " Yes, edit my user-level settings");
     const out = el("div", { className: "pm-preview" });
+    const gitignore = el("input", { type: "checkbox" });
+    const gitignoreLabel = el("label", { className: "pm-optin pm-gitignore", hidden: true }, gitignore, " Also add it to .gitignore");
     const typed = el("input", { className: "pm-typed", spellcheck: false, autocomplete: "off", "aria-label": "Type the rule to confirm", oninput: () => gate() });
     const typedWrap = el("label", { className: "field pm-typed-wrap", hidden: true }, el("span", { className: "field-label", textContent: "Dangerous: type it exactly to confirm" }), typed);
     const error = el("p", { className: "form-error", role: "alert" });
@@ -350,12 +390,14 @@ window.FwHubPerms = function (ctx) {
         const p = await rawApi("POST", "/api/perms/preview", body());
         if (seq !== ui.previewSeq) return;
         preview = p;
+        gitignoreLabel.hidden = !p.can_gitignore;
         typedWrap.hidden = !p.type_to_confirm;
         if (!p.type_to_confirm) typed.value = "";
         fill(out, 
           p.sentence ? el("p", { className: "pm-sentence", textContent: p.sentence }) : null,
-          el("p", { className: "pm-file" }, "Edits ", el("code", { textContent: p.path }), p.exists ? "" : " (new file)"),
+          el("p", { className: "pm-file" }, "Edits ", el("code", {}, pathText(p.path, "")), p.exists ? "" : " (new file)"),
           p.warning ? el("p", { className: "pm-warn", textContent: p.warning }) : null,
+          p.can_gitignore ? gitignoreLabel : null,
           p.rules.filter((r) => r.risk.dangerous).map((r) => el("p", { className: "pm-danger-line" }, el("b", { textContent: "Dangerous " }), el("code", { textContent: r.rule }), `: ${r.risk.reason}`)),
           (p.added || []).length ? diffView(p.diff) : el("p", { className: "pm-note", textContent: "Already in this file: nothing to write." }),
           (p.notes || []).map((n) => el("p", { className: "pm-note", textContent: n })),
@@ -375,6 +417,7 @@ window.FwHubPerms = function (ctx) {
       b.confirm = true;
       b.base = preview.base;
       if (preview.type_to_confirm) b.typed = typed.value.trim();
+      if (preview.can_gitignore && gitignore.checked) b.gitignore = true;
       if (answer) {
         b.answer = true;
         b.request_key = pending.request.key;
@@ -398,9 +441,9 @@ window.FwHubPerms = function (ctx) {
       pending ? `${target}: ${pending.summary}` : target,
       el(
         "div",
-        { className: "pm-body" },
+        { className: "pm-body pm-allow" },
         choices,
-        el("label", { className: "field" }, el("span", { className: "field-label", textContent: multi ? "Rules (one per command)" : codex ? "Command prefix" : "Rule" }), multi ? el("code", { className: "pm-multi", textContent: pick.rules.join("   ") }) : custom),
+        el("label", { className: "field pm-rule-field" }, el("span", { className: "field-label", textContent: multi ? "Rules (one per command)" : codex ? "Command prefix" : "Rule" }), multi ? el("code", { className: "pm-multi", textContent: pick.rules.join("   ") }) : custom),
         el("label", { className: "field" }, el("span", { className: "field-label", textContent: "Written to" }), fileSelect),
         userLabel,
         out,

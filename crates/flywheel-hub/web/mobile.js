@@ -450,7 +450,10 @@ window.FwHubMobile = function (ctx) {
     }
     const prompt = window.FwHubPrompt.parse(screenLines(true));
     const options = prompt ? prompt.options : [];
-    const question = agent.detail || (prompt && prompt.question) || "waiting on you";
+    // Claude's "permission to use Bash" names the tool only: add the
+    // command its dialog shows between its dashed rules.
+    const subject = agent.detail === "permission to use Bash" ? dialogSubject(screenLines(true)) : "";
+    const question = (agent.detail && subject ? `${agent.detail}: ${subject}` : agent.detail) || (prompt && prompt.question) || "waiting on you";
     const key = JSON.stringify([state.attached, question, options]);
     // Answered already: the status lags the answer (until the agent's
     // next hook), and a second tap would type it twice.
@@ -511,6 +514,21 @@ window.FwHubMobile = function (ctx) {
     );
     bar.hidden = false;
     updateBar();
+  }
+
+  // The first line inside the last pair of dashed (╌) rules on screen.
+  function dialogSubject(lines) {
+    const rules = [];
+    lines.forEach((l, i) => {
+      if (/^\s*╌{10,}\s*$/.test(l)) rules.push(i);
+    });
+    if (rules.length < 2) return "";
+    const [a, b] = rules.slice(-2);
+    for (let i = a + 1; i < b; i++) {
+      const text = lines[i].trim();
+      if (text) return text.length > 120 ? `${text.slice(0, 119)}…` : text;
+    }
+    return "";
   }
 
   let quickTimer = 0;

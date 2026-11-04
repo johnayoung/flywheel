@@ -495,7 +495,7 @@ pub struct Hub {
     /// The activity journal and each client's presence.
     activity: crate::activity::Activity,
     /// Pending permission requests and their journal (`crate::perms`).
-    perms: crate::perms::Runtime,
+    perms: Arc<crate::perms::Runtime>,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -604,7 +604,7 @@ impl Hub {
             )),
             queue: crate::queue::QueueRuntime::default(),
             activity: crate::activity::Activity::open(&options_state_dir),
-            perms: crate::perms::Runtime::new(&options_state_dir, perms_env),
+            perms: Arc::new(crate::perms::Runtime::new(&options_state_dir, perms_env)),
             _serve_lock: serve_lock,
         }))
     }
@@ -792,7 +792,7 @@ impl Hub {
     }
 
     /// Agent permission rules: pending requests and their journal.
-    pub(crate) fn perms(&self) -> &crate::perms::Runtime {
+    pub(crate) fn perms(&self) -> &Arc<crate::perms::Runtime> {
         &self.perms
     }
 

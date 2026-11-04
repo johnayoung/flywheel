@@ -583,13 +583,14 @@ const MAX_DIFF_CELLS: usize = 4_000_000;
 pub fn unified_diff(label: &str, old: &str, new: &str) -> String {
     let a: Vec<&str> = old.lines().collect();
     let b: Vec<&str> = new.lines().collect();
+    if a == b {
+        // Nothing changes: no diff at all (not bare headers).
+        return String::new();
+    }
     let mut out = format!(
         "--- {}\n+++ {label}\n",
         if old.is_empty() { "/dev/null" } else { label }
     );
-    if a == b {
-        return out;
-    }
     // Edit script by LCS (settings files are small).
     let ops: Vec<(char, &str)> = if a.len().saturating_mul(b.len()) > MAX_DIFF_CELLS {
         a.iter()
@@ -615,12 +616,13 @@ pub fn unified_diff(label: &str, old: &str, new: &str) -> String {
                 ops.push((' ', a[i]));
                 i += 1;
                 j += 1;
-            } else if j < m && (i == n || lcs[i][j + 1] >= lcs[i + 1][j]) {
-                ops.push(('+', b[j]));
-                j += 1;
-            } else {
+            } else if i < n && (j == m || lcs[i + 1][j] >= lcs[i][j + 1]) {
+                // Removals before additions, as unified diffs show them.
                 ops.push(('-', a[i]));
                 i += 1;
+            } else {
+                ops.push(('+', b[j]));
+                j += 1;
             }
         }
         ops

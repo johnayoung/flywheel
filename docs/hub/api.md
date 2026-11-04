@@ -154,7 +154,7 @@ Behaviour: [hub-workflows](workflows.md#permissions). `?folder=` (absolute, in a
 | GET | `/api/perms` | `{"folder","repo","session"?,"claude":{"sources","managed_only","targets"},"codex","pending"?:{"request","summary","claude"\|"codex":{"rules","candidates","notes"},"decision"?}}` |
 | GET | `/api/perms/suggest` | `days` 1-30 (14) -> `{"suggestions":[{"agent","tool","rules","count","sessions","last_at"}],"skipped_dangerous"}` |
 | POST | `/api/perms/preview` | `{"rules"}` (Claude) \| `{"patterns"}` (Codex) \| `{"setting","value"}`, `"file"?` -> `{"path","diff","sentence","warning","rules","added","base","type_to_confirm"?,"notes"}` |
-| POST | `/api/perms/allow` | preview's body + `"confirm":true`, `"base"?` (409 changed), `"typed"?`, `"answer"?`, `"request_key"?` -> preview + `"written","answered"?` |
+| POST | `/api/perms/allow` | preview's body + `"confirm":true`, `"base"` (409 changed), `"typed"?`, `"gitignore"?`, `"answer"?`, `"request_key"?` -> preview + `"written","answered"?` |
 
 ## Auth, machines, peers
 

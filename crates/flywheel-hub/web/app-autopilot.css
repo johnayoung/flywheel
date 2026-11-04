@@ -22,6 +22,8 @@
   color: var(--ink-3);
   background: var(--bg);
 }
+button.ap-tier { width: 100%; padding: 0; cursor: pointer; border-radius: 0; }
+.ap-tier.picked { outline: 2px solid var(--ink); outline-offset: -2px; }
 .ap-tier.pre { border-top: 2px solid var(--alert); }
 .ap-tier.relevant { background: color-mix(in srgb, var(--fw-ok) 22%, var(--bg)); color: var(--ink); border-color: color-mix(in srgb, var(--fw-ok) 55%, var(--rule-2)); }
 .ap-tier.prefiltered { background: repeating-linear-gradient(135deg, var(--bg) 0 3px, var(--bg-3) 3px 6px); }
@@ -50,6 +52,15 @@
 .ap-tier-list { list-style: none; margin: 0 0 .3rem; padding: 0; display: grid; gap: .2rem; font-size: 10.5px; color: var(--ink-2); }
 .ap-tier-list li { display: flex; align-items: baseline; gap: .45rem; overflow-wrap: anywhere; }
 .ap-tier-block { margin: 0 0 .55rem; }
+.ap-tier-pick { margin: 0 0 .4rem; color: var(--ink); font-size: 11px; overflow-wrap: anywhere; }
+.ap-tier-names, .ap-history { margin: .35rem 0 0; font-size: 10.5px; color: var(--ink-2); }
+.ap-tier-names summary, .ap-history summary { cursor: pointer; color: var(--ink-3); }
+.ap-tier-names ol, .ap-history ol { list-style: none; margin: .3rem 0 0; padding: 0; display: grid; gap: .2rem; }
+.ap-tier-names li { display: flex; align-items: baseline; gap: .45rem; overflow-wrap: anywhere; }
+.ap-hist { display: grid; grid-template-columns: 4.6rem minmax(0, 1fr); gap: .5rem; align-items: baseline; overflow-wrap: anywhere; }
+.ap-hist-at { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.ap-hist.approved { color: var(--ink); }
+.ap-hist.denied { color: var(--alert); }
 .ap-tier-block .ap-tiers { margin-bottom: .6rem; }
 .ap-last { margin: .35rem 0 0; color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
 .ap-pending { margin: .35rem 0 0; color: var(--ink-2); font-size: 10.5px; overflow-wrap: anywhere; }
@@ -81,6 +92,8 @@
   border-radius: 2px;
   font: 600 9.5px/1.5 var(--mono);
   color: var(--ink-2);
+  white-space: nowrap;
+  flex: none;
 }
 .ap-chip.hot { border-color: var(--alert); color: var(--alert); }
 .ap-score { font-variant-numeric: tabular-nums; color: var(--ink-2); }
@@ -105,7 +118,8 @@
 @media (max-width: 760px) {
   .ap-cand, .ap-gate-line { grid-template-columns: 4.6rem minmax(0, 1fr); }
   .ap-cand > .fw-task-meta, .ap-gate-line > .fw-task-meta { grid-column: 1 / -1; justify-content: flex-end; }
-  .ap-tier { min-height: 2rem; }
+  .ap-tier { min-height: 2.75rem; }
+  .ap-tier-names summary, .ap-history summary { min-height: 2.75rem; display: flex; align-items: center; }
   .ap-gate-actions button, .ap-deny-actions button, .ap-alert-actions button { min-height: 2.75rem; min-width: 2.75rem; }
   /* The daemon rows' controls (session / stop / pause / resume, worker):
      44px touch targets, spaced. */

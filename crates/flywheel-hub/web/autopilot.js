@@ -17,7 +17,32 @@ window.FwHubAutopilot = function (ctx) {
 
   // Deny forms open, by run id (their feedback survives re-renders).
   const denying = new Map();
+  // Decisions sent from this page, by gate instance, until the read shows
+  // them queued (or the gate moved on): the gate shows them pending at
+  // once, and a second click sends nothing.
+  const sent = new Map();
+  // The tier a tap picked, by folder key (its name and verdict show below
+  // the strip: a phone has no hover).
+  const picked = new Map();
+  // Disclosures the operator opened or closed, by folder key and name
+  // (a re-render keeps them as left).
+  const disclosed = new Map();
   let busy = false;
+
+  // A <details> whose open state survives re-renders.
+  function disclosure(key, name, fallback, className, summary, ...body) {
+    const id = `${key}\0${name}`;
+    const open = disclosed.has(id) ? disclosed.get(id) : fallback;
+    return el(
+      "details",
+      { className, open, ontoggle: (event) => disclosed.set(id, event.target.open) },
+      el("summary", { textContent: summary }),
+      ...body,
+    );
+  }
+
+  const gateKey = (gate) => `${gate.run_id}:${gate.gate}:${gate.attempt}`;
+  const pendingOf = (gate) => gate.pending || sent.get(gateKey(gate)) || null;
 
   const tierLabel = (t) => `T${t}`;
 
@@ -99,6 +124,7 @@ window.FwHubAutopilot = function (ctx) {
   }
 
   async function decide(key, gate, approve) {
+    if (pendingOf(gate)) return;
     const feedback = approve ? "" : (denying.get(gate.run_id) || "").trim();
     const ok = await confirmDialog({
       kicker: "autopilot gate",
@@ -109,11 +135,19 @@ window.FwHubAutopilot = function (ctx) {
       ok: approve ? "Approve" : "Deny",
       tone: approve ? "plain" : undefined,
     });
-    if (!ok) return;
+    if (!ok || pendingOf(gate)) return;
     const body = { run: gate.run_id, decision: approve ? "approve" : "deny", confirm: true, gate: gate.gate, attempt: gate.attempt };
     if (feedback) body.feedback = feedback;
+    const mark = gateKey(gate);
+    sent.set(mark, { folder: key, kind: approve ? "approve" : "reject", command_id: null, enqueued_at: new Date().toISOString() });
+    ctx.render();
     const done = await act(key, "decide", body);
-    if (!done) return;
+    if (!done) {
+      sent.delete(mark);
+      ctx.render();
+      return;
+    }
+    sent.set(mark, { folder: key, kind: done.kind, command_id: done.command_id, enqueued_at: new Date().toISOString() });
     denying.delete(gate.run_id);
     toast(`${approve ? "Approved" : "Denied"} ${gate.task_id} (command #${done.command_id}): the next worker run applies it.`, { timeout: 5000 });
   }
@@ -177,7 +211,8 @@ window.FwHubAutopilot = function (ctx) {
 
   function gateRow(key, gate) {
     const readOnly = !!ctx.machineOfKey(key);
-    const open = denying.has(gate.run_id) && !gate.pending;
+    const queued = pendingOf(gate);
+    const open = denying.has(gate.run_id) && !queued;
     const form = open
       ? el(
         "div",
@@ -198,15 +233,18 @@ window.FwHubAutopilot = function (ctx) {
         ),
       )
       : null;
-    const pending = gate.pending
+    const pending = queued
       ? el("p", {
         className: "ap-pending",
-        textContent: `${gate.pending.kind === "approve" ? "Approval" : "Deny"} queued (command #${gate.pending.command_id}, ${ctx.ago(gate.pending.enqueued_at)} ago): the next worker run on ${gate.task_id} applies it.`,
+        role: "status",
+        textContent: queued.command_id == null
+          ? `Decision pending: sending the ${queued.kind === "approve" ? "approval" : "deny"}...`
+          : `Decision pending: ${queued.kind === "approve" ? "approval" : "deny"} queued (command #${queued.command_id}, ${ctx.ago(queued.enqueued_at)} ago); the next worker run on ${gate.task_id} applies it.`,
       })
       : null;
     return el(
       "li",
-      { className: `ap-gate${gate.autopilot ? " ours" : ""}${gate.pending ? " decided" : ""}`, id: gateId(gate.run_id) },
+      { className: `ap-gate${gate.autopilot ? " ours" : ""}${queued ? " decided" : ""}`, id: gateId(gate.run_id) },
       el(
         "div",
         { className: "ap-gate-line" },
@@ -225,7 +263,7 @@ window.FwHubAutopilot = function (ctx) {
         ),
       ),
       pending,
-      readOnly || gate.pending
+      readOnly || queued
         ? null
         : el(
           "div",
@@ -331,36 +369,47 @@ window.FwHubAutopilot = function (ctx) {
     ["not-run", "not run (queue full)"],
   ];
 
-  function tierStrip(pilot) {
+  const verdictWords = (t) => {
+    const what = [t.verdict === "relevant" ? "found work" : t.verdict === "prefiltered" ? "skipped before discovery" : t.verdict === "not relevant" ? "nothing found" : "not run (queue full)"];
+    if (t.emitted) what.push(`${t.emitted} emitted`);
+    if (t.dropped) what.push(`${t.dropped} dropped`);
+    return what.join(", ");
+  };
+  const tierWords = (t) => `T${t.tier} ${t.name} (${t.preemptive ? "preemptive" : `weight ${t.weight}`}): ${verdictWords(t)}`;
+
+  function tierStrip(key, pilot) {
     const tiers = pilot.tiers;
     const basis = pilot.last_decided || pilot.decision;
+    const chosen = tiers.find((t) => t.tier === picked.get(key));
     const cells = el(
       "div",
-      { className: "ap-tiers", role: "list", "aria-label": basis ? `Tier verdicts of cycle ${basis.cycle}` : "Tier verdicts (no cycle yet)" },
+      { className: "ap-tiers", role: "group", "aria-label": basis ? `Tier verdicts of cycle ${basis.cycle}` : "Tier verdicts (no cycle yet)" },
       tiers.map((t) => el(
-        "span",
+        "button",
         {
-          role: "listitem",
-          className: `ap-tier ${t.verdict.replace(" ", "-")}${t.preemptive ? " pre" : ""}${t.dropped ? " dropped" : ""}`,
-          title: `Tier ${t.tier}: ${t.name} (${t.preemptive ? "preemptive" : `scheduled, weight ${t.weight}`}): ${t.verdict}${t.emitted ? `, ${t.emitted} emitted` : ""}${t.dropped ? `, ${t.dropped} dropped` : ""}`,
-          "aria-label": `Tier ${t.tier} ${t.name}: ${t.verdict}${t.emitted ? `, ${t.emitted} emitted` : ""}${t.dropped ? `, ${t.dropped} dropped` : ""}`,
+          type: "button",
+          className: `ap-tier ${t.verdict.replace(" ", "-")}${t.preemptive ? " pre" : ""}${t.dropped ? " dropped" : ""}${chosen === t ? " picked" : ""}`,
+          title: tierWords(t),
+          "aria-label": tierWords(t),
+          "aria-pressed": String(chosen === t),
+          onclick: () => {
+            if (picked.get(key) === t.tier) picked.delete(key);
+            else picked.set(key, t.tier);
+            ctx.render();
+          },
         },
         String(t.tier),
-        t.emitted ? el("i", { textContent: String(t.emitted) }) : null,
-        t.dropped ? el("em", { textContent: `\u00d7${t.dropped}` }) : null,
+        t.emitted ? el("i", { textContent: String(t.emitted), "aria-hidden": "true" }) : null,
+        t.dropped ? el("em", { textContent: `\u00d7${t.dropped}`, "aria-hidden": "true" }) : null,
       )),
     );
-    // The verdicts in words (a phone has no hover): the tiers that found
-    // work, each named, then the rest by verdict.
+    // The tier a tap picked, named, with its verdict.
+    const pick = chosen ? el("p", { className: "ap-tier-pick", role: "status", textContent: tierWords(chosen) }) : null;
+    // The verdicts in words: the tiers that found work, each named, then
+    // the rest by verdict.
     const found = tiers.filter((t) => t.verdict === "relevant" || t.emitted || t.dropped);
     const rest = (verdict) => tiers.filter((t) => t.verdict === verdict && !found.includes(t)).map((t) => tierLabel(t.tier));
-    const words = [];
-    for (const t of found) {
-      const what = [t.verdict];
-      if (t.emitted) what.push(`${t.emitted} emitted`);
-      if (t.dropped) what.push(`${t.dropped} dropped`);
-      words.push(el("li", {}, chip(tierLabel(t.tier), t.preemptive ? "hot" : ""), el("span", { textContent: `${t.name}: ${what.join(", ")}` })));
-    }
+    const words = found.map((t) => el("li", {}, chip(tierLabel(t.tier), t.preemptive ? "hot" : ""), el("span", { textContent: `${t.name}: ${verdictWords(t)}` })));
     const groups = [["prefiltered", "skipped before discovery"], ["not relevant", "nothing found"], ["not run", "not run (queue full)"]]
       .map(([verdict, label]) => [label, rest(verdict)])
       .filter(([, list]) => list.length)
@@ -371,28 +420,67 @@ window.FwHubAutopilot = function (ctx) {
       VERDICTS.map(([cls, label]) => el("span", {}, el("span", { className: `ap-swatch ${cls}` }), label)),
       el("span", {}, el("span", { className: "ap-swatch dropped" }), "a finding dropped"),
     );
+    // Every tier by name: the compact key to the numbers.
+    const names = disclosure(
+      key,
+      "tiers",
+      false,
+      "ap-tier-names",
+      "Tier names",
+      el("ol", {}, tiers.map((t) => el("li", {}, chip(tierLabel(t.tier), t.preemptive ? "hot" : ""), el("span", { textContent: `${t.name}${basis ? ` -- ${verdictWords(t)}` : ""}` })))),
+    );
     return el(
       "div",
       { className: "ap-tier-block" },
-      el("p", { className: "ap-meta", textContent: basis ? `Tiers, as cycle ${basis.cycle} judged them (1-3 preemptive)` : "Tiers (1-3 preemptive): no cycle yet" }),
+      el("p", { className: "ap-meta", textContent: basis ? `Tiers, as cycle ${basis.cycle} judged them (1-3 preemptive; tap one for its name)` : "Tiers (1-3 preemptive): no cycle yet" }),
       cells,
+      pick,
       basis ? legend : null,
       words.length ? el("ul", { className: "ap-tier-list" }, words) : null,
       groups.length ? el("p", { className: "ap-meta", textContent: groups.join(" · ") }) : null,
+      names,
+    );
+  }
+
+  // The folder's newest decisions (cycles, gate approvals and denials),
+  // from the hub's activity journal.
+  function historyList(key, pilot) {
+    const rows = pilot.history || [];
+    if (!rows.length) return null;
+    return disclosure(
+      key,
+      "history",
+      rows.length <= 5,
+      "ap-history",
+      `Decisions, newest first (${rows.length})`,
+      el("ol", {}, rows.map((r) => el(
+        "li",
+        { className: `ap-hist ${r.kind.replace("autopilot.", "")}` },
+        el("small", { className: "ap-hist-at", textContent: `${ctx.ago(r.at)} ago`, title: r.at }),
+        el("span", { textContent: r.text }),
+      ))),
     );
   }
 
   function section(key, panel) {
     const pilot = panel.intake;
     if (!pilot) return null;
+    // A decision sent from here is the read's once it shows queued, and
+    // over once its gate is gone (applied, or the task moved on).
+    for (const [mark, entry] of sent) {
+      if (entry.folder !== key) continue;
+      const gate = pilot.gates.find((g) => gateKey(g) === mark);
+      if (!gate || (gate.pending && entry.command_id != null)) sent.delete(mark);
+    }
     const ours = pilot.gates.filter((g) => g.autopilot);
     const others = pilot.gates.filter((g) => !g.autopilot);
     const config = pilot.config;
     const body = [
       el("p", { className: "ap-config", textContent: `target ${config.target_depth} · every ${config.interval_seconds}s · lands via ${config.landing} · ${gates(config).join(" · ")}` }),
       pilot.problem ? el("p", { className: "fw-problem", textContent: pilot.problem }) : null,
-      tierStrip(pilot),
+      tierStrip(key, pilot),
       decisionBox(pilot),
+      historyList(key, pilot),
     ];
     if (pilot.gates.length) {
       body.push(el("h4", { className: "ap-sub", textContent: `Waiting on you (${pilot.gates.length})` }));
@@ -421,8 +509,9 @@ window.FwHubAutopilot = function (ctx) {
     if (alert.kind !== "awaiting" || !alert.run_id || ctx.machineOfKey(key) || !panel.intake) return null;
     const gate = panel.intake.gates.find((g) => g.run_id === alert.run_id);
     if (!gate) return null;
-    if (gate.pending) {
-      return el("small", { className: "ap-alert-pending", textContent: `${gate.pending.kind === "approve" ? "approval" : "deny"} queued` });
+    const queued = pendingOf(gate);
+    if (queued) {
+      return el("small", { className: "ap-alert-pending", textContent: `decision pending: ${queued.kind === "approve" ? "approval" : "deny"}` });
     }
     return el(
       "span",

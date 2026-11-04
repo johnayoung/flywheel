@@ -98,14 +98,7 @@ pub(crate) fn main(args: &PluginArgs, out: &mut dyn Write, err: &mut dyn Write) 
             let on = matches!(args.command, PluginCommand::Enable(_));
             let found = plugins::scan(&dir);
             let Some(plugin) = found.iter().find(|p| p.name == a.name) else {
-                return fail(
-                    err,
-                    &format!(
-                        "no plugin {:?} in {}",
-                        a.name,
-                        dir.join(plugins::PLUGINS_DIR).display()
-                    ),
-                );
+                return fail(err, &no_plugin(&dir, &a.name));
             };
             if on && let Err(e) = &plugin.manifest {
                 let _ = writeln!(
@@ -130,6 +123,11 @@ pub(crate) fn main(args: &PluginArgs, out: &mut dyn Write, err: &mut dyn Write) 
                 return fail(err, &format!("{:?} is not a plugin name", a.name));
             }
             let runs = plugins::read_logs(&dir, &a.name, a.lines.max(1));
+            // A removed plugin's runs still show; a name with neither is
+            // an error, as enable/disable say.
+            if runs.is_empty() && !plugins::scan(&dir).iter().any(|p| p.name == a.name) {
+                return fail(err, &no_plugin(&dir, &a.name));
+            }
             if a.json {
                 for run in runs {
                     let _ = writeln!(out, "{}", serde_json::to_string(&run).unwrap_or_default());
@@ -170,6 +168,13 @@ pub(crate) fn main(args: &PluginArgs, out: &mut dyn Write, err: &mut dyn Write) 
             0
         }
     }
+}
+
+fn no_plugin(dir: &std::path::Path, name: &str) -> String {
+    format!(
+        "no plugin {name:?} in {}",
+        dir.join(plugins::PLUGINS_DIR).display()
+    )
 }
 
 fn print_plugin(view: &Value, out: &mut dyn Write) {

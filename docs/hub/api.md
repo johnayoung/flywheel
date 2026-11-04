@@ -123,11 +123,11 @@ Fan-out view: `{"id","base_sha","winner","counts","leader","settled","graded_at"
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/activity[?since=&until=&ws=&session=&kind=&limit=&cursor=&machines=none]` | `{"rows":[{"id","at","kind","session_id","workspace_id","text","data","machine"?}],"next","partial","machines"}` newest first (`next`: a `cursor`); `matched {workspace,session}`; a selector found nowhere: 404 |
+| GET | `/api/activity[?since=&until=&ws=&session=&kind=&limit=&cursor=&machines=none]` | `{"rows":[{"id","at","kind","session_id","workspace_id","text","data","machine"?}],"next","partial","machines"}` newest first (`next`: a `cursor`); `matched {workspace,session}`; selector found nowhere: 404 |
 | GET | `/api/activity/digest[?since=&client=&until=&ws=&session=]` | `{"since","until","turns_finished","blocked_now","fanouts_graded","commands_suggested","cost_usd","workspaces","empty","partial"}`; `since=last-seen` needs `client` |
 | POST | `/api/activity/seen` | `{"client"}` -> 204: its `last-seen` is now |
 
-Times: RFC 3339, unix ms, an age (`90m`, `1h30m`), or `last-seen` (with `client`). `ws`, `session`: id, 4+ char prefix, or name (per machine). `kind`: a comma list (`review` = `review.*`). Beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A peer's request, or `machines=none`, answers for that hub alone.
+Times: RFC 3339, unix ms, an age (`90m`, `1h30m`), or `last-seen` (with `client`). `ws`, `session`: id, 4+ char prefix, or name (per machine). `kind`: comma list (`review` = `review.*`). Beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A peer's request or `machines=none`: this hub alone.
 
 ## Settings, config, plugins, notify, TLS
 

@@ -18,16 +18,16 @@ Trust model, auth, remote access, TLS, machines, share links. Front door: [hub](
 - `/login?code=` (or `?token=`) sets an `HttpOnly; SameSite=Strict` cookie holding a fresh per-login secret, never the token (`Secure` under https). 30 days, max 256; `POST /logout` ends one.
 - Scripts: `Authorization: Bearer <token>`; codes are not bearer credentials. Cross-origin `Origin` is refused on WebSocket upgrades and every non-GET request.
 - 10 wrong credentials per client address (IPv6 /64) in 10 minutes -> 429, except with a live login cookie; direct local connections are exempt (a local tunnel such as `ssh -L` looks direct).
-- Authenticated and unauthenticated connections have separate pools; unauthenticated ones get 3 s for a request head and go first, so a flood never locks you out. A WebSocket that stops reading (terminal, share, events, the `/m/` relay either way) is dropped after 60 s.
+- Authenticated and unauthenticated connections have separate pools; unauthenticated ones get 3 s for a request head and go first, so a flood never locks you out. A WebSocket that stops reading (terminal, share, events, `/m/` relay either way) is dropped after 60 s, nothing more written to it.
 
 ## Remote access
 
 Recommended: Tailscale (https on the tailnet, which phones need for clipboard, notifications, install).
 
 ```bash
-fw hub serve                                     # loopback only
-tailscale serve --bg http://127.0.0.1:7420       # https://<machine>.<tailnet>.ts.net -> the hub
-fw hub url --qr                                  # scan with the phone
+fw hub serve  # loopback only
+tailscale serve --bg http://127.0.0.1:7420  # https://<machine>.<tailnet>.ts.net -> the hub
+fw hub url --qr  # scan with the phone
 ```
 
 - `serve` and `url` detect a `tailscale serve` of the hub's port (accepted as an origin), else print the command.
@@ -37,13 +37,13 @@ fw hub url --qr                                  # scan with the phone
 ## HTTPS without Tailscale
 
 ```bash
-fw hub serve --bind 0.0.0.0 --tls auto     # or hub.toml [server] tls = "auto"
-fw hub url --qr                            # QR 1: install the CA (http /ca), QR 2: log in (https)
-fw hub tls ca                              # fingerprint, constraints, file (--out FILE [--der])
-fw hub tls rotate                          # new CA, old key deleted; every device re-installs
+fw hub serve --bind 0.0.0.0 --tls auto  # or hub.toml [server] tls = "auto"
+fw hub url --qr  # QR 1: install the CA (http /ca), QR 2: log in (https)
+fw hub tls ca  # fingerprint, constraints, file (--out FILE [--der])
+fw hub tls rotate  # new CA, old key deleted; every device re-installs
 ```
 
-- **The local CA is name-constrained**: a critical `nameConstraints` permits only this hub's names and addresses, so a stolen CA key cannot impersonate other sites. Bare hosts become `<host>.local`. Check the fingerprint against `fw hub tls ca` before installing.
+- **The local CA is name-constrained** (critical `nameConstraints`: this hub's names and addresses only): a stolen CA key cannot impersonate other sites. Bare hosts become `<host>.local`. Check the fingerprint against `fw hub tls ca` before installing.
 - `--tls-name` takes private names only (`.local` `.lan` `.home.arpa` `.internal` `.localhost` `<tailnet>.ts.net`; private, loopback, link-local, CGNAT, ULA addresses). One you own: `--tls-allow-public-name NAME`, warned.
 - One port, both schemes: with TLS on, plain http from the network reaches only `/ca` (the rest 308s to https); local and `--trusted-proxy` peers keep http.
 - `<state-dir>/tls/`: `ca-key.pem` (never leaves it), `ca-cert.pem`. ECDSA P-256; CA 10 years; leaf 14 days, re-issued 5 days before expiry or when names change.
@@ -58,9 +58,9 @@ fw hub tls rotate                          # new CA, old key deleted; every devi
 One UI over several hubs: this hub (A) registers hub B and proxies the browser's API calls and sockets under `/m/<machine>/api/...`; the browser never holds B's credential.
 
 ```bash
-fw hub peer issue --name laptop > /tmp/cred                          # on B: printed once
-fw hub machine add desktop https://desktop.tailnet.ts.net < /tmp/cred   # on A: never on argv
-FW_HUB_MACHINE_SECRET=$(ssh desktop fw hub token) fw hub machine add desktop URL --mint   # or mint one with B's token (not stored)
+fw hub peer issue --name laptop > /tmp/cred  # on B: printed once
+fw hub machine add desktop https://desktop.tailnet.ts.net < /tmp/cred  # on A: never on argv
+FW_HUB_MACHINE_SECRET=$(ssh desktop fw hub token) fw hub machine add desktop URL --mint  # or mint one with B's token (not stored)
 fw hub ls --machine desktop; fw hub attach --machine desktop SESSION
 ```
 
@@ -78,8 +78,8 @@ fw hub ls --machine desktop; fw hub attach --machine desktop SESSION
 **A viewer sees everything that terminal shows**, typed secrets included. Share only what you would screen-share.
 
 ```bash
-fw hub share agent --expires 2h --name pairing   # /share/fwview_<id>_<secret> on every origin; --qr for a phone
-fw hub share ls; fw hub share revoke pairing     # or the id; --all [--session S]
+fw hub share agent --expires 2h --name pairing  # /share/fwview_<id>_<secret> on every origin; --qr for a phone
+fw hub share ls; fw hub share revoke pairing  # or the id; --all [--session S]
 ```
 
 - Credential (256 bits) in the URL path; only digests stored (`shares.json`). Expiry 60 s to `shares.max_expiry` (30 d), default `shares.default_expiry` (1 h); 128 live at most.

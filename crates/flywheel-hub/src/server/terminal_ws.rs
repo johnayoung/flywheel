@@ -875,7 +875,7 @@ async fn pump(
                         // the reply Close on receipt but only writes it on a
                         // flush (a send would be refused after closing), so
                         // the client sees a clean close instead of 1006.
-                        let _ = viewer.socket.flush().await;
+                        viewer.flush().await;
                         break;
                     }
                     Some(Err(_)) | None => break,

@@ -586,6 +586,11 @@ async fn plugins_receive_events_answer_actions_and_are_bounded() {
         out.contains("action:slow") && out.contains("timed out"),
         "{out}"
     );
+    // A plugin that is not there (and never ran) is an error, as for
+    // enable/disable.
+    let (code, _, err) = hub.cli(&["plugin", "logs", "nope"]).await;
+    assert_eq!(code, 1);
+    assert!(err.contains("no plugin \"nope\""), "{err}");
     let (code, out, _) = hub.cli(&["plugin", "ls"]).await;
     assert_eq!(code, 0);
     assert!(

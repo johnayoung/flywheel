@@ -356,6 +356,12 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   #sidebar > #workspaces { overflow: visible; min-height: 40vh; }
   /* Its own short scroll inside that one (about three agents). */
   #sidebar .attn-list { max-height: 11.5rem; }
+  /* More rows past its bottom: they fade out there. */
+  #sidebar .attn-list.more-below { mask-image: linear-gradient(to bottom, #000 calc(100% - 2.2rem), transparent); }
+  /* The rows a workspace's "N in Needs you" line pointed at. */
+  #sidebar .attn-row.pointed { animation: attn-pointed 1.6s ease-out; }
+  @keyframes attn-pointed { from { background: color-mix(in srgb, var(--alert) 28%, transparent); } }
+  @media (prefers-reduced-motion: reduce) { #sidebar .attn-row.pointed { animation: none; outline: 1px solid var(--alert); } }
   /* A session Needs you lists is one line under its workspace. */
   .ws-needs {
     width: 100%;

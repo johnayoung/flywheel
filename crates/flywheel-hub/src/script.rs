@@ -364,22 +364,12 @@ pub fn tokens_label(n: u64) -> String {
     }
 }
 
-/// Dollars as every CLI surface writes them: `$0.42`, and a sub-cent
-/// spend kept visible (`$0.0031`).
-pub fn dollars(usd: f64) -> String {
-    if usd > 0.0 && usd < 0.01 {
-        format!("${usd:.4}")
-    } else {
-        format!("${usd:.2}")
-    }
-}
-
 /// A cost for humans: `$0.42`, `$0.0031`; marked `+` when some tokens
 /// are of a model without a known price.
 pub fn cost_label(cost: &Value) -> String {
     let usd = cost.get("cost_usd").and_then(Value::as_f64).unwrap_or(0.0);
     let priced = cost.get("priced").and_then(Value::as_bool) != Some(false);
-    let amount = dollars(usd);
+    let amount = crate::util::dollars(usd);
     if priced {
         amount
     } else if usd == 0.0 {
@@ -1192,6 +1182,19 @@ pub(crate) fn relaunch(args: &RelaunchArgs, out: &mut dyn Write, err: &mut dyn W
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_costs_read_as_the_activity_digest_and_the_web_ui_do() {
+        let label = |usd: f64| cost_label(&json!({ "cost_usd": usd }));
+        assert_eq!(label(0.0), "$0");
+        assert_eq!(label(0.0042), "$0.0042");
+        assert_eq!(label(3.5), "$3.50");
+        assert_eq!(label(1234.4), "$1234");
+        assert_eq!(
+            cost_label(&json!({ "cost_usd": 0.4, "priced": false })),
+            "$0.40+unpriced"
+        );
+    }
 
     #[test]
     fn a_kind_override_takes_only_the_template_options_that_kind_has() {

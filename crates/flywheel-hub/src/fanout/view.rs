@@ -209,7 +209,7 @@ pub fn verdict_of(candidate: &Candidate, stale: Option<&str>) -> Verdict {
 
 fn money(cost: Option<f64>) -> String {
     match cost {
-        Some(cost) => crate::script::dollars(cost),
+        Some(cost) => crate::util::dollars(cost),
         None => "unpriced".to_owned(),
     }
 }

@@ -338,7 +338,9 @@ async fn the_machine_proxy_drops_a_stalled_side_either_way() {
     let mut stalled = hub.ws("/m/box/api/flood", true).await;
     // The relay stalls on the stalled browser, then gives up on it: its
     // machine connection is closed, the other's goes on.
-    let ended = timeout(SEND_TIMEOUT * 15, seen.recv())
+    // Within the stall plus one bounded close (no more writes to the side
+    // that stalled), with room for the buffers to fill.
+    let ended = timeout(SEND_TIMEOUT * 6, seen.recv())
         .await
         .expect("the stalled relay was kept")
         .unwrap();
@@ -371,7 +373,7 @@ async fn the_machine_proxy_drops_a_stalled_side_either_way() {
     assert!(write_until_stalled(&mut browser, Message::binary(vec![b'y'; 16 * 1024])).await > 0);
     // Its close (1011) reaches the browser unless what the browser sent
     // and the hub never read turned the close into a reset.
-    let deadline = Instant::now() + SEND_TIMEOUT * 15;
+    let deadline = Instant::now() + SEND_TIMEOUT * 6;
     loop {
         let wait = deadline.saturating_duration_since(Instant::now());
         match timeout(wait, browser.next()).await {

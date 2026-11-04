@@ -558,7 +558,7 @@ fn render(view: &Value, verbose: bool, out: &mut dyn Write) -> std::io::Result<(
             })
             .unwrap_or_else(|| "-".to_owned());
         let cost = match c.get("cost_usd").and_then(Value::as_f64) {
-            Some(usd) => crate::script::dollars(usd),
+            Some(usd) => crate::util::dollars(usd),
             None if c.get("tokens").and_then(Value::as_u64).unwrap_or(0) > 0 => {
                 "unpriced".to_owned()
             }

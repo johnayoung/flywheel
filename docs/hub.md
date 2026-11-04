@@ -10,24 +10,24 @@
 ## 60-second quickstart
 
 ```bash
-cargo install --path crates/flywheel           # fw + flywheel on PATH (~/.cargo/bin)
-fw hub doctor                                  # optional: PATH, claude/codex, hooks, port, tailscale
-fw hub start                                   # detached on 127.0.0.1:7420; prints one-time login URLs
-fw hub open                                    # this machine's browser, signed in
-fw hub import ~/code/*.code-workspace          # VS Code multi-root workspaces -> hub workspaces
-id=$(fw hub new myrepo --create --folder ~/code/myrepo --kind claude --prompt "Fix the failing test")   # or the UI (Alt N)
+cargo install --path crates/flywheel  # fw + flywheel on PATH (~/.cargo/bin)
+fw hub doctor  # optional: PATH, claude/codex, hooks, port, tailscale
+fw hub start  # detached on 127.0.0.1:7420; prints one-time login URLs
+fw hub open  # this machine's browser, signed in
+fw hub import ~/code/*.code-workspace  # VS Code multi-root workspaces -> hub workspaces
+id=$(fw hub new myrepo --create --folder ~/code/myrepo --kind claude --prompt "Fix the failing test")  # or the UI (Alt N)
 fw hub wait "$id" --until done --timeout 900
-fw hub commands "$id" --last --copy            # newest suggested shell block, exact text, OSC 52 copy
+fw hub commands "$id" --last --copy  # newest suggested shell block, exact text, OSC 52 copy
 ```
 
 Phone or another machine:
 
 ```bash
-tailscale serve --bg http://127.0.0.1:7420     # recommended: https on the tailnet
-fw hub url --qr                                # scan the login QR
+tailscale serve --bg http://127.0.0.1:7420  # recommended: https on the tailnet
+fw hub url --qr  # scan the login QR
 
-fw hub stop; fw hub start --bind 0.0.0.0 --tls auto   # or: built-in https on the LAN
-fw hub url --qr                                # first QR installs the CA (/ca), second logs in over https
+fw hub stop; fw hub start --bind 0.0.0.0 --tls auto  # or: built-in https on the LAN
+fw hub url --qr  # first QR installs the CA (/ca), second logs in over https
 ```
 
 After a rebuild: `fw hub upgrade` (live handoff, no session restarts), not stop/start.

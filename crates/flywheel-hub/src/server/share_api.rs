@@ -23,7 +23,6 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
-use futures_util::SinkExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::{Arc, PoisonError};
@@ -505,7 +504,7 @@ async fn read_only_pump(
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                     Some(Ok(Message::Close(_))) => {
-                        let _ = viewer.socket.flush().await;
+                        viewer.flush().await;
                         break;
                     }
                     Some(Err(_)) | None => break,

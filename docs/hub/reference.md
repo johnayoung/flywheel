@@ -16,14 +16,14 @@ Every `fw hub` verb and flag, the serve flags, the hub's files (`docs_drift.rs` 
 Server and lifecycle:
 
 ```bash
-fw hub start {serve} [--timeout SECS] [--handoff]   # detached; prints login URLs
+fw hub start {serve} [--timeout SECS] [--handoff]  # detached; prints login URLs
 fw hub stop [--timeout SECS] [--force]
-fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS]   # exit 4 refused, 3 no hub
-fw hub status [--json]                              # exit 3 not running
-fw hub logs [--follow|-f] [--lines|-n N]            # -n 0: all
-fw hub serve {serve} [--handoff]                    # foreground
-fw hub install-service {serve} [--name N] [--force] [--print]   # systemd --user unit
-fw hub doctor [--port N] [--json]                   # exit 1 on a FAIL
+fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS]  # exit 4 refused, 3 no hub
+fw hub status [--json]  # exit 3 not running
+fw hub logs [--follow|-f] [--lines|-n N]  # -n 0: all
+fw hub serve {serve} [--handoff]  # foreground
+fw hub install-service {serve} [--name N] [--force] [--print]  # systemd --user unit
+fw hub doctor [--port N] [--json]  # exit 1 on a FAIL
 ```
 
 Sign-in, access, other hubs:
@@ -37,7 +37,7 @@ fw hub tls rotate
 fw hub peer issue --name X [--json]
 fw hub peer ls [--json]
 fw hub peer revoke NAME|ID
-fw hub machine add NAME URL [--mint] [--peer-name N] [--fingerprint SHA256] [--replace] [--json]   # secret: env or stdin
+fw hub machine add NAME URL [--mint] [--peer-name N] [--fingerprint SHA256] [--replace] [--json]  # secret: env or stdin
 fw hub machine ls [--no-probe] [--json]
 fw hub machine rm NAME [--json]
 fw hub machine test [NAME] [--json]
@@ -59,7 +59,7 @@ fw hub send SESSION TEXT|- [--enter] [--raw] {remote} {machine}
 fw hub read SESSION [--source visible|recent] [--lines N] [--json] {remote} {machine}
 fw hub wait SESSION --until done|blocked|idle|working|exit [--timeout SECS] [--changed] {remote} {machine}
 fw hub attach [SESSION] [--prefix C-b] [--no-status] {remote} {machine}
-fw hub kill SESSION [--rm] [--remove-worktree] [--force] {remote} {machine}   # --rm forgets
+fw hub kill SESSION [--rm] [--remove-worktree] [--force] {remote} {machine}  # --rm forgets
 fw hub relaunch SESSION {remote} {machine}
 fw hub explain [SESSION] [--file SCREEN.txt|-] [--kind claude|codex|shell] [--json] {remote} {machine}
 fw hub import FILE.code-workspace... [--name N] [--update] [--json]
@@ -69,7 +69,7 @@ Agent output:
 
 ```bash
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N] {remote} {machine}
-fw hub search QUERY [--regex] [--case] [--session S] [--workspace W] [--kind K]... [--source scrollback|transcript|commands]... [--limit N] [--per-session N] [--offset N] [--json] {remote} {machine}   # 1: no hits
+fw hub search QUERY [--regex] [--case] [--session S] [--workspace W] [--kind K]... [--source scrollback|transcript|commands]... [--limit N] [--per-session N] [--offset N] [--json] {remote} {machine}  # 1: no hits
 fw hub activity [--since AGE|TIME|last-seen] [--until T] [--workspace W] [--session S] [--kind K]... [--limit N] [--json] {remote} {machine}
 fw hub record start SESSION [--json] {remote}
 fw hub record stop SESSION [--json] {remote}
@@ -159,7 +159,7 @@ Taken by `serve`, `start`, `install-service`. All but `--notify-url` are also `h
 
 ## hub.toml
 
-`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors (`serve` exits 2). Edits are re-read within 1 s: live keys apply, the rest at restart; an invalid edit keeps the last good settings.
+`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors (`serve` exits 2). Edits are re-read within 1 s: live keys apply, the rest at restart; an invalid edit keeps the last good ones.
 
 ```toml
 [server]

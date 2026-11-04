@@ -361,19 +361,16 @@ function listedInNeedsYou() {
   return phone() ? new Set(attention.entries().map((e) => e.session.id)) : new Set();
 }
 
-function needsYouLine(count) {
+function needsYouLine(ids) {
   return el(
     "li",
     {},
     el("button", {
       type: "button",
       className: "ws-needs",
-      textContent: `${count} in Needs you`,
+      textContent: `${ids.length} in Needs you`,
       title: "Listed in Needs you, at the top",
-      onclick: () => {
-        const list = $("#attention");
-        if (list && !list.hidden) list.scrollIntoView({ block: "start", behavior: "smooth" });
-      },
+      onclick: () => attention.reveal(ids),
     }),
   );
 }
@@ -381,7 +378,7 @@ function needsYouLine(count) {
 function renderWorkspace(workspace, i, numbering, needsYou = new Set()) {
   const sessions = state.sessions.filter((s) => s.workspace_id === workspace.id);
   const listed = sessions.filter((s) => !needsYou.has(s.id));
-  const elsewhere = sessions.length - listed.length;
+  const elsewhere = sessions.filter((s) => needsYou.has(s.id)).map((s) => s.id);
   const live = sessions.filter((s) => s.live && s.state === "running" && reachable(s)).length;
   const collapsed = state.collapsed.has(workspace.id);
   const attachedHere = sessionById(state.attached)?.workspace_id === workspace.id;
@@ -456,7 +453,7 @@ function renderWorkspace(workspace, i, numbering, needsYou = new Set()) {
           "ul",
           { className: "sessions" },
           listed.map((s) => renderSession(s, numbering.get(s.id))),
-          elsewhere ? needsYouLine(elsewhere) : null,
+          elsewhere.length ? needsYouLine(elsewhere) : null,
         )
         : el(
           "div",

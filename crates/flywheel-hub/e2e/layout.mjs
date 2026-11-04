@@ -823,6 +823,43 @@ try {
   check(refolded === "false", `phone: picking a utility folds More again (${refolded})`);
   await mp.keyboard.press("Escape");
   await mp.waitForTimeout(300);
+  // More agents blocked than Needs you's short scroll shows: three in one
+  // workspace, then one in another (blocked last, so listed last, below
+  // the fold). The list says there is more, and that workspace's
+  // "1 in Needs you" line brings its agent into view.
+  const crowded = [];
+  for (const [name, n] of [["crowd", 3], ["stray", 1]]) {
+    const dir = path.join(tmp, "code", name);
+    fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
+    const ws = await api("POST", "/api/workspaces", { name, folders: [dir] });
+    for (let i = 0; i < n; i++) {
+      crowded.push(await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", prompt: "polish", name: `${name}-${i}`, cols: 80, rows: 24 }));
+      await sleep(300);
+    }
+  }
+  const stray = crowded[crowded.length - 1];
+  if (!(await mp.evaluate(() => document.body.classList.contains("side-open")))) await mp.locator(".menu-toggle").tap();
+  const seen = (id) => mp.evaluate((id) => {
+    const row = document.querySelector(`#attention .attn-row[data-id="${id}"]`);
+    if (!row) return { row: false };
+    const r = row.getBoundingClientRect();
+    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + Math.min(r.height / 2, 10));
+    return { row: true, visible: !!hit && row.contains(hit), more: document.querySelector("#sidebar .attn-list").classList.contains("more-below") };
+  }, id);
+  await mp.waitForFunction((id) => !!document.querySelector(`#attention .attn-row[data-id="${id}"]`), stray.id, { timeout: 15000 }).catch(() => {});
+  await mp.evaluate(() => { document.querySelector("#sidebar").scrollTop = 0; });
+  await mp.waitForTimeout(300);
+  const before = await seen(stray.id);
+  check(before.row && !before.visible && before.more, `phone: a capped Needs you says there is more below (${JSON.stringify(before)})`);
+  const line = mp.locator(`#workspaces section.workspace:has(.ws-name:text-is("stray")) .ws-needs`).first();
+  await line.scrollIntoViewIfNeeded();
+  await line.tap();
+  await mp.waitForTimeout(900);
+  const after = await seen(stray.id);
+  check(after.visible, `phone: "1 in Needs you" brings that workspace's agent into view (${JSON.stringify(after)})`);
+  await mp.screenshot({ path: path.join(out, "phone-needs-reveal.png") });
+  for (const s of crowded) await api("DELETE", `/api/sessions/${s.id}`);
+  await mp.waitForTimeout(500);
   // Drawers on a phone, over an agent in a real repo (Review needs git).
   await mp.goto(`${base}/login?token=${token}#session=${agent.id}`);
   await mp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });

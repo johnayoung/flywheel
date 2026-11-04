@@ -134,8 +134,41 @@ window.FwHubAttention = function (ctx) {
     for (const root of [$("#attention"), $("#empty-attention")]) {
       if (!root) continue;
       const any = list.length || loop.length || graded.length || queues.length;
+      // A re-render keeps where its own short scroll was (a row the
+      // phone's "N in Needs you" line scrolled to stays in view).
+      const kept = root.querySelector(".attn-list")?.scrollTop || 0;
       root.hidden = !any;
       root.replaceChildren(...(any ? content(list, loop, graded, queues) : []));
+      const inner = root.querySelector(".attn-list");
+      if (inner) {
+        inner.scrollTop = kept;
+        inner.addEventListener("scroll", () => moreBelow(inner), { passive: true });
+        moreBelow(inner);
+      }
+    }
+  }
+
+  // Rows past the bottom of a capped list fade out there: there is more.
+  function moreBelow(list) {
+    list.classList.toggle("more-below", list.scrollTop + list.clientHeight < list.scrollHeight - 2);
+  }
+
+  // Bring these sessions' rows into view (the list scrolled to the first,
+  // then the box onto the screen) and mark them a moment.
+  function reveal(ids) {
+    const box = $("#attention");
+    if (!box || box.hidden) return;
+    const list = box.querySelector(".attn-list");
+    const rows = [...box.querySelectorAll(".attn-row[data-id]")].filter((r) => ids.includes(r.dataset.id));
+    if (list && rows.length) {
+      list.scrollTop += rows[0].getBoundingClientRect().top - list.getBoundingClientRect().top;
+      moreBelow(list);
+    }
+    box.scrollIntoView({ block: "start", behavior: "smooth" });
+    for (const r of rows) {
+      r.classList.remove("pointed");
+      void r.offsetWidth;
+      r.classList.add("pointed");
     }
   }
 
@@ -178,5 +211,5 @@ window.FwHubAttention = function (ctx) {
     if (document.visibilityState === "visible" && !$("#attention").hidden) render();
   }, 30000);
 
-  return { render, entries, branchOf };
+  return { render, entries, branchOf, reveal };
 };

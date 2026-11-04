@@ -6,13 +6,13 @@ Driving agents from scripts and the UI. Front door: [hub](../hub.md).
 
 ```bash
 id=$(fw hub new demo --kind claude --name fixer)
-fw hub wait "$id" --until idle --timeout 60           # agent up, waiting for a prompt
+fw hub wait "$id" --until idle --timeout 60  # agent up, waiting for a prompt
 fw hub send "$id" $'Fix the failing test in src/lib.rs\n'
 fw hub wait "$id" --until done --changed --timeout 900 || { fw hub read "$id"; exit 1; }
-fw hub commands "$id" --last > next.sh                # newest shell block it suggested, exactly
-fw hub send sh "$(cat next.sh)" --enter               # run it in a shell session
+fw hub commands "$id" --last > next.sh  # newest shell block it suggested, exactly
+fw hub send sh "$(cat next.sh)" --enter  # run it in a shell session
 fw hub new demo --name build -- sh -c "$(cat next.sh)" && fw hub wait build --until exit --timeout 600
-fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"   # 0: it waits on a prompt
+fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it waits on a prompt
 ```
 
 - `wait`: 0 met, 124 timeout, 1 error (or the session ended first). `--changed`: only statuses begun after it started (`wait --changed &`, then the prompt). `--until idle` accepts `done`; `exit` prints `exited N` / `killed (SIG)`; `--timeout 0` checks once.
@@ -42,8 +42,8 @@ Agents wrap commands for the screen; the hub reads each fenced block from the ag
 ## Worktrees and companion shells
 
 ```bash
-fw hub new WS --kind claude --worktree fix-retry [--base main]   # git worktree add -b <prefix>fix-retry ../<repo>.worktrees/fix-retry
-fw hub kill fix-retry --rm --remove-worktree                     # refused if work would be lost, unless --force
+fw hub new WS --kind claude --worktree fix-retry [--base main]  # git worktree add -b <prefix>fix-retry ../<repo>.worktrees/fix-retry
+fw hub kill fix-retry --rm --remove-worktree  # refused if work would be lost, unless --force
 ```
 
 - A sibling of the **main** checkout; base `--base`, else the current branch; bad names, existing dirs or branches refused before git runs.
@@ -81,7 +81,7 @@ id=$(fw hub fanout new demo --prompt "Fix the flaky retry test" \
   --agent claude:opus --agent claude:sonnet --agent codex:gpt-5.1-codex \
   --grader 'unit=cargo test -p retry' --grader ~/oracles/retry-check.sh --permission-mode acceptEdits)
 fw hub fanout wait "$id" --timeout 3600; fw hub fanout show "$id" -v
-fw hub fanout fix "$id" c3 --yes           # paste c3's failing grader output into its agent
+fw hub fanout fix "$id" c3 --yes  # paste c3's failing grader output into its agent
 fw hub fanout pick "$id" c1 --yes [--rebase]
 fw hub fanout cleanup "$id" [--force] --yes
 ```
@@ -99,15 +99,15 @@ fw hub fanout cleanup "$id" [--force] --yes
 For a folder flywheel drives with a **directory** work source:
 
 ```bash
-fw hub fanout promote "$id"            # dry run: path and exact bytes
-fw hub fanout promote "$id" --yes      # writes .flywheel/tasks/active/NN-<slug>/<slug>-<tag>.json (uncommitted)
+fw hub fanout promote "$id"  # dry run: path and exact bytes
+fw hub fanout promote "$id" --yes  # writes .flywheel/tasks/active/NN-<slug>/<slug>-<tag>.json (uncommitted)
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
 - **Promote**: goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints (only `[submit] protected_paths` refuses a landing), winner -> a reference; refused for an existing file or id.
-- The file is left **uncommitted**; **Run <id> with worker here** runs `fw worker --task <id>` (that task alone).
+- The file is left **uncommitted**; **Run <id> with worker here** (a task-seeded fan-out offers it at once) runs `fw worker --task <id>` alone.
 - **Fan out this task** (Flywheel panel): prompt from its goal and context; graders = its command plus **held-out** graders, added server-side (none: refused; an unreadable registry fails closed).
-- Held-out graders never reach an agent via the hub: a prompt naming one is refused; Ask to fix only says one failed. Not a sandbox. A task-seeded fan-out offers **Run <id> with worker here** at once.
+- Held-out graders never reach an agent via the hub: a prompt naming one is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
 
@@ -119,7 +119,7 @@ Folders with a `flywheel.toml` or `.flywheel/` get the verified loop beside the 
 - **Start worker here**: a hub shell running `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks before adding unmet prerequisites). A second needs confirming (409). A pending task a running scoped worker will run says `queued in <session>`. Outcome: `verified`, `not verified`, `refused`, `worker exit N`.
 - **Output** on a run: its `fw show` summary and redacted transcript, followed live.
 - A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is never created. One watcher per folder (stat 2 s, re-read 15 s).
-- Seam: `flywheel-hub` defines `flywheel::FlywheelProvider`; the `flywheel` crate implements it (`hub_flywheel.rs`).
+- Seam: `flywheel::FlywheelProvider` (hub), implemented by the `flywheel` crate (`hub_flywheel.rs`).
 
 ## Prompt queue
 
@@ -144,8 +144,8 @@ fw hub queue ls api
 What happened, newest first: palette **Activity**, the sidebar chip, the header pill.
 
 ```bash
-fw hub activity                         # last 24 h: the digest, then the timeline
-fw hub activity --since last-seen       # since this CLI last looked (marks now)
+fw hub activity  # last 24 h: the digest, then the timeline
+fw hub activity --since last-seen  # since this CLI last looked (marks now)
 fw hub activity --since 2h --workspace api --kind review --json
 ```
 

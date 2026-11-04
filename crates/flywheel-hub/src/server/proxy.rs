@@ -639,6 +639,10 @@ struct Relay {
 enum End {
     /// The browser closed or went away.
     Browser,
+    /// The browser stopped reading (a write to it timed out).
+    BrowserStalled,
+    /// The machine stopped reading (a write to it timed out).
+    MachineStalled,
     /// The machine closed (its close frame) or the link broke (`None`).
     Machine(Option<(u16, String)>),
     /// This hub ends it (a credential, a removed machine, shutdown).
@@ -711,12 +715,12 @@ async fn relay(browser: WebSocket, upstream: crate::endpoint::Socket, mut ctx: R
                             | tungstenite::Message::Frame(_) => continue,
                         };
                         if !write_within(limit, to_browser.send(out)).await {
-                            return End::Browser;
+                            return End::BrowserStalled;
                         }
                     }
                     _ = ping.tick() => {
                         if !write_within(limit, to_browser.send(Message::Ping(Bytes::new()))).await {
-                            return End::Browser;
+                            return End::BrowserStalled;
                         }
                     }
                 }
@@ -736,7 +740,7 @@ async fn relay(browser: WebSocket, upstream: crate::endpoint::Socket, mut ctx: R
                     Message::Ping(_) | Message::Pong(_) => continue,
                 };
                 if !write_within(limit, to_machine.send(out)).await {
-                    return End::Machine(None);
+                    return End::MachineStalled;
                 }
             }
         };
@@ -762,17 +766,32 @@ async fn relay(browser: WebSocket, upstream: crate::endpoint::Socket, mut ctx: R
             } => End::Local(CloseFrame { code: 1001, reason: "the hub is shutting down".into() }),
         }
     };
-    let browser_frame = match end {
-        End::Browser => None,
-        End::Machine(upstream) => Some(browser_close(&ctx.name, upstream)),
-        End::Local(frame) => Some(frame),
+    // Closing: nothing more is written to a side that stalled, and the
+    // two closes go out together within one more send timeout, so a
+    // stalled relay holds its sockets for at most twice the limit.
+    let (browser_frame, browser_open, machine_open) = match end {
+        End::Browser => (None, true, true),
+        End::BrowserStalled => (None, false, true),
+        End::Machine(upstream) => (Some(browser_close(&ctx.name, upstream)), true, true),
+        End::MachineStalled => (Some(browser_close(&ctx.name, None)), true, false),
+        End::Local(frame) => (Some(frame), true, true),
     };
-    if let Some(frame) = browser_frame {
-        write_within(limit, to_browser.send(Message::Close(Some(frame)))).await;
-    }
-    write_within(limit, to_browser.flush()).await;
-    write_within(limit, to_machine.send(tungstenite::Message::Close(None))).await;
-    write_within(limit, to_machine.flush()).await;
+    let browser = async {
+        if !browser_open {
+            return;
+        }
+        if let Some(frame) = browser_frame {
+            let _ = to_browser.send(Message::Close(Some(frame))).await;
+        }
+        let _ = to_browser.flush().await;
+    };
+    let machine = async {
+        if machine_open {
+            let _ = to_machine.send(tungstenite::Message::Close(None)).await;
+            let _ = to_machine.flush().await;
+        }
+    };
+    let _ = tokio::time::timeout(limit, futures_util::future::join(browser, machine)).await;
 }
 
 #[cfg(test)]

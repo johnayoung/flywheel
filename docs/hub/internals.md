@@ -70,19 +70,19 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 Per-kind TOML screen rules read against the **live bottom** of the screen: `crates/flywheel-hub/detect/{claude,codex,shell}.toml`, each replaced wholesale by `<state-dir>/agent-detection/<kind>.toml` (re-read within 1 s; an invalid one is logged and ignored).
 
 ```toml
-kind = "codex"            # must match the file name
-version = 2               # shown by explain
-[[rule]]                  # first rule whose every clause holds wins
+kind = "codex"  # must match the file name
+version = 2  # shown by explain
+[[rule]]  # first rule whose every clause holds wins
 id = "approval"
-state = "blocked"         # working | blocked | idle | hold (keep the status)
+state = "blocked"  # working | blocked | idle | hold (keep the status)
 detail = "asks for approval"
-detail_line = ['(?i)^\s*(would you like to .+\?)$']   # capture 1 becomes the detail (wins over detail)
+detail_line = ['(?i)^\s*(would you like to .+\?)$']  # capture 1 becomes the detail (wins over detail)
 [[rule.when]]
-lines = 1                 # last N non-empty rows (1-100, default 30)
+lines = 1  # last N non-empty rows (1-100, default 30)
 line = ['(?i)^\s*press enter to confirm or esc to cancel\s*$']
 [[rule.when]]
 lines = 100
-any = ["would you like to run the following command?"]   # also all, none, not_line
+any = ["would you like to run the following command?"]  # also all, none, not_line
 ```
 
 - Pin `blocked` rules to a dialog's last-row footer so quoted text does not match. Limits: 64 rules, 8 clauses, 16 patterns per list, 400 chars, 64 KiB per file; read at most every 250 ms.
@@ -103,7 +103,7 @@ Per workspace: tabs of split trees, one session per pane. Stored on the hub (sha
 
 - Desktop: tab bar (`+`, double-click renames, middle-click closes). Drop a sidebar session on a pane edge to split, its middle to show it.
 - A new-shell split (`Alt \`, `Alt -`) opens an agent's companion shell first; ``Alt ` `` opens it beside its agent above 1100 px.
-- Panes stay 40x8 cells or more (else a new tab). Closing a pane (`Alt X`) leaves its session running; removing a session closes its panes and empty tabs. Only the active tab attaches; 12 tabs, 12 panes per tab.
+- Panes stay 40x8 cells+ (else a new tab). Closing a pane (`Alt X`) leaves its session running; removing a session closes its panes and empty tabs. Only the active tab attaches; 12 tabs, 12 panes per tab.
 - Phones (< 760 px): one pane, a chip row switches sessions; layouts unchanged.
 - Browser checks (opt-in, temp hub, fake `claude`; env `FW`, `PLAYWRIGHT`, `CHROMIUM`, `PORT`): `node crates/flywheel-hub/e2e/layout.mjs [OUT_DIR]` (layouts, tap targets at 1440x900, 390x844); `e2e/network.mjs [--baseline] [--full]` (a 400/150 kbps, 300 ms proxy).
 
@@ -115,7 +115,7 @@ Keys: [hub-reference](reference.md#keyboard-shortcuts).
 - Title and favicon count blocked and done. `#session=<id>` survives reloads; a dropped or silent (no pong 6 s after a ping) socket keeps the screen and reconnects (2 s for 30 s, then up to 10 s) with what it missed.
 - Keys typed while down wait (`N queued`), sent in order once back; dropped, and said, if the session changed (epoch). No local echo; unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
 - Drawers (Commands, Flywheel, Review, Queue): one width at the stage's right edge; phone: full-screen sheets (Flywheel closes on a switch to another folder's session).
-- Ended sessions offer Relaunch and Close; one relaunched elsewhere reattaches; one removed elsewhere leaves its pane with a toast.
+- Ended sessions offer Relaunch and Close; relaunched elsewhere: reattaches; removed elsewhere: its pane goes, with a toast.
 - New workspace: folder paths or **Import VS Code workspace**. New session: kind, folder, optional worktree. First run: import offers and a 30-second tour.
 - Themes: auto, dark, light (lifts low-contrast TUI colours to 4.5:1).
 - Embedded: xterm.js 6.0.0 (+ fit, web-links, search), UI fonts (SIL OFL); licenses in `web/vendor/`.
@@ -124,12 +124,12 @@ Keys: [hub-reference](reference.md#keyboard-shortcuts).
 
 Tested at 390x844 and 430x932.
 
-- Pinned to the visual viewport (the keyboard shrinks the terminal); the PTY keeps 16 rows or more (shorter boxes clip around the cursor).
-- **Needs you**: blocked and done agents of every workspace (blocked, longest waiting, first) head the sidebar (it scrolls as one) and the start screen; a workspace lists them as one `N in Needs you` row. The footer's utilities are one **More** row.
+- Pinned to the visual viewport (the keyboard shrinks the terminal); the PTY keeps 16+ rows (shorter boxes clip around the cursor).
+- **Needs you**: blocked and done agents of every workspace (blocked, longest waiting, first) head the sidebar (one scroll) and the start screen; a workspace lists them as one `N in Needs you` row (tap: scrolls to them). The footer's utilities are one **More** row.
 - **Key bar** (touch): `esc` arrows `enter` `^c` (44px, fits 360px); then `tab` `shift-tab` sticky `ctrl` `alt`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd`, `compose`. Modifiers apply to key-bar keys too.
 - **Quick answers**: a blocked dialog's options as buttons. **Compose**: multi-line text as one bracketed paste + Enter; per-device history, per-session drafts.
 - Touch: swipe scrolls, long-press selects, pinch zooms.
-- **Alerts** (per device): a notification when an agent becomes blocked or done while the page is hidden or idle 5 min (https or localhost).
+- **Alerts** (per device): a notification when an agent turns blocked or done while the page is hidden or idle 5 min (https or localhost).
 - **Lite mode** (Settings > Terminal, header `lite` pill; per device; `auto`: browser says slow, transfers under 64 KB/s, or 3+ round trips at 300 ms+): terminals at most 4 updates/s, hidden panes none; side panels wait (60 s); re-lists every 3 s at most.
 - **Install**: PWA; the service worker never touches `/api` or sockets, and serves the cached page only when the hub is unreachable.
 
@@ -145,9 +145,9 @@ Tested at 390x844 and 430x932.
 ## Recording
 
 ```bash
-fw hub record start agent        # or the header's rec pill
+fw hub record start agent  # or the header's rec pill
 fw hub record stop agent; fw hub record ls
-fw hub record get <name> -o demo.cast; asciinema play demo.cast   # or /replay#<name>
+fw hub record get <name> -o demo.cast; asciinema play demo.cast  # or /replay#<name>
 ```
 
 - Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers like `exit: N`), from a screen snapshot.
@@ -160,7 +160,7 @@ fw hub record get <name> -o demo.cast; asciinema play demo.cast   # or /replay#<
 ntfy-compatible POST when an agent becomes **blocked** or **done**, so a phone hears it with every browser closed.
 
 ```bash
-fw hub start --notify-url https://ntfy.sh/<long-random-topic>   # prefer notify.toml: flags show in ps
+fw hub start --notify-url https://ntfy.sh/<long-random-topic>  # prefer notify.toml: flags show in ps
 ```
 
 - `<session> is blocked|done`, workspace / kind / branch, the blocked detail, `Priority: high` when blocked, `Click:` the session URL; never terminal content, paths, or tokens.

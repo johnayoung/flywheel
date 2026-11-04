@@ -223,7 +223,8 @@ pub fn parse_duration(raw: &str) -> Result<u64, String> {
     Ok(total)
 }
 
-/// A dollar amount as the web UI writes it (`fmt.js` `dollars`): `$0`,
+/// A dollar amount as every surface writes it (CLI rows, activity rows,
+/// and the web UI's `fmt.js` `dollars`): `$0`,
 /// `$0.0040` (sub-cent spend stays visible), `$0.42`, `$120`.
 pub fn dollars(usd: f64) -> String {
     if usd <= 0.0 || !usd.is_finite() {

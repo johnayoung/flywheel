@@ -437,8 +437,9 @@ impl Hub {
             return;
         };
         // `seen` (on a finished turn's `done` only): someone watched it
-        // finish. `turn_finished` (deprecated, same events): kept for
-        // plugins written against it.
+        // finish. `turn_finished` (deprecated, same events; removed in
+        // 0.8): kept for plugins written against it, as is `statuses =
+        // ["done"]` taking it (see `Subscription::takes`).
         let changed = |status: AgentStatus, previous: Option<AgentStatus>, seen: Option<bool>| {
             self.emit_lifecycle(
                 "status.changed",

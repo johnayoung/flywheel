@@ -768,17 +768,20 @@ window.FwHubSearch = function (ctx) {
     );
   }
 
-  // Which call a result answers (parallel calls' results come back in
-  // any order): its index, and its input's first line (a command).
-  function answers(m) {
-    if (m.call_index == null) return "";
-    const call = viewer.messages.get(m.call_index);
-    // The call's text: its tool, then its input's lines (a list's items
-    // indented, "- key: value"); the first that holds a value.
-    const line = call ? call.text.split("\n").slice(1).find((l) => !/^[\s-]*[\w-]+:$/.test(l)) || "" : "";
-    const first = line.replace(/^[\s-]*[\w-]+: /, "").trim();
-    const shown = first.length > 60 ? `${first.slice(0, 59)}…` : first;
-    return ` · for #${m.call_index}${shown ? ` ${shown}` : ""}`;
+  // What a result answers (parallel calls' results come back in any
+  // order): the call, short as the hub labels it ("Bash: cargo test -p
+  // x"; a hub without labels: the loaded call's first input value), and
+  // its index.
+  function callOf(m) {
+    let label = m.call || "";
+    if (!label && m.call_index != null) {
+      const call = viewer.messages.get(m.call_index);
+      const line = call ? call.text.split("\n").slice(1).find((l) => !/^[\s-]*[\w-]+:$/.test(l)) || "" : "";
+      const first = line.replace(/^[\s-]*[\w-]+: /, "").trim();
+      const shown = first.length > 60 ? `${first.slice(0, 59)}…` : first;
+      label = shown ? `${m.tool || "tool"}: ${shown}` : "";
+    }
+    return label;
   }
 
   function renderTranscript(scrollToFocus) {
@@ -792,8 +795,9 @@ window.FwHubSearch = function (ctx) {
     }
     const canSend = !!ctx.handoff && ctx.handoff().targets(viewer.session.session_id).length > 0;
     for (const m of list) {
+      const call = m.kind === "result" ? callOf(m) : "";
       const who = m.kind === "tool" ? `tool · ${m.tool || ""}`
-        : m.kind === "result" ? `${m.tool || "tool"} result${m.error ? " · error" : ""}${answers(m)}`
+        : m.kind === "result" ? `${call ? "result" : `${m.tool || "tool"} result`}${m.error ? " · error" : ""}${m.call_index != null ? ` · for #${m.call_index}` : ""}`
         : m.role;
       nodes.push(el(
         "article",
@@ -802,6 +806,8 @@ window.FwHubSearch = function (ctx) {
           "header",
           { className: "tx-msg-head" },
           el("span", { className: "tx-who", textContent: who }),
+          // As written (a command keeps its case), the whole on hover.
+          call ? el("span", { className: "tx-call", textContent: call, title: call }) : null,
           el("span", { className: "tx-index", textContent: `#${m.index}` }),
           m.timestamp ? el("span", { className: "tx-when", textContent: `${age(m.timestamp)} ago`, title: m.timestamp }) : null,
           m.truncated ? el("span", { className: "tx-cut", textContent: "cut at 64 KiB" }) : null,

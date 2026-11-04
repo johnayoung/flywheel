@@ -29,7 +29,7 @@ pub use model::{
     BaseView, BranchDiff, Commit, DiffPage, FileChange, FileSet, Remote, Review, Scope, Untracked,
     UpstreamView, branch_diff, diff, read,
 };
-pub use plan::{Outcome, Plan, Planned, PrDefaults, Ran, plan_commit, plan_push};
+pub use plan::{FileCount, Outcome, Plan, Planned, PrDefaults, Ran, plan_commit, plan_push};
 pub(crate) use session::MergeVia;
 pub use session::{Action, ActionReport, AgentRef, AskKind, AskPlan, FanoutRef, SessionReview};
 

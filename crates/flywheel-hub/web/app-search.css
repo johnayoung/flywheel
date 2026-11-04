@@ -128,7 +128,8 @@
 .tx-expand { margin-top: .2rem; font-size: 10px; }
 .tx-msg.focus { background: var(--bg-3); box-shadow: inset 0 0 0 1px var(--signal); }
 .tx-msg-head { display: flex; gap: .6rem; align-items: baseline; color: var(--ink-3); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
-.tx-who { color: var(--ink-2); font-weight: 700; }
+.tx-who { color: var(--ink-2); font-weight: 700; flex: none; }
+.tx-call { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: none; letter-spacing: 0; font-family: var(--term); font-size: 11px; color: var(--ink-2); font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
 .tx-cut { color: var(--alert); }
 .tx-text { margin: .25rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); }
 .tx-more { align-self: center; }

@@ -480,6 +480,13 @@ async fn search_finds_scrollback_transcripts_and_commands_across_sessions() {
     // ... and the index of that call (parallel calls' results come back
     // in any order).
     assert_eq!(newest["messages"][0]["call_index"], 2);
+    // ... and that call, short, to tell it from its parallel siblings.
+    assert!(
+        newest["messages"][0]["call"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("Bash: ")),
+        "{newest}"
+    );
     let (status, body) = hub
         .call(
             reqwest::Method::GET,

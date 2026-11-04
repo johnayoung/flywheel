@@ -252,6 +252,7 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
         contents: Vec::new(),
         suspects: Vec::new(),
         excluded: Vec::new(),
+        files: None,
     })
 }
 
@@ -331,6 +332,7 @@ pub fn plan_rebase(tools: &Tools, target: &Target) -> Result<Plan, String> {
         contents: Vec::new(),
         suspects: Vec::new(),
         excluded: Vec::new(),
+        files: None,
     })
 }
 
@@ -371,6 +373,7 @@ pub fn plan_abort(tools: &Tools, target: &Target) -> Result<Plan, String> {
         contents: Vec::new(),
         suspects: Vec::new(),
         excluded: Vec::new(),
+        files: None,
     })
 }
 
@@ -510,5 +513,6 @@ pub fn plan_merge(tools: &Tools, target: &Target) -> Result<Plan, String> {
         contents: Vec::new(),
         suspects: Vec::new(),
         excluded: Vec::new(),
+        files: None,
     })
 }

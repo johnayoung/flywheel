@@ -97,6 +97,17 @@ pub struct Plan {
     /// Commit: the changed paths left out (staged ones unstaged again).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub excluded: Vec<String>,
+    /// Commit: how many files it takes, and how many of them `details`
+    /// names (fewer past the review's [`MAX_FILES`] cut).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files: Option<FileCount>,
+}
+
+/// A commit's files: all of them, and those its plan lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FileCount {
+    pub total: usize,
+    pub listed: usize,
 }
 
 /// A changed file, or a directory of them, a commit-all may not want.
@@ -104,8 +115,10 @@ pub struct Plan {
 pub struct Suspect {
     /// A file, or a directory of generated output (ending in `/`).
     pub path: String,
-    /// `generated` (build or tool output), `secret` (keys, `.env`), or
-    /// `large` (over [`LARGE_FILE_BYTES`]).
+    /// `generated` (build or tool output), `build` (a directory that may
+    /// be build output: `dist/`, `build/`, ...), `secret` (keys, `.env`),
+    /// or `large` (over [`LARGE_FILE_BYTES`]). `generated` and `secret`
+    /// are left out by default.
     pub kind: &'static str,
     /// Left out of the commit.
     pub excluded: bool,
@@ -390,41 +403,108 @@ const GENERATED_DIRS: &[&str] = &[
     ".next",
 ];
 
-/// The outermost directory of `path` (relative to the work tree `dir`)
-/// that holds only generated output, with its trailing `/`: one of
-/// [`GENERATED_DIRS`], or a Cargo `target/` (beside a `Cargo.toml`,
-/// tagged by Cargo, or holding a profile, `doc`, or a target triple).
-fn generated_dir(dir: &Path, path: &str) -> Option<String> {
-    const CARGO_OUTPUT: &[&str] = &[
-        "debug",
-        "release",
-        "doc",
-        "tmp",
-        "package",
-        "CACHEDIR.TAG",
-        ".rustc_info.json",
-    ];
-    let parts: Vec<&str> = path.split('/').collect();
-    let prefix = |i: usize| format!("{}/", parts[..=i].join("/"));
-    for i in 0..parts.len().saturating_sub(1) {
-        let part = parts[i];
-        if GENERATED_DIRS.contains(&part) {
-            return Some(prefix(i));
-        }
-        if part == "target" {
-            let next = parts[i + 1];
-            let triple = next.matches('-').count() >= 2 && !next.contains('.');
-            let parent = dir.join(parts[..i].join("/"));
-            if CARGO_OUTPUT.contains(&next)
-                || triple
-                || parent.join("Cargo.toml").is_file()
-                || parent.join("target/CACHEDIR.TAG").is_file()
-            {
-                return Some(prefix(i));
-            }
+/// Directories that are often build output and sometimes source (a
+/// `build/` of scripts, a checked-in `dist/`): named, never left out by
+/// default.
+const MAYBE_GENERATED_DIRS: &[&str] = &["dist", "build", "coverage", "venv"];
+
+/// What a Cargo target directory holds at its top.
+const CARGO_OUTPUT: &[&str] = &[
+    "debug",
+    "release",
+    "doc",
+    "tmp",
+    "package",
+    "CACHEDIR.TAG",
+    ".rustc_info.json",
+];
+
+/// How sure a directory is generated output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Generated {
+    /// Only ever output: left out by default.
+    Surely,
+    /// Often output, sometimes source: named, kept by default.
+    Maybe,
+}
+
+/// Classifies changed paths' directories as generated output, reading the
+/// work tree `dir` for the markers that decide it (each looked up once).
+struct Classifier<'a> {
+    dir: &'a Path,
+    files: std::collections::HashMap<String, bool>,
+}
+
+impl<'a> Classifier<'a> {
+    fn new(dir: &'a Path) -> Self {
+        Self {
+            dir,
+            files: std::collections::HashMap::new(),
         }
     }
-    None
+
+    /// Whether `rel` (under the work tree) is a file.
+    fn file(&mut self, rel: String) -> bool {
+        let dir = self.dir;
+        *self
+            .files
+            .entry(rel)
+            .or_insert_with_key(|rel| dir.join(rel).is_file())
+    }
+
+    /// Directory `parts[..=i]`, holding `parts[i + 1]`: generated output,
+    /// and how surely. Surely: one of [`GENERATED_DIRS`], a `*.egg-info`,
+    /// a directory tagged a cache (`CACHEDIR.TAG`: Cargo tags every target
+    /// directory, `CARGO_TARGET_DIR` ones included), a virtualenv
+    /// (`pyvenv.cfg`), or a `target/` beside a `Cargo.toml`. Maybe: a
+    /// `target/` shaped like Cargo's (a profile, `doc`, a target triple)
+    /// with no manifest beside it, or one of [`MAYBE_GENERATED_DIRS`].
+    fn class(&mut self, parts: &[&str], i: usize) -> Option<Generated> {
+        let name = parts[i];
+        if GENERATED_DIRS.contains(&name)
+            || (name.len() > ".egg-info".len() && name.ends_with(".egg-info"))
+        {
+            return Some(Generated::Surely);
+        }
+        let at = parts[..=i].join("/");
+        if self.file(format!("{at}/CACHEDIR.TAG")) || self.file(format!("{at}/pyvenv.cfg")) {
+            return Some(Generated::Surely);
+        }
+        if name == "target" {
+            let next = parts[i + 1];
+            let triple = next.matches('-').count() >= 2 && !next.contains('.');
+            let manifest = match i {
+                0 => "Cargo.toml".to_owned(),
+                _ => format!("{}/Cargo.toml", parts[..i].join("/")),
+            };
+            if self.file(manifest) || self.file(format!("{at}/.rustc_info.json")) {
+                return Some(Generated::Surely);
+            }
+            if CARGO_OUTPUT.contains(&next) || triple {
+                return Some(Generated::Maybe);
+            }
+        }
+        MAYBE_GENERATED_DIRS
+            .contains(&name)
+            .then_some(Generated::Maybe)
+    }
+
+    /// The directory of `path` that holds only generated output, with its
+    /// trailing `/`: the outermost sure one, else the outermost maybe.
+    fn generated_dir(&mut self, path: &str) -> Option<(String, Generated)> {
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut maybe = None;
+        for i in 0..parts.len().saturating_sub(1) {
+            match self.class(&parts, i) {
+                Some(Generated::Surely) => {
+                    return Some((format!("{}/", parts[..=i].join("/")), Generated::Surely));
+                }
+                Some(Generated::Maybe) if maybe.is_none() => maybe = Some(i),
+                _ => {}
+            }
+        }
+        maybe.map(|i| (format!("{}/", parts[..=i].join("/")), Generated::Maybe))
+    }
 }
 
 /// Whether a file looks like a build or tool artifact by itself
@@ -476,53 +556,50 @@ fn is_zip(file: &Path) -> bool {
 /// What a commit-all would take that may not be wanted, from every
 /// changed path (`paths`, the full status, not the cut review list): a
 /// directory of generated output (one entry, ending in `/`, for all its
-/// files), and each other file still in the work tree that looks
-/// generated or secret (left out unless `exclude` says otherwise) or is
-/// large (kept unless excluded). `exclude` (`None`: those defaults) names
-/// exactly what is left out.
+/// files; `generated` when sure, `build` when only maybe), and each other
+/// file still in the work tree that looks secret or generated (left out
+/// unless `exclude` says otherwise) or is large (kept unless excluded).
+/// A secret or a sure directory inside a maybe one is its own entry.
+/// `exclude` (`None`: those defaults) names exactly what is left out.
 fn suspects(dir: &Path, paths: &[&str], exclude: Option<&[String]>) -> Vec<Suspect> {
     let mut found: Vec<Suspect> = Vec::new();
     let mut dirs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut classifier = Classifier::new(dir);
     for path in paths {
-        if let Some(under) = generated_dir(dir, path) {
-            match dirs.get(&under) {
-                Some(&at) => found[at].files += 1,
-                None => {
-                    dirs.insert(under.clone(), found.len());
-                    found.push(Suspect {
-                        path: under,
-                        kind: "generated",
-                        excluded: false,
-                        files: 1,
-                    });
-                }
-            }
-            continue;
-        }
+        let under = classifier.generated_dir(path);
         let file = dir.join(path);
-        let Ok(meta) = file.symlink_metadata() else {
-            continue;
+        let meta = file.symlink_metadata().ok();
+        let secret =
+            meta.is_some() && looks_secret(path) && !(path.ends_with(".key") && is_zip(&file));
+        let (entry, kind) = match under {
+            Some((under, Generated::Surely)) => (under, "generated"),
+            _ if secret => ((*path).to_owned(), "secret"),
+            _ if meta.is_some() && looks_generated(path) => ((*path).to_owned(), "generated"),
+            Some((under, Generated::Maybe)) => (under, "build"),
+            None => match &meta {
+                Some(meta) if meta.is_file() && meta.len() >= LARGE_FILE_BYTES => {
+                    ((*path).to_owned(), "large")
+                }
+                _ => continue,
+            },
         };
-        let kind = if looks_secret(path) && !(path.ends_with(".key") && is_zip(&file)) {
-            "secret"
-        } else if looks_generated(path) {
-            "generated"
-        } else if meta.is_file() && meta.len() >= LARGE_FILE_BYTES {
-            "large"
-        } else {
-            continue;
-        };
-        found.push(Suspect {
-            path: (*path).to_owned(),
-            kind,
-            excluded: false,
-            files: 1,
-        });
+        match dirs.get(&entry) {
+            Some(&at) => found[at].files += 1,
+            None => {
+                dirs.insert(entry.clone(), found.len());
+                found.push(Suspect {
+                    path: entry,
+                    kind,
+                    excluded: false,
+                    files: 1,
+                });
+            }
+        }
     }
     for s in &mut found {
         s.excluded = match exclude {
             Some(list) => list.contains(&s.path),
-            None => s.kind != "large",
+            None => matches!(s.kind, "generated" | "secret"),
         };
     }
     found
@@ -591,16 +668,23 @@ pub fn plan_commit(
     };
     let left_out = |path: &str| excluded.iter().any(|e| covers(e, path));
     let mut details = Vec::new();
+    let mut listed = std::collections::HashSet::new();
     for f in review.staged.files.iter().filter(|f| !left_out(&f.path)) {
         details.push(change_line("staged ", f));
+        listed.insert(f.path.as_str());
     }
     for f in review.unstaged.files.iter().filter(|f| !left_out(&f.path)) {
         details.push(change_line("", f));
+        listed.insert(f.path.as_str());
     }
     for u in review.untracked.iter().filter(|u| !left_out(&u.path)) {
         details.push(format!("new {}", u.path));
+        listed.insert(u.path.as_str());
     }
     let files = changed.iter().filter(|p| !left_out(p)).count();
+    // A rename's old path is a change of its own in `changed` (renames
+    // off), one line here: never list more than there are.
+    let listed = listed.len().min(files);
     let out = changed.len() - files;
     if files == 0 && refusal.is_none() {
         refusal = Some("every change is left out: nothing to commit".into());
@@ -613,9 +697,12 @@ pub fn plan_commit(
     if review.branch.is_none() {
         warnings.push("HEAD is detached: the commit is on no branch".into());
     }
-    if review.untracked_truncated || review.unstaged.truncated || review.staged.truncated {
+    if listed < files
+        && (review.untracked_truncated || review.unstaged.truncated || review.staged.truncated)
+    {
         warnings.push(format!(
-            "more than {MAX_FILES} files change; the list is cut (what is left out covers them all)"
+            "{} committed; the list names {listed} (cut at {MAX_FILES} per set; what is left out was checked against all)",
+            plural(files, "file")
         ));
     }
     if out > 0 {
@@ -631,6 +718,7 @@ pub fn plan_commit(
         let looks = match first.kind {
             "secret" => "like a secret",
             "generated" => "generated",
+            "build" => "like build output",
             _ => "large (5 MiB or more)",
         };
         let more = match kept.len() {
@@ -710,6 +798,10 @@ pub fn plan_commit(
         contents,
         suspects,
         excluded,
+        files: Some(FileCount {
+            total: files,
+            listed,
+        }),
     })
 }
 
@@ -890,6 +982,7 @@ pub fn plan_push(tools: &Tools, target: &Target, remote: Option<&str>) -> Result
         contents: Vec::new(),
         suspects: Vec::new(),
         excluded: Vec::new(),
+        files: None,
     })
 }
 
@@ -907,6 +1000,7 @@ pub(super) fn refused(action: &'static str, why: &str) -> Plan {
         contents: Vec::new(),
         suspects: Vec::new(),
         excluded: Vec::new(),
+        files: None,
     }
 }
 
@@ -914,22 +1008,46 @@ pub(super) fn refused(action: &'static str, why: &str) -> Plan {
 mod tests {
     use super::*;
 
+    /// `path`'s generated directory as `(dir, sure)`, against work tree
+    /// `dir`.
+    fn generated(dir: &Path, path: &str) -> Option<(String, bool)> {
+        Classifier::new(dir)
+            .generated_dir(path)
+            .map(|(under, how)| (under, how == Generated::Surely))
+    }
+
     #[test]
     fn new_build_artifacts_are_warned_about() {
         let nowhere = Path::new("/nonexistent-hub-test-dir");
-        for (path, under) in [
-            ("__pycache__/calc.cpython-313.pyc", "__pycache__/"),
-            ("pkg/__pycache__/x.txt", "pkg/__pycache__/"),
-            ("web/node_modules/a/node_modules/b.js", "web/node_modules/"),
-            ("target/debug/app", "target/"),
-            ("target/x86_64-unknown-linux-musl/release/app", "target/"),
-            ("target/doc/index.html", "target/"),
-            ("target/.rustc_info.json", "target/"),
-            ("crates/foo/target/debug/libfoo.rlib", "crates/foo/target/"),
+        for (path, under, sure) in [
+            ("__pycache__/calc.cpython-313.pyc", "__pycache__/", true),
+            ("pkg/__pycache__/x.txt", "pkg/__pycache__/", true),
+            (
+                "web/node_modules/a/node_modules/b.js",
+                "web/node_modules/",
+                true,
+            ),
+            ("app/.next/server/page.js", "app/.next/", true),
+            (".venv/lib/site.py", ".venv/", true),
+            ("src/calc.egg-info/PKG-INFO", "src/calc.egg-info/", true),
+            // Shaped like Cargo's but no manifest beside it: only maybe.
+            ("target/debug/app", "target/", false),
+            (
+                "target/x86_64-unknown-linux-musl/release/app",
+                "target/",
+                false,
+            ),
+            ("target/doc/index.html", "target/", false),
+            ("web/dist/app.js", "web/dist/", false),
+            ("build/lib/calc.py", "build/", false),
+            ("coverage/lcov.info", "coverage/", false),
+            ("venv/bin/python", "venv/", false),
+            // A sure directory inside a maybe one wins.
+            ("dist/node_modules/x.js", "dist/node_modules/", true),
         ] {
             assert_eq!(
-                generated_dir(nowhere, path).as_deref(),
-                Some(under),
+                generated(nowhere, path),
+                Some((under.to_owned(), sure)),
                 "{path}"
             );
         }
@@ -944,9 +1062,12 @@ mod tests {
             ".o",
             "target/README.md",
             "target",
+            "dist",
+            ".egg-info/x",
+            "src/distance/x.rs",
         ] {
             assert!(!looks_generated(path), "{path}");
-            assert_eq!(generated_dir(nowhere, path), None, "{path}");
+            assert_eq!(generated(nowhere, path), None, "{path}");
         }
         for path in [
             ".env",
@@ -974,16 +1095,80 @@ mod tests {
     }
 
     #[test]
-    fn a_target_dir_beside_a_cargo_manifest_is_build_output() {
+    fn cargo_and_cache_tagged_dirs_are_build_output_at_any_depth() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("tool/target/custom")).unwrap();
-        std::fs::write(dir.path().join("tool/Cargo.toml"), "[package]\n").unwrap();
-        assert_eq!(
-            generated_dir(dir.path(), "tool/target/custom/out.bin").as_deref(),
-            Some("tool/target/")
+        let root = dir.path();
+        let mkfile = |rel: &str, body: &str| {
+            let at = root.join(rel);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, body).unwrap();
+        };
+        mkfile("tool/Cargo.toml", "[package]\n");
+        mkfile("tool/target/custom/out.bin", "x");
+        mkfile("crates/a/b/Cargo.toml", "[package]\n");
+        mkfile("crates/a/b/target/debug/liba.rlib", "x");
+        // CARGO_TARGET_DIR=out/cargo: Cargo tags it.
+        mkfile(
+            "out/cargo/CACHEDIR.TAG",
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
         );
+        mkfile("out/cargo/release/app", "x");
+        mkfile("py/env/pyvenv.cfg", "home = /usr/bin\n");
+        mkfile("py/env/bin/python", "x");
+        mkfile("venv/pyvenv.cfg", "home = /usr/bin\n");
+        for (path, under) in [
+            ("tool/target/custom/out.bin", "tool/target/"),
+            ("crates/a/b/target/debug/liba.rlib", "crates/a/b/target/"),
+            ("out/cargo/release/app", "out/cargo/"),
+            ("py/env/bin/python", "py/env/"),
+            ("venv/bin/python", "venv/"),
+        ] {
+            assert_eq!(
+                generated(root, path),
+                Some((under.to_owned(), true)),
+                "{path}"
+            );
+        }
         // No manifest, no Cargo output inside: a directory like any other.
-        assert_eq!(generated_dir(dir.path(), "web/target/custom/out.bin"), None);
+        assert_eq!(generated(root, "web/target/custom/out.bin"), None);
+    }
+
+    #[test]
+    fn only_unambiguous_build_output_is_left_out_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for rel in [
+            "dist/app.js",
+            "dist/app.css",
+            "dist/.env",
+            "node_modules/x/i.js",
+            "calc.egg-info/PKG-INFO",
+        ] {
+            let at = root.join(rel);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, "x").unwrap();
+        }
+        let paths = [
+            "calc.egg-info/PKG-INFO",
+            "dist/.env",
+            "dist/app.css",
+            "dist/app.js",
+            "node_modules/x/i.js",
+        ];
+        let found = suspects(root, &paths, None);
+        let got: Vec<(&str, &str, bool, usize)> = found
+            .iter()
+            .map(|s| (s.path.as_str(), s.kind, s.excluded, s.files))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("calc.egg-info/", "generated", true, 1),
+                ("dist/.env", "secret", true, 1),
+                ("dist/", "build", false, 2),
+                ("node_modules/", "generated", true, 1),
+            ]
+        );
     }
 
     #[test]

@@ -147,6 +147,89 @@ pub struct MessageMeta {
     /// results come back in any order).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_index: Option<u64>,
+    /// A tool result: its call, short (`Bash: cargo test -p x`; see
+    /// [`call_label`]), so parallel calls' results tell apart even when
+    /// the call itself is not loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
+}
+
+/// Longest [`call_label`] input part, in characters.
+const CALL_LABEL_CHARS: usize = 80;
+
+/// A tool call, short: its tool and the one input value that says what it
+/// does (a command, a file, a pattern, ...; else the first value), cut to
+/// [`CALL_LABEL_CHARS`]. `text` is the call's message text: the tool's
+/// name, then its input as `key: value` lines (see
+/// [`agentlog::tool_text`]) or as written (Codex's patch, a bare command).
+pub fn call_label(text: &str) -> String {
+    const KEYS: &[&str] = &[
+        "command",
+        "cmd",
+        "file_path",
+        "notebook_path",
+        "pattern",
+        "url",
+        "query",
+        "path",
+        "question",
+        "description",
+        "prompt",
+    ];
+    let mut lines = text.lines();
+    let name = lines.next().unwrap_or_default().trim();
+    let input: Vec<&str> = lines.filter(|l| !l.trim().is_empty()).collect();
+    let field = |line: &str| -> Option<(String, String)> {
+        let (key, value) = line.split_once(": ")?;
+        let key = key.trim_start_matches([' ', '-']);
+        (!key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '-'))
+        .then(|| (key.to_owned(), value.trim().to_owned()))
+    };
+    let fields: Vec<(String, String)> = input.iter().filter_map(|l| field(l)).collect();
+    let value = KEYS
+        .iter()
+        .find_map(|k| fields.iter().find(|(key, v)| key == k && !v.is_empty()))
+        .or_else(|| fields.iter().find(|(_, v)| !v.is_empty()))
+        .map(|(_, v)| argv_text(v))
+        .or_else(|| {
+            // Not key-value: a patch names its file; else the first line.
+            let file = input
+                .iter()
+                .find_map(|l| l.strip_prefix("*** ").and_then(|l| l.split_once("File: ")))
+                .map(|(_, f)| f.trim().to_owned());
+            file.or_else(|| input.first().map(|l| l.trim().to_owned()))
+        })
+        .unwrap_or_default();
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let value = match value.char_indices().nth(CALL_LABEL_CHARS) {
+        Some((at, _)) => format!("{}\u{2026}", &value[..at]),
+        None => value,
+    };
+    match (name.is_empty(), value.is_empty()) {
+        (_, true) => name.to_owned(),
+        (true, false) => value,
+        (false, false) => format!("{name}: {value}"),
+    }
+}
+
+/// A command written as a JSON argv (`["bash","-lc","cargo test"]`, as
+/// Codex's shell takes it) as the line it runs; anything else as is.
+fn argv_text(value: &str) -> String {
+    let Ok(argv) = serde_json::from_str::<Vec<String>>(value) else {
+        return value.to_owned();
+    };
+    match argv.as_slice() {
+        [shell, flag, script]
+            if matches!(shell.rsplit('/').next(), Some("bash" | "sh" | "zsh"))
+                && matches!(flag.as_str(), "-c" | "-lc") =>
+        {
+            script.clone()
+        }
+        _ => argv.join(" "),
+    }
 }
 
 /// Cut `text` to at most `max` bytes, on a character boundary.
@@ -176,9 +259,9 @@ pub(crate) struct TranscriptIndex {
     pub(crate) meta_bytes: usize,
     /// Most bytes it holds ([`MAX_TRANSCRIPT_BYTES`]).
     pub(crate) cap: usize,
-    /// The newest tool calls' ids, tool names and indexes, to name their
-    /// results.
-    calls: VecDeque<(String, String, u64)>,
+    /// The newest tool calls (id, tool name, index, [`call_label`]), to
+    /// name their results.
+    calls: VecDeque<(String, String, u64, String)>,
 }
 
 /// Tool calls remembered to name their results (results follow their
@@ -192,6 +275,7 @@ pub(crate) fn meta_cost(meta: &MessageMeta) -> usize {
         + meta.message_id.len()
         + meta.tool.as_ref().map_or(0, String::len)
         + meta.timestamp.as_ref().map_or(0, String::len)
+        + meta.call.as_ref().map_or(0, String::len)
 }
 
 impl TranscriptIndex {
@@ -246,19 +330,22 @@ impl TranscriptIndex {
         };
         let messages = messages_of(self.format, agentlog::parse(self.format, &value, offset));
         for mut message in messages {
-            let mut call_index = None;
+            let (mut call_index, mut call_text) = (None, None);
             match (message.kind, &message.call) {
                 (MessageKind::Tool, Some(call)) => {
                     if self.calls.len() == CALLS_KEPT {
                         self.calls.pop_front();
                     }
                     let name = message.tool.clone().unwrap_or_default();
-                    self.calls.push_back((call.clone(), name, self.next_index));
+                    let label = call_label(&message.text);
+                    self.calls
+                        .push_back((call.clone(), name, self.next_index, label));
                 }
                 (MessageKind::Result, Some(call)) => {
-                    let found = self.calls.iter().rev().find(|(id, _, _)| id == call);
-                    message.tool = found.map(|(_, name, _)| name.clone());
-                    call_index = found.map(|(_, _, index)| *index);
+                    let found = self.calls.iter().rev().find(|(id, ..)| id == call);
+                    message.tool = found.map(|(_, name, ..)| name.clone());
+                    call_index = found.map(|(_, _, index, _)| *index);
+                    call_text = found.map(|(.., label)| label.clone());
                 }
                 _ => {}
             }
@@ -274,6 +361,7 @@ impl TranscriptIndex {
                 truncated,
                 error: message.error,
                 call_index,
+                call: call_text,
             };
             self.meta_bytes += meta_cost(&meta);
             self.messages.push_back(meta);

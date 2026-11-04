@@ -175,6 +175,30 @@ pub struct Subscription {
     pub command: Vec<String>,
 }
 
+impl Subscription {
+    /// Whether an event with `payload` is one this subscription takes:
+    /// its `statuses` (when set) name the payload's `status`, its `kinds`
+    /// the session's kind. Deprecated alias, kept until 0.8: `"done"`
+    /// also takes a payload marked `turn_finished` (every finished turn
+    /// is a `done` now, so it matches nothing more; plugins written
+    /// against it keep working).
+    pub fn takes(&self, payload: &Value) -> bool {
+        let status = payload.get("status").and_then(Value::as_str);
+        let kind = payload.pointer("/session/kind").and_then(Value::as_str);
+        let turn_finished = payload
+            .get("turn_finished")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let wanted = |s: &str| self.statuses.iter().any(|w| w == s);
+        let status_ok = self.statuses.is_empty()
+            || status.is_some_and(wanted)
+            || (turn_finished && wanted("done"));
+        let kind_ok =
+            self.kinds.is_empty() || kind.is_some_and(|k| self.kinds.iter().any(|w| w == k));
+        status_ok && kind_ok
+    }
+}
+
 /// What a plugin action needs to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1005,26 +1029,13 @@ impl PluginHost {
         if !self.master() {
             return 0;
         }
-        let kind = payload
-            .pointer("/session/kind")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let status = payload
-            .get("status")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         let mut started = 0;
         for plugin in self.plugins().iter().filter(|p| p.enabled) {
             let Ok(manifest) = &plugin.manifest else {
                 continue;
             };
             for sub in manifest.events.iter().filter(|s| s.on == event) {
-                if !sub.statuses.is_empty()
-                    && !status.as_ref().is_some_and(|s| sub.statuses.contains(s))
-                {
-                    continue;
-                }
-                if !sub.kinds.is_empty() && !kind.as_ref().is_some_and(|k| sub.kinds.contains(k)) {
+                if !sub.takes(&payload) {
                     continue;
                 }
                 if self.queued.fetch_add(1, Ordering::SeqCst) >= MAX_QUEUED {
@@ -1396,6 +1407,25 @@ pub fn plugin_view(state_dir: &Path, plugin: &Plugin) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscriptions_filter_by_status_and_kind_and_keep_the_turn_finished_alias() {
+        let sub = |statuses: &[&str], kinds: &[&str]| super::Subscription {
+            on: "status.changed".into(),
+            statuses: statuses.iter().map(|s| (*s).to_owned()).collect(),
+            kinds: kinds.iter().map(|s| (*s).to_owned()).collect(),
+            command: Vec::new(),
+        };
+        let event = |status: &str, kind: &str, turn_finished: bool| serde_json::json!({"status": status, "session": {"kind": kind}, "turn_finished": turn_finished});
+        assert!(sub(&[], &[]).takes(&event("idle", "shell", false)));
+        assert!(sub(&["blocked"], &[]).takes(&event("blocked", "claude", false)));
+        assert!(!sub(&["blocked"], &[]).takes(&event("working", "claude", false)));
+        assert!(!sub(&[], &["codex"]).takes(&event("done", "claude", true)));
+        assert!(sub(&["done"], &["claude"]).takes(&event("done", "claude", true)));
+        // Deprecated: a payload marked turn_finished is a `done`.
+        assert!(sub(&["done"], &[]).takes(&event("idle", "claude", true)));
+        assert!(!sub(&["done"], &[]).takes(&event("idle", "claude", false)));
+    }
+
     use super::*;
 
     #[test]

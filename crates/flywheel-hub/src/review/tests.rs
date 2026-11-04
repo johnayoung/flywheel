@@ -1305,6 +1305,12 @@ fn commit_all_classifies_every_change_past_the_review_cut() {
     }
     write(wt, "zz/.env", "TOKEN=1\n");
     write(wt, "zz/target/x86_64-unknown-linux-musl/release/app", "elf");
+    // Cargo tags every target directory it makes.
+    write(
+        wt,
+        "zz/target/CACHEDIR.TAG",
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    );
     let plan = plan_commit(&tools(), &t, "feat: app", None).unwrap();
     assert_eq!(plan.refusal, None, "{plan:?}");
     let kinds: Vec<(&str, &str, bool, usize)> = plan
@@ -1317,14 +1323,14 @@ fn commit_all_classifies_every_change_past_the_review_cut() {
         [
             ("node_modules/", "generated", true, MAX_FILES + 200),
             ("zz/.env", "secret", true, 1),
-            ("zz/target/", "generated", true, 1),
+            ("zz/target/", "generated", true, 2),
         ]
     );
     assert_eq!(
         plan.summary,
         format!(
             "Stage 1 file (leaving {} out) and commit it on feat",
-            MAX_FILES + 202
+            MAX_FILES + 203
         )
     );
     let done = commit(&tools(), &t, "feat: app", None, &plan.fingerprint).unwrap();
@@ -1357,5 +1363,53 @@ fn commit_all_unstages_a_staged_generated_directory() {
     assert!(
         run_git(wt, &["status", "--porcelain", "--untracked-files=all"])
             .contains("?? pkg/__pycache__/lib.cpython-313.pyc")
+    );
+}
+
+#[test]
+fn commit_all_past_the_review_cut_says_what_it_lists_and_leaves_a_late_secret_out() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    // 1500 plain source files (none generated): the review lists cut at
+    // MAX_FILES, and a .env sorted after every one of them.
+    for i in 0..1500 {
+        write(wt, &format!("src/m{i:04}.rs"), "pub fn f() {}\n");
+    }
+    write(wt, "zz/.env", "TOKEN=hunter2\n");
+    let plan = plan_commit(&tools(), &t, "feat: many", None).unwrap();
+    assert_eq!(plan.refusal, None, "{:?}", plan.refusal);
+    let kinds: Vec<(&str, &str, bool)> = plan
+        .suspects
+        .iter()
+        .map(|s| (s.path.as_str(), s.kind, s.excluded))
+        .collect();
+    assert_eq!(kinds, [("zz/.env", "secret", true)]);
+    assert_eq!(
+        plan.files,
+        Some(FileCount {
+            total: 1500,
+            listed: MAX_FILES
+        })
+    );
+    assert_eq!(plan.details.len(), MAX_FILES);
+    assert!(
+        plan.warnings
+            .iter()
+            .any(|w| w.starts_with(&format!("1500 files committed; the list names {MAX_FILES}"))),
+        "{:?}",
+        plan.warnings
+    );
+    assert_eq!(
+        plan.summary,
+        "Stage 1500 files (leaving 1 out) and commit them on feat"
+    );
+    let done = commit(&tools(), &t, "feat: many", None, &plan.fingerprint).unwrap();
+    assert!(done.ok, "{done:?}");
+    let committed = run_git(wt, &["show", "--name-only", "--format=", "HEAD"]);
+    assert_eq!(committed.lines().count(), 1500);
+    assert!(!committed.contains(".env"), "the secret was committed");
+    assert!(
+        run_git(wt, &["status", "--porcelain", "--untracked-files=all"]).contains("?? zz/.env")
     );
 }

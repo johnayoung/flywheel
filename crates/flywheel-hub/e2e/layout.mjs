@@ -813,7 +813,7 @@ try {
   // A whole label the screen cannot tell from a wrapped one (its
   // description's first word would not have fit after it): the agent's
   // own options (its status's questions) keep them apart.
-  const ambiguous = ["Which config?", "", "❯ 1. Use the existing configuration file in the repository root",
+  const ambiguous = ["Which config should the setup use?", "", "❯ 1. Use the existing configuration file in the repository root",
     "     Supercalifragilistic defaults stay as they are", "  2. Start fresh", "     Writes a new file", "  3. Type something.",
     "──────────────────────────────────────────────────────────────────────", "  4. Chat about this", "", "Enter to select · ↑/↓ to navigate · Esc to cancel"];
   const questions = [{ question: "Which config should the setup use?", options: [
@@ -834,6 +834,18 @@ try {
   const onSecond = await mp.evaluate(([l, q]) => window.FwHubPrompt.parse(l, q), [secondTab, twoAsked]);
   check(onSecond && onSecond.question === "Enable TLS?" && onSecond.options[1].detail === "Plain http behind a proxy",
     `phone: of two questions with the same options, the one on screen is answered (${JSON.stringify(onSecond)})`);
+  // Options alike, question not on the screen (another prompt, or the
+  // agent moved on): the agent's question is not taken for it.
+  const otherPrompt = ["Do you want to make this edit to notes.txt?", "", "❯ 1. Yes", "  2. No", "", "Esc to cancel"];
+  const notAsked = await mp.evaluate(([l, q]) => window.FwHubPrompt.parse(l, q), [otherPrompt, [twoAsked[0]]]);
+  check(notAsked && notAsked.question === "Do you want to make this edit to notes.txt?" && notAsked.options[0].label === "1  Yes" && !notAsked.options[0].detail,
+    `phone: a question whose text is not on screen does not answer a prompt with the same options (${JSON.stringify(notAsked)})`);
+  // Its text wrapped by the screen still counts.
+  const wrappedQ = [{ question: "Should the migration also rewrite the old rows in place?", options: [{ label: "Yes", description: "One pass" }, { label: "No", description: "New rows only" }] }];
+  const wrapScreen = ["Should the migration also rewrite the old", "rows in place?", "", "❯ 1. Yes", "     One pass", "  2. No", "     New rows only", "  3. Type something.", "", "Enter to select · ↑/↓ to navigate · Esc to cancel"];
+  const wrappedTold = await mp.evaluate(([l, q]) => window.FwHubPrompt.parse(l, q), [wrapScreen, wrappedQ]);
+  check(wrappedTold && wrappedTold.question === wrappedQ[0].question && wrappedTold.options[1].detail === "New rows only",
+    `phone: a question wrapped on screen is still matched by its text (${JSON.stringify(wrappedTold)})`);
   const wrappedLines = ["Would you like to run the following command?", "", "  $ cargo test -p parser", "",
     "› 1. Yes, proceed (y)", "  2. Yes, and don't ask again for commands that start with", "     `cargo test -p parser` (p)",
     "  3. No, and tell Codex what to do differently (esc)", "", "  Press enter to confirm or esc to cancel"];
@@ -1272,14 +1284,17 @@ try {
   await seenPage.waitForSelector("#tx-body .tx-msg.kind-result", { timeout: 10000 });
   const results = () => seenPage.evaluate(() => [...document.querySelectorAll("#tx-body .tx-msg.kind-result")].map((a) => ({
     who: a.querySelector(".tx-who").textContent,
+    // The call it answers, as written (a command keeps its case).
+    call: (a.querySelector(".tx-call") || {}).textContent || "",
+    callCase: a.querySelector(".tx-call") ? getComputedStyle(a.querySelector(".tx-call")).textTransform : "",
     open: a.querySelector("details.tx-result").open,
     lines: a.querySelector(".tx-result pre").textContent.split("\n").length,
     more: (a.querySelector(".tx-expand") || {}).textContent || "",
   })));
   let shownResults = await results();
-  check(shownResults.length === 2 && shownResults[0].who === "Bash result · for #1 seq 20" && shownResults[0].open && shownResults[0].lines === 8 && shownResults[0].more === "Show all 20 lines",
+  check(shownResults.length === 2 && shownResults[0].who === "result · for #1" && shownResults[0].call === "Bash: seq 20" && shownResults[0].callCase === "none" && shownResults[0].open && shownResults[0].lines === 8 && shownResults[0].more === "Show all 20 lines",
     `transcript: a long Bash output is a block cut to 8 lines with an expand (${JSON.stringify(shownResults)})`);
-  check(shownResults[1] && shownResults[1].who === "AskUserQuestion result · for #3 Which color?" && shownResults[1].lines === 1 && !shownResults[1].more,
+  check(shownResults[1] && shownResults[1].who === "result · for #3" && shownResults[1].call === "AskUserQuestion: Which color?" && shownResults[1].lines === 1 && !shownResults[1].more,
     `transcript: a question's answers show whole (${JSON.stringify(shownResults[1])})`);
   const askCall = await seenPage.evaluate(() => [...document.querySelectorAll("#tx-body .tx-msg.kind-tool")].map((a) => a.querySelector("pre").textContent).find((t) => t.startsWith("AskUserQuestion")));
   check(askCall && askCall.includes("  - question: Which color?") && askCall.includes("      - label: Red") && !askCall.includes("[{"),

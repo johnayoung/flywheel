@@ -396,3 +396,40 @@ fn transcript_reading_stops_at_the_deadline_and_resumes() {
     assert_eq!(index.messages.len(), 20_000);
     assert_eq!(index.messages[19_999].index, 19_999);
 }
+
+#[test]
+fn a_tool_call_is_labelled_by_what_it_does() {
+    use super::transcripts::call_label;
+    for (text, want) in [
+        (
+            "Bash\ncommand: cargo test -p x\ndescription: Run the tests",
+            "Bash: cargo test -p x",
+        ),
+        (
+            "Edit\nreplace_all: false\nfile_path: /src/lib.rs\nold_string: a",
+            "Edit: /src/lib.rs",
+        ),
+        ("Grep\npattern: fn main\npath: src", "Grep: fn main"),
+        (
+            "shell\ncommand: [\"bash\",\"-lc\",\"cargo test\"]\nworkdir: /w",
+            "shell: cargo test",
+        ),
+        ("shell\ncommand: [\"git\",\"status\"]", "shell: git status"),
+        (
+            "apply_patch\n*** Begin Patch\n*** Update File: src/lib.rs\n@@",
+            "apply_patch: src/lib.rs",
+        ),
+        ("shell\nls -la", "shell: ls -la"),
+        (
+            "AskUserQuestion\nquestions:\n  - question: Which color?\n    options:\n      - label: Red\n        description: Warm",
+            "AskUserQuestion: Which color?",
+        ),
+        ("TodoRead", "TodoRead"),
+    ] {
+        assert_eq!(call_label(text), want, "{text}");
+    }
+    let long = format!("Bash\ncommand: {}", "x".repeat(200));
+    let label = call_label(&long);
+    assert!(label.ends_with('\u{2026}'), "{label}");
+    assert_eq!(label.chars().count(), "Bash: ".len() + 81);
+}

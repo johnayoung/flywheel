@@ -220,6 +220,8 @@ fn reference_documents_every_verb_and_flag() {
     let mut by_path: BTreeMap<String, String> = BTreeMap::new();
     let mut errors = Vec::new();
     for (path, syntax) in entries(verbs, &tree) {
+        // `{where}` is shorthand for both.
+        let syntax = syntax.replace("{where}", "{remote} {machine}");
         if path.is_empty() {
             errors.push(format!("`{syntax}`: no such verb"));
             continue;
@@ -372,9 +374,10 @@ fn reference_documents_every_hub_toml_key() {
     );
 }
 
-/// The key table, generated from the keymap catalog.
+/// The key table, generated from the keymap catalog (ids and defaults;
+/// Settings > Keyboard shows each action's label).
 fn key_table() -> String {
-    let mut table = String::from("| Action | Default | |\n|---|---|---|\n");
+    let mut table = String::from("| Action | Default |\n|---|---|\n");
     for action in ACTIONS {
         let defaults = if action.defaults.is_empty() {
             "-".to_owned()
@@ -386,10 +389,7 @@ fn key_table() -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        table.push_str(&format!(
-            "| `{}` | {defaults} | {} |\n",
-            action.id, action.label
-        ));
+        table.push_str(&format!("| `{}` | {defaults} |\n", action.id));
     }
     table
 }
@@ -635,8 +635,8 @@ const PAGES: [(&str, &str); 6] = [
 ];
 
 /// The hub docs' size budget, all pages together: condensed, not moved.
-/// Condensed again to about 82,000 bytes (80 KiB), leaving about 4 KiB
-/// before the next pass.
+/// Condensed again to under 78,000 bytes (iteration 49), leaving about
+/// 8 KiB for new features before the next pass.
 const HUB_DOCS_MAX_BYTES: usize = 84 * 1024;
 /// One reference page's budget.
 const PAGE_MAX_BYTES: usize = 24 * 1024;

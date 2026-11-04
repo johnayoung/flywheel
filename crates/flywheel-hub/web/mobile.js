@@ -156,21 +156,23 @@ window.FwHubPrompt = (function () {
   const norm = (text) => text.replace(/\s+/g, " ").trim();
   // A multi-select option's box ("[ ] ", "[✔] ", "☐ ").
   const BOX = /^(?:\[[ x✓✔]?\]|[☐☒✓✔])\s*/i;
-  // Several questions with the same options (Yes / No each): the one
-  // whose text is on the screen above the run, none when it is not shown.
+  // Only a question whose own text is on the screen above the run (any
+  // wrapping): options alone ("Yes" / "No") are shared by several
+  // questions, and by prompts that are no question of the agent's at all.
+  const squash = (text) => text.replace(/\s+/g, "");
   function written(run, questions, lines) {
-    const fits = (questions || []).filter((q) => {
+    const above = squash(lines.slice(0, run[0].index).map(bare).join(""));
+    return (questions || []).find((q) => {
       const options = q.options || [];
+      const asked = squash(bare(q.question || ""));
+      if (!asked || !above.includes(asked)) return false;
       if (!options.length || options.length > run.length) return false;
       return options.every((choice, i) => {
         const shown = norm(run[i].first.replace(BOX, "").replace(HOTKEY, ""));
         const label = norm(choice.label || "");
         return !!shown && !!label && (label.startsWith(shown) || shown.startsWith(label));
       });
-    });
-    if (fits.length < 2) return fits[0] || null;
-    const above = norm(lines.slice(0, run[0].index).map(bare).join(" "));
-    return fits.find((q) => q.question && above.includes(norm(q.question))) || null;
+    }) || null;
   }
 
   // `questions` (optional): the blocked agent's question tool input, as

@@ -219,12 +219,17 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
     let there = pushed.as_ref().map(|p| p.0.clone()).unwrap_or_default();
     Ok(Plan {
         action: "pr",
-        summary: format!(
-            "Open a pull request of {} into {}{}",
-            branch.clone().unwrap_or_default(),
-            base.clone().unwrap_or_else(|| "?".into()),
-            host.map(|h| format!(" on {h}")).unwrap_or_default()
-        ),
+        summary: match &base {
+            Some(base) => format!(
+                "Open a pull request of {} into {base}{}",
+                branch.clone().unwrap_or_default(),
+                host.map(|h| format!(" on {h}")).unwrap_or_default()
+            ),
+            None => format!(
+                "Open a pull request of {} (no base branch to merge into yet)",
+                branch.clone().unwrap_or_default()
+            ),
+        },
         details: review
             .commits
             .iter()
@@ -235,7 +240,12 @@ pub fn plan_pr(tools: &Tools, target: &Target, request: &PrRequest) -> Result<Pl
         } else {
             vec!["uncommitted changes are not in the pull request".into()]
         },
-        commands: vec![command],
+        // No base: no command to show (never `--base ''`).
+        commands: if base.is_some() {
+            vec![command]
+        } else {
+            Vec::new()
+        },
         // Everything that shapes the command: what runs is what was
         // confirmed.
         fingerprint: fingerprint(&[

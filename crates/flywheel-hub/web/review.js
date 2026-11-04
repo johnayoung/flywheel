@@ -755,7 +755,7 @@ window.FwHubReview = function (ctx) {
         disabled: !data.branch || pushed || noRemote,
         title: noRemote ? "No remote to push to: add one (git remote add)" : pushed ? `In sync with ${data.upstream.name}` : "Push the branch (never forced)",
       }),
-      button("Open PR…", "pr", { ghost: true, disabled: !data.branch, title: "gh pr create from the pushed branch" }),
+      button("Open PR…", "pr", { ghost: true, disabled: !data.branch || noRemote, title: noRemote ? "No remote to open a pull request on: add one (git remote add)" : "gh pr create from the pushed branch" }),
     ];
     if (worktree) {
       list.push(button("Rebase onto base…", "rebase", { ghost: true, disabled: !data.behind || !!data.operation, title: data.behind ? `Replay onto ${data.base && data.base.name}` : "Already on top of the base" }));
@@ -1161,7 +1161,10 @@ window.FwHubReview = function (ctx) {
         replan(0);
       } else {
         const box = $("#rva-plan");
-        box.append(el("p", { className: "rva-refusal", textContent: error.message }));
+        const shown = el("p", { className: "rva-refusal", textContent: error.message });
+        box.append(shown);
+        // Below the plan: brought into view, not left under the fold.
+        shown.scrollIntoView({ block: "nearest" });
         syncOk();
       }
       return;

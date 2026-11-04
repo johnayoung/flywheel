@@ -75,3 +75,6 @@ tempfile.workspace = true
 rqrr = "0.10"
 tokio-tungstenite = "0.29"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "query"] }
+# Read the vendored woff2 fonts' character maps (tests/glyphs.rs).
+brotli-decompressor = "5.0"
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }

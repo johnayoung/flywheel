@@ -53,6 +53,9 @@ async function boot() {
     ? Promise.all([
       document.fonts.load('13px "FW Term"'),
       document.fonts.load('600 13px "FW Term"'),
+      // The symbols face an agent's first screen draws (its unicode-range
+      // holds U+23BF), so its glyphs are measured with it too.
+      document.fonts.load('13px "FW Symbols"', "\u23bf"),
     ])
     : Promise.resolve();
   // The hub's settings (theme, keys, terminal) before the first paint.

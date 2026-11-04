@@ -184,6 +184,9 @@ window.FwHubPrompt = (function () {
       const next = run[i + 1];
       if (!next) return;
       for (let j = option.index + 1; j < next.index; j++) {
+        // A rule between options (Claude's question puts one above "Chat
+        // about this") is not more of the option.
+        if (!bare(lines[j])) continue;
         const more = lines[j].replace(/[│┃|]/g, "").trim();
         if (more) option.text += ` ${more}`;
       }

@@ -54,6 +54,53 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // full-screen sheet no terminal shows around; and a toast never covers a
 // drawer's controls (the drawer lifts them above the stack, its frame
 // stays put, and drops the room once the toasts go).
+// Every character real Claude Code sessions print (tests/fixtures/
+// claude-glyphs.txt) is drawn by the vendored terminal fonts (JetBrains
+// Mono, then the JuliaMono "FW Symbols"), never a device font or a tofu
+// box: each in a span in the terminal's own font stack, asked which
+// platform font Chromium drew it with (and the same for the live rows).
+const GLYPHS = fs.readFileSync(path.join(root, "crates/flywheel-hub/tests/fixtures/claude-glyphs.txt"), "utf8")
+  .split("\n").filter((l) => l.startsWith("U+")).map((l) => parseInt(l.slice(2).split(" ")[0], 16))
+  .filter((cp) => cp !== 0xa0);
+async function glyphChecks(page, label) {
+  const stack = await page.evaluate(async (cps) => {
+    const rows = document.querySelector(".xterm-rows");
+    const stack = getComputedStyle(rows).fontFamily;
+    const box = document.createElement("div");
+    box.id = "e2e-glyphs";
+    box.style.cssText = `position:fixed;left:0;top:0;opacity:0;pointer-events:none;font-family:${stack};font-size:14px`;
+    for (const cp of cps) {
+      const span = document.createElement("span");
+      span.dataset.cp = cp.toString(16);
+      span.textContent = String.fromCodePoint(cp);
+      box.append(span);
+    }
+    document.body.append(box);
+    await document.fonts.load(`14px ${stack}`, box.textContent);
+    await document.fonts.ready;
+    return stack;
+  }, GLYPHS);
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("DOM.enable");
+  await cdp.send("CSS.enable");
+  const { root: doc } = await cdp.send("DOM.getDocument", { depth: -1 });
+  const vendored = (f) => /^(JetBrains Mono|JuliaMono)$/.test(f.familyName);
+  const fallback = [];
+  for (const selector of ["#e2e-glyphs span", ".xterm-rows > div"]) {
+    const { nodeIds } = await cdp.send("DOM.querySelectorAll", { nodeId: doc.nodeId, selector });
+    for (const nodeId of nodeIds) {
+      const { fonts } = await cdp.send("CSS.getPlatformFontsForNode", { nodeId });
+      const { attributes } = await cdp.send("DOM.getAttributes", { nodeId });
+      const cp = attributes.includes("data-cp") ? attributes[attributes.indexOf("data-cp") + 1] : "row";
+      for (const f of fonts.filter((f) => !vendored(f))) fallback.push(`${cp}:${f.familyName}`);
+    }
+  }
+  await page.evaluate(() => document.getElementById("e2e-glyphs").remove());
+  await cdp.detach();
+  check(stack.includes('"FW Symbols"'), `${label}: the terminal falls back to the vendored symbols (${stack})`);
+  check(!fallback.length, `${label}: ${GLYPHS.length} Claude Code characters drawn by vendored fonts (${JSON.stringify(fallback)})`);
+}
+
 async function drawerChecks(page, label, phone) {
   const boxes = {};
   for (const which of ["commands", "review", "queue", "flywheel"]) {
@@ -233,6 +280,7 @@ try {
   check(s.tabs === 2, `desktop: 2 tabs (${s.tabs})`);
   check(!s.empty, "desktop: no empty hero with a saved layout");
   check(s.floored === 0, "desktop: no pane held at the phone row floor");
+  await glyphChecks(page, "desktop");
   // The shells' prompts (top rows) are on screen, not clipped under the title.
   await page.waitForTimeout(800);
   const prompts = await page.evaluate(() => [...document.querySelectorAll("#terminal .pane-term")].map((host) => {
@@ -636,6 +684,15 @@ try {
     trust && trust.question === "Quick safety check: Is this a project you created or one you trust?",
     `phone: the trust dialog's question is its question, not the link below it (${JSON.stringify(trust && trust.question)})`,
   );
+  // AskUserQuestion's rule above "Chat about this" is not part of the
+  // option before it (captured at a desktop's width and a phone's).
+  for (const name of ["claude-ask-question", "claude-ask-question-narrow"]) {
+    const lines = fs.readFileSync(path.join(root, `crates/flywheel-hub/detect/fixtures/${name}.txt`), "utf8").split("\n");
+    const asked = await mp.evaluate((l) => window.FwHubPrompt.parse(l), lines);
+    const typed = asked && asked.options.find((o) => /Type something/.test(o.label));
+    check(typed && /^\d+ {2}Type something\.$/.test(typed.label) && asked.options.every((o) => !/[─━]/.test(o.label)),
+      `phone: ${name}: no rule in the quick answers (${JSON.stringify(asked && asked.options.map((o) => o.label))})`);
+  }
   // "Always allow" is offered for every tool permission or approval, as
   // its status detail reads it (screen-read details do not say
   // "permission"), and for no trust dialog, question, or MCP form.
@@ -899,6 +956,7 @@ try {
   await mp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
   await mp.waitForTimeout(800);
   await drawerChecks(mp, "phone", true);
+  await glyphChecks(mp, "phone");
   // The replay player and a share link's view: every control at least
   // 44x44 (a checkbox counts by its label).
   await api("POST", `/api/sessions/${sids[1]}/record/start`);
@@ -918,6 +976,7 @@ try {
   await mp.goto(`${base}/replay#${encodeURIComponent(recording.name)}`);
   await mp.waitForSelector(".xterm", { timeout: 15000 });
   await mp.waitForTimeout(800);
+  await glyphChecks(mp, "phone /replay");
   const replaySmall = await tapTargets(mp);
   check(replaySmall.length === 0, `phone: /replay tap targets at least 44x44 (${JSON.stringify(replaySmall)})`);
   await mp.screenshot({ path: path.join(out, "phone-replay.png") });
@@ -925,6 +984,7 @@ try {
   await viewer.goto(`${base}/share/${share.credential}`);
   await viewer.waitForSelector(".xterm", { timeout: 15000 });
   await viewer.waitForTimeout(800);
+  await glyphChecks(viewer, "phone /share");
   const shareSmall = await tapTargets(viewer);
   check(shareSmall.length === 0, `phone: /share tap targets at least 44x44 (${JSON.stringify(shareSmall)})`);
   await viewer.screenshot({ path: path.join(out, "phone-share.png") });

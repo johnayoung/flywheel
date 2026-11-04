@@ -52,7 +52,9 @@ lines = 14
 line = ['(?i)^\s*do you want to .+\?\s*$', '(?i)^\s*(?:❯\s*)?1\.\s+yes\b']
 
 # AskUserQuestion: a "☐ <header>" tab, numbered options, and
-# "Enter to select · ↑/↓ to navigate · Esc to cancel".
+# "Enter to select · ↑/↓ to navigate · Esc to cancel". On a short screen
+# (a phone) wrapped option descriptions push the tab off the top: its
+# "Type something." option stands in for it.
 [[rule]]
 id = "question"
 state = "blocked"
@@ -62,7 +64,7 @@ lines = 1
 line = ['(?i)^\s*enter to select\b.*\besc to cancel\s*$']
 [[rule.when]]
 lines = 24
-line = ['^\s*[☐☒✔✓]\s+\S', '^\s*(?:❯\s*)?1\.\s+\S']
+line = ['^\s*(?:[☐☒✔✓]\s+\S|(?:❯\s*)?\d{1,2}\.\s+Type something\.?\s*$)', '^\s*(?:❯\s*)?1\.\s+\S']
 
 # A running turn: the footer's "esc to interrupt".
 [[rule]]

@@ -26,11 +26,52 @@
   font-weight: 100 800;
   font-display: swap;
 }
+/* Symbols JetBrains Mono lacks (Claude Code's U+23BF tool-result corner,
+ * U+23F5/U+23F8 mode marks, dingbat spinners, braille, ballot boxes,
+ * arrows, geometric shapes, ...): JuliaMono, the same 0.6 em advance, so
+ * they keep the cell grid. Each face's unicode-range is its subset's
+ * cmap, so the browser fetches a face only for text it draws. */
+@font-face {
+  font-family: "FW Symbols";
+  src: url(/assets/vendor/fonts/juliamono-symbols.woff2) format("woff2");
+  font-display: swap;
+  unicode-range:
+    U+2011-2012, U+2015, U+2017, U+2023, U+2025, U+2027-202F, U+2031,
+    U+2035-2038, U+203B, U+2040-2043, U+2047-205E, U+219A-219C, U+219F,
+    U+21A1, U+21A4, U+21A8, U+21AB-21AC, U+21AE-21BD, U+21BF-21C8,
+    U+21CA-21CF, U+21D5-21DA, U+21DC-21DD, U+21E0-21E4, U+21E6, U+21E9,
+    U+21EB-21FF, U+2300-2301, U+2306-2307, U+230C-2317, U+2319-231B,
+    U+2320-2323, U+2327, U+2329-232A, U+232C-2335, U+237B-2388,
+    U+238C-2394, U+2396-239A, U+23AE-23CD, U+23CF-23FA, U+23FF, U+2422,
+    U+2425-2429, U+2460-24FF, U+25A2-25A9, U+25AC-25B1, U+25CD,
+    U+25D0-25D3, U+25D6-25E5, U+25EC-25EE, U+25F0-25F5, U+25F7-266C,
+    U+266E, U+2670-2686, U+2688-269F, U+26A2-2712, U+2714, U+2716,
+    U+2718-2735, U+2737-276D, U+2772-2793, U+2795-279B, U+279F-27BF,
+    U+27F0-27F4, U+27F8-28FF;
+}
+@font-face {
+  font-family: "FW Symbols";
+  src: url(/assets/vendor/fonts/juliamono-symbols-ext.woff2) format("woff2");
+  font-display: swap;
+  unicode-range:
+    U+2071, U+207B, U+207D-207F, U+208A-20AA, U+20AD, U+20AF-20B3,
+    U+20B5-20BC, U+20BE, U+2100-2101, U+2103-210C, U+210E-2112, U+2114,
+    U+2117-2118, U+211B-211C, U+211E-2121, U+2123, U+2125-212D,
+    U+212F-213F, U+2141-2189, U+220D, U+2214, U+2216-2217, U+221B-221D,
+    U+221F-2222, U+2226, U+222C-2233, U+223A-223B, U+223D, U+223F-2242,
+    U+2244, U+2246, U+224A, U+224C, U+224E-2253, U+2255-2256, U+2258-225E,
+    U+2266-2269, U+2274-2279, U+227D-2281, U+228A-228D, U+229A,
+    U+22A6-22B3, U+22B5-22B7, U+22B9-22BA, U+22BE-22C1, U+22C5, U+22C7,
+    U+22CB-22CD, U+22CF, U+22D1-22E1, U+22E3-22ED, U+22F2-22FF,
+    U+27C0-27C4, U+27C7-27DB, U+27DD-27E5, U+27EC-27EF, U+2900-2915,
+    U+2917-2949, U+294B-297F, U+2B00-2B57, U+2B59-2B73, U+2B76-2BFF,
+    U+1FB00-1FB92, U+1FB94-1FBFA;
+}
 
 :root {
   --display: "FW Display", "Oswald", "Arial Narrow", sans-serif;
   --mono: "FW Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --term: "FW Term", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --term: "FW Term", "FW Symbols", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --side: 18.5rem;
   /* Every drawer over the terminal (Commands, Flywheel, Review, Queue):
      one width, one edge (the stage's right). Narrow enough to leave the

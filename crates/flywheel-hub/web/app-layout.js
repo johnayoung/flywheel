@@ -11,12 +11,14 @@
 // focus, and zoom are this browser's. A phone shows one pane at a time
 // (the "solo" pane) and never edits layouts.
 
-const TERM_FONT = '"FW Term", ui-monospace, "SF Mono", Menlo, Consolas, monospace';
-// Settings' appearance.term_font -> the CSS stack ("FW Term" is JetBrains Mono).
+const TERM_FONT = '"FW Term", "FW Symbols", ui-monospace, "SF Mono", Menlo, Consolas, monospace';
+// Settings' appearance.term_font -> the CSS stack ("FW Term" is JetBrains
+// Mono). Every stack ends in the built-in box drawing and symbols (an
+// agent's TUI draws them), so no glyph falls to whatever the device has.
 const TERM_FONTS = {
   jetbrains: TERM_FONT,
-  martian: '"FW Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace',
-  system: 'ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace',
+  martian: '"FW Mono", "FW Term", "FW Symbols", ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+  system: 'ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "FW Term", "FW Symbols", monospace',
 };
 
 // The xterm options Settings decides.

@@ -5,9 +5,18 @@
 //! license file (xterm.js 6.0.0, @xterm/addon-fit 0.11.0,
 //! @xterm/addon-web-links 0.12.0, @xterm/addon-search 0.16.0; sourcemap
 //! comments stripped) and the
-//! UI fonts under `web/vendor/fonts/` (Big Shoulders Display, Martian Mono,
-//! JetBrains Mono: latin variable subsets from @fontsource-variable 5.3.0,
-//! SIL OFL 1.1).
+//! UI fonts under `web/vendor/fonts/`, all SIL OFL 1.1: Big Shoulders
+//! Display and Martian Mono (latin variable subsets from
+//! @fontsource-variable 5.3.0); JetBrains Mono 2.304 (the release's
+//! variable font, `pyftsubset --no-hinting --layout-features='*'` to
+//! U+0000-024F, U+02B0-036F, U+2000-2BFF, U+E0A0-E0D4 (powerline),
+//! U+FEFF, U+FFFD: 82 KiB) and JuliaMono 0.063 Regular for the symbols it
+//! lacks (same 0.6 em advance; subset to exactly the ranges in the
+//! stylesheets' "FW Symbols" unicode-range, `--no-hinting
+//! --layout-features=''`: 71 KiB for arrows, technical, box/blocks,
+//! geometric, misc symbols, dingbats, braille; 50 KiB, fetched only when
+//! drawn, for letterlike, math, supplemental arrows, U+2B00-2BFF and
+//! legacy computing). woff2 is brotli already: served as is.
 //!
 //! The PWA icons (`icon-192.png`, `icon-512.png`, `icon-maskable-512.png`,
 //! `apple-touch-icon.png`) are `icon.svg`'s wheel rasterized by headless
@@ -251,6 +260,16 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "vendor/fonts/jetbrains-mono.woff2",
         include_bytes!("../web/vendor/fonts/jetbrains-mono.woff2"),
+        "font/woff2",
+    ),
+    (
+        "vendor/fonts/juliamono-symbols.woff2",
+        include_bytes!("../web/vendor/fonts/juliamono-symbols.woff2"),
+        "font/woff2",
+    ),
+    (
+        "vendor/fonts/juliamono-symbols-ext.woff2",
+        include_bytes!("../web/vendor/fonts/juliamono-symbols-ext.woff2"),
         "font/woff2",
     ),
     (
@@ -911,7 +930,7 @@ mod tests {
             assert!(asset(path).is_some(), "app.css references missing {path}");
             fonts += 1;
         }
-        assert_eq!(fonts, 3, "one @font-face per vendored font");
+        assert_eq!(fonts, 5, "one @font-face per vendored font");
     }
 
     #[test]

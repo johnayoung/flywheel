@@ -114,15 +114,15 @@ Keys: [hub-reference](reference.md#keyboard-shortcuts).
 - Sidebar: machines > workspaces (rollup chip) > sessions (status dot, `↑ahead ↓behind ~changed ?untracked`); companions under their agent; blocked rows show the question. Folder chips: filled = git, hollow = plain, struck = missing.
 - Title and favicon count blocked and done. `#session=<id>` survives reloads; a dropped or silent (no pong 6 s after a ping) socket keeps the screen and reconnects (2 s for 30 s, then up to 10 s) with what it missed.
 - Keys typed while down wait (`N queued`), sent in order once back; dropped, and said, if the session changed (epoch). No local echo; unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
-- Drawers (Commands, Flywheel, Review, Queue): one width at the stage's right edge; phone: full-screen sheets (Flywheel closes on a switch to another folder's session).
-- Ended sessions offer Relaunch and Close; relaunched elsewhere: reattaches; removed elsewhere: its pane goes, with a toast.
-- New workspace: folder paths or **Import VS Code workspace**. New session: kind, folder, optional worktree. First run: import offers and a 30-second tour.
-- Themes: auto, dark, light (lifts low-contrast TUI colours to 4.5:1).
-- Embedded: xterm.js 6.0.0 (+ fit, web-links, search), UI fonts (SIL OFL); licenses in `web/vendor/`.
+- Drawers (Commands, Flywheel, Review, Queue): one width at the stage's right edge; phone: full-screen sheets (Flywheel closes on switching folders).
+- Ended sessions: Relaunch, Close; relaunched elsewhere: reattaches; removed elsewhere: pane goes (toast).
+- New workspace: paths or **Import VS Code workspace**. New session: kind, folder, worktree. First run: import offers, a 30-second tour.
+- Themes: auto, dark, light (low-contrast TUI colours lifted to 4.5:1).
+- Embedded (licenses in `web/vendor/`): xterm.js 6.0.0 (+ fit, web-links, search); OFL fonts. Terminal: JetBrains Mono 2.304, then JuliaMono for its gaps (`tests/glyphs.rs`).
 
 ## Phone
 
-Tested at 390x844 and 430x932.
+Tested: 390x844, 430x932.
 
 - Pinned to the visual viewport (the keyboard shrinks the terminal); the PTY keeps 16+ rows (shorter boxes clip around the cursor).
 - **Needs you**: blocked and done agents of every workspace (blocked, longest waiting, first) head the sidebar (one scroll) and the start screen; a workspace lists them as one `N in Needs you` row (tap: scrolls to them). The footer's utilities are one **More** row.

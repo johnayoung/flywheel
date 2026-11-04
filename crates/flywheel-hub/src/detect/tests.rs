@@ -70,6 +70,14 @@ fn claude_rules_read_real_claude_code_screens() {
         Some(Blocked),
         Some("question"),
     );
+    // The same tool at a phone's 55 columns (2.1.306 on haiku): option
+    // descriptions wrap, a rule sits between the last two options.
+    assert_reads(
+        claude,
+        "claude-ask-question-narrow",
+        Some(Blocked),
+        Some("question"),
+    );
     assert_reads(claude, "claude-working", Some(Working), Some("turn_footer"));
     assert_reads(
         claude,

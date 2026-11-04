@@ -48,7 +48,7 @@ window.FwHubTermView = function (host, stage) {
     disableStdin: true,
     cursorBlink: false,
     scrollback: 10000,
-    fontFamily: '"FW Term", ui-monospace, "SF Mono", Menlo, Consolas, monospace',
+    fontFamily: '"FW Term", "FW Symbols", ui-monospace, "SF Mono", Menlo, Consolas, monospace',
     fontSize: 13,
     theme: palette(),
     minimumContrastRatio: light.matches ? 4.5 : 1,

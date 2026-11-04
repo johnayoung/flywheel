@@ -1,0 +1,17 @@
+
+Which color do you prefer?
+
+❯ 1. Blue (Recommended)
+     Neutral and widely readable, a common safe default
+     for UI accents.
+  2. Red
+     Strong and attention-grabbing, best for warnings
+     or highlights.
+  3. Green
+     Calm and associated with success or confirmation
+     states.
+  4. Type something.
+───────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

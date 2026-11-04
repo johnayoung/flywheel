@@ -2884,9 +2884,11 @@ fn reconcile_live_runs_interrupts_vanished_runs_once_and_leaves_parked_gates() {
     f.seed("parked", "run-parked", Status::AwaitingApproval, "");
     let wanted = BTreeSet::from(["listed".to_owned()]);
     let mut signaled = HashSet::new();
-    let newly = reconcile_live_runs(f.control.as_ref(), &wanted, &mut signaled, t0()).unwrap();
+    let newly =
+        reconcile_live_runs(f.control.as_ref(), &wanted, &mut signaled, t0(), None).unwrap();
     assert_eq!(newly, ["run-gone"]);
-    let again = reconcile_live_runs(f.control.as_ref(), &wanted, &mut signaled, t0()).unwrap();
+    let again =
+        reconcile_live_runs(f.control.as_ref(), &wanted, &mut signaled, t0(), None).unwrap();
     assert!(again.is_empty(), "signaled at most once per session");
     let cmds = f.control.claim_commands("run-gone", t0()).unwrap();
     assert_eq!(cmds.len(), 1);
@@ -2989,6 +2991,7 @@ async fn review_listing_whose_every_thread_fails_to_parse_never_interrupts_a_liv
         0.01,
         fixed(t0()),
         Some(f.log.sink()),
+        None,
     ));
     // Wait until the reconciler has observed the broken listing a few times.
     while gh.calls.lock().unwrap().len() < 3 {
@@ -3036,6 +3039,7 @@ fn sweep_finalizes_claimable_strands_and_reaps_orphans_but_never_a_live_claim() 
         60.0,
         0.0,
         &clock,
+        None,
         None,
     )
     .unwrap();
@@ -3601,4 +3605,353 @@ async fn lease_past_the_timestamp_range_is_a_config_error_not_a_panic() {
         "{err}"
     );
     assert!(f.claims.load_claim("solo").unwrap().is_none());
+}
+
+// --- scoped sessions (`fw worker --task`) ------------------------------------------
+
+fn scope_request(tasks: &[&str], with_prerequisites: bool) -> ScopeRequest {
+    ScopeRequest {
+        tasks: tasks.iter().map(|t| (*t).to_owned()).collect(),
+        with_prerequisites,
+        worker_capabilities: BTreeSet::new(),
+    }
+}
+
+fn lifecycles_of(f: &Fixture, task_id: &str) -> Vec<Lifecycle> {
+    f.control
+        .list_lifecycles(&LifecycleFilter::default().with_task_id(task_id))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_scoped_session_runs_only_its_members_and_touches_nothing_else() {
+    let f = Fixture::new();
+    let source = MemorySource::new(vec![item("first"), item("second"), item("third")]);
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["second"], false),
+        None,
+    )
+    .unwrap();
+    assert_eq!(plan.named, ["second"]);
+    assert!(plan.added.is_empty());
+    let mut req = f.request(source.clone());
+    req.scope = Some(plan.scope(t0()));
+    let report = run(req).await;
+    assert_eq!(ids(&report), ["second"]);
+    assert!(lifecycles_of(&f, "first").is_empty());
+    assert!(lifecycles_of(&f, "third").is_empty());
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &plan.scope(t0()),
+    )
+    .unwrap();
+    assert!(verdict.settled() && verdict.all_verified());
+    assert_eq!(verdict.summary(), "scope: 1/1 verified -- second verified");
+}
+
+#[tokio::test]
+async fn unmet_prerequisites_refuse_unless_pulled_in_and_then_run_first() {
+    let f = Fixture::new();
+    let source = MemorySource::new(vec![
+        item("grand"),
+        item("parent").with_prerequisites(["grand"]),
+        item("child").with_prerequisites(["parent"]),
+        item("bystander"),
+    ]);
+    let err = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["child"], false),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(&err, ScopeError::UnmetPrerequisites(u) if u.len() == 1));
+    assert_eq!(
+        err.to_string(),
+        "task child waits on unmet prerequisite parent (fresh)"
+    );
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["child"], true),
+        None,
+    )
+    .unwrap();
+    assert_eq!(plan.named, ["child"]);
+    assert_eq!(plan.added, ["grand", "parent"]);
+    let mut req = f.request(source.clone());
+    req.scope = Some(plan.scope(t0()));
+    assert_eq!(ids(&run(req).await), ["grand", "parent", "child"]);
+    assert!(lifecycles_of(&f, "bystander").is_empty());
+    // Once the prerequisites are done, the plain form is accepted.
+    let plain = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["child"], false),
+        None,
+    );
+    assert!(plain.is_ok());
+}
+
+#[tokio::test]
+async fn unknown_and_unrunnable_tasks_are_refused_by_name() {
+    let f = Fixture::new();
+    let mut gpu = item("gpu");
+    gpu.required_capabilities = BTreeSet::from(["gpu".to_owned()]);
+    let source = MemorySource::new(vec![
+        item("known"),
+        gpu,
+        item("orphan").with_prerequisites(["ghost"]),
+    ]);
+    let err = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["known", "nope"], false),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unknown task nope: the work source does not list it and the store never finished it"
+    );
+    let err = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["gpu"], false),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("task gpu cannot run here: it requires capabilities this worker lacks (gpu"),
+        "{err}"
+    );
+    // A prerequisite no source lists cannot be pulled in either.
+    let err = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["orphan"], true),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "task orphan waits on unmet prerequisite ghost (unlisted)"
+    );
+    assert!(matches!(
+        plan_scope(
+            source.as_ref(),
+            f.control.as_ref(),
+            &scope_request(&[], false),
+            None
+        ),
+        Err(ScopeError::Empty)
+    ));
+    // An archived (store-done, unlisted) task is a valid, already-verified member.
+    f.seed("archived", "run-archived", Status::Done, "");
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["archived"], false),
+        None,
+    )
+    .unwrap();
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &plan.scope(t0()),
+    )
+    .unwrap();
+    assert!(verdict.all_verified());
+}
+
+#[tokio::test]
+async fn a_scoped_session_never_steals_a_peer_claim() {
+    let f = Fixture::new();
+    f.claims
+        .acquire_claim("held", "other-worker", t0(), 3600.0, &BTreeSet::new())
+        .unwrap()
+        .unwrap();
+    let source = MemorySource::new(vec![item("held"), item("free")]);
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["held"], false),
+        None,
+    )
+    .unwrap();
+    let mut req = f.request(source.clone());
+    req.scope = Some(plan.scope(t0()));
+    let report = run(req).await;
+    assert!(report.runs.is_empty(), "{:?}", ids(&report));
+    assert_eq!(
+        f.claims.load_claim("held").unwrap().unwrap().worker_id,
+        "other-worker"
+    );
+    assert!(lifecycles_of(&f, "free").is_empty());
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &plan.scope(t0()),
+    )
+    .unwrap();
+    assert!(!verdict.settled());
+    assert_eq!(verdict.summary(), "scope: 0/1 verified -- held pending");
+}
+
+#[tokio::test]
+async fn a_member_failed_before_the_scope_reruns_and_one_failed_under_it_does_not() {
+    let f = Fixture::new();
+    // Failed an hour before the scope began: the scope re-runs it.
+    let mut old = Lifecycle::new("flaky").with_run_id("run-old");
+    let path = path_to(Status::Failed, "earlier failure");
+    let owned: Vec<(Status, &str)> = path.iter().map(|(s, e)| (*s, e.as_str())).collect();
+    walk(&mut old, &owned, t0() - ChronoDuration::hours(1));
+    f.control.create_lifecycle(&old).unwrap();
+    f.runner.script("flaky", vec![failed("still broken")]);
+    let source = MemorySource::new(vec![
+        item("flaky"),
+        item("child").with_prerequisites(["flaky"]),
+    ]);
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["flaky", "child"], false),
+        None,
+    );
+    // child waits on flaky (retryable): refused without pulling it in.
+    assert!(plan.is_err());
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["child"], true),
+        None,
+    )
+    .unwrap();
+    let scope = plan.scope(t0());
+    let mut req = f.request(source.clone());
+    req.scope = Some(scope.clone());
+    assert_eq!(ids(&run(req.clone()).await), ["flaky"]);
+    // A second session under the same scope does not run it again.
+    assert!(run(req).await.runs.is_empty());
+    assert_eq!(lifecycles_of(&f, "flaky").len(), 2);
+    let verdict = evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &scope).unwrap();
+    assert!(verdict.settled() && !verdict.all_verified());
+    assert_eq!(
+        verdict.outcomes,
+        [(
+            "child".to_owned(),
+            ScopeOutcome::Blocked {
+                prerequisite: "flaky".into()
+            }
+        )]
+    );
+    assert_eq!(
+        verdict.summary(),
+        "scope: 0/1 verified -- child blocked (prerequisite flaky did not verify)"
+    );
+}
+
+#[tokio::test]
+async fn parked_landings_and_approval_gates_settle_as_parked() {
+    let f = Fixture::new();
+    let landed = f.seed("landed", "run-landed", Status::Done, "");
+    let parked = f.seed("parked", "run-parked", Status::Done, "");
+    f.seed("gated", "run-gated", Status::AwaitingApproval, "");
+    f.seed(
+        "failing",
+        "run-failing",
+        Status::Failed,
+        "grader unit failed",
+    );
+    f.control
+        .append_domain_event(
+            &DomainEvent::new(
+                "run-parked",
+                t0(),
+                DomainEventPayload::LandingParked(LandingParked {
+                    park_kind: PARK_KIND_HELD_OUT_GATE.into(),
+                    detail: "held-out oracle failed".into(),
+                    ..LandingParked::default()
+                }),
+            ),
+            parked.version,
+        )
+        .unwrap();
+    f.control
+        .append_domain_event(
+            &DomainEvent::new(
+                "run-landed",
+                t0(),
+                DomainEventPayload::Landed(Landed {
+                    strategy: "merge".into(),
+                    landed_ref: "abc".into(),
+                    rung: String::new(),
+                    agent_turns: None,
+                    agent_wall_seconds: None,
+                }),
+            ),
+            landed.version,
+        )
+        .unwrap();
+    let source = MemorySource::new(vec![
+        item("landed"),
+        item("parked"),
+        WorkItem::new(gated_task("gated"), "ref:gated"),
+        item("failing"),
+    ]);
+    let plan = ScopePlan {
+        named: ["landed", "parked", "gated", "failing"]
+            .map(str::to_owned)
+            .to_vec(),
+        added: Vec::new(),
+    };
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &plan.scope(t0()),
+    )
+    .unwrap();
+    let labels: Vec<&str> = verdict.outcomes.iter().map(|(_, o)| o.label()).collect();
+    assert_eq!(labels, ["verified", "parked", "parked", "failed"]);
+    assert!(verdict.settled());
+    assert!(
+        verdict
+            .summary()
+            .contains("parked (landing parked: held-out-gate -- held-out oracle failed)"),
+        "{}",
+        verdict.summary()
+    );
+    // The same failure seen by a scope that began after it is not settled:
+    // the scoped worker will run it.
+    let later = plan.scope(t0() + ChronoDuration::seconds(1));
+    let verdict = evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &later).unwrap();
+    assert_eq!(verdict.outcomes[3].1, ScopeOutcome::Pending);
+}
+
+#[tokio::test]
+async fn a_scoped_session_leaves_an_out_of_scope_strand_alone() {
+    let f = Fixture::new();
+    f.seed("stranded", "run-stranded", Status::Running, "");
+    let source = MemorySource::new(vec![item("stranded"), item("mine")]);
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["mine"], false),
+        None,
+    )
+    .unwrap();
+    let mut req = f.request(source);
+    req.scope = Some(plan.scope(t0()));
+    let report = run(req).await;
+    assert_eq!(ids(&report), ["mine"]);
+    assert!(report.recovered.is_empty());
+    assert_eq!(f.lifecycle("run-stranded").status, Status::Running);
 }

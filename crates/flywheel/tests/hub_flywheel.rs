@@ -960,3 +960,155 @@ fn no_flywheel_turns_the_panel_off() {
     );
     assert_eq!(code, 404);
 }
+
+/// A `claude` stand-in a real `fw worker` drives to DONE: it records the
+/// task it ran (its worktree's name) in `ran`, commits a change there,
+/// and ends the iteration with `verify`.
+fn verifying_claude(path: &Path, ran: &Path) {
+    write_script(
+        path,
+        &format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo '2.1.0 (Claude Code)'; exit 0; fi
+id=$(basename "$PWD")
+echo "$id" >> '{ran}'
+date +%s%N > "work-$id.txt"
+git add -A >/dev/null 2>&1 && git commit -qm "work $id" >/dev/null 2>&1
+E='<!-- LOOP_STATUS -->\n{{\"intent\":\"verify\",\"reason\":\"done\"}}\n<!-- /LOOP_STATUS -->'
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"sess-fake","model":"claude-fake-1"}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"'"$E"'","num_turns":1,"total_cost_usd":0.01,"usage":{{"input_tokens":7,"output_tokens":2}}}}'
+"#,
+            ran = ran.display()
+        ),
+    );
+}
+
+fn screen_text(server: &Server, sid: &str) -> String {
+    let (_, screen) = http(server, "GET", &format!("/api/sessions/{sid}/screen"), None);
+    screen["lines"]
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let ran = dir.join("ran.log");
+    verifying_claude(&dir.join("bin/claude"), &ran);
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
+    std::fs::write(root.join(".gitignore"), ".flywheel/\n").unwrap();
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(
+        &root,
+        &["config", "user.email", "hub-scope@example.invalid"],
+    );
+    git(&root, &["config", "user.name", "hub scope"]);
+    git(&root, &["config", "commit.gpgsign", "false"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "adopt"]);
+    write_task(&root, "01-core", "alpha", &[]);
+    write_task(&root, "01-core", "beta", &[]);
+    write_task(&root, "01-core", "gamma", &["alpha"]);
+    let server = start(&dir);
+    let (code, workspace) = http(
+        &server,
+        "POST",
+        "/api/workspaces",
+        Some(json!({ "name": "scoped", "folders": [{"path": root}] })),
+    );
+    assert_eq!(code, 201, "{workspace}");
+    let workspace_id = workspace["id"].as_str().unwrap().to_owned();
+    let start_worker = |body: Value| http(&server, "POST", "/api/flywheel/worker", Some(body));
+    let argv_of = |session: &Value| -> Vec<String> {
+        session["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Ids that are not task ids, and a prerequisite switch with no task.
+    for bad in [
+        json!({ "folder": root, "tasks": ["a b"] }),
+        json!({ "folder": root, "tasks": [""] }),
+        json!({ "folder": root, "with_prereqs": true }),
+    ] {
+        let (code, refused) = start_worker(bad);
+        assert_eq!(code, 400, "{refused}");
+    }
+
+    // Run beta with worker here: `fw worker --task=beta`, which runs beta
+    // alone, says so, and exits 0.
+    let (code, session) = start_worker(json!({
+        "folder": root, "workspace_id": workspace_id, "tasks": ["beta"], "cols": 120, "rows": 30,
+    }));
+    assert_eq!(code, 201, "{session}");
+    assert_eq!(session["name"], "fw worker beta");
+    let argv = argv_of(&session);
+    assert_eq!(argv[3], "fw-worker");
+    assert_eq!(&argv[5..], ["worker", "--task=beta"]);
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let screen = wait_for("the scoped worker to finish", || {
+        let text = screen_text(&server, &sid);
+        text.contains("fw worker exited with status")
+            .then_some(text)
+    });
+    assert!(
+        screen.contains("scope: 1/1 verified -- beta verified"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("fw worker exited with status 0"),
+        "{screen}"
+    );
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "beta\n");
+    let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{sid}"), None);
+    assert_eq!(code, 204);
+
+    // A task with an unmet prerequisite, asked to bring it along.
+    let (code, session) = start_worker(json!({
+        "folder": root, "workspace_id": workspace_id, "tasks": ["gamma"], "with_prereqs": true,
+    }));
+    assert_eq!(code, 201, "{session}");
+    assert_eq!(
+        &argv_of(&session)[5..],
+        ["worker", "--task=gamma", "--with-prereqs"]
+    );
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let screen = wait_for("the prerequisite run to finish", || {
+        let text = screen_text(&server, &sid);
+        text.contains("fw worker exited with status")
+            .then_some(text)
+    });
+    assert!(
+        screen.contains("scope: 1/1 verified -- gamma verified"),
+        "{screen}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ran).unwrap(),
+        "beta\nalpha\ngamma\n"
+    );
+    let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{sid}"), None);
+    assert_eq!(code, 204);
+
+    // The generic Start worker here stays unscoped.
+    let (code, session) = start_worker(json!({ "folder": root, "workspace_id": workspace_id }));
+    assert_eq!(code, 201, "{session}");
+    assert_eq!(session["name"], "fw worker");
+    assert_eq!(&argv_of(&session)[5..], ["worker"]);
+    let sid = session["id"].as_str().unwrap();
+    let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{sid}"), None);
+    assert_eq!(code, 204);
+}

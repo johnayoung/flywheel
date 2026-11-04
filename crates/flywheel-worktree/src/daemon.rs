@@ -30,6 +30,7 @@ use crate::retention::{
     DEFAULT_RETENTION_DAYS, DEFAULT_RUN_LOG_RETENTION, retention_cadence_tick, retention_targets,
     sweep_run_logs, wall_clock_seconds,
 };
+use crate::scoped::WorkerScope;
 use crate::submit_registry::{
     MERGE_STRATEGY, SubmitBuildRequest, SubmitStrategyRegistry, builtin_registry,
 };
@@ -67,7 +68,8 @@ use flywheel_orchestrator::orchestrate::{
     DEFAULT_LANDING_REDRIVE_BOUND, DEFAULT_PREREQ_REDRIVE_BOUND,
     DEFAULT_SESSION_PAUSE_CEILING_SECONDS, DEFAULT_SWEEP_SECONDS, DEFAULT_WORKER_CONCURRENCY,
     GraphSnapshotPolicy, OrchestrateError, OrchestrateRequest, OrchestratorReport,
-    ProgressProbeFactory, RunTask, RunTaskError, RunTaskFuture, RunTaskRequest, orchestrate,
+    ProgressProbeFactory, RunTask, RunTaskError, RunTaskFuture, RunTaskRequest, TaskScope,
+    orchestrate,
 };
 use flywheel_orchestrator::policy::{
     PolicyError, Skills as PolicySkills, WorkPolicy, resolve_grader_env, resolve_sandbox_root,
@@ -876,6 +878,8 @@ pub struct RunOnceRequest {
     pub environ: Option<BTreeMap<String, String>>,
     pub gh: Option<Arc<dyn GhRunner>>,
     pub runtime: Option<Arc<Runtime>>,
+    /// Restrict the cycle to these tasks (`--task`); `None` drains the queue.
+    pub scope: Option<TaskScope>,
 }
 
 impl fmt::Debug for RunOnceRequest {
@@ -894,6 +898,7 @@ impl fmt::Debug for RunOnceRequest {
             .field("sweep_seconds", &self.sweep_seconds)
             .field("landing_redrive_bound", &self.landing_redrive_bound)
             .field("policy", &self.policy.is_some())
+            .field("scope", &self.scope)
             .finish_non_exhaustive()
     }
 }
@@ -930,6 +935,7 @@ impl RunOnceRequest {
             environ: None,
             gh: None,
             runtime: None,
+            scope: None,
         }
     }
 
@@ -1126,6 +1132,7 @@ pub fn run_once(request: RunOnceRequest) -> Result<OrchestratorReport, RunOnceEr
         // accumulate duplicate graph snapshots.
         snapshot_policy: GraphSnapshotPolicy::SkipUnchanged,
         environ: Some(environ),
+        scope: request.scope.clone(),
     };
     let (report, interrupted) = match runtime.block_on(orchestrate(orchestrate_request)) {
         Ok(report) => (report, false),
@@ -1193,6 +1200,9 @@ pub enum CycleOutcome {
     Completed,
     /// The operator interrupted the cycle; the loop stops cleanly.
     Interrupted,
+    /// A scoped worker's tasks all settled: the loop stops cleanly
+    /// instead of idling.
+    Settled,
 }
 
 /// A cycle failure the breaker classifies.
@@ -1287,6 +1297,7 @@ pub fn run_daemon_loop(
                 sleep(CYCLE_FAILURE_BACKOFF_SECONDS, should_stop);
                 continue;
             }
+            Ok(CycleOutcome::Settled) => break,
             Ok(CycleOutcome::Completed) => {}
         }
         consecutive_failures = 0;
@@ -1499,6 +1510,16 @@ pub struct WorkerArgs {
     /// supervisor's lifeline pipe, passed only by [`crate::pool`] to the
     /// members it spawns. See [`arm_supervisor_lifeline`].
     pub supervisor_fd: Option<i32>,
+    /// `--task ID` (repeatable): run only these tasks, then exit once every
+    /// one is settled (see [`crate::scoped`]).
+    pub tasks: Vec<String>,
+    /// `--with-prereqs`: pull the named tasks' not-done prerequisites into
+    /// the scope instead of refusing.
+    pub with_prereqs: bool,
+    /// Internal (hidden): the instant the pool supervisor's scope began,
+    /// passed to its members so they share one "attempted under this
+    /// scope" bar. See [`crate::scoped::SCOPE_SINCE_FLAG`].
+    pub scope_since: Option<String>,
 }
 
 impl Default for WorkerArgs {
@@ -1520,11 +1541,16 @@ impl Default for WorkerArgs {
             reconcile_seconds: DEFAULT_RECONCILE_SECONDS,
             once: false,
             supervisor_fd: None,
+            tasks: Vec::new(),
+            with_prereqs: false,
+            scope_since: None,
         }
     }
 }
 
 /// The outcome of parsing: the flags, or the help text to print.
+// Built once per process and matched at once: boxing buys nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Parsed {
     Args(WorkerArgs),
@@ -1569,6 +1595,7 @@ pub const USAGE: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--
                        [--worker-id WORKER_ID] [--concurrency CONCURRENCY]
                        [--lease-seconds LEASE_SECONDS]
                        [--reconcile-seconds RECONCILE_SECONDS] [--once]
+                       [--task TASK] [--with-prereqs]
 ";
 
 /// The argparse `-h` text (`COLUMNS=80`).
@@ -1581,6 +1608,7 @@ pub const HELP: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--d
                        [--worker-id WORKER_ID] [--concurrency CONCURRENCY]
                        [--lease-seconds LEASE_SECONDS]
                        [--reconcile-seconds RECONCILE_SECONDS] [--once]
+                       [--task TASK] [--with-prereqs]
 
 Git-worktree worker: drive flywheel tasks under .flywheel/tasks/active/, each
 in its own worktree, FF-merging on done and parking on failure.
@@ -1622,6 +1650,13 @@ options:
                         vanished (e.g. its task file was deleted). 0 disables
                         (default: 15).
   --once                Run a single drain cycle and exit (no daemon loop).
+  --task TASK           Run only this task (repeatable): nothing else is
+                        selected, and the worker exits once every named task
+                        is verified, failed, or parked (exit 0 only when all
+                        verified). A task whose prerequisites are not done is
+                        refused.
+  --with-prereqs        With --task: also run the named tasks' not-done
+                        prerequisites (transitively), before them.
 ";
 
 /// The internal flag a pool member receives its supervisor lifeline on
@@ -1636,7 +1671,7 @@ enum Arity {
 }
 
 /// The option table in declaration order (argparse's prefix-match order).
-const OPTIONS: [(&str, Arity); 18] = [
+const OPTIONS: [(&str, Arity); 21] = [
     ("-h", Arity::Flag),
     ("--help", Arity::Flag),
     ("--tasks-dir", Arity::One),
@@ -1654,7 +1689,10 @@ const OPTIONS: [(&str, Arity); 18] = [
     ("--lease-seconds", Arity::One),
     ("--reconcile-seconds", Arity::One),
     ("--once", Arity::Flag),
+    ("--task", Arity::One),
+    ("--with-prereqs", Arity::Flag),
     (SUPERVISOR_FD_FLAG, Arity::One),
+    (crate::scoped::SCOPE_SINCE_FLAG, Arity::One),
 ];
 
 fn is_negative_number(token: &str) -> bool {
@@ -1695,10 +1733,13 @@ fn resolve_option(token: &str) -> Result<Option<(&'static str, Arity)>, ArgError
     }
     let matches: Vec<(&'static str, Arity)> = OPTIONS
         .iter()
-        // The internal flag matches only exactly, so it never makes an
+        // The internal flags match only exactly, so they never make an
         // operator abbreviation (`--s` for --sandbox-root) ambiguous.
         .filter(|(name, _)| {
-            name.starts_with("--") && name.starts_with(token) && *name != SUPERVISOR_FD_FLAG
+            name.starts_with("--")
+                && name.starts_with(token)
+                && *name != SUPERVISOR_FD_FLAG
+                && *name != crate::scoped::SCOPE_SINCE_FLAG
         })
         .copied()
         .collect();
@@ -1805,6 +1846,17 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
             "--lease-seconds" => args.lease_seconds = parse_float_flag(name, &v)?,
             "--reconcile-seconds" => args.reconcile_seconds = parse_float_flag(name, &v)?,
             "--once" => args.once = true,
+            "--task" => {
+                let id = v.trim();
+                if id.is_empty() {
+                    return Err(ArgError::new("argument --task: expected a task id"));
+                }
+                if !args.tasks.iter().any(|t| t == id) {
+                    args.tasks.push(id.to_owned());
+                }
+            }
+            "--with-prereqs" => args.with_prereqs = true,
+            crate::scoped::SCOPE_SINCE_FLAG => args.scope_since = Some(v),
             SUPERVISOR_FD_FLAG => {
                 let fd = i32::try_from(parse_int_flag(name, &v)?).map_err(|_| {
                     ArgError::new(format!("argument {name}: invalid int value: '{v}'"))
@@ -1819,6 +1871,9 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
             "unrecognized arguments: {}",
             extras.join(" ")
         )));
+    }
+    if args.with_prereqs && args.tasks.is_empty() {
+        return Err(ArgError::new("argument --with-prereqs: requires --task"));
     }
     Ok(Parsed::Args(args))
 }
@@ -1957,6 +2012,34 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         return 1;
     }
 
+    // `--task`: validated before anything is claimed (a refusal exits 2).
+    // A pool never outnumbers its scope: members past the scope's size
+    // would only idle.
+    let scope = match WorkerScope::open(&args, policy.as_deref(), &tasks_dir, &db_path, &repo_root)
+    {
+        Ok(scope) => scope,
+        Err(failure) => {
+            let _ = writeln!(err, "flywheel worker: {failure}");
+            return 2;
+        }
+    };
+    let concurrency = match &scope {
+        Some(scope) => {
+            log(&scope.describe());
+            let cap = u32::try_from(scope.len()).unwrap_or(u32::MAX).max(1);
+            if concurrency > cap {
+                log(&format!(
+                    "concurrency {concurrency} capped to {cap}: the scope has {cap} task(s)"
+                ));
+            }
+            concurrency.min(cap)
+        }
+        None => concurrency,
+    };
+    // A pool member reports its scope's outcome through the supervisor:
+    // it exits 0 once the scope settles, whatever the outcome.
+    let scoped_member = scope.is_some() && args.supervisor_fd.is_some();
+
     // A resolved concurrency > 1 makes this invocation the pool supervisor,
     // not a worker: it spawns N single-task members (each re-invoking this
     // verb at --concurrency 1) against the one shared store.
@@ -1968,15 +2051,24 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
                 return 1;
             }
         };
-        return crate::pool::run_pool(
+        let member_flags = scope
+            .as_ref()
+            .map(|scope| scope.member_flags(&args))
+            .unwrap_or_default();
+        let code = crate::pool::run_pool(
             program,
             &args,
+            &member_flags,
             concurrency,
             model.as_deref(),
             &db_path,
             args.worker_id.as_deref(),
-            log,
+            Arc::clone(&log),
         );
+        return match &scope {
+            Some(scope) => report_scope(scope, code, out, &log),
+            None => code,
+        };
     }
 
     let environ = environ_from_process();
@@ -2195,8 +2287,16 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         request.held_out_source = held_out.clone();
         request.shutdown = Some(shutdown.clone());
         request.runtime = Some(Arc::clone(&runtime));
+        request.scope = scope.as_ref().map(|scope| scope.scope.clone());
         match run_once(request) {
-            Ok(_) => Ok(CycleOutcome::Completed),
+            Ok(_) => match &scope {
+                Some(scope) => match scope.verdict() {
+                    Ok(verdict) if verdict.settled() => Ok(CycleOutcome::Settled),
+                    Ok(_) => Ok(CycleOutcome::Completed),
+                    Err(failure) => Err(Box::new(failure) as CycleError),
+                },
+                None => Ok(CycleOutcome::Completed),
+            },
             Err(RunOnceError::Interrupted(_)) => Ok(CycleOutcome::Interrupted),
             Err(failure) => Err(Box::new(failure) as CycleError),
         }
@@ -2239,8 +2339,34 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         &hooks,
     );
     heartbeat.stop();
+    let code = match &scope {
+        Some(scope) if scoped_member => {
+            if let Ok(verdict) = scope.verdict() {
+                log(&verdict.summary());
+            }
+            code
+        }
+        Some(scope) => report_scope(scope, code, out, &log),
+        None => code,
+    };
     log("Shutting down.");
     code
+}
+
+/// Print a scoped run's one-line summary to stdout and return its exit
+/// code (see [`crate::scoped::exit_code`]); a store that cannot be read
+/// at the end is reported and exits 1.
+fn report_scope(scope: &WorkerScope, loop_code: i32, out: &mut dyn Write, log: &Logger) -> i32 {
+    match scope.verdict() {
+        Ok(verdict) => {
+            let _ = writeln!(out, "{}", verdict.summary());
+            crate::scoped::exit_code(loop_code, &verdict)
+        }
+        Err(failure) => {
+            log(&format!("reading the scope's outcome failed: {failure}"));
+            if loop_code != 0 { loop_code } else { 1 }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3513,6 +3639,42 @@ esac
         assert_eq!(main_with(&argv, &mut out, &mut err), 2);
         let err = String::from_utf8(err).unwrap();
         assert!(err.contains("--supervisor-fd 1"), "{err}");
+    }
+
+    #[test]
+    fn task_flags_repeat_dedupe_and_the_scope_start_stays_internal() {
+        let parsed = args(&["--task", "a", "--task=b", "--task", "a", "--with-prereqs"]);
+        assert_eq!(parsed.tasks, ["a", "b"]);
+        assert!(parsed.with_prereqs);
+        assert_eq!(args(&[]).tasks, Vec::<String>::new());
+        assert_eq!(
+            arg_error(&["--task", ""]),
+            format!("{USAGE}flywheel worker: error: argument --task: expected a task id\n")
+        );
+        assert_eq!(
+            arg_error(&["--with-prereqs"]),
+            format!("{USAGE}flywheel worker: error: argument --with-prereqs: requires --task\n")
+        );
+        // `--task` is exact; `--tas` could be either task flag.
+        assert_eq!(
+            arg_error(&["--tas", "x"]),
+            format!(
+                "{USAGE}flywheel worker: error: ambiguous option: --tas could match --tasks-dir, --task\n"
+            )
+        );
+        assert!(args(&["--with", "--task", "x"]).with_prereqs);
+        assert_eq!(
+            args(&["--scope-since=2026-01-01T00:00:00.000Z", "--task", "x"])
+                .scope_since
+                .as_deref(),
+            Some("2026-01-01T00:00:00.000Z")
+        );
+        assert_eq!(
+            arg_error(&["--scope", "x"]),
+            format!("{USAGE}flywheel worker: error: unrecognized arguments: --scope x\n")
+        );
+        assert!(!HELP.contains(crate::scoped::SCOPE_SINCE_FLAG));
+        assert!(HELP.contains("--task TASK") && HELP.contains("--with-prereqs"));
     }
 
     // --- main ------------------------------------------------------------------------------

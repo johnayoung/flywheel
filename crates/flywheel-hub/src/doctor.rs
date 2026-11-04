@@ -1927,17 +1927,30 @@ mod tests {
         assert_eq!(check.level, Level::Fail, "{check:?}");
         assert!(check.fix.unwrap().contains("--port"));
         drop(taken);
-        // A free port is ok. (Retried on fresh ports: once freed, a port
-        // can be taken at once by a parallel test's connection.)
-        let free = (0..10).any(|_| {
-            let port = TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
-            port_check(IpAddr::V4(Ipv4Addr::LOCALHOST), port, None).level == Level::Ok
-        });
-        assert!(free);
+        // A free port is ok. Probed below the ephemeral range: a port
+        // `bind(:0)` handed out and this test freed is at once reusable by
+        // any parallel test's outgoing connection (the kernel picks those
+        // from the same range), so it is not reliably free a moment later.
+        // Nothing in the process auto-assigns these; one skipped here is
+        // held by a long-lived listener on this machine.
+        let free = unassigned_ports()
+            .map(|port| port_check(IpAddr::V4(Ipv4Addr::LOCALHOST), port, None))
+            .find(|check| check.level == Level::Ok)
+            .expect("a free port below the ephemeral range");
+        assert!(free.summary.ends_with("is free"), "{free:?}");
+        assert!(free.fix.is_none(), "{free:?}");
+    }
+
+    /// Ports the kernel never hands out on its own (not to `bind(:0)`, not
+    /// to an outgoing connection): the 2000 just below the ephemeral range
+    /// (Linux reads it; elsewhere it starts at 32768 or above).
+    fn unassigned_ports() -> std::ops::Range<u16> {
+        let start = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .ok()
+            .and_then(|range| range.split_whitespace().next()?.parse::<u16>().ok())
+            .unwrap_or(32768)
+            .clamp(4096, 32768);
+        (start - 2000)..start
     }
 
     #[test]

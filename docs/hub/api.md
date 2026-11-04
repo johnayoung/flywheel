@@ -103,7 +103,7 @@ Review actions (commit, push, pr, rebase, abort, merge) are two-step: `{"dry_run
 | GET | `/api/flywheel/panel?folder=` | the whole panel (`phases`, `live`, `runs`, `worker`, `autopilot`, `claims`, `alerts`, `source`, `store`, `worktree_of`, `problem`); 404 unless an adopted workspace folder |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"run_id","task_id","status","active","summary","from","entries":[{"ts","kind","header","body","error"}],"next"}`; poll with `since=next`. 400 bad run id, 404 unknown run, 503 while an earlier read still waits on the store |
 | GET | `/api/flywheel/task?folder=&task=` | the task as a fan-out seed `{"folder","task_id","phase","goal","prompt","digest","graders","held_out":[name],"not_run","protect","protect_skipped"}` |
-| POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"cols"?,"rows"?}` -> 201 the new `fw worker` session; 409 `{"error","running":{"id","name"}}` while a hub-started worker runs there and `another` is not true |
+| POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"cols"?,"rows"?}` -> 201 the new `fw worker` session (`--task` per id in `tasks`; 400 for a bad id); 409 `{"error","running":{"id","name"}}` while a hub-started worker runs there and `another` is not true |
 
 Fan-out view: `{"id","name","base_sha","graders","winner","counts","leader","settled","candidates":[{"label","session_id","kind","model","branch","verdict","rank","why","grade","stale","cost_usd","pickable"}]}` (lists: no grader output). 503 fan-outs off.
 

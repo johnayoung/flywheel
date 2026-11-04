@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use super::OrchestrateError;
 use super::prereqs::stranded_run_ids;
+use super::scope::{TaskScope, in_scope};
 
 /// Emit one line to the optional log.
 pub(super) fn emit(log: Option<&LogSink>, line: impl AsRef<str>) {
@@ -52,16 +53,21 @@ fn live_run_rows(control: &dyn HarnessStore) -> Result<Vec<(String, String)>, St
 /// the run's own watcher applies it, so this works for peer workers' runs
 /// too). `already_signaled` is the caller-owned dedup set: a run is signaled
 /// at most once per session even though it stays `running` until the
-/// watcher acts. Returns the run ids newly signaled.
+/// watcher acts. A scoped session (`scope`) only ever signals its own
+/// members' runs. Returns the run ids newly signaled.
 pub fn reconcile_live_runs(
     control: &dyn HarnessStore,
     wanted_task_ids: &BTreeSet<String>,
     already_signaled: &mut HashSet<String>,
     now: DateTime<Utc>,
+    scope: Option<&TaskScope>,
 ) -> Result<Vec<String>, StoreError> {
     let mut signaled = Vec::new();
     for (run_id, task_id) in live_run_rows(control)? {
-        if wanted_task_ids.contains(&task_id) || already_signaled.contains(&run_id) {
+        if wanted_task_ids.contains(&task_id)
+            || already_signaled.contains(&run_id)
+            || !in_scope(scope, &task_id)
+        {
             continue;
         }
         let mut payload = Map::new();
@@ -92,6 +98,7 @@ pub(super) async fn source_reconcile_loop(
     interval: f64,
     now: Clock,
     log: Option<LogSink>,
+    scope: Option<TaskScope>,
 ) {
     let mut already_signaled: HashSet<String> = HashSet::new();
     loop {
@@ -116,6 +123,7 @@ pub(super) async fn source_reconcile_loop(
             &wanted,
             &mut already_signaled,
             now(),
+            scope.as_ref(),
         ) {
             Ok(newly) => newly,
             Err(err) => {
@@ -259,7 +267,8 @@ pub fn assemble_graph_snapshot_items(
 /// proves no live worker holds it, so its stranded lifecycle is safe to
 /// finalize. A task a peer actively runs cannot be claimed and is left
 /// untouched. Keyless acquires (bookkeeping never queues behind a shared
-/// file key).
+/// file key). A scoped session (`scope`) only recovers its own members.
+#[allow(clippy::too_many_arguments)]
 pub fn recover_claimable_stranded(
     control: &Arc<dyn HarnessStore>,
     claims: &dyn ClaimStore,
@@ -268,12 +277,16 @@ pub fn recover_claimable_stranded(
     steal_grace_seconds: f64,
     now: &Clock,
     sink: Option<SharedSink>,
+    scope: Option<&TaskScope>,
 ) -> Result<Vec<String>, OrchestrateError> {
     let mut recovered = Vec::new();
     for run_id in stranded_run_ids(control.as_ref(), None)? {
         let Some(lifecycle) = control.load_lifecycle(&run_id)? else {
             continue;
         };
+        if !in_scope(scope, &lifecycle.task_id) {
+            continue;
+        }
         let Some(claim) = super::acquire_with_grace(
             claims,
             &lifecycle.task_id,
@@ -304,7 +317,10 @@ pub fn recover_claimable_stranded(
 /// One expired-lease sweep: finalize claimable stranded lifecycles, then
 /// reap any remaining lapsed claim rows (spec 00069, criteria #1/#2).
 ///
-/// Returns `(recovered_run_ids, released_task_ids)`.
+/// Returns `(recovered_run_ids, released_task_ids)`. A scoped session
+/// (`scope`) finalizes only its own members' strands; reaping a lapsed
+/// claim row (no live owner, no lifecycle change) stays fleet-wide.
+#[allow(clippy::too_many_arguments)]
 pub fn sweep_expired_leases(
     control: &Arc<dyn HarnessStore>,
     claims: &dyn ClaimStore,
@@ -313,6 +329,7 @@ pub fn sweep_expired_leases(
     steal_grace_seconds: f64,
     now: &Clock,
     sink: Option<SharedSink>,
+    scope: Option<&TaskScope>,
 ) -> Result<(Vec<String>, Vec<String>), OrchestrateError> {
     let recovered = recover_claimable_stranded(
         control,
@@ -322,6 +339,7 @@ pub fn sweep_expired_leases(
         steal_grace_seconds,
         now,
         sink,
+        scope,
     )?;
     let released = claims.sweep_expired_claims(now())?;
     Ok((recovered, released))
@@ -341,6 +359,7 @@ pub(super) async fn lease_sweep_loop(
     now: Clock,
     sink: Option<SharedSink>,
     log: Option<LogSink>,
+    scope: Option<TaskScope>,
 ) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs_f64(interval)).await;
@@ -352,6 +371,7 @@ pub(super) async fn lease_sweep_loop(
             steal_grace_seconds,
             &now,
             sink.clone(),
+            scope.as_ref(),
         );
         let (recovered, released) = match swept {
             Ok(swept) => swept,

@@ -1102,15 +1102,18 @@ fn promote(args: &PromoteArgs, out: &mut dyn Write, err: &mut dyn Write) -> Resu
         return Ok(0);
     }
     let written = done.get("written").unwrap_or(&Value::Null);
+    let task_id = str_field(written, "task_id");
+    let listed = if written.get("listed").and_then(Value::as_bool) == Some(true) {
+        format!(
+            "; the directory source lists it: run `fw worker --task {task_id}` there to verify it"
+        )
+    } else {
+        String::new()
+    };
     writeln!(
         out,
-        "wrote {} (uncommitted){}",
-        str_field(written, "path"),
-        if written.get("listed").and_then(Value::as_bool) == Some(true) {
-            "; the directory source lists it: run `fw worker` there to verify it"
-        } else {
-            ""
-        }
+        "wrote {} (uncommitted){listed}",
+        str_field(written, "path")
     )
     .map_err(io)?;
     let queue: Vec<&str> = list(written, "queue")
@@ -1120,8 +1123,8 @@ fn promote(args: &PromoteArgs, out: &mut dyn Write, err: &mut dyn Write) -> Resu
     if !queue.is_empty() {
         writeln!(
             out,
-            "note: `fw worker` drains every active task, not only this one; {} other{} not done \
-             yet may run first: {}",
+            "note: `fw worker` without --task drains every active task; {} other{} not done \
+             yet: {}",
             queue.len(),
             if queue.len() == 1 { "" } else { "s" },
             queue.join(", ")

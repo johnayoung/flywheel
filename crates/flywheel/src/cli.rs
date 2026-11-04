@@ -16,7 +16,7 @@
 //!   `recover`, `resolve`, `recheck-blocked`, `validate`
 //! * core (single-task producer verbs): `interrupt`, `approve`, `reject`,
 //!   `say` (surface name) -> `steer` (core verb)
-//! * worker: `worker [--once]` -> the git-worktree daemon loop
+//! * worker: `worker [--once] [--task ID]` -> the git-worktree daemon loop
 //! * daemons: `autopilot`, `triage` (and the headless
 //!   `autopilot-supervised` run path)
 //! * audit: `audit RUN_ID` -> the core audit stream
@@ -148,7 +148,7 @@ exits 0.
 
 Verbs:
   init             scaffold .flywheel/ and a flywheel.toml work policy
-  worker [--once]  run the git-worktree daemon loop (or a single drain)
+  worker [--once]  run the worktree daemon loop (--once: one drain; --task ID)
   autopilot        keep the queue full (neverending; --once for one pass)
   triage           triage the intake board (neverending; --once for one pass)
   status [--json]  print every active task's state

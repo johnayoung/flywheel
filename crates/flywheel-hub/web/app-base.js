@@ -406,9 +406,9 @@ const fanoutTask = window.FwHubFanoutTask({
     fanout.close();
     flywheel.open(folder, workspaceId);
   },
-  startWorker: (folder, workspaceId) => {
+  startWorker: (folder, workspaceId, taskId) => {
     fanout.close();
-    return flywheel.startWorkerIn(folder, workspaceId);
+    return flywheel.startWorkerIn(folder, workspaceId, taskId);
   },
   pendingTasks: (folder, except) => flywheel.pendingTasks(folder, except),
   onPromoted: () => fanout.reload(),

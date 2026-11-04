@@ -122,10 +122,10 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 
 - **Promote**: goal (`--goal`, else the seeding task's, else the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, the winner's commit -> a reference. Written through core's task loader; refused for an existing file, id, or an id with runs.
 - `--protect` paths become constraints only: only flywheel.toml `[submit] protected_paths` refuses a landing, and the hub never edits flywheel.toml.
-- The file is left **uncommitted** in the main checkout; then **Run fw worker here**. `fw worker` takes no task: it drains every active task, so others may run first (the dialog lists them).
+- The file is left **uncommitted** in the main checkout; then **Run <id> with worker here**: `fw worker --task <id>` runs that task alone and exits with its outcome (the dialog lists what stays queued).
 - **Fan out this task** (Flywheel panel): prompt from the task's goal and context; graders = its command graders plus its **held-out** graders, added server-side. A task with no command grader is refused; an unreadable held-out registry fails closed.
 - Held-out graders never reach an agent through the hub: a prompt naming one is refused, and Ask to fix says only that a held-out check failed (and is not offered when a pinned grader script changed: that one is yours to restore). Not a sandbox (agents run as you).
-- Promoting a task-seeded fan-out offers **Run fw worker here** (the task is already durable); a new task needs `--task-id`.
+- Promoting a task-seeded fan-out offers **Run <id> with worker here** (the task is already durable); a new task needs `--task-id`.
 
 ## Flywheel panel
 
@@ -136,7 +136,7 @@ Workspace folders with a `flywheel.toml` or `.flywheel/` get the verified loop b
 - Shows active phases and tasks (`pending | running | verified | failed | parked | awaiting | blocked`, from `fw status --json`), live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, and alerts.
 - Alerts join the sidebar's **Needs you**; **Mark seen** drops them in this browser until they change.
 - Open it from the folder chip's `verified/total` badge, the `flywheel` header pill (`Alt F`), or the palette.
-- **Start worker here**: a hub shell running `fw worker` in a split below the focused pane. A second is refused (409) unless confirmed.
+- **Start worker here**: a hub shell running `fw worker` (the whole queue) in a split below the focused pane; a task row's **run** starts `fw worker --task <id>` (asks before adding unmet prerequisites). A second is refused (409) unless confirmed.
 - **Output** on a run: its `fw show` summary and redacted agent transcript, followed live.
 - A linked worktree reads its own store (`Linked worktree of <main>`). Tracker sources (`github*`) are not listed.
 - Each adopted folder has one watcher (stat every 2 s, re-read on change or every 15 s). A missing SQLite store is never created.

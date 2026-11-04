@@ -26,6 +26,7 @@ mod prereqs;
 mod primitives;
 mod redrive;
 mod run_task;
+mod scope;
 mod sweep;
 #[cfg(test)]
 mod tests;
@@ -53,6 +54,10 @@ pub use redrive::{
 };
 pub use run_task::{
     AgentPrimitives, RunMode, RunTask, RunTaskError, RunTaskFuture, RunTaskRequest, SharedRunTask,
+};
+pub use scope::{
+    ScopeError, ScopeOutcome, ScopePlan, ScopeRequest, ScopeVerdict, TaskScope, UnmetPrerequisite,
+    evaluate_scope, plan_scope,
 };
 pub use sweep::{
     assemble_graph_snapshot_items, reconcile_live_runs, recover_claimable_stranded,
@@ -84,6 +89,7 @@ use flywheel_core::lifecycle::Status;
 use flywheel_core::store::{HarnessStore, StoreConflictError, StoreError};
 use flywheel_core::telemetry_file::FileTelemetrySink;
 use flywheel_core::validation::validate_task;
+use scope::{failed_under_scope, in_scope};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
@@ -242,6 +248,9 @@ pub struct OrchestrateRequest {
     /// The environment `[sandbox.env]` resolves against; the process
     /// environment when `None`.
     pub environ: Option<BTreeMap<String, String>>,
+    /// Restrict every action of the session to these tasks (`fw worker
+    /// --task`); `None` drives the whole listing. See [`TaskScope`].
+    pub scope: Option<TaskScope>,
 }
 
 impl fmt::Debug for OrchestrateRequest {
@@ -261,6 +270,7 @@ impl fmt::Debug for OrchestrateRequest {
                 &self.session_pause_ceiling_seconds,
             )
             .field("snapshot_policy", &self.snapshot_policy)
+            .field("scope", &self.scope)
             .finish_non_exhaustive()
     }
 }
@@ -304,6 +314,7 @@ impl OrchestrateRequest {
             shutdown: None,
             snapshot_policy: GraphSnapshotPolicy::EveryPass,
             environ: None,
+            scope: None,
         }
     }
 }
@@ -445,6 +456,8 @@ pub async fn orchestrate(
     let claims = request.claims.clone();
     let source = request.source.clone();
     let shutdown = request.shutdown.clone();
+    let scope = request.scope.clone();
+    let scope = scope.as_ref();
 
     let ctx = DriveContext {
         control: control.clone(),
@@ -482,6 +495,7 @@ pub async fn orchestrate(
         steal_grace,
         &clock,
         sink.clone(),
+        scope,
     )?;
 
     let _reconciler = request
@@ -494,6 +508,7 @@ pub async fn orchestrate(
                 interval,
                 clock.clone(),
                 log.clone(),
+                scope.cloned(),
             )))
         });
     // The in-loop sweeper claims under a DISTINCT worker id: acquire_claim
@@ -511,6 +526,7 @@ pub async fn orchestrate(
             clock.clone(),
             sink.clone(),
             log.clone(),
+            scope.cloned(),
         )))
     });
 
@@ -582,6 +598,7 @@ pub async fn orchestrate(
             .issues
             .iter()
             .filter(|issue| !satisfied_prereqs.contains(&issue.missing_id))
+            .filter(|issue| in_scope(scope, issue.task_id()))
             .cloned()
             .collect();
         redrive_missing_prerequisites(
@@ -599,6 +616,7 @@ pub async fn orchestrate(
                     Some(Status::AwaitingApproval) | Some(Status::Failed)
                 )
             })
+            .filter(|r| in_scope(scope, &r.task_id))
             .filter_map(|r| {
                 r.latest_run_id.as_ref().map(|run_id| HumanGateRequest {
                     task_id: r.task_id.clone(),
@@ -681,7 +699,7 @@ pub async fn orchestrate(
             if claim_pause_until.is_some() {
                 break;
             }
-            if !is_blocked_interrupted(row) {
+            if !is_blocked_interrupted(row) || !in_scope(scope, &row.task_id) {
                 continue;
             }
             let Some(run_id) = row.latest_run_id.clone() else {
@@ -775,7 +793,7 @@ pub async fn orchestrate(
         //     expiring deadline so the no-op resolve is not re-run every
         //     pass.
         for row in &rows {
-            if !is_awaiting_approval(row) {
+            if !is_awaiting_approval(row) || !in_scope(scope, &row.task_id) {
                 continue;
             }
             let Some(run_id) = row.latest_run_id.clone() else {
@@ -890,6 +908,7 @@ pub async fn orchestrate(
             let redrive_requests: Vec<SubmitRequest> = rows
                 .iter()
                 .filter(|r| r.latest_status == Some(Status::Done))
+                .filter(|r| in_scope(scope, &r.task_id))
                 .filter_map(|r| {
                     let run_id = r.latest_run_id.clone()?;
                     let item = item_by_id[&r.task_id];
@@ -932,6 +951,19 @@ pub async fn orchestrate(
         //    consume -- tasks a peer worker currently holds.
         let mut held: HashSet<String> = HashSet::new();
         let mut ran_fresh = false;
+        // A scoped session never selects outside its scope, nor re-runs a
+        // member that already failed under it (a peer sharing the scope
+        // may have run it since this worker last looked).
+        let mut out_of_scope: HashSet<String> = HashSet::new();
+        if let Some(scope) = scope {
+            for row in &rows {
+                if !scope.contains(&row.task_id)
+                    || failed_under_scope(control.as_ref(), row, scope)?
+                {
+                    out_of_scope.insert(row.task_id.clone());
+                }
+            }
+        }
         loop {
             if claim_pause_until.is_some() {
                 break;
@@ -946,6 +978,7 @@ pub async fn orchestrate(
                 .chain(blocked_ids.iter())
                 .chain(held.iter())
                 .chain(reachability_held.iter())
+                .chain(out_of_scope.iter())
                 .cloned()
                 .collect();
             let query = ReadySetQuery {
@@ -1008,7 +1041,13 @@ pub async fn orchestrate(
                 .ready_set(&state_values(&states), &query)
                 .iter()
                 .any(|i| i.task.id == pick_id);
-            if !still_ready {
+            // A peer sharing the scope may have run and failed it since
+            // the pass-top read: the same "attempted under this scope" bar.
+            let failed_meanwhile = match scope {
+                Some(scope) => failed_under_scope(control.as_ref(), &refreshed, scope)?,
+                None => false,
+            };
+            if !still_ready || failed_meanwhile {
                 claims.release_claim(&claim, Some(clock()))?;
                 attempted_fresh.insert(pick_id);
                 continue;

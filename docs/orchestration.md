@@ -57,6 +57,8 @@ For a directory source, both are read from the task file's top-level JSON keys (
 
 The worker's advertised set is `WorkPolicy.execution_capabilities`, configured under `[execution] capabilities` in `flywheel.toml` (`crates/flywheel-orchestrator/src/policy.rs`), defaulting to empty. **`[execution] capabilities` (worker work-classes) is distinct from `[sandbox.capabilities]` (agent tools/skills/MCP)** — see [configuration.md](configuration.md). Priority and capability filtering apply in both execution modes.
 
+**Scoped sessions.** `OrchestrateRequest.scope` (a `TaskScope`, set by `fw worker --task`) restricts every action of a session (stranded recovery, resume, approval resolution, landing re-drive, fresh selection) to its member ids, while the pass still reads the whole listing so an out-of-scope DONE prerequisite promotes a member. A member whose latest lifecycle failed at or after the scope began is not selected again. `plan_scope` validates a scope up front; `evaluate_scope` reports when every named task settled. See [cli.md](cli.md) (`worker`).
+
 ## Claims and leases (multi-worker mutual exclusion)
 
 The orchestrator's per-task lease store coordinates concurrent workers. A worker holds a lease while running a task and releases it on completion; the live lease is the liveness signal. A crashed worker's heartbeat stops, the lease lapses, and another worker reclaims it. This is transient coordination state, not audit history, which is why it lives in the orchestrator store rather than core.

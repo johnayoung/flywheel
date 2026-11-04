@@ -1098,6 +1098,7 @@ pub fn member_program() -> std::io::Result<Vec<String>> {
 pub fn pool_member_argv(
     program: &[String],
     args: &WorkerArgs,
+    scope_flags: &[String],
     worker_id: &str,
     model: Option<&str>,
 ) -> Vec<String> {
@@ -1143,6 +1144,7 @@ pub fn pool_member_argv(
     if args.once {
         argv.push("--once".to_owned());
     }
+    argv.extend(scope_flags.iter().cloned());
     argv
 }
 
@@ -1155,9 +1157,11 @@ pub fn pool_member_argv(
 /// a fresh per-invocation prefix, keeping every member's id distinct so
 /// claims attribute to the right worker. Member output lands under
 /// `<db dir>/logs/worker/`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pool(
     program: Vec<String>,
     args: &WorkerArgs,
+    scope_flags: &[String],
     concurrency: u32,
     model: Option<&str>,
     db_path: &Path,
@@ -1169,10 +1173,20 @@ pub fn run_pool(
         str::to_owned,
     );
     let member_args = args.clone();
+    let member_scope = scope_flags.to_vec();
     let model = model.map(str::to_owned);
     let spawn_member: SpawnMember = Arc::new(move |member_id: &str| {
-        pool_member_argv(&program, &member_args, member_id, model.as_deref())
+        pool_member_argv(
+            &program,
+            &member_args,
+            &member_scope,
+            member_id,
+            model.as_deref(),
+        )
     });
+    // A scoped member exits 0 once its scope settles: like a `--once`
+    // drain, that retires its slot instead of reading as a daemon death.
+    let retire_on_clean_exit = args.once || !scope_flags.is_empty();
     let log_dir = db_path
         .parent()
         .map(|p| p.join("logs").join("worker"))
@@ -1181,7 +1195,7 @@ pub fn run_pool(
         i64::from(concurrency),
         spawn_member,
         Arc::clone(&log),
-        args.once,
+        retire_on_clean_exit,
     )
     .with_prefix(prefix.clone())
     .with_log_dir(log_dir)
@@ -1786,11 +1800,11 @@ mod tests {
 
     #[test]
     fn pool_member_argv_pins_concurrency_one_and_distinct_id() {
-        let argv = pool_member_argv(&program(), &full_args(), "fleet-2", None);
+        let argv = pool_member_argv(&program(), &full_args(), &[], "fleet-2", None);
         assert_eq!(&argv[..2], &program()[..]);
         assert_eq!(value_after(&argv, "--concurrency"), "1");
         assert_eq!(value_after(&argv, "--worker-id"), "fleet-2");
-        let other = pool_member_argv(&program(), &full_args(), "fleet-1", None);
+        let other = pool_member_argv(&program(), &full_args(), &[], "fleet-1", None);
         assert_eq!(value_after(&other, "--worker-id"), "fleet-1");
     }
 
@@ -1807,7 +1821,7 @@ mod tests {
             once: true,
             ..full_args()
         };
-        let argv = pool_member_argv(&program(), &args, "fleet-0", Some("sonnet"));
+        let argv = pool_member_argv(&program(), &args, &[], "fleet-0", Some("sonnet"));
         assert_eq!(value_after(&argv, "--max-turns"), "9");
         assert_eq!(value_after(&argv, "--max-retries"), "2");
         assert_eq!(value_after(&argv, "--lease-seconds"), "120.0");
@@ -1827,8 +1841,30 @@ mod tests {
     }
 
     #[test]
+    fn pool_member_argv_hands_the_scope_to_every_member() {
+        let flags = [
+            "--task=-odd-id".to_owned(),
+            "--task=plain".to_owned(),
+            "--with-prereqs".to_owned(),
+            "--scope-since=2026-11-03T10:00:00.123Z".to_owned(),
+        ];
+        let argv = pool_member_argv(&program(), &full_args(), &flags, "fleet-0", None);
+        assert!(argv.ends_with(&flags));
+        let crate::daemon::Parsed::Args(parsed) = crate::daemon::parse_args(&argv[2..]).unwrap()
+        else {
+            panic!("member argv parses as args");
+        };
+        assert_eq!(parsed.tasks, ["-odd-id", "plain"]);
+        assert!(parsed.with_prereqs);
+        assert_eq!(
+            parsed.scope_since.as_deref(),
+            Some("2026-11-03T10:00:00.123Z")
+        );
+    }
+
+    #[test]
     fn pool_member_argv_omits_optional_flags_when_unset() {
-        let argv = pool_member_argv(&program(), &full_args(), "fleet-0", None);
+        let argv = pool_member_argv(&program(), &full_args(), &[], "fleet-0", None);
         for flag in ["--tasks-dir", "--db", "--sandbox-root", "--model", "--once"] {
             assert!(!argv.iter().any(|a| a == flag), "{flag} present");
         }

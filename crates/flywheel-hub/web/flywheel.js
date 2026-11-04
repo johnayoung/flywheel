@@ -3,7 +3,8 @@
 // status, in-flight and recent runs with grader receipts, worker and
 // autopilot liveness, claims, and the stop / strand alerts -- read-only,
 // beside the terminals. Actions: start `fw worker` in a hub shell session
-// there, and open a run's output (its `fw show` summary and redacted
+// there (the whole queue, or one task: `fw worker --task ID`, which runs
+// only it and exits once it settles), and open a run's output (its `fw show` summary and redacted
 // agent transcript). app-base.js creates it with its helpers; protocol:
 // GET /api/flywheel, /api/flywheel/panel, /api/flywheel/run, POST
 // /api/flywheel/worker, and the events socket's {"type":"flywheel"} and
@@ -499,17 +500,45 @@ window.FwHubFlywheel = function (ctx) {
     return { status: response.status, ok: response.ok, data };
   }
 
-  async function startWorker() {
+  // A panel task's prerequisites not verified yet (one the panel does not
+  // list is archived, so done).
+  function unmetPrerequisites(panel, taskId) {
+    const tasks = new Map(panel.phases.flatMap((p) => p.tasks).map((t) => [t.id, t]));
+    const task = tasks.get(taskId);
+    if (!task) return [];
+    return task.prerequisites.filter((id) => tasks.has(id) && tasks.get(id).state !== "verified");
+  }
+
+  // Start a worker in the open panel's folder: the whole queue, or only
+  // `taskId` (`fw worker --task`), with its unmet prerequisites if asked.
+  async function startWorker(taskId) {
     const folder = ui.folder;
     const panel = ui.panel;
     const workspace = workspaceFor(folder);
     if (!folder || !workspace) return;
+    const scoped = typeof taskId === "string" && taskId !== "";
+    let withPrereqs = false;
+    if (scoped && panel) {
+      const unmet = unmetPrerequisites(panel, taskId);
+      if (unmet.length) {
+        const ok = await confirmDialog({
+          kicker: "flywheel",
+          title: `Run ${taskId} with its prerequisites?`,
+          body: `${taskId} waits on ${unmet.join(", ")}, not verified yet. The worker runs ${unmet.length === 1 ? "it" : "them"} first, then ${taskId}, and nothing else; it stops if one fails.`,
+          ok: `Run ${unmet.length + 1} tasks`,
+        });
+        if (!ok) return;
+        withPrereqs = true;
+      }
+    }
     let another = false;
     if (panel && panel.worker.live) {
       const ok = await confirmDialog({
         kicker: "flywheel",
         title: "Start another worker?",
-        body: `A worker already holds leases in ${labelFor(folder)} (${panel.worker.detail}). Workers claim tasks, so a second one runs tasks in parallel with it.`,
+        body: scoped
+          ? `A worker already holds leases in ${labelFor(folder)} (${panel.worker.detail}). This one runs only ${taskId}; if the other claims it first, this one waits for it, then reports.`
+          : `A worker already holds leases in ${labelFor(folder)} (${panel.worker.detail}). Workers claim tasks, so a second one runs tasks in parallel with it.`,
         ok: "Start another",
       });
       if (!ok) return;
@@ -517,6 +546,10 @@ window.FwHubFlywheel = function (ctx) {
     }
     try {
       const request = { folder, workspace_id: workspace.id, another };
+      if (scoped) {
+        request.tasks = [taskId];
+        request.with_prereqs = withPrereqs;
+      }
       const workerPath = `${via(folder)}/api/flywheel/worker`;
       request.folder = pathOf(folder);
       let out = await post(workerPath, request);
@@ -582,10 +615,31 @@ window.FwHubFlywheel = function (ctx) {
         "span",
         { className: "fw-task-meta" },
         task.worker_id ? el("small", { textContent: task.worker_id, title: "worker" }) : null,
+        runButton(task),
         fanOutButton(task),
         outputButton(task.run_id, task.id),
       ),
     );
+  }
+
+  // "Run <id> with worker here": `fw worker --task <id>` in a hub shell
+  // session, which runs that task alone and exits once it settles. This
+  // hub's folders only (a peer hub that predates scoped workers would
+  // drain its whole queue instead), and only work not verified or running.
+  function runButton(task) {
+    const folder = ui.folder;
+    if (machineOfKey(folder) || task.state === "verified" || task.state === "running") return null;
+    return el("button", {
+      type: "button",
+      className: "text-btn fw-out",
+      textContent: "run",
+      title: `Run ${task.id} with worker here: fw worker --task ${task.id} in a new shell session, which runs only this task${task.prerequisites.length ? " (and, if you confirm, its unmet prerequisites first)" : ""}, then exits`,
+      "aria-label": `Run ${task.id} with worker here`,
+      onclick: (event) => {
+        event.stopPropagation();
+        startWorker(task.id);
+      },
+    });
   }
 
   // "Fan out this task" (fanout-task.js): this hub's folders only, and
@@ -606,13 +660,14 @@ window.FwHubFlywheel = function (ctx) {
     });
   }
 
-  // "Run fw worker here" from elsewhere (a promoted fan-out): the
-  // folder's panel, then its Start worker -- once the panel is read, so a
+  // "Run <id> with worker here" from elsewhere (a promoted fan-out): the
+  // folder's panel, then its scoped start -- once the panel is read, so a
   // worker already holding leases there (one started outside the hub
-  // too) is asked about first.
-  async function startWorkerIn(folder, workspaceId) {
+  // too) and unmet prerequisites are asked about first. No `taskId`
+  // starts the unscoped worker.
+  async function startWorkerIn(folder, workspaceId, taskId) {
     await open(folder, workspaceId);
-    return startWorker();
+    return startWorker(taskId);
   }
 
   // The active tasks in `folder` not verified yet, other than `except`:
@@ -754,11 +809,11 @@ window.FwHubFlywheel = function (ctx) {
       {
         type: "button",
         className: "slab fw-start",
-        onclick: startWorker,
+        onclick: () => startWorker(),
         disabled: broken,
         title: broken
           ? "The policy does not load (see below): fix flywheel.toml, then start a worker"
-          : "Run fw worker in a new shell session in this folder",
+          : "Run fw worker in a new shell session in this folder: it drains every active task not done yet (a task's run button runs that one alone)",
       },
       icon("plus"),
       broken ? "Fix flywheel.toml first" : panel.worker.live ? "Start another worker" : "Start worker here",

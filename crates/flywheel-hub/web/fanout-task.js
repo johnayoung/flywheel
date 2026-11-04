@@ -3,8 +3,9 @@
 // repo's directory work source -- the prompt as context, the graders as
 // command graders, the winner's commit as a reference -- shown first word
 // for word (path and bytes), written only on confirm (the dry run's
-// fingerprint), as an uncommitted file; then "Run fw worker here" so the
-// flywheel loop verifies it again. Fan out this task (from the Flywheel
+// fingerprint), as an uncommitted file; then "Run <id> with worker here"
+// (`fw worker --task <id>`: that task alone) so the flywheel loop
+// verifies it again. Fan out this task (from the Flywheel
 // panel): a launch form seeded with the task's goal, context, and command
 // graders; its held-out graders are added by the hub at launch, run in
 // every worktree, and never shown to the agents. app-base.js creates it;
@@ -137,31 +138,41 @@ window.FwHubFanoutTask = function (ctx) {
         el("p", {
           className: "fo-plan-detail",
           textContent: w.listed
-            ? "Its directory work source lists it: `fw worker` there picks it up and verifies it through the loop (its graders, then the held-out gate and landing). Commit the file to keep it with the repo."
+            ? "Its directory work source lists it: a worker there verifies it through the loop (its graders, then the held-out gate and landing). Commit the file to keep it with the repo."
             : "Written, but the directory work source does not list it (see the Flywheel panel's problem line).",
         }),
         ...(done.warnings || []).map((x) => el("p", { className: "fo-plan-warn", textContent: `warning: ${x}` })),
-        queueNote(w.queue || [])),
+        queueNote(w.task_id, w.queue || [])),
       el("footer", { className: "sheet-foot" },
         el("button", { type: "submit", className: "slab ghost", value: "", textContent: "Close" }),
         el("button", { type: "button", className: "slab ghost", textContent: "Open Flywheel panel", onclick: () => {
           dialog.close();
           ctx.openFlywheel(folder, f.workspace_id);
         } }),
-        el("button", { type: "button", className: "slab", textContent: "Run fw worker here", title: WORKER_TITLE, onclick: () => {
-          dialog.close();
-          ctx.startWorker(folder, f.workspace_id);
-        } })),
+        runButton(folder, f.workspace_id, w.task_id)),
     ));
     dialog.querySelector(".sheet-foot .slab:not(.ghost)").focus();
   }
 
-  const WORKER_TITLE = "Start fw worker in a new shell session in this folder: it takes no task, and drains every active task not done yet, this one included";
+  // `fw worker --task <id>`: the task alone (its unmet prerequisites too,
+  // once confirmed in the panel), then the worker exits.
+  function runButton(folder, workspaceId, taskId) {
+    return el("button", {
+      type: "button",
+      className: "slab",
+      textContent: `Run ${taskId} with worker here`,
+      title: `Start fw worker --task ${taskId} in a new shell session in this folder: it runs only ${taskId}, then exits with its outcome`,
+      onclick: () => {
+        dialog.close();
+        ctx.startWorker(folder, workspaceId, taskId);
+      },
+    });
+  }
 
-  // `fw worker` takes no task: it drains the whole active queue.
-  function queueNote(queue) {
+  // The scoped worker leaves the rest of the queue alone; say what stays.
+  function queueNote(taskId, queue) {
     if (!queue.length) return null;
-    return el("p", { className: "fo-plan-warn", textContent: `fw worker drains every active task, not only this one: ${queue.length} other${queue.length === 1 ? "" : "s"} not done yet may run first (${queue.join(", ")}).` });
+    return el("p", { className: "fo-plan-detail", textContent: `Only ${taskId} runs: ${queue.length} other active task${queue.length === 1 ? "" : "s"} not done yet stay${queue.length === 1 ? "s" : ""} queued (${queue.join(", ")}) for the panel's Start worker here, which drains them all.` });
   }
 
   // A fan-out seeded from a task: that task is the durable one already.
@@ -177,19 +188,16 @@ window.FwHubFanoutTask = function (ctx) {
       { method: "dialog" },
       el("header", { className: "sheet-head" }, el("span", { className: "sheet-kicker", textContent: "flywheel task" }), el("h2", { textContent: `${f.name} came from task ${o.task_id}` })),
       el("div", { className: "fo-act-body" },
-        el("p", { className: "fo-plan-summary" }, "Task ", el("code", { textContent: o.phase ? `${o.phase}/${o.task_id}` : o.task_id }), " is already the durable spec and graders for this work", o.held_out ? `, held-out oracle${o.held_out === 1 ? "" : "s"} included` : "", ". To verify it through the loop, run the worker in this folder."),
-        el("p", { className: "fo-plan-detail", textContent: "fw worker takes no task: it drains every active task not done yet, in phase order, this one included. A separate task (a new id) leaves the original's held-out oracles behind." }),
+        el("p", { className: "fo-plan-summary" }, "Task ", el("code", { textContent: o.phase ? `${o.phase}/${o.task_id}` : o.task_id }), " is already the durable spec and graders for this work", o.held_out ? `, held-out oracle${o.held_out === 1 ? "" : "s"} included` : "", ". To verify it through the loop, run it with the worker in this folder."),
+        el("p", { className: "fo-plan-detail", textContent: "A separate task (a new id) leaves the original's held-out oracles behind." }),
         queue),
       el("footer", { className: "sheet-foot" },
         el("button", { type: "submit", className: "slab ghost", value: "", textContent: "Close" }),
         el("button", { type: "button", className: "slab ghost", textContent: "Write a separate task…", onclick: () => promoteForm(f, `${o.task_id}-${f.id.slice(0, 4)}`) }),
-        el("button", { type: "button", className: "slab", textContent: "Run fw worker here", title: WORKER_TITLE, onclick: () => {
-          dialog.close();
-          ctx.startWorker(folder, f.workspace_id);
-        } })),
+        runButton(folder, f.workspace_id, o.task_id)),
     ));
     ctx.pendingTasks(folder, o.task_id).then(
-      (ids) => queue.replaceChildren(queueNote(ids) || ""),
+      (ids) => queue.replaceChildren(queueNote(o.task_id, ids) || ""),
       () => {},
     );
     if (!dialog.open) dialog.showModal();

@@ -46,7 +46,7 @@ use flywheel_core::store_memory::InMemoryStore;
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome, LiveRun, Note,
-    PanelClaim, PanelPhase, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight,
+    PanelClaim, PanelPhase, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight, WorkerScope,
 };
 use flywheel_hub::util::path_identity as file_identity;
 use flywheel_orchestrator::autopilot_activity::{epoch_now, is_record_live, read_activity};
@@ -1064,11 +1064,13 @@ impl FlywheelProvider for HubFlywheel {
             .retain(|open| open.root != folder);
     }
 
-    fn worker_command(&self, _folder: &Path) -> Vec<String> {
-        vec![
+    fn worker_command(&self, _folder: &Path, scope: &WorkerScope) -> Vec<String> {
+        let mut argv = vec![
             self.program.to_string_lossy().into_owned(),
             "worker".to_owned(),
-        ]
+        ];
+        argv.extend(scope.flags());
+        argv
     }
 
     fn plan_task(&self, folder: &Path, draft: &TaskDraft) -> Result<TaskFilePlan, String> {

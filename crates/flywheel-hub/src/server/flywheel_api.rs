@@ -5,9 +5,10 @@
 //! * `GET /api/flywheel/run?folder=P&run=R[&since=N]` -- a run's `fw show`
 //!   summary and its transcript from entry `N` on;
 //! * `POST /api/flywheel/worker {"folder", "workspace_id"?, "another"?,
-//!   "cols"?, "rows"?}` -- start `fw worker` in a new hub shell session
-//!   there; 409 (with the running session) while a worker this hub
-//!   started still runs in the folder, unless `another` is true;
+//!   "tasks"?, "with_prereqs"?, "cols"?, "rows"?}` -- start `fw worker`
+//!   (`fw worker --task ID ...` when `tasks` names any) in a new hub shell
+//!   session there; 409 (with the running session) while a worker this
+//!   hub started still runs in the folder, unless `another` is true;
 //! * `{"type":"flywheel"}` messages on the events socket.
 //!
 //! Only folders of the hub's workspaces are served, and only adopted ones.
@@ -15,7 +16,7 @@
 use super::ApiQuery;
 use super::{AppState, error_response};
 use crate::flywheel::{
-    FlywheelEvent, FlywheelMonitor, FlywheelSummary, runs_worker, valid_run_id,
+    FlywheelEvent, FlywheelMonitor, FlywheelSummary, WorkerScope, runs_worker, valid_run_id,
     worker_session_command, worker_session_name,
 };
 use crate::hub::{CreateSession, Hub};
@@ -247,6 +248,13 @@ pub(super) struct WorkerRequest {
     /// Start one even though a worker this hub started still runs here.
     #[serde(default)]
     another: bool,
+    /// Run only these tasks (`fw worker --task ID ...`); empty drains the
+    /// whole queue.
+    #[serde(default)]
+    tasks: Vec<String>,
+    /// With `tasks`: also run their not-done prerequisites, first.
+    #[serde(default)]
+    with_prereqs: bool,
     cols: Option<u16>,
     rows: Option<u16>,
 }
@@ -259,11 +267,15 @@ enum StartRefused {
 
 pub(super) async fn start_worker(
     State(app): State<AppState>,
-    super::ApiJson(request): super::ApiJson<WorkerRequest>,
+    super::ApiJson(mut request): super::ApiJson<WorkerRequest>,
 ) -> Response {
     let monitor = match monitor(&app) {
         Ok(m) => m,
         Err(refusal) => return refusal.into_response(),
+    };
+    let scope = match WorkerScope::new(std::mem::take(&mut request.tasks), request.with_prereqs) {
+        Ok(scope) => scope,
+        Err(why) => return error_response(StatusCode::BAD_REQUEST, &why),
     };
     let (path, workspaces) = match adopted_folder(&app, &monitor, request.folder).await {
         Ok(found) => found,
@@ -298,8 +310,8 @@ pub(super) async fn start_worker(
                 name: running.record.name.clone(),
             });
         }
-        let name = worker_session_name(sessions.iter().map(|s| s.record.name.as_str()));
-        let command = worker_session_command(&starter.provider().worker_command(&folder));
+        let name = worker_session_name(&scope, sessions.iter().map(|s| s.record.name.as_str()));
+        let command = worker_session_command(&starter.provider().worker_command(&folder, &scope));
         hub.create_session(CreateSession {
             workspace_id: workspace.id,
             repo: Some(folder),

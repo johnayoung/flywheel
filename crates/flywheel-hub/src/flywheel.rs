@@ -370,8 +370,9 @@ pub trait FlywheelProvider: Send + Sync + 'static {
     fn run_output(&self, folder: &Path, run_id: &str, since: usize) -> Result<RunOutput, String>;
 
     /// The argv that runs a worker for `folder` (run with `folder` as the
-    /// working directory), e.g. `[/path/to/fw, worker]`.
-    fn worker_command(&self, folder: &Path) -> Vec<String>;
+    /// working directory), e.g. `[/path/to/fw, worker]`; restricted to
+    /// `scope`'s tasks when it names any (`[.., worker, --task=ID]`).
+    fn worker_command(&self, folder: &Path, scope: &WorkerScope) -> Vec<String>;
 
     /// Drop whatever is kept open for `folder` (stores, listings,
     /// transcripts): it left every workspace. A later read reopens.
@@ -738,6 +739,73 @@ pub const WORKER_MARKER: &str = "fw-worker";
 /// The name a started worker's session gets (numbered when taken).
 pub const WORKER_SESSION_NAME: &str = "fw worker";
 
+/// Which tasks a started worker runs: empty `tasks` drains the whole
+/// queue (`fw worker`); else only those (`fw worker --task ID ...`),
+/// plus their not-done prerequisites with `with_prereqs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkerScope {
+    pub tasks: Vec<String>,
+    pub with_prereqs: bool,
+}
+
+impl WorkerScope {
+    /// The longest task id a scope accepts.
+    pub const MAX_ID: usize = 200;
+    /// The most tasks one scoped start names.
+    pub const MAX_TASKS: usize = 50;
+
+    /// A scope over `tasks` (validated: non-empty printable ids without
+    /// whitespace, deduplicated, bounded), or why it is refused.
+    pub fn new(tasks: Vec<String>, with_prereqs: bool) -> Result<Self, String> {
+        if with_prereqs && tasks.is_empty() {
+            return Err("with_prereqs needs at least one task".into());
+        }
+        if tasks.len() > Self::MAX_TASKS {
+            return Err(format!("at most {} tasks per worker", Self::MAX_TASKS));
+        }
+        let mut unique: Vec<String> = Vec::new();
+        for id in tasks {
+            if id.is_empty()
+                || id.len() > Self::MAX_ID
+                || id.chars().any(|c| c.is_control() || c.is_whitespace())
+            {
+                return Err(format!("{id:?} is not a task id"));
+            }
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+        Ok(Self {
+            tasks: unique,
+            with_prereqs,
+        })
+    }
+
+    /// The `fw worker` flags for this scope (the `=` spelling, so an id
+    /// can never read as an option).
+    pub fn flags(&self) -> Vec<String> {
+        let mut flags: Vec<String> = self.tasks.iter().map(|t| format!("--task={t}")).collect();
+        if self.with_prereqs {
+            flags.push("--with-prereqs".to_owned());
+        }
+        flags
+    }
+
+    /// The session-name base: `fw worker`, or `fw worker <ids>`.
+    fn session_base(&self) -> String {
+        if self.tasks.is_empty() {
+            return WORKER_SESSION_NAME.to_owned();
+        }
+        let ids = self.tasks.join(", ");
+        let ids = if ids.chars().count() > 40 {
+            format!("{}...", ids.chars().take(37).collect::<String>())
+        } else {
+            ids
+        };
+        format!("{WORKER_SESSION_NAME} {ids}")
+    }
+}
+
 /// Whether `view` is a "Start worker here" session in `folder` whose
 /// worker is still running (not yet the shell it leaves behind). On Linux
 /// that is read from the session process's argv: its `/bin/sh` keeps the
@@ -783,13 +851,17 @@ fn process_runs_worker(_pid: u32) -> bool {
 /// A worker session name no session has: [`WORKER_SESSION_NAME`], else
 /// `fw worker 2`, `fw worker 3`, ... (names address sessions in `fw hub`
 /// verbs, so they stay unique).
-pub fn worker_session_name<'a>(taken: impl IntoIterator<Item = &'a str>) -> String {
+pub fn worker_session_name<'a>(
+    scope: &WorkerScope,
+    taken: impl IntoIterator<Item = &'a str>,
+) -> String {
     let taken: HashSet<&str> = taken.into_iter().map(str::trim).collect();
-    if !taken.contains(WORKER_SESSION_NAME) {
-        return WORKER_SESSION_NAME.to_owned();
+    let base = scope.session_base();
+    if !taken.contains(base.as_str()) {
+        return base;
     }
     (2..)
-        .map(|n| format!("{WORKER_SESSION_NAME} {n}"))
+        .map(|n| format!("{base} {n}"))
         .find(|name| !taken.contains(name.as_str()))
         .expect("an unbounded range has a free name")
 }
@@ -944,12 +1016,41 @@ mod tests {
 
     #[test]
     fn worker_session_names_stay_unique() {
-        assert_eq!(worker_session_name(["shell", "claude"]), "fw worker");
-        assert_eq!(worker_session_name(["fw worker"]), "fw worker 2");
+        let all = WorkerScope::default();
+        assert_eq!(worker_session_name(&all, ["shell", "claude"]), "fw worker");
+        assert_eq!(worker_session_name(&all, ["fw worker"]), "fw worker 2");
         assert_eq!(
-            worker_session_name([" fw worker ", "fw worker 2", "fw worker 4"]),
+            worker_session_name(&all, [" fw worker ", "fw worker 2", "fw worker 4"]),
             "fw worker 3"
         );
+        let one = WorkerScope::new(vec!["beta".into()], false).unwrap();
+        assert_eq!(worker_session_name(&one, ["fw worker"]), "fw worker beta");
+        assert_eq!(
+            worker_session_name(&one, ["fw worker beta"]),
+            "fw worker beta 2"
+        );
+        let long = WorkerScope::new((0..9).map(|n| format!("task-{n}")).collect(), false).unwrap();
+        assert_eq!(
+            worker_session_name(&long, []),
+            "fw worker task-0, task-1, task-2, task-3, task-..."
+        );
+    }
+
+    #[test]
+    fn worker_scopes_validate_ids_and_render_safe_flags() {
+        let scope = WorkerScope::new(vec!["-a".into(), "b".into(), "-a".into()], true).unwrap();
+        assert_eq!(scope.tasks, ["-a", "b"]);
+        assert_eq!(scope.flags(), ["--task=-a", "--task=b", "--with-prereqs"]);
+        assert!(WorkerScope::default().flags().is_empty());
+        for bad in ["", "a b", "a\nb", "a\0b"] {
+            assert!(
+                WorkerScope::new(vec![bad.into()], false).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert!(WorkerScope::new(vec!["x".repeat(201)], false).is_err());
+        assert!(WorkerScope::new(Vec::new(), true).is_err());
+        assert!(WorkerScope::new((0..51).map(|n| n.to_string()).collect(), false).is_err());
     }
 
     #[cfg(target_os = "linux")]
@@ -991,9 +1092,12 @@ mod tests {
         until("the worker to start", &|| process_runs_worker(pid));
         std::fs::write(&gate, "").unwrap();
         until("the shell to take over", &|| !process_runs_worker(pid));
-        // The same live process (now the shell), no longer a worker.
-        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
-        assert_eq!(comm.trim(), "sleep");
+        // The same live process becomes the shell (whose script then execs
+        // `sleep`: wait for that second exec, not just the first), and is
+        // no longer a worker.
+        let comm = || std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+        until("the shell to exec its sleep", &|| comm().trim() == "sleep");
+        assert!(!process_runs_worker(pid));
         drop(child);
         assert!(!process_runs_worker(pid), "a gone process runs nothing");
     }

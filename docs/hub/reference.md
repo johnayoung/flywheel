@@ -84,7 +84,7 @@ Git and agents together:
 fw hub review SESSION [--base REF] [--diff PATH] [--scope committed|staged|unstaged|untracked] [--json] {remote} {machine}
 fw hub merge SESSION [--yes|-y] [--rebase] [--remove-worktree] [--abort-rebase] [--json] {remote} {machine}
 fw hub handoff FROM TO (--selection-file F|- | --diff [--path P] [--base REF] | --last-command | --command SEQ | --message N) [--to-machine M] [--max-bytes N] [--edit] [--dry-run] [--json] {remote} {machine}
-fw hub ask-review SESSION [--kind claude|codex] [--base REF] [--dry-run] [--findings] [--send-findings] [--json] {remote} {machine}
+fw hub ask-review SESSION [--kind claude|codex] [--base REF] [--model M] [--dry-run] [--findings] [--send-findings] [--json] {remote} {machine}
 fw hub fanout new WS (--prompt TEXT|- --grader [name=]CMD... | --from-task ID) --agent KIND[:MODEL]... [--folder F] [--base BRANCH] [--name N] [--timeout SECS] [--protect PATH]... [--permission-mode M] [--approval A] [--sandbox S] [--no-commit-instruction] [--json] {remote} {machine}
 fw hub fanout ls [--json] {remote} {machine}
 fw hub fanout show FANOUT [--verbose|-v] [--json] {remote} {machine}

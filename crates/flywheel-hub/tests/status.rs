@@ -831,7 +831,8 @@ async fn codex_status_from_its_screen_and_turn_complete_notify() {
     send(&env, "codex", "notify", None, Some(notify)).unwrap();
     let done = status_becomes(&mut events, &sid, "done").await;
     assert_eq!(done["workspace_status"], "done");
-    next_event(&mut events, "sessions").await;
+    // The thread it names is recorded before the turn reads done (its
+    // rollout is read for the turn's commands first).
     assert_eq!(
         hub.get(&format!("/api/sessions/{sid}")).await["agent_session_id"],
         "thr_123"

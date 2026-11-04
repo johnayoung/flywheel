@@ -1,0 +1,15 @@
+{
+  "session_id": "99859e2e-e3ae-488f-8ac5-560dcd09e2e6",
+  "transcript_path": "/home/user/.claude/projects/-tmp-hub46-repos-calc-worktrees-fix-add/99859e2e-e3ae-488f-8ac5-560dcd09e2e6.jsonl",
+  "cwd": "/tmp/hub46/repos/calc.worktrees/fix-add",
+  "prompt_id": "61757f7c-d01c-4ddd-ad76-02f402d4b48c",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "```bash\necho probe-one\n```",
+  "background_tasks": [],
+  "session_crons": []
+}

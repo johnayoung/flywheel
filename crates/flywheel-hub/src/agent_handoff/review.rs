@@ -37,6 +37,11 @@ pub struct ReviewRequest {
     /// Compare against this instead of the session's base.
     #[serde(default)]
     pub base: Option<String>,
+    /// The reviewer's model (default: the author's when both are the same
+    /// kind of agent, else hub.toml `agents.<kind>.model`, else the CLI's
+    /// own).
+    #[serde(default)]
+    pub model: Option<String>,
     /// Say what would happen; launch nothing.
     #[serde(default)]
     pub dry_run: bool,
@@ -127,6 +132,31 @@ pub fn read_only_launch(kind: SessionKind) -> AgentLaunch {
             ..AgentLaunch::default()
         },
         SessionKind::Shell => AgentLaunch::default(),
+    }
+}
+
+/// The model a `kind` reviewer of `author` is asked to run: the one named,
+/// else the author's own when it is the same kind of agent (a haiku
+/// session's reviewer is not launched on the user's default model, which
+/// may cost many times more); `None` leaves it to hub.toml and the CLI.
+fn reviewer_model(
+    request: &ReviewRequest,
+    author: &SessionRecord,
+    kind: SessionKind,
+) -> Option<String> {
+    let named = request
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    match named {
+        Some(model) => Some(model.to_owned()),
+        None if author.kind == kind => author
+            .launch
+            .as_ref()
+            .and_then(|l| l.model.clone())
+            .filter(|m| !m.trim().is_empty()),
+        None => None,
     }
 }
 
@@ -324,9 +354,11 @@ impl Hub {
             REVIEW_DIFF_BYTES,
         );
         let tunables = self.tunables();
+        let mut read_only = read_only_launch(kind);
+        read_only.model = reviewer_model(request, &author.record, kind);
         let launch = tunables
             .agent_defaults
-            .fill(kind, &read_only_launch(kind))
+            .fill(kind, &read_only)
             .validated(kind)
             .map_err(StateError::Invalid)?;
         let flags = launch.args(kind);

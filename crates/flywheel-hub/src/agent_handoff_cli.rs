@@ -79,6 +79,11 @@ pub(crate) struct AskReviewArgs {
     /// Compare against REF instead of the session's base.
     #[arg(long, value_name = "REF")]
     base: Option<String>,
+    /// The reviewer's model (claude --model / codex -m) [default: the
+    /// author's when the reviewer is the same kind of agent, else hub.toml
+    /// agents.<kind>.model, else the agent CLI's own]
+    #[arg(long, conflicts_with_all = ["findings", "send_findings"])]
+    model: Option<String>,
     /// Print what would launch (kind, read-only flags, prompt); launch
     /// nothing.
     #[arg(long, conflicts_with_all = ["findings", "send_findings"])]
@@ -340,7 +345,12 @@ fn run_ask_review(
         let launched = conn.blocking_call(
             "POST",
             &format!("/api/sessions/{id}/review/reviewer"),
-            Some(&json!({ "kind": args.kind, "base": args.base, "dry_run": args.dry_run })),
+            Some(&json!({
+                "kind": args.kind,
+                "base": args.base,
+                "model": args.model,
+                "dry_run": args.dry_run,
+            })),
         )?;
         if let Some(note) = launched.get("fallback").and_then(Value::as_str) {
             let _ = writeln!(err, "fw hub: {note}");

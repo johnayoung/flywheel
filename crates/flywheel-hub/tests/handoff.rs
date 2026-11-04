@@ -837,8 +837,13 @@ async fn a_review_goes_to_the_other_kind_read_only_and_its_findings_come_back() 
 async fn without_codex_a_claude_author_gets_a_claude_reviewer() {
     let hub = TestHub::start(false).await;
     let wid = hub.workspace().await;
+    // A cheap model on purpose: its reviewer (the same kind) keeps it
+    // instead of the user's default model.
     let (author, _) = hub
-        .spawn(json!({ "workspace_id": wid, "kind": "claude", "worktree": { "task": "solo" } }))
+        .spawn(json!({
+            "workspace_id": wid, "kind": "claude", "model": "haiku",
+            "worktree": { "task": "solo" },
+        }))
         .await;
     let (_, worktree) = hub.started("claude", &author).await;
     let (status, why) = hub
@@ -858,6 +863,17 @@ async fn without_codex_a_claude_author_gets_a_claude_reviewer() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(why.contains("codex is not installed"), "{why}");
+    let named = hub
+        .post(
+            &format!("/api/sessions/{author}/review/reviewer"),
+            json!({ "dry_run": true, "model": "sonnet" }),
+        )
+        .await;
+    assert_eq!(
+        named["flags"],
+        json!(["--model", "sonnet", "--permission-mode", "plan"]),
+        "a named model wins"
+    );
     hub.as_running();
     let (code, out, err) = run_cli(&["ask-review", &author, "--state-dir", &hub.state_dir()]).await;
     assert_eq!(code, 0, "{err}");
@@ -866,7 +882,10 @@ async fn without_codex_a_claude_author_gets_a_claude_reviewer() {
         "{err}"
     );
     assert!(out.contains("launched claude reviewer"), "{out}");
-    assert!(out.contains("(--permission-mode plan)"), "{out}");
+    assert!(
+        out.contains("(--model haiku --permission-mode plan)"),
+        "{out}"
+    );
     let author_view = hub.session(&author).await;
     let reviewer = author_view["reviewer"].as_str().unwrap().to_owned();
     let (argv, cwd) = hub.started("claude", &reviewer).await;
@@ -874,6 +893,10 @@ async fn without_codex_a_claude_author_gets_a_claude_reviewer() {
     assert!(
         argv.windows(2).any(|w| w == ["--permission-mode", "plan"]),
         "{argv:?}"
+    );
+    assert!(
+        argv.windows(2).any(|w| w == ["--model", "haiku"]),
+        "the author's model: {argv:?}"
     );
     hub.shutdown().await;
 }

@@ -27,7 +27,7 @@ fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it wait
 
 Agents wrap commands for the screen; the hub reads each fenced block from the agent's own record and serves it **exactly as written**.
 
-- Sources: Claude's transcript (assistant text only), Codex's rollout (`$CODEX_HOME/sessions/.../rollout-*-<thread-id>.jsonl`), else its `notify` payload.
+- Sources: Claude's transcript (assistant text; before its line is on disk, the Stop hook's `last_assistant_message`: blocks are in before `done`), Codex's rollout (`$CODEX_HOME/sessions/.../rollout-*-<thread-id>.jsonl`), else its `notify` payload.
 - Tailed every second and per hook report; the newest 500 per session persist (`commands/<id>.json`).
 - Shell blocks: `bash sh zsh shell console fish ksh ...`, or untagged ones that start like a command; `console` blocks keep only the commands (`$ ` stripped).
 - Send pastes (bracketed when enabled), Send + Run adds Enter; multi-line without bracketed paste: 409, use Copy.
@@ -37,6 +37,7 @@ Agents wrap commands for the screen; the hub reads each fenced block from the ag
 ## Usage and cost
 
 - From transcripts (Claude `message.usage` incl. subagents, Codex `token_count`), priced by model: `usage.rs` `PRICES` (list prices, also on subscriptions; unknown models: tokens only).
+- Claude's side calls (titles, command descriptions) are not in transcripts: ~1-2% under its `cost-state`.
 - Header meter, sidebar rows, `fw hub ls`, `GET /api/usage`; 62 days per session; removed sessions' in `usage-archive.json`.
 
 ## Worktrees and companion shells
@@ -70,6 +71,7 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 - **Send to agent** (`fw hub handoff FROM TO`, `handoff.send`): a selection, message, block, or diff to another agent (any workspace or machine) as one prompt (`From <session> on <branch>:` + a fence; 32 KiB, editable).
 - **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author, reused.
+- Reviewer model: `--model`, else the author's when the same kind, else `agents.<kind>.model` (Claude plans haiku on sonnet anyway).
 - **Send findings to <author>** pastes the reviewer's latest reply back. Pairing survives restarts; closing the author closes its reviewers.
 
 ## Verified fan-out
@@ -99,12 +101,13 @@ fw hub fanout cleanup "$id" [--force] --yes
 For a folder flywheel drives with a **directory** work source:
 
 ```bash
-fw hub fanout promote "$id"  # dry run: path and exact bytes
-fw hub fanout promote "$id" --yes  # writes .flywheel/tasks/active/NN-<slug>/<slug>-<tag>.json (uncommitted)
+fw hub fanout promote "$id" --reference c1  # instead of pick; dry run: path and exact bytes
+fw hub fanout promote "$id" --reference c1 --yes  # writes .flywheel/tasks/active/NN-<slug>/<slug>-<tag>.json (uncommitted)
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote**: goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints (only `[submit] protected_paths` refuses a landing), winner -> a reference; refused for an existing file or id.
+- **Promote instead of picking** to land via `fw worker`; after a pick it is refused (nothing left to do).
+- **Promote**: goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints (only `[submit] protected_paths` refuses a landing), `--reference` candidate -> a reference; refused for an existing file or id.
 - The file is left **uncommitted**; **Run <id> with worker here** (a task-seeded fan-out offers it at once) runs `fw worker --task <id>` alone.
 - **Fan out this task** (Flywheel panel): prompt from its goal and context; graders = its command plus **held-out** graders, added server-side (none: refused; an unreadable registry fails closed).
 - Held-out graders never reach an agent via the hub: a prompt naming one is refused; Ask to fix only says one failed. Not a sandbox.

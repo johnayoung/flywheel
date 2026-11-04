@@ -295,6 +295,40 @@ impl Hub {
         if kind == SessionKind::Claude {
             self.perms_note_report(&report.session, &report.event, signal, &payload);
         }
+        if let Some(reported) = agent::reported_conversation(kind, &payload)
+            && conversation.as_deref() != Some(reported.as_str())
+        {
+            let changed = self
+                .store()
+                .set_agent_session_id(&report.session, &reported)
+                .map_err(|e| e.to_string())?;
+            if changed {
+                self.emit(HubEvent::Sessions);
+            }
+        }
+        self.commands
+            .note_report(&report.session, kind, &report.event, &payload);
+        // A finished turn's commands are in before the status says
+        // `done`, so whoever waited for `done` finds them (`fw hub wait
+        // --until done && fw hub commands --last`): the transcript read now
+        // (a Codex rollout, or a Claude line already flushed), else the
+        // reply Claude's Stop hook carries (its transcript line is written
+        // a moment after the hook runs).
+        if signal == Some(Signal::Done) {
+            // Cloned: the store is not held while the transcript is read.
+            let record = self.store().session(&report.session).cloned();
+            if let Ok(record) = record {
+                self.refresh_commands(&record);
+                // Not on disk yet: the reply the hook carries.
+                let added = self.commands.note_stop(&record, &payload);
+                if !added.is_empty() {
+                    self.emit(HubEvent::Commands {
+                        session_id: record.id.clone(),
+                        added,
+                    });
+                }
+            }
+        }
         if let Some(signal) = signal {
             let source = StatusSource::Hook {
                 agent: report.source.clone(),
@@ -311,19 +345,6 @@ impl Hub {
                 source,
             );
         }
-        if let Some(reported) = agent::reported_conversation(kind, &payload)
-            && conversation.as_deref() != Some(reported.as_str())
-        {
-            let changed = self
-                .store()
-                .set_agent_session_id(&report.session, &reported)
-                .map_err(|e| e.to_string())?;
-            if changed {
-                self.emit(HubEvent::Sessions);
-            }
-        }
-        self.commands
-            .note_report(&report.session, kind, &report.event, &payload);
         Ok(())
     }
 

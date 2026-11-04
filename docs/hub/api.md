@@ -79,7 +79,7 @@ Session views carry `agent` `{"status","detail"?,"since"}`, `agent_session_id`, 
 | POST | `/api/sessions/{id}/review/abort` | `git rebase --abort` |
 | POST | `/api/sessions/{id}/review/merge` | |
 | POST | `/api/sessions/{id}/review/ask` | `{"kind":"commit_message\|resolve_conflicts","dry_run"?}` -> `{"agent","prompt","paste"?}` |
-| POST | `/api/sessions/{id}/review/reviewer` | `{"kind"?,"base"?,"dry_run"?}`: 201 launched, 200 asked again; 409 nothing to review |
+| POST | `/api/sessions/{id}/review/reviewer` | `{"kind"?,"base"?,"model"?,"dry_run"?}`: 201 launched, 200 asked again; 409 nothing to review |
 | GET | `/api/sessions/{id}/review/findings` | the reviewer's latest `reply` and its `blocks` (409 no reviewer) |
 | POST | `/api/sessions/{id}/review/findings/send` | `{"prompt"?}` -> `{"to","paste"}` |
 | POST | `/api/sessions/{id}/handoff/compose` | `{"source":{"kind":"selection\|transcript\|command\|last_command\|diff",...},"max_bytes"?}` -> `{"prompt"}` |

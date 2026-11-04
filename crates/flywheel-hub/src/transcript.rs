@@ -293,6 +293,10 @@ struct SessionCommands {
     missed: Option<(Option<String>, Instant)>,
     /// Codex `notify` replies (turn id, text) not yet read.
     notified: VecDeque<(String, String)>,
+    /// Blocks of the last Claude Stop hook reply (conversation, text) its
+    /// transcript has not written yet: that line, when it comes, adds
+    /// nothing again.
+    from_hook: Vec<(Option<String>, String)>,
     /// Where the log is saved (`None`: kept in memory only).
     file: Option<PathBuf>,
     /// Why the last save failed.
@@ -422,6 +426,16 @@ impl SessionCommands {
                 }
                 let key = key_of(conversation, &reply.message_id, block_index);
                 if self.keys.contains(&key) {
+                    continue;
+                }
+                // The transcript line of a reply its Stop hook gave first.
+                if source == CommandSource::Transcript
+                    && let Some(at) = self
+                        .from_hook
+                        .iter()
+                        .position(|(c, t)| c.as_deref() == conversation && *t == block.text)
+                {
+                    self.from_hook.remove(at);
                     continue;
                 }
                 // A rollout found after its notify fallback was used: the
@@ -741,6 +755,72 @@ impl CommandBook {
             }
         }
         self.wake();
+    }
+
+    /// A Claude Code turn finished with `payload` (its Stop hook's): the
+    /// blocks of its `last_assistant_message` when the transcript has not
+    /// given them yet (it is written a moment after the hook). Call after
+    /// reading the transcript. Returns the new commands.
+    pub fn note_stop(&self, record: &SessionRecord, payload: &serde_json::Value) -> Vec<Command> {
+        let Some(text) = payload
+            .get("last_assistant_message")
+            .and_then(|m| m.as_str())
+            .filter(|m| m.contains("```") || m.contains("~~~"))
+        else {
+            return Vec::new();
+        };
+        if !record.runs_agent() || record.kind != SessionKind::Claude {
+            return Vec::new();
+        }
+        let conversation = record.agent_session_id.clone();
+        // Closed fences only: a long payload is cut to fit a report.
+        let blocks: Vec<String> = fenced_blocks(text)
+            .into_iter()
+            .filter(|b| b.closed && b.text.len() <= MAX_BLOCK_BYTES)
+            .map(|b| b.text)
+            .collect();
+        if blocks.is_empty() {
+            return Vec::new();
+        }
+        let entry = self.entry(&record.id);
+        let mut log = entry.log();
+        if log.gone {
+            return Vec::new();
+        }
+        log.from_hook.clear();
+        // Read already (the newest blocks of the conversation are these).
+        let newest: Vec<&str> = log
+            .entries
+            .iter()
+            .rev()
+            .filter(|c| c.conversation == conversation)
+            .take(blocks.len())
+            .map(|c| c.text.as_str())
+            .collect();
+        if newest.len() == blocks.len() && newest.iter().rev().zip(&blocks).all(|(a, b)| a == b) {
+            return Vec::new();
+        }
+        let turn = payload
+            .get("prompt_id")
+            .and_then(|p| p.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}", log.next_seq));
+        let reply = Reply {
+            message_id: format!("stop-{turn}"),
+            timestamp: Some(
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ),
+            texts: vec![text.to_owned()],
+        };
+        let added = log.add(&reply, conversation.as_deref(), CommandSource::Hook, true);
+        log.from_hook = added
+            .iter()
+            .map(|c| (c.conversation.clone(), c.text.clone()))
+            .collect();
+        if !added.is_empty() {
+            log.save();
+        }
+        added
     }
 
     fn wake(&self) {

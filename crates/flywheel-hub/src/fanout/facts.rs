@@ -327,6 +327,13 @@ pub fn merge_base(tools: &Tools, dir: &Path, base: &str) -> Option<String> {
         .filter(|sha| !sha.is_empty())
 }
 
+/// Whether `commit` is on local branch `branch` of the repo at `dir` (its
+/// tip or an ancestor of it); `false` when git cannot tell.
+pub fn on_branch(tools: &Tools, dir: &Path, commit: &str, branch: &str) -> bool {
+    let tip = format!("refs/heads/{branch}");
+    git(tools, dir, &["merge-base", "--is-ancestor", commit, &tip]).is_ok()
+}
+
 /// The branch checked out in `dir` (`None`: detached HEAD).
 pub fn current_branch(tools: &Tools, dir: &Path) -> Option<String> {
     git(tools, dir, &["symbolic-ref", "--short", "-q", "HEAD"])

@@ -221,6 +221,25 @@ impl Fanouts {
             .ok_or_else(|| HubError::Internal("the hub is shutting down".into()))
     }
 
+    /// Why `fanout` cannot be promoted to a flywheel task: its picked
+    /// winner is on the base already, so the task's worker would find
+    /// nothing to do (and stop: "the work is already on the base").
+    pub fn promotion_refusal(&self, fanout: &super::Fanout) -> Option<String> {
+        let winner = fanout.winner.as_ref()?;
+        if !super::facts::on_branch(&self.tools, &fanout.repo, &winner.head, &winner.base) {
+            return None;
+        }
+        Some(format!(
+            "{label} was picked: its commit {sha} is on {base} already, so a flywheel task for \
+             this work has nothing left to do (its worker stops: the work is already on the \
+             base). Promote a fan-out instead of picking it (--reference a passing candidate) \
+             to land the work through `fw worker`",
+            label = winner.label,
+            sha = short_sha(&winner.head),
+            base = winner.base,
+        ))
+    }
+
     /// What runs the graders, as the board shows it.
     pub fn runner_name(&self) -> Option<String> {
         self.runner.as_ref().map(|r| r.name())

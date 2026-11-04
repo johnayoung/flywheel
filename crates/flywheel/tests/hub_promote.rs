@@ -255,11 +255,16 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
         .trim()
         .to_owned();
     env.ok(&["fanout", "wait", &id, "--timeout", "90"]);
-    env.ok(&["fanout", "pick", &id, "c1", "--yes"]);
-    let head = env.git(&["rev-parse", "main"]);
+    // Promoted instead of picked: the task's worker lands the work.
+    let base = env.git(&["rev-parse", "main"]);
+    let board = env.json(&["fanout", "show", &id, "--json"]);
+    let head = candidate(&board, "c1")["grade"]["head"]
+        .as_str()
+        .unwrap_or_else(|| panic!("c1 graded at a commit: {board:#}"))
+        .to_owned();
 
     // The dry run shows exactly what is written, and writes nothing.
-    let plan = env.json(&["fanout", "promote", &id, "--json"]);
+    let plan = env.json(&["fanout", "promote", &id, "--reference", "c1", "--json"]);
     let task_id = format!("answer-{}", &id[..4]);
     let relative = format!(".flywheel/tasks/active/01-{task_id}/{task_id}.json");
     assert_eq!(plan["plan"]["relative"], relative.as_str(), "{plan:#}");
@@ -277,7 +282,15 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
         "the protected path not covered by [submit] protected_paths is named: {plan:#}"
     );
 
-    let done = env.json(&["fanout", "promote", &id, "--yes", "--json"]);
+    let done = env.json(&[
+        "fanout",
+        "promote",
+        &id,
+        "--reference",
+        "c1",
+        "--yes",
+        "--json",
+    ]);
     assert_eq!(done["written"]["listed"], true, "{done:#}");
     assert_eq!(
         read(&path),
@@ -319,7 +332,7 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
             .all(|g| g["type"] == "command")
     );
     // Uncommitted: the hub never commits to the operator's branch.
-    assert_eq!(env.git(&["rev-parse", "main"]), head);
+    assert_eq!(env.git(&["rev-parse", "main"]), base);
     assert!(
         env.git(&["status", "--porcelain"])
             .contains(".flywheel/tasks/")
@@ -335,7 +348,7 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
     let board = env.json(&["fanout", "show", &id, "--json"]);
     assert_eq!(board["promoted"][0]["task_id"], task_id.as_str());
     // Never twice.
-    let again = env.fw(&["fanout", "promote", &id, "--yes"]);
+    let again = env.fw(&["fanout", "promote", &id, "--reference", "c1", "--yes"]);
     assert!(!again.status.success());
     assert!(String::from_utf8_lossy(&again.stderr).contains("already defined"));
 
@@ -542,4 +555,25 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
     let refused = String::from_utf8_lossy(&refused.stderr);
     assert!(refused.contains("not its agent's to fix"), "{refused}");
     assert!(!refused.contains("exact.sh"), "{refused}");
+
+    // Picked, the work is on the base: a task for it would have nothing
+    // to do (a real worker's agent stops: "already on the base"), so it
+    // is not written.
+    env.git(&["stash", "push", "-q", "--include-untracked"]);
+    env.ok(&["fanout", "pick", &id, "c1", "--yes"]);
+    assert_eq!(env.git(&["rev-parse", "main"]), head);
+    let late = env.fw(&[
+        "fanout",
+        "promote",
+        &id,
+        "--task-id",
+        "answer-late",
+        "--json",
+    ]);
+    assert!(!late.status.success());
+    let late = String::from_utf8_lossy(&late.stderr);
+    assert!(
+        late.contains("c1 was picked") && late.contains("nothing left to do"),
+        "{late}"
+    );
 }

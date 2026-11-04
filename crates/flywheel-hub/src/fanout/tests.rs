@@ -304,6 +304,42 @@ fn ranking_puts_passing_first_then_smaller_diffs_then_lower_cost() {
 }
 
 #[test]
+fn a_cost_tie_under_a_cent_is_told_apart_where_it_decides() {
+    // Two real claude:haiku candidates of one fan-out: same 4-line diff,
+    // costs the board rounds to one figure.
+    let pass = || grade(true, 4, vec![run("unit", GraderStatus::Passed, Some(0))]);
+    let mut views = vec![
+        view(
+            "c1",
+            Verdict::Pass,
+            Phase::Graded,
+            Some(pass()),
+            Some(0.005_975_61),
+        ),
+        view(
+            "c2",
+            Verdict::Pass,
+            Phase::Graded,
+            Some(pass()),
+            Some(0.005_965_87),
+        ),
+    ];
+    rank(&mut views);
+    assert_eq!(views[0].label, "c2");
+    let why = |i: usize| views[i].why.join(" | ");
+    assert!(
+        why(0).contains("ahead of c1: same diff, cheaper ($0.00597 vs $0.00598)"),
+        "{}",
+        why(0)
+    );
+    assert!(
+        why(1).contains("below c2: same diff, costs more ($0.00598 vs $0.00597)"),
+        "{}",
+        why(1)
+    );
+}
+
+#[test]
 fn a_pass_that_changes_nothing_ranks_after_real_passes() {
     let pass = |files, lines| {
         let mut g = grade(

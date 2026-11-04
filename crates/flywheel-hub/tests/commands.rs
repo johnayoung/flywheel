@@ -682,3 +682,119 @@ async fn commands_survive_a_restart_and_resume_but_a_fallback_shell_is_not_follo
     wait_for_commands(&hub, &sid, &["echo after resume", "echo before restart"]).await;
     hub.shutdown().await;
 }
+
+/// Claude Code 2.1.306's real Stop hook payload (captured from a hub
+/// session; its paths and ids are replaced per test).
+const STOP_HOOK: &str = include_str!("fixtures/claude-stop-hook.json");
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_turn_s_commands_are_in_before_it_reads_done() {
+    let hub = TestHub::start().await;
+    let ws = hub
+        .post(
+            "/api/workspaces",
+            json!({ "name": "w", "repos": [hub.repo()] }),
+        )
+        .await;
+    let claude = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws["id"], "kind": "claude", "name": "agent" }),
+        )
+        .await;
+    let sid = claude["id"].as_str().unwrap().to_owned();
+    let conversation = claude["agent_session_id"].as_str().unwrap().to_owned();
+    let env = agent_env(&hub, "claude").await;
+    // Where only the hook names it, so nothing reads it unasked.
+    let elsewhere = hub.dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let transcript = elsewhere.join(format!("{conversation}.jsonl"));
+    let reply = json!({
+        "type": "assistant", "uuid": "a1", "timestamp": chrono::Utc::now().to_rfc3339(),
+        "sessionId": conversation,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "```bash\necho probe-one\n```"}]},
+    });
+    let stop = |transcript: &Path| {
+        let mut payload: Value = serde_json::from_str(STOP_HOOK).unwrap();
+        payload["session_id"] = json!(conversation);
+        payload["transcript_path"] = json!(transcript);
+        payload["cwd"] = json!(hub.repo());
+        Report {
+            session: sid.clone(),
+            secret: env[report::SECRET_ENV].clone(),
+            source: "claude".into(),
+            event: "Stop".into(),
+            detail: None,
+            payload: Some(payload),
+        }
+    };
+    let socket = PathBuf::from(&env[report::SOCKET_ENV]);
+    let mut events = hub.events().await;
+
+    // As Claude Code 2.1.306 does it: the Stop hook runs ~100 ms before
+    // the reply's transcript line is on disk; the hook carries the reply.
+    append(
+        &transcript,
+        &json!({"type": "user", "uuid": "u0", "message": {"role": "user", "content": "suggest"}}),
+    );
+    let report = stop(&transcript);
+    let to = socket.clone();
+    tokio::task::spawn_blocking(move || report::send(&to, &report))
+        .await
+        .unwrap()
+        .unwrap();
+    // On the events socket the reply's commands come before `done`.
+    let mut seen_commands = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Some(Ok(Message::Text(text))) = timeout(remaining, events.next())
+            .await
+            .expect("timed out waiting for done")
+        else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).unwrap();
+        if value["session_id"] != sid.as_str() {
+            continue;
+        }
+        if value["type"] == "commands" {
+            assert_eq!(value["commands"][0]["text"], "echo probe-one");
+            assert_eq!(value["commands"][0]["source"], "hook");
+            seen_commands = true;
+        }
+        if value["type"] == "status" && value["status"]["status"] == "done" {
+            assert!(seen_commands, "done was pushed before the turn's commands");
+            break;
+        }
+    }
+    // Whoever waited for done reads them at once...
+    let list = hub.get(&format!("/api/sessions/{sid}/commands")).await;
+    assert_eq!(list["commands"][0]["command"], "echo probe-one");
+    // ...and once the transcript line lands, it adds nothing again.
+    append(&transcript, &reply);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let list = hub.get(&format!("/api/sessions/{sid}/commands")).await;
+    assert_eq!(list["commands"].as_array().unwrap().len(), 1, "{list}");
+
+    // A turn whose line is on disk already: read from the transcript.
+    let second = json!({
+        "type": "assistant", "uuid": "a2", "timestamp": chrono::Utc::now().to_rfc3339(),
+        "sessionId": conversation,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "```bash\necho probe-two\n```"}]},
+    });
+    append(&transcript, &second);
+    let mut report = stop(&transcript);
+    report.payload.as_mut().unwrap()["last_assistant_message"] =
+        json!("```bash\necho probe-two\n```");
+    tokio::task::spawn_blocking(move || report::send(&socket, &report))
+        .await
+        .unwrap()
+        .unwrap();
+    let list = hub.get(&format!("/api/sessions/{sid}/commands")).await;
+    let commands = list["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 2, "{list}");
+    assert_eq!(commands[0]["command"], "echo probe-two");
+    assert_eq!(commands[0]["source"], "transcript");
+    hub.shutdown().await;
+}

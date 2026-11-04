@@ -84,6 +84,9 @@ pub(super) async fn promote(
     let answer = blocking(move || {
         let fanout = engine.record(&id)?;
         require_adopted(provider.as_ref(), &fanout.repo)?;
+        if let Some(refusal) = engine.promotion_refusal(&fanout) {
+            return Err(conflict(refusal));
+        }
         let drafted = promote::draft(&fanout, &body).map_err(invalid)?;
         let plan = provider
             .plan_task(&fanout.repo, &drafted.draft)

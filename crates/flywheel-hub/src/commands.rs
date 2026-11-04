@@ -469,6 +469,10 @@ pub enum CommandSource {
     /// A Codex `notify` payload's `last-assistant-message` (no rollout
     /// found).
     Notify,
+    /// A Claude Code Stop hook's `last_assistant_message`: the turn's
+    /// reply before its transcript line is on disk (Claude Code writes
+    /// that a moment after the hook runs).
+    Hook,
 }
 
 /// A code block an agent suggested in one session.

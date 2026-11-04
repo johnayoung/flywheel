@@ -214,6 +214,23 @@ fn money(cost: Option<f64>) -> String {
     }
 }
 
+/// Two costs as the board shows them, with as many more decimals as it
+/// takes to tell them apart (cents round two cheap runs to one figure:
+/// "$0.0060 vs $0.0060" explains nothing).
+fn money_apart(a: Option<f64>, b: Option<f64>) -> (String, String) {
+    let (shown_a, shown_b) = (money(a), money(b));
+    let (Some(x), Some(y)) = (a, b) else {
+        return (shown_a, shown_b);
+    };
+    if shown_a != shown_b || x == y {
+        return (shown_a, shown_b);
+    }
+    (5..=8)
+        .map(|digits| (format!("${x:.digits$}"), format!("${y:.digits$}")))
+        .find(|(p, q)| p != q)
+        .unwrap_or((format!("${x:.8}"), format!("${y:.8}")))
+}
+
 /// Order the board and say why: passing first (smaller diff, then lower
 /// cost), then failing (more graders passed, smaller diff, lower cost),
 /// then stale, pending, and ungraded ones in launch order. Fills `rank`
@@ -373,11 +390,8 @@ fn versus(
         } else {
             "costs more"
         };
-        return format!(
-            "{relation} {who}: same diff, {word} ({} vs {})",
-            money(v.cost_usd),
-            money(other.cost_usd)
-        );
+        let (mine, theirs) = money_apart(v.cost_usd, other.cost_usd);
+        return format!("{relation} {who}: same diff, {word} ({mine} vs {theirs})");
     }
     format!("{relation} {who}: same diff and cost (launch order)")
 }

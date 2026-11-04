@@ -99,15 +99,18 @@ pub struct Plan {
     pub excluded: Vec<String>,
 }
 
-/// A changed file a commit-all may not want.
+/// A changed file, or a directory of them, a commit-all may not want.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Suspect {
+    /// A file, or a directory of generated output (ending in `/`).
     pub path: String,
     /// `generated` (build or tool output), `secret` (keys, `.env`), or
     /// `large` (over [`LARGE_FILE_BYTES`]).
     pub kind: &'static str,
     /// Left out of the commit.
     pub excluded: bool,
+    /// The changed files it stands for (a file: 1).
+    pub files: usize,
 }
 
 /// A changed file at least this big is named before it is committed.
@@ -169,7 +172,11 @@ pub(super) fn tree_state(git: &Git<'_>) -> Result<String, String> {
 
 /// [`tree_state`], and the changed paths with what each holds (a commit
 /// checks what it staged against these).
-fn tree_snapshot(git: &Git<'_>) -> Result<(String, Vec<(String, String)>), String> {
+/// A work tree's state ([`tree_state`]), each changed path with what it
+/// holds, and the `git status` read.
+type Snapshot = (String, Vec<(String, String)>, Vec<u8>);
+
+fn tree_snapshot(git: &Git<'_>) -> Result<Snapshot, String> {
     let status = porcelain(git, &["--branch"])?;
     let mut state = String::from_utf8_lossy(&status).into_owned();
     let contents = path_contents(git, &status);
@@ -179,7 +186,7 @@ fn tree_snapshot(git: &Git<'_>) -> Result<(String, Vec<(String, String)>), Strin
         state.push('\u{2}');
         state.push_str(hash);
     }
-    Ok((state, contents))
+    Ok((state, contents, status))
 }
 
 /// `git status --porcelain=v2 -z` with untracked files, renames off (each
@@ -224,7 +231,7 @@ pub(super) fn staged_as_planned(
     excluded: &[String],
 ) -> Result<bool, String> {
     let status = porcelain(git, &[])?;
-    let left_out = |path: &str| excluded.iter().any(|e| e == path);
+    let left_out = |path: &str| excluded.iter().any(|e| covers(e, path));
     let fully_staged = status_entries(&status).into_iter().all(|(entry, path)| {
         left_out(&path)
             || match entry.first() {
@@ -246,6 +253,18 @@ pub(super) fn staged_as_planned(
     now.sort();
     planned.sort();
     Ok(now == planned)
+}
+
+/// The paths with a change in the index (`git status --porcelain=v2 -z`).
+fn staged_paths(status: &[u8]) -> Vec<String> {
+    status_entries(status)
+        .into_iter()
+        // "1 XY ..." / "2 XY ...": X is the index against HEAD.
+        .filter(|(entry, _)| {
+            matches!(entry.first(), Some(b'1' | b'2')) && entry.get(2) != Some(&b'.')
+        })
+        .map(|(_, path)| path)
+        .collect()
 }
 
 /// The work-tree paths `git status --porcelain=v2 -z` names (changed,
@@ -343,34 +362,84 @@ fn change_line(prefix: &str, f: &FileChange) -> String {
     }
 }
 
-/// Whether a new file looks like a build or tool artifact (bytecode,
-/// objects, dependency and cache directories) rather than source.
-fn looks_generated(path: &str) -> bool {
-    const DIRS: &[&str] = &[
-        "__pycache__",
-        "node_modules",
-        ".pytest_cache",
-        ".mypy_cache",
-        ".ruff_cache",
-        ".tox",
-        ".venv",
-        ".gradle",
-        ".next",
+/// Whether `exclude` (a path, or a directory ending in `/`) leaves `path`
+/// out.
+pub(super) fn covers(exclude: &str, path: &str) -> bool {
+    exclude == path || (exclude.ends_with('/') && path.starts_with(exclude))
+}
+
+/// `exclude` as a git pathspec of exactly that path (a directory: every
+/// path under it), from the top, with `magic` added.
+fn literal_spec(magic: &str, exclude: &str) -> String {
+    format!(
+        ":(top,literal{magic}){}",
+        exclude.strip_suffix('/').unwrap_or(exclude)
+    )
+}
+
+/// Directories that only ever hold dependency, cache or build output.
+const GENERATED_DIRS: &[&str] = &[
+    "__pycache__",
+    "node_modules",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    ".gradle",
+    ".next",
+];
+
+/// The outermost directory of `path` (relative to the work tree `dir`)
+/// that holds only generated output, with its trailing `/`: one of
+/// [`GENERATED_DIRS`], or a Cargo `target/` (beside a `Cargo.toml`,
+/// tagged by Cargo, or holding a profile, `doc`, or a target triple).
+fn generated_dir(dir: &Path, path: &str) -> Option<String> {
+    const CARGO_OUTPUT: &[&str] = &[
+        "debug",
+        "release",
+        "doc",
+        "tmp",
+        "package",
+        "CACHEDIR.TAG",
+        ".rustc_info.json",
     ];
-    const EXTENSIONS: &[&str] = &["pyc", "pyo", "o", "obj", "class"];
     let parts: Vec<&str> = path.split('/').collect();
-    let name = parts.last().copied().unwrap_or(path);
-    parts[..parts.len() - 1].iter().any(|d| DIRS.contains(d))
-        || name == ".DS_Store"
+    let prefix = |i: usize| format!("{}/", parts[..=i].join("/"));
+    for i in 0..parts.len().saturating_sub(1) {
+        let part = parts[i];
+        if GENERATED_DIRS.contains(&part) {
+            return Some(prefix(i));
+        }
+        if part == "target" {
+            let next = parts[i + 1];
+            let triple = next.matches('-').count() >= 2 && !next.contains('.');
+            let parent = dir.join(parts[..i].join("/"));
+            if CARGO_OUTPUT.contains(&next)
+                || triple
+                || parent.join("Cargo.toml").is_file()
+                || parent.join("target/CACHEDIR.TAG").is_file()
+            {
+                return Some(prefix(i));
+            }
+        }
+    }
+    None
+}
+
+/// Whether a file looks like a build or tool artifact by itself
+/// (bytecode, objects) rather than source.
+fn looks_generated(path: &str) -> bool {
+    const EXTENSIONS: &[&str] = &["pyc", "pyo", "o", "obj", "class"];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name == ".DS_Store"
         || name
             .rsplit_once('.')
             .is_some_and(|(stem, ext)| !stem.is_empty() && EXTENSIONS.contains(&ext))
-        || path.starts_with("target/debug/")
-        || path.starts_with("target/release/")
 }
 
-/// Whether a file looks like a secret: a dotenv file (not a checked-in
-/// example), a private key or certificate store, credentials.
+/// Whether a file looks like a secret by its name: a dotenv file (not a
+/// checked-in example), a private key or certificate store, credentials.
 fn looks_secret(path: &str) -> bool {
     const EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx", "jks", "keystore", "ppk"];
     const NAMES: &[&str] = &[
@@ -395,49 +464,78 @@ fn looks_secret(path: &str) -> bool {
             .is_some_and(|(stem, ext)| !stem.is_empty() && EXTENSIONS.contains(&ext))
 }
 
-/// What a commit-all would take that may not be wanted: each changed file
-/// still in the work tree that looks generated or secret (left out unless
-/// `exclude` says otherwise) or is large (kept unless excluded). `exclude`
-/// (`None`: those defaults) names exactly what is left out.
+/// A `.key` that is a zip (a Keynote deck), not a key.
+fn is_zip(file: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    std::fs::File::open(file)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok_and(|()| head == *b"PK\x03\x04")
+}
+
+/// What a commit-all would take that may not be wanted, from every
+/// changed path (`paths`, the full status, not the cut review list): a
+/// directory of generated output (one entry, ending in `/`, for all its
+/// files), and each other file still in the work tree that looks
+/// generated or secret (left out unless `exclude` says otherwise) or is
+/// large (kept unless excluded). `exclude` (`None`: those defaults) names
+/// exactly what is left out.
 fn suspects(dir: &Path, paths: &[&str], exclude: Option<&[String]>) -> Vec<Suspect> {
-    paths
-        .iter()
-        .filter_map(|path| {
-            let meta = dir.join(path).symlink_metadata().ok()?;
-            let kind = if looks_secret(path) {
-                "secret"
-            } else if looks_generated(path) {
-                "generated"
-            } else if meta.is_file() && meta.len() >= LARGE_FILE_BYTES {
-                "large"
-            } else {
-                return None;
-            };
-            let excluded = match exclude {
-                Some(list) => list.iter().any(|e| e == path),
-                None => kind != "large",
-            };
-            Some(Suspect {
-                path: (*path).to_owned(),
-                kind,
-                excluded,
-            })
-        })
-        .collect()
+    let mut found: Vec<Suspect> = Vec::new();
+    let mut dirs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for path in paths {
+        if let Some(under) = generated_dir(dir, path) {
+            match dirs.get(&under) {
+                Some(&at) => found[at].files += 1,
+                None => {
+                    dirs.insert(under.clone(), found.len());
+                    found.push(Suspect {
+                        path: under,
+                        kind: "generated",
+                        excluded: false,
+                        files: 1,
+                    });
+                }
+            }
+            continue;
+        }
+        let file = dir.join(path);
+        let Ok(meta) = file.symlink_metadata() else {
+            continue;
+        };
+        let kind = if looks_secret(path) && !(path.ends_with(".key") && is_zip(&file)) {
+            "secret"
+        } else if looks_generated(path) {
+            "generated"
+        } else if meta.is_file() && meta.len() >= LARGE_FILE_BYTES {
+            "large"
+        } else {
+            continue;
+        };
+        found.push(Suspect {
+            path: (*path).to_owned(),
+            kind,
+            excluded: false,
+            files: 1,
+        });
+    }
+    for s in &mut found {
+        s.excluded = match exclude {
+            Some(list) => list.contains(&s.path),
+            None => s.kind != "large",
+        };
+    }
+    found
 }
 
 /// `git add -A` of the whole work tree, but for `excluded` (each path
-/// exactly, from the top: `:(top,literal,exclude)`).
+/// exactly, a directory all of it, from the top).
 fn add_args(excluded: &[String]) -> Vec<String> {
     let mut args = vec!["add".to_owned(), "-A".to_owned()];
     if !excluded.is_empty() {
         args.push("--".into());
         args.push(":/".into());
-        args.extend(
-            excluded
-                .iter()
-                .map(|p| format!(":(top,literal,exclude){p}")),
-        );
+        args.extend(excluded.iter().map(|p| literal_spec(",exclude", p)));
     }
     args
 }
@@ -453,7 +551,7 @@ pub fn plan_commit(
 ) -> Result<Plan, String> {
     let git = Git::new(tools, &target.dir);
     let review = read(tools, target)?;
-    let (state, contents) = tree_snapshot(&git)?;
+    let (state, contents, status) = tree_snapshot(&git)?;
     let mut refusal = None;
     if let Some(op) = &review.operation {
         refusal = Some(format!(
@@ -471,24 +569,14 @@ pub fn plan_commit(
     } else if message.trim().is_empty() {
         refusal = Some("write a commit message".into());
     }
-    // A file both staged and changed again since is one file.
-    let mut changed: Vec<&str> = Vec::new();
-    for path in review
-        .staged
-        .files
-        .iter()
-        .chain(&review.unstaged.files)
-        .map(|f| f.path.as_str())
-        .chain(review.untracked.iter().map(|u| u.path.as_str()))
-    {
-        if !changed.contains(&path) {
-            changed.push(path);
-        }
-    }
+    // Every changed path, from the full status (the review lists are
+    // cut at MAX_FILES; `git add -A` is not): one entry per path, staged
+    // or not.
+    let changed: Vec<&str> = contents.iter().map(|(path, _)| path.as_str()).collect();
     if let Some(unknown) = exclude
         .unwrap_or_default()
         .iter()
-        .find(|e| !changed.contains(&e.as_str()))
+        .find(|e| !changed.iter().any(|p| covers(e, p)))
     {
         refusal.get_or_insert_with(|| format!("{unknown} has no change to leave out"));
     }
@@ -501,7 +589,7 @@ pub fn plan_commit(
             .map(|s| s.path.clone())
             .collect(),
     };
-    let left_out = |path: &str| excluded.iter().any(|e| e == path);
+    let left_out = |path: &str| excluded.iter().any(|e| covers(e, path));
     let mut details = Vec::new();
     for f in review.staged.files.iter().filter(|f| !left_out(&f.path)) {
         details.push(change_line("staged ", f));
@@ -513,6 +601,7 @@ pub fn plan_commit(
         details.push(format!("new {}", u.path));
     }
     let files = changed.iter().filter(|p| !left_out(p)).count();
+    let out = changed.len() - files;
     if files == 0 && refusal.is_none() {
         refusal = Some("every change is left out: nothing to commit".into());
     }
@@ -526,13 +615,13 @@ pub fn plan_commit(
     }
     if review.untracked_truncated || review.unstaged.truncated || review.staged.truncated {
         warnings.push(format!(
-            "more than {MAX_FILES} files change; the list is cut"
+            "more than {MAX_FILES} files change; the list is cut (what is left out covers them all)"
         ));
     }
-    if !excluded.is_empty() {
+    if out > 0 {
         warnings.push(format!(
             "{} left out (still in the work tree; list {} in .gitignore to keep {} out)",
-            plural(excluded.len(), "file"),
+            plural(out, "file"),
             if excluded.len() == 1 { "it" } else { "them" },
             if excluded.len() == 1 { "it" } else { "them" },
         ));
@@ -548,10 +637,12 @@ pub fn plan_commit(
             1 => String::new(),
             n => format!(" ({} more like it)", n - 1),
         };
-        warnings.push(format!(
-            "{} looks {looks} and is committed{more}",
-            first.path
-        ));
+        let what = if first.files > 1 {
+            format!("{} ({})", first.path, plural(first.files, "file"))
+        } else {
+            first.path.clone()
+        };
+        warnings.push(format!("{what} looks {looks} and is committed{more}"));
     }
     let dir = &target.dir;
     let mut add = vec![Planned::new(
@@ -562,12 +653,11 @@ pub fn plan_commit(
     )];
     // Left out but staged already: unstaged again (no HEAD yet: dropped
     // from the index), the work tree untouched.
-    let staged_out: Vec<String> = review
-        .staged
-        .files
+    let staged = staged_paths(&status);
+    let staged_out: Vec<String> = excluded
         .iter()
-        .filter(|f| left_out(&f.path))
-        .map(|f| format!(":(top,literal){}", f.path))
+        .filter(|e| staged.iter().any(|p| covers(e, p)))
+        .map(|e| literal_spec("", e))
         .collect();
     if !staged_out.is_empty() {
         let mut args: Vec<String> = if review.head.is_some() {
@@ -599,7 +689,7 @@ pub fn plan_commit(
     let excluded_key = excluded.join("\u{0}");
     Ok(Plan {
         action: "commit",
-        summary: match (excluded.len(), files) {
+        summary: match (out, files) {
             (0, _) => format!(
                 "Stage all {} and commit them on {branch}",
                 plural(files, "file")
@@ -826,15 +916,24 @@ mod tests {
 
     #[test]
     fn new_build_artifacts_are_warned_about() {
-        for path in [
-            "__pycache__/calc.cpython-313.pyc",
-            "pkg/__pycache__/x.txt",
-            "web/node_modules/a/index.js",
-            "Main.class",
-            "src/lib.o",
-            ".DS_Store",
-            "target/debug/app",
+        let nowhere = Path::new("/nonexistent-hub-test-dir");
+        for (path, under) in [
+            ("__pycache__/calc.cpython-313.pyc", "__pycache__/"),
+            ("pkg/__pycache__/x.txt", "pkg/__pycache__/"),
+            ("web/node_modules/a/node_modules/b.js", "web/node_modules/"),
+            ("target/debug/app", "target/"),
+            ("target/x86_64-unknown-linux-musl/release/app", "target/"),
+            ("target/doc/index.html", "target/"),
+            ("target/.rustc_info.json", "target/"),
+            ("crates/foo/target/debug/libfoo.rlib", "crates/foo/target/"),
         ] {
+            assert_eq!(
+                generated_dir(nowhere, path).as_deref(),
+                Some(under),
+                "{path}"
+            );
+        }
+        for path in ["Main.class", "src/lib.o", ".DS_Store"] {
             assert!(looks_generated(path), "{path}");
         }
         for path in [
@@ -844,8 +943,10 @@ mod tests {
             "docs/obj.md",
             ".o",
             "target/README.md",
+            "target",
         ] {
             assert!(!looks_generated(path), "{path}");
+            assert_eq!(generated_dir(nowhere, path), None, "{path}");
         }
         for path in [
             ".env",
@@ -870,5 +971,40 @@ mod tests {
         ] {
             assert!(!looks_secret(path), "{path}");
         }
+    }
+
+    #[test]
+    fn a_target_dir_beside_a_cargo_manifest_is_build_output() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tool/target/custom")).unwrap();
+        std::fs::write(dir.path().join("tool/Cargo.toml"), "[package]\n").unwrap();
+        assert_eq!(
+            generated_dir(dir.path(), "tool/target/custom/out.bin").as_deref(),
+            Some("tool/target/")
+        );
+        // No manifest, no Cargo output inside: a directory like any other.
+        assert_eq!(generated_dir(dir.path(), "web/target/custom/out.bin"), None);
+    }
+
+    #[test]
+    fn a_keynote_deck_is_not_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("deck.key"), b"PK\x03\x04rest of a zip").unwrap();
+        std::fs::write(dir.path().join("tls.key"), "-----BEGIN PRIVATE KEY-----\n").unwrap();
+        let found = suspects(dir.path(), &["deck.key", "tls.key"], None);
+        let kinds: Vec<(&str, &str)> = found.iter().map(|s| (s.path.as_str(), s.kind)).collect();
+        assert_eq!(kinds, [("tls.key", "secret")]);
+    }
+
+    #[test]
+    fn a_directory_exclusion_covers_what_is_under_it() {
+        assert!(covers("node_modules/", "node_modules/a/b.js"));
+        assert!(covers("a.txt", "a.txt"));
+        assert!(!covers("node_modules/", "node_modules_old/a.js"));
+        assert!(!covers("a", "a/b"));
+        assert_eq!(
+            literal_spec(",exclude", "node_modules/"),
+            ":(top,literal,exclude)node_modules"
+        );
     }
 }

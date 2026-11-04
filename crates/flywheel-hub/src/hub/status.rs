@@ -436,7 +436,9 @@ impl Hub {
         let Some(session) = self.event_session(id) else {
             return;
         };
-        // `seen` (on `done` only): someone watched it finish.
+        // `seen` (on a finished turn's `done` only): someone watched it
+        // finish. `turn_finished` (deprecated, same events): kept for
+        // plugins written against it.
         let changed = |status: AgentStatus, previous: Option<AgentStatus>, seen: Option<bool>| {
             self.emit_lifecycle(
                 "status.changed",
@@ -447,6 +449,7 @@ impl Hub {
                     "detail": view.detail,
                     "since": view.since,
                     "seen": seen,
+                    "turn_finished": seen.is_some(),
                 }),
             );
         };

@@ -477,6 +477,9 @@ async fn search_finds_scrollback_transcripts_and_commands_across_sessions() {
     assert_eq!(newest["messages"][0]["kind"], "result");
     assert_eq!(newest["messages"][0]["tool"], "Bash");
     assert_eq!(newest["messages"][0]["text"], "zebra-7f9 Running");
+    // ... and the index of that call (parallel calls' results come back
+    // in any order).
+    assert_eq!(newest["messages"][0]["call_index"], 2);
     let (status, body) = hub
         .call(
             reqwest::Method::GET,

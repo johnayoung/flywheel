@@ -825,6 +825,15 @@ try {
   check(told && told.options[0].label === "1  Use the existing configuration file in the repository root" && told.options[0].detail === "Supercalifragilistic defaults stay as they are"
     && told.options[1].detail === "Writes a new file" && told.options[2].label === "3  Type something." && told.question === "Which config should the setup use?",
     `phone: the agent's own options keep label and description apart (${JSON.stringify(told)})`);
+  // Several questions with the same options: the one on the screen.
+  const twoAsked = [
+    { question: "Use Postgres?", options: [{ label: "Yes", description: "A server database" }, { label: "No", description: "Stay on SQLite" }] },
+    { question: "Enable TLS?", options: [{ label: "Yes", description: "Serve https" }, { label: "No", description: "Plain http behind a proxy" }] }];
+  const secondTab = ["←  ☒ Postgres  ☐ TLS  ✔ Submit  →", "", "Enable TLS?", "", "❯ 1. Yes", "     Serve https", "  2. No",
+    "     Plain http behind a proxy", "  3. Type something.", "", "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"];
+  const onSecond = await mp.evaluate(([l, q]) => window.FwHubPrompt.parse(l, q), [secondTab, twoAsked]);
+  check(onSecond && onSecond.question === "Enable TLS?" && onSecond.options[1].detail === "Plain http behind a proxy",
+    `phone: of two questions with the same options, the one on screen is answered (${JSON.stringify(onSecond)})`);
   const wrappedLines = ["Would you like to run the following command?", "", "  $ cargo test -p parser", "",
     "› 1. Yes, proceed (y)", "  2. Yes, and don't ask again for commands that start with", "     `cargo test -p parser` (p)",
     "  3. No, and tell Codex what to do differently (esc)", "", "  Press enter to confirm or esc to cancel"];
@@ -1154,8 +1163,17 @@ try {
     }
     return statusOf();
   };
+  // The page has the push before time jumps (else it hears of the turn
+  // only after its watcher went quiet).
+  const pageSees = async (id, want) => {
+    for (let i = 0; i < 100; i++) {
+      if (await seenPage.evaluate(([s, w]) => (agentStatus(sessionById(s)) || {}).status === w, [id, want])) return;
+      await sleep(50);
+    }
+  };
   say("e2e-go");
   await until("working");
+  await pageSees(watch.id, "working");
   await seenPage.clock.fastForward("06:00");
   await seenPage.waitForTimeout(500);
   say("e2e-stop");
@@ -1188,6 +1206,51 @@ try {
   await seenPage.evaluate(() => window.dispatchEvent(new Event("focus")));
   got = await until("idle");
   check(got === "idle", `seen: focusing the window counts as back (${got})`);
+  // A split: the watch is per pane. A's turn was watched; B's started
+  // while nobody was here (A still working), so B's end stays done.
+  const wsSplit = await api("POST", "/api/workspaces", { name: "e2e-watch", folders: [repo] });
+  const pair = [];
+  for (const name of ["wa", "wb"]) pair.push(await api("POST", "/api/sessions", { workspace_id: wsSplit.id, kind: "claude", name, cols: 80, rows: 30 }));
+  await api("PUT", `/api/workspaces/${wsSplit.id}/layout`, {
+    rev: 0,
+    tabs: [{ id: "s1", name: "pair", root: split("right", 0.5, pane("sa", pair[0].id), pane("sb", pair[1].id)) }],
+  });
+  await seenPage.goto(`${base}/#session=${pair[0].id}`);
+  await seenPage.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
+  await seenPage.waitForTimeout(1500);
+  const onStage = await seenPage.evaluate(() => document.querySelectorAll("#terminal .pane .xterm").length);
+  check(onStage === 2, `seen: the split shows both agents, a layout saved before this page heard of them (${onStage})`);
+  const sayTo = (id, text) => execFileSync(fw, ["hub", "send", "--state-dir", state, id, `${text}\n`]);
+  const statusFor = async (id) => ((await api("GET", `/api/sessions/${id}`)).agent || {}).status;
+  const untilFor = async (id, want) => {
+    for (let i = 0; i < 100; i++) {
+      if ((await statusFor(id)) === want) return want;
+      await sleep(50);
+    }
+    return statusFor(id);
+  };
+  await seenPage.mouse.move(600, 400);
+  await seenPage.mouse.move(640, 420);
+  sayTo(pair[0].id, "e2e-go");
+  await untilFor(pair[0].id, "working");
+  await pageSees(pair[0].id, "working");
+  await seenPage.clock.fastForward("06:00");
+  await seenPage.waitForTimeout(500);
+  sayTo(pair[1].id, "e2e-go");
+  await untilFor(pair[1].id, "working");
+  await pageSees(pair[1].id, "working");
+  sayTo(pair[0].id, "e2e-stop");
+  got = await untilFor(pair[0].id, "idle");
+  check(got === "idle", `seen: the watched pane of a split is seen when it ends (${got})`);
+  await seenPage.waitForTimeout(500);
+  sayTo(pair[1].id, "e2e-stop");
+  await untilFor(pair[1].id, "done");
+  await seenPage.waitForTimeout(500);
+  got = await statusFor(pair[1].id);
+  check(got === "done", `seen: a split pane's turn started while nobody was here stays done (${got})`);
+  for (const s of pair) await api("DELETE", `/api/sessions/${s.id}`);
+  await seenPage.goto(`${base}/#session=${watch.id}`);
+  await seenPage.waitForSelector("#terminal .pane.focused .xterm", { timeout: 15000 });
 
   // Transcript viewer: tool results are collapsible blocks under their
   // calls (named for the call's tool): a long Bash output shows its first
@@ -1214,10 +1277,13 @@ try {
     more: (a.querySelector(".tx-expand") || {}).textContent || "",
   })));
   let shownResults = await results();
-  check(shownResults.length === 2 && shownResults[0].who === "Bash result" && shownResults[0].open && shownResults[0].lines === 8 && shownResults[0].more === "Show all 20 lines",
+  check(shownResults.length === 2 && shownResults[0].who === "Bash result · for #1 seq 20" && shownResults[0].open && shownResults[0].lines === 8 && shownResults[0].more === "Show all 20 lines",
     `transcript: a long Bash output is a block cut to 8 lines with an expand (${JSON.stringify(shownResults)})`);
-  check(shownResults[1] && shownResults[1].who === "AskUserQuestion result" && shownResults[1].lines === 1 && !shownResults[1].more,
+  check(shownResults[1] && shownResults[1].who === "AskUserQuestion result · for #3 Which color?" && shownResults[1].lines === 1 && !shownResults[1].more,
     `transcript: a question's answers show whole (${JSON.stringify(shownResults[1])})`);
+  const askCall = await seenPage.evaluate(() => [...document.querySelectorAll("#tx-body .tx-msg.kind-tool")].map((a) => a.querySelector("pre").textContent).find((t) => t.startsWith("AskUserQuestion")));
+  check(askCall && askCall.includes("  - question: Which color?") && askCall.includes("      - label: Red") && !askCall.includes("[{"),
+    `transcript: a question call reads as its questions and options, not JSON (${JSON.stringify(askCall)})`);
   await seenPage.locator("#tx-body .tx-expand").first().click();
   shownResults = await results();
   check(shownResults[0].lines === 20 && shownResults[0].more === "Show less", `transcript: expanded, the whole output (${JSON.stringify(shownResults[0])})`);

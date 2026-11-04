@@ -143,6 +143,10 @@ pub struct MessageMeta {
     /// A tool result reporting a failure.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub error: bool,
+    /// A tool result: the index of the call it answers (parallel calls'
+    /// results come back in any order).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_index: Option<u64>,
 }
 
 /// Cut `text` to at most `max` bytes, on a character boundary.
@@ -172,8 +176,9 @@ pub(crate) struct TranscriptIndex {
     pub(crate) meta_bytes: usize,
     /// Most bytes it holds ([`MAX_TRANSCRIPT_BYTES`]).
     pub(crate) cap: usize,
-    /// The newest tool calls' ids and tool names, to name their results.
-    calls: VecDeque<(String, String)>,
+    /// The newest tool calls' ids, tool names and indexes, to name their
+    /// results.
+    calls: VecDeque<(String, String, u64)>,
 }
 
 /// Tool calls remembered to name their results (results follow their
@@ -241,21 +246,19 @@ impl TranscriptIndex {
         };
         let messages = messages_of(self.format, agentlog::parse(self.format, &value, offset));
         for mut message in messages {
+            let mut call_index = None;
             match (message.kind, &message.call) {
                 (MessageKind::Tool, Some(call)) => {
                     if self.calls.len() == CALLS_KEPT {
                         self.calls.pop_front();
                     }
                     let name = message.tool.clone().unwrap_or_default();
-                    self.calls.push_back((call.clone(), name));
+                    self.calls.push_back((call.clone(), name, self.next_index));
                 }
                 (MessageKind::Result, Some(call)) => {
-                    message.tool = self
-                        .calls
-                        .iter()
-                        .rev()
-                        .find(|(id, _)| id == call)
-                        .map(|(_, name)| name.clone());
+                    let found = self.calls.iter().rev().find(|(id, _, _)| id == call);
+                    message.tool = found.map(|(_, name, _)| name.clone());
+                    call_index = found.map(|(_, _, index)| *index);
                 }
                 _ => {}
             }
@@ -270,6 +273,7 @@ impl TranscriptIndex {
                 timestamp: message.timestamp,
                 truncated,
                 error: message.error,
+                call_index,
             };
             self.meta_bytes += meta_cost(&meta);
             self.messages.push_back(meta);

@@ -670,6 +670,9 @@ async function refresh(force = true) {
   }
   state.snapshot = snapshot;
   render();
+  // A pane whose session this page had not heard of yet stood empty.
+  const tab = !phone() && state.view ? activeTab() : null;
+  if (tab && L.panes(tab.root).some((leaf) => leaf.session && !state.panes.has(leaf.id) && sessionById(leaf.session))) renderStage();
   net.defer("usage", () => launcher.rollupsSoon());
 }
 

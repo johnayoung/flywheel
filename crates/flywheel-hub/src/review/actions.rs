@@ -205,14 +205,19 @@ pub(super) fn run_staged_as_planned(
     let as_planned = staged_as_planned(&git, &plan.contents, &plan.excluded);
     if !matches!(as_planned, Ok(true)) {
         let restored = git.out(&["read-tree", &saved]).is_ok();
-        return Err(ActionError::Conflict(format!(
-            "the work tree changed while committing (after the plan was checked): nothing was committed{}; review it again and confirm the new plan",
-            if restored {
-                ""
-            } else {
-                ", but the index could not be put back (git reset to unstage)"
-            }
-        )));
+        let not_restored = if restored {
+            ""
+        } else {
+            ", but the index could not be put back (git reset to unstage)"
+        };
+        return Err(ActionError::Conflict(match as_planned {
+            Err(why) => format!(
+                "what was staged could not be checked ({why}): nothing was committed{not_restored}"
+            ),
+            _ => format!(
+                "the work tree changed while committing (after the plan was checked): nothing was committed{not_restored}; review it again and confirm the new plan"
+            ),
+        }));
     }
     done.extend(run_plan(std::slice::from_ref(commit))?);
     Ok(done)

@@ -768,6 +768,19 @@ window.FwHubSearch = function (ctx) {
     );
   }
 
+  // Which call a result answers (parallel calls' results come back in
+  // any order): its index, and its input's first line (a command).
+  function answers(m) {
+    if (m.call_index == null) return "";
+    const call = viewer.messages.get(m.call_index);
+    // The call's text: its tool, then its input's lines (a list's items
+    // indented, "- key: value"); the first that holds a value.
+    const line = call ? call.text.split("\n").slice(1).find((l) => !/^[\s-]*[\w-]+:$/.test(l)) || "" : "";
+    const first = line.replace(/^[\s-]*[\w-]+: /, "").trim();
+    const shown = first.length > 60 ? `${first.slice(0, 59)}…` : first;
+    return ` · for #${m.call_index}${shown ? ` ${shown}` : ""}`;
+  }
+
   function renderTranscript(scrollToFocus) {
     const body = $("#tx-body");
     const list = [...viewer.messages.values()].sort((a, b) => a.index - b.index);
@@ -780,7 +793,7 @@ window.FwHubSearch = function (ctx) {
     const canSend = !!ctx.handoff && ctx.handoff().targets(viewer.session.session_id).length > 0;
     for (const m of list) {
       const who = m.kind === "tool" ? `tool · ${m.tool || ""}`
-        : m.kind === "result" ? `${m.tool || "tool"} result${m.error ? " · error" : ""}`
+        : m.kind === "result" ? `${m.tool || "tool"} result${m.error ? " · error" : ""}${answers(m)}`
         : m.role;
       nodes.push(el(
         "article",

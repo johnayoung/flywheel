@@ -186,6 +186,19 @@ fn tool_inputs_read_as_key_value_lines() {
     assert_eq!(tool_text(&json!("plain")), "plain");
     assert_eq!(tool_text(&Value::Null), "");
     assert_eq!(tool_text(&json!([1, 2])), "[1,2]");
+    // A question tool's input: its questions and options as items.
+    let asked = json!({"questions": [{
+        "question": "Which color?",
+        "options": [
+            {"label": "Red", "description": "Warm"},
+            {"label": "Blue", "description": "Cool"}
+        ],
+        "multiSelect": false
+    }]});
+    assert_eq!(
+        tool_text(&asked),
+        "questions:\n  - question: Which color?\n    options:\n      - label: Red\n        description: Warm\n      - label: Blue\n        description: Cool\n    multiSelect: false"
+    );
 }
 
 // --- the tail -----------------------------------------------------------

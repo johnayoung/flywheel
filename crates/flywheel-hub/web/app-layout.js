@@ -249,12 +249,16 @@ async function drainLayout(workspaceId) {
     let ok = false;
     for (let attempt = 0; attempt < 4; attempt++) {
       const base = L.clone(state.confirmed[workspaceId] || { rev: 0, tabs: [] });
+      // Panes the hub holds already stay, though this page may not have
+      // heard of their sessions yet (a layout saved elsewhere right after
+      // creating them): the hub drops a removed session's panes itself.
+      const held = base.tabs.flatMap((t) => L.sessionsOf(t.root));
       if (edit(base) === false) {
         ok = true;
         break;
       }
       // Never send a pane for a session this page has not heard of yet.
-      L.prune(base, new Set(state.sessions.filter((s) => s.workspace_id === workspaceId).map((s) => s.id)));
+      L.prune(base, new Set([...held, ...state.sessions.filter((s) => s.workspace_id === workspaceId).map((s) => s.id)]));
       try {
         state.confirmed[workspaceId] = await putLayout(workspaceId, base);
         ok = true;

@@ -156,18 +156,21 @@ window.FwHubPrompt = (function () {
   const norm = (text) => text.replace(/\s+/g, " ").trim();
   // A multi-select option's box ("[ ] ", "[✔] ", "☐ ").
   const BOX = /^(?:\[[ x✓✔]?\]|[☐☒✓✔])\s*/i;
-  function written(run, questions) {
-    for (const q of questions || []) {
+  // Several questions with the same options (Yes / No each): the one
+  // whose text is on the screen above the run, none when it is not shown.
+  function written(run, questions, lines) {
+    const fits = (questions || []).filter((q) => {
       const options = q.options || [];
-      if (!options.length || options.length > run.length) continue;
-      const same = options.every((choice, i) => {
+      if (!options.length || options.length > run.length) return false;
+      return options.every((choice, i) => {
         const shown = norm(run[i].first.replace(BOX, "").replace(HOTKEY, ""));
         const label = norm(choice.label || "");
         return !!shown && !!label && (label.startsWith(shown) || shown.startsWith(label));
       });
-      if (same) return q;
-    }
-    return null;
+    });
+    if (fits.length < 2) return fits[0] || null;
+    const above = norm(lines.slice(0, run[0].index).map(bare).join(" "));
+    return fits.find((q) => q.question && above.includes(norm(q.question))) || null;
   }
 
   // `questions` (optional): the blocked agent's question tool input, as
@@ -225,7 +228,7 @@ window.FwHubPrompt = (function () {
       }
     });
     // As the agent wrote them, when it says (Claude's AskUserQuestion).
-    const asked = written(run, questions);
+    const asked = written(run, questions, lines);
     if (asked) {
       asked.options.forEach((choice, i) => {
         const box = BOX.exec(run[i].first);

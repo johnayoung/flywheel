@@ -133,26 +133,34 @@ window.matchMedia(NARROW).addEventListener("change", () => {
 // though: whoever sat through an agent's work without touching anything
 // is reading the reply when it finishes (seen, not "done"), up to
 // WATCH_MS since their last input (past that, they have gone). One that
-// started while nobody was here (a queued prompt) is not.
+// started while nobody was here (a queued prompt) is not: the watch is
+// per session, so in a split one pane's watched turn does not carry
+// another's.
 const IDLE_MS = 5 * 60 * 1000;
 const WATCH_MS = 30 * 60 * 1000;
 let lastInput = Date.now();
 let idleTimers = [];
-let watched = false;
+const watched = new Set();
 function workingOnScreen() {
   const ids = [state.attached, ...livePanes().filter((p) => onStage(p)).map((p) => p.sessionId)];
-  return ids.some((id) => {
+  return new Set(ids.filter((id) => {
     const session = id && sessionById(id);
     const status = session && agentStatus(session);
     return !!status && status.status === "working";
-  });
+  }));
+}
+// The sessions on screen still watched (none once WATCH_MS passed): a
+// turn stays watched from someone's input during it to its end.
+function watching() {
+  const quiet = Date.now() - lastInput;
+  const working = workingOnScreen();
+  for (const id of watched) if (!working.has(id)) watched.delete(id);
+  if (quiet < IDLE_MS) for (const id of working) watched.add(id);
+  return quiet < WATCH_MS ? watched : new Set();
 }
 function idle() {
   const quiet = Date.now() - lastInput;
-  const working = workingOnScreen();
-  if (!working) watched = false;
-  else if (quiet < IDLE_MS) watched = true;
-  return quiet >= IDLE_MS && !(watched && working && quiet < WATCH_MS);
+  return watching().size === 0 && quiet >= IDLE_MS;
 }
 function present() {
   return document.visibilityState === "visible" && document.hasFocus() && !idle();
@@ -196,10 +204,14 @@ function onStage(pane) {
 
 function currentView() {
   if (!present()) return { session_id: null, visible: [] };
+  // Present only through a watch (no input for IDLE_MS): just the
+  // watched sessions count as looked at.
+  const only = Date.now() - lastInput >= IDLE_MS ? watching() : null;
+  const counts = (id) => !only || only.has(id);
   const session = sessionById(state.attached);
-  const focused = session && session.live ? session.id : null;
+  const focused = session && session.live && counts(session.id) ? session.id : null;
   const visible = livePanes()
-    .filter((p) => p.sessionId && p.sessionId !== focused && onStage(p) && sessionById(p.sessionId)?.live)
+    .filter((p) => p.sessionId && p.sessionId !== focused && onStage(p) && sessionById(p.sessionId)?.live && counts(p.sessionId))
     .map((p) => p.sessionId);
   return { session_id: focused, visible };
 }

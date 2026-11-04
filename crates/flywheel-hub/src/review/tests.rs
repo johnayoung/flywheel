@@ -1159,7 +1159,7 @@ fn commit_all_leaves_out_build_output_and_secrets_unless_told() {
     assert_eq!(
         sorted,
         [
-            ("__pycache__/calc.cpython-313.pyc", "generated", true),
+            ("__pycache__/", "generated", true),
             ("app/.env", "secret", true),
             ("big.bin", "large", false),
             ("certs/server.pem", "secret", true),
@@ -1167,14 +1167,7 @@ fn commit_all_leaves_out_build_output_and_secrets_unless_told() {
     );
     let mut excluded = plan.excluded.clone();
     excluded.sort();
-    assert_eq!(
-        excluded,
-        [
-            "__pycache__/calc.cpython-313.pyc",
-            "app/.env",
-            "certs/server.pem"
-        ]
-    );
+    assert_eq!(excluded, ["__pycache__/", "app/.env", "certs/server.pem"]);
     assert!(
         plan.details
             .iter()
@@ -1250,7 +1243,7 @@ fn commit_all_leaves_out_build_output_and_secrets_unless_told() {
         &t,
         "x",
         Some(&[
-            "__pycache__/calc.cpython-313.pyc".to_owned(),
+            "__pycache__/".to_owned(),
             "app/.env".to_owned(),
             "certs/server.pem".to_owned(),
         ]),
@@ -1297,4 +1290,72 @@ fn commit_all_leaves_a_staged_secret_out_of_a_first_commit() {
         "main.rs"
     );
     assert!(run_git(&repo, &["status", "--porcelain"]).contains("?? .env"));
+}
+
+#[test]
+fn commit_all_classifies_every_change_past_the_review_cut() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    write(wt, "app.js", "console.log(1)\n");
+    // More generated files than the review lists hold, and a secret and
+    // a Cargo target sorted after all of them.
+    for i in 0..(MAX_FILES + 200) {
+        write(wt, &format!("node_modules/pkg/dist/m{i:05}.js"), "x");
+    }
+    write(wt, "zz/.env", "TOKEN=1\n");
+    write(wt, "zz/target/x86_64-unknown-linux-musl/release/app", "elf");
+    let plan = plan_commit(&tools(), &t, "feat: app", None).unwrap();
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    let kinds: Vec<(&str, &str, bool, usize)> = plan
+        .suspects
+        .iter()
+        .map(|s| (s.path.as_str(), s.kind, s.excluded, s.files))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("node_modules/", "generated", true, MAX_FILES + 200),
+            ("zz/.env", "secret", true, 1),
+            ("zz/target/", "generated", true, 1),
+        ]
+    );
+    assert_eq!(
+        plan.summary,
+        format!(
+            "Stage 1 file (leaving {} out) and commit it on feat",
+            MAX_FILES + 202
+        )
+    );
+    let done = commit(&tools(), &t, "feat: app", None, &plan.fingerprint).unwrap();
+    assert!(done.ok, "{done:?}");
+    assert_eq!(
+        run_git(wt, &["show", "--name-only", "--format=", "HEAD"]),
+        "app.js"
+    );
+    // A directory named for leaving out is checked against every change.
+    let named = plan_commit(&tools(), &t, "x", Some(&["zz/target/".to_owned()])).unwrap();
+    assert_eq!(named.refusal, None, "{:?}", named.refusal);
+    assert_eq!(named.excluded, ["zz/target/"]);
+}
+
+#[test]
+fn commit_all_unstages_a_staged_generated_directory() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    write(wt, "lib.py", "x = 1\n");
+    write(wt, "pkg/__pycache__/lib.cpython-313.pyc", "bytecode");
+    run_git(wt, &["add", "-A"]);
+    let plan = plan_commit(&tools(), &t, "feat: lib", None).unwrap();
+    assert_eq!(plan.excluded, ["pkg/__pycache__/"]);
+    commit(&tools(), &t, "feat: lib", None, &plan.fingerprint).unwrap();
+    assert_eq!(
+        run_git(wt, &["show", "--name-only", "--format=", "HEAD"]),
+        "lib.py"
+    );
+    assert!(
+        run_git(wt, &["status", "--porcelain", "--untracked-files=all"])
+            .contains("?? pkg/__pycache__/lib.cpython-313.pyc")
+    );
 }

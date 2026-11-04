@@ -82,8 +82,11 @@ function renderStage() {
   sendView();
 }
 
+// A pane stands empty until its session is known here (a layout saved
+// elsewhere can arrive before the session list): once it is, the shape
+// changes and the stage is rebuilt with its terminal.
 const shape = (node) => (!node ? null : node.type === "pane"
-  ? (node.session === null ? `${node.id}:empty` : node.id)
+  ? (node.session === null || !state.panes.has(node.id) ? `${node.id}:empty` : node.id)
   : [node.dir, shape(node.a), shape(node.b)]);
 
 function buildNode(node, path) {

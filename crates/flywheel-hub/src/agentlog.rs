@@ -142,23 +142,56 @@ fn count(value: &Value, key: &str) -> u64 {
 }
 
 /// A tool's input as text: `key: value` lines for an object (strings as
-/// written, the rest as JSON), a JSON string's content decoded first.
+/// written, scalars and flat arrays as JSON, a list of objects -- an
+/// AskUserQuestion's questions and their options -- as indented `- key:
+/// value` items), a JSON string's content decoded first.
 pub fn tool_text(input: &Value) -> String {
     match input {
         Value::String(text) => match serde_json::from_str::<Value>(text) {
             Ok(parsed @ Value::Object(_)) => tool_text(&parsed),
             _ => text.clone(),
         },
-        Value::Object(fields) => fields
-            .iter()
-            .map(|(key, value)| match value {
-                Value::String(text) => format!("{key}: {text}"),
-                other => format!("{key}: {other}"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        Value::Object(fields) => {
+            let mut lines = Vec::new();
+            fields_text(fields, "", "", &mut lines);
+            lines.join("\n")
+        }
         Value::Null => String::new(),
         other => other.to_string(),
+    }
+}
+
+/// Nesting deeper than this is written as JSON.
+const TOOL_TEXT_DEPTH: usize = 4;
+
+/// `fields` as `key: value` lines, the first starting with `first`, the
+/// rest with `indent`.
+fn fields_text(
+    fields: &serde_json::Map<String, Value>,
+    first: &str,
+    indent: &str,
+    lines: &mut Vec<String>,
+) {
+    for (i, (key, value)) in fields.iter().enumerate() {
+        let lead = if i == 0 { first } else { indent };
+        let items = value.as_array().filter(|items| {
+            indent.len() < TOOL_TEXT_DEPTH * 4
+                && !items.is_empty()
+                && items.iter().all(Value::is_object)
+        });
+        match (value, items) {
+            (_, Some(items)) => {
+                lines.push(format!("{lead}{key}:"));
+                let inner = format!("{indent}    ");
+                for item in items {
+                    if let Value::Object(item) = item {
+                        fields_text(item, &format!("{indent}  - "), &inner, lines);
+                    }
+                }
+            }
+            (Value::String(text), None) => lines.push(format!("{lead}{key}: {text}")),
+            (other, None) => lines.push(format!("{lead}{key}: {other}")),
+        }
     }
 }
 

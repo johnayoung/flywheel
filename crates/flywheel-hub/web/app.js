@@ -92,13 +92,17 @@ async function boot() {
   }
   // Follow an edited or navigated #session= (replaceState fires no
   // hashchange, so this sees only the user's own changes).
-  window.addEventListener("hashchange", () => {
+  window.addEventListener("hashchange", async () => {
     const target = /^#session=([0-9a-f]+)$/.exec(window.location.hash);
     if (!target) {
       if (state.attached) detach();
       return;
     }
     if (target[1] === state.attached) return;
+    // One created since the last list (a link to a new session): look
+    // again before calling it gone.
+    if (!sessionById(target[1])) await refresh().catch(() => {});
+    if (window.location.hash !== target[0]) return;
     if (sessionById(target[1])) openSession(target[1]);
     else if (state.attached) history.replaceState(null, "", `#session=${state.attached}`);
     else detach(STALE_LINK, "Session removed.");

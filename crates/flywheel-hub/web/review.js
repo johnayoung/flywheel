@@ -1060,7 +1060,17 @@ window.FwHubReview = function (ctx) {
           replan(0);
         },
       });
-      return { box, path: s.path, row: el("label", { className: `rva-suspect ${s.kind}` }, box, el("span", { className: "rva-suspect-path", textContent: s.path }), el("span", { className: "rva-suspect-kind", textContent: SUSPECT[s.kind] || s.kind })) };
+      // The tail of a long path tells rows apart: the directory part
+      // gives way first, the name stays whole.
+      const cut = s.path.replace(/\/$/, "").lastIndexOf("/") + 1;
+      const kind = (SUSPECT[s.kind] || s.kind) + (s.files > 1 ? ` · ${s.files} files` : "");
+      const path = el(
+        "span",
+        { className: "rva-suspect-path", title: s.path },
+        el("span", { className: "rva-suspect-dir", textContent: s.path.slice(0, cut) }),
+        el("span", { className: "rva-suspect-name", textContent: s.path.slice(cut) }),
+      );
+      return { box, path: s.path, row: el("label", { className: `rva-suspect ${s.kind}` }, box, path, el("span", { className: "rva-suspect-kind", textContent: kind })) };
     });
     return el(
       "fieldset",

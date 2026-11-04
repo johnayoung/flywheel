@@ -394,7 +394,7 @@ async fn a_worktree_session_is_reviewed_committed_pushed_merged_and_removed() {
     assert_eq!(status, StatusCode::OK, "{plan}");
     assert_eq!(
         plan["suspects"],
-        json!([{ "path": ".env", "kind": "secret", "excluded": true }])
+        json!([{ "path": ".env", "kind": "secret", "excluded": true, "files": 1 }])
     );
     assert_eq!(plan["excluded"], json!([".env"]));
     let (status, plan) = hub

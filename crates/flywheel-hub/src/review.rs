@@ -22,6 +22,7 @@ mod model;
 mod plan;
 pub mod runner;
 mod session;
+mod suspects;
 
 pub use actions::{abort, check_message, commit, merge, pr, push, rebase};
 pub use integrate::{PrRequest, gh_status, plan_abort, plan_merge, plan_pr, plan_rebase};

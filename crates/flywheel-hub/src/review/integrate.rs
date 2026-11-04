@@ -5,6 +5,7 @@ use super::model::{Review, left_right, nul_list, operation, read, url_host};
 use super::plan::{Plan, Planned, PrDefaults, fingerprint, push_destination, refused, tree_state};
 use super::runner;
 use super::runner::Spec;
+use super::suspects::{Suspect, suspects};
 use super::{
     BaseSource, GH_STATUS_TIMEOUT, GH_TIMEOUT, Git, MERGE_TIMEOUT, READ_LIMIT, REBASE_TIMEOUT,
     Target, Tools,
@@ -381,7 +382,35 @@ pub fn plan_abort(tools: &Tools, target: &Target) -> Result<Plan, String> {
 /// checkout (`git merge --ff-only`): refused when the main checkout is
 /// not on the base, has uncommitted changes, or the branch is not a
 /// fast-forward of the base (`needs_rebase`).
-pub fn plan_merge(tools: &Tools, target: &Target) -> Result<Plan, String> {
+/// What a merge would land that looks like a secret, an agent's personal
+/// settings, or build output: the files the branch adds (since it left
+/// the base), judged as commit all judges them.
+fn landed_suspects(git: &Git<'_>, dir: &Path, base: &str, head: &str) -> Vec<Suspect> {
+    let Ok(out) = git.raw(
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--diff-filter=A",
+            &format!("refs/heads/{base}...{head}"),
+        ],
+        READ_LIMIT,
+    ) else {
+        return Vec::new();
+    };
+    if !out.success() {
+        return Vec::new();
+    }
+    let added = nul_list(&out.stdout);
+    let paths: Vec<&str> = added.iter().map(String::as_str).collect();
+    suspects(dir, &paths, None)
+}
+
+/// Plan fast-forwarding the base to a worktree session's branch.
+/// `include_suspects`: land what looks like a secret, personal settings,
+/// or build output anyway (else refused, naming it).
+pub fn plan_merge(tools: &Tools, target: &Target, include_suspects: bool) -> Result<Plan, String> {
     let git = Git::new(tools, &target.dir);
     let Some(worktree) = &target.worktree else {
         return Ok(refused(
@@ -478,6 +507,31 @@ pub fn plan_merge(tools: &Tools, target: &Target) -> Result<Plan, String> {
                 .to_owned(),
         );
     }
+    let suspects = if branch_sha.is_empty() || !base_is_branch {
+        Vec::new()
+    } else {
+        landed_suspects(&git, &target.dir, &base, &branch_sha)
+    };
+    let held: Vec<&str> = suspects
+        .iter()
+        .filter(|s| s.excluded)
+        .map(|s| s.path.as_str())
+        .collect();
+    if !held.is_empty() {
+        let what = format!(
+            "{branch} adds {} that look{} like a secret, an agent's personal settings, or build output: {}",
+            plural(held.len(), "path"),
+            if held.len() == 1 { "s" } else { "" },
+            held.join(", ")
+        );
+        if include_suspects {
+            warnings.push(format!("{what} (landed anyway, as asked)"));
+        } else if refusal.is_none() {
+            refusal = Some(format!(
+                "{what}. Remove them from the branch (git rm --cached, commit), or land them anyway (--include-suspects, or tick it in the dialog)"
+            ));
+        }
+    }
     let command = Planned::new(
         &tools.git,
         &main,
@@ -502,6 +556,11 @@ pub fn plan_merge(tools: &Tools, target: &Target) -> Result<Plan, String> {
         commands: vec![command],
         fingerprint: fingerprint(&[
             "merge",
+            if include_suspects {
+                "include-suspects"
+            } else {
+                ""
+            },
             &branch_sha,
             &main_head,
             main_branch.as_deref().unwrap_or_default(),
@@ -511,7 +570,7 @@ pub fn plan_merge(tools: &Tools, target: &Target) -> Result<Plan, String> {
         needs_rebase,
         defaults: None,
         contents: Vec::new(),
-        suspects: Vec::new(),
+        suspects,
         excluded: Vec::new(),
         files: None,
     })

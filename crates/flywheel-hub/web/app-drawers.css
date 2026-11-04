@@ -604,7 +604,7 @@
 .rva-suspect-dir { overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; direction: rtl; text-align: left; }
 .rva-suspect-name { flex: 0 0 auto; }
 .rva-suspect-kind { color: var(--ink-3); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
-.rva-suspect.secret .rva-suspect-kind { color: var(--alert); }
+.rva-suspect.secret .rva-suspect-kind, .rva-suspect.personal .rva-suspect-kind { color: var(--alert); }
 .rva-suspect.build .rva-suspect-kind { color: var(--ink-2); }
 .rva-hint { margin: 0; color: var(--ink-3); font-size: 11.5px; line-height: 1.5; }
 .rva-refusal, .rva-outcome { white-space: pre-line; overflow-wrap: anywhere; }

@@ -99,7 +99,11 @@ pub enum Action {
     Rebase,
     /// Abort a stopped rebase.
     Abort,
-    Merge,
+    Merge {
+        /// Land what looks like a secret, personal settings, or build
+        /// output anyway.
+        include_suspects: bool,
+    },
 }
 
 impl Action {
@@ -110,7 +114,7 @@ impl Action {
             Self::Pr(_) => "pr",
             Self::Rebase => "rebase",
             Self::Abort => "abort",
-            Self::Merge => "merge",
+            Self::Merge { .. } => "merge",
         }
     }
 }
@@ -336,10 +340,12 @@ impl Hub {
             Action::Pr(request) => super::plan_pr(tools, &target, request),
             Action::Rebase => super::plan_rebase(tools, &target),
             Action::Abort => super::plan_abort(tools, &target),
-            Action::Merge => super::plan_merge(tools, &target),
+            Action::Merge { include_suspects } => {
+                super::plan_merge(tools, &target, *include_suspects)
+            }
         };
         let mut plan = plan.map_err(|e| HubError::from(StateError::Conflict(e)))?;
-        if matches!(action, Action::Merge)
+        if matches!(action, Action::Merge { .. })
             && via == MergeVia::Review
             && let Some(fanout) = self.review_fanout(&target)
         {
@@ -401,7 +407,7 @@ impl Hub {
         // No prompt queue types into an agent of this work tree while git
         // works on it.
         let _held = self.hold_dir(&target.dir, &format!("a review {}", action.name()));
-        if matches!(action, Action::Merge)
+        if matches!(action, Action::Merge { .. })
             && via == MergeVia::Review
             && let Some(why) = self.review_fanout(&target).and_then(|f| f.merge_refusal())
         {
@@ -420,7 +426,9 @@ impl Hub {
             Action::Pr(request) => super::pr(tools, &target, request, confirm),
             Action::Rebase => super::rebase(tools, &target, confirm),
             Action::Abort => super::abort(tools, &target, confirm),
-            Action::Merge => super::merge(tools, &target, confirm),
+            Action::Merge { include_suspects } => {
+                super::merge(tools, &target, *include_suspects, confirm)
+            }
         };
         match &result {
             Ok(outcome) => {
@@ -456,7 +464,7 @@ impl Hub {
                 Action::Push { .. } => "review.pushed",
                 Action::Pr(_) => "review.pr_opened",
                 Action::Rebase => "review.rebased",
-                Action::Merge => "review.merged",
+                Action::Merge { .. } => "review.merged",
                 Action::Abort => "",
             };
             if !event.is_empty()
@@ -477,7 +485,7 @@ impl Hub {
             }
         }
         let worktree = match action {
-            Action::Merge if outcome.ok => self.worktree_info(id).ok(),
+            Action::Merge { .. } if outcome.ok => self.worktree_info(id).ok(),
             _ => None,
         };
         Ok(ActionReport { outcome, worktree })

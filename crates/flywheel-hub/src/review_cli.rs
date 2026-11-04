@@ -58,6 +58,10 @@ pub struct MergeArgs {
     /// to where it was before it).
     #[arg(long, conflicts_with_all = ["rebase", "remove_worktree"])]
     abort_rebase: bool,
+    /// Land files the branch adds that look like secrets, an agent's
+    /// personal settings, or build output (refused otherwise).
+    #[arg(long)]
+    include_suspects: bool,
     /// Print the plan / outcome as JSON.
     #[arg(long)]
     json: bool,
@@ -330,10 +334,11 @@ fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Re
         return abort_rebase(args, &conn, &id, &label, out, err);
     }
     let dry = json!({ "dry_run": true });
+    let merge_dry = json!({ "dry_run": true, "include_suspects": args.include_suspects });
     let mut plan = conn.blocking_call(
         "POST",
         &format!("/api/sessions/{id}/review/merge"),
-        Some(&dry),
+        Some(&merge_dry),
     )?;
     let needs_rebase = plan.get("needs_rebase").and_then(Value::as_bool) == Some(true);
     if needs_rebase && args.rebase {
@@ -382,7 +387,7 @@ fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Re
         plan = conn.blocking_call(
             "POST",
             &format!("/api/sessions/{id}/review/merge"),
-            Some(&dry),
+            Some(&merge_dry),
         )?;
     }
     if let Some(why) = plan.get("refusal").and_then(Value::as_str) {
@@ -414,7 +419,10 @@ fn merge_inner(args: &MergeArgs, out: &mut dyn Write, err: &mut dyn Write) -> Re
     let done = conn.blocking_call(
         "POST",
         &format!("/api/sessions/{id}/review/merge"),
-        Some(&json!({ "confirm": str_field(&plan, "fingerprint") })),
+        Some(&json!({
+            "confirm": str_field(&plan, "fingerprint"),
+            "include_suspects": args.include_suspects,
+        })),
     )?;
     let mut report = json!({ "merge": done });
     if !args.json {

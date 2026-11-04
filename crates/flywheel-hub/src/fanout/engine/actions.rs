@@ -171,7 +171,12 @@ impl Fanouts {
     }
 
     /// What merging `label` into the base would run, or why it cannot.
-    pub fn pick_plan(&self, id: &str, label: &str) -> Result<PickPlan, HubError> {
+    pub fn pick_plan(
+        &self,
+        id: &str,
+        label: &str,
+        include_suspects: bool,
+    ) -> Result<PickPlan, HubError> {
         let hub = self.hub()?;
         let (fanout, candidate) = self.get(&hub, id, label)?;
         let mut plan = PickPlan {
@@ -194,7 +199,7 @@ impl Fanouts {
         let merge = hub.review_plan_via(
             &self.tools,
             &candidate.session_id,
-            &Action::Merge,
+            &Action::Merge { include_suspects },
             MergeVia::FanoutPick,
         )?;
         plan.needs_rebase = merge.needs_rebase;
@@ -211,7 +216,13 @@ impl Fanouts {
 
     /// Merge `label` (the plan with fingerprint `confirm`) and record it
     /// the winner.
-    pub fn pick(&self, id: &str, label: &str, confirm: &str) -> Result<PickReport, HubError> {
+    pub fn pick(
+        &self,
+        id: &str,
+        label: &str,
+        confirm: &str,
+        include_suspects: bool,
+    ) -> Result<PickReport, HubError> {
         let hub = self.hub()?;
         let (fanout, candidate) = self.get(&hub, id, label)?;
         if let Some(why) = self.pick_refusal(&fanout, &candidate) {
@@ -228,7 +239,7 @@ impl Fanouts {
         let planned = hub.review_plan_via(
             &self.tools,
             &candidate.session_id,
-            &Action::Merge,
+            &Action::Merge { include_suspects },
             MergeVia::FanoutPick,
         )?;
         if planned.fingerprint != confirm {
@@ -243,7 +254,7 @@ impl Fanouts {
         let merge = hub.review_run_via(
             &self.tools,
             &candidate.session_id,
-            &Action::Merge,
+            &Action::Merge { include_suspects },
             confirm,
             MergeVia::FanoutPick,
         )?;

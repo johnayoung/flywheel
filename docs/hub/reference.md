@@ -82,7 +82,7 @@ Git and agents together:
 
 ```bash
 fw hub review SESSION [--base REF] [--diff PATH] [--scope committed|staged|unstaged|untracked] [--json] {where}
-fw hub merge SESSION [--yes|-y] [--rebase] [--remove-worktree] [--abort-rebase] [--json] {where}
+fw hub merge SESSION [--yes|-y] [--rebase] [--remove-worktree] [--abort-rebase] [--include-suspects] [--json] {where}
 fw hub handoff FROM TO (--selection-file F|- | --diff [--path P] [--base REF] | --last-command | --command SEQ | --message N) [--to-machine M] [--max-bytes N] [--edit] [--dry-run] [--json] {where}
 fw hub ask-review SESSION [--kind claude|codex] [--base REF] [--model M] [--dry-run] [--findings] [--send-findings] [--json] {where}
 fw hub fanout new WS (--prompt TEXT|- --grader [name=]CMD... | --from-task ID) --agent KIND[:MODEL]... [--folder F] [--base BRANCH] [--name N] [--timeout SECS] [--protect PATH]... [--permission-mode M] [--approval A] [--sandbox S] [--no-commit-instruction] [--json] {where}
@@ -91,7 +91,7 @@ fw hub fanout show FANOUT [--verbose|-v] [--json] {where}
 fw hub fanout wait FANOUT [--timeout SECS] [--json] {where}
 fw hub fanout grade FANOUT CAND {where}
 fw hub fanout fix FANOUT CAND [--yes|-y] [--json] {where}
-fw hub fanout pick FANOUT CAND [--yes|-y] [--rebase] [--json] {where}
+fw hub fanout pick FANOUT CAND [--yes|-y] [--rebase] [--include-suspects] [--json] {where}
 fw hub fanout promote FANOUT [--task-id ID] [--phase NAME] [--goal TEXT] [--reference CAND|none] [--yes|-y] [--json] {where}
 fw hub fanout cleanup FANOUT [CAND...] [--stop-only] [--force] [--yes|-y] [--json] {where}
 fw hub fanout rm FANOUT {where}

@@ -88,6 +88,10 @@ pub(super) struct ActionBody {
     base: Option<String>,
     #[serde(default)]
     draft: bool,
+    /// Merge: land what looks like a secret, personal settings, or build
+    /// output anyway.
+    #[serde(default)]
+    include_suspects: bool,
 }
 
 fn action(name: &str, body: &ActionBody) -> Action {
@@ -107,7 +111,9 @@ fn action(name: &str, body: &ActionBody) -> Action {
         }),
         "rebase" => Action::Rebase,
         "abort" => Action::Abort,
-        _ => Action::Merge,
+        _ => Action::Merge {
+            include_suspects: body.include_suspects,
+        },
     }
 }
 

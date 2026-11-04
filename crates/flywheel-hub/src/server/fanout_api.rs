@@ -111,6 +111,10 @@ pub(super) struct CandidateBody {
     #[serde(default)]
     dry_run: bool,
     confirm: Option<String>,
+    /// Pick: land what looks like a secret, personal settings, or build
+    /// output anyway.
+    #[serde(default)]
+    include_suspects: bool,
 }
 
 pub(super) async fn grade(
@@ -151,13 +155,16 @@ pub(super) async fn pick(
         return Ok(off());
     };
     if body.dry_run {
-        let plan = blocking(move || engine.pick_plan(&id, &body.candidate)).await?;
+        let plan =
+            blocking(move || engine.pick_plan(&id, &body.candidate, body.include_suspects)).await?;
         return Ok(Json(plan).into_response());
     }
     let Some(confirm) = body.confirm else {
         return Err(needs_confirm().into());
     };
-    let report = blocking(move || engine.pick(&id, &body.candidate, &confirm)).await?;
+    let report =
+        blocking(move || engine.pick(&id, &body.candidate, &confirm, body.include_suspects))
+            .await?;
     Ok(Json(report).into_response())
 }
 

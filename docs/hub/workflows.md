@@ -58,7 +58,10 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 | Rebase onto base | `git rebase <base>` in the worktree | uncommitted changes (conflicts stop; Abort) |
 | Merge into base | `git -C <main checkout> merge --ff-only <planned commit>` | main checkout dirty or off base, not a fast-forward |
 
-- **Commit all** checks every changed path, not just the 1000 listed (the plan says how many of how many). Ticked: `generated` (`node_modules/`, `__pycache__/`, `.venv/`, `*.egg-info/`, `.pyc`, a dir with `CACHEDIR.TAG` or `pyvenv.cfg`, `target/` by `Cargo.toml`), `secret` (`.env*`, keys); unticked: `build` (`dist/`, `build/`, `coverage/`, `venv/`, other Cargo-shaped `target/`), `large` (5 MiB+).
+- **Commit all** checks every changed path, not just the 1000 listed. Ticked: `generated` (`node_modules/`, `__pycache__/`, `.venv/`, `*.egg-info/`, `.pyc`, a dir with `CACHEDIR.TAG` or `pyvenv.cfg`, `target/` by `Cargo.toml`); `secret` (`.env*`, keys by name or content, credentials files, `*.tfvars`), `personal` (`.claude/settings.local.json`, `CLAUDE.local.md`).
+- Unticked: `build` (`dist/`, `build/`, `coverage/`, `venv/`, other Cargo-shaped `target/`), `large` (5 MiB+).
+- No git identity: refused before staging; a failed step puts the index back.
+- **Merge** and fan-out **pick** refuse a branch that adds a `generated`/`secret`/`personal` file unless `--include-suspects` (the dialog's box).
 - "Ask the agent" pastes a commit-message or conflict prompt. Runner: argv, no shell or prompts, deadlines, 4 git/gh at once, one action per repo, logged.
 
 ## Handoff and peer review
@@ -145,6 +148,8 @@ Palette **Permissions: FOLDER**, `fw hub perms show`.
 - **View**: Claude Code sources highest first (managed `/etc/claude-code` + `managed-settings.d`, the hub's `--settings` + `--permission-mode`, local at the main checkout's root, project, user), each rule and file; Codex trust (`[projects."<repo>"]`), `approval_policy`, `sandbox_mode` and their sources, `rules/*.rules`.
 - **Always allow** (why?, quick answers' `always`, the sheet): the request from the `PermissionRequest` hook, else the dialog on screen; the narrowest rule (`Bash(cargo test -p app *)`: program, subcommand, scoping flags; else the exact command; one per command of a line).
 - Default file `.claude/settings.local.json` (warned when tracked; untracked-not-ignored: `--gitignore` / the box adds it); user is opt-in. Preview: file, diff, "This lets the agent ...", an overriding deny/ask. Atomic, serialized, keys and layout kept; Yes is typed only if the dialog on screen is that request.
-- **Never proposed**: every command, `rm`, `sudo`, `curl`/`wget`, interpreters, `git push` (also `git -C dir push`), `git *`, `cp`/`mv`/`tee`/`sed`/`awk *`, `gh pr merge`, whole MCP servers, pipes into a shell, substitutions, writes outside the repo or to `.claude/` `.git/`; writing one takes the rule typed back (CLI: on a terminal). `&&` `;` `|` refused.
+- **Never proposed**: every command, `rm`, `sudo`, `curl`/`wget`, interpreters, `git push` (also `git -C dir push`), `git *`, `cp`/`mv`/`tee`/`sed`/`awk *`, `gh pr merge`, `fw`/`flywheel`, `find *`, exec subcommands (`npm exec`, `git rebase`), `timeout 5 *`, whole MCP servers, pipes into a shell, substitutions, writes outside the repo or to `.claude/` `.codex/` `.git/` `.gitmodules` `.mcp.json`.
+- Writing one of those takes the rule typed back (CLI: on a terminal). `&&` `;` `|` refused.
 - **Suggestions**: `permission-requests.jsonl` (0600, 30 days; rules, never commands) per repo, most frequent first, minus what a rule covers.
 - **Codex**: prefix rules to `.codex/rules/default.rules` (loaded once trusted) or `~/.codex`; `trust_level` in `$CODEX_HOME/config.toml`, `approval_policy` / `sandbox_mode` in `.codex/config.toml`; `never` and `danger-full-access` are typed back. Writes: a hub log line and `perms.allowed`.
+- Trusting a project whose `.codex/` holds those, a dangerous rule, or `notify`/`mcp_servers`/hooks is typed back too (listed); a symlinked project `.codex` is refused.

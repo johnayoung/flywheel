@@ -209,6 +209,10 @@ struct PickArgs {
     /// graded again and must pass before it can be picked (run pick again).
     #[arg(long)]
     rebase: bool,
+    /// Land files the candidate adds that look like secrets, an agent's
+    /// personal settings, or build output (refused otherwise).
+    #[arg(long)]
+    include_suspects: bool,
     /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
@@ -855,7 +859,10 @@ fn pick(args: &PickArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
     let io = |e: std::io::Error| e.to_string();
     let url = format!("/api/fanouts/{id}/pick");
     let dry = json!({ "candidate": label, "dry_run": true });
-    let plan = conn.blocking_call("POST", &url, Some(&dry))?;
+    let pick_dry = json!({
+        "candidate": label, "dry_run": true, "include_suspects": args.include_suspects,
+    });
+    let plan = conn.blocking_call("POST", &url, Some(&pick_dry))?;
     let needs_rebase = plan.get("needs_rebase").and_then(Value::as_bool) == Some(true);
     if needs_rebase && args.rebase {
         let rebase_url = format!("/api/fanouts/{id}/rebase");
@@ -942,7 +949,11 @@ fn pick(args: &PickArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32
     let done = conn.blocking_call(
         "POST",
         &url,
-        Some(&json!({ "candidate": label, "confirm": str_field(&merge, "fingerprint") })),
+        Some(&json!({
+            "candidate": label,
+            "confirm": str_field(&merge, "fingerprint"),
+            "include_suspects": args.include_suspects,
+        })),
     )?;
     if args.json {
         write_json(out, &done).map_err(|e| e.to_string())?;

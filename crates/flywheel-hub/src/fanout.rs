@@ -84,8 +84,9 @@ pub const MAX_PIN_BYTES: u64 = 1024 * 1024;
 pub const MAX_GRADING: usize = 2;
 /// Appended to the prompt unless turned off: the merge path lands commits,
 /// so a candidate's work must be committed to be picked.
-pub const COMMIT_INSTRUCTION: &str = "When you are done, commit all of your changes on the \
-     current branch (git add -A, then git commit with a short message) and stop.";
+pub const COMMIT_INSTRUCTION: &str = "When you are done, commit your source changes on the \
+     current branch (not .env files, keys, credentials, .claude/settings.local.json, or build \
+     output) with a short message, and stop.";
 
 /// One grader command (run with `/bin/sh -c` in the candidate's worktree).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

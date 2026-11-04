@@ -2,7 +2,7 @@
 //! as the push remote; scripted stand-ins for `gh`).
 
 use super::*;
-use super::{actions::*, integrate::*, model::*, plan::*};
+use super::{actions::*, integrate::*, model::*, plan::*, suspects::LARGE_FILE_BYTES};
 use crate::git;
 use std::collections::HashMap;
 use std::process::Command;
@@ -654,7 +654,7 @@ fn merge_fast_forwards_the_base_in_the_main_checkout() {
     let f = Fixture::new();
     let wt = &f.wt.path;
     let t = f.target();
-    let nothing = plan_merge(&tools(), &t).unwrap();
+    let nothing = plan_merge(&tools(), &t, false).unwrap();
     assert!(nothing.refusal.unwrap().contains("nothing to merge"));
 
     commit_file(wt, "a.txt", "a\n", "feat: a");
@@ -662,18 +662,18 @@ fn merge_fast_forwards_the_base_in_the_main_checkout() {
 
     // The main checkout off its base: refused.
     run_git(&f.repo, &["checkout", "-q", "-b", "side"]);
-    let plan = plan_merge(&tools(), &t).unwrap();
+    let plan = plan_merge(&tools(), &t, false).unwrap();
     assert!(plan.refusal.unwrap().contains("is on side, not main"));
     run_git(&f.repo, &["checkout", "-q", "main"]);
 
     // Dirty main checkout: refused (untracked files alone are not dirt).
     write(&f.repo, "README", "local edit\n");
-    let plan = plan_merge(&tools(), &t).unwrap();
+    let plan = plan_merge(&tools(), &t, false).unwrap();
     assert!(plan.refusal.unwrap().contains("1 uncommitted change"));
     run_git(&f.repo, &["checkout", "--", "README"]);
     write(&f.repo, "scratch", "x\n");
 
-    let plan = plan_merge(&tools(), &t).unwrap();
+    let plan = plan_merge(&tools(), &t, false).unwrap();
     assert_eq!(plan.refusal, None, "{plan:?}");
     assert!(!plan.needs_rebase);
     assert_eq!(
@@ -688,7 +688,7 @@ fn merge_fast_forwards_the_base_in_the_main_checkout() {
     // The main checkout moves meanwhile: stale.
     std::fs::remove_file(f.repo.join("scratch")).unwrap();
     commit_file(&f.repo, "moved.txt", "m\n", "main moves first");
-    let stale = merge(&tools(), &t, &plan.fingerprint);
+    let stale = merge(&tools(), &t, false, &plan.fingerprint);
     assert!(stale.is_err());
     assert_eq!(
         run_git(&f.repo, &["rev-list", "--count", "HEAD..feat"]),
@@ -697,7 +697,7 @@ fn merge_fast_forwards_the_base_in_the_main_checkout() {
 
     // Base moved on: not a fast-forward, rebase first.
     commit_file(&f.repo, "main.txt", "m\n", "main moves");
-    let plan = plan_merge(&tools(), &t).unwrap();
+    let plan = plan_merge(&tools(), &t, false).unwrap();
     assert!(plan.needs_rebase);
     assert!(
         plan.refusal
@@ -714,9 +714,9 @@ fn merge_fast_forwards_the_base_in_the_main_checkout() {
     let done = rebase(&tools(), &t, &rebase_plan.fingerprint).unwrap();
     assert!(done.ok, "{done:?}");
 
-    let plan = plan_merge(&tools(), &t).unwrap();
+    let plan = plan_merge(&tools(), &t, false).unwrap();
     assert_eq!(plan.refusal, None);
-    let done = merge(&tools(), &t, &plan.fingerprint).unwrap();
+    let done = merge(&tools(), &t, false, &plan.fingerprint).unwrap();
     assert!(done.ok);
     assert_eq!(
         run_git(&f.repo, &["rev-parse", "main"]),
@@ -800,7 +800,7 @@ fn merging_is_for_worktree_sessions_on_a_branch_base() {
         worktree: None,
     };
     assert!(
-        plan_merge(&tools(), &plain)
+        plan_merge(&tools(), &plain, false)
             .unwrap()
             .refusal
             .unwrap()
@@ -826,7 +826,7 @@ fn merging_is_for_worktree_sessions_on_a_branch_base() {
         ..f.target()
     };
     assert!(
-        plan_merge(&tools(), &t)
+        plan_merge(&tools(), &t, false)
             .unwrap()
             .refusal
             .unwrap()
@@ -1121,7 +1121,7 @@ fn merge_runs_the_planned_commit_not_the_moving_branch() {
     let t = f.target();
     commit_file(wt, "a.txt", "a\n", "feat: a");
     let planned = run_git(wt, &["rev-parse", "HEAD"]);
-    let plan = plan_merge(&tools(), &t).unwrap();
+    let plan = plan_merge(&tools(), &t, false).unwrap();
     assert_eq!(plan.refusal, None, "{plan:?}");
     commit_file(wt, "b.txt", "b\n", "unreviewed");
     // Run the plan as planned (what a confirm racing the commit runs).
@@ -1457,4 +1457,60 @@ fn too_many_changes_names_the_untracked_directories() {
     let why = too_many_changes(&Git::new(&tools, wt));
     assert!(why.starts_with("too many changes to plan against (git status is over 64 MiB): untracked directories dist/, node_modules/;"), "{why}");
     assert!(why.contains(".gitignore"), "{why}");
+}
+
+#[test]
+fn merge_refuses_suspect_files_unless_landed_on_purpose() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    commit_file(wt, "src/a.rs", "fn a() {}\n", "feat: a");
+    commit_file(wt, ".env", "API_KEY=x\n", "oops: env");
+    // Forced: a global excludes file may ignore it.
+    write(wt, ".claude/settings.local.json", "{}\n");
+    run_git(wt, &["add", "-f", "--", ".claude/settings.local.json"]);
+    run_git(wt, &["commit", "-q", "-m", "oops: perms"]);
+    let plan = plan_merge(&tools(), &t, false).unwrap();
+    let why = plan.refusal.clone().unwrap();
+    assert!(
+        why.contains(".env") && why.contains(".claude/settings.local.json"),
+        "{why}"
+    );
+    assert!(!why.contains("src/a.rs"), "{why}");
+    let refused = merge(&tools(), &t, false, &plan.fingerprint);
+    assert!(refused.is_err());
+    let plan = plan_merge(&tools(), &t, true).unwrap();
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    assert!(plan.warnings.iter().any(|w| w.contains("landed anyway")));
+    // A fingerprint from the refusing plan does not run the other.
+    let done = merge(&tools(), &t, true, &plan.fingerprint).unwrap();
+    assert!(done.ok);
+}
+
+#[test]
+fn a_failed_commit_puts_the_index_back_and_no_identity_is_refused_first() {
+    let f = Fixture::new();
+    let wt = &f.wt.path;
+    let t = f.target();
+    write(wt, "new.txt", "n\n");
+    write(&f.repo, ".git/hooks/pre-commit", "#!/bin/sh\nexit 1\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            f.repo.join(".git/hooks/pre-commit"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let plan = plan_commit(&tools(), &t, "feat: new", None).unwrap();
+    assert_eq!(plan.refusal, None, "{plan:?}");
+    let err = commit(&tools(), &t, "feat: new", None, &plan.fingerprint).unwrap_err();
+    assert!(err.to_string().contains("put back"), "{err}");
+    assert_eq!(run_git(wt, &["status", "--porcelain"]), "?? new.txt");
+    // No identity: refused before anything is staged.
+    std::fs::remove_file(f.repo.join(".git/hooks/pre-commit")).unwrap();
+    run_git(wt, &["config", "user.name", ""]);
+    let plan = plan_commit(&tools(), &t, "feat: new", None).unwrap();
+    assert!(plan.refusal.unwrap().contains("no identity"));
 }

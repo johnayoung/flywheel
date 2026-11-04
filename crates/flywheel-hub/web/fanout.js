@@ -570,7 +570,25 @@ window.FwHubFanout = function (ctx) {
 
   function pick(f, c) {
     return busy(f, c, "pick", async () => {
-      const plan = await post(f, "pick", { candidate: c.label, dry_run: true });
+      let plan = await post(f, "pick", { candidate: c.label, dry_run: true });
+      // What the candidate adds that looks like a secret, personal
+      // settings, or build output: landed only on purpose.
+      const held = ((plan.merge && plan.merge.suspects) || []).filter((s) => s.excluded);
+      let include = false;
+      if (plan.refusal && !plan.needs_rebase && held.length) {
+        const go = await ask({
+          kicker: "pick winner",
+          title: `${c.label} adds files that may not belong in ${f.base}`,
+          body: [
+            el("p", { className: "sheet-body", textContent: plan.refusal }),
+            el("ul", { className: "fo-plan" }, held.map((s) => el("li", { className: "fo-plan-detail", textContent: s.path }))),
+          ],
+          buttons: [{ label: "Land them anyway", value: "include", tone: "danger" }],
+        });
+        if (go !== "include") return;
+        include = true;
+        plan = await post(f, "pick", { candidate: c.label, dry_run: true, include_suspects: true });
+      }
       if (plan.needs_rebase) {
         // One confirm: the rebase's own commands are shown here.
         const rebasing = (await post(f, "rebase", { candidate: c.label, dry_run: true })).plan;
@@ -606,7 +624,7 @@ window.FwHubFanout = function (ctx) {
         buttons: [{ label: "Merge", value: "merge" }],
       });
       if (go !== "merge") return;
-      const done = await post(f, "pick", { candidate: c.label, confirm: plan.merge.fingerprint });
+      const done = await post(f, "pick", { candidate: c.label, confirm: plan.merge.fingerprint, include_suspects: include });
       await reload();
       if (!done.merge.ok) {
         await ask({ kicker: "pick winner", title: "The merge stopped", body: [el("pre", { className: "fo-cmds", textContent: (done.merge.ran || []).map((r) => `$ ${r.display}\n${r.output}`).join("\n") || done.merge.summary })], buttons: [] });

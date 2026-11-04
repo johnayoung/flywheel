@@ -201,7 +201,20 @@ pub(super) fn run_staged_as_planned(
         .split_last()
         .ok_or_else(|| ActionError::Conflict("the commit plan runs nothing".into()))?;
     let saved = git.out(&["write-tree"]).map_err(unplannable)?;
-    let mut done = run_plan(stage)?;
+    // A step that fails puts the index back as it was: nothing the user
+    // left untracked stays staged.
+    let put_back = |e: ActionError| {
+        let note = if git.out(&["read-tree", &saved]).is_ok() {
+            "the index was put back as it was"
+        } else {
+            "the index could not be put back (git reset to unstage)"
+        };
+        match e {
+            ActionError::Invalid(m) => ActionError::Invalid(format!("{m} ({note})")),
+            ActionError::Conflict(m) => ActionError::Conflict(format!("{m} ({note})")),
+        }
+    };
+    let mut done = run_plan(stage).map_err(put_back)?;
     let as_planned = staged_as_planned(&git, &plan.contents, &plan.excluded);
     if !matches!(as_planned, Ok(true)) {
         let restored = git.out(&["read-tree", &saved]).is_ok();
@@ -219,7 +232,7 @@ pub(super) fn run_staged_as_planned(
             ),
         }));
     }
-    done.extend(run_plan(std::slice::from_ref(commit))?);
+    done.extend(run_plan(std::slice::from_ref(commit)).map_err(put_back)?);
     Ok(done)
 }
 
@@ -418,9 +431,14 @@ pub fn abort(tools: &Tools, target: &Target, confirm: &str) -> Result<Outcome, A
 }
 
 /// Fast-forward the base in the main checkout, as confirmed.
-pub fn merge(tools: &Tools, target: &Target, confirm: &str) -> Result<Outcome, ActionError> {
+pub fn merge(
+    tools: &Tools,
+    target: &Target,
+    include_suspects: bool,
+    confirm: &str,
+) -> Result<Outcome, ActionError> {
     let _lock = RepoLock::take(tools, &target.dir)?;
-    let plan = plan_merge(tools, target).map_err(unplannable)?;
+    let plan = plan_merge(tools, target, include_suspects).map_err(unplannable)?;
     confirmed(&plan, confirm)?;
     let done = run_plan(&plan.commands)?;
     let main = plan.commands[0].dir.clone();

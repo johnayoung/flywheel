@@ -860,6 +860,7 @@ window.FwHubReview = function (ctx) {
         draft: f.draft ? f.draft.checked : false,
       };
     }
+    if (action === "merge") return { include_suspects: !!act.includeSuspects };
     return {};
   }
 
@@ -875,6 +876,7 @@ window.FwHubReview = function (ctx) {
     act.after = null;
     act.prFilled = false;
     act.exclude = null;
+    act.includeSuspects = false;
     act.fields = {};
     const [kicker, title] = TITLES[action];
     $("#rva-kicker").textContent = kicker;
@@ -1048,9 +1050,10 @@ window.FwHubReview = function (ctx) {
   // Commit all: files that look like build output or secrets (left out
   // unless unchecked) or may be build output (dist/, build/) or are large
   // (kept unless checked), one box each.
-  const SUSPECT = { generated: "build output", build: "maybe build output", secret: "secret", large: "5 MiB or more" };
+  const SUSPECT = { generated: "build output", build: "maybe build output", secret: "secret", personal: "personal agent settings", large: "5 MiB or more" };
   function suspectList(plan) {
     const suspects = plan.suspects || [];
+    if (act.action === "merge") return landSuspects(suspects);
     if (act.action !== "commit" || !suspects.length) return null;
     const boxes = suspects.map((s) => {
       const box = el("input", {
@@ -1080,6 +1083,30 @@ window.FwHubReview = function (ctx) {
       { className: "rva-suspects" },
       el("legend", { className: "field-label", textContent: "Leave out of the commit" }),
       ...boxes.map((b) => b.row),
+    );
+  }
+
+  // Merge: what the branch adds that looks like a secret, personal
+  // settings, or build output is refused unless landed on purpose.
+  function landSuspects(suspects) {
+    const held = suspects.filter((s) => s.excluded);
+    if (!held.length) return null;
+    const box = el("input", {
+      type: "checkbox",
+      checked: !!act.includeSuspects,
+      onchange: () => {
+        act.includeSuspects = box.checked;
+        replan(0);
+      },
+    });
+    return el(
+      "fieldset",
+      { className: "rva-suspects" },
+      el("legend", { className: "field-label", textContent: "The branch adds" }),
+      ...held.map((s) => el("p", { className: `rva-suspect ${s.kind}` },
+        el("span", { className: "rva-suspect-path", title: s.path, textContent: s.path }),
+        el("span", { className: "rva-suspect-kind", textContent: SUSPECT[s.kind] || s.kind }))),
+      el("label", { className: "rva-suspect" }, box, el("span", { textContent: "Land them anyway" })),
     );
   }
 

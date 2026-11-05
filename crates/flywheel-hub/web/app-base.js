@@ -107,7 +107,7 @@ const store = {
 // device's overrides, the keymap every shortcut dispatches on, plugins,
 // and the hub.toml view. Made first: the theme and keys below read it.
 const settings = window.FwHubSettings({
-  $, el, icon, store, IS_MAC,
+  $, el, icon, store, IS_MAC, age,
   rawApi: (...args) => rawApi(...args),
   // Settings > Digest (digest.js, created further down).
   digestSection: (rerender) => digests.settingsSection(rerender),

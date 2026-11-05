@@ -137,7 +137,7 @@ pub fn add(state_dir: &Path, name: &str, token: &str, replace: bool) -> Result<(
     let path = file(state_dir, name);
     if path.exists() && !replace {
         return Err(AccountError::Exists(format!(
-            "account {name:?} exists: --replace to change its token"
+            "account {name:?} exists: replace its token instead (CLI: --replace)"
         )));
     }
     let dir = dir(state_dir);

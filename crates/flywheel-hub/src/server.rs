@@ -285,7 +285,14 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             "/api/workspaces/{id}/conversations",
             get(conversations_api::list),
         )
-        .route("/api/claude-accounts", get(conversations_api::accounts))
+        .route(
+            "/api/claude-accounts",
+            get(conversations_api::accounts).post(conversations_api::add_account),
+        )
+        .route(
+            "/api/claude-accounts/{name}",
+            axum::routing::delete(conversations_api::remove_account),
+        )
         .route("/api/kinds", get(list_kinds))
         .route("/api/templates", get(templates_api::list))
         .route("/api/workspaces/{id}/templates", post(templates_api::save))

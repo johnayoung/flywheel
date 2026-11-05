@@ -139,3 +139,15 @@ body:not(.ligatures) :is(.tx-body, #cmd-list, #run-body, .rv-diff, #search-resul
   .pref-device input[type="checkbox"] { width: 22px; height: 22px; }
   .pref-scope .text-btn, .key-actions .text-btn { min-height: 44px; min-width: 44px; }
 }
+
+/* Settings > Agents: Claude accounts. */
+.settings-sub { margin: 1rem 0 0; font: 700 12px var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-2); }
+.acct-list { display: grid; gap: .35rem; margin: 0; padding: 0; list-style: none; }
+.acct-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: .3rem .6rem; padding: .5rem .7rem; border: 1px solid var(--rule-2); border-radius: 2px; background: var(--bg-2); }
+.acct-actions { margin-left: auto; display: inline-flex; gap: .5rem; }
+.acct-replace, .acct-add { display: flex; flex-wrap: wrap; gap: .5rem; flex-basis: 100%; }
+.acct-replace[hidden] { display: none; }
+.acct-add { margin-top: .5rem; }
+.acct-name { flex: 0 1 9rem; }
+.acct-token { flex: 1 1 14rem; min-width: 0; }
+.acct-name, .acct-token { padding: .45rem .55rem; border: 1px solid var(--rule-2); border-radius: 2px; background: var(--bg); color: var(--ink); font: 12px var(--term); }

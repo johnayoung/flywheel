@@ -424,6 +424,170 @@ window.FwHubSettings = function (ctx) {
     if (dialog.open && view.section === "plugins") renderSection();
   }
 
+  // --- Claude accounts (Agents) ------------------------------------------------------
+
+  // Tokens from `claude setup-token`, stored by the hub (0600 files) and
+  // never shown again: the list has names only.
+  const accounts = { list: null, error: "", busy: false, note: "" };
+
+  async function loadAccounts() {
+    try {
+      accounts.list = (await rawApi("GET", "/api/claude-accounts")).accounts || [];
+    } catch (error) {
+      accounts.list = [];
+      accounts.error = error.message;
+    }
+    if (dialog.open && view.section === "agents") renderSection();
+  }
+
+  async function saveAccount(name, token, replace) {
+    if (accounts.busy) return false;
+    accounts.busy = true;
+    accounts.error = "";
+    try {
+      await rawApi("POST", "/api/claude-accounts", { name, token, replace });
+      accounts.note = replace ? `Replaced ${name}'s token.` : `Added ${name}: pick it in the new-session form's Account.`;
+      return true;
+    } catch (error) {
+      accounts.error = error.message;
+      accounts.note = "";
+      return false;
+    } finally {
+      accounts.busy = false;
+      await loadAccounts();
+    }
+  }
+
+  async function removeAccount(name) {
+    accounts.error = "";
+    try {
+      await rawApi("DELETE", `/api/claude-accounts/${encodeURIComponent(name)}`);
+      accounts.note = `Removed ${name}. Sessions launched with it will not relaunch until it is added again.`;
+    } catch (error) {
+      accounts.error = error.message;
+    }
+    await loadAccounts();
+  }
+
+  // A row of inputs and its button (not a <form>: Settings is one already,
+  // and a nested one is invalid): Enter in an input runs it too.
+  function inputGroup(className, inputs, button, run) {
+    button.addEventListener("click", run);
+    for (const input of inputs) {
+      input.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter" || event.isComposing) return;
+        event.preventDefault();
+        run();
+      });
+    }
+    return el("div", { className }, ...inputs, button);
+  }
+
+  function tokenInput(label) {
+    return el("input", {
+      type: "password",
+      className: "acct-token",
+      autocomplete: "off",
+      spellcheck: false,
+      placeholder: "sk-ant-oat01-…",
+      "aria-label": label,
+    });
+  }
+
+  function accountRow(account) {
+    const token = tokenInput(`New token for ${account.name}`);
+    const replaceForm = inputGroup(
+      "acct-replace",
+      [token],
+      el("button", { type: "button", className: "slab ghost", textContent: "Save" }),
+      async () => {
+        if (await saveAccount(account.name, token.value, true)) token.value = "";
+      },
+    );
+    replaceForm.hidden = true;
+    return el(
+      "li",
+      { className: "acct-row" },
+      el("b", { textContent: account.name }),
+      el("span", { className: "field-hint", textContent: `token saved ${ctx.age ? `${ctx.age(account.updated)} ago` : account.updated}`, title: account.updated }),
+      el(
+        "span",
+        { className: "acct-actions" },
+        el("button", {
+          type: "button",
+          className: "text-btn",
+          textContent: "replace token",
+          onclick: () => {
+            replaceForm.hidden = !replaceForm.hidden;
+            if (!replaceForm.hidden) token.focus();
+          },
+        }),
+        el("button", {
+          type: "button",
+          className: "text-btn danger",
+          textContent: "remove",
+          onclick: (event) => {
+            const button = event.currentTarget;
+            if (button.dataset.armed) {
+              removeAccount(account.name);
+              return;
+            }
+            button.dataset.armed = "1";
+            button.textContent = "click again to remove";
+            setTimeout(() => {
+              delete button.dataset.armed;
+              button.textContent = "remove";
+            }, 4000);
+          },
+        }),
+      ),
+      replaceForm,
+    );
+  }
+
+  function accountsSection() {
+    if (!accounts.list) {
+      loadAccounts();
+      return [el("p", { className: "sheet-body", textContent: "Loading Claude accounts…" })];
+    }
+    const name = el("input", {
+      className: "acct-name",
+      maxLength: 40,
+      autocomplete: "off",
+      spellcheck: false,
+      placeholder: "work",
+      "aria-label": "Account name",
+    });
+    const token = tokenInput("Token");
+    const add = inputGroup(
+      "acct-add",
+      [name, token],
+      el("button", { type: "button", className: "slab", textContent: "Add account", disabled: accounts.busy }),
+      async () => {
+        if (await saveAccount(name.value.trim(), token.value, false)) {
+          name.value = "";
+          token.value = "";
+        }
+      },
+    );
+    return [
+      el("h3", { className: "settings-sub", textContent: "Claude accounts" }),
+      el(
+        "p",
+        { className: "sheet-body settings-note" },
+        "Run another Claude subscription beside your login: sign in as it, run ",
+        el("code", { textContent: "claude setup-token" }),
+        ", paste the token here. A Claude session launched with it (the new-session form's Account) bills that account; settings, MCP, and transcripts stay shared. Tokens are stored on the hub (0600) and never shown again.",
+      ),
+      accounts.list.length
+        ? el("ul", { className: "acct-list" }, ...accounts.list.map(accountRow))
+        : el("p", { className: "sheet-body", textContent: "No accounts: sessions use the CLI's own login." }),
+      add,
+      accounts.error ? el("p", { className: "form-error", role: "alert", textContent: accounts.error }) : null,
+      accounts.note ? el("p", { className: "tpl-note", textContent: accounts.note }) : null,
+    ];
+  }
+
   function renderBadge() {
     const gear = $("#settings-gear");
     if (!gear) return;
@@ -1003,6 +1167,7 @@ window.FwHubSettings = function (ctx) {
     else if (section === "plugins") nodes = pluginsSection();
     else if (section === "server") nodes = serverSection();
     else if (section === "digest") nodes = ctx.digestSection(() => renderSection());
+    else if (section === "agents") nodes = [...prefsSection(section), ...accountsSection()];
     else nodes = prefsSection(section);
     const scroll = body.scrollTop;
     body.replaceChildren(...nodes.filter(Boolean));
@@ -1015,6 +1180,9 @@ window.FwHubSettings = function (ctx) {
     renderNav();
     loadPlugins();
     loadConfig();
+    accounts.note = "";
+    accounts.error = "";
+    loadAccounts();
     if (!dialog.open) dialog.showModal();
     renderSection();
     load().then(() => renderSection());

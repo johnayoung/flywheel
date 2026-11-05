@@ -19,7 +19,7 @@ fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it wait
 ## Agent launcher
 
 - **Resume** (`--resume ID`, `--continue`, the dialog's **Conversation**): a new session picks up one of the folder's Claude Code or Codex conversations (`fw hub conversations WS --kind K`); one open in a running session is refused. Relaunch and hub restarts already resume a session's own conversation.
-- **Accounts** (Claude): `claude setup-token` as the other account, `fw hub account add work`, then `--account work` or the dialog's **Account** (per workspace). Spawns get `CLAUDE_CODE_OAUTH_TOKEN`: one `~/.claude` serves both; rows show `@work`. A key in Claude's settings `env` outranks it.
+- **Accounts** (Claude): `claude setup-token` as the other account, Settings > Agents (or `fw hub account add work`), then `--account work` or the dialog's **Account** (per workspace). Spawns get `CLAUDE_CODE_OAUTH_TOKEN`: one `~/.claude` serves both; rows show `@work`. A key in Claude's settings `env` outranks it.
 - **First prompt** (`--prompt`, 32 KiB): the first user turn, on create only. **Model**: `claude --model` / `codex -m`.
 - **Permissions**: Claude `--permission-mode` (`bypassPermissions` warns, marks the session `unchecked`); Codex `-a` approval, `-s` sandbox; reapplied on relaunch and restore.
 - **Templates** (per workspace): kind, prompt, model, permissions, worktree; a taken name needs `--replace` (all) or `--edit` (given flags). Launch: palette, `new --template NAME` (flags win). Defaults: `[agents.*]`.

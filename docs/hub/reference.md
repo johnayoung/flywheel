@@ -328,6 +328,10 @@ Sections: Appearance, Terminal (incl. lite mode), Keyboard (pane prefix, key bar
 
 ## Keyboard shortcuts
 
+In a terminal (fixed): **Shift+Enter** types a newline (`^J`: a new prompt line in Claude Code and Codex, Enter in a shell). **Ctrl+C** with a selection copies it (none: `^C`); **Ctrl+V** pastes (an image-only clipboard sends `^V`, for Claude Code's image paste). macOS keeps Ctrl for the terminal (Cmd+C/V). Shift+drag selects under mouse reporting.
+
+`session.reference` (`alt+i`) puts another session into the focused one, at the cursor and unsent: a reference its agent reads live (`fw hub read <id> --source recent --lines 200`, same machine only), or that session's last 200 lines, pasted.
+
 Defaults, all rebindable (Settings > Keyboard). `mod` = Ctrl (Cmd on macOS); `alt` = Alt (Ctrl Option on macOS); `prefix.*` keys follow `prefix.arm` when the pane prefix is on (twice sends `^B`).
 
 | Action | Default | Does |
@@ -343,6 +347,7 @@ Defaults, all rebindable (Settings > Keyboard). `mod` = Ctrl (Cmd on macOS); `al
 | `session.next` | `alt+down` | Next session |
 | `session.rename` | `alt+r` | Rename the attached session |
 | `session.close` | `alt+w` | Close the attached session |
+| `session.reference` | `alt+i` | Reference another session in the focused one |
 | `share.open` | - | Share the attached session (read-only link) |
 | `record.toggle` | - | Start or stop recording the attached session |
 | `commands.toggle` | `alt+c` | Suggested commands drawer |

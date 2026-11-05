@@ -118,6 +118,48 @@ window.FwHubPanes = function (ctx) {
     }
   }
 
+  // Terminal keys a browser terminal would otherwise lose. Returning false
+  // keeps the key from xterm (it would send ^C, ^V, or a plain Enter):
+  // - Shift+Enter: a newline (^J), which Claude Code and Codex insert in
+  //   the prompt instead of submitting it; a shell runs the line as Enter.
+  // - Ctrl+C with a selection (Ctrl+Insert): copy it, as in Windows
+  //   Terminal; with none, ^C (interrupt) as always.
+  // - Ctrl+V (Shift+Insert): the browser's paste, which xterm sends as one
+  //   (bracketed) paste.
+  // On a Mac, Cmd+C/Cmd+V already copy and paste, so Ctrl keeps its
+  // terminal meaning.
+  function clipboardKey(term, event) {
+    const key = event.key;
+    const ctrl = event.ctrlKey && !event.altKey && !event.metaKey;
+    if (key === "Enter" && event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      if (event.type === "keydown") {
+        event.preventDefault();
+        term.input("\n");
+      }
+      return false;
+    }
+    const copy = (!ctx.IS_MAC && ctrl && !event.shiftKey && (key === "c" || key === "C") && term.hasSelection()) ||
+      (ctrl && !event.shiftKey && key === "Insert");
+    if (copy) {
+      if (event.type === "keydown") {
+        event.preventDefault();
+        const text = term.getSelection();
+        if (text) {
+          ctx.copyText(text).then((ok) => {
+            if (!ok) ctx.toast("Copy failed: this browser refused the clipboard.", { tone: "bad" });
+          });
+        }
+        term.clearSelection();
+      }
+      return false;
+    }
+    const paste = (!ctx.IS_MAC && ctrl && !event.shiftKey && (key === "v" || key === "V")) ||
+      (event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && key === "Insert");
+    // No preventDefault: the browser's paste event is the paste.
+    if (paste) return false;
+    return true;
+  }
+
   function create(paneId) {
     const head = el("header", { className: "pane-head" });
     const host = el("div", { className: "pane-term" });
@@ -181,6 +223,21 @@ window.FwHubPanes = function (ctx) {
       pane.search = search;
       term.open(host);
       muteQueries(term);
+      term.attachCustomKeyEventHandler((event) => clipboardKey(term, event));
+      // A paste without text (an image on the clipboard): ^V, so an agent
+      // that reads the clipboard itself (Claude Code) attaches the image.
+      // Capture phase, ahead of xterm's own listener on its textarea.
+      host.addEventListener(
+        "paste",
+        (event) => {
+          const data = event.clipboardData;
+          if (!data || data.getData("text/plain") || !data.types.length) return;
+          event.preventDefault();
+          event.stopPropagation();
+          pane.input("\x16");
+        },
+        true,
+      );
       term.onData((data) => pane.input(ctx.transformInput(data)));
       term.onBinary((data) => {
         // Legacy mouse reports only: sent when the link is up, never queued.

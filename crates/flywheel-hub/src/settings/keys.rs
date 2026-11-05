@@ -124,6 +124,12 @@ pub const ACTIONS: &[ActionSpec] = &[
         &["alt+w"],
     ),
     global(
+        "session.reference",
+        "Sessions",
+        "Reference another session in the focused one",
+        &["alt+i"],
+    ),
+    global(
         "share.open",
         "Sessions",
         "Share the attached session (read-only link)",

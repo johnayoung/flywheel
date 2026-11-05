@@ -52,6 +52,9 @@ function paletteCommands() {
       cmd(`Relaunch ${attached.name}`, "same session, fresh process", () => relaunch(attached.id), "redo");
     }
     cmd(`Close ${attached.name}`, k("session.close"), () => closeSession(attached.id), "x");
+    if (attached.live) {
+      cmd(`Reference another session in ${attached.name}…`, [k("session.reference"), "a live pointer its agent reads, or that session's output"].filter(Boolean).join(": "), () => referenceSession(), "send");
+    }
     cmd("Detach", "close every pane here; the sessions keep running", () => detach(), "chev");
   }
   if (state.view && !phone()) {
@@ -382,6 +385,7 @@ const GLOBAL_ACTIONS = {
   "session.prev": () => jumpBy(-1),
   "session.rename": () => (state.attached ? startRename(state.attached) : false),
   "session.close": () => (state.attached ? closeSession(state.attached) : false),
+  "session.reference": () => referenceSession(),
   "commands.toggle": () => {
     review.close();
     commands.toggle();
@@ -459,6 +463,96 @@ window.addEventListener(
   },
   true,
 );
+
+// --- session references ----------------------------------------------
+
+// How much of a referenced session's output a reference reads or a paste
+// takes: the last lines of its scrollback and screen.
+const REFERENCE_LINES = 200;
+
+// Put another session into the focused one's input, typed at its cursor
+// (nothing is submitted): a live reference its agent reads when it needs
+// to (`fw hub read`, against the hub both run on), or that session's
+// recent output, pasted.
+function referenceSession() {
+  const pane = focusedPane();
+  const target = pane && pane.term && sessionById(pane.sessionId);
+  if (!target || !target.live) return false;
+  const others = orderedSessions().filter((s) => s.id !== target.id && s.live);
+  if (!others.length) {
+    commands.toast("No other session with a terminal to reference.");
+    return true;
+  }
+  const items = others.map((source) => {
+    const workspace = workspaceById(source.workspace_id);
+    return {
+      group: "Sessions",
+      glyph: glyphFor(source.kind),
+      label: source.name,
+      hint: `${source.machine ? `${source.machine} · ` : ""}${workspace ? workspace.name : ""} · ${statusLook(source).label}`,
+      run: () => referenceMenu(pane, target, source),
+    };
+  });
+  openPalette("", items, `Reference a session in ${target.name}`);
+  return true;
+}
+
+function referenceMenu(pane, target, source) {
+  const items = [];
+  // `fw hub read` inside the target reaches its own hub: a session on
+  // another machine is only reachable from there by pasting its output.
+  if ((source.machine || "") === (target.machine || "")) {
+    items.push({
+      group: "Reference",
+      glyph: "send",
+      label: `Reference ${source.name}`,
+      hint: "a pointer the agent follows: fw hub read, live when it reads",
+      run: () => typeInto(pane, target, referenceText(source)),
+    });
+  }
+  items.push({
+    group: "Reference",
+    glyph: "copy",
+    label: `Paste ${source.name}'s output`,
+    hint: `its last ${REFERENCE_LINES} lines, as they are now`,
+    run: () => pasteOutput(pane, target, source),
+  });
+  openPalette("", items, `${source.name} into ${target.name}`);
+}
+
+function referenceText(source) {
+  return `the hub session "${source.name}" (read its terminal with \`fw hub read ${source.id} --source recent --lines ${REFERENCE_LINES}\`) `;
+}
+
+async function pasteOutput(pane, target, source) {
+  let screen;
+  try {
+    screen = await api("GET", `/api/sessions/${source.id}/screen?source=recent&lines=${REFERENCE_LINES}`);
+  } catch (err) {
+    commands.toast(`Could not read ${source.name}: ${err.message}`, { tone: "bad" });
+    return;
+  }
+  const lines = (screen.lines || []).map((line) => line.replace(/\s+$/, ""));
+  while (lines.length && !lines[0]) lines.shift();
+  while (lines.length && !lines[lines.length - 1]) lines.pop();
+  if (!lines.length) {
+    commands.toast(`${source.name} has no output yet.`);
+    return;
+  }
+  const fence = lines.some((line) => line.startsWith("```")) ? "````" : "```";
+  typeInto(pane, target, `Output of the hub session "${source.name}" (last ${lines.length} lines):\n${fence}\n${lines.join("\n")}\n${fence}\n`);
+}
+
+// As a paste (bracketed when the program asked), so nothing in the text
+// submits the line; refused when the pane moved on to another session.
+function typeInto(pane, target, text) {
+  if (pane.disposed || !pane.term || pane.sessionId !== target.id) {
+    commands.toast(`${target.name} is no longer in that pane.`, { tone: "bad" });
+    return;
+  }
+  pane.term.paste(text);
+  pane.term.focus();
+}
 
 // --- chrome actions --------------------------------------------------
 

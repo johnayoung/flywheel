@@ -122,6 +122,11 @@ Fan-outs off: 503.
 | GET | `/api/activity[?since=&until=&ws=&session=&kind=&limit=&cursor=&machines=none]` | rows newest first, `next` (a `cursor`), `partial`; unknown selector: 404 |
 | GET | `/api/activity/digest[?since=&client=&until=&ws=&session=]` | the away digest ([hub-workflows](workflows.md#activity)); `since=last-seen` needs `client` |
 | POST | `/api/activity/seen` | `{"client"}` -> 204: its `last-seen` is now |
+| GET | `/api/digest` | schedule, `next`, `recent`, `push` host ([hub-workflows](workflows.md#digests)) |
+| GET | `/api/digest/preview[?since=]` | a digest, neither sent nor kept |
+| POST | `/api/digest/send` | `{"since"?}` -> the digest sent, `delivery` |
+| PUT | `/api/digest/config` | `{"times","timezone"?,"channels"?,"quiet_if_empty"?}` -> rewrites hub.toml `[digest]`; 422, 409 |
+| GET | `/api/digests/{id}` | one of the last 14 |
 
 Times: RFC 3339, unix ms, an age (`90m`), `last-seen`. `ws`, `session`: id, prefix, or name. `kind`: comma list (`review` = `review.*`); beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A peer or `machines=none`: this hub alone.
 
@@ -239,6 +244,7 @@ Close codes: **4001** token rotated, **4002** logout / login expired, **4003** p
 | `plugins` / `plugin_toast` | / `"plugin","message","tone"` | plugins changed / a plugin's toast |
 | `activity` | `"row"` | a journal row was written |
 | `away` | `"since","until"` | back after 10+ min: its digest span |
+| `digest` | `"id"` | a digest was sent (`GET /api/digests/{id}`) |
 
 Client sends `{"type":"view","session_id","visible"?:[ids],"present"?}`: what is on screen counts as viewed; `present`: someone is at the page.
 
@@ -286,6 +292,7 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `autopilot.approval_needed` | `task_id`, `run_id`, `instruction`, `gate`, `attempt` (once per gate, attempt) |
 | `autopilot.approved` | `task_id`, `run_id`, `gate`, `attempt`, `command_id`, `feedback` (bool, not the text) |
 | `autopilot.denied` | as `approved` |
+| `digest.ready` | `digest`: as `GET /api/digests/{id}`; no `session` |
 
 ## Prompt queues
 

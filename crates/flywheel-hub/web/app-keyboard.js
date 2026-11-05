@@ -93,6 +93,7 @@ function paletteCommands() {
   launcher.paletteItems(cmd);
   search.paletteItems(cmd);
   activity.paletteItems(cmd);
+  digests.paletteItems(cmd);
   commands.paletteItems(cmd);
   flywheel.paletteItems(cmd);
   fanout.paletteItems(cmd);

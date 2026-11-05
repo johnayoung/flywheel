@@ -83,11 +83,12 @@ async function boot() {
   // A link to a folder's Flywheel panel (`#flywheel=<path>`, a browser
   // notification's) or to an autopilot gate (`#gate=<run id>`, a push's):
   // open that panel, then drop the hash.
-  const panelLink = /^#(flywheel|gate)=(.+)$/.exec(window.location.hash);
+  const panelLink = /^#(flywheel|gate|digest)=(.+)$/.exec(window.location.hash);
   if (panelLink) {
     history.replaceState(null, "", window.location.pathname);
     const value = decodeURIComponent(panelLink[2]);
     if (panelLink[1] === "flywheel") flywheel.open(value);
+    else if (panelLink[1] === "digest") digests.follow(`#digest=${value}`);
     else if (/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
       flywheel.reload().catch(() => {}).then(() => flywheel.openGate(value)).then((found) => {
         if (!found) commands.toast("That gate is no longer waiting: it was decided, or its run moved on.", { timeout: 6000 });
@@ -123,6 +124,7 @@ async function boot() {
   });
   startPolling();
   connectEvents();
+  if (!panelLink) digests.start();
 }
 
 boot();

@@ -1,0 +1,15 @@
+/* flywheel hub -- the scheduled digest card (digest.js) and Settings >
+   Digest. The card reuses the "while you were away" card's parts
+   (app-activity.css: .away, .away-stats, .away-list). */
+
+.digest-card { z-index: 31; }
+.digest-spaces { font-size: 11px; color: var(--ink-2); }
+.digest-ws { padding: .15rem .1rem; overflow-wrap: anywhere; }
+.digest-ws b { color: var(--ink); }
+.digest-blocked { color: var(--alert); }
+.digest-channels { display: flex; flex-wrap: wrap; gap: .6rem; }
+.digest-actions { display: flex; flex-wrap: wrap; gap: .5rem; padding-top: .5rem; }
+
+@media (max-width: 720px) {
+  .digest-actions .slab { flex: 1; min-height: 2.6rem; }
+}

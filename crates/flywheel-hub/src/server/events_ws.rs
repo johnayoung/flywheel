@@ -266,6 +266,7 @@ fn event_message(hub: &Hub, client: &str, event: HubEvent) -> Option<Message> {
             text(json!({ "type": "layout", "workspace_id": workspace_id, "rev": rev }))
         }
         HubEvent::Activity { row } => text(json!({ "type": "activity", "row": row })),
+        HubEvent::Digest { id } => text(json!({ "type": "digest", "id": id })),
         HubEvent::Sessions
         | HubEvent::Unwatched { .. }
         | HubEvent::Lifecycle { .. }

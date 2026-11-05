@@ -372,6 +372,8 @@ function onPush(message, machine) {
     pullRequests.onActivity(message.row);
   } else if (message.type === "away" && !machine) {
     activity.onAway(message);
+  } else if (message.type === "digest" && !machine) {
+    digests.onPush(message);
   } else if (!machine && ["settings", "config", "plugins", "plugin_toast"].includes(message.type)) {
     settings.onPush(message);
   }

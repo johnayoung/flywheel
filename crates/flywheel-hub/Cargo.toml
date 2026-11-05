@@ -68,6 +68,12 @@ x509-parser = "0.18"
 time = { version = "0.3", default-features = false, features = ["std"] }
 ratatui = "0.29"
 crossterm = "0.28"
+# Scheduled digests (`digest/schedule.rs`): "08:00 in Europe/Berlin" across
+# DST changes needs the IANA rules; chrono-tz compiles them in (the same on
+# every box, musl and containers without /usr/share/zoneinfo included), and
+# iana-time-zone (already chrono's) names the system's zone for the default.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+iana-time-zone = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true

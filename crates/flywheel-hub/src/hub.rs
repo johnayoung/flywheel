@@ -403,6 +403,8 @@ pub enum HubEvent {
     },
     /// A row was added to the activity journal (see [`crate::activity`]).
     Activity { row: serde_json::Value },
+    /// A scheduled or hand-sent digest is ready (see [`crate::digest`]).
+    Digest { id: String },
 }
 
 /// Facts about the server-owned PTY (present until the session is removed

@@ -447,6 +447,11 @@ impl Hub {
                     );
                     return;
                 }
+                // The digest service writes its own row, whatever its
+                // channels (see `digest_row`).
+                if event == "digest.ready" {
+                    return;
+                }
                 if event == "session.removed"
                     && let Some(id) = payload.pointer("/session/id").and_then(Value::as_str)
                     && let Some(draft) = self.activity().forget(id)
@@ -850,6 +855,7 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
                 }
             }
         }
+        "digest.ready" => return Some(digest_row(payload.get("digest").unwrap_or(&Value::Null))),
         "record.started" => draft("started recording".to_owned())
             .with_id("recording", str_at(payload, "/recording/name")),
         "record.stopped" => draft("stopped recording".to_owned())
@@ -857,6 +863,35 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
             .with("reason", str_at(payload, "/reason")),
         _ => return None,
     })
+}
+
+/// The row a digest sent makes: its label, headline counts, and how many
+/// items need you (never the items' text).
+pub(crate) fn digest_row(digest: &Value) -> Draft {
+    let label = str_at(digest, "/label").unwrap_or("manual");
+    let needs = digest
+        .get("needs_you")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let turns = digest
+        .pointer("/totals/turns_finished")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let blocked = digest
+        .pointer("/totals/blocked_now")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let what = if label == "manual" {
+        "sent a digest".to_owned()
+    } else {
+        format!("sent the {label} digest")
+    };
+    Draft::new(
+        "digest.ready",
+        format!("{what}: {turns} turns finished, {blocked} blocked, {needs} need you"),
+    )
+    .with_id("digest", str_at(digest, "/id"))
+    .with("needs_you", needs)
 }
 
 /// `n` as the sidebar and `fw hub ls` show counts (`950`, `110.0k`, `2.3M`).

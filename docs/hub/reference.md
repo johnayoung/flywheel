@@ -72,6 +72,7 @@ Agent output:
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N] {where}
 fw hub search QUERY [--regex] [--case] [--session S] [--workspace W] [--kind K]... [--source scrollback|transcript|commands]... [--limit N] [--per-session N] [--offset N] [--json] {where}  # 1: no hits
 fw hub activity [--since AGE|TIME|last-seen] [--until T] [--workspace W] [--session S] [--kind K]... [--limit N] [--json] {where}
+fw hub digest [--since AGE|TIME] [--send] [--json] {where}  # a preview unless --send
 fw hub record start SESSION [--json] {remote}
 fw hub record stop SESSION [--json] {remote}
 fw hub record ls [--json] {remote}
@@ -237,6 +238,12 @@ reviewer = "other"         # other (claude <-> codex) | same | claude | codex
 
 [queue]
 typing_quiet = "8s"        # no typing this long before a queue delivers
+
+[digest]                   # scheduled summaries; off until times are set
+times = ["08:00", "18:00"] # local times in timezone
+timezone = "Europe/Berlin" # IANA name; default the system's
+channels = ["push", "browser", "plugin"]
+quiet_if_empty = true      # skip a scheduled one with nothing in it
 ```
 
 | Key | Flag | Default | Applies |
@@ -268,6 +275,10 @@ typing_quiet = "8s"        # no typing this long before a queue delivers
 | `shares.max_expiry` | `--share-max-expiry` | `"30d"` | live |
 | `review.reviewer` | - | `"other"` | live |
 | `queue.typing_quiet` | - | `"8s"` (1s-10m) | live |
+| `digest.times` | - | `[]` (off; at most 8) | live |
+| `digest.timezone` | - | the system's, else UTC | live |
+| `digest.channels` | - | all three | live |
+| `digest.quiet_if_empty` | - | `true` | live |
 
 Elsewhere: push (`notify.toml`: secrets), detection overrides (`agent-detection/`), plugins (`plugins/`), UI settings (`settings.json`).
 
@@ -307,7 +318,7 @@ command = ["./summarize.py"]  # optional: else the top-level one
 
 `Alt ,` or the sidebar gear; stored by the hub (`settings.json`), any can be kept for **this device** only.
 
-Sections: Appearance, Terminal (incl. lite mode), Keyboard (pane prefix, key bar, shortcuts), Notifications, Agents (new-session defaults), Plugins (enable, runs, logs), Server (effective hub.toml, read-only).
+Sections: Appearance, Terminal (incl. lite mode), Keyboard (pane prefix, key bar, shortcuts), Notifications, Agents (new-session defaults), Plugins (enable, runs, logs), Digest (writes hub.toml `[digest]` only), Server (effective hub.toml, read-only).
 
 **Key bindings**: up to 4 per action, `mod+...+key`. Refused (422): keys the browser/OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: `alt+b/f`, `ctrl+<letter>`.
 
@@ -397,4 +408,4 @@ All files 0600, the dir 0700.
 - `token`; `logins.json` (login-cookie digests); `state.json` (workspaces, sessions, layouts, templates, fan-outs, queues; schema 5); `settings.json`; `hub.toml`, `notify.toml`.
 - `server.json`, `serve.lock`, `report.sock`, `handoff.sock` (the running hub's address, lock, sockets); `hub.log[.1..3]`.
 - `machines.json` (plaintext credentials), `peers.json`, `shares.json` (digests); `commands/<id>.json` (suggested blocks + usage), `usage-archive.json` (removed sessions').
-- `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` (local CA); `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` (clients' last-active times); `open-<id>.html` (`open` redirect pages).
+- `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` (local CA); `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` (clients' last-active times); `digest.json`, `digest.lock` (last slot, recent digests); `open-<id>.html` (`open` redirect pages).

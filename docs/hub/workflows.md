@@ -145,6 +145,14 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 - **Kept** in `activity.jsonl` (rotated at 1 MiB or a week, 30 days): kind, ids, names, short facts; never terminal output, prompts, commands, grader output, paths; token-shaped words are `[redacted]`.
 - **While you were away** (back after 10+ min): turns finished, blocked now, fan-outs graded, commands suggested, cost. **Machines**: asked at once (4 s each), merged, labelled; a silent one makes it `partial`.
 
+## Digests
+
+Off until `hub.toml` `[digest] times` is set ([hub-reference](reference.md#hubtoml); Settings > Digest writes that table). `fw hub digest` previews; `--send` sends now.
+
+- **Says**, since the last digest, per workspace: turns finished, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, longest blocked, red PRs, stalled queues) with links.
+- **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty ones are skipped (`quiet_if_empty`).
+- **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it.
+
 ## Permissions
 
 Palette **Permissions: FOLDER**, `fw hub perms show`.

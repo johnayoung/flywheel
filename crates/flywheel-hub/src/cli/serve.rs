@@ -328,13 +328,14 @@ pub(super) fn serve_cmd(
              scripting verbs will not find this hub): {e}"
         );
     }
+    // Where a push's or digest's link opens the hub: where a phone reaches it.
+    let link_base = public_urls
+        .first()
+        .or_else(|| tailscale.as_ref().and_then(|ts| ts.serve_urls.first()))
+        .cloned();
     let notifier = match notify {
         Some(mut config) => {
-            // A push's click opens the hub where a phone reaches it.
-            config.click_base = public_urls
-                .first()
-                .or_else(|| tailscale.as_ref().and_then(|ts| ts.serve_urls.first()))
-                .cloned();
+            config.click_base.clone_from(&link_base);
             match Notifier::new(config) {
                 Ok(notifier) => {
                     let _enter = runtime.enter();
@@ -399,6 +400,31 @@ pub(super) fn serve_cmd(
         let _enter = runtime.enter();
         plugins.watch(&hub);
     }
+    // Scheduled digests: hub.toml [digest], read on every look.
+    let digest = crate::digest::DigestService::new(
+        hub.state_dir(),
+        {
+            let config = Arc::clone(&config);
+            move || config.current().digest
+        },
+        notifier.clone(),
+        flywheel.clone(),
+        link_base,
+    );
+    {
+        let _enter = runtime.enter();
+        digest.start(&hub);
+    }
+    let schedule = digest.config();
+    if schedule.enabled() {
+        let _ = writeln!(
+            out,
+            "digests: {} {} -> {}",
+            schedule.times_text().join(", "),
+            schedule.timezone.name(),
+            schedule.channels.names().join(", ")
+        );
+    }
     // hub.toml edits: live keys in force at once, the UI told.
     if let Err(e) = config.attach(&hub, Some(Arc::clone(&plugins))) {
         let _ = writeln!(
@@ -411,6 +437,7 @@ pub(super) fn serve_cmd(
         allowed_origins,
         trusted_proxies: effective.trusted_proxies.clone(),
         notifier,
+        digest: Some(digest),
         flywheel,
         review_tools,
         fanouts,

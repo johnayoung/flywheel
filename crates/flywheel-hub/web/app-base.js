@@ -109,6 +109,8 @@ const store = {
 const settings = window.FwHubSettings({
   $, el, icon, store, IS_MAC,
   rawApi: (...args) => rawApi(...args),
+  // Settings > Digest (digest.js, created further down).
+  digestSection: (rerender) => digests.settingsSection(rerender),
   toast: (...args) => commands.toast(...args),
   // The attached session when it is this hub's (plugins run here).
   attachedLocal: () => {
@@ -619,6 +621,18 @@ const activity = window.FwHubActivity({
     if (search.isOpen()) search.close(false);
     explain.close();
   },
+});
+
+// Scheduled digests (digest.js): the digest card, its notification, and
+// Settings > Digest.
+const digests = window.FwHubDigest({
+  $, el, icon, rawApi, store, pwa, sessionById, prefs: settings,
+  toast: (...args) => commands.toast(...args),
+  openSession: (id) => openSession(id),
+  openGate: (run) => flywheel.reload().catch(() => {}).then(() => flywheel.openGate(run)).then((found) => {
+    if (!found) commands.toast("That gate is no longer waiting: it was decided, or its run moved on.", { timeout: 6000 });
+  }),
+  openActivity: (since) => activity.open({ since }),
 });
 
 // Agent permission rules (perms.js): the Permissions sheet and "Always

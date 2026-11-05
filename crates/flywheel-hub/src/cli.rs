@@ -130,6 +130,11 @@ enum HubCommand {
     /// now, fan-outs graded, commands suggested, cost; then the activity
     /// timeline (this hub and its machines), newest first.
     Activity(crate::activity_cli::ActivityArgs),
+    /// The digest since the last one (or --since): per workspace, turns
+    /// finished, agents blocked, fan-outs graded, PRs, autopilot, queue
+    /// stalls, spend, and the top items that need you; previewed, or sent
+    /// now with --send. Scheduled ones: hub.toml [digest].
+    Digest(crate::digest_cli::DigestArgs),
     /// A session's git work: its branch against its base (commits,
     /// changed files with +/- counts), and staged, unstaged, and untracked
     /// changes apart; --diff PATH prints one file's diff.
@@ -677,6 +682,7 @@ fn dispatch_verb(
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),
         HubCommand::Search(args) => crate::search_cli::run(&args, out, err),
         HubCommand::Activity(args) => crate::activity_cli::run(&args, out, err),
+        HubCommand::Digest(args) => crate::digest_cli::run(&args, out, err),
         HubCommand::Review(args) => crate::review_cli::review(&args, out, err),
         HubCommand::Merge(args) => crate::review_cli::merge(&args, out, err),
         HubCommand::Fanout(args) => crate::fanout_cli::main(&args, out, err),
@@ -869,6 +875,7 @@ mod tests {
             &["send", "x", "hi"],
             &["kill", "x"],
             &["activity"],
+            &["digest"],
         ] {
             let mut args = verb.to_vec();
             args.extend(["--state-dir", state]);

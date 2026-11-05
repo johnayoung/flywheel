@@ -68,6 +68,9 @@ pub struct FileConfig {
     pub review: ReviewSection,
     #[serde(default)]
     pub queue: QueueSection,
+    /// Scheduled digests (see [`crate::digest`]).
+    #[serde(default)]
+    pub digest: crate::digest::DigestSection,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -381,6 +384,7 @@ pub struct Effective {
     pub share_policy: crate::share::SharePolicy,
     pub reviewer: ReviewerChoice,
     pub queue_typing_quiet: Duration,
+    pub digest: crate::digest::DigestConfig,
     sources: Vec<(&'static str, Source)>,
 }
 
@@ -422,6 +426,10 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("shares.max_expiry", Apply::Live),
     ("review.reviewer", Apply::Live),
     ("queue.typing_quiet", Apply::Live),
+    ("digest.times", Apply::Live),
+    ("digest.timezone", Apply::Live),
+    ("digest.channels", Apply::Live),
+    ("digest.quiet_if_empty", Apply::Live),
 ];
 
 impl Effective {
@@ -507,6 +515,10 @@ impl Effective {
             "shares.max_expiry" => json!(crate::share::format_ttl(self.share_policy.max_ttl)),
             "review.reviewer" => json!(self.reviewer.as_str()),
             "queue.typing_quiet" => json!(crate::share::format_ttl(self.queue_typing_quiet)),
+            "digest.times" => json!(self.digest.times_text()),
+            "digest.timezone" => json!(self.digest.timezone.name()),
+            "digest.channels" => json!(self.digest.channels.names()),
+            "digest.quiet_if_empty" => json!(self.digest.quiet_if_empty),
             _ => Value::Null,
         }
     }
@@ -893,6 +905,22 @@ pub fn resolve(
         file_quiet,
         crate::queue::DEFAULT_TYPING_QUIET
     );
+    let digest = match crate::digest::DigestConfig::resolve(&file.digest) {
+        Ok(digest) => digest,
+        Err(found) => {
+            errors.extend(found);
+            crate::digest::DigestConfig::default()
+        }
+    };
+    let section = &file.digest;
+    for (key, set) in [
+        ("digest.times", section.times.is_some()),
+        ("digest.timezone", section.timezone.is_some()),
+        ("digest.channels", section.channels.is_some()),
+        ("digest.quiet_if_empty", section.quiet_if_empty.is_some()),
+    ] {
+        sources.push((key, if set { Source::File } else { Source::Default }));
+    }
     if !errors.is_empty() {
         return Err(errors);
     }
@@ -917,6 +945,7 @@ pub fn resolve(
         share_policy,
         reviewer,
         queue_typing_quiet,
+        digest,
         sources,
     })
 }
@@ -1107,6 +1136,16 @@ impl std::fmt::Debug for ConfigWatch {
     }
 }
 
+/// Why a settings write was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteError {
+    /// The values asked for are invalid (each `key: why`).
+    Invalid(Vec<String>),
+    /// The file cannot take them as asked (invalid on disk, unreadable,
+    /// shaped so it cannot be rewritten in place).
+    Conflict(String),
+}
+
 /// What reloading the file did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reload {
@@ -1290,6 +1329,55 @@ impl ConfigWatch {
         })
     }
 
+    /// Replace the file's `[digest]` table with `section` (Settings >
+    /// Digest): the rest of the file is kept line for line, the whole is
+    /// checked to resolve before it is written (atomically, its mode
+    /// kept), then reloaded. Refused while the file on disk is invalid or
+    /// sets `digest` keys some other way (a dotted key, an inline table).
+    pub fn write_digest(&self, section: &crate::digest::DigestSection) -> Result<(), WriteError> {
+        crate::digest::DigestConfig::resolve(section).map_err(WriteError::Invalid)?;
+        let _ = self.reload();
+        if let Some(error) = self.error() {
+            return Err(WriteError::Conflict(format!(
+                "{} is invalid; fix it first: {error}",
+                self.path.display()
+            )));
+        }
+        let text = match std::fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(WriteError::Conflict(format!(
+                    "cannot read {}: {e}",
+                    self.path.display()
+                )));
+            }
+        };
+        let by_hand = |why: String| {
+            WriteError::Conflict(format!(
+                "cannot rewrite [digest] in {} ({why}); edit it by hand",
+                self.path.display()
+            ))
+        };
+        let spliced = crate::digest::splice_section(&text, section).map_err(&by_hand)?;
+        let file = parse(&spliced).map_err(&by_hand)?;
+        if file.digest != *section {
+            return Err(by_hand(
+                "it sets digest keys outside a [digest] table".to_owned(),
+            ));
+        }
+        resolve(&file, &self.flags, self.home.as_deref())
+            .map_err(|errors| by_hand(errors.join("; ")))?;
+        crate::util::write_atomic(
+            &self.path,
+            spliced.as_bytes(),
+            crate::util::FileMode::KeepOr(0o600),
+        )
+        .map_err(|e| WriteError::Conflict(format!("cannot write {}: {e}", self.path.display())))?;
+        let _ = self.reload();
+        Ok(())
+    }
+
     /// The `GET /api/config` / `fw hub config show` view.
     pub fn view(&self) -> Value {
         let state = self.lock();
@@ -1374,6 +1462,12 @@ reviewer = "other"         # other (claude <-> codex) | same | claude | codex
 
 [queue]
 typing_quiet = "8s"        # no typing this long before a queue delivers
+
+[digest]                   # scheduled summaries; off until times are set
+times = ["08:00", "18:00"] # local times in timezone
+timezone = "Europe/Berlin" # IANA name; default the system's
+channels = ["push", "browser", "plugin"]
+quiet_if_empty = true      # skip a scheduled one with nothing in it
 "#;
 
 #[cfg(test)]

@@ -65,6 +65,7 @@ mod ca_page;
 mod commands_api;
 mod deflate;
 mod detect_api;
+mod digest_api;
 mod events_ws;
 mod fanout_api;
 mod flywheel_api;
@@ -181,6 +182,8 @@ pub struct ServerOptions {
     /// Push notifications (`--notify-url` / `notify.toml`), for the
     /// notify API (`GET /api/notify`, `POST /api/notify/test`).
     pub notifier: Option<Arc<crate::notify::Notifier>>,
+    /// Scheduled digests (`GET /api/digest`, `fw hub digest`).
+    pub digest: Option<Arc<crate::digest::DigestService>>,
     /// The Flywheel panel's monitor (`/api/flywheel*` and the events
     /// socket's `flywheel` messages); `None` turns the panel off.
     pub flywheel: Option<Arc<crate::flywheel::FlywheelMonitor>>,
@@ -369,6 +372,14 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/activity", get(activity_api::list))
         .route("/api/activity/digest", get(activity_api::digest))
         .route("/api/activity/seen", post(activity_api::seen))
+        .route("/api/digest", get(digest_api::view))
+        .route("/api/digest/preview", get(digest_api::preview))
+        .route("/api/digest/send", post(digest_api::send))
+        .route(
+            "/api/digest/config",
+            axum::routing::put(digest_api::put_config),
+        )
+        .route("/api/digests/{id}", get(digest_api::get_one))
         .route("/api/sessions/{id}/transcript", get(search_api::transcript))
         .route("/api/login-codes", post(mint_login_code))
         .route("/api/token/rotate", post(rotate_token))

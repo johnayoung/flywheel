@@ -272,6 +272,8 @@ pub struct Push {
     pub priority: &'static str,
     pub tags: String,
     pub click: Option<String>,
+    /// ntfy action buttons that open a URL: (label, url), at most three.
+    pub actions: Vec<(String, String)>,
 }
 
 /// The push for `subject` (`None` unless it is blocked or done).
@@ -324,6 +326,7 @@ pub fn compose(subject: &Subject, click_base: Option<&str>, detail: bool) -> Opt
                 subject.session_id
             )
         }),
+        actions: Vec::new(),
     })
 }
 
@@ -354,18 +357,47 @@ pub fn compose_gate(payload: &serde_json::Value, click_base: Option<&str>, detai
                 format!("{}/", base.trim_end_matches('/'))
             }
         }),
+        actions: Vec::new(),
     }
 }
 
+/// ntfy's `Actions` header for `actions` (`view, <label>, <url>; ...`):
+/// at most three, labels without the header's separators, and only http(s)
+/// URLs.
+fn actions_header(actions: &[(String, String)]) -> Option<String> {
+    let parts: Vec<String> = actions
+        .iter()
+        .filter(|(_, url)| {
+            (url.starts_with("https://") || url.starts_with("http://"))
+                && !url.contains([',', ';', ' '])
+        })
+        .take(3)
+        .map(|(label, url)| {
+            let label: String = clean(label)
+                .chars()
+                .map(|c| {
+                    if matches!(c, ',' | ';' | '=' | '"') {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            format!("view, {}, {url}", bounded(label.trim(), 40))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 /// Control characters out, whitespace runs to one space.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     text.split(|c: char| c.is_whitespace() || c.is_control())
         .filter(|w| !w.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn bounded(text: &str, max: usize) -> String {
+pub(crate) fn bounded(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_owned();
     }
@@ -454,6 +486,9 @@ impl Notifier {
         if let Some(click) = &push.click {
             headers.push(("Click", header_text(click)));
         }
+        if let Some(actions) = actions_header(&push.actions) {
+            headers.push(("Actions", header_text(&actions)));
+        }
         if let Some(token) = &self.config.token {
             headers.push(("Authorization", format!("Bearer {token}")));
         } else if let Some(basic) = basic_auth(&self.config.url) {
@@ -500,6 +535,7 @@ impl Notifier {
             priority: "default",
             tags: "flywheel,test".into(),
             click: self.config.click_base.clone(),
+            actions: Vec::new(),
         })
         .await
     }

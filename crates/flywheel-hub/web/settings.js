@@ -473,6 +473,7 @@ window.FwHubSettings = function (ctx) {
     ["notifications", "Notifications"],
     ["agents", "Agents"],
     ["plugins", "Plugins"],
+    ["digest", "Digest"],
     ["server", "Server"],
   ];
   const dialog = $("#dlg-settings");
@@ -1001,6 +1002,7 @@ window.FwHubSettings = function (ctx) {
     if (section === "keyboard") nodes = [...prefsSection("keyboard"), ...keysSection()];
     else if (section === "plugins") nodes = pluginsSection();
     else if (section === "server") nodes = serverSection();
+    else if (section === "digest") nodes = ctx.digestSection(() => renderSection());
     else nodes = prefsSection(section);
     const scroll = body.scrollTop;
     body.replaceChildren(...nodes.filter(Boolean));

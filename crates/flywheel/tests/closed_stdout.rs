@@ -36,8 +36,8 @@ fn read_only_verb_exits_quietly_when_stdout_closes() {
     assert!(stderr.is_empty(), "{stderr}");
 }
 
-/// `fw hub` verbs that print a lot, piped into `head -1` against a running
-/// hub: exit 0 and nothing on stderr (one closed-pipe policy for every
+/// `fw hub` verbs that print a lot, piped into a reader that is gone
+/// against a running hub: exit 0 and nothing on stderr (one closed-pipe policy for every
 /// verb, `util::quiet_on_closed_pipe`).
 #[cfg(target_os = "linux")]
 #[test]
@@ -71,45 +71,74 @@ fn hub_verbs_exit_quietly_when_stdout_closes() {
     let started = fw(&["start", "--port", "0"]);
     assert!(started.status.success(), "{started:?}");
     let _stop = Stop(&fw);
-    // A shell that printed thousands of matching lines.
-    let made = fw(&[
-        "new",
-        "big",
-        "--create",
-        "--folder",
-        repo.to_str().unwrap(),
-        "--",
-        "/bin/sh",
-        "-c",
-        "i=0; while [ $i -lt 4000 ]; do echo \"needle-$i-padding-padding-padding-padding\"; \
-         i=$((i+1)); done; echo printed-all; sleep 600",
-    ]);
-    assert!(made.status.success(), "{made:?}");
-    let id = String::from_utf8(made.stdout).unwrap().trim().to_owned();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let read = fw(&["read", &id]);
-        if String::from_utf8_lossy(&read.stdout).contains("printed-all") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the shell never finished printing"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+    // Two shells that printed thousands of matching lines (search shows
+    // at most 1000 hits a session).
+    let mut ids = Vec::new();
+    for name in ["big", "big2"] {
+        let made = fw(&[
+            "new",
+            name,
+            "--create",
+            "--folder",
+            repo.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "i=0; while [ $i -lt 4000 ]; do echo \"needle-$i-padding-padding-padding-padding-padding-padding-padding\"; \
+             i=$((i+1)); done; echo printed-all; sleep 600",
+        ]);
+        assert!(made.status.success(), "{made:?}");
+        ids.push(String::from_utf8(made.stdout).unwrap().trim().to_owned());
     }
-    // Each prints well past the pipe buffer after `head` has exited.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for id in &ids {
+        loop {
+            let read = fw(&["read", id]);
+            if String::from_utf8_lossy(&read.stdout).contains("printed-all") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the shell never finished printing"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    // The reader exits without reading anything, so a verb printing more
+    // than a pipe holds (64 KiB) must hit the closed pipe, however the
+    // processes are scheduled. (`head -n 1` would read an unknown amount
+    // first: a verb whose output fit in that plus the pipe never saw it
+    // closed.)
+    const PAST_THE_PIPE: usize = 2 * 64 * 1024;
     let state_arg = state.display().to_string();
-    let read = format!("read {id} --source recent --lines 4000 --json");
-    for verb in [
-        "search needle --limit 2000 --per-session 1000",
-        "search needle --limit 2000 --per-session 1000 --json",
-        read.as_str(),
-        "activity --limit 500 --json",
+    let read = format!("read {} --source recent --lines 4000 --json", ids[0]);
+    for (verb, big) in [
+        ("search needle --limit 2000 --per-session 1000", true),
+        ("search needle --limit 2000 --per-session 1000 --json", true),
+        (read.as_str(), true),
+        // Short here; it shares the closed-pipe policy all the same.
+        ("activity --limit 500 --json", false),
     ] {
         let (name, rest) = verb.split_once(' ').unwrap();
+        if big {
+            let mut argv = vec![name, "--state-dir", state_arg.as_str()];
+            argv.extend(rest.split(' '));
+            let all = Command::new(bin)
+                .arg("hub")
+                .args(&argv)
+                .env("HOME", &root)
+                .env_remove("XDG_STATE_HOME")
+                .env_remove("FW_HUB_TOKEN")
+                .output()
+                .unwrap();
+            assert!(
+                all.stdout.len() > PAST_THE_PIPE,
+                "fw hub {verb} prints only {} bytes: not past the pipe",
+                all.stdout.len()
+            );
+        }
         let script = format!(
-            "'{bin}' hub {name} --state-dir '{state_arg}' {rest} | head -n 1 >/dev/null; \
+            "'{bin}' hub {name} --state-dir '{state_arg}' {rest} | true; \
              exit \"${{PIPESTATUS[0]}}\""
         );
         let output = Command::new("bash")

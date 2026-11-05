@@ -45,7 +45,8 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// A stand-in agent: dumps its environment, draws `<dir>/<name>.screen`,
-/// then records the first key it is sent in `<dir>/<name>.answer`.
+/// then records the first key it is sent in `<dir>/<name>.answer` (written to a
+/// temp file and renamed, so a reader never sees it half-written).
 fn fake_agent(dir: &Path, name: &str) -> PathBuf {
     let path = dir.join(name);
     let d = dir.join(name);
@@ -54,7 +55,7 @@ fn fake_agent(dir: &Path, name: &str) -> PathBuf {
         &format!(
             "#!/bin/sh\nenv > '{d}.env.tmp' && mv '{d}.env.tmp' '{d}.env'\n\
              cat '{d}.screen'\nstty raw -echo\n\
-             key=$(dd bs=1 count=1 2>/dev/null)\nprintf '%s' \"$key\" > '{d}.answer'\nsleep 600\n",
+             key=$(dd bs=1 count=1 2>/dev/null)\nprintf '%s' \"$key\" > '{d}.answer.tmp' && mv '{d}.answer.tmp' '{d}.answer'\nsleep 600\n",
             d = d.display()
         ),
     );

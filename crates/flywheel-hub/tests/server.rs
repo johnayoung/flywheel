@@ -2067,6 +2067,13 @@ async fn a_clean_shutdown_restores_shells_in_place_on_the_next_open() {
     let eid = exited["id"].as_str().unwrap().to_owned();
     wait_state(&hub, &eid, "exited").await;
     send_input(&hub, &sid, json!({"data": "cd sub", "enter": true})).await;
+    // Typed only at the prompt after the cd: typed ahead, its echo comes
+    // before that prompt and the output lands on the prompt's line.
+    hub.wait_screen(&sid, |s| {
+        let lines: Vec<String> = lines_of(s).into_iter().filter(|l| !l.is_empty()).collect();
+        lines.iter().any(|l| l == "$ cd sub") && lines.last().is_some_and(|l| l == "$")
+    })
+    .await;
     send_input(&hub, &sid, json!({"data": "pwd", "enter": true})).await;
     let marker = deeper.display().to_string();
     hub.wait_screen(&sid, |s| lines_of(s).contains(&marker))

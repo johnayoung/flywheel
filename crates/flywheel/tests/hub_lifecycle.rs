@@ -171,10 +171,13 @@ fn fake_agents(env: &Env) {
 }
 
 /// Each launch of fake agent `name` so far: its `cwd=`, `secret=`, and
-/// `arg=` lines.
+/// `arg=` lines. Only finished records count (each is several writes,
+/// ended by `---`): one being written is not a launch yet.
 fn launches(env: &Env, name: &str) -> Vec<Vec<String>> {
     let log = std::fs::read_to_string(env.root.join(format!("{name}.log"))).unwrap_or_default();
-    log.split("---\n")
+    let finished = log.rfind("---\n").map_or(0, |end| end + "---\n".len());
+    log[..finished]
+        .split("---\n")
         .filter(|l| !l.trim().is_empty())
         .map(|l| l.lines().map(str::to_owned).collect())
         .collect()

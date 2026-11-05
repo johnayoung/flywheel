@@ -348,14 +348,19 @@ fn fast_burst(tag: &str, n: usize) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lite_viewer_gets_a_bounded_update_rate_ending_on_the_emulators_screen() {
     let hub = TestHub::start().await;
-    // A status line redrawn as fast as sh can for two seconds, a log line
-    // now and then, then the end.
+    // A status line redrawn as fast as sh can for two seconds (and at
+    // least 100 times, so a slow machine still logs), a log line now and
+    // then, then the end. Each turn redraws it 40 times in one write, more
+    // than a lite update sends as it came (1 KiB): however fast the shell
+    // runs, an update spanning a turn is a frame.
+    let burst = "$s".repeat(40);
     let id = hub
-        .session(
-            "read go; end=$(($(date +%s) + 2)); i=0; while [ $(date +%s) -lt $end ]; do \
-             i=$((i+1)); printf '\\r\\033[2K\\033[33m*\\033[0m working %d' $i; \
-             [ $((i % 200)) -eq 0 ] && printf '\\nlog %d\\n' $i; done; printf '\\nall done\\n'; sleep 30",
-        )
+        .session(&format!(
+            "read go; end=$(($(date +%s) + 2)); i=0; \
+             while [ $(date +%s) -lt $end ] || [ $i -lt 100 ]; do \
+             i=$((i+1)); s=\"\\r\\033[2K\\033[33m*\\033[0m working $i\"; printf \"{burst}\"; \
+             [ $((i % 50)) -eq 0 ] && printf '\\nlog %d\\n' $i; done; printf '\\nall done\\n'; sleep 30",
+        ))
         .await;
     let fps = 5;
     let mut viewer = Viewer::new(

@@ -453,15 +453,17 @@ async fn queued_prompts_go_one_finished_turn_at_a_time_in_order() {
     assert_eq!(hub.session(&agent.id).await["queue"]["pending"], 0);
 
     // Edits and removals keep to pending items; a shell has no queue.
-    let item = hub.add(&agent.id, "typo", None).await["item"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    // Paused first: the finished turn would take an item added to a
+    // running queue at its next tick.
     hub.post(
         &format!("/api/sessions/{}/queue/pause", agent.id),
         json!({}),
     )
     .await;
+    let item = hub.add(&agent.id, "typo", None).await["item"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let (status, edited) = hub
         .call(
             reqwest::Method::PATCH,
@@ -639,12 +641,15 @@ async fn the_hubs_own_pastes_count_as_typing_and_a_draft_is_kept_across_an_answe
     agent.fire("SessionStart", None).await;
     status_is(&hub, &agent.id, "idle").await;
     sleep(Duration::from_secs(2)).await;
-    hub.add(&agent.id, "queued meanwhile", None).await;
+    // Paused before the item goes in: added to a running queue, the item
+    // is deliverable at once and the next tick could send it before a
+    // pause landed.
     hub.post(
         &format!("/api/sessions/{}/queue/pause", agent.id),
         json!({}),
     )
     .await;
+    hub.add(&agent.id, "queued meanwhile", None).await;
     // A paste the hub makes (handoff, send findings, a plugin action, the
     // paste API) types into the agent: the queue waits it out like keys.
     hub.post(

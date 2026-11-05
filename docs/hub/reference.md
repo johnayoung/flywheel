@@ -53,6 +53,12 @@ Sessions:
 fw hub ls [--json] {where}
 fw hub new WS [--kind shell|claude|codex] [--folder PATH|LABEL] [--name N] [--create] [--worktree TASK] [--base REF] [--json] {where} [-- ARGV...]
     [--prompt TEXT|-] [--model M] [--permission-mode P] [--approval A] [--sandbox S] [--template NAME]
+    [--resume ID | --continue]  # agents: pick up a conversation of the folder (no --prompt, no --worktree)
+    [--account NAME]  # claude: run under that account's token instead of the CLI's login
+fw hub account ls [--json] [--state-dir DIR]
+fw hub account add NAME [--replace] [--state-dir DIR]  # token from `claude setup-token`, on stdin (no echo)
+fw hub account rm NAME [--state-dir DIR]
+fw hub conversations WS [--kind claude|codex] [--folder PATH|LABEL] [--limit N] [--json] {where}  # newest first: id, time, title or first prompt
 fw hub template ls [WS] [--json] {where}
 fw hub template save WS NAME [--kind claude|codex] [--prompt TEXT|-] [--model M] [--permission-mode P] [--approval A] [--sandbox S] [--worktree] [--no-worktree] [--replace] [--edit] {where}
 fw hub template rm WS NAME {where}
@@ -91,7 +97,7 @@ fw hub pr fix-ci SESSION [--check NAME] [--yes|-y] [--json] {where}
 fw hub pr rerun SESSION [--yes|-y] [--json] {where}
 fw hub pr ready SESSION [--yes|-y] [--json] {where}
 fw hub pr merge SESSION [--yes|-y] [--force NUMBER] [--json] {where}
-fw hub handoff FROM TO (--selection-file F|- | --diff [--path P] [--base REF] | --last-command | --command SEQ | --message N) [--to-machine M] [--max-bytes N] [--edit] [--dry-run] [--json] {where}
+fw hub handoff FROM TO (--selection-file F|- | --diff [--path P] [--base REF] | --last-command | --output | --command SEQ | --message N) [--to-machine M] [--max-bytes N] [--edit] [--dry-run] [--json] {where}
 fw hub ask-review SESSION [--kind claude|codex] [--base REF] [--model M] [--dry-run] [--findings] [--send-findings] [--json] {where}
 fw hub fanout new WS (--prompt TEXT|- --grader [name=]CMD... | --from-task ID) --agent KIND[:MODEL]... [--folder F] [--base BRANCH] [--name N] [--timeout SECS] [--protect PATH]... [--permission-mode M] [--approval A] [--sandbox S] [--no-commit-instruction] [--json] {where}
 fw hub fanout ls [--json] {where}
@@ -356,6 +362,7 @@ Defaults, all rebindable (Settings > Keyboard). `mod` = Ctrl (Cmd on macOS); `al
 | `flywheel.toggle` | `alt+f` | Flywheel panel |
 | `review.toggle` | `alt+g` | Review the attached session's git work |
 | `handoff.send` | - | Send the terminal selection to another agent |
+| `handoff.output` | `alt+o` | Send a shell's last output to an agent |
 | `review.ask` | - | Ask an agent of the other kind to review the attached session |
 | `queue.toggle` | `alt+q` | Prompt queue of the attached agent |
 | `fanout.open` | - | Verified fan-outs |
@@ -408,7 +415,7 @@ Also: `F2` / double-click renames and `Delete` closes a focused sidebar row.
 | `FLYWHEEL_PG_DSN`, `DATABASE_URL` | the Flywheel panel's Postgres DSN |
 | `BROWSER` | `fw hub open`'s opener |
 | `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | transcripts / rollouts (default `~/.claude`, `~/.codex`) |
-| set in sessions | `FLYWHEEL_HUB_SESSION`, `FLYWHEEL_HUB_WORKSPACE`, `TERM=xterm-256color`; agents `FLYWHEEL_HUB_REPORT_SOCKET`, `FLYWHEEL_HUB_REPORT_SECRET` |
+| set in sessions | `FLYWHEEL_HUB_SESSION`, `FLYWHEEL_HUB_WORKSPACE`, `TERM=xterm-256color`; agents `FLYWHEEL_HUB_REPORT_SOCKET`, `FLYWHEEL_HUB_REPORT_SECRET`; a Claude session with an account `CLAUDE_CODE_OAUTH_TOKEN` (and no `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, which outrank it) |
 
 ## State dir
 
@@ -417,4 +424,4 @@ All files 0600, the dir 0700.
 - `token`; `logins.json` (login-cookie digests); `state.json` (workspaces, sessions, layouts, templates, fan-outs, queues; schema 5); `settings.json`; `hub.toml`, `notify.toml`.
 - `server.json`, `serve.lock`, `report.sock`, `handoff.sock` (the running hub's address, lock, sockets); `hub.log[.1..3]`.
 - `machines.json` (plaintext credentials), `peers.json`, `shares.json` (digests); `commands/<id>.json` (suggested blocks + usage), `usage-archive.json` (removed sessions').
-- `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` (local CA); `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` (clients' last-active times); `digest.json`, `digest.lock` (last slot, recent digests); `open-<id>.html` (`open` redirect pages).
+- `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` (local CA); `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` (clients' last-active times); `digest.json`, `digest.lock` (last slot, recent digests); `open-<id>.html` (`open` redirect pages); `claude-accounts/<name>.token` (Claude account tokens).

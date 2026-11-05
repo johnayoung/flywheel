@@ -258,6 +258,10 @@ pub struct SessionRecord {
     /// session's directory, read-only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_of: Option<String>,
+    /// A Claude session's account ([`crate::accounts`]): it runs under that
+    /// token instead of the CLI's own login, on every relaunch and restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// A saved way to start an agent in a workspace: kind, first prompt,

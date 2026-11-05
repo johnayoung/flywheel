@@ -60,6 +60,9 @@ pub enum Source {
     Command { seq: u64 },
     /// Its newest suggested shell command.
     LastCommand,
+    /// What its terminal printed last: the output of the last command
+    /// typed at its prompt, else its last lines.
+    Output,
     /// Its branch against its base (`git diff <base>...HEAD`), or one
     /// file's part of it.
     Diff {
@@ -79,6 +82,7 @@ impl Source {
             Self::Transcript { .. } => "transcript",
             Self::Command { .. } => "command",
             Self::LastCommand => "last_command",
+            Self::Output => "output",
             Self::Diff { .. } => "diff",
         }
     }
@@ -114,7 +118,8 @@ pub struct Provenance {
 #[derive(Debug, Clone, Serialize)]
 pub struct Composed {
     pub from: Provenance,
-    /// `selection`, `transcript`, `command`, `last_command`, `diff`.
+    /// `selection`, `transcript`, `command`, `last_command`, `output`,
+    /// `diff`.
     pub source: &'static str,
     /// What the header says it is ("selected terminal text").
     pub what: String,
@@ -233,6 +238,52 @@ pub fn assemble(
         prompt.push('\n');
     }
     (prompt, kept.len(), truncated)
+}
+
+/// Terminal lines read for [`Source::Output`].
+pub const OUTPUT_SCAN_LINES: usize = 5000;
+/// Lines kept when the last command cannot be told apart.
+pub const OUTPUT_FALLBACK_LINES: usize = 200;
+
+/// What a shell's terminal printed last, from its recent lines (newest
+/// last): the command typed at the prompt it sits at now and that
+/// command's output, or (no earlier line starts with the same prompt) its
+/// last [`OUTPUT_FALLBACK_LINES`] lines and no command. The prompt line
+/// below the output is left out, and so is the first line of a two-line
+/// prompt (the line above the prompt, when it also sits above the
+/// command).
+pub fn last_output(lines: &[String]) -> (Option<String>, String) {
+    let lines: Vec<&str> = lines.iter().map(|l| l.trim_end()).collect();
+    let end = lines
+        .iter()
+        .rposition(|l| !l.is_empty())
+        .map_or(0, |i| i + 1);
+    let lines = &lines[..end];
+    let Some((&prompt, before)) = lines.split_last() else {
+        return (None, String::new());
+    };
+    let found = (!prompt.trim().is_empty())
+        .then(|| {
+            before
+                .iter()
+                .rposition(|l| l.starts_with(prompt) && l.len() > prompt.len())
+        })
+        .flatten();
+    let Some(at) = found else {
+        let start = lines.len().saturating_sub(OUTPUT_FALLBACK_LINES);
+        return (None, lines[start..].join("\n"));
+    };
+    let command = lines[at][prompt.len()..].trim().to_owned();
+    let mut output = &before[at + 1..];
+    // A two-line prompt: its first line repeats above both prompts.
+    if at > 0
+        && let Some((&last, rest)) = output.split_last()
+        && last == lines[at - 1]
+        && !last.is_empty()
+    {
+        output = rest;
+    }
+    (Some(command), output.join("\n"))
 }
 
 /// The size cap a request asks for, within bounds.
@@ -419,6 +470,40 @@ impl Hub {
                     command.command,
                 ))
             }
+            Source::Output => {
+                let session = self.live_session(&record.id).ok_or_else(|| {
+                    StateError::Conflict(format!(
+                        "{} has no terminal on this hub to read",
+                        record.label()
+                    ))
+                })?;
+                let screen = session.screen_text(crate::vt::TextSource::Recent {
+                    lines: OUTPUT_SCAN_LINES,
+                });
+                if screen.alt_screen {
+                    return Err(StateError::Conflict(format!(
+                        "{} shows a full-screen program: select the text and send that instead",
+                        record.label()
+                    ))
+                    .into());
+                }
+                let (command, output) = last_output(&screen.lines);
+                let what = match &command {
+                    Some(command) if output.trim().is_empty() => {
+                        return Err(StateError::Conflict(format!(
+                            "`{command}` printed nothing in {}",
+                            record.label()
+                        ))
+                        .into());
+                    }
+                    Some(command) => format!("the output of `{command}`"),
+                    None => format!(
+                        "the last {OUTPUT_FALLBACK_LINES} lines of its terminal (no command \
+                         found at its prompt)"
+                    ),
+                };
+                Ok((what, "text".to_owned(), output))
+            }
             Source::Diff {
                 path,
                 old_path,
@@ -503,6 +588,7 @@ impl Hub {
                     "transcript",
                     "command",
                     "last_command",
+                    "output",
                     "diff",
                     "review_findings",
                 ]
@@ -587,6 +673,46 @@ mod tests {
             header(&from(Some("main"), Some("box")), None, "x"),
             "From claude-1 on main (machine box): x"
         );
+    }
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn the_last_output_is_what_the_last_command_at_the_prompt_printed() {
+        let screen = lines(
+            "me@box:~/app$ ls\nREADME\nme@box:~/app$ cargo test   \nrunning 2 tests\n\ntest result: FAILED\nme@box:~/app$ \n\n",
+        );
+        assert_eq!(
+            last_output(&screen),
+            (
+                Some("cargo test".to_owned()),
+                "running 2 tests\n\ntest result: FAILED".to_owned()
+            )
+        );
+        // A two-line prompt (starship): its first line is left out too.
+        let screen = lines("~/app on main\n❯ make\nbuilt\n~/app on main\n❯");
+        assert_eq!(
+            last_output(&screen),
+            (Some("make".to_owned()), "built".to_owned())
+        );
+    }
+
+    #[test]
+    fn without_a_command_at_the_prompt_the_last_lines_go() {
+        // Still running (no prompt below), or the prompt changed.
+        let screen = lines("$ watch\ntick 1\ntick 2");
+        assert_eq!(
+            last_output(&screen),
+            (None, "$ watch\ntick 1\ntick 2".to_owned())
+        );
+        let many: Vec<String> = (0..500).map(|i| format!("line {i}")).collect();
+        let (command, output) = last_output(&many);
+        assert_eq!(command, None);
+        assert_eq!(output.lines().count(), OUTPUT_FALLBACK_LINES);
+        assert!(output.ends_with("line 499"));
+        assert_eq!(last_output(&[]), (None, String::new()));
     }
 
     #[test]

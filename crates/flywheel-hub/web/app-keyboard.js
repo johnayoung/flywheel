@@ -395,6 +395,7 @@ const GLOBAL_ACTIONS = {
   "flywheel.toggle": () => flywheel.togglePill(),
   "review.toggle": () => review.togglePill(),
   "handoff.send": () => (state.attached ? handoff.sendSelection(state.attached) : false),
+  "handoff.output": () => (state.attached ? handoff.sendOutput(state.attached) : false),
   "review.ask": () => (state.attached ? handoff.askReview(state.attached) : false),
   "queue.toggle": () => promptQueue.togglePill(),
   "share.open": () => (sharing.canShare(state.attached) ? sharing.open(state.attached) : false),
@@ -584,6 +585,7 @@ const actions = {
     commands.toggle();
   },
   "flip-companion": () => commands.flipCompanion(),
+  "send-output": () => handoff.sendOutput(state.attached),
   "toggle-flywheel": () => flywheel.togglePill(),
   "toggle-review": () => review.togglePill(),
   "toggle-queue": () => promptQueue.togglePill(),

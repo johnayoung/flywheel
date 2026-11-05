@@ -74,6 +74,12 @@ enum HubCommand {
     /// Open a session in a workspace; prints its id. Agents take a first
     /// prompt, model, and permission options, or a saved --template.
     New(script::NewArgs),
+    /// A folder's past Claude Code or Codex conversations, newest first:
+    /// `new --resume ID` (or `--continue`) picks one up.
+    Conversations(script::ConversationsArgs),
+    /// Claude Code accounts (tokens from `claude setup-token`) a claude
+    /// session can launch with instead of the CLI's login: ls, add, rm.
+    Account(crate::account_cli::AccountArgs),
     /// A workspace's launch templates: ls, save, rm.
     Template(crate::template_cli::TemplateArgs),
     /// Type text into a session (pasted, bracketed-paste aware).
@@ -142,9 +148,9 @@ enum HubCommand {
     /// Hand part of one session to another agent session (here or on a
     /// machine) as one prompt under a provenance header (`From <session>
     /// on <branch>: ...`): a selection (--selection-file), its branch
-    /// diff (--diff), a suggested command (--last-command, --command), or
-    /// a transcript message (--message); pasted, then Enter. Capped, with
-    /// a truncation notice.
+    /// diff (--diff), a suggested command (--last-command, --command), what
+    /// its terminal printed last (--output), or a transcript message
+    /// (--message); pasted, then Enter. Capped, with a truncation notice.
     Handoff(crate::agent_handoff_cli::HandoffArgs),
     /// Ask an agent of the other kind (Claude <-> Codex; hub.toml
     /// review.reviewer) to review a session's branch read-only, in its
@@ -710,6 +716,8 @@ fn dispatch_verb(
         HubCommand::InstallService(args) => lifecycle::install_service(&args, out, err),
         HubCommand::Ls(args) => script::ls(&args, out, err),
         HubCommand::New(args) => script::new(&args, out, err),
+        HubCommand::Conversations(args) => script::conversations(&args, out, err),
+        HubCommand::Account(args) => crate::account_cli::main(&args, out, err),
         HubCommand::Template(args) => crate::template_cli::main(&args, out, err),
         HubCommand::Send(args) => script::send(&args, out, err),
         HubCommand::Read(args) => script::read(&args, out, err),

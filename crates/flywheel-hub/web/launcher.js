@@ -39,6 +39,9 @@ window.FwHubLauncher = function (ctx) {
   };
 
   const box = $("#agent-opts");
+  const resumeSelect = $("#agent-resume");
+  const accountBox = $("#ao-account");
+  const accountSelect = $("#agent-account");
   const promptInput = $("#agent-prompt");
   const modelInput = $("#agent-model");
   const models = $("#agent-models");
@@ -63,6 +66,7 @@ window.FwHubLauncher = function (ctx) {
 
   let kind = "shell";
   let workspaceId = null;
+  let folder = null;
 
   // --- formatting -----------------------------------------------------------
 
@@ -283,6 +287,100 @@ window.FwHubLauncher = function (ctx) {
       : "CLI default";
     prefill();
     updateWarning();
+    loadConversations();
+    loadAccounts();
+  }
+
+  // --- Claude accounts -------------------------------------------------------------
+
+  // The account a Claude session launches with (`fw hub account`): the
+  // CLI's own login unless one is picked; the pick is remembered per
+  // workspace.
+  const accountKey = () => `fw-hub.claude-account.${workspaceId}`;
+  let accountsSeq = 0;
+  async function loadAccounts() {
+    const seq = ++accountsSeq;
+    accountSelect.replaceChildren(el("option", { value: "", textContent: "CLI login" }));
+    accountBox.hidden = true;
+    if (kind !== "claude" || !workspaceId) return;
+    let list = [];
+    try {
+      list = (await api("GET", "/api/claude-accounts")).accounts || [];
+    } catch (_) {
+      return;
+    }
+    if (seq !== accountsSeq || !list.length) return;
+    accountSelect.append(...list.map((a) => el("option", { value: a.name, textContent: a.name })));
+    let remembered = "";
+    try {
+      remembered = localStorage.getItem(accountKey()) || "";
+    } catch (_) {
+      // Private mode: no memory.
+    }
+    if (list.some((a) => a.name === remembered)) accountSelect.value = remembered;
+    accountBox.hidden = false;
+  }
+  accountSelect.addEventListener("change", () => {
+    try {
+      localStorage.setItem(accountKey(), accountSelect.value);
+    } catch (_) {
+      // Private mode: the pick lasts this dialog.
+    }
+  });
+
+  // --- resuming a conversation ---------------------------------------------------
+
+  // The picked folder's past conversations of this kind, newest first: a
+  // new conversation, the latest one (`--continue`), or one by id.
+  let conversationsSeq = 0;
+  async function loadConversations() {
+    const seq = ++conversationsSeq;
+    const agent = kind === "claude" || kind === "codex";
+    const fresh = el("option", { value: "", textContent: "New conversation" });
+    resumeSelect.replaceChildren(fresh);
+    resumeSelect.disabled = true;
+    resumeChanged();
+    if (!agent || !workspaceId) return;
+    const query = new URLSearchParams({ kind, limit: "30" });
+    if (folder) query.set("folder", folder);
+    let list = [];
+    try {
+      list = (await api("GET", `/api/workspaces/${workspaceId}/conversations?${query}`)).conversations || [];
+    } catch (error) {
+      if (seq === conversationsSeq) fresh.textContent = `New conversation (could not list past ones: ${error.message})`;
+      return;
+    }
+    if (seq !== conversationsSeq) return;
+    const open = (c) => (c.open_in ? ` (open in ${c.open_in.name})` : "");
+    const about = (c) => c.title || c.prompt || c.id;
+    const options = list.map((c) => el("option", {
+      value: c.id,
+      textContent: `${ctx.age(c.modified)} ago · ${about(c)}${open(c)}`,
+      title: [c.title, c.prompt, c.id].filter(Boolean).join("\n"),
+      disabled: !!c.open_in,
+    }));
+    const latest = list.find((c) => !c.open_in);
+    if (latest && latest === list[0]) {
+      options.unshift(el("option", { value: "latest", textContent: `Continue the latest: ${about(latest)}` }));
+    }
+    fresh.textContent = list.length ? "New conversation" : "New conversation (none to resume here)";
+    resumeSelect.replaceChildren(fresh, ...options);
+    resumeSelect.disabled = !list.length;
+  }
+
+  // A resumed conversation takes no first prompt.
+  function resumeChanged() {
+    const resuming = !!resumeSelect.value;
+    promptInput.disabled = resuming;
+    promptInput.placeholder = resuming ? "Resumed: it picks up where it left off; send a prompt once it is up" : "What should it do?";
+  }
+  resumeSelect.addEventListener("change", resumeChanged);
+
+  // The new-session form's folder changed.
+  function setFolder(path) {
+    if (path === folder) return;
+    folder = path || null;
+    loadConversations();
   }
 
   // Settings' agent defaults for this kind go into fields the user has
@@ -332,10 +430,12 @@ window.FwHubLauncher = function (ctx) {
     if (kind !== "claude" && kind !== "codex") return {};
     const body = {};
     const prompt = promptInput.value;
-    if (prompt.trim()) body.prompt = prompt;
+    if (resumeSelect.value) body.resume = resumeSelect.value;
+    else if (prompt.trim()) body.prompt = prompt;
     const model = modelInput.value.trim();
     if (model) body.model = model;
     if (kind === "claude" && modeSelect.value) body.permission_mode = modeSelect.value;
+    if (kind === "claude" && !accountBox.hidden && accountSelect.value) body.account = accountSelect.value;
     if (kind === "codex") {
       if (approvalSelect.value) body.approval = approvalSelect.value;
       if (sandboxSelect.value) body.sandbox = sandboxSelect.value;
@@ -346,6 +446,7 @@ window.FwHubLauncher = function (ctx) {
   // The form opened (or its workspace changed).
   function reset(id) {
     workspaceId = id;
+    folder = null;
     promptInput.value = "";
     modelInput.value = "";
     modeSelect.value = "";
@@ -360,6 +461,8 @@ window.FwHubLauncher = function (ctx) {
     note("");
     renderTemplates();
     updateWarning();
+    loadConversations();
+    loadAccounts();
   }
 
   // What a save or delete did, said inside the dialog (a toast sits
@@ -610,7 +713,7 @@ window.FwHubLauncher = function (ctx) {
   }
 
   return {
-    setKind, reset, request, renderHeader, rowChip, workspaceChip, paletteItems, templateItems, render, onUsage,
+    setKind, setFolder, reset, request, renderHeader, rowChip, workspaceChip, paletteItems, templateItems, render, onUsage,
     loadRollups, rollupsSoon, PALETTE_PREFIX, tokens, costText, taskFrom,
   };
 };

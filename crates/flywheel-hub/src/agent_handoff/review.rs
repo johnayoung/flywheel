@@ -530,8 +530,13 @@ impl Hub {
             launch: Some(launch),
             reviewer: None,
             review_of: Some(author.id.clone()),
+            // A Claude reviewer of a Claude author bills the same account.
+            account: author
+                .account
+                .clone()
+                .filter(|_| kind == SessionKind::Claude),
         };
-        let view = self.launch(record, None, None, prompt.as_deref())?;
+        let view = self.launch(record, None, None, false, prompt.as_deref())?;
         let paired = self.store().set_review_pair(&author.id, &view.record.id);
         let replaced = match paired {
             Ok(replaced) => replaced,

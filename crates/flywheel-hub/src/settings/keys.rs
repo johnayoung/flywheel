@@ -173,6 +173,12 @@ pub const ACTIONS: &[ActionSpec] = &[
         &[],
     ),
     global(
+        "handoff.output",
+        "Agents",
+        "Send a shell's last output to an agent",
+        &["alt+o"],
+    ),
+    global(
         "review.ask",
         "Agents",
         "Ask an agent of the other kind to review the attached session",

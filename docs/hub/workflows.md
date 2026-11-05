@@ -18,6 +18,8 @@ fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it wait
 
 ## Agent launcher
 
+- **Resume** (`--resume ID`, `--continue`, the dialog's **Conversation**): a new session picks up one of the folder's Claude Code or Codex conversations (`fw hub conversations WS --kind K`); one open in a running session is refused. Relaunch and hub restarts already resume a session's own conversation.
+- **Accounts** (Claude): `claude setup-token` as the other account, `fw hub account add work`, then `--account work` or the dialog's **Account** (per workspace). Spawns get `CLAUDE_CODE_OAUTH_TOKEN`: one `~/.claude` serves both; rows show `@work`. A key in Claude's settings `env` outranks it.
 - **First prompt** (`--prompt`, 32 KiB): the first user turn, on create only. **Model**: `claude --model` / `codex -m`.
 - **Permissions**: Claude `--permission-mode` (`bypassPermissions` warns, marks the session `unchecked`); Codex `-a` approval, `-s` sandbox; reapplied on relaunch and restore.
 - **Templates** (per workspace): kind, prompt, model, permissions, worktree; a taken name needs `--replace` (all) or `--edit` (given flags). Launch: palette, `new --template NAME` (flags win). Defaults: `[agents.*]`.
@@ -78,6 +80,7 @@ A branch with a pull request: a badge on its row (`#7`, checks), a PR section in
 ## Handoff and peer review
 
 - **Send to agent** (`fw hub handoff FROM TO`, `handoff.send`): a selection, message, block, or diff to another agent (any workspace or machine) as one editable prompt (32 KiB).
+- **Shell output to agent** (`Alt O`, header **to <agent>** on a shell, `fw hub handoff SHELL AGENT --output`): the output of the last command typed at the shell's prompt (found by the prompt line it sits at now), else its last 200 lines; a companion shell defaults to its own agent.
 - **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author. Model: `--model`, else the author's (same kind), else `agents.<kind>.model`.
 - **Send findings to <author>** pastes the reviewer's latest reply back. Pairing survives restarts; closing the author closes its reviewers.
 

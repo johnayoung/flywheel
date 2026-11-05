@@ -204,6 +204,31 @@ pub struct CreateSession {
     /// An agent's model and permission options.
     #[serde(flatten)]
     pub launch: agent::AgentLaunch,
+    /// Resume an earlier conversation of the folder instead of starting
+    /// one: its id, or `latest` (Claude's `--continue`).
+    pub resume: Option<String>,
+    /// A Claude session's account ([`crate::accounts`]); default: the
+    /// CLI's own login.
+    pub account: Option<String>,
+}
+
+/// [`CreateSession::resume`]'s value for the folder's newest conversation.
+pub const RESUME_LATEST: &str = "latest";
+
+/// A past conversation to resume, and the running session holding it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationView {
+    #[serde(flatten)]
+    pub conversation: crate::conversations::Conversation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_in: Option<SessionRef>,
+}
+
+/// A session, by id and name.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionRef {
+    pub id: String,
+    pub name: String,
 }
 
 /// A new worktree for a session: `<repo-parent>/<repo>.worktrees/<task>`

@@ -2,11 +2,12 @@
 //! spawning their PTYs, naming, killing, and removing sessions.
 
 use super::{
-    BADGE_AFTER_RUN, CompanionPaste, CreateSession, DEFAULT_COLS, DEFAULT_ROWS, Hub, HubError,
-    HubEvent, KILL_GRACE, KindAvailability, LiveView, READY_TIMEOUT, Readiness, SessionView,
-    badge_key, forget, process_cwd, wait_ready,
+    BADGE_AFTER_RUN, CompanionPaste, ConversationView, CreateSession, DEFAULT_COLS, DEFAULT_ROWS,
+    Hub, HubError, HubEvent, KILL_GRACE, KindAvailability, LiveView, READY_TIMEOUT, RESUME_LATEST,
+    Readiness, SessionView, badge_key, forget, process_cwd, wait_ready,
 };
 use crate::agent::{self, SessionKind, which};
+use crate::conversations;
 use crate::git;
 use crate::pty::{ExitInfo, PtySession, SpawnSpec};
 use crate::report;
@@ -126,6 +127,36 @@ impl Hub {
         if request.worktree.is_some() && !crate::state::is_git_root(&cwd) {
             return Err(StateError::Invalid(git::not_a_repo_root(&cwd)).into());
         }
+        let account = match request.account.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(_) if request.kind != SessionKind::Claude => {
+                return Err(StateError::Invalid(
+                    "an account is for claude sessions (a Claude Code token)".into(),
+                )
+                .into());
+            }
+            Some(name) => {
+                crate::accounts::validate_name(name)
+                    .map_err(|e| StateError::Invalid(e.to_string()))?;
+                if !crate::accounts::exists(&self.options.state_dir, name) {
+                    return Err(StateError::Invalid(format!(
+                        "no Claude account {name:?} (`fw hub account ls` lists them)"
+                    ))
+                    .into());
+                }
+                Some(name.to_owned())
+            }
+        };
+        let resumed = match request.resume.as_deref() {
+            Some(resume) => Some(self.resume_target(
+                request.kind,
+                &cwd,
+                resume,
+                request.prompt.is_some(),
+                request.worktree.is_some(),
+            )?),
+            None => None,
+        };
         let command = match (request.kind, request.command) {
             (SessionKind::Shell, Some(argv)) if argv.is_empty() || argv[0].trim().is_empty() => {
                 return Err(StateError::Invalid("command must not be empty".into()).into());
@@ -191,9 +222,12 @@ impl Hub {
             cwd: worktree.as_ref().map_or(cwd, |w| w.path.clone()),
             command,
             // Claude takes its conversation id from the hub, so its
-            // transcript and `--resume` are known from the start.
-            agent_session_id: (request.kind == SessionKind::Claude)
-                .then(|| uuid::Uuid::new_v4().hyphenated().to_string()),
+            // transcript and `--resume` are known from the start; a resumed
+            // conversation keeps its own.
+            agent_session_id: resumed.clone().or_else(|| {
+                (request.kind == SessionKind::Claude)
+                    .then(|| uuid::Uuid::new_v4().hyphenated().to_string())
+            }),
             created_at: Utc::now(),
             state: SessionState::Running,
             fallback_command: None,
@@ -202,6 +236,7 @@ impl Hub {
             launch: (!options.is_empty()).then_some(options),
             reviewer: None,
             review_of: None,
+            account,
         };
         if record
             .launch
@@ -216,7 +251,13 @@ impl Hub {
                 record.kind.as_str()
             );
         }
-        let launched = self.launch(record, request.cols, request.rows, prompt.as_deref());
+        let launched = self.launch(
+            record,
+            request.cols,
+            request.rows,
+            resumed.is_some(),
+            prompt.as_deref(),
+        );
         if launched.is_err()
             && let Some(worktree) = &worktree
         {
@@ -232,6 +273,7 @@ impl Hub {
         record: SessionRecord,
         cols: Option<u16>,
         rows: Option<u16>,
+        resume: bool,
         prompt: Option<&str>,
     ) -> Result<SessionView, HubError> {
         let id = record.id.clone();
@@ -239,7 +281,7 @@ impl Hub {
         // exit callback (which also takes it) cannot observe a session that
         // is live but unrecorded.
         let mut store = self.store();
-        let session = match self.spawn_pty(&record, cols, rows, false, prompt) {
+        let session = match self.spawn_pty(&record, cols, rows, resume, prompt) {
             Ok(session) => session,
             Err(e) => {
                 self.board().untrack(&id);
@@ -261,6 +303,153 @@ impl Hub {
             self.emit_lifecycle("session.created", serde_json::json!({ "session": session }));
         }
         Ok(self.view(record))
+    }
+
+    /// The conversation a new `kind` session in `cwd` resumes: `resume`'s
+    /// id, or the folder's newest ([`RESUME_LATEST`]). Refused for a shell,
+    /// with a first prompt or a new worktree, for a conversation the agent
+    /// CLI has not filed under `cwd`, and for one a running session holds.
+    fn resume_target(
+        &self,
+        kind: SessionKind,
+        cwd: &std::path::Path,
+        resume: &str,
+        prompt: bool,
+        worktree: bool,
+    ) -> Result<String, HubError> {
+        let refuse = |why: String| -> HubError { StateError::Invalid(why).into() };
+        if !kind.is_agent() {
+            return Err(refuse(
+                "resume is for claude and codex sessions; a shell has no conversation".into(),
+            ));
+        }
+        if prompt {
+            return Err(refuse(
+                "a resumed conversation takes no first prompt: send it once it is up".into(),
+            ));
+        }
+        if worktree {
+            return Err(refuse(
+                "a resumed conversation runs in the folder it was filed under, not a new worktree"
+                    .into(),
+            ));
+        }
+        let claude_dir = self.options.claude_config_dir.as_deref();
+        let codex_home = self.options.codex_home.as_deref();
+        let id = if resume == RESUME_LATEST {
+            conversations::latest(kind, claude_dir, codex_home, cwd)
+                .map(|c| c.id)
+                .ok_or_else(|| {
+                    refuse(format!(
+                        "no {} conversation in {} to continue",
+                        kind.as_str(),
+                        cwd.display()
+                    ))
+                })?
+        } else {
+            let id = resume.trim();
+            let filed = agent::is_conversation_id(id)
+                && match kind {
+                    SessionKind::Claude => claude_dir.is_some_and(|dir| {
+                        dir.join("projects")
+                            .join(agent::claude_project_dir_name(cwd))
+                            .join(format!("{id}.jsonl"))
+                            .is_file()
+                    }),
+                    SessionKind::Codex => {
+                        codex_home.is_some_and(|home| agent::codex_rollout(home, id).is_some())
+                    }
+                    SessionKind::Shell => false,
+                };
+            if !filed {
+                return Err(refuse(format!(
+                    "{id:?} is not a {} conversation of {} (`fw hub conversations` lists them)",
+                    kind.as_str(),
+                    cwd.display()
+                )));
+            }
+            id.to_owned()
+        };
+        if let Some(holder) = self.conversation_holder(&id) {
+            return Err(StateError::Conflict(format!(
+                "conversation {id} is open in session {}: attach to it, or stop it first",
+                holder.label()
+            ))
+            .into());
+        }
+        Ok(id)
+    }
+
+    /// The running session whose agent is in conversation `id`.
+    fn conversation_holder(&self, id: &str) -> Option<SessionRecord> {
+        self.store()
+            .sessions()
+            .iter()
+            .find(|s| {
+                s.agent_session_id.as_deref() == Some(id)
+                    && s.state.is_running()
+                    && s.fallback_command.is_none()
+            })
+            .cloned()
+    }
+
+    /// `kind` conversations of one of `workspace_id`'s folders (default:
+    /// its first), newest first, each with the running session holding it.
+    /// Blocking (reads the agents' files).
+    pub fn conversations(
+        &self,
+        workspace_id: &str,
+        folder: Option<&std::path::Path>,
+        kind: SessionKind,
+        limit: usize,
+    ) -> Result<Vec<ConversationView>, HubError> {
+        let workspace = self.workspace(workspace_id)?;
+        let folder = match folder {
+            None => workspace.first_folder().to_path_buf(),
+            Some(folder) if workspace.has_folder(folder) => folder.to_path_buf(),
+            Some(folder) => {
+                return Err(StateError::Invalid(format!(
+                    "folder {} is not part of workspace {}",
+                    folder.display(),
+                    workspace.name
+                ))
+                .into());
+            }
+        };
+        let list = match kind {
+            SessionKind::Claude => self
+                .options
+                .claude_config_dir
+                .as_deref()
+                .map(|dir| conversations::claude(dir, &folder, limit)),
+            SessionKind::Codex => self
+                .options
+                .codex_home
+                .as_deref()
+                .map(|home| conversations::codex(home, &folder, limit)),
+            SessionKind::Shell => {
+                return Err(StateError::Invalid(
+                    "conversations are claude's or codex's; a shell has none".into(),
+                )
+                .into());
+            }
+        };
+        Ok(list
+            .unwrap_or_default()
+            .into_iter()
+            .map(|conversation| {
+                let open_in =
+                    self.conversation_holder(&conversation.id)
+                        .map(|s| super::SessionRef {
+                            id: s.id,
+                            name: s.name,
+                        });
+                ConversationView {
+                    conversation,
+                    open_in,
+                }
+            })
+            .collect())
     }
 
     /// Re-read `record`'s git badge shortly (a command just ran there).
@@ -347,8 +536,9 @@ impl Hub {
             launch: None,
             reviewer: None,
             review_of: None,
+            account: None,
         };
-        Ok((self.launch(record, cols, rows, None)?, true))
+        Ok((self.launch(record, cols, rows, false, None)?, true))
     }
 
     /// Paste `text` into an agent session's companion shell, starting it
@@ -418,6 +608,27 @@ impl Hub {
             ("FLYWHEEL_HUB_WORKSPACE".into(), record.workspace_id.clone()),
         ];
         let mut generation = None;
+        let mut env_remove: Vec<String> = agent::INHERITED_AGENT_ENV
+            .iter()
+            .copied()
+            .chain([report::SOCKET_ENV, report::SECRET_ENV])
+            .map(str::to_owned)
+            .collect();
+        if let Some(account) = record
+            .account
+            .as_deref()
+            .filter(|_| kind == SessionKind::Claude)
+        {
+            // Read at every spawn: a replaced token applies on relaunch.
+            let token = crate::accounts::token(&self.options.state_dir, account)
+                .map_err(|e| StateError::Invalid(e.to_string()))?;
+            env.push((crate::accounts::TOKEN_ENV.to_owned(), token));
+            env_remove.extend(
+                crate::accounts::OUTRANKING_ENV
+                    .iter()
+                    .map(|v| (*v).to_owned()),
+            );
+        }
         if kind.is_agent() {
             let key = self
                 .board()
@@ -464,13 +675,9 @@ impl Hub {
                 cwd: record.cwd.clone(),
                 env,
                 // Another hub's report channel (a hub run inside a hub
-                // session) and an enclosing agent's markers stay out.
-                env_remove: agent::INHERITED_AGENT_ENV
-                    .iter()
-                    .copied()
-                    .chain([report::SOCKET_ENV, report::SECRET_ENV])
-                    .map(str::to_owned)
-                    .collect(),
+                // session) and an enclosing agent's markers stay out; so
+                // does what would outrank an account's token.
+                env_remove,
                 cols: cols.filter(|&c| c > 0).unwrap_or(DEFAULT_COLS),
                 rows: rows.filter(|&r| r > 0).unwrap_or(DEFAULT_ROWS),
                 scrollback_lines: self.tunables().scrollback_lines,

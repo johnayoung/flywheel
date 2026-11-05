@@ -143,6 +143,8 @@ impl Fanouts {
                 }),
                 prompt: Some(sent.clone()),
                 launch: launch.clone(),
+                resume: None,
+                account: None,
             });
             let view = match created {
                 Ok(view) => view,

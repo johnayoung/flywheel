@@ -136,10 +136,14 @@ fn local_hub(state: &StateDirArg) -> Result<Endpoint, String> {
     Ok(Endpoint::local(&dir)?.with_timeout(Duration::from_secs(60)))
 }
 
-/// Read a secret: the environment, else one line of stdin (no echo on a
+/// Read a secret: `env` when set, else one line of stdin (no echo on a
 /// terminal).
-fn read_secret(prompt: &str, err: &mut dyn Write) -> Result<String, String> {
-    if let Ok(secret) = std::env::var(SECRET_ENV)
+pub(crate) fn read_secret(
+    env: Option<&str>,
+    prompt: &str,
+    err: &mut dyn Write,
+) -> Result<String, String> {
+    if let Some(secret) = env.and_then(|name| std::env::var(name).ok())
         && !secret.trim().is_empty()
     {
         return Ok(secret.trim().to_owned());
@@ -160,9 +164,12 @@ fn read_secret(prompt: &str, err: &mut dyn Write) -> Result<String, String> {
     read.map_err(|e| format!("reading the secret from stdin: {e}"))?;
     let secret = line.trim().to_owned();
     if secret.is_empty() {
-        return Err(format!(
-            "no secret given: set {SECRET_ENV} or pipe it on stdin (never on the command line)"
-        ));
+        return Err(match env {
+            Some(env) => format!(
+                "no secret given: set {env} or pipe it on stdin (never on the command line)"
+            ),
+            None => "no secret given: pipe it on stdin (never on the command line)".to_owned(),
+        });
     }
     Ok(secret)
 }
@@ -198,6 +205,7 @@ impl Drop for EchoOff {
 fn add(args: &AddArgs, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32, String> {
     let hub = local_hub(&args.state)?;
     let secret = read_secret(
+        Some(SECRET_ENV),
         if args.mint {
             "the machine's token (fw hub token there; used once, not stored)"
         } else {

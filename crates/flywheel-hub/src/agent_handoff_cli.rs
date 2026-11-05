@@ -15,7 +15,7 @@ use std::path::PathBuf;
 #[command(group(
     clap::ArgGroup::new("what")
         .required(true)
-        .args(["selection_file", "diff", "last_command", "command", "message"])
+        .args(["selection_file", "diff", "last_command", "output", "command", "message"])
 ))]
 pub(crate) struct HandoffArgs {
     /// The session handed from (id, unique id prefix, or name).
@@ -38,6 +38,10 @@ pub(crate) struct HandoffArgs {
     /// Hand off the last shell command FROM suggested.
     #[arg(long)]
     last_command: bool,
+    /// Hand off what FROM's terminal printed last: the output of the
+    /// command typed at its prompt, else its last 200 lines.
+    #[arg(long)]
+    output: bool,
     /// Hand off FROM's suggested code block SEQ (`fw hub commands --json`).
     #[arg(long, value_name = "SEQ")]
     command: Option<u64>,
@@ -183,6 +187,8 @@ fn run_handoff(
         json!({ "kind": "diff", "path": args.path, "base": args.base })
     } else if args.last_command {
         json!({ "kind": "last_command" })
+    } else if args.output {
+        json!({ "kind": "output" })
     } else if let Some(seq) = args.command {
         json!({ "kind": "command", "seq": seq })
     } else if let Some(index) = args.message {

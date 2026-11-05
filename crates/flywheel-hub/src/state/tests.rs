@@ -135,6 +135,7 @@ fn running_session(workspace_id: &str, cwd: &Path) -> SessionRecord {
         launch: None,
         reviewer: None,
         review_of: None,
+        account: None,
     }
 }
 

@@ -352,13 +352,17 @@ function sessionFolder(session) {
   return { label: rest ? `${label}/${rest}` : label, outside: !folder };
 }
 
-// The line under a session row: its folder, then its branch (worktree.js).
+// The line under a session row: its Claude account (when not the CLI's
+// login), its folder, then its branch (worktree.js).
 function whereLine(session) {
   if (!session.cwd) return worktrees.badge(session);
   const folder = sessionFolder(session);
   return el(
     "span",
     { className: "session-where" },
+    session.account
+      ? el("span", { className: "session-account", textContent: `@${session.account}`, title: `Claude account ${session.account} (fw hub account)` })
+      : null,
     el("span", {
       className: `session-folder${folder.outside ? " outside" : ""}`,
       textContent: folder.label,
@@ -614,6 +618,19 @@ function renderFlip(session) {
   button.setAttribute("aria-label", button.title);
 }
 
+// The header's "to agent" on a shell: its last output, to an agent (its
+// own, for a companion shell), editable first.
+function renderSendOutput(session) {
+  const button = $("#out-toggle");
+  const pool = session && !isAgent(session) && session.live ? handoff.targets(session.id) : [];
+  button.hidden = !pool.length;
+  if (button.hidden) return;
+  const parent = session.companion_of ? pool.find((s) => s.id === session.companion_of) : null;
+  $("#out-label").textContent = parent ? `to ${parent.name}` : "to agent";
+  button.title = withKey(`Send the last command's output to ${parent ? parent.name : "an agent"} (editable first)`, "handoff.output");
+  button.setAttribute("aria-label", button.title);
+}
+
 function renderMain() {
   const session = sessionById(state.attached);
   // An empty tab of a workspace that is open (a new tab, its sessions
@@ -646,6 +663,7 @@ function renderMain() {
   sharing.renderHeader(session);
   promptQueue.renderHeader(session);
   renderFlip(session);
+  renderSendOutput(session);
   updateMeters();
   const counts = attentionCounts();
   document.title = `${titlePrefix(counts)}${session ? `${session.name} · flywheel hub` : "flywheel hub"}`;

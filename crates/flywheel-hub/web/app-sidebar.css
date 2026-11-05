@@ -50,16 +50,15 @@
 .workspace.collapsed .ws-head .chev { transform: rotate(0deg); }
 .workspace.collapsed .ws-body { display: none; }
 
-/* Long names wrap (two lines at most) instead of shrinking to a few
-   letters next to the chips. */
+/* One line, cut with an ellipsis (the full name is its title): a name
+   that wrapped would flip between one and two lines as the status pill and
+   cost next to it come and go, pushing every row below it down. */
 .ws-name {
   flex: 1;
   min-width: 0;
   overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
+  text-overflow: ellipsis;
   font: 700 13px/1.25 var(--mono);
   font-stretch: 87.5%;
 }
@@ -94,8 +93,7 @@
 
 /* Hidden tools must not take clicks: visibility, not just opacity. They
    float over the row's right end, shown or not, so showing them never
-   reflows the name (a name that wrapped to two lines would push every row
-   below it down). Only the head row's own hover shows them, so the status
+   squeezes the name. Only the head row's own hover shows them, so the status
    pill and count they cover stay readable while you work in its sessions. */
 .ws-tools {
   position: absolute;
@@ -116,7 +114,7 @@
 }
 
 /* Touch screens have no hover: the tools sit on their own line under an
-   open workspace's name (which wraps rather than shrink to nothing), and
+   open workspace's name, and
    the attached row's actions sit on a line under it. */
 @media (hover: none) {
   .ws-head-row { flex-wrap: wrap; }

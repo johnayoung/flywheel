@@ -1,6 +1,7 @@
 // flywheel hub: cross-agent handoff and review pairing. "Send to agent"
 // composes a prompt from part of one session -- selected terminal text, a
-// transcript message, a suggested block, its branch diff -- on the hub
+// shell's last output, a transcript message, a suggested block, its
+// branch diff -- on the hub
 // that owns it (POST /api/sessions/{from}/handoff/compose: the content
 // the user picked under a "From <session> on <branch>:" header, capped
 // with a notice), lets the user pick the agent and edit the prompt, and
@@ -69,10 +70,13 @@ window.FwHubHandoff = function (ctx) {
     }
   }
 
-  // The likeliest target: the last one used, the source's review partner,
+  // The likeliest target: a companion shell's agent, the last one used, the
+  // source's review partner,
   // an agent of the other kind in its workspace, any agent in it.
   function defaultTarget(from, pool) {
     const has = (id) => id && pool.some((s) => s.id === id);
+    // A companion shell's output goes back to its own agent.
+    if (from && has(from.companion_of)) return from.companion_of;
     if (has(lastTarget())) return lastTarget();
     if (from) {
       if (has(from.reviewer)) return from.reviewer;
@@ -286,6 +290,14 @@ window.FwHubHandoff = function (ctx) {
   }
 
   const sendLastCommand = (id) => open(id, { kind: "last_command" }, true);
+  // What a shell printed last: the last command's output, else its last
+  // lines (composed first: an empty one is a toast).
+  function sendOutput(id) {
+    const session = sessionById(id || state.attached);
+    if (!session || isAgent(session) || !session.live) return false;
+    open(session.id, { kind: "output" }, true);
+    return true;
+  }
   const sendCommand = (id, seq) => open(id, { kind: "command", seq });
   const sendDiff = (id, path, oldPath) => open(id, { kind: "diff", path: path || null, old_path: oldPath || null });
   // A transcript message, or the part of it selected in the viewer.
@@ -644,6 +656,7 @@ window.FwHubHandoff = function (ctx) {
     if (hasOthers) {
       cmd("Send selection to another agent…", [key("handoff.send"), "the terminal text selected, with where it is from"].filter(Boolean).join(": "), () => sendSelection(session.id), "send");
       if (isAgent(session)) cmd(`Send ${session.name}'s last command to an agent…`, "its newest suggested shell command", () => sendLastCommand(session.id), "send");
+      if (!isAgent(session) && session.live) cmd(`Send ${session.name}'s output to an agent…`, [key("handoff.output"), "the last command's output, else its last 200 lines"].filter(Boolean).join(": "), () => sendOutput(session.id), "send");
       if (session.git || session.worktree) cmd(`Send ${session.name}'s branch diff to an agent…`, "git diff <base>...HEAD, capped", () => sendDiff(session.id), "send");
     }
     if (session.git || session.worktree) {
@@ -655,6 +668,7 @@ window.FwHubHandoff = function (ctx) {
     open,
     sendSelection,
     sendLastCommand,
+    sendOutput,
     sendCommand,
     sendDiff,
     sendTranscript,

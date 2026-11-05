@@ -160,6 +160,7 @@
         <button type="button" id="act-toggle" class="cmd-pill act-pill" data-action="activity" title="Activity: what happened, on every machine" aria-controls="dlg-activity"><svg><use href="#i-activity"/></svg>activity<b id="act-count" hidden></b></button>
         <button type="button" id="search-toggle" class="cmd-pill search-pill" data-action="search" data-key-title="search.open" data-title="Search every session" title="Search every session (Ctrl Shift F)" aria-controls="search"><svg><use href="#i-search"/></svg>search</button>
         <button type="button" id="flip-toggle" class="cmd-pill flip-pill" data-action="flip-companion" hidden><svg><use href="#i-shell"/></svg><span id="flip-label">shell</span></button>
+        <button type="button" id="out-toggle" class="cmd-pill out-pill" data-action="send-output" hidden><svg><use href="#i-send"/></svg><span id="out-label">to agent</span></button>
         <button type="button" id="cmd-toggle" class="cmd-pill" data-action="toggle-commands" data-key-title="commands.toggle" data-title="Suggested commands" title="Suggested commands (Alt C)" aria-pressed="false" aria-controls="commands"><svg><use href="#i-copy"/></svg>suggested<b id="cmd-count" hidden></b></button>
         <button type="button" id="rv-toggle" class="cmd-pill rv-pill" data-action="toggle-review" aria-pressed="false" aria-controls="review" hidden><svg><use href="#i-branch"/></svg>review<b id="rv-count" hidden></b></button>
         <button type="button" id="fw-toggle" class="cmd-pill fw-pill" data-action="toggle-flywheel" aria-pressed="false" aria-controls="flywheel" hidden><svg><use href="#i-wheel"/></svg>flywheel<b id="fw-count" hidden></b></button>
@@ -382,6 +383,10 @@
     </div>
     <fieldset class="field agent-opts" id="agent-opts" hidden>
       <legend class="field-label">Agent</legend>
+      <label class="ao-field ao-resume">
+        <span class="field-label">Conversation <span class="field-hint">new, or resume one of this folder's</span></span>
+        <select id="agent-resume"></select>
+      </label>
       <label class="ao-prompt">
         <span class="field-label">First prompt <span class="field-hint">optional &middot; sent as the first turn &middot; Ctrl Enter launches</span></span>
         <textarea id="agent-prompt" rows="4" spellcheck="true" placeholder="What should it do?"></textarea>
@@ -390,6 +395,8 @@
         <label class="ao-field"><span class="field-label">Model</span>
           <input id="agent-model" list="agent-models" maxlength="100" autocomplete="off" spellcheck="false"></label>
         <datalist id="agent-models"></datalist>
+        <label class="ao-field claude-only" id="ao-account" hidden><span class="field-label">Account <span class="field-hint">fw hub account</span></span>
+          <select id="agent-account"></select></label>
         <label class="ao-field claude-only"><span class="field-label">Permissions</span>
           <select id="agent-mode"></select></label>
         <label class="ao-field codex-only"><span class="field-label">Approval</span>

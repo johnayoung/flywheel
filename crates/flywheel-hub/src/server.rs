@@ -64,6 +64,7 @@ mod autopilot_api;
 mod broadcast_api;
 mod ca_page;
 mod commands_api;
+mod conversations_api;
 mod deflate;
 mod detect_api;
 mod digest_api;
@@ -280,6 +281,11 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
                 .patch(update_session)
                 .delete(worktree_api::remove_session),
         )
+        .route(
+            "/api/workspaces/{id}/conversations",
+            get(conversations_api::list),
+        )
+        .route("/api/claude-accounts", get(conversations_api::accounts))
         .route("/api/kinds", get(list_kinds))
         .route("/api/templates", get(templates_api::list))
         .route("/api/workspaces/{id}/templates", post(templates_api::save))

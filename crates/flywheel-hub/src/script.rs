@@ -589,6 +589,18 @@ pub(crate) struct NewArgs {
     /// folder's current branch).
     #[arg(long, requires = "worktree", value_name = "REF")]
     base: Option<String>,
+    /// Claude: launch under this account (`fw hub account ls`) instead of
+    /// the CLI's own login.
+    #[arg(long, value_name = "NAME")]
+    account: Option<String>,
+    /// Agents: resume the folder's conversation ID (`fw hub conversations`
+    /// lists them) instead of starting one.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["continue_", "worktree"])]
+    resume: Option<String>,
+    /// Agents: continue the folder's newest conversation (`claude
+    /// --continue`).
+    #[arg(long = "continue", conflicts_with = "worktree")]
+    continue_: bool,
     /// Print the new session as JSON instead of its id.
     #[arg(long)]
     json: bool,
@@ -728,6 +740,23 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
     }
     if let Some(task) = &worktree {
         body["worktree"] = json!({ "task": task, "base": args.base });
+    }
+    if let Some(account) = &args.account {
+        body["account"] = json!(account);
+    }
+    if let Some(id) = &args.resume {
+        body["resume"] = json!(id);
+    } else if args.continue_ {
+        body["resume"] = json!(crate::hub::RESUME_LATEST);
+    }
+    if body.get("resume").is_some() {
+        // A template's first prompt is for a new conversation.
+        if args.launch.prompt_text()?.is_some() {
+            return Err("a resumed conversation takes no --prompt: send it once it is up".into());
+        }
+        if let Some(map) = body.as_object_mut() {
+            map.remove("prompt");
+        }
     }
     let view = conn.blocking_call("POST", "/api/sessions", Some(&body))?;
     if let Some(worktree) = view.get("worktree") {
@@ -1159,6 +1188,96 @@ pub(crate) fn kill(args: &KillArgs, out: &mut dyn Write, err: &mut dyn Write) ->
         }
         Err(message) => fail(err, &message),
     }
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ConversationsArgs {
+    /// Workspace id, unique id prefix, or name.
+    workspace: String,
+    /// claude or codex.
+    #[arg(long, default_value = "claude", value_parser = ["claude", "codex"])]
+    kind: String,
+    /// One of the workspace's folders (default: its first).
+    #[arg(long, visible_alias = "repo", value_name = "FOLDER")]
+    folder: Option<PathBuf>,
+    /// At most this many, newest first.
+    #[arg(long, default_value_t = crate::conversations::DEFAULT_LIMIT)]
+    limit: usize,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+}
+
+/// A folder's past agent conversations: `fw hub new WS --kind K --resume
+/// ID` resumes one.
+pub(crate) fn conversations(
+    args: &ConversationsArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let result = connect(&args.endpoint).and_then(|conn| {
+        let workspaces = conn.blocking_workspaces()?;
+        let workspace = resolve(&workspaces, &args.workspace, "workspace")?;
+        let mut query = format!("kind={}&limit={}", args.kind, args.limit);
+        if let Some(folder) = &args.folder {
+            let folder = pick_folder(workspace, folder)?;
+            query.push_str(&format!(
+                "&folder={}",
+                query_escape(&folder.to_string_lossy())
+            ));
+        }
+        conn.blocking_call(
+            "GET",
+            &format!(
+                "/api/workspaces/{}/conversations?{query}",
+                str_field(workspace, "id")
+            ),
+            None,
+        )
+    });
+    let listed = match result {
+        Ok(listed) => listed,
+        Err(message) => return fail(err, &message),
+    };
+    if args.json {
+        print_json(out, &listed);
+        return 0;
+    }
+    let empty = Vec::new();
+    let list = listed
+        .get("conversations")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    if list.is_empty() {
+        let _ = writeln!(err, "fw hub: no {} conversations in that folder", args.kind);
+        return 0;
+    }
+    for conversation in list {
+        let when = crate::search_cli::local_time(str_field(conversation, "modified"));
+        let about = conversation
+            .get("title")
+            .or_else(|| conversation.get("prompt"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let open = conversation
+            .get("open_in")
+            .map(|s| {
+                format!(
+                    " [open in {}]",
+                    crate::search_cli::plain(str_field(s, "name"))
+                )
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "{}  {when}{open}  {}",
+            str_field(conversation, "id"),
+            crate::search_cli::plain(about)
+        );
+    }
+    0
 }
 
 #[derive(Debug, clap::Args)]

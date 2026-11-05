@@ -3,19 +3,23 @@
 
 /* --- worktrees and companion shells ------------------------------------- */
 
-/* The branch line under a session row (git folders and worktrees). */
+/* The branch line under a session row (git folders and worktrees): one
+   line, the branch name cut first, so counts that come and go never wrap
+   the row taller. */
 .session-git {
   grid-column: 3 / -1;
   display: flex;
   align-items: center;
   gap: .4rem;
   min-width: 0;
+  white-space: nowrap;
   margin-top: -.3rem;
   font-size: 10px;
   color: var(--ink-3);
   font-variant-numeric: tabular-nums;
 }
 .session-git svg { flex: none; width: .75rem; height: .75rem; }
+.session-git > :not(.branch) { flex: none; }
 .session-git .branch { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-git.worktree .branch { color: var(--ink-2); }
 .session-git .wt-tag {
@@ -52,6 +56,7 @@
   white-space: nowrap;
 }
 .session-folder.outside { font-style: italic; }
+.session-account { flex: none; color: var(--brass); white-space: nowrap; }
 .session.active .session-folder { color: var(--ink-2); }
 
 /* A companion shell hangs under its agent. */

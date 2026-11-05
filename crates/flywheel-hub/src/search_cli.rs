@@ -156,7 +156,7 @@ fn text(value: &Value, key: &str) -> String {
     plain(str_field(value, key))
 }
 
-fn plain(text: &str) -> String {
+pub(crate) fn plain(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -177,7 +177,7 @@ const CLI_BEFORE_CHARS: usize = 60;
 
 /// An RFC 3339 timestamp in local time, to the minute (as written when
 /// it does not parse).
-fn local_time(raw: &str) -> String {
+pub(crate) fn local_time(raw: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(raw) {
         Ok(at) => at
             .with_timezone(&chrono::Local)

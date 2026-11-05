@@ -47,6 +47,8 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 | GET | `/api/worktrees/plan?folder=&task=&base=` | `{"plan"\|null,"error"}` |
 | GET | `/api/sessions/{id}/ws` | terminal WebSocket (below) |
 | GET | `/api/kinds` | session kinds, each `available` |
+| GET | `/api/claude-accounts` | `{accounts:[{name,updated}]}` (never tokens); `POST /api/sessions` `"account":NAME` launches a claude session under one |
+| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, default 30): past conversations of the folder, newest first, `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `POST /api/sessions` `"resume":ID\|"latest"` resumes one |
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
@@ -74,7 +76,7 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/sessions/{id}/review/reviewer` | `{"kind"?,"base"?,"model"?,"dry_run"?}`: 201 launched, 200 asked again; 409 nothing |
 | GET | `/api/sessions/{id}/review/findings` | the reviewer's latest reply (409 none) |
 | POST | `/api/sessions/{id}/review/findings/send` | `{"prompt"?}` |
-| POST | `/api/sessions/{id}/handoff/compose` | `{"source":{"kind":"selection\|transcript\|command\|last_command\|diff",...},"max_bytes"?}` -> `{"prompt"}` |
+| POST | `/api/sessions/{id}/handoff/compose` | `{"source":{"kind":"selection\|transcript\|command\|last_command\|output\|diff",...},"max_bytes"?}` -> `{"prompt"}` |
 | POST | `/api/sessions/{id}/handoff` | `{"prompt","from"?,"source"?}`: pasted + Enter (128 KiB) |
 
 **Two-step**: `{"dry_run":true}` -> a plan (summary, exact `commands`, warnings, `refusal`, `needs_rebase`, `fingerprint`; commit adds `suspects`), then the body with `"confirm":fingerprint` runs it -> `{"ok","ran","url"?}`; 409 refused / changed since.

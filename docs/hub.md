@@ -41,7 +41,7 @@ Full syntax, flags, and files: [hub-reference](hub/reference.md). `fw hub <verb>
 |---|---|
 | Server | `start` `stop` `upgrade` `status` `logs` `serve` `install-service` `doctor` |
 | Sign-in and access | `open` `url` `token` `tls` `peer` `machine` `share` |
-| Sessions | `ls` `new` `send` `read` `wait` `attach` `kill` `relaunch` `explain` `import` `template` `queue` `broadcast` |
+| Sessions | `ls` `new` `send` `read` `wait` `attach` `kill` `relaunch` `explain` `import` `template` `queue` `broadcast` `conversations` `account` |
 | Agent output | `commands` `search` `activity` `digest` `record` |
 | Git and agents together | `review` `merge` `pr` `handoff` `ask-review` `fanout` `autopilot` |
 | Settings | `config` `plugin` `perms` |

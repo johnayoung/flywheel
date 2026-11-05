@@ -1557,6 +1557,7 @@ mod tests {
             launch: None,
             reviewer: None,
             review_of: None,
+            account: None,
         }
     }
 

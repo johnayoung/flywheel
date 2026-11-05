@@ -450,6 +450,7 @@ function pickedFolderChanged() {
   const checked = sessionForm.querySelector('input[name="repo"]:checked');
   const folder = workspace && checked ? workspace.folders.find((f) => f.path === checked.value) : null;
   worktrees.setFolder(folder || null);
+  launcher.setFolder(folder ? folder.path : null);
   updateSessionPlaceholder();
 }
 

@@ -486,7 +486,7 @@ const worktrees = window.FwHubWorktree({ $, el, icon, api });
 // The agent launcher and cost meter (launcher.js): the form's agent
 // fields, launch templates, quick launch, and token usage.
 const launcher = window.FwHubLauncher({
-  $, el, api, state, worktrees,
+  $, el, api, state, worktrees, age,
   // Usage rollups wait while lite (netlink.js).
   defer: (key, fn) => net.defer(key, fn),
   // The new-session form's pre-filled agent options (Settings: agents).

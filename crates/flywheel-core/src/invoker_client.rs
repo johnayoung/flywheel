@@ -78,6 +78,11 @@ afterward if time still allows.";
 /// iterations do not hammer the store.
 pub const DEFAULT_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Default minimum gap between context-usage readings. Each reading is an
+/// IPC round trip into the agent CLI, and usage only moves once per agent
+/// turn, so it is sampled far less often than the command queue is polled.
+pub const DEFAULT_CONTEXT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Control-command verbs. `interrupt` / `set_model` / `say` each map to one
 /// dispatch on the live agent; `approve` / `reject` are out-of-band verbs
 /// resolving a parked `awaiting_approval` lifecycle and are left for that
@@ -717,6 +722,8 @@ pub struct ControlCommandWatcher {
     clock: Clock,
     on_applied: Option<CommandAppliedObserver>,
     context_observer: Option<ContextUsageObserver>,
+    context_poll_interval: Duration,
+    last_context_poll: Option<tokio::time::Instant>,
     recovery_signal: Option<RecoverySignal>,
     nudge: Option<CheckpointNudge>,
 }
@@ -750,6 +757,8 @@ impl ControlCommandWatcher {
             clock: utc_now_clock(),
             on_applied: None,
             context_observer: None,
+            context_poll_interval: DEFAULT_CONTEXT_POLL_INTERVAL,
+            last_context_poll: None,
             recovery_signal: None,
             nudge: None,
         }
@@ -798,6 +807,13 @@ impl ControlCommandWatcher {
 
     pub fn with_context_observer(mut self, observer: ContextUsageObserver) -> Self {
         self.context_observer = Some(observer);
+        self
+    }
+
+    /// Minimum gap between context-usage readings (the first poll always
+    /// reads).
+    pub fn with_context_poll_interval(mut self, interval: Duration) -> Self {
+        self.context_poll_interval = interval;
         self
     }
 
@@ -903,10 +919,17 @@ impl ControlCommandWatcher {
     /// checkpoint nudge. Returns `true` when a recovery was requested (the
     /// agent has been interrupted best-effort; the caller cancels the run).
     async fn observe(&mut self, control: &dyn AgentControl) -> bool {
-        if let Some(observer) = &self.context_observer
-            && let Ok(reading) = control.context_usage().await
-        {
-            guarded(|| observer(&reading));
+        if let Some(observer) = &self.context_observer {
+            let now = tokio::time::Instant::now();
+            let due = self
+                .last_context_poll
+                .is_none_or(|last| now.duration_since(last) >= self.context_poll_interval);
+            if due {
+                self.last_context_poll = Some(now);
+                if let Ok(reading) = control.context_usage().await {
+                    guarded(|| observer(&reading));
+                }
+            }
         }
         if self
             .recovery_signal
@@ -1576,6 +1599,7 @@ mod tests {
                 .with_context_observer(Arc::new(move |reading| {
                     sink.lock().unwrap().push(reading.clone());
                 }))
+                .with_context_poll_interval(Duration::ZERO)
                 .run(control, cancel, stop_rx),
         );
         tokio::time::sleep(Duration::from_millis(40)).await;
@@ -1584,6 +1608,33 @@ mod tests {
         let readings = readings.lock().unwrap();
         assert!(readings.len() >= 2, "{}", readings.len());
         assert_eq!(readings[0]["used_percentage"], 42);
+    }
+
+    #[tokio::test]
+    async fn context_usage_is_sampled_at_its_own_slower_cadence() {
+        let store = Arc::new(InMemoryStore::new());
+        let (_, emit) = audit();
+        let control: Arc<dyn AgentControl> = Arc::new(ScriptedControl {
+            usage: Some(json!({"used_percentage": 42})),
+            ..ScriptedControl::default()
+        });
+        let readings: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = readings.clone();
+        let cancel = CancelHandle::new();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        // The command queue polls every 5ms; context usage at most once per
+        // the default interval, so a 40ms run reads it exactly once.
+        let task = tokio::spawn(
+            watcher(&store, emit)
+                .with_context_observer(Arc::new(move |reading| {
+                    sink.lock().unwrap().push(reading.clone());
+                }))
+                .run(control, cancel, stop_rx),
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        stop_tx.send(true).unwrap();
+        task.await.unwrap();
+        assert_eq!(readings.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

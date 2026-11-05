@@ -36,6 +36,7 @@ pub mod doctor;
 pub mod endpoint;
 pub mod fanout;
 pub mod fanout_cli;
+pub mod files;
 pub mod flywheel;
 pub mod git;
 pub mod handoff;

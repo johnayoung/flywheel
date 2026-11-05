@@ -218,6 +218,8 @@ window.FwHubPanes = function (ctx) {
       const fit = new window.FitAddon.FitAddon();
       term.loadAddon(fit);
       term.loadAddon(new window.WebLinksAddon.WebLinksAddon());
+      // Paths of files under the session's folders open in the viewer.
+      if (ctx.fileLinks) term.registerLinkProvider(ctx.fileLinks(term, () => pane.sessionId));
       const search = new window.SearchAddon.SearchAddon();
       term.loadAddon(search);
       pane.search = search;

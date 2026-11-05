@@ -93,28 +93,23 @@
 @keyframes alarm { 50% { opacity: .6; } }
 
 /* Hidden tools must not take clicks: visibility, not just opacity. They
-   float over the row's right end, so a hidden set takes no room from the
-   name. */
+   float over the row's right end, shown or not, so showing them never
+   reflows the name (a name that wrapped to two lines would push every row
+   below it down). Only the head row's own hover shows them, so the status
+   pill and count they cover stay readable while you work in its sessions. */
 .ws-tools {
   position: absolute;
   top: 50%;
   right: .5rem;
   transform: translateY(-50%);
   display: inline-flex;
-  padding-left: .4rem;
-  background: linear-gradient(90deg, transparent, var(--bg-2) .4rem);
+  padding-left: .9rem;
+  background: linear-gradient(90deg, transparent, var(--bg-2) .9rem);
   opacity: 0;
   visibility: hidden;
   transition: opacity .15s, visibility 0s .15s;
 }
-/* Shown, they take their room in the row (the name gives it up), so the
-   status pill and count beside it are never drawn over or clipped. */
-.workspace:hover .ws-tools, .workspace:focus-within .ws-tools {
-  position: static;
-  transform: none;
-  flex: none;
-  padding-left: .2rem;
-  background: none;
+.ws-head-row:hover .ws-tools, .ws-head-row:focus-within .ws-tools {
   opacity: 1;
   visibility: visible;
   transition: opacity .15s;
@@ -139,7 +134,7 @@
   /* The attached row keeps its whole name: its state and actions take a
      line of their own under it. */
   .session.active .session-meta { grid-column: 3 / -1; justify-content: flex-end; }
-  .session.active .session-actions { display: inline-flex; }
+  .session.active .session-actions { display: inline-flex; margin: 0; }
   .session.active .session-meta .session-state { display: inline; }
 }
 
@@ -262,7 +257,9 @@
 }
 .session.needs-you.active::before { background: var(--alert); }
 
-.session-actions { display: none; gap: 0; }
+/* Shown on hover in place of the state label: negative margins keep the
+   taller buttons from growing the row (and shifting every row below). */
+.session-actions { display: none; gap: 0; margin: -.35rem 0; }
 .session:hover .session-actions, .session:focus-within .session-actions { display: inline-flex; }
 .session:hover .session-state, .session:focus-within .session-state { display: none; }
 

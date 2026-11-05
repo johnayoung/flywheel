@@ -27,7 +27,9 @@ use crate::agent::{SessionKind, claude_transcript, codex_rollout, is_conversatio
 pub(crate) use crate::agentlog::Format;
 use crate::agentlog::{self, Event, JsonlTail, Line, PartKind, Read, Role};
 pub use crate::agentlog::{MAX_LINE_BYTES, READ_CHUNK};
-use crate::commands::{Command, CommandSource, MAX_BLOCK_BYTES, copyable, fenced_blocks, is_shell};
+use crate::commands::{
+    Command, CommandSource, MAX_BLOCK_BYTES, bang_spans, copyable, fenced_blocks, is_shell,
+};
 use crate::hub::{Hub, HubError, HubEvent};
 use crate::pty::{ENTER_DELAY, WriteOutcome, paste_bytes};
 use crate::state::{SessionRecord, StateError};
@@ -173,9 +175,13 @@ fn line(
     start: u64,
     each: &mut dyn FnMut(Item),
 ) {
-    // Cheap pre-filter: only lines with a fence, or usage, are parsed
-    // (big tool results are skipped unparsed).
-    let fenced = !usage_only && (contains(bytes, b"```") || contains(bytes, b"~~~"));
+    // Cheap pre-filter: only lines with a fence or an inline `! cmd`, or
+    // usage, are parsed (big tool results are skipped unparsed).
+    let fenced = !usage_only
+        && (contains(bytes, b"```")
+            || contains(bytes, b"~~~")
+            || contains(bytes, b"`!")
+            || contains(bytes, b"` !"));
     let usage = match format {
         Format::Claude => {
             contains(bytes, b"\"usage\"") && contains(bytes, b"\"type\":\"assistant\"")
@@ -432,66 +438,73 @@ impl SessionCommands {
         closed_only: bool,
     ) -> Vec<Command> {
         let mut added = Vec::new();
-        let mut index = 0;
         let mut fences = Vec::new();
         let mut matched_hook = false;
-        for text in &reply.texts {
-            for block in fenced_blocks(text) {
-                let block_index = index;
-                index += 1;
-                if source == CommandSource::Transcript {
-                    fences.push(block.text.clone());
-                }
-                if (closed_only && !block.closed) || block.text.len() > MAX_BLOCK_BYTES {
-                    continue;
-                }
-                let key = key_of(conversation, &reply.message_id, block_index);
-                if self.keys.contains(&key) {
-                    continue;
-                }
-                // The transcript line of a reply its Stop hook gave first.
-                if source == CommandSource::Transcript
-                    && let Some(at) = self
-                        .from_hook
-                        .iter()
-                        .position(|(c, t)| c.as_deref() == conversation && *t == block.text)
-                {
-                    self.from_hook.remove(at);
-                    matched_hook = true;
-                    continue;
-                }
-                // A rollout found after its notify fallback was used: the
-                // same text from the same conversation is the same block.
-                if source == CommandSource::Rollout
-                    && self.entries.iter().any(|c| {
-                        c.source == CommandSource::Notify
-                            && c.conversation.as_deref() == conversation
-                            && c.text == block.text
-                    })
-                {
-                    continue;
-                }
-                self.remember(key);
-                let lang = block.lang.clone();
-                let command = Command {
-                    seq: self.next_seq,
-                    conversation: conversation.map(str::to_owned),
-                    message_id: reply.message_id.clone(),
-                    timestamp: reply.timestamp.clone(),
-                    block_index,
-                    shell: is_shell(lang.as_deref(), &block.text),
-                    command: copyable(lang.as_deref(), &block.text),
-                    lang,
-                    text: block.text,
-                    source,
-                };
-                self.next_seq += 1;
-                if self.entries.len() == MAX_COMMANDS {
-                    self.entries.pop_front();
-                }
-                self.entries.push_back(command.clone());
-                added.push(command);
+        // Fences first, then inline `! cmd` spans: a fence keeps the index
+        // it had before spans were read.
+        let fenced = reply
+            .texts
+            .iter()
+            .flat_map(|t| fenced_blocks(t))
+            .map(|b| (b, true));
+        let spans = reply
+            .texts
+            .iter()
+            .flat_map(|t| bang_spans(t))
+            .map(|b| (b, false));
+        for (block_index, (block, is_fence)) in fenced.chain(spans).enumerate() {
+            if source == CommandSource::Transcript && is_fence {
+                fences.push(block.text.clone());
             }
+            if (closed_only && !block.closed) || block.text.len() > MAX_BLOCK_BYTES {
+                continue;
+            }
+            let key = key_of(conversation, &reply.message_id, block_index);
+            if self.keys.contains(&key) {
+                continue;
+            }
+            // The transcript line of a reply its Stop hook gave first.
+            if source == CommandSource::Transcript
+                && let Some(at) = self
+                    .from_hook
+                    .iter()
+                    .position(|(c, t)| c.as_deref() == conversation && *t == block.text)
+            {
+                self.from_hook.remove(at);
+                matched_hook = true;
+                continue;
+            }
+            // A rollout found after its notify fallback was used: the
+            // same text from the same conversation is the same block.
+            if source == CommandSource::Rollout
+                && self.entries.iter().any(|c| {
+                    c.source == CommandSource::Notify
+                        && c.conversation.as_deref() == conversation
+                        && c.text == block.text
+                })
+            {
+                continue;
+            }
+            self.remember(key);
+            let lang = block.lang.clone();
+            let command = Command {
+                seq: self.next_seq,
+                conversation: conversation.map(str::to_owned),
+                message_id: reply.message_id.clone(),
+                timestamp: reply.timestamp.clone(),
+                block_index,
+                shell: is_shell(lang.as_deref(), &block.text),
+                command: copyable(lang.as_deref(), &block.text),
+                lang,
+                text: block.text,
+                source,
+            };
+            self.next_seq += 1;
+            if self.entries.len() == MAX_COMMANDS {
+                self.entries.pop_front();
+            }
+            self.entries.push_back(command.clone());
+            added.push(command);
         }
         if source == CommandSource::Transcript && !fences.is_empty() {
             // Not the line of the hook's reply: what is left of it never
@@ -1660,6 +1673,30 @@ mod tests {
             Some("json"),
             "newest first"
         );
+    }
+
+    #[test]
+    fn inline_bang_commands_follow_the_fences_once_hook_or_transcript() {
+        let (_dir, book, record, path) = claude_setup("c1");
+        let reply = "Run `! gcloud auth login`, then:\n```bash\nls\n```";
+        // The Stop hook gives the reply first; its transcript line adds
+        // nothing more.
+        let hooked = book.note_stop(&record, &json!({"last_assistant_message": reply}));
+        assert_eq!(hooked.len(), 2);
+        assert_eq!((hooked[0].text.as_str(), hooked[0].block_index), ("ls", 0));
+        assert_eq!(hooked[1].text, "! gcloud auth login");
+        assert_eq!(hooked[1].command, "gcloud auth login");
+        assert_eq!(hooked[1].block_index, 1);
+        assert!(hooked[1].shell);
+        append(&path, &claude_line("u1", reply));
+        book.entry("s1").log().missed = None;
+        assert!(book.refresh(&record).is_empty(), "no duplicates");
+        // A reply with only an inline one comes from the transcript.
+        let next = claude_line("u2", "Type `! gh auth login` here.").replace("msg_1", "msg_2");
+        append(&path, &next);
+        let added = book.refresh(&record);
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].command, "gh auth login");
     }
 
     #[test]

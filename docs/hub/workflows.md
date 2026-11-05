@@ -28,6 +28,7 @@ Each fenced block is read from the agent's own record and served **exactly as wr
 
 - Sources: Claude's transcript (or the Stop hook's `last_assistant_message`, so blocks are in before `done`), Codex's rollout, else its `notify` payload. Tailed each second and per hook report; newest 500 per session persist.
 - Shell blocks: `bash sh zsh shell console fish ...`, or untagged ones that start like a command; `console` keeps only the commands.
+- In-session commands (Claude Code's `!` bash mode): an inline `` `! cmd` `` or a block of `! cmd` lines is a shell command; Copy / Send drop the `!`.
 - Send pastes (bracketed when enabled), Send + Run adds Enter; multi-line without bracketed paste: 409, use Copy. `--copy`: OSC 52, over SSH too (tmux: `set -g set-clipboard on`).
 - **Commands drawer** (`Alt C`): newest first; Send targets the companion shell (opened if needed). Keys: `j`/`k`, `c` copy, `1`-`9` a card, `s` send, `Shift S` send + run.
 

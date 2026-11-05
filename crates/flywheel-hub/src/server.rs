@@ -69,6 +69,7 @@ mod detect_api;
 mod digest_api;
 mod events_ws;
 mod fanout_api;
+mod files_api;
 mod flywheel_api;
 mod handoff_api;
 mod import_api;
@@ -307,6 +308,11 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             get(commands_api::list_commands),
         )
         .route("/api/sessions/{id}/paste", post(commands_api::paste))
+        .route("/api/sessions/{id}/file", get(files_api::read_file))
+        .route(
+            "/api/sessions/{id}/files/check",
+            post(files_api::check_files),
+        )
         .route(
             "/api/sessions/{id}/companion",
             post(worktree_api::companion),

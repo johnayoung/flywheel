@@ -120,6 +120,107 @@ pub fn fenced_blocks(markdown: &str) -> Vec<Fenced> {
     blocks
 }
 
+/// The inline code spans of `markdown` (outside its fences) that an agent
+/// gives as an in-session shell command: `` `! cmd` ``, Claude Code's bash
+/// mode prefix. Each comes back as an untagged block whose text is the
+/// span as written (`! cmd`); a placeholder (`` `! <command>` ``) is not a
+/// command.
+pub fn bang_spans(markdown: &str) -> Vec<Fenced> {
+    let mut spans = Vec::new();
+    let mut open: Option<Fence> = None;
+    let mut prose: Vec<&str> = Vec::new();
+    let flush = |prose: &mut Vec<&str>, spans: &mut Vec<Fenced>| {
+        if !prose.is_empty() {
+            code_spans(&prose.join("\n"), spans);
+            prose.clear();
+        }
+    };
+    for raw in markdown.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        match open {
+            None => {
+                if let Some((fence, _)) = opening_fence(line) {
+                    flush(&mut prose, &mut spans);
+                    open = Some(fence);
+                } else {
+                    prose.push(line);
+                }
+            }
+            Some(fence) => {
+                if closes(line, fence) {
+                    open = None;
+                }
+            }
+        }
+    }
+    flush(&mut prose, &mut spans);
+    spans
+}
+
+/// The `! cmd` code spans of a prose text (CommonMark: a backtick run
+/// opens, the next run of the same length closes; a line break inside is
+/// a space; one space is stripped from each end when both have one).
+fn code_spans(prose: &str, spans: &mut Vec<Fenced>) {
+    let bytes = prose.as_bytes();
+    let run_at = |i: usize| bytes[i..].iter().take_while(|&&b| b == b'`').count();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let len = run_at(i);
+        let start = i + len;
+        let mut j = start;
+        let mut end = None;
+        while j < bytes.len() {
+            if bytes[j] == b'`' {
+                let run = run_at(j);
+                if run == len {
+                    end = Some(j);
+                    break;
+                }
+                j += run;
+            } else {
+                j += 1;
+            }
+        }
+        let Some(end) = end else {
+            // No closing run: the backticks are literal.
+            i = start;
+            continue;
+        };
+        let content = prose[start..end].replace('\n', " ");
+        let content = match content.strip_prefix(' ').and_then(|c| c.strip_suffix(' ')) {
+            Some(inner) if !content.trim().is_empty() => inner.to_owned(),
+            _ => content,
+        };
+        if let Some(rest) = content.strip_prefix("! ") {
+            let rest = rest.trim();
+            if !rest.is_empty() && !rest.starts_with('<') && content.len() <= MAX_BLOCK_BYTES {
+                spans.push(Fenced {
+                    lang: None,
+                    text: content.trim_end().to_owned(),
+                    closed: true,
+                });
+            }
+        }
+        i = end + len;
+    }
+}
+
+/// A line given with Claude Code's bash-mode prefix: `!` then a command
+/// (`! ls`, `!ls`), not `!=` or a lone `!`.
+fn bang_line(line: &str) -> Option<&str> {
+    let rest = line.trim_start().strip_prefix('!')?;
+    let command = rest.strip_prefix(' ').unwrap_or(rest);
+    (!command.trim().is_empty() && !rest.starts_with('=')).then_some(command)
+}
+
 /// Info-string languages that are shell.
 const SHELL_LANGS: &[&str] = &[
     "bash",
@@ -358,6 +459,10 @@ fn looks_like_command(text: &str) -> bool {
     else {
         return false;
     };
+    // Claude Code's `! cmd`: the agent says it is a command.
+    if bang_line(first).is_some() {
+        return true;
+    }
     let first = first.strip_prefix("$ ").unwrap_or(first);
     let mut words = first.split_whitespace();
     let mut word = words.next().unwrap_or_default();
@@ -407,6 +512,21 @@ pub fn copyable(lang: Option<&str>, text: &str) -> String {
             .find(|l| !l.trim().is_empty())
             .is_some_and(|l| prompted(l))
     };
+    // `! cmd` lines (Claude Code's bash mode) run in a shell without
+    // their `!`: every command line has one, comments and blanks kept.
+    let shellish = lang.is_none_or(|l| SHELL_LANGS.contains(&l) && !CONSOLE_LANGS.contains(&l));
+    let commands = || {
+        lines
+            .iter()
+            .filter(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+    };
+    if shellish && commands().next().is_some() && commands().all(|l| bang_line(l).is_some()) {
+        return lines
+            .iter()
+            .map(|l| bang_line(l).unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
     let console = match lang {
         Some(lang) if CONSOLE_LANGS.contains(&lang) => true,
         Some(lang) if SHELL_LANGS.contains(&lang) => first_prompted(),
@@ -645,6 +765,45 @@ mod tests {
         // `$HOME` is not a prompt.
         assert_eq!(copyable(None, "$HOME/bin/x"), "$HOME/bin/x");
         assert_eq!(copyable(Some("console"), ""), "");
+    }
+
+    #[test]
+    fn bang_commands_are_shell_and_copy_without_the_bang() {
+        assert!(is_shell(None, "! gcloud auth login"));
+        assert!(is_shell(None, "!some-local-tool --flag"));
+        assert!(!is_shell(None, "!= 3"));
+        assert!(!is_shell(Some("rust"), "! x"));
+        assert_eq!(copyable(None, "! gcloud auth login"), "gcloud auth login");
+        assert_eq!(
+            copyable(Some("bash"), "# log in\n!gh auth login\n\n! gh auth status"),
+            "# log in\ngh auth login\n\ngh auth status"
+        );
+        // Not every line is a bang line: as written.
+        assert_eq!(copyable(None, "! ls\npwd"), "! ls\npwd");
+        assert_eq!(copyable(Some("python"), "! ls"), "! ls");
+    }
+
+    #[test]
+    fn bang_spans_find_inline_in_session_commands() {
+        let texts = |md: &str| {
+            bang_spans(md)
+                .into_iter()
+                .map(|b| b.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            texts("Run `! gcloud auth login` here, then `` ! echo `x` ``.\nAlso `ls` and `!=`."),
+            vec!["! gcloud auth login", "! echo `x`"]
+        );
+        // Inside a fence, a placeholder, an unclosed span, an escaped tick.
+        assert!(texts("```\n`! ls`\n```\ntype `! <command>`, \\`! no` and `! open").is_empty());
+        // A span broken over two lines.
+        assert_eq!(texts("try `! cargo\ntest` now"), vec!["! cargo test"]);
+        assert!(
+            bang_spans("`! ls`")
+                .iter()
+                .all(|b| b.lang.is_none() && b.closed)
+        );
     }
 
     #[test]

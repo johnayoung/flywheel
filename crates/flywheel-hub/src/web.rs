@@ -127,6 +127,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         "image/png",
     ),
     ("commands.js", include_bytes!("../web/commands.js"), JS),
+    ("files.js", include_bytes!("../web/files.js"), JS),
     ("import.js", include_bytes!("../web/import.js"), JS),
     ("onboarding.js", include_bytes!("../web/onboarding.js"), JS),
     ("worktree.js", include_bytes!("../web/worktree.js"), JS),

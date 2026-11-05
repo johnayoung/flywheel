@@ -39,6 +39,8 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 | POST | `/api/sessions/{id}/input` | `{"data","paste"?,"enter"?}`; 409 not running / not reading |
 | POST | `/api/sessions/{id}/paste` | `{"text","run"?}`: `/input` with `paste`, trailing newlines dropped, 1 MiB; 409 unsafe multi-line |
 | GET | `/api/sessions/{id}/commands[?limit=N&all=true]` | newest first (shell unless `all`; `limit` 1..500, 50) |
+| GET | `/api/sessions/{id}/file?path=` | a file the session names: relative to its cwd, worktree, or workspace folders, or absolute / `~/`; must resolve (symlinks too) under those; `{"path","size","text","truncated"}` (first 2 MiB); 403 outside, 404 none, 415 binary |
+| POST | `/api/sessions/{id}/files/check` | `{"paths":[...]}` (64): `{"files":[{"path","size"}\|null]}`, in order |
 | GET | `/api/sessions/{id}/transcript[?around=N&before=N&after=N]` | messages, paged (30, max 200); 400 a shell |
 | POST | `/api/sessions/{id}/companion` | `{"text"?,"run"?}`: companion shell (201 / 200 running), `text` pasted when ready |
 | GET | `/api/sessions/{id}/worktree` | path, branch, base, dirty / untracked / unmerged, removal `refusal` |

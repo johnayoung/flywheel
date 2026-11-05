@@ -379,6 +379,15 @@ const commands = window.FwHubCommands({
   handoff: () => handoff,
 });
 
+// Files a terminal names, and their viewer (files.js).
+const files = window.FwHubFiles({
+  el,
+  icon,
+  api,
+  toast: (...args) => commands.toast(...args),
+  copyText: (text) => commands.copyText(text),
+});
+
 // One overlay over the terminal at a time: opening a drawer closes the
 // others and the "why?" popover (which would cover the drawer's top).
 function closeOverlays(keep) {

@@ -129,6 +129,7 @@ const panes = window.FwHubPanes({
   IS_MAC,
   copyText: (text) => commands.copyText(text),
   toast: (...args) => commands.toast(...args),
+  fileLinks: (term, sessionOf) => files.linkProvider(term, sessionOf),
   fitTerminal: (pane) => mobile.fitTerminal(pane),
   attachTerminal: (pane) => mobile.attachTerminal(pane.term),
   themeMessage: () => themeMessage(),

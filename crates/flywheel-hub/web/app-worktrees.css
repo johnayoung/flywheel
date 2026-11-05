@@ -31,6 +31,29 @@
 .session-git .dirty, .session-git .untracked { color: var(--brass); }
 .session.active .session-git { color: var(--ink-2); }
 
+/* The folder a session runs in, then its branch line, on one line under
+   the row; the folder gives up room first. */
+.session-where {
+  grid-column: 3 / -1;
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  min-width: 0;
+  margin-top: -.3rem;
+  font-size: 10px;
+  color: var(--ink-3);
+}
+.session-where .session-git { flex: 0 1 auto; margin-top: 0; }
+.session-folder {
+  flex: 0 1 auto;
+  min-width: 2.5rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-folder.outside { font-style: italic; }
+.session.active .session-folder { color: var(--ink-2); }
+
 /* A companion shell hangs under its agent. */
 .session.companion { padding-left: 2.9rem; min-height: 1.8rem; }
 .session.companion::after {

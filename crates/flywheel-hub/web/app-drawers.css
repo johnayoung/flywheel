@@ -297,6 +297,38 @@
   scrollbar-width: thin;
   scrollbar-color: var(--rule-2) transparent;
 }
+/* The file viewer (files.js): line numbers stay put while long lines
+   scroll sideways; the line a link named is marked. */
+.fv-tools { display: flex; align-items: center; gap: .4rem; flex: none; }
+.fv-meta { display: block; overflow-wrap: anywhere; }
+.fv-body { padding: 0; }
+.fv-grid { position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr); min-width: max-content; }
+.fv-gutter, .fv-code { margin: 0; padding: .7rem 0 1.4rem; font: inherit; white-space: pre; tab-size: 4; }
+.fv-gutter {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  padding-left: .9rem;
+  padding-right: .8rem;
+  text-align: right;
+  color: var(--ink-3);
+  background: var(--bg);
+  border-right: 1px solid var(--rule);
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
+.fv-code { position: relative; z-index: 1; padding-left: .9rem; padding-right: 1.4rem; color: var(--ink); }
+.fv-mark {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(.7rem + var(--line) * 1.5em);
+  height: 1.5em;
+  background: color-mix(in srgb, var(--signal) 16%, transparent);
+  pointer-events: none;
+}
+.fv-body .tx-note { padding: .7rem 1.4rem; }
+
 .run-summary { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); font: inherit; }
 .run-entry { display: grid; grid-template-columns: 4.6rem minmax(0, 1fr); column-gap: .7rem; padding: .18rem 0; }
 .run-ts { color: var(--ink-3); font-variant-numeric: tabular-nums; }

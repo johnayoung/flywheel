@@ -319,9 +319,52 @@ function renderSession(session, index) {
     // line says it all.
     (session.companion_of && sessionById(session.companion_of)) || (session.review_of && sessionById(session.review_of))
       ? null
-      : worktrees.badge(session),
+      : whereLine(session),
     // Author <-> reviewer (handoff.js).
     handoff.pairChip(session),
+  );
+}
+
+// Where a session runs, as its workspace names it: the folder it was
+// opened in (and the subdirectory, if deeper), for a worktree the folder
+// it was cut from. A cwd outside every folder shows its last component.
+function sessionFolder(session) {
+  const trim = (path) => String(path || "").replace(/\/+$/, "") || "/";
+  const cwd = trim(session.cwd);
+  const folders = workspaceById(session.workspace_id)?.folders || [];
+  const repo = session.worktree ? trim(session.worktree.repo) : null;
+  const root = session.worktree ? trim(session.worktree.path) : null;
+  let folder = null;
+  let rest = "";
+  if (repo) {
+    folder = folders.find((f) => trim(f.path) === repo) || { path: repo };
+    rest = cwd.startsWith(`${root}/`) ? cwd.slice(root.length + 1) : "";
+  } else {
+    for (const f of folders) {
+      const path = trim(f.path);
+      if ((cwd === path || cwd.startsWith(`${path}/`)) && (!folder || path.length > trim(folder.path).length)) {
+        folder = f;
+      }
+    }
+    if (folder) rest = cwd.slice(trim(folder.path).length + 1);
+  }
+  const label = folder ? folderLabel(folder) : basename(cwd);
+  return { label: rest ? `${label}/${rest}` : label, outside: !folder };
+}
+
+// The line under a session row: its folder, then its branch (worktree.js).
+function whereLine(session) {
+  if (!session.cwd) return worktrees.badge(session);
+  const folder = sessionFolder(session);
+  return el(
+    "span",
+    { className: "session-where" },
+    el("span", {
+      className: `session-folder${folder.outside ? " outside" : ""}`,
+      textContent: folder.label,
+      title: folder.outside ? `${session.cwd} (outside the workspace's folders)` : session.cwd,
+    }),
+    worktrees.badge(session),
   );
 }
 

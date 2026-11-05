@@ -28,24 +28,43 @@ pub fn open_hub(options: HubOptions) -> Arc<Hub> {
     }
 }
 
-/// Whether `pid` has exited: gone, or a zombie awaiting its reaper. Only
-/// positive evidence counts as dead: `kill` saying no such process, its
-/// `/proc` entry gone, or a zombie/dead state. A process a test spawned
-/// indirectly (a plugin's background child) is reparented when its parent
-/// dies, and whether that reaper waits for it is the environment's
-/// business, not the hub's: in a container whose PID 1 is `cargo`, it
-/// never is, and the exited process stays a zombie for good.
-pub fn process_dead(pid: i32) -> bool {
+/// Whether `pid`, a child of this test process (the hub runs in it, so
+/// the hub's own children are its to reap), has been reaped: `kill` says
+/// no such process. A zombie still counts as alive -- a hub that killed a
+/// child and never waited for it leaked it.
+pub fn child_reaped(pid: i32) -> bool {
     // SAFETY: kill(2) with signal 0 only probes for existence.
-    if unsafe { libc::kill(pid, 0) } != 0 {
-        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    let probed = unsafe { libc::kill(pid, 0) };
+    probed != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether `pid`, a process this test spawned only indirectly (a plugin's
+/// background child), has exited: gone, or a zombie awaiting a reaper that
+/// is not this process. Such a process is reparented when its parent dies,
+/// and whether that reaper waits for it is the environment's business, not
+/// the hub's: in a container whose PID 1 is `cargo`, it never does, and the
+/// exited process stays a zombie for good. Only positive evidence counts:
+/// without `/proc` (macOS) a process `kill` still finds is alive.
+pub fn orphan_exited(pid: i32) -> bool {
+    if child_reaped(pid) {
+        return true;
     }
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat
-            .rsplit(')')
-            .next()
-            .and_then(|rest| rest.split_whitespace().next())
-            .is_some_and(|state| matches!(state, "Z" | "X" | "x")),
-        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+    #[cfg(target_os = "linux")]
+    {
+        // `/proc/<pid>/stat`: `pid (comm) state ppid ...`; comm may hold
+        // spaces and parentheses, so split after the last `)`.
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let mut fields = stat.rsplit(')').next().unwrap_or("").split_whitespace();
+                let state = fields.next();
+                let ppid: Option<u32> = fields.next().and_then(|p| p.parse().ok());
+                matches!(state, Some("Z" | "X" | "x")) && ppid != Some(std::process::id())
+            }
+            Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }

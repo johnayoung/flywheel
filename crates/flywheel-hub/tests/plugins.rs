@@ -279,10 +279,56 @@ fn fire(env: &HashMap<String, String>, event: &str, payload: Value) {
     .unwrap();
 }
 
-/// Still running: an exited process left a zombie by a reaper that never
-/// waits (a container's PID 1) has not outlived anything.
-fn alive(pid: i32) -> bool {
-    !support::process_dead(pid)
+/// Still running. The plugin process itself is the hub's child: it is
+/// alive until the hub reaps it (a zombie means the hub never waited). Its
+/// background child is reparented when the plugin dies, and a zombie left
+/// by a reaper that never waits (a container's PID 1) has not outlived
+/// anything.
+fn alive(pid: i32, hubs_child: bool) -> bool {
+    if hubs_child {
+        !support::child_reaped(pid)
+    } else {
+        !support::orphan_exited(pid)
+    }
+}
+
+/// A process this test spawned and has not waited for is a zombie child
+/// of the test process -- the hub's position with its plugins -- and
+/// `alive` must count it alive until it is reaped, or a hub that kills a
+/// plugin and never waits for it would pass the bounded-run tests.
+#[test]
+fn an_unreaped_child_counts_as_alive() {
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let pid = i32::try_from(child.id()).unwrap();
+    // Let it exit without reaping it.
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap()
+            .rsplit(')')
+            .next()
+            .unwrap()
+            .trim_start()
+            .starts_with('Z')
+        {
+            assert!(Instant::now() < deadline, "{pid} never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(alive(pid, true), "an unreaped zombie child counted as gone");
+    assert!(
+        alive(pid, false),
+        "a zombie of ours counted as an orphan's leftover"
+    );
+    assert!(child.wait().unwrap().success());
+    assert!(!alive(pid, true));
+    assert!(!alive(pid, false));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -610,14 +656,14 @@ async fn plugins_receive_events_answer_actions_and_are_bounded() {
             .contains("timed out after 1s"),
         "{slow}"
     );
-    for file in ["slow.pid", "child.pid"] {
+    for (file, hubs_child) in [("slow.pid", true), ("child.pid", false)] {
         let pid: i32 = std::fs::read_to_string(probe.join(file))
             .unwrap()
             .trim()
             .parse()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while alive(pid) {
+        while alive(pid, hubs_child) {
             assert!(
                 Instant::now() < deadline,
                 "{file} {pid} survived the deadline"
@@ -861,14 +907,14 @@ esac
     let last = runs.last().unwrap();
     assert_eq!(last["trigger"], "action:hang");
     assert_eq!(last["timed_out"], true, "{last}");
-    for file in ["hang.pid", "hangchild.pid"] {
+    for (file, hubs_child) in [("hang.pid", true), ("hangchild.pid", false)] {
         let pid: i32 = std::fs::read_to_string(dir.join(file))
             .unwrap()
             .trim()
             .parse()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
-        while alive(pid) {
+        while alive(pid, hubs_child) {
             assert!(Instant::now() < deadline, "{file} {pid} outlived the run");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

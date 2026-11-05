@@ -19,6 +19,9 @@ window.FwHubDigest = function (ctx) {
   const card = $("#digest-card");
   let view = null; // last GET /api/digest
   let shown = null; // the report on the card
+  // Settings > Digest while it is on screen: its redraw, whether the form
+  // was edited since it was drawn, and a note to show on the next draw.
+  let form = null;
 
   const money = (n) => window.FwHubFmt.dollars(Number(n || 0));
   const local = (iso) => new Date(iso).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
@@ -92,7 +95,7 @@ window.FwHubDigest = function (ctx) {
     const note = d
       ? d.quiet
         ? "Not sent: nothing in it."
-        : `Sent to ${d.channels.length ? d.channels.join(", ") : "nowhere"}${d.push_error ? `; push failed: ${d.push_error}` : ""}.`
+        : `Sent to ${d.channels.length ? d.channels.join(", ") : "nowhere"}${d.push_error ? `; push failed: ${d.push_error}` : ""}.${(d.unheard || []).map((why) => ` Not received: ${why}.`).join("")}`
       : "";
     card.replaceChildren(...[
       el(
@@ -104,11 +107,15 @@ window.FwHubDigest = function (ctx) {
       ),
       el(
         "div",
-        { className: "away-stats" },
+        { className: "away-stats digest-stats" },
         stat(t.turns_finished || 0, "turns finished"),
         stat((t.blocked_now || 0) + (t.gates_waiting || 0), "need you", "bad"),
         stat(t.prs_red || 0, "PRs red", "bad"),
-        stat((t.prs_green || 0) + (t.prs_merged || 0), "PRs green / merged"),
+        stat(t.prs_green || 0, "PRs green"),
+        stat(t.prs_merged || 0, "PRs merged"),
+        stat(t.fanouts_graded || 0, "fan-outs graded"),
+        stat(t.autopilot_decisions || 0, "autopilot decisions"),
+        stat(t.queue_stalls || 0, "queue stalls", "bad"),
         el("div", { className: `away-stat${t.spend_today_usd ? "" : " zero"}` }, el("b", { textContent: money(t.spend_today_usd) }), el("span", { textContent: `today (${money(t.spend_week_usd)} week)` })),
       ),
       report.empty ? el("p", { className: "away-note", textContent: "Nothing happened, and nothing waits on you." }) : null,
@@ -201,7 +208,14 @@ window.FwHubDigest = function (ctx) {
     show(latest.id);
   }
 
+  // Settings is a modal (the top layer): the card shows once it is shut.
+  function closeSettings() {
+    const dialog = $("#dlg-settings");
+    if (dialog && dialog.open) dialog.close();
+  }
+
   async function preview(since) {
+    closeSettings();
     try {
       const q = since ? `?since=${encodeURIComponent(since)}` : "";
       render(await rawApi("GET", `/api/digest/preview${q}`));
@@ -211,6 +225,7 @@ window.FwHubDigest = function (ctx) {
   }
 
   async function sendNow() {
+    closeSettings();
     try {
       const report = await rawApi("POST", "/api/digest/send", {});
       render(report);
@@ -234,6 +249,16 @@ window.FwHubDigest = function (ctx) {
     );
   }
 
+  // hub.toml changed (a file edit, another client's save): an untouched
+  // form shows the new values; an edited one says so (a save would be
+  // refused as stale).
+  async function onConfig() {
+    await load();
+    if (!form || !form.alive()) return;
+    if (form.dirty) form.warn("hub.toml changed elsewhere since this form loaded: Save shows the new values first.");
+    else form.rerender();
+  }
+
   // The section's nodes; `rerender` draws it again (after a load).
   function settingsSection(rerender) {
     if (!view) {
@@ -254,19 +279,33 @@ window.FwHubDigest = function (ctx) {
     const channel = (name) => el("label", { className: "cmd-check" }, el("input", { type: "checkbox", value: name, checked: (view.channels || []).includes(name), dataset: { channel: name } }), ` ${name}`);
     const channels = el("div", { id: "digest-channels", className: "digest-channels" }, ["push", "browser", "plugin"].map(channel));
     const quiet = el("input", { type: "checkbox", id: "digest-quiet", checked: view.quiet_if_empty !== false });
-    const error = el("p", { className: "form-error" });
+    const error = el("p", { className: "form-error", textContent: form && form.note ? form.note : "" });
+    const drawnRev = view.rev;
+    const mine = { rerender, dirty: false, note: "", alive: () => times.isConnected, warn: (text) => { error.textContent = text; } };
+    form = mine;
+    for (const input of [times, zone, quiet, ...channels.querySelectorAll("input")]) {
+      input.addEventListener("input", () => { mine.dirty = true; });
+      input.addEventListener("change", () => { mine.dirty = true; });
+    }
     const save = async () => {
       const list = times.value.split(/[,\s]+/).map((t) => t.trim()).filter(Boolean);
       const picked = [...channels.querySelectorAll("input[data-channel]")].filter((c) => c.checked).map((c) => c.value);
-      const body = { times: list, channels: picked, quiet_if_empty: quiet.checked };
-      if (zone.value.trim()) body.timezone = zone.value.trim();
+      // Every key, written against the rev this form was drawn from.
+      const body = { times: list, channels: picked, quiet_if_empty: quiet.checked, timezone: zone.value.trim() };
+      if (typeof drawnRev === "number") body.rev = drawnRev;
       try {
         view = await rawApi("PUT", "/api/digest/config", body);
-        error.textContent = "";
         toast(view.enabled ? `Digests at ${view.times.join(", ")} (${view.timezone}).` : "Scheduled digests off.");
         rerender();
       } catch (e) {
-        error.textContent = e.message;
+        if (e.status === 409 && /changed since/.test(e.message)) {
+          await load();
+          const next = { ...mine, note: "hub.toml changed elsewhere: the form now shows it. Apply your change again." };
+          form = next;
+          rerender();
+        } else {
+          error.textContent = e.message;
+        }
       }
     };
     const last = (view.recent || [])[0];
@@ -316,5 +355,5 @@ window.FwHubDigest = function (ctx) {
     if (event.key === "Escape") dismiss();
   });
 
-  return { start, onPush, follow, settingsSection, paletteItems, reload: load };
+  return { start, onPush, onConfig, follow, settingsSection, paletteItems, reload: load };
 };

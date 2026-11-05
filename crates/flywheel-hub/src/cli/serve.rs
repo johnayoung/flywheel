@@ -411,6 +411,7 @@ pub(super) fn serve_cmd(
         flywheel.clone(),
         link_base,
     );
+    digest.set_plugins(Arc::clone(&plugins));
     {
         let _enter = runtime.enter();
         digest.start(&hub);

@@ -1144,6 +1144,8 @@ pub enum WriteError {
     /// The file cannot take them as asked (invalid on disk, unreadable,
     /// shaped so it cannot be rewritten in place).
     Conflict(String),
+    /// The file changed since the writer read it (`rev` moved on).
+    Stale(u64),
 }
 
 /// What reloading the file did.
@@ -1334,9 +1336,19 @@ impl ConfigWatch {
     /// checked to resolve before it is written (atomically, its mode
     /// kept), then reloaded. Refused while the file on disk is invalid or
     /// sets `digest` keys some other way (a dotted key, an inline table).
-    pub fn write_digest(&self, section: &crate::digest::DigestSection) -> Result<(), WriteError> {
-        crate::digest::DigestConfig::resolve(section).map_err(WriteError::Invalid)?;
+    /// `change` makes the new table from the one on disk; `rev`: the
+    /// [`Self::rev`] the writer read, refused as stale once it moved on.
+    pub fn write_digest(
+        &self,
+        rev: Option<u64>,
+        change: impl FnOnce(&crate::digest::DigestSection) -> crate::digest::DigestSection,
+    ) -> Result<(), WriteError> {
         let _ = self.reload();
+        if let Some(rev) = rev
+            && rev != self.rev()
+        {
+            return Err(WriteError::Stale(self.rev()));
+        }
         if let Some(error) = self.error() {
             return Err(WriteError::Conflict(format!(
                 "{} is invalid; fix it first: {error}",
@@ -1359,6 +1371,9 @@ impl ConfigWatch {
                 self.path.display()
             ))
         };
+        let on_disk = parse(&text).map_err(&by_hand)?;
+        let section = &change(&on_disk.digest);
+        crate::digest::DigestConfig::resolve(section).map_err(WriteError::Invalid)?;
         let spliced = crate::digest::splice_section(&text, section).map_err(&by_hand)?;
         let file = parse(&spliced).map_err(&by_hand)?;
         if file.digest != *section {

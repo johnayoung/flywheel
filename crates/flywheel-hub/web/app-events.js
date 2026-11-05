@@ -376,6 +376,7 @@ function onPush(message, machine) {
     digests.onPush(message);
   } else if (!machine && ["settings", "config", "plugins", "plugin_toast"].includes(message.type)) {
     settings.onPush(message);
+    if (message.type === "config") digests.onConfig();
   }
 }
 

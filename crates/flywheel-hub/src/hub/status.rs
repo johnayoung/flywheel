@@ -374,6 +374,11 @@ impl Hub {
         self.board().connect(client)
     }
 
+    /// How many events clients (browsers) are connected now.
+    pub fn connected_viewers(&self) -> usize {
+        self.board().viewer_count()
+    }
+
     pub fn disconnect_viewer(&self, viewer: u64) {
         let left = self.board().disconnect(viewer);
         for session_id in left {

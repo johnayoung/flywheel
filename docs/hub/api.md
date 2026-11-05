@@ -125,7 +125,7 @@ Fan-outs off: 503.
 | GET | `/api/digest` | schedule, `next`, `recent`, `push` host ([hub-workflows](workflows.md#digests)) |
 | GET | `/api/digest/preview[?since=]` | a digest, neither sent nor kept |
 | POST | `/api/digest/send` | `{"since"?}` -> the digest sent, `delivery` |
-| PUT | `/api/digest/config` | `{"times","timezone"?,"channels"?,"quiet_if_empty"?}` -> rewrites hub.toml `[digest]`; 422, 409 |
+| PUT | `/api/digest/config` | `{"times"?,"timezone"?,"channels"?,"quiet_if_empty"?,"rev"?}` (omitted: kept; `timezone:""`: system) -> rewrites hub.toml `[digest]`; 422; 409 (`stale`: `rev` moved on) |
 | GET | `/api/digests/{id}` | one of the last 14 |
 
 Times: RFC 3339, unix ms, an age (`90m`), `last-seen`. `ws`, `session`: id, prefix, or name. `kind`: comma list (`review` = `review.*`); beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A peer or `machines=none`: this hub alone.

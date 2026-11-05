@@ -531,6 +531,11 @@ impl StatusBoard {
         self.next_viewer
     }
 
+    /// How many client connections are registered.
+    pub fn viewer_count(&self) -> usize {
+        self.viewers.len()
+    }
+
     /// Drop a client connection. Returns the sessions it was viewing that
     /// nobody else views any more.
     pub fn disconnect(&mut self, viewer: u64) -> Vec<String> {

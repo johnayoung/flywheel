@@ -125,6 +125,12 @@ fn service(
 
 impl TestHub {
     async fn start(webhook: &Webhook) -> Self {
+        Self::start_with(webhook, false).await
+    }
+
+    /// With `watch`: the digest reads a real `hub.toml` watcher, and
+    /// Settings (`PUT /api/digest/config`) writes it.
+    async fn start_with(webhook: &Webhook, watch: bool) -> Self {
         flywheel_hub::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("repo/.git")).unwrap();
@@ -136,7 +142,29 @@ impl TestHub {
         options.claude_config_dir = Some(dir.path().join("claude-config"));
         let hub = support::open_hub(options);
         let config: SharedConfig = Arc::new(Mutex::new(DigestConfig::default()));
-        let digest = service(hub.state_dir(), &config, Some(webhook.notifier()));
+        let watcher = watch.then(|| {
+            Arc::new(
+                flywheel_hub::config::ConfigWatch::open(
+                    hub.state_dir(),
+                    flywheel_hub::config::Flags::default(),
+                    None,
+                )
+                .unwrap(),
+            )
+        });
+        let digest = match &watcher {
+            Some(watcher) => {
+                let watcher = Arc::clone(watcher);
+                DigestService::new(
+                    hub.state_dir(),
+                    move || watcher.current().digest,
+                    Some(webhook.notifier()),
+                    None,
+                    None,
+                )
+            }
+            None => service(hub.state_dir(), &config, Some(webhook.notifier())),
+        };
         let token = hub.token().expose().to_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -146,6 +174,7 @@ impl TestHub {
             Arc::clone(&hub),
             ServerOptions {
                 digest: Some(Arc::clone(&digest)),
+                config: watcher,
                 ..ServerOptions::default()
             },
             async {
@@ -319,6 +348,27 @@ async fn a_scheduled_digest_goes_out_once_with_names_and_counts_only() {
             .about(&about)
             .with("cost_usd", 0.42),
     );
+
+    // A browser open and a plugin listening for digest.ready: every
+    // channel is heard.
+    let _browser = hub.hub.connect_viewer("test-browser");
+    let plugin_dir = hub.hub.state_dir().join("plugins/digestlog");
+    std::fs::create_dir_all(&plugin_dir).unwrap();
+    std::fs::write(
+        plugin_dir.join("plugin.toml"),
+        "[[events]]\non = \"digest.ready\"\ncommand = [\"/bin/true\"]\n",
+    )
+    .unwrap();
+    flywheel_hub::plugins::set_enabled(hub.hub.state_dir(), "digestlog", true).unwrap();
+    hub.digest
+        .set_plugins(Arc::new(flywheel_hub::plugins::PluginHost::new(
+            hub.hub.state_dir(),
+            flywheel_hub::plugins::HostOptions {
+                max_concurrent: 1,
+                base_env: Vec::new(),
+                enabled: true,
+            },
+        )));
 
     let (hhmm, slot) = slot_in(2);
     *hub.config.lock().unwrap() = digest_config(&[hhmm]);
@@ -548,7 +598,22 @@ async fn an_empty_scheduled_digest_stays_quiet_and_a_failed_push_is_kept() {
     let error = view["recent"][0]["push_error"].as_str().unwrap();
     assert!(error.contains("503"), "{error}");
     assert!(!error.contains(TOPIC), "{error}");
-    assert_eq!(view["recent"][0]["channels"], json!(["browser", "plugin"]));
+    // No browser open, no plugin listening: not claimed as delivered, and
+    // said why.
+    assert_eq!(view["recent"][0]["channels"], json!([]));
+    let (_, kept) = hub
+        .call(
+            reqwest::Method::GET,
+            &format!("/api/digests/{}", view["recent"][0]["id"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    let unheard = kept["delivery"]["unheard"].to_string();
+    assert!(
+        unheard.contains("browser: no browser open")
+            && unheard.contains("plugin: no enabled plugin"),
+        "{unheard}"
+    );
     // A slot missed by more than the grace window is not sent late.
     let late = next + chrono::TimeDelta::days(1) + chrono::TimeDelta::hours(3);
     assert!(matches!(
@@ -556,5 +621,73 @@ async fn an_empty_scheduled_digest_stays_quiet_and_a_failed_push_is_kept() {
         Due::Skipped(_)
     ));
     assert_eq!(webhook.all().len(), 1);
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_writes_never_revert_a_newer_hub_toml() {
+    let webhook = Webhook::start(200).await;
+    let hub = TestHub::start_with(&webhook, true).await;
+    let path = hub.hub.state_dir().join(flywheel_hub::config::CONFIG_FILE);
+    let put = |body: Value| hub.call(reqwest::Method::PUT, "/api/digest/config", Some(body));
+
+    // Settings opens: it reads the schedule and the file's rev.
+    let (status, view) = put(json!({
+        "times": ["07:01"],
+        "timezone": "America/New_York",
+        "quiet_if_empty": false,
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let (_, opened) = hub.call(reqwest::Method::GET, "/api/digest", None).await;
+    let rev = opened["rev"].as_u64().unwrap();
+
+    // Meanwhile the file is edited by hand (07:05).
+    let text = std::fs::read_to_string(&path).unwrap();
+    // (A size change too: the watcher's fingerprint cannot miss it.)
+    std::fs::write(
+        &path,
+        format!("# edited by hand\n{}", text.replace("07:01", "07:05")),
+    )
+    .unwrap();
+
+    // The open form saves what it loaded: refused as stale, the file kept.
+    let (status, refused) = put(json!({ "times": ["07:01"], "rev": rev })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["stale"], true);
+    assert!(std::fs::read_to_string(&path).unwrap().contains("07:05"));
+
+    // Re-read and applied again: written; keys left out are kept.
+    let (_, fresh) = hub.call(reqwest::Method::GET, "/api/digest", None).await;
+    assert_eq!(fresh["times"], json!(["07:05"]));
+    let (status, saved) = put(json!({
+        "times": ["08:00", "08:00"],
+        "rev": fresh["rev"],
+    }))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["times"], json!(["08:00"]));
+    assert_eq!(saved["timezone"], "America/New_York");
+    assert_eq!(saved["timezone_source"], "file");
+    assert_eq!(saved["quiet_if_empty"], false);
+    // `timezone: ""` removes it (the system's zone).
+    let (status, cleared) = put(json!({ "timezone": "" })).await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_ne!(cleared["timezone_source"], "file");
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("timezone"));
+
+    // A digest cannot start after it ends.
+    let (status, error) = hub
+        .call(
+            reqwest::Method::GET,
+            "/api/digest/preview?since=2099-01-01T00:00:00Z",
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        error["error"].as_str().unwrap().contains("in the future"),
+        "{error}"
+    );
     hub.shutdown().await;
 }

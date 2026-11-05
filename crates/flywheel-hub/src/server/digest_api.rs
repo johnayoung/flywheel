@@ -45,20 +45,50 @@ fn owner_only(peer: Option<&axum::Extension<PeerInfo>>, what: &str) -> Result<()
     }
 }
 
+/// `since` as asked: not after now (a digest ends now).
 fn since_of(raw: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, Refused> {
-    raw.filter(|r| !r.trim().is_empty())
-        .map(|r| parse_time(r, chrono::Utc::now()))
+    let now = chrono::Utc::now();
+    let since = raw
+        .filter(|r| !r.trim().is_empty())
+        .map(|r| parse_time(r, now))
         .transpose()
-        .map_err(|message| Refused(StatusCode::BAD_REQUEST, format!("since: {message}")))
+        .map_err(|message| Refused(StatusCode::BAD_REQUEST, format!("since: {message}")))?;
+    if let Some(at) = since
+        && at > now
+    {
+        return Err(Refused(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "since: {} is in the future; a digest ends now",
+                at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+        ));
+    }
+    Ok(since)
+}
+
+/// `GET /api/digest`'s answer: the service's view, whether Settings may
+/// write it, and the hub.toml `rev` a write must name.
+async fn full_view(app: &AppState, digest: Arc<DigestService>) -> Response {
+    let config = app.options.config.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut view = digest.view();
+        view["editable"] = json!(config.is_some());
+        if let Some(config) = &config {
+            view["rev"] = json!(config.rev());
+        }
+        view
+    })
+    .await
+    {
+        Ok(view) => Json(view).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
 
 pub(super) async fn view(State(app): State<AppState>) -> Response {
     match service(&app) {
-        Ok(digest) => {
-            let mut view = digest.view();
-            view["editable"] = json!(app.options.config.is_some());
-            Json(view).into_response()
-        }
+        Ok(digest) => full_view(&app, digest).await,
         Err(refused) => refused.into_response(),
     }
 }
@@ -126,12 +156,45 @@ pub(super) async fn get_one(State(app): State<AppState>, Path(id): Path<String>)
     if !valid_id(&id) {
         return error_response(StatusCode::BAD_REQUEST, "not a digest id");
     }
-    match digest.get(&id) {
-        Some(report) => Json(report).into_response(),
-        None => error_response(
+    match tokio::task::spawn_blocking(move || digest.get(&id)).await {
+        Ok(Some(report)) => Json(report).into_response(),
+        Ok(None) => error_response(
             StatusCode::NOT_FOUND,
             "no such digest (the hub keeps its last 14)",
         ),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// `PUT /api/digest/config`: the keys given replace the file's (an
+/// omitted one is kept; `timezone: ""` removes it: the system's zone),
+/// written against `rev` (`GET /api/digest`) when given.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConfigPatch {
+    times: Option<Vec<String>>,
+    timezone: Option<String>,
+    channels: Option<Vec<String>>,
+    quiet_if_empty: Option<bool>,
+    rev: Option<u64>,
+}
+
+impl ConfigPatch {
+    fn apply(self, current: &DigestSection) -> DigestSection {
+        let mut next = current.clone();
+        if let Some(times) = self.times {
+            next.times = Some(times);
+        }
+        if let Some(zone) = self.timezone {
+            next.timezone = Some(zone).filter(|z| !z.trim().is_empty());
+        }
+        if let Some(channels) = self.channels {
+            next.channels = Some(channels);
+        }
+        if let Some(quiet) = self.quiet_if_empty {
+            next.quiet_if_empty = Some(quiet);
+        }
+        next
     }
 }
 
@@ -139,7 +202,7 @@ pub(super) async fn get_one(State(app): State<AppState>, Path(id): Path<String>)
 pub(super) async fn put_config(
     State(app): State<AppState>,
     peer: Option<axum::Extension<PeerInfo>>,
-    ApiJson(section): ApiJson<DigestSection>,
+    ApiJson(patch): ApiJson<ConfigPatch>,
 ) -> Response {
     if let Err(refused) = owner_only(peer.as_ref(), "configuring digests") {
         return refused.into_response();
@@ -152,21 +215,30 @@ pub(super) async fn put_config(
     };
     let written = {
         let config = Arc::clone(&config);
-        tokio::task::spawn_blocking(move || config.write_digest(&section)).await
+        let rev = patch.rev;
+        tokio::task::spawn_blocking(move || {
+            config.write_digest(rev, |current| patch.apply(current))
+        })
+        .await
     };
     match written {
         Ok(Ok(())) => {
             app.hub
                 .emit(crate::hub::HubEvent::Config { rev: config.rev() });
             match service(&app) {
-                Ok(digest) => {
-                    let mut view = digest.view();
-                    view["editable"] = json!(true);
-                    Json(view).into_response()
-                }
+                Ok(digest) => full_view(&app, digest).await,
                 Err(refused) => refused.into_response(),
             }
         }
+        Ok(Err(WriteError::Stale(rev))) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "hub.toml changed since this was read; re-read it and apply again",
+                "stale": true,
+                "rev": rev,
+            })),
+        )
+            .into_response(),
         Ok(Err(WriteError::Invalid(errors))) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({ "error": errors.first().cloned().unwrap_or_default(), "errors": errors })),

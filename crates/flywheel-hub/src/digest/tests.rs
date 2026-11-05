@@ -378,6 +378,84 @@ fn a_send_whose_hub_died_is_resent_once_by_the_next() {
 }
 
 #[test]
+fn a_leftover_claim_never_wedges_later_digests() {
+    let config = config(&["08:00", "18:00"], "UTC");
+    let always = |_: u32| true;
+    // A hub as pid 1 (a container) killed mid-send; restarted as pid 1
+    // again with a new owner: its own pid "runs", yet the claim is dead.
+    let mut marker = Marker::default();
+    let before = claimant(1, "before");
+    let after = claimant(1, "after");
+    decide(
+        &mut marker,
+        &config,
+        utc(2026, 5, 1, 7, 0),
+        &before,
+        &always,
+    );
+    let Due::Send(claimed) = decide(
+        &mut marker,
+        &config,
+        utc(2026, 5, 1, 8, 0),
+        &before,
+        &always,
+    )
+    .0
+    else {
+        panic!()
+    };
+    let Due::Send(again) = decide(&mut marker, &config, utc(2026, 5, 1, 8, 1), &after, &always).0
+    else {
+        panic!("the restarted hub must deliver the dead claim")
+    };
+    assert_eq!(again.id, claimed.id);
+    assert_eq!(
+        decide(&mut marker, &config, utc(2026, 5, 1, 8, 2), &after, &always).0,
+        Due::Idle,
+        "under way with the restarted hub"
+    );
+
+    // A claimer whose pid looks alive (reused by another process) but that
+    // never finished: dropped after CLAIM_TTL, not sent again, and the
+    // next slot goes out.
+    let mut reused = Marker::default();
+    let gone = claimant(300, "gone");
+    let next = claimant(400, "next");
+    decide(&mut reused, &config, utc(2026, 5, 1, 7, 0), &gone, &always);
+    decide(&mut reused, &config, utc(2026, 5, 1, 8, 0), &gone, &always);
+    assert_eq!(
+        decide(&mut reused, &config, utc(2026, 5, 1, 8, 4), &next, &always).0,
+        Due::Idle,
+        "a live claimer within CLAIM_TTL is waited for"
+    );
+    assert_eq!(
+        decide(&mut reused, &config, utc(2026, 5, 1, 8, 6), &next, &always).0,
+        Due::Idle
+    );
+    assert!(reused.pending.is_none(), "dropped after CLAIM_TTL");
+    let Due::Send(evening) = decide(&mut reused, &config, utc(2026, 5, 1, 18, 0), &next, &always).0
+    else {
+        panic!("the next slot must not be held off")
+    };
+    assert_eq!(evening.slot, Some(utc(2026, 5, 1, 18, 0)));
+
+    // Our own claim whose release failed (the marker write after the
+    // send): held only for CLAIM_TTL, then the schedule carries on.
+    let mut own = Marker::default();
+    let me = claimant(500, "me");
+    decide(&mut own, &config, utc(2026, 5, 1, 7, 0), &me, &always);
+    decide(&mut own, &config, utc(2026, 5, 1, 8, 0), &me, &always);
+    assert_eq!(
+        decide(&mut own, &config, utc(2026, 5, 1, 8, 1), &me, &always).0,
+        Due::Idle
+    );
+    assert!(matches!(
+        decide(&mut own, &config, utc(2026, 5, 1, 18, 0), &me, &always).0,
+        Due::Send(_)
+    ));
+}
+
+#[test]
 fn finished_digests_release_the_claim_and_keep_the_last_fourteen() {
     let mut marker = Marker {
         pending: Some(store::Pending {
@@ -475,6 +553,17 @@ fn the_digest_table_is_rewritten_in_place() {
     assert_eq!(crate::config::parse(&appended).unwrap().digest, section);
     let fresh = splice_section("", &section).unwrap();
     assert!(fresh.starts_with("[digest]\n"), "{fresh}");
+    // The next table's own comments (directly above its header) stay.
+    let next = "[digest]\ntimes = [\"08:00\"]\n\n# reviewer: keep codex for cost\n#  (second line)\n[review]\nreviewer = \"codex\"\n";
+    let out = splice_section(next, &section).unwrap();
+    assert!(
+        out.ends_with(
+            "\n\n# reviewer: keep codex for cost\n#  (second line)\n[review]\nreviewer = \"codex\"\n"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("08:00"), "{out}");
+    assert_eq!(crate::config::parse(&out).unwrap().digest, section);
 }
 
 #[test]
@@ -489,7 +578,7 @@ fn settings_write_the_digest_table_and_refuse_what_they_cannot_rewrite() {
         timezone: Some("Asia/Tokyo".into()),
         ..DigestSection::default()
     };
-    watch.write_digest(&section).unwrap();
+    watch.write_digest(None, |_| section.clone()).unwrap();
     let current = watch.current();
     assert_eq!(current.digest.times_text(), ["08:00"]);
     assert_eq!(current.digest.timezone.name(), "Asia/Tokyo");
@@ -506,15 +595,42 @@ fn settings_write_the_digest_table_and_refuse_what_they_cannot_rewrite() {
         ..DigestSection::default()
     };
     assert!(matches!(
-        watch.write_digest(&bad),
+        watch.write_digest(None, |_| bad.clone()),
         Err(crate::config::WriteError::Invalid(_))
     ));
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    // Written against an old rev (the file was edited since): refused,
+    // the newer file kept.
+    let read_at = watch.rev();
+    std::fs::write(
+        &path,
+        "[server]\nport = 7499\n\n[digest]\ntimes = [\"07:05\"]\n",
+    )
+    .unwrap();
+    let stale = DigestSection {
+        times: Some(vec!["07:01".into()]),
+        ..DigestSection::default()
+    };
+    assert!(matches!(
+        watch.write_digest(Some(read_at), |_| stale.clone()),
+        Err(crate::config::WriteError::Stale(_))
+    ));
+    assert!(std::fs::read_to_string(&path).unwrap().contains("07:05"));
+    // The change starts from what is on disk: keys it leaves alone stay.
+    watch
+        .write_digest(Some(watch.rev()), |current| DigestSection {
+            quiet_if_empty: Some(false),
+            ..current.clone()
+        })
+        .unwrap();
+    let kept = watch.current().digest;
+    assert_eq!(kept.times_text(), ["07:05"]);
+    assert!(!kept.quiet_if_empty);
     // Digest keys set as dotted keys elsewhere: not rewritten.
     std::fs::write(&path, "digest.timezone = \"UTC\"\n[server]\nport = 7499\n").unwrap();
     assert!(watch.reload() != crate::config::Reload::Unchanged);
     assert!(matches!(
-        watch.write_digest(&section),
+        watch.write_digest(None, |_| section.clone()),
         Err(crate::config::WriteError::Conflict(_))
     ));
 }

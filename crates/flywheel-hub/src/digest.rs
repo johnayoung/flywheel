@@ -44,6 +44,10 @@ pub const LOCK_FILE: &str = "digest.lock";
 /// A slot missed (the hub was down, the machine asleep) is still sent
 /// this long after it; later, it is skipped.
 pub const GRACE: Duration = Duration::hours(2);
+/// A claim (a send under way) older than this is abandoned even though
+/// its pid runs: a send takes seconds (the push waits at most 10 s), so
+/// such a claimer finished without releasing it, or its pid was reused.
+pub const CLAIM_TTL: Duration = Duration::minutes(5);
 /// The longest span one digest covers (a first one after a long pause).
 pub const MAX_SPAN: Duration = Duration::days(7);
 /// Digests kept for the in-app card and `#digest=` links.
@@ -293,19 +297,26 @@ pub fn decide(
     }
     let mut changed = false;
     if let Some(pending) = &mut marker.pending {
-        if pending.owner == me.owner && pending.pid == me.pid {
-            // Ours, under way.
+        let age = now - pending.claimed_at;
+        let mine = pending.pid == me.pid && pending.owner == me.owner;
+        // Our pid with another owner: a hub restarted under the pid the
+        // claimer had (pid 1 in a container) -- the claimer is gone.
+        let claimer_runs = mine || (pending.pid != me.pid && alive(pending.pid));
+        if claimer_runs && age <= CLAIM_TTL {
+            // Under way (ours, or another live hub's).
             return (Due::Idle, false);
         }
-        if alive(pending.pid) {
-            return (Due::Idle, false);
-        }
-        if now - pending.claimed_at <= GRACE {
+        if !claimer_runs && age <= GRACE {
             // Its claimer died mid-send: deliver it again.
             pending.pid = me.pid;
             pending.owner.clone_from(&me.owner);
+            pending.claimed_at = now;
             return (Due::Send(pending.clone()), true);
         }
+        // Abandoned: older than grace, or a "live" claimer that never
+        // finished in CLAIM_TTL (its marker write failed, or its pid now
+        // belongs to another process). Dropped, not sent again: it may
+        // have gone out.
         marker.pending = None;
         changed = true;
     }
@@ -367,7 +378,9 @@ pub fn valid_id(id: &str) -> bool {
 
 /// `text` (a `hub.toml`) with its `[digest]` table replaced by `section`
 /// (appended when there is none); every other line kept as it was. The
-/// table runs from its header to the next table header.
+/// table runs from its header to the next table header, less the comment
+/// lines directly above that header (they stay with it); comments inside
+/// `[digest]` are not kept.
 pub fn splice_section(text: &str, section: &DigestSection) -> Result<String, String> {
     let body = toml::to_string(section).map_err(|e| e.to_string())?;
     let block = format!("[digest]\n{body}");
@@ -386,12 +399,21 @@ pub fn splice_section(text: &str, section: &DigestSection) -> Result<String, Str
         if !replaced && is_digest(lines[i]) {
             out.push_str(&block);
             i += 1;
+            let start = i;
             while i < lines.len() && !is_header(lines[i]) {
                 i += 1;
             }
-            // Keep a blank line before the next table.
             if i < lines.len() {
+                // Comments right above the next header are its own.
+                let mut own = i;
+                while own > start && lines[own - 1].trim_start().starts_with('#') {
+                    own -= 1;
+                }
+                // Keep a blank line before the next table.
                 out.push('\n');
+                for line in &lines[own..i] {
+                    out.push_str(line);
+                }
             }
             replaced = true;
             continue;

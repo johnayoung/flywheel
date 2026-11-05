@@ -1027,6 +1027,22 @@ impl PluginHost {
         }
     }
 
+    /// How many enabled subscriptions [`Self::dispatch`] would run for
+    /// `event` with `payload` (0 while plugins are off). Reads the plugin
+    /// directory: call it off the async runtime.
+    pub fn listeners(&self, event: &str, payload: &Value) -> usize {
+        if !self.master() {
+            return 0;
+        }
+        self.plugins()
+            .iter()
+            .filter(|p| p.enabled)
+            .filter_map(|p| p.manifest.as_ref().ok())
+            .flat_map(|m| m.events.iter())
+            .filter(|sub| sub.on == event && sub.takes(payload))
+            .count()
+    }
+
     /// Run every enabled subscription to `event` (each on its own task;
     /// waits for a slot). `payload` is the event's data. Returns how many
     /// runs were started.

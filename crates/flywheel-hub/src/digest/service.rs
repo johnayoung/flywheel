@@ -19,7 +19,7 @@ use tokio::sync::broadcast::error::RecvError;
 const POLL: std::time::Duration = std::time::Duration::from_secs(30);
 
 type ConfigFn = Box<dyn Fn() -> DigestConfig + Send + Sync>;
-type AliveFn = Box<dyn Fn(u32) -> bool + Send + Sync>;
+type AliveFn = Arc<dyn Fn(u32) -> bool + Send + Sync>;
 
 /// Digests for one hub.
 pub struct DigestService {
@@ -33,6 +33,8 @@ pub struct DigestService {
     alive: AliveFn,
     /// One send at a time from this hub.
     sending: tokio::sync::Mutex<()>,
+    /// The hub's plugins (whether any listens for `digest.ready`).
+    plugins: std::sync::OnceLock<Arc<crate::plugins::PluginHost>>,
 }
 
 impl std::fmt::Debug for DigestService {
@@ -64,9 +66,25 @@ impl DigestService {
                 pid: std::process::id(),
                 owner: crate::state::new_id(),
             },
-            alive: Box::new(pid_alive),
+            alive: Arc::new(pid_alive),
             sending: tokio::sync::Mutex::new(()),
+            plugins: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The hub's plugin host: a digest names `plugin` as delivered only
+    /// when an enabled plugin subscribes to `digest.ready`.
+    pub fn set_plugins(&self, host: Arc<crate::plugins::PluginHost>) {
+        let _ = self.plugins.set(host);
+    }
+
+    /// `f` on a blocking thread (marker file, lock, journal reads).
+    async fn blocking<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, String> {
+        tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub fn config(&self) -> DigestConfig {
@@ -118,14 +136,18 @@ impl DigestService {
     }
 
     /// Decide what is due at `now` and send it.
-    pub async fn tick(&self, hub: &Hub, now: DateTime<Utc>) -> Due {
+    pub async fn tick(self: &Arc<Self>, hub: &Arc<Hub>, now: DateTime<Utc>) -> Due {
         let config = self.config();
-        let alive = &self.alive;
-        let me = &self.me;
-        let due = match self
-            .store
-            .update(|marker| decide(marker, &config, now, me, &|pid| alive(pid)))
-        {
+        let decided = {
+            let (store, config) = (self.store.clone(), config.clone());
+            let (me, alive) = (self.me.clone(), Arc::clone(&self.alive));
+            Self::blocking(move || {
+                store.update(|marker| decide(marker, &config, now, &me, &|pid| alive(pid)))
+            })
+            .await
+            .and_then(|r| r)
+        };
+        let due = match decided {
             Ok(due) => due,
             Err(e) => {
                 eprintln!("fw hub: digest marker: {e}");
@@ -144,16 +166,18 @@ impl DigestService {
                     .slot
                     .map_or("manual", |slot| schedule::label_of(&config.timezone, slot));
                 let _guard = self.sending.lock().await;
-                let report = self.make(
-                    hub,
-                    &config,
-                    pending.id.clone(),
-                    "scheduled",
-                    label,
-                    pending.slot,
-                    pending.since,
-                    pending.until,
-                );
+                let report = self
+                    .make_off_runtime(
+                        hub,
+                        &config,
+                        pending.id.clone(),
+                        "scheduled",
+                        label.to_owned(),
+                        pending.slot,
+                        pending.since,
+                        pending.until,
+                    )
+                    .await;
                 self.deliver(hub, &config, report, true).await;
             }
             Due::Off | Due::Idle => {}
@@ -191,22 +215,79 @@ impl DigestService {
     /// from `since` (default: since the last one); the next scheduled one
     /// starts where it ends.
     pub async fn send_now(
-        &self,
-        hub: &Hub,
+        self: &Arc<Self>,
+        hub: &Arc<Hub>,
         since: Option<DateTime<Utc>>,
     ) -> Result<Report, String> {
         let config = self.config();
         let _guard = self.sending.lock().await;
         let now = Utc::now();
-        let default_since = self.default_since(now);
-        let since = since.unwrap_or(default_since).min(now);
-        self.store.update(|marker| {
-            marker.last_until = Some(now);
-            ((), true)
-        })?;
+        let since = {
+            let me = Arc::clone(self);
+            Self::blocking(move || {
+                let since = since.unwrap_or_else(|| me.default_since(now)).min(now);
+                me.store
+                    .update(|marker| {
+                        marker.last_until = Some(now);
+                        ((), true)
+                    })
+                    .map(|()| since)
+            })
+            .await
+            .and_then(|r| r)?
+        };
         let id = format!("dg-m{}", now.timestamp_millis());
-        let report = self.make(hub, &config, id, "manual", "manual", None, since, now);
+        let report = self
+            .make_off_runtime(
+                hub,
+                &config,
+                id,
+                "manual",
+                "manual".to_owned(),
+                None,
+                since,
+                now,
+            )
+            .await;
         Ok(self.deliver(hub, &config, report, false).await)
+    }
+
+    /// [`Self::make`] on a blocking thread (it reads the journal).
+    #[allow(clippy::too_many_arguments)]
+    async fn make_off_runtime(
+        self: &Arc<Self>,
+        hub: &Arc<Hub>,
+        config: &DigestConfig,
+        id: String,
+        trigger: &'static str,
+        label: String,
+        slot: Option<DateTime<Utc>>,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Report {
+        let (me, hub, config) = (Arc::clone(self), Arc::clone(hub), config.clone());
+        let made = Self::blocking({
+            let (id, label) = (id.clone(), label.clone());
+            move || me.make(&hub, &config, id, trigger, &label, slot, since, until)
+        })
+        .await;
+        made.unwrap_or_else(|e| {
+            // The blocking pool is gone (shutting down): an empty digest
+            // still releases the claim.
+            eprintln!("fw hub: digest: {e}");
+            build(&Inputs {
+                id,
+                trigger,
+                label,
+                slot,
+                since,
+                until,
+                tz: self.config().timezone,
+                rows: &[],
+                live: &Live::default(),
+                hub_url: self.hub_url.as_deref(),
+            })
+        })
     }
 
     /// A kept digest.
@@ -380,38 +461,66 @@ impl DigestService {
         if scheduled && report.empty && config.quiet_if_empty {
             delivery.quiet = true;
         } else {
-            if config.channels.push
-                && let Some(notifier) = &self.notifier
-            {
-                match notifier.send(&report.push()).await {
-                    Ok(()) => delivery.channels.push("push".to_owned()),
-                    Err(e) => {
-                        eprintln!("fw hub: digest push failed: {e}");
-                        delivery.push_error = Some(e);
-                    }
+            if config.channels.push {
+                match &self.notifier {
+                    Some(notifier) => match notifier.send(&report.push()).await {
+                        Ok(()) => delivery.channels.push("push".to_owned()),
+                        Err(e) => {
+                            eprintln!("fw hub: digest push failed: {e}");
+                            delivery.push_error = Some(e);
+                        }
+                    },
+                    None => delivery
+                        .unheard
+                        .push("push: notify.toml is not set up".to_owned()),
                 }
             }
             if config.channels.browser {
-                delivery.channels.push("browser".to_owned());
+                if hub.connected_viewers() > 0 {
+                    delivery.channels.push("browser".to_owned());
+                } else {
+                    delivery.unheard.push(
+                        "browser: no browser open (the card shows when one opens)".to_owned(),
+                    );
+                }
             }
             if config.channels.plugin {
-                delivery.channels.push("plugin".to_owned());
+                let listeners = match self.plugins.get() {
+                    Some(host) => {
+                        let host = Arc::clone(host);
+                        Self::blocking(move || host.listeners("digest.ready", &Value::Null))
+                            .await
+                            .unwrap_or(0)
+                    }
+                    None => 0,
+                };
+                if listeners > 0 {
+                    delivery.channels.push("plugin".to_owned());
+                } else {
+                    delivery
+                        .unheard
+                        .push("plugin: no enabled plugin listens for digest.ready".to_owned());
+                }
             }
         }
         report.delivery = Some(delivery);
         // Kept before it is announced: a browser told reads it at once.
-        if let Err(e) = self.store.update(|marker| {
-            finish(marker, &report);
-            ((), true)
-        }) {
+        let kept = {
+            let (store, report) = (self.store.clone(), report.clone());
+            Self::blocking(move || {
+                store.update(|marker| {
+                    finish(marker, &report);
+                    ((), true)
+                })
+            })
+            .await
+            .and_then(|r| r)
+        };
+        if let Err(e) = kept {
             eprintln!("fw hub: digest marker: {e}");
         }
-        let channels = &report
-            .delivery
-            .as_ref()
-            .map(|d| d.channels.clone())
-            .unwrap_or_default();
-        if !report.delivery.as_ref().is_some_and(|d| d.quiet) {
+        let quiet = report.delivery.as_ref().is_some_and(|d| d.quiet);
+        if !quiet {
             let row =
                 crate::activity::digest_row(&serde_json::to_value(&report).unwrap_or(Value::Null));
             if let Some(row) = hub.activity().record(row) {
@@ -420,12 +529,14 @@ impl DigestService {
                 });
             }
         }
-        if channels.iter().any(|c| c == "browser") {
+        // Announced over every channel configured, heard or not (a browser
+        // or plugin may arrive between the count and the event).
+        if !quiet && config.channels.browser {
             hub.emit(HubEvent::Digest {
                 id: report.id.clone(),
             });
         }
-        if channels.iter().any(|c| c == "plugin") {
+        if !quiet && config.channels.plugin {
             hub.emit_lifecycle(
                 "digest.ready",
                 json!({ "digest": serde_json::to_value(&report).unwrap_or(Value::Null) }),

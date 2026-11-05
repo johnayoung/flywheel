@@ -11,7 +11,7 @@
 use super::schedule;
 use crate::activity::{Row, scrub};
 use crate::util::dollars;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -169,6 +169,10 @@ pub struct Delivery {
     /// Nothing in it and `quiet_if_empty`: not delivered.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quiet: bool,
+    /// Channels configured that nothing received, each `channel: why`
+    /// (no browser open, no plugin listening, push not set up).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unheard: Vec<String>,
 }
 
 /// One digest.
@@ -690,7 +694,13 @@ impl Report {
 
     /// The plain-text digest `fw hub digest` prints (times in `tz`).
     pub fn text(&self, tz: &Tz) -> String {
-        let local = |at: DateTime<Utc>| at.with_timezone(tz).format("%a %d %b %H:%M").to_string();
+        // The year too when the span crosses one.
+        let format = if self.since.with_timezone(tz).year() == self.until.with_timezone(tz).year() {
+            "%a %d %b %H:%M"
+        } else {
+            "%a %d %b %Y %H:%M"
+        };
+        let local = |at: DateTime<Utc>| at.with_timezone(tz).format(format).to_string();
         let mut out = format!(
             "{} ({} - {}, {})\n{}\n",
             self.title(),
@@ -728,6 +738,9 @@ impl Report {
                     delivery.channels.join(", ")
                 };
                 out.push_str(&format!("Sent to: {to}\n"));
+                for why in &delivery.unheard {
+                    out.push_str(&format!("Not received: {why}\n"));
+                }
             }
             if let Some(e) = &delivery.push_error {
                 out.push_str(&format!("Push failed: {e}\n"));

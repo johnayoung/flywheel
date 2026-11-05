@@ -10,7 +10,10 @@
 //! A claim is written before anything is delivered (`pending`, with the
 //! claiming process's pid): a hub that dies mid-send leaves it, and the
 //! next hub delivers it again if that process is gone and the claim is
-//! within [`super::GRACE`]; a live claimer's send is never repeated.
+//! within [`super::GRACE`]; a live claimer's send is not repeated. A claim
+//! is dead when its pid is gone or is the claiming hub's own pid under
+//! another owner (a restart that reused it), and abandoned (dropped, not
+//! resent) past [`super::CLAIM_TTL`] whatever its pid.
 
 use super::Report;
 use chrono::{DateTime, Utc};

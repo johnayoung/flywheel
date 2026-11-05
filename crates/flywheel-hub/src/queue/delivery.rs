@@ -13,28 +13,31 @@ use std::sync::atomic::Ordering;
 
 impl Hub {
     /// The queue's start: settle items a dead hub left `sending`, then
-    /// look at the queues every [`TICK`] until the hub stops. Once per
-    /// hub; a live handoff's new hub starts it at commit.
+    /// look at the queues every [`TICK`] while any has an item to send,
+    /// until the hub stops. With none (or while paused) it sleeps until a
+    /// queue changes or the gate does. Once per hub; a live handoff's new
+    /// hub starts it at commit.
     pub(crate) fn start_queues(self: &Arc<Self>) {
         if self.queue_runtime().started.swap(true, Ordering::SeqCst) {
             return;
         }
         self.reconcile_queues();
         let weak = Arc::downgrade(self);
+        let wakeup = Arc::clone(&self.queue_runtime().wakeup);
         let spawned = std::thread::Builder::new()
             .name("hub-queue".into())
             .spawn(move || {
-                loop {
-                    std::thread::sleep(TICK);
+                // Waits never hold the hub: dropping it closes the wakeup.
+                let mut wait = Some(TICK);
+                while wakeup.wait(wait) {
                     let Some(hub) = weak.upgrade() else {
                         break;
                     };
                     if hub.queue_runtime().is_stopped() {
                         break;
                     }
-                    if !hub.queue_runtime().is_paused() {
-                        hub.queue_tick();
-                    }
+                    let sending = !hub.queue_runtime().is_paused() && hub.queue_tick();
+                    wait = sending.then_some(TICK);
                 }
             });
         if let Err(e) = spawned {
@@ -142,8 +145,9 @@ impl Hub {
         found
     }
 
-    /// One look at every queue with something to send.
-    fn queue_tick(&self) {
+    /// One look at every queue with something to send; returns whether
+    /// there was any (look again in a [`TICK`]).
+    fn queue_tick(&self) -> bool {
         let candidates: Vec<(SessionQueue, SessionRecord)> = {
             let store = self.store();
             store
@@ -153,6 +157,7 @@ impl Hub {
                 .filter_map(|(id, q)| Some((q.clone(), store.session(id).ok()?.clone())))
                 .collect()
         };
+        let any = !candidates.is_empty();
         for (queue, record) in candidates {
             let facts = self.queue_facts(&record, &queue);
             match decide(&queue, &facts) {
@@ -171,6 +176,7 @@ impl Hub {
                 Decision::Deliver(item) => self.deliver(&record.id, &item),
             }
         }
+        any
     }
 
     pub(crate) fn stall_queue(&self, id: &str, reason: &str, item: Option<&str>) {

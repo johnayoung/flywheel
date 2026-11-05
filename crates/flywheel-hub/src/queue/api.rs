@@ -210,7 +210,10 @@ impl Hub {
             .collect()
     }
 
+    /// A queue changed: tell clients, and wake the delivery thread (an
+    /// item may be ready to go).
     pub(crate) fn queue_changed(&self) {
+        self.queue_runtime().wakeup.nudge();
         self.emit(HubEvent::Sessions);
     }
 

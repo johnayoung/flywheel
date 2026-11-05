@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 /// What a queue delivery may not overlap: a handoff or shutdown.
@@ -16,6 +16,55 @@ struct Gate {
     stopped: bool,
     /// One is under way.
     delivering: bool,
+}
+
+/// Wakes the delivery thread: a queue changed (an item may be ready to
+/// go), or the gate opened or closed. With nothing to send it waits here
+/// with no timeout, so idle queues cost no wakeups.
+#[derive(Debug, Default)]
+pub(crate) struct Wakeup {
+    state: Mutex<WakeState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct WakeState {
+    nudged: bool,
+    /// The runtime is gone (its hub dropped): the thread ends.
+    closed: bool,
+}
+
+impl Wakeup {
+    pub(crate) fn nudge(&self) {
+        lock(&self.state).nudged = true;
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait for a nudge (consuming it), for at most `timeout` (`None`:
+    /// however long). False once closed.
+    pub(crate) fn wait(&self, timeout: Option<Duration>) -> bool {
+        let state = lock(&self.state);
+        let woken = |s: &mut WakeState| !s.nudged && !s.closed;
+        let mut state = match timeout {
+            Some(timeout) => {
+                self.changed
+                    .wait_timeout_while(state, timeout, woken)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            }
+            None => self
+                .changed
+                .wait_while(state, woken)
+                .unwrap_or_else(PoisonError::into_inner),
+        };
+        state.nudged = false;
+        !state.closed
+    }
 }
 
 /// Who holds sessions: review actions running on them.
@@ -177,6 +226,15 @@ pub struct QueueRuntime {
     gate: Mutex<Gate>,
     gate_changed: Condvar,
     pub(crate) started: AtomicBool,
+    /// Shared with the delivery thread, which waits on it without holding
+    /// the hub (see [`Wakeup`]).
+    pub(crate) wakeup: Arc<Wakeup>,
+}
+
+impl Drop for QueueRuntime {
+    fn drop(&mut self) {
+        self.wakeup.close();
+    }
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -226,12 +284,14 @@ impl QueueRuntime {
     /// Deliver again after [`QueueRuntime::pause`].
     pub(crate) fn resume(&self) {
         lock(&self.gate).paused = false;
+        self.wakeup.nudge();
     }
 
     /// Stop for good (shutdown), waiting up to `timeout` for a delivery.
     pub(crate) fn stop(&self, timeout: Duration) {
         let mut gate = lock(&self.gate);
         gate.stopped = true;
+        self.wakeup.nudge();
         self.wait_idle(gate, timeout);
     }
 

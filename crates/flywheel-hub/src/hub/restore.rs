@@ -66,7 +66,10 @@ impl Hub {
         // once the new agent is at rest.
         if store.queue(id).is_some_and(|q| q.stalled.is_some()) {
             match store.update_queue(id, |q| q.stalled = None) {
-                Ok(()) => eprintln!("fw hub: queue {id}: relaunched, so its stall is cleared"),
+                Ok(()) => {
+                    eprintln!("fw hub: queue {id}: relaunched, so its stall is cleared");
+                    self.queue_runtime().wakeup.nudge();
+                }
                 Err(e) => eprintln!("fw hub: queue {id}: stall not cleared: {e}"),
             }
         }

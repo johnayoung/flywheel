@@ -2,6 +2,7 @@ use super::deciding::{Decision, Facts, Presence, decide, normalized};
 use super::runtime::Draft;
 use super::*;
 use crate::status::{AgentStatus, StatusView};
+use std::sync::Arc;
 
 fn at(secs: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
@@ -360,4 +361,32 @@ fn an_editor_lease_lapses_or_is_let_go() {
     assert!(rt.is_editing("i1"));
     rt.set_editing("i1", false);
     assert!(!rt.is_editing("i1"));
+}
+
+/// The delivery thread's wakeup: a nudge sent while it is busy is kept
+/// for its next wait, a resume or stop nudges, and dropping the runtime
+/// (the hub) ends a wait with no timeout.
+#[test]
+fn the_delivery_wakeup_keeps_nudges_and_closes_with_the_runtime() {
+    let rt = QueueRuntime::default();
+    let wakeup = Arc::clone(&rt.wakeup);
+    // Nothing pending: a bounded wait times out (still open).
+    let started = std::time::Instant::now();
+    assert!(wakeup.wait(Some(Duration::from_millis(20))));
+    assert!(started.elapsed() >= Duration::from_millis(20));
+    // A nudge before the wait is not lost, and is consumed by it.
+    wakeup.nudge();
+    assert!(wakeup.wait(None));
+    rt.resume();
+    assert!(wakeup.wait(None));
+    rt.stop(Duration::ZERO);
+    assert!(wakeup.wait(None));
+    // Blocked with no timeout, the thread is let go when the hub goes.
+    let waiter = {
+        let wakeup = Arc::clone(&wakeup);
+        std::thread::spawn(move || wakeup.wait(None))
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    drop(rt);
+    assert!(!waiter.join().unwrap(), "a closed wakeup ends the wait");
 }

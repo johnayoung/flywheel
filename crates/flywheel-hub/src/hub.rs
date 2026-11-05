@@ -36,9 +36,6 @@ pub(crate) mod handoff;
 pub const KILL_GRACE: Duration = Duration::from_secs(3);
 /// Hub-wide event broadcast depth; a subscriber further behind resyncs.
 const EVENT_DEPTH: usize = 256;
-/// How often an agent screen monitor wakes with no output (a settle or
-/// stall may be due).
-const MONITOR_POLL: Duration = Duration::from_millis(100);
 /// Least time between two looks at an agent session's screen: output
 /// marks the screen dirty, and it is read at most this often (and once
 /// more after the output stops).
@@ -46,6 +43,15 @@ const SCREEN_LOOK: Duration = Duration::from_millis(250);
 /// Default terminal size for sessions created without one.
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 32;
+
+/// An agent session's screen monitor (see [`Hub::monitor_agent`]).
+struct Monitor {
+    /// The spawn generation it watches.
+    generation: u64,
+    /// Wakes it when a report changes the session's status: it sleeps
+    /// until output, this, or a look it has pending falls due.
+    wake: Arc<tokio::sync::Notify>,
+}
 
 /// Hub construction options.
 #[derive(Debug, Clone)]
@@ -475,9 +481,9 @@ pub struct Hub {
     board: Mutex<StatusBoard>,
     events: broadcast::Sender<HubEvent>,
     report: Mutex<Option<ReportServer>>,
-    /// Sessions whose output an activity monitor subscribes to (session ->
-    /// spawn generation), so it is not counted as a client.
-    monitored: Mutex<HashMap<String, u64>>,
+    /// Sessions whose output an activity monitor subscribes to, so it is
+    /// not counted as a client.
+    monitored: Mutex<HashMap<String, Monitor>>,
     /// Suggested commands read from agent transcripts.
     commands: CommandBook,
     /// Session git badges.
@@ -879,7 +885,7 @@ impl Hub {
         self.board.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn monitored(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+    fn monitored(&self) -> MutexGuard<'_, HashMap<String, Monitor>> {
         self.monitored
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

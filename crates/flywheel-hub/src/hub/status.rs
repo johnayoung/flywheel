@@ -1,7 +1,7 @@
 //! Agent status glue: screen and hook signals into the status board,
 //! viewers (seen-tracking), alerts, and status snapshots.
 
-use super::{Hub, HubError, HubEvent, MONITOR_POLL, SCREEN_LOOK, badge_key};
+use super::{Hub, HubError, HubEvent, Monitor, SCREEN_LOOK, badge_key};
 use crate::agent::{self, SessionKind, claude_signal, codex_signal};
 use crate::detect::Detection;
 use crate::detect::tracker::{Look, ScreenTracker};
@@ -11,7 +11,39 @@ use crate::status::{AgentStatus, Audience, Graded, Signal, Snapshot, StatusSourc
 use crate::vt::TextSource;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
+
+/// What one session event means to a screen monitor.
+enum Seen {
+    /// Output (or output missed by lagging): the screen changed.
+    Output,
+    /// A redraw with no output (a resize).
+    Redraw,
+    /// The session ended or its PTY is gone.
+    End,
+}
+
+impl Seen {
+    fn of(event: Result<SessionEvent, broadcast::error::RecvError>) -> Self {
+        use broadcast::error::RecvError;
+        match event {
+            Ok(SessionEvent::Output(_)) | Err(RecvError::Lagged(_)) => Self::Output,
+            Ok(SessionEvent::Resize { .. }) => Self::Redraw,
+            Ok(SessionEvent::Exit(_)) | Err(RecvError::Closed) => Self::End,
+        }
+    }
+
+    /// The next queued event, without waiting (`None`: none queued).
+    fn queued(events: &mut broadcast::Receiver<SessionEvent>) -> Option<Self> {
+        use broadcast::error::{RecvError, TryRecvError};
+        match events.try_recv() {
+            Ok(event) => Some(Self::of(Ok(event))),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Lagged(n)) => Some(Self::of(Err(RecvError::Lagged(n)))),
+            Err(TryRecvError::Closed) => Some(Self::End),
+        }
+    }
+}
 
 /// A session's status at one moment: as anyone sees it, and before seen
 /// tracking with its spell (a new spell of `done` is a new turn).
@@ -49,7 +81,10 @@ impl Hub {
     /// Claude Code's interrupts (Esc fires no hook) and folder-trust
     /// dialog (shown before any hook). The kind's detection manifest reads
     /// the server's emulator after output, at most every [`SCREEN_LOOK`].
-    /// Runs until the process exits or the PTY is dropped.
+    /// Runs until the process exits or the PTY is dropped. Between looks
+    /// it sleeps until output, a report changing the status (its
+    /// [`Monitor::wake`]), or -- only while the tracker has a look pending
+    /// or the screen is dirty -- the next look falling due.
     pub(super) fn monitor_agent(
         self: &Arc<Self>,
         kind: SessionKind,
@@ -68,40 +103,78 @@ impl Hub {
         let pty = Arc::downgrade(session);
         let id = id.to_owned();
         let thread_id = id.clone();
-        self.monitored().insert(id.clone(), generation);
+        let wake = Arc::new(Notify::new());
+        self.monitored().insert(
+            id.clone(),
+            Monitor {
+                generation,
+                wake: Arc::clone(&wake),
+            },
+        );
         let spawned = std::thread::Builder::new()
             .name("hub-agent-monitor".into())
             .spawn(move || {
                 let id = thread_id;
+                // A timer-only runtime on this thread, to wait on the
+                // session's events, the wake and a deadline at once.
+                let waiter = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build();
                 let mut tracker = ScreenTracker::new(kind);
                 let mut dirty = true;
                 let mut looked: Option<Instant> = None;
                 let mut last_output: Option<Instant> = Some(Instant::now());
                 let mut last_spell: Option<u64> = None;
-                loop {
-                    match events.try_recv() {
-                        Ok(SessionEvent::Output(_)) => {
-                            dirty = true;
-                            last_output = Some(Instant::now());
+                while let Ok(waiter) = &waiter {
+                    // Whether to look again with no new output: only
+                    // when the screen is dirty or the tracker waits on
+                    // it, at the next allowed look. Otherwise sleep until
+                    // output or a report.
+                    let due_at = (dirty || tracker.pending())
+                        .then(|| looked.map_or_else(Instant::now, |at| at + SCREEN_LOOK));
+                    let first = waiter.block_on(async {
+                        let due = async {
+                            match due_at {
+                                Some(at) => tokio::time::sleep_until(at.into()).await,
+                                None => std::future::pending().await,
+                            }
+                        };
+                        tokio::select! {
+                            event = events.recv() => Some(Seen::of(event)),
+                            () = wake.notified() => None,
+                            () = due => None,
                         }
-                        // A resize redraws: look again.
-                        Ok(SessionEvent::Resize { .. }) => dirty = true,
-                        Ok(SessionEvent::Exit(_)) | Err(broadcast::error::TryRecvError::Closed) => {
-                            break;
+                    });
+                    // Take everything queued in one pass.
+                    let mut ended = false;
+                    let mut next = first;
+                    while let Some(seen) = next.take().or_else(|| Seen::queued(&mut events)) {
+                        match seen {
+                            Seen::Output => {
+                                dirty = true;
+                                last_output = Some(Instant::now());
+                            }
+                            // A resize redraws: look again.
+                            Seen::Redraw => dirty = true,
+                            Seen::End => {
+                                ended = true;
+                                break;
+                            }
                         }
-                        Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                            dirty = true;
-                            last_output = Some(Instant::now());
-                        }
-                        Err(broadcast::error::TryRecvError::Empty) => {
-                            std::thread::sleep(MONITOR_POLL);
-                        }
+                    }
+                    if ended {
+                        break;
+                    }
+                    let now = Instant::now();
+                    let due = looked.is_none_or(|at| now.duration_since(at) >= SCREEN_LOOK);
+                    if !due && (dirty || tracker.pending()) {
+                        // A look waits on its deadline anyway: no need to
+                        // take the board lock on every burst of output.
+                        continue;
                     }
                     let Some(hub) = weak.upgrade() else {
                         break;
                     };
-                    let now = Instant::now();
-                    let due = looked.is_none_or(|at| now.duration_since(at) >= SCREEN_LOOK);
                     let Some((status, spell, reported)) = hub.board().raw_status(&id, generation)
                     else {
                         break;
@@ -132,13 +205,18 @@ impl Hub {
                         now,
                         last_output,
                     });
-                    if let Some(decision) = decision {
-                        hub.apply_screen(&id, generation, spell, decision);
+                    // Applied, the decision started a new spell: look
+                    // again (as for a report's), whether or not more output
+                    // comes -- a frozen screen still has a stall to time.
+                    if let Some(decision) = decision
+                        && hub.apply_screen(&id, generation, spell, decision)
+                    {
+                        dirty = true;
                     }
                 }
                 if let Some(hub) = weak.upgrade() {
                     let mut monitored = hub.monitored();
-                    if monitored.get(&id) == Some(&generation) {
+                    if monitored.get(&id).map(|m| m.generation) == Some(generation) {
                         monitored.remove(&id);
                     }
                 }
@@ -149,14 +227,15 @@ impl Hub {
     }
 
     /// Apply what the screen calls for, unless a report landed since it
-    /// was read; push the change if there was one.
+    /// was read; push the change if there was one. Returns whether it was
+    /// applied.
     fn apply_screen(
         &self,
         id: &str,
         generation: u64,
         spell: u64,
         decision: crate::detect::tracker::Decision,
-    ) {
+    ) -> bool {
         let transition = {
             let mut board = self.board();
             let before = StatusAt::of(&board, id);
@@ -174,9 +253,11 @@ impl Hub {
                     after: StatusAt::of(&board, id),
                 })
         };
+        let applied = transition.is_some();
         if let Some(transition) = transition {
             self.status_changed(id, transition);
         }
+        applied
     }
 
     /// The detection manifests in force.
@@ -226,6 +307,10 @@ impl Hub {
                 })
         };
         if let Some(transition) = transition {
+            // A new spell: the screen monitor looks again for its markers.
+            if let Some(monitor) = self.monitored().get(id) {
+                monitor.wake.notify_one();
+            }
             self.status_changed(id, transition);
         }
     }

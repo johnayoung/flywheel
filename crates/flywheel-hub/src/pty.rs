@@ -40,12 +40,11 @@ pub use recent::{RECENT_BYTES, RecentItem, output_len};
 /// Adopting a PTY handed over by another hub process, and exporting one.
 #[path = "handoff/pty_side.rs"]
 pub(crate) mod handoff;
+use crate::wake::Waker;
 use axum::body::Bytes;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -231,35 +230,6 @@ pub enum Reattach {
     /// the session is not the one the viewer saw (relaunched, another
     /// hub's) -- what it typed against it no longer applies.
     Fresh { continued: bool },
-}
-
-/// A wakeup an I/O thread blocked in `poll` sees: a socket pair whose
-/// read end joins the poll set and becomes readable once signalled. Idle
-/// threads block without a timeout; whatever changes what they should do
-/// (a release, a pause, the session closing) sets its flag, then signals.
-struct Waker {
-    rx: UnixStream,
-    tx: UnixStream,
-}
-
-impl Waker {
-    fn new() -> std::io::Result<Self> {
-        let (rx, tx) = UnixStream::pair()?;
-        rx.set_nonblocking(true)?;
-        tx.set_nonblocking(true)?;
-        Ok(Self { rx, tx })
-    }
-
-    /// Make the read end readable. A full buffer (`WouldBlock`) already is.
-    fn signal(&self) {
-        let _ = (&self.tx).write(&[1]);
-    }
-
-    /// Consume every pending signal, so the next `poll` blocks again.
-    fn drain(&self) {
-        let mut buf = [0u8; 64];
-        while matches!((&self.rx).read(&mut buf), Ok(n) if n > 0) {}
-    }
 }
 
 /// State shared with the I/O threads.
@@ -1208,7 +1178,7 @@ fn wait_ready(fd: libc::c_int, events: libc::c_short, queue: &InputQueue, wake: 
                 revents: 0,
             },
             libc::pollfd {
-                fd: wake.rx.as_raw_fd(),
+                fd: wake.fd(),
                 events: libc::POLLIN,
                 revents: 0,
             },

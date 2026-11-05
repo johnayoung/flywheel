@@ -21,6 +21,8 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::wake::Waker;
+
 /// Socket file name inside the state dir.
 pub const SOCKET_FILE: &str = "report.sock";
 /// Environment of an agent session: the socket path and its secret
@@ -31,8 +33,6 @@ pub const SESSION_ENV: &str = "FLYWHEEL_HUB_SESSION";
 /// Largest report line accepted (hook payloads carry prompts and tool
 /// input; they are cut, not refused, by the client).
 pub const MAX_REPORT_BYTES: usize = 256 * 1024;
-/// How often the accept loop re-checks for [`ReportServer::stop`].
-const STOP_POLL: Duration = Duration::from_millis(250);
 /// Pause after a failed accept (out of file descriptors, say): the
 /// pending connection keeps the listener readable, so retrying at once
 /// would spin.
@@ -116,6 +116,10 @@ struct Control {
     /// [`ReportServer::stop`] removes the socket file (off while another
     /// hub process may own it).
     unlink: AtomicBool,
+    /// Wakes the accept loop out of `poll` on a stop, a pause or a
+    /// resume (it waits for nothing else, so an idle hub costs no
+    /// wakeups).
+    wake: Waker,
 }
 
 impl std::fmt::Debug for ReportServer {
@@ -182,6 +186,7 @@ impl ReportServer {
             in_flight: Mutex::new(0),
             idle: Condvar::new(),
             unlink: AtomicBool::new(unlink),
+            wake: Waker::new().map_err(io)?,
         });
         let stopping = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stopping);
@@ -219,6 +224,7 @@ impl ReportServer {
             .paused
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = true;
+        self.control.wake.signal();
         let in_flight = self
             .control
             .in_flight
@@ -238,6 +244,7 @@ impl ReportServer {
             .paused
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = false;
+        self.control.wake.signal();
     }
 
     /// Whether [`ReportServer::stop`] (and dropping it) removes the
@@ -254,6 +261,7 @@ impl ReportServer {
         if self.stopping.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.control.wake.signal();
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
@@ -336,18 +344,37 @@ fn private_socket_dir(dir: &Path, uid: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Wait up to [`STOP_POLL`] for `listener` to have a connection pending.
-fn readable(listener: &UnixListener) -> bool {
+/// Block until `listener` has a connection pending (true) or `wake` is
+/// signalled (false, the signal consumed: re-check stop and pause).
+/// Without a listener (paused: connections wait in the backlog), only
+/// `wake` ends the wait.
+fn wait_ready(listener: Option<&UnixListener>, wake: &Waker) -> bool {
     use std::os::fd::AsRawFd;
-    let mut fd = libc::pollfd {
-        fd: listener.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let timeout = libc::c_int::try_from(STOP_POLL.as_millis()).unwrap_or(250);
-    // SAFETY: one valid pollfd, count 1.
-    let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
-    ready > 0 && fd.revents & libc::POLLIN != 0
+    let mut fds = [
+        libc::pollfd {
+            fd: wake.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: listener.map_or(-1, AsRawFd::as_raw_fd),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    let count = if listener.is_some() { 2 } else { 1 };
+    // SAFETY: `fds` holds `count` valid pollfds for the duration of the
+    // call; both descriptors outlive it.
+    let ready = unsafe { libc::poll(fds.as_mut_ptr(), count, -1) };
+    if ready <= 0 {
+        // EINTR (or a failed poll): the caller re-checks and waits again.
+        return false;
+    }
+    if fds[0].revents != 0 {
+        wake.drain();
+        return false;
+    }
+    fds[1].revents & libc::POLLIN != 0
 }
 
 fn accept_loop(
@@ -356,9 +383,16 @@ fn accept_loop(
     stopping: &AtomicBool,
     control: &Arc<Control>,
 ) {
-    // Poll rather than block in accept, so `stop` never needs to connect.
+    // Poll rather than block in accept, so `stop` never needs to connect:
+    // it signals `control.wake`, as do pause and resume.
     while !stopping.load(Ordering::SeqCst) {
-        if !readable(listener) {
+        let is_paused = *control
+            .paused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Paused for a handoff: connections wait in the backlog for
+        // whichever hub carries on, so only a resume or stop matters.
+        if !wait_ready((!is_paused).then_some(listener), &control.wake) {
             continue;
         }
         let paused = control
@@ -366,10 +400,7 @@ fn accept_loop(
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if *paused {
-            // Paused for a handoff: the connection waits in the backlog
-            // for whichever hub carries on.
-            drop(paused);
-            std::thread::sleep(STOP_POLL);
+            // Paused while this connection arrived: leave it queued.
             continue;
         }
         let Ok((stream, _)) = listener.accept() else {
@@ -582,6 +613,42 @@ mod tests {
         server.stop();
         assert!(!path.exists());
         assert!(send(&path, &report("Stop")).is_err());
+    }
+
+    /// The accept loop blocks with no timeout: a pause, a resume and a
+    /// stop each wake it. A report sent while paused waits in the backlog
+    /// and is handled once resumed.
+    #[test]
+    fn pause_resume_and_stop_wake_the_accept_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let mut server = ReportServer::bind(
+            dir.path(),
+            Arc::new(move |r: Report| {
+                sink.lock().unwrap().push(r);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        // Idle first, so the loop is asleep in poll.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(server.pause(Duration::from_secs(5)));
+        let path = server.path().to_path_buf();
+        let sender = std::thread::spawn(move || send(&path, &report("Stop")));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(seen.lock().unwrap().is_empty(), "handled while paused");
+        server.resume();
+        sender.join().unwrap().unwrap();
+        assert_eq!(seen.lock().unwrap().as_slice(), &[report("Stop")]);
+        std::thread::sleep(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        server.stop();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

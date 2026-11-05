@@ -299,22 +299,26 @@ async fn run(
     setup_deadline: Option<Instant>,
 ) -> Outcome {
     let setup = async {
-        // Subscribe before reading the record, so no change falls between.
-        let mut socket = endpoint.websocket(&events_path()).await?;
-        let sessions = endpoint.sessions().await?;
-        // The hub's first message is every session's status for this client.
-        let snapshot = loop {
-            match next_event(&mut socket).await.map_err(|e| match e {
-                Ended::Restart => "the hub restarted while the wait was starting".to_owned(),
-                Ended::Failed(message) => message,
-            })? {
-                Some(event) if event.get("type").and_then(Value::as_str) == Some("snapshot") => {
-                    break event;
+        // A wait started while `fw hub upgrade` hands the hub over starts
+        // against the next process.
+        let retry_until = Instant::now() + RECONNECT_WINDOW;
+        let mut delay = Duration::from_millis(200);
+        loop {
+            match start(endpoint).await {
+                Ok(parts) => return Ok(parts),
+                Err(Ended::Restart) if Instant::now() < retry_until => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
                 }
-                _ => {}
+                Err(Ended::Restart) => {
+                    return Err(format!(
+                        "the hub restarted and did not come back within {}s",
+                        RECONNECT_WINDOW.as_secs()
+                    ));
+                }
+                Err(Ended::Failed(message)) => return Err(message),
             }
-        };
-        Ok::<_, String>((socket, sessions, snapshot))
+        }
     };
     let setup = match setup_deadline {
         Some(at) => match tokio::time::timeout_at(at, setup).await {
@@ -379,6 +383,31 @@ async fn run(
     })
 }
 
+/// Subscribe to the events, read every session, and take the hub's first
+/// message (every session's status for this client). A handoff under way
+/// (the frozen hub's 503, or the socket closed for the restart) is
+/// [`Ended::Restart`].
+async fn start(endpoint: &Endpoint) -> Result<(Socket, Vec<Value>, Value), Ended> {
+    let failed = |message: String| {
+        if crate::handoff::handing_over(&message) {
+            Ended::Restart
+        } else {
+            Ended::Failed(message)
+        }
+    };
+    // Subscribe before reading the record, so no change falls between.
+    let mut socket = endpoint.websocket(&events_path()).await.map_err(failed)?;
+    let sessions = endpoint.sessions().await.map_err(failed)?;
+    loop {
+        match next_event(&mut socket).await? {
+            Some(event) if event.get("type").and_then(Value::as_str) == Some("snapshot") => {
+                return Ok((socket, sessions, event));
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Follow the events socket until the tracker decides.
 async fn watch(
     endpoint: &Endpoint,
@@ -393,20 +422,7 @@ async fn watch(
             Ok(None) => continue,
             Err(Ended::Failed(message)) => return Outcome::Failed(message),
             Err(Ended::Restart) => {
-                // A live handoff: the session carries on in the next hub
-                // process; its first message (a snapshot) and a re-read
-                // record catch up on what happened meanwhile.
-                match reconnect(endpoint, id).await {
-                    Ok((fresh, Some(read))) => {
-                        *socket = fresh;
-                        *record = read;
-                    }
-                    Ok((_, None)) => {
-                        return Outcome::Failed(format!("session {} was removed", tracker.name));
-                    }
-                    Err(message) => return Outcome::Failed(message),
-                }
-                if let Some(outcome) = tracker.on_record(record, false) {
+                if let Some(outcome) = resume(endpoint, socket, id, tracker, record).await {
                     return outcome;
                 }
                 continue;
@@ -437,6 +453,15 @@ async fn watch(
                 Ok(None) => {
                     return Outcome::Failed(format!("session {} was removed", tracker.name));
                 }
+                // Frozen for a handoff since the event: this socket is
+                // about to close for the restart; carry on in the next
+                // process now.
+                Err(message) if crate::handoff::handing_over(&message) => {
+                    if let Some(outcome) = resume(endpoint, socket, id, tracker, record).await {
+                        return outcome;
+                    }
+                    continue;
+                }
                 Err(message) => return Outcome::Failed(message),
             }
             if let Some(outcome) = tracker.on_record(record, false) {
@@ -444,6 +469,32 @@ async fn watch(
             }
         }
     }
+}
+
+/// A live handoff: the session carries on in the next hub process; its
+/// first message (a snapshot) and a re-read record catch up on what
+/// happened meanwhile. `Some` when that decides the wait.
+async fn resume(
+    endpoint: &Endpoint,
+    socket: &mut Socket,
+    id: &str,
+    tracker: &mut Tracker,
+    record: &mut Value,
+) -> Option<Outcome> {
+    match reconnect(endpoint, id).await {
+        Ok((fresh, Some(read))) => {
+            *socket = fresh;
+            *record = read;
+        }
+        Ok((_, None)) => {
+            return Some(Outcome::Failed(format!(
+                "session {} was removed",
+                tracker.name
+            )));
+        }
+        Err(message) => return Some(Outcome::Failed(message)),
+    }
+    tracker.on_record(record, false)
 }
 
 /// Connect the events socket again after a restart and re-read session
@@ -575,6 +626,116 @@ impl Tracker {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A wait begun while `fw hub upgrade` has the hub frozen (every
+    /// request answered 503) waits for the next process instead of failing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wait_begun_while_the_hub_hands_over_waits_for_the_next_process() {
+        use axum::extract::ws::{Message as WsMessage, WebSocketUpgrade};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let gate = crate::handoff::Gate::new();
+        gate.set_open(false);
+        let refused = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&refused);
+        let app = axum::Router::new()
+            .route(
+                "/api/sessions",
+                axum::routing::get(|| async {
+                    axum::Json(json!({ "sessions": [{
+                        "id": "s1", "name": "agent", "kind": "claude",
+                        "state": "running", "live": { "pid": 1 },
+                    }] }))
+                }),
+            )
+            .route(
+                "/api/events",
+                axum::routing::get(|ws: WebSocketUpgrade| async move {
+                    ws.on_upgrade(|mut socket| async move {
+                        let snapshot = json!({ "type": "snapshot", "sessions": {
+                            "s1": { "status": "done", "since": "2026-11-04T00:00:00Z" },
+                        } });
+                        let _ = socket
+                            .send(WsMessage::Text(snapshot.to_string().into()))
+                            .await;
+                        while let Some(Ok(_)) = socket.recv().await {}
+                    })
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                gate.clone(),
+                crate::handoff::gate_requests,
+            ))
+            .layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    let counted = Arc::clone(&counted);
+                    async move {
+                        let response = next.run(request).await;
+                        if response.status() == axum::http::StatusCode::SERVICE_UNAVAILABLE {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        response
+                    }
+                },
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = tempfile::tempdir().unwrap();
+        let endpoint = Endpoint::resolve(&EndpointArgs {
+            url: Some(format!("http://{addr}")),
+            token: Some("test".into()),
+            machine: None,
+            fingerprint: None,
+            state: crate::cli::StateDirArg {
+                state_dir: Some(state.path().to_path_buf()),
+            },
+        })
+        .unwrap();
+        // The new process takes over once the wait has been refused.
+        let opener = {
+            let gate = gate.clone();
+            let refused = Arc::clone(&refused);
+            tokio::spawn(async move {
+                while refused.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                gate.set_open(true);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let outcome = run(
+            &endpoint,
+            "s1",
+            Until::Done,
+            Changed {
+                after_baseline: false,
+                started: None,
+            },
+            Some(deadline),
+            Some(deadline),
+        )
+        .await;
+        opener.await.unwrap();
+        assert!(
+            refused.load(Ordering::SeqCst) > 0,
+            "the hub was never frozen"
+        );
+        assert!(matches!(outcome, Outcome::Met(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn only_a_frozen_hubs_reply_is_a_handoff() {
+        assert!(crate::handoff::handing_over(&format!(
+            "{} (HTTP 503)",
+            crate::handoff::FROZEN_REPLY
+        )));
+        assert!(!crate::handoff::handing_over(
+            "the hub is at its connection limit (HTTP 503)"
+        ));
+        assert!(!crate::handoff::handing_over(crate::handoff::FROZEN_REPLY));
+    }
 
     fn tracker(until: Until, changed: bool) -> Tracker {
         Tracker {

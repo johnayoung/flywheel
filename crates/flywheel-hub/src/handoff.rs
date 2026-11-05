@@ -479,7 +479,7 @@ impl Gate {
         *self.inner.open.borrow()
     }
 
-    fn set_open(&self, open: bool) {
+    pub(crate) fn set_open(&self, open: bool) {
         self.inner.open.send_replace(open);
     }
 
@@ -535,6 +535,17 @@ impl Drop for InFlight {
     }
 }
 
+/// What a request to a frozen hub is answered (with a 503): a client that
+/// recognizes it ([`handing_over`]) retries against the next process.
+pub const FROZEN_REPLY: &str = "the hub is handing over to a new process; retry";
+
+/// Whether `error` (an [`crate::endpoint::Endpoint`] call's) is a frozen
+/// hub's [`FROZEN_REPLY`]: a handoff is under way, so the same call
+/// succeeds against the next process in a moment.
+pub fn handing_over(error: &str) -> bool {
+    error == format!("{FROZEN_REPLY} (HTTP 503)")
+}
+
 /// Middleware: while a handoff has the hub frozen, refuse requests (503,
 /// retry in a second: the new hub answers then); count the others, and
 /// hand them the [`Gate`] (an extension: WebSockets watch it).
@@ -551,7 +562,7 @@ pub async fn gate_requests(
         return (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             [(axum::http::header::RETRY_AFTER, "1")],
-            "the hub is handing over to a new process; retry\n",
+            format!("{FROZEN_REPLY}\n"),
         )
             .into_response();
     }

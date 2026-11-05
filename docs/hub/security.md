@@ -13,7 +13,7 @@ Front door: [hub](../hub.md).
 
 - Token: 256 random bits in `<state-dir>/token`. `fw hub token --rotate` ends every cookie, code, and socket of the old one (4001); agent hooks are unaffected.
 - One-time codes: 100 bits, single use, 5 minutes, 64 outstanding at most; typing forgives case, `-`, spaces, `i l o` look-alikes.
-- `/login?code=` (or `?token=`) sets an `HttpOnly; SameSite=Strict` cookie holding a fresh per-login secret, never the token (`Secure` under https); 30 days, 256 at most; `POST /logout` ends one.
+- `/login?code=` (or `?token=`) sets an `HttpOnly; SameSite=Strict` cookie holding a fresh per-login secret, never the token (`Secure` under https); it lasts `server.login_days` (30) after its last use (each use slides the expiry, written at most hourly, and refreshes the cookie), 256 at most; `POST /logout` ends one.
 - Scripts: `Authorization: Bearer <token>`. Cross-origin `Origin` is refused on WebSocket upgrades and every non-GET.
 - 10 wrong credentials per client address (IPv6 /64) in 10 minutes -> 429, except with a live login cookie; direct local connections (and local tunnels such as `ssh -L`) are exempt.
 - Unauthenticated connections have their own pool and 3 s for a request head: a flood never locks you out. A WebSocket that stops reading is dropped after 60 s.

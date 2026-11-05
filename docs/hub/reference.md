@@ -184,6 +184,7 @@ Taken by `serve`, `start`, `install-service`; each sets the [hub.toml](#hubtoml)
 | `--record-dir-cap` | oldest finished go first (part cap..`1TiB`) |
 | `--share-default-expiry` | a link naming none |
 | `--share-max-expiry` | longest accepted (`60s`-`30d`) |
+| `--login-days` | a browser login lasts this long after its last use |
 
 ## hub.toml
 
@@ -199,6 +200,7 @@ trusted_proxies = []
 tls = "off"                # "auto", or "/path/cert.pem,/path/key.pem"
 tls_names = []             # e.g. ["192.168.0.0/16"]
 tls_public_names = []
+login_days = 30            # a login lasts this long after its last use
 
 [sessions]
 scrollback_lines = 5000
@@ -257,6 +259,7 @@ quiet_if_empty = true      # skip a scheduled one with nothing in it
 | `server.tls` | `--tls` | `"off"` (CERT,KEY absolute) | restart |
 | `server.tls_names` | `--tls-name` | `[]` (private only) | restart |
 | `server.tls_public_names` | `--tls-allow-public-name` | `[]` | restart |
+| `server.login_days` | `--login-days` | `30` (1-365; new logins, and each at its next use) | live |
 | `sessions.scrollback_lines` | `--scrollback-lines` | `5000` (new sessions) | live |
 | `sessions.restore` | `--no-restore` | `true` | restart |
 | `sessions.agent_resume` | `--no-agent-resume` | `true` | restart |

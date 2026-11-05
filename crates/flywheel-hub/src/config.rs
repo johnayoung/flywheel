@@ -87,6 +87,8 @@ pub struct ServerSection {
     pub tls_names: Option<Vec<String>>,
     /// The public ones among `tls_names` the operator opted in to.
     pub tls_public_names: Option<Vec<String>>,
+    /// Days a browser login lasts after its last use (each use renews).
+    pub login_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -281,6 +283,7 @@ pub struct Flags {
     pub record_dir_cap: Option<u64>,
     pub share_default_expiry: Option<Duration>,
     pub share_max_expiry: Option<Duration>,
+    pub login_days: Option<u32>,
 }
 
 /// Where an effective value came from.
@@ -358,6 +361,8 @@ pub struct Tunables {
     pub reviewer: ReviewerChoice,
     /// No typed input for this long before a queue delivers.
     pub queue_typing_quiet: Duration,
+    /// Days a browser login lasts after its last use.
+    pub login_days: u32,
 }
 
 /// Every setting resolved, with where each came from.
@@ -384,6 +389,7 @@ pub struct Effective {
     pub share_policy: crate::share::SharePolicy,
     pub reviewer: ReviewerChoice,
     pub queue_typing_quiet: Duration,
+    pub login_days: u32,
     pub digest: crate::digest::DigestConfig,
     sources: Vec<(&'static str, Source)>,
 }
@@ -407,6 +413,7 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("server.tls", Apply::Restart),
     ("server.tls_names", Apply::Restart),
     ("server.tls_public_names", Apply::Restart),
+    ("server.login_days", Apply::Live),
     ("sessions.scrollback_lines", Apply::Live),
     ("sessions.restore", Apply::Restart),
     ("sessions.agent_resume", Apply::Restart),
@@ -451,6 +458,7 @@ impl Effective {
             share_policy: self.share_policy,
             reviewer: self.reviewer,
             queue_typing_quiet: self.queue_typing_quiet,
+            login_days: self.login_days,
         }
     }
 
@@ -483,6 +491,7 @@ impl Effective {
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()
             ),
+            "server.login_days" => json!(self.login_days),
             "sessions.scrollback_lines" => json!(self.scrollback_lines),
             "sessions.restore" => json!(self.restore),
             "sessions.agent_resume" => json!(self.agent_resume),
@@ -905,6 +914,30 @@ pub fn resolve(
         file_quiet,
         crate::queue::DEFAULT_TYPING_QUIET
     );
+    let days_in = |key: &str, days: u32, errors: &mut Vec<String>| {
+        use crate::auth::{MAX_LOGIN_DAYS, MIN_LOGIN_DAYS};
+        if (MIN_LOGIN_DAYS..=MAX_LOGIN_DAYS).contains(&days) {
+            Some(days)
+        } else {
+            errors.push(format!(
+                "{key}: {days} days is out of range ({MIN_LOGIN_DAYS}-{MAX_LOGIN_DAYS})"
+            ));
+            None
+        }
+    };
+    let file_login_days = file
+        .server
+        .login_days
+        .and_then(|days| days_in("server.login_days", days, &mut errors));
+    let flag_login_days = flags
+        .login_days
+        .and_then(|days| days_in("--login-days", days, &mut errors));
+    let login_days = pick!(
+        "server.login_days",
+        flag_login_days,
+        file_login_days,
+        crate::auth::DEFAULT_LOGIN_DAYS
+    );
     let digest = match crate::digest::DigestConfig::resolve(&file.digest) {
         Ok(digest) => digest,
         Err(found) => {
@@ -945,6 +978,7 @@ pub fn resolve(
         share_policy,
         reviewer,
         queue_typing_quiet,
+        login_days,
         digest,
         sources,
     })
@@ -1437,6 +1471,7 @@ trusted_proxies = []
 tls = "off"                # "auto", or "/path/cert.pem,/path/key.pem"
 tls_names = []             # e.g. ["192.168.0.0/16"]
 tls_public_names = []
+login_days = 30            # a login lasts this long after its last use
 
 [sessions]
 scrollback_lines = 5000
@@ -1626,6 +1661,7 @@ mod tests {
 bind = "localhost"
 public_urls = ["https://box/path"]
 trusted_proxies = ["proxy"]
+login_days = 0
 [sessions]
 scrollback_lines = 0
 [worktrees]
@@ -1646,6 +1682,7 @@ max_concurrent = 99
             "server.bind",
             "server.public_urls",
             "server.trusted_proxies",
+            "server.login_days",
             "sessions.scrollback_lines",
             "worktrees.branch_prefix",
             "import.root",
@@ -1658,6 +1695,42 @@ max_concurrent = 99
                 "{key} not in {errors:?}"
             );
         }
+    }
+
+    #[test]
+    fn login_days_is_bounded_and_flag_beats_file() {
+        let resolved = |text: &str, flag: Option<u32>| {
+            let flags = Flags {
+                login_days: flag,
+                ..Flags::default()
+            };
+            resolve(&parse(text).unwrap(), &flags, home())
+        };
+        let e = resolved("", None).unwrap();
+        assert_eq!(e.login_days, crate::auth::DEFAULT_LOGIN_DAYS);
+        assert_eq!(e.source("server.login_days"), Source::Default);
+        let e = resolved("[server]\nlogin_days = 365\n", None).unwrap();
+        assert_eq!(
+            (e.login_days, e.source("server.login_days")),
+            (365, Source::File)
+        );
+        assert_eq!(e.value("server.login_days"), json!(365));
+        assert_eq!(e.tunables().login_days, 365);
+        let e = resolved("[server]\nlogin_days = 365\n", Some(1)).unwrap();
+        assert_eq!(
+            (e.login_days, e.source("server.login_days")),
+            (1, Source::Flag)
+        );
+        for bad in ["0", "366"] {
+            let errors = resolved(&format!("[server]\nlogin_days = {bad}\n"), None).unwrap_err();
+            assert!(
+                errors.iter().any(|m| m.starts_with("server.login_days:")),
+                "{errors:?}"
+            );
+        }
+        assert!(resolved("", Some(0)).is_err());
+        assert!(parse("[server]\nlogin_days = -1\n").is_err());
+        assert!(parse("[server]\nlogin_days = \"30d\"\n").is_err());
     }
 
     #[test]

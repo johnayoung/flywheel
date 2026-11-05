@@ -89,6 +89,7 @@ pub(super) fn serve_cmd(
     options.share_policy = effective.share_policy;
     options.reviewer = effective.reviewer;
     options.queue_typing_quiet = effective.queue_typing_quiet;
+    options.login_days = effective.login_days;
     // One hub per state dir: the hub holds `<state-dir>/serve.lock` for
     // its whole life (a second would overwrite the first's runtime file and
     // report socket, leaving `url` / `token --rotate` and agent hooks unable

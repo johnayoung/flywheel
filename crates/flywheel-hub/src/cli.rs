@@ -390,6 +390,10 @@ pub(crate) struct HubArgs {
     /// [default: 30d, or hub.toml shares.max_expiry].
     #[arg(long, value_name = "DURATION", value_parser = crate::share::parse_ttl)]
     share_max_expiry: Option<Duration>,
+    /// Days a browser login lasts after its last use; each use renews it
+    /// (1 to 365) [default: 30, or hub.toml server.login_days].
+    #[arg(long, value_name = "DAYS", value_parser = clap::value_parser!(u32).range(1..=365))]
+    login_days: Option<u32>,
     #[command(flatten)]
     pub(crate) state: StateDirArg,
 }
@@ -485,6 +489,9 @@ impl HubArgs {
         if let Some(ttl) = self.share_max_expiry {
             argv.extend(["--share-max-expiry".to_owned(), ttl.as_secs().to_string()]);
         }
+        if let Some(days) = self.login_days {
+            argv.extend(["--login-days".to_owned(), days.to_string()]);
+        }
         argv.extend([
             "--state-dir".to_owned(),
             state_dir.to_string_lossy().into_owned(),
@@ -513,6 +520,7 @@ impl HubArgs {
             record_dir_cap: self.record_dir_cap,
             share_default_expiry: self.share_default_expiry,
             share_max_expiry: self.share_max_expiry,
+            login_days: self.login_days,
         }
     }
 
@@ -1010,6 +1018,8 @@ mod tests {
             "10m",
             "--share-max-expiry",
             "1d",
+            "--login-days",
+            "90",
         ])
         .unwrap();
         let HubCommand::Serve(args) = cli.command else {
@@ -1025,6 +1035,9 @@ mod tests {
         assert_eq!(flags.record_dir_cap, Some(1 << 30));
         assert_eq!(flags.share_default_expiry, Some(Duration::from_secs(600)));
         assert_eq!(flags.share_max_expiry, Some(Duration::from_secs(86_400)));
+        assert_eq!(flags.login_days, Some(90));
+        assert!(HubCli::try_parse_from(["fw hub", "serve", "--login-days", "0"]).is_err());
+        assert!(HubCli::try_parse_from(["fw hub", "serve", "--login-days", "366"]).is_err());
         assert!(HubCli::try_parse_from(["fw hub", "serve", "--record-part-cap", "lots"]).is_err());
     }
 

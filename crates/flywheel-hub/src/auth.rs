@@ -25,8 +25,21 @@ use subtle::ConstantTimeEq;
 pub const TOKEN_FILE: &str = "token";
 /// The login cookie's name prefix; see [`cookie_name`].
 pub const COOKIE_PREFIX: &str = "fw_hub_";
-/// Login cookie lifetime: 30 days (rotating the token invalidates it sooner).
-pub const COOKIE_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+/// Default login lifetime in days (`server.login_days`): how long a
+/// browser login lasts after its last use (rotating the token or logging
+/// out ends it sooner).
+pub const DEFAULT_LOGIN_DAYS: u32 = 30;
+/// Bounds of `server.login_days`.
+pub const MIN_LOGIN_DAYS: u32 = 1;
+pub const MAX_LOGIN_DAYS: u32 = 365;
+/// A used login is renewed (and the logins file written) at most this
+/// often: its expiry slides to `now + lifetime` once it is this far behind.
+pub const LOGIN_RENEW_INTERVAL_SECS: u64 = 60 * 60;
+
+/// A login lifetime of `days`, in seconds.
+pub fn login_lifetime_secs(days: u32) -> u64 {
+    u64::from(days) * 24 * 60 * 60
+}
 /// Random bytes in a token (256 bits).
 const TOKEN_BYTES: usize = 32;
 /// The browser logins file inside the state dir (digests only).
@@ -130,8 +143,11 @@ impl Token {
 /// which is what the login cookie carries -- so a phone that scanned a QR
 /// code holds a revocable login, not the long-lived token. Only SHA-256
 /// digests are kept, persisted (0600) in [`LOGINS_FILE`] so logins survive
-/// a hub restart. Rotating the token forgets every login; logging out
-/// forgets that one.
+/// a hub restart (and a live handoff: the new hub reads the file after
+/// the old one froze). A login's expiry slides: each use renews it to
+/// `now + lifetime`, written at most once per [`LOGIN_RENEW_INTERVAL_SECS`]
+/// ([`Logins::renew`]), so only an unused login expires. Rotating the
+/// token forgets every login; logging out forgets that one.
 #[derive(Debug, Default)]
 pub struct Logins {
     entries: Vec<LoginEntry>,
@@ -195,8 +211,8 @@ impl Logins {
         write_private(&path, &json).map_err(|source| TokenError::Io { path, source })
     }
 
-    /// A fresh login secret valid for [`COOKIE_MAX_AGE_SECS`].
-    pub fn issue(&mut self, now: u64) -> Result<String, TokenError> {
+    /// A fresh login secret valid for `lifetime` seconds (until renewed).
+    pub fn issue(&mut self, now: u64, lifetime: u64) -> Result<String, TokenError> {
         let secret = random_hex(TOKEN_BYTES)?;
         self.prune(now);
         if self.entries.len() >= MAX_LOGINS
@@ -211,17 +227,47 @@ impl Logins {
         }
         self.entries.push(LoginEntry {
             digest: login_digest(&secret),
-            expires: now.saturating_add(COOKIE_MAX_AGE_SECS),
+            expires: now.saturating_add(lifetime),
         });
         Ok(secret)
     }
 
+    fn live_entry(&mut self, secret: &str, now: u64) -> Option<&mut LoginEntry> {
+        let digest = login_digest(secret);
+        self.entries
+            .iter_mut()
+            .find(|e| e.expires > now && bool::from(e.digest.as_bytes().ct_eq(digest.as_bytes())))
+    }
+
     /// Whether `secret` is a live login.
     pub fn valid(&self, secret: &str, now: u64) -> bool {
+        self.expires(secret, now).is_some()
+    }
+
+    /// When the live login `secret` expires (Unix seconds).
+    pub fn expires(&self, secret: &str, now: u64) -> Option<u64> {
         let digest = login_digest(secret);
         self.entries
             .iter()
-            .any(|e| e.expires > now && bool::from(e.digest.as_bytes().ct_eq(digest.as_bytes())))
+            .find(|e| e.expires > now && bool::from(e.digest.as_bytes().ct_eq(digest.as_bytes())))
+            .map(|e| e.expires)
+    }
+
+    /// The live login `secret` was used: slide its expiry to `now +
+    /// lifetime` when that is at least [`LOGIN_RENEW_INTERVAL_SECS`] later
+    /// than it stands (or earlier: the lifetime was shortened). The new
+    /// expiry when it changed (the caller persists it); `None` for an
+    /// unknown or expired login, or within the interval.
+    pub fn renew(&mut self, secret: &str, now: u64, lifetime: u64) -> Option<u64> {
+        let entry = self.live_entry(secret, now)?;
+        let renewed = now.saturating_add(lifetime);
+        let due = renewed >= entry.expires.saturating_add(LOGIN_RENEW_INTERVAL_SECS)
+            || renewed < entry.expires;
+        if !due {
+            return None;
+        }
+        entry.expires = renewed;
+        Some(renewed)
     }
 
     /// Forget `secret`; true when it was a login.
@@ -468,11 +514,12 @@ pub fn bearer_value(authorization: &str) -> Option<&str> {
         .then_some(value.trim())
 }
 
-/// The `Set-Cookie` value that logs a browser in: the cookie named after
-/// `token`, carrying the login `secret` from [`Logins::issue`].
-pub fn login_cookie(token: &Token, secret: &str, secure: bool) -> String {
+/// The `Set-Cookie` value that logs a browser in (or refreshes its
+/// expiry): the cookie named after `token`, carrying the login `secret`
+/// from [`Logins::issue`], kept by the browser for `max_age` seconds.
+pub fn login_cookie(token: &Token, secret: &str, max_age: u64, secure: bool) -> String {
     format!(
-        "{}={secret}; Path=/; HttpOnly; SameSite=Strict; Max-Age={COOKIE_MAX_AGE_SECS}{}",
+        "{}={secret}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{}",
         cookie_name(token.expose()),
         if secure { "; Secure" } else { "" }
     )
@@ -616,7 +663,8 @@ mod tests {
     #[test]
     fn login_cookie_is_http_only_and_strict() {
         let t = Token::generate().unwrap();
-        let c = login_cookie(&t, "s3cret", false);
+        let c = login_cookie(&t, "s3cret", 60, false);
+        assert!(c.contains("Max-Age=60"));
         assert!(c.contains("HttpOnly") && c.contains("SameSite=Strict"));
         assert!(c.starts_with(&format!("{}=s3cret;", cookie_name(t.expose()))));
         assert!(
@@ -624,7 +672,7 @@ mod tests {
             "the cookie never carries the token"
         );
         assert!(!c.contains("Secure"));
-        assert!(login_cookie(&t, "s3cret", true).ends_with("; Secure"));
+        assert!(login_cookie(&t, "s3cret", 60, true).ends_with("; Secure"));
         assert!(logout_cookie(&t).contains("Max-Age=0"));
     }
 
@@ -673,10 +721,11 @@ mod tests {
     fn logins_are_per_sign_in_persisted_and_revocable() {
         let dir = tempfile::tempdir().unwrap();
         let now = 1_000_000;
+        let lifetime = login_lifetime_secs(DEFAULT_LOGIN_DAYS);
         let mut logins = Logins::load(dir.path(), now);
         assert!(logins.is_empty());
-        let a = logins.issue(now).unwrap();
-        let b = logins.issue(now).unwrap();
+        let a = logins.issue(now, lifetime).unwrap();
+        let b = logins.issue(now, lifetime).unwrap();
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
         assert!(logins.valid(&a, now) && logins.valid(&b, now));
@@ -698,7 +747,7 @@ mod tests {
         assert!(reloaded.revoke(&a));
         assert!(!reloaded.revoke(&a));
         assert!(!reloaded.valid(&a, now) && reloaded.valid(&b, now));
-        let expiry = now + COOKIE_MAX_AGE_SECS;
+        let expiry = now + lifetime;
         assert!(!reloaded.valid(&b, expiry), "expired");
         assert_eq!(Logins::load(dir.path(), expiry).len(), 0);
         reloaded.clear();
@@ -710,14 +759,72 @@ mod tests {
     #[test]
     fn logins_are_bounded() {
         let mut logins = Logins::default();
-        let first = logins.issue(10).unwrap();
+        let first = logins.issue(10, 1000).unwrap();
         for i in 0..MAX_LOGINS {
-            logins.issue(11 + i as u64).unwrap();
+            logins.issue(11 + i as u64, 1000).unwrap();
         }
         assert_eq!(logins.len(), MAX_LOGINS);
         assert!(
             !logins.valid(&first, 20),
             "the soonest to expire was dropped"
+        );
+    }
+
+    #[test]
+    fn a_used_login_slides_at_most_once_per_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = login_lifetime_secs(1);
+        let lifetime = 30 * day;
+        let t0 = 1_000_000;
+        let mut logins = Logins::default();
+        let a = logins.issue(t0, lifetime).unwrap();
+        assert_eq!(logins.expires(&a, t0), Some(t0 + lifetime));
+        // Within the interval: nothing to write.
+        assert_eq!(logins.renew(&a, t0 + 10, lifetime), None);
+        let t1 = t0 + LOGIN_RENEW_INTERVAL_SECS - 1;
+        assert_eq!(logins.renew(&a, t1, lifetime), None);
+        // Once the interval has passed, the expiry slides.
+        let t2 = t0 + LOGIN_RENEW_INTERVAL_SECS;
+        assert_eq!(logins.renew(&a, t2, lifetime), Some(t2 + lifetime));
+        assert_eq!(logins.renew(&a, t2 + 60, lifetime), None, "rate limited");
+        // Used every 20 days, it outlives the original 30.
+        let t3 = t0 + 20 * day;
+        assert_eq!(logins.renew(&a, t3, lifetime), Some(t3 + lifetime));
+        let t4 = t0 + 40 * day;
+        assert!(logins.valid(&a, t4), "past the first expiry");
+        assert_eq!(logins.renew(&a, t4, lifetime), Some(t4 + lifetime));
+        // A restart keeps the renewed expiry.
+        logins.save(dir.path()).unwrap();
+        let reloaded = Logins::load(dir.path(), t4);
+        assert_eq!(reloaded.expires(&a, t4), Some(t4 + lifetime));
+        // Unused for the lifetime, it expires and cannot be renewed.
+        let idle = t4 + lifetime;
+        assert!(!logins.valid(&a, idle));
+        assert_eq!(logins.renew(&a, idle, lifetime), None);
+        assert!(Logins::load(dir.path(), idle).is_empty());
+        // A shortened lifetime pulls a live login in at its next use.
+        let b = logins.issue(t0, lifetime).unwrap();
+        assert_eq!(logins.renew(&b, t0 + 10, day), Some(t0 + 10 + day));
+        assert_eq!(logins.renew(&b, t0 + 20, day), None);
+        assert_eq!(logins.renew("nope", t0, lifetime), None);
+    }
+
+    #[test]
+    fn a_login_from_before_rolling_expiry_renews() {
+        // logins.json as written before expiries slid: same shape.
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = 2_000_000;
+        let lifetime = login_lifetime_secs(DEFAULT_LOGIN_DAYS);
+        let mut old = Logins::default();
+        let secret = old.issue(t0, lifetime).unwrap();
+        old.save(dir.path()).unwrap();
+        let text = fs::read_to_string(dir.path().join(LOGINS_FILE)).unwrap();
+        assert!(text.starts_with("{\"logins\":[{\"digest\":"), "{text}");
+        let later = t0 + 29 * 24 * 60 * 60;
+        let mut logins = Logins::load(dir.path(), later);
+        assert_eq!(
+            logins.renew(&secret, later, lifetime),
+            Some(later + lifetime)
         );
     }
 

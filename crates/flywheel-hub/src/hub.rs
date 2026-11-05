@@ -96,6 +96,9 @@ pub struct HubOptions {
     /// How long a session goes without typed input before its prompt
     /// queue delivers (`queue.typing_quiet`).
     pub queue_typing_quiet: Duration,
+    /// Days a browser login lasts after its last use
+    /// (`server.login_days`).
+    pub login_days: u32,
 }
 
 impl HubOptions {
@@ -129,6 +132,7 @@ impl HubOptions {
             share_policy: crate::share::SharePolicy::default(),
             reviewer: crate::config::ReviewerChoice::Other,
             queue_typing_quiet: crate::queue::DEFAULT_TYPING_QUIET,
+            login_days: crate::auth::DEFAULT_LOGIN_DAYS,
         }
     }
 }
@@ -569,6 +573,7 @@ impl Hub {
             share_policy: options.share_policy,
             reviewer: options.reviewer,
             queue_typing_quiet: options.queue_typing_quiet,
+            login_days: options.login_days,
         };
         let record_limits = options.record_limits;
         let perms_env = crate::perms::Env::new(
@@ -758,7 +763,7 @@ impl Hub {
     pub fn issue_login(&self) -> Result<String, HubError> {
         let mut logins = self.logins();
         let before = logins.len();
-        let secret = logins.issue(unix_now())?;
+        let secret = logins.issue(unix_now(), self.login_lifetime())?;
         logins.save(&self.options.state_dir)?;
         if logins.len() <= before {
             drop(logins);
@@ -777,6 +782,35 @@ impl Hub {
     /// Whether `secret` is a live browser login.
     pub fn login_valid(&self, secret: &str) -> bool {
         self.logins().valid(secret, unix_now())
+    }
+
+    /// The login lifetime in force (`server.login_days`), in seconds.
+    pub fn login_lifetime(&self) -> u64 {
+        crate::auth::login_lifetime_secs(self.tunables().login_days)
+    }
+
+    /// Seconds the live browser login `secret` has left.
+    pub fn login_remaining(&self, secret: &str) -> Option<u64> {
+        let now = unix_now();
+        self.logins()
+            .expires(secret, now)
+            .map(|e| e.saturating_sub(now))
+    }
+
+    /// The live browser login `secret` was used: slide its expiry (see
+    /// [`crate::auth::Logins::renew`]) and persist it. The seconds it now
+    /// has left when it was renewed (the caller refreshes the cookie);
+    /// `None` when it was not due, or is not a live login. A failed write
+    /// keeps the renewal in memory (the next one retries it).
+    pub fn renew_login(&self, secret: &str) -> Option<u64> {
+        let now = unix_now();
+        let lifetime = self.login_lifetime();
+        let mut logins = self.logins();
+        let expires = logins.renew(secret, now, lifetime)?;
+        if let Err(e) = logins.save(&self.options.state_dir) {
+            eprintln!("fw hub: saving a renewed login: {e}");
+        }
+        Some(expires.saturating_sub(now))
     }
 
     /// End the browser login `secret` (logout).

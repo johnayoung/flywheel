@@ -373,10 +373,18 @@ pub(super) async fn require_auth(
     let peer_changes = app.peers.subscribe();
     match authenticate(&app, request.headers(), client) {
         Auth::Granted(login) => {
+            // A used login slides its expiry; the browser's cookie follows.
+            let refresh = login.as_deref().and_then(|secret| {
+                let left = app.hub.renew_login(secret)?;
+                let secure = browser_https(request.headers(), client, &app.options);
+                Some(login_cookie(&app.hub.token(), secret, left, secure))
+            });
             request
                 .extensions_mut()
                 .insert(watch.for_login(&app.hub, login));
-            next.run(request).await
+            let mut response = next.run(request).await;
+            append_cookie(&mut response, refresh.as_deref());
+            response
         }
         Auth::Peer(peer) => {
             if crate::peers::peer_forbidden(request.uri().path()) {
@@ -396,6 +404,13 @@ pub(super) async fn require_auth(
         Auth::Anonymous | Auth::Denied => {
             error_response(StatusCode::UNAUTHORIZED, "authentication required")
         }
+    }
+}
+
+/// Add a `Set-Cookie` (a refreshed login cookie) to `response`.
+fn append_cookie(response: &mut Response, cookie: Option<&str>) {
+    if let Some(value) = cookie.and_then(|c| HeaderValue::from_str(c).ok()) {
+        response.headers_mut().append(header::SET_COOKIE, value);
     }
 }
 
@@ -495,8 +510,21 @@ pub(super) async fn index(
     PageQuery(query): PageQuery<IndexQuery>,
 ) -> Response {
     match authenticate(&app, &headers, client) {
-        Auth::Granted(_) => {
+        Auth::Granted(login) => {
             let mut response = no_store(index_page(&headers));
+            // Every page load re-sends the cookie with the login's
+            // (renewed) expiry, so the browser never drops it first.
+            if let Some(secret) = login.as_deref() {
+                let left = app
+                    .hub
+                    .renew_login(secret)
+                    .or_else(|| app.hub.login_remaining(secret));
+                if let Some(left) = left {
+                    let secure = browser_https(&headers, client, &app.options);
+                    let cookie = login_cookie(&app.hub.token(), secret, left, secure);
+                    append_cookie(&mut response, Some(&cookie));
+                }
+            }
             // The service worker keeps only this page (never the sign-in
             // page) as the offline app shell.
             response.headers_mut().insert(
@@ -608,6 +636,7 @@ fn login(app: &AppState, headers: &HeaderMap, client: Client, presented: Option<
     let cookie = login_cookie(
         &token,
         &secret,
+        app.hub.login_lifetime(),
         browser_https(headers, client, &app.options),
     );
     let mut response = Html(web::LOGGED_IN_HTML).into_response();

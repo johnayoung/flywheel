@@ -8,7 +8,7 @@
 mod support;
 
 use flywheel_hub::{Hub, HubOptions, ServerOptions, serve};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,8 +22,16 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// The hub's send timeout here.
 const SEND_TIMEOUT: Duration = Duration::from_secs(1);
-/// A receive buffer small enough that a reader that stops reading stalls
-/// the writer after a few frames.
+/// A socket buffer small enough that a reader that stops reading stalls
+/// the writer after a few frames: the stalled readers' receive buffers,
+/// and the hub's send buffers (set on its listener, so every connection
+/// it accepts has it). Without the latter, the hub's send buffer
+/// autotunes to megabytes on loopback, and filling it with answers to a
+/// flood of small messages takes a flood the kernel may never deliver:
+/// past a few megabytes in flight, the hub's receive window can stay shut
+/// with nothing left to read (Linux 6.18 drops the sender's retransmits as
+/// beyond the window, `TcpExtBeyondWindow`), and a hub with nothing to
+/// read and room to write never stalls.
 const SMALL_BUFFER: u32 = 4096;
 
 type Ws = WebSocketStream<TcpStream>;
@@ -59,7 +67,10 @@ impl TestHub {
         options.default_shell = vec!["/bin/sh".into()];
         let hub = support::open_hub(options);
         let token = hub.token().expose().to_owned();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.set_send_buffer_size(SMALL_BUFFER).unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(64).unwrap();
         let addr = listener.local_addr().unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
         let server = tokio::spawn(serve(
@@ -127,19 +138,42 @@ impl TestHub {
     }
 }
 
-/// Write `message` until a write does not finish within a while (the
-/// other side stopped reading, and every buffer between is full) or the
-/// other side dropped the socket (it stopped reading and gave up on us
-/// meanwhile). Returns how many went out.
-async fn write_until_stalled(ws: &mut Ws, message: Message) -> usize {
-    let deadline = Instant::now() + Duration::from_secs(20);
+/// Write `message` over and over until `done` resolves; returns how many
+/// went out. A write that does not finish within a while is retried, not
+/// taken as the end: a write held up for some other reason than the hub
+/// having stopped reading (this process starved of CPU on a loaded runner)
+/// looks the same from here, and stopping there could leave the hub too
+/// little to answer to ever stall. Only `done` -- what the test waits for
+/// the hub to do -- says enough went out. After a write fails (the hub
+/// dropped the socket), only `done` is awaited. Panics with `kept` if
+/// `done` has not resolved within `within`.
+async fn write_until<S>(
+    sink: &mut S,
+    message: Message,
+    done: impl Future<Output = ()>,
+    within: Duration,
+    kept: &str,
+) -> usize
+where
+    S: Sink<Message> + Unpin,
+{
+    tokio::pin!(done);
+    let give_up = tokio::time::sleep(within);
+    tokio::pin!(give_up);
     let mut wrote = 0;
+    let mut open = true;
     loop {
-        match timeout(Duration::from_millis(300), ws.send(message.clone())).await {
-            Err(_) | Ok(Err(_)) => return wrote,
-            Ok(Ok(())) => wrote += 1,
+        tokio::select! {
+            () = &mut done => return wrote,
+            () = &mut give_up => panic!("{kept} ({wrote} messages written in {within:?})"),
+            sent = timeout(Duration::from_millis(300), sink.send(message.clone())), if open => {
+                match sent {
+                    Ok(Ok(())) => wrote += 1,
+                    Ok(Err(_)) => open = false,
+                    Err(_) => {}
+                }
+            }
         }
-        assert!(Instant::now() < deadline, "writes never stalled");
     }
 }
 
@@ -201,19 +235,23 @@ async fn a_stalled_events_reader_is_dropped_and_frees_its_viewer() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     // ... then every message it sends is answered (an error for one it
-    // cannot parse), and it never reads the answers.
-    assert!(write_until_stalled(&mut stalled, Message::text("?")).await > 0);
-
-    // Past the send timeout the hub drops it: its connection, and with it
-    // its presence, are gone (when it left stays put).
-    let deadline = Instant::now() + SEND_TIMEOUT * 15;
-    loop {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        if !present(&hub) {
-            break;
+    // cannot parse), and it never reads the answers. Past the send timeout
+    // of a write that cannot finish, the hub drops it: its connection, and
+    // with it its presence, are gone (when it left stays put).
+    let gone = async {
+        while present(&hub) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(Instant::now() < deadline, "the stalled reader was kept");
-    }
+    };
+    let wrote = write_until(
+        &mut stalled,
+        Message::text("?"),
+        gone,
+        Duration::from_secs(60),
+        "the stalled reader was kept",
+    )
+    .await;
+    assert!(wrote > 0);
     // The healthy client carries on ...
     let repo = hub._dir.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -369,23 +407,30 @@ async fn the_machine_proxy_drops_a_stalled_side_either_way() {
 
     // Browser -> machine: the machine stops reading; the relay gives up on
     // it and tells the browser the link was lost.
-    let mut browser = hub.ws("/m/box/api/deaf", false).await;
-    assert!(write_until_stalled(&mut browser, Message::binary(vec![b'y'; 16 * 1024])).await > 0);
+    let (mut to_machine, mut from_machine) = hub.ws("/m/box/api/deaf", false).await.split();
     // Its close (1011) reaches the browser unless what the browser sent
     // and the hub never read turned the close into a reset.
-    let deadline = Instant::now() + SEND_TIMEOUT * 6;
-    loop {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        match timeout(wait, browser.next()).await {
-            Ok(Some(Ok(Message::Close(frame)))) => {
-                assert_eq!(frame.map(|f| u16::from(f.code)), Some(1011));
-                break;
+    let lost = async {
+        loop {
+            match from_machine.next().await {
+                Some(Ok(Message::Close(frame))) => {
+                    assert_eq!(frame.map(|f| u16::from(f.code)), Some(1011));
+                    return;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(_)) | None => return,
             }
-            Ok(Some(Ok(_))) => {}
-            Ok(Some(Err(_)) | None) => break,
-            Err(_) => panic!("the relay to a deaf machine was kept"),
         }
-    }
+    };
+    let wrote = write_until(
+        &mut to_machine,
+        Message::binary(vec![b'y'; 16 * 1024]),
+        lost,
+        Duration::from_secs(60),
+        "the relay to a deaf machine was kept",
+    )
+    .await;
+    assert!(wrote > 0);
     // The machine's connection was dropped too: reading now, it ends.
     listen.send(()).await.unwrap();
     assert!(matches!(

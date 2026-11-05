@@ -27,3 +27,25 @@ pub fn open_hub(options: HubOptions) -> Arc<Hub> {
         }
     }
 }
+
+/// Whether `pid` has exited: gone, or a zombie awaiting its reaper. Only
+/// positive evidence counts as dead: `kill` saying no such process, its
+/// `/proc` entry gone, or a zombie/dead state. A process a test spawned
+/// indirectly (a plugin's background child) is reparented when its parent
+/// dies, and whether that reaper waits for it is the environment's
+/// business, not the hub's: in a container whose PID 1 is `cargo`, it
+/// never is, and the exited process stays a zombie for good.
+pub fn process_dead(pid: i32) -> bool {
+    // SAFETY: kill(2) with signal 0 only probes for existence.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|state| matches!(state, "Z" | "X" | "x")),
+        Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+    }
+}

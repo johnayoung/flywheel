@@ -279,9 +279,10 @@ fn fire(env: &HashMap<String, String>, event: &str, payload: Value) {
     .unwrap();
 }
 
+/// Still running: an exited process left a zombie by a reaper that never
+/// waits (a container's PID 1) has not outlived anything.
 fn alive(pid: i32) -> bool {
-    // Signal 0: the process exists (a zombie counts; ours are reaped).
-    unsafe { libc::kill(pid, 0) == 0 }
+    !support::process_dead(pid)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -167,6 +167,23 @@ impl TestHub {
         }
     }
 
+    /// The `perms` activity page, once it holds `n` rows. Rows are
+    /// journaled by the activity task off the request's thread, so a read
+    /// right after a write may not include it yet.
+    async fn perms_activity(&self, n: usize) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let page = self.get("/api/activity?kind=perms&machines=none").await;
+            let rows = page["rows"].as_array().map_or(0, Vec::len);
+            assert!(rows <= n, "more than {n} perms rows: {page}");
+            if rows == n {
+                return page;
+            }
+            assert!(Instant::now() < deadline, "never {n} perms rows: {page}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// `body` with the base of its preview (as every client sends it).
     async fn based(&self, mut body: Value) -> Value {
         let (status, preview) = self
@@ -420,8 +437,9 @@ async fn always_allow_from_a_blocked_claude_prompt() {
         .await;
     assert_eq!(suggested["suggestions"], json!([]));
 
-    // Logged to activity, without the rule's command text.
-    let activity = hub.get("/api/activity?kind=perms&machines=none").await;
+    // Logged to activity (journaled off the request's thread), without
+    // the rule's command text.
+    let activity = hub.perms_activity(1).await;
     let row = &activity["rows"][0];
     assert_eq!(row["kind"], "perms.allowed", "{activity}");
     assert_eq!(
@@ -472,7 +490,7 @@ async fn always_allow_from_a_blocked_claude_prompt() {
     );
     typed["typed"] = json!("Bash(rm:*)");
     assert_eq!(hub.post("/api/perms/allow", typed).await["written"], true);
-    let activity = hub.get("/api/activity?kind=perms&machines=none").await;
+    let activity = hub.perms_activity(2).await;
     assert_eq!(
         activity["rows"][0]["text"],
         "allowed 1 permission rule for claude (local settings), typed-confirmed as dangerous"

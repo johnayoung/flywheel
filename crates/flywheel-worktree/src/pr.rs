@@ -61,11 +61,13 @@ use flywheel_orchestrator::strategy::{
     LandabilityVerdict, PrepareError, SandboxHandle, SandboxRequest, SubmitOutcome, SubmitRequest,
     SubmitStrategy,
 };
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 /// The longest PR title the strategy emits; longer titles are cut to
 /// `TITLE_MAX - 1` characters plus an ellipsis.
@@ -722,6 +724,13 @@ enum Gate {
 /// PR (the phase archives later, once the PR merges -- the dependent task's
 /// surface). Every failure is logged and surfaced, never raised: a
 /// phase-completion attempt must never unwind the archive sweep.
+///
+/// Republishing is memoized ([`PhasePublishMemo`]): while a phase PR waits
+/// for review the sweep hands the phase over every worker cycle, and a
+/// repeat with unchanged inputs (phase-branch tip, true-base sha, rendered
+/// PR title/body) skips the verify/push/gh work. The remote base is fetched
+/// at most once per [`DEFAULT_BASE_FETCH_INTERVAL`]; a moved branch tip or
+/// base always re-syncs and re-verifies before anything is pushed.
 pub struct PhasePrPublisher {
     store: Arc<dyn PhaseEvidenceStore>,
     pub repo_root: PathBuf,
@@ -730,8 +739,103 @@ pub struct PhasePrPublisher {
     /// `[phase] verify`, run against the phase-branch tree; `None` => no
     /// gate.
     pub phase_verify: Option<String>,
+    /// Minimum time between remote fetches of the true base per phase.
+    pub base_fetch_interval: Duration,
+    /// How long a published (pushed + PR ensured) or refused (conflicting
+    /// sync, red verify) memo entry stands before the same inputs are
+    /// re-attempted -- self-heals external drift (a deleted remote branch, a
+    /// closed PR, a flaky verify) without redoing the work every cycle.
+    pub revalidate_interval: Duration,
+    memo: PhasePublishMemo,
     log: Logger,
     gh: Arc<dyn GhRunner>,
+}
+
+/// Default [`PhasePrPublisher::base_fetch_interval`].
+pub const DEFAULT_BASE_FETCH_INTERVAL: Duration = Duration::from_secs(60);
+/// Default [`PhasePrPublisher::revalidate_interval`].
+pub const DEFAULT_REVALIDATE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// What the phase publisher remembers between worker cycles, keyed by
+/// remote, true base, and phase. The worker rebuilds its publisher every
+/// cycle; it holds one memo for its lifetime and hands it to each publisher
+/// so unchanged phases are not re-verified, re-pushed, and re-announced.
+/// Cloning shares the memo.
+#[derive(Clone, Default)]
+pub struct PhasePublishMemo {
+    entries: Arc<Mutex<BTreeMap<String, PhaseMemoEntry>>>,
+}
+
+impl fmt::Debug for PhasePublishMemo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let phases = self
+            .entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len();
+        f.debug_struct("PhasePublishMemo")
+            .field("phases", &phases)
+            .finish()
+    }
+}
+
+impl PhasePublishMemo {
+    fn with<R>(&self, key: &str, f: impl FnOnce(&mut PhaseMemoEntry) -> R) -> R {
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        f(entries.entry(key.to_owned()).or_default())
+    }
+}
+
+/// One phase's memo.
+#[derive(Debug, Default)]
+struct PhaseMemoEntry {
+    /// The last remote fetch of the true base.
+    base: Option<BaseObservation>,
+    /// A sync that conflicted for this (tip, base).
+    sync_refused: Option<SyncRefusal>,
+    /// The `[phase] verify` verdict for a tip.
+    verify: Option<VerifyVerdict>,
+    /// The tip last pushed to the remote.
+    pushed: Option<(String, Instant)>,
+    /// The PR last ensured (opened or body-refreshed).
+    pr: Option<PrEnsured>,
+}
+
+#[derive(Debug, Clone)]
+struct BaseObservation {
+    /// The fetched base sha; `None` when the fetch failed (the local base
+    /// ref is consulted instead).
+    fetched: Option<String>,
+    fetch_stderr: String,
+    at: Instant,
+}
+
+#[derive(Debug)]
+struct SyncRefusal {
+    tip: String,
+    base_sha: String,
+    at: Instant,
+}
+
+#[derive(Debug)]
+struct VerifyVerdict {
+    tip: String,
+    command: String,
+    passed: bool,
+    at: Instant,
+}
+
+#[derive(Debug)]
+struct PrEnsured {
+    tip: String,
+    title: String,
+    body: String,
+    at: Instant,
+}
+
+/// `at` is younger than `interval` as of `now`.
+fn fresh(at: Instant, now: Instant, interval: Duration) -> bool {
+    now.saturating_duration_since(at) < interval
 }
 
 impl fmt::Debug for PhasePrPublisher {
@@ -741,6 +845,8 @@ impl fmt::Debug for PhasePrPublisher {
             .field("remote", &self.remote)
             .field("pr_base", &self.pr_base)
             .field("phase_verify", &self.phase_verify)
+            .field("base_fetch_interval", &self.base_fetch_interval)
+            .field("revalidate_interval", &self.revalidate_interval)
             .finish_non_exhaustive()
     }
 }
@@ -762,6 +868,9 @@ impl PhasePrPublisher {
             remote: remote.into(),
             pr_base: pr_base.into(),
             phase_verify: None,
+            base_fetch_interval: DEFAULT_BASE_FETCH_INTERVAL,
+            revalidate_interval: DEFAULT_REVALIDATE_INTERVAL,
+            memo: PhasePublishMemo::default(),
             log,
             gh: Arc::new(ProcessGhRunner),
         }
@@ -769,6 +878,13 @@ impl PhasePrPublisher {
 
     pub fn with_phase_verify(mut self, command: Option<String>) -> Self {
         self.phase_verify = command;
+        self
+    }
+
+    /// Share `memo` (held for the worker's lifetime) instead of a fresh one,
+    /// so republishing an unchanged phase is a no-op across cycles.
+    pub fn with_memo(mut self, memo: PhasePublishMemo) -> Self {
+        self.memo = memo;
         self
     }
 
@@ -809,32 +925,104 @@ impl PhasePrPublisher {
         branch: &str,
         tasks: &[Task],
     ) -> Result<(), PhasePublishError> {
-        if let Gate::Refused(detail) = self.sync_with_true_base(branch)? {
-            self.log(format!(
-                "pre-PR sync of {branch} with {}/{} failed ({detail}); opening no PR -- a \
-                 conflicting phase PR runs zero CI and stalls silently -- phase '{phase}' left \
-                 active; merge {} into {branch} by hand to unblock",
-                self.remote, self.pr_base, self.pr_base
-            ));
+        let key = format!("{}\0{}\0{phase}", self.remote, self.pr_base);
+        let now = Instant::now();
+        let base_sha = match self.true_base_sha(&key, now)? {
+            Ok(sha) => sha,
+            Err(detail) => {
+                self.log_sync_refusal(phase, branch, &detail);
+                return Ok(());
+            }
+        };
+        let Some(tip_before) = self.branch_tip(branch)? else {
+            self.log_sync_refusal(phase, branch, &format!("cannot resolve {branch}"));
+            return Ok(());
+        };
+        // The same conflict for the same (tip, base) is not re-attempted (nor
+        // re-announced) until the revalidation window lapses.
+        let refused_before = self.memo.with(&key, |entry| {
+            entry.sync_refused.as_ref().is_some_and(|r| {
+                r.tip == tip_before
+                    && r.base_sha == base_sha
+                    && fresh(r.at, now, self.revalidate_interval)
+            })
+        });
+        if refused_before {
             return Ok(());
         }
-        if let Some(command) = &self.phase_verify
-            && let Gate::Refused(detail) = self.verify_phase_tree(branch, command)?
-        {
-            self.log(format!(
-                "[phase] verify failed against the {branch} tree ({detail}); opening no PR, \
-                 phase '{phase}' left active"
-            ));
+        if let Gate::Refused(detail) = self.sync_with_true_base(branch, &base_sha)? {
+            self.memo.with(&key, |entry| {
+                entry.sync_refused = Some(SyncRefusal {
+                    tip: tip_before,
+                    base_sha,
+                    at: now,
+                });
+            });
+            self.log_sync_refusal(phase, branch, &detail);
             return Ok(());
         }
-        let push = push_with_lease(&self.repo_root, &self.remote, branch)?;
-        if !push.ok() {
-            self.log(format!(
-                "push of {branch} to {} failed ({}); opening no PR, phase '{phase}' left active",
-                self.remote,
-                push.stderr.trim()
-            ));
+        let Some(tip) = self.branch_tip(branch)? else {
+            self.log_sync_refusal(phase, branch, &format!("cannot resolve {branch}"));
             return Ok(());
+        };
+        if let Some(command) = &self.phase_verify {
+            // A tree is identified by its tip sha: a pass for this exact tip
+            // stands; a red verdict is retried once the revalidation window
+            // lapses (a flaky gate is not wedged forever).
+            let memoized = self.memo.with(&key, |entry| {
+                entry
+                    .verify
+                    .as_ref()
+                    .filter(|v| {
+                        v.tip == tip
+                            && v.command == *command
+                            && (v.passed || fresh(v.at, now, self.revalidate_interval))
+                    })
+                    .map(|v| v.passed)
+            });
+            match memoized {
+                Some(true) => {}
+                Some(false) => return Ok(()),
+                None => {
+                    let verdict = self.verify_phase_tree(branch, command)?;
+                    let passed = verdict == Gate::Passed;
+                    self.memo.with(&key, |entry| {
+                        entry.verify = Some(VerifyVerdict {
+                            tip: tip.clone(),
+                            command: command.clone(),
+                            passed,
+                            at: now,
+                        });
+                    });
+                    if let Gate::Refused(detail) = verdict {
+                        self.log(format!(
+                            "[phase] verify failed against the {branch} tree ({detail}); \
+                             opening no PR, phase '{phase}' left active"
+                        ));
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let pushed = self.memo.with(&key, |entry| {
+            entry
+                .pushed
+                .as_ref()
+                .is_some_and(|(t, at)| *t == tip && fresh(*at, now, self.revalidate_interval))
+        });
+        if !pushed {
+            let push = push_with_lease(&self.repo_root, &self.remote, branch)?;
+            if !push.ok() {
+                self.log(format!(
+                    "push of {branch} to {} failed ({}); opening no PR, phase '{phase}' left \
+                     active",
+                    self.remote,
+                    push.stderr.trim()
+                ));
+                return Ok(());
+            }
+            self.memo
+                .with(&key, |entry| entry.pushed = Some((tip.clone(), now)));
         }
         let sections = tasks
             .iter()
@@ -842,18 +1030,121 @@ impl PhasePrPublisher {
             .collect::<Result<Vec<_>, _>>()?;
         let body = render_phase_pr_body(phase, &sections);
         let title = truncate_title(format!("Phase {phase}: {} task(s)", sections.len()));
+        let ensured = self.memo.with(&key, |entry| {
+            entry.pr.as_ref().is_some_and(|pr| {
+                pr.tip == tip
+                    && pr.title == title
+                    && pr.body == body
+                    && fresh(pr.at, now, self.revalidate_interval)
+            })
+        });
+        if pushed && ensured {
+            return Ok(());
+        }
         match ensure_pr(self.gh.as_ref(), branch, &self.pr_base, &title, &body) {
-            Ok(url) => self.log(format!(
-                "Phase '{phase}': pushed {branch} and ensured PR {url} ({} task(s)); merge is \
-                 review/CI's call",
-                sections.len()
-            )),
+            Ok(url) => {
+                self.log(format!(
+                    "Phase '{phase}': pushed {branch} and ensured PR {url} ({} task(s)); merge \
+                     is review/CI's call",
+                    sections.len()
+                ));
+                self.memo.with(&key, |entry| {
+                    entry.pr = Some(PrEnsured {
+                        tip,
+                        title,
+                        body,
+                        at: now,
+                    });
+                });
+            }
             Err(exc) => self.log(format!(
                 "opening/refreshing the phase PR for {branch} failed ({exc}); the branch is \
                  pushed but no PR is open, phase '{phase}' left active"
             )),
         }
         Ok(())
+    }
+
+    fn log_sync_refusal(&self, phase: &str, branch: &str, detail: &str) {
+        self.log(format!(
+            "pre-PR sync of {branch} with {}/{} failed ({detail}); opening no PR -- a \
+             conflicting phase PR runs zero CI and stalls silently -- phase '{phase}' left \
+             active; merge {} into {branch} by hand to unblock",
+            self.remote, self.pr_base, self.pr_base
+        ));
+    }
+
+    /// `branch`'s tip sha, `None` when it does not resolve.
+    fn branch_tip(&self, branch: &str) -> Result<Option<String>, PhasePublishError> {
+        let out = git(
+            &self.repo_root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{branch}^{{commit}}"),
+            ],
+        )?;
+        Ok(out.ok().then(|| out.trimmed().to_owned()))
+    }
+
+    /// The sha of the ref the PR actually merges into: `pr_base` fetched
+    /// from `remote`, falling back to the local `pr_base` ref when the fetch
+    /// cannot resolve it (offline runs, local-only bases). The fetch runs at
+    /// most once per `base_fetch_interval` per phase -- a phase waiting on
+    /// review must not hit the network every worker cycle -- and the last
+    /// observation stands in between. `Err` carries the refusal detail when
+    /// the base resolves nowhere.
+    fn true_base_sha(
+        &self,
+        key: &str,
+        now: Instant,
+    ) -> Result<Result<String, String>, PhasePublishError> {
+        let cached = self.memo.with(key, |entry| {
+            entry
+                .base
+                .clone()
+                .filter(|obs| fresh(obs.at, now, self.base_fetch_interval))
+        });
+        let observation = match cached {
+            Some(observation) => observation,
+            None => {
+                let fetch = git(&self.repo_root, &["fetch", &self.remote, &self.pr_base])?;
+                let fetched = if fetch.ok() {
+                    let head = git(&self.repo_root, &["rev-parse", "FETCH_HEAD"])?;
+                    head.ok().then(|| head.trimmed().to_owned())
+                } else {
+                    None
+                };
+                let observation = BaseObservation {
+                    fetched,
+                    fetch_stderr: fetch.stderr.trim().to_owned(),
+                    at: now,
+                };
+                self.memo
+                    .with(key, |entry| entry.base = Some(observation.clone()));
+                observation
+            }
+        };
+        if let Some(sha) = observation.fetched {
+            return Ok(Ok(sha));
+        }
+        let probe = git(
+            &self.repo_root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{}^{{commit}}", self.pr_base),
+            ],
+        )?;
+        if !probe.ok() {
+            return Ok(Err(format!(
+                "cannot resolve the true base '{}' locally or on '{}' ({})",
+                self.pr_base, self.remote, observation.fetch_stderr
+            )));
+        }
+        Ok(Ok(probe.trimmed().to_owned()))
     }
 
     /// Merge the true base into `branch` once, before any PR opens.
@@ -866,40 +1157,18 @@ impl PhasePrPublisher {
     /// merged tree CI will test) or fails LOUD at the seam where the
     /// operator is already watching.
     ///
-    /// The base is the ref the PR actually merges into: `pr_base` fetched
-    /// from `remote`, falling back to the local `pr_base` ref when the fetch
-    /// cannot resolve it (offline runs, local-only bases). A base already
+    /// `base_sha` is the ref the PR actually merges into (resolved by
+    /// [`Self::true_base_sha`]). A base already
     /// contained in the branch is a no-op -- no merge commit churn, no
     /// forced CI re-run -- so repeated sweep passes stay idempotent. The
     /// merge itself runs in a disposable worktree ON the branch (phase
     /// branches are never checked out, so the branch ref is free); a
     /// conflict aborts the merge, leaves the branch exactly as it was, and
     /// reports the conflicted paths.
-    fn sync_with_true_base(&self, branch: &str) -> Result<Gate, PhasePublishError> {
-        let fetch = git(&self.repo_root, &["fetch", &self.remote, &self.pr_base])?;
-        let base_ref = if fetch.ok() {
-            "FETCH_HEAD".to_owned()
-        } else {
-            let probe = git(
-                &self.repo_root,
-                &["rev-parse", "--verify", "--quiet", &self.pr_base],
-            )?;
-            if !probe.ok() {
-                return Ok(Gate::Refused(format!(
-                    "cannot resolve the true base '{}' locally or on '{}' ({})",
-                    self.pr_base,
-                    self.remote,
-                    fetch.stderr.trim()
-                )));
-            }
-            self.pr_base.clone()
-        };
-        let base_sha = git(&self.repo_root, &["rev-parse", &base_ref])?
-            .trimmed()
-            .to_owned();
+    fn sync_with_true_base(&self, branch: &str, base_sha: &str) -> Result<Gate, PhasePublishError> {
         let contained = git(
             &self.repo_root,
-            &["merge-base", "--is-ancestor", &base_sha, branch],
+            &["merge-base", "--is-ancestor", base_sha, branch],
         )?;
         if contained.ok() {
             return Ok(Gate::Passed);
@@ -919,7 +1188,7 @@ impl PhasePrPublisher {
         );
         let merge = git(
             &scratch.checkout,
-            &["merge", "--no-edit", "-m", &message, &base_sha],
+            &["merge", "--no-edit", "-m", &message, base_sha],
         )?;
         if !merge.ok() {
             let conflicted: Vec<String> = git(
@@ -939,7 +1208,7 @@ impl PhasePrPublisher {
             return Ok(Gate::Refused(format!(
                 "merging {} ({}): {what}",
                 self.pr_base,
-                base_sha.get(..12).unwrap_or(&base_sha)
+                base_sha.get(..12).unwrap_or(base_sha)
             )));
         }
         Ok(Gate::Passed)
@@ -2293,6 +2562,189 @@ mod tests {
         let edit = gh.call("edit");
         assert_eq!(edit[2], "https://example.test/phase-pr/9");
         assert!(f.phase_active());
+    }
+
+    /// Count `[phase] verify` runs and pushes received by the remote, so a
+    /// test can tell a memoized cycle from a republishing one.
+    struct PublishCounters {
+        verify_log: PathBuf,
+        push_log: PathBuf,
+    }
+
+    impl PublishCounters {
+        fn install(f: &PhaseFixture) -> Self {
+            let root = f.repo.parent().unwrap();
+            let counters = Self {
+                verify_log: root.join("verify-runs"),
+                push_log: root.join("pushes"),
+            };
+            let hook = f.remote.join("hooks").join("pre-receive");
+            fs::write(
+                &hook,
+                format!(
+                    "#!/bin/sh\ncat >/dev/null\necho push >> '{}'\n",
+                    counters.push_log.display()
+                ),
+            )
+            .unwrap();
+            let mut perms = fs::metadata(&hook).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            fs::set_permissions(&hook, perms).unwrap();
+            counters
+        }
+
+        fn verify_command(&self) -> String {
+            format!(
+                "echo run >> '{}' && test -f a.txt",
+                self.verify_log.display()
+            )
+        }
+
+        fn lines(path: &Path) -> usize {
+            fs::read_to_string(path).map_or(0, |s| s.lines().count())
+        }
+
+        fn verifies(&self) -> usize {
+            Self::lines(&self.verify_log)
+        }
+
+        fn pushes(&self) -> usize {
+            Self::lines(&self.push_log)
+        }
+    }
+
+    #[test]
+    fn unchanged_phase_is_not_republished_on_the_next_cycle() {
+        let f = complete_phase_fixture(&[("a.txt", "1")]);
+        let counters = PublishCounters::install(&f);
+        let gh = phase_gh("");
+        let memo = PhasePublishMemo::default();
+        let branch = phase_branch(PHASE);
+        // The worker rebuilds its publisher every cycle and shares the memo.
+        let cycle = |log: Logger| {
+            let publisher = f
+                .publisher(Arc::clone(&gh), log)
+                .with_phase_verify(Some(counters.verify_command()))
+                .with_memo(memo.clone());
+            f.sweep(&publisher);
+        };
+
+        let (log, lines) = capture_log();
+        cycle(log);
+        assert_eq!(counters.verifies(), 1);
+        assert_eq!(counters.pushes(), 1);
+        assert_eq!(gh.commands(), ["pr list", "pr create"]);
+        assert_eq!(lines.lock().unwrap().len(), 1);
+
+        // Second cycle, nothing changed: no verify, no push, no gh, silent.
+        let (log, lines) = capture_log();
+        cycle(log);
+        assert_eq!(counters.verifies(), 1);
+        assert_eq!(counters.pushes(), 1);
+        assert_eq!(gh.commands(), ["pr list", "pr create"]);
+        assert!(lines.lock().unwrap().is_empty(), "{:?}", lines.lock());
+        assert!(f.phase_active());
+
+        // The phase branch moves: re-verify, re-push, re-ensure the PR.
+        git_ok(&f.repo, &["checkout", "-q", &branch]);
+        commit(&f.repo, "c.txt", "3\n", "feat: more phase work");
+        git_ok(&f.repo, &["checkout", "-q", "main"]);
+        let (log, lines) = capture_log();
+        cycle(log);
+        assert_eq!(counters.verifies(), 2);
+        assert_eq!(counters.pushes(), 2);
+        assert_eq!(
+            gh.commands(),
+            ["pr list", "pr create", "pr list", "pr create"]
+        );
+        assert_eq!(
+            rev(&f.remote, &format!("refs/heads/{branch}")),
+            rev(&f.repo, &branch)
+        );
+        assert_eq!(lines.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_moved_base_republishes_once_the_fetch_throttle_lapses() {
+        let f = complete_phase_fixture(&[("a.txt", "1")]);
+        let counters = PublishCounters::install(&f);
+        let gh = phase_gh("");
+        let memo = PhasePublishMemo::default();
+        let branch = phase_branch(PHASE);
+        let publisher = |fetch_interval: Duration| {
+            let mut publisher = f
+                .publisher(Arc::clone(&gh), quiet())
+                .with_phase_verify(Some(counters.verify_command()))
+                .with_memo(memo.clone());
+            publisher.base_fetch_interval = fetch_interval;
+            publisher
+        };
+
+        // The true base lives on the remote, so it is resolved by fetch.
+        git_ok(&f.repo, &["push", "-q", "origin", "main:main"]);
+        f.sweep(&publisher(DEFAULT_BASE_FETCH_INTERVAL));
+        assert_eq!((counters.verifies(), counters.pushes()), (1, 2));
+
+        // The true base advances on the remote only (the local main stays
+        // behind). Inside the fetch throttle the last observation stands: no
+        // network round-trip, no republish.
+        commit(&f.repo, "extra.txt", "mainline\n", "feat: base advanced");
+        git_ok(&f.repo, &["push", "-q", "origin", "main:main"]);
+        git_ok(&f.repo, &["reset", "-q", "--hard", "HEAD~1"]);
+        let pushes_with_main = counters.pushes();
+        f.sweep(&publisher(DEFAULT_BASE_FETCH_INTERVAL));
+        assert_eq!(counters.verifies(), 1);
+        assert_eq!(counters.pushes(), pushes_with_main);
+        assert_eq!(gh.commands(), ["pr list", "pr create"]);
+
+        // Once the throttle lapses the moved base is observed: the branch is
+        // re-synced, the merged tree re-verified, pushed, and the PR ensured.
+        f.sweep(&publisher(Duration::ZERO));
+        assert_eq!(counters.verifies(), 2);
+        assert_eq!(counters.pushes(), pushes_with_main + 1);
+        assert_eq!(
+            gh.commands(),
+            ["pr list", "pr create", "pr list", "pr create"]
+        );
+        let tree = git_ok(&f.repo, &["ls-tree", "-r", "--name-only", &branch]);
+        assert!(tree.contains("extra.txt"));
+        assert_eq!(
+            rev(&f.remote, &format!("refs/heads/{branch}")),
+            rev(&f.repo, &branch)
+        );
+
+        // And settles again: a lapsed throttle alone (base unchanged)
+        // re-fetches but republishes nothing.
+        f.sweep(&publisher(Duration::ZERO));
+        assert_eq!(counters.verifies(), 2);
+        assert_eq!(counters.pushes(), pushes_with_main + 1);
+        assert_eq!(gh.commands().len(), 4);
+    }
+
+    #[test]
+    fn a_red_verify_is_not_rerun_until_the_tip_moves_or_the_window_lapses() {
+        let f = complete_phase_fixture(&[("a.txt", "1")]);
+        let verify_log = f.repo.parent().unwrap().join("red-verify-runs");
+        let command = format!("echo run >> '{}'; false", verify_log.display());
+        let gh = phase_gh("");
+        let memo = PhasePublishMemo::default();
+        let publisher = |revalidate: Duration| {
+            let mut publisher = f
+                .publisher(Arc::clone(&gh), quiet())
+                .with_phase_verify(Some(command.clone()))
+                .with_memo(memo.clone());
+            publisher.revalidate_interval = revalidate;
+            publisher
+        };
+        let runs = || PublishCounters::lines(&verify_log);
+
+        f.sweep(&publisher(DEFAULT_REVALIDATE_INTERVAL));
+        f.sweep(&publisher(DEFAULT_REVALIDATE_INTERVAL));
+        assert_eq!(runs(), 1);
+        f.sweep(&publisher(Duration::ZERO));
+        assert_eq!(runs(), 2);
+        assert!(gh.calls().is_empty());
+        assert!(!remote_branch_exists(&f.remote, &phase_branch(PHASE)));
     }
 
     #[test]

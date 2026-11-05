@@ -25,7 +25,7 @@
 //! `docs/configuration.md` (`[worker]`, `[execution]`), `docs/container-backend.md`.
 
 use crate::phase::{ArchiveError, ArchiveSweep, archive_phases, record_phase_bases};
-use crate::pr::{PhaseEvidenceStore, PhasePrPublisher, register_pr_strategy};
+use crate::pr::{PhaseEvidenceStore, PhasePrPublisher, PhasePublishMemo, register_pr_strategy};
 use crate::retention::{
     DEFAULT_RETENTION_DAYS, DEFAULT_RUN_LOG_RETENTION, retention_cadence_tick, retention_targets,
     sweep_run_logs, wall_clock_seconds,
@@ -880,6 +880,9 @@ pub struct RunOnceRequest {
     pub runtime: Option<Arc<Runtime>>,
     /// Restrict the cycle to these tasks (`--task`); `None` drains the queue.
     pub scope: Option<TaskScope>,
+    /// The phase publisher's memo; the daemon holds one for its lifetime so
+    /// an unchanged phase PR is not re-verified and re-pushed every cycle.
+    pub phase_publish_memo: PhasePublishMemo,
 }
 
 impl fmt::Debug for RunOnceRequest {
@@ -936,6 +939,7 @@ impl RunOnceRequest {
             gh: None,
             runtime: None,
             scope: None,
+            phase_publish_memo: PhasePublishMemo::default(),
         }
     }
 
@@ -1162,7 +1166,8 @@ pub fn run_once(request: RunOnceRequest) -> Result<OrchestratorReport, RunOnceEr
                     pr_base,
                     Arc::clone(&log),
                 )
-                .with_phase_verify(p.phase_verify.clone());
+                .with_phase_verify(p.phase_verify.clone())
+                .with_memo(request.phase_publish_memo.clone());
                 if let Some(gh) = request.gh.clone() {
                     publisher = publisher.with_gh(gh);
                 }
@@ -2258,6 +2263,9 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     // claim, a sandbox that will not prepare, a running member), once per
     // change, so a pane never looks frozen.
     let mut last_waiting: Option<String> = None;
+    // Outlives every cycle: a phase PR awaiting review is republished only
+    // when its inputs change, not every poll.
+    let phase_publish_memo = PhasePublishMemo::default();
     let mut run_cycle = || -> Result<CycleOutcome, CycleError> {
         // Default-on run-log retention: hold .flywheel/logs/runs/ at or under
         // the configured bound before draining. Worktree retention runs every
@@ -2292,6 +2300,7 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         request.shutdown = Some(shutdown.clone());
         request.runtime = Some(Arc::clone(&runtime));
         request.scope = scope.as_ref().map(|scope| scope.scope.clone());
+        request.phase_publish_memo = phase_publish_memo.clone();
         match run_once(request) {
             Ok(_) => match &scope {
                 Some(scope) => match scope.verdict() {

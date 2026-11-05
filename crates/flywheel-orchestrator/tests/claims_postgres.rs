@@ -776,3 +776,33 @@ fn claim_store_heals_a_terminated_connection() {
     let fresh: i32 = store.with_client(|client| scalar(client, "SELECT pg_backend_pid()"));
     assert_ne!(fresh, pid, "a fresh backend serves the claim store");
 }
+
+/// The orchestrate loop drives the claim store from async code; the
+/// blocking driver must not panic there on connect, verbs, close, or drop.
+#[test]
+fn claim_store_is_usable_and_droppable_inside_a_tokio_runtime() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_async_claims");
+    let dsn = pg.dsn();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let store = PostgresClaimStore::connect(&dsn, &schema).unwrap();
+        let claim = store
+            .acquire_claim("task-async", "worker-a", t(0), 30.0, &none())
+            .unwrap();
+        assert!(claim.is_some());
+        let rows: i64 =
+            store.with_client(|client| scalar(client, "SELECT count(*) FROM task_claims"));
+        assert_eq!(rows, 1);
+        drop(store);
+        PostgresClaimStore::connect(&dsn, &schema)
+            .unwrap()
+            .close()
+            .unwrap();
+    });
+}

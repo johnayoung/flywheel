@@ -83,6 +83,7 @@ use crate::events::{DomainEvent, DomainEventKind, DomainEventPayload, apply};
 use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status};
 use crate::loaders::task_digest;
 use crate::notifier::RunNotifier;
+use crate::pg_tls::{SyncClient, off_runtime};
 use crate::store::{
     AttemptStore, CURRENT_SCHEMA_VERSION, ControlCommandRecord, ControlCommandStore,
     DomainEventStore, GraderResultRecord, GraderResultStore, JsonObject, LifecycleFilter,
@@ -444,7 +445,7 @@ impl Drop for Listener {
 /// Each instance owns one connection in autocommit mode (each statement is
 /// its own transaction unless a verb opens an explicit transaction).
 pub struct PostgresStore {
-    client: Mutex<Client>,
+    client: Mutex<SyncClient>,
     /// Kept to heal a closed connection; never logged or echoed.
     dsn: String,
     schema: String,
@@ -491,14 +492,18 @@ impl PostgresStore {
             .clone()
             .unwrap_or_else(|| Arc::new(RunNotifier::new()));
         let (config, tls) = crate::pg_tls::configure(dsn).map_err(StoreError::backend)?;
-        let mut client = config.connect(tls).map_err(db)?;
-        // Pin the search_path for the session so unqualified DDL/DML
-        // resolves under the store's schema without embedding the name in
-        // every statement (the Python store's per-connection configure).
-        client
-            .batch_execute(&search_path_sql(&schema))
-            .map_err(db)?;
-        bootstrap(&mut client, &schema)?;
+        let client = off_runtime(|| {
+            let mut client = SyncClient::new(config.connect(tls).map_err(db)?);
+            // Pin the search_path for the session so unqualified DDL/DML
+            // resolves under the store's schema without embedding the name
+            // in every statement (the Python store's per-connection
+            // configure).
+            client
+                .batch_execute(&search_path_sql(&schema))
+                .map_err(db)?;
+            bootstrap(&mut client, &schema)?;
+            Ok::<_, StoreError>(client)
+        })?;
         let listener = options
             .listen
             .then(|| start_listener(dsn, &channel, &notifier));
@@ -542,12 +547,16 @@ impl PostgresStore {
     ///
     /// The escape hatch for consumers that share the database (the
     /// orchestrator's own tables) and for inspection; the store's own
-    /// invariants are not re-checked on whatever `f` does.
-    pub fn with_client<T>(&self, f: impl FnOnce(&mut Client) -> T) -> T {
-        let mut client = self.raw_lock();
-        // Best-effort heal; a still-dead connection surfaces through `f`.
-        let _ = crate::pg_tls::ensure_open(&mut client, &self.dsn, &search_path_sql(&self.schema));
-        f(&mut client)
+    /// invariants are not re-checked on whatever `f` does. Runs off any
+    /// tokio runtime (see [`off_runtime`]).
+    pub fn with_client<T: Send>(&self, f: impl FnOnce(&mut Client) -> T + Send) -> T {
+        off_runtime(|| {
+            let mut client = self.raw_lock();
+            // Best-effort heal; a still-dead connection surfaces through `f`.
+            let _ =
+                crate::pg_tls::ensure_open(&mut client, &self.dsn, &search_path_sql(&self.schema));
+            f(&mut client)
+        })
     }
 
     /// Stop the listener (if any) and close the connection.
@@ -557,22 +566,28 @@ impl PostgresStore {
             .client
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        client.close().map_err(db)
+        off_runtime(move || client.into_inner().close().map_err(db))
     }
 
-    fn raw_lock(&self) -> MutexGuard<'_, Client> {
+    fn raw_lock(&self) -> MutexGuard<'_, SyncClient> {
         self.client
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The connection under the store's lock, reconnected first when the
-    /// previous one was observed closed.
-    fn lock(&self) -> Result<MutexGuard<'_, Client>, StoreError> {
-        let mut client = self.raw_lock();
-        crate::pg_tls::ensure_open(&mut client, &self.dsn, &search_path_sql(&self.schema))
-            .map_err(StoreError::backend)?;
-        Ok(client)
+    /// Run `f` against the connection under the store's lock, reconnected
+    /// first when the previous one was observed closed, off any tokio
+    /// runtime (see [`off_runtime`]).
+    fn conn<T: Send>(
+        &self,
+        f: impl FnOnce(&mut Client) -> Result<T, StoreError> + Send,
+    ) -> Result<T, StoreError> {
+        off_runtime(|| {
+            let mut client = self.raw_lock();
+            crate::pg_tls::ensure_open(&mut client, &self.dsn, &search_path_sql(&self.schema))
+                .map_err(StoreError::backend)?;
+            f(&mut client)
+        })
     }
 }
 
@@ -1583,10 +1598,11 @@ fn control_command_from_row(row: &Row) -> Result<ControlCommandRecord, StoreErro
 
 impl LifecycleStore for PostgresStore {
     fn create_lifecycle(&self, lifecycle: &Lifecycle) -> Result<(), StoreError> {
-        let mut client = self.lock()?;
-        let mut tx = client.transaction().map_err(db)?;
-        insert_lifecycle(&mut tx, lifecycle)?;
-        tx.commit().map_err(db)
+        self.conn(|client| {
+            let mut tx = client.transaction().map_err(db)?;
+            insert_lifecycle(&mut tx, lifecycle)?;
+            tx.commit().map_err(db)
+        })
     }
 
     fn update_lifecycle(
@@ -1594,23 +1610,19 @@ impl LifecycleStore for PostgresStore {
         lifecycle: &Lifecycle,
         expected_version: u64,
     ) -> Result<(), StoreError> {
-        let mut client = self.lock()?;
-        update_lifecycle_row(&mut *client, lifecycle, expected_version)
+        self.conn(|client| update_lifecycle_row(&mut *client, lifecycle, expected_version))
     }
 
     fn load_lifecycle(&self, run_id: &str) -> Result<Option<Lifecycle>, StoreError> {
-        let mut client = self.lock()?;
-        load_lifecycle_row(&mut *client, run_id, false)
+        self.conn(|client| load_lifecycle_row(&mut *client, run_id, false))
     }
 
     fn list_lifecycles(&self, filter: &LifecycleFilter) -> Result<Vec<Lifecycle>, StoreError> {
-        let mut client = self.lock()?;
-        list_lifecycle_rows(&mut *client, filter)
+        self.conn(|client| list_lifecycle_rows(&mut *client, filter))
     }
 
     fn summarize_spend(&self, window: &SpendWindow) -> Result<SpendSummary, StoreError> {
-        let mut client = self.lock()?;
-        summarize_spend_rows(&mut *client, window)
+        self.conn(|client| summarize_spend_rows(&mut *client, window))
     }
 }
 
@@ -1626,36 +1638,37 @@ impl TaskStore for PostgresStore {
         let column = |key: &str| definition.get(key).cloned().unwrap_or(Value::Null);
         let (graders_json, tags_json, context_json) =
             (column("graders"), column("tags"), column("context"));
-        let mut client = self.lock()?;
-        // One transaction so the identity row and the version row land
-        // together. The version row is immutable (ON CONFLICT DO NOTHING
-        // keeps the original created_at); the whole definition is part of
-        // the content hash.
-        let mut tx = client.transaction().map_err(db)?;
-        ensure_task_identity(&mut tx, &task.id, now)?;
-        tx.execute(
-            "UPDATE tasks SET updated_at = $1 WHERE id = $2",
-            &[&now, &task.id],
-        )
-        .map_err(db)?;
-        tx.execute(
-            "INSERT INTO task_versions (
-                task_id, content_hash, goal, graders_json, tags_json, context_json, created_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (task_id, content_hash) DO NOTHING",
-            &[
-                &task.id,
-                &content_hash,
-                &goal,
-                &graders_json,
-                &tags_json,
-                &context_json,
-                &now,
-            ],
-        )
-        .map_err(db)?;
-        tx.commit().map_err(db)?;
-        Ok(content_hash)
+        self.conn(|client| {
+            // One transaction so the identity row and the version row land
+            // together. The version row is immutable (ON CONFLICT DO NOTHING
+            // keeps the original created_at); the whole definition is part of
+            // the content hash.
+            let mut tx = client.transaction().map_err(db)?;
+            ensure_task_identity(&mut tx, &task.id, now)?;
+            tx.execute(
+                "UPDATE tasks SET updated_at = $1 WHERE id = $2",
+                &[&now, &task.id],
+            )
+            .map_err(db)?;
+            tx.execute(
+                "INSERT INTO task_versions (
+                    task_id, content_hash, goal, graders_json, tags_json, context_json, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (task_id, content_hash) DO NOTHING",
+                &[
+                    &task.id,
+                    &content_hash,
+                    &goal,
+                    &graders_json,
+                    &tags_json,
+                    &context_json,
+                    &now,
+                ],
+            )
+            .map_err(db)?;
+            tx.commit().map_err(db)?;
+            Ok(content_hash)
+        })
     }
 
     fn load_task(
@@ -1663,25 +1676,25 @@ impl TaskStore for PostgresStore {
         task_id: &str,
         content_hash: Option<&str>,
     ) -> Result<Option<Task>, StoreError> {
-        let mut client = self.lock()?;
-        load_task_row(&mut *client, task_id, content_hash)
+        self.conn(|client| load_task_row(&mut *client, task_id, content_hash))
     }
 
     fn load_task_for_run(&self, run_id: &str) -> Result<Option<Task>, StoreError> {
-        let mut client = self.lock()?;
-        let pinned = client
-            .query_opt(
-                "SELECT task_id, task_content_hash FROM lifecycles WHERE run_id = $1",
-                &[&run_id],
-            )
-            .map_err(db)?;
-        let Some(row) = pinned else {
-            return Ok(None);
-        };
-        let task_id: String = col(&row, 0)?;
-        let content_hash: Option<String> = col(&row, 1)?;
-        let content_hash = content_hash.filter(|h| !h.is_empty());
-        load_task_row(&mut *client, &task_id, content_hash.as_deref())
+        self.conn(|client| {
+            let pinned = client
+                .query_opt(
+                    "SELECT task_id, task_content_hash FROM lifecycles WHERE run_id = $1",
+                    &[&run_id],
+                )
+                .map_err(db)?;
+            let Some(row) = pinned else {
+                return Ok(None);
+            };
+            let task_id: String = col(&row, 0)?;
+            let content_hash: Option<String> = col(&row, 1)?;
+            let content_hash = content_hash.filter(|h| !h.is_empty());
+            load_task_row(&mut *client, &task_id, content_hash.as_deref())
+        })
     }
 }
 
@@ -1721,8 +1734,7 @@ impl DomainEventStore for PostgresStore {
         event: &DomainEvent,
         expected_version: u64,
     ) -> Result<Lifecycle, StoreError> {
-        let (folded, sequence) = {
-            let mut client = self.lock()?;
+        let (folded, sequence) = self.conn(|client| {
             // One transaction: the version check, projection writes and
             // event-row append are atomic, and SELECT ... FOR UPDATE on the
             // lifecycle row keeps a concurrent appender from interleaving.
@@ -1753,8 +1765,8 @@ impl DomainEventStore for PostgresStore {
             };
             let sequence = insert_domain_event(&mut tx, event, &self.channel)?;
             tx.commit().map_err(db)?;
-            (folded, sequence)
-        };
+            Ok((folded, sequence))
+        })?;
         // Signal only after the transaction commits so a woken consumer
         // never observes a watermark for an uncommitted (or rolled-back)
         // append.
@@ -1763,8 +1775,7 @@ impl DomainEventStore for PostgresStore {
     }
 
     fn list_domain_events(&self, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
-        let mut client = self.lock()?;
-        list_domain_event_rows(&mut *client, run_id)
+        self.conn(|client| list_domain_event_rows(&mut *client, run_id))
     }
 
     fn latest_domain_event_of_kind(
@@ -1772,8 +1783,7 @@ impl DomainEventStore for PostgresStore {
         run_id: &str,
         kind: DomainEventKind,
     ) -> Result<Option<DomainEvent>, StoreError> {
-        let mut client = self.lock()?;
-        latest_domain_event_row_of_kind(&mut *client, run_id, kind)
+        self.conn(|client| latest_domain_event_row_of_kind(&mut *client, run_id, kind))
     }
 }
 
@@ -1784,35 +1794,34 @@ impl AttemptStore for PostgresStore {
         attempt: &Attempt,
         expected_version: Option<u64>,
     ) -> Result<(), StoreError> {
-        let mut client = self.lock()?;
-        let Some(expected) = expected_version else {
-            // Unconditional upsert: a direct caller's write, or the
-            // domain-event projection (already inside the version-checked
-            // append transaction).
-            return upsert_attempt(&mut *client, run_id, attempt);
-        };
-        // Versioned write (the harness's iteration-boundary aggregate
-        // rollup): verify the lifecycle's optimistic-concurrency key under
-        // FOR UPDATE in the same transaction as the upsert so a stale worker
-        // cannot clobber counters after the run moved on.
-        let mut tx = client.transaction().map_err(db)?;
-        let actual = stored_version(&mut tx, run_id, true)?
-            .ok_or_else(|| StoreError::lifecycle_not_found(run_id))?;
-        if actual != expected {
-            return Err(StoreError::optimistic_concurrency(run_id, expected, actual));
-        }
-        upsert_attempt(&mut tx, run_id, attempt)?;
-        tx.commit().map_err(db)
+        self.conn(|client| {
+            let Some(expected) = expected_version else {
+                // Unconditional upsert: a direct caller's write, or the
+                // domain-event projection (already inside the version-checked
+                // append transaction).
+                return upsert_attempt(&mut *client, run_id, attempt);
+            };
+            // Versioned write (the harness's iteration-boundary aggregate
+            // rollup): verify the lifecycle's optimistic-concurrency key under
+            // FOR UPDATE in the same transaction as the upsert so a stale worker
+            // cannot clobber counters after the run moved on.
+            let mut tx = client.transaction().map_err(db)?;
+            let actual = stored_version(&mut tx, run_id, true)?
+                .ok_or_else(|| StoreError::lifecycle_not_found(run_id))?;
+            if actual != expected {
+                return Err(StoreError::optimistic_concurrency(run_id, expected, actual));
+            }
+            upsert_attempt(&mut tx, run_id, attempt)?;
+            tx.commit().map_err(db)
+        })
     }
 
     fn load_attempt(&self, run_id: &str, number: u32) -> Result<Option<Attempt>, StoreError> {
-        let mut client = self.lock()?;
-        load_attempt_row(&mut *client, run_id, number)
+        self.conn(|client| load_attempt_row(&mut *client, run_id, number))
     }
 
     fn list_attempts(&self, run_id: &str) -> Result<Vec<Attempt>, StoreError> {
-        let mut client = self.lock()?;
-        list_attempt_rows(&mut *client, run_id)
+        self.conn(|client| list_attempt_rows(&mut *client, run_id))
     }
 }
 
@@ -1821,8 +1830,7 @@ impl GraderResultStore for PostgresStore {
         &self,
         result: &GraderResultRecord,
     ) -> Result<GraderResultRecord, StoreError> {
-        let mut client = self.lock()?;
-        insert_grader_result(&mut *client, result)
+        self.conn(|client| insert_grader_result(&mut *client, result))
     }
 
     fn list_grader_results(
@@ -1830,8 +1838,7 @@ impl GraderResultStore for PostgresStore {
         run_id: &str,
         attempt_number: u32,
     ) -> Result<Vec<GraderResultRecord>, StoreError> {
-        let mut client = self.lock()?;
-        list_grader_result_rows(&mut *client, run_id, attempt_number)
+        self.conn(|client| list_grader_result_rows(&mut *client, run_id, attempt_number))
     }
 }
 
@@ -1847,8 +1854,7 @@ impl ControlCommandStore for PostgresStore {
         // pending queue immediately; BIGSERIAL assigns id, the per-run
         // enqueue-order key claim_commands consumes.
         let payload_json = nul_free_json(Value::Object(payload.clone()));
-        let id: i64 = {
-            let mut client = self.lock()?;
+        let id: i64 = self.conn(|client| {
             let row = client
                 .query_one(
                     "INSERT INTO control_commands (run_id, kind, payload_json, enqueued_at, claimed_at)
@@ -1856,8 +1862,8 @@ impl ControlCommandStore for PostgresStore {
                     &[&run_id, &kind, &payload_json, &now],
                 )
                 .map_err(db)?;
-            col(&row, 0)?
-        };
+            col(&row, 0)
+        })?;
         let mut record = ControlCommandRecord::pending(run_id, kind, payload, now);
         record.id = Some(id);
         Ok(record)
@@ -1874,8 +1880,7 @@ impl ControlCommandStore for PostgresStore {
         // slice. The outer UPDATE then flips claimed_at and returns the row.
         // RETURNING yields rows in arbitrary order; sort by id afterwards to
         // honor the enqueue-order contract.
-        let rows = {
-            let mut client = self.lock()?;
+        let rows = self.conn(|client| {
             client
                 .query(
                     "UPDATE control_commands SET claimed_at = $1
@@ -1888,8 +1893,8 @@ impl ControlCommandStore for PostgresStore {
                      RETURNING id, run_id, kind, payload_json, enqueued_at, claimed_at",
                     &[&now, &run_id],
                 )
-                .map_err(db)?
-        };
+                .map_err(db)
+        })?;
         let mut records = rows
             .iter()
             .map(control_command_from_row)
@@ -1902,16 +1907,16 @@ impl ControlCommandStore for PostgresStore {
         // Queue hygiene (spec 00025 FR-10): the consumer deletes an applied
         // row only after the steering domain event committed. Unknown ids
         // are a no-op by contract.
-        let mut client = self.lock()?;
-        client
-            .execute("DELETE FROM control_commands WHERE id = $1", &[&command_id])
-            .map_err(db)?;
-        Ok(())
+        self.conn(|client| {
+            client
+                .execute("DELETE FROM control_commands WHERE id = $1", &[&command_id])
+                .map_err(db)?;
+            Ok(())
+        })
     }
 
     fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
-        let rows = {
-            let mut client = self.lock()?;
+        let rows = self.conn(|client| {
             client
                 .query(
                     "SELECT id, run_id, kind, payload_json, enqueued_at, claimed_at
@@ -1919,8 +1924,8 @@ impl ControlCommandStore for PostgresStore {
                      ORDER BY id",
                     &[&run_id],
                 )
-                .map_err(db)?
-        };
+                .map_err(db)
+        })?;
         rows.iter().map(control_command_from_row).collect()
     }
 }

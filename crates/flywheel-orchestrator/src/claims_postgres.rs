@@ -47,13 +47,14 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Timelike, Utc};
 use postgres::types::{FromSql, ToSql};
 use postgres::{Client, GenericClient, Row, Transaction};
 use serde_json::Value;
 
+use flywheel_core::pg_tls::{SyncClient, off_runtime};
 use flywheel_core::store::HarnessStore;
 use flywheel_core::store_postgres::{
     BOOTSTRAP_LOCK_KEY, DEFAULT_SCHEMA, IntegerOutOfRange, PostgresError, PostgresStore,
@@ -692,7 +693,7 @@ fn bootstrap(client: &mut Client, schema: &str) -> Result<(), ClaimStoreError> {
 /// coordinate through the database itself: the acquire advisory lock, row
 /// locks, and the `ON CONFLICT` guard, never through anything in-process.
 pub struct PostgresClaimStore {
-    client: Mutex<Client>,
+    client: Mutex<SyncClient>,
     /// Kept to heal a closed connection; never logged or echoed.
     dsn: String,
     schema: String,
@@ -722,11 +723,14 @@ impl PostgresClaimStore {
             .to_owned();
         let (config, tls) = flywheel_core::pg_tls::configure(dsn)
             .map_err(|err| ClaimStoreError::Backend(Box::new(err)))?;
-        let mut client = config.connect(tls).map_err(db)?;
-        client
-            .batch_execute(&search_path_sql(&schema))
-            .map_err(db)?;
-        bootstrap(&mut client, &schema)?;
+        let client = off_runtime(|| {
+            let mut client = SyncClient::new(config.connect(tls).map_err(db)?);
+            client
+                .batch_execute(&search_path_sql(&schema))
+                .map_err(db)?;
+            bootstrap(&mut client, &schema)?;
+            Ok::<_, ClaimStoreError>(client)
+        })?;
         Ok(Self {
             client: Mutex::new(client),
             dsn: dsn.to_owned(),
@@ -742,18 +746,21 @@ impl PostgresClaimStore {
     /// Run `f` against the underlying connection under the store's lock:
     /// the escape hatch for inspection and for consumers sharing the
     /// database. The store's invariants are not re-checked on what `f` does.
-    pub fn with_client<T>(&self, f: impl FnOnce(&mut Client) -> T) -> T {
-        let mut client = self
-            .client
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Best-effort heal; a still-dead connection surfaces through `f`.
-        let _ = flywheel_core::pg_tls::ensure_open(
-            &mut client,
-            &self.dsn,
-            &search_path_sql(&self.schema),
-        );
-        f(&mut client)
+    /// Runs off any tokio runtime (see [`off_runtime`]).
+    pub fn with_client<T: Send>(&self, f: impl FnOnce(&mut Client) -> T + Send) -> T {
+        off_runtime(|| {
+            let mut client = self
+                .client
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Best-effort heal; a still-dead connection surfaces through `f`.
+            let _ = flywheel_core::pg_tls::ensure_open(
+                &mut client,
+                &self.dsn,
+                &search_path_sql(&self.schema),
+            );
+            f(&mut client)
+        })
     }
 
     /// Close the connection.
@@ -762,37 +769,47 @@ impl PostgresClaimStore {
             .client
             .into_inner()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        client.close().map_err(db)
+        off_runtime(move || client.into_inner().close().map_err(db))
     }
 
-    /// The connection under the store's lock, reconnected first when the
-    /// previous one was observed closed.
-    fn lock(&self) -> Result<MutexGuard<'_, Client>, ClaimStoreError> {
-        let mut client = self.client.lock().map_err(|_| ClaimStoreError::Poisoned)?;
-        flywheel_core::pg_tls::ensure_open(&mut client, &self.dsn, &search_path_sql(&self.schema))
+    /// Run `body` against the connection under the store's lock,
+    /// reconnected first when the previous one was observed closed, off any
+    /// tokio runtime (see [`off_runtime`]).
+    fn conn<T: Send>(
+        &self,
+        body: impl FnOnce(&mut Client) -> Result<T, ClaimStoreError> + Send,
+    ) -> Result<T, ClaimStoreError> {
+        off_runtime(|| {
+            let mut client = self.client.lock().map_err(|_| ClaimStoreError::Poisoned)?;
+            flywheel_core::pg_tls::ensure_open(
+                &mut client,
+                &self.dsn,
+                &search_path_sql(&self.schema),
+            )
             .map_err(|err| ClaimStoreError::Backend(Box::new(err)))?;
-        Ok(client)
+            body(&mut client)
+        })
     }
 
     /// Run `body` in one transaction: committed on `Ok`, rolled back on
     /// `Err` (so a ledger row never outlives a failed transition).
-    fn write<T>(
+    fn write<T: Send>(
         &self,
-        body: impl FnOnce(&mut Transaction<'_>) -> Result<T, ClaimStoreError>,
+        body: impl FnOnce(&mut Transaction<'_>) -> Result<T, ClaimStoreError> + Send,
     ) -> Result<T, ClaimStoreError> {
-        let mut client = self.lock()?;
-        let mut tx = client.transaction().map_err(db)?;
-        let value = body(&mut tx)?;
-        tx.commit().map_err(db)?;
-        Ok(value)
+        self.conn(|client| {
+            let mut tx = client.transaction().map_err(db)?;
+            let value = body(&mut tx)?;
+            tx.commit().map_err(db)?;
+            Ok(value)
+        })
     }
 
-    fn read<T>(
+    fn read<T: Send>(
         &self,
-        body: impl FnOnce(&mut Client) -> Result<T, ClaimStoreError>,
+        body: impl FnOnce(&mut Client) -> Result<T, ClaimStoreError> + Send,
     ) -> Result<T, ClaimStoreError> {
-        let mut client = self.lock()?;
-        body(&mut client)
+        self.conn(body)
     }
 }
 

@@ -216,6 +216,66 @@ pub fn ensure_open(client: &mut Client, dsn: &str, session_sql: &str) -> Result<
     Ok(())
 }
 
+/// Run `f` where the blocking `postgres` client is allowed to block.
+///
+/// The blocking client drives every call -- and its own drop -- through a
+/// private runtime's `block_on`, which panics on a thread already driving
+/// async tasks. Store verbs are synchronous yet called from async code (the
+/// orchestrate loop, the hub), so when a tokio runtime is current `f` runs
+/// on a scoped helper thread; otherwise it runs inline.
+pub fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return f();
+    }
+    std::thread::scope(|scope| match scope.spawn(f).join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
+}
+
+/// A blocking [`Client`] whose drop also runs [`off_runtime`], so a store
+/// released inside async code does not panic tearing down its connection.
+pub struct SyncClient(Option<Client>);
+
+impl SyncClient {
+    pub fn new(client: Client) -> Self {
+        Self(Some(client))
+    }
+
+    /// Take the connection back (e.g. to close it explicitly).
+    pub fn into_inner(mut self) -> Client {
+        self.0
+            .take()
+            .expect("SyncClient holds its client until consumed")
+    }
+}
+
+impl std::ops::Deref for SyncClient {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        self.0
+            .as_ref()
+            .expect("SyncClient holds its client until consumed")
+    }
+}
+
+impl std::ops::DerefMut for SyncClient {
+    fn deref_mut(&mut self) -> &mut Client {
+        self.0
+            .as_mut()
+            .expect("SyncClient holds its client until consumed")
+    }
+}
+
+impl Drop for SyncClient {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            off_runtime(move || drop(client));
+        }
+    }
+}
+
 /// Why [`connect`] failed.
 #[derive(Debug)]
 pub enum ConnectError {

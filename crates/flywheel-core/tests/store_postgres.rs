@@ -1114,3 +1114,47 @@ fn listen_bridge_watermark_is_the_exact_committed_sequence() {
     assert_eq!(consumer.notifier().watermark("run-wm"), 2);
     consumer.close().unwrap();
 }
+
+/// The blocking driver runs each call (and its teardown) through a private
+/// runtime's `block_on`; the orchestrate loop calls store verbs from async
+/// code. Connecting, every verb, closing, and dropping inside a runtime --
+/// multi- and current-thread -- must neither panic nor abort.
+#[test]
+fn store_is_usable_and_droppable_inside_a_tokio_runtime() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    for multi_thread in [true, false] {
+        let runtime = if multi_thread {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+        }
+        .unwrap();
+        let schema = pg.fresh_schema("fw_async");
+        let dsn = pg.dsn();
+        runtime.block_on(async move {
+            let store = PostgresStore::connect(&dsn, &schema).unwrap();
+            let lifecycle = Lifecycle::new("async-task").with_run_id("async-run");
+            store.create_lifecycle(&lifecycle).unwrap();
+            let listed = store.list_lifecycles(&LifecycleFilter::default()).unwrap();
+            assert_eq!(listed.len(), 1);
+            let tables: i64 = store.with_client(|client| {
+                client
+                    .query_one("SELECT count(*) FROM lifecycles", &[])
+                    .unwrap()
+                    .get(0)
+            });
+            assert_eq!(tables, 1);
+            drop(store);
+            PostgresStore::connect(&dsn, &schema)
+                .unwrap()
+                .close()
+                .unwrap();
+        });
+    }
+}

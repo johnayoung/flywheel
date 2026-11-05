@@ -38,9 +38,6 @@ const ACTIVE_FILE: &str = "active.json";
 pub const DEFAULT_MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Default cap on the whole directory: the oldest finished recordings go.
 pub const DEFAULT_MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
-/// How often an idle recorder looks for output (the timing resolution of
-/// output arriving after a pause).
-const POLL: Duration = Duration::from_millis(10);
 /// Bytes an event line takes beyond its data (time, code, quoting).
 const EVENT_OVERHEAD: u64 = 64;
 /// Room kept at the end of a part for the marker that ends it
@@ -118,6 +115,32 @@ const STOP: u8 = 1;
 /// Drain what was output, then let go of the file (a handoff): the
 /// recording carries on in whichever process resumes it.
 const FREEZE: u8 = 2;
+
+/// What a recorder thread is told to do ([`RUN`], [`STOP`], [`FREEZE`]),
+/// and the wakeup that tells it: an idle recorder sleeps until output or
+/// this.
+struct Control {
+    state: AtomicU8,
+    changed: tokio::sync::Notify,
+}
+
+impl Control {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: AtomicU8::new(RUN),
+            changed: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn set(&self, state: u8) {
+        self.state.store(state, Ordering::Release);
+        self.changed.notify_one();
+    }
+
+    fn get(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+}
 
 /// Size caps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,7 +229,7 @@ pub type EndNotice = Arc<dyn Fn(&str, &str) + Send + Sync>;
 struct Recorder {
     entry: Arc<Mutex<ActiveEntry>>,
     generation: u64,
-    control: Arc<AtomicU8>,
+    control: Arc<Control>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -470,7 +493,7 @@ impl Recordings {
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let entry = Arc::new(Mutex::new(entry));
-        let control = Arc::new(AtomicU8::new(RUN));
+        let control = Control::new();
         let worker = Worker {
             owner: Arc::downgrade(self),
             entry: Arc::clone(&entry),
@@ -506,7 +529,7 @@ impl Recordings {
                     "session {id} is not being recorded"
                 )));
             };
-            recorder.control.store(STOP, Ordering::Release);
+            recorder.control.set(STOP);
             (
                 Arc::clone(&recorder.entry),
                 recorder.generation,
@@ -538,7 +561,7 @@ impl Recordings {
     pub fn stop_all(&self) {
         let recorders: Vec<Recorder> = self.recorders().drain().map(|(_, r)| r).collect();
         for recorder in &recorders {
-            recorder.control.store(STOP, Ordering::Release);
+            recorder.control.set(STOP);
         }
         for mut recorder in recorders {
             if let Some(thread) = recorder.thread.take() {
@@ -557,7 +580,7 @@ impl Recordings {
             recorders
                 .values_mut()
                 .filter_map(|r| {
-                    r.control.store(FREEZE, Ordering::Release);
+                    r.control.set(FREEZE);
                     r.thread.take()
                 })
                 .collect()
@@ -595,7 +618,7 @@ impl Recordings {
                 Recorder {
                     entry: Arc::new(Mutex::new(entry)),
                     generation,
-                    control: Arc::new(AtomicU8::new(RUN)),
+                    control: Control::new(),
                     thread: None,
                 },
             );
@@ -841,7 +864,7 @@ struct Worker {
     owner: Weak<Recordings>,
     entry: Arc<Mutex<ActiveEntry>>,
     generation: u64,
-    control: Arc<AtomicU8>,
+    control: Arc<Control>,
     session: Weak<PtySession>,
     /// The terminal as the recording so far draws it: fed exactly what is
     /// written, so a new part opens on the screen where the last one
@@ -868,12 +891,17 @@ impl Worker {
         // the stop was seen). Checked before every event, as under
         // sustained output the queue never runs empty.
         let mut stopping: Option<usize> = None;
+        // Waits for output or a control change when idle: no drivers,
+        // neither the channel nor the notification needs one.
+        let waiter = tokio::runtime::Builder::new_current_thread().build();
+        // An event taken while waiting, written before the queue's.
+        let mut held: Option<Result<SessionEvent, broadcast::error::TryRecvError>> = None;
         let finished = loop {
-            match (stopping, self.control.load(Ordering::Acquire)) {
+            match (stopping, self.control.get()) {
                 (Some(0), _) => break false,
                 (Some(left), _) => stopping = Some(left - 1),
                 (None, STOP) => {
-                    stopping = Some(self.events.len());
+                    stopping = Some(self.events.len() + usize::from(held.is_some()));
                     continue;
                 }
                 (None, FREEZE) => {
@@ -883,7 +911,7 @@ impl Worker {
                 }
                 (None, _) => {}
             }
-            match self.events.try_recv() {
+            match held.take().unwrap_or_else(|| self.events.try_recv()) {
                 Ok(SessionEvent::Output(bytes)) => {
                     let text = self.writer.output_text(&bytes);
                     if !text.is_empty() && !self.record_output(&text) {
@@ -925,10 +953,31 @@ impl Worker {
                     if stopping.is_some() {
                         break false;
                     }
+                    // Caught up: write out what is buffered (nothing to do
+                    // when nothing was written since), then sleep until
+                    // output or a stop.
                     if let Err(e) = self.writer.flush() {
                         break self.failed(&e);
                     }
-                    std::thread::sleep(POLL);
+                    let waiter = match &waiter {
+                        Ok(waiter) => waiter,
+                        Err(e) => break self.failed(e),
+                    };
+                    let control = &self.control;
+                    let events = &mut self.events;
+                    held = waiter.block_on(async {
+                        tokio::select! {
+                            event = events.recv() => Some(event.map_err(|e| match e {
+                                broadcast::error::RecvError::Closed => {
+                                    broadcast::error::TryRecvError::Closed
+                                }
+                                broadcast::error::RecvError::Lagged(n) => {
+                                    broadcast::error::TryRecvError::Lagged(n)
+                                }
+                            })),
+                            () = control.changed.notified() => None,
+                        }
+                    });
                 }
             }
         };
@@ -1540,13 +1589,16 @@ mod tests {
         assert_eq!(file_label(&"x".repeat(100), "id").len(), 48);
     }
 
-    /// A stop is seen between events, not only once the queue drains:
-    /// under sustained output it never does. What was queued when it was
-    /// seen is still written.
-    #[test]
-    fn a_stop_ends_a_recording_under_sustained_output() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("x.cast");
+    /// A recorder thread writing `path`, fed by the returned sender; the
+    /// receiver hears when it ends.
+    fn spawn_worker(
+        path: &Path,
+    ) -> (
+        broadcast::Sender<SessionEvent>,
+        Arc<Control>,
+        std::sync::mpsc::Receiver<()>,
+        std::thread::JoinHandle<()>,
+    ) {
         let entry = ActiveEntry {
             session_id: "s".into(),
             file: "x.cast".into(),
@@ -1555,10 +1607,10 @@ mod tests {
             started_ms: now_ms(),
             title: "t".into(),
         };
-        let mut writer = CastWriter::create(&path, 80, 24, &entry).unwrap();
+        let mut writer = CastWriter::create(path, 80, 24, &entry).unwrap();
         writer.snapshot(b"").unwrap();
         let (tx, events) = broadcast::channel(1 << 16);
-        let control = Arc::new(AtomicU8::new(RUN));
+        let control = Control::new();
         let worker = Worker {
             owner: Weak::new(),
             entry: Arc::new(Mutex::new(entry)),
@@ -1575,6 +1627,54 @@ mod tests {
             worker.run();
             let _ = done_tx.send(());
         });
+        (tx, control, done, thread)
+    }
+
+    /// An idle recorder sleeps with no timeout: output wakes it (and is
+    /// written out once it catches up), and so do a stop and a freeze.
+    #[test]
+    fn an_idle_recorder_wakes_for_output_stop_and_freeze() {
+        let dir = tempfile::tempdir().unwrap();
+        for control_change in [STOP, FREEZE] {
+            let path = dir.path().join(format!("idle-{control_change}.cast"));
+            let (tx, control, done, thread) = spawn_worker(&path);
+            for n in 0..3 {
+                // Idle first, so the recorder is asleep when output comes.
+                std::thread::sleep(Duration::from_millis(50));
+                let line = format!("after idle {n}\n");
+                tx.send(SessionEvent::Output(axum::body::Bytes::from(line.clone())))
+                    .unwrap();
+                // As JSON-escaped in its event line.
+                let wanted = serde_json::to_string(&line).unwrap();
+                let wanted = &wanted[1..wanted.len() - 1];
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !fs::read_to_string(&path).unwrap().contains(wanted) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{line:?} never written out"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            control.set(control_change);
+            assert!(
+                done.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "an idle recorder never saw its control change"
+            );
+            thread.join().unwrap();
+            drop(tx);
+        }
+    }
+
+    /// A stop is seen between events, not only once the queue drains:
+    /// under sustained output it never does. What was queued when it was
+    /// seen is still written.
+    #[test]
+    fn a_stop_ends_a_recording_under_sustained_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.cast");
+        let (tx, control, done, thread) = spawn_worker(&path);
         // A producer that keeps the queue from ever running empty.
         let producing = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let producer = {
@@ -1594,7 +1694,7 @@ mod tests {
             })
         };
         std::thread::sleep(Duration::from_millis(100));
-        control.store(STOP, Ordering::Release);
+        control.set(STOP);
         let stopped = done.recv_timeout(Duration::from_secs(10));
         producing.store(false, Ordering::Release);
         producer.join().unwrap();

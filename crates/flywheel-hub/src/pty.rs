@@ -44,6 +44,8 @@ use axum::body::Bytes;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -66,8 +68,6 @@ pub const MAX_ROWS: u16 = 300;
 /// Input bytes queued for a child that is not reading its stdin before
 /// further input is refused.
 pub const INPUT_QUEUE_LIMIT: usize = 4 * 1024 * 1024;
-/// How often the reader and writer threads re-check [`PtySession::release`].
-const RELEASE_POLL: Duration = Duration::from_millis(200);
 /// Largest single write to the PTY after it reports writable.
 const WRITE_SLICE: usize = 512;
 
@@ -233,7 +233,36 @@ pub enum Reattach {
     Fresh { continued: bool },
 }
 
-/// State shared with the writer thread.
+/// A wakeup an I/O thread blocked in `poll` sees: a socket pair whose
+/// read end joins the poll set and becomes readable once signalled. Idle
+/// threads block without a timeout; whatever changes what they should do
+/// (a release, a pause, the session closing) sets its flag, then signals.
+struct Waker {
+    rx: UnixStream,
+    tx: UnixStream,
+}
+
+impl Waker {
+    fn new() -> std::io::Result<Self> {
+        let (rx, tx) = UnixStream::pair()?;
+        rx.set_nonblocking(true)?;
+        tx.set_nonblocking(true)?;
+        Ok(Self { rx, tx })
+    }
+
+    /// Make the read end readable. A full buffer (`WouldBlock`) already is.
+    fn signal(&self) {
+        let _ = (&self.tx).write(&[1]);
+    }
+
+    /// Consume every pending signal, so the next `poll` blocks again.
+    fn drain(&self) {
+        let mut buf = [0u8; 64];
+        while matches!((&self.rx).read(&mut buf), Ok(n) if n > 0) {}
+    }
+}
+
+/// State shared with the I/O threads.
 struct InputQueue {
     queued: AtomicUsize,
     released: AtomicBool,
@@ -245,6 +274,12 @@ struct InputQueue {
     pausing: AtomicBool,
     pause: Mutex<PauseState>,
     pause_changed: Condvar,
+    /// Wakes the reader out of `poll` on the master.
+    reader_wake: Waker,
+    /// Wakes the writer out of `poll` on the master (while it waits for
+    /// the child to read); blocked on its channel instead, it is woken by
+    /// an empty message ([`PtySession::wake_io`]).
+    writer_wake: Waker,
 }
 
 /// A live handoff's hold on the I/O threads (see [`PtySession::pause`]).
@@ -266,15 +301,17 @@ struct PauseState {
 }
 
 impl InputQueue {
-    fn new() -> Self {
-        Self {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
             queued: AtomicUsize::new(0),
             released: AtomicBool::new(false),
             closing: AtomicBool::new(false),
             pausing: AtomicBool::new(false),
             pause: Mutex::new(PauseState::default()),
             pause_changed: Condvar::new(),
-        }
+            reader_wake: Waker::new()?,
+            writer_wake: Waker::new()?,
+        })
     }
 
     fn pause_state(&self) -> std::sync::MutexGuard<'_, PauseState> {
@@ -303,12 +340,13 @@ impl InputQueue {
             state.writer_parked = true;
         }
         self.pause_changed.notify_all();
+        // `release` and `resume` change what this waits on under the
+        // pause lock, then notify: no timeout is needed to see either.
         while state.requested && !self.released() {
             state = self
                 .pause_changed
-                .wait_timeout(state, RELEASE_POLL)
-                .unwrap_or_else(PoisonError::into_inner)
-                .0;
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
         }
         if reader {
             state.reader_parked = false;
@@ -426,7 +464,10 @@ impl PtySession {
             .ok_or_else(|| spawn_err("the pty master has no file descriptor".into()))?;
         let (events, _) = broadcast::channel(BROADCAST_DEPTH);
         let (input, input_rx) = std_mpsc::channel::<Vec<u8>>();
-        let queue = Arc::new(InputQueue::new());
+        let queue = Arc::new(InputQueue::new().map_err(|e| SpawnError::Spawn {
+            program: program.clone(),
+            reason: e.to_string(),
+        })?);
         // Only the waiter below reaps the child, and it has not started.
         let pidfd = pid.and_then(handoff::pidfd_open);
         let session = Arc::new(Self {
@@ -516,7 +557,7 @@ impl PtySession {
     fn read_loop(&self, fd: libc::c_int, mut reader: Box<dyn Read + Send>) {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
-            match wait_ready(fd, libc::POLLIN, &self.queue) {
+            match wait_ready(fd, libc::POLLIN, &self.queue, &self.queue.reader_wake) {
                 Wake::Ready => {}
                 Wake::Released => break,
                 Wake::Paused => {
@@ -574,6 +615,8 @@ impl PtySession {
         }
         if !pause.writer_done {
             self.queue.closing.store(true, Ordering::Release);
+            drop(pause);
+            self.wake_io();
             return;
         }
         // The pause lock is held: no pause can start (and read the
@@ -986,12 +1029,28 @@ impl PtySession {
     }
 
     /// Stop the reader and writer threads and refuse further input. The
-    /// threads notice within [`RELEASE_POLL`]; once they and every other
-    /// holder drop their `Arc`, the PTY master is closed. Use after
+    /// threads are woken at once; once they and every other holder drop
+    /// their `Arc`, the PTY master is closed. Use after
     /// [`PtySession::kill`] when the session is being forgotten.
     pub fn release(&self) {
-        self.queue.released.store(true, Ordering::Release);
-        self.queue.pause_changed.notify_all();
+        {
+            // Under the pause lock, so a thread about to park sees it.
+            let _state = self.queue.pause_state();
+            self.queue.released.store(true, Ordering::Release);
+            self.queue.pause_changed.notify_all();
+        }
+        self.wake_io();
+    }
+
+    /// Wake both I/O threads to re-check their flags (released, closing,
+    /// pausing), wherever they block: the reader and a writer waiting for
+    /// the PTY to drain in `poll`, an idle writer on its channel (an empty
+    /// message, which writes nothing and is otherwise never sent: see
+    /// [`PtySession::write`]).
+    fn wake_io(&self) {
+        self.queue.reader_wake.signal();
+        self.queue.writer_wake.signal();
+        let _ = self.input.send(Vec::new());
     }
 
     /// Whether [`PtySession::release`] has been called.
@@ -1013,12 +1072,13 @@ impl PtySession {
     /// The first half of [`PtySession::pause`]: ask the I/O threads to
     /// park without waiting for them. Pausing many sessions requests all
     /// of them first, then waits ([`PtySession::wait_paused`]), so the
-    /// threads park in parallel -- one [`RELEASE_POLL`] in all, not one
-    /// per session.
+    /// threads park in parallel.
     pub fn request_pause(&self) {
         let mut state = self.queue.pause_state();
         state.requested = true;
         self.queue.pausing.store(true, Ordering::Release);
+        drop(state);
+        self.wake_io();
     }
 
     /// The second half of [`PtySession::pause`]: wait up to `timeout` for
@@ -1131,10 +1191,9 @@ impl PtySession {
 }
 
 /// Block until `fd` reports `events` (or an error/hangup, which the next
-/// read or write surfaces), checking for a release or a pause every
-/// [`RELEASE_POLL`].
-fn wait_ready(fd: libc::c_int, events: libc::c_short, queue: &InputQueue) -> Wake {
-    let timeout = libc::c_int::try_from(RELEASE_POLL.as_millis()).unwrap_or(200);
+/// read or write surfaces), or until `wake` is signalled for a release, a
+/// pause or the session closing. No timeout: an idle thread stays asleep.
+fn wait_ready(fd: libc::c_int, events: libc::c_short, queue: &InputQueue, wake: &Waker) -> Wake {
     loop {
         if queue.stopping() {
             return Wake::Released;
@@ -1142,15 +1201,28 @@ fn wait_ready(fd: libc::c_int, events: libc::c_short, queue: &InputQueue) -> Wak
         if queue.pausing.load(Ordering::Acquire) {
             return Wake::Paused;
         }
-        let mut pfd = libc::pollfd {
-            fd,
-            events,
-            revents: 0,
-        };
-        // SAFETY: `pfd` is a valid pollfd for the duration of the call and
-        // nfds is 1. `fd` stays open: the session owning it outlives us.
-        let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout) };
+        let mut pfds = [
+            libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake.rx.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `pfds` is a valid array of two pollfds for the duration
+        // of the call. `fd` stays open (the session owning it outlives us),
+        // and so does the wake socket (the queue we borrow owns it).
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) };
         if rc > 0 {
+            if pfds[1].revents != 0 {
+                // A flag changed: consume the signal, then re-check.
+                wake.drain();
+                continue;
+            }
             return Wake::Ready;
         }
         if rc < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
@@ -1194,17 +1266,18 @@ fn write_loop(
                 pending = left;
                 continue;
             }
-            match input.recv_timeout(RELEASE_POLL) {
+            // Blocks until input or a wakeup (an empty message: nothing
+            // to write, the flags above are re-checked).
+            match input.recv() {
                 Ok(bytes) => bytes,
-                Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(std_mpsc::RecvError) => return,
             }
         } else {
             std::mem::take(&mut pending)
         };
         let mut written = 0;
         while written < bytes.len() {
-            match wait_ready(fd, libc::POLLOUT, queue) {
+            match wait_ready(fd, libc::POLLOUT, queue, &queue.writer_wake) {
                 Wake::Ready => {}
                 Wake::Released => return,
                 Wake::Paused => {
@@ -1554,7 +1627,6 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "linux")]
     fn wait_for(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -1673,8 +1745,62 @@ mod tests {
         }
         assert!(outcomes.contains(&WriteOutcome::Backlogged), "{outcomes:?}");
         assert!(session.queued_input() <= INPUT_QUEUE_LIMIT + chunk.len());
+        // The writer is blocked in `poll` waiting for the PTY to drain:
+        // a pause and then a release reach it there.
+        assert!(session.pause(Duration::from_secs(5)));
+        session.resume();
+        session.release();
+        assert!(
+            wait_for(Duration::from_secs(5), || io_done(&session)),
+            "release must wake a writer waiting on a full PTY"
+        );
         session.kill(Duration::from_millis(200));
         assert!(session.wait_exit(Duration::from_secs(10)));
+    }
+
+    fn io_done(session: &PtySession) -> bool {
+        let state = session.queue.pause_state();
+        state.reader_done && state.writer_done
+    }
+
+    /// Idle I/O threads block with no timeout: the reader in `poll` on the
+    /// master, the writer on its empty channel. Nothing would ever re-check
+    /// a flag on its own, so these prove each change wakes them.
+    #[test]
+    fn pause_resume_and_release_wake_idle_io_threads() {
+        let session = PtySession::spawn(spec("stty -echo; echo ready; cat"), |_| {}).unwrap();
+        let mut att = session.attach();
+        assert!(read_until(&mut att, "ready", Duration::from_secs(10)).contains("ready"));
+        for round in 0..3 {
+            assert!(session.pause(Duration::from_secs(5)), "round {round}");
+            assert!(session.is_paused());
+            // Taken while paused, written once resumed.
+            let line = format!("held-{round}\n");
+            assert_eq!(session.write(line.into_bytes()), WriteOutcome::Queued);
+            session.resume();
+            let needle = format!("held-{round}");
+            assert!(
+                read_until(&mut att, &needle, Duration::from_secs(5)).contains(&needle),
+                "round {round}"
+            );
+        }
+        session.release();
+        assert!(
+            wait_for(Duration::from_secs(5), || io_done(&session)),
+            "release must wake idle reader and writer threads"
+        );
+        session.kill(Duration::from_millis(200));
+        assert!(session.wait_exit(Duration::from_secs(10)));
+    }
+
+    /// An ended session's writer, idle on its channel, is woken to end so
+    /// the descriptors close.
+    #[test]
+    fn an_ended_session_wakes_its_idle_writer() {
+        let session = PtySession::spawn(spec("exit 0"), |_| {}).unwrap();
+        assert!(session.wait_exit(Duration::from_secs(10)));
+        assert!(wait_closed(&session));
+        assert!(io_done(&session));
     }
 
     #[cfg(target_os = "linux")]

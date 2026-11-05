@@ -248,7 +248,7 @@ impl PtySession {
         let _ = screen.take_replies();
         let (events, _) = broadcast::channel(BROADCAST_DEPTH);
         let (input, input_rx) = std_mpsc::channel::<Vec<u8>>();
-        let queue = Arc::new(InputQueue::new());
+        let queue = Arc::new(InputQueue::new()?);
         {
             let mut state = queue.pause_state();
             state.requested = true;

@@ -61,6 +61,7 @@ mod activity_api;
 mod admission;
 mod auth;
 mod autopilot_api;
+mod broadcast_api;
 mod ca_page;
 mod commands_api;
 mod deflate;
@@ -347,6 +348,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             post(handoff_api::compose),
         )
         .route("/api/sessions/{id}/handoff", post(handoff_api::deliver))
+        .route("/api/broadcast", post(broadcast_api::broadcast))
         .route("/api/queues", get(queue_api::list))
         .route(
             "/api/sessions/{id}/queue",

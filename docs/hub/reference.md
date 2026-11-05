@@ -131,6 +131,7 @@ fw hub queue clear SESSION [--all] [--json] {where}
 fw hub queue move SESSION ITEM POS [--json] {where}
 fw hub queue pause SESSION [--json] {where}
 fw hub queue resume SESSION [--json] {where}
+fw hub broadcast TARGET... TEXT|- [--header] [--json] {where}  # exit 1: any refused
 ```
 
 A folder's autopilot (`start`, `approve`, `deny` ask; `--yes` skips):

@@ -252,7 +252,7 @@ function renderSession(session, index) {
   return el(
     "li",
     {
-      className: `session${active ? " active" : ""}${shown ? " shown" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${session.companion_of || session.review_of ? " companion" : ""}`,
+      className: `session${active ? " active" : ""}${shown ? " shown" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${session.companion_of || session.review_of ? " companion" : ""}${broadcast.isPicked(session.id) ? " picked" : ""}`,
       dataset: { id: session.id },
       tabIndex: 0,
       role: "button",
@@ -266,7 +266,11 @@ function renderSession(session, index) {
         e.dataTransfer.setData("text/plain", session.name);
         e.dataTransfer.effectAllowed = "copyMove";
       },
-      onclick: () => openSession(session.id),
+      // Ctrl/Cmd-click picks agents for a broadcast (broadcast.js).
+      onclick: (e) => {
+        if ((e.ctrlKey || e.metaKey) && !e.target.closest("button") && broadcast.toggle(session)) return;
+        openSession(session.id);
+      },
       ondblclick: (e) => {
         if (!e.target.closest("button")) startRename(session.id);
       },
@@ -419,6 +423,7 @@ function renderWorkspace(workspace, i, numbering, needsYou = new Set()) {
         "span",
         { className: "ws-tools" },
         iconButton("plus", "New session here", () => openSessionDialog(workspace.id)),
+        broadcast.workspaceTool(workspace, iconButton),
         iconButton("gear", "Edit workspace", () => openWorkspaceDialog(workspace)),
         iconButton("x", "Delete workspace", () => deleteWorkspace(workspace), true),
       ),
@@ -535,6 +540,7 @@ function render() {
 
   attention.render();
   launcher.render();
+  broadcast.render();
   if (!tabRenaming) renderTabs();
   for (const pane of livePanes()) renderPaneHead(pane);
   renderMain();

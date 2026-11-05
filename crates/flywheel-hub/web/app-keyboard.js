@@ -100,6 +100,7 @@ function paletteCommands() {
   review.paletteItems(cmd);
   handoff.paletteItems(cmd);
   promptQueue.paletteItems(cmd);
+  broadcast.paletteItems(cmd);
   pullRequests.paletteItems(cmd);
   perms.paletteItems(cmd);
   mobile.paletteItems(cmd);
@@ -476,6 +477,7 @@ const actions = {
     document.body.classList.remove("side-open");
     openPalette("", launcher.templateItems(), "Launch from a template");
   },
+  broadcast: () => broadcast.open([]),
   fanouts: () => {
     document.body.classList.remove("side-open");
     fanout.open();

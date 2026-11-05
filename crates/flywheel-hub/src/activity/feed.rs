@@ -628,6 +628,30 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
                 .with_id("from_id", str_at(payload, "/from/session_id"))
                 .with("source", str_at(payload, "/source"))
         }
+        "broadcast.sent" => {
+            // Counts and the workspace: never the prompt.
+            let count = |key: &str| {
+                payload
+                    .pointer(&format!("/broadcast/counts/{key}"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+            };
+            let (sent, queued, refused) = (count("sent"), count("queued"), count("refused"));
+            let total = sent + queued + refused;
+            let workspace = payload.get("workspace").unwrap_or(&Value::Null);
+            Draft::new(
+                event,
+                format!(
+                    "broadcast a prompt to {total} target{}: {sent} sent, {queued} queued, {refused} refused",
+                    if total == 1 { "" } else { "s" }
+                ),
+            )
+            .in_workspace(str_at(workspace, "/id"), str_at(workspace, "/name"))
+            .with_id("broadcast_id", str_at(payload, "/broadcast/id"))
+            .with("sent", sent)
+            .with("queued", queued)
+            .with("refused", refused)
+        }
         "fanout.finished" => {
             let fanout = payload.get("fanout").unwrap_or(&Value::Null);
             let name = str_at(fanout, "/name").unwrap_or("fan-out");

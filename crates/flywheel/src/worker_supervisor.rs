@@ -940,16 +940,7 @@ pub(crate) mod test_support {
     /// Whether `pid` is still a runnable process: gone or a zombie (killed,
     /// awaiting reap) both read as dead.
     pub fn process_alive(pid: u32) -> bool {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
-                let state = stat
-                    .rsplit_once(')')
-                    .and_then(|(_, rest)| rest.split_whitespace().next())
-                    .unwrap_or("");
-                state != "Z"
-            }
-            Err(_) => false,
-        }
+        flywheel_hub::daemon::process_alive(pid)
     }
 
     pub fn wait_dead(pid: u32, timeout: Duration) -> bool {

@@ -71,6 +71,7 @@ pub const EVENTS: &[&str] = &[
     "review.merged",
     "review.requested",
     "handoff.sent",
+    "broadcast.sent",
     "fanout.finished",
     "share.created",
     "share.revoked",

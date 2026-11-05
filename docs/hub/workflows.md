@@ -137,6 +137,8 @@ Per agent session, prompts the hub types in itself, in order ("when done, do X")
 | Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched |
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
+**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase on main"`); a workspace means its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), refused with why (shell, exited, full). `--header` names the recipients.
+
 ## Activity
 
 What happened, newest first: palette **Activity**, the header pill, `fw hub activity` (24 h: the digest, then the timeline; `--since last-seen`: since this CLI last looked).

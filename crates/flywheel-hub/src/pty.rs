@@ -1579,10 +1579,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn pid_alive(pid: u32) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat"))
-            .ok()
-            .and_then(|stat| stat_session(&stat))
-            .is_some_and(|(state, _)| state != 'Z' && state != 'X')
+        crate::daemon::process_alive(pid)
     }
 
     #[cfg(target_os = "linux")]

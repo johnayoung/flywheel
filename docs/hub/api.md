@@ -273,6 +273,7 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 | `review.rebased` | as above |
 | `review.merged` | as above |
 | `review.requested` | `author`, `reviewer`, `reused`, `kind`, `base` |
+| `broadcast.sent` | `broadcast` (`id`, `text` to 2000 chars, `counts`), `workspace` (one, or null), `targets[]` (`session`, `result`, `why`) |
 | `handoff.sent` | `from`, `to`, `source` (findings: `review_findings`), `bytes`, `truncated`; target's hub |
 | `fanout.finished` | `fanout` once settled (no agent working, nothing queued): candidates best first with `verdict`, `rank`, `tail` (last 400 stderr chars of the first failing grader); no `session` |
 | `queue.delivered` | `item` (`text` to 2000 chars), `pending` |
@@ -308,3 +309,4 @@ Behaviour: [hub-workflows](workflows.md#prompt-queue). `{item}`: id prefix (4+) 
 | POST | `/api/sessions/{id}/queue/pause` | |
 | POST | `/api/sessions/{id}/queue/resume` | also clears a stall |
 | POST | `/api/sessions/{id}/queue/clear` | `{"all"?}`: the delivered history too |
+| POST | `/api/broadcast` | `{"targets","text","header"?}` -> `counts`, `results[]` (`result` `sent`/`queued`/`refused`, `why`) |

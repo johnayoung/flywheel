@@ -160,6 +160,11 @@ fn one_line(text: &str, max: usize) -> String {
     }
 }
 
+/// A prompt as plugin events carry it: one line, capped.
+pub(crate) fn event_text(text: &str) -> String {
+    one_line(text, EVENT_TEXT_CHARS)
+}
+
 /// An item in a plugin event (`queue.delivered`, `queue.stalled`): one
 /// shape for both.
 pub(crate) fn event_item(
@@ -168,7 +173,7 @@ pub(crate) fn event_item(
 ) -> serde_json::Value {
     serde_json::json!({
         "id": item.id,
-        "text": one_line(&item.text, EVENT_TEXT_CHARS),
+        "text": event_text(&item.text),
         "bytes": item.text.len(),
         "when": item.when,
         "added_at": item.added_at,

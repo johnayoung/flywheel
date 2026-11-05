@@ -1,0 +1,109 @@
+/* flywheel hub: broadcast (broadcast.js): the sidebar's selection bar,
+ * picked rows, and the Send to several agents dialog with its result
+ * list. */
+
+#dlg-broadcast { width: min(40rem, calc(100vw - 2rem)); }
+.bc-intro { font-size: 12px; }
+
+/* Ctrl/Cmd-clicked agent rows. */
+.session.picked { box-shadow: inset 3px 0 0 var(--signal); background: var(--signal-soft); }
+.bc-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .45rem;
+  margin: .4rem .8rem;
+  padding: .45rem .6rem;
+  border: 1px solid var(--rule-2);
+  border-left: 3px solid var(--signal);
+  background: var(--bg-3);
+  font-size: 11.5px;
+}
+.bc-bar-count { flex: 1 1 auto; color: var(--ink-2); }
+.bc-bar svg { width: .85rem; height: .85rem; }
+
+.bc-targets {
+  display: grid;
+  gap: .55rem;
+  max-height: 40vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: .45rem .55rem;
+  border: 1px solid var(--rule-2);
+  background: var(--bg);
+}
+.bc-group { display: grid; gap: .15rem; }
+.bc-group-head {
+  display: flex;
+  align-items: center;
+  gap: .45rem;
+  font-size: 9.5px;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.bc-group-head .text-btn { margin-left: auto; letter-spacing: .08em; }
+.bc-target {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: .5rem;
+  min-height: 2rem;
+  padding: 0 .25rem;
+  cursor: pointer;
+  font-size: 12px;
+}
+.bc-target.off { opacity: .5; cursor: not-allowed; }
+.bc-target input { accent-color: var(--signal); }
+.bc-target .glyph svg { width: .9rem; height: .9rem; }
+.bc-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.bc-where { font: 11px var(--mono); color: var(--ink-3); white-space: nowrap; }
+.bc-status { font: 10.5px var(--mono); color: var(--ink-2); white-space: nowrap; }
+.bc-status[data-dot="blocked"] { color: var(--alert); }
+.bc-status[data-dot="working"] { color: var(--brass); }
+.bc-empty { margin: 0; color: var(--ink-3); font-size: 12px; }
+
+.bc-prompt textarea {
+  width: 100%;
+  min-height: 7rem;
+  max-height: 40vh;
+  resize: vertical;
+  padding: .6rem .7rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 12px/1.45 var(--term);
+}
+.bc-prompt textarea:focus { outline: none; border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-soft); }
+.bc-check { display: inline-flex; align-items: center; gap: .45rem; font-size: 12px; color: var(--ink-2); }
+.bc-check input { accent-color: var(--signal); }
+
+.bc-results { display: grid; gap: .35rem; margin: 0; padding: 0; list-style: none; }
+.bc-result {
+  display: grid;
+  grid-template-columns: 4.6rem minmax(0, 1fr);
+  align-items: baseline;
+  gap: .6rem;
+  padding: .4rem .5rem;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--signal);
+  background: var(--bg);
+  font-size: 12px;
+}
+.bc-result.queued { border-left-color: var(--brass); }
+.bc-result.refused { border-left-color: var(--alert); }
+.bc-tag { font: 600 10px var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); }
+.bc-result-main { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .5rem; min-width: 0; }
+.bc-why { flex-basis: 100%; color: var(--ink-3); font-size: 11.5px; overflow-wrap: anywhere; }
+
+/* A phone: the targets take a finger; the status drops under the name. */
+@media (max-width: 760px) {
+  .bc-target { grid-template-columns: auto auto minmax(0, 1fr) auto; min-height: 44px; }
+  .bc-where { display: none; }
+  .bc-prompt textarea { font-size: 16px; }
+}
+@media (pointer: coarse) {
+  .bc-target input { width: 1.2rem; height: 1.2rem; }
+  .bc-group-head .text-btn, .bc-bar .slab { min-height: 44px; }
+}

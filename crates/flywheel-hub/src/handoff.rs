@@ -46,9 +46,9 @@
 //! unknown code. A hub running as a systemd service refuses (its sessions
 //! live in the unit's cgroup and would die with the old process).
 
+pub(crate) use crate::daemon::process_alive;
 use crate::hub::Hub;
 use crate::hub::handoff::{Frozen, Incoming, IncomingSession};
-pub(crate) use crate::pty::handoff::process_alive;
 use crate::pty::handoff::{Adopt, PtyExport, PtyMeta};
 use crate::status::handoff::BoardExport;
 use serde::{Deserialize, Serialize};

@@ -156,17 +156,34 @@ pub fn process_start_time(pid: u32) -> Option<String> {
 }
 
 /// Whether `pid` names a live process on this host (`kill(pid, 0)`: success
-/// or `EPERM` means it exists).
+/// or `EPERM` means it exists) that is not a zombie: an owner that exited
+/// but was never reaped by its parent still answers `kill(pid, 0)` (and
+/// keeps its start time), yet runs nothing -- its container is an orphan.
 pub fn pid_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
         return false;
     };
-    if pid <= 0 {
+    if raw <= 0 {
         return false;
     }
     // SAFETY: signal 0 performs only the existence/permission check.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let rc = unsafe { libc::kill(raw, 0) };
+    if rc != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+        return false;
+    }
+    !is_zombie(pid)
+}
+
+/// Whether `/proc/<pid>/stat` names a zombie (`Z`) or dead (`X`) process;
+/// unreadable (no `/proc`, or gone meanwhile): not known to be one.
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            let after_comm = &stat[stat.rfind(')')? + 1..];
+            after_comm.split_whitespace().next()?.chars().next()
+        })
+        .is_some_and(|state| state == 'Z' || state == 'X')
 }
 
 /// One flywheel-owned container as `docker ps` reports it, with whatever
@@ -2495,6 +2512,40 @@ mod tests {
         // kill(0, 0) probes the caller's own process group; it is no owner.
         assert!(!pid_alive(0));
         assert!(!pid_alive(u32::MAX));
+    }
+
+    /// An owner that exited unreaped (a zombie) is dead: `kill(pid, 0)`
+    /// still answers for it, `pid_alive` must not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pid_alive_reads_an_unreaped_zombie_as_dead() {
+        // SAFETY: the child only calls _exit(2), async-signal-safe.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: leave the child at once, running no Rust teardown.
+            unsafe { libc::_exit(0) };
+        }
+        let upid = u32::try_from(pid).unwrap();
+        let deadline = Instant::now() + WALL_BUDGET;
+        let zombie = loop {
+            if is_zombie(upid) {
+                break true;
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        // SAFETY: probing a pid this test owns (not yet reaped).
+        let probed = unsafe { libc::kill(pid, 0) };
+        let alive = pid_alive(upid);
+        let mut status = 0;
+        // SAFETY: reap the child this test forked.
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        assert!(zombie, "the child never became a zombie");
+        assert_eq!(probed, 0, "kill(pid, 0) answers for a zombie");
+        assert!(!alive, "a zombie owner read as alive");
     }
 
     #[test]

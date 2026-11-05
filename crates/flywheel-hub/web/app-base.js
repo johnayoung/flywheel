@@ -603,6 +603,18 @@ const promptQueue = window.FwHubQueue({
   onOpen: () => closeOverlays("queue"),
 });
 
+// Broadcast (broadcast.js): one prompt to several agent sessions, each
+// sent now or queued until its turn is done.
+const broadcast = window.FwHubBroadcast({
+  $, el, icon, rawApi, machines, state, sessionById, workspaceById, isAgent, glyphFor,
+  statusLook: (session) => statusLook(session),
+  toast: (...args) => commands.toast(...args),
+  render: () => render(),
+  refresh: () => refresh().catch(() => {}),
+  openSession: (id) => openSession(id),
+  openQueue: (id) => promptQueue.open(id),
+});
+
 // The activity timeline and "while you were away" (activity.js).
 const activity = window.FwHubActivity({
   $, el, icon, rawApi, state, sessionById, workspaceById, store,

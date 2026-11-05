@@ -85,27 +85,9 @@ pub(crate) fn pidfd_open(_pid: u32) -> Option<OwnedFd> {
     None
 }
 
-/// Whether process `pid` exists and is not a zombie.
-pub(crate) fn process_alive(pid: u32) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
-                super::stat_session(&stat).is_some_and(|(state, _)| state != 'Z' && state != 'X')
-            }
-            Err(_) => false,
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let Ok(pid) = libc::pid_t::try_from(pid) else {
-            return false;
-        };
-        // SAFETY: kill(2) with signal 0 only checks for the process.
-        let rc = unsafe { libc::kill(pid, 0) };
-        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-}
+/// Whether process `pid` exists and is not a zombie (the crate's one
+/// liveness check).
+pub(crate) use crate::daemon::process_alive;
 
 /// Block until the leader has exited: its pidfd turns readable, or (no
 /// pidfd) the pid stops naming a live process.

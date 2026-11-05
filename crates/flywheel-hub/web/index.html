@@ -35,6 +35,7 @@
 <link rel="stylesheet" href="/assets/app-sharing.css">
 <link rel="stylesheet" href="/assets/app-handoff.css">
 <link rel="stylesheet" href="/assets/app-queue.css">
+<link rel="stylesheet" href="/assets/app-broadcast.css">
 <link rel="stylesheet" href="/assets/app-activity.css">
 <link rel="stylesheet" href="/assets/app-digest.css">
 <link rel="stylesheet" href="/assets/app-perms.css">
@@ -84,6 +85,7 @@
   <symbol id="i-link" viewBox="0 0 16 16"><path d="M6.4 9.6 9.6 6.4" stroke="currentColor" stroke-width="1.5"/><path d="M7.3 4.5l1.3-1.3a2.6 2.6 0 0 1 3.7 3.7L11 8.2M8.7 11.5l-1.3 1.3a2.6 2.6 0 0 1-3.7-3.7L5 7.8" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-exit" viewBox="0 0 16 16"><path d="M9.5 2.5h-6v11h6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M6.8 8h7.2M11.4 5.4 14 8l-2.6 2.6" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-queue" viewBox="0 0 16 16"><path d="M2.5 4h7M2.5 8h7M2.5 12h4.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M11 9.5 13.5 12 11 14.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M12.5 3v9" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+  <symbol id="i-broadcast" viewBox="0 0 16 16"><circle cx="8" cy="8" r="1.6" fill="currentColor"/><path d="M5.2 5.2a4 4 0 0 0 0 5.6M10.8 5.2a4 4 0 0 1 0 5.6M3 3a7 7 0 0 0 0 10M13 3a7 7 0 0 1 0 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
   <symbol id="i-grip" viewBox="0 0 16 16"><circle cx="6" cy="4" r="1.1" fill="currentColor"/><circle cx="10" cy="4" r="1.1" fill="currentColor"/><circle cx="6" cy="8" r="1.1" fill="currentColor"/><circle cx="10" cy="8" r="1.1" fill="currentColor"/><circle cx="6" cy="12" r="1.1" fill="currentColor"/><circle cx="10" cy="12" r="1.1" fill="currentColor"/></symbol>
   <symbol id="i-activity" viewBox="0 0 16 16"><path d="M1.5 8.5h3l2-5 3 9 2-4h3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></symbol>
   <symbol id="i-signal" viewBox="0 0 16 16"><path d="M3 13.5v-2M6.3 13.5v-4M9.6 13.5v-6.5M13 13.5v-9.5" stroke="currentColor" stroke-width="1.8"/></symbol>
@@ -103,12 +105,14 @@
     <div id="offline" class="offline" hidden role="status">hub unreachable &mdash; retrying</div>
     <section id="attention" class="attention" hidden aria-label="Agents that need you"></section>
     <nav id="workspaces" aria-label="Workspaces"></nav>
+    <div id="bc-bar" class="bc-bar" hidden role="region" aria-label="Selected agents"></div>
     <div id="spend" class="spend" hidden aria-label="Agent spend"></div>
     <div class="side-actions">
       <button type="button" class="slab" data-action="new-session" data-key-title="session.new" data-title="New session" title="New session (Alt N)"><svg><use href="#i-plus"/></svg>Session</button>
       <button type="button" class="slab ghost" data-action="new-workspace" data-key-title="workspace.new" data-title="New workspace" title="New workspace (Alt Shift N)"><svg><use href="#i-plus"/></svg>Workspace</button>
       <button type="button" class="slab ghost" id="from-template" data-action="from-template" title="New agent from a saved template" hidden><svg><use href="#i-plus"/></svg>From template</button>
       <button type="button" class="slab ghost" data-action="fanouts" title="Verified fan-out: one prompt to several agents, graded and ranked"><svg><use href="#i-branch"/></svg>Fan-out</button>
+      <button type="button" class="slab ghost" id="bc-open" data-action="broadcast" title="Broadcast: one prompt to several agents (Ctrl-click rows to pick)" hidden><svg><use href="#i-broadcast"/></svg>Broadcast</button>
     </div>
     <footer class="side-foot" id="side-foot">
       <button type="button" class="side-more-toggle" id="side-more-toggle" aria-expanded="false" aria-controls="side-more"><svg aria-hidden="true"><use href="#i-dots"/></svg><span>More</span><span class="side-more-hint">palette, search, theme, alerts, activity, settings&hellip;</span></button>
@@ -529,6 +533,31 @@
   </form>
 </dialog>
 
+<dialog id="dlg-broadcast" class="sheet bc-sheet" aria-labelledby="bc-title">
+  <form method="dialog" novalidate>
+    <header class="sheet-head">
+      <span class="sheet-kicker">broadcast</span>
+      <h2 id="bc-title">Send to several agents</h2>
+    </header>
+    <p class="sheet-body bc-intro">Each agent at rest gets it now; a busy or blocked one gets it queued, once its turn is done. Never typed while it is blocked or someone types into it.</p>
+    <div class="field">
+      <span class="field-label">To <span class="field-hint" id="bc-count"></span></span>
+      <div class="bc-targets" id="bc-targets"></div>
+    </div>
+    <label class="field bc-prompt">
+      <span class="field-label">Prompt</span>
+      <textarea id="bc-text" rows="6" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+    </label>
+    <label class="bc-check"><input type="checkbox" id="bc-header"> Start with a line naming every recipient</label>
+    <ul class="bc-results" id="bc-results" hidden></ul>
+    <p class="ho-note" id="bc-note" role="status" aria-live="polite"></p>
+    <footer class="sheet-foot">
+      <button type="button" class="slab ghost" value="cancel" data-close>Close</button>
+      <button type="button" class="slab" id="bc-send" title="Send (Ctrl Enter)">Send</button>
+    </footer>
+  </form>
+</dialog>
+
 <dialog id="dlg-confirm" class="sheet narrow" aria-labelledby="confirm-title">
   <form method="dialog">
     <header class="sheet-head">
@@ -724,6 +753,7 @@
 <script src="/assets/sharing.js"></script>
 <script src="/assets/handoff.js"></script>
 <script src="/assets/queue.js"></script>
+<script src="/assets/broadcast.js"></script>
 <script src="/assets/activity.js"></script>
 <script src="/assets/digest.js"></script>
 <script src="/assets/perms.js"></script>

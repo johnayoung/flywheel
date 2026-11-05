@@ -63,7 +63,7 @@ mod delivery;
 mod runtime;
 
 pub use api::Delivery;
-pub(crate) use deciding::event_item;
+pub(crate) use deciding::{event_item, event_text};
 pub use runtime::{EDIT_LEASE, QueueRuntime, SessionHold, TypingExport};
 
 /// Pending items per session.

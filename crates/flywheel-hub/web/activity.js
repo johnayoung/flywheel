@@ -33,6 +33,7 @@ window.FwHubActivity = function (ctx) {
     ["usage", "usage"],
     ["queue", "prompt queues"],
     ["handoff", "handoffs"],
+    ["broadcast", "broadcasts"],
     ["share,record", "shares and recordings"],
     ["plugin", "plugins"],
     ["hub", "hub"],
@@ -45,6 +46,7 @@ window.FwHubActivity = function (ctx) {
     usage: "spend",
     "fanout.finished": "fan-out",
     "handoff.sent": "handoff",
+    "broadcast.sent": "broadcast",
     "plugin.ran": "plugin",
   };
 

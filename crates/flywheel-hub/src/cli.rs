@@ -157,6 +157,12 @@ enum HubCommand {
     /// types into it, or a grading or review uses it): add, ls, rm,
     /// clear, move, pause, resume.
     Queue(crate::queue_cli::QueueArgs),
+    /// Send one prompt to several agent sessions (and workspaces: each of
+    /// their agents): typed in now where the agent is at rest, else queued
+    /// for it (never while it is blocked or typed into); prints each
+    /// target's result (sent, queued, refused and why). Exit 1 when any
+    /// was refused.
+    Broadcast(crate::broadcast_cli::BroadcastArgs),
     /// A session's pull request: state, review decision, mergeability,
     /// and CI checks (from gh, cached by the hub); log prints a failing
     /// check's log, fix-ci asks the agent to fix it (queued while it
@@ -717,6 +723,7 @@ fn dispatch_verb(
         HubCommand::Handoff(args) => crate::agent_handoff_cli::handoff(&args, out, err),
         HubCommand::AskReview(args) => crate::agent_handoff_cli::ask_review(&args, out, err),
         HubCommand::Queue(args) => crate::queue_cli::main(&args, out, err),
+        HubCommand::Broadcast(args) => crate::broadcast_cli::broadcast(&args, out, err),
         HubCommand::Pr(args) => crate::pr_cli::main(&args, out, err),
         HubCommand::Autopilot(args) => crate::autopilot_cli::main(&args, out, err),
     }

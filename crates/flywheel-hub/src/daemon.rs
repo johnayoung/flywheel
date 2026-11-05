@@ -198,18 +198,53 @@ pub fn spawn_detached(program: &Path, args: &[String], log: &Path) -> std::io::R
     command.spawn()
 }
 
-/// Whether `pid` names a live process (one this user may signal).
+/// Whether `pid` names a running process: one that exists (this user may
+/// signal it or not) and, on Linux, is not a zombie -- a process that
+/// exited but whose parent never reaped it still answers `kill(pid, 0)`,
+/// and must not read as a hub, worker, or autopilot running forever.
+/// Every liveness check in this crate (and the `flywheel` shell's) goes
+/// through here.
 #[cfg(unix)]
 pub fn process_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
         return false;
     };
-    if pid <= 0 {
+    if raw <= 0 {
         return false;
     }
     // SAFETY: kill(2) with signal 0 only probes for existence.
-    let rc = unsafe { libc::kill(pid, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let rc = unsafe { libc::kill(raw, 0) };
+    if rc != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
+        return false;
+    }
+    !is_zombie(pid)
+}
+
+/// Whether `/proc/<pid>/stat` says the process is a zombie (`Z`) or dead
+/// (`X`). Unreadable (gone meanwhile, or `/proc` hidden): not known to be
+/// one, so `kill(pid, 0)`'s answer stands.
+#[cfg(target_os = "linux")]
+fn is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat_state(&stat))
+        .is_some_and(|state| state == 'Z' || state == 'X')
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_zombie(_pid: u32) -> bool {
+    false
+}
+
+/// The state field of a `/proc/<pid>/stat` line: the first after the
+/// parenthesised command name, which may itself hold spaces and parens.
+#[cfg(target_os = "linux")]
+fn stat_state(stat: &str) -> Option<char> {
+    stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
 }
 
 /// Send `signal` to `pid` (never to a group or to every process).
@@ -519,5 +554,53 @@ mod tests {
         child.wait().unwrap();
         assert!(!process_alive(pid));
         assert!(send_signal(0, libc::SIGTERM).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_zero_negative_and_out_of_range_are_never_alive() {
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
+        // Never a group or "every process" probe.
+        assert!(!process_alive(u32::try_from(i32::MAX).unwrap() + 1));
+    }
+
+    /// A child that exited and was never reaped is a zombie: `kill(pid,
+    /// 0)` still succeeds, but it runs nothing and must read as dead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreaped_zombie_reads_as_dead() {
+        // SAFETY: the child only calls _exit(2), async-signal-safe.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: leave the child at once, running no Rust teardown.
+            unsafe { libc::_exit(0) };
+        }
+        let upid = u32::try_from(pid).unwrap();
+        let zombie = wait_until(Duration::from_secs(10), || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| stat_state(&s))
+                == Some('Z')
+        });
+        // SAFETY: probing a pid this test owns (not yet reaped).
+        let probed = unsafe { libc::kill(pid, 0) };
+        let alive = process_alive(upid);
+        let mut status = 0;
+        // SAFETY: reap the child this test forked.
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        assert!(zombie, "the child never became a zombie");
+        assert_eq!(probed, 0, "kill(pid, 0) answers for a zombie");
+        assert!(!alive, "a zombie read as alive");
+        assert!(!process_alive(upid), "a reaped child read as alive");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_stat_state_reads_past_a_command_name_with_parens() {
+        assert_eq!(stat_state("42 (a) b) Z 1 42 42 0"), Some('Z'));
+        assert_eq!(stat_state("42 (sleep) S 1 42"), Some('S'));
+        assert_eq!(stat_state("garbage"), None);
     }
 }

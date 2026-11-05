@@ -407,6 +407,30 @@ fn lifecycle_events_become_rows_with_whitelisted_facts_only() {
 }
 
 #[test]
+fn a_broadcast_row_counts_results_and_never_holds_the_prompt() {
+    let row = draft_for(
+        "broadcast.sent",
+        &json!({
+            "broadcast": {"id": "b1", "text": "SECRET_PROMPT rebase on main", "bytes": 28,
+                "counts": {"sent": 2, "queued": 1, "refused": 1}},
+            "workspace": {"id": "w1", "name": "api"},
+            "targets": [{"target": "api", "session": {"id": "s", "name": "n"},
+                "result": "refused", "why": "SECRET_PROMPT"}],
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        row.text,
+        "broadcast a prompt to 4 targets: 2 sent, 1 queued, 1 refused"
+    );
+    assert_eq!(row.workspace_id.as_deref(), Some("w1"));
+    assert_eq!(row.data["broadcast_id"], "b1");
+    assert_eq!(row.data["refused"], 1);
+    let all = serde_json::to_string(&row.into_row(1, at(0))).unwrap();
+    assert!(!all.contains("SECRET_PROMPT"), "{all}");
+}
+
+#[test]
 fn every_plugin_event_has_a_row_shape() {
     for event in crate::plugins::EVENTS {
         let payload = json!({"session": {"id": "s", "name": "n"}, "status": "blocked",

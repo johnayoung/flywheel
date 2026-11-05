@@ -168,6 +168,12 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ),
     ("queue.js", include_bytes!("../web/queue.js"), JS),
     (
+        "app-broadcast.css",
+        include_bytes!("../web/app-broadcast.css"),
+        "text/css; charset=utf-8",
+    ),
+    ("broadcast.js", include_bytes!("../web/broadcast.js"), JS),
+    (
         "app-activity.css",
         include_bytes!("../web/app-activity.css"),
         "text/css; charset=utf-8",

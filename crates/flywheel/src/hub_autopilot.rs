@@ -46,17 +46,10 @@ pub const MAX_CANDIDATES: usize = 40;
 /// Task files larger than this are not read for the view.
 const MAX_TASK_FILE_BYTES: u64 = 1024 * 1024;
 
-/// Whether `pid` runs on this machine.
+/// Whether `pid` runs on this machine: alive and not a zombie (a daemon
+/// that exited unreaped is stopped, not running forever).
 fn pid_runs(pid: i64) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: kill with signal 0 only checks the pid; nothing is sent.
-    let answer = unsafe { libc::kill(pid, 0) };
-    answer == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    u32::try_from(pid).is_ok_and(flywheel_hub::daemon::process_alive)
 }
 
 fn epoch(seconds: f64) -> Option<DateTime<Utc>> {
@@ -624,5 +617,62 @@ pub(crate) fn decide(
         Err(GateDecisionError::Store(e)) => {
             Err(GateRefused::Store(format!("enqueueing the decision: {e}")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(pid: i64) -> AutopilotActivity {
+        serde_json::from_value(serde_json::json!({
+            "pid": pid,
+            "phase": PHASE_RUNNING,
+            "cycle_index": 1,
+            "updated_at": epoch_now(),
+            "interval_seconds": 60.0,
+            "expires_at": epoch_now() + 600.0,
+        }))
+        .expect("an activity record")
+    }
+
+    /// A daemon that exited without its parent reaping it (a zombie)
+    /// still answers `kill(pid, 0)`; with a fresh record it would read as
+    /// running forever and `start` would answer 409.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_zombie_daemon_reads_as_stopped() {
+        let own = i64::from(std::process::id());
+        assert_eq!(
+            daemon(Some(&record(own)), false),
+            (PilotState::Running, true)
+        );
+        // SAFETY: the child only calls _exit(2), async-signal-safe.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: leave the child at once, running no Rust teardown.
+            unsafe { libc::_exit(0) };
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let zombie = loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let state = stat
+                .rfind(')')
+                .and_then(|at| stat[at + 1..].split_whitespace().next().map(str::to_owned));
+            if state.as_deref() == Some("Z") {
+                break true;
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let seen = daemon(Some(&record(i64::from(pid))), false);
+        let mut status = 0;
+        // SAFETY: reap the child this test forked.
+        unsafe { libc::waitpid(pid, &raw mut status, 0) };
+        assert!(zombie, "the child never became a zombie");
+        assert_eq!(seen, (PilotState::Stopped, false));
     }
 }

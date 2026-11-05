@@ -4,8 +4,8 @@
 // and nobody types into it, else queued until its turn is done (never
 // while it is blocked), or refused with why. A selection spanning
 // machines is one call per machine, through this hub's proxy
-// (/m/<machine>/api/broadcast); the answers are merged into one result
-// list.
+// (/m/<machine>/api/broadcast), each carrying every recipient's name for
+// the header; the answers are merged into one result list.
 //
 // Ways in: Ctrl/Cmd-click agent rows in the sidebar (the selection bar
 // under the workspaces sends them), a workspace's "Send to all agents",
@@ -50,9 +50,14 @@ window.FwHubBroadcast = function (ctx) {
 
   // --- the sidebar's selection ----------------------------------------------
 
-  // A Ctrl/Cmd-click on a row: toggle it (agents only). `true`: handled.
+  // A Ctrl/Cmd-click on a row: toggle it (agents only; a shell says why).
+  // `true`: handled.
   function toggle(session) {
-    if (!isAgent(session)) return false;
+    if (!session) return false;
+    if (!isAgent(session)) {
+      toast(`${session.name} is a shell: broadcasts go to Claude Code and Codex sessions.`);
+      return true;
+    }
     if (ui.picked.has(session.id)) ui.picked.delete(session.id);
     else ui.picked.add(session.id);
     ctx.render();
@@ -96,6 +101,7 @@ window.FwHubBroadcast = function (ctx) {
     const st = statusLook(session);
     const workspace = workspaceById(session.workspace_id);
     const offline = !!session.machine && !machines.reachable(session.machine);
+    const queued = (session.queue && session.queue.pending) || 0;
     const box = el("input", {
       type: "checkbox",
       checked: ui.chosen.has(session.id),
@@ -113,7 +119,12 @@ window.FwHubBroadcast = function (ctx) {
       el("span", { className: `glyph ${glyphFor(session.kind)}` }, icon(glyphFor(session.kind))),
       el("span", { className: "bc-name", textContent: session.name }),
       el("span", { className: "bc-where", textContent: [workspace ? workspace.name : "", session.machine ? `@${session.machine}` : ""].filter(Boolean).join(" ") }),
-      el("span", { className: `bc-status ${st.tone || ""}`, dataset: { dot: st.dot }, textContent: st.label }),
+      el("span", {
+        className: `bc-status ${st.tone || ""}`,
+        dataset: { dot: st.dot },
+        title: queued ? `${queued} prompt${queued === 1 ? "" : "s"} already queued: this one goes after` : "",
+        textContent: queued ? `${st.label} · ${queued} queued` : st.label,
+      }),
     );
   }
 
@@ -173,6 +184,8 @@ window.FwHubBroadcast = function (ctx) {
 
   // Open the dialog with `ids` chosen.
   function open(ids) {
+    // A prompt already sent is not left ready to send again.
+    if (ui.sent) text.value = "";
     ui.chosen = new Set((ids || []).filter((id) => isAgent(sessionById(id))));
     ui.sent = false;
     ui.busy = false;
@@ -222,6 +235,8 @@ window.FwHubBroadcast = function (ctx) {
       byMachine.get(m).push(s);
     }
     const withHeader = header.checked;
+    // The header names every recipient, not one machine's share.
+    const recipients = withHeader ? chosen.map((s) => s.name) : [];
     try {
       localStorage.setItem(HEADER_KEY, withHeader ? "1" : "0");
     } catch (_) {
@@ -237,6 +252,7 @@ window.FwHubBroadcast = function (ctx) {
             targets: sessions.map((s) => s.id),
             text: prompt,
             header: withHeader,
+            recipients,
           });
           return (done.results || []).map((r) => ({ ...r, machine }));
         } catch (error) {

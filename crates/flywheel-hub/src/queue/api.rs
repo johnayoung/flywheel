@@ -12,6 +12,9 @@ use crate::state::{SessionRecord, SessionState, StateError, new_id};
 use crate::status::AgentStatus;
 use chrono::Utc;
 
+/// What a stall for a gone agent ends with.
+const RELAUNCH_HINT: &str = ": relaunch it and the queue carries on";
+
 impl Hub {
     /// Record that input was typed into session `id` (a browser, `fw hub
     /// attach`, `fw hub send`, Compose, any paste the hub makes): its time,
@@ -111,14 +114,14 @@ impl Hub {
                     }
                     None if record.runs_agent() => Presence::Ready,
                     None => Presence::Gone(format!(
-                        "{} came back as a plain shell after a restart: relaunch it and the queue carries on",
+                        "{} came back as a plain shell after a restart{RELAUNCH_HINT}",
                         record.kind.as_str()
                     )),
                 },
                 None => Presence::Starting("its terminal is not up yet"),
             },
             SessionState::Exited { exit, .. } => Presence::Gone(format!(
-                "its agent exited ({}): relaunch it and the queue carries on",
+                "its agent exited ({}){RELAUNCH_HINT}",
                 exit_text(exit)
             )),
             SessionState::Stopped {
@@ -130,9 +133,9 @@ impl Hub {
                 restore_error: Some(why),
                 ..
             } => Presence::Gone(format!("it could not be restored: {why}")),
-            SessionState::Stopped { .. } => Presence::Gone(
-                "it is stopped (not restored): relaunch it and the queue carries on".into(),
-            ),
+            SessionState::Stopped { .. } => {
+                Presence::Gone(format!("it is stopped (not restored){RELAUNCH_HINT}"))
+            }
         }
     }
 
@@ -461,9 +464,16 @@ impl Hub {
     /// queued before it, no review or grading using it); else queue it
     /// (`done`), so it goes after the agent's turn. Refused when the
     /// agent is gone (exited, or a plain shell after a restart).
+    ///
+    /// The decision and the paste run under the paste turn, and a paste
+    /// counts as a delivery (`last_delivered_at`), so of several sent at
+    /// once to one agent at rest only the first is typed in: the rest wait
+    /// in its queue until the agent has taken it up and finished.
     pub fn send_or_queue(&self, id: &str, text: &str) -> Result<Delivery, HubError> {
         let record = self.queue_record(id)?;
         let text = validate_text(text)?;
+        let runtime = self.queue_runtime();
+        let _turn = runtime.paste_turn();
         let current = self.store().queue(id).cloned().unwrap_or_default();
         let mut alone = SessionQueue {
             last_delivered_at: current.last_delivered_at,
@@ -479,7 +489,13 @@ impl Hub {
         });
         let facts = self.queue_facts(&record, &alone);
         if let Presence::Gone(why) = &facts.presence {
-            return Err(StateError::Conflict(format!("{}: {why}", record.label())).into());
+            // Refused, not queued: a relaunch will not bring it.
+            let why = why.strip_suffix(RELAUNCH_HINT).unwrap_or(why);
+            return Err(StateError::Conflict(format!(
+                "{}: {why}: not queued (relaunch it, then send again)",
+                record.label()
+            ))
+            .into());
         }
         let why = if current.pending_count() > 0 {
             Some(format!(
@@ -501,9 +517,20 @@ impl Hub {
             }
         };
         match why {
-            None => Ok(Delivery::Pasted {
-                paste: self.paste(id, &text, true)?,
-            }),
+            None => {
+                // Taken before the paste: the turn it starts reports after.
+                let at = Utc::now();
+                let paste = self.paste_turn_held(id, &text, true, false)?;
+                // Kept in memory even when the save fails: the paste went.
+                if let Err(e) = self.store().update_queue_keeping(id, |queue| {
+                    queue.last_delivered_at =
+                        Some(queue.last_delivered_at.map_or(at, |t| t.max(at)));
+                }) {
+                    eprintln!("fw hub: queue {id}: sent, but not recorded: {e}");
+                }
+                self.queue_changed();
+                Ok(Delivery::Pasted { paste })
+            }
             Some(why) => {
                 let (item, view) = self.queue_add(
                     id,

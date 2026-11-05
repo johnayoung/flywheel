@@ -14,7 +14,8 @@
 //!
 //! An optional provenance header opens the prompt (`Broadcast to 3 agent
 //! sessions (api-1, api-2, web): ...`), so each agent knows its siblings got
-//! the same. Each broadcast announces `broadcast.sent` (plugins, and one
+//! the same; a call that is one machine's part of a wider broadcast passes
+//! every recipient's name (`recipients`) so the header names them all. Each broadcast announces `broadcast.sent` (plugins, and one
 //! activity row) with the per-target results and the text (capped), never
 //! in the activity row.
 //!
@@ -33,6 +34,8 @@ use serde_json::{Value, json};
 /// The most targets (selectors, and sessions they name) one broadcast
 /// reaches.
 pub const MAX_TARGETS: usize = 64;
+/// The most names a request may hand the header (`recipients`).
+pub const MAX_RECIPIENTS: usize = 1024;
 /// Sessions the provenance header names before `+N more`.
 const HEADER_NAMES: usize = 8;
 
@@ -47,6 +50,11 @@ pub struct BroadcastRequest {
     /// Open it with a provenance line naming who got it.
     #[serde(default)]
     pub header: bool,
+    /// The names the header lists when this call is one part of a wider
+    /// broadcast (the web UI's one call per machine); absent: this call's
+    /// own agents.
+    #[serde(default)]
+    pub recipients: Vec<String>,
 }
 
 /// What became of the prompt for one target.
@@ -267,13 +275,38 @@ impl Hub {
             .into());
         }
         let prompt = if request.header {
-            // The agents it is for (a shell named among them is refused).
-            let names: Vec<&str> = targets
+            let given: Vec<&str> = request
+                .recipients
                 .iter()
-                .filter(|(_, r)| r.runs_agent())
-                .map(|(_, r)| r.name.as_str())
+                .map(|n| n.trim())
+                .filter(|n| !n.is_empty())
                 .collect();
-            crate::queue::validate_text(&format!("{}\n\n{text}", header(&names)))?
+            if given.len() > MAX_RECIPIENTS {
+                return Err(StateError::Invalid(format!(
+                    "{} recipients: the header names at most {MAX_RECIPIENTS}",
+                    given.len()
+                ))
+                .into());
+            }
+            // The agents it is for (a shell named among them is refused).
+            let names: Vec<&str> = if given.is_empty() {
+                targets
+                    .iter()
+                    .filter(|(_, r)| r.runs_agent())
+                    .map(|(_, r)| r.name.as_str())
+                    .collect()
+            } else {
+                given
+            };
+            let prompt = format!("{}\n\n{text}", header(&names));
+            crate::queue::validate_text(&prompt).map_err(|_| {
+                StateError::Invalid(format!(
+                    "with the header the prompt is {} bytes ({} of them yours); at most {} are queued: shorten it or send it without the header",
+                    prompt.len(),
+                    text.len(),
+                    crate::queue::MAX_TEXT_BYTES
+                ))
+            })?
         } else {
             text
         };

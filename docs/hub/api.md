@@ -309,4 +309,4 @@ Behaviour: [hub-workflows](workflows.md#prompt-queue). `{item}`: id prefix (4+) 
 | POST | `/api/sessions/{id}/queue/pause` | |
 | POST | `/api/sessions/{id}/queue/resume` | also clears a stall |
 | POST | `/api/sessions/{id}/queue/clear` | `{"all"?}`: the delivered history too |
-| POST | `/api/broadcast` | `{"targets","text","header"?}` -> `counts`, `results[]` (`result` `sent`/`queued`/`refused`, `why`) |
+| POST | `/api/broadcast` | `{"targets","text","header"?,"recipients"?}` (header names) -> `counts`, `results[]` (`result` `sent`/`queued`/`refused`, `why`) |

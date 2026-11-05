@@ -190,17 +190,25 @@ pub struct Subscription {
 impl Subscription {
     /// Whether an event with `payload` is one this subscription takes:
     /// its `statuses` (when set) name the payload's `status`, its `kinds`
-    /// the session's kind. (`"done"` hears every finished turn, watched or
+    /// the session's kind (`broadcast.sent`: any target session's). (`"done"` hears every finished turn, watched or
     /// not, once: the `done` each one says. It no longer also takes a
     /// shown `idle` marked `turn_finished`: that one follows its turn's
     /// `done`, and taking it too would say the turn twice.)
     pub fn takes(&self, payload: &Value) -> bool {
         let status = payload.get("status").and_then(Value::as_str);
-        let kind = payload.pointer("/session/kind").and_then(Value::as_str);
+        let wanted = |kind: Option<&str>| kind.is_some_and(|k| self.kinds.iter().any(|w| w == k));
         let status_ok = self.statuses.is_empty()
             || status.is_some_and(|s| self.statuses.iter().any(|w| w == s));
-        let kind_ok =
-            self.kinds.is_empty() || kind.is_some_and(|k| self.kinds.iter().any(|w| w == k));
+        let kind_ok = self.kinds.is_empty()
+            || wanted(payload.pointer("/session/kind").and_then(Value::as_str))
+            || payload
+                .get("targets")
+                .and_then(Value::as_array)
+                .is_some_and(|targets| {
+                    targets
+                        .iter()
+                        .any(|t| wanted(t.pointer("/session/kind").and_then(Value::as_str)))
+                });
         status_ok && kind_ok
     }
 }
@@ -1447,6 +1455,14 @@ mod tests {
         // takes the done only, "idle" the idle.
         assert!(!sub(&["done"], &[]).takes(&event("idle", "claude", true)));
         assert!(sub(&["idle"], &[]).takes(&event("idle", "claude", true)));
+        // broadcast.sent: a kinds filter matches any target's session.
+        let broadcast = serde_json::json!({"targets": [
+            {"session": null, "result": "refused"},
+            {"session": {"kind": "shell"}, "result": "refused"},
+            {"session": {"kind": "claude"}, "result": "sent"},
+        ]});
+        assert!(sub(&[], &["claude"]).takes(&broadcast));
+        assert!(!sub(&[], &["codex"]).takes(&broadcast));
     }
 
     use super::*;

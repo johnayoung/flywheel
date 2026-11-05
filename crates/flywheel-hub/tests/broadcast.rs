@@ -522,7 +522,148 @@ async fn a_broadcast_on_another_machine_works_through_the_proxy() {
     one.typed_becomes(&pasted("from the laptop")).await;
     // Kept by the hub that owns the sessions.
     assert!(a.hub.queue_views().is_empty());
-    assert_eq!(b.hub.queue_views().len(), 1);
+    let waiting: Vec<_> = b
+        .hub
+        .queue_views()
+        .into_iter()
+        .filter(|q| q.pending > 0)
+        .collect();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].session_id, two.id);
     two.fire("Stop", None).await;
     two.typed_becomes(&pasted("from the laptop")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simultaneous_broadcasts_to_one_resting_agent_type_one_and_queue_the_rest() {
+    let hub = TestHub::start().await;
+    let ws = hub.workspace("race").await;
+    let agent = hub.claude(&ws, "fresh-1").await;
+    agent.fire("SessionStart", None).await;
+    hub.status_is(&agent.id, "idle").await;
+    sleep(Duration::from_secs(2)).await;
+
+    let send = |n: u32| {
+        hub.post(
+            "/api/broadcast",
+            json!({ "targets": [agent.id], "text": format!("race {n}") }),
+        )
+    };
+    let answers = [send(1), send(2), send(3)];
+    let answers = futures_util::future::join_all(answers).await;
+    let results: Vec<&Value> = answers.iter().map(|a| result_for(a, &agent.id)).collect();
+    let sent: Vec<usize> = (0..3).filter(|&i| results[i]["result"] == "sent").collect();
+    assert_eq!(sent.len(), 1, "exactly one is typed in now: {answers:?}");
+    for (i, r) in results.iter().enumerate() {
+        if i == sent[0] {
+            continue;
+        }
+        assert_eq!(r["result"], "queued", "{r}");
+        let why = r["why"].as_str().unwrap();
+        // The hub's own paste holds the rest, not "someone typed".
+        assert!(!why.contains("typed"), "{why}");
+        assert!(
+            why.contains("take up the last delivered prompt") || why.contains("queued before it"),
+            "{why}"
+        );
+    }
+    let first = format!("race {}", sent[0] + 1);
+    let mut want = pasted(&first);
+    agent.typed_becomes(&want).await;
+    agent.stays(&want).await;
+
+    // The rest go one per finished turn, in the order they were queued.
+    let queue = hub.get(&format!("/api/sessions/{}/queue", agent.id)).await;
+    let order: Vec<String> = queue["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["state"] == "pending")
+        .map(|i| i["text"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(order.len(), 2, "{queue}");
+    for text in order {
+        agent.fire("UserPromptSubmit", None).await;
+        agent.fire("Stop", None).await;
+        want.extend(pasted(&text));
+        agent.typed_becomes(&want).await;
+    }
+    agent.stays(&want).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn header_names_given_recipients_and_refusals_say_what_happens() {
+    let hub = TestHub::start().await;
+    let ws = hub.workspace("hdr").await;
+    let agent = hub.claude(&ws, "api-1").await;
+    let gone = hub.claude(&ws, "stuck-1").await;
+    agent.fire("SessionStart", None).await;
+    hub.status_is(&agent.id, "idle").await;
+    sleep(Duration::from_secs(2)).await;
+
+    // One machine's share of a wider broadcast: the header names everyone.
+    let done = hub
+        .post(
+            "/api/broadcast",
+            json!({
+                "targets": [agent.id],
+                "text": "run the tests",
+                "header": true,
+                "recipients": ["api-1", "api-2", "web-1"],
+            }),
+        )
+        .await;
+    let prompt = "Broadcast to 3 agent sessions (api-1, api-2, web-1):\n\nrun the tests";
+    assert_eq!(result_for(&done, &agent.id)["result"], "sent", "{done}");
+    agent.typed_becomes(&pasted(prompt)).await;
+
+    // A prompt that fits, but not with the header: the error says so.
+    let (status, answer) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/broadcast",
+            Some(json!({ "targets": [agent.id], "text": "y".repeat(65_500), "header": true })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    let message = answer.to_string();
+    assert!(message.contains("with the header"), "{message}");
+    assert!(message.contains("65500 of them yours"), "{message}");
+
+    // An exited agent is refused, and nothing says the prompt will follow
+    // a relaunch.
+    hub.post(&format!("/api/sessions/{}/kill", gone.id), json!({}))
+        .await;
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let sessions = hub.get("/api/sessions").await;
+        let state = sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == gone.id)
+            .map(|s| s["state"].clone());
+        if state == Some(json!("exited")) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{} never exited", gone.id);
+        sleep(Duration::from_millis(25)).await;
+    }
+    let done = hub
+        .post(
+            "/api/broadcast",
+            json!({ "targets": [gone.id], "text": "after kill" }),
+        )
+        .await;
+    let refused = result_for(&done, &gone.id);
+    assert_eq!(refused["result"], "refused", "{done}");
+    let why = refused["why"].as_str().unwrap();
+    assert!(why.contains("not queued"), "{why}");
+    assert!(!why.contains("queue carries on"), "{why}");
+    assert!(
+        hub.hub
+            .queue_views()
+            .iter()
+            .all(|q| q.session_id != gone.id)
+    );
 }

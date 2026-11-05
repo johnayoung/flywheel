@@ -307,7 +307,7 @@ timeout_secs = 10  # 1-300
 [[events]]
 on = "status.changed"  # any event in api.md#plugin-events
 statuses = ["blocked", "done"]  # optional (status.changed)
-kinds = ["claude", "codex"]  # optional (never matches fanout.finished)
+kinds = ["claude", "codex"]  # optional (broadcast.sent: any target; never fanout.finished)
 [[actions]]  # palette "Plugin: <title>", Settings > Plugins
 id = "summarize"
 title = "Summarize this session"

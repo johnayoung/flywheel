@@ -6,7 +6,7 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 
 - JSON under `/api`: `Authorization: Bearer <token>`, a login cookie, or a peer credential ([hub-security](security.md#auth)).
 - Errors `{"error"}`: 400 malformed, 404 unknown, 405 method, 409 refused by state, 422 wrong JSON shape. `cols`/`rows` 0: 120x32.
-- Tables name inputs and status codes; for a response's full shape, curl the route: `curl -s -H "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq` (most verbs' `--json` prints the same).
+- Tables give request bodies, status codes; a response's full shape: `curl -sH "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq`, or a verb's `--json`.
 
 ## Workspaces
 
@@ -14,11 +14,11 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 |---|---|---|
 | GET / POST | `/api/workspaces` | list (with `templates`) / create `{"name","folders"}` |
 | GET / PATCH / DELETE | `/api/workspaces/{id}` | PATCH `name` / `folders`; 409 a running session's folder / sessions running |
-| GET / PUT | `/api/workspaces/{id}/layout` | `{"rev","tabs"}` of pane / split trees; PUT -> `rev`+1; 409 stale; 400 invalid (ratio 0.05..0.95, 12 tabs / 12 panes) |
+| GET / PUT | `/api/workspaces/{id}/layout` | `{"rev","tabs":[{"id","name","root"}]}`; node `{"type":"pane","id","session"?}` or `{"type":"split","dir":"right\|down","ratio","a","b"}`; PUT -> `rev`+1; 409 stale; 400 invalid (ratio 0.05..0.95, 12 tabs / 12 panes) |
 | POST | `/api/workspaces/import` | `{"path","name"?,"update"?}` (hub-side file): 201 / 200 updated / 409 taken |
 | GET | `/api/code-workspaces[?root=]` | `.code-workspace` files under `--import-root` |
 | GET | `/api/folders/check?path=` | `ok`, `git` / `error` |
-| GET | `/api/repos/check` | old name of the above |
+| GET | `/api/repos/check` | old name |
 | GET | `/api/templates[?workspace_id=]` | launch templates |
 | POST | `/api/workspaces/{id}/templates` | create (a taken `name`: 409 unless `"replace":true`) |
 | DELETE | `/api/workspaces/{id}/templates/{name}` | |
@@ -29,9 +29,9 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 
 | Method | Path | |
 |---|---|---|
-| GET / POST | `/api/sessions[?workspace_id=]` | list / create `{"workspace_id","folder"?,"kind"?,"command"?,"worktree"?:{"task","base"?},"prompt"?,...}` (`fw hub new`'s flags) |
+| GET / POST | `/api/sessions[?workspace_id=]` | list / create `{"workspace_id","folder"?,"kind"?,"command"?:[argv],"worktree"?:{"task","base"?},"prompt"?,...}` (`new`'s flags) |
 | GET / PATCH / DELETE | `/api/sessions/{id}` | PATCH `{"name"}`; DELETE kills, forgets (204; `?remove_worktree=true[&force=true]`) |
-| POST | `/api/sessions/{id}/kill` | 202: SIGHUP (3 s: SIGKILL), record kept |
+| POST | `/api/sessions/{id}/kill` | 202: SIGHUP (3 s: SIGKILL), kept |
 | POST | `/api/sessions/{id}/relaunch` | `{"cols"?,"rows"?}`: an ended session, same id; 409 running |
 | POST | `/api/sessions/{id}/restart` | old `/relaunch` |
 | GET | `/api/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered text: `visible` rows, or `recent` lines (1..100000, 100); cursor, modes |
@@ -48,7 +48,7 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
-A session lists its `agent` status (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings.
+A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings.
 
 ## Review, handoff, peer review
 
@@ -69,23 +69,23 @@ A session lists its `agent` status (`detail`, `since`, AskUserQuestion's `questi
 | POST | `/api/sessions/{id}/pr/ready` | two-step |
 | POST | `/api/sessions/{id}/pr/merge` | two-step; plan `forcible`: send `force` (the PR number) |
 | POST | `/api/sessions/{id}/review/ask` | `{"kind":"commit_message\|resolve_conflicts","dry_run"?}` |
-| POST | `/api/sessions/{id}/review/reviewer` | as `fw hub ask-review`: 201 launched, 200 asked again; 409 nothing |
+| POST | `/api/sessions/{id}/review/reviewer` | `{"kind"?,"base"?,"model"?,"dry_run"?}`: 201 launched, 200 asked again; 409 nothing |
 | GET | `/api/sessions/{id}/review/findings` | the reviewer's latest reply (409 none) |
 | POST | `/api/sessions/{id}/review/findings/send` | `{"prompt"?}` |
-| POST | `/api/sessions/{id}/handoff/compose` | `{"source":{"kind":"selection\|transcript\|command\|last_command\|diff",...}}` -> `{"prompt"}` |
+| POST | `/api/sessions/{id}/handoff/compose` | `{"source":{"kind":"selection\|transcript\|command\|last_command\|diff",...},"max_bytes"?}` -> `{"prompt"}` |
 | POST | `/api/sessions/{id}/handoff` | `{"prompt","from"?,"source"?}`: pasted + Enter (128 KiB) |
 
-**Two-step**: `{"dry_run":true}` -> a plan (summary, exact `commands`, warnings, `refusal`, `needs_rebase`, `fingerprint`; commit adds `suspects`), then `{"confirm":fingerprint}` runs it -> `{"ok","ran","url"?}`; 409 refused / stale.
+**Two-step**: `{"dry_run":true}` -> a plan (summary, exact `commands`, warnings, `refusal`, `needs_rebase`, `fingerprint`; commit adds `suspects`), then the body with `"confirm":fingerprint` runs it -> `{"ok","ran","url"?}`; 409 refused / changed since.
 
 ## Fan-outs and Flywheel
 
 | Method | Path | |
 |---|---|---|
-| GET / POST | `/api/fanouts` | list / launch `{"workspace_id","prompt","candidates":[{"kind","model"?}],"graders"}` + `fw hub fanout new`'s flags -> 201 |
+| GET / POST | `/api/fanouts` | list / launch `{"workspace_id","prompt","candidates":[{"kind","model"?,...}],"graders":[CMD\|{"run","name"?}],"base"?,"protect"?,"from_task"?,...}` (`fanout new`'s flags) -> 201 |
 | GET / DELETE | `/api/fanouts/{id}` | the ranked board / forget it (204; sessions, worktrees stay) |
 | POST | `/api/fanouts/{id}/grade` | `{"candidate"}` -> 202 |
 | POST | `/api/fanouts/{id}/fix` | `{"candidate","dry_run"?}` |
-| POST | `/api/fanouts/{id}/pick` | `{"candidate"}`, two-step (plan adds `merge`, `losers`) |
+| POST | `/api/fanouts/{id}/pick` | `{"candidate","include_suspects"?}`, two-step (plan adds `merge`, `losers`) |
 | POST | `/api/fanouts/{id}/rebase` | `{"candidate"}`, two-step |
 | POST | `/api/fanouts/{id}/seen` | `{"graded_at"}` -> 204 (`needs_you` false) |
 | POST | `/api/fanouts/{id}/cleanup` | `{"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}` |
@@ -99,8 +99,8 @@ A session lists its `agent` status (`detail`, `since`, AskUserQuestion's `questi
 | POST | `/api/flywheel/autopilot/stop` | `{"folder"}` -> 202 (Ctrl-C); 409 none of this hub's |
 | POST | `/api/flywheel/autopilot/pause` | `{"folder"}` -> `{"paused","changed"}` |
 | POST | `/api/flywheel/autopilot/resume` | as `pause` |
-| POST | `/api/flywheel/autopilot/decide` | `{"folder","run","decision":"approve"/"deny","confirm":true}` + `fw hub autopilot`'s `gate`, `attempt`, `feedback`; 409 not that gate or one queued; 404 no run |
-| POST | `/api/flywheel/worker` | `{"folder","tasks"?,"with_prereqs"?,"another"?}` -> 201 the `fw worker` session; 409 running (unless `another`) |
+| POST | `/api/flywheel/autopilot/decide` | `{"folder","run","decision":"approve"/"deny","confirm":true}` + `gate`, `attempt`, `feedback` (as `fw hub autopilot`); 409 not that gate or one queued; 404 no run |
+| POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"cols"?,"rows"?}` -> 201 the `fw worker` session; 409 running, unless `another` |
 
 Fan-outs off: 503.
 
@@ -129,7 +129,7 @@ Times: RFC 3339, unix ms, an age (`90m`), `last-seen`. `ws`, `session`: id, pref
 
 | Method | Path | |
 |---|---|---|
-| GET / PUT | `/api/settings` | `{"rev","values","keys"}`; PUT `values` / `keys` (`null` resets); 409 stale; 422 `{"errors"}` |
+| GET / PUT | `/api/settings` | `{"rev","values","keys"}`; PUT `{"rev","values"?:{id: value\|null},"keys"?:{action: [keys]\|null}}` (`null` resets); 409 stale; 422 `{"errors"}` |
 | POST | `/api/settings/keys/check` | `{"keys"}` -> `{"errors","warnings"}` |
 | GET | `/api/config` | as `fw hub config show --json` |
 | GET | `/api/plugins` | each plugin: enabled, valid, error, events, actions |
@@ -162,7 +162,7 @@ Behaviour: [hub-workflows](workflows.md#permissions). `?folder=` (absolute, in a
 | GET / POST | `/api/peers` | list / `{"name"}` -> 201 `{"peer","credential"}` |
 | DELETE | `/api/peers/{which}` | revoke by id or name |
 | DELETE | `/api/peer` | a peer credential revokes itself |
-| GET / POST | `/api/machines` | list (link `status`) / `{"name","url","credential"\|"token"}` + `machine add`'s flags -> 201 (200 `replace`) |
+| GET / POST | `/api/machines` | list (link `status`) / `{"name","url","credential"\|"token","fingerprint"?,"replace"?}` -> 201 (200 `replace`) |
 | DELETE | `/api/machines/{name}` | also asks it to revoke the peer |
 | POST | `/api/machines/{name}/test` | ok, latency, its `whoami` or error |
 | any | `/m/{name}/{*rest}` | proxy to machine `name`'s API and sockets |
@@ -194,7 +194,7 @@ Behaviour: [hub-workflows](workflows.md#permissions). `?folder=` (absolute, in a
 | GET | `/share/{credential}/assets/{*path}` | its assets |
 | any | `/share/{credential}/{*rest}` | 403 |
 
-Unreadable queries / login bodies: a 4xx page (JSON for `Accept: application/json`).
+Unreadable queries / login bodies: a 4xx page (JSON if `Accept: application/json`).
 
 ## Terminal WebSocket
 
@@ -223,24 +223,24 @@ Close codes: **4001** token rotated, **4002** logout / login expired, **4003** p
 
 ## Events WebSocket
 
-`/api/events[?client=ID]` (as `client` above; default its own). Server `type`s:
+`/api/events[?client=ID]` (as `client` above; default its own). Server sends `{"type",...}`:
 
-| Type | When |
-|---|---|
-| `snapshot` | on connect, falling behind, a fan-out change: every status and rollup |
-| `status` | per change, as this client sees it |
-| `sessions` | sessions, workspaces, viewers changed: re-list (at most every 250 ms) |
-| `usage` | a session's usage changed |
-| `commands` | an agent suggested code blocks |
-| `flywheel` / `flywheel_reset` | a panel changed (`summary` `null`: unwatched) / missed some |
-| `layout` | a layout saved or pruned |
-| `fanout` | a fan-out changed |
-| `settings` / `config` | UI settings / hub.toml re-read |
-| `plugins` / `plugin_toast` | plugins changed / a plugin's toast |
-| `activity` | a journal row was written |
-| `away` | this client is back after 10+ min: its digest span |
+| `type` | Other fields | When |
+|---|---|---|
+| `snapshot` | `"sessions":{id:status},"workspaces":{id:rollup},"graded":[id],"fanouts":{ws:n}` | on connect, falling behind, a fan-out change |
+| `status` | `"session_id","status"\|null,"workspace_id","workspace_status"` | per change, as this client sees it |
+| `sessions` | | sessions, workspaces, viewers changed: re-list (250 ms apart at most) |
+| `usage` | the session's usage | changed |
+| `commands` | `"session_id","fresh","commands"` | an agent suggested blocks (`fresh`: within 2 min) |
+| `flywheel` / `flywheel_reset` | `"folder","summary"\|null` / | a panel changed (`null`: unwatched) / missed some |
+| `layout` | `"workspace_id","rev"` | a layout saved or pruned |
+| `fanout` | `"id"` | a fan-out changed |
+| `settings` / `config` | `"rev"` | UI settings / hub.toml re-read |
+| `plugins` / `plugin_toast` | / `"plugin","message","tone"` | plugins changed / a plugin's toast |
+| `activity` | `"row"` | a journal row was written |
+| `away` | `"since","until"` | back after 10+ min: its digest span |
 
-Client sends `view` `{"session_id","visible"?,"present"?}`: what is on screen counts as viewed; `present`: someone is at the page.
+Client sends `{"type":"view","session_id","visible"?:[ids],"present"?}`: what is on screen counts as viewed; `present`: someone is at the page.
 
 ## Plugins
 
@@ -252,7 +252,7 @@ Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 
 ### Plugin events
 
-`payload.session` (when there is one): id, name, kind, state, workspace, cwd, worktree, branch, agent. Rows name the main fields; full payloads: a plugin that logs its stdin.
+`payload.session` (if any): id, name, kind, state, workspace, cwd, worktree, branch, agent. Rows name main fields; full payloads: log a plugin's stdin.
 
 | Event | Payload adds |
 |---|---|

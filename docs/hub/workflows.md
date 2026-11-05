@@ -33,7 +33,7 @@ Each fenced block is read from the agent's own record and served **exactly as wr
 
 ## Usage and cost
 
-- From transcripts (Claude `message.usage` incl. subagents, Codex `token_count`) at list prices (`usage.rs` `PRICES`; unknown models: tokens only); ~1-2% under Claude's own (side calls are not in transcripts).
+- From transcripts (Claude `message.usage` incl. subagents, Codex `token_count`) at list prices (`usage.rs` `PRICES`; unknown models: tokens only); ~1-2% under Claude's own (side calls are untranscribed).
 - Header meter, sidebar, `fw hub ls`, `GET /api/usage`; 62 days per session.
 
 ## Worktrees and companion shells
@@ -48,7 +48,7 @@ fw hub kill fix-retry --rm --remove-worktree  # refused if work would be lost, u
 
 ## Review
 
-Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the worktree's, else the upstream (`--base`). **Every action is planned first** (exact commands, refusals); running needs the plan's `fingerprint` (changed since: 409).
+Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the worktree's, else the upstream (`--base`). **Every action is planned first**, then run by its `fingerprint` ([hub-api](api.md#review-handoff-peer-review)).
 
 | Action | Runs | Refused when |
 |---|---|---|
@@ -60,7 +60,7 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 - **Commit all** checks every changed path. Ticked: `generated` (`node_modules/`, `__pycache__/`, `.venv/`, `*.egg-info/`, `.pyc`, a dir with `CACHEDIR.TAG` or `pyvenv.cfg`, `target/` by `Cargo.toml`);
   `secret` (`.env*`, keys by name or content, credentials, `*.tfvars`), `personal` (`.claude/settings.local.json`, `CLAUDE.local.md`), `junk` (`.DS_Store`, `*.log`). Unticked: `build` (`dist/`, `build/`, `coverage/`, `venv/`, other `target/`), `large` (5 MiB+).
-- No git identity: refused before staging; a failed step puts the index back. **Merge** and fan-out **pick** refuse a branch adding a ticked kind unless `--include-suspects`.
+- No git identity: refused before staging; a failed step restores the index. **Merge** and fan-out **pick** refuse a branch adding a ticked kind unless `--include-suspects`.
 - "Ask the agent" pastes a commit-message or conflict prompt. Runner: argv, no shell, deadlines, one action per repo, logged.
 
 ## Pull requests and CI
@@ -78,7 +78,7 @@ A branch with a pull request: a badge on its row (`#7`, checks), a PR section in
 
 - **Send to agent** (`fw hub handoff FROM TO`, `handoff.send`): a selection, message, block, or diff to another agent (any workspace or machine) as one editable prompt (32 KiB).
 - **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author. Model: `--model`, else the author's (same kind), else `agents.<kind>.model`.
-- **Send findings to <author>** pastes the reviewer's latest reply back. Pairing survives restarts; the author's close closes its reviewers.
+- **Send findings to <author>** pastes the reviewer's latest reply back. Pairing survives restarts; closing the author closes its reviewers.
 
 ## Verified fan-out
 
@@ -94,7 +94,7 @@ fw hub fanout pick "$id" c1 --yes [--rebase]
 fw hub fanout cleanup "$id" [--force] --yes
 ```
 
-- **Agent claims are untrusted**: a finished turn only queues grading; the verdict is the graders' exit codes. Needs you lists it once per unseen grading.
+- **Agent claims are untrusted**: a finished turn only queues grading; the verdict is the graders' exit codes. Needs you: once per unseen grading.
 - **Graders are held out of the prompt only** (agents run as you): `--protect` a tracked grader's inputs (a change fails) or keep it outside the repo ([held-out gate](../held-out-gate.md)); absolute-path scripts are pinned by hash.
 - Grading: flywheel-core's runner (in order, `/bin/sh -c`, exit 0 passes, `--timeout` 900 s each, first failure stops); 2 at once. Rank: passing (smaller diff, then lower cost), failing, stale, grading, ungraded; a pass changing nothing cannot be picked.
 - **Pick** needs a fresh pass on a clean tree at exactly the graded commit, then ff-merges it (plan + fingerprint); base moved: `--rebase`, which grades again.
@@ -117,15 +117,15 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 
 Folders with a `flywheel.toml` or `.flywheel/` get the verified loop beside the terminals, read-only (`--no-flywheel`: off). **Postgres stores read the DSN from the hub's own environment** (`FLYWHEEL_PG_DSN`, else `DATABASE_URL`).
 
-- Phases and tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
+- Phases, tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
 - **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks to add unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`.
 - Shown: tier verdicts, the newest deciding cycle (emitted, dropped with reasons), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate shown (one per gate, then `decision pending`; deny retries with feedback). Peers: read-only.
-- A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is not created. One watcher per folder (stat 2 s, re-read 15 s). Seam: `flywheel::FlywheelProvider` (`hub_flywheel.rs`).
+- A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is not made. One watcher per folder (stat 2 s, re-read 15 s). Seam: `flywheel::FlywheelProvider` (`hub_flywheel.rs`).
 
 ## Prompt queue
 
-Per agent session, prompts the hub types in itself, in order ("when it's done, then do X"): `fw hub queue add api --when idle "now the changelog"`.
+Per agent session, prompts the hub types in itself, in order ("when done, do X"): `fw hub queue add api --when idle "now the changelog"`.
 
 | | |
 |---|---|

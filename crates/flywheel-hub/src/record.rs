@@ -16,8 +16,9 @@
 //! from `recordings/active.json`).
 
 use crate::hub::{Hub, HubError, HubEvent};
-use crate::pty::{PtySession, SessionEvent};
+use crate::pty::{Attachment, PtySession, SessionEvent};
 use crate::state::StateError;
+use crate::vt::Emulator;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -449,7 +450,7 @@ impl Recordings {
                     false,
                 ));
             }
-            let recorder = self.spawn(entry, writer, attachment.events, session, ended);
+            let recorder = self.spawn(entry, writer, attachment, session, ended);
             recorders.insert(session_id.to_owned(), recorder);
             true
         };
@@ -461,7 +462,7 @@ impl Recordings {
         self: &Arc<Self>,
         entry: ActiveEntry,
         writer: CastWriter,
-        events: broadcast::Receiver<SessionEvent>,
+        attachment: Attachment,
         session: &Arc<PtySession>,
         ended: EndNotice,
     ) -> Recorder {
@@ -476,7 +477,8 @@ impl Recordings {
             generation,
             control: Arc::clone(&control),
             session: Arc::downgrade(session),
-            events,
+            mirror: mirror_of(attachment.cols, attachment.rows, &attachment.replay),
+            events: attachment.events,
             writer,
             ended,
         };
@@ -642,13 +644,7 @@ impl Recordings {
                 let _ = writer.flush();
                 continue;
             }
-            let recorder = self.spawn(
-                entry,
-                writer,
-                attachment.events,
-                &session,
-                Arc::clone(ended),
-            );
+            let recorder = self.spawn(entry, writer, attachment, &session, Arc::clone(ended));
             self.recorders().insert(id, recorder);
         }
         self.save_active();
@@ -847,9 +843,23 @@ struct Worker {
     generation: u64,
     control: Arc<AtomicU8>,
     session: Weak<PtySession>,
+    /// The terminal as the recording so far draws it: fed exactly what is
+    /// written, so a new part opens on the screen where the last one
+    /// ended -- not on the session's screen, which may be ahead by the
+    /// output still queued here.
+    mirror: Emulator,
     events: broadcast::Receiver<SessionEvent>,
     writer: CastWriter,
     ended: EndNotice,
+}
+
+/// A recorder's [`Worker::mirror`], starting on the screen `replay` (a
+/// screen-only snapshot) rebuilds.
+fn mirror_of(cols: u16, rows: u16, replay: &[u8]) -> Emulator {
+    let mut mirror = Emulator::new(cols, rows, 0);
+    mirror.process(replay);
+    drop(mirror.take_replies());
+    mirror
 }
 
 impl Worker {
@@ -876,50 +886,19 @@ impl Worker {
             match self.events.try_recv() {
                 Ok(SessionEvent::Output(bytes)) => {
                     let text = self.writer.output_text(&bytes);
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let line = match self.writer.text_line(&text) {
-                        Ok(line) => line,
-                        Err(e) => break self.failed(&e),
-                    };
-                    if self.room_for(line.len()) {
-                        if let Err(e) = self.writer.line(&line) {
-                            break self.failed(&e);
-                        }
-                        continue;
-                    }
-                    // An event that would cross the cap opens the next
-                    // part instead (its fresh snapshot shows this output).
-                    // One too big for even a fresh part (a PTY read is up
-                    // to 64 KiB, more once escaped) is cut: what fits goes
-                    // here, and the next part's snapshot shows the rest.
-                    if self.fresh() {
-                        let budget = self.room_left().saturating_sub(EVENT_OVERHEAD);
-                        let head = fitting_prefix(&text, budget);
-                        let wrote = self
-                            .writer
-                            .text_line(head)
-                            .and_then(|line| self.writer.line(&line));
-                        if let Err(e) = wrote {
-                            break self.failed(&e);
-                        }
-                    }
-                    if !self.rotate() {
+                    if !text.is_empty() && !self.record_output(&text) {
                         break true;
                     }
                 }
                 Ok(SessionEvent::Resize { cols, rows }) => {
                     // `[t,"r","65535x65535"]`: inside the overhead.
-                    if !self.room_for(0) && !self.fresh() {
-                        if !self.rotate() {
-                            break true;
-                        }
-                        continue;
+                    if !self.room_for(0) && !self.fresh() && !self.rotate() {
+                        break true;
                     }
                     if let Err(e) = self.writer.resize(cols, rows) {
                         break self.failed(&e);
                     }
+                    self.mirror.resize(cols, rows);
                 }
                 Ok(SessionEvent::Exit(info)) => {
                     let _ = self
@@ -933,15 +912,12 @@ impl Worker {
                 }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {
                     // Output was lost: carry on from the screen as it is
-                    // (in the next part when the screen would not fit).
-                    let carried = if self.fresh()
+                    // (in the next part when the screen would not fit),
+                    // marked as a resync.
+                    let room = self.fresh()
                         || self.room_for(self.screen_estimate().saturating_mul(6))
-                    {
-                        self.resync()
-                    } else {
-                        self.rotate()
-                    };
-                    if !carried {
+                        || self.rotate();
+                    if !room || !self.resync() {
                         break true;
                     }
                 }
@@ -966,6 +942,54 @@ impl Worker {
                 (self.ended)(&id, &file);
             }
         }
+    }
+
+    /// Write `text` (output) as events: in this part while it fits, else
+    /// from the start of the next one, which opens on the screen as it
+    /// was just before `text`. Text too big for even a fresh part (a PTY
+    /// read is up to 64 KiB, more once escaped) is cut: what fits fills a
+    /// part, the rest goes on in the next. False when the recording ends
+    /// here.
+    fn record_output(&mut self, text: &str) -> bool {
+        let mut rest = text;
+        loop {
+            let line = match self.writer.text_line(rest) {
+                Ok(line) => line,
+                Err(e) => return !self.failed(&e),
+            };
+            if self.room_for(line.len()) {
+                if let Err(e) = self.writer.line(&line) {
+                    return !self.failed(&e);
+                }
+                self.mirror_output(rest);
+                return true;
+            }
+            if self.fresh() {
+                let budget = self.room_left().saturating_sub(EVENT_OVERHEAD);
+                let head = fitting_prefix(rest, budget);
+                let wrote = self
+                    .writer
+                    .text_line(head)
+                    .and_then(|line| self.writer.line(&line));
+                if let Err(e) = wrote {
+                    return !self.failed(&e);
+                }
+                self.mirror_output(head);
+                rest = &rest[head.len()..];
+                if rest.is_empty() {
+                    return true;
+                }
+            }
+            if !self.rotate() {
+                return false;
+            }
+        }
+    }
+
+    fn mirror_output(&mut self, text: &str) {
+        self.mirror.process(text.as_bytes());
+        // Queries are the session's to answer (its own emulator does).
+        drop(self.mirror.take_replies());
     }
 
     /// Whether `len` more bytes still fit the part, leaving room for the
@@ -1018,6 +1042,7 @@ impl Worker {
         };
         let attachment = session.attach_with(0);
         self.events = attachment.events;
+        self.mirror = mirror_of(attachment.cols, attachment.rows, &attachment.replay);
         let wrote = self.writer.marker("resync").and_then(|()| {
             self.writer.resize(attachment.cols, attachment.rows)?;
             match self.writer.output_line(&attachment.replay)? {
@@ -1041,14 +1066,18 @@ impl Worker {
         true
     }
 
-    /// The file reached its cap: carry on in the next part, from a fresh
-    /// snapshot. False when the recording ends here (it failed, or the
-    /// process had exited meanwhile).
+    /// The file reached its cap: carry on in the next part, opening on
+    /// the screen the recording has drawn so far (the same receiver goes
+    /// on: no queued output is skipped). False when the recording ends
+    /// here (it failed).
     fn rotate(&mut self) -> bool {
-        let (Some(owner), Some(session)) = (self.owner.upgrade(), self.session.upgrade()) else {
+        let Some(owner) = self.owner.upgrade() else {
             return false;
         };
-        let attachment = session.attach_with(0);
+        let snapshot = self.mirror.snapshot(0);
+        let (cols, rows) = self.mirror.size();
+        let cols = u16::try_from(cols).unwrap_or(u16::MAX);
+        let rows = u16::try_from(rows).unwrap_or(u16::MAX);
         let next = {
             let entry = self.entry.lock().unwrap_or_else(PoisonError::into_inner);
             let part = entry.part + 1;
@@ -1059,24 +1088,24 @@ impl Worker {
                 ..entry.clone()
             }
         };
+        // A UTF-8 sequence the last output began goes on in the next part.
+        let pending = std::mem::take(&mut self.writer.pending);
         let _ = self.writer.marker(&format!("continued in {}", next.file));
         let _ = self.writer.finish();
         let path = owner.dir.join(&next.file);
-        let created = CastWriter::create(&path, attachment.cols, attachment.rows, &next).and_then(
-            |mut writer| {
-                writer.snapshot(&attachment.replay)?;
-                writer.flush()?;
-                Ok(writer)
-            },
-        );
+        let created = CastWriter::create(&path, cols, rows, &next).and_then(|mut writer| {
+            writer.snapshot(&snapshot)?;
+            writer.flush()?;
+            Ok(writer)
+        });
         match created {
             Ok(writer) => {
                 self.writer = writer;
-                self.events = attachment.events;
+                self.writer.pending = pending;
                 *self.entry.lock().unwrap_or_else(PoisonError::into_inner) = next;
                 owner.save_active();
                 owner.sweep();
-                !self.ended_meanwhile(attachment.exit.as_ref())
+                true
             }
             Err(e) => {
                 self.failed(&e);
@@ -1536,6 +1565,7 @@ mod tests {
             generation: 0,
             control: Arc::clone(&control),
             session: Weak::new(),
+            mirror: Emulator::new(80, 24, 0),
             events,
             writer,
             ended: Arc::new(|_: &str, _: &str| {}),
@@ -1601,73 +1631,126 @@ mod tests {
         parts
     }
 
-    /// Whether part `info` holds its header and opening snapshot.
-    fn opened(recordings: &Recordings, info: &RecordingInfo) -> bool {
-        fs::read_to_string(recordings.path_of(&info.name).unwrap())
-            .ok()
-            .and_then(|text| parse_cast(&text).ok())
-            .is_some_and(|cast| !cast.events.is_empty())
+    /// The parts read back: `None` while one is still being written (no
+    /// header yet, or a torn last line).
+    fn read_parts(recordings: &Recordings) -> Option<Vec<(RecordingInfo, Cast)>> {
+        parts_of(recordings)
+            .into_iter()
+            .map(|info| {
+                let text = fs::read_to_string(recordings.path_of(&info.name).ok()?).ok()?;
+                if !text.ends_with('\n') {
+                    return None;
+                }
+                let cast = parse_cast(&text).ok()?;
+                (!cast.events.is_empty()).then_some((info, cast))
+            })
+            .collect()
     }
 
-    /// What feeding one chunk of output does to the recording.
-    enum Fed {
-        /// Written as an event of the current part.
-        Appended,
-        /// The current part ended; the next one opened.
-        Rotated,
+    /// The output each part's events carry, after its opening snapshot.
+    fn recorded(parts: &[(RecordingInfo, Cast)]) -> String {
+        parts
+            .iter()
+            .flat_map(|(_, cast)| &cast.events[1..])
+            .filter(|e| e.1 == "o")
+            .map(|e| e.2.as_str())
+            .collect()
     }
 
-    /// Feed `chunk` to `session` as one read of its PTY, and wait for the
-    /// recorder to have handled it as `expect`ed -- one chunk at a time, so
-    /// the recorder never falls behind and no chunk is folded into a
-    /// rotation's snapshot by how threads happen to be scheduled.
-    fn feed(recordings: &Recordings, session: &PtySession, chunk: &[u8], expect: &Fed) {
-        let before = parts_of(recordings);
-        let current = before.last().unwrap().clone();
-        assert!(opened(recordings, &current), "{before:?}");
-        session.ingest(axum::body::Bytes::copy_from_slice(chunk));
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    /// Wait until the recording's events carry exactly `want`; the parts.
+    fn wait_recorded(recordings: &Recordings, want: &str) -> Vec<(RecordingInfo, Cast)> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
-            let now = parts_of(recordings);
-            let done = match expect {
-                // Once the next part is open the recorder has subscribed
-                // again: what comes next is an event of it.
-                Fed::Rotated => {
-                    now.len() == before.len() + 1 && opened(recordings, now.last().unwrap())
+            if let Some(parts) = read_parts(recordings) {
+                let got = recorded(&parts);
+                if got == want {
+                    return parts;
                 }
-                Fed::Appended => {
-                    now.len() == before.len()
-                        && fs::metadata(recordings.path_of(&current.name).unwrap())
-                            .unwrap()
-                            .len()
-                            > current.size
-                }
-            };
-            if done {
-                return;
+                assert!(
+                    want.starts_with(&got),
+                    "recorded output is not a prefix of what was fed ({} of {} bytes)",
+                    got.len(),
+                    want.len()
+                );
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "chunk of {} bytes never handled: {now:?}",
-                chunk.len()
+                "the recording never caught up with {} bytes",
+                want.len()
             );
             std::thread::sleep(Duration::from_millis(5));
         }
     }
 
-    /// Every part holds its cap, even when one PTY read escapes to more
-    /// than a whole part (control bytes take six bytes each in JSON). The
-    /// output is fed in chunks of known sizes, so the parts are exact.
-    #[test]
-    fn output_bigger_than_a_part_is_cut_to_fit() {
-        let dir = tempfile::tempdir().unwrap();
-        let limits = RecordLimits {
-            max_file_bytes: 8 * 1024,
-            max_total_bytes: 1 << 30,
+    /// The screen a player shows at the end of `cast` (its rows, cursor).
+    fn screen_at_end(cast: &Cast, opening_only: bool) -> crate::vt::ScreenText {
+        let size = |key: &str| u16::try_from(cast.header[key].as_u64().unwrap()).unwrap();
+        let mut term = Emulator::new(size("width"), size("height"), 0);
+        let events = if opening_only {
+            &cast.events[..1]
+        } else {
+            &cast.events[..]
         };
-        let recordings = Arc::new(Recordings::new(dir.path(), limits));
-        // A silent child: everything recorded is what the test feeds.
-        let session = PtySession::spawn(
+        for (_, code, data) in events {
+            match code.as_str() {
+                "o" => term.process(data.as_bytes()),
+                "r" => {
+                    let (cols, rows) = data.split_once('x').unwrap();
+                    term.resize(cols.parse().unwrap(), rows.parse().unwrap());
+                }
+                _ => {}
+            }
+        }
+        term.text(crate::vt::TextSource::Visible)
+    }
+
+    /// What every recording's parts must hold: the cap, times that never
+    /// go back, an opening snapshot at t=0, an end marker naming the next
+    /// part (the last: the exit), no resync (nothing was lost), and each
+    /// part opening on exactly the screen the one before ended on.
+    fn assert_parts_hold(parts: &[(RecordingInfo, Cast)], limits: RecordLimits, exit: &str) {
+        let base = base_of(&parts[0].0.name).to_owned();
+        let numbers: Vec<u32> = parts.iter().map(|(p, _)| p.part).collect();
+        let expected: Vec<u32> = (1..=u32::try_from(parts.len()).unwrap()).collect();
+        assert_eq!(numbers, expected);
+        for (n, (info, cast)) in parts.iter().enumerate() {
+            assert_eq!(base_of(&info.name), base, "{info:?}");
+            assert!(info.size <= limits.max_file_bytes, "{info:?}");
+            assert!(
+                cast.events.windows(2).all(|w| w[0].0 <= w[1].0),
+                "{}: times go back",
+                info.name
+            );
+            let opening = &cast.events[0];
+            assert_eq!((opening.0, opening.1.as_str()), (0.0, "o"), "{}", info.name);
+            let markers: Vec<&str> = cast
+                .events
+                .iter()
+                .filter(|e| e.1 == "m")
+                .map(|e| e.2.as_str())
+                .collect();
+            let label = match parts.get(n + 1) {
+                Some((next, _)) => format!("continued in {}", next.name),
+                None => exit.to_owned(),
+            };
+            assert_eq!(markers, vec![label.as_str()], "{}", info.name);
+            if let Some((_, next)) = parts.get(n + 1) {
+                assert_eq!(
+                    screen_at_end(cast, false),
+                    screen_at_end(next, true),
+                    "{} does not open where {} ended",
+                    parts[n + 1].0.name,
+                    info.name
+                );
+            }
+        }
+    }
+
+    /// A silent child on a 20x5 screen with no history (a snapshot is the
+    /// 100 cells of the screen): everything recorded is what the test
+    /// feeds it as reads of its PTY. It exits 7 on a line of input.
+    fn silent_session() -> Arc<PtySession> {
+        PtySession::spawn(
             crate::pty::SpawnSpec {
                 argv: vec![
                     "/bin/sh".into(),
@@ -1679,120 +1762,130 @@ mod tests {
                 env_remove: Vec::new(),
                 cols: 20,
                 rows: 5,
-                // No history: a snapshot is the 100 cells of the screen.
                 scrollback_lines: 0,
             },
             |_| {},
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Start recording `session`; a receiver of the recording's end.
+    fn record(
+        recordings: &Arc<Recordings>,
+        session: &Arc<PtySession>,
+    ) -> std::sync::mpsc::Receiver<()> {
         let (ended_tx, ended) = std::sync::mpsc::channel::<()>();
         let ended_tx = Mutex::new(ended_tx);
         let notice: EndNotice = Arc::new(move |_: &str, _: &str| {
             let _ = ended_tx.lock().unwrap().send(());
         });
         recordings
-            .start("s", "big", "big", &session, notice)
+            .start("s", "big", "big", session, notice)
             .unwrap();
-        // Printable chunks: two fit a part (a small screen keeps its
-        // snapshot short), the third opens the next part and shows in
-        // its snapshot.
-        let letter = |c: char| c.to_string().repeat(3000).into_bytes();
-        for (c, expect) in [
-            ('a', Fed::Appended),
-            ('b', Fed::Appended),
-            ('c', Fed::Rotated),
-            ('d', Fed::Appended),
-            ('e', Fed::Appended),
-            ('f', Fed::Rotated),
-            ('g', Fed::Appended),
-            ('h', Fed::Appended),
-        ] {
-            feed(&recordings, &session, &letter(c), &expect);
-        }
-        // Control bytes: 12000 bytes escaped, more than a whole part. On
-        // a part with events it opens the next; on a fresh part what fits
-        // is written and the next part opens.
-        let control = vec![1u8; 2000];
-        for _ in 0..3 {
-            feed(&recordings, &session, &control, &Fed::Rotated);
-        }
+        ended
+    }
+
+    fn exit_and_end(session: &PtySession, ended: &std::sync::mpsc::Receiver<()>) {
         session.write(b"go\r".to_vec());
         assert!(session.wait_exit(Duration::from_secs(20)));
         ended
             .recv_timeout(Duration::from_secs(20))
             .expect("the recording ends with the process");
+    }
 
-        let parts = parts_of(&recordings);
-        let numbers: Vec<u32> = parts.iter().map(|p| p.part).collect();
-        assert_eq!(numbers, vec![1, 2, 3, 4, 5, 6], "{parts:?}");
-        let base = base_of(&parts[0].name).to_owned();
-        let casts: Vec<Cast> = parts
-            .iter()
-            .map(|part| {
-                assert_eq!(base_of(&part.name), base, "{part:?}");
-                assert!(part.size <= limits.max_file_bytes, "{part:?}");
-                let text = fs::read_to_string(recordings.path_of(&part.name).unwrap()).unwrap();
-                assert_eq!(text.len() as u64, part.size);
-                let cast = parse_cast(&text).unwrap();
-                assert!(
-                    cast.events.windows(2).all(|w| w[0].0 <= w[1].0),
-                    "{}: times go back",
-                    part.name
-                );
-                let opening = &cast.events[0];
-                assert_eq!((opening.0, opening.1.as_str()), (0.0, "o"), "{}", part.name);
-                cast
-            })
+    /// Every part holds its cap, even when one PTY read escapes to more
+    /// than a whole part (control bytes take six bytes each in JSON), and
+    /// every byte of output is an event of some part, in order: a chunk
+    /// that would cross the cap opens the next part (on the screen as it
+    /// was before the chunk) and is its first event. Chunks of known
+    /// sizes, each handled before the next: the part counts are exact.
+    #[test]
+    fn output_bigger_than_a_part_is_cut_to_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = RecordLimits {
+            max_file_bytes: 8 * 1024,
+            max_total_bytes: 1 << 30,
+        };
+        let recordings = Arc::new(Recordings::new(dir.path(), limits));
+        let session = silent_session();
+        let ended = record(&recordings, &session);
+        // Printable chunks of 3000: two fit a part (a small screen keeps
+        // its snapshot short); the next opens a part. Then control bytes:
+        // 2000 escape to 12000, more than a whole part -- cut to fill one,
+        // the rest going on in the next.
+        let mut chunks: Vec<String> = "abcdefgh"
+            .chars()
+            .map(|c| c.to_string().repeat(3000))
             .collect();
-        // Each part but the last ends saying where it continues; the last
-        // with the exit.
-        for (n, cast) in casts.iter().enumerate() {
-            let last = cast.events.last().unwrap();
-            let label = match parts.get(n + 1) {
-                Some(next) => format!("continued in {}", next.name),
-                None => "exit: 7".to_owned(),
-            };
-            assert_eq!((last.1.as_str(), last.2.as_str()), ("m", label.as_str()));
+        chunks.extend(std::iter::repeat_n("\u{1}".repeat(2000), 3));
+        let mut fed = String::new();
+        let mut counts = Vec::new();
+        for chunk in &chunks {
+            session.ingest(axum::body::Bytes::copy_from_slice(chunk.as_bytes()));
+            fed.push_str(chunk);
+            counts.push(wait_recorded(&recordings, &fed).len());
         }
-        // What each part's events say, after its opening snapshot.
-        let fed: Vec<String> = casts
-            .iter()
-            .map(|cast| {
-                cast.events[1..]
-                    .iter()
-                    .filter(|e| e.1 == "o")
-                    .map(|e| e.2.as_str())
-                    .collect()
-            })
-            .collect();
-        let text = |c: char| c.to_string().repeat(3000);
-        // Byte-exact: every chunk that fit, in order; a chunk that opened
-        // a part is on its snapshot's screen instead.
-        assert_eq!(fed[0], text('a') + &text('b'));
-        assert_eq!(fed[1], text('d') + &text('e'));
-        assert_eq!(fed[2], text('g') + &text('h'));
-        assert!(casts[1].events[0].2.contains(&"c".repeat(20)));
-        assert!(casts[2].events[0].2.contains(&"f".repeat(20)));
-        // The first oversized chunk met a part with events: it opened the
-        // next part, which it fills (on the screen, control bytes leave
-        // nothing). The next two met fresh parts: cut to what fits.
-        assert_eq!(fed[3].len(), fed[4].len());
-        for cut in &fed[3..5] {
-            assert!(
-                !cut.is_empty() && cut.len() < control.len(),
-                "{}",
-                cut.len()
-            );
-            assert!(cut.bytes().all(|b| b == 1));
+        exit_and_end(&session, &ended);
+        let parts = wait_recorded(&recordings, &fed);
+        // Each control chunk meets a part with events (it opens the next),
+        // fills that fresh part with its head (about 1200 of its 2000
+        // bytes) and goes on in another.
+        assert_eq!(counts, vec![1, 1, 2, 2, 3, 3, 4, 4, 6, 8, 10]);
+        assert_eq!(parts.len(), 10);
+        assert_parts_hold(&parts, limits, "exit: 7");
+        // Byte-exact per part: whole chunks while they fit, then cuts.
+        for (n, pair) in ["ab", "cd", "ef", "gh"].iter().enumerate() {
+            let want: String = pair.chars().map(|c| c.to_string().repeat(3000)).collect();
+            assert_eq!(recorded(&parts[n..=n]), want, "part {}", n + 1);
         }
-        for part in &parts[3..5] {
+        for (n, pair) in parts[4..].chunks(2).enumerate() {
+            assert_eq!(recorded(pair), chunks[8 + n], "control chunk {n}");
+            let (head, _) = &pair[0];
             // Filled to the cap, less the room kept for its end marker.
             assert!(
-                part.size + 1 + EVENT_OVERHEAD + END_RESERVE + 64 >= limits.max_file_bytes,
-                "{part:?}"
+                head.size + 1 + EVENT_OVERHEAD + END_RESERVE + 64 >= limits.max_file_bytes,
+                "{head:?}"
             );
+            let tail = recorded(&pair[1..]);
+            assert!(!tail.is_empty() && tail.len() < 1000, "{}", tail.len());
         }
-        assert!(fed[5].is_empty(), "{:?}", fed[5]);
+    }
+
+    /// Output that queues up behind the recorder while it rotates is not
+    /// lost: the backlog goes on in the next part, which opens on the
+    /// screen the last one ended on (once, the backlog was thrown away and
+    /// the next part opened on the session's later screen instead).
+    #[test]
+    fn a_backlog_goes_on_across_parts_byte_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = RecordLimits {
+            max_file_bytes: 8 * 1024,
+            max_total_bytes: 1 << 30,
+        };
+        let recordings = Arc::new(Recordings::new(dir.path(), limits));
+        let session = silent_session();
+        let ended = record(&recordings, &session);
+        // `seq 1 40000` (about 230 KB, dozens of parts), fed as fast as
+        // it goes in 1000-byte reads (fewer than the session's queue
+        // holds: the recorder cannot lag, only fall behind).
+        let fed: String = (1..=40_000).map(|n| format!("{n}\r\n")).collect();
+        for chunk in fed.as_bytes().chunks(1000) {
+            session.ingest(axum::body::Bytes::copy_from_slice(chunk));
+        }
+        exit_and_end(&session, &ended);
+        let parts = wait_recorded(&recordings, &fed);
+        assert!(parts.len() > 20, "{}", parts.len());
+        assert_parts_hold(&parts, limits, "exit: 7");
+        // Every line is in the parts' events, in order.
+        let all = recorded(&parts);
+        let lines: Vec<&str> = all.split("\r\n").collect();
+        assert_eq!(lines.len(), 40_001);
+        assert!(
+            lines[..40_000]
+                .iter()
+                .enumerate()
+                .all(|(n, l)| *l == (n + 1).to_string())
+        );
     }
 
     #[test]

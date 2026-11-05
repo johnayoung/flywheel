@@ -10,13 +10,13 @@
 
 ```bash
 cargo install --path crates/flywheel  # fw + flywheel on PATH (~/.cargo/bin)
-fw hub doctor  # optional: checks PATH, agents, hooks, port
+fw hub doctor  # optional: PATH, agents, hooks, port
 fw hub start  # detached on 127.0.0.1:7420; prints one-time login URLs
 fw hub open  # this machine's browser, signed in
 fw hub import ~/code/*.code-workspace  # VS Code multi-root workspaces -> hub workspaces
 id=$(fw hub new myrepo --create --folder ~/code/myrepo --kind claude --prompt "Fix the failing test")  # or the UI (Alt N)
 fw hub wait "$id" --until done --timeout 900
-fw hub commands "$id" --last --copy  # newest suggested shell block, exact, to the clipboard
+fw hub commands "$id" --last --copy  # newest suggested shell block, exact, to clipboard
 ```
 
 Phone or another machine: `tailscale serve --bg http://127.0.0.1:7420`, then `fw hub url --qr` and scan; without Tailscale see [hub-security](hub/security.md#https-without-tailscale). After a rebuild: `fw hub upgrade` (live handoff, no session restarts), not stop/start.
@@ -27,9 +27,9 @@ Phone or another machine: `tailscale serve --bg http://127.0.0.1:7420`, then `fw
 
 | Page | Covers |
 |---|---|
-| [hub-reference](hub/reference.md) | verbs and flags, config files, UI settings, keys, environment, state dir |
+| [hub-reference](hub/reference.md) | verbs, flags, config files, UI settings, keys, env, state dir |
 | [hub-workflows](hub/workflows.md) | scripting, launcher, commands, cost, worktrees, review, PR + CI, handoff, peer review, fan-out, Flywheel, queue, activity, permissions |
-| [hub-internals](hub/internals.md) | model, emulation, restore, live upgrade, status, detection, `attach`, layout, web UI, phone, search, recording, push, doctor |
+| [hub-internals](hub/internals.md) | model, emulation, restore, upgrade, status, detection, `attach`, layout, UI, phone, search, recording, push, doctor |
 | [hub-security](hub/security.md) | trust model, auth, remote access, TLS, machines and peers, share links |
 | [hub-api](hub/api.md) | REST routes, WebSockets, plugin protocol and events |
 

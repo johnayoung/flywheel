@@ -647,8 +647,9 @@ const PAGES: [(&str, &str); 6] = [
 ];
 
 /// The hub docs' size budget, all pages together: condensed, not moved.
-/// Condensed again to about 77,400 bytes (iteration 54; under 76 KiB),
-/// leaving about 8 KiB for new features before the next pass.
+/// Condensed again to 77,762 bytes (iteration 54: under 76 KiB = 77,824
+/// bytes, request bodies and WebSocket frames kept), leaving about 8 KB
+/// for new features before the next pass.
 const HUB_DOCS_MAX_BYTES: usize = 84 * 1024;
 /// One reference page's budget.
 const PAGE_MAX_BYTES: usize = 24 * 1024;

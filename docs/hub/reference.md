@@ -307,7 +307,7 @@ command = ["./summarize.py"]  # optional: else the top-level one
 
 `Alt ,` or the sidebar gear; stored by the hub (`settings.json`), any can be kept for **this device** only.
 
-Sections: **Appearance** (theme, font, text size, density), **Terminal** (client scrollback, cursor, ligatures, lite mode), **Keyboard** (pane prefix, key bar, companion key mode, tour, shortcuts), **Notifications**, **Agents** (new-session defaults), **Plugins** (enable, last run, logs), **Server** (effective hub.toml, read-only).
+Sections: Appearance, Terminal (incl. lite mode), Keyboard (pane prefix, key bar, shortcuts), Notifications, Agents (new-session defaults), Plugins (enable, runs, logs), Server (effective hub.toml, read-only).
 
 **Key bindings**: up to 4 per action, `mod+...+key`. Refused (422): keys the browser/OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: `alt+b/f`, `ctrl+<letter>`.
 

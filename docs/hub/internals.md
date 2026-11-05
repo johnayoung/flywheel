@@ -22,7 +22,7 @@ How the hub works underneath. Front door: [hub](../hub.md).
 
 - `start` runs `fw hub serve` detached into `hub.log` (10 MiB, 3 kept); not ready (`server.json`) by `--timeout`: SIGTERM, log tail. `stop` SIGTERMs, waits for the lock; `--force` SIGKILLs (no restore record).
 - One hub per state dir (`serve.lock`); a stale `server.json` is removed (the CLI never sends the token to whatever listens there now).
-- Shutdown records running sessions `stopped`, then SIGHUP, then SIGKILL (`nohup`ed children too); SIGTERM during startup waits until serving.
+- Shutdown records running sessions `stopped`, then SIGHUP, SIGKILL (`nohup`ed children too); SIGTERM during startup waits until serving.
 - `install-service`: `~/.config/systemd/user/<name>.service` (`KillMode=mixed`) + enable/linger steps.
 
 **Restore** (each start unless `--no-restore`) of `stopped` sessions: same id, name, order; fresh PTY.
@@ -43,7 +43,7 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 - Binary: `--binary`, else `fw` on `PATH`, else this one; it inherits the old hub's environment. Earlier agents' hooks keep the old binary's path: upgrade in place.
 - Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring, and exits once the new hub acks. Input meanwhile is `nack`ed for a resend: never lost or doubled.
 - Failure before commit thaws the old hub; a stuck new one is killed at `--timeout`. Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` restarts instead (sessions restored, not kept); systemd: `systemctl --user restart <unit>`.
-- Handed-over processes are not children: exits via pidfd, code unknown. `attach` / `wait` reconnect within 2 min.
+- Handed-over processes are not children: exits via pidfd, code unknown. `attach`, `wait` reconnect within 2 min.
 
 ## Agent status
 
@@ -55,9 +55,9 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 | `idle` | seen, or waiting for a first prompt | `SessionStart`; viewed `done`; an interrupted turn | viewed `done`; screen: the composer (`›`) |
 | `unknown` | no signal, or agent ended | `SessionEnd`, exit | exit; status line frozen 5 s; no rule matches 3 s |
 
-- **Idle is not authorization**: an unknown prompt reads idle or unknown, never blocked.
+- **Idle is not authorization**: an unknown prompt reads idle or unknown, not blocked.
 - Hook / `notify` reports win; screen rules fill gaps. Esc fires no Claude hook: a seen turn showing the prompt 3 s reads `idle`, a dialog closing onto a running turn `working`.
-- Seen is per client id (REST: anyone). A view counts while the page is visible, focused, and used in 5 min; a turn watched from its start counts to 30 min.
+- Seen is per client id (REST: anyone). A view counts while the page is visible, focused, used in 5 min; a turn watched from its start counts to 30 min.
 - Rollup: a workspace's most urgent session, blocked > working > done > idle. Fan-out candidates roll up `idle` until a pick; an unseen grading is one `done`.
 - Claude: `--session-id <uuid>` (`agent_session_id`, follows `/clear`), hooks via `--settings` (merged with yours) running `<this binary> hub report`. Codex: `-c notify=[<this binary> hub report --source codex --event notify]`; `thread-id` is `agent_session_id`.
 
@@ -65,7 +65,7 @@ Replaces the hub process **without ending any session**: same pids, screens, scr
 
 Per-kind TOML rules read against the screen's **live bottom**: `crates/flywheel-hub/detect/{claude,codex,shell}.toml`, each replaced wholesale by `<state-dir>/agent-detection/<kind>.toml` (re-read within 1 s; invalid: logged, ignored).
 
-Copy a shipped file (commented) to start. Fields: `kind` (the file name), `version` (shown by `explain`); `[[rule]]`s, the first whose every clause holds wins: `id`, `state` (`working` | `blocked` | `idle` | `hold`: keep the status), `detail`, `detail_line` (regexes; capture 1 becomes the detail);
+Start from a shipped (commented) file. Fields: `kind` (the file name), `version` (shown by `explain`); `[[rule]]`s, the first whose every clause holds wins: `id`, `state` (`working` | `blocked` | `idle` | `hold`: keep the status), `detail`, `detail_line` (regexes; capture 1 becomes the detail);
 `[[rule.when]]` clauses: `lines` (the last N non-empty rows, 1-100, 30), `line` / `not_line` (regexes), `any` / `all` / `none` (case-insensitive text).
 
 - Pin `blocked` rules to a dialog's footer so quoted text does not match. Limits: 64 rules, 8 clauses, 16 patterns per list, 400 chars, 64 KiB per file; read at most every 250 ms. Shell rules only answer `explain`.
@@ -83,14 +83,14 @@ Any terminal, local or over SSH (`--url`, `FW_HUB_TOKEN`).
 
 Per workspace: tabs of split trees, one session per pane, stored on the hub; active tab, focus, zoom per browser. Keys: [hub-reference](reference.md#keyboard-shortcuts).
 
-- Tab bar: `+`, double-click renames, middle-click closes. A sidebar session dropped on a pane edge splits, mid-pane shows it. A new-shell split opens an agent's companion shell first.
-- Panes stay 40x8 cells+ (else a new tab). Closing a pane leaves its session running; removing a session closes its panes and empty tabs. Only the active tab attaches; 12 tabs, 12 panes each. Phones (< 760 px): one pane, a chip row switches.
-- Browser checks (opt-in; temp hub, fake `claude`; env `FW`, `PLAYWRIGHT`, `CHROMIUM`): `node crates/flywheel-hub/e2e/layout.mjs`, `e2e/network.mjs` (400/150 kbps, 300 ms).
+- Tab bar: `+`, double-click renames, middle-click closes. A sidebar session dropped on a pane edge splits, mid-pane shows it. A new-shell split opens an agent's companion first.
+- Panes stay 40x8 cells+ (else a new tab). Closing a pane leaves its session running; removing one closes its panes, empty tabs. Only the active tab attaches; 12 tabs, 12 panes each. Phones (< 760 px): one pane, a chip row switches.
+- Browser checks (opt-in; env `FW`, `PLAYWRIGHT`, `CHROMIUM`): `node crates/flywheel-hub/e2e/{layout,network}.mjs` (network: 400/150 kbps, 300 ms).
 
 ## Web UI
 
 - Sidebar: machines > workspaces (rollup) > sessions (status dot, `↑ahead ↓behind ~changed ?untracked`, companions, a blocked row's question). Folder chips: filled git, hollow plain, struck missing.
-- Title and favicon count blocked and done; `#session=<id>` survives reloads. A dropped or silent (no pong in 6 s) socket keeps the screen and reconnects (2 s, up to 10 s) with what it missed.
+- Title and favicon count blocked and done; `#session=<id>` survives reloads. A dropped or silent (no pong in 6 s) socket keeps the screen, reconnects (2 s, up to 10 s) with what it missed.
 - Keys typed while down wait (`N queued`) and go in order once back; dropped, and said, if the session changed (epoch). Unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
 - Drawers (Commands, Flywheel, Review, Queue) share the stage's right edge; phones: full-screen sheets. Ended sessions: Relaunch, Close. First run: import offers, a 30 s tour. Themes: auto, dark, light (dim TUI colours lifted to 4.5:1).
 - Vendored (`web/vendor/`, with licenses): xterm.js 6.0.0 (+ fit, web-links, search); JetBrains Mono 2.304, then JuliaMono for its gaps.
@@ -119,15 +119,15 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); the PTY keeps
 
 `fw hub record start|stop SESSION` (or the `rec` pill); `fw hub record get NAME -o demo.cast; asciinema play demo.cast`.
 
-- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers like `exit: N`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`; `recordings.dir_cap` deletes the oldest finished.
-- Ends on stop, exit, relaunch, or hub stop; `upgrade` continues the file. Peers 403; an active one cannot be deleted (409).
+- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after falling behind, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on the screen the last part ended on: no output is skipped; `recordings.dir_cap` deletes the oldest finished.
+- Ends on stop, exit, relaunch, hub stop; `upgrade` continues the file. Peers 403; an active one is not deleted (409).
 - `/replay#<name>`: seek with marker ticks, 0.5-8x, idle gaps cut to 2 s, follows parts.
 
 ## Push notifications
 
 ntfy-compatible POST when an agent becomes **blocked** or **done**, so a phone hears it with every browser closed. Config: [hub-reference](reference.md#notifytoml); test: palette "Send a test push".
 
-- `<session> is blocked|done`, workspace, kind, branch, the blocked detail, `Click:` the session URL (`Priority: high` when blocked); never terminal content, paths, or tokens.
+- `<session> is blocked|done`, workspace, kind, branch, the blocked detail, `Click:` the session URL (`Priority: high` if blocked); never terminal content, paths, tokens.
 - Sent once the status held `settle_secs`, nobody views it, and a done turn is unseen; once per spell, `debounce_secs` per session and status. One POST (10 s, no redirects or proxy env); failures logged.
 
 ## Doctor

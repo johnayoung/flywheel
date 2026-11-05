@@ -528,28 +528,33 @@ impl PtySession {
             }
             match reader.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => {
-                    let chunk = Bytes::copy_from_slice(&buf[..n]);
-                    let replies = {
-                        let mut shared = self.lock();
-                        shared.screen.process(&chunk);
-                        let seq = shared.output_bytes;
-                        shared.recent.push(seq, RecentItem::Output(chunk.clone()));
-                        shared.output_bytes += chunk.len() as u64;
-                        // No receivers is not an error: output is retained.
-                        let _ = self.events.send(SessionEvent::Output(chunk));
-                        shared.screen.take_replies()
-                    };
-                    if !replies.is_empty() {
-                        // Dropped like any input when the child is not
-                        // reading (or gone).
-                        let _ = self.write(replies);
-                    }
-                }
+                Ok(n) => self.ingest(Bytes::copy_from_slice(&buf[..n])),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 // EIO is how Linux reports "slave side closed".
                 Err(_) => break,
             }
+        }
+    }
+
+    /// One read of the child's output: through the emulator, into the
+    /// recent ring, out to every subscriber; terminal queries it holds
+    /// are answered. Tests feed chunks of a known size here to take the
+    /// kernel's read sizes out of what they prove.
+    pub(crate) fn ingest(&self, chunk: Bytes) {
+        let replies = {
+            let mut shared = self.lock();
+            shared.screen.process(&chunk);
+            let seq = shared.output_bytes;
+            shared.recent.push(seq, RecentItem::Output(chunk.clone()));
+            shared.output_bytes += chunk.len() as u64;
+            // No receivers is not an error: output is retained.
+            let _ = self.events.send(SessionEvent::Output(chunk));
+            shared.screen.take_replies()
+        };
+        if !replies.is_empty() {
+            // Dropped like any input when the child is not reading (or
+            // gone).
+            let _ = self.write(replies);
         }
     }
 

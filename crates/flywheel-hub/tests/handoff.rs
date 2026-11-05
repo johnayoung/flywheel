@@ -501,6 +501,23 @@ async fn handoffs_reach_another_agent_exactly_under_their_provenance() {
         &transcript,
         &claude_line("u1", "assistant", "Run:\n```bash\nmake check\n```"),
     );
+    // The transcript is tailed once a second (no hook report here): the
+    // block is read before the handoff names it, however slow the box.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let listed = hub.get(&format!("/api/sessions/{claude}/commands")).await;
+        if listed["commands"].as_array().is_some_and(|c| {
+            c.iter()
+                .any(|c| c["text"].as_str().map(str::trim_end) == Some("make check"))
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the block was never read: {listed}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let (code, out, err) = run_cli(&[
         "handoff",
         &claude,

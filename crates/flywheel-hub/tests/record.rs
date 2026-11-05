@@ -136,6 +136,38 @@ impl TestHub {
         }
     }
 
+    /// Wait until the newest part of recording `base` holds `needle`
+    /// (written out: the recorder flushes once it has caught up).
+    async fn recorded(&self, base: &str, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let newest = std::fs::read_dir(self.recordings_dir())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter_map(|name| {
+                    let rest = name.strip_prefix(base)?.strip_suffix(".cast")?;
+                    let part = match rest.strip_prefix(".part") {
+                        Some(n) => n.parse::<u32>().ok()?,
+                        None if rest.is_empty() => 1,
+                        None => return None,
+                    };
+                    Some((part, name))
+                })
+                .max();
+            let text = newest
+                .and_then(|(_, name)| {
+                    std::fs::read_to_string(self.recordings_dir().join(name)).ok()
+                })
+                .unwrap_or_default();
+            if text.contains(needle) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "{needle:?} never recorded");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    }
+
     async fn download(&self, name: &str) -> String {
         let response = self
             .http
@@ -358,14 +390,22 @@ async fn recordings_rotate_at_their_cap_keep_the_directory_bounded_and_end_with_
         .await;
     assert_eq!(status, StatusCode::CREATED, "{started}");
     let first = started["recording"]["name"].as_str().unwrap().to_owned();
-    // Plenty of output, in bursts so the recorder keeps up.
-    for round in 0..6 {
+    // Output in bursts, each recorded before the next, until the oldest
+    // part made room: how much a burst records depends on how far the
+    // recorder falls behind (it carries on from the screen), so the
+    // bursts are counted, not assumed.
+    let base = first.trim_end_matches(".cast").to_owned();
+    let mut round = 0;
+    while hub.recordings_dir().join(&first).exists() {
+        assert!(round < 40, "the oldest part was never deleted");
         hub.type_line(
             &sid,
             &format!("seq 1 6000 | sed 's/^/r{round}-/'; echo done-{round}-$((0+1))"),
         )
         .await;
         hub.screen_shows(&sid, &format!("done-{round}-1")).await;
+        hub.recorded(&base, &format!("done-{round}-1")).await;
+        round += 1;
     }
     let listed = hub.get("/api/recordings").await;
     let recordings = listed["recordings"].as_array().unwrap().clone();
@@ -392,10 +432,9 @@ async fn recordings_rotate_at_their_cap_keep_the_directory_bounded_and_end_with_
         "{total}"
     );
     // Every part is a recording of its own, opening on a fresh screen.
-    let base = first.trim_end_matches(".cast");
     for rec in &recordings {
         let name = rec["name"].as_str().unwrap();
-        assert!(name.starts_with(base), "{name}");
+        assert!(name.starts_with(&base), "{name}");
         // Its cap holds, the marker ending it included.
         assert!(
             rec["size"].as_u64().unwrap() <= limits.max_file_bytes,

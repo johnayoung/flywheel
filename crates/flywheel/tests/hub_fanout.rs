@@ -547,14 +547,21 @@ fn fan_out_lands_only_what_was_graded() {
         ],
         &[&check_grader],
     );
+    // Candidates list by rank, which moves as gradings land: each is
+    // checked by its own label.
     let board = env.board(&id);
-    assert!(
-        board["candidates"][0]["session"]
-            .as_str()
-            .unwrap()
-            .starts_with("c1-"),
-        "the label leads the session name: {board}"
-    );
+    let candidates = board["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 4, "{board}");
+    for candidate in candidates {
+        let label = candidate["label"].as_str().unwrap();
+        assert!(
+            candidate["session"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{label}-")),
+            "the label leads the session name: {board}"
+        );
+    }
     let board = env.board_until(&id, "three gradings", |b| {
         ["c1", "c2", "c4"].iter().all(|l| graded(b, l, 1))
     });

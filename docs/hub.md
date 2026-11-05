@@ -4,35 +4,34 @@
 
 ## Security first
 
-- **A hub is a shell over HTTP.** Its token, a login cookie, a peer credential, or a shell in one of its sessions is a shell as you.
-- **Agents and plugins are not sandboxed**: they run as you and can read the state dir. Keep the bind on `127.0.0.1`; reach it from other devices via `tailscale serve` or `--tls auto`, never plain HTTP on an untrusted network. Share links show everything. More: [hub-security](hub/security.md#trust-model).
+**A hub is a shell over HTTP**: its token, a login cookie, a peer credential, or a shell in one of its sessions is a shell as you; agents and plugins are not sandboxed. Keep the bind on `127.0.0.1`; reach it from other devices via `tailscale serve` or `--tls auto`, never plain HTTP on an untrusted network. Share links show everything. More: [hub-security](hub/security.md#trust-model).
 
 ## 60-second quickstart
 
 ```bash
 cargo install --path crates/flywheel  # fw + flywheel on PATH (~/.cargo/bin)
-fw hub doctor  # optional: PATH, claude/codex, hooks, port, tailscale
+fw hub doctor  # optional: checks PATH, agents, hooks, port
 fw hub start  # detached on 127.0.0.1:7420; prints one-time login URLs
 fw hub open  # this machine's browser, signed in
 fw hub import ~/code/*.code-workspace  # VS Code multi-root workspaces -> hub workspaces
 id=$(fw hub new myrepo --create --folder ~/code/myrepo --kind claude --prompt "Fix the failing test")  # or the UI (Alt N)
 fw hub wait "$id" --until done --timeout 900
-fw hub commands "$id" --last --copy  # newest suggested shell block, exact text, OSC 52 copy
+fw hub commands "$id" --last --copy  # newest suggested shell block, exact, to the clipboard
 ```
 
 Phone or another machine: `tailscale serve --bg http://127.0.0.1:7420`, then `fw hub url --qr` and scan; without Tailscale see [hub-security](hub/security.md#https-without-tailscale). After a rebuild: `fw hub upgrade` (live handoff, no session restarts), not stop/start.
 
 ## Feature map
 
-`fw docs <topic>` prints a page; each part below is a section of it.
+`fw docs <topic>` prints a page.
 
 | Page | Covers |
 |---|---|
-| [hub-reference](hub/reference.md) | verbs and flags, `hub.toml`, `notify.toml`, `plugin.toml`, UI settings, keys, environment, state dir |
-| [hub-workflows](hub/workflows.md) | scripting, launcher, suggested commands, cost, worktrees, review (commit / push / PR / rebase / ff-merge), PR + CI, handoff, Claude <-> Codex review, verified fan-out, Flywheel, prompt queue, activity, permissions |
-| [hub-internals](hub/internals.md) | model, terminal emulation, lifecycle and restore, live upgrade, agent status, detection, `fw hub attach`, tabs and splits, web UI, phone, search, recording, push, doctor |
-| [hub-security](hub/security.md) | trust model, auth, remote access (tailscale, built-in TLS), machines and peers, share links |
-| [hub-api](hub/api.md) | REST routes, terminal and events WebSockets, plugin protocol and events |
+| [hub-reference](hub/reference.md) | verbs and flags, config files, UI settings, keys, environment, state dir |
+| [hub-workflows](hub/workflows.md) | scripting, launcher, commands, cost, worktrees, review, PR + CI, handoff, peer review, fan-out, Flywheel, queue, activity, permissions |
+| [hub-internals](hub/internals.md) | model, emulation, restore, live upgrade, status, detection, `attach`, layout, web UI, phone, search, recording, push, doctor |
+| [hub-security](hub/security.md) | trust model, auth, remote access, TLS, machines and peers, share links |
+| [hub-api](hub/api.md) | REST routes, WebSockets, plugin protocol and events |
 
 ## Verbs
 

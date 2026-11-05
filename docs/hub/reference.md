@@ -1,12 +1,12 @@
 # Hub reference
 
-Every `fw hub` verb and flag and the hub's files (`docs_drift.rs` fails the build on drift). Front door: [hub](../hub.md).
+Every `fw hub` verb and flag and the hub's files (`docs_drift.rs` checks). Front door: [hub](../hub.md).
 
 ## Conventions
 
-- `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; ambiguous or none: error; `activity` also takes names its journal or a machine knows).
+- `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; `activity` also takes names its journal or a machine knows).
 - A closed output pipe (`| head -1`) ends a verb quietly, exit 0.
-- Exit codes: 0 ok, 1 failed, 2 bad usage/config, 3 no hub running (every verb that needs one; one wording: `no hub is running for state dir D`), 4 handoff refused as incompatible, 5 hub busy (retry). `doctor`, `tls`, `config` work without a hub (exit 0) and say so in that wording.
+- Exit codes: 0 ok, 1 failed, 2 bad usage/config, 3 no hub running (`no hub is running for state dir D`), 4 handoff refused as incompatible, 5 hub busy (retry). `doctor`, `tls`, `config` work without a hub (exit 0) and say so.
 - Every verb but `report` takes `--state-dir DIR` (default `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub`).
 - `{remote}` = `[--url URL] [--token T] [--fingerprint SHA256]`: a hub elsewhere; prefer `FW_HUB_TOKEN` (argv is world-readable).
 - `{machine}` = `[--machine NAME]`: a machine registered on that hub, via its proxy; `{where}` = `{remote} {machine}`.
@@ -159,7 +159,7 @@ The rest: [hub-workflows](workflows.md), [hub-internals](internals.md).
 
 ## Serve flags
 
-Taken by `serve`, `start`, `install-service`. All but `--notify-url` are `hub.toml` keys (defaults [below](#hubtoml)); a flag wins.
+Taken by `serve`, `start`, `install-service`; each sets the [hub.toml](#hubtoml) key of its row there (a flag wins), but `--notify-url`: the ntfy push URL over `notify.toml` `url` (shows in `ps`: prefer the file).
 
 | Flag | |
 |---|---|
@@ -168,18 +168,18 @@ Taken by `serve`, `start`, `install-service`. All but `--notify-url` are `hub.to
 | `--public-url` | origin browsers reach the hub at via a proxy; repeatable |
 | `--allow-origin` | extra accepted origin; repeatable |
 | `--trusted-proxy` | a proxy elsewhere whose `X-Forwarded-*` are believed (loopback always); repeatable |
-| `--tls` | `auto` (local name-constrained CA), `off`, or `CERT,KEY` (your PEM files) |
+| `--tls` | `auto` (local name-constrained CA), `off`, or `CERT,KEY` (PEM files) |
 | `--tls-name` | extra private name, IP, or network (at most /8) for the local CA; repeatable |
-| `--tls-allow-public-name` | opt in to a public `--tls-name` you own; repeatable; warned |
+| `--tls-allow-public-name` | a public `--tls-name` you own; repeatable; warned |
 | `--scrollback-lines` | per session, max 1M cells (~14 MiB at 5000 x 120) |
 | `--no-restore` | drop pending restores for good |
 | `--no-agent-resume` | restore agents as fresh shells |
 | `--no-flywheel` | no Flywheel panel, Promote, or task fan-out |
 | `--import-root` | where UI import looks (3 levels) |
-| `--notify-url` | ntfy push URL; overrides `notify.toml` `url` (shows in `ps`) |
-| `--worktree-branch-prefix` | worktree branches are `<prefix><task>` |
+| `--notify-url` | above |
+| `--worktree-branch-prefix` | branches are `<prefix><task>` |
 | `--record-part-cap` | a part past it rotates (`64KiB`-`4GiB`) |
-| `--record-dir-cap` | recordings cap, oldest finished go first (part cap..`1TiB`) |
+| `--record-dir-cap` | oldest finished go first (part cap..`1TiB`) |
 | `--share-default-expiry` | a link naming none |
 | `--share-max-expiry` | longest accepted (`60s`-`30d`) |
 
@@ -307,15 +307,13 @@ command = ["./summarize.py"]  # optional: else the top-level one
 
 `Alt ,` or the sidebar gear; stored by the hub (`settings.json`), any can be kept for **this device** only.
 
-- **Appearance**: theme, terminal font, text size (13, phones 11), density. **Terminal**: client scrollback, cursor style / blink, ligatures (off), lite mode (auto; per device).
-- **Keyboard**: pane prefix, key bar, companion key mode, tour, every shortcut. **Notifications**: system (device), command toasts. **Agents**: new-session defaults per kind.
-- **Plugins**: enable, events, actions, last run / error, logs. **Server** (read-only): effective hub.toml, sources, errors, pending restart.
+Sections: **Appearance** (theme, font, text size, density), **Terminal** (client scrollback, cursor, ligatures, lite mode), **Keyboard** (pane prefix, key bar, companion key mode, tour, shortcuts), **Notifications**, **Agents** (new-session defaults), **Plugins** (enable, last run, logs), **Server** (effective hub.toml, read-only).
 
 **Key bindings**: up to 4 per action, `mod+...+key`. Refused (422): keys the browser/OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: `alt+b/f`, `ctrl+<letter>`.
 
 ## Keyboard shortcuts
 
-Defaults, all rebindable in Settings > Keyboard. `mod` = Ctrl (Cmd on macOS); `alt` = Alt (Ctrl Option on macOS); `prefix.*` keys follow `prefix.arm` when the pane prefix is on (twice sends `^B`); `palette.open` pressed inside the palette goes to the terminal.
+Defaults, all rebindable (Settings > Keyboard). `mod` = Ctrl (Cmd on macOS); `alt` = Alt (Ctrl Option on macOS); `prefix.*` keys follow `prefix.arm` when the pane prefix is on (twice sends `^B`).
 
 | Action | Default | Does |
 |---|---|---|
@@ -396,17 +394,7 @@ Also: `F2` / double-click renames and `Delete` closes a focused sidebar row.
 
 All files 0600, the dir 0700.
 
-| Path | |
-|---|---|
-| `token` | access token |
-| `logins.json` | login-cookie digests |
-| `state.json` | workspaces, sessions, layouts, templates, fan-outs, queues (schema 5) |
-| `settings.json` | UI settings |
-| `hub.toml`, `notify.toml` | above |
-| `server.json`, `serve.lock`, `report.sock`, `handoff.sock` | running hub's address, lock, sockets |
-| `hub.log`, `hub.log.1..3` | detached hub log |
-| `machines.json`, `peers.json`, `shares.json` | machines (plaintext credentials), peer and share digests |
-| `commands/<id>.json`, `usage-archive.json` | suggested blocks + usage; removed sessions' usage |
-| `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` | as named; `tls/`: local CA |
-| `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` | activity journal; each client's last-active time |
-| `open-<id>.html` | `open` redirect pages |
+- `token`; `logins.json` (login-cookie digests); `state.json` (workspaces, sessions, layouts, templates, fan-outs, queues; schema 5); `settings.json`; `hub.toml`, `notify.toml`.
+- `server.json`, `serve.lock`, `report.sock`, `handoff.sock` (the running hub's address, lock, sockets); `hub.log[.1..3]`.
+- `machines.json` (plaintext credentials), `peers.json`, `shares.json` (digests); `commands/<id>.json` (suggested blocks + usage), `usage-archive.json` (removed sessions').
+- `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` (local CA); `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` (clients' last-active times); `open-<id>.html` (`open` redirect pages).

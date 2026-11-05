@@ -1587,8 +1587,77 @@ mod tests {
         assert!(serde_json::to_string(cut).unwrap().len() <= 602);
     }
 
+    /// The parts of the one recording in `recordings`, in part order (by
+    /// file name: a part just created has no header on disk yet).
+    fn parts_of(recordings: &Recordings) -> Vec<RecordingInfo> {
+        let number = |name: &str| {
+            name.strip_suffix(".cast")
+                .and_then(|stem| stem.rsplit_once(".part"))
+                .and_then(|(_, n)| n.parse::<u32>().ok())
+                .unwrap_or(1)
+        };
+        let mut parts = recordings.list().unwrap();
+        parts.sort_by_key(|p| number(&p.name));
+        parts
+    }
+
+    /// Whether part `info` holds its header and opening snapshot.
+    fn opened(recordings: &Recordings, info: &RecordingInfo) -> bool {
+        fs::read_to_string(recordings.path_of(&info.name).unwrap())
+            .ok()
+            .and_then(|text| parse_cast(&text).ok())
+            .is_some_and(|cast| !cast.events.is_empty())
+    }
+
+    /// What feeding one chunk of output does to the recording.
+    enum Fed {
+        /// Written as an event of the current part.
+        Appended,
+        /// The current part ended; the next one opened.
+        Rotated,
+    }
+
+    /// Feed `chunk` to `session` as one read of its PTY, and wait for the
+    /// recorder to have handled it as `expect`ed -- one chunk at a time, so
+    /// the recorder never falls behind and no chunk is folded into a
+    /// rotation's snapshot by how threads happen to be scheduled.
+    fn feed(recordings: &Recordings, session: &PtySession, chunk: &[u8], expect: &Fed) {
+        let before = parts_of(recordings);
+        let current = before.last().unwrap().clone();
+        assert!(opened(recordings, &current), "{before:?}");
+        session.ingest(axum::body::Bytes::copy_from_slice(chunk));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let now = parts_of(recordings);
+            let done = match expect {
+                // Once the next part is open the recorder has subscribed
+                // again: what comes next is an event of it.
+                Fed::Rotated => {
+                    now.len() == before.len() + 1 && opened(recordings, now.last().unwrap())
+                }
+                Fed::Appended => {
+                    now.len() == before.len()
+                        && fs::metadata(recordings.path_of(&current.name).unwrap())
+                            .unwrap()
+                            .len()
+                            > current.size
+                }
+            };
+            if done {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "chunk of {} bytes never handled: {now:?}",
+                chunk.len()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Every part holds its cap, even when one PTY read escapes to more
-    /// than a whole part (control bytes take six bytes each in JSON).
+    /// than a whole part (control bytes take six bytes each in JSON). The
+    /// output is fed in chunks of known sizes, so the parts are exact.
     #[test]
     fn output_bigger_than_a_part_is_cut_to_fit() {
         let dir = tempfile::tempdir().unwrap();
@@ -1597,20 +1666,21 @@ mod tests {
             max_total_bytes: 1 << 30,
         };
         let recordings = Arc::new(Recordings::new(dir.path(), limits));
+        // A silent child: everything recorded is what the test feeds.
         let session = PtySession::spawn(
             crate::pty::SpawnSpec {
                 argv: vec![
                     "/bin/sh".into(),
                     "-c".into(),
-                    "read go; head -c 300000 /dev/zero | tr '\\0' '\\001'; echo; echo all-out"
-                        .into(),
+                    "stty -echo; read go; exit 7".into(),
                 ],
                 cwd: std::env::temp_dir(),
                 env: Vec::new(),
                 env_remove: Vec::new(),
-                cols: 80,
-                rows: 24,
-                scrollback_lines: 100,
+                cols: 20,
+                rows: 5,
+                // No history: a snapshot is the 100 cells of the screen.
+                scrollback_lines: 0,
             },
             |_| {},
         )
@@ -1623,18 +1693,106 @@ mod tests {
         recordings
             .start("s", "big", "big", &session, notice)
             .unwrap();
+        // Printable chunks: two fit a part (a small screen keeps its
+        // snapshot short), the third opens the next part and shows in
+        // its snapshot.
+        let letter = |c: char| c.to_string().repeat(3000).into_bytes();
+        for (c, expect) in [
+            ('a', Fed::Appended),
+            ('b', Fed::Appended),
+            ('c', Fed::Rotated),
+            ('d', Fed::Appended),
+            ('e', Fed::Appended),
+            ('f', Fed::Rotated),
+            ('g', Fed::Appended),
+            ('h', Fed::Appended),
+        ] {
+            feed(&recordings, &session, &letter(c), &expect);
+        }
+        // Control bytes: 12000 bytes escaped, more than a whole part. On
+        // a part with events it opens the next; on a fresh part what fits
+        // is written and the next part opens.
+        let control = vec![1u8; 2000];
+        for _ in 0..3 {
+            feed(&recordings, &session, &control, &Fed::Rotated);
+        }
         session.write(b"go\r".to_vec());
         assert!(session.wait_exit(Duration::from_secs(20)));
         ended
             .recv_timeout(Duration::from_secs(20))
             .expect("the recording ends with the process");
-        let parts = recordings.list().unwrap();
-        assert!(parts.len() > 3, "rotated: {}", parts.len());
-        for part in &parts {
-            assert!(part.size <= limits.max_file_bytes, "{part:?}");
-            let text = fs::read_to_string(recordings.path_of(&part.name).unwrap()).unwrap();
-            assert!(parse_cast(&text).is_ok(), "{}", part.name);
+
+        let parts = parts_of(&recordings);
+        let numbers: Vec<u32> = parts.iter().map(|p| p.part).collect();
+        assert_eq!(numbers, vec![1, 2, 3, 4, 5, 6], "{parts:?}");
+        let base = base_of(&parts[0].name).to_owned();
+        let casts: Vec<Cast> = parts
+            .iter()
+            .map(|part| {
+                assert_eq!(base_of(&part.name), base, "{part:?}");
+                assert!(part.size <= limits.max_file_bytes, "{part:?}");
+                let text = fs::read_to_string(recordings.path_of(&part.name).unwrap()).unwrap();
+                assert_eq!(text.len() as u64, part.size);
+                let cast = parse_cast(&text).unwrap();
+                assert!(
+                    cast.events.windows(2).all(|w| w[0].0 <= w[1].0),
+                    "{}: times go back",
+                    part.name
+                );
+                let opening = &cast.events[0];
+                assert_eq!((opening.0, opening.1.as_str()), (0.0, "o"), "{}", part.name);
+                cast
+            })
+            .collect();
+        // Each part but the last ends saying where it continues; the last
+        // with the exit.
+        for (n, cast) in casts.iter().enumerate() {
+            let last = cast.events.last().unwrap();
+            let label = match parts.get(n + 1) {
+                Some(next) => format!("continued in {}", next.name),
+                None => "exit: 7".to_owned(),
+            };
+            assert_eq!((last.1.as_str(), last.2.as_str()), ("m", label.as_str()));
         }
+        // What each part's events say, after its opening snapshot.
+        let fed: Vec<String> = casts
+            .iter()
+            .map(|cast| {
+                cast.events[1..]
+                    .iter()
+                    .filter(|e| e.1 == "o")
+                    .map(|e| e.2.as_str())
+                    .collect()
+            })
+            .collect();
+        let text = |c: char| c.to_string().repeat(3000);
+        // Byte-exact: every chunk that fit, in order; a chunk that opened
+        // a part is on its snapshot's screen instead.
+        assert_eq!(fed[0], text('a') + &text('b'));
+        assert_eq!(fed[1], text('d') + &text('e'));
+        assert_eq!(fed[2], text('g') + &text('h'));
+        assert!(casts[1].events[0].2.contains(&"c".repeat(20)));
+        assert!(casts[2].events[0].2.contains(&"f".repeat(20)));
+        // The first oversized chunk met a part with events: it opened the
+        // next part, which it fills (on the screen, control bytes leave
+        // nothing). The next two met fresh parts: cut to what fits.
+        assert_eq!(fed[3].len(), fed[4].len());
+        for cut in &fed[3..5] {
+            assert!(
+                !cut.is_empty() && cut.len() < control.len(),
+                "{}",
+                cut.len()
+            );
+            assert!(cut.bytes().all(|b| b == 1));
+        }
+        for part in &parts[3..5] {
+            // Filled to the cap, less the room kept for its end marker.
+            assert!(
+                part.size + 1 + EVENT_OVERHEAD + END_RESERVE + 64 >= limits.max_file_bytes,
+                "{part:?}"
+            );
+        }
+        assert!(fed[5].is_empty(), "{:?}", fed[5]);
     }
 
     #[test]

@@ -514,6 +514,10 @@ pub struct LifecycleFilter {
     /// id is a member (an empty set matches nothing). Lets a caller classify
     /// many tasks with one read instead of one read per task.
     pub task_ids: Option<Vec<String>>,
+    /// `None` returns every matching row; `Some(n)` keeps only the first `n`
+    /// rows of the `(updated_at DESC, run_id DESC)` order, applied by the
+    /// backend so a "newest N runs" read never folds the whole table.
+    pub limit: Option<usize>,
 }
 
 impl LifecycleFilter {
@@ -539,8 +543,15 @@ impl LifecycleFilter {
         self
     }
 
-    /// Whether a lifecycle satisfies both filters; backends that scan rather
-    /// than query apply exactly this.
+    #[must_use]
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Whether a lifecycle satisfies the row predicates (status and task
+    /// filters); backends that scan rather than query apply exactly this,
+    /// then sort and apply [`limit`](Self::limit).
     pub fn matches(&self, lifecycle: &Lifecycle) -> bool {
         if let Some(statuses) = &self.statuses
             && !statuses.contains(&lifecycle.status)
@@ -610,6 +621,8 @@ pub trait LifecycleStore {
     /// field): the most-recently-written row first, ties broken by greater
     /// `run_id`. The order is deterministic (identical calls return an
     /// identical `run_id` sequence) and identical across every backend.
+    /// [`LifecycleFilter::limit`] truncates this order to its first `n`
+    /// rows.
     fn list_lifecycles(&self, filter: &LifecycleFilter) -> Result<Vec<Lifecycle>, StoreError>;
 
     /// Sum token and cost spend across every attempt of every run.
@@ -1068,6 +1081,9 @@ mod tests {
                 .cloned()
                 .collect();
             out.sort_by(|a, b| b.run_id.cmp(&a.run_id));
+            if let Some(limit) = filter.limit {
+                out.truncate(limit);
+            }
             Ok(out)
         }
         fn summarize_spend(&self, window: &SpendWindow) -> Result<SpendSummary, StoreError> {

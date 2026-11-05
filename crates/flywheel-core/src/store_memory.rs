@@ -415,6 +415,9 @@ impl LifecycleStore for InMemoryStore {
         // (updated_at DESC, run_id DESC): newest write first, ties (none
         // under a strictly monotonic write seq) broken by greater run_id.
         matched.sort_by(|a, b| b.cmp(a));
+        if let Some(limit) = filter.limit {
+            matched.truncate(limit);
+        }
         Ok(matched
             .into_iter()
             .filter_map(|(_, run_id)| inner.load_lifecycle(run_id))

@@ -731,15 +731,12 @@ fn recent_run(core: &dyn HarnessStore, lc: &Lifecycle) -> Result<RecentRun, Stri
 }
 
 fn recent_runs(core: &dyn HarnessStore) -> Result<Vec<RecentRun>, String> {
-    // Newest first: the store orders by (updated_at DESC, run_id DESC).
+    // Newest first: the store orders by (updated_at DESC, run_id DESC) and
+    // applies the limit itself, so only the shown runs are folded.
     let lifecycles = core
-        .list_lifecycles(&LifecycleFilter::default())
+        .list_lifecycles(&LifecycleFilter::default().with_limit(RECENT_RUNS))
         .map_err(|e| format!("reading runs: {e}"))?;
-    lifecycles
-        .iter()
-        .take(RECENT_RUNS)
-        .map(|lc| recent_run(core, lc))
-        .collect()
+    lifecycles.iter().map(|lc| recent_run(core, lc)).collect()
 }
 
 fn claims_and_worker(

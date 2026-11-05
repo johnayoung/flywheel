@@ -76,10 +76,12 @@ fn resolve_awaiting_instruction<S: TaskStore + ?Sized>(
 }
 
 /// Snapshot every in-flight run (RUNNING / VALIDATING / AWAITING_APPROVAL)
-/// from relational rows only, sorted by task id (ties by run id).
+/// from relational rows only, sorted by task id (ties by run id). Each
+/// listed lifecycle already carries its attempts in number order, so the
+/// frame is one store read, not one per run.
 pub fn collect_live_rows<S>(store: &S) -> Result<Vec<LiveRunRow>, StoreError>
 where
-    S: LifecycleStore + AttemptStore + TaskStore + ?Sized,
+    S: LifecycleStore + TaskStore + ?Sized,
 {
     let filter = LifecycleFilter::default().with_statuses([
         Status::Running,
@@ -90,12 +92,12 @@ where
     lifecycles.sort_by(|a, b| (&a.task_id, &a.run_id).cmp(&(&b.task_id, &b.run_id)));
     let mut rows = Vec::with_capacity(lifecycles.len());
     for lc in lifecycles {
-        let attempts = store.list_attempts(&lc.run_id)?;
+        let attempts = &lc.attempts;
         let mut tokens = 0u64;
         let mut cost = 0.0f64;
         let mut turns = 0u64;
         let mut iters_completed = 0u64;
-        for a in &attempts {
+        for a in attempts {
             tokens += a.total_tokens();
             cost += a.total_cost_usd;
             turns += a.turns;

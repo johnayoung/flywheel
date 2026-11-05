@@ -69,6 +69,19 @@ use crate::task::{GraderType, Task};
 /// The canonical DDL, embedded verbatim from its single source of truth.
 pub const SCHEMA_SQL: &str = include_str!("../schema/persistence-schema.sql");
 
+/// Indexes for the store's own access patterns that the canonical DDL does
+/// not declare: `list_lifecycles` filters on `task_id` (one task or a task
+/// set) and `status`, and every listing orders by `(updated_at DESC, run_id
+/// DESC)`; without these each read scans `lifecycles`. Applied
+/// post-bootstrap like the triggers below, so the canonical schema file is
+/// unchanged and an existing database gains them on its next open. Mirrors
+/// the Postgres store's `SUPPLEMENTARY_INDEXES`.
+const SUPPLEMENTARY_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS idx_lifecycles_task_id ON lifecycles(task_id);
+CREATE INDEX IF NOT EXISTS idx_lifecycles_updated_at ON lifecycles(updated_at DESC, run_id DESC);
+CREATE INDEX IF NOT EXISTS idx_lifecycles_status ON lifecycles(status);
+";
+
 /// Append-only enforcement on `grader_results`. Applied post-bootstrap so
 /// the canonical schema file is unchanged; `IF NOT EXISTS` makes the
 /// triggers idempotent across reopens of the same file.
@@ -162,6 +175,9 @@ impl SqliteStoreOptions {
 /// Each instance owns one connection in autocommit mode (each statement is
 /// its own transaction unless a verb opens an explicit `BEGIN IMMEDIATE`).
 /// WAL mode gives concurrent readers visibility while a writer is active.
+/// Per-connection prepared-statement cache size (see `from_connection`).
+const STATEMENT_CACHE_CAPACITY: usize = 64;
+
 pub struct SqliteStore {
     conn: Mutex<Connection>,
     notifier: Arc<RunNotifier>,
@@ -205,6 +221,11 @@ impl SqliteStore {
             .notifier
             .clone()
             .unwrap_or_else(|| Arc::new(RunNotifier::new()));
+        // Hot reads and writes go through `prepare_cached`; size the
+        // per-connection statement cache so the distinct shapes (the
+        // filter-dependent `list_lifecycles` pair included) stay resident
+        // instead of evicting each other at rusqlite's default of 16.
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         let store = Self {
             conn: Mutex::new(conn),
             notifier,
@@ -293,6 +314,7 @@ fn bootstrap(conn: &mut Connection, busy_timeout: Duration) -> Result<(), StoreE
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(db)?;
     conn.execute_batch(APPEND_ONLY_TRIGGERS).map_err(db)?;
+    conn.execute_batch(SUPPLEMENTARY_INDEXES).map_err(db)?;
     // Version pin: the schema_version table has CHECK (id = 1) so there is
     // at most one row. The one supported forward migration (v11 -> v12: add
     // the nullable lifecycles.source column) is applied in place first; it
@@ -568,22 +590,18 @@ fn update_lifecycle_row(
 }
 
 fn stored_version(conn: &Connection, run_id: &str) -> Result<Option<u64>, StoreError> {
-    conn.query_row(
-        "SELECT version FROM lifecycles WHERE run_id = ?1",
-        params![run_id],
-        |row| row.get(0),
-    )
-    .optional()
-    .map_err(db)
+    conn.prepare_cached("SELECT version FROM lifecycles WHERE run_id = ?1")
+        .and_then(|mut stmt| stmt.query_row(params![run_id], |row| row.get(0)))
+        .optional()
+        .map_err(db)
 }
 
 fn load_lifecycle_row(conn: &Connection, run_id: &str) -> Result<Option<Lifecycle>, StoreError> {
     let raw = conn
-        .query_row(
-            &format!("SELECT {LIFECYCLE_COLUMNS} FROM lifecycles WHERE run_id = ?1"),
-            params![run_id],
-            RawLifecycle::read,
-        )
+        .prepare_cached(&format!(
+            "SELECT {LIFECYCLE_COLUMNS} FROM lifecycles WHERE run_id = ?1"
+        ))
+        .and_then(|mut stmt| stmt.query_row(params![run_id], RawLifecycle::read))
         .optional()
         .map_err(db)?;
     let Some(raw) = raw else {
@@ -635,6 +653,16 @@ fn filter_clause(filter: &LifecycleFilter) -> Option<(String, Vec<Box<dyn ToSql>
     Some((where_clause, params))
 }
 
+/// The `LIMIT` suffix for a [`LifecycleFilter::limit`]; empty when unbounded.
+/// The bound is inlined (it is a `usize`, never caller text) so each limit
+/// shape is one cached statement; a bound past `i64::MAX` is unbounded.
+fn limit_clause(limit: Option<usize>) -> String {
+    match limit.and_then(|n| i64::try_from(n).ok()) {
+        Some(n) => format!("LIMIT {n}"),
+        None => String::new(),
+    }
+}
+
 fn list_lifecycle_rows(
     conn: &Connection,
     filter: &LifecycleFilter,
@@ -643,14 +671,16 @@ fn list_lifecycle_rows(
         return Ok(Vec::new());
     };
     let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let limit_clause = limit_clause(filter.limit);
     // Two queries regardless of row count: the ordered lifecycle rows, then
-    // every attempt of a matched run in one pass (joined on the same
-    // filter), grouped in memory. No per-row follow-up reads.
+    // every attempt of a selected run in one pass (joined on the same
+    // filtered, ordered, limited run set), grouped in memory. No per-row
+    // follow-up reads.
     let mut lifecycles: Vec<Lifecycle> = {
         let mut stmt = conn
-            .prepare(&format!(
+            .prepare_cached(&format!(
                 "SELECT {LIFECYCLE_COLUMNS} FROM lifecycles l {where_clause} \
-                 ORDER BY l.updated_at DESC, l.run_id DESC"
+                 ORDER BY l.updated_at DESC, l.run_id DESC {limit_clause}"
             ))
             .map_err(db)?;
         let raws = stmt
@@ -665,9 +695,11 @@ fn list_lifecycle_rows(
     let mut attempts_by_run: HashMap<String, Vec<Attempt>> = HashMap::new();
     {
         let mut stmt = conn
-            .prepare(&format!(
+            .prepare_cached(&format!(
                 "SELECT a.run_id, {ATTEMPT_COLUMNS} FROM attempts a \
-                 JOIN lifecycles l ON l.run_id = a.run_id {where_clause} \
+                 JOIN (SELECT l.run_id FROM lifecycles l {where_clause} \
+                       ORDER BY l.updated_at DESC, l.run_id DESC {limit_clause}) sel \
+                 ON sel.run_id = a.run_id \
                  ORDER BY a.run_id, a.number"
             ))
             .map_err(db)?;
@@ -726,7 +758,7 @@ fn summarize_spend_rows(
     // activity instant are excluded from every bounded window by contract
     // and are filtered out in SQL.
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT input_tokens, output_tokens, cache_creation_input_tokens,
                     cache_read_input_tokens, total_cost_usd, last_activity_at
              FROM attempts WHERE last_activity_at IS NOT NULL",
@@ -897,7 +929,7 @@ fn upsert_attempt(conn: &Connection, run_id: &str, attempt: &Attempt) -> Result<
 
 fn list_attempt_rows(conn: &Connection, run_id: &str) -> Result<Vec<Attempt>, StoreError> {
     let mut stmt = conn
-        .prepare(&format!(
+        .prepare_cached(&format!(
             "SELECT {ATTEMPT_COLUMNS} FROM attempts a WHERE a.run_id = ?1 ORDER BY a.number"
         ))
         .map_err(db)?;
@@ -914,11 +946,10 @@ fn load_attempt_row(
     run_id: &str,
     number: u32,
 ) -> Result<Option<Attempt>, StoreError> {
-    conn.query_row(
-        &format!("SELECT {ATTEMPT_COLUMNS} FROM attempts a WHERE a.run_id = ?1 AND a.number = ?2"),
-        params![run_id, number],
-        RawAttempt::read,
-    )
+    conn.prepare_cached(&format!(
+        "SELECT {ATTEMPT_COLUMNS} FROM attempts a WHERE a.run_id = ?1 AND a.number = ?2"
+    ))
+    .and_then(|mut stmt| stmt.query_row(params![run_id, number], RawAttempt::read))
     .optional()
     .map_err(db)?
     .map(RawAttempt::decode)
@@ -932,29 +963,28 @@ fn load_attempt_row(
 /// stays strictly monotonic; the `UNIQUE (run_id, sequence)` constraint
 /// backstops any writer that bypasses it.
 fn next_domain_sequence(conn: &Connection, run_id: &str) -> Result<u64, StoreError> {
-    conn.query_row(
-        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE run_id = ?1",
-        params![run_id],
-        |row| row.get(0),
-    )
-    .map_err(db)
+    conn.prepare_cached("SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE run_id = ?1")
+        .and_then(|mut stmt| stmt.query_row(params![run_id], |row| row.get(0)))
+        .map_err(db)
 }
 
 fn insert_domain_event(conn: &Connection, event: &DomainEvent) -> Result<u64, StoreError> {
     let sequence = next_domain_sequence(conn, &event.run_id)?;
     let row = event_to_row(event)?;
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO events (run_id, attempt_number, ts, kind, payload_json, sequence)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
+    )
+    .and_then(|mut stmt| {
+        stmt.execute(params![
             row.run_id,
             row.attempt_number,
             row.ts,
             row.kind,
             row.payload_json,
             sequence
-        ],
-    )
+        ])
+    })
     .map_err(db)?;
     Ok(sequence)
 }
@@ -1117,7 +1147,7 @@ fn list_grader_result_rows(
     attempt_number: u32,
 ) -> Result<Vec<GraderResultRecord>, StoreError> {
     let mut stmt = conn
-        .prepare(
+        .prepare_cached(
             "SELECT id, run_id, attempt_number, ordinal, grader_type, grader_name,
                     grader_spec_json, passed, duration_ms, payload_json, ts
              FROM grader_results WHERE run_id = ?1 AND attempt_number = ?2
@@ -1475,7 +1505,7 @@ impl ControlCommandStore for SqliteStore {
                 .map_err(db)?;
             let raws = {
                 let mut stmt = tx
-                    .prepare(
+                    .prepare_cached(
                         "UPDATE control_commands SET claimed_at = ?1
                          WHERE run_id = ?2 AND claimed_at IS NULL
                          RETURNING id, run_id, kind, payload_json, enqueued_at, claimed_at",
@@ -1512,7 +1542,7 @@ impl ControlCommandStore for SqliteStore {
     fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
         self.with_retry(|conn| {
             let mut stmt = conn
-                .prepare(
+                .prepare_cached(
                     "SELECT id, run_id, kind, payload_json, enqueued_at, claimed_at
                      FROM control_commands WHERE run_id = ?1 AND claimed_at IS NULL
                      ORDER BY id",
@@ -1609,6 +1639,64 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect()
+        );
+    }
+
+    fn lifecycle_indexes(store: &SqliteStore) -> BTreeSet<String> {
+        store.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' \
+                     AND tbl_name = 'lifecycles' AND name LIKE 'idx_%'",
+                )
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn bootstrap_adds_lifecycle_indexes_to_an_existing_database() {
+        let expected: BTreeSet<String> = [
+            "idx_lifecycles_status",
+            "idx_lifecycles_task_id",
+            "idx_lifecycles_updated_at",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexes.db");
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(lifecycle_indexes(&store), expected);
+        // A database bootstrapped before the indexes existed.
+        store.with_connection(|conn| {
+            conn.execute_batch(
+                "DROP INDEX idx_lifecycles_status; \
+                 DROP INDEX idx_lifecycles_task_id; \
+                 DROP INDEX idx_lifecycles_updated_at;",
+            )
+            .unwrap();
+        });
+        assert!(lifecycle_indexes(&store).is_empty());
+        store.close().unwrap();
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(lifecycle_indexes(&reopened), expected);
+        let plan: Vec<String> = reopened.with_connection(|conn| {
+            let mut stmt = conn
+                .prepare("EXPLAIN QUERY PLAN SELECT run_id FROM lifecycles WHERE task_id = 't'")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        });
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("idx_lifecycles_task_id")),
+            "{plan:?}"
         );
     }
 

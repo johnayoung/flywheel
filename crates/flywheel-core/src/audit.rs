@@ -1680,6 +1680,9 @@ mod tests {
                 .cloned()
                 .collect();
             out.sort_by(|a, b| b.run_id.cmp(&a.run_id));
+            if let Some(limit) = filter.limit {
+                out.truncate(limit);
+            }
             Ok(out)
         }
         fn summarize_spend(&self, window: &SpendWindow) -> Result<SpendSummary, StoreError> {

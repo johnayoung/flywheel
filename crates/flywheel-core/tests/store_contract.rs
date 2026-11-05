@@ -1494,6 +1494,85 @@ fn append_whose_projection_fails_writes_nothing(store: &dyn HarnessStore) {
     assert_eq!(store.list_grader_results("r1", 1).unwrap().len(), 1);
 }
 
+fn list_lifecycles_limit_keeps_the_newest_rows_with_their_attempts(store: &dyn HarnessStore) {
+    // Distinct write instants: the durable store orders on a wall-clock
+    // updated_at with microsecond resolution.
+    let pause = || std::thread::sleep(Duration::from_millis(2));
+    for (run_id, task_id) in [("r1", "t1"), ("r2", "t2"), ("r3", "t1"), ("r4", "t2")] {
+        let mut lc = lifecycle(task_id, run_id);
+        if run_id != "r2" {
+            lc.transition_to(Status::Ready, "", Some(t(0))).unwrap();
+        }
+        store.create_lifecycle(&lc).unwrap();
+        pause();
+    }
+    for n in [2, 1] {
+        store
+            .save_attempt("r3", &Attempt::new(n, t(i64::from(n)), "r3"), None)
+            .unwrap();
+    }
+    store
+        .save_attempt("r1", &Attempt::new(1, t(0), "r1"), None)
+        .unwrap();
+    let run_ids = |filter: &LifecycleFilter| -> Vec<String> {
+        store
+            .list_lifecycles(filter)
+            .unwrap()
+            .into_iter()
+            .map(|lc| lc.run_id)
+            .collect()
+    };
+    let all = run_ids(&LifecycleFilter::default());
+    assert_eq!(all.len(), 4);
+    // The limit truncates the canonical order; it never reorders or drops a
+    // newer row in favor of an older one.
+    for n in 0..=5 {
+        let expected: Vec<String> = all.iter().take(n).cloned().collect();
+        assert_eq!(
+            run_ids(&LifecycleFilter::default().with_limit(n)),
+            expected,
+            "limit {n}"
+        );
+    }
+    // The limit applies after every row filter.
+    let ready = run_ids(&LifecycleFilter::default().with_statuses([Status::Ready]));
+    assert_eq!(ready.len(), 3);
+    assert_eq!(
+        run_ids(
+            &LifecycleFilter::default()
+                .with_statuses([Status::Ready])
+                .with_limit(2)
+        ),
+        ready[..2].to_vec()
+    );
+    assert_eq!(
+        run_ids(&LifecycleFilter::default().with_task_id("t1").with_limit(1)),
+        run_ids(&LifecycleFilter::default().with_task_id("t1"))[..1].to_vec()
+    );
+    assert_eq!(
+        run_ids(
+            &LifecycleFilter::default()
+                .with_task_ids(["t2"])
+                .with_limit(1)
+        ),
+        run_ids(&LifecycleFilter::default().with_task_ids(["t2"]))[..1].to_vec()
+    );
+    // Limited rows are the same fully folded lifecycles, attempts attached.
+    let limited = store
+        .list_lifecycles(&LifecycleFilter::default().with_limit(3))
+        .unwrap();
+    let unlimited = store.list_lifecycles(&LifecycleFilter::default()).unwrap();
+    assert_eq!(limited, unlimited[..3].to_vec());
+    for lc in &limited {
+        assert_eq!(lc, &store.load_lifecycle(&lc.run_id).unwrap().unwrap());
+    }
+    let r3 = unlimited.iter().find(|lc| lc.run_id == "r3").unwrap();
+    assert_eq!(
+        r3.attempts.iter().map(|a| a.number).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
 fn list_lifecycles_attaches_every_attempt_in_number_order(store: &dyn HarnessStore) {
     ensure_lifecycle(store, "r1", "t");
     ensure_lifecycle(store, "r2", "t");
@@ -1778,6 +1857,10 @@ const CASES: &[(&str, Case)] = &[
     (
         "list_lifecycles_attaches_every_attempt_in_number_order",
         list_lifecycles_attaches_every_attempt_in_number_order,
+    ),
+    (
+        "list_lifecycles_limit_keeps_the_newest_rows_with_their_attempts",
+        list_lifecycles_limit_keeps_the_newest_rows_with_their_attempts,
     ),
     (
         "save_attempt_upsert_replaces_agent_context",

@@ -1551,17 +1551,25 @@ pub const TERMINAL_STATUSES: [Status; 2] = [Status::Done, Status::Failed];
 /// `DONE`/`FAILED` tasks decouples "is the queue full?" from "is the phase
 /// fully archived?".
 ///
-/// Resilient by construction: one store read lists every terminal
-/// lifecycle; if it fails every task counts as actionable (conservative --
-/// never under-reports depth) so a transient store hiccup can never crash a
-/// daemon cycle or spuriously over-emit.
+/// Resilient by construction: one store read lists the terminal lifecycles
+/// of the active tasks only (never the whole run history); if it fails
+/// every task counts as actionable (conservative -- never under-reports
+/// depth) so a transient store hiccup can never crash a daemon cycle or
+/// spuriously over-emit.
 pub fn actionable_queue_depth(
     tasks_dir: &Path,
     store: &dyn LifecycleStore,
 ) -> Result<usize, WorkSourceError> {
     let active = load_active_tasks(tasks_dir)?;
+    if active.is_empty() {
+        return Ok(0);
+    }
     let terminal: BTreeSet<String> = store
-        .list_lifecycles(&LifecycleFilter::default().with_statuses(TERMINAL_STATUSES))
+        .list_lifecycles(
+            &LifecycleFilter::default()
+                .with_statuses(TERMINAL_STATUSES)
+                .with_task_ids(active.iter().map(|(_, task)| task.id.clone())),
+        )
         .map(|rows| rows.into_iter().map(|l| l.task_id).collect())
         .unwrap_or_default();
     Ok(active

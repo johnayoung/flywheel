@@ -191,7 +191,7 @@ fn bootstrap_is_idempotent_and_keeps_existing_rows() {
 }
 
 #[test]
-fn fresh_store_records_current_schema_version_and_supplementary_indexes() {
+fn fresh_store_records_current_schema_version_and_lifecycle_indexes() {
     let Some(pg) = Postgres::acquire() else {
         return;
     };
@@ -210,6 +210,7 @@ fn fresh_store_records_current_schema_version_and_supplementary_indexes() {
         .collect();
     assert!(indexes.contains("idx_lifecycles_task_id"), "{indexes:?}");
     assert!(indexes.contains("idx_lifecycles_updated_at"), "{indexes:?}");
+    assert!(indexes.contains("idx_lifecycles_status"), "{indexes:?}");
 }
 
 #[test]

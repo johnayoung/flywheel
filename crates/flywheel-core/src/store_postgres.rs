@@ -100,13 +100,15 @@ pub const SCHEMA_SQL: &str = include_str!("../schema/persistence-schema-postgres
 
 /// Indexes for the store's own access patterns that the canonical DDL does
 /// not declare. Postgres does not index foreign-key columns automatically, so
-/// `list_lifecycles(task_id = ...)` and the `(updated_at DESC, run_id DESC)`
-/// ordering every listing uses would otherwise sequential-scan `lifecycles`.
-/// Purely additive and idempotent; a schema bootstrapped by the Python store
-/// gains them on first open here and loses nothing.
+/// `list_lifecycles(task_id = ...)`, the status filter, and the
+/// `(updated_at DESC, run_id DESC)` ordering every listing uses would
+/// otherwise sequential-scan `lifecycles`. Purely additive and idempotent; a
+/// schema bootstrapped by the Python store gains them on first open here and
+/// loses nothing. Mirrored by the SQLite store's `SUPPLEMENTARY_INDEXES`.
 const SUPPLEMENTARY_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS idx_lifecycles_task_id ON lifecycles(task_id);
 CREATE INDEX IF NOT EXISTS idx_lifecycles_updated_at ON lifecycles(updated_at DESC, run_id DESC);
+CREATE INDEX IF NOT EXISTS idx_lifecycles_status ON lifecycles(status);
 ";
 
 /// Serializes concurrent first-open bootstraps against a fresh schema.
@@ -1114,12 +1116,24 @@ fn list_lifecycle_rows<C: GenericClient>(
     };
     let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p.as_ref()).collect();
     // One query regardless of row count: every matched lifecycle with its
-    // attempts joined in, grouped in memory. No per-row follow-up reads.
+    // attempts joined in, grouped in memory. No per-row follow-up reads. A
+    // limit selects the newest runs first (index-ordered) so only their
+    // attempts are joined; the bound is a `usize`, inlined, never caller text.
+    let (source, outer_where) = match filter.limit.and_then(|n| i64::try_from(n).ok()) {
+        Some(n) => (
+            format!(
+                "(SELECT * FROM lifecycles l {where_clause} \
+                 ORDER BY l.updated_at DESC, l.run_id DESC LIMIT {n}) l"
+            ),
+            String::new(),
+        ),
+        None => ("lifecycles l".to_owned(), where_clause),
+    };
     let rows = c
         .query(
             &format!(
-                "SELECT {LIFECYCLE_COLUMNS}, {ATTEMPT_COLUMNS} FROM lifecycles l \
-                 LEFT JOIN attempts a ON a.run_id = l.run_id {where_clause} \
+                "SELECT {LIFECYCLE_COLUMNS}, {ATTEMPT_COLUMNS} FROM {source} \
+                 LEFT JOIN attempts a ON a.run_id = l.run_id {outer_where} \
                  ORDER BY l.updated_at DESC, l.run_id DESC, a.number"
             ),
             param_refs.as_slice(),

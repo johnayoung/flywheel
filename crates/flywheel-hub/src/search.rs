@@ -501,8 +501,10 @@ fn state_name(state: &SessionState) -> &'static str {
 }
 impl Hub {
     /// Where `view`'s current conversation is written, looked up at most
-    /// every [`LOCATE_RETRY`] while it is not found.
-    fn transcript_of(&self, view: &SessionView) -> Option<(PathBuf, Format)> {
+    /// every [`LOCATE_RETRY`] while it is not found -- unless `asked`
+    /// (one session's transcript requested now: it may have just been
+    /// created, so a recent miss is looked past).
+    fn transcript_of(&self, view: &SessionView, asked: bool) -> Option<(PathBuf, Format)> {
         let record = &view.record;
         if !record.kind.is_agent() {
             return None;
@@ -516,7 +518,7 @@ impl Hub {
             .cloned();
         if let Some(found) = cached.filter(|l| {
             l.conversation == record.agent_session_id
-                && (l.file.is_some() || l.at.elapsed() < LOCATE_RETRY)
+                && (l.file.is_some() || (!asked && l.at.elapsed() < LOCATE_RETRY))
         }) {
             return found.file;
         }
@@ -739,7 +741,7 @@ impl Hub {
         group: &mut SessionGroup,
         response: &mut SearchResponse,
     ) -> bool {
-        let Some((path, format)) = self.transcript_of(view) else {
+        let Some((path, format)) = self.transcript_of(view, false) else {
             return true;
         };
         let slot = self.search_index().transcript(&path, format);

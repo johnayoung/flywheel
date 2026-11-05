@@ -923,8 +923,22 @@ impl CommandBook {
         self.refresh_all(record).commands
     }
 
-    /// [`Self::refresh`], also saying whether its usage changed.
+    /// [`Self::refresh`], also saying whether its usage changed. A
+    /// transcript not found is looked for again only after
+    /// [`LOOKUP_RETRY`] (the watcher polls every session).
     pub fn refresh_all(&self, record: &SessionRecord) -> Refreshed {
+        self.refresh_looking(record, false)
+    }
+
+    /// [`Self::refresh_all`] for someone asking about this session now:
+    /// its transcript is looked for even if a look just missed it (an
+    /// agent's first reply creates the file, and whoever asks right after
+    /// must find that reply).
+    pub fn catch_up(&self, record: &SessionRecord) -> Refreshed {
+        self.refresh_looking(record, true)
+    }
+
+    fn refresh_looking(&self, record: &SessionRecord, asked: bool) -> Refreshed {
         // A fallback shell (an agent restored without its conversation)
         // writes no transcript: its saved blocks stay listed, unfollowed.
         if !record.runs_agent() {
@@ -953,7 +967,7 @@ impl CommandBook {
                 .missed
                 .as_ref()
                 .is_some_and(|(c, at)| *c == conversation && at.elapsed() < LOOKUP_RETRY);
-            if !recently_missed {
+            if asked || !recently_missed {
                 match self.locate(record, log.hinted.as_deref()) {
                     Some((path, format)) => {
                         // Finish the old file first: its last reply may
@@ -1291,6 +1305,18 @@ impl Hub {
     /// subscribers.
     pub(crate) fn refresh_commands(&self, record: &SessionRecord) {
         let refreshed = self.command_book().refresh_all(record);
+        self.announce_refreshed(record, refreshed);
+    }
+
+    /// [`Hub::refresh_commands`] for a request about this one session:
+    /// read up to date even if its transcript was just looked for and not
+    /// there yet.
+    pub(crate) fn catch_up_commands(&self, record: &SessionRecord) {
+        let refreshed = self.command_book().catch_up(record);
+        self.announce_refreshed(record, refreshed);
+    }
+
+    fn announce_refreshed(&self, record: &SessionRecord, refreshed: Refreshed) {
         if !refreshed.commands.is_empty() {
             self.emit(HubEvent::Commands {
                 session_id: record.id.clone(),
@@ -1345,7 +1371,7 @@ impl Hub {
     /// first, whether or not the session runs).
     pub fn commands(&self, id: &str, filter: CommandFilter) -> Result<CommandList, HubError> {
         let record = self.session(id)?.record;
-        self.refresh_commands(&record);
+        self.catch_up_commands(&record);
         Ok(self.command_book().list(&record, filter))
     }
 
@@ -1557,6 +1583,27 @@ mod tests {
         let book = CommandBook::new(Some(config), None, None);
         let record = record(SessionKind::Claude, &cwd, conversation);
         (dir, book, record, path)
+    }
+
+    #[test]
+    fn a_transcript_created_after_a_miss_is_found_by_whoever_asks() {
+        let (_dir, book, record, path) = claude_setup("c1");
+        // The watcher looks before the agent has written anything...
+        assert!(book.refresh(&record).is_empty(), "no transcript yet");
+        // ...then its first reply creates the file.
+        append(&path, &claude_line("u1", "Run:\n```bash\nmake check\n```"));
+        append(&path, "\n");
+        // A poll backs off from the recent miss (the watcher's next look
+        // reads it within LOOKUP_RETRY)...
+        assert!(book.refresh(&record).is_empty(), "the poll backs off");
+        // ...but a request about this session reads it now.
+        let added = book.catch_up(&record).commands;
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].command, "make check");
+        assert!(
+            book.catch_up(&record).commands.is_empty(),
+            "nothing re-read"
+        );
     }
 
     #[test]

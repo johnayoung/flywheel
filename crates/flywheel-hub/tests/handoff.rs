@@ -470,6 +470,33 @@ async fn handoffs_reach_another_agent_exactly_under_their_provenance() {
     // The last suggested command, through the CLI.
     hub.as_running();
     let transcript = claude_transcript(&hub.root, &hub.session(&claude).await);
+    // Asked before the agent has written anything: nothing yet (and the
+    // hub has now looked for the transcript and missed it).
+    let (status, why) = hub
+        .refused(
+            &format!("/api/sessions/{claude}/handoff/compose"),
+            json!({ "source": { "kind": "last_command" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        why,
+        format!("{claude_name} has suggested no shell command yet")
+    );
+    let (status, why) = hub
+        .refused(
+            &format!("/api/sessions/{claude}/handoff/compose"),
+            json!({ "source": { "kind": "transcript", "index": 0 } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        why,
+        format!("message 0 of {claude_name}'s transcript not found")
+    );
+    // The agent's first reply creates the transcript; a handoff right
+    // after it reads it then, not at the hub's next poll.
+    assert!(!transcript.exists());
     append(
         &transcript,
         &claude_line("u1", "assistant", "Run:\n```bash\nmake check\n```"),
@@ -524,25 +551,13 @@ async fn handoffs_reach_another_agent_exactly_under_their_provenance() {
         &transcript,
         &claude_line("u2", "assistant", "Then:\n```sh\n$ cargo test\n```"),
     );
-    let deadline = Instant::now() + WAIT;
-    let last = loop {
-        let (status, last) = hub
-            .call(
-                reqwest::Method::POST,
-                &format!("/api/sessions/{claude}/handoff/compose"),
-                Some(json!({ "source": { "kind": "last_command" } })),
-            )
-            .await;
-        assert!(status.is_success(), "{last}");
-        if last["prompt"].as_str().unwrap().contains("cargo test") {
-            break last;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the new block was never read: {last}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // Read at once: the compose catches the transcript up itself.
+    let last = hub
+        .post(
+            &format!("/api/sessions/{claude}/handoff/compose"),
+            json!({ "source": { "kind": "last_command" } }),
+        )
+        .await;
     assert_eq!(
         last["prompt"],
         format!("{header}\n\n```sh\ncargo test\n```\n")

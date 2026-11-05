@@ -65,7 +65,7 @@ impl Hub {
             messages: Vec::new(),
             error: None,
         };
-        let Some((path, format)) = self.transcript_of(&view) else {
+        let Some((path, format)) = self.transcript_of(&view, true) else {
             return Ok(page);
         };
         let slot = self.search_index().transcript(&path, format);

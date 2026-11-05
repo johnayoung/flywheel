@@ -315,6 +315,7 @@ function paneMenu(pane, x, y) {
     { label: "Split down: new shell", hint: keyHint("pane.split_down"), run: () => splitWithShell(pane, "down") },
     { label: zoomed ? "Unzoom" : "Zoom", hint: keyHint("pane.zoom"), run: () => toggleZoom(pane.id), disabled: L.panes(tab.root).length < 2 },
     { label: "Move to a new tab", run: () => paneToTab(pane), disabled: L.panes(tab.root).length < 2 },
+    ...(outputTarget(session) ? [{ label: `Send output ${outputTarget(session).label}`, hint: keyHint("handoff.output"), run: () => handoff.sendOutput(session.id) }] : []),
     { label: "Close pane (keeps running)", hint: keyHint("pane.close"), run: () => closePane(pane.id) },
     { label: `Close session ${session.name}`, hint: keyHint("session.close"), danger: true, run: () => closeSession(session.id) },
   ];

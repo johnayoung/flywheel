@@ -622,12 +622,11 @@ function renderFlip(session) {
 // own, for a companion shell), editable first.
 function renderSendOutput(session) {
   const button = $("#out-toggle");
-  const pool = session && !isAgent(session) && session.live ? handoff.targets(session.id) : [];
-  button.hidden = !pool.length;
-  if (button.hidden) return;
-  const parent = session.companion_of ? pool.find((s) => s.id === session.companion_of) : null;
-  $("#out-label").textContent = parent ? `to ${parent.name}` : "to agent";
-  button.title = withKey(`Send the last command's output to ${parent ? parent.name : "an agent"} (editable first)`, "handoff.output");
+  const target = outputTarget(session);
+  button.hidden = !target;
+  if (!target) return;
+  $("#out-label").textContent = target.label;
+  button.title = withKey(`Send the last command's output to ${target.name} (editable first)`, "handoff.output");
   button.setAttribute("aria-label", button.title);
 }
 

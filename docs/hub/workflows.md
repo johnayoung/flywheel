@@ -80,7 +80,7 @@ A branch with a pull request: a badge on its row (`#7`, checks), a PR section in
 ## Handoff and peer review
 
 - **Send to agent** (`fw hub handoff FROM TO`, `handoff.send`): a selection, message, block, or diff to another agent (any workspace or machine) as one editable prompt (32 KiB).
-- **Shell output to agent** (`Alt O`, header **to <agent>** on a shell, `fw hub handoff SHELL AGENT --output`): the output of the last command typed at the shell's prompt (found by the prompt line it sits at now), else its last 200 lines; a companion shell defaults to its own agent.
+- **Shell output to agent** (`Alt O`, header **to <agent>** on a shell, the send icon or pane menu on a shell pane, `fw hub handoff SHELL AGENT --output`): the output of the last command typed at the shell's prompt (found by the prompt line it sits at now), else its last 200 lines; a companion shell defaults to its own agent.
 - **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author. Model: `--model`, else the author's (same kind), else `agents.<kind>.model`.
 - **Send findings to <author>** pastes the reviewer's latest reply back. Pairing survives restarts; closing the author closes its reviewers.
 

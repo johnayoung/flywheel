@@ -273,6 +273,7 @@ function renderPaneHead(pane) {
       { className: "pane-tools" },
       splitTool(iconButton("split-right", withKey("Split right: new shell", "pane.split_right"), () => splitWithShell(pane, "right"))),
       splitTool(iconButton("split-down", withKey("Split down: new shell", "pane.split_down"), () => splitWithShell(pane, "down"))),
+      sendOutputTool(session),
       iconButton(zoomed ? "unzoom" : "zoom", withKey(zoomed ? "Unzoom" : "Zoom", "pane.zoom"), () => toggleZoom(pane.id)),
       iconButton("dots", "Pane menu", (event) => {
         const box = event.currentTarget.getBoundingClientRect();
@@ -281,6 +282,23 @@ function renderPaneHead(pane) {
       iconButton("x", withKey("Close pane: the session keeps running", "pane.close"), () => closePane(pane.id)),
     ),
   ].filter(Boolean));
+}
+
+// A live shell's "send output" target: its own agent for a companion
+// shell, else any agent that can take a paste (null when none can).
+function outputTarget(session) {
+  const pool = session && !isAgent(session) && session.live ? handoff.targets(session.id) : [];
+  if (!pool.length) return null;
+  const parent = session.companion_of ? pool.find((s) => s.id === session.companion_of) : null;
+  return { label: parent ? `to ${parent.name}` : "to agent", name: parent ? parent.name : "an agent" };
+}
+
+function sendOutputTool(session) {
+  const target = outputTarget(session);
+  if (!target) return null;
+  const button = iconButton("send", withKey(`Send the last command's output to ${target.name} (editable first)`, "handoff.output"), () => handoff.sendOutput(session.id));
+  button.classList.add("split-tool");
+  return button;
 }
 
 function splitTool(button) {

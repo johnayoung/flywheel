@@ -19,12 +19,10 @@
 //! sink instance a lock serializes appends so interleaved callers cannot
 //! split a line.
 //!
-//! Wire compatibility: every line is byte-identical to what the Python
-//! `FileTelemetrySink` writes for the same record (`json.dumps(obj,
-//! ensure_ascii=False)` separators, key order, Python float `repr`, aware
-//! UTC `isoformat()` timestamps), so the Python and Rust audit readers can
-//! read each other's files. The encoder is exposed as [`python_json_dumps`]
-//! for the other read-side renderers that must match Python output.
+//! Wire format: every line uses `json.dumps(obj, ensure_ascii=False)`
+//! separators, a fixed key order, Python float `repr`, and aware UTC
+//! `isoformat()` timestamps. The encoder is exposed as [`python_json_dumps`]
+//! for the read-side renderers that share the format.
 //!
 //! Like the run database, run files are verbatim and sensitive by default;
 //! redaction is read-time (see `crate::redaction`).
@@ -155,9 +153,8 @@ impl Drop for FileTelemetrySink {
 ///
 /// Timestamps become ISO-8601 strings; the payload object is persisted
 /// verbatim. `run_id` is included so each line is self-contained even when
-/// the file is moved or concatenated by external tooling. Key order is the
-/// Python writer's: `kind`, `ts`, `run_id`, `attempt_number`,
-/// `iteration_number`, `payload`.
+/// the file is moved or concatenated by external tooling. Key order is fixed:
+/// `kind`, `ts`, `run_id`, `attempt_number`, `iteration_number`, `payload`.
 pub fn telemetry_record_to_json(record: &TelemetryRecord) -> JsonObject {
     let mut obj = Map::with_capacity(6);
     obj.insert("kind".to_owned(), Value::String(record.kind.clone()));
@@ -416,15 +413,14 @@ mod tests {
             .collect()
     }
 
-    // --- Byte parity with the Python writer ---------------------------------
+    // --- Byte parity with the goldens -----------------------------------------
 
-    /// The exact bytes `flywheel_core.telemetry_file.FileTelemetrySink`
-    /// wrote for three records (captured from the Python implementation).
-    const PYTHON_LINE_1: &str = r#"{"kind": "message_turn", "ts": "2026-06-11T12:00:00+00:00", "run_id": "run-1", "attempt_number": 1, "iteration_number": 1, "payload": {"text": "hello"}}"#;
-    const PYTHON_LINE_2: &str = "{\"kind\": \"harness.iteration_start\", \"ts\": \"2026-06-11T12:00:01.123456+00:00\", \"run_id\": \"run-1\", \"attempt_number\": null, \"iteration_number\": null, \"payload\": {\"u\": \"\u{e9}\u{1F600} \\u0001\\t\\\"q\\\"\\\\ /\", \"f\": [1e+16, 1e-05, 2.5, 100.0, -0.0, 0.30000000000000004], \"i\": [0, -7, 9007199254740993], \"n\": null, \"b\": [true, false], \"nested\": {\"z\": {\"y\": []}, \"a\": {}}}}";
-    const PYTHON_LINE_3: &str = r#"{"kind": "domain.landed", "ts": "2026-06-11T12:00:00+00:00", "run_id": "run-1", "attempt_number": 2, "iteration_number": null, "payload": {"strategy": "merge"}}"#;
+    /// The exact bytes the sink writes for three records.
+    const GOLDEN_LINE_1: &str = r#"{"kind": "message_turn", "ts": "2026-06-11T12:00:00+00:00", "run_id": "run-1", "attempt_number": 1, "iteration_number": 1, "payload": {"text": "hello"}}"#;
+    const GOLDEN_LINE_2: &str = "{\"kind\": \"harness.iteration_start\", \"ts\": \"2026-06-11T12:00:01.123456+00:00\", \"run_id\": \"run-1\", \"attempt_number\": null, \"iteration_number\": null, \"payload\": {\"u\": \"\u{e9}\u{1F600} \\u0001\\t\\\"q\\\"\\\\ /\", \"f\": [1e+16, 1e-05, 2.5, 100.0, -0.0, 0.30000000000000004], \"i\": [0, -7, 9007199254740993], \"n\": null, \"b\": [true, false], \"nested\": {\"z\": {\"y\": []}, \"a\": {}}}}";
+    const GOLDEN_LINE_3: &str = r#"{"kind": "domain.landed", "ts": "2026-06-11T12:00:00+00:00", "run_id": "run-1", "attempt_number": 2, "iteration_number": null, "payload": {"strategy": "merge"}}"#;
 
-    fn python_fixture_records() -> Vec<TelemetryRecord> {
+    fn golden_records() -> Vec<TelemetryRecord> {
         let mut second = TelemetryRecord::new(
             "run-1",
             ts("2026-06-11T12:00:01.123456+00:00"),
@@ -453,22 +449,22 @@ mod tests {
     }
 
     #[test]
-    fn writer_output_is_byte_identical_to_python_writer() {
+    fn writer_output_matches_golden() {
         let dir = tempfile::tempdir().unwrap();
         let sink = FileTelemetrySink::new(dir.path());
-        for record in python_fixture_records() {
+        for record in golden_records() {
             sink.append_telemetry(&record).unwrap();
         }
         let written = std::fs::read_to_string(sink.path_for("run-1").unwrap()).unwrap();
-        let expected = format!("{PYTHON_LINE_1}\n{PYTHON_LINE_2}\n{PYTHON_LINE_3}\n");
+        let expected = format!("{GOLDEN_LINE_1}\n{GOLDEN_LINE_2}\n{GOLDEN_LINE_3}\n");
         assert_eq!(written, expected);
     }
 
     #[test]
-    fn python_written_lines_parse_into_equal_records() {
-        for (line, expected) in [PYTHON_LINE_1, PYTHON_LINE_2, PYTHON_LINE_3]
+    fn golden_lines_parse_into_equal_records() {
+        for (line, expected) in [GOLDEN_LINE_1, GOLDEN_LINE_2, GOLDEN_LINE_3]
             .into_iter()
-            .zip(python_fixture_records())
+            .zip(golden_records())
         {
             let parsed: TelemetryRecord = serde_json::from_str(line).unwrap();
             assert_eq!(parsed, expected);

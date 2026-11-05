@@ -134,5 +134,5 @@ ntfy-compatible POST when an agent becomes **blocked** or **done**, so a phone h
 
 `fw hub doctor`: `ok | info | warn | FAIL` per finding, each with a `fix:`; read-only (binds the port a moment, runs `--version`/`--help` only).
 
-Checks: `fw` / `flywheel` on PATH (a script, e.g. a Python venv's `fw`: FAIL; another build: warn), the running `hub`'s version, `claude` / `codex` and `claude hooks` (missing, no `--version`, `--settings` rejects the hooks),
+Checks: `fw` / `flywheel` on PATH (a script or other program: FAIL; another build: warn), the running `hub`'s version, `claude` / `codex` and `claude hooks` (missing, no `--version`, `--settings` rejects the hooks),
 state dir and secrets (owner, 0700 / 0600), the config files (as `fw hub config check`), `recordings` (90%: info, past `dir_cap`: warn), `port`, `tailscale`, `browser`, `systemd` (linger, WSL), `clock`, `disk` (< 2 GiB warn, < 512 MiB FAIL).

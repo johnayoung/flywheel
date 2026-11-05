@@ -182,7 +182,7 @@ fn count_word(n: usize) -> String {
 }
 
 /// [`orchestrator_prompt`] for the subset of tiers actually dispatched this
-/// cycle (byte-identical to it for all 11).
+/// cycle (identical to it for all 11).
 pub fn orchestrator_prompt_for(repo_root: &Path, tiers: &[Tier]) -> String {
     let keys = tiers
         .iter()

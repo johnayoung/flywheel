@@ -20,8 +20,7 @@
 //! content-hash definition; the triage engine (the write side) uses the
 //! same definitions, so the side that mints a receipt and the side that
 //! trusts it can never drift. The line splitting reproduces Python's
-//! `str.splitlines` boundaries so a receipt minted by the Python engine
-//! hashes identically here.
+//! `str.splitlines` boundaries so receipt hashes stay stable.
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};

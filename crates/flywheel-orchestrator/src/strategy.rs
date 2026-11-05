@@ -65,7 +65,7 @@ impl fmt::Display for SandboxMode {
 /// What the orchestrator needs a consumer to provision a run's sandbox.
 ///
 /// `task_file` is the backing file for file-backed work sources and `None`
-/// otherwise (the Python seam carries an empty path there); `source_ref`
+/// otherwise; `source_ref`
 /// always carries the source's opaque item handle. `run_id` is `None` for a
 /// fresh run and the lifecycle being continued on a resume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

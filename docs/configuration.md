@@ -153,7 +153,7 @@ How DONE work leaves the loop. An absent table means historical merge landing. S
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
 | `strategy` | enum `merge`/`pr`/`phase` | `merge` | how DONE work lands; routed via the `SUBMIT_STRATEGIES` registry; ignored for routing when `[[submit.tiers]]` is configured |
-| `protected_paths` | list of glob | `[]` | repo-relative globs (`PurePath.full_match`, `**` crosses dirs) a finished branch may not touch; a match refuses landing and parks the work |
+| `protected_paths` | list of glob | `[]` | repo-relative whole-path globs (`**` crosses dirs; `*`, `?` do not) a finished branch may not touch; a match refuses landing and parks the work |
 | `remote` | str | `origin` | `pr` strategy push target |
 | `pr_base` | str | unset (worker base branch) | `pr` strategy PR base branch |
 | `base` | str | unset (checked-out branch) | explicit landing/phase-base branch |
@@ -182,7 +182,7 @@ paths = ["scripts/**"]
 ```
 
 - Tiers: `0` = merge (direct), `1` = phase integration branch, `2` = PR. Highest tier of any touched file wins; a file matching no rule defaults to tier `1`.
-- `paths` use `protected_paths` glob semantics (`PurePath.full_match`, `**` crosses dirs) over the branch's merge-base-scoped diff.
+- `paths` use `protected_paths` glob semantics (whole-path match; `**` crosses dirs, `*`, `?` do not) over the branch's merge-base-scoped diff.
 - Classification is worker-side only; the policy file itself always classifies tier `2`, so a branch editing these rules cannot cheapen its own route.
 - `protected_paths` outranks every tier (a protected file parks; tier 2 is a landing route, protection is a refusal).
 - Each decision is recorded on the run's ledger (`LandingRouted`: per-file tiers, winning tier, strategy).
@@ -301,9 +301,9 @@ Rendered:
 - `[source]` — `directory` or `github` only. `github_ci`/`github_review` must be hand-edited in.
 - `[paths]` — `db` and `sandbox_root`.
 - `[store]` — from `--store`/`--pg-schema`.
-- `[submit]` — `base = "<current branch>"` when a branch is detected, else a commented placeholder.
-- Commented placeholders for `[[defaults.graders]]`, `[agent] model`, `[sandbox] setup`, and `[phase] verify`.
+- `[submit]` — `protected_paths = [".github/**", "flywheel.toml"]` active; `base` (suggesting the detected branch, else `"main"`), `verify`, `strategy`, `remote`, and `pr_base` as commented placeholders.
+- Commented placeholders for `[[defaults.graders]]`, `[agent] model`, `[sandbox] setup`/`backend`/`preset`/`permission_mode`, `[phase] verify`, `[held_out] root`, `[autopilot]` and `[autopilot.weights]`, `[worker] concurrency`, and `[execution] mode`/`capabilities`. The `[sandbox.*]` subtables are listed in a comment only.
 
-**Not rendered by init — must be hand-written:** `[execution]`, `[worker]`, `[held_out]`, `[autopilot]` and `[autopilot.weights]`, `[triage]`, `[deadlines]`, every `[sandbox.*]` subtable (`exec`/`capabilities`/`network`/`env`/`limits`/`retention`/`container`), `[sandbox] preset`/`backend`/`permission_mode`, `[submit] strategy`/`protected_paths`/`remote`/`pr_base`, and `[source] failure_filter`.
+**Not rendered by init — must be hand-written:** `[triage]`, `[deadlines]`, every `[sandbox.*]` subtable (`exec`/`capabilities`/`network`/`env`/`limits`/`retention`/`container`), and `[source] failure_filter`.
 
 The commented `[agent] model` placeholder shows one example model id; do not treat any printed id as canonical — the value is opaque and projects vary.

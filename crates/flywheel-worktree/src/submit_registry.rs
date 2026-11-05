@@ -9,10 +9,7 @@
 //! [`SubmitStrategyRegistry::register`] without this module naming them, so
 //! adding a strategy never edits this file.
 //!
-//! Port of the Python `flywheel_worktree._submit_registry` module. The
-//! Python resolved a `"module:attr"` target lazily to break the
-//! `worker <-> pr` import cycle; Rust modules have no such cycle, so a spec
-//! carries its factory closure directly.
+//! A spec carries its factory closure directly.
 //!
 //! # The factory signature
 //!
@@ -52,9 +49,8 @@ pub const PHASE_STRATEGY: &str = "phase";
 
 /// The shared construction inputs every submit-strategy factory accepts.
 ///
-/// Mirrors the keyword signature the Python builders shared: the repo
-/// layout, the resolved landing base, the merge lock, the log sink, the
-/// `[submit] protected_paths` and `[sandbox] setup` knobs, the
+/// The repo layout, the resolved landing base, the merge lock, the log sink,
+/// the `[submit] protected_paths` and `[sandbox] setup` knobs, the
 /// `[sandbox.retention]` dispositions, and the optional seams (run ledger,
 /// resolved grader env, held-out gate source, conflict resolver). `policy`
 /// is the loaded `flywheel.toml`, `None` for a bare construction; a factory
@@ -451,7 +447,7 @@ mod tests {
         assert!(sub.verify_command.is_none());
         assert_eq!(sub.recovery_agent_max_turns, 0);
         // The disk/inode preflight is default-on in front of the ledger
-        // append, matching the Python worker's bare-construction default.
+        // append by default.
         assert!(sub.ledger_guard.is_some());
         drop(strategy);
     }

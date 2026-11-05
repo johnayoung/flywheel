@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn recheck_lines_are_byte_identical_to_python() {
+    fn recheck_lines_match_golden() {
         assert_eq!(
             format_recheck_line("r1", &outcome(true, "unblocked", vec![]), false),
             "r1: unblocked"

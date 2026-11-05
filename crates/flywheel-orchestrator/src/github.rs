@@ -219,7 +219,7 @@ pub fn format_report_body(report: &WorkReport) -> String {
 }
 
 /// Python's `type(x).__name__` for the value a JSON value decodes to, so
-/// payload-shape errors read the same as the Python adapter's.
+/// payload-shape errors name the decoded type.
 pub(crate) fn py_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "NoneType",

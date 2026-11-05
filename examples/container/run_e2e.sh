@@ -34,7 +34,7 @@
 #
 # Environment
 #   FW_IMAGE      agent image          (default flywheel-agent:latest)
-#   FW_MODEL      agent model          (default claude-sonnet-4-6)
+#   FW_MODEL      agent model          (default claude-sonnet-5-5)
 #   FW_E2E_DIR    scratch root         (default /tmp/fw-e2e; wiped each run)
 #   FLYWHEEL_BIN  flywheel binary      (default: `flywheel` on PATH, else a
 #                                       release build of this checkout)
@@ -42,7 +42,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IMAGE="${FW_IMAGE:-flywheel-agent:latest}"
-MODEL="${FW_MODEL:-claude-sonnet-4-6}"
+MODEL="${FW_MODEL:-claude-sonnet-5-5}"
 BASE="${FW_E2E_DIR:-/tmp/fw-e2e}"
 SCRATCH="$BASE/repo"
 TASK_ID="hello"

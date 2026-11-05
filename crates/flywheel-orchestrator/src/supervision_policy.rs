@@ -90,8 +90,8 @@ pub struct SupervisionBudget {
 
 impl SupervisionBudget {
     /// Validate and build a budget. `max_respawns` is taken as a signed
-    /// value so a negative configuration is rejected with the same
-    /// diagnostic the Python dataclass raised, rather than wrapping.
+    /// value so a negative configuration is rejected with a
+    /// diagnostic rather than wrapping.
     pub fn new(max_respawns: i64, window_seconds: f64) -> Result<Self, SupervisionBudgetError> {
         if max_respawns < 0 {
             return Err(SupervisionBudgetError::NegativeRespawns(max_respawns));

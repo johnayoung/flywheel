@@ -1,5 +1,4 @@
-//! Cross-task orchestrator -- the consumer-side scheduler (port of the
-//! Python `flywheel_orchestrator._orchestrate`).
+//! Cross-task orchestrator -- the consumer-side scheduler.
 //!
 //! `docs/strategy.md` is explicit that *strategy lives in the consumer, not
 //! the loop*: the harness owns a single task's lifecycle; deciding **which**
@@ -205,8 +204,7 @@ pub enum OrchestrateError {
 /// factory); `run_task` is the [`RunTask`] seam the daemon binds to the
 /// core workflow. `strategy` is the consumer landing seam; `None` runs each
 /// task in `sandbox_root/<task-id>` and lands nothing, exactly the plain
-/// library default. Every other knob defaults as the Python library call
-/// did (`new`).
+/// library default. Every other knob takes its default from `new`.
 #[derive(Clone)]
 pub struct OrchestrateRequest {
     pub source: Arc<dyn WorkSource>,
@@ -226,7 +224,7 @@ pub struct OrchestrateRequest {
     /// Raises the tolerated cross-host clock skew from two thirds of a window
     /// to a full window at the cost of that much extra reclaim latency for a
     /// genuinely dead worker. `None` resolves to the heartbeat interval
-    /// (`lease_seconds / 3`); `Some(0.0)` disables it (the Python behavior).
+    /// (`lease_seconds / 3`); `Some(0.0)` disables it.
     pub steal_grace_seconds: Option<f64>,
     pub log: Option<LogSink>,
     pub now: Option<Clock>,
@@ -276,7 +274,7 @@ impl fmt::Debug for OrchestrateRequest {
 }
 
 impl OrchestrateRequest {
-    /// A request with the Python library defaults for every optional knob.
+    /// A request with the library defaults for every optional knob.
     pub fn new(
         source: Arc<dyn WorkSource>,
         control: Arc<dyn HarnessStore>,
@@ -391,8 +389,7 @@ impl Drop for AbortOnDrop {
 /// eligible and claimable. Safe to run as several concurrent workers against
 /// one store -- per-task leases keep them from double-running a task.
 ///
-/// See [`OrchestrateRequest`] for every knob; the Python `orchestrate(...)`
-/// keyword set maps onto it one-to-one, with the stores and the runner
+/// See [`OrchestrateRequest`] for every knob, with the stores and the runner
 /// injected instead of opened from `db_path`.
 pub async fn orchestrate(
     request: OrchestrateRequest,

@@ -12,8 +12,7 @@
 //!
 //! The lifecycle is shared behind a mutex because the steering-ledger
 //! observer appends `CommandApplied` facts from the invoker's watcher task
-//! while the harness is parked awaiting the iteration -- the Rust spelling
-//! of the Python single-event-loop interleaving.
+//! while the harness is parked awaiting the iteration.
 
 use super::HarnessError;
 use super::telemetry::{MirroringStore, RunTelemetry, store_error_type};
@@ -29,12 +28,9 @@ use std::future::pending;
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::watch;
 
-/// The operator shutdown signal (SIGINT / SIGTERM): the Rust spelling of the
-/// `asyncio.CancelledError` a signal-cancelled task surfaces in the Python
-/// harness.
+/// The operator shutdown signal (SIGINT / SIGTERM).
 ///
-/// Trigger it from a signal handler (see
-/// [`ShutdownSignal::install_os_handlers`]) or any supervisor; the harness
+/// Trigger it from a signal handler or any supervisor; the harness
 /// observes it at the attempt boundary (the in-flight agent invocation and
 /// the rubric-judge await are the cancellation points), finalizes the open
 /// attempt `INTERNAL_ERROR`, emits `harness.interrupted`, transitions the
@@ -75,28 +71,6 @@ impl ShutdownSignal {
         let mut rx = self.rx.clone();
         if rx.wait_for(|triggered| *triggered).await.is_err() {
             pending::<()>().await;
-        }
-    }
-
-    /// Trigger this signal on the process's SIGINT or SIGTERM (unix only;
-    /// a no-op elsewhere). Spawns a background listener on the current
-    /// tokio runtime.
-    pub fn install_os_handlers(&self) {
-        #[cfg(unix)]
-        {
-            let signal = self.clone();
-            tokio::spawn(async move {
-                use tokio::signal::unix::{SignalKind, signal as unix_signal};
-                let mut term = match unix_signal(SignalKind::terminate()) {
-                    Ok(term) => term,
-                    Err(_) => return,
-                };
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
-                signal.trigger();
-            });
         }
     }
 }

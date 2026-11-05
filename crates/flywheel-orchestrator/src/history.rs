@@ -1159,8 +1159,8 @@ mod tests {
     }
 
     /// A run that failed verification on attempt 1 and passed on attempt 2,
-    /// with landing decisions appended to its ledger. Mirrors the Python
-    /// fixture the embedded renderer expectations were generated from.
+    /// with landing decisions appended to its ledger: the fixture the
+    /// embedded renderer goldens were generated from.
     fn seed_two_attempt_run(store: &InMemoryStore, run_id: &str, task_id: &str, source: &str) {
         let mut lc = Lifecycle::new(task_id).with_run_id(run_id);
         lc.source = source.to_owned();
@@ -1337,17 +1337,17 @@ mod tests {
         );
     }
 
-    // --- renderers: byte-identical to the Python CLI --------------------------
+    // --- renderers: byte-identical to the goldens ------------------------------
 
     #[test]
-    fn history_text_matches_python_byte_for_byte() {
+    fn history_text_matches_golden_byte_for_byte() {
         let expected = "  31-b/t2       failed            2026-06-01 14:05  runs=1  tokens=7  cost=$0.0001  -- boom\nsecond\n  30-a/t1       done              2026-06-01 13:16  runs=2  tokens=1450  cost=$0.7500\n  07-legacy/t3  failed_validation 2026-06-01 11:05  runs=1  tokens=0  cost=$0.0000  -- bad";
         assert_eq!(render_history_text(&fixture_rows()), expected);
         assert_eq!(render_history_text(&[]), "(no finished runs)");
     }
 
     #[test]
-    fn history_json_matches_python_byte_for_byte() {
+    fn history_json_matches_golden_byte_for_byte() {
         let expected = r#"[
   {
     "task_id": "t2",
@@ -1427,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn show_text_matches_python_byte_for_byte() {
+    fn show_text_matches_golden_byte_for_byte() {
         let expected = "task     : t1
 phase    : 30-a
 run      : run-x
@@ -1480,7 +1480,7 @@ attempts :
     }
 
     #[test]
-    fn show_json_matches_python_byte_for_byte() {
+    fn show_json_matches_golden_byte_for_byte() {
         let expected = r#"{
   "run": {
     "run_id": "run-x",

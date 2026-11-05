@@ -1,5 +1,4 @@
-//! Port of the Python `flywheel._autopilot_supervisor` module: the
-//! console's subprocess supervisor for the operator-started autopilot
+//! The console's subprocess supervisor for the operator-started autopilot
 //! daemon.
 //!
 //! The console keeps a second supervised child running underneath it,

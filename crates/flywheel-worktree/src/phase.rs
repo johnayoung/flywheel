@@ -3,13 +3,6 @@
 //! and the archive sweep that moves a completed `active/<phase>` to
 //! `archive/` once every exit gate passes.
 //!
-//! Port of the phase half of the Python `flywheel_worktree.worker` module
-//! (`PhaseBranchSubmitter`, `record_phase_bases`, `archive_phases`) together
-//! with the archive machinery it drove in
-//! `flywheel_orchestrator._workflow` (`archive_completed_phases`, the
-//! loop-base ref helpers, and the `loop-path-exempt.md` opt-out parser),
-//! which the Rust orchestrator does not yet ship.
-//!
 //! Invariants:
 //!
 //! * The worker never commits to the operator's branch. Base capture is pure

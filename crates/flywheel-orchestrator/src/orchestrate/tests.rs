@@ -3655,7 +3655,7 @@ fn run_task_error_classifies_optimistic_concurrency() {
 }
 
 #[test]
-fn default_constants_match_the_python_module() {
+fn default_constants_are_pinned() {
     assert_eq!(DEFAULT_LEASE_SECONDS, 300.0);
     assert_eq!(DEFAULT_RECONCILE_SECONDS, 15.0);
     assert_eq!(DEFAULT_SWEEP_SECONDS, 15.0);

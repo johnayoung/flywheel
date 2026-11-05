@@ -1,5 +1,3 @@
-//! Port of the Python `flywheel_orchestrator._store_registry` module.
-//!
 //! The registries of core and claim store backends: the names an operator can
 //! select in `[store] backend`, each bound to a builder. The two families
 //! (core store, claim store) share one builder signature so the factory in
@@ -8,8 +6,7 @@
 //!
 //! Only `sqlite` is registered here. A `postgres` backend is added later by
 //! its own module calling [`Registry::register`] on both families with a
-//! [`BackendSpec`] whose `extra` is `Some("postgres")`; nothing in this file
-//! changes when that lands.
+//! [`BackendSpec`]; nothing in this file changes when that lands.
 //!
 //! The sqlite *core* store is not named here either: `flywheel_core`'s
 //! `SqliteStore` is passed in by the caller as a [`SqliteCoreOpener`] when
@@ -86,27 +83,19 @@ pub type ClaimStoreBuilder =
     Arc<dyn Fn(&BuildRequest<'_>) -> Result<Arc<dyn ClaimStore>, StoreConfigError> + Send + Sync>;
 
 /// One registered backend: its name, a one-line summary for operator
-/// listings, the optional extra it depends on (informational: `None` for
-/// built-ins with no optional dependency), and its builder.
+/// listings, and its builder.
 #[derive(Clone)]
 pub struct BackendSpec<B> {
     pub name: String,
     pub summary: String,
-    pub extra: Option<String>,
     pub build: B,
 }
 
 impl<B> BackendSpec<B> {
-    pub fn new(
-        name: impl Into<String>,
-        summary: impl Into<String>,
-        extra: Option<&str>,
-        build: B,
-    ) -> Self {
+    pub fn new(name: impl Into<String>, summary: impl Into<String>, build: B) -> Self {
         Self {
             name: name.into(),
             summary: summary.into(),
-            extra: extra.map(str::to_owned),
             build,
         }
     }
@@ -117,7 +106,6 @@ impl<B> fmt::Debug for BackendSpec<B> {
         f.debug_struct("BackendSpec")
             .field("name", &self.name)
             .field("summary", &self.summary)
-            .field("extra", &self.extra)
             .finish_non_exhaustive()
     }
 }
@@ -246,13 +234,11 @@ impl StoreRegistries {
         let _ = registries.core.register(BackendSpec::new(
             DEFAULT_BACKEND,
             "local SQLite file (default)",
-            None,
             core_builder,
         ));
         let _ = registries.claims.register(BackendSpec::new(
             DEFAULT_BACKEND,
             "local SQLite file (default)",
-            None,
             claim_builder,
         ));
         registries
@@ -278,10 +264,10 @@ mod tests {
     fn unknown_name_lists_registered_choices() {
         let mut registry: Registry<u8> = Registry::new("store");
         registry
-            .register(BackendSpec::new("sqlite", "s", None, 1))
+            .register(BackendSpec::new("sqlite", "s", 1))
             .unwrap();
         registry
-            .register(BackendSpec::new("postgres", "p", Some("postgres"), 2))
+            .register(BackendSpec::new("postgres", "p", 2))
             .unwrap();
         let err = registry.resolve("mysql").unwrap_err();
         assert_eq!(
@@ -305,10 +291,10 @@ mod tests {
     fn duplicate_registration_is_refused() {
         let mut registry: Registry<u8> = Registry::new("store");
         registry
-            .register(BackendSpec::new("sqlite", "s", None, 1))
+            .register(BackendSpec::new("sqlite", "s", 1))
             .unwrap();
         let err = registry
-            .register(BackendSpec::new("sqlite", "again", None, 2))
+            .register(BackendSpec::new("sqlite", "again", 2))
             .unwrap_err();
         assert_eq!(
             err,
@@ -331,7 +317,6 @@ mod tests {
         assert_eq!(registries.core.names(), vec!["sqlite"]);
         assert_eq!(registries.claims.names(), vec!["sqlite"]);
         let spec = registries.claims.resolve("sqlite").unwrap();
-        assert_eq!(spec.extra, None);
         assert_eq!(spec.summary, "local SQLite file (default)");
     }
 
@@ -350,19 +335,9 @@ mod tests {
             .register(BackendSpec::new(
                 "postgres",
                 "durable Postgres backend",
-                Some("postgres"),
                 builder,
             ))
             .unwrap();
         assert_eq!(registries.claims.names(), vec!["postgres", "sqlite"]);
-        assert_eq!(
-            registries
-                .claims
-                .resolve("postgres")
-                .unwrap()
-                .extra
-                .as_deref(),
-            Some("postgres")
-        );
     }
 }

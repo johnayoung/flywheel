@@ -1,5 +1,4 @@
-//! Port of the Python `flywheel_orchestrator._workflow` module: the
-//! orchestrator's operator verbs (`next`, `status`, `live`, `history`,
+//! The orchestrator's operator verbs (`next`, `status`, `live`, `history`,
 //! `show`, `validate`, `recheck-blocked`, `recover`, `resolve`, `init`) and
 //! the argparse-identical entry point the product shell calls in-process.
 //!
@@ -81,7 +80,7 @@ pub const DEFAULT_DB_PATH: &str = ".flywheel/flywheel.sqlite";
 
 /// Anything a verb can fail with. [`run`] maps the input-side variants
 /// (policy, work source, task file, missing file) to the `error: ...` /
-/// exit 2 surface the Python entry point prints; store-side failures exit
+/// exit 2 surface; store-side failures exit
 /// 1 with the same prefix.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkflowError {

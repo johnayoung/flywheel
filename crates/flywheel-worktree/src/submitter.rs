@@ -16,12 +16,9 @@
 //! The worker never commits to the operator's branch: the only commits this
 //! module authors are the merge-fallback merge commit on the *task branch*
 //! (its own landing bookkeeping) and the message-only trailer rewrite
-//! (`crate::trailers`). Git is driven through `std::process::Command("git")`
-//! with the same argv as the Python worker so ref names and behavior match.
+//! (`crate::trailers`). Git is driven through `std::process::Command("git")`.
 //!
-//! Port of the landing half of the Python `flywheel_worktree.worker` module
-//! (`GitWorktreeSubmitter` and its plumbing). The per-phase integration
-//! branch variant lives in `crate::phase`.
+//! The per-phase integration branch variant lives in `crate::phase`.
 
 use crate::trailers::{TrailerError, provenance_trailers, stamp_commit_messages};
 use chrono::Utc;
@@ -109,9 +106,9 @@ impl From<PrepareSandboxError> for PrepareError {
     }
 }
 
-/// Everything the landing ladder can "raise" (the Python `except Exception`
-/// in `submit`): contained by [`GitWorktreeSubmitter::submit`] into a
-/// `submit-error` park so a landing failure never unwinds the orchestrator.
+/// Everything the landing ladder can fail with: contained by
+/// [`GitWorktreeSubmitter::submit`] into a `submit-error` park so a landing
+/// failure never unwinds the orchestrator.
 #[derive(Debug, thiserror::Error)]
 pub enum SubmitError {
     #[error(transparent)]
@@ -234,9 +231,8 @@ pub fn checked_out_branch(repo_root: &Path) -> Result<Option<String>, GitError> 
 /// Per-task leases keep two workers off the same task, but two workers
 /// finishing *different* tasks would both fast-forward the one shared base.
 /// This `flock(2)` serializes those merges (and the archive move): peers
-/// still run tasks, only the merge is exclusive. The same mechanism the
-/// Python worker used (`fcntl.flock`), so a Rust and a Python worker sharing
-/// a repo exclude each other too.
+/// still run tasks, only the merge is exclusive. Every worker
+/// sharing a repo takes the same lock, so they exclude each other.
 #[derive(Debug)]
 pub struct MergeLock {
     file: File,
@@ -423,7 +419,7 @@ pub type ConflictResolver = Arc<
 /// conflict), and asks it to stage the resolutions. The worker authors the
 /// merge commit and owns every landing gate afterwards, so the prompt does
 /// not ask the agent to commit, verify, or judge -- its claim is untrusted.
-/// Agent-facing: byte-identical to the Python renderer.
+/// Agent-facing: pinned byte for byte by the tests.
 pub fn render_conflict_resolution_prompt(req: &SubmitRequest, branch: &str, base: &str) -> String {
     format!(
         "You are resolving a git merge conflict, nothing more.\n\n\
@@ -550,8 +546,7 @@ pub struct AgentUsage {
     pub wall_seconds: f64,
 }
 
-/// The glob matcher behind `[submit] protected_paths`: Python
-/// `PurePosixPath.full_match` semantics. `**` matches zero or more whole
+/// The glob matcher behind `[submit] protected_paths`. `**` matches zero or more whole
 /// path segments, `*` and `?` never cross `/`, `[...]` is a character class
 /// (`[!...]` negated). The whole path must match.
 pub fn protected_path_matches(path: &str, pattern: &str) -> bool {
@@ -1307,7 +1302,7 @@ impl GitWorktreeSubmitter {
     // --- the ladder ----------------------------------------------------------------------------
 
     /// The landing ladder proper. Every leaf returns an outcome; an `Err` is
-    /// the Python "raise" that [`SubmitStrategy::submit`] contains.
+    /// the failure that [`SubmitStrategy::submit`] contains.
     pub fn submit_inner(&self, req: &SubmitRequest) -> Result<SubmitOutcome, SubmitError> {
         let phase = self.phase_of(req.task_file.as_deref());
         let worktree = self.worktree(&req.task_id);
@@ -2700,7 +2695,7 @@ mod tests {
     }
 
     #[test]
-    fn conflict_prompt_is_byte_identical_to_the_python_renderer() {
+    fn conflict_prompt_matches_golden() {
         let req = SubmitRequest::new(
             flywheel_core::task::Task::new("Add the thing.", Vec::new()).with_id("t1"),
             "run-1",

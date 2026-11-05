@@ -11,8 +11,8 @@
 //!
 //! The digest canonicalization reproduces Python's
 //! `json.dumps(obj, sort_keys=True, separators=(",", ":"))` byte-for-byte
-//! (ASCII-only output with `\uXXXX` escapes, Python float `repr`) so Rust
-//! and Python stores pin identical `task_versions` rows for the same task.
+//! (ASCII-only output with `\uXXXX` escapes, Python float `repr`) so every
+//! store pins identical `task_versions` rows for the same task.
 
 use crate::task::{
     CommandGrader, Context, Grader, ManualGrader, RubricGrader, Seconds, Task, TaskBudgets,
@@ -47,8 +47,6 @@ pub const BUDGET_KEYS: [&str; 3] = [
 
 /// Source label used by [`load_task_data`] when the caller gives none.
 pub const DEFAULT_DATA_SOURCE: &str = "<data>";
-/// Source label used by [`load_graders`] when the caller gives none.
-pub const DEFAULT_GRADERS_SOURCE: &str = "<graders>";
 /// Source label used by [`deserialize_task`].
 pub const SERIALIZED_TASK_SOURCE: &str = "<serialized task>";
 /// Source label used by the JSONL reader/str loaders when none is given.
@@ -500,8 +498,8 @@ fn task_from_value(data: &Value, source: &str) -> Result<Task, TaskLoadError> {
         Some(Value::String(s)) => s.clone(),
         _ => String::new(),
     };
-    // A non-string `id` (including an explicit null) must fail validation
-    // exactly as in the Python loader; an empty string is the sentinel that
+    // A non-string `id` (including an explicit null) must fail validation;
+    // an empty string is the sentinel that
     // `Task::validate` rejects with the same message.
     let id = match data.get("id") {
         None => crate::task::default_task_id(),
@@ -660,8 +658,8 @@ pub fn deserialize_task(data: &Value) -> Result<Task, TaskLoadError> {
 /// Two tasks with the same definition share a digest regardless of `id`.
 /// Editing the goal, a grader, a tag, or the context yields a new digest (a
 /// new immutable version a run can pin). `prerequisites` is excluded because
-/// it is not a core concept at all. Byte-identical to the Python
-/// `task_digest` for the same definition (see [`canonical_json`]).
+/// it is not a core concept at all. Stable byte for byte for the same
+/// definition (see [`canonical_json`]).
 pub fn task_digest(task: &Task) -> String {
     let canonical = canonical_json(&Value::Object(definition_value(task)));
     hex::encode(Sha256::digest(canonical.as_bytes()))
@@ -789,8 +787,8 @@ fn py_repr(value: &Value) -> String {
 
 /// Python's `repr()` of a `str`: single-quoted unless the text holds a
 /// single quote and no double quote, with backslash escapes for the quote,
-/// backslashes, and control characters. Operator-facing messages that the
-/// Python implementation renders with `{value!r}` use this for parity.
+/// backslashes, and control characters. Operator-facing messages that quote a
+/// value with `{value!r}` use this.
 pub fn py_str_repr(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') {
         '"'
@@ -1347,10 +1345,9 @@ mod tests {
         assert_ne!(task_digest(&t), digest);
     }
 
-    /// Hard-coded hashes computed with the Python implementation
-    /// (`flywheel_core.loaders.task_digest`) for the same definitions.
+    /// Hard-coded golden hashes for the same definitions.
     #[test]
-    fn task_digest_matches_python_byte_for_byte() {
+    fn task_digest_matches_golden_byte_for_byte() {
         let minimal = load_task_data(&well_formed(), "S").unwrap();
         assert_eq!(
             task_digest(&minimal),

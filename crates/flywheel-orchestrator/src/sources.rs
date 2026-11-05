@@ -232,10 +232,9 @@ pub struct WorkReport {
 
 /// The orchestrator's boundary with the system that owns the work.
 ///
-/// `source_kind` and `source_name` are required members here (the Python
-/// seam duck-types them) because `sync_work_source` stamps both onto the
-/// `source_syncs` row: an adapter that forgot either would fail at sync
-/// time rather than at compile time.
+/// `source_kind` and `source_name` are required members here because
+/// `sync_work_source` stamps both onto the `source_syncs` row: an adapter
+/// that forgot either would fail at sync time rather than at compile time.
 pub trait WorkSource: Send + Sync {
     /// The provenance tag stamped on every emitted item (`"directory"`,
     /// `"github_issue"`, `"github_ci"`, `"github_review"`).
@@ -1224,7 +1223,7 @@ mod tests {
         );
     }
 
-    // --- parity with the Python DirectoryWorkSource over the real repo tree --
+    // --- golden listing of the real repo tree ------------------------------------
 
     #[derive(Deserialize)]
     struct ParityItem {
@@ -1281,7 +1280,7 @@ mod tests {
         assert_eq!(
             items.len(),
             expected.items.len(),
-            "item count differs from Python"
+            "item count differs from the golden"
         );
         for (got, want) in items.iter().zip(&expected.items) {
             let rel = got
@@ -1292,7 +1291,7 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            assert_eq!(rel, want.file, "walk order differs from Python");
+            assert_eq!(rel, want.file, "walk order differs from the golden");
             assert_eq!(got.id(), want.id, "{rel}: id");
             assert_eq!(
                 got.phase.as_deref(),
@@ -1343,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn parity_with_python_listing_of_repo_tasks_tree() {
+    fn listing_of_repo_tasks_tree_matches_golden() {
         let fixture: ParityFixture = serde_json::from_str(include_str!(
             "../tests/fixtures/directory_source_parity.json"
         ))
@@ -1353,9 +1352,8 @@ mod tests {
         // The live active/ tree, read in place (read-only).
         assert_listing_matches(&fixture.active, &repo.join(".flywheel/tasks"));
 
-        // The archive holds the repo's real task definitions; Python listed
-        // it through a temporary tasks_dir whose active/ is a copy of it,
-        // and the Rust listing reads an identical copy.
+        // The archive holds the repo's real task definitions; the golden
+        // lists it through a temporary tasks_dir whose active/ is a copy.
         let tmp = TempDir::new().unwrap();
         let tasks_dir = tmp.path().join("tasks");
         copy_tree(

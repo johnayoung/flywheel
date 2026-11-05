@@ -1,5 +1,5 @@
 //! `build_cli_plan` flag mapping for the claude-code adapter: the CLI
-//! transport must carry every option the Python SDK transport honored.
+//! transport must carry every agent option.
 
 use flywheel_agents::claude_code::{build_cli_plan, cli::build_settings_value};
 use flywheel_agents::{

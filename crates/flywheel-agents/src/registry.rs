@@ -1,8 +1,6 @@
 //! Adapter registry: first-party registration plus caller-supplied plugins.
 //!
-//! Python discovered third-party adapters through the
-//! `flywheel_agents.adapters` entry-point group. Rust has no runtime
-//! entry-point mechanism, so plugins register through
+//! There is no runtime discovery: plugins register through
 //! [`AdapterRegistry::register_plugin`]: a factory that fails (returns an
 //! error or panics) is recorded on `load_failures` and never prevents the
 //! registry from loading.

@@ -326,7 +326,7 @@ Raw events are delivered to the sink before normalization; raw and normalized ev
 Transports solve protocol mechanics and contain no product behavior. They consume `RunningProcess` streams from a host rather than owning spawns.
 
 - **JSON lines (shipped)** — `src/jsonl.rs`: the shared `JsonLinesAgent` plus `ControlChannel` (request ids, responses, timeouts for the claude-code `control_request` protocol, inbound `can_use_tool` approval requests). Tolerates interleaved non-JSON lines and malformed JSON (preserved as `raw`, never dropped). Both shipped adapters ride it with their own `LineNormalizer`.
-- **`[agent] transport`** — `cli` is the only transport for both adapters. `transport = "sdk"` (the former in-process Python SDK path) is rejected: the claude-code adapter fails the run with `UnsupportedCapability`, and the policy loader rejects it at config load. The CLI transport speaks the same stream-json control protocol the vendor SDKs wrap, so nothing is lost.
+- **`[agent] transport`** — `cli` is the only transport for both adapters. Any other value is rejected at config load by the policy loader, and the claude-code adapter fails the run with `UnsupportedCapability`. The CLI transport speaks the same stream-json control protocol the vendor SDKs wrap.
 - **JSON-RPC (backlog, not built)** — request ids, notifications, dispatch, timeouts, cancellation. The codex app server (the shipped codex adapter uses headless exec JSONL instead).
 - **ACP (backlog, not built)** — Agent Client Protocol client: initialization, session creation, prompts, mode/model selection, permission requests, cancellation, plan and tool events. Gemini CLI, Qwen Code, and future ACP agents share it.
 

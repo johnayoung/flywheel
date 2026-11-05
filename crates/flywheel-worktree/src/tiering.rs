@@ -19,10 +19,8 @@
 //! first, so a protected file parks regardless of its computed tier (D-1,
 //! criterion 5).
 //!
-//! Port of the Python `flywheel_worktree.tiering` module. Deviation: a
-//! non-DONE run is handed straight to the inherited park/destroy path
-//! without classifying its diff -- the Python derived and witnessed a
-//! routing decision for a failed run that never routed anywhere.
+//! A non-DONE run is handed straight to the inherited park/destroy path
+//! without classifying its diff.
 
 use crate::submit_registry::{
     MERGE_STRATEGY, PHASE_STRATEGY, PR_STRATEGY, SubmitBuildRequest, SubmitRegistryError,
@@ -217,11 +215,6 @@ impl TierRoutingSubmitter {
         }
     }
 
-    pub fn with_policy_file(mut self, policy_file: impl Into<String>) -> Self {
-        self.policy_file = policy_file.into();
-        self
-    }
-
     pub fn inner(&self) -> &GitWorktreeSubmitter {
         &self.inner
     }
@@ -268,7 +261,7 @@ impl TierRoutingSubmitter {
     }
 
     /// Classify and route. Every leaf returns an outcome; an `Err` is the
-    /// Python "raise" that [`SubmitStrategy::submit`] contains.
+    /// failure that [`SubmitStrategy::submit`] contains.
     pub fn submit_inner(&self, req: &SubmitRequest) -> Result<SubmitOutcome, SubmitError> {
         if req.status != Status::Done {
             // Nothing routes: the inherited path parks (or destroys) the

@@ -1,8 +1,3 @@
-# Python bytecode (held-out oracle scripts may be Python)
-__pycache__/
-*.py[cod]
-.venv/
-
 # IDE
 .idea/
 .vscode/
@@ -24,9 +19,8 @@ Thumbs.db
 .flywheel/.merge.lock
 .flywheel/flywheel.sqlite*
 
-# Claude Code local config (commands + workflows are tracked; the rest is local)
+# Claude Code local config (workflows are tracked; the rest is local)
 .claude/*
-!.claude/commands/
 !.claude/workflows/
 
 # Serena MCP (symbol retrieval) per-project cache/config/memories

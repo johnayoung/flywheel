@@ -592,10 +592,7 @@ mod tests {
         let cargo = dir.path().join("cargo/bin");
         std::fs::create_dir_all(&venv).unwrap();
         std::fs::create_dir_all(&cargo).unwrap();
-        write_script(
-            &venv.join("fw"),
-            "#!/usr/bin/python3\nfrom flywheel._cli import main\n",
-        );
+        write_script(&venv.join("fw"), "#!/usr/bin/python3\nprint('hi')\n");
         // "This binary": an executable copy in cargo/bin.
         write_script(&cargo.join("fw"), "#!/bin/sh\nexit 0\n");
         let exe = cargo.join("fw").canonicalize().unwrap();
@@ -615,12 +612,7 @@ mod tests {
             fix.contains("hash -r") && fix.contains("cargo/bin"),
             "{fix}"
         );
-        // No pyvenv.cfg: a Python package's entry point, not a venv's.
-        assert!(fix.contains("a Python package's entry point"), "{fix}");
-        std::fs::write(dir.path().join("venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
-        let fix = on_path_check("fw", &found, Some(&exe)).fix.unwrap();
-        assert!(fix.contains("a Python venv's entry point"), "{fix}");
-        // A shell script: no Python advice at all.
+        // A shell script is reported the same way.
         write_script(&venv.join("fw"), "#!/bin/bash\necho hi\n");
         let check = on_path_check("fw", &found, Some(&exe));
         assert_eq!(check.level, Level::Fail);
@@ -629,7 +621,6 @@ mod tests {
             "{}",
             check.summary
         );
-        assert!(!check.fix.unwrap().contains("Python"));
         assert!(
             check.details.iter().any(|d| d.contains("shadowed")),
             "{:?}",

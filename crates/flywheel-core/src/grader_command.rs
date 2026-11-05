@@ -129,7 +129,7 @@ impl fmt::Display for Termination {
 /// it replaces the inherited environment (the orchestrator resolves ambient
 /// env plus `[sandbox.env]` overrides into one mapping). `None` inherits the
 /// worker process environment unchanged, so a run with no overrides is
-/// byte-identical to running the command by hand.
+/// identical to running the command by hand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandGraderOptions {
     /// Working directory for every grader; `None` inherits the worker's.
@@ -340,7 +340,7 @@ async fn kill_process_group(child: &mut Child, pgid: Option<i32>) {
     let _ = child.kill().await;
 }
 
-/// `exit_code` as Python reports it: the exit status, or the negated
+/// `exit_code` as `Popen.returncode` reports it: the exit status, or the negated
 /// signal number when the process was signal-terminated.
 fn python_exit_code(status: &std::process::ExitStatus) -> Option<i32> {
     if let Some(code) = status.code() {
@@ -414,8 +414,7 @@ fn take_capture(slot: &CaptureSlot) -> CapturedStream {
 /// Drive a spawned child to completion under the wall-clock ceiling,
 /// draining both pipes concurrently. "Completion" means the shell has
 /// exited *and* both pipes have reached EOF, so a detached grandchild that
-/// keeps a pipe open is treated like the Python `communicate()` -- it times
-/// out and the whole group is killed.
+/// keeps a pipe open times out and the whole group is killed.
 async fn supervise(mut child: Child, deadline: &Deadline, capture_cap: Option<usize>) -> Execution {
     let pgid = child.id().and_then(|pid| i32::try_from(pid).ok());
     // Registered for the life of the unreaped shell so a daemon shutdown

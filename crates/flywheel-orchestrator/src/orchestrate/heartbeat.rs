@@ -3,9 +3,9 @@
 //!
 //! The heartbeat is the worker's liveness proof: as long as the process is
 //! alive the lease is renewed, so another worker never reclaims a task that
-//! is actually running. It runs on a plain OS thread (the Rust spelling of
-//! the Python daemon thread): if the process dies the thread dies with it,
-//! the lease lapses, and the task becomes reclaimable. A lost lease (the
+//! is actually running. It runs on a plain OS thread: if the process dies
+//! the thread dies with it, the lease lapses, and the task becomes
+//! reclaimable. A lost lease (the
 //! worker stalled past the window, or clock skew let a peer steal it) stops
 //! renewal and raises the `lost` flag so the driving future can stop before
 //! landing or reporting a run whose claim a peer now owns.
@@ -174,7 +174,7 @@ impl ClaimHeartbeat {
     ///
     /// Waits at most `interval + 1s` for the thread to wind down (a renew
     /// blocked on a wedged store must not hang the worker); a thread still
-    /// alive past that is detached, exactly as the Python `join(timeout)`.
+    /// alive past that is detached.
     pub fn stop(mut self) -> TaskClaim {
         self.signal_stop();
         let (done, cv) = &*self.finished;

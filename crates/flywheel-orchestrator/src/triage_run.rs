@@ -351,8 +351,7 @@ const MAX_WAIT: Duration = Duration::from_secs(u32::MAX as u64);
 
 /// Sleep up to `seconds`, waking immediately when `stop` is set.
 ///
-/// Honors fractional seconds exactly (the Python shell truncated the wait
-/// to whole seconds and polled once per second).
+/// Honors fractional seconds exactly.
 pub fn interruptible_sleep(stop: &StopFlag, seconds: f64) {
     if seconds.is_nan() || seconds <= 0.0 {
         return;
@@ -464,7 +463,7 @@ impl TriageHost for ProductionHost {
 }
 
 /// Set `stop` on every SIGTERM/SIGINT for the life of the process, logging
-/// each one (the handler stays armed, as Python's did across cycles), and
+/// each one (the handler stays armed across cycles), and
 /// terminate every live agent process group (each leads a group of its
 /// own, out of reach of a signal aimed at this daemon's group).
 #[cfg(unix)]

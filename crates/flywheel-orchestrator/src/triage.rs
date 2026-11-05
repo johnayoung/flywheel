@@ -102,7 +102,7 @@ pub enum TriageError {
     /// `gh issue list` printed something that is not JSON.
     #[error("gh issue list returned invalid JSON: {0}")]
     InvalidListJson(String),
-    /// `gh issue list` printed JSON that is not a list; carries the Python
+    /// `gh issue list` printed JSON that is not a list; carries the
     /// type name of what it was (`dict`, `str`, ...).
     #[error("gh issue list returned {0}, expected a list")]
     ListNotAList(String),
@@ -323,8 +323,8 @@ const PROMPT_RULES: &str = concat!(
 /// *because* that stated outcome does not yet hold -- not merely any check
 /// that happens to fail on the current base. When the issue lacks the
 /// information to write such a grader, the agent must name the specific
-/// gaps for THIS issue rather than emit a vague check. Byte-identical to
-/// the Python engine's prompt.
+/// gaps for THIS issue rather than emit a vague check. Pinned by
+/// golden hashes.
 pub fn triage_authoring_prompt(title: &str, body: &str) -> String {
     let stripped = strip_spec_block(body);
     let human = if stripped.is_empty() {
@@ -514,8 +514,7 @@ fn ensure_authoritative_grader(plan: &TriagePlan) -> Vec<Map<String, Value>> {
 
 /// `json.dumps(value, indent=2)` as Python prints it: two-space pretty
 /// output with every non-ASCII character written as a `\u` escape (`ensure_ascii`),
-/// so a block the Rust engine embeds is byte-identical to one the Python
-/// engine embeds.
+/// so the embedded block is stable byte for byte.
 fn py_json_dumps_indent2(value: &Value) -> String {
     let pretty = serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string());
     let mut out = String::with_capacity(pretty.len());
@@ -1630,11 +1629,11 @@ mod tests {
         )
     }
 
-    // --- byte-identity with the Python engine ---------------------------------------
+    // --- byte-identity with the goldens ---------------------------------------------
 
     #[test]
-    fn authoring_prompt_is_byte_identical_to_python() {
-        // SHA-256 of the strings the Python `triage_authoring_prompt` emits.
+    fn authoring_prompt_matches_golden() {
+        // SHA-256 of the pinned `triage_authoring_prompt` output.
         assert_eq!(
             sha256_hex(&triage_authoring_prompt("TITLE_X", "BODY_X")),
             "8a7dc3fa63af0fd6262b8d0fd9b15199285344961fc8e6d7dbcef5857f36d197"
@@ -1653,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn comments_are_byte_identical_to_python() {
+    fn comments_match_golden() {
         assert_eq!(
             sha256_hex(&needs_detail_comment(&[])),
             "9bfbf64b0a399eff1155416d1e22ad46114647b6498292f293c673cc5751d105"
@@ -1673,7 +1672,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_spec_block_is_byte_identical_to_python_json_dumps() {
+    fn embedded_spec_block_matches_golden() {
         let receipt = TriageReceipt {
             command: "cmd".into(),
             exit_code: 1,

@@ -453,8 +453,8 @@ fn control_request_frames_distinguish_approvals() {
 
 #[test]
 fn sdk_shaped_exchange_folds_to_completed_run() {
-    // The same logical exchange the Python SDK-parity test used, as the
-    // stream-json lines the SDK itself consumed underneath.
+    // A logical SDK-shaped exchange, as the stream-json lines the SDK
+    // consumes underneath.
     let lines = [
         json!({"type": "system", "subtype": "init", "session_id": "sess-1", "model": "claude-opus-4"}).to_string(),
         json!({"type": "assistant", "message": {"content": [

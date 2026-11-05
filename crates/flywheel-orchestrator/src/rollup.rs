@@ -1357,8 +1357,7 @@ mod tests {
         );
     }
 
-    /// The fixture the original Python renderers were run against; the
-    /// expected strings below are their verbatim output (pinned for parity).
+    /// The fixture the goldens below were rendered from.
     fn fixture_rollup() -> Rollup {
         let store = InMemoryStore::new();
         // a: verified across a retry -- attempt 1 red, attempt 2 all green.
@@ -1429,7 +1428,7 @@ mod tests {
     }
 
     #[test]
-    fn render_text_matches_python_byte_for_byte() {
+    fn render_text_matches_golden_byte_for_byte() {
         let expected = "\
 rollup -- status is derived from grader evidence, not self-reported
 
@@ -1455,7 +1454,7 @@ rollup -- status is derived from grader evidence, not self-reported
     }
 
     #[test]
-    fn render_json_matches_python_byte_for_byte() {
+    fn render_json_matches_golden_byte_for_byte() {
         let expected = r#"{
   "totals": {
     "verified": 1,

@@ -1,16 +1,15 @@
 //! Single-task workflow: run and steer one flywheel task against a real agent.
 //!
-//! Port of the Python `flywheel_core.workflow`. This is the core single-task
-//! entry point: it owns no execution logic of its own -- running a task
-//! delegates to [`crate::harness::run_task`] with the production agents-backed
-//! invoker, and steering enqueues control commands. It covers exactly one
-//! task at a time; multi-task scheduling (selection over a prerequisite DAG,
-//! phases, the live dashboard) lives in the orchestrator crate.
+//! This is the core single-task entry point: it owns no execution logic of
+//! its own -- running a task delegates to [`crate::harness::run_task`] with
+//! the production agents-backed invoker, and steering enqueues control
+//! commands. It covers exactly one task at a time; multi-task scheduling
+//! (selection over a prerequisite DAG, phases, the live dashboard) lives in
+//! the orchestrator crate.
 //!
 //! The operator verbs are reachable through [`main`], routed by the product
-//! shell as the hidden `flywheel workflow` verb (the Rust spelling of
-//! `python -m flywheel_core.workflow`), with argparse-identical usage, help,
-//! and error text:
+//! shell as the hidden `flywheel workflow` verb, with argparse-style usage,
+//! help, and error text:
 //!
 //! ```text
 //! run GOAL_OR_FILE [--check CMD] [--rubric A] [--db PATH] [--sandbox DIR]
@@ -28,9 +27,8 @@
 //! agent's own claim). Events stream to stdout as they fire (readable by
 //! default, NDJSON with `--json`).
 //!
-//! There is no vendor SDK in the Rust runtime: the production invoker is the
-//! `flywheel-agents` runtime under a [`LocalHost`], the same path the Python
-//! `agent_id=` opt-in took. The live message stream therefore renders the
+//! The production invoker is the `flywheel-agents` runtime under a
+//! [`LocalHost`]. The live message stream therefore renders the
 //! normalized agent events ([`flywheel_agents::AgentEvent`]) rather than SDK
 //! message objects.
 
@@ -156,7 +154,7 @@ impl EventsMode {
         }
     }
 
-    /// Parse the Python spelling (`plain` / `json` / `none`).
+    /// Parse the CLI spelling (`plain` / `json` / `none`).
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "plain" => Some(EventsMode::Plain),
@@ -656,7 +654,7 @@ impl Default for AgentOptions {
 }
 
 /// Construct the task-agent [`AgentConfiguration`] from the sandbox
-/// primitives (the Rust spelling of Python's `build_agent_options`).
+/// primitives.
 ///
 /// The working directory is not part of the configuration: the invoker
 /// carries it and the claude-code adapter adds it as `--add-dir` itself.
@@ -838,9 +836,8 @@ pub fn install_cancel_on_signal(signal: &ShutdownSignal) -> Option<tokio::task::
 
 // --- run_task_object --------------------------------------------------------------
 
-/// The keyword surface of [`run_task_object`]; every field has the same
-/// meaning as its Python keyword and `Default` reproduces the Python
-/// defaults.
+/// The keyword surface of [`run_task_object`]; `Default` gives the
+/// library defaults.
 #[derive(Clone, Default)]
 pub struct RunTaskOptions {
     /// The agent to drive the run on; `None` resolves to
@@ -2450,10 +2447,10 @@ mod tests {
         items.iter().map(|s| (*s).to_owned()).collect()
     }
 
-    // --- Formatting (fixtures generated from the Python module) -----------------
+    // --- Formatting goldens --------------------------------------------------------
 
     #[test]
-    fn short_matches_python() {
+    fn short_matches_golden() {
         assert_eq!(short("hello", 60), "hello");
         assert_eq!(
             short(&"a".repeat(61), 60),
@@ -2483,7 +2480,7 @@ mod tests {
     }
 
     #[test]
-    fn payload_summary_matches_python() {
+    fn payload_summary_matches_golden() {
         assert_eq!(event_payload_summary(&Map::new(), 100), "");
         let payload = json!({
             "a": 1, "b": "two\nlines", "c": "x".repeat(45), "d": null, "e": 1.0,
@@ -2512,7 +2509,7 @@ mod tests {
     }
 
     #[test]
-    fn event_lines_match_python() {
+    fn event_lines_match_golden() {
         let r1 = record(
             "harness.attempt_started",
             ts_micro(),
@@ -2561,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_use_matches_python() {
+    fn tool_use_matches_golden() {
         let input = json!({"file_path": "/tmp/x.py", "content": "a".repeat(50), "c": 1, "d": 2});
         assert_eq!(
             format_tool_use("Write", input.as_object().unwrap()),

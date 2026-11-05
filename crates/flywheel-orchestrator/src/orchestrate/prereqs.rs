@@ -1,5 +1,4 @@
-//! The pieces of the Python `_workflow` / `workflow` modules the loop
-//! depends on: the latest-lifecycle read, the stranded-run query, the
+//! The workflow pieces the loop depends on: the latest-lifecycle read, the stranded-run query, the
 //! retry / turn defaults, and the git-backed phase-prerequisite
 //! reachability hold (spec 00079, #7).
 

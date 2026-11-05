@@ -316,10 +316,6 @@ impl<N: LineNormalizer> JsonLinesAgent<N> {
         self
     }
 
-    pub fn control_channel(&self) -> Option<&Arc<ControlChannel>> {
-        self.control.as_ref()
-    }
-
     /// The process's stdin writer, when the plan kept it open.
     pub fn process_stdin(&self) -> Option<StdinWriter> {
         self.process.stdin()

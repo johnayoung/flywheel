@@ -16,10 +16,6 @@
 //! Every check is read-only except the optional provision step
 //! ([`PreflightOptions::provision`]), which constructs a [`PostgresStore`] so
 //! its bootstrap DDL runs during init rather than at the first worker run.
-//!
-//! The Python module's first check verifies the optional `psycopg` extra is
-//! importable; the Rust driver is compiled in, so that check always passes
-//! and is kept only so reports line up across implementations.
 
 use std::fmt;
 use std::time::Duration;
@@ -69,7 +65,7 @@ pub enum CheckStatus {
 }
 
 impl CheckStatus {
-    /// The Python wire string (`"ok"` / `"warn"` / `"block"`).
+    /// The wire string (`"ok"` / `"warn"` / `"block"`).
     pub fn as_str(self) -> &'static str {
         match self {
             CheckStatus::Ok => "ok",
@@ -228,11 +224,7 @@ pub fn run_postgres_preflight(
     schema: &str,
     options: PreflightOptions,
 ) -> PreflightOutcome {
-    let mut checks = vec![PreflightCheck::new(
-        "postgres extra",
-        CheckStatus::Ok,
-        "postgres driver is built in",
-    )];
+    let mut checks = Vec::new();
     let password = dsn_password(dsn);
 
     let mut client = match connect(dsn) {
@@ -651,7 +643,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn check_status_wire_strings_match_python() {
+    fn check_status_wire_strings_are_pinned() {
         assert_eq!(CheckStatus::Ok.as_str(), "ok");
         assert_eq!(CheckStatus::Warn.to_string(), "warn");
         assert_eq!(CheckStatus::Block.as_str(), "block");

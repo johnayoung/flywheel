@@ -1,5 +1,4 @@
-//! Port of the Python `flywheel._worker_supervisor` module: the console's
-//! subprocess supervisor for the engine-on-launch worker, plus the
+//! The console's subprocess supervisor for the engine-on-launch worker, plus the
 //! spawn / supervise / stop machinery the autopilot supervisor shares.
 //!
 //! Bare `flywheel` (or `fw`) opens the operator console; this module is how
@@ -146,10 +145,10 @@ fn spawn_in_own_session(argv: &[String], log: File) -> io::Result<Child> {
     {
         use std::os::unix::process::CommandExt;
         // SAFETY: setsid(2) is async-signal-safe and touches no memory; it
-        // runs in the forked child before exec, which is exactly Python's
-        // `start_new_session=True`. A failure (the child is never already a
-        // group leader, so none is expected) leaves the child in the
-        // console's session, which only weakens Ctrl+C isolation.
+        // runs in the forked child before exec, giving it a session of its
+        // own. A failure (the child is never already a group leader, so none
+        // is expected) leaves the child in the console's session, which only
+        // weakens Ctrl+C isolation.
         unsafe {
             command.pre_exec(|| {
                 setsid();
@@ -185,8 +184,8 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<ExitStatus>
 /// A supervised child's stdout+stderr are redirected to `log_path`; on an
 /// unexpected exit the most informative line is typically the last
 /// non-blank one -- e.g. `flywheel worker: policy error: ...` (a config
-/// problem the operator can fix). Returns that line (capped), skipping the
-/// `RuntimeWarning` noise a Python-launched agent may emit, or `None` when
+/// problem the operator can fix). Returns that line (capped), skipping
+/// `RuntimeWarning` noise, or `None` when
 /// the log is empty/unreadable. Best-effort: a missing reason simply
 /// degrades to the bare exit code.
 pub fn read_supervised_death_reason(log_path: Option<&Path>) -> Option<String> {

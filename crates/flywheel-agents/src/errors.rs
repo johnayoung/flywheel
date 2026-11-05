@@ -43,7 +43,7 @@ pub enum AgentError {
 }
 
 impl AgentError {
-    /// Stable machine-routable code, matching the Python error classes.
+    /// Stable machine-routable code.
     pub const fn code(&self) -> &'static str {
         match self {
             AgentError::UnknownAgent(_) => "unknown_agent",
@@ -78,7 +78,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codes_and_retryability_match_python_taxonomy() {
+    fn codes_and_retryability_are_pinned() {
         assert_eq!(AgentError::UnknownAgent("x".into()).code(), "unknown_agent");
         assert!(!AgentError::UnknownAgent("x".into()).retryable());
         assert_eq!(

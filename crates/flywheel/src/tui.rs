@@ -432,7 +432,7 @@ impl InputBar {
 
 // --- Console flags ------------------------------------------------------------------
 
-/// The console's command-line flags (the Python `fw` argparse surface).
+/// The console's command-line flags.
 #[derive(Debug, Clone, PartialEq, Parser)]
 #[command(
     name = "fw",

@@ -505,7 +505,7 @@ fn oracle_grader(
         Some(interpreter) => format!("{interpreter} {quoted}"),
         None => quoted,
     };
-    // Keys sorted, mirroring the Python's `sort_keys=True` on disk.
+    // Keys sorted (`sort_keys=True` on disk).
     Ok(json!({"name": name, "run": run, "type": "command"}))
 }
 

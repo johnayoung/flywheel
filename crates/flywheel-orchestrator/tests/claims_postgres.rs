@@ -1,11 +1,10 @@
 //! Postgres-specific behaviour of
 //! `flywheel_orchestrator::claims_postgres::PostgresClaimStore`.
 //!
-//! The shared trait contract (and the Rust/Python interop) lives in
+//! The shared trait contract lives in
 //! `claims_contract.rs`, where the Postgres backend joins every case. The
 //! cases here pin what only makes sense for this backend: contention across
-//! separate connections (ports of the Python `test_postgres_claim_contention`
-//! and the advisory-lock cases in `test_orchestrator_claims`), the v3 -> v9
+//! separate connections (row contention and the advisory lock), the v3 -> v9
 //! in-place migration and the newer-sentinel refusal, concurrent first-open
 //! bootstrap safety (`pg_stat_database.deadlocks` must not move), schema
 //! isolation and coexistence with the core store, TIMESTAMPTZ / JSONB column
@@ -293,7 +292,7 @@ fn sweep_journals_reaped_claims_in_task_id_order_in_one_statement() {
 
 /// Materialize a schema-v3 orchestrator store (pre-ledger) plus a v6
 /// stop-events table that predates the `run_id` / `attribution` columns,
-/// seeded with rows -- the Python `_build_v3_postgres_store` fixture.
+/// seeded with rows.
 fn build_v3_schema(pg: &Postgres, schema: &str) {
     let mut client = pg.admin();
     client

@@ -1,13 +1,12 @@
 //! The `RunTask` seam: how the orchestrate loop hands one task to a runner.
 //!
-//! The Python loop called `flywheel_core.workflow.run_task_object` directly.
-//! The Rust loop instead owns a narrow seam -- [`RunTask`] -- carrying
-//! everything the loop hands the runner (task, seeded lifecycle, sandbox,
-//! agent env, invoke wrapper, policy-derived harness config, telemetry
-//! root, worker id, source ref, budgets). The product daemon binds it to the
-//! core workflow; tests drive it with scripted outcomes. The loop never
-//! inspects how the runner reaches its [`HarnessOutcome`]: it only reads
-//! the authoritative lifecycle the runner finalized in the store.
+//! The loop owns a narrow seam -- [`RunTask`] -- carrying everything the loop
+//! hands the runner (task, seeded lifecycle, sandbox, agent env, invoke
+//! wrapper, policy-derived harness config, telemetry root, worker id, source
+//! ref, budgets). The product daemon binds it to the core workflow; tests
+//! drive it with scripted outcomes. The loop never inspects how the runner
+//! reaches its [`HarnessOutcome`]: it only reads the authoritative lifecycle
+//! the runner finalized in the store.
 
 use crate::policy::Skills;
 use flywheel_core::agents_invoke::InvokeFn;
@@ -55,8 +54,7 @@ impl fmt::Display for RunMode {
 /// `[sandbox.*]` policy (spec 00037 SC-5/SC-6) plus the `[agent]` opt-in.
 ///
 /// Only primitives cross the seam: the runner builds its agent options from
-/// these the same way the Python `run_task_object` did. `agent_env` already
-/// carries the sandbox handle's contribution (the handle wins on
+/// these. `agent_env` already carries the sandbox handle's contribution (the handle wins on
 /// collision); `grader_env` is the full replacement environment command
 /// graders run with (`None` -- inherit as before).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

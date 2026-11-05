@@ -41,14 +41,6 @@ impl GraderType {
             GraderType::Manual => "manual",
         }
     }
-
-    /// Execution order: cost-cheapest first (`docs/task-schema.md`).
-    pub const COST_ORDER: [GraderType; 4] = [
-        GraderType::Command,
-        GraderType::Transcript,
-        GraderType::Rubric,
-        GraderType::Manual,
-    ];
 }
 
 impl fmt::Display for GraderType {
@@ -77,7 +69,7 @@ pub const KNOWN_GRADER_TYPES: [&str; 4] = ["command", "rubric", "manual", "trans
 
 /// A seconds value that remembers whether its source wrote an integer or a
 /// float, so content hashes, serialized task versions, and rendered prompts
-/// stay byte-identical to the Python implementation (`30` vs `30.0`).
+/// stay byte-stable (`30` vs `30.0`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Seconds {
@@ -507,11 +499,6 @@ impl Task {
             grader.validate()?;
         }
         self.budgets.validate()
-    }
-
-    /// Whether the task declares at least one manual-approval gate.
-    pub fn has_manual_gate(&self) -> bool {
-        self.graders.iter().any(|g| matches!(g, Grader::Manual(_)))
     }
 }
 

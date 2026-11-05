@@ -19,12 +19,10 @@
 //! space must never be mistaken for *lack* of it and silently drop an
 //! authoritative write.
 //!
-//! Port of the Python `flywheel_worktree._disk_preflight` module. The
-//! Python issued two system calls per probe (`shutil.disk_usage` plus
-//! `os.statvfs`); one `statvfs` carries both dimensions, so this port issues
-//! one. [`DiskPreflight`] implements the submitter's [`LedgerWriteGuard`]
-//! seam, which is how the merge, phase, pr, and tier-routing strategies wire
-//! it in front of every ledger append.
+//! One `statvfs` per probe carries both dimensions. [`DiskPreflight`]
+//! implements the submitter's [`LedgerWriteGuard`] seam, which is how the
+//! merge, phase, pr, and tier-routing strategies wire it in front of every
+//! ledger append.
 
 use crate::submitter::{LedgerWriteError, LedgerWriteGuard, Logger};
 use chrono::{DateTime, Utc};
@@ -54,7 +52,7 @@ pub const DEGRADED_SPACE_KIND: &str = "worker.disk_space_degraded";
 
 /// The free-inode count reported for a filesystem with no inode concept
 /// (`f_files == 0`), so the inode dimension never trips there rather than
-/// spuriously degrading. The Python used `sys.maxsize` for the same purpose.
+/// spuriously degrading.
 pub const UNLIMITED_INODES: u64 = u64::MAX;
 
 /// Observed free capacity on a filesystem: bytes and inodes.
@@ -385,10 +383,10 @@ pub fn telemetry_record(record: &DegradedSpaceRecord) -> TelemetryRecord {
     telemetry
 }
 
-/// Python's `repr()` of a `str`, so the preflight's log lines match the
-/// Python worker's byte for byte: single-quoted unless the text contains a
-/// single quote and no double quote, with backslashes, the chosen quote, and
-/// control characters escaped.
+/// Python's `repr()` of a `str`, for the preflight's log lines:
+/// single-quoted unless the text contains a single quote and no double
+/// quote, with backslashes, the chosen quote, and control characters
+/// escaped.
 fn py_repr(text: &str) -> String {
     let quote = if text.contains('\'') && !text.contains('"') {
         '"'
@@ -414,8 +412,8 @@ fn py_repr(text: &str) -> String {
     out
 }
 
-/// The Python exception class name `shutil.disk_usage` would have raised
-/// for an I/O error of this kind.
+/// The Python exception-class name for an I/O error of this kind, used in
+/// log lines.
 fn os_error_name(err: &std::io::Error) -> &'static str {
     match err.kind() {
         std::io::ErrorKind::NotFound => "FileNotFoundError",

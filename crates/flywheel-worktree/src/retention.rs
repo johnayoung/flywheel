@@ -1,8 +1,6 @@
 //! Worker housekeeping: parked-worktree retention and run-log retention.
 //!
-//! Port of the retention functions of the Python `flywheel_worktree.worker`
-//! module (`sweep_run_logs`, `retention_sweep`, `retention_targets`,
-//! `retention_cadence_tick`). Both sweeps are bounded, best-effort, and
+//! Both sweeps are bounded, best-effort, and
 //! never fail: housekeeping cannot escape into the run loop, so every
 //! unremovable file or directory is skipped, not raised.
 //!

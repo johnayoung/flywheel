@@ -149,8 +149,7 @@ impl TierVerdict {
 /// The `Display` text leads with the failure class
 /// (`DeadlineExceeded`, `AgentError`, `AgentRunFailure`) so a recorded drop
 /// or error-verdict reason distinguishes a wall-clock timeout from an
-/// ordinary agent failure -- the Rust spelling of the Python
-/// `f"{type(exc).__name__}: {exc}"`.
+/// ordinary agent failure (`<type name>: <message>`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvokeError {
     /// The call outlived its wall-clock ceiling and was cancelled.
@@ -633,7 +632,7 @@ fn parse_findings(tier: Tier, raw: Option<&Value>) -> Vec<Finding> {
     findings
 }
 
-/// The Python `str(value)` of a JSON value: strings verbatim, everything
+/// The `str(value)` of a JSON value: strings verbatim, everything
 /// else in its JSON spelling.
 fn value_as_text(value: &Value) -> String {
     match value {
@@ -693,22 +692,13 @@ fn json_truthy(value: &Value) -> bool {
     }
 }
 
-/// Run one tier's relevance agent and parse its verdict.
+/// Run one tier's relevance agent, with the cycle's shared repo digest
+/// appended to the tier prompt ([`prompt_with_digest`]), and parse its verdict.
 ///
 /// Any failure of the agent call is contained and returned as a
 /// not-relevant verdict carrying the error reason, so one failing tier never
 /// aborts the fan-out (best-effort, mirroring the orchestrator's report
 /// posture).
-pub async fn discover_tier(
-    tier: Tier,
-    repo_root: &Path,
-    invoker: &dyn AutopilotInvoker,
-) -> TierVerdict {
-    discover_tier_with(tier, repo_root, None, invoker).await
-}
-
-/// [`discover_tier`] with the cycle's shared repo digest appended to the
-/// tier prompt ([`prompt_with_digest`]).
 pub async fn discover_tier_with(
     tier: Tier,
     repo_root: &Path,
@@ -756,7 +746,7 @@ async fn join_all<F: Future>(futures: Vec<F>) -> Vec<F::Output> {
 /// Which path [`run_discovery`] drives.
 pub enum DiscoveryDriver<'a> {
     /// The per-tier fan-out through a (scripted) invoker: one
-    /// [`discover_tier`] call per tier, concurrent and best-effort.
+    /// [`discover_tier_with`] call per tier, concurrent and best-effort.
     PerTier(&'a dyn AutopilotInvoker),
     /// The single-session tier-subagent path through an injected runner.
     SingleSession(&'a dyn DiscoverySessionRunner),
@@ -1834,19 +1824,18 @@ mod tests {
     }
 
     #[test]
-    fn breakdown_serializes_final_under_the_python_key() {
+    fn breakdown_serializes_final_under_the_final_key() {
         let value = serde_json::to_value(breakdown()).unwrap();
         assert_eq!(value["final"], json!(10.0));
         assert_eq!(value["tier"], json!(6));
     }
 
-    // --- prompts: byte-identical to the Python ---------------------------------------
+    // --- prompts: byte-identical to the goldens --------------------------------------
 
-    const PY_TIER1_PROMPT: &str = "You are the relevance agent for autopilot TIER: 1 (Production down / active harm).\n\nTier remit: Outages, in-progress data loss, active breach, payments failing. Nothing below advances while open.\n\nRead the repository at /repo and decide whether THIS tier is relevant to THIS codebase. Relevance is per-codebase: e.g. \"production down\" is meaningless for a pure library. If the tier does not apply, say so -- do not invent work to fill it.\n\nIf the tier is relevant, surface zero or more concrete findings, each backed by evidence you actually observed in the repo. For each finding estimate, on a 0-10 scale: urgency (how fast cost grows if untouched), importance (value/risk-reduction if done), blocks (how many other efforts it unblocks), effort (cost to do). Set ready=true when the work can start now.\n\nRespond with exactly one fenced JSON block:\n```json\n{\n  \"relevant\": true,\n  \"reason\": \"one sentence on why this tier does or does not apply\",\n  \"findings\": [\n    {\"id\": \"short-slug\", \"title\": \"...\", \"detail\": \"...\", \"evidence\": [\"path:line or observation\"], \"urgency\": 0, \"importance\": 0, \"blocks\": 0, \"effort\": 0, \"ready\": true}\n  ]\n}\n```\nA not-relevant verdict carries relevant=false, a reason, and an empty findings list.";
+    const GOLDEN_TIER1_PROMPT: &str = "You are the relevance agent for autopilot TIER: 1 (Production down / active harm).\n\nTier remit: Outages, in-progress data loss, active breach, payments failing. Nothing below advances while open.\n\nRead the repository at /repo and decide whether THIS tier is relevant to THIS codebase. Relevance is per-codebase: e.g. \"production down\" is meaningless for a pure library. If the tier does not apply, say so -- do not invent work to fill it.\n\nIf the tier is relevant, surface zero or more concrete findings, each backed by evidence you actually observed in the repo. For each finding estimate, on a 0-10 scale: urgency (how fast cost grows if untouched), importance (value/risk-reduction if done), blocks (how many other efforts it unblocks), effort (cost to do). Set ready=true when the work can start now.\n\nRespond with exactly one fenced JSON block:\n```json\n{\n  \"relevant\": true,\n  \"reason\": \"one sentence on why this tier does or does not apply\",\n  \"findings\": [\n    {\"id\": \"short-slug\", \"title\": \"...\", \"detail\": \"...\", \"evidence\": [\"path:line or observation\"], \"urgency\": 0, \"importance\": 0, \"blocks\": 0, \"effort\": 0, \"ready\": true}\n  ]\n}\n```\nA not-relevant verdict carries relevant=false, a reason, and an empty findings list.";
 
-    /// sha256 of `tier_prompt(tier, Path("/repo"))` for every tier, from
-    /// the Python module.
-    const PY_TIER_PROMPT_HASHES: [&str; 11] = [
+    /// sha256 of `tier_prompt(tier, Path("/repo"))` for every tier.
+    const GOLDEN_TIER_PROMPT_HASHES: [&str; 11] = [
         "613b11fa0086476ab46f435c2ddb4f50ce28940e2770471df0b7f19501e48eeb",
         "6ffaa4c9270c1a2f38f565dd621c71486613fe55a028dbc8745cd087a000e6ae",
         "a6c4deff9b32f7752da15cc5a3d6146ea3f3605489aea1dc1a53dffbd8547174",
@@ -1860,28 +1849,31 @@ mod tests {
         "62f860999d5372f675f12290f00fc55423d6f95499315c224f2169aa3a5bb15a",
     ];
 
-    const PY_ORCHESTRATOR_PROMPT: &str = "You are autopilot's discovery dispatcher for the repository at /repo.\n\nEleven tier-relevance subagents are registered: tier-1, tier-2, tier-3, tier-4, tier-5, tier-6, tier-7, tier-8, tier-9, tier-10, tier-11.\n\nUse the Agent tool (a.k.a. Task) to dispatch EVERY one of these 11 subagents exactly once, each with subagent_type set to its key. Tell each subagent to read the repository, judge whether its tier is relevant to THIS codebase, and return its verdict as the fenced JSON block its own instructions define. Dispatch all 11 regardless of your own opinion -- do not skip, merge, or pre-judge any tier. The per-tier tool-results are read directly, so you need not restate them.\n\nAfter all 11 subagents return, emit exactly one final fenced JSON block aggregating every verdict as a safety net:\n```json\n{\"verdicts\": [{\"tier\": 1, \"relevant\": false, \"reason\": \"...\", \"findings\": []}]}\n```";
+    const GOLDEN_ORCHESTRATOR_PROMPT: &str = "You are autopilot's discovery dispatcher for the repository at /repo.\n\nEleven tier-relevance subagents are registered: tier-1, tier-2, tier-3, tier-4, tier-5, tier-6, tier-7, tier-8, tier-9, tier-10, tier-11.\n\nUse the Agent tool (a.k.a. Task) to dispatch EVERY one of these 11 subagents exactly once, each with subagent_type set to its key. Tell each subagent to read the repository, judge whether its tier is relevant to THIS codebase, and return its verdict as the fenced JSON block its own instructions define. Dispatch all 11 regardless of your own opinion -- do not skip, merge, or pre-judge any tier. The per-tier tool-results are read directly, so you need not restate them.\n\nAfter all 11 subagents return, emit exactly one final fenced JSON block aggregating every verdict as a safety net:\n```json\n{\"verdicts\": [{\"tier\": 1, \"relevant\": false, \"reason\": \"...\", \"findings\": []}]}\n```";
 
-    const PY_AUTHORING_PROMPT: &str = "You are autopilot's headless authoring agent. Compile the finding below into one or more flywheel tasks following the fw-spec and fw-plan contracts -- a one-sentence goal and the strongest out-of-band grader you can express.\n\nRepository: /repo\nFinding (Tier 6, Test coverage (shipped/in-flight)): add coverage for the parser\nDetail: the parser module has no tests\nEvidence:\n  - src/parser.py:1\n  - src/parser.py:40\n\nHARD INTEGRITY RULES:\n- Every emitted task must carry at least one grader.\n- The authoritative grader MUST be either (a) a command that invokes a check already committed in this repo (a test/lint/build command that exists BEFORE this task runs), or (b) a registered held-out oracle by absolute path. It must NEVER be a brand-new check this task's own diff creates -- that is self-attestation.\n- Resolve any ambiguity a human would be asked about as a recorded assumption; never emit a vaguer task to dodge a question.\n- If you cannot express an out-of-band grader for this finding, do not invent one: set \"dropped\" to a one-sentence reason and emit no task.\n\nRespond with exactly one fenced JSON block:\n```json\n{\n  \"tasks\": [\n    {\n      \"task\": {\"id\": \"kebab-id\", \"goal\": \"one sentence\", \"graders\": [{\"type\": \"command\", \"run\": \"<existing repo check>\"}], \"tags\": [], \"context\": {}},\n      \"authoritative_grader\": \"<run string matching a command grader above>\",\n      \"grader_source\": \"repo_command\",\n      \"grader_target\": \"<repo-relative path to the pre-existing check the grader runs>\",\n      \"creates_files\": [\"<paths this task's diff will create>\"],\n      \"assumptions\": [\"<ambiguity you resolved yourself>\"]\n    }\n  ],\n  \"dropped\": \"\"\n}\n```";
+    const GOLDEN_AUTHORING_PROMPT: &str = "You are autopilot's headless authoring agent. Compile the finding below into one or more flywheel tasks following the fw-spec and fw-plan contracts -- a one-sentence goal and the strongest out-of-band grader you can express.\n\nRepository: /repo\nFinding (Tier 6, Test coverage (shipped/in-flight)): add coverage for the parser\nDetail: the parser module has no tests\nEvidence:\n  - src/parser.py:1\n  - src/parser.py:40\n\nHARD INTEGRITY RULES:\n- Every emitted task must carry at least one grader.\n- The authoritative grader MUST be either (a) a command that invokes a check already committed in this repo (a test/lint/build command that exists BEFORE this task runs), or (b) a registered held-out oracle by absolute path. It must NEVER be a brand-new check this task's own diff creates -- that is self-attestation.\n- Resolve any ambiguity a human would be asked about as a recorded assumption; never emit a vaguer task to dodge a question.\n- If you cannot express an out-of-band grader for this finding, do not invent one: set \"dropped\" to a one-sentence reason and emit no task.\n\nRespond with exactly one fenced JSON block:\n```json\n{\n  \"tasks\": [\n    {\n      \"task\": {\"id\": \"kebab-id\", \"goal\": \"one sentence\", \"graders\": [{\"type\": \"command\", \"run\": \"<existing repo check>\"}], \"tags\": [], \"context\": {}},\n      \"authoritative_grader\": \"<run string matching a command grader above>\",\n      \"grader_source\": \"repo_command\",\n      \"grader_target\": \"<repo-relative path to the pre-existing check the grader runs>\",\n      \"creates_files\": [\"<paths this task's diff will create>\"],\n      \"assumptions\": [\"<ambiguity you resolved yourself>\"]\n    }\n  ],\n  \"dropped\": \"\"\n}\n```";
 
     #[test]
-    fn tier_prompt_is_byte_identical_to_python() {
-        assert_eq!(tier_prompt(Tier::ProductionDown, &repo()), PY_TIER1_PROMPT);
-        for (tier, expected) in Tier::ALL.iter().zip(PY_TIER_PROMPT_HASHES) {
+    fn tier_prompt_matches_golden() {
+        assert_eq!(
+            tier_prompt(Tier::ProductionDown, &repo()),
+            GOLDEN_TIER1_PROMPT
+        );
+        for (tier, expected) in Tier::ALL.iter().zip(GOLDEN_TIER_PROMPT_HASHES) {
             assert_eq!(sha256(&tier_prompt(*tier, &repo())), expected, "{tier:?}");
         }
     }
 
     #[test]
-    fn orchestrator_prompt_is_byte_identical_to_python() {
-        assert_eq!(orchestrator_prompt(&repo()), PY_ORCHESTRATOR_PROMPT);
+    fn orchestrator_prompt_matches_golden() {
+        assert_eq!(orchestrator_prompt(&repo()), GOLDEN_ORCHESTRATOR_PROMPT);
     }
 
     #[test]
-    fn authoring_prompt_is_byte_identical_to_python() {
+    fn authoring_prompt_matches_golden() {
         let mut f = coverage_finding();
         f.evidence.push("src/parser.py:40".to_owned());
-        assert_eq!(authoring_prompt(&f, &repo()), PY_AUTHORING_PROMPT);
+        assert_eq!(authoring_prompt(&f, &repo()), GOLDEN_AUTHORING_PROMPT);
         let bare = Finding::new("t11-x", Tier::Polish, "tidy");
         let prompt = authoring_prompt(&bare, &repo());
         assert_eq!(
@@ -2393,8 +2385,7 @@ mod tests {
         let expected: BTreeSet<String> = Tier::ALL.iter().map(|t| tier_agent_key(*t)).collect();
         assert_eq!(agents.keys().cloned().collect::<BTreeSet<_>>(), expected);
         assert_eq!(agents["tier-1"]["model"], json!("claude-fake-1"));
-        // The sdk transport does not exist in the Rust runtime: nothing is
-        // pinned so the adapter's cli default applies.
+        // No transport is pinned, so the adapter's cli default applies.
         assert!(configuration.option("transport").is_none());
     }
 
@@ -3517,7 +3508,7 @@ while true; do text "still streaming"; sleep 0.01; done"#;
     fn dispatcher_prompt_for_a_subset_names_only_those_tiers() {
         assert_eq!(
             orchestrator_prompt_for(&repo(), &Tier::ALL),
-            PY_ORCHESTRATOR_PROMPT
+            GOLDEN_ORCHESTRATOR_PROMPT
         );
         assert_eq!(
             orchestrator_prompt_for(&repo(), &[Tier::CoreFeatureWork, Tier::Documentation]),
@@ -3531,7 +3522,7 @@ while true; do text "still streaming"; sleep 0.01; done"#;
         assert_eq!(
             tier,
             format!(
-                "{PY_TIER1_PROMPT}\n\nSHARED REPOSITORY DIGEST (built once this cycle by \
+                "{GOLDEN_TIER1_PROMPT}\n\nSHARED REPOSITORY DIGEST (built once this cycle by \
                  autopilot; use it for the repo's layout, manifests, and recent history instead \
                  of re-surveying them, and open files only to confirm specific evidence):\n\
                  <repo-digest>\nDIGEST\n</repo-digest>"
@@ -3540,7 +3531,7 @@ while true; do text "still streaming"; sleep 0.01; done"#;
         let mut f = coverage_finding();
         f.evidence.push("src/parser.py:40".to_owned());
         let authoring = prompt_with_digest(authoring_prompt(&f, &repo()), Some("DIGEST"));
-        assert!(authoring.starts_with(PY_AUTHORING_PROMPT));
+        assert!(authoring.starts_with(GOLDEN_AUTHORING_PROMPT));
         assert!(authoring.ends_with("<repo-digest>\nDIGEST\n</repo-digest>"));
     }
 

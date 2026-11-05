@@ -418,8 +418,8 @@ pub const INVOCATION_TEARDOWN_SECONDS: f64 = DEFAULT_KILL_GRACE.as_secs_f64() * 
 
 /// Stop an in-flight invocation and wait for its agent to die.
 ///
-/// Python awaited `agent.cancel(); agent.wait()` before propagating a
-/// hang, deadline, or interrupt; dropping the future would only *request*
+/// The agent is cancelled and awaited before a hang, deadline, or interrupt
+/// propagates; dropping the future would only *request*
 /// cancellation and leave the teardown running detached, so a retry could
 /// spawn a new agent into the same worktree beside the old one. An invoker
 /// that bound `abort` resolves once its agent is terminated and reaped;

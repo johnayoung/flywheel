@@ -302,11 +302,6 @@ impl DashboardApp {
         self.last_worker_status.as_ref()
     }
 
-    /// The most recent autopilot status, or `None` if no control is wired.
-    pub fn autopilot_status(&self) -> Option<&DaemonStatus> {
-        self.last_autopilot_status.as_ref()
-    }
-
     /// The run ids the table shows, in display order.
     pub fn visible_run_order(&self) -> Vec<String> {
         self.visible.iter().map(|r| r.run_id.clone()).collect()
@@ -347,15 +342,6 @@ impl DashboardApp {
 
     pub fn screen_depth(&self) -> usize {
         self.stack.len()
-    }
-
-    /// The topmost pushed screen, if any.
-    pub fn top_screen(&self) -> Option<&Screen> {
-        self.stack.last()
-    }
-
-    pub fn top_screen_mut(&mut self) -> Option<&mut Screen> {
-        self.stack.last_mut()
     }
 
     /// The session screen on top of the stack, if that is what is showing.

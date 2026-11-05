@@ -268,7 +268,7 @@ pub fn cmd_status(
     let worker_ids = live_worker_ids(store)?;
 
     // One ledger read per DONE run, shared by the per-row annotation and
-    // the store-backed strand surface (the Python reads each run twice).
+    // the store-backed strand surface.
     let mut park_by_run: BTreeMap<String, Option<Park>> = BTreeMap::new();
     let mut park_for = |run_id: &str| -> Result<Option<Park>, StoreError> {
         if let Some(cached) = park_by_run.get(run_id) {
@@ -548,7 +548,7 @@ mod tests {
         serde_json::from_str(&run_status(tmp, store, claims, true, false)).unwrap()
     }
 
-    /// The seeded scenario the Python fixture rendered (see the embedded
+    /// The seeded scenario the goldens render (see the embedded
     /// expectations below): seven listed tasks across two phases plus
     /// rowless stops and a rowless strand.
     fn scenario() -> (TempDir, InMemoryStore, InMemoryClaimStore) {
@@ -843,7 +843,7 @@ mod tests {
 ";
 
     #[test]
-    fn text_surface_is_byte_identical_to_python() {
+    fn text_surface_matches_golden() {
         let (tmp, store, claims) = scenario();
         assert_eq!(
             run_status(&tmp, &store, &claims, false, false),
@@ -852,14 +852,14 @@ mod tests {
     }
 
     #[test]
-    fn json_surface_is_byte_identical_to_python() {
+    fn json_surface_matches_golden() {
         let (tmp, store, claims) = scenario();
         let expected = EXPECTED_JSON.replace("<TMP>", &tmp.path().display().to_string());
         assert_eq!(run_status(&tmp, &store, &claims, true, false), expected);
     }
 
     #[test]
-    fn rollup_surfaces_are_byte_identical_to_python() {
+    fn rollup_surfaces_match_golden() {
         let (tmp, store, claims) = scenario();
         assert_eq!(
             run_status(&tmp, &store, &claims, false, true),

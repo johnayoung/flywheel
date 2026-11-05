@@ -17,10 +17,9 @@
 //! resulting values in memory; once constructed the redactor is a pure
 //! transform like every other built-in.
 //!
-//! Output parity: for the same record, salt, and configuration every
-//! redactor here produces byte-identical output to the Python
-//! `flywheel_core.redaction` module (token format, HMAC-SHA256 digest
-//! prefix, pattern order, overlap handling).
+//! Output stability: for the same record, salt, and configuration every
+//! redactor here produces byte-identical output (token format, HMAC-SHA256
+//! digest prefix, pattern order, overlap handling).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -976,11 +975,11 @@ mod tests {
         PatternRedactor::new(&[ANTHROPIC], None).unwrap()
     }
 
-    // --- Token format and HMAC parity with Python ---------------------------
+    // --- Token format and HMAC goldens ----------------------------------------
 
     #[test]
-    fn format_token_matches_python_hmac_digests() {
-        // Digests computed with Python's
+    fn format_token_matches_pinned_hmac_digests() {
+        // Digests are
         // `hmac.new(salt, text, hashlib.sha256).hexdigest()[:8]`.
         assert_eq!(
             format_token(

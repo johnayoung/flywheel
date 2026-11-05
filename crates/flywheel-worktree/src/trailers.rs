@@ -14,11 +14,9 @@
 //! harness-derived value (spec 00078, D-2), so a forged provenance value
 //! cannot survive on the landed commit.
 //!
-//! Port of the Python `flywheel_worktree._trailers` module. Where the Python
-//! issued four `git` reads per rewritten commit (parents, tree, message,
-//! identity), this port reads all of them through one `git log -1` call, so
-//! a stamp costs three git invocations per commit instead of six; the
-//! rewritten messages are byte-identical.
+//! Each rewritten commit's parents, tree, message, and identity are read
+//! through one `git log -1` call, so a stamp costs three git invocations per
+//! commit.
 
 use regex::Regex;
 use std::io::Write;
@@ -211,9 +209,8 @@ fn read_commit(repo: &Path, sha: &str) -> Result<CommitRecord, TrailerError> {
 /// authoritative `trailers` appended as a well-formed trailer block.
 ///
 /// `raw_body` is the `%B` render of the message. Lines are split and
-/// re-joined with `\n` exactly as the Python did (dropping the render's
-/// trailing newline), then handed to `git interpret-trailers`, so the
-/// resulting message is byte-identical to the Python stamp.
+/// re-joined with `\n` (dropping the render's trailing newline), then
+/// handed to `git interpret-trailers`.
 fn stamped_message(
     repo: &Path,
     raw_body: &str,
@@ -537,8 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn stamped_message_is_byte_identical_to_the_python_rendering() {
-        // The Python port: `%B` render -> splitlines -> join("\n") ->
+    fn stamped_message_matches_golden() {
+        // `%B` render -> splitlines -> join("\n") ->
         // interpret-trailers. For a plain subject the result is the subject,
         // a blank line, and the three trailer lines.
         let (_dir, repo) = repo();

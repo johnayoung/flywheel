@@ -75,8 +75,7 @@ pub fn resolve_auth(
     }
 }
 
-/// Build a [`ContainerConfig`] from primitives (the Python
-/// `build_container_strategy` parameters).
+/// Build a [`ContainerConfig`] from primitives.
 ///
 /// `exec_timeout` of `0` (or negative) means unbounded; an empty
 /// `egress_network` means unset. `management_timeout` is the wall-clock

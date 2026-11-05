@@ -6,7 +6,7 @@
 //! typed event from a stored row. The common columns (`run_id`, `ts`,
 //! `attempt_number`, `sequence`, `id`) live on the row, not in the payload;
 //! the `kind` discriminator is its own column and is never written into the
-//! payload text, so rows are byte-compatible with the Python implementation.
+//! payload text, so rows keep a stable byte format.
 //!
 //! Timestamps are written as RFC 3339 UTC in exactly the form Python's
 //! `datetime.isoformat()` emits for an aware UTC value
@@ -171,10 +171,9 @@ pub fn event_kind(event: &DomainEvent) -> &'static str {
 /// Project the event-specific fields into a JSON object.
 ///
 /// Excludes the common columns and the `kind` discriminator, which the store
-/// persists as dedicated columns. Fields the Python implementation omits when
-/// at their default (a park's `receipts`, a land's `rung`, the agent-session
-/// usage pair) are omitted here too, so a row written by either side is
-/// byte-identical for the same event.
+/// persists as dedicated columns. Fields at their default (a park's
+/// `receipts`, a land's `rung`, the agent-session usage pair) are omitted,
+/// so a row is byte-identical for the same event.
 pub fn event_payload(payload: &DomainEventPayload) -> Result<Map<String, Value>, EventSerdeError> {
     match serde_json::to_value(payload)? {
         Value::Object(mut map) => {
@@ -191,8 +190,7 @@ pub fn event_payload_json(payload: &DomainEventPayload) -> Result<String, EventS
 }
 
 /// Reconstruct a typed payload from the `kind` column and a parsed payload
-/// object. Missing optional fields take the same defaults the Python reader
-/// applies.
+/// object. Missing optional fields take their defaults.
 pub fn payload_from_value(
     kind: &str,
     payload: Map<String, Value>,
@@ -371,12 +369,12 @@ mod tests {
         let text = serde_json::to_string(&holder).unwrap();
         assert_eq!(text, r#"{"ts":"2026-05-28T20:26:40+00:00","maybe":null}"#);
         assert_eq!(serde_json::from_str::<Holder>(&text).unwrap(), holder);
-        let python: Holder = serde_json::from_str(
+        let naive: Holder = serde_json::from_str(
             r#"{"ts":"2026-05-28T20:26:40","maybe":"2026-05-28T20:26:41+00:00"}"#,
         )
         .unwrap();
         assert_eq!(
-            python,
+            naive,
             Holder {
                 ts: at(0),
                 maybe: Some(at(1))
@@ -643,8 +641,8 @@ mod tests {
     }
 
     #[test]
-    fn python_written_rows_are_readable() {
-        // Payloads exactly as the Python store serializes them, including
+    fn stored_rows_with_isoformat_timestamps_are_readable() {
+        // Payloads in the stored wire format, including
         // the isoformat timestamps inside attempt events and a null name.
         let started = EventRow {
             id: Some(4),

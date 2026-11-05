@@ -2232,7 +2232,7 @@ fn deferred_subsystems_are_listed_and_not_silently_implemented() {
 }
 
 #[test]
-fn harness_config_defaults_match_python() {
+fn harness_config_defaults_are_pinned() {
     let cfg = HarnessConfig::default();
     assert_eq!(cfg.max_retries, 0);
     assert_eq!(cfg.max_cost_usd, 0.0);

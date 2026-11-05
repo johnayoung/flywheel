@@ -39,7 +39,7 @@
 #                          --all-targets -- -W clippy::pedantic.
 #   clean_build_secs       proxy: wall-clock of cargo build --release
 #                          -p flywheel after cargo clean --release for the
-#                          six workspace crates only (third-party deps stay
+#                          seven workspace crates only (third-party deps stay
 #                          cached), so it measures our own compile cost.
 #   test_secs              wall-clock of cargo test --workspace after the
 #                          test binaries are pre-built (--no-run), i.e. test
@@ -74,8 +74,8 @@ for arg in "$@"; do
   esac
 done
 
-WORKSPACE_CRATES=(flywheel-agents flywheel-core flywheel-orchestrator flywheel-worktree flywheel-container flywheel)
-BENCH_TARGETS=(core_hot_paths orchestrator_hot_paths)
+WORKSPACE_CRATES=(flywheel-agents flywheel-core flywheel-orchestrator flywheel-worktree flywheel-container flywheel-hub flywheel)
+BENCH_TARGETS=(core_hot_paths orchestrator_hot_paths worktree_hot_paths)
 
 log() { echo "[scorecard] $*" >&2; }
 

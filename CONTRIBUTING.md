@@ -16,7 +16,7 @@ Stable Rust (`rust-version` 1.91, edition 2024) via [rustup](https://rustup.rs/)
 ```bash
 git clone https://github.com/johnayoung/flywheel
 cd flywheel
-cargo build                          # all six crates under crates/
+cargo build                          # all seven crates under crates/
 cargo install --path crates/flywheel # optional: put flywheel + fw on PATH
 ```
 

@@ -10,9 +10,7 @@
 //! IO, no clock, no async.
 //!
 //! The input digest is `sha256` over [`stable_encode`], a deterministic
-//! structural encoding that is byte-identical to the Python
-//! `flywheel_core.loop_guard._stable_encode`, so digests recorded by either
-//! implementation agree.
+//! structural encoding, so recorded digests stay comparable across runs.
 
 use crate::invoker::ToolInteraction;
 use serde::{Deserialize, Serialize};
@@ -148,7 +146,7 @@ fn python_float_repr(value: f64) -> String {
 }
 
 fn encode_str_into(out: &mut String, s: &str) {
-    // Length is the Python `len(str)`: code points, not bytes.
+    // Length counts code points, not bytes.
     let _ = write!(out, "S:{}:{}", s.chars().count(), s);
 }
 
@@ -210,11 +208,10 @@ fn encode_map_into(out: &mut String, map: &Map<String, Value>) {
 
 /// Deterministic structural encoding of a tool-input value.
 ///
-/// Byte-identical structured inputs collide and key-order noise in
-/// mappings does not split them. The encoding is tagged (`N`, `T`/`F`,
-/// `I:`, `X:`, `S:<len>:`, `L[...]`, `D{k=v,...}`) and matches the Python
-/// implementation byte-for-byte: string lengths count code points and
-/// floats use Python `repr` formatting.
+/// Byte-identical structured inputs collide and key-order noise in mappings
+/// does not split them. The encoding is tagged (`N`, `T`/`F`, `I:`, `X:`,
+/// `S:<len>:`, `L[...]`, `D{k=v,...}`) and is pinned byte-for-byte: string
+/// lengths count code points and floats use Python `repr` formatting.
 pub fn stable_encode(value: &Value) -> String {
     let mut out = String::new();
     encode_into(&mut out, value);
@@ -419,12 +416,11 @@ mod tests {
         }
     }
 
-    // --- stable encoding parity with the Python implementation ---
+    // --- stable encoding goldens ---
 
     #[test]
-    fn stable_encode_matches_python_byte_for_byte() {
-        // Expected encodings and digests were produced by running the
-        // Python `_stable_encode` / `_digest` on the same inputs.
+    fn stable_encode_matches_golden_byte_for_byte() {
+        // Golden encodings and digests for these inputs.
         let cases: Vec<(Value, &str, &str)> = vec![
             (
                 json!({"cmd": "ls"}),

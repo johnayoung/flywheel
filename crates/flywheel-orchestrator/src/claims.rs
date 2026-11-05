@@ -1,5 +1,3 @@
-//! Port of the Python `flywheel_orchestrator._claims` module.
-//!
 //! Per-task lease store for multi-worker mutual exclusion -- the
 //! orchestrator's *own* persistence, independent of flywheel-core's store. A
 //! claim is transient coordination state (a worker holds a lease while running
@@ -14,12 +12,9 @@
 //!
 //! Every timestamp column is written with
 //! [`flywheel_core::event_serde::format_timestamp`] and read with
-//! [`flywheel_core::event_serde::parse_timestamp`], which reproduce Python's
-//! aware-UTC `datetime.isoformat()` byte for byte, so one SQLite file can be
-//! driven by Rust and Python workers at once and both agree on lease expiry.
-//! The DDL below is the Python module's inline schema verbatim (plus one
-//! additive index), so a store bootstrapped by either side opens cleanly in
-//! the other.
+//! [`flywheel_core::event_serde::parse_timestamp`], which write aware-UTC
+//! `datetime.isoformat()` text byte for byte, so every worker sharing one
+//! SQLite file agrees on lease expiry.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -56,10 +51,6 @@ use flywheel_core::task::Task;
 /// * v7 `orchestrator_stop_events.run_id`
 /// * v8 `orchestrator_session_pauses` ledger
 /// * v9 `orchestrator_stop_events.attribution`
-///
-/// This matches the Python module's sentinel so a store bootstrapped by
-/// either implementation opens in the other without tripping the
-/// newer-than-code guard.
 pub const CURRENT_ORCH_SCHEMA_VERSION: u32 = 9;
 
 // --- Claim-event vocabulary --------------------------------------------------------
@@ -315,9 +306,8 @@ pub struct WorkItemRecord {
 
 /// One observed work item, as handed to [`ClaimStore::upsert_work_item`].
 ///
-/// The catalog write-side shape: the Python store takes a `WorkItem` and
-/// derives `task_content_hash` with `task_digest`; this crate's sources
-/// module is independent of the store, so the observation carries the digest
+/// The catalog write-side shape: the sources module is independent of
+/// the store, so the observation carries the digest
 /// itself ([`WorkItemObservation::for_task`] computes it).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkItemObservation {
@@ -376,10 +366,6 @@ pub struct OrchestratorEventRecord {
     pub lease_expires_at: DateTime<Utc>,
     pub occurred_at: DateTime<Utc>,
 }
-
-/// Alias matching the assignment's naming; the record type is
-/// [`OrchestratorEventRecord`].
-pub type OrchestratorEvent = OrchestratorEventRecord;
 
 /// One immutable `orchestrator_stop_events` row -- a pre-run dead-end, a
 /// human-review routing, or a bookkeeping marker. Never deduped: recurrence
@@ -469,8 +455,8 @@ pub struct GraphSnapshotRecord {
 
 // --- Encoding helpers -----------------------------------------------------------------
 
-/// Canonical JSON-array encoding of a string set, byte-identical to the
-/// Python `json.dumps(sorted(values))` (`", "` separator, ASCII-escaped).
+/// Canonical JSON-array encoding of a string set, byte-identical to
+/// `json.dumps(sorted(values))` (`", "` separator, ASCII-escaped).
 pub fn encode_str_set(values: &BTreeSet<String>) -> String {
     let mut out = String::from("[");
     for (index, value) in values.iter().enumerate() {
@@ -1371,14 +1357,12 @@ fn clamp_pause(
 
 // --- SQLite store -----------------------------------------------------------------------
 
-/// The orchestrator DDL, verbatim from the Python module so one file serves
-/// both implementations. Every statement is idempotent (`IF NOT EXISTS`);
+/// The orchestrator DDL. Every statement is idempotent (`IF NOT EXISTS`);
 /// the column-level additive migrations run after it in [`bootstrap`].
 ///
-/// One addition over the Python DDL: `idx_orchestrator_stop_events_kind`,
-/// which backs the human-review queue read (`WHERE kind IN (...)`) on a
-/// ledger that otherwise grows without bound. It is purely additive -- the
-/// Python store opens the file unchanged.
+/// [`EXTRA_INDEX_SQL`] adds `idx_orchestrator_stop_events_kind`, which backs
+/// the human-review queue read (`WHERE kind IN (...)`) on a ledger that
+/// otherwise grows without bound. It is purely additive.
 const SCHEMA_SQL: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -1500,9 +1484,8 @@ CREATE INDEX IF NOT EXISTS idx_orchestrator_session_pauses_pause_until
   ON orchestrator_session_pauses (pause_until);
 ";
 
-/// The index this port adds over the Python DDL (see [`SCHEMA_SQL`]). Kept
-/// as a separate statement so the shared block above stays byte-identical to
-/// the Python module's.
+/// The supplementary stop-events index (see [`SCHEMA_SQL`]), kept as a
+/// separate statement applied after the base DDL.
 const EXTRA_INDEX_SQL: &str = "
 CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_kind
   ON orchestrator_stop_events (kind, id);
@@ -1513,9 +1496,9 @@ CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_kind
 /// touches only its own tables).
 ///
 /// One connection behind a mutex; every mutation runs in a `BEGIN IMMEDIATE`
-/// transaction so concurrent instances on one file (several workers, or Rust
-/// and Python side by side) serialize their check-and-write through SQLite's
-/// own lock with a 5s busy timeout.
+/// transaction so concurrent instances on one file (several workers)
+/// serialize their check-and-write through SQLite's own lock with a 5s busy
+/// timeout.
 #[derive(Debug)]
 pub struct SqliteClaimStore {
     conn: Mutex<Connection>,
@@ -2600,7 +2583,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_matches_python_sentinel() {
+    fn schema_version_sentinel_is_pinned() {
         assert_eq!(CURRENT_ORCH_SCHEMA_VERSION, 9);
     }
 
@@ -2712,7 +2695,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_error_message_matches_python_shape() {
+    fn schema_error_message_shape_is_pinned() {
         let err = OrchestratorSchemaError {
             observed: Some(12),
             expected: CURRENT_ORCH_SCHEMA_VERSION,

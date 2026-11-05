@@ -497,26 +497,26 @@ mod tests {
         }
     }
 
-    const PY_INIT_PROMPT: &str = "You are the onboarding-assessment agent for `flywheel init`.\n\nInspect the repository at /repo: detect its toolchain (build system, test runner, linter), and propose the flywheel policy a maintainer would write by hand.\n\nDerive the default grader commands from checks that ALREADY exist in this repo (the test/lint/build commands a contributor runs today). Do not invent a command the repo cannot run. Propose a sandbox setup command that warms a fresh checkout (dependency install/fetch) when one applies, the autopilot intake cadence, and any build-output directories that belong in .gitignore.\n\nRespond with exactly one fenced JSON block:\n```json\n{\n  \"source_kind\": \"directory\",\n  \"default_graders\": [\"<existing test command>\", \"<existing lint command>\"],\n  \"sandbox_setup\": \"<dependency install/fetch command, or null>\",\n  \"autopilot\": {\"target_depth\": 3, \"interval_seconds\": 600},\n  \"gitignore_additions\": [\"<build-output dir>\"],\n  \"notes\": \"one sentence describing the detected toolchain\"\n}\n```";
+    const GOLDEN_INIT_PROMPT: &str = "You are the onboarding-assessment agent for `flywheel init`.\n\nInspect the repository at /repo: detect its toolchain (build system, test runner, linter), and propose the flywheel policy a maintainer would write by hand.\n\nDerive the default grader commands from checks that ALREADY exist in this repo (the test/lint/build commands a contributor runs today). Do not invent a command the repo cannot run. Propose a sandbox setup command that warms a fresh checkout (dependency install/fetch) when one applies, the autopilot intake cadence, and any build-output directories that belong in .gitignore.\n\nRespond with exactly one fenced JSON block:\n```json\n{\n  \"source_kind\": \"directory\",\n  \"default_graders\": [\"<existing test command>\", \"<existing lint command>\"],\n  \"sandbox_setup\": \"<dependency install/fetch command, or null>\",\n  \"autopilot\": {\"target_depth\": 3, \"interval_seconds\": 600},\n  \"gitignore_additions\": [\"<build-output dir>\"],\n  \"notes\": \"one sentence describing the detected toolchain\"\n}\n```";
 
-    const PY_POLICY_NONE: &str = "# Flywheel work policy proposed by `flywheel init --agent`.\n# An agent inspected the repo and derived these settings; review and edit freely.\n# Committed with the repo; CLI flags always override.\n\n[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n\n[store]\nbackend = \"sqlite\"\n\n[paths]\ndb = \".flywheel/flywheel.sqlite\"\nsandbox_root = \".flywheel/worktrees\"\n\n# Default graders for work items that declare none (the verification\n# commands the agent derived from this repo's existing checks).\n[[defaults.graders]]\ntype = \"command\"\nrun = \"cargo test --workspace\"\n\n[[defaults.graders]]\ntype = \"command\"\nrun = \"cargo clippy --workspace -- -D warnings\"\n\n# Sandbox provisioning: runs (shell) inside every newly created sandbox\n# before the agent enters.\n[sandbox]\nsetup = \"cargo fetch\"\n\n# Autopilot intake daemon cadence (target queue depth and refill interval).\n[autopilot]\ntarget_depth = 3\ninterval_seconds = 600\n\n# Landing policy. Leave base UNSET to FF-merge work in-tree onto your\n# checked-out branch. Set base ONLY to a separate\n# integration branch you do NOT have checked out.\n[submit]\n# base = \"main\"\n";
+    const GOLDEN_POLICY_NONE: &str = "# Flywheel work policy proposed by `flywheel init --agent`.\n# An agent inspected the repo and derived these settings; review and edit freely.\n# Committed with the repo; CLI flags always override.\n\n[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n\n[store]\nbackend = \"sqlite\"\n\n[paths]\ndb = \".flywheel/flywheel.sqlite\"\nsandbox_root = \".flywheel/worktrees\"\n\n# Default graders for work items that declare none (the verification\n# commands the agent derived from this repo's existing checks).\n[[defaults.graders]]\ntype = \"command\"\nrun = \"cargo test --workspace\"\n\n[[defaults.graders]]\ntype = \"command\"\nrun = \"cargo clippy --workspace -- -D warnings\"\n\n# Sandbox provisioning: runs (shell) inside every newly created sandbox\n# before the agent enters.\n[sandbox]\nsetup = \"cargo fetch\"\n\n# Autopilot intake daemon cadence (target queue depth and refill interval).\n[autopilot]\ntarget_depth = 3\ninterval_seconds = 600\n\n# Landing policy. Leave base UNSET to FF-merge work in-tree onto your\n# checked-out branch. Set base ONLY to a separate\n# integration branch you do NOT have checked out.\n[submit]\n# base = \"main\"\n";
 
-    const PY_POLICY_MINIMAL: &str = "# Flywheel work policy proposed by `flywheel init --agent`.\n# An agent inspected the repo and derived these settings; review and edit freely.\n# Committed with the repo; CLI flags always override.\n\n[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n\n[store]\nbackend = \"sqlite\"\n\n[paths]\ndb = \".flywheel/flywheel.sqlite\"\nsandbox_root = \".flywheel/worktrees\"\n\n# Autopilot intake daemon cadence (target queue depth and refill interval).\n[autopilot]\ninterval_seconds = 0.5\n\n# Landing policy. Leave base UNSET to FF-merge work in-tree onto your\n# checked-out branch. Set base ONLY to a separate\n# integration branch you do NOT have checked out.\n[submit]\n# base = \"main\"\n";
+    const GOLDEN_POLICY_MINIMAL: &str = "# Flywheel work policy proposed by `flywheel init --agent`.\n# An agent inspected the repo and derived these settings; review and edit freely.\n# Committed with the repo; CLI flags always override.\n\n[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n\n[store]\nbackend = \"sqlite\"\n\n[paths]\ndb = \".flywheel/flywheel.sqlite\"\nsandbox_root = \".flywheel/worktrees\"\n\n# Autopilot intake daemon cadence (target queue depth and refill interval).\n[autopilot]\ninterval_seconds = 0.5\n\n# Landing policy. Leave base UNSET to FF-merge work in-tree onto your\n# checked-out branch. Set base ONLY to a separate\n# integration branch you do NOT have checked out.\n[submit]\n# base = \"main\"\n";
 
-    // --- prompt and render: byte-identical to the Python ------------------------------
+    // --- prompt and render: byte-identical to the goldens -----------------------------
 
     #[test]
-    fn init_prompt_is_byte_identical_to_python() {
-        assert_eq!(init_prompt(Path::new("/repo")), PY_INIT_PROMPT);
+    fn init_prompt_matches_golden() {
+        assert_eq!(init_prompt(Path::new("/repo")), GOLDEN_INIT_PROMPT);
     }
 
     #[test]
-    fn rendered_policy_is_byte_identical_to_python() {
-        assert_eq!(render_agent_policy(&canned(), None), PY_POLICY_NONE);
+    fn rendered_policy_matches_golden() {
+        assert_eq!(render_agent_policy(&canned(), None), GOLDEN_POLICY_NONE);
         let with_base = render_agent_policy(&canned(), Some("main"));
         assert_eq!(
             with_base,
-            PY_POLICY_NONE.replace(
+            GOLDEN_POLICY_NONE.replace(
                 "# checked-out branch. Set base ONLY",
                 "# checked-out branch (detected current branch: main). Set base ONLY"
             )
@@ -525,9 +525,9 @@ mod tests {
             interval_seconds: Some(0.5),
             ..InitProposal::default()
         };
-        assert_eq!(render_agent_policy(&minimal, None), PY_POLICY_MINIMAL);
+        assert_eq!(render_agent_policy(&minimal, None), GOLDEN_POLICY_MINIMAL);
         // An empty detected branch reads as none.
-        assert_eq!(render_agent_policy(&canned(), Some("")), PY_POLICY_NONE);
+        assert_eq!(render_agent_policy(&canned(), Some("")), GOLDEN_POLICY_NONE);
     }
 
     #[test]

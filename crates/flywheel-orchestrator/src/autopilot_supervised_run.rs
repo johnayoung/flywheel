@@ -246,7 +246,7 @@ pub fn default_daemon_program() -> Result<Vec<String>, String> {
 /// A thin handle over the running daemon so [`run_supervised`] is agnostic
 /// to how it was launched: `wait` blocks until the child exits and returns
 /// its exit code (a crash OR a forwarded-signal graceful shutdown; a
-/// signal-killed child reports the negated signal number, as Python did),
+/// signal-killed child reports the negated signal number),
 /// and `terminate` brings the child and everything it spawned down
 /// orphan-free (SIGTERM the process group, escalate to SIGKILL). Both are
 /// safe to call from any thread: the stop-signal handler terminates the

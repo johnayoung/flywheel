@@ -225,8 +225,7 @@ where
 
 /// Print one snapshot (exit 0), or with `--watch N` clear the screen and
 /// refresh every N seconds until the operator presses Ctrl-C, which exits
-/// cleanly with code 0 (the Python verb caught `KeyboardInterrupt` and
-/// returned 0).
+/// cleanly with code 0.
 pub fn cmd_live<S>(args: &LiveArgs, store: &S, out: &mut dyn Write) -> Result<i32, WorkflowError>
 where
     S: LifecycleStore + AttemptStore + TaskStore + ?Sized,
@@ -492,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn live_lines_are_byte_identical_to_python() {
+    fn live_lines_match_golden() {
         let now = t0() + Duration::seconds(200);
         let base = LiveRunRow {
             run_id: "r".into(),

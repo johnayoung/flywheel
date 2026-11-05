@@ -99,8 +99,7 @@ pub enum PoolError {
     },
 }
 
-/// How a member died, rendered the way the Python supervisor printed
-/// `Popen.returncode`: the exit code, or the negated signal number.
+/// How a member died, rendered as `Popen.returncode`: the exit code, or the negated signal number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemberExit {
     pub code: Option<i32>,
@@ -232,8 +231,7 @@ impl PoolMember {
     }
 }
 
-/// Everything [`WorkerPool::new`] takes; `new` fills the Python keyword
-/// defaults.
+/// Everything [`WorkerPool::new`] takes; `new` fills the defaults.
 #[derive(Clone)]
 pub struct PoolOptions {
     pub size: i64,

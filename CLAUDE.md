@@ -37,6 +37,7 @@ Authoritative specs in `docs/` override any inferred behavior. Full index: `docs
 - `docs/cli.md` — the `flywheel`/`fw` verbs and operator console
 - `docs/autopilot.md` — the autopilot intake daemon (tiers, scoring, CLI, console)
 - `docs/workflow.md` — how flywheel develops itself: the spec-driven authoring pipeline and the runtime loop
+- `docs/team-mode.md` — team mode: GitHub as the shared control plane
 
 Curated docs (`cli`, `configuration`, `task-schema`, `loop`, `workflow`, `strategy`, `sandbox`, `held-out-gate`, `autopilot`, `team-mode`, `hub`, `hub-reference`, `hub-api`, `hub-security`, `hub-workflows`, `hub-internals`) are embedded in the binary for `fw docs` (`crates/flywheel/src/docs.rs`); a rebuild picks up edits.
 
@@ -64,7 +65,7 @@ The `serena` MCP server (auto-loaded from the committed `.mcp.json`) provides la
 ## Non-negotiable invariants
 
 - **IMPORTANT: `task.rs`, `lifecycle.rs`, and `envelope.rs` in `flywheel-core` are pure.** No `std::fs`/`std::io`/`std::env`/`std::process`/`std::net`/`tokio::`/`File::`/`read_to_string`. Enforced by `crates/flywheel-core/tests/module_purity.rs`. Do not weaken the test to make a feature fit — move file/JSON code into `crates/flywheel-core/src/loaders.rs` instead.
-- **IMPORTANT: `Task` is input-source agnostic.** Direct struct construction (`Task::new`) is a first-class API; loaders are optional conveniences. No `Task` field may name a path/file/payload/raw/source. See memory `feedback_task_schema_input_agnostic.md`.
+- **IMPORTANT: `Task` is input-source agnostic.** Direct struct construction (`Task::new`) is a first-class API; loaders are optional conveniences. No `Task` field may name a path/file/payload/raw/source.
 - **Agent claims are untrusted.** Agent-reported status feeds verification, never authoritative lifecycle state. The harness owns transitions.
 - **Original task definition is immutable.** Execution-time clarifications belong in lifecycle records, not in the `Task`.
 - **Agents are external CLIs.** Flywheel drives the `claude` (stream-json) and `codex` CLIs as subprocesses through `flywheel-agents`; there is no in-process agent SDK, and `[agent] transport = "sdk"` is rejected at config load. `flywheel-agents` must not depend on any other flywheel crate.

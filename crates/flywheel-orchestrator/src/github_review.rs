@@ -722,7 +722,7 @@ mod tests {
     }
 
     #[test]
-    fn source_version_matches_the_python_seed() {
+    fn source_version_is_pinned() {
         let gh = FakeGh::new(payload(vec![thread("RT_x")]));
         let items = source(&gh).list_work().unwrap();
         let seed = "please add a test\u{0}False\u{0}False\u{0}2026-06-25T00:00:00Z";

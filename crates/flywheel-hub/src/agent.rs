@@ -210,19 +210,6 @@ pub const CLAUDE_BYPASS_MODE: &str = "bypassPermissions";
 pub const CODEX_APPROVALS: &[&str] = &["untrusted", "on-failure", "on-request", "never"];
 /// Codex's `--sandbox` policies.
 pub const CODEX_SANDBOXES: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
-/// Model choices offered by the launcher (any other id is accepted too):
-/// Claude Code's aliases, then full ids.
-pub const CLAUDE_MODELS: &[&str] = &[
-    "opus",
-    "sonnet",
-    "haiku",
-    "fable",
-    "claude-opus-5-5",
-    "claude-sonnet-5-5",
-    "claude-haiku-5-5",
-    "claude-fable-5-1",
-];
-pub const CODEX_MODELS: &[&str] = &["gpt-5-codex", "gpt-5", "gpt-5.1-codex", "gpt-5.1"];
 /// Longest model id accepted.
 pub const MAX_MODEL_CHARS: usize = 100;
 /// Largest initial prompt (it travels as one argv element; Linux caps

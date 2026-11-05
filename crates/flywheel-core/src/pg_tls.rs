@@ -2,9 +2,8 @@
 //!
 //! The Rust driver (`postgres` / `tokio-postgres`) understands only
 //! `sslmode=disable|prefer|require` and has no notion of root or client
-//! certificates, while operators write libpq DSNs (the Python store hands
-//! them to psycopg, i.e. libpq, verbatim). This module is the single place
-//! that bridges the two: [`configure`] strips the libpq TLS keywords out of
+//! certificates, while operators write libpq DSNs. This module is the single
+//! place that bridges the two: [`configure`] strips the libpq TLS keywords out of
 //! the DSN, resolves them the way libpq does, and returns the driver
 //! [`Config`] plus a rustls connector whose certificate verification
 //! matches the requested mode.

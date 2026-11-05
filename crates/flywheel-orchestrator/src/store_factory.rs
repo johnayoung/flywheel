@@ -1,5 +1,3 @@
-//! Port of the Python `flywheel_orchestrator._store_factory` module.
-//!
 //! The single construction point for the core store and the claim store a
 //! `[store]` config selects. Both are routed by name through
 //! [`StoreRegistries`], so adding a backend is a registration, never a branch
@@ -43,9 +41,6 @@ pub enum StoreConfigError {
          export one with a {backend} connection string"
     )]
     MissingDsn { backend: String },
-    /// A DSN-backed backend was selected but the build does not ship it.
-    #[error("store backend is {backend} but the {extra} backend is not available in this build")]
-    MissingExtra { backend: String, extra: String },
     /// The configured store could not be reached during the startup probe.
     /// Names the backend and the DSN sources tried, never the DSN value.
     #[error(
@@ -151,7 +146,6 @@ pub fn preflight_store(
         // backend and both DSN sources.
         Err(err @ StoreConfigError::UnknownBackend(_))
         | Err(err @ StoreConfigError::MissingDsn { .. })
-        | Err(err @ StoreConfigError::MissingExtra { .. })
         | Err(err @ StoreConfigError::Unreachable { .. }) => Err(err),
         Err(StoreConfigError::Core(source)) => Err(StoreConfigError::Unreachable {
             backend: config.backend.clone(),
@@ -306,7 +300,6 @@ mod tests {
             .register(BackendSpec::new(
                 "postgres",
                 "durable Postgres backend",
-                Some("postgres"),
                 builder,
             ))
             .unwrap();

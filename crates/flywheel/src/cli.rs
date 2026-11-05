@@ -1,5 +1,4 @@
-//! Port of the Python `flywheel._cli` module: the `flywheel` / `fw` verb
-//! router.
+//! The `flywheel` / `fw` verb router.
 //!
 //! Bare `flywheel` (or `fw`) opens the operator console; `--json` or a
 //! non-TTY stdout prints one JSON snapshot and exits (delegated to
@@ -26,10 +25,8 @@
 //!
 //! `next`, `orchestrate`, and the core single-task CLI (`run`, `is-done`,
 //! `set-model`, ... under `workflow`) are plumbing, not product verbs -- the
-//! spec keeps `worker --once` as the only blessed headless drain. They were
-//! reachable in Python as `python -m flywheel_orchestrator.workflow` /
-//! `python -m flywheel_core.workflow`; this build routes them as hidden verbs
-//! (absent from [`USAGE`]) so no surface is lost:
+//! spec keeps `worker --once` as the only blessed headless drain. They are
+//! routed as hidden verbs (absent from [`USAGE`]):
 //!
 //! * `flywheel next` / `flywheel orchestrate` -> the orchestrator CLI (the
 //!   latter through the `orchestrate` runner the shell binds)
@@ -120,24 +117,22 @@ pub const CORE_STEER_VERB: &str = "steer";
 pub const WORKER_VERB: &str = "worker";
 pub const AUTOPILOT_VERB: &str = "autopilot";
 /// The headless supervised autopilot run path (spec 00070 criterion #5).
-/// Reachable only as a verb in this build (the Python reached it as
-/// `python -m`), so it is routed but kept out of the operator usage text.
+/// Routed but kept out of the operator usage text.
 pub const AUTOPILOT_SUPERVISED_VERB: &str = "autopilot-supervised";
 pub const TRIAGE_VERB: &str = "triage";
 pub const AUDIT_VERB: &str = "audit";
-/// Hidden orchestrator plumbing verbs (the Python reached them as
-/// `python -m flywheel_orchestrator.workflow next|orchestrate`). Routed but
+/// Hidden orchestrator plumbing verbs. Routed but kept out of the operator
+/// usage text.|orchestrate`). Routed but
 /// kept out of the operator usage text.
 pub const HIDDEN_ORCHESTRATOR_VERBS: [&str; 2] = ["next", "orchestrate"];
-/// The hidden core single-task CLI (the Python's
-/// `python -m flywheel_core.workflow`): `flywheel workflow run GOAL_OR_FILE`,
+/// The hidden core single-task CLI: `flywheel workflow run GOAL_OR_FILE`,
 /// `is-done`, `set-model`, and the producer verbs under their core names.
 pub const WORKFLOW_VERB: &str = "workflow";
 pub const DOCS_VERB: &str = "docs";
 /// The web workspace of server-owned agent terminals (`flywheel-hub`).
 pub const HUB_VERB: &str = "hub";
 
-/// The `fw --help` text, byte-identical to the Python router's.
+/// The `fw --help` text.
 pub const USAGE: &str = "usage: flywheel [--json] [--help] [--version] <verb> [args...]
        fw [--json] [--help] [--version] <verb> [args...]
 
@@ -716,7 +711,7 @@ fn arm_audit_interrupt(flag: StopFlag) {
 
 /// The `audit` verb: parse, resolve the store and logs root, stream.
 ///
-/// Mirrors the Python CLI's ordering: a disallowed flag combination or an
+/// Ordering: a disallowed flag combination or an
 /// unresolvable `--redact-policy` fails fast (exit 2) before the store is
 /// touched; a nonexistent store is an operator error (exit 2) rather than
 /// an empty result, since opening it would silently bootstrap an empty
@@ -820,7 +815,7 @@ pub fn archive_runner() -> ArchiveRunner {
 /// The `orchestrate` runner: one drain pass of the worktree daemon over the
 /// verb's resolved request, with the policy-selected landing strategy, the
 /// held-out gate, and the sandbox backend wired exactly as `flywheel
-/// worker --once` wires them. Prints the Python `[orchestrate]` report
+/// worker --once` wires them. Prints the `[orchestrate]` report
 /// lines to stderr; exits 1 when any run ended in a non-done state.
 pub fn orchestrate_runner() -> OrchestrateRunner {
     Arc::new(
@@ -1024,7 +1019,7 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
     }
 }
 
-/// The Python `_cmd_orchestrate` report: recovered run ids, one line per
+/// The `orchestrate` report: recovered run ids, one line per
 /// run, and exit 1 when any run ended in a non-done state so a CI driver
 /// can tell the batch did not fully complete.
 pub fn print_orchestrate_report(report: &OrchestratorReport, err: &mut dyn Write) -> i32 {
@@ -1759,13 +1754,6 @@ mod tests {
             "error: unknown built-in policy 'x'; expected one of ['default', 'strict'] or a \
              registered custom policy\n"
         );
-        assert_eq!(
-            error(&["run-1", "--redact-policy", "pkg.mod:factory"]),
-            "error: --redact-policy 'pkg.mod:factory': dotted-path policy factories \
-             ('module.sub:factory') are not supported; expected one of ['default', 'strict']\n"
-        );
-        assert!(!AUDIT_HELP.contains("module.sub"));
-        assert!(!AUDIT_HELP.contains("DOTTED"));
         assert!(AUDIT_HELP.starts_with("usage: flywheel audit [-h]"));
     }
 
@@ -1956,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestrate_report_prints_the_python_lines_and_exit_code() {
+    fn orchestrate_report_prints_the_pinned_lines_and_exit_code() {
         use flywheel_orchestrator::orchestrate::{RunMode, RunRecord};
         let report = OrchestratorReport {
             worker_id: "w".to_owned(),

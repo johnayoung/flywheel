@@ -1,8 +1,7 @@
 //! Harness: the single-task orchestration loop.
 //!
-//! Port of the Python `flywheel_core.harness`. Wires the invoker, the
-//! envelope parser, the prompt builder, and the grader runners into one
-//! driver: given a [`Task`] and a [`Lifecycle`], [`run_task`] carries the
+//! Wires the invoker, the envelope parser, the prompt builder, and the
+//! grader runners into one driver: given a [`Task`] and a [`Lifecycle`], [`run_task`] carries the
 //! lifecycle to a terminal status (`done` / `failed`) or pauses it
 //! (`interrupted` / `awaiting_approval`) using a single owned state machine.
 //!
@@ -36,7 +35,7 @@ mod tests;
 mod validate;
 
 pub use crate::agents_invoke::{
-    InvocationObservers, InvocationRequest, InvokeFn, InvokeFunc, InvokeFuture, MessageObserver,
+    InvocationObservers, InvocationRequest, InvokeFn, InvokeFuture, MessageObserver,
 };
 pub use iterate::{build_observation, build_usage_breakdown, occupancy_from_usage};
 pub use ops::{
@@ -114,8 +113,6 @@ pub type LandabilityGate = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// Per-run harness knobs.
 ///
-/// Every field has the same meaning as its Python counterpart:
-///
 /// * `max_retries` -- the validation retry budget consumed by
 ///   [`Lifecycle::is_retry_eligible`].
 /// * `max_cost_usd` / `max_tokens` / `wall_clock_seconds` -- PER-RUN
@@ -141,8 +138,7 @@ pub type LandabilityGate = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 /// * `checkpoint_nudge_seconds` / `checkpoint_progress_probe` -- threaded
 ///   onto every invocation request for the live checkpoint nudge.
 /// * `agent_id` / `recovery_summarizer_max_turns` -- the cold-session agent
-///   the default judge / summarizer run on (Rust-only: the Python defaults
-///   were the SDK's `query`).
+///   the default judge / summarizer run on.
 #[derive(Clone)]
 pub struct HarnessConfig {
     pub max_retries: u32,
@@ -258,7 +254,7 @@ impl fmt::Debug for HarnessConfig {
 pub struct HarnessConfigError(pub String);
 
 impl HarnessConfig {
-    /// Validate the knobs the Python dataclass rejected at construction.
+    /// Validate the knobs.
     pub fn validate(&self) -> Result<(), HarnessConfigError> {
         let ratio = self.context_recovery_trigger_ratio;
         if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
@@ -314,8 +310,7 @@ pub enum HarnessError {
 }
 
 impl HarnessError {
-    /// A stable error-class label (the Rust spelling of Python's
-    /// `type(exc).__name__`).
+    /// A stable error-class label.
     pub fn error_type(&self) -> &'static str {
         match self {
             HarnessError::Config(_) => "HarnessConfigError",

@@ -1,9 +1,9 @@
 //! The reference worker daemon: the `flywheel worker` entry point.
 //!
-//! Port of the daemon half of the Python `flywheel_worktree.worker` module
-//! (the submit strategies live in [`crate::submitter`] / [`crate::phase`] /
+//! The submit strategies live in [`crate::submitter`] / [`crate::phase`] /
 //! [`crate::pr`] / [`crate::tiering`]; the multi-worker process pool in
-//! [`crate::pool`]). It owns the concerns flywheel deliberately does not:
+//! [`crate::pool`]. The daemon owns the concerns flywheel deliberately does
+//! not:
 //!
 //! * **the cycle** -- [`run_once`] records phase base refs, drains every
 //!   eligible task to quiescence through the git-submit seam (one
@@ -159,7 +159,7 @@ fn truncate(text: &str, limit: usize) -> String {
 /// Single-line per-in-flight-run progress: lifecycle-position breadcrumb
 /// (`attempt=N iter=K`), running tokens/cost/turns rolled up from the run's
 /// `harness.iteration_completed` events, age of the latest activity, and
-/// the current agent action. Byte-identical to the Python renderer.
+/// the current agent action. Pinned byte for byte by the tests.
 pub fn format_heartbeat(row: &LiveRunRow, now: DateTime<Utc>) -> String {
     let age = match row.last_ts {
         None => "\u{2014}".to_owned(),
@@ -745,7 +745,7 @@ impl RunTask for CoreRunTask {
 
 /// The agent configuration one in-container invocation runs with: the
 /// strategy's resolved model and permission policy on the `claude-code`
-/// adapter (the Python container backend's `make_agents_invoke` parameters).
+/// adapter.
 pub fn container_agent_configuration(spec: &ContainerInvokeSpec) -> AgentConfiguration {
     let mut configuration = AgentConfiguration::new(&spec.agent_id);
     configuration.model_id = Some(spec.model.clone());
@@ -820,7 +820,7 @@ pub fn strategy_name_for(policy: Option<&WorkPolicy>) -> &str {
 
 /// The landing layout a cycle's bookkeeping runs against: the repo, the
 /// merge lock, the resolved landing base, and the log sink -- the fields
-/// the Python cycle read off its `GitWorktreeSubmitter`.
+/// the cycle reads off its `GitWorktreeSubmitter`.
 #[derive(Clone)]
 pub struct LandingLayout {
     pub repo_root: PathBuf,
@@ -851,7 +851,7 @@ impl LandingLayout {
     }
 }
 
-/// Everything one [`run_once`] cycle needs. `new` fills the Python keyword
+/// Everything one [`run_once`] cycle needs. `new` fills the
 /// defaults; the seams (`invoke`, `run_task`, `gh`, `environ`, `runtime`)
 /// are test injection points.
 #[derive(Clone)]
@@ -904,7 +904,7 @@ impl fmt::Debug for RunOnceRequest {
 }
 
 impl RunOnceRequest {
-    /// A request over an already-built strategy with the Python defaults.
+    /// A request over an already-built strategy with the defaults.
     pub fn new(
         strategy: Arc<dyn SubmitStrategy>,
         layout: LandingLayout,
@@ -975,8 +975,8 @@ pub enum RunOnceError {
 }
 
 impl RunOnceError {
-    /// The Python exception class the failure corresponds to, for log
-    /// lines that name the fault type.
+    /// The exception-class name the failure corresponds to, for log lines
+    /// that name the fault type.
     pub fn kind(&self) -> &'static str {
         match self {
             RunOnceError::Interrupted(_) => "KeyboardInterrupt",
@@ -1215,8 +1215,8 @@ pub type PermanentStopHook<'a> = &'a dyn Fn(&CycleError);
 /// The loop's observer hooks and the test-only cycle bound.
 #[derive(Default)]
 pub struct LoopHooks<'a> {
-    /// Runs before every cycle (re-arming signal handlers in the Python
-    /// daemon; unused by the Rust production loop, which arms once).
+    /// Runs before every cycle (unused by the production loop, which arms
+    /// signal handlers once).
     pub before_cycle: Option<&'a dyn Fn()>,
     pub on_cycle_failure: Option<CycleFailureHook<'a>>,
     pub on_give_up: Option<&'a dyn Fn(u32)>,
@@ -1316,7 +1316,7 @@ pub fn run_daemon_loop(
     0
 }
 
-/// Sleep up to `seconds` (whole seconds, as the Python loop did), waking
+/// Sleep up to `seconds` (whole seconds), waking
 /// each second to re-check `should_stop`.
 pub fn interruptible_sleep(seconds: f64, should_stop: &dyn Fn() -> bool) {
     let whole = if seconds.is_finite() {
@@ -1500,8 +1500,8 @@ pub struct WorkerArgs {
     pub heartbeat: i64,
     pub poll_interval: i64,
     pub worker_id: Option<String>,
-    /// Validated later by [`resolve_concurrency`], exactly as the Python
-    /// parser left it a string.
+    /// Validated later by [`resolve_concurrency`], so the
+    /// parser leaves it a string.
     pub concurrency: Option<String>,
     pub lease_seconds: f64,
     pub reconcile_seconds: f64,
@@ -1920,9 +1920,9 @@ pub fn main(argv: &[String]) -> i32 {
 
 /// `flywheel worker` with injected stdout/stderr sinks for the parser and
 /// startup diagnostics (the worker's own log lines go to the process stderr
-/// through [`make_logger`], as the Python daemon's did).
+/// through [`make_logger`]).
 ///
-/// Resolution order mirrors the Python `main`: policy, landing base, pool
+/// Resolution order: policy, landing base, pool
 /// size, and worktree root resolve BEFORE any store opens (a policy error
 /// exits 2 having claimed nothing); a resolved concurrency above 1 makes
 /// this invocation the pool supervisor ([`crate::pool::run_pool`]); the
@@ -3890,7 +3890,7 @@ esac
     }
 
     #[test]
-    fn describe_cycle_error_names_the_python_kind() {
+    fn describe_cycle_error_names_the_kind() {
         let err: CycleError = Box::new(RunOnceError::Io(std::io::Error::other("disk gone")));
         assert_eq!(describe_cycle_error(&err), "OSError: disk gone");
         let plain: CycleError = "bare".into();

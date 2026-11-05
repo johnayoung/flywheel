@@ -1,5 +1,3 @@
-//! Port of the Python `flywheel_orchestrator._claims_postgres` module.
-//!
 //! The Postgres [`ClaimStore`]: the durable, network-addressable backend for
 //! the orchestrator's leases, ledgers, and WorkGraph catalog. Mirrors
 //! [`flywheel_core::store_postgres::PostgresStore`] operationally -- one
@@ -9,12 +7,9 @@
 //! it can share a database (under the same or a different schema) with the
 //! core store without either touching the other's tables.
 //!
-//! The DDL is the Python module's verbatim: timestamps are `TIMESTAMPTZ`
-//! (compared temporally, never as text), `*_json` columns are `JSONB`, ids
-//! are `BIGSERIAL`. A schema bootstrapped by either implementation opens in
-//! the other, and every row either side writes reads back through the other:
-//! mixed Rust and Python workers can share one database and agree on lease
-//! expiry, ledger order, and catalog contents.
+//! Timestamps are `TIMESTAMPTZ` (compared temporally, never as text), `*_json`
+//! columns are `JSONB`, ids are `BIGSERIAL`. Workers can share one database
+//! and agree on lease expiry, ledger order, and catalog contents.
 //!
 //! Concurrency model: `acquire_claim` takes a transaction-scoped advisory
 //! lock ([`CLAIM_ACQUIRE_LOCK_KEY`], the Postgres analog of SQLite's `BEGIN
@@ -24,8 +19,7 @@
 //! a different worker updates no row and returns `None`). Every ledger row
 //! commits in the same transaction as the `task_claims` change it describes.
 //!
-//! Departures from the Python store, all interop-preserving (storage and
-//! semantics are unchanged; only the Rust side's queries differ):
+//! Query behavior worth knowing:
 //!
 //! * conflict-key overlap is decided in SQL with the JSONB `?|` operator
 //!   instead of fetching every live row's keys and intersecting client-side;
@@ -34,7 +28,7 @@
 //! * snapshot items and dependency edges are bulk-inserted through `unnest`
 //!   instead of one `INSERT` per row;
 //! * `list_claims` and `list_work_items` are ordered by `task_id`, as the
-//!   trait documents (the Python store emits heap order);
+//!   trait documents;
 //! * `*_json` set columns read back as [`encode_str_set`] canonical text
 //!   (ASCII-escaped, as the SQLite and in-memory stores return) rather than
 //!   the server's JSONB rendering;
@@ -82,10 +76,6 @@ use crate::store_registry::{
 /// The registry name both families select the Postgres backend by.
 pub const POSTGRES_BACKEND: &str = "postgres";
 
-/// The optional extra the Python distribution gates this backend behind;
-/// informational on the Rust side (the driver is compiled in).
-pub const POSTGRES_EXTRA: &str = "postgres";
-
 /// Fixed key serializing every `acquire_claim` transaction on a database.
 ///
 /// Under the default `READ COMMITTED` isolation the conflict-key check and
@@ -94,12 +84,11 @@ pub const POSTGRES_EXTRA: &str = "postgres";
 /// before either commits. Taken unconditionally (an empty-key claim must not
 /// slip between a keyed claim's check and its upsert) and released at
 /// commit or rollback. Distinct from [`BOOTSTRAP_LOCK_KEY`] so runtime
-/// claims never wait on a bootstrap. `0x666C7977` == `"flyw"`; the same
-/// value the Python store takes, so Rust and Python workers serialize
-/// against each other too.
+/// claims never wait on a bootstrap. `0x666C7977` == `"flyw"`; every worker
+/// takes the same key, so they serialize against each other.
 pub const CLAIM_ACQUIRE_LOCK_KEY: i64 = 0x666C_7977;
 
-/// The orchestrator DDL, verbatim from the Python module (every statement
+/// The orchestrator DDL (every statement
 /// idempotent). The column-level additive migrations -- v3
 /// `task_claims.conflict_keys_json`, v7 `orchestrator_stop_events.run_id`,
 /// v9 `orchestrator_stop_events.attribution` -- run after it in
@@ -223,10 +212,10 @@ CREATE INDEX IF NOT EXISTS idx_orchestrator_session_pauses_pause_until
   ON orchestrator_session_pauses (pause_until);
 ";
 
-/// The index this port adds over the Python DDL: it backs the human-review
+/// A supplementary index: it backs the human-review
 /// queue read (`WHERE kind = ANY(...) ORDER BY id`) on a ledger that
-/// otherwise grows without bound. Purely additive; a schema bootstrapped by
-/// the Python store gains it on first open here and loses nothing.
+/// otherwise grows without bound. Purely additive; an older schema gains it on
+/// first open.
 const SUPPLEMENTARY_INDEXES: &str = "
 CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_kind
   ON orchestrator_stop_events (kind, id);
@@ -699,7 +688,7 @@ fn bootstrap(client: &mut Client, schema: &str) -> Result<(), ClaimStoreError> {
 ///
 /// Safe to point at the schema the core `PostgresStore` uses (each owns only
 /// its own tables and sentinel) or at a schema of its own. Several instances
-/// -- in one process, across processes, or mixed with Python workers --
+/// -- in one process or across processes --
 /// coordinate through the database itself: the acquire advisory lock, row
 /// locks, and the `ON CONFLICT` guard, never through anything in-process.
 pub struct PostgresClaimStore {
@@ -822,7 +811,7 @@ impl ClaimStore for PostgresClaimStore {
         let keys: Vec<&str> = conflict_keys.iter().map(String::as_str).collect();
         self.write(|tx| {
             // Serialize the check-then-upsert against every other acquire on
-            // this database (Rust or Python); released at commit/rollback.
+            // this database; released at commit/rollback.
             tx.execute(
                 "SELECT pg_advisory_xact_lock($1)",
                 &[&CLAIM_ACQUIRE_LOCK_KEY],
@@ -1574,12 +1563,7 @@ pub fn build_postgres_core_store(
 }
 
 fn postgres_spec<B>(build: B) -> BackendSpec<B> {
-    BackendSpec::new(
-        POSTGRES_BACKEND,
-        "durable Postgres backend",
-        Some(POSTGRES_EXTRA),
-        build,
-    )
+    BackendSpec::new(POSTGRES_BACKEND, "durable Postgres backend", build)
 }
 
 /// Register `postgres` in the claim-store family; refuses a duplicate.
@@ -1640,7 +1624,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_keys_are_distinct_and_the_python_values() {
+    fn lock_keys_are_distinct_and_pinned() {
         assert_eq!(CLAIM_ACQUIRE_LOCK_KEY, 0x666C_7977);
         assert_eq!(BOOTSTRAP_LOCK_KEY, 0x666C_7962);
         assert_ne!(CLAIM_ACQUIRE_LOCK_KEY, BOOTSTRAP_LOCK_KEY);
@@ -1703,7 +1687,6 @@ mod tests {
         assert_eq!(registries.core.names(), vec!["postgres", "sqlite"]);
         assert_eq!(registries.claims.names(), vec!["postgres", "sqlite"]);
         let spec = registries.claims.resolve(POSTGRES_BACKEND).unwrap();
-        assert_eq!(spec.extra.as_deref(), Some(POSTGRES_EXTRA));
         assert_eq!(spec.summary, "durable Postgres backend");
         let again = register_postgres_claim_backend(&mut registries).unwrap_err();
         assert_eq!(

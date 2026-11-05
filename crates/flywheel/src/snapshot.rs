@@ -6,8 +6,7 @@
 //! from [`collect_live_rows`], plus a summary header whose task-state counts
 //! mirror `flywheel status` against the same store.
 //!
-//! [`collect_live_rows`] is the live read model (the Python
-//! `flywheel_orchestrator.collect_live_rows`): every field is computed from
+//! [`collect_live_rows`] is the live read model: every field is computed from
 //! relational rows only -- `lifecycles` plus the per-attempt aggregate
 //! columns the harness maintains at iteration boundaries -- never from a
 //! telemetry scan. Output is sorted by `(task_id, run_id)` so two
@@ -988,41 +987,6 @@ mod tests {
         let now = at(5, 30);
         let snap = build_snapshot(&store, None, now, start).unwrap();
         assert_eq!(snap.summary.runtime_seconds, 5 * 60 + 30);
-    }
-
-    /// Byte-identical parity against the Python `build_snapshot` over a
-    /// store the Python seeded: set `FLYWHEEL_PARITY_DB` (sqlite path),
-    /// `FLYWHEEL_PARITY_NOW` / `FLYWHEEL_PARITY_STARTED` (RFC 3339),
-    /// optionally `FLYWHEEL_PARITY_TASKS` (tasks dir), and
-    /// `FLYWHEEL_PARITY_EXPECTED` (the Python `--json` text). Skipped when
-    /// the variables are unset so the suite needs no Python.
-    #[test]
-    fn python_parity_over_seeded_sqlite_store() {
-        let Ok(db) = std::env::var("FLYWHEEL_PARITY_DB") else {
-            return;
-        };
-        let expected =
-            std::fs::read_to_string(std::env::var("FLYWHEEL_PARITY_EXPECTED").unwrap()).unwrap();
-        let now: DateTime<Utc> = std::env::var("FLYWHEEL_PARITY_NOW")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let started: DateTime<Utc> = std::env::var("FLYWHEEL_PARITY_STARTED")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let store = flywheel_core::store_sqlite::SqliteStore::open(&db).unwrap();
-        let source = std::env::var("FLYWHEEL_PARITY_TASKS")
-            .ok()
-            .map(DirectoryWorkSource::new);
-        let snap = build_snapshot(
-            &store,
-            source.as_ref().map(|s| s as &dyn WorkSource),
-            now,
-            started,
-        )
-        .unwrap();
-        assert_eq!(render_snapshot_json(&snap), expected.trim_end());
     }
 
     #[test]

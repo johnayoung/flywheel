@@ -9,9 +9,8 @@
 //! `input_mode = "text"` opt-out reproduces the historical container
 //! command (prompt piped as plain text, stdin closed), which cannot steer.
 //!
-//! Requesting any other transport (the Python package's `sdk`) fails
-//! explicitly: there is no Rust agent SDK, and none is needed because the
-//! SDK transport was itself a wrapper over this exact wire protocol.
+//! Requesting any other transport fails explicitly: the vendor SDKs wrap
+//! this exact wire protocol, so the CLI is the only transport.
 
 pub mod cli;
 pub mod common;
@@ -120,11 +119,12 @@ impl AgentAdapter for ClaudeCodeAdapter {
         services: AdapterServices,
     ) -> BoxFuture<'_, Result<Box<dyn RunningAgent>, AgentError>> {
         Box::pin(async move {
-            match request.configuration.option_str("transport").unwrap_or("cli") {
+            match request
+                .configuration
+                .option_str("transport")
+                .unwrap_or("cli")
+            {
                 "cli" => start_cli_agent(&request, &services).await,
-                "sdk" => Err(AgentError::UnsupportedCapability(
-                    "the sdk transport does not exist in the Rust runtime; the cli transport speaks the same stream-json control protocol the SDK used".into(),
-                )),
                 other => Err(AgentError::UnsupportedCapability(format!(
                     "unknown claude-code transport {other:?} (expected cli)"
                 ))),

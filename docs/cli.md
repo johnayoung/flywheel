@@ -30,7 +30,7 @@ The router (`route`, `crates/flywheel/src/cli.rs`) dispatches by the first argv 
 
 `fw <verb> --help` forwards `--help` to that verb's own parser, so each verb's specific flags come from the delegated parser, not from the router.
 
-**Plumbing verbs are hidden.** Spec 00021 FR-4 keeps `next`, bare `orchestrate`, and the single-task core verbs as plumbing: they route (`flywheel next`, `flywheel orchestrate`, `flywheel workflow run|is-done|set-model|...`) but never appear in `fw --help`. `worker --once` is the only blessed headless single-task drain. An unknown verb prints `fw: unknown command: <verb>` to stderr and exits 2.
+**Plumbing verbs are hidden.** `next`, bare `orchestrate`, and the single-task core verbs stay plumbing: they route (`flywheel next`, `flywheel orchestrate`, `flywheel workflow run|is-done|set-model|...`) but never appear in `fw --help`. `worker --once` is the only blessed headless single-task drain. An unknown verb prints `fw: unknown command: <verb>` to stderr and exits 2.
 
 ### Resolution precedence
 

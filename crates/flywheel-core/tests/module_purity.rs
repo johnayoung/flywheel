@@ -1,6 +1,5 @@
 //! `task` and `lifecycle` must stay pure: no filesystem, IO, or environment
-//! access. Mirrors the Python `test_task_module_purity.py` /
-//! `test_lifecycle_module_purity.py` invariants.
+//! access.
 
 const TASK_SRC: &str = include_str!("../src/task.rs");
 const LIFECYCLE_SRC: &str = include_str!("../src/lifecycle.rs");

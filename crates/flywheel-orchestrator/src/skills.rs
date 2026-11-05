@@ -152,7 +152,7 @@ impl Default for SkillRenderSettings {
     }
 }
 
-/// `Path.parent` the way Python reports it: the containing directory, or
+/// `Path.parent` with Python `pathlib` semantics: the containing directory, or
 /// the empty path (Python's `.`) for a bare name.
 fn parent_of(path: &Path) -> PathBuf {
     path.parent().map(Path::to_path_buf).unwrap_or_default()

@@ -27,10 +27,10 @@
 //!   with per-record error isolation. The returned handle stops and joins
 //!   the thread.
 //! * [`run_audit`]: the `flywheel audit` verb as a library function. It
-//!   renders exactly what the Python CLI renders (text and NDJSON modes,
-//!   redaction on by default with the stderr notice, `--dry-run` coverage
-//!   report, `--follow`) against an already-open store and a caller-supplied
-//!   `Write`; the product shell owns argument parsing and store opening.
+//!   renders text and NDJSON modes (redaction on by default with the stderr
+//!   notice, `--dry-run` coverage report, `--follow`) against an already-open
+//!   store and a caller-supplied `Write`; the product shell owns argument
+//!   parsing and store opening.
 //!
 //! Line classification mirrors the merged stream's surface: SDK message
 //! lines become [`SdkMessageRecord`], `harness.*` telemetry lines become
@@ -1041,8 +1041,8 @@ pub const BUILTIN_POLICY_NAMES: [&str; 2] = ["default", "strict"];
 pub type PolicyFactory =
     Arc<dyn Fn(Option<&[u8]>) -> Result<Box<dyn Redactor>, String> + Send + Sync>;
 
-/// The `flywheel audit` verb's options, mirroring the Python CLI flags
-/// one-for-one. The product shell parses the command line into this.
+/// The `flywheel audit` verb's options, one per CLI flag. The product shell
+/// parses the command line into this.
 #[derive(Clone)]
 pub struct AuditArgs {
     /// The run whose audit stream to read.
@@ -1174,8 +1174,7 @@ pub fn validate_flag_combinations(args: &AuditArgs) -> Option<String> {
 #[error("{0}")]
 pub struct PolicyError(pub String);
 
-/// `repr(text)` for a Python string, for operator-facing messages that
-/// mirror the Python CLI.
+/// `repr(text)` for a Python string, for operator-facing messages.
 fn py_repr(text: &str) -> String {
     let quote = if text.contains('\'') && !text.contains('"') {
         '"'
@@ -1249,17 +1248,6 @@ pub fn resolve_policy(args: &AuditArgs) -> Result<(Box<dyn Redactor>, String), P
     custom.sort_unstable();
     custom.dedup();
     let listed: Vec<String> = builtin.into_iter().chain(custom).map(py_repr).collect();
-    if name.contains(':') {
-        // The Python CLI imported `module.sub:factory` at run time; a
-        // compiled binary has no importable modules, so say so instead of
-        // reporting the dotted path as a mistyped built-in name.
-        return Err(PolicyError(format!(
-            "--redact-policy {}: dotted-path policy factories ('module.sub:factory') are not \
-             supported; expected one of [{}]",
-            py_repr(name),
-            listed.join(", ")
-        )));
-    }
     Err(PolicyError(format!(
         "unknown built-in policy {}; expected one of [{}] or a registered custom policy",
         py_repr(name),
@@ -1479,8 +1467,7 @@ pub const EXIT_INTERRUPTED: i32 = 130;
 
 /// Run the `flywheel audit` verb against an already-open store.
 ///
-/// Writes exactly what the Python CLI writes to `out` / `err` and returns
-/// its exit code:
+/// Writes the verb's output to `out` / `err` and returns its exit code:
 ///
 /// * `2` with an `error: ...` line for a disallowed flag combination or an
 ///   unresolvable `--redact-policy` (both decided before any record
@@ -1808,10 +1795,9 @@ mod tests {
         }
     }
 
-    /// The `run-cli` fixture the Python CLI reference outputs were captured
-    /// against: three sink records, a mirrored domain line, a line with no
-    /// coordinates, a hand-written line, a malformed line, and a partial
-    /// trailing line.
+    /// The `run-cli` fixture the CLI goldens were captured against: three
+    /// sink records, a mirrored domain line, a line with no coordinates, a
+    /// hand-written line, a malformed line, and a partial trailing line.
     const SECRET: &str = "sk-ant-abcdef0123456789ABCDEF";
     const ENV_SECRET: &str = "unusual-test-shaped-key-value-1234";
 
@@ -1878,14 +1864,14 @@ mod tests {
         }
     }
 
-    /// Captured from `python -m flywheel_core.audit` against the fixture
-    /// above (default text mode, redaction on, ANTHROPIC_API_KEY seeded).
-    const PY_TEXT: &str = "2026-06-11T12:00:00+00:00 seq=1 attempt=1 iter=- kind=event:harness.iteration_start | {\"attempt\":1,\"iteration\":1}\n2026-06-11T12:00:01.123456+00:00 seq=2 attempt=1 iter=1 kind=sdk:assistant | {\"big\":\"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX... (use --json for full payload)\n2026-06-11T12:00:00+00:00 seq=4 attempt=1 iter=- kind=event:harness.iteration_end | {\"attempt\":1,\"cost\":0.0123,\"iteration\":1}\n2026-06-11T12:00:00+00:00 seq=5 attempt=0 iter=0 kind=sdk:result | {\"message_type\":\"result\",\"ok\":true}\n2026-06-11T12:00:00+00:00 seq=6 attempt=1 iter=2 kind=sdk:assistant | {\"text\":\"env [REDACTED:ANTHROPIC_API_KEY] here\"}\n";
-    const PY_NOTICE: &str = "redaction: default policy applied (use --raw for verbatim)\nnote: redaction is best-effort; unmatched secrets may pass through; the store remains the unredacted source of truth\n";
-    const PY_JSON_LINE_2_STRICT: &str = "{\"attempt_number\": 1, \"iteration_number\": 1, \"kind_or_message_type\": \"assistant\", \"payload\": {\"big\": \"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\", \"content\": [{\"input\": \"[REDACTED:tool:Read]\", \"name\": \"Read\", \"type\": \"tool_use\"}], \"message_type\": \"assistant\", \"text\": \"key is [REDACTED:anthropic_key] \\u00e9\", \"tool_input\": {\"command\": \"echo [REDACTED:anthropic_key]\"}}, \"run_id\": \"run-cli\", \"sequence\": 2, \"ts\": \"2026-06-11T12:00:01.123456+00:00\"}";
-    const PY_JSON_LINE_1: &str = "{\"attempt_number\": 1, \"iteration_number\": null, \"kind_or_message_type\": \"harness.iteration_start\", \"payload\": {\"attempt\": 1, \"iteration\": 1}, \"run_id\": \"run-cli\", \"sequence\": 1, \"ts\": \"2026-06-11T12:00:00+00:00\"}";
-    const PY_JSON_LINE_5: &str = "{\"attempt_number\": 0, \"iteration_number\": 0, \"kind_or_message_type\": \"result\", \"payload\": {\"message_type\": \"result\", \"ok\": true}, \"run_id\": \"run-cli\", \"sequence\": 5, \"ts\": \"2026-06-11T12:00:00+00:00\"}";
-    const PY_DRY_RUN_STRICT_SALTED: &str = "dry-run coverage report\npolicy: strict\nrecords scanned: 5\nrecords redacted: 2\ntotal redactions: 4\nhits by label:\n  anthropic_key: 2\n  ANTHROPIC_API_KEY: 1\n  tool:Read: 1\n";
+    /// Golden output for the fixture above (default text mode, redaction on,
+    /// ANTHROPIC_API_KEY seeded).
+    const GOLDEN_TEXT: &str = "2026-06-11T12:00:00+00:00 seq=1 attempt=1 iter=- kind=event:harness.iteration_start | {\"attempt\":1,\"iteration\":1}\n2026-06-11T12:00:01.123456+00:00 seq=2 attempt=1 iter=1 kind=sdk:assistant | {\"big\":\"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX... (use --json for full payload)\n2026-06-11T12:00:00+00:00 seq=4 attempt=1 iter=- kind=event:harness.iteration_end | {\"attempt\":1,\"cost\":0.0123,\"iteration\":1}\n2026-06-11T12:00:00+00:00 seq=5 attempt=0 iter=0 kind=sdk:result | {\"message_type\":\"result\",\"ok\":true}\n2026-06-11T12:00:00+00:00 seq=6 attempt=1 iter=2 kind=sdk:assistant | {\"text\":\"env [REDACTED:ANTHROPIC_API_KEY] here\"}\n";
+    const GOLDEN_NOTICE: &str = "redaction: default policy applied (use --raw for verbatim)\nnote: redaction is best-effort; unmatched secrets may pass through; the store remains the unredacted source of truth\n";
+    const GOLDEN_JSON_LINE_2_STRICT: &str = "{\"attempt_number\": 1, \"iteration_number\": 1, \"kind_or_message_type\": \"assistant\", \"payload\": {\"big\": \"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX\", \"content\": [{\"input\": \"[REDACTED:tool:Read]\", \"name\": \"Read\", \"type\": \"tool_use\"}], \"message_type\": \"assistant\", \"text\": \"key is [REDACTED:anthropic_key] \\u00e9\", \"tool_input\": {\"command\": \"echo [REDACTED:anthropic_key]\"}}, \"run_id\": \"run-cli\", \"sequence\": 2, \"ts\": \"2026-06-11T12:00:01.123456+00:00\"}";
+    const GOLDEN_JSON_LINE_1: &str = "{\"attempt_number\": 1, \"iteration_number\": null, \"kind_or_message_type\": \"harness.iteration_start\", \"payload\": {\"attempt\": 1, \"iteration\": 1}, \"run_id\": \"run-cli\", \"sequence\": 1, \"ts\": \"2026-06-11T12:00:00+00:00\"}";
+    const GOLDEN_JSON_LINE_5: &str = "{\"attempt_number\": 0, \"iteration_number\": 0, \"kind_or_message_type\": \"result\", \"payload\": {\"message_type\": \"result\", \"ok\": true}, \"run_id\": \"run-cli\", \"sequence\": 5, \"ts\": \"2026-06-11T12:00:00+00:00\"}";
+    const GOLDEN_DRY_RUN_STRICT_SALTED: &str = "dry-run coverage report\npolicy: strict\nrecords scanned: 5\nrecords redacted: 2\ntotal redactions: 4\nhits by label:\n  anthropic_key: 2\n  ANTHROPIC_API_KEY: 1\n  tool:Read: 1\n";
 
     /// `run_audit` with the CLI's `ANTHROPIC_API_KEY` seed supplied through
     /// a registered policy instead of the process environment, so the test
@@ -2615,25 +2601,25 @@ mod tests {
         assert!(flag.is_set());
     }
 
-    // --- CLI: byte parity with the Python CLI --------------------------------
+    // --- CLI: byte parity with the goldens -----------------------------------
 
     #[test]
-    fn cli_text_mode_matches_python_output_with_redaction_notice() {
+    fn cli_text_mode_matches_golden_with_redaction_notice() {
         let dir = tempfile::tempdir().unwrap();
         let store = TestStore::with_running("run-cli");
         write_cli_fixture(dir.path(), "run-cli", true);
         let args = seeded_args("run-cli", "default");
         let (code, out, err) = cli(&args, &store, dir.path());
         assert_eq!(code, 0);
-        assert_eq!(out, PY_TEXT);
+        assert_eq!(out, GOLDEN_TEXT);
         assert_eq!(
             err,
-            PY_NOTICE.replace("default policy", "seeded-default policy")
+            GOLDEN_NOTICE.replace("default policy", "seeded-default policy")
         );
     }
 
     #[test]
-    fn cli_json_mode_matches_python_output_for_default_strict_and_salt() {
+    fn cli_json_mode_matches_golden_for_default_strict_and_salt() {
         let dir = tempfile::tempdir().unwrap();
         let store = TestStore::with_running("run-cli");
         write_cli_fixture(dir.path(), "run-cli", true);
@@ -2644,16 +2630,16 @@ mod tests {
         assert_eq!(code, 0);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 5);
-        assert_eq!(lines[0], PY_JSON_LINE_1);
-        assert_eq!(lines[1], PY_JSON_LINE_2_STRICT);
-        assert_eq!(lines[3], PY_JSON_LINE_5);
+        assert_eq!(lines[0], GOLDEN_JSON_LINE_1);
+        assert_eq!(lines[1], GOLDEN_JSON_LINE_2_STRICT);
+        assert_eq!(lines[3], GOLDEN_JSON_LINE_5);
         assert_eq!(
             lines[4],
             "{\"attempt_number\": 1, \"iteration_number\": 2, \"kind_or_message_type\": \"assistant\", \"payload\": {\"text\": \"env [REDACTED:ANTHROPIC_API_KEY] here\"}, \"run_id\": \"run-cli\", \"sequence\": 6, \"ts\": \"2026-06-11T12:00:00+00:00\"}"
         );
         assert_eq!(
             err,
-            PY_NOTICE.replace("default policy", "seeded-strict policy")
+            GOLDEN_NOTICE.replace("default policy", "seeded-strict policy")
         );
 
         let mut args = seeded_args("run-cli", "default");
@@ -2662,7 +2648,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(
             lines[1],
-            PY_JSON_LINE_2_STRICT.replace(
+            GOLDEN_JSON_LINE_2_STRICT.replace(
                 "\"[REDACTED:tool:Read]\"",
                 "{\"file_path\": \"/home/me/.env\"}"
             )
@@ -2691,7 +2677,7 @@ mod tests {
         assert_eq!(err, "");
         assert_eq!(
             out,
-            PY_TEXT.replace("[REDACTED:ANTHROPIC_API_KEY]", ENV_SECRET)
+            GOLDEN_TEXT.replace("[REDACTED:ANTHROPIC_API_KEY]", ENV_SECRET)
         );
         args.json = true;
         let (_, out, _) = cli(&args, &store, dir.path());
@@ -2706,11 +2692,11 @@ mod tests {
         let (code, out, _) = cli(&args, &store, dir.path());
         assert_eq!(code, 0);
         assert!(start.elapsed() < Duration::from_secs(2));
-        assert_eq!(out, PY_TEXT);
+        assert_eq!(out, GOLDEN_TEXT);
     }
 
     #[test]
-    fn cli_dry_run_matches_python_coverage_report() {
+    fn cli_dry_run_matches_golden_coverage_report() {
         let dir = tempfile::tempdir().unwrap();
         let store = TestStore::with_running("run-cli");
         write_cli_fixture(dir.path(), "run-cli", true);
@@ -2721,7 +2707,7 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(
             out,
-            PY_DRY_RUN_STRICT_SALTED.replace("policy: strict", "policy: seeded-strict")
+            GOLDEN_DRY_RUN_STRICT_SALTED.replace("policy: strict", "policy: seeded-strict")
         );
         assert!(err.starts_with("redaction: seeded-strict policy applied"));
         assert!(!out.contains(SECRET));
@@ -2750,7 +2736,7 @@ mod tests {
             out,
             "dry-run coverage report\npolicy: default\nrecords scanned: 2\nrecords redacted: 0\ntotal redactions: 0\nhits by label: (none)\n"
         );
-        assert_eq!(err, PY_NOTICE);
+        assert_eq!(err, GOLDEN_NOTICE);
     }
 
     #[test]
@@ -2822,7 +2808,7 @@ mod tests {
             "error: unknown built-in policy 'other'; expected one of ['default', 'strict', \"it's:broken\"] or a registered custom policy\n"
         );
 
-        // A Python dotted-path factory is rejected with the supported names.
+        // A dotted-path name is just an unknown policy.
         let mut dotted = AuditArgs::new("run-cli");
         dotted.redact_policy = Some("mypkg.redact:build".to_owned());
         let (code, out, err) = cli(&dotted, &store, dir.path());
@@ -2830,8 +2816,7 @@ mod tests {
         assert_eq!(out, "");
         assert_eq!(
             err,
-            "error: --redact-policy 'mypkg.redact:build': dotted-path policy factories \
-             ('module.sub:factory') are not supported; expected one of ['default', 'strict']\n"
+            "error: unknown built-in policy 'mypkg.redact:build'; expected one of ['default', 'strict'] or a registered custom policy\n"
         );
 
         // Built-in names resolve even when custom policies are registered.

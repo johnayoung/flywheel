@@ -18,7 +18,7 @@ mkdir -p "$PHASE_DIR"
 cat > "$PHASE_DIR/readme-rewrite.json" <<EOF
 {
   "id": "$TASK_ID",
-  "goal": "Rewrite the root README.md from scratch as a concise onboarding page for the flywheel workspace: one-line pitch, quickstart (cargo build, running a task via flywheel worker --once), the six-crate workspace layout, and links to docs/.",
+  "goal": "Rewrite the root README.md from scratch as a concise onboarding page for the flywheel workspace: one-line pitch, quickstart (cargo build, running a task via flywheel worker --once), the seven-crate workspace layout, and links to docs/.",
   "tags": ["docs", "smoke"],
   "context": {
     "relevant": [

@@ -1,5 +1,5 @@
 {
- "generated_by": "uv run python (DirectoryWorkSource over .flywheel/tasks, archive copied to a temp active/ tree)",
+ "generated_by": "DirectoryWorkSource over .flywheel/tasks, archive copied to a temp active/ tree",
  "active": {
   "items": [],
   "skipped_count": 0,

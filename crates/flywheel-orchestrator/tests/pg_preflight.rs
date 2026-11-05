@@ -138,7 +138,6 @@ fn unreachable_server_blocks_on_connection_without_leaking_the_dsn() {
     let dsn = "postgresql://flywheel:hunter2@127.0.0.1:1/flywheel?connect_timeout=1";
     let outcome = run_postgres_preflight(dsn, "flywheel", PreflightOptions::default());
     assert!(outcome.blocked());
-    assert_eq!(status(&outcome, "postgres extra"), CheckStatus::Ok);
     let connection = outcome.check("connection").unwrap();
     assert_eq!(connection.status, CheckStatus::Block);
     assert!(
@@ -159,7 +158,7 @@ fn unreachable_server_blocks_on_connection_without_leaking_the_dsn() {
             .is_some_and(|r| r.contains("6543"))
     );
     // Short-circuited: nothing after the connection check ran.
-    assert_eq!(outcome.checks.len(), 2);
+    assert_eq!(outcome.checks.len(), 1);
     assert!(!outcome.provisioned);
     // The override does not provision an unreachable target either.
     let forced = run_postgres_preflight(
@@ -198,7 +197,6 @@ fn preflight_fresh_schema_all_ok() {
     let schema = pg.fresh_schema("fw_preflight");
     let outcome = run_postgres_preflight(&pg.dsn(), &schema, PreflightOptions::default());
     assert!(!outcome.blocked(), "{}", format_report(&outcome.checks));
-    assert_eq!(status(&outcome, "postgres extra"), CheckStatus::Ok);
     assert_eq!(status(&outcome, "connection"), CheckStatus::Ok);
     assert_eq!(status(&outcome, "pooler mode"), CheckStatus::Ok);
     assert_eq!(status(&outcome, "privileges"), CheckStatus::Ok);

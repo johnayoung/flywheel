@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use flywheel_core::store::{LifecycleStore, StoreError};
@@ -200,15 +200,6 @@ pub fn cmd_next<S: LifecycleStore + ?Sized>(
         None => writeln!(out, "{}", pick.item.source_ref)?,
     }
     Ok(0)
-}
-
-/// The path-or-ref `next` prints for a pick, as a `PathBuf` for callers
-/// that consume the file.
-pub fn pick_output(pick: &StatusRow) -> PathBuf {
-    match pick.task_file() {
-        Some(path) => PathBuf::from(python_path_str(path)),
-        None => PathBuf::from(&pick.item.source_ref),
-    }
 }
 
 #[cfg(test)]

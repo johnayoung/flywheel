@@ -23,13 +23,12 @@
 //! ([`crate::grader_rubric::AgentsJudgeInvoke`]) and the recovery summarizer
 //! ([`crate::recovery_summarizer::AgentsSummarizerInvoke`]).
 //!
-//! There is no vendor SDK in the Rust runtime: every agent runs through the
+//! There is no vendor SDK: every agent runs through the
 //! claude-code (or codex) adapter under an [`ExecutionHost`], so this module
-//! is the single agent-driving boundary the Python `_sdk` / `agents_invoke`
-//! pair used to share.
+//! is the single agent-driving boundary.
 
 use crate::envelope::{EnvelopeResult, parse_envelope};
-use crate::grader_transcript::{MonotonicClock, TranscriptCounter, first_breach};
+use crate::grader_transcript::{TranscriptCounter, first_breach};
 use crate::invoker::{
     InvocationFailure, InvocationSignals, IterationResult, ToolInteraction, ToolResultContent,
     ToolResultObservation, Usage, iteration_envelope_is_salvageable, merge_salvaged_iteration,
@@ -219,12 +218,8 @@ impl fmt::Debug for InvocationRequest {
 /// The future one agent iteration resolves to.
 pub type InvokeFuture = Pin<Box<dyn Future<Output = IterationResult> + Send>>;
 
-/// One agent iteration as a shareable async function: the Rust spelling of
-/// the Python `InvokeFunc` (`Callable[[InvocationRequest], Awaitable[IterationResult]]`).
+/// One agent iteration as a shareable async function.
 pub type InvokeFn = Arc<dyn Fn(InvocationRequest) -> InvokeFuture + Send + Sync>;
-
-/// Alias matching the Python name.
-pub type InvokeFunc = InvokeFn;
 
 /// Run `f`, containing a panic: observers are best-effort by contract.
 fn guarded(f: impl FnOnce()) {
@@ -381,7 +376,6 @@ pub struct AgentsInvoker {
     sink: Option<Arc<dyn EventSink>>,
     control_plane: Option<ControlPlane>,
     salvage_lost_envelope: bool,
-    transcript_clock: Option<MonotonicClock>,
 }
 
 impl fmt::Debug for AgentsInvoker {
@@ -411,7 +405,6 @@ impl AgentsInvoker {
             sink: None,
             control_plane: None,
             salvage_lost_envelope: true,
-            transcript_clock: None,
         }
     }
 
@@ -450,13 +443,6 @@ impl AgentsInvoker {
     /// Enable or disable the lost-envelope salvage re-prompt.
     pub fn with_envelope_salvage(mut self, enabled: bool) -> Self {
         self.salvage_lost_envelope = enabled;
-        self
-    }
-
-    /// Inject the monotonic clock the transcript hard limits measure
-    /// `max_wall_seconds` against.
-    pub fn with_transcript_clock(mut self, clock: MonotonicClock) -> Self {
-        self.transcript_clock = Some(clock);
         self
     }
 
@@ -683,10 +669,7 @@ impl AgentsInvoker {
         // stream. Written out as a loop over the channel so the future stays
         // `Send` for the boxed `InvokeFn`.
         let graders = &request.transcript_graders;
-        let mut counter = match &self.transcript_clock {
-            Some(clock) => TranscriptCounter::start_with_clock(clock.clone()),
-            None => TranscriptCounter::start(),
-        };
+        let mut counter = TranscriptCounter::start();
         let mut breached = false;
         while let Some(event) = active.events.recv().await {
             let msg = event_to_message(&event);
@@ -854,11 +837,6 @@ impl ColdSession {
 
     pub fn with_timeout_seconds(mut self, timeout_seconds: Option<f64>) -> Self {
         self.timeout_seconds = timeout_seconds;
-        self
-    }
-
-    pub fn with_command_override(mut self, argv: Vec<String>) -> Self {
-        self.configuration.command_override = Some(argv);
         self
     }
 

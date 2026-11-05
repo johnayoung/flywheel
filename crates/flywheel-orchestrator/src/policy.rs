@@ -5,9 +5,8 @@
 //! default* -- so switching a project between a task directory and an issue
 //! tracker is a committed config change, not a flywheel code change.
 //!
-//! Port of the Python `flywheel_orchestrator._policy` module. One function
-//! owns the whole surface: [`load_policy`] parses the file into a validated
-//! [`WorkPolicy`]; every key is validated here and every default lives here.
+//! One function owns the whole surface: [`load_policy`] parses the file into
+//! a validated [`WorkPolicy`]; every key is validated here and every default lives here.
 //! The contract is *strict on values, lenient on keys*: a wrong-typed or
 //! out-of-enum value fails fast with a [`PolicyError`] naming the offending
 //! file and key, while unknown keys under a known table and unknown section
@@ -168,7 +167,7 @@ pub const SANDBOX_ROOT_SIBLING_TOKEN: &str = "@sibling";
 ///
 /// The message always identifies the offending file (and key, where
 /// applicable) so the operator's fix is unambiguous. The message text
-/// mirrors the Python module so operators see the same diagnostics.
+/// is pinned so operators see stable diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
     /// The file could not be read.
@@ -712,9 +711,7 @@ pub fn load_policy_table(data: &Table, policy_file: &Path) -> Result<WorkPolicy,
         // speaks only the CLI transport, so any other value would fail every
         // run after the daemon started.
         return Err(ctx.err(format!(
-            "agent.transport must be one of {}, got {}; the Python-era \"sdk\" transport is \
-             gone (the cli transport speaks the same stream-json control protocol) -- set \
-             transport = \"cli\" or remove the key",
+            "agent.transport must be one of {}, got {}",
             py_tuple(&AGENT_TRANSPORTS),
             py_str_repr(transport)
         )));
@@ -1833,7 +1830,7 @@ fn py_float_repr(f: f64) -> String {
 }
 
 /// Python `repr()` of a decoded TOML value, so `got {value!r}` diagnostics
-/// read identically to the Python module's.
+/// quote the offending value.
 fn py_repr(value: &Value) -> String {
     match value {
         Value::String(s) => py_str_repr(s),
@@ -2412,11 +2409,7 @@ mod tests {
         assert!(err_dir("[agent]\nid = \"\"\n").contains("agent.id must be a non-empty string"));
         assert_eq!(
             err_dir("[agent]\nid = \"claude-code\"\ntransport = \"sdk\"\n"),
-            format!(
-                "{FILE}: agent.transport must be one of ('cli',), got 'sdk'; the Python-era \
-                 \"sdk\" transport is gone (the cli transport speaks the same stream-json \
-                 control protocol) -- set transport = \"cli\" or remove the key"
-            )
+            format!("{FILE}: agent.transport must be one of ('cli',), got 'sdk'")
         );
         assert!(
             err_dir("[agent]\nid = \"codex\"\ntransport = \"grpc\"\n")
@@ -2433,8 +2426,7 @@ mod tests {
             err_top("agent = \"x\"\n"),
             format!("{FILE}: [agent] must be a table")
         );
-        // A falsy scalar where a table belongs is a typo too (the Python
-        // loader silently accepted `agent = false`).
+        // A falsy scalar where a table belongs is a typo too (`agent = false`).
         assert_eq!(
             err_top("agent = false\n"),
             format!("{FILE}: [agent] must be a table")
@@ -2769,7 +2761,6 @@ mod tests {
 
     #[test]
     fn submit_tiers_carry_on_github_policy() {
-        // The Python loader dropped [[submit.tiers]] for kind = "github".
         let policy = ok_github("[[submit.tiers]]\ntier = 0\npaths = [\"docs/**\"]\n");
         assert_eq!(policy.submit_tiers.len(), 1);
         assert_eq!(policy.submit_tiers[0].tier, 0);
@@ -3339,35 +3330,29 @@ mod tests {
         assert_eq!(keyed.len(), "proj-".len() + 12);
     }
 
-    // --- parity with the Python loader ---------------------------------------------
+    // --- resolved-policy goldens ----------------------------------------------------
 
-    fn parity_check(policy: &WorkPolicy, expected: &str) {
+    fn golden_check(policy: &WorkPolicy, expected: &str) {
         let actual = serde_json::to_value(policy).unwrap();
         let expected: serde_json::Value = serde_json::from_str(expected).unwrap();
-        assert_eq!(
-            actual, expected,
-            "resolved policy diverges from the Python loader"
-        );
+        assert_eq!(actual, expected, "resolved policy diverges from the golden");
     }
 
-    /// The repository's own `flywheel.toml`, resolved by the Python loader
-    /// (`flywheel_orchestrator._policy.load_policy`) and dumped as JSON.
+    /// The repository's own `flywheel.toml`, resolved and dumped as JSON.
     #[test]
-    fn parity_repository_flywheel_toml() {
+    fn golden_repository_flywheel_toml() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let policy = load_policy(root.join("flywheel.toml")).unwrap();
-        parity_check(
+        golden_check(
             &policy,
             r#"{"agent_id": null, "agent_transport": null, "autopilot_interval_seconds": 300.0, "autopilot_landing": "merge", "autopilot_target_depth": 5, "autopilot_weights": null, "db_path": ".flywheel/flywheel.sqlite", "deadlines": {"agent_iteration_seconds": 3600.0, "autopilot_agent_seconds": 1800.0, "command_grader_seconds": 900.0, "docker_management_seconds": 120.0, "rubric_judge_seconds": 600.0}, "default_graders": [], "execution_capabilities": [], "execution_mode": "local", "github_ci_failure_filter": "failure", "github_ci_repo": null, "github_done_action": "comment", "github_label": null, "github_repo": null, "github_require_triage_receipt": false, "github_review_repo": null, "held_out_root": ".flywheel/verification/held-out", "model": "claude-opus-4-8", "phase_verify": "scripts/check.sh", "protected_paths": [".github/**", "flywheel.toml", "scripts/**", "CLAUDE.md", ".claude/**"], "sandbox": {"backend": "worktree", "capabilities": {"allowed_tools": [], "denied_tools": [], "mcp_servers": [], "mcp_strict": false, "setting_sources": null, "skills": "all"}, "container": {"auth": "oauth", "auth_env": "", "egress_network": "", "exec_timeout": 1800, "image": "", "model": ""}, "env": {"inherit_home": true, "passthrough": [], "set_values": {}}, "exec": {"auto_allow": true, "enabled": false}, "limits": {"lease_seconds": 300, "max_cost_usd": 0.0, "max_retries": 1, "max_tokens": 0, "max_turns": 500, "rubric_judge_max_turns": null, "wall_clock_seconds": 0}, "network": {"allow_hosts": [], "allow_unix_sockets": [], "policy": "allow"}, "permission_mode": "bypassPermissions", "preset": "fast", "retention": {"on_done": "destroy", "on_failure": "park", "sweep_days": 7}}, "sandbox_root": ".flywheel/worktrees", "sandbox_setup": null, "source_kind": "directory", "store_backend": "sqlite", "store_schema": null, "submit_base": null, "submit_pr_base": null, "submit_recovery_agent_max_turns": 30, "submit_recovery_agent_max_wall_seconds": 900.0, "submit_remote": "origin", "submit_strategy": "merge", "submit_tiers": [], "submit_verify": "scripts/check.sh", "tasks_dir": ".flywheel/tasks", "triage_intake_label": "flywheel", "triage_interval_seconds": 300.0, "triage_max_per_pass": null, "triage_needs_detail_label": "flywheel:needs-detail", "triage_ready_label": "flywheel:ready", "worker_checkpoint_nudge_seconds": 300.0, "worker_concurrency": 3, "worker_session_pause_ceiling_seconds": 21600.0}"#,
         );
     }
 
-    /// A github-kind policy exercising every optional section, resolved by
-    /// the Python loader and dumped as JSON. The only representational
-    /// difference is the grader: Python's `asdict` emits `"name": null`
-    /// where the core `Grader` serializer omits the absent name.
+    /// A github-kind policy exercising every optional section, resolved and
+    /// dumped as JSON (the core `Grader` serializer omits an absent name).
     #[test]
-    fn parity_rich_github_policy() {
+    fn golden_rich_github_policy() {
         let body = r#"
 [source]
 kind = "github"
@@ -3479,7 +3464,7 @@ exec_timeout = 5
 egress_network = "egress"
 "#;
         let policy = load(body).unwrap();
-        parity_check(
+        golden_check(
             &policy,
             r#"{"agent_id": "claude-code", "agent_transport": "cli", "autopilot_interval_seconds": 10.0, "autopilot_landing": "pr", "autopilot_target_depth": 2, "autopilot_weights": {"effort": 1.0, "importance": 3.0, "interrupt_base": 10000.0, "tier": 1.5, "unblock": 7.0, "urgency": 3.0}, "db_path": "state/fw.sqlite", "deadlines": {"agent_iteration_seconds": null, "autopilot_agent_seconds": 1800.0, "command_grader_seconds": 900.0, "docker_management_seconds": 120.0, "rubric_judge_seconds": 42.5}, "default_graders": [{"run": "cargo test", "type": "command"}], "execution_capabilities": ["cuda", "gpu"], "execution_mode": "distributed", "github_ci_failure_filter": "failure", "github_ci_repo": null, "github_done_action": "close", "github_label": "fw", "github_repo": "acme/widgets", "github_require_triage_receipt": true, "github_review_repo": null, "held_out_root": "oracles", "model": "claude-sonnet-4-5", "phase_verify": "make gate", "protected_paths": ["ci/**"], "sandbox": {"backend": "container", "capabilities": {"allowed_tools": ["Bash", "Edit", "Glob", "Grep", "Read", "Write"], "denied_tools": ["WebFetch"], "mcp_servers": ["serena"], "mcp_strict": true, "setting_sources": ["project"], "skills": ["a", "b"]}, "container": {"auth": "api_key", "auth_env": "TOK", "egress_network": "egress", "exec_timeout": 5, "image": "img:1", "model": "m"}, "env": {"inherit_home": false, "passthrough": ["HOME", "CARGO_HOME"], "set_values": {"RUSTC_WRAPPER": "sccache"}}, "exec": {"auto_allow": false, "enabled": true}, "limits": {"lease_seconds": 60, "max_cost_usd": 2.0, "max_retries": 2, "max_tokens": 1000, "max_turns": 7, "rubric_judge_max_turns": 8, "wall_clock_seconds": 99}, "network": {"allow_hosts": ["api.github.com"], "allow_unix_sockets": ["/run/x.sock"], "policy": "deny"}, "permission_mode": "default", "preset": "hardened", "retention": {"on_done": "preserve", "on_failure": "destroy", "sweep_days": 3}}, "sandbox_root": "@cache", "sandbox_setup": "cargo fetch", "source_kind": "github", "store_backend": "postgres", "store_schema": "fw_ci", "submit_base": "integration", "submit_pr_base": "develop", "submit_recovery_agent_max_turns": 0, "submit_recovery_agent_max_wall_seconds": 60.0, "submit_remote": "upstream", "submit_strategy": "pr", "submit_tiers": [], "submit_verify": "make check", "tasks_dir": null, "triage_intake_label": "in", "triage_interval_seconds": 5.0, "triage_max_per_pass": 3, "triage_needs_detail_label": "nd", "triage_ready_label": "ready", "worker_checkpoint_nudge_seconds": 0.0, "worker_concurrency": 0, "worker_session_pause_ceiling_seconds": 120.0}"#,
         );

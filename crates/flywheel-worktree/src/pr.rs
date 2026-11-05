@@ -31,13 +31,12 @@
 //! verdict. It plugs into the archive sweep's `phase_completion` seam
 //! (`crate::phase::ArchiveOptions`).
 //!
-//! Port of the Python `flywheel_worktree.pr` module. Deviations: the pr
-//! strategy records the same `uncommitted-work` park witness the merge
-//! strategy does (the Python only logged it), and provenance trailers are
-//! stamped over the task's own commits (`<landing base>..<branch>`, the same
-//! range the commit count and protected-path gate judge) rather than
-//! `pr_base..branch`, which rewrote commits outside the task when `pr_base`
-//! differed from the worker's base.
+//! The pr strategy records the same `uncommitted-work` park witness the
+//! merge strategy does, and provenance trailers are stamped over the task's
+//! own commits (`<landing base>..<branch>`, the same range the commit count
+//! and protected-path gate judge) rather than `pr_base..branch`, which would
+//! rewrite commits outside the task when `pr_base` differs from the
+//! worker's base.
 
 use crate::phase::phase_branch;
 use crate::submit_registry::{
@@ -88,7 +87,7 @@ fn gh(runner: &dyn GhRunner, argv: &[&str]) -> Result<String, GhError> {
 ///
 /// The receipts are the harness's verdict, not the agent's claim -- the body
 /// says so explicitly because that distinction is the whole reason a
-/// reviewer can trust the green. Byte-identical to the Python rendering.
+/// reviewer can trust the green. Pinned byte for byte by the tests.
 pub fn render_pr_body(req: &SubmitRequest) -> String {
     let mut lines: Vec<String> = vec![
         "## Task".into(),
@@ -135,7 +134,7 @@ fn push_receipt_table(lines: &mut Vec<String>, receipts: &[GraderReceipt]) {
 }
 
 /// Cut `title` to [`TITLE_MAX`] characters, ending in an ellipsis when it
-/// was longer (character-counted, as the Python slice was).
+/// was longer (character-counted).
 pub fn truncate_title(title: String) -> String {
     if title.chars().count() <= TITLE_MAX {
         return title;
@@ -308,7 +307,7 @@ impl GitPullRequestSubmitter {
     }
 
     /// The PR landing path. Every leaf returns an outcome; an `Err` is the
-    /// Python "raise" that [`SubmitStrategy::submit`] contains.
+    /// failure that [`SubmitStrategy::submit`] contains.
     pub fn submit_inner(&self, req: &SubmitRequest) -> Result<SubmitOutcome, SubmitError> {
         if req.status != Status::Done {
             // Identical park semantics to the merge strategy: the inherited
@@ -651,7 +650,7 @@ fn push_phase_task_section(lines: &mut Vec<String>, section: &PhaseTaskSection) 
 /// The receipts are the harness's verdicts (never the agent's claim) and
 /// the held-out outcome is rendered faithfully -- `NO_GATE` distinct from
 /// `PASS` -- so a reviewer sees, per task, exactly how "done" was decided
-/// before trusting the aggregate. Byte-identical to the Python rendering.
+/// before trusting the aggregate. Pinned byte for byte by the tests.
 pub fn render_phase_pr_body(phase: &str, sections: &[PhaseTaskSection]) -> String {
     let mut lines: Vec<String> = vec![
         format!("## Phase `{phase}`"),
@@ -678,8 +677,7 @@ pub fn render_phase_pr_body(phase: &str, sections: &[PhaseTaskSection]) -> Strin
     lines.join("\n")
 }
 
-/// What stops a phase publication outright (the Python `except Exception`
-/// in the completion callable): the sweep is never unwound, the failure is
+/// What stops a phase publication outright: the sweep is never unwound, the failure is
 /// logged and the phase left active.
 #[derive(Debug, thiserror::Error)]
 pub enum PhasePublishError {
@@ -998,7 +996,7 @@ impl PhasePrPublisher {
     }
 }
 
-/// `stderr` trimmed, else `fallback` -- the Python `a.strip() or b`.
+/// `stderr` trimmed, else `fallback` .
 fn refusal_detail(stderr: &str, fallback: &str) -> String {
     let trimmed = stderr.trim();
     if trimmed.is_empty() {
@@ -1244,7 +1242,7 @@ mod tests {
     // --- body rendering ----------------------------------------------------------------
 
     #[test]
-    fn render_pr_body_is_byte_identical_to_the_python() {
+    fn render_pr_body_matches_golden() {
         let task = Task::new(
             "Goal for t1.",
             vec![Grader::Command(CommandGrader::new("true").unwrap())],
@@ -2020,7 +2018,7 @@ mod tests {
     // --- phase PR body (pure) ------------------------------------------------------------------
 
     #[test]
-    fn render_phase_body_is_byte_identical_to_the_python() {
+    fn render_phase_body_matches_golden() {
         let sections = vec![
             PhaseTaskSection {
                 task_id: "t1".into(),
@@ -2574,8 +2572,8 @@ mod tests {
 
     #[test]
     fn publish_contains_a_git_spawn_failure() {
-        // An unspawnable git (an empty repo root path) is the Python
-        // "raised" branch: logged, never unwound into the sweep.
+        // An unspawnable git (an empty repo root path) is the failure
+        // branch: logged, never unwound into the sweep.
         let store: Arc<dyn PhaseEvidenceStore> = Arc::new(InMemoryStore::new());
         let (log, lines) = capture_log();
         let tmp = tempfile::tempdir().unwrap();

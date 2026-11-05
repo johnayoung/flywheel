@@ -958,14 +958,10 @@ dependencies = [
 name = "flywheel-container"
 version = "0.6.1"
 dependencies = [
- "chrono",
  "flywheel-agents",
  "flywheel-core",
  "flywheel-orchestrator",
  "libc",
- "regex",
- "serde",
- "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1075,12 +1071,9 @@ dependencies = [
  "flywheel-container",
  "flywheel-core",
  "flywheel-orchestrator",
- "hex",
  "libc",
  "regex",
- "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

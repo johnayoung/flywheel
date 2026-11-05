@@ -26,9 +26,8 @@
 //! now" injection when the iteration nears its wall-clock ceiling without
 //! new progress).
 //!
-//! In the Python implementation this module wrapped the vendor SDK client;
-//! the Rust runtime has no SDK and every agent runs through
-//! `flywheel-agents`, so the client wrapper collapses onto [`AgentControl`]
+//! Every agent runs through `flywheel-agents`, so the client wrapper
+//! collapses onto [`AgentControl`]
 //! and the per-iteration drive lives in [`crate::agents_invoke`].
 //!
 //! [`InvocationFailure`]: crate::invoker::InvocationFailure
@@ -103,7 +102,7 @@ pub const EVENT_CHECKPOINT_NUDGE: &str = "harness.checkpoint_nudge";
 /// `interrupt` control command (the store-triggered twin of SIGINT/SIGTERM).
 pub const FAILURE_OPERATOR_INTERRUPT: &str = "operator_interrupt";
 /// `InvocationFailure::error_type` for a run stopped by a harness-initiated
-/// mid-turn recovery request (the Python `HarnessRecoveryRequested`).
+/// mid-turn recovery request.
 pub const FAILURE_HARNESS_RECOVERY: &str = "harness_recovery_requested";
 
 /// Audit emitter: `(event kind, payload)`. Best-effort; a panicking emitter

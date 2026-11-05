@@ -1,6 +1,6 @@
 //! Postgres-specific behaviour of `flywheel_core::store_postgres::PostgresStore`.
 //!
-//! The shared trait contract (and the Python interop) lives in
+//! The shared trait contract lives in
 //! `store_contract.rs`. The cases here pin properties that only make sense
 //! for the Postgres backend: JSONB and TIMESTAMPTZ column typing, raw-SQL
 //! append-only enforcement, foreign keys, schema isolation, the version pin
@@ -444,7 +444,7 @@ fn blocked_requires_json_persists_as_text_and_null() {
 }
 
 #[test]
-fn empty_identity_strings_persist_as_null_like_the_python_store() {
+fn empty_identity_strings_persist_as_null() {
     let Some(pg) = Postgres::acquire() else {
         return;
     };

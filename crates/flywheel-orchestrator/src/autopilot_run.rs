@@ -319,8 +319,8 @@ pub fn make_logger(prefix: &str, emit: LogSink) -> LogSink {
     Arc::new(move |message: &str| emit(&format!("{prefix} {message}")))
 }
 
-/// The innermost error of `err`'s source chain: the exception the Python
-/// pass raised, before the Rust wrappers added their context.
+/// The innermost error of `err`'s source chain: the root cause,
+/// before the wrappers added their context.
 fn innermost<'a>(err: &'a (dyn Error + 'static)) -> &'a (dyn Error + 'static) {
     let mut current = err;
     while let Some(next) = current.source() {
@@ -377,9 +377,8 @@ fn schema_marker_in_chain(err: &(dyn Error + 'static)) -> Option<&'static str> {
 /// The error's class name for the `(<name>: <message>)` log parenthetical,
 /// standing in for Python's `type(exc).__name__`: a schema mismatch
 /// anywhere in the chain is named as such; otherwise the innermost error
-/// of the chain (the exception the Python pass raised, before the Rust
-/// wrappers added their context) is named, with the Rust error types
-/// mapped to the exception classes the Python shell would have raised.
+/// of the chain (the root cause, before the wrappers added their context) is named,
+/// with the error types mapped to stable exception-class names.
 pub fn error_type_name(err: &(dyn Error + 'static)) -> &'static str {
     if let Some(marker) = schema_marker_in_chain(err) {
         return marker;
@@ -688,7 +687,7 @@ pub type CycleError = Box<dyn Error + Send + Sync + 'static>;
 /// Bucket a cycle's error as TRANSIENT/PERMANENT, or `None` when out of
 /// scope. The core classifier ([`classify_error`]) knows the core store's
 /// schema mismatch; the orchestrator store's [`OrchestratorSchemaError`] is
-/// the same PERMANENT marker (the Python classes share one base), so it is
+/// the same PERMANENT marker, so it is
 /// recognized here anywhere in the source chain.
 pub fn classify_cycle_fault(err: &(dyn Error + 'static)) -> Option<FaultClass> {
     if schema_marker_in_chain(err).is_some() {
@@ -1108,10 +1107,9 @@ pub const SIGTERM: i32 = 15;
 pub const SIGINT: i32 = 2;
 
 /// Call `on_signal(signum)` on every SIGTERM/SIGINT for the life of the
-/// process (the handler stays armed across cycles, as Python's re-arming
-/// achieved), then terminate every live agent process group: agent
-/// sessions lead groups of their own, out of reach of a signal aimed at
-/// this daemon's group.
+/// process (the handler stays armed across cycles), then terminate every live
+/// agent process group: agent sessions lead groups of their own, out of reach
+/// of a signal aimed at this daemon's group.
 #[cfg(unix)]
 pub(crate) async fn watch_stop_signals(on_signal: SignalHandler, log: LogSink) {
     use tokio::signal::unix::{SignalKind, signal};

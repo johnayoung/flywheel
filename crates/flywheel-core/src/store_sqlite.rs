@@ -4,9 +4,7 @@
 //! `persistence-schema.sql` verbatim (embedded at compile time from its
 //! canonical path, so the DDL is never re-derived here), including its
 //! `PRAGMA journal_mode = WAL` and `PRAGMA foreign_keys = ON` directives.
-//! Databases written by the Python `SqliteStore` open unchanged, and every
-//! row this store writes reads back through the Python store: timestamps
-//! use [`crate::event_serde::format_timestamp`], JSON columns use the same
+//! Wire format: timestamps use [`crate::event_serde::format_timestamp`], JSON columns use the same
 //! key names, `status` / `outcome` / `grader_type` are their snake_case
 //! wire strings, and `passed` is `0` / `1`.
 //!
@@ -93,7 +91,7 @@ pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 /// Bounded retry budget for the locked-past-`busy_timeout` path (the same
 /// budget convention as the harness's transient retries).
 pub const DEFAULT_MAX_TRANSIENT_RETRIES: u32 = 6;
-/// Capped exponential backoff defaults shared with the Python fault policy:
+/// Capped exponential backoff defaults:
 /// `base * factor^attempt`, held at `cap`.
 pub const DEFAULT_BACKOFF_BASE: Duration = Duration::from_millis(500);
 pub const DEFAULT_BACKOFF_FACTOR: f64 = 2.0;
@@ -372,7 +370,7 @@ fn json_object(text: &str) -> Result<JsonObject, StoreError> {
 }
 
 /// NULL for an empty identity-style string (`task_content_hash`, `source`),
-/// matching the Python store's `value or None`.
+/// (`value or None`).
 fn null_if_empty(value: &str) -> Option<&str> {
     (!value.is_empty()).then_some(value)
 }

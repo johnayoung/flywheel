@@ -529,7 +529,7 @@ async fn text_mode_exposes_no_control_surface() {
 }
 
 #[tokio::test]
-async fn sdk_transport_is_rejected_explicitly() {
+async fn unknown_transport_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let request =
         ScenarioBuilder::claude(fake_claude(dir.path()), "happy", dir.path().to_path_buf())

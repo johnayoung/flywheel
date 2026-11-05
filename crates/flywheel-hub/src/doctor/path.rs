@@ -226,19 +226,6 @@ pub(crate) fn on_path_check_with(
                 .find(|p| matches!(classify(p), Found::This | Found::OtherFlywheel(_)))
                 .and_then(|p| p.parent())
                 .map_or_else(|| exe_dir.clone(), |d| d.display().to_string());
-            // What usually puts it there, when that is known.
-            let origin = match &kind {
-                Found::Script(interpreter) if interpreter.contains("python") => {
-                    if first.parent().is_some_and(in_python_venv) {
-                        " (a Python venv's entry point: deactivate the venv, or uninstall the \
-                         package that installs it)"
-                    } else {
-                        " (a Python package's entry point: uninstall the package that \
-                         installs it)"
-                    }
-                }
-                _ => "",
-            };
             Check::new(
                 id,
                 Level::Fail,
@@ -250,7 +237,7 @@ pub(crate) fn on_path_check_with(
             )
             .detail(format!("this flywheel: {this}"))
             .fix(format!(
-                "remove or rename {}{origin}, or put {shadowed} before {} on PATH; then \
+                "remove or rename {}, or put {shadowed} before {} on PATH; then \
                  `hash -r`",
                 first.display(),
                 first
@@ -263,11 +250,4 @@ pub(crate) fn on_path_check_with(
         check = check.detail(format!("also on PATH (shadowed): {}", later.display()));
     }
     check
-}
-
-/// A `bin` directory of a Python virtual environment (`pyvenv.cfg` beside
-/// it).
-fn in_python_venv(bin: &Path) -> bool {
-    bin.parent()
-        .is_some_and(|root| root.join("pyvenv.cfg").is_file())
 }

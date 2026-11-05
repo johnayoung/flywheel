@@ -181,8 +181,8 @@ impl RunTelemetry {
     }
 }
 
-/// A stable error-class label for a [`StoreError`], the Rust spelling of
-/// Python's `type(exc).__name__` in crash / failure payloads.
+/// A stable error-class label for a [`StoreError`] in crash / failure
+/// payloads.
 pub fn store_error_type(err: &StoreError) -> &'static str {
     use crate::store::StoreConflictError;
     match err {

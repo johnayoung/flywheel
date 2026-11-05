@@ -17,8 +17,8 @@
 //! The receipt payload is the documented manual shape from the schema
 //! header -- `{operator_id, decision, notes, decided_at}` -- plus the
 //! gate's `instruction` and a `summary` alias of `notes`, so rows written
-//! here read back through the same `summary` key the Python harness and
-//! prompt renderer consume (`ManualFinding`).
+//! here read back through the same `summary` key the harness and prompt
+//! renderer consume (`ManualFinding`).
 
 use crate::event_serde::format_timestamp;
 use crate::store::{GraderResultRecord, JsonObject};
@@ -234,8 +234,7 @@ pub fn build_reject_result(
 }
 
 /// The operator feedback carried by a persisted manual receipt: `notes`,
-/// falling back to the `summary` key of rows written by the Python
-/// implementation. `None` when neither is a string.
+/// falling back to the legacy `summary` key. `None` when neither is a string.
 pub fn receipt_notes(payload: &JsonObject) -> Option<&str> {
     payload
         .get("notes")
@@ -481,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn receipt_readers_understand_python_written_rows() {
+    fn receipt_readers_understand_legacy_summary_rows() {
         let mut record = build_approve_result(&gate(0, None), "run-1", 1, "alice", "ok", ts(0));
         record.payload = json!({"instruction": "confirm", "summary": "legacy feedback"})
             .as_object()

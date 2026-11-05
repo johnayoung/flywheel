@@ -274,11 +274,11 @@ sandbox_root = \".flywheel/worktrees\"
 # array-of-tables entry per grader, run in order; pass is exit code 0.
 # [[defaults.graders]]
 # type = \"command\"
-# run = \"uv run pytest\"
+# run = \"make test\"
 
 # --- Agent -----------------------------------------------------------------
-# The model id the worker passes to the agent SDK verbatim (no allowlist).
-# CLI --model overrides. Unset uses the SDK default.
+# The model id the worker passes to the agent CLI verbatim (no allowlist).
+# CLI --model overrides. Unset uses the agent CLI's default.
 # [agent]
 # model = \"claude-opus-4-8\"
 
@@ -287,10 +287,10 @@ sandbox_root = \".flywheel/worktrees\"
 # inside every newly created sandbox before the agent enters (dependency
 # install, codegen) so tasks never pay discovery cost for a bare worktree.
 # `backend` selects the execution surface: \"worktree\" (default) or \"container\"
-# (Docker; needs the flywheel-container extra + a [sandbox.container] block).
+# (Docker; needs a [sandbox.container] block).
 # `preset` is a code-owned baseline that subtable keys override.
 # [sandbox]
-# setup = \"uv sync\"
+# setup = \"make deps\"
 # backend = \"worktree\"               # worktree | container
 # preset = \"fast\"                    # fast | balanced | hardened
 # permission_mode = \"default\"        # default | acceptEdits | bypassPermissions
@@ -312,7 +312,7 @@ const INIT_POLICY_TAIL_FOOT: &str =
 # archiving it. Unset = today's archival (no gate). Distinct from
 # [submit] verify, which gates each individual land.
 # [phase]
-# verify = \"uv run pytest\"
+# verify = \"make test\"
 
 # --- Held-out landing gate -------------------------------------------------
 # `root` is a directory of operator-authored held-out grader registrations the
@@ -396,7 +396,7 @@ pub fn render_submit_block(submit_base: Option<&str>) -> String {
          # grader configs and .flywheel state as your surface grows.\n\
          [submit]\n\
          # base = {suggestion}\n\
-         # verify = \"uv run pytest\"\n\
+         # verify = \"make test\"\n\
          protected_paths = [{protected}]\n\
          # strategy = \"merge\"          # merge | phase | pr\n\
          # remote = \"origin\"           # pr strategy push target\n\
@@ -1630,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_policy_is_byte_identical_to_python_for_github_postgres() {
+    fn rendered_policy_matches_golden_for_github_postgres() {
         let answers = InitAnswers {
             store_backend: "postgres".into(),
             store_schema: Some("flywheel_ci".into()),
@@ -1644,7 +1644,7 @@ mod tests {
         let text = render_init_policy(&answers);
         assert!(text.contains("\n[source]\nkind = \"github\"\nrepo = \"octo/widgets\"\nlabel = \"work\"\ndone_action = \"close\"\n\n[store]\nbackend = \"postgres\"\nschema = \"flywheel_ci\"\n\n[paths]\n"));
         assert!(text.contains("# branch (detected current branch: feature/x\"y) \u{2014} the working default. Set base ONLY to a\n"));
-        assert!(text.contains("[submit]\n# base = \"feature/x\\\"y\"\n# verify = \"uv run pytest\"\nprotected_paths = [\".github/**\", \"flywheel.toml\"]\n# strategy = \"merge\"          # merge | phase | pr\n"));
+        assert!(text.contains("[submit]\n# base = \"feature/x\\\"y\"\n# verify = \"make test\"\nprotected_paths = [\".github/**\", \"flywheel.toml\"]\n# strategy = \"merge\"          # merge | phase | pr\n"));
         let unset = render_init_policy(&InitAnswers::default());
         assert!(unset.contains("# branch \u{2014} the working default. Set base ONLY to a\n"));
         assert!(unset.contains("[submit]\n# base = \"main\"\n"));
@@ -1682,7 +1682,7 @@ mod tests {
         );
         let verify = text.replace(
             "[submit]\n# base",
-            "[submit]\nverify = \"uv run pytest\"\n# base",
+            "[submit]\nverify = \"make test\"\n# base",
         );
         std::fs::write(tmp.path().join("flywheel.toml"), &verify).unwrap();
         assert_eq!(
@@ -1690,7 +1690,7 @@ mod tests {
                 .unwrap()
                 .submit_verify
                 .as_deref(),
-            Some("uv run pytest")
+            Some("make test")
         );
     }
 
@@ -1905,7 +1905,7 @@ sandbox_root = \"custom/sandboxes\"
 
 [[defaults.graders]]
 type = \"command\"
-run = \"uv run pytest -q\"
+run = \"make test\"
 
 [agent]
 model = \"claude-opus-4-7\"

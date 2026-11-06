@@ -41,6 +41,7 @@ pub mod fanout;
 pub mod fanout_cli;
 pub mod files;
 pub mod flywheel;
+pub mod fsbrowse;
 pub mod git;
 pub mod handoff;
 pub mod hub;

@@ -28,6 +28,33 @@ impl Hub {
         Ok(workspace)
     }
 
+    /// Every folder a workspace lists or a session opened in, each with
+    /// its workspace's name and when it was last used (the folder
+    /// picker's suggestions). No disk access.
+    pub fn used_folders(&self) -> Vec<crate::fsbrowse::UsedFolder> {
+        let store = self.store();
+        let names: HashMap<&str, &str> = store
+            .workspaces()
+            .iter()
+            .map(|w| (w.id.as_str(), w.name.as_str()))
+            .collect();
+        let listed = store.workspaces().iter().flat_map(|w| {
+            w.folders.iter().map(|f| crate::fsbrowse::UsedFolder {
+                path: f.path.clone(),
+                workspace: w.name.clone(),
+                when: w.created_at,
+            })
+        });
+        let opened = store.sessions().iter().filter_map(|s| {
+            Some(crate::fsbrowse::UsedFolder {
+                path: s.folder().to_path_buf(),
+                workspace: (*names.get(s.workspace_id.as_str())?).to_owned(),
+                when: s.created_at,
+            })
+        });
+        listed.chain(opened).collect()
+    }
+
     pub fn create_workspace(&self, input: WorkspaceInput) -> Result<Workspace, HubError> {
         let workspace = self.store().create_workspace(input)?;
         self.emit(HubEvent::Sessions);

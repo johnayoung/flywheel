@@ -1397,6 +1397,89 @@ async fn repo_check_validates_a_single_path() {
     hub.shutdown().await;
 }
 
+/// The folder picker: subdirectories (never files) of a hub-side path,
+/// and suggestions led by the folders workspaces use; neither without a
+/// credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn folder_picker_lists_directories_and_suggests_used_folders() {
+    let hub = TestHub::start().await;
+    let parent = hub.repo.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(parent.join("plain")).unwrap();
+    std::fs::create_dir_all(parent.join(".dot")).unwrap();
+    std::fs::write(parent.join("notes.txt"), "secret").unwrap();
+    let dirs = |query: Vec<(&'static str, String)>| {
+        let request = hub
+            .authed(reqwest::Method::GET, "/api/fs/dirs")
+            .query(&query);
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            (status, response.json::<Value>().await.unwrap())
+        }
+    };
+    let (status, listing) = dirs(vec![("path", parent.display().to_string())]).await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    let entries = listing["entries"].as_array().unwrap();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"repo") && names.contains(&"plain"),
+        "{names:?}"
+    );
+    assert!(!names.contains(&"notes.txt"), "files are never listed");
+    assert_eq!(names.last(), Some(&".dot"), "hidden ones last");
+    let repo = entries.iter().find(|e| e["name"] == "repo").unwrap();
+    assert_eq!(repo["git"], true);
+    assert_eq!(
+        listing["path"],
+        parent.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(!listing.to_string().contains("secret"));
+
+    let (_, filtered) = dirs(vec![
+        ("path", parent.display().to_string()),
+        ("prefix", "PL".into()),
+    ])
+    .await;
+    assert_eq!(filtered["entries"].as_array().unwrap().len(), 1);
+    let (status, missing) = dirs(vec![("path", parent.join("nope").display().to_string())]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    let (status, relative) = dirs(vec![("path", "relative".into())]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{relative}");
+    let (status, file) = dirs(vec![(
+        "path",
+        parent.join("notes.txt").display().to_string(),
+    )])
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{file}");
+
+    hub.create_workspace("picker").await;
+    let suggested: Value = hub
+        .authed(reqwest::Method::GET, "/api/fs/suggestions")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let first = &suggested["suggestions"][0];
+    assert_eq!(
+        first["path"],
+        hub.repo.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(first["source"], "used");
+    assert_eq!(first["workspace"], "picker");
+    assert_eq!(first["git"], true);
+
+    for route in ["/api/fs/dirs?path=/", "/api/fs/suggestions"] {
+        let anonymous = hub.http.get(hub.url(route)).send().await.unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{route}");
+    }
+    hub.shutdown().await;
+}
+
 async fn wait_state(hub: &TestHub, sid: &str, want: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {

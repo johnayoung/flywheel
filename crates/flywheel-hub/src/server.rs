@@ -75,6 +75,7 @@ mod events_ws;
 mod fanout_api;
 mod files_api;
 mod flywheel_api;
+mod fs_api;
 mod handoff_api;
 mod import_api;
 mod listen;
@@ -245,6 +246,8 @@ struct AppState {
     machines: Arc<crate::machines::Machines>,
     /// The UI's preferences and keymap (`settings.json`).
     settings: Arc<crate::settings::SettingsStore>,
+    /// The folder picker's last discovery scan (`/api/fs/suggestions`).
+    repo_scan: Arc<crate::fsbrowse::RepoScanCache>,
 }
 
 /// Build the router. Flipping `shutdown` to `true` closes every open
@@ -261,6 +264,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         failures: Arc::new(Mutex::new(FailureLimiter::default())),
         peers,
         machines,
+        repo_scan: Arc::default(),
     };
     let protected = Router::new()
         .route(
@@ -307,6 +311,9 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/folders/check", get(check_folder))
         // The pre-folders name of the same check.
         .route("/api/repos/check", get(check_folder))
+        // The folder picker: directories on this machine (names only).
+        .route("/api/fs/dirs", get(fs_api::dirs))
+        .route("/api/fs/suggestions", get(fs_api::suggestions))
         .route("/api/workspaces/import", post(import_api::import_workspace))
         .route(
             "/api/code-workspaces",

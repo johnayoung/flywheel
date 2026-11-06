@@ -258,6 +258,12 @@ async fn a_hub_drives_another_through_its_proxy() {
         .call(reqwest::Method::GET, "/api/sessions", peer, None)
         .await;
     assert_eq!(status, StatusCode::OK);
+    // The folder picker works where workspaces are made: a machine's
+    // folders are browsed on that machine, through its peer credential.
+    let (status, listing) = b
+        .call(reqwest::Method::GET, "/api/fs/dirs?path=/", peer, None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
     for (method, path) in [
         (reqwest::Method::POST, "/api/token/rotate"),
         (reqwest::Method::POST, "/api/login-codes"),

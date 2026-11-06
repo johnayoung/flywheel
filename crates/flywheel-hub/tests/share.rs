@@ -361,6 +361,9 @@ async fn a_share_link_is_a_read_only_view_of_its_one_session() {
         "/api/plugins/hello/logs",
         "/api/config",
         "/api/recordings",
+        // The folder picker lists the hub's directories: never a viewer's.
+        "/api/fs/dirs?path=/",
+        "/api/fs/suggestions",
         "/",
         "/assets/app.js",
         "/replay",

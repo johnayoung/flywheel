@@ -19,6 +19,8 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 | GET | `/api/code-workspaces[?root=]` | `.code-workspace` files under `--import-root` |
 | GET | `/api/folders/check?path=` | `ok`, `git` / `error` |
 | GET | `/api/repos/check` | old name |
+| GET | `/api/fs/dirs?path=[&prefix=]` | subdirectories (never files): `path`, `parent`, `entries:[{"name","path","git","hidden","link"?,"error"?}]`, `truncated` (2000) |
+| GET | `/api/fs/suggestions` | `suggestions:[{"path","source":"used\|found","workspace"?}]`: used folders, then repos under `~/{code,src,projects,dev,repos,work}`, `~` (cached 60 s) |
 | GET | `/api/templates[?workspace_id=]` | launch templates |
 | POST | `/api/workspaces/{id}/templates` | create (a taken `name`: 409 unless `"replace":true`) |
 | DELETE | `/api/workspaces/{id}/templates/{name}` | |

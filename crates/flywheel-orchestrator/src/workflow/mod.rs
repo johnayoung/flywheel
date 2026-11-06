@@ -251,20 +251,33 @@ pub fn home_project_policy(access: Access) -> Result<WorkPolicy, PolicyError> {
         path: PathBuf::from("."),
         message: format!("cannot resolve the working directory: {err}"),
     })?;
-    let project = home::resolve_project(&home, &cwd)?;
-    let repo_root = home::worktree_toplevel(&cwd)?;
+    let (repo_root, policy) = home_project_policy_in(&home, &cwd, access)?;
     if cwd.canonicalize().ok().as_deref() != Some(repo_root.as_path()) {
         std::env::set_current_dir(&repo_root).map_err(|err| PolicyError::Read {
             path: repo_root.clone(),
             message: format!("cannot re-anchor to {}: {err}", repo_root.display()),
         })?;
     }
-    notice_legacy_layout(&repo_root, &home);
-    let config = load_project_config(&home, &project, &repo_root, access, &ConfigFlags::default())?;
-    let bound = home::bind_project(&home, &project, &config.project_id.value)?;
-    let mut policy = policy_for_project(&bound, repo_root)?;
-    config.apply_to_policy(&mut policy);
     Ok(policy)
+}
+
+/// [`home_project_policy`] for the git repo holding `dir`, without moving
+/// the process: returns the worktree top level the caller re-anchors at,
+/// and the policy. Notices and the trust prompt behave as in
+/// [`home_project_policy`].
+pub fn home_project_policy_in(
+    home: &home::Home,
+    dir: &Path,
+    access: Access,
+) -> Result<(PathBuf, WorkPolicy), PolicyError> {
+    let project = home::resolve_project(home, dir)?;
+    let repo_root = home::worktree_toplevel(dir)?;
+    notice_legacy_layout(&repo_root, home);
+    let config = load_project_config(home, &project, &repo_root, access, &ConfigFlags::default())?;
+    let bound = home::bind_project(home, &project, &config.project_id.value)?;
+    let mut policy = policy_for_project(&bound, repo_root.clone())?;
+    config.apply_to_policy(&mut policy);
+    Ok((repo_root, policy))
 }
 
 /// Whether `folder` belongs to a project flywheel already knows, without
@@ -1341,9 +1354,6 @@ mod tests {
         assert_eq!(String::from_utf8(out).unwrap(), args::TOP_HELP);
     }
 
-    /// Serializes the tests that move the process working directory.
-    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn argv(parts: &[String]) -> Vec<String> {
         parts.to_vec()
     }
@@ -1512,8 +1522,6 @@ mod tests {
 
     #[test]
     fn status_never_reads_a_legacy_policy_and_refuses_outside_a_git_repo() {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let original = std::env::current_dir().unwrap();
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("repo");
         test_support::write_task(
@@ -1536,16 +1544,18 @@ mod tests {
         assert!(err.contains("unrecognized arguments: --policy"), "{err}");
 
         // A flywheel.toml is never auto-detected (here or in a parent): the
-        // directory is not a git repo, so the home project refuses.
+        // directory is not a git repo, so the home project refuses -- and
+        // nothing is written to the home. The directory is passed
+        // explicitly: tests never move the process working directory.
+        let home = home::Home::at(tmp.path().join("home"));
         for dir in [root.clone(), root.join("src").join("deep")] {
             std::fs::create_dir_all(&dir).unwrap();
-            std::env::set_current_dir(&dir).unwrap();
-            let (code, out, err) = run_capture(&argv(&["status".to_owned()]));
-            std::env::set_current_dir(&original).unwrap();
-            assert_eq!(code, 2);
+            let err = home_project_policy_in(&home, &dir, Access::ReadOnly)
+                .unwrap_err()
+                .to_string();
             assert!(err.contains("not inside a git repository"), "{err}");
-            assert!(!out.contains("01-phase/t1"));
         }
+        assert!(!home.root().exists(), "nothing written to the home");
     }
 
     fn git_repo(dir: &Path) {

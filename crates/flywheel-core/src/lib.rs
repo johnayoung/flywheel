@@ -40,6 +40,7 @@ pub mod store_sqlite;
 pub mod strategy;
 pub mod task;
 pub mod telemetry_file;
+pub mod transcripts;
 pub mod validation;
 pub mod workflow;
 

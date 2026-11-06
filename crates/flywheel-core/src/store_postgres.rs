@@ -95,8 +95,9 @@ use crate::schema_ddl::{
 use crate::store::{
     AttemptStore, CURRENT_SCHEMA_VERSION, ControlCommandRecord, ControlCommandStore,
     DEFAULT_PARTITION, DomainEventStore, GraderResultRecord, GraderResultStore, JsonObject,
-    LifecycleFilter, LifecycleStore, OLDEST_UPGRADABLE_SCHEMA_VERSION, SchemaUpgrade, SpendSummary,
-    SpendWindow, StoreError, StoreSchemaError, TaskStore,
+    LedgerEntry, LedgerFilter, LedgerStore, LifecycleFilter, LifecycleStore,
+    OLDEST_UPGRADABLE_SCHEMA_VERSION, SchemaUpgrade, SpendSummary, SpendWindow, StoreError,
+    StoreSchemaError, TaskStore, TranscriptRecord,
 };
 use crate::store_memory::{
     assemble_task, grader_result_from_event, parse_wire_enum, projected_attempt, task_definition,
@@ -2339,6 +2340,104 @@ impl ControlCommandStore for PostgresStore {
     }
 }
 
+impl LedgerStore for PostgresStore {
+    fn append_transcript(&self, record: &TranscriptRecord) -> Result<TranscriptRecord, StoreError> {
+        let bytes = int8(record.bytes, "transcripts.bytes")?;
+        let run_id = nul_free_text(&record.run_id);
+        let uri = nul_free_text(&record.uri);
+        let sha256 = nul_free_text(&record.sha256);
+        let p = self.partition();
+        let id: i64 = self.conn(|client| {
+            let row = client
+                .query_one(
+                    "INSERT INTO transcripts (project_id, run_id, uri, sha256, bytes, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                    &[&p, &run_id, &uri, &sha256, &bytes, &record.created_at],
+                )
+                .map_err(db)?;
+            col(&row, 0)
+        })?;
+        let mut stored = record.clone();
+        stored.id = Some(id);
+        Ok(stored)
+    }
+
+    fn list_transcripts(&self) -> Result<Vec<TranscriptRecord>, StoreError> {
+        let p = self.partition();
+        self.conn(|client| {
+            let rows = client
+                .query(
+                    "SELECT id, run_id, uri, sha256, bytes, created_at FROM transcripts
+                     WHERE project_id = $1 ORDER BY created_at, id",
+                    &[&p],
+                )
+                .map_err(db)?;
+            rows.iter()
+                .map(|row| {
+                    Ok(TranscriptRecord {
+                        run_id: col(row, 1)?,
+                        uri: col(row, 2)?,
+                        sha256: col(row, 3)?,
+                        bytes: unsigned(col::<i64>(row, 4)?, "transcripts.bytes")?,
+                        created_at: col(row, 5)?,
+                        id: Some(col(row, 0)?),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn append_ledger_entry(&self, entry: &LedgerEntry) -> Result<LedgerEntry, StoreError> {
+        let payload = nul_free_json(Value::Object(entry.payload.clone()));
+        let kind = nul_free_text(&entry.kind);
+        let run_id = entry.run_id.as_deref().map(nul_free_text);
+        let p = self.partition();
+        let id: i64 = self.conn(|client| {
+            let row = client
+                .query_one(
+                    "INSERT INTO audit_log (project_id, kind, at, run_id, payload_json)
+                     VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                    &[&p, &kind, &entry.at, &run_id, &payload],
+                )
+                .map_err(db)?;
+            col(&row, 0)
+        })?;
+        let mut stored = entry.clone();
+        stored.id = Some(id);
+        Ok(stored)
+    }
+
+    fn list_ledger_entries(&self, filter: &LedgerFilter) -> Result<Vec<LedgerEntry>, StoreError> {
+        let p = self.partition();
+        let prefix = filter.kind_prefix.clone().unwrap_or_default();
+        // NULL: no limit.
+        let limit: Option<i64> = filter.newest.map(|n| i64::try_from(n).unwrap_or(i64::MAX));
+        self.conn(|client| {
+            let rows = client
+                .query(
+                    "SELECT id, kind, at, run_id, payload_json FROM (
+                         SELECT id, kind, at, run_id, payload_json FROM audit_log
+                         WHERE project_id = $1 AND left(kind, length($2)) = $2
+                         ORDER BY at DESC, id DESC LIMIT $3
+                     ) newest ORDER BY at, id",
+                    &[&p, &prefix, &limit],
+                )
+                .map_err(db)?;
+            rows.iter()
+                .map(|row| {
+                    Ok(LedgerEntry {
+                        kind: col(row, 1)?,
+                        at: col(row, 2)?,
+                        run_id: col(row, 3)?,
+                        payload: json_object(col(row, 4)?)?,
+                        id: Some(col(row, 0)?),
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2346,7 +2445,7 @@ mod tests {
     #[test]
     fn schema_is_embedded_from_the_canonical_file() {
         assert!(SCHEMA_SQL.contains("timestamps_json         JSONB NOT NULL"));
-        assert!(SCHEMA_SQL.contains("INSERT INTO schema_version (version, id) VALUES (13, 1)"));
+        assert!(SCHEMA_SQL.contains("INSERT INTO schema_version (version, id) VALUES (14, 1)"));
         assert!(SCHEMA_SQL.contains("grader_results_reject_mutation"));
         assert!(SCHEMA_SQL.contains("ERRCODE = 'check_violation'"));
     }

@@ -27,8 +27,9 @@ use flywheel_core::events::{DomainEvent, DomainEventPayload, LifecycleInitialize
 use flywheel_core::lifecycle::{Attempt, Lifecycle, Status};
 use flywheel_core::store::{
     AttemptStore, CURRENT_SCHEMA_VERSION, ControlCommandStore, DomainEventStore,
-    GraderResultRecord, GraderResultStore, HarnessStore, JsonObject, LifecycleFilter,
-    LifecycleStore, StoreConflictError, StoreError, TaskStore,
+    GraderResultRecord, GraderResultStore, HarnessStore, JsonObject, LedgerEntry, LedgerFilter,
+    LedgerStore, LifecycleFilter, LifecycleStore, StoreConflictError, StoreError, TaskStore,
+    TranscriptRecord,
 };
 use flywheel_core::store_postgres::{
     BOOTSTRAP_LOCK_KEY, ListenerState, PostgresError, PostgresStore, PostgresStoreOptions,
@@ -119,6 +120,8 @@ fn bootstrap_creates_every_table_with_jsonb_and_timestamptz_columns() {
         "grader_results",
         "schema_version",
         "control_commands",
+        "transcripts",
+        "audit_log",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -150,6 +153,7 @@ fn bootstrap_creates_every_table_with_jsonb_and_timestamptz_columns() {
         ("lifecycles", "timestamps_json"),
         ("control_commands", "payload_json"),
         ("task_versions", "graders_json"),
+        ("audit_log", "payload_json"),
     ] {
         assert_eq!(type_of(table, column), "jsonb", "{table}.{column}");
     }
@@ -162,6 +166,8 @@ fn bootstrap_creates_every_table_with_jsonb_and_timestamptz_columns() {
         ("control_commands", "enqueued_at"),
         ("control_commands", "claimed_at"),
         ("task_versions", "created_at"),
+        ("transcripts", "created_at"),
+        ("audit_log", "at"),
     ] {
         assert_eq!(
             type_of(table, column),
@@ -172,6 +178,7 @@ fn bootstrap_creates_every_table_with_jsonb_and_timestamptz_columns() {
     // blocked_requires_json is deliberately TEXT (an opaque serialized blob).
     assert_eq!(type_of("lifecycles", "blocked_requires_json"), "text");
     assert_eq!(type_of("task_versions", "insertion_seq"), "bigint");
+    assert_eq!(type_of("transcripts", "bytes"), "bigint");
 }
 
 #[test]
@@ -309,6 +316,7 @@ fn a_v12_schema_is_refused_then_upgraded_in_place_with_its_rows_keyed() {
     let upgrade = PostgresStore::upgrade(&pg.dsn(), &schema, "proj-x").unwrap();
     assert_eq!(upgrade.from, Some(12));
     assert_eq!(upgrade.to, CURRENT_SCHEMA_VERSION);
+    // The seven v12 tables are re-keyed; the v14 ledger tables are created.
     assert_eq!(upgrade.partitioned.len(), 7, "{:?}", upgrade.partitioned);
     assert_eq!(schema_version(&pg, &schema), CURRENT_SCHEMA_VERSION as i32);
     assert_eq!(first_column(&pg, &schema, "schema_version"), "version");
@@ -350,6 +358,112 @@ fn a_v12_schema_is_refused_then_upgraded_in_place_with_its_rows_keyed() {
     store.close().unwrap();
     other.close().unwrap();
     // Idempotent: the second upgrade re-keys nothing.
+    assert!(
+        PostgresStore::upgrade(&pg.dsn(), &schema, "proj-x")
+            .unwrap()
+            .is_noop()
+    );
+}
+
+/// A real v13 schema (the frozen pre-ledger DDL) holding one run.
+fn seed_v13(pg: &Postgres, schema: &str) {
+    pg.admin()
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .unwrap();
+    let mut admin = pg.admin_in(schema);
+    admin
+        .batch_execute(include_str!("fixtures/persistence-schema-postgres-v13.sql"))
+        .unwrap();
+    admin
+        .batch_execute(
+            "INSERT INTO tasks (project_id, id, first_seen_at, updated_at)
+               VALUES ('proj-x', 't1', now(), now());
+             INSERT INTO lifecycles
+               (project_id, run_id, task_id, status, version, retries, timestamps_json,
+                updated_at)
+               VALUES ('proj-x', 'run-13', 't1', 'done', 5, 0, '{}', now());",
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_v13_schema_is_refused_then_upgraded_with_the_ledger_tables() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_v13");
+    seed_v13(&pg, &schema);
+    let err = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-x").unwrap_err();
+    assert!(err.to_string().contains("fw db upgrade"), "{err}");
+    assert_eq!(schema_version(&pg, &schema), 13);
+
+    let upgrade = PostgresStore::upgrade(&pg.dsn(), &schema, "proj-x").unwrap();
+    assert_eq!(upgrade.from, Some(13));
+    assert!(upgrade.partitioned.is_empty(), "{:?}", upgrade.partitioned);
+    assert_eq!(schema_version(&pg, &schema), CURRENT_SCHEMA_VERSION as i32);
+
+    let store = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-x").unwrap();
+    assert_eq!(store.load_lifecycle("run-13").unwrap().unwrap().version, 5);
+    let row = store
+        .append_transcript(&TranscriptRecord {
+            run_id: "run-13".into(),
+            uri: "file:///tmp/run-13.jsonl".into(),
+            sha256: "0".repeat(64),
+            bytes: 9,
+            created_at: at(1),
+            id: None,
+        })
+        .unwrap();
+    assert_eq!(store.list_transcripts().unwrap(), vec![row]);
+    for (kind, secs) in [
+        ("autopilot.decision", 3),
+        ("autopilot.cycle", 2),
+        ("hub.merge", 4),
+    ] {
+        store
+            .append_ledger_entry(
+                &LedgerEntry::new(kind, at(secs), obj(json!({"n": secs}))).with_run_id("run-13"),
+            )
+            .unwrap();
+    }
+    let newest_autopilot = store
+        .list_ledger_entries(&LedgerFilter::kind_prefix("autopilot.").with_newest(1))
+        .unwrap();
+    assert_eq!(newest_autopilot.len(), 1);
+    assert_eq!(newest_autopilot[0].kind, "autopilot.decision");
+    assert_eq!(newest_autopilot[0].payload["n"], 3);
+    let all = store.list_ledger_entries(&LedgerFilter::default()).unwrap();
+    let kinds: Vec<&str> = all.iter().map(|e| e.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["autopilot.cycle", "autopilot.decision", "hub.merge"]
+    );
+    assert_eq!(all[0].run_id.as_deref(), Some("run-13"));
+    // Append-only at the database layer.
+    for statement in [
+        "DELETE FROM transcripts",
+        "UPDATE transcripts SET bytes = 0",
+        "DELETE FROM audit_log",
+        "UPDATE audit_log SET kind = 'x'",
+    ] {
+        let raw = store.with_client(|client| client.execute(statement, &[]).unwrap_err());
+        assert_eq!(
+            sqlstate(&raw),
+            Some(SqlState::CHECK_VIOLATION),
+            "{statement}"
+        );
+    }
+    // Another partition sees none of it.
+    let other = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-y").unwrap();
+    assert!(other.list_transcripts().unwrap().is_empty());
+    assert!(
+        other
+            .list_ledger_entries(&LedgerFilter::default())
+            .unwrap()
+            .is_empty()
+    );
+    store.close().unwrap();
+    other.close().unwrap();
     assert!(
         PostgresStore::upgrade(&pg.dsn(), &schema, "proj-x")
             .unwrap()

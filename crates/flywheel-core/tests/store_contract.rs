@@ -1268,6 +1268,82 @@ fn control_commands_enqueue_claim_once_in_order_scoped_by_run(store: &dyn Harnes
     assert_eq!(again[0].claimed_at, Some(t(6)));
 }
 
+fn ledger_rows_append_and_list_oldest_first_with_kind_and_newest_filters(store: &dyn HarnessStore) {
+    use flywheel_core::store::{LedgerEntry, LedgerFilter, TranscriptRecord};
+    assert!(store.list_transcripts().unwrap().is_empty());
+    assert!(
+        store
+            .list_ledger_entries(&LedgerFilter::default())
+            .unwrap()
+            .is_empty()
+    );
+    let second = store
+        .append_transcript(&TranscriptRecord {
+            run_id: "r2".into(),
+            uri: "file:///t/r2.jsonl".into(),
+            sha256: "b".repeat(64),
+            bytes: 2,
+            created_at: t(2),
+            id: None,
+        })
+        .unwrap();
+    let first = store
+        .append_transcript(&TranscriptRecord {
+            run_id: "r1".into(),
+            uri: "file:///t/r1.jsonl".into(),
+            sha256: "a".repeat(64),
+            bytes: 1,
+            created_at: t(1),
+            id: None,
+        })
+        .unwrap();
+    assert!(first.id.is_some() && second.id.is_some());
+    assert_eq!(store.list_transcripts().unwrap(), vec![first, second]);
+
+    for (kind, second) in [
+        ("autopilot.cycle", 5),
+        ("hub.merge", 3),
+        ("autopilot.decision", 4),
+        ("autopilot.decision", 6),
+    ] {
+        store
+            .append_ledger_entry(&LedgerEntry::new(
+                kind,
+                t(second),
+                obj(json!({"s": second, "nested": {"k": [1, 2]}})),
+            ))
+            .unwrap();
+    }
+    let all = store.list_ledger_entries(&LedgerFilter::default()).unwrap();
+    let order: Vec<(&str, i64)> = all
+        .iter()
+        .map(|e| (e.kind.as_str(), e.payload["s"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            ("hub.merge", 3),
+            ("autopilot.decision", 4),
+            ("autopilot.cycle", 5),
+            ("autopilot.decision", 6)
+        ]
+    );
+    assert_eq!(all[0].payload["nested"], json!({"k": [1, 2]}));
+    assert_eq!(all[0].run_id, None);
+    let newest = store
+        .list_ledger_entries(&LedgerFilter::kind_prefix("autopilot.").with_newest(2))
+        .unwrap();
+    let seconds: Vec<i64> = newest
+        .iter()
+        .map(|e| e.payload["s"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seconds, [5, 6]);
+    let cycles = store
+        .list_ledger_entries(&LedgerFilter::kind_prefix("autopilot.cycle"))
+        .unwrap();
+    assert_eq!(cycles.len(), 1);
+}
+
 fn delete_command_removes_the_row_and_unknown_ids_are_noops(store: &dyn HarnessStore) {
     ensure_lifecycle(store, "r1", "t");
     store
@@ -1837,6 +1913,10 @@ const CASES: &[(&str, Case)] = &[
     (
         "delete_command_removes_the_row_and_unknown_ids_are_noops",
         delete_command_removes_the_row_and_unknown_ids_are_noops,
+    ),
+    (
+        "ledger_rows_append_and_list_oldest_first_with_kind_and_newest_filters",
+        ledger_rows_append_and_list_oldest_first_with_kind_and_newest_filters,
     ),
     (
         "list_lifecycles_filters_and_orders_by_most_recent_write",

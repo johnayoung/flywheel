@@ -28,6 +28,7 @@ use crate::autopilot_activity::{
 use crate::autopilot_context::{
     DISCOVERY_CACHE_FILENAME, DiscoveryCacheStatus, default_discovery_cache_path,
 };
+use crate::autopilot_ledger::{PassMode, record_failed_pass, record_pass};
 use crate::claims::{ClaimStore, ClaimStoreError, OrchestratorSchemaError};
 use crate::orchestrate::{
     DEFAULT_NO_PROGRESS_BOUND, NoProgressObservation, NoProgressOutcome, NoProgressResult,
@@ -872,6 +873,44 @@ pub fn run_daemon_loop(
     cycles
 }
 
+// --- The decision ledger -----------------------------------------------------------------------
+
+/// Writes every pass's decisions to the core store's audit ledger
+/// ([`crate::autopilot_ledger`]). Best effort like the store it rides on: a
+/// missing store or a failed write is logged, never fatal to a cycle.
+struct LedgerWriter {
+    store: Option<Arc<dyn HarnessStore>>,
+    log: LogSink,
+    now: Clock,
+}
+
+impl LedgerWriter {
+    fn pass(&self, cycle: i64, mode: PassMode, result: &AutopilotPassResult) {
+        if let Some(store) = &self.store
+            && let Err(err) = record_pass(store.as_ref(), cycle, mode, result, (self.now)())
+        {
+            (self.log)(&format!("decision ledger write failed ({err}); continuing"));
+        }
+    }
+
+    fn failed(&self, cycle: i64, mode: PassMode, err: &CycleError) {
+        if let Some(store) = &self.store
+            && let Err(write) = record_failed_pass(
+                store.as_ref(),
+                cycle,
+                mode,
+                &err.to_string(),
+                error_type_name(err.as_ref()),
+                (self.now)(),
+            )
+        {
+            (self.log)(&format!(
+                "decision ledger write failed ({write}); continuing"
+            ));
+        }
+    }
+}
+
 // --- The activity / liveness record -----------------------------------------------------------
 
 /// The liveness record's freshness window is one interval (the gap between
@@ -1483,6 +1522,12 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
     // Resolve the store path once; both best-effort counters open from it.
     let db_path = resolve_daemon_db_path(policy, &repo_root);
     let depth_store = host.queue_depth_store(policy, &db_path, &log);
+    // The same core store receives every pass's decisions as ledger rows.
+    let ledger = LedgerWriter {
+        store: depth_store.clone(),
+        log: log.clone(),
+        now: host.utc_clock(),
+    };
     let queue_depth = depth_store
         .map(|store| move |tasks_dir: &Path| actionable_queue_depth(tasks_dir, store.as_ref()));
     let queue_depth_probe: Option<&QueueDepthFn<'_>> = match &queue_depth {
@@ -1529,9 +1574,11 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         return match run_cycle() {
             Ok(result) => {
                 log_result(&log, &result);
+                ledger.pass(1, PassMode::Once, &result);
                 0
             }
             Err(err) => {
+                ledger.failed(1, PassMode::Once, &err);
                 stderr(&format!("flywheel autopilot: {err}"));
                 1
             }
@@ -1572,10 +1619,12 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
     let should_stop = || stop.is_set();
     let sleep = |seconds: f64, _should_stop: &dyn Fn() -> bool| host.sleep(&stop, seconds);
     let held = Cell::new(false);
+    let cycle_index = Cell::new(0i64);
     let before_cycle = || {
         if held.replace(false) {
             log("resumed: the pause marker is gone");
         }
+        cycle_index.set(cycle_index.get() + 1);
         recorder.before_cycle();
     };
     let paused = || is_paused(&activity_path);
@@ -1599,6 +1648,7 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
             log_result(&log, result);
         }
         recorder.on_cycle(result);
+        ledger.pass(cycle_index.get(), PassMode::Daemon, result);
         if let Some(claims) = &backoff_claims {
             match apply_no_progress_backoff(
                 result,
@@ -1627,6 +1677,7 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         }
     };
     let on_cycle_failure = |err: &CycleError, consecutive: u32| {
+        ledger.failed(cycle_index.get(), PassMode::Daemon, err);
         log(&format!(
             "cycle failed ({}: {err}) [{consecutive}/{MAX_CONSECUTIVE_CYCLE_FAILURES}]",
             error_type_name(err.as_ref())
@@ -1640,6 +1691,7 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         ));
     };
     let on_permanent_stop = |err: &CycleError| {
+        ledger.failed(cycle_index.get(), PassMode::Daemon, err);
         gave_up.set(true);
         log(&format!(
             "permanent fault ({}: {err}); cannot succeed on retry; exiting non-zero for \
@@ -2865,6 +2917,66 @@ mod tests {
         let host = host(&dir, dir_policy()).with_depth_store(Arc::new(InMemoryStore::new()));
         assert_eq!(run_main(&argv(&["--once"]), &host), 0);
         assert_eq!(*host.probed.lock().unwrap(), vec![Some(0)]);
+    }
+
+    #[test]
+    fn every_pass_records_its_decisions_in_the_store_ledger() {
+        use crate::autopilot_ledger::{KIND_CYCLE, KIND_DECISION, KIND_PREFIX};
+        use flywheel_core::store::{LedgerFilter, LedgerStore};
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(InMemoryStore::new());
+        let tier = Tier::try_from(5).unwrap();
+        let emitted = result_with(
+            vec![emitted_task("t1", tier)],
+            vec![DroppedFinding {
+                finding: Finding::new("d1", tier, "vague"),
+                reason: "ungradeable".into(),
+            }],
+            vec![tier],
+            "emitted 1",
+        );
+        let host = host(&dir, dir_policy())
+            .with_depth_store(store.clone())
+            .script(vec![Ok(emitted)]);
+        assert_eq!(run_main(&argv(&["--once"]), &host), 0);
+        let rows = store
+            .list_ledger_entries(&LedgerFilter::kind_prefix(KIND_PREFIX))
+            .unwrap();
+        let kinds: Vec<&str> = rows.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(kinds, [KIND_CYCLE, KIND_DECISION, KIND_DECISION]);
+        assert_eq!(rows[0].payload["mode"], "once");
+        assert_eq!(rows[2].payload["reason"], "ungradeable");
+
+        // A failed pass is a cycle row carrying the error.
+        let store = Arc::new(InMemoryStore::new());
+        let host = host_with(&dir, dir_policy())
+            .with_depth_store(store.clone())
+            .script(vec![Err(boom("agent unreachable"))]);
+        assert_eq!(run_main(&argv(&["--once"]), &host), 1);
+        let rows = store.list_ledger_entries(&LedgerFilter::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, KIND_CYCLE);
+        assert_eq!(rows[0].payload["outcome"], "error");
+        assert_eq!(rows[0].payload["error"], "agent unreachable");
+
+        // Daemon cycles are numbered.
+        let store = Arc::new(InMemoryStore::new());
+        let activity = dir.path().join("logs").join("ledger-act.json");
+        let host = host_with(&dir, dir_policy())
+            .with_depth_store(store.clone())
+            .stop_after(2);
+        let code = run_main(
+            &argv(&["--activity-file", activity.to_str().unwrap()]),
+            &host,
+        );
+        assert_eq!(code, 0);
+        let cycles: Vec<i64> = store
+            .list_ledger_entries(&LedgerFilter::kind_prefix(KIND_CYCLE))
+            .unwrap()
+            .iter()
+            .map(|r| r.payload["cycle"].as_i64().unwrap())
+            .collect();
+        assert_eq!(cycles, [1, 2]);
     }
 
     #[test]

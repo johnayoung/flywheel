@@ -18,7 +18,10 @@
 //! * worker: `worker [--once] [--task ID]` -> the git-worktree daemon loop
 //! * daemons: `autopilot`, `triage` (and the headless
 //!   `autopilot-supervised` run path)
-//! * audit: `audit RUN_ID` -> the core audit stream
+//! * audit: `audit RUN_ID` -> the core audit stream; `audit --project
+//!   [--json]` -> the cwd project's audit rows (transcripts + ledger)
+//! * purge: `purge [--project [--yes]]` -> delete transcript bodies (or the
+//!   whole project dir); audit rows stay
 //! * docs: `docs [TOPIC]` -> the curated operator docs
 //! * hub: `hub <serve|token>` -> the web workspace (`flywheel-hub`)
 //! * exec: `exec [PROMPT]` -> one agent call, no config/store/worktree
@@ -165,6 +168,8 @@ Verbs:
   recheck-blocked  re-evaluate blocked lifecycles' requires
   validate         statically validate active tasks' graders (lint)
   audit RUN_ID     stream the totally-ordered audit records for a run
+  audit --project  print this project's audit rows, newest last (--json: NDJSON)
+  purge            delete this project's transcript bodies (--project: the whole project dir)
   docs [TOPIC]     print a curated operator doc (bare: list the topics)
   hub serve        run the web workspace of agent terminals (hub url: login links + QR)
   hub commands S   print / copy (OSC 52) the code blocks an agent session suggested
@@ -367,7 +372,15 @@ pub fn route(
         return triage_run::main(rest);
     }
     if verb == AUDIT_VERB {
+        if rest.iter().any(|a| a == "--project") {
+            // The cwd project's audit record (any store backend).
+            return crate::ledger_verbs::run_audit_project(rest, out, err);
+        }
         return delegate_audit(rest, out, err);
+    }
+    if verb == crate::ledger_verbs::PURGE_VERB {
+        // Delete transcript bodies (or the project dir); rows stay.
+        return crate::ledger_verbs::run_purge(rest, out, err);
     }
     if verb == DOCS_VERB {
         // Curated operator docs served from the binary -- knowledge, not

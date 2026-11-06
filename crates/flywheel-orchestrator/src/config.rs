@@ -442,7 +442,8 @@ impl EffectiveConfig {
     /// AND phase-exit verify gates (one command, which is also the default
     /// grader a tracker item without graders is verified by), submit
     /// protected paths, the landing strategy (task work and autopilot
-    /// work alike), and the store backend (+ DSN).
+    /// work alike), the transcript retention window, and the store backend
+    /// (+ DSN).
     pub fn apply_to_policy(&self, policy: &mut WorkPolicy) {
         policy.model.clone_from(&self.model.value);
         policy.worker_concurrency = self.concurrency.value;
@@ -460,6 +461,8 @@ impl EffectiveConfig {
             .protected_paths
             .clone_from(&self.protected_paths.value);
         policy.submit_strategy = self.land.value.as_str().to_owned();
+        policy.transcript_retention_days =
+            u64::try_from(self.transcript_retention_days.value).unwrap_or(0);
         match &self.store.value {
             StoreSetting::Sqlite => {
                 policy.store_backend = DEFAULT_BACKEND.to_owned();
@@ -700,7 +703,8 @@ pub fn parse_layer(text: &str, path: &Path, kind: LayerKind) -> Result<ConfigLay
             "concurrency" => layer.concurrency = Some(positive_int(path, name, value)?),
             "store" => layer.store = Some(store_setting(path, value)?),
             "transcript_retention_days" => {
-                layer.transcript_retention_days = Some(positive_int(path, name, value)?);
+                // 0 keeps transcript bodies forever.
+                layer.transcript_retention_days = Some(non_negative_int(path, name, value)?);
             }
             "verify" => {
                 let Value::String(command) = value else {
@@ -754,6 +758,13 @@ fn non_empty_string(path: &Path, name: &str, value: &Value) -> Result<String, Co
             path,
             format!("`{name}` must be a non-empty string"),
         )),
+    }
+}
+
+fn non_negative_int(path: &Path, name: &str, value: &Value) -> Result<i64, ConfigError> {
+    match value.as_integer() {
+        Some(n) if n >= 0 => Ok(n),
+        _ => Err(invalid(path, format!("`{name}` must be an integer >= 0"))),
     }
 }
 
@@ -1081,6 +1092,12 @@ project_id = "6F9619FF-8B86-D011-B42D-00C04FC964FF"
     }
 
     #[test]
+    fn zero_retention_parses_as_keep_forever() {
+        let parsed = layer("transcript_retention_days = 0", LayerKind::User).unwrap();
+        assert_eq!(parsed.transcript_retention_days, Some(0));
+    }
+
+    #[test]
     fn bad_values_are_refused() {
         for text in [
             "concurrency = 0",
@@ -1252,13 +1269,17 @@ project_id = "6F9619FF-8B86-D011-B42D-00C04FC964FF"
                 protected_paths: Some(vec!["ci/**".into()]),
                 land: Some(Land::Pr),
                 store: Some(StoreSetting::Postgres(Dsn::new("postgres://h/db"))),
+                transcript_retention_days: Some(0),
                 ..ConfigLayer::default()
             }),
             local_project_id: "id".into(),
             ..ConfigInputs::default()
         });
         let mut policy = WorkPolicy::default();
+        assert_eq!(policy.transcript_retention_days, 90);
         config.apply_to_policy(&mut policy);
+        // 0 keeps transcript bodies forever.
+        assert_eq!(policy.transcript_retention_days, 0);
         assert_eq!(policy.model.as_deref(), Some("m"));
         assert_eq!(policy.worker_concurrency, 4);
         assert_eq!(policy.submit_verify.as_deref(), Some("make gate"));

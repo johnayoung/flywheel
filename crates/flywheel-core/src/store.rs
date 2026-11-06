@@ -31,8 +31,9 @@ use crate::task::{GraderType, Task};
 /// store is created at it, a store at it opens, and anything else fails with
 /// [`StoreSchemaError`] (a store behind it names the in-place upgrade, a
 /// store ahead of it names a newer flywheel). v13 partitions every table by
-/// the opaque `project_id` key ([`DEFAULT_PARTITION`]).
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+/// the opaque `project_id` key ([`DEFAULT_PARTITION`]); v14 adds the audit
+/// ledger (`transcripts`, `audit_log`; see [`LedgerStore`]).
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
 
 /// The oldest on-disk version the in-place upgrade migrates from (v11: the
 /// domain-event-only `events` table). Older stores must be re-created.
@@ -407,6 +408,102 @@ pub struct GraderResultRecord {
     pub grader_name: Option<String>,
     #[serde(default)]
     pub id: Option<i64>,
+}
+
+/// One row in the `transcripts` table: a finalized run transcript body.
+///
+/// The body itself is a file (or any other addressable object) named by
+/// `uri`; the row pins what it held when it was finalized: the SHA-256 of
+/// the body's bytes (lowercase hex) and their count. Rows are append-only
+/// and outlive their bodies: deleting a body (retention, purge) never
+/// deletes its row. A run that is resumed and finalized again records a
+/// second row describing the longer body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptRecord {
+    pub run_id: String,
+    pub uri: String,
+    pub sha256: String,
+    pub bytes: u64,
+    #[serde(with = "crate::event_serde::timestamp")]
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub id: Option<i64>,
+}
+
+/// One row in the `audit_log` table: an opaque, append-only ledger entry.
+///
+/// `kind` is a caller-chosen dotted name (`autopilot.cycle`, ...) core never
+/// interprets; `payload` is its kind-specific detail, persisted verbatim;
+/// `run_id` optionally ties the entry to a run. `id` is assigned by the
+/// store on append and orders entries recorded at the same instant.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub kind: String,
+    #[serde(with = "crate::event_serde::timestamp")]
+    pub at: DateTime<Utc>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub payload: JsonObject,
+    #[serde(default)]
+    pub id: Option<i64>,
+}
+
+impl LedgerEntry {
+    /// A store-id-less entry.
+    pub fn new(kind: impl Into<String>, at: DateTime<Utc>, payload: JsonObject) -> Self {
+        Self {
+            kind: kind.into(),
+            at,
+            run_id: None,
+            payload,
+            id: None,
+        }
+    }
+
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
+    }
+}
+
+/// Which ledger entries [`LedgerStore::list_ledger_entries`] returns.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerFilter {
+    /// Only entries whose `kind` starts with this text.
+    pub kind_prefix: Option<String>,
+    /// Only the newest `n` matching entries (still returned oldest first).
+    pub newest: Option<usize>,
+}
+
+impl LedgerFilter {
+    pub fn kind_prefix(prefix: impl Into<String>) -> Self {
+        Self {
+            kind_prefix: Some(prefix.into()),
+            newest: None,
+        }
+    }
+
+    pub fn with_newest(mut self, n: usize) -> Self {
+        self.newest = Some(n);
+        self
+    }
+
+    /// Whether `entry` passes the kind filter (the limit is the caller's).
+    pub fn matches(&self, entry: &LedgerEntry) -> bool {
+        self.kind_prefix
+            .as_deref()
+            .is_none_or(|prefix| entry.kind.starts_with(prefix))
+    }
+}
+
+/// Keep the newest `filter.newest` of `rows` (already oldest first).
+pub fn keep_newest<T>(mut rows: Vec<T>, filter: &LedgerFilter) -> Vec<T> {
+    if let Some(n) = filter.newest
+        && rows.len() > n
+    {
+        rows.drain(..rows.len() - n);
+    }
+    rows
 }
 
 /// One row in the `control_commands` table.
@@ -923,6 +1020,20 @@ pub trait ControlCommandStore {
     fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError>;
 }
 
+/// Persistence contract for the audit ledger: `transcripts` and
+/// `audit_log`. Append-only: there is no update or delete entry point, and
+/// the stores reject both at the database layer. Lists return rows oldest
+/// first, ordered by their timestamp then store id.
+pub trait LedgerStore {
+    fn append_transcript(&self, record: &TranscriptRecord) -> Result<TranscriptRecord, StoreError>;
+
+    fn list_transcripts(&self) -> Result<Vec<TranscriptRecord>, StoreError>;
+
+    fn append_ledger_entry(&self, entry: &LedgerEntry) -> Result<LedgerEntry, StoreError>;
+
+    fn list_ledger_entries(&self, filter: &LedgerFilter) -> Result<Vec<LedgerEntry>, StoreError>;
+}
+
 /// Composite store contract the harness requires.
 ///
 /// Satisfied automatically by any `Send + Sync` type implementing every
@@ -938,6 +1049,7 @@ pub trait HarnessStore:
     + AttemptStore
     + GraderResultStore
     + ControlCommandStore
+    + LedgerStore
     + Send
     + Sync
 {
@@ -950,6 +1062,7 @@ impl<T> HarnessStore for T where
         + AttemptStore
         + GraderResultStore
         + ControlCommandStore
+        + LedgerStore
         + Send
         + Sync
         + ?Sized
@@ -1052,6 +1165,20 @@ macro_rules! forward_store_traits {
                 (**self).pending_commands(run_id)
             }
         }
+        impl<S: LedgerStore + ?Sized> LedgerStore for $ptr<S> {
+            fn append_transcript(&self, record: &TranscriptRecord) -> Result<TranscriptRecord, StoreError> {
+                (**self).append_transcript(record)
+            }
+            fn list_transcripts(&self) -> Result<Vec<TranscriptRecord>, StoreError> {
+                (**self).list_transcripts()
+            }
+            fn append_ledger_entry(&self, entry: &LedgerEntry) -> Result<LedgerEntry, StoreError> {
+                (**self).append_ledger_entry(entry)
+            }
+            fn list_ledger_entries(&self, filter: &LedgerFilter) -> Result<Vec<LedgerEntry>, StoreError> {
+                (**self).list_ledger_entries(filter)
+            }
+        }
     )*};
 }
 
@@ -1094,6 +1221,45 @@ mod tests {
         graders: Mutex<Vec<GraderResultRecord>>,
         commands: Mutex<Vec<ControlCommandRecord>>,
         telemetry: Mutex<Vec<TelemetryRecord>>,
+        transcripts: Mutex<Vec<TranscriptRecord>>,
+        ledger: Mutex<Vec<LedgerEntry>>,
+    }
+
+    impl LedgerStore for MemoryStore {
+        fn append_transcript(
+            &self,
+            record: &TranscriptRecord,
+        ) -> Result<TranscriptRecord, StoreError> {
+            let mut rows = self.transcripts.lock().unwrap();
+            let mut stored = record.clone();
+            stored.id = Some(i64::try_from(rows.len()).unwrap() + 1);
+            rows.push(stored.clone());
+            Ok(stored)
+        }
+        fn list_transcripts(&self) -> Result<Vec<TranscriptRecord>, StoreError> {
+            Ok(self.transcripts.lock().unwrap().clone())
+        }
+        fn append_ledger_entry(&self, entry: &LedgerEntry) -> Result<LedgerEntry, StoreError> {
+            let mut rows = self.ledger.lock().unwrap();
+            let mut stored = entry.clone();
+            stored.id = Some(i64::try_from(rows.len()).unwrap() + 1);
+            rows.push(stored.clone());
+            Ok(stored)
+        }
+        fn list_ledger_entries(
+            &self,
+            filter: &LedgerFilter,
+        ) -> Result<Vec<LedgerEntry>, StoreError> {
+            let rows: Vec<LedgerEntry> = self
+                .ledger
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| filter.matches(e))
+                .cloned()
+                .collect();
+            Ok(keep_newest(rows, filter))
+        }
     }
 
     impl LifecycleStore for MemoryStore {
@@ -1483,7 +1649,7 @@ mod tests {
         assert!(behind.is_behind());
         assert_eq!(
             behind.to_string(),
-            "store schema is behind: schema_version=12, this flywheel expects 13; \
+            "store schema is behind: schema_version=12, this flywheel expects 14; \
              run `fw db upgrade` to migrate it in place"
         );
         let ahead = StoreSchemaError::new(Some(99));
@@ -1494,12 +1660,12 @@ mod tests {
         assert!(!unknown.is_behind());
         assert_eq!(
             unknown.to_string(),
-            "store has no readable schema_version row (expected 13); it is not a flywheel \
+            "store has no readable schema_version row (expected 14); it is not a flywheel \
              store or it is damaged"
         );
         let wrapped: StoreError = unknown.into();
         assert!(wrapped.is_schema_mismatch());
-        assert_eq!(CURRENT_SCHEMA_VERSION, 13);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 14);
     }
 
     #[test]

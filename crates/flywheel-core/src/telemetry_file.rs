@@ -1,7 +1,9 @@
 //! File implementation of the [`TelemetrySink`] contract from `crate::store`.
 //!
-//! Writes one append-only JSONL file per run at
-//! `<logs_root>/runs/<run_id>.jsonl` (default logs root
+//! Writes one append-only JSONL file per run -- the run's transcript -- at
+//! `<runs dir>/<run_id>.jsonl` (see [`runs_dir_for_logs_root`]: the
+//! project's `transcripts/` dir for a logs root inside a flywheel-home
+//! project dir, else `<logs_root>/runs`; default logs root
 //! [`DEFAULT_LOGS_ROOT`]): one JSON object per line, in emission order.
 //! File write order is the canonical observability ordering for the run;
 //! the sink never rewrites, reorders, or truncates a file it has appended
@@ -47,6 +49,30 @@ pub const DEFAULT_LOGS_ROOT: &str = ".flywheel/logs";
 /// Subdirectory of the logs root holding the per-run JSONL files.
 pub const RUNS_DIRNAME: &str = "runs";
 
+/// A flywheel-home project dir's transcript dir (sibling of its `logs/`).
+pub const TRANSCRIPTS_DIRNAME: &str = "transcripts";
+
+/// The file marking a flywheel-home project dir (`projects/<id>/meta.json`).
+pub const PROJECT_MARKER_FILENAME: &str = "meta.json";
+
+/// The directory holding the per-run JSONL files for `logs_root`.
+///
+/// A logs root inside a flywheel-home project dir (its parent holds
+/// [`PROJECT_MARKER_FILENAME`]) keeps run transcripts in the sibling
+/// [`TRANSCRIPTS_DIRNAME`] dir (`projects/<id>/transcripts/`); any other
+/// logs root (an explicit `--db` outside a project dir, an explicit `--logs-root`) keeps
+/// them in `<logs_root>/runs`. Writer and readers both resolve through
+/// here, so they always agree.
+pub fn runs_dir_for_logs_root(logs_root: &Path) -> PathBuf {
+    if let Some(project_dir) = logs_root.parent()
+        && logs_root.file_name().is_some_and(|name| name == "logs")
+        && project_dir.join(PROJECT_MARKER_FILENAME).is_file()
+    {
+        return project_dir.join(TRANSCRIPTS_DIRNAME);
+    }
+    logs_root.join(RUNS_DIRNAME)
+}
+
 /// A `run_id` that cannot form a safe single-segment filename.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("run_id {0:?} is not a valid file key")]
@@ -69,7 +95,7 @@ pub fn validate_run_id(run_id: &str) -> Result<(), InvalidRunId> {
 /// JSONL-file [`TelemetrySink`].
 ///
 /// One instance serves any number of runs: appends are routed to
-/// `<logs_root>/runs/<record.run_id>.jsonl` and the file handle is cached
+/// `<runs dir>/<record.run_id>.jsonl` ([`runs_dir_for_logs_root`]) and the file handle is cached
 /// per run for the lifetime of the sink (or until [`close`](Self::close)).
 /// Files are opened in append mode, so a second sink, or a sink re-created
 /// after `close`, continues the same file without rewriting prior lines.
@@ -91,7 +117,7 @@ impl Default for FileTelemetrySink {
 impl FileTelemetrySink {
     pub fn new(logs_root: impl AsRef<Path>) -> Self {
         Self {
-            runs_dir: logs_root.as_ref().join(RUNS_DIRNAME),
+            runs_dir: runs_dir_for_logs_root(logs_root.as_ref()),
             handles: Mutex::new(HashMap::new()),
         }
     }

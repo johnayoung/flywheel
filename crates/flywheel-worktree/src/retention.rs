@@ -39,6 +39,30 @@ const _: () = assert!(DEFAULT_RUN_LOG_RETENTION > 0);
 
 const SECONDS_PER_DAY: f64 = 86_400.0;
 
+/// Delete the transcript bodies in `transcripts_dir` older than
+/// `retention_days` days (0: keep forever) and log what was deleted. Their
+/// ledger rows stay. A failure is logged, never raised: retention must not
+/// keep a worker from starting.
+pub fn sweep_transcript_retention(transcripts_dir: &Path, retention_days: u64, log: &dyn Fn(&str)) {
+    match flywheel_core::transcripts::sweep_expired(
+        transcripts_dir,
+        retention_days,
+        SystemTime::now(),
+    ) {
+        Ok(deleted) if deleted.is_empty() => {}
+        Ok(deleted) => log(&format!(
+            "transcript retention: deleted {} body(ies) older than {retention_days} day(s) \
+             from {} (ledger rows kept)",
+            deleted.len(),
+            transcripts_dir.display()
+        )),
+        Err(err) => log(&format!(
+            "transcript retention: sweep of {} failed ({err}); continuing",
+            transcripts_dir.display()
+        )),
+    }
+}
+
 /// Hold `runs_dir` at or under `max_run_files` per-run JSONL files by
 /// deleting the oldest (by mtime) and preserving the most-recent
 /// `max_run_files`.

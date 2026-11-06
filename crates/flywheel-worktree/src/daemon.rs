@@ -28,7 +28,7 @@ use crate::phase::{ArchiveError, ArchiveSweep, archive_phases, record_phase_base
 use crate::pr::register_pr_strategy;
 use crate::retention::{
     DEFAULT_RETENTION_DAYS, DEFAULT_RUN_LOG_RETENTION, retention_cadence_tick, sweep_run_logs,
-    wall_clock_seconds,
+    sweep_transcript_retention, wall_clock_seconds,
 };
 use crate::scoped::WorkerScope;
 use crate::submit_registry::{
@@ -54,6 +54,7 @@ use flywheel_core::faults::{FaultClass, classify_error};
 use flywheel_core::harness::{DEFAULT_AGENT_ID, HarnessError, ShutdownSignal};
 use flywheel_core::invoker_client::ProgressProbe as CoreProgressProbe;
 use flywheel_core::loaders::py_str_repr;
+use flywheel_core::telemetry_file::runs_dir_for_logs_root;
 use flywheel_core::workflow::{
     AgentOptions, EventsMode, LineSink, RunStore, RunTaskOptions, Skills as CoreSkills,
     WorkflowError, run_task_object,
@@ -2172,7 +2173,9 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         log: Arc::clone(&log),
     };
 
-    let run_logs_dir = db_parent.join("logs").join("runs");
+    // The run transcripts' dir: a home project's transcripts/, else the
+    // explicit `--db` dir's logs/runs (the same resolution the sink writes by).
+    let run_logs_dir = runs_dir_for_logs_root(&db_parent.join("logs"));
     log(&format!(
         "started pid={} base={phase_base} db={} concurrency={concurrency}",
         std::process::id(),
@@ -2184,6 +2187,14 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         worktrees_dir.display(),
         run_logs_dir.display()
     ));
+    // Transcript retention: a home project's bodies older than the
+    // effective `transcript_retention_days` are deleted at worker start
+    // (their ledger rows stay).
+    if let Some(policy) = policy.as_deref()
+        && policy.project.is_some()
+    {
+        sweep_transcript_retention(&run_logs_dir, policy.transcript_retention_days, &*log);
+    }
 
     // Reap any flywheel-owned container a prior killed worker left
     // orphaned (the SIGKILL/OOM case the exit-time registry cannot cover).

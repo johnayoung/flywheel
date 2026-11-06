@@ -125,7 +125,7 @@ Folders whose git repo has a project id flywheel knows get the verified loop, re
 - Phases, tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
 - **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks to add unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`.
-- Shown: tier verdicts, the newest deciding cycle (emitted, dropped with reasons), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate shown (one per gate, then `decision pending`; deny retries with feedback). Peers: read-only.
+- Shown (decisions from the ledger): tier verdicts, the newest deciding cycle (emitted, dropped with reasons), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each logged. Peers: read-only.
 - A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is not made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
 
 ## Prompt queue

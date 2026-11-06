@@ -69,8 +69,9 @@ use crate::schema_ddl::{create_table_as, without_pragmas};
 use crate::store::{
     AttemptStore, CURRENT_SCHEMA_VERSION, ControlCommandRecord, ControlCommandStore,
     DEFAULT_PARTITION, DomainEventStore, GraderResultRecord, GraderResultStore, JsonObject,
-    LifecycleFilter, LifecycleStore, OLDEST_UPGRADABLE_SCHEMA_VERSION, SchemaUpgrade, SpendSummary,
-    SpendWindow, StoreError, StoreSchemaError, TaskStore,
+    LedgerEntry, LedgerFilter, LedgerStore, LifecycleFilter, LifecycleStore,
+    OLDEST_UPGRADABLE_SCHEMA_VERSION, SchemaUpgrade, SpendSummary, SpendWindow, StoreError,
+    StoreSchemaError, TaskStore, TranscriptRecord,
 };
 use crate::store_memory::{
     assemble_task, grader_result_from_event, parse_wire_enum, projected_attempt, task_definition,
@@ -97,7 +98,7 @@ CREATE INDEX IF NOT EXISTS idx_lifecycles_status ON lifecycles(project_id, statu
 /// The partitioned core tables, parents before children (the order an
 /// in-place upgrade re-keys them in). `schema_version` is the one table
 /// without a partition column.
-pub const PARTITIONED_TABLES: [&str; 7] = [
+pub const PARTITIONED_TABLES: [&str; 9] = [
     "tasks",
     "task_versions",
     "lifecycles",
@@ -105,12 +106,19 @@ pub const PARTITIONED_TABLES: [&str; 7] = [
     "events",
     "grader_results",
     "control_commands",
+    "transcripts",
+    "audit_log",
 ];
+
+/// The audit-ledger tables (schema_version 14), a subset of
+/// [`PARTITIONED_TABLES`].
+pub const LEDGER_TABLES: [&str; 2] = ["transcripts", "audit_log"];
 
 /// The core schema-version sentinel table.
 pub const VERSION_TABLE: &str = "schema_version";
 
-/// Append-only enforcement on `grader_results`. Applied post-bootstrap so
+/// Append-only enforcement on `grader_results` and the audit ledger
+/// (`transcripts`, `audit_log`). Applied post-bootstrap so
 /// the canonical schema file is unchanged; `IF NOT EXISTS` makes the
 /// triggers idempotent across reopens of the same file.
 const APPEND_ONLY_TRIGGERS: &str = "
@@ -124,6 +132,30 @@ CREATE TRIGGER IF NOT EXISTS grader_results_no_delete
 BEFORE DELETE ON grader_results
 BEGIN
     SELECT RAISE(ABORT, 'grader_results is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS transcripts_no_update
+BEFORE UPDATE ON transcripts
+BEGIN
+    SELECT RAISE(ABORT, 'transcripts is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS transcripts_no_delete
+BEFORE DELETE ON transcripts
+BEGIN
+    SELECT RAISE(ABORT, 'transcripts is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_log_no_update
+BEFORE UPDATE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log is append-only');
+END;
+
+CREATE TRIGGER IF NOT EXISTS audit_log_no_delete
+BEFORE DELETE ON audit_log
+BEGIN
+    SELECT RAISE(ABORT, 'audit_log is append-only');
 END;
 ";
 
@@ -1931,6 +1963,135 @@ impl ControlCommandStore for SqliteStore {
     }
 }
 
+impl LedgerStore for SqliteStore {
+    fn append_transcript(&self, record: &TranscriptRecord) -> Result<TranscriptRecord, StoreError> {
+        let bytes = i64::try_from(record.bytes).map_err(|_| {
+            StoreError::backend(std::io::Error::other("transcripts.bytes exceeds i64"))
+        })?;
+        let created_at = format_timestamp(&record.created_at);
+        let p = self.partition();
+        let id = self.with_retry(|conn| {
+            conn.execute(
+                "INSERT INTO transcripts (project_id, run_id, uri, sha256, bytes, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    p,
+                    record.run_id,
+                    record.uri,
+                    record.sha256,
+                    bytes,
+                    created_at
+                ],
+            )
+            .map_err(db)?;
+            Ok(conn.last_insert_rowid())
+        })?;
+        let mut stored = record.clone();
+        stored.id = Some(id);
+        Ok(stored)
+    }
+
+    fn list_transcripts(&self) -> Result<Vec<TranscriptRecord>, StoreError> {
+        let p = self.partition();
+        self.with_retry(|conn| {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, run_id, uri, sha256, bytes, created_at FROM transcripts
+                     WHERE project_id = ?1 ORDER BY created_at, id",
+                )
+                .map_err(db)?;
+            let raws = stmt
+                .query_map(params![p], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .map_err(db)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db)?;
+            raws.into_iter()
+                .map(|(id, run_id, uri, sha256, bytes, created_at)| {
+                    Ok(TranscriptRecord {
+                        run_id,
+                        uri,
+                        sha256,
+                        bytes: u64::try_from(bytes).unwrap_or_default(),
+                        created_at: ts(&created_at)?,
+                        id: Some(id),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    fn append_ledger_entry(&self, entry: &LedgerEntry) -> Result<LedgerEntry, StoreError> {
+        let payload_json = Value::Object(entry.payload.clone()).to_string();
+        let at = format_timestamp(&entry.at);
+        let p = self.partition();
+        let id = self.with_retry(|conn| {
+            conn.execute(
+                "INSERT INTO audit_log (project_id, kind, at, run_id, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![p, entry.kind, at, entry.run_id, payload_json],
+            )
+            .map_err(db)?;
+            Ok(conn.last_insert_rowid())
+        })?;
+        let mut stored = entry.clone();
+        stored.id = Some(id);
+        Ok(stored)
+    }
+
+    fn list_ledger_entries(&self, filter: &LedgerFilter) -> Result<Vec<LedgerEntry>, StoreError> {
+        let p = self.partition();
+        let prefix = filter.kind_prefix.clone().unwrap_or_default();
+        let limit = filter
+            .newest
+            .map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
+        self.with_retry(|conn| {
+            // The newest `limit` matches (-1: all), re-read oldest first.
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT id, kind, at, run_id, payload_json FROM (
+                         SELECT id, kind, at, run_id, payload_json FROM audit_log
+                         WHERE project_id = ?1 AND substr(kind, 1, length(?2)) = ?2
+                         ORDER BY at DESC, id DESC LIMIT ?3
+                     ) ORDER BY at, id",
+                )
+                .map_err(db)?;
+            let raws = stmt
+                .query_map(params![p, prefix, limit], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(db)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(db)?;
+            raws.into_iter()
+                .map(|(id, kind, at, run_id, payload_json)| {
+                    Ok(LedgerEntry {
+                        kind,
+                        at: ts(&at)?,
+                        run_id,
+                        payload: json_object(&payload_json)?,
+                        id: Some(id),
+                    })
+                })
+                .collect()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1965,7 +2126,7 @@ mod tests {
         assert!(SCHEMA_SQL.contains("PRAGMA foreign_keys = ON"));
         assert!(
             SCHEMA_SQL
-                .contains("INSERT OR IGNORE INTO schema_version (version, id) VALUES (13, 1)")
+                .contains("INSERT OR IGNORE INTO schema_version (version, id) VALUES (14, 1)")
         );
     }
 
@@ -2007,6 +2168,8 @@ mod tests {
             "grader_results",
             "schema_version",
             "control_commands",
+            "transcripts",
+            "audit_log",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -2338,9 +2501,14 @@ mod tests {
         let upgrade = SqliteStore::upgrade(&path, "proj-x").unwrap();
         assert_eq!(upgrade.from, Some(12));
         assert_eq!(upgrade.to, CURRENT_SCHEMA_VERSION);
+        // Every v12 table is re-keyed; the v14 ledger tables are created.
         assert_eq!(
             upgrade.partitioned,
-            PARTITIONED_TABLES.map(str::to_owned).to_vec()
+            PARTITIONED_TABLES
+                .iter()
+                .filter(|t| !LEDGER_TABLES.contains(t))
+                .map(|t| (*t).to_owned())
+                .collect::<Vec<_>>()
         );
 
         let store = SqliteStore::open_partition(&path, "proj-x").unwrap();
@@ -2382,6 +2550,132 @@ mod tests {
         other.close().unwrap();
         // Idempotent: a second upgrade re-keys nothing.
         assert!(SqliteStore::upgrade(&path, "proj-x").unwrap().is_noop());
+    }
+
+    /// A real v13 database (the frozen pre-ledger DDL) holding one run.
+    fn seed_v13(path: &Path) {
+        let raw = Connection::open(path).unwrap();
+        raw.execute_batch(include_str!("../tests/fixtures/persistence-schema-v13.sql"))
+            .unwrap();
+        raw.execute_batch(
+            "INSERT INTO tasks (project_id, id, first_seen_at, updated_at)
+               VALUES ('proj-x', 't1', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+             INSERT INTO task_versions
+               (project_id, task_id, content_hash, goal, graders_json, tags_json, context_json,
+                created_at)
+               VALUES ('proj-x', 't1', 'h1', 'Goal.', '[{\"type\": \"command\", \"run\": \"true\"}]',
+                       '[]', 'null', '2026-01-01T00:00:00+00:00');
+             INSERT INTO lifecycles
+               (project_id, run_id, task_id, status, version, retries, timestamps_json,
+                updated_at, task_content_hash)
+               VALUES ('proj-x', 'run-13', 't1', 'done', 5, 0, '{}',
+                       '2026-01-01T00:00:00+00:00', 'h1');",
+        )
+        .unwrap();
+        raw.close().unwrap();
+    }
+
+    #[test]
+    fn a_v13_store_is_refused_then_upgraded_with_the_ledger_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v13.db");
+        seed_v13(&path);
+        let err = SqliteStore::open_partition(&path, "proj-x").unwrap_err();
+        assert!(err.to_string().contains("fw db upgrade"), "{err}");
+        assert_eq!(recorded(&path), Recorded::Version(Some(13)));
+        {
+            let raw = Connection::open(&path).unwrap();
+            assert!(!table_exists(&raw, "transcripts").unwrap());
+            assert!(!table_exists(&raw, "audit_log").unwrap());
+        }
+
+        let upgrade = SqliteStore::upgrade(&path, "proj-x").unwrap();
+        assert_eq!(upgrade.from, Some(13));
+        assert_eq!(upgrade.to, CURRENT_SCHEMA_VERSION);
+        // Nothing to re-key: v13 tables are already partitioned.
+        assert!(upgrade.partitioned.is_empty());
+        assert_eq!(
+            recorded(&path),
+            Recorded::Version(Some(CURRENT_SCHEMA_VERSION))
+        );
+
+        let store = SqliteStore::open_partition(&path, "proj-x").unwrap();
+        assert_eq!(store.load_lifecycle("run-13").unwrap().unwrap().version, 5);
+        let row = store
+            .append_transcript(&TranscriptRecord {
+                run_id: "run-13".into(),
+                uri: "file:///tmp/run-13.jsonl".into(),
+                sha256: "0".repeat(64),
+                bytes: 9,
+                created_at: at(1),
+                id: None,
+            })
+            .unwrap();
+        assert_eq!(store.list_transcripts().unwrap(), vec![row]);
+        let entry = store
+            .append_ledger_entry(&LedgerEntry::new(
+                "autopilot.cycle",
+                at(2),
+                JsonObject::new(),
+            ))
+            .unwrap();
+        assert_eq!(
+            store.list_ledger_entries(&LedgerFilter::default()).unwrap(),
+            vec![entry]
+        );
+        // The ledger is append-only at the database layer too.
+        for statement in [
+            "DELETE FROM transcripts",
+            "UPDATE transcripts SET bytes = 0",
+            "DELETE FROM audit_log",
+            "UPDATE audit_log SET kind = 'x'",
+        ] {
+            let err = store.with_connection(|conn| conn.execute(statement, []).unwrap_err());
+            assert!(
+                err.to_string().contains("append-only"),
+                "{statement}: {err}"
+            );
+        }
+        store.close().unwrap();
+        // Idempotent.
+        assert!(SqliteStore::upgrade(&path, "proj-x").unwrap().is_noop());
+    }
+
+    #[test]
+    fn ledger_rows_are_partitioned_ordered_and_filtered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.db");
+        let a = SqliteStore::open_partition(&path, "a").unwrap();
+        let b = SqliteStore::open_partition(&path, "b").unwrap();
+        for (kind, secs) in [
+            ("autopilot.decision", 3),
+            ("autopilot.cycle", 1),
+            ("hub.merge", 2),
+            ("autopilot.cycle", 4),
+        ] {
+            a.append_ledger_entry(
+                &LedgerEntry::new(kind, at(secs), JsonObject::new()).with_run_id("r"),
+            )
+            .unwrap();
+        }
+        let all = a.list_ledger_entries(&LedgerFilter::default()).unwrap();
+        let times: Vec<i64> = all
+            .iter()
+            .map(|e| e.at.timestamp() - at(0).timestamp())
+            .collect();
+        assert_eq!(times, [1, 2, 3, 4]);
+        assert_eq!(all[0].run_id.as_deref(), Some("r"));
+        let autopilot = a
+            .list_ledger_entries(&LedgerFilter::kind_prefix("autopilot.").with_newest(2))
+            .unwrap();
+        let kinds: Vec<&str> = autopilot.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, ["autopilot.decision", "autopilot.cycle"]);
+        assert!(
+            b.list_ledger_entries(&LedgerFilter::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(b.list_transcripts().unwrap().is_empty());
     }
 
     #[test]

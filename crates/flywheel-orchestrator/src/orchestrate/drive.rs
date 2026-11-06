@@ -19,6 +19,8 @@ use super::redrive::probe_landability;
 use super::run_task::{AgentPrimitives, RunMode, RunTask, RunTaskError, RunTaskRequest};
 use super::sweep::emit;
 use super::{OrchestrateError, RunRecord};
+use flywheel_core::audit::run_file_path;
+use flywheel_core::transcripts::finalize_transcript;
 
 /// The consumer's git-free progress-probe factory: given a run's sandbox it
 /// returns the opaque closure the harness's checkpoint nudge consults.
@@ -300,7 +302,10 @@ pub(super) async fn drive_under_lease(
         shutdown: ctx.shutdown.clone(),
         log: ctx.log.clone(),
     };
-    let outcome = match ctx.run_task.run(request).await {
+    let transcript_run_id = request.run_id().to_owned();
+    let ran = ctx.run_task.run(request).await;
+    record_transcript(ctx, &transcript_run_id);
+    let outcome = match ran {
         Ok(outcome) => outcome,
         Err(err) => {
             guard.finish();
@@ -494,5 +499,22 @@ pub(super) async fn drive_or_relinquish(
         }
         Err(DriveError::RunTask(err)) => Err(OrchestrateError::RunTask(err)),
         Err(DriveError::Orchestrate(err)) => Err(err),
+    }
+}
+
+/// Record the run's transcript body (its run file under the telemetry
+/// root) in the ledger once the runner returned: the body is final. Best
+/// effort: a failure is logged, never fatal to the run. No telemetry root,
+/// no file this loop can name.
+fn record_transcript(ctx: &DriveContext, run_id: &str) {
+    let Some(root) = &ctx.telemetry_root else {
+        return;
+    };
+    let path = run_file_path(root, run_id);
+    if let Err(err) = finalize_transcript(ctx.control.as_ref(), &path, run_id, (ctx.now)()) {
+        emit(
+            ctx.log.as_ref(),
+            format!("[orchestrate] {run_id}: transcript not recorded ({err}); continuing"),
+        );
     }
 }

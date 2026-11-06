@@ -38,8 +38,9 @@ use crate::loaders::{deserialize_task, serialize_task, task_digest};
 use crate::notifier::RunNotifier;
 use crate::store::{
     AttemptStore, ControlCommandRecord, ControlCommandStore, DomainEventStore, GraderResultRecord,
-    GraderResultStore, JsonObject, LifecycleFilter, LifecycleStore, SpendSummary, SpendWindow,
-    StoreError, TaskStore,
+    GraderResultStore, JsonObject, LedgerEntry, LedgerFilter, LedgerStore, LifecycleFilter,
+    LifecycleStore, SpendSummary, SpendWindow, StoreError, TaskStore, TranscriptRecord,
+    keep_newest,
 };
 use crate::task::{GraderType, Task};
 
@@ -85,6 +86,10 @@ struct Inner {
     /// in ascending id order without a separate index.
     control_commands: Vec<ControlCommandRecord>,
     control_command_seq: i64,
+    /// The append-only audit ledger, in append order.
+    transcripts: Vec<TranscriptRecord>,
+    ledger: Vec<LedgerEntry>,
+    ledger_seq: i64,
 }
 
 /// In-memory implementation of every store trait.
@@ -617,6 +622,51 @@ impl GraderResultStore for InMemoryStore {
             .collect();
         rows.sort_by_key(|r| r.ordinal);
         Ok(rows)
+    }
+}
+
+// --- LedgerStore ----------------------------------------------------------------------
+
+/// Oldest first by timestamp, then store id (the durable stores' order).
+fn sort_ledger<T>(rows: &mut [T], key: impl Fn(&T) -> (DateTime<Utc>, Option<i64>)) {
+    rows.sort_by_key(|row| key(row));
+}
+
+impl LedgerStore for InMemoryStore {
+    fn append_transcript(&self, record: &TranscriptRecord) -> Result<TranscriptRecord, StoreError> {
+        let mut inner = self.lock();
+        inner.ledger_seq += 1;
+        let mut stored = record.clone();
+        stored.id = Some(inner.ledger_seq);
+        inner.transcripts.push(stored.clone());
+        Ok(stored)
+    }
+
+    fn list_transcripts(&self) -> Result<Vec<TranscriptRecord>, StoreError> {
+        let mut rows = self.lock().transcripts.clone();
+        sort_ledger(&mut rows, |r| (r.created_at, r.id));
+        Ok(rows)
+    }
+
+    fn append_ledger_entry(&self, entry: &LedgerEntry) -> Result<LedgerEntry, StoreError> {
+        let mut inner = self.lock();
+        inner.ledger_seq += 1;
+        let mut stored = entry.clone();
+        stored.id = Some(inner.ledger_seq);
+        inner.ledger.push(stored.clone());
+        Ok(stored)
+    }
+
+    fn list_ledger_entries(&self, filter: &LedgerFilter) -> Result<Vec<LedgerEntry>, StoreError> {
+        let mut rows: Vec<LedgerEntry> = self
+            .lock()
+            .ledger
+            .iter()
+            .filter(|e| filter.matches(e))
+            .cloned()
+            .collect();
+        sort_ledger(&mut rows, |e| (e.at, e.id));
+        Ok(keep_newest(rows, filter))
     }
 }
 

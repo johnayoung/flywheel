@@ -1129,7 +1129,35 @@ pub async fn run_task_object(
         }
     };
 
-    let result = drive_run(task, sandbox, &options, lifecycle, backend, sink, out).await;
+    let run_id = lifecycle.run_id.clone();
+    let result = drive_run(
+        task,
+        sandbox,
+        &options,
+        lifecycle,
+        backend.clone(),
+        sink,
+        out.clone(),
+    )
+    .await;
+
+    // The run's transcript is final once the run returns: record its body
+    // in the ledger (only a sink built here is a file this call can name;
+    // an injected sink's owner records its own).
+    if let Some(file_sink) = &owned_sink {
+        file_sink.close();
+        if let Ok(path) = file_sink.path_for(&run_id)
+            && let Err(failure) = crate::transcripts::finalize_transcript(
+                backend.as_ref(),
+                &path,
+                &run_id,
+                Utc::now(),
+            )
+        {
+            out(&format!("[workflow] transcript not recorded: {failure}"));
+        }
+    }
+    drop(backend);
 
     if let Some(store) = owned_backend
         && let Ok(store) = Arc::try_unwrap(store)

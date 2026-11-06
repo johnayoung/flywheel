@@ -12,7 +12,7 @@
 --
 -- events holds domain rows only (since schema_version 11). Telemetry —
 -- harness telemetry events and the verbatim SDK message stream — is not
--- stored here: it flows to a per-run JSONL file under .flywheel/logs via
+-- stored here: it flows to a per-run JSONL file (the run transcript) via
 -- the TelemetrySink seam. The former category column, the SDK-message
 -- table, and the shared per-run counter table that interleaved telemetry
 -- with domain rows into one merged audit stream were all removed; the
@@ -30,8 +30,9 @@
 --
 -- Store contents are sensitive-by-default; payloads are persisted verbatim
 -- and unredacted. The same contract extends to the per-run telemetry files
--- under .flywheel/logs. Operators must treat the database and the logs
--- directory as confidential.
+-- (under the project's transcripts/ dir in a flywheel home, else
+-- .flywheel/logs/runs). Operators must treat the database and those files
+-- as confidential.
 --
 -- project_id partitions every table (schema_version 13): one database (one
 -- user-level DSN) can hold many projects. It is an opaque key supplied by
@@ -290,6 +291,44 @@ CREATE TABLE IF NOT EXISTS control_commands (
 CREATE INDEX IF NOT EXISTS idx_control_commands_pending
   ON control_commands(project_id, run_id, id) WHERE claimed_at IS NULL;
 
+-- The audit ledger (schema_version 14): rows kept forever. Both tables are
+-- append-only by contract (enforced by the BEFORE UPDATE / BEFORE DELETE
+-- triggers below) and carry no foreign key: a ledger row must outlive
+-- anything it describes.
+--
+-- transcripts: one row per finalized run transcript body. The body is a
+-- file named by uri (file:// + absolute path); sha256 (lowercase hex) and
+-- bytes describe the body's bytes when the run finalized it. Deleting a
+-- body (retention sweep, fw purge) never deletes its row.
+CREATE TABLE IF NOT EXISTS transcripts (
+  id          BIGSERIAL   PRIMARY KEY,
+  project_id  TEXT        NOT NULL,
+  run_id      TEXT        NOT NULL,
+  uri         TEXT        NOT NULL,
+  sha256      TEXT        NOT NULL,
+  bytes       BIGINT      NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_transcripts_created
+  ON transcripts(project_id, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_transcripts_run
+  ON transcripts(project_id, run_id);
+
+-- audit_log: opaque ledger entries. kind is a caller-chosen dotted name
+-- (autopilot.cycle, autopilot.decision, autopilot.approve, ...) the store
+-- never interprets; payload_json is its kind-specific detail; run_id ties
+-- an entry to a run when it has one.
+CREATE TABLE IF NOT EXISTS audit_log (
+  id            BIGSERIAL   PRIMARY KEY,
+  project_id    TEXT        NOT NULL,
+  kind          TEXT        NOT NULL,
+  at            TIMESTAMPTZ NOT NULL,
+  run_id        TEXT,
+  payload_json  JSONB       NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_log_at
+  ON audit_log(project_id, at, id);
+
 -- schema_version pins the on-disk schema; it is the one table without a
 -- project_id (it versions the whole schema). version is the first column.
 -- The CHECK clause forces a single sentinel row at id = 1 so
@@ -298,12 +337,13 @@ CREATE INDEX IF NOT EXISTS idx_control_commands_pending
 -- StoreSchemaError. `fw db upgrade` migrates a behind schema in place
 -- (v11 -> v12 added the nullable lifecycles.source column; v12 -> v13
 -- re-keys every table by project_id, filling existing rows with the store's
--- bound project id).
+-- bound project id; v13 -> v14 adds the transcripts and audit_log ledger
+-- tables).
 CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER NOT NULL,
   id      INTEGER PRIMARY KEY CHECK (id = 1)
 );
-INSERT INTO schema_version (version, id) VALUES (13, 1)
+INSERT INTO schema_version (version, id) VALUES (14, 1)
   ON CONFLICT (id) DO NOTHING;
 
 -- Append-only enforcement for grader_results. The trigger function raises a
@@ -340,6 +380,40 @@ BEGIN
     CREATE TRIGGER grader_results_no_delete
       BEFORE DELETE ON grader_results
       FOR EACH ROW EXECUTE FUNCTION grader_results_reject_mutation();
+  END IF;
+END
+$$;
+
+-- Append-only enforcement for the audit ledger (transcripts, audit_log),
+-- guarded the same way.
+CREATE OR REPLACE FUNCTION ledger_reject_mutation()
+RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION '% is append-only; % is not permitted', TG_TABLE_NAME, TG_OP
+    USING ERRCODE = 'check_violation';
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'transcripts_no_mutation'
+      AND tgrelid = 'transcripts'::regclass
+  ) THEN
+    CREATE TRIGGER transcripts_no_mutation
+      BEFORE UPDATE OR DELETE ON transcripts
+      FOR EACH ROW EXECUTE FUNCTION ledger_reject_mutation();
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger
+    WHERE tgname = 'audit_log_no_mutation'
+      AND tgrelid = 'audit_log'::regclass
+  ) THEN
+    CREATE TRIGGER audit_log_no_mutation
+      BEFORE UPDATE OR DELETE ON audit_log
+      FOR EACH ROW EXECUTE FUNCTION ledger_reject_mutation();
   END IF;
 END
 $$;

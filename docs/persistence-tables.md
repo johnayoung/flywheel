@@ -1,6 +1,6 @@
 # Persistence Tables
 
-Reference for the flywheel store: the core run tables (schema_version **13**) and the orchestrator's coordination tables (orchestrator_schema_version **10**). Canonical DDL: `crates/flywheel-core/schema/persistence-schema.sql` (Postgres mirror: `persistence-schema-postgres.sql` alongside); orchestrator DDL: `crates/flywheel-orchestrator/src/claims.rs` (SQLite) and `claims_postgres.rs` (Postgres). An empty table means "nothing exercised it on this database," not "deprecated."
+Reference for the flywheel store: the core run tables (schema_version **14**) and the orchestrator's coordination tables (orchestrator_schema_version **10**). Canonical DDL: `crates/flywheel-core/schema/persistence-schema.sql` (Postgres mirror: `persistence-schema-postgres.sql` alongside); orchestrator DDL: `crates/flywheel-orchestrator/src/claims.rs` (SQLite) and `claims_postgres.rs` (Postgres). An empty table means "nothing exercised it on this database," not "deprecated."
 
 Postgres `TEXT`/`JSONB` cannot hold U+0000: the Postgres store writes NULs in free-form run data (agent output, errors, blocked-requires, agent context, event/grader/control-command payloads) as U+FFFD; SQLite keeps them verbatim.
 
@@ -11,7 +11,7 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 **Every table except the two schema-version sentinels has a `project_id TEXT NOT NULL` column, and every query reads and writes only the opener's `project_id`.** One SQLite file or one Postgres DSN can therefore hold many projects (no schema-per-project).
 
 - `project_id` leads the primary key of every naturally keyed table (`tasks`, `task_versions`, `lifecycles`, `attempts`, `task_claims`, `work_items`, `work_item_dependencies`, `graph_snapshot_items`).
-- Surrogate-id ledgers (`events`, `grader_results`, `control_commands`, `source_syncs`, `orchestrator_events`, `orchestrator_stop_events`, `graph_snapshots`, `orchestrator_session_pauses`) keep their `id` primary key; `project_id` leads every unique constraint and hot lookup index on them.
+- Surrogate-id ledgers (`events`, `grader_results`, `control_commands`, `transcripts`, `audit_log`, `source_syncs`, `orchestrator_events`, `orchestrator_stop_events`, `graph_snapshots`, `orchestrator_session_pauses`) keep their `id` primary key; `project_id` leads every unique constraint and hot lookup index on them.
 - Foreign keys are composite and carry `project_id`, so a row can only reference rows of its own project.
 - In flywheel-core the column is an opaque partition key supplied by whoever opens the store (`SqliteStoreOptions::partition`, `PostgresStoreOptions::partition`; default `default`); core never resolves projects. The shell passes the bound project id (config `project_id` override, else the repo's `.git/config` id); invocations that skip project resolution (`--db` with `--tasks-dir`) use `default`.
 
@@ -26,6 +26,8 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 | `events`           | `id`; unique `(project_id, run_id, sequence)` | Totally-ordered per-run domain-event ledger; lifecycle state is folded from these rows. `sequence` is per-run, strictly monotonic, allocated inside the append transaction. |
 | `grader_results`   | `id`; index `(project_id, run_id, attempt_number, ordinal)` | Append-only receipt log, one row per grader execution. Snapshots the grader spec as it ran. FK -> `attempts`. |
 | `control_commands` | `id`; index `(project_id, run_id, id)` where pending | Operator steering queue for one live run. CLI enqueues; the in-run watcher claim-once-applies. **Empty until live operator interaction.** |
+| `transcripts`      | `id`; index `(project_id, created_at, id)` | Audit ledger (v14): one row per finalized run transcript body -- `run_id`, `uri` (`file://` + absolute path), `sha256`, `bytes`, `created_at`. Append-only (triggers reject UPDATE/DELETE); no FK, kept forever, outlives its body. |
+| `audit_log`        | `id`; index `(project_id, at, id)` | Audit ledger (v14): opaque `kind` + `payload_json` (+ optional `run_id`): `autopilot.cycle`, `autopilot.decision`, `autopilot.approve`, `autopilot.deny`. Append-only, no FK, kept forever. |
 | `schema_version`   | `id = 1` | Sentinel `(version, id)`; no `project_id` (it versions the whole database). |
 
 ## Orchestrator tables
@@ -41,7 +43,7 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 ## Schema versions and upgrade
 
 - A store is checked before any DDL runs: a brand-new store is created at the current version; **a store behind it is refused with an error naming `fw db upgrade`** (no implicit migration on open); a store ahead of it is refused as written by a newer flywheel.
-- `fw db upgrade` migrates in place, one transaction per half, from any supported older version (core v11+, orchestrator v1+): missing columns are added, every table lacking `project_id` is re-keyed with existing rows assigned the store's bound project id, the sentinel is re-created version-first, and the version row is set current. Each step inspects the live layout, so re-running it (or running it on a store already partitioned whose version row is behind) only fixes the version. See [cli.md](cli.md#the-store).
+- `fw db upgrade` migrates in place, one transaction per half, from any supported older version (core v11+, orchestrator v1+): missing columns are added, every table lacking `project_id` is re-keyed with existing rows assigned the store's bound project id, the sentinel is re-created version-first, missing tables (v13 -> v14: `transcripts`, `audit_log`) are created, and the version row is set current. Each step inspects the live layout, so re-running it (or running it on a store already partitioned whose version row is behind) only fixes the version. See [cli.md](cli.md#the-store).
 
 ## Notes
 
@@ -49,5 +51,5 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 - **Recovering "the exact task a run executed"** is `lifecycles.task_content_hash` -> `task_versions` (`load_task_for_run`). The harness saves the definition before seeding the run, so the pinned version is always present.
 - **`prerequisites` is not persisted by core.** The inter-task dependency DAG is an orchestration-layer concept, kept in the orchestrator tables above.
 - **Multi-worker mutual exclusion lives outside core.** `task_claims` belongs to the `flywheel-orchestrator` crate's own store, which shares the database but owns its tables. The single-task loop has no notion of competing workers.
-- **Telemetry is not in the DB.** The verbatim agent message stream and `harness.*` telemetry go to per-run append-only JSONL files under `logs/runs/` beside the store (`$FLYWHEEL_HOME/projects/<id>/logs/runs/` by default) via the telemetry sink (see [vision.md](vision.md), "Audit stream"). The relational store holds state only.
+- **Telemetry is not in the DB.** The verbatim agent message stream and `harness.*` telemetry go to per-run append-only JSONL files -- the run transcripts -- under `$FLYWHEEL_HOME/projects/<id>/transcripts/` (an explicit `--db` outside a project dir: `logs/runs/` beside it) via the telemetry sink; each finalized body is recorded in `transcripts` with its sha256. Bodies past `transcript_retention_days` are swept (worker start, `fw purge`); rows stay (see [vision.md](vision.md), "Audit stream"). The relational store holds state only.
 - Store contents are sensitive-by-default: payloads are persisted verbatim and unredacted. Treat the file as confidential.

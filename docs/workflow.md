@@ -46,7 +46,7 @@ $FLYWHEEL_HOME/projects/<id>/   (fw project path)
   worktrees/                per-task git worktrees (runtime)
   .merge.lock               serializes FF-merges into main
   logs/worker/              supervisor per-run worker logs
-  logs/runs/                per-run agent transcripts
+  logs/runs/                per-run agent transcripts (home projects: projects/<id>/transcripts/)
 ```
 
 Phases are plain directories: the `NN-` prefix controls walk order, there is no phase metadata, and cross-task ordering lives only in each task's `prerequisites`.

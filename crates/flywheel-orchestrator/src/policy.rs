@@ -413,6 +413,14 @@ pub struct WorkPolicy {
     /// backend resolve its DSN from the environment. Its `Debug` form is
     /// redacted.
     pub store_dsn: Option<crate::store_registry::Dsn>,
+    /// Transcript bodies older than this many days are deleted by the
+    /// retention sweep (0: kept forever); their ledger rows stay. Set from
+    /// the effective config (`transcript_retention_days`).
+    pub transcript_retention_days: u64,
+}
+
+fn default_transcript_retention_days() -> u64 {
+    crate::config::DEFAULT_TRANSCRIPT_RETENTION_DAYS.unsigned_abs()
 }
 
 impl WorkPolicy {
@@ -497,6 +505,7 @@ impl Default for WorkPolicy {
             triage_max_per_pass: None,
             project: None,
             store_dsn: None,
+            transcript_retention_days: default_transcript_retention_days(),
         }
     }
 }

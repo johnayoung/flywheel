@@ -3,15 +3,19 @@
 //!
 //! * state: the daemon's activity record (`autopilot_activity`), its pause
 //!   marker, and -- on this machine -- whether its pid still runs;
-//! * what the last cycle decided: the record's last-cycle summary
-//!   (emitted tasks, dropped findings with reasons, tier verdicts);
+//! * what the last cycle decided: the `autopilot.cycle` rows every pass
+//!   writes to the store's audit ledger (`autopilot_ledger`; emitted
+//!   tasks, dropped findings with reasons, tier verdicts), falling back to
+//!   the activity record's last-cycle summary for a daemon that predates
+//!   the ledger;
 //! * candidates: the task files autopilot emitted (`active|archive/
 //!   autopilot*/`), with the score breakdown recorded in their
 //!   `autopilot` block and their latest run from the store;
 //! * gates: runs parked at `awaiting_approval`, pinned by
 //!   [`GateBinding::of_parked`]; a decision goes through
 //!   [`enqueue_gate_decision`], exactly as `fw approve` / `fw reject
-//!   --gate --attempt` and the console's keypress do;
+//!   --gate --attempt` and the console's keypress do, and is recorded in
+//!   the ledger (`autopilot.approve` / `autopilot.deny`);
 //! * pause / resume: `autopilot_activity::set_paused`, as `fw autopilot
 //!   --pause|--resume`.
 
@@ -21,7 +25,7 @@ use flywheel_core::invoker_client::{
     enqueue_gate_decision,
 };
 use flywheel_core::lifecycle::{Lifecycle, Status};
-use flywheel_core::store::{HarnessStore, LifecycleFilter};
+use flywheel_core::store::{HarnessStore, LedgerFilter, LifecycleFilter};
 use flywheel_hub::autopilot::{
     AutopilotView, GateDecided, GateDecision, GateRefused, PendingDecision, PilotCandidate,
     PilotConfig, PilotDecision, PilotDrop, PilotEmit, PilotGate, PilotHold, PilotState, PilotTier,
@@ -32,6 +36,9 @@ use flywheel_orchestrator::autopilot_activity::{
     AutopilotActivity, CycleSummary, DISCOVERY_NOT_CONSULTED, PHASE_IDLE, PHASE_PAUSED,
     PHASE_RUNNING, PHASE_STARTING, PHASE_STOPPED, epoch_now, is_paused, is_record_live,
     read_activity,
+};
+use flywheel_orchestrator::autopilot_ledger::{
+    GateDecisionRecord, KIND_CYCLE, cycle_summary, record_gate_decision,
 };
 use flywheel_orchestrator::policy::{
     AutopilotWeights, DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY, DEFAULT_AUTOPILOT_INTERVAL_SECONDS,
@@ -161,6 +168,38 @@ fn last_decided(activity: &AutopilotActivity) -> Option<PilotDecision> {
         }),
         None => None,
     }
+}
+
+/// How many of the newest `autopilot.cycle` rows the view scans for the
+/// last cycle that decided anything.
+const LEDGER_CYCLES: usize = 200;
+
+/// The last cycle's decision and the newest cycle that decided anything.
+type LedgerDecisions = (Option<PilotDecision>, Option<PilotDecision>);
+
+/// What the last cycle decided and the newest cycle that decided anything,
+/// from the store's `autopilot.cycle` ledger rows; `None` when the store
+/// holds none (a daemon that predates the ledger: use its record).
+fn ledger_decisions(core: &dyn HarnessStore) -> Result<Option<LedgerDecisions>, String> {
+    let rows = core
+        .list_ledger_entries(&LedgerFilter::kind_prefix(KIND_CYCLE).with_newest(LEDGER_CYCLES))
+        .map_err(|e| format!("reading autopilot decisions: {e}"))?;
+    let summaries: Vec<(CycleSummary, DateTime<Utc>)> = rows
+        .iter()
+        .filter_map(|row| cycle_summary(row).map(|summary| (summary, row.at)))
+        .collect();
+    if summaries.is_empty() {
+        return Ok(None);
+    }
+    let decision = summaries
+        .last()
+        .map(|(summary, at)| pilot_decision(summary, Some(*at)));
+    let last_decided = summaries
+        .iter()
+        .rev()
+        .find(|(summary, _)| summary.decided())
+        .map(|(summary, at)| pilot_decision(summary, Some(*at)));
+    Ok(Some((decision, last_decided)))
 }
 
 fn tiers(decision: Option<&PilotDecision>) -> Vec<PilotTier> {
@@ -407,9 +446,23 @@ pub(crate) fn read_view(
     let activity = activity_path.and_then(|path| read_activity(Some(path)));
     let paused = activity_path.is_some_and(is_paused);
     let (state, live) = daemon(activity.as_ref(), paused);
-    let decision = activity.as_ref().and_then(decision);
-    let last_decided = activity.as_ref().and_then(last_decided);
     let mut problems: Vec<String> = Vec::new();
+    // Decisions come from the store's ledger; the activity record only
+    // stands in when the ledger holds none.
+    let (decision, last_decided) = match ledger_decisions(core) {
+        Ok(Some(decisions)) => decisions,
+        Ok(None) => (
+            activity.as_ref().and_then(decision),
+            activity.as_ref().and_then(last_decided),
+        ),
+        Err(e) => {
+            problems.push(e);
+            (
+                activity.as_ref().and_then(decision),
+                activity.as_ref().and_then(last_decided),
+            )
+        }
+    };
 
     let mut candidates = tasks_dir.map(emitted_tasks).unwrap_or_default();
     let tasks: HashMap<&str, &flywheel_hub::flywheel::PanelTask> = panel
@@ -590,14 +643,36 @@ pub(crate) fn decide(
         )));
     }
     match enqueue_gate_decision(core, &decision.run_id, kind, payload, Utc::now()) {
-        Ok((record, binding)) => Ok(GateDecided {
-            run_id: decision.run_id.clone(),
-            task_id,
-            kind: kind.to_owned(),
-            command_id: record.id.unwrap_or_default(),
-            gate: binding.awaiting_ordinal,
-            attempt: binding.attempt_number,
-        }),
+        Ok((record, binding)) => {
+            let decided = GateDecided {
+                run_id: decision.run_id.clone(),
+                task_id,
+                kind: kind.to_owned(),
+                command_id: record.id.unwrap_or_default(),
+                gate: binding.awaiting_ordinal,
+                attempt: binding.attempt_number,
+            };
+            // The ledger row is the audit record of the decision; the
+            // enqueued command is what a worker applies. A failed ledger
+            // write must not hide an already-enqueued decision.
+            if let Err(e) = record_gate_decision(
+                core,
+                &GateDecisionRecord {
+                    approve: decision.approve,
+                    run_id: &decided.run_id,
+                    task_id: &decided.task_id,
+                    gate: decided.gate,
+                    attempt: decided.attempt,
+                    command_id: decided.command_id,
+                    actor: "hub",
+                    with_feedback: decision.feedback.is_some(),
+                },
+                Utc::now(),
+            ) {
+                eprintln!("fw hub: autopilot decision ledger write failed: {e}");
+            }
+            Ok(decided)
+        }
         Err(GateDecisionError::UnknownRun(_)) => Err(GateRefused::UnknownRun(format!(
             "no run {} in this repo's store",
             decision.run_id
@@ -625,6 +700,33 @@ mod tests {
             "expires_at": epoch_now() + 600.0,
         }))
         .expect("an activity record")
+    }
+
+    #[test]
+    fn decisions_are_read_from_the_store_ledger() {
+        use flywheel_core::store_memory::InMemoryStore;
+        use flywheel_orchestrator::autopilot::AutopilotPassResult;
+        use flywheel_orchestrator::autopilot_ledger::{PassMode, record_failed_pass, record_pass};
+        let store = InMemoryStore::new();
+        // No rows: the caller falls back to the activity record.
+        assert_eq!(ledger_decisions(&store).unwrap(), None);
+
+        let decided = AutopilotPassResult {
+            reason: "emitted 2".into(),
+            discovery_cache: flywheel_orchestrator::autopilot_context::DiscoveryCacheStatus::Miss,
+            ..AutopilotPassResult::default()
+        };
+        let t0 = Utc::now();
+        record_pass(&store, 1, PassMode::Daemon, &decided, t0).unwrap();
+        record_failed_pass(&store, 2, PassMode::Daemon, "boom", "CycleError", t0).unwrap();
+        let (decision, last_decided) = ledger_decisions(&store).unwrap().unwrap();
+        let decision = decision.unwrap();
+        assert_eq!(decision.cycle, 2);
+        assert_eq!(decision.reason, "cycle failed (CycleError): boom");
+        let last_decided = last_decided.unwrap();
+        assert_eq!(last_decided.cycle, 1);
+        assert_eq!(last_decided.reason, "emitted 2");
+        assert_eq!(last_decided.at, Some(t0));
     }
 
     /// A daemon that exited without its parent reaping it (a zombie)

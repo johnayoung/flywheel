@@ -11,7 +11,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Read verbs | `fw status` / `live` / `history` / `show` / `validate` | Inspect state, runs, and task definitions |
 | Steering verbs | `fw say` / `interrupt` / `approve` / `reject` | Enqueue one control command against a live run |
 | Daemons | `fw worker` / `autopilot` / `triage` | Drain the queue (worker), keep it full (autopilot), or triage the intake board (triage) |
-| Audit | `fw audit RUN_ID` | Stream the totally-ordered telemetry for one run |
+| Audit | `fw audit RUN_ID` / `fw audit --project [--json]` / `fw purge [--project]` | Stream one run's telemetry; list the project's audit rows (transcripts, autopilot decisions); delete transcript bodies (rows stay) |
 | Setup | `fw init` | Set up this repo's project; writes nothing into the repo (see [`init`](#init)) |
 | Hub | `fw hub` server: `start` / `stop` / `upgrade` / `status` / `logs` / `serve` / `install-service` / `doctor`; access: `open` / `url` / `token` / `tls` / `peer` / `machine` / `share`; sessions: `ls` / `new` / `send` / `read` / `wait` / `attach` / `kill` / `relaunch` / `explain` / `import` / `template` / `queue` / `broadcast` / `conversations` / `account`; output: `commands` / `search` / `activity` / `digest` / `record`; git: `review` / `merge` / `pr` / `handoff` / `ask-review` / `fanout` / `autopilot`; settings: `config` / `plugin` / `perms`; hooks only: `report` | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
 | One-shot | `fw exec [PROMPT]` | Run one agent call from any project: no tasks, store, worktree, or config |
@@ -47,7 +47,7 @@ Every delegated verb resolves its inputs the same way: **explicit flag wins, the
 | Work source | `--tasks-dir DIR` (forces directory source) | `$FLYWHEEL_HOME/projects/<id>/tasks` | `resolve_work_source` |
 | Worktree root | `--sandbox-root` (worker) | `$FLYWHEEL_HOME/projects/<id>/worktrees` | `resolve_sandbox_root` |
 
-Logs (`logs/runs/`, `logs/worker/`, `logs/autopilot/`), the merge lock (`.merge.lock`), and the held-out registry (`held-out/`) sit in the project dir. Work-source, sandbox, and agent flags: [configuration.md](configuration.md#verb-flags).
+Run transcripts (`transcripts/<run_id>.jsonl`), logs (`logs/worker/`, `logs/autopilot/`), the merge lock (`.merge.lock`), and the held-out registry (`held-out/`) sit in the project dir (an explicit `--db` outside a project dir keeps run files at `<db dir>/logs/runs/`). Work-source, sandbox, and agent flags: [configuration.md](configuration.md#verb-flags).
 
 Anchors are in `crates/flywheel-orchestrator/src/workflow/mod.rs`.
 
@@ -99,7 +99,7 @@ Every table carries a `project_id` partition column, so one store (one Postgres 
 | `db upgrade` | Migrate the cwd project's store (sqlite under the project dir, or the configured Postgres DSN) in place: run tables and orchestrator tables, each in one transaction, from any supported older version; existing rows get the project id. Idempotent (a second run, or a store already partitioned whose version row is behind, only fixes the version). Exit 1 on a newer or unrecognized store. |
 | `db upgrade --db PATH` | Upgrade that sqlite file (partition `default`). |
 
-Schema versions: run store `schema_version` 13, orchestrator store `orchestrator_schema_version` 10. Catalog: [persistence-tables.md](persistence-tables.md).
+Schema versions: run store `schema_version` 14 (v14 added the `transcripts` and `audit_log` ledger tables), orchestrator store `orchestrator_schema_version` 10. Catalog: [persistence-tables.md](persistence-tables.md).
 
 ## Read verbs
 
@@ -222,6 +222,25 @@ Flags are validated **before** the repo root or any `gh` call: a missing or malf
 | `--once` | one triage pass then exit |
 | `--interval SECONDS` | daemon cycle interval (default 300.0) |
 | `--model` | agent model for the authoring session (overrides `model`) |
+
+### `audit --project [--json]`
+
+The cwd project's audit record, oldest first (newest last), from whichever store the project uses (sqlite or Postgres). Rows are append-only and kept forever (`crates/flywheel/src/ledger_verbs.rs`).
+
+| `kind` | Fields (besides `kind`, `at`) | Written |
+|---|---|---|
+| `transcript` | `run_id`, `uri` (`file://` + absolute path), `sha256` (hex of the body bytes), `bytes` | when a run finalizes (the runner returned) |
+| `autopilot.cycle` | `cycle`, `mode` (`once`/`daemon`), `outcome` (`ok`/`error`), `reason`, `emitted`, `dropped`, `relevant_tiers`, `not_relevant_tiers`, `prefiltered`, `discovery_cache`, `emitted_tasks`, `dropped_findings`; on error `error`, `error_type` | every autopilot pass |
+| `autopilot.decision` | `cycle`, `decision` (`emitted`/`dropped`), `finding_id`, `tier`, `title`, `reason`; `task_id` when emitted | per emitted task / dropped finding |
+| `autopilot.approve` / `autopilot.deny` | `run_id`, `task_id`, `gate`, `attempt`, `command_id`, `actor`, `with_feedback` | per gate decision from the hub's autopilot panel |
+
+`--json` prints NDJSON, one object per row; `at` is RFC 3339. Plain output is one line per row.
+
+### `purge [--project [--yes]]`
+
+`fw purge` deletes every transcript body of the cwd project (`transcripts/`, plus any pre-ledger `logs/runs/`) and reports the count; the `transcript` rows stay. `fw purge --project` deletes the whole `$FLYWHEEL_HOME/projects/<id>/` dir (store file, tasks, specs, transcripts, worktrees) after a `[y/N]` prompt; unattended (stdin not a TTY) it exits 2 unless `--yes`. A Postgres store's rows survive it.
+
+Retention: bodies older than `transcript_retention_days` (default 90; `0` keeps forever) are deleted at worker start and by `fw purge`; rows stay.
 
 ### `audit RUN_ID`
 

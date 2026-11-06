@@ -67,7 +67,9 @@ use crate::store::{
     AuditRecord, DomainEventStore, EventRecord, JsonObject, LifecycleStore, SdkMessageRecord,
     StoreError,
 };
-use crate::telemetry_file::{DEFAULT_LOGS_ROOT, JsonStyle, RUNS_DIRNAME, python_json_dumps};
+use crate::telemetry_file::{
+    DEFAULT_LOGS_ROOT, JsonStyle, python_json_dumps, runs_dir_for_logs_root,
+};
 
 // --- Errors ---------------------------------------------------------------------
 
@@ -112,7 +114,7 @@ pub struct FileCursor {
 /// validation: a reader that is handed an unsafe `run_id` simply finds no
 /// file.
 pub fn run_file_path(logs_root: &Path, run_id: &str) -> PathBuf {
-    logs_root.join(RUNS_DIRNAME).join(format!("{run_id}.jsonl"))
+    runs_dir_for_logs_root(logs_root).join(format!("{run_id}.jsonl"))
 }
 
 /// Line-at-a-time tailer over one run file.

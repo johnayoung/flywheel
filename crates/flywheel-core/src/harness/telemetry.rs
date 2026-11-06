@@ -342,6 +342,33 @@ impl GraderResultStore for MirroringStore {
     }
 }
 
+impl crate::store::LedgerStore for MirroringStore {
+    fn append_transcript(
+        &self,
+        record: &crate::store::TranscriptRecord,
+    ) -> Result<crate::store::TranscriptRecord, StoreError> {
+        self.wrapped.append_transcript(record)
+    }
+
+    fn list_transcripts(&self) -> Result<Vec<crate::store::TranscriptRecord>, StoreError> {
+        self.wrapped.list_transcripts()
+    }
+
+    fn append_ledger_entry(
+        &self,
+        entry: &crate::store::LedgerEntry,
+    ) -> Result<crate::store::LedgerEntry, StoreError> {
+        self.wrapped.append_ledger_entry(entry)
+    }
+
+    fn list_ledger_entries(
+        &self,
+        filter: &crate::store::LedgerFilter,
+    ) -> Result<Vec<crate::store::LedgerEntry>, StoreError> {
+        self.wrapped.list_ledger_entries(filter)
+    }
+}
+
 impl ControlCommandStore for MirroringStore {
     fn enqueue_command(
         &self,

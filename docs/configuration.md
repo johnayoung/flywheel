@@ -19,7 +19,7 @@ Flywheel reads three TOML files and one environment variable; the repo needs non
 | `model` | string | unset (the agent CLI's own default; `null` in `fw config`) | the agent model (`--model` wins) |
 | `concurrency` | int >= 1 | `1` | worker pool size (`--concurrency` wins) |
 | `store` | `"sqlite"` or a `postgres://` / `postgresql://` DSN | `"sqlite"` (`projects/<id>/flywheel.sqlite`) | the store backend; one Postgres DSN serves every project, and choosing Postgres is what permits cross-machine claims ([team-mode.md](team-mode.md)) |
-| `transcript_retention_days` | int >= 1 | `90` | transcript body retention |
+| `transcript_retention_days` | int >= 0 | `90` | days a run transcript body is kept (swept at worker start and by `fw purge`; `0` keeps forever); its audit row is kept regardless |
 | `verify` | string (shell) | unset (no gate) | the standing submit gate (re-run under the merge lock before every landing), the phase-exit gate, AND the default grader of a tracker item (GitHub issue/CI/review) that carries none; `""` disables a lower layer's command |
 | `protected_paths` | list of globs | `[]` | paths a finished branch may not touch (`**` crosses dirs; `*`, `?` do not); a match parks the work |
 | `land` | `"merge"` or `"pr"` | `"merge"` | the submit strategy, for task work and autopilot work alike |

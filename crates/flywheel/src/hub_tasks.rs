@@ -429,7 +429,7 @@ fn held_out_graders(layout: &TaskLayout, task: &Task) -> Result<Vec<GraderSpec>,
         .collect())
 }
 
-/// `[submit] protected_paths` as hub protected paths (a path or a
+/// The `protected_paths` config key as hub protected paths (a path or a
 /// directory, compared by content): a literal path, or `dir/**`, maps to
 /// itself / `dir`; a pattern with a glob inside a name cannot, and is
 /// returned apart (the loop still enforces it at landing).

@@ -372,7 +372,10 @@ fn audit_outside_a_git_repo_refuses_unless_db_names_the_store() {
     refused(&sandbox.fw(&plain, &["audit", "run-ghost"]));
 
     // An explicit --db names the store (relative to the cwd): it is read.
-    let output = sandbox.fw(&plain, &["audit", "--db", "custom/store.sqlite", "run-ghost"]);
+    let output = sandbox.fw(
+        &plain,
+        &["audit", "--db", "custom/store.sqlite", "run-ghost"],
+    );
     assert_eq!(
         output.status.code(),
         Some(0),

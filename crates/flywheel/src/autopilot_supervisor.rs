@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Where the autopilot supervisor's logs (and the activity record) land
-/// by default.
+/// when no home project names a log dir (cwd-relative; the console passes
+/// the project's `logs/autopilot/`).
 pub const DEFAULT_AUTOPILOT_LOG_DIR: &str = ".flywheel/logs/autopilot";
 
 /// Every supervisor log is `autopilot-supervisor-<ts>-<seq>.log` under the

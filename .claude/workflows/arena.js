@@ -133,7 +133,7 @@ const runPrompt = (variant) => [
   'You are faithfully RUNNING an artifact (a prompt or skill) against an input, to produce exactly what that artifact would produce. This is a controlled A/B comparison; another agent is running a different version on the same input.',
   '',
   loadInstr(variant.source),
-  'If the instructions contain placeholder tokens, treat them as their default paths: __FW_TASKS_DIR__ -> .flywheel/tasks, __FW_SPECS_DIR__ -> .flywheel/specs, __FW_AUDITS_DIR__ -> .flywheel/audits, __FW_PROPOSALS_DIR__ -> .flywheel/proposals, __FW_LOGS_DIR__ -> .flywheel/logs; __FW_DELIVERY__ -> use the task-directory convention.',
+  'If the instructions contain placeholder tokens, treat them as the project-dir paths fw renders them to: __FW_TASKS_DIR__ -> $(fw project path --tasks), __FW_SPECS_DIR__ -> $(fw project path --specs), __FW_AUDITS_DIR__ -> $(fw project path --root)/audits, __FW_PROPOSALS_DIR__ -> $(fw project path --root)/proposals, __FW_LOGS_DIR__ -> $(fw project path --logs); __FW_DELIVERY__ -> use the task-directory convention.',
   '',
   'WHAT THE ARTIFACT IS: ' + V.task,
   '',

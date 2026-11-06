@@ -43,7 +43,10 @@ use crate::event_serde::format_timestamp;
 use crate::store::{JsonObject, StoreError, TelemetryRecord, TelemetrySink};
 use crate::task::python_float_repr;
 
-/// The spec's default logs root, relative to the working directory.
+/// Core's standalone logs root, relative to the working directory. Under
+/// `fw` the logs root is derived from the home project's store path
+/// (`$FLYWHEEL_HOME/projects/<id>/`); this default applies only when core
+/// runs with no project.
 pub const DEFAULT_LOGS_ROOT: &str = ".flywheel/logs";
 
 /// Subdirectory of the logs root holding the per-run JSONL files.

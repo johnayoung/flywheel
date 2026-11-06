@@ -232,9 +232,9 @@ pub struct UntrustedRepoFile {
 pub struct FlywheelPanel {
     pub folder: PathBuf,
     pub generated_at: DateTime<Utc>,
-    /// Where tasks come from (`directory .flywheel/tasks`, `github`, ...).
+    /// Where tasks come from (`directory <project>/tasks`, `github`, ...).
     pub source: String,
-    /// The store read (`sqlite .flywheel/flywheel.sqlite`, `postgres`).
+    /// The store read (`sqlite <project>/flywheel.sqlite`, `postgres`).
     pub store: String,
     /// The main checkout, when the folder is a linked git worktree: flywheel
     /// keeps a store per checkout, so this panel reads the worktree's own

@@ -14,8 +14,8 @@
 //!   deployment config for "production down", no build manifest or CI for
 //!   "broken build", no source code for the code-only tiers). A skipped tier
 //!   is recorded with an explicit reason; it never reaches an agent.
-//! * [`DiscoveryCache`] -- tier verdicts persisted under
-//!   `.flywheel/logs/autopilot/` keyed on the repo state (HEAD sha plus a
+//! * [`DiscoveryCache`] -- tier verdicts persisted under the project's
+//!   `logs/autopilot/` (`$FLYWHEEL_HOME/projects/<id>/`) keyed on the repo state (HEAD sha plus a
 //!   working-tree fingerprint) and, per tier, on the exact rendered prompt
 //!   and agent configuration, so an unchanged repo reuses its verdicts
 //!   across cycles and daemon restarts. Bounded by entry count and TTL.
@@ -45,9 +45,10 @@ pub const PREFILTER_VERSION: u32 = 1;
 /// session's own repo survey.
 pub const DIGEST_MAX_CHARS: usize = 8_000;
 
-/// Repo-relative path prefix autopilot owns; excluded from the inventory and
-/// the working-tree fingerprint so emitting a task never invalidates the
-/// cache or reshapes the digest.
+/// Repo-relative prefix of the pre-home flywheel state dir; excluded from
+/// the inventory and the working-tree fingerprint so a leftover (ignored,
+/// never read) `.flywheel/` neither reshapes the digest nor invalidates the
+/// cache. Live state is under `$FLYWHEEL_HOME`, outside the repo tree.
 pub const FLYWHEEL_DIR_PREFIX: &str = ".flywheel/";
 
 /// Upper bound on the inventory size, so a pathological tree cannot balloon
@@ -68,7 +69,7 @@ const WALK_SKIP_DIRS: [&str; 7] = [
 // --- Inventory ----------------------------------------------------------------------
 
 /// The repo's file listing (repo-relative, `/`-separated, sorted, unique),
-/// excluding autopilot's own `.flywheel/` state.
+/// excluding a leftover pre-home `.flywheel/` dir.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RepoInventory {
     pub files: Vec<String>,
@@ -727,8 +728,10 @@ pub const DISCOVERY_CACHE_SCHEMA_VERSION: u64 = 1;
 /// At most this many repo states are retained (most recent first).
 pub const DISCOVERY_CACHE_MAX_ENTRIES: usize = 8;
 
-/// The cache file, beside the daemon's activity record (gitignored with the
-/// rest of `.flywheel/logs/`).
+/// The cache file for a policy bound to no project (direct construction
+/// only): under `<repo>/.flywheel/logs/autopilot/`. A home project's cache
+/// lives beside its activity record in the project dir
+/// ([`crate::autopilot_run::autopilot_log_dir`]).
 pub fn default_discovery_cache_path(repo_root: &Path) -> PathBuf {
     repo_root
         .join(".flywheel")

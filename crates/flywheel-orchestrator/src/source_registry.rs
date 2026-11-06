@@ -38,7 +38,8 @@ pub const BUILTIN_SOURCE_KINDS: [&str; 4] = [
     GITHUB_REVIEW_KIND,
 ];
 
-/// A `[source] tasks_dir` setting when the operator gives none.
+/// The `tasks_dir` source setting when a direct caller gives none
+/// (cwd-relative; every `fw` policy names the home project's tasks dir).
 pub const DEFAULT_TASKS_DIR: &str = ".flywheel/tasks";
 
 /// Everything a source factory may read to construct its adapter.
@@ -303,7 +304,7 @@ impl SourceRegistry {
 
 /// The factory behind the `directory` kind.
 ///
-/// Reads `[source] tasks_dir` (falling back to [`DEFAULT_TASKS_DIR`]) and
+/// Reads the `tasks_dir` setting (falling back to [`DEFAULT_TASKS_DIR`]) and
 /// wires the context's `log` sink in; `default_graders` and `stop_sink`
 /// are ignored because directory tasks always carry their own graders and
 /// an unloadable file is skipped and counted by the source itself.

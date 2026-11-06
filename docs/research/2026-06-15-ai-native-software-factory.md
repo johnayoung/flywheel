@@ -1,6 +1,6 @@
 # AI-Native Software Factory: End-to-End SDD Pipeline — Research Brief (mid-2026)
 
-> Point-in-time research artifact, not an authoritative spec. Feeds `/define` and `.flywheel/specs/`.
+> Point-in-time research artifact, not an authoritative spec. Feeds `/define` and the project's central specs dir (`fw project path --specs`).
 > Generated 2026-06-15 via the deep-research workflow (run `wf_be2a53a8-647`): 5 angles, 21 sources
 > fetched, 102 claims extracted, 25 adversarially verified (22 confirmed, 3 killed), 13 after synthesis.
 > Facts are verified + cited; the flywheel routing at the end is reasoned design recommendation, not

@@ -1001,8 +1001,8 @@ fn commit_archive_move(repo_root: &Path, active_dir: &Path, dest: &Path, log: &d
     if !ok {
         let last = out.trim().lines().last().unwrap_or("git failed").to_owned();
         log(format!(
-            "archival move of {name} left uncommitted ({last}); commit .flywheel/tasks by hand \
-             to keep the queue's git truth in step"
+            "archival move of {name} left uncommitted ({last}); commit {active} and {archived} \
+             by hand to keep the queue's git truth in step"
         ));
         return;
     }

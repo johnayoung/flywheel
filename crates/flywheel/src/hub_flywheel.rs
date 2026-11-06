@@ -215,9 +215,10 @@ impl HubFlywheel {
 pub(crate) struct TaskLayout {
     /// The directory source's tasks dir (absolute).
     pub tasks_dir: PathBuf,
-    /// The `[held_out] root` registry, when configured.
+    /// The project's held-out registry (`<project>/held-out`), when it holds
+    /// registrations.
     pub held_out: Option<flywheel_orchestrator::held_out_gate::FilesystemHeldOutGraderSource>,
-    /// `[submit] protected_paths`: what a landing may not change.
+    /// The `protected_paths` config key: what a landing may not change.
     pub protected_paths: Vec<String>,
 }
 

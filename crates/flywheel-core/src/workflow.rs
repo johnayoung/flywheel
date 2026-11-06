@@ -64,7 +64,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Where the verbs persist by default: `.flywheel/flywheel.sqlite`.
+/// Where the verbs persist when no `--db` reaches core: cwd-relative
+/// `.flywheel/flywheel.sqlite`. Core's standalone default only: `fw` always
+/// passes `--db` (the home project's `flywheel.sqlite` or the operator's).
 pub const DEFAULT_DB_PATH: &str = ".flywheel/flywheel.sqlite";
 /// Default agent turn cap per iteration.
 pub const DEFAULT_MAX_TURNS: u32 = 500;
@@ -1400,8 +1402,8 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
-  --db DB               SQLite database path (default:
-                        .flywheel/flywheel.sqlite).
+  --db DB               SQLite database path (default: the home project's
+                        store).
   --check CMD           Add a command grader (pass=exit 0) for an inline goal.
                         Repeatable. Ignored for a task file.
   --rubric ASSERTION    Add a natural-language rubric assertion for an inline
@@ -1428,7 +1430,7 @@ positional arguments:
 
 options:
   -h, --help  show this help message and exit
-  --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
+  --db DB     SQLite database path (default: the home project's store).";
 
 const INTERRUPT_USAGE: &str = "usage: flywheel workflow interrupt [-h] [--db DB] RUN_ID";
 
@@ -1439,7 +1441,7 @@ positional arguments:
 
 options:
   -h, --help  show this help message and exit
-  --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
+  --db DB     SQLite database path (default: the home project's store).";
 
 const STEER_USAGE: &str = "usage: flywheel workflow steer [-h] [--db DB] RUN_ID MESSAGE";
 
@@ -1451,7 +1453,7 @@ positional arguments:
 
 options:
   -h, --help  show this help message and exit
-  --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
+  --db DB     SQLite database path (default: the home project's store).";
 
 const SET_MODEL_USAGE: &str = "usage: flywheel workflow set-model [-h] [--db DB] RUN_ID MODEL";
 
@@ -1463,7 +1465,7 @@ positional arguments:
 
 options:
   -h, --help  show this help message and exit
-  --db DB     SQLite database path (default: .flywheel/flywheel.sqlite).";
+  --db DB     SQLite database path (default: the home project's store).";
 
 const APPROVE_USAGE: &str =
     "usage: flywheel workflow approve [-h] [--gate ORDINAL] [--attempt N] [--db DB] RUN_ID";
@@ -1480,7 +1482,7 @@ options:
                     (from harness.awaiting_approval). Without it the
                     decision binds to whatever gate is parked now.
   --attempt N       Refuse unless the gate is parked on this attempt.
-  --db DB           SQLite database path (default: .flywheel/flywheel.sqlite).";
+  --db DB           SQLite database path (default: the home project's store).";
 
 const REJECT_USAGE: &str = "usage: flywheel workflow reject [-h] [--feedback TEXT] \
                             [--gate ORDINAL] [--attempt N] [--db DB] RUN_ID";
@@ -1499,7 +1501,7 @@ options:
                    \"(no feedback provided)\".
   --gate ORDINAL   Refuse unless the parked gate is this awaiting_ordinal.
   --attempt N      Refuse unless the gate is parked on this attempt.
-  --db DB          SQLite database path (default: .flywheel/flywheel.sqlite).";
+  --db DB          SQLite database path (default: the home project's store).";
 
 const COMMANDS: [&str; 7] = [
     "run",

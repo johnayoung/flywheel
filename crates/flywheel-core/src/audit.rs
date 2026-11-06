@@ -1017,7 +1017,8 @@ pub fn record_kind_label(record: &AuditRecord) -> String {
 
 /// Default store path used when neither `--db` nor `$FLYWHEEL_DB` is set.
 /// Matches the spec's `./flywheel.db` fallback: the audit CLI is a debugging
-/// tool that may run outside a `.flywheel/` layout.
+/// tool that may run outside any flywheel project (`fw audit` always passes
+/// the home project's `--db`).
 pub const DEFAULT_DB_PATH: &str = "flywheel.db";
 
 /// Total preview budget for the text mode. Fixed (not terminal-width

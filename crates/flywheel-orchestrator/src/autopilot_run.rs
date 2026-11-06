@@ -508,9 +508,10 @@ pub fn resolve_runtime(args: &AutopilotArgs, policy: Option<&WorkPolicy>) -> Res
     }
 }
 
-/// The store path the daemon's counters open: the policy's `[paths] db`
-/// (default `.flywheel/flywheel.sqlite`), anchored under `repo_root` when
-/// relative -- exactly as the worker resolves it.
+/// The store path the daemon's counters open: the policy's store (the home
+/// project's `flywheel.sqlite`; [`DEFAULT_DB_PATH`] for a policy with none),
+/// anchored under `repo_root` when relative -- exactly as the worker
+/// resolves it.
 pub fn resolve_daemon_db_path(policy: Option<&WorkPolicy>, repo_root: &Path) -> PathBuf {
     let raw = policy
         .and_then(|p| p.db_path.clone())

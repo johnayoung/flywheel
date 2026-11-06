@@ -12,8 +12,8 @@
 //!   existing lease-lapse semantics).
 //! * **Spawn / supervise** -- when no live worker is detected, spawn a child
 //!   running the worker daemon and remember it as ours. The child's
-//!   stdout/stderr are redirected to a per-spawn supervisor log under
-//!   `.flywheel/logs/worker/`; the log directory's footprint is bounded by
+//!   stdout/stderr are redirected to a per-spawn supervisor log under the
+//!   home project's `logs/worker/`; the log directory's footprint is bounded by
 //!   reclaiming the oldest logs on every spawn.
 //! * **Quit handoff** -- `detach` drops the reference to the child (the
 //!   worker keeps running, the console can exit); `stop` signals the
@@ -49,8 +49,9 @@ use std::time::{Duration, Instant, SystemTime};
 /// cleanup. Tests pass a smaller value so the suite stays snappy.
 pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Where the worker supervisor's per-spawn logs land by default, next to
-/// the worker's own per-run forensics.
+/// Where the worker supervisor's per-spawn logs land when no home project
+/// names a log dir (cwd-relative; the console passes the project's
+/// `logs/worker/`).
 pub const DEFAULT_WORKER_LOG_DIR: &str = ".flywheel/logs/worker";
 
 /// Every worker supervisor log is `supervisor-<ts>-<seq>.log`; the reclaim

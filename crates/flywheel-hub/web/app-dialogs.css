@@ -101,8 +101,8 @@
 
 .repo-row {
   display: grid;
-  grid-template-columns: 1.4rem 1fr 7.5rem 1.55rem;
-  grid-template-areas: "n input label x" ". note note note";
+  grid-template-columns: 1.4rem 1fr 1.55rem 7.5rem 1.55rem;
+  grid-template-areas: "n input browse label x" ". note note note note";
   align-items: center;
   gap: .15rem .4rem;
   counter-increment: repo;
@@ -354,7 +354,7 @@
 /* Folder labels beside their paths in the workspace dialog. */
 .repo-row .folder-label { grid-area: label; min-width: 0; }
 @media (max-width: 520px) {
-  .repo-row { grid-template-columns: 1.4rem 1fr 1.55rem; grid-template-areas: "n input x" ". label label" ". note note"; }
+  .repo-row { grid-template-columns: 1.4rem 1fr 1.55rem 1.55rem; grid-template-areas: "n input browse x" ". label label label" ". note note note"; }
 }
 
 /* Phone: one scroller (the dialog), not lists scrolling inside it. */

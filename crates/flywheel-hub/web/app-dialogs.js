@@ -66,6 +66,14 @@ settings.onChange((ids) => {
 });
 let wsEditing = null; // workspace being edited, or null for create
 let checkSeq = 0;
+// Completion, the folder browser, and suggestions (folders.js), over the
+// dialog's machine's directories.
+const folders = window.FwHubFolders({
+  $, el, icon, api, basename,
+  rows: () => [...$("#repo-rows").children],
+  machine: () => (wsEditing ? wsEditing.machine || null : $("#ws-machine").value || null),
+  addFolders: (paths, origin) => addFolders(paths, origin),
+});
 
 // `value`: a path, or a workspace folder {path, name}.
 function repoRow(value) {
@@ -89,6 +97,8 @@ function repoRow(value) {
     "aria-label": "Folder label (optional; shown instead of the directory name)",
     title: "Label (optional): shown instead of the directory name",
   });
+  const browse = iconButton("folder", "Browse folders on the hub's machine", () => folders.browse(row));
+  browse.classList.add("browse");
   const verdict = icon("check");
   verdict.classList.add("verdict");
   const note = el("span", { className: "note" });
@@ -96,6 +106,7 @@ function repoRow(value) {
     "li",
     { className: "repo-row", dataset: { state: "empty" } },
     el("span", { className: "input-wrap" }, input, verdict),
+    browse,
     label,
     iconButton("x", "Remove folder", () => {
       row.remove();
@@ -104,6 +115,7 @@ function repoRow(value) {
     }),
     note,
   );
+  folders.attach(input);
   let timer = 0;
   row.check = () => checkRow(row);
   input.addEventListener("input", () => {
@@ -146,6 +158,52 @@ function addRepoRow(value) {
   const row = repoRow(value);
   $("#repo-rows").append(row);
   return row;
+}
+
+// Add folder paths (from the browser or a suggestion): the first fills
+// `origin` (the row the browser opened from) when it is empty -- with no
+// origin, the first empty row -- the rest become rows after it. A folder
+// already listed is skipped, and the toast says so.
+function addFolders(paths, origin) {
+  const rows = [...$("#repo-rows").children];
+  // "Select this folder" from a row's browser replaces what the row says.
+  let empty = origin && (!origin.input.value.trim() || paths.length === 1) ? origin : null;
+  if (!origin) empty = rows.find((row) => !row.input.value.trim()) || null;
+  const listed = new Set();
+  for (const row of rows) {
+    if (row === empty) continue;
+    if (row.result && row.result.ok) listed.add(row.result.path);
+    if (row.input.value.trim()) listed.add(folders.expand(row.input.value));
+  }
+  let after = origin || rows[rows.length - 1] || null;
+  let skipped = 0;
+  let last = null;
+  for (const path of paths) {
+    const full = folders.expand(path);
+    if (listed.has(full)) {
+      skipped += 1;
+      continue;
+    }
+    listed.add(full);
+    if (empty) {
+      empty.input.value = path;
+      empty.input.dispatchEvent(new Event("input"));
+      after = empty;
+      last = empty;
+      empty = null;
+      continue;
+    }
+    const row = repoRow(path);
+    if (after) after.after(row);
+    else $("#repo-rows").append(row);
+    after = row;
+    last = row;
+  }
+  if (last) last.input.focus();
+  markDuplicates();
+  if (skipped) {
+    commands.toast(skipped === 1 ? "That folder is already in the list." : `${skipped} folders were already in the list.`);
+  }
 }
 
 async function checkRow(row) {
@@ -223,6 +281,7 @@ function markDuplicates() {
       }
     }
   });
+  folders.renderSuggestions();
 }
 
 function openWorkspaceDialog(workspace) {
@@ -250,14 +309,22 @@ function openWorkspaceDialog(workspace) {
   importer.reset(!workspace);
   // VS Code import reads this machine's files: here only.
   $("#ws-import").hidden = !!workspace || !!select.value;
+  folders.reset();
   $("#dlg-workspace").showModal();
+  folders.loadSuggestions();
   wsForm.name.focus();
 }
 
 $("#add-repo").addEventListener("click", () => addRepoRow("").input.focus());
-// Another machine: the folder paths are checked again, there.
+$("#browse-repo").addEventListener("click", () => {
+  folders.browse([...$("#repo-rows").children].find((row) => !row.input.value.trim()) || null);
+});
+// Another machine: the folder paths are checked again, there, and its
+// directories browsed and suggested.
 $("#ws-machine").addEventListener("change", () => {
   $("#ws-import").hidden = !!$("#ws-machine").value;
+  folders.reset();
+  folders.loadSuggestions();
   for (const row of $("#repo-rows").children) if (row.input.value.trim()) checkRow(row);
 });
 

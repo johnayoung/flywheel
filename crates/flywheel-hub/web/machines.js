@@ -43,7 +43,7 @@ window.FwHubMachines = function (ctx) {
     (state.localSessions || []).some((s) => s.id === id) ||
     (state.localWorkspaces || []).some((w) => w.id === id);
   // Calls about "where": they follow the dialog's machine.
-  const CONTEXT_GET = /^\/api\/(?:kinds|claude-accounts|folders\/check|repos\/check|worktrees\/plan)(?=[/?]|$)/;
+  const CONTEXT_GET = /^\/api\/(?:kinds|claude-accounts|folders\/check|repos\/check|fs\/dirs|fs\/suggestions|worktrees\/plan)(?=[/?]|$)/;
 
   function route(method, path, body) {
     if (path.startsWith("/m/")) return path;

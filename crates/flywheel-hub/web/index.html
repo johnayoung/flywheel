@@ -23,6 +23,7 @@
 <link rel="stylesheet" href="/assets/app-sidebar.css">
 <link rel="stylesheet" href="/assets/app-stage.css">
 <link rel="stylesheet" href="/assets/app-dialogs.css">
+<link rel="stylesheet" href="/assets/app-folders.css">
 <link rel="stylesheet" href="/assets/app-onboarding.css">
 <link rel="stylesheet" href="/assets/app-phone.css">
 <link rel="stylesheet" href="/assets/app-worktrees.css">
@@ -91,6 +92,9 @@
   <symbol id="i-signal" viewBox="0 0 16 16"><path d="M3 13.5v-2M6.3 13.5v-4M9.6 13.5v-6.5M13 13.5v-9.5" stroke="currentColor" stroke-width="1.8"/></symbol>
   <symbol id="i-signal-low" viewBox="0 0 16 16"><path d="M3 13.5v-2M6.3 13.5v-4" stroke="currentColor" stroke-width="1.8"/><path d="M9.6 13.5v-6.5M13 13.5v-9.5" stroke="currentColor" stroke-width="1.8" opacity=".3"/></symbol>
   <symbol id="i-dots" viewBox="0 0 16 16"><circle cx="3.5" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="8" r="1.3" fill="currentColor"/><circle cx="12.5" cy="8" r="1.3" fill="currentColor"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 16 16"><path d="M1.8 3.2h4.4l1.4 1.6h6.6v8H1.8Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M1.8 6.6h12.4" stroke="currentColor" stroke-width="1.2"/></symbol>
+  <symbol id="i-home" viewBox="0 0 16 16"><path d="M2.5 7.5 8 2.8l5.5 4.7M4 6.4v7.1h3v-4h2v4h3V6.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+  <symbol id="i-up" viewBox="0 0 16 16"><path d="M8 13.5V3M3.8 7.2 8 3l4.2 4.2" fill="none" stroke="currentColor" stroke-width="1.6"/></symbol>
 </svg>
 
 <div id="app">
@@ -338,12 +342,47 @@
     <div class="field">
       <span class="field-label">Folders <span class="field-hint">git repos or plain directories &middot; absolute or ~/</span></span>
       <ol id="repo-rows" class="repo-rows"></ol>
-      <button type="button" class="text-btn" id="add-repo"><svg><use href="#i-plus"/></svg>add folder</button>
+      <div class="repo-actions">
+        <button type="button" class="text-btn" id="add-repo"><svg><use href="#i-plus"/></svg>add folder</button>
+        <button type="button" class="text-btn" id="browse-repo"><svg><use href="#i-folder"/></svg>browse</button>
+      </div>
+      <section class="ws-suggest" id="ws-suggest" aria-labelledby="ws-suggest-label" hidden>
+        <span class="field-label" id="ws-suggest-label">Suggested <span class="field-hint" id="ws-suggest-hint"></span></span>
+        <ul class="suggest-list" id="suggest-list"></ul>
+        <button type="button" class="text-btn" id="suggest-more" hidden></button>
+      </section>
     </div>
     <p class="form-error" id="workspace-error" role="alert"></p>
     <footer class="sheet-foot">
       <button type="button" class="slab ghost" value="cancel" data-close>Cancel</button>
       <button type="submit" class="slab" id="workspace-submit">Create</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog id="dlg-folders" class="sheet folder-sheet" aria-labelledby="dlg-folders-title">
+  <form method="dialog" id="folders-form" novalidate>
+    <header class="sheet-head">
+      <span class="sheet-kicker" id="folders-kicker">folders</span>
+      <h2 id="dlg-folders-title">Browse</h2>
+    </header>
+    <nav class="fb-bar" aria-label="Location">
+      <button type="button" class="icon" id="fb-home" title="Home" aria-label="Home"><svg><use href="#i-home"/></svg></button>
+      <button type="button" class="icon" id="fb-up" title="Up one level" aria-label="Up one level"><svg><use href="#i-up"/></svg></button>
+      <ol class="fb-crumbs" id="fb-crumbs"></ol>
+    </nav>
+    <div class="fb-filter">
+      <svg aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="fb-filter" type="text" autocomplete="off" spellcheck="false" placeholder="filter" aria-label="Filter folders" aria-controls="fb-list">
+      <label class="fb-hidden"><input type="checkbox" id="fb-show-hidden"> hidden</label>
+    </div>
+    <ul class="fb-list" id="fb-list" role="listbox" aria-multiselectable="true" aria-label="Folders" tabindex="0"></ul>
+    <p class="form-error" id="fb-error" role="alert"></p>
+    <footer class="sheet-foot fb-foot">
+      <span class="fb-keys" aria-hidden="true"><kbd>&uarr;</kbd><kbd>&darr;</kbd> move <kbd>Enter</kbd> open <kbd>Space</kbd> mark <kbd>&larr;</kbd> up</span>
+      <span class="fb-count" id="fb-count" aria-live="polite"></span>
+      <button type="button" class="slab ghost" value="cancel" data-close>Cancel</button>
+      <button type="submit" class="slab" id="fb-submit">Select this folder</button>
     </footer>
   </form>
 </dialog>
@@ -741,6 +780,7 @@
 <script src="/assets/reply-marks.js"></script>
 <script src="/assets/files.js"></script>
 <script src="/assets/import.js"></script>
+<script src="/assets/folders.js"></script>
 <script src="/assets/onboarding.js"></script>
 <script src="/assets/pwa.js"></script>
 <script src="/assets/netlink.js"></script>

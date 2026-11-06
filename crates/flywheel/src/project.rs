@@ -5,20 +5,27 @@
 //!   or no longer carries that id; prints what it removed.
 //! * `fw project relink [PATH]` -- re-point the cwd repo's id at an existing
 //!   project dir (recovery after a re-clone or a lost `.git/config` key).
+//! * `fw project path [--root|--specs|--tasks|--logs|--worktrees|--held-out]`
+//!   -- the absolute dir of the cwd project (created if missing), so skills
+//!   and scripts never hard-code a path.
 //!
 //! Identity and the home layout live in `flywheel_orchestrator::home`.
 
 use std::io::Write;
+use std::path::PathBuf;
 
+use flywheel_orchestrator::config::{Access, ConfigError, ConfigFlags};
 use flywheel_orchestrator::home::{
-    Home, ProjectError, list_projects, prune_projects, relink_project,
+    self, Home, Project, ProjectError, list_projects, prune_projects, relink_project,
 };
+use flywheel_orchestrator::workflow::{load_project_config, notice_legacy_layout};
 
 /// The verb name.
 pub const PROJECT_VERB: &str = "project";
 
 /// `fw project --help`.
-pub const PROJECT_USAGE: &str = "usage: fw project <ls [--json] | prune | relink [PATH]>
+pub const PROJECT_USAGE: &str =
+    "usage: fw project <ls [--json] | prune | relink [PATH] | path [FLAG]>
 
 Projects are git repos, identified by the id in their .git/config
 (flywheel.projectid); each keeps its state under
@@ -30,6 +37,9 @@ $FLYWHEEL_HOME/projects/<id>/ (default ~/.flywheel).
   relink [PATH]  point the current repo at an existing project dir (PATH:
                  the dir or its id; bare: the project recording this repo's
                  path)
+  path [FLAG]    print the absolute dir of the current repo's project,
+                 creating it if missing; one of --root (default), --specs,
+                 --tasks, --logs, --worktrees, --held-out
 ";
 
 /// Run `fw project ...` (`args` excludes the verb); returns the exit code.
@@ -58,6 +68,23 @@ pub fn run_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
             [target] if !target.starts_with('-') => relink(Some(target), out),
             _ => return usage_error(err, &format!("unexpected arguments: {}", rest.join(" "))),
         },
+        "path" => {
+            let kind = match rest {
+                [] => PathKind::Root,
+                [flag] => match PathKind::from_flag(flag) {
+                    Some(kind) => kind,
+                    None => return usage_error(err, &format!("unknown path flag: {flag}")),
+                },
+                _ => return usage_error(err, "path takes at most one flag"),
+            };
+            return match project_path(kind, out) {
+                Ok(()) => 0,
+                Err(failure) => {
+                    let _ = writeln!(err, "fw project: error: {failure}");
+                    1
+                }
+            };
+        }
         other => return usage_error(err, &format!("unknown subcommand: {other}")),
     };
     match result {
@@ -67,6 +94,91 @@ pub fn run_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
             1
         }
     }
+}
+
+/// One `fw project path` directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    Root,
+    Specs,
+    Tasks,
+    Logs,
+    Worktrees,
+    HeldOut,
+}
+
+impl PathKind {
+    /// Every kind with its flag, in `--help` order.
+    pub const ALL: [(PathKind, &'static str); 6] = [
+        (PathKind::Root, "--root"),
+        (PathKind::Specs, "--specs"),
+        (PathKind::Tasks, "--tasks"),
+        (PathKind::Logs, "--logs"),
+        (PathKind::Worktrees, "--worktrees"),
+        (PathKind::HeldOut, "--held-out"),
+    ];
+
+    pub fn from_flag(flag: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .find(|(_, name)| *name == flag)
+            .map(|(kind, _)| *kind)
+    }
+
+    /// This kind's directory under `project`.
+    pub fn dir(self, project: &Project) -> PathBuf {
+        let paths = &project.paths;
+        match self {
+            PathKind::Root => paths.root().to_path_buf(),
+            PathKind::Specs => paths.specs(),
+            PathKind::Tasks => paths.tasks(),
+            PathKind::Logs => paths.logs(),
+            PathKind::Worktrees => paths.worktrees(),
+            PathKind::HeldOut => paths.held_out(),
+        }
+    }
+}
+
+/// The project the working directory's invocations use: the cwd repo's
+/// project, re-bound to the `project_id` its effective config names (a
+/// shared project dir), loaded read-only -- an untrusted `.flywheel.toml`
+/// is warned about and ignored. Writes nothing into the repo tree beyond
+/// the `.git/config` id.
+pub fn cwd_bound_project() -> Result<Project, ConfigError> {
+    let home = Home::from_env()?;
+    let cwd = std::env::current_dir().map_err(|err| {
+        ConfigError::Project(ProjectError::Invalid(format!(
+            "cannot resolve the working directory: {err}"
+        )))
+    })?;
+    let project = home::resolve_project(&home, &cwd)?;
+    let repo_root = home::worktree_toplevel(&cwd)?;
+    notice_legacy_layout(&repo_root, &home);
+    let config = load_project_config(
+        &home,
+        &project,
+        &repo_root,
+        Access::ReadOnly,
+        &ConfigFlags::default(),
+    )?;
+    Ok(home::bind_project(
+        &home,
+        &project,
+        &config.project_id.value,
+    )?)
+}
+
+fn project_path(kind: PathKind, out: &mut dyn Write) -> Result<(), ConfigError> {
+    let project = cwd_bound_project()?;
+    let dir = kind.dir(&project);
+    std::fs::create_dir_all(&dir).map_err(|failure| {
+        ConfigError::Project(ProjectError::Io {
+            path: dir.clone(),
+            message: failure.to_string(),
+        })
+    })?;
+    writeln!(out, "{}", dir.display()).map_err(|e| ConfigError::Project(io(e)))?;
+    Ok(())
 }
 
 fn usage_error(err: &mut dyn Write, message: &str) -> i32 {
@@ -179,5 +291,18 @@ mod tests {
         assert_eq!(run(&["ls", "--yaml"]).0, 2);
         assert_eq!(run(&["prune", "x"]).0, 2);
         assert_eq!(run(&["relink", "a", "b"]).0, 2);
+        let (code, _, err) = run(&["path", "--nope"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("unknown path flag: --nope"), "{err}");
+        assert_eq!(run(&["path", "--specs", "--tasks"]).0, 2);
+    }
+
+    #[test]
+    fn path_flags_round_trip() {
+        for (kind, flag) in PathKind::ALL {
+            assert_eq!(PathKind::from_flag(flag), Some(kind));
+            assert!(PROJECT_USAGE.contains(flag), "{flag} missing from usage");
+        }
+        assert_eq!(PathKind::from_flag("--db"), None);
     }
 }

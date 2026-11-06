@@ -6,8 +6,9 @@
 //! writing nothing into the repo but the `.git/config` id; linked worktrees
 //! share the project; a moved repo keeps its id; a copy mints its own; a
 //! non-git dir is refused naming git; the hub keeps its state under
-//! `$FLYWHEEL_HOME/hub`; `fw project ls|prune|relink`; and a worker drains a
-//! home project's queue and lands the work.
+//! `$FLYWHEEL_HOME/hub`; `fw project ls|prune|relink|path`; `fw spec
+//! ls|export` copy the central specs out byte-for-byte; and a worker drains
+//! a home project's queue and lands the work.
 
 #![cfg(unix)]
 
@@ -395,9 +396,159 @@ fn a_worker_drains_a_home_project_and_lands_the_work() {
 fn project_help_lists_the_subcommands() {
     let sandbox = Sandbox::new();
     let help = sandbox.ok(&sandbox.root, &["project", "--help"]);
-    for sub in ["ls", "prune", "relink"] {
+    for sub in ["ls", "prune", "relink", "path"] {
         assert!(help.contains(sub), "{help}");
     }
     let usage = sandbox.ok(&sandbox.root, &["--help"]);
     assert!(usage.contains("project ls"), "{usage}");
+    assert!(usage.contains("project path"), "{usage}");
+    assert!(usage.contains("spec export DIR"), "{usage}");
+    let spec = sandbox.ok(&sandbox.root, &["spec", "--help"]);
+    assert!(
+        spec.contains("export DIR") && spec.contains("--force"),
+        "{spec}"
+    );
+}
+
+#[test]
+fn project_path_names_the_cwd_projects_dirs_and_writes_nothing_in_the_tree() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo("repo");
+    let before = tree(&repo);
+    let root = sandbox.ok(&repo, &["project", "path"]);
+    let id = stored_id(&repo);
+    let project = sandbox.flywheel_home().join("projects").join(&id);
+    assert_eq!(root.trim(), project.to_str().unwrap());
+    assert_eq!(
+        sandbox.ok(&repo, &["project", "path", "--root"]),
+        format!("{}\n", project.display())
+    );
+    for (flag, sub) in [
+        ("--specs", "specs"),
+        ("--tasks", "tasks"),
+        ("--logs", "logs"),
+        ("--worktrees", "worktrees"),
+        ("--held-out", "held-out"),
+    ] {
+        let out = sandbox.ok(&repo, &["project", "path", flag]);
+        assert_eq!(out, format!("{}\n", project.join(sub).display()), "{flag}");
+        assert!(project.join(sub).is_dir(), "{flag} not created");
+    }
+    // A subdirectory and a linked worktree resolve to the same project.
+    let sub = repo.join("src");
+    std::fs::create_dir_all(&sub).unwrap();
+    assert_eq!(
+        sandbox.ok(&sub, &["project", "path", "--specs"]).trim(),
+        project.join("specs").to_str().unwrap()
+    );
+    std::fs::remove_dir_all(&sub).unwrap();
+    let linked = sandbox.root.join("linked");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "side",
+            linked.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        sandbox.ok(&linked, &["project", "path", "--specs"]).trim(),
+        project.join("specs").to_str().unwrap()
+    );
+    git(
+        &repo,
+        &["worktree", "remove", "--force", linked.to_str().unwrap()],
+    );
+    assert_eq!(sandbox.projects(), vec![id]);
+    assert_eq!(tree(&repo), before, "the repo tree changed");
+
+    let output = sandbox.fw(&repo, &["project", "path", "--db"]);
+    assert_eq!(output.status.code(), Some(2));
+    let outside = sandbox.root.join("plain");
+    std::fs::create_dir_all(&outside).unwrap();
+    let output = sandbox.fw(&outside, &["project", "path"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("git"));
+}
+
+#[test]
+fn spec_export_reproduces_the_central_specs_byte_for_byte() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo("repo");
+    let before = tree(&repo);
+    let specs = PathBuf::from(sandbox.ok(&repo, &["project", "path", "--specs"]).trim());
+    let id = stored_id(&repo);
+    assert_eq!(
+        specs,
+        sandbox
+            .flywheel_home()
+            .join("projects")
+            .join(&id)
+            .join("specs")
+    );
+    assert_eq!(
+        sandbox.ok(&repo, &["spec", "ls"]).trim(),
+        format!("(no specs in {})", specs.display())
+    );
+    let probe: &[u8] = b"# Feature: probe\n\nbytes \x00\xff\r\n";
+    std::fs::write(specs.join("00001-FEATURE-probe.md"), probe).unwrap();
+    std::fs::create_dir_all(specs.join("archive")).unwrap();
+    std::fs::write(specs.join("archive/00000-FEATURE-old.md"), "old\n").unwrap();
+
+    let listed: serde_json::Value =
+        serde_json::from_str(&sandbox.ok(&repo, &["spec", "ls", "--json"])).unwrap();
+    assert_eq!(
+        listed,
+        serde_json::json!([
+            {"path": "00001-FEATURE-probe.md", "archived": false},
+            {"path": "archive/00000-FEATURE-old.md", "archived": true},
+        ])
+    );
+
+    // A relative DIR resolves against the working directory.
+    let output = sandbox.fw(&repo, &["spec", "export", "../exported"]);
+    assert!(output.status.success(), "{output:?}");
+    let exported = sandbox.root.join("exported");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!(
+            "wrote {}",
+            exported.join("00001-FEATURE-probe.md").display()
+        )),
+        "{stdout}"
+    );
+    assert!(stdout.contains("2 written, 0 unchanged"), "{stdout}");
+    assert_eq!(
+        std::fs::read(exported.join("00001-FEATURE-probe.md")).unwrap(),
+        probe
+    );
+    assert_eq!(
+        std::fs::read(exported.join("archive/00000-FEATURE-old.md")).unwrap(),
+        b"old\n"
+    );
+
+    // A differing file is refused without --force, overwritten with it.
+    std::fs::write(exported.join("00001-FEATURE-probe.md"), "edited\n").unwrap();
+    let output = sandbox.fw(&repo, &["spec", "export", exported.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--force"), "{stderr}");
+    assert_eq!(
+        std::fs::read(exported.join("00001-FEATURE-probe.md")).unwrap(),
+        b"edited\n"
+    );
+    let out = sandbox.ok(
+        &repo,
+        &["spec", "export", exported.to_str().unwrap(), "--force"],
+    );
+    assert!(out.contains("1 written, 1 unchanged"), "{out}");
+    assert_eq!(
+        std::fs::read(exported.join("00001-FEATURE-probe.md")).unwrap(),
+        probe
+    );
+
+    assert_eq!(tree(&repo), before, "the repo tree changed");
 }

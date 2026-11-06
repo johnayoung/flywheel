@@ -52,7 +52,7 @@ Each verb enqueues one control command; the harness applies it in the matching l
 
 ## DIAGNOSE A PARKED WORKTREE
 
-A run that failed, was interrupted, or could not land leaves its git worktree on disk — under the sandbox root (default `.flywheel/worktrees/`) — instead of being cleaned up, parked for forensics. Diagnose it:
+A run that failed, was interrupted, or could not land leaves its git worktree on disk — under the sandbox root (`__FW_WORKTREES_DIR__/` unless `--sandbox-root` names another) — instead of being cleaned up, parked for forensics. Diagnose it:
 
 1. `fw status` — find the task; a stuck run reads RUNNING/INTERRUPTED, a finished-bad one appears in `fw history`.
 2. `fw show TASK_ID` — the per-attempt outcomes, grader receipts (pass/FAIL), and final agent output for that task's latest run: this is where you learn *why* it parked.

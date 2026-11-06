@@ -170,6 +170,8 @@ Verbs:
   hub commands S   print / copy (OSC 52) the code blocks an agent session suggested
   exec [PROMPT]    run one agent call (no tasks, store, worktree, or config)
   project ls       list known projects (--json); also: project prune, project relink [PATH]
+  project path     print this repo's project dir (--specs, --tasks, --logs, --root, ...)
+  spec export DIR  copy this repo's specs (incl. archive/) into DIR (--force); also: spec ls
   config [--json]  print the effective config, each key with its source
   trust            approve this repo's .flywheel.toml (--revoke to withdraw)
   db upgrade       migrate the store in place to this build's schema
@@ -388,6 +390,10 @@ pub fn route(
     if verb == crate::project::PROJECT_VERB {
         // The home's project registry: identity, listing, pruning, relink.
         return crate::project::run_with(rest, out, err);
+    }
+    if verb == crate::spec::SPEC_VERB {
+        // The project's central specs: list, export into a directory.
+        return crate::spec::run_with(rest, out, err);
     }
     if verb == crate::config_verbs::CONFIG_VERB {
         // The effective config: every key with its source.

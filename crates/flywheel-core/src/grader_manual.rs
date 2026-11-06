@@ -1,7 +1,8 @@
 //! Manual grader gate-selection and receipt assembly.
 //!
-//! Pure module that supports the human-approval gate
-//! (`.flywheel/specs/00016-FEATURE-manual-grader-approval-gate.md`). The
+//! Pure module that supports the human-approval gate (spec
+//! `00016-FEATURE-manual-grader-approval-gate`, in the project's specs dir:
+//! `fw project path --specs`). The
 //! harness/resolver layer drives IO; this module only:
 //!
 //! * Selects the next pending [`ManualGrader`] on a [`Task`] as a small

@@ -157,7 +157,7 @@ Rules while bucketing:
 
 ## STEP 7 — WRITE THE REPORT
 
-Output goes to `__FW_AUDITS_DIR__/<scope>.md` (create the directory if needed). Audits are committed, not gitignored — they are the historical record a later auditor re-verifies against.
+Output goes to `__FW_AUDITS_DIR__/<scope>.md` (create the directory if needed). Audits live in the project dir under the flywheel home, never in the repo tree — they are the historical record a later auditor re-verifies against.
 
 Few high-signal, evidence-bound findings beat a long report. Precision is the binding constraint: a finding you cannot tie to a concrete loop misfire with a re-runnable pointer is noise and is dropped, not padded in to look thorough. No action items, no fix proposals, no single-root-cause narrative, no counterfactuals, no un-cited claims.
 

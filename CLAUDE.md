@@ -45,7 +45,7 @@ Authoritative specs in `docs/` override any inferred behavior. Full index: `docs
 
 Curated docs (`cli`, `configuration`, `task-schema`, `loop`, `workflow`, `strategy`, `sandbox`, `held-out-gate`, `autopilot`, `team-mode`, `hub`, `hub-reference`, `hub-api`, `hub-security`, `hub-workflows`, `hub-internals`) are embedded in the binary for `fw docs` (`crates/flywheel/src/docs.rs`); a rebuild picks up edits.
 
-New feature work is specced under `.flywheel/specs/` (there is no `docs/roadmap.md`).
+New feature work is specced in the project's central specs dir (`fw project path --specs`, under `$FLYWHEEL_HOME/projects/<id>/specs/`; `fw spec export DIR` copies it out). There is no `docs/roadmap.md`.
 
 ## Commands
 

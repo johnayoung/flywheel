@@ -410,6 +410,11 @@ fn a_repo_project_id_shares_the_project_dir_but_not_the_trust_key() {
     let shared_dir = sandbox.flywheel_home().join("projects").join(shared);
     assert!(shared_dir.join("tasks/active").is_dir());
     assert!(shared_dir.join("meta.json").is_file());
+    // `fw project path` (what the fw-* skills resolve through) names it too.
+    assert_eq!(
+        sandbox.ok(&repo, &["project", "path", "--specs"]).trim(),
+        shared_dir.join("specs").to_str().unwrap()
+    );
     let trust = std::fs::read_to_string(sandbox.flywheel_home().join("trust.json")).unwrap();
     assert!(trust.contains(&local) && !trust.contains(shared), "{trust}");
     // prune keeps the shared dir while the repo declares it.

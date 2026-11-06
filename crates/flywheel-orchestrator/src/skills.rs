@@ -27,20 +27,23 @@
 //!
 //! The markdown lives as greenfield templates with `__FW_*__` placeholder
 //! tokens, embedded into this crate at compile time (see [`template`]) so
-//! the binary is self-contained; rendering binds them to the repo's actual
-//! settings (task directory, state directories, and -- for `fw-plan` -- the
-//! work-source kind, so a GitHub-source repo gets issue-creation
-//! instructions instead of task-file instructions).
+//! the binary is self-contained. Directory tokens render to `fw project
+//! path` shell expressions (`$(fw project path --specs)`, ...), so a skill
+//! never hard-codes a path: specs, tasks, audits, and logs resolve at use
+//! time to the cwd project's dirs under `$FLYWHEEL_HOME/projects/<id>/`.
+//! The one repo-specific binding is `fw-plan`'s work-source kind, so a
+//! GitHub-source repo gets issue-creation instructions instead of
+//! task-file instructions.
 //!
 //! Every generated `SKILL.md` carries [`MANAGED_MARKER`] right after its
-//! frontmatter. Re-running `flywheel init` (e.g. after changing the tasks
-//! directory or the work source) regenerates marker-bearing files in place;
+//! frontmatter. Re-running `flywheel init` (e.g. after changing the work
+//! source) regenerates marker-bearing files in place;
 //! a file whose marker was removed is treated as user-owned and left
 //! untouched. Names are `fw-`-prefixed precisely to avoid colliding with
 //! generic command names (`/task`, `/define`) a repo may already have.
 
 use crate::policy::WorkPolicy;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Installed skill names. The first five are the authoring pipeline, in
 /// pipeline order; `flywheel-ops` is the operability companion (driving the
@@ -64,8 +67,19 @@ pub const MANAGED_MARKER: &str = "<!-- managed-by: flywheel init -->";
 /// Default install root, relative to the repo root `init` runs in.
 pub const DEFAULT_SKILLS_ROOT: &str = ".claude/skills";
 
-const DEFAULT_TASKS_DIR: &str = ".flywheel/tasks";
-const DEFAULT_DB_PATH: &str = ".flywheel/flywheel.sqlite";
+/// The shell expression a rendered skill uses for each flywheel directory.
+///
+/// Skills never hard-code a path: every directory is resolved at use time
+/// through `fw project path`, so the rendered text is the same for every
+/// repo and always names the cwd project's dirs under `$FLYWHEEL_HOME`.
+pub const SPECS_DIR_EXPR: &str = "$(fw project path --specs)";
+pub const TASKS_DIR_EXPR: &str = "$(fw project path --tasks)";
+pub const LOGS_DIR_EXPR: &str = "$(fw project path --logs)";
+pub const AUDITS_DIR_EXPR: &str = "$(fw project path --root)/audits";
+pub const PROPOSALS_DIR_EXPR: &str = "$(fw project path --root)/proposals";
+pub const VERIFICATION_DIR_EXPR: &str = "$(fw project path --root)/verification";
+pub const HELD_OUT_DIR_EXPR: &str = "$(fw project path --held-out)";
+pub const WORKTREES_DIR_EXPR: &str = "$(fw project path --worktrees)";
 
 /// The skill templates, embedded at build time from the single canonical
 /// copy under this crate's `skill_templates/` directory.
@@ -121,20 +135,12 @@ impl SkillError {
     }
 }
 
-/// The repo-specific values a skill render binds to.
-///
-/// Derived from the effective work policy (see [`settings_from_policy`]);
-/// defaults mirror `flywheel init`'s own defaults so a policy-less repo
-/// renders identically to a default-answers init. [`state_root`]
-/// anchors the conventional sibling directories (`specs/`, `audits/`,
-/// `proposals/`): the tasks directory's parent when the directory layout is
-/// in use, else the store directory.
-///
-/// [`state_root`]: SkillRenderSettings::state_root
+/// The repo-specific values a skill render binds to: the work-source kind
+/// (and, for GitHub, its repo and label), which picks `fw-plan`'s delivery
+/// block. Directories are never bound here -- the rendered text resolves
+/// them through `fw project path` at use time (see [`SPECS_DIR_EXPR`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillRenderSettings {
-    pub tasks_dir: PathBuf,
-    pub db_path: PathBuf,
     pub source_kind: String,
     pub github_repo: Option<String>,
     pub github_label: Option<String>,
@@ -143,45 +149,10 @@ pub struct SkillRenderSettings {
 impl Default for SkillRenderSettings {
     fn default() -> Self {
         Self {
-            tasks_dir: PathBuf::from(DEFAULT_TASKS_DIR),
-            db_path: PathBuf::from(DEFAULT_DB_PATH),
             source_kind: "directory".to_owned(),
             github_repo: None,
             github_label: None,
         }
-    }
-}
-
-/// `Path.parent` with Python `pathlib` semantics: the containing directory, or
-/// the empty path (Python's `.`) for a bare name.
-fn parent_of(path: &Path) -> PathBuf {
-    path.parent().map(Path::to_path_buf).unwrap_or_default()
-}
-
-impl SkillRenderSettings {
-    pub fn state_root(&self) -> PathBuf {
-        if self.source_kind == "directory" {
-            parent_of(&self.tasks_dir)
-        } else {
-            parent_of(&self.db_path)
-        }
-    }
-
-    pub fn specs_dir(&self) -> PathBuf {
-        self.state_root().join("specs")
-    }
-
-    pub fn audits_dir(&self) -> PathBuf {
-        self.state_root().join("audits")
-    }
-
-    pub fn proposals_dir(&self) -> PathBuf {
-        self.state_root().join("proposals")
-    }
-
-    /// Mirrors the harness's telemetry root: `<db dir>/logs`.
-    pub fn logs_dir(&self) -> PathBuf {
-        parent_of(&self.db_path).join("logs")
     }
 }
 
@@ -191,14 +162,6 @@ pub fn settings_from_policy(policy: Option<&WorkPolicy>) -> SkillRenderSettings 
         return SkillRenderSettings::default();
     };
     SkillRenderSettings {
-        tasks_dir: policy
-            .tasks_dir
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_TASKS_DIR)),
-        db_path: policy
-            .db_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)),
         source_kind: policy.source_kind.clone(),
         github_repo: policy.github_repo.clone(),
         github_label: policy.github_label.clone(),
@@ -216,23 +179,6 @@ pub struct SkillInstallReport {
     pub created: Vec<PathBuf>,
     pub updated: Vec<PathBuf>,
     pub skipped: Vec<PathBuf>,
-}
-
-/// A path rendered the way Python's `str(Path(...))` prints it: `.`
-/// segments and empty components collapsed, no trailing separator, and the
-/// bare current directory as `.`.
-fn py_path_str(path: &Path) -> String {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        if !matches!(component, Component::CurDir) {
-            out.push(component.as_os_str());
-        }
-    }
-    if out.as_os_str().is_empty() {
-        ".".to_owned()
-    } else {
-        out.to_string_lossy().into_owned()
-    }
 }
 
 fn read_template(name: &str) -> Result<&'static str, SkillError> {
@@ -270,14 +216,14 @@ pub fn render_skill(name: &str, settings: &SkillRenderSettings) -> Result<String
         text = text.replace("__FW_DELIVERY__", &delivery_block(settings)?);
     }
     let replacements = [
-        ("__FW_TASKS_DIR__", py_path_str(&settings.tasks_dir)),
-        ("__FW_SPECS_DIR__", py_path_str(&settings.specs_dir())),
-        ("__FW_AUDITS_DIR__", py_path_str(&settings.audits_dir())),
-        (
-            "__FW_PROPOSALS_DIR__",
-            py_path_str(&settings.proposals_dir()),
-        ),
-        ("__FW_LOGS_DIR__", py_path_str(&settings.logs_dir())),
+        ("__FW_TASKS_DIR__", TASKS_DIR_EXPR),
+        ("__FW_SPECS_DIR__", SPECS_DIR_EXPR),
+        ("__FW_AUDITS_DIR__", AUDITS_DIR_EXPR),
+        ("__FW_PROPOSALS_DIR__", PROPOSALS_DIR_EXPR),
+        ("__FW_LOGS_DIR__", LOGS_DIR_EXPR),
+        ("__FW_VERIFICATION_DIR__", VERIFICATION_DIR_EXPR),
+        ("__FW_HELD_OUT_DIR__", HELD_OUT_DIR_EXPR),
+        ("__FW_WORKTREES_DIR__", WORKTREES_DIR_EXPR),
     ];
     for (token, value) in &replacements {
         text = text.replace(token, value);
@@ -336,12 +282,24 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn settings_with_tasks_dir(tasks_dir: &str) -> SkillRenderSettings {
+    fn github_settings() -> SkillRenderSettings {
         SkillRenderSettings {
-            tasks_dir: PathBuf::from(tasks_dir),
-            ..SkillRenderSettings::default()
+            source_kind: "github".to_owned(),
+            github_repo: Some("octo/widgets".to_owned()),
+            github_label: Some("flywheel".to_owned()),
         }
     }
+
+    /// The repo-tree paths no rendered skill may name.
+    const HARD_CODED: [&str; 7] = [
+        ".flywheel/specs",
+        ".flywheel/tasks",
+        ".flywheel/flywheel.sqlite",
+        ".flywheel/verification",
+        ".flywheel/audits",
+        ".flywheel/proposals",
+        ".flywheel/logs",
+    ];
 
     // --- rendering ----------------------------------------------------------
 
@@ -358,21 +316,38 @@ mod tests {
     }
 
     #[test]
-    fn render_binds_default_paths() {
+    fn render_resolves_dirs_through_fw_project_path() {
         let settings = SkillRenderSettings::default();
         let plan = render_skill("fw-plan", &settings).unwrap();
-        assert!(plan.contains(".flywheel/tasks/active/"));
-        assert!(plan.contains(".flywheel/specs/"));
+        assert!(plan.contains("$(fw project path --tasks)/active/"));
+        assert!(plan.contains("$(fw project path --specs)/"));
         let spec = render_skill("fw-spec", &settings).unwrap();
-        assert!(spec.contains(".flywheel/specs/NNNNN-FEATURE-<name>.md"));
+        assert!(spec.contains("$(fw project path --specs)/NNNNN-FEATURE-<name>.md"));
+        assert!(spec.contains("$(fw project path --specs)/archive/[0-9]*-FEATURE-*.md"));
         let retro = render_skill("fw-retro", &settings).unwrap();
-        assert!(retro.contains(".flywheel/audits/"));
-        assert!(retro.contains(".flywheel/logs/runs/"));
+        assert!(retro.contains("$(fw project path --root)/audits/"));
+        assert!(retro.contains("$(fw project path --logs)/runs/"));
         let improve = render_skill("fw-improve", &settings).unwrap();
-        assert!(improve.contains(".flywheel/proposals/"));
+        assert!(improve.contains("$(fw project path --root)/proposals/"));
         let verify = render_skill("fw-verify", &settings).unwrap();
-        assert!(verify.contains(".flywheel/tasks/active/"));
-        assert!(verify.contains(".flywheel/specs/"));
+        assert!(verify.contains("$(fw project path --tasks)/active/"));
+        assert!(verify.contains("$(fw project path --specs)/"));
+        assert!(verify.contains("$(fw project path --root)/verification/<spec>/"));
+        assert!(verify.contains("$(fw project path --held-out)"));
+        let ops = render_skill("flywheel-ops", &settings).unwrap();
+        assert!(ops.contains("$(fw project path --worktrees)"));
+    }
+
+    #[test]
+    fn no_rendered_skill_hard_codes_a_repo_state_path() {
+        for settings in [SkillRenderSettings::default(), github_settings()] {
+            for name in SKILL_NAMES {
+                let text = render_skill(name, &settings).unwrap();
+                for path in HARD_CODED {
+                    assert!(!text.contains(path), "{name} names {path}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -404,22 +379,8 @@ mod tests {
     }
 
     #[test]
-    fn render_binds_custom_tasks_dir() {
-        let text = render_skill("fw-plan", &settings_with_tasks_dir("work/tasks")).unwrap();
-        assert!(text.contains("work/tasks/active/"));
-        assert!(!text.contains(".flywheel/tasks"));
-        assert!(text.contains("work/specs/"));
-    }
-
-    #[test]
     fn render_github_source_swaps_delivery_block() {
-        let settings = SkillRenderSettings {
-            source_kind: "github".to_owned(),
-            github_repo: Some("octo/widgets".to_owned()),
-            github_label: Some("flywheel".to_owned()),
-            ..SkillRenderSettings::default()
-        };
-        let text = render_skill("fw-plan", &settings).unwrap();
+        let text = render_skill("fw-plan", &github_settings()).unwrap();
         assert!(text.contains("gh issue create"));
         assert!(text.contains("octo/widgets"));
         assert!(text.contains("WORK ITEMS ARE GITHUB ISSUES"));
@@ -436,7 +397,6 @@ mod tests {
             source_kind: "github".to_owned(),
             github_repo: Some("octo/widgets".to_owned()),
             github_label: None,
-            ..SkillRenderSettings::default()
         };
         let text = render_skill("fw-plan", &settings).unwrap();
         assert!(!text.contains("gh issue create"));
@@ -464,43 +424,21 @@ mod tests {
     }
 
     #[test]
-    fn settings_from_policy_binds_policy_paths() {
-        let policy = WorkPolicy {
-            source_kind: "directory".to_owned(),
-            tasks_dir: Some(PathBuf::from("custom/tasks")),
-            db_path: Some(PathBuf::from("custom/state.sqlite")),
-            ..WorkPolicy::default()
-        };
-        let settings = settings_from_policy(Some(&policy));
-        assert_eq!(settings.tasks_dir, PathBuf::from("custom/tasks"));
-        assert_eq!(settings.specs_dir(), PathBuf::from("custom/specs"));
-        assert_eq!(settings.logs_dir(), PathBuf::from("custom/logs"));
-        assert_eq!(
-            settings_from_policy(None).tasks_dir,
-            PathBuf::from(".flywheel/tasks")
-        );
-    }
-
-    #[test]
-    fn settings_for_tracker_source_anchor_on_db_dir() {
+    fn settings_from_policy_binds_the_source() {
         let policy = WorkPolicy {
             source_kind: "github".to_owned(),
             github_repo: Some("octo/widgets".to_owned()),
             github_label: Some("flywheel".to_owned()),
+            tasks_dir: Some(PathBuf::from("custom/tasks")),
             db_path: Some(PathBuf::from("state/flywheel.sqlite")),
             ..WorkPolicy::default()
         };
-        let settings = settings_from_policy(Some(&policy));
-        assert_eq!(settings.specs_dir(), PathBuf::from("state/specs"));
-        assert_eq!(settings.audits_dir(), PathBuf::from("state/audits"));
-    }
-
-    #[test]
-    fn bare_tasks_dir_anchors_siblings_at_the_current_directory() {
-        let settings = settings_with_tasks_dir("tasks");
-        assert_eq!(py_path_str(&settings.specs_dir()), "specs");
-        assert_eq!(py_path_str(Path::new("./work/tasks/")), "work/tasks");
-        assert_eq!(py_path_str(Path::new(".")), ".");
+        assert_eq!(settings_from_policy(Some(&policy)), github_settings());
+        assert_eq!(settings_from_policy(None), SkillRenderSettings::default());
+        // A policy's paths never reach the render: dirs resolve at use time.
+        let text = render_skill("fw-retro", &settings_from_policy(Some(&policy))).unwrap();
+        assert!(!text.contains("custom/tasks"));
+        assert!(!text.contains("state/"));
     }
 
     // --- install / regenerate semantics -------------------------------------
@@ -517,16 +455,14 @@ mod tests {
             assert!(root.join(name).join("SKILL.md").is_file());
         }
 
-        let second =
-            install_skills(&root, &settings_with_tasks_dir("work/tasks"), &SKILL_NAMES).unwrap();
+        let second = install_skills(&root, &github_settings(), &SKILL_NAMES).unwrap();
         assert!(second.created.is_empty());
         assert_eq!(second.updated.len(), SKILL_NAMES.len());
         let plan = std::fs::read_to_string(root.join("fw-plan").join("SKILL.md")).unwrap();
-        assert!(plan.contains("work/tasks/active/"));
+        assert!(plan.contains("gh issue create"));
 
         // A same-settings re-run still reports every managed file as updated.
-        let third =
-            install_skills(&root, &settings_with_tasks_dir("work/tasks"), &SKILL_NAMES).unwrap();
+        let third = install_skills(&root, &github_settings(), &SKILL_NAMES).unwrap();
         assert_eq!(third.updated.len(), SKILL_NAMES.len());
     }
 
@@ -541,8 +477,7 @@ mod tests {
             .replace(&format!("{MANAGED_MARKER}\n"), "");
         std::fs::write(&target, &owned).unwrap();
 
-        let report =
-            install_skills(&root, &settings_with_tasks_dir("work/tasks"), &SKILL_NAMES).unwrap();
+        let report = install_skills(&root, &github_settings(), &SKILL_NAMES).unwrap();
         assert!(report.skipped.contains(&target));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), owned);
         assert_eq!(report.updated.len(), SKILL_NAMES.len() - 1);

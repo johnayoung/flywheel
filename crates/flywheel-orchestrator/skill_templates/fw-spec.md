@@ -171,7 +171,7 @@ Ask: **does this feature change the verification surface itself** — the tests,
 
 ## STEP 6: WRITE THE SPEC
 
-Specs live at `__FW_SPECS_DIR__/NNNNN-FEATURE-<name>.md`. Pick the next sequence number:
+Specs live at `__FW_SPECS_DIR__/NNNNN-FEATURE-<name>.md`: the cwd project's specs dir under the flywheel home, never the repo tree (`fw project path --specs` prints it; `fw spec export DIR` copies the tree out for anyone who wants specs committed). Pick the next sequence number:
 
 ```bash
 ls __FW_SPECS_DIR__/[0-9]*-FEATURE-*.md __FW_SPECS_DIR__/archive/[0-9]*-FEATURE-*.md 2>/dev/null \

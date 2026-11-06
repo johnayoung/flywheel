@@ -15,7 +15,8 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Setup | `fw init` | Scaffold the legacy `.flywheel/` and `flywheel.toml` (not read by default; see [configuration.md](configuration.md#legacy-layout)) |
 | Hub | `fw hub` server: `start` / `stop` / `upgrade` / `status` / `logs` / `serve` / `install-service` / `doctor`; access: `open` / `url` / `token` / `tls` / `peer` / `machine` / `share`; sessions: `ls` / `new` / `send` / `read` / `wait` / `attach` / `kill` / `relaunch` / `explain` / `import` / `template` / `queue` / `broadcast` / `conversations` / `account`; output: `commands` / `search` / `activity` / `digest` / `record`; git: `review` / `merge` / `pr` / `handoff` / `ask-review` / `fanout` / `autopilot`; settings: `config` / `plugin` / `perms`; hooks only: `report` | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
 | One-shot | `fw exec [PROMPT]` | Run one agent call from any project: no tasks, store, worktree, or config |
-| Projects | `fw project ls [--json]` / `prune` / `relink [PATH]` | The home's project registry (see [Projects and the home](#projects-and-the-home)) |
+| Projects | `fw project ls [--json]` / `prune` / `relink [PATH]` / `path [FLAG]` | The home's project registry and the cwd project's dirs (see [Projects and the home](#projects-and-the-home)) |
+| Specs | `fw spec ls [--json]` / `export DIR [--force]` | The cwd project's central specs; copy them out (see [Specs](#specs)) |
 | Config | `fw config [--json]` / `fw trust [--revoke]` | The effective config with sources; approve the repo's `.flywheel.toml` (see [Config and trust](#config-and-trust)) |
 | Store | `fw db upgrade [--db PATH] [--policy FILE]` | Migrate the store in place to this build's schema (see [The store](#the-store)) |
 
@@ -76,6 +77,16 @@ Every byte flywheel writes lives under `$FLYWHEEL_HOME` (default `~/.flywheel`):
 | `project ls [--json]` | Every project: `<id>  <path>` lines; `--json` prints `[{"id","path"}]`. |
 | `project prune` | Remove project dirs whose recorded repo no longer exists or no longer carries that id; prints `removed <id> (<path>): <reason>` per dir. |
 | `project relink [PATH]` | Point the cwd repo's id at an existing project dir (PATH: the dir or its id; bare: the single project recording this repo's path). Recovery after a re-clone or a lost key. |
+| `project path [FLAG]` | Print the absolute dir of the cwd project (bound to a trusted `project_id`), creating it: `--root` (default), `--specs`, `--tasks`, `--logs`, `--worktrees`, `--held-out`. Skills and scripts use this instead of hard-coding paths: `ls "$(fw project path --specs)"`. Exit 2 on an unknown flag, 1 outside a git repo. |
+
+### Specs
+
+Specs live centrally in `$FLYWHEEL_HOME/projects/<id>/specs/` (with `archive/`), never in the repo; the `fw-*` skills read and write them through `fw project path --specs`.
+
+| Verb | What it does |
+|---|---|
+| `spec ls [--json]` | Every spec file relative to the specs dir, sorted; `--json` prints `[{"path","archived"}]`. |
+| `spec export DIR [--force]` | Copy the specs tree (including `archive/`) into DIR byte-for-byte, creating DIR (relative DIR: against the working dir). Prints `wrote <path>` per file and a summary; identical files are left alone. A differing existing file aborts before any write (exit 1) unless `--force`; DIR inside the specs dir is refused. |
 
 ## The store
 

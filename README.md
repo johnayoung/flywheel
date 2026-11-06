@@ -30,7 +30,7 @@ The worker drives the agent through its CLI (`claude`, or `codex` via `[agent]`)
 
 ## Authoring skills
 
-Tasks are the input to the loop; flywheel ships the spec-driven pipeline that produces them as Claude Code skills (five pipeline skills plus an operator runbook). `flywheel init` installs them into the repo's `.claude/skills/` (prompted by default in an interactive run; `--skills` / `--no-skills` answer non-interactively), rendered for the repo's work policy (`flywheel.toml` — `/fw-plan` swaps a task-directory vs GitHub-issues delivery section by work source):
+Tasks are the input to the loop; flywheel ships the spec-driven pipeline that produces them as Claude Code skills (five pipeline skills plus an operator runbook). `flywheel init` installs them into the repo's `.claude/skills/` (prompted by default in an interactive run; `--skills` / `--no-skills` answer non-interactively), rendered for the repo's work source (`/fw-plan` swaps a task-directory vs GitHub-issues delivery section):
 
 - **`/fw-spec`** — interview an idea into ungameable, end-state success criteria, written as a numbered spec.
 - **`/fw-plan`** — compile a spec or request into right-sized tasks, each spined on the strongest reward-hack-resistant grader the worker can run out-of-band.
@@ -38,6 +38,8 @@ Tasks are the input to the loop; flywheel ships the spec-driven pipeline that pr
 - **`/fw-retro`** — forensic audit of how the loop executed a phase; every finding carries a re-runnable CLI pointer and stops at diagnosis.
 - **`/fw-improve`** — turn cited retro findings into ranked, scoped proposals, each ending in a handoff (`/fw-spec`, `/fw-plan`, or accept).
 - **`/flywheel-ops`** — operate the running loop: start and drain the worker, read run state from grader receipts, recover parked or stranded work.
+
+Specs, tasks, audits, and proposals live in the project dir, never the repo: the skills resolve each path with `fw project path --specs|--tasks|--root`, and `fw spec export DIR` copies the specs out if you want them committed.
 
 They are project-agnostic templates: re-running `flywheel init` regenerates the managed files and leaves any you have edited untouched. Each skill's cited design rationale lives in [`docs/research/`](docs/research/).
 

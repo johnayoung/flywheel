@@ -135,7 +135,7 @@ Present the proposals ranked by leverage (highest first), each a single paragrap
 
 ## STEP 8 -- WRITE THE PROPOSALS DOC
 
-Output goes to `__FW_PROPOSALS_DIR__/<scope>.md` (or `__FW_PROPOSALS_DIR__/cross-scope-<date>.md` for an `all` run). Committed, not gitignored -- it is the auditable record that turns a null result into a documented decision rather than a silent gap, the one a later operator re-verifies against.
+Output goes to `__FW_PROPOSALS_DIR__/<scope>.md` (or `__FW_PROPOSALS_DIR__/cross-scope-<date>.md` for an `all` run). Kept in the project dir under the flywheel home, never in the repo tree -- it is the auditable record that turns a null result into a documented decision rather than a silent gap, the one a later operator re-verifies against.
 
 ```markdown
 # Improvement proposals: <scope>

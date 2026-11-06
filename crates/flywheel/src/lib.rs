@@ -24,6 +24,7 @@ pub mod session;
 pub mod session_screen;
 pub mod slash;
 pub mod snapshot;
+pub mod spec;
 pub mod tui;
 pub mod worker_supervisor;
 

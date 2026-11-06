@@ -43,6 +43,7 @@ impl Env {
             .env("HOME", &self.root)
             .env("PS1", "$ ")
             .env_remove("XDG_STATE_HOME")
+            .env_remove("FLYWHEEL_HOME")
             .env_remove("INVOCATION_ID")
             .output()
             .unwrap()

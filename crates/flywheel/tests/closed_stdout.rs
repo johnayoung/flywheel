@@ -57,6 +57,7 @@ fn hub_verbs_exit_quietly_when_stdout_closes() {
             .env("SHELL", "/bin/sh")
             .env("HOME", &root)
             .env_remove("XDG_STATE_HOME")
+            .env_remove("FLYWHEEL_HOME")
             .env_remove("INVOCATION_ID")
             .env_remove("FW_HUB_TOKEN")
             .output()
@@ -128,6 +129,7 @@ fn hub_verbs_exit_quietly_when_stdout_closes() {
                 .args(&argv)
                 .env("HOME", &root)
                 .env_remove("XDG_STATE_HOME")
+                .env_remove("FLYWHEEL_HOME")
                 .env_remove("FW_HUB_TOKEN")
                 .output()
                 .unwrap();
@@ -146,6 +148,7 @@ fn hub_verbs_exit_quietly_when_stdout_closes() {
             .arg(&script)
             .env("HOME", &root)
             .env_remove("XDG_STATE_HOME")
+            .env_remove("FLYWHEEL_HOME")
             .env_remove("FW_HUB_TOKEN")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

@@ -52,7 +52,8 @@ impl Env {
             .env("CODEX_HOME", self.root.join("codex"))
             .env("FW_BIN", env!("CARGO_BIN_EXE_fw"))
             .env("PS1", "$ ")
-            .env_remove("XDG_STATE_HOME");
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("FLYWHEEL_HOME");
         command
     }
 

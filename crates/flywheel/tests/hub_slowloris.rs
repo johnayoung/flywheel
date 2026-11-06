@@ -88,6 +88,7 @@ impl Env {
             .env("PATH", std::env::join_paths(paths).unwrap())
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env_remove("XDG_STATE_HOME")
+            .env_remove("FLYWHEEL_HOME")
             .env_remove("INVOCATION_ID")
             .env_remove("FW_HUB_TOKEN");
         command

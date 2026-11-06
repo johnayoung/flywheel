@@ -562,8 +562,9 @@ fn write_service(args: &InstallServiceArgs, out: &mut dyn Write) -> Result<(), S
     // Its output goes to the journal: no one-time login code there.
     argv.push("--no-login-code".to_owned());
     // User services start with a minimal environment: carry over what
-    // sessions need to find the shell and the agent CLIs.
-    let env: Vec<(String, String)> = ["PATH", "SHELL"]
+    // sessions need to find the shell, the agent CLIs, and the flywheel
+    // home the `fw` verbs they run resolve.
+    let env: Vec<(String, String)> = ["PATH", "SHELL", "FLYWHEEL_HOME"]
         .into_iter()
         .filter_map(|name| {
             std::env::var(name)

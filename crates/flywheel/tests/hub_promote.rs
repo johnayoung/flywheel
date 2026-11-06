@@ -90,6 +90,7 @@ impl Env {
             .env("FANOUT_ROOT", &self.root)
             .envs(IDENTITY)
             .env_remove("XDG_STATE_HOME")
+            .env_remove("FLYWHEEL_HOME")
             .env_remove("FW_HUB_TOKEN")
             .env_remove("FLYWHEEL_PG_DSN")
             .env_remove("DATABASE_URL");

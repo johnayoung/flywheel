@@ -125,6 +125,8 @@ const MAX_PASTE: usize = 64 * 1024;
 pub const ENV_ALLOW: &[&str] = &[
     "PATH",
     "HOME",
+    // A plugin that runs `fw` resolves the same flywheel home as the hub.
+    "FLYWHEEL_HOME",
     "USER",
     "LOGNAME",
     "SHELL",

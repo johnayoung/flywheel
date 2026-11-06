@@ -70,6 +70,7 @@ impl Fake {
             .args(args)
             .current_dir(cwd)
             .env("HOME", self.path())
+            .env_remove("FLYWHEEL_HOME")
             .env("FAKE_DIR", self.path())
             .env("FAKE_SCENARIO", scenario)
             .stdin(if stdin.is_some() {
@@ -251,6 +252,7 @@ fn missing_agent_executable_exits_one_with_a_failure() {
         .arg("p")
         .current_dir(tmp.path())
         .env("HOME", tmp.path())
+        .env_remove("FLYWHEEL_HOME")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
@@ -352,6 +354,7 @@ fn sigterm_cancels_the_run_and_kills_the_agent_group() {
         .args(["--json", "p"])
         .current_dir(fake.path())
         .env("HOME", fake.path())
+        .env_remove("FLYWHEEL_HOME")
         .env("FAKE_DIR", fake.path())
         .env("FAKE_SCENARIO", "tree")
         .stdin(Stdio::null())

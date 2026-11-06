@@ -268,8 +268,8 @@ struct ReportArgs {
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct StateDirArg {
-    /// State directory [default: $XDG_STATE_HOME/flywheel/hub or
-    /// ~/.local/state/flywheel/hub].
+    /// State directory [default: $FLYWHEEL_HOME/hub, i.e.
+    /// ~/.flywheel/hub].
     #[arg(long, value_name = "DIR")]
     pub(crate) state_dir: Option<PathBuf>,
 }
@@ -543,8 +543,9 @@ impl HubArgs {
 pub(crate) fn resolve_state_dir(arg: &StateDirArg) -> Result<PathBuf, String> {
     match &arg.state_dir {
         Some(dir) => Ok(dir.clone()),
-        None => default_state_dir()
-            .ok_or_else(|| "cannot resolve a state dir: set HOME or pass --state-dir".to_owned()),
+        None => default_state_dir().ok_or_else(|| {
+            "cannot resolve a state dir: set FLYWHEEL_HOME or HOME, or pass --state-dir".to_owned()
+        }),
     }
 }
 

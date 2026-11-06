@@ -54,6 +54,7 @@ impl Env {
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("PS1", "$ ")
             .env_remove("XDG_STATE_HOME")
+            .env_remove("FLYWHEEL_HOME")
             .env_remove("INVOCATION_ID");
         command
     }

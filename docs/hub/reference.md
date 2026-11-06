@@ -7,7 +7,7 @@ Every `fw hub` verb and flag and the hub's files (`docs_drift.rs` checks). Front
 - `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; `activity` also takes names its journal or a machine knows).
 - A closed output pipe (`| head -1`) ends a verb quietly, exit 0.
 - Exit codes: 0 ok, 1 failed, 2 bad usage/config, 3 no hub running (`no hub is running for state dir D`), 4 handoff refused as incompatible, 5 hub busy (retry). `doctor`, `tls`, `config` work without a hub (exit 0) and say so.
-- Every verb but `report` takes `--state-dir DIR` (default `$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub`).
+- Every verb but `report` takes `--state-dir DIR` (default `$FLYWHEEL_HOME/hub`).
 - `{remote}` = `[--url URL] [--token T] [--fingerprint SHA256]`: a hub elsewhere; prefer `FW_HUB_TOKEN` (argv is world-readable).
 - `{machine}` = `[--machine NAME]`: a machine registered on that hub, via its proxy; `{where}` = `{remote} {machine}`.
 - `{serve}` = the [serve flags](#serve-flags).
@@ -411,6 +411,7 @@ Also: `F2` / double-click renames and `Delete` closes a focused sidebar row.
 
 | Variable | |
 |---|---|
+| `FLYWHEEL_HOME` | default `~/.flywheel` |
 | `FW_HUB_TOKEN` | token for `{remote}` verbs |
 | `FW_HUB_MACHINE_SECRET` | `machine add` secret |
 | `FLYWHEEL_PG_DSN`, `DATABASE_URL` | the Flywheel panel's Postgres DSN |

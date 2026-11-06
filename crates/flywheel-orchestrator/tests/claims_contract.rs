@@ -1347,9 +1347,12 @@ fn concurrent_acquire_on_one_file_admits_exactly_one_winner() {
             let barrier = barrier.clone();
             thread::spawn(move || {
                 // Each worker bootstraps its own connection concurrently, then
-                // races the acquire from the barrier.
-                let store = SqliteClaimStore::open(&path).unwrap();
+                // races the acquire from the barrier. The barrier is reached
+                // before a failed open panics, so a failure fails the test
+                // instead of stranding the other workers at the barrier.
+                let store = SqliteClaimStore::open(&path);
                 barrier.wait();
+                let store = store.unwrap();
                 let won = store
                     .acquire_claim("task-hot", &format!("worker-{i}"), t(0), 30.0, &none())
                     .unwrap()

@@ -1567,8 +1567,8 @@ impl SqliteClaimStore {
         path: impl AsRef<Path>,
         partition: &str,
     ) -> Result<Self, ClaimStoreError> {
-        let conn = Connection::open(path.as_ref())?;
-        with_locked_retry(|| bootstrap(&conn))?;
+        let mut conn = Connection::open(path.as_ref())?;
+        with_locked_retry(|| bootstrap(&mut conn))?;
         Ok(Self {
             conn: Mutex::new(conn),
             partition: partition.to_owned(),
@@ -1578,8 +1578,8 @@ impl SqliteClaimStore {
     /// A private in-memory database (the `":memory:"` path), bound to
     /// [`DEFAULT_PARTITION`].
     pub fn in_memory() -> Result<Self, ClaimStoreError> {
-        let conn = Connection::open_in_memory()?;
-        bootstrap(&conn)?;
+        let mut conn = Connection::open_in_memory()?;
+        bootstrap(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             partition: DEFAULT_PARTITION.to_owned(),
@@ -1690,23 +1690,43 @@ fn seed_version(conn: &Connection) -> Result<(), rusqlite::Error> {
 /// is created at the current version, a current one opens, and anything
 /// else is refused -- a behind store names `fw db upgrade`; nothing is
 /// migrated implicitly.
-fn bootstrap(conn: &Connection) -> Result<(), ClaimStoreError> {
+fn bootstrap(conn: &mut Connection) -> Result<(), ClaimStoreError> {
     // busy_timeout FIRST: the schema script is this connection's first
     // contended write, and N workers bootstrapping one fresh store at once
     // would otherwise hand every loser an instant "database is locked".
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-    match recorded_version(conn, ORCH_VERSION_TABLE)? {
+    // A store whose sentinel already records the current version was
+    // created whole (see below), so re-running the idempotent DDL takes no
+    // write lock: an open of an existing store never waits on a writer.
+    if recorded_version(conn, ORCH_VERSION_TABLE)?
+        == Recorded::Version(Some(CURRENT_ORCH_SCHEMA_VERSION))
+    {
+        conn.execute_batch(SCHEMA_SQL)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        return Ok(());
+    }
+    // journal_mode cannot change inside a transaction (and is persistent).
+    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+    // Everything else -- a fresh file above all -- runs the version check,
+    // the DDL, and the sentinel seed as ONE immediate transaction:
+    // concurrent openers of a fresh file serialize on the write lock, so
+    // none reads another's half-created schema (tables present, sentinel
+    // row not yet) and refuses it as a foreign store.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    match recorded_version(&tx, ORCH_VERSION_TABLE)? {
         Recorded::Missing => {
-            if any_table_exists(conn, &ORCH_PARTITIONED_TABLES)? {
+            if any_table_exists(&tx, &ORCH_PARTITIONED_TABLES)? {
                 return Err(OrchestratorSchemaError::new(None).into());
             }
         }
         Recorded::Version(Some(v)) if v == CURRENT_ORCH_SCHEMA_VERSION => {}
         Recorded::Version(observed) => return Err(OrchestratorSchemaError::new(observed).into()),
     }
-    conn.execute_batch(SCHEMA_SQL)?;
+    tx.execute_batch(&without_pragmas(SCHEMA_SQL))?;
+    seed_version(&tx)?;
+    tx.commit()?;
+    // A no-op inside a transaction, so it is set once the DDL committed.
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    seed_version(conn)?;
     Ok(())
 }
 

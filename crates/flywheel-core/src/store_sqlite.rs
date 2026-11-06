@@ -400,25 +400,52 @@ impl SqliteStore {
 
 fn bootstrap(conn: &mut Connection, busy_timeout: Duration) -> Result<(), StoreError> {
     conn.busy_timeout(busy_timeout).map_err(db)?;
+    // A store whose sentinel already records the current version was
+    // created whole (see below), so re-running the idempotent DDL takes no
+    // write lock: an open of an existing store never waits on a writer.
+    if recorded_version(conn, VERSION_TABLE).map_err(db)?
+        == Recorded::Version(Some(CURRENT_SCHEMA_VERSION))
+    {
+        conn.execute_batch(SCHEMA_SQL).map_err(db)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")
+            .map_err(db)?;
+        conn.execute_batch(APPEND_ONLY_TRIGGERS).map_err(db)?;
+        conn.execute_batch(SUPPLEMENTARY_INDEXES).map_err(db)?;
+        return Ok(());
+    }
+    // journal_mode cannot change inside a transaction; it is persistent, so
+    // setting it first (outside the bootstrap transaction) is idempotent.
+    conn.execute_batch("PRAGMA journal_mode = WAL;")
+        .map_err(db)?;
+    // Everything else -- a fresh file above all -- runs the version check
+    // and the DDL as ONE immediate transaction: concurrent openers of a
+    // fresh file serialize on the write lock, so none can read the
+    // half-created schema another is writing (partitioned tables present,
+    // sentinel not yet) and misread it as a foreign store.
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db)?;
     // Version pin BEFORE any DDL: the current DDL indexes the partition
     // column, which a behind store does not have yet. A fresh file (no core
     // table at all) is created at the current version; anything not at the
     // current version is refused (a behind store names the in-place
     // upgrade; there is no implicit migration on open).
-    match recorded_version(conn, VERSION_TABLE).map_err(db)? {
+    match recorded_version(&tx, VERSION_TABLE).map_err(db)? {
         Recorded::Missing => {
-            if any_table_exists(conn, &PARTITIONED_TABLES).map_err(db)? {
+            if any_table_exists(&tx, &PARTITIONED_TABLES).map_err(db)? {
                 return Err(StoreSchemaError::new(None).into());
             }
         }
         Recorded::Version(Some(v)) if v == CURRENT_SCHEMA_VERSION => {}
         Recorded::Version(observed) => return Err(StoreSchemaError::new(observed).into()),
     }
-    conn.execute_batch(SCHEMA_SQL).map_err(db)?;
+    tx.execute_batch(&without_pragmas(SCHEMA_SQL)).map_err(db)?;
+    tx.execute_batch(APPEND_ONLY_TRIGGERS).map_err(db)?;
+    tx.execute_batch(SUPPLEMENTARY_INDEXES).map_err(db)?;
+    tx.commit().map_err(db)?;
+    // A no-op inside a transaction, so it is set once the DDL committed.
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(db)?;
-    conn.execute_batch(APPEND_ONLY_TRIGGERS).map_err(db)?;
-    conn.execute_batch(SUPPLEMENTARY_INDEXES).map_err(db)?;
     Ok(())
 }
 
@@ -2175,6 +2202,33 @@ mod tests {
         .map(str::to_owned)
         .collect();
         assert_eq!(table_names(&store), expected);
+    }
+
+    /// Openers racing on one fresh file (a daemon creating its store while
+    /// the hub's monitor opens it) all bootstrap it: none reads another's
+    /// half-created schema as a foreign store.
+    #[test]
+    fn concurrent_openers_of_a_fresh_file_all_bootstrap_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..20 {
+            let path = dir.path().join(format!("race-{round}.db"));
+            let openers = 8;
+            let barrier = Arc::new(std::sync::Barrier::new(openers));
+            let handles: Vec<_> = (0..openers)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        SqliteStore::open(&path).map(|_| ())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let opened = handle.join().unwrap();
+                assert!(opened.is_ok(), "round {round}: {opened:?}");
+            }
+        }
     }
 
     #[test]

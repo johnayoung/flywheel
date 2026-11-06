@@ -142,6 +142,8 @@ Secrets live in the environment or your user `config.toml`, never in a committed
 
 Postgres TLS follows libpq: `sslmode` defaults to `prefer`; `verify-ca`/`verify-full` need `sslrootcert` (a PEM file, `~/.postgresql/root.crt`, or `system`). Example: `postgresql://u:p@db.example.com/app?sslmode=verify-full&sslrootcert=system`.
 
+Connections are bounded unless the DSN says otherwise: `connect_timeout` defaults to 10 s, and TCP keepalives (idle 30 s, interval 10 s, 3 probes) turn a vanished server into an error instead of a hang. Set `connect_timeout`, `keepalives_idle`, or `keepalives=0` in the DSN to override.
+
 ## What `fw init` does
 
 Writes nothing into the repo tree (beyond the `.git/config` project id): resolves the project, creates `$FLYWHEEL_HOME/config.toml` (every key commented) when missing, installs the fw-* skills under `$CLAUDE_CONFIG_DIR/skills` (`--no-skills` skips), runs the Postgres preflight when `store` is a DSN (`--provision`, `--allow-unverified`), detects a verify command (`Cargo.toml` -> `cargo test`, `package.json` test script -> `npm test`, pytest config -> `pytest`, `go.mod` -> `go test ./...`, Makefile `test:` -> `make test`), and prints a suggested `.flywheel.toml` to commit and `fw trust`.

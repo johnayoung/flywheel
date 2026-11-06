@@ -83,9 +83,12 @@ fn concurrent_acquire_across_connections_admits_exactly_one_winner() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 // Each worker opens (and bootstraps) its own connection
-                // concurrently, then races the acquire from the barrier.
-                let store = PostgresClaimStore::connect(&dsn, &schema).unwrap();
+                // concurrently, then races the acquire from the barrier. The
+                // barrier is reached before a failed open panics, so a
+                // failure fails the test instead of stranding the others.
+                let store = PostgresClaimStore::connect(&dsn, &schema);
                 barrier.wait();
+                let store = store.unwrap();
                 let won = store
                     .acquire_claim("task-hot", &format!("worker-{i}"), t(0), 30.0, &none())
                     .unwrap()

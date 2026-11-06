@@ -1430,3 +1430,41 @@ fn store_is_usable_and_droppable_inside_a_tokio_runtime() {
         });
     }
 }
+
+/// The fixture's own connections are bounded end to end: a peer that
+/// accepts the socket and then never answers the startup handshake (the
+/// case a TCP-level connect timeout cannot catch) is an error on time,
+/// not a test binary parked in a futex wait. No Docker needed.
+#[test]
+fn the_fixture_connect_to_a_silent_server_fails_within_its_bound() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let dsn = format!("postgresql://u:p@127.0.0.1:{port}/db");
+    let started = Instant::now();
+    let err = pg_container::connect_within(&dsn, Duration::from_secs(2))
+        .err()
+        .expect("nobody answers");
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(10), "took {took:?}");
+    assert!(err.contains("no answer from the server"), "{err}");
+    // Dropping the listener resets the abandoned attempt's socket.
+    drop(listener);
+}
+
+/// A closed port is refused at once with the driver's error.
+#[test]
+fn the_fixture_connect_to_a_closed_port_fails_at_once() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let dsn = format!("postgresql://u:p@127.0.0.1:{port}/db");
+    let started = Instant::now();
+    let err = pg_container::connect_within(&dsn, pg_container::HANDSHAKE_TIMEOUT)
+        .err()
+        .expect("the port is closed");
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(10), "took {took:?}");
+    assert!(err.contains("error connecting to server"), "{err}");
+}

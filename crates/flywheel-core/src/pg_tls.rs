@@ -32,6 +32,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use postgres::Client;
 use postgres::config::{Config, SslMode as DriverSslMode};
@@ -173,8 +174,40 @@ pub fn configure_with(
         .parse()
         .map_err(|err: postgres::Error| PgTlsError(format!("invalid connection string: {err}")))?;
     config.ssl_mode(plan.mode.driver());
+    apply_default_bounds(&mut config);
     let tls = MakeRustlsConnect::new(client_config(&plan)?);
     Ok((config, tls))
+}
+
+/// Bound on one TCP connect attempt when the DSN sets no
+/// `connect_timeout` (the driver's own default is to wait forever).
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Keepalive schedule when the DSN tunes none: a server that vanished
+/// without closing the socket (host down, network gone) surfaces as an
+/// error after about idle + interval * retries instead of a read that
+/// never returns.
+pub const DEFAULT_KEEPALIVES_IDLE: Duration = Duration::from_secs(30);
+pub const DEFAULT_KEEPALIVES_INTERVAL: Duration = Duration::from_secs(10);
+pub const DEFAULT_KEEPALIVES_RETRIES: u32 = 3;
+/// The driver's own idle default, i.e. "the DSN did not set it".
+const DRIVER_KEEPALIVES_IDLE: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Fill the connect timeout and keepalive schedule the DSN left at the
+/// driver's unbounded defaults; anything the DSN sets is kept, and
+/// `keepalives=0` stays off.
+fn apply_default_bounds(config: &mut Config) {
+    if config.get_connect_timeout().is_none() {
+        config.connect_timeout(DEFAULT_CONNECT_TIMEOUT);
+    }
+    let untuned = config.get_keepalives_idle() == DRIVER_KEEPALIVES_IDLE
+        && config.get_keepalives_interval().is_none()
+        && config.get_keepalives_retries().is_none();
+    if config.get_keepalives() && untuned {
+        config
+            .keepalives_idle(DEFAULT_KEEPALIVES_IDLE)
+            .keepalives_interval(DEFAULT_KEEPALIVES_INTERVAL)
+            .keepalives_retries(DEFAULT_KEEPALIVES_RETRIES);
+    }
 }
 
 /// The driver config for `dsn` with the libpq TLS keywords stripped, for
@@ -708,6 +741,57 @@ mod tests {
 
     fn no_env(_: &str) -> Option<String> {
         None
+    }
+
+    #[test]
+    fn an_untuned_dsn_gets_a_connect_timeout_and_keepalives() {
+        let (config, _) =
+            configure_with("postgresql://u:p@db/app?sslmode=disable", &no_env).unwrap();
+        assert_eq!(config.get_connect_timeout(), Some(&DEFAULT_CONNECT_TIMEOUT));
+        assert!(config.get_keepalives());
+        assert_eq!(config.get_keepalives_idle(), DEFAULT_KEEPALIVES_IDLE);
+        assert_eq!(
+            config.get_keepalives_interval(),
+            Some(DEFAULT_KEEPALIVES_INTERVAL)
+        );
+        assert_eq!(
+            config.get_keepalives_retries(),
+            Some(DEFAULT_KEEPALIVES_RETRIES)
+        );
+    }
+
+    #[test]
+    fn bounds_the_dsn_sets_are_kept() {
+        let (config, _) = configure_with(
+            "postgresql://u:p@db/app?sslmode=disable&connect_timeout=3&keepalives_idle=90",
+            &no_env,
+        )
+        .unwrap();
+        assert_eq!(config.get_connect_timeout(), Some(&Duration::from_secs(3)));
+        assert_eq!(config.get_keepalives_idle(), Duration::from_secs(90));
+        assert_eq!(config.get_keepalives_interval(), None);
+        let (config, _) =
+            configure_with("host=db user=u sslmode=disable keepalives=0", &no_env).unwrap();
+        assert!(!config.get_keepalives(), "keepalives=0 stays off");
+        assert_eq!(config.get_connect_timeout(), Some(&DEFAULT_CONNECT_TIMEOUT));
+    }
+
+    /// A server that never answers the SYN (TEST-NET-1 is unroutable: the
+    /// packets are dropped, or the network is reported unreachable at
+    /// once) is an error within the default connect timeout, not the
+    /// minutes of kernel SYN retries an unbounded connect would wait.
+    #[test]
+    fn an_unanswered_connect_fails_within_the_default_timeout() {
+        let started = std::time::Instant::now();
+        let err = connect("postgresql://u:p@192.0.2.1:5432/app?sslmode=disable")
+            .err()
+            .expect("nothing answers on TEST-NET-1");
+        let took = started.elapsed();
+        assert!(
+            took < DEFAULT_CONNECT_TIMEOUT + Duration::from_secs(10),
+            "took {took:?}: {err}"
+        );
+        assert!(matches!(err, ConnectError::Postgres(_)), "{err}");
     }
 
     #[test]

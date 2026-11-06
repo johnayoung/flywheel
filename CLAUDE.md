@@ -18,6 +18,8 @@ A Cargo workspace of seven crates under `crates/`, each with its source in `crat
 
 Cross-task concepts (prerequisites/DAG, scheduling, claims) live in the orchestrator, never in core. When adding to core, ask: would a single `run_task(task, lifecycle, store)` invocation — one task, no scheduler — need it? If not, it belongs above the line.
 
+The flywheel home (`$FLYWHEEL_HOME`, default `~/.flywheel`) and project identity (`flywheel.projectid` in the repo's `.git/config`) live in `crates/flywheel-orchestrator/src/home.rs`, the single source for every home path; `flywheel-hub` mirrors only its default state dir (`$FLYWHEEL_HOME/hub`), pinned by a test in the `flywheel` crate. Without a `flywheel.toml`, store verbs default to `$FLYWHEEL_HOME/projects/<id>/`.
+
 Plugins (stores, work sources, submit strategies, agent adapters) are compile-time registries (`crates/*/src/*registry.rs`); there is no runtime plugin discovery.
 
 Authoritative specs in `docs/` override any inferred behavior. Full index: `docs/README.md`.

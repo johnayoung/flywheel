@@ -552,8 +552,10 @@ pub fn run_main(argv: &[String], host: &dyn TriageHost) -> i32 {
 
     // Resolve and validate the policy BEFORE touching git or the gh seam: a
     // malformed [triage] value must exit 2 having issued no GitHub write and
-    // no git command (spec 00082, the write-free guarantee).
-    let policy = match load_effective_policy(host.policy_path().as_deref()) {
+    // no git command (spec 00082, the write-free guarantee). Triage needs a
+    // github [source], which only a policy file can name, so the home
+    // project's built-in policy is never consulted.
+    let policy = match crate::workflow::load_policy_file(host.policy_path().as_deref()) {
         Ok(policy) => policy,
         Err(err) => {
             stderr(&format!("flywheel triage: policy error: {err}"));

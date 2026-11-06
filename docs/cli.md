@@ -15,6 +15,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Setup | `fw init` | Scaffold `.flywheel/` and a `flywheel.toml` work policy |
 | Hub | `fw hub` server: `start` / `stop` / `upgrade` / `status` / `logs` / `serve` / `install-service` / `doctor`; access: `open` / `url` / `token` / `tls` / `peer` / `machine` / `share`; sessions: `ls` / `new` / `send` / `read` / `wait` / `attach` / `kill` / `relaunch` / `explain` / `import` / `template` / `queue` / `broadcast` / `conversations` / `account`; output: `commands` / `search` / `activity` / `digest` / `record`; git: `review` / `merge` / `pr` / `handoff` / `ask-review` / `fanout` / `autopilot`; settings: `config` / `plugin` / `perms`; hooks only: `report` | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
 | One-shot | `fw exec [PROMPT]` | Run one agent call from any project: no tasks, store, worktree, or config |
+| Projects | `fw project ls [--json]` / `prune` / `relink [PATH]` | The home's project registry (see [Projects and the home](#projects-and-the-home)) |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.
 
@@ -34,17 +35,35 @@ The router (`route`, `crates/flywheel/src/cli.rs`) dispatches by the first argv 
 
 ### Resolution precedence
 
-Every delegated verb resolves its inputs the same way: **explicit flag wins, then `flywheel.toml` policy, then a built-in default.**
+Every delegated verb resolves its inputs the same way: **explicit flag wins, then `flywheel.toml` policy, then the home project's built-in default.** With no `flywheel.toml`, every default lives under `$FLYWHEEL_HOME/projects/<id>/` (see [Projects and the home](#projects-and-the-home)); a directory outside a git repo is refused unless explicit flags name every path the verb reads.
 
 | Input | Explicit flag | Policy key | Built-in default | Anchor |
 |---|---|---|---|---|
-| Policy | `--policy FILE` | auto-detect `flywheel.toml` in cwd, else the nearest parent (re-anchors cwd there) | none (`.flywheel/` defaults) | `load_effective_policy` |
-| DB path | `--db PATH` | `[paths] db` | `.flywheel/flywheel.sqlite` | `resolve_db_path` |
-| Work source | `--tasks-dir DIR` (forces directory source) | `[source]` (directory or github) | `.flywheel/tasks` | `resolve_work_source` |
+| Policy | `--policy FILE` | auto-detect `flywheel.toml` in cwd, else the nearest parent (re-anchors cwd there) | the home project (re-anchors cwd at the worktree top level) | `load_effective_policy` |
+| DB path | `--db PATH` | `[paths] db` | `$FLYWHEEL_HOME/projects/<id>/flywheel.sqlite` | `resolve_db_path` |
+| Work source | `--tasks-dir DIR` (forces directory source) | `[source]` (directory or github) | `$FLYWHEEL_HOME/projects/<id>/tasks` | `resolve_work_source` |
+| Worktree root | `--sandbox-root` (worker) | `[paths] sandbox_root` | `$FLYWHEEL_HOME/projects/<id>/worktrees` | `resolve_sandbox_root` |
+
+Logs (`logs/runs/`, `logs/worker/`, `logs/autopilot/`) and the merge lock sit beside the store in the project dir. A repo with a `flywheel.toml` keeps the in-repo `.flywheel/` defaults for keys it leaves unset.
 
 Anchors are in `crates/flywheel-orchestrator/src/workflow/mod.rs`.
 
 The Postgres DSN is never stored in `flywheel.toml`. It is read only from the environment: `FLYWHEEL_PG_DSN`, falling back to `DATABASE_URL` (`resolve_postgres_dsn`, `crates/flywheel-orchestrator/src/store_factory.rs`). See [configuration.md](configuration.md) for the full policy schema.
+
+## Projects and the home
+
+Every byte flywheel writes lives under `$FLYWHEEL_HOME` (default `~/.flywheel`): `config.toml`, `trust.json`, `hub/` (hub state), and `projects/<id>/` (`meta.json`, `config.toml`, `flywheel.sqlite`, `specs/`, `tasks/`, `transcripts/`, `worktrees/`, `held-out/`, `logs/`).
+
+- A project is a git repo. Its id (UUID v4) is stored in the repo's common `.git/config` as `flywheel.projectid`, so every linked worktree maps to one project. The first store verb in a repo mints it; nothing else is written into the repo.
+- `meta.json` records `id`, `path` (canonical main worktree), `git_common_dir`, `remote` (origin URL or null), `first_seen`, `last_seen`.
+- A moved repo keeps its id (`meta.json` follows). A copy (the recorded repo still exists and carries the same id) mints a new id for the copy; the original is untouched.
+- Outside a git repo, store verbs exit non-zero with an error naming git.
+
+| Verb | What it does |
+|---|---|
+| `project ls [--json]` | Every project: `<id>  <path>` lines; `--json` prints `[{"id","path"}]`. |
+| `project prune` | Remove project dirs whose recorded repo no longer exists or no longer carries that id; prints `removed <id> (<path>): <reason>` per dir. |
+| `project relink [PATH]` | Point the cwd repo's id at an existing project dir (PATH: the dir or its id; bare: the single project recording this repo's path). Recovery after a re-clone or a lost key. |
 
 ## Read verbs
 
@@ -180,13 +199,13 @@ Streams the totally-ordered audit records for one run, routed by the shell (`aud
 
 Entry: `main_with` (`crates/flywheel/src/tui.rs`). Bare `fw` on a TTY opens it; `fw --json` or any non-TTY stdout prints one `DashboardSnapshot` and exits 0 with no ANSI.
 
-The console fails fast on a missing store before launching: a missing sqlite file exits 2 with the remedy `run 'fw init' ...`; a Postgres backend with no resolvable DSN env exits 2.
+The console fails fast on a missing store before launching (a home project's store is created instead): a missing sqlite file exits 2 with the remedy `run 'fw init' ...`; a Postgres backend with no resolvable DSN env exits 2.
 
 ### Console flags
 
 | Flag | Controls |
 |---|---|
-| `--db PATH` | store path (default policy `[paths] db` else `.flywheel/flywheel.sqlite`) |
+| `--db PATH` | store path (default policy `[paths] db` else the home project's `flywheel.sqlite`) |
 | `--policy FILE` | work-policy file (default `flywheel.toml` if present) |
 | `--tasks-dir DIR` | tasks root for summary counts and `/archive` |
 | `--json` | print one JSON snapshot and exit (implied off a non-TTY) |
@@ -247,9 +266,9 @@ The compose box doubles as input: plain text is a `say`; a leading `/` is a slas
 
 ### Worker and autopilot supervisors
 
-`WorkerSupervisor` (`crates/flywheel/src/worker_supervisor.rs`) spawns `<console binary> worker --db <path> [--tasks-dir ..] [--model ..]` in a new session (`setsid`), so a console Ctrl-C never reaches the child; only `stop` signals it (SIGTERM to the process group, 10s wait, then SIGKILL). It reads `task_claims` to detect liveness: a live lease this console did not spawn shows as DETACHED. Spawn logs land under `.flywheel/logs/worker/`.
+`WorkerSupervisor` (`crates/flywheel/src/worker_supervisor.rs`) spawns `<console binary> worker --db <path> [--tasks-dir ..] [--model ..]` in a new session (`setsid`), so a console Ctrl-C never reaches the child; only `stop` signals it (SIGTERM to the process group, 10s wait, then SIGKILL). It reads `task_claims` to detect liveness: a live lease this console did not spawn shows as DETACHED. Spawn logs land under the project's `logs/worker/` (`.flywheel/logs/worker/` for a `flywheel.toml` repo).
 
-`AutopilotSupervisor` (`crates/flywheel/src/autopilot_supervisor.rs`) spawns `<console binary> autopilot [--tasks-dir ..] [--model ..] [--activity-file ..]` without `--once` (the neverending daemon). It writes no lease; liveness rides on the daemon's activity record (pid + `expires_at`), so a live daemon this console did not spawn is adopted as DETACHED and a stale record reads as not-live. Logs land under `.flywheel/logs/autopilot/`. Same spawn/detach/stop shape, independent of the worker.
+`AutopilotSupervisor` (`crates/flywheel/src/autopilot_supervisor.rs`) spawns `<console binary> autopilot [--tasks-dir ..] [--model ..] [--activity-file ..]` without `--once` (the neverending daemon). It writes no lease; liveness rides on the daemon's activity record (pid + `expires_at`), so a live daemon this console did not spawn is adopted as DETACHED and a stale record reads as not-live. Logs land under the project's `logs/autopilot/` (`.flywheel/logs/autopilot/` for a `flywheel.toml` repo). Same spawn/detach/stop shape, independent of the worker.
 
 ## Slash commands
 

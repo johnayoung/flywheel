@@ -20,6 +20,8 @@ flywheel worker --once  # claim one task, run it, exit
 flywheel                # operator console (alias: fw)
 ```
 
+Any git repo works without `flywheel init`: flywheel keeps its state under `$FLYWHEEL_HOME/projects/<id>/` (default `~/.flywheel`), keyed by an id it stores in the repo's `.git/config`. `fw project ls` lists the known projects.
+
 The worker drives the agent through its CLI (`claude`, or `codex` via `[agent]`), so the CLI must be on `PATH` and authenticated before the first run.
 
 `flywheel <verb> --help` lists each verb's flags (`status`, `live`, `history`, `show`, `say`, `interrupt`, `approve`, `reject`, `audit`, ...).

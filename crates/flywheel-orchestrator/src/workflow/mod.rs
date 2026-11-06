@@ -5,7 +5,8 @@
 //! Every verb is a library function taking parsed arguments, already-open
 //! stores, and the two output sinks, and returning the process exit code.
 //! [`main`] / [`run`] wire them to the command line: resolve the effective
-//! policy (flag > `flywheel.toml` > built-in default), build the work
+//! policy (flag > `flywheel.toml` > the home project's built-in default),
+//! build the work
 //! source through the source registry, open the policy-selected stores,
 //! then dispatch. The two verbs whose bodies live elsewhere -- the
 //! `orchestrate` loop and the `archive` sweep (which belongs to the worktree
@@ -40,8 +41,10 @@ use crate::claims::{ClaimStore, ClaimStoreError};
 use crate::claims_postgres::register_postgres_backends;
 use crate::github::register_github_sources;
 use crate::history::build_task_phase_index;
+use crate::home;
 use crate::policy::{
-    DEFAULT_POLICY_FILENAME, PolicyError, WorkPolicy, load_policy, resolve_sandbox_root,
+    DEFAULT_POLICY_FILENAME, PolicyError, ProjectBinding, WorkPolicy, load_policy,
+    resolve_sandbox_root,
 };
 use crate::source_registry::{SourceBuildContext, SourceRegistry, SourceRegistryError};
 use crate::sources::{DirectoryWorkSource, WorkSource, WorkSourceError};
@@ -122,8 +125,22 @@ impl WorkflowError {
 
 /// Load the policy the orchestrator verbs honor for an invocation.
 ///
-/// Mirrors the orchestrate CLI's precedence so a downstream package can pin
-/// to the same resolution:
+/// A policy file wins when there is one ([`load_policy_file`]); otherwise
+/// the invocation runs against its home project ([`home_project_policy`]):
+/// every default (store, tasks, worktrees, logs) lives under
+/// `$FLYWHEEL_HOME/projects/<id>/`, and a directory outside any git repo is
+/// refused. On success the result is always `Some`; the `Option` keeps the
+/// signature of the file-only resolution callers already match on.
+pub fn load_effective_policy(
+    policy_path: Option<&Path>,
+) -> Result<Option<WorkPolicy>, PolicyError> {
+    if let Some(policy) = load_policy_file(policy_path)? {
+        return Ok(Some(policy));
+    }
+    home_project_policy().map(Some)
+}
+
+/// The policy-file half of [`load_effective_policy`]:
 ///
 /// * an explicit `policy_path` is loaded (a missing/invalid file is an
 ///   error, propagated as [`PolicyError`]);
@@ -134,14 +151,11 @@ impl WorkflowError {
 ///   subdirectory used to resolve every cwd-relative default against the
 ///   subdirectory and silently report an empty queue, so the whole
 ///   invocation must behave exactly like a repo-root one;
-/// * otherwise there is no policy and every default falls back to the
-///   built-in `.flywheel/` layout.
+/// * otherwise `None`.
 ///
 /// An empty `policy_path` is treated as "not specified" to match the
 /// argparse default surface.
-pub fn load_effective_policy(
-    policy_path: Option<&Path>,
-) -> Result<Option<WorkPolicy>, PolicyError> {
+pub fn load_policy_file(policy_path: Option<&Path>) -> Result<Option<WorkPolicy>, PolicyError> {
     if let Some(path) = policy_path.filter(|p| !p.as_os_str().is_empty()) {
         return load_policy(path).map(Some);
     }
@@ -164,6 +178,55 @@ pub fn load_effective_policy(
         }
     }
     Ok(None)
+}
+
+/// The built-in policy for the working directory's home project.
+///
+/// Resolves (creating on first sight) the project of the git repo holding
+/// the working directory, RE-ANCHORS the process at the current worktree's
+/// top level (so a subdirectory invocation behaves like a repo-root one),
+/// creates the project's tasks dir, and returns the default policy with the
+/// store, tasks dir, and worktree root under `$FLYWHEEL_HOME/projects/<id>/`.
+/// Nothing is written into the repo tree except the `.git/config` id.
+pub fn home_project_policy() -> Result<WorkPolicy, PolicyError> {
+    let project = home::resolve_cwd_project()?;
+    let cwd = std::env::current_dir().map_err(|err| PolicyError::Read {
+        path: PathBuf::from("."),
+        message: format!("cannot resolve the working directory: {err}"),
+    })?;
+    let repo_root = home::worktree_toplevel(&cwd)?;
+    if cwd.canonicalize().ok().as_deref() != Some(repo_root.as_path()) {
+        std::env::set_current_dir(&repo_root).map_err(|err| PolicyError::Read {
+            path: repo_root.clone(),
+            message: format!("cannot re-anchor to {}: {err}", repo_root.display()),
+        })?;
+    }
+    Ok(policy_for_project(&project, repo_root)?)
+}
+
+/// The default policy bound to `project`, its tasks dir created.
+pub fn policy_for_project(
+    project: &home::Project,
+    repo_root: PathBuf,
+) -> Result<WorkPolicy, home::ProjectError> {
+    let paths = &project.paths;
+    let active = paths.tasks().join("active");
+    std::fs::create_dir_all(&active).map_err(|err| home::ProjectError::Io {
+        path: active.clone(),
+        message: err.to_string(),
+    })?;
+    Ok(WorkPolicy {
+        source_kind: "directory".to_owned(),
+        tasks_dir: Some(paths.tasks()),
+        db_path: Some(paths.db()),
+        sandbox_root: Some(paths.worktrees()),
+        project: Some(ProjectBinding {
+            id: project.id.clone(),
+            dir: paths.root().to_path_buf(),
+            repo_root,
+        }),
+        ..WorkPolicy::default()
+    })
 }
 
 /// The shipped source registry: `directory` plus the three GitHub kinds.
@@ -340,6 +403,18 @@ pub fn repo_root_for_tasks_dir(tasks_dir: &Path) -> PathBuf {
     std::env::current_dir().unwrap_or_default()
 }
 
+/// The repo root for `tasks_dir`: a home project's tasks live outside the
+/// repo, so a home-bound policy answers with its recorded repo root;
+/// otherwise [`repo_root_for_tasks_dir`].
+pub fn repo_root_for(tasks_dir: &Path, policy: Option<&WorkPolicy>) -> PathBuf {
+    if let Some(project) = policy.and_then(|p| p.project.as_ref())
+        && policy.and_then(|p| p.tasks_dir.as_deref()) == Some(tasks_dir)
+    {
+        return project.repo_root.clone();
+    }
+    repo_root_for_tasks_dir(tasks_dir)
+}
+
 /// `(repo_root, true_base)` for the phase-prerequisite reachability hold:
 /// the configured submit base else `HEAD`, and the `.flywheel` ancestor of
 /// the resolved tasks dir (falling back to cwd).
@@ -353,7 +428,7 @@ pub fn reachability_context(
             .and_then(|p| p.tasks_dir.clone())
             .unwrap_or_else(|| PathBuf::from(DEFAULT_TASKS_DIR)),
     };
-    let repo_root = repo_root_for_tasks_dir(&tasks_dir);
+    let repo_root = repo_root_for(&tasks_dir, policy);
     let true_base = policy
         .and_then(|p| p.submit_base.clone())
         .filter(|b| !b.is_empty())
@@ -621,13 +696,25 @@ pub fn dispatch(
     let registries = default_store_registries();
     let sources = default_source_registry();
     let environ: Environ = environ_from_process();
-    let policy_of = |p: &Option<String>| -> Result<Option<WorkPolicy>, WorkflowError> {
-        Ok(load_effective_policy(p.as_deref().map(Path::new))?)
-    };
+    // Explicit flags that cover every path a verb reads skip the home
+    // project (a policy file is still honored), so `--db` / `--tasks-dir`
+    // keep working outside a git repo.
+    let given = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
+    let policy_of =
+        |p: &Option<String>, explicit: bool| -> Result<Option<WorkPolicy>, WorkflowError> {
+            let path = p.as_deref().map(Path::new);
+            if explicit {
+                return Ok(load_policy_file(path)?);
+            }
+            Ok(load_effective_policy(path)?)
+        };
     match command {
         Command::Init(args) => Ok(cmd_init(&args, init_host, out, err)?),
         Command::Next(common) => {
-            let policy = policy_of(&common.policy)?;
+            let policy = policy_of(
+                &common.policy,
+                given(&common.db) && given(&common.tasks_dir),
+            )?;
             let source =
                 resolve_work_source(common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
             let db_path = resolve_db_path(common.db.as_deref(), policy.as_ref());
@@ -650,7 +737,10 @@ pub fn dispatch(
                 writeln!(err, "error: orchestrate is not available in this build")?;
                 return Ok(2);
             };
-            let policy = policy_of(&args.common.policy)?;
+            let policy = policy_of(
+                &args.common.policy,
+                given(&args.common.db) && given(&args.common.tasks_dir),
+            )?;
             let source =
                 resolve_work_source(args.common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
@@ -672,7 +762,10 @@ pub fn dispatch(
             Ok(runner(request, out, err))
         }
         Command::Status(args) => {
-            let policy = policy_of(&args.common.policy)?;
+            let policy = policy_of(
+                &args.common.policy,
+                given(&args.common.db) && given(&args.common.tasks_dir),
+            )?;
             let source =
                 resolve_work_source(args.common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
@@ -692,14 +785,14 @@ pub fn dispatch(
             )
         }
         Command::Live(args) => {
-            let policy = policy_of(&args.policy)?;
+            let policy = policy_of(&args.policy, given(&args.db))?;
             let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
             cmd_live(&args, &*stores.core, out)
         }
         Command::History(args) => {
-            let policy = policy_of(&args.common.policy)?;
+            let policy = policy_of(&args.common.policy, given(&args.common.db))?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
@@ -708,7 +801,7 @@ pub fn dispatch(
             cmd_history(&args, &*stores.core, &fallback, out)
         }
         Command::Show(args) => {
-            let policy = policy_of(&args.common.policy)?;
+            let policy = policy_of(&args.common.policy, given(&args.common.db))?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
@@ -722,7 +815,10 @@ pub fn dispatch(
                 writeln!(err, "error: archive is not available in this build")?;
                 return Ok(2);
             };
-            let policy = policy_of(&common.policy)?;
+            let policy = policy_of(
+                &common.policy,
+                given(&common.db) && given(&common.tasks_dir),
+            )?;
             let tasks_dir = resolve_directory_tasks_dir(
                 "archive",
                 common.tasks_dir.as_deref(),
@@ -730,7 +826,7 @@ pub fn dispatch(
             )?;
             let db_path = resolve_db_path(common.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
-            let repo_root = repo_root_for_tasks_dir(&tasks_dir);
+            let repo_root = repo_root_for(&tasks_dir, policy.as_ref());
             let landing_base = policy
                 .as_ref()
                 .and_then(|p| p.submit_base.clone())
@@ -758,16 +854,20 @@ pub fn dispatch(
             }
         }
         Command::Validate(common) => {
-            let policy = policy_of(&common.policy)?;
+            let policy = policy_of(&common.policy, given(&common.tasks_dir))?;
             let tasks_dir = resolve_directory_tasks_dir(
                 "validate",
                 common.tasks_dir.as_deref(),
                 policy.as_ref(),
             )?;
-            cmd_validate(&tasks_dir, out, err)
+            let repo_root = repo_root_for(&tasks_dir, policy.as_ref());
+            cmd_validate(&tasks_dir, &repo_root, out, err)
         }
         Command::RecheckBlocked(args) => {
-            let policy = policy_of(&args.common.policy)?;
+            let policy = policy_of(
+                &args.common.policy,
+                given(&args.common.db) && given(&args.common.tasks_dir),
+            )?;
             let source =
                 resolve_work_source(args.common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
@@ -778,7 +878,7 @@ pub fn dispatch(
             cmd_recheck_blocked(&args, &items, stores.core.clone(), &logs_root, out, err)
         }
         Command::Recover(args) => {
-            let policy = policy_of(&args.policy)?;
+            let policy = policy_of(&args.policy, given(&args.db))?;
             let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
@@ -798,7 +898,7 @@ pub fn dispatch(
                 writeln!(err, "error: --reason must not be empty")?;
                 return Ok(2);
             }
-            let policy = policy_of(&args.policy)?;
+            let policy = policy_of(&args.policy, given(&args.db))?;
             let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
@@ -1307,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn status_walks_up_to_the_policy_or_fails_loud_outside_a_repo() {
+    fn status_walks_up_to_the_policy_or_refuses_outside_a_git_repo() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::current_dir().unwrap();
         let tmp = TempDir::new().unwrap();
@@ -1337,7 +1437,7 @@ mod tests {
         let (code, out, err) = run_capture(&argv(&["status".to_owned()]));
         std::env::set_current_dir(&original).unwrap();
         assert_eq!(code, 2);
-        assert!(err.contains("not a flywheel repo"), "{err}");
+        assert!(err.contains("not inside a git repository"), "{err}");
         assert!(!out.contains("(no active tasks)"));
     }
 

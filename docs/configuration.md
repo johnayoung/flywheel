@@ -2,11 +2,13 @@
 
 A single `flywheel.toml` at the repo root is the consumer repo's versioned contract with the orchestrator: where work comes from, what "runnable" means by default, and how finished work lands. Switching a project between a task directory and an issue tracker is a committed config change, not a flywheel code change.
 
+**No `flywheel.toml` is required.** Without one, every store verb runs against the cwd repo's home project: the built-in policy (`home_project_policy`, `crates/flywheel-orchestrator/src/workflow/mod.rs`) points the store, tasks dir, and worktree root at `$FLYWHEEL_HOME/projects/<id>/` (default `~/.flywheel`); see [cli.md](cli.md#projects-and-the-home). A present `flywheel.toml` is still honored, and its unset `[paths]`/`tasks_dir` keys keep the in-repo `.flywheel/` defaults below.
+
 One module owns the whole surface: `load_policy` (`crates/flywheel-orchestrator/src/policy.rs`) parses the file with the `toml` crate into an immutable `WorkPolicy`. Every key is validated there, every default lives there.
 
 ## Precedence and validation
 
-- **Precedence**: an explicit CLI flag wins over the file, the file wins over the built-in default. The read commands (`status`, `live`, `worker`, `autopilot`, ...) auto-detect `flywheel.toml` in the cwd, else the nearest parent directory, re-anchoring the process there (`load_effective_policy`, `crates/flywheel-orchestrator/src/workflow/mod.rs`); `--policy` overrides the path, and an explicit `--tasks-dir`/`--db`/`--sandbox-root`/`--model` always beats the file.
+- **Precedence**: an explicit CLI flag wins over the file, the file wins over the built-in (home project) default. The read commands (`status`, `live`, `worker`, `autopilot`, ...) auto-detect `flywheel.toml` in the cwd, else the nearest parent directory, re-anchoring the process there (`load_effective_policy`, `crates/flywheel-orchestrator/src/workflow/mod.rs`); `--policy` overrides the path, and an explicit `--tasks-dir`/`--db`/`--sandbox-root`/`--model` always beats the file.
 - **Strict on values, lenient on keys**: a wrong-typed or out-of-enum value fails fast with a `PolicyError` that names the offending file and key — a typo never silently degrades behavior. Unknown *keys* under a known table, and unknown *section* tables, are ignored for forward-compatibility.
 - **`[source]` is the only required table.** Its absence raises `PolicyError` "missing required `[source]` table". Every other section is optional; an absent section yields a back-compat default so a pre-existing file keeps loading unchanged.
 - **Credentials and DSNs never live in the file.** Postgres DSNs, API tokens, and OAuth tokens are read from named environment variables only (see [Environment variables](#environment-variables)). Config carries env var *names*, never values.

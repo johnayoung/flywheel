@@ -25,7 +25,9 @@ use crate::autopilot_activity::{
     PHASE_IDLE, PHASE_PAUSED, PHASE_RUNNING, PHASE_STARTING, PHASE_STOPPED, epoch_now, is_paused,
     set_paused, write_activity,
 };
-use crate::autopilot_context::{DiscoveryCacheStatus, default_discovery_cache_path};
+use crate::autopilot_context::{
+    DISCOVERY_CACHE_FILENAME, DiscoveryCacheStatus, default_discovery_cache_path,
+};
 use crate::claims::{ClaimStore, ClaimStoreError, OrchestratorSchemaError};
 use crate::orchestrate::{
     DEFAULT_NO_PROGRESS_BOUND, NoProgressObservation, NoProgressOutcome, NoProgressResult,
@@ -84,8 +86,8 @@ options:
   --once                Run a single refill pass and exit (no daemon loop).
   --activity-file ACTIVITY_FILE
                         Path to write the live activity snapshot the console
-                        reads (defaults to
-                        <repo>/.flywheel/logs/autopilot/activity.json).
+                        reads (defaults to the project's
+                        logs/autopilot/activity.json under $FLYWHEEL_HOME).
   --pause               Hold the running daemon between cycles (writes
                         <activity file>.paused) and exit.
   --resume              Let a paused daemon run cycles again and exit.";
@@ -499,6 +501,18 @@ pub fn resolve_daemon_db_path(policy: Option<&WorkPolicy>, repo_root: &Path) -> 
         raw
     } else {
         repo_root.join(raw)
+    }
+}
+
+/// The directory the daemon's activity record and discovery cache live in:
+/// `$FLYWHEEL_HOME/projects/<id>/logs/autopilot` for a home project, else
+/// `<repo>/.flywheel/logs/autopilot` (a policy-file repo).
+pub fn autopilot_log_dir(policy: Option<&WorkPolicy>, repo_root: &Path) -> PathBuf {
+    match policy.and_then(|p| p.project.as_ref()) {
+        Some(project) => project.paths().autopilot_logs(),
+        None => default_discovery_cache_path(repo_root)
+            .parent()
+            .map_or_else(|| repo_root.to_path_buf(), Path::to_path_buf),
     }
 }
 
@@ -1339,13 +1353,18 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         }
     };
     let log = make_logger(LOG_PREFIX, stderr.clone());
+    let policy = match load_effective_policy(host.policy_path().as_deref()) {
+        Ok(policy) => policy,
+        Err(err) => {
+            stderr(&format!("flywheel autopilot: policy error: {err}"));
+            return 2;
+        }
+    };
+    let policy = policy.as_ref();
+    let log_dir = autopilot_log_dir(policy, &repo_root);
     let activity_path = match args.activity_file.as_deref().filter(|p| !p.is_empty()) {
         Some(path) => PathBuf::from(path),
-        None => repo_root
-            .join(".flywheel")
-            .join("logs")
-            .join("autopilot")
-            .join("activity.json"),
+        None => log_dir.join("activity.json"),
     };
     if args.pause || args.resume {
         return match set_paused(&activity_path, args.pause) {
@@ -1378,15 +1397,6 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
             }
         };
     }
-
-    let policy = match load_effective_policy(host.policy_path().as_deref()) {
-        Ok(policy) => policy,
-        Err(err) => {
-            stderr(&format!("flywheel autopilot: policy error: {err}"));
-            return 2;
-        }
-    };
-    let policy = policy.as_ref();
 
     let runtime = resolve_runtime(&args, policy);
     let model = args
@@ -1421,7 +1431,7 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
             })
             .try_into()
             .unwrap_or(1),
-        discovery_cache: Some(default_discovery_cache_path(&repo_root)),
+        discovery_cache: Some(log_dir.join(DISCOVERY_CACHE_FILENAME)),
         discovery_cache_ttl_seconds: policy
             .map_or(DEFAULT_AUTOPILOT_DISCOVERY_CACHE_TTL_SECONDS, |p| {
                 p.autopilot_discovery_cache_ttl_seconds

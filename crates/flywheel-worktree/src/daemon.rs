@@ -1625,7 +1625,8 @@ options:
   --sandbox-root SANDBOX_ROOT
                         Root under which each task's worktree is created
                         (default: [paths] sandbox_root in flywheel.toml, else
-                        .flywheel/worktrees). Relative paths anchor at the
+                        the project's worktrees/ under $FLYWHEEL_HOME).
+                        Relative paths anchor at the
                         repo root; @cache and @sibling select out-of-tree
                         layouts.
   --model MODEL
@@ -1634,7 +1635,7 @@ options:
   --worktree-retention-days WORKTREE_RETENTION_DAYS
   --run-log-retention RUN_LOG_RETENTION
                         Cap on per-run telemetry JSONL files kept under
-                        .flywheel/logs/runs/; the oldest past the cap are
+                        logs/runs/ beside the store; the oldest past the cap are
                         reclaimed each cycle so the most-recent runs survive
                         (0 disables).
   --heartbeat HEARTBEAT
@@ -1996,16 +1997,29 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     };
     let model = resolve_model(args.model.as_deref(), policy.as_deref());
 
+    // A home project (no policy file) keeps every default under
+    // $FLYWHEEL_HOME/projects/<id>/; a policy-file repo keeps the in-repo
+    // .flywheel/ layout.
+    let home_project = policy.as_deref().and_then(|p| p.project.as_ref());
+    let state_root = home_project.map_or_else(|| repo_root.join(".flywheel"), |p| p.dir.clone());
     let tasks_dir = args
         .tasks_dir
         .as_deref()
         .filter(|s| !s.is_empty())
-        .map_or_else(|| repo_root.join(".flywheel").join("tasks"), PathBuf::from);
-    let db_path = args.db.as_deref().filter(|s| !s.is_empty()).map_or_else(
-        || repo_root.join(".flywheel").join("flywheel.sqlite"),
-        PathBuf::from,
+        .map(PathBuf::from)
+        .or_else(|| home_project.and(policy.as_deref().and_then(|p| p.tasks_dir.clone())))
+        .unwrap_or_else(|| state_root.join("tasks"));
+    let db_path = args
+        .db
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_project.and(policy.as_deref().and_then(|p| p.db_path.clone())))
+        .unwrap_or_else(|| state_root.join("flywheel.sqlite"));
+    let lock_path = home_project.map_or_else(
+        || state_root.join(".merge.lock"),
+        |p| p.paths().merge_lock(),
     );
-    let lock_path = repo_root.join(".flywheel").join(".merge.lock");
     let db_parent = db_path
         .parent()
         .map(Path::to_path_buf)

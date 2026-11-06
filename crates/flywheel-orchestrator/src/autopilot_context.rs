@@ -734,8 +734,11 @@ pub fn default_discovery_cache_path(repo_root: &Path) -> PathBuf {
         .join(".flywheel")
         .join("logs")
         .join("autopilot")
-        .join("discovery-cache.json")
+        .join(DISCOVERY_CACHE_FILENAME)
 }
+
+/// The discovery cache's file name inside the autopilot log dir.
+pub const DISCOVERY_CACHE_FILENAME: &str = "discovery-cache.json";
 
 /// One tier verdict, valid only under `key` (the rendered prompt and agent
 /// configuration it was produced with).

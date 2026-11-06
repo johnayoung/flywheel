@@ -80,8 +80,8 @@ options:
   --model MODEL
   --activity-file ACTIVITY_FILE
                         Path to the daemon's activity/liveness record
-                        (defaults to
-                        <repo>/.flywheel/logs/autopilot/activity.json).
+                        (defaults to the project's
+                        logs/autopilot/activity.json under $FLYWHEEL_HOME).
   --max-respawns MAX_RESPAWNS
                         Deaths tolerated inside the rolling window before
                         giving up.
@@ -808,11 +808,14 @@ pub fn run_main(argv: &[String], host: &dyn SupervisedHost) -> i32 {
     };
     let activity_path = match args.activity_file.as_deref().filter(|p| !p.is_empty()) {
         Some(path) => PathBuf::from(path),
-        None => repo_root
-            .join(".flywheel")
-            .join("logs")
-            .join("autopilot")
-            .join("activity.json"),
+        None => match crate::workflow::load_effective_policy(None) {
+            Ok(policy) => crate::autopilot_run::autopilot_log_dir(policy.as_ref(), &repo_root)
+                .join("activity.json"),
+            Err(err) => {
+                stderr(&format!("autopilot-supervised: policy error: {err}"));
+                return 2;
+            }
+        },
     };
     let log_dir = activity_path
         .parent()

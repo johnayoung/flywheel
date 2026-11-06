@@ -86,6 +86,9 @@ pub fn show_repo_root(tasks_dir: Option<&str>, policy: Option<&WorkPolicy>) -> P
     if let Some(dir) = tasks_dir.filter(|d| !d.is_empty()) {
         return repo_root_for_tasks_dir(Path::new(dir));
     }
+    if let Some(project) = policy.and_then(|p| p.project.as_ref()) {
+        return project.repo_root.clone();
+    }
     if let Some(policy) = policy
         && policy.source_kind == "directory"
         && let Some(dir) = &policy.tasks_dir

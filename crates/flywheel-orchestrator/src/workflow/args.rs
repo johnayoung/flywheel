@@ -830,12 +830,13 @@ options:
 ";
 
 const COMMON_OPTIONS_WIDE: &str = "  --tasks-dir TASKS_DIR
-                        Tasks root directory (default: .flywheel/tasks).
+                        Tasks root directory (default: the project's tasks/
+                        under $FLYWHEEL_HOME).
   --policy POLICY       Work-policy file selecting the work source (default:
                         flywheel.toml if present). An explicit --tasks-dir
                         overrides the policy.
-  --db DB               SQLite database path (default:
-                        .flywheel/flywheel.sqlite).
+  --db DB               SQLite database path (default: the project's
+                        flywheel.sqlite under $FLYWHEEL_HOME).
 ";
 
 const NEXT_USAGE: &str =
@@ -853,7 +854,8 @@ const ORCHESTRATE_USAGE: &str =
 
 const ORCHESTRATE_OPTIONS: &str = "  --sandbox-root SANDBOX_ROOT
                         Root under which each task runs in <sandbox-
-                        root>/<task-id> (default: .flywheel/worktrees).
+                        root>/<task-id> (default: the project's worktrees/
+                        under $FLYWHEEL_HOME).
                         Relative paths anchor at the repo root; @cache and
                         @sibling select out-of-tree layouts.
   --model MODEL         Override the Claude model passed to the SDK.
@@ -902,7 +904,8 @@ options:
   --policy POLICY  Work-policy file selecting the work source (default:
                    flywheel.toml if present). An explicit --tasks-dir
                    overrides the policy.
-  --db DB          SQLite database path (default: .flywheel/flywheel.sqlite).
+  --db DB          SQLite database path (default: the project's flywheel.sqlite
+                   under $FLYWHEEL_HOME).
   --watch SECONDS  Refresh continuously every SECONDS; clears the screen on
                    each tick. Default 0 prints one snapshot and exits.
 ";
@@ -953,7 +956,8 @@ const VALIDATE_OPTIONS: &str = "
 options:
   -h, --help            show this help message and exit
   --tasks-dir TASKS_DIR
-                        Tasks root directory (default: .flywheel/tasks).
+                        Tasks root directory (default: the project's tasks/
+                        under $FLYWHEEL_HOME).
   --policy POLICY       Work-policy file selecting the work source (default:
                         flywheel.toml if present). An explicit --tasks-dir
                         overrides the policy.
@@ -983,8 +987,8 @@ options:
   --policy POLICY    Work-policy file selecting the work source (default:
                      flywheel.toml if present). An explicit --tasks-dir
                      overrides the policy.
-  --db DB            SQLite database path (default:
-                     .flywheel/flywheel.sqlite).
+  --db DB            SQLite database path (default: the project's
+                     flywheel.sqlite under $FLYWHEEL_HOME).
   --task-id TASK_ID  Only recover stranded lifecycles for this task id. Omit
                      to recover every stranded lifecycle in the store.
 ";
@@ -1006,7 +1010,8 @@ options:
   --policy POLICY  Work-policy file selecting the work source (default:
                    flywheel.toml if present). An explicit --tasks-dir
                    overrides the policy.
-  --db DB          SQLite database path (default: .flywheel/flywheel.sqlite).
+  --db DB          SQLite database path (default: the project's flywheel.sqlite
+                   under $FLYWHEEL_HOME).
 ";
 
 const OPTIONS_HEAD_WIDE: &str = "

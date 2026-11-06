@@ -57,7 +57,7 @@ The daemon is invoked as `flywheel worker` (the product shell delegates in-proce
 3. Write per-run logs to `.flywheel/logs/` (supervisor logs under `logs/worker/`, agent transcripts under `logs/runs/`).
 4. `archive_completed_phases()` — move fully-DONE phases to `archive/`, subject to the gate below. A recurring phase name (autopilot's fixed `active/autopilot`) archives each later generation to the next free `archive/<phase>-<n>` (n >= 2). A phase sharing a task id with any archived generation is a resurrected duplicate (an archival whose `active/` deletion was never committed) and is refused loudly, never skipped silently.
 
-Default paths are code, not convention: `DEFAULT_TASKS_DIR = .flywheel/tasks` (`crates/flywheel-orchestrator/src/workflow/mod.rs`) and `DEFAULT_DB_PATH = .flywheel/flywheel.sqlite` (`crates/flywheel-core/src/workflow.rs`); the worker logs default to `.flywheel/logs/worker/` (supervisor) and `.flywheel/logs/runs/` (per-run agent transcripts). All are overridable via CLI flags.
+Default paths are code, not convention: without a `flywheel.toml` the tasks dir, store, worktrees, and logs live under `$FLYWHEEL_HOME/projects/<id>/` (`crates/flywheel-orchestrator/src/home.rs`); a `flywheel.toml` repo keeps `.flywheel/tasks`, `.flywheel/flywheel.sqlite`, and `.flywheel/logs/{worker,runs}/`. All are overridable via CLI flags.
 
 ### The in-loop-verification gate
 

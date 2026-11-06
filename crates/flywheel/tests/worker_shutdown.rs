@@ -210,6 +210,7 @@ impl Fixture {
             .current_dir(&self.repo)
             .env("PATH", std::env::join_paths(paths).unwrap())
             .env("HOME", &self.root)
+            .env_remove("FLYWHEEL_HOME")
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude-config"))
             .env_remove("FLYWHEEL_PG_DSN")
             .stdin(Stdio::null())

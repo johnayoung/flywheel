@@ -44,6 +44,8 @@ use flywheel_orchestrator::autopilot_activity::AutopilotActivity;
 use flywheel_orchestrator::claims_postgres::register_postgres_backends;
 use flywheel_orchestrator::github::register_github_sources;
 use flywheel_orchestrator::history::{HistoryQuery, build_task_phase_index, collect_history_rows};
+use flywheel_orchestrator::home::ProjectPaths;
+use flywheel_orchestrator::policy::ProjectBinding;
 use flywheel_orchestrator::policy::{DEFAULT_TASKS_DIR, WorkPolicy};
 use flywheel_orchestrator::source_registry::{SourceBuildContext, default_registry};
 use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkSource};
@@ -53,7 +55,7 @@ use flywheel_orchestrator::store_factory::{
 use flywheel_orchestrator::store_registry::{
     Environ, SqliteCoreOpener, StoreConfig, StoreRegistries,
 };
-use flywheel_orchestrator::triage_run::load_effective_policy;
+use flywheel_orchestrator::workflow::{load_effective_policy, load_policy_file, repo_root_for};
 use flywheel_worktree::phase::{ArchiveOptions, archive_completed_phases};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -443,8 +445,8 @@ impl InputBar {
              the console; --json (or a non-TTY stdout) prints one snapshot and exits."
 )]
 pub struct TuiArgs {
-    /// Store path. Defaults to the policy's [paths] db (else
-    /// .flywheel/flywheel.sqlite). Matches fw status / fw live.
+    /// Store path. Defaults to the policy's [paths] db (else the
+    /// project's flywheel.sqlite under $FLYWHEEL_HOME). Matches fw status.
     #[arg(long)]
     pub db: Option<String>,
     /// Work-policy file selecting the work source (default: flywheel.toml
@@ -734,6 +736,10 @@ pub fn missing_dsn_message() -> String {
 /// console is watching.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonSpawnSpec {
+    /// The home project's paths: the supervisors log under its
+    /// `logs/worker/` and `logs/autopilot/`. `None` keeps the in-repo
+    /// `.flywheel/logs/` defaults (a policy-file repo).
+    pub project: Option<ProjectPaths>,
     pub db_path: PathBuf,
     pub tasks_dir: Option<PathBuf>,
     pub model: Option<String>,
@@ -765,7 +771,17 @@ pub fn main_with(argv: &[String], daemons: Option<DaemonFactory>) -> i32 {
             return if err.use_stderr() { 2 } else { 0 };
         }
     };
-    let policy = match load_effective_policy(args.policy.as_deref().map(Path::new)) {
+    // Explicit --db and --tasks-dir name every path the console reads, so
+    // only a policy file is consulted; otherwise the home project supplies
+    // the defaults.
+    let given = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
+    let policy_path = args.policy.as_deref().map(Path::new);
+    let loaded = if given(&args.db) && given(&args.tasks_dir) {
+        load_policy_file(policy_path)
+    } else {
+        load_effective_policy(policy_path)
+    };
+    let policy = match loaded {
         Ok(policy) => policy,
         Err(err) => {
             eprintln!("fw: policy error: {err}");
@@ -773,6 +789,7 @@ pub fn main_with(argv: &[String], daemons: Option<DaemonFactory>) -> i32 {
         }
     };
     let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
+    let home_project = policy.as_ref().and_then(|p| p.project.clone());
     if policy
         .as_ref()
         .is_some_and(|p| p.store_backend == "postgres")
@@ -781,7 +798,7 @@ pub fn main_with(argv: &[String], daemons: Option<DaemonFactory>) -> i32 {
             eprintln!("{}", missing_dsn_message());
             return 2;
         }
-    } else if !db_path.exists() {
+    } else if home_project.is_none() && !db_path.exists() {
         eprintln!("{}", missing_store_message(&db_path));
         return 2;
     }
@@ -804,6 +821,7 @@ pub fn main_with(argv: &[String], daemons: Option<DaemonFactory>) -> i32 {
         return run_snapshot(bundle.core.as_ref(), work_source.as_ref());
     }
     let spec = DaemonSpawnSpec {
+        project: home_project.as_ref().map(ProjectBinding::paths),
         db_path: db_path.clone(),
         tasks_dir: resolve_tasks_dir_for_worker(args.tasks_dir.as_deref(), policy.as_ref()),
         model: resolve_model_for_worker(args.model.as_deref(), policy.as_ref()),
@@ -935,11 +953,12 @@ pub fn build_dashboard(
     let phase_verify = policy.and_then(|p| p.phase_verify.clone());
     let archive_bundle = bundle.clone();
     let archive_dir = archive_tasks_dir.clone();
+    let archive_policy = policy.cloned();
     let archive = move || -> Result<Vec<String>, String> {
         let Some(dir) = &archive_dir else {
             return Ok(Vec::new());
         };
-        let repo_root = repo_root_for_tasks_dir(dir);
+        let repo_root = repo_root_for(dir, archive_policy.as_ref());
         let options = ArchiveOptions {
             repo_root: Some(&repo_root),
             phase_verify: phase_verify.as_deref(),

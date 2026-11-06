@@ -22,6 +22,7 @@
 //! * docs: `docs [TOPIC]` -> the curated operator docs
 //! * hub: `hub <serve|token>` -> the web workspace (`flywheel-hub`)
 //! * exec: `exec [PROMPT]` -> one agent call, no config/store/worktree
+//! * project: `project <ls|prune|relink>` -> the home's project registry
 //!
 //! `next`, `orchestrate`, and the core single-task CLI (`run`, `is-done`,
 //! `set-model`, ... under `workflow`) are plumbing, not product verbs -- the
@@ -71,8 +72,8 @@ use flywheel_orchestrator::supervision_policy::{SupervisionBudget, SupervisionPo
 use flywheel_orchestrator::triage_run;
 use flywheel_orchestrator::workflow::{
     self as orchestrator_workflow, ArchiveRequest, ArchiveRunner, OrchestrateRequest,
-    OrchestrateRunner, Verbs, default_store_registries, load_effective_policy, python_path_str,
-    resolve_db_path, store_config_for,
+    OrchestrateRunner, Verbs, default_store_registries, load_effective_policy, load_policy_file,
+    python_path_str, resolve_db_path, store_config_for,
 };
 use flywheel_worktree::daemon::{
     self, LandingLayout, RunOnceError, RunOnceRequest, arm_signals, build_held_out_source,
@@ -164,6 +165,11 @@ Verbs:
   hub serve        run the web workspace of agent terminals (hub url: login links + QR)
   hub commands S   print / copy (OSC 52) the code blocks an agent session suggested
   exec [PROMPT]    run one agent call (no tasks, store, worktree, or config)
+  project ls       list known projects (--json); also: project prune, project relink [PATH]
+
+Store verbs work in any git repo: state lives under
+$FLYWHEEL_HOME/projects/<id>/ (default ~/.flywheel), keyed by the id in
+the repo's .git/config. A directory outside a git repo is refused.
 
 Each verb forwards its own --help to the underlying implementation,
 so 'flywheel <verb> --help' (equivalently 'fw <verb> --help') lists
@@ -363,6 +369,10 @@ pub fn route(
         };
         return flywheel_hub::cli::run_with(rest, out, err, &extensions);
     }
+    if verb == crate::project::PROJECT_VERB {
+        // The home's project registry: identity, listing, pruning, relink.
+        return crate::project::run_with(rest, out, err);
+    }
     if verb == exec::EXEC_VERB {
         // One agent call: no flywheel.toml load, no store, no worktree.
         return exec::run_with(rest, out, err);
@@ -391,7 +401,18 @@ fn delegate_producer(core_argv: Vec<String>, err: &mut dyn Write) -> i32 {
     if core_argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
         return core_workflow::main(&core_argv);
     }
-    let policy = match load_effective_policy(None) {
+    let explicit_db = core_argv
+        .iter()
+        .skip(1)
+        .any(|a| a == "--db" || a.starts_with("--db="));
+    // An explicit --db names the store; only a policy file can still pick
+    // its backend, so the home project is not resolved.
+    let loaded = if explicit_db {
+        load_policy_file(None)
+    } else {
+        load_effective_policy(None)
+    };
+    let policy = match loaded {
         Ok(policy) => policy,
         Err(failure) => {
             let _ = writeln!(err, "{PROG}: policy error: {failure}");
@@ -402,8 +423,18 @@ fn delegate_producer(core_argv: Vec<String>, err: &mut dyn Write) -> i32 {
         .as_ref()
         .map_or("sqlite", |p| p.store_backend.as_str());
     if backend == "sqlite" {
-        // Byte-identical default: core resolves --db and opens its own
-        // sqlite store exactly as before.
+        // A home project's store lives under $FLYWHEEL_HOME: name it for
+        // core. Otherwise core resolves --db and opens its own sqlite store
+        // exactly as before.
+        if !explicit_db && policy.as_ref().is_some_and(|p| p.project.is_some()) {
+            let db_path = resolve_db_path(None, policy.as_ref());
+            let mut argv = core_argv;
+            argv.splice(
+                1..1,
+                ["--db".to_owned(), db_path.to_string_lossy().into_owned()],
+            );
+            return core_workflow::main(&argv);
+        }
         return core_workflow::main(&core_argv);
     }
     let db_path = resolve_db_path(None, policy.as_ref());
@@ -853,7 +884,13 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
             .unwrap_or_else(|| repo_root.join(".flywheel").join("tasks"));
     let db_path = request.db_path.clone();
     let worktrees_dir = request.sandbox_root.clone();
-    let lock_path = repo_root.join(".flywheel").join(".merge.lock");
+    let lock_path = policy
+        .as_deref()
+        .and_then(|p| p.project.as_ref())
+        .map_or_else(
+            || repo_root.join(".flywheel").join(".merge.lock"),
+            |project| project.paths().merge_lock(),
+        );
     let db_parent = db_path
         .parent()
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
@@ -1087,6 +1124,13 @@ impl ConsoleDaemons {
         let autopilot = match supervision_policy() {
             Some(policy) => autopilot.with_policy(policy),
             None => autopilot,
+        };
+        let (worker, autopilot) = match &spec.project {
+            Some(project) => (
+                worker.with_log_dir(project.worker_logs()),
+                autopilot.with_log_dir(project.autopilot_logs()),
+            ),
+            None => (worker, autopilot),
         };
         Self::with_supervisors(worker, autopilot)
     }
@@ -1662,13 +1706,13 @@ mod tests {
         std::env::set_current_dir(tmp.path()).unwrap();
         let restore = |previous: &Path| std::env::set_current_dir(previous).unwrap();
 
-        // No policy, no store: the injected default path does not exist.
+        // No policy outside a git repo: the home project cannot resolve, so
+        // the verb refuses naming git (and core's default is never created).
         let (code, _out, err) = run(&["audit", "run-ghost"], &unbound());
-        assert_eq!(code, 2);
-        assert_eq!(
-            err,
-            "error: no store at .flywheel/flywheel.sqlite (pass --db or set $FLYWHEEL_DB)\n"
-        );
+        if code != 2 || !err.contains("not inside a git repository") {
+            restore(&previous);
+            panic!("expected the git refusal, got {code}: {err}");
+        }
         assert!(!tmp.path().join("flywheel.db").exists());
 
         // A policy naming [paths] db: that store is read, core's default
@@ -1926,6 +1970,7 @@ mod tests {
     fn production_factory_builds_supervisors_for_the_spec() {
         let tmp = TempDir::new().unwrap();
         let spec = DaemonSpawnSpec {
+            project: None,
             db_path: tmp.path().join("db.sqlite"),
             tasks_dir: Some(tmp.path().join("tasks")),
             model: Some("claude-opus-4".to_owned()),

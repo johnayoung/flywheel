@@ -10,7 +10,7 @@ use flywheel_core::validation::{TaskDefect, validate_task};
 use crate::sources::load_active_tasks;
 use crate::surface_lint::{build_surface, surface_overlap_defects};
 
-use super::{WorkflowError, repo_root_for_tasks_dir};
+use super::WorkflowError;
 
 /// Statically validate every active task under `tasks_dir`.
 ///
@@ -20,16 +20,19 @@ use super::{WorkflowError, repo_root_for_tasks_dir};
 /// each offending task and its defects (the count goes to stderr); exits 0
 /// with `All N active task(s) valid.` otherwise. Never runs a grader, reads
 /// the store, or tests whether a derived path exists.
+///
+/// `repo_root` anchors the graders' repo-relative paths (see
+/// [`super::repo_root_for`]).
 pub fn cmd_validate(
     tasks_dir: &Path,
+    repo_root: &Path,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32, WorkflowError> {
-    let repo_root = repo_root_for_tasks_dir(tasks_dir);
     let loaded = load_active_tasks(tasks_dir)?;
     let mut invalid: BTreeMap<String, Vec<TaskDefect>> = BTreeMap::new();
     for (_, task) in &loaded {
-        let defects = validate_task(task, &repo_root);
+        let defects = validate_task(task, repo_root);
         if !defects.is_empty() {
             invalid.entry(task.id.clone()).or_default().extend(defects);
         }
@@ -72,7 +75,8 @@ mod tests {
 
     fn run(tmp: &TempDir) -> (i32, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = cmd_validate(tmp.path(), &mut out, &mut err).unwrap();
+        let repo_root = super::super::repo_root_for_tasks_dir(tmp.path());
+        let code = cmd_validate(tmp.path(), &repo_root, &mut out, &mut err).unwrap();
         (
             code,
             String::from_utf8(out).unwrap(),

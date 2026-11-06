@@ -179,6 +179,10 @@ pub enum PolicyError {
     /// A value failed validation; the message names the file and key.
     #[error("{0}")]
     Invalid(String),
+    /// No policy file, and the home project for the working directory
+    /// could not be resolved (not a git repo, unusable home, ...).
+    #[error("{0}")]
+    Project(#[from] crate::home::ProjectError),
 }
 
 /// `[sandbox.exec]` -- bash command isolation (SDK `sandbox` option).
@@ -569,6 +573,29 @@ pub struct WorkPolicy {
     pub triage_needs_detail_label: String,
     pub triage_interval_seconds: f64,
     pub triage_max_per_pass: Option<i64>,
+    /// The home project this policy was synthesized for (no policy file:
+    /// every default lives under `$FLYWHEEL_HOME/projects/<id>/`). `None`
+    /// for a policy loaded from a file. Never serialized.
+    #[serde(skip)]
+    pub project: Option<ProjectBinding>,
+}
+
+/// The home project a synthesized policy is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectBinding {
+    pub id: String,
+    /// `$FLYWHEEL_HOME/projects/<id>`.
+    pub dir: PathBuf,
+    /// The current worktree's top-level directory (the invocation's repo
+    /// root; graders and git operations anchor here).
+    pub repo_root: PathBuf,
+}
+
+impl ProjectBinding {
+    /// Every path under the bound project dir.
+    pub fn paths(&self) -> crate::home::ProjectPaths {
+        crate::home::ProjectPaths::at(&self.dir)
+    }
 }
 
 impl Default for WorkPolicy {
@@ -625,6 +652,7 @@ impl Default for WorkPolicy {
             triage_needs_detail_label: DEFAULT_TRIAGE_NEEDS_DETAIL_LABEL.to_string(),
             triage_interval_seconds: DEFAULT_TRIAGE_INTERVAL_SECONDS,
             triage_max_per_pass: None,
+            project: None,
         }
     }
 }

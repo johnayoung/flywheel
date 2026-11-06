@@ -1287,9 +1287,6 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    /// Serializes the tests that change the process cwd.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
-
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|p| (*p).to_owned()).collect()
     }
@@ -1781,51 +1778,6 @@ mod tests {
         assert_eq!(code, 0);
         assert_eq!(out, "");
         assert_eq!(err, "no records for run_id run-ghost\n");
-    }
-
-    #[test]
-    fn audit_resolves_the_db_from_the_policy_and_fails_fast_on_a_missing_store() {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-        let tmp = TempDir::new().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-        let restore = |previous: &Path| std::env::set_current_dir(previous).unwrap();
-
-        // No policy outside a git repo: the home project cannot resolve, so
-        // the verb refuses naming git (and core's default is never created).
-        let (code, _out, err) = run(&["audit", "run-ghost"], &unbound());
-        if code != 2 || !err.contains("not inside a git repository") {
-            restore(&previous);
-            panic!("expected the git refusal, got {code}: {err}");
-        }
-        assert!(!tmp.path().join("flywheel.db").exists());
-
-        // A legacy flywheel.toml naming [paths] db is no longer read: the
-        // verb still refuses outside a git repo.
-        let db = tmp.path().join("custom").join("store.sqlite");
-        fs::create_dir_all(db.parent().unwrap()).unwrap();
-        fresh_store(&db);
-        fs::write(
-            tmp.path().join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n[paths]\ndb = \"custom/store.sqlite\"\n",
-        )
-        .unwrap();
-        let (code, _out, err) = run(&["audit", "run-ghost"], &unbound());
-        if code != 2 || !err.contains("not inside a git repository") {
-            restore(&previous);
-            panic!("expected the git refusal despite flywheel.toml, got {code}: {err}");
-        }
-
-        // An explicit --db names the store: it is read, and core's default
-        // path is neither consulted nor created.
-        let (code, _out, err) = run(
-            &["audit", "--db", "custom/store.sqlite", "run-ghost"],
-            &unbound(),
-        );
-        restore(&previous);
-        assert_eq!(code, 0);
-        assert_eq!(err, "no records for run_id run-ghost\n");
-        assert!(!tmp.path().join("flywheel.db").exists());
     }
 
     #[test]

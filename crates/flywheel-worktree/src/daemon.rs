@@ -405,7 +405,14 @@ pub struct NotARepository;
 
 /// The toplevel of the repository the working directory is inside.
 pub fn repo_root() -> Result<PathBuf, NotARepository> {
+    repo_root_at(Path::new("."))
+}
+
+/// The toplevel of the repository `dir` is inside.
+pub fn repo_root_at(dir: &Path) -> Result<PathBuf, NotARepository> {
     let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
         .args(["rev-parse", "--show-toplevel"])
         .stdin(Stdio::null())
         .output();
@@ -2387,9 +2394,6 @@ mod tests {
     use std::fs;
     use std::sync::Mutex;
 
-    /// Serializes the tests that change the process cwd.
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
-
     fn quiet() -> Logger {
         Arc::new(|_m: &str| {})
     }
@@ -2711,12 +2715,8 @@ mod tests {
 
     #[test]
     fn repo_root_outside_a_repository_is_an_error() {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(tmp.path()).unwrap();
-        let result = repo_root();
-        std::env::set_current_dir(previous).unwrap();
+        let result = repo_root_at(tmp.path());
         assert_eq!(
             result.unwrap_err().to_string(),
             "ERROR: not inside a git repository."
@@ -3715,22 +3715,6 @@ esac
 
     // --- main ------------------------------------------------------------------------------
 
-    struct CwdGuard {
-        previous: PathBuf,
-    }
-
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.previous);
-        }
-    }
-
-    fn enter(dir: &Path) -> CwdGuard {
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir).unwrap();
-        CwdGuard { previous }
-    }
-
     fn run_main(argv: &[&str]) -> (i32, String, String) {
         let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
         let mut out = Vec::new();
@@ -3741,72 +3725,6 @@ esac
             String::from_utf8_lossy(&out).into_owned(),
             String::from_utf8_lossy(&err).into_owned(),
         )
-    }
-
-    /// Points `FLYWHEEL_HOME` at `home` for the guard's life and restores
-    /// the previous value on drop. Callers hold [`CWD_LOCK`], which every
-    /// test that runs the worker entry point (the only reader) takes.
-    struct HomeGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: the tests that read the variable serialize on CWD_LOCK,
-            // which the caller still holds while this guard drops.
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(flywheel_orchestrator::home::HOME_ENV, value),
-                    None => std::env::remove_var(flywheel_orchestrator::home::HOME_ENV),
-                }
-            }
-        }
-    }
-
-    fn with_home(home: &Path) -> HomeGuard {
-        let previous = std::env::var_os(flywheel_orchestrator::home::HOME_ENV);
-        // SAFETY: as in `HomeGuard::drop`.
-        unsafe { std::env::set_var(flywheel_orchestrator::home::HOME_ENV, home) };
-        HomeGuard { previous }
-    }
-
-    /// The one project dir under `home` (the worker created it).
-    fn project_dir(home: &Path) -> PathBuf {
-        let mut dirs: Vec<PathBuf> = fs::read_dir(home.join("projects"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .collect();
-        assert_eq!(dirs.len(), 1, "{dirs:?}");
-        dirs.remove(0)
-    }
-
-    fn porcelain(repo: &Path) -> String {
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["status", "--porcelain", "--ignored"])
-            .output()
-            .unwrap();
-        String::from_utf8(output.stdout).unwrap()
-    }
-
-    #[test]
-    fn main_subone_concurrency_exits_nonzero_and_claims_nothing() {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = with_home(&tmp.path().join("home"));
-        let repo = tmp.path().join("repo");
-        init_repo(&repo);
-        let _cwd = enter(&repo);
-        let (code, _out, err) = run_main(&["--concurrency", "0", "--once"]);
-        assert_ne!(code, 0);
-        assert!(err.contains("concurrency"), "{err}");
-        assert!(err.starts_with("flywheel worker: policy error: "), "{err}");
-        assert!(
-            !project_dir(&tmp.path().join("home"))
-                .join("flywheel.sqlite")
-                .exists()
-        );
     }
 
     #[test]
@@ -3822,48 +3740,6 @@ esac
             err.contains("unrecognized arguments: --policy flywheel.toml"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn main_once_keeps_every_runtime_artifact_under_the_home_project() {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let _home = with_home(&home);
-        let repo = tmp.path().join("repo");
-        init_repo(&repo);
-        let before = porcelain(&repo);
-        let _cwd = enter(&repo);
-        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        let project = project_dir(&home);
-        assert!(project.join("flywheel.sqlite").exists());
-        assert!(project.join("worktrees").is_dir());
-        assert!(project.join("tasks").join("active").is_dir());
-        assert_eq!(
-            porcelain(&repo),
-            before,
-            "the worker wrote into the repo tree"
-        );
-    }
-
-    #[test]
-    fn main_refuses_inconsistent_run_flags_before_claiming() {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _home = with_home(&tmp.path().join("home"));
-        let repo = tmp.path().join("repo");
-        init_repo(&repo);
-        let _cwd = enter(&repo);
-        let (code, _out, err) = run_main(&["--once", "--source", "github"]);
-        assert_eq!(code, 2);
-        assert!(
-            err.contains("--source github needs --repo OWNER/NAME"),
-            "{err}"
-        );
-        let (code, _out, err) = run_main(&["--once", "--sandbox", "container"]);
-        assert_eq!(code, 2);
-        assert!(err.contains("needs --image IMAGE"), "{err}");
     }
 
     #[test]
@@ -3895,18 +3771,6 @@ esac
                 image: Some("img".into()),
                 agent: Some("codex".into()),
             }
-        );
-    }
-
-    #[test]
-    fn main_outside_a_repository_reports_the_git_error() {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let _cwd = enter(tmp.path());
-        let (code, _out, err) = run_main(&["--once"]);
-        assert_eq!(
-            (code, err.as_str()),
-            (1, "ERROR: not inside a git repository.\n")
         );
     }
 

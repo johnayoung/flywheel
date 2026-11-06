@@ -345,6 +345,94 @@ fn a_non_git_dir_is_refused_naming_git() {
 }
 
 #[test]
+fn audit_outside_a_git_repo_refuses_unless_db_names_the_store() {
+    let sandbox = Sandbox::new();
+    let plain = sandbox.root.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let refused = |output: &Output| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("not inside a git repository"), "{stderr}");
+    };
+
+    // No project outside a git repo: the verb refuses naming git, and
+    // core's default store path is never created.
+    refused(&sandbox.fw(&plain, &["audit", "run-ghost"]));
+    assert!(!plain.join("flywheel.db").exists());
+
+    // A legacy flywheel.toml naming a db is not read: still refused.
+    let db = plain.join("custom").join("store.sqlite");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    flywheel_core::store_sqlite::SqliteStore::open(&db).unwrap();
+    std::fs::write(
+        plain.join("flywheel.toml"),
+        "[source]\nkind = \"directory\"\n[paths]\ndb = \"custom/store.sqlite\"\n",
+    )
+    .unwrap();
+    refused(&sandbox.fw(&plain, &["audit", "run-ghost"]));
+
+    // An explicit --db names the store (relative to the cwd): it is read.
+    let output = sandbox.fw(&plain, &["audit", "--db", "custom/store.sqlite", "run-ghost"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "no records for run_id run-ghost\n"
+    );
+    assert!(!plain.join("flywheel.db").exists());
+    assert!(sandbox.projects().is_empty());
+}
+
+#[test]
+fn worker_once_keeps_every_artifact_in_the_home_and_refuses_bad_flags_first() {
+    let sandbox = Sandbox::new();
+    let repo = sandbox.repo("repo");
+    let porcelain = || git(&repo, &["status", "--porcelain", "--ignored"]);
+    let before = porcelain();
+    let stderr = |output: &Output| String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // A sub-one pool is a policy error before anything is claimed or opened.
+    let output = sandbox.fw(&repo, &["worker", "--concurrency", "0", "--once"]);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(
+        stderr(&output).contains("flywheel worker: policy error: ")
+            && stderr(&output).contains("concurrency"),
+        "{}",
+        stderr(&output)
+    );
+    let [id] = sandbox.projects().try_into().unwrap();
+    let project = sandbox.flywheel_home().join("projects").join(&id);
+    assert!(!project.join("flywheel.sqlite").exists());
+
+    // Inconsistent run flags are refused (exit 2) before claiming.
+    let output = sandbox.fw(&repo, &["worker", "--once", "--source", "github"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("--source github needs --repo OWNER/NAME"));
+    let output = sandbox.fw(&repo, &["worker", "--once", "--sandbox", "container"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("needs --image IMAGE"));
+
+    // An empty queue: the store, worktree root, and tasks dir all land in
+    // the project dir; the repo tree (ignored files included) is untouched.
+    sandbox.ok(&repo, &["worker", "--once", "--heartbeat", "0"]);
+    assert!(project.join("flywheel.sqlite").exists());
+    assert!(project.join("worktrees").is_dir());
+    assert!(project.join("tasks").join("active").is_dir());
+    assert_eq!(porcelain(), before, "the worker wrote into the repo tree");
+
+    // Outside a git repo the worker names git and exits 1.
+    let plain = sandbox.root.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let output = sandbox.fw(&plain, &["worker", "--once"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("ERROR: not inside a git repository."));
+}
+
+#[test]
 fn a_worker_drains_a_home_project_and_lands_the_work() {
     let sandbox = Sandbox::new();
     let repo = sandbox.repo("repo");

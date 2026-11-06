@@ -128,6 +128,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ),
     ("commands.js", include_bytes!("../web/commands.js"), JS),
     ("replies.js", include_bytes!("../web/replies.js"), JS),
+    (
+        "reply-marks.js",
+        include_bytes!("../web/reply-marks.js"),
+        JS,
+    ),
     ("files.js", include_bytes!("../web/files.js"), JS),
     ("import.js", include_bytes!("../web/import.js"), JS),
     ("onboarding.js", include_bytes!("../web/onboarding.js"), JS),

@@ -535,6 +535,26 @@ body.resizing-y, body.resizing-y * { cursor: row-resize !important; user-select:
 }
 .pane-term .xterm { height: 100%; }
 .pane-term .xterm-viewport { background-color: var(--bg) !important; }
+/* Copy button on the agent reply under the pointer (reply-marks.js): an
+   xterm decoration at the reply's first visible row, right edge. */
+/* x 0 leaves xterm's right offset unset: pinned here. */
+.pane-term .xterm-decoration.reply-mark { right: 0; display: flex; justify-content: flex-end; align-items: center; pointer-events: none; }
+.reply-mark-btn {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  max-width: 1.6rem;
+  padding: 0;
+  border: 1px solid var(--rule-2);
+  background: var(--bg);
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.reply-mark-btn:hover, .reply-mark-btn:focus-visible { color: var(--signal); border-color: var(--signal); }
+.reply-mark-btn svg { width: .8rem; height: .8rem; }
 .pane-term .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--rule-2) transparent; }
 /* Sized to another viewer's terminal (panes.js) or held at the phone's row
    floor (mobile.js): clipped, the window follows the cursor (panes.js

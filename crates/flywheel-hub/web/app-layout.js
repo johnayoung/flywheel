@@ -112,6 +112,14 @@ function claimsSize(pane) {
 const panes = window.FwHubPanes({
   el, state, sessionById, TERM_FONT, status: statusLook, goneText, exitHow,
   net,
+  // Copy buttons on an agent's replies in its terminal (reply-marks.js).
+  replyMarks: window.FwHubReplyMarks({
+    el,
+    icon,
+    sessionById,
+    replies,
+    paneHidden: (pane) => document.visibilityState !== "visible" || !onStage(pane),
+  }),
   // Off screen: the page hidden, or the pane parked (another tab, a zoom).
   paneHidden: (pane) => document.visibilityState !== "visible" || !onStage(pane),
   // A machine's session attaches through this hub's proxy.

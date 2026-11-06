@@ -212,7 +212,8 @@ window.FwHubPanes = function (ctx) {
         lineHeight: 1.12,
         // Font, size, cursor, scrollback: Settings (appearance, terminal).
         ...ctx.termPrefs(),
-        allowProposedApi: false,
+        // Decorations (reply-marks.js's copy buttons) are proposed API.
+        allowProposedApi: true,
         ...ctx.termTheme(),
       });
       const fit = new window.FitAddon.FitAddon();
@@ -225,6 +226,10 @@ window.FwHubPanes = function (ctx) {
       pane.search = search;
       term.open(host);
       muteQueries(term);
+      // Copy buttons on an agent's replies: re-read after anything that
+      // may move or redraw the rows.
+      pane.marks = ctx.replyMarks ? ctx.replyMarks.attach(pane) : null;
+      if (pane.marks) term.onWriteParsed(() => pane.marks.refresh());
       term.attachCustomKeyEventHandler((event) => clipboardKey(term, event));
       // A paste without text (an image on the clipboard): ^V, so an agent
       // that reads the clipboard itself (Claude Code) attaches the image.
@@ -253,11 +258,15 @@ window.FwHubPanes = function (ctx) {
         if (!pane.following && pane.claims()) pane.send(JSON.stringify({ type: "resize", cols, rows }));
         ctx.onResize(pane);
         scheduleClip();
+        if (pane.marks) pane.marks.refresh();
       });
       // The cursor moving or the view scrolling only moves the clip
       // window: the box and terminal heights measured last still hold.
       term.onCursorMove(() => scheduleClip(true));
-      term.onScroll(() => scheduleClip(true));
+      term.onScroll(() => {
+        scheduleClip(true);
+        if (pane.marks) pane.marks.refresh();
+      });
       // Typing or clicking in a pane focuses it (its xterm took the focus).
       term.textarea.addEventListener("focus", () => ctx.onFocusIn(pane));
       pane.term = term;
@@ -587,6 +596,7 @@ window.FwHubPanes = function (ctx) {
       if (!session) return;
       if (!pane.term) makeTerm();
       closeSocket();
+      if (pane.marks) pane.marks.reset();
       pane.sessionId = id;
       pane.retry = 0;
       forgetLink();
@@ -608,6 +618,7 @@ window.FwHubPanes = function (ctx) {
     // Let go of the session (the pane stays, empty).
     pane.clear = () => {
       closeSocket();
+      if (pane.marks) pane.marks.reset();
       forgetLink();
       pane.sessionId = null;
       pane.exited = null;
@@ -1003,6 +1014,8 @@ window.FwHubPanes = function (ctx) {
       clearTimeout(retryTimer);
       closeSocket();
       forgetLink();
+      if (pane.marks) pane.marks.dispose();
+      pane.marks = null;
       if (pane.term) pane.term.dispose();
       pane.term = null;
       pane.fit = null;

@@ -49,6 +49,7 @@ pub(super) fn serve_cmd(
         let _ = writeln!(err, "fw hub: {message}");
         return 2;
     }
+    crate::cli::notice_legacy_state(&hub_args.state, err);
     if let Err(e) = crate::paths::ensure_private_dir(&state_dir) {
         let _ = writeln!(err, "fw hub: state dir {}: {e}", state_dir.display());
         return 1;

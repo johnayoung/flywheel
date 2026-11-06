@@ -65,7 +65,7 @@ An unapproved repo file: `worker`, `autopilot`, `archive`, and the console refus
 
 ## Projects and the home
 
-Every byte flywheel writes lives under `$FLYWHEEL_HOME` (default `~/.flywheel`): `config.toml`, `trust.json`, `hub/` (hub state), and `projects/<id>/` (`meta.json`, `config.toml`, `flywheel.sqlite`, `specs/`, `tasks/`, `transcripts/`, `worktrees/`, `held-out/`, `logs/`).
+Every byte flywheel writes lives under `$FLYWHEEL_HOME` (default `~/.flywheel`): `config.toml`, `trust.json`, `hub/` (hub state), and `projects/<id>/` (`meta.json`, `config.toml`, `flywheel.sqlite`, `specs/`, `tasks/`, `transcripts/`, `worktrees/`, `held-out/`, `logs/`). A pre-home hub state dir (`$XDG_STATE_HOME/flywheel/hub`, else `~/.local/state/flywheel/hub`) is not read: the first `fw hub start`/`serve` prints the `mv` that moves it.
 
 - A project is a git repo. Its id (UUID v4) is stored in the repo's common `.git/config` as `flywheel.projectid`, so every linked worktree maps to one project. The first store verb in a repo mints it; nothing else is written into the repo.
 - `meta.json` records `id`, `path` (canonical main worktree), `git_common_dir`, `remote` (origin URL or null), `first_seen`, `last_seen`.

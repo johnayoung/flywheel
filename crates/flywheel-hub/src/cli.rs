@@ -549,6 +549,23 @@ pub(crate) fn resolve_state_dir(arg: &StateDirArg) -> Result<PathBuf, String> {
     }
 }
 
+/// Print [`crate::paths::legacy_state_notice`] on `err` when the hub runs
+/// on the default state dir (no `--state-dir`) and a pre-home state dir
+/// exists while the default does not. Call before the state dir is created.
+pub(crate) fn notice_legacy_state(arg: &StateDirArg, err: &mut dyn Write) {
+    if arg.state_dir.is_some() {
+        return;
+    }
+    let (Some(legacy), Some(state_dir)) = (crate::paths::legacy_state_dir(), default_state_dir())
+    else {
+        return;
+    };
+    let state_dir = std::path::absolute(&state_dir).unwrap_or(state_dir);
+    if let Some(line) = crate::paths::legacy_state_notice(&legacy, &state_dir) {
+        let _ = writeln!(err, "{line}");
+    }
+}
+
 /// Most async worker threads the hub runs. Its async work is many small
 /// wakeups (terminal output frames, pushes, short requests; anything slow
 /// runs on the blocking pool): measured with 50 sessions and 3 browsers,

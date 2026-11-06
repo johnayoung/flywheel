@@ -82,6 +82,7 @@ fn start_daemon(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) -> R
     }
     // Refuse bad options here, not in a log nobody is reading.
     args.hub.public_url_origins()?;
+    crate::cli::notice_legacy_state(&args.hub.state, err);
     let dir = prepare_state_dir(&args.hub.state)?;
     if let Some(info) = running_hub(&dir)? {
         let _ = writeln!(

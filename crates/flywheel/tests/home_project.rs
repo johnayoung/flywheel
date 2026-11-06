@@ -232,6 +232,80 @@ fn the_hub_keeps_its_state_under_the_flywheel_home() {
     assert!(!sandbox.root.join("home/.local").exists());
 }
 
+/// A pre-home hub state dir (`$XDG_STATE_HOME/flywheel/hub`) is never read
+/// or moved: the first `fw hub start` / `fw hub serve` on the new layout
+/// prints the `mv` that moves it, once.
+#[test]
+fn a_legacy_hub_state_dir_gets_a_one_time_move_notice() {
+    use std::io::{BufRead, BufReader};
+    let sandbox = Sandbox::new();
+    let legacy = sandbox.xdg_state().join("flywheel/hub");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("token"), "old-token\n").unwrap();
+    let new = sandbox.flywheel_home().join("hub");
+    let mv = format!("mv {} {}", legacy.display(), new.display());
+
+    // `fw hub serve` (foreground): the notice is on stderr before it serves.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["hub", "serve", "--port", "0"])
+        .current_dir(&sandbox.root)
+        .env("FLYWHEEL_HOME", sandbox.flywheel_home())
+        .env("HOME", sandbox.root.join("home"))
+        .env("XDG_STATE_HOME", sandbox.xdg_state())
+        .env("PATH", path)
+        .env("SHELL", "/bin/sh")
+        .env_remove("FW_HUB_TOKEN")
+        .env_remove("INVOCATION_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    BufReader::new(serve.stderr.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    let _ = serve.kill();
+    let _ = serve.wait();
+    assert!(first.starts_with("fw hub: notice: "), "{first}");
+    assert!(first.contains(&mv), "{first}");
+    assert_eq!(
+        std::fs::read_to_string(legacy.join("token")).unwrap(),
+        "old-token\n"
+    );
+
+    // Back to a first start (the killed serve may have created the dir):
+    // `fw hub start` prints it once, a second start says nothing.
+    let _ = std::fs::remove_dir_all(&new);
+    let started = sandbox.fw(&sandbox.root, &["hub", "start", "--port", "0"]);
+    let stderr = String::from_utf8_lossy(&started.stderr).into_owned();
+    assert!(started.status.success(), "{stderr}");
+    let stopped = sandbox.fw(
+        &sandbox.root,
+        &["hub", "stop", "--force", "--timeout", "10"],
+    );
+    assert!(stopped.status.success(), "{stopped:?}");
+    assert_eq!(stderr.matches("fw hub: notice: ").count(), 1, "{stderr}");
+    assert!(stderr.contains(&mv), "{stderr}");
+    let again = sandbox.fw(&sandbox.root, &["hub", "start", "--port", "0"]);
+    let _ = sandbox.fw(
+        &sandbox.root,
+        &["hub", "stop", "--force", "--timeout", "10"],
+    );
+    assert!(again.status.success(), "{again:?}");
+    assert!(
+        !String::from_utf8_lossy(&again.stderr).contains("notice"),
+        "{again:?}"
+    );
+    // Nothing was moved: the old state is where it was.
+    assert_eq!(
+        std::fs::read_to_string(legacy.join("token")).unwrap(),
+        "old-token\n"
+    );
+    assert!(new.join("token").is_file());
+}
+
 #[test]
 fn linked_worktrees_share_and_moves_keep_and_copies_mint() {
     let sandbox = Sandbox::new();

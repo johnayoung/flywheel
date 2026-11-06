@@ -68,7 +68,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The default store path when neither `--db` nor the policy names one.
+/// The cwd-relative store path when neither `--db` nor a policy names one
+/// (direct callers only: the console always has a home-project policy
+/// unless `--db` is given).
 pub const DEFAULT_STORE_PATH: &str = ".flywheel/flywheel.sqlite";
 
 // --- Daemon control ---------------------------------------------------------------
@@ -492,7 +494,8 @@ pub fn parse_args(argv: &[String]) -> Result<TuiArgs, clap::Error> {
 // --- Resolution helpers ----------------------------------------------------------
 
 /// The store path with `fw status`'s precedence: explicit `--db`, else the
-/// policy's `[paths] db`, else [`DEFAULT_STORE_PATH`].
+/// policy's store (the home project's `flywheel.sqlite`), else
+/// [`DEFAULT_STORE_PATH`].
 pub fn resolve_db_path(db_arg: Option<&str>, policy: Option<&WorkPolicy>) -> PathBuf {
     if let Some(db) = db_arg.filter(|d| !d.is_empty()) {
         return PathBuf::from(db);
@@ -504,7 +507,7 @@ pub fn resolve_db_path(db_arg: Option<&str>, policy: Option<&WorkPolicy>) -> Pat
 }
 
 /// The agent model id the spawned worker should run with: an explicit
-/// `--model` wins, else the policy's `[agent] model`, else `None` so the
+/// `--model` wins, else the policy's `model` config key, else `None` so the
 /// worker omits `--model` and the SDK falls through to its default.
 pub fn resolve_model_for_worker(
     model_arg: Option<&str>,
@@ -547,8 +550,9 @@ pub fn resolve_archive_tasks_dir(
         .and_then(|p| p.tasks_dir.clone())
 }
 
-/// The repo root a tasks dir belongs to: the parent of the enclosing
-/// `.flywheel` directory, else the current working directory.
+/// The repo root an explicit `--tasks-dir` belongs to: the parent of an
+/// enclosing pre-home `.flywheel` directory, else the current working
+/// directory.
 pub fn repo_root_for_tasks_dir(tasks_dir: &Path) -> PathBuf {
     let resolved = tasks_dir
         .canonicalize()
@@ -563,7 +567,7 @@ pub fn repo_root_for_tasks_dir(tasks_dir: &Path) -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// The `[source]` table a policy's source fields re-materialize to, so the
+/// The source settings table a policy's source fields re-materialize to, so the
 /// registry can build the adapter the policy selects.
 pub fn source_settings_for_policy(policy: &WorkPolicy) -> toml::Table {
     let mut settings = toml::Table::new();
@@ -616,8 +620,8 @@ pub fn source_settings_for_policy(policy: &WorkPolicy) -> toml::Table {
 }
 
 /// Mirror `fw status`'s work-source precedence: an explicit `--tasks-dir`
-/// selects the directory source, else the policy decides, else the default
-/// `.flywheel/tasks` directory. Directory sources are wrapped in a
+/// selects the directory source, else the policy decides, else it is an
+/// error naming `--tasks-dir`. Directory sources are wrapped in a
 /// fingerprint cache so the per-tick listing cost is one metadata walk.
 pub fn resolve_work_source(
     tasks_dir_arg: Option<&str>,
@@ -725,8 +729,9 @@ pub fn missing_dsn_message() -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonSpawnSpec {
     /// The home project's paths: the supervisors log under its
-    /// `logs/worker/` and `logs/autopilot/`. `None` keeps the in-repo
-    /// `.flywheel/logs/` defaults (explicit `--db`/`--tasks-dir`, no project).
+    /// `logs/worker/` and `logs/autopilot/`. `None` (explicit
+    /// `--db`/`--tasks-dir`, no project) keeps the supervisors' cwd-relative
+    /// `.flywheel/logs/` defaults.
     pub project: Option<ProjectPaths>,
     pub db_path: PathBuf,
     /// The store partition the console reads (the project id, or
@@ -1472,12 +1477,17 @@ mod tests {
     fn main_missing_store_exits_2_and_json_mode_prints_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist.sqlite");
+        // Both explicit paths: no home project is resolved (the test never
+        // touches the real $FLYWHEEL_HOME or the checkout it runs in).
         let argv = vec![
             "--db".to_owned(),
             missing.display().to_string(),
             "--json".to_owned(),
+            "--tasks-dir".to_owned(),
+            dir.path().join("tasks").display().to_string(),
         ];
         assert_eq!(main(&argv), 2);
+        assert!(!missing.exists(), "the missing store is never created");
         let db = dir.path().join("db.sqlite");
         {
             let store = SqliteStore::open(&db).unwrap();

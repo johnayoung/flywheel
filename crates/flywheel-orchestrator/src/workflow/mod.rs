@@ -76,10 +76,16 @@ pub use show::{
 pub use status::cmd_status;
 pub use validate::cmd_validate;
 
-/// The default tasks root when neither a flag nor a policy names one.
+/// The cwd-relative tasks root a direct library caller with neither a flag
+/// nor a policy falls back to. Never reached through `fw`: every verb binds
+/// the home project (`$FLYWHEEL_HOME/projects/<id>/tasks`) or takes explicit
+/// flags.
 pub const DEFAULT_TASKS_DIR: &str = ".flywheel/tasks";
-/// The default SQLite store path (`flywheel_core.workflow.DEFAULT_DB_PATH`).
-pub const DEFAULT_DB_PATH: &str = ".flywheel/flywheel.sqlite";
+/// The cwd-relative SQLite store a direct library caller with neither a
+/// flag nor a policy falls back to (core's standalone
+/// `flywheel_core::workflow::DEFAULT_DB_PATH`). Never reached through `fw`,
+/// which uses `$FLYWHEEL_HOME/projects/<id>/flywheel.sqlite` or `--db`.
+pub const DEFAULT_DB_PATH: &str = flywheel_core::workflow::DEFAULT_DB_PATH;
 
 // --- Errors ------------------------------------------------------------------------
 
@@ -356,7 +362,7 @@ pub fn default_source_registry() -> SourceRegistry {
     registry
 }
 
-/// The `[source]` settings table a policy describes, in the shape the
+/// The source settings table a policy describes, in the shape the
 /// registry factories read (`kind` plus the per-kind keys).
 pub fn source_settings_from_policy(policy: &WorkPolicy) -> toml::Table {
     let mut settings = toml::Table::new();
@@ -415,11 +421,9 @@ pub fn build_work_source(
 /// Resolve the work source for a CLI invocation.
 ///
 /// Precedence: an explicit `--tasks-dir` always selects the directory
-/// source; otherwise the policy decides; otherwise the default directory
-/// layout applies -- and when even that is absent the invocation fails
-/// LOUD instead of rendering an empty queue indistinguishable from a
-/// caught-up repo: no policy up the directory tree plus no
-/// `.flywheel/tasks` here means this is not a flywheel repo.
+/// source; otherwise the policy (the home project's) decides; with neither
+/// the invocation fails LOUD instead of rendering an empty queue
+/// indistinguishable from a caught-up repo. No repo-tree layout is probed.
 pub fn resolve_work_source(
     tasks_dir: Option<&str>,
     policy: Option<&WorkPolicy>,
@@ -431,21 +435,18 @@ pub fn resolve_work_source(
     if let Some(policy) = policy {
         return Ok(build_work_source(policy, registry)?);
     }
-    if !Path::new(DEFAULT_TASKS_DIR).is_dir() {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        return Err(PolicyError::Invalid(format!(
-            "no {DEFAULT_TASKS_DIR} in {}: run inside a git repo (its project's tasks live \
-             under $FLYWHEEL_HOME), or pass --tasks-dir",
-            cwd.display()
-        ))
-        .into());
-    }
-    Ok(Box::new(DirectoryWorkSource::new(DEFAULT_TASKS_DIR)))
+    Err(PolicyError::Invalid(
+        "no tasks dir: run inside a git repo (its project's tasks live under \
+         $FLYWHEEL_HOME), or pass --tasks-dir"
+            .to_owned(),
+    )
+    .into())
 }
 
 /// Resolve the SQLite store path with orchestrate's precedence: the
-/// explicit `--db` flag, else the policy's `[paths] db`, else the built-in
-/// `.flywheel/flywheel.sqlite`. An empty `db` counts as "not specified".
+/// explicit `--db` flag, else the policy's store (the home project's
+/// `flywheel.sqlite`), else [`DEFAULT_DB_PATH`] (direct library callers
+/// only). An empty `db` counts as "not specified".
 pub fn resolve_db_path(db: Option<&str>, policy: Option<&WorkPolicy>) -> PathBuf {
     if let Some(db) = db.filter(|d| !d.is_empty()) {
         return PathBuf::from(db);
@@ -457,9 +458,9 @@ pub fn resolve_db_path(db: Option<&str>, policy: Option<&WorkPolicy>) -> PathBuf
 }
 
 /// The tasks dir a directory-only verb (`validate`, `archive`) operates on:
-/// the flag, else a directory policy's `tasks_dir`, else the default; a
+/// the flag, else a directory policy's `tasks_dir` (the home project's); a
 /// tracker policy is refused with `<verb> applies to directory work sources
-/// only`.
+/// only`, and no flag and no policy is refused naming `--tasks-dir`.
 pub fn resolve_directory_tasks_dir(
     verb: &str,
     tasks_dir: Option<&str>,
@@ -477,7 +478,10 @@ pub fn resolve_directory_tasks_dir(
             "{verb} applies to directory work sources only; the active policy selects a \
              tracker source (pass --tasks-dir to {verb} a directory layout explicitly)"
         ))),
-        None => Ok(PathBuf::from(DEFAULT_TASKS_DIR)),
+        None => Err(PolicyError::Invalid(format!(
+            "{verb}: no tasks dir: run inside a git repo (its project's tasks live under \
+             $FLYWHEEL_HOME), or pass --tasks-dir"
+        ))),
     }
 }
 
@@ -505,11 +509,13 @@ fn resolve_nonstrict(path: &Path) -> PathBuf {
     out
 }
 
-/// Resolve the repo root a grader's `run` path tokens are relative to.
+/// Resolve the repo root a grader's `run` path tokens are relative to, for
+/// an explicit `--tasks-dir` with no home project to answer it.
 ///
-/// Tasks live under `<repo_root>/.flywheel/tasks`, so the repo root is the
-/// ancestor that contains the `.flywheel` directory. A custom `--tasks-dir`
-/// outside a `.flywheel` tree falls back to the current working directory.
+/// A tasks dir inside a `<repo>/.flywheel/` tree (the pre-home layout an
+/// operator may still point `--tasks-dir` at) answers `<repo>`; any other
+/// dir falls back to the current working directory. Home-project tasks go
+/// through [`repo_root_for`], which answers the project's recorded root.
 pub fn repo_root_for_tasks_dir(tasks_dir: &Path) -> PathBuf {
     let resolved = resolve_nonstrict(tasks_dir);
     for parent in resolved.ancestors().skip(1) {
@@ -535,19 +541,20 @@ pub fn repo_root_for(tasks_dir: &Path, policy: Option<&WorkPolicy>) -> PathBuf {
 }
 
 /// `(repo_root, true_base)` for the phase-prerequisite reachability hold:
-/// the configured submit base else `HEAD`, and the `.flywheel` ancestor of
-/// the resolved tasks dir (falling back to cwd).
+/// the configured submit base else `HEAD`, and the repo root of the
+/// resolved tasks dir ([`repo_root_for`]; the cwd when there is none).
 pub fn reachability_context(
     tasks_dir: Option<&str>,
     policy: Option<&WorkPolicy>,
 ) -> (PathBuf, String) {
-    let tasks_dir = match tasks_dir.filter(|d| !d.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => policy
-            .and_then(|p| p.tasks_dir.clone())
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_TASKS_DIR)),
+    let tasks_dir = tasks_dir
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| policy.and_then(|p| p.tasks_dir.clone()));
+    let repo_root = match tasks_dir {
+        Some(dir) => repo_root_for(&dir, policy),
+        None => std::env::current_dir().unwrap_or_default(),
     };
-    let repo_root = repo_root_for(&tasks_dir, policy);
     let true_base = policy
         .and_then(|p| p.submit_base.clone())
         .filter(|b| !b.is_empty())
@@ -566,7 +573,7 @@ pub fn resolve_fallback_phases(
         return build_task_phase_index(dir);
     }
     match policy {
-        None => build_task_phase_index(DEFAULT_TASKS_DIR),
+        None => BTreeMap::new(),
         Some(policy) if policy.source_kind == "directory" => match &policy.tasks_dir {
             Some(dir) => build_task_phase_index(dir),
             None => BTreeMap::new(),
@@ -1271,10 +1278,8 @@ mod tests {
             resolve_directory_tasks_dir("validate", Some("x"), Some(&policy)).unwrap(),
             PathBuf::from("x")
         );
-        assert_eq!(
-            resolve_directory_tasks_dir("archive", None, None).unwrap(),
-            PathBuf::from(DEFAULT_TASKS_DIR)
-        );
+        let err = resolve_directory_tasks_dir("archive", None, None).unwrap_err();
+        assert!(err.to_string().contains("pass --tasks-dir"), "{err}");
     }
 
     #[test]

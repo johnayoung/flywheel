@@ -33,7 +33,7 @@ Each fenced block is read from the agent's own record and served **exactly as wr
 - In-session commands (Claude Code's `!` bash mode): an inline `` `! cmd` `` or a block of `! cmd` lines is a shell command; Copy / Send drop the `!`.
 - Send pastes (bracketed when enabled), Send + Run adds Enter; multi-line without bracketed paste: 409, use Copy. `--copy`: OSC 52, over SSH too (tmux: `set -g set-clipboard on`).
 - **Commands drawer** (`Alt C`): newest first; Send targets the companion shell (opened if needed). Keys: `j`/`k`, `c` copy, `1`-`9` a card, `s` send, `Shift S` send + run.
-- **Replies**: every assistant message as written (newest 100, 64 KiB each; same sources). `Alt Y` or the pane menu copies the last; the drawer's Replies tab copies one whole or block by block. Hovering a reply in an agent's pane (`●`/`•`, not a tool call) shows a copy button: its Markdown, else the text as drawn.
+- **Replies**: every assistant message as written (newest 100, 64 KiB each). `Alt Y` copies the last; the Replies tab copies one whole or by block. Hovering a reply in an agent's pane (not a tool call) shows a copy button.
 
 ## Usage and cost
 

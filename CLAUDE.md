@@ -12,13 +12,13 @@ A Cargo workspace of seven crates under `crates/`, each with its source in `crat
 - **`flywheel-core`** — the lifecycle of a **single task**. Knows nothing about who calls it. Its workflow entry points are hidden verbs on the binary (`flywheel workflow run|is-done|set-model`). This is the only crate most contributors touch.
 - **`flywheel-orchestrator`** — built on core: drives **many** tasks (selection over a prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon). Owns its own store (`task_claims`). Library only.
 - **`flywheel-worktree`** — built on the orchestrator: the git-worktree submit strategy + daemon, one worked example of a consumer. Library only; spawned via `flywheel worker`.
-- **`flywheel-container`** — built on the orchestrator: the Docker sandbox execution backend (the agent CLI in headless stream-json via `docker exec` against a bind-mounted worktree, driven through the `flywheel-agents` claude-code adapter under `DockerExecHost`). A sibling consumer of the orchestrator like `flywheel-worktree`. Library only; activated via `[sandbox] backend = "container"`.
+- **`flywheel-container`** — built on the orchestrator: the Docker sandbox execution backend (the agent CLI in headless stream-json via `docker exec` against a bind-mounted worktree, driven through the `flywheel-agents` claude-code adapter under `DockerExecHost`). A sibling consumer of the orchestrator like `flywheel-worktree`. Library only; activated via `fw worker --sandbox container --image IMAGE`.
 - **`flywheel-hub`** — `fw hub`: the web workspace for AI coding agents (axum server owning one PTY per session, workspaces of git repos, token auth, REST + WebSocket API, the embedded plain-JS web UI under `crates/flywheel-hub/web/`). Depends on no other flywheel crate; nothing below `flywheel` depends on it. Docs: `docs/hub.md` (front door: security, quickstart, feature map) + `docs/hub/{reference,api,security,workflows,internals}.md`; `crates/flywheel-hub/src/docs_drift.rs` fails the build when they drift from the CLI, `hub.toml` keys, keymap, routes, or plugin events.
 - **`flywheel`** — top of stack: the unified product shell. Binaries `flywheel` and `fw` (one implementation, two entries) route every operator verb and own the operator console.
 
 Cross-task concepts (prerequisites/DAG, scheduling, claims) live in the orchestrator, never in core. When adding to core, ask: would a single `run_task(task, lifecycle, store)` invocation — one task, no scheduler — need it? If not, it belongs above the line.
 
-The flywheel home (`$FLYWHEEL_HOME`, default `~/.flywheel`) and project identity (`flywheel.projectid` in the repo's `.git/config`) live in `crates/flywheel-orchestrator/src/home.rs`, the single source for every home path; `flywheel-hub` mirrors only its default state dir (`$FLYWHEEL_HOME/hub`), pinned by a test in the `flywheel` crate. Store verbs default to `$FLYWHEEL_HOME/projects/<id>/`; a repo's `flywheel.toml` / `.flywheel/` is ignored (only an explicit `--policy FILE` reads the legacy format).
+The flywheel home (`$FLYWHEEL_HOME`, default `~/.flywheel`) and project identity (`flywheel.projectid` in the repo's `.git/config`) live in `crates/flywheel-orchestrator/src/home.rs`, the single source for every home path; `flywheel-hub` mirrors only its default state dir (`$FLYWHEEL_HOME/hub`), pinned by a test in the `flywheel` crate. Store verbs default to `$FLYWHEEL_HOME/projects/<id>/`; a repo's legacy `flywheel.toml` / `.flywheel/` is ignored with a one-line notice. Every runtime artifact (tasks, store, worktrees, logs, merge lock, held-out registry) lives under the project dir; no verb writes into the repo tree beyond the `.git/config` id. There is no policy file: `WorkPolicy` (`policy.rs`) is synthesized from the home project, the config, and verb flags (`RunFlags`: `fw worker --source/--repo/--label/--require-triage-receipt/--sandbox/--image/--agent`).
 
 Config is eight keys from `$FLYWHEEL_HOME/config.toml` (user), the committed `.flywheel.toml` (repo: `verify`, `protected_paths`, `land`, `project_id` only, honored after `fw trust`), and `$FLYWHEEL_HOME/projects/<id>/config.toml` (personal); precedence flag > env > personal > repo > user > default. Loader: `crates/flywheel-orchestrator/src/config.rs`; trust (`trust.json`, keyed by local project id + file sha256): `trust.rs`. Verbs that run repo commands load with `Access::Execute` (refuse untrusted unattended), read verbs with `Access::ReadOnly`.
 
@@ -35,9 +35,9 @@ Authoritative specs in `docs/` override any inferred behavior. Full index: `docs
 - `docs/orchestration.md` — multi-task scheduling, claims/leases, the orchestrator store and ledgers
 - `docs/work-sources.md` — the `WorkSource` seam and shipped sources (directory, github, github_ci, github_review)
 - `docs/strategy.md` — the `SubmitStrategy`/`SandboxHandle` landing seam and shipped strategies (merge, PR, container)
-- `docs/sandbox.md` + `docs/container-backend.md` — the sandbox-as-deploy model, the `[sandbox.*]` reference, and the Docker backend
+- `docs/sandbox.md` + `docs/container-backend.md` — the sandbox-as-deploy model, its built-in defaults, and the Docker backend
 - `docs/held-out-gate.md` — the execute-time held-out landing gate
-- `docs/configuration.md` — the effective config, repo-file trust, and the legacy `flywheel.toml` reference
+- `docs/configuration.md` — the eight config keys, repo-file trust, verb flags, and where every removed setting went
 - `docs/cli.md` — the `flywheel`/`fw` verbs and operator console
 - `docs/autopilot.md` — the autopilot intake daemon (tiers, scoring, CLI, console)
 - `docs/workflow.md` — how flywheel develops itself: the spec-driven authoring pipeline and the runtime loop
@@ -72,7 +72,7 @@ The `serena` MCP server (auto-loaded from the committed `.mcp.json`) provides la
 - **IMPORTANT: `Task` is input-source agnostic.** Direct struct construction (`Task::new`) is a first-class API; loaders are optional conveniences. No `Task` field may name a path/file/payload/raw/source.
 - **Agent claims are untrusted.** Agent-reported status feeds verification, never authoritative lifecycle state. The harness owns transitions.
 - **Original task definition is immutable.** Execution-time clarifications belong in lifecycle records, not in the `Task`.
-- **Agents are external CLIs.** Flywheel drives the `claude` (stream-json) and `codex` CLIs as subprocesses through `flywheel-agents`; there is no in-process agent SDK, and `[agent] transport = "sdk"` is rejected at config load. `flywheel-agents` must not depend on any other flywheel crate.
+- **Agents are external CLIs.** Flywheel drives the `claude` (stream-json) and `codex` CLIs as subprocesses through `flywheel-agents`; there is no in-process agent SDK and no transport setting. `flywheel-agents` must not depend on any other flywheel crate.
 - **The worker never commits to the operator's branch.** Landing is the `SubmitStrategy`'s job (FF-merge or PR); phase bookkeeping lives in the `refs/flywheel/loop-base/<phase>` ref namespace, materialized into a `.loop-base` dotfile only when a phase archives. Nothing lands that was not verified against the exact base it lands on (submit-time rebase re-runs command graders).
 
 ## Conventions

@@ -28,7 +28,7 @@ flowchart TD
     D -->|yes| DISC["Discovery: one relevance judgment per tier (11 tier subagents in one session) produces findings with evidence and estimates"]
     DISC --> SCORE["Score and sequence: server-side final score, ready/preemptive band ahead of the scheduled band"]
     SCORE --> AUTH["Author: compile top findings into Tasks, each with an out-of-band grader and conflict_keys derived from grader_target and creates_files; un-lowerable findings dropped with a reason"]
-    AUTH --> EMIT["Emit task JSON to .flywheel/tasks/active/autopilot/ (idempotent by task id across active and archive)"]
+    AUTH --> EMIT["Emit task JSON to projects/<id>/tasks/active/autopilot/ (idempotent by task id across active and archive)"]
     EMIT --> START
     EMIT -.->|"independent daemon"| WORKER["Worker drains the queue: claim (conflict_keys serialize overlapping tasks), run the agent, land via the SubmitStrategy"]
 ```
@@ -46,7 +46,7 @@ Three mechanisms (`autopilot_context.rs`) keep an idle or unchanged repo from re
 
 - **Structural pre-filter** — a deterministic file-listing check skips a tier whose precondition is absent; the skipped tier never reaches an agent and records a `structural pre-filter: ...` not-relevant reason. Tier 1 needs deployment config (Dockerfile/compose, k8s/Helm, Procfile, PaaS/serverless manifest, Terraform, service unit, deploy workflow); tier 3 needs a build manifest or CI config; tiers 6–8 need source code. Tiers 2, 4, 5, 9–11 are always dispatched.
 - **Shared repo digest** — one bounded summary (≤8,000 chars: recent commits, two-level layout with file counts, file-type histogram, structural markers, root manifest and README excerpts) is built per repo state and appended to every tier and authoring prompt as a `<repo-digest>` section, so sessions stop re-surveying the tree from cold. The base prompts are unchanged.
-- **Discovery verdict cache** — `logs/autopilot/discovery-cache.json` in the home project dir (`.flywheel/logs/autopilot/` for a `flywheel.toml` repo; survives restarts). Entries key on HEAD plus a fingerprint of uncommitted changes outside `.flywheel/` (emitting tasks never invalidates it); each tier verdict additionally keys on its exact rendered prompt and agent config. A hit runs no discovery agent; errored verdicts are never cached, so only those tiers re-run (`partial`). Findings already authored (emitted or dropped) at the same state are skipped, never re-authored into duplicates. Bounded to 8 states and `discovery_cache_ttl_seconds` (default 6h; `0` disables).
+- **Discovery verdict cache** — `logs/autopilot/discovery-cache.json` in the home project dir (survives restarts). Entries key on HEAD plus a fingerprint of uncommitted changes (emitting tasks never invalidates it); each tier verdict additionally keys on its exact rendered prompt and agent config. A hit runs no discovery agent; errored verdicts are never cached, so only those tiers re-run (`partial`). Findings already authored (emitted or dropped) at the same state are skipped, never re-authored into duplicates. Bounded to 8 states and a 6h lifetime.
 
 **Authoring fan-out.** Up to `authoring_concurrency` (default 3) authoring sessions run at once, never more than the slots still open. Results are emitted strictly in score-sequence order, so the emitted set, the per-pass write cap, the integrity checks, and the no-overwrite emit are identical to the serial loop (`1` = serial). Leaving the pass (cap reached, deadline, cancel) drops every in-flight session, which kills its process group.
 
@@ -59,45 +59,37 @@ flywheel autopilot                      # neverending daemon (default interval 3
 flywheel autopilot --once               # one refill pass, then exit 0
 flywheel autopilot --target-depth 8     # fill to depth 8 this run
 flywheel autopilot --interval 120       # 120s between daemon cycles
+flywheel autopilot --once --dry-run     # decide only: no agent, nothing emitted
 ```
 
 | Flag | Type | Effect |
 | --- | --- | --- |
-| `--tasks-dir` | path | Work queue directory (overrides `[work].tasks_dir`) |
-| `--model` | string | Agent model for discovery and authoring (overrides `[work].model`) |
-| `--target-depth` | int | Fill the queue to this depth (overrides `[autopilot].target_depth`) |
-| `--interval` | float | Seconds between daemon cycles (overrides `[autopilot].interval_seconds`) |
+| `--tasks-dir` | path | Work queue directory (default: the project's `tasks/`) |
+| `--model` | string | Agent model for discovery and authoring (overrides `model`) |
+| `--agent` | string | Agent adapter (`claude-code` default, `codex`) |
+| `--target-depth` | int | Fill the queue to this depth (default 5) |
+| `--interval` | float | Seconds between daemon cycles (default 300) |
 | `--once` | flag | Run one refill pass and exit; no daemon loop |
+| `--dry-run` | flag | With `--once`: measure the queue against the target and log the decision; no discovery, no authoring, nothing written |
 | `--pause` / `--resume` | flag | Hold / release a running daemon between cycles (marker `<activity file>.paused`), then exit |
 
-Flag precedence is CLI flag > policy > code default (`resolve_runtime`, `crates/flywheel-orchestrator/src/autopilot_run.rs`). `landing` and the score weights come from policy only (no CLI flag).
+Flags override built-in defaults (`resolve_runtime`, `crates/flywheel-orchestrator/src/autopilot_run.rs`).
 
-**The daemon never terminates on an idle cycle.** An empty pass writes nothing and the loop continues; it exits only on SIGTERM or SIGINT, finishing the current cycle first (`run_daemon_loop`, `autopilot_run.rs`). A policy error exits 2 before the loop starts. A graceful exit writes a `stopped` record that reads not-live at once. The record names the cycle its summary came from (`last_cycle`) and keeps the newest cycle that decided anything (`last_decision`) across later no-op cycles. While paused it runs no pass (no breaker or back-off strikes) and keeps its record fresh (phase `paused`). The hub drives the same verbs: [hub-workflows](hub/workflows.md#flywheel-panel).
+**The daemon never terminates on an idle cycle.** An empty pass writes nothing and the loop continues; it exits only on SIGTERM or SIGINT, finishing the current cycle first (`run_daemon_loop`, `autopilot_run.rs`). A config or trust error exits 2 before the loop starts. A graceful exit writes a `stopped` record that reads not-live at once. The record names the cycle its summary came from (`last_cycle`) and keeps the newest cycle that decided anything (`last_decision`) across later no-op cycles. While paused it runs no pass (no breaker or back-off strikes) and keeps its record fresh (phase `paused`). The hub drives the same verbs: [hub-workflows](hub/workflows.md#flywheel-panel).
 
 ## Configuration
 
-The optional `[autopilot]` table and `[autopilot.weights]` sub-table bind into `WorkPolicy` (`crates/flywheel-orchestrator/src/policy.rs`). A malformed value raises `PolicyError` so a typo never silently degrades autopilot. See [configuration.md](configuration.md).
+No `[autopilot]` section: emitted work lands per the `land` config key, the model is `model`, and the rest is built in (`WorkPolicy::default`, `crates/flywheel-orchestrator/src/policy.rs`; fates in [configuration.md](configuration.md#where-every-old-setting-went)).
 
-```toml
-[autopilot]
-target_depth     = 5        # positive int; fill the queue to this depth
-landing          = "merge"  # "merge" (FF-merge) or "pr"
-interval_seconds = 300.0    # positive float; seconds between daemon cycles
-authoring_concurrency = 3   # positive int; concurrent authoring sessions (1 = serial)
-discovery_cache_ttl_seconds = 21600.0  # >= 0; cached discovery verdict lifetime (0 = off)
-```
+| Setting | Value |
+| --- | --- |
+| target depth | 5 (`--target-depth`) |
+| interval | 300s (`--interval`) |
+| authoring concurrency | 3 sessions per pass |
+| discovery cache lifetime | 6h |
+| landing | `land` (`merge` or `pr`) |
 
-| Key | Type | Default | Controls |
-| --- | --- | --- | --- |
-| `target_depth` | int | `5` | Queue depth the refill pass fills to |
-| `landing` | string | `merge` | Submit strategy for emitted work: `merge` (FF-merge) or `pr` |
-| `interval_seconds` | float | `300.0` | Seconds between daemon cycles |
-| `authoring_concurrency` | int | `3` | Authoring sessions run at once per pass; `1` = serial |
-| `discovery_cache_ttl_seconds` | float | `21600.0` | Cached discovery verdict lifetime; `0` disables the cache |
-
-The model is not under `[autopilot]` — it comes from the top-level `[work].model`.
-
-`[autopilot.weights]` overrides individual scoring weights; every unset weight keeps its engine default (`AutopilotWeights::default`, `policy.rs`; aliased as `ScoreWeights` in `autopilot.rs`).
+Score weights (`AutopilotWeights::default`; `ScoreWeights` in `autopilot.rs`):
 
 | Weight | Default | Score term |
 | --- | --- | --- |
@@ -108,16 +100,6 @@ The model is not under `[autopilot]` — it comes from the top-level `[work].mod
 | `effort` | `1.0` | Effort penalty (`w_effort`) |
 | `interrupt_base` | `10000.0` | Floor added to ready preemptive findings (`INTERRUPT_BASE`) |
 
-```toml
-[autopilot.weights]   # all optional; an unset weight keeps the engine default
-tier           = 10.0
-urgency        = 3.0
-importance     = 3.0
-unblock        = 2.0
-effort         = 1.0
-interrupt_base = 10000.0
-```
-
 ## The operator console
 
 From the interactive console, `/autopilot start` spawns the neverending autopilot daemon as a detached supervised child; `/autopilot stop` SIGTERMs it (`handle_autopilot_slash`, `crates/flywheel/src/dashboard.rs`). It mirrors `/worker start|stop` but runs independently — starting or stopping autopilot never touches the worker. See [cli.md](cli.md).
@@ -125,7 +107,7 @@ From the interactive console, `/autopilot start` spawns the neverending autopilo
 **Autopilot is never auto-spawned on console launch, unlike the worker, because it writes to the base branch unattended — start it explicitly.** The supervisor is constructed so its status surface and the `/autopilot start` action exist, but nothing spawns until the operator opts in (`crates/flywheel/src/tui.rs`: only the worker honors `auto_start_worker`).
 
 - `start` is idempotent — an already-supervised daemon is left unchanged (no second daemon). The console spawns the continuous daemon, never `--once`.
-- The daemon spawns in its own session (`setsid`), so console Ctrl+C never reaches it and it **survives console exit**. Autopilot writes no claim lease; instead its activity record (`logs/autopilot/activity.json` in the home project dir, or `.flywheel/logs/autopilot/` for a `flywheel.toml` repo; carrying `pid` and an `expires_at` deadline pushed forward every cycle) is the liveness record. A later console that finds a live record adopts the daemon as `Detached` and spawns nothing; a stale record does not block a respawn (`crates/flywheel/src/autopilot_supervisor.rs`).
+- The daemon spawns in its own session (`setsid`), so console Ctrl+C never reaches it and it **survives console exit**. Autopilot writes no claim lease; instead its activity record (`logs/autopilot/activity.json` in the home project dir; carrying `pid` and an `expires_at` deadline pushed forward every cycle) is the liveness record. A later console that finds a live record adopts the daemon as `Detached` and spawns nothing; a stale record does not block a respawn (`crates/flywheel/src/autopilot_supervisor.rs`).
 - `stop` SIGTERMs the child's process group and waits (escalating to SIGKILL past the wait window); it acts only when this console owns the daemon, otherwise it reports "no supervised autopilot to stop".
 
 For where autopilot sits in the spec/plan/verify/execute/retro pipeline — it is the unattended intake half — see [workflow.md](workflow.md); for how emitted work lands, see [strategy.md](strategy.md).
@@ -170,7 +152,7 @@ else:
 
 Urgency is a static agent-supplied 0–10 estimate; the scoring engine consumes it as-is and never escalates it over time. The engine has no clock, deadline, or `now` input.
 
-The shipped weight defaults are `w_tier=10`, `w_urg=3`, `w_imp=3`, `w_unblock=2`, `w_effort=1`, `INTERRUPT_BASE=10000` (`AutopilotWeights::default`); all are tunable via `[autopilot.weights]`. `INTERRUPT_BASE` is large enough that any ready preemptive finding outscores every possible scheduled score, and `sequence_findings` also partitions the two bands before sorting, so the override is absolute by both arithmetic and partition. A Tier 1–3 finding that is not `ready` falls through to the scheduled branch and still scores (with its high tier weight). The recorded breakdown (`ScoreBreakdown`) persists every component plus the `preemptive` flag, so `recompute_final` can re-derive the score from the recorded inputs.
+The shipped weight defaults are `w_tier=10`, `w_urg=3`, `w_imp=3`, `w_unblock=2`, `w_effort=1`, `INTERRUPT_BASE=10000` (`AutopilotWeights::default`); all are built in. `INTERRUPT_BASE` is large enough that any ready preemptive finding outscores every possible scheduled score, and `sequence_findings` also partitions the two bands before sorting, so the override is absolute by both arithmetic and partition. A Tier 1–3 finding that is not `ready` falls through to the scheduled branch and still scores (with its high tier weight). The recorded breakdown (`ScoreBreakdown`) persists every component plus the `preemptive` flag, so `recompute_final` can re-derive the score from the recorded inputs.
 
 ---
 

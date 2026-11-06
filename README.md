@@ -14,23 +14,23 @@ cargo install --path crates/flywheel                                   # or from
 Prebuilt binaries (linux x86_64/aarch64, macOS x86_64/aarch64) are attached to each [GitHub Release](https://github.com/johnayoung/flywheel/releases).
 
 ```bash
-flywheel init           # scaffold .flywheel/, a work policy, and the SDD skills
+flywheel init           # set up the project + skills; prints a suggested .flywheel.toml (writes nothing into the repo)
 claude login            # or export ANTHROPIC_API_KEY=... -- authenticate the agent CLI first
 flywheel worker --once  # claim one task, run it, exit
 flywheel                # operator console (alias: fw)
 ```
 
-Any git repo works without `flywheel init`: flywheel keeps its state under `$FLYWHEEL_HOME/projects/<id>/` (default `~/.flywheel`), keyed by an id it stores in the repo's `.git/config`. `fw project ls` lists the known projects.
+Any git repo works, `fw init` or not: flywheel keeps its state under `$FLYWHEEL_HOME/projects/<id>/` (default `~/.flywheel`), keyed by an id it stores in the repo's `.git/config`. `fw project ls` lists the known projects.
 
 Settings: `~/.flywheel/config.toml` (yours), an optional committed `.flywheel.toml` (`verify`, `protected_paths`, `land`, `project_id`; honored after `fw trust`), and a per-project `config.toml` in the home. `fw config` shows the effective values and where each came from ([docs/configuration.md](docs/configuration.md)).
 
-The worker drives the agent through its CLI (`claude`, or `codex` via `[agent]`), so the CLI must be on `PATH` and authenticated before the first run.
+The worker drives the agent through its CLI (`claude`, or `codex` via `fw worker --agent codex`), so the CLI must be on `PATH` and authenticated before the first run.
 
 `flywheel <verb> --help` lists each verb's flags (`status`, `live`, `history`, `show`, `say`, `interrupt`, `approve`, `reject`, `audit`, ...).
 
 ## Authoring skills
 
-Tasks are the input to the loop; flywheel ships the spec-driven pipeline that produces them as Claude Code skills (five pipeline skills plus an operator runbook). `flywheel init` installs them into the repo's `.claude/skills/` (prompted by default in an interactive run; `--skills` / `--no-skills` answer non-interactively), rendered for the repo's work source (`/fw-plan` swaps a task-directory vs GitHub-issues delivery section):
+Tasks are the input to the loop; flywheel ships the spec-driven pipeline that produces them as Claude Code skills (five pipeline skills plus an operator runbook). `fw init` installs them at user level (`$CLAUDE_CONFIG_DIR/skills`, default `~/.claude/skills`; `--no-skills` skips):
 
 - **`/fw-spec`** — interview an idea into ungameable, end-state success criteria, written as a numbered spec.
 - **`/fw-plan`** — compile a spec or request into right-sized tasks, each spined on the strongest reward-hack-resistant grader the worker can run out-of-band.
@@ -41,19 +41,16 @@ Tasks are the input to the loop; flywheel ships the spec-driven pipeline that pr
 
 Specs, tasks, audits, and proposals live in the project dir, never the repo: the skills resolve each path with `fw project path --specs|--tasks|--root`, and `fw spec export DIR` copies the specs out if you want them committed.
 
-They are project-agnostic templates: re-running `flywheel init` regenerates the managed files and leaves any you have edited untouched. Each skill's cited design rationale lives in [`docs/research/`](docs/research/).
+They are project-agnostic templates: re-running `fw init` regenerates the managed files and leaves any you have edited untouched. Each skill's cited design rationale lives in [`docs/research/`](docs/research/).
 
 ## How work lands
 
-Each task runs in its own git worktree on a `flywheel/<phase>/<task-id>` branch. When the graders pass, the work lands through the configured landing strategy (`land = "merge" | "pr"`; `phase` and tiers through a legacy `--policy` file):
+Each task runs in its own git worktree on a `flywheel/<phase>/<task-id>` branch. When the graders pass, the work lands through the configured landing strategy (`land = "merge" | "pr"`):
 
 - `merge` (default) — fast-forward the branch into the worker's base branch. If the base advanced underneath a finished task, the branch is rebased and its command graders re-run before the merge, so nothing lands that was not verified against the exact base it lands on.
 - `pr` — push the branch and open a pull request with the grader receipts in the body; review and CI own the merge.
-- `phase` — fast-forward each task onto a per-phase integration branch, then publish the completed phase as one aggregate pull request.
 
-`[[submit.tiers]]` routes each change to one of these by the risk tier of the files it touches.
-
-Either way the work itself is never trusted blind: agent claims feed verification, graders gate the landing, and a `[submit] protected_paths` list keeps a task from rewriting the verification surface (grader config, CI) it is judged by. The worker never commits to your branch directly.
+Either way the work itself is never trusted blind: agent claims feed verification, graders gate the landing, and a `protected_paths` list keeps a task from rewriting the verification surface (grader config, CI) it is judged by. The worker never commits to your branch directly.
 
 ## Crates
 
@@ -65,7 +62,7 @@ A Cargo workspace of seven crates under `crates/`. Dependencies point one way on
 | `flywheel-core` | Lifecycle of a single task: invoke, validate envelopes, verify via graders, record attempts, retry. |
 | `flywheel-orchestrator` | Drives many tasks on top of core: prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon, and the `SubmitStrategy` landing seam. |
 | `flywheel-worktree` | Git-worktree landing strategies — FF-merge (default) or pull request — plus the worker daemon. |
-| `flywheel-container` | Docker sandbox execution backend: runs the agent CLI inside a container against a bind-mounted worktree. Activated via `[sandbox] backend = "container"`. |
+| `flywheel-container` | Docker sandbox execution backend: runs the agent CLI inside a container against a bind-mounted worktree. Activated via `fw worker --sandbox container --image IMAGE`. |
 | `flywheel-hub` | `fw hub`: web workspace of server-owned agent terminals (axum server, REST + WebSocket API, embedded web UI). Depends on no other flywheel crate. |
 | `flywheel` | The `flywheel` / `fw` binaries: verb router and operator console. Bundles the container backend. |
 

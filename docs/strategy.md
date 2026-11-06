@@ -6,7 +6,7 @@ Strategy is the work between "agent finished" and "result committed / merged / s
 
 ## The seam
 
-The named seam is the `SubmitStrategy` trait (`crates/flywheel-orchestrator/src/strategy.rs`), bundling the two hooks `orchestrate` calls around every run (plus a read-only `is_landable` with an always-landable default). Any `Send + Sync` type implementing it is passed as `OrchestrateRequest.strategy`; `CallableStrategy` assembles one from the standalone `prepare_sandbox`/`submit` closures, and with no strategy wired `PlainDirectoryStrategy` runs each task in `sandbox_root/<task-id>` and lands nothing. Selecting a built-in strategy by name (the `flywheel.toml` `[submit] strategy` key) routes through the compile-time `SubmitStrategyRegistry` (`crates/flywheel-worktree/src/submit_registry.rs`), which maps `merge`/`pr`/`phase` to their submitters; the worker builds it via `worker_registry` (`crates/flywheel-worktree/src/daemon.rs`).
+The named seam is the `SubmitStrategy` trait (`crates/flywheel-orchestrator/src/strategy.rs`), bundling the two hooks `orchestrate` calls around every run (plus a read-only `is_landable` with an always-landable default). Any `Send + Sync` type implementing it is passed as `OrchestrateRequest.strategy`; `CallableStrategy` assembles one from the standalone `prepare_sandbox`/`submit` closures, and with no strategy wired `PlainDirectoryStrategy` runs each task in `sandbox_root/<task-id>` and lands nothing. Selecting a built-in strategy by name (the `land` config key) routes through the compile-time `SubmitStrategyRegistry` (`crates/flywheel-worktree/src/submit_registry.rs`), which maps `merge`/`pr` to their submitters; the worker builds it via `worker_registry` (`crates/flywheel-worktree/src/daemon.rs`).
 
 | Hook              | When                                | Contract                                                                                       |
 | ----------------- | ----------------------------------- | ---------------------------------------------------------------------------------------------- |
@@ -30,26 +30,13 @@ The named seam is the `SubmitStrategy` trait (`crates/flywheel-orchestrator/src/
 
 ## Shipped strategies
 
-One `SubmitStrategy` per landing policy, forming a trust ladder consumers climb as graders earn trust. Selected per repo via `flywheel.toml` `[submit] strategy`.
+One `SubmitStrategy` per landing policy, forming a trust ladder consumers climb as graders earn trust. Selected by the `land` config key (`merge` or `pr`).
 
 - **`merge`** (default) — `GitWorktreeSubmitter` (`crates/flywheel-worktree/src/submitter.rs`), full autonomy. Each task runs in its own git worktree on branch `flywheel/<phase>/<task-id>`, branched off the worker's starting branch; on `done` the branch is fast-forward-merged back into that base and the worktree removed, while failed/interrupted worktrees are parked for forensics. If the base advanced under a finished task, the branch is rebased once and its command graders re-run against the rebased tree before the merge — nothing lands that was not verified against the exact base it lands on.
 - **`pr`** — `GitPullRequestSubmitter` (`crates/flywheel-worktree/src/pr.rs`), review-gated. Same provisioning; on `done` the branch is pushed to the remote and a PR opened (or refreshed) with the run's grader receipts rendered in the body, so reviewers see how "done" was decided. Nothing merges locally — review/CI own the merge. Park semantics are identical.
-- **`phase`** — `PhaseBranchSubmitter` (`crates/flywheel-worktree/src/phase.rs`, spec 00079), phase-scoped review. The merge strategy's full verify ladder, but each task fast-forwards onto a per-phase integration branch `flywheel/phase/<phase>` (forked from the true base on the phase's first landing) instead of the base itself; the true base never advances locally. A completed phase is synced with the true base (one merge of the base into the phase branch, so the PR opens mergeable -- a conflicting PR runs zero GitHub CI and stalls silently; a conflicting sync aborts loudly and opens no PR), then published as one aggregate PR (`PhasePrPublisher`, `crates/flywheel-worktree/src/pr.rs`) and archives only once that PR merges. While the PR awaits review the worker republishes only when an input changes (phase-branch tip, true-base sha, rendered title/body); the remote base is fetched at most once a minute, and a moved tip or base always re-syncs and re-verifies before pushing.
-- **`ContainerSubmitStrategy`** (`crates/flywheel-container/src/submit.rs`) — container isolation. *Composes* an inner landing strategy (`merge` or `pr`) rather than replacing one: the agent runs in a Docker container against the bind-mounted worktree while landing stays host-side. Selected via `[sandbox] backend = "container"` (not `[submit] strategy`); the worker wraps the inner submitter in it via `maybe_wrap_for_backend` (`crates/flywheel-container/src/config.rs`). `prepare_sandbox` returns a `SandboxHandle` whose `invoke_wrapper` `docker exec`s the agent CLI in the container and whose `teardown` disposes it; `submit` delegates to the inner strategy unchanged. See [container-backend.md](container-backend.md) and [sandbox.md](sandbox.md).
+- **`ContainerSubmitStrategy`** (`crates/flywheel-container/src/submit.rs`) — container isolation. *Composes* an inner landing strategy (`merge` or `pr`) rather than replacing one: the agent runs in a Docker container against the bind-mounted worktree while landing stays host-side. Selected via `fw worker --sandbox container` (not `land`); the worker wraps the inner submitter in it via `maybe_wrap_for_backend` (`crates/flywheel-container/src/config.rs`). `prepare_sandbox` returns a `SandboxHandle` whose `invoke_wrapper` `docker exec`s the agent CLI in the container and whose `teardown` disposes it; `submit` delegates to the inner strategy unchanged. See [container-backend.md](container-backend.md) and [sandbox.md](sandbox.md).
 
-All shipped strategies honor `[submit] protected_paths`: a finished branch touching the verification surface (grader configs, CI) never lands, regardless of strategy. The seam keeps all git in the consumer — flywheel core stays git-free.
-
-## Risk-tiered routing (`[[submit.tiers]]`)
-
-With `[[submit.tiers]]` configured (spec 00080), the strategy applied to each DONE task is a function of its diff, not a repo-global constant. `TierRoutingSubmitter` (`crates/flywheel-worktree/src/tiering.rs`) provisions like `merge` (worktrees fork from the true base) and classifies the branch's merge-base-scoped changed files at submit time against the operator's path rules:
-
-- tier 0 routes to `merge` (direct land), tier 1 to `phase`, tier 2 to `pr` — delegates built through the same registry; the highest tier of any touched file wins.
-- A file matching no rule defaults to **tier 1** — a newly invented path is never a silent direct-merge lane.
-- Classification reads only the policy the **worker process** loaded; the policy file itself always classifies at the highest tier, so a branch editing the rules cannot cheapen its own route.
-- `protected_paths` outranks every tier: the routed strategy still runs its own protected-path refusal first. Protection is refusal, not routing.
-- Each decision (per-file tiers, winning tier, strategy) is recorded on the run's ledger as a `LandingRouted` event before the routed strategy runs.
-
-Absent `[[submit.tiers]]`, landing is byte-identical to the configured `[submit] strategy` with no classifier in the path.
+All shipped strategies honor `protected_paths`: a finished branch touching the verification surface (grader configs, CI) never lands, regardless of strategy. The seam keeps all git in the consumer — flywheel core stays git-free.
 
 ## How a finished task lands
 
@@ -58,21 +45,21 @@ The decision `submit` makes for a DONE run, under the merge lock (which serializ
 ```mermaid
 flowchart TD
     A["Run reaches a terminal status (submit, under the task lease)"] --> B{"status == DONE?"}
-    B -->|"no (failed / interrupted)"| P0["Park or destroy the sandbox per [sandbox.retention] on_failure"]
-    B -->|yes| S{"[submit] strategy"}
+    B -->|"no (failed / interrupted)"| P0["Park or destroy the sandbox (default: park)"]
+    B -->|yes| S{"land"}
 
-    S -->|pr| PR["Push branch to [submit] remote, open/refresh a PR onto pr_base with grader receipts in the body. Review and CI own the merge."]
+    S -->|pr| PR["Push branch to origin, open/refresh a PR onto the landing base with grader receipts in the body. Review and CI own the merge."]
 
     S -->|"merge (default)"| L["Acquire the merge lock"]
     L --> U{"worktree clean?"}
     U -->|"no, uncommitted edits"| K1["Park, park_kind=uncommitted-work"]
     U -->|yes| C{"commits beyond base?"}
     C -->|"no, empty diff"| CL["Clean up branch (legitimate no-op, nothing to land)"]
-    C -->|yes| PP{"touches [submit] protected_paths?"}
+    C -->|yes| PP{"touches protected_paths?"}
     PP -->|yes| K2["Park, refuse to land"]
     PP -->|no| FF{"branch already contains base? (fast-forward possible)"}
 
-    FF -->|"yes, clean FF"| V1{"[submit] verify passes? (standing build gate)"}
+    FF -->|"yes, clean FF"| V1{"verify passes? (standing build gate)"}
     V1 -->|no| K3["Park, park_kind=standing-verify"]
     V1 -->|yes| M1["FF-merge into base. LANDED. (in-tree merge --ff-only when base is the checked-out branch; out-of-tree fetch when base is a separate branch)"]
 
@@ -80,12 +67,12 @@ flowchart TD
     RB -->|no| K4["Park, park_kind=divergent-base"]
     RB -->|yes| RV{"task command graders re-pass on the rebased tree?"}
     RV -->|no| K5["Park, post-rebase re-verify failed"]
-    RV -->|yes| V2{"[submit] verify passes?"}
+    RV -->|yes| V2{"verify passes?"}
     V2 -->|no| K6["Park, park_kind=standing-verify"]
     V2 -->|yes| M2["FF-merge into base. LANDED."]
 ```
 
-`[submit] base` unset (the default) lands onto the branch you have checked out (in-tree FF); set it to a *separate* branch you do not have checked out to land out-of-tree. `[submit] verify` (spec 00064) is the repo-wide standing build gate; `park_kind` values are queryable on the run's ledger and surfaced by `flywheel status` (see [configuration.md](configuration.md)).
+Landing targets the branch you have checked out (in-tree FF). `verify` (spec 00064) is the repo-wide standing build gate; `park_kind` values are queryable on the run's ledger and surfaced by `fw status` (see [configuration.md](configuration.md)).
 
 ## Future strategies
 

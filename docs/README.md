@@ -26,13 +26,13 @@ Driving many tasks over a prerequisite DAG, landing the results, and isolating t
 - [work-sources.md](work-sources.md) — the `WorkSource` seam and the shipped sources: `directory`, `github`, `github_ci`, `github_review`.
 - [strategy.md](strategy.md) — the `SubmitStrategy` / `SandboxHandle` landing seam and the shipped strategies (merge, PR, container).
 - [held-out-gate.md](held-out-gate.md) — the execute-time held-out landing gate that defends against reward-hacking.
-- [sandbox.md](sandbox.md) — the sandbox-as-deploy model and the complete `[sandbox.*]` reference.
+- [sandbox.md](sandbox.md) — the sandbox-as-deploy model: backends and built-in defaults.
 - [container-backend.md](container-backend.md) — the Docker execution backend: image contract, auth modes, network teeth, limitations.
 
 ## Operating flywheel — the product shell (`flywheel` / `fw`)
 
 - [cli.md](cli.md) — every verb, the interactive operator console, slash commands, and `init`.
-- [configuration.md](configuration.md) — the effective config (`config.toml`, the trust-gated `.flywheel.toml`) and the legacy `flywheel.toml` reference.
+- [configuration.md](configuration.md) — the eight config keys (`config.toml`, the trust-gated `.flywheel.toml`), verb flags, and where every removed setting went.
 - [team-mode.md](team-mode.md) — the multi-operator runbook: GitHub App worker identity, ruleset requirements, and the merge queue as the distributed merge lock.
 - [autopilot.md](autopilot.md) — the autopilot intake daemon: tier model, scoring, CLI, and console activation.
 - [workflow.md](workflow.md) — how flywheel develops itself: the spec-driven authoring pipeline (the `fw-*` skills) and the runtime loop.
@@ -45,7 +45,7 @@ Driving many tasks over a prerequisite DAG, landing the results, and isolating t
 
 ## Design rationale
 
-- [agent-harness.md](agent-harness.md) — the `flywheel-agents` multi-agent execution layer: architecture, per-section status markers, and the remaining backlog. claude-code and codex adapters shipped; `[agent] id` selects one (default `claude-code`). Agents run only through their CLIs; `[agent] transport = "sdk"` is rejected at config load.
+- [agent-harness.md](agent-harness.md) — the `flywheel-agents` multi-agent execution layer: architecture, per-section status markers, and the remaining backlog. claude-code and codex adapters shipped; `--agent` selects one (default `claude-code`). Agents run only through their CLIs.
 - [research/](research/) — cited design rationale for the `fw-*` authoring skills. Not part of the normative spec set.
 
 ---

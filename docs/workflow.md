@@ -1,8 +1,8 @@
 # Workflow
 
-This is the home of flywheel's **intent-authoring pipeline** — the write-half of the binding the [vision](vision.md) North Star describes (authoring intent an agent cannot game, then compiling it into `Task`/`Grader`). It ships as the `fw-*` skills `flywheel init --skills` installs into any repo; this doc is also the record of how flywheel runs that pipeline on itself.
+This is the home of flywheel's **intent-authoring pipeline** — the write-half of the binding the [vision](vision.md) North Star describes (authoring intent an agent cannot game, then compiling it into `Task`/`Grader`). It ships as the `fw-*` skills `fw init` installs at user level; this doc is also the record of how flywheel runs that pipeline on itself.
 
-How flywheel develops itself. Every feature since the Postgres store has gone through this pipeline: a spec is defined, decomposed into task JSONs, executed by flywheel's own worker loop, then audited for loop friction that feeds the next round of features. The pipeline lives half in the `fw-*` authoring skills (run by an operator in Claude Code) and half in the project dir under `$FLYWHEEL_HOME` (artifacts and runtime state). This doc records the current state and rationale. The authoring half has been promoted into shipped code — the `fw-spec`/`fw-plan`/`fw-verify`/`fw-retro`/`fw-improve` skills that `flywheel init --skills` installs into any repo; the original slash-command prompts they were promoted from have since been removed. The rest is the baseline for promoting further pieces.
+How flywheel develops itself. Every feature since the Postgres store has gone through this pipeline: a spec is defined, decomposed into task JSONs, executed by flywheel's own worker loop, then audited for loop friction that feeds the next round of features. The pipeline lives half in the `fw-*` authoring skills (run by an operator in Claude Code) and half in the project dir under `$FLYWHEEL_HOME` (artifacts and runtime state). This doc records the current state and rationale. The authoring half has been promoted into shipped code — the `fw-spec`/`fw-plan`/`fw-verify`/`fw-retro`/`fw-improve` skills that `fw init` installs at user level; the original slash-command prompts they were promoted from have since been removed. The rest is the baseline for promoting further pieces.
 
 ## Pipeline at a glance
 
@@ -10,14 +10,14 @@ How flywheel develops itself. Every feature since the Postgres store has gone th
 | ------- | ------------------------ | --------------------------- | ---------------------------------------------------------------- |
 | Spec    | `/fw-spec`               | vague feature idea          | spec with held-out, ungameable success criteria: `<project>/specs/NNNNN-FEATURE-<name>.md` |
 | Plan    | `/fw-plan`               | spec reference or free text | task JSONs, each spined on a grader: `<project>/tasks/active/NN-<phase>/<id>.json` |
-| Verify  | `/fw-verify` (optional)  | planned tasks for a phase   | blind-authored held-out oracles: discrimination proof in `<project>/audits/`, throwaway oracle in `<project>/verification/`, optional `[held_out] root` registration. Runs between plan and execute |
+| Verify  | `/fw-verify` (optional)  | planned tasks for a phase   | blind-authored held-out oracles: discrimination proof in `<project>/audits/`, throwaway oracle in `<project>/verification/`, a registration in the project's `held-out/`. Runs between plan and execute |
 | Execute | `flywheel worker` daemon | active phase dirs           | landed work (FF-merge into the base, or a PR), lifecycles in the store, archived phase |
 | Retro   | `/fw-retro`              | store + logs for a phase    | cited loop-friction findings: `<project>/audits/<phase>.md`     |
 | Improve | `/fw-improve`            | one or more retros          | ranked proposals, each handed to `/fw-spec`, `/fw-plan`, or "accept": `<project>/proposals/<phase>.md` |
 
 `<project>` is the repo's project dir, `$FLYWHEEL_HOME/projects/<id>/` (`fw project path` prints it; `--specs`/`--tasks`/`--logs` print the subdirs). The skills resolve every path through `fw project path` and never write into the repo tree; `fw spec export DIR` copies the specs tree out for anyone who wants it committed.
 
-The loop closes: proposals become specs become phases become retros. The five stages ship as the `fw-*` skills `flywheel init --skills` installs into any repo (flywheel's own included); the old `/define`, `/task`, `/audit-phase`, and `/propose-improvements` slash commands they were promoted from no longer exist. Two further commands review the *work* rather than the loop (`/review-phase`, `/arewedone`); they live at user level (`~/.claude/commands/`), not in this repo.
+The loop closes: proposals become specs become phases become retros. The five stages ship as the `fw-*` skills `fw init` installs at user level; the old `/define`, `/task`, `/audit-phase`, and `/propose-improvements` slash commands they were promoted from no longer exist. Two further commands review the *work* rather than the loop (`/review-phase`, `/arewedone`); they live at user level (`~/.claude/commands/`), not in this repo.
 
 ### Stage contracts
 
@@ -60,7 +60,7 @@ The daemon is invoked as `flywheel worker` (the product shell delegates in-proce
 3. Write per-run logs to the project's `logs/` (supervisor logs under `logs/worker/`, agent transcripts under `logs/runs/`).
 4. `archive_completed_phases()` — move fully-DONE phases to `archive/`, subject to the gate below. A recurring phase name (autopilot's fixed `active/autopilot`) archives each later generation to the next free `archive/<phase>-<n>` (n >= 2). A phase sharing a task id with any archived generation is a resurrected duplicate (an archival whose `active/` deletion was never committed) and is refused loudly, never skipped silently.
 
-Default paths are code, not convention: without a `flywheel.toml` the tasks dir, store, worktrees, and logs live under `$FLYWHEEL_HOME/projects/<id>/` (`crates/flywheel-orchestrator/src/home.rs`); a `flywheel.toml` repo keeps `.flywheel/tasks`, `.flywheel/flywheel.sqlite`, and `.flywheel/logs/{worker,runs}/`. All are overridable via CLI flags.
+Default paths are code, not convention: the tasks dir, store, worktrees, and logs live under `$FLYWHEEL_HOME/projects/<id>/` (`crates/flywheel-orchestrator/src/home.rs`). Path flags (`--tasks-dir`, `--db`, `--sandbox-root`) override them.
 
 ### The in-loop-verification gate
 
@@ -84,49 +84,33 @@ The orchestrator does not consume the tasks dir directly anymore — it consumes
 - **Outbound** — `report(WorkReport)` receives each driven run's terminal status, run id, and final grader receipts after the consumer `submit` step, still under the task lease. Delivery is best-effort; a raising report never unwinds the loop. Ticket writes go through this path, never through the agent.
 - **Steering** — a reconciler re-lists the source every `--reconcile-seconds` (default 15, 0 disables) and enqueues an `interrupt` control command for any in-flight run whose item is no longer listed (closed issue, pulled label, deleted task file). A listing failure never interrupts anything. The run parks as `INTERRUPTED` with its sandbox preserved — restore the item and it resumes.
 
-Four adapters ship today, registered in the compile-time registry `crates/flywheel-orchestrator/src/source_registry.rs` (no runtime plugin discovery; a new kind is a code change that registers a factory). The grade is always the policy's graders run out-of-band by the harness, never the tracker's own status — see [work-sources.md](work-sources.md) for the full per-kind reference.
+Four adapters ship today, registered in the compile-time registry `crates/flywheel-orchestrator/src/source_registry.rs` (no runtime plugin discovery; a new kind is a code change that registers a factory). The grade is always the item's (or `verify`'s) graders run out-of-band by the harness, never the tracker's own status — see [work-sources.md](work-sources.md) for the full per-kind reference.
 
-| `[source] kind` | Inbound | Outbound | Grade |
+| `--source` | Inbound | Outbound | Grade |
 | --------------- | ------- | -------- | ----- |
 | `directory` | `<project>/tasks/active/<phase>/*.json` task files | `report` is a no-op (the store is the local record; phase archiving stays a separate directory flow) | task file's own graders |
-| `github` | labeled open issues via `gh` (`gh-<number>` ids; optional fenced ` ```flywheel ` body block overrides goal/graders/context/tags/prerequisites) | comment, or close on DONE when `done_action = "close"` | issue block graders, else `[[defaults.graders]]`, else skipped |
-| `github_ci` | failed CI runs via `gh run list --status <failure_filter>` (stable per-`(workflow, branch)` ids) | commit comment | `[[defaults.graders]]` only (out-of-band; never the check status) |
-| `github_review` | unresolved PR review threads via `gh api graphql` (`isResolved` is a candidate filter, never the verdict) | PR comment (never a resolve/reply mutation) | `[[defaults.graders]]` only |
+| `github` | labeled open issues via `gh` (`gh-<number>` ids; optional fenced ` ```flywheel ` body block overrides goal/graders/context/tags/prerequisites) | comment | issue block graders, else `verify`, else skipped |
+| `github_ci` | failed CI runs via `gh run list --status <failure_filter>` (stable per-`(workflow, branch)` ids) | commit comment | `verify` only (out-of-band; never the check status) |
+| `github_review` | unresolved PR review threads via `gh api graphql` (`isResolved` is a candidate filter, never the verdict) | PR comment (never a resolve/reply mutation) | `verify` only |
 
-The GitHub kinds drive the `gh` CLI; `gh` must be on PATH and authed. `init` scaffolds only `directory`/`github` — `github_ci`/`github_review` are hand-edited into the file.
+The GitHub kinds drive the `gh` CLI; `gh` must be on PATH and authed.
 
-`flywheel.toml` at the repo root selects the source per project (`crates/flywheel-orchestrator/src/policy.rs`); see [configuration.md](configuration.md) for the complete key reference:
+`fw worker --source KIND --repo OWNER/NAME` selects a tracker source; the `verify` config key is the default grader for tracker items ([configuration.md](configuration.md#verb-flags)):
 
-```toml
-[source]
-kind = "github"            # or "directory"
-repo = "owner/name"
-label = "flywheel"
-done_action = "close"      # or "comment"
-
-[[defaults.graders]]
-type = "command"
-run = "cargo test --workspace"
-
-[submit]
-# How DONE work lands: "merge" FF-merges into the worker's base (full
-# autonomy, default); "pr" pushes the branch and opens a PR with grader
-# receipts in the body (remote/pr_base configurable) — review owns the merge.
-strategy = "merge"
-# Glob patterns (** crosses directories) a finished task's branch may not
-# touch; a match refuses the landing and parks the work. Protects the
-# verification surface (grader configs, CI) from the work it judges.
-protected_paths = [".github/**", "flywheel.toml"]
-
-[sandbox]
-# Shell command run inside every newly created worktree before the agent
-# enters (deps install, codegen). Reused parked worktrees skip it.
-setup = "cargo fetch"
+```bash
+fw worker --source github --repo owner/name --label flywheel
 ```
 
-`flywheel status|live|archive|recover|recheck-blocked` auto-detect `flywheel.toml` (override with `--policy`; an explicit `--tasks-dir`/`--db` flag always wins). The optional `[paths]` table pins the store db and sandbox root so an initialized repo never falls back to `.flywheel/` defaults. The bare `next` and `orchestrate` verbs are intentionally not exposed on the product shell -- use `flywheel worker [--once]` to drive a phase. See [cli.md](cli.md) for the full verb and console reference, and [autopilot.md](autopilot.md) for the intake daemon that authors and refills work ahead of the worker.
+```toml
+# .flywheel.toml (committed; `fw trust` once per clone)
+verify = "cargo test --workspace"                 # standing gate + tracker default grader
+protected_paths = [".github/**", ".flywheel.toml"] # a match parks the work
+land = "merge"                                     # or "pr"
+```
 
-`flywheel init` scaffolds the self-contained local layout — `.flywheel/tasks/{active,archive}/`, a `.flywheel/.gitignore` for runtime state, and a repo-root `flywheel.toml` pointing everything at `.flywheel/`; when a Dockerfile is present it also appends `.flywheel/` to `.dockerignore`, since docker build contexts do not read `.gitignore`. Idempotent; never overwrites. `flywheel init --skills` additionally renders the five authoring-pipeline skills (`fw-spec`/`fw-plan`/`fw-verify`/`fw-retro`/`fw-improve`, in pipeline order — the first five of `SKILL_NAMES`, `crates/flywheel-orchestrator/src/skills.rs`) into `.claude/skills/`, parameterized by the work policy (`fw-plan` gets the task-directory or GitHub-issues delivery section to match the source). A sixth skill, `flywheel-ops`, installs beside them as the operability companion to the Execute stage: it drives the *running* loop (start and drain the worker, read run state off grader receipts, recover parked or stranded work) and references only real `fw` verbs and `fw docs` topics. `/fw-verify` runs between plan and execute: it blind-authors the discriminating held-out test oracle for the planned tasks so the agent never writes the test that grades it — the write-half of the execute-time [held-out-gate.md](held-out-gate.md). This repo adopted the layout itself: the old hand-rolled `.workflow/` tree was migrated wholesale into `.flywheel/` (specs, audits, archived phases, the live store) and no longer exists.
+The bare `next` and `orchestrate` verbs are intentionally not exposed on the product shell -- use `fw worker [--once]` to drive a phase. See [cli.md](cli.md) for the full verb and console reference, and [autopilot.md](autopilot.md) for the intake daemon that authors and refills work ahead of the worker.
+
+`fw init` writes nothing into the repo: it resolves the project, creates the user config, and installs the five authoring-pipeline skills (`fw-spec`/`fw-plan`/`fw-verify`/`fw-retro`/`fw-improve`, in pipeline order — the first five of `SKILL_NAMES`, `crates/flywheel-orchestrator/src/skills.rs`) at user level (`$CLAUDE_CONFIG_DIR/skills`, default `~/.claude/skills`). A sixth skill, `flywheel-ops`, installs beside them as the operability companion to the Execute stage: it drives the *running* loop (start and drain the worker, read run state off grader receipts, recover parked or stranded work) and references only real `fw` verbs and `fw docs` topics. `/fw-verify` runs between plan and execute: it blind-authors the discriminating held-out test oracle for the planned tasks so the agent never writes the test that grades it — the write-half of the execute-time [held-out-gate.md](held-out-gate.md).
 
 ## Code vs. convention
 
@@ -135,12 +119,12 @@ What it takes for another codebase to run this workflow — most of it now ships
 | Piece                                                               | Lives in                                              | Status          |
 | ------------------------------------------------------------------- | ----------------------------------------------------- | --------------- |
 | Task selection, claims/leases, `orchestrate`                        | `flywheel-orchestrator`                               | shipped code    |
-| `WorkSource` seam, directory + GitHub adapters, `flywheel.toml`     | `flywheel-orchestrator` (`sources.rs`, `github.rs`, `policy.rs`) | shipped code    |
+| `WorkSource` seam, directory + GitHub adapters, `--source` flags  | `flywheel-orchestrator` (`sources.rs`, `github.rs`, `policy.rs`) | shipped code    |
 | Archive gate, loop-path signals, `.loop-base`, opt-out parsing      | `flywheel-worktree` (`phase.rs`) + `flywheel-core` (`loop_path_marker.rs`) | shipped code    |
 | Worktree-per-task submit strategy, daemon                           | `flywheel-worktree` crate (library)                   | shipped code    |
-| Default `.flywheel/` paths                                          | CLI defaults in all three crates                      | shipped code    |
-| Authoring pipeline as installable skills (`fw-spec`/`fw-plan`/`fw-verify`/`fw-retro`/`fw-improve`) | `flywheel-orchestrator` (`skills.rs`, `crates/flywheel-orchestrator/skill_templates/`); installed by `flywheel init --skills` | shipped code |
+| Default `projects/<id>/` paths                                      | CLI defaults in all three crates                      | shipped code    |
+| Authoring pipeline as installable skills (`fw-spec`/`fw-plan`/`fw-verify`/`fw-retro`/`fw-improve`) | `flywheel-orchestrator` (`skills.rs`, `crates/flywheel-orchestrator/skill_templates/`); installed by `fw init` | shipped code |
 | Spec/task/audit/proposal doc formats, `NNNNN-FEATURE-` numbering, evidence rules | rendered inside those skill templates | shipped code |
 | Phase naming, the pipeline ordering itself | operator habit | repo convention |
 
-The command prompts and the document contracts they enforce have since been promoted: they ship as the `fw-*` skills `flywheel init --skills` installs into any repo, and the original slash-command prompts they were promoted from have been removed. What remains convention is the thin operator-habit layer — phase naming and the pipeline ordering itself.
+The command prompts and the document contracts they enforce have since been promoted: they ship as the `fw-*` skills `fw init` installs, and the original slash-command prompts they were promoted from have been removed. What remains convention is the thin operator-habit layer — phase naming and the pipeline ordering itself.

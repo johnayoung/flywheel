@@ -13,7 +13,7 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 - `project_id` leads the primary key of every naturally keyed table (`tasks`, `task_versions`, `lifecycles`, `attempts`, `task_claims`, `work_items`, `work_item_dependencies`, `graph_snapshot_items`).
 - Surrogate-id ledgers (`events`, `grader_results`, `control_commands`, `source_syncs`, `orchestrator_events`, `orchestrator_stop_events`, `graph_snapshots`, `orchestrator_session_pauses`) keep their `id` primary key; `project_id` leads every unique constraint and hot lookup index on them.
 - Foreign keys are composite and carry `project_id`, so a row can only reference rows of its own project.
-- In flywheel-core the column is an opaque partition key supplied by whoever opens the store (`SqliteStoreOptions::partition`, `PostgresStoreOptions::partition`; default `default`); core never resolves projects. The shell passes the bound project id (config `project_id` override, else the repo's `.git/config` id); invocations that skip project resolution (`--policy FILE`, or `--db` with `--tasks-dir`) use `default`.
+- In flywheel-core the column is an opaque partition key supplied by whoever opens the store (`SqliteStoreOptions::partition`, `PostgresStoreOptions::partition`; default `default`); core never resolves projects. The shell passes the bound project id (config `project_id` override, else the repo's `.git/config` id); invocations that skip project resolution (`--db` with `--tasks-dir`) use `default`.
 
 ## Core tables
 

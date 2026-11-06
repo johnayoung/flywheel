@@ -111,16 +111,16 @@ For a folder flywheel drives with a **directory** work source:
 
 ```bash
 fw hub fanout promote "$id" --reference c1  # instead of pick; dry run: path and exact bytes
-fw hub fanout promote "$id" --reference c1 --yes  # writes .flywheel/tasks/active/NN-<slug>/<slug>-<tag>.json (uncommitted)
+fw hub fanout promote "$id" --reference c1 --yes  # writes <project>/tasks/active/NN-<slug>/<slug>-<tag>.json
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote instead of picking** to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, `--reference` (default winner, else leader); refused for an existing file or id. Left **uncommitted**; **Run <id> with worker here** runs `fw worker --task <id>`.
+- **Promote instead of picking** to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, `--reference` (default winner, else leader); refused for an existing file or id. **Run <id> with worker here** runs `fw worker --task <id>`.
 - **Fan out this task** (Flywheel panel): prompt from its goal and context; graders = its command plus **held-out** graders, added server-side (none, or an unreadable registry: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
 
-`flywheel.toml`, `.flywheel/`, or `.flywheel.toml` folders get the verified loop, read-only (`--no-flywheel`: off); launches add `--policy`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN: the hub's env** (`FLYWHEEL_PG_DSN`, else `DATABASE_URL`).
+Folders whose git repo has a project id flywheel knows get the verified loop, read-only (`--no-flywheel`: off); state comes from `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else the hub's env.
 
 - Phases, tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
 - **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks to add unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.

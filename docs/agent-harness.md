@@ -1,6 +1,6 @@
 # flywheel-agents — the multi-agent execution layer
 
-**Status: shipped; the only agent path.** Architecture and status record for the `flywheel-agents` crate (`crates/flywheel-agents`). Every agent invocation in flywheel runs through this runtime; `[agent] id` selects the adapter (default `claude-code`). There is no in-process vendor SDK: agents run as their own CLIs. Sections carry explicit **Status** markers wherever the built code deviates from or defers the text; where an unmarked claim and shipped code disagree, the code's own spec set (`docs/README.md`) wins.
+**Status: shipped; the only agent path.** Architecture and status record for the `flywheel-agents` crate (`crates/flywheel-agents`). Every agent invocation in flywheel runs through this runtime; `fw worker --agent ID` / `fw autopilot --agent ID` select the adapter (default `claude-code`). There is no in-process vendor SDK: agents run as their own CLIs. Sections carry explicit **Status** markers wherever the built code deviates from or defers the text; where an unmarked claim and shipped code disagree, the code's own spec set (`docs/README.md`) wins.
 
 ## 1. Objective
 
@@ -50,7 +50,7 @@ Named `flywheel-agents`, not `flywheel-harness`: "harness" is already the loop h
 - **An HTTP/WebSocket service.** Library only. A service surface belongs to the interactivity program and wraps this runtime later.
 - **Crate-owned persistence.** No SQLite, no `~/.agent-harness`. The crate emits through a sink trait (§ 9); flywheel's telemetry sink and relational store are the system of record.
 - **Interactive approvals.** flywheel runs unattended. Normalized approval events plus an auto-resolving policy callback (§ 12); no approval UI or queue subsystem.
-- **Profiles.** `flywheel.toml` is the profile layer.
+- **Profiles.** flywheel's effective config ([configuration.md](configuration.md)) is the profile layer.
 - **MCP config-file writing.** Canonical read/translate only (§ 13).
 - **Session resume/fork/replay as a product feature.** Fresh-session-per-iteration is a deliberate flywheel design choice; `native_session_id` is captured and reported. The claude-code adapter accepts `resume`/`session_id`/`fork_session` adapter options, used only for envelope salvage (§ 15.1).
 
@@ -181,7 +181,7 @@ pub struct AgentConfiguration {
 }
 ```
 
-`adapter_options` carries what the generic fields cannot honestly represent. For claude-code this is where the `[sandbox.capabilities]` vocabulary lands — `skills`, `allowed_tools`, `disallowed_tools`, `setting_sources`, `mcp_servers`, `mcp_strict`, `sandbox_exec` — plus `transport`, `input_mode`, `agents`, `settings`, `hooks`, session options, and the co-author suppression toggle (full list in the `claude_code/cli.rs` module docs). Adapters reject a permission policy they cannot honor (claude-code has no `ReadOnly`) rather than approximating.
+`adapter_options` carries what the generic fields cannot honestly represent. For claude-code this is where the sandbox capabilities vocabulary lands — `skills`, `allowed_tools`, `disallowed_tools`, `setting_sources`, `mcp_servers`, `mcp_strict`, `sandbox_exec` — plus `transport`, `input_mode`, `agents`, `settings`, `hooks`, session options, and the co-author suppression toggle (full list in the `claude_code/cli.rs` module docs). Adapters reject a permission policy they cannot honor (claude-code has no `ReadOnly`) rather than approximating.
 
 ## 6. Adapter contract
 
@@ -326,7 +326,7 @@ Raw events are delivered to the sink before normalization; raw and normalized ev
 Transports solve protocol mechanics and contain no product behavior. They consume `RunningProcess` streams from a host rather than owning spawns.
 
 - **JSON lines (shipped)** — `src/jsonl.rs`: the shared `JsonLinesAgent` plus `ControlChannel` (request ids, responses, timeouts for the claude-code `control_request` protocol, inbound `can_use_tool` approval requests). Tolerates interleaved non-JSON lines and malformed JSON (preserved as `raw`, never dropped). Both shipped adapters ride it with their own `LineNormalizer`.
-- **`[agent] transport`** — `cli` is the only transport for both adapters. Any other value is rejected at config load by the policy loader, and the claude-code adapter fails the run with `UnsupportedCapability`. The CLI transport speaks the same stream-json control protocol the vendor SDKs wrap.
+- **Transport** — `cli` is the only transport for both adapters (no setting); any other value fails the run with `UnsupportedCapability`. The CLI transport speaks the same stream-json control protocol the vendor SDKs wrap.
 - **JSON-RPC (backlog, not built)** — request ids, notifications, dispatch, timeouts, cancellation. The codex app server (the shipped codex adapter uses headless exec JSONL instead).
 - **ACP (backlog, not built)** — Agent Client Protocol client: initialization, session creation, prompts, mode/model selection, permission requests, cancellation, plan and tool events. Gemini CLI, Qwen Code, and future ACP agents share it.
 
@@ -428,10 +428,10 @@ Every agent invocation goes through the runtime: the worker invoker (`AgentsInvo
 
 ### 15.3 Config surface
 
-- `[agent] id` selects the adapter (default `claude-code`); `model` stays an opaque per-agent string. `[agent] transport` requires `[agent] id`; `cli` is the only accepted value (§ 11).
-- `permission_mode` maps to `PermissionPolicy` at the workflow boundary (`permission_policy_for`, `crates/flywheel-core/src/workflow.rs`: `bypassPermissions` -> `Auto`, `plan` -> `Plan`, anything else -> `Supervised`); the `[sandbox]` key keeps Claude vocabulary for back-compat.
-- `[sandbox.capabilities]` rides claude-code `adapter_options` on the worktree backend (`build_agent_configuration`); the container backend builds its configuration from model and permission policy only — see `docs/sandbox.md`.
-- `[sandbox.container] auth` / `auth_env` generalizing to the per-agent auth modes of § 13.2: future (`ClaudeAuth` unchanged today).
+- `--agent ID` (worker, autopilot) selects the adapter (default `claude-code`); the `model` config key stays an opaque per-agent string. The transport is always `cli` (§ 11).
+- `permission_mode` maps to `PermissionPolicy` at the workflow boundary (`permission_policy_for`, `crates/flywheel-core/src/workflow.rs`: `bypassPermissions` -> `Auto`, `plan` -> `Plan`, anything else -> `Supervised`); the built-in default is `bypassPermissions`.
+- The sandbox capabilities (built-in defaults) ride claude-code `adapter_options` on the worktree backend (`build_agent_configuration`); the container backend builds its configuration from model and permission policy only — see `docs/sandbox.md`.
+- Container auth modes generalizing to the per-agent auth modes of § 13.2: future (`ClaudeAuth` unchanged today).
 
 ### 15.4 Container backend
 

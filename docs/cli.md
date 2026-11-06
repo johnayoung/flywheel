@@ -12,13 +12,13 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Steering verbs | `fw say` / `interrupt` / `approve` / `reject` | Enqueue one control command against a live run |
 | Daemons | `fw worker` / `autopilot` / `triage` | Drain the queue (worker), keep it full (autopilot), or triage the intake board (triage) |
 | Audit | `fw audit RUN_ID` | Stream the totally-ordered telemetry for one run |
-| Setup | `fw init` | Scaffold the legacy `.flywheel/` and `flywheel.toml` (not read by default; see [configuration.md](configuration.md#legacy-layout)) |
+| Setup | `fw init` | Set up this repo's project; writes nothing into the repo (see [`init`](#init)) |
 | Hub | `fw hub` server: `start` / `stop` / `upgrade` / `status` / `logs` / `serve` / `install-service` / `doctor`; access: `open` / `url` / `token` / `tls` / `peer` / `machine` / `share`; sessions: `ls` / `new` / `send` / `read` / `wait` / `attach` / `kill` / `relaunch` / `explain` / `import` / `template` / `queue` / `broadcast` / `conversations` / `account`; output: `commands` / `search` / `activity` / `digest` / `record`; git: `review` / `merge` / `pr` / `handoff` / `ask-review` / `fanout` / `autopilot`; settings: `config` / `plugin` / `perms`; hooks only: `report` | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
 | One-shot | `fw exec [PROMPT]` | Run one agent call from any project: no tasks, store, worktree, or config |
 | Projects | `fw project ls [--json]` / `prune` / `relink [PATH]` / `path [FLAG]` | The home's project registry and the cwd project's dirs (see [Projects and the home](#projects-and-the-home)) |
 | Specs | `fw spec ls [--json]` / `export DIR [--force]` | The cwd project's central specs; copy them out (see [Specs](#specs)) |
 | Config | `fw config [--json]` / `fw trust [--revoke]` | The effective config with sources; approve the repo's `.flywheel.toml` (see [Config and trust](#config-and-trust)) |
-| Store | `fw db upgrade [--db PATH] [--policy FILE]` | Migrate the store in place to this build's schema (see [The store](#the-store)) |
+| Store | `fw db upgrade [--db PATH]` | Migrate the store in place to this build's schema (see [The store](#the-store)) |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.
 
@@ -38,16 +38,16 @@ The router (`route`, `crates/flywheel/src/cli.rs`) dispatches by the first argv 
 
 ### Resolution precedence
 
-Every delegated verb resolves its inputs the same way: **explicit flag wins, then the effective config ([Config and trust](#config-and-trust)), then the home project's built-in default.** Every default lives under `$FLYWHEEL_HOME/projects/<id>/` (see [Projects and the home](#projects-and-the-home)); a directory outside a git repo is refused unless explicit flags name every path the verb reads. A repo's own `flywheel.toml` / `.flywheel/` is never read: one stderr notice says it is ignored and can be deleted.
+Every delegated verb resolves its inputs the same way: **explicit flag wins, then the effective config ([Config and trust](#config-and-trust)), then the home project's built-in default.** Every default lives under `$FLYWHEEL_HOME/projects/<id>/` (see [Projects and the home](#projects-and-the-home)); a directory outside a git repo is refused unless explicit flags name every path the verb reads. A repo's legacy `flywheel.toml` / `.flywheel/` is never read: one stderr notice says it is ignored and can be deleted. There is no `--policy` flag.
 
 | Input | Explicit flag | Built-in default | Anchor |
 |---|---|---|---|
-| Policy | `--policy FILE` (legacy format, loaded as-is) | the home project + effective config (re-anchors cwd at the worktree top level) | `load_effective_policy` |
+| Policy | (none) | the home project + effective config (re-anchors cwd at the worktree top level) | `load_effective_policy` |
 | DB path | `--db PATH` | `$FLYWHEEL_HOME/projects/<id>/flywheel.sqlite` (or the `store` DSN) | `resolve_db_path` |
 | Work source | `--tasks-dir DIR` (forces directory source) | `$FLYWHEEL_HOME/projects/<id>/tasks` | `resolve_work_source` |
 | Worktree root | `--sandbox-root` (worker) | `$FLYWHEEL_HOME/projects/<id>/worktrees` | `resolve_sandbox_root` |
 
-Logs (`logs/runs/`, `logs/worker/`, `logs/autopilot/`) and the merge lock sit beside the store in the project dir.
+Logs (`logs/runs/`, `logs/worker/`, `logs/autopilot/`), the merge lock (`.merge.lock`), and the held-out registry (`held-out/`) sit in the project dir. Work-source, sandbox, and agent flags: [configuration.md](configuration.md#verb-flags).
 
 Anchors are in `crates/flywheel-orchestrator/src/workflow/mod.rs`.
 
@@ -90,7 +90,7 @@ Specs live centrally in `$FLYWHEEL_HOME/projects/<id>/specs/` (with `archive/`),
 
 ## The store
 
-Every table carries a `project_id` partition column, so one store (one Postgres DSN) holds many projects; each verb reads and writes only its own project's rows. The partition is the bound project id (the config `project_id` override, else the `.git/config` id). Invocations that skip project resolution -- `--policy FILE`, or `--db` with `--tasks-dir` -- use the fixed partition `default`.
+Every table carries a `project_id` partition column, so one store (one Postgres DSN) holds many projects; each verb reads and writes only its own project's rows. The partition is the bound project id (the config `project_id` override, else the `.git/config` id). Invocations that skip project resolution (`--db` with `--tasks-dir`) use the fixed partition `default`.
 
 **A store whose schema version is behind this build is refused, never migrated implicitly**: every store verb exits non-zero with an error naming `fw db upgrade`. A store written by a newer flywheel is refused outright. A brand-new store is created at the current version.
 
@@ -98,7 +98,6 @@ Every table carries a `project_id` partition column, so one store (one Postgres 
 |---|---|
 | `db upgrade` | Migrate the cwd project's store (sqlite under the project dir, or the configured Postgres DSN) in place: run tables and orchestrator tables, each in one transaction, from any supported older version; existing rows get the project id. Idempotent (a second run, or a store already partitioned whose version row is behind, only fixes the version). Exit 1 on a newer or unrecognized store. |
 | `db upgrade --db PATH` | Upgrade that sqlite file (partition `default`). |
-| `db upgrade --policy FILE` | Upgrade the store a legacy policy file selects (partition `default`). |
 
 Schema versions: run store `schema_version` 13, orchestrator store `orchestrator_schema_version` 10. Catalog: [persistence-tables.md](persistence-tables.md).
 
@@ -108,16 +107,16 @@ Delegated to the orchestrator CLI (`main`, `crates/flywheel-orchestrator/src/wor
 
 | Verb | What it does | Key flags |
 |---|---|---|
-| `status` | One line per active task: `phase/task_id state [-- error]`. INTERRUPTED rows show `blocked_on:`; AWAITING_APPROVAL rows show `awaiting_on: <instruction>`; a DONE run that never landed shows `stranded: <park_kind> -- <detail>` (the work finished but the strategy parked it -- uncommitted tree, divergent base, or a failed `[submit] verify`). `--json` emits a per-task array, each entry carrying `stranded: {park_kind, detail}` when parked (omitted otherwise). | `--json`, `--rollup`, `--tasks-dir`, `--policy`, `--db` |
+| `status` | One line per active task: `phase/task_id state [-- error]`. INTERRUPTED rows show `blocked_on:`; AWAITING_APPROVAL rows show `awaiting_on: <instruction>`; a DONE run that never landed shows `stranded: <park_kind> -- <detail>` (the work finished but the strategy parked it -- uncommitted tree, divergent base, or a failed `verify`). `--json` emits a per-task array, each entry carrying `stranded: {park_kind, detail}` when parked (omitted otherwise). | `--json`, `--rollup`, `--tasks-dir`, `--db` |
 | `status --rollup` | Phase-grouped, **evidence-derived** rollup: each task's status is computed from grader receipts (verified vs accepted vs blocked/failed/not-started), never self-reported. | `--rollup`, `--json` |
-| `live` | One line per in-flight run (RUNNING / VALIDATING / AWAITING_APPROVAL): status, `attempt=N iter=K`, `tokens=/cost=/turns=`, `age=` / `idle=` (marked `STALE` past 90s idle), last action. `--watch N` clears and refreshes every N seconds (Ctrl-C exits). | `--watch SECONDS`, `--policy`, `--db` (no `--tasks-dir`) |
-| `history` | Finished runs (done / failed / failed_validation), one line per task, newest first; retries fold to one row `runs=N`. | `--status S` (repeatable), `--phase`, `--limit N`, `--json`, `--tasks-dir`, `--policy`, `--db` |
-| `show ID` | One run in full: lifecycle, per-attempt outcome/iter/turns/tokens/cost, grader receipts (pass/FAIL), final agent output, related runs. `ID` accepts a run_id or a task id (latest run). | positional `run_or_task_id`, `--json`, `--tasks-dir`, `--policy`, `--db` |
-| `validate` | Statically validate the active listing without running anything: per-task, each command grader must shell-parse (`bash -n`); pairwise, two tasks' derived file surfaces (context.relevant paths + command-grader run paths) must not overlap unless they share a `conflict_keys` entry, list the path in a top-level `overlap_ok` array, or are chained via `prerequisites`. Never checks whether a derived path exists on disk (an output path is still a surface). Exits non-zero naming each offending task (and, for an overlap, both task ids and every shared path), else `All N active task(s) valid.` Lints DONE-but-still-listed tasks too -- archiving, not status, is the operator's lever. Directory sources only. | `--tasks-dir`, `--policy` (no `--db`) |
-| `archive` | Move active `<phase>` dirs whose tasks are all DONE into `archive/`, printing each moved dir. Directory sources only. A loop-path / phase-verify gate applies when `repo_root` is threaded (see [loop.md](loop.md)). | `--tasks-dir`, `--policy`, `--db` |
-| `recover` | Finalize lifecycles stranded in running/validating to interrupted; prints transitioned run_ids, else `(no stranded lifecycles)`. Finalizes only under the task's claim: a run whose claim a live worker holds is in flight, not stranded, and is skipped with a stderr `skipped <run_id>: ...` note (a lapsed lease is recovered). | `--task-id`, `--policy`, `--db` |
-| `resolve ID` | Deliberately abandon a strand: record an operator-attributed `stop-resolved` marker keyed to the task id, carrying `--reason` verbatim, so the next `archive` sweep archives the otherwise-landed phase. The landing re-driver leaves a run alone once an attributed marker is at least as recent as its latest park, so an abandoned strand is never re-landed. A landing strand parked on the task's latest DONE run after the marker is a fresh strand: the re-driver resumes it, `status` re-surfaces it and archival probes the task again until it is resolved anew. The only non-probe path to clearing a strand (never manual store SQL, never a task-file tombstone). Clears either an unresolved stop event or a ledger-only landing strand (a parked DONE run `status` shows as `stranded:`); refuses (exit 1) when the task has neither; empty `--reason` exits 2. | positional `task_id`, required `--reason TEXT`, `--policy`, `--db` |
-| `recheck-blocked` | Re-evaluate blocked (INTERRUPTED with persisted `requires`) lifecycles; when all predicates are satisfied, transition interrupted to ready. Default scans all. | `--run-id`, `--dry-run`, `--tasks-dir`, `--policy`, `--db` |
+| `live` | One line per in-flight run (RUNNING / VALIDATING / AWAITING_APPROVAL): status, `attempt=N iter=K`, `tokens=/cost=/turns=`, `age=` / `idle=` (marked `STALE` past 90s idle), last action. `--watch N` clears and refreshes every N seconds (Ctrl-C exits). | `--watch SECONDS`, `--db` (no `--tasks-dir`) |
+| `history` | Finished runs (done / failed / failed_validation), one line per task, newest first; retries fold to one row `runs=N`. | `--status S` (repeatable), `--phase`, `--limit N`, `--json`, `--tasks-dir`, `--db` |
+| `show ID` | One run in full: lifecycle, per-attempt outcome/iter/turns/tokens/cost, grader receipts (pass/FAIL), final agent output, related runs. `ID` accepts a run_id or a task id (latest run). | positional `run_or_task_id`, `--json`, `--tasks-dir`, `--db` |
+| `validate` | Statically validate the active listing without running anything: per-task, each command grader must shell-parse (`bash -n`); pairwise, two tasks' derived file surfaces (context.relevant paths + command-grader run paths) must not overlap unless they share a `conflict_keys` entry, list the path in a top-level `overlap_ok` array, or are chained via `prerequisites`. Never checks whether a derived path exists on disk (an output path is still a surface). Exits non-zero naming each offending task (and, for an overlap, both task ids and every shared path), else `All N active task(s) valid.` Lints DONE-but-still-listed tasks too -- archiving, not status, is the operator's lever. Directory sources only. | `--tasks-dir` (no `--db`) |
+| `archive` | Move active `<phase>` dirs whose tasks are all DONE into `archive/`, printing each moved dir. Directory sources only. A loop-path / phase-verify gate applies when `repo_root` is threaded (see [loop.md](loop.md)). | `--tasks-dir`, `--db` |
+| `recover` | Finalize lifecycles stranded in running/validating to interrupted; prints transitioned run_ids, else `(no stranded lifecycles)`. Finalizes only under the task's claim: a run whose claim a live worker holds is in flight, not stranded, and is skipped with a stderr `skipped <run_id>: ...` note (a lapsed lease is recovered). | `--task-id`, `--db` |
+| `resolve ID` | Deliberately abandon a strand: record an operator-attributed `stop-resolved` marker keyed to the task id, carrying `--reason` verbatim, so the next `archive` sweep archives the otherwise-landed phase. The landing re-driver leaves a run alone once an attributed marker is at least as recent as its latest park, so an abandoned strand is never re-landed. A landing strand parked on the task's latest DONE run after the marker is a fresh strand: the re-driver resumes it, `status` re-surfaces it and archival probes the task again until it is resolved anew. The only non-probe path to clearing a strand (never manual store SQL, never a task-file tombstone). Clears either an unresolved stop event or a ledger-only landing strand (a parked DONE run `status` shows as `stranded:`); refuses (exit 1) when the task has neither; empty `--reason` exits 2. | positional `task_id`, required `--reason TEXT`, `--db` |
+| `recheck-blocked` | Re-evaluate blocked (INTERRUPTED with persisted `requires`) lifecycles; when all predicates are satisfied, transition interrupted to ready. Default scans all. | `--run-id`, `--dry-run`, `--tasks-dir`, `--db` |
 
 `status --rollup` is evidence-derived from grader receipts, not from any agent claim; see [work-sources.md](work-sources.md) and [orchestration.md](orchestration.md) for how items and phases map onto it. `recheck-blocked --dry-run` reports without transitioning (emits `harness.recheck_attempted`, never `harness.unblocked`).
 
@@ -138,7 +137,7 @@ The shell's `say` is a surface rename of core's `steer` verb; the underlying cor
 
 ## `exec`
 
-One agent call through the `flywheel-agents` runtime under a local host (`crates/flywheel/src/exec.rs`). **No `flywheel.toml` is loaded and nothing is written under `.flywheel/`**: no task, store, or worktree. stdout carries only the result; diagnostics go to stderr.
+One agent call through the `flywheel-agents` runtime under a local host (`crates/flywheel/src/exec.rs`). **No config is loaded and nothing is written under `$FLYWHEEL_HOME`**: no task, store, or worktree. stdout carries only the result; diagnostics go to stderr.
 
 ```bash
 fw exec --json --max-turns 1 --cwd /tmp/work \
@@ -166,14 +165,17 @@ Exit codes: **0** clean stop (terminal envelope seen, no `failure`/`fault`, `sto
 
 ### `worker [--once] [--task ID ...] [--with-prereqs]`
 
-The blessed headless drain, delegated in-process to the worktree daemon (`main`, `crates/flywheel-worktree/src/daemon.rs`). It drives tasks under active phase dirs, each in its own git worktree, fast-forward-merging on done and parking on failure. `--once` runs a single drain cycle; without it the worker is a daemon.
+The blessed headless drain, delegated in-process to the worktree daemon (`main`, `crates/flywheel-worktree/src/daemon.rs`). It drives the project's tasks (`projects/<id>/tasks/active/<phase>/`), each in its own git worktree under `projects/<id>/worktrees`, landing on done (`land`) and parking on failure. `--once` runs a single drain cycle; without it the worker is a daemon.
 
 | Flag | Controls |
 |---|---|
 | `--once` | single drain cycle, no daemon loop |
 | `--tasks-dir`, `--db` | standard resolution inputs |
-| `--policy FILE` | legacy: run on this `flywheel.toml` instead of the effective config (no trust check) |
-| `--sandbox-root` | worktree root; accepts a path or the `@cache`/`@sibling` tokens (see [configuration.md](configuration.md)) |
+| `--sandbox-root` | worktree root (default `projects/<id>/worktrees`; relative paths anchor at the repo root) |
+| `--source`, `--repo`, `--label`, `--require-triage-receipt` | GitHub work sources ([configuration.md](configuration.md#verb-flags)) |
+| `--sandbox container --image IMAGE` | the container backend ([container-backend.md](container-backend.md)) |
+| `--agent ID` | agent adapter (`claude-code` default, `codex`) |
+| `--concurrency N` | pool size (overrides `concurrency`; default 1) |
 | `--model` | agent model (overrides `model`) |
 | `--max-turns`, `--max-retries` | per-run ceilings |
 | `--worker-id` | identity stamped on claims |
@@ -189,7 +191,7 @@ The blessed headless drain, delegated in-process to the worktree daemon (`main`,
 
 **Shutdown.** SIGTERM, SIGINT, and SIGHUP (a closing terminal/PTY) are all an orderly stop: the in-flight run finalizes to `interrupted`, its claim is released, and every agent/grader process group is terminated (SIGTERM, SIGKILL after 5s). With `--concurrency N > 1` the invocation is a pool supervisor whose members run in sessions of their own; it forwards the stop as SIGTERM to each member (SIGKILL after 10s, logged as `pool member <id> did not exit within 10s of SIGTERM`). A signal while the worker is still starting (loading the policy, opening stores) is recorded from its first instruction and acted on before the first claim: an orderly stop, exit 0, nothing claimed. Only one landing while the binary itself is still being loaded (the first few ms after exec) takes the default action, before anything exists to leave behind. A supervisor that dies without a handler (SIGKILL, OOM) closes each member's lifeline pipe (the internal `--supervisor-fd`), and the member stops exactly as on SIGTERM. A member that dies without a handler (SIGKILL, OOM, past the 10s window) has whatever it left in its session (agent/grader groups) SIGKILLed by the supervisor when it reaps it (Linux), and its claim lapses (`--lease-seconds`). A SIGKILLed single worker (`--concurrency 1`) has nothing above it: its claim lapses and its agent group keeps running, so stop workers with SIGTERM. SIGHUP inherited as ignored (`nohup fw worker ...`) stays ignored: the worker outlives its terminal.
 
-### `autopilot [--once]`
+### `autopilot [--once [--dry-run]]`
 
 Keeps the work queue full with verifiable, tier-prioritized tasks. Delegated to `main` in `crates/flywheel-orchestrator/src/autopilot_run.rs`. **Neverending daemon by default**; `--once` runs one refill pass and exits. The daemon loop never terminates on an idle cycle — it exits only on SIGTERM/SIGINT (`run_daemon_loop`).
 
@@ -197,26 +199,29 @@ Keeps the work queue full with verifiable, tier-prioritized tasks. Delegated to 
 |---|---|
 | `--once` | one refill pass then exit |
 | `--tasks-dir`, `--model` | standard inputs |
-| `--policy FILE` | legacy: run on this `flywheel.toml` instead of the effective config |
-| `--target-depth N` | fill the queue to depth N (overrides `[autopilot]` config; default 5) |
-| `--interval SECONDS` | daemon cycle interval (overrides config; default 300.0) |
+| `--dry-run` | with `--once`: measure the queue against the target and log the decision; no agent, nothing emitted |
+| `--agent ID` | agent adapter for discovery and authoring |
+| `--target-depth N` | fill the queue to depth N (default 5) |
+| `--interval SECONDS` | daemon cycle interval (default 300.0) |
 | `--pause` / `--resume` | write / remove `<activity file>.paused` and exit: a running daemon holds between cycles (phase `paused`, still live) until resumed |
 
-Landing strategy and scoring weights come from policy (`autopilot_landing` default `merge`, `autopilot_weights`). See [autopilot.md](autopilot.md) for the tier and scoring model.
+Emitted work lands per the `land` config key; scoring weights are built in. See [autopilot.md](autopilot.md) for the tier and scoring model.
 
-### `triage [--once]`
+### `triage --repo OWNER/NAME [--label L] [--once]`
 
 Triages the GitHub intake board: authors a fail-first spec+grader for each candidate issue, then labels well-specified issues ready and under-specified ones needs-detail, each with a receipt. Delegated to `main` in `crates/flywheel-orchestrator/src/triage_run.rs`. **Neverending label-polling daemon by default**; `--once` runs one triage pass and exits 0. The daemon loop never terminates on an idle cycle — an empty board writes nothing and the next cycle is scheduled; it exits only on SIGTERM/SIGINT (`run_daemon_loop`).
 
 A candidate whose triage errors (agent, grader executor, or `gh` write) is logged as `#N failed (...)` and counted in the pass summary without blocking the remaining candidates; an issue it left unwritten is retried next pass. A pass fails only when every attempted candidate failed (or the board read fails). A full 200-issue listing page logs a truncation warning.
 
-The policy is resolved and validated **before** the repo root or any `gh` call: a malformed `[triage]` value prints to stderr and exits 2 having issued no GitHub write. Triage requires `[source] kind = "github"` with a `repo`; any other source exits 2. The board labels and cadence come from the optional `[triage]` table (`intake_label` default `flywheel`, `ready_label` default `flywheel:ready`, `needs_detail_label` default `flywheel:needs-detail`, `interval_seconds` default `300.0`, `max_per_pass` uncapped); see [configuration.md](configuration.md).
+Flags are validated **before** the repo root or any `gh` call: a missing or malformed `--repo` exits 2 having issued no GitHub write. Labels: intake `--label` (default `flywheel`), ready `flywheel:ready`, needs-detail `flywheel:needs-detail`; interval 300s; no per-pass cap.
 
 | Flag | Controls |
 |---|---|
+| `--repo OWNER/NAME` | the intake board's repo (required) |
+| `--label L` | intake label (default `flywheel`) |
 | `--once` | one triage pass then exit |
-| `--interval SECONDS` | daemon cycle interval (overrides `[triage] interval_seconds`; default 300.0) |
-| `--model` | agent model for the authoring session (overrides `[agent] model`) |
+| `--interval SECONDS` | daemon cycle interval (default 300.0) |
+| `--model` | agent model for the authoring session (overrides `model`) |
 
 ### `audit RUN_ID`
 
@@ -238,18 +243,17 @@ Streams the totally-ordered audit records for one run, routed by the shell (`aud
 
 Entry: `main_with` (`crates/flywheel/src/tui.rs`). Bare `fw` on a TTY opens it; `fw --json` or any non-TTY stdout prints one `DashboardSnapshot` and exits 0 with no ANSI.
 
-The console fails fast on a missing store before launching (a home project's store is created instead): a missing sqlite file exits 2 with the remedy `run 'fw init' ...`; a Postgres backend with no resolvable DSN env exits 2.
+A home project's store is created on launch; an explicit `--db` naming a missing sqlite file exits 2 (remedy: `run 'fw worker' ...`).
 
 ### Console flags
 
 | Flag | Controls |
 |---|---|
 | `--db PATH` | store path (default the home project's `flywheel.sqlite`) |
-| `--policy FILE` | legacy work-policy file (never auto-detected) |
 | `--tasks-dir DIR` | tasks root for summary counts and `/archive` |
 | `--json` | print one JSON snapshot and exit (implied off a non-TTY) |
 | `--poll-interval FLOAT` | dashboard poll cadence (default 1.0s) |
-| `--model ID` | model forwarded to the spawned worker (overrides `[agent] model`) |
+| `--model ID` | model forwarded to the spawned worker (overrides `model`) |
 | `--no-worker` | do not spawn a supervised worker on launch (status bar shows `worker: none`) |
 
 On launch the console opens the store, constructs a `WorkerSupervisor` and spawns it unless `--no-worker`, and constructs an `AutopilotSupervisor` that is **never auto-spawned** — autopilot starts only via `/autopilot start` because it writes to the base branch unattended (decision D-6). On exit both supervisors detach by default: the child keeps running so a SIGINT on the console never silently kills it.
@@ -305,7 +309,7 @@ The compose box doubles as input: plain text is a `say`; a leading `/` is a slas
 
 ### Worker and autopilot supervisors
 
-`WorkerSupervisor` (`crates/flywheel/src/worker_supervisor.rs`) spawns `<console binary> worker --db <path> [--tasks-dir ..] [--model ..]` in a new session (`setsid`), so a console Ctrl-C never reaches the child; only `stop` signals it (SIGTERM to the process group, 10s wait, then SIGKILL). It reads `task_claims` to detect liveness: a live lease this console did not spawn shows as DETACHED. Spawn logs land under the project's `logs/worker/` (beside the store for a `--policy` file).
+`WorkerSupervisor` (`crates/flywheel/src/worker_supervisor.rs`) spawns `<console binary> worker --db <path> [--tasks-dir ..] [--model ..]` in a new session (`setsid`), so a console Ctrl-C never reaches the child; only `stop` signals it (SIGTERM to the process group, 10s wait, then SIGKILL). It reads `task_claims` to detect liveness: a live lease this console did not spawn shows as DETACHED. Spawn logs land under the project's `logs/worker/`.
 
 `AutopilotSupervisor` (`crates/flywheel/src/autopilot_supervisor.rs`) spawns `<console binary> autopilot [--tasks-dir ..] [--model ..] [--activity-file ..]` without `--once` (the neverending daemon). It writes no lease; liveness rides on the daemon's activity record (pid + `expires_at`), so a live daemon this console did not spawn is adopted as DETACHED and a stale record reads as not-live. Logs land under the project's `logs/autopilot/`. Same spawn/detach/stop shape, independent of the worker.
 
@@ -330,25 +334,22 @@ An unknown verb leaves the typed line populated for editing rather than erroring
 
 ## `init`
 
-Legacy: scaffolds `.flywheel/` and a `flywheel.toml` work policy, which verbs read only through an explicit `--policy flywheel.toml` (`cmd_init`, `crates/flywheel-orchestrator/src/workflow/init.rs`). When a Dockerfile or Containerfile sits at the repo root, it also appends `.flywheel/` to `.dockerignore` (`ensure_dockerignore_covers_flywheel`) — docker build contexts do not read `.gitignore`. Idempotent: existing files are left untouched and reported.
+`fw init [--no-skills] [--provision] [--allow-unverified]` (`cmd_init`, `crates/flywheel-orchestrator/src/workflow/init.rs`). **Writes nothing into the repo tree** (beyond the `.git/config` project id). Outside a git repo: exit 2.
 
-**Git preflight is a hard gate.** Before any file is written, `init` refuses (exit 2, nothing scaffolded) when the cwd is not a git repo or HEAD is detached (`init_git_preflight_error`). The state `init` produces must be one the worker's own preconditions accept.
+1. Resolves the project and prints `project: <id> (<dir>)`.
+2. Creates `$FLYWHEEL_HOME/config.toml` (every key commented) when missing.
+3. Postgres `store`: runs the preflight; a blocking issue exits 2 unless `--allow-unverified`; `--provision` creates the tables now.
+4. Installs the fw-* skills under `$CLAUDE_CONFIG_DIR/skills` (default `~/.claude/skills`) unless `--no-skills`.
+5. Reports agent auth (`ANTHROPIC_API_KEY` or `~/.claude/.credentials.json`; non-blocking).
+6. Without a `.flywheel.toml`: detects a verify command and prints a suggested file to commit, then `fw trust`:
 
-| Flag | Effect |
-|---|---|
-| `--store {sqlite,postgres}` | pre-answer `[store] backend` (default sqlite) |
-| `--pg-schema NAME` | `[store] schema` (postgres only; identifier-validated) |
-| `--provision` | after the postgres preflight passes, create the schema and run bootstrap DDL now (postgres + resolvable DSN only) |
-| `--allow-unverified` | scaffold even when the postgres preflight reports a blocking issue (downgrades blocks to warnings) |
-| `--source {directory,github}` | pre-answer `[source] kind` (default directory) |
-| `--repo OWNER/NAME` | github repo (default parsed from the origin remote) |
-| `--label NAME` | github issue label (default `flywheel`) |
-| `--skills` / `--no-skills` | install / skip the Claude Code skills. Interactive default yes; non-interactive default no |
-| `--defaults` | accept every default without prompting (a non-TTY stdin implies this) |
+```toml
+verify = "cargo test"
+# protected_paths = [".github/**", ".flywheel.toml"]
+# land = "merge"    # or "pr"
+```
 
-Answers are collected fully before any write, so Ctrl-C/EOF mid-prompt leaves no partial `flywheel.toml`. The rendered policy carries `[source]`, `[store]`, `[paths]`, an auto-detected `[submit] base`, and commented placeholders — **no credential ever appears** (the postgres DSN lives only in env). After writing, `init` reports whether `ANTHROPIC_API_KEY` is set or `~/.claude/.credentials.json` exists (non-blocking).
-
-For the resulting `flywheel.toml` schema see [configuration.md](configuration.md); for the installed `fw-*` skills and the spec/plan/verify/execute pipeline they drive see [workflow.md](workflow.md).
+Detection: `Cargo.toml` -> `cargo test`, `package.json` test script -> `npm test`, pytest config -> `pytest`, `go.mod` -> `go test ./...`, Makefile `test:` -> `make test`. Skills and the pipeline they drive: [workflow.md](workflow.md).
 
 ## The `--json` snapshot
 

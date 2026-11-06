@@ -232,7 +232,16 @@ The cwd project's audit record, oldest first (newest last), from whichever store
 | `transcript` | `run_id`, `uri` (`file://` + absolute path), `sha256` (hex of the body bytes), `bytes` | when a run finalizes (the runner returned) |
 | `autopilot.cycle` | `cycle`, `mode` (`once`/`daemon`), `outcome` (`ok`/`error`), `reason`, `emitted`, `dropped`, `relevant_tiers`, `not_relevant_tiers`, `prefiltered`, `discovery_cache`, `emitted_tasks`, `dropped_findings`; on error `error`, `error_type` | every autopilot pass |
 | `autopilot.decision` | `cycle`, `decision` (`emitted`/`dropped`), `finding_id`, `tier`, `title`, `reason`; `task_id` when emitted | per emitted task / dropped finding |
-| `autopilot.approve` / `autopilot.deny` | `run_id`, `task_id`, `gate`, `attempt`, `command_id`, `actor`, `with_feedback` | per gate decision from the hub's autopilot panel |
+| `autopilot.approve` / `autopilot.deny` | `run_id`, `task_id`, `gate`, `attempt`, `command_id`, `actor`, `with_feedback` | per hub gate decision on a task autopilot emitted |
+| `hub.approve` / `hub.deny` | as above plus `subject` = `run_gate`; or (`hub.approve` only) `subject` = `permission`, `agent`, `file`, `rules`, `dangerous` | a hub gate decision on any other task; an agent tool permission allowed in the hub |
+| `hub.session.start` | `session_id`, `session_name`, `session_kind` (`shell`/`claude`/`codex`), `workspace`, `cwd`, `worktree`, `branch`, `base`, `repo` | a hub session opened |
+| `hub.session.end` | the session fields plus `exit_code`, `signal`, `hub_stopping` (hung up by `fw hub stop`), `summary` (the agent's last reply, one line, 280 chars) | its process exited |
+| `hub.merge` / `hub.pr` | the session fields plus `branch`, `base`, `commit`, `url` (PR), `summary` | a review drawer merge / opened PR |
+| `hub.review` | the session fields plus `action` (`commit`/`push`/`rebase`/`request`), `commit`; a request adds `reviewer_session_id`, `reviewer_kind`, `reused` | a review action, or a reviewer asked for |
+| `hub.handoff` | the target session's fields plus `from`, `source`, `bytes`, `truncated` | text handed off into a session |
+| `hub.fanout` | `fanout_id`, `name`, `workspace`, `base`, `base_sha`, `graded_at`, `leader`, `winner`, `counts`, `candidates` (`label`, `session_id`, `verdict`, `passed`, `branch`, `commit`, `graders_passed`, `graders_total`) | a verified fan-out finished grading |
+
+`hub.*` rows land in the store of the project the touched folder (a session's worktree, else its start directory) is in. A folder in no project the home knows -- not a git repo, a repo no `fw` verb ran in, a copy of a project repo -- records nothing and is not made a project (no project dir, no `.git/config` write); a failed write is logged in the hub log, never fails the action (`crates/flywheel/src/hub_audit.rs`).
 
 `--json` prints NDJSON, one object per row; `at` is RFC 3339. Plain output is one line per row.
 

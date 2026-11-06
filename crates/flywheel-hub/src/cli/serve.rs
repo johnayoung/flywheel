@@ -130,6 +130,12 @@ pub(super) fn serve_cmd(
             return 1;
         }
     };
+    // Hub actions become audit rows in their projects' stores.
+    if let Some(sink) = &extensions.audit
+        && let Err(e) = hub.set_audit_sink(Arc::clone(sink))
+    {
+        let _ = writeln!(err, "fw hub: hub actions will not be audited: {e}");
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(runtime_workers())

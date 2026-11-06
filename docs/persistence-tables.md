@@ -27,7 +27,7 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 | `grader_results`   | `id`; index `(project_id, run_id, attempt_number, ordinal)` | Append-only receipt log, one row per grader execution. Snapshots the grader spec as it ran. FK -> `attempts`. |
 | `control_commands` | `id`; index `(project_id, run_id, id)` where pending | Operator steering queue for one live run. CLI enqueues; the in-run watcher claim-once-applies. **Empty until live operator interaction.** |
 | `transcripts`      | `id`; index `(project_id, created_at, id)` | Audit ledger (v14): one row per finalized run transcript body -- `run_id`, `uri` (`file://` + absolute path), `sha256`, `bytes`, `created_at`. Append-only (triggers reject UPDATE/DELETE); no FK, kept forever, outlives its body. |
-| `audit_log`        | `id`; index `(project_id, at, id)` | Audit ledger (v14): opaque `kind` + `payload_json` (+ optional `run_id`): `autopilot.cycle`, `autopilot.decision`, `autopilot.approve`, `autopilot.deny`. Append-only, no FK, kept forever. |
+| `audit_log`        | `id`; index `(project_id, at, id)` | Audit ledger (v14): opaque `kind` + `payload_json` (+ optional `run_id`): `autopilot.cycle`, `autopilot.decision`, `autopilot.approve`, `autopilot.deny`, and the hub's `hub.session.start`, `hub.session.end`, `hub.merge`, `hub.review`, `hub.pr`, `hub.fanout`, `hub.handoff`, `hub.approve`, `hub.deny` (fields: `docs/cli.md`). Append-only, no FK, kept forever. |
 | `schema_version`   | `id = 1` | Sentinel `(version, id)`; no `project_id` (it versions the whole database). |
 
 ## Orchestrator tables

@@ -397,6 +397,9 @@ pub fn route(
             )),
             // Verified fan-outs grade with flywheel-core's command graders.
             graders: Some(std::sync::Arc::new(crate::hub_graders::CoreGraderRunner)),
+            // Hub actions become audit rows in the store of the project
+            // each touched (an existing project only: none is created).
+            audit: Some(std::sync::Arc::new(crate::hub_audit::HubAudit::new())),
         };
         return flywheel_hub::cli::run_with(rest, out, err, &extensions);
     }

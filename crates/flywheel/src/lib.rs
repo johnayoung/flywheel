@@ -14,6 +14,7 @@ pub mod db_verbs;
 pub mod docs;
 pub mod exec;
 pub mod history_screen;
+pub mod hub_audit;
 pub mod hub_autopilot;
 pub mod hub_flywheel;
 pub mod hub_graders;

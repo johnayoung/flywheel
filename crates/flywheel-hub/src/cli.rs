@@ -589,6 +589,9 @@ pub struct HubExtensions {
     /// Runs verified fan-outs' graders (`None`: fan-outs cannot start or
     /// grade).
     pub graders: Option<Arc<dyn crate::fanout::GraderRunner>>,
+    /// Records hub actions in the store of the project each touched
+    /// (`None`: no audit rows; see [`crate::audit`]).
+    pub audit: Option<Arc<dyn crate::audit::AuditSink>>,
 }
 
 impl std::fmt::Debug for HubExtensions {
@@ -596,6 +599,7 @@ impl std::fmt::Debug for HubExtensions {
         f.debug_struct("HubExtensions")
             .field("flywheel", &self.flywheel.is_some())
             .field("graders", &self.graders.as_ref().map(|g| g.name()))
+            .field("audit", &self.audit.is_some())
             .finish()
     }
 }

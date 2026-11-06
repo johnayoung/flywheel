@@ -15,7 +15,9 @@
 //!   [`GateBinding::of_parked`]; a decision goes through
 //!   [`enqueue_gate_decision`], exactly as `fw approve` / `fw reject
 //!   --gate --attempt` and the console's keypress do, and is recorded in
-//!   the ledger (`autopilot.approve` / `autopilot.deny`);
+//!   the ledger: `autopilot.approve` / `autopilot.deny` for a task
+//!   autopilot emitted (an `autopilot.cycle` row lists it), else
+//!   `hub.approve` / `hub.deny` (`subject = "run_gate"`);
 //! * pause / resume: `autopilot_activity::set_paused`, as `fw autopilot
 //!   --pause|--resume`.
 
@@ -25,7 +27,7 @@ use flywheel_core::invoker_client::{
     enqueue_gate_decision,
 };
 use flywheel_core::lifecycle::{Lifecycle, Status};
-use flywheel_core::store::{HarnessStore, LedgerFilter, LifecycleFilter};
+use flywheel_core::store::{HarnessStore, LedgerFilter, LifecycleFilter, StoreError};
 use flywheel_hub::autopilot::{
     AutopilotView, GateDecided, GateDecision, GateRefused, PendingDecision, PilotCandidate,
     PilotConfig, PilotDecision, PilotDrop, PilotEmit, PilotGate, PilotHold, PilotState, PilotTier,
@@ -38,7 +40,7 @@ use flywheel_orchestrator::autopilot_activity::{
     read_activity,
 };
 use flywheel_orchestrator::autopilot_ledger::{
-    GateDecisionRecord, KIND_CYCLE, cycle_summary, record_gate_decision,
+    GateDecisionRecord, KIND_CYCLE, cycle_summary, gate_decision_entry,
 };
 use flywheel_orchestrator::policy::{
     AutopilotWeights, DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY, DEFAULT_AUTOPILOT_INTERVAL_SECONDS,
@@ -601,6 +603,44 @@ pub(crate) fn read_view(
 
 /// Enqueue `decision` through [`enqueue_gate_decision`] (pinned to the
 /// gate and attempt it names).
+/// Whether autopilot emitted `task_id`: an `autopilot.cycle` row lists it.
+fn autopilot_emitted(core: &dyn HarnessStore, task_id: &str) -> Result<bool, StoreError> {
+    let cycles = core.list_ledger_entries(&LedgerFilter::kind_prefix(KIND_CYCLE))?;
+    Ok(cycles.iter().any(|row| {
+        row.payload
+            .get("emitted_tasks")
+            .and_then(Value::as_array)
+            .is_some_and(|tasks| {
+                tasks
+                    .iter()
+                    .any(|t| t.get("task_id").and_then(Value::as_str) == Some(task_id))
+            })
+    }))
+}
+
+/// The ledger row of a gate decision made in the hub: `autopilot.approve`
+/// / `autopilot.deny` on autopilot's work, else `hub.approve` /
+/// `hub.deny` (with `subject = "run_gate"`).
+fn record_hub_gate_decision(
+    core: &dyn HarnessStore,
+    record: &GateDecisionRecord<'_>,
+    at: DateTime<Utc>,
+) -> Result<(), StoreError> {
+    let mut entry = gate_decision_entry(record, at);
+    if !autopilot_emitted(core, record.task_id)? {
+        entry.kind = if record.approve {
+            flywheel_hub::audit::KIND_APPROVE
+        } else {
+            flywheel_hub::audit::KIND_DENY
+        }
+        .to_owned();
+        entry
+            .payload
+            .insert("subject".into(), Value::from("run_gate"));
+    }
+    core.append_ledger_entry(&entry).map(|_| ())
+}
+
 pub(crate) fn decide(
     core: &dyn HarnessStore,
     decision: &GateDecision,
@@ -655,21 +695,18 @@ pub(crate) fn decide(
             // The ledger row is the audit record of the decision; the
             // enqueued command is what a worker applies. A failed ledger
             // write must not hide an already-enqueued decision.
-            if let Err(e) = record_gate_decision(
-                core,
-                &GateDecisionRecord {
-                    approve: decision.approve,
-                    run_id: &decided.run_id,
-                    task_id: &decided.task_id,
-                    gate: decided.gate,
-                    attempt: decided.attempt,
-                    command_id: decided.command_id,
-                    actor: "hub",
-                    with_feedback: decision.feedback.is_some(),
-                },
-                Utc::now(),
-            ) {
-                eprintln!("fw hub: autopilot decision ledger write failed: {e}");
+            let record = GateDecisionRecord {
+                approve: decision.approve,
+                run_id: &decided.run_id,
+                task_id: &decided.task_id,
+                gate: decided.gate,
+                attempt: decided.attempt,
+                command_id: decided.command_id,
+                actor: "hub",
+                with_feedback: decision.feedback.is_some(),
+            };
+            if let Err(e) = record_hub_gate_decision(core, &record, Utc::now()) {
+                eprintln!("fw hub: gate decision ledger write failed: {e}");
             }
             Ok(decided)
         }
@@ -727,6 +764,42 @@ mod tests {
         assert_eq!(last_decided.cycle, 1);
         assert_eq!(last_decided.reason, "emitted 2");
         assert_eq!(last_decided.at, Some(t0));
+    }
+
+    #[test]
+    fn a_hub_gate_decision_is_autopilots_only_on_a_task_autopilot_emitted() {
+        use flywheel_core::store::{LedgerEntry, LedgerStore};
+        use flywheel_core::store_memory::InMemoryStore;
+        let store = InMemoryStore::new();
+        let mut cycle = Map::new();
+        cycle.insert(
+            "emitted_tasks".into(),
+            serde_json::json!([{ "task_id": "ap-1", "tier": 2 }]),
+        );
+        store
+            .append_ledger_entry(&LedgerEntry::new(KIND_CYCLE, Utc::now(), cycle))
+            .unwrap();
+        let decision = |task_id, approve| GateDecisionRecord {
+            approve,
+            run_id: "run-1",
+            task_id,
+            gate: 1,
+            attempt: 1,
+            command_id: 7,
+            actor: "hub",
+            with_feedback: false,
+        };
+        let now = Utc::now();
+        record_hub_gate_decision(&store, &decision("ap-1", true), now).unwrap();
+        record_hub_gate_decision(&store, &decision("hand-1", true), now).unwrap();
+        record_hub_gate_decision(&store, &decision("hand-1", false), now).unwrap();
+        let rows = store.list_ledger_entries(&LedgerFilter::default()).unwrap();
+        let kinds: Vec<&str> = rows[1..].iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(kinds, ["autopilot.approve", "hub.approve", "hub.deny"]);
+        assert_eq!(rows[2].payload["subject"], "run_gate");
+        assert_eq!(rows[2].payload["task_id"], "hand-1");
+        assert_eq!(rows[2].run_id.as_deref(), Some("run-1"));
+        assert!(rows[1].payload.get("subject").is_none());
     }
 
     /// A daemon that exited without its parent reaping it (a zombie)

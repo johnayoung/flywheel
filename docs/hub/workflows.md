@@ -18,8 +18,8 @@ fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it wait
 
 ## Agent launcher
 
-- **Resume** (`--resume ID`, `--continue`, the dialog's **Conversation**): a new session picks up one of the folder's Claude Code or Codex conversations (`fw hub conversations WS --kind K`); one open in a running session is refused. Relaunch and hub restarts already resume a session's own conversation.
-- **Accounts** (Claude): `claude setup-token` as the other account, Settings > Agents (or `fw hub account add work`), then `--account work` or the dialog's **Account** (per workspace). Spawns get `CLAUDE_CODE_OAUTH_TOKEN`: one `~/.claude` serves both; rows show `@work`. A key in Claude's settings `env` outranks it.
+- **Resume** (`--resume ID`, `--continue`, the dialog's **Conversation**): a new session picks up one of the folder's Claude Code or Codex conversations (`fw hub conversations WS --kind K`); one open in a running session is refused. Relaunch and restarts resume a session's own.
+- **Accounts** (Claude): `claude setup-token` as the other account, Settings > Agents (or `fw hub account add work`), then `--account work` or the dialog's **Account** (per workspace). Spawns get `CLAUDE_CODE_OAUTH_TOKEN` (one `~/.claude` serves both; rows show `@work`); Claude's settings `env` outranks it.
 - **First prompt** (`--prompt`, 32 KiB): the first user turn, on create only. **Model**: `claude --model` / `codex -m`.
 - **Permissions**: Claude `--permission-mode` (`bypassPermissions` warns, marks the session `unchecked`); Codex `-a` approval, `-s` sandbox; reapplied on relaunch and restore.
 - **Templates** (per workspace): kind, prompt, model, permissions, worktree; a taken name needs `--replace` (all) or `--edit` (given flags). Launch: palette, `new --template NAME` (flags win). Defaults: `[agents.*]`.
@@ -81,7 +81,7 @@ A branch with a pull request: a badge on its row (`#7`, checks), a PR section in
 ## Handoff and peer review
 
 - **Send to agent** (`fw hub handoff FROM TO`, `handoff.send`): a selection, message, block, or diff to another agent (any workspace or machine) as one editable prompt (32 KiB).
-- **Shell output to agent** (`Alt O`, header **to <agent>** on a shell, the send icon or pane menu on a shell pane, `fw hub handoff SHELL AGENT --output`): the output of the last command typed at the shell's prompt (found by the prompt line it sits at now), else its last 200 lines; a companion shell defaults to its own agent.
+- **Shell output to agent** (`Alt O`, header **to <agent>** on a shell, the send icon or pane menu on a shell pane, `fw hub handoff SHELL AGENT --output`): the output of the last command typed at the shell's prompt, else its last 200 lines; a companion shell: its own agent.
 - **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author. Model: `--model`, else the author's (same kind), else `agents.<kind>.model`.
 - **Send findings to <author>** pastes the reviewer's latest reply back. Pairing survives restarts; closing the author closes its reviewers.
 
@@ -125,8 +125,9 @@ Folders whose git repo has a project id flywheel knows get the verified loop, re
 - Phases, tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
 - **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks to add unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`.
-- Shown (decisions from the ledger): tier verdicts, the newest deciding cycle (emitted, dropped with reasons), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each logged. Peers: read-only.
+- Shown (decisions from the ledger): tier verdicts, the newest deciding cycle (emitted, dropped with reasons), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
 - A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is not made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
+- **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the touched folder's project store (`fw audit --project`). No project: no row, none made. Seam: `AuditSink` (`hub_audit.rs`).
 
 ## Prompt queue
 
@@ -142,7 +143,7 @@ Per agent session, prompts the hub types in itself, in order ("when done, do X")
 | Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched |
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
-**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase on main"`); a workspace means its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), refused with why (shell, exited, full). `--header` names the recipients.
+**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase on main"`); a workspace means its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), else refused with why. `--header` names the recipients.
 
 ## Activity
 
@@ -157,7 +158,7 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 Off until `hub.toml` `[digest] times` is set ([hub-reference](reference.md#hubtoml); Settings > Digest writes that table). `fw hub digest` previews; `--send` sends now.
 
 - **Says**, since the last digest, per workspace: turns finished, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, longest blocked, red PRs, stalled queues) with links.
-- **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty ones are skipped (`quiet_if_empty`). `delivery.channels` lists only what heard it (`unheard`: no browser open, no plugin listening).
+- **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty ones are skipped (`quiet_if_empty`). `delivery.channels` lists only what heard it.
 - **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it. A send claim older than 5 min is dropped even if its pid runs (reused).
 
 ## Permissions

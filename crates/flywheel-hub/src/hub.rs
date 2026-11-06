@@ -544,6 +544,9 @@ pub struct Hub {
     activity: crate::activity::Activity,
     /// Pending permission requests and their journal (`crate::perms`).
     perms: Arc<crate::perms::Runtime>,
+    /// Hub actions recorded in their projects' stores, once the embedding
+    /// binary plugged in a sink (see [`crate::audit`]).
+    audit: std::sync::OnceLock<crate::audit::AuditRecorder>,
     /// Held until the hub is dropped (see [`ServeLock`]).
     _serve_lock: ServeLock,
 }
@@ -655,6 +658,7 @@ impl Hub {
             queue: crate::queue::QueueRuntime::default(),
             activity: crate::activity::Activity::open(&options_state_dir),
             perms: Arc::new(crate::perms::Runtime::new(&options_state_dir, perms_env)),
+            audit: std::sync::OnceLock::new(),
             _serve_lock: serve_lock,
         }))
     }
@@ -690,7 +694,40 @@ impl Hub {
     /// [`crate::plugins::EVENTS`]) with `payload`.
     pub fn emit_lifecycle(&self, event: &'static str, payload: serde_json::Value) {
         debug_assert!(crate::plugins::EVENTS.contains(&event), "{event}");
+        if let Some(recorder) = self.audit.get() {
+            let reply = (event == "session.exited")
+                .then(|| self.last_reply(&payload))
+                .flatten();
+            if let Some(record) =
+                crate::audit::from_lifecycle(event, &payload, reply.as_deref(), chrono::Utc::now())
+            {
+                recorder.submit(record);
+            }
+        }
         self.emit(HubEvent::Lifecycle { event, payload });
+    }
+
+    /// Record hub actions through `sink` from now on (see
+    /// [`crate::audit`]); refused when one is already plugged in.
+    pub fn set_audit_sink(&self, sink: Arc<dyn crate::audit::AuditSink>) -> std::io::Result<()> {
+        let recorder = crate::audit::AuditRecorder::start(sink)?;
+        self.audit.set(recorder).map_err(|recorder| {
+            recorder.close(Duration::ZERO);
+            std::io::Error::other("an audit sink is already set")
+        })
+    }
+
+    /// The newest agent reply of the session a lifecycle payload names, as
+    /// the hub already holds it (no transcript read).
+    fn last_reply(&self, payload: &serde_json::Value) -> Option<String> {
+        let id = payload.get("session")?.get("id")?.as_str()?;
+        let record = self.store().session(id).ok()?.clone();
+        self.commands
+            .replies(&record, 1)
+            .replies
+            .into_iter()
+            .next()
+            .map(|r| r.reply.text)
     }
 
     /// A session as plugin events describe it (`None`: no such session).
@@ -973,6 +1010,11 @@ impl Hub {
         self.recordings.stop_all();
         for session in &sessions {
             session.release();
+        }
+        // The hung-up sessions' ends included: queued audit rows are
+        // written before the process exits.
+        if let Some(recorder) = self.audit.get() {
+            recorder.close(crate::audit::FLUSH_TIMEOUT);
         }
     }
 }

@@ -19,6 +19,7 @@ pub mod agent_handoff;
 pub mod agent_handoff_cli;
 pub mod agentlog;
 pub mod attach;
+pub mod audit;
 pub mod auth;
 pub mod autopilot;
 pub mod autopilot_cli;

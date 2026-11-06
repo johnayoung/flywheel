@@ -496,6 +496,21 @@ pub fn resolve_project(home: &Home, dir: &Path) -> Result<Project, ProjectError>
     Ok(Project { id, paths, meta })
 }
 
+/// Whether [`resolve_project`] on `dir` would mint a new id (and so create
+/// a project): its repo carries no id yet, or it is a copy of the repo the
+/// id's meta.json records. Read-only: for callers that must never create a
+/// project (the hub's audit record).
+pub fn would_mint(home: &Home, dir: &Path) -> Result<bool, ProjectError> {
+    let common_dir = git_common_dir(dir)?;
+    let Some(id) = read_stored_id(&common_dir)? else {
+        return Ok(true);
+    };
+    Ok(match read_meta(&home.project(&id))? {
+        Some(meta) => meta.git_common_dir != common_dir && is_original(&meta, &id)?,
+        None => false,
+    })
+}
+
 /// The project dir an invocation of `local` uses when its effective config
 /// names `id` (a `project_id` override shares one project dir -- and one
 /// Postgres partition -- across clones). `id == local.id` is `local`

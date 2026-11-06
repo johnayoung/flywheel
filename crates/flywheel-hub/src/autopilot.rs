@@ -19,7 +19,7 @@
 //! daemon's pause marker as `fw autopilot --pause|--resume` do; approve /
 //! deny enqueue a gate decision bound to the gate shown, as `fw approve` /
 //! `fw reject --gate --attempt` do. The hub decides nothing itself: the
-//! held-out gate, risk tiers, and team-mode reviews stay where they are
+//! held-out gate and team-mode reviews stay where they are
 //! enforced (worker, submit strategy, GitHub) and are only shown.
 //!
 //! Events ([`events_between`]): `autopilot.started`, `autopilot.stopped`,
@@ -77,15 +77,14 @@ pub struct PilotConfig {
     pub model: Option<String>,
     /// Every score weight in effect (`tier`, `urgency`, ...).
     pub weights: BTreeMap<String, f64>,
-    /// `[submit] strategy`.
+    /// The `land` config key (`merge` or `pr`).
     pub submit_strategy: String,
-    /// The `[[submit.tiers]]` risk tiers configured (empty: none).
-    pub risk_tiers: Vec<u8>,
-    /// `[execution] mode = "distributed"` (team mode: GitHub reviews).
+    /// The store is postgres: claims span machines (team mode).
     pub team_mode: bool,
-    /// `[held_out] root` is set: the execute-time held-out gate applies.
+    /// The project's held-out dir holds registrations: the execute-time
+    /// held-out gate applies.
     pub held_out: bool,
-    /// `[submit] verify` is set.
+    /// The `verify` config key is set.
     pub submit_verify: bool,
 }
 

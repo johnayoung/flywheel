@@ -747,7 +747,6 @@ pub struct GitWorktreeSubmitter {
     pub lock_path: PathBuf,
     pub log: Logger,
     pub protected_paths: Vec<String>,
-    pub setup_command: Option<String>,
     /// Submit-time retention (`[sandbox.retention] on_done`): `destroy`
     /// (default) removes a landed worktree+branch; `preserve` keeps them.
     pub on_done: String,
@@ -792,7 +791,6 @@ impl fmt::Debug for GitWorktreeSubmitter {
             .field("phase_base", &self.phase_base)
             .field("lock_path", &self.lock_path)
             .field("protected_paths", &self.protected_paths)
-            .field("setup_command", &self.setup_command)
             .field("on_done", &self.on_done)
             .field("on_failure", &self.on_failure)
             .field("store", &self.store.is_some())
@@ -827,7 +825,6 @@ impl GitWorktreeSubmitter {
             lock_path: lock_path.into(),
             log,
             protected_paths: Vec::new(),
-            setup_command: None,
             on_done: "destroy".to_owned(),
             on_failure: "park".to_owned(),
             store: None,
@@ -849,11 +846,6 @@ impl GitWorktreeSubmitter {
         S: Into<String>,
     {
         self.protected_paths = paths.into_iter().map(Into::into).collect();
-        self
-    }
-
-    pub fn with_setup_command(mut self, command: impl Into<String>) -> Self {
-        self.setup_command = Some(command.into());
         self
     }
 
@@ -1186,9 +1178,7 @@ impl GitWorktreeSubmitter {
     ///
     /// Reuses a parked worktree+branch on retry (rebasing onto base first),
     /// recreates it when only the branch survived a sweep, and refuses to
-    /// clobber half-present operator state. Every freshly created directory
-    /// gets the policy's sandbox setup command; a reused parked worktree
-    /// skips it (its environment survived with it).
+    /// clobber half-present operator state.
     pub fn prepare_worktree(&self, req: &SandboxRequest) -> Result<PathBuf, PrepareSandboxError> {
         let task_id = &req.task_id;
         let phase = self.phase_of(req.task_file.as_deref());
@@ -1212,7 +1202,6 @@ impl GitWorktreeSubmitter {
             }
             self.guard_done_branch(req.run_id.as_deref(), &branch, &worktree, &base)?;
             self.discard_and_recreate(&worktree, &branch, &base)?;
-            self.run_setup(&worktree)?;
             return Ok(worktree);
         }
 
@@ -1225,7 +1214,6 @@ impl GitWorktreeSubmitter {
                 self.guard_done_branch(req.run_id.as_deref(), &branch, &worktree, &base)?;
                 self.discard_and_recreate(&worktree, &branch, &base)?;
             }
-            self.run_setup(&worktree)?;
             return Ok(worktree);
         }
 
@@ -1237,39 +1225,7 @@ impl GitWorktreeSubmitter {
         }
 
         self.add_worktree(&worktree, &["-b", &branch, &base])?;
-        self.run_setup(&worktree)?;
         Ok(worktree)
-    }
-
-    /// Run the policy's `[sandbox] setup` command (shell) inside a newly
-    /// provisioned worktree before the agent enters. Failure skips the task
-    /// this session rather than running it in a half-provisioned sandbox.
-    fn run_setup(&self, worktree: &Path) -> Result<(), PrepareSandboxError> {
-        let Some(command) = &self.setup_command else {
-            return Ok(());
-        };
-        self.log(format!(
-            "sandbox setup: {command:?} in {}",
-            worktree.display()
-        ));
-        let proc = run_shell(command, worktree, None);
-        if !proc.ok() {
-            let tail = char_tail(
-                if proc.stderr.is_empty() {
-                    &proc.stdout
-                } else {
-                    &proc.stderr
-                },
-                2000,
-            );
-            return Err(PrepareSandboxError(format!(
-                "sandbox setup {command:?} failed in {} (exit {}): {tail}",
-                worktree.display(),
-                proc.code
-                    .map_or_else(|| "signal".to_owned(), |c| c.to_string())
-            )));
-        }
-        Ok(())
     }
 
     // --- landability -----------------------------------------------------------------------
@@ -2320,7 +2276,6 @@ pub fn build_merge_submitter(
     .with_ledger_guard(Arc::new(
         crate::disk_preflight::DiskPreflight::new().with_log(Arc::clone(&request.log)),
     ));
-    submitter.setup_command = request.setup_command.clone();
     submitter.store = request.store.clone();
     submitter.grader_env = request.grader_env.clone();
     submitter.held_out_source = request.held_out_source.clone();
@@ -2755,32 +2710,10 @@ mod tests {
     }
 
     #[test]
-    fn setup_command_runs_in_fresh_worktrees_and_its_failure_skips_the_task() {
+    fn reused_parked_worktree_rebases_onto_advanced_base() {
         let (_dir, repo) = repo();
-        let s = submitter(&repo, ledger()).with_setup_command("echo provisioned > setup.txt");
-        let (_tf, wt) = prepared(&s, &repo, "01-phase", "t1", "true");
-        assert_eq!(
-            fs::read_to_string(wt.join("setup.txt")).unwrap().trim(),
-            "provisioned"
-        );
-
-        let failing = submitter(&repo, ledger()).with_setup_command("echo nope >&2; exit 3");
-        let tf = task_file(&repo, "01-phase", "t2", "true");
-        let err = failing
-            .prepare_worktree(&sandbox_req(&tf, "t2"))
-            .unwrap_err();
-        assert!(err.0.contains("exit 3"), "{err}");
-        assert!(err.0.contains("nope"), "{err}");
-        let prepare_err: PrepareError = err.into();
-        assert!(prepare_err.message.contains("sandbox setup"));
-    }
-
-    #[test]
-    fn reused_parked_worktree_rebases_onto_advanced_base_and_skips_setup() {
-        let (_dir, repo) = repo();
-        let s = submitter(&repo, ledger()).with_setup_command("touch setup-ran");
+        let s = submitter(&repo, ledger());
         let (tf, wt) = prepared(&s, &repo, "01-phase", "t1", "true");
-        fs::remove_file(wt.join("setup-ran")).unwrap();
         commit(&wt, "work.txt", "w", "agent work");
         commit(&repo, "other.txt", "o", "base advances");
         let again = s.prepare_worktree(&sandbox_req(&tf, "t1")).unwrap();
@@ -2790,10 +2723,6 @@ mod tests {
             "rebased onto the advanced base"
         );
         assert!(wt.join("work.txt").exists(), "prior commits carry forward");
-        assert!(
-            !wt.join("setup-ran").exists(),
-            "a reused worktree skips setup"
-        );
     }
 
     #[test]

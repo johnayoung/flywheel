@@ -23,7 +23,6 @@ pub mod github_review;
 pub mod held_out_gate;
 pub mod history;
 pub mod home;
-pub mod init_agent;
 pub mod orchestrate;
 pub mod pg_preflight;
 pub mod policy;

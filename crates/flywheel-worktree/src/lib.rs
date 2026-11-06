@@ -1,5 +1,5 @@
 //! flywheel worktree: built on the orchestrator -- the git-worktree submit
-//! strategies (merge, phase, pr, risk tiers) and the reference worker daemon
+//! strategies (merge, phase, pr) and the reference worker daemon
 //! spawned by `flywheel worker`.
 //!
 //! The worker never commits to the operator's branch: landing is the
@@ -18,5 +18,4 @@ pub mod retention;
 pub mod scoped;
 pub mod submit_registry;
 pub mod submitter;
-pub mod tiering;
 pub mod trailers;

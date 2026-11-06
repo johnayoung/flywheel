@@ -240,16 +240,6 @@ fn config(policy: Option<&WorkPolicy>) -> PilotConfig {
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v))
     .collect();
-    let mut risk_tiers: Vec<u8> = policy
-        .map(|p| {
-            p.submit_tiers
-                .iter()
-                .filter_map(|r| u8::try_from(r.tier).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    risk_tiers.sort_unstable();
-    risk_tiers.dedup();
     PilotConfig {
         target_depth: policy.map_or(DEFAULT_AUTOPILOT_TARGET_DEPTH, |p| p.autopilot_target_depth),
         landing: policy.map_or_else(
@@ -265,9 +255,11 @@ fn config(policy: Option<&WorkPolicy>) -> PilotConfig {
         model: policy.and_then(|p| p.model.clone()),
         weights,
         submit_strategy: policy.map_or_else(|| "merge".to_owned(), |p| p.submit_strategy.clone()),
-        risk_tiers,
-        team_mode: policy.is_some_and(|p| p.execution_mode == "distributed"),
-        held_out: policy.is_some_and(|p| p.held_out_root.is_some()),
+        team_mode: policy.is_some_and(WorkPolicy::distributed),
+        held_out: policy.is_some_and(|p| {
+            p.held_out_root()
+                .is_some_and(|root| flywheel_worktree::daemon::holds_registrations(&root))
+        }),
         submit_verify: policy.is_some_and(|p| p.submit_verify.is_some()),
     }
 }
@@ -406,15 +398,14 @@ fn newest(lifecycles: Vec<Lifecycle>) -> HashMap<String, Lifecycle> {
 /// The folder's autopilot view (see the module doc). `panel` is the
 /// folder's panel read from the same stores, its tasks already folded.
 pub(crate) fn read_view(
-    root: &Path,
+    activity_path: Option<&Path>,
     policy: Option<&WorkPolicy>,
     tasks_dir: Option<&Path>,
     core: &dyn HarnessStore,
     panel: &FlywheelPanel,
 ) -> AutopilotView {
-    let activity_path = root.join(crate::hub_flywheel::AUTOPILOT_ACTIVITY);
-    let activity = read_activity(Some(&activity_path));
-    let paused = is_paused(&activity_path);
+    let activity = activity_path.and_then(|path| read_activity(Some(path)));
+    let paused = activity_path.is_some_and(is_paused);
     let (state, live) = daemon(activity.as_ref(), paused);
     let decision = activity.as_ref().and_then(decision);
     let last_decided = activity.as_ref().and_then(last_decided);

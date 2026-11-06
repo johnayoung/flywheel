@@ -32,6 +32,7 @@ use crate::triage::{
     build_grader_executor, build_triage_authoring_invoker, resolve_base_sha,
 };
 pub use crate::workflow::load_effective_policy;
+use crate::policy::{PolicyError, RunFlags, WorkPolicy};
 use flywheel_core::audit::StopFlag;
 use std::cell::Cell;
 use std::fmt;
@@ -54,10 +55,11 @@ pub const CYCLE_FAILURE_BACKOFF_SECONDS: f64 = 10.0;
 pub const LOG_PREFIX: &str = "[triage]";
 
 /// The one-line usage argparse prints on a bad argument.
-pub const USAGE: &str =
-    "usage: flywheel triage [-h] [--model MODEL] [--interval INTERVAL] [--once]";
+pub const USAGE: &str = "usage: flywheel triage [-h] --repo OWNER/NAME [--label LABEL] [--model MODEL]
+                       [--interval INTERVAL] [--once]";
 
-const HELP: &str = "usage: flywheel triage [-h] [--model MODEL] [--interval INTERVAL] [--once]
+const HELP: &str = "usage: flywheel triage [-h] --repo OWNER/NAME [--label LABEL] [--model MODEL]
+                       [--interval INTERVAL] [--once]
 
 Triage the intake board: promote well-specified issues to the ready label and route \
 under-specified ones to needs-detail, each with a fail-first receipt. Runs as a neverending \
@@ -65,18 +67,26 @@ label-polling daemon by default; --once runs a single triage pass and exits.
 
 options:
   -h, --help           show this help message and exit
+  --repo OWNER/NAME    The GitHub repository whose intake board triage reads and
+                       writes (required).
+  --label LABEL        The intake label (default: flywheel); promoted issues get
+                       flywheel:ready, under-specified ones flywheel:needs-detail.
   --model MODEL
-  --interval INTERVAL  Seconds between daemon cycles (overrides [triage] config).
+  --interval INTERVAL  Seconds between daemon cycles (default: 300).
   --once               Run a single triage pass and exit (no daemon loop).";
 
-const REQUIRES_GITHUB: &str = "flywheel triage: requires [source] kind = \"github\" with a repo \
-(the intake board triage reads and writes)";
+const REQUIRES_REPO: &str = "flywheel triage: requires --repo OWNER/NAME (the intake board \
+triage reads and writes)";
 
 // --- Arguments ------------------------------------------------------------------------
 
 /// The parsed `flywheel triage` command line.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TriageArgs {
+    /// `--repo OWNER/NAME`: the intake board's repository.
+    pub repo: Option<String>,
+    /// `--label L`: the intake label.
+    pub label: Option<String>,
     pub model: Option<String>,
     pub interval: Option<f64>,
     pub once: bool,
@@ -84,7 +94,9 @@ pub struct TriageArgs {
 }
 
 /// The long options `flywheel triage` defines, for unique-prefix matching.
-const LONG_OPTIONS: [&str; 4] = ["--help", "--model", "--interval", "--once"];
+const LONG_OPTIONS: [&str; 6] = [
+    "--help", "--repo", "--label", "--model", "--interval", "--once",
+];
 
 /// Parse `argv` (everything after the verb) as argparse would: `--model M`,
 /// `--interval SECONDS` (a float), `--once`, `-h`/`--help`; every long option
@@ -120,6 +132,8 @@ pub fn parse_args(argv: &[String]) -> Result<TriageArgs, String> {
                 args.once = true;
             }
             "--model" => args.model = Some(take_value(option, inline, &mut iter)?),
+            "--repo" => args.repo = Some(take_value(option, inline, &mut iter)?),
+            "--label" => args.label = Some(take_value(option, inline, &mut iter)?),
             "--interval" => {
                 let raw = take_value(option, inline, &mut iter)?;
                 args.interval = Some(parse_float_arg(option, &raw)?);
@@ -367,10 +381,12 @@ pub fn interruptible_sleep(stop: &StopFlag, seconds: f64) {
 /// The process-level effects `flywheel triage` performs, behind one seam
 /// so [`run_main`] is hermetic in tests.
 pub trait TriageHost: Send + Sync {
-    /// An explicit policy file, or `None` to auto-detect from the working
-    /// directory ([`load_effective_policy`]).
-    fn policy_path(&self) -> Option<PathBuf> {
-        None
+    /// The policy a run resolves: the working directory's home project
+    /// with its effective config ([`load_effective_policy`]; triage runs no
+    /// repo-file command, so it only reads).
+    fn load_policy(&self) -> Result<WorkPolicy, PolicyError> {
+        load_effective_policy(crate::config::Access::ReadOnly)?
+            .ok_or_else(|| PolicyError::Invalid("no project for this directory".to_owned()))
     }
 
     /// The raw stderr line sink (no prefix).
@@ -551,22 +567,32 @@ pub fn run_main(argv: &[String], host: &dyn TriageHost) -> i32 {
     let log = make_logger(LOG_PREFIX, stderr.clone());
 
     // Resolve and validate the policy BEFORE touching git or the gh seam: a
-    // malformed [triage] value must exit 2 having issued no GitHub write and
-    // no git command (spec 00082, the write-free guarantee). Triage needs a
-    // github [source], which only a policy file can name, so the home
-    // project's built-in policy is never consulted.
-    let policy = match crate::workflow::load_policy_file(host.policy_path().as_deref()) {
+    // bad flag must exit 2 having issued no GitHub write and no git command
+    // (spec 00082, the write-free guarantee). The board is named by
+    // `--repo` (and `--label`); every other knob is a built-in default.
+    let Some(repo_flag) = args.repo.clone().filter(|r| !r.is_empty()) else {
+        stderr(REQUIRES_REPO);
+        return 2;
+    };
+    let policy = host.load_policy().and_then(|mut policy| {
+        RunFlags {
+            source: Some("github".to_owned()),
+            repo: Some(repo_flag),
+            label: args.label.clone(),
+            ..RunFlags::default()
+        }
+        .apply(&mut policy)?;
+        if let Some(label) = args.label.clone().filter(|l| !l.is_empty()) {
+            policy.triage_intake_label = label;
+        }
+        Ok(policy)
+    });
+    let policy = match policy {
         Ok(policy) => policy,
         Err(err) => {
             stderr(&format!("flywheel triage: policy error: {err}"));
             return 2;
         }
-    };
-    let Some(policy) = policy.filter(|p| {
-        p.source_kind == "github" && p.github_repo.as_deref().is_some_and(|r| !r.is_empty())
-    }) else {
-        stderr(REQUIRES_GITHUB);
-        return 2;
     };
     let repo = policy.github_repo.clone().unwrap_or_default();
     let board = TriageBoard {
@@ -580,7 +606,7 @@ pub fn run_main(argv: &[String], host: &dyn TriageHost) -> i32 {
             .agent_id
             .clone()
             .unwrap_or_else(|| TriageAgentOptions::default().agent_id),
-        agent_transport: policy.agent_transport.clone(),
+        agent_transport: None,
         model: args.model.clone().or_else(|| policy.model.clone()),
         ..TriageAgentOptions::default()
     };
@@ -674,11 +700,8 @@ mod tests {
     use crate::triage::test_support::ForbiddenGh;
     use crate::triage::{Decision, TriageOutcome};
     use std::collections::VecDeque;
-    use std::path::Path;
     use std::sync::Mutex;
 
-    const GITHUB_SOURCE: &str =
-        "[source]\nkind = \"github\"\nrepo = \"octo/repo\"\nlabel = \"flywheel\"\n";
 
     fn idle() -> Result<TriagePassResult, TriageError> {
         Ok(TriagePassResult::default())
@@ -690,10 +713,11 @@ mod tests {
         args.iter().map(|a| a.to_string()).collect()
     }
 
-    fn write_policy(dir: &Path, body: &str) -> PathBuf {
-        let path = dir.join("flywheel.toml");
-        std::fs::write(&path, body).unwrap();
-        path
+    /// `args` naming the `octo/repo` board.
+    fn board(args: &[&str]) -> Vec<String> {
+        let mut out = argv(&["--repo", "octo/repo"]);
+        out.extend(argv(args));
+        out
     }
 
     // --- argument parsing ------------------------------------------------------------------
@@ -708,7 +732,7 @@ mod tests {
                 model: Some("m".into()),
                 interval: Some(2.5),
                 once: true,
-                help: false
+                ..TriageArgs::default()
             }
         );
         let parsed = parse_args(&argv(&["--model=a", "--model=b", "--interval=7"])).unwrap();
@@ -730,6 +754,13 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_reads_the_board_flags() {
+        let parsed = parse_args(&argv(&["--repo", "o/r", "--label=intake"])).unwrap();
+        assert_eq!(parsed.repo.as_deref(), Some("o/r"));
+        assert_eq!(parsed.label.as_deref(), Some("intake"));
+    }
+
+    #[test]
     fn parse_args_accepts_unique_prefix_abbreviations() {
         let parsed = parse_args(&argv(&["--on", "--mod", "m", "--int=3"])).unwrap();
         assert_eq!(
@@ -738,7 +769,7 @@ mod tests {
                 model: Some("m".into()),
                 interval: Some(3.0),
                 once: true,
-                help: false
+                ..TriageArgs::default()
             }
         );
         assert!(parse_args(&argv(&["--he"])).unwrap().help);
@@ -792,24 +823,6 @@ mod tests {
         interruptible_sleep(&stop, 30.0);
         interruptible_sleep(&stop, f64::INFINITY);
         assert!(started.elapsed() < Duration::from_millis(500));
-    }
-
-    #[test]
-    fn explicit_policy_path_is_loaded_and_empty_means_unspecified_default_detection() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_policy(
-            dir.path(),
-            &format!("{GITHUB_SOURCE}\n[triage]\nmax_per_pass = 3\n"),
-        );
-        let policy = load_effective_policy(Some(&path), crate::config::Access::ReadOnly)
-            .unwrap()
-            .unwrap();
-        assert_eq!(policy.triage_max_per_pass, Some(3));
-        let missing = dir.path().join("absent.toml");
-        assert!(matches!(
-            load_effective_policy(Some(&missing), crate::config::Access::ReadOnly),
-            Err(PolicyError::Read { .. })
-        ));
     }
 
     // --- the daemon loop -------------------------------------------------------------------
@@ -948,14 +961,14 @@ mod tests {
 
     // --- the entrypoint ------------------------------------------------------------------
 
-    /// A hermetic host: an explicit policy file, captured stderr, a forbidden
+    /// A hermetic host: a fixed base policy (or policy error), captured stderr, a forbidden
     /// `gh` runner, an optional repo root (absent = must not be resolved),
     /// a scripted pass recording the specs it was handed, and a no-op sleep.
     /// `armed` holds the daemon's stop flag once signals are armed; with
     /// `stop_after_cycle` the scripted pass sets it, standing in for a
     /// signal arriving mid-cycle.
     struct FakeHost {
-        policy: PathBuf,
+        policy: Result<WorkPolicy, PolicyError>,
         stderr: Arc<Mutex<Vec<String>>>,
         root: Option<PathBuf>,
         passes: Mutex<Vec<SinglePassSpec>>,
@@ -965,7 +978,7 @@ mod tests {
     }
 
     impl FakeHost {
-        fn new(policy: PathBuf, root: Option<PathBuf>) -> Self {
+        fn new(policy: Result<WorkPolicy, PolicyError>, root: Option<PathBuf>) -> Self {
             Self {
                 policy,
                 stderr: Arc::new(Mutex::new(Vec::new())),
@@ -983,8 +996,8 @@ mod tests {
     }
 
     impl TriageHost for FakeHost {
-        fn policy_path(&self) -> Option<PathBuf> {
-            Some(self.policy.clone())
+        fn load_policy(&self) -> Result<WorkPolicy, PolicyError> {
+            self.policy.clone()
         }
 
         fn stderr(&self) -> LogSink {
@@ -1030,32 +1043,28 @@ mod tests {
     }
 
     #[test]
-    fn malformed_triage_policy_exits_two_write_free() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = write_policy(
-            dir.path(),
-            &format!("{GITHUB_SOURCE}\n[triage]\ninterval_seconds = -5\n"),
-        );
-        let host = FakeHost::new(policy, None);
-        assert_eq!(run_main(&[], &host), 2);
+    fn a_policy_error_exits_two_write_free() {
+        let host = FakeHost::new(Err(PolicyError::Invalid("bad config".into())), None);
+        assert_eq!(run_main(&board(&[]), &host), 2);
         let err = host.err_text();
-        assert!(err.contains("policy error"), "{err}");
-        assert!(err.contains("triage.interval_seconds"), "{err}");
+        assert!(err.contains("policy error: bad config"), "{err}");
         assert!(host.passes.lock().unwrap().is_empty());
+        // A malformed --repo is refused the same way.
+        let host = FakeHost::new(Ok(WorkPolicy::default()), None);
+        assert_eq!(run_main(&argv(&["--repo", "noslash"]), &host), 2);
+        assert!(host.err_text().contains("--repo must be OWNER/NAME"));
     }
 
     #[test]
-    fn non_github_source_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = write_policy(dir.path(), "[source]\nkind = \"directory\"\n");
-        let host = FakeHost::new(policy, None);
+    fn a_missing_repo_is_refused() {
+        let host = FakeHost::new(Ok(WorkPolicy::default()), None);
         assert_eq!(run_main(&[], &host), 2);
-        assert!(host.err_text().contains("github"));
+        assert!(host.err_text().contains("requires --repo OWNER/NAME"));
     }
 
     #[test]
     fn bad_arguments_exit_two_before_the_policy() {
-        let host = FakeHost::new(PathBuf::from("/nonexistent/flywheel.toml"), None);
+        let host = FakeHost::new(Ok(WorkPolicy::default()), None);
         assert_eq!(run_main(&argv(&["--bogus"]), &host), 2);
         let err = host.err_text();
         assert!(err.starts_with(USAGE), "{err}");
@@ -1065,9 +1074,8 @@ mod tests {
     #[test]
     fn once_runs_exactly_one_pass_and_exits_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = write_policy(dir.path(), GITHUB_SOURCE);
-        let host = FakeHost::new(policy, Some(dir.path().to_path_buf()));
-        assert_eq!(run_main(&argv(&["--once"]), &host), 0);
+        let host = FakeHost::new(Ok(WorkPolicy::default()), Some(dir.path().to_path_buf()));
+        assert_eq!(run_main(&board(&["--once"]), &host), 0);
         let passes = host.passes.lock().unwrap();
         assert_eq!(passes.len(), 1);
         let spec = &passes[0];
@@ -1090,13 +1098,13 @@ mod tests {
     #[test]
     fn once_wires_max_per_pass_model_and_agent_into_the_spec() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = write_policy(
-            dir.path(),
-            &format!(
-                "{GITHUB_SOURCE}\n[agent]\nid = \"codex\"\ntransport = \"cli\"\nmodel = \"claude-x\"\n\n[triage]\nmax_per_pass = 7\n"
-            ),
-        );
-        let host = FakeHost::new(policy, Some(dir.path().to_path_buf()));
+        let policy = WorkPolicy {
+            agent_id: Some("codex".into()),
+            model: Some("claude-x".into()),
+            triage_max_per_pass: Some(7),
+            ..WorkPolicy::default()
+        };
+        let host = FakeHost::new(Ok(policy), Some(dir.path().to_path_buf()));
         host.outcome.lock().unwrap().push_back(Ok(TriagePassResult {
             outcomes: vec![
                 TriageOutcome {
@@ -1123,17 +1131,17 @@ mod tests {
             deferred: 2,
             failed: vec![],
         }));
-        assert_eq!(run_main(&argv(&["--once", "--model", "m2"]), &host), 0);
+        assert_eq!(run_main(&board(&["--once", "--model", "m2"]), &host), 0);
         let passes = host.passes.lock().unwrap();
         assert_eq!(passes[0].per_pass_cap, Some(7));
         assert_eq!(passes[0].agent.model.as_deref(), Some("m2"));
         assert_eq!(passes[0].agent.agent_id, "codex");
-        assert_eq!(passes[0].agent.agent_transport.as_deref(), Some("cli"));
+        assert_eq!(passes[0].agent.agent_transport, None);
         let err = host.err_text();
         assert!(err.contains("[triage] pass complete: 1 ready, 1 needs-detail, 2 deferred\n[triage] #3: ready\n[triage] #4: needs_detail"), "{err}");
         drop(passes);
-        // Without --model the policy's [agent] model flows through.
-        assert_eq!(run_main(&argv(&["--once"]), &host), 0);
+        // Without --model the config's model flows through.
+        assert_eq!(run_main(&board(&["--once"]), &host), 0);
         let passes = host.passes.lock().unwrap();
         assert_eq!(passes[1].agent.model.as_deref(), Some("claude-x"));
     }
@@ -1141,8 +1149,7 @@ mod tests {
     #[test]
     fn once_summary_counts_failed_candidates() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = write_policy(dir.path(), GITHUB_SOURCE);
-        let host = FakeHost::new(policy, Some(dir.path().to_path_buf()));
+        let host = FakeHost::new(Ok(WorkPolicy::default()), Some(dir.path().to_path_buf()));
         host.outcome.lock().unwrap().push_back(Ok(TriagePassResult {
             outcomes: vec![TriageOutcome {
                 number: 8,
@@ -1161,7 +1168,7 @@ mod tests {
                 message: "authoring agent failed: x".into(),
             }],
         }));
-        assert_eq!(run_main(&argv(&["--once"]), &host), 0);
+        assert_eq!(run_main(&board(&["--once"]), &host), 0);
         let err = host.err_text();
         assert!(
             err.contains("[triage] pass complete: 1 ready, 0 needs-detail, 0 deferred, 1 failed\n[triage] #8: ready"),
@@ -1172,13 +1179,12 @@ mod tests {
     #[test]
     fn once_failing_pass_exits_one_with_the_error() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = write_policy(dir.path(), GITHUB_SOURCE);
-        let host = FakeHost::new(policy, Some(dir.path().to_path_buf()));
+        let host = FakeHost::new(Ok(WorkPolicy::default()), Some(dir.path().to_path_buf()));
         host.outcome
             .lock()
             .unwrap()
             .push_back(Err(TriageError::Git("no HEAD".into())));
-        assert_eq!(run_main(&argv(&["--once"]), &host), 1);
+        assert_eq!(run_main(&board(&["--once"]), &host), 1);
         assert!(host.err_text().ends_with("flywheel triage: no HEAD"));
     }
 
@@ -1186,8 +1192,8 @@ mod tests {
     fn missing_repo_root_exits_one_after_the_policy() {
         struct NoRoot(FakeHost);
         impl TriageHost for NoRoot {
-            fn policy_path(&self) -> Option<PathBuf> {
-                self.0.policy_path()
+            fn load_policy(&self) -> Result<WorkPolicy, PolicyError> {
+                self.0.load_policy()
             }
             fn stderr(&self) -> LogSink {
                 self.0.stderr()
@@ -1213,10 +1219,8 @@ mod tests {
                 self.0.sleep(stop, seconds)
             }
         }
-        let dir = tempfile::tempdir().unwrap();
-        let policy = write_policy(dir.path(), GITHUB_SOURCE);
-        let host = NoRoot(FakeHost::new(policy, None));
-        assert_eq!(run_main(&argv(&["--once"]), &host), 1);
+        let host = NoRoot(FakeHost::new(Ok(WorkPolicy::default()), None));
+        assert_eq!(run_main(&board(&["--once"]), &host), 1);
         assert_eq!(host.0.err_text(), "ERROR: not inside a git repository.");
         assert!(host.0.passes.lock().unwrap().is_empty());
     }
@@ -1224,15 +1228,15 @@ mod tests {
     #[test]
     fn daemon_arms_signals_and_stops_on_the_flag() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = write_policy(
-            dir.path(),
-            &format!("{GITHUB_SOURCE}\n[triage]\ninterval_seconds = 2.5\n"),
-        );
-        let mut host = FakeHost::new(policy, Some(dir.path().to_path_buf()));
+        let policy = WorkPolicy {
+            triage_interval_seconds: 2.5,
+            ..WorkPolicy::default()
+        };
+        let mut host = FakeHost::new(Ok(policy), Some(dir.path().to_path_buf()));
         // The scripted pass sets the daemon's own stop flag mid-cycle (as a
         // signal handler would), so the loop exits after exactly one cycle.
         host.stop_after_cycle = true;
-        assert_eq!(run_main(&argv(&["--interval", "0.25"]), &host), 0);
+        assert_eq!(run_main(&board(&["--interval", "0.25"]), &host), 0);
         assert!(host.armed.lock().unwrap().is_some());
         assert_eq!(host.passes.lock().unwrap().len(), 1);
         let err = host.err_text();
@@ -1246,8 +1250,7 @@ mod tests {
     #[test]
     fn daemon_gives_up_after_consecutive_failures_and_exits_one() {
         let dir = tempfile::tempdir().unwrap();
-        let policy = write_policy(dir.path(), GITHUB_SOURCE);
-        let host = FakeHost::new(policy, Some(dir.path().to_path_buf()));
+        let host = FakeHost::new(Ok(WorkPolicy::default()), Some(dir.path().to_path_buf()));
         for _ in 0..MAX_CONSECUTIVE_CYCLE_FAILURES {
             host.outcome
                 .lock()
@@ -1257,7 +1260,7 @@ mod tests {
         // The fake host's sleep is a no-op, so the backoff between strikes
         // costs no wall-clock time; the host never sets the stop flag, so
         // only the circuit breaker can end the loop.
-        assert_eq!(run_main(&[], &host), 1);
+        assert_eq!(run_main(&board(&[]), &host), 1);
         assert_eq!(
             host.passes.lock().unwrap().len(),
             MAX_CONSECUTIVE_CYCLE_FAILURES as usize

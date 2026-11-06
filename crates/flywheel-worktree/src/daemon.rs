@@ -25,9 +25,9 @@
 //! `docs/configuration.md` (`[worker]`, `[execution]`), `docs/container-backend.md`.
 
 use crate::phase::{ArchiveError, ArchiveSweep, archive_phases, record_phase_bases};
-use crate::pr::{PhaseEvidenceStore, PhasePrPublisher, PhasePublishMemo, register_pr_strategy};
+use crate::pr::register_pr_strategy;
 use crate::retention::{
-    DEFAULT_RETENTION_DAYS, DEFAULT_RUN_LOG_RETENTION, retention_cadence_tick, retention_targets,
+    DEFAULT_RETENTION_DAYS, DEFAULT_RUN_LOG_RETENTION, retention_cadence_tick,
     sweep_run_logs, wall_clock_seconds,
 };
 use crate::scoped::WorkerScope;
@@ -39,7 +39,6 @@ use crate::submitter::{
     GitError, GitWorktreeSubmitter, LandingLedger, Logger, checked_out_branch, git,
     git_progress_probe, merge_lock,
 };
-use crate::tiering::{TIER_STRATEGY, register_tier_strategy};
 use chrono::{DateTime, Utc};
 use flywheel_agents::hosts::ExecutionHost;
 use flywheel_agents::{
@@ -60,10 +59,7 @@ use flywheel_core::workflow::{
     WorkflowError, run_task_object,
 };
 use flywheel_orchestrator::claims::ClaimStoreError;
-use flywheel_orchestrator::github::GhRunner;
-use flywheel_orchestrator::held_out_gate::{
-    FilesystemHeldOutGraderSource, HeldOutGraderError, HeldOutGraderSource,
-};
+use flywheel_orchestrator::held_out_gate::{FilesystemHeldOutGraderSource, HeldOutGraderSource};
 use flywheel_orchestrator::orchestrate::{
     DEFAULT_LANDING_REDRIVE_BOUND, DEFAULT_PREREQ_REDRIVE_BOUND,
     DEFAULT_SESSION_PAUSE_CEILING_SECONDS, DEFAULT_SWEEP_SECONDS, DEFAULT_WORKER_CONCURRENCY,
@@ -72,7 +68,7 @@ use flywheel_orchestrator::orchestrate::{
     orchestrate,
 };
 use flywheel_orchestrator::policy::{
-    PolicyError, Skills as PolicySkills, WorkPolicy, resolve_grader_env, resolve_sandbox_root,
+    PolicyError, RunFlags, Skills as PolicySkills, WorkPolicy, resolve_grader_env, resolve_sandbox_root,
 };
 use flywheel_orchestrator::sources::DirectoryWorkSource;
 use flywheel_orchestrator::store_factory::{StoreConfigError, build_store};
@@ -119,7 +115,7 @@ pub const PERMANENT_STOP_EXIT_CODE: i32 = 2;
 /// payload can never wrap the single-line heartbeat unboundedly.
 pub const HEARTBEAT_DETAIL_MAX_WIDTH: usize = 100;
 /// The setting named by every concurrency diagnostic.
-pub const CONCURRENCY_SETTING: &str = "--concurrency / [worker] concurrency";
+pub const CONCURRENCY_SETTING: &str = "--concurrency / the concurrency config key";
 
 // --- Logging ------------------------------------------------------------------------------
 
@@ -560,56 +556,23 @@ pub fn resolve_concurrency(
     Ok(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
-/// The execute-time held-out grader source, built only when `[held_out]
-/// root` is configured (the gate is opt-in). A relative root resolves
-/// against `repo_root` regardless of the worker's cwd or any sandbox path;
-/// an absolute root is honored as written.
+/// The execute-time held-out grader source: the project's fixed
+/// `held-out/` dir (`$FLYWHEEL_HOME/projects/<id>/held-out`), built only
+/// once that directory holds registrations -- the gate activates by
+/// `/fw-verify` registering an oracle, never by configuration. `repo_root`
+/// is unused for the location (the root never lives in the repo tree) and
+/// kept for the callers' signature.
 pub fn build_held_out_source(
     policy: Option<&WorkPolicy>,
-    repo_root: &Path,
+    _repo_root: &Path,
 ) -> Option<FilesystemHeldOutGraderSource> {
-    let root = policy?.held_out_root.as_ref()?;
-    Some(FilesystemHeldOutGraderSource::new(repo_root.join(root)))
+    let root = policy?.held_out_root()?;
+    holds_registrations(&root).then(|| FilesystemHeldOutGraderSource::new(root))
 }
 
-/// The conventional `[held_out] root`, relative to the repo root: the
-/// git-ignored payload directory `/fw-verify` writes registrations into.
-pub const CONVENTIONAL_HELD_OUT_ROOT: &str = ".flywheel/verification/held-out";
-
-/// Make `source`'s root ready for the worker, or say why it cannot be.
-///
-/// The payload tree is git-ignored, so a fresh clone never has it. When the
-/// configured root resolves to exactly [`CONVENTIONAL_HELD_OUT_ROOT`] under
-/// `repo_root` and is missing, it is created (empty, so every task reads as
-/// unregistered until an oracle is written). Any other missing root -- a
-/// typo, or an operator-chosen location -- is left alone and reported, so a
-/// misspelled root still refuses to start instead of gating nothing.
-/// Returns `true` when the conventional root was created.
-///
-/// # Errors
-///
-/// The root (after any creation) is missing, not a directory, or cannot
-/// be inspected or created.
-pub fn prepare_held_out_root(
-    source: &FilesystemHeldOutGraderSource,
-    repo_root: &Path,
-) -> Result<bool, HeldOutGraderError> {
-    let conventional = repo_root.join(CONVENTIONAL_HELD_OUT_ROOT);
-    let created = source.root.components().eq(conventional.components())
-        && matches!(
-            std::fs::symlink_metadata(&source.root),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound
-        );
-    if created {
-        std::fs::create_dir_all(&source.root).map_err(|err| {
-            HeldOutGraderError::new(format!(
-                "{}: cannot create the conventional held-out root: {err}",
-                source.root.display()
-            ))
-        })?;
-    }
-    source.check_root()?;
-    Ok(created)
+/// Whether `root` is a directory with at least one entry.
+pub fn holds_registrations(root: &Path) -> bool {
+    std::fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 // --- The RunTask binding ---------------------------------------------------------------
@@ -801,7 +764,6 @@ pub fn wrap_for_backend(
 pub fn worker_registry() -> SubmitStrategyRegistry {
     let mut registry = builtin_registry();
     register_pr_strategy(&mut registry).expect("fresh registry has no pr entry");
-    register_tier_strategy(&mut registry).expect("fresh registry has no tiered entry");
     registry
 }
 
@@ -810,7 +772,6 @@ pub fn worker_registry() -> SubmitStrategyRegistry {
 /// repo-global), else `[submit] strategy`, else `merge`.
 pub fn strategy_name_for(policy: Option<&WorkPolicy>) -> &str {
     match policy {
-        Some(p) if !p.submit_tiers.is_empty() => TIER_STRATEGY,
         Some(p) => p.submit_strategy.as_str(),
         None => MERGE_STRATEGY,
     }
@@ -876,13 +837,9 @@ pub struct RunOnceRequest {
     pub shutdown: Option<ShutdownSignal>,
     pub run_task: Option<Arc<dyn RunTask>>,
     pub environ: Option<BTreeMap<String, String>>,
-    pub gh: Option<Arc<dyn GhRunner>>,
     pub runtime: Option<Arc<Runtime>>,
     /// Restrict the cycle to these tasks (`--task`); `None` drains the queue.
     pub scope: Option<TaskScope>,
-    /// The phase publisher's memo; the daemon holds one for its lifetime so
-    /// an unchanged phase PR is not re-verified and re-pushed every cycle.
-    pub phase_publish_memo: PhasePublishMemo,
 }
 
 impl fmt::Debug for RunOnceRequest {
@@ -936,10 +893,8 @@ impl RunOnceRequest {
             shutdown: None,
             run_task: None,
             environ: None,
-            gh: None,
             runtime: None,
             scope: None,
-            phase_publish_memo: PhasePublishMemo::default(),
         }
     }
 
@@ -1146,42 +1101,10 @@ pub fn run_once(request: RunOnceRequest) -> Result<OrchestratorReport, RunOnceEr
 
     {
         let _lock = merge_lock(&layout.lock_path)?;
-        // Phase-strategy completion seam (spec 00079, criterion 3): the true
-        // base for the phase PR is the operator's base (`[submit] pr_base`
-        // or the resolved landing base), never the phase branch. Built only
-        // for the phase strategy and for tier routing.
-        let publisher = policy
-            .as_deref()
-            .filter(|p| p.submit_strategy == "phase" || !p.submit_tiers.is_empty())
-            .map(|p| {
-                let pr_base = p
-                    .submit_pr_base
-                    .clone()
-                    .unwrap_or_else(|| layout.phase_base.clone());
-                let evidence: Arc<dyn PhaseEvidenceStore> = Arc::new(Arc::clone(&stores.core));
-                let mut publisher = PhasePrPublisher::new(
-                    evidence,
-                    &layout.repo_root,
-                    p.submit_remote.clone(),
-                    pr_base,
-                    Arc::clone(&log),
-                )
-                .with_phase_verify(p.phase_verify.clone())
-                .with_memo(request.phase_publish_memo.clone());
-                if let Some(gh) = request.gh.clone() {
-                    publisher = publisher.with_gh(gh);
-                }
-                publisher
-            });
-        let completion = publisher.as_ref().map(PhasePrPublisher::completion);
         let sweep = ArchiveSweep {
             repo_root: Some(&layout.repo_root),
             landing_base: Some(&layout.phase_base),
-            true_base: None,
             policy: policy.as_deref(),
-            phase_completion: completion
-                .as_ref()
-                .map(|c| c as &dyn Fn(&Path, &[flywheel_core::task::Task])),
         };
         archive_phases(
             &request.tasks_dir,
@@ -1494,9 +1417,9 @@ pub fn arm_supervisor_lifeline(
 /// The parsed `flywheel worker` flags, with argparse's defaults.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerArgs {
-    /// Legacy: an explicit `flywheel.toml` work policy (instead of the home
-    /// project's effective config).
-    pub policy: Option<String>,
+    /// `--source/--repo/--label/--require-triage-receipt/--sandbox/--image/
+    /// --agent`: the work source, sandbox backend, and agent adapter.
+    pub run: RunFlags,
     pub tasks_dir: Option<String>,
     pub db: Option<String>,
     pub sandbox_root: Option<String>,
@@ -1533,7 +1456,7 @@ pub struct WorkerArgs {
 impl Default for WorkerArgs {
     fn default() -> Self {
         Self {
-            policy: None,
+            run: RunFlags::default(),
             tasks_dir: None,
             db: None,
             sandbox_root: None,
@@ -1604,7 +1527,10 @@ pub const USAGE: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--
                        [--worker-id WORKER_ID] [--concurrency CONCURRENCY]
                        [--lease-seconds LEASE_SECONDS]
                        [--reconcile-seconds RECONCILE_SECONDS] [--once]
-                       [--task TASK] [--with-prereqs] [--policy POLICY]
+                       [--task TASK] [--with-prereqs] [--source SOURCE]
+                       [--repo OWNER/NAME] [--label LABEL]
+                       [--require-triage-receipt] [--sandbox SANDBOX]
+                       [--image IMAGE] [--agent AGENT]
 ";
 
 /// The argparse `-h` text (`COLUMNS=80`).
@@ -1617,10 +1543,14 @@ pub const HELP: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--d
                        [--worker-id WORKER_ID] [--concurrency CONCURRENCY]
                        [--lease-seconds LEASE_SECONDS]
                        [--reconcile-seconds RECONCILE_SECONDS] [--once]
-                       [--task TASK] [--with-prereqs] [--policy POLICY]
+                       [--task TASK] [--with-prereqs] [--source SOURCE]
+                       [--repo OWNER/NAME] [--label LABEL]
+                       [--require-triage-receipt] [--sandbox SANDBOX]
+                       [--image IMAGE] [--agent AGENT]
 
-Git-worktree worker: drive flywheel tasks under .flywheel/tasks/active/, each
-in its own worktree, FF-merging on done and parking on failure.
+Git-worktree worker: drive the project's tasks (under $FLYWHEEL_HOME/projects/
+<id>/tasks/active/), each in its own worktree, landing on done and parking on
+failure.
 
 options:
   -h, --help            show this help message and exit
@@ -1628,11 +1558,9 @@ options:
   --db DB
   --sandbox-root SANDBOX_ROOT
                         Root under which each task's worktree is created
-                        (default: [paths] sandbox_root in flywheel.toml, else
-                        the project's worktrees/ under $FLYWHEEL_HOME).
-                        Relative paths anchor at the
-                        repo root; @cache and @sibling select out-of-tree
-                        layouts.
+                        (default: the project's worktrees/ under
+                        $FLYWHEEL_HOME). Relative paths anchor at the repo
+                        root.
   --model MODEL
   --max-turns MAX_TURNS
   --max-retries MAX_RETRIES
@@ -1650,8 +1578,8 @@ options:
   --worker-id WORKER_ID
   --concurrency CONCURRENCY
                         Worker pool size: how many tasks this invocation
-                        drives concurrently. Overrides [worker] concurrency in
-                        flywheel.toml (default 1). Must resolve to an integer
+                        drives concurrently. Overrides the `concurrency`
+                        config key (default 1). Must resolve to an integer
                         >= 1.
   --lease-seconds LEASE_SECONDS
   --reconcile-seconds RECONCILE_SECONDS
@@ -1667,8 +1595,20 @@ options:
                         refused.
   --with-prereqs        With --task: also run the named tasks' not-done
                         prerequisites (transitively), before them.
-  --policy POLICY       Legacy: run on this flywheel.toml work policy instead
-                        of the home project's effective config.
+  --source SOURCE       Work source: directory (default: the project's tasks
+                        dir), github (issues), github_ci (failed CI runs), or
+                        github_review (PR review threads).
+  --repo OWNER/NAME     The GitHub repository a github* source reads.
+  --label LABEL         The github source's issue label (default: flywheel).
+  --require-triage-receipt
+                        github source: only run issues a triage pass marked
+                        ready (team mode).
+  --sandbox SANDBOX     Execution backend: worktree (default) or container
+                        (the agent runs in a Docker container against the
+                        bind-mounted worktree).
+  --image IMAGE         The container backend's image (required with
+                        --sandbox container).
+  --agent AGENT         The agent adapter: claude-code (default) or codex.
 ";
 
 /// The internal flag a pool member receives its supervisor lifeline on
@@ -1683,7 +1623,7 @@ enum Arity {
 }
 
 /// The option table in declaration order (argparse's prefix-match order).
-const OPTIONS: [(&str, Arity); 22] = [
+const OPTIONS: [(&str, Arity); 28] = [
     ("-h", Arity::Flag),
     ("--help", Arity::Flag),
     ("--tasks-dir", Arity::One),
@@ -1703,7 +1643,13 @@ const OPTIONS: [(&str, Arity); 22] = [
     ("--once", Arity::Flag),
     ("--task", Arity::One),
     ("--with-prereqs", Arity::Flag),
-    ("--policy", Arity::One),
+    ("--source", Arity::One),
+    ("--repo", Arity::One),
+    ("--label", Arity::One),
+    ("--require-triage-receipt", Arity::Flag),
+    ("--sandbox", Arity::One),
+    ("--image", Arity::One),
+    ("--agent", Arity::One),
     (SUPERVISOR_FD_FLAG, Arity::One),
     (crate::scoped::SCOPE_SINCE_FLAG, Arity::One),
 ];
@@ -1842,7 +1788,13 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
         let v = value.unwrap_or_default();
         match name {
             "-h" | "--help" => return Ok(Parsed::Help(HELP.to_owned())),
-            "--policy" => args.policy = Some(v),
+            "--source" => args.run.source = Some(v),
+            "--repo" => args.run.repo = Some(v),
+            "--label" => args.run.label = Some(v),
+            "--require-triage-receipt" => args.run.require_triage_receipt = true,
+            "--sandbox" => args.run.sandbox = Some(v),
+            "--image" => args.run.image = Some(v),
+            "--agent" => args.run.agent = Some(v),
             "--tasks-dir" => args.tasks_dir = Some(v),
             "--db" => args.db = Some(v),
             "--sandbox-root" => args.sandbox_root = Some(v),
@@ -1984,17 +1936,25 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     // loads; the pool size and the worktree root resolve before any store
     // opens so an operator mistake fails fast with nothing claimed.
     let resolved: Result<_, PolicyError> = (|| {
-        let policy_path = args.policy.as_deref().map(Path::new);
-        let policy = load_effective_policy(policy_path, Access::Execute)?.map(Arc::new);
+        let mut policy = load_effective_policy(Access::Execute)?
+            .filter(|p| p.project.is_some())
+            .ok_or_else(|| PolicyError::Invalid("no home project for this repo".to_owned()))?;
+        args.run.apply(&mut policy)?;
+        let policy = Some(Arc::new(policy));
         let phase_base = resolve_landing_base(&repo_root, policy.as_deref(), Some(&log))?;
         let concurrency = resolve_concurrency(args.concurrency.as_deref(), policy.as_deref())?;
         let configured_root = args
             .sandbox_root
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| policy.as_deref().and_then(|p| p.sandbox_root.clone()));
-        let worktrees_dir = resolve_sandbox_root(configured_root.as_deref(), &repo_root)?;
+            .map(PathBuf::from);
+        let default_root = policy
+            .as_deref()
+            .and_then(|p| p.project.as_ref())
+            .map(|p| p.paths().worktrees())
+            .ok_or_else(|| PolicyError::Invalid("no home project for this repo".to_owned()))?;
+        let worktrees_dir =
+            resolve_sandbox_root(configured_root.as_deref(), &repo_root, &default_root);
         Ok((policy, phase_base, concurrency, worktrees_dir))
     })();
     let (policy, phase_base, concurrency, worktrees_dir) = match resolved {
@@ -2004,31 +1964,39 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
             return 2;
         }
     };
+    if let Some(p) = policy.as_deref()
+        && p.distributed()
+        && p.submit_strategy == MERGE_STRATEGY
+    {
+        log(
+            "warning: the store is postgres (claims span machines) but land = \"merge\" \
+             serializes landings through this machine's merge lock; workers on other machines \
+             can race the base branch. Set land = \"pr\" with a merge queue for team mode \
+             (fw docs team-mode).",
+        );
+    }
     let model = resolve_model(args.model.as_deref(), policy.as_deref());
 
-    // A home project (no policy file) keeps every default under
-    // $FLYWHEEL_HOME/projects/<id>/; a policy-file repo keeps the in-repo
-    // .flywheel/ layout.
-    let home_project = policy.as_deref().and_then(|p| p.project.as_ref());
-    let state_root = home_project.map_or_else(|| repo_root.join(".flywheel"), |p| p.dir.clone());
+    // Every default lives under $FLYWHEEL_HOME/projects/<id>/ (the policy
+    // above is always bound to the home project).
+    let Some(project) = policy.as_deref().and_then(|p| p.project.clone()) else {
+        let _ = writeln!(err, "flywheel worker: no home project for this repo");
+        return 2;
+    };
+    let project_paths = project.paths();
     let tasks_dir = args
         .tasks_dir
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .or_else(|| home_project.and(policy.as_deref().and_then(|p| p.tasks_dir.clone())))
-        .unwrap_or_else(|| state_root.join("tasks"));
+        .unwrap_or_else(|| project_paths.tasks());
     let db_path = args
         .db
         .as_deref()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .or_else(|| home_project.and(policy.as_deref().and_then(|p| p.db_path.clone())))
-        .unwrap_or_else(|| state_root.join("flywheel.sqlite"));
-    let lock_path = home_project.map_or_else(
-        || state_root.join(".merge.lock"),
-        |p| p.paths().merge_lock(),
-    );
+        .unwrap_or_else(|| project_paths.db());
+    let lock_path = project_paths.merge_lock();
     let db_parent = db_path
         .parent()
         .map(Path::to_path_buf)
@@ -2104,7 +2072,6 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         .as_deref()
         .map(|p| p.protected_paths.clone())
         .unwrap_or_default();
-    let setup_command = policy.as_deref().and_then(|p| p.sandbox_setup.clone());
     let (on_done, on_failure) = policy.as_deref().map_or_else(
         || ("destroy".to_owned(), "park".to_owned()),
         |p| {
@@ -2136,19 +2103,9 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     };
     let held_out_source = build_held_out_source(policy.as_deref(), &repo_root).map(Arc::new);
     if let Some(source) = &held_out_source {
-        match prepare_held_out_root(source, &repo_root) {
-            Ok(true) => log(&format!(
-                "created the conventional held-out root {}",
-                source.root.display()
-            )),
-            Ok(false) => {}
-            Err(failure) => {
-                let _ = writeln!(
-                    err,
-                    "flywheel worker: held-out gate misconfigured: {failure}"
-                );
-                return 1;
-            }
+        if let Err(failure) = source.check_root() {
+            let _ = writeln!(err, "flywheel worker: held-out gate unusable: {failure}");
+            return 1;
         }
         log(&format!(
             "held-out gate active root={}",
@@ -2175,14 +2132,11 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
             .as_deref()
             .and_then(|p| p.agent_id.as_deref())
             .unwrap_or(DEFAULT_AGENT_ID),
-        policy.as_deref().and_then(|p| p.agent_transport.as_deref()),
+        None,
         None,
     ));
     if let Some(policy) = policy.clone() {
         build_request = build_request.with_policy(policy);
-    }
-    if let Some(command) = setup_command {
-        build_request = build_request.with_setup_command(command);
     }
     if let Some(env) = grader_env {
         build_request = build_request.with_grader_env(env);
@@ -2286,25 +2240,18 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     // claim, a sandbox that will not prepare, a running member), once per
     // change, so a pane never looks frozen.
     let mut last_waiting: Option<String> = None;
-    // Outlives every cycle: a phase PR awaiting review is republished only
-    // when its inputs change, not every poll.
-    let phase_publish_memo = PhasePublishMemo::default();
     let mut run_cycle = || -> Result<CycleOutcome, CycleError> {
-        // Default-on run-log retention: hold .flywheel/logs/runs/ at or under
-        // the configured bound before draining. Worktree retention runs every
-        // cycle, not once at boot, with the clock read fresh each tick; when
-        // the configured root moved off the legacy .flywheel/worktrees, that
-        // location is swept too until it empties out.
+        // Default-on run-log retention: hold the project's logs/runs/ at or
+        // under the configured bound before draining. Worktree retention runs
+        // every cycle, not once at boot, with the clock read fresh each tick.
         sweep_run_logs(&run_logs_dir, run_log_retention, &*cycle_log);
-        for sweep_root in retention_targets(&repo_root, &worktrees_dir) {
-            retention_cadence_tick(
-                &repo_root,
-                &sweep_root,
-                retention_days,
-                &*cycle_log,
-                &wall_clock_seconds,
-            );
-        }
+        retention_cadence_tick(
+            &repo_root,
+            &worktrees_dir,
+            retention_days,
+            &*cycle_log,
+            &wall_clock_seconds,
+        );
         let mut request = RunOnceRequest::new(
             Arc::clone(&run_strategy),
             layout.clone(),
@@ -2323,7 +2270,6 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         request.shutdown = Some(shutdown.clone());
         request.runtime = Some(Arc::clone(&runtime));
         request.scope = scope.as_ref().map(|scope| scope.scope.clone());
-        request.phase_publish_memo = phase_publish_memo.clone();
         match run_once(request) {
             Ok(_) => match &scope {
                 Some(scope) => match scope.verdict() {
@@ -2427,7 +2373,6 @@ mod tests {
     use flywheel_core::store_sqlite::SqliteStore;
     use flywheel_core::task::Task;
     use flywheel_orchestrator::orchestrate::{AgentPrimitives, RunMode};
-    use flywheel_orchestrator::policy::load_policy_str;
     use flywheel_orchestrator::strategy::PlainDirectoryStrategy;
     use std::fs;
     use std::sync::Mutex;
@@ -2448,9 +2393,8 @@ mod tests {
         )
     }
 
-    fn policy(text: &str) -> WorkPolicy {
-        let text = format!("[source]\nkind = \"directory\"\n{text}");
-        load_policy_str(&text, Path::new("/tmp/flywheel.toml")).unwrap()
+    fn policy() -> WorkPolicy {
+        WorkPolicy::default()
     }
 
     fn submitter(repo: &Path) -> GitWorktreeSubmitter {
@@ -2580,7 +2524,10 @@ mod tests {
 
     #[test]
     fn resolve_model_precedence() {
-        let p = policy("[agent]\nmodel = \"claude-from-policy\"\n");
+        let p = WorkPolicy {
+            model: Some("claude-from-policy".into()),
+            ..policy()
+        };
         assert_eq!(
             resolve_model(Some("claude-from-flag"), Some(&p)).as_deref(),
             Some("claude-from-flag")
@@ -2594,17 +2541,26 @@ mod tests {
             Some("claude-from-policy")
         );
         assert_eq!(resolve_model(None, None), None);
-        assert_eq!(resolve_model(None, Some(&policy(""))), None);
+        assert_eq!(resolve_model(None, Some(&policy())), None);
     }
 
     #[test]
     fn resolve_concurrency_precedence_and_validation() {
         assert_eq!(resolve_concurrency(None, None).unwrap(), 1);
-        let four = policy("[worker]\nconcurrency = 4\n");
+        let four = WorkPolicy {
+            worker_concurrency: 4,
+            ..policy()
+        };
         assert_eq!(resolve_concurrency(None, Some(&four)).unwrap(), 4);
-        let three = policy("[worker]\nconcurrency = 3\n");
+        let three = WorkPolicy {
+            worker_concurrency: 3,
+            ..policy()
+        };
         assert_eq!(resolve_concurrency(Some("1"), Some(&three)).unwrap(), 1);
-        let one = policy("[worker]\nconcurrency = 1\n");
+        let one = WorkPolicy {
+            worker_concurrency: 1,
+            ..policy()
+        };
         assert_eq!(resolve_concurrency(Some("3"), Some(&one)).unwrap(), 3);
         let zero = WorkPolicy {
             worker_concurrency: 0,
@@ -2621,35 +2577,43 @@ mod tests {
             resolve_concurrency(Some("two"), None)
                 .unwrap_err()
                 .to_string(),
-            "--concurrency / [worker] concurrency must be an integer >= 1, got 'two'"
+            "--concurrency / the concurrency config key must be an integer >= 1, got 'two'"
         );
         assert_eq!(
             resolve_concurrency(None, Some(&zero))
                 .unwrap_err()
                 .to_string(),
-            "--concurrency / [worker] concurrency must resolve to an integer >= 1, got 0"
+            "--concurrency / the concurrency config key must resolve to an integer >= 1, got 0"
         );
         assert_eq!(resolve_concurrency(Some(" +2 "), None).unwrap(), 2);
     }
 
     #[test]
-    fn build_held_out_source_is_opt_in_and_repo_root_anchored() {
-        let repo_root = Path::new("/srv/repo");
-        assert!(build_held_out_source(None, repo_root).is_none());
-        assert!(build_held_out_source(Some(&policy("")), repo_root).is_none());
-        let relative = policy("[held_out]\nroot = \".flywheel/held-out\"\n");
+    fn build_held_out_source_activates_only_on_registrations_in_the_project_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        assert!(build_held_out_source(None, &repo_root).is_none());
+        // A policy bound to no project has no held-out dir.
+        assert!(build_held_out_source(Some(&policy()), &repo_root).is_none());
+        let project = tmp.path().join("home/projects/p1");
+        let bound = WorkPolicy {
+            project: Some(flywheel_orchestrator::policy::ProjectBinding {
+                id: "p1".into(),
+                dir: project.clone(),
+                repo_root: repo_root.clone(),
+            }),
+            ..policy()
+        };
+        let held_out = project.join("held-out");
+        // Missing, then empty: the gate stays off.
+        assert!(build_held_out_source(Some(&bound), &repo_root).is_none());
+        fs::create_dir_all(&held_out).unwrap();
+        assert!(build_held_out_source(Some(&bound), &repo_root).is_none());
+        // A registration turns it on, at the fixed project location.
+        fs::create_dir_all(held_out.join("t1")).unwrap();
         assert_eq!(
-            build_held_out_source(Some(&relative), repo_root)
-                .unwrap()
-                .root,
-            PathBuf::from("/srv/repo/.flywheel/held-out")
-        );
-        let absolute = policy("[held_out]\nroot = \"/elsewhere/held-out\"\n");
-        assert_eq!(
-            build_held_out_source(Some(&absolute), repo_root)
-                .unwrap()
-                .root,
-            PathBuf::from("/elsewhere/held-out")
+            build_held_out_source(Some(&bound), &repo_root).unwrap().root,
+            held_out
         );
     }
 
@@ -2662,7 +2626,7 @@ mod tests {
         init_repo(&repo);
         assert_eq!(resolve_landing_base(&repo, None, None).unwrap(), "main");
         assert_eq!(
-            resolve_landing_base(&repo, Some(&policy("")), None).unwrap(),
+            resolve_landing_base(&repo, Some(&policy()), None).unwrap(),
             "main"
         );
     }
@@ -2672,7 +2636,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         init_repo(&repo);
-        let p = policy("[submit]\nbase = \"main\"\n");
+        let p = WorkPolicy {
+            submit_base: Some("main".into()),
+            ..policy()
+        };
         let err = resolve_landing_base(&repo, Some(&p), None)
             .unwrap_err()
             .to_string();
@@ -2709,7 +2676,10 @@ mod tests {
         let advanced = commit(&upstream, "new.txt", "x", "advance upstream");
         assert_ne!(rev(&repo, "main"), advanced);
         let (log, lines) = capture();
-        let p = policy("[submit]\nbase = \"main\"\n");
+        let p = WorkPolicy {
+            submit_base: Some("main".into()),
+            ..policy()
+        };
         assert_eq!(
             resolve_landing_base(&repo, Some(&p), Some(&log)).unwrap(),
             "main"
@@ -2857,7 +2827,7 @@ mod tests {
         let out =
             wrap_for_backend(Arc::clone(&inner), None, None, &BTreeMap::new(), &quiet()).unwrap();
         assert!(Arc::ptr_eq(&inner, &out));
-        let p = policy("[sandbox]\nbackend = \"worktree\"\n");
+        let p = policy();
         let out = wrap_for_backend(
             Arc::clone(&inner),
             Some(&p),
@@ -2872,9 +2842,15 @@ mod tests {
     #[test]
     fn container_backend_wraps_with_the_resolved_model_and_logs_selection() {
         let inner: Arc<dyn SubmitStrategy> = Arc::new(PlainDirectoryStrategy::new("/tmp/x"));
-        let p = policy(
-            "[sandbox]\nbackend = \"container\"\n[sandbox.container]\nimage = \"img:1\"\nauth = \"none\"\n",
-        );
+        let mut p = policy();
+        RunFlags {
+            sandbox: Some("container".into()),
+            image: Some("img:1".into()),
+            ..RunFlags::default()
+        }
+        .apply(&mut p)
+        .unwrap();
+        p.sandbox.container.auth = "none".into();
         let (log, lines) = capture();
         let out = wrap_for_backend(
             Arc::clone(&inner),
@@ -2921,14 +2897,13 @@ mod tests {
     #[test]
     fn registry_and_strategy_selection() {
         let registry = worker_registry();
-        assert_eq!(registry.names(), vec!["merge", "phase", "pr", "tiered"]);
+        assert_eq!(registry.names(), vec!["merge", "pr"]);
         assert_eq!(strategy_name_for(None), "merge");
-        assert_eq!(
-            strategy_name_for(Some(&policy("[submit]\nstrategy = \"pr\"\n"))),
-            "pr"
-        );
-        let tiered = policy("[[submit.tiers]]\ntier = 2\npaths = [\"**\"]\n");
-        assert_eq!(strategy_name_for(Some(&tiered)), "tiered");
+        let pr = WorkPolicy {
+            submit_strategy: "pr".into(),
+            ..policy()
+        };
+        assert_eq!(strategy_name_for(Some(&pr)), "pr");
     }
 
     // --- the agents-backed conflict resolver ---------------------------------------------
@@ -3298,7 +3273,10 @@ esac
             repo.join(".flywheel").join("flywheel.sqlite"),
             repo.join(".flywheel").join("worktrees"),
         );
-        request.policy = Some(Arc::new(policy("[store]\nbackend = \"postgres\"\n")));
+        request.policy = Some(Arc::new(WorkPolicy {
+            store_backend: "postgres".into(),
+            ..policy()
+        }));
         request.environ = Some(BTreeMap::new());
         request.invoke = Some(Arc::new(|_request| {
             Box::pin(async { panic!("invoke must not run: store construction fails") })
@@ -3673,7 +3651,10 @@ esac
             arg_error(&["--su", "7"]),
             format!("{USAGE}flywheel worker: error: unrecognized arguments: --su 7\n")
         );
-        assert_eq!(args(&["--s", "/x"]).sandbox_root.as_deref(), Some("/x"));
+        assert_eq!(
+            args(&["--sandbox-r", "/x"]).sandbox_root.as_deref(),
+            Some("/x")
+        );
         assert!(!HELP.contains(SUPERVISOR_FD_FLAG));
         // A bad descriptor fails before anything runs (exit 2, no repo
         // lookup, no store).
@@ -3750,25 +3731,66 @@ esac
         )
     }
 
+    /// Points `FLYWHEEL_HOME` at `home` for the guard's life and restores
+    /// the previous value on drop. Callers hold [`CWD_LOCK`], which every
+    /// test that runs the worker entry point (the only reader) takes.
+    struct HomeGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: the tests that read the variable serialize on CWD_LOCK,
+            // which the caller still holds while this guard drops.
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(flywheel_orchestrator::home::HOME_ENV, value),
+                    None => std::env::remove_var(flywheel_orchestrator::home::HOME_ENV),
+                }
+            }
+        }
+    }
+
+    fn with_home(home: &Path) -> HomeGuard {
+        let previous = std::env::var_os(flywheel_orchestrator::home::HOME_ENV);
+        // SAFETY: as in `HomeGuard::drop`.
+        unsafe { std::env::set_var(flywheel_orchestrator::home::HOME_ENV, home) };
+        HomeGuard { previous }
+    }
+
+    /// The one project dir under `home` (the worker created it).
+    fn project_dir(home: &Path) -> PathBuf {
+        let mut dirs: Vec<PathBuf> = fs::read_dir(home.join("projects"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        dirs.remove(0)
+    }
+
+    fn porcelain(repo: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["status", "--porcelain", "--ignored"])
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    }
+
     #[test]
     fn main_subone_concurrency_exits_nonzero_and_claims_nothing() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
+        let _home = with_home(&tmp.path().join("home"));
         let repo = tmp.path().join("repo");
         init_repo(&repo);
-        fs::write(
-            repo.join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n",
-        )
-        .unwrap();
-        task_file(&repo, "01-phase", "t1", "true");
         let _cwd = enter(&repo);
-        let (code, _out, err) =
-            run_main(&["--policy", "flywheel.toml", "--concurrency", "0", "--once"]);
+        let (code, _out, err) = run_main(&["--concurrency", "0", "--once"]);
         assert_ne!(code, 0);
         assert!(err.contains("concurrency"), "{err}");
         assert!(err.starts_with("flywheel worker: policy error: "), "{err}");
-        assert!(!repo.join(".flywheel").join("flywheel.sqlite").exists());
+        assert!(!project_dir(&tmp.path().join("home")).join("flywheel.sqlite").exists());
     }
 
     #[test]
@@ -3778,140 +3800,76 @@ esac
         let (code, _out, err) = run_main(&["--bogus"]);
         assert_eq!(code, 2);
         assert!(err.ends_with("flywheel worker: error: unrecognized arguments: --bogus\n"));
+        let (code, _out, err) = run_main(&["--policy", "flywheel.toml"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("unrecognized arguments: --policy flywheel.toml"), "{err}");
     }
 
     #[test]
-    fn main_once_on_an_empty_queue_exits_zero_and_creates_the_store() {
+    fn main_once_keeps_every_runtime_artifact_under_the_home_project() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let _home = with_home(&home);
         let repo = tmp.path().join("repo");
         init_repo(&repo);
-        fs::write(
-            repo.join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n",
-        )
-        .unwrap();
-        fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
+        let before = porcelain(&repo);
         let _cwd = enter(&repo);
-        let (code, _out, err) =
-            run_main(&["--policy", "flywheel.toml", "--once", "--heartbeat", "0"]);
+        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
         assert_eq!((code, err.as_str()), (0, ""));
-        assert!(repo.join(".flywheel").join("flywheel.sqlite").exists());
-        assert!(repo.join(".flywheel").join("worktrees").is_dir());
+        let project = project_dir(&home);
+        assert!(project.join("flywheel.sqlite").exists());
+        assert!(project.join("worktrees").is_dir());
+        assert!(project.join("tasks").join("active").is_dir());
+        assert_eq!(porcelain(&repo), before, "the worker wrote into the repo tree");
     }
 
     #[test]
-    fn main_refuses_to_start_when_the_configured_held_out_root_is_missing() {
-        let _guard = CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn main_refuses_inconsistent_run_flags_before_claiming() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
+        let _home = with_home(&tmp.path().join("home"));
         let repo = tmp.path().join("repo");
         init_repo(&repo);
-        fs::write(
-            repo.join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n\n[held_out]\nroot = \".flywheel/verification/held-oot\"\n",
-        )
-        .unwrap();
-        fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
         let _cwd = enter(&repo);
-        let (code, _out, err) =
-            run_main(&["--policy", "flywheel.toml", "--once", "--heartbeat", "0"]);
-        assert_eq!(code, 1, "{err}");
-        assert!(
-            err.starts_with("flywheel worker: held-out gate misconfigured: "),
-            "{err}"
+        let (code, _out, err) = run_main(&["--once", "--source", "github"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("--source github needs --repo OWNER/NAME"), "{err}");
+        let (code, _out, err) = run_main(&["--once", "--sandbox", "container"]);
+        assert_eq!(code, 2);
+        assert!(err.contains("needs --image IMAGE"), "{err}");
+    }
+
+    #[test]
+    fn worker_run_flags_parse() {
+        let Parsed::Args(args) = parse_args(&[
+            "--source=github".to_owned(),
+            "--repo".to_owned(),
+            "o/r".to_owned(),
+            "--label".to_owned(),
+            "ready".to_owned(),
+            "--require-triage-receipt".to_owned(),
+            "--sandbox".to_owned(),
+            "container".to_owned(),
+            "--image=img".to_owned(),
+            "--agent".to_owned(),
+            "codex".to_owned(),
+        ])
+        .unwrap() else {
+            panic!("help");
+        };
+        assert_eq!(
+            args.run,
+            RunFlags {
+                source: Some("github".into()),
+                repo: Some("o/r".into()),
+                label: Some("ready".into()),
+                require_triage_receipt: true,
+                sandbox: Some("container".into()),
+                image: Some("img".into()),
+                agent: Some("codex".into()),
+            }
         );
-        assert!(
-            err.contains("held-oot: held-out root does not exist"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn main_starts_with_an_existing_held_out_root() {
-        let _guard = CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        init_repo(&repo);
-        fs::write(
-            repo.join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n\n[held_out]\nroot = \".flywheel/verification/held-out\"\n",
-        )
-        .unwrap();
-        fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
-        fs::create_dir_all(repo.join(".flywheel/verification/held-out")).unwrap();
-        let _cwd = enter(&repo);
-        let (code, _out, err) =
-            run_main(&["--policy", "flywheel.toml", "--once", "--heartbeat", "0"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-    }
-
-    #[test]
-    fn main_starts_on_a_fresh_clone_by_creating_the_conventional_held_out_root() {
-        let _guard = CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        init_repo(&repo);
-        fs::write(
-            repo.join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n\n[held_out]\nroot = \".flywheel/verification/held-out\"\n",
-        )
-        .unwrap();
-        fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
-        assert!(!repo.join(".flywheel/verification").exists());
-        let _cwd = enter(&repo);
-        let (code, _out, err) =
-            run_main(&["--policy", "flywheel.toml", "--once", "--heartbeat", "0"]);
-        assert_eq!((code, err.as_str()), (0, ""));
-        assert!(repo.join(".flywheel/verification/held-out").is_dir());
-    }
-
-    #[test]
-    fn prepare_held_out_root_creates_only_the_missing_conventional_root() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let source = |root: &str| FilesystemHeldOutGraderSource::new(repo.join(root));
-
-        let typo = source(".flywheel/verification/held-oot");
-        let failure = prepare_held_out_root(&typo, repo).unwrap_err();
-        assert!(
-            failure.0.contains("held-out root does not exist"),
-            "{failure:?}"
-        );
-        assert!(!typo.root.exists());
-        let elsewhere = source("oracles");
-        assert!(prepare_held_out_root(&elsewhere, repo).is_err());
-        assert!(!elsewhere.root.exists());
-
-        let dotted = source("./.flywheel/verification/held-out");
-        assert_eq!(prepare_held_out_root(&dotted, repo), Ok(true));
-        assert!(repo.join(CONVENTIONAL_HELD_OUT_ROOT).is_dir());
-        assert_eq!(prepare_held_out_root(&dotted, repo), Ok(false));
-        let absolute = FilesystemHeldOutGraderSource::new(repo.join(CONVENTIONAL_HELD_OUT_ROOT));
-        assert_eq!(prepare_held_out_root(&absolute, repo), Ok(false));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn prepare_held_out_root_never_replaces_a_conventional_path_that_is_not_a_directory() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path();
-        let root = repo.join(CONVENTIONAL_HELD_OUT_ROOT);
-        fs::create_dir_all(root.parent().unwrap()).unwrap();
-        fs::write(&root, "not a dir").unwrap();
-        let source = FilesystemHeldOutGraderSource::new(&root);
-        let failure = prepare_held_out_root(&source, repo).unwrap_err();
-        assert!(failure.0.contains("not a directory"), "{failure:?}");
-        fs::remove_file(&root).unwrap();
-        std::os::unix::fs::symlink(repo.join("gone"), &root).unwrap();
-        let failure = prepare_held_out_root(&source, repo).unwrap_err();
-        assert!(failure.0.contains("does not exist"), "{failure:?}");
-        assert!(!repo.join("gone").exists());
     }
 
     #[test]

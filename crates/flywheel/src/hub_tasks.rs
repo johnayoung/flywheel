@@ -25,7 +25,6 @@ use flywheel_orchestrator::sources::{
     DirectoryWorkSource, WorkSource, iter_active_phase_dirs, iter_active_task_files,
     task_id_defined,
 };
-use flywheel_worktree::daemon::CONVENTIONAL_HELD_OUT_ROOT;
 use flywheel_worktree::submitter::protected_path_matches;
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
@@ -404,20 +403,13 @@ pub fn seed_prompt(task: &Task) -> String {
 /// landing: its registration plus the standing oracles matching it.
 fn held_out_graders(
     layout: &TaskLayout,
-    folder: &Path,
     task: &Task,
 ) -> Result<Vec<GraderSpec>, String> {
+    // The project's held-out dir: absent until an oracle is registered
+    // (the gate is off until then).
     let Some(source) = &layout.held_out else {
         return Ok(Vec::new());
     };
-    // The conventional payload root is git-ignored: a checkout that never
-    // had an oracle registered has none (the worker creates it empty).
-    let conventional = folder.join(CONVENTIONAL_HELD_OUT_ROOT);
-    if source.root.components().eq(conventional.components())
-        && std::fs::symlink_metadata(&source.root).is_err()
-    {
-        return Ok(Vec::new());
-    }
     let refused = |e: flywheel_orchestrator::held_out_gate::HeldOutGraderError| {
         format!(
             "the held-out registry cannot be read ({e}): a fan-out of task {} would run \
@@ -503,7 +495,7 @@ pub fn task_seed(provider: &HubFlywheel, folder: &Path, task_id: &str) -> Result
             }),
         }
     }
-    let held_out = held_out_graders(&layout, folder, &task)?;
+    let held_out = held_out_graders(&layout, &task)?;
     let (repo_protect, protect_skipped) = hub_protect(&layout.protected_paths);
     let mut protect = repo_protect.clone();
     for path in task

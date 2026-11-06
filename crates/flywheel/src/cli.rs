@@ -25,7 +25,7 @@
 //! * project: `project <ls|prune|relink>` -> the home's project registry
 //! * config: `config [--json]` -> the effective config with sources
 //! * trust: `trust [--revoke]` -> approve (or revoke) the repo's `.flywheel.toml`
-//! * db: `db upgrade [--db PATH] [--policy FILE]` -> migrate the store in place
+//! * db: `db upgrade [--db PATH]` -> migrate the store in place
 //!
 //! `next`, `orchestrate`, and the core single-task CLI (`run`, `is-done`,
 //! `set-model`, ... under `workflow`) are plumbing, not product verbs -- the
@@ -76,12 +76,12 @@ use flywheel_orchestrator::supervision_policy::{SupervisionBudget, SupervisionPo
 use flywheel_orchestrator::triage_run;
 use flywheel_orchestrator::workflow::{
     self as orchestrator_workflow, Access, ArchiveRequest, ArchiveRunner, OrchestrateRequest,
-    OrchestrateRunner, Verbs, default_store_registries, load_effective_policy, load_policy_file,
+    OrchestrateRunner, Verbs, default_store_registries, load_effective_policy,
     python_path_str, resolve_db_path, store_config_for, store_partition,
 };
 use flywheel_worktree::daemon::{
     self, LandingLayout, RunOnceError, RunOnceRequest, arm_signals, build_held_out_source,
-    make_agents_resolve_conflict, make_logger, prepare_held_out_root, resolve_landing_base,
+    make_agents_resolve_conflict, make_logger, resolve_landing_base,
     resolve_model, run_once, strategy_name_for, worker_registry, wrap_for_backend,
 };
 use flywheel_worktree::phase::{ArchiveOptions, archive_completed_phases};
@@ -147,7 +147,7 @@ invocation whose stdout is not a TTY) prints one JSON snapshot and
 exits 0.
 
 Verbs:
-  init             scaffold .flywheel/ and a flywheel.toml work policy
+  init             set up this repo's project (writes nothing into the repo)
   worker [--once]  run the worktree daemon loop (--once: one drain; --task ID)
   autopilot        keep the queue full (neverending; --once for one pass)
   triage           triage the intake board (neverending; --once for one pass)
@@ -439,12 +439,12 @@ fn delegate_producer(core_argv: Vec<String>, err: &mut dyn Write) -> i32 {
         .iter()
         .skip(1)
         .any(|a| a == "--db" || a.starts_with("--db="));
-    // An explicit --db names the store; only a policy file can still pick
-    // its backend, so the home project is not resolved.
+    // An explicit --db names the (sqlite) store, so the home project is not
+    // resolved.
     let loaded = if explicit_db {
-        load_policy_file(None)
+        Ok(None)
     } else {
-        load_effective_policy(None, Access::ReadOnly)
+        load_effective_policy(Access::ReadOnly)
     };
     let policy = match loaded {
         Ok(policy) => policy,
@@ -489,8 +489,8 @@ fn delegate_producer(core_argv: Vec<String>, err: &mut dyn Write) -> i32 {
 /// Forward `audit` to the core audit verb with the product's db resolution.
 ///
 /// Core's audit plumbing defaults `--db` to `$FLYWHEEL_DB` or
-/// `./flywheel.db`; every sibling verb resolves the store as `--db` >
-/// policy `[paths] db` > `.flywheel/flywheel.sqlite`. Inject the resolved
+/// `./flywheel.db`; every sibling verb resolves the store as `--db` > the
+/// home project's `flywheel.sqlite`. Inject the resolved
 /// path when the operator did not pass `--db` so `fw audit` reads the same
 /// store `fw history` / `fw show` do. An explicit `--db` (or a bare
 /// `--help`) forwards untouched.
@@ -500,7 +500,7 @@ fn delegate_audit(rest: &[String], out: &mut dyn Write, err: &mut dyn Write) -> 
     if explicit_db || help {
         return audit_main(rest, out, err);
     }
-    let policy = match load_effective_policy(None, Access::ReadOnly) {
+    let policy = match load_effective_policy(Access::ReadOnly) {
         Ok(policy) => policy,
         Err(failure) => {
             let _ = writeln!(err, "{PROG}: policy error: {failure}");
@@ -873,7 +873,6 @@ pub fn archive_runner() -> ArchiveRunner {
                 log: Some(&logger),
                 phase_verify: request.phase_verify.as_deref(),
                 landing_base: Some(&request.landing_base),
-                true_base: Some(&request.landing_base),
                 claims: Some(request.claims.as_ref()),
                 ..ArchiveOptions::default()
             };
@@ -927,21 +926,26 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
     };
     let args = request.args;
     let model = resolve_model(args.model.as_deref(), policy.as_deref());
-    let tasks_dir =
+    let Some(tasks_dir) =
         resolve_tasks_dir_for_worker(args.common.tasks_dir.as_deref(), policy.as_deref())
-            .unwrap_or_else(|| repo_root.join(".flywheel").join("tasks"));
+    else {
+        let _ = writeln!(err, "error: orchestrate needs --tasks-dir outside a git repo");
+        return 2;
+    };
     let db_path = request.db_path.clone();
     let worktrees_dir = request.sandbox_root.clone();
+    let db_parent = db_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
+    // The project's merge lock; an explicit --db/--tasks-dir run (no
+    // project) locks beside its store.
     let lock_path = policy
         .as_deref()
         .and_then(|p| p.project.as_ref())
         .map_or_else(
-            || repo_root.join(".flywheel").join(".merge.lock"),
+            || db_parent.join(".merge.lock"),
             |project| project.paths().merge_lock(),
         );
-    let db_parent = db_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
     if let Err(failure) =
         std::fs::create_dir_all(&worktrees_dir).and_then(|()| std::fs::create_dir_all(&db_parent))
     {
@@ -954,7 +958,6 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
         .as_deref()
         .map(|p| p.protected_paths.clone())
         .unwrap_or_default();
-    let setup_command = policy.as_deref().and_then(|p| p.sandbox_setup.clone());
     let (on_done, on_failure) = policy.as_deref().map_or_else(
         || ("destroy".to_owned(), "park".to_owned()),
         |p| {
@@ -981,16 +984,9 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
     };
     let held_out_source = build_held_out_source(policy.as_deref(), &repo_root).map(Arc::new);
     if let Some(source) = &held_out_source {
-        match prepare_held_out_root(source, &repo_root) {
-            Ok(true) => log(&format!(
-                "created the conventional held-out root {}",
-                source.root.display()
-            )),
-            Ok(false) => {}
-            Err(failure) => {
-                let _ = writeln!(err, "error: held-out gate misconfigured: {failure}");
-                return 1;
-            }
+        if let Err(failure) = source.check_root() {
+            let _ = writeln!(err, "error: held-out gate unusable: {failure}");
+            return 1;
         }
         log(&format!(
             "held-out gate active root={}",
@@ -1016,14 +1012,11 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
             .as_deref()
             .and_then(|p| p.agent_id.as_deref())
             .unwrap_or(DEFAULT_AGENT_ID),
-        policy.as_deref().and_then(|p| p.agent_transport.as_deref()),
+        None,
         None,
     ));
     if let Some(policy) = policy.clone() {
         build_request = build_request.with_policy(policy);
-    }
-    if let Some(command) = setup_command {
-        build_request = build_request.with_setup_command(command);
     }
     if let Some(env) = grader_env {
         build_request = build_request.with_grader_env(env);

@@ -439,13 +439,23 @@ impl EffectiveConfig {
     }
 
     /// Map the config onto `policy`: model, worker concurrency, the submit
-    /// AND phase-exit verify gates (one command), submit protected paths,
-    /// the submit strategy, and the store backend (+ DSN).
+    /// AND phase-exit verify gates (one command, which is also the default
+    /// grader a tracker item without graders is verified by), submit
+    /// protected paths, the landing strategy (task work and autopilot
+    /// work alike), and the store backend (+ DSN).
     pub fn apply_to_policy(&self, policy: &mut WorkPolicy) {
         policy.model.clone_from(&self.model.value);
         policy.worker_concurrency = self.concurrency.value;
         policy.submit_verify.clone_from(&self.verify.value);
         policy.phase_verify.clone_from(&self.verify.value);
+        policy.default_graders = self
+            .verify
+            .value
+            .iter()
+            .filter_map(|command| flywheel_core::task::CommandGrader::new(command.clone()).ok())
+            .map(flywheel_core::task::Grader::Command)
+            .collect();
+        policy.autopilot_landing = self.land.value.as_str().to_owned();
         policy
             .protected_paths
             .clone_from(&self.protected_paths.value);

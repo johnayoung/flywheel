@@ -38,10 +38,6 @@ pub const COMMANDS: [&str; 12] = [
 
 /// `--status` choices for `history`.
 pub const HISTORY_STATUS_CHOICES: [&str; 3] = ["done", "failed", "failed_validation"];
-/// `--store` choices for `init`.
-pub const INIT_STORE_BACKENDS: [&str; 2] = ["sqlite", "postgres"];
-/// `--source` choices for `init`.
-pub const INIT_SOURCE_KINDS: [&str; 2] = ["directory", "github"];
 
 // --- Parsed shapes ----------------------------------------------------------------
 
@@ -49,22 +45,17 @@ pub const INIT_SOURCE_KINDS: [&str; 2] = ["directory", "github"];
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommonArgs {
     pub tasks_dir: Option<String>,
-    pub policy: Option<String>,
     pub db: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InitArgs {
-    pub store: Option<String>,
-    pub pg_schema: Option<String>,
+    /// `--no-skills`: skip installing the user-level fw-* skills.
+    pub no_skills: bool,
+    /// `--provision`: create the postgres tables now (postgres store only).
     pub provision: bool,
+    /// `--allow-unverified`: downgrade a blocking postgres preflight.
     pub allow_unverified: bool,
-    pub source: Option<String>,
-    pub repo: Option<String>,
-    pub label: Option<String>,
-    pub skills: Option<bool>,
-    pub defaults: bool,
-    pub agent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,7 +94,6 @@ pub struct StatusArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LiveArgs {
-    pub policy: Option<String>,
     pub db: Option<String>,
     pub watch: i64,
 }
@@ -134,7 +124,6 @@ pub struct RecheckBlockedArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecoverArgs {
-    pub policy: Option<String>,
     pub db: Option<String>,
     pub task_id: Option<String>,
 }
@@ -143,7 +132,6 @@ pub struct RecoverArgs {
 pub struct ResolveArgs {
     pub task_id: String,
     pub reason: String,
-    pub policy: Option<String>,
     pub db: Option<String>,
 }
 
@@ -264,26 +252,18 @@ const fn one(name: &'static str) -> OptSpec {
     }
 }
 
-const COMMON_OPTS: [OptSpec; 3] = [one("--tasks-dir"), one("--policy"), one("--db")];
+const COMMON_OPTS: [OptSpec; 2] = [one("--tasks-dir"), one("--db")];
 
 fn options_for(verb: &str) -> Vec<OptSpec> {
     let mut opts = vec![flag("-h"), flag("--help")];
     match verb {
         "init" => opts.extend([
-            one("--store"),
-            one("--pg-schema"),
             flag("--provision"),
             flag("--allow-unverified"),
-            one("--source"),
-            one("--repo"),
-            one("--label"),
-            flag("--skills"),
             flag("--no-skills"),
-            flag("--defaults"),
-            flag("--agent"),
         ]),
         "next" | "archive" => opts.extend(COMMON_OPTS),
-        "validate" => opts.extend([one("--tasks-dir"), one("--policy")]),
+        "validate" => opts.extend([one("--tasks-dir")]),
         "orchestrate" => {
             opts.extend(COMMON_OPTS);
             opts.extend([
@@ -300,7 +280,7 @@ fn options_for(verb: &str) -> Vec<OptSpec> {
             opts.extend(COMMON_OPTS);
             opts.extend([flag("--json"), flag("--rollup")]);
         }
-        "live" => opts.extend([one("--policy"), one("--db"), one("--watch")]),
+        "live" => opts.extend([one("--db"), one("--watch")]),
         "history" => {
             opts.extend(COMMON_OPTS);
             opts.extend([
@@ -318,8 +298,8 @@ fn options_for(verb: &str) -> Vec<OptSpec> {
             opts.extend(COMMON_OPTS);
             opts.extend([one("--run-id"), flag("--dry-run")]);
         }
-        "recover" => opts.extend([one("--policy"), one("--db"), one("--task-id")]),
-        "resolve" => opts.extend([one("--reason"), one("--policy"), one("--db")]),
+        "recover" => opts.extend([one("--db"), one("--task-id")]),
+        "resolve" => opts.extend([one("--reason"), one("--db")]),
         _ => {}
     }
     opts
@@ -537,25 +517,10 @@ fn collect(verb: &str, tokens: Vec<Token>) -> Result<Collected, ArgError> {
                 match name {
                     "-h" | "--help" => c.help = true,
                     "--tasks-dir" => c.common.tasks_dir = Some(v),
-                    "--policy" => c.common.policy = Some(v),
                     "--db" => c.common.db = Some(v),
-                    "--store" => {
-                        check_choice(verb, name, &v, &INIT_STORE_BACKENDS)?;
-                        c.init.store = Some(v);
-                    }
-                    "--pg-schema" => c.init.pg_schema = Some(v),
                     "--provision" => c.init.provision = true,
                     "--allow-unverified" => c.init.allow_unverified = true,
-                    "--source" => {
-                        check_choice(verb, name, &v, &INIT_SOURCE_KINDS)?;
-                        c.init.source = Some(v);
-                    }
-                    "--repo" => c.init.repo = Some(v),
-                    "--label" => c.init.label = Some(v),
-                    "--skills" => c.init.skills = Some(true),
-                    "--no-skills" => c.init.skills = Some(false),
-                    "--defaults" => c.init.defaults = true,
-                    "--agent" => c.init.agent = true,
+                    "--no-skills" => c.init.no_skills = true,
                     "--sandbox-root" => c.orchestrate.sandbox_root = Some(v),
                     "--model" => c.orchestrate.model = Some(v),
                     "--max-turns" => c.orchestrate.max_turns = parse_int(verb, name, &v)?,
@@ -636,7 +601,6 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
             rollup: c.rollup,
         }),
         "live" => Command::Live(LiveArgs {
-            policy: c.common.policy.clone(),
             db: c.common.db.clone(),
             watch: c.watch,
         }),
@@ -669,7 +633,6 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
             dry_run: c.dry_run,
         }),
         "recover" => Command::Recover(RecoverArgs {
-            policy: c.common.policy.clone(),
             db: c.common.db.clone(),
             task_id: c.task_id.clone(),
         }),
@@ -694,7 +657,6 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
             Command::Resolve(ResolveArgs {
                 task_id: task_id.unwrap_or_default(),
                 reason: c.reason.clone().unwrap_or_default(),
-                policy: c.common.policy.clone(),
                 db: c.common.db.clone(),
             })
         }
@@ -724,19 +686,15 @@ pub const TOP_USAGE: &str = "usage: flywheel [-h]
 pub const TOP_HELP: &str = "usage: flywheel [-h]
                 {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve} ...
 
-Schedule and drive many flywheel tasks laid out under
-.flywheel/tasks/active/<phase>/.
+Schedule and drive many flywheel tasks laid out under the project's
+tasks/active/<phase>/ ($FLYWHEEL_HOME/projects/<id>/).
 
 positional arguments:
   {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve}
-    init                Scaffold .flywheel/ (tasks dir, gitignored runtime
-                        state) and a flywheel.toml work policy in the current
-                        directory. Prompts for store backend and work source
-                        on a TTY; flags pre-answer prompts; a non-TTY stdin
-                        takes every default. With an existing flywheel.toml,
-                        an interactive run offers to reconfigure it (rewriting
-                        only the answered keys); a non-interactive run never
-                        touches it.
+    init                Resolve this repo's project under $FLYWHEEL_HOME,
+                        create the user config if missing, install the fw-*
+                        skills at user level, and print a suggested
+                        .flywheel.toml. Writes nothing into the repo tree.
     next                Print path to the next eligible task and exit 0; exit
                         1 if nothing is eligible.
     orchestrate         Drive every eligible task to quiescence: honor
@@ -778,72 +736,36 @@ options:
   -h, --help            show this help message and exit
 ";
 
-const INIT_USAGE: &str = "usage: flywheel init [-h] [--store {sqlite,postgres}] [--pg-schema NAME]
-                     [--provision] [--allow-unverified]
-                     [--source {directory,github}] [--repo OWNER/NAME]
-                     [--label LABEL] [--skills | --no-skills] [--defaults]
-                     [--agent]
-";
+const INIT_USAGE: &str =
+    "usage: flywheel init [-h] [--provision] [--allow-unverified] [--no-skills]\n";
 
 const INIT_OPTIONS: &str = "
 options:
-  -h, --help            show this help message and exit
-  --store {sqlite,postgres}
-                        Store backend recorded as [store] backend (pre-answers
-                        the prompt; default: sqlite).
-  --pg-schema NAME      Postgres schema name recorded as [store] schema
-                        (postgres backend only).
-  --provision           After the postgres preflight passes, create the schema
-                        and run the store's bootstrap DDL now (postgres
-                        backend with a resolvable DSN only), so tables exist
-                        before the first worker run instead of being created
-                        lazily by it.
-  --allow-unverified    Scaffold the policy even when the postgres preflight
-                        reports a blocking issue (unreachable DSN,
-                        transaction-mode pooler, missing privileges,
-                        incompatible schema version). The report still prints;
-                        this only downgrades the blocks to warnings.
-  --source {directory,github}
-                        Work source kind recorded as [source] kind (pre-
-                        answers the prompt; default: directory).
-  --repo OWNER/NAME     GitHub repo for the github work source (default:
-                        parsed from the origin remote).
-  --label LABEL         Issue label for the github work source (default:
-                        flywheel).
-  --skills, --no-skills
-                        Install (or regenerate) the Claude Code skills (fw-
-                        spec, fw-plan, fw-verify, fw-retro, fw-improve,
-                        flywheel-ops) under .claude/skills/ (pre-answers the
-                        prompt; interactive default: yes, non-interactive
-                        default: no). With an existing flywheel.toml, a non-
-                        interactive 'flywheel init --skills' regenerates the
-                        skills against the current policy without touching the
-                        policy file.
-  --defaults            Accept every default without prompting (a non-TTY
-                        stdin implies this).
-  --agent               Drive an agent to inspect the repo and PROPOSE the
-                        flywheel.toml policy (detected toolchain -> default
-                        graders, sandbox setup, autopilot cadence, .gitignore
-                        additions) instead of prompting. The proposal is
-                        printed before the policy is written and is re-
-                        validated; an unparseable response writes nothing.
+  -h, --help          show this help message and exit
+  --provision         When the effective store is postgres: after the preflight
+                      passes, create the tables now instead of on the first
+                      worker run.
+  --allow-unverified  Downgrade a blocking postgres preflight (unreachable DSN,
+                      transaction-mode pooler, missing privileges, incompatible
+                      schema version) to a warning.
+  --no-skills         Do not install the fw-* Claude Code skills (fw-spec,
+                      fw-plan, fw-verify, fw-retro, fw-improve, flywheel-ops)
+                      under $CLAUDE_CONFIG_DIR/skills (default:
+                      ~/.claude/skills).
 ";
 
 const COMMON_OPTIONS_WIDE: &str = "  --tasks-dir TASKS_DIR
                         Tasks root directory (default: the project's tasks/
                         under $FLYWHEEL_HOME).
-  --policy POLICY       Work-policy file selecting the work source (default:
-                        flywheel.toml if present). An explicit --tasks-dir
-                        overrides the policy.
   --db DB               SQLite database path (default: the project's
                         flywheel.sqlite under $FLYWHEEL_HOME).
 ";
 
 const NEXT_USAGE: &str =
-    "usage: flywheel next [-h] [--tasks-dir TASKS_DIR] [--policy POLICY] [--db DB]\n";
+    "usage: flywheel next [-h] [--tasks-dir TASKS_DIR] [--db DB]\n";
 
 const ORCHESTRATE_USAGE: &str =
-    "usage: flywheel orchestrate [-h] [--tasks-dir TASKS_DIR] [--policy POLICY]
+    "usage: flywheel orchestrate [-h] [--tasks-dir TASKS_DIR]
                             [--db DB] [--sandbox-root SANDBOX_ROOT]
                             [--model MODEL] [--max-turns MAX_TURNS]
                             [--max-retries MAX_RETRIES]
@@ -883,7 +805,7 @@ const ORCHESTRATE_OPTIONS: &str = "  --sandbox-root SANDBOX_ROOT
                         label, deleted task file). 0 disables (default: 15).
 ";
 
-const STATUS_USAGE: &str = "usage: flywheel status [-h] [--tasks-dir TASKS_DIR] [--policy POLICY]
+const STATUS_USAGE: &str = "usage: flywheel status [-h] [--tasks-dir TASKS_DIR]
                        [--db DB] [--json] [--rollup]
 ";
 
@@ -896,21 +818,18 @@ const STATUS_OPTIONS: &str =
 ";
 
 const LIVE_USAGE: &str =
-    "usage: flywheel live [-h] [--policy POLICY] [--db DB] [--watch SECONDS]\n";
+    "usage: flywheel live [-h] [--db DB] [--watch SECONDS]\n";
 
 const LIVE_OPTIONS: &str = "
 options:
   -h, --help       show this help message and exit
-  --policy POLICY  Work-policy file selecting the work source (default:
-                   flywheel.toml if present). An explicit --tasks-dir
-                   overrides the policy.
   --db DB          SQLite database path (default: the project's flywheel.sqlite
                    under $FLYWHEEL_HOME).
   --watch SECONDS  Refresh continuously every SECONDS; clears the screen on
                    each tick. Default 0 prints one snapshot and exits.
 ";
 
-const HISTORY_USAGE: &str = "usage: flywheel history [-h] [--tasks-dir TASKS_DIR] [--policy POLICY]
+const HISTORY_USAGE: &str = "usage: flywheel history [-h] [--tasks-dir TASKS_DIR]
                         [--db DB] [--status {done,failed,failed_validation}]
                         [--phase PHASE] [--limit N] [--json]
 ";
@@ -926,7 +845,7 @@ const HISTORY_OPTIONS: &str = "  --status {done,failed,failed_validation}
 ";
 
 const SHOW_USAGE: &str =
-    "usage: flywheel show [-h] [--tasks-dir TASKS_DIR] [--policy POLICY] [--db DB]
+    "usage: flywheel show [-h] [--tasks-dir TASKS_DIR] [--db DB]
                      [--json] [--raw]
                      run_or_task_id
 ";
@@ -945,12 +864,12 @@ const SHOW_OPTIONS: &str =
                         forensics on trusted output sinks.
 ";
 
-const ARCHIVE_USAGE: &str = "usage: flywheel archive [-h] [--tasks-dir TASKS_DIR] [--policy POLICY]
+const ARCHIVE_USAGE: &str = "usage: flywheel archive [-h] [--tasks-dir TASKS_DIR]
                         [--db DB]
 ";
 
 const VALIDATE_USAGE: &str =
-    "usage: flywheel validate [-h] [--tasks-dir TASKS_DIR] [--policy POLICY]\n";
+    "usage: flywheel validate [-h] [--tasks-dir TASKS_DIR]\n";
 
 const VALIDATE_OPTIONS: &str = "
 options:
@@ -958,13 +877,10 @@ options:
   --tasks-dir TASKS_DIR
                         Tasks root directory (default: the project's tasks/
                         under $FLYWHEEL_HOME).
-  --policy POLICY       Work-policy file selecting the work source (default:
-                        flywheel.toml if present). An explicit --tasks-dir
-                        overrides the policy.
 ";
 
 const RECHECK_USAGE: &str =
-    "usage: flywheel recheck-blocked [-h] [--tasks-dir TASKS_DIR] [--policy POLICY]
+    "usage: flywheel recheck-blocked [-h] [--tasks-dir TASKS_DIR]
                                 [--db DB] [--run-id RUN_ID] [--dry-run]
 ";
 
@@ -979,14 +895,11 @@ const RECHECK_OPTIONS: &str =
 ";
 
 const RECOVER_USAGE: &str =
-    "usage: flywheel recover [-h] [--policy POLICY] [--db DB] [--task-id TASK_ID]\n";
+    "usage: flywheel recover [-h] [--db DB] [--task-id TASK_ID]\n";
 
 const RECOVER_OPTIONS: &str = "
 options:
   -h, --help         show this help message and exit
-  --policy POLICY    Work-policy file selecting the work source (default:
-                     flywheel.toml if present). An explicit --tasks-dir
-                     overrides the policy.
   --db DB            SQLite database path (default: the project's
                      flywheel.sqlite under $FLYWHEEL_HOME).
   --task-id TASK_ID  Only recover stranded lifecycles for this task id. Omit
@@ -994,7 +907,7 @@ options:
 ";
 
 const RESOLVE_USAGE: &str =
-    "usage: flywheel resolve [-h] --reason REASON [--policy POLICY] [--db DB]
+    "usage: flywheel resolve [-h] --reason REASON [--db DB]
                         task_id
 ";
 
@@ -1007,9 +920,6 @@ options:
   -h, --help       show this help message and exit
   --reason REASON  Why the strand is being abandoned. Recorded verbatim on the
                    resolution marker for the audit trail.
-  --policy POLICY  Work-policy file selecting the work source (default:
-                   flywheel.toml if present). An explicit --tasks-dir
-                   overrides the policy.
   --db DB          SQLite database path (default: the project's flywheel.sqlite
                    under $FLYWHEEL_HOME).
 ";
@@ -1138,12 +1048,6 @@ mod tests {
             )
         );
         assert_eq!(
-            err(&["init", "--store", "mysql"]),
-            format!(
-                "{INIT_USAGE}flywheel init: error: argument --store: invalid choice: 'mysql' (choose from sqlite, postgres)\n"
-            )
-        );
-        assert_eq!(
             err(&["live", "--watch"]),
             format!("{LIVE_USAGE}flywheel live: error: argument --watch: expected one argument\n")
         );
@@ -1164,8 +1068,8 @@ mod tests {
             )
         );
         assert_eq!(
-            err(&["init", "--skills", "--no-skills", "--store"]),
-            format!("{INIT_USAGE}flywheel init: error: argument --store: expected one argument\n")
+            err(&["init", "--store", "postgres"]),
+            "usage: flywheel [-h]\n                {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve} ...\nflywheel: error: unrecognized arguments: --store postgres\n"
         );
         assert_eq!(
             err(&["status", "--json=1"]),
@@ -1174,9 +1078,9 @@ mod tests {
             )
         );
         assert_eq!(
-            err(&["init", "--defaults=1"]),
+            err(&["init", "--no-skills=1"]),
             format!(
-                "{INIT_USAGE}flywheel init: error: argument --defaults: ignored explicit argument '1'\n"
+                "{INIT_USAGE}flywheel init: error: argument --no-skills: ignored explicit argument '1'\n"
             )
         );
     }
@@ -1244,7 +1148,6 @@ mod tests {
             Command::Status(StatusArgs {
                 common: CommonArgs {
                     tasks_dir: Some("x".into()),
-                    policy: None,
                     db: Some("y".into()),
                 },
                 json: false,
@@ -1252,20 +1155,11 @@ mod tests {
             })
         );
         assert_eq!(
-            cmd(&[
-                "init",
-                "--skills",
-                "--no-skills",
-                "--store",
-                "postgres",
-                "--pg-schema",
-                "s"
-            ]),
+            cmd(&["init", "--no-skills", "--prov", "--allow-unverified"]),
             Command::Init(InitArgs {
-                store: Some("postgres".into()),
-                pg_schema: Some("s".into()),
-                skills: Some(false),
-                ..InitArgs::default()
+                no_skills: true,
+                provision: true,
+                allow_unverified: true,
             })
         );
         assert_eq!(
@@ -1273,7 +1167,6 @@ mod tests {
             Command::Resolve(ResolveArgs {
                 task_id: "t1".into(),
                 reason: "why".into(),
-                policy: None,
                 db: Some("d".into()),
             })
         );
@@ -1297,7 +1190,6 @@ mod tests {
         assert_eq!(
             cmd(&["live", "--watch", "5"]),
             Command::Live(LiveArgs {
-                policy: None,
                 db: None,
                 watch: 5,
             })
@@ -1313,7 +1205,6 @@ mod tests {
         assert_eq!(
             cmd(&["recover", "--task-id", "t"]),
             Command::Recover(RecoverArgs {
-                policy: None,
                 db: None,
                 task_id: Some("t".into()),
             })
@@ -1334,8 +1225,10 @@ mod tests {
 
     #[test]
     fn ambiguous_prefix_is_an_error_and_negative_numbers_are_values() {
-        let rendered = err(&["history", "--p", "x"]);
-        assert!(rendered.contains("ambiguous option: --p could match --policy, --phase"));
+        let rendered = err(&["orchestrate", "--max", "x"]);
+        assert!(rendered.contains("ambiguous option: --max could match --max-turns, --max-retries"));
+        let rendered = err(&["status", "--policy", "x"]);
+        assert!(rendered.contains("unrecognized arguments: --policy x"), "{rendered}");
         assert_eq!(
             cmd(&["history", "--limit", "-1"]),
             Command::History(HistoryArgs {

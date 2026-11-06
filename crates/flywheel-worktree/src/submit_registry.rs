@@ -1,13 +1,11 @@
 //! The registry of submit (landing) strategies.
 //!
-//! Names the landing strategies an operator can select in
-//! `[submit] strategy` and binds each to a factory beside its
-//! implementation: [`crate::submitter::build_merge_submitter`] and
-//! [`crate::phase::build_phase_submitter`] ship here as the built-ins; the
-//! `pr` strategy (`crate::pr`) and the tier router (`crate::tiering`)
-//! register themselves against the same registry through
-//! [`SubmitStrategyRegistry::register`] without this module naming them, so
-//! adding a strategy never edits this file.
+//! Names the landing strategies the `land` config key selects (`merge`,
+//! `pr`) and binds each to a factory beside its implementation:
+//! [`crate::submitter::build_merge_submitter`] ships here as the built-in;
+//! the `pr` strategy (`crate::pr`) registers itself against the same
+//! registry through [`SubmitStrategyRegistry::register`] without this module
+//! naming it, so adding a strategy never edits this file.
 //!
 //! A spec carries its factory closure directly.
 //!
@@ -20,12 +18,11 @@
 //!     -> Result<Arc<dyn SubmitStrategy>, SubmitRegistryError>
 //! ```
 //!
-//! The registry is passed so a composite strategy (the tier router, which
-//! delegates to `merge`/`phase`/`pr` by tier) can build its delegates through
-//! the same table it was resolved from. [`SubmitBuildRequest`] is the shared
+//! The registry is passed so a composite strategy can build its delegates
+//! through the same table it was resolved from. [`SubmitBuildRequest`] is the shared
 //! argument set every factory accepts, so the worker dispatches by name with
-//! no per-strategy branch; a factory reads its own knobs (`[submit] remote`,
-//! `pr_base`, `verify`, the recovery-agent bounds) off `request.policy`.
+//! no per-strategy branch; a factory reads its own knobs (remote, PR base,
+//! `verify`, the recovery-agent bounds) off `request.policy`.
 
 use crate::submitter::{ConflictResolver, LandingLedger};
 use flywheel_orchestrator::held_out_gate::HeldOutGraderSource;
@@ -44,17 +41,15 @@ pub const SUBMIT_FAMILY: &str = "submit strategy";
 pub const MERGE_STRATEGY: &str = "merge";
 /// The pull-request strategy (registered by `crate::pr`).
 pub const PR_STRATEGY: &str = "pr";
-/// The per-phase integration-branch strategy.
-pub const PHASE_STRATEGY: &str = "phase";
 
 /// The shared construction inputs every submit-strategy factory accepts.
 ///
 /// The repo layout, the resolved landing base, the merge lock, the log sink,
-/// the `[submit] protected_paths` and `[sandbox] setup` knobs, the
-/// `[sandbox.retention]` dispositions, and the optional seams (run ledger,
-/// resolved grader env, held-out gate source, conflict resolver). `policy`
-/// is the loaded `flywheel.toml`, `None` for a bare construction; a factory
-/// that needs a required policy field reports [`SubmitRegistryError::Build`].
+/// the `protected_paths` config key, the retention dispositions, and the
+/// optional seams (run ledger, resolved grader env, held-out gate source,
+/// conflict resolver). `policy` is the invocation's resolved policy, `None`
+/// for a bare construction; a factory that needs a required policy field
+/// reports [`SubmitRegistryError::Build`].
 #[derive(Clone)]
 pub struct SubmitBuildRequest {
     pub policy: Option<Arc<WorkPolicy>>,
@@ -65,7 +60,6 @@ pub struct SubmitBuildRequest {
     pub lock_path: PathBuf,
     pub log: LogSink,
     pub protected_paths: Vec<String>,
-    pub setup_command: Option<String>,
     pub on_done: String,
     pub on_failure: String,
     pub store: Option<Arc<dyn LandingLedger>>,
@@ -95,7 +89,6 @@ impl SubmitBuildRequest {
             lock_path: lock_path.into(),
             log,
             protected_paths: Vec::new(),
-            setup_command: None,
             on_done: "destroy".to_owned(),
             on_failure: "park".to_owned(),
             store: None,
@@ -116,11 +109,6 @@ impl SubmitBuildRequest {
         S: Into<String>,
     {
         self.protected_paths = paths.into_iter().map(Into::into).collect();
-        self
-    }
-
-    pub fn with_setup_command(mut self, command: impl Into<String>) -> Self {
-        self.setup_command = Some(command.into());
         self
     }
 
@@ -165,7 +153,6 @@ impl fmt::Debug for SubmitBuildRequest {
             .field("phase_base", &self.phase_base)
             .field("lock_path", &self.lock_path)
             .field("protected_paths", &self.protected_paths)
-            .field("setup_command", &self.setup_command)
             .field("on_done", &self.on_done)
             .field("on_failure", &self.on_failure)
             .field("store", &self.store.is_some())
@@ -336,8 +323,8 @@ impl SubmitStrategyRegistry {
 }
 
 /// The registry with the strategies this crate's landing core ships:
-/// `merge` and `phase`. The `pr` strategy and the tier router add
-/// themselves through [`SubmitStrategyRegistry::register`] from their own
+/// `merge`. The `pr` strategy adds
+/// itself through [`SubmitStrategyRegistry::register`] from their own
 /// modules; the worker daemon assembles the full table.
 pub fn builtin_registry() -> SubmitStrategyRegistry {
     let mut registry = SubmitStrategyRegistry::new();
@@ -351,16 +338,6 @@ pub fn builtin_registry() -> SubmitStrategyRegistry {
             }),
         ))
         .expect("fresh registry has no merge entry");
-    registry
-        .register(SubmitStrategySpec::new(
-            PHASE_STRATEGY,
-            "land each task onto a per-phase integration branch",
-            Arc::new(|_registry, request| {
-                Ok(Arc::new(crate::phase::build_phase_submitter(request))
-                    as Arc<dyn SubmitStrategy>)
-            }),
-        ))
-        .expect("fresh registry has no phase entry");
     registry
 }
 
@@ -384,8 +361,7 @@ mod tests {
             tmp.join(".merge.lock"),
             log,
         )
-        .with_protected_paths(["conftest.py", ".github/**"])
-        .with_setup_command("echo setup");
+        .with_protected_paths(["conftest.py", ".github/**"]);
         (req, lines)
     }
 
@@ -401,13 +377,13 @@ mod tests {
     }
 
     #[test]
-    fn builtin_names_are_merge_then_phase() {
+    fn the_only_builtin_is_merge() {
         let registry = builtin_registry();
-        assert_eq!(registry.names(), vec!["merge", "phase"]);
+        assert_eq!(registry.names(), vec!["merge"]);
         assert!(registry.contains(MERGE_STRATEGY));
-        assert!(registry.contains(PHASE_STRATEGY));
+        assert!(!registry.contains("phase"));
         assert!(!registry.contains(PR_STRATEGY));
-        assert_eq!(registry.specs().len(), 2);
+        assert_eq!(registry.specs().len(), 1);
     }
 
     #[test]
@@ -416,7 +392,6 @@ mod tests {
         let err = registry.resolve("nope").unwrap_err();
         let message = err.to_string();
         assert!(message.contains("\"merge\""), "{message}");
-        assert!(message.contains("\"phase\""), "{message}");
         assert!(message.contains("nope"), "{message}");
         let empty = SubmitStrategyRegistry::new();
         assert!(
@@ -443,23 +418,12 @@ mod tests {
         assert_eq!(sub.phase_base, "main");
         assert_eq!(sub.lock_path, req.lock_path);
         assert_eq!(sub.protected_paths, vec!["conftest.py", ".github/**"]);
-        assert_eq!(sub.setup_command.as_deref(), Some("echo setup"));
         assert!(sub.verify_command.is_none());
         assert_eq!(sub.recovery_agent_max_turns, 0);
         // The disk/inode preflight is default-on in front of the ledger
         // append by default.
         assert!(sub.ledger_guard.is_some());
         drop(strategy);
-    }
-
-    #[test]
-    fn phase_builds_and_logs_the_landing_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (req, lines) = request(tmp.path());
-        let _strategy = builtin_registry().build(PHASE_STRATEGY, &req).unwrap();
-        let logged = lines.lock().unwrap().join("\n");
-        assert!(logged.contains("landing strategy: phase"), "{logged}");
-        assert!(logged.contains("true base main never advanced"), "{logged}");
     }
 
     #[test]
@@ -496,7 +460,7 @@ mod tests {
                 }),
             ))
             .unwrap();
-        assert_eq!(registry.names(), vec!["merge", "phase", "pr"]);
+        assert_eq!(registry.names(), vec!["merge", "pr"]);
         let tmp = tempfile::tempdir().unwrap();
         let (req, _lines) = request(tmp.path());
         let built = registry.build(PR_STRATEGY, &req).unwrap();

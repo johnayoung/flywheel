@@ -12,9 +12,9 @@
 //!
 //! Which store: the cwd project's (sqlite at
 //! `$FLYWHEEL_HOME/projects/<id>/flywheel.sqlite`, or the configured
-//! postgres DSN, partition = the project id); `--policy FILE` the legacy
-//! policy's store; `--db PATH` that sqlite file. The two explicit forms skip
-//! project resolution and bind the documented `default` partition.
+//! postgres DSN, partition = the project id); `--db PATH` that sqlite file,
+//! which skips project resolution and binds the documented `default`
+//! partition.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,14 +27,12 @@ use flywheel_orchestrator::claims_postgres::PostgresClaimStore;
 use flywheel_orchestrator::config::Access;
 use flywheel_orchestrator::policy::WorkPolicy;
 use flywheel_orchestrator::store_factory::{PG_DSN_ENV, resolve_postgres_dsn};
-use flywheel_orchestrator::workflow::{
-    load_effective_policy, load_policy_file, resolve_db_path, store_partition,
-};
+use flywheel_orchestrator::workflow::{load_effective_policy, resolve_db_path, store_partition};
 
 pub const DB_VERB: &str = "db";
 
 /// `fw db --help`.
-pub const DB_USAGE: &str = "usage: fw db upgrade [--db PATH] [--policy FILE]
+pub const DB_USAGE: &str = "usage: fw db upgrade [--db PATH]
 
 Migrate the store in place to this flywheel's schema version. Store verbs
 refuse a store whose schema is behind and name this command; nothing is
@@ -47,14 +45,11 @@ $FLYWHEEL_HOME/projects/<id>/, or the configured postgres DSN).
 
 options:
   --db PATH       upgrade this sqlite file (partition 'default')
-  --policy FILE   upgrade the store a legacy policy file selects
-                  (partition 'default')
 ";
 
 #[derive(Debug, Default)]
 struct UpgradeArgs {
     db: Option<String>,
-    policy: Option<String>,
 }
 
 fn parse_upgrade(args: &[String]) -> Result<UpgradeArgs, String> {
@@ -67,7 +62,6 @@ fn parse_upgrade(args: &[String]) -> Result<UpgradeArgs, String> {
         };
         let slot = match flag {
             "--db" => &mut parsed.db,
-            "--policy" => &mut parsed.policy,
             other => return Err(format!("unrecognized argument: {other}")),
         };
         let value = match inline {
@@ -115,14 +109,13 @@ pub fn run_db(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 
 }
 
 fn run_upgrade(args: &UpgradeArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    // An explicit --db or --policy names the store, so the cwd project is
-    // not resolved (and the partition is the documented default); otherwise
-    // the cwd repo's home project supplies the store and the partition.
-    let policy_path = args.policy.as_deref().map(Path::new);
-    let loaded = if args.db.is_some() || policy_path.is_some() {
-        load_policy_file(policy_path)
+    // An explicit --db names the store, so the cwd project is not resolved
+    // (and the partition is the documented default); otherwise the cwd
+    // repo's home project supplies the store and the partition.
+    let loaded = if args.db.is_some() {
+        Ok(None)
     } else {
-        load_effective_policy(None, Access::ReadOnly)
+        load_effective_policy(Access::ReadOnly)
     };
     let policy = match loaded {
         Ok(policy) => policy,
@@ -180,9 +173,7 @@ fn upgrade_postgres(policy: Option<&WorkPolicy>, partition: &str) -> Result<Vec<
                 "store backend is postgres but no DSN is configured (store = ... or {PG_DSN_ENV})"
             )
         })?;
-    let schema = policy
-        .and_then(|p| p.store_schema.clone())
-        .unwrap_or_else(|| DEFAULT_SCHEMA.to_owned());
+    let schema = DEFAULT_SCHEMA.to_owned();
     let core = PostgresStore::upgrade(&dsn, &schema, partition).map_err(|e| e.to_string())?;
     let claims =
         PostgresClaimStore::upgrade(&dsn, &schema, partition).map_err(|e| e.to_string())?;
@@ -234,10 +225,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_db_and_policy_in_both_spellings() {
-        let parsed = parse_upgrade(&strings(&["--db", "a.sqlite", "--policy=p.toml"])).unwrap();
+    fn parses_db_in_both_spellings_and_refuses_the_removed_policy_flag() {
+        let parsed = parse_upgrade(&strings(&["--db", "a.sqlite"])).unwrap();
         assert_eq!(parsed.db.as_deref(), Some("a.sqlite"));
-        assert_eq!(parsed.policy.as_deref(), Some("p.toml"));
+        let parsed = parse_upgrade(&strings(&["--db=b.sqlite"])).unwrap();
+        assert_eq!(parsed.db.as_deref(), Some("b.sqlite"));
+        assert!(parse_upgrade(&strings(&["--policy=p.toml"])).is_err());
         assert!(parse_upgrade(&strings(&["--db"])).is_err());
         assert!(parse_upgrade(&strings(&["--db="])).is_err());
         assert!(parse_upgrade(&strings(&["--force"])).is_err());

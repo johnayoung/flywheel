@@ -45,8 +45,7 @@ use crate::github::register_github_sources;
 use crate::history::build_task_phase_index;
 use crate::home;
 use crate::policy::{
-    DEFAULT_POLICY_FILENAME, PolicyError, ProjectBinding, WorkPolicy, load_policy,
-    resolve_sandbox_root,
+    LEGACY_POLICY_FILENAME, PolicyError, ProjectBinding, WorkPolicy, resolve_sandbox_root,
 };
 use crate::source_registry::{SourceBuildContext, SourceRegistry, SourceRegistryError};
 use crate::sources::{DirectoryWorkSource, WorkSource, WorkSourceError};
@@ -60,7 +59,8 @@ pub use args::{
     RecheckBlockedArgs, RecoverArgs, ResolveArgs, ShowArgs, StatusArgs, parse_args,
 };
 pub use init::{
-    InitHost, ProductionInitHost, PromptError, cmd_init, cmd_init_agent, render_init_policy,
+    DetectedVerify, InitHost, ProductionInitHost, cmd_init, detect_verify,
+    render_suggested_repo_file,
 };
 pub use live::{LiveRunRow, cmd_live, cmd_live_until, collect_live_rows, format_live_line};
 pub use ops::{
@@ -125,40 +125,17 @@ impl WorkflowError {
 
 // --- Policy, source, and store resolution -----------------------------------------
 
-/// Load the policy the orchestrator verbs honor for an invocation.
-///
-/// An explicit `--policy FILE` is loaded as-is (the legacy policy format;
-/// [`load_policy_file`]). Otherwise the invocation runs against its home
-/// project ([`home_project_policy`]): every default (store, tasks,
-/// worktrees, logs) lives under `$FLYWHEEL_HOME/projects/<id>/`, the
-/// effective config ([`crate::config`]) is applied, and a directory outside
-/// any git repo is refused. `access` says whether this verb runs repo-file
-/// commands (an untrusted `.flywheel.toml` is then refused or prompted for)
-/// or only reads (it is then warned about and ignored). On success the
-/// result is always `Some`; the `Option` keeps the signature callers
-/// already match on.
-pub fn load_effective_policy(
-    policy_path: Option<&Path>,
-    access: Access,
-) -> Result<Option<WorkPolicy>, PolicyError> {
-    if let Some(policy) = load_policy_file(policy_path)? {
-        return Ok(Some(policy));
-    }
+/// Load the policy the orchestrator verbs honor for an invocation: the
+/// working directory's home project ([`home_project_policy`]). Every
+/// default (store, tasks, worktrees, logs) lives under
+/// `$FLYWHEEL_HOME/projects/<id>/`, the effective config
+/// ([`crate::config`]) is applied, and a directory outside any git repo is
+/// refused. `access` says whether this verb runs repo-file commands (an
+/// untrusted `.flywheel.toml` is then refused or prompted for) or only
+/// reads (it is then warned about and ignored). On success the result is
+/// always `Some`; the `Option` keeps the signature callers match on.
+pub fn load_effective_policy(access: Access) -> Result<Option<WorkPolicy>, PolicyError> {
     home_project_policy(access).map(Some)
-}
-
-/// The explicit-file half of [`load_effective_policy`]: `policy_path`
-/// loaded as a legacy policy file (a missing/invalid file is an error), or
-/// `None` when no path was given. A repo's own `flywheel.toml` is never
-/// auto-detected any more ([`notice_legacy_layout`] says so).
-///
-/// An empty `policy_path` is treated as "not specified" to match the
-/// argparse default surface.
-pub fn load_policy_file(policy_path: Option<&Path>) -> Result<Option<WorkPolicy>, PolicyError> {
-    match policy_path.filter(|p| !p.as_os_str().is_empty()) {
-        Some(path) => load_policy(path).map(Some),
-        None => Ok(None),
-    }
 }
 
 /// Print `line` on stderr once per process (repeated policy loads in one
@@ -178,8 +155,8 @@ pub fn notice_once(line: &str) {
 /// never mistaken for the old `.flywheel/` (a home-dir repo holds it).
 pub fn legacy_layout_notice(repo_root: &Path, home: &home::Home) -> Option<String> {
     let mut found = Vec::new();
-    if repo_root.join(DEFAULT_POLICY_FILENAME).is_file() {
-        found.push(DEFAULT_POLICY_FILENAME.to_owned());
+    if repo_root.join(LEGACY_POLICY_FILENAME).is_file() {
+        found.push(LEGACY_POLICY_FILENAME.to_owned());
     }
     let dot_dir = repo_root.join(".flywheel");
     let is_home = match (dot_dir.canonicalize(), home.root().canonicalize()) {
@@ -288,6 +265,50 @@ pub fn home_project_policy(access: Access) -> Result<WorkPolicy, PolicyError> {
     let mut policy = policy_for_project(&bound, repo_root)?;
     config.apply_to_policy(&mut policy);
     Ok(policy)
+}
+
+/// Whether `folder` belongs to a project flywheel already knows, without
+/// minting an id or writing anything: its git repo carries a project id
+/// (`.git/config`, or a `project_id` in its `.flywheel.toml`) whose
+/// project dir exists under `home`. The hub's Flywheel panel shows exactly
+/// these folders.
+pub fn known_project(home: &home::Home, folder: &Path) -> Option<String> {
+    let declared = home::worktree_toplevel(folder)
+        .ok()
+        .and_then(|root| crate::config::declared_project_id(&root));
+    let stored = home::stored_project_id(folder).ok().flatten();
+    [declared, stored]
+        .into_iter()
+        .flatten()
+        .find(|id| home.project(id).root().is_dir())
+}
+
+/// The policy for the project of the git repo holding `folder`, resolved
+/// without touching the process (no cwd change, no prompt, no stderr):
+/// the cwd-free twin of [`home_project_policy`] for a long-lived process
+/// serving many repos (the hub). The repo file is read with `access`
+/// (an untrusted one is ignored for [`Access::ReadOnly`]); config
+/// warnings are returned, not printed.
+pub fn project_policy_at(
+    home: &home::Home,
+    folder: &Path,
+    access: Access,
+) -> Result<(WorkPolicy, Vec<String>), PolicyError> {
+    let project = home::resolve_project(home, folder)?;
+    let repo_root = home::worktree_toplevel(folder)?;
+    let loaded = load_config(
+        home,
+        &project,
+        &repo_root,
+        access,
+        &ConfigFlags::default(),
+        crate::config::env_dsn_from_process(),
+        Interaction::Unattended,
+    )?;
+    let bound = home::bind_project(home, &project, &loaded.config.project_id.value)?;
+    let mut policy = policy_for_project(&bound, repo_root)?;
+    loaded.config.apply_to_policy(&mut policy);
+    Ok((policy, loaded.warnings))
 }
 
 /// The default policy bound to `project`, its tasks dir created.
@@ -400,9 +421,8 @@ pub fn resolve_work_source(
     if !Path::new(DEFAULT_TASKS_DIR).is_dir() {
         let cwd = std::env::current_dir().unwrap_or_default();
         return Err(PolicyError::Invalid(format!(
-            "no {DEFAULT_POLICY_FILENAME} found in {} or any parent directory, and no \
-             {DEFAULT_TASKS_DIR} here: not a flywheel repo (run from one, or pass --policy / \
-             --tasks-dir)",
+            "no {DEFAULT_TASKS_DIR} in {}: run inside a git repo (its project's tasks live \
+             under $FLYWHEEL_HOME), or pass --tasks-dir",
             cwd.display()
         ))
         .into());
@@ -556,8 +576,8 @@ pub fn default_store_registries() -> StoreRegistries {
 /// The partition key (`project_id` column) the stores of `policy` are
 /// opened with: the bound home project's id (the config `project_id`
 /// override, else the repo's `.git/config` id) when the invocation resolved
-/// one, else [`DEFAULT_PARTITION`] -- an explicit legacy `--policy` file or a
-/// `--db` + `--tasks-dir` pair that skips project resolution.
+/// one, else [`DEFAULT_PARTITION`] -- a `--db` + `--tasks-dir` pair that
+/// skips project resolution.
 pub fn store_partition(policy: Option<&WorkPolicy>) -> String {
     policy.and_then(|p| p.project.as_ref()).map_or_else(
         || DEFAULT_PARTITION.to_owned(),
@@ -572,7 +592,7 @@ pub fn store_config_for(policy: Option<&WorkPolicy>, db_path: &Path) -> StoreCon
             .map(|p| p.store_backend.clone())
             .unwrap_or_else(|| DEFAULT_BACKEND.to_owned()),
         db_path: db_path.to_path_buf(),
-        schema: policy.and_then(|p| p.store_schema.clone()),
+        schema: None,
         dsn: policy.and_then(|p| p.store_dsn.clone()),
         project_id: store_partition(policy),
     }
@@ -798,8 +818,7 @@ pub fn dispatch(
     let sources = default_source_registry();
     let environ: Environ = environ_from_process();
     // Explicit flags that cover every path a verb reads skip the home
-    // project (a policy file is still honored), so `--db` / `--tasks-dir`
-    // keep working outside a git repo.
+    // project, so `--db` / `--tasks-dir` keep working outside a git repo.
     let given = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
     // Verbs that run repo-file commands (the orchestrate loop, the archive
     // sweep's phase-exit verify) need a trusted `.flywheel.toml`; the rest
@@ -808,20 +827,16 @@ pub fn dispatch(
         Command::Orchestrate(_) | Command::Archive(_) => Access::Execute,
         _ => Access::ReadOnly,
     };
-    let policy_of =
-        |p: &Option<String>, explicit: bool| -> Result<Option<WorkPolicy>, WorkflowError> {
-            let path = p.as_deref().map(Path::new);
-            if explicit {
-                return Ok(load_policy_file(path)?);
-            }
-            Ok(load_effective_policy(path, access)?)
-        };
+    let policy_of = |explicit: bool| -> Result<Option<WorkPolicy>, WorkflowError> {
+        if explicit {
+            return Ok(None);
+        }
+        Ok(load_effective_policy(access)?)
+    };
     match command {
         Command::Init(args) => Ok(cmd_init(&args, init_host, out, err)?),
         Command::Next(common) => {
-            let policy = policy_of(
-                &common.policy,
-                given(&common.db) && given(&common.tasks_dir),
+            let policy = policy_of(given(&common.db) && given(&common.tasks_dir),
             )?;
             let source =
                 resolve_work_source(common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
@@ -845,9 +860,7 @@ pub fn dispatch(
                 writeln!(err, "error: orchestrate is not available in this build")?;
                 return Ok(2);
             };
-            let policy = policy_of(
-                &args.common.policy,
-                given(&args.common.db) && given(&args.common.tasks_dir),
+            let policy = policy_of(given(&args.common.db) && given(&args.common.tasks_dir),
             )?;
             let source =
                 resolve_work_source(args.common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
@@ -856,10 +869,18 @@ pub fn dispatch(
                 .sandbox_root
                 .as_deref()
                 .filter(|r| !r.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| policy.as_ref().and_then(|p| p.sandbox_root.clone()));
+                .map(PathBuf::from);
             let cwd = std::env::current_dir()?;
-            let sandbox_root = resolve_sandbox_root(configured.as_deref(), &cwd)?;
+            let Some(default_root) = policy
+                .as_ref()
+                .and_then(|p| p.sandbox_root.clone())
+                .or_else(|| configured.clone())
+            else {
+                return Err(WorkflowError::Message(
+                    "orchestrate needs --sandbox-root when it runs outside a git repo".to_owned(),
+                ));
+            };
+            let sandbox_root = resolve_sandbox_root(configured.as_deref(), &cwd, &default_root);
             let request = OrchestrateRequest {
                 args: &args,
                 policy: policy.as_ref(),
@@ -870,9 +891,7 @@ pub fn dispatch(
             Ok(runner(request, out, err))
         }
         Command::Status(args) => {
-            let policy = policy_of(
-                &args.common.policy,
-                given(&args.common.db) && given(&args.common.tasks_dir),
+            let policy = policy_of(given(&args.common.db) && given(&args.common.tasks_dir),
             )?;
             let source =
                 resolve_work_source(args.common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
@@ -893,14 +912,14 @@ pub fn dispatch(
             )
         }
         Command::Live(args) => {
-            let policy = policy_of(&args.policy, given(&args.db))?;
+            let policy = policy_of(given(&args.db))?;
             let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
             cmd_live(&args, &*stores.core, out)
         }
         Command::History(args) => {
-            let policy = policy_of(&args.common.policy, given(&args.common.db))?;
+            let policy = policy_of(given(&args.common.db))?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
@@ -909,7 +928,7 @@ pub fn dispatch(
             cmd_history(&args, &*stores.core, &fallback, out)
         }
         Command::Show(args) => {
-            let policy = policy_of(&args.common.policy, given(&args.common.db))?;
+            let policy = policy_of(given(&args.common.db))?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
@@ -923,9 +942,7 @@ pub fn dispatch(
                 writeln!(err, "error: archive is not available in this build")?;
                 return Ok(2);
             };
-            let policy = policy_of(
-                &common.policy,
-                given(&common.db) && given(&common.tasks_dir),
+            let policy = policy_of(given(&common.db) && given(&common.tasks_dir),
             )?;
             let tasks_dir = resolve_directory_tasks_dir(
                 "archive",
@@ -962,7 +979,7 @@ pub fn dispatch(
             }
         }
         Command::Validate(common) => {
-            let policy = policy_of(&common.policy, given(&common.tasks_dir))?;
+            let policy = policy_of(given(&common.tasks_dir))?;
             let tasks_dir = resolve_directory_tasks_dir(
                 "validate",
                 common.tasks_dir.as_deref(),
@@ -972,9 +989,7 @@ pub fn dispatch(
             cmd_validate(&tasks_dir, &repo_root, out, err)
         }
         Command::RecheckBlocked(args) => {
-            let policy = policy_of(
-                &args.common.policy,
-                given(&args.common.db) && given(&args.common.tasks_dir),
+            let policy = policy_of(given(&args.common.db) && given(&args.common.tasks_dir),
             )?;
             let source =
                 resolve_work_source(args.common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
@@ -986,7 +1001,7 @@ pub fn dispatch(
             cmd_recheck_blocked(&args, &items, stores.core.clone(), &logs_root, out, err)
         }
         Command::Recover(args) => {
-            let policy = policy_of(&args.policy, given(&args.db))?;
+            let policy = policy_of(given(&args.db))?;
             let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
@@ -1006,7 +1021,7 @@ pub fn dispatch(
                 writeln!(err, "error: --reason must not be empty")?;
                 return Ok(2);
             }
-            let policy = policy_of(&args.policy, given(&args.db))?;
+            let policy = policy_of(given(&args.db))?;
             let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
@@ -1273,17 +1288,15 @@ mod tests {
 
     #[test]
     fn unknown_source_kind_is_an_error_never_a_directory_fallback() {
-        // The policy loader rejects it outright...
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("flywheel.toml");
-        std::fs::write(&file, "[source]\nkind = \"jira\"\ntasks_dir = \"tasks\"\n").unwrap();
-        let err = load_effective_policy(Some(&file), Access::ReadOnly)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("source.kind must be one of ('directory', 'github', 'github_ci', 'github_review'), got 'jira'"),
-            "{err}"
-        );
+        // `fw worker --source` rejects it outright...
+        let err = crate::policy::RunFlags {
+            source: Some("jira".into()),
+            ..crate::policy::RunFlags::default()
+        }
+        .apply(&mut WorkPolicy::default())
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--source must be one of"), "{err}");
         // ...and a directly constructed policy fails at the registry.
         let policy = WorkPolicy {
             source_kind: "jira".into(),
@@ -1352,20 +1365,18 @@ mod tests {
         )
     }
 
-    /// A directory-source policy pinned to `tasks_dir` and a sqlite store at
-    /// `db`, so the verbs never auto-detect this repository's own policy.
-    fn write_policy(root: &Path, tasks_dir: &Path, db: &Path) -> PathBuf {
-        let policy = root.join("flywheel.toml");
-        std::fs::write(
-            &policy,
-            format!(
-                "[source]\nkind = \"directory\"\ntasks_dir = {}\n\n[paths]\ndb = {}\n",
-                serde_json::to_string(&tasks_dir.display().to_string()).unwrap(),
-                serde_json::to_string(&db.display().to_string()).unwrap(),
-            ),
-        )
-        .unwrap();
-        policy
+    /// The explicit flags `verb` accepts that pin it to `tasks_dir` and a
+    /// sqlite store at `db` (explicit paths skip the home project, so the
+    /// verbs never touch a real `$FLYWHEEL_HOME`).
+    fn pinned(verb: &str, tasks_dir: &Path, db: &Path) -> Vec<String> {
+        let mut argv = vec![verb.to_owned()];
+        if matches!(verb, "next" | "status" | "history" | "show" | "validate") {
+            argv.extend(["--tasks-dir".to_owned(), tasks_dir.display().to_string()]);
+        }
+        if verb != "validate" {
+            argv.extend(["--db".to_owned(), db.display().to_string()]);
+        }
+        argv
     }
 
     #[test]
@@ -1375,14 +1386,7 @@ mod tests {
         let written = test_support::write_task(&tasks.join("active/01-phase/a.json"), "a", &[]);
         test_support::write_task(&tasks.join("active/01-phase/b.json"), "b", &["a"]);
         let db = tmp.path().join("state").join("db.sqlite");
-        let policy = write_policy(tmp.path(), &tasks, &db);
-        let common = |verb: &str| -> Vec<String> {
-            argv(&[
-                verb.to_owned(),
-                "--policy".to_owned(),
-                policy.display().to_string(),
-            ])
-        };
+        let common = |verb: &str| -> Vec<String> { pinned(verb, &tasks, &db) };
 
         let (code, out, err) = run_capture(&common("next"));
         assert_eq!((code, err.as_str()), (0, ""));
@@ -1456,12 +1460,7 @@ mod tests {
         test_support::write_task(&tasks.join("active/01-phase/a.json"), "a", &[]);
         test_support::write_task(&tasks.join("active/01-phase/b.json"), "b", &[]);
         let db = tmp.path().join("state").join("db.sqlite");
-        let policy = write_policy(tmp.path(), &tasks, &db);
-        let recover = argv(&[
-            "recover".to_owned(),
-            "--policy".to_owned(),
-            policy.display().to_string(),
-        ]);
+        let recover = pinned("recover", &tasks, &db);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let registries = default_store_registries();
         let bundle = open_stores_for(None, &db, &registries, &Environ::new()).unwrap();
@@ -1517,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn status_reads_only_an_explicit_policy_and_refuses_outside_a_git_repo() {
+    fn status_never_reads_a_legacy_policy_and_refuses_outside_a_git_repo() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::current_dir().unwrap();
         let tmp = TempDir::new().unwrap();
@@ -1532,16 +1531,14 @@ mod tests {
             "[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n",
         )
         .unwrap();
-        // An explicit (legacy) --policy is still honored.
-        std::env::set_current_dir(&root).unwrap();
-        let (code, out, err) = run_capture(&argv(&[
+        // The removed --policy flag is an unrecognized argument.
+        let (code, _, err) = run_capture(&argv(&[
             "status".to_owned(),
             "--policy".to_owned(),
-            "flywheel.toml".to_owned(),
+            root.join("flywheel.toml").display().to_string(),
         ]));
-        std::env::set_current_dir(&original).unwrap();
-        assert_eq!((code, err.as_str()), (0, ""));
-        assert!(out.contains("01-phase/t1"));
+        assert_eq!(code, 2);
+        assert!(err.contains("unrecognized arguments: --policy"), "{err}");
 
         // A flywheel.toml is never auto-detected (here or in a parent): the
         // directory is not a git repo, so the home project refuses.

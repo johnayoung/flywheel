@@ -18,7 +18,7 @@
 //!   reported through the log seam.
 
 use crate::submitter::{
-    GitError, GitWorktreeSubmitter, LandingBase, Logger, checked_out_branch, git, git_checked,
+    Logger, git,
     merge_lock,
 };
 use chrono::{DateTime, Utc};
@@ -34,15 +34,10 @@ use flywheel_orchestrator::claims::{
 };
 use flywheel_orchestrator::policy::WorkPolicy;
 use flywheel_orchestrator::sources::{WorkSourceError, iter_active_phase_dirs, phase_task_files};
-use flywheel_orchestrator::strategy::{
-    LandabilityVerdict, PrepareError, SandboxHandle, SandboxRequest, SubmitOutcome, SubmitRequest,
-    SubmitStrategy,
-};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 
 /// The tag a DONE task carries to satisfy the loop-path archive gate.
 pub const IN_LOOP_VERIFICATION_TAG: &str = "in-loop-verification";
@@ -60,115 +55,6 @@ pub const LOOP_BASE_REF_PREFIX: &str = "refs/flywheel/loop-base/";
 pub const LOOP_PATH_OPTOUT_FILENAME: &str = "loop-path-exempt.md";
 
 const LOOP_PATH_OPTOUT_REQUIRED_KEYS: [&str; 3] = ["phase", "author", "reason"];
-
-// --- the phase-branch landing strategy ---------------------------------------------------
-
-/// The integration branch a phase lands its tasks onto.
-pub fn phase_branch(phase: &str) -> String {
-    format!("flywheel/phase/{phase}")
-}
-
-/// The phase strategy's [`LandingBase`]: the phase's integration branch
-/// once it exists (so tasks stack and measure only their own commits), else
-/// the true base -- the branch point for the phase's first task.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PhaseIntegrationBase;
-
-impl LandingBase for PhaseIntegrationBase {
-    fn resolve(&self, submitter: &GitWorktreeSubmitter, phase: &str) -> Result<String, GitError> {
-        let integration = phase_branch(phase);
-        if submitter.branch_exists(&integration)? {
-            return Ok(integration);
-        }
-        Ok(submitter.phase_base.clone())
-    }
-
-    /// Called only at an actual fast-forward (never on a park), so the first
-    /// passing task in a phase forks `flywheel/phase/<phase>` from the
-    /// then-current true base. The true base is never advanced -- only the
-    /// integration ref is (criterion 1). Idempotent once the branch exists.
-    fn materialize(
-        &self,
-        submitter: &GitWorktreeSubmitter,
-        phase: &str,
-        base: &str,
-    ) -> Result<String, GitError> {
-        let integration = phase_branch(phase);
-        if !submitter.branch_exists(&integration)? {
-            git_checked(&submitter.repo_root, &["branch", &integration, base])?;
-            (submitter.log)(&format!(
-                "created phase integration branch {integration} at {base}"
-            ));
-        }
-        Ok(integration)
-    }
-}
-
-/// Land each task onto a per-phase integration branch (spec 00079).
-///
-/// The merge strategy's identical provisioning and full verify ladder, with
-/// one behavioral change: the ref a passing task fast-forwards onto is the
-/// phase's integration branch `flywheel/phase/<phase>`, never the single
-/// configured base. The true base is never advanced; the integration branch
-/// is a separate ref advanced out-of-tree (it is never checked out), so the
-/// operator's checkout stays untouched. Tasks in the same phase stack
-/// because provisioning branches a fresh worktree off the integration branch
-/// once it exists.
-#[derive(Debug, Clone)]
-pub struct PhaseBranchSubmitter {
-    inner: GitWorktreeSubmitter,
-}
-
-impl PhaseBranchSubmitter {
-    /// Wrap `inner`, pointing its landing-base seam at the phase branch.
-    pub fn new(inner: GitWorktreeSubmitter) -> Self {
-        Self {
-            inner: inner.with_landing_base(Arc::new(PhaseIntegrationBase)),
-        }
-    }
-
-    pub fn inner(&self) -> &GitWorktreeSubmitter {
-        &self.inner
-    }
-}
-
-impl std::ops::Deref for PhaseBranchSubmitter {
-    type Target = GitWorktreeSubmitter;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl SubmitStrategy for PhaseBranchSubmitter {
-    fn prepare_sandbox(&self, request: &SandboxRequest) -> Result<SandboxHandle, PrepareError> {
-        self.inner.prepare_sandbox(request)
-    }
-
-    fn submit(&self, request: &SubmitRequest) -> SubmitOutcome {
-        self.inner.submit(request)
-    }
-
-    fn is_landable(&self, request: &SubmitRequest) -> LandabilityVerdict {
-        self.inner.is_landable(request)
-    }
-}
-
-/// Build the phase backend (the registry's `phase` target, spec 00079):
-/// the merge builder's exact configuration (same `[submit] verify`,
-/// recovery-agent bounds, and model), only the landing ref differs. Logs the
-/// resolved landing target so an operator can see the strategy that armed.
-pub fn build_phase_submitter(
-    request: &crate::submit_registry::SubmitBuildRequest,
-) -> PhaseBranchSubmitter {
-    let submitter = PhaseBranchSubmitter::new(crate::submitter::build_merge_submitter(request));
-    (request.log)(&format!(
-        "landing strategy: phase (integration branch flywheel/phase/<phase> per task's phase; \
-         true base {} never advanced)",
-        request.phase_base
-    ));
-    submitter
-}
 
 // --- loop-base refs ----------------------------------------------------------------------
 
@@ -434,38 +320,19 @@ pub enum LandingState {
     Indeterminate,
 }
 
-/// The archive sweep's phase-branch merge verdict (spec 00079, D-2/D-3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PhaseMergeState {
-    /// The integration branch tip is an ancestor of the true base: the
-    /// phase PR merged as a merge commit.
-    Merged,
-    /// The branch exists, is not an ancestor, and carries changes the true
-    /// base lacks (an open phase PR).
-    Unmerged,
-    /// The branch's content is already applied to the true base but its tip
-    /// is not an ancestor: a squash/rebase merge discarded the commit.
-    MergeMethodMismatch,
-}
-
 /// The store surface the sweep reads: DONE-ness and the latest run by task
 /// id, plus the run's domain events for the `Landed` receipt fast path.
 pub trait ArchiveStore: LifecycleStore + DomainEventStore {}
 
 impl<T: LifecycleStore + DomainEventStore + ?Sized> ArchiveStore for T {}
 
-/// The phase-branch-landing completion seam (spec 00079, criterion 3):
-/// handed `(phase_dir, loaded_tasks)` for a completed, landed phase whose
-/// integration branch has not merged into the true base.
-pub type PhaseCompletion<'a> = &'a (dyn Fn(&Path, &[Task]) + 'a);
-
 /// Everything beyond the tasks dir and store that arms an archive gate.
 /// Every field defaults to unset, which preserves the legacy DONE-only
 /// archival contract.
 #[derive(Clone, Copy, Default)]
 pub struct ArchiveOptions<'a> {
-    /// Enables the loop-path gate, the landed predicate, the phase-merge
-    /// predicate, the phase-verify gate, and the archival-move commit.
+    /// Enables the loop-path gate, the landed predicate, the phase-verify
+    /// gate, and the archival-move commit.
     pub repo_root: Option<&'a Path>,
     pub log: Option<&'a Logger>,
     /// The phase-exit integration gate (spec 00035): a shell command run in
@@ -473,12 +340,9 @@ pub struct ArchiveOptions<'a> {
     pub phase_verify: Option<&'a str>,
     /// Arms the per-task landed predicate (spec 00077) with `repo_root`.
     pub landing_base: Option<&'a str>,
-    /// Arms the phase-branch merge predicate (spec 00079) with `repo_root`.
-    pub true_base: Option<&'a str>,
     /// The stop-event ledger: stamps `stop-resolved` markers on archive and
     /// surfaces indeterminate-landing strands.
     pub claims: Option<&'a dyn ClaimStore>,
-    pub phase_completion: Option<PhaseCompletion<'a>>,
     /// The marker clock; wall-clock UTC when unset.
     pub now: Option<&'a (dyn Fn() -> DateTime<Utc> + 'a)>,
 }
@@ -489,9 +353,7 @@ impl std::fmt::Debug for ArchiveOptions<'_> {
             .field("repo_root", &self.repo_root)
             .field("phase_verify", &self.phase_verify)
             .field("landing_base", &self.landing_base)
-            .field("true_base", &self.true_base)
             .field("claims", &self.claims.is_some())
-            .field("phase_completion", &self.phase_completion.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -526,15 +388,11 @@ pub enum ArchiveError {
 ///    head is an ancestor of (or patch-absorbed into) `landing_base`; an
 ///    operator-resolved strand is skipped; an indeterminate one is surfaced
 ///    through `claims` once;
-/// 3. the phase-branch merge predicate (`repo_root` + `true_base`): when
-///    `flywheel/phase/<phase>` exists its tip must be an ancestor of the
-///    true base, else the `phase_completion` seam fires (or the refusal is
-///    logged);
-/// 4. the loop-path gate (`repo_root`): a diff vs the recorded base that
+/// 3. the loop-path gate (`repo_root`): a diff vs the recorded base that
 ///    hits a watched signal needs a DONE `in-loop-verification` task or a
 ///    valid `loop-path-exempt.md`;
-/// 5. the phase-verify gate (`repo_root` + `phase_verify`);
-/// 6. the destination: `archive/<phase>`, or for a recurring phase name
+/// 4. the phase-verify gate (`repo_root` + `phase_verify`);
+/// 5. the destination: `archive/<phase>`, or for a recurring phase name
 ///    (autopilot's fixed `active/autopilot`) the next free
 ///    `archive/<phase>-<n>`; a phase sharing a task with an archived
 ///    generation is a resurrected duplicate and is refused loudly (never a
@@ -604,25 +462,6 @@ pub fn archive_completed_phases(
             }
             if blocking {
                 continue;
-            }
-        }
-
-        // Phase-branch merge predicate (spec 00079, criteria 4/5/6/8).
-        if let (Some(repo_root), Some(true_base)) = (options.repo_root, options.true_base) {
-            let branch = phase_branch(&phase_name);
-            if let Some(tip) = resolve_ref(repo_root, &branch) {
-                let merge_state = probe_phase_merge(repo_root, &tip, true_base);
-                if merge_state != PhaseMergeState::Merged {
-                    match options.phase_completion {
-                        Some(completion) => completion(&phase_dir, &loaded_tasks),
-                        None => log(format_phase_merge_refusal(
-                            &phase_name,
-                            &branch,
-                            merge_state,
-                        )),
-                    }
-                    continue;
-                }
             }
         }
 
@@ -779,11 +618,9 @@ fn archive_destination(
     }
 }
 
-/// The worker-side archive sweep: resolves the phase-merge predicate's true
-/// base from the policy (`[submit] base`, else the operator's checked-out
-/// branch), suppresses the repo-root phase-verify gate when a phase
-/// publisher owns it (pure phase strategy, no tiers), runs
-/// [`archive_completed_phases`], and announces each archived phase.
+/// The worker-side archive sweep: runs [`archive_completed_phases`] with
+/// the policy's phase-exit verify gate armed, and announces each archived
+/// phase.
 pub fn archive_phases(
     tasks_dir: &Path,
     store: &dyn ArchiveStore,
@@ -791,37 +628,12 @@ pub fn archive_phases(
     log: &Logger,
     sweep: &ArchiveSweep<'_>,
 ) -> Result<Vec<PathBuf>, ArchiveError> {
-    let resolved_true_base: Option<String> = sweep
-        .true_base
-        .map(str::to_owned)
-        .or_else(|| sweep.policy.and_then(|p| p.submit_base.clone()))
-        .or_else(|| {
-            sweep
-                .repo_root
-                .and_then(|root| checked_out_branch(root).ok().flatten())
-        });
-    // Under the pure phase strategy every landing reaches the phase branch,
-    // so the publisher's phase-branch-tree gate covers every archival and the
-    // repo-root gate would judge the wrong tree. Under tier routing a phase
-    // may archive without ever growing an integration branch, so the
-    // repo-root gate stays armed.
-    let publisher_owns_phase_verify = sweep.phase_completion.is_some()
-        && sweep
-            .policy
-            .is_some_and(|p| p.submit_strategy == "phase" && p.submit_tiers.is_empty());
-    let phase_verify = if publisher_owns_phase_verify {
-        None
-    } else {
-        sweep.policy.and_then(|p| p.phase_verify.as_deref())
-    };
     let options = ArchiveOptions {
         repo_root: sweep.repo_root,
         log: Some(log),
-        phase_verify,
+        phase_verify: sweep.policy.and_then(|p| p.phase_verify.as_deref()),
         landing_base: sweep.landing_base,
-        true_base: resolved_true_base.as_deref(),
         claims,
-        phase_completion: sweep.phase_completion,
         now: None,
     };
     let moved = archive_completed_phases(tasks_dir, store, &options)?;
@@ -837,11 +649,7 @@ pub struct ArchiveSweep<'a> {
     pub repo_root: Option<&'a Path>,
     /// The worker's resolved submit base (arms the landed predicate).
     pub landing_base: Option<&'a str>,
-    /// Overrides the policy/checkout-derived true base.
-    pub true_base: Option<&'a str>,
     pub policy: Option<&'a WorkPolicy>,
-    /// The phase PR publisher under the phase strategy / tier routing.
-    pub phase_completion: Option<PhaseCompletion<'a>>,
 }
 
 impl std::fmt::Debug for ArchiveSweep<'_> {
@@ -849,9 +657,7 @@ impl std::fmt::Debug for ArchiveSweep<'_> {
         f.debug_struct("ArchiveSweep")
             .field("repo_root", &self.repo_root)
             .field("landing_base", &self.landing_base)
-            .field("true_base", &self.true_base)
             .field("policy", &self.policy.is_some())
-            .field("phase_completion", &self.phase_completion.is_some())
             .finish()
     }
 }
@@ -968,37 +774,6 @@ fn format_landing_refusal(phase_name: &str, task_id: &str, state: LandingState) 
          ancestor of the landing base)"
     };
     format!("Refusing to archive phase {phase_name}: task {task_id} is not landed -- {cause}")
-}
-
-/// Merged-ness is git ancestry, never a remote PR state string: a squash /
-/// rebase merge applies the phase's content while discarding the branch
-/// commit, so equal trees with broken ancestry is the distinct mismatch.
-fn probe_phase_merge(repo_root: &Path, phase_tip: &str, true_base: &str) -> PhaseMergeState {
-    if is_ancestor(repo_root, phase_tip, true_base) {
-        return PhaseMergeState::Merged;
-    }
-    if git_capture(repo_root, &["diff", "--quiet", true_base, phase_tip]).0 {
-        return PhaseMergeState::MergeMethodMismatch;
-    }
-    PhaseMergeState::Unmerged
-}
-
-fn format_phase_merge_refusal(phase_name: &str, branch: &str, state: PhaseMergeState) -> String {
-    let cause = if state == PhaseMergeState::MergeMethodMismatch {
-        format!(
-            "its integration branch {branch} is not an ancestor of the true base but its content \
-             is already applied there -- a squash or rebase merge discarded the branch commit \
-             (merge-method mismatch); re-merge the phase PR with a merge commit or resolve the \
-             strand"
-        )
-    } else {
-        format!(
-            "its integration branch {branch} is not an ancestor of the true base -- the phase PR \
-             is still open; archival waits for it to merge (the worker performs no local merge \
-             of the phase branch)"
-        )
-    };
-    format!("Refusing to archive phase {phase_name}: the phase PR is not merged -- {cause}")
 }
 
 /// Append one indeterminate-landing marker for `task_id`, idempotently:
@@ -1240,13 +1015,12 @@ fn commit_archive_move(repo_root: &Path, active_dir: &Path, dest: &Path, log: &d
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use crate::submitter::test_support::{
-        branch_exists, commit, git_ok, init_repo, is_ancestor as git_is_ancestor, landed, ledger,
-        parked, range_shas, rev, sandbox_req, submit_req, submitter, task_file, trailer_value,
+        commit, git_ok, init_repo, is_ancestor as git_is_ancestor, rev,
     };
     use flywheel_core::events::{
         DomainEvent, LANDING_STRATEGY_MERGE, Landed, PARK_KIND_DIVERGENT_BASE,
-        PARK_KIND_PROTECTED_PATHS, PARK_KIND_STANDING_VERIFY,
     };
     use flywheel_core::lifecycle::Lifecycle;
     use flywheel_core::store_memory::InMemoryStore;
@@ -1260,212 +1034,11 @@ mod tests {
         (dir, path)
     }
 
-    fn phase_submitter(repo: &Path, store: Arc<InMemoryStore>) -> PhaseBranchSubmitter {
-        PhaseBranchSubmitter::new(submitter(repo, store))
-    }
-
-    fn prepare_with_commit(
-        s: &PhaseBranchSubmitter,
-        repo: &Path,
-        phase: &str,
-        task_id: &str,
-        file: &str,
-    ) -> (PathBuf, PathBuf) {
-        let tf = task_file(repo, phase, task_id, "true");
-        let wt = s.prepare_worktree(&sandbox_req(&tf, task_id)).unwrap();
-        commit(&wt, file, "x", &format!("feat: {file}"));
-        (tf, wt)
-    }
-
     fn capture_log() -> (Logger, Arc<Mutex<Vec<String>>>) {
         let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&lines);
         let log: Logger = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned()));
         (log, lines)
-    }
-
-    // --- the phase-branch landing strategy ---------------------------------------------
-
-    #[test]
-    fn two_tasks_stack_on_the_phase_branch_and_the_true_base_never_moves() {
-        let (_dir, repo) = repo();
-        let store = ledger();
-        let s = phase_submitter(&repo, Arc::clone(&store));
-        let true_base = rev(&repo, "main");
-        let branch = phase_branch("01-phase");
-        assert!(!branch_exists(&repo, &branch));
-
-        let (tf1, wt1) = prepare_with_commit(&s, &repo, "01-phase", "t1", "a.txt");
-        assert!(
-            s.submit(&submit_req(&tf1, "t1", &wt1, Status::Done, &["true"]))
-                .is_landed()
-        );
-        assert!(branch_exists(&repo, &branch));
-        let first_tip = rev(&repo, &branch);
-        assert!(!wt1.exists());
-        assert_eq!(rev(&repo, "main"), true_base);
-        assert_eq!(landed(&store)[0].landed_ref, first_tip);
-        assert_eq!(landed(&store)[0].strategy, LANDING_STRATEGY_MERGE);
-
-        // The second task forks from the integration branch and stacks.
-        let (tf2, wt2) = prepare_with_commit(&s, &repo, "01-phase", "t2", "b.txt");
-        assert!(git_is_ancestor(&repo, &first_tip, &rev(&wt2, "HEAD")));
-        let mut req = submit_req(&tf2, "t2", &wt2, Status::Done, &["true"]);
-        req.task_id = "t2".into();
-        assert!(s.submit(&req).is_landed());
-        let second_tip = rev(&repo, &branch);
-        assert_ne!(second_tip, first_tip);
-        assert!(git_is_ancestor(&repo, &first_tip, &second_tip));
-        assert_eq!(rev(&repo, "main"), true_base);
-        assert!(!repo.join("a.txt").exists(), "operator checkout untouched");
-        assert_eq!(
-            git_ok(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            "main"
-        );
-        // Trailers are stamped on the phase path too.
-        let shas = range_shas(&repo, &format!("{true_base}..{second_tip}"));
-        assert_eq!(shas.len(), 2);
-        assert_eq!(trailer_value(&repo, &shas[1], "Flywheel-Task"), "t2");
-    }
-
-    #[test]
-    fn first_landing_creates_the_branch_at_the_true_base_tip() {
-        let (_dir, repo) = repo();
-        let s = phase_submitter(&repo, ledger());
-        let (tf, wt) = prepare_with_commit(&s, &repo, "01-phase", "t1", "a.txt");
-        commit(&repo, "advance.txt", "x", "base advances after fork");
-        let true_base_tip = rev(&repo, "main");
-        assert!(
-            s.submit(&submit_req(&tf, "t1", &wt, Status::Done, &["true"]))
-                .is_landed()
-        );
-        let branch = phase_branch("01-phase");
-        // The branch forks from the then-current true base (so the rebase
-        // path ran) and ends at the task's rebased commit.
-        assert!(git_is_ancestor(&repo, &true_base_tip, &rev(&repo, &branch)));
-        assert_eq!(
-            git_ok(&repo, &["rev-list", "--count", &format!("main..{branch}")]),
-            "1"
-        );
-        assert_eq!(rev(&repo, "main"), true_base_tip);
-    }
-
-    #[test]
-    fn two_phases_get_distinct_integration_branches() {
-        let (_dir, repo) = repo();
-        let s = phase_submitter(&repo, ledger());
-        let (tf1, wt1) = prepare_with_commit(&s, &repo, "01-phase", "t1", "a.txt");
-        s.submit(&submit_req(&tf1, "t1", &wt1, Status::Done, &["true"]));
-        let (tf2, wt2) = prepare_with_commit(&s, &repo, "02-phase", "t2", "b.txt");
-        let mut req = submit_req(&tf2, "t2", &wt2, Status::Done, &["true"]);
-        req.task_id = "t2".into();
-        s.submit(&req);
-        assert!(branch_exists(&repo, "flywheel/phase/01-phase"));
-        assert!(branch_exists(&repo, "flywheel/phase/02-phase"));
-        assert_ne!(
-            rev(&repo, "flywheel/phase/01-phase"),
-            rev(&repo, "flywheel/phase/02-phase")
-        );
-        assert_eq!(
-            git_ok(
-                &repo,
-                &["rev-list", "--count", "main..flywheel/phase/02-phase"]
-            ),
-            "1"
-        );
-    }
-
-    #[test]
-    fn parks_leave_the_phase_branch_unchanged_or_uncreated() {
-        let (_dir, repo) = repo();
-        let store = ledger();
-        // Protected path on the first task: no branch is ever created.
-        let s = phase_submitter(&repo, Arc::clone(&store))
-            .inner()
-            .clone()
-            .with_protected_paths(["conftest.py"]);
-        let s = PhaseBranchSubmitter::new(s);
-        let (tf, wt) = prepare_with_commit(&s, &repo, "01-phase", "t1", "conftest.py");
-        let outcome = s.submit(&submit_req(&tf, "t1", &wt, Status::Done, &["true"]));
-        assert!(
-            matches!(&outcome, SubmitOutcome::Parked { park_kind, .. } if park_kind == PARK_KIND_PROTECTED_PATHS)
-        );
-        assert!(!branch_exists(&repo, "flywheel/phase/01-phase"));
-        assert!(wt.exists());
-
-        // Clean-FF standing-verify failure: still no branch.
-        let failing = PhaseBranchSubmitter::new(
-            submitter(&repo, Arc::clone(&store)).with_verify_command("false"),
-        );
-        let (tf2, wt2) = prepare_with_commit(&failing, &repo, "01-phase", "t2", "b.txt");
-        let mut req = submit_req(&tf2, "t2", &wt2, Status::Done, &["true"]);
-        req.task_id = "t2".into();
-        assert!(
-            matches!(failing.submit(&req), SubmitOutcome::Parked { park_kind, .. } if park_kind == PARK_KIND_STANDING_VERIFY)
-        );
-        assert!(!branch_exists(&repo, "flywheel/phase/01-phase"));
-
-        // A landed first task creates the branch; a base-advanced
-        // standing-verify failure on the next leaves it byte-identical.
-        let ok = phase_submitter(&repo, Arc::clone(&store));
-        let (tf3, wt3) = prepare_with_commit(&ok, &repo, "01-phase", "t3", "c.txt");
-        let mut req = submit_req(&tf3, "t3", &wt3, Status::Done, &["true"]);
-        req.task_id = "t3".into();
-        assert!(ok.submit(&req).is_landed());
-        let branch_tip = rev(&repo, "flywheel/phase/01-phase");
-        let (tf4, wt4) = prepare_with_commit(&failing, &repo, "01-phase", "t4", "d.txt");
-        // Advance the integration branch out-of-band so t4 must rebase.
-        let (tf5, wt5) = prepare_with_commit(&ok, &repo, "01-phase", "t5", "e.txt");
-        let mut req5 = submit_req(&tf5, "t5", &wt5, Status::Done, &["true"]);
-        req5.task_id = "t5".into();
-        assert!(ok.submit(&req5).is_landed());
-        let advanced_tip = rev(&repo, "flywheel/phase/01-phase");
-        assert_ne!(advanced_tip, branch_tip);
-        let mut req4 = submit_req(&tf4, "t4", &wt4, Status::Done, &["true"]);
-        req4.task_id = "t4".into();
-        assert!(
-            matches!(failing.submit(&req4), SubmitOutcome::Parked { park_kind, .. } if park_kind == PARK_KIND_STANDING_VERIFY)
-        );
-        assert_eq!(rev(&repo, "flywheel/phase/01-phase"), advanced_tip);
-        assert!(wt4.exists());
-        assert!(
-            parked(&store)
-                .iter()
-                .all(|p| p.park_kind != PARK_KIND_DIVERGENT_BASE)
-        );
-    }
-
-    #[test]
-    fn merge_strategy_creates_no_phase_branch() {
-        let (_dir, repo) = repo();
-        let s = submitter(&repo, ledger());
-        let tf = task_file(&repo, "01-phase", "t1", "true");
-        let wt = s.prepare_worktree(&sandbox_req(&tf, "t1")).unwrap();
-        commit(&wt, "a.txt", "x", "feat: a");
-        assert!(
-            s.submit(&submit_req(&tf, "t1", &wt, Status::Done, &["true"]))
-                .is_landed()
-        );
-        assert!(!branch_exists(&repo, "flywheel/phase/01-phase"));
-        assert!(repo.join("a.txt").exists());
-    }
-
-    #[test]
-    fn build_phase_submitter_logs_the_landing_target() {
-        let (_dir, repo) = repo();
-        let (log, lines) = capture_log();
-        let req = crate::submit_registry::SubmitBuildRequest::new(
-            &repo,
-            repo.join(".flywheel/tasks"),
-            repo.join(".flywheel/worktrees"),
-            "main",
-            repo.join(".flywheel/.merge.lock"),
-            log,
-        );
-        let s = build_phase_submitter(&req);
-        assert_eq!(s.phase_base, "main");
-        assert!(lines.lock().unwrap()[0].contains("landing strategy: phase"));
-        assert_eq!(s.landing_base_for("01-phase").unwrap(), "main");
     }
 
     // --- loop-base refs ---------------------------------------------------------------
@@ -1979,70 +1552,6 @@ mod tests {
     }
 
     #[test]
-    fn phase_merge_predicate_distinguishes_open_squash_and_merged() {
-        let f = Fixture::new();
-        f.task("01-phase", "t1", &[]);
-        f.done("t1", "run-t1");
-        f.landed_receipt("run-t1");
-        git_ok(
-            &f.repo,
-            &["checkout", "-q", "-b", "flywheel/phase/01-phase"],
-        );
-        commit(&f.repo, "phase.txt", "p", "phase work");
-        git_ok(&f.repo, &["checkout", "-q", "main"]);
-        let armed = ArchiveOptions {
-            repo_root: Some(&f.repo),
-            landing_base: Some("main"),
-            true_base: Some("main"),
-            ..ArchiveOptions::default()
-        };
-        let (moved, logged) = f.sweep(armed);
-        assert!(moved.is_empty());
-        assert!(
-            logged[0].contains("the phase PR is still open"),
-            "{}",
-            logged[0]
-        );
-
-        // The completion seam fires instead of the refusal.
-        let seen: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
-        let completion = |dir: &Path, tasks: &[Task]| {
-            seen.lock().unwrap().push((dir.to_path_buf(), tasks.len()));
-        };
-        let (moved, logged) = f.sweep(ArchiveOptions {
-            phase_completion: Some(&completion),
-            ..armed
-        });
-        assert!(moved.is_empty());
-        assert!(logged.is_empty());
-        assert_eq!(
-            *seen.lock().unwrap(),
-            vec![(f.tasks_dir.join("active/01-phase"), 1)]
-        );
-
-        // A squash merge applies the content but breaks ancestry.
-        git_ok(&f.repo, &["merge", "--squash", "flywheel/phase/01-phase"]);
-        git_ok(&f.repo, &["commit", "-m", "squash"]);
-        let (moved, logged) = f.sweep(armed);
-        assert!(moved.is_empty());
-        assert!(logged[0].contains("merge-method mismatch"), "{}", logged[0]);
-
-        // A merge commit keeps ancestry: the phase archives.
-        git_ok(
-            &f.repo,
-            &[
-                "merge",
-                "--no-ff",
-                "-m",
-                "merge phase",
-                "flywheel/phase/01-phase",
-            ],
-        );
-        let (moved, _) = f.sweep(armed);
-        assert_eq!(moved.len(), 1);
-    }
-
-    #[test]
     fn loop_path_gate_requires_verification_task_or_opt_out() {
         let f = Fixture::new();
         let phase = f.phase("01-phase");
@@ -2198,64 +1707,6 @@ mod tests {
     }
 
     #[test]
-    fn archive_phases_wrapper_resolves_the_true_base_and_announces() {
-        let f = Fixture::new();
-        f.task("01-phase", "t1", &[]);
-        f.done("t1", "run-t1");
-        f.landed_receipt("run-t1");
-        // An unmerged phase branch blocks via the checkout-derived true base.
-        git_ok(
-            &f.repo,
-            &["checkout", "-q", "-b", "flywheel/phase/01-phase"],
-        );
-        commit(&f.repo, "phase.txt", "p", "phase work");
-        git_ok(&f.repo, &["checkout", "-q", "main"]);
-        let (log, lines) = capture_log();
-        let policy = WorkPolicy {
-            phase_verify: Some("exit 9".into()),
-            submit_strategy: "phase".into(),
-            ..WorkPolicy::default()
-        };
-        let sweep = ArchiveSweep {
-            repo_root: Some(&f.repo),
-            landing_base: Some("main"),
-            policy: Some(&policy),
-            ..ArchiveSweep::default()
-        };
-        let moved = archive_phases(&f.tasks_dir, &f.store, Some(&f.claims), &log, &sweep).unwrap();
-        assert!(moved.is_empty());
-        assert!(lines.lock().unwrap()[0].contains("phase PR is still open"));
-
-        // Merge it; with a publisher wired under the pure phase strategy the
-        // repo-root phase-verify gate is suppressed and the phase archives.
-        git_ok(
-            &f.repo,
-            &[
-                "merge",
-                "--no-ff",
-                "-m",
-                "merge phase",
-                "flywheel/phase/01-phase",
-            ],
-        );
-        let completion = |_: &Path, _: &[Task]| {};
-        let sweep = ArchiveSweep {
-            phase_completion: Some(&completion),
-            ..sweep
-        };
-        let moved = archive_phases(&f.tasks_dir, &f.store, Some(&f.claims), &log, &sweep).unwrap();
-        assert_eq!(moved.len(), 1);
-        assert!(
-            lines
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|l| l.starts_with("Archived phase: "))
-        );
-        assert!(format!("{sweep:?}").contains("phase_completion: true"));
-    }
-
-    #[test]
     fn archive_phases_wrapper_keeps_phase_verify_armed_without_a_publisher() {
         let f = Fixture::new();
         f.task("01-phase", "t1", &[]);
@@ -2289,23 +1740,6 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-    }
-
-    #[test]
-    fn phase_integration_materialize_never_moves_an_existing_branch() {
-        // A worker that resolved the true base before a sibling forked the
-        // integration branch must not reset the branch (and drop the
-        // sibling's landing) when it materializes.
-        let (_dir, repo) = repo();
-        let s = submitter(&repo, ledger());
-        git_ok(&repo, &["checkout", "-q", "-b", "flywheel/phase/01-phase"]);
-        let tip = commit(&repo, "landed.txt", "x", "sibling landing");
-        git_ok(&repo, &["checkout", "-q", "main"]);
-        let integration = PhaseIntegrationBase
-            .materialize(&s, "01-phase", "main")
-            .unwrap();
-        assert_eq!(integration, "flywheel/phase/01-phase");
-        assert_eq!(rev(&repo, "flywheel/phase/01-phase"), tip);
     }
 
     #[test]
@@ -2740,71 +2174,6 @@ mod tests {
         let (moved, logged) = f.sweep(ArchiveOptions::default());
         assert_eq!(moved, vec![archive.join("auto-3")], "{logged:?}");
         assert!(archive.join("auto-2").is_file());
-    }
-
-    #[test]
-    fn archive_phases_wrapper_prefers_the_explicit_true_base() {
-        let f = Fixture::new();
-        f.task("01-phase", "t1", &[]);
-        f.done("t1", "run-t1");
-        git_ok(
-            &f.repo,
-            &["checkout", "-q", "-b", "flywheel/phase/01-phase"],
-        );
-        commit(&f.repo, "phase.txt", "p", "phase work");
-        git_ok(&f.repo, &["checkout", "-q", "-b", "release", "main"]);
-        git_ok(
-            &f.repo,
-            &["merge", "--no-ff", "-m", "merge", "flywheel/phase/01-phase"],
-        );
-        git_ok(&f.repo, &["checkout", "-q", "main"]);
-        let (log, _) = capture_log();
-        let policy = WorkPolicy {
-            submit_base: Some("main".into()),
-            ..WorkPolicy::default()
-        };
-        let sweep = ArchiveSweep {
-            repo_root: Some(&f.repo),
-            true_base: Some("release"),
-            policy: Some(&policy),
-            ..ArchiveSweep::default()
-        };
-        let moved = archive_phases(&f.tasks_dir, &f.store, None, &log, &sweep).unwrap();
-        assert_eq!(moved.len(), 1);
-    }
-
-    #[test]
-    fn archive_phases_wrapper_suppresses_phase_verify_only_for_the_pure_phase_strategy() {
-        let completion = |_: &Path, _: &[Task]| {};
-        let tiered = WorkPolicy {
-            phase_verify: Some("exit 9".into()),
-            submit_strategy: "phase".into(),
-            submit_tiers: vec![flywheel_orchestrator::policy::SubmitTierRule {
-                tier: 1,
-                paths: vec!["src/**".into()],
-            }],
-            ..WorkPolicy::default()
-        };
-        let merge = WorkPolicy {
-            phase_verify: Some("exit 9".into()),
-            submit_strategy: "merge".into(),
-            ..WorkPolicy::default()
-        };
-        for policy in [&tiered, &merge] {
-            let f = Fixture::new();
-            f.task("01-phase", "t1", &[]);
-            f.done("t1", "run-t1");
-            let (log, lines) = capture_log();
-            let sweep = ArchiveSweep {
-                repo_root: Some(&f.repo),
-                policy: Some(policy),
-                phase_completion: Some(&completion),
-                ..ArchiveSweep::default()
-            };
-            let moved = archive_phases(&f.tasks_dir, &f.store, None, &log, &sweep).unwrap();
-            assert!(moved.is_empty(), "{}", policy.submit_strategy);
-            assert!(lines.lock().unwrap()[0].contains("phase-verify command"));
-        }
     }
 
     #[test]

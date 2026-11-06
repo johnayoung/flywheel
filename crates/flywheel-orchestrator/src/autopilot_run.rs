@@ -63,13 +63,13 @@ pub const LOG_PREFIX: &str = "[autopilot]";
 /// The usage block argparse prints on a bad argument (80-column wrap).
 pub const USAGE: &str = "usage: flywheel autopilot [-h] [--tasks-dir TASKS_DIR] [--model MODEL]
                           [--target-depth TARGET_DEPTH] [--interval INTERVAL]
-                          [--once] [--activity-file ACTIVITY_FILE] [--pause]
-                          [--resume] [--policy POLICY]";
+                          [--once] [--dry-run] [--activity-file ACTIVITY_FILE]
+                          [--pause] [--resume] [--agent AGENT]";
 
 const HELP: &str = "usage: flywheel autopilot [-h] [--tasks-dir TASKS_DIR] [--model MODEL]
                           [--target-depth TARGET_DEPTH] [--interval INTERVAL]
-                          [--once] [--activity-file ACTIVITY_FILE] [--pause]
-                          [--resume] [--policy POLICY]
+                          [--once] [--dry-run] [--activity-file ACTIVITY_FILE]
+                          [--pause] [--resume] [--agent AGENT]
 
 Keep the work queue full with verifiable, tier-prioritized tasks. Runs as a
 neverending daemon by default; --once runs a single refill pass and exits.
@@ -84,6 +84,9 @@ options:
   --interval INTERVAL   Seconds between daemon cycles (overrides [autopilot]
                         config).
   --once                Run a single refill pass and exit (no daemon loop).
+  --dry-run             With --once: measure the queue against the target and
+                        report the refill decision without running discovery
+                        or authoring anything (no agent, nothing emitted).
   --activity-file ACTIVITY_FILE
                         Path to write the live activity snapshot the console
                         reads (defaults to the project's
@@ -91,22 +94,23 @@ options:
   --pause               Hold the running daemon between cycles (writes
                         <activity file>.paused) and exit.
   --resume              Let a paused daemon run cycles again and exit.
-  --policy POLICY       Legacy: run on this flywheel.toml work policy instead
-                        of the home project's effective config.";
+  --agent AGENT         The agent adapter discovery and authoring run on
+                        (claude-code default, or codex).";
 
 /// The long options in argparse declaration order (abbreviation matching
 /// reports ambiguities in this order).
-const LONG_OPTIONS: [&str; 10] = [
+const LONG_OPTIONS: [&str; 11] = [
     "--help",
     "--tasks-dir",
     "--model",
     "--target-depth",
     "--interval",
     "--once",
+    "--dry-run",
     "--activity-file",
     "--pause",
     "--resume",
-    "--policy",
+    "--agent",
 ];
 
 // --- Arguments ------------------------------------------------------------------------
@@ -124,8 +128,10 @@ pub struct AutopilotArgs {
     pub pause: bool,
     /// Remove the pause marker and exit.
     pub resume: bool,
-    /// Legacy: an explicit `flywheel.toml` work policy.
-    pub policy: Option<String>,
+    /// `--dry-run` (with `--once`): decide, emit nothing.
+    pub dry_run: bool,
+    /// `--agent ID`: the agent adapter (`claude-code` default, `codex`).
+    pub agent: Option<String>,
     pub help: bool,
 }
 
@@ -283,7 +289,11 @@ pub fn parse_args(argv: &[String]) -> Result<AutopilotArgs, String> {
             }
             "--tasks-dir" => args.tasks_dir = Some(take_value(option, inline, &mut iter)?),
             "--model" => args.model = Some(take_value(option, inline, &mut iter)?),
-            "--policy" => args.policy = Some(take_value(option, inline, &mut iter)?),
+            "--agent" => args.agent = Some(take_value(option, inline, &mut iter)?),
+            "--dry-run" => {
+                reject_inline(option, inline)?;
+                args.dry_run = true;
+            }
             "--activity-file" => {
                 args.activity_file = Some(take_value(option, inline, &mut iter)?);
             }
@@ -315,6 +325,9 @@ pub fn parse_args(argv: &[String]) -> Result<AutopilotArgs, String> {
             "argument {}: not allowed with argument {}",
             chosen[1], chosen[0]
         ));
+    }
+    if args.dry_run && !args.once {
+        return Err("argument --dry-run: requires --once".to_owned());
     }
     Ok(args)
 }
@@ -1174,10 +1187,13 @@ pub(crate) async fn watch_stop_signals(on_signal: SignalHandler, log: LogSink) {
 /// The process-level effects `flywheel autopilot` performs, behind one seam
 /// so [`run_main`] is hermetic in tests.
 pub trait AutopilotHost: Send + Sync {
-    /// An explicit policy file, or `None` to auto-detect from the working
-    /// directory (`load_effective_policy`).
-    fn policy_path(&self) -> Option<PathBuf> {
-        None
+    /// The policy a run resolves: the working directory's home project
+    /// with its effective config ([`load_effective_policy`]).
+    fn load_policy(
+        &self,
+        access: crate::config::Access,
+    ) -> Result<Option<WorkPolicy>, crate::policy::PolicyError> {
+        load_effective_policy(access)
     }
 
     /// The raw stderr line sink (no prefix).
@@ -1312,6 +1328,46 @@ impl AutopilotHost for ProductionHost {
     }
 }
 
+/// `fw autopilot --once --dry-run`: measure the actionable queue against
+/// the target depth and log the refill decision. Runs no discovery or
+/// authoring agent and writes nothing (no task file, no activity record,
+/// no discovery cache). Exit 0, or 1 when the queue cannot be measured.
+pub fn dry_run_pass(
+    runtime: &ResolvedRuntime,
+    queue_depth: Option<&QueueDepthFn<'_>>,
+    log: &LogSink,
+    stderr: &LogSink,
+) -> i32 {
+    let depth = match queue_depth {
+        Some(probe) => probe(&runtime.tasks_dir),
+        None => crate::autopilot::directory_queue_depth(&runtime.tasks_dir),
+    };
+    let depth = match depth {
+        Ok(depth) => depth,
+        Err(err) => {
+            stderr(&format!("flywheel autopilot: cannot measure the queue: {err}"));
+            return 1;
+        }
+    };
+    let depth_i64 = i64::try_from(depth).unwrap_or(i64::MAX);
+    let decision = if depth_i64 >= runtime.target_depth {
+        "queue at or above target: nothing to author".to_owned()
+    } else {
+        format!(
+            "would author up to {} task(s)",
+            runtime.target_depth - depth_i64
+        )
+    };
+    log(&format!(
+        "dry run tasks={} queue_depth={depth} target_depth={} landing={}: {decision} \
+         (dry run: no agent ran, nothing emitted)",
+        python_path_str(&runtime.tasks_dir),
+        runtime.target_depth,
+        runtime.landing,
+    ));
+    0
+}
+
 // --- main -------------------------------------------------------------------------------------
 
 /// Run `flywheel autopilot` with the real host; returns the process exit code.
@@ -1367,19 +1423,19 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
     } else {
         crate::config::Access::Execute
     };
-    let policy_path = args
-        .policy
-        .as_deref()
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| host.policy_path());
-    let policy = match load_effective_policy(policy_path.as_deref(), access) {
+    let mut policy = match host.load_policy(access) {
         Ok(policy) => policy,
         Err(err) => {
             stderr(&format!("flywheel autopilot: policy error: {err}"));
             return 2;
         }
     };
+    if let (Some(policy), Some(agent)) = (
+        policy.as_mut(),
+        args.agent.as_deref().filter(|a| !a.is_empty()),
+    ) {
+        policy.agent_id = Some(agent.to_owned());
+    }
     let policy = policy.as_ref();
     let log_dir = autopilot_log_dir(policy, &repo_root);
     let activity_path = match args.activity_file.as_deref().filter(|p| !p.is_empty()) {
@@ -1444,7 +1500,7 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         // ceilings.
         deadlines: policy.map(|p| p.deadlines.clone()),
         agent_id: policy.and_then(|p| p.agent_id.clone()),
-        agent_transport: policy.and_then(|p| p.agent_transport.clone()),
+        agent_transport: None,
         authoring_concurrency: policy
             .map_or(DEFAULT_AUTOPILOT_AUTHORING_CONCURRENCY, |p| {
                 p.autopilot_authoring_concurrency
@@ -1461,6 +1517,9 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
     let tasks_text = python_path_str(&runtime.tasks_dir);
     let mut run_cycle = || host.run_cycle(&spec, queue_depth_probe);
 
+    if args.once && args.dry_run {
+        return dry_run_pass(&runtime, queue_depth_probe, &log, &stderr);
+    }
     if args.once {
         log(&format!(
             "single pass repo={repo_text} tasks={tasks_text} target_depth={} landing={}",
@@ -1690,10 +1749,13 @@ mod tests {
         )))
     }
 
-    fn write_policy(dir: &Path, body: &str) -> PathBuf {
-        let path = dir.join("flywheel.toml");
-        std::fs::write(&path, format!("[source]\nkind = \"directory\"\n{body}")).unwrap();
-        path
+    /// The directory-source policy the entrypoint tests run on (tasks at
+    /// the relative `.flywheel/tasks`, no project bound).
+    fn dir_policy() -> WorkPolicy {
+        WorkPolicy {
+            tasks_dir: Some(PathBuf::from(".flywheel/tasks")),
+            ..WorkPolicy::default()
+        }
     }
 
     // --- argument parsing ------------------------------------------------------------------
@@ -1713,8 +1775,8 @@ mod tests {
             "2.5",
             "--activity-file",
             "a.json",
-            "--policy",
-            "p.toml",
+            "--agent",
+            "codex",
         ]))
         .unwrap();
         assert_eq!(
@@ -1728,7 +1790,8 @@ mod tests {
                 activity_file: Some("a.json".into()),
                 pause: false,
                 resume: false,
-                policy: Some("p.toml".into()),
+                dry_run: false,
+                agent: Some("codex".into()),
                 help: false,
             }
         );
@@ -1814,15 +1877,16 @@ mod tests {
 
     #[test]
     fn resolve_runtime_prefers_flag_then_policy_then_default() {
-        let dir = TempDir::new().unwrap();
-        let path = write_policy(
-            dir.path(),
-            "tasks_dir = \"queue\"\n[autopilot]\ntarget_depth = 7\nlanding = \"pr\"\n\
-             interval_seconds = 42\n[autopilot.weights]\ntier = 1.5\n",
-        );
-        let policy = load_effective_policy(Some(&path), crate::config::Access::ReadOnly)
-            .unwrap()
-            .unwrap();
+        let policy = WorkPolicy {
+            tasks_dir: Some(PathBuf::from("queue")),
+            autopilot_target_depth: 7,
+            autopilot_landing: "pr".into(),
+            autopilot_weights: Some(crate::policy::AutopilotWeights {
+                tier: 1.5,
+                ..crate::policy::AutopilotWeights::default()
+            }),
+            ..WorkPolicy::default()
+        };
 
         let defaults = resolve_runtime(&AutopilotArgs::default(), None);
         assert_eq!(defaults.tasks_dir, PathBuf::from(DEFAULT_TASKS_DIR));
@@ -1867,23 +1931,60 @@ mod tests {
             resolve_daemon_db_path(None, repo),
             PathBuf::from("/repo/.flywheel/flywheel.sqlite")
         );
-        let dir = TempDir::new().unwrap();
-        let relative = write_policy(dir.path(), "[paths]\ndb = \"state/fw.sqlite\"\n");
-        let policy = load_effective_policy(Some(&relative), crate::config::Access::ReadOnly)
-            .unwrap()
-            .unwrap();
+        let relative = WorkPolicy {
+            db_path: Some(PathBuf::from("state/fw.sqlite")),
+            ..WorkPolicy::default()
+        };
         assert_eq!(
-            resolve_daemon_db_path(Some(&policy), repo),
+            resolve_daemon_db_path(Some(&relative), repo),
             PathBuf::from("/repo/state/fw.sqlite")
         );
-        let absolute = write_policy(dir.path(), "[paths]\ndb = \"/var/fw.sqlite\"\n");
-        let policy = load_effective_policy(Some(&absolute), crate::config::Access::ReadOnly)
-            .unwrap()
-            .unwrap();
+        let absolute = WorkPolicy {
+            db_path: Some(PathBuf::from("/var/fw.sqlite")),
+            ..WorkPolicy::default()
+        };
         assert_eq!(
-            resolve_daemon_db_path(Some(&policy), repo),
+            resolve_daemon_db_path(Some(&absolute), repo),
             PathBuf::from("/var/fw.sqlite")
         );
+    }
+
+    #[test]
+    fn dry_run_requires_once() {
+        assert_eq!(
+            parse_args(&argv(&["--dry-run"])).unwrap_err(),
+            "argument --dry-run: requires --once"
+        );
+        let parsed = parse_args(&argv(&["--once", "--dry-run"])).unwrap();
+        assert!(parsed.once && parsed.dry_run);
+    }
+
+    #[test]
+    fn a_dry_run_decides_from_the_queue_and_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let tasks = dir.path().join("tasks");
+        std::fs::create_dir_all(tasks.join("active")).unwrap();
+        let runtime = ResolvedRuntime {
+            tasks_dir: tasks.clone(),
+            target_depth: 3,
+            landing: "merge".into(),
+            weights: ScoreWeights::default(),
+        };
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        let log: LogSink = Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned()));
+        let probe = |_: &Path| -> Result<usize, crate::sources::WorkSourceError> { Ok(1) };
+        assert_eq!(dry_run_pass(&runtime, Some(&probe), &log, &log), 0);
+        let full = |_: &Path| -> Result<usize, crate::sources::WorkSourceError> { Ok(3) };
+        assert_eq!(dry_run_pass(&runtime, Some(&full), &log, &log), 0);
+        let logged = lines.lock().unwrap().join("\n");
+        assert!(logged.contains("queue_depth=1 target_depth=3"), "{logged}");
+        assert!(logged.contains("would author up to 2 task(s)"), "{logged}");
+        assert!(logged.contains("nothing to author"), "{logged}");
+        assert!(logged.contains("nothing emitted"), "{logged}");
+        // Nothing was written: the tasks tree is exactly as it was.
+        let entries: Vec<_> = std::fs::read_dir(&tasks).unwrap().collect();
+        assert_eq!(entries.len(), 1);
     }
 
     // --- no-progress back-off -------------------------------------------------------------------
@@ -2372,12 +2473,12 @@ mod tests {
 
     // --- the entrypoint ------------------------------------------------------------------------
 
-    /// A hermetic host: an explicit policy file, captured stderr, a repo root,
+    /// A hermetic host: a fixed policy (or policy error), captured stderr, a repo root,
     /// scripted pass outcomes (an idle result once the script is exhausted),
     /// optional in-memory stores, and the armed stop flag so the script can
     /// stand in for a signal arriving mid-cycle.
     struct FakeHost {
-        policy: PathBuf,
+        policy: Result<WorkPolicy, crate::policy::PolicyError>,
         stderr: Arc<Mutex<Vec<String>>>,
         root: PathBuf,
         specs: Mutex<Vec<SinglePassSpec>>,
@@ -2391,7 +2492,7 @@ mod tests {
     }
 
     impl FakeHost {
-        fn new(policy: PathBuf, root: PathBuf) -> Self {
+        fn new(policy: Result<WorkPolicy, crate::policy::PolicyError>, root: PathBuf) -> Self {
             Self {
                 policy,
                 stderr: Arc::new(Mutex::new(Vec::new())),
@@ -2437,8 +2538,11 @@ mod tests {
     }
 
     impl AutopilotHost for FakeHost {
-        fn policy_path(&self) -> Option<PathBuf> {
-            Some(self.policy.clone())
+        fn load_policy(
+            &self,
+            _access: crate::config::Access,
+        ) -> Result<Option<WorkPolicy>, crate::policy::PolicyError> {
+            self.policy.clone().map(Some)
         }
 
         fn stderr(&self) -> LogSink {
@@ -2513,15 +2617,14 @@ mod tests {
         }
     }
 
-    fn host(dir: &TempDir, policy_body: &str) -> FakeHost {
-        let policy = write_policy(dir.path(), policy_body);
-        FakeHost::new(policy, dir.path().to_path_buf())
+    fn host(dir: &TempDir, policy: WorkPolicy) -> FakeHost {
+        FakeHost::new(Ok(policy), dir.path().to_path_buf())
     }
 
     #[test]
     fn bad_argument_prints_usage_and_exits_2() {
         let dir = TempDir::new().unwrap();
-        let host = host(&dir, "");
+        let host = host(&dir, dir_policy());
         assert_eq!(run_main(&argv(&["--bogus"]), &host), 2);
         assert_eq!(
             host.lines(),
@@ -2536,16 +2639,14 @@ mod tests {
     #[test]
     fn help_exits_0_without_running() {
         let dir = TempDir::new().unwrap();
-        let host = host(&dir, "");
+        let host = host(&dir, dir_policy());
         assert_eq!(run_main(&argv(&["--help"]), &host), 0);
         assert!(host.specs.lock().unwrap().is_empty());
     }
 
     #[test]
     fn missing_repo_root_exits_1_with_the_message() {
-        let dir = TempDir::new().unwrap();
-        let policy = write_policy(dir.path(), "");
-        let host = FakeHost::new(policy, PathBuf::new());
+        let host = FakeHost::new(Ok(dir_policy()), PathBuf::new());
         assert_eq!(run_main(&argv(&["--once"]), &host), 1);
         assert_eq!(host.lines(), vec!["ERROR: not inside a git repository."]);
     }
@@ -2553,7 +2654,10 @@ mod tests {
     #[test]
     fn policy_error_exits_2_before_any_pass() {
         let dir = TempDir::new().unwrap();
-        let host = host(&dir, "[autopilot]\ntarget_depth = \"many\"\n");
+        let host = FakeHost::new(
+            Err(crate::policy::PolicyError::Invalid("bad config".into())),
+            dir.path().to_path_buf(),
+        );
         assert_eq!(run_main(&argv(&["--once"]), &host), 2);
         let text = host.err_text();
         assert!(
@@ -2575,7 +2679,14 @@ mod tests {
             vec![Tier::CoreFeatureWork],
             "emitted 1, dropped 1",
         );
-        let host = host(&dir, "[autopilot]\ntarget_depth = 3\nlanding = \"pr\"\n")
+        let host = host(
+            &dir,
+            WorkPolicy {
+                autopilot_target_depth: 3,
+                autopilot_landing: "pr".into(),
+                ..dir_policy()
+            },
+        )
             .script(vec![Ok(result)]);
         assert_eq!(run_main(&argv(&["--once", "--model", "m"]), &host), 0);
         let root = python_path_str(dir.path());
@@ -2603,7 +2714,7 @@ mod tests {
     #[test]
     fn once_failing_pass_exits_1() {
         let dir = TempDir::new().unwrap();
-        let host = host(&dir, "").script(vec![Err(boom("agent unreachable"))]);
+        let host = host(&dir, dir_policy()).script(vec![Err(boom("agent unreachable"))]);
         assert_eq!(run_main(&argv(&["--once"]), &host), 1);
         assert_eq!(
             host.lines().last().map(String::as_str),
@@ -2614,7 +2725,7 @@ mod tests {
     #[test]
     fn once_threads_the_policy_deadline_override_to_the_pass() {
         let dir = TempDir::new().unwrap();
-        let host = host(&dir, "[deadlines]\nautopilot_agent_seconds = 0.05\n");
+        let host = host(&dir, deadline_policy(0.05));
         assert_eq!(run_main(&argv(&["--once"]), &host), 0);
         let specs = host.specs.lock().unwrap();
         let deadlines = specs[0].deadlines.clone().unwrap();
@@ -2627,7 +2738,7 @@ mod tests {
             Some(DEFAULT_AUTOPILOT_AGENT_SECONDS)
         );
         // The zero opt-out reaches the seam as the unbounded ceiling.
-        let host = host_with(&dir, "[deadlines]\nautopilot_agent_seconds = 0\n");
+        let host = host_with(&dir, deadline_policy(0.0));
         assert_eq!(run_main(&argv(&["--once"]), &host), 0);
         let specs = host.specs.lock().unwrap();
         let deadlines = specs[0].deadlines.clone().unwrap();
@@ -2637,7 +2748,7 @@ mod tests {
     #[test]
     fn once_threads_the_cycle_cost_controls_to_the_pass() {
         let dir = TempDir::new().unwrap();
-        let host = host(&dir, "");
+        let host = host(&dir, dir_policy());
         assert_eq!(run_main(&argv(&["--once"]), &host), 0);
         {
             let specs = host.specs.lock().unwrap();
@@ -2654,7 +2765,11 @@ mod tests {
         }
         let host = host_with(
             &dir,
-            "[autopilot]\nauthoring_concurrency = 1\ndiscovery_cache_ttl_seconds = 0\n",
+            WorkPolicy {
+                autopilot_authoring_concurrency: 1,
+                autopilot_discovery_cache_ttl_seconds: 0.0,
+                ..dir_policy()
+            },
         );
         assert_eq!(run_main(&argv(&["--once"]), &host), 0);
         let specs = host.specs.lock().unwrap();
@@ -2711,8 +2826,16 @@ mod tests {
         );
     }
 
-    fn host_with(dir: &TempDir, policy_body: &str) -> FakeHost {
-        host(dir, policy_body)
+    fn host_with(dir: &TempDir, policy: WorkPolicy) -> FakeHost {
+        host(dir, policy)
+    }
+
+    /// [`dir_policy`] with the autopilot agent deadline at `seconds` (0:
+    /// the unbounded opt-out).
+    fn deadline_policy(seconds: f64) -> WorkPolicy {
+        let mut policy = dir_policy();
+        policy.deadlines.autopilot_agent_seconds = (seconds > 0.0).then_some(seconds);
+        policy
     }
 
     #[test]
@@ -2738,7 +2861,7 @@ mod tests {
     #[test]
     fn daemon_uses_the_store_backed_actionable_depth_probe() {
         let dir = TempDir::new().unwrap();
-        let host = host(&dir, "").with_depth_store(Arc::new(InMemoryStore::new()));
+        let host = host(&dir, dir_policy()).with_depth_store(Arc::new(InMemoryStore::new()));
         assert_eq!(run_main(&argv(&["--once"]), &host), 0);
         assert_eq!(*host.probed.lock().unwrap(), vec![Some(0)]);
     }
@@ -2750,7 +2873,7 @@ mod tests {
             .map(|_| Err(boom("cycle blew up")))
             .collect();
         let activity = dir.path().join("act.json");
-        let host = host(&dir, "").script(outcomes);
+        let host = host(&dir, dir_policy()).script(outcomes);
         let code = run_main(
             &argv(&[
                 "--interval",
@@ -2797,7 +2920,7 @@ mod tests {
     #[test]
     fn daemon_permanent_fault_exits_non_zero_after_one_cycle() {
         let dir = TempDir::new().unwrap();
-        let host = host(&dir, "").script(vec![Err(orchestrator_schema_fault())]);
+        let host = host(&dir, dir_policy()).script(vec![Err(orchestrator_schema_fault())]);
         let activity = dir.path().join("act.json");
         let code = run_main(
             &argv(&["--activity-file", activity.to_str().unwrap()]),
@@ -2824,7 +2947,7 @@ mod tests {
     fn daemon_stops_on_the_armed_signal_after_the_current_cycle() {
         let dir = TempDir::new().unwrap();
         let activity = dir.path().join("logs").join("act.json");
-        let host = host(&dir, "").stop_after(2);
+        let host = host(&dir, dir_policy()).stop_after(2);
         let code = run_main(
             &argv(&[
                 "--interval",
@@ -2895,7 +3018,7 @@ mod tests {
         let activity = dir.path().join("logs").join("act.json");
         let marker = crate::autopilot_activity::pause_marker_path(&activity);
         let file = activity.to_str().unwrap();
-        let host = host(&dir, "");
+        let host = host(&dir, dir_policy());
         assert_eq!(
             run_main(&argv(&["--pause", "--activity-file", file]), &host),
             0
@@ -3003,7 +3126,7 @@ mod tests {
     fn daemon_backs_off_a_never_progressing_repo_and_stops() {
         let dir = TempDir::new().unwrap();
         let claims = Arc::new(InMemoryClaimStore::new());
-        let host = host(&dir, "").with_claims(claims.clone()).script(vec![
+        let host = host(&dir, dir_policy()).with_claims(claims.clone()).script(vec![
             Ok(idle("idle 1")),
             Ok(idle("idle 2")),
             Ok(idle("idle 3")),
@@ -3038,7 +3161,7 @@ mod tests {
     #[test]
     fn daemon_default_activity_path_lands_under_the_repo_logs() {
         let dir = TempDir::new().unwrap();
-        let host = host(&dir, "").stop_after(1);
+        let host = host(&dir, dir_policy()).stop_after(1);
         assert_eq!(run_main(&[], &host), 0);
         let expected = dir
             .path()

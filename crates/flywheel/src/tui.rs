@@ -46,7 +46,7 @@ use flywheel_orchestrator::github::register_github_sources;
 use flywheel_orchestrator::history::{HistoryQuery, build_task_phase_index, collect_history_rows};
 use flywheel_orchestrator::home::ProjectPaths;
 use flywheel_orchestrator::policy::ProjectBinding;
-use flywheel_orchestrator::policy::{DEFAULT_TASKS_DIR, WorkPolicy};
+use flywheel_orchestrator::policy::WorkPolicy;
 use flywheel_orchestrator::source_registry::{SourceBuildContext, default_registry};
 use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkSource};
 use flywheel_orchestrator::store_factory::{
@@ -54,7 +54,7 @@ use flywheel_orchestrator::store_factory::{
 };
 use flywheel_orchestrator::store_registry::{Environ, SqliteCoreOpener, StoreRegistries};
 use flywheel_orchestrator::workflow::{
-    Access, load_effective_policy, load_policy_file, repo_root_for, store_config_for,
+    Access, load_effective_policy, repo_root_for, store_config_for,
     store_partition,
 };
 use flywheel_worktree::phase::{ArchiveOptions, archive_completed_phases};
@@ -446,16 +446,12 @@ impl InputBar {
              the console; --json (or a non-TTY stdout) prints one snapshot and exits."
 )]
 pub struct TuiArgs {
-    /// Store path. Defaults to the policy's [paths] db (else the
-    /// project's flywheel.sqlite under $FLYWHEEL_HOME). Matches fw status.
+    /// Store path. Defaults to the project's flywheel.sqlite under
+    /// $FLYWHEEL_HOME. Matches fw status.
     #[arg(long)]
     pub db: Option<String>,
-    /// Work-policy file selecting the work source (default: flywheel.toml
-    /// if present).
-    #[arg(long)]
-    pub policy: Option<String>,
     /// Tasks root directory for the summary's task-state counts and
-    /// /archive (default: policy source, else .flywheel/tasks).
+    /// /archive (default: the project's tasks dir under $FLYWHEEL_HOME).
     #[arg(long = "tasks-dir")]
     pub tasks_dir: Option<String>,
     /// Print one JSON snapshot of the dashboard data and exit. Implied
@@ -466,8 +462,7 @@ pub struct TuiArgs {
     #[arg(long = "poll-interval", default_value_t = DEFAULT_POLL_INTERVAL_SECONDS)]
     pub poll_interval: f64,
     /// Agent model id forwarded to the spawned worker as --model. Overrides
-    /// the [agent] model setting in flywheel.toml; absent both, the SDK
-    /// uses the Claude Code default.
+    /// the `model` config key; absent both, the agent CLI's own default.
     #[arg(long)]
     pub model: Option<String>,
     /// Skip spawning a supervised worker on console launch. The status bar
@@ -481,7 +476,6 @@ impl Default for TuiArgs {
     fn default() -> Self {
         Self {
             db: None,
-            policy: None,
             tasks_dir: None,
             json: false,
             poll_interval: DEFAULT_POLL_INTERVAL_SECONDS,
@@ -549,11 +543,9 @@ pub fn resolve_archive_tasks_dir(
     if let Some(dir) = tasks_dir_arg.filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
-    match policy {
-        None => Some(PathBuf::from(DEFAULT_TASKS_DIR)),
-        Some(p) if p.source_kind == "directory" => p.tasks_dir.clone(),
-        Some(_) => None,
-    }
+    policy
+        .filter(|p| p.source_kind == "directory")
+        .and_then(|p| p.tasks_dir.clone())
 }
 
 /// The repo root a tasks dir belongs to: the parent of the enclosing
@@ -642,13 +634,13 @@ pub fn resolve_work_source(
         return Ok(cached_directory(PathBuf::from(dir)));
     }
     let Some(policy) = policy else {
-        return Ok(cached_directory(PathBuf::from(DEFAULT_TASKS_DIR)));
+        return Err("no tasks dir: pass --tasks-dir, or run inside a git repo".to_owned());
     };
     if policy.source_kind == "directory" {
         let dir = policy
             .tasks_dir
             .clone()
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_TASKS_DIR));
+            .ok_or_else(|| "the directory source names no tasks dir".to_owned())?;
         return Ok(cached_directory(dir));
     }
     let context = SourceBuildContext::new(source_settings_for_policy(policy))
@@ -713,8 +705,7 @@ pub fn open_store_bundle(
 /// The missing-sqlite-store message (exit 2) with the `fw init` remedy.
 pub fn missing_store_message(db_path: &Path) -> String {
     format!(
-        "fw: no store found at {}\n  run 'fw init' to scaffold .flywheel/ and the work policy, \
-         then start the orchestrator to populate the store.",
+        "fw: no store found at {}\n  run 'fw worker' (or drop the explicit --db) to create it.",
         db_path.display()
     )
 }
@@ -773,10 +764,9 @@ pub fn main_with(argv: &[String], daemons: Option<DaemonFactory>) -> i32 {
         }
     };
     // Explicit --db and --tasks-dir name every path the console reads, so
-    // only a policy file is consulted; otherwise the home project supplies
-    // the defaults.
+    // no project is resolved; otherwise the home project supplies the
+    // defaults.
     let given = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
-    let policy_path = args.policy.as_deref().map(Path::new);
     // The console archives phases (running the phase-exit verify) and
     // starts workers, so it needs a trusted `.flywheel.toml` (prompting on
     // the terminal); a JSON snapshot only reads.
@@ -787,9 +777,9 @@ pub fn main_with(argv: &[String], daemons: Option<DaemonFactory>) -> i32 {
         Access::Execute
     };
     let loaded = if given(&args.db) && given(&args.tasks_dir) {
-        load_policy_file(policy_path)
+        Ok(None)
     } else {
-        load_effective_policy(policy_path, access)
+        load_effective_policy(access)
     };
     let policy = match loaded {
         Ok(policy) => policy,
@@ -975,7 +965,6 @@ pub fn build_dashboard(
             repo_root: Some(&repo_root),
             phase_verify: phase_verify.as_deref(),
             landing_base: Some(&landing_base),
-            true_base: Some(&landing_base),
             claims: Some(archive_bundle.claims.as_ref()),
             ..ArchiveOptions::default()
         };
@@ -1329,8 +1318,6 @@ mod tests {
         let argv: Vec<String> = [
             "--db",
             "x.sqlite",
-            "--policy",
-            "p.toml",
             "--tasks-dir",
             "t",
             "--json",
@@ -1345,7 +1332,7 @@ mod tests {
         .collect();
         let args = parse_args(&argv).unwrap();
         assert_eq!(args.db.as_deref(), Some("x.sqlite"));
-        assert_eq!(args.policy.as_deref(), Some("p.toml"));
+        assert!(parse_args(&["--policy".to_owned(), "p.toml".to_owned()]).is_err());
         assert_eq!(args.tasks_dir.as_deref(), Some("t"));
         assert!(args.json);
         assert_eq!(args.poll_interval, 0.5);
@@ -1421,10 +1408,7 @@ mod tests {
             Some(tasks.clone())
         );
         assert_eq!(resolve_tasks_dir_for_worker(None, None), None);
-        assert_eq!(
-            resolve_archive_tasks_dir(None, None),
-            Some(PathBuf::from(DEFAULT_TASKS_DIR))
-        );
+        assert_eq!(resolve_archive_tasks_dir(None, None), None);
         assert_eq!(resolve_archive_tasks_dir(None, Some(&policy)), Some(tasks));
         let tracker = WorkPolicy {
             source_kind: "github".to_owned(),
@@ -1471,17 +1455,14 @@ mod tests {
         let directory =
             resolve_work_source(None, Some(&directory_policy(dir.path(), None))).unwrap();
         assert_eq!(directory.source_kind(), "directory");
-        assert_eq!(
-            resolve_work_source(None, None).unwrap().source_kind(),
-            "directory"
-        );
+        assert!(resolve_work_source(None, None).is_err());
     }
 
     #[test]
     fn messages_name_remedies() {
         let msg = missing_store_message(Path::new("/tmp/absent.sqlite"));
         assert!(msg.starts_with("fw: no store found at /tmp/absent.sqlite"));
-        assert!(msg.contains("fw init"));
+        assert!(msg.contains("fw worker"));
         let dsn = missing_dsn_message();
         assert!(dsn.contains("FLYWHEEL_PG_DSN"));
         assert!(dsn.contains("DATABASE_URL"));
@@ -1515,29 +1496,6 @@ mod tests {
             dir.path().join("tasks").display().to_string(),
         ];
         assert_eq!(main(&argv), 0);
-    }
-
-    #[test]
-    fn main_postgres_backend_without_dsn_exits_2() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = dir.path().join("flywheel.toml");
-        std::fs::write(
-            &policy,
-            "[source]\nkind = \"directory\"\n[store]\nbackend = \"postgres\"\n",
-        )
-        .unwrap();
-        // The check reads the process environment; both DSN variables are
-        // unset in the test environment unless the operator exported one.
-        if std::env::var_os(PG_DSN_ENV).is_some() || std::env::var_os(PG_DSN_FALLBACK_ENV).is_some()
-        {
-            return;
-        }
-        let argv = vec![
-            "--policy".to_owned(),
-            policy.display().to_string(),
-            "--json".to_owned(),
-        ];
-        assert_eq!(main(&argv), 2);
     }
 
     #[test]

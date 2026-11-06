@@ -809,7 +809,7 @@ pub fn run_main(argv: &[String], host: &dyn SupervisedHost) -> i32 {
     let activity_path = match args.activity_file.as_deref().filter(|p| !p.is_empty()) {
         Some(path) => PathBuf::from(path),
         None => {
-            match crate::workflow::load_effective_policy(None, crate::config::Access::Execute) {
+            match crate::workflow::load_effective_policy(crate::config::Access::Execute) {
                 Ok(policy) => crate::autopilot_run::autopilot_log_dir(policy.as_ref(), &repo_root)
                     .join("activity.json"),
                 Err(err) => {

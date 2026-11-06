@@ -919,7 +919,6 @@ mod tests {
             let args = ResolveArgs {
                 task_id: "zz".into(),
                 reason: reason.into(),
-                policy: None,
                 db: None,
             };
             let (mut out, mut err) = (Vec::new(), Vec::new());

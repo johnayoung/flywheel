@@ -4,14 +4,14 @@
 //! never fail: housekeeping cannot escape into the run loop, so every
 //! unremovable file or directory is skipped, not raised.
 //!
-//! * [`sweep_run_logs`] holds `.flywheel/logs/runs/` at or under a cap by
+//! * [`sweep_run_logs`] holds the project's `logs/runs/` at or under a cap by
 //!   reclaiming the oldest per-run telemetry files (`docs/cli.md`,
 //!   `--run-log-retention`).
 //! * [`retention_sweep`] removes parked worktrees older than the window and
 //!   their `flywheel/<phase>/<task-id>` branches (`docs/sandbox.md`,
-//!   `[sandbox.retention] sweep_days` / `--worktree-retention-days`).
+//!   `--worktree-retention-days`).
 //!   [`retention_cadence_tick`] runs it once per daemon cycle against a fresh
-//!   clock reading; [`retention_targets`] lists the roots one pass covers.
+//!   clock reading.
 //!
 //! The daemon (`crate::daemon`) drives these; nothing here knows about
 //! policies or the store.
@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const DEFAULT_RETENTION_DAYS: u64 = 7;
 
 /// Default cap on per-run telemetry JSONL files kept under
-/// `.flywheel/logs/runs/` (`--run-log-retention`). The harness's sink writes
+/// the project's `logs/runs/` (`--run-log-retention`). The harness's sink writes
 /// one `<run_id>.jsonl` per run and never rotates them, so without an active
 /// bound the directory grows without limit. The worker reclaims the oldest
 /// files past this cap each cycle; the most-recent runs (including the one
@@ -163,27 +163,6 @@ pub fn retention_sweep(
             let _ = git(repo_root, &["branch", "-D", branch]);
         }
     }
-}
-
-/// The worktree roots one retention pass covers.
-///
-/// Always the active root; additionally the legacy hardcoded
-/// `.flywheel/worktrees` while it still exists on disk. `[paths]
-/// sandbox_root` used to be silently ignored on this path, so a repo that
-/// pinned it has in-flight/parked worktrees at the legacy location the
-/// moment the knob became live -- those must keep aging out of the same
-/// retention window instead of stranding forever.
-pub fn retention_targets(repo_root: &Path, worktrees_dir: &Path) -> Vec<PathBuf> {
-    let mut targets = vec![worktrees_dir.to_path_buf()];
-    let legacy = repo_root.join(".flywheel").join("worktrees");
-    let distinct = match (fs::canonicalize(&legacy), fs::canonicalize(worktrees_dir)) {
-        (Ok(a), Ok(b)) => a != b,
-        _ => true,
-    };
-    if distinct && legacy.is_dir() {
-        targets.push(legacy);
-    }
-    targets
 }
 
 /// Run one [`retention_sweep`] pass, reading the clock fresh.
@@ -569,61 +548,4 @@ mod tests {
         );
     }
 
-    // --- retention targets ---------------------------------------------------------------
-
-    #[test]
-    fn retention_targets_single_when_root_is_the_legacy_default() {
-        let (_dir, repo) = repo();
-        let worktrees = worktrees_dir(&repo);
-        assert_eq!(retention_targets(&repo, &worktrees), vec![worktrees]);
-    }
-
-    #[test]
-    fn retention_targets_include_populated_legacy_location() {
-        let (dir, repo) = repo();
-        let legacy = worktrees_dir(&repo);
-        let relocated = dir.path().join("elsewhere").join("worktrees");
-        fs::create_dir_all(&relocated).unwrap();
-        assert_eq!(
-            retention_targets(&repo, &relocated),
-            vec![relocated, legacy]
-        );
-    }
-
-    #[test]
-    fn retention_targets_skip_absent_legacy_location() {
-        let (dir, repo) = repo();
-        let relocated = dir.path().join("elsewhere").join("worktrees");
-        fs::create_dir_all(&relocated).unwrap();
-        assert_eq!(retention_targets(&repo, &relocated), vec![relocated]);
-    }
-
-    #[test]
-    fn retention_targets_dedupe_a_symlinked_legacy_root() {
-        // The active root reached through a symlink to the legacy dir is
-        // the same directory: it is swept once, not twice.
-        let (dir, repo) = repo();
-        let legacy = worktrees_dir(&repo);
-        let link = dir.path().join("link");
-        std::os::unix::fs::symlink(&legacy, &link).unwrap();
-        assert_eq!(retention_targets(&repo, &link), vec![link]);
-    }
-
-    #[test]
-    fn sweep_reclaims_aged_legacy_worktree_after_relocation() {
-        let (dir, repo) = repo();
-        let legacy = worktrees_dir(&repo);
-        let relocated = dir.path().join("elsewhere").join("worktrees");
-        fs::create_dir_all(&relocated).unwrap();
-        let stranded = add_worktree(&repo, &legacy, "stranded");
-        let now = 1_000_000_000.0;
-        set_mtime(&stranded, now - (WINDOW + DAY));
-
-        for target in retention_targets(&repo, &relocated) {
-            retention_cadence_tick(&repo, &target, RETENTION_DAYS, &quiet, &|| now);
-        }
-
-        assert!(!stranded.exists());
-        assert!(!branch_exists(&repo, "flywheel/_root/stranded"));
-    }
 }

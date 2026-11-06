@@ -189,9 +189,7 @@ pub fn maybe_wrap_for_backend(
 mod tests {
     use super::*;
     use crate::docker::default_management_timeout;
-    use flywheel_orchestrator::policy::load_policy_str;
     use flywheel_orchestrator::strategy::{InvokeFn, PlainDirectoryStrategy};
-    use std::path::Path;
 
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -317,31 +315,30 @@ mod tests {
 
     // --- policy bridge -----------------------------------------------------------------
 
-    fn policy(text: &str) -> WorkPolicy {
-        let text = format!("[source]\nkind = \"directory\"\n{text}");
-        load_policy_str(&text, Path::new("/tmp/flywheel.toml")).unwrap()
+    /// The container backend as `fw worker --sandbox container --image
+    /// flywheel-agent:latest` selects it, with the internal network and
+    /// deadline parameters set off their defaults to prove they thread.
+    fn container_policy() -> WorkPolicy {
+        let mut policy = WorkPolicy::default();
+        policy.deadlines.docker_management_seconds = Some(7.5);
+        policy.sandbox.backend = "container".into();
+        policy.sandbox.container.image = "flywheel-agent:latest".into();
+        policy.sandbox.container.auth = "oauth".into();
+        policy.sandbox.container.exec_timeout = 0;
+        policy.sandbox.network.policy = "deny".into();
+        policy.sandbox.network.allow_hosts = vec!["api.github.com".into()];
+        policy
     }
 
-    const CONTAINER_POLICY: &str = r#"
-[sandbox]
-backend = "container"
-
-[sandbox.container]
-image = "flywheel-agent:latest"
-auth = "oauth"
-exec_timeout = 0
-
-[sandbox.network]
-policy = "deny"
-allow_hosts = ["api.github.com"]
-
-[deadlines]
-docker_management_seconds = 7.5
-"#;
+    fn with_auth(auth: &str) -> WorkPolicy {
+        let mut policy = container_policy();
+        policy.sandbox.container.auth = auth.into();
+        policy
+    }
 
     #[test]
     fn container_backend_resolves_from_policy() {
-        let p = policy(CONTAINER_POLICY);
+        let p = container_policy();
         let cfg = container_config_from_policy(
             &p,
             Some("claude-sonnet-4-6"),
@@ -362,10 +359,8 @@ docker_management_seconds = 7.5
 
     #[test]
     fn container_model_in_policy_wins_over_fallback() {
-        let p = policy(&CONTAINER_POLICY.replace(
-            "auth = \"oauth\"",
-            "auth = \"none\"\nmodel = \"claude-opus-4-8\"",
-        ));
+        let mut p = with_auth("none");
+        p.sandbox.container.model = "claude-opus-4-8".into();
         let cfg = container_config_from_policy(&p, Some("fallback"), &BTreeMap::new())
             .unwrap()
             .unwrap();
@@ -375,7 +370,7 @@ docker_management_seconds = 7.5
 
     #[test]
     fn missing_model_is_an_error() {
-        let p = policy(&CONTAINER_POLICY.replace("auth = \"oauth\"", "auth = \"none\""));
+        let p = with_auth("none");
         assert_eq!(
             container_config_from_policy(&p, None, &BTreeMap::new()).unwrap_err(),
             ConfigError::MissingModel
@@ -384,14 +379,14 @@ docker_management_seconds = 7.5
 
     #[test]
     fn missing_token_surfaces_through_the_bridge() {
-        let p = policy(CONTAINER_POLICY);
+        let p = container_policy();
         let err = container_config_from_policy(&p, Some("m"), &BTreeMap::new()).unwrap_err();
         assert!(matches!(err, ConfigError::MissingToken { .. }));
     }
 
     #[test]
     fn worktree_backend_resolves_to_none_and_wraps_nothing() {
-        let p = policy("[sandbox]\nbackend = \"worktree\"\n");
+        let p = WorkPolicy::default();
         assert!(
             container_config_from_policy(&p, Some("m"), &BTreeMap::new())
                 .unwrap()
@@ -422,7 +417,7 @@ docker_management_seconds = 7.5
 
     #[test]
     fn container_backend_wraps_inner_and_logs_selection() {
-        let p = policy(CONTAINER_POLICY);
+        let p = container_policy();
         let inner: Arc<dyn SubmitStrategy> = Arc::new(PlainDirectoryStrategy::new("/tmp/x"));
         let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let sink = Arc::clone(&lines);
@@ -449,7 +444,7 @@ docker_management_seconds = 7.5
         // The bridge never threads the process env into the container, so a
         // host ANTHROPIC_API_KEY does not conflict; an explicit container env
         // carrying it does.
-        let p = policy(CONTAINER_POLICY);
+        let p = container_policy();
         let host_env = env(&[(OAUTH_TOKEN_ENV, "tok"), (API_KEY_ENV, "sk-host")]);
         let cfg = container_config_from_policy(&p, Some("m"), &host_env)
             .unwrap()

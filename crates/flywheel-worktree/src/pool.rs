@@ -1127,9 +1127,7 @@ pub fn pool_member_argv(
         .into_iter()
         .map(str::to_owned),
     );
-    if let Some(policy) = &args.policy {
-        argv.extend(["--policy".to_owned(), policy.clone()]);
-    }
+    argv.extend(args.run.to_argv());
     if let Some(tasks_dir) = &args.tasks_dir {
         argv.extend(["--tasks-dir".to_owned(), tasks_dir.clone()]);
     }
@@ -1818,13 +1816,26 @@ mod tests {
             run_log_retention: 42,
             tasks_dir: Some("/tmp/tasks".into()),
             db: Some("/tmp/db.sqlite".into()),
-            sandbox_root: Some("@cache".into()),
-            policy: Some("/tmp/flywheel.toml".into()),
+            sandbox_root: Some("/tmp/boxes".into()),
+            run: flywheel_orchestrator::policy::RunFlags {
+                source: Some("github".into()),
+                repo: Some("o/r".into()),
+                sandbox: Some("container".into()),
+                image: Some("img".into()),
+                ..Default::default()
+            },
             once: true,
             ..full_args()
         };
         let argv = pool_member_argv(&program(), &args, &[], "fleet-0", Some("sonnet"));
-        assert_eq!(value_after(&argv, "--policy"), "/tmp/flywheel.toml");
+        for flag in [
+            "--source=github",
+            "--repo=o/r",
+            "--sandbox=container",
+            "--image=img",
+        ] {
+            assert!(argv.iter().any(|a| a == flag), "{flag} missing: {argv:?}");
+        }
         assert_eq!(value_after(&argv, "--max-turns"), "9");
         assert_eq!(value_after(&argv, "--max-retries"), "2");
         assert_eq!(value_after(&argv, "--lease-seconds"), "120.0");
@@ -1835,7 +1846,7 @@ mod tests {
         assert_eq!(value_after(&argv, "--worktree-retention-days"), "7");
         assert_eq!(value_after(&argv, "--tasks-dir"), "/tmp/tasks");
         assert_eq!(value_after(&argv, "--db"), "/tmp/db.sqlite");
-        assert_eq!(value_after(&argv, "--sandbox-root"), "@cache");
+        assert_eq!(value_after(&argv, "--sandbox-root"), "/tmp/boxes");
         assert_eq!(value_after(&argv, "--model"), "sonnet");
         assert!(argv.iter().any(|a| a == "--once"));
         // The member argv round-trips through the worker parser.

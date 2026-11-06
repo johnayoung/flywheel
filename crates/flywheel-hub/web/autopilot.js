@@ -6,7 +6,7 @@
 // deny -- each confirmed, each the CLI's own code path on the server
 // (`fw autopilot` in a hub session, its pause marker, `fw approve` /
 // `fw reject` pinned to the gate shown; one decision per gate until a
-// worker applies it). The held-out gate, risk tiers
+// worker applies it). The held-out gate
 // and team-mode reviews are shown, never decided here. Another machine's
 // folders are read-only. flywheel.js renders what this returns; protocol:
 // POST /api/flywheel/autopilot/{start,stop,pause,resume,decide}.
@@ -59,7 +59,6 @@ window.FwHubAutopilot = function (ctx) {
     const out = [`submit ${config.submit_strategy || "merge"}`];
     if (config.submit_verify) out.push("submit verify");
     if (config.held_out) out.push("held-out gate");
-    if (config.risk_tiers && config.risk_tiers.length) out.push(`risk tiers ${config.risk_tiers.join("/")}`);
     if (config.team_mode) out.push("team mode: GitHub reviews");
     return out;
   }

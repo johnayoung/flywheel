@@ -38,7 +38,7 @@ pub fn sandbox_agent_primitives(
     let cap = &sandbox.capabilities;
     AgentPrimitives {
         agent_id: policy.and_then(|p| p.agent_id.clone()),
-        agent_transport: policy.and_then(|p| p.agent_transport.clone()),
+        agent_transport: None,
         permission_mode: sandbox.permission_mode.clone(),
         skills: cap.skills.clone(),
         allowed_tools: cap.allowed_tools.clone(),

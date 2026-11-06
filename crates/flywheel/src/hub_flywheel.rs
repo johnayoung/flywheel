@@ -7,10 +7,14 @@
 //! lives in this crate, which sits above the hub; the hub only defines the
 //! seam and plain data, so it never compiles the store backends.
 //!
-//! Per folder: the folder's own `flywheel.toml` (never the process's
-//! working directory -- one hub serves many repos) with its relative
-//! paths anchored at the folder; the stores it selects, opened once and
-//! kept; the work listing behind the console's fingerprint cache. Then:
+//! Per folder: the folder's home project (never the process's working
+//! directory -- one hub serves many repos): a folder whose git repo
+//! carries a project id flywheel already knows ([`known_project`]) is
+//! shown, resolved exactly as `fw status` there resolves it (store, tasks,
+//! and logs under `$FLYWHEEL_HOME/projects/<id>/`, the effective config
+//! applied, an untrusted `.flywheel.toml` ignored); the stores it selects,
+//! opened once and kept; the work listing behind the console's
+//! fingerprint cache. Then:
 //!
 //! * tasks and alerts: `fw status --json` itself ([`cmd_status`]), so a
 //!   strand, stop, or failure reads exactly as the CLI reports it;
@@ -27,9 +31,9 @@
 //! does). A missing SQLite store is never created: the panel lists the
 //! tasks as pending against an empty in-memory store instead.
 //!
-//! Postgres: like every `fw` verb, the DSN comes from the environment
-//! (`FLYWHEEL_PG_DSN` / `DATABASE_URL`) -- here the hub process's, the same
-//! for every folder (flywheel.toml never carries one). The store label
+//! Postgres: like every `fw` verb, the DSN comes from the effective config
+//! (`store = "postgres://..."`) or the environment (`FLYWHEEL_PG_DSN` /
+//! `DATABASE_URL`) -- here the hub process's. The store label
 //! names the database read (`postgres host:port/db`, no credentials) so a
 //! folder read from the wrong one shows it. A failed read drops the
 //! connection; the next read reconnects.
@@ -37,7 +41,7 @@
 use crate::session::TranscriptTailer;
 use crate::session_screen::is_error_entry;
 use crate::snapshot::{CachedWorkSource, collect_live_rows, directory_fingerprint};
-use crate::tui::{DEFAULT_STORE_PATH, open_store_bundle, process_environ};
+use crate::tui::{open_store_bundle, process_environ};
 use chrono::{DateTime, Utc};
 use flywheel_core::audit::run_file_path;
 use flywheel_core::lifecycle::{Lifecycle, Status};
@@ -56,17 +60,17 @@ use flywheel_orchestrator::autopilot_activity::{
 };
 use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore, REASON_AWAITING_APPROVAL};
 use flywheel_orchestrator::config::{REPO_CONFIG_FILENAME, read_repo_file};
-use flywheel_orchestrator::home::{Home, ProjectError, stored_project_id};
+use flywheel_orchestrator::home::{Home, stored_project_id};
 use flywheel_orchestrator::pg_preflight::dsn_target;
-use flywheel_orchestrator::policy::{
-    DEFAULT_POLICY_FILENAME, DEFAULT_TASKS_DIR, WorkPolicy, load_policy,
-};
+use flywheel_orchestrator::config::Access;
+use flywheel_orchestrator::policy::WorkPolicy;
 use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkSource};
 use flywheel_orchestrator::store_factory::{StoreBundle, resolve_postgres_dsn};
 use flywheel_orchestrator::trust;
 use flywheel_orchestrator::workflow::status::format_blocked_on;
 use flywheel_orchestrator::workflow::{
-    CommonArgs, ShowArgs, StatusArgs, cmd_show, cmd_status, resolve_fallback_phases,
+    CommonArgs, ShowArgs, StatusArgs, cmd_show, cmd_status, known_project, project_policy_at,
+    resolve_fallback_phases,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -78,9 +82,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 /// How many recent runs the panel lists.
 pub const RECENT_RUNS: usize = 12;
-/// Where `fw autopilot` keeps its activity record by default (under the
-/// repo root).
-pub const AUTOPILOT_ACTIVITY: &str = ".flywheel/logs/autopilot/activity.json";
+/// The activity record's file name under the project's
+/// `logs/autopilot/` (where `fw autopilot` keeps it).
+pub const AUTOPILOT_ACTIVITY: &str = "activity.json";
 /// Transcript entries kept per open run (older ones are dropped).
 pub const TRANSCRIPT_WINDOW: usize = 5000;
 /// The most transcript entries one answer carries (the newest).
@@ -101,6 +105,9 @@ pub struct HubFlywheel {
     /// (`crate::hub_tasks::write_task`): two promotions never both pass
     /// the "id not defined yet" check.
     task_writes: Mutex<()>,
+    /// The flywheel home projects resolve under; `None` reads
+    /// `$FLYWHEEL_HOME` (default `~/.flywheel`) on each use.
+    home: Option<PathBuf>,
 }
 
 /// A run's transcript kept warm between polls.
@@ -126,6 +133,22 @@ impl HubFlywheel {
             folders: Mutex::new(HashMap::new()),
             transcripts: Mutex::new(VecDeque::new()),
             task_writes: Mutex::new(()),
+            home: None,
+        }
+    }
+
+    /// The same provider resolving projects under the home at `root`
+    /// instead of `$FLYWHEEL_HOME` (tests, embedders).
+    pub fn with_home(mut self, root: impl Into<PathBuf>) -> Self {
+        self.home = Some(root.into());
+        self
+    }
+
+    /// The home projects resolve under.
+    fn home(&self) -> Result<Home, String> {
+        match &self.home {
+            Some(root) => Ok(Home::at(root)),
+            None => Home::from_env().map_err(|e| e.to_string()),
         }
     }
 
@@ -204,7 +227,7 @@ impl HubFlywheel {
     pub(crate) fn task_layout(&self, root: &Path) -> Result<TaskLayout, String> {
         let state = self.folder(root);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-        let resolved = state.resolve(root)?;
+        let resolved = state.resolve(&self.home(), root)?;
         let tasks_dir = resolved.tasks_dir.clone().ok_or_else(|| {
             format!(
                 "tasks come from the {} source in {}: only a directory source takes task \
@@ -238,7 +261,7 @@ impl HubFlywheel {
     fn lifecycles(&self, root: &Path, filter: &LifecycleFilter) -> Result<Vec<Lifecycle>, String> {
         let state = self.folder(root);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-        let resolved = state.resolve(root)?;
+        let resolved = state.resolve(&self.home(), root)?;
         let core = match resolved.stores(root)? {
             Some(bundle) => Arc::clone(&bundle.core),
             None => return Ok(Vec::new()),
@@ -279,15 +302,6 @@ fn stamp(path: &Path) -> Option<(u64, u128)> {
     Some((meta.len(), modified))
 }
 
-/// `path` anchored at `root` when relative.
-fn anchored(root: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    }
-}
-
 /// `path` relative to `root` for display, else as is.
 fn shown(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
@@ -296,12 +310,12 @@ fn shown(root: &Path, path: &Path) -> String {
         .into_owned()
 }
 
-/// What one folder's policy resolves to, plus the stores and listing kept
-/// open across reads.
+/// What one folder's project resolves to, plus the stores and listing
+/// kept open across reads.
 #[derive(Default)]
 struct Folder {
-    /// The `flywheel.toml` stamp `resolved` was read under.
-    policy_stamp: Option<Option<(u64, u128)>>,
+    /// The config stamps `resolved` was read under.
+    config_stamp: Option<u64>,
     resolved: Option<Result<Resolved, String>>,
     /// The main checkout when the folder is a linked git worktree; read
     /// once (`Some(None)`: not one).
@@ -317,6 +331,8 @@ struct Resolved {
     /// `None` for tracker sources (their listing is a network call).
     source: Option<Box<dyn WorkSource>>,
     source_label: String,
+    /// The project's autopilot activity record.
+    activity: PathBuf,
     stores: Option<OpenStores>,
 }
 
@@ -326,6 +342,18 @@ struct OpenStores {
     identity: Option<(u64, u64)>,
 }
 
+/// A hash of every file the folder's effective config is read from (the
+/// repo file, the user config, the project's personal config).
+fn config_stamp(home: &Home, folder: &Path) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    stamp(&folder.join(REPO_CONFIG_FILENAME)).hash(&mut hasher);
+    stamp(&home.config_file()).hash(&mut hasher);
+    if let Some(id) = known_project(home, folder) {
+        stamp(&home.project(&id).config()).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 impl Folder {
     fn worktree_of(&mut self, root: &Path) -> Option<PathBuf> {
         self.worktree_of
@@ -333,63 +361,56 @@ impl Folder {
             .clone()
     }
 
-    /// Re-read the policy when `flywheel.toml` changed (or on first use).
-    fn resolve(&mut self, root: &Path) -> Result<&mut Resolved, String> {
-        let policy_file = root.join(DEFAULT_POLICY_FILENAME);
-        let current = stamp(&policy_file);
-        if self.policy_stamp != Some(current) || self.resolved.is_none() {
-            self.policy_stamp = Some(current);
-            self.resolved = Some(Resolved::read(root, &policy_file, current.is_some()));
+    /// Re-resolve the project when its config changed (or on first use).
+    fn resolve(&mut self, home: &Result<Home, String>, root: &Path) -> Result<&mut Resolved, String> {
+        let home = home.as_ref().map_err(Clone::clone)?;
+        let current = config_stamp(home, root);
+        if self.config_stamp != Some(current) || self.resolved.is_none() {
+            self.config_stamp = Some(current);
+            self.resolved = Some(Resolved::read(home, root));
         }
         match self.resolved.as_mut().expect("just set") {
             Ok(resolved) => Ok(resolved),
             Err(message) => Err(message.clone()),
         }
     }
+
+    /// The project's autopilot activity record, when the folder resolves.
+    fn activity(&mut self, home: &Result<Home, String>, root: &Path) -> Option<PathBuf> {
+        self.resolve(home, root).ok().map(|r| r.activity.clone())
+    }
 }
 
 impl Resolved {
-    fn read(root: &Path, policy_file: &Path, has_policy: bool) -> Result<Self, String> {
-        let mut policy = if has_policy {
-            Some(load_policy(policy_file).map_err(|e| format!("{DEFAULT_POLICY_FILENAME}: {e}"))?)
-        } else {
-            None
-        };
-        if let Some(policy) = &mut policy {
-            policy.db_path = policy.db_path.as_deref().map(|p| anchored(root, p));
-            policy.tasks_dir = policy.tasks_dir.as_deref().map(|p| anchored(root, p));
-        }
-        let db_path = policy
-            .as_ref()
-            .and_then(|p| p.db_path.clone())
-            .unwrap_or_else(|| root.join(DEFAULT_STORE_PATH));
-        let backend = policy
-            .as_ref()
-            .map_or_else(|| "sqlite".to_owned(), |p| p.store_backend.clone());
-        let source_kind = policy
-            .as_ref()
-            .map_or_else(|| "directory".to_owned(), |p| p.source_kind.clone());
-        let (tasks_dir, source, source_label) = if source_kind == "directory" {
-            let dir = policy
-                .as_ref()
-                .and_then(|p| p.tasks_dir.clone())
-                .unwrap_or_else(|| root.join(DEFAULT_TASKS_DIR));
+    fn read(home: &Home, root: &Path) -> Result<Self, String> {
+        let (policy, _warnings) =
+            project_policy_at(home, root, Access::ReadOnly).map_err(|e| e.to_string())?;
+        let project = policy
+            .project
+            .clone()
+            .ok_or_else(|| format!("{} resolves to no project", root.display()))?;
+        let paths = project.paths();
+        let db_path = policy.db_path.clone().unwrap_or_else(|| paths.db());
+        let backend = policy.store_backend.clone();
+        let (tasks_dir, source, source_label) = if policy.source_kind == "directory" {
+            let dir = policy.tasks_dir.clone().unwrap_or_else(|| paths.tasks());
             let source: Box<dyn WorkSource> = Box::new(CachedWorkSource::for_directory(
                 Box::new(DirectoryWorkSource::new(&dir)),
                 dir.clone(),
             ));
-            let label = format!("directory {}", shown(root, &dir));
+            let label = format!("directory {}", dir.display());
             (Some(dir), Some(source), label)
         } else {
-            (None, None, source_kind)
+            (None, None, policy.source_kind.clone())
         };
         Ok(Self {
-            policy,
+            policy: Some(policy),
             db_path,
             backend,
             tasks_dir,
             source,
             source_label,
+            activity: paths.autopilot_logs().join(AUTOPILOT_ACTIVITY),
             stores: None,
         })
     }
@@ -405,9 +426,6 @@ impl Resolved {
         {
             label.push(' ');
             label.push_str(&target);
-        }
-        if let Some(schema) = self.policy.as_ref().and_then(|p| p.store_schema.as_deref()) {
-            label.push_str(&format!(" (schema {schema})"));
         }
         label
     }
@@ -431,11 +449,14 @@ impl Resolved {
             self.stores = None;
         }
         if self.stores.is_none() {
-            if !sqlite && resolve_postgres_dsn(&process_environ()).is_none() {
+            if !sqlite
+                && self.policy.as_ref().and_then(|p| p.store_dsn.as_ref()).is_none()
+                && resolve_postgres_dsn(&process_environ()).is_none()
+            {
                 return Err(format!(
-                    "the store backend is {} but the hub's environment sets neither \
-                     FLYWHEEL_PG_DSN nor DATABASE_URL: start `fw hub serve` from a shell \
-                     that exports the DSN this repo's `fw` verbs use",
+                    "the store backend is {} but no DSN is configured: set `store` in \
+                     $FLYWHEEL_HOME/config.toml, or start `fw hub serve` from a shell that \
+                     exports FLYWHEEL_PG_DSN",
                     self.backend
                 ));
             }
@@ -785,16 +806,21 @@ fn claims_and_worker(
 
 /// The daemon's liveness for the panel's row; `running`: its pid still
 /// runs (false once the intake read found it gone).
-fn autopilot_state(root: &Path, running: bool) -> DaemonState {
-    let path = root.join(AUTOPILOT_ACTIVITY);
-    let Some(activity) = read_activity(Some(&path)) else {
+fn autopilot_state(path: Option<&Path>, running: bool) -> DaemonState {
+    let Some(path) = path else {
+        return DaemonState {
+            live: false,
+            detail: "no activity record (not running here)".into(),
+        };
+    };
+    let Some(activity) = read_activity(Some(path)) else {
         return DaemonState {
             live: false,
             detail: "no activity record (not running here)".into(),
         };
     };
     let now = epoch_now();
-    let held = if is_paused(&path) { ", paused" } else { "" };
+    let held = if is_paused(path) { ", paused" } else { "" };
     if running && activity.phase != PHASE_STOPPED && is_record_live(Some(&activity), now) {
         DaemonState {
             live: true,
@@ -907,7 +933,7 @@ fn cut(body: String) -> String {
 /// the file's sha256), `Err` when the file does not load. Never mints an
 /// id or writes the home.
 fn repo_file_trust(
-    home: Result<Home, ProjectError>,
+    home: Result<Home, String>,
     folder: &Path,
 ) -> Result<Option<UntrustedRepoFile>, String> {
     let repo = match read_repo_file(folder) {
@@ -919,7 +945,8 @@ fn repo_file_trust(
         (Ok(home), Ok(Some(id))) => {
             trust::is_trusted(&home, &id, &repo.sha256).map_err(|e| e.to_string())?
         }
-        (Err(failure), _) | (_, Err(failure)) => return Err(failure.to_string()),
+        (Err(failure), _) => return Err(failure),
+        (_, Err(failure)) => return Err(failure.to_string()),
         (Ok(_), Ok(None)) => false,
     };
     Ok((!trusted).then(|| UntrustedRepoFile {
@@ -928,40 +955,27 @@ fn repo_file_trust(
     }))
 }
 
-/// `--policy=<folder>/flywheel.toml` when the folder carries one: the panel
-/// reads the folder's own policy file, and `fw worker` / `fw autopilot` no
-/// longer auto-detect it, so a launch from the panel names it explicitly to
-/// run against the same tasks and store the panel shows.
-fn legacy_policy_flag(folder: &Path) -> Option<String> {
-    let file = folder.join(DEFAULT_POLICY_FILENAME);
-    file.is_file()
-        .then(|| format!("--policy={}", file.display()))
-}
-
 impl FlywheelProvider for HubFlywheel {
     fn adopted(&self, folder: &Path) -> bool {
-        // A linked git worktree of an adopted repo counts too: flywheel
-        // keeps a store per checkout (`fw worker` and `fw status` resolve
-        // `.flywheel/` under the worktree itself, never the main
-        // checkout's), so its panel reads its own store and says so
-        // (`worktree_of`).
-        folder.join(DEFAULT_POLICY_FILENAME).is_file()
-            || folder.join(".flywheel").is_dir()
-            || folder.join(REPO_CONFIG_FILENAME).is_file()
+        // A git repo flywheel already knows (its project id is recorded and
+        // its project dir exists under $FLYWHEEL_HOME); a linked worktree
+        // maps to its repo's project through the shared git dir, and its
+        // panel says so (`worktree_of`). Nothing in the repo tree marks it.
+        self.home()
+            .is_ok_and(|home| known_project(&home, folder).is_some())
     }
 
     fn fingerprint(&self, folder: &Path) -> u64 {
         let mut hasher = DefaultHasher::new();
-        stamp(&folder.join(DEFAULT_POLICY_FILENAME)).hash(&mut hasher);
-        stamp(&folder.join(AUTOPILOT_ACTIVITY)).hash(&mut hasher);
-        // Trust: an edited repo file or a new approval re-reads the panel.
-        stamp(&folder.join(REPO_CONFIG_FILENAME)).hash(&mut hasher);
-        if let Ok(home) = Home::from_env() {
+        if let Ok(home) = self.home() {
+            config_stamp(&home, folder).hash(&mut hasher);
+            // Trust: a new approval re-reads the panel.
             stamp(&home.trust_file()).hash(&mut hasher);
         }
         let state = self.folder(folder);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Ok(resolved) = state.resolve(folder) {
+        if let Ok(resolved) = state.resolve(&self.home(), folder) {
+            stamp(&resolved.activity).hash(&mut hasher);
             if resolved.backend == "sqlite" {
                 let db = &resolved.db_path;
                 stamp(db).hash(&mut hasher);
@@ -979,16 +993,17 @@ impl FlywheelProvider for HubFlywheel {
     fn panel(&self, folder: &Path) -> FlywheelPanel {
         let now = Utc::now();
         let mut panel = FlywheelPanel::empty(folder.to_path_buf(), now);
-        panel.autopilot = autopilot_state(folder, true);
         let mut trust_problem = None;
-        match repo_file_trust(Home::from_env(), folder) {
+        match repo_file_trust(self.home(), folder) {
             Ok(untrusted) => panel.untrusted = untrusted,
             Err(message) => trust_problem = Some(message),
         }
         let state = self.folder(folder);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
         panel.worktree_of = state.worktree_of(folder);
-        let resolved = match state.resolve(folder) {
+        let activity = state.activity(&self.home(), folder);
+        panel.autopilot = autopilot_state(activity.as_deref(), true);
+        let resolved = match state.resolve(&self.home(), folder) {
             Ok(resolved) => resolved,
             Err(message) => {
                 panel.problem = Some(message);
@@ -1060,7 +1075,7 @@ impl FlywheelProvider for HubFlywheel {
             Err(message) => problems.push(message),
         }
         let intake = crate::hub_autopilot::read_view(
-            folder,
+            activity.as_deref(),
             policy.as_ref(),
             tasks_dir.as_deref(),
             core.as_ref(),
@@ -1069,7 +1084,7 @@ impl FlywheelProvider for HubFlywheel {
         // The record lapses with time, but a daemon that died (or was
         // stopped) on this machine is gone now: the panel says so at once.
         if panel.autopilot.live && !intake.live {
-            panel.autopilot = autopilot_state(folder, false);
+            panel.autopilot = autopilot_state(activity.as_deref(), false);
         }
         panel.intake = Some(intake);
         if problems.len() > opened {
@@ -1087,7 +1102,7 @@ impl FlywheelProvider for HubFlywheel {
     fn run_output(&self, folder: &Path, run_id: &str, since: usize) -> Result<RunOutput, String> {
         let state = self.folder(folder);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-        let resolved = state.resolve(folder)?;
+        let resolved = state.resolve(&self.home(), folder)?;
         let db_path = resolved.db_path.clone();
         let fallback = resolved
             .tasks_dir
@@ -1153,12 +1168,11 @@ impl FlywheelProvider for HubFlywheel {
             .retain(|open| open.root != folder);
     }
 
-    fn worker_command(&self, folder: &Path, scope: &WorkerScope) -> Vec<String> {
+    fn worker_command(&self, _folder: &Path, scope: &WorkerScope) -> Vec<String> {
         let mut argv = vec![
             self.program.to_string_lossy().into_owned(),
             "worker".to_owned(),
         ];
-        argv.extend(legacy_policy_flag(folder));
         argv.extend(scope.flags());
         argv
     }
@@ -1180,17 +1194,20 @@ impl FlywheelProvider for HubFlywheel {
         crate::hub_tasks::task_seed(self, folder, task_id)
     }
 
-    fn autopilot_command(&self, folder: &Path) -> Vec<String> {
-        let mut argv = vec![
+    fn autopilot_command(&self, _folder: &Path) -> Vec<String> {
+        vec![
             self.program.to_string_lossy().into_owned(),
             "autopilot".to_owned(),
-        ];
-        argv.extend(legacy_policy_flag(folder));
-        argv
+        ]
     }
 
     fn set_autopilot_paused(&self, folder: &Path, paused: bool) -> Result<bool, String> {
-        set_paused(&folder.join(AUTOPILOT_ACTIVITY), paused).map_err(|e| {
+        let activity = {
+            let state = self.folder(folder);
+            let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.resolve(&self.home(), folder)?.activity.clone()
+        };
+        set_paused(&activity, paused).map_err(|e| {
             format!(
                 "cannot {} autopilot in {}: {e}",
                 if paused { "pause" } else { "resume" },
@@ -1206,7 +1223,7 @@ impl FlywheelProvider for HubFlywheel {
     ) -> Result<GateDecided, GateRefused> {
         let state = self.folder(folder);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-        let resolved = state.resolve(folder).map_err(GateRefused::Store)?;
+        let resolved = state.resolve(&self.home(), folder).map_err(GateRefused::Store)?;
         let core = match resolved.stores(folder).map_err(GateRefused::Store)? {
             Some(bundle) => Arc::clone(&bundle.core),
             None => {

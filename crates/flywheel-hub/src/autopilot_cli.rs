@@ -347,9 +347,6 @@ fn print_status(out: &mut dyn Write, answer: &Value) {
     if config["held_out"] == true {
         gates.push("held-out gate".into());
     }
-    if list(config, "risk_tiers").iter().any(Value::is_u64) {
-        gates.push(format!("risk tiers {}", tiers(&config["risk_tiers"])));
-    }
     if config["team_mode"] == true {
         gates.push("team mode (GitHub reviews)".into());
     }

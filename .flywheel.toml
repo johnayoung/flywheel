@@ -1,0 +1,2 @@
+verify = "scripts/check.sh"
+protected_paths = [".github/**", ".flywheel.toml", "scripts/**", "CLAUDE.md", ".claude/**"]

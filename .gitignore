@@ -12,12 +12,9 @@ Thumbs.db
 /logs/
 /tmp/
 
-# Flywheel runtime state (also covered by .flywheel/.gitignore)
-.flywheel/worktrees/
-.flywheel/sandboxes/
-.flywheel/logs/
-.flywheel/.merge.lock
-.flywheel/flywheel.sqlite*
+# A leftover pre-home flywheel state dir: no longer read (state lives under
+# $FLYWHEEL_HOME/projects/<id>/); safe to delete, never to commit.
+/.flywheel/
 
 # Claude Code local config (workflows are tracked; the rest is local)
 .claude/*

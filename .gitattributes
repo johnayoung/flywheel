@@ -1,10 +1,8 @@
 # Keep GitHub's language statistics focused on real source code.
 #
-# Runtime/workflow artifacts and lockfiles are data, not source — exclude
-# them from the language bar (and collapse their diffs in PRs). Without this,
-# the hundreds of task JSON files and the lockfile skew the detected language.
+# Lockfiles and phase bookkeeping are data, not source — exclude them from
+# the language bar (and collapse their diffs in PRs).
 
-.flywheel/**            linguist-generated
 Cargo.lock              linguist-generated
 *.loop-base             linguist-generated
 

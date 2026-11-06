@@ -630,6 +630,49 @@
 .cmd-keys kbd { margin: 0 .15rem; }
 @media (hover: none) { .cmd-keys { display: none; } }
 
+/* --- replies (the Commands drawer's Replies view) --------------------------- */
+
+.cmd-tabs { padding: 0 1rem; }
+.reply .cmd-meta { flex-wrap: wrap; }
+.reply-copy { margin-left: auto; padding: .2rem .55rem; font-size: 10.5px; }
+.reply-copy svg { width: .75rem; height: .75rem; }
+.reply-body { padding: .35rem .3rem .5rem; }
+/* Shown as written (line breaks kept); copied exactly by its button. */
+.reply-block {
+  position: relative;
+  padding: .3rem 2.1rem .3rem .5rem;
+  border-left: 2px solid transparent;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.5;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.reply-block:hover, .reply-block:focus-within { border-left-color: var(--signal); background: var(--bg-2); }
+.reply-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.reply-heading { font-weight: 700; white-space: pre-wrap; }
+.reply-block blockquote { margin: 0; padding-left: .6rem; border-left: 2px solid var(--rule-2); color: var(--ink-2); white-space: pre-wrap; }
+.reply-block code { font: 400 12px/1.4 var(--term); }
+.reply-text code, .reply-heading code, .reply-block blockquote code { padding: 0 .2rem; background: var(--bg-2); }
+.reply-code, .reply-table {
+  margin: 0;
+  padding: .5rem .6rem;
+  overflow-x: auto;
+  white-space: pre;
+  tab-size: 8;
+  font: 400 12px/1.45 var(--term);
+  border: 1px solid var(--rule);
+  scrollbar-width: thin;
+}
+.reply-block-copy {
+  position: absolute;
+  top: .25rem;
+  right: .25rem;
+  opacity: 0;
+}
+.reply-block:hover .reply-block-copy, .reply-block-copy:focus-visible { opacity: 1; }
+@media (hover: none) { .reply-block-copy { opacity: .7; } }
+
 /* --- toasts ----------------------------------------------------------------- */
 
 .toasts {

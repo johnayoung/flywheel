@@ -3,7 +3,8 @@
 // or wrapping), with Copy, Send (paste into a shell session, never Enter)
 // and Send + Run. With no shell running where the agent works, "Open shell
 // & send" starts the agent's companion shell (same directory) and pastes
-// once its prompt is up. app-base.js creates it with its helpers; protocol:
+// once its prompt is up. Its Replies view lists the agent's replies whole
+// (replies.js). app-base.js creates it with its helpers; protocol:
 // GET /api/sessions/{id}/commands, POST /api/sessions/{id}/paste,
 // POST /api/sessions/{id}/companion, and the events socket's
 // {"type":"commands"} pushes.
@@ -18,6 +19,7 @@ window.FwHubCommands = function (ctx) {
   const cache = {}; // session id -> commands, newest first
   const ui = {
     open: false,
+    view: "commands", // or "replies" (the agent's replies, replies.js)
     source: null, // session id whose commands are shown (chosen by the user)
     target: null, // session id Send pastes into (chosen by the user)
     all: false, // every block, not only shell commands
@@ -588,6 +590,29 @@ window.FwHubCommands = function (ctx) {
     $("#cmd-toggle").setAttribute("aria-pressed", String(ui.open));
     if (!ui.open) return;
 
+    const replies = ctx.replies();
+    const viewing = ui.view === "replies";
+    $("#cmd-heading").textContent = viewing ? "Replies" : "Commands";
+    $("#commands").setAttribute("aria-label", viewing ? "Agent replies" : "Suggested commands");
+    $("#cmd-tabs").replaceChildren(
+      ...[["commands", "Commands", source ? shown(source).length : 0], ["replies", "Replies", source ? replies.count(source.id) : 0]].map(([key, label, n]) =>
+        el(
+          "button",
+          {
+            type: "button",
+            role: "tab",
+            className: `rv-tab${ui.view === key ? " on" : ""}`,
+            "aria-selected": String(ui.view === key),
+            onclick: () => setView(key),
+          },
+          label,
+          el("span", { className: "rv-n", textContent: String(n) }),
+        )),
+    );
+    for (const node of [$("#cmd-target").closest("label"), $("#cmd-all").closest("label"), $("#cmd-hint")]) node.hidden = viewing;
+    $("#cmd-keys-commands").hidden = viewing;
+    $("#cmd-keys-replies").hidden = !viewing;
+
     const pool = sources();
     const sourcePick = $("#cmd-source");
     sourcePick.replaceChildren(
@@ -596,6 +621,10 @@ window.FwHubCommands = function (ctx) {
         : [el("option", { value: "", textContent: "no agent sessions" })]),
     );
     sourcePick.disabled = pool.length < 2 || isAgent(attachedSession());
+    if (viewing) {
+      replies.render($("#cmd-list"), source);
+      return;
+    }
     const target = currentTarget(source);
     const targetPool = targets(source);
     const targetPick = $("#cmd-target");
@@ -738,6 +767,7 @@ window.FwHubCommands = function (ctx) {
       if (card) ui.focusPending = false;
       const source = currentSource();
       if (source) load(source.id);
+      if (source && ui.view === "replies") ctx.replies().load(source.id).catch(() => {});
     } else {
       ui.focusPending = false;
       renderDrawer();
@@ -747,10 +777,36 @@ window.FwHubCommands = function (ctx) {
 
   const toggle = () => setOpen(!ui.open);
 
+  function setView(view) {
+    ui.view = view;
+    const source = currentSource();
+    if (source && view === "replies") ctx.replies().load(source.id).catch(() => {});
+    renderDrawer();
+    $("#cmd-list").scrollTop = 0;
+  }
+
+  // Open the drawer on the Replies view (of session `id`'s agent, or the
+  // drawer's own pick).
+  function openReplies(id) {
+    const agent = id ? ctx.replies().agentOf(sessionById(id)) : null;
+    if (agent) ui.source = agent.id;
+    ui.view = "replies";
+    if (ui.open) setView("replies");
+    else setOpen(true);
+  }
+
+  // `id`'s replies changed (replies.js): redraw when they are shown.
+  function repliesChanged(id) {
+    if (!ui.open || ui.view !== "replies") return;
+    const source = currentSource();
+    if (source && source.id === id) renderDrawer();
+  }
+
   // Open the drawer on session `id`'s block `seq` (a search hit; `all`:
   // it is not a shell block, so every block is listed).
   function openAt(id, seq, all) {
     ui.source = id;
+    ui.view = "commands";
     if (all) ui.all = true;
     ui.wanted = seq;
     if (ui.open) {
@@ -764,6 +820,7 @@ window.FwHubCommands = function (ctx) {
   $("#cmd-source").addEventListener("change", (event) => {
     ui.source = event.target.value || null;
     if (ui.source) load(ui.source);
+    if (ui.source && ui.view === "replies") ctx.replies().load(ui.source).catch(() => {});
     renderDrawer();
   });
   $("#cmd-target").addEventListener("change", (event) => {
@@ -796,6 +853,11 @@ window.FwHubCommands = function (ctx) {
     }
     const field = event.target.closest("select, input, textarea");
     if (field) return;
+    if (ui.view === "replies") {
+      // 1-9 copy the nth reply; buttons keep Enter and Space.
+      if (/^[1-9]$/.test(event.key) && ctx.replies().copyNth(currentSource(), Number(event.key))) done();
+      return;
+    }
     const onButton = !!event.target.closest("button");
     const command = selectedCommand();
     const source = currentSource();
@@ -884,6 +946,11 @@ window.FwHubCommands = function (ctx) {
     if (source) {
       cmd(`Copy last command from ${source.name}`, ctx.keyOf("commands.copy_last"), copyLast, "copy");
     }
+    const agent = ctx.replies().agentOf(attachedSession());
+    if (agent) {
+      cmd(`Copy last reply from ${agent.name}`, ctx.keyOf("reply.copy_last"), () => ctx.replies().copyLast(agent.id), "copy");
+      cmd(`Show ${agent.name}'s replies`, "", () => openReplies(agent.id), "copy");
+    }
     const attached = attachedSession();
     if (attached && attached.companion_of && sessionById(attached.companion_of)) {
       cmd(`Back to agent ${sessionById(attached.companion_of).name}`, flipKey(), flipCompanion, "claude");
@@ -896,6 +963,7 @@ window.FwHubCommands = function (ctx) {
   // The drawer follows the attached session.
   function render() {
     forgetRemoved();
+    ctx.replies().forgetRemoved();
     renderDrawer();
   }
 
@@ -905,5 +973,5 @@ window.FwHubCommands = function (ctx) {
     if (source && !cache[source.id] && ui.loading !== source.id) load(source.id);
   }
 
-  return { onEvent, toggle, openAt, copyLast, flipCompanion, paletteItems, render, prefetch, copyText, toast, isOpen: () => ui.open };
+  return { onEvent, toggle, openAt, openReplies, repliesChanged, copyLast, flipCompanion, paletteItems, render, prefetch, copyText, toast, isOpen: () => ui.open };
 };

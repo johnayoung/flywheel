@@ -63,6 +63,7 @@ pub mod queue;
 pub mod queue_cli;
 pub mod record;
 pub mod remote;
+pub mod replies;
 pub mod report;
 pub mod restore;
 pub mod review;

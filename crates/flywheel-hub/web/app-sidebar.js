@@ -701,6 +701,10 @@ function renderMain() {
 
   commands.render();
   net.defer("commands", () => commands.prefetch());
+  // Copy last reply copies at the key press: the attached agent's replies
+  // are kept at hand.
+  const replying = replies.agentOf(session);
+  if (replying) net.defer("replies", () => replies.ensure(replying.id));
   flywheel.render();
   review.render();
   mobile.render();

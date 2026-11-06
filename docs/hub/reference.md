@@ -358,6 +358,7 @@ Defaults, all rebindable (Settings > Keyboard). `mod` = Ctrl (Cmd on macOS); `al
 | `record.toggle` | - | Start or stop recording the attached session |
 | `commands.toggle` | `alt+c` | Suggested commands drawer |
 | `commands.copy_last` | `alt+shift+c` | Copy the last suggested shell command |
+| `reply.copy_last` | `alt+y` | Copy the attached agent's last reply |
 | `companion.flip` | `` alt+` `` | Flip between an agent and its companion shell |
 | `flywheel.toggle` | `alt+f` | Flywheel panel |
 | `review.toggle` | `alt+g` | Review the attached session's git work |
@@ -423,5 +424,5 @@ All files 0600, the dir 0700.
 
 - `token`; `logins.json` (login-cookie digests); `state.json` (workspaces, sessions, layouts, templates, fan-outs, queues; schema 5); `settings.json`; `hub.toml`, `notify.toml`.
 - `server.json`, `serve.lock`, `report.sock`, `handoff.sock` (the running hub's address, lock, sockets); `hub.log[.1..3]`.
-- `machines.json` (plaintext credentials), `peers.json`, `shares.json` (digests); `commands/<id>.json` (suggested blocks + usage), `usage-archive.json` (removed sessions').
+- `machines.json` (plaintext credentials), `peers.json`, `shares.json` (digests); `commands/<id>.json` (blocks, replies, usage), `usage-archive.json` (removed sessions').
 - `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` (local CA); `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` (clients' last-active times); `digest.json`, `digest.lock` (last slot, recent digests); `open-<id>.html` (`open` redirect pages); `claude-accounts/<name>.token` (Claude account tokens).

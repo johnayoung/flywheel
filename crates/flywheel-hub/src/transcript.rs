@@ -1,4 +1,4 @@
-//! Following agent transcripts for suggested commands.
+//! Following agent transcripts for suggested commands and replies.
 //!
 //! Claude Code appends every reply to its transcript
 //! (`<config>/projects/<dir>/<conversation>.jsonl`); Codex to its rollout
@@ -6,14 +6,15 @@
 //! hub tails the file of each agent session's current conversation from a
 //! byte offset (no re-reads, memory bounded per line and per session),
 //! pulls the fenced code blocks out of assistant text, and keeps the
-//! newest [`MAX_COMMANDS`] per session. A conversation switch (`/clear`,
+//! newest [`MAX_COMMANDS`] per session; the assistant text itself is kept
+//! as replies ([`crate::replies`], the newest [`MAX_REPLIES`]). A conversation switch (`/clear`,
 //! a resume under a new id) moves the tail to the new file; a file that
 //! is replaced or truncated is read again from the start, without
 //! duplicating blocks already seen. Codex sessions with no rollout to be
 //! found fall back to the `notify` payload's `last-assistant-message`.
 //!
-//! Each session's commands and its tail position are saved under the state
-//! dir (`commands/<session>.json`), so a restarted hub keeps every block,
+//! Each session's commands, replies, and tail position are saved under the
+//! state dir (`commands/<session>.json`), so a restarted hub keeps every block,
 //! including those of conversations before a `/clear`, under the same
 //! `seq`, and resumes reading where it stopped.
 //!
@@ -32,6 +33,8 @@ use crate::commands::{
 };
 use crate::hub::{Hub, HubError, HubEvent};
 use crate::pty::{ENTER_DELAY, WriteOutcome, paste_bytes};
+pub use crate::replies::MAX_REPLIES;
+use crate::replies::{AgentReply, ReplyLog, ReplyView};
 use crate::state::{SessionRecord, StateError};
 use crate::usage::{
     CodexCursor, RollupBuilder, SessionUsage, Turn, UsageArchive, UsageView, claude_usage,
@@ -102,6 +105,14 @@ pub struct Reply {
     pub timestamp: Option<String>,
     /// The reply's text parts (each mined separately for fences).
     pub texts: Vec<String>,
+}
+
+impl Reply {
+    /// The reply's text as one Markdown text: its parts, a blank line
+    /// between each.
+    fn text(&self) -> String {
+        self.texts.join("\n\n")
+    }
 }
 
 impl Tail {
@@ -175,20 +186,23 @@ fn line(
     start: u64,
     each: &mut dyn FnMut(Item),
 ) {
-    // Cheap pre-filter: only lines with a fence or an inline `! cmd`, or
-    // usage, are parsed (big tool results are skipped unparsed).
-    let fenced = !usage_only
-        && (contains(bytes, b"```")
-            || contains(bytes, b"~~~")
-            || contains(bytes, b"`!")
-            || contains(bytes, b"` !"));
+    // Cheap pre-filter: only lines with assistant text (a reply, maybe
+    // with fences or an inline `! cmd`), or usage, are parsed (big tool
+    // results are skipped unparsed).
+    let text = !usage_only
+        && match format {
+            Format::Claude => {
+                contains(bytes, b"\"type\":\"text\"") && contains(bytes, b"\"type\":\"assistant\"")
+            }
+            Format::Codex => contains(bytes, b"\"output_text\""),
+        };
     let usage = match format {
         Format::Claude => {
             contains(bytes, b"\"usage\"") && contains(bytes, b"\"type\":\"assistant\"")
         }
         Format::Codex => contains(bytes, b"token_count") || contains(bytes, b"turn_context"),
     };
-    if !fenced && !usage {
+    if !text && !usage {
         return;
     }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
@@ -204,7 +218,7 @@ fn line(
             each(Item::Usage(turn));
         }
     }
-    if fenced && let Some(mut reply) = reply_of(format, parsed) {
+    if text && let Some(mut reply) = reply_of(format, parsed) {
         // An item without an id (Codex rollouts write none) is named by
         // where its line starts (see [`crate::agentlog`]).
         if reply.message_id.is_empty() {
@@ -273,6 +287,11 @@ struct Saved {
     /// See [`SessionCommands::last_reply`].
     #[serde(default)]
     last_reply: Option<(Option<String>, Vec<String>)>,
+    /// Oldest first.
+    #[serde(default)]
+    replies: Vec<AgentReply>,
+    #[serde(default)]
+    next_reply_seq: u64,
 }
 
 /// Where a tail stopped.
@@ -315,6 +334,8 @@ struct SessionCommands {
     /// its conversation: a Stop hook's reply that is a prefix of it (the
     /// hook's payload may be cut short) was read already.
     last_reply: Option<(Option<String>, Vec<String>)>,
+    /// The assistant's replies (see [`crate::replies`]).
+    replies: ReplyLog,
     /// Where the log is saved (`None`: kept in memory only).
     file: Option<PathBuf>,
     /// Why the last save failed.
@@ -365,6 +386,7 @@ impl SessionCommands {
         log.parked = saved.parked.into_iter().collect();
         log.from_hook = saved.from_hook;
         log.last_reply = saved.last_reply;
+        log.replies = ReplyLog::restore(saved.replies, saved.next_reply_seq);
         log
     }
 
@@ -405,6 +427,7 @@ impl SessionCommands {
         let Some(file) = self.file.as_deref() else {
             return;
         };
+        let (replies, next_reply_seq) = self.replies.saved();
         let saved = Saved {
             next_seq: self.next_seq,
             tail: self.tail.as_ref().map(Tail::saved),
@@ -414,6 +437,8 @@ impl SessionCommands {
             parked: self.parked.iter().cloned().collect(),
             from_hook: self.from_hook.clone(),
             last_reply: self.last_reply.clone(),
+            replies,
+            next_reply_seq,
         };
         let result = serde_json::to_vec(&saved)
             .map_err(std::io::Error::other)
@@ -531,15 +556,70 @@ impl SessionCommands {
         self.key_order.push_back(key);
     }
 
+    /// The blocks of a Stop hook's `reply` the transcript has not given
+    /// yet (closed fences only: a long payload is cut to fit a report);
+    /// they are noted so its transcript line adds them no second time.
+    fn hook_commands(&mut self, reply: &Reply, conversation: Option<&str>) -> Vec<Command> {
+        let closed: Vec<String> = reply
+            .texts
+            .iter()
+            .flat_map(|t| fenced_blocks(t))
+            .filter(|b| b.closed)
+            .map(|b| b.text)
+            .collect();
+        if !closed.iter().any(|b| b.len() <= MAX_BLOCK_BYTES) {
+            return Vec::new();
+        }
+        self.from_hook.clear();
+        // Read already: the last transcript reply begins with these blocks
+        // (the hook's text may be cut short, and its unclosed fences are
+        // left out).
+        let read = self.last_reply.as_ref().is_some_and(|(c, fences)| {
+            c.as_deref() == conversation
+                && closed.len() <= fences.len()
+                && closed.iter().zip(fences).all(|(a, b)| a == b)
+        });
+        if read {
+            return Vec::new();
+        }
+        let added = self.add(reply, conversation, CommandSource::Hook, true);
+        self.from_hook = added
+            .iter()
+            .map(|c| (c.conversation.clone(), c.text.clone()))
+            .collect();
+        added
+    }
+
+    /// Keep `reply` as a reply too (see [`crate::replies`]).
+    fn add_reply(
+        &mut self,
+        reply: &Reply,
+        conversation: Option<&str>,
+        source: CommandSource,
+        added: &mut Refreshed,
+    ) {
+        if let Some(entry) = self.replies.add(
+            conversation,
+            &reply.message_id,
+            reply.timestamp.as_deref(),
+            &reply.text(),
+            source,
+        ) {
+            crate::replies::push_bounded(&mut added.replies, entry);
+        }
+    }
+
     /// Read what `tail` has new into the log, adding to `added` (at most
-    /// [`MAX_COMMANDS`], the newest); returns the tail.
-    fn drain(&mut self, mut tail: Tail, added: &mut Vec<Command>) -> Tail {
+    /// [`MAX_COMMANDS`] commands and [`MAX_REPLIES`] replies, the newest);
+    /// returns the tail.
+    fn drain(&mut self, mut tail: Tail, added: &mut Refreshed) -> Tail {
         let source = source_of(tail.format);
         let conversation = tail.conversation.clone();
         tail.read(&mut |item| match item {
             Item::Reply(reply) => {
                 let more = self.add(&reply, conversation.as_deref(), source, false);
-                push_bounded(added, more);
+                push_bounded(&mut added.commands, more);
+                self.add_reply(&reply, conversation.as_deref(), source, added);
             }
             Item::Usage(turn) => {
                 let changed = self.usage().observe(&turn);
@@ -665,7 +745,22 @@ impl Slot {
 pub struct Refreshed {
     /// New commands, oldest first.
     pub commands: Vec<Command>,
+    /// New replies (and fallbacks their transcript line replaced), oldest
+    /// first.
+    pub replies: Vec<AgentReply>,
     pub usage_changed: bool,
+}
+
+/// A session's replies, newest first.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplyList {
+    pub session_id: String,
+    /// The conversation being followed.
+    pub conversation: Option<String>,
+    pub replies: Vec<ReplyView>,
+    /// Why they could not be saved (kept in memory, lost at a restart).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub save_error: Option<String>,
 }
 
 /// Which commands [`CommandBook::list`] returns.
@@ -781,9 +876,9 @@ impl CommandBook {
                     let message = payload
                         .get("last-assistant-message")
                         .and_then(|m| m.as_str());
-                    if let Some(message) =
-                        message.filter(|m| m.contains("```") || m.contains("~~~"))
-                    {
+                    // Every reply (a reply of its own; its fences, if any,
+                    // commands).
+                    if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
                         let turn = payload
                             .get("turn-id")
                             .and_then(|t| t.as_str())
@@ -801,47 +896,27 @@ impl CommandBook {
         self.wake();
     }
 
-    /// A Claude Code turn finished with `payload` (its Stop hook's): the
-    /// blocks of its `last_assistant_message` when the transcript has not
-    /// given them yet (it is written a moment after the hook). Call after
-    /// reading the transcript. Returns the new commands.
-    pub fn note_stop(&self, record: &SessionRecord, payload: &serde_json::Value) -> Vec<Command> {
+    /// A Claude Code turn finished with `payload` (its Stop hook's): its
+    /// `last_assistant_message` as a reply, and the blocks in it, when the
+    /// transcript has not given them yet (it is written a moment after the
+    /// hook). Call after reading the transcript. Returns what was added.
+    pub fn note_stop(&self, record: &SessionRecord, payload: &serde_json::Value) -> Refreshed {
+        let mut added = Refreshed::default();
         let Some(text) = payload
             .get("last_assistant_message")
             .and_then(|m| m.as_str())
-            .filter(|m| m.contains("```") || m.contains("~~~"))
+            .filter(|m| !m.trim().is_empty())
         else {
-            return Vec::new();
+            return added;
         };
         if !record.runs_agent() || record.kind != SessionKind::Claude {
-            return Vec::new();
+            return added;
         }
         let conversation = record.agent_session_id.clone();
-        // Closed fences only: a long payload is cut to fit a report.
-        let closed: Vec<String> = fenced_blocks(text)
-            .into_iter()
-            .filter(|b| b.closed)
-            .map(|b| b.text)
-            .collect();
-        if !closed.iter().any(|b| b.len() <= MAX_BLOCK_BYTES) {
-            return Vec::new();
-        }
         let entry = self.entry(&record.id);
         let mut log = entry.log();
         if log.gone {
-            return Vec::new();
-        }
-        log.from_hook.clear();
-        // Read already: the last transcript reply begins with these blocks
-        // (the hook's text may be cut short, and its unclosed fences are
-        // left out).
-        let read = log.last_reply.as_ref().is_some_and(|(c, fences)| {
-            *c == conversation
-                && closed.len() <= fences.len()
-                && closed.iter().zip(fences).all(|(a, b)| a == b)
-        });
-        if read {
-            return Vec::new();
+            return added;
         }
         let turn = payload
             .get("prompt_id")
@@ -855,12 +930,18 @@ impl CommandBook {
             ),
             texts: vec![text.to_owned()],
         };
-        let added = log.add(&reply, conversation.as_deref(), CommandSource::Hook, true);
-        log.from_hook = added
-            .iter()
-            .map(|c| (c.conversation.clone(), c.text.clone()))
-            .collect();
-        if !added.is_empty() {
+        // A reply the transcript gave already adds nothing (see
+        // [`ReplyLog::add`]).
+        log.add_reply(
+            &reply,
+            conversation.as_deref(),
+            CommandSource::Hook,
+            &mut added,
+        );
+        if text.contains("```") || text.contains("~~~") {
+            added.commands = log.hook_commands(&reply, conversation.as_deref());
+        }
+        if !added.commands.is_empty() || !added.replies.is_empty() {
             log.save();
         }
         added
@@ -969,7 +1050,7 @@ impl CommandBook {
             }
         }
         let conversation = record.agent_session_id.clone();
-        let mut added = Vec::new();
+        let mut added = Refreshed::default();
         let mut switched = false;
         let following = log
             .tail
@@ -1017,7 +1098,8 @@ impl CommandBook {
             log.subagents.push(tail);
         }
         // Codex replies with no rollout to read: from the notify payload
-        // (possibly cut short by the report budget: closed fences only).
+        // (possibly cut short by the report budget: closed fences only;
+        // the rollout's line, once read, replaces the reply).
         let notified: Vec<(String, String)> = log.notified.drain(..).collect();
         if log.tail.is_none() {
             for (turn, text) in notified {
@@ -1029,17 +1111,24 @@ impl CommandBook {
                     texts: vec![text],
                 };
                 let more = log.add(&reply, conversation.as_deref(), CommandSource::Notify, true);
-                push_bounded(&mut added, more);
+                push_bounded(&mut added.commands, more);
+                log.add_reply(
+                    &reply,
+                    conversation.as_deref(),
+                    CommandSource::Notify,
+                    &mut added,
+                );
             }
         }
-        let usage_changed = std::mem::take(&mut log.usage_changed);
-        if switched || !added.is_empty() || usage_changed {
+        added.usage_changed = std::mem::take(&mut log.usage_changed);
+        if switched
+            || !added.commands.is_empty()
+            || !added.replies.is_empty()
+            || added.usage_changed
+        {
             log.save();
         }
-        Refreshed {
-            commands: added,
-            usage_changed,
-        }
+        added
     }
 
     /// A session's token usage (`None` before its first counted call).
@@ -1115,6 +1204,23 @@ impl CommandBook {
                 .filter(|c| filter.all || c.shell)
                 .take(filter.limit)
                 .cloned()
+                .collect(),
+        }
+    }
+
+    /// A session's replies, at most `limit`, newest first.
+    pub fn replies(&self, record: &SessionRecord, limit: usize) -> ReplyList {
+        let entry = self.entry(&record.id);
+        let log = entry.log();
+        ReplyList {
+            session_id: record.id.clone(),
+            conversation: record.agent_session_id.clone(),
+            save_error: log.save_error.clone(),
+            replies: log
+                .replies
+                .newest(limit)
+                .cloned()
+                .map(ReplyView::from)
                 .collect(),
         }
     }
@@ -1329,11 +1435,19 @@ impl Hub {
         self.announce_refreshed(record, refreshed);
     }
 
-    fn announce_refreshed(&self, record: &SessionRecord, refreshed: Refreshed) {
+    /// Push what a read of `record`'s transcript (or its Stop hook) added
+    /// to events subscribers.
+    pub(crate) fn announce_refreshed(&self, record: &SessionRecord, refreshed: Refreshed) {
         if !refreshed.commands.is_empty() {
             self.emit(HubEvent::Commands {
                 session_id: record.id.clone(),
                 added: refreshed.commands,
+            });
+        }
+        if !refreshed.replies.is_empty() {
+            self.emit(HubEvent::Replies {
+                session_id: record.id.clone(),
+                added: refreshed.replies,
             });
         }
         if refreshed.usage_changed {
@@ -1386,6 +1500,14 @@ impl Hub {
         let record = self.session(id)?.record;
         self.catch_up_commands(&record);
         Ok(self.command_book().list(&record, filter))
+    }
+
+    /// A session's replies, at most `limit`, newest first (read up to date
+    /// first, whether or not the session runs).
+    pub fn replies(&self, id: &str, limit: usize) -> Result<ReplyList, HubError> {
+        let record = self.session(id)?.record;
+        self.catch_up_commands(&record);
+        Ok(self.command_book().replies(&record, limit))
     }
 
     /// Paste `text` into a running session's terminal, as a bracketed
@@ -1527,14 +1649,17 @@ mod tests {
                 assert_eq!(usage_only.iter().collect::<Vec<_>>(), usage, "{name}");
             }
             let mut log = SessionCommands::default();
-            let mut added = Vec::new();
+            let mut added = Refreshed::default();
             log.drain(Tail::new(path, format, conversation), &mut added);
             let mut out = String::new();
             for item in &items {
                 writeln!(out, "{item:?}").unwrap();
             }
-            for command in &added {
+            for command in &added.commands {
                 writeln!(out, "{command:?}").unwrap();
+            }
+            for reply in added.replies {
+                writeln!(out, "{:?}", ReplyView::from(reply)).unwrap();
             }
             crate::test_golden::assert_golden(&format!("{name}.commands.txt"), &out);
         }
@@ -1682,7 +1807,9 @@ mod tests {
         let reply = "Run `! gcloud auth login`, then:\n```bash\nls\n```";
         // The Stop hook gives the reply first; its transcript line adds
         // nothing more.
-        let hooked = book.note_stop(&record, &json!({"last_assistant_message": reply}));
+        let hooked = book
+            .note_stop(&record, &json!({"last_assistant_message": reply}))
+            .commands;
         assert_eq!(hooked.len(), 2);
         assert_eq!((hooked[0].text.as_str(), hooked[0].block_index), ("ls", 0));
         assert_eq!(hooked[1].text, "! gcloud auth login");
@@ -1938,6 +2065,124 @@ mod tests {
         assert!(!store.join("gone.json").exists());
         book.retain(&HashSet::new());
         assert!(!store.join("s1.json").exists());
+    }
+
+    #[test]
+    fn replies_follow_hook_transcript_clear_and_restart_without_duplicates() {
+        let (dir, _, mut record, path) = claude_setup("c1");
+        let config = dir.path().join("claude");
+        let store = dir.path().join("state").join(COMMANDS_DIR);
+        let book = CommandBook::new(Some(config.clone()), None, Some(store.clone()));
+        let texts = |list: &ReplyList| -> Vec<(u64, String)> {
+            list.replies
+                .iter()
+                .map(|r| (r.reply.seq, r.reply.text.clone()))
+                .collect()
+        };
+        // Text between tool calls, then a tool call: one reply, no command.
+        append(&path, &claude_line("u1", "Let me look."));
+        append(
+            &path,
+            &json!({"type": "assistant", "uuid": "u2", "message": {"id": "msg_2", "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}})
+            .to_string(),
+        );
+        append(&path, "\n");
+        let added = book.refresh_all(&record);
+        assert!(added.commands.is_empty());
+        assert_eq!(added.replies.len(), 1);
+        assert_eq!(added.replies[0].text, "Let me look.");
+        // The turn ends: its Stop hook carries the final reply (cut short
+        // to fit the report) before the transcript has it...
+        let final_text = "Here is the message:\n\n- first\n- second\n\nThanks.";
+        let hooked = book.note_stop(
+            &record,
+            &json!({"last_assistant_message": &final_text[..30], "prompt_id": "p1"}),
+        );
+        assert_eq!(hooked.replies.len(), 1);
+        assert_eq!(hooked.replies[0].source, CommandSource::Hook);
+        // ...and its line, once written, takes the hook reply's place.
+        append(
+            &path,
+            &claude_line("u3", final_text).replace("msg_1", "msg_3"),
+        );
+        let added = book.refresh_all(&record);
+        assert_eq!(added.replies.len(), 1);
+        assert_eq!(added.replies[0].seq, hooked.replies[0].seq);
+        assert_eq!(added.replies[0].text, final_text);
+        assert_eq!(added.replies[0].source, CommandSource::Transcript);
+        // A late hook for a reply read already adds nothing.
+        assert!(
+            book.note_stop(&record, &json!({"last_assistant_message": final_text}))
+                .replies
+                .is_empty()
+        );
+        // `/clear`: the next conversation's replies follow.
+        let new_path = path.with_file_name("c2.jsonl");
+        append(&new_path, &claude_line("v1", "Fresh start."));
+        record.agent_session_id = Some("c2".into());
+        assert_eq!(book.refresh_all(&record).replies.len(), 1);
+        let before = book.replies(&record, MAX_REPLIES);
+        assert_eq!(
+            texts(&before),
+            [
+                (2, "Fresh start.".to_owned()),
+                (1, final_text.to_owned()),
+                (0, "Let me look.".to_owned())
+            ]
+        );
+        assert_eq!(before.replies[1].blocks.len(), 3);
+        assert_eq!(texts(&book.replies(&record, 1)).len(), 1);
+        drop(book);
+
+        // A new hub on the same state dir: the same replies, nothing read
+        // twice, the next one numbered on.
+        let book = CommandBook::new(Some(config), None, Some(store));
+        assert_eq!(texts(&book.replies(&record, MAX_REPLIES)), texts(&before));
+        assert!(book.refresh_all(&record).replies.is_empty());
+        append(&new_path, &claude_line("v2", "Next."));
+        let added = book.refresh_all(&record);
+        assert_eq!(
+            (added.replies[0].seq, added.replies[0].text.as_str()),
+            (3, "Next.")
+        );
+    }
+
+    #[test]
+    fn codex_notify_replies_are_replaced_by_their_rollout_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("codex");
+        let thread = "01a07c85-9201-7123-8801-041350ceed6a";
+        let book = CommandBook::new(None, Some(home.clone()), None);
+        let record = record(SessionKind::Codex, dir.path(), thread);
+        // No rollout: the notify payload's reply (no fences: a reply only).
+        book.note_report(
+            "s1",
+            SessionKind::Codex,
+            "notify",
+            &json!({"turn-id": "t1", "last-assistant-message": "All done: tests"}),
+        );
+        let added = book.refresh_all(&record);
+        assert!(added.commands.is_empty());
+        assert_eq!(added.replies.len(), 1);
+        assert_eq!(added.replies[0].source, CommandSource::Notify);
+        let day = home.join("sessions/2026/11/02");
+        std::fs::create_dir_all(&day).unwrap();
+        let rollout = day.join(format!("rollout-2026-11-02T10-00-00-{thread}.jsonl"));
+        append(
+            &rollout,
+            &(json!({"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "All done: tests pass."}]}})
+            .to_string()
+                + "\n"),
+        );
+        book.entry("s1").log().missed = None;
+        let added = book.refresh_all(&record);
+        assert_eq!(added.replies.len(), 1);
+        assert_eq!(added.replies[0].seq, 0);
+        assert_eq!(added.replies[0].text, "All done: tests pass.");
+        assert_eq!(added.replies[0].source, CommandSource::Rollout);
+        assert_eq!(book.replies(&record, MAX_REPLIES).replies.len(), 1);
     }
 
     #[test]

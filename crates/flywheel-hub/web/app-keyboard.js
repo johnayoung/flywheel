@@ -391,6 +391,7 @@ const GLOBAL_ACTIONS = {
     commands.toggle();
   },
   "commands.copy_last": () => commands.copyLast(),
+  "reply.copy_last": () => (state.attached ? replies.copyLast(state.attached) : false),
   "companion.flip": () => (state.attached ? commands.flipCompanion() : false),
   "flywheel.toggle": () => flywheel.togglePill(),
   "review.toggle": () => review.togglePill(),

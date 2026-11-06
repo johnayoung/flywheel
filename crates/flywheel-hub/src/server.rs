@@ -44,7 +44,10 @@
 //!   session or workspace list changed (re-list over REST);
 //!   `{"type":"commands","session_id","fresh":B,"commands":[...]}` when an
 //!   agent session suggested code blocks (newest first; `fresh`: written in
-//!   the last two minutes, not a transcript's backlog). A `status` is
+//!   the last two minutes, not a transcript's backlog);
+//!   `{"type":"replies","session_id","replies":[...]}` when one wrote
+//!   replies (newest first; a `seq` already known replaces that reply). A
+//!   `status` is
 //!   `{"status":"working|blocked|done|idle|unknown","detail"?,"since"}`, as
 //!   this client sees it (`done` turns into `idle` once it viewed them).
 //!   `{"type":"layout","workspace_id","rev"}` when a workspace's tabs and
@@ -319,6 +322,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route(
             "/api/sessions/{id}/commands",
             get(commands_api::list_commands),
+        )
+        .route(
+            "/api/sessions/{id}/replies",
+            get(commands_api::list_replies),
         )
         .route("/api/sessions/{id}/paste", post(commands_api::paste))
         .route("/api/sessions/{id}/file", get(files_api::read_file))

@@ -1,10 +1,12 @@
-//! `GET /api/sessions/{id}/commands`, `POST /api/sessions/{id}/paste`, and
-//! the events socket's `commands` message.
+//! `GET /api/sessions/{id}/commands`, `GET /api/sessions/{id}/replies`,
+//! `POST /api/sessions/{id}/paste`, and the events socket's `commands` and
+//! `replies` messages.
 
 use super::ApiQuery;
 use super::{ApiJson, ApiResult, AppState, blocking, error_response, text};
 use crate::commands::Command;
-use crate::transcript::{CommandFilter, MAX_COMMANDS, is_fresh};
+use crate::replies::{AgentReply, ReplyView};
+use crate::transcript::{CommandFilter, MAX_COMMANDS, MAX_REPLIES, is_fresh};
 use axum::Json;
 use axum::extract::ws::Message;
 use axum::extract::{Path, State};
@@ -52,6 +54,39 @@ pub(super) async fn list_commands(
     Ok(Json(list).into_response())
 }
 
+/// Default `limit` of the replies route.
+pub const DEFAULT_REPLIES: usize = 20;
+
+#[derive(Deserialize)]
+pub(super) struct RepliesQuery {
+    /// Parsed by hand so a bad value gets the API's JSON error.
+    limit: Option<String>,
+}
+
+/// A session's replies, newest first, each with its Markdown blocks: at
+/// most `limit` (1..=100, default 20).
+pub(super) async fn list_replies(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiQuery(query): ApiQuery<RepliesQuery>,
+) -> ApiResult<Response> {
+    let limit = match query.limit.as_deref() {
+        None => DEFAULT_REPLIES,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if (1..=MAX_REPLIES).contains(&n) => n,
+            _ => {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("limit must be an integer between 1 and {MAX_REPLIES}"),
+                ));
+            }
+        },
+    };
+    let hub = Arc::clone(&app.hub);
+    let list = blocking(move || hub.replies(&id, limit)).await?;
+    Ok(Json(list).into_response())
+}
+
 #[derive(Deserialize)]
 pub(super) struct PasteRequest {
     text: String,
@@ -82,5 +117,17 @@ pub(super) fn event_message(session_id: &str, mut added: Vec<Command>) -> Messag
         "session_id": session_id,
         "fresh": fresh,
         "commands": added,
+    }))
+}
+
+/// The events socket's message for replies an agent session just wrote
+/// (or a fallback replaced by its transcript line: same `seq`), newest
+/// first.
+pub(super) fn replies_message(session_id: &str, added: Vec<AgentReply>) -> Message {
+    let replies: Vec<ReplyView> = added.into_iter().rev().map(ReplyView::from).collect();
+    text(json!({
+        "type": "replies",
+        "session_id": session_id,
+        "replies": replies,
     }))
 }

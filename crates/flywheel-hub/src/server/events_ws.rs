@@ -247,6 +247,9 @@ fn event_message(hub: &Hub, client: &str, event: HubEvent) -> Option<Message> {
     Some(match event {
         HubEvent::Status { session_id } => status_message(hub, client, &session_id),
         HubEvent::Commands { session_id, added } => commands_api::event_message(&session_id, added),
+        HubEvent::Replies { session_id, added } => {
+            commands_api::replies_message(&session_id, added)
+        }
         HubEvent::Usage { session_id } => {
             let usage = hub.session(&session_id).ok().and_then(|v| v.usage);
             text(json!({ "type": "usage", "session_id": session_id, "usage": usage }))

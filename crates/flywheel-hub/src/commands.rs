@@ -28,7 +28,7 @@ pub struct Fenced {
 
 /// What a fence line opens: its character, length, and indentation.
 #[derive(Debug, Clone, Copy)]
-struct Fence {
+pub(crate) struct Fence {
     ch: u8,
     len: usize,
     indent: usize,
@@ -37,7 +37,7 @@ struct Fence {
 /// A line that opens a fence: optional spaces, then 3+ backticks or
 /// tildes; a backtick fence's info string has no backticks (so ```` ```x``` ````
 /// on one line is inline code, not a fence).
-fn opening_fence(line: &str) -> Option<(Fence, &str)> {
+pub(crate) fn opening_fence(line: &str) -> Option<(Fence, &str)> {
     let indent = line.len() - line.trim_start_matches(' ').len();
     let rest = &line[indent..];
     let ch = *rest.as_bytes().first()?;
@@ -57,7 +57,7 @@ fn opening_fence(line: &str) -> Option<(Fence, &str)> {
 
 /// Whether `line` closes `fence`: the same character, at least as long,
 /// nothing after it but whitespace.
-fn closes(line: &str, fence: Fence) -> bool {
+pub(crate) fn closes(line: &str, fence: Fence) -> bool {
     let rest = line.trim_start_matches(' ');
     let len = rest.bytes().take_while(|&b| b == fence.ch).count();
     len >= fence.len && rest[len..].trim().is_empty()

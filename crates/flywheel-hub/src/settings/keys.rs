@@ -154,6 +154,12 @@ pub const ACTIONS: &[ActionSpec] = &[
         &["alt+shift+c"],
     ),
     global(
+        "reply.copy_last",
+        "Agents",
+        "Copy the attached agent's last reply",
+        &["alt+y"],
+    ),
+    global(
         "companion.flip",
         "Agents",
         "Flip between an agent and its companion shell",

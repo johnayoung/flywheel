@@ -411,12 +411,7 @@ impl Hub {
                 self.refresh_commands(&record);
                 // Not on disk yet: the reply the hook carries.
                 let added = self.commands.note_stop(&record, &payload);
-                if !added.is_empty() {
-                    self.emit(HubEvent::Commands {
-                        session_id: record.id.clone(),
-                        added,
-                    });
-                }
+                self.announce_refreshed(&record, added);
             }
         }
         // A permission prompt's question tool (AskUserQuestion): its

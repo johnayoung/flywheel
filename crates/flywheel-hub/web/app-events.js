@@ -359,6 +359,8 @@ function applyStatus(message) {
 function onPush(message, machine) {
   if (message.type === "commands") {
     commands.onEvent(message);
+  } else if (message.type === "replies") {
+    replies.onEvent(message);
   } else if (message.type === "usage") {
     launcher.onUsage(message);
   } else if (message.type === "flywheel" || message.type === "flywheel_reset") {

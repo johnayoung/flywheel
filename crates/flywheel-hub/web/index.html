@@ -184,8 +184,8 @@
       <aside id="commands" class="commands" hidden tabindex="-1" aria-label="Suggested commands">
         <header class="cmd-head">
           <div class="cmd-title">
-            <span class="sheet-kicker">suggested</span>
-            <h2>Commands</h2>
+            <span class="sheet-kicker">from the agent</span>
+            <h2 id="cmd-heading">Commands</h2>
           </div>
           <button type="button" class="icon" id="cmd-close" title="Close (Esc)" aria-label="Close commands"><svg><use href="#i-x"/></svg></button>
         </header>
@@ -195,8 +195,9 @@
           <label class="cmd-check"><input type="checkbox" id="cmd-all"> all blocks</label>
         </div>
         <p class="cmd-hint" id="cmd-hint" aria-live="polite"></p>
+        <nav id="cmd-tabs" class="rv-tabs cmd-tabs" role="tablist" aria-label="Commands or replies"></nav>
         <ul id="cmd-list" class="cmd-list"></ul>
-        <footer class="cmd-keys" aria-hidden="true"><kbd>&uarr;</kbd><kbd>&darr;</kbd> pick <kbd>Enter</kbd> copy <kbd>1</kbd>-<kbd>9</kbd> copy nth <kbd>s</kbd> send <kbd>Shift S</kbd> send + run <kbd>Esc</kbd> close</footer>
+        <footer class="cmd-keys" aria-hidden="true"><span id="cmd-keys-commands"><kbd>&uarr;</kbd><kbd>&darr;</kbd> pick <kbd>Enter</kbd> copy <kbd>1</kbd>-<kbd>9</kbd> copy nth <kbd>s</kbd> send <kbd>Shift S</kbd> send + run <kbd>Esc</kbd> close</span><span id="cmd-keys-replies" hidden><kbd>1</kbd>-<kbd>9</kbd> copy the nth reply <kbd>Tab</kbd> to a copy button <kbd>Esc</kbd> close</span></footer>
       </aside>
       <aside id="flywheel" class="commands fw-drawer" hidden tabindex="-1" aria-label="Flywheel panel">
         <header class="cmd-head">
@@ -736,6 +737,7 @@
 <script src="/assets/vendor/addon-search/addon-search.js"></script>
 <script src="/assets/fmt.js"></script>
 <script src="/assets/commands.js"></script>
+<script src="/assets/replies.js"></script>
 <script src="/assets/files.js"></script>
 <script src="/assets/import.js"></script>
 <script src="/assets/onboarding.js"></script>

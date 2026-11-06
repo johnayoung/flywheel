@@ -897,3 +897,102 @@ async fn a_stop_hook_reply_that_differs_from_the_transcript_adds_nothing_twice()
     );
     hub.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replies_reach_rest_and_events_with_their_blocks_exactly() {
+    let hub = TestHub::start().await;
+    let ws = hub
+        .post(
+            "/api/workspaces",
+            json!({ "name": "w", "repos": [hub.repo()] }),
+        )
+        .await;
+    let claude = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws["id"], "kind": "claude", "name": "agent" }),
+        )
+        .await;
+    let sid = claude["id"].as_str().unwrap().to_owned();
+    let conversation = claude["agent_session_id"].as_str().unwrap().to_owned();
+    let empty = hub.get(&format!("/api/sessions/{sid}/replies")).await;
+    assert_eq!(empty["replies"], json!([]));
+    let mut events = hub.events().await;
+    let project = hub
+        .dir
+        .path()
+        .join("claude-config/projects")
+        .join(claude_project_dir_name(&hub.repo()));
+    std::fs::create_dir_all(&project).unwrap();
+    let transcript = project.join(format!("{conversation}.jsonl"));
+    let slack = "Hey team, the **release** is out:\n\n- API frozen\n- docs updated\n\n```sh\nfw hub\n\nfw docs\n```\n\nThanks!";
+    append(
+        &transcript,
+        &json!({"type": "assistant", "uuid": "a1", "timestamp": chrono::Utc::now().to_rfc3339(),
+            "message": {"role": "assistant", "content": [{"type": "text", "text": slack}]}}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let event = loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, events.next())
+            .await
+            .expect("timed out waiting for a replies event")
+        {
+            Some(Ok(Message::Text(text))) => {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "replies" {
+                    break value;
+                }
+            }
+            Some(Ok(_)) => {}
+            other => panic!("events socket ended: {other:?}"),
+        }
+    };
+    assert_eq!(event["session_id"], sid.as_str());
+    assert_eq!(event["replies"][0]["text"], slack);
+    let list = hub
+        .get(&format!("/api/sessions/{sid}/replies?limit=5"))
+        .await;
+    let reply = &list["replies"][0];
+    assert_eq!(reply, &event["replies"][0]);
+    assert_eq!(reply["text"], slack);
+    assert_eq!(reply["source"], "transcript");
+    assert_eq!(reply["message_id"], "a1");
+    assert_eq!(
+        reply["match_key"],
+        "HeyteamthereleaseisoutAPIfrozendocsupdatedfwhubfwdocsThanks"
+    );
+    let blocks: Vec<(&str, &str)> = reply["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| (b["kind"].as_str().unwrap(), b["text"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        blocks,
+        [
+            ("paragraph", "Hey team, the **release** is out:"),
+            ("list", "- API frozen\n- docs updated"),
+            ("code", "```sh\nfw hub\n\nfw docs\n```"),
+            ("paragraph", "Thanks!"),
+        ]
+    );
+    assert_eq!(reply["blocks"][2]["code"], "fw hub\n\nfw docs");
+    assert_eq!(reply["blocks"][2]["lang"], "sh");
+    for bad in ["limit=0", "limit=101", "limit=x"] {
+        let (status, body) = hub
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/sessions/{sid}/replies?{bad}"),
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(body["error"].is_string());
+    }
+    let (status, _) = hub
+        .call(reqwest::Method::GET, "/api/sessions/nope/replies", None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    hub.shutdown().await;
+}

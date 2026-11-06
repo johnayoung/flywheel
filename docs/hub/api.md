@@ -39,6 +39,7 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 | POST | `/api/sessions/{id}/input` | `{"data","paste"?,"enter"?}`; 409 not running / not reading |
 | POST | `/api/sessions/{id}/paste` | `{"text","run"?}`: `/input` with `paste`, trailing newlines dropped, 1 MiB; 409 unsafe multi-line |
 | GET | `/api/sessions/{id}/commands[?limit=N&all=true]` | newest first (shell unless `all`; `limit` 1..500, 50) |
+| GET | `/api/sessions/{id}/replies[?limit=N]` | newest first (`limit` 1..100, 20): `text`, `blocks`, `match_key` |
 | GET | `/api/sessions/{id}/file?path=` | a file the session names: relative to its cwd, worktree, or workspace folders, or absolute / `~/`; must resolve (symlinks too) under those; `{"path","size","text","truncated"}` (first 2 MiB); 403 outside, 404 none, 415 binary |
 | POST | `/api/sessions/{id}/files/check` | `{"paths":[...]}` (64): `{"files":[{"path","size"}\|null]}`, in order |
 | GET | `/api/sessions/{id}/transcript[?around=N&before=N&after=N]` | messages, paged (30, max 200); 400 a shell |
@@ -243,6 +244,7 @@ Close codes: **4001** token rotated, **4002** logout / login expired, **4003** p
 | `sessions` | | sessions, workspaces, viewers changed: re-list (250 ms apart at most) |
 | `usage` | the session's usage | changed |
 | `commands` | `"session_id","fresh","commands"` | an agent suggested blocks (`fresh`: within 2 min) |
+| `replies` | `"session_id","replies"` | an agent replied (a known `seq` replaces that reply) |
 | `flywheel` / `flywheel_reset` | `"folder","summary"\|null` / | a panel changed (`null`: unwatched) / missed some |
 | `layout` | `"workspace_id","rev"` | a layout saved or pruned |
 | `fanout` | `"id"` | a fan-out changed |

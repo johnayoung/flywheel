@@ -393,6 +393,12 @@ pub enum HubEvent {
         session_id: String,
         added: Vec<crate::commands::Command>,
     },
+    /// An agent session wrote new replies, or a fallback reply was
+    /// replaced by its transcript line (same `seq`; oldest first).
+    Replies {
+        session_id: String,
+        added: Vec<crate::replies::AgentReply>,
+    },
     /// A session's agent status changed (re-read it per client).
     Status { session_id: String },
     /// The last client looking at a session looked away (or left): a

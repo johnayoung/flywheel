@@ -316,6 +316,12 @@ function paneMenu(pane, x, y) {
     { label: zoomed ? "Unzoom" : "Zoom", hint: keyHint("pane.zoom"), run: () => toggleZoom(pane.id), disabled: L.panes(tab.root).length < 2 },
     { label: "Move to a new tab", run: () => paneToTab(pane), disabled: L.panes(tab.root).length < 2 },
     ...(outputTarget(session) ? [{ label: `Send output ${outputTarget(session).label}`, hint: keyHint("handoff.output"), run: () => handoff.sendOutput(session.id) }] : []),
+    ...(isAgent(session)
+      ? [
+        { label: "Copy last reply", hint: keyHint("reply.copy_last"), run: () => replies.copyLast(session.id) },
+        { label: "Replies…", run: () => commands.openReplies(session.id) },
+      ]
+      : []),
     { label: "Close pane (keeps running)", hint: keyHint("pane.close"), run: () => closePane(pane.id) },
     { label: `Close session ${session.name}`, hint: keyHint("session.close"), danger: true, run: () => closeSession(session.id) },
   ];

@@ -377,6 +377,22 @@ const commands = window.FwHubCommands({
   onOpen: () => closeOverlays("commands"),
   // "To agent" on a block (handoff.js).
   handoff: () => handoff,
+  // The drawer's Replies view (replies.js).
+  replies: () => replies,
+});
+
+// Agents' replies (replies.js): copy the last one, the drawer's Replies
+// view, and what panes match their rendered replies against.
+const replies = window.FwHubReplies({
+  el,
+  icon,
+  api,
+  state,
+  sessionById,
+  isAgent,
+  toast: (...args) => commands.toast(...args),
+  copyText: (text) => commands.copyText(text),
+  onChange: (id) => commands.repliesChanged(id),
 });
 
 // Files a terminal names, and their viewer (files.js).

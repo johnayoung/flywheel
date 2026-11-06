@@ -34,6 +34,7 @@
 
 use crate::tui::{DaemonState, DaemonStatus};
 use chrono::{DateTime, Utc};
+use flywheel_core::store::DEFAULT_PARTITION;
 use flywheel_orchestrator::claims::{ClaimStore, SqliteClaimStore};
 use flywheel_orchestrator::supervision_policy::{RespawnDecision, SupervisionPolicy};
 use std::fs::{self, File, OpenOptions};
@@ -232,7 +233,8 @@ pub fn format_dead_message(exit_code: Option<i32>, reason: Option<&str>) -> Stri
 
 /// Whether any worker currently holds a live lease in `task_claims`.
 ///
-/// Reads the orchestrator's claim store at `db_path`. A lease whose
+/// Reads the orchestrator's claim store at `db_path`, partition `partition`
+/// (the console's project id). A lease whose
 /// `lease_expires_at` is at or before `now` (a lapsed lease) does NOT count
 /// as a live worker, matching the acquire-steal semantics. Returns
 /// `Ok(false)` when the database file does not exist (a fresh project that
@@ -240,11 +242,12 @@ pub fn format_dead_message(exit_code: Option<i32>, reason: Option<&str>) -> Stri
 /// orchestrator schema when it is absent, which the worker's own startup
 /// would do anyway. Any other store failure is returned so the caller can
 /// surface it rather than read a corrupted store as idle.
-pub fn has_live_lease(db_path: &Path, now: DateTime<Utc>) -> Result<bool, String> {
+pub fn has_live_lease(db_path: &Path, partition: &str, now: DateTime<Utc>) -> Result<bool, String> {
     if !db_path.exists() {
         return Ok(false);
     }
-    let claims = SqliteClaimStore::open(db_path).map_err(|err| err.to_string())?;
+    let claims =
+        SqliteClaimStore::open_partition(db_path, partition).map_err(|err| err.to_string())?;
     let rows = claims.list_claims().map_err(|err| err.to_string())?;
     Ok(rows.iter().any(|claim| claim.lease_expires_at > now))
 }
@@ -697,6 +700,7 @@ impl SupervisedProcess {
 /// live lease it does not own reads `Detached` and is never signaled.
 pub struct WorkerSupervisor {
     db_path: PathBuf,
+    partition: String,
     tasks_dir: Option<PathBuf>,
     model: Option<String>,
     spawn_argv: Option<Vec<String>>,
@@ -707,6 +711,7 @@ impl std::fmt::Debug for WorkerSupervisor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerSupervisor")
             .field("db_path", &self.db_path)
+            .field("partition", &self.partition)
             .field("tasks_dir", &self.tasks_dir)
             .field("model", &self.model)
             .field("spawn_argv", &self.spawn_argv)
@@ -724,6 +729,7 @@ impl WorkerSupervisor {
     pub fn new(db_path: impl Into<PathBuf>) -> Self {
         Self {
             db_path: db_path.into(),
+            partition: DEFAULT_PARTITION.to_owned(),
             tasks_dir: None,
             model: None,
             spawn_argv: None,
@@ -735,6 +741,13 @@ impl WorkerSupervisor {
                 None,
             ),
         }
+    }
+
+    /// The store partition (project id) the liveness probe reads; the
+    /// spawned worker resolves the same project from its working directory.
+    pub fn with_partition(mut self, partition: impl Into<String>) -> Self {
+        self.partition = partition.into();
+        self
     }
 
     /// Where the per-spawn supervisor logs land.
@@ -816,7 +829,7 @@ impl WorkerSupervisor {
         if let Some(owned) = self.process.owned_status(&argv) {
             return Ok(owned);
         }
-        if has_live_lease(&self.db_path, Utc::now())? {
+        if has_live_lease(&self.db_path, &self.partition, Utc::now())? {
             return Ok(DaemonStatus::new(DaemonState::Detached));
         }
         Ok(DaemonStatus::new(DaemonState::None))
@@ -1027,7 +1040,11 @@ mod tests {
     fn has_live_lease_is_false_for_a_missing_db() {
         let tmp = TempDir::new().unwrap();
         assert_eq!(
-            has_live_lease(&tmp.path().join("nope.sqlite"), Utc::now()),
+            has_live_lease(
+                &tmp.path().join("nope.sqlite"),
+                DEFAULT_PARTITION,
+                Utc::now()
+            ),
             Ok(false)
         );
     }
@@ -1037,9 +1054,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = tmp.path().join("store.sqlite");
         seed_lease(&db, "task-a", "worker-1", 60.0);
-        assert_eq!(has_live_lease(&db, Utc::now()), Ok(true));
+        assert_eq!(has_live_lease(&db, DEFAULT_PARTITION, Utc::now()), Ok(true));
+        // Another project's partition of the same file holds no lease.
+        assert_eq!(has_live_lease(&db, "other-project", Utc::now()), Ok(false));
         let later = Utc::now() + chrono::Duration::seconds(120);
-        assert_eq!(has_live_lease(&db, later), Ok(false));
+        assert_eq!(has_live_lease(&db, DEFAULT_PARTITION, later), Ok(false));
     }
 
     // --- spawn argv ----------------------------------------------------------

@@ -33,10 +33,21 @@
 -- under .flywheel/logs. Operators must treat the database and the logs
 -- directory as confidential.
 --
+-- project_id partitions every table (schema_version 13): one database (one
+-- user-level DSN) can hold many projects. It is an opaque key supplied by
+-- whoever opens the store (flywheel-core never interprets it); every read
+-- and write is scoped to the opener's value. It leads each table's primary
+-- key, or, for the surrogate-id ledgers (events, grader_results,
+-- control_commands), every unique constraint and hot lookup index, and
+-- composite foreign keys carry it so a row can only reference rows of its
+-- own project.
+--
 -- schema_version pins the on-disk schema version against the constant
--- CURRENT_SCHEMA_VERSION declared in flywheel.store_protocols. Stores read
--- the row on open and refuse pre-feature databases with a clear
--- "store must be re-created" error; there is no in-place migration.
+-- CURRENT_SCHEMA_VERSION (flywheel_core::store). Stores read the row on open:
+-- a brand-new schema is created at the current version, a schema behind it
+-- is refused with an error naming `fw db upgrade` (which migrates it in
+-- place, transactionally), and a schema ahead of it is refused as written by
+-- a newer flywheel. There is no implicit migration on open.
 --
 -- Bootstrap is idempotent: every CREATE statement uses IF NOT EXISTS, and
 -- the trigger creations are wrapped in DO $$ guards that no-op when the
@@ -68,9 +79,11 @@
 -- that task_versions and lifecycles can foreign-key a real, catalogued
 -- identity rather than a bare string.
 CREATE TABLE IF NOT EXISTS tasks (
-  id            TEXT PRIMARY KEY,
+  project_id    TEXT NOT NULL,
+  id            TEXT NOT NULL,
   first_seen_at TIMESTAMPTZ NOT NULL,
-  updated_at    TIMESTAMPTZ NOT NULL
+  updated_at    TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (project_id, id)
 );
 
 -- task_versions: immutable, content-addressed task definitions. Keyed by
@@ -85,6 +98,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 -- matching the insertion-order tie-break the sqlite (rowid) and in-memory
 -- (insertion seq) backends already use so all three return the same version.
 CREATE TABLE IF NOT EXISTS task_versions (
+  project_id    TEXT NOT NULL,
   task_id       TEXT NOT NULL,
   content_hash  TEXT NOT NULL,
   goal          TEXT NOT NULL,
@@ -93,11 +107,11 @@ CREATE TABLE IF NOT EXISTS task_versions (
   context_json  JSONB NOT NULL,
   created_at    TIMESTAMPTZ NOT NULL,
   insertion_seq BIGINT GENERATED ALWAYS AS IDENTITY,
-  PRIMARY KEY (task_id, content_hash),
-  FOREIGN KEY (task_id) REFERENCES tasks(id)
+  PRIMARY KEY (project_id, task_id, content_hash),
+  FOREIGN KEY (project_id, task_id) REFERENCES tasks(project_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_task_versions_id_created
-  ON task_versions(task_id, created_at);
+  ON task_versions(project_id, task_id, created_at);
 
 -- lifecycles: the single mutable row per run, keyed by run_id. version drives
 -- optimistic concurrency — every update carries an expected version and a
@@ -111,7 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_task_versions_id_created
 -- seeding, so the pinned version is present. session_id carries the agent SDK
 -- session id used to resume the brain across iterations.
 CREATE TABLE IF NOT EXISTS lifecycles (
-  run_id                  TEXT PRIMARY KEY,
+  project_id              TEXT NOT NULL,
+  run_id                  TEXT NOT NULL,
   task_id                 TEXT NOT NULL,
   status                  TEXT NOT NULL,
   version                 INTEGER NOT NULL,
@@ -140,7 +155,8 @@ CREATE TABLE IF NOT EXISTS lifecycles (
   -- without a source. Added in schema_version 12 via the forward
   -- migration the store applies on bootstrap.
   source                  TEXT,
-  FOREIGN KEY (task_id) REFERENCES tasks(id)
+  PRIMARY KEY (project_id, run_id),
+  FOREIGN KEY (project_id, task_id) REFERENCES tasks(project_id, id)
 );
 
 -- agent_context_json captures the agent identity and world state for this
@@ -166,6 +182,7 @@ CREATE TABLE IF NOT EXISTS lifecycles (
 -- before the first completed iteration). The dashboard snapshot reads
 -- these relational columns instead of scanning telemetry events.
 CREATE TABLE IF NOT EXISTS attempts (
+  project_id                   TEXT NOT NULL,
   run_id                       TEXT NOT NULL,
   number                       INTEGER NOT NULL,
   attempt_run_id               TEXT,
@@ -183,27 +200,28 @@ CREATE TABLE IF NOT EXISTS attempts (
   turns                        INTEGER NOT NULL DEFAULT 0,
   total_cost_usd               DOUBLE PRECISION NOT NULL DEFAULT 0,
   last_activity_at             TIMESTAMPTZ,
-  PRIMARY KEY (run_id, number),
-  FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
+  PRIMARY KEY (project_id, run_id, number),
+  FOREIGN KEY (project_id, run_id) REFERENCES lifecycles(project_id, run_id)
 );
 
 -- events: the domain-event ledger. Every row is a state-bearing,
 -- event-sourced member of the lifecycle log; kind holds the
 -- DomainEventKind value. sequence is per-run and strictly monotonic
 -- (MAX + 1 allocated inside the append transaction); list_domain_events
--- replays rows in ascending sequence order. The UNIQUE (run_id, sequence)
--- constraint both enforces the ordering invariant and provides the index
--- that read path uses.
+-- replays rows in ascending sequence order. The
+-- UNIQUE (project_id, run_id, sequence) constraint both enforces the
+-- ordering invariant and provides the index that read path uses.
 CREATE TABLE IF NOT EXISTS events (
   id              BIGSERIAL PRIMARY KEY,
+  project_id      TEXT NOT NULL,
   run_id          TEXT NOT NULL,
   attempt_number  INTEGER,
   ts              TIMESTAMPTZ NOT NULL,
   kind            TEXT NOT NULL,
   payload_json    JSONB NOT NULL,
   sequence        BIGINT NOT NULL,
-  FOREIGN KEY (run_id) REFERENCES lifecycles(run_id),
-  UNIQUE (run_id, sequence)
+  FOREIGN KEY (project_id, run_id) REFERENCES lifecycles(project_id, run_id),
+  UNIQUE (project_id, run_id, sequence)
 );
 
 -- One row per grader execution. Append-only — see header.
@@ -223,6 +241,7 @@ CREATE TABLE IF NOT EXISTS events (
 --   manual:     {operator_id, decision, notes, decided_at}
 CREATE TABLE IF NOT EXISTS grader_results (
   id                BIGSERIAL PRIMARY KEY,
+  project_id        TEXT NOT NULL,
   run_id            TEXT NOT NULL,
   attempt_number    INTEGER NOT NULL,
   ordinal           INTEGER NOT NULL,
@@ -233,15 +252,15 @@ CREATE TABLE IF NOT EXISTS grader_results (
   duration_ms       INTEGER NOT NULL,
   payload_json      JSONB NOT NULL,
   ts                TIMESTAMPTZ NOT NULL,
-  FOREIGN KEY (run_id, attempt_number) REFERENCES attempts(run_id, number)
+  FOREIGN KEY (project_id, run_id, attempt_number) REFERENCES attempts(project_id, run_id, number)
 );
 
--- events reads are served by the index the UNIQUE (run_id, sequence)
--- constraint materializes; no separate events index is needed.
--- grader_results reads are always scoped to one attempt's graders in ordinal
--- order.
+-- events reads are served by the index the
+-- UNIQUE (project_id, run_id, sequence) constraint materializes; no separate
+-- events index is needed. grader_results reads are always scoped to one
+-- attempt's graders in ordinal order.
 CREATE INDEX IF NOT EXISTS idx_grader_results_run_attempt
-  ON grader_results(run_id, attempt_number, ordinal);
+  ON grader_results(project_id, run_id, attempt_number, ordinal);
 
 -- Multi-worker mutual exclusion (the task_claims lease) is NOT a flywheel-core
 -- concern — a single task's lifecycle has no notion of competing workers. It
@@ -260,31 +279,31 @@ CREATE INDEX IF NOT EXISTS idx_grader_results_run_attempt
 -- bootstrap.
 CREATE TABLE IF NOT EXISTS control_commands (
   id            BIGSERIAL PRIMARY KEY,
+  project_id    TEXT        NOT NULL,
   run_id        TEXT        NOT NULL,
   kind          TEXT        NOT NULL,
   payload_json  JSONB       NOT NULL,
   enqueued_at   TIMESTAMPTZ NOT NULL,
   claimed_at    TIMESTAMPTZ,
-  FOREIGN KEY (run_id) REFERENCES lifecycles(run_id)
+  FOREIGN KEY (project_id, run_id) REFERENCES lifecycles(project_id, run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_control_commands_pending
-  ON control_commands(run_id, id) WHERE claimed_at IS NULL;
+  ON control_commands(project_id, run_id, id) WHERE claimed_at IS NULL;
 
--- schema_version pins the on-disk schema. The CHECK clause forces a
--- single sentinel row at id = 1 so ``ON CONFLICT DO NOTHING`` is a true
--- upsert against re-bootstrap; stores compare ``version`` on open and
--- refuse mismatched databases with StoreSchemaError. Forward migrations
--- from earlier schema versions are applied by the concrete store's
--- bootstrap (e.g. v3 -> v4 bumps this row after CREATE TABLE IF NOT
--- EXISTS above materializes control_commands on an existing database;
--- v4 -> v5 adds the lifecycles.awaiting_manual_ordinal nullable column;
--- v5 -> v6 drops the unused claude_session_store table; v11 -> v12 adds
--- the lifecycles.source nullable column — see bootstrap).
+-- schema_version pins the on-disk schema; it is the one table without a
+-- project_id (it versions the whole schema). version is the first column.
+-- The CHECK clause forces a single sentinel row at id = 1 so
+-- ``ON CONFLICT DO NOTHING`` is a true upsert against re-bootstrap; stores
+-- compare ``version`` on open and refuse mismatched databases with
+-- StoreSchemaError. `fw db upgrade` migrates a behind schema in place
+-- (v11 -> v12 added the nullable lifecycles.source column; v12 -> v13
+-- re-keys every table by project_id, filling existing rows with the store's
+-- bound project id).
 CREATE TABLE IF NOT EXISTS schema_version (
-  id      INTEGER PRIMARY KEY CHECK (id = 1),
-  version INTEGER NOT NULL
+  version INTEGER NOT NULL,
+  id      INTEGER PRIMARY KEY CHECK (id = 1)
 );
-INSERT INTO schema_version (id, version) VALUES (1, 12)
+INSERT INTO schema_version (version, id) VALUES (13, 1)
   ON CONFLICT (id) DO NOTHING;
 
 -- Append-only enforcement for grader_results. The trigger function raises a

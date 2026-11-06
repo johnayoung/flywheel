@@ -309,37 +309,35 @@ fn preflight_incompatible_schema_version_blocks() {
         "{}",
         prov.detail
     );
-    assert!(
-        prov.detail.contains("store must be re-created"),
-        "{}",
-        prov.detail
-    );
+    assert!(prov.detail.contains("newer flywheel"), "{}", prov.detail);
 }
 
 #[test]
-fn preflight_migratable_schema_version_warns() {
+fn preflight_behind_schema_version_blocks_naming_the_upgrade() {
     let Some(pg) = Postgres::acquire() else {
         return;
     };
-    let schema = pg.fresh_schema("fw_migratable");
+    let schema = pg.fresh_schema("fw_behind");
     pg.admin()
         .batch_execute(&format!(
             "CREATE SCHEMA \"{schema}\";
              CREATE TABLE \"{schema}\".schema_version (id INT PRIMARY KEY, version INT NOT NULL);
-             INSERT INTO \"{schema}\".schema_version (id, version) VALUES (1, 11);"
+             INSERT INTO \"{schema}\".schema_version (id, version) VALUES (1, 12);"
         ))
         .unwrap();
     let outcome = run_postgres_preflight(&pg.dsn(), &schema, PreflightOptions::default());
-    assert!(!outcome.blocked());
+    assert!(outcome.blocked());
     let version_check = outcome.check("schema version").unwrap();
-    assert_eq!(version_check.status, CheckStatus::Warn);
+    assert_eq!(version_check.status, CheckStatus::Block);
     assert_eq!(
         version_check.detail,
         format!(
-            "schema '{schema}' is at version 11; it will be migrated in place to \
-             {CURRENT_SCHEMA_VERSION} on first use"
+            "schema '{schema}' is at version 12, behind the store's {CURRENT_SCHEMA_VERSION}; \
+             the store refuses to open it until it is upgraded"
         )
     );
+    let remedy = version_check.remedy.as_deref().unwrap();
+    assert!(remedy.starts_with("fw db upgrade"), "{remedy}");
 }
 
 #[test]

@@ -17,6 +17,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | One-shot | `fw exec [PROMPT]` | Run one agent call from any project: no tasks, store, worktree, or config |
 | Projects | `fw project ls [--json]` / `prune` / `relink [PATH]` | The home's project registry (see [Projects and the home](#projects-and-the-home)) |
 | Config | `fw config [--json]` / `fw trust [--revoke]` | The effective config with sources; approve the repo's `.flywheel.toml` (see [Config and trust](#config-and-trust)) |
+| Store | `fw db upgrade [--db PATH] [--policy FILE]` | Migrate the store in place to this build's schema (see [The store](#the-store)) |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.
 
@@ -75,6 +76,20 @@ Every byte flywheel writes lives under `$FLYWHEEL_HOME` (default `~/.flywheel`):
 | `project ls [--json]` | Every project: `<id>  <path>` lines; `--json` prints `[{"id","path"}]`. |
 | `project prune` | Remove project dirs whose recorded repo no longer exists or no longer carries that id; prints `removed <id> (<path>): <reason>` per dir. |
 | `project relink [PATH]` | Point the cwd repo's id at an existing project dir (PATH: the dir or its id; bare: the single project recording this repo's path). Recovery after a re-clone or a lost key. |
+
+## The store
+
+Every table carries a `project_id` partition column, so one store (one Postgres DSN) holds many projects; each verb reads and writes only its own project's rows. The partition is the bound project id (the config `project_id` override, else the `.git/config` id). Invocations that skip project resolution -- `--policy FILE`, or `--db` with `--tasks-dir` -- use the fixed partition `default`.
+
+**A store whose schema version is behind this build is refused, never migrated implicitly**: every store verb exits non-zero with an error naming `fw db upgrade`. A store written by a newer flywheel is refused outright. A brand-new store is created at the current version.
+
+| Verb | What it does |
+|---|---|
+| `db upgrade` | Migrate the cwd project's store (sqlite under the project dir, or the configured Postgres DSN) in place: run tables and orchestrator tables, each in one transaction, from any supported older version; existing rows get the project id. Idempotent (a second run, or a store already partitioned whose version row is behind, only fixes the version). Exit 1 on a newer or unrecognized store. |
+| `db upgrade --db PATH` | Upgrade that sqlite file (partition `default`). |
+| `db upgrade --policy FILE` | Upgrade the store a legacy policy file selects (partition `default`). |
+
+Schema versions: run store `schema_version` 13, orchestrator store `orchestrator_schema_version` 10. Catalog: [persistence-tables.md](persistence-tables.md).
 
 ## Read verbs
 

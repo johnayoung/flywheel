@@ -25,6 +25,7 @@
 //! * project: `project <ls|prune|relink>` -> the home's project registry
 //! * config: `config [--json]` -> the effective config with sources
 //! * trust: `trust [--revoke]` -> approve (or revoke) the repo's `.flywheel.toml`
+//! * db: `db upgrade [--db PATH] [--policy FILE]` -> migrate the store in place
 //!
 //! `next`, `orchestrate`, and the core single-task CLI (`run`, `is-done`,
 //! `set-model`, ... under `workflow`) are plumbing, not product verbs -- the
@@ -57,6 +58,7 @@ use flywheel_core::audit::{
 };
 use flywheel_core::harness::{DEFAULT_AGENT_ID, ShutdownSignal};
 use flywheel_core::lifecycle::Status;
+use flywheel_core::store::DEFAULT_PARTITION;
 use flywheel_core::store_sqlite::SqliteStore;
 use flywheel_core::workflow::{self as core_workflow, RunStore};
 use flywheel_orchestrator::autopilot_run::{
@@ -75,7 +77,7 @@ use flywheel_orchestrator::triage_run;
 use flywheel_orchestrator::workflow::{
     self as orchestrator_workflow, Access, ArchiveRequest, ArchiveRunner, OrchestrateRequest,
     OrchestrateRunner, Verbs, default_store_registries, load_effective_policy, load_policy_file,
-    python_path_str, resolve_db_path, store_config_for,
+    python_path_str, resolve_db_path, store_config_for, store_partition,
 };
 use flywheel_worktree::daemon::{
     self, LandingLayout, RunOnceError, RunOnceRequest, arm_signals, build_held_out_source,
@@ -170,6 +172,7 @@ Verbs:
   project ls       list known projects (--json); also: project prune, project relink [PATH]
   config [--json]  print the effective config, each key with its source
   trust            approve this repo's .flywheel.toml (--revoke to withdraw)
+  db upgrade       migrate the store in place to this build's schema
 
 Store verbs work in any git repo: state lives under
 $FLYWHEEL_HOME/projects/<id>/ (default ~/.flywheel), keyed by the id in
@@ -394,6 +397,10 @@ pub fn route(
         // Approve (or revoke) the cwd repo's `.flywheel.toml`.
         return crate::config_verbs::run_trust(rest, out, err);
     }
+    if verb == crate::db_verbs::DB_VERB {
+        // Migrate the store in place to this build's schema.
+        return crate::db_verbs::run_db(rest, out, err);
+    }
     if verb == exec::EXEC_VERB {
         // One agent call: no flywheel.toml load, no store, no worktree.
         return exec::run_with(rest, out, err);
@@ -443,21 +450,17 @@ fn delegate_producer(core_argv: Vec<String>, err: &mut dyn Write) -> i32 {
     let backend = policy
         .as_ref()
         .map_or("sqlite", |p| p.store_backend.as_str());
-    if backend == "sqlite" {
-        // A home project's store lives under $FLYWHEEL_HOME: name it for
-        // core. Otherwise core resolves --db and opens its own sqlite store
-        // exactly as before.
-        if !explicit_db && policy.as_ref().is_some_and(|p| p.project.is_some()) {
-            let db_path = resolve_db_path(None, policy.as_ref());
-            let mut argv = core_argv;
-            argv.splice(
-                1..1,
-                ["--db".to_owned(), db_path.to_string_lossy().into_owned()],
-            );
-            return core_workflow::main(&argv);
-        }
+    let home_project = !explicit_db && policy.as_ref().is_some_and(|p| p.project.is_some());
+    if backend == "sqlite" && !home_project {
+        // No project and the default backend: core resolves --db and opens
+        // its own sqlite store (default partition) exactly as before.
         return core_workflow::main(&core_argv);
     }
+    // A home project's store lives under $FLYWHEEL_HOME and is partitioned
+    // by the project id; a postgres store is the policy's. Either way the
+    // store is opened here (bound to the project's partition) and injected,
+    // and a home project's --db names the project dir core anchors its run
+    // logs under.
     let db_path = resolve_db_path(None, policy.as_ref());
     let bundle = match open_store_bundle(policy.as_ref(), &db_path) {
         Ok(bundle) => bundle,
@@ -466,8 +469,15 @@ fn delegate_producer(core_argv: Vec<String>, err: &mut dyn Write) -> i32 {
             return 2;
         }
     };
+    let mut argv = core_argv;
+    if home_project {
+        argv.splice(
+            1..1,
+            ["--db".to_owned(), db_path.to_string_lossy().into_owned()],
+        );
+    }
     let store: Arc<dyn RunStore> = Arc::new(bundle.core);
-    core_workflow::main_with_store(&core_argv, Some(store))
+    core_workflow::main_with_store(&argv, Some(store))
 }
 
 /// Forward `audit` to the core audit verb with the product's db resolution.
@@ -494,7 +504,7 @@ fn delegate_audit(rest: &[String], out: &mut dyn Write, err: &mut dyn Write) -> 
     let db_path = resolve_db_path(None, policy.as_ref());
     let mut argv = vec!["--db".to_owned(), db_path.to_string_lossy().into_owned()];
     argv.extend_from_slice(rest);
-    audit_main(&argv, out, err)
+    audit_main_in(&argv, &store_partition(policy.as_ref()), out, err)
 }
 
 // --- The audit verb's command line --------------------------------------------------
@@ -769,6 +779,17 @@ fn arm_audit_interrupt(flag: StopFlag) {
 /// an empty result, since opening it would silently bootstrap an empty
 /// database; an unknown run exits 0 with a stderr notice.
 pub fn audit_main(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    audit_main_in(argv, DEFAULT_PARTITION, out, err)
+}
+
+/// [`audit_main`] reading the store's `partition` (the resolved project's
+/// id; [`DEFAULT_PARTITION`] for an explicit `--db`).
+pub fn audit_main_in(
+    argv: &[String],
+    partition: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     let command = match parse_audit_args(argv) {
         Ok(AuditParsed::Command(command)) => command,
         Ok(AuditParsed::Help) => {
@@ -800,7 +821,7 @@ pub fn audit_main(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> 
         );
         return 2;
     }
-    let store = match SqliteStore::open(&db_path) {
+    let store = match SqliteStore::open_partition(&db_path, partition) {
         Ok(store) => store,
         Err(failure) => {
             let _ = writeln!(err, "error: {failure}");
@@ -1133,6 +1154,7 @@ impl ConsoleDaemons {
     /// (never auto-spawned -- it writes to the base branch unattended).
     pub fn new(spec: &DaemonSpawnSpec) -> Self {
         let worker = WorkerSupervisor::new(&spec.db_path)
+            .with_partition(spec.partition.clone())
             .with_tasks_dir(spec.tasks_dir.clone())
             .with_model(spec.model.clone());
         let worker = match supervision_policy() {
@@ -2017,6 +2039,7 @@ mod tests {
         let spec = DaemonSpawnSpec {
             project: None,
             db_path: tmp.path().join("db.sqlite"),
+            partition: DEFAULT_PARTITION.to_owned(),
             tasks_dir: Some(tmp.path().join("tasks")),
             model: Some("claude-opus-4".to_owned()),
             auto_start_worker: false,

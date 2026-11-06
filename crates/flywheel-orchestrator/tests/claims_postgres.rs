@@ -31,8 +31,9 @@ use flywheel_core::store::{CURRENT_SCHEMA_VERSION, LifecycleStore};
 use flywheel_core::store_postgres::PostgresStore;
 use flywheel_orchestrator::claims::{
     CURRENT_ORCH_SCHEMA_VERSION, ClaimStore, ClaimStoreError, EVENT_ACQUIRED, EVENT_EXPIRED,
-    REASON_AWAITING_APPROVAL, REASON_PREREQUISITE_MISSING, STOP_PREPARE_SKIP, SqliteClaimStore,
-    WorkItemObservation, conflict_keys,
+    GraphSnapshotItem, ORCH_PARTITIONED_TABLES, REASON_AWAITING_APPROVAL,
+    REASON_PREREQUISITE_MISSING, STOP_PREPARE_SKIP, SqliteClaimStore, WorkItemObservation,
+    conflict_keys,
 };
 use flywheel_orchestrator::claims_postgres::{
     CLAIM_ACQUIRE_LOCK_KEY, POSTGRES_BACKEND, PostgresClaimStore, register_postgres_backends,
@@ -162,6 +163,7 @@ fn two_claimants_through_the_factory_split_every_task_exactly_once() {
         db_path: db_path.clone(),
         schema: Some(schema.clone()),
         dsn: None,
+        project_id: flywheel_core::store::DEFAULT_PARTITION.to_owned(),
     };
     let store_a = build_claim_store(&registries, &config, &environ).unwrap();
     let store_b = build_claim_store(&registries, &config, &environ).unwrap();
@@ -346,13 +348,22 @@ fn build_v3_schema(pg: &Postgres, schema: &str) {
 }
 
 #[test]
-fn v3_schema_migrates_forward_keeping_rows_with_empty_ledgers() {
+fn v3_schema_is_refused_then_upgrades_keeping_rows_with_empty_ledgers() {
     let Some(pg) = Postgres::acquire() else {
         return;
     };
     let schema = pg.fresh_schema("fw_v3");
     build_v3_schema(&pg, &schema);
-    let store = open(&pg, &schema);
+    // No implicit migration: the open names the upgrade and changes nothing.
+    let err = PostgresClaimStore::connect(&pg.dsn(), &schema).unwrap_err();
+    assert!(err.to_string().contains("fw db upgrade"), "{err}");
+    let upgrade = PostgresClaimStore::upgrade(&pg.dsn(), &schema, "proj").unwrap();
+    assert_eq!(upgrade.from, Some(3));
+    assert_eq!(
+        upgrade.partitioned,
+        vec!["task_claims", "work_items", "orchestrator_stop_events"]
+    );
+    let store = PostgresClaimStore::connect_partition(&pg.dsn(), &schema, "proj").unwrap();
     let claim = store.load_claim("task-a").unwrap().unwrap();
     assert_eq!(claim.worker_id, "worker-1");
     assert_eq!(claim.lease_expires_at, t(30));
@@ -377,10 +388,168 @@ fn v3_schema_migrates_forward_keeping_rows_with_empty_ledgers() {
         "SELECT version FROM orchestrator_schema_version WHERE id = 1",
     );
     assert_eq!(version, CURRENT_ORCH_SCHEMA_VERSION as i32);
-    // A second open is a clean no-op on the converged schema.
+    // A second upgrade is a clean no-op on the converged schema.
     drop(store);
-    let reopened = open(&pg, &schema);
+    assert!(
+        PostgresClaimStore::upgrade(&pg.dsn(), &schema, "proj")
+            .unwrap()
+            .is_noop()
+    );
+    let reopened = PostgresClaimStore::connect_partition(&pg.dsn(), &schema, "proj").unwrap();
     assert_eq!(reopened.list_stop_events().unwrap().len(), 2);
+}
+
+#[test]
+fn a_v9_schema_upgrades_in_place_keyed_by_the_partition() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_v9");
+    pg.admin()
+        .batch_execute(&format!(
+            "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\", public;
+             {}
+             INSERT INTO task_claims (task_id, worker_id, claimed_at, lease_expires_at, version,
+               conflict_keys_json) VALUES ('t1', 'w1', '2026-05-28T12:00:00+00:00',
+               '2026-05-28T12:00:30+00:00', 2, '[\"k\"]'::jsonb);
+             INSERT INTO orchestrator_events (task_id, worker_id, event_type, version,
+               lease_expires_at, occurred_at) VALUES ('t1', 'w1', 'acquired', 1,
+               '2026-05-28T12:00:30+00:00', '2026-05-28T12:00:00+00:00');
+             INSERT INTO work_item_dependencies (task_id, prerequisite_task_id, created_at)
+               VALUES ('t1', 't0', '2026-05-28T12:00:00+00:00');",
+            include_str!("fixtures/orchestrator-schema-postgres-v9.sql")
+        ))
+        .unwrap();
+    let upgrade = PostgresClaimStore::upgrade(&pg.dsn(), &schema, "proj").unwrap();
+    assert_eq!(upgrade.from, Some(9));
+    assert_eq!(upgrade.partitioned.len(), ORCH_PARTITIONED_TABLES.len());
+    let store = PostgresClaimStore::connect_partition(&pg.dsn(), &schema, "proj").unwrap();
+    assert_eq!(store.load_claim("t1").unwrap().unwrap().version, 2);
+    assert_eq!(store.load_work_item_dependencies("t1").unwrap(), vec!["t0"]);
+    assert!(
+        store
+            .acquire_claim("t2", "w2", t(10), 30.0, &conflict_keys(["k"]))
+            .unwrap()
+            .is_none()
+    );
+    store
+        .acquire_claim("t3", "w3", t(10), 30.0, &none())
+        .unwrap()
+        .unwrap();
+    let events = store.list_events().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(events[1].id > events[0].id);
+    let mut admin = pg.admin_in(&schema);
+    let first: String = scalar(
+        &mut admin,
+        "SELECT column_name::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'orchestrator_schema_version' \
+         ORDER BY ordinal_position LIMIT 1",
+    );
+    assert_eq!(first, "version");
+    let pk: String = scalar(
+        &mut admin,
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conrelid = 'task_claims'::regclass AND contype = 'p'",
+    );
+    assert_eq!(pk, "PRIMARY KEY (project_id, task_id)");
+    // Another partition sees none of the migrated rows.
+    let other = PostgresClaimStore::connect_partition(&pg.dsn(), &schema, "other").unwrap();
+    assert!(other.load_claim("t1").unwrap().is_none());
+}
+
+#[test]
+fn a_keyed_schema_behind_only_in_its_version_row_is_refused_then_repaired() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_behind");
+    open(&pg, &schema)
+        .acquire_claim("t1", "w1", t(0), 30.0, &none())
+        .unwrap()
+        .unwrap();
+    pg.admin_in(&schema)
+        .batch_execute("UPDATE orchestrator_schema_version SET version = version - 1")
+        .unwrap();
+    let err = PostgresClaimStore::connect(&pg.dsn(), &schema).unwrap_err();
+    assert!(err.to_string().contains("fw db upgrade"), "{err}");
+    let upgrade = PostgresClaimStore::upgrade(&pg.dsn(), &schema, "default").unwrap();
+    assert_eq!(upgrade.from, Some(CURRENT_ORCH_SCHEMA_VERSION - 1));
+    assert!(upgrade.partitioned.is_empty());
+    assert!(open(&pg, &schema).load_claim("t1").unwrap().is_some());
+}
+
+#[test]
+fn partitions_sharing_one_schema_never_see_each_other() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_parts");
+    let a = PostgresClaimStore::connect_partition(&pg.dsn(), &schema, "proj-a").unwrap();
+    let b = PostgresClaimStore::connect_partition(&pg.dsn(), &schema, "proj-b").unwrap();
+    assert_eq!(a.partition(), "proj-a");
+    let keys = conflict_keys(["k"]);
+    a.acquire_claim("t1", "wa", t(0), 30.0, &keys)
+        .unwrap()
+        .unwrap();
+    b.acquire_claim("t1", "wb", t(0), 30.0, &keys)
+        .unwrap()
+        .unwrap();
+    assert!(
+        b.acquire_claim("t2", "wb", t(1), 30.0, &keys)
+            .unwrap()
+            .is_none()
+    );
+    for store in [&a, &b] {
+        store
+            .upsert_work_item(
+                &WorkItemObservation {
+                    task_id: "t1".into(),
+                    ..Default::default()
+                },
+                t(0),
+            )
+            .unwrap();
+        store
+            .replace_work_item_dependencies("t1", &["t0".to_owned()], t(0))
+            .unwrap();
+        store
+            .record_human_review(REASON_AWAITING_APPROVAL, "t1", t(0), "r", "")
+            .unwrap();
+        store.record_session_pause(t(50), t(0), 30.0, "r").unwrap();
+        store
+            .record_source_sync_start("directory", "d", t(0))
+            .unwrap();
+        store
+            .record_graph_snapshot(&[GraphSnapshotItem::new("t1", "ready", true)], t(0))
+            .unwrap();
+    }
+    a.mark_work_items_disappeared(&[], t(5)).unwrap();
+    assert!(
+        a.load_work_item("t1")
+            .unwrap()
+            .unwrap()
+            .disappeared_at
+            .is_some()
+    );
+    assert!(
+        b.load_work_item("t1")
+            .unwrap()
+            .unwrap()
+            .disappeared_at
+            .is_none()
+    );
+    assert_eq!(a.list_claims().unwrap().len(), 1);
+    assert_eq!(a.list_events().unwrap().len(), 1);
+    assert_eq!(a.list_human_review_queue().unwrap().len(), 1);
+    assert_eq!(a.list_work_item_dependencies().unwrap().len(), 1);
+    assert_eq!(a.list_session_pauses().unwrap().len(), 1);
+    assert_eq!(a.list_source_syncs().unwrap().len(), 1);
+    let snap = b.latest_graph_snapshot().unwrap().unwrap();
+    assert_eq!(snap.last_event_id, b.list_events().unwrap()[0].id);
+    assert!(a.list_graph_snapshot_items(snap.id).unwrap().is_empty());
+    assert_eq!(a.sweep_expired_claims(t(40)).unwrap(), vec!["t1"]);
+    assert!(b.load_claim("t1").unwrap().is_some());
 }
 
 #[test]
@@ -542,7 +711,9 @@ fn columns_are_timestamptz_and_jsonb_and_the_queue_index_exists() {
         "idx_orchestrator_stop_events_subject",
         "idx_orchestrator_stop_events_kind",
         "idx_orchestrator_session_pauses_pause_until",
-        "idx_graph_snapshot_items_snapshot",
+        "idx_orchestrator_events_project",
+        "idx_graph_snapshots_project",
+        "idx_source_syncs_project",
         "idx_work_item_dependencies_prerequisite",
     ] {
         assert!(indexes.iter().any(|i| i == expected), "{expected} missing");
@@ -561,8 +732,9 @@ fn expiry_is_decided_temporally_across_offsets() {
     // at :30 -- decisions no text comparison of the literals would reach.
     pg.admin_in(&schema)
         .batch_execute(
-            "INSERT INTO task_claims (task_id, worker_id, claimed_at, lease_expires_at, \
-             version, conflict_keys_json) VALUES ('held', 'w1', '2026-05-28 14:00:00+02', \
+            "INSERT INTO task_claims (project_id, task_id, worker_id, claimed_at, \
+             lease_expires_at, version, conflict_keys_json) VALUES ('default', 'held', 'w1', \
+             '2026-05-28 14:00:00+02', \
              '2026-05-28 14:00:30+02', 1, '[\"k\"]'::jsonb)",
         )
         .unwrap();
@@ -710,8 +882,8 @@ fn nul_bytes_in_free_form_text_are_stored_as_replacement_characters() {
 // --- Factory routing ---------------------------------------------------------------------------
 
 fn sqlite_registries() -> StoreRegistries {
-    let opener: SqliteCoreOpener = Arc::new(|path: &std::path::Path| {
-        flywheel_core::store_sqlite::SqliteStore::open(path)
+    let opener: SqliteCoreOpener = Arc::new(|path: &std::path::Path, partition: &str| {
+        flywheel_core::store_sqlite::SqliteStore::open_partition(path, partition)
             .map(|store| Arc::new(store) as Arc<dyn flywheel_core::store::HarnessStore>)
     });
     StoreRegistries::with_sqlite(opener)
@@ -733,6 +905,7 @@ fn open_stores_routes_both_families_onto_one_postgres_schema() {
         db_path: db_path.clone(),
         schema: Some(schema.clone()),
         dsn: None,
+        project_id: flywheel_core::store::DEFAULT_PARTITION.to_owned(),
     };
     preflight_store(&registries, &config, &environ).unwrap();
     let bundle = open_stores(&registries, &config, &environ).unwrap();

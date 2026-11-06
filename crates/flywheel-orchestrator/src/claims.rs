@@ -31,6 +31,11 @@ use flywheel_core::events::{
     PARK_KIND_SUBMIT_ERROR, PARK_KIND_UNCOMMITTED_WORK,
 };
 use flywheel_core::loaders::{canonical_json, task_digest};
+use flywheel_core::schema_ddl::without_pragmas;
+use flywheel_core::store::{DEFAULT_PARTITION, SchemaUpgrade, schema_version_message};
+use flywheel_core::store_sqlite::{
+    Recorded, any_table_exists, partition_table, recorded_version, version_column_first,
+};
 use flywheel_core::task::Task;
 
 // --- Schema version -------------------------------------------------------------
@@ -39,8 +44,9 @@ use flywheel_core::task::Task;
 /// flywheel-core's `schema_version` so the two can share one backend without
 /// colliding.
 ///
-/// History (every bump is a pure additive forward migration -- `CREATE TABLE
-/// IF NOT EXISTS` plus `ALTER TABLE ADD COLUMN`, never drop-and-recreate):
+/// History (v1..v9 were additive; v10 re-keys every table by `project_id`).
+/// A store behind this version is refused on open naming `fw db upgrade`
+/// ([`SqliteClaimStore::upgrade`]), which migrates any of v1..v9 in place:
 ///
 /// * v1 `task_claims` + `orchestrator_schema_version`
 /// * v2 `work_items`, `work_item_dependencies`, `source_syncs`
@@ -51,7 +57,26 @@ use flywheel_core::task::Task;
 /// * v7 `orchestrator_stop_events.run_id`
 /// * v8 `orchestrator_session_pauses` ledger
 /// * v9 `orchestrator_stop_events.attribution`
-pub const CURRENT_ORCH_SCHEMA_VERSION: u32 = 9;
+/// * v10 every table partitioned by the opaque `project_id` key (leading
+///   each primary key or hot index); the sentinel is `(version, id)`
+pub const CURRENT_ORCH_SCHEMA_VERSION: u32 = 10;
+
+/// The orchestrator tables, every one partitioned by `project_id`. The
+/// sentinel ([`ORCH_VERSION_TABLE`]) is the one table without it.
+pub const ORCH_PARTITIONED_TABLES: [&str; 9] = [
+    "task_claims",
+    "work_items",
+    "work_item_dependencies",
+    "source_syncs",
+    "orchestrator_events",
+    "orchestrator_stop_events",
+    "graph_snapshots",
+    "graph_snapshot_items",
+    "orchestrator_session_pauses",
+];
+
+/// The orchestrator's schema-version sentinel table.
+pub const ORCH_VERSION_TABLE: &str = "orchestrator_schema_version";
 
 // --- Claim-event vocabulary --------------------------------------------------------
 
@@ -187,13 +212,13 @@ pub struct ClaimLostError {
     pub task_id: String,
 }
 
-/// The orchestrator's on-disk schema version is newer than this build (or the
-/// sentinel is unreadable). Older stores are migrated forward in place and
-/// never trip this.
+/// The orchestrator's on-disk schema version is not this build's: behind
+/// (names `fw db upgrade`, which migrates it in place), newer than this build,
+/// or unreadable. There is no implicit migration on open.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "orchestrator store must be re-created: observed orchestrator_schema_version={}, expected {expected}",
-    observed_display(.observed)
+    "{}",
+    schema_version_message("orchestrator store", ORCH_VERSION_TABLE, *.observed, *.expected)
 )]
 pub struct OrchestratorSchemaError {
     /// `None` when the sentinel row is missing entirely.
@@ -201,10 +226,17 @@ pub struct OrchestratorSchemaError {
     pub expected: u32,
 }
 
-fn observed_display(observed: &Option<u32>) -> String {
-    match observed {
-        Some(v) => v.to_string(),
-        None => "None".to_owned(),
+impl OrchestratorSchemaError {
+    fn new(observed: Option<u32>) -> Self {
+        Self {
+            observed,
+            expected: CURRENT_ORCH_SCHEMA_VERSION,
+        }
+    }
+
+    /// The store is at an older version the in-place upgrade migrates.
+    pub fn is_behind(&self) -> bool {
+        self.observed.is_some_and(|v| v < self.expected)
     }
 }
 
@@ -1357,32 +1389,36 @@ fn clamp_pause(
 
 // --- SQLite store -----------------------------------------------------------------------
 
-/// The orchestrator DDL. Every statement is idempotent (`IF NOT EXISTS`);
-/// the column-level additive migrations run after it in [`bootstrap`].
+/// The orchestrator DDL. Every statement is idempotent (`IF NOT EXISTS`).
 ///
-/// [`EXTRA_INDEX_SQL`] adds `idx_orchestrator_stop_events_kind`, which backs
-/// the human-review queue read (`WHERE kind IN (...)`) on a ledger that
-/// otherwise grows without bound. It is purely additive.
+/// Every table leads with the opaque `project_id` partition key: it leads
+/// each natural primary key, and every hot lookup index of the surrogate-id
+/// ledgers. The sentinel is `(version, id)` -- version first. Table-level
+/// constraints sit one per line (the in-place upgrade re-creates tables from
+/// these statements). Mirrors `claims_postgres::SCHEMA_SQL` table for table.
 const SCHEMA_SQL: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS task_claims (
-  task_id            TEXT PRIMARY KEY,
+  project_id         TEXT NOT NULL,
+  task_id            TEXT NOT NULL,
   worker_id          TEXT NOT NULL,
   claimed_at         DATETIME NOT NULL,
   lease_expires_at   DATETIME NOT NULL,
   version            INTEGER NOT NULL,
-  conflict_keys_json TEXT NOT NULL DEFAULT '[]'
+  conflict_keys_json TEXT NOT NULL DEFAULT '[]',
+  PRIMARY KEY (project_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS orchestrator_schema_version (
-  id      INTEGER PRIMARY KEY CHECK (id = 1),
-  version INTEGER NOT NULL
+  version INTEGER NOT NULL,
+  id      INTEGER PRIMARY KEY CHECK (id = 1)
 );
 
 CREATE TABLE IF NOT EXISTS work_items (
-  task_id                    TEXT PRIMARY KEY,
+  project_id                 TEXT NOT NULL,
+  task_id                    TEXT NOT NULL,
   source_kind                TEXT,
   source_ref                 TEXT,
   source_url                 TEXT,
@@ -1394,20 +1430,23 @@ CREATE TABLE IF NOT EXISTS work_items (
   first_seen_at              TEXT NOT NULL,
   last_seen_at               TEXT NOT NULL,
   disappeared_at             TEXT,
-  metadata_json              TEXT NOT NULL DEFAULT '{}'
+  metadata_json              TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (project_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS work_item_dependencies (
+  project_id           TEXT NOT NULL,
   task_id              TEXT NOT NULL,
   prerequisite_task_id TEXT NOT NULL,
   created_at           TEXT NOT NULL,
-  PRIMARY KEY (task_id, prerequisite_task_id)
+  PRIMARY KEY (project_id, task_id, prerequisite_task_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_work_item_dependencies_prerequisite
-  ON work_item_dependencies (prerequisite_task_id);
+  ON work_item_dependencies (project_id, prerequisite_task_id);
 
 CREATE TABLE IF NOT EXISTS source_syncs (
+  project_id     TEXT NOT NULL,
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   source_kind    TEXT NOT NULL,
   source_name    TEXT NOT NULL,
@@ -1419,7 +1458,11 @@ CREATE TABLE IF NOT EXISTS source_syncs (
   metadata_json  TEXT NOT NULL DEFAULT '{}'
 );
 
+CREATE INDEX IF NOT EXISTS idx_source_syncs_project
+  ON source_syncs (project_id, id);
+
 CREATE TABLE IF NOT EXISTS orchestrator_events (
+  project_id       TEXT NOT NULL,
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id          TEXT NOT NULL,
   worker_id        TEXT NOT NULL,
@@ -1430,9 +1473,13 @@ CREATE TABLE IF NOT EXISTS orchestrator_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_events_task
-  ON orchestrator_events (task_id, id);
+  ON orchestrator_events (project_id, task_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_orchestrator_events_project
+  ON orchestrator_events (project_id, id);
 
 CREATE TABLE IF NOT EXISTS orchestrator_stop_events (
+  project_id  TEXT NOT NULL,
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   kind        TEXT NOT NULL,
   subject     TEXT NOT NULL,
@@ -1443,16 +1490,24 @@ CREATE TABLE IF NOT EXISTS orchestrator_stop_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_subject
-  ON orchestrator_stop_events (subject, id);
+  ON orchestrator_stop_events (project_id, subject, id);
+
+CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_kind
+  ON orchestrator_stop_events (project_id, kind, id);
 
 CREATE TABLE IF NOT EXISTS graph_snapshots (
+  project_id    TEXT NOT NULL,
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   captured_at   TEXT NOT NULL,
   item_count    INTEGER NOT NULL,
   last_event_id INTEGER NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_graph_snapshots_project
+  ON graph_snapshots (project_id, id);
+
 CREATE TABLE IF NOT EXISTS graph_snapshot_items (
+  project_id                  TEXT NOT NULL,
   snapshot_id                 INTEGER NOT NULL,
   task_id                     TEXT NOT NULL,
   source_kind                 TEXT,
@@ -1466,13 +1521,11 @@ CREATE TABLE IF NOT EXISTS graph_snapshot_items (
   ready                       INTEGER NOT NULL,
   claim_holder                TEXT,
   resolved_prerequisites_json TEXT NOT NULL DEFAULT '[]',
-  PRIMARY KEY (snapshot_id, task_id)
+  PRIMARY KEY (project_id, snapshot_id, task_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_graph_snapshot_items_snapshot
-  ON graph_snapshot_items (snapshot_id);
-
 CREATE TABLE IF NOT EXISTS orchestrator_session_pauses (
+  project_id  TEXT NOT NULL,
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id      TEXT NOT NULL DEFAULT '',
   reset_at    TEXT NOT NULL,
@@ -1481,14 +1534,7 @@ CREATE TABLE IF NOT EXISTS orchestrator_session_pauses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_session_pauses_pause_until
-  ON orchestrator_session_pauses (pause_until);
-";
-
-/// The supplementary stop-events index (see [`SCHEMA_SQL`]), kept as a
-/// separate statement applied after the base DDL.
-const EXTRA_INDEX_SQL: &str = "
-CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_kind
-  ON orchestrator_stop_events (kind, id);
+  ON orchestrator_session_pauses (project_id, pause_until);
 ";
 
 /// SQLite [`ClaimStore`]. Owns the orchestrator tables and their schema
@@ -1499,28 +1545,77 @@ CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_kind
 /// transaction so concurrent instances on one file (several workers)
 /// serialize their check-and-write through SQLite's own lock with a 5s busy
 /// timeout.
+///
+/// Every read and write is scoped to the store's partition (the opaque
+/// `project_id` its opener supplies), so several partitions share one file
+/// without observing each other's claims, ledgers, or work items.
 #[derive(Debug)]
 pub struct SqliteClaimStore {
     conn: Mutex<Connection>,
+    partition: String,
 }
 
 impl SqliteClaimStore {
-    /// Open (and bootstrap or migrate) the store at `path`.
+    /// Open (bootstrapping a fresh file) the store at `path`, bound to
+    /// [`DEFAULT_PARTITION`]. A store at another schema version is refused.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ClaimStoreError> {
+        Self::open_partition(path, DEFAULT_PARTITION)
+    }
+
+    /// Open the store at `path` bound to `partition`.
+    pub fn open_partition(
+        path: impl AsRef<Path>,
+        partition: &str,
+    ) -> Result<Self, ClaimStoreError> {
         let conn = Connection::open(path.as_ref())?;
         with_locked_retry(|| bootstrap(&conn))?;
         Ok(Self {
             conn: Mutex::new(conn),
+            partition: partition.to_owned(),
         })
     }
 
-    /// A private in-memory database (the `":memory:"` path).
+    /// A private in-memory database (the `":memory:"` path), bound to
+    /// [`DEFAULT_PARTITION`].
     pub fn in_memory() -> Result<Self, ClaimStoreError> {
         let conn = Connection::open_in_memory()?;
         bootstrap(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            partition: DEFAULT_PARTITION.to_owned(),
         })
+    }
+
+    /// The partition key every read and write is scoped to.
+    pub fn partition(&self) -> &str {
+        &self.partition
+    }
+
+    /// Migrate the orchestrator tables of the database at `path` in place to
+    /// [`CURRENT_ORCH_SCHEMA_VERSION`], filling the partition column of
+    /// existing rows with `partition`.
+    ///
+    /// One `BEGIN IMMEDIATE` transaction (with `foreign_keys` off for its
+    /// duration): every orchestrator table lacking `project_id` is rebuilt
+    /// from the current DDL (columns an older version lacked take their
+    /// declared defaults, so any of v1..v9 converges), the sentinel is
+    /// re-created version-first, missing tables and indexes are created, and
+    /// the version is set current. Each step inspects the live layout, so
+    /// the upgrade is idempotent and also repairs a keyed store whose version
+    /// row is behind. A missing store is created current; a newer one is
+    /// refused untouched.
+    pub fn upgrade(
+        path: impl AsRef<Path>,
+        partition: &str,
+    ) -> Result<SchemaUpgrade, ClaimStoreError> {
+        let mut conn = Connection::open(path.as_ref())?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = OFF;")?;
+        let result = upgrade_in_transaction(&mut conn, partition);
+        let restored = conn.execute_batch("PRAGMA foreign_keys = ON;");
+        let upgrade = result?;
+        restored?;
+        Ok(upgrade)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, ClaimStoreError> {
@@ -1579,75 +1674,86 @@ fn with_locked_retry<T>(
     }
 }
 
-fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>, rusqlite::Error> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    rows.collect()
+/// Insert the sentinel row at the current version when absent.
+fn seed_version(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR IGNORE INTO orchestrator_schema_version (version, id) VALUES (?1, 1)",
+        params![CURRENT_ORCH_SCHEMA_VERSION],
+    )?;
+    Ok(())
 }
 
-/// Materialize the schema and converge an older store forward.
+/// Check the schema version, then materialize the schema of a fresh store.
+///
+/// The version is read BEFORE any DDL (the current DDL indexes the partition
+/// column, which a behind store lacks): a fresh file (no orchestrator table)
+/// is created at the current version, a current one opens, and anything
+/// else is refused -- a behind store names `fw db upgrade`; nothing is
+/// migrated implicitly.
 fn bootstrap(conn: &Connection) -> Result<(), ClaimStoreError> {
     // busy_timeout FIRST: the schema script is this connection's first
     // contended write, and N workers bootstrapping one fresh store at once
     // would otherwise hand every loser an instant "database is locked".
     conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    match recorded_version(conn, ORCH_VERSION_TABLE)? {
+        Recorded::Missing => {
+            if any_table_exists(conn, &ORCH_PARTITIONED_TABLES)? {
+                return Err(OrchestratorSchemaError::new(None).into());
+            }
+        }
+        Recorded::Version(Some(v)) if v == CURRENT_ORCH_SCHEMA_VERSION => {}
+        Recorded::Version(observed) => return Err(OrchestratorSchemaError::new(observed).into()),
+    }
     conn.execute_batch(SCHEMA_SQL)?;
-    conn.execute_batch(EXTRA_INDEX_SQL)?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-    // Additive v3 migration: a v1/v2 task_claims table predates the
-    // conflict-keys column; add it in place.
-    if !table_columns(conn, "task_claims")?.contains("conflict_keys_json") {
-        conn.execute_batch(
-            "ALTER TABLE task_claims ADD COLUMN conflict_keys_json TEXT NOT NULL DEFAULT '[]'",
-        )?;
-    }
-    // Additive v7 / v9 migrations: a v6..v8 stop-events table predates the
-    // run_id / attribution columns.
-    let stop_columns = table_columns(conn, "orchestrator_stop_events")?;
-    if !stop_columns.contains("run_id") {
-        conn.execute_batch(
-            "ALTER TABLE orchestrator_stop_events ADD COLUMN run_id TEXT NOT NULL DEFAULT ''",
-        )?;
-    }
-    if !stop_columns.contains("attribution") {
-        conn.execute_batch(
-            "ALTER TABLE orchestrator_stop_events ADD COLUMN attribution TEXT NOT NULL DEFAULT ''",
-        )?;
-    }
-    conn.execute(
-        "INSERT OR IGNORE INTO orchestrator_schema_version (id, version) VALUES (1, ?1)",
-        params![CURRENT_ORCH_SCHEMA_VERSION],
-    )?;
-    let observed: Option<i64> = conn
-        .query_row(
-            "SELECT version FROM orchestrator_schema_version WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let observed = observed.and_then(|v| u32::try_from(v).ok());
-    // Every table/column above was materialized additively, so an older store
-    // keeps its rows and simply converges its sentinel forward. A store newer
-    // than this build (or an unreadable sentinel) is refused.
-    match observed {
-        Some(v) if v < CURRENT_ORCH_SCHEMA_VERSION => {
-            conn.execute(
-                "UPDATE orchestrator_schema_version SET version = ?1 WHERE id = 1",
-                params![CURRENT_ORCH_SCHEMA_VERSION],
-            )?;
-            Ok(())
-        }
-        Some(v) if v == CURRENT_ORCH_SCHEMA_VERSION => Ok(()),
-        other => Err(OrchestratorSchemaError {
-            observed: other,
-            expected: CURRENT_ORCH_SCHEMA_VERSION,
-        }
-        .into()),
-    }
+    seed_version(conn)?;
+    Ok(())
 }
 
+fn upgrade_in_transaction(
+    conn: &mut Connection,
+    partition: &str,
+) -> Result<SchemaUpgrade, ClaimStoreError> {
+    let ddl = without_pragmas(SCHEMA_SQL);
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let from = match recorded_version(&tx, ORCH_VERSION_TABLE)? {
+        Recorded::Missing => {
+            if any_table_exists(&tx, &ORCH_PARTITIONED_TABLES)? {
+                return Err(OrchestratorSchemaError::new(None).into());
+            }
+            None
+        }
+        Recorded::Version(None) => return Err(OrchestratorSchemaError::new(None).into()),
+        Recorded::Version(Some(v)) if v > CURRENT_ORCH_SCHEMA_VERSION => {
+            return Err(OrchestratorSchemaError::new(Some(v)).into());
+        }
+        Recorded::Version(Some(v)) => Some(v),
+    };
+    let mut partitioned = Vec::new();
+    for table in ORCH_PARTITIONED_TABLES {
+        if partition_table(&tx, &ddl, table, partition)? {
+            partitioned.push(table.to_owned());
+        }
+    }
+    version_column_first(&tx, &ddl, ORCH_VERSION_TABLE)?;
+    tx.execute_batch(&ddl)?;
+    seed_version(&tx)?;
+    tx.execute(
+        "UPDATE orchestrator_schema_version SET version = ?1 WHERE id = 1",
+        params![CURRENT_ORCH_SCHEMA_VERSION],
+    )?;
+    tx.commit()?;
+    Ok(SchemaUpgrade {
+        from,
+        to: CURRENT_ORCH_SCHEMA_VERSION,
+        partitioned,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn append_event(
     tx: &Transaction<'_>,
+    p: &str,
     task_id: &str,
     worker_id: &str,
     event_type: &str,
@@ -1656,9 +1762,10 @@ fn append_event(
     occurred_at: DateTime<Utc>,
 ) -> Result<(), ClaimStoreError> {
     tx.execute(
-        "INSERT INTO orchestrator_events (task_id, worker_id, event_type, version, \
-         lease_expires_at, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO orchestrator_events (project_id, task_id, worker_id, event_type, version, \
+         lease_expires_at, occurred_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
+            p,
             task_id,
             worker_id,
             event_type,
@@ -1670,8 +1777,10 @@ fn append_event(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_stop_event(
     tx: &Transaction<'_>,
+    p: &str,
     kind: &str,
     subject: &str,
     detail: &str,
@@ -1680,9 +1789,10 @@ fn insert_stop_event(
     attribution: &str,
 ) -> Result<(), ClaimStoreError> {
     tx.execute(
-        "INSERT INTO orchestrator_stop_events (kind, subject, detail, occurred_at, run_id, \
-         attribution) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO orchestrator_stop_events (project_id, kind, subject, detail, occurred_at, \
+         run_id, attribution) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
+            p,
             kind,
             subject,
             detail,
@@ -1695,10 +1805,15 @@ fn insert_stop_event(
 }
 
 /// Delete the claim row when the token matches, returning whether it did.
-fn delete_matching(tx: &Transaction<'_>, claim: &TaskClaim) -> Result<bool, ClaimStoreError> {
+fn delete_matching(
+    tx: &Transaction<'_>,
+    p: &str,
+    claim: &TaskClaim,
+) -> Result<bool, ClaimStoreError> {
     let deleted = tx.execute(
-        "DELETE FROM task_claims WHERE task_id = ?1 AND version = ?2 AND worker_id = ?3",
-        params![claim.task_id, claim.version, claim.worker_id],
+        "DELETE FROM task_claims WHERE project_id = ?1 AND task_id = ?2 AND version = ?3 \
+         AND worker_id = ?4",
+        params![p, claim.task_id, claim.version, claim.worker_id],
     )?;
     Ok(deleted == 1)
 }
@@ -1711,14 +1826,16 @@ fn delete_matching(tx: &Transaction<'_>, claim: &TaskClaim) -> Result<bool, Clai
 /// never make a lapsed lease block (or a live lease pass) on string order.
 fn has_conflicting_live_claim(
     tx: &Transaction<'_>,
+    p: &str,
     task_id: &str,
     incoming: &BTreeSet<String>,
     now: DateTime<Utc>,
 ) -> Result<bool, ClaimStoreError> {
     let mut stmt = tx.prepare(
-        "SELECT lease_expires_at, conflict_keys_json FROM task_claims WHERE task_id != ?1",
+        "SELECT lease_expires_at, conflict_keys_json FROM task_claims \
+         WHERE project_id = ?1 AND task_id != ?2",
     )?;
-    let rows = stmt.query_map(params![task_id], |row| {
+    let rows = stmt.query_map(params![p, task_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
     for row in rows {
@@ -1901,12 +2018,13 @@ impl ClaimStore for SqliteClaimStore {
         let now = to_micros(now);
         let lease_expires = checked_lease_expiry(now, lease_seconds)?;
         let keys_json = encode_str_set(conflict_keys);
+        let p = self.partition();
         self.write(|tx| {
             let existing: Option<(String, String, i64)> = tx
                 .query_row(
                     "SELECT worker_id, lease_expires_at, version FROM task_claims \
-                     WHERE task_id = ?1",
-                    params![task_id],
+                     WHERE project_id = ?1 AND task_id = ?2",
+                    params![p, task_id],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
@@ -1917,7 +2035,7 @@ impl ClaimStore for SqliteClaimStore {
                 return Ok(None);
             }
             if !conflict_keys.is_empty()
-                && has_conflicting_live_claim(tx, task_id, conflict_keys, now)?
+                && has_conflicting_live_claim(tx, p, task_id, conflict_keys, now)?
             {
                 return Ok(None);
             }
@@ -1930,9 +2048,11 @@ impl ClaimStore for SqliteClaimStore {
             };
             if existing.is_none() {
                 tx.execute(
-                    "INSERT INTO task_claims (task_id, worker_id, claimed_at, lease_expires_at, \
-                     version, conflict_keys_json) VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                    "INSERT INTO task_claims (project_id, task_id, worker_id, claimed_at, \
+                     lease_expires_at, version, conflict_keys_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
                     params![
+                        p,
                         task_id,
                         worker_id,
                         format_timestamp(&now),
@@ -1944,19 +2064,21 @@ impl ClaimStore for SqliteClaimStore {
                 tx.execute(
                     "UPDATE task_claims SET worker_id = ?1, claimed_at = ?2, \
                      lease_expires_at = ?3, version = ?4, conflict_keys_json = ?5 \
-                     WHERE task_id = ?6",
+                     WHERE project_id = ?6 AND task_id = ?7",
                     params![
                         worker_id,
                         format_timestamp(&now),
                         format_timestamp(&lease_expires),
                         version,
                         keys_json,
+                        p,
                         task_id,
                     ],
                 )?;
             }
             append_event(
                 tx,
+                p,
                 task_id,
                 worker_id,
                 event_type,
@@ -1985,13 +2107,15 @@ impl ClaimStore for SqliteClaimStore {
         let new_version = claim.version + 1;
         // The UPDATE and its `renewed` event commit together: a stale token
         // updates no row, the error rolls the transaction back, no event.
+        let p = self.partition();
         self.write(|tx| {
             let updated = tx.execute(
                 "UPDATE task_claims SET lease_expires_at = ?1, version = ?2 \
-                 WHERE task_id = ?3 AND version = ?4 AND worker_id = ?5",
+                 WHERE project_id = ?3 AND task_id = ?4 AND version = ?5 AND worker_id = ?6",
                 params![
                     format_timestamp(&lease_expires),
                     new_version,
+                    p,
                     claim.task_id,
                     claim.version,
                     claim.worker_id,
@@ -2005,6 +2129,7 @@ impl ClaimStore for SqliteClaimStore {
             }
             append_event(
                 tx,
+                p,
                 &claim.task_id,
                 &claim.worker_id,
                 EVENT_RENEWED,
@@ -2027,10 +2152,12 @@ impl ClaimStore for SqliteClaimStore {
         claim: &TaskClaim,
         now: Option<DateTime<Utc>>,
     ) -> Result<(), ClaimStoreError> {
+        let p = self.partition();
         self.write(|tx| {
-            if delete_matching(tx, claim)? {
+            if delete_matching(tx, p, claim)? {
                 append_event(
                     tx,
+                    p,
                     &claim.task_id,
                     &claim.worker_id,
                     EVENT_RELEASED,
@@ -2047,8 +2174,10 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_one(
             &conn,
-            &format!("SELECT {CLAIM_COLUMNS} FROM task_claims WHERE task_id = ?1"),
-            params![task_id],
+            &format!(
+                "SELECT {CLAIM_COLUMNS} FROM task_claims WHERE project_id = ?1 AND task_id = ?2"
+            ),
+            params![self.partition(), task_id],
             row_to_claim,
         )
     }
@@ -2057,8 +2186,10 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_all(
             &conn,
-            &format!("SELECT {CLAIM_COLUMNS} FROM task_claims ORDER BY task_id"),
-            [],
+            &format!(
+                "SELECT {CLAIM_COLUMNS} FROM task_claims WHERE project_id = ?1 ORDER BY task_id"
+            ),
+            params![self.partition()],
             row_to_claim,
         )
     }
@@ -2068,11 +2199,12 @@ impl ClaimStore for SqliteClaimStore {
         // Select every row, decide lapse on the parsed instant (never on ISO
         // string order), and delete the lapsed ones by key inside the same
         // IMMEDIATE transaction -- one `expired` event per reaped claim.
+        let p = self.partition();
         self.write(|tx| {
             let mut stmt = tx.prepare(&format!(
-                "SELECT {CLAIM_COLUMNS} FROM task_claims ORDER BY task_id"
+                "SELECT {CLAIM_COLUMNS} FROM task_claims WHERE project_id = ?1 ORDER BY task_id"
             ))?;
-            let mut rows = stmt.query([])?;
+            let mut rows = stmt.query(params![p])?;
             let mut doomed = Vec::new();
             while let Some(row) = rows.next()? {
                 let claim = row_to_claim(row)?;
@@ -2084,11 +2216,12 @@ impl ClaimStore for SqliteClaimStore {
             drop(stmt);
             for claim in &doomed {
                 tx.execute(
-                    "DELETE FROM task_claims WHERE task_id = ?1",
-                    params![claim.task_id],
+                    "DELETE FROM task_claims WHERE project_id = ?1 AND task_id = ?2",
+                    params![p, claim.task_id],
                 )?;
                 append_event(
                     tx,
+                    p,
                     &claim.task_id,
                     &claim.worker_id,
                     EVENT_EXPIRED,
@@ -2105,8 +2238,10 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_all(
             &conn,
-            &format!("SELECT {EVENT_COLUMNS} FROM orchestrator_events ORDER BY id"),
-            [],
+            &format!(
+                "SELECT {EVENT_COLUMNS} FROM orchestrator_events WHERE project_id = ?1 ORDER BY id"
+            ),
+            params![self.partition()],
             row_to_event,
         )
     }
@@ -2119,9 +2254,10 @@ impl ClaimStore for SqliteClaimStore {
         query_all(
             &conn,
             &format!(
-                "SELECT {EVENT_COLUMNS} FROM orchestrator_events WHERE task_id = ?1 ORDER BY id"
+                "SELECT {EVENT_COLUMNS} FROM orchestrator_events \
+                 WHERE project_id = ?1 AND task_id = ?2 ORDER BY id"
             ),
-            params![task_id],
+            params![self.partition(), task_id],
             row_to_event,
         )
     }
@@ -2134,7 +2270,10 @@ impl ClaimStore for SqliteClaimStore {
         occurred_at: DateTime<Utc>,
         attribution: &str,
     ) -> Result<(), ClaimStoreError> {
-        self.write(|tx| insert_stop_event(tx, kind, subject, detail, occurred_at, "", attribution))
+        let p = self.partition();
+        self.write(|tx| {
+            insert_stop_event(tx, p, kind, subject, detail, occurred_at, "", attribution)
+        })
     }
 
     fn record_prepare_skip(
@@ -2143,10 +2282,12 @@ impl ClaimStore for SqliteClaimStore {
         detail: &str,
         now: DateTime<Utc>,
     ) -> Result<(), ClaimStoreError> {
+        let p = self.partition();
         self.write(|tx| {
-            if delete_matching(tx, claim)? {
+            if delete_matching(tx, p, claim)? {
                 append_event(
                     tx,
+                    p,
                     &claim.task_id,
                     &claim.worker_id,
                     EVENT_RELEASED,
@@ -2155,7 +2296,16 @@ impl ClaimStore for SqliteClaimStore {
                     now,
                 )?;
             }
-            insert_stop_event(tx, STOP_PREPARE_SKIP, &claim.task_id, detail, now, "", "")
+            insert_stop_event(
+                tx,
+                p,
+                STOP_PREPARE_SKIP,
+                &claim.task_id,
+                detail,
+                now,
+                "",
+                "",
+            )
         })
     }
 
@@ -2163,8 +2313,11 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_all(
             &conn,
-            &format!("SELECT {STOP_COLUMNS} FROM orchestrator_stop_events ORDER BY id"),
-            [],
+            &format!(
+                "SELECT {STOP_COLUMNS} FROM orchestrator_stop_events WHERE project_id = ?1 \
+                 ORDER BY id"
+            ),
+            params![self.partition()],
             row_to_stop_event,
         )
     }
@@ -2177,10 +2330,10 @@ impl ClaimStore for SqliteClaimStore {
         query_all(
             &conn,
             &format!(
-                "SELECT {STOP_COLUMNS} FROM orchestrator_stop_events WHERE subject = ?1 \
-                 ORDER BY id"
+                "SELECT {STOP_COLUMNS} FROM orchestrator_stop_events \
+                 WHERE project_id = ?1 AND subject = ?2 ORDER BY id"
             ),
-            params![subject],
+            params![self.partition(), subject],
             row_to_stop_event,
         )
     }
@@ -2195,11 +2348,13 @@ impl ClaimStore for SqliteClaimStore {
         let Some(pause_until) = clamp_pause(reset_at, now, ceiling_seconds) else {
             return Ok(None);
         };
+        let p = self.partition();
         self.write(|tx| {
             tx.execute(
-                "INSERT INTO orchestrator_session_pauses (run_id, reset_at, pause_until, \
-                 recorded_at) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO orchestrator_session_pauses (project_id, run_id, reset_at, \
+                 pause_until, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
+                    p,
                     run_id,
                     format_timestamp(&reset_at),
                     format_timestamp(&pause_until),
@@ -2222,9 +2377,10 @@ impl ClaimStore for SqliteClaimStore {
         let floor = format_timestamp(&(now - Duration::days(1)));
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT pause_until FROM orchestrator_session_pauses WHERE pause_until >= ?1",
+            "SELECT pause_until FROM orchestrator_session_pauses \
+             WHERE project_id = ?1 AND pause_until >= ?2",
         )?;
-        let mut rows = stmt.query(params![&floor[..10]])?;
+        let mut rows = stmt.query(params![self.partition(), &floor[..10]])?;
         let mut horizon: Option<DateTime<Utc>> = None;
         while let Some(row) = rows.next()? {
             let candidate = parse_timestamp(&row.get::<_, String>(0)?)?;
@@ -2240,8 +2396,8 @@ impl ClaimStore for SqliteClaimStore {
         query_all(
             &conn,
             "SELECT id, run_id, reset_at, pause_until, recorded_at \
-             FROM orchestrator_session_pauses ORDER BY id",
-            [],
+             FROM orchestrator_session_pauses WHERE project_id = ?1 ORDER BY id",
+            params![self.partition()],
             row_to_pause,
         )
     }
@@ -2255,22 +2411,26 @@ impl ClaimStore for SqliteClaimStore {
         detail: &str,
     ) -> Result<(), ClaimStoreError> {
         require_review_reason(reason)?;
-        self.write(|tx| insert_stop_event(tx, reason, task_id, detail, occurred_at, run_id, ""))
+        let p = self.partition();
+        self.write(|tx| insert_stop_event(tx, p, reason, task_id, detail, occurred_at, run_id, ""))
     }
 
     fn list_human_review_queue(&self) -> Result<Vec<HumanReviewQueueEntry>, ClaimStoreError> {
-        let placeholders = (1..=HUMAN_REVIEW_QUEUE_REASONS.len())
+        let placeholders = (2..=HUMAN_REVIEW_QUEUE_REASONS.len() + 1)
             .map(|i| format!("?{i}"))
             .collect::<Vec<_>>()
             .join(",");
         let mut reasons: Vec<&str> = HUMAN_REVIEW_QUEUE_REASONS.to_vec();
         reasons.sort_unstable();
+        let mut bind: Vec<&str> = vec![self.partition()];
+        bind.extend(reasons);
         let conn = self.lock()?;
         let mut stmt = conn.prepare(&format!(
             "SELECT id, kind, subject, detail, occurred_at, run_id \
-             FROM orchestrator_stop_events WHERE kind IN ({placeholders}) ORDER BY id"
+             FROM orchestrator_stop_events WHERE project_id = ?1 AND kind IN ({placeholders}) \
+             ORDER BY id"
         ))?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(reasons.iter()))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(bind.iter()))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             out.push(HumanReviewQueueEntry {
@@ -2292,16 +2452,18 @@ impl ClaimStore for SqliteClaimStore {
     ) -> Result<GraphSnapshotRecord, ClaimStoreError> {
         require_unique_snapshot_items(items)?;
         let captured_at = to_micros(captured_at);
+        let p = self.partition();
         self.write(|tx| {
             let last_event_id: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(id), 0) FROM orchestrator_events",
-                [],
+                "SELECT COALESCE(MAX(id), 0) FROM orchestrator_events WHERE project_id = ?1",
+                params![p],
                 |row| row.get(0),
             )?;
             tx.execute(
-                "INSERT INTO graph_snapshots (captured_at, item_count, last_event_id) \
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO graph_snapshots (project_id, captured_at, item_count, last_event_id) \
+                 VALUES (?1, ?2, ?3, ?4)",
                 params![
+                    p,
                     format_timestamp(&captured_at),
                     items.len() as i64,
                     last_event_id
@@ -2309,13 +2471,14 @@ impl ClaimStore for SqliteClaimStore {
             )?;
             let snapshot_id = tx.last_insert_rowid();
             let mut insert = tx.prepare(
-                "INSERT INTO graph_snapshot_items (snapshot_id, task_id, source_kind, \
+                "INSERT INTO graph_snapshot_items (project_id, snapshot_id, task_id, source_kind, \
                  source_ref, source_url, source_version, priority, required_capabilities_json, \
                  conflict_keys_json, state, ready, claim_holder, resolved_prerequisites_json) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             )?;
             for item in items {
                 insert.execute(params![
+                    p,
                     snapshot_id,
                     item.task_id,
                     item.source_kind,
@@ -2344,8 +2507,10 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_all(
             &conn,
-            &format!("SELECT {SNAPSHOT_COLUMNS} FROM graph_snapshots ORDER BY id"),
-            [],
+            &format!(
+                "SELECT {SNAPSHOT_COLUMNS} FROM graph_snapshots WHERE project_id = ?1 ORDER BY id"
+            ),
+            params![self.partition()],
             row_to_snapshot,
         )
     }
@@ -2359,9 +2524,9 @@ impl ClaimStore for SqliteClaimStore {
             &conn,
             &format!(
                 "SELECT {SNAPSHOT_ITEM_COLUMNS} FROM graph_snapshot_items \
-                 WHERE snapshot_id = ?1 ORDER BY task_id"
+                 WHERE project_id = ?1 AND snapshot_id = ?2 ORDER BY task_id"
             ),
-            params![snapshot_id],
+            params![self.partition(), snapshot_id],
             row_to_snapshot_item,
         )
     }
@@ -2370,8 +2535,11 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_one(
             &conn,
-            &format!("SELECT {SNAPSHOT_COLUMNS} FROM graph_snapshots ORDER BY id DESC LIMIT 1"),
-            [],
+            &format!(
+                "SELECT {SNAPSHOT_COLUMNS} FROM graph_snapshots WHERE project_id = ?1 \
+                 ORDER BY id DESC LIMIT 1"
+            ),
+            params![self.partition()],
             row_to_snapshot,
         )
     }
@@ -2382,13 +2550,14 @@ impl ClaimStore for SqliteClaimStore {
         now: DateTime<Utc>,
     ) -> Result<(), ClaimStoreError> {
         let now_text = format_timestamp(&now);
+        let p = self.partition();
         self.write(|tx| {
             tx.execute(
                 "INSERT INTO work_items (task_id, source_kind, source_ref, source_url, \
                  source_version, task_content_hash, priority, required_capabilities_json, \
-                 conflict_keys_json, first_seen_at, last_seen_at, disappeared_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL) \
-                 ON CONFLICT(task_id) DO UPDATE SET \
+                 conflict_keys_json, first_seen_at, last_seen_at, disappeared_at, project_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12) \
+                 ON CONFLICT(project_id, task_id) DO UPDATE SET \
                  source_kind = excluded.source_kind, source_ref = excluded.source_ref, \
                  source_url = excluded.source_url, source_version = excluded.source_version, \
                  task_content_hash = excluded.task_content_hash, priority = excluded.priority, \
@@ -2407,6 +2576,7 @@ impl ClaimStore for SqliteClaimStore {
                     encode_str_set(&item.conflict_keys),
                     now_text,
                     now_text,
+                    p,
                 ],
             )?;
             Ok(())
@@ -2421,17 +2591,18 @@ impl ClaimStore for SqliteClaimStore {
     ) -> Result<(), ClaimStoreError> {
         let now_text = format_timestamp(&now);
         let unique: BTreeSet<&String> = prerequisite_task_ids.iter().collect();
+        let p = self.partition();
         self.write(|tx| {
             tx.execute(
-                "DELETE FROM work_item_dependencies WHERE task_id = ?1",
-                params![task_id],
+                "DELETE FROM work_item_dependencies WHERE project_id = ?1 AND task_id = ?2",
+                params![p, task_id],
             )?;
             let mut insert = tx.prepare(
-                "INSERT INTO work_item_dependencies (task_id, prerequisite_task_id, created_at) \
-                 VALUES (?1, ?2, ?3)",
+                "INSERT INTO work_item_dependencies (project_id, task_id, prerequisite_task_id, \
+                 created_at) VALUES (?1, ?2, ?3, ?4)",
             )?;
             for prerequisite in &unique {
-                insert.execute(params![task_id, prerequisite, now_text])?;
+                insert.execute(params![p, task_id, prerequisite, now_text])?;
             }
             Ok(())
         })
@@ -2444,24 +2615,26 @@ impl ClaimStore for SqliteClaimStore {
     ) -> Result<(), ClaimStoreError> {
         let now_text = format_timestamp(&now);
         let observed: BTreeSet<&String> = observed_task_ids.iter().collect();
+        let p = self.partition().to_owned();
         self.write(|tx| {
             if observed.is_empty() {
                 tx.execute(
-                    "UPDATE work_items SET disappeared_at = ?1 WHERE disappeared_at IS NULL",
-                    params![now_text],
+                    "UPDATE work_items SET disappeared_at = ?1 \
+                     WHERE project_id = ?2 AND disappeared_at IS NULL",
+                    params![now_text, p],
                 )?;
                 return Ok(());
             }
-            let placeholders = (2..observed.len() + 2)
+            let placeholders = (3..observed.len() + 3)
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&now_text];
+            let mut bind: Vec<&dyn rusqlite::ToSql> = vec![&now_text, &p];
             bind.extend(observed.iter().map(|s| *s as &dyn rusqlite::ToSql));
             tx.execute(
                 &format!(
-                    "UPDATE work_items SET disappeared_at = ?1 WHERE disappeared_at IS NULL \
-                     AND task_id NOT IN ({placeholders})"
+                    "UPDATE work_items SET disappeared_at = ?1 WHERE project_id = ?2 \
+                     AND disappeared_at IS NULL AND task_id NOT IN ({placeholders})"
                 ),
                 bind.as_slice(),
             )?;
@@ -2473,8 +2646,10 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_one(
             &conn,
-            &format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE task_id = ?1"),
-            params![task_id],
+            &format!(
+                "SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE project_id = ?1 AND task_id = ?2"
+            ),
+            params![self.partition(), task_id],
             row_to_work_item,
         )
     }
@@ -2483,8 +2658,10 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_all(
             &conn,
-            &format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items ORDER BY task_id"),
-            [],
+            &format!(
+                "SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE project_id = ?1 ORDER BY task_id"
+            ),
+            params![self.partition()],
             row_to_work_item,
         )
     }
@@ -2493,9 +2670,9 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_all(
             &conn,
-            "SELECT prerequisite_task_id FROM work_item_dependencies WHERE task_id = ?1 \
-             ORDER BY prerequisite_task_id",
-            params![task_id],
+            "SELECT prerequisite_task_id FROM work_item_dependencies \
+             WHERE project_id = ?1 AND task_id = ?2 ORDER BY prerequisite_task_id",
+            params![self.partition(), task_id],
             |row| Ok(row.get(0)?),
         )
     }
@@ -2505,8 +2682,8 @@ impl ClaimStore for SqliteClaimStore {
         query_all(
             &conn,
             "SELECT task_id, prerequisite_task_id FROM work_item_dependencies \
-             ORDER BY task_id, prerequisite_task_id",
-            [],
+             WHERE project_id = ?1 ORDER BY task_id, prerequisite_task_id",
+            params![self.partition()],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
     }
@@ -2517,11 +2694,12 @@ impl ClaimStore for SqliteClaimStore {
         source_name: &str,
         now: DateTime<Utc>,
     ) -> Result<i64, ClaimStoreError> {
+        let p = self.partition();
         self.write(|tx| {
             tx.execute(
-                "INSERT INTO source_syncs (source_kind, source_name, started_at, status, \
-                 observed_count) VALUES (?1, ?2, ?3, 'running', 0)",
-                params![source_kind, source_name, format_timestamp(&now)],
+                "INSERT INTO source_syncs (project_id, source_kind, source_name, started_at, \
+                 status, observed_count) VALUES (?1, ?2, ?3, ?4, 'running', 0)",
+                params![p, source_kind, source_name, format_timestamp(&now)],
             )?;
             Ok(tx.last_insert_rowid())
         })
@@ -2535,15 +2713,17 @@ impl ClaimStore for SqliteClaimStore {
         error: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<(), ClaimStoreError> {
+        let p = self.partition();
         self.write(|tx| {
             tx.execute(
                 "UPDATE source_syncs SET status = ?1, observed_count = ?2, error = ?3, \
-                 finished_at = ?4 WHERE id = ?5",
+                 finished_at = ?4 WHERE project_id = ?5 AND id = ?6",
                 params![
                     status,
                     observed_count,
                     error,
                     format_timestamp(&now),
+                    p,
                     sync_id
                 ],
             )?;
@@ -2555,8 +2735,10 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_one(
             &conn,
-            &format!("SELECT {SOURCE_SYNC_COLUMNS} FROM source_syncs WHERE id = ?1"),
-            params![sync_id],
+            &format!(
+                "SELECT {SOURCE_SYNC_COLUMNS} FROM source_syncs WHERE project_id = ?1 AND id = ?2"
+            ),
+            params![self.partition(), sync_id],
             row_to_source_sync,
         )
     }
@@ -2565,8 +2747,10 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_all(
             &conn,
-            &format!("SELECT {SOURCE_SYNC_COLUMNS} FROM source_syncs ORDER BY id"),
-            [],
+            &format!(
+                "SELECT {SOURCE_SYNC_COLUMNS} FROM source_syncs WHERE project_id = ?1 ORDER BY id"
+            ),
+            params![self.partition()],
             row_to_source_sync,
         )
     }
@@ -2584,7 +2768,7 @@ mod tests {
 
     #[test]
     fn schema_version_sentinel_is_pinned() {
-        assert_eq!(CURRENT_ORCH_SCHEMA_VERSION, 9);
+        assert_eq!(CURRENT_ORCH_SCHEMA_VERSION, 10);
     }
 
     #[test]
@@ -2696,20 +2880,23 @@ mod tests {
 
     #[test]
     fn schema_error_message_shape_is_pinned() {
-        let err = OrchestratorSchemaError {
-            observed: Some(12),
-            expected: CURRENT_ORCH_SCHEMA_VERSION,
-        };
+        let behind = OrchestratorSchemaError::new(Some(9));
+        assert!(behind.is_behind());
         assert_eq!(
-            err.to_string(),
-            "orchestrator store must be re-created: observed orchestrator_schema_version=12, \
-             expected 9"
+            behind.to_string(),
+            "orchestrator store schema is behind: orchestrator_schema_version=9, this flywheel \
+             expects 10; run `fw db upgrade` to migrate it in place"
         );
-        let missing = OrchestratorSchemaError {
-            observed: None,
-            expected: 9,
-        };
-        assert!(missing.to_string().contains("version=None"));
+        let ahead = OrchestratorSchemaError::new(Some(12));
+        assert!(!ahead.is_behind());
+        assert!(ahead.to_string().contains("newer flywheel"), "{ahead}");
+        let missing = OrchestratorSchemaError::new(None);
+        assert!(!missing.is_behind());
+        assert!(
+            missing
+                .to_string()
+                .contains("no readable orchestrator_schema_version")
+        );
     }
 
     #[test]
@@ -2806,9 +2993,9 @@ mod tests {
         {
             let conn = store.lock().unwrap();
             conn.execute(
-                "INSERT INTO task_claims (task_id, worker_id, claimed_at, lease_expires_at, \
-                 version, conflict_keys_json) VALUES ('held', 'w1', '2026-05-28T12:00:00', \
-                 '2026-05-28T12:00:30', 1, '[\"k\"]')",
+                "INSERT INTO task_claims (project_id, task_id, worker_id, claimed_at, \
+                 lease_expires_at, version, conflict_keys_json) VALUES ('default', 'held', 'w1', \
+                 '2026-05-28T12:00:00', '2026-05-28T12:00:30', 1, '[\"k\"]')",
                 [],
             )
             .unwrap();
@@ -2849,5 +3036,250 @@ mod tests {
             if calls == 1 { Err(busy()) } else { Ok(calls) }
         });
         assert_eq!(outcome.unwrap(), 2);
+    }
+
+    fn columns(conn: &Connection, table: &str) -> Vec<String> {
+        flywheel_core::store_sqlite::table_columns(conn, table).unwrap()
+    }
+
+    fn sentinel(path: &Path) -> Recorded {
+        let conn = Connection::open(path).unwrap();
+        recorded_version(&conn, ORCH_VERSION_TABLE).unwrap()
+    }
+
+    #[test]
+    fn every_orchestrator_table_leads_with_the_partition_and_the_sentinel_with_version() {
+        let store = SqliteClaimStore::in_memory().unwrap();
+        assert_eq!(store.partition(), DEFAULT_PARTITION);
+        let conn = store.lock().unwrap();
+        for table in ORCH_PARTITIONED_TABLES {
+            assert_eq!(columns(&conn, table)[0], "project_id", "{table}");
+        }
+        let sentinel = columns(&conn, ORCH_VERSION_TABLE);
+        assert_eq!(sentinel, vec!["version", "id"]);
+        for table in ORCH_PARTITIONED_TABLES.iter().chain([&ORCH_VERSION_TABLE]) {
+            assert!(
+                flywheel_core::schema_ddl::create_table_statement(SCHEMA_SQL, table).is_some(),
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn partitions_sharing_one_file_never_see_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let a = SqliteClaimStore::open_partition(&path, "proj-a").unwrap();
+        let b = SqliteClaimStore::open_partition(&path, "proj-b").unwrap();
+        let keys = conflict_keys(["k"]);
+        // The same task id (and an overlapping conflict key) is claimable in
+        // both partitions at once.
+        let ca = a
+            .acquire_claim("t1", "wa", t(0), 30.0, &keys)
+            .unwrap()
+            .unwrap();
+        let cb = b
+            .acquire_claim("t1", "wb", t(0), 30.0, &keys)
+            .unwrap()
+            .unwrap();
+        assert!(
+            b.acquire_claim("t2", "wb", t(1), 30.0, &keys)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(a.load_claim("t1").unwrap().unwrap(), ca);
+        assert_eq!(b.load_claim("t1").unwrap().unwrap(), cb);
+        assert_eq!(a.list_events().unwrap().len(), 1);
+        for store in [&a, &b] {
+            store
+                .upsert_work_item(
+                    &WorkItemObservation {
+                        task_id: "t1".into(),
+                        ..Default::default()
+                    },
+                    t(0),
+                )
+                .unwrap();
+            store
+                .replace_work_item_dependencies("t1", &["t0".to_owned()], t(0))
+                .unwrap();
+            store
+                .record_stop_event(STOP_NO_OP_CYCLE, "t1", "d", t(0), "")
+                .unwrap();
+            store.record_session_pause(t(50), t(0), 30.0, "r").unwrap();
+            store
+                .record_source_sync_start("directory", "d", t(0))
+                .unwrap();
+            store
+                .record_graph_snapshot(&[GraphSnapshotItem::new("t1", "ready", true)], t(0))
+                .unwrap();
+        }
+        a.mark_work_items_disappeared(&[], t(5)).unwrap();
+        assert!(
+            a.load_work_item("t1")
+                .unwrap()
+                .unwrap()
+                .disappeared_at
+                .is_some()
+        );
+        assert!(
+            b.load_work_item("t1")
+                .unwrap()
+                .unwrap()
+                .disappeared_at
+                .is_none()
+        );
+        assert_eq!(a.list_work_item_dependencies().unwrap().len(), 1);
+        assert_eq!(a.list_stop_events().unwrap().len(), 1);
+        assert_eq!(a.list_session_pauses().unwrap().len(), 1);
+        assert_eq!(a.list_source_syncs().unwrap().len(), 1);
+        let snap = b.latest_graph_snapshot().unwrap().unwrap();
+        assert_eq!(snap.last_event_id, b.list_events().unwrap()[0].id);
+        assert!(a.list_graph_snapshot_items(snap.id).unwrap().is_empty());
+        assert_eq!(b.list_graph_snapshot_items(snap.id).unwrap().len(), 1);
+        assert_eq!(a.sweep_expired_claims(t(40)).unwrap(), vec!["t1"]);
+        assert!(b.load_claim("t1").unwrap().is_some());
+        let unscoped = SqliteClaimStore::open(&path).unwrap();
+        assert!(unscoped.list_work_items().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_behind_store_is_refused_naming_the_upgrade_and_the_upgrade_fixes_only_the_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("behind.db");
+        let store = SqliteClaimStore::open_partition(&path, "p").unwrap();
+        store
+            .acquire_claim("t1", "w", t(0), 30.0, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        drop(store);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("UPDATE orchestrator_schema_version SET version = version - 1")
+            .unwrap();
+        let err = SqliteClaimStore::open_partition(&path, "p").unwrap_err();
+        assert!(err.is_schema_mismatch());
+        assert!(err.to_string().contains("fw db upgrade"), "{err}");
+        let upgrade = SqliteClaimStore::upgrade(&path, "p").unwrap();
+        assert_eq!(upgrade.from, Some(CURRENT_ORCH_SCHEMA_VERSION - 1));
+        assert!(upgrade.partitioned.is_empty());
+        assert!(SqliteClaimStore::upgrade(&path, "p").unwrap().is_noop());
+        let reopened = SqliteClaimStore::open_partition(&path, "p").unwrap();
+        assert!(reopened.load_claim("t1").unwrap().is_some());
+    }
+
+    fn seed_v9(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(include_str!("../tests/fixtures/orchestrator-schema-v9.sql"))
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO task_claims (task_id, worker_id, claimed_at, lease_expires_at, version, \
+               conflict_keys_json) VALUES ('t1', 'w1', '2026-05-28T12:00:00+00:00', \
+               '2026-05-28T12:00:30+00:00', 2, '[\"k\"]');
+             INSERT INTO orchestrator_events (task_id, worker_id, event_type, version, \
+               lease_expires_at, occurred_at) VALUES ('t1', 'w1', 'acquired', 1, \
+               '2026-05-28T12:00:30+00:00', '2026-05-28T12:00:00+00:00');
+             INSERT INTO orchestrator_stop_events (kind, subject, detail, occurred_at, run_id, \
+               attribution) VALUES ('merge-conflict', 't1', 'd', '2026-05-28T12:00:00+00:00', \
+               'run-1', '');
+             INSERT INTO work_items (task_id, first_seen_at, last_seen_at) VALUES ('t1', \
+               '2026-05-28T12:00:00+00:00', '2026-05-28T12:00:00+00:00');
+             INSERT INTO work_item_dependencies (task_id, prerequisite_task_id, created_at) \
+               VALUES ('t1', 't0', '2026-05-28T12:00:00+00:00');",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_v9_store_is_refused_then_upgraded_in_place_keeping_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v9.db");
+        seed_v9(&path);
+        let err = SqliteClaimStore::open_partition(&path, "proj").unwrap_err();
+        assert!(err.to_string().contains("fw db upgrade"), "{err}");
+        assert_eq!(sentinel(&path), Recorded::Version(Some(9)));
+
+        let upgrade = SqliteClaimStore::upgrade(&path, "proj").unwrap();
+        assert_eq!(upgrade.from, Some(9));
+        assert_eq!(upgrade.to, CURRENT_ORCH_SCHEMA_VERSION);
+        assert_eq!(
+            upgrade.partitioned,
+            ORCH_PARTITIONED_TABLES.map(str::to_owned).to_vec()
+        );
+
+        let store = SqliteClaimStore::open_partition(&path, "proj").unwrap();
+        let claim = store.load_claim("t1").unwrap().unwrap();
+        assert_eq!(claim.version, 2);
+        assert_eq!(store.list_events().unwrap().len(), 1);
+        assert_eq!(store.list_human_review_queue().unwrap().len(), 1);
+        assert!(store.load_work_item("t1").unwrap().is_some());
+        assert_eq!(store.load_work_item_dependencies("t1").unwrap(), vec!["t0"]);
+        // The migrated conflict keys still block an overlapping claim.
+        assert!(
+            store
+                .acquire_claim("t2", "w2", t(10), 30.0, &conflict_keys(["k"]))
+                .unwrap()
+                .is_none()
+        );
+        // New ledger rows continue after the migrated ids.
+        store
+            .acquire_claim("t3", "w3", t(10), 30.0, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        let events = store.list_events().unwrap();
+        assert!(events[1].id > events[0].id);
+        let other = SqliteClaimStore::open_partition(&path, "elsewhere").unwrap();
+        assert!(other.load_claim("t1").unwrap().is_none());
+        assert_eq!(
+            columns(&store.lock().unwrap(), ORCH_VERSION_TABLE)[0],
+            "version"
+        );
+        drop(store);
+        drop(other);
+        assert!(SqliteClaimStore::upgrade(&path, "proj").unwrap().is_noop());
+    }
+
+    #[test]
+    fn an_older_store_missing_additive_columns_converges_through_the_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v2.db");
+        seed_v9(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE task_claims DROP COLUMN conflict_keys_json;
+                 ALTER TABLE orchestrator_stop_events DROP COLUMN attribution;
+                 DROP TABLE orchestrator_session_pauses;
+                 UPDATE orchestrator_schema_version SET version = 2 WHERE id = 1;",
+            )
+            .unwrap();
+        let upgrade = SqliteClaimStore::upgrade(&path, "p").unwrap();
+        assert_eq!(upgrade.from, Some(2));
+        let store = SqliteClaimStore::open_partition(&path, "p").unwrap();
+        assert!(store.load_claim("t1").unwrap().is_some());
+        assert_eq!(store.list_stop_events().unwrap()[0].attribution, "");
+        assert!(store.list_session_pauses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn upgrade_refuses_a_newer_store_and_creates_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        SqliteClaimStore::open(&path).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("UPDATE orchestrator_schema_version SET version = 99")
+            .unwrap();
+        let err = SqliteClaimStore::upgrade(&path, "p").unwrap_err();
+        assert!(err.to_string().contains("newer flywheel"), "{err}");
+        assert_eq!(sentinel(&path), Recorded::Version(Some(99)));
+        let fresh = dir.path().join("fresh.db");
+        let upgrade = SqliteClaimStore::upgrade(&fresh, "p").unwrap();
+        assert_eq!(upgrade.from, None);
+        assert_eq!(
+            sentinel(&fresh),
+            Recorded::Version(Some(CURRENT_ORCH_SCHEMA_VERSION))
+        );
+        SqliteClaimStore::open_partition(&fresh, "p").unwrap();
     }
 }

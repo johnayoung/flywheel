@@ -27,13 +27,18 @@
 //! ([`BOOTSTRAP_LOCK_KEY`]) as its first statement so concurrent first opens
 //! of one fresh schema serialize instead of deadlocking on the shared
 //! catalogs; every later opener then sees a provisioned schema and the
-//! `IF NOT EXISTS` script is a clean no-op. The one supported forward
-//! migration (v11 -> v12: the nullable `lifecycles.source` column) is applied
-//! in place; any other `schema_version` mismatch is refused with
-//! [`StoreSchemaError`].
+//! `IF NOT EXISTS` script is a clean no-op. The schema version is checked
+//! before any DDL runs: a fresh schema is created at the current version,
+//! and any other `schema_version` is refused with [`StoreSchemaError`] (a
+//! behind one names `fw db upgrade`, which [`PostgresStore::upgrade`]
+//! implements; there is no implicit migration on open).
+//!
+//! Partitioning: every table carries the opaque `project_id` partition key
+//! ([`PostgresStoreOptions::partition`]); every read and write binds it, so
+//! one database (one DSN) holds many partitions side by side.
 //!
 //! Optimistic concurrency on `lifecycles.version` is a single
-//! `UPDATE ... WHERE run_id = $1 AND version = $2` checked by rows affected;
+//! `UPDATE ... WHERE project_id = $p AND run_id = $1 AND version = $2` checked by rows affected;
 //! a zero-row result is disambiguated into
 //! [`StoreConflictError::LifecycleNotFound`] or
 //! [`StoreConflictError::OptimisticConcurrency`] by a follow-up read. The
@@ -84,14 +89,19 @@ use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status};
 use crate::loaders::task_digest;
 use crate::notifier::RunNotifier;
 use crate::pg_tls::{SyncClient, off_runtime};
+use crate::schema_ddl::{
+    column_definitions, create_table_as, sql_literal, table_constraints, without_pragmas,
+};
 use crate::store::{
     AttemptStore, CURRENT_SCHEMA_VERSION, ControlCommandRecord, ControlCommandStore,
-    DomainEventStore, GraderResultRecord, GraderResultStore, JsonObject, LifecycleFilter,
-    LifecycleStore, SpendSummary, SpendWindow, StoreError, StoreSchemaError, TaskStore,
+    DEFAULT_PARTITION, DomainEventStore, GraderResultRecord, GraderResultStore, JsonObject,
+    LifecycleFilter, LifecycleStore, OLDEST_UPGRADABLE_SCHEMA_VERSION, SchemaUpgrade, SpendSummary,
+    SpendWindow, StoreError, StoreSchemaError, TaskStore,
 };
 use crate::store_memory::{
     assemble_task, grader_result_from_event, parse_wire_enum, projected_attempt, task_definition,
 };
+use crate::store_sqlite::{PARTITIONED_TABLES, Recorded, VERSION_TABLE, too_old_to_upgrade};
 use crate::task::{GraderType, Task};
 
 /// The canonical Postgres DDL, embedded verbatim from its single source of
@@ -106,9 +116,10 @@ pub const SCHEMA_SQL: &str = include_str!("../schema/persistence-schema-postgres
 /// schema bootstrapped by the Python store gains them on first open here and
 /// loses nothing. Mirrored by the SQLite store's `SUPPLEMENTARY_INDEXES`.
 const SUPPLEMENTARY_INDEXES: &str = "
-CREATE INDEX IF NOT EXISTS idx_lifecycles_task_id ON lifecycles(task_id);
-CREATE INDEX IF NOT EXISTS idx_lifecycles_updated_at ON lifecycles(updated_at DESC, run_id DESC);
-CREATE INDEX IF NOT EXISTS idx_lifecycles_status ON lifecycles(status);
+CREATE INDEX IF NOT EXISTS idx_lifecycles_task_id ON lifecycles(project_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_lifecycles_updated_at
+  ON lifecycles(project_id, updated_at DESC, run_id DESC);
+CREATE INDEX IF NOT EXISTS idx_lifecycles_status ON lifecycles(project_id, status);
 ";
 
 /// Serializes concurrent first-open bootstraps against a fresh schema.
@@ -362,6 +373,9 @@ pub struct PostgresStoreOptions {
     pub listen: bool,
     /// `None` gives the store its own [`RunNotifier`].
     pub notifier: Option<Arc<RunNotifier>>,
+    /// The opaque partition key (`project_id` column) every read and write
+    /// is scoped to. Supplied by whoever opens the store.
+    pub partition: String,
 }
 
 impl Default for PostgresStoreOptions {
@@ -370,6 +384,7 @@ impl Default for PostgresStoreOptions {
             schema: DEFAULT_SCHEMA.to_owned(),
             listen: false,
             notifier: None,
+            partition: DEFAULT_PARTITION.to_owned(),
         }
     }
 }
@@ -380,6 +395,7 @@ impl fmt::Debug for PostgresStoreOptions {
             .field("schema", &self.schema)
             .field("listen", &self.listen)
             .field("notifier", &self.notifier.is_some())
+            .field("partition", &self.partition)
             .finish()
     }
 }
@@ -452,6 +468,7 @@ pub struct PostgresStore {
     dsn: String,
     schema: String,
     channel: String,
+    partition: String,
     notifier: Arc<RunNotifier>,
     listener: Option<Listener>,
 }
@@ -461,6 +478,7 @@ impl fmt::Debug for PostgresStore {
         f.debug_struct("PostgresStore")
             .field("schema", &self.schema)
             .field("channel", &self.channel)
+            .field("partition", &self.partition)
             .field("listening", &self.listener.is_some())
             .finish_non_exhaustive()
     }
@@ -482,6 +500,32 @@ impl PostgresStore {
                 ..Default::default()
             },
         )
+    }
+
+    /// [`connect`](Self::connect) bound to `partition`.
+    pub fn connect_partition(dsn: &str, schema: &str, partition: &str) -> Result<Self, StoreError> {
+        Self::connect_with(
+            dsn,
+            PostgresStoreOptions {
+                schema: schema.to_owned(),
+                partition: partition.to_owned(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Migrate the core tables of `schema` in place to
+    /// [`CURRENT_SCHEMA_VERSION`], filling the partition column of existing
+    /// rows with `partition`. See [`upgrade_client`].
+    pub fn upgrade(dsn: &str, schema: &str, partition: &str) -> Result<SchemaUpgrade, StoreError> {
+        let schema = validate_schema(schema).map_err(StoreError::backend)?;
+        let (config, tls) = crate::pg_tls::configure(dsn).map_err(StoreError::backend)?;
+        off_runtime(|| {
+            let mut client = config.connect(tls).map_err(db)?;
+            let upgrade = upgrade_client(&mut client, schema, partition)?;
+            client.close().map_err(db)?;
+            Ok(upgrade)
+        })
     }
 
     pub fn connect_with(dsn: &str, options: PostgresStoreOptions) -> Result<Self, StoreError> {
@@ -514,9 +558,15 @@ impl PostgresStore {
             dsn: dsn.to_owned(),
             schema,
             channel,
+            partition: options.partition,
             notifier,
             listener,
         })
+    }
+
+    /// The partition key every read and write is scoped to.
+    pub fn partition(&self) -> &str {
+        &self.partition
     }
 
     /// The schema every table lives under.
@@ -611,49 +661,334 @@ fn bootstrap(client: &mut Client, schema: &str) -> Result<(), StoreError> {
         search_path_sql(schema)
     ))
     .map_err(db)?;
+    // Version pin BEFORE any DDL: the current DDL indexes the partition
+    // column, which a behind schema does not have yet. A fresh schema (no
+    // core table at all) is created at the current version; anything else
+    // not at the current version is refused untouched (the transaction
+    // drops, rolling back the CREATE SCHEMA no-op).
+    match recorded_version(&mut tx, schema, VERSION_TABLE).map_err(db)? {
+        Recorded::Missing => {
+            if any_table_exists(&mut tx, schema, &PARTITIONED_TABLES).map_err(db)? {
+                return Err(StoreSchemaError::new(None).into());
+            }
+        }
+        Recorded::Version(Some(v)) if v == CURRENT_SCHEMA_VERSION => {}
+        Recorded::Version(observed) => return Err(StoreSchemaError::new(observed).into()),
+    }
     tx.batch_execute(SCHEMA_SQL).map_err(db)?;
-    // Additive, version-neutral convergence: a task_versions table created
-    // before insertion_seq existed gains it here. Guarded by a catalog read
-    // rather than ADD COLUMN IF NOT EXISTS, which takes an ACCESS EXCLUSIVE
-    // lock on the table even when it then no-ops.
-    let has_insertion_seq: bool = tx
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-             WHERE table_schema = $1::text AND table_name = 'task_versions' \
-             AND column_name = 'insertion_seq')",
-            &[&schema],
-        )
-        .map_err(db)?
-        .get(0);
-    if !has_insertion_seq {
-        tx.batch_execute(
-            "ALTER TABLE task_versions ADD COLUMN insertion_seq BIGINT GENERATED ALWAYS AS IDENTITY",
-        )
-        .map_err(db)?;
-    }
     tx.batch_execute(SUPPLEMENTARY_INDEXES).map_err(db)?;
-    // Version pin: the one supported forward migration (v11 -> v12: add the
-    // nullable lifecycles.source column) is applied in place first; it is
-    // purely additive, so existing history survives. Any other mismatch is
-    // refused rather than upgraded.
-    let observed: Option<i32> = tx
-        .query_opt("SELECT version FROM schema_version WHERE id = 1", &[])
-        .map_err(db)?
-        .map(|row| row.get(0));
-    let mut observed = observed.and_then(|v| u32::try_from(v).ok());
-    if observed == Some(11) {
-        tx.batch_execute(
-            "ALTER TABLE lifecycles ADD COLUMN IF NOT EXISTS source TEXT;
-             UPDATE schema_version SET version = 12 WHERE id = 1;",
-        )
-        .map_err(db)?;
-        observed = Some(12);
-    }
     tx.commit().map_err(db)?;
-    if observed != Some(CURRENT_SCHEMA_VERSION) {
-        return Err(StoreSchemaError::new(observed).into());
-    }
     Ok(())
+}
+
+// --- In-place upgrade ---------------------------------------------------------------------
+
+/// What the sentinel `table` of `schema` records (read by column name, so
+/// either column order reads the same).
+pub fn recorded_version<C: GenericClient>(
+    c: &mut C,
+    schema: &str,
+    table: &str,
+) -> Result<Recorded, postgres::Error> {
+    if !table_exists(c, schema, table)? {
+        return Ok(Recorded::Missing);
+    }
+    let observed: Option<i32> = c
+        .query_opt(
+            &format!("SELECT version FROM \"{schema}\".\"{table}\" WHERE id = 1"),
+            &[],
+        )?
+        .map(|row| row.get(0));
+    Ok(Recorded::Version(
+        observed.and_then(|v| u32::try_from(v).ok()),
+    ))
+}
+
+/// Whether `schema.table` exists.
+pub fn table_exists<C: GenericClient>(
+    c: &mut C,
+    schema: &str,
+    table: &str,
+) -> Result<bool, postgres::Error> {
+    Ok(c.query_one(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = $1::text AND table_name = $2::text)",
+        &[&schema, &table],
+    )?
+    .get(0))
+}
+
+/// Whether any of `tables` exists in `schema`.
+pub fn any_table_exists<C: GenericClient>(
+    c: &mut C,
+    schema: &str,
+    tables: &[&str],
+) -> Result<bool, postgres::Error> {
+    for table in tables {
+        if table_exists(c, schema, table)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `schema.table`'s column names in ordinal order.
+pub fn table_columns<C: GenericClient>(
+    c: &mut C,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, postgres::Error> {
+    Ok(c.query(
+        "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = $1::text AND table_name = $2::text ORDER BY ordinal_position",
+        &[&schema, &table],
+    )?
+    .iter()
+    .map(|row| row.get(0))
+    .collect())
+}
+
+fn qualified(schema: &str, table: &str) -> String {
+    format!("\"{schema}\".\"{table}\"")
+}
+
+/// `(name, contype)` of every constraint on `schema.table` of the given
+/// kinds (`'f'`, `'p'`, `'u'`, ...).
+fn constraints_of<C: GenericClient>(
+    c: &mut C,
+    schema: &str,
+    table: &str,
+    kinds: &[&str],
+) -> Result<Vec<(String, String)>, postgres::Error> {
+    let kinds: Vec<String> = kinds.iter().map(|k| (*k).to_owned()).collect();
+    Ok(c.query(
+        "SELECT conname::text, contype::text FROM pg_constraint \
+             WHERE conrelid = $1::text::regclass AND contype::text = ANY($2) ORDER BY conname",
+        &[&qualified(schema, table), &kinds],
+    )?
+    .iter()
+    .map(|row| (row.get(0), row.get(1)))
+    .collect())
+}
+
+/// Add every column `ddl` declares for `table` that the live table lacks,
+/// except `skip` (the columns the caller adds itself). The legacy additive
+/// convergence (`lifecycles.source`, `task_versions.insertion_seq`, ...):
+/// each declaration carries its own default, so existing rows stay valid.
+pub fn add_missing_columns<C: GenericClient>(
+    c: &mut C,
+    schema: &str,
+    ddl: &str,
+    table: &str,
+    skip: &[&str],
+) -> Result<Vec<String>, postgres::Error> {
+    if !table_exists(c, schema, table)? {
+        return Ok(Vec::new());
+    }
+    let live = table_columns(c, schema, table)?;
+    let mut added = Vec::new();
+    for (name, definition) in column_definitions(ddl, table) {
+        if live.contains(&name) || skip.contains(&name.as_str()) {
+            continue;
+        }
+        c.batch_execute(&format!(
+            "ALTER TABLE {} ADD COLUMN {definition}",
+            qualified(schema, table)
+        ))?;
+        added.push(name);
+    }
+    Ok(added)
+}
+
+/// Re-key every table of `tables` that exists without the `project_id`
+/// partition column: the column is added (existing rows get `partition`),
+/// every foreign key, the table-level primary key / unique constraints the
+/// DDL redeclares, and every plain index on those tables are dropped, and the
+/// DDL's table-level constraints are re-added (keys first, then foreign
+/// keys, which Postgres validates against the re-keyed rows). The caller
+/// then runs the DDL to re-create the indexes. Returns the re-keyed tables;
+/// tables already keyed or absent are untouched, so a repeated upgrade is a
+/// no-op. Must run inside the caller's transaction.
+pub fn partition_tables<C: GenericClient>(
+    c: &mut C,
+    schema: &str,
+    ddl: &str,
+    tables: &[&str],
+    partition: &str,
+) -> Result<Vec<String>, postgres::Error> {
+    let mut migrating: Vec<&str> = Vec::new();
+    for table in tables {
+        if table_exists(c, schema, table)?
+            && !table_columns(c, schema, table)?
+                .iter()
+                .any(|col| col == "project_id")
+        {
+            migrating.push(table);
+        }
+    }
+    let literal = sql_literal(partition);
+    for table in &migrating {
+        let name = qualified(schema, table);
+        c.batch_execute(&format!(
+            "ALTER TABLE {name} ADD COLUMN project_id TEXT NOT NULL DEFAULT {literal};
+             ALTER TABLE {name} ALTER COLUMN project_id DROP DEFAULT;"
+        ))?;
+    }
+    for table in &migrating {
+        for (constraint, _) in constraints_of(c, schema, table, &["f"])? {
+            c.batch_execute(&format!(
+                "ALTER TABLE {} DROP CONSTRAINT \"{constraint}\"",
+                qualified(schema, table)
+            ))?;
+        }
+    }
+    for table in &migrating {
+        let redeclares_pk = table_constraints(ddl, table)
+            .iter()
+            .any(|clause| clause.starts_with("PRIMARY KEY"));
+        for (constraint, kind) in constraints_of(c, schema, table, &["p", "u"])? {
+            if kind == "u" || redeclares_pk {
+                c.batch_execute(&format!(
+                    "ALTER TABLE {} DROP CONSTRAINT \"{constraint}\"",
+                    qualified(schema, table)
+                ))?;
+            }
+        }
+        let plain_indexes: Vec<String> = c
+            .query(
+                "SELECT i.relname::text FROM pg_index x \
+                 JOIN pg_class i ON i.oid = x.indexrelid \
+                 WHERE x.indrelid = $1::text::regclass \
+                 AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = x.indexrelid)",
+                &[&qualified(schema, table)],
+            )?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        for index in plain_indexes {
+            c.batch_execute(&format!("DROP INDEX \"{schema}\".\"{index}\""))?;
+        }
+    }
+    for foreign in [false, true] {
+        for table in &migrating {
+            for clause in table_constraints(ddl, table) {
+                if clause.starts_with("FOREIGN KEY") == foreign {
+                    c.batch_execute(&format!(
+                        "ALTER TABLE {} ADD {clause}",
+                        qualified(schema, table)
+                    ))?;
+                }
+            }
+        }
+    }
+    Ok(migrating.into_iter().map(str::to_owned).collect())
+}
+
+/// Re-create the sentinel `table` from `ddl` when its first column is not
+/// `version` (the pre-v13 `(id, version)` order), keeping its row and the
+/// default constraint names. Returns whether it did.
+pub fn version_column_first<C: GenericClient>(
+    c: &mut C,
+    schema: &str,
+    ddl: &str,
+    table: &str,
+) -> Result<bool, postgres::Error> {
+    if !table_exists(c, schema, table)?
+        || table_columns(c, schema, table)?.first().map(String::as_str) == Some("version")
+    {
+        return Ok(false);
+    }
+    let shadow = format!("{table}__rebuild");
+    let Some(create) = create_table_as(ddl, table, &shadow) else {
+        return Ok(false);
+    };
+    c.batch_execute(&format!(
+        "{create}
+         INSERT INTO \"{schema}\".{shadow} (version, id) SELECT version, id FROM {old};
+         DROP TABLE {old};
+         ALTER TABLE \"{schema}\".{shadow} RENAME TO {table};",
+        old = qualified(schema, table),
+    ))?;
+    let prefix = format!("{shadow}_");
+    for (constraint, _) in constraints_of(c, schema, table, &["p", "c", "u"])? {
+        if let Some(rest) = constraint.strip_prefix(&prefix) {
+            c.batch_execute(&format!(
+                "ALTER TABLE {} RENAME CONSTRAINT \"{constraint}\" TO \"{table}_{rest}\"",
+                qualified(schema, table)
+            ))?;
+        }
+    }
+    Ok(true)
+}
+
+/// Migrate the core tables of `schema` in place to [`CURRENT_SCHEMA_VERSION`].
+///
+/// One transaction under the bootstrap advisory lock: legacy additive
+/// columns are added, every core table lacking the `project_id` column is
+/// re-keyed with its rows assigned `partition`
+/// ([`partition_tables`]), the sentinel is re-created version-first, the DDL
+/// re-creates any missing table or index, and the version row is set
+/// current. Each step inspects the live layout rather than trusting the
+/// recorded version, so re-running it (or running it on a schema whose
+/// tables are already keyed but whose version row is behind) succeeds and
+/// only fixes the version. A schema with no core tables is created at the
+/// current version; one newer than this build, or older than
+/// [`OLDEST_UPGRADABLE_SCHEMA_VERSION`], is refused untouched.
+pub fn upgrade_client(
+    client: &mut Client,
+    schema: &str,
+    partition: &str,
+) -> Result<SchemaUpgrade, StoreError> {
+    let mut tx = client.transaction().map_err(db)?;
+    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&BOOTSTRAP_LOCK_KEY])
+        .map_err(db)?;
+    tx.batch_execute(&format!(
+        "CREATE SCHEMA IF NOT EXISTS \"{schema}\";\n{}",
+        search_path_sql(schema)
+    ))
+    .map_err(db)?;
+    let from = match recorded_version(&mut tx, schema, VERSION_TABLE).map_err(db)? {
+        Recorded::Missing => {
+            if any_table_exists(&mut tx, schema, &PARTITIONED_TABLES).map_err(db)? {
+                return Err(StoreSchemaError::new(None).into());
+            }
+            None
+        }
+        Recorded::Version(None) => return Err(StoreSchemaError::new(None).into()),
+        Recorded::Version(Some(v)) if v > CURRENT_SCHEMA_VERSION => {
+            return Err(StoreSchemaError::new(Some(v)).into());
+        }
+        Recorded::Version(Some(v)) if v < OLDEST_UPGRADABLE_SCHEMA_VERSION => {
+            return Err(too_old_to_upgrade(
+                "store",
+                VERSION_TABLE,
+                v,
+                OLDEST_UPGRADABLE_SCHEMA_VERSION,
+            ));
+        }
+        Recorded::Version(Some(v)) => Some(v),
+    };
+    let ddl = without_pragmas(SCHEMA_SQL);
+    for table in PARTITIONED_TABLES {
+        add_missing_columns(&mut tx, schema, &ddl, table, &["project_id"]).map_err(db)?;
+    }
+    let partitioned =
+        partition_tables(&mut tx, schema, &ddl, &PARTITIONED_TABLES, partition).map_err(db)?;
+    version_column_first(&mut tx, schema, &ddl, VERSION_TABLE).map_err(db)?;
+    tx.batch_execute(&ddl).map_err(db)?;
+    tx.batch_execute(SUPPLEMENTARY_INDEXES).map_err(db)?;
+    let current = i32::try_from(CURRENT_SCHEMA_VERSION).unwrap_or(i32::MAX);
+    tx.execute(
+        "UPDATE schema_version SET version = $1 WHERE id = 1",
+        &[&current],
+    )
+    .map_err(db)?;
+    tx.commit().map_err(db)?;
+    Ok(SchemaUpgrade {
+        from,
+        to: CURRENT_SCHEMA_VERSION,
+        partitioned,
+    })
 }
 
 // --- LISTEN bridge --------------------------------------------------------------------------
@@ -872,13 +1207,14 @@ fn deserialize_timestamps(value: Value) -> Result<BTreeMap<Status, DateTime<Utc>
 /// preserves the original `first_seen_at`.
 fn ensure_task_identity<C: GenericClient>(
     c: &mut C,
+    p: &str,
     task_id: &str,
     now: DateTime<Utc>,
 ) -> Result<(), StoreError> {
     c.execute(
-        "INSERT INTO tasks (id, first_seen_at, updated_at) VALUES ($1, $2, $3) \
-         ON CONFLICT (id) DO NOTHING",
-        &[&task_id, &now, &now],
+        "INSERT INTO tasks (project_id, id, first_seen_at, updated_at) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (project_id, id) DO NOTHING",
+        &[&p, &task_id, &now, &now],
     )
     .map_err(db)?;
     Ok(())
@@ -911,13 +1247,17 @@ impl LifecycleParams {
     }
 }
 
-fn insert_lifecycle<C: GenericClient>(c: &mut C, lifecycle: &Lifecycle) -> Result<(), StoreError> {
+fn insert_lifecycle<C: GenericClient>(
+    c: &mut C,
+    p: &str,
+    lifecycle: &Lifecycle,
+) -> Result<(), StoreError> {
     // Auto-register the task identity so lifecycles.task_id -> tasks(id)
     // always holds, covering callers that seed a lifecycle without a prior
     // save_task.
     let now = Utc::now();
-    ensure_task_identity(c, &lifecycle.task_id, now)?;
-    let p = LifecycleParams::new(lifecycle)?;
+    ensure_task_identity(c, p, &lifecycle.task_id, now)?;
+    let params = LifecycleParams::new(lifecycle)?;
     let blocked_requires = lifecycle
         .blocked_requires_json
         .as_deref()
@@ -927,25 +1267,26 @@ fn insert_lifecycle<C: GenericClient>(c: &mut C, lifecycle: &Lifecycle) -> Resul
             run_id, task_id, status, version, retries, error,
             agent_output, session_id, artifacts_dir, worker_id,
             timestamps_json, updated_at, blocked_requires_json,
-            task_content_hash, awaiting_manual_ordinal, source
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+            task_content_hash, awaiting_manual_ordinal, source, project_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         &[
             &lifecycle.run_id,
             &lifecycle.task_id,
-            &p.status,
-            &p.version,
-            &p.retries,
+            &params.status,
+            &params.version,
+            &params.retries,
             &free_text_or_null(&lifecycle.error),
             &free_text_or_null(&lifecycle.agent_output),
             &null_if_empty(&lifecycle.session_id),
             &null_if_empty(&lifecycle.artifacts_dir),
             &null_if_empty(&lifecycle.worker_id),
-            &p.timestamps_json,
-            &p.updated_at,
+            &params.timestamps_json,
+            &params.updated_at,
             &blocked_requires,
             &null_if_empty(&lifecycle.task_content_hash),
-            &p.awaiting_manual_ordinal,
+            &params.awaiting_manual_ordinal,
             &null_if_empty(&lifecycle.source),
+            &p,
         ],
     );
     match result {
@@ -959,10 +1300,11 @@ fn insert_lifecycle<C: GenericClient>(c: &mut C, lifecycle: &Lifecycle) -> Resul
 
 fn update_lifecycle_row<C: GenericClient>(
     c: &mut C,
+    p: &str,
     lifecycle: &Lifecycle,
     expected_version: u64,
 ) -> Result<(), StoreError> {
-    let p = LifecycleParams::new(lifecycle)?;
+    let params = LifecycleParams::new(lifecycle)?;
     let blocked_requires = lifecycle
         .blocked_requires_json
         .as_deref()
@@ -975,25 +1317,26 @@ fn update_lifecycle_row<C: GenericClient>(
                 agent_output = $6, session_id = $7, artifacts_dir = $8, worker_id = $9,
                 timestamps_json = $10, updated_at = $11, blocked_requires_json = $12,
                 task_content_hash = $13, awaiting_manual_ordinal = $14, source = $15
-            WHERE run_id = $16 AND version = $17",
+            WHERE run_id = $16 AND version = $17 AND project_id = $18",
             &[
                 &lifecycle.task_id,
-                &p.status,
-                &p.version,
-                &p.retries,
+                &params.status,
+                &params.version,
+                &params.retries,
                 &free_text_or_null(&lifecycle.error),
                 &free_text_or_null(&lifecycle.agent_output),
                 &null_if_empty(&lifecycle.session_id),
                 &null_if_empty(&lifecycle.artifacts_dir),
                 &null_if_empty(&lifecycle.worker_id),
-                &p.timestamps_json,
-                &p.updated_at,
+                &params.timestamps_json,
+                &params.updated_at,
                 &blocked_requires,
                 &null_if_empty(&lifecycle.task_content_hash),
-                &p.awaiting_manual_ordinal,
+                &params.awaiting_manual_ordinal,
                 &null_if_empty(&lifecycle.source),
                 &lifecycle.run_id,
                 &expected,
+                &p,
             ],
         )
         .map_err(db)?;
@@ -1001,7 +1344,7 @@ fn update_lifecycle_row<C: GenericClient>(
         return Ok(());
     }
     // Zero rows: disambiguate not-found from a version conflict.
-    match stored_version(c, &lifecycle.run_id, false)? {
+    match stored_version(c, p, &lifecycle.run_id, false)? {
         None => Err(StoreError::lifecycle_not_found(&lifecycle.run_id)),
         Some(actual) => Err(StoreError::optimistic_concurrency(
             &lifecycle.run_id,
@@ -1015,15 +1358,16 @@ fn update_lifecycle_row<C: GenericClient>(
 /// surrounding transaction.
 fn stored_version<C: GenericClient>(
     c: &mut C,
+    p: &str,
     run_id: &str,
     for_update: bool,
 ) -> Result<Option<u64>, StoreError> {
     let sql = if for_update {
-        "SELECT version FROM lifecycles WHERE run_id = $1 FOR UPDATE"
+        "SELECT version FROM lifecycles WHERE project_id = $1 AND run_id = $2 FOR UPDATE"
     } else {
-        "SELECT version FROM lifecycles WHERE run_id = $1"
+        "SELECT version FROM lifecycles WHERE project_id = $1 AND run_id = $2"
     };
-    let row = c.query_opt(sql, &[&run_id]).map_err(db)?;
+    let row = c.query_opt(sql, &[&p, &run_id]).map_err(db)?;
     row.map(|row| {
         let version: i32 = col(&row, 0)?;
         unsigned(version, "lifecycles.version")
@@ -1058,6 +1402,7 @@ fn fold_joined_rows(rows: &[Row]) -> Result<Vec<Lifecycle>, StoreError> {
 /// (`FOR UPDATE OF l`) for the surrounding append transaction.
 fn load_lifecycle_row<C: GenericClient>(
     c: &mut C,
+    p: &str,
     run_id: &str,
     for_update: bool,
 ) -> Result<Option<Lifecycle>, StoreError> {
@@ -1066,20 +1411,24 @@ fn load_lifecycle_row<C: GenericClient>(
         .query(
             &format!(
                 "SELECT {LIFECYCLE_COLUMNS}, {ATTEMPT_COLUMNS} FROM lifecycles l \
-                 LEFT JOIN attempts a ON a.run_id = l.run_id \
-                 WHERE l.run_id = $1 ORDER BY a.number{lock}"
+                 LEFT JOIN attempts a ON a.project_id = l.project_id AND a.run_id = l.run_id \
+                 WHERE l.project_id = $1 AND l.run_id = $2 ORDER BY a.number{lock}"
             ),
-            &[&run_id],
+            &[&p, &run_id],
         )
         .map_err(db)?;
     Ok(fold_joined_rows(&rows)?.into_iter().next())
 }
 
-/// The SQL filter for `list_lifecycles`; `None` when the filter can match
-/// nothing (an empty status set).
-fn filter_clause(filter: &LifecycleFilter) -> Option<(String, Vec<Box<dyn ToSql + Sync>>)> {
-    let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+/// The SQL filter for `list_lifecycles` (always scoped to the partition,
+/// bound as `$1`); `None` when the filter can match nothing (an empty status
+/// set).
+fn filter_clause(
+    p: &str,
+    filter: &LifecycleFilter,
+) -> Option<(String, Vec<Box<dyn ToSql + Sync>>)> {
+    let mut clauses: Vec<String> = vec!["l.project_id = $1".to_owned()];
+    let mut params: Vec<Box<dyn ToSql + Sync>> = vec![Box::new(p.to_owned())];
     if let Some(statuses) = &filter.statuses {
         if statuses.is_empty() {
             return None;
@@ -1099,19 +1448,16 @@ fn filter_clause(filter: &LifecycleFilter) -> Option<(String, Vec<Box<dyn ToSql 
         params.push(Box::new(task_ids.clone()));
         clauses.push(format!("l.task_id = ANY(${})", params.len()));
     }
-    let where_clause = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", clauses.join(" AND "))
-    };
+    let where_clause = format!("WHERE {}", clauses.join(" AND "));
     Some((where_clause, params))
 }
 
 fn list_lifecycle_rows<C: GenericClient>(
     c: &mut C,
+    p: &str,
     filter: &LifecycleFilter,
 ) -> Result<Vec<Lifecycle>, StoreError> {
-    let Some((where_clause, params)) = filter_clause(filter) else {
+    let Some((where_clause, params)) = filter_clause(p, filter) else {
         return Ok(Vec::new());
     };
     let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p.as_ref()).collect();
@@ -1133,7 +1479,8 @@ fn list_lifecycle_rows<C: GenericClient>(
         .query(
             &format!(
                 "SELECT {LIFECYCLE_COLUMNS}, {ATTEMPT_COLUMNS} FROM {source} \
-                 LEFT JOIN attempts a ON a.run_id = l.run_id {outer_where} \
+                 LEFT JOIN attempts a ON a.project_id = l.project_id AND a.run_id = l.run_id \
+                 {outer_where} \
                  ORDER BY l.updated_at DESC, l.run_id DESC, a.number"
             ),
             param_refs.as_slice(),
@@ -1144,6 +1491,7 @@ fn list_lifecycle_rows<C: GenericClient>(
 
 fn summarize_spend_rows<C: GenericClient>(
     c: &mut C,
+    p: &str,
     window: &SpendWindow,
 ) -> Result<SpendSummary, StoreError> {
     // SUM over every attempt's four token columns + cost. The window is
@@ -1153,8 +1501,8 @@ fn summarize_spend_rows<C: GenericClient>(
     // unbounded grand total but never lands inside a bounded window. SUM of
     // BIGINT is NUMERIC in Postgres, hence the casts; COALESCE keeps an
     // empty result at all-zero totals rather than NULL.
-    let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn ToSql + Sync>> = Vec::new();
+    let mut clauses: Vec<String> = vec!["project_id = $1".to_owned()];
+    let mut params: Vec<Box<dyn ToSql + Sync>> = vec![Box::new(p.to_owned())];
     if let Some(since) = window.since {
         params.push(Box::new(since));
         clauses.push(format!(
@@ -1169,11 +1517,7 @@ fn summarize_spend_rows<C: GenericClient>(
             params.len()
         ));
     }
-    let where_clause = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", clauses.join(" AND "))
-    };
+    let where_clause = format!("WHERE {}", clauses.join(" AND "));
     let param_refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p.as_ref()).collect();
     let row = c
         .query_one(
@@ -1297,6 +1641,7 @@ impl RawAttempt {
 
 fn upsert_attempt<C: GenericClient>(
     c: &mut C,
+    p: &str,
     run_id: &str,
     attempt: &Attempt,
 ) -> Result<(), StoreError> {
@@ -1327,9 +1672,9 @@ fn upsert_attempt<C: GenericClient>(
             run_id, number, attempt_run_id, started_at, ended_at, outcome,
             agent_output, error, agent_context_json, input_tokens, output_tokens,
             cache_creation_input_tokens, cache_read_input_tokens,
-            iterations_completed, turns, total_cost_usd, last_activity_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-        ON CONFLICT (run_id, number) DO UPDATE SET
+            iterations_completed, turns, total_cost_usd, last_activity_at, project_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        ON CONFLICT (project_id, run_id, number) DO UPDATE SET
             attempt_run_id = EXCLUDED.attempt_run_id,
             started_at = EXCLUDED.started_at,
             ended_at = EXCLUDED.ended_at,
@@ -1363,6 +1708,7 @@ fn upsert_attempt<C: GenericClient>(
             &turns,
             &attempt.total_cost_usd,
             &attempt.last_activity_at,
+            &p,
         ],
     )
     .map_err(db)?;
@@ -1371,14 +1717,16 @@ fn upsert_attempt<C: GenericClient>(
 
 fn list_attempt_rows<C: GenericClient>(
     c: &mut C,
+    p: &str,
     run_id: &str,
 ) -> Result<Vec<Attempt>, StoreError> {
     let rows = c
         .query(
             &format!(
-                "SELECT {ATTEMPT_COLUMNS} FROM attempts a WHERE a.run_id = $1 ORDER BY a.number"
+                "SELECT {ATTEMPT_COLUMNS} FROM attempts a \
+                 WHERE a.project_id = $1 AND a.run_id = $2 ORDER BY a.number"
             ),
-            &[&run_id],
+            &[&p, &run_id],
         )
         .map_err(db)?;
     rows.iter()
@@ -1388,6 +1736,7 @@ fn list_attempt_rows<C: GenericClient>(
 
 fn load_attempt_row<C: GenericClient>(
     c: &mut C,
+    p: &str,
     run_id: &str,
     number: u32,
 ) -> Result<Option<Attempt>, StoreError> {
@@ -1395,9 +1744,10 @@ fn load_attempt_row<C: GenericClient>(
     let row = c
         .query_opt(
             &format!(
-                "SELECT {ATTEMPT_COLUMNS} FROM attempts a WHERE a.run_id = $1 AND a.number = $2"
+                "SELECT {ATTEMPT_COLUMNS} FROM attempts a \
+                 WHERE a.project_id = $1 AND a.run_id = $2 AND a.number = $3"
             ),
-            &[&run_id, &number],
+            &[&p, &run_id, &number],
         )
         .map_err(db)?;
     row.map(|row| RawAttempt::read(&row)?.decode()).transpose()
@@ -1408,13 +1758,18 @@ fn load_attempt_row<C: GenericClient>(
 /// `MAX(sequence) + 1` over the run's rows. Always called inside the append
 /// transaction, where the `FOR UPDATE` lock on the lifecycle row serializes
 /// appenders, so per-run ordering stays strictly monotonic; the
-/// `UNIQUE (run_id, sequence)` constraint backstops any writer that bypasses
-/// the lock.
-fn next_domain_sequence<C: GenericClient>(c: &mut C, run_id: &str) -> Result<i64, StoreError> {
+/// `UNIQUE (project_id, run_id, sequence)` constraint backstops any writer
+/// that bypasses the lock.
+fn next_domain_sequence<C: GenericClient>(
+    c: &mut C,
+    p: &str,
+    run_id: &str,
+) -> Result<i64, StoreError> {
     let row = c
         .query_one(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE run_id = $1",
-            &[&run_id],
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events \
+             WHERE project_id = $1 AND run_id = $2",
+            &[&p, &run_id],
         )
         .map_err(db)?;
     col(&row, 0)
@@ -1425,16 +1780,17 @@ fn next_domain_sequence<C: GenericClient>(c: &mut C, run_id: &str) -> Result<i64
 /// never observes a watermark for an aborted write.
 fn insert_domain_event<C: GenericClient>(
     c: &mut C,
+    p: &str,
     event: &DomainEvent,
     channel: &str,
 ) -> Result<u64, StoreError> {
-    let sequence = next_domain_sequence(c, &event.run_id)?;
+    let sequence = next_domain_sequence(c, p, &event.run_id)?;
     let attempt_number = opt_int4(event.attempt_number, "events.attempt_number")?;
     let kind = event_kind(event);
     let payload = nul_free_json(Value::Object(event_payload(&event.payload)?));
     c.execute(
-        "INSERT INTO events (run_id, attempt_number, ts, kind, payload_json, sequence)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO events (run_id, attempt_number, ts, kind, payload_json, sequence, project_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
         &[
             &event.run_id,
             &attempt_number,
@@ -1442,6 +1798,7 @@ fn insert_domain_event<C: GenericClient>(
             &kind,
             &payload,
             &sequence,
+            &p,
         ],
     )
     .map_err(db)?;
@@ -1472,12 +1829,16 @@ fn decode_event_row(row: &Row) -> Result<DomainEvent, StoreError> {
 
 fn list_domain_event_rows<C: GenericClient>(
     c: &mut C,
+    p: &str,
     run_id: &str,
 ) -> Result<Vec<DomainEvent>, StoreError> {
     let rows = c
         .query(
-            &format!("SELECT {EVENT_COLUMNS} FROM events WHERE run_id = $1 ORDER BY sequence"),
-            &[&run_id],
+            &format!(
+                "SELECT {EVENT_COLUMNS} FROM events WHERE project_id = $1 AND run_id = $2 \
+                 ORDER BY sequence"
+            ),
+            &[&p, &run_id],
         )
         .map_err(db)?;
     rows.iter().map(decode_event_row).collect()
@@ -1486,16 +1847,17 @@ fn list_domain_event_rows<C: GenericClient>(
 /// The run's highest-sequence `kind` row, decoding only that row.
 fn latest_domain_event_row_of_kind<C: GenericClient>(
     c: &mut C,
+    p: &str,
     run_id: &str,
     kind: DomainEventKind,
 ) -> Result<Option<DomainEvent>, StoreError> {
     let row = c
         .query_opt(
             &format!(
-                "SELECT {EVENT_COLUMNS} FROM events WHERE run_id = $1 AND kind = $2 \
-                 ORDER BY sequence DESC LIMIT 1"
+                "SELECT {EVENT_COLUMNS} FROM events WHERE project_id = $1 AND run_id = $2 \
+                 AND kind = $3 ORDER BY sequence DESC LIMIT 1"
             ),
-            &[&run_id, &kind.as_str()],
+            &[&p, &run_id, &kind.as_str()],
         )
         .map_err(db)?;
     row.as_ref().map(decode_event_row).transpose()
@@ -1506,18 +1868,19 @@ fn latest_domain_event_row_of_kind<C: GenericClient>(
 /// lifecycle row.
 fn project_domain_event<C: GenericClient>(
     c: &mut C,
+    p: &str,
     event: &DomainEvent,
     folded: &Lifecycle,
 ) -> Result<(), StoreError> {
     match &event.payload {
         DomainEventPayload::AttemptStarted(a) => {
-            upsert_attempt(c, &folded.run_id, projected_attempt(folded, a.number)?)
+            upsert_attempt(c, p, &folded.run_id, projected_attempt(folded, a.number)?)
         }
         DomainEventPayload::AttemptFinalized(f) => {
-            upsert_attempt(c, &folded.run_id, projected_attempt(folded, f.number)?)
+            upsert_attempt(c, p, &folded.run_id, projected_attempt(folded, f.number)?)
         }
         DomainEventPayload::GraderEvaluated(g) => {
-            insert_grader_result(c, &grader_result_from_event(event, g)?).map(|_| ())
+            insert_grader_result(c, p, &grader_result_from_event(event, g)?).map(|_| ())
         }
         _ => Ok(()),
     }
@@ -1527,6 +1890,7 @@ fn project_domain_event<C: GenericClient>(
 
 fn insert_grader_result<C: GenericClient>(
     c: &mut C,
+    p: &str,
     result: &GraderResultRecord,
 ) -> Result<GraderResultRecord, StoreError> {
     let attempt_number = int4(result.attempt_number, "grader_results.attempt_number")?;
@@ -1538,8 +1902,8 @@ fn insert_grader_result<C: GenericClient>(
         .query_one(
             "INSERT INTO grader_results (
                 run_id, attempt_number, ordinal, grader_type, grader_name,
-                grader_spec_json, passed, duration_ms, payload_json, ts
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                grader_spec_json, passed, duration_ms, payload_json, ts, project_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id",
             &[
                 &result.run_id,
@@ -1552,6 +1916,7 @@ fn insert_grader_result<C: GenericClient>(
                 &duration_ms,
                 &payload,
                 &result.ts,
+                &p,
             ],
         )
         .map_err(db)?;
@@ -1562,6 +1927,7 @@ fn insert_grader_result<C: GenericClient>(
 
 fn list_grader_result_rows<C: GenericClient>(
     c: &mut C,
+    p: &str,
     run_id: &str,
     attempt_number: u32,
 ) -> Result<Vec<GraderResultRecord>, StoreError> {
@@ -1570,9 +1936,9 @@ fn list_grader_result_rows<C: GenericClient>(
         .query(
             "SELECT id, run_id, attempt_number, ordinal, grader_type, grader_name,
                     grader_spec_json, passed, duration_ms, payload_json, ts
-             FROM grader_results WHERE run_id = $1 AND attempt_number = $2
+             FROM grader_results WHERE project_id = $1 AND run_id = $2 AND attempt_number = $3
              ORDER BY ordinal",
-            &[&run_id, &attempt_number],
+            &[&p, &run_id, &attempt_number],
         )
         .map_err(db)?;
     rows.iter()
@@ -1612,9 +1978,10 @@ fn control_command_from_row(row: &Row) -> Result<ControlCommandRecord, StoreErro
 
 impl LifecycleStore for PostgresStore {
     fn create_lifecycle(&self, lifecycle: &Lifecycle) -> Result<(), StoreError> {
+        let p = self.partition();
         self.conn(|client| {
             let mut tx = client.transaction().map_err(db)?;
-            insert_lifecycle(&mut tx, lifecycle)?;
+            insert_lifecycle(&mut tx, p, lifecycle)?;
             tx.commit().map_err(db)
         })
     }
@@ -1624,19 +1991,23 @@ impl LifecycleStore for PostgresStore {
         lifecycle: &Lifecycle,
         expected_version: u64,
     ) -> Result<(), StoreError> {
-        self.conn(|client| update_lifecycle_row(&mut *client, lifecycle, expected_version))
+        let p = self.partition();
+        self.conn(|client| update_lifecycle_row(&mut *client, p, lifecycle, expected_version))
     }
 
     fn load_lifecycle(&self, run_id: &str) -> Result<Option<Lifecycle>, StoreError> {
-        self.conn(|client| load_lifecycle_row(&mut *client, run_id, false))
+        let p = self.partition();
+        self.conn(|client| load_lifecycle_row(&mut *client, p, run_id, false))
     }
 
     fn list_lifecycles(&self, filter: &LifecycleFilter) -> Result<Vec<Lifecycle>, StoreError> {
-        self.conn(|client| list_lifecycle_rows(&mut *client, filter))
+        let p = self.partition();
+        self.conn(|client| list_lifecycle_rows(&mut *client, p, filter))
     }
 
     fn summarize_spend(&self, window: &SpendWindow) -> Result<SpendSummary, StoreError> {
-        self.conn(|client| summarize_spend_rows(&mut *client, window))
+        let p = self.partition();
+        self.conn(|client| summarize_spend_rows(&mut *client, p, window))
     }
 }
 
@@ -1652,24 +2023,27 @@ impl TaskStore for PostgresStore {
         let column = |key: &str| definition.get(key).cloned().unwrap_or(Value::Null);
         let (graders_json, tags_json, context_json) =
             (column("graders"), column("tags"), column("context"));
+        let p = self.partition();
         self.conn(|client| {
             // One transaction so the identity row and the version row land
             // together. The version row is immutable (ON CONFLICT DO NOTHING
             // keeps the original created_at); the whole definition is part of
             // the content hash.
             let mut tx = client.transaction().map_err(db)?;
-            ensure_task_identity(&mut tx, &task.id, now)?;
+            ensure_task_identity(&mut tx, p, &task.id, now)?;
             tx.execute(
-                "UPDATE tasks SET updated_at = $1 WHERE id = $2",
-                &[&now, &task.id],
+                "UPDATE tasks SET updated_at = $1 WHERE project_id = $2 AND id = $3",
+                &[&now, &p, &task.id],
             )
             .map_err(db)?;
             tx.execute(
                 "INSERT INTO task_versions (
-                    task_id, content_hash, goal, graders_json, tags_json, context_json, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
-                ON CONFLICT (task_id, content_hash) DO NOTHING",
+                    project_id, task_id, content_hash, goal, graders_json, tags_json,
+                    context_json, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (project_id, task_id, content_hash) DO NOTHING",
                 &[
+                    &p,
                     &task.id,
                     &content_hash,
                     &goal,
@@ -1690,15 +2064,18 @@ impl TaskStore for PostgresStore {
         task_id: &str,
         content_hash: Option<&str>,
     ) -> Result<Option<Task>, StoreError> {
-        self.conn(|client| load_task_row(&mut *client, task_id, content_hash))
+        let p = self.partition();
+        self.conn(|client| load_task_row(&mut *client, p, task_id, content_hash))
     }
 
     fn load_task_for_run(&self, run_id: &str) -> Result<Option<Task>, StoreError> {
+        let p = self.partition();
         self.conn(|client| {
             let pinned = client
                 .query_opt(
-                    "SELECT task_id, task_content_hash FROM lifecycles WHERE run_id = $1",
-                    &[&run_id],
+                    "SELECT task_id, task_content_hash FROM lifecycles \
+                     WHERE project_id = $1 AND run_id = $2",
+                    &[&p, &run_id],
                 )
                 .map_err(db)?;
             let Some(row) = pinned else {
@@ -1707,27 +2084,28 @@ impl TaskStore for PostgresStore {
             let task_id: String = col(&row, 0)?;
             let content_hash: Option<String> = col(&row, 1)?;
             let content_hash = content_hash.filter(|h| !h.is_empty());
-            load_task_row(&mut *client, &task_id, content_hash.as_deref())
+            load_task_row(&mut *client, p, &task_id, content_hash.as_deref())
         })
     }
 }
 
 fn load_task_row<C: GenericClient>(
     c: &mut C,
+    p: &str,
     task_id: &str,
     content_hash: Option<&str>,
 ) -> Result<Option<Task>, StoreError> {
     let row = match content_hash {
         Some(hash) => c.query_opt(
             "SELECT goal, graders_json, tags_json, context_json
-             FROM task_versions WHERE task_id = $1 AND content_hash = $2",
-            &[&task_id, &hash],
+             FROM task_versions WHERE project_id = $1 AND task_id = $2 AND content_hash = $3",
+            &[&p, &task_id, &hash],
         ),
         None => c.query_opt(
             "SELECT goal, graders_json, tags_json, context_json
-             FROM task_versions WHERE task_id = $1
+             FROM task_versions WHERE project_id = $1 AND task_id = $2
              ORDER BY created_at DESC, insertion_seq DESC LIMIT 1",
-            &[&task_id],
+            &[&p, &task_id],
         ),
     }
     .map_err(db)?;
@@ -1748,6 +2126,7 @@ impl DomainEventStore for PostgresStore {
         event: &DomainEvent,
         expected_version: u64,
     ) -> Result<Lifecycle, StoreError> {
+        let p = self.partition();
         let (folded, sequence) = self.conn(|client| {
             // One transaction: the version check, projection writes and
             // event-row append are atomic, and SELECT ... FOR UPDATE on the
@@ -1758,11 +2137,11 @@ impl DomainEventStore for PostgresStore {
             let folded = match &event.payload {
                 DomainEventPayload::LifecycleInitialized(_) => {
                     let seeded = apply(None, event)?;
-                    insert_lifecycle(&mut tx, &seeded)?;
+                    insert_lifecycle(&mut tx, p, &seeded)?;
                     seeded
                 }
                 _ => {
-                    let current = load_lifecycle_row(&mut tx, &event.run_id, true)?
+                    let current = load_lifecycle_row(&mut tx, p, &event.run_id, true)?
                         .ok_or_else(|| StoreError::lifecycle_not_found(&event.run_id))?;
                     if current.version != expected_version {
                         return Err(StoreError::optimistic_concurrency(
@@ -1772,12 +2151,12 @@ impl DomainEventStore for PostgresStore {
                         ));
                     }
                     let folded = apply(Some(&current), event)?;
-                    update_lifecycle_row(&mut tx, &folded, expected_version)?;
-                    project_domain_event(&mut tx, event, &folded)?;
+                    update_lifecycle_row(&mut tx, p, &folded, expected_version)?;
+                    project_domain_event(&mut tx, p, event, &folded)?;
                     folded
                 }
             };
-            let sequence = insert_domain_event(&mut tx, event, &self.channel)?;
+            let sequence = insert_domain_event(&mut tx, p, event, &self.channel)?;
             tx.commit().map_err(db)?;
             Ok((folded, sequence))
         })?;
@@ -1789,7 +2168,8 @@ impl DomainEventStore for PostgresStore {
     }
 
     fn list_domain_events(&self, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
-        self.conn(|client| list_domain_event_rows(&mut *client, run_id))
+        let p = self.partition();
+        self.conn(|client| list_domain_event_rows(&mut *client, p, run_id))
     }
 
     fn latest_domain_event_of_kind(
@@ -1797,7 +2177,8 @@ impl DomainEventStore for PostgresStore {
         run_id: &str,
         kind: DomainEventKind,
     ) -> Result<Option<DomainEvent>, StoreError> {
-        self.conn(|client| latest_domain_event_row_of_kind(&mut *client, run_id, kind))
+        let p = self.partition();
+        self.conn(|client| latest_domain_event_row_of_kind(&mut *client, p, run_id, kind))
     }
 }
 
@@ -1808,34 +2189,37 @@ impl AttemptStore for PostgresStore {
         attempt: &Attempt,
         expected_version: Option<u64>,
     ) -> Result<(), StoreError> {
+        let p = self.partition();
         self.conn(|client| {
             let Some(expected) = expected_version else {
                 // Unconditional upsert: a direct caller's write, or the
                 // domain-event projection (already inside the version-checked
                 // append transaction).
-                return upsert_attempt(&mut *client, run_id, attempt);
+                return upsert_attempt(&mut *client, p, run_id, attempt);
             };
             // Versioned write (the harness's iteration-boundary aggregate
             // rollup): verify the lifecycle's optimistic-concurrency key under
             // FOR UPDATE in the same transaction as the upsert so a stale worker
             // cannot clobber counters after the run moved on.
             let mut tx = client.transaction().map_err(db)?;
-            let actual = stored_version(&mut tx, run_id, true)?
+            let actual = stored_version(&mut tx, p, run_id, true)?
                 .ok_or_else(|| StoreError::lifecycle_not_found(run_id))?;
             if actual != expected {
                 return Err(StoreError::optimistic_concurrency(run_id, expected, actual));
             }
-            upsert_attempt(&mut tx, run_id, attempt)?;
+            upsert_attempt(&mut tx, p, run_id, attempt)?;
             tx.commit().map_err(db)
         })
     }
 
     fn load_attempt(&self, run_id: &str, number: u32) -> Result<Option<Attempt>, StoreError> {
-        self.conn(|client| load_attempt_row(&mut *client, run_id, number))
+        let p = self.partition();
+        self.conn(|client| load_attempt_row(&mut *client, p, run_id, number))
     }
 
     fn list_attempts(&self, run_id: &str) -> Result<Vec<Attempt>, StoreError> {
-        self.conn(|client| list_attempt_rows(&mut *client, run_id))
+        let p = self.partition();
+        self.conn(|client| list_attempt_rows(&mut *client, p, run_id))
     }
 }
 
@@ -1844,7 +2228,8 @@ impl GraderResultStore for PostgresStore {
         &self,
         result: &GraderResultRecord,
     ) -> Result<GraderResultRecord, StoreError> {
-        self.conn(|client| insert_grader_result(&mut *client, result))
+        let p = self.partition();
+        self.conn(|client| insert_grader_result(&mut *client, p, result))
     }
 
     fn list_grader_results(
@@ -1852,7 +2237,8 @@ impl GraderResultStore for PostgresStore {
         run_id: &str,
         attempt_number: u32,
     ) -> Result<Vec<GraderResultRecord>, StoreError> {
-        self.conn(|client| list_grader_result_rows(&mut *client, run_id, attempt_number))
+        let p = self.partition();
+        self.conn(|client| list_grader_result_rows(&mut *client, p, run_id, attempt_number))
     }
 }
 
@@ -1868,12 +2254,14 @@ impl ControlCommandStore for PostgresStore {
         // pending queue immediately; BIGSERIAL assigns id, the per-run
         // enqueue-order key claim_commands consumes.
         let payload_json = nul_free_json(Value::Object(payload.clone()));
+        let p = self.partition();
         let id: i64 = self.conn(|client| {
             let row = client
                 .query_one(
-                    "INSERT INTO control_commands (run_id, kind, payload_json, enqueued_at, claimed_at)
-                     VALUES ($1, $2, $3, $4, NULL) RETURNING id",
-                    &[&run_id, &kind, &payload_json, &now],
+                    "INSERT INTO control_commands
+                         (project_id, run_id, kind, payload_json, enqueued_at, claimed_at)
+                     VALUES ($1, $2, $3, $4, $5, NULL) RETURNING id",
+                    &[&p, &run_id, &kind, &payload_json, &now],
                 )
                 .map_err(db)?;
             col(&row, 0)
@@ -1894,18 +2282,19 @@ impl ControlCommandStore for PostgresStore {
         // slice. The outer UPDATE then flips claimed_at and returns the row.
         // RETURNING yields rows in arbitrary order; sort by id afterwards to
         // honor the enqueue-order contract.
+        let p = self.partition();
         let rows = self.conn(|client| {
             client
                 .query(
                     "UPDATE control_commands SET claimed_at = $1
                      WHERE id IN (
                          SELECT id FROM control_commands
-                         WHERE run_id = $2 AND claimed_at IS NULL
+                         WHERE project_id = $3 AND run_id = $2 AND claimed_at IS NULL
                          ORDER BY id
                          FOR UPDATE SKIP LOCKED
                      )
                      RETURNING id, run_id, kind, payload_json, enqueued_at, claimed_at",
-                    &[&now, &run_id],
+                    &[&now, &run_id, &p],
                 )
                 .map_err(db)
         })?;
@@ -1921,22 +2310,28 @@ impl ControlCommandStore for PostgresStore {
         // Queue hygiene (spec 00025 FR-10): the consumer deletes an applied
         // row only after the steering domain event committed. Unknown ids
         // are a no-op by contract.
+        let p = self.partition();
         self.conn(|client| {
             client
-                .execute("DELETE FROM control_commands WHERE id = $1", &[&command_id])
+                .execute(
+                    "DELETE FROM control_commands WHERE project_id = $1 AND id = $2",
+                    &[&p, &command_id],
+                )
                 .map_err(db)?;
             Ok(())
         })
     }
 
     fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
+        let p = self.partition();
         let rows = self.conn(|client| {
             client
                 .query(
                     "SELECT id, run_id, kind, payload_json, enqueued_at, claimed_at
-                     FROM control_commands WHERE run_id = $1 AND claimed_at IS NULL
+                     FROM control_commands
+                     WHERE project_id = $1 AND run_id = $2 AND claimed_at IS NULL
                      ORDER BY id",
-                    &[&run_id],
+                    &[&p, &run_id],
                 )
                 .map_err(db)
         })?;
@@ -1951,7 +2346,7 @@ mod tests {
     #[test]
     fn schema_is_embedded_from_the_canonical_file() {
         assert!(SCHEMA_SQL.contains("timestamps_json         JSONB NOT NULL"));
-        assert!(SCHEMA_SQL.contains("INSERT INTO schema_version (id, version) VALUES (1, 12)"));
+        assert!(SCHEMA_SQL.contains("INSERT INTO schema_version (version, id) VALUES (13, 1)"));
         assert!(SCHEMA_SQL.contains("grader_results_reject_mutation"));
         assert!(SCHEMA_SQL.contains("ERRCODE = 'check_violation'"));
     }
@@ -2062,28 +2457,39 @@ mod tests {
     #[test]
     fn filter_clause_uses_array_membership_and_positional_params() {
         let (where_clause, params) = filter_clause(
+            "p",
             &LifecycleFilter::default()
                 .with_statuses([Status::Ready])
                 .with_task_id("t"),
         )
         .unwrap();
-        assert_eq!(where_clause, "WHERE l.status = ANY($1) AND l.task_id = $2");
-        assert_eq!(params.len(), 2);
+        assert_eq!(
+            where_clause,
+            "WHERE l.project_id = $1 AND l.status = ANY($2) AND l.task_id = $3"
+        );
+        assert_eq!(params.len(), 3);
         let (where_clause, params) = filter_clause(
+            "p",
             &LifecycleFilter::default()
                 .with_task_id("t")
                 .with_task_ids(["t", "u"]),
         )
         .unwrap();
-        assert_eq!(where_clause, "WHERE l.task_id = $1 AND l.task_id = ANY($2)");
-        assert_eq!(params.len(), 2);
-        assert!(
-            filter_clause(&LifecycleFilter::default().with_task_ids(Vec::<String>::new()))
-                .is_none()
+        assert_eq!(
+            where_clause,
+            "WHERE l.project_id = $1 AND l.task_id = $2 AND l.task_id = ANY($3)"
         );
-        assert!(filter_clause(&LifecycleFilter::default().with_statuses([])).is_none());
-        let (empty, none) = filter_clause(&LifecycleFilter::default()).unwrap();
-        assert_eq!(empty, "");
-        assert!(none.is_empty());
+        assert_eq!(params.len(), 3);
+        assert!(
+            filter_clause(
+                "p",
+                &LifecycleFilter::default().with_task_ids(Vec::<String>::new())
+            )
+            .is_none()
+        );
+        assert!(filter_clause("p", &LifecycleFilter::default().with_statuses([])).is_none());
+        let (scoped, only_partition) = filter_clause("p", &LifecycleFilter::default()).unwrap();
+        assert_eq!(scoped, "WHERE l.project_id = $1");
+        assert_eq!(only_partition.len(), 1);
     }
 }

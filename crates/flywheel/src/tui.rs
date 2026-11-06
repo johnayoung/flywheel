@@ -52,11 +52,10 @@ use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkSource};
 use flywheel_orchestrator::store_factory::{
     PG_DSN_ENV, PG_DSN_FALLBACK_ENV, StoreBundle, open_stores, resolve_postgres_dsn,
 };
-use flywheel_orchestrator::store_registry::{
-    Environ, SqliteCoreOpener, StoreConfig, StoreRegistries,
-};
+use flywheel_orchestrator::store_registry::{Environ, SqliteCoreOpener, StoreRegistries};
 use flywheel_orchestrator::workflow::{
-    Access, load_effective_policy, load_policy_file, repo_root_for,
+    Access, load_effective_policy, load_policy_file, repo_root_for, store_config_for,
+    store_partition,
 };
 use flywheel_worktree::phase::{ArchiveOptions, archive_completed_phases};
 use ratatui::Frame;
@@ -668,8 +667,9 @@ pub fn process_environ() -> Environ {
 
 /// The shipped store registries: sqlite (core + claims) plus postgres.
 pub fn store_registries() -> StoreRegistries {
-    let opener: SqliteCoreOpener = Arc::new(|path: &Path| {
-        SqliteStore::open(path).map(|store| Arc::new(store) as Arc<dyn HarnessStore>)
+    let opener: SqliteCoreOpener = Arc::new(|path: &Path, partition: &str| {
+        SqliteStore::open_partition(path, partition)
+            .map(|store| Arc::new(store) as Arc<dyn HarnessStore>)
     });
     let mut registries = StoreRegistries::with_sqlite(opener);
     // A fresh registry cannot already hold the postgres name.
@@ -706,12 +706,7 @@ pub fn open_store_bundle(
     policy: Option<&WorkPolicy>,
     db_path: &Path,
 ) -> Result<StoreBundle, String> {
-    let config = StoreConfig {
-        backend: policy.map_or_else(|| "sqlite".to_owned(), |p| p.store_backend.clone()),
-        db_path: db_path.to_path_buf(),
-        schema: policy.and_then(|p| p.store_schema.clone()),
-        dsn: policy.and_then(|p| p.store_dsn.clone()),
-    };
+    let config = store_config_for(policy, db_path);
     open_stores(&store_registries(), &config, &process_environ()).map_err(|err| err.to_string())
 }
 
@@ -744,6 +739,9 @@ pub struct DaemonSpawnSpec {
     /// `.flywheel/logs/` defaults (a policy-file repo).
     pub project: Option<ProjectPaths>,
     pub db_path: PathBuf,
+    /// The store partition the console reads (the project id, or
+    /// `default`); the worker supervisor's liveness probe reads the same.
+    pub partition: String,
     pub tasks_dir: Option<PathBuf>,
     pub model: Option<String>,
     /// `false` under `--no-worker`: construct the supervisors but do not
@@ -836,6 +834,7 @@ pub fn main_with(argv: &[String], daemons: Option<DaemonFactory>) -> i32 {
     let spec = DaemonSpawnSpec {
         project: home_project.as_ref().map(ProjectBinding::paths),
         db_path: db_path.clone(),
+        partition: store_partition(policy.as_ref()),
         tasks_dir: resolve_tasks_dir_for_worker(args.tasks_dir.as_deref(), policy.as_ref()),
         model: resolve_model_for_worker(args.model.as_deref(), policy.as_ref()),
         auto_start_worker: !args.no_worker,

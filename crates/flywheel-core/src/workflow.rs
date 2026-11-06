@@ -2068,7 +2068,7 @@ fn exit_code_for(result: Result<HarnessOutcome, WorkflowError>) -> i32 {
     }
 }
 
-fn cmd_run(args: RunArgs) -> i32 {
+fn cmd_run(args: RunArgs, store: Option<Arc<dyn RunStore>>) -> i32 {
     let db_path = resolve_db(args.db.as_deref());
     let sandbox = match &args.sandbox {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
@@ -2094,6 +2094,9 @@ fn cmd_run(args: RunArgs) -> i32 {
     options.agent.max_turns = args.max_turns;
     options.max_retries = Some(args.max_retries);
     options.events = events;
+    // An injected store (the shell's partition- and backend-selected one)
+    // owns the run record; `--db` then only anchors the run logs.
+    options.store = store;
 
     // File vs inline goal: an existing file is loaded as a task (which
     // carries its own graders); anything else is treated as an inline goal.
@@ -2135,7 +2138,7 @@ fn drain_agent_teardown(runtime: &tokio::runtime::Runtime) {
     ));
 }
 
-fn cmd_is_done(task_file: &str, db: Option<&str>) -> i32 {
+fn cmd_is_done(task_file: &str, db: Option<&str>, store: Option<Arc<dyn RunStore>>) -> i32 {
     let task = match load_task_file(task_file) {
         Ok(task) => task,
         Err(err) => {
@@ -2143,12 +2146,14 @@ fn cmd_is_done(task_file: &str, db: Option<&str>) -> i32 {
             return 2;
         }
     };
-    let db_path = resolve_db(db);
-    let outcome = SqliteStore::open(&db_path).and_then(|store| {
-        let done = has_done_lifecycle(&store, &task.id);
-        store.close()?;
-        done
-    });
+    let outcome = match store {
+        Some(store) => has_done_lifecycle(store.as_ref(), &task.id),
+        None => SqliteStore::open(resolve_db(db)).and_then(|store| {
+            let done = has_done_lifecycle(&store, &task.id);
+            store.close()?;
+            done
+        }),
+    };
     match outcome {
         Ok(true) => 0,
         Ok(false) => 1,
@@ -2163,8 +2168,8 @@ fn cmd_is_done(task_file: &str, db: Option<&str>) -> i32 {
 /// (interrupt / steer / set-model / approve / reject) enqueue into.
 pub fn dispatch(command: Command, store: Option<Arc<dyn RunStore>>) -> i32 {
     match command {
-        Command::Run(args) => cmd_run(args),
-        Command::IsDone { task_file, db } => cmd_is_done(&task_file, db.as_deref()),
+        Command::Run(args) => cmd_run(args, store),
+        Command::IsDone { task_file, db } => cmd_is_done(&task_file, db.as_deref(), store),
         Command::Interrupt { run_id, db } => enqueue_control_command(
             &resolve_db(db.as_deref()),
             &run_id,

@@ -20,7 +20,7 @@ use crate::claims::{ClaimStore, ClaimStoreError};
 use crate::store_registry::{BuildRequest, Environ, RegistryError, StoreRegistries};
 
 pub use crate::store_registry::{
-    DEFAULT_BACKEND, SqliteCoreOpener, StoreConfig, environ_from_process,
+    DEFAULT_BACKEND, DEFAULT_PARTITION, SqliteCoreOpener, StoreConfig, environ_from_process,
 };
 
 /// The flywheel-specific DSN variable; wins over the fallback silently.
@@ -206,12 +206,16 @@ mod tests {
         );
     }
 
-    /// A registries value whose core sqlite opener records the path it was
-    /// handed instead of opening a real core store (the core `SqliteStore`
-    /// is not this module's concern).
-    fn recording_registries(seen: Arc<Mutex<Vec<std::path::PathBuf>>>) -> StoreRegistries {
-        let opener: SqliteCoreOpener = Arc::new(move |path: &Path| {
-            seen.lock().unwrap().push(path.to_path_buf());
+    /// A registries value whose core sqlite opener records the path and
+    /// partition it was handed instead of opening a real core store (the
+    /// core `SqliteStore` is not this module's concern).
+    fn recording_registries(
+        seen: Arc<Mutex<Vec<(std::path::PathBuf, String)>>>,
+    ) -> StoreRegistries {
+        let opener: SqliteCoreOpener = Arc::new(move |path: &Path, partition: &str| {
+            seen.lock()
+                .unwrap()
+                .push((path.to_path_buf(), partition.to_owned()));
             Err(StoreError::backend(std::io::Error::other(
                 "core store opener stub for the factory tests",
             )))
@@ -241,18 +245,22 @@ mod tests {
     }
 
     #[test]
-    fn build_store_routes_db_path_to_the_core_opener() {
+    fn build_store_routes_db_path_and_partition_to_the_core_opener() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let registries = recording_registries(seen.clone());
-        let config = StoreConfig::sqlite("/tmp/some.db");
+        let config = StoreConfig::sqlite("/tmp/some.db").with_project_id("proj-1");
         let Err(err) = build_store(&registries, &config, &Environ::new()) else {
             panic!("the recording opener always fails");
         };
         assert!(matches!(err, StoreConfigError::Core(_)), "{err}");
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            &[std::path::PathBuf::from("/tmp/some.db")]
+            &[(
+                std::path::PathBuf::from("/tmp/some.db"),
+                "proj-1".to_owned()
+            )]
         );
+        assert_eq!(StoreConfig::sqlite("/tmp/x").project_id, DEFAULT_PARTITION);
     }
 
     #[test]
@@ -263,6 +271,7 @@ mod tests {
             db_path: "/tmp/x.db".into(),
             schema: None,
             dsn: None,
+            project_id: DEFAULT_PARTITION.to_owned(),
         };
         let Err(err) = build_claim_store(&registries, &config, &Environ::new()) else {
             panic!("mysql is not registered");
@@ -309,6 +318,7 @@ mod tests {
             db_path: "/tmp/unused.db".into(),
             schema: Some("flywheel".to_owned()),
             dsn: None,
+            project_id: DEFAULT_PARTITION.to_owned(),
         };
 
         let missing = preflight_store(&registries, &config, &Environ::new()).unwrap_err();

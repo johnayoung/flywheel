@@ -18,8 +18,17 @@
 //! * WAL mode is sticky at the database level for file-backed databases and
 //!   falls back to `memory` for `:memory:` databases per SQLite semantics.
 //!
+//! Partitioning: every table carries the opaque `project_id` partition key
+//! ([`SqliteStoreOptions::partition`], default
+//! [`DEFAULT_PARTITION`](crate::store::DEFAULT_PARTITION)); every read and
+//! write binds it, so one file can hold many partitions without any of them
+//! observing another's rows. The schema version is checked before any DDL
+//! runs: a fresh file is created at the current version, a behind one is
+//! refused naming `fw db upgrade` ([`SqliteStore::upgrade`]), and a newer
+//! one is refused outright.
+//!
 //! Optimistic concurrency on `lifecycles.version` is a single
-//! `UPDATE ... WHERE run_id = ? AND version = ?` checked by rows affected; a
+//! `UPDATE ... WHERE project_id = ? AND run_id = ? AND version = ?` checked by rows affected; a
 //! zero-row result is disambiguated into
 //! [`StoreConflictError::LifecycleNotFound`] or
 //! [`StoreConflictError::OptimisticConcurrency`] by a follow-up read.
@@ -56,10 +65,12 @@ use crate::events::{DomainEvent, DomainEventKind, DomainEventPayload, apply};
 use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status};
 use crate::loaders::task_digest;
 use crate::notifier::RunNotifier;
+use crate::schema_ddl::{create_table_as, without_pragmas};
 use crate::store::{
     AttemptStore, CURRENT_SCHEMA_VERSION, ControlCommandRecord, ControlCommandStore,
-    DomainEventStore, GraderResultRecord, GraderResultStore, JsonObject, LifecycleFilter,
-    LifecycleStore, SpendSummary, SpendWindow, StoreError, StoreSchemaError, TaskStore,
+    DEFAULT_PARTITION, DomainEventStore, GraderResultRecord, GraderResultStore, JsonObject,
+    LifecycleFilter, LifecycleStore, OLDEST_UPGRADABLE_SCHEMA_VERSION, SchemaUpgrade, SpendSummary,
+    SpendWindow, StoreError, StoreSchemaError, TaskStore,
 };
 use crate::store_memory::{
     assemble_task, grader_result_from_event, parse_wire_enum, projected_attempt, task_definition,
@@ -77,10 +88,27 @@ pub const SCHEMA_SQL: &str = include_str!("../schema/persistence-schema.sql");
 /// unchanged and an existing database gains them on its next open. Mirrors
 /// the Postgres store's `SUPPLEMENTARY_INDEXES`.
 const SUPPLEMENTARY_INDEXES: &str = "
-CREATE INDEX IF NOT EXISTS idx_lifecycles_task_id ON lifecycles(task_id);
-CREATE INDEX IF NOT EXISTS idx_lifecycles_updated_at ON lifecycles(updated_at DESC, run_id DESC);
-CREATE INDEX IF NOT EXISTS idx_lifecycles_status ON lifecycles(status);
+CREATE INDEX IF NOT EXISTS idx_lifecycles_task_id ON lifecycles(project_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_lifecycles_updated_at
+  ON lifecycles(project_id, updated_at DESC, run_id DESC);
+CREATE INDEX IF NOT EXISTS idx_lifecycles_status ON lifecycles(project_id, status);
 ";
+
+/// The partitioned core tables, parents before children (the order an
+/// in-place upgrade re-keys them in). `schema_version` is the one table
+/// without a partition column.
+pub const PARTITIONED_TABLES: [&str; 7] = [
+    "tasks",
+    "task_versions",
+    "lifecycles",
+    "attempts",
+    "events",
+    "grader_results",
+    "control_commands",
+];
+
+/// The core schema-version sentinel table.
+pub const VERSION_TABLE: &str = "schema_version";
 
 /// Append-only enforcement on `grader_results`. Applied post-bootstrap so
 /// the canonical schema file is unchanged; `IF NOT EXISTS` makes the
@@ -128,6 +156,9 @@ pub struct SqliteStoreOptions {
     pub transient_sleep: Option<SleepFn>,
     /// `None` gives the store its own [`RunNotifier`].
     pub notifier: Option<Arc<RunNotifier>>,
+    /// The opaque partition key (`project_id` column) every read and write
+    /// is scoped to. Supplied by whoever opens the store.
+    pub partition: String,
 }
 
 impl Default for SqliteStoreOptions {
@@ -140,6 +171,7 @@ impl Default for SqliteStoreOptions {
             backoff_cap: DEFAULT_BACKOFF_CAP,
             transient_sleep: None,
             notifier: None,
+            partition: DEFAULT_PARTITION.to_owned(),
         }
     }
 }
@@ -154,6 +186,7 @@ impl fmt::Debug for SqliteStoreOptions {
             .field("backoff_cap", &self.backoff_cap)
             .field("transient_sleep", &self.transient_sleep.is_some())
             .field("notifier", &self.notifier.is_some())
+            .field("partition", &self.partition)
             .finish()
     }
 }
@@ -193,9 +226,29 @@ impl fmt::Debug for SqliteStore {
 }
 
 impl SqliteStore {
-    /// Open (creating if absent) and bootstrap the database at `path`.
+    /// Open (creating if absent) and bootstrap the database at `path`, bound
+    /// to [`DEFAULT_PARTITION`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         Self::open_with(path, SqliteStoreOptions::default())
+    }
+
+    /// Open the database at `path` bound to `partition`.
+    pub fn open_partition(path: impl AsRef<Path>, partition: &str) -> Result<Self, StoreError> {
+        Self::open_with(
+            path,
+            SqliteStoreOptions {
+                partition: partition.to_owned(),
+                ..SqliteStoreOptions::default()
+            },
+        )
+    }
+
+    /// Migrate the core tables of the database at `path` in place to
+    /// [`CURRENT_SCHEMA_VERSION`], filling the partition column of existing
+    /// rows with `partition`. See [`upgrade_connection`].
+    pub fn upgrade(path: impl AsRef<Path>, partition: &str) -> Result<SchemaUpgrade, StoreError> {
+        let mut conn = Connection::open(path).map_err(db)?;
+        upgrade_connection(&mut conn, partition)
     }
 
     pub fn open_with(
@@ -247,6 +300,11 @@ impl SqliteStore {
 
     pub fn options(&self) -> &SqliteStoreOptions {
         &self.options
+    }
+
+    /// The partition key every read and write is scoped to.
+    pub fn partition(&self) -> &str {
+        &self.options.partition
     }
 
     /// Run `f` against the underlying connection under the store's lock.
@@ -310,37 +368,282 @@ impl SqliteStore {
 
 fn bootstrap(conn: &mut Connection, busy_timeout: Duration) -> Result<(), StoreError> {
     conn.busy_timeout(busy_timeout).map_err(db)?;
+    // Version pin BEFORE any DDL: the current DDL indexes the partition
+    // column, which a behind store does not have yet. A fresh file (no core
+    // table at all) is created at the current version; anything not at the
+    // current version is refused (a behind store names the in-place
+    // upgrade; there is no implicit migration on open).
+    match recorded_version(conn, VERSION_TABLE).map_err(db)? {
+        Recorded::Missing => {
+            if any_table_exists(conn, &PARTITIONED_TABLES).map_err(db)? {
+                return Err(StoreSchemaError::new(None).into());
+            }
+        }
+        Recorded::Version(Some(v)) if v == CURRENT_SCHEMA_VERSION => {}
+        Recorded::Version(observed) => return Err(StoreSchemaError::new(observed).into()),
+    }
     conn.execute_batch(SCHEMA_SQL).map_err(db)?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")
         .map_err(db)?;
     conn.execute_batch(APPEND_ONLY_TRIGGERS).map_err(db)?;
     conn.execute_batch(SUPPLEMENTARY_INDEXES).map_err(db)?;
-    // Version pin: the schema_version table has CHECK (id = 1) so there is
-    // at most one row. The one supported forward migration (v11 -> v12: add
-    // the nullable lifecycles.source column) is applied in place first; it
-    // is purely additive, so existing history survives. Any other mismatch
-    // is refused rather than upgraded.
+    Ok(())
+}
+
+// --- In-place upgrade -----------------------------------------------------------------
+
+/// What a schema-version sentinel table holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recorded {
+    /// The sentinel table does not exist.
+    Missing,
+    /// The table exists; `None` when its `id = 1` row is missing or its
+    /// version is not a non-negative integer.
+    Version(Option<u32>),
+}
+
+/// The version recorded in the sentinel `table` (a `(version, id)` table
+/// with one row at `id = 1`), read by column name so either column order
+/// reads the same.
+pub fn recorded_version(conn: &Connection, table: &str) -> rusqlite::Result<Recorded> {
+    if !table_exists(conn, table)? {
+        return Ok(Recorded::Missing);
+    }
     let observed: Option<i64> = conn
         .query_row(
-            "SELECT version FROM schema_version WHERE id = 1",
+            &format!("SELECT version FROM {table} WHERE id = 1"),
             [],
             |row| row.get(0),
         )
-        .optional()
-        .map_err(db)?;
-    let mut observed = observed.and_then(|v| u32::try_from(v).ok());
-    if observed == Some(11) {
-        conn.execute_batch(
-            "ALTER TABLE lifecycles ADD COLUMN source TEXT;
-             UPDATE schema_version SET version = 12 WHERE id = 1;",
-        )
-        .map_err(db)?;
-        observed = Some(12);
+        .optional()?;
+    Ok(Recorded::Version(
+        observed.and_then(|v| u32::try_from(v).ok()),
+    ))
+}
+
+/// Whether `table` exists in the main database.
+pub fn table_exists(conn: &Connection, table: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        params![table],
+        |row| row.get(0),
+    )
+}
+
+/// Whether any of `tables` exists.
+pub fn any_table_exists(conn: &Connection, tables: &[&str]) -> rusqlite::Result<bool> {
+    for table in tables {
+        if table_exists(conn, table)? {
+            return Ok(true);
+        }
     }
-    if observed != Some(CURRENT_SCHEMA_VERSION) {
-        return Err(StoreSchemaError::new(observed).into());
+    Ok(false)
+}
+
+/// `table`'s column names in declaration order.
+pub fn table_columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    rows.collect()
+}
+
+fn missing_ddl(table: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(format!(
+            "no CREATE TABLE statement for {table} in the schema DDL"
+        )),
+    )
+}
+
+/// Re-create `table` from its statement in `ddl` (SQLite cannot change a
+/// primary key in place): create a shadow table with the current layout,
+/// copy every column both layouts share (plus `extra` = `(column, value)`
+/// when given), drop the old table, and rename the shadow into place.
+/// Columns the old layout lacks take their declared defaults. Must run with
+/// `foreign_keys` off (the caller's transaction re-checks them).
+fn rebuild_table(
+    conn: &Connection,
+    ddl: &str,
+    table: &str,
+    extra: Option<(&str, &str)>,
+) -> rusqlite::Result<()> {
+    let shadow = format!("{table}__rebuild");
+    let create = create_table_as(ddl, table, &shadow).ok_or_else(|| missing_ddl(table))?;
+    conn.execute_batch(&format!("DROP TABLE IF EXISTS {shadow};"))?;
+    conn.execute_batch(&create)?;
+    let old = table_columns(conn, table)?;
+    let new = table_columns(conn, &shadow)?;
+    let shared: Vec<&str> = old
+        .iter()
+        .filter(|c| new.contains(c) && extra.is_none_or(|(e, _)| e != c.as_str()))
+        .map(String::as_str)
+        .collect();
+    let (into, select, value): (String, String, Option<&str>) = match extra {
+        Some((column, value)) => (
+            std::iter::once(column)
+                .chain(shared.iter().copied())
+                .collect::<Vec<_>>()
+                .join(", "),
+            std::iter::once("?1")
+                .chain(shared.iter().copied())
+                .collect::<Vec<_>>()
+                .join(", "),
+            Some(value),
+        ),
+        None => (shared.join(", "), shared.join(", "), None),
+    };
+    let copy = format!("INSERT INTO {shadow} ({into}) SELECT {select} FROM {table}");
+    match value {
+        Some(value) => conn.execute(&copy, params![value])?,
+        None => conn.execute(&copy, [])?,
+    };
+    conn.execute_batch(&format!(
+        "DROP TABLE {table}; ALTER TABLE {shadow} RENAME TO {table};"
+    ))?;
+    Ok(())
+}
+
+/// Re-key `table` by the `project_id` partition column when it exists
+/// without one: rebuilt from `ddl` with every existing row assigned
+/// `partition`. Returns whether it rebuilt (absent or already-keyed tables
+/// are left alone, so a repeated upgrade is a no-op).
+pub fn partition_table(
+    conn: &Connection,
+    ddl: &str,
+    table: &str,
+    partition: &str,
+) -> rusqlite::Result<bool> {
+    if !table_exists(conn, table)?
+        || table_columns(conn, table)?
+            .iter()
+            .any(|c| c == "project_id")
+    {
+        return Ok(false);
+    }
+    rebuild_table(conn, ddl, table, Some(("project_id", partition)))?;
+    Ok(true)
+}
+
+/// Re-create the sentinel `table` from `ddl` when its first column is not
+/// `version` (the pre-v13 `(id, version)` order). Returns whether it did.
+pub fn version_column_first(conn: &Connection, ddl: &str, table: &str) -> rusqlite::Result<bool> {
+    if !table_exists(conn, table)?
+        || table_columns(conn, table)?.first().map(String::as_str) == Some("version")
+    {
+        return Ok(false);
+    }
+    rebuild_table(conn, ddl, table, None)?;
+    Ok(true)
+}
+
+/// Fail when any of `tables` holds a row violating a foreign key.
+pub fn check_foreign_keys(conn: &Connection, tables: &[&str]) -> Result<(), StoreError> {
+    for table in tables {
+        if !table_exists(conn, table).map_err(db)? {
+            continue;
+        }
+        let violation: Option<String> = conn
+            .query_row(&format!("PRAGMA foreign_key_check({table})"), [], |row| {
+                row.get(2)
+            })
+            .optional()
+            .map_err(db)?;
+        if let Some(parent) = violation {
+            return Err(StoreError::backend(std::io::Error::other(format!(
+                "upgrade aborted: a {table} row references a missing {parent} row"
+            ))));
+        }
     }
     Ok(())
+}
+
+/// The refusal for a store older than any version the upgrade migrates.
+pub fn too_old_to_upgrade(label: &str, table: &str, observed: u32, oldest: u32) -> StoreError {
+    StoreError::backend(std::io::Error::other(format!(
+        "{label} is at {table}={observed}, older than the oldest version the in-place upgrade \
+         migrates ({oldest}); it must be re-created"
+    )))
+}
+
+/// Migrate the core tables on `conn` in place to [`CURRENT_SCHEMA_VERSION`].
+///
+/// One `BEGIN IMMEDIATE` transaction (with `foreign_keys` off for the
+/// duration, re-checked before commit): every core table that lacks the
+/// `project_id` column is re-keyed with its rows assigned `partition`, the
+/// sentinel is re-created version-first, any missing table or index is
+/// created from the current DDL, and the version row is set current. Each
+/// step inspects the actual layout rather than trusting the recorded
+/// version, so the upgrade is idempotent: re-running it, or running it on a
+/// store whose tables are already keyed but whose version row is behind,
+/// succeeds and only fixes the version. A store with no core tables is
+/// created at the current version. A store newer than this build, or older
+/// than [`OLDEST_UPGRADABLE_SCHEMA_VERSION`], is refused untouched.
+pub fn upgrade_connection(
+    conn: &mut Connection,
+    partition: &str,
+) -> Result<SchemaUpgrade, StoreError> {
+    conn.busy_timeout(DEFAULT_BUSY_TIMEOUT).map_err(db)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = OFF;")
+        .map_err(db)?;
+    let result = upgrade_in_transaction(conn, partition);
+    let restored = conn.execute_batch("PRAGMA foreign_keys = ON;").map_err(db);
+    let upgrade = result?;
+    restored?;
+    Ok(upgrade)
+}
+
+fn upgrade_in_transaction(
+    conn: &mut Connection,
+    partition: &str,
+) -> Result<SchemaUpgrade, StoreError> {
+    let ddl = without_pragmas(SCHEMA_SQL);
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(db)?;
+    let from = match recorded_version(&tx, VERSION_TABLE).map_err(db)? {
+        Recorded::Missing => {
+            if any_table_exists(&tx, &PARTITIONED_TABLES).map_err(db)? {
+                return Err(StoreSchemaError::new(None).into());
+            }
+            None
+        }
+        Recorded::Version(None) => return Err(StoreSchemaError::new(None).into()),
+        Recorded::Version(Some(v)) if v > CURRENT_SCHEMA_VERSION => {
+            return Err(StoreSchemaError::new(Some(v)).into());
+        }
+        Recorded::Version(Some(v)) if v < OLDEST_UPGRADABLE_SCHEMA_VERSION => {
+            return Err(too_old_to_upgrade(
+                "store",
+                VERSION_TABLE,
+                v,
+                OLDEST_UPGRADABLE_SCHEMA_VERSION,
+            ));
+        }
+        Recorded::Version(Some(v)) => Some(v),
+    };
+    let mut partitioned = Vec::new();
+    for table in PARTITIONED_TABLES {
+        if partition_table(&tx, &ddl, table, partition).map_err(db)? {
+            partitioned.push(table.to_owned());
+        }
+    }
+    version_column_first(&tx, &ddl, VERSION_TABLE).map_err(db)?;
+    tx.execute_batch(&ddl).map_err(db)?;
+    tx.execute_batch(APPEND_ONLY_TRIGGERS).map_err(db)?;
+    tx.execute_batch(SUPPLEMENTARY_INDEXES).map_err(db)?;
+    tx.execute(
+        &format!("UPDATE {VERSION_TABLE} SET version = ?1 WHERE id = 1"),
+        params![CURRENT_SCHEMA_VERSION],
+    )
+    .map_err(db)?;
+    check_foreign_keys(&tx, &PARTITIONED_TABLES)?;
+    tx.commit().map_err(db)?;
+    Ok(SchemaUpgrade {
+        from,
+        to: CURRENT_SCHEMA_VERSION,
+        partitioned,
+    })
 }
 
 // --- Error helpers --------------------------------------------------------------------
@@ -489,30 +792,36 @@ fn deserialize_timestamps(
     Ok(out)
 }
 
-fn ensure_task_identity(conn: &Connection, task_id: &str, now_iso: &str) -> Result<(), StoreError> {
+fn ensure_task_identity(
+    conn: &Connection,
+    p: &str,
+    task_id: &str,
+    now_iso: &str,
+) -> Result<(), StoreError> {
     // INSERT OR IGNORE preserves the original first_seen_at; the FK anchor
     // exists after this call so versions and lifecycles can reference it.
     conn.execute(
-        "INSERT OR IGNORE INTO tasks (id, first_seen_at, updated_at) VALUES (?1, ?2, ?3)",
-        params![task_id, now_iso, now_iso],
+        "INSERT OR IGNORE INTO tasks (project_id, id, first_seen_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![p, task_id, now_iso, now_iso],
     )
     .map_err(db)?;
     Ok(())
 }
 
-fn insert_lifecycle(conn: &Connection, lifecycle: &Lifecycle) -> Result<(), StoreError> {
+fn insert_lifecycle(conn: &Connection, p: &str, lifecycle: &Lifecycle) -> Result<(), StoreError> {
     // Auto-register the task identity so lifecycles.task_id -> tasks(id)
     // always holds, covering callers that seed a lifecycle without a prior
     // save_task.
     let now_iso = format_timestamp(&Utc::now());
-    ensure_task_identity(conn, &lifecycle.task_id, &now_iso)?;
+    ensure_task_identity(conn, p, &lifecycle.task_id, &now_iso)?;
     let result = conn.execute(
         "INSERT INTO lifecycles (
             run_id, task_id, status, version, retries, error,
             agent_output, session_id, artifacts_dir, worker_id,
             timestamps_json, updated_at, blocked_requires_json,
-            task_content_hash, awaiting_manual_ordinal, source
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            task_content_hash, awaiting_manual_ordinal, source, project_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             lifecycle.run_id,
             lifecycle.task_id,
@@ -530,6 +839,7 @@ fn insert_lifecycle(conn: &Connection, lifecycle: &Lifecycle) -> Result<(), Stor
             null_if_empty(&lifecycle.task_content_hash),
             lifecycle.awaiting_manual_ordinal,
             null_if_empty(&lifecycle.source),
+            p,
         ],
     );
     match result {
@@ -543,6 +853,7 @@ fn insert_lifecycle(conn: &Connection, lifecycle: &Lifecycle) -> Result<(), Stor
 
 fn update_lifecycle_row(
     conn: &Connection,
+    p: &str,
     lifecycle: &Lifecycle,
     expected_version: u64,
 ) -> Result<(), StoreError> {
@@ -553,7 +864,7 @@ fn update_lifecycle_row(
                 agent_output = ?6, session_id = ?7, artifacts_dir = ?8, worker_id = ?9,
                 timestamps_json = ?10, updated_at = ?11, blocked_requires_json = ?12,
                 task_content_hash = ?13, awaiting_manual_ordinal = ?14, source = ?15
-            WHERE run_id = ?16 AND version = ?17",
+            WHERE run_id = ?16 AND version = ?17 AND project_id = ?18",
             params![
                 lifecycle.task_id,
                 lifecycle.status.as_str(),
@@ -572,6 +883,7 @@ fn update_lifecycle_row(
                 null_if_empty(&lifecycle.source),
                 lifecycle.run_id,
                 expected_version,
+                p,
             ],
         )
         .map_err(db)?;
@@ -579,7 +891,7 @@ fn update_lifecycle_row(
         return Ok(());
     }
     // Zero rows: disambiguate not-found from a version conflict.
-    match stored_version(conn, &lifecycle.run_id)? {
+    match stored_version(conn, p, &lifecycle.run_id)? {
         None => Err(StoreError::lifecycle_not_found(&lifecycle.run_id)),
         Some(actual) => Err(StoreError::optimistic_concurrency(
             &lifecycle.run_id,
@@ -589,34 +901,39 @@ fn update_lifecycle_row(
     }
 }
 
-fn stored_version(conn: &Connection, run_id: &str) -> Result<Option<u64>, StoreError> {
-    conn.prepare_cached("SELECT version FROM lifecycles WHERE run_id = ?1")
-        .and_then(|mut stmt| stmt.query_row(params![run_id], |row| row.get(0)))
+fn stored_version(conn: &Connection, p: &str, run_id: &str) -> Result<Option<u64>, StoreError> {
+    conn.prepare_cached("SELECT version FROM lifecycles WHERE project_id = ?1 AND run_id = ?2")
+        .and_then(|mut stmt| stmt.query_row(params![p, run_id], |row| row.get(0)))
         .optional()
         .map_err(db)
 }
 
-fn load_lifecycle_row(conn: &Connection, run_id: &str) -> Result<Option<Lifecycle>, StoreError> {
+fn load_lifecycle_row(
+    conn: &Connection,
+    p: &str,
+    run_id: &str,
+) -> Result<Option<Lifecycle>, StoreError> {
     let raw = conn
         .prepare_cached(&format!(
-            "SELECT {LIFECYCLE_COLUMNS} FROM lifecycles WHERE run_id = ?1"
+            "SELECT {LIFECYCLE_COLUMNS} FROM lifecycles WHERE project_id = ?1 AND run_id = ?2"
         ))
-        .and_then(|mut stmt| stmt.query_row(params![run_id], RawLifecycle::read))
+        .and_then(|mut stmt| stmt.query_row(params![p, run_id], RawLifecycle::read))
         .optional()
         .map_err(db)?;
     let Some(raw) = raw else {
         return Ok(None);
     };
     let mut lifecycle = raw.decode()?;
-    lifecycle.attempts = list_attempt_rows(conn, run_id)?;
+    lifecycle.attempts = list_attempt_rows(conn, p, run_id)?;
     Ok(Some(lifecycle))
 }
 
-/// The SQL filter for `list_lifecycles`; `None` when the filter can match
-/// nothing (an empty status set).
-fn filter_clause(filter: &LifecycleFilter) -> Option<(String, Vec<Box<dyn ToSql>>)> {
-    let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+/// The SQL filter for `list_lifecycles` (always scoped to the partition,
+/// bound as `?1`); `None` when the filter can match nothing (an empty status
+/// set).
+fn filter_clause(p: &str, filter: &LifecycleFilter) -> Option<(String, Vec<Box<dyn ToSql>>)> {
+    let mut clauses: Vec<String> = vec!["l.project_id = ?1".to_owned()];
+    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(p.to_owned())];
     if let Some(statuses) = &filter.statuses {
         if statuses.is_empty() {
             return None;
@@ -645,11 +962,7 @@ fn filter_clause(filter: &LifecycleFilter) -> Option<(String, Vec<Box<dyn ToSql>
         ));
         params.push(Box::new(Value::from(task_ids.clone()).to_string()));
     }
-    let where_clause = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", clauses.join(" AND "))
-    };
+    let where_clause = format!("WHERE {}", clauses.join(" AND "));
     Some((where_clause, params))
 }
 
@@ -665,9 +978,10 @@ fn limit_clause(limit: Option<usize>) -> String {
 
 fn list_lifecycle_rows(
     conn: &Connection,
+    p: &str,
     filter: &LifecycleFilter,
 ) -> Result<Vec<Lifecycle>, StoreError> {
-    let Some((where_clause, params)) = filter_clause(filter) else {
+    let Some((where_clause, params)) = filter_clause(p, filter) else {
         return Ok(Vec::new());
     };
     let param_refs: Vec<&dyn ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -700,6 +1014,7 @@ fn list_lifecycle_rows(
                  JOIN (SELECT l.run_id FROM lifecycles l {where_clause} \
                        ORDER BY l.updated_at DESC, l.run_id DESC {limit_clause}) sel \
                  ON sel.run_id = a.run_id \
+                 WHERE a.project_id = ?1 \
                  ORDER BY a.run_id, a.number"
             ))
             .map_err(db)?;
@@ -728,6 +1043,7 @@ fn list_lifecycle_rows(
 
 fn summarize_spend_rows(
     conn: &Connection,
+    p: &str,
     window: &SpendWindow,
 ) -> Result<SpendSummary, StoreError> {
     if window.is_unbounded() {
@@ -738,8 +1054,8 @@ fn summarize_spend_rows(
                         COALESCE(SUM(cache_creation_input_tokens), 0),
                         COALESCE(SUM(cache_read_input_tokens), 0),
                         COALESCE(SUM(total_cost_usd), 0.0)
-                 FROM attempts",
-                [],
+                 FROM attempts WHERE project_id = ?1",
+                params![p],
                 |row| {
                     Ok(SpendSummary {
                         input_tokens: row.get(0)?,
@@ -761,11 +1077,11 @@ fn summarize_spend_rows(
         .prepare_cached(
             "SELECT input_tokens, output_tokens, cache_creation_input_tokens,
                     cache_read_input_tokens, total_cost_usd, last_activity_at
-             FROM attempts WHERE last_activity_at IS NOT NULL",
+             FROM attempts WHERE project_id = ?1 AND last_activity_at IS NOT NULL",
         )
         .map_err(db)?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(params![p], |row| {
             Ok((
                 row.get::<_, u64>(0)?,
                 row.get::<_, u64>(1)?,
@@ -875,7 +1191,12 @@ impl RawAttempt {
     }
 }
 
-fn upsert_attempt(conn: &Connection, run_id: &str, attempt: &Attempt) -> Result<(), StoreError> {
+fn upsert_attempt(
+    conn: &Connection,
+    p: &str,
+    run_id: &str,
+    attempt: &Attempt,
+) -> Result<(), StoreError> {
     // A true upsert on the (run_id, number) primary key: the existing row is
     // updated in place rather than deleted and re-inserted, so dependent
     // grader_results rows and the rowid are untouched. The harness records
@@ -885,9 +1206,9 @@ fn upsert_attempt(conn: &Connection, run_id: &str, attempt: &Attempt) -> Result<
             run_id, number, attempt_run_id, started_at, ended_at, outcome,
             agent_output, error, agent_context_json, input_tokens, output_tokens,
             cache_creation_input_tokens, cache_read_input_tokens,
-            iterations_completed, turns, total_cost_usd, last_activity_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-        ON CONFLICT(run_id, number) DO UPDATE SET
+            iterations_completed, turns, total_cost_usd, last_activity_at, project_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        ON CONFLICT(project_id, run_id, number) DO UPDATE SET
             attempt_run_id = excluded.attempt_run_id,
             started_at = excluded.started_at,
             ended_at = excluded.ended_at,
@@ -921,20 +1242,22 @@ fn upsert_attempt(conn: &Connection, run_id: &str, attempt: &Attempt) -> Result<
             attempt.turns,
             attempt.total_cost_usd,
             fmt_opt_ts(attempt.last_activity_at),
+            p,
         ],
     )
     .map_err(db)?;
     Ok(())
 }
 
-fn list_attempt_rows(conn: &Connection, run_id: &str) -> Result<Vec<Attempt>, StoreError> {
+fn list_attempt_rows(conn: &Connection, p: &str, run_id: &str) -> Result<Vec<Attempt>, StoreError> {
     let mut stmt = conn
         .prepare_cached(&format!(
-            "SELECT {ATTEMPT_COLUMNS} FROM attempts a WHERE a.run_id = ?1 ORDER BY a.number"
+            "SELECT {ATTEMPT_COLUMNS} FROM attempts a WHERE a.project_id = ?1 AND a.run_id = ?2 \
+             ORDER BY a.number"
         ))
         .map_err(db)?;
     let raws = stmt
-        .query_map(params![run_id], RawAttempt::read)
+        .query_map(params![p, run_id], RawAttempt::read)
         .map_err(db)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db)?;
@@ -943,13 +1266,15 @@ fn list_attempt_rows(conn: &Connection, run_id: &str) -> Result<Vec<Attempt>, St
 
 fn load_attempt_row(
     conn: &Connection,
+    p: &str,
     run_id: &str,
     number: u32,
 ) -> Result<Option<Attempt>, StoreError> {
     conn.prepare_cached(&format!(
-        "SELECT {ATTEMPT_COLUMNS} FROM attempts a WHERE a.run_id = ?1 AND a.number = ?2"
+        "SELECT {ATTEMPT_COLUMNS} FROM attempts a \
+         WHERE a.project_id = ?1 AND a.run_id = ?2 AND a.number = ?3"
     ))
-    .and_then(|mut stmt| stmt.query_row(params![run_id, number], RawAttempt::read))
+    .and_then(|mut stmt| stmt.query_row(params![p, run_id, number], RawAttempt::read))
     .optional()
     .map_err(db)?
     .map(RawAttempt::decode)
@@ -960,23 +1285,26 @@ fn load_attempt_row(
 
 /// `MAX(sequence) + 1` over the run's rows. Always called inside the append
 /// transaction (`BEGIN IMMEDIATE` serializes writers) so per-run ordering
-/// stays strictly monotonic; the `UNIQUE (run_id, sequence)` constraint
-/// backstops any writer that bypasses it.
-fn next_domain_sequence(conn: &Connection, run_id: &str) -> Result<u64, StoreError> {
-    conn.prepare_cached("SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE run_id = ?1")
-        .and_then(|mut stmt| stmt.query_row(params![run_id], |row| row.get(0)))
-        .map_err(db)
+/// stays strictly monotonic; the `UNIQUE (project_id, run_id, sequence)`
+/// constraint backstops any writer that bypasses it.
+fn next_domain_sequence(conn: &Connection, p: &str, run_id: &str) -> Result<u64, StoreError> {
+    conn.prepare_cached(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events WHERE project_id = ?1 AND run_id = ?2",
+    )
+    .and_then(|mut stmt| stmt.query_row(params![p, run_id], |row| row.get(0)))
+    .map_err(db)
 }
 
-fn insert_domain_event(conn: &Connection, event: &DomainEvent) -> Result<u64, StoreError> {
-    let sequence = next_domain_sequence(conn, &event.run_id)?;
+fn insert_domain_event(conn: &Connection, p: &str, event: &DomainEvent) -> Result<u64, StoreError> {
+    let sequence = next_domain_sequence(conn, p, &event.run_id)?;
     let row = event_to_row(event)?;
     conn.prepare_cached(
-        "INSERT INTO events (run_id, attempt_number, ts, kind, payload_json, sequence)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO events (project_id, run_id, attempt_number, ts, kind, payload_json, sequence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .and_then(|mut stmt| {
         stmt.execute(params![
+            p,
             row.run_id,
             row.attempt_number,
             row.ts,
@@ -1003,14 +1331,19 @@ fn read_event_row(row: &Row<'_>) -> rusqlite::Result<EventRow> {
     })
 }
 
-fn list_domain_event_rows(conn: &Connection, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
+fn list_domain_event_rows(
+    conn: &Connection,
+    p: &str,
+    run_id: &str,
+) -> Result<Vec<DomainEvent>, StoreError> {
     let mut stmt = conn
         .prepare_cached(&format!(
-            "SELECT {EVENT_COLUMNS} FROM events WHERE run_id = ?1 ORDER BY sequence"
+            "SELECT {EVENT_COLUMNS} FROM events WHERE project_id = ?1 AND run_id = ?2 \
+             ORDER BY sequence"
         ))
         .map_err(db)?;
     let rows = stmt
-        .query_map(params![run_id], read_event_row)
+        .query_map(params![p, run_id], read_event_row)
         .map_err(db)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db)?;
@@ -1019,21 +1352,23 @@ fn list_domain_event_rows(conn: &Connection, run_id: &str) -> Result<Vec<DomainE
         .collect()
 }
 
-/// The run's highest-sequence `kind` row, walking the `(run_id, sequence)`
-/// unique index backwards and decoding only the matching row.
+/// The run's highest-sequence `kind` row, walking the
+/// `(project_id, run_id, sequence)` unique index backwards and decoding only
+/// the matching row.
 fn latest_domain_event_row_of_kind(
     conn: &Connection,
+    p: &str,
     run_id: &str,
     kind: DomainEventKind,
 ) -> Result<Option<DomainEvent>, StoreError> {
     let mut stmt = conn
         .prepare_cached(&format!(
-            "SELECT {EVENT_COLUMNS} FROM events WHERE run_id = ?1 AND kind = ?2 \
-             ORDER BY sequence DESC LIMIT 1"
+            "SELECT {EVENT_COLUMNS} FROM events WHERE project_id = ?1 AND run_id = ?2 \
+             AND kind = ?3 ORDER BY sequence DESC LIMIT 1"
         ))
         .map_err(db)?;
     let row = stmt
-        .query_row(params![run_id, kind.as_str()], read_event_row)
+        .query_row(params![p, run_id, kind.as_str()], read_event_row)
         .optional()
         .map_err(db)?;
     row.as_ref()
@@ -1046,18 +1381,25 @@ fn latest_domain_event_row_of_kind(
 /// lifecycle row.
 fn project_domain_event(
     conn: &Connection,
+    p: &str,
     event: &DomainEvent,
     folded: &Lifecycle,
 ) -> Result<(), StoreError> {
     match &event.payload {
-        DomainEventPayload::AttemptStarted(a) => {
-            upsert_attempt(conn, &folded.run_id, projected_attempt(folded, a.number)?)
-        }
-        DomainEventPayload::AttemptFinalized(f) => {
-            upsert_attempt(conn, &folded.run_id, projected_attempt(folded, f.number)?)
-        }
+        DomainEventPayload::AttemptStarted(a) => upsert_attempt(
+            conn,
+            p,
+            &folded.run_id,
+            projected_attempt(folded, a.number)?,
+        ),
+        DomainEventPayload::AttemptFinalized(f) => upsert_attempt(
+            conn,
+            p,
+            &folded.run_id,
+            projected_attempt(folded, f.number)?,
+        ),
         DomainEventPayload::GraderEvaluated(g) => {
-            insert_grader_result(conn, &grader_result_from_event(event, g)?).map(|_| ())
+            insert_grader_result(conn, p, &grader_result_from_event(event, g)?).map(|_| ())
         }
         _ => Ok(()),
     }
@@ -1115,13 +1457,14 @@ impl RawGraderResult {
 
 fn insert_grader_result(
     conn: &Connection,
+    p: &str,
     result: &GraderResultRecord,
 ) -> Result<GraderResultRecord, StoreError> {
     conn.execute(
         "INSERT INTO grader_results (
             run_id, attempt_number, ordinal, grader_type, grader_name,
-            grader_spec_json, passed, duration_ms, payload_json, ts
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            grader_spec_json, passed, duration_ms, payload_json, ts, project_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             result.run_id,
             result.attempt_number,
@@ -1133,6 +1476,7 @@ fn insert_grader_result(
             result.duration_ms,
             Value::Object(result.payload.clone()).to_string(),
             format_timestamp(&result.ts),
+            p,
         ],
     )
     .map_err(db)?;
@@ -1143,6 +1487,7 @@ fn insert_grader_result(
 
 fn list_grader_result_rows(
     conn: &Connection,
+    p: &str,
     run_id: &str,
     attempt_number: u32,
 ) -> Result<Vec<GraderResultRecord>, StoreError> {
@@ -1150,12 +1495,12 @@ fn list_grader_result_rows(
         .prepare_cached(
             "SELECT id, run_id, attempt_number, ordinal, grader_type, grader_name,
                     grader_spec_json, passed, duration_ms, payload_json, ts
-             FROM grader_results WHERE run_id = ?1 AND attempt_number = ?2
+             FROM grader_results WHERE project_id = ?1 AND run_id = ?2 AND attempt_number = ?3
              ORDER BY ordinal",
         )
         .map_err(db)?;
     let raws = stmt
-        .query_map(params![run_id, attempt_number], RawGraderResult::read)
+        .query_map(params![p, run_id, attempt_number], RawGraderResult::read)
         .map_err(db)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(db)?;
@@ -1201,7 +1546,8 @@ impl RawControlCommand {
 
 impl LifecycleStore for SqliteStore {
     fn create_lifecycle(&self, lifecycle: &Lifecycle) -> Result<(), StoreError> {
-        self.with_retry(|conn| insert_lifecycle(conn, lifecycle))
+        let p = self.partition();
+        self.with_retry(|conn| insert_lifecycle(conn, p, lifecycle))
     }
 
     fn update_lifecycle(
@@ -1209,19 +1555,23 @@ impl LifecycleStore for SqliteStore {
         lifecycle: &Lifecycle,
         expected_version: u64,
     ) -> Result<(), StoreError> {
-        self.with_retry(|conn| update_lifecycle_row(conn, lifecycle, expected_version))
+        let p = self.partition();
+        self.with_retry(|conn| update_lifecycle_row(conn, p, lifecycle, expected_version))
     }
 
     fn load_lifecycle(&self, run_id: &str) -> Result<Option<Lifecycle>, StoreError> {
-        self.with_retry(|conn| load_lifecycle_row(conn, run_id))
+        let p = self.partition();
+        self.with_retry(|conn| load_lifecycle_row(conn, p, run_id))
     }
 
     fn list_lifecycles(&self, filter: &LifecycleFilter) -> Result<Vec<Lifecycle>, StoreError> {
-        self.with_retry(|conn| list_lifecycle_rows(conn, filter))
+        let p = self.partition();
+        self.with_retry(|conn| list_lifecycle_rows(conn, p, filter))
     }
 
     fn summarize_spend(&self, window: &SpendWindow) -> Result<SpendSummary, StoreError> {
-        self.with_retry(|conn| summarize_spend_rows(conn, window))
+        let p = self.partition();
+        self.with_retry(|conn| summarize_spend_rows(conn, p, window))
     }
 }
 
@@ -1244,6 +1594,7 @@ impl TaskStore for SqliteStore {
         };
         let (graders_json, tags_json, context_json) =
             (column("graders"), column("tags"), column("context"));
+        let p = self.partition();
         self.with_retry(|conn| {
             // One transaction so the identity row and the version row land
             // together. The version row is immutable (INSERT OR IGNORE keeps
@@ -1252,17 +1603,19 @@ impl TaskStore for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(db)?;
-            ensure_task_identity(&tx, &task.id, &now_iso)?;
+            ensure_task_identity(&tx, p, &task.id, &now_iso)?;
             tx.execute(
-                "UPDATE tasks SET updated_at = ?1 WHERE id = ?2",
-                params![now_iso, task.id],
+                "UPDATE tasks SET updated_at = ?1 WHERE project_id = ?2 AND id = ?3",
+                params![now_iso, p, task.id],
             )
             .map_err(db)?;
             tx.execute(
                 "INSERT OR IGNORE INTO task_versions (
-                    task_id, content_hash, goal, graders_json, tags_json, context_json, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    project_id, task_id, content_hash, goal, graders_json, tags_json,
+                    context_json, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
+                    p,
                     task.id,
                     content_hash,
                     goal,
@@ -1283,15 +1636,18 @@ impl TaskStore for SqliteStore {
         task_id: &str,
         content_hash: Option<&str>,
     ) -> Result<Option<Task>, StoreError> {
-        self.with_retry(|conn| load_task_row(conn, task_id, content_hash))
+        let p = self.partition();
+        self.with_retry(|conn| load_task_row(conn, p, task_id, content_hash))
     }
 
     fn load_task_for_run(&self, run_id: &str) -> Result<Option<Task>, StoreError> {
+        let p = self.partition();
         self.with_retry(|conn| {
             let pinned: Option<(String, Option<String>)> = conn
                 .query_row(
-                    "SELECT task_id, task_content_hash FROM lifecycles WHERE run_id = ?1",
-                    params![run_id],
+                    "SELECT task_id, task_content_hash FROM lifecycles \
+                     WHERE project_id = ?1 AND run_id = ?2",
+                    params![p, run_id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()
@@ -1300,13 +1656,14 @@ impl TaskStore for SqliteStore {
                 return Ok(None);
             };
             let content_hash = content_hash.filter(|h| !h.is_empty());
-            load_task_row(conn, &task_id, content_hash.as_deref())
+            load_task_row(conn, p, &task_id, content_hash.as_deref())
         })
     }
 }
 
 fn load_task_row(
     conn: &Connection,
+    p: &str,
     task_id: &str,
     content_hash: Option<&str>,
 ) -> Result<Option<Task>, StoreError> {
@@ -1317,17 +1674,17 @@ fn load_task_row(
         Some(hash) => conn
             .query_row(
                 "SELECT goal, graders_json, tags_json, context_json
-                 FROM task_versions WHERE task_id = ?1 AND content_hash = ?2",
-                params![task_id, hash],
+                 FROM task_versions WHERE project_id = ?1 AND task_id = ?2 AND content_hash = ?3",
+                params![p, task_id, hash],
                 read,
             )
             .optional(),
         None => conn
             .query_row(
                 "SELECT goal, graders_json, tags_json, context_json
-                 FROM task_versions WHERE task_id = ?1
+                 FROM task_versions WHERE project_id = ?1 AND task_id = ?2
                  ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                params![task_id],
+                params![p, task_id],
                 read,
             )
             .optional(),
@@ -1350,6 +1707,7 @@ impl DomainEventStore for SqliteStore {
         event: &DomainEvent,
         expected_version: u64,
     ) -> Result<Lifecycle, StoreError> {
+        let p = self.partition();
         let (folded, sequence) = self.with_retry(|conn| {
             // BEGIN IMMEDIATE acquires the write lock up front so a
             // concurrent appender cannot interleave between the version
@@ -1361,11 +1719,11 @@ impl DomainEventStore for SqliteStore {
             let folded = match &event.payload {
                 DomainEventPayload::LifecycleInitialized(_) => {
                     let seeded = apply(None, event)?;
-                    insert_lifecycle(&tx, &seeded)?;
+                    insert_lifecycle(&tx, p, &seeded)?;
                     seeded
                 }
                 _ => {
-                    let current = load_lifecycle_row(&tx, &event.run_id)?
+                    let current = load_lifecycle_row(&tx, p, &event.run_id)?
                         .ok_or_else(|| StoreError::lifecycle_not_found(&event.run_id))?;
                     if current.version != expected_version {
                         return Err(StoreError::optimistic_concurrency(
@@ -1375,12 +1733,12 @@ impl DomainEventStore for SqliteStore {
                         ));
                     }
                     let folded = apply(Some(&current), event)?;
-                    update_lifecycle_row(&tx, &folded, expected_version)?;
-                    project_domain_event(&tx, event, &folded)?;
+                    update_lifecycle_row(&tx, p, &folded, expected_version)?;
+                    project_domain_event(&tx, p, event, &folded)?;
                     folded
                 }
             };
-            let sequence = insert_domain_event(&tx, event)?;
+            let sequence = insert_domain_event(&tx, p, event)?;
             tx.commit().map_err(db)?;
             Ok((folded, sequence))
         })?;
@@ -1392,7 +1750,8 @@ impl DomainEventStore for SqliteStore {
     }
 
     fn list_domain_events(&self, run_id: &str) -> Result<Vec<DomainEvent>, StoreError> {
-        self.with_retry(|conn| list_domain_event_rows(conn, run_id))
+        let p = self.partition();
+        self.with_retry(|conn| list_domain_event_rows(conn, p, run_id))
     }
 
     fn latest_domain_event_of_kind(
@@ -1400,7 +1759,8 @@ impl DomainEventStore for SqliteStore {
         run_id: &str,
         kind: DomainEventKind,
     ) -> Result<Option<DomainEvent>, StoreError> {
-        self.with_retry(|conn| latest_domain_event_row_of_kind(conn, run_id, kind))
+        let p = self.partition();
+        self.with_retry(|conn| latest_domain_event_row_of_kind(conn, p, run_id, kind))
     }
 }
 
@@ -1411,12 +1771,13 @@ impl AttemptStore for SqliteStore {
         attempt: &Attempt,
         expected_version: Option<u64>,
     ) -> Result<(), StoreError> {
+        let p = self.partition();
         self.with_retry(|conn| {
             let Some(expected) = expected_version else {
                 // Unconditional upsert: a direct caller's write, or the
                 // domain-event projection (already inside the
                 // version-checked append transaction).
-                return upsert_attempt(conn, run_id, attempt);
+                return upsert_attempt(conn, p, run_id, attempt);
             };
             // Versioned write (the harness's iteration-boundary aggregate
             // rollup): verify the lifecycle's optimistic-concurrency key in
@@ -1425,22 +1786,24 @@ impl AttemptStore for SqliteStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(db)?;
-            let actual = stored_version(&tx, run_id)?
+            let actual = stored_version(&tx, p, run_id)?
                 .ok_or_else(|| StoreError::lifecycle_not_found(run_id))?;
             if actual != expected {
                 return Err(StoreError::optimistic_concurrency(run_id, expected, actual));
             }
-            upsert_attempt(&tx, run_id, attempt)?;
+            upsert_attempt(&tx, p, run_id, attempt)?;
             tx.commit().map_err(db)
         })
     }
 
     fn load_attempt(&self, run_id: &str, number: u32) -> Result<Option<Attempt>, StoreError> {
-        self.with_retry(|conn| load_attempt_row(conn, run_id, number))
+        let p = self.partition();
+        self.with_retry(|conn| load_attempt_row(conn, p, run_id, number))
     }
 
     fn list_attempts(&self, run_id: &str) -> Result<Vec<Attempt>, StoreError> {
-        self.with_retry(|conn| list_attempt_rows(conn, run_id))
+        let p = self.partition();
+        self.with_retry(|conn| list_attempt_rows(conn, p, run_id))
     }
 }
 
@@ -1449,7 +1812,8 @@ impl GraderResultStore for SqliteStore {
         &self,
         result: &GraderResultRecord,
     ) -> Result<GraderResultRecord, StoreError> {
-        self.with_retry(|conn| insert_grader_result(conn, result))
+        let p = self.partition();
+        self.with_retry(|conn| insert_grader_result(conn, p, result))
     }
 
     fn list_grader_results(
@@ -1457,7 +1821,8 @@ impl GraderResultStore for SqliteStore {
         run_id: &str,
         attempt_number: u32,
     ) -> Result<Vec<GraderResultRecord>, StoreError> {
-        self.with_retry(|conn| list_grader_result_rows(conn, run_id, attempt_number))
+        let p = self.partition();
+        self.with_retry(|conn| list_grader_result_rows(conn, p, run_id, attempt_number))
     }
 }
 
@@ -1474,11 +1839,13 @@ impl ControlCommandStore for SqliteStore {
         // the enqueue-order key claim_commands consumes.
         let payload_json = Value::Object(payload.clone()).to_string();
         let enqueued_at = format_timestamp(&now);
+        let p = self.partition();
         let id = self.with_retry(|conn| {
             conn.execute(
-                "INSERT INTO control_commands (run_id, kind, payload_json, enqueued_at, claimed_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL)",
-                params![run_id, kind, payload_json, enqueued_at],
+                "INSERT INTO control_commands
+                     (project_id, run_id, kind, payload_json, enqueued_at, claimed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                params![p, run_id, kind, payload_json, enqueued_at],
             )
             .map_err(db)?;
             Ok(conn.last_insert_rowid())
@@ -1499,6 +1866,7 @@ impl ControlCommandStore for SqliteStore {
         // RETURNING yields rows in arbitrary order; sort by id afterwards to
         // honor the enqueue-order contract.
         let claimed_at = format_timestamp(&now);
+        let p = self.partition();
         let mut records = self.with_retry(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1507,11 +1875,11 @@ impl ControlCommandStore for SqliteStore {
                 let mut stmt = tx
                     .prepare_cached(
                         "UPDATE control_commands SET claimed_at = ?1
-                         WHERE run_id = ?2 AND claimed_at IS NULL
+                         WHERE project_id = ?2 AND run_id = ?3 AND claimed_at IS NULL
                          RETURNING id, run_id, kind, payload_json, enqueued_at, claimed_at",
                     )
                     .map_err(db)?;
-                stmt.query_map(params![claimed_at, run_id], RawControlCommand::read)
+                stmt.query_map(params![claimed_at, p, run_id], RawControlCommand::read)
                     .map_err(db)?
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(db)?
@@ -1529,10 +1897,11 @@ impl ControlCommandStore for SqliteStore {
         // Queue hygiene (spec 00025 FR-10): the consumer deletes an applied
         // row only after the steering domain event committed. Unknown ids
         // are a no-op by contract.
+        let p = self.partition();
         self.with_retry(|conn| {
             conn.execute(
-                "DELETE FROM control_commands WHERE id = ?1",
-                params![command_id],
+                "DELETE FROM control_commands WHERE project_id = ?1 AND id = ?2",
+                params![p, command_id],
             )
             .map_err(db)?;
             Ok(())
@@ -1540,16 +1909,18 @@ impl ControlCommandStore for SqliteStore {
     }
 
     fn pending_commands(&self, run_id: &str) -> Result<Vec<ControlCommandRecord>, StoreError> {
+        let p = self.partition();
         self.with_retry(|conn| {
             let mut stmt = conn
                 .prepare_cached(
                     "SELECT id, run_id, kind, payload_json, enqueued_at, claimed_at
-                     FROM control_commands WHERE run_id = ?1 AND claimed_at IS NULL
+                     FROM control_commands
+                     WHERE project_id = ?1 AND run_id = ?2 AND claimed_at IS NULL
                      ORDER BY id",
                 )
                 .map_err(db)?;
             let raws = stmt
-                .query_map(params![run_id], RawControlCommand::read)
+                .query_map(params![p, run_id], RawControlCommand::read)
                 .map_err(db)?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(db)?;
@@ -1572,18 +1943,20 @@ mod tests {
     }
 
     fn table_names(store: &SqliteStore) -> BTreeSet<String> {
-        store.with_connection(|conn| {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' \
-                     AND name NOT LIKE 'sqlite_%' ORDER BY name",
-                )
-                .unwrap();
-            stmt.query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap()
-        })
+        store.with_connection(table_names_of)
+    }
+
+    fn table_names_of(conn: &Connection) -> BTreeSet<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
     }
 
     #[test]
@@ -1592,8 +1965,34 @@ mod tests {
         assert!(SCHEMA_SQL.contains("PRAGMA foreign_keys = ON"));
         assert!(
             SCHEMA_SQL
-                .contains("INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 12)")
+                .contains("INSERT OR IGNORE INTO schema_version (version, id) VALUES (13, 1)")
         );
+    }
+
+    #[test]
+    fn every_partitioned_table_has_a_create_statement() {
+        for table in PARTITIONED_TABLES.iter().chain([&VERSION_TABLE]) {
+            assert!(
+                crate::schema_ddl::create_table_statement(SCHEMA_SQL, table).is_some(),
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_table_but_the_version_sentinel_is_partitioned() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.with_connection(|conn| {
+            for table in table_names_of(conn) {
+                let columns = table_columns(conn, &table).unwrap();
+                if table == VERSION_TABLE {
+                    assert_eq!(columns.first().map(String::as_str), Some("version"));
+                    assert!(!columns.contains(&"project_id".to_owned()));
+                } else {
+                    assert!(columns.contains(&"project_id".to_owned()), "{table}");
+                }
+            }
+        });
     }
 
     #[test]
@@ -1686,7 +2085,10 @@ mod tests {
         assert_eq!(lifecycle_indexes(&reopened), expected);
         let plan: Vec<String> = reopened.with_connection(|conn| {
             let mut stmt = conn
-                .prepare("EXPLAIN QUERY PLAN SELECT run_id FROM lifecycles WHERE task_id = 't'")
+                .prepare(
+                    "EXPLAIN QUERY PLAN SELECT run_id FROM lifecycles \
+                     WHERE project_id = 'p' AND task_id = 't'",
+                )
                 .unwrap();
             stmt.query_map([], |row| row.get::<_, String>(3))
                 .unwrap()
@@ -1825,7 +2227,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_schema_version_is_refused() {
+    fn a_newer_schema_version_is_refused_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mismatch.db");
         SqliteStore::open(&path).unwrap().close().unwrap();
@@ -1838,12 +2240,260 @@ mod tests {
         raw.close().unwrap();
         let err = SqliteStore::open(&path).unwrap_err();
         assert!(err.is_schema_mismatch());
-        assert!(err.to_string().contains("store must be re-created"));
+        assert!(err.to_string().contains("newer flywheel"), "{err}");
         let StoreError::Schema(schema) = err else {
             panic!("expected schema error");
         };
         assert_eq!(schema.observed_version, Some(CURRENT_SCHEMA_VERSION + 99));
         assert_eq!(schema.expected_version, CURRENT_SCHEMA_VERSION);
+        // The upgrade refuses it too, and leaves the version alone.
+        let err = SqliteStore::upgrade(&path, "p").unwrap_err();
+        assert!(err.to_string().contains("newer flywheel"), "{err}");
+        assert_eq!(
+            recorded(&path),
+            Recorded::Version(Some(CURRENT_SCHEMA_VERSION + 99))
+        );
+    }
+
+    fn recorded(path: &Path) -> Recorded {
+        let raw = Connection::open(path).unwrap();
+        recorded_version(&raw, VERSION_TABLE).unwrap()
+    }
+
+    #[test]
+    fn a_behind_schema_is_refused_naming_the_upgrade_and_the_upgrade_fixes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("behind.db");
+        let store = SqliteStore::open_partition(&path, "proj-a").unwrap();
+        store
+            .create_lifecycle(&Lifecycle::new("t").with_run_id("r1"))
+            .unwrap();
+        store.close().unwrap();
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch("UPDATE schema_version SET version = version - 1")
+            .unwrap();
+        raw.close().unwrap();
+
+        let err = SqliteStore::open_partition(&path, "proj-a").unwrap_err();
+        assert!(err.is_schema_mismatch());
+        assert!(err.to_string().contains("fw db upgrade"), "{err}");
+
+        // Tables are already keyed: the upgrade only fixes the version row.
+        let upgrade = SqliteStore::upgrade(&path, "proj-a").unwrap();
+        assert_eq!(upgrade.from, Some(CURRENT_SCHEMA_VERSION - 1));
+        assert_eq!(upgrade.to, CURRENT_SCHEMA_VERSION);
+        assert!(upgrade.partitioned.is_empty());
+        let again = SqliteStore::upgrade(&path, "proj-a").unwrap();
+        assert!(again.is_noop(), "{again:?}");
+        let reopened = SqliteStore::open_partition(&path, "proj-a").unwrap();
+        assert!(reopened.load_lifecycle("r1").unwrap().is_some());
+    }
+
+    /// A real v12 database (the frozen pre-partition DDL) holding one run
+    /// with an attempt, an event, a grader receipt, a pending command, and
+    /// a saved task.
+    fn seed_v12(path: &Path) {
+        let raw = Connection::open(path).unwrap();
+        raw.execute_batch(include_str!("../tests/fixtures/persistence-schema-v12.sql"))
+            .unwrap();
+        raw.execute_batch(
+            "INSERT INTO tasks (id, first_seen_at, updated_at)
+               VALUES ('t1', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+             INSERT INTO task_versions
+               (task_id, content_hash, goal, graders_json, tags_json, context_json, created_at)
+               VALUES ('t1', 'h1', 'Goal.', '[{\"type\": \"command\", \"run\": \"true\"}]',
+                       '[]', 'null', '2026-01-01T00:00:00+00:00');
+             INSERT INTO lifecycles
+               (run_id, task_id, status, version, retries, timestamps_json, updated_at,
+                task_content_hash, source)
+               VALUES ('run-old', 't1', 'running', 3, 0, '{}', '2026-01-01T00:00:00+00:00',
+                       'h1', 'owner/repo#1');
+             INSERT INTO attempts (run_id, number, started_at, input_tokens)
+               VALUES ('run-old', 1, '2026-01-01T00:00:00+00:00', 42);
+             INSERT INTO events (run_id, attempt_number, ts, kind, payload_json, sequence)
+               VALUES ('run-old', NULL, '2026-01-01T00:00:00+00:00', 'lifecycle_initialized',
+                       '{\"task_id\": \"t1\"}', 1);
+             INSERT INTO grader_results
+               (run_id, attempt_number, ordinal, grader_type, grader_spec_json, passed,
+                duration_ms, payload_json, ts)
+               VALUES ('run-old', 1, 0, 'command', '{\"type\": \"command\", \"run\": \"true\"}',
+                       1, 5, '{\"exit_code\": 0}', '2026-01-01T00:00:00+00:00');
+             INSERT INTO control_commands (run_id, kind, payload_json, enqueued_at)
+               VALUES ('run-old', 'interrupt', '{}', '2026-01-01T00:00:00+00:00');",
+        )
+        .unwrap();
+        raw.close().unwrap();
+    }
+
+    #[test]
+    fn a_v12_store_is_refused_then_upgraded_in_place_with_its_rows_keyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v12.db");
+        seed_v12(&path);
+        let err = SqliteStore::open_partition(&path, "proj-x").unwrap_err();
+        assert!(err.to_string().contains("fw db upgrade"), "{err}");
+        // The refused open changed nothing.
+        assert_eq!(recorded(&path), Recorded::Version(Some(12)));
+
+        let upgrade = SqliteStore::upgrade(&path, "proj-x").unwrap();
+        assert_eq!(upgrade.from, Some(12));
+        assert_eq!(upgrade.to, CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            upgrade.partitioned,
+            PARTITIONED_TABLES.map(str::to_owned).to_vec()
+        );
+
+        let store = SqliteStore::open_partition(&path, "proj-x").unwrap();
+        let lifecycle = store.load_lifecycle("run-old").unwrap().unwrap();
+        assert_eq!(lifecycle.version, 3);
+        assert_eq!(lifecycle.source, "owner/repo#1");
+        assert_eq!(lifecycle.attempts.len(), 1);
+        assert_eq!(lifecycle.attempts[0].input_tokens, 42);
+        assert_eq!(store.list_domain_events("run-old").unwrap().len(), 1);
+        assert_eq!(store.list_grader_results("run-old", 1).unwrap().len(), 1);
+        assert_eq!(store.pending_commands("run-old").unwrap().len(), 1);
+        assert_eq!(
+            store.load_task_for_run("run-old").unwrap().unwrap().id,
+            "t1"
+        );
+        // New ledger rows continue after the migrated ids.
+        let receipt = store.list_grader_results("run-old", 1).unwrap().remove(0);
+        let appended = store.append_grader_result(&receipt).unwrap();
+        assert!(appended.id > receipt.id);
+        // Another partition sees none of it.
+        let other = SqliteStore::open_partition(&path, "proj-y").unwrap();
+        assert!(other.load_lifecycle("run-old").unwrap().is_none());
+        assert!(other.load_task("t1", None).unwrap().is_none());
+        // The append-only triggers and lifecycle indexes were re-created.
+        assert_eq!(lifecycle_indexes(&store).len(), 3);
+        let err = store
+            .with_connection(|conn| conn.execute("DELETE FROM grader_results", []).unwrap_err());
+        assert!(err.to_string().contains("append-only"), "{err}");
+        store.with_connection(|conn| {
+            assert_eq!(
+                table_columns(conn, VERSION_TABLE)
+                    .unwrap()
+                    .first()
+                    .map(String::as_str),
+                Some("version")
+            );
+        });
+        store.close().unwrap();
+        other.close().unwrap();
+        // Idempotent: a second upgrade re-keys nothing.
+        assert!(SqliteStore::upgrade(&path, "proj-x").unwrap().is_noop());
+    }
+
+    #[test]
+    fn a_v11_store_upgrades_through_to_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v11.db");
+        seed_v12(&path);
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "ALTER TABLE lifecycles DROP COLUMN source;
+             UPDATE schema_version SET version = 11 WHERE id = 1;",
+        )
+        .unwrap();
+        raw.close().unwrap();
+        let upgrade = SqliteStore::upgrade(&path, "p").unwrap();
+        assert_eq!(upgrade.from, Some(11));
+        let store = SqliteStore::open_partition(&path, "p").unwrap();
+        assert_eq!(store.load_lifecycle("run-old").unwrap().unwrap().source, "");
+    }
+
+    #[test]
+    fn a_store_older_than_the_upgrade_floor_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v10.db");
+        seed_v12(&path);
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch("UPDATE schema_version SET version = 10 WHERE id = 1;")
+            .unwrap();
+        raw.close().unwrap();
+        let err = SqliteStore::upgrade(&path, "p").unwrap_err();
+        assert!(err.to_string().contains("must be re-created"), "{err}");
+        assert_eq!(recorded(&path), Recorded::Version(Some(10)));
+    }
+
+    #[test]
+    fn upgrading_a_missing_store_creates_it_at_the_current_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.db");
+        let upgrade = SqliteStore::upgrade(&path, "p").unwrap();
+        assert_eq!(upgrade.from, None);
+        assert_eq!(
+            recorded(&path),
+            Recorded::Version(Some(CURRENT_SCHEMA_VERSION))
+        );
+        SqliteStore::open_partition(&path, "p").unwrap();
+    }
+
+    #[test]
+    fn a_failed_upgrade_rolls_back_every_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan.db");
+        seed_v12(&path);
+        // An orphaned attempt (its run row is gone) fails the FK re-check.
+        let raw = Connection::open(&path).unwrap();
+        raw.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO attempts (run_id, number, started_at)
+               VALUES ('ghost', 1, '2026-01-01T00:00:00+00:00');",
+        )
+        .unwrap();
+        raw.close().unwrap();
+        let err = SqliteStore::upgrade(&path, "p").unwrap_err();
+        assert!(err.to_string().contains("upgrade aborted"), "{err}");
+        assert_eq!(recorded(&path), Recorded::Version(Some(12)));
+        let raw = Connection::open(&path).unwrap();
+        assert!(
+            !table_columns(&raw, "lifecycles")
+                .unwrap()
+                .contains(&"project_id".to_owned())
+        );
+        assert!(
+            !table_names_of(&raw)
+                .iter()
+                .any(|t| t.ends_with("__rebuild"))
+        );
+    }
+
+    #[test]
+    fn partitions_sharing_one_file_never_see_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.db");
+        let a = SqliteStore::open_partition(&path, "proj-a").unwrap();
+        let b = SqliteStore::open_partition(&path, "proj-b").unwrap();
+        assert_eq!(a.partition(), "proj-a");
+        // The same run and task ids exist independently in each partition.
+        for store in [&a, &b] {
+            store
+                .create_lifecycle(&Lifecycle::new("t").with_run_id("r1"))
+                .unwrap();
+            store
+                .save_attempt("r1", &Attempt::new(1, at(0), "r1"), None)
+                .unwrap();
+            store
+                .enqueue_command("r1", "interrupt", JsonObject::new(), at(0))
+                .unwrap();
+        }
+        let mut lc = a.load_lifecycle("r1").unwrap().unwrap();
+        lc.transition_to(Status::Ready, "", Some(at(1))).unwrap();
+        a.update_lifecycle(&lc, 1).unwrap();
+        assert_eq!(a.load_lifecycle("r1").unwrap().unwrap().version, 2);
+        assert_eq!(b.load_lifecycle("r1").unwrap().unwrap().version, 1);
+        assert_eq!(
+            a.list_lifecycles(&LifecycleFilter::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(a.claim_commands("r1", at(2)).unwrap().len(), 1);
+        assert_eq!(b.pending_commands("r1").unwrap().len(), 1);
+        let unscoped = SqliteStore::open(&path).unwrap();
+        assert!(unscoped.load_lifecycle("r1").unwrap().is_none());
+        assert_eq!(unscoped.partition(), crate::store::DEFAULT_PARTITION);
     }
 
     #[test]
@@ -1856,49 +2506,6 @@ mod tests {
             .unwrap()
         });
         assert_eq!(version, i64::from(CURRENT_SCHEMA_VERSION));
-    }
-
-    fn downgrade_to_v11(path: &Path) {
-        let raw = Connection::open(path).unwrap();
-        raw.execute_batch(
-            "ALTER TABLE lifecycles DROP COLUMN source;
-             UPDATE schema_version SET version = 11 WHERE id = 1;",
-        )
-        .unwrap();
-        raw.close().unwrap();
-    }
-
-    #[test]
-    fn v11_database_is_forward_migrated_in_place() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v11.db");
-        let store = SqliteStore::open(&path).unwrap();
-        store
-            .create_lifecycle(&Lifecycle::new("t1").with_run_id("run-old"))
-            .unwrap();
-        store.close().unwrap();
-        downgrade_to_v11(&path);
-
-        let migrated = SqliteStore::open(&path).unwrap();
-        let version: i64 = migrated.with_connection(|conn| {
-            conn.query_row("SELECT version FROM schema_version WHERE id = 1", [], |r| {
-                r.get(0)
-            })
-            .unwrap()
-        });
-        assert_eq!(version, i64::from(CURRENT_SCHEMA_VERSION));
-        let old = migrated.load_lifecycle("run-old").unwrap().unwrap();
-        assert_eq!(old.source, "");
-        let mut fresh = Lifecycle::new("t1").with_run_id("run-new");
-        fresh.source = ".flywheel/tasks/active/30-history/t1.json".into();
-        migrated.create_lifecycle(&fresh).unwrap();
-        assert_eq!(
-            migrated.load_lifecycle("run-new").unwrap().unwrap().source,
-            fresh.source
-        );
-        migrated.close().unwrap();
-        // Reopening after the migration must not re-add the column.
-        SqliteStore::open(&path).unwrap().close().unwrap();
     }
 
     #[test]

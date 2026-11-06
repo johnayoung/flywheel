@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use flywheel_core::store::{HarnessStore, StoreError};
 
+pub use flywheel_core::store::DEFAULT_PARTITION;
+
 use crate::claims::{ClaimStore, SqliteClaimStore};
 use crate::store_factory::StoreConfigError;
 
@@ -32,12 +34,19 @@ use crate::store_factory::StoreConfigError;
 /// "postgres://..."` in a config file, or `FLYWHEEL_PG_DSN`); when `None` a
 /// DSN-backed builder resolves one from the environment at build time. A
 /// DSN is never echoed back ([`Dsn`]'s `Debug` redacts it).
+///
+/// `project_id` is the partition key both stores are opened with: every
+/// row they read or write carries it, so one database (one Postgres DSN)
+/// holds many projects. The home project's resolved id when the invocation
+/// resolved one, else [`DEFAULT_PARTITION`] (explicit legacy `--db` /
+/// `--policy` paths).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {
     pub backend: String,
     pub db_path: PathBuf,
     pub schema: Option<String>,
     pub dsn: Option<Dsn>,
+    pub project_id: String,
 }
 
 /// A database connection string. Its `Debug` form never shows the value, so
@@ -64,14 +73,21 @@ impl fmt::Debug for Dsn {
 }
 
 impl StoreConfig {
-    /// The default backend: sqlite at `db_path`.
+    /// The default backend: sqlite at `db_path`, the default partition.
     pub fn sqlite(db_path: impl Into<PathBuf>) -> Self {
         Self {
             backend: DEFAULT_BACKEND.to_owned(),
             db_path: db_path.into(),
             schema: None,
             dsn: None,
+            project_id: DEFAULT_PARTITION.to_owned(),
         }
+    }
+
+    /// The same config bound to partition `project_id`.
+    pub fn with_project_id(mut self, project_id: impl Into<String>) -> Self {
+        self.project_id = project_id.into();
+        self
     }
 }
 
@@ -95,11 +111,11 @@ pub struct BuildRequest<'a> {
     pub environ: &'a Environ,
 }
 
-/// Opens the core SQLite store at a path. Supplied by the caller (the
-/// product shell) so this crate never names `flywheel_core`'s concrete
-/// `SqliteStore` type.
+/// Opens the core SQLite store at a path, bound to a partition key.
+/// Supplied by the caller (the product shell) so this crate never names
+/// `flywheel_core`'s concrete `SqliteStore` type.
 pub type SqliteCoreOpener =
-    Arc<dyn Fn(&Path) -> Result<Arc<dyn HarnessStore>, StoreError> + Send + Sync>;
+    Arc<dyn Fn(&Path, &str) -> Result<Arc<dyn HarnessStore>, StoreError> + Send + Sync>;
 
 /// A core-store builder: `BuildRequest -> Arc<dyn HarnessStore>`.
 pub type CoreStoreBuilder =
@@ -254,7 +270,8 @@ impl StoreRegistries {
     pub fn with_sqlite(core_sqlite_opener: SqliteCoreOpener) -> Self {
         let mut registries = Self::empty();
         let core_builder: CoreStoreBuilder = Arc::new(move |request: &BuildRequest<'_>| {
-            (core_sqlite_opener)(&request.config.db_path).map_err(StoreConfigError::from)
+            (core_sqlite_opener)(&request.config.db_path, &request.config.project_id)
+                .map_err(StoreConfigError::from)
         });
         let claim_builder: ClaimStoreBuilder = Arc::new(build_sqlite_claim_store);
         // Fresh registries cannot already hold the name.
@@ -273,13 +290,14 @@ impl StoreRegistries {
 }
 
 /// Build the sqlite claim store (the registry's `sqlite` target):
-/// `SqliteClaimStore::open(db_path)`, the same file the core sqlite store
-/// binds (each owns its own tables). The environment is unused but part of
-/// the shared builder signature.
+/// `SqliteClaimStore::open_partition(db_path, project_id)`, the same file and
+/// partition the core sqlite store binds (each owns its own tables). The
+/// environment is unused but part of the shared builder signature.
 pub fn build_sqlite_claim_store(
     request: &BuildRequest<'_>,
 ) -> Result<Arc<dyn ClaimStore>, StoreConfigError> {
-    let store = SqliteClaimStore::open(&request.config.db_path)?;
+    let store =
+        SqliteClaimStore::open_partition(&request.config.db_path, &request.config.project_id)?;
     Ok(Arc::new(store))
 }
 
@@ -335,7 +353,7 @@ mod tests {
 
     #[test]
     fn with_sqlite_registers_sqlite_in_both_families() {
-        let opener: SqliteCoreOpener = Arc::new(|_path: &Path| {
+        let opener: SqliteCoreOpener = Arc::new(|_path: &Path, _partition: &str| {
             Err(StoreError::backend(std::io::Error::other(
                 "not opened in this test",
             )))
@@ -349,8 +367,9 @@ mod tests {
 
     #[test]
     fn a_later_postgres_entry_registers_without_touching_this_module() {
-        let opener: SqliteCoreOpener =
-            Arc::new(|_path: &Path| Err(StoreError::backend(std::io::Error::other("unused"))));
+        let opener: SqliteCoreOpener = Arc::new(|_path: &Path, _partition: &str| {
+            Err(StoreError::backend(std::io::Error::other("unused")))
+        });
         let mut registries = StoreRegistries::with_sqlite(opener);
         let builder: ClaimStoreBuilder = Arc::new(|_request: &BuildRequest<'_>| {
             Err(StoreConfigError::MissingDsn {

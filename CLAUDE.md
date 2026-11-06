@@ -30,7 +30,7 @@ Authoritative specs in `docs/` override any inferred behavior. Full index: `docs
 - `docs/task-schema.md` — `Task`/`Grader`/`Context` shape and validation rules
 - `docs/task-lifecycle.md` — `Lifecycle`/`Attempt`/`Status`/`Outcome` and transition rules
 - `docs/loop.md` — iteration envelope (`<!-- LOOP_STATUS -->`) and harness behavior
-- `docs/persistence-tables.md` — the core store catalog; canonical DDL is `crates/flywheel-core/schema/persistence-schema.sql` (SQLite, WAL, foreign keys on, optimistic concurrency on `version`; Postgres mirror `persistence-schema-postgres.sql` alongside)
+- `docs/persistence-tables.md` — the store catalog; canonical DDL is `crates/flywheel-core/schema/persistence-schema.sql` (SQLite, WAL, foreign keys on, optimistic concurrency on `version`; Postgres mirror `persistence-schema-postgres.sql` alongside). Every table but the schema-version sentinels is partitioned by an opaque `project_id` key the opener supplies (core never resolves projects); a behind schema is refused naming `fw db upgrade`
 - `docs/data-taxonomy.md` — authoritative state vs. telemetry split
 - `docs/orchestration.md` — multi-task scheduling, claims/leases, the orchestrator store and ledgers
 - `docs/work-sources.md` — the `WorkSource` seam and shipped sources (directory, github, github_ci, github_review)

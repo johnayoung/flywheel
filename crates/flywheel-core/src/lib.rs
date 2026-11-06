@@ -32,6 +32,7 @@ pub mod pg_tls;
 pub mod prompt;
 pub mod recovery_summarizer;
 pub mod redaction;
+pub mod schema_ddl;
 pub mod store;
 pub mod store_memory;
 pub mod store_postgres;

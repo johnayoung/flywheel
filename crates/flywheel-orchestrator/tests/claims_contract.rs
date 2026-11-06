@@ -1498,7 +1498,7 @@ fn build_v6_stop_table_without_later_columns(conn: &Connection) {
 }
 
 #[test]
-fn v3_store_migrates_forward_keeping_rows_with_empty_ledgers() {
+fn v3_store_is_refused_then_upgrades_keeping_rows_with_empty_ledgers() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v3.db");
     build_v3_store(&path);
@@ -1506,7 +1506,14 @@ fn v3_store_migrates_forward_keeping_rows_with_empty_ledgers() {
         let conn = Connection::open(&path).unwrap();
         build_v6_stop_table_without_later_columns(&conn);
     }
-    let store = SqliteClaimStore::open(&path).unwrap();
+    // No implicit migration: the open names the upgrade and changes nothing.
+    let err = SqliteClaimStore::open(&path).unwrap_err();
+    assert!(err.is_schema_mismatch(), "{err}");
+    assert!(err.to_string().contains("fw db upgrade"), "{err}");
+    let upgrade = SqliteClaimStore::upgrade(&path, "proj").unwrap();
+    assert_eq!(upgrade.from, Some(3));
+    assert_eq!(upgrade.to, CURRENT_ORCH_SCHEMA_VERSION);
+    let store = SqliteClaimStore::open_partition(&path, "proj").unwrap();
     let claim = store.load_claim("task-a").unwrap().unwrap();
     assert_eq!(claim.worker_id, "worker-1");
     assert_eq!(claim.lease_expires_at, t(30));

@@ -10,6 +10,7 @@ pub mod autopilot_supervisor;
 pub mod cli;
 pub mod config_verbs;
 pub mod dashboard;
+pub mod db_verbs;
 pub mod docs;
 pub mod exec;
 pub mod history_screen;

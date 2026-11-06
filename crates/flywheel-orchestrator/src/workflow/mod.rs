@@ -52,7 +52,7 @@ use crate::source_registry::{SourceBuildContext, SourceRegistry, SourceRegistryE
 use crate::sources::{DirectoryWorkSource, WorkSource, WorkSourceError};
 use crate::store_factory::{StoreBundle, StoreConfigError, open_stores};
 use crate::store_registry::{
-    DEFAULT_BACKEND, Environ, StoreConfig, StoreRegistries, environ_from_process,
+    DEFAULT_BACKEND, DEFAULT_PARTITION, Environ, StoreConfig, StoreRegistries, environ_from_process,
 };
 
 pub use args::{
@@ -544,12 +544,25 @@ pub fn resolve_fallback_phases(
 
 /// The shipped store registries: sqlite (core + claims) and postgres.
 pub fn default_store_registries() -> StoreRegistries {
-    let mut registries = StoreRegistries::with_sqlite(Arc::new(|path: &Path| {
-        SqliteStore::open(path).map(|store| Arc::new(store) as Arc<dyn HarnessStore>)
+    let mut registries = StoreRegistries::with_sqlite(Arc::new(|path: &Path, partition: &str| {
+        SqliteStore::open_partition(path, partition)
+            .map(|store| Arc::new(store) as Arc<dyn HarnessStore>)
     }));
     // The fresh registries cannot already hold the postgres name.
     let _ = register_postgres_backends(&mut registries);
     registries
+}
+
+/// The partition key (`project_id` column) the stores of `policy` are
+/// opened with: the bound home project's id (the config `project_id`
+/// override, else the repo's `.git/config` id) when the invocation resolved
+/// one, else [`DEFAULT_PARTITION`] -- an explicit legacy `--policy` file or a
+/// `--db` + `--tasks-dir` pair that skips project resolution.
+pub fn store_partition(policy: Option<&WorkPolicy>) -> String {
+    policy.and_then(|p| p.project.as_ref()).map_or_else(
+        || DEFAULT_PARTITION.to_owned(),
+        |project| project.id.clone(),
+    )
 }
 
 /// The [`StoreConfig`] a policy selects for `db_path`.
@@ -561,6 +574,7 @@ pub fn store_config_for(policy: Option<&WorkPolicy>, db_path: &Path) -> StoreCon
         db_path: db_path.to_path_buf(),
         schema: policy.and_then(|p| p.store_schema.clone()),
         dsn: policy.and_then(|p| p.store_dsn.clone()),
+        project_id: store_partition(policy),
     }
 }
 

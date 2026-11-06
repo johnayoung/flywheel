@@ -26,12 +26,30 @@ use crate::task::{GraderType, Task};
 
 // --- Schema version -------------------------------------------------------------
 
-/// Bumped whenever the persistence schema gains a backwards-incompatible
-/// change. Stores compare their on-disk `schema_version` row against this
-/// constant and fail with [`StoreSchemaError`] when it does not match (v11
-/// databases are forward-migrated in place to v12 by the store bootstraps;
-/// the change is purely additive: the nullable `lifecycles.source` column).
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+/// Bumped whenever the persistence schema changes shape. Stores compare their
+/// on-disk `schema_version` row against this constant on open: a brand-new
+/// store is created at it, a store at it opens, and anything else fails with
+/// [`StoreSchemaError`] (a store behind it names the in-place upgrade, a
+/// store ahead of it names a newer flywheel). v13 partitions every table by
+/// the opaque `project_id` key ([`DEFAULT_PARTITION`]).
+pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+
+/// The oldest on-disk version the in-place upgrade migrates from (v11: the
+/// domain-event-only `events` table). Older stores must be re-created.
+pub const OLDEST_UPGRADABLE_SCHEMA_VERSION: u32 = 11;
+
+/// The partition key a store binds when its opener supplies none.
+///
+/// Every persisted row carries an opaque `project_id` partition key (named
+/// for operators; core never interprets it): whoever opens a store passes
+/// one, and every read and write is scoped to that value, so one database
+/// can hold many independent partitions. Callers that resolve no partition
+/// (an explicit legacy `--db` path, a direct `SqliteStore::open`) bind this
+/// fixed value.
+pub const DEFAULT_PARTITION: &str = "default";
+
+/// The upgrade command a behind-schema error names.
+pub const UPGRADE_COMMAND: &str = "fw db upgrade";
 
 // --- Typed conflict signals -----------------------------------------------------
 
@@ -71,31 +89,51 @@ impl StoreConflictError {
 
 // --- Schema-version mismatch signal ---------------------------------------------
 
+/// The operator-facing text for a schema-version mismatch of the store
+/// `label` whose sentinel lives in `table`.
+///
+/// * behind (`observed < expected`): names [`UPGRADE_COMMAND`], which
+///   migrates in place; there is no implicit migration on open.
+/// * ahead: the store was written by a newer flywheel; refuse.
+/// * `None`: the sentinel row is missing or unreadable.
+pub fn schema_version_message(
+    label: &str,
+    table: &str,
+    observed: Option<u32>,
+    expected: u32,
+) -> String {
+    match observed {
+        Some(v) if v < expected => format!(
+            "{label} schema is behind: {table}={v}, this flywheel expects {expected}; \
+             run `{UPGRADE_COMMAND}` to migrate it in place"
+        ),
+        Some(v) => format!(
+            "{label} schema is newer than this flywheel: {table}={v}, this flywheel expects \
+             {expected}; it was written by a newer flywheel, so upgrade flywheel to open it"
+        ),
+        None => format!(
+            "{label} has no readable {table} row (expected {expected}); it is not a flywheel \
+             store or it is damaged"
+        ),
+    }
+}
+
 /// A concrete store opened a database whose `schema_version` row does not
 /// match [`CURRENT_SCHEMA_VERSION`].
 ///
-/// The message is fixed-prefix (`store must be re-created`) and the value
-/// carries both the observed and expected versions so callers can
-/// distinguish a legacy database from generic operational errors. Retrying
-/// a mismatch cannot reconcile an incompatible on-disk schema; the store
-/// must be re-created, so the fault classifier buckets it as PERMANENT via
-/// [`StoreError::is_schema_mismatch`].
+/// The value carries both the observed and expected versions so callers can
+/// tell a behind store (upgradable in place) from a newer or damaged one.
+/// Retrying a mismatch cannot reconcile the on-disk schema, so the fault
+/// classifier buckets it as PERMANENT via [`StoreError::is_schema_mismatch`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "store must be re-created: observed schema_version={}, expected {expected_version}",
-    observed_display(.observed_version)
+    "{}",
+    schema_version_message("store", "schema_version", *.observed_version, *.expected_version)
 )]
 pub struct StoreSchemaError {
     /// `None` when the sentinel row is missing entirely.
     pub observed_version: Option<u32>,
     pub expected_version: u32,
-}
-
-fn observed_display(observed: &Option<u32>) -> String {
-    match observed {
-        Some(v) => v.to_string(),
-        None => "None".to_owned(),
-    }
 }
 
 impl StoreSchemaError {
@@ -104,6 +142,31 @@ impl StoreSchemaError {
             observed_version,
             expected_version: CURRENT_SCHEMA_VERSION,
         }
+    }
+
+    /// The store is at an older version the in-place upgrade migrates.
+    pub fn is_behind(&self) -> bool {
+        self.observed_version
+            .is_some_and(|v| v < self.expected_version)
+    }
+}
+
+/// What an in-place schema upgrade did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaUpgrade {
+    /// The recorded version before the upgrade; `None` for a store created
+    /// fresh by the upgrade.
+    pub from: Option<u32>,
+    /// The version recorded after the upgrade.
+    pub to: u32,
+    /// Tables re-keyed by the partition column, in upgrade order.
+    pub partitioned: Vec<String>,
+}
+
+impl SchemaUpgrade {
+    /// Whether the upgrade changed nothing (already current, fully keyed).
+    pub fn is_noop(&self) -> bool {
+        self.from == Some(self.to) && self.partitioned.is_empty()
     }
 }
 
@@ -1414,21 +1477,29 @@ mod tests {
 
     #[test]
     fn schema_error_message_and_fields() {
-        let err = StoreSchemaError::new(Some(1));
-        assert_eq!(err.observed_version, Some(1));
-        assert_eq!(err.expected_version, CURRENT_SCHEMA_VERSION);
+        let behind = StoreSchemaError::new(Some(12));
+        assert_eq!(behind.observed_version, Some(12));
+        assert_eq!(behind.expected_version, CURRENT_SCHEMA_VERSION);
+        assert!(behind.is_behind());
         assert_eq!(
-            err.to_string(),
-            "store must be re-created: observed schema_version=1, expected 12"
+            behind.to_string(),
+            "store schema is behind: schema_version=12, this flywheel expects 13; \
+             run `fw db upgrade` to migrate it in place"
         );
+        let ahead = StoreSchemaError::new(Some(99));
+        assert!(!ahead.is_behind());
+        assert!(ahead.to_string().contains("newer flywheel"), "{ahead}");
+        assert!(!ahead.to_string().contains("fw db upgrade"));
         let unknown = StoreSchemaError::new(None);
+        assert!(!unknown.is_behind());
         assert_eq!(
             unknown.to_string(),
-            "store must be re-created: observed schema_version=None, expected 12"
+            "store has no readable schema_version row (expected 13); it is not a flywheel \
+             store or it is damaged"
         );
         let wrapped: StoreError = unknown.into();
         assert!(wrapped.is_schema_mismatch());
-        assert_eq!(CURRENT_SCHEMA_VERSION, 12);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 13);
     }
 
     #[test]

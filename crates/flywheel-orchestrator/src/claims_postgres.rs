@@ -32,11 +32,15 @@
 //! * `*_json` set columns read back as [`encode_str_set`] canonical text
 //!   (ASCII-escaped, as the SQLite and in-memory stores return) rather than
 //!   the server's JSONB rendering;
-//! * the additive column migrations are guarded by a catalog read instead of
-//!   `ADD COLUMN IF NOT EXISTS`, which takes an `ACCESS EXCLUSIVE` lock on
-//!   the table even when it then no-ops;
+//! * every table is partitioned by the opaque `project_id` key the opener
+//!   supplies ([`PostgresClaimStore::connect_partition`]); every statement
+//!   binds it, so many projects share one database (one DSN) without seeing
+//!   each other's leases, ledgers, or catalog;
+//! * the schema version is checked before any DDL: a behind schema is
+//!   refused naming `fw db upgrade` ([`PostgresClaimStore::upgrade`]), which
+//!   migrates any of v1..v9 in place -- nothing migrates implicitly on open;
 //! * `idx_orchestrator_stop_events_kind` backs the human-review queue read,
-//!   matching the index the SQLite port adds;
+//!   matching the index the SQLite port declares;
 //! * free-form text -- stop-event `detail` and `source_syncs.error` -- is
 //!   written with every U+0000 replaced by U+FFFD ([`nul_free_text`]), as the
 //!   core Postgres store does for run data: `TEXT` cannot hold NUL, and those
@@ -55,19 +59,23 @@ use postgres::{Client, GenericClient, Row, Transaction};
 use serde_json::Value;
 
 use flywheel_core::pg_tls::{SyncClient, off_runtime};
-use flywheel_core::store::HarnessStore;
+use flywheel_core::schema_ddl::without_pragmas;
+use flywheel_core::store::{DEFAULT_PARTITION, HarnessStore, SchemaUpgrade};
 use flywheel_core::store_postgres::{
     BOOTSTRAP_LOCK_KEY, DEFAULT_SCHEMA, IntegerOutOfRange, PostgresError, PostgresStore,
-    validate_schema,
+    add_missing_columns, any_table_exists, partition_tables, recorded_version, validate_schema,
+    version_column_first,
 };
+use flywheel_core::store_sqlite::Recorded;
 
 use crate::claims::{
     CURRENT_ORCH_SCHEMA_VERSION, ClaimLostError, ClaimStore, ClaimStoreError, EVENT_ACQUIRED,
     EVENT_EXPIRED, EVENT_RELEASED, EVENT_RENEWED, EVENT_STOLEN, GraphSnapshotItem,
     GraphSnapshotRecord, HUMAN_REVIEW_QUEUE_REASONS, HumanReviewQueueEntry,
-    OrchestratorEventRecord, OrchestratorSchemaError, OrchestratorStopEventRecord,
-    STOP_PREPARE_SKIP, SessionPauseRecord, SourceSyncRecord, TaskClaim, WorkItemObservation,
-    WorkItemRecord, decode_str_set, encode_str_set, is_human_review_reason,
+    ORCH_PARTITIONED_TABLES, ORCH_VERSION_TABLE, OrchestratorEventRecord, OrchestratorSchemaError,
+    OrchestratorStopEventRecord, STOP_PREPARE_SKIP, SessionPauseRecord, SourceSyncRecord,
+    TaskClaim, WorkItemObservation, WorkItemRecord, decode_str_set, encode_str_set,
+    is_human_review_reason,
 };
 use crate::store_factory::{StoreConfigError, resolve_postgres_dsn};
 use crate::store_registry::{
@@ -89,29 +97,32 @@ pub const POSTGRES_BACKEND: &str = "postgres";
 /// takes the same key, so they serialize against each other.
 pub const CLAIM_ACQUIRE_LOCK_KEY: i64 = 0x666C_7977;
 
-/// The orchestrator DDL (every statement
-/// idempotent). The column-level additive migrations -- v3
-/// `task_claims.conflict_keys_json`, v7 `orchestrator_stop_events.run_id`,
-/// v9 `orchestrator_stop_events.attribution` -- run after it in
-/// [`bootstrap`], guarded by a catalog read, so a v1..v8 schema converges in
-/// place keeping every row.
+/// The orchestrator DDL (every statement idempotent), the Postgres mirror of
+/// the SQLite store's: every table leads with the opaque `project_id`
+/// partition key, which leads each natural primary key and every hot index
+/// of the surrogate-id ledgers; the sentinel is `(version, id)`, version
+/// first. Table-level constraints sit one per line (the in-place upgrade
+/// re-adds them from these statements).
 pub const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS task_claims (
-  task_id            TEXT PRIMARY KEY,
+  project_id         TEXT NOT NULL,
+  task_id            TEXT NOT NULL,
   worker_id          TEXT NOT NULL,
   claimed_at         TIMESTAMPTZ NOT NULL,
   lease_expires_at   TIMESTAMPTZ NOT NULL,
   version            INTEGER NOT NULL,
-  conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb
+  conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+  PRIMARY KEY (project_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS orchestrator_schema_version (
-  id      INTEGER PRIMARY KEY CHECK (id = 1),
-  version INTEGER NOT NULL
+  version INTEGER NOT NULL,
+  id      INTEGER PRIMARY KEY CHECK (id = 1)
 );
 
 CREATE TABLE IF NOT EXISTS work_items (
-  task_id                    TEXT PRIMARY KEY,
+  project_id                 TEXT NOT NULL,
+  task_id                    TEXT NOT NULL,
   source_kind                TEXT,
   source_ref                 TEXT,
   source_url                 TEXT,
@@ -123,20 +134,23 @@ CREATE TABLE IF NOT EXISTS work_items (
   first_seen_at              TIMESTAMPTZ NOT NULL,
   last_seen_at               TIMESTAMPTZ NOT NULL,
   disappeared_at             TIMESTAMPTZ,
-  metadata_json              JSONB NOT NULL DEFAULT '{}'::jsonb
+  metadata_json              JSONB NOT NULL DEFAULT '{}'::jsonb,
+  PRIMARY KEY (project_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS work_item_dependencies (
+  project_id           TEXT NOT NULL,
   task_id              TEXT NOT NULL,
   prerequisite_task_id TEXT NOT NULL,
   created_at           TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (task_id, prerequisite_task_id)
+  PRIMARY KEY (project_id, task_id, prerequisite_task_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_work_item_dependencies_prerequisite
-  ON work_item_dependencies (prerequisite_task_id);
+  ON work_item_dependencies (project_id, prerequisite_task_id);
 
 CREATE TABLE IF NOT EXISTS source_syncs (
+  project_id     TEXT NOT NULL,
   id             BIGSERIAL PRIMARY KEY,
   source_kind    TEXT NOT NULL,
   source_name    TEXT NOT NULL,
@@ -148,7 +162,11 @@ CREATE TABLE IF NOT EXISTS source_syncs (
   metadata_json  JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
+CREATE INDEX IF NOT EXISTS idx_source_syncs_project
+  ON source_syncs (project_id, id);
+
 CREATE TABLE IF NOT EXISTS orchestrator_events (
+  project_id       TEXT NOT NULL,
   id               BIGSERIAL PRIMARY KEY,
   task_id          TEXT NOT NULL,
   worker_id        TEXT NOT NULL,
@@ -159,16 +177,24 @@ CREATE TABLE IF NOT EXISTS orchestrator_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_events_task
-  ON orchestrator_events (task_id, id);
+  ON orchestrator_events (project_id, task_id, id);
+
+CREATE INDEX IF NOT EXISTS idx_orchestrator_events_project
+  ON orchestrator_events (project_id, id);
 
 CREATE TABLE IF NOT EXISTS graph_snapshots (
+  project_id    TEXT NOT NULL,
   id            BIGSERIAL PRIMARY KEY,
   captured_at   TIMESTAMPTZ NOT NULL,
   item_count    INTEGER NOT NULL,
   last_event_id BIGINT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_graph_snapshots_project
+  ON graph_snapshots (project_id, id);
+
 CREATE TABLE IF NOT EXISTS graph_snapshot_items (
+  project_id                  TEXT NOT NULL,
   snapshot_id                 BIGINT NOT NULL,
   task_id                     TEXT NOT NULL,
   source_kind                 TEXT,
@@ -182,13 +208,11 @@ CREATE TABLE IF NOT EXISTS graph_snapshot_items (
   ready                       BOOLEAN NOT NULL,
   claim_holder                TEXT,
   resolved_prerequisites_json JSONB NOT NULL DEFAULT '[]'::jsonb,
-  PRIMARY KEY (snapshot_id, task_id)
+  PRIMARY KEY (project_id, snapshot_id, task_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_graph_snapshot_items_snapshot
-  ON graph_snapshot_items (snapshot_id);
-
 CREATE TABLE IF NOT EXISTS orchestrator_stop_events (
+  project_id  TEXT NOT NULL,
   id          BIGSERIAL PRIMARY KEY,
   kind        TEXT NOT NULL,
   subject     TEXT NOT NULL,
@@ -199,9 +223,13 @@ CREATE TABLE IF NOT EXISTS orchestrator_stop_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_subject
-  ON orchestrator_stop_events (subject, id);
+  ON orchestrator_stop_events (project_id, subject, id);
+
+CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_kind
+  ON orchestrator_stop_events (project_id, kind, id);
 
 CREATE TABLE IF NOT EXISTS orchestrator_session_pauses (
+  project_id  TEXT NOT NULL,
   id          BIGSERIAL PRIMARY KEY,
   run_id      TEXT NOT NULL DEFAULT '',
   reset_at    TIMESTAMPTZ NOT NULL,
@@ -210,37 +238,8 @@ CREATE TABLE IF NOT EXISTS orchestrator_session_pauses (
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_session_pauses_pause_until
-  ON orchestrator_session_pauses (pause_until);
+  ON orchestrator_session_pauses (project_id, pause_until);
 ";
-
-/// A supplementary index: it backs the human-review
-/// queue read (`WHERE kind = ANY(...) ORDER BY id`) on a ledger that
-/// otherwise grows without bound. Purely additive; an older schema gains it on
-/// first open.
-const SUPPLEMENTARY_INDEXES: &str = "
-CREATE INDEX IF NOT EXISTS idx_orchestrator_stop_events_kind
-  ON orchestrator_stop_events (kind, id);
-";
-
-/// The additive column migrations, keyed by `(table, column)`: applied only
-/// when the catalog says the column is absent.
-const COLUMN_MIGRATIONS: [(&str, &str, &str); 3] = [
-    (
-        "task_claims",
-        "conflict_keys_json",
-        "ALTER TABLE task_claims ADD COLUMN conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb",
-    ),
-    (
-        "orchestrator_stop_events",
-        "run_id",
-        "ALTER TABLE orchestrator_stop_events ADD COLUMN run_id TEXT NOT NULL DEFAULT ''",
-    ),
-    (
-        "orchestrator_stop_events",
-        "attribution",
-        "ALTER TABLE orchestrator_stop_events ADD COLUMN attribution TEXT NOT NULL DEFAULT ''",
-    ),
-];
 
 // --- Error and value helpers ------------------------------------------------------------
 
@@ -536,8 +535,10 @@ fn nul_free_text(value: &str) -> Cow<'_, str> {
 /// Append one ledger row on the caller's transaction, so the event commits
 /// with the `task_claims` mutation it describes and a rolled-back transition
 /// takes its event with it.
+#[allow(clippy::too_many_arguments)]
 fn append_event<C: GenericClient>(
     c: &mut C,
+    p: &str,
     task_id: &str,
     worker_id: &str,
     event_type: &str,
@@ -548,7 +549,7 @@ fn append_event<C: GenericClient>(
     let version = int4(version, "orchestrator_events.version")?;
     c.execute(
         "INSERT INTO orchestrator_events (task_id, worker_id, event_type, version, \
-         lease_expires_at, occurred_at) VALUES ($1, $2, $3, $4, $5, $6)",
+         lease_expires_at, occurred_at, project_id) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         &[
             &task_id,
             &worker_id,
@@ -556,6 +557,7 @@ fn append_event<C: GenericClient>(
             &version,
             &lease_expires_at,
             &occurred_at,
+            &p,
         ],
     )
     .map_err(db)?;
@@ -564,8 +566,10 @@ fn append_event<C: GenericClient>(
 
 /// Append one stop row on the caller's transaction. Never dedupes:
 /// recurrence is the signal. `detail` is stored NUL-free ([`nul_free_text`]).
+#[allow(clippy::too_many_arguments)]
 fn insert_stop_event<C: GenericClient>(
     c: &mut C,
+    p: &str,
     kind: &str,
     subject: &str,
     detail: &str,
@@ -575,7 +579,7 @@ fn insert_stop_event<C: GenericClient>(
 ) -> Result<(), ClaimStoreError> {
     c.execute(
         "INSERT INTO orchestrator_stop_events (kind, subject, detail, occurred_at, run_id, \
-         attribution) VALUES ($1, $2, $3, $4, $5, $6)",
+         attribution, project_id) VALUES ($1, $2, $3, $4, $5, $6, $7)",
         &[
             &kind,
             &subject,
@@ -583,6 +587,7 @@ fn insert_stop_event<C: GenericClient>(
             &to_micros(occurred_at),
             &run_id,
             &attribution,
+            &p,
         ],
     )
     .map_err(db)?;
@@ -593,13 +598,14 @@ fn insert_stop_event<C: GenericClient>(
 /// it, returning whether it did.
 fn delete_matching<C: GenericClient>(
     c: &mut C,
+    p: &str,
     claim: &TaskClaim,
 ) -> Result<bool, ClaimStoreError> {
     let deleted = c
         .execute(
             "DELETE FROM task_claims WHERE task_id = $1 AND version = $2::bigint \
-             AND worker_id = $3",
-            &[&claim.task_id, &claim.version, &claim.worker_id],
+             AND worker_id = $3 AND project_id = $4",
+            &[&claim.task_id, &claim.version, &claim.worker_id, &p],
         )
         .map_err(db)?;
     Ok(deleted == 1)
@@ -607,79 +613,119 @@ fn delete_matching<C: GenericClient>(
 
 // --- Bootstrap ----------------------------------------------------------------------------
 
-/// Materialize the schema and converge an older store forward, all under
-/// the bootstrap advisory lock in one transaction.
-fn bootstrap(client: &mut Client, schema: &str) -> Result<(), ClaimStoreError> {
-    let mut tx = client.transaction().map_err(db)?;
-    // Serialize the whole bootstrap against every other opener (of this
-    // store or the core store) so the CREATE SCHEMA / CREATE TABLE IF NOT
-    // EXISTS sequence cannot race on a fresh schema: two racing openers
-    // otherwise deadlock on the shared catalogs or trip a pg_namespace
-    // unique violation. Released at the commit below.
+fn schema_error(observed: Option<u32>) -> ClaimStoreError {
+    OrchestratorSchemaError {
+        observed,
+        expected: CURRENT_ORCH_SCHEMA_VERSION,
+    }
+    .into()
+}
+
+fn current_version() -> Result<i32, ClaimStoreError> {
+    int4(
+        i64::from(CURRENT_ORCH_SCHEMA_VERSION),
+        "orchestrator_schema_version.version",
+    )
+}
+
+/// Take the bootstrap advisory lock and pin the (created-if-absent) schema
+/// on the transaction's session.
+fn lock_and_pin(tx: &mut Transaction<'_>, schema: &str) -> Result<(), ClaimStoreError> {
+    // Serialize against every other opener (of this store or the core
+    // store) so the CREATE SCHEMA / CREATE TABLE IF NOT EXISTS sequence
+    // cannot race on a fresh schema: two racing openers otherwise deadlock
+    // on the shared catalogs or trip a pg_namespace unique violation.
+    // Released at the transaction's end.
     tx.execute("SELECT pg_advisory_xact_lock($1)", &[&BOOTSTRAP_LOCK_KEY])
         .map_err(db)?;
     tx.batch_execute(&format!(
         "CREATE SCHEMA IF NOT EXISTS \"{schema}\";\n{}",
         search_path_sql(schema)
     ))
-    .map_err(db)?;
-    tx.batch_execute(SCHEMA_SQL).map_err(db)?;
-    // Additive column migrations (v3 / v7 / v9), applied only when the
-    // catalog says the column is missing: a v1..v8 schema gains the column
-    // in place with its default, so every existing row survives.
-    let present: BTreeSet<(String, String)> = tx
-        .query(
-            "SELECT table_name, column_name FROM information_schema.columns \
-             WHERE table_schema = $1::text \
-             AND table_name IN ('task_claims', 'orchestrator_stop_events')",
-            &[&schema],
-        )
-        .map_err(db)?
-        .iter()
-        .map(|row| Ok((col(row, 0)?, col(row, 1)?)))
-        .collect::<Result<_, ClaimStoreError>>()?;
-    for (table, column, ddl) in COLUMN_MIGRATIONS {
-        if !present.contains(&(table.to_owned(), column.to_owned())) {
-            tx.batch_execute(ddl).map_err(db)?;
+    .map_err(db)
+}
+
+/// Check the version, then materialize a fresh schema -- under the bootstrap
+/// advisory lock in one transaction.
+///
+/// The version is read BEFORE any DDL (the current DDL indexes the partition
+/// column, which a behind schema lacks): a fresh schema (no orchestrator
+/// table) is created at the current version, a current one opens, and
+/// anything else is refused untouched -- a behind schema names
+/// `fw db upgrade`; nothing migrates implicitly.
+fn bootstrap(client: &mut Client, schema: &str) -> Result<(), ClaimStoreError> {
+    let mut tx = client.transaction().map_err(db)?;
+    lock_and_pin(&mut tx, schema)?;
+    match recorded_version(&mut tx, schema, ORCH_VERSION_TABLE).map_err(db)? {
+        Recorded::Missing => {
+            if any_table_exists(&mut tx, schema, &ORCH_PARTITIONED_TABLES).map_err(db)? {
+                return Err(schema_error(None));
+            }
         }
+        Recorded::Version(Some(v)) if v == CURRENT_ORCH_SCHEMA_VERSION => {}
+        Recorded::Version(observed) => return Err(schema_error(observed)),
     }
-    tx.batch_execute(SUPPLEMENTARY_INDEXES).map_err(db)?;
-    let current = int4(
-        i64::from(CURRENT_ORCH_SCHEMA_VERSION),
-        "orchestrator_schema_version.version",
-    )?;
+    tx.batch_execute(SCHEMA_SQL).map_err(db)?;
     tx.execute(
-        "INSERT INTO orchestrator_schema_version (id, version) VALUES (1, $1) \
+        "INSERT INTO orchestrator_schema_version (version, id) VALUES ($1, 1) \
+         ON CONFLICT (id) DO NOTHING",
+        &[&current_version()?],
+    )
+    .map_err(db)?;
+    tx.commit().map_err(db)
+}
+
+/// Migrate the orchestrator tables of `schema` in place to
+/// [`CURRENT_ORCH_SCHEMA_VERSION`] (see [`PostgresClaimStore::upgrade`]).
+pub fn upgrade_client(
+    client: &mut Client,
+    schema: &str,
+    partition: &str,
+) -> Result<SchemaUpgrade, ClaimStoreError> {
+    let mut tx = client.transaction().map_err(db)?;
+    lock_and_pin(&mut tx, schema)?;
+    let from = match recorded_version(&mut tx, schema, ORCH_VERSION_TABLE).map_err(db)? {
+        Recorded::Missing => {
+            if any_table_exists(&mut tx, schema, &ORCH_PARTITIONED_TABLES).map_err(db)? {
+                return Err(schema_error(None));
+            }
+            None
+        }
+        Recorded::Version(None) => return Err(schema_error(None)),
+        Recorded::Version(Some(v)) if v > CURRENT_ORCH_SCHEMA_VERSION => {
+            return Err(schema_error(Some(v)));
+        }
+        Recorded::Version(Some(v)) => Some(v),
+    };
+    let ddl = without_pragmas(SCHEMA_SQL);
+    // The legacy additive columns (v3 conflict_keys_json, v7 run_id, v9
+    // attribution) arrive with their declared defaults first, so every row
+    // of any v1..v9 schema survives the re-key.
+    for table in ORCH_PARTITIONED_TABLES {
+        add_missing_columns(&mut tx, schema, &ddl, table, &["project_id"]).map_err(db)?;
+    }
+    let partitioned =
+        partition_tables(&mut tx, schema, &ddl, &ORCH_PARTITIONED_TABLES, partition).map_err(db)?;
+    version_column_first(&mut tx, schema, &ddl, ORCH_VERSION_TABLE).map_err(db)?;
+    tx.batch_execute(&ddl).map_err(db)?;
+    let current = current_version()?;
+    tx.execute(
+        "INSERT INTO orchestrator_schema_version (version, id) VALUES ($1, 1) \
          ON CONFLICT (id) DO NOTHING",
         &[&current],
     )
     .map_err(db)?;
-    // Every table and column above was materialized additively, so an older
-    // store keeps its rows and simply converges its sentinel forward. A
-    // newer-than-this-build sentinel is left alone and refused below.
     tx.execute(
-        "UPDATE orchestrator_schema_version SET version = $1 WHERE id = 1 AND version < $1",
+        "UPDATE orchestrator_schema_version SET version = $1 WHERE id = 1",
         &[&current],
     )
     .map_err(db)?;
-    let observed: Option<i32> = tx
-        .query_opt(
-            "SELECT version FROM orchestrator_schema_version WHERE id = 1",
-            &[],
-        )
-        .map_err(db)?
-        .map(|row| col(&row, 0))
-        .transpose()?;
     tx.commit().map_err(db)?;
-    let observed = observed.and_then(|v| u32::try_from(v).ok());
-    if observed != Some(CURRENT_ORCH_SCHEMA_VERSION) {
-        return Err(OrchestratorSchemaError {
-            observed,
-            expected: CURRENT_ORCH_SCHEMA_VERSION,
-        }
-        .into());
-    }
-    Ok(())
+    Ok(SchemaUpgrade {
+        from,
+        to: CURRENT_ORCH_SCHEMA_VERSION,
+        partitioned,
+    })
 }
 
 // --- The store ----------------------------------------------------------------------------
@@ -697,12 +743,14 @@ pub struct PostgresClaimStore {
     /// Kept to heal a closed connection; never logged or echoed.
     dsn: String,
     schema: String,
+    partition: String,
 }
 
 impl fmt::Debug for PostgresClaimStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PostgresClaimStore")
             .field("schema", &self.schema)
+            .field("partition", &self.partition)
             .finish_non_exhaustive()
     }
 }
@@ -715,9 +763,19 @@ impl PostgresClaimStore {
     /// Fails before any network traffic when `schema` is not
     /// identifier-safe; connection and authentication failures surface as
     /// [`ClaimStoreError::Backend`] wrapping a [`PostgresError`]; a schema
-    /// whose sentinel is newer than this build is refused with
-    /// [`ClaimStoreError::Schema`].
+    /// whose sentinel is not this build's (behind, newer, or missing beside
+    /// existing tables) is refused with [`ClaimStoreError::Schema`]. Bound
+    /// to [`DEFAULT_PARTITION`].
     pub fn connect(dsn: &str, schema: &str) -> Result<Self, ClaimStoreError> {
+        Self::connect_partition(dsn, schema, DEFAULT_PARTITION)
+    }
+
+    /// [`connect`](Self::connect) bound to `partition`.
+    pub fn connect_partition(
+        dsn: &str,
+        schema: &str,
+        partition: &str,
+    ) -> Result<Self, ClaimStoreError> {
         let schema = validate_schema(schema)
             .map_err(|err| ClaimStoreError::Backend(Box::new(err)))?
             .to_owned();
@@ -735,7 +793,42 @@ impl PostgresClaimStore {
             client: Mutex::new(client),
             dsn: dsn.to_owned(),
             schema,
+            partition: partition.to_owned(),
         })
+    }
+
+    /// Migrate the orchestrator tables of `schema` in place to
+    /// [`CURRENT_ORCH_SCHEMA_VERSION`], filling the partition column of
+    /// existing rows with `partition`.
+    ///
+    /// One transaction under the bootstrap advisory lock: legacy additive
+    /// columns are added, every table lacking `project_id` is re-keyed
+    /// (column added with `partition` for existing rows, keys and indexes
+    /// re-declared from the DDL), the sentinel is re-created version-first,
+    /// missing tables and indexes are created, and the version is set
+    /// current. Each step inspects the live layout, so the upgrade is
+    /// idempotent and also repairs a keyed schema whose version row is
+    /// behind. A newer schema is refused untouched.
+    pub fn upgrade(
+        dsn: &str,
+        schema: &str,
+        partition: &str,
+    ) -> Result<SchemaUpgrade, ClaimStoreError> {
+        let schema =
+            validate_schema(schema).map_err(|err| ClaimStoreError::Backend(Box::new(err)))?;
+        let (config, tls) = flywheel_core::pg_tls::configure(dsn)
+            .map_err(|err| ClaimStoreError::Backend(Box::new(err)))?;
+        off_runtime(|| {
+            let mut client = config.connect(tls).map_err(db)?;
+            let upgrade = upgrade_client(&mut client, schema, partition)?;
+            client.close().map_err(db)?;
+            Ok(upgrade)
+        })
+    }
+
+    /// The partition key every read and write is scoped to.
+    pub fn partition(&self) -> &str {
+        &self.partition
     }
 
     /// The schema every table lives under.
@@ -826,6 +919,7 @@ impl ClaimStore for PostgresClaimStore {
         let lease_expires = checked_lease_expiry(now, lease_seconds)?;
         let keys_value = set_value(conflict_keys);
         let keys: Vec<&str> = conflict_keys.iter().map(String::as_str).collect();
+        let p = self.partition.as_str();
         self.write(|tx| {
             // Serialize the check-then-upsert against every other acquire on
             // this database; released at commit/rollback.
@@ -841,9 +935,10 @@ impl ClaimStore for PostgresClaimStore {
             if !keys.is_empty() {
                 let blocked: bool = tx
                     .query_one(
-                        "SELECT EXISTS (SELECT 1 FROM task_claims WHERE task_id <> $1 \
-                         AND lease_expires_at > $2 AND conflict_keys_json ?| $3::text[])",
-                        &[&task_id, &now, &keys],
+                        "SELECT EXISTS (SELECT 1 FROM task_claims WHERE project_id = $4 \
+                         AND task_id <> $1 AND lease_expires_at > $2 \
+                         AND conflict_keys_json ?| $3::text[])",
+                        &[&task_id, &now, &keys, &p],
                     )
                     .map_err(db)?
                     .try_get(0)
@@ -859,12 +954,13 @@ impl ClaimStore for PostgresClaimStore {
             let row = tx
                 .query_opt(
                     "WITH prev AS (\
-                         SELECT worker_id AS prev_worker FROM task_claims WHERE task_id = $1\
+                         SELECT worker_id AS prev_worker FROM task_claims \
+                         WHERE project_id = $6 AND task_id = $1\
                      ), upserted AS (\
-                         INSERT INTO task_claims (task_id, worker_id, claimed_at, \
+                         INSERT INTO task_claims (project_id, task_id, worker_id, claimed_at, \
                              lease_expires_at, version, conflict_keys_json) \
-                         VALUES ($1, $2, $3, $4, 1, $5::jsonb) \
-                         ON CONFLICT (task_id) DO UPDATE SET \
+                         VALUES ($6, $1, $2, $3, $4, 1, $5::jsonb) \
+                         ON CONFLICT (project_id, task_id) DO UPDATE SET \
                              worker_id = EXCLUDED.worker_id, \
                              claimed_at = EXCLUDED.claimed_at, \
                              lease_expires_at = EXCLUDED.lease_expires_at, \
@@ -876,7 +972,7 @@ impl ClaimStore for PostgresClaimStore {
                      ) \
                      SELECT upserted.version, prev.prev_worker \
                      FROM upserted LEFT JOIN prev ON true",
-                    &[&task_id, &worker_id, &now, &lease_expires, &keys_value],
+                    &[&task_id, &worker_id, &now, &lease_expires, &keys_value, &p],
                 )
                 .map_err(db)?;
             let Some(row) = row else {
@@ -894,6 +990,7 @@ impl ClaimStore for PostgresClaimStore {
             };
             append_event(
                 tx,
+                p,
                 task_id,
                 worker_id,
                 event_type,
@@ -921,17 +1018,19 @@ impl ClaimStore for PostgresClaimStore {
         let lease_expires = checked_lease_expiry(now, lease_seconds)?;
         // The UPDATE and its `renewed` event commit together: a stale token
         // updates no row, the error rolls the transaction back, no event.
+        let p = self.partition.as_str();
         self.write(|tx| {
             let row = tx
                 .query_opt(
                     "UPDATE task_claims SET lease_expires_at = $1, version = version + 1 \
                      WHERE task_id = $2 AND version = $3::bigint AND worker_id = $4 \
-                     RETURNING version",
+                     AND project_id = $5 RETURNING version",
                     &[
                         &lease_expires,
                         &claim.task_id,
                         &claim.version,
                         &claim.worker_id,
+                        &p,
                     ],
                 )
                 .map_err(db)?;
@@ -944,6 +1043,7 @@ impl ClaimStore for PostgresClaimStore {
             let version = col_int4(&row, 0)?;
             append_event(
                 tx,
+                p,
                 &claim.task_id,
                 &claim.worker_id,
                 EVENT_RENEWED,
@@ -967,10 +1067,12 @@ impl ClaimStore for PostgresClaimStore {
         now: Option<DateTime<Utc>>,
     ) -> Result<(), ClaimStoreError> {
         let occurred_at = to_micros(now.unwrap_or(claim.lease_expires_at));
+        let p = self.partition.as_str();
         self.write(|tx| {
-            if delete_matching(tx, claim)? {
+            if delete_matching(tx, p, claim)? {
                 append_event(
                     tx,
+                    p,
                     &claim.task_id,
                     &claim.worker_id,
                     EVENT_RELEASED,
@@ -984,22 +1086,28 @@ impl ClaimStore for PostgresClaimStore {
     }
 
     fn load_claim(&self, task_id: &str) -> Result<Option<TaskClaim>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_one(
                 c,
-                &format!("SELECT {CLAIM_COLUMNS} FROM task_claims WHERE task_id = $1"),
-                &[&task_id],
+                &format!(
+                    "SELECT {CLAIM_COLUMNS} FROM task_claims WHERE project_id = $1 AND task_id = $2"
+                ),
+                &[&p, &task_id],
                 row_to_claim,
             )
         })
     }
 
     fn list_claims(&self) -> Result<Vec<TaskClaim>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
-                &format!("SELECT {CLAIM_COLUMNS} FROM task_claims ORDER BY task_id"),
-                &[],
+                &format!(
+                    "SELECT {CLAIM_COLUMNS} FROM task_claims WHERE project_id = $1 ORDER BY task_id"
+                ),
+                &[&p],
                 row_to_claim,
             )
         })
@@ -1011,21 +1119,24 @@ impl ClaimStore for PostgresClaimStore {
         // temporal not lexical) and journal one `expired` event per reaped
         // claim carrying that claim's holder / version, in task_id order so
         // the freed ids and the events emit as the SQLite backend does.
+        let p = self.partition.as_str();
         self.write(|tx| {
             let rows = tx
                 .query(
                     "WITH reaped AS (\
-                         DELETE FROM task_claims WHERE lease_expires_at <= $1 \
+                         DELETE FROM task_claims WHERE project_id = $3 \
+                         AND lease_expires_at <= $1 \
                          RETURNING task_id, worker_id, version, lease_expires_at\
                      ), journaled AS (\
-                         INSERT INTO orchestrator_events (task_id, worker_id, event_type, \
-                             version, lease_expires_at, occurred_at) \
-                         SELECT task_id, worker_id, $2::text, version, lease_expires_at, $1 \
+                         INSERT INTO orchestrator_events (project_id, task_id, worker_id, \
+                             event_type, version, lease_expires_at, occurred_at) \
+                         SELECT $3, task_id, worker_id, $2::text, version, lease_expires_at, \
+                             $1 \
                          FROM reaped ORDER BY task_id \
                          RETURNING task_id\
                      ) \
                      SELECT task_id FROM journaled ORDER BY task_id",
-                    &[&now, &EVENT_EXPIRED],
+                    &[&now, &EVENT_EXPIRED, &p],
                 )
                 .map_err(db)?;
             rows.iter().map(|row| col(row, 0)).collect()
@@ -1033,11 +1144,15 @@ impl ClaimStore for PostgresClaimStore {
     }
 
     fn list_events(&self) -> Result<Vec<OrchestratorEventRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
-                &format!("SELECT {EVENT_COLUMNS} FROM orchestrator_events ORDER BY id"),
-                &[],
+                &format!(
+                    "SELECT {EVENT_COLUMNS} FROM orchestrator_events WHERE project_id = $1 \
+                     ORDER BY id"
+                ),
+                &[&p],
                 row_to_event,
             )
         })
@@ -1047,14 +1162,15 @@ impl ClaimStore for PostgresClaimStore {
         &self,
         task_id: &str,
     ) -> Result<Vec<OrchestratorEventRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
                 &format!(
-                    "SELECT {EVENT_COLUMNS} FROM orchestrator_events WHERE task_id = $1 \
-                     ORDER BY id"
+                    "SELECT {EVENT_COLUMNS} FROM orchestrator_events \
+                     WHERE project_id = $1 AND task_id = $2 ORDER BY id"
                 ),
-                &[&task_id],
+                &[&p, &task_id],
                 row_to_event,
             )
         })
@@ -1068,7 +1184,10 @@ impl ClaimStore for PostgresClaimStore {
         occurred_at: DateTime<Utc>,
         attribution: &str,
     ) -> Result<(), ClaimStoreError> {
-        self.write(|tx| insert_stop_event(tx, kind, subject, detail, occurred_at, "", attribution))
+        let p = self.partition.as_str();
+        self.write(|tx| {
+            insert_stop_event(tx, p, kind, subject, detail, occurred_at, "", attribution)
+        })
     }
 
     fn record_prepare_skip(
@@ -1082,10 +1201,12 @@ impl ClaimStore for PostgresClaimStore {
         // row) and the `prepare-skip` stop row commit in one transaction; the
         // stop row is written unconditionally -- the dead-end happened
         // whether or not the release found a row to delete.
+        let p = self.partition.as_str();
         self.write(|tx| {
-            if delete_matching(tx, claim)? {
+            if delete_matching(tx, p, claim)? {
                 append_event(
                     tx,
+                    p,
                     &claim.task_id,
                     &claim.worker_id,
                     EVENT_RELEASED,
@@ -1094,16 +1215,29 @@ impl ClaimStore for PostgresClaimStore {
                     now,
                 )?;
             }
-            insert_stop_event(tx, STOP_PREPARE_SKIP, &claim.task_id, detail, now, "", "")
+            insert_stop_event(
+                tx,
+                p,
+                STOP_PREPARE_SKIP,
+                &claim.task_id,
+                detail,
+                now,
+                "",
+                "",
+            )
         })
     }
 
     fn list_stop_events(&self) -> Result<Vec<OrchestratorStopEventRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
-                &format!("SELECT {STOP_COLUMNS} FROM orchestrator_stop_events ORDER BY id"),
-                &[],
+                &format!(
+                    "SELECT {STOP_COLUMNS} FROM orchestrator_stop_events WHERE project_id = $1 \
+                     ORDER BY id"
+                ),
+                &[&p],
                 row_to_stop_event,
             )
         })
@@ -1113,14 +1247,15 @@ impl ClaimStore for PostgresClaimStore {
         &self,
         subject: &str,
     ) -> Result<Vec<OrchestratorStopEventRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
                 &format!(
-                    "SELECT {STOP_COLUMNS} FROM orchestrator_stop_events WHERE subject = $1 \
-                     ORDER BY id"
+                    "SELECT {STOP_COLUMNS} FROM orchestrator_stop_events \
+                     WHERE project_id = $1 AND subject = $2 ORDER BY id"
                 ),
-                &[&subject],
+                &[&p, &subject],
                 row_to_stop_event,
             )
         })
@@ -1138,11 +1273,12 @@ impl ClaimStore for PostgresClaimStore {
         };
         let reset_at = to_micros(reset_at);
         let now = to_micros(now);
+        let p = self.partition.as_str();
         self.write(|tx| {
             tx.execute(
                 "INSERT INTO orchestrator_session_pauses (run_id, reset_at, pause_until, \
-                 recorded_at) VALUES ($1, $2, $3, $4)",
-                &[&run_id, &reset_at, &pause_until, &now],
+                 recorded_at, project_id) VALUES ($1, $2, $3, $4, $5)",
+                &[&run_id, &reset_at, &pause_until, &now, &p],
             )
             .map_err(db)?;
             Ok(())
@@ -1158,12 +1294,13 @@ impl ClaimStore for PostgresClaimStore {
         // High-water horizon over rows still in the future; each row was
         // individually clamped so the max never exceeds the latest
         // min(reset, recorded_at + ceiling). Index-backed on pause_until.
+        let p = self.partition.as_str();
         self.read(|c| {
             let row = c
                 .query_one(
                     "SELECT MAX(pause_until) FROM orchestrator_session_pauses \
-                     WHERE pause_until > $1",
-                    &[&now],
+                     WHERE project_id = $2 AND pause_until > $1",
+                    &[&now, &p],
                 )
                 .map_err(db)?;
             col(&row, 0)
@@ -1171,11 +1308,15 @@ impl ClaimStore for PostgresClaimStore {
     }
 
     fn list_session_pauses(&self) -> Result<Vec<SessionPauseRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
-                &format!("SELECT {PAUSE_COLUMNS} FROM orchestrator_session_pauses ORDER BY id"),
-                &[],
+                &format!(
+                    "SELECT {PAUSE_COLUMNS} FROM orchestrator_session_pauses WHERE project_id = $1 \
+                     ORDER BY id"
+                ),
+                &[&p],
                 row_to_pause,
             )
         })
@@ -1190,18 +1331,21 @@ impl ClaimStore for PostgresClaimStore {
         detail: &str,
     ) -> Result<(), ClaimStoreError> {
         require_review_reason(reason)?;
-        self.write(|tx| insert_stop_event(tx, reason, task_id, detail, occurred_at, run_id, ""))
+        let p = self.partition.as_str();
+        self.write(|tx| insert_stop_event(tx, p, reason, task_id, detail, occurred_at, run_id, ""))
     }
 
     fn list_human_review_queue(&self) -> Result<Vec<HumanReviewQueueEntry>, ClaimStoreError> {
         let mut reasons: Vec<&str> = HUMAN_REVIEW_QUEUE_REASONS.to_vec();
         reasons.sort_unstable();
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
                 "SELECT id, kind, subject, detail, occurred_at, run_id \
-                 FROM orchestrator_stop_events WHERE kind = ANY($1::text[]) ORDER BY id",
-                &[&reasons],
+                 FROM orchestrator_stop_events WHERE project_id = $2 AND kind = ANY($1::text[]) \
+                 ORDER BY id",
+                &[&reasons, &p],
                 row_to_review_entry,
             )
         })
@@ -1246,27 +1390,31 @@ impl ClaimStore for PostgresClaimStore {
         // Header and every item row commit in one transaction, and
         // `last_event_id` is the live ledger high-water mark read inside
         // that transaction (0 on an empty ledger), never caller-supplied.
+        let p = self.partition.as_str();
         self.write(|tx| {
             let last_event_id: i64 = tx
-                .query_one("SELECT COALESCE(MAX(id), 0) FROM orchestrator_events", &[])
+                .query_one(
+                    "SELECT COALESCE(MAX(id), 0) FROM orchestrator_events WHERE project_id = $1",
+                    &[&p],
+                )
                 .map_err(db)?
                 .try_get(0)
                 .map_err(db)?;
             let snapshot_id: i64 = tx
                 .query_one(
-                    "INSERT INTO graph_snapshots (captured_at, item_count, last_event_id) \
-                     VALUES ($1, $2, $3) RETURNING id",
-                    &[&captured_at, &item_count, &last_event_id],
+                    "INSERT INTO graph_snapshots (captured_at, item_count, last_event_id, \
+                     project_id) VALUES ($1, $2, $3, $4) RETURNING id",
+                    &[&captured_at, &item_count, &last_event_id, &p],
                 )
                 .map_err(db)?
                 .try_get(0)
                 .map_err(db)?;
             tx.execute(
-                "INSERT INTO graph_snapshot_items (snapshot_id, task_id, source_kind, \
-                     source_ref, source_url, source_version, priority, \
+                "INSERT INTO graph_snapshot_items (project_id, snapshot_id, task_id, \
+                     source_kind, source_ref, source_url, source_version, priority, \
                      required_capabilities_json, conflict_keys_json, state, ready, \
                      claim_holder, resolved_prerequisites_json) \
-                 SELECT $1::bigint, u.task_id, u.source_kind, u.source_ref, u.source_url, \
+                 SELECT $14::text, $1::bigint, u.task_id, u.source_kind, u.source_ref, u.source_url, \
                      u.source_version, u.priority, u.required_capabilities::jsonb, \
                      u.conflict_keys::jsonb, u.state, u.ready, u.claim_holder, \
                      u.resolved_prerequisites::jsonb \
@@ -1290,6 +1438,7 @@ impl ClaimStore for PostgresClaimStore {
                     &readiness,
                     &holders,
                     &resolved,
+                    &p,
                 ],
             )
             .map_err(db)?;
@@ -1303,11 +1452,14 @@ impl ClaimStore for PostgresClaimStore {
     }
 
     fn list_graph_snapshots(&self) -> Result<Vec<GraphSnapshotRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
-                &format!("SELECT {SNAPSHOT_COLUMNS} FROM graph_snapshots ORDER BY id"),
-                &[],
+                &format!(
+                    "SELECT {SNAPSHOT_COLUMNS} FROM graph_snapshots WHERE project_id = $1 ORDER BY id"
+                ),
+                &[&p],
                 row_to_snapshot,
             )
         })
@@ -1317,25 +1469,30 @@ impl ClaimStore for PostgresClaimStore {
         &self,
         snapshot_id: i64,
     ) -> Result<Vec<GraphSnapshotItem>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
                 &format!(
                     "SELECT {SNAPSHOT_ITEM_COLUMNS} FROM graph_snapshot_items \
-                     WHERE snapshot_id = $1 ORDER BY task_id"
+                     WHERE project_id = $1 AND snapshot_id = $2 ORDER BY task_id"
                 ),
-                &[&snapshot_id],
+                &[&p, &snapshot_id],
                 row_to_snapshot_item,
             )
         })
     }
 
     fn latest_graph_snapshot(&self) -> Result<Option<GraphSnapshotRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_one(
                 c,
-                &format!("SELECT {SNAPSHOT_COLUMNS} FROM graph_snapshots ORDER BY id DESC LIMIT 1"),
-                &[],
+                &format!(
+                    "SELECT {SNAPSHOT_COLUMNS} FROM graph_snapshots WHERE project_id = $1 \
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                &[&p],
                 row_to_snapshot,
             )
         })
@@ -1350,13 +1507,15 @@ impl ClaimStore for PostgresClaimStore {
         let priority = int4(item.priority, "work_items.priority")?;
         let capabilities = set_value(&item.required_capabilities);
         let conflict_keys = set_value(&item.conflict_keys);
+        let p = self.partition.as_str();
         self.write(|tx| {
             tx.execute(
                 "INSERT INTO work_items (task_id, source_kind, source_ref, source_url, \
                      source_version, task_content_hash, priority, required_capabilities_json, \
-                     conflict_keys_json, first_seen_at, last_seen_at, disappeared_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $10, NULL) \
-                 ON CONFLICT (task_id) DO UPDATE SET \
+                     conflict_keys_json, first_seen_at, last_seen_at, disappeared_at, \
+                     project_id) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10, $10, NULL, $11) \
+                 ON CONFLICT (project_id, task_id) DO UPDATE SET \
                      source_kind = EXCLUDED.source_kind, source_ref = EXCLUDED.source_ref, \
                      source_url = EXCLUDED.source_url, source_version = EXCLUDED.source_version, \
                      task_content_hash = EXCLUDED.task_content_hash, \
@@ -1375,6 +1534,7 @@ impl ClaimStore for PostgresClaimStore {
                     &capabilities,
                     &conflict_keys,
                     &now,
+                    &p,
                 ],
             )
             .map_err(db)?;
@@ -1395,16 +1555,18 @@ impl ClaimStore for PostgresClaimStore {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let p = self.partition.as_str();
         self.write(|tx| {
             tx.execute(
-                "DELETE FROM work_item_dependencies WHERE task_id = $1",
-                &[&task_id],
+                "DELETE FROM work_item_dependencies WHERE project_id = $1 AND task_id = $2",
+                &[&p, &task_id],
             )
             .map_err(db)?;
             tx.execute(
-                "INSERT INTO work_item_dependencies (task_id, prerequisite_task_id, created_at) \
-                 SELECT $1, p, $3 FROM unnest($2::text[]) AS p",
-                &[&task_id, &unique, &now],
+                "INSERT INTO work_item_dependencies (project_id, task_id, prerequisite_task_id, \
+                     created_at) \
+                 SELECT $4, $1, prereq, $3 FROM unnest($2::text[]) AS prereq",
+                &[&task_id, &unique, &now, &p],
             )
             .map_err(db)?;
             Ok(())
@@ -1418,11 +1580,13 @@ impl ClaimStore for PostgresClaimStore {
     ) -> Result<(), ClaimStoreError> {
         let now = to_micros(now);
         let observed: Vec<&str> = observed_task_ids.iter().map(String::as_str).collect();
+        let p = self.partition.as_str();
         self.write(|tx| {
             tx.execute(
                 "UPDATE work_items SET disappeared_at = $1 \
-                 WHERE disappeared_at IS NULL AND task_id <> ALL($2::text[])",
-                &[&now, &observed],
+                 WHERE project_id = $3 AND disappeared_at IS NULL \
+                 AND task_id <> ALL($2::text[])",
+                &[&now, &observed, &p],
             )
             .map_err(db)?;
             Ok(())
@@ -1430,46 +1594,56 @@ impl ClaimStore for PostgresClaimStore {
     }
 
     fn load_work_item(&self, task_id: &str) -> Result<Option<WorkItemRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_one(
                 c,
-                &format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE task_id = $1"),
-                &[&task_id],
+                &format!(
+                    "SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE project_id = $1 \
+                     AND task_id = $2"
+                ),
+                &[&p, &task_id],
                 row_to_work_item,
             )
         })
     }
 
     fn list_work_items(&self) -> Result<Vec<WorkItemRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
-                &format!("SELECT {WORK_ITEM_COLUMNS} FROM work_items ORDER BY task_id"),
-                &[],
+                &format!(
+                    "SELECT {WORK_ITEM_COLUMNS} FROM work_items WHERE project_id = $1 \
+                     ORDER BY task_id"
+                ),
+                &[&p],
                 row_to_work_item,
             )
         })
     }
 
     fn load_work_item_dependencies(&self, task_id: &str) -> Result<Vec<String>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
-                "SELECT prerequisite_task_id FROM work_item_dependencies WHERE task_id = $1 \
-                 ORDER BY prerequisite_task_id",
-                &[&task_id],
+                "SELECT prerequisite_task_id FROM work_item_dependencies \
+                 WHERE project_id = $1 AND task_id = $2 ORDER BY prerequisite_task_id",
+                &[&p, &task_id],
                 |row| col(row, 0),
             )
         })
     }
 
     fn list_work_item_dependencies(&self) -> Result<Vec<(String, String)>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
                 "SELECT task_id, prerequisite_task_id FROM work_item_dependencies \
-                 ORDER BY task_id, prerequisite_task_id",
-                &[],
+                 WHERE project_id = $1 ORDER BY task_id, prerequisite_task_id",
+                &[&p],
                 |row| Ok((col(row, 0)?, col(row, 1)?)),
             )
         })
@@ -1482,12 +1656,14 @@ impl ClaimStore for PostgresClaimStore {
         now: DateTime<Utc>,
     ) -> Result<i64, ClaimStoreError> {
         let now = to_micros(now);
+        let p = self.partition.as_str();
         self.write(|tx| {
             let row = tx
                 .query_one(
                     "INSERT INTO source_syncs (source_kind, source_name, started_at, status, \
-                     observed_count) VALUES ($1, $2, $3, 'running', 0) RETURNING id",
-                    &[&source_kind, &source_name, &now],
+                     observed_count, project_id) VALUES ($1, $2, $3, 'running', 0, $4) \
+                     RETURNING id",
+                    &[&source_kind, &source_name, &now, &p],
                 )
                 .map_err(db)?;
             col(&row, 0)
@@ -1505,11 +1681,12 @@ impl ClaimStore for PostgresClaimStore {
         let now = to_micros(now);
         let observed_count = int4(observed_count, "source_syncs.observed_count")?;
         let error = error.map(nul_free_text);
+        let p = self.partition.as_str();
         self.write(|tx| {
             tx.execute(
                 "UPDATE source_syncs SET status = $1, observed_count = $2, error = $3, \
-                 finished_at = $4 WHERE id = $5",
-                &[&status, &observed_count, &error, &now, &sync_id],
+                 finished_at = $4 WHERE id = $5 AND project_id = $6",
+                &[&status, &observed_count, &error, &now, &sync_id, &p],
             )
             .map_err(db)?;
             Ok(())
@@ -1517,22 +1694,30 @@ impl ClaimStore for PostgresClaimStore {
     }
 
     fn load_source_sync(&self, sync_id: i64) -> Result<Option<SourceSyncRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_one(
                 c,
-                &format!("SELECT {SOURCE_SYNC_COLUMNS} FROM source_syncs WHERE id = $1"),
-                &[&sync_id],
+                &format!(
+                    "SELECT {SOURCE_SYNC_COLUMNS} FROM source_syncs WHERE project_id = $1 \
+                     AND id = $2"
+                ),
+                &[&p, &sync_id],
                 row_to_source_sync,
             )
         })
     }
 
     fn list_source_syncs(&self) -> Result<Vec<SourceSyncRecord>, ClaimStoreError> {
+        let p = self.partition.as_str();
         self.read(|c| {
             query_all(
                 c,
-                &format!("SELECT {SOURCE_SYNC_COLUMNS} FROM source_syncs ORDER BY id"),
-                &[],
+                &format!(
+                    "SELECT {SOURCE_SYNC_COLUMNS} FROM source_syncs WHERE project_id = $1 \
+                     ORDER BY id"
+                ),
+                &[&p],
                 row_to_source_sync,
             )
         })
@@ -1568,7 +1753,11 @@ pub fn build_postgres_claim_store(
     request: &BuildRequest<'_>,
 ) -> Result<Arc<dyn ClaimStore>, StoreConfigError> {
     let dsn = requested_dsn(request)?;
-    let store = PostgresClaimStore::connect(&dsn, requested_schema(request))?;
+    let store = PostgresClaimStore::connect_partition(
+        &dsn,
+        requested_schema(request),
+        &request.config.project_id,
+    )?;
     Ok(Arc::new(store))
 }
 
@@ -1579,7 +1768,11 @@ pub fn build_postgres_core_store(
     request: &BuildRequest<'_>,
 ) -> Result<Arc<dyn HarnessStore>, StoreConfigError> {
     let dsn = requested_dsn(request)?;
-    let store = PostgresStore::connect(&dsn, requested_schema(request))?;
+    let store = PostgresStore::connect_partition(
+        &dsn,
+        requested_schema(request),
+        &request.config.project_id,
+    )?;
     Ok(Arc::new(store))
 }
 
@@ -1628,7 +1821,7 @@ mod tests {
     }
 
     fn registries() -> StoreRegistries {
-        let opener: SqliteCoreOpener = Arc::new(|_path: &Path| {
+        let opener: SqliteCoreOpener = Arc::new(|_path: &Path, _partition: &str| {
             Err(StoreError::backend(std::io::Error::other(
                 "core sqlite opener unused in these tests",
             )))
@@ -1642,6 +1835,7 @@ mod tests {
             db_path: "/tmp/never-created.db".into(),
             schema: schema.map(str::to_owned),
             dsn: None,
+            project_id: flywheel_core::store::DEFAULT_PARTITION.to_owned(),
         }
     }
 
@@ -1676,9 +1870,16 @@ mod tests {
         assert!(SCHEMA_SQL.contains("conflict_keys_json JSONB NOT NULL DEFAULT '[]'::jsonb"));
         assert!(!SCHEMA_SQL.contains("DATETIME"));
         assert!(!SCHEMA_SQL.contains("AUTOINCREMENT"));
-        for (table, column, ddl) in COLUMN_MIGRATIONS {
-            assert!(ddl.starts_with(&format!("ALTER TABLE {table} ADD COLUMN {column} ")));
+        // Lockstep with the SQLite DDL: the same tables, every partitioned
+        // one leading with project_id, the sentinel version-first.
+        for table in ORCH_PARTITIONED_TABLES {
+            let columns = flywheel_core::schema_ddl::declared_columns(SCHEMA_SQL, table);
+            assert_eq!(columns[0], "project_id", "{table}");
         }
+        assert_eq!(
+            flywheel_core::schema_ddl::declared_columns(SCHEMA_SQL, ORCH_VERSION_TABLE),
+            vec!["version", "id"]
+        );
     }
 
     #[test]

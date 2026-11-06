@@ -20,15 +20,11 @@
 use std::fmt;
 use std::time::Duration;
 
-use flywheel_core::store::CURRENT_SCHEMA_VERSION;
+use flywheel_core::store::{
+    CURRENT_SCHEMA_VERSION, OLDEST_UPGRADABLE_SCHEMA_VERSION, UPGRADE_COMMAND,
+};
 use flywheel_core::store_postgres::{PostgresStore, describe_error};
 use postgres::Client;
-
-/// The schema versions the store migrates forward in place (v11 -> v12, an
-/// additive nullable column). Mirrors the store bootstrap; kept in sync here
-/// so the version check can say "will auto-migrate" instead of "will be
-/// refused".
-pub const IN_PLACE_MIGRATABLE_FROM: &[u32] = &[11];
 
 /// Bounded wait for the preflight's one connection attempt.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -564,15 +560,23 @@ fn schema_version_verdict(
             format!("schema '{schema}' is at version {observed_text} (current)"),
         ));
     }
-    if observed_version.is_some_and(|v| IN_PLACE_MIGRATABLE_FROM.contains(&v)) {
+    // A behind-but-upgradable schema is refused on open (there is no
+    // implicit migration); the in-place upgrade verb migrates it, keeping
+    // every row.
+    if observed_version
+        .is_some_and(|v| (OLDEST_UPGRADABLE_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION).contains(&v))
+    {
         return Ok(PreflightCheck::new(
             "schema version",
-            CheckStatus::Warn,
+            CheckStatus::Block,
             format!(
-                "schema '{schema}' is at version {observed_text}; it will be migrated in place \
-                 to {CURRENT_SCHEMA_VERSION} on first use"
+                "schema '{schema}' is at version {observed_text}, behind the store's \
+                 {CURRENT_SCHEMA_VERSION}; the store refuses to open it until it is upgraded"
             ),
-        ));
+        )
+        .with_remedy(format!(
+            "{UPGRADE_COMMAND}  -- migrates the schema in place, keeping every row"
+        )));
     }
     Ok(PreflightCheck::new(
         "schema version",

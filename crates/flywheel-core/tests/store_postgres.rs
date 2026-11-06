@@ -4,7 +4,8 @@
 //! `store_contract.rs`. The cases here pin properties that only make sense
 //! for the Postgres backend: JSONB and TIMESTAMPTZ column typing, raw-SQL
 //! append-only enforcement, foreign keys, schema isolation, the version pin
-//! and the v11 -> v12 migration, the LISTEN/NOTIFY bridge, concurrent
+//! the project_id partitioning, the behind-schema refusal and the in-place
+//! `upgrade` (from a real v12 layout), the LISTEN/NOTIFY bridge, concurrent
 //! first-open bootstrap safety, and the fail-loud connection path.
 //!
 //! Every database-backed case runs against the throwaway container from
@@ -229,7 +230,12 @@ fn mismatched_schema_version_is_refused() {
         .unwrap();
     let err = PostgresStore::connect(&pg.dsn(), &schema).unwrap_err();
     assert!(err.is_schema_mismatch());
-    assert!(err.to_string().contains("store must be re-created"));
+    assert!(err.to_string().contains("newer flywheel"), "{err}");
+    let err_upgrade = PostgresStore::upgrade(&pg.dsn(), &schema, "p").unwrap_err();
+    assert!(
+        err_upgrade.to_string().contains("newer flywheel"),
+        "{err_upgrade}"
+    );
     let StoreError::Schema(schema_err) = err else {
         panic!("expected schema error");
     };
@@ -240,57 +246,203 @@ fn mismatched_schema_version_is_refused() {
     assert_eq!(schema_err.expected_version, CURRENT_SCHEMA_VERSION);
 }
 
+/// A real v12 schema (the frozen pre-partition DDL) holding one run with an
+/// attempt, an event, a grader receipt, a pending command, and a task.
+fn seed_v12(pg: &Postgres, schema: &str) {
+    pg.admin()
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .unwrap();
+    let mut admin = pg.admin_in(schema);
+    admin
+        .batch_execute(include_str!("fixtures/persistence-schema-postgres-v12.sql"))
+        .unwrap();
+    admin
+        .batch_execute(
+            "INSERT INTO tasks (id, first_seen_at, updated_at)
+               VALUES ('t1', now(), now());
+             INSERT INTO task_versions
+               (task_id, content_hash, goal, graders_json, tags_json, context_json, created_at)
+               VALUES ('t1', 'h1', 'Goal.', '[{\"type\": \"command\", \"run\": \"true\"}]',
+                       '[]', 'null', now());
+             INSERT INTO lifecycles
+               (run_id, task_id, status, version, retries, timestamps_json, updated_at,
+                task_content_hash, source)
+               VALUES ('run-old', 't1', 'running', 3, 0, '{}', now(), 'h1', 'owner/repo#1');
+             INSERT INTO attempts (run_id, number, started_at, input_tokens)
+               VALUES ('run-old', 1, now(), 42);
+             INSERT INTO events (run_id, attempt_number, ts, kind, payload_json, sequence)
+               VALUES ('run-old', NULL, now(), 'lifecycle_initialized',
+                       '{\"task_id\": \"t1\"}', 1);
+             INSERT INTO grader_results
+               (run_id, attempt_number, ordinal, grader_type, grader_spec_json, passed,
+                duration_ms, payload_json, ts)
+               VALUES ('run-old', 1, 0, 'command', '{\"type\": \"command\", \"run\": \"true\"}',
+                       true, 5, '{\"exit_code\": 0}', now());
+             INSERT INTO control_commands (run_id, kind, payload_json, enqueued_at)
+               VALUES ('run-old', 'interrupt', '{}', now());",
+        )
+        .unwrap();
+}
+
+fn first_column(pg: &Postgres, schema: &str, table: &str) -> String {
+    pg.admin()
+        .query_one(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = $1::text AND table_name = $2::text AND ordinal_position = 1",
+            &[&schema, &table],
+        )
+        .unwrap()
+        .get(0)
+}
+
 #[test]
-fn v11_schema_is_forward_migrated_in_place() {
+fn a_v12_schema_is_refused_then_upgraded_in_place_with_its_rows_keyed() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_v12");
+    seed_v12(&pg, &schema);
+    let err = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-x").unwrap_err();
+    assert!(err.to_string().contains("fw db upgrade"), "{err}");
+    assert_eq!(schema_version(&pg, &schema), 12);
+
+    let upgrade = PostgresStore::upgrade(&pg.dsn(), &schema, "proj-x").unwrap();
+    assert_eq!(upgrade.from, Some(12));
+    assert_eq!(upgrade.to, CURRENT_SCHEMA_VERSION);
+    assert_eq!(upgrade.partitioned.len(), 7, "{:?}", upgrade.partitioned);
+    assert_eq!(schema_version(&pg, &schema), CURRENT_SCHEMA_VERSION as i32);
+    assert_eq!(first_column(&pg, &schema, "schema_version"), "version");
+
+    let store = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-x").unwrap();
+    let lifecycle = store.load_lifecycle("run-old").unwrap().unwrap();
+    assert_eq!(lifecycle.version, 3);
+    assert_eq!(lifecycle.source, "owner/repo#1");
+    assert_eq!(lifecycle.attempts[0].input_tokens, 42);
+    assert_eq!(store.list_domain_events("run-old").unwrap().len(), 1);
+    assert_eq!(store.list_grader_results("run-old", 1).unwrap().len(), 1);
+    assert_eq!(store.pending_commands("run-old").unwrap().len(), 1);
+    assert_eq!(
+        store.load_task_for_run("run-old").unwrap().unwrap().id,
+        "t1"
+    );
+    // Ledger ids continue past the migrated rows; the triggers survive.
+    let receipt = store.list_grader_results("run-old", 1).unwrap().remove(0);
+    assert!(store.append_grader_result(&receipt).unwrap().id > receipt.id);
+    let raw = store.with_client(|client| {
+        client
+            .execute("DELETE FROM grader_results", &[])
+            .unwrap_err()
+    });
+    assert_eq!(sqlstate(&raw), Some(SqlState::CHECK_VIOLATION));
+    // A composite FK now rejects a cross-project reference.
+    let cross = store.with_client(|client| {
+        client
+            .execute(
+                "INSERT INTO attempts (project_id, run_id, number, started_at) \
+                 VALUES ('proj-y', 'run-old', 2, now())",
+                &[],
+            )
+            .unwrap_err()
+    });
+    assert_eq!(sqlstate(&cross), Some(SqlState::FOREIGN_KEY_VIOLATION));
+    let other = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-y").unwrap();
+    assert!(other.load_lifecycle("run-old").unwrap().is_none());
+    store.close().unwrap();
+    other.close().unwrap();
+    // Idempotent: the second upgrade re-keys nothing.
+    assert!(
+        PostgresStore::upgrade(&pg.dsn(), &schema, "proj-x")
+            .unwrap()
+            .is_noop()
+    );
+}
+
+#[test]
+fn a_v11_schema_upgrades_through_to_current() {
     let Some(pg) = Postgres::acquire() else {
         return;
     };
     let schema = pg.fresh_schema("fw_v11");
-    let store = open(&pg, &schema);
-    store
-        .create_lifecycle(&Lifecycle::new("t1").with_run_id("run-old"))
-        .unwrap();
-    store.close().unwrap();
+    seed_v12(&pg, &schema);
     pg.admin_in(&schema)
         .batch_execute(
             "ALTER TABLE lifecycles DROP COLUMN source;
+             ALTER TABLE task_versions DROP COLUMN insertion_seq;
              UPDATE schema_version SET version = 11 WHERE id = 1;",
         )
         .unwrap();
-    assert_eq!(schema_version(&pg, &schema), 11);
-
-    let migrated = open(&pg, &schema);
-    assert_eq!(schema_version(&pg, &schema), CURRENT_SCHEMA_VERSION as i32);
-    let old = migrated.load_lifecycle("run-old").unwrap().unwrap();
-    assert_eq!(old.source, "");
-    let mut fresh = Lifecycle::new("t1").with_run_id("run-new");
-    fresh.source = ".flywheel/tasks/active/30-history/t1.json".into();
-    migrated.create_lifecycle(&fresh).unwrap();
-    assert_eq!(
-        migrated.load_lifecycle("run-new").unwrap().unwrap().source,
-        fresh.source
-    );
-    migrated.close().unwrap();
-    // Reopening after the migration must not re-add the column.
-    open(&pg, &schema).close().unwrap();
-}
-
-#[test]
-fn insertion_seq_is_restored_on_a_pre_identity_schema() {
-    let Some(pg) = Postgres::acquire() else {
-        return;
-    };
-    let schema = pg.fresh_schema("fw_seq");
-    open(&pg, &schema).close().unwrap();
-    pg.admin_in(&schema)
-        .batch_execute("ALTER TABLE task_versions DROP COLUMN insertion_seq")
-        .unwrap();
-    let store = open(&pg, &schema);
+    let upgrade = PostgresStore::upgrade(&pg.dsn(), &schema, "p").unwrap();
+    assert_eq!(upgrade.from, Some(11));
+    let store = PostgresStore::connect_partition(&pg.dsn(), &schema, "p").unwrap();
+    assert_eq!(store.load_lifecycle("run-old").unwrap().unwrap().source, "");
+    // insertion_seq was restored: the latest-version tie-break works.
     let first = command_task("t", "First saved.");
     let second = command_task("t", "Second saved.");
     store.save_task(&first, at(0)).unwrap();
     store.save_task(&second, at(0)).unwrap();
     assert_eq!(store.load_task("t", None).unwrap(), Some(second));
+}
+
+#[test]
+fn a_behind_but_partitioned_schema_only_needs_its_version_fixed() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_behind");
+    let store = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-a").unwrap();
+    store
+        .create_lifecycle(&Lifecycle::new("t").with_run_id("r1"))
+        .unwrap();
+    store.close().unwrap();
+    pg.admin_in(&schema)
+        .batch_execute("UPDATE schema_version SET version = version - 1")
+        .unwrap();
+    let err = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-a").unwrap_err();
+    assert!(err.to_string().contains("fw db upgrade"), "{err}");
+    let upgrade = PostgresStore::upgrade(&pg.dsn(), &schema, "proj-a").unwrap();
+    assert_eq!(upgrade.from, Some(CURRENT_SCHEMA_VERSION - 1));
+    assert!(upgrade.partitioned.is_empty());
+    let reopened = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-a").unwrap();
+    assert!(reopened.load_lifecycle("r1").unwrap().is_some());
+}
+
+#[test]
+fn partitions_sharing_one_schema_never_see_each_other() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_parts");
+    let a = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-a").unwrap();
+    let b = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-b").unwrap();
+    assert_eq!(a.partition(), "proj-a");
+    for (store, goal) in [(&a, "A goal."), (&b, "B goal.")] {
+        store.save_task(&command_task("t", goal), at(0)).unwrap();
+        store
+            .create_lifecycle(&Lifecycle::new("t").with_run_id("r1"))
+            .unwrap();
+        store
+            .save_attempt("r1", &Attempt::new(1, at(0), "r1"), None)
+            .unwrap();
+        store
+            .enqueue_command("r1", "interrupt", JsonObject::new(), at(0))
+            .unwrap();
+    }
+    assert_eq!(a.load_task("t", None).unwrap().unwrap().goal, "A goal.");
+    assert_eq!(b.load_task("t", None).unwrap().unwrap().goal, "B goal.");
+    let mut lc = a.load_lifecycle("r1").unwrap().unwrap();
+    lc.transition_to(Status::Ready, "", Some(at(1))).unwrap();
+    a.update_lifecycle(&lc, 1).unwrap();
+    assert_eq!(b.load_lifecycle("r1").unwrap().unwrap().version, 1);
+    assert_eq!(
+        a.list_lifecycles(&LifecycleFilter::default())
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(a.claim_commands("r1", at(2)).unwrap().len(), 1);
+    assert_eq!(b.pending_commands("r1").unwrap().len(), 1);
+    let unscoped = open(&pg, &schema);
+    assert!(unscoped.load_lifecycle("r1").unwrap().is_none());
 }
 
 #[test]
@@ -382,8 +534,8 @@ fn foreign_keys_reject_orphan_rows() {
     let orphan_event = store.with_client(|client| {
         client
             .execute(
-                "INSERT INTO events (run_id, ts, kind, payload_json, sequence) \
-                 VALUES ($1, $2, 'x', '{}'::jsonb, 1)",
+                "INSERT INTO events (project_id, run_id, ts, kind, payload_json, sequence) \
+                 VALUES ('default', $1, $2, 'x', '{}'::jsonb, 1)",
                 &[&"nope", &now],
             )
             .unwrap_err()
@@ -395,9 +547,10 @@ fn foreign_keys_reject_orphan_rows() {
     let orphan_result = store.with_client(|client| {
         client
             .execute(
-                "INSERT INTO grader_results (run_id, attempt_number, ordinal, grader_type, \
-                 grader_spec_json, passed, duration_ms, payload_json, ts) \
-                 VALUES ('r1', 999, 0, 'command', '{}'::jsonb, true, 1, '{}'::jsonb, $1)",
+                "INSERT INTO grader_results (project_id, run_id, attempt_number, ordinal, \
+                 grader_type, grader_spec_json, passed, duration_ms, payload_json, ts) \
+                 VALUES ('default', 'r1', 999, 0, 'command', '{}'::jsonb, true, 1, \
+                 '{}'::jsonb, $1)",
                 &[&now],
             )
             .unwrap_err()
@@ -739,6 +892,7 @@ fn listen_notify_bridges_cross_instance_writes() {
             schema: schema.clone(),
             listen: true,
             notifier: None,
+            ..PostgresStoreOptions::default()
         },
     )
     .unwrap();
@@ -810,6 +964,7 @@ fn listener_reports_failure_when_it_cannot_subscribe() {
             schema,
             listen: true,
             notifier: None,
+            ..PostgresStoreOptions::default()
         },
     )
     .unwrap_err();
@@ -937,6 +1092,7 @@ fn listener_resubscribes_after_its_connection_is_terminated() {
             schema: schema.clone(),
             listen: true,
             notifier: None,
+            ..PostgresStoreOptions::default()
         },
     )
     .unwrap();
@@ -1070,6 +1226,7 @@ fn listen_bridge_watermark_is_the_exact_committed_sequence() {
             schema: schema.clone(),
             listen: true,
             notifier: None,
+            ..PostgresStoreOptions::default()
         },
     )
     .unwrap();

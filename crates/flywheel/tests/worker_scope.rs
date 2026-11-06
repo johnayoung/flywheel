@@ -107,8 +107,9 @@ impl Repo {
         let mut paths = vec![self.root.join("bin")];
         paths.extend(std::env::split_paths(&path));
         let mut command = Command::new(env!("CARGO_BIN_EXE_fw"));
+        // The repo's flywheel.toml is legacy: name it explicitly.
         command
-            .arg("worker")
+            .args(["worker", "--policy", "flywheel.toml"])
             .args(args)
             .args(["--heartbeat", "0", "--poll-interval", "1"])
             .current_dir(&self.repo)

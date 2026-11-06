@@ -120,13 +120,13 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 
 ## Flywheel panel
 
-Folders with a `flywheel.toml` or `.flywheel/` get the verified loop beside the terminals, read-only (`--no-flywheel`: off). **Postgres stores read the DSN from the hub's own environment** (`FLYWHEEL_PG_DSN`, else `DATABASE_URL`).
+`flywheel.toml`, `.flywheel/`, or `.flywheel.toml` folders get the verified loop, read-only (`--no-flywheel`: off); launches add `--policy`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN: the hub's env** (`FLYWHEEL_PG_DSN`, else `DATABASE_URL`).
 
 - Phases, tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
 - **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks to add unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`.
 - Shown: tier verdicts, the newest deciding cycle (emitted, dropped with reasons), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate shown (one per gate, then `decision pending`; deny retries with feedback). Peers: read-only.
-- A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is not made. One watcher per folder (stat 2 s, re-read 15 s). Seam: `flywheel::FlywheelProvider` (`hub_flywheel.rs`).
+- A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is not made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
 
 ## Prompt queue
 

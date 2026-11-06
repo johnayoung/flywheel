@@ -893,19 +893,23 @@ window.FwHubFlywheel = function (ctx) {
     // No source read: the policy itself does not load (a worker would exit
     // at once with the same error).
     const broken = !!panel.problem && !panel.source;
+    // An unapproved .flywheel.toml: a worker would refuse at once.
+    const untrusted = panel.untrusted || null;
     const start = el(
       "button",
       {
         type: "button",
         className: "slab fw-start",
         onclick: () => startWorker(),
-        disabled: broken,
-        title: broken
+        disabled: broken || !!untrusted,
+        title: untrusted
+          ? `Approve .flywheel.toml first: ${untrusted.command}`
+          : broken
           ? "The policy does not load (see below): fix flywheel.toml, then start a worker"
           : "Run fw worker in a new shell session in this folder: it drains every active task not done yet (a task's run button runs that one alone)",
       },
       icon("plus"),
-      broken ? "Fix flywheel.toml first" : panel.worker.live ? "Start another worker" : "Start worker here",
+      untrusted ? "Run fw trust first" : broken ? "Fix flywheel.toml first" : panel.worker.live ? "Start another worker" : "Start worker here",
     );
     const goto = workers.length
       ? el("button", {
@@ -927,6 +931,14 @@ window.FwHubFlywheel = function (ctx) {
       ),
     ];
     if (ui.error) children.push(el("p", { className: "fw-problem", role: "alert", textContent: ui.error }));
+    if (untrusted) {
+      children.push(el(
+        "p",
+        { className: "fw-problem fw-untrusted", role: "alert" },
+        `${untrusted.file} is not trusted: its settings do not apply, and workers and the autopilot refuse to run here. Review it, then run in a terminal: `,
+        el("code", { textContent: untrusted.command }),
+      ));
+    }
     const note = worktreeNote(panel);
     if (note) children.push(el("p", { className: "fw-note", textContent: note }));
     if (panel.problem) children.push(el("p", { className: "fw-problem", textContent: panel.problem }));

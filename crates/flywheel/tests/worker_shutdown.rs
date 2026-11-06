@@ -205,7 +205,9 @@ impl Fixture {
         let log = std::fs::File::create(self.root.join("worker.log")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_fw"));
         command
-            .args(["worker", "--concurrency", &concurrency.to_string()])
+            // The repo's flywheel.toml is legacy: name it explicitly.
+            .args(["worker", "--policy", "flywheel.toml"])
+            .args(["--concurrency", &concurrency.to_string()])
             .args(["--heartbeat", "1", "--poll-interval", "1"])
             .current_dir(&self.repo)
             .env("PATH", std::env::join_paths(paths).unwrap())

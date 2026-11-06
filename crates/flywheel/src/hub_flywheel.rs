@@ -47,19 +47,23 @@ use flywheel_hub::autopilot::{GateDecided, GateDecision, GateRefused};
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome, LiveRun, Note,
-    PanelClaim, PanelPhase, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight, WorkerScope,
+    PanelClaim, PanelPhase, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight,
+    UntrustedRepoFile, WorkerScope,
 };
 use flywheel_hub::util::path_identity as file_identity;
 use flywheel_orchestrator::autopilot_activity::{
     PHASE_STOPPED, epoch_now, is_paused, is_record_live, read_activity, set_paused,
 };
 use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore, REASON_AWAITING_APPROVAL};
+use flywheel_orchestrator::config::{REPO_CONFIG_FILENAME, read_repo_file};
+use flywheel_orchestrator::home::{Home, ProjectError, stored_project_id};
 use flywheel_orchestrator::pg_preflight::dsn_target;
 use flywheel_orchestrator::policy::{
     DEFAULT_POLICY_FILENAME, DEFAULT_TASKS_DIR, WorkPolicy, load_policy,
 };
 use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkSource};
 use flywheel_orchestrator::store_factory::{StoreBundle, resolve_postgres_dsn};
+use flywheel_orchestrator::trust;
 use flywheel_orchestrator::workflow::status::format_blocked_on;
 use flywheel_orchestrator::workflow::{
     CommonArgs, ShowArgs, StatusArgs, cmd_show, cmd_status, resolve_fallback_phases,
@@ -898,6 +902,42 @@ fn cut(body: String) -> String {
 
 // --- the provider ----------------------------------------------------------------
 
+/// The folder's `.flywheel.toml` trust state: `Ok(Some)` while it awaits
+/// `fw trust` (keyed, like every verb, by the repo's local project id and
+/// the file's sha256), `Err` when the file does not load. Never mints an
+/// id or writes the home.
+fn repo_file_trust(
+    home: Result<Home, ProjectError>,
+    folder: &Path,
+) -> Result<Option<UntrustedRepoFile>, String> {
+    let repo = match read_repo_file(folder) {
+        Ok(Some(repo)) => repo,
+        Ok(None) => return Ok(None),
+        Err(failure) => return Err(failure.to_string()),
+    };
+    let trusted = match (home, stored_project_id(folder)) {
+        (Ok(home), Ok(Some(id))) => {
+            trust::is_trusted(&home, &id, &repo.sha256).map_err(|e| e.to_string())?
+        }
+        (Err(failure), _) | (_, Err(failure)) => return Err(failure.to_string()),
+        (Ok(_), Ok(None)) => false,
+    };
+    Ok((!trusted).then(|| UntrustedRepoFile {
+        file: repo.path,
+        command: format!("cd {} && fw trust", folder.display()),
+    }))
+}
+
+/// `--policy=<folder>/flywheel.toml` when the folder carries one: the panel
+/// reads the folder's own policy file, and `fw worker` / `fw autopilot` no
+/// longer auto-detect it, so a launch from the panel names it explicitly to
+/// run against the same tasks and store the panel shows.
+fn legacy_policy_flag(folder: &Path) -> Option<String> {
+    let file = folder.join(DEFAULT_POLICY_FILENAME);
+    file.is_file()
+        .then(|| format!("--policy={}", file.display()))
+}
+
 impl FlywheelProvider for HubFlywheel {
     fn adopted(&self, folder: &Path) -> bool {
         // A linked git worktree of an adopted repo counts too: flywheel
@@ -905,13 +945,20 @@ impl FlywheelProvider for HubFlywheel {
         // `.flywheel/` under the worktree itself, never the main
         // checkout's), so its panel reads its own store and says so
         // (`worktree_of`).
-        folder.join(DEFAULT_POLICY_FILENAME).is_file() || folder.join(".flywheel").is_dir()
+        folder.join(DEFAULT_POLICY_FILENAME).is_file()
+            || folder.join(".flywheel").is_dir()
+            || folder.join(REPO_CONFIG_FILENAME).is_file()
     }
 
     fn fingerprint(&self, folder: &Path) -> u64 {
         let mut hasher = DefaultHasher::new();
         stamp(&folder.join(DEFAULT_POLICY_FILENAME)).hash(&mut hasher);
         stamp(&folder.join(AUTOPILOT_ACTIVITY)).hash(&mut hasher);
+        // Trust: an edited repo file or a new approval re-reads the panel.
+        stamp(&folder.join(REPO_CONFIG_FILENAME)).hash(&mut hasher);
+        if let Ok(home) = Home::from_env() {
+            stamp(&home.trust_file()).hash(&mut hasher);
+        }
         let state = self.folder(folder);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Ok(resolved) = state.resolve(folder) {
@@ -933,6 +980,11 @@ impl FlywheelProvider for HubFlywheel {
         let now = Utc::now();
         let mut panel = FlywheelPanel::empty(folder.to_path_buf(), now);
         panel.autopilot = autopilot_state(folder, true);
+        let mut trust_problem = None;
+        match repo_file_trust(Home::from_env(), folder) {
+            Ok(untrusted) => panel.untrusted = untrusted,
+            Err(message) => trust_problem = Some(message),
+        }
         let state = self.folder(folder);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
         panel.worktree_of = state.worktree_of(folder);
@@ -945,7 +997,7 @@ impl FlywheelProvider for HubFlywheel {
         };
         panel.source = resolved.source_label.clone();
         panel.store = resolved.store_label(folder);
-        let mut problems: Vec<String> = Vec::new();
+        let mut problems: Vec<String> = trust_problem.into_iter().collect();
         let (core, claims): (Arc<dyn HarnessStore>, Arc<dyn ClaimStore>) =
             match resolved.stores(folder) {
                 Ok(Some(bundle)) => (Arc::clone(&bundle.core), Arc::clone(&bundle.claims)),
@@ -1101,11 +1153,12 @@ impl FlywheelProvider for HubFlywheel {
             .retain(|open| open.root != folder);
     }
 
-    fn worker_command(&self, _folder: &Path, scope: &WorkerScope) -> Vec<String> {
+    fn worker_command(&self, folder: &Path, scope: &WorkerScope) -> Vec<String> {
         let mut argv = vec![
             self.program.to_string_lossy().into_owned(),
             "worker".to_owned(),
         ];
+        argv.extend(legacy_policy_flag(folder));
         argv.extend(scope.flags());
         argv
     }
@@ -1127,11 +1180,13 @@ impl FlywheelProvider for HubFlywheel {
         crate::hub_tasks::task_seed(self, folder, task_id)
     }
 
-    fn autopilot_command(&self, _folder: &Path) -> Vec<String> {
-        vec![
+    fn autopilot_command(&self, folder: &Path) -> Vec<String> {
+        let mut argv = vec![
             self.program.to_string_lossy().into_owned(),
             "autopilot".to_owned(),
-        ]
+        ];
+        argv.extend(legacy_policy_flag(folder));
+        argv
     }
 
     fn set_autopilot_paused(&self, folder: &Path, paused: bool) -> Result<bool, String> {
@@ -1168,6 +1223,67 @@ impl FlywheelProvider for HubFlywheel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn the_panel_names_the_trust_command_for_an_unapproved_repo_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = Home::at(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        // No repo file: nothing to trust.
+        assert_eq!(repo_file_trust(Ok(home.clone()), &repo), Ok(None));
+
+        std::fs::write(repo.join(REPO_CONFIG_FILENAME), "verify = \"make\"\n").unwrap();
+        // No project id yet (never minted here): untrusted.
+        let untrusted = repo_file_trust(Ok(home.clone()), &repo).unwrap().unwrap();
+        assert_eq!(
+            untrusted.command,
+            format!("cd {} && fw trust", repo.display())
+        );
+        assert_eq!(stored_project_id(&repo), Ok(None), "the hub mints no id");
+        assert!(!home.root().exists(), "the hub writes no home state");
+
+        // Approved under the local id and these bytes: trusted.
+        let project = flywheel_orchestrator::home::resolve_project(&home, &repo).unwrap();
+        let bytes = std::fs::read(repo.join(REPO_CONFIG_FILENAME)).unwrap();
+        trust::approve(
+            &home,
+            &project.id,
+            &trust::sha256_hex(&bytes),
+            &repo.join(REPO_CONFIG_FILENAME),
+        )
+        .unwrap();
+        assert_eq!(repo_file_trust(Ok(home.clone()), &repo), Ok(None));
+
+        // Edited: untrusted again.
+        std::fs::write(repo.join(REPO_CONFIG_FILENAME), "verify = \"make all\"\n").unwrap();
+        assert!(repo_file_trust(Ok(home.clone()), &repo).unwrap().is_some());
+
+        // A credential-bearing file is a problem, never trusted state.
+        std::fs::write(
+            repo.join(REPO_CONFIG_FILENAME),
+            "dsn = \"postgres://u:p@h/d\"\n",
+        )
+        .unwrap();
+        let problem = repo_file_trust(Ok(home), &repo).unwrap_err();
+        assert!(
+            problem.contains("dsn") && !problem.contains("u:p@"),
+            "{problem}"
+        );
+    }
 
     #[test]
     fn a_human_gate_stop_is_not_repeated_open_or_decided() {

@@ -64,12 +64,12 @@ pub const LOG_PREFIX: &str = "[autopilot]";
 pub const USAGE: &str = "usage: flywheel autopilot [-h] [--tasks-dir TASKS_DIR] [--model MODEL]
                           [--target-depth TARGET_DEPTH] [--interval INTERVAL]
                           [--once] [--activity-file ACTIVITY_FILE] [--pause]
-                          [--resume]";
+                          [--resume] [--policy POLICY]";
 
 const HELP: &str = "usage: flywheel autopilot [-h] [--tasks-dir TASKS_DIR] [--model MODEL]
                           [--target-depth TARGET_DEPTH] [--interval INTERVAL]
                           [--once] [--activity-file ACTIVITY_FILE] [--pause]
-                          [--resume]
+                          [--resume] [--policy POLICY]
 
 Keep the work queue full with verifiable, tier-prioritized tasks. Runs as a
 neverending daemon by default; --once runs a single refill pass and exits.
@@ -90,11 +90,13 @@ options:
                         logs/autopilot/activity.json under $FLYWHEEL_HOME).
   --pause               Hold the running daemon between cycles (writes
                         <activity file>.paused) and exit.
-  --resume              Let a paused daemon run cycles again and exit.";
+  --resume              Let a paused daemon run cycles again and exit.
+  --policy POLICY       Legacy: run on this flywheel.toml work policy instead
+                        of the home project's effective config.";
 
 /// The long options in argparse declaration order (abbreviation matching
 /// reports ambiguities in this order).
-const LONG_OPTIONS: [&str; 9] = [
+const LONG_OPTIONS: [&str; 10] = [
     "--help",
     "--tasks-dir",
     "--model",
@@ -104,6 +106,7 @@ const LONG_OPTIONS: [&str; 9] = [
     "--activity-file",
     "--pause",
     "--resume",
+    "--policy",
 ];
 
 // --- Arguments ------------------------------------------------------------------------
@@ -121,6 +124,8 @@ pub struct AutopilotArgs {
     pub pause: bool,
     /// Remove the pause marker and exit.
     pub resume: bool,
+    /// Legacy: an explicit `flywheel.toml` work policy.
+    pub policy: Option<String>,
     pub help: bool,
 }
 
@@ -278,6 +283,7 @@ pub fn parse_args(argv: &[String]) -> Result<AutopilotArgs, String> {
             }
             "--tasks-dir" => args.tasks_dir = Some(take_value(option, inline, &mut iter)?),
             "--model" => args.model = Some(take_value(option, inline, &mut iter)?),
+            "--policy" => args.policy = Some(take_value(option, inline, &mut iter)?),
             "--activity-file" => {
                 args.activity_file = Some(take_value(option, inline, &mut iter)?);
             }
@@ -1353,7 +1359,21 @@ pub fn run_main(argv: &[String], host: &dyn AutopilotHost) -> i32 {
         }
     };
     let log = make_logger(LOG_PREFIX, stderr.clone());
-    let policy = match load_effective_policy(host.policy_path().as_deref()) {
+    // A pass runs the repo's verify gate through the tasks it lands, so a
+    // daemon run needs a trusted `.flywheel.toml`; pause/resume only flip
+    // the activity record.
+    let access = if args.pause || args.resume {
+        crate::config::Access::ReadOnly
+    } else {
+        crate::config::Access::Execute
+    };
+    let policy_path = args
+        .policy
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| host.policy_path());
+    let policy = match load_effective_policy(policy_path.as_deref(), access) {
         Ok(policy) => policy,
         Err(err) => {
             stderr(&format!("flywheel autopilot: policy error: {err}"));
@@ -1693,6 +1713,8 @@ mod tests {
             "2.5",
             "--activity-file",
             "a.json",
+            "--policy",
+            "p.toml",
         ]))
         .unwrap();
         assert_eq!(
@@ -1706,6 +1728,7 @@ mod tests {
                 activity_file: Some("a.json".into()),
                 pause: false,
                 resume: false,
+                policy: Some("p.toml".into()),
                 help: false,
             }
         );
@@ -1797,7 +1820,9 @@ mod tests {
             "tasks_dir = \"queue\"\n[autopilot]\ntarget_depth = 7\nlanding = \"pr\"\n\
              interval_seconds = 42\n[autopilot.weights]\ntier = 1.5\n",
         );
-        let policy = load_effective_policy(Some(&path)).unwrap().unwrap();
+        let policy = load_effective_policy(Some(&path), crate::config::Access::ReadOnly)
+            .unwrap()
+            .unwrap();
 
         let defaults = resolve_runtime(&AutopilotArgs::default(), None);
         assert_eq!(defaults.tasks_dir, PathBuf::from(DEFAULT_TASKS_DIR));
@@ -1844,13 +1869,17 @@ mod tests {
         );
         let dir = TempDir::new().unwrap();
         let relative = write_policy(dir.path(), "[paths]\ndb = \"state/fw.sqlite\"\n");
-        let policy = load_effective_policy(Some(&relative)).unwrap().unwrap();
+        let policy = load_effective_policy(Some(&relative), crate::config::Access::ReadOnly)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             resolve_daemon_db_path(Some(&policy), repo),
             PathBuf::from("/repo/state/fw.sqlite")
         );
         let absolute = write_policy(dir.path(), "[paths]\ndb = \"/var/fw.sqlite\"\n");
-        let policy = load_effective_policy(Some(&absolute)).unwrap().unwrap();
+        let policy = load_effective_policy(Some(&absolute), crate::config::Access::ReadOnly)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             resolve_daemon_db_path(Some(&policy), repo),
             PathBuf::from("/var/fw.sqlite")

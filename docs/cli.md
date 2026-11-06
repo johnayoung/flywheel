@@ -12,10 +12,11 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Steering verbs | `fw say` / `interrupt` / `approve` / `reject` | Enqueue one control command against a live run |
 | Daemons | `fw worker` / `autopilot` / `triage` | Drain the queue (worker), keep it full (autopilot), or triage the intake board (triage) |
 | Audit | `fw audit RUN_ID` | Stream the totally-ordered telemetry for one run |
-| Setup | `fw init` | Scaffold `.flywheel/` and a `flywheel.toml` work policy |
+| Setup | `fw init` | Scaffold the legacy `.flywheel/` and `flywheel.toml` (not read by default; see [configuration.md](configuration.md#legacy-layout)) |
 | Hub | `fw hub` server: `start` / `stop` / `upgrade` / `status` / `logs` / `serve` / `install-service` / `doctor`; access: `open` / `url` / `token` / `tls` / `peer` / `machine` / `share`; sessions: `ls` / `new` / `send` / `read` / `wait` / `attach` / `kill` / `relaunch` / `explain` / `import` / `template` / `queue` / `broadcast` / `conversations` / `account`; output: `commands` / `search` / `activity` / `digest` / `record`; git: `review` / `merge` / `pr` / `handoff` / `ask-review` / `fanout` / `autopilot`; settings: `config` / `plugin` / `perms`; hooks only: `report` | Web workspace of server-owned agent terminals (see [hub.md](hub.md)) |
 | One-shot | `fw exec [PROMPT]` | Run one agent call from any project: no tasks, store, worktree, or config |
 | Projects | `fw project ls [--json]` / `prune` / `relink [PATH]` | The home's project registry (see [Projects and the home](#projects-and-the-home)) |
+| Config | `fw config [--json]` / `fw trust [--revoke]` | The effective config with sources; approve the repo's `.flywheel.toml` (see [Config and trust](#config-and-trust)) |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.
 
@@ -35,20 +36,30 @@ The router (`route`, `crates/flywheel/src/cli.rs`) dispatches by the first argv 
 
 ### Resolution precedence
 
-Every delegated verb resolves its inputs the same way: **explicit flag wins, then `flywheel.toml` policy, then the home project's built-in default.** With no `flywheel.toml`, every default lives under `$FLYWHEEL_HOME/projects/<id>/` (see [Projects and the home](#projects-and-the-home)); a directory outside a git repo is refused unless explicit flags name every path the verb reads.
+Every delegated verb resolves its inputs the same way: **explicit flag wins, then the effective config ([Config and trust](#config-and-trust)), then the home project's built-in default.** Every default lives under `$FLYWHEEL_HOME/projects/<id>/` (see [Projects and the home](#projects-and-the-home)); a directory outside a git repo is refused unless explicit flags name every path the verb reads. A repo's own `flywheel.toml` / `.flywheel/` is never read: one stderr notice says it is ignored and can be deleted.
 
-| Input | Explicit flag | Policy key | Built-in default | Anchor |
-|---|---|---|---|---|
-| Policy | `--policy FILE` | auto-detect `flywheel.toml` in cwd, else the nearest parent (re-anchors cwd there) | the home project (re-anchors cwd at the worktree top level) | `load_effective_policy` |
-| DB path | `--db PATH` | `[paths] db` | `$FLYWHEEL_HOME/projects/<id>/flywheel.sqlite` | `resolve_db_path` |
-| Work source | `--tasks-dir DIR` (forces directory source) | `[source]` (directory or github) | `$FLYWHEEL_HOME/projects/<id>/tasks` | `resolve_work_source` |
-| Worktree root | `--sandbox-root` (worker) | `[paths] sandbox_root` | `$FLYWHEEL_HOME/projects/<id>/worktrees` | `resolve_sandbox_root` |
+| Input | Explicit flag | Built-in default | Anchor |
+|---|---|---|---|
+| Policy | `--policy FILE` (legacy format, loaded as-is) | the home project + effective config (re-anchors cwd at the worktree top level) | `load_effective_policy` |
+| DB path | `--db PATH` | `$FLYWHEEL_HOME/projects/<id>/flywheel.sqlite` (or the `store` DSN) | `resolve_db_path` |
+| Work source | `--tasks-dir DIR` (forces directory source) | `$FLYWHEEL_HOME/projects/<id>/tasks` | `resolve_work_source` |
+| Worktree root | `--sandbox-root` (worker) | `$FLYWHEEL_HOME/projects/<id>/worktrees` | `resolve_sandbox_root` |
 
-Logs (`logs/runs/`, `logs/worker/`, `logs/autopilot/`) and the merge lock sit beside the store in the project dir. A repo with a `flywheel.toml` keeps the in-repo `.flywheel/` defaults for keys it leaves unset.
+Logs (`logs/runs/`, `logs/worker/`, `logs/autopilot/`) and the merge lock sit beside the store in the project dir.
 
 Anchors are in `crates/flywheel-orchestrator/src/workflow/mod.rs`.
 
-The Postgres DSN is never stored in `flywheel.toml`. It is read only from the environment: `FLYWHEEL_PG_DSN`, falling back to `DATABASE_URL` (`resolve_postgres_dsn`, `crates/flywheel-orchestrator/src/store_factory.rs`). See [configuration.md](configuration.md) for the full policy schema.
+The Postgres DSN comes from `store` in your user/personal `config.toml` or `FLYWHEEL_PG_DSN`, never a committed file. See [configuration.md](configuration.md).
+
+## Config and trust
+
+| Verb | What it does |
+|---|---|
+| `config [--json]` | The effective config of the cwd project: `model`, `concurrency`, `store`, `transcript_retention_days`, `verify`, `protected_paths`, `land`, `project_id`, each with its source (`default`/`user`/`repo`/`personal`/`env`/`flag`). `--json`: `{key: {"value", "source"}}`, DSN password as `***`. `--model` / `--concurrency` preview a flag. Exit 2 on an invalid config file (the error names the key). |
+| `trust` | Approve the cwd repo's `.flywheel.toml` as it is now (printed first when stdin is a terminal), keyed by the local project id and the file's sha256 in `$FLYWHEEL_HOME/trust.json`. Exit 1 when there is no file. |
+| `trust --revoke` | Remove every approval of the cwd project. |
+
+An unapproved repo file: `worker`, `autopilot`, `archive`, and the console refuse unattended (stdin not a TTY) with `cd <repo> && fw trust`, or prompt once `[y/N]` on a TTY; read-only verbs warn once and ignore it. Editing the file revokes approval.
 
 ## Projects and the home
 
@@ -134,9 +145,10 @@ The blessed headless drain, delegated in-process to the worktree daemon (`main`,
 | Flag | Controls |
 |---|---|
 | `--once` | single drain cycle, no daemon loop |
-| `--tasks-dir`, `--db`, `--policy` | standard resolution inputs |
-| `--sandbox-root` | worktree root (overrides `[paths] sandbox_root`); accepts a path or the `@cache`/`@sibling` tokens (see [configuration.md](configuration.md)) |
-| `--model` | agent model (overrides `[agent] model`) |
+| `--tasks-dir`, `--db` | standard resolution inputs |
+| `--policy FILE` | legacy: run on this `flywheel.toml` instead of the effective config (no trust check) |
+| `--sandbox-root` | worktree root; accepts a path or the `@cache`/`@sibling` tokens (see [configuration.md](configuration.md)) |
+| `--model` | agent model (overrides `model`) |
 | `--max-turns`, `--max-retries` | per-run ceilings |
 | `--worker-id` | identity stamped on claims |
 | `--lease-seconds` | claim lease window (default 300) |
@@ -159,6 +171,7 @@ Keeps the work queue full with verifiable, tier-prioritized tasks. Delegated to 
 |---|---|
 | `--once` | one refill pass then exit |
 | `--tasks-dir`, `--model` | standard inputs |
+| `--policy FILE` | legacy: run on this `flywheel.toml` instead of the effective config |
 | `--target-depth N` | fill the queue to depth N (overrides `[autopilot]` config; default 5) |
 | `--interval SECONDS` | daemon cycle interval (overrides config; default 300.0) |
 | `--pause` / `--resume` | write / remove `<activity file>.paused` and exit: a running daemon holds between cycles (phase `paused`, still live) until resumed |
@@ -205,8 +218,8 @@ The console fails fast on a missing store before launching (a home project's sto
 
 | Flag | Controls |
 |---|---|
-| `--db PATH` | store path (default policy `[paths] db` else the home project's `flywheel.sqlite`) |
-| `--policy FILE` | work-policy file (default `flywheel.toml` if present) |
+| `--db PATH` | store path (default the home project's `flywheel.sqlite`) |
+| `--policy FILE` | legacy work-policy file (never auto-detected) |
 | `--tasks-dir DIR` | tasks root for summary counts and `/archive` |
 | `--json` | print one JSON snapshot and exit (implied off a non-TTY) |
 | `--poll-interval FLOAT` | dashboard poll cadence (default 1.0s) |
@@ -266,9 +279,9 @@ The compose box doubles as input: plain text is a `say`; a leading `/` is a slas
 
 ### Worker and autopilot supervisors
 
-`WorkerSupervisor` (`crates/flywheel/src/worker_supervisor.rs`) spawns `<console binary> worker --db <path> [--tasks-dir ..] [--model ..]` in a new session (`setsid`), so a console Ctrl-C never reaches the child; only `stop` signals it (SIGTERM to the process group, 10s wait, then SIGKILL). It reads `task_claims` to detect liveness: a live lease this console did not spawn shows as DETACHED. Spawn logs land under the project's `logs/worker/` (`.flywheel/logs/worker/` for a `flywheel.toml` repo).
+`WorkerSupervisor` (`crates/flywheel/src/worker_supervisor.rs`) spawns `<console binary> worker --db <path> [--tasks-dir ..] [--model ..]` in a new session (`setsid`), so a console Ctrl-C never reaches the child; only `stop` signals it (SIGTERM to the process group, 10s wait, then SIGKILL). It reads `task_claims` to detect liveness: a live lease this console did not spawn shows as DETACHED. Spawn logs land under the project's `logs/worker/` (beside the store for a `--policy` file).
 
-`AutopilotSupervisor` (`crates/flywheel/src/autopilot_supervisor.rs`) spawns `<console binary> autopilot [--tasks-dir ..] [--model ..] [--activity-file ..]` without `--once` (the neverending daemon). It writes no lease; liveness rides on the daemon's activity record (pid + `expires_at`), so a live daemon this console did not spawn is adopted as DETACHED and a stale record reads as not-live. Logs land under the project's `logs/autopilot/` (`.flywheel/logs/autopilot/` for a `flywheel.toml` repo). Same spawn/detach/stop shape, independent of the worker.
+`AutopilotSupervisor` (`crates/flywheel/src/autopilot_supervisor.rs`) spawns `<console binary> autopilot [--tasks-dir ..] [--model ..] [--activity-file ..]` without `--once` (the neverending daemon). It writes no lease; liveness rides on the daemon's activity record (pid + `expires_at`), so a live daemon this console did not spawn is adopted as DETACHED and a stale record reads as not-live. Logs land under the project's `logs/autopilot/`. Same spawn/detach/stop shape, independent of the worker.
 
 ## Slash commands
 
@@ -291,7 +304,7 @@ An unknown verb leaves the typed line populated for editing rather than erroring
 
 ## `init`
 
-Scaffolds `.flywheel/` and a `flywheel.toml` work policy (`cmd_init`, `crates/flywheel-orchestrator/src/workflow/init.rs`). When a Dockerfile or Containerfile sits at the repo root, it also appends `.flywheel/` to `.dockerignore` (`ensure_dockerignore_covers_flywheel`) — docker build contexts do not read `.gitignore`. Idempotent: existing files are left untouched and reported.
+Legacy: scaffolds `.flywheel/` and a `flywheel.toml` work policy, which verbs read only through an explicit `--policy flywheel.toml` (`cmd_init`, `crates/flywheel-orchestrator/src/workflow/init.rs`). When a Dockerfile or Containerfile sits at the repo root, it also appends `.flywheel/` to `.dockerignore` (`ensure_dockerignore_covers_flywheel`) — docker build contexts do not read `.gitignore`. Idempotent: existing files are left untouched and reported.
 
 **Git preflight is a hard gate.** Before any file is written, `init` refuses (exit 2, nothing scaffolded) when the cwd is not a git repo or HEAD is detached (`init_git_preflight_error`). The state `init` produces must be one the worker's own preconditions accept.
 

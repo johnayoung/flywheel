@@ -183,6 +183,10 @@ pub enum PolicyError {
     /// could not be resolved (not a git repo, unusable home, ...).
     #[error("{0}")]
     Project(#[from] crate::home::ProjectError),
+    /// The effective config (user / repo / personal files, trust) could
+    /// not be loaded, or an untrusted repo file was refused.
+    #[error("{0}")]
+    Config(#[from] crate::config::ConfigError),
 }
 
 /// `[sandbox.exec]` -- bash command isolation (SDK `sandbox` option).
@@ -578,6 +582,12 @@ pub struct WorkPolicy {
     /// for a policy loaded from a file. Never serialized.
     #[serde(skip)]
     pub project: Option<ProjectBinding>,
+    /// The postgres DSN the effective config selected (`store =
+    /// "postgres://..."`, or `FLYWHEEL_PG_DSN`); `None` lets a postgres
+    /// backend resolve its DSN from the environment. Never serialized, and
+    /// its `Debug` form is redacted.
+    #[serde(skip)]
+    pub store_dsn: Option<crate::store_registry::Dsn>,
 }
 
 /// The home project a synthesized policy is bound to.
@@ -653,6 +663,7 @@ impl Default for WorkPolicy {
             triage_interval_seconds: DEFAULT_TRIAGE_INTERVAL_SECONDS,
             triage_max_per_pass: None,
             project: None,
+            store_dsn: None,
         }
     }
 }

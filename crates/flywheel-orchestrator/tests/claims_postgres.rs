@@ -161,6 +161,7 @@ fn two_claimants_through_the_factory_split_every_task_exactly_once() {
         backend: POSTGRES_BACKEND.to_owned(),
         db_path: db_path.clone(),
         schema: Some(schema.clone()),
+        dsn: None,
     };
     let store_a = build_claim_store(&registries, &config, &environ).unwrap();
     let store_b = build_claim_store(&registries, &config, &environ).unwrap();
@@ -731,6 +732,7 @@ fn open_stores_routes_both_families_onto_one_postgres_schema() {
         backend: POSTGRES_BACKEND.to_owned(),
         db_path: db_path.clone(),
         schema: Some(schema.clone()),
+        dsn: None,
     };
     preflight_store(&registries, &config, &environ).unwrap();
     let bundle = open_stores(&registries, &config, &environ).unwrap();

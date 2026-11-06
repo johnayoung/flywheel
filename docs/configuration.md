@@ -1,63 +1,70 @@
-# Configuration (flywheel.toml)
+# Configuration
 
-A single `flywheel.toml` at the repo root is the consumer repo's versioned contract with the orchestrator: where work comes from, what "runnable" means by default, and how finished work lands. Switching a project between a task directory and an issue tracker is a committed config change, not a flywheel code change.
+Flywheel reads three TOML files and one environment variable; the repo needs none of them. Every key below is everything a user can set -- each other knob is a built-in default.
 
-**No `flywheel.toml` is required.** Without one, every store verb runs against the cwd repo's home project: the built-in policy (`home_project_policy`, `crates/flywheel-orchestrator/src/workflow/mod.rs`) points the store, tasks dir, and worktree root at `$FLYWHEEL_HOME/projects/<id>/` (default `~/.flywheel`); see [cli.md](cli.md#projects-and-the-home). A present `flywheel.toml` is still honored, and its unset `[paths]`/`tasks_dir` keys keep the in-repo `.flywheel/` defaults below.
+| File | Who writes it | Keys |
+|------|---------------|------|
+| `$FLYWHEEL_HOME/config.toml` (default `~/.flywheel`) | you, once per machine (**user**) | all eight |
+| `<repo top-level>/.flywheel.toml` | the team, committed (**repo**); applies only after `fw trust` | `verify`, `protected_paths`, `land`, `project_id` |
+| `$FLYWHEEL_HOME/projects/<id>/config.toml` | you, per project, never in the repo (**personal**) | all eight |
 
-One module owns the whole surface: `load_policy` (`crates/flywheel-orchestrator/src/policy.rs`) parses the file with the `toml` crate into an immutable `WorkPolicy`. Every key is validated there, every default lives there.
+**Precedence:** CLI flag > env > personal > repo > user > built-in default. `fw config [--json]` prints every key with the layer it came from.
 
-## Precedence and validation
+**Strict:** any other key -- including every old `flywheel.toml` section (`[sandbox]`, `[submit]`, `[source]`, ...) -- is an error naming it, exit non-zero. The loader is `crates/flywheel-orchestrator/src/config.rs`.
 
-- **Precedence**: an explicit CLI flag wins over the file, the file wins over the built-in (home project) default. The read commands (`status`, `live`, `worker`, `autopilot`, ...) auto-detect `flywheel.toml` in the cwd, else the nearest parent directory, re-anchoring the process there (`load_effective_policy`, `crates/flywheel-orchestrator/src/workflow/mod.rs`); `--policy` overrides the path, and an explicit `--tasks-dir`/`--db`/`--sandbox-root`/`--model` always beats the file.
-- **Strict on values, lenient on keys**: a wrong-typed or out-of-enum value fails fast with a `PolicyError` that names the offending file and key — a typo never silently degrades behavior. Unknown *keys* under a known table, and unknown *section* tables, are ignored for forward-compatibility.
-- **`[source]` is the only required table.** Its absence raises `PolicyError` "missing required `[source]` table". Every other section is optional; an absent section yields a back-compat default so a pre-existing file keeps loading unchanged.
-- **Credentials and DSNs never live in the file.** Postgres DSNs, API tokens, and OAuth tokens are read from named environment variables only (see [Environment variables](#environment-variables)). Config carries env var *names*, never values.
+## Keys
 
-## Sections at a glance
+| Key | Type | Default | Maps onto |
+|-----|------|---------|-----------|
+| `model` | string | unset (the agent CLI's own default; `null` in `fw config`) | the agent model (`--model` wins) |
+| `concurrency` | int >= 1 | `1` | worker pool size (`--concurrency` wins) |
+| `store` | `"sqlite"` or a `postgres://` / `postgresql://` DSN | `"sqlite"` (`projects/<id>/flywheel.sqlite`) | the store backend; one Postgres DSN serves every project |
+| `transcript_retention_days` | int >= 1 | `90` | transcript body retention |
+| `verify` | string (shell) | unset (no gate) | BOTH the standing submit gate (re-run under the merge lock before every landing) and the phase-exit gate; `""` disables a lower layer's command |
+| `protected_paths` | list of globs | `[]` | paths a finished branch may not touch (`**` crosses dirs; `*`, `?` do not); a match parks the work |
+| `land` | `"merge"` or `"pr"` | `"merge"` | the submit strategy |
+| `project_id` | UUID | the id in the repo's `.git/config` | which `projects/<id>/` dir (and Postgres partition) the repo uses -- a committed value lets a team share one |
 
-| Section | Required | Purpose | Deep dive |
-|---------|----------|---------|-----------|
-| `[source]` | yes | where work comes from (kind + per-kind settings) | [work-sources.md](work-sources.md) |
-| `[paths]` | no | where runtime state lives (db, sandbox root) | this doc |
-| `[agent]` | no | agent model id | this doc |
-| `[[defaults.graders]]` | no | default graders for tracker work items | [task-schema.md](task-schema.md) |
-| `[store]` | no | persistence backend (sqlite/postgres) | this doc |
-| `[execution]` | no | mode (local/distributed) + advertised capabilities | [orchestration.md](orchestration.md) |
-| `[worker]` | no | worker pool size (concurrency), checkpoint-nudge threshold, session-pause ceiling | this doc |
-| `[submit]` | no | how DONE work lands (strategy, protected paths) | [strategy.md](strategy.md) |
-| `[phase]` | no | phase-exit verify gate | this doc |
-| `[held_out]` | no | execute-time held-out landing gate | [held-out-gate.md](held-out-gate.md) |
-| `[autopilot]` | no | intake-daemon cadence + scoring weights | [autopilot.md](autopilot.md) |
-| `[triage]` | no | triage-daemon board labels + cadence + per-pass cap | this doc |
-| `[deadlines]` | no | default-on wall-clock ceilings for the five external-call classes | this doc |
-| `[sandbox.*]` | no | provisioning + the agent's execution environment | [sandbox.md](sandbox.md) |
+Env: `FLYWHEEL_PG_DSN` sets `store` (source `env`). Flags: `--model`, `--concurrency` (source `flag`; `fw config` accepts both to preview).
 
-The main axes and what each selects — the "how config changes the path" view:
+```toml
+# ~/.flywheel/config.toml
+model = "claude-opus-4-8"
+concurrency = 2
+store = "postgres://fw:secret@db.internal:5432/flywheel"
 
-```mermaid
-flowchart LR
-    CFG["flywheel.toml"] --> SRC["[source] kind"]
-    SRC --> SRCd["directory: task JSON files"]
-    SRC --> SRCg["github / github_ci / github_review: tracker issues and PRs"]
-    CFG --> ST["[store] backend"]
-    ST --> STs["sqlite (default)"]
-    ST --> STp["postgres (required for execution.mode = distributed)"]
-    CFG --> SBX["[sandbox] backend"]
-    SBX --> SBw["worktree (default): a git worktree per task"]
-    SBX --> SBc["container: Docker via the flywheel-container crate"]
-    CFG --> SUB["[submit]"]
-    SUB --> STR{"strategy"}
-    STR --> SM["merge (default): FF-merge in-tree, full autonomy"]
-    STR --> SP["pr: push and open a PR, review owns the merge"]
-    SUB --> BASE{"base set?"}
-    BASE -->|unset| BU["land onto the checked-out branch"]
-    BASE -->|set| BS["land out-of-tree onto a separate integration branch"]
-    SUB --> VER["verify: standing build gate (land only if it passes)"]
+# <repo>/.flywheel.toml (committed)
+verify = "scripts/check.sh"
+protected_paths = [".github/**", ".flywheel.toml"]
+land = "pr"
 ```
 
-See [strategy.md](strategy.md) for the full landing decision tree these `[submit]` keys drive.
+`fw config --json` (pinned shape): an object with exactly the eight keys, each `{"value": <value or null>, "source": "default|user|repo|personal|env|flag"}`. A DSN's password prints as `***`.
 
-## `[source]` (required)
+## The repo file and trust
+
+`.flywheel.toml` is committed, so it can make every clone run `verify`. It is honored only after approval:
+
+- **Credentials are refused at load**, naming the key and never echoing the value: a key named `store`, any key whose name contains `dsn`, `password`, `passwd`, `token`, or `secret` (case-insensitive, at any depth), a url/uri-named key whose value holds `scheme://user@...`, or any string value holding `scheme://user:password@...`.
+- **Trust** lives in `$FLYWHEEL_HOME/trust.json`, keyed by (the LOCAL project id from `.git/config`, sha256 of the file's bytes). Editing the file revokes it; the file's own `project_id` never picks its trust key. Code: `crates/flywheel-orchestrator/src/trust.rs`.
+- `fw trust` approves the current bytes (showing the file and what it runs when stdin is a terminal); `fw trust --revoke` drops every approval of the project.
+- **Untrusted, executing verbs** (`worker`, `autopilot`, `archive`, the console, hub-launched runs): stdin not a TTY -> refuse, exit non-zero, print `cd <repo> && fw trust`; stdin a TTY -> show the file, prompt once `[y/N]`, record on yes.
+- **Untrusted, read-only verbs** (`status`, `config`, `history`, `show`, ...): one warning line, then run as if the file were absent.
+- The hub's Flywheel panel shows the untrusted state and the exact command.
+
+## Legacy layout
+
+A repo's `flywheel.toml` and `.flywheel/` are **not read**. When either is present, every verb prints one notice that it is ignored and can be deleted, and changes nothing in the repo tree. State lives under `$FLYWHEEL_HOME/projects/<id>/`; see [cli.md](cli.md#projects-and-the-home).
+
+Every old `WorkPolicy` setting without a key above runs at its built-in default (`WorkPolicy::default`, `crates/flywheel-orchestrator/src/policy.rs`): `directory` source over `projects/<id>/tasks`, worktrees under `projects/<id>/worktrees`, no default graders, `[execution] mode = "local"`, `[worker]` nudge 300s / pause ceiling 6h, `[submit]` remote `origin` / no `base` / no tiers / recovery rung 30 turns, 900s, no `[held_out]` gate, `[sandbox]` preset `fast` on the `worktree` backend, `[deadlines]` defaults, `[autopilot]` depth 5 / 300s / weights default, `[triage]` default labels.
+
+**`--policy FILE` (legacy, removed later):** `status`, `live`, `history`, `show`, `archive`, `recover`, `resolve`, `recheck-blocked`, `validate`, `worker`, `autopilot`, and the console still accept an explicit old-format policy file, loaded as-is (no effective config, no trust); `--db` / `--tasks-dir` still name paths directly. The reference below documents that format only for `--policy`.
+
+## Legacy policy file reference (`--policy FILE` only)
+
+Precedence inside a `--policy` file: an explicit CLI flag wins over the file, the file over the built-in default. Values are strict (a wrong type or enum fails naming the file and key); unknown keys and sections are ignored. `[source]` is the only required table. Postgres DSNs come from the environment, never the file.
+
+### `[source]` (required)
 
 Where work comes from. `kind` selects the `WorkSource` backend; the remaining keys are per-kind. See [work-sources.md](work-sources.md) for each kind's listing/grading behavior.
 
@@ -72,7 +79,7 @@ Where work comes from. `kind` selects the `WorkSource` backend; the remaining ke
 
 `github_review` lists unresolved PR review threads; its grade is the policy's `[[defaults.graders]]` run out-of-band, never the thread's `isResolved` state.
 
-## `[paths]` (optional)
+### `[paths]` (optional)
 
 Where runtime state lives. When a key is unset the CLI falls back to its built-in default.
 
@@ -88,7 +95,7 @@ Where runtime state lives. When a key is unset the CLI falls back to its built-i
 
 Both `flywheel worker` and `flywheel orchestrate` honor the key; `--sandbox-root` overrides it. When the resolved root differs from the legacy `.flywheel/worktrees`, the worker's retention sweep also covers the legacy directory while it exists, so worktrees created before a relocation still age out. An out-of-tree root stays out of docker build contexts by construction; for the default nested root, `flywheel init` appends `.flywheel/` to `.dockerignore` when a Dockerfile is present (docker does not read `.gitignore`).
 
-## `[agent]` (optional)
+### `[agent]` (optional)
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
@@ -98,7 +105,7 @@ Both `flywheel worker` and `flywheel orchestrate` honor the key; `--sandbox-root
 
 Values are opaque: flywheel maintains no allowlist. Model resolution precedence is `--model` flag > `[agent] model` > the agent CLI's own default (`resolve_model`, `crates/flywheel-worktree/src/daemon.rs`). An empty or whitespace-only string raises `PolicyError`, as does `transport` without `id`. An unknown `id` fails at run time with the registered adapter set in the message. See [agent-harness.md](agent-harness.md) for the multi-agent architecture.
 
-## `[[defaults.graders]]` (optional)
+### `[[defaults.graders]]` (optional)
 
 Default grader policy, parsed as the standard `Grader` array via `load_graders` (`crates/flywheel-core/src/loaders.rs`). See [task-schema.md](task-schema.md) for the `Grader` shape.
 
@@ -110,7 +117,7 @@ type = "command"
 run = "cargo test --workspace"
 ```
 
-## `[store]` (optional)
+### `[store]` (optional)
 
 Persistence backend. An absent section means `sqlite`.
 
@@ -121,7 +128,7 @@ Persistence backend. An absent section means `sqlite`.
 
 The Postgres DSN is never configured here; it comes from the environment (see below).
 
-## `[execution]` (optional)
+### `[execution]` (optional)
 
 Distribution and capability matching. See [orchestration.md](orchestration.md).
 
@@ -132,7 +139,7 @@ Distribution and capability matching. See [orchestration.md](orchestration.md).
 
 **`mode = "distributed"` requires `store.backend = "postgres"` or `load_policy` raises**. That postgres requirement is `mode`'s *only* runtime effect: `execution_mode` is a pure load-time validation assertion — it is never read by any scheduler/claim/lease code path, so it does not itself change how work is scheduled, claimed, or leased. `capabilities` is the *worker's* advertised set: the scheduler offers this worker only items whose `required_capabilities` is a subset of it. This is distinct from `[sandbox.capabilities]`, which is the *agent's* tool/skill/MCP surface inside the sandbox.
 
-## `[worker]` (optional)
+### `[worker]` (optional)
 
 Worker pool size, checkpoint-nudge threshold, and session-pause ceiling for a single `flywheel worker` invocation.
 
@@ -148,7 +155,7 @@ Worker pool size, checkpoint-nudge threshold, and session-pause ceiling for a si
 
 `session_pause_ceiling_seconds` is **default-on** (21600.0 = 6h): when any run surfaces a structural session-limit reset (the harness's `HarnessOutcome.session_limit_reset`, never parsed from an error string), the orchestrator records a pause behind the shared claim store with `pause_until = min(reset, now + ceiling)`. While that horizon is in the future, **every** driver against the same claim store (in-memory, SQLite, or Postgres) declines fresh and resume claims pool-wide — bookkeeping (lease sweeps, reconcile, redrives, snapshots) is unaffected — and claiming resumes on its own once it passes. The ceiling bounds how long one derived reset can hold the pool off claiming, so a far-future reset never yields an unbounded pause; a reset already in the past never records a pause. Each pause is a queryable ledger row plus a stream log line naming `pause_until` and its cause. `0` disables pausing entirely (today's behavior byte-for-byte).
 
-## `[submit]` (optional)
+### `[submit]` (optional)
 
 How DONE work leaves the loop. An absent table means historical merge landing. See [strategy.md](strategy.md) for the shipped strategies and the protected-paths contract.
 
@@ -169,7 +176,7 @@ How DONE work leaves the loop. An absent table means historical merge landing. S
 
 `recovery_agent_max_turns` / `recovery_agent_max_wall_seconds` arm the `merge` strategy's last recovery rung (spec 00077): when FF, rebase, and the merge-fallback all hit a textual conflict, a single bounded agent session resolves the conflict markers and stages the result. The resolved tree lands only after re-running the task's command graders, `[submit] verify`, and the declared held-out gate — the same out-of-band bar every other land clears; any failure parks the run preserved with the session's turn/wall usage recorded on the ledger. A land from this rung records `rung="agent-resolved"`. Both bounds are wrong-type / out-of-range validated at load (a bad value raises `PolicyError` naming the key) so a typo never silently disables or unbounds the rung. Setting `recovery_agent_max_turns = 0` keeps the historical merge-conflict park.
 
-### `[[submit.tiers]]` (optional, spec 00080)
+#### `[[submit.tiers]]` (optional, spec 00080)
 
 Risk-tiered landing: route each DONE task by the highest tier its changed files classify at, instead of one repo-global strategy. Array of tables, each with exactly `tier` and `paths`:
 
@@ -190,7 +197,7 @@ paths = ["scripts/**"]
 - Each decision is recorded on the run's ledger (`LandingRouted`: per-file tiers, winning tier, strategy).
 - Absent: landing is byte-identical to `[submit] strategy`.
 
-## `[phase]` (optional)
+### `[phase]` (optional)
 
 | Key | Type | Default | Controls |
 |-----|------|---------|----------|
@@ -198,7 +205,7 @@ paths = ["scripts/**"]
 
 Consumed by the phase-archive gate (`ArchiveOptions::phase_verify`, `crates/flywheel-worktree/src/phase.rs`) and the phase-PR publisher (`crates/flywheel-worktree/src/pr.rs`). Unset means today's archival behavior with no gate.
 
-## `[held_out]` (optional)
+### `[held_out]` (optional)
 
 Execute-time held-out landing gate. See [held-out-gate.md](held-out-gate.md).
 
@@ -208,7 +215,7 @@ Execute-time held-out landing gate. See [held-out-gate.md](held-out-gate.md).
 
 **There is deliberately no default `root`.** Unset means the worker builds no held-out source and landing is byte-identical to today; a default would silently activate gating on upgrade. A relative `root` resolves against the repo root (`build_held_out_source`, `crates/flywheel-worktree/src/daemon.rs`). A set `root` must be an existing directory: the worker refuses to start if it is missing, and the gate fails closed if it disappears mid-run. Exception: the conventional `.flywheel/verification/held-out` (git-ignored, so absent from a fresh clone) is created empty at worker start when missing.
 
-## `[autopilot]` and `[autopilot.weights]` (optional)
+### `[autopilot]` and `[autopilot.weights]` (optional)
 
 Intake-daemon cadence and the score-axis weights. See [autopilot.md](autopilot.md) for the tier hierarchy and weighted scoring model.
 
@@ -233,7 +240,7 @@ Intake-daemon cadence and the score-axis weights. See [autopilot.md](autopilot.m
 
 The autopilot CLI flags `--target-depth`/`--interval`/`--model` override the corresponding `[autopilot]` keys (`resolve_runtime`, `crates/flywheel-orchestrator/src/autopilot_run.rs`).
 
-## `[triage]` (optional)
+### `[triage]` (optional)
 
 Board labels and cadence for the `flywheel triage` intake daemon (`fw triage`). The intake label defaults to the github source's own default label (`flywheel`), so the board triage reads is the board the worker drains. A malformed value exits 2 before the engine is built or any `gh` call is issued.
 
@@ -247,7 +254,7 @@ Board labels and cadence for the `flywheel triage` intake daemon (`fw triage`). 
 
 The triage CLI flags `--interval`/`--model` override the corresponding `[triage]`/`[agent]` keys.
 
-## `[deadlines]` (optional)
+### `[deadlines]` (optional)
 
 Default-on, per-class wall-clock ceilings (seconds) for the five external-call classes flywheel issues (spec 00066, `crates/flywheel-core/src/deadline_config.rs`). **Every class ships a finite default; set a key to `0` to opt that class out (unbounded).** TOML has no null, so `0` is the on-disk spelling of the unbounded opt-out — an omitted key keeps its default, leaving a pre-existing file byte-identical.
 
@@ -261,7 +268,7 @@ Default-on, per-class wall-clock ceilings (seconds) for the five external-call c
 
 Consumed only by those three layers; a negative, non-finite, or out-of-range (past ~1.8e19) value resolves to the same unbounded opt-out as `0`. Every other seconds-valued knob in this file rejects a value outside the `Duration` range (`inf`, `nan`, past ~1.8e19) at load. A task's own `budgets` object (see [task-schema.md](task-schema.md)) overrides `agent_iteration_seconds` and `rubric_judge_seconds` for that task alone — the heavyweight tail declares its ceiling per task instead of the repo loosening a class-wide one.
 
-## `[sandbox.*]`
+### `[sandbox.*]`
 
 The `[sandbox]` table configures provisioning and the agent's execution environment. The top-level flat keys are below; the full per-subtable reference (`exec`, `capabilities`, `network`, `env`, `limits`, `retention`, `container`) and the named presets live in [sandbox.md](sandbox.md).
 
@@ -282,19 +289,20 @@ The `[sandbox]` table configures provisioning and the agent's execution environm
 
 ## Environment variables
 
-Secrets and connection strings live in the environment, never in `flywheel.toml`.
+Secrets live in the environment or your user `config.toml`, never in a committed file.
 
 | Variable | Used for | Notes |
 |----------|----------|-------|
-| `FLYWHEEL_PG_DSN` | Postgres DSN (primary) | `resolve_postgres_dsn` (`crates/flywheel-orchestrator/src/store_factory.rs`); wins over `DATABASE_URL`. An empty value is treated as unset so a stray `export FLYWHEEL_PG_DSN=` cannot select an empty DSN |
-| `DATABASE_URL` | Postgres DSN (fallback) | used only when `FLYWHEEL_PG_DSN` is unset |
+| `FLYWHEEL_HOME` | the flywheel home | default `~/.flywheel` |
+| `FLYWHEEL_PG_DSN` | Postgres DSN | sets the effective `store` (source `env`, above personal/repo/user); under a legacy `--policy` it is the primary DSN (`resolve_postgres_dsn`, `crates/flywheel-orchestrator/src/store_factory.rs`). An empty value is treated as unset |
+| `DATABASE_URL` | Postgres DSN (fallback) | legacy `--policy` postgres only, when `FLYWHEEL_PG_DSN` is unset |
 | `FLYWHEEL_DB` | SQLite store path fallback | fallback for the audit stream's `--db` when invoked without the shell's policy resolution (`resolve_db_path`, `crates/flywheel-core/src/audit.rs`); empty value treated as unset |
 | `ANTHROPIC_API_KEY` | raw API-key auth for the agent | `crates/flywheel-container/src/auth.rs`; in `api_key` container auth mode the token is read from this name |
 | `PGSSLMODE`, `PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY` | Postgres TLS defaults | used only when the DSN omits the matching keyword |
 
 Postgres TLS follows libpq: `sslmode` defaults to `prefer`; `verify-ca`/`verify-full` need `sslrootcert` (a PEM file, `~/.postgresql/root.crt`, or `system` for the platform store, which forces `verify-full`). Example: `postgresql://u:p@db.example.com/app?sslmode=verify-full&sslrootcert=system`.
 
-## What `flywheel init` scaffolds
+### What `flywheel init` scaffolds (legacy)
 
 `flywheel init` writes only a thin subset of the surface (`render_init_policy`, `crates/flywheel-orchestrator/src/workflow/init.rs`). It is idempotent and never overwrites a non-managed file. See [cli.md](cli.md) for the full init flag list.
 

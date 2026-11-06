@@ -18,7 +18,9 @@ A Cargo workspace of seven crates under `crates/`, each with its source in `crat
 
 Cross-task concepts (prerequisites/DAG, scheduling, claims) live in the orchestrator, never in core. When adding to core, ask: would a single `run_task(task, lifecycle, store)` invocation — one task, no scheduler — need it? If not, it belongs above the line.
 
-The flywheel home (`$FLYWHEEL_HOME`, default `~/.flywheel`) and project identity (`flywheel.projectid` in the repo's `.git/config`) live in `crates/flywheel-orchestrator/src/home.rs`, the single source for every home path; `flywheel-hub` mirrors only its default state dir (`$FLYWHEEL_HOME/hub`), pinned by a test in the `flywheel` crate. Without a `flywheel.toml`, store verbs default to `$FLYWHEEL_HOME/projects/<id>/`.
+The flywheel home (`$FLYWHEEL_HOME`, default `~/.flywheel`) and project identity (`flywheel.projectid` in the repo's `.git/config`) live in `crates/flywheel-orchestrator/src/home.rs`, the single source for every home path; `flywheel-hub` mirrors only its default state dir (`$FLYWHEEL_HOME/hub`), pinned by a test in the `flywheel` crate. Store verbs default to `$FLYWHEEL_HOME/projects/<id>/`; a repo's `flywheel.toml` / `.flywheel/` is ignored (only an explicit `--policy FILE` reads the legacy format).
+
+Config is eight keys from `$FLYWHEEL_HOME/config.toml` (user), the committed `.flywheel.toml` (repo: `verify`, `protected_paths`, `land`, `project_id` only, honored after `fw trust`), and `$FLYWHEEL_HOME/projects/<id>/config.toml` (personal); precedence flag > env > personal > repo > user > default. Loader: `crates/flywheel-orchestrator/src/config.rs`; trust (`trust.json`, keyed by local project id + file sha256): `trust.rs`. Verbs that run repo commands load with `Access::Execute` (refuse untrusted unattended), read verbs with `Access::ReadOnly`.
 
 Plugins (stores, work sources, submit strategies, agent adapters) are compile-time registries (`crates/*/src/*registry.rs`); there is no runtime plugin discovery.
 
@@ -35,7 +37,7 @@ Authoritative specs in `docs/` override any inferred behavior. Full index: `docs
 - `docs/strategy.md` — the `SubmitStrategy`/`SandboxHandle` landing seam and shipped strategies (merge, PR, container)
 - `docs/sandbox.md` + `docs/container-backend.md` — the sandbox-as-deploy model, the `[sandbox.*]` reference, and the Docker backend
 - `docs/held-out-gate.md` — the execute-time held-out landing gate
-- `docs/configuration.md` — the complete `flywheel.toml` reference
+- `docs/configuration.md` — the effective config, repo-file trust, and the legacy `flywheel.toml` reference
 - `docs/cli.md` — the `flywheel`/`fw` verbs and operator console
 - `docs/autopilot.md` — the autopilot intake daemon (tiers, scoring, CLI, console)
 - `docs/workflow.md` — how flywheel develops itself: the spec-driven authoring pipeline and the runtime loop

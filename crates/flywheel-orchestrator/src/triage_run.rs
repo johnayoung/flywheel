@@ -801,11 +801,13 @@ mod tests {
             dir.path(),
             &format!("{GITHUB_SOURCE}\n[triage]\nmax_per_pass = 3\n"),
         );
-        let policy = load_effective_policy(Some(&path)).unwrap().unwrap();
+        let policy = load_effective_policy(Some(&path), crate::config::Access::ReadOnly)
+            .unwrap()
+            .unwrap();
         assert_eq!(policy.triage_max_per_pass, Some(3));
         let missing = dir.path().join("absent.toml");
         assert!(matches!(
-            load_effective_policy(Some(&missing)),
+            load_effective_policy(Some(&missing), crate::config::Access::ReadOnly),
             Err(PolicyError::Read { .. })
         ));
     }

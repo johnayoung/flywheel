@@ -24,7 +24,7 @@ pub mod show;
 pub mod status;
 pub mod validate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +39,8 @@ use serde_json::Value;
 
 use crate::claims::{ClaimStore, ClaimStoreError};
 use crate::claims_postgres::register_postgres_backends;
+pub use crate::config::Access;
+use crate::config::{ConfigError, ConfigFlags, EffectiveConfig, Interaction, load_config};
 use crate::github::register_github_sources;
 use crate::history::build_task_phase_index;
 use crate::home;
@@ -125,75 +127,154 @@ impl WorkflowError {
 
 /// Load the policy the orchestrator verbs honor for an invocation.
 ///
-/// A policy file wins when there is one ([`load_policy_file`]); otherwise
-/// the invocation runs against its home project ([`home_project_policy`]):
-/// every default (store, tasks, worktrees, logs) lives under
-/// `$FLYWHEEL_HOME/projects/<id>/`, and a directory outside any git repo is
-/// refused. On success the result is always `Some`; the `Option` keeps the
-/// signature of the file-only resolution callers already match on.
+/// An explicit `--policy FILE` is loaded as-is (the legacy policy format;
+/// [`load_policy_file`]). Otherwise the invocation runs against its home
+/// project ([`home_project_policy`]): every default (store, tasks,
+/// worktrees, logs) lives under `$FLYWHEEL_HOME/projects/<id>/`, the
+/// effective config ([`crate::config`]) is applied, and a directory outside
+/// any git repo is refused. `access` says whether this verb runs repo-file
+/// commands (an untrusted `.flywheel.toml` is then refused or prompted for)
+/// or only reads (it is then warned about and ignored). On success the
+/// result is always `Some`; the `Option` keeps the signature callers
+/// already match on.
 pub fn load_effective_policy(
     policy_path: Option<&Path>,
+    access: Access,
 ) -> Result<Option<WorkPolicy>, PolicyError> {
     if let Some(policy) = load_policy_file(policy_path)? {
         return Ok(Some(policy));
     }
-    home_project_policy().map(Some)
+    home_project_policy(access).map(Some)
 }
 
-/// The policy-file half of [`load_effective_policy`]:
-///
-/// * an explicit `policy_path` is loaded (a missing/invalid file is an
-///   error, propagated as [`PolicyError`]);
-/// * otherwise `flywheel.toml` in the working directory is auto-detected;
-/// * otherwise the parents of the working directory are searched toward
-///   the filesystem root, and a hit RE-ANCHORS the process there
-///   (`set_current_dir`) before loading -- `fw` invoked from a
-///   subdirectory used to resolve every cwd-relative default against the
-///   subdirectory and silently report an empty queue, so the whole
-///   invocation must behave exactly like a repo-root one;
-/// * otherwise `None`.
+/// The explicit-file half of [`load_effective_policy`]: `policy_path`
+/// loaded as a legacy policy file (a missing/invalid file is an error), or
+/// `None` when no path was given. A repo's own `flywheel.toml` is never
+/// auto-detected any more ([`notice_legacy_layout`] says so).
 ///
 /// An empty `policy_path` is treated as "not specified" to match the
 /// argparse default surface.
 pub fn load_policy_file(policy_path: Option<&Path>) -> Result<Option<WorkPolicy>, PolicyError> {
-    if let Some(path) = policy_path.filter(|p| !p.as_os_str().is_empty()) {
-        return load_policy(path).map(Some);
+    match policy_path.filter(|p| !p.as_os_str().is_empty()) {
+        Some(path) => load_policy(path).map(Some),
+        None => Ok(None),
     }
-    let candidate = Path::new(DEFAULT_POLICY_FILENAME);
-    if candidate.is_file() {
-        return load_policy(candidate).map(Some);
-    }
-    let cwd = std::env::current_dir().map_err(|err| PolicyError::Read {
-        path: PathBuf::from(DEFAULT_POLICY_FILENAME),
-        message: format!("cannot resolve the working directory: {err}"),
-    })?;
-    for parent in cwd.ancestors().skip(1) {
-        let found = parent.join(DEFAULT_POLICY_FILENAME);
-        if found.is_file() {
-            std::env::set_current_dir(parent).map_err(|err| PolicyError::Read {
-                path: found.clone(),
-                message: format!("cannot re-anchor to {}: {err}", parent.display()),
-            })?;
-            return load_policy(candidate).map(Some);
-        }
-    }
-    Ok(None)
 }
 
-/// The built-in policy for the working directory's home project.
+/// Print `line` on stderr once per process (repeated policy loads in one
+/// invocation must not repeat a notice).
+pub fn notice_once(line: &str) {
+    static SHOWN: std::sync::Mutex<BTreeSet<String>> = std::sync::Mutex::new(BTreeSet::new());
+    let mut shown = SHOWN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if shown.insert(line.to_owned()) {
+        eprintln!("{line}");
+    }
+}
+
+/// The one-line notice for a repo still carrying the old layout
+/// (`flywheel.toml`, `.flywheel/`), or `None`. The flywheel home itself is
+/// never mistaken for the old `.flywheel/` (a home-dir repo holds it).
+pub fn legacy_layout_notice(repo_root: &Path, home: &home::Home) -> Option<String> {
+    let mut found = Vec::new();
+    if repo_root.join(DEFAULT_POLICY_FILENAME).is_file() {
+        found.push(DEFAULT_POLICY_FILENAME.to_owned());
+    }
+    let dot_dir = repo_root.join(".flywheel");
+    let is_home = match (dot_dir.canonicalize(), home.root().canonicalize()) {
+        (Ok(dir), Ok(root)) => dir == root,
+        _ => false,
+    };
+    if dot_dir.is_dir() && !is_home {
+        found.push(".flywheel/".to_owned());
+    }
+    if found.is_empty() {
+        return None;
+    }
+    let (names, verb) = match found.as_slice() {
+        [one] => (one.clone(), "is"),
+        _ => (found.join(" and "), "are"),
+    };
+    Some(format!(
+        "fw: notice: {names} in {} {verb} ignored (state lives under $FLYWHEEL_HOME; repo \
+         settings go in {}); {} can be deleted",
+        repo_root.display(),
+        crate::config::REPO_CONFIG_FILENAME,
+        if found.len() == 1 { "it" } else { "they" },
+    ))
+}
+
+/// Print [`legacy_layout_notice`] for `repo_root`, once.
+pub fn notice_legacy_layout(repo_root: &Path, home: &home::Home) {
+    if let Some(line) = legacy_layout_notice(repo_root, home) {
+        notice_once(&line);
+    }
+}
+
+/// Load the effective config for `project` at `repo_root`, prompting on the
+/// terminal when `access` executes repo-file commands and stdin is a TTY
+/// (unattended otherwise). Warnings are printed once on stderr.
+pub fn load_project_config(
+    home: &home::Home,
+    project: &home::Project,
+    repo_root: &Path,
+    access: Access,
+    flags: &ConfigFlags,
+) -> Result<EffectiveConfig, ConfigError> {
+    use std::io::IsTerminal;
+    let env_dsn = crate::config::env_dsn_from_process();
+    let stdin = std::io::stdin();
+    let loaded = if access == Access::Execute && stdin.is_terminal() {
+        let mut input = stdin.lock();
+        let mut output = std::io::stderr();
+        load_config(
+            home,
+            project,
+            repo_root,
+            access,
+            flags,
+            env_dsn,
+            Interaction::Prompt {
+                input: &mut input,
+                output: &mut output,
+            },
+        )?
+    } else {
+        load_config(
+            home,
+            project,
+            repo_root,
+            access,
+            flags,
+            env_dsn,
+            Interaction::Unattended,
+        )?
+    };
+    for warning in &loaded.warnings {
+        notice_once(warning);
+    }
+    Ok(loaded.config)
+}
+
+/// The policy for the working directory's home project.
 ///
 /// Resolves (creating on first sight) the project of the git repo holding
 /// the working directory, RE-ANCHORS the process at the current worktree's
 /// top level (so a subdirectory invocation behaves like a repo-root one),
-/// creates the project's tasks dir, and returns the default policy with the
-/// store, tasks dir, and worktree root under `$FLYWHEEL_HOME/projects/<id>/`.
-/// Nothing is written into the repo tree except the `.git/config` id.
-pub fn home_project_policy() -> Result<WorkPolicy, PolicyError> {
-    let project = home::resolve_cwd_project()?;
+/// notes an ignored legacy layout, loads the effective config, binds the
+/// project dir its `project_id` names (the local id unless a config file
+/// overrides it), creates the tasks dir, and returns the default policy
+/// with the store, tasks dir, and worktree root under that project dir and
+/// the config applied. Nothing is written into the repo tree except the
+/// `.git/config` id.
+pub fn home_project_policy(access: Access) -> Result<WorkPolicy, PolicyError> {
+    let home = home::Home::from_env()?;
     let cwd = std::env::current_dir().map_err(|err| PolicyError::Read {
         path: PathBuf::from("."),
         message: format!("cannot resolve the working directory: {err}"),
     })?;
+    let project = home::resolve_project(&home, &cwd)?;
     let repo_root = home::worktree_toplevel(&cwd)?;
     if cwd.canonicalize().ok().as_deref() != Some(repo_root.as_path()) {
         std::env::set_current_dir(&repo_root).map_err(|err| PolicyError::Read {
@@ -201,7 +282,12 @@ pub fn home_project_policy() -> Result<WorkPolicy, PolicyError> {
             message: format!("cannot re-anchor to {}: {err}", repo_root.display()),
         })?;
     }
-    Ok(policy_for_project(&project, repo_root)?)
+    notice_legacy_layout(&repo_root, &home);
+    let config = load_project_config(&home, &project, &repo_root, access, &ConfigFlags::default())?;
+    let bound = home::bind_project(&home, &project, &config.project_id.value)?;
+    let mut policy = policy_for_project(&bound, repo_root)?;
+    config.apply_to_policy(&mut policy);
+    Ok(policy)
 }
 
 /// The default policy bound to `project`, its tasks dir created.
@@ -474,6 +560,7 @@ pub fn store_config_for(policy: Option<&WorkPolicy>, db_path: &Path) -> StoreCon
             .unwrap_or_else(|| DEFAULT_BACKEND.to_owned()),
         db_path: db_path.to_path_buf(),
         schema: policy.and_then(|p| p.store_schema.clone()),
+        dsn: policy.and_then(|p| p.store_dsn.clone()),
     }
 }
 
@@ -700,13 +787,20 @@ pub fn dispatch(
     // project (a policy file is still honored), so `--db` / `--tasks-dir`
     // keep working outside a git repo.
     let given = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
+    // Verbs that run repo-file commands (the orchestrate loop, the archive
+    // sweep's phase-exit verify) need a trusted `.flywheel.toml`; the rest
+    // only read.
+    let access = match &command {
+        Command::Orchestrate(_) | Command::Archive(_) => Access::Execute,
+        _ => Access::ReadOnly,
+    };
     let policy_of =
         |p: &Option<String>, explicit: bool| -> Result<Option<WorkPolicy>, WorkflowError> {
             let path = p.as_deref().map(Path::new);
             if explicit {
                 return Ok(load_policy_file(path)?);
             }
-            Ok(load_effective_policy(path)?)
+            Ok(load_effective_policy(path, access)?)
         };
     match command {
         Command::Init(args) => Ok(cmd_init(&args, init_host, out, err)?),
@@ -1169,7 +1263,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("flywheel.toml");
         std::fs::write(&file, "[source]\nkind = \"jira\"\ntasks_dir = \"tasks\"\n").unwrap();
-        let err = load_effective_policy(Some(&file)).unwrap_err().to_string();
+        let err = load_effective_policy(Some(&file), Access::ReadOnly)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("source.kind must be one of ('directory', 'github', 'github_ci', 'github_review'), got 'jira'"),
             "{err}"
@@ -1407,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn status_walks_up_to_the_policy_or_refuses_outside_a_git_repo() {
+    fn status_reads_only_an_explicit_policy_and_refuses_outside_a_git_repo() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let original = std::env::current_dir().unwrap();
         let tmp = TempDir::new().unwrap();
@@ -1422,23 +1518,28 @@ mod tests {
             "[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n",
         )
         .unwrap();
-        let sub = root.join("src").join("deep");
-        std::fs::create_dir_all(&sub).unwrap();
-        std::env::set_current_dir(&sub).unwrap();
-        let (code, out, err) = run_capture(&argv(&["status".to_owned()]));
+        // An explicit (legacy) --policy is still honored.
+        std::env::set_current_dir(&root).unwrap();
+        let (code, out, err) = run_capture(&argv(&[
+            "status".to_owned(),
+            "--policy".to_owned(),
+            "flywheel.toml".to_owned(),
+        ]));
         std::env::set_current_dir(&original).unwrap();
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(out.contains("01-phase/t1"));
-        assert!(!out.contains("(no active tasks)"));
 
-        let bare = tmp.path().join("not-a-repo");
-        std::fs::create_dir_all(&bare).unwrap();
-        std::env::set_current_dir(&bare).unwrap();
-        let (code, out, err) = run_capture(&argv(&["status".to_owned()]));
-        std::env::set_current_dir(&original).unwrap();
-        assert_eq!(code, 2);
-        assert!(err.contains("not inside a git repository"), "{err}");
-        assert!(!out.contains("(no active tasks)"));
+        // A flywheel.toml is never auto-detected (here or in a parent): the
+        // directory is not a git repo, so the home project refuses.
+        for dir in [root.clone(), root.join("src").join("deep")] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::env::set_current_dir(&dir).unwrap();
+            let (code, out, err) = run_capture(&argv(&["status".to_owned()]));
+            std::env::set_current_dir(&original).unwrap();
+            assert_eq!(code, 2);
+            assert!(err.contains("not inside a git repository"), "{err}");
+            assert!(!out.contains("01-phase/t1"));
+        }
     }
 
     #[test]

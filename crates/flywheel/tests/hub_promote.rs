@@ -139,7 +139,8 @@ impl Env {
     }
 
     fn status(&self) -> Vec<Value> {
-        let output = self.fw_in_repo(&["status", "--json"]);
+        // `fw init` scaffolded a legacy flywheel.toml: name it explicitly.
+        let output = self.fw_in_repo(&["status", "--json", "--policy", "flywheel.toml"]);
         assert!(output.status.success(), "fw status: {output:?}");
         serde_json::from_slice::<Value>(&output.stdout)
             .unwrap()

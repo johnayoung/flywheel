@@ -35,7 +35,10 @@ pub const TOPICS: [(&str, &str); 16] = [
         "cli",
         "every verb, the interactive operator console, slash commands, and init.",
     ),
-    ("configuration", "the complete flywheel.toml reference."),
+    (
+        "configuration",
+        "the effective config (config.toml, .flywheel.toml, trust) and the legacy policy file.",
+    ),
     (
         "task-schema",
         "the Task / Grader / Context shape and validation rules.",

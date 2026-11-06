@@ -1547,9 +1547,13 @@ fn requested_schema<'a>(request: &'a BuildRequest<'_>) -> &'a str {
     request.config.schema.as_deref().unwrap_or(DEFAULT_SCHEMA)
 }
 
-/// The DSN a build request resolves to, or the fail-fast missing-DSN error
-/// (which names the variables, never a value).
+/// The DSN a build request resolves to -- the config's own (the effective
+/// `store` setting) else the environment's -- or the fail-fast missing-DSN
+/// error (which names the variables, never a value).
 fn requested_dsn(request: &BuildRequest<'_>) -> Result<String, StoreConfigError> {
+    if let Some(dsn) = &request.config.dsn {
+        return Ok(dsn.expose().to_owned());
+    }
     resolve_postgres_dsn(request.environ).ok_or_else(|| StoreConfigError::MissingDsn {
         backend: POSTGRES_BACKEND.to_owned(),
     })
@@ -1637,6 +1641,7 @@ mod tests {
             backend: POSTGRES_BACKEND.to_owned(),
             db_path: "/tmp/never-created.db".into(),
             schema: schema.map(str::to_owned),
+            dsn: None,
         }
     }
 

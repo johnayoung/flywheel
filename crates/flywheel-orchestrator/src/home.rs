@@ -365,6 +365,13 @@ fn read_stored_id(common_dir: &Path) -> Result<Option<String>, ProjectError> {
     }
 }
 
+/// The project id the repo holding `dir` already carries, without minting
+/// one or touching the home (`Ok(None)` when it has none). For readers
+/// that must not create state, such as the hub's trust check.
+pub fn stored_project_id(dir: &Path) -> Result<Option<String>, ProjectError> {
+    read_stored_id(&git_common_dir(dir)?)
+}
+
 fn write_stored_id(common_dir: &Path, id: &str) -> Result<(), ProjectError> {
     let config = common_dir.join("config");
     let output = Command::new("git")
@@ -489,6 +496,44 @@ pub fn resolve_project(home: &Home, dir: &Path) -> Result<Project, ProjectError>
     Ok(Project { id, paths, meta })
 }
 
+/// The project dir an invocation of `local` uses when its effective config
+/// names `id` (a `project_id` override shares one project dir -- and one
+/// Postgres partition -- across clones). `id == local.id` is `local`
+/// itself; otherwise `id`'s meta.json is created or updated to record this
+/// repo, so `fw project ls` shows it and `fw project prune` keeps it while
+/// the repo's `.flywheel.toml` still declares it.
+pub fn bind_project(home: &Home, local: &Project, id: &str) -> Result<Project, ProjectError> {
+    if id == local.id {
+        return Ok(local.clone());
+    }
+    let paths = home.project(id);
+    let now = now_stamp();
+    let meta = match read_meta(&paths)? {
+        Some(mut meta) => {
+            meta.id = id.to_owned();
+            meta.path.clone_from(&local.meta.path);
+            meta.git_common_dir.clone_from(&local.meta.git_common_dir);
+            meta.remote.clone_from(&local.meta.remote);
+            meta.last_seen = now;
+            meta
+        }
+        None => ProjectMeta {
+            id: id.to_owned(),
+            path: local.meta.path.clone(),
+            git_common_dir: local.meta.git_common_dir.clone(),
+            remote: local.meta.remote.clone(),
+            first_seen: now.clone(),
+            last_seen: now,
+        },
+    };
+    write_meta(&paths, &meta)?;
+    Ok(Project {
+        id: id.to_owned(),
+        paths,
+        meta,
+    })
+}
+
 /// Whether the repo `meta` records still exists and carries `id`.
 fn is_original(meta: &ProjectMeta, id: &str) -> Result<bool, ProjectError> {
     if !meta.git_common_dir.is_dir() {
@@ -571,8 +616,9 @@ pub struct Pruned {
 }
 
 /// Remove every project dir whose recorded repo no longer exists or no
-/// longer carries that id (and every UUID-named dir without a readable
-/// meta.json).
+/// longer carries that id -- neither in its `.git/config` nor as the
+/// `project_id` its `.flywheel.toml` declares -- (and every UUID-named dir
+/// without a readable meta.json).
 pub fn prune_projects(home: &Home) -> Result<Vec<Pruned>, ProjectError> {
     let mut pruned = Vec::new();
     for (id, meta) in project_dirs(home)? {
@@ -582,6 +628,12 @@ pub fn prune_projects(home: &Home) -> Result<Vec<Pruned>, ProjectError> {
                 "recorded repo {} no longer exists",
                 meta.path.display()
             )),
+            // A shared project dir: the repo's committed file declares it.
+            Some(meta)
+                if crate::config::declared_project_id(&meta.path).as_deref() == Some(&id) =>
+            {
+                None
+            }
             Some(meta) => match read_stored_id(&meta.git_common_dir) {
                 Ok(Some(stored)) if stored == id => None,
                 Ok(Some(stored)) => Some(format!(

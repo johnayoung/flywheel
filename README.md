@@ -22,6 +22,8 @@ flywheel                # operator console (alias: fw)
 
 Any git repo works without `flywheel init`: flywheel keeps its state under `$FLYWHEEL_HOME/projects/<id>/` (default `~/.flywheel`), keyed by an id it stores in the repo's `.git/config`. `fw project ls` lists the known projects.
 
+Settings: `~/.flywheel/config.toml` (yours), an optional committed `.flywheel.toml` (`verify`, `protected_paths`, `land`, `project_id`; honored after `fw trust`), and a per-project `config.toml` in the home. `fw config` shows the effective values and where each came from ([docs/configuration.md](docs/configuration.md)).
+
 The worker drives the agent through its CLI (`claude`, or `codex` via `[agent]`), so the CLI must be on `PATH` and authenticated before the first run.
 
 `flywheel <verb> --help` lists each verb's flags (`status`, `live`, `history`, `show`, `say`, `interrupt`, `approve`, `reject`, `audit`, ...).
@@ -41,7 +43,7 @@ They are project-agnostic templates: re-running `flywheel init` regenerates the 
 
 ## How work lands
 
-Each task runs in its own git worktree on a `flywheel/<phase>/<task-id>` branch. When the graders pass, the work lands through the configured landing strategy (`flywheel.toml` `[submit] strategy`):
+Each task runs in its own git worktree on a `flywheel/<phase>/<task-id>` branch. When the graders pass, the work lands through the configured landing strategy (`land = "merge" | "pr"`; `phase` and tiers through a legacy `--policy` file):
 
 - `merge` (default) — fast-forward the branch into the worker's base branch. If the base advanced underneath a finished task, the branch is rebased and its command graders re-run before the merge, so nothing lands that was not verified against the exact base it lands on.
 - `pr` — push the branch and open a pull request with the grader receipts in the body; review and CI own the merge.

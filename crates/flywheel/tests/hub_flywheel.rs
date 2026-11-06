@@ -1068,7 +1068,10 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     assert_eq!(session["name"], "fw worker beta");
     let argv = argv_of(&session);
     assert_eq!(argv[3], "fw-worker");
-    assert_eq!(&argv[5..], ["worker", "--task=beta"]);
+    // The folder's flywheel.toml is named: the worker no longer
+    // auto-detects it.
+    let policy_flag = format!("--policy={}", root.join("flywheel.toml").display());
+    assert_eq!(&argv[5..], ["worker", policy_flag.as_str(), "--task=beta"]);
     let sid = session["id"].as_str().unwrap().to_owned();
     let screen = wait_for("the scoped worker to finish", || {
         let text = screen_text(&server, &sid);
@@ -1101,7 +1104,12 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     assert_eq!(code, 201, "{session}");
     assert_eq!(
         &argv_of(&session)[5..],
-        ["worker", "--task=gamma", "--with-prereqs"]
+        [
+            "worker",
+            policy_flag.as_str(),
+            "--task=gamma",
+            "--with-prereqs"
+        ]
     );
     let sid = session["id"].as_str().unwrap().to_owned();
     let screen = wait_for("the prerequisite run to finish", || {
@@ -1124,7 +1132,7 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     let (code, session) = start_worker(json!({ "folder": root, "workspace_id": workspace_id }));
     assert_eq!(code, 201, "{session}");
     assert_eq!(session["name"], "fw worker");
-    assert_eq!(&argv_of(&session)[5..], ["worker"]);
+    assert_eq!(&argv_of(&session)[5..], ["worker", policy_flag.as_str()]);
     let sid = session["id"].as_str().unwrap();
     let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{sid}"), None);
     assert_eq!(code, 204);

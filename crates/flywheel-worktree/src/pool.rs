@@ -1127,6 +1127,9 @@ pub fn pool_member_argv(
         .into_iter()
         .map(str::to_owned),
     );
+    if let Some(policy) = &args.policy {
+        argv.extend(["--policy".to_owned(), policy.clone()]);
+    }
     if let Some(tasks_dir) = &args.tasks_dir {
         argv.extend(["--tasks-dir".to_owned(), tasks_dir.clone()]);
     }
@@ -1816,10 +1819,12 @@ mod tests {
             tasks_dir: Some("/tmp/tasks".into()),
             db: Some("/tmp/db.sqlite".into()),
             sandbox_root: Some("@cache".into()),
+            policy: Some("/tmp/flywheel.toml".into()),
             once: true,
             ..full_args()
         };
         let argv = pool_member_argv(&program(), &args, &[], "fleet-0", Some("sonnet"));
+        assert_eq!(value_after(&argv, "--policy"), "/tmp/flywheel.toml");
         assert_eq!(value_after(&argv, "--max-turns"), "9");
         assert_eq!(value_after(&argv, "--max-retries"), "2");
         assert_eq!(value_after(&argv, "--lease-seconds"), "120.0");

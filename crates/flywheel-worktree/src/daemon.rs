@@ -82,7 +82,7 @@ use flywheel_orchestrator::workflow::args::{
     DEFAULT_LEASE_SECONDS, DEFAULT_MAX_RETRIES, DEFAULT_MAX_TURNS, DEFAULT_RECONCILE_SECONDS,
 };
 use flywheel_orchestrator::workflow::{
-    LiveRunRow, collect_live_rows, default_store_registries, load_effective_policy,
+    Access, LiveRunRow, collect_live_rows, default_store_registries, load_effective_policy,
     open_stores_for, store_config_for,
 };
 use serde_json::{Value, json};
@@ -1494,6 +1494,9 @@ pub fn arm_supervisor_lifeline(
 /// The parsed `flywheel worker` flags, with argparse's defaults.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerArgs {
+    /// Legacy: an explicit `flywheel.toml` work policy (instead of the home
+    /// project's effective config).
+    pub policy: Option<String>,
     pub tasks_dir: Option<String>,
     pub db: Option<String>,
     pub sandbox_root: Option<String>,
@@ -1530,6 +1533,7 @@ pub struct WorkerArgs {
 impl Default for WorkerArgs {
     fn default() -> Self {
         Self {
+            policy: None,
             tasks_dir: None,
             db: None,
             sandbox_root: None,
@@ -1600,7 +1604,7 @@ pub const USAGE: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--
                        [--worker-id WORKER_ID] [--concurrency CONCURRENCY]
                        [--lease-seconds LEASE_SECONDS]
                        [--reconcile-seconds RECONCILE_SECONDS] [--once]
-                       [--task TASK] [--with-prereqs]
+                       [--task TASK] [--with-prereqs] [--policy POLICY]
 ";
 
 /// The argparse `-h` text (`COLUMNS=80`).
@@ -1613,7 +1617,7 @@ pub const HELP: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--d
                        [--worker-id WORKER_ID] [--concurrency CONCURRENCY]
                        [--lease-seconds LEASE_SECONDS]
                        [--reconcile-seconds RECONCILE_SECONDS] [--once]
-                       [--task TASK] [--with-prereqs]
+                       [--task TASK] [--with-prereqs] [--policy POLICY]
 
 Git-worktree worker: drive flywheel tasks under .flywheel/tasks/active/, each
 in its own worktree, FF-merging on done and parking on failure.
@@ -1663,6 +1667,8 @@ options:
                         refused.
   --with-prereqs        With --task: also run the named tasks' not-done
                         prerequisites (transitively), before them.
+  --policy POLICY       Legacy: run on this flywheel.toml work policy instead
+                        of the home project's effective config.
 ";
 
 /// The internal flag a pool member receives its supervisor lifeline on
@@ -1677,7 +1683,7 @@ enum Arity {
 }
 
 /// The option table in declaration order (argparse's prefix-match order).
-const OPTIONS: [(&str, Arity); 21] = [
+const OPTIONS: [(&str, Arity); 22] = [
     ("-h", Arity::Flag),
     ("--help", Arity::Flag),
     ("--tasks-dir", Arity::One),
@@ -1697,6 +1703,7 @@ const OPTIONS: [(&str, Arity); 21] = [
     ("--once", Arity::Flag),
     ("--task", Arity::One),
     ("--with-prereqs", Arity::Flag),
+    ("--policy", Arity::One),
     (SUPERVISOR_FD_FLAG, Arity::One),
     (crate::scoped::SCOPE_SINCE_FLAG, Arity::One),
 ];
@@ -1835,6 +1842,7 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
         let v = value.unwrap_or_default();
         match name {
             "-h" | "--help" => return Ok(Parsed::Help(HELP.to_owned())),
+            "--policy" => args.policy = Some(v),
             "--tasks-dir" => args.tasks_dir = Some(v),
             "--db" => args.db = Some(v),
             "--sandbox-root" => args.sandbox_root = Some(v),
@@ -1976,7 +1984,8 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     // loads; the pool size and the worktree root resolve before any store
     // opens so an operator mistake fails fast with nothing claimed.
     let resolved: Result<_, PolicyError> = (|| {
-        let policy = load_effective_policy(None)?.map(Arc::new);
+        let policy_path = args.policy.as_deref().map(Path::new);
+        let policy = load_effective_policy(policy_path, Access::Execute)?.map(Arc::new);
         let phase_base = resolve_landing_base(&repo_root, policy.as_deref(), Some(&log))?;
         let concurrency = resolve_concurrency(args.concurrency.as_deref(), policy.as_deref())?;
         let configured_root = args
@@ -3754,7 +3763,8 @@ esac
         .unwrap();
         task_file(&repo, "01-phase", "t1", "true");
         let _cwd = enter(&repo);
-        let (code, _out, err) = run_main(&["--concurrency", "0", "--once"]);
+        let (code, _out, err) =
+            run_main(&["--policy", "flywheel.toml", "--concurrency", "0", "--once"]);
         assert_ne!(code, 0);
         assert!(err.contains("concurrency"), "{err}");
         assert!(err.starts_with("flywheel worker: policy error: "), "{err}");
@@ -3783,7 +3793,8 @@ esac
         .unwrap();
         fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
         let _cwd = enter(&repo);
-        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
+        let (code, _out, err) =
+            run_main(&["--policy", "flywheel.toml", "--once", "--heartbeat", "0"]);
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(repo.join(".flywheel").join("flywheel.sqlite").exists());
         assert!(repo.join(".flywheel").join("worktrees").is_dir());
@@ -3804,7 +3815,8 @@ esac
         .unwrap();
         fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
         let _cwd = enter(&repo);
-        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
+        let (code, _out, err) =
+            run_main(&["--policy", "flywheel.toml", "--once", "--heartbeat", "0"]);
         assert_eq!(code, 1, "{err}");
         assert!(
             err.starts_with("flywheel worker: held-out gate misconfigured: "),
@@ -3832,7 +3844,8 @@ esac
         fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
         fs::create_dir_all(repo.join(".flywheel/verification/held-out")).unwrap();
         let _cwd = enter(&repo);
-        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
+        let (code, _out, err) =
+            run_main(&["--policy", "flywheel.toml", "--once", "--heartbeat", "0"]);
         assert_eq!((code, err.as_str()), (0, ""));
     }
 
@@ -3852,7 +3865,8 @@ esac
         fs::create_dir_all(repo.join(".flywheel").join("tasks").join("active")).unwrap();
         assert!(!repo.join(".flywheel/verification").exists());
         let _cwd = enter(&repo);
-        let (code, _out, err) = run_main(&["--once", "--heartbeat", "0"]);
+        let (code, _out, err) =
+            run_main(&["--policy", "flywheel.toml", "--once", "--heartbeat", "0"]);
         assert_eq!((code, err.as_str()), (0, ""));
         assert!(repo.join(".flywheel/verification/held-out").is_dir());
     }

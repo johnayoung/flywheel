@@ -8,6 +8,7 @@
 
 pub mod autopilot_supervisor;
 pub mod cli;
+pub mod config_verbs;
 pub mod dashboard;
 pub mod docs;
 pub mod exec;

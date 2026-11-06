@@ -321,7 +321,14 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
         .filter_map(Value::as_str)
         .collect();
     assert_eq!(argv[3], "fw-autopilot");
-    assert_eq!(argv[5..], ["autopilot"], "the daemon, never --once");
+    // The folder's flywheel.toml is named: the daemon no longer
+    // auto-detects it.
+    let policy_flag = format!("--policy={}", root.join("flywheel.toml").display());
+    assert_eq!(
+        argv[5..],
+        ["autopilot", policy_flag.as_str()],
+        "the daemon, never --once"
+    );
     let sid = session["id"].as_str().unwrap().to_owned();
 
     // Its first cycle: what it decided, and why.

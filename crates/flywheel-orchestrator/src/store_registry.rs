@@ -28,13 +28,39 @@ use crate::store_factory::StoreConfigError;
 /// `backend` is the registry name (`"sqlite"` by default); `db_path` is the
 /// resolved SQLite file (flag > policy > default, resolved by the caller);
 /// `schema` is the optional Postgres schema name a `postgres` builder passes
-/// through. The DSN is never part of the config -- it is resolved from the
-/// environment at build time and never echoed back.
+/// through. `dsn` is the DSN the effective config selected (`store =
+/// "postgres://..."` in a config file, or `FLYWHEEL_PG_DSN`); when `None` a
+/// DSN-backed builder resolves one from the environment at build time. A
+/// DSN is never echoed back ([`Dsn`]'s `Debug` redacts it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {
     pub backend: String,
     pub db_path: PathBuf,
     pub schema: Option<String>,
+    pub dsn: Option<Dsn>,
+}
+
+/// A database connection string. Its `Debug` form never shows the value, so
+/// a config or policy holding one can be logged safely; [`Dsn::expose`] is
+/// the only way to read it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Dsn(String);
+
+impl Dsn {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The raw connection string (credentials included): only for a driver.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Dsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Dsn(<redacted>)")
+    }
 }
 
 impl StoreConfig {
@@ -44,6 +70,7 @@ impl StoreConfig {
             backend: DEFAULT_BACKEND.to_owned(),
             db_path: db_path.into(),
             schema: None,
+            dsn: None,
         }
     }
 }

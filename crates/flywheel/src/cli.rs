@@ -23,6 +23,8 @@
 //! * hub: `hub <serve|token>` -> the web workspace (`flywheel-hub`)
 //! * exec: `exec [PROMPT]` -> one agent call, no config/store/worktree
 //! * project: `project <ls|prune|relink>` -> the home's project registry
+//! * config: `config [--json]` -> the effective config with sources
+//! * trust: `trust [--revoke]` -> approve (or revoke) the repo's `.flywheel.toml`
 //!
 //! `next`, `orchestrate`, and the core single-task CLI (`run`, `is-done`,
 //! `set-model`, ... under `workflow`) are plumbing, not product verbs -- the
@@ -71,7 +73,7 @@ use flywheel_orchestrator::store_registry::environ_from_process;
 use flywheel_orchestrator::supervision_policy::{SupervisionBudget, SupervisionPolicy};
 use flywheel_orchestrator::triage_run;
 use flywheel_orchestrator::workflow::{
-    self as orchestrator_workflow, ArchiveRequest, ArchiveRunner, OrchestrateRequest,
+    self as orchestrator_workflow, Access, ArchiveRequest, ArchiveRunner, OrchestrateRequest,
     OrchestrateRunner, Verbs, default_store_registries, load_effective_policy, load_policy_file,
     python_path_str, resolve_db_path, store_config_for,
 };
@@ -166,10 +168,14 @@ Verbs:
   hub commands S   print / copy (OSC 52) the code blocks an agent session suggested
   exec [PROMPT]    run one agent call (no tasks, store, worktree, or config)
   project ls       list known projects (--json); also: project prune, project relink [PATH]
+  config [--json]  print the effective config, each key with its source
+  trust            approve this repo's .flywheel.toml (--revoke to withdraw)
 
 Store verbs work in any git repo: state lives under
 $FLYWHEEL_HOME/projects/<id>/ (default ~/.flywheel), keyed by the id in
 the repo's .git/config. A directory outside a git repo is refused.
+Settings: $FLYWHEEL_HOME/config.toml, the repo's .flywheel.toml (once
+trusted), and $FLYWHEEL_HOME/projects/<id>/config.toml; see 'fw config'.
 
 Each verb forwards its own --help to the underlying implementation,
 so 'flywheel <verb> --help' (equivalently 'fw <verb> --help') lists
@@ -253,8 +259,15 @@ pub fn run_with(argv: Vec<String>, bindings: ShellBindings) -> i32 {
 /// at `fw --help`.
 /// One-shot, read-only verbs: they spawn no agents or graders, so a closed
 /// stdout (`fw status | head`) may end them the way it ends any Unix filter.
-const READ_ONLY_VERBS: [&str; 7] = [
-    "status", "live", "history", "show", "validate", AUDIT_VERB, DOCS_VERB,
+const READ_ONLY_VERBS: [&str; 8] = [
+    "status",
+    "live",
+    "history",
+    "show",
+    "validate",
+    AUDIT_VERB,
+    DOCS_VERB,
+    crate::config_verbs::CONFIG_VERB,
 ];
 
 /// Restore the default SIGPIPE disposition (the Rust runtime ignores it, so
@@ -373,6 +386,14 @@ pub fn route(
         // The home's project registry: identity, listing, pruning, relink.
         return crate::project::run_with(rest, out, err);
     }
+    if verb == crate::config_verbs::CONFIG_VERB {
+        // The effective config: every key with its source.
+        return crate::config_verbs::run_config(rest, out, err);
+    }
+    if verb == crate::config_verbs::TRUST_VERB {
+        // Approve (or revoke) the cwd repo's `.flywheel.toml`.
+        return crate::config_verbs::run_trust(rest, out, err);
+    }
     if verb == exec::EXEC_VERB {
         // One agent call: no flywheel.toml load, no store, no worktree.
         return exec::run_with(rest, out, err);
@@ -410,7 +431,7 @@ fn delegate_producer(core_argv: Vec<String>, err: &mut dyn Write) -> i32 {
     let loaded = if explicit_db {
         load_policy_file(None)
     } else {
-        load_effective_policy(None)
+        load_effective_policy(None, Access::ReadOnly)
     };
     let policy = match loaded {
         Ok(policy) => policy,
@@ -463,7 +484,7 @@ fn delegate_audit(rest: &[String], out: &mut dyn Write, err: &mut dyn Write) -> 
     if explicit_db || help {
         return audit_main(rest, out, err);
     }
-    let policy = match load_effective_policy(None) {
+    let policy = match load_effective_policy(None, Access::ReadOnly) {
         Ok(policy) => policy,
         Err(failure) => {
             let _ = writeln!(err, "{PROG}: policy error: {failure}");
@@ -1377,7 +1398,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let db = tmp.path().join("db.sqlite");
         seed_running(&db, "beta");
-        let (code, _out, err) = run(&["--json", "--db", db.to_str().unwrap()], &unbound());
+        // --db and --tasks-dir name every path: no home project (the cwd's
+        // repo) is resolved.
+        let tasks = tmp.path().join("tasks");
+        std::fs::create_dir_all(tasks.join("active")).unwrap();
+        let (code, _out, err) = run(
+            &[
+                "--json",
+                "--db",
+                db.to_str().unwrap(),
+                "--tasks-dir",
+                tasks.to_str().unwrap(),
+            ],
+            &unbound(),
+        );
         assert_eq!(code, 0, "stderr: {err}");
     }
 
@@ -1715,8 +1749,8 @@ mod tests {
         }
         assert!(!tmp.path().join("flywheel.db").exists());
 
-        // A policy naming [paths] db: that store is read, core's default
-        // path is neither consulted nor created.
+        // A legacy flywheel.toml naming [paths] db is no longer read: the
+        // verb still refuses outside a git repo.
         let db = tmp.path().join("custom").join("store.sqlite");
         fs::create_dir_all(db.parent().unwrap()).unwrap();
         fresh_store(&db);
@@ -1726,6 +1760,17 @@ mod tests {
         )
         .unwrap();
         let (code, _out, err) = run(&["audit", "run-ghost"], &unbound());
+        if code != 2 || !err.contains("not inside a git repository") {
+            restore(&previous);
+            panic!("expected the git refusal despite flywheel.toml, got {code}: {err}");
+        }
+
+        // An explicit --db names the store: it is read, and core's default
+        // path is neither consulted nor created.
+        let (code, _out, err) = run(
+            &["audit", "--db", "custom/store.sqlite", "run-ghost"],
+            &unbound(),
+        );
         restore(&previous);
         assert_eq!(code, 0);
         assert_eq!(err, "no records for run_id run-ghost\n");

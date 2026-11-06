@@ -262,6 +262,7 @@ mod tests {
             backend: "mysql".to_owned(),
             db_path: "/tmp/x.db".into(),
             schema: None,
+            dsn: None,
         };
         let Err(err) = build_claim_store(&registries, &config, &Environ::new()) else {
             panic!("mysql is not registered");
@@ -307,6 +308,7 @@ mod tests {
             backend: "postgres".to_owned(),
             db_path: "/tmp/unused.db".into(),
             schema: Some("flywheel".to_owned()),
+            dsn: None,
         };
 
         let missing = preflight_store(&registries, &config, &Environ::new()).unwrap_err();

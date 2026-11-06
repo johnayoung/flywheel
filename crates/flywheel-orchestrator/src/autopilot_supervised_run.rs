@@ -808,14 +808,16 @@ pub fn run_main(argv: &[String], host: &dyn SupervisedHost) -> i32 {
     };
     let activity_path = match args.activity_file.as_deref().filter(|p| !p.is_empty()) {
         Some(path) => PathBuf::from(path),
-        None => match crate::workflow::load_effective_policy(None) {
-            Ok(policy) => crate::autopilot_run::autopilot_log_dir(policy.as_ref(), &repo_root)
-                .join("activity.json"),
-            Err(err) => {
-                stderr(&format!("autopilot-supervised: policy error: {err}"));
-                return 2;
+        None => {
+            match crate::workflow::load_effective_policy(None, crate::config::Access::Execute) {
+                Ok(policy) => crate::autopilot_run::autopilot_log_dir(policy.as_ref(), &repo_root)
+                    .join("activity.json"),
+                Err(err) => {
+                    stderr(&format!("autopilot-supervised: policy error: {err}"));
+                    return 2;
+                }
             }
-        },
+        }
     };
     let log_dir = activity_path
         .parent()
@@ -1429,7 +1431,21 @@ mod tests {
     fn adoption_spawns_nothing_and_exits_0() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(dir.path()).live(live_record(9999));
-        assert_eq!(run_main(&argv(&["--window-seconds", "60"]), &host), 0);
+        // An explicit activity file: the default resolves the cwd's home
+        // project, which a unit test must never touch.
+        let activity = dir.path().join("activity.json");
+        assert_eq!(
+            run_main(
+                &argv(&[
+                    "--window-seconds",
+                    "60",
+                    "--activity-file",
+                    activity.to_str().unwrap()
+                ]),
+                &host
+            ),
+            0
+        );
         let lines = host.lines();
         assert_eq!(
             lines[0],
@@ -1454,10 +1470,20 @@ mod tests {
     fn crash_loop_exhausts_the_budget_and_exits_1() {
         let dir = TempDir::new().unwrap();
         let host = FakeHost::new(dir.path()).exits(&[1, 1, 1]);
+        // An explicit activity file: the default resolves the cwd's home
+        // project, which a unit test must never touch.
+        let expected_activity = dir
+            .path()
+            .join(".flywheel")
+            .join("logs")
+            .join("autopilot")
+            .join("activity.json");
         let code = run_main(
             &argv(&[
                 "--max-respawns",
                 "2",
+                "--activity-file",
+                expected_activity.to_str().unwrap(),
                 "--tasks-dir",
                 "queue",
                 "--model",
@@ -1486,12 +1512,6 @@ mod tests {
         );
         let spawns = host.spawns.lock().unwrap();
         assert_eq!(spawns.len(), 3);
-        let expected_activity = dir
-            .path()
-            .join(".flywheel")
-            .join("logs")
-            .join("autopilot")
-            .join("activity.json");
         assert_eq!(
             spawns[0].0,
             argv(&[

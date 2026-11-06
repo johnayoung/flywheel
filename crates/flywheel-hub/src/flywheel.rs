@@ -217,6 +217,16 @@ pub struct Alert {
     pub run_id: Option<String>,
 }
 
+/// The folder's committed `.flywheel.toml` is not approved on this machine:
+/// its settings do not apply, and workers and the autopilot refuse to run
+/// it until the operator runs `command` in a terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UntrustedRepoFile {
+    pub file: PathBuf,
+    /// The exact command that approves it (`cd <folder> && fw trust`).
+    pub command: String,
+}
+
 /// Everything the panel shows for one adopted folder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlywheelPanel {
@@ -234,6 +244,9 @@ pub struct FlywheelPanel {
     /// Why some of the panel is missing (no store yet, a policy or store
     /// error); what could be read is still shown.
     pub problem: Option<String>,
+    /// Set while the folder's `.flywheel.toml` awaits `fw trust`.
+    #[serde(default)]
+    pub untrusted: Option<UntrustedRepoFile>,
     pub phases: Vec<PanelPhase>,
     /// Said instead of tasks when the source is not listed here.
     pub tasks_note: Option<String>,
@@ -259,6 +272,7 @@ impl FlywheelPanel {
             store: String::new(),
             worktree_of: None,
             problem: None,
+            untrusted: None,
             phases: Vec::new(),
             tasks_note: None,
             live: Vec::new(),

@@ -55,7 +55,9 @@ use flywheel_orchestrator::store_factory::{
 use flywheel_orchestrator::store_registry::{
     Environ, SqliteCoreOpener, StoreConfig, StoreRegistries,
 };
-use flywheel_orchestrator::workflow::{load_effective_policy, load_policy_file, repo_root_for};
+use flywheel_orchestrator::workflow::{
+    Access, load_effective_policy, load_policy_file, repo_root_for,
+};
 use flywheel_worktree::phase::{ArchiveOptions, archive_completed_phases};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -708,6 +710,7 @@ pub fn open_store_bundle(
         backend: policy.map_or_else(|| "sqlite".to_owned(), |p| p.store_backend.clone()),
         db_path: db_path.to_path_buf(),
         schema: policy.and_then(|p| p.store_schema.clone()),
+        dsn: policy.and_then(|p| p.store_dsn.clone()),
     };
     open_stores(&store_registries(), &config, &process_environ()).map_err(|err| err.to_string())
 }
@@ -776,10 +779,19 @@ pub fn main_with(argv: &[String], daemons: Option<DaemonFactory>) -> i32 {
     // the defaults.
     let given = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
     let policy_path = args.policy.as_deref().map(Path::new);
+    // The console archives phases (running the phase-exit verify) and
+    // starts workers, so it needs a trusted `.flywheel.toml` (prompting on
+    // the terminal); a JSON snapshot only reads.
+    let snapshot = args.json || !std::io::stdout().is_terminal();
+    let access = if snapshot {
+        Access::ReadOnly
+    } else {
+        Access::Execute
+    };
     let loaded = if given(&args.db) && given(&args.tasks_dir) {
         load_policy_file(policy_path)
     } else {
-        load_effective_policy(policy_path)
+        load_effective_policy(policy_path, access)
     };
     let policy = match loaded {
         Ok(policy) => policy,
@@ -794,7 +806,8 @@ pub fn main_with(argv: &[String], daemons: Option<DaemonFactory>) -> i32 {
         .as_ref()
         .is_some_and(|p| p.store_backend == "postgres")
     {
-        if resolve_postgres_dsn(&process_environ()).is_none() {
+        let configured_dsn = policy.as_ref().is_some_and(|p| p.store_dsn.is_some());
+        if !configured_dsn && resolve_postgres_dsn(&process_environ()).is_none() {
             eprintln!("{}", missing_dsn_message());
             return 2;
         }

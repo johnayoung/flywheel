@@ -34,31 +34,37 @@ use std::time::{Duration, Instant};
 
 use script::write_script;
 
-/// The `claude` stand-in: the first discovery finds a tier-6 and a
-/// (higher-scoring) tier-4 finding, every later one finds nothing (so the
-/// cycles after the first are deterministic); authoring drops the tier-4 one with a reason and
-/// compiles the other into a task with a committed command grader and a
-/// manual gate (the one slot of target depth 1); anything else is a
-/// worker iteration that commits and asks to verify.
+/// The `claude` stand-in: discovery finds a tier-6 and a (higher-scoring)
+/// tier-4 finding until the tier-6 one has been authored, and nothing after
+/// that (so the cycles after the one that emitted are deterministic, and a
+/// cycle that failed before authoring is retried with the same findings);
+/// authoring drops the tier-4 one with a reason and compiles the other into
+/// a task with a committed command grader and a manual gate; anything else
+/// is a worker iteration that commits and asks to verify. Every call
+/// appends its kind to `$FAKE_STATE/claude.log` for the timeout dumps.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo '2.1.0 (Claude Code)'; exit 0; fi
 IFS= read -r first || first=""
 case "$first" in
 *"discovery dispatcher"*)
-  if [ -e "$FAKE_STATE/discovered" ]; then
+  echo "discovery $(date +%s.%N)" >> "$FAKE_STATE/claude.log"
+  if [ -e "$FAKE_STATE/authored" ]; then
     J='```json\n{\"verdicts\": []}\n```'
   else
-  : > "$FAKE_STATE/discovered"
   J='```json\n{\"verdicts\": [{\"tier\": 6, \"relevant\": true, \"reason\": \"the parser has no tests\", \"findings\": [{\"id\": \"parser-tests\", \"title\": \"Cover the parser\", \"detail\": \"no tests\", \"evidence\": [\"src/parser.sh:1\"], \"urgency\": 4, \"importance\": 6, \"blocks\": 1, \"effort\": 2, \"ready\": true}]}, {\"tier\": 4, \"relevant\": true, \"reason\": \"a README was promised\", \"findings\": [{\"id\": \"readme\", \"title\": \"Write the promised README\", \"urgency\": 5, \"importance\": 5, \"effort\": 1}]}]}\n```'
   fi
   ;;
 *"headless authoring agent"*"Cover the parser"*)
+  echo "authoring cover-parser $(date +%s.%N)" >> "$FAKE_STATE/claude.log"
+  : > "$FAKE_STATE/authored"
   J='```json\n{\"tasks\": [{\"task\": {\"id\": \"cover-parser\", \"goal\": \"Cover the parser with tests.\", \"graders\": [{\"type\": \"command\", \"name\": \"check\", \"run\": \"sh check.sh\"}, {\"type\": \"manual\", \"instruction\": \"Confirm the parser fixtures are realistic\"}], \"tags\": [], \"context\": {}}, \"authoritative_grader\": \"sh check.sh\", \"grader_source\": \"repo_command\", \"grader_target\": \"check.sh\", \"creates_files\": [\"tests/parser_test.sh\"], \"assumptions\": [\"shell tests are fine\"]}], \"dropped\": \"\"}\n```'
   ;;
 *"headless authoring agent"*)
+  echo "authoring readme $(date +%s.%N)" >> "$FAKE_STATE/claude.log"
   J='```json\n{\"tasks\": [], \"dropped\": \"no committed check can grade a README\"}\n```'
   ;;
 *)
+  echo "worker $(date +%s.%N)" >> "$FAKE_STATE/claude.log"
   id=$(basename "$PWD")
   date +%s%N > "work-$id.txt"
   git add -A >/dev/null 2>&1 && git commit -qm "work $id" >/dev/null 2>&1
@@ -205,13 +211,25 @@ fn dechunk(body: &str) -> String {
     out
 }
 
-fn wait_for<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+fn wait_for<T>(what: &str, probe: impl FnMut() -> Option<T>) -> T {
+    wait_for_or(what, probe, String::new)
+}
+
+/// [`wait_for`], with `context` (what the processes involved show) in the
+/// timeout message, so a timeout says where it stalled.
+fn wait_for_or<T>(
+    what: &str,
+    mut probe: impl FnMut() -> Option<T>,
+    context: impl FnOnce() -> String,
+) -> T {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
         if let Some(value) = probe() {
             return value;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for {what}\n{}", context());
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -337,11 +355,36 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
     assert_eq!(argv[5..], ["autopilot"], "the daemon, never --once");
     let sid = session["id"].as_str().unwrap().to_owned();
 
-    // Its first cycle: what it decided, and why.
-    let decided = wait_for("the first cycle's decision", || {
-        let answer = view();
-        (answer["view"]["decision"]["emitted"] == 1).then_some(answer)
-    });
+    // Its first cycle: what it decided, and why. The view is the hub
+    // monitor's latest read, which lists the tasks before it reads the
+    // daemon's record: wait for one read that has both the decision and
+    // the task it emitted.
+    let last_view = std::cell::RefCell::new(Value::Null);
+    let decided = wait_for_or(
+        "the first cycle's decision",
+        || {
+            let answer = view();
+            *last_view.borrow_mut() = answer.clone();
+            let view = &answer["view"];
+            (view["decision"]["emitted"] == 1 && view["candidates"][0]["state"] == "pending")
+                .then_some(answer)
+        },
+        || {
+            let (_, panel) = http(
+                &server,
+                "GET",
+                &format!("/api/flywheel/panel?folder={}", query(&root)),
+                None,
+            );
+            format!(
+                "last view: {}\npanel problem: {}\ndaemon session:\n{}\nclaude calls:\n{}",
+                last_view.borrow(),
+                panel["problem"],
+                screen_text(&server, &sid),
+                std::fs::read_to_string(dir.join("claude.log")).unwrap_or_default()
+            )
+        },
+    );
     let pilot = &decided["view"];
     assert_eq!(pilot["live"], true, "{pilot}");
     assert_eq!(decided["sessions"][0]["id"], json!(sid));
@@ -695,11 +738,14 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
             .then_some(text)
     });
     assert!(screen.contains("cover-parser verified"), "{screen}");
-    let landed = wait_for("the view to show it verified", || {
+    // The worker archived the phase before it exited; the monitor's read
+    // may predate the move (the run already verified, the file still
+    // active), so wait for the read that shows both.
+    let landed = wait_for("the view to show it verified and archived", || {
         let answer = view();
-        (answer["view"]["candidates"][0]["state"] == "verified").then_some(answer)
+        let candidate = &answer["view"]["candidates"][0];
+        (candidate["state"] == "verified" && candidate["archived"] == true).then_some(answer)
     });
-    assert_eq!(landed["view"]["candidates"][0]["archived"], true);
     assert!(landed["view"]["gates"].as_array().unwrap().is_empty());
 
     // The CLI verb against the same hub.

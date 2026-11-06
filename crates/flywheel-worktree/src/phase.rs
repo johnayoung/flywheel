@@ -17,10 +17,7 @@
 //!   failing phase-verify, a same-named archive already present) is
 //!   reported through the log seam.
 
-use crate::submitter::{
-    Logger, git,
-    merge_lock,
-};
+use crate::submitter::{Logger, git, merge_lock};
 use chrono::{DateTime, Utc};
 use flywheel_core::events::{DomainEventKind, DomainEventPayload, LANDING_STRAND_KINDS};
 use flywheel_core::lifecycle::Status;
@@ -1015,7 +1012,6 @@ fn commit_archive_move(repo_root: &Path, active_dir: &Path, dest: &Path, log: &d
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use crate::submitter::test_support::{
         commit, git_ok, init_repo, is_ancestor as git_is_ancestor, rev,
     };
@@ -1025,6 +1021,7 @@ mod tests {
     use flywheel_core::lifecycle::Lifecycle;
     use flywheel_core::store_memory::InMemoryStore;
     use flywheel_orchestrator::claims::{InMemoryClaimStore, STOP_DANGLING_PREREQUISITE};
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     fn repo() -> (tempfile::TempDir, PathBuf) {

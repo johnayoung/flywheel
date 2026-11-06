@@ -5,7 +5,7 @@
 //! through the `gh` CLI (reusing the same injectable [`GhRunner`] seam) and
 //! compiles each into a [`WorkItem`] the orchestrator drives to green. The
 //! two adapters never mix: issues and CI failures have different listing,
-//! keying, and write-back, so they live behind separate `[source] kind`
+//! keying, and write-back, so they live behind separate `--source`
 //! selectors (spec 00052 decision D-1).
 //!
 //! Run -> Task compilation:
@@ -15,7 +15,7 @@
 //!   is ONE work item, not a new one every poll/push (D-3). It is NOT keyed
 //!   on the per-run `databaseId` (that advances as the head moves, which
 //!   would queue an unbounded stream of duplicates).
-//! * `graders` come solely from the operator's policy `[[defaults.graders]]`.
+//! * `graders` come solely from the policy's default graders (the `verify` config key).
 //!   A CI run carries no embedded spec block, so a run that resolves to
 //!   ZERO graders is **not runnable**: it is skipped and logged rather than
 //!   run ungated or graded by a fabricated check the operator never

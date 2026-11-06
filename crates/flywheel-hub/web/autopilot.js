@@ -189,7 +189,7 @@ window.FwHubAutopilot = function (ctx) {
         type: "button",
         className: "slab fw-start",
         disabled: broken || busy,
-        title: broken ? "The policy does not load: fix flywheel.toml first" : "Run fw autopilot in a new shell session here (asks first: its work lands unattended)",
+        title: broken ? "The project does not resolve: fix its config first" : "Run fw autopilot in a new shell session here (asks first: its work lands unattended)",
         onclick: () => start(key, panel),
       }, icon("plus"), "Start autopilot"));
     }

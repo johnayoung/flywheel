@@ -1,5 +1,7 @@
-//! Autopilot from the hub, end to end: a temp flywheel-adopted git repo
-//! (directory work source, SQLite store), a `claude` stand-in on PATH
+//! Autopilot from the hub, end to end: a temp git repo adopted as a home
+//! project (`$FLYWHEEL_HOME` in the tempdir: its tasks, SQLite store, and
+//! autopilot activity live under the project dir, never in the repo), a
+//! `claude` stand-in on PATH
 //! that answers autopilot's discovery and authoring prompts and a worker's
 //! iteration, and the real `fw hub serve`. Through the hub's API: start
 //! the real `fw autopilot` daemon in a hub session, read what it decided
@@ -22,6 +24,7 @@ use flywheel_core::store::{AttemptStore, LifecycleStore};
 use flywheel_core::store_sqlite::SqliteStore;
 use flywheel_hub::autopilot::{GateDecision, GateRefused};
 use flywheel_hub::flywheel::FlywheelProvider;
+use flywheel_orchestrator::home::{Home, resolve_project};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -31,12 +34,9 @@ use std::time::{Duration, Instant};
 
 use script::write_script;
 
-const POLICY: &str = "[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n\n\
-                      [paths]\ndb = \".flywheel/flywheel.sqlite\"\n\n\
-                      [autopilot]\ntarget_depth = 1\ninterval_seconds = 2\n";
-
-/// The `claude` stand-in: discovery finds a tier-6 and a (higher-scoring)
-/// tier-4 finding; authoring drops the tier-4 one with a reason and
+/// The `claude` stand-in: the first discovery finds a tier-6 and a
+/// (higher-scoring) tier-4 finding, every later one finds nothing (so the
+/// cycles after the first are deterministic); authoring drops the tier-4 one with a reason and
 /// compiles the other into a task with a committed command grader and a
 /// manual gate (the one slot of target depth 1); anything else is a
 /// worker iteration that commits and asks to verify.
@@ -45,7 +45,12 @@ if [ "$1" = "--version" ]; then echo '2.1.0 (Claude Code)'; exit 0; fi
 IFS= read -r first || first=""
 case "$first" in
 *"discovery dispatcher"*)
+  if [ -e "$FAKE_STATE/discovered" ]; then
+    J='```json\n{\"verdicts\": []}\n```'
+  else
+  : > "$FAKE_STATE/discovered"
   J='```json\n{\"verdicts\": [{\"tier\": 6, \"relevant\": true, \"reason\": \"the parser has no tests\", \"findings\": [{\"id\": \"parser-tests\", \"title\": \"Cover the parser\", \"detail\": \"no tests\", \"evidence\": [\"src/parser.sh:1\"], \"urgency\": 4, \"importance\": 6, \"blocks\": 1, \"effort\": 2, \"ready\": true}]}, {\"tier\": 4, \"relevant\": true, \"reason\": \"a README was promised\", \"findings\": [{\"id\": \"readme\", \"title\": \"Write the promised README\", \"urgency\": 5, \"importance\": 5, \"effort\": 1}]}]}\n```'
+  fi
   ;;
 *"headless authoring agent"*"Cover the parser"*)
   J='```json\n{\"tasks\": [{\"task\": {\"id\": \"cover-parser\", \"goal\": \"Cover the parser with tests.\", \"graders\": [{\"type\": \"command\", \"name\": \"check\", \"run\": \"sh check.sh\"}, {\"type\": \"manual\", \"instruction\": \"Confirm the parser fixtures are realistic\"}], \"tags\": [], \"context\": {}}, \"authoritative_grader\": \"sh check.sh\", \"grader_source\": \"repo_command\", \"grader_target\": \"check.sh\", \"creates_files\": [\"tests/parser_test.sh\"], \"assumptions\": [\"shell tests are fine\"]}], \"dropped\": \"\"}\n```'
@@ -75,11 +80,10 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// The adopted repo: a committed check (`check.sh`) the authored task's
-/// grader runs, and nothing queued.
-fn adopted_repo(root: &Path) {
+/// grader runs, and nothing queued. Returns its project dir under the
+/// flywheel home `home` (created here, as any `fw` verb in the repo would).
+fn adopted_repo(root: &Path, home: &Path) -> PathBuf {
     std::fs::create_dir_all(root.join("src")).unwrap();
-    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
-    std::fs::write(root.join(".gitignore"), ".flywheel/\n").unwrap();
     std::fs::write(root.join("check.sh"), "#!/bin/sh\nexit 0\n").unwrap();
     std::fs::write(root.join("src/parser.sh"), "echo parse\n").unwrap();
     git(root, &["init", "-q", "-b", "main"]);
@@ -91,6 +95,13 @@ fn adopted_repo(root: &Path) {
     git(root, &["config", "commit.gpgsign", "false"]);
     git(root, &["add", "."]);
     git(root, &["commit", "-q", "-m", "adopt"]);
+    let project = resolve_project(&Home::at(home), root).unwrap();
+    project.paths.root().to_path_buf()
+}
+
+/// The flywheel home every process of a test shares.
+fn flywheel_home(dir: &Path) -> PathBuf {
+    dir.join("flywheel-home")
 }
 
 struct Server {
@@ -123,7 +134,8 @@ fn start(dir: &Path) -> Server {
         .env("PATH", path_with_bin(dir))
         .env("SHELL", "/bin/sh")
         .env("HOME", &home)
-        .env_remove("FLYWHEEL_HOME")
+        .env("FLYWHEEL_HOME", flywheel_home(dir))
+        .env("FAKE_STATE", dir)
         .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"))
         .env("CODEX_HOME", dir.join("codex-home"))
         .stdout(Stdio::piped())
@@ -262,8 +274,8 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     write_script(&dir.join("bin/claude"), FAKE_CLAUDE);
     let root = dir.join("repo");
-    adopted_repo(&root);
-    let db = root.join(".flywheel/flywheel.sqlite");
+    let project = adopted_repo(&root, &flywheel_home(&dir));
+    let db = project.join("flywheel.sqlite");
     let server = start(&dir);
     let (code, workspace) = http(
         &server,
@@ -321,14 +333,8 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
         .filter_map(Value::as_str)
         .collect();
     assert_eq!(argv[3], "fw-autopilot");
-    // The folder's flywheel.toml is named: the daemon no longer
-    // auto-detects it.
-    let policy_flag = format!("--policy={}", root.join("flywheel.toml").display());
-    assert_eq!(
-        argv[5..],
-        ["autopilot", policy_flag.as_str()],
-        "the daemon, never --once"
-    );
+    // The daemon resolves the folder's home project itself: no flags.
+    assert_eq!(argv[5..], ["autopilot"], "the daemon, never --once");
     let sid = session["id"].as_str().unwrap().to_owned();
 
     // Its first cycle: what it decided, and why.
@@ -383,7 +389,10 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
     // Pause and resume through the daemon's own marker.
     let marker = PathBuf::from(format!(
         "{}.paused",
-        root.join(AUTOPILOT_ACTIVITY).display()
+        project
+            .join("logs/autopilot")
+            .join(AUTOPILOT_ACTIVITY)
+            .display()
     ));
     let (code, paused) = http(
         &server,
@@ -702,7 +711,7 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
             .arg("--state-dir")
             .arg(dir.join("state"))
             .env("HOME", dir.join("home"))
-            .env_remove("FLYWHEEL_HOME")
+            .env("FLYWHEEL_HOME", flywheel_home(&dir))
             .stdin(Stdio::null())
             .output()
             .unwrap()
@@ -711,14 +720,13 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
     let text = String::from_utf8_lossy(&status.stdout);
     assert_eq!(status.status.code(), Some(0), "{text}");
     assert!(text.starts_with("autopilot: stopped"), "{text}");
-    // The last cycle (the queue held at its target), and the emitted
-    // task with its score and landed run.
+    // The built-in cadence (no config knob), the cycle that emitted the
+    // task and why it dropped the other finding, and the emitted task
+    // with its score and landed run.
     assert!(
-        text.contains("already at or above target 1; nothing emitted"),
+        text.contains("config: target depth 5, landing merge, every 300.0s"),
         "{text}"
     );
-    // ...and, kept since, the cycle that emitted it and why it dropped the
-    // other finding.
     assert!(text.contains("emitted 1, dropped 1"), "{text}");
     assert!(
         text.contains("(tier 4): no committed check can grade a README"),
@@ -743,10 +751,20 @@ fn the_hub_starts_reads_pauses_gates_and_stops_the_real_autopilot() {
     assert!(marker.is_file());
     assert_eq!(cli(&["resume"]).status.code(), Some(0));
     assert!(!marker.exists());
+    // Daemon, workers, gates, and the landing left nothing in the repo
+    // tree but the landed commit.
+    let porcelain = Command::new("git")
+        .args(["status", "--porcelain", "--ignored"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&porcelain.stdout), "");
 }
 
-fn seed_parked(db: &Path, task_id: &str, run_id: &str) {
-    let store = SqliteStore::open(db).unwrap();
+/// Seed a run parked on manual gate 2 into the project store at `db`
+/// (partitioned by the project id, as every `fw` verb opens it).
+fn seed_parked(db: &Path, project_id: &str, task_id: &str, run_id: &str) {
+    let store = SqliteStore::open_partition(db, project_id).unwrap();
     let now = Utc::now();
     let mut lc = Lifecycle::new(task_id).with_run_id(run_id);
     for status in [
@@ -767,12 +785,14 @@ fn seed_parked(db: &Path, task_id: &str, run_id: &str) {
 #[test]
 fn a_deny_carries_feedback_and_binds_to_the_parked_gate() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
-    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
-    let db = root.join(".flywheel/flywheel.sqlite");
-    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-    seed_parked(&db, "gated", "run-gated");
-    let provider = HubFlywheel::new("/usr/bin/false");
+    let dir = tmp.path().canonicalize().unwrap();
+    let root = dir.join("repo");
+    let home = flywheel_home(&dir);
+    let project = adopted_repo(&root, &home);
+    let db = project.join("flywheel.sqlite");
+    let project_id = project.file_name().unwrap().to_str().unwrap().to_owned();
+    seed_parked(&db, &project_id, "gated", "run-gated");
+    let provider = HubFlywheel::new("/usr/bin/false").with_home(&home);
 
     let deny = |gate: Option<u32>, attempt: Option<u32>| {
         provider.decide_gate(
@@ -821,6 +841,13 @@ fn a_deny_carries_feedback_and_binds_to_the_parked_gate() {
     // Pause and resume write the daemon's marker, as `fw autopilot
     // --pause` does.
     assert!(provider.set_autopilot_paused(&root, true).unwrap());
+    assert!(
+        project
+            .join("logs/autopilot")
+            .join(format!("{AUTOPILOT_ACTIVITY}.paused"))
+            .is_file(),
+        "the marker is the project's, never in the repo"
+    );
     let view = provider.panel(&root).intake.unwrap();
     assert!(view.paused);
     assert_eq!(view.state.as_str(), "absent");

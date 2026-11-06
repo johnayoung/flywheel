@@ -11,9 +11,8 @@ use std::io::Write;
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct AutopilotArgs {
-    /// The adopted folder (a workspace folder with flywheel.toml or
-    /// .flywheel/); a relative path is resolved here for this machine's
-    /// hub.
+    /// The adopted folder (a workspace folder whose git repo is a flywheel
+    /// project); a relative path is resolved here for this machine's hub.
     folder: String,
     #[command(subcommand)]
     action: Action,

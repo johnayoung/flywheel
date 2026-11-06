@@ -59,10 +59,10 @@ use flywheel_orchestrator::autopilot_activity::{
     PHASE_STOPPED, epoch_now, is_paused, is_record_live, read_activity, set_paused,
 };
 use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore, REASON_AWAITING_APPROVAL};
+use flywheel_orchestrator::config::Access;
 use flywheel_orchestrator::config::{REPO_CONFIG_FILENAME, read_repo_file};
 use flywheel_orchestrator::home::{Home, stored_project_id};
 use flywheel_orchestrator::pg_preflight::dsn_target;
-use flywheel_orchestrator::config::Access;
 use flywheel_orchestrator::policy::WorkPolicy;
 use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkSource};
 use flywheel_orchestrator::store_factory::{StoreBundle, resolve_postgres_dsn};
@@ -362,7 +362,11 @@ impl Folder {
     }
 
     /// Re-resolve the project when its config changed (or on first use).
-    fn resolve(&mut self, home: &Result<Home, String>, root: &Path) -> Result<&mut Resolved, String> {
+    fn resolve(
+        &mut self,
+        home: &Result<Home, String>,
+        root: &Path,
+    ) -> Result<&mut Resolved, String> {
         let home = home.as_ref().map_err(Clone::clone)?;
         let current = config_stamp(home, root);
         if self.config_stamp != Some(current) || self.resolved.is_none() {
@@ -450,7 +454,11 @@ impl Resolved {
         }
         if self.stores.is_none() {
             if !sqlite
-                && self.policy.as_ref().and_then(|p| p.store_dsn.as_ref()).is_none()
+                && self
+                    .policy
+                    .as_ref()
+                    .and_then(|p| p.store_dsn.as_ref())
+                    .is_none()
                 && resolve_postgres_dsn(&process_environ()).is_none()
             {
                 return Err(format!(
@@ -1223,7 +1231,9 @@ impl FlywheelProvider for HubFlywheel {
     ) -> Result<GateDecided, GateRefused> {
         let state = self.folder(folder);
         let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-        let resolved = state.resolve(&self.home(), folder).map_err(GateRefused::Store)?;
+        let resolved = state
+            .resolve(&self.home(), folder)
+            .map_err(GateRefused::Store)?;
         let core = match resolved.stores(folder).map_err(GateRefused::Store)? {
             Some(bundle) => Arc::clone(&bundle.core),
             None => {

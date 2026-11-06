@@ -1,4 +1,4 @@
-//! `[sandbox.network]` to Docker network resolution (spec 00044 G6).
+//! The sandbox network policy to Docker network resolution (spec 00044 G6).
 //!
 //! The honest network model: the orchestrator owns *attachment*, the
 //! operator owns the *proxy*. Network policy is mapped to a Docker

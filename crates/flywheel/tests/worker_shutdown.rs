@@ -122,11 +122,25 @@ fn wait_until(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// The test environment every spawned `fw` gets: a tempdir home, never the
+/// operator's.
+fn test_env(command: &mut Command, root: &Path) {
+    command
+        .env("HOME", root)
+        .env("FLYWHEEL_HOME", root.join("flywheel-home"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("CLAUDE_CONFIG_DIR", root.join("claude-config"))
+        .env_remove("FLYWHEEL_PG_DSN")
+        .env_remove("DATABASE_URL");
+}
+
 /// A repo with two queued tasks and the scripted agent on PATH.
 struct Fixture {
     _dir: tempfile::TempDir,
     root: PathBuf,
     repo: PathBuf,
+    /// The repo's home project dir (`$FLYWHEEL_HOME/projects/<id>`).
+    project: PathBuf,
     /// Every pid this test learned about, SIGKILLed on drop so a failing
     /// assertion never leaks processes.
     tracked: Vec<i32>,
@@ -163,14 +177,17 @@ impl Fixture {
         git(&repo, &["config", "user.name", "worker shutdown"]);
         git(&repo, &["config", "commit.gpgsign", "false"]);
         std::fs::write(repo.join("README.md"), "base\n").unwrap();
-        std::fs::write(
-            repo.join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n",
-        )
-        .unwrap();
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-q", "-m", "init"]);
-        let phase = repo.join(".flywheel/tasks/active/01-shutdown");
+        let mut path = Command::new(env!("CARGO_BIN_EXE_fw"));
+        path.args(["project", "path"])
+            .current_dir(&repo)
+            .stdin(Stdio::null());
+        test_env(&mut path, &root);
+        let output = path.output().unwrap();
+        assert!(output.status.success(), "fw project path: {output:?}");
+        let project = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        let phase = project.join("tasks/active/01-shutdown");
         std::fs::create_dir_all(&phase).unwrap();
         for id in ["task-a", "task-b"] {
             std::fs::write(
@@ -185,6 +202,7 @@ impl Fixture {
             _dir: dir,
             root,
             repo,
+            project,
             tracked: Vec::new(),
         }
     }
@@ -205,16 +223,11 @@ impl Fixture {
         let log = std::fs::File::create(self.root.join("worker.log")).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_fw"));
         command
-            // The repo's flywheel.toml is legacy: name it explicitly.
-            .args(["worker", "--policy", "flywheel.toml"])
+            .arg("worker")
             .args(["--concurrency", &concurrency.to_string()])
             .args(["--heartbeat", "1", "--poll-interval", "1"])
             .current_dir(&self.repo)
             .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("HOME", &self.root)
-            .env_remove("FLYWHEEL_HOME")
-            .env("CLAUDE_CONFIG_DIR", self.root.join("claude-config"))
-            .env_remove("FLYWHEEL_PG_DSN")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log);
@@ -230,6 +243,7 @@ impl Fixture {
                 Ok(())
             });
         }
+        test_env(&mut command, &self.root);
         let child = command.spawn().unwrap();
         self.tracked.push(child.id() as i32);
         child
@@ -247,7 +261,7 @@ impl Fixture {
     /// can still meet a transient lock (WAL recovery, the last writer's
     /// close-time checkpoint), so wait it out instead of failing the read.
     fn db(&self) -> rusqlite::Connection {
-        let db = rusqlite::Connection::open(self.repo.join(".flywheel/flywheel.sqlite")).unwrap();
+        let db = rusqlite::Connection::open(self.project.join("flywheel.sqlite")).unwrap();
         db.busy_timeout(SHUTDOWN_DEADLINE).unwrap();
         db
     }
@@ -276,7 +290,7 @@ impl Fixture {
 
     fn worker_log(&self) -> String {
         let mut text = std::fs::read_to_string(self.root.join("worker.log")).unwrap_or_default();
-        if let Ok(entries) = std::fs::read_dir(self.repo.join(".flywheel/logs/worker")) {
+        if let Ok(entries) = std::fs::read_dir(self.project.join("logs/worker")) {
             for entry in entries.flatten() {
                 text.push_str(&format!("\n== {}\n", entry.path().display()));
                 text.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
@@ -677,7 +691,7 @@ fn a_signal_during_startup_is_an_orderly_stop() {
         assert_eq!(fx.agents(), Vec::<i32>::new(), "{log}");
         // The store may not even hold its tables yet: none is no claim.
         let has = |table: &str| {
-            fx.repo.join(".flywheel/flywheel.sqlite").exists()
+            fx.project.join("flywheel.sqlite").exists()
                 && fx
                     .db()
                     .query_row(

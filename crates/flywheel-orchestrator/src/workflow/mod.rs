@@ -5,7 +5,7 @@
 //! Every verb is a library function taking parsed arguments, already-open
 //! stores, and the two output sinks, and returning the process exit code.
 //! [`main`] / [`run`] wire them to the command line: resolve the effective
-//! policy (flag > `flywheel.toml` > the home project's built-in default),
+//! policy (the home project's built-in defaults plus the effective config),
 //! build the work
 //! source through the source registry, open the policy-selected stores,
 //! then dispatch. The two verbs whose bodies live elsewhere -- the
@@ -836,8 +836,7 @@ pub fn dispatch(
     match command {
         Command::Init(args) => Ok(cmd_init(&args, init_host, out, err)?),
         Command::Next(common) => {
-            let policy = policy_of(given(&common.db) && given(&common.tasks_dir),
-            )?;
+            let policy = policy_of(given(&common.db) && given(&common.tasks_dir))?;
             let source =
                 resolve_work_source(common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
             let db_path = resolve_db_path(common.db.as_deref(), policy.as_ref());
@@ -860,8 +859,7 @@ pub fn dispatch(
                 writeln!(err, "error: orchestrate is not available in this build")?;
                 return Ok(2);
             };
-            let policy = policy_of(given(&args.common.db) && given(&args.common.tasks_dir),
-            )?;
+            let policy = policy_of(given(&args.common.db) && given(&args.common.tasks_dir))?;
             let source =
                 resolve_work_source(args.common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
@@ -891,8 +889,7 @@ pub fn dispatch(
             Ok(runner(request, out, err))
         }
         Command::Status(args) => {
-            let policy = policy_of(given(&args.common.db) && given(&args.common.tasks_dir),
-            )?;
+            let policy = policy_of(given(&args.common.db) && given(&args.common.tasks_dir))?;
             let source =
                 resolve_work_source(args.common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
@@ -942,8 +939,7 @@ pub fn dispatch(
                 writeln!(err, "error: archive is not available in this build")?;
                 return Ok(2);
             };
-            let policy = policy_of(given(&common.db) && given(&common.tasks_dir),
-            )?;
+            let policy = policy_of(given(&common.db) && given(&common.tasks_dir))?;
             let tasks_dir = resolve_directory_tasks_dir(
                 "archive",
                 common.tasks_dir.as_deref(),
@@ -989,8 +985,7 @@ pub fn dispatch(
             cmd_validate(&tasks_dir, &repo_root, out, err)
         }
         Command::RecheckBlocked(args) => {
-            let policy = policy_of(given(&args.common.db) && given(&args.common.tasks_dir),
-            )?;
+            let policy = policy_of(given(&args.common.db) && given(&args.common.tasks_dir))?;
             let source =
                 resolve_work_source(args.common.tasks_dir.as_deref(), policy.as_ref(), &sources)?;
             let db_path = resolve_db_path(args.common.db.as_deref(), policy.as_ref());
@@ -1551,6 +1546,54 @@ mod tests {
             assert!(err.contains("not inside a git repository"), "{err}");
             assert!(!out.contains("01-phase/t1"));
         }
+    }
+
+    fn git_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn known_project_reads_without_minting_and_project_policy_is_cwd_free() {
+        let tmp = TempDir::new().unwrap();
+        let home = home::Home::at(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        git_repo(&repo);
+        assert_eq!(known_project(&home, &repo), None);
+        assert_eq!(
+            home::stored_project_id(&repo).unwrap(),
+            None,
+            "nothing minted"
+        );
+        assert!(!home.root().exists(), "nothing written to the home");
+
+        let cwd = std::env::current_dir().unwrap();
+        let (policy, warnings) = project_policy_at(&home, &repo, Access::ReadOnly).unwrap();
+        assert_eq!(std::env::current_dir().unwrap(), cwd, "the cwd never moves");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let project = policy.project.clone().unwrap();
+        let paths = project.paths();
+        assert_eq!(known_project(&home, &repo), Some(project.id.clone()));
+        assert_eq!(policy.tasks_dir, Some(paths.tasks()));
+        assert_eq!(policy.db_path, Some(paths.db()));
+        assert_eq!(policy.sandbox_root, Some(paths.worktrees()));
+        assert_eq!(policy.held_out_root(), Some(paths.held_out()));
+        assert!(paths.tasks().join("active").is_dir());
+
+        // A project id another clone declared is known once its dir exists.
+        let other = tmp.path().join("other");
+        git_repo(&other);
+        std::fs::write(
+            other.join(crate::config::REPO_CONFIG_FILENAME),
+            format!("project_id = \"{}\"\n", project.id),
+        )
+        .unwrap();
+        assert_eq!(known_project(&home, &other), Some(project.id));
     }
 
     #[test]

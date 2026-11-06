@@ -1,7 +1,7 @@
 //! The Flywheel panel: verified work beside the terminals.
 //!
-//! For every workspace folder that is a flywheel-adopted repo (a
-//! `flywheel.toml` or a `.flywheel/` dir) the hub shows what the loop is
+//! For every workspace folder that is a flywheel project (a git repo whose
+//! project id the flywheel home knows) the hub shows what the loop is
 //! doing there -- active phases and their tasks with lifecycle status,
 //! recent runs with their grader receipts, worker / autopilot liveness,
 //! claims, and the stop / strand alerts `fw status` surfaces -- read-only.

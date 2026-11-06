@@ -142,7 +142,7 @@ pub(super) async fn adopted_folder(
             return Err(Refusal::new(
                 StatusCode::NOT_FOUND,
                 format!(
-                    "{} is not a flywheel repo (no flywheel.toml or .flywheel/)",
+                    "{} is not a flywheel project (no project id flywheel knows; run `fw init` there)",
                     path.display()
                 ),
             ));

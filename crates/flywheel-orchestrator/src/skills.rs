@@ -353,7 +353,7 @@ mod tests {
     #[test]
     fn fw_verify_instructs_held_out_registration_and_keeps_fence() {
         let text = render_skill("fw-verify", &SkillRenderSettings::default()).unwrap();
-        assert!(text.contains("[held_out] root"));
+        assert!(!text.contains("[held_out]"));
         assert!(text.contains("<held-out-root>/<task_id>.json"));
         assert!(text.contains("KEYED BY the owning task id"));
         assert!(text.contains("ABSOLUTE OPERATOR PATH"));

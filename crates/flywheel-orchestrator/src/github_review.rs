@@ -9,7 +9,7 @@
 //! a [`WorkItem`] the orchestrator drives an agent to address. The three
 //! adapters never mix: issues, CI failures, and review threads have
 //! different listing, keying, and write-back, so each lives behind its own
-//! `[source] kind` selector (D-1).
+//! `--source` selector (D-1).
 //!
 //! Thread -> Task compilation:
 //!
@@ -18,8 +18,8 @@
 //!   is ONE work item, not a fresh one every time a reviewer comments. It
 //!   is NOT keyed on a comment id or comment count (those advance on every
 //!   reply, which would re-queue the same concern endlessly).
-//! * `graders` come solely from the operator's policy
-//!   `[[defaults.graders]]`, NEVER from the thread's `isResolved` state and
+//! * `graders` come solely from the policy's default graders (the
+//!   `verify` config key), NEVER from the thread's `isResolved` state and
 //!   never compiled from the review comment text (D-4). A review comment is
 //!   subjective and not itself a check, so a thread that resolves to ZERO
 //!   graders is **not runnable**: it is skipped and logged rather than run

@@ -39,6 +39,20 @@ struct Repo {
     _dir: tempfile::TempDir,
     root: PathBuf,
     repo: PathBuf,
+    /// The repo's home project dir (`$FLYWHEEL_HOME/projects/<id>`).
+    project: PathBuf,
+}
+
+/// The test environment every spawned `fw` gets: a tempdir home, never the
+/// operator's.
+fn test_env(command: &mut Command, root: &Path) {
+    command
+        .env("HOME", root)
+        .env("FLYWHEEL_HOME", root.join("flywheel-home"))
+        .env("XDG_STATE_HOME", root.join("xdg-state"))
+        .env("CLAUDE_CONFIG_DIR", root.join("claude-config"))
+        .env_remove("FLYWHEEL_PG_DSN")
+        .env_remove("DATABASE_URL");
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {
@@ -72,14 +86,17 @@ impl Repo {
         git(&repo, &["config", "user.name", "worker scope"]);
         git(&repo, &["config", "commit.gpgsign", "false"]);
         std::fs::write(repo.join("README.md"), "base\n").unwrap();
-        std::fs::write(
-            repo.join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n",
-        )
-        .unwrap();
         git(&repo, &["add", "-A"]);
         git(&repo, &["commit", "-qm", "init"]);
-        let phase = repo.join(".flywheel/tasks/active/01-scope");
+        let mut path = Command::new(env!("CARGO_BIN_EXE_fw"));
+        path.args(["project", "path"])
+            .current_dir(&repo)
+            .stdin(Stdio::null());
+        test_env(&mut path, &root);
+        let output = path.output().unwrap();
+        assert!(output.status.success(), "fw project path: {output:?}");
+        let project = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+        let phase = project.join("tasks/active/01-scope");
         std::fs::create_dir_all(&phase).unwrap();
         let task = |id: &str, run: &str, prerequisites: &[&str]| {
             let body = serde_json::json!({
@@ -99,6 +116,7 @@ impl Repo {
             _dir: dir,
             root,
             repo,
+            project,
         }
     }
 
@@ -107,22 +125,17 @@ impl Repo {
         let mut paths = vec![self.root.join("bin")];
         paths.extend(std::env::split_paths(&path));
         let mut command = Command::new(env!("CARGO_BIN_EXE_fw"));
-        // The repo's flywheel.toml is legacy: name it explicitly.
         command
-            .args(["worker", "--policy", "flywheel.toml"])
+            .arg("worker")
             .args(args)
             .args(["--heartbeat", "0", "--poll-interval", "1"])
             .current_dir(&self.repo)
             .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("HOME", &self.root)
-            .env_remove("FLYWHEEL_HOME")
             .env("RAN_LOG", self.root.join("ran.log"))
-            .env("CLAUDE_CONFIG_DIR", self.root.join("claude-config"))
-            .env_remove("FLYWHEEL_PG_DSN")
-            .env_remove("DATABASE_URL")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        test_env(&mut command, &self.root);
         command
     }
 
@@ -146,7 +159,7 @@ impl Repo {
     }
 
     fn db_path(&self) -> PathBuf {
-        self.repo.join(".flywheel/flywheel.sqlite")
+        self.project.join("flywheel.sqlite")
     }
 
     /// Every task with a lifecycle, sorted.
@@ -214,6 +227,8 @@ fn only_the_named_task_runs_and_every_other_stays_untouched() {
     assert_eq!(repo.ran(), ["beta"]);
     assert_eq!(repo.touched(), ["beta"]);
     assert_eq!(repo.landed(), ["work beta", "init"]);
+    // Every runtime artifact lives under the home project, none in the repo.
+    assert_eq!(git(&repo.repo, &["status", "--porcelain", "--ignored"]), "");
     // Named again once verified: nothing runs, and it reports so.
     let again = repo.worker(&["--task", "beta"]);
     assert_eq!(again.code, 0, "{}{}", again.stdout, again.stderr);
@@ -322,7 +337,9 @@ fn a_pool_never_outnumbers_its_scope_and_runs_no_extras() {
 fn a_claim_another_worker_holds_is_waited_out_never_stolen() {
     let repo = Repo::new();
     // The store exists once a worker opened it; open it the same way.
-    let claims = SqliteClaimStore::open(repo.db_path()).unwrap();
+    // Bound to the project's partition (the project dir's name is its id).
+    let partition = repo.project.file_name().unwrap().to_string_lossy();
+    let claims = SqliteClaimStore::open_partition(repo.db_path(), &partition).unwrap();
     let held = claims
         .acquire_claim("beta", "peer-worker", Utc::now(), 600.0, &BTreeSet::new())
         .unwrap()
@@ -366,13 +383,9 @@ fn a_claim_another_worker_holds_is_waited_out_never_stolen() {
 #[test]
 fn a_held_out_gate_block_parks_the_task_and_exits_one() {
     let repo = Repo::new();
-    std::fs::write(
-        repo.repo.join("flywheel.toml"),
-        "[source]\nkind = \"directory\"\n\n[held_out]\nroot = \".flywheel/verification/held-out\"\n",
-    )
-    .unwrap();
-    git(&repo.repo, &["commit", "-qam", "gate"]);
-    let held_out = repo.repo.join(".flywheel/verification/held-out");
+    // The gate is fixed at the project's held-out/ and on once it holds a
+    // registration.
+    let held_out = repo.project.join("held-out");
     std::fs::create_dir_all(&held_out).unwrap();
     std::fs::write(
         held_out.join("gamma.json"),
@@ -388,7 +401,7 @@ fn a_held_out_gate_block_parks_the_task_and_exits_one() {
         summary(&run)
     );
     assert_eq!(repo.ran(), ["gamma"]);
-    assert_eq!(repo.landed(), ["gate", "init"]);
+    assert_eq!(repo.landed(), ["init"]);
 }
 
 #[test]
@@ -396,7 +409,7 @@ fn a_sandbox_that_will_not_prepare_settles_parked_instead_of_idling() {
     let repo = Repo::new();
     // A stray directory where gamma's worktree goes: the merge strategy
     // refuses to clobber it on every attempt.
-    std::fs::create_dir_all(repo.repo.join(".flywheel/worktrees/gamma")).unwrap();
+    std::fs::create_dir_all(repo.project.join("worktrees/gamma")).unwrap();
     let run = repo.worker(&["--task", "gamma"]);
     assert_eq!(run.code, 1, "{}{}", run.stdout, run.stderr);
     assert!(
@@ -418,7 +431,7 @@ fn a_sandbox_that_will_not_prepare_settles_parked_instead_of_idling() {
 #[test]
 fn a_dependent_held_behind_an_unmerged_phase_is_refused_at_start() {
     let repo = Repo::new();
-    let next = repo.repo.join(".flywheel/tasks/active/02-next");
+    let next = repo.project.join("tasks/active/02-next");
     std::fs::create_dir_all(&next).unwrap();
     let omega = serde_json::json!({
         "id": "omega",

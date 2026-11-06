@@ -905,11 +905,11 @@ window.FwHubFlywheel = function (ctx) {
         title: untrusted
           ? `Approve .flywheel.toml first: ${untrusted.command}`
           : broken
-          ? "The policy does not load (see below): fix flywheel.toml, then start a worker"
+          ? "The project does not resolve (see below): fix its config, then start a worker"
           : "Run fw worker in a new shell session in this folder: it drains every active task not done yet (a task's run button runs that one alone)",
       },
       icon("plus"),
-      untrusted ? "Run fw trust first" : broken ? "Fix flywheel.toml first" : panel.worker.live ? "Start another worker" : "Start worker here",
+      untrusted ? "Run fw trust first" : broken ? "Fix the config first" : panel.worker.live ? "Start another worker" : "Start worker here",
     );
     const goto = workers.length
       ? el("button", {

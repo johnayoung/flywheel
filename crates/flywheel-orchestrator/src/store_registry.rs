@@ -1,5 +1,5 @@
 //! The registries of core and claim store backends: the names an operator can
-//! select in `[store] backend`, each bound to a builder. The two families
+//! select with the `store` config key, each bound to a builder. The two families
 //! (core store, claim store) share one builder signature so the factory in
 //! [`crate::store_factory`] dispatches by name with no per-backend branch;
 //! each registry owns the unknown-name failure for its family.
@@ -38,8 +38,8 @@ use crate::store_factory::StoreConfigError;
 /// `project_id` is the partition key both stores are opened with: every
 /// row they read or write carries it, so one database (one Postgres DSN)
 /// holds many projects. The home project's resolved id when the invocation
-/// resolved one, else [`DEFAULT_PARTITION`] (explicit legacy `--db` /
-/// `--policy` paths).
+/// resolved one, else [`DEFAULT_PARTITION`] (explicit `--db` /
+/// `--tasks-dir` paths that skip project resolution).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {
     pub backend: String,

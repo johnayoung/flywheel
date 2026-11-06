@@ -1,5 +1,5 @@
 //! The single construction point for the core store and the claim store a
-//! `[store]` config selects. Both are routed by name through
+//! `store` config key selects. Both are routed by name through
 //! [`StoreRegistries`], so adding a backend is a registration, never a branch
 //! here. The postgres DSN is never part of the config -- it is resolved from
 //! the environment (`FLYWHEEL_PG_DSN`, falling back to `DATABASE_URL`) and

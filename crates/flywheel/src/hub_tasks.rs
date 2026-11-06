@@ -5,10 +5,10 @@
 //! what the hub writes is exactly what `fw worker` and `fw status` read.
 //!
 //! Where the file goes: `<tasks dir>/active/<phase>/<id>.json` of the
-//! folder's policy (the panel's resolution: `[source]` tasks dir, else
-//! `.flywheel/tasks`), as a new uncommitted file in that checkout. The
-//! worker reads the working tree and never commits to the operator's
-//! branch, so neither does the hub; committing it is the operator's call.
+//! folder's project (the panel's resolution: the project's central
+//! `$FLYWHEEL_HOME/projects/<id>/tasks`, outside the repo tree, so the hub
+//! never writes into the checkout; `fw spec export` is how a team commits
+//! its specs).
 //! An id already defined there (active or archived), or with runs in the
 //! store, is refused: the loop keys runs by task id, so a reused id would
 //! read as already done.
@@ -251,8 +251,8 @@ pub fn plan_task(
     if !uncovered.is_empty() {
         notes.push(format!(
             "Protected in the fan-out, written as constraints: {}. The loop refuses a landing \
-             that changes a path only when flywheel.toml's [submit] protected_paths lists it; \
-             add {} there to keep it enforced.",
+             that changes a path only when the protected_paths config key lists it (user or \
+             personal config, or a trusted .flywheel.toml); add {} there to keep it enforced.",
             uncovered.join(", "),
             if uncovered.len() == 1 { "it" } else { "them" }
         ));
@@ -401,10 +401,7 @@ pub fn seed_prompt(task: &Task) -> String {
 
 /// The held-out command graders the gate would run for `task` at
 /// landing: its registration plus the standing oracles matching it.
-fn held_out_graders(
-    layout: &TaskLayout,
-    task: &Task,
-) -> Result<Vec<GraderSpec>, String> {
+fn held_out_graders(layout: &TaskLayout, task: &Task) -> Result<Vec<GraderSpec>, String> {
     // The project's held-out dir: absent until an oracle is registered
     // (the gate is off until then).
     let Some(source) = &layout.held_out else {
@@ -539,16 +536,54 @@ mod tests {
     use super::*;
     use flywheel_hub::flywheel::FlywheelProvider;
 
-    fn repo() -> tempfile::TempDir {
+    /// A real git repo (`repo/`) whose home project (under `home/`) holds
+    /// an active `01-first/existing` task and an archived `04-old` phase.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        home: PathBuf,
+        tasks: PathBuf,
+        project: PathBuf,
+    }
+
+    impl Fixture {
+        fn provider(&self) -> HubFlywheel {
+            HubFlywheel::new("/bin/fw").with_home(&self.home)
+        }
+    }
+
+    fn repo() -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".flywheel/tasks/active/01-first")).unwrap();
-        std::fs::create_dir_all(dir.path().join(".flywheel/tasks/archive/04-old")).unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let root = root.canonicalize().unwrap();
+        let home = dir.path().join("home");
+        let project = flywheel_orchestrator::home::resolve_project(
+            &flywheel_orchestrator::home::Home::at(&home),
+            &root,
+        )
+        .unwrap();
+        let tasks = project.paths.tasks();
+        std::fs::create_dir_all(tasks.join("active/01-first")).unwrap();
+        std::fs::create_dir_all(tasks.join("archive/04-old")).unwrap();
         std::fs::write(
-            dir.path().join(".flywheel/tasks/active/01-first/existing.json"),
+            tasks.join("active/01-first/existing.json"),
             r#"{"id":"existing","goal":"Existing work.","graders":[{"type":"command","run":"true"}]}"#,
         )
         .unwrap();
-        dir
+        Fixture {
+            _dir: dir,
+            root,
+            home,
+            tasks,
+            project: project.paths.root().to_path_buf(),
+        }
     }
 
     fn draft(id: &str) -> TaskDraft {
@@ -581,14 +616,14 @@ mod tests {
 
     #[test]
     fn a_promotion_writes_a_task_the_loader_and_the_directory_source_read() {
-        let dir = repo();
-        let root = dir.path().canonicalize().unwrap();
-        let provider = HubFlywheel::new("/bin/fw");
+        let f = repo();
+        let root = f.root.clone();
+        let provider = f.provider();
         let plan = provider.plan_task(&root, &draft("answer-42")).unwrap();
         assert!(
             plan.notes
                 .iter()
-                .any(|n| n.contains("check.sh") && n.contains("[submit] protected_paths")),
+                .any(|n| n.contains("check.sh") && n.contains("protected_paths")),
             "{:?}",
             plan.notes
         );
@@ -599,9 +634,11 @@ mod tests {
         assert!(plan.new_phase);
         assert_eq!(plan.phases, vec!["01-first".to_owned()]);
         assert_eq!(
-            plan.relative,
-            ".flywheel/tasks/active/05-answer-42/answer-42.json"
+            PathBuf::from(&plan.relative),
+            f.tasks.join("active/05-answer-42/answer-42.json"),
+            "the task lands in the project's central tasks dir"
         );
+        assert!(!root.join(".flywheel").exists());
         let value: Value = serde_json::from_str(&plan.contents).unwrap();
         assert_eq!(value["graders"][0]["type"], "command");
         assert_eq!(value["graders"][1].get("name"), None);
@@ -663,15 +700,10 @@ mod tests {
 
     #[test]
     fn a_seed_carries_command_graders_and_held_out_ones_apart() {
-        let dir = repo();
-        let root = dir.path().canonicalize().unwrap();
+        let f = repo();
+        let root = f.root.clone();
         std::fs::write(
-            root.join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n\n[held_out]\nroot = \".flywheel/verification/held-out\"\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join(".flywheel/tasks/active/01-first/answer.json"),
+            f.tasks.join("active/01-first/answer.json"),
             serde_json::to_string(&json!({
                 "id": "answer",
                 "goal": "Make answer.txt say 42.",
@@ -685,8 +717,8 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let provider = HubFlywheel::new("/bin/fw");
-        // The conventional root not created yet: nothing registered.
+        let provider = f.provider();
+        // The project's held-out dir not created yet: nothing registered.
         let seed = provider.task_seed(&root, "answer").unwrap();
         assert!(seed.held_out.is_empty());
         assert_eq!(seed.phase.as_deref(), Some("01-first"));
@@ -702,7 +734,7 @@ mod tests {
         assert!(seed.prompt.contains("## Relevant files\n\n- answer.txt"));
         assert!(seed.prompt.contains("- `test -f answer.txt` (exists)"));
 
-        let held = root.join(".flywheel/verification/held-out");
+        let held = f.project.join("held-out");
         std::fs::create_dir_all(&held).unwrap();
         let oracle = held.join("oracle.sh");
         std::fs::write(&oracle, "#!/bin/sh\ngrep -qx 42 answer.txt\n").unwrap();
@@ -734,9 +766,9 @@ mod tests {
 
     #[test]
     fn an_archived_phase_is_refused_and_the_queue_is_named() {
-        let dir = repo();
-        let root = dir.path().canonicalize().unwrap();
-        let provider = HubFlywheel::new("/bin/fw");
+        let f = repo();
+        let root = f.root.clone();
+        let provider = f.provider();
         let mut into = draft("answer-42");
         into.phase = Some("04-old".into());
         let err = provider.plan_task(&root, &into).unwrap_err();
@@ -755,9 +787,9 @@ mod tests {
 
     #[test]
     fn concurrent_promotions_never_define_one_id_twice() {
-        let dir = repo();
-        let root = dir.path().canonicalize().unwrap();
-        let provider = std::sync::Arc::new(HubFlywheel::new("/bin/fw"));
+        let f = repo();
+        let root = f.root.clone();
+        let provider = std::sync::Arc::new(f.provider());
         let drafts: Vec<TaskDraft> = (0..6)
             .map(|i| {
                 let mut d = draft("answer");
@@ -813,15 +845,16 @@ mod tests {
                 ]
             )
         );
-        let dir = repo();
-        let root = dir.path().canonicalize().unwrap();
+        let f = repo();
+        let root = f.root.clone();
+        // The protected_paths config key (here the user config).
         std::fs::write(
-            root.join("flywheel.toml"),
-            "[source]\nkind = \"directory\"\n\n[submit]\nprotected_paths = [\".github/**\", \"flywheel.toml\", \"*.lock\"]\n",
+            f.home.join("config.toml"),
+            "protected_paths = [\".github/**\", \"flywheel.toml\", \"*.lock\"]\n",
         )
         .unwrap();
         std::fs::write(
-            root.join(".flywheel/tasks/active/01-first/answer.json"),
+            f.tasks.join("active/01-first/answer.json"),
             serde_json::to_string(&json!({
                 "id": "answer",
                 "goal": "Make answer.txt say 42.",
@@ -836,7 +869,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let provider = HubFlywheel::new("/bin/fw");
+        let provider = f.provider();
         let seed = provider.task_seed(&root, "answer").unwrap();
         assert_eq!(seed.protect, [".github", "flywheel.toml", "README.md"]);
         assert_eq!(seed.repo_protect, [".github", "flywheel.toml"]);

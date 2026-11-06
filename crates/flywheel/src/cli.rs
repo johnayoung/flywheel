@@ -76,13 +76,13 @@ use flywheel_orchestrator::supervision_policy::{SupervisionBudget, SupervisionPo
 use flywheel_orchestrator::triage_run;
 use flywheel_orchestrator::workflow::{
     self as orchestrator_workflow, Access, ArchiveRequest, ArchiveRunner, OrchestrateRequest,
-    OrchestrateRunner, Verbs, default_store_registries, load_effective_policy,
-    python_path_str, resolve_db_path, store_config_for, store_partition,
+    OrchestrateRunner, Verbs, default_store_registries, load_effective_policy, python_path_str,
+    resolve_db_path, store_config_for, store_partition,
 };
 use flywheel_worktree::daemon::{
     self, LandingLayout, RunOnceError, RunOnceRequest, arm_signals, build_held_out_source,
-    make_agents_resolve_conflict, make_logger, resolve_landing_base,
-    resolve_model, run_once, strategy_name_for, worker_registry, wrap_for_backend,
+    make_agents_resolve_conflict, make_logger, resolve_landing_base, resolve_model, run_once,
+    strategy_name_for, worker_registry, wrap_for_backend,
 };
 use flywheel_worktree::phase::{ArchiveOptions, archive_completed_phases};
 use flywheel_worktree::submit_registry::SubmitBuildRequest;
@@ -96,7 +96,7 @@ use std::time::Duration;
 pub const PROG: &str = "fw";
 
 /// Verbs delegated verbatim to the orchestrator CLI (the multi-task
-/// layer): its parser already owns their flags (`--policy` / `--tasks-dir`
+/// layer): its parser already owns their flags (`--tasks-dir`
 /// / `--db` / `--json` / `--watch`) and exit codes, so the router hands the
 /// argv through.
 pub const ORCHESTRATOR_VERBS: [&str; 10] = [
@@ -371,7 +371,7 @@ pub fn route(
     }
     if verb == DOCS_VERB {
         // Curated operator docs served from the binary -- knowledge, not
-        // policy: no flywheel.toml load, no store, works from any directory.
+        // config: no project, no store, works from any directory.
         return docs::run_with(rest, out, err);
     }
     if verb == HUB_VERB {
@@ -408,7 +408,7 @@ pub fn route(
         return crate::db_verbs::run_db(rest, out, err);
     }
     if verb == exec::EXEC_VERB {
-        // One agent call: no flywheel.toml load, no store, no worktree.
+        // One agent call: no config, no store, no worktree.
         return exec::run_with(rest, out, err);
     }
 
@@ -929,7 +929,10 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
     let Some(tasks_dir) =
         resolve_tasks_dir_for_worker(args.common.tasks_dir.as_deref(), policy.as_deref())
     else {
-        let _ = writeln!(err, "error: orchestrate needs --tasks-dir outside a git repo");
+        let _ = writeln!(
+            err,
+            "error: orchestrate needs --tasks-dir outside a git repo"
+        );
         return 2;
     };
     let db_path = request.db_path.clone();
@@ -1172,7 +1175,18 @@ impl ConsoleDaemons {
                 worker.with_log_dir(project.worker_logs()),
                 autopilot.with_log_dir(project.autopilot_logs()),
             ),
-            None => (worker, autopilot),
+            // Explicit --db/--tasks-dir (no project): logs beside the store,
+            // never in the working directory's tree.
+            None => {
+                let logs = spec
+                    .db_path
+                    .parent()
+                    .map_or_else(|| PathBuf::from("logs"), |dir| dir.join("logs"));
+                (
+                    worker.with_log_dir(logs.join("worker")),
+                    autopilot.with_log_dir(logs.join("autopilot")),
+                )
+            }
         };
         Self::with_supervisors(worker, autopilot)
     }

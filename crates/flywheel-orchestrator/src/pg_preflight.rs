@@ -10,7 +10,7 @@
 //! The engine runs an ordered list of checks over one connection and returns
 //! structured [`PreflightCheck`] results. The init workflow prints them and,
 //! when any check is [`CheckStatus::Block`] and the operator did not pass
-//! `--allow-unverified`, aborts init without writing `flywheel.toml` -- so a
+//! `--allow-unverified`, aborts init (exit 2) -- so a
 //! misconfigured target never yields a config that looks ready.
 //!
 //! Every check is read-only except the optional provision step

@@ -1,6 +1,7 @@
-//! The hub's Flywheel panel against a real flywheel-adopted repo: a temp
-//! dir with `flywheel.toml`, task files under `.flywheel/tasks/active/`,
-//! and a SQLite store populated through the real store APIs (lifecycles,
+//! The hub's Flywheel panel against a real flywheel project: a temp git
+//! repo whose project lives under a temp `$FLYWHEEL_HOME` (task files under
+//! `<project>/tasks/active/`), and a SQLite store populated through the
+//! real store APIs, bound to the project's partition (lifecycles,
 //! attempts, grader receipts, a landing park, claims, a stop event), plus
 //! the autopilot's activity record and a run transcript written by the
 //! real telemetry sink. First the provider directly, then the real `fw hub
@@ -26,6 +27,7 @@ use flywheel_core::telemetry_file::FileTelemetrySink;
 use flywheel_hub::flywheel::{AlertKind, FlywheelProvider, TaskLight};
 use flywheel_orchestrator::autopilot_activity::{AutopilotActivity, epoch_now, write_activity};
 use flywheel_orchestrator::claims::{ClaimStore, STOP_DANGLING_PREREQUISITE, SqliteClaimStore};
+use flywheel_orchestrator::home::{Home, ProjectPaths, resolve_project};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -36,14 +38,41 @@ use std::time::{Duration, Instant};
 
 use script::write_script;
 
-const POLICY: &str = "[source]\nkind = \"directory\"\ntasks_dir = \".flywheel/tasks\"\n\n\
-                      [paths]\ndb = \".flywheel/flywheel.sqlite\"\n";
+/// The project `root` (a git repo) resolves to under the home at `home`,
+/// minted on first sight exactly as any `fw` verb run there would: the
+/// hub's panel shows only repos whose project the home knows.
+fn adopt(home: &Path, root: &Path) -> Project {
+    let project = resolve_project(&Home::at(home), root).unwrap();
+    Project {
+        id: project.id,
+        paths: project.paths,
+    }
+}
 
-fn write_task(root: &Path, phase: &str, id: &str, prerequisites: &[&str]) {
-    let path = root
-        .join(".flywheel/tasks/active")
-        .join(phase)
-        .join(format!("{id}.json"));
+struct Project {
+    id: String,
+    paths: ProjectPaths,
+}
+
+impl Project {
+    fn tasks(&self) -> PathBuf {
+        self.paths.tasks()
+    }
+    fn db(&self) -> PathBuf {
+        self.paths.db()
+    }
+    fn dir(&self) -> PathBuf {
+        self.paths.root().to_path_buf()
+    }
+    /// The project's core store, bound to its partition.
+    fn store(&self) -> SqliteStore {
+        std::fs::create_dir_all(self.dir()).unwrap();
+        SqliteStore::open_partition(self.db(), &self.id).unwrap()
+    }
+}
+
+fn write_task(tasks: &Path, phase: &str, id: &str, prerequisites: &[&str]) {
+    let path = tasks.join("active").join(phase).join(format!("{id}.json"));
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let task = json!({
         "id": id,
@@ -122,17 +151,21 @@ const DONE: [Status; 4] = [
     Status::Done,
 ];
 
-/// The adopted repo every test reads (see the module doc).
-fn adopted_repo(root: &Path) {
-    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
-    write_task(root, "01-core", "alpha", &[]);
-    write_task(root, "01-core", "beta", &[]);
-    write_task(root, "01-core", "gamma", &[]);
-    write_task(root, "01-core", "delta", &["alpha"]);
-    write_task(root, "02-land", "eps", &[]);
+/// The project every test reads (see the module doc): `root` becomes a git
+/// repo (no commit yet) whose project under `home` holds the tasks, store,
+/// transcript, and autopilot record.
+fn adopted_repo(home: &Path, root: &Path) -> Project {
+    git(root, &["init", "-q"]);
+    let project = adopt(home, root);
+    let tasks = project.tasks();
+    write_task(&tasks, "01-core", "alpha", &[]);
+    write_task(&tasks, "01-core", "beta", &[]);
+    write_task(&tasks, "01-core", "gamma", &[]);
+    write_task(&tasks, "01-core", "delta", &["alpha"]);
+    write_task(&tasks, "02-land", "eps", &[]);
 
-    let db = root.join(".flywheel/flywheel.sqlite");
-    let store = SqliteStore::open(&db).unwrap();
+    let db = project.db();
+    let store = project.store();
     let t0 = Utc::now() - ChronoDuration::minutes(30);
     seed_run(
         &store,
@@ -191,7 +224,7 @@ fn adopted_repo(root: &Path) {
         &[],
     );
 
-    let claims = SqliteClaimStore::open(&db).unwrap();
+    let claims = SqliteClaimStore::open_partition(&db, &project.id).unwrap();
     claims
         .acquire_claim("gamma", "worker-7", Utc::now(), 600.0, &BTreeSet::new())
         .unwrap()
@@ -206,7 +239,7 @@ fn adopted_repo(root: &Path) {
         )
         .unwrap();
 
-    let sink = FileTelemetrySink::new(root.join(".flywheel/logs"));
+    let sink = FileTelemetrySink::new(project.paths.logs());
     for text in ["Reading the task.", "All graders should pass now."] {
         let mut record = TelemetryRecord::new("run-alpha", t0, "AssistantMessage");
         record.payload = obj(json!({"content": [{"type": "text", "text": text}]}));
@@ -219,28 +252,54 @@ fn adopted_repo(root: &Path) {
     let mut activity =
         AutopilotActivity::new(i64::from(std::process::id()), "idle", 3, epoch_now(), 60.0);
     activity.expires_at = Some(epoch_now() + 120.0);
-    let path = root.join(AUTOPILOT_ACTIVITY);
+    let path = project.paths.autopilot_logs().join(AUTOPILOT_ACTIVITY);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     write_activity(&path, &activity).unwrap();
+    project
 }
 
-fn temp_repo() -> (tempfile::TempDir, PathBuf) {
+/// A temp dir holding `repo/` (the adopted repo) and `fw-home/` (its home).
+struct Fixture {
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    project: Project,
+}
+
+impl Fixture {
+    fn provider(&self) -> HubFlywheel {
+        HubFlywheel::new("/usr/bin/false").with_home(&self.home)
+    }
+}
+
+fn temp_repo() -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap().join("repo");
+    let base = tmp.path().canonicalize().unwrap();
+    let root = base.join("repo");
+    let home = base.join("fw-home");
     std::fs::create_dir_all(&root).unwrap();
-    adopted_repo(&root);
-    (tmp, root)
+    let project = adopted_repo(&home, &root);
+    Fixture {
+        _tmp: tmp,
+        root,
+        home,
+        project,
+    }
 }
 
 #[test]
 fn panel_reads_phases_runs_graders_claims_daemons_and_alerts() {
-    let (_tmp, root) = temp_repo();
-    let provider = HubFlywheel::new("/usr/bin/false");
+    let fx = temp_repo();
+    let root = fx.root.clone();
+    let provider = fx.provider();
     assert!(provider.adopted(&root));
     let panel = provider.panel(&root);
     assert_eq!(panel.problem, None, "{panel:#?}");
-    assert_eq!(panel.source, "directory .flywheel/tasks");
-    assert_eq!(panel.store, "sqlite .flywheel/flywheel.sqlite");
+    assert_eq!(
+        panel.source,
+        format!("directory {}", fx.project.tasks().display())
+    );
+    assert_eq!(panel.store, format!("sqlite {}", fx.project.db().display()));
 
     let names: Vec<&str> = panel.phases.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["01-core", "02-land"]);
@@ -319,8 +378,9 @@ fn panel_reads_phases_runs_graders_claims_daemons_and_alerts() {
 
 #[test]
 fn run_output_is_fw_show_plus_the_transcript_tailed_incrementally() {
-    let (_tmp, root) = temp_repo();
-    let provider = HubFlywheel::new("/usr/bin/false");
+    let fx = temp_repo();
+    let root = fx.root.clone();
+    let provider = fx.provider();
     let out = provider.run_output(&root, "run-alpha", 0).unwrap();
     assert_eq!(out.task_id.as_deref(), Some("alpha"));
     assert_eq!(out.status.as_deref(), Some("done"));
@@ -349,7 +409,7 @@ fn run_output_is_fw_show_plus_the_transcript_tailed_incrementally() {
     assert_eq!(again.next, 2);
 
     // The agent writes more: only the new entry comes back.
-    let sink = FileTelemetrySink::new(root.join(".flywheel/logs"));
+    let sink = FileTelemetrySink::new(fx.project.paths.logs());
     let mut record = TelemetryRecord::new("run-alpha", Utc::now(), "AssistantMessage");
     record.payload = obj(json!({"content": [{"type": "text", "text": "Done."}]}));
     record.attempt_number = Some(1);
@@ -369,16 +429,17 @@ fn run_output_is_fw_show_plus_the_transcript_tailed_incrementally() {
 
 #[test]
 fn fingerprint_follows_the_store_and_the_task_tree() {
-    let (_tmp, root) = temp_repo();
-    let provider = HubFlywheel::new("/usr/bin/false");
+    let fx = temp_repo();
+    let root = fx.root.clone();
+    let provider = fx.provider();
     let first = provider.fingerprint(&root);
     assert_eq!(provider.fingerprint(&root), first, "stable when idle");
     std::thread::sleep(Duration::from_millis(20));
-    write_task(&root, "03-next", "theta", &[]);
+    write_task(&fx.project.tasks(), "03-next", "theta", &[]);
     let after_task = provider.fingerprint(&root);
     assert_ne!(after_task, first);
     std::thread::sleep(Duration::from_millis(20));
-    let store = SqliteStore::open(root.join(".flywheel/flywheel.sqlite")).unwrap();
+    let store = fx.project.store();
     seed_run(
         &store,
         "theta",
@@ -397,33 +458,69 @@ fn fingerprint_follows_the_store_and_the_task_tree() {
 #[test]
 fn a_repo_without_a_store_lists_pending_tasks_and_creates_nothing() {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
-    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
-    write_task(&root, "01-core", "alpha", &[]);
-    let provider = HubFlywheel::new("/usr/bin/false");
+    let base = tmp.path().canonicalize().unwrap();
+    let root = base.join("repo");
+    let home = base.join("fw-home");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    let project = adopt(&home, &root);
+    write_task(&project.tasks(), "01-core", "alpha", &[]);
+    let provider = HubFlywheel::new("/usr/bin/false").with_home(&home);
     let panel = provider.panel(&root);
     let problem = panel.problem.clone().unwrap();
     assert!(problem.contains("no store yet"), "{problem}");
     assert_eq!(panel.phases.len(), 1);
     assert_eq!(panel.phases[0].tasks[0].state, TaskLight::Pending);
-    assert!(!root.join(".flywheel/flywheel.sqlite").exists());
+    assert!(!project.db().exists());
     assert!(!panel.worker.live && !panel.autopilot.live);
     assert!(provider.run_output(&root, "run-x", 0).is_err());
-    assert!(!root.join(".flywheel/flywheel.sqlite").exists());
+    assert!(!project.db().exists());
+    // Nothing of the panel lands in the repo tree.
+    let status = Command::new("git")
+        .args(["status", "--porcelain", "--ignored"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "");
+}
 
-    // A broken policy is named, not guessed around.
-    std::fs::write(root.join("flywheel.toml"), "[source]\nkind = 5\n").unwrap();
-    let panel = provider.panel(&root);
-    assert!(
-        panel.problem.as_deref().unwrap().contains("flywheel.toml"),
-        "{:?}",
-        panel.problem
-    );
+#[test]
+fn only_repos_whose_project_the_home_knows_are_adopted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("fw-home");
+    let provider = HubFlywheel::new("/usr/bin/false").with_home(&home);
 
-    let plain = tempfile::tempdir().unwrap();
-    assert!(!provider.adopted(plain.path()));
-    std::fs::create_dir(plain.path().join(".flywheel")).unwrap();
-    assert!(provider.adopted(plain.path()));
+    // Not a git repo at all.
+    let plain = base.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    assert!(!provider.adopted(&plain));
+
+    // A git repo still carrying the legacy layout is not a project: the old
+    // markers mean nothing now, and reading never mints an id.
+    let legacy = base.join("legacy");
+    std::fs::create_dir_all(legacy.join(".flywheel/tasks/active")).unwrap();
+    git(&legacy, &["init", "-q"]);
+    std::fs::write(
+        legacy.join("flywheel.toml"),
+        "[source]\nkind = \"directory\"\n",
+    )
+    .unwrap();
+    assert!(!provider.adopted(&legacy));
+    assert!(!home.exists(), "detection writes no home state");
+
+    // Once a verb resolved it, the repo is a known project.
+    adopt(&home, &legacy);
+    assert!(provider.adopted(&legacy));
+    // A project another home knows is not this home's.
+    let other = HubFlywheel::new("/usr/bin/false").with_home(base.join("elsewhere"));
+    assert!(!other.adopted(&legacy));
+
+    // Launches run in the folder against its project: no policy file named.
+    let worker = provider.worker_command(&legacy, &Default::default());
+    assert_eq!(worker, ["/usr/bin/false", "worker"]);
+    let autopilot = provider.autopilot_command(&legacy);
+    assert_eq!(autopilot, ["/usr/bin/false", "autopilot"]);
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -449,18 +546,17 @@ fn open_files_under(pid: u32, dir: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
-fn a_linked_worktree_of_an_adopted_repo_reads_its_own_store_and_says_so() {
+fn a_linked_worktree_maps_to_its_repos_project_and_says_so() {
     let tmp = tempfile::tempdir().unwrap();
     let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("fw-home");
     let main = base.join("repo");
     std::fs::create_dir_all(&main).unwrap();
     git(&main, &["init", "-q"]);
-    std::fs::write(main.join("flywheel.toml"), POLICY).unwrap();
-    std::fs::write(main.join(".gitignore"), ".flywheel/\n").unwrap();
+    std::fs::write(main.join("README.md"), "x\n").unwrap();
     git(&main, &["add", "."]);
-    git(&main, &["commit", "-q", "-m", "adopt"]);
-    std::fs::create_dir_all(main.join(".flywheel")).unwrap();
-    SqliteStore::open(main.join(".flywheel/flywheel.sqlite")).unwrap();
+    git(&main, &["commit", "-q", "-m", "init"]);
+    let project = adopt(&home, &main);
     let sibling = base.join("repo.worktrees/task");
     git(
         &main,
@@ -473,39 +569,42 @@ fn a_linked_worktree_of_an_adopted_repo_reads_its_own_store_and_says_so() {
             sibling.to_str().unwrap(),
         ],
     );
-    assert!(sibling.join("flywheel.toml").is_file(), "tracked policy");
-    let provider = HubFlywheel::new("/usr/bin/false");
+    let provider = HubFlywheel::new("/usr/bin/false").with_home(&home);
     assert!(provider.adopted(&main));
-    // `fw worker` / `fw status` run there resolve `.flywheel/` under the
-    // worktree: its own loop, labelled as a worktree of the main checkout.
+    // The worktree shares the repo's git dir, so it is the same project:
+    // its panel reads the project's one store, labelled as a worktree of
+    // the main checkout.
     assert!(provider.adopted(&sibling));
-    let main_panel = provider.panel(&main);
-    assert_eq!(main_panel.worktree_of, None);
-    assert_eq!(main_panel.problem, None, "{main_panel:?}");
     let panel = provider.panel(&sibling);
     assert_eq!(panel.worktree_of.as_deref(), Some(main.as_path()));
     assert_eq!(panel.summary().worktree_of.as_deref(), Some(main.as_path()));
     let problem = panel.problem.clone().unwrap_or_default();
     assert!(problem.contains("no store yet"), "{problem}");
-    assert!(
-        !sibling.join(".flywheel/flywheel.sqlite").exists(),
-        "reading creates no store"
+    assert!(!project.db().exists(), "reading creates no store");
+
+    project.store();
+    let main_panel = provider.panel(&main);
+    assert_eq!(main_panel.worktree_of, None);
+    assert_eq!(main_panel.problem, None, "{main_panel:?}");
+    assert_eq!(
+        main_panel.store,
+        format!("sqlite {}", project.db().display())
     );
-    std::fs::create_dir_all(sibling.join(".flywheel")).unwrap();
-    SqliteStore::open(sibling.join(".flywheel/flywheel.sqlite")).unwrap();
     let panel = provider.panel(&sibling);
     assert_eq!(panel.worktree_of.as_deref(), Some(main.as_path()));
     assert_eq!(panel.problem, None, "{panel:?}");
+    assert_eq!(panel.store, main_panel.store, "one project, one store");
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn forgetting_a_folder_closes_its_store() {
-    let (_tmp, root) = temp_repo();
-    let provider = HubFlywheel::new("/usr/bin/false");
+    let fx = temp_repo();
+    let root = fx.root.clone();
+    let provider = fx.provider();
     let panel = provider.panel(&root);
     assert!(panel.problem.is_none(), "{:?}", panel.problem);
-    let dir = root.join(".flywheel");
+    let dir = fx.project.dir();
     assert!(
         !open_files_under(std::process::id(), &dir).is_empty(),
         "the store stays open between reads"
@@ -589,6 +688,12 @@ fn hermetic_home(dir: &Path) -> PathBuf {
     home
 }
 
+/// The flywheel home the hub (and every `fw` it launches) resolves
+/// projects under.
+fn fw_home(dir: &Path) -> PathBuf {
+    dir.join("fw-home")
+}
+
 fn start(dir: &Path) -> Server {
     let path = format!(
         "{}:{}",
@@ -601,7 +706,8 @@ fn start(dir: &Path) -> Server {
         .env("PATH", path)
         .env("SHELL", "/bin/sh")
         .env("HOME", hermetic_home(dir))
-        .env_remove("FLYWHEEL_HOME")
+        .env("FLYWHEEL_HOME", fw_home(dir))
+        .env_remove("FLYWHEEL_PG_DSN")
         .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"))
         .env("CODEX_HOME", dir.join("codex-home"))
         .stdout(Stdio::piped())
@@ -674,7 +780,7 @@ fn the_hub_serves_the_panel_pushes_changes_and_starts_a_worker_session() {
     write_script(&fake, "#!/bin/sh\necho fake claude >&2\nexit 1\n");
     let root = dir.join("repo");
     std::fs::create_dir_all(&root).unwrap();
-    adopted_repo(&root);
+    let project = adopted_repo(&fw_home(&dir), &root);
     let plain = dir.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
     let server = start(&dir);
@@ -754,7 +860,7 @@ fn the_hub_serves_the_panel_pushes_changes_and_starts_a_worker_session() {
     assert_eq!(code, 400);
 
     // A change on disk is pushed: the failed task's retry is verified.
-    let store = SqliteStore::open(root.join(".flywheel/flywheel.sqlite")).unwrap();
+    let store = project.store();
     seed_run(
         &store,
         "beta",
@@ -771,8 +877,8 @@ fn the_hub_serves_the_panel_pushes_changes_and_starts_a_worker_session() {
     assert_eq!(changed["summary"]["alerts"].as_array().unwrap().len(), 2);
 
     // Start worker here: a real hub shell session running `fw worker` in
-    // the folder (which is not a git repo, so the worker says so and
-    // exits), then a shell.
+    // the folder (a repo with no commit yet, so the worker has no branch
+    // to land on, says so, and exits), then a shell.
     let (code, session) = http(
         &server,
         "POST",
@@ -807,7 +913,7 @@ fn the_hub_serves_the_panel_pushes_changes_and_starts_a_worker_session() {
         text.contains("fw worker exited with status")
             .then_some(text)
     });
-    assert!(screen.contains("not inside a git repository"), "{screen}");
+    assert!(screen.contains("policy error"), "{screen}");
     let (_, view) = http(&server, "GET", &format!("/api/sessions/{sid}"), None);
     assert_eq!(view["state"], "running", "the shell outlives the worker");
 
@@ -839,7 +945,7 @@ fn the_hub_serves_the_panel_pushes_changes_and_starts_a_worker_session() {
     // ... and closes its store in the hub.
     #[cfg(target_os = "linux")]
     wait_for("the hub to close the removed folder's store", || {
-        open_files_under(server.child.id(), &root.join(".flywheel"))
+        open_files_under(server.child.id(), &project.dir())
             .is_empty()
             .then_some(())
     });
@@ -852,14 +958,14 @@ fn start_worker_here_refuses_a_duplicate_while_the_first_still_runs() {
     std::fs::create_dir_all(dir.join("bin")).unwrap();
     let fake = dir.join("bin/claude");
     write_script(&fake, "#!/bin/sh\necho fake claude >&2\nexit 1\n");
-    // An adopted git repo with nothing to do: its `fw worker` idles.
+    // A project's git repo with nothing to do: its `fw worker` idles.
     let root = dir.join("idle");
-    std::fs::create_dir_all(root.join(".flywheel/tasks/active")).unwrap();
-    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
-    std::fs::write(root.join(".gitignore"), ".flywheel/\n").unwrap();
+    std::fs::create_dir_all(&root).unwrap();
     git(&root, &["init", "-q"]);
+    std::fs::write(root.join("README.md"), "idle\n").unwrap();
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "-m", "adopt"]);
+    git(&root, &["commit", "-q", "-m", "init"]);
+    adopt(&fw_home(&dir), &root);
     let server = start(&dir);
     let (code, workspace) = http(
         &server,
@@ -942,7 +1048,7 @@ fn no_flywheel_turns_the_panel_off() {
         .env("PATH", path)
         .env("SHELL", "/bin/sh")
         .env("HOME", hermetic_home(&dir))
-        .env_remove("FLYWHEEL_HOME")
+        .env("FLYWHEEL_HOME", fw_home(&dir))
         .env("CLAUDE_CONFIG_DIR", dir.join("claude-config"))
         .env("CODEX_HOME", dir.join("codex-home"))
         .stdout(Stdio::piped())
@@ -1015,8 +1121,7 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     verifying_claude(&dir.join("bin/claude"), &ran);
     let root = dir.join("repo");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
-    std::fs::write(root.join(".gitignore"), ".flywheel/\n").unwrap();
+    std::fs::write(root.join("README.md"), "scoped\n").unwrap();
     git(&root, &["init", "-q", "-b", "main"]);
     git(
         &root,
@@ -1025,10 +1130,11 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     git(&root, &["config", "user.name", "hub scope"]);
     git(&root, &["config", "commit.gpgsign", "false"]);
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "-m", "adopt"]);
-    write_task(&root, "01-core", "alpha", &[]);
-    write_task(&root, "01-core", "beta", &[]);
-    write_task(&root, "01-core", "gamma", &["alpha"]);
+    git(&root, &["commit", "-q", "-m", "init"]);
+    let tasks = adopt(&fw_home(&dir), &root).tasks();
+    write_task(&tasks, "01-core", "alpha", &[]);
+    write_task(&tasks, "01-core", "beta", &[]);
+    write_task(&tasks, "01-core", "gamma", &["alpha"]);
     let server = start(&dir);
     let (code, workspace) = http(
         &server,
@@ -1068,10 +1174,8 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     assert_eq!(session["name"], "fw worker beta");
     let argv = argv_of(&session);
     assert_eq!(argv[3], "fw-worker");
-    // The folder's flywheel.toml is named: the worker no longer
-    // auto-detects it.
-    let policy_flag = format!("--policy={}", root.join("flywheel.toml").display());
-    assert_eq!(&argv[5..], ["worker", policy_flag.as_str(), "--task=beta"]);
+    // The worker runs in the folder against its project: no policy file.
+    assert_eq!(&argv[5..], ["worker", "--task=beta"]);
     let sid = session["id"].as_str().unwrap().to_owned();
     let screen = wait_for("the scoped worker to finish", || {
         let text = screen_text(&server, &sid);
@@ -1104,12 +1208,7 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     assert_eq!(code, 201, "{session}");
     assert_eq!(
         &argv_of(&session)[5..],
-        [
-            "worker",
-            policy_flag.as_str(),
-            "--task=gamma",
-            "--with-prereqs"
-        ]
+        ["worker", "--task=gamma", "--with-prereqs"]
     );
     let sid = session["id"].as_str().unwrap().to_owned();
     let screen = wait_for("the prerequisite run to finish", || {
@@ -1132,7 +1231,7 @@ fn run_a_task_with_worker_here_starts_a_worker_scoped_to_it() {
     let (code, session) = start_worker(json!({ "folder": root, "workspace_id": workspace_id }));
     assert_eq!(code, 201, "{session}");
     assert_eq!(session["name"], "fw worker");
-    assert_eq!(&argv_of(&session)[5..], ["worker", policy_flag.as_str()]);
+    assert_eq!(&argv_of(&session)[5..], ["worker"]);
     let sid = session["id"].as_str().unwrap();
     let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{sid}"), None);
     assert_eq!(code, 204);
@@ -1184,8 +1283,7 @@ fn pending_tasks_a_running_scoped_worker_will_run_say_which() {
     );
     let root = dir.join("repo");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::write(root.join("flywheel.toml"), POLICY).unwrap();
-    std::fs::write(root.join(".gitignore"), ".flywheel/\n").unwrap();
+    std::fs::write(root.join("README.md"), "scoped\n").unwrap();
     git(&root, &["init", "-q", "-b", "main"]);
     git(
         &root,
@@ -1194,10 +1292,11 @@ fn pending_tasks_a_running_scoped_worker_will_run_say_which() {
     git(&root, &["config", "user.name", "hub queue"]);
     git(&root, &["config", "commit.gpgsign", "false"]);
     git(&root, &["add", "."]);
-    git(&root, &["commit", "-q", "-m", "adopt"]);
-    write_task(&root, "01-core", "alpha", &[]);
-    write_task(&root, "01-core", "delta", &["alpha"]);
-    write_task(&root, "01-core", "other", &[]);
+    git(&root, &["commit", "-q", "-m", "init"]);
+    let tasks = adopt(&fw_home(&dir), &root).tasks();
+    write_task(&tasks, "01-core", "alpha", &[]);
+    write_task(&tasks, "01-core", "delta", &["alpha"]);
+    write_task(&tasks, "01-core", "other", &[]);
     let server = start(&dir);
     let (code, workspace) = http(
         &server,

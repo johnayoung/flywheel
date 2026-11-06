@@ -1,6 +1,8 @@
 //! A verified fan-out and a flywheel task, both ways, through the real
-//! `fw` binary: a detached hub on 127.0.0.1:0 over a flywheel-adopted git
-//! repo (`fw init`), scripted `claude` stand-ins on PATH, graders run by
+//! `fw` binary: a detached hub on 127.0.0.1:0 over a git repo adopted as a
+//! home project (`fw init`, `$FLYWHEEL_HOME` in the tempdir; tasks, store,
+//! and held-out registry under its project dir, never in the repo), scripted
+//! `claude` stand-ins on PATH, graders run by
 //! flywheel-core's runner. Promote writes a task file the loop's loader
 //! and `fw status --json` read; "fan out this task" seeds a fan-out with
 //! the task's command graders plus its held-out graders, which run but
@@ -21,6 +23,8 @@ struct Env {
     root: PathBuf,
     state: PathBuf,
     repo: PathBuf,
+    /// `$FLYWHEEL_HOME/projects/<id>` of the repo.
+    project: PathBuf,
 }
 
 const IDENTITY: [(&str, &str); 4] = [
@@ -37,24 +41,36 @@ impl Env {
         let state = root.join("state");
         let repo = root.join("code").join("demo");
         std::fs::create_dir_all(&repo).unwrap();
-        let env = Self {
+        let mut env = Self {
             _dir: dir,
             root,
             state,
             repo,
+            project: PathBuf::new(),
         };
         env.git(&["init", "-q", "-b", "main"]);
         std::fs::write(env.repo.join("README.md"), "demo\n").unwrap();
         env.git(&["add", "-A"]);
         env.git(&["commit", "-qm", "initial"]);
-        let init = env.fw_in_repo(&["init"]);
+        // The repo's protected paths come from the config (here the user
+        // config); `fw init` adopts the repo without writing into it.
+        std::fs::create_dir_all(env.flywheel_home()).unwrap();
+        std::fs::write(
+            env.flywheel_home().join("config.toml"),
+            "protected_paths = [\".github/**\", \".flywheel.toml\"]\n",
+        )
+        .unwrap();
+        let init = env.fw_in_repo(&["init", "--no-skills"]);
         assert!(init.status.success(), "fw init: {init:?}");
-        let mut policy = std::fs::read_to_string(env.repo.join("flywheel.toml")).unwrap();
-        policy.push_str("\n[held_out]\nroot = \".flywheel/verification/held-out\"\n");
-        std::fs::write(env.repo.join("flywheel.toml"), policy).unwrap();
-        env.git(&["add", "-A"]);
-        env.git(&["commit", "-qm", "adopt flywheel"]);
+        assert_eq!(env.git(&["status", "--porcelain", "--ignored"]), "");
+        let path = env.fw_in_repo(&["project", "path"]);
+        assert!(path.status.success(), "fw project path: {path:?}");
+        env.project = PathBuf::from(String::from_utf8(path.stdout).unwrap().trim());
         env
+    }
+
+    fn flywheel_home(&self) -> PathBuf {
+        self.root.join("flywheel-home")
     }
 
     fn git(&self, args: &[&str]) -> String {
@@ -90,7 +106,7 @@ impl Env {
             .env("FANOUT_ROOT", &self.root)
             .envs(IDENTITY)
             .env_remove("XDG_STATE_HOME")
-            .env_remove("FLYWHEEL_HOME")
+            .env("FLYWHEEL_HOME", self.flywheel_home())
             .env_remove("FW_HUB_TOKEN")
             .env_remove("FLYWHEEL_PG_DSN")
             .env_remove("DATABASE_URL");
@@ -139,8 +155,7 @@ impl Env {
     }
 
     fn status(&self) -> Vec<Value> {
-        // `fw init` scaffolded a legacy flywheel.toml: name it explicitly.
-        let output = self.fw_in_repo(&["status", "--json", "--policy", "flywheel.toml"]);
+        let output = self.fw_in_repo(&["status", "--json"]);
         assert!(output.status.success(), "fw status: {output:?}");
         serde_json::from_slice::<Value>(&output.stdout)
             .unwrap()
@@ -268,11 +283,13 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
     // The dry run shows exactly what is written, and writes nothing.
     let plan = env.json(&["fanout", "promote", &id, "--reference", "c1", "--json"]);
     let task_id = format!("answer-{}", &id[..4]);
-    let relative = format!(".flywheel/tasks/active/01-{task_id}/{task_id}.json");
-    assert_eq!(plan["plan"]["relative"], relative.as_str(), "{plan:#}");
+    // The project's central tasks dir, outside the repo tree.
+    let path = env
+        .project
+        .join(format!("tasks/active/01-{task_id}/{task_id}.json"));
+    assert_eq!(plan["plan"]["relative"], path.to_str().unwrap(), "{plan:#}");
     assert_eq!(plan["plan"]["task_id"], task_id.as_str());
     assert_eq!(plan["reference"], head.as_str(), "the winner's commit");
-    let path = env.repo.join(&relative);
     assert!(!path.exists(), "a dry run writes nothing");
     let contents = plan["plan"]["contents"].as_str().unwrap().to_owned();
     assert!(
@@ -281,7 +298,7 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
             .unwrap()
             .iter()
             .any(|n| n.as_str().unwrap().contains("README.md")),
-        "the protected path not covered by [submit] protected_paths is named: {plan:#}"
+        "the protected path not covered by the protected_paths config is named: {plan:#}"
     );
 
     let done = env.json(&[
@@ -333,12 +350,10 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
             .iter()
             .all(|g| g["type"] == "command")
     );
-    // Uncommitted: the hub never commits to the operator's branch.
+    // The hub never commits to the operator's branch, and the task file
+    // is not in the repo tree at all.
     assert_eq!(env.git(&["rev-parse", "main"]), base);
-    assert!(
-        env.git(&["status", "--porcelain"])
-            .contains(".flywheel/tasks/")
-    );
+    assert_eq!(env.git(&["status", "--porcelain"]), "");
     // What the loop reads.
     let listed = env.status();
     let entry = listed
@@ -346,7 +361,13 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
         .find(|e| e["task_id"] == task_id.as_str())
         .unwrap_or_else(|| panic!("fw status lists {task_id}: {listed:?}"));
     assert_eq!(entry["state"], "fresh");
-    assert_eq!(entry["task_file"], relative.as_str());
+    assert!(
+        entry["task_file"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("01-{task_id}/{task_id}.json")),
+        "{entry}"
+    );
     let board = env.json(&["fanout", "show", &id, "--json"]);
     assert_eq!(board["promoted"][0]["task_id"], task_id.as_str());
     // Never twice.
@@ -354,8 +375,9 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
     assert!(!again.status.success());
     assert!(String::from_utf8_lossy(&again.stderr).contains("already defined"));
 
-    // A held-out oracle for the task, out of every worktree.
-    let held = env.repo.join(".flywheel/verification/held-out");
+    // A held-out oracle for the task in the project's held-out registry,
+    // out of every worktree (registering it activates the gate).
+    let held = env.project.join("held-out");
     std::fs::create_dir_all(&held).unwrap();
     let oracle = held.join("exact.sh");
     std::fs::write(&oracle, "grep -qx 42 answer.txt\n").unwrap();
@@ -407,10 +429,10 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
         .iter()
         .map(|p| p.as_str().unwrap())
         .collect();
-    for path in ["README.md", "flywheel.toml", ".github"] {
+    for path in ["README.md", ".flywheel.toml", ".github"] {
         assert!(
             protect.contains(&path),
-            "the task's constraint and the repo's [submit] protected_paths hold the candidates: \
+            "the task's constraint and the protected_paths config hold the candidates: \
              {protect:?}"
         );
     }
@@ -569,7 +591,6 @@ fn a_fan_out_becomes_a_flywheel_task_and_a_task_fans_out_with_its_held_out_grade
             && shown.contains("its worker finds nothing left to do"),
         "{shown}"
     );
-    env.git(&["stash", "push", "-q", "--include-untracked"]);
     env.ok(&["fanout", "pick", &id, "c1", "--yes"]);
     assert_eq!(env.git(&["rev-parse", "main"]), head);
     let late = env.fw(&[

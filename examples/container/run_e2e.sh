@@ -7,9 +7,10 @@
 # headless in the container -> stream-json parsed into the loop envelope ->
 # host-side grader sees the agent's edits -> DONE -> landing -> teardown.
 #
-# It builds a throwaway git repo under $FW_E2E_DIR (default /tmp/fw-e2e/repo),
-# writes a flywheel.toml selecting `[sandbox] backend = "container"`, seeds one
-# task, and drains it with `flywheel worker --once`.
+# It builds a throwaway git repo under $FW_E2E_DIR (default /tmp/fw-e2e/repo)
+# with its own flywheel home ($FW_E2E_DIR/home), seeds one task into the
+# project's tasks dir, and drains it with
+# `fw worker --once --sandbox container --image $FW_IMAGE`.
 #
 # Prerequisites
 #   1. Build the agent image (from examples/container/), matching your uid/gid:
@@ -27,9 +28,8 @@
 #
 # Success looks like
 #   - the script ends with "[run_e2e] PASS" and exits 0;
-#   - DONE.txt is committed on the scratch repo's main branch, and the copy the
-#     agent wrote through the bind mount (in the preserved worktree) is owned
-#     by you;
+#   - DONE.txt is committed on the scratch repo's main branch, and the repo
+#     tree holds nothing else (state lives under the scratch home);
 #   - `docker ps -a | grep flywheel-hello` shows nothing (container torn down).
 #
 # Environment
@@ -62,7 +62,8 @@ resolve_binary() {
     fi
 }
 
-# Echo the [sandbox.container] auth mode for whichever credential is present.
+# Name the auth mode the container backend will detect (it prefers a
+# subscription token, then a ~/.claude session, then an API key).
 resolve_auth() {
     if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
         echo oauth
@@ -84,51 +85,24 @@ BIN="$(resolve_binary)"
 [[ -x "$BIN" ]] || die "flywheel binary not executable: $BIN"
 AUTH="$(resolve_auth)"
 
-rm -rf "$SCRATCH"
-mkdir -p "$SCRATCH/.flywheel/tasks/active/01-phase"
+rm -rf "$BASE"
+mkdir -p "$SCRATCH"
+export FLYWHEEL_HOME="$BASE/home"
 cd "$SCRATCH"
 git init --quiet --initial-branch=main
 git config user.name "flywheel e2e"
 git config user.email "e2e@flywheel.invalid"
+echo "# e2e" > README.md
+git add -A
+git commit --quiet -m "chore: seed container e2e scratch repo"
 
-cat > flywheel.toml <<EOF
-[source]
-kind = "directory"
-tasks_dir = ".flywheel/tasks"
+# The agent model, from the user config (the container backend needs one).
+mkdir -p "$FLYWHEEL_HOME"
+printf 'model = "%s"\n' "$MODEL" > "$FLYWHEEL_HOME/config.toml"
 
-[paths]
-db = ".flywheel/flywheel.sqlite"
-sandbox_root = ".flywheel/worktrees"
-
-[agent]
-model = "$MODEL"
-
-[sandbox]
-backend = "container"
-
-[sandbox.limits]
-max_retries = 0
-max_turns = 8
-
-# Keep the landed worktree so the agent-written file's ownership is checkable.
-[sandbox.retention]
-on_done = "preserve"
-
-[sandbox.container]
-image = "$IMAGE"
-model = "$MODEL"
-auth = "$AUTH"
-exec_timeout = 600
-EOF
-
-cat > .gitignore <<'EOF'
-.flywheel/worktrees/
-.flywheel/logs/
-.flywheel/flywheel.sqlite*
-.flywheel/.merge.lock
-EOF
-
-cat > ".flywheel/tasks/active/01-phase/$TASK_ID.json" <<EOF
+TASKS="$("$BIN" project path --tasks)"
+mkdir -p "$TASKS/active/01-phase"
+cat > "$TASKS/active/01-phase/$TASK_ID.json" <<EOF
 {
   "id": "$TASK_ID",
   "goal": "Create a file named DONE.txt containing the text: ok. Commit it with the message 'chore: add DONE.txt'.",
@@ -136,13 +110,11 @@ cat > ".flywheel/tasks/active/01-phase/$TASK_ID.json" <<EOF
 }
 EOF
 
-git add -A
-git commit --quiet -m "chore: seed container e2e scratch repo"
-
 log "image=$IMAGE model=$MODEL auth=$AUTH bin=$BIN"
 log "scratch repo: $SCRATCH"
 status=0
-"$BIN" worker --once || status=$?
+"$BIN" worker --once --sandbox container --image "$IMAGE" --max-turns 8 --max-retries 0 \
+    || status=$?
 log "worker exited $status"
 
 "$BIN" status || true
@@ -152,11 +124,6 @@ leftover="$(docker ps -a --filter "name=flywheel-$TASK_ID-" --format '{{.Names}}
 git cat-file -e "main:DONE.txt" 2>/dev/null \
     || die "DONE.txt did not land on main (see \`$BIN show $TASK_ID\` in $SCRATCH)"
 [[ "$status" -eq 0 ]] || die "worker exited $status"
-# The copy the agent wrote through the bind mount, in the preserved worktree.
-written="$(find "$SCRATCH/.flywheel/worktrees" -name DONE.txt -not -path '*/.git/*' -print -quit)"
-[[ -n "$written" ]] || die "no agent-written DONE.txt under $SCRATCH/.flywheel/worktrees"
-owner="$(stat -c '%u' "$written")"
-[[ "$owner" == "$(id -u)" ]] || die "$written owner uid $owner, expected $(id -u)"
-
-log "DONE.txt on main, host-owned, container torn down"
+[[ -z "$(git status --porcelain --ignored)" ]] || die "the run wrote into the repo tree"
+log "DONE.txt on main, repo tree clean, container torn down"
 log "PASS"

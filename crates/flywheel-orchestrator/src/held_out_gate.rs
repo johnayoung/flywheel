@@ -249,7 +249,7 @@ impl FilesystemHeldOutGraderSource {
             ))),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 Err(HeldOutGraderError::new(format!(
-                    "{}: held-out root does not exist (create it, or remove [held_out] root to disable the gate)",
+                    "{}: held-out root does not exist (it is the project's held-out/ dir; /fw-verify creates it when it registers an oracle)",
                     self.root.display()
                 )))
             }

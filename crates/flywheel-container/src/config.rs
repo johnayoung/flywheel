@@ -1,4 +1,5 @@
-//! Bridge from resolved `[sandbox.container]` policy to a strategy (00045).
+//! Bridge from the resolved container sandbox policy (`fw worker --sandbox
+//! container --image IMAGE`) to a strategy (00045).
 //!
 //! Keeps the policy-to-strategy mapping in flywheel-container (which owns
 //! [`ContainerSubmitStrategy`] / [`ClaudeAuth`]), so the worker just hands
@@ -16,16 +17,20 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
-    #[error("sandbox.container auth={mode:?} requires the {var} environment variable to be set")]
+    #[error("container auth={mode:?} requires the {var} environment variable to be set")]
     MissingToken { mode: String, var: String },
+    #[error(
+        "the container backend found no Claude credential: export CLAUDE_CODE_OAUTH_TOKEN \
+         (`claude setup-token`), run `claude login`, or set ANTHROPIC_API_KEY"
+    )]
+    NoCredential,
     #[error("unknown container auth mode {0:?}")]
     UnknownAuthMode(String),
     #[error(transparent)]
     Auth(#[from] AuthError),
     #[error(
-        "sandbox.backend = 'container' needs an explicit model: set [sandbox.container] model, \
-         [agent] model, or --model (the agent CLI is invoked with --model and has no implicit \
-         default here)."
+        "--sandbox container needs an explicit model: set the `model` config key or pass \
+         --model (the agent CLI is invoked with --model and has no implicit default here)."
     )]
     MissingModel,
 }
@@ -38,8 +43,43 @@ fn default_token_env(mode: &str) -> Option<&'static str> {
     }
 }
 
-/// Resolve a `[sandbox.container] auth` mode to a [`ClaudeAuth`].
+/// The default container auth mode: detect the credential at hand.
+pub const AUTO_AUTH: &str = "auto";
+
+/// The auth mode [`AUTO_AUTH`] resolves to, preferring a subscription:
+/// `oauth` when `CLAUDE_CODE_OAUTH_TOKEN` is set, else `session` when
+/// `$HOME/.claude/.credentials.json` exists (an existing `claude login`),
+/// else `api_key` when `ANTHROPIC_API_KEY` is set.
 ///
+/// # Errors
+///
+/// None of the three credentials is present.
+pub fn detect_auth_mode(env: &BTreeMap<String, String>) -> Result<&'static str, ConfigError> {
+    let set = |name: &str| env.get(name).is_some_and(|v| !v.is_empty());
+    if set(OAUTH_TOKEN_ENV) {
+        return Ok("oauth");
+    }
+    let session = env
+        .get("HOME")
+        .filter(|home| !home.is_empty())
+        .is_some_and(|home| {
+            std::path::Path::new(home)
+                .join(".claude")
+                .join(".credentials.json")
+                .is_file()
+        });
+    if session {
+        return Ok("session");
+    }
+    if set(API_KEY_ENV) {
+        return Ok("api_key");
+    }
+    Err(ConfigError::NoCredential)
+}
+
+/// Resolve a container auth mode to a [`ClaudeAuth`].
+///
+/// `auto` (the default) detects the mode ([`detect_auth_mode`]).
 /// `oauth`/`api_key` read the token from `env` by name (`token_env` or the
 /// mode's default var); an unset or empty var is a clear error rather than a
 /// silent unauthenticated run. `session` mounts `~/.claude`; `none` injects
@@ -49,6 +89,9 @@ pub fn resolve_auth(
     env: &BTreeMap<String, String>,
     token_env: Option<&str>,
 ) -> Result<Option<ClaudeAuth>, ConfigError> {
+    if mode == AUTO_AUTH {
+        return resolve_auth(detect_auth_mode(env)?, env, None);
+    }
     match mode {
         "none" => Ok(None),
         "session" => Ok(Some(ClaudeAuth::session(None))),
@@ -116,7 +159,7 @@ pub fn build_container_config(
 /// `[sandbox.container] model`, falling back to `model` (the worker's
 /// resolved agent model); neither set is an error, since the agent CLI is
 /// invoked with `--model` and has no implicit default here. Auth tokens are
-/// read from `env` at resolve time and never from the policy file. Docker
+/// read from `env` at resolve time and never from configuration. Docker
 /// management calls run under the policy's `[deadlines]
 /// docker_management_seconds` ceiling, not the crate default.
 pub fn container_config_from_policy(
@@ -334,6 +377,42 @@ mod tests {
         let mut policy = container_policy();
         policy.sandbox.container.auth = auth.into();
         policy
+    }
+
+    #[test]
+    fn auto_auth_prefers_a_subscription_then_falls_back_to_an_api_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().display().to_string();
+        assert_eq!(
+            detect_auth_mode(&env(&[(OAUTH_TOKEN_ENV, "t"), (API_KEY_ENV, "k")])).unwrap(),
+            "oauth"
+        );
+        assert_eq!(
+            detect_auth_mode(&env(&[("HOME", &home), (API_KEY_ENV, "k")])).unwrap(),
+            "api_key"
+        );
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        std::fs::write(tmp.path().join(".claude/.credentials.json"), "{}").unwrap();
+        assert_eq!(
+            detect_auth_mode(&env(&[("HOME", &home), (API_KEY_ENV, "k")])).unwrap(),
+            "session"
+        );
+        assert_eq!(
+            detect_auth_mode(&env(&[(OAUTH_TOKEN_ENV, "")])).unwrap_err(),
+            ConfigError::NoCredential
+        );
+        let auth = resolve_auth(AUTO_AUTH, &env(&[(OAUTH_TOKEN_ENV, "tok")]), None)
+            .unwrap()
+            .unwrap();
+        assert!(auth.is_subscription());
+        let mut p = container_policy();
+        p.sandbox.container.auth = WorkPolicy::default().sandbox.container.auth;
+        assert_eq!(p.sandbox.container.auth, AUTO_AUTH);
+        assert!(
+            container_config_from_policy(&p, Some("m"), &env(&[(API_KEY_ENV, "k")]))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

@@ -8,10 +8,10 @@
 //! section 15.4).
 //!
 //! Public surface: the Docker lifecycle primitives ([`docker`]), the
-//! [`ClaudeAuth`] auth-mode passthrough ([`auth`]), the `[sandbox.network]`
+//! [`ClaudeAuth`] auth-mode passthrough ([`auth`]), the network policy
 //! policy resolver ([`network`]), [`ContainerSubmitStrategy`] (which composes
 //! an inner landing strategy, [`submit`]), and the policy-to-strategy bridge
-//! ([`config`]). Activated via `[sandbox] backend = "container"`.
+//! ([`config`]). Activated via `fw worker --sandbox container --image IMAGE`.
 
 pub mod auth;
 pub mod config;

@@ -7,7 +7,7 @@ argument-hint: '[what you want to do: run, drain, status, or recover]'
 
 You operate the loop that is already built. Your job is to keep tasks flowing to a landed state and to unstick them when they park — never to author specs, write graders, or judge the shipped code (that is `/fw-spec`, `/fw-plan`, `/fw-verify`, `/fw-retro`, `/fw-improve`). Every command below is a real `fw` verb. For anything deeper than this runbook, send the operator to `fw docs <topic>` rather than reconstructing it from memory — the curated docs are the source of truth and this skill never duplicates them.
 
-`fw` and `flywheel` are byte-identical entries on one implementation; this skill writes `fw`. The read and steer verbs load `flywheel.toml` from the repo root, so run them from an initialized repo (`fw init` scaffolds one).
+`fw` and `flywheel` are byte-identical entries on one implementation; this skill writes `fw`. Every verb runs on the git repo at the working directory: its state lives under `$FLYWHEEL_HOME/projects/<id>/` (`fw project path`), and its settings are the eight keys `fw config` prints. `fw init` prints a suggested `.flywheel.toml`; it writes nothing into the repo.
 
 ## INPUT
 
@@ -76,14 +76,14 @@ It means the task reached DONE — its graders passed and the harness verified i
 
 - `uncommitted-work` — the tree was dirty at DONE (the agent never committed). The "done" is suspect; inspect, and usually re-drive the task rather than trust it.
 - `divergent-base` — the base advanced and the rebase did not apply cleanly (the loser of a concurrent conflict).
-- `standing-verify` — the repo-wide `[submit] verify` gate failed against the base (often the base itself is red).
-- `protected-paths` — the branch touched the fenced verification surface (`[submit] protected_paths`) and policy refuses to land it.
+- `standing-verify` — the repo-wide `verify` gate failed against the base (often the base itself is red).
+- `protected-paths` — the branch touched the fenced verification surface (the `protected_paths` config key) and flywheel refuses to land it.
 
 Recover by landing the verified branch yourself, re-verified against the exact base — the same discipline the worker enforces, so nothing lands unproven:
 
 ```
 cd <parked-worktree>              # path is in the stranded detail and the worker log
-git rebase <base>                 # the [submit] base (default: your checked-out branch)
+git rebase <base>                 # the landing base (your checked-out branch)
 <run the task's graders>          # nothing lands unverified against the base it lands on
 git switch <base>
 git merge --ff-only <branch>
@@ -91,7 +91,7 @@ git worktree remove <parked-worktree>
 git branch -d <branch>
 ```
 
-For `standing-verify`, fix the base's failing gate before re-landing; for `uncommitted-work`, prefer re-driving the task over hand-committing an agent's uncommitted edits. The full landing decision tree and every `park_kind` are in `fw docs strategy`; `[submit] base`, `verify`, and `protected_paths` are in `fw docs configuration`.
+For `standing-verify`, fix the base's failing gate before re-landing; for `uncommitted-work`, prefer re-driving the task over hand-committing an agent's uncommitted edits. The full landing decision tree and every `park_kind` are in `fw docs strategy`; `verify`, `protected_paths`, and `land` are in `fw docs configuration`.
 
 ## WHERE TO GO DEEPER
 
@@ -101,7 +101,7 @@ This skill is a runbook, not a manual. For depth, read the curated operator docs
 - `fw docs loop` — the single-task control plane and the iteration envelope.
 - `fw docs strategy` — how a DONE task lands and every `park_kind`.
 - `fw docs sandbox` — the sandbox-as-deploy model and worktree lifecycle.
-- `fw docs configuration` — the complete `flywheel.toml` reference.
+- `fw docs configuration` — the eight config keys and where each removed setting went.
 - `fw docs autopilot` — the intake daemon that refills the queue.
 
 Bare `fw docs` lists every topic.

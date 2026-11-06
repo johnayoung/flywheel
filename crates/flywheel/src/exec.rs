@@ -2,8 +2,8 @@
 //!
 //! Drives a single run through [`AgentRuntime`] under a `LocalHost` and
 //! prints the folded [`CompletedRun`]. No task, no store, no worktree, no
-//! `flywheel.toml`: the verb never loads config and never writes under
-//! `.flywheel/`, so any project can shell out to it.
+//! config: the verb never resolves a project and never writes anything, so
+//! any project can shell out to it.
 //!
 //! Exit codes: 0 when the agent stopped cleanly (terminal envelope seen, no
 //! `failure`, no `fault`, `stop.is_error` false); 1 when the run failed
@@ -41,7 +41,7 @@ Exit: 0 clean stop, 1 run failed (result still printed), 2 usage error.";
 #[derive(Debug, Parser)]
 #[command(
     name = "fw exec",
-    about = "Run one agent call: no tasks, store, worktree, or flywheel.toml",
+    about = "Run one agent call: no tasks, store, worktree, or config",
     after_help = AFTER_HELP
 )]
 struct ExecArgs {

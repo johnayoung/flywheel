@@ -547,5 +547,4 @@ mod tests {
             &quiet,
         );
     }
-
 }

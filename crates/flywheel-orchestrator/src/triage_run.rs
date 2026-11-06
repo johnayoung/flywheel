@@ -8,7 +8,7 @@
 //! signal handling.
 //!
 //! Load discipline (spec 00082): the policy is resolved and validated BEFORE
-//! the repo root or any GitHub seam is touched, so a malformed `[triage]`
+//! the repo root or any GitHub seam is touched, so a bad flag
 //! policy exits 2 having issued no `gh` call and no git command -- the
 //! write-free guarantee an idle or failing pass must honor. An idle pass
 //! (empty backlog) writes nothing and the daemon simply schedules the next
@@ -19,20 +19,20 @@
 //! pass itself, and signal arming. [`ProductionHost`] is the real one.
 //!
 //! Authoritative specs: `docs/cli.md` (`triage`), `docs/configuration.md`
-//! (`[triage]`), `docs/autopilot.md`.
+//! (where every old setting went), `docs/autopilot.md`.
 
 use crate::autopilot_run::{
     looks_like_negative_number, match_long_option, parse_float_arg, reject_inline, split_flag,
     take_value,
 };
 use crate::github::{GhRunner, ProcessGhRunner};
+use crate::policy::{PolicyError, RunFlags, WorkPolicy};
 use crate::sources::LogSink;
 use crate::triage::{
     TriageAgentOptions, TriageBoard, TriageError, TriagePass, TriagePassResult, TriageSeams,
     build_grader_executor, build_triage_authoring_invoker, resolve_base_sha,
 };
 pub use crate::workflow::load_effective_policy;
-use crate::policy::{PolicyError, RunFlags, WorkPolicy};
 use flywheel_core::audit::StopFlag;
 use std::cell::Cell;
 use std::fmt;
@@ -55,7 +55,8 @@ pub const CYCLE_FAILURE_BACKOFF_SECONDS: f64 = 10.0;
 pub const LOG_PREFIX: &str = "[triage]";
 
 /// The one-line usage argparse prints on a bad argument.
-pub const USAGE: &str = "usage: flywheel triage [-h] --repo OWNER/NAME [--label LABEL] [--model MODEL]
+pub const USAGE: &str =
+    "usage: flywheel triage [-h] --repo OWNER/NAME [--label LABEL] [--model MODEL]
                        [--interval INTERVAL] [--once]";
 
 const HELP: &str = "usage: flywheel triage [-h] --repo OWNER/NAME [--label LABEL] [--model MODEL]
@@ -95,7 +96,12 @@ pub struct TriageArgs {
 
 /// The long options `flywheel triage` defines, for unique-prefix matching.
 const LONG_OPTIONS: [&str; 6] = [
-    "--help", "--repo", "--label", "--model", "--interval", "--once",
+    "--help",
+    "--repo",
+    "--label",
+    "--model",
+    "--interval",
+    "--once",
 ];
 
 /// Parse `argv` (everything after the verb) as argparse would: `--model M`,
@@ -701,7 +707,6 @@ mod tests {
     use crate::triage::{Decision, TriageOutcome};
     use std::collections::VecDeque;
     use std::sync::Mutex;
-
 
     fn idle() -> Result<TriagePassResult, TriageError> {
         Ok(TriagePassResult::default())

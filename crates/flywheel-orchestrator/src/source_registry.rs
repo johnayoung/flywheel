@@ -1,8 +1,8 @@
 //! The registry of work-source backends.
 //!
-//! Names the work-source kinds an operator can select in `[source] kind`
+//! Names the work-source kinds an operator can select with `fw worker --source`
 //! and binds each to a factory that builds the adapter from a
-//! [`SourceBuildContext`] (the parsed `[source]` table plus the operator's
+//! [`SourceBuildContext`] (the source settings table plus the operator's
 //! default graders and the optional stop/log sinks). The registry depends
 //! only on the [`WorkSource`] seam, so adapters register themselves without
 //! this module importing them: [`default_registry`] registers the always
@@ -43,7 +43,8 @@ pub const DEFAULT_TASKS_DIR: &str = ".flywheel/tasks";
 
 /// Everything a source factory may read to construct its adapter.
 ///
-/// `settings` is the parsed `[source]` table of `flywheel.toml` (including
+/// `settings` is the source settings table the policy re-materializes
+/// (`crate::workflow::source_settings_from_policy`; including
 /// `kind`); each factory reads the keys its adapter needs (`tasks_dir`,
 /// `repo`, `label`, ...) and fails with [`SourceRegistryError::Config`]
 /// when a required one is missing or mistyped. `default_graders` is the

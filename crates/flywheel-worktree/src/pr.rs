@@ -12,14 +12,8 @@
 //! exactly as the merge strategy does; the protected-path gate applies the
 //! same (defense in depth even with a human reviewing).
 //!
-//! Selected via `flywheel.toml`:
-//!
-//! ```toml
-//! [submit]
-//! strategy = "pr"        # default "merge"
-//! remote = "origin"      # push target (default shown)
-//! # pr_base = "main"     # PR base branch (default: the worker's base)
-//! ```
+//! Selected by the `land = "pr"` config key; it pushes to `origin` and opens
+//! the PR onto the worker's landing base.
 //!
 //! PR creation shells out to the `gh` CLI through the same runner seam the
 //! GitHub work source uses ([`GhRunner`]); tests inject a scripted runner.
@@ -39,8 +33,8 @@ use crate::submitter::{
     GitError, GitOutput, GitWorktreeSubmitter, SubmitError, build_merge_submitter, git,
 };
 use flywheel_core::events::{
-    LANDING_STRATEGY_PR, Landed, LandingParked, PARK_KIND_PROTECTED_PATHS,
-    PARK_KIND_PUSH_FAILED, PARK_KIND_SUBMIT_ERROR, PARK_KIND_UNCOMMITTED_WORK,
+    LANDING_STRATEGY_PR, Landed, LandingParked, PARK_KIND_PROTECTED_PATHS, PARK_KIND_PUSH_FAILED,
+    PARK_KIND_SUBMIT_ERROR, PARK_KIND_UNCOMMITTED_WORK,
 };
 use flywheel_core::lifecycle::Status;
 use flywheel_orchestrator::github::{GhRunner, ProcessGhRunner, run_gh};
@@ -498,11 +492,11 @@ pub(crate) mod test_support {
     //! Real-git-with-a-bare-remote fixtures and the scripted `gh` runner.
 
     use super::*;
-    use std::path::PathBuf;
     use crate::submitter::test_support::{git_ok, init_repo};
     use flywheel_core::task::GraderType;
     use flywheel_orchestrator::github::GhOutput;
     use flywheel_orchestrator::sources::WorkSourceError;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     /// The canned `pr create` URL.
@@ -642,17 +636,13 @@ mod tests {
     use flywheel_core::task::Task;
     use std::fs;
     use std::path::PathBuf;
-    
+
     use crate::submit_registry::{MERGE_STRATEGY, builtin_registry};
     use crate::submitter::test_support::{
         branch_exists, commit, git_ok, landed, ledger, parked, rev, sandbox_req, submit_req,
         submitter, task_file, trailer_value,
     };
-    
-    
-    
-    
-    
+
     use flywheel_core::task::{CommandGrader, Grader, GraderType};
     use flywheel_orchestrator::github::GhOutput;
     use flywheel_orchestrator::policy::WorkPolicy;
@@ -1429,10 +1419,7 @@ mod tests {
     fn pr_registers_and_builds_from_policy_knobs() {
         let mut registry = builtin_registry();
         register_pr_strategy(&mut registry).unwrap();
-        assert_eq!(
-            registry.names(),
-            vec![MERGE_STRATEGY, PR_STRATEGY]
-        );
+        assert_eq!(registry.names(), vec![MERGE_STRATEGY, PR_STRATEGY]);
         assert!(matches!(
             register_pr_strategy(&mut registry),
             Err(SubmitRegistryError::Duplicate { .. })
@@ -1541,5 +1528,4 @@ mod tests {
         assert_eq!(title, format!("t1: {}\u{2026}", "g".repeat(85)));
         assert_eq!(title.chars().count(), TITLE_MAX);
     }
-
 }

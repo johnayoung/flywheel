@@ -62,7 +62,7 @@ fn require_adopted(
         return Ok(());
     }
     Err(not_found(format!(
-        "{} is not a flywheel repo (no flywheel.toml or .flywheel/): run `fw init` there first",
+        "{} is not a flywheel project (no project id flywheel knows): run `fw init` there first",
         folder.display()
     )))
 }

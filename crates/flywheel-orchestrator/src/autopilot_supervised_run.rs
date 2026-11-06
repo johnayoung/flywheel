@@ -808,16 +808,14 @@ pub fn run_main(argv: &[String], host: &dyn SupervisedHost) -> i32 {
     };
     let activity_path = match args.activity_file.as_deref().filter(|p| !p.is_empty()) {
         Some(path) => PathBuf::from(path),
-        None => {
-            match crate::workflow::load_effective_policy(crate::config::Access::Execute) {
-                Ok(policy) => crate::autopilot_run::autopilot_log_dir(policy.as_ref(), &repo_root)
-                    .join("activity.json"),
-                Err(err) => {
-                    stderr(&format!("autopilot-supervised: policy error: {err}"));
-                    return 2;
-                }
+        None => match crate::workflow::load_effective_policy(crate::config::Access::Execute) {
+            Ok(policy) => crate::autopilot_run::autopilot_log_dir(policy.as_ref(), &repo_root)
+                .join("activity.json"),
+            Err(err) => {
+                stderr(&format!("autopilot-supervised: policy error: {err}"));
+                return 2;
             }
-        }
+        },
     };
     let log_dir = activity_path
         .parent()

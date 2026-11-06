@@ -48,7 +48,7 @@
 //!
 //! The pass records no stop events: its only side channel is the log seam
 //! (the per-pass cap line and the skipped-issue lines). There is no CLI
-//! verb, no daemon loop, and no `[triage]` policy binding here -- those live
+//! verb, no daemon loop, and no policy binding here -- those live
 //! in [`crate::triage_run`]; the repo, labels, base SHA, and cap arrive as
 //! explicit constructor arguments.
 //!

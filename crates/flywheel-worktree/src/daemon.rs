@@ -22,13 +22,13 @@
 //! The worker never commits to the operator's branch: landing is the
 //! `SubmitStrategy`'s job. Authoritative specs: `docs/cli.md` (the `worker`
 //! verb), `docs/strategy.md`, `docs/sandbox.md`, `docs/orchestration.md`,
-//! `docs/configuration.md` (`[worker]`, `[execution]`), `docs/container-backend.md`.
+//! `docs/configuration.md` (verb flags), `docs/container-backend.md`.
 
 use crate::phase::{ArchiveError, ArchiveSweep, archive_phases, record_phase_bases};
 use crate::pr::register_pr_strategy;
 use crate::retention::{
-    DEFAULT_RETENTION_DAYS, DEFAULT_RUN_LOG_RETENTION, retention_cadence_tick,
-    sweep_run_logs, wall_clock_seconds,
+    DEFAULT_RETENTION_DAYS, DEFAULT_RUN_LOG_RETENTION, retention_cadence_tick, sweep_run_logs,
+    wall_clock_seconds,
 };
 use crate::scoped::WorkerScope;
 use crate::submit_registry::{
@@ -68,7 +68,8 @@ use flywheel_orchestrator::orchestrate::{
     orchestrate,
 };
 use flywheel_orchestrator::policy::{
-    PolicyError, RunFlags, Skills as PolicySkills, WorkPolicy, resolve_grader_env, resolve_sandbox_root,
+    PolicyError, RunFlags, Skills as PolicySkills, WorkPolicy, resolve_grader_env,
+    resolve_sandbox_root,
 };
 use flywheel_orchestrator::sources::DirectoryWorkSource;
 use flywheel_orchestrator::store_factory::{StoreConfigError, build_store};
@@ -466,7 +467,8 @@ pub fn fetch_base_fresh(
 
 /// Resolve the merge-strategy landing base, fetching it fresh.
 ///
-/// The base is `[submit] base` when configured; otherwise the operator's
+/// The base is the policy's `submit_base` when a directly constructed
+/// policy sets one (no config key does); otherwise the operator's
 /// currently-checked-out branch. A configured base equal to the checked-out
 /// branch is refused (never land into the working checkout), as is a
 /// detached `HEAD` with no base configured.
@@ -481,8 +483,7 @@ pub fn resolve_landing_base(
         if checked_out.as_deref() == Some(configured.as_str()) {
             return Err(PolicyError::Invalid(format!(
                 "configured landing base {} is the operator's currently-checked-out branch; \
-                 refusing to land into the working checkout (check out a different branch or \
-                 change [submit] base)",
+                 refusing to land into the working checkout (check out a different branch)",
                 py_str_repr(&configured)
             )));
         }
@@ -492,9 +493,7 @@ pub fn resolve_landing_base(
     }
     checked_out.ok_or_else(|| {
         PolicyError::Invalid(
-            "worker started on detached HEAD with no [submit] base configured; set [submit] base \
-             to a landing branch or check out a branch."
-                .to_owned(),
+            "worker started on detached HEAD; check out a branch to land on.".to_owned(),
         )
     })
 }
@@ -1932,7 +1931,7 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
 
     // Loaded once: the same policy resolves the agent model, the landing
     // base, and the store backend for every store this process constructs.
-    // Base resolution reads [submit] base, so it runs AFTER the policy
+    // Base resolution reads the policy, so it runs AFTER the policy
     // loads; the pool size and the worktree root resolve before any store
     // opens so an operator mistake fails fast with nothing claimed.
     let resolved: Result<_, PolicyError> = (|| {
@@ -2612,7 +2611,9 @@ mod tests {
         // A registration turns it on, at the fixed project location.
         fs::create_dir_all(held_out.join("t1")).unwrap();
         assert_eq!(
-            build_held_out_source(Some(&bound), &repo_root).unwrap().root,
+            build_held_out_source(Some(&bound), &repo_root)
+                .unwrap()
+                .root,
             held_out
         );
     }
@@ -3790,7 +3791,11 @@ esac
         assert_ne!(code, 0);
         assert!(err.contains("concurrency"), "{err}");
         assert!(err.starts_with("flywheel worker: policy error: "), "{err}");
-        assert!(!project_dir(&tmp.path().join("home")).join("flywheel.sqlite").exists());
+        assert!(
+            !project_dir(&tmp.path().join("home"))
+                .join("flywheel.sqlite")
+                .exists()
+        );
     }
 
     #[test]
@@ -3802,7 +3807,10 @@ esac
         assert!(err.ends_with("flywheel worker: error: unrecognized arguments: --bogus\n"));
         let (code, _out, err) = run_main(&["--policy", "flywheel.toml"]);
         assert_eq!(code, 2);
-        assert!(err.contains("unrecognized arguments: --policy flywheel.toml"), "{err}");
+        assert!(
+            err.contains("unrecognized arguments: --policy flywheel.toml"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3821,7 +3829,11 @@ esac
         assert!(project.join("flywheel.sqlite").exists());
         assert!(project.join("worktrees").is_dir());
         assert!(project.join("tasks").join("active").is_dir());
-        assert_eq!(porcelain(&repo), before, "the worker wrote into the repo tree");
+        assert_eq!(
+            porcelain(&repo),
+            before,
+            "the worker wrote into the repo tree"
+        );
     }
 
     #[test]
@@ -3834,7 +3846,10 @@ esac
         let _cwd = enter(&repo);
         let (code, _out, err) = run_main(&["--once", "--source", "github"]);
         assert_eq!(code, 2);
-        assert!(err.contains("--source github needs --repo OWNER/NAME"), "{err}");
+        assert!(
+            err.contains("--source github needs --repo OWNER/NAME"),
+            "{err}"
+        );
         let (code, _out, err) = run_main(&["--once", "--sandbox", "container"]);
         assert_eq!(code, 2);
         assert!(err.contains("needs --image IMAGE"), "{err}");

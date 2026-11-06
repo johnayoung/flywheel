@@ -14,7 +14,7 @@
 //! [`ProductionHost`] is the real one.
 //!
 //! Authoritative specs: `docs/autopilot.md`, `docs/cli.md` (`autopilot`),
-//! `docs/configuration.md` (`[autopilot]`).
+//! `docs/configuration.md` (built-in defaults).
 
 use crate::autopilot::{
     AutopilotPassResult, DEFAULT_LANDING, DEFAULT_TARGET_DEPTH, QueueDepthFn, RefillError,
@@ -79,10 +79,8 @@ options:
   --tasks-dir TASKS_DIR
   --model MODEL
   --target-depth TARGET_DEPTH
-                        Fill the queue up to this depth (overrides [autopilot]
-                        config).
-  --interval INTERVAL   Seconds between daemon cycles (overrides [autopilot]
-                        config).
+                        Fill the queue up to this depth (default: 5).
+  --interval INTERVAL   Seconds between daemon cycles (default: 300).
   --once                Run a single refill pass and exit (no daemon loop).
   --dry-run             With --once: measure the queue against the target and
                         report the refill decision without running discovery
@@ -525,7 +523,8 @@ pub fn resolve_daemon_db_path(policy: Option<&WorkPolicy>, repo_root: &Path) -> 
 
 /// The directory the daemon's activity record and discovery cache live in:
 /// `$FLYWHEEL_HOME/projects/<id>/logs/autopilot` for a home project, else
-/// `<repo>/.flywheel/logs/autopilot` (a policy-file repo).
+/// `<repo>/.flywheel/logs/autopilot` for a policy bound to no project
+/// (direct construction only).
 pub fn autopilot_log_dir(policy: Option<&WorkPolicy>, repo_root: &Path) -> PathBuf {
     match policy.and_then(|p| p.project.as_ref()) {
         Some(project) => project.paths().autopilot_logs(),
@@ -1345,7 +1344,9 @@ pub fn dry_run_pass(
     let depth = match depth {
         Ok(depth) => depth,
         Err(err) => {
-            stderr(&format!("flywheel autopilot: cannot measure the queue: {err}"));
+            stderr(&format!(
+                "flywheel autopilot: cannot measure the queue: {err}"
+            ));
             return 1;
         }
     };
@@ -2687,7 +2688,7 @@ mod tests {
                 ..dir_policy()
             },
         )
-            .script(vec![Ok(result)]);
+        .script(vec![Ok(result)]);
         assert_eq!(run_main(&argv(&["--once", "--model", "m"]), &host), 0);
         let root = python_path_str(dir.path());
         assert_eq!(
@@ -3126,11 +3127,13 @@ mod tests {
     fn daemon_backs_off_a_never_progressing_repo_and_stops() {
         let dir = TempDir::new().unwrap();
         let claims = Arc::new(InMemoryClaimStore::new());
-        let host = host(&dir, dir_policy()).with_claims(claims.clone()).script(vec![
-            Ok(idle("idle 1")),
-            Ok(idle("idle 2")),
-            Ok(idle("idle 3")),
-        ]);
+        let host = host(&dir, dir_policy())
+            .with_claims(claims.clone())
+            .script(vec![
+                Ok(idle("idle 1")),
+                Ok(idle("idle 2")),
+                Ok(idle("idle 3")),
+            ]);
         let code = run_main(
             &argv(&[
                 "--activity-file",

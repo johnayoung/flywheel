@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Seed a throwaway README-rewrite task into .flywheel/tasks/active/ to smoke-test
+# Seed a throwaway README-rewrite task into this repo's project tasks dir
+# ($(fw project path --tasks)/active/) to smoke-test
 # the loop after changes. Repeatable: each run replaces the previous seed and
 # stamps a fresh task id so the store never sees it as already completed.
 #
@@ -9,7 +10,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PHASE_DIR="$REPO_ROOT/.flywheel/tasks/active/99-smoke-readme"
+cd "$REPO_ROOT"
+PHASE_DIR="$(cargo run --quiet -p flywheel --bin fw -- project path --tasks)/active/99-smoke-readme"
 TASK_ID="smoke-readme-rewrite-$(date +%Y%m%d-%H%M%S)"
 
 rm -rf "$PHASE_DIR"

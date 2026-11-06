@@ -17,7 +17,7 @@
 //! matching `include_str!` arm in [`render_topic`] and its
 //! `doc_pages/<topic>.md -> ../../../docs/<source_path>` symlink).
 //!
-//! Docs are knowledge, not policy: this verb loads no `flywheel.toml` and
+//! Docs are knowledge, not policy: this verb loads no config and
 //! touches no store, so it works in a bare directory with nothing
 //! scaffolded.
 
@@ -37,7 +37,7 @@ pub const TOPICS: [(&str, &str); 16] = [
     ),
     (
         "configuration",
-        "the effective config (config.toml, .flywheel.toml, trust) and the legacy policy file.",
+        "the eight config keys (config.toml, .flywheel.toml, trust) and where every removed setting went.",
     ),
     (
         "task-schema",
@@ -57,7 +57,7 @@ pub const TOPICS: [(&str, &str); 16] = [
     ),
     (
         "sandbox",
-        "the sandbox-as-deploy model and the complete [sandbox.*] reference.",
+        "the sandbox-as-deploy model: the worktree and container backends and their defaults.",
     ),
     (
         "held-out-gate",

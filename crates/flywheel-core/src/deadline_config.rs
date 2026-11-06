@@ -14,7 +14,7 @@
 //! a positive, finite number of seconds is the ceiling and `None` is the
 //! explicit unbounded opt-out.
 //!
-//! See `docs/configuration.md` (`[deadlines]`) for the on-disk reference.
+//! The values are built-in defaults (`docs/configuration.md`, where every old setting went).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

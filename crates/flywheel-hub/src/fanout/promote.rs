@@ -17,9 +17,9 @@
 //! * the fan-out's graders: command graders, in order (held-out ones stay
 //!   in the held-out registry: a task's graders are shown to its agent);
 //! * protected paths: `context.constraints` lines; what enforces them in
-//!   the loop is the repo-wide `[submit] protected_paths` (a branch
+//!   the loop is the repo-wide `protected_paths` config key (a branch
 //!   touching one is parked, never landed), so the plan says which are not
-//!   covered there (the hub never edits `flywheel.toml`, itself protected);
+//!   covered there (the hub never edits the repo's config);
 //! * the winner's commit (or a named passing candidate's): one
 //!   `context.references` line, offered as prior work to consult, not the
 //!   solution.

@@ -248,12 +248,14 @@ impl Default for SandboxRetention {
     }
 }
 
-/// `[sandbox.container]` -- container backend config (spec 00045).
+/// The container backend's parameters (spec 00045).
 ///
-/// Inert unless `[sandbox] backend = "container"`, at which point `image` is
-/// required. `auth` declares a MODE and `auth_env` the env var NAME the token
-/// is read from at run time -- the value never lives in the policy file.
-/// `model` falls back to the worker's resolved agent model when empty.
+/// Inert unless the backend is `container` (`fw worker --sandbox
+/// container`), at which point `image` (`--image`) is required. `auth`
+/// declares a MODE (default `auto`: detect the credential at hand) and
+/// `auth_env` the env var NAME a token is read from at run time -- the value
+/// never lives in configuration. `model` falls back to the worker's
+/// resolved agent model when empty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxContainer {
     pub image: String,
@@ -269,7 +271,7 @@ impl Default for SandboxContainer {
         Self {
             image: String::new(),
             model: String::new(),
-            auth: "oauth".to_string(),
+            auth: "auto".to_string(),
             auth_env: String::new(),
             exec_timeout: 1800,
             egress_network: String::new(),
@@ -310,7 +312,6 @@ impl Default for SandboxPolicy {
         }
     }
 }
-
 
 /// The tunable weights of the `docs/autopilot.md` scheduled-score formula
 /// (`[autopilot.weights]`). Defaults are the shipped weights.
@@ -556,9 +557,7 @@ impl RunFlags {
             return invalid("--repo needs --source github, github_ci, or github_review".into());
         }
         if kind != "github" && (self.label.is_some() || self.require_triage_receipt) {
-            return invalid(
-                "--label and --require-triage-receipt need --source github".to_owned(),
-            );
+            return invalid("--label and --require-triage-receipt need --source github".to_owned());
         }
         if kind != "directory" && self.repo.is_none() {
             return invalid(format!("--source {kind} needs --repo OWNER/NAME"));
@@ -695,7 +694,6 @@ fn process_environ() -> BTreeMap<String, String> {
     std::env::vars().collect()
 }
 
-
 // --- Sandbox root resolution ----------------------------------------------------
 
 /// Resolve `fw worker --sandbox-root PATH` to the absolute worktree root.
@@ -703,7 +701,11 @@ fn process_environ() -> BTreeMap<String, String> {
 /// `None` keeps `default` (the project's `worktrees/` under
 /// `$FLYWHEEL_HOME`). A relative path anchors at `repo_root` -- never the
 /// process cwd; an absolute path is used verbatim.
-pub fn resolve_sandbox_root(configured: Option<&Path>, repo_root: &Path, default: &Path) -> PathBuf {
+pub fn resolve_sandbox_root(
+    configured: Option<&Path>,
+    repo_root: &Path,
+    default: &Path,
+) -> PathBuf {
     match configured {
         None => resolve_nonstrict(default),
         Some(path) if path.is_absolute() => path.to_path_buf(),
@@ -882,25 +884,44 @@ mod tests {
     #[test]
     fn inconsistent_source_flags_are_refused() {
         let err = |flags: RunFlags| applied(flags).unwrap_err();
-        assert!(err(RunFlags { source: Some("jira".into()), ..RunFlags::default() })
-            .contains("--source must be one of"));
-        assert!(err(RunFlags { source: Some("github".into()), ..RunFlags::default() })
-            .contains("needs --repo OWNER/NAME"));
-        assert!(err(RunFlags {
-            source: Some("github".into()),
-            repo: Some("noslash".into()),
-            ..RunFlags::default()
-        })
-        .contains("--repo must be OWNER/NAME"));
-        assert!(err(RunFlags { repo: Some("a/b".into()), ..RunFlags::default() })
-            .contains("--repo needs --source"));
-        assert!(err(RunFlags {
-            source: Some("github_ci".into()),
-            repo: Some("a/b".into()),
-            label: Some("x".into()),
-            ..RunFlags::default()
-        })
-        .contains("need --source github"));
+        assert!(
+            err(RunFlags {
+                source: Some("jira".into()),
+                ..RunFlags::default()
+            })
+            .contains("--source must be one of")
+        );
+        assert!(
+            err(RunFlags {
+                source: Some("github".into()),
+                ..RunFlags::default()
+            })
+            .contains("needs --repo OWNER/NAME")
+        );
+        assert!(
+            err(RunFlags {
+                source: Some("github".into()),
+                repo: Some("noslash".into()),
+                ..RunFlags::default()
+            })
+            .contains("--repo must be OWNER/NAME")
+        );
+        assert!(
+            err(RunFlags {
+                repo: Some("a/b".into()),
+                ..RunFlags::default()
+            })
+            .contains("--repo needs --source")
+        );
+        assert!(
+            err(RunFlags {
+                source: Some("github_ci".into()),
+                repo: Some("a/b".into()),
+                label: Some("x".into()),
+                ..RunFlags::default()
+            })
+            .contains("need --source github")
+        );
     }
 
     #[test]
@@ -916,12 +937,27 @@ mod tests {
         assert_eq!(policy.sandbox.container.image, "ghcr.io/o/i:1");
         assert_eq!(policy.agent_id.as_deref(), Some("codex"));
         let err = |flags: RunFlags| applied(flags).unwrap_err();
-        assert!(err(RunFlags { sandbox: Some("container".into()), ..RunFlags::default() })
-            .contains("needs --image"));
-        assert!(err(RunFlags { image: Some("i".into()), ..RunFlags::default() })
-            .contains("--image needs --sandbox container"));
-        assert!(err(RunFlags { sandbox: Some("vm".into()), ..RunFlags::default() })
-            .contains("--sandbox must be one of"));
+        assert!(
+            err(RunFlags {
+                sandbox: Some("container".into()),
+                ..RunFlags::default()
+            })
+            .contains("needs --image")
+        );
+        assert!(
+            err(RunFlags {
+                image: Some("i".into()),
+                ..RunFlags::default()
+            })
+            .contains("--image needs --sandbox container")
+        );
+        assert!(
+            err(RunFlags {
+                sandbox: Some("vm".into()),
+                ..RunFlags::default()
+            })
+            .contains("--sandbox must be one of")
+        );
     }
 
     #[test]

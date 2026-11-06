@@ -761,11 +761,9 @@ const COMMON_OPTIONS_WIDE: &str = "  --tasks-dir TASKS_DIR
                         flywheel.sqlite under $FLYWHEEL_HOME).
 ";
 
-const NEXT_USAGE: &str =
-    "usage: flywheel next [-h] [--tasks-dir TASKS_DIR] [--db DB]\n";
+const NEXT_USAGE: &str = "usage: flywheel next [-h] [--tasks-dir TASKS_DIR] [--db DB]\n";
 
-const ORCHESTRATE_USAGE: &str =
-    "usage: flywheel orchestrate [-h] [--tasks-dir TASKS_DIR]
+const ORCHESTRATE_USAGE: &str = "usage: flywheel orchestrate [-h] [--tasks-dir TASKS_DIR]
                             [--db DB] [--sandbox-root SANDBOX_ROOT]
                             [--model MODEL] [--max-turns MAX_TURNS]
                             [--max-retries MAX_RETRIES]
@@ -817,8 +815,7 @@ const STATUS_OPTIONS: &str =
                         never self-reported.
 ";
 
-const LIVE_USAGE: &str =
-    "usage: flywheel live [-h] [--db DB] [--watch SECONDS]\n";
+const LIVE_USAGE: &str = "usage: flywheel live [-h] [--db DB] [--watch SECONDS]\n";
 
 const LIVE_OPTIONS: &str = "
 options:
@@ -844,8 +841,7 @@ const HISTORY_OPTIONS: &str = "  --status {done,failed,failed_validation}
   --json                Emit machine-readable JSON instead of a text table.
 ";
 
-const SHOW_USAGE: &str =
-    "usage: flywheel show [-h] [--tasks-dir TASKS_DIR] [--db DB]
+const SHOW_USAGE: &str = "usage: flywheel show [-h] [--tasks-dir TASKS_DIR] [--db DB]
                      [--json] [--raw]
                      run_or_task_id
 ";
@@ -868,8 +864,7 @@ const ARCHIVE_USAGE: &str = "usage: flywheel archive [-h] [--tasks-dir TASKS_DIR
                         [--db DB]
 ";
 
-const VALIDATE_USAGE: &str =
-    "usage: flywheel validate [-h] [--tasks-dir TASKS_DIR]\n";
+const VALIDATE_USAGE: &str = "usage: flywheel validate [-h] [--tasks-dir TASKS_DIR]\n";
 
 const VALIDATE_OPTIONS: &str = "
 options:
@@ -879,8 +874,7 @@ options:
                         under $FLYWHEEL_HOME).
 ";
 
-const RECHECK_USAGE: &str =
-    "usage: flywheel recheck-blocked [-h] [--tasks-dir TASKS_DIR]
+const RECHECK_USAGE: &str = "usage: flywheel recheck-blocked [-h] [--tasks-dir TASKS_DIR]
                                 [--db DB] [--run-id RUN_ID] [--dry-run]
 ";
 
@@ -894,8 +888,7 @@ const RECHECK_OPTIONS: &str =
                         not emit harness.unblocked.
 ";
 
-const RECOVER_USAGE: &str =
-    "usage: flywheel recover [-h] [--db DB] [--task-id TASK_ID]\n";
+const RECOVER_USAGE: &str = "usage: flywheel recover [-h] [--db DB] [--task-id TASK_ID]\n";
 
 const RECOVER_OPTIONS: &str = "
 options:
@@ -906,8 +899,7 @@ options:
                      to recover every stranded lifecycle in the store.
 ";
 
-const RESOLVE_USAGE: &str =
-    "usage: flywheel resolve [-h] --reason REASON [--db DB]
+const RESOLVE_USAGE: &str = "usage: flywheel resolve [-h] --reason REASON [--db DB]
                         task_id
 ";
 
@@ -1189,10 +1181,7 @@ mod tests {
         );
         assert_eq!(
             cmd(&["live", "--watch", "5"]),
-            Command::Live(LiveArgs {
-                db: None,
-                watch: 5,
-            })
+            Command::Live(LiveArgs { db: None, watch: 5 })
         );
         assert_eq!(
             cmd(&["recheck-blocked", "--run-id", "r", "--dry-run"]),
@@ -1226,9 +1215,14 @@ mod tests {
     #[test]
     fn ambiguous_prefix_is_an_error_and_negative_numbers_are_values() {
         let rendered = err(&["orchestrate", "--max", "x"]);
-        assert!(rendered.contains("ambiguous option: --max could match --max-turns, --max-retries"));
+        assert!(
+            rendered.contains("ambiguous option: --max could match --max-turns, --max-retries")
+        );
         let rendered = err(&["status", "--policy", "x"]);
-        assert!(rendered.contains("unrecognized arguments: --policy x"), "{rendered}");
+        assert!(
+            rendered.contains("unrecognized arguments: --policy x"),
+            "{rendered}"
+        );
         assert_eq!(
             cmd(&["history", "--limit", "-1"]),
             Command::History(HistoryArgs {

@@ -382,7 +382,7 @@ pub fn plan_scope(
             unrunnable.push((
                 id.clone(),
                 format!(
-                    "it requires capabilities this worker lacks ({}; see [execution] capabilities)",
+                    "it requires capabilities this worker lacks ({}; workers advertise none)",
                     missing.join(", ")
                 ),
             ));

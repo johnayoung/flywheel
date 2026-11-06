@@ -44,7 +44,7 @@
 //! the [`GhRunner`] subprocess boundary (with [`ProcessGhRunner`] as the
 //! real implementation), [`run_gh`], [`format_report_body`],
 //! [`emit_truncation_warning`], and [`register_github_sources`], which
-//! binds all three `[source] kind`s into a [`SourceRegistry`].
+//! binds all three `--source` kinds into a [`SourceRegistry`].
 //!
 //! Authoritative spec: `docs/work-sources.md` (`github`).
 

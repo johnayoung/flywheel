@@ -6,7 +6,7 @@
 //! no ANSI sequences -- the interactive-default + print-mode pattern.
 //!
 //! Store path resolution mirrors `fw status` / `fw live` (explicit `--db`
-//! -> policy `[paths] db` -> `.flywheel/flywheel.sqlite`); the work source
+//! -> the home project's `flywheel.sqlite`); the work source
 //! (used by both the summary header's task-state counts and the `/archive`
 //! slash command) mirrors the same explicit `--tasks-dir` -> policy ->
 //! default chain.
@@ -54,8 +54,7 @@ use flywheel_orchestrator::store_factory::{
 };
 use flywheel_orchestrator::store_registry::{Environ, SqliteCoreOpener, StoreRegistries};
 use flywheel_orchestrator::workflow::{
-    Access, load_effective_policy, repo_root_for, store_config_for,
-    store_partition,
+    Access, load_effective_policy, repo_root_for, store_config_for, store_partition,
 };
 use flywheel_worktree::phase::{ArchiveOptions, archive_completed_phases};
 use ratatui::Frame;
@@ -727,7 +726,7 @@ pub fn missing_dsn_message() -> String {
 pub struct DaemonSpawnSpec {
     /// The home project's paths: the supervisors log under its
     /// `logs/worker/` and `logs/autopilot/`. `None` keeps the in-repo
-    /// `.flywheel/logs/` defaults (a policy-file repo).
+    /// `.flywheel/logs/` defaults (explicit `--db`/`--tasks-dir`, no project).
     pub project: Option<ProjectPaths>,
     pub db_path: PathBuf,
     /// The store partition the console reads (the project id, or

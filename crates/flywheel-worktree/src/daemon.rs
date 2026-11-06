@@ -508,7 +508,7 @@ pub fn resolve_landing_base(
 
 // --- Flag / policy resolution ------------------------------------------------------------
 
-/// The agent model id: an explicit `--model` wins, else `[agent] model`,
+/// The agent model id: an explicit `--model` wins, else the `model` key,
 /// else `None` (the agent's own default).
 pub fn resolve_model(flag: Option<&str>, policy: Option<&WorkPolicy>) -> Option<String> {
     if let Some(model) = flag.filter(|m| !m.is_empty()) {
@@ -776,7 +776,7 @@ pub fn worker_registry() -> SubmitStrategyRegistry {
 
 /// The registry name the policy selects: the tier router when
 /// `[[submit.tiers]]` rules are configured (the route is per-diff, not
-/// repo-global), else `[submit] strategy`, else `merge`.
+/// repo-global), else the `land` key, else `merge`.
 pub fn strategy_name_for(policy: Option<&WorkPolicy>) -> &str {
     match policy {
         Some(p) => p.submit_strategy.as_str(),

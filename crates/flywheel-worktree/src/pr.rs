@@ -480,7 +480,7 @@ pub fn register_pr_strategy(
 ) -> Result<(), SubmitRegistryError> {
     registry.register(SubmitStrategySpec::new(
         PR_STRATEGY,
-        "push the task branch to [submit] remote and open a pull request onto pr_base",
+        "push the task branch to the remote and open a pull request onto the PR base",
         Arc::new(|_registry, request| {
             Ok(Arc::new(build_pr_submitter(request)) as Arc<dyn SubmitStrategy>)
         }),
@@ -782,7 +782,7 @@ mod tests {
             SubmitOutcome::landed(LANDING_STRATEGY_PR, CREATED_URL)
         );
         // Branch landed on the remote, PR opened, nothing merged locally; the
-        // [submit] verify standing gate is not in the PR path (CI owns it).
+        // `verify` standing gate is not in the PR path (CI owns it).
         assert!(remote_branch_exists(&remote, BRANCH));
         assert_eq!(gh.commands(), ["pr list", "pr create"]);
         assert_eq!(rev(&repo, "main"), base_before);

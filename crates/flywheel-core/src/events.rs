@@ -272,7 +272,7 @@ pub const GATE_EXCERPT_MAX_BYTES: usize = 8192;
 /// Stored raw: redaction is applied at render time, not persist time (D-2).
 ///
 /// Reused by the held-out landing gate's [`HeldOutGateEvaluated`] verdict and
-/// by a grader-decided [`LandingParked`] record (the `[submit] verify`
+/// by a grader-decided [`LandingParked`] record (the `verify`
 /// standing build invariant or a post-rebase re-verification), so both
 /// surface a deciding check's output through one shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,7 +299,7 @@ pub struct GateGraderReceipt {
 /// via `list_domain_events(run_id)`.
 ///
 /// `receipts` carries the deciding check's output for a park a grader
-/// decided (the `[submit] verify` standing build invariant, or a post-rebase
+/// decided (the `verify` standing build invariant, or a post-rebase
 /// re-verification under `divergent-base`), one [`GateGraderReceipt`] per
 /// executed check. Empty for every other park kind, whose cause is fully
 /// carried by `park_kind` / `detail`; omitted from the wire payload when

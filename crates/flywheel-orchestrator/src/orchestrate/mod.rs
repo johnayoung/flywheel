@@ -123,7 +123,7 @@ pub const DEFAULT_SWEEP_SECONDS: f64 = 15.0;
 pub const DEFAULT_SESSION_PAUSE_CEILING_SECONDS: f64 =
     crate::policy::DEFAULT_SESSION_PAUSE_CEILING_SECONDS;
 
-/// Default `[worker] concurrency`.
+/// Default the `concurrency` key.
 pub const DEFAULT_WORKER_CONCURRENCY: i64 = crate::policy::DEFAULT_WORKER_CONCURRENCY;
 
 /// How long the reactive approval sweep suppresses a re-resolve of a parked

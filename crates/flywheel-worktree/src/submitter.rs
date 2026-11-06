@@ -546,7 +546,7 @@ pub struct AgentUsage {
     pub wall_seconds: f64,
 }
 
-/// The glob matcher behind `[submit] protected_paths`. `**` matches zero or more whole
+/// The glob matcher behind `protected_paths`. `**` matches zero or more whole
 /// path segments, `*` and `?` never cross `/`, `[...]` is a character class
 /// (`[!...]` negated). The whole path must match.
 pub fn protected_path_matches(path: &str, pattern: &str) -> bool {
@@ -759,7 +759,7 @@ pub struct GitWorktreeSubmitter {
     /// The full environment submit-time re-verification runs command
     /// graders with (resolved `[sandbox.env]`); `None` inherits the worker's.
     pub grader_env: Option<BTreeMap<String, String>>,
-    /// The standing build invariant (`[submit] verify`, spec 00064), re-run
+    /// The standing build invariant (`verify`, spec 00064), re-run
     /// under the merge lock against the exact tree about to become the base.
     pub verify_command: Option<String>,
     /// The declared held-out landing gate (spec 00051), re-run against the
@@ -1351,7 +1351,7 @@ impl GitWorktreeSubmitter {
                     &req.run_id,
                     PARK_KIND_STANDING_VERIFY,
                     format!(
-                        "{} failed the standing build invariant ([submit] verify) against the \
+                        "{} failed the standing build invariant (the `verify` key) against the \
                          tree it would land; worktree preserved at {}",
                         landing.branch,
                         landing.worktree.display()
@@ -1427,7 +1427,7 @@ impl GitWorktreeSubmitter {
                 &req.run_id,
                 PARK_KIND_STANDING_VERIFY,
                 format!(
-                    "{} failed the standing build invariant ([submit] verify) against the rebased \
+                    "{} failed the standing build invariant (the `verify` key) against the rebased \
                      tree it would land; worktree preserved at {}",
                     landing.branch,
                     landing.worktree.display()
@@ -1742,7 +1742,7 @@ impl GitWorktreeSubmitter {
                 &req.run_id,
                 PARK_KIND_STANDING_VERIFY,
                 format!(
-                    "{branch} {prefix}failed the standing build invariant ([submit] verify) against \
+                    "{branch} {prefix}failed the standing build invariant (the `verify` key) against \
                      the {tree} tree it would land; worktree preserved at {wt}"
                 ),
                 verify.receipts,
@@ -2005,7 +2005,7 @@ impl GitWorktreeSubmitter {
         Ok(CheckVerdict { passed, receipts })
     }
 
-    /// Run the policy's standing build invariant (`[submit] verify`, spec
+    /// Run the policy's standing build invariant (`verify`, spec
     /// 00064) against the exact tree about to become the base: the
     /// repo-wide "the trunk must build" gate, independent of the task's own
     /// graders. Unset => passes with no receipt. Never fails into `submit`:
@@ -2250,7 +2250,7 @@ impl SubmitStrategy for GitWorktreeSubmitter {
 }
 
 /// Build the merge backend (the registry's `merge` target) from the shared
-/// builder request: the `[submit] verify` standing invariant and the
+/// builder request: the `verify` standing invariant and the
 /// bounded conflict-resolution rung's bounds/model come off `policy`
 /// (spec 00064 / 00076); everything else is the request's own fields. A
 /// `None` policy leaves the rung disabled, byte-identical to a

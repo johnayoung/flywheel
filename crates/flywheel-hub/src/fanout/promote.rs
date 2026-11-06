@@ -93,8 +93,8 @@ pub struct TaskOrigin {
     /// writes the task's context back instead of the prompt.
     #[serde(default)]
     pub prompt_seeded: bool,
-    /// The protected paths that came from the repo's `[submit]
-    /// protected_paths` (the loop enforces those already).
+    /// The protected paths that came from the repo's
+    /// `protected_paths` (the loop enforces those already).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repo_protect: Vec<String>,
 }
@@ -210,7 +210,7 @@ pub struct TaskDraft {
     /// Command graders, in order.
     pub graders: Vec<GraderSpec>,
     /// The fan-out's protected paths (relative to the repo): the provider
-    /// says which the repo's `[submit] protected_paths` already refuses at
+    /// says which the repo's `protected_paths` already refuses at
     /// landing.
     #[serde(default)]
     pub protect: Vec<String>,
@@ -264,20 +264,20 @@ pub struct TaskSeed {
     pub digest: String,
     /// Its command graders, in order (what its agent sees too).
     pub graders: Vec<GraderSpec>,
-    /// Its held-out command graders (`[held_out] root`): registered for the
+    /// Its held-out command graders (the project's `held-out/` dir): registered for the
     /// task id, plus the standing oracles matching it.
     pub held_out: Vec<GraderSpec>,
     /// Its graders the hub does not run (rubric, manual, transcript).
     pub not_run: Vec<String>,
     pub context: SeedContext,
     pub tags: Vec<String>,
-    /// What a candidate must leave unchanged: the repo's `[submit]
-    /// protected_paths` the hub can hold to (literal paths and `dir/**`),
+    /// What a candidate must leave unchanged: the repo's
+    /// `protected_paths` the hub can hold to (literal paths and `dir/**`),
     /// then the paths its constraints name ([`protected_in_constraint`]).
     pub protect: Vec<String>,
-    /// The part of `protect` from `[submit] protected_paths`.
+    /// The part of `protect` from `protected_paths`.
     pub repo_protect: Vec<String>,
-    /// `[submit] protected_paths` patterns the hub cannot hold to (globs
+    /// `protected_paths` patterns the hub cannot hold to (globs
     /// inside a name): the loop still refuses a landing touching them.
     pub protect_skipped: Vec<String>,
 }
@@ -522,7 +522,7 @@ pub fn draft(
             ),
             _ => format!(
                 "{held} held-out grader{s} stay{v} out of the task file: the held-out gate runs \
-                 only what is registered for {task_id} under [held_out] root (/fw-verify)"
+                 only what is registered for {task_id} in the project's held-out dir (/fw-verify)"
             ),
         });
     }

@@ -1,6 +1,6 @@
 # Persistence Tables
 
-Reference for the flywheel store: the core run tables (schema_version **14**) and the orchestrator's coordination tables (orchestrator_schema_version **10**). Canonical DDL: `crates/flywheel-core/schema/persistence-schema.sql` (Postgres mirror: `persistence-schema-postgres.sql` alongside); orchestrator DDL: `crates/flywheel-orchestrator/src/claims.rs` (SQLite) and `claims_postgres.rs` (Postgres). An empty table means "nothing exercised it on this database," not "deprecated."
+Reference for the flywheel store: the core run tables (schema_version **15**) and the orchestrator's coordination tables (orchestrator_schema_version **10**). Canonical DDL: `crates/flywheel-core/schema/persistence-schema.sql` (Postgres mirror: `persistence-schema-postgres.sql` alongside); orchestrator DDL: `crates/flywheel-orchestrator/src/claims.rs` (SQLite) and `claims_postgres.rs` (Postgres). An empty table means "nothing exercised it on this database," not "deprecated."
 
 Postgres `TEXT`/`JSONB` cannot hold U+0000: the Postgres store writes NULs in free-form run data (agent output, errors, blocked-requires, agent context, event/grader/control-command payloads) as U+FFFD; SQLite keeps them verbatim.
 
@@ -22,7 +22,7 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 | `tasks`            | `(project_id, id)` | Logical task identity. The FK anchor every task reference points at. Carries no definition. |
 | `task_versions`    | `(project_id, task_id, content_hash)` | Immutable, content-addressed definitions. `content_hash` covers goal + graders + tags + context. FK `(project_id, task_id)` -> `tasks`. |
 | `lifecycles`       | `(project_id, run_id)` | The single mutable row per run. `version` drives optimistic concurrency. FK `(project_id, task_id)` -> `tasks`; `task_content_hash` pins the exact `task_versions` row the run ran. |
-| `attempts`         | `(project_id, run_id, number)` | Per-execution history under a run with outcome + agent identity (`agent_context_json`). FK -> `lifecycles`. |
+| `attempts`         | `(project_id, run_id, number)` | Per-execution history under a run with outcome + agent identity (`agent_context_json`) + harness-chosen stop reason (`stop_reason_json`, v15; NULL for older attempts, never backfilled). FK -> `lifecycles`. |
 | `events`           | `id`; unique `(project_id, run_id, sequence)` | Totally-ordered per-run domain-event ledger; lifecycle state is folded from these rows. `sequence` is per-run, strictly monotonic, allocated inside the append transaction. |
 | `grader_results`   | `id`; index `(project_id, run_id, attempt_number, ordinal)` | Append-only receipt log, one row per grader execution. Snapshots the grader spec as it ran. FK -> `attempts`. |
 | `control_commands` | `id`; index `(project_id, run_id, id)` where pending | Operator steering queue for one live run. CLI enqueues; the in-run watcher claim-once-applies. **Empty until live operator interaction.** |
@@ -43,7 +43,7 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 ## Schema versions and upgrade
 
 - A store is checked before any DDL runs: a brand-new store is created at the current version; **a store behind it is refused with an error naming `fw db upgrade`** (no implicit migration on open); a store ahead of it is refused as written by a newer flywheel.
-- `fw db upgrade` migrates in place, one transaction per half, from any supported older version (core v11+, orchestrator v1+): missing columns are added, every table lacking `project_id` is re-keyed with existing rows assigned the store's bound project id, the sentinel is re-created version-first, missing tables (v13 -> v14: `transcripts`, `audit_log`) are created, and the version row is set current. Each step inspects the live layout, so re-running it (or running it on a store already partitioned whose version row is behind) only fixes the version. See [cli.md](cli.md#the-store).
+- `fw db upgrade` migrates in place, one transaction per half, from any supported older version (core v11+, orchestrator v1+): missing columns are added (v14 -> v15: `attempts.stop_reason_json`, NULL on existing rows), every table lacking `project_id` is re-keyed with existing rows assigned the store's bound project id, the sentinel is re-created version-first, missing tables (v13 -> v14: `transcripts`, `audit_log`) are created, and the version row is set current. Each step inspects the live layout, so re-running it (or running it on a store already partitioned whose version row is behind) only fixes the version. See [cli.md](cli.md#the-store).
 
 ## Notes
 

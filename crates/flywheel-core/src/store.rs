@@ -32,8 +32,9 @@ use crate::task::{GraderType, Task};
 /// [`StoreSchemaError`] (a store behind it names the in-place upgrade, a
 /// store ahead of it names a newer flywheel). v13 partitions every table by
 /// the opaque `project_id` key ([`DEFAULT_PARTITION`]); v14 adds the audit
-/// ledger (`transcripts`, `audit_log`; see [`LedgerStore`]).
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+/// ledger (`transcripts`, `audit_log`; see [`LedgerStore`]); v15 adds the
+/// nullable `attempts.stop_reason_json` column.
+pub const CURRENT_SCHEMA_VERSION: u32 = 15;
 
 /// The oldest on-disk version the in-place upgrade migrates from (v11: the
 /// domain-event-only `events` table). Older stores must be re-created.
@@ -1649,7 +1650,7 @@ mod tests {
         assert!(behind.is_behind());
         assert_eq!(
             behind.to_string(),
-            "store schema is behind: schema_version=12, this flywheel expects 14; \
+            "store schema is behind: schema_version=12, this flywheel expects 15; \
              run `fw db upgrade` to migrate it in place"
         );
         let ahead = StoreSchemaError::new(Some(99));
@@ -1660,12 +1661,12 @@ mod tests {
         assert!(!unknown.is_behind());
         assert_eq!(
             unknown.to_string(),
-            "store has no readable schema_version row (expected 14); it is not a flywheel \
+            "store has no readable schema_version row (expected 15); it is not a flywheel \
              store or it is damaged"
         );
         let wrapped: StoreError = unknown.into();
         assert!(wrapped.is_schema_mismatch());
-        assert_eq!(CURRENT_SCHEMA_VERSION, 14);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 15);
     }
 
     #[test]

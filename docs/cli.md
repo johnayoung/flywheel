@@ -99,7 +99,7 @@ Every table carries a `project_id` partition column, so one store (one Postgres 
 | `db upgrade` | Migrate the cwd project's store (sqlite under the project dir, or the configured Postgres DSN) in place: run tables and orchestrator tables, each in one transaction, from any supported older version; existing rows get the project id. Idempotent (a second run, or a store already partitioned whose version row is behind, only fixes the version). Exit 1 on a newer or unrecognized store. |
 | `db upgrade --db PATH` | Upgrade that sqlite file (partition `default`). |
 
-Schema versions: run store `schema_version` 14 (v14 added the `transcripts` and `audit_log` ledger tables), orchestrator store `orchestrator_schema_version` 10. Catalog: [persistence-tables.md](persistence-tables.md).
+Schema versions: run store `schema_version` 15 (v15 added `attempts.stop_reason_json`), orchestrator store `orchestrator_schema_version` 10. Catalog: [persistence-tables.md](persistence-tables.md).
 
 ## Read verbs
 

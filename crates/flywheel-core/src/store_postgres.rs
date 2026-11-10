@@ -1115,7 +1115,7 @@ const LIFECYCLE_COLUMN_COUNT: usize = 15;
 const ATTEMPT_COLUMNS: &str = "a.number, a.attempt_run_id, a.started_at, a.ended_at, a.outcome, \
      a.agent_output, a.error, a.agent_context_json, a.input_tokens, a.output_tokens, \
      a.cache_creation_input_tokens, a.cache_read_input_tokens, a.iterations_completed, \
-     a.turns, a.total_cost_usd, a.last_activity_at";
+     a.turns, a.total_cost_usd, a.last_activity_at, a.stop_reason_json";
 
 /// The `lifecycles` row as persisted, before any decoding.
 struct RawLifecycle {
@@ -1564,6 +1564,7 @@ struct RawAttempt {
     turns: i32,
     total_cost_usd: f64,
     last_activity_at: Option<DateTime<Utc>>,
+    stop_reason_json: Option<Value>,
 }
 
 impl RawAttempt {
@@ -1599,6 +1600,7 @@ impl RawAttempt {
             turns: col(row, at + 13)?,
             total_cost_usd: col(row, at + 14)?,
             last_activity_at: col(row, at + 15)?,
+            stop_reason_json: col(row, at + 16)?,
         }))
     }
 
@@ -1636,6 +1638,12 @@ impl RawAttempt {
         attempt.turns = unsigned(self.turns, "attempts.turns")?;
         attempt.total_cost_usd = self.total_cost_usd;
         attempt.last_activity_at = self.last_activity_at;
+        // NULL for attempts recorded before v15: never inferred.
+        attempt.stop_reason = self
+            .stop_reason_json
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()?;
         Ok(attempt)
     }
 }
@@ -1668,13 +1676,21 @@ fn upsert_attempt<C: GenericClient>(
         "attempts.iterations_completed",
     )?;
     let turns = int4(attempt.turns, "attempts.turns")?;
+    let stop_reason = attempt
+        .stop_reason
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?
+        .map(nul_free_json);
     c.execute(
         "INSERT INTO attempts (
             run_id, number, attempt_run_id, started_at, ended_at, outcome,
             agent_output, error, agent_context_json, input_tokens, output_tokens,
             cache_creation_input_tokens, cache_read_input_tokens,
-            iterations_completed, turns, total_cost_usd, last_activity_at, project_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            iterations_completed, turns, total_cost_usd, last_activity_at, project_id,
+            stop_reason_json
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+            $19)
         ON CONFLICT (project_id, run_id, number) DO UPDATE SET
             attempt_run_id = EXCLUDED.attempt_run_id,
             started_at = EXCLUDED.started_at,
@@ -1690,7 +1706,8 @@ fn upsert_attempt<C: GenericClient>(
             iterations_completed = EXCLUDED.iterations_completed,
             turns = EXCLUDED.turns,
             total_cost_usd = EXCLUDED.total_cost_usd,
-            last_activity_at = EXCLUDED.last_activity_at",
+            last_activity_at = EXCLUDED.last_activity_at,
+            stop_reason_json = EXCLUDED.stop_reason_json",
         &[
             &run_id,
             &number,
@@ -1710,6 +1727,7 @@ fn upsert_attempt<C: GenericClient>(
             &attempt.total_cost_usd,
             &attempt.last_activity_at,
             &p,
+            &stop_reason,
         ],
     )
     .map_err(db)?;
@@ -2445,7 +2463,7 @@ mod tests {
     #[test]
     fn schema_is_embedded_from_the_canonical_file() {
         assert!(SCHEMA_SQL.contains("timestamps_json         JSONB NOT NULL"));
-        assert!(SCHEMA_SQL.contains("INSERT INTO schema_version (version, id) VALUES (14, 1)"));
+        assert!(SCHEMA_SQL.contains("INSERT INTO schema_version (version, id) VALUES (15, 1)"));
         assert!(SCHEMA_SQL.contains("grader_results_reject_mutation"));
         assert!(SCHEMA_SQL.contains("ERRCODE = 'check_violation'"));
     }

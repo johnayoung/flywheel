@@ -25,7 +25,7 @@ use flywheel_core::events::{
     DomainEventPayload, GraderEvaluated, LandingParked, LifecycleInitialized, TransitionedTo,
     replay,
 };
-use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome, Status};
+use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome, Status, StopReason};
 use flywheel_core::loaders::task_digest;
 use flywheel_core::store::{
     GraderResultRecord, HarnessStore, JsonObject, LifecycleFilter, SpendSummary, SpendWindow,
@@ -948,6 +948,88 @@ fn attempt_finalized_preserves_boundary_rolled_aggregates(store: &dyn HarnessSto
     assert_eq!(lc.attempts[0].outcome, Some(Outcome::Succeeded));
 }
 
+fn stop_reason_round_trips_through_the_attempt_rows(store: &dyn HarnessStore) {
+    seed(store, "r1");
+    store
+        .append_domain_event(&transition("r1", 1, Status::Ready), 1)
+        .unwrap();
+    store
+        .append_domain_event(&transition("r1", 2, Status::Running), 2)
+        .unwrap();
+    store
+        .append_domain_event(&attempt_started("r1", 3, 1, &[]), 3)
+        .unwrap();
+    // Unset while the attempt runs.
+    assert_eq!(
+        store.load_attempt("r1", 1).unwrap().unwrap().stop_reason,
+        None
+    );
+    let mut finalized = attempt_finalized("r1", 4, 1, "out");
+    let reason = StopReason::ChecksFailed {
+        check: "unit".into(),
+    };
+    if let DomainEventPayload::AttemptFinalized(f) = &mut finalized.payload {
+        f.outcome = Outcome::ValidationFailed;
+        f.stop_reason = Some(reason.clone());
+    }
+    store.append_domain_event(&finalized, 4).unwrap();
+    store
+        .append_domain_event(&attempt_started("r1", 5, 2, &[]), 5)
+        .unwrap();
+    let mut second = attempt_finalized("r1", 6, 2, "out");
+    if let DomainEventPayload::AttemptFinalized(f) = &mut second.payload {
+        f.stop_reason = Some(StopReason::LandingBlocked {
+            reason: "conflict".into(),
+        });
+    }
+    store.append_domain_event(&second, 6).unwrap();
+
+    let expected = [
+        Some(reason),
+        Some(StopReason::LandingBlocked {
+            reason: "conflict".into(),
+        }),
+    ];
+    let row = store.load_attempt("r1", 1).unwrap().unwrap();
+    assert_eq!(row.stop_reason, expected[0]);
+    let listed: Vec<_> = store
+        .list_attempts("r1")
+        .unwrap()
+        .into_iter()
+        .map(|a| a.stop_reason)
+        .collect();
+    assert_eq!(listed, expected);
+    let loaded = store.load_lifecycle("r1").unwrap().unwrap();
+    let attached: Vec<_> = loaded
+        .attempts
+        .iter()
+        .map(|a| a.stop_reason.clone())
+        .collect();
+    assert_eq!(attached, expected);
+    let all = store.list_lifecycles(&LifecycleFilter::default()).unwrap();
+    let from_list: Vec<_> = all[0]
+        .attempts
+        .iter()
+        .map(|a| a.stop_reason.clone())
+        .collect();
+    assert_eq!(from_list, expected);
+    // The read model matches a rebuild from the ledger.
+    assert_eq!(
+        replay(&store.list_domain_events("r1").unwrap()).unwrap(),
+        loaded
+    );
+    // An aggregate save keeps the reason; a reasonless attempt stays None.
+    let mut rolled = row.clone();
+    rolled.turns = 3;
+    store.save_attempt("r1", &rolled, None).unwrap();
+    assert_eq!(store.load_attempt("r1", 1).unwrap().unwrap(), rolled);
+    ensure_attempt(store, "r2", 1);
+    assert_eq!(
+        store.load_attempt("r2", 1).unwrap().unwrap().stop_reason,
+        None
+    );
+}
+
 fn landing_parked_round_trips_on_the_ledger(store: &dyn HarnessStore) {
     drive_to_done(store, "r1");
     let before = store.load_lifecycle("r1").unwrap().unwrap().version;
@@ -1866,6 +1948,10 @@ const CASES: &[(&str, Case)] = &[
     (
         "attempt_finalized_preserves_boundary_rolled_aggregates",
         attempt_finalized_preserves_boundary_rolled_aggregates,
+    ),
+    (
+        "stop_reason_round_trips_through_the_attempt_rows",
+        stop_reason_round_trips_through_the_attempt_rows,
     ),
     (
         "nul_bytes_in_run_output_never_wedge_the_run",

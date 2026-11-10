@@ -213,7 +213,7 @@ fn a_v12_store_upgrades_with_its_rows_assigned_the_project_id() {
     );
 
     let report = sandbox.ok(&repo, &["db", "upgrade"]);
-    assert!(report.contains("schema 12 -> 14"), "{report}");
+    assert!(report.contains("schema 12 -> 15"), "{report}");
     let conn = Connection::open(&db).unwrap();
     let owner: String = conn
         .query_row(

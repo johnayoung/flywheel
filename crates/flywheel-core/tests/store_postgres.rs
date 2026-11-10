@@ -24,7 +24,7 @@ use postgres::error::SqlState;
 use serde_json::json;
 
 use flywheel_core::events::{DomainEvent, DomainEventPayload, LifecycleInitialized};
-use flywheel_core::lifecycle::{Attempt, Lifecycle, Status};
+use flywheel_core::lifecycle::{Attempt, Lifecycle, Status, StopReason};
 use flywheel_core::store::{
     AttemptStore, CURRENT_SCHEMA_VERSION, ControlCommandStore, DomainEventStore,
     GraderResultRecord, GraderResultStore, HarnessStore, JsonObject, LedgerEntry, LedgerFilter,
@@ -326,6 +326,7 @@ fn a_v12_schema_is_refused_then_upgraded_in_place_with_its_rows_keyed() {
     assert_eq!(lifecycle.version, 3);
     assert_eq!(lifecycle.source, "owner/repo#1");
     assert_eq!(lifecycle.attempts[0].input_tokens, 42);
+    assert_eq!(lifecycle.attempts[0].stop_reason, None);
     assert_eq!(store.list_domain_events("run-old").unwrap().len(), 1);
     assert_eq!(store.list_grader_results("run-old", 1).unwrap().len(), 1);
     assert_eq!(store.pending_commands("run-old").unwrap().len(), 1);
@@ -381,7 +382,9 @@ fn seed_v13(pg: &Postgres, schema: &str) {
              INSERT INTO lifecycles
                (project_id, run_id, task_id, status, version, retries, timestamps_json,
                 updated_at)
-               VALUES ('proj-x', 'run-13', 't1', 'done', 5, 0, '{}', now());",
+               VALUES ('proj-x', 'run-13', 't1', 'done', 5, 0, '{}', now());
+             INSERT INTO attempts (project_id, run_id, number, started_at, outcome)
+               VALUES ('proj-x', 'run-13', 1, now(), 'succeeded');",
         )
         .unwrap();
 }
@@ -403,7 +406,11 @@ fn a_v13_schema_is_refused_then_upgraded_with_the_ledger_tables() {
     assert_eq!(schema_version(&pg, &schema), CURRENT_SCHEMA_VERSION as i32);
 
     let store = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-x").unwrap();
-    assert_eq!(store.load_lifecycle("run-13").unwrap().unwrap().version, 5);
+    let lifecycle = store.load_lifecycle("run-13").unwrap().unwrap();
+    assert_eq!(lifecycle.version, 5);
+    // The pre-existing attempt reads back with no stop reason.
+    assert_eq!(lifecycle.attempts.len(), 1);
+    assert_eq!(lifecycle.attempts[0].stop_reason, None);
     let row = store
         .append_transcript(&TranscriptRecord {
             run_id: "run-13".into(),
@@ -464,6 +471,155 @@ fn a_v13_schema_is_refused_then_upgraded_with_the_ledger_tables() {
     );
     store.close().unwrap();
     other.close().unwrap();
+    assert!(
+        PostgresStore::upgrade(&pg.dsn(), &schema, "proj-x")
+            .unwrap()
+            .is_noop()
+    );
+}
+
+/// A real v14 schema (the frozen pre-stop-reason DDL) holding a run with a
+/// finalized and an open attempt, its ledger, a grader receipt, a pending
+/// command, a saved task, and audit-ledger rows.
+fn seed_v14(pg: &Postgres, schema: &str) {
+    pg.admin()
+        .batch_execute(&format!("CREATE SCHEMA \"{schema}\""))
+        .unwrap();
+    let mut admin = pg.admin_in(schema);
+    admin
+        .batch_execute(include_str!("fixtures/persistence-schema-postgres-v14.sql"))
+        .unwrap();
+    admin
+        .batch_execute(
+            "INSERT INTO tasks (project_id, id, first_seen_at, updated_at)
+               VALUES ('proj-x', 't1', now(), now());
+             INSERT INTO task_versions
+               (project_id, task_id, content_hash, goal, graders_json, tags_json, context_json,
+                created_at)
+               VALUES ('proj-x', 't1', 'h1', 'Goal.',
+                       '[{\"type\": \"command\", \"run\": \"true\"}]', '[]', 'null', now());
+             INSERT INTO lifecycles
+               (project_id, run_id, task_id, status, version, retries, timestamps_json,
+                updated_at, task_content_hash, source)
+               VALUES ('proj-x', 'run-14', 't1', 'running', 7, 1, '{}', now(), 'h1',
+                       'owner/repo#14');
+             INSERT INTO attempts
+               (project_id, run_id, number, attempt_run_id, started_at, ended_at, outcome,
+                agent_output, error, agent_context_json, input_tokens, turns, total_cost_usd)
+               VALUES ('proj-x', 'run-14', 1, 'run-14', now(), now(), 'agent_error', 'out',
+                       'boom', '{\"model_id\": \"m\"}', 42, 3, 0.25);
+             INSERT INTO attempts (project_id, run_id, number, started_at)
+               VALUES ('proj-x', 'run-14', 2, now());
+             INSERT INTO events
+               (project_id, run_id, attempt_number, ts, kind, payload_json, sequence)
+               VALUES ('proj-x', 'run-14', NULL, now(), 'lifecycle_initialized',
+                       '{\"task_id\": \"t1\"}', 1);
+             INSERT INTO grader_results
+               (project_id, run_id, attempt_number, ordinal, grader_type, grader_spec_json,
+                passed, duration_ms, payload_json, ts)
+               VALUES ('proj-x', 'run-14', 1, 0, 'command',
+                       '{\"type\": \"command\", \"run\": \"true\"}', false, 5,
+                       '{\"exit_code\": 1}', now());
+             INSERT INTO control_commands (project_id, run_id, kind, payload_json, enqueued_at)
+               VALUES ('proj-x', 'run-14', 'interrupt', '{}', now());
+             INSERT INTO transcripts (project_id, run_id, uri, sha256, bytes, created_at)
+               VALUES ('proj-x', 'run-14', 'file:///tmp/run-14.jsonl', 'ab', 9, now());
+             INSERT INTO audit_log (project_id, kind, at, run_id, payload_json)
+               VALUES ('proj-x', 'autopilot.cycle', now(), NULL, '{}');",
+        )
+        .unwrap();
+}
+
+/// Every row of `table` as sorted JSON text, minus the `without` key.
+fn row_snapshot(pg: &Postgres, schema: &str, table: &str, without: &str) -> Vec<String> {
+    pg.admin_in(schema)
+        .query(
+            &format!("SELECT (to_jsonb(t) - $1::text)::text AS row FROM {table} t ORDER BY row"),
+            &[&without],
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+#[test]
+fn a_v14_schema_upgrades_keeping_every_row_with_a_null_stop_reason() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_v14");
+    seed_v14(&pg, &schema);
+    let err = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-x").unwrap_err();
+    assert!(err.to_string().contains("fw db upgrade"), "{err}");
+    assert_eq!(schema_version(&pg, &schema), 14);
+    let tables = [
+        "tasks",
+        "task_versions",
+        "lifecycles",
+        "attempts",
+        "events",
+        "grader_results",
+        "control_commands",
+        "transcripts",
+        "audit_log",
+    ];
+    let before: Vec<Vec<String>> = tables
+        .iter()
+        .map(|table| {
+            let rows = row_snapshot(&pg, &schema, table, "stop_reason_json");
+            assert!(!rows.is_empty(), "{table} seeded");
+            rows
+        })
+        .collect();
+
+    let upgrade = PostgresStore::upgrade(&pg.dsn(), &schema, "proj-x").unwrap();
+    assert_eq!(upgrade.from, Some(14));
+    assert_eq!(upgrade.to, CURRENT_SCHEMA_VERSION);
+    assert!(upgrade.partitioned.is_empty(), "{:?}", upgrade.partitioned);
+    assert_eq!(schema_version(&pg, &schema), CURRENT_SCHEMA_VERSION as i32);
+    // Every pre-existing row is kept verbatim.
+    for (table, rows) in tables.iter().zip(&before) {
+        assert_eq!(
+            &row_snapshot(&pg, &schema, table, "stop_reason_json"),
+            rows,
+            "{table}"
+        );
+    }
+    // The new column exists and nothing was backfilled into it.
+    let unset: i64 = pg
+        .admin_in(&schema)
+        .query_one(
+            "SELECT count(*) FROM attempts WHERE stop_reason_json IS NULL",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(unset, 2);
+
+    let store = PostgresStore::connect_partition(&pg.dsn(), &schema, "proj-x").unwrap();
+    let lifecycle = store.load_lifecycle("run-14").unwrap().unwrap();
+    assert_eq!(lifecycle.version, 7);
+    assert_eq!(lifecycle.source, "owner/repo#14");
+    assert_eq!(lifecycle.attempts.len(), 2);
+    assert_eq!(lifecycle.attempts[0].input_tokens, 42);
+    assert!(lifecycle.attempts.iter().all(|a| a.stop_reason.is_none()));
+    let listed = store.list_lifecycles(&LifecycleFilter::default()).unwrap();
+    assert!(listed[0].attempts.iter().all(|a| a.stop_reason.is_none()));
+    // New attempts record a reason alongside the old reasonless rows.
+    let mut open = store.load_attempt("run-14", 2).unwrap().unwrap();
+    open.stop_reason = Some(StopReason::Crash);
+    store.save_attempt("run-14", &open, None).unwrap();
+    assert_eq!(store.load_attempt("run-14", 2).unwrap().unwrap(), open);
+    assert_eq!(
+        store
+            .load_attempt("run-14", 1)
+            .unwrap()
+            .unwrap()
+            .stop_reason,
+        None
+    );
+    store.close().unwrap();
     assert!(
         PostgresStore::upgrade(&pg.dsn(), &schema, "proj-x")
             .unwrap()

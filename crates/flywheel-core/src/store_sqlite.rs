@@ -65,7 +65,7 @@ use crate::events::{DomainEvent, DomainEventKind, DomainEventPayload, apply};
 use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status};
 use crate::loaders::task_digest;
 use crate::notifier::RunNotifier;
-use crate::schema_ddl::{create_table_as, without_pragmas};
+use crate::schema_ddl::{column_definitions, create_table_as, without_pragmas};
 use crate::store::{
     AttemptStore, CURRENT_SCHEMA_VERSION, ControlCommandRecord, ControlCommandStore,
     DEFAULT_PARTITION, DomainEventStore, GraderResultRecord, GraderResultStore, JsonObject,
@@ -584,6 +584,32 @@ pub fn partition_table(
     Ok(true)
 }
 
+/// Add every column `ddl` declares for `table` that the live table lacks
+/// (v14 -> v15: the nullable `attempts.stop_reason_json`). Each declaration
+/// is nullable or carries its own default, so existing rows are kept as-is
+/// and read the new column as NULL or its default; nothing is backfilled.
+/// Returns the added column names; an absent table, or one already
+/// current, is left alone, so a repeated upgrade is a no-op.
+pub fn add_missing_columns(
+    conn: &Connection,
+    ddl: &str,
+    table: &str,
+) -> rusqlite::Result<Vec<String>> {
+    if !table_exists(conn, table)? {
+        return Ok(Vec::new());
+    }
+    let live = table_columns(conn, table)?;
+    let mut added = Vec::new();
+    for (name, definition) in column_definitions(ddl, table) {
+        if live.contains(&name) {
+            continue;
+        }
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition};"))?;
+        added.push(name);
+    }
+    Ok(added)
+}
+
 /// Re-create the sentinel `table` from `ddl` when its first column is not
 /// `version` (the pre-v13 `(id, version)` order). Returns whether it did.
 pub fn version_column_first(conn: &Connection, ddl: &str, table: &str) -> rusqlite::Result<bool> {
@@ -629,13 +655,14 @@ pub fn too_old_to_upgrade(label: &str, table: &str, observed: u32, oldest: u32) 
 ///
 /// One `BEGIN IMMEDIATE` transaction (with `foreign_keys` off for the
 /// duration, re-checked before commit): every core table that lacks the
-/// `project_id` column is re-keyed with its rows assigned `partition`, the
-/// sentinel is re-created version-first, any missing table or index is
-/// created from the current DDL, and the version row is set current. Each
-/// step inspects the actual layout rather than trusting the recorded
-/// version, so the upgrade is idempotent: re-running it, or running it on a
-/// store whose tables are already keyed but whose version row is behind,
-/// succeeds and only fixes the version. A store with no core tables is
+/// `project_id` column is re-keyed with its rows assigned `partition`, every
+/// column the DDL declares that a table lacks is added (existing rows read
+/// it as NULL), the sentinel is re-created version-first, any missing table
+/// or index is created from the current DDL, and the version row is set
+/// current. Each step inspects the actual layout rather than trusting the
+/// recorded version, so the upgrade is idempotent: re-running it, or running
+/// it on a store whose tables are already keyed but whose version row is
+/// behind, succeeds and only fixes the version. A store with no core tables is
 /// created at the current version. A store newer than this build, or older
 /// than [`OLDEST_UPGRADABLE_SCHEMA_VERSION`], is refused untouched.
 pub fn upgrade_connection(
@@ -686,6 +713,8 @@ fn upgrade_in_transaction(
         if partition_table(&tx, &ddl, table, partition).map_err(db)? {
             partitioned.push(table.to_owned());
         }
+        // After any re-key (a rebuild already takes the current layout).
+        add_missing_columns(&tx, &ddl, table).map_err(db)?;
     }
     version_column_first(&tx, &ddl, VERSION_TABLE).map_err(db)?;
     tx.execute_batch(&ddl).map_err(db)?;
@@ -1172,7 +1201,7 @@ fn summarize_spend_rows(
 const ATTEMPT_COLUMNS: &str = "a.number, a.attempt_run_id, a.started_at, a.ended_at, a.outcome, \
      a.agent_output, a.error, a.agent_context_json, a.input_tokens, a.output_tokens, \
      a.cache_creation_input_tokens, a.cache_read_input_tokens, a.iterations_completed, \
-     a.turns, a.total_cost_usd, a.last_activity_at";
+     a.turns, a.total_cost_usd, a.last_activity_at, a.stop_reason_json";
 
 struct RawAttempt {
     number: u32,
@@ -1191,6 +1220,7 @@ struct RawAttempt {
     turns: u64,
     total_cost_usd: f64,
     last_activity_at: Option<String>,
+    stop_reason_json: Option<String>,
 }
 
 impl RawAttempt {
@@ -1216,6 +1246,7 @@ impl RawAttempt {
             turns: row.get(at + 13)?,
             total_cost_usd: row.get(at + 14)?,
             last_activity_at: row.get(at + 15)?,
+            stop_reason_json: row.get(at + 16)?,
         })
     }
 
@@ -1246,6 +1277,12 @@ impl RawAttempt {
         attempt.turns = self.turns;
         attempt.total_cost_usd = self.total_cost_usd;
         attempt.last_activity_at = opt_ts(self.last_activity_at.as_deref())?;
+        // NULL for attempts recorded before v15: never inferred.
+        attempt.stop_reason = self
+            .stop_reason_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
         Ok(attempt)
     }
 }
@@ -1265,8 +1302,10 @@ fn upsert_attempt(
             run_id, number, attempt_run_id, started_at, ended_at, outcome,
             agent_output, error, agent_context_json, input_tokens, output_tokens,
             cache_creation_input_tokens, cache_read_input_tokens,
-            iterations_completed, turns, total_cost_usd, last_activity_at, project_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            iterations_completed, turns, total_cost_usd, last_activity_at, project_id,
+            stop_reason_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+            ?19)
         ON CONFLICT(project_id, run_id, number) DO UPDATE SET
             attempt_run_id = excluded.attempt_run_id,
             started_at = excluded.started_at,
@@ -1282,7 +1321,8 @@ fn upsert_attempt(
             iterations_completed = excluded.iterations_completed,
             turns = excluded.turns,
             total_cost_usd = excluded.total_cost_usd,
-            last_activity_at = excluded.last_activity_at",
+            last_activity_at = excluded.last_activity_at,
+            stop_reason_json = excluded.stop_reason_json",
         params![
             run_id,
             attempt.number,
@@ -1302,6 +1342,11 @@ fn upsert_attempt(
             attempt.total_cost_usd,
             fmt_opt_ts(attempt.last_activity_at),
             p,
+            attempt
+                .stop_reason
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
         ],
     )
     .map_err(db)?;
@@ -2123,6 +2168,7 @@ impl LedgerStore for SqliteStore {
 mod tests {
     use super::*;
     use crate::events::LifecycleInitialized;
+    use crate::lifecycle::StopReason;
     use crate::store::{HarnessStore, StoreConflictError};
     use std::collections::BTreeSet;
 
@@ -2153,7 +2199,7 @@ mod tests {
         assert!(SCHEMA_SQL.contains("PRAGMA foreign_keys = ON"));
         assert!(
             SCHEMA_SQL
-                .contains("INSERT OR IGNORE INTO schema_version (version, id) VALUES (14, 1)")
+                .contains("INSERT OR IGNORE INTO schema_version (version, id) VALUES (15, 1)")
         );
     }
 
@@ -2571,6 +2617,7 @@ mod tests {
         assert_eq!(lifecycle.source, "owner/repo#1");
         assert_eq!(lifecycle.attempts.len(), 1);
         assert_eq!(lifecycle.attempts[0].input_tokens, 42);
+        assert_eq!(lifecycle.attempts[0].stop_reason, None);
         assert_eq!(store.list_domain_events("run-old").unwrap().len(), 1);
         assert_eq!(store.list_grader_results("run-old", 1).unwrap().len(), 1);
         assert_eq!(store.pending_commands("run-old").unwrap().len(), 1);
@@ -2623,7 +2670,9 @@ mod tests {
                (project_id, run_id, task_id, status, version, retries, timestamps_json,
                 updated_at, task_content_hash)
                VALUES ('proj-x', 'run-13', 't1', 'done', 5, 0, '{}',
-                       '2026-01-01T00:00:00+00:00', 'h1');",
+                       '2026-01-01T00:00:00+00:00', 'h1');
+             INSERT INTO attempts (project_id, run_id, number, started_at, outcome)
+               VALUES ('proj-x', 'run-13', 1, '2026-01-01T00:00:00+00:00', 'succeeded');",
         )
         .unwrap();
         raw.close().unwrap();
@@ -2654,7 +2703,11 @@ mod tests {
         );
 
         let store = SqliteStore::open_partition(&path, "proj-x").unwrap();
-        assert_eq!(store.load_lifecycle("run-13").unwrap().unwrap().version, 5);
+        let lifecycle = store.load_lifecycle("run-13").unwrap().unwrap();
+        assert_eq!(lifecycle.version, 5);
+        // The pre-existing attempt reads back with no stop reason.
+        assert_eq!(lifecycle.attempts.len(), 1);
+        assert_eq!(lifecycle.attempts[0].stop_reason, None);
         let row = store
             .append_transcript(&TranscriptRecord {
                 run_id: "run-13".into(),
@@ -2690,6 +2743,157 @@ mod tests {
                 "{statement}: {err}"
             );
         }
+        store.close().unwrap();
+        // Idempotent.
+        assert!(SqliteStore::upgrade(&path, "proj-x").unwrap().is_noop());
+    }
+
+    /// A real v14 database (the frozen pre-stop-reason DDL) holding a run
+    /// with a finalized and an open attempt, its ledger, a grader receipt,
+    /// a pending command, a saved task, and audit-ledger rows.
+    fn seed_v14(path: &Path) {
+        let raw = Connection::open(path).unwrap();
+        raw.execute_batch(include_str!("../tests/fixtures/persistence-schema-v14.sql"))
+            .unwrap();
+        raw.execute_batch(
+            "INSERT INTO tasks (project_id, id, first_seen_at, updated_at)
+               VALUES ('proj-x', 't1', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+             INSERT INTO task_versions
+               (project_id, task_id, content_hash, goal, graders_json, tags_json, context_json,
+                created_at)
+               VALUES ('proj-x', 't1', 'h1', 'Goal.', '[{\"type\": \"command\", \"run\": \"true\"}]',
+                       '[]', 'null', '2026-01-01T00:00:00+00:00');
+             INSERT INTO lifecycles
+               (project_id, run_id, task_id, status, version, retries, timestamps_json,
+                updated_at, task_content_hash, source)
+               VALUES ('proj-x', 'run-14', 't1', 'running', 7, 1, '{}',
+                       '2026-01-01T00:00:00+00:00', 'h1', 'owner/repo#14');
+             INSERT INTO attempts
+               (project_id, run_id, number, attempt_run_id, started_at, ended_at, outcome,
+                agent_output, error, agent_context_json, input_tokens, turns, total_cost_usd)
+               VALUES ('proj-x', 'run-14', 1, 'run-14', '2026-01-01T00:00:00+00:00',
+                       '2026-01-01T00:01:00+00:00', 'agent_error', 'out', 'boom',
+                       '{\"model_id\": \"m\"}', 42, 3, 0.25);
+             INSERT INTO attempts (project_id, run_id, number, started_at)
+               VALUES ('proj-x', 'run-14', 2, '2026-01-01T00:02:00+00:00');
+             INSERT INTO events
+               (project_id, run_id, attempt_number, ts, kind, payload_json, sequence)
+               VALUES ('proj-x', 'run-14', NULL, '2026-01-01T00:00:00+00:00',
+                       'lifecycle_initialized', '{\"task_id\": \"t1\"}', 1);
+             INSERT INTO grader_results
+               (project_id, run_id, attempt_number, ordinal, grader_type, grader_spec_json,
+                passed, duration_ms, payload_json, ts)
+               VALUES ('proj-x', 'run-14', 1, 0, 'command',
+                       '{\"type\": \"command\", \"run\": \"true\"}', 0, 5,
+                       '{\"exit_code\": 1}', '2026-01-01T00:01:00+00:00');
+             INSERT INTO control_commands (project_id, run_id, kind, payload_json, enqueued_at)
+               VALUES ('proj-x', 'run-14', 'interrupt', '{}', '2026-01-01T00:00:00+00:00');
+             INSERT INTO transcripts (project_id, run_id, uri, sha256, bytes, created_at)
+               VALUES ('proj-x', 'run-14', 'file:///tmp/run-14.jsonl', 'ab', 9,
+                       '2026-01-01T00:01:00+00:00');
+             INSERT INTO audit_log (project_id, kind, at, run_id, payload_json)
+               VALUES ('proj-x', 'autopilot.cycle', '2026-01-01T00:01:00+00:00', NULL, '{}');",
+        )
+        .unwrap();
+        raw.close().unwrap();
+    }
+
+    /// Every row of `table`, restricted to `columns`, in rowid order.
+    fn table_rows(
+        conn: &Connection,
+        table: &str,
+        columns: &[String],
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM {table} ORDER BY rowid",
+                columns.join(", ")
+            ))
+            .unwrap();
+        stmt.query_map([], |row| {
+            (0..columns.len())
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect()
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_v14_store_upgrades_keeping_every_row_with_a_null_stop_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v14.db");
+        seed_v14(&path);
+        let err = SqliteStore::open_partition(&path, "proj-x").unwrap_err();
+        assert!(err.to_string().contains("fw db upgrade"), "{err}");
+        assert_eq!(recorded(&path), Recorded::Version(Some(14)));
+        let before: Vec<(Vec<String>, Vec<Vec<rusqlite::types::Value>>)> = {
+            let raw = Connection::open(&path).unwrap();
+            assert!(
+                !table_columns(&raw, "attempts")
+                    .unwrap()
+                    .contains(&"stop_reason_json".to_owned())
+            );
+            PARTITIONED_TABLES
+                .iter()
+                .map(|table| {
+                    let columns = table_columns(&raw, table).unwrap();
+                    let rows = table_rows(&raw, table, &columns);
+                    assert!(!rows.is_empty(), "{table} seeded");
+                    (columns, rows)
+                })
+                .collect()
+        };
+
+        let upgrade = SqliteStore::upgrade(&path, "proj-x").unwrap();
+        assert_eq!(upgrade.from, Some(14));
+        assert_eq!(upgrade.to, CURRENT_SCHEMA_VERSION);
+        assert!(upgrade.partitioned.is_empty());
+        assert_eq!(
+            recorded(&path),
+            Recorded::Version(Some(CURRENT_SCHEMA_VERSION))
+        );
+        {
+            let raw = Connection::open(&path).unwrap();
+            // Every pre-existing row is kept verbatim, in place.
+            for (table, (columns, rows)) in PARTITIONED_TABLES.iter().zip(&before) {
+                assert_eq!(&table_rows(&raw, table, columns), rows, "{table}");
+            }
+            // The new column exists and nothing was backfilled into it.
+            let reasons: Vec<Option<String>> = raw
+                .prepare("SELECT stop_reason_json FROM attempts ORDER BY rowid")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(reasons, vec![None, None]);
+        }
+
+        let store = SqliteStore::open_partition(&path, "proj-x").unwrap();
+        let lifecycle = store.load_lifecycle("run-14").unwrap().unwrap();
+        assert_eq!(lifecycle.version, 7);
+        assert_eq!(lifecycle.source, "owner/repo#14");
+        assert_eq!(lifecycle.attempts.len(), 2);
+        assert_eq!(lifecycle.attempts[0].outcome, Some(Outcome::AgentError));
+        assert_eq!(lifecycle.attempts[0].input_tokens, 42);
+        assert!(lifecycle.attempts.iter().all(|a| a.stop_reason.is_none()));
+        let listed = store.list_lifecycles(&LifecycleFilter::default()).unwrap();
+        assert!(listed[0].attempts.iter().all(|a| a.stop_reason.is_none()));
+        // New attempts record a reason alongside the old reasonless rows.
+        let mut open = store.load_attempt("run-14", 2).unwrap().unwrap();
+        open.stop_reason = Some(StopReason::Crash);
+        store.save_attempt("run-14", &open, None).unwrap();
+        assert_eq!(store.load_attempt("run-14", 2).unwrap().unwrap(), open);
+        assert_eq!(
+            store
+                .load_attempt("run-14", 1)
+                .unwrap()
+                .unwrap()
+                .stop_reason,
+            None
+        );
         store.close().unwrap();
         // Idempotent.
         assert!(SqliteStore::upgrade(&path, "proj-x").unwrap().is_noop());

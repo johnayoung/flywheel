@@ -201,6 +201,12 @@ CREATE TABLE IF NOT EXISTS attempts (
   turns                        INTEGER NOT NULL DEFAULT 0,
   total_cost_usd               DOUBLE PRECISION NOT NULL DEFAULT 0,
   last_activity_at             TIMESTAMPTZ,
+  -- Why the attempt stopped: the harness-chosen StopReason as JSON
+  -- ({"kind": "checks_failed", "check": "unit"}), copied from the
+  -- AttemptFinalized event. NULL while the attempt runs and for attempts
+  -- recorded before schema_version 15 (never backfilled). Added in
+  -- schema_version 15 via the in-place upgrade's add-column step.
+  stop_reason_json             JSONB,
   PRIMARY KEY (project_id, run_id, number),
   FOREIGN KEY (project_id, run_id) REFERENCES lifecycles(project_id, run_id)
 );
@@ -338,12 +344,12 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_at
 -- (v11 -> v12 added the nullable lifecycles.source column; v12 -> v13
 -- re-keys every table by project_id, filling existing rows with the store's
 -- bound project id; v13 -> v14 adds the transcripts and audit_log ledger
--- tables).
+-- tables; v14 -> v15 adds the nullable attempts.stop_reason_json column).
 CREATE TABLE IF NOT EXISTS schema_version (
   version INTEGER NOT NULL,
   id      INTEGER PRIMARY KEY CHECK (id = 1)
 );
-INSERT INTO schema_version (version, id) VALUES (14, 1)
+INSERT INTO schema_version (version, id) VALUES (15, 1)
   ON CONFLICT (id) DO NOTHING;
 
 -- Append-only enforcement for grader_results. The trigger function raises a

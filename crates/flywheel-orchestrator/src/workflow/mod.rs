@@ -64,7 +64,8 @@ pub use init::{
 };
 pub use live::{LiveRunRow, cmd_live, cmd_live_until, collect_live_rows, format_live_line};
 pub use ops::{
-    cmd_recheck_blocked, cmd_recover, cmd_resolve, format_recheck_line, recover_stranded_lifecycles,
+    cmd_recheck_blocked, cmd_recover, cmd_resolve, cmd_resolve_releasing, format_recheck_line,
+    recover_stranded_lifecycles,
 };
 pub use select::{
     LatestLifecycleRow, SelectOptions, StatusRow, build_status_rows, cmd_next, cmd_next_landed,
@@ -1042,8 +1043,21 @@ pub fn dispatch(
             let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
             ensure_db_parent(&db_path)?;
             let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
-            cmd_resolve(
+            // The dependents `releases:` names come from the home project's
+            // listing; an explicit `--db` still reads it when one resolves.
+            // The listing is informational only: when no project or source
+            // resolves, resolve proceeds and simply names no dependents.
+            let listing_policy = match policy {
+                Some(policy) => Some(policy),
+                None => load_effective_policy(access).ok().flatten(),
+            };
+            let items: Vec<crate::sources::WorkItem> = listing_policy
+                .and_then(|policy| build_work_source(&policy, &sources).ok())
+                .and_then(|source| source.list_work().ok())
+                .unwrap_or_default();
+            cmd_resolve_releasing(
                 &args,
+                &items,
                 &*stores.core,
                 &*stores.claims,
                 chrono::Utc::now(),

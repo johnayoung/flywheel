@@ -296,6 +296,44 @@ pub fn cmd_resolve(
     Ok(0)
 }
 
+/// [`cmd_resolve`] plus the release report (spec 00086, criterion 16):
+/// after a successful resolve, one `releases: a, b` line names every
+/// listed dependent that was held on `args.task_id` as an unlanded
+/// prerequisite and is no longer held on any. No line when it releases
+/// none, so resolve's output is otherwise unchanged. `items` is the
+/// active listing the dependents are read from.
+pub fn cmd_resolve_releasing(
+    args: &ResolveArgs,
+    items: &[WorkItem],
+    store: &dyn HarnessStore,
+    claims: &dyn ClaimStore,
+    now: DateTime<Utc>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32, WorkflowError> {
+    let rows = super::select::status_rows(items, store)?;
+    let held_before = super::status::waiting_on_landing(&rows, store, claims, now)?;
+    let code = cmd_resolve(args, store, claims, now, out, err)?;
+    if code != 0 {
+        return Ok(code);
+    }
+    let held_after = super::status::waiting_on_landing(&rows, store, claims, now)?;
+    let released: Vec<&str> = rows
+        .iter()
+        .map(super::select::StatusRow::task_id)
+        .filter(|dependent| {
+            held_before
+                .get(*dependent)
+                .is_some_and(|ids| ids.iter().any(|id| id == &args.task_id))
+                && !held_after.contains_key(*dependent)
+        })
+        .collect();
+    if !released.is_empty() {
+        writeln!(out, "releases: {}", released.join(", "))?;
+    }
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::*;

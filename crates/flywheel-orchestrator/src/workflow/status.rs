@@ -18,7 +18,8 @@ use serde_json::{Map, Value, json};
 use crate::claims::{
     ClaimStore, OrchestratorStopEventRecord, RESOLUTION_ATTRIBUTIONS, STOP_RESOLVED,
 };
-use crate::rollup::{build_rollup, render_rollup_text, rollup_to_json};
+use crate::orchestrate::unlanded_prerequisite_holds;
+use crate::rollup::{build_rollup_landed, render_rollup_text, rollup_to_json};
 use crate::sources::WorkItem;
 
 use super::args::StatusArgs;
@@ -227,17 +228,41 @@ fn phase_label(row: &StatusRow) -> String {
     "external".to_owned()
 }
 
+/// Every not-done listed task held behind unlanded prerequisites, keyed by
+/// the dependent, each with those prerequisite ids in prerequisite order --
+/// the landed-only predicate selection applies (spec 00086, D-4).
+pub(crate) fn waiting_on_landing(
+    rows: &[StatusRow],
+    store: &dyn HarnessStore,
+    claims: &dyn ClaimStore,
+    now: DateTime<Utc>,
+) -> Result<BTreeMap<String, Vec<String>>, WorkflowError> {
+    Ok(
+        unlanded_prerequisite_holds(store, claims, &snapshots(rows), now)?
+            .into_iter()
+            .map(|(dependent, holds)| {
+                (
+                    dependent,
+                    holds.into_iter().map(|hold| hold.task_id).collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_status_rollup(
     args: &StatusArgs,
     rows: &[StatusRow],
     store: &dyn HarnessStore,
+    landing_holds: &BTreeMap<String, Vec<String>>,
     repo_root: Option<&Path>,
     true_base: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<i32, WorkflowError> {
     let plain = snapshots(rows);
     let holds = reachability_held_prerequisites(&plain, repo_root, true_base);
-    let rollup = build_rollup(&plain, store, &holds)?;
+    let rollup = build_rollup_landed(&plain, store, &holds, landing_holds)?;
     if args.json {
         writeln!(out, "{}", py_json_dumps_indent2(&rollup_to_json(&rollup)))?;
     } else {
@@ -262,8 +287,17 @@ pub fn cmd_status(
     out: &mut dyn Write,
 ) -> Result<i32, WorkflowError> {
     let rows = status_rows(items, store)?;
+    let landing_holds = waiting_on_landing(&rows, store, claims, Utc::now())?;
     if args.rollup {
-        return cmd_status_rollup(args, &rows, store, repo_root, true_base, out);
+        return cmd_status_rollup(
+            args,
+            &rows,
+            store,
+            &landing_holds,
+            repo_root,
+            true_base,
+            out,
+        );
     }
     let worker_ids = live_worker_ids(store)?;
 
@@ -348,6 +382,9 @@ pub fn cmd_status(
             );
             entry.insert("latest_error".into(), json!(row.status.latest_error));
             entry.insert("prerequisites".into(), json!(row.item.prerequisites));
+            if let Some(unlanded) = landing_holds.get(row.task_id()) {
+                entry.insert("unlanded_prerequisites".into(), json!(unlanded));
+            }
             if let Some(Some(worker_id)) = row
                 .status
                 .latest_run_id
@@ -424,6 +461,9 @@ pub fn cmd_status(
         }
         if let Some(instruction) = awaiting_instruction_for_row(row) {
             writeln!(out, "    awaiting_on: {instruction}")?;
+        }
+        if let Some(unlanded) = landing_holds.get(row.task_id()) {
+            writeln!(out, "    waiting_on_landing: {}", unlanded.join(", "))?;
         }
         if let Some(park) = row
             .status
@@ -1282,5 +1322,209 @@ mod tests {
         );
         assert!(parse_blocked_requires(Some("{}")).is_none());
         assert!(parse_blocked_requires(Some("nope")).is_none());
+    }
+
+    /// Two parked DONE prerequisites (`p2` listed before `p1` in `dep`'s
+    /// prerequisites), one landed-clean DONE prerequisite `q` with its own
+    /// dependent `free`.
+    fn waiting_on_landing_scenario() -> (TempDir, InMemoryStore, InMemoryClaimStore) {
+        let tmp = TempDir::new().unwrap();
+        let ph = tmp.path().join("active").join("01-phase");
+        write_task(&ph.join("p1.json"), "p1", &[]);
+        write_task(&ph.join("p2.json"), "p2", &[]);
+        write_task(&ph.join("q.json"), "q", &[]);
+        write_task(&ph.join("dep.json"), "dep", &["p2", "q", "p1"]);
+        write_task(&ph.join("free.json"), "free", &["q"]);
+        let store = InMemoryStore::new();
+        for (task, kind) in [
+            ("p1", PARK_KIND_HELD_OUT_GATE),
+            ("p2", PARK_KIND_STANDING_VERIFY),
+        ] {
+            let lc = seed_done(&store, task);
+            park(&store, &lc.run_id, kind, "parked", t0());
+        }
+        seed_done(&store, "q");
+        // A held-out-gate park is routed to the human-review queue, which
+        // records its stop row (the strand `resolve` abandons).
+        let claims = InMemoryClaimStore::new();
+        claims
+            .record_human_review(
+                PARK_KIND_HELD_OUT_GATE,
+                "p1",
+                t0(),
+                "run-p1-ok",
+                "landing re-drive exhausted",
+            )
+            .unwrap();
+        (tmp, store, claims)
+    }
+
+    fn rollup_task(payload: &Value, task_id: &str) -> Value {
+        payload["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|phase| phase["tasks"].as_array().unwrap().iter())
+            .find(|task| task["task_id"] == json!(task_id))
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn waiting_on_landing_names_every_unlanded_prerequisite_in_prerequisite_order() {
+        let (tmp, store, claims) = waiting_on_landing_scenario();
+        let text = run_status(&tmp, &store, &claims, false, false);
+        assert!(
+            text.contains("  01-phase/dep   fresh            \n    waiting_on_landing: p2, p1\n"),
+            "{text}"
+        );
+        assert_eq!(text.matches("waiting_on_landing:").count(), 1, "{text}");
+
+        let payload = status_json(&tmp, &store, &claims);
+        let entry = |id: &str| {
+            payload
+                .iter()
+                .find(|e| e["task_id"] == json!(id))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(entry("dep")["unlanded_prerequisites"], json!(["p2", "p1"]));
+        for id in ["free", "q", "p1", "p2"] {
+            assert!(entry(id).get("unlanded_prerequisites").is_none(), "{id}");
+        }
+
+        let rollup: Value =
+            serde_json::from_str(&run_status(&tmp, &store, &claims, true, true)).unwrap();
+        let dep = rollup_task(&rollup, "dep");
+        assert_eq!(dep["status"], json!("blocked_by_prereq"));
+        assert_eq!(dep["unsatisfied_prerequisites"], json!(["p2", "p1"]));
+        assert_eq!(dep["detail"], json!("waiting on landing: p2, p1"));
+        let free = rollup_task(&rollup, "free");
+        assert_eq!(free["status"], json!("not_started"));
+        assert_eq!(free["unsatisfied_prerequisites"], json!([]));
+        let rollup_text = run_status(&tmp, &store, &claims, false, true);
+        assert!(
+            rollup_text.contains("waiting on landing: p2, p1"),
+            "{rollup_text}"
+        );
+    }
+
+    #[test]
+    fn waiting_on_landing_joins_incomplete_prerequisites_in_the_rollup() {
+        let (tmp, store, claims) = waiting_on_landing_scenario();
+        let ph = tmp.path().join("active").join("01-phase");
+        write_task(&ph.join("todo.json"), "todo", &[]);
+        write_task(&ph.join("mixed.json"), "mixed", &["todo", "p1"]);
+        let rollup: Value =
+            serde_json::from_str(&run_status(&tmp, &store, &claims, true, true)).unwrap();
+        let mixed = rollup_task(&rollup, "mixed");
+        assert_eq!(mixed["status"], json!("blocked_by_prereq"));
+        assert_eq!(mixed["unsatisfied_prerequisites"], json!(["todo", "p1"]));
+        assert_eq!(
+            mixed["detail"],
+            json!("waiting on: todo; waiting on landing: p1")
+        );
+    }
+
+    #[test]
+    fn waiting_on_landing_covers_a_landing_still_in_flight_and_clears_once_landed() {
+        let tmp = TempDir::new().unwrap();
+        let ph = tmp.path().join("active").join("01-phase");
+        write_task(&ph.join("p.json"), "p", &[]);
+        write_task(&ph.join("dep.json"), "dep", &["p"]);
+        let store = InMemoryStore::new();
+        seed_done(&store, "p");
+        let claims = InMemoryClaimStore::new();
+        // DONE, never parked, claim still held by a live worker: mid-landing.
+        let claim = claims
+            .acquire_claim("p", "worker-1", Utc::now(), 3600.0, &BTreeSet::new())
+            .unwrap()
+            .unwrap();
+        let text = run_status(&tmp, &store, &claims, false, false);
+        assert!(text.contains("    waiting_on_landing: p\n"), "{text}");
+        let payload = status_json(&tmp, &store, &claims);
+        let dep = payload
+            .iter()
+            .find(|e| e["task_id"] == json!("dep"))
+            .unwrap();
+        assert_eq!(dep["unlanded_prerequisites"], json!(["p"]));
+
+        claims.release_claim(&claim, None).unwrap();
+        let text = run_status(&tmp, &store, &claims, false, false);
+        assert!(!text.contains("waiting_on_landing"), "{text}");
+        let payload = status_json(&tmp, &store, &claims);
+        assert!(
+            payload
+                .iter()
+                .all(|e| e.get("unlanded_prerequisites").is_none())
+        );
+    }
+
+    #[test]
+    fn waiting_on_landing_clears_on_resolve_which_names_the_released_dependents() {
+        use super::super::args::ResolveArgs;
+        use super::super::ops::{cmd_resolve, cmd_resolve_releasing};
+        let (tmp, store, claims) = waiting_on_landing_scenario();
+        let ph = tmp.path().join("active").join("01-phase");
+        write_task(&ph.join("dep-b.json"), "dep-b", &["p1"]);
+        let items = DirectoryWorkSource::new(tmp.path()).list_work().unwrap();
+        let resolve = |task: &str, now: DateTime<Utc>| {
+            let args = ResolveArgs {
+                task_id: task.into(),
+                reason: "landed by hand".into(),
+                db: None,
+            };
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code =
+                cmd_resolve_releasing(&args, &items, &store, &claims, now, &mut out, &mut err)
+                    .unwrap();
+            (code, String::from_utf8(out).unwrap())
+        };
+
+        // p2 resolved: dep is still held on p1, so nothing is released.
+        let (code, out) = resolve("p2", t0() + Duration::minutes(1));
+        assert_eq!(code, 0);
+        assert_eq!(
+            out,
+            "resolved p2: abandoned strand (superseded 'standing-verify')\n"
+        );
+        let payload = status_json(&tmp, &store, &claims);
+        let dep = payload
+            .iter()
+            .find(|e| e["task_id"] == json!("dep"))
+            .unwrap();
+        assert_eq!(dep["unlanded_prerequisites"], json!(["p1"]));
+
+        // p1 resolved: both of its waiting dependents are freed, in status listing order.
+        let (code, out) = resolve("p1", t0() + Duration::minutes(2));
+        assert_eq!(code, 0);
+        assert_eq!(
+            out,
+            "resolved p1: abandoned strand (superseded 'held-out-gate')\nreleases: dep-b, dep\n"
+        );
+        let text = run_status(&tmp, &store, &claims, false, false);
+        assert!(!text.contains("waiting_on_landing"), "{text}");
+
+        // A refused resolve prints nothing on stdout, like the plain verb.
+        let (code, out) = resolve("p1", t0() + Duration::minutes(3));
+        assert_eq!((code, out.as_str()), (1, ""));
+
+        // A resolve releasing nobody is byte-identical to the plain verb.
+        let lone = seed_done(&store, "lone");
+        park(&store, &lone.run_id, PARK_KIND_STANDING_VERIFY, "x", t0());
+        let (_, wrapped) = resolve("lone", t0() + Duration::minutes(4));
+        let other = seed_done(&store, "other");
+        park(&store, &other.run_id, PARK_KIND_STANDING_VERIFY, "x", t0());
+        let args = ResolveArgs {
+            task_id: "other".into(),
+            reason: "landed by hand".into(),
+            db: None,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        cmd_resolve(&args, &store, &claims, t0(), &mut out, &mut err).unwrap();
+        assert_eq!(
+            wrapped.replace("lone", "other"),
+            String::from_utf8(out).unwrap()
+        );
     }
 }

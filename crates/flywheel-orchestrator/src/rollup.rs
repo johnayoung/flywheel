@@ -535,6 +535,21 @@ pub fn build_rollup<S: LifecycleStore + GraderResultStore + ?Sized>(
     store: &S,
     reachability_holds: &BTreeMap<String, PrerequisiteReachabilityHold>,
 ) -> Result<Rollup, StoreError> {
+    build_rollup_landed(rows, store, reachability_holds, &BTreeMap::new())
+}
+
+/// [`build_rollup`] with the landed-only prerequisite rule (spec 00086,
+/// D-4): `unlanded_holds` maps a dependent to its DONE-but-unlanded
+/// prerequisite ids (the orchestrator's `unlanded_prerequisite_holds`
+/// projection). A not-started dependent with any such id is blocked by
+/// prerequisite, and those ids join its `unsatisfied_prerequisites` in
+/// prerequisite order.
+pub fn build_rollup_landed<S: LifecycleStore + GraderResultStore + ?Sized>(
+    rows: &[TaskStatusRow],
+    store: &S,
+    reachability_holds: &BTreeMap<String, PrerequisiteReachabilityHold>,
+    unlanded_holds: &BTreeMap<String, Vec<String>>,
+) -> Result<Rollup, StoreError> {
     // First pass: classify each task in isolation, recording its status so
     // the prerequisite pass can resolve dependencies by id.
     let mut classified = Vec::with_capacity(rows.len());
@@ -558,18 +573,34 @@ pub fn build_rollup<S: LifecycleStore + GraderResultStore + ?Sized>(
     for (row, mut status, passed, total, mut detail) in classified {
         let mut unsatisfied: Vec<String> = Vec::new();
         if status == RollupStatus::NotStarted && !row.prerequisites.is_empty() {
-            unsatisfied = row
-                .prerequisites
-                .iter()
-                .filter(|id| {
-                    !status_by_id.get(id.as_str()).is_some_and(|s| s.is_done())
-                        && !store_done.contains(id.as_str())
-                })
-                .cloned()
-                .collect();
+            let unlanded = unlanded_holds.get(&row.task_id);
+            let is_unlanded = |id: &str| unlanded.is_some_and(|ids| ids.iter().any(|u| u == id));
+            let mut incomplete: Vec<String> = Vec::new();
+            let mut waiting_on_landing: Vec<String> = Vec::new();
+            for id in &row.prerequisites {
+                if is_unlanded(id) {
+                    unsatisfied.push(id.clone());
+                    waiting_on_landing.push(id.clone());
+                } else if !status_by_id.get(id.as_str()).is_some_and(|s| s.is_done())
+                    && !store_done.contains(id.as_str())
+                {
+                    unsatisfied.push(id.clone());
+                    incomplete.push(id.clone());
+                }
+            }
             if !unsatisfied.is_empty() {
                 status = RollupStatus::BlockedByPrereq;
-                detail = format!("waiting on: {}", unsatisfied.join(", "));
+                let mut parts = Vec::new();
+                if !incomplete.is_empty() {
+                    parts.push(format!("waiting on: {}", incomplete.join(", ")));
+                }
+                if !waiting_on_landing.is_empty() {
+                    parts.push(format!(
+                        "waiting on landing: {}",
+                        waiting_on_landing.join(", ")
+                    ));
+                }
+                detail = parts.join("; ");
             }
         }
         // A dependent whose prerequisites are all DONE but not yet reachable

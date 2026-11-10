@@ -399,12 +399,23 @@ window.FwHubBoardTask = function (ctx) {
     return out;
   }
 
+  // Each check's status (`passed`, `failed`, `judge_faulted`, `not_run`) on
+  // the latest attempt of the newest run, as the run detail reports it.
+  function latestStatus(h) {
+    const out = new Map();
+    const run = h.runs[0];
+    const a = run && run.attempts.length ? run.attempts[run.attempts.length - 1] : null;
+    for (const c of (a && a.checks) || []) out.set(c.name, c.status);
+    return out;
+  }
+
   const KIND = { command: "command", rubric: "reviewer", manual: "manual", transcript: "transcript" };
   const MARK = { pass: ["✓", "passed on its latest receipt"], fail: ["✗", "failed on its latest receipt"], none: ["·", "no receipt yet"] };
 
   function checksSection(h) {
     if (!h) return null;
     const st = standing(h);
+    const last = latestStatus(h);
     const pass = h.checks.filter((c) => st.get(c.name) === "pass").length;
     const fail = h.checks.filter((c) => st.get(c.name) === "fail").length;
     const count = h.checks.length
@@ -420,7 +431,7 @@ window.FwHubBoardTask = function (ctx) {
           const s = st.get(c.name) || "none";
           return el(
             "li",
-            { className: `fwb-check ${s}`, "data-fw-check": c.name, title: c.held_out ? "Held out: the agent never sees it; it runs on the committed result before it may land" : `${KIND[c.kind] || c.kind} check` },
+            { className: `fwb-check ${s}`, "data-fw-check": c.name, "data-fw-check-status": last.get(c.name), title: c.held_out ? "Held out: the agent never sees it; it runs on the committed result before it may land" : `${KIND[c.kind] || c.kind} check` },
             el("span", { className: "fwb-check-mark", title: MARK[s][1], "aria-label": MARK[s][1], textContent: MARK[s][0] }),
             el("b", { textContent: c.name }),
             el("small", { textContent: c.held_out ? "held out" : KIND[c.kind] || c.kind }),

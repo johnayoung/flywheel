@@ -18,7 +18,10 @@
 //!
 //! * tasks and alerts: `fw status --json` itself ([`cmd_status`]), so a
 //!   strand, stop, or failure reads exactly as the CLI reports it;
-//! * in-flight runs: the console's live rows ([`collect_live_rows`]);
+//! * in-flight runs: the console's live rows ([`collect_live_rows`]), each
+//!   with the latest tool call its transcript records (tailed per run);
+//! * a task's history: every lifecycle of the task with each attempt, and
+//!   its checks (held-out ones by name only);
 //! * recent runs: the newest lifecycles with their latest attempt's grader
 //!   receipts from `grader_results`;
 //! * plans: every phase under `tasks/active/` and `tasks/archive/`, folded
@@ -42,7 +45,7 @@
 //! folder read from the wrong one shows it. A failed read drops the
 //! connection; the next read reconnects.
 
-use crate::session::TranscriptTailer;
+use crate::session::{EntryKind, TranscriptEntry, TranscriptTailer};
 use crate::session_screen::is_error_entry;
 use crate::snapshot::{CachedWorkSource, collect_live_rows, directory_fingerprint};
 use crate::tui::{open_store_bundle, process_environ};
@@ -56,8 +59,9 @@ use flywheel_hub::autopilot::{GateDecided, GateDecision, GateRefused};
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome, LiveRun, Note,
-    PanelClaim, PanelPhase, PanelPlan, PanelTask, RecentRun, RunEntry, RunOutput, Steer,
-    SteerRefused, Steered, TaskLight, UntrustedRepoFile, WorkerScope,
+    PanelClaim, PanelPhase, PanelPlan, PanelTask, RecentRun, RunAttempt, RunEntry, RunOutput,
+    Steer, SteerRefused, Steered, TaskHistory, TaskLight, TaskRun, ToolCall, UntrustedRepoFile,
+    WorkerScope, valid_run_id,
 };
 use flywheel_hub::util::path_identity as file_identity;
 use flywheel_orchestrator::autopilot_activity::{
@@ -326,6 +330,9 @@ struct Folder {
     /// The main checkout when the folder is a linked git worktree; read
     /// once (`Some(None)`: not one).
     worktree_of: Option<Option<PathBuf>>,
+    /// The in-flight runs' transcripts, tailed for their latest tool call
+    /// (kept to the runs the last panel read found in flight).
+    tool_tails: HashMap<String, ToolTail>,
 }
 
 struct Resolved {
@@ -919,6 +926,35 @@ fn live_runs(core: &dyn HarnessStore, now: DateTime<Utc>) -> Result<Vec<LiveRun>
             last_detail: row.last_detail,
             worker_id: row.worker_id,
             awaiting: row.awaiting_instruction,
+            last_tool: None,
+        })
+        .collect())
+}
+
+/// One attempt's grader receipts, by name (never a grader's command).
+fn grader_outcomes(
+    core: &dyn HarnessStore,
+    run_id: &str,
+    attempt: u32,
+) -> Result<Vec<GraderOutcome>, String> {
+    Ok(core
+        .list_grader_results(run_id, attempt)
+        .map_err(|e| format!("reading grader receipts: {e}"))?
+        .into_iter()
+        .map(|r| GraderOutcome {
+            name: r
+                .grader_name
+                .clone()
+                .or_else(|| {
+                    r.grader_spec
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| format!("#{}", r.ordinal)),
+            kind: r.grader_type.as_str().to_owned(),
+            passed: r.passed,
+            duration_ms: r.duration_ms,
         })
         .collect())
 }
@@ -926,26 +962,7 @@ fn live_runs(core: &dyn HarnessStore, now: DateTime<Utc>) -> Result<Vec<LiveRun>
 fn recent_run(core: &dyn HarnessStore, lc: &Lifecycle) -> Result<RecentRun, String> {
     let latest = lc.attempts.last();
     let graders = match latest {
-        Some(attempt) => core
-            .list_grader_results(&lc.run_id, attempt.number)
-            .map_err(|e| format!("reading grader receipts: {e}"))?
-            .into_iter()
-            .map(|r| GraderOutcome {
-                name: r
-                    .grader_name
-                    .clone()
-                    .or_else(|| {
-                        r.grader_spec
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| format!("#{}", r.ordinal)),
-                kind: r.grader_type.as_str().to_owned(),
-                passed: r.passed,
-                duration_ms: r.duration_ms,
-            })
-            .collect(),
+        Some(attempt) => grader_outcomes(core, &lc.run_id, attempt.number)?,
         None => Vec::new(),
     };
     Ok(RecentRun {
@@ -966,6 +983,45 @@ fn recent_run(core: &dyn HarnessStore, lc: &Lifecycle) -> Result<RecentRun, Stri
         error: lc.error.clone(),
         graders,
     })
+}
+
+/// Every run of `task_id` (newest first, never windowed) with each
+/// attempt's outcome, error, and grader receipts.
+fn task_runs(core: &dyn HarnessStore, task_id: &str) -> Result<Vec<TaskRun>, String> {
+    let lifecycles = core
+        .list_lifecycles(&LifecycleFilter::default().with_task_id(task_id))
+        .map_err(|e| format!("reading runs: {e}"))?;
+    lifecycles
+        .iter()
+        .map(|lc| {
+            let attempts = lc
+                .attempts
+                .iter()
+                .map(|a| {
+                    Ok(RunAttempt {
+                        number: a.number,
+                        outcome: a.outcome.map(|o| o.as_str().to_owned()),
+                        error: a.error.clone(),
+                        started_at: a.started_at,
+                        ended_at: a.ended_at,
+                        tokens: a.total_tokens(),
+                        cost_usd: a.total_cost_usd,
+                        graders: grader_outcomes(core, &lc.run_id, a.number)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(TaskRun {
+                run_id: lc.run_id.clone(),
+                status: lc.status.as_str().to_owned(),
+                started_at: lc.timestamps.values().min().copied(),
+                updated_at: lc.timestamps.values().max().copied(),
+                error: lc.error.clone(),
+                tokens: attempts.iter().map(|a| a.tokens).sum(),
+                cost_usd: attempts.iter().fold(0.0, |total, a| total + a.cost_usd),
+                attempts,
+            })
+        })
+        .collect()
 }
 
 fn recent_runs(core: &dyn HarnessStore) -> Result<Vec<RecentRun>, String> {
@@ -1065,6 +1121,73 @@ fn human_seconds(seconds: i64) -> String {
 }
 
 // --- transcripts ---------------------------------------------------------------
+
+/// A transcript entry's tool call: `tool(<name>)` and its argument.
+fn tool_call(entry: &TranscriptEntry) -> Option<ToolCall> {
+    if entry.kind != EntryKind::ToolCall {
+        return None;
+    }
+    let tool = entry
+        .header
+        .strip_prefix("tool(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(&entry.header);
+    Some(ToolCall {
+        tool: tool.to_owned(),
+        argument: cut(entry.body.clone()),
+        ts: entry.ts,
+    })
+}
+
+/// An in-flight run's transcript tailed only for its latest tool call.
+struct ToolTail {
+    tailer: TranscriptTailer,
+    last: Option<ToolCall>,
+}
+
+impl ToolTail {
+    fn new(file: PathBuf, run_id: &str) -> Self {
+        Self {
+            tailer: TranscriptTailer::new(file, run_id),
+            last: None,
+        }
+    }
+
+    /// The latest tool call, after reading what was appended since the
+    /// last pull. A missing transcript reads as none; a failed read keeps
+    /// the last one seen.
+    fn pull(&mut self) -> Option<ToolCall> {
+        if let Ok(fresh) = self.tailer.fetch()
+            && let Some(call) = fresh.iter().rev().find_map(tool_call)
+        {
+            self.last = Some(call);
+        }
+        self.last.clone()
+    }
+}
+
+/// Fill in each live run's latest tool call from its transcript under
+/// `logs_root`, keeping `tails` to exactly those runs.
+fn mark_last_tools(tails: &mut HashMap<String, ToolTail>, logs_root: &Path, live: &mut [LiveRun]) {
+    tails.retain(|run_id, _| live.iter().any(|run| &run.run_id == run_id));
+    for run in live {
+        if !valid_run_id(&run.run_id) {
+            continue;
+        }
+        let tail = tails
+            .entry(run.run_id.clone())
+            .or_insert_with(|| ToolTail::new(run_file_path(logs_root, &run.run_id), &run.run_id));
+        run.last_tool = tail.pull();
+    }
+}
+
+/// The console's logs root: `<store dir>/logs`.
+fn logs_root(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .map_or_else(PathBuf::new, Path::to_path_buf)
+        .join("logs")
+}
 
 /// One run's transcript, tailed incrementally and windowed.
 struct Transcript {
@@ -1200,6 +1323,12 @@ impl FlywheelProvider for HubFlywheel {
                 directory_fingerprint(dir).hash(&mut hasher);
             }
         }
+        // A tool call appended to an in-flight run's transcript.
+        let mut tails: Vec<(&String, &ToolTail)> = state.tool_tails.iter().collect();
+        tails.sort_by(|a, b| a.0.cmp(b.0));
+        for (_, tail) in tails {
+            stamp(tail.tailer.run_file()).hash(&mut hasher);
+        }
         hasher.finish()
     }
 
@@ -1249,6 +1378,7 @@ impl FlywheelProvider for HubFlywheel {
             };
         let policy = resolved.policy.clone();
         let tasks_dir = resolved.tasks_dir.clone();
+        let db_path = resolved.db_path.clone();
         let items = match &resolved.source {
             Some(source) => match source.list_work() {
                 Ok(items) => items,
@@ -1275,6 +1405,11 @@ impl FlywheelProvider for HubFlywheel {
         match live_runs(core.as_ref(), now) {
             Ok(live) => panel.live = live,
             Err(message) => problems.push(message),
+        }
+        {
+            let state = self.folder(folder);
+            let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+            mark_last_tools(&mut state.tool_tails, &logs_root(&db_path), &mut panel.live);
         }
         match recent_runs(core.as_ref()) {
             Ok(runs) => panel.runs = runs,
@@ -1341,12 +1476,8 @@ impl FlywheelProvider for HubFlywheel {
         let mut summary: Vec<u8> = Vec::new();
         cmd_show(&args, core.as_ref(), folder, &fallback, &mut summary)
             .map_err(|e| format!("reading run {run_id}: {e}"))?;
-        // The console's logs root: `<store dir>/logs`.
-        let logs_root = db_path
-            .parent()
-            .map_or_else(PathBuf::new, Path::to_path_buf)
-            .join("logs");
-        let transcript = self.transcript(folder, run_id, run_file_path(&logs_root, run_id));
+        let transcript =
+            self.transcript(folder, run_id, run_file_path(&logs_root(&db_path), run_id));
         let mut transcript = transcript.lock().unwrap_or_else(PoisonError::into_inner);
         transcript.pull()?;
         let (from, entries) = transcript.from(since);
@@ -1366,6 +1497,34 @@ impl FlywheelProvider for HubFlywheel {
             next: transcript.total(),
             from,
             entries,
+        })
+    }
+
+    fn task_history(&self, folder: &Path, task_id: &str) -> Result<TaskHistory, String> {
+        let state = self.folder(folder);
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let resolved = state.resolve(&self.home(), folder)?;
+        let core = match resolved.stores(folder)? {
+            Some(bundle) => Some(Arc::clone(&bundle.core)),
+            None => None,
+        };
+        drop(state);
+        let runs = match core {
+            Some(core) => task_runs(core.as_ref(), task_id).inspect_err(|_| {
+                // A dead handle: reopen on the next read.
+                self.drop_stores(folder);
+            })?,
+            None => Vec::new(),
+        };
+        let (checks, problem) = match crate::hub_tasks::task_checks(self, folder, task_id) {
+            Ok(checks) => (checks, None),
+            Err(message) => (Vec::new(), Some(message)),
+        };
+        Ok(TaskHistory {
+            task_id: task_id.to_owned(),
+            runs,
+            checks,
+            problem,
         })
     }
 

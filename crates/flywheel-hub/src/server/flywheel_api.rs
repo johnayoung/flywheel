@@ -5,6 +5,9 @@
 //!   pending tasks a running scoped worker will run marked `queued_in`;
 //! * `GET /api/flywheel/run?folder=P&run=R[&since=N]` -- a run's `fw show`
 //!   summary and its transcript from entry `N` on;
+//! * `GET /api/flywheel/history?folder=P&task=T` -- every recorded run of
+//!   task `T` (never windowed) with each attempt's outcome and error, and
+//!   its checks (held-out ones by name only);
 //! * `POST /api/flywheel/worker {"folder", "workspace_id"?, "another"?,
 //!   "tasks"?, "with_prereqs"?, "cols"?, "rows"?}` -- start `fw worker`
 //!   (`fw worker --task ID ...` when `tasks` names any) in a new hub shell
@@ -267,6 +270,45 @@ pub(super) async fn run_output(
     match read {
         Ok(Ok(output)) => Json(output).into_response(),
         Ok(Err(message)) => error_response(StatusCode::NOT_FOUND, &message),
+        Err(refusal) => refusal.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct HistoryQuery {
+    folder: String,
+    task: String,
+}
+
+pub(super) async fn task_history(
+    State(app): State<AppState>,
+    ApiQuery(query): ApiQuery<HistoryQuery>,
+) -> Response {
+    let monitor = match monitor(&app) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let task = query.task.trim().to_owned();
+    if let Err(why) = WorkerScope::new(vec![task.clone()], false) {
+        return error_response(StatusCode::BAD_REQUEST, &why);
+    }
+    let (path, _) = match adopted_folder(&app, &monitor, query.folder).await {
+        Ok(found) => found,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let Some(guard) = monitor.begin_read(format!("history\0{}\0{task}", path.display())) else {
+        return still_reading("read of this task's runs");
+    };
+    let provider = Arc::clone(monitor.provider());
+    let read = off_runtime(RUN_OUTPUT_TIMEOUT, "reading the task's runs", move || {
+        let history = provider.task_history(&path, &task);
+        drop(guard);
+        history
+    })
+    .await;
+    match read {
+        Ok(Ok(history)) => Json(history).into_response(),
+        Ok(Err(message)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &message),
         Err(refusal) => refusal.into_response(),
     }
 }

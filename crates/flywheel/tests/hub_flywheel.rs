@@ -1810,3 +1810,338 @@ fn create_task_plans_then_writes_one_loader_valid_file_under_the_home_only() {
     assert_eq!(code, 403);
     assert!(!core.join("delta.json").exists());
 }
+
+/// A distinct token per call (the fixture's "random" strings).
+fn token(label: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{label}-{nanos:x}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A failed run of `task_id` with one failed attempt per error in
+/// `errors` (in order), the run's error the last of them.
+fn seed_failed_run(
+    store: &SqliteStore,
+    task_id: &str,
+    run_id: &str,
+    at: DateTime<Utc>,
+    errors: &[String],
+) {
+    let mut lc = Lifecycle::new(task_id);
+    lc.run_id = run_id.to_owned();
+    let last = errors.last().cloned().unwrap_or_default();
+    for (i, status) in [
+        Status::Ready,
+        Status::Running,
+        Status::Validating,
+        Status::FailedValidation,
+    ]
+    .iter()
+    .enumerate()
+    {
+        let error = if *status == Status::FailedValidation {
+            last.as_str()
+        } else {
+            ""
+        };
+        lc.transition_to(*status, error, Some(at + ChronoDuration::seconds(i as i64)))
+            .unwrap();
+    }
+    store.create_lifecycle(&lc).unwrap();
+    for (n, error) in errors.iter().enumerate() {
+        let number = n as u32 + 1;
+        let mut attempt = Attempt::new(number, at, run_id);
+        attempt.outcome = Some(Outcome::ValidationFailed);
+        attempt.error = error.clone();
+        attempt.total_cost_usd = 0.1;
+        attempt.ended_at = Some(at + ChronoDuration::seconds(2));
+        store.save_attempt(run_id, &attempt, None).unwrap();
+        store
+            .append_grader_result(&GraderResultRecord {
+                run_id: run_id.to_owned(),
+                attempt_number: number,
+                ordinal: 0,
+                grader_type: GraderType::Command,
+                grader_spec: obj(json!({"type": "command", "name": "unit", "run": "true"})),
+                passed: false,
+                duration_ms: 7,
+                payload: Map::new(),
+                ts: at + ChronoDuration::seconds(1),
+                grader_name: Some("unit".into()),
+                id: None,
+            })
+            .unwrap();
+    }
+}
+
+/// `task_id`'s held-out registration in the project: one command grader
+/// named `name` running the oracle at a path naming `secret`.
+fn register_held_out(project: &Project, task_id: &str, name: &str, secret: &str) -> String {
+    let held = project.dir().join("held-out");
+    std::fs::create_dir_all(&held).unwrap();
+    let oracle = held.join(format!("{secret}.sh"));
+    std::fs::write(&oracle, "#!/bin/sh\nexit 0\n").unwrap();
+    let run = format!("sh {} --{secret}", oracle.display());
+    std::fs::write(
+        held.join(format!("{task_id}.json")),
+        json!({"graders": [{"type": "command", "run": run, "name": name}]}).to_string(),
+    )
+    .unwrap();
+    run
+}
+
+#[test]
+fn task_history_lists_every_run_past_the_recent_window_with_each_attempts_outcome_and_error() {
+    let fx = temp_repo();
+    let root = fx.root.clone();
+    let store = fx.project.store();
+    let t0 = Utc::now() - ChronoDuration::hours(3);
+    let mut seeded: Vec<(String, Vec<String>)> = Vec::new();
+    for n in 0..14 {
+        let run_id = format!("run-beta-{n:02}");
+        let errors = vec![token("first-try"), token("second-try")];
+        seed_failed_run(
+            &store,
+            "beta",
+            &run_id,
+            t0 + ChronoDuration::minutes(n),
+            &errors,
+        );
+        seeded.push((run_id, errors));
+    }
+    let held_name = token("held-beta");
+    let secret = token("oracle-secret");
+    let held_run = register_held_out(&fx.project, "beta", &held_name, &secret);
+    let provider = fx.provider();
+
+    // The panel's recent window stays 12; the history is never windowed.
+    assert_eq!(provider.panel(&root).runs.len(), 12);
+    let history = provider.task_history(&root, "beta").unwrap();
+    assert_eq!(history.task_id, "beta");
+    assert_eq!(history.runs.len(), 15, "the 14 seeded plus run-beta");
+    assert!(
+        history
+            .runs
+            .iter()
+            .all(|r| r.run_id.starts_with("run-beta"))
+    );
+    for (run_id, errors) in &seeded {
+        let run = history
+            .runs
+            .iter()
+            .find(|r| &r.run_id == run_id)
+            .unwrap_or_else(|| panic!("{run_id} missing"));
+        assert_eq!(run.status, "failed_validation");
+        assert_eq!(&run.error, errors.last().unwrap());
+        assert_eq!(run.attempts.len(), 2);
+        for (attempt, error) in run.attempts.iter().zip(errors) {
+            assert_eq!(attempt.outcome.as_deref(), Some("validation_failed"));
+            assert_eq!(&attempt.error, error);
+            assert_eq!(attempt.graders.len(), 1);
+            assert!(!attempt.graders[0].passed);
+        }
+        assert!((run.cost_usd - 0.2).abs() < 1e-9);
+    }
+    // Newest first.
+    assert_eq!(history.runs[0].run_id, "run-beta-13");
+
+    // Checks: the task file's, then the held-out one by name only.
+    let checks: Vec<(&str, &str, bool)> = history
+        .checks
+        .iter()
+        .map(|c| (c.name.as_str(), c.kind.as_str(), c.held_out))
+        .collect();
+    assert_eq!(
+        checks,
+        [
+            ("unit", "command", false),
+            (held_name.as_str(), "command", true)
+        ]
+    );
+    assert_eq!(history.problem, None);
+    let wire = serde_json::to_string(&history).unwrap();
+    assert!(!wire.contains(&secret), "{wire}");
+    assert!(!wire.contains(&held_run), "{wire}");
+    assert!(!wire.contains("held-out/"), "{wire}");
+
+    // A task with no runs and no file: empty, not an error.
+    let none = provider.task_history(&root, "nobody").unwrap();
+    assert!(none.runs.is_empty() && none.checks.is_empty());
+}
+
+/// Append one assistant message carrying `content` to `run_id`'s
+/// transcript under the project's logs.
+fn append_transcript(project: &Project, run_id: &str, content: Value) {
+    let sink = FileTelemetrySink::new(project.paths.logs());
+    let mut record = TelemetryRecord::new(run_id, Utc::now(), "AssistantMessage");
+    record.payload = obj(json!({ "content": content }));
+    record.attempt_number = Some(1);
+    record.iteration_number = Some(1);
+    sink.append_telemetry(&record).unwrap();
+}
+
+#[test]
+fn last_tool_call_of_a_live_run_follows_its_transcript() {
+    let fx = temp_repo();
+    let root = fx.root.clone();
+    let provider = fx.provider();
+    let gamma = |panel: &flywheel_hub::flywheel::FlywheelPanel| {
+        panel
+            .live
+            .iter()
+            .find(|r| r.run_id == "run-gamma")
+            .cloned()
+            .expect("run-gamma is in flight")
+    };
+    // No transcript yet: no tool call, and the panel still reads.
+    let panel = provider.panel(&root);
+    assert_eq!(gamma(&panel).last_tool, None);
+    assert_eq!(panel.problem, None);
+    let before = provider.fingerprint(&root);
+
+    let first = token("first-arg");
+    append_transcript(
+        &fx.project,
+        "run-gamma",
+        json!([
+            {"type": "text", "text": "Listing."},
+            {"type": "tool_use", "name": "Bash", "input": {"command": format!("echo {first}")}},
+        ]),
+    );
+    // The append alone re-reads the panel (the monitor's change check).
+    assert_ne!(provider.fingerprint(&root), before);
+    let call = gamma(&provider.panel(&root))
+        .last_tool
+        .expect("a tool call");
+    assert_eq!(call.tool, "Bash");
+    assert_eq!(call.argument, format!("echo {first}"));
+
+    // A newer call replaces it; plain text after it does not.
+    let second = token("second-arg");
+    append_transcript(
+        &fx.project,
+        "run-gamma",
+        json!([{"type": "tool_use", "name": "Edit", "input": {"file_path": second}}]),
+    );
+    append_transcript(
+        &fx.project,
+        "run-gamma",
+        json!([{"type": "text", "text": "Edited."}]),
+    );
+    let call = gamma(&provider.panel(&root))
+        .last_tool
+        .expect("a tool call");
+    assert_eq!(
+        (call.tool.as_str(), call.argument.as_str()),
+        ("Edit", second.as_str())
+    );
+    // A fresh provider (a restarted hub) finds the same latest call.
+    let fresh = fx.provider();
+    let call = gamma(&fresh.panel(&root)).last_tool.expect("a tool call");
+    assert_eq!(call.argument, second);
+}
+
+#[test]
+fn task_history_route_and_last_tool_call_are_served_by_the_hub() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let project = adopted_repo(&fw_home(&dir), &root);
+    {
+        let store = project.store();
+        for n in 0..13 {
+            seed_failed_run(
+                &store,
+                "beta",
+                &format!("run-beta-{n:02}"),
+                Utc::now() - ChronoDuration::hours(2) + ChronoDuration::minutes(n),
+                &[format!("boom-{n}")],
+            );
+        }
+    }
+    let held_name = token("held-route");
+    let secret = token("route-secret");
+    register_held_out(&project, "beta", &held_name, &secret);
+    let server = start(&dir);
+    let (code, workspace) = http(
+        &server,
+        "POST",
+        "/api/workspaces",
+        Some(json!({ "name": "history", "folders": [{"path": root}] })),
+    );
+    assert_eq!(code, 201, "{workspace}");
+    let folder = root
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('/', "%2F");
+
+    let (code, history) = http(
+        &server,
+        "GET",
+        &format!("/api/flywheel/history?folder={folder}&task=beta"),
+        None,
+    );
+    assert_eq!(code, 200, "{history}");
+    let runs = history["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 14);
+    for n in 0..13 {
+        let run = runs
+            .iter()
+            .find(|r| r["run_id"] == format!("run-beta-{n:02}"))
+            .unwrap();
+        assert_eq!(run["attempts"][0]["error"], format!("boom-{n}"));
+        assert_eq!(run["attempts"][0]["outcome"], "validation_failed");
+    }
+    let text = history.to_string();
+    assert!(text.contains(&held_name), "{text}");
+    assert!(!text.contains(&secret), "{text}");
+
+    let (code, _) = http(
+        &server,
+        "GET",
+        &format!("/api/flywheel/history?folder={folder}&task=-x"),
+        None,
+    );
+    assert_eq!(code, 400);
+    let (code, _) = http(
+        &server,
+        "GET",
+        "/api/flywheel/history?folder=%2Fnowhere&task=beta",
+        None,
+    );
+    assert_eq!(code, 404);
+
+    // A tool call appended to a live run's transcript reaches the panel
+    // well inside 10 seconds.
+    let argument = token("live-arg");
+    let appended = Instant::now();
+    append_transcript(
+        &project,
+        "run-gamma",
+        json!([{"type": "tool_use", "name": "Grep", "input": {"pattern": argument}}]),
+    );
+    let call = wait_for("the tool call on the panel", || {
+        let (code, panel) = http(
+            &server,
+            "GET",
+            &format!("/api/flywheel/panel?folder={folder}"),
+            None,
+        );
+        assert_eq!(code, 200, "{panel}");
+        let live = panel["live"].as_array()?;
+        let run = live.iter().find(|r| r["run_id"] == "run-gamma")?;
+        (run["last_tool"]["argument"] == json!(argument)).then(|| run["last_tool"].clone())
+    });
+    assert_eq!(call["tool"], "Grep");
+    assert!(
+        appended.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        appended.elapsed()
+    );
+}

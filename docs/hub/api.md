@@ -100,8 +100,9 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/fanouts/{id}/cleanup` | `{"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}` |
 | POST | `/api/fanouts/{id}/promote` | `{"task_id"?,"goal"?,...}`, two-step (plan: path, contents); 409 exists / changed |
 | GET | `/api/flywheel` | per adopted folder: counts, `plans`, alerts, live runs, worker |
-| GET | `/api/flywheel/panel?folder=` | the panel (`queued_in`: a scoped worker will run it); 404 not adopted |
+| GET | `/api/flywheel/panel?folder=` | the panel (`queued_in`: a scoped worker will run it, live `last_tool`); 404 not adopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next"}` (poll `since=next`); 503 a read still waits |
+| GET | `/api/flywheel/history?folder=&task=` | all the task's runs, attempts' `outcome`/`error`; `checks` (held-out: names) |
 | GET | `/api/flywheel/task?folder=&task=` | the task as a fan-out seed |
 | POST | `/api/flywheel/tasks` | `{"folder","task_id","goal","phase"?,"prerequisites"?,"checks":[{"run","name"?}]}`, two-step; 400 invalid; peers 403 |
 | GET | `/api/flywheel/autopilot?folder=` | `intake` (+ 20 newest decisions), this hub's autopilot sessions |

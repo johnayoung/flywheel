@@ -166,6 +166,20 @@ pub struct LiveRun {
     pub last_detail: String,
     pub worker_id: Option<String>,
     pub awaiting: Option<String>,
+    /// The most recent tool call in its transcript; `None` before the
+    /// first (or without a transcript).
+    #[serde(default)]
+    pub last_tool: Option<ToolCall>,
+}
+
+/// One tool call from a run's (redacted) transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// The tool's name (`Bash`, `Edit`, ...).
+    pub tool: String,
+    /// Its primary argument (a command, a path, a pattern, ...).
+    pub argument: String,
+    pub ts: DateTime<Utc>,
 }
 
 /// One grader's receipt on a run's latest attempt.
@@ -194,6 +208,62 @@ pub struct RecentRun {
     #[serde(default)]
     pub error: String,
     pub graders: Vec<GraderOutcome>,
+}
+
+/// Every recorded run of one task (newest first), never windowed, and
+/// its checks by name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskHistory {
+    pub task_id: String,
+    pub runs: Vec<TaskRun>,
+    /// Its task file's graders, then its held-out ones (by name only:
+    /// never a held-out command or oracle path); empty when no task file
+    /// defines the id.
+    pub checks: Vec<TaskCheck>,
+    /// Why the checks could not be read (the runs still are).
+    #[serde(default)]
+    pub problem: Option<String>,
+}
+
+/// One run of a task with every attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRun {
+    pub run_id: String,
+    pub status: String,
+    pub started_at: Option<DateTime<Utc>>,
+    /// The latest recorded lifecycle transition.
+    pub updated_at: Option<DateTime<Utc>>,
+    /// The run's error, if any.
+    pub error: String,
+    pub tokens: u64,
+    pub cost_usd: f64,
+    /// In order.
+    pub attempts: Vec<RunAttempt>,
+}
+
+/// One attempt of a run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAttempt {
+    pub number: u32,
+    /// `succeeded`, `failed_validation`, ...; `None` while in flight.
+    pub outcome: Option<String>,
+    pub error: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub tokens: u64,
+    pub cost_usd: f64,
+    /// Its grader receipts.
+    pub graders: Vec<GraderOutcome>,
+}
+
+/// One check of a task, by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCheck {
+    pub name: String,
+    /// `command`, `rubric`, `manual`, `transcript`.
+    pub kind: String,
+    /// From the project's held-out registry.
+    pub held_out: bool,
 }
 
 /// A daemon's liveness, read from what it leaves in the store or on disk.
@@ -513,6 +583,11 @@ pub trait FlywheelProvider: Send + Sync + 'static {
 
     /// A run's output, its transcript from entry `since` on.
     fn run_output(&self, folder: &Path, run_id: &str, since: usize) -> Result<RunOutput, String>;
+
+    /// Every run `folder`'s store records for task `task_id` (newest
+    /// first, never windowed) with each attempt, and the task's checks
+    /// (held-out ones by name only).
+    fn task_history(&self, folder: &Path, task_id: &str) -> Result<TaskHistory, String>;
 
     /// The argv that runs a worker for `folder` (run with `folder` as the
     /// working directory), e.g. `[/path/to/fw, worker]`; restricted to
@@ -1401,6 +1476,7 @@ mod tests {
             last_detail: String::new(),
             worker_id: None,
             awaiting: None,
+            last_tool: None,
         });
         let mut b = a.clone();
         b.generated_at = a.generated_at + chrono::Duration::seconds(30);
@@ -1408,6 +1484,26 @@ mod tests {
         assert!(a.same_content(&b));
         b.live[0].tokens = 11;
         assert!(!a.same_content(&b));
+        // A new tool call is a change worth pushing.
+        let mut c = a.clone();
+        c.live[0].last_tool = Some(ToolCall {
+            tool: "Bash".into(),
+            argument: "ls".into(),
+            ts: a.generated_at,
+        });
+        assert!(!a.same_content(&c));
+    }
+
+    #[test]
+    fn live_runs_read_without_last_tool_call_from_older_answers() {
+        let old = serde_json::json!({
+            "run_id": "r", "task_id": "t", "status": "running", "attempt": 1,
+            "iteration": null, "age_seconds": null, "idle_seconds": null,
+            "tokens": 0, "cost_usd": 0.0, "last_detail": "", "worker_id": null,
+            "awaiting": null,
+        });
+        let run: LiveRun = serde_json::from_value(old).unwrap();
+        assert_eq!(run.last_tool, None);
     }
 
     #[test]

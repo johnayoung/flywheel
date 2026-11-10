@@ -72,16 +72,16 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 A branch with a pull request: a badge on its row (`#7`, checks), a PR section in Review, `fw hub pr SESSION`. All through `gh` (missing or signed out: the section says why).
 
 - **Asked** per (folder, branch) by head (`gh pr list --head B`; branch `123` never binds PR #123), if pushed and not a default branch: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, its own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, stale).
-- **View log**: `gh run view --job J --log-failed`, the last 400 lines, escapes stripped, secrets redacted (Activity's rules, `NAME=value`, `password:`, `--password V`, AWS keys, URL passwords).
+- **View log**: `gh run view --job J --log-failed`, the last 400 lines, escapes stripped, secrets redacted (Activity's rules).
 - **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued (`done`). One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; not re-pasted within 5 min.
 - **Re-run failed** (`gh run rerun R --failed`), **Ready** (`gh pr ready`),
-  **Merge** (`gh pr merge N --<method> --match-head-commit SHA`, the repo's default method): planned, confirmed by fingerprint against GitHub re-read (unreadable: refused). Merge refuses closed, draft, conflicting; checks failing or running, changes requested, review required: only with the number typed back (`--force N`).
+  **Merge** (`gh pr merge N --<method> --match-head-commit SHA`, the repo's default method): planned, fingerprint-checked against a GitHub re-read (unreadable: refused). Merge refuses closed, draft, conflicting; checks failing or running, changes requested, review required: only with the number typed back (`--force N`).
 - **Events** `pr.checks_failed`, `pr.checks_passed` (from running or red), `pr.review_changes_requested`, `pr.merged`; a hub start announces nothing.
 
 ## Handoff and peer review
 
 - **Send to agent** (`fw hub handoff FROM TO`, `handoff.send`): a selection, message, block, or diff to another agent (any workspace or machine) as one editable prompt (32 KiB).
-- **Shell output to agent** (`Alt O`, header **to <agent>** on a shell, the send icon or pane menu on a shell pane, `fw hub handoff SHELL AGENT --output`): the output of the last command typed at the shell's prompt, else its last 200 lines; a companion shell: its own agent.
+- **Shell output to agent** (`Alt O`, a shell's header **to <agent>**, send icon or pane menu, `fw hub handoff SHELL AGENT --output`): the last prompt command's output, else the last 200 lines; a companion shell: its own agent.
 - **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author. Model: `--model` > the author's (same kind) > `agents.<kind>.model`.
 - **Send findings to <author>** pastes the reviewer's latest reply back. Pairing survives restarts; closing the author closes its reviewers.
 
@@ -120,14 +120,14 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 
 ## Flywheel panel
 
-Repos with a project id flywheel knows get the verified loop, read-only (`--no-flywheel`: off); state: `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else the hub's env.
+Repos flywheel knows (project id) get the verified loop, read-only (`--no-flywheel`: off); state: `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else hub env.
 
-- Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
-- **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks to add unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
+- Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs (last tool call), the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's `verified/total` badge, `Alt F`, the palette.
+- **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (offers unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`.
-- Shown (from the ledger): tier verdicts, the newest deciding cycle (emitted, dropped + why), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
-- A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store is made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
-- **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`). No project: no row, none made. Seam: `AuditSink` (`hub_audit.rs`).
+- Shown (ledger): tier verdicts, the newest deciding cycle (emitted, dropped + why), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
+- A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
+- **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`). No project: no row. Seam: `AuditSink` (`hub_audit.rs`).
 
 ## Prompt queue
 

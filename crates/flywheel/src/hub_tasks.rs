@@ -20,10 +20,11 @@ use flywheel_hub::fanout::GraderSpec;
 use flywheel_hub::fanout::promote::{
     SeedContext, TaskDraft, TaskFilePlan, TaskSeed, TaskWritten, protected_in_constraint, slug,
 };
+use flywheel_hub::flywheel::TaskCheck;
 use flywheel_orchestrator::held_out_gate::HeldOutGraderSource;
 use flywheel_orchestrator::sources::{
     DirectoryWorkSource, WorkSource, iter_active_phase_dirs, iter_active_task_files,
-    task_id_defined,
+    phase_task_files, task_id_defined,
 };
 use flywheel_worktree::submitter::protected_path_matches;
 use serde_json::{Map, Value, json};
@@ -475,6 +476,68 @@ fn hub_protect(patterns: &[String]) -> (Vec<String>, Vec<String>) {
         }
     }
     (paths, skipped)
+}
+
+/// The task file defining `task_id` under `tasks_dir`: active phases
+/// first, then archived ones; `None` when no loadable file does.
+fn defined_task(tasks_dir: &Path, task_id: &str) -> Result<Option<Task>, String> {
+    let listing = |e: &dyn std::fmt::Display| format!("listing {}: {e}", tasks_dir.display());
+    let mut files = iter_active_task_files(tasks_dir).map_err(|e| listing(&e))?;
+    let archive = tasks_dir.join("archive");
+    if archive.is_dir() {
+        let mut phases: Vec<PathBuf> = std::fs::read_dir(&archive)
+            .map_err(|e| listing(&e))?
+            .filter_map(Result::ok)
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        phases.sort();
+        for phase in phases {
+            files.extend(phase_task_files(&phase).map_err(|e| listing(&e))?);
+        }
+    }
+    Ok(files
+        .into_iter()
+        .filter_map(|path| load_task_file(&path).ok())
+        .find(|task| task.id == task_id))
+}
+
+/// See `FlywheelProvider::task_history`: task `task_id`'s checks by name,
+/// its task file's graders then its held-out ones (never a held-out
+/// command or oracle path); none when no task file defines it.
+pub(crate) fn task_checks(
+    provider: &HubFlywheel,
+    folder: &Path,
+    task_id: &str,
+) -> Result<Vec<TaskCheck>, String> {
+    let layout = provider.task_layout(folder)?;
+    let Some(task) = defined_task(&layout.tasks_dir, task_id)? else {
+        return Ok(Vec::new());
+    };
+    let mut checks: Vec<TaskCheck> = task
+        .graders
+        .iter()
+        .enumerate()
+        .map(|(i, grader)| TaskCheck {
+            name: grader
+                .name()
+                .map_or_else(|| format!("#{}", i + 1), str::to_owned),
+            kind: grader.grader_type().to_string(),
+            held_out: false,
+        })
+        .collect();
+    let held_out = held_out_graders(&layout, &task)?;
+    checks.extend(held_out.into_iter().enumerate().map(|(i, grader)| {
+        TaskCheck {
+            name: grader
+                .name
+                .unwrap_or_else(|| format!("held-out #{}", i + 1)),
+            kind: "command".to_owned(),
+            held_out: true,
+        }
+    }));
+    Ok(checks)
 }
 
 /// See `FlywheelProvider::task_seed`.

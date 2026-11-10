@@ -19,7 +19,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Projects | `fw project ls [--json]` / `prune` / `relink [PATH]` / `path [FLAG]` | The home's project registry and the cwd project's dirs (see [Projects and the home](#projects-and-the-home)) |
 | Specs | `fw spec ls [--json]` / `export DIR [--force]` | The cwd project's central specs; copy them out (see [Specs](#specs)) |
 | Config | `fw config [--json]` / `fw trust [--revoke]` | The effective config with sources; approve the repo's `.flywheel.toml` (see [Config and trust](#config-and-trust)) |
-| Store | `fw db upgrade [--db PATH]` | Migrate the store in place to this build's schema (see [The store](#the-store)) |
+| Store | `fw db upgrade [--project ID \| --db PATH]`, `fw db status [...] [--json]` | Migrate the store in place to this build's schema (see [The store](#the-store)) |
 | Self-update | `fw self-update [--dry-run] [--json]` | Build a clean, landed flywheel checkout and install the new `fw` / `flywheel` in place (see [`self-update`](#self-update)) |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.
@@ -100,6 +100,8 @@ Every table carries a `project_id` partition column, so one store (one Postgres 
 |---|---|
 | `db upgrade` | Migrate the cwd project's store (sqlite under the project dir, or the configured Postgres DSN) in place: run tables and orchestrator tables, each in one transaction, from any supported older version; existing rows get the project id. Idempotent (a second run, or a store already partitioned whose version row is behind, only fixes the version). Exit 1 on a newer or unrecognized store. |
 | `db upgrade --db PATH` | Upgrade that sqlite file (partition `default`). |
+| `db upgrade --project ID` | Upgrade that known project's store (`fw project ls`), resolved from the home without the cwd; partition `ID`, same result as `fw db upgrade` in its repo. |
+| `db status [--project ID \| --db PATH] [--json]` | Read the store's recorded and this build's target versions; creates and changes nothing. JSON: `{project_id, store:"sqlite"\|"postgres", location, current:{run, orchestrator}\|null, target:{run, orchestrator}}` (`current` null: no store yet; the DSN password prints as `***`). Exit 1 when the store cannot be read or reached. |
 
 Schema versions: run store `schema_version` 15 (v15 added `attempts.stop_reason_json`), orchestrator store `orchestrator_schema_version` 10. Catalog: [persistence-tables.md](persistence-tables.md).
 
@@ -138,7 +140,9 @@ self-update: install ok -- fw and flywheel 0.6.1 (3f2a9c1d0b7e) in /home/me/.car
 self-update: updated
 ```
 
-Status is `ok`, `skipped`, `failed`, `reverted`, or `planned`; a step a refused run never reached is `skipped`. This build performs preflight, build, and install; drain, backup, db-upgrade, hub, and restart report `skipped` (`planned` under `--dry-run`).
+Status is `ok`, `skipped`, `failed`, `reverted`, or `planned`; a step a refused run never reached is `skipped`. This build performs preflight, build, drain, backup, install, and db-upgrade; hub and restart report `skipped` (`planned` under `--dry-run`).
+
+**Stores:** after the build, every project in `fw project ls` is planned through the new build's `fw db status --project ID --json`, so target versions come from the artifact. Refused (exit 3, before any signal): a behind Postgres store without `--upgrade-postgres`, an unreachable Postgres store, a store newer than the build. Backup (after the drain): each behind SQLite store is snapshotted by `VACUUM INTO` (WAL-only commits included) to `$FLYWHEEL_HOME/projects/<id>/backups/<UTC %Y%m%dT%H%M%SZ>-run<N>-orch<M>.sqlite` (pre-upgrade versions; one file, no sidecars; 5 newest kept per project); stores not behind get none. db-upgrade (after the install): the installed `fw db upgrade --project ID` per store, SQLite first; Postgres is upgraded with `backup: null`. A failure from install through db-upgrade restores every changed store from its backup (online-backup API), reinstalls `previous/` and the previous `state.json`, leaves the hub alone, and exits 1 with install and db-upgrade `reverted`. `state.json` also lists the upgraded stores and their backups.
 
 `--json` prints one `{"step","status","detail"}` object per step, then exactly one `{"summary":{...}}` with keys `outcome` (`updated` / `current` / `planned` / `refused` / `failed` / `updated-hub-pending`), `source` (`{kind:"checkout", path, commit}`), `from` / `to` (`{version, commit|null, sha256}`), `drained`, `not_stopped`, `unidentified_claims`, `backups`, `upgraded`, `hub`, `restarted`, `manual`. Build output goes to stderr, so stdout stays JSON Lines.
 

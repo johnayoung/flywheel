@@ -529,6 +529,28 @@ impl PostgresStore {
         })
     }
 
+    /// What each sentinel table in `tables` of `schema` records, read
+    /// without creating or altering anything (no bootstrap, no upgrade).
+    /// Fails like [`connect`](Self::connect) when the server cannot be
+    /// reached; the DSN is never echoed.
+    pub fn recorded_versions(
+        dsn: &str,
+        schema: &str,
+        tables: &[&str],
+    ) -> Result<Vec<Recorded>, StoreError> {
+        let schema = validate_schema(schema).map_err(StoreError::backend)?;
+        let (config, tls) = crate::pg_tls::configure(dsn).map_err(StoreError::backend)?;
+        off_runtime(|| {
+            let mut client = config.connect(tls).map_err(db)?;
+            let recorded = tables
+                .iter()
+                .map(|table| recorded_version(&mut client, schema, table).map_err(db))
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            client.close().map_err(db)?;
+            Ok(recorded)
+        })
+    }
+
     pub fn connect_with(dsn: &str, options: PostgresStoreOptions) -> Result<Self, StoreError> {
         let schema = validate_schema(&options.schema)
             .map_err(StoreError::backend)?

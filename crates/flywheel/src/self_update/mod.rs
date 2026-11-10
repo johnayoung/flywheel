@@ -12,10 +12,19 @@
 //! Drain (after the build, before the install) SIGTERMs this home's
 //! `worker` / `autopilot` / `triage` daemons found from `/proc` and waits
 //! up to `--drain-timeout`; a survivor aborts the run (exit 1) with the
-//! install dir untouched ([`drain`]). Every refusal (exit 3) happens
-//! before anything outside the lock file changes. The backup, db-upgrade,
-//! hub, and restart steps report `skipped` (`planned` under `--dry-run`):
-//! this build does not perform them.
+//! install dir untouched ([`drain`]). Stores ([`stores`]): after the
+//! build and before the drain, every project in `fw project ls` is asked,
+//! through the newly built `fw db status`, whether its store is behind; a
+//! behind Postgres store without `--upgrade-postgres`, an unreachable one,
+//! or one newer than the build refuses the run. Backup (after the drain)
+//! snapshots each behind SQLite store into `projects/<id>/backups/`;
+//! db-upgrade (after the install) runs the installed `fw db upgrade
+//! --project ID` per store. A db-upgrade failure restores every upgraded
+//! store from its backup, puts the previous pair and record back, and
+//! exits 1 with install and db-upgrade `reverted`. Every refusal (exit 3)
+//! happens before anything outside the lock file changes. The hub and
+//! restart steps report `skipped` (`planned` under `--dry-run`): this
+//! build does not perform them.
 //!
 //! Spec: `docs/cli.md` (`self-update`).
 
@@ -24,12 +33,15 @@ pub mod drain;
 pub mod install;
 pub mod output;
 pub mod source;
+pub mod stores;
 
 use flywheel_orchestrator::home::Home;
-use install::{InstallError, Record};
+use install::{InstallError, Record, StoreRecord};
 use output::{BinaryInfo, Outcome, Reporter, SourceInfo, Status, Step, Summary};
+use serde_json::json;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use stores::{Backend, Planned};
 
 pub const SELF_UPDATE_VERB: &str = "self-update";
 
@@ -184,6 +196,14 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
     let detail = format!("fw {version} at {short}");
     reporter.step(Step::Build, Status::Ok, Some(&detail));
 
+    // --- store plan -------------------------------------------------------------
+    // Before any signal: the new build says which stores are behind, and a
+    // store it cannot upgrade safely refuses the run here.
+    let planned = match stores::plan(&home, &artifacts.fw, args.upgrade_postgres) {
+        Ok(planned) => planned,
+        Err(why) => return refuse(reporter, Step::Backup, &why, &summary),
+    };
+
     // --- drain (discovery) -------------------------------------------------------
     // Re-read now: the build took a while and processes come and go.
     let set = match drain::discover(&home) {
@@ -216,10 +236,29 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
             Some(pid) => format!("hub pid {pid} is serving this home"),
             None => "no hub is serving this home".to_owned(),
         };
+        summary.upgraded = planned.iter().map(|p| p.to_json(None)).collect();
+        let to_back_up: Vec<&str> = planned
+            .iter()
+            .filter(|p| matches!(p.backend, Backend::Sqlite(_)))
+            .map(|p| p.project_id.as_str())
+            .collect();
+        let backup_detail = if to_back_up.is_empty() {
+            "no sqlite store is behind the build".to_owned()
+        } else {
+            format!(
+                "would back up the store of {} under projects/<id>/backups/",
+                to_back_up.join(", ")
+            )
+        };
+        let upgrade_detail = if planned.is_empty() {
+            "no store is behind the build".to_owned()
+        } else {
+            format!("would upgrade {}", describe_planned(&planned, None))
+        };
         reporter.step(Step::Drain, Status::Planned, Some(&drain_detail));
-        reporter.step(Step::Backup, Status::Planned, None);
+        reporter.step(Step::Backup, Status::Planned, Some(&backup_detail));
         reporter.step(Step::Install, Status::Planned, Some(&detail));
-        reporter.step(Step::DbUpgrade, Status::Planned, None);
+        reporter.step(Step::DbUpgrade, Status::Planned, Some(&upgrade_detail));
         reporter.step(Step::Hub, Status::Planned, Some(&hub_detail));
         return reporter.finish(Status::Planned, Outcome::Planned, &summary);
     }
@@ -255,7 +294,60 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
     }
     summary.unidentified_claims = drain::live_claims(&home);
 
+    // --- backup ----------------------------------------------------------------
+    // One snapshot per behind SQLite store, after the drain and before any
+    // store changes; `backups[i]` belongs to `planned[i]`.
+    let mut backups: Vec<Option<PathBuf>> = vec![None; planned.len()];
+    for (slot, plan) in backups.iter_mut().zip(&planned) {
+        if !matches!(plan.backend, Backend::Sqlite(_)) {
+            continue;
+        }
+        match stores::backup(&home, plan) {
+            Ok(path) => {
+                summary.backups.push(json!({
+                    "project_id": plan.project_id,
+                    "path": path.display().to_string(),
+                    "run_version": plan.from.run,
+                    "orchestrator_version": plan.from.orchestrator,
+                }));
+                *slot = Some(path);
+            }
+            Err(why) => {
+                let detail = format!("{why}; no store was upgraded and nothing was installed");
+                reporter.step(Step::Backup, Status::Failed, Some(&detail));
+                return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
+            }
+        }
+    }
+    let backed_up: Vec<String> = backups
+        .iter()
+        .flatten()
+        .map(|p| p.display().to_string())
+        .collect();
+    if backed_up.is_empty() {
+        let detail = if planned.is_empty() {
+            "no store is behind the build"
+        } else {
+            "no sqlite store is behind the build"
+        };
+        reporter.step(Step::Backup, Status::Skipped, Some(detail));
+    } else {
+        let detail = format!("wrote {}", backed_up.join(", "));
+        reporter.step(Step::Backup, Status::Ok, Some(&detail));
+    }
+
     // --- install ---------------------------------------------------------------
+    let installed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut new_record = Record {
+        commit: checkout.head.clone(),
+        checkout: checkout.root.clone(),
+        install_dir: install_dir.clone(),
+        version: version.clone(),
+        fw_sha256: fw_sha.clone(),
+        flywheel_sha256: flywheel_sha.clone(),
+        installed_at,
+        stores: Vec::new(),
+    };
     let installed = install::install(
         &home,
         &install_dir,
@@ -269,37 +361,21 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
         ],
     )
     .and_then(|()| {
-        let record = Record {
-            commit: checkout.head.clone(),
-            checkout: checkout.root.clone(),
-            install_dir: install_dir.clone(),
-            version: version.clone(),
-            fw_sha256: fw_sha.clone(),
-            flywheel_sha256: flywheel_sha.clone(),
-            installed_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        };
-        install::write_record(&home, &record)
+        install::write_record(&home, &new_record)
             .map_err(|why| restore_previous(&home, &install_dir, why))
     });
     match installed {
-        Ok(()) => {
-            let detail = format!(
-                "fw and flywheel {version} ({short}) in {}",
-                install_dir.display()
-            );
-            reporter.step(Step::Install, Status::Ok, Some(&detail));
-            reporter.finish(Status::Skipped, Outcome::Updated, &summary)
-        }
+        Ok(()) => {}
         Err(InstallError::Reverted(why)) => {
             summary.to = summary.from.clone();
             let detail = format!("{why}; the previous pair is back in place");
             reporter.step(Step::Install, Status::Reverted, Some(&detail));
-            reporter.finish(Status::Skipped, Outcome::Failed, &summary)
+            return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
         }
         Err(InstallError::NothingChanged(why)) => {
             summary.to = summary.from.clone();
             reporter.step(Step::Install, Status::Failed, Some(&why));
-            reporter.finish(Status::Skipped, Outcome::Failed, &summary)
+            return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
         }
         Err(InstallError::RevertFailed(why)) => {
             let detail = format!(
@@ -307,9 +383,137 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
                 home.self_update_previous_dir().display()
             );
             reporter.step(Step::Install, Status::Failed, Some(&detail));
-            reporter.finish(Status::Skipped, Outcome::Failed, &summary)
+            return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
         }
     }
+    let install_detail = format!(
+        "fw and flywheel {version} ({short}) in {}",
+        install_dir.display()
+    );
+
+    // --- db-upgrade ------------------------------------------------------------
+    // SQLite stores first (each restorable from its backup), Postgres last.
+    let installed_fw = install_dir.join("fw");
+    let mut order: Vec<usize> = (0..planned.len()).collect();
+    order.sort_by_key(|&i| matches!(planned[i].backend, Backend::Postgres(_)));
+    let mut upgraded: Vec<usize> = Vec::new();
+    let mut failure = None;
+    for i in order {
+        match stores::upgrade(&installed_fw, &home, &planned[i]) {
+            Ok(()) => upgraded.push(i),
+            Err(why) => {
+                failure = Some((i, why));
+                break;
+            }
+        }
+    }
+    let Some((failed, why)) = failure else {
+        reporter.step(Step::Install, Status::Ok, Some(&install_detail));
+        summary.upgraded = planned
+            .iter()
+            .zip(&backups)
+            .map(|(plan, backup)| plan.to_json(backup.as_deref()))
+            .collect();
+        if planned.is_empty() {
+            let detail = "no store is behind the build";
+            reporter.step(Step::DbUpgrade, Status::Skipped, Some(detail));
+        } else {
+            new_record.stores = planned
+                .iter()
+                .zip(&backups)
+                .map(|(plan, backup)| StoreRecord {
+                    project_id: plan.project_id.clone(),
+                    store: plan.store_name().to_owned(),
+                    backup: backup.clone(),
+                })
+                .collect();
+            let mut detail = format!("upgraded {}", describe_planned(&planned, Some(&backups)));
+            if let Err(e) = install::write_record(&home, &new_record) {
+                detail.push_str(&format!("; could not record the upgraded stores: {e}"));
+            }
+            reporter.step(Step::DbUpgrade, Status::Ok, Some(&detail));
+        }
+        return reporter.finish(Status::Skipped, Outcome::Updated, &summary);
+    };
+
+    // --- revert ----------------------------------------------------------------
+    // Restore every store this run changed, then the previous pair and
+    // record; the hub is not touched.
+    let mut to_restore = upgraded.clone();
+    if stores::changed(&planned[failed]) {
+        to_restore.push(failed);
+    }
+    let mut restored = Vec::new();
+    let mut still_upgraded = Vec::new();
+    let mut store_errors = Vec::new();
+    for i in to_restore {
+        let plan = &planned[i];
+        let outcome = match &backups[i] {
+            Some(backup) => stores::restore(plan, backup),
+            None => stores::restore(plan, Path::new("")),
+        };
+        match outcome {
+            Ok(()) => restored.push(plan.project_id.clone()),
+            Err(e) => {
+                store_errors.push(e);
+                still_upgraded.push(plan.to_json(backups[i].as_deref()));
+            }
+        }
+    }
+    summary.upgraded = still_upgraded;
+    let binaries = install::restore_previous(&home, &install_dir);
+    let record_back = match record.as_ref() {
+        Some(previous) => install::write_record(&home, previous),
+        None => match std::fs::remove_file(home.self_update_state()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!(
+                "cannot remove {}: {e}",
+                home.self_update_state().display()
+            )),
+            _ => Ok(()),
+        },
+    };
+    match binaries.and(record_back) {
+        Ok(()) => {
+            summary.to = summary.from.clone();
+            let detail = format!("{install_detail}; reverted: the previous pair is back in place");
+            reporter.step(Step::Install, Status::Reverted, Some(&detail));
+        }
+        Err(e) => {
+            let detail = format!(
+                "{install_detail}; revert failed: {e}; restore by hand from {}",
+                home.self_update_previous_dir().display()
+            );
+            reporter.step(Step::Install, Status::Failed, Some(&detail));
+        }
+    }
+    let restored_detail = if restored.is_empty() {
+        "no store had changed".to_owned()
+    } else {
+        format!("restored {} from their backups", restored.join(", "))
+    };
+    if store_errors.is_empty() {
+        let detail = format!("{why}; {restored_detail}");
+        reporter.step(Step::DbUpgrade, Status::Reverted, Some(&detail));
+    } else {
+        let detail = format!("{why}; {restored_detail}; {}", store_errors.join("; "));
+        reporter.step(Step::DbUpgrade, Status::Failed, Some(&detail));
+    }
+    reporter.finish(Status::Skipped, Outcome::Failed, &summary)
+}
+
+/// `<id> (<store> run N -> T, orchestrator M -> U[, backup PATH])`, comma-separated.
+fn describe_planned(planned: &[Planned], backups: Option<&[Option<PathBuf>]>) -> String {
+    planned
+        .iter()
+        .enumerate()
+        .map(
+            |(i, plan)| match backups.and_then(|b| b.get(i)).and_then(Option::as_ref) {
+                Some(backup) => format!("{}, backup {}", plan.describe(), backup.display()),
+                None => plan.describe(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// The preflight / drain refusal while an operator console of this home

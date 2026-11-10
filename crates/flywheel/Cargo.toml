@@ -33,7 +33,8 @@ hex.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tokio.workspace = true
-rusqlite.workspace = true
+# `backup`: the online-backup API self-update restores a store with.
+rusqlite = { workspace = true, features = ["backup"] }
 toml.workspace = true
 clap.workspace = true
 ratatui = "0.29"
@@ -42,6 +43,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+# Seeds and inspects a behind Postgres store in the self-update stores test.
+postgres.workspace = true
 # The hub's events WebSocket in the Flywheel panel's end-to-end test.
 tungstenite = "0.29"
 rusqlite.workspace = true

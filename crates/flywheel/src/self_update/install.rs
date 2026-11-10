@@ -164,6 +164,18 @@ pub struct Record {
     pub fw_sha256: String,
     pub flywheel_sha256: String,
     pub installed_at: String,
+    /// The stores this update upgraded (empty when none was behind).
+    #[serde(default)]
+    pub stores: Vec<StoreRecord>,
+}
+
+/// One store an update upgraded, and the backup taken before it
+/// (`None` for Postgres).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreRecord {
+    pub project_id: String,
+    pub store: String,
+    pub backup: Option<PathBuf>,
 }
 
 /// Read the record; a missing or unreadable record is `None` (the next run
@@ -415,6 +427,11 @@ mod tests {
             fw_sha256: sha256_file(&bin.join("fw")).unwrap(),
             flywheel_sha256: sha256_file(&bin.join("flywheel")).unwrap(),
             installed_at: "2026-11-10T00:00:00Z".into(),
+            stores: vec![StoreRecord {
+                project_id: "p".into(),
+                store: "sqlite".into(),
+                backup: Some(PathBuf::from("/b.sqlite")),
+            }],
         };
         write_record(&home, &record).unwrap();
         assert_eq!(read_record(&home).as_ref(), Some(&record));

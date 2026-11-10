@@ -786,3 +786,174 @@ pub fn worker_under(wrapper: u32) -> u32 {
         },
     )
 }
+
+// --- project stores the stores tests seed and inspect -------------------------
+
+/// `fw args...` in `cwd`, confined to `home` / `flywheel_home`.
+pub fn fw_confined(cwd: &Path, home: &Path, flywheel_home: &Path, args: &[&str]) -> Output {
+    let mut command = Command::new(fw_under_test());
+    command
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    confine(&mut command, home, flywheel_home, &[]);
+    command.output().unwrap()
+}
+
+/// The project id a project dir is named by.
+pub fn project_id_of(project_dir: &Path) -> String {
+    project_dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Build `db` from the frozen previous-version DDL (run store v14,
+/// orchestrator store v9, both WAL) with rows in both halves: run rows in
+/// partition `project_id` (v14 is already partitioned), orchestrator rows
+/// unkeyed (v9 predates the partition, so the upgrade assigns it).
+pub fn seed_behind_store(db: &Path, project_id: &str) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute_batch(include_str!(
+        "../../../flywheel-core/tests/fixtures/persistence-schema-v14.sql"
+    ))
+    .unwrap();
+    conn.execute_batch(include_str!(
+        "../../../flywheel-orchestrator/tests/fixtures/orchestrator-schema-v9.sql"
+    ))
+    .unwrap();
+    let keyed = "INSERT INTO tasks (project_id, id, first_seen_at, updated_at)
+           VALUES (?1, 'legacy', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+         INSERT INTO task_versions
+           (project_id, task_id, content_hash, goal, graders_json, tags_json, context_json,
+            created_at)
+           VALUES (?1, 'legacy', 'h-legacy', 'Goal legacy.',
+                   '[{\"type\": \"command\", \"run\": \"true\"}]', '[]', 'null',
+                   '2026-01-01T00:00:00+00:00');
+         INSERT INTO lifecycles
+           (project_id, run_id, task_id, status, version, retries, timestamps_json,
+            updated_at, task_content_hash, source)
+           VALUES (?1, 'run-legacy', 'legacy', 'failed', 3, 0, '{}',
+                   '2026-01-01T00:00:00+00:00', 'h-legacy', '')";
+    for statement in keyed.split(';').filter(|s| !s.trim().is_empty()) {
+        conn.execute(statement, [project_id]).unwrap();
+    }
+    conn.execute_batch(
+        "INSERT INTO task_claims (task_id, worker_id, claimed_at, lease_expires_at, version, \
+           conflict_keys_json) VALUES ('t1', 'w1', '2026-05-28T12:00:00+00:00', \
+           '2026-05-28T12:00:30+00:00', 2, '[\"k\"]');
+         INSERT INTO orchestrator_events (task_id, worker_id, event_type, version, \
+           lease_expires_at, occurred_at) VALUES ('t1', 'w1', 'acquired', 1, \
+           '2026-05-28T12:00:30+00:00', '2026-05-28T12:00:00+00:00');
+         INSERT INTO work_items (task_id, first_seen_at, last_seen_at) VALUES ('t1', \
+           '2026-05-28T12:00:00+00:00', '2026-05-28T12:00:00+00:00');",
+    )
+    .unwrap();
+    conn.close().unwrap();
+}
+
+fn open_read_only(db: &Path) -> rusqlite::Connection {
+    rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+}
+
+/// `(run, orchestrator)` schema versions `db` records.
+pub fn store_versions(db: &Path) -> (Option<i64>, Option<i64>) {
+    let conn = open_read_only(db);
+    let read = |table: &str| match conn.query_row(
+        &format!("SELECT version FROM {table} WHERE id = 1"),
+        [],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(v) => Some(v),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) if e.to_string().contains("no such table") => None,
+        Err(e) => panic!("cannot read {table} of {}: {e}", db.display()),
+    };
+    (read("schema_version"), read("orchestrator_schema_version"))
+}
+
+/// A `.dump`-equivalent of `db`, read through its own connection: every
+/// schema object's SQL, then every table's rows (sorted), so two stores
+/// with equal content dump equal.
+pub fn store_dump(db: &Path) -> String {
+    let conn = open_read_only(db);
+    let mut out = String::new();
+    let objects: Vec<(String, String, Option<String>)> = conn
+        .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for (kind, name, sql) in &objects {
+        out.push_str(&format!(
+            "{kind} {name}: {}\n",
+            sql.as_deref().unwrap_or("")
+        ));
+    }
+    for (kind, name, _) in &objects {
+        if kind != "table" {
+            continue;
+        }
+        let mut statement = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+        let width = statement.column_count();
+        let mut rows: Vec<String> = statement
+            .query_map([], |r| {
+                (0..width)
+                    .map(|i| {
+                        r.get::<_, rusqlite::types::Value>(i)
+                            .map(|v| format!("{v:?}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|cells| cells.join("|"))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        rows.sort();
+        for row in rows {
+            out.push_str(&format!("{name}: {row}\n"));
+        }
+    }
+    out
+}
+
+/// Every `(table, project_id)` value of the tables that carry the column.
+pub fn partition_values(db: &Path) -> Vec<(String, String)> {
+    let conn = open_read_only(db);
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut out = Vec::new();
+    for table in tables {
+        let has_column: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('{table}') \
+                     WHERE name = 'project_id')"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if !has_column {
+            continue;
+        }
+        let values: Vec<String> = conn
+            .prepare(&format!("SELECT project_id FROM \"{table}\""))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        out.extend(values.into_iter().map(|v| (table.clone(), v)));
+    }
+    out
+}

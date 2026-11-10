@@ -36,7 +36,9 @@ window.FwHubBoard = function (ctx) {
   };
   // A run that has not started yet (pending, ready) still waits in Queued.
   const RUN_LANE = { validating: "checking", pending: "queued", ready: "queued" };
-  const laneOf = (light, status) => (light === "running" ? RUN_LANE[status] || "running" : LANE_OF[light] || "queued");
+  // An interrupted run waits for a person to release it, so it needs you;
+  // the panel's light calls it blocked, the same as an unmet prerequisite.
+  const laneOf = (light, status) => (status === "interrupted" ? "needs" : light === "running" ? RUN_LANE[status] || "running" : LANE_OF[light] || "queued");
 
   const views = new Map(); // board tab id -> { plan: { key, name } | null }
   const panels = new Map(); // folder key -> { panel, error, seq, loading }

@@ -852,8 +852,14 @@ fn fold_plans(
                     .get(task.as_str())
                     .copied()
                     .unwrap_or_else(|| unlisted_light(task_runs));
+                // An interrupted run waits for a person to release it: it needs
+                // someone, even though the panel's light reads it as blocked.
+                let interrupted = task_runs
+                    .first()
+                    .is_some_and(|lc| lc.status == Status::Interrupted);
                 match light {
                     TaskLight::Failed | TaskLight::Parked | TaskLight::Awaiting => out.needs += 1,
+                    _ if interrupted => out.needs += 1,
                     TaskLight::Running => out.running += 1,
                     _ => {}
                 }
@@ -1858,6 +1864,31 @@ mod tests {
             archived,
             tasks: tasks.iter().map(|t| (*t).to_owned()).collect(),
         }
+    }
+
+    #[test]
+    fn portfolio_counts_an_interrupted_run_as_needing_someone() {
+        let now = Utc::now();
+        // The panel's light calls an interrupted run blocked, like an unmet
+        // prerequisite; only the interrupted one waits for a person.
+        let lifecycles = vec![run("held", "r-held", Status::Interrupted, now, &[0.5])];
+        let lights: HashMap<&str, TaskLight> = [
+            ("held", TaskLight::Blocked),
+            ("waiting", TaskLight::Blocked),
+        ]
+        .into();
+        let plans = fold_plans(
+            vec![files("01-plan", false, &["held", "waiting"])],
+            &lifecycles,
+            &lights,
+            now,
+        );
+        assert_eq!(
+            plans[0].needs, 1,
+            "interrupted needs someone; prerequisite-blocked does not"
+        );
+        let held = plans[0].tasks.iter().find(|t| t.id == "held").unwrap();
+        assert_eq!(held.status.as_deref(), Some("interrupted"));
     }
 
     #[test]

@@ -132,11 +132,21 @@ fn path_with_bin(dir: &Path) -> String {
 }
 
 fn start(dir: &Path) -> Server {
+    start_in(dir, Some(&dir.join("state")))
+}
+
+/// [`start`] with state dir `state` (`None`: the default,
+/// `$FLYWHEEL_HOME/hub`).
+fn start_in(dir: &Path, state: Option<&Path>) -> Server {
     let home = dir.join("home");
     std::fs::create_dir_all(&home).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_fw"))
-        .args(["hub", "serve", "--port", "0", "--state-dir"])
-        .arg(dir.join("state"))
+    let state_dir = state.map_or_else(|| flywheel_home(dir).join("hub"), Path::to_path_buf);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fw"));
+    command.args(["hub", "serve", "--port", "0"]);
+    if let Some(state) = state {
+        command.arg("--state-dir").arg(state);
+    }
+    let mut child = command
         .env("PATH", path_with_bin(dir))
         .env("SHELL", "/bin/sh")
         .env("HOME", &home)
@@ -156,7 +166,7 @@ fn start(dir: &Path) -> Server {
         .and_then(|p| p.trim().parse().ok())
         .unwrap_or_else(|| panic!("unexpected banner {first:?}"));
     std::thread::spawn(move || for _ in lines {});
-    let token = std::fs::read_to_string(dir.join("state/token"))
+    let token = std::fs::read_to_string(state_dir.join("token"))
         .unwrap()
         .trim()
         .to_owned();
@@ -899,4 +909,142 @@ fn a_deny_carries_feedback_and_binds_to_the_parked_gate() {
     assert_eq!(view.state.as_str(), "absent");
     assert_eq!(view.gates.len(), 0, "the gated task is not listed");
     assert!(provider.set_autopilot_paused(&root, false).unwrap());
+}
+
+/// The sessions the hub at `server` has.
+fn session_count(server: &Server) -> usize {
+    let (code, list) = http(server, "GET", "/api/sessions", None);
+    assert_eq!(code, 200, "{list}");
+    list["sessions"].as_array().unwrap().len()
+}
+
+/// The argv of `fw worker` in a worker session's command (after the
+/// wrapper's marker).
+fn worker_argv(session: &Value) -> Vec<String> {
+    let command: Vec<String> = session["command"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no command in {session}"))
+        .iter()
+        .map(|a| a.as_str().unwrap().to_owned())
+        .collect();
+    let at = command.iter().position(|a| a == "fw-worker").unwrap();
+    command[at + 1..].to_vec()
+}
+
+/// A hub on the default state dir with account `work`, and an adopted
+/// repo in one of its workspaces: `(server, repo, workspace id)`.
+fn account_hub(dir: &Path, state: Option<&Path>) -> (Server, PathBuf, String) {
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write_script(&dir.join("bin/claude"), FAKE_CLAUDE);
+    let root = dir.join("repo");
+    adopted_repo(&root, &flywheel_home(dir));
+    let server = start_in(dir, state);
+    let (code, added) = http(
+        &server,
+        "POST",
+        "/api/claude-accounts",
+        Some(json!({ "name": "work", "token": ACCOUNT_TOKEN })),
+    );
+    assert_eq!(code, 201, "{added}");
+    let (code, workspace) = http(
+        &server,
+        "POST",
+        "/api/workspaces",
+        Some(json!({ "name": "acct", "folders": [{"path": root}] })),
+    );
+    assert_eq!(code, 201, "{workspace}");
+    let id = workspace["id"].as_str().unwrap().to_owned();
+    wait_for("the monitor to watch the folder", || {
+        let (_, list) = http(&server, "GET", "/api/flywheel", None);
+        (list["folders"][0]["folder"] == json!(root)).then_some(())
+    });
+    (server, root, id)
+}
+
+const ACCOUNT_TOKEN: &str = "sk-ant-oat01-hub-worker-account-secret";
+
+#[test]
+fn hub_worker_account_starts_fw_worker_under_the_named_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let (server, root, workspace_id) = account_hub(&dir, None);
+    let start = |body: Value| http(&server, "POST", "/api/flywheel/worker", Some(body));
+
+    // Refused before anything is created: an unknown account, a name no
+    // account can have.
+    let before = session_count(&server);
+    for bad in ["nope", "Not A Name", "--once"] {
+        let (code, refused) = start(json!({
+            "folder": root, "workspace_id": workspace_id, "account": bad,
+        }));
+        assert_eq!(code, 400, "{bad:?}: {refused}");
+        assert!(refused["error"].is_string(), "{refused}");
+        assert_eq!(session_count(&server), before, "{bad:?} created a session");
+    }
+
+    // A known account: `fw worker --account work`, the name only.
+    let (code, worker) = start(json!({
+        "folder": root, "workspace_id": workspace_id, "account": "work", "tasks": ["t-1"],
+    }));
+    assert_eq!(code, 201, "{worker}");
+    assert_eq!(session_count(&server), before + 1);
+    let argv = worker_argv(&worker);
+    assert_eq!(
+        argv[1..],
+        ["worker", "--task=t-1", "--account", "work"],
+        "{argv:?}"
+    );
+    assert!(!worker.to_string().contains(ACCOUNT_TOKEN), "{worker}");
+    let (_, sessions) = http(&server, "GET", "/api/sessions", None);
+    assert!(!sessions.to_string().contains(ACCOUNT_TOKEN));
+    let (_, panel) = http(
+        &server,
+        "GET",
+        &format!("/api/flywheel/panel?folder={}", query(&root)),
+        None,
+    );
+    assert!(!panel.to_string().contains(ACCOUNT_TOKEN));
+
+    // No account (or an empty one): exactly today's worker.
+    for body in [
+        json!({ "folder": root, "workspace_id": workspace_id, "another": true }),
+        json!({ "folder": root, "workspace_id": workspace_id, "another": true, "account": " " }),
+    ] {
+        let (code, plain) = start(body);
+        assert_eq!(code, 201, "{plain}");
+        assert_eq!(worker_argv(&plain)[1..], ["worker"]);
+    }
+}
+
+#[test]
+fn hub_worker_account_refused_off_the_default_state_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let state = dir.join("state");
+    let (server, root, workspace_id) = account_hub(&dir, Some(&state));
+    let before = session_count(&server);
+    let (code, refused) = http(
+        &server,
+        "POST",
+        "/api/flywheel/worker",
+        Some(json!({ "folder": root, "workspace_id": workspace_id, "account": "work" })),
+    );
+    assert_eq!(code, 400, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("FLYWHEEL_HOME/hub"),
+        "{refused}"
+    );
+    assert_eq!(session_count(&server), before);
+    // Without an account the same hub still starts one.
+    let (code, worker) = http(
+        &server,
+        "POST",
+        "/api/flywheel/worker",
+        Some(json!({ "folder": root, "workspace_id": workspace_id })),
+    );
+    assert_eq!(code, 201, "{worker}");
+    assert_eq!(worker_argv(&worker)[1..], ["worker"]);
 }

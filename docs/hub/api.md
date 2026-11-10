@@ -115,7 +115,7 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/flywheel/steer/interrupt` | `{"folder","run"}`: as `say`, for `fw interrupt` |
 | POST | `/api/flywheel/pauses/clear` | `{"folder","ids"?\|"account"?\|"all"?,"reason"}` -> `{"cleared":[id]}`, via `hub`; 400 empty reason; 409 no match |
 | POST | `/api/flywheel/reland` | `{"folder","task","workspace_id"?,"cols"?,"rows"?}` -> 201 the `fw reland <task>` session; 409 nothing to re-land / running; 404 unknown task |
-| POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"cols"?,"rows"?}` -> 201 the `fw worker` session; 409 running, unless `another` |
+| POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"account"?,"cols"?,"rows"?}` -> 201 the `fw worker [--account A]` session; 409 running, unless `another`; 400 unknown account, `--state-dir` hub |
 
 Fan-outs off: 503.
 

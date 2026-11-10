@@ -1283,11 +1283,14 @@ pub const WORKER_SESSION_NAME: &str = "fw worker";
 
 /// Which tasks a started worker runs: empty `tasks` drains the whole
 /// queue (`fw worker`); else only those (`fw worker --task ID ...`),
-/// plus their not-done prerequisites with `with_prereqs`.
+/// plus their not-done prerequisites with `with_prereqs`. `account`
+/// names the Claude account its agents run under (`--account NAME`; the
+/// worker reads the token itself, never from argv or the environment).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkerScope {
     pub tasks: Vec<String>,
     pub with_prereqs: bool,
+    pub account: Option<String>,
 }
 
 impl WorkerScope {
@@ -1324,7 +1327,17 @@ impl WorkerScope {
         Ok(Self {
             tasks: unique,
             with_prereqs,
+            account: None,
         })
+    }
+
+    /// This scope run under Claude account `account` (a name
+    /// [`crate::accounts::validate_name`] accepts; the caller checks it
+    /// exists).
+    pub fn with_account(mut self, account: &str) -> Result<Self, String> {
+        crate::accounts::validate_name(account).map_err(|e| e.to_string())?;
+        self.account = Some(account.to_owned());
+        Ok(self)
     }
 
     /// The `fw worker` flags for this scope (the `=` spelling, so an id
@@ -1333,6 +1346,9 @@ impl WorkerScope {
         let mut flags: Vec<String> = self.tasks.iter().map(|t| format!("--task={t}")).collect();
         if self.with_prereqs {
             flags.push("--with-prereqs".to_owned());
+        }
+        if let Some(account) = &self.account {
+            flags.extend(["--account".to_owned(), account.clone()]);
         }
         flags
     }
@@ -1343,13 +1359,16 @@ impl WorkerScope {
     pub fn of_command(command: &[String]) -> Option<Self> {
         let at = command.iter().position(|a| a == WORKER_MARKER)?;
         let mut scope = Self::default();
-        for arg in &command[at + 1..] {
+        let mut args = command[at + 1..].iter();
+        while let Some(arg) = args.next() {
             if let Some(id) = arg.strip_prefix("--task=") {
                 if !scope.tasks.iter().any(|t| t == id) {
                     scope.tasks.push(id.to_owned());
                 }
             } else if arg == "--with-prereqs" {
                 scope.with_prereqs = true;
+            } else if arg == "--account" {
+                scope.account = args.next().cloned();
             }
         }
         (!scope.tasks.is_empty()).then_some(scope)
@@ -1798,6 +1817,27 @@ mod tests {
             worker_session_name(&long, []),
             "fw worker task-0, task-1, task-2, task-3, task-..."
         );
+    }
+
+    #[test]
+    fn hub_worker_account_spells_the_flag_and_reads_it_back() {
+        let scoped = WorkerScope::new(vec!["d".into()], false)
+            .unwrap()
+            .with_account("work")
+            .unwrap();
+        assert_eq!(scoped.flags(), ["--task=d", "--account", "work"]);
+        let argv = worker_session_command(
+            &["/bin/fw".to_owned(), "worker".to_owned()]
+                .into_iter()
+                .chain(scoped.flags())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(WorkerScope::of_command(&argv), Some(scoped));
+        let all = WorkerScope::default().with_account("me_2").unwrap();
+        assert_eq!(all.flags(), ["--account", "me_2"]);
+        for bad in ["", "-x", "Work", "a b", "--once"] {
+            assert!(WorkerScope::default().with_account(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

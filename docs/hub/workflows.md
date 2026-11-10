@@ -115,16 +115,16 @@ fw hub fanout promote "$id" --reference c1 --yes  # writes <project>/tasks/activ
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote** (not pick) to land via `fw worker` (refused after a pick): goal (`--goal`, seed task's, else prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
-- **Fan out this task** (Flywheel panel): prompt = its goal and context; graders = its command plus **held-out** graders, added server-side (none/unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
+- **Promote** to land via `fw worker` (refused after a pick): goal (`--goal`, seed task's, else prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
+- **Fan out this task** (Flywheel panel): prompt = its goal, context; graders = its command plus **held-out** graders, added server-side (none/unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
 
 Repos flywheel knows (project id) get the verified loop, read-only (`--no-flywheel`: off); state: `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else hub env.
 
-- Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs (last tool call), 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's `verified/total` badge, `Alt F`, the palette.
-- **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (offers unmet prerequisites); a second asks (409); `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted live transcript; message, interrupt (confirmed).
-- **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) = `fw autopilot` in a session; stop = Ctrl-C; pause / resume = its `--pause|--resume`.
+- Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs (last tool call), 12 newest runs + grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's `verified/total` badge, `Alt F`, palette.
+- **Start worker here**: `fw worker` in a split; a task's **run**: `fw worker --task <id>` (offers unmet prereqs); a second asks (409); `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted live transcript; message, interrupt (confirmed).
+- **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) = `fw autopilot` in a session; stop = Ctrl-C; pause/resume = its `--pause|--resume`.
 - Shown (ledger): tier verdicts, newest deciding cycle (emitted, dropped + why), 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row.
 - A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. Per-folder watcher (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
 - **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`), if any. Seam: `AuditSink` (`hub_audit.rs`).

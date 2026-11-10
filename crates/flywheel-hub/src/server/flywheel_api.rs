@@ -9,8 +9,9 @@
 //!   task `T` (never windowed) with each attempt's outcome and error, and
 //!   its checks (held-out ones by name only);
 //! * `POST /api/flywheel/worker {"folder", "workspace_id"?, "another"?,
-//!   "tasks"?, "with_prereqs"?, "cols"?, "rows"?}` -- start `fw worker`
-//!   (`fw worker --task ID ...` when `tasks` names any) in a new hub shell
+//!   "tasks"?, "with_prereqs"?, "account"?, "cols"?, "rows"?}` -- start `fw worker`
+//!   (`fw worker --task ID ...` when `tasks` names any, `--account NAME`
+//!   with `account`: 400 unknown, or off the default state dir) in a new hub shell
 //!   session there; 409 (with the running session) while a worker this
 //!   hub started still runs in the folder, unless `another` is true;
 //! * `POST /api/flywheel/reland {"folder", "task", "workspace_id"?,
@@ -339,8 +340,35 @@ pub(super) struct WorkerRequest {
     /// With `tasks`: also run their not-done prerequisites, first.
     #[serde(default)]
     with_prereqs: bool,
+    /// Run the worker's agents under this Claude account (`fw worker
+    /// --account NAME`); absent or empty is the CLI's own login.
+    account: Option<String>,
     cols: Option<u16>,
     rows: Option<u16>,
+}
+
+/// Why a worker start under `account` is refused (400), or `None`: the
+/// name must be valid and have a token, and the hub's state dir must be
+/// the home default, the only accounts dir `fw worker` reads.
+fn account_refusal(state_dir: &std::path::Path, account: &str) -> Option<String> {
+    if let Err(e) = crate::accounts::validate_name(account) {
+        return Some(e.to_string());
+    }
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
+    };
+    match crate::paths::default_state_dir() {
+        Some(home) if same(state_dir, &home) => {}
+        _ => {
+            return Some(format!(
+                "this hub's state dir {} is not $FLYWHEEL_HOME/hub, where `fw worker \
+                 --account` reads accounts; start the hub without --state-dir",
+                state_dir.display()
+            ));
+        }
+    }
+    (!crate::accounts::exists(state_dir, account))
+        .then(|| format!("no Claude account {account:?} (`fw hub account ls` lists them)"))
 }
 
 /// Why a worker start did not create a session.
@@ -357,10 +385,27 @@ pub(super) async fn start_worker(
         Ok(m) => m,
         Err(refusal) => return refusal.into_response(),
     };
-    let scope = match WorkerScope::new(std::mem::take(&mut request.tasks), request.with_prereqs) {
+    let mut scope = match WorkerScope::new(std::mem::take(&mut request.tasks), request.with_prereqs)
+    {
         Ok(scope) => scope,
         Err(why) => return error_response(StatusCode::BAD_REQUEST, &why),
     };
+    if let Some(account) = request.account.as_deref().map(str::trim)
+        && !account.is_empty()
+    {
+        let state_dir = app.hub.state_dir().to_path_buf();
+        let name = account.to_owned();
+        let refused = tokio::task::spawn_blocking(move || account_refusal(&state_dir, &name))
+            .await
+            .unwrap_or_else(|join| Some(format!("checking the account failed: {join}")));
+        if let Some(why) = refused {
+            return error_response(StatusCode::BAD_REQUEST, &why);
+        }
+        scope = match scope.with_account(account) {
+            Ok(scope) => scope,
+            Err(why) => return error_response(StatusCode::BAD_REQUEST, &why),
+        };
+    }
     let (path, workspaces) = match adopted_folder(&app, &monitor, request.folder).await {
         Ok(found) => found,
         Err(refusal) => return refusal.into_response(),

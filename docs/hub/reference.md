@@ -417,7 +417,7 @@ Also: `F2` / double-click renames and `Delete` closes a focused sidebar row.
 | `FLYWHEEL_PG_DSN`, `DATABASE_URL` | the Flywheel panel's Postgres DSN |
 | `BROWSER` | `fw hub open`'s opener |
 | `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | transcripts / rollouts (default `~/.claude`, `~/.codex`) |
-| set in sessions | `FLYWHEEL_HUB_SESSION`, `FLYWHEEL_HUB_WORKSPACE`, `TERM=xterm-256color`; agents `FLYWHEEL_HUB_REPORT_SOCKET`, `FLYWHEEL_HUB_REPORT_SECRET`; a Claude session with an account `CLAUDE_CODE_OAUTH_TOKEN` (and no `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`, which outrank it) |
+| set in sessions | `FLYWHEEL_HUB_SESSION`, `FLYWHEEL_HUB_WORKSPACE`, `TERM=xterm-256color`; agents `FLYWHEEL_HUB_REPORT_SOCKET`, `FLYWHEEL_HUB_REPORT_SECRET`; a Claude session with an account `CLAUDE_CODE_OAUTH_TOKEN`, minus the outranking `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` |
 
 ## State dir
 

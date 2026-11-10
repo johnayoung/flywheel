@@ -119,9 +119,9 @@
 .fwb-card-top .fw-dot { position: relative; top: -.05rem; }
 .fwb-card-id { min-width: 0; overflow-wrap: anywhere; color: var(--ink); font-weight: 600; line-height: 1.3; }
 .fwb-card-age { margin-left: auto; flex: none; color: var(--ink-3); font-size: 10px; font-variant-numeric: tabular-nums; }
-.fwb-card-why { display: flex; align-items: baseline; gap: .45rem; min-width: 0; }
+.fwb-card-why { display: flex; flex-wrap: wrap; align-items: baseline; gap: .2rem .45rem; min-width: 0; }
 .fwb-card-why .fw-light { flex: none; }
-.fwb-card-why b { min-width: 0; color: var(--tone); font-size: 10.5px; font-weight: 600; line-height: 1.35; }
+.fwb-card-why b { min-width: 0; overflow-wrap: anywhere; color: var(--tone); font-size: 10.5px; font-weight: 600; line-height: 1.35; }
 .fwb-card-error { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; color: var(--ink-2); font: 400 10.5px/1.45 var(--term); }
 .fwb-card-now { display: flex; align-items: baseline; gap: .45rem; min-width: 0; }
 .fwb-card-tool { flex: none; color: var(--signal); font-size: 9.5px; font-weight: 600; letter-spacing: .06em; }

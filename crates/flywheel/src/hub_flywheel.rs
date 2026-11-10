@@ -1975,6 +1975,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_live_run_s_last_tool_comes_from_its_normalized_transcript() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = run_file_path(tmp.path(), "run-1");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let line = |kind: &str, payload: serde_json::Value| {
+            let record = serde_json::json!({
+                "kind": kind,
+                "ts": "2026-11-10T15:30:34.247779+00:00",
+                "run_id": "run-1",
+                "attempt_number": 1,
+                "iteration_number": 1,
+                "payload": {"type": kind, "payload": payload, "source": "claude-code"},
+            });
+            format!("{record}\n")
+        };
+        let mut transcript = line(
+            "tool.started",
+            serde_json::json!({"tool_use_id": "t1", "tool_name": "Read", "tool_input": {"file_path": "/a.rs"}}),
+        );
+        transcript.push_str(&line(
+            "tool.finished",
+            serde_json::json!({"tool_use_id": "t1", "is_error": false, "content": "fn a() {}"}),
+        ));
+        transcript.push_str(&line(
+            "tool.started",
+            serde_json::json!({"tool_use_id": "t2", "tool_name": "Bash", "tool_input": {"command": "cargo test"}}),
+        ));
+        transcript.push_str(&line(
+            "context.usage",
+            serde_json::json!({"usage": {"input_tokens": 2}}),
+        ));
+        std::fs::write(&file, transcript).unwrap();
+        let mut tail = ToolTail::new(file.clone(), "run-1");
+        let last = tail
+            .pull()
+            .expect("a normalized tool.started is a tool call");
+        assert_eq!(
+            (last.tool.as_str(), last.argument.as_str()),
+            ("Bash", "cargo test")
+        );
+        // Nothing new: the last call seen is kept.
+        let again = tail.pull().unwrap();
+        assert_eq!(again.tool, "Bash");
+    }
+
     /// An in-memory store holding one run of `task-a` through `path`.
     fn store_with_run(run_id: &str, path: &[Status]) -> InMemoryStore {
         let store = InMemoryStore::new();

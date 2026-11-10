@@ -691,6 +691,234 @@ fn classify_result(record: &SdkMessageRecord, sequence: u64) -> Vec<TranscriptEn
     )]
 }
 
+// --- Normalized agent-event classification --------------------------------------
+
+/// Normalized event kinds that render nothing: per-turn token counters and
+/// streaming deltas the full message supersedes (the raw stream-json path
+/// never rendered either).
+const SILENT_NORMALIZED_KINDS: [&str; 2] = ["context.usage", "message.assistant.delta"];
+
+/// The remaining normalized event kinds (see `flywheel_agents::EventType`),
+/// rendered as a `kind` header over a capped payload digest.
+const OTHER_NORMALIZED_KINDS: [&str; 8] = [
+    "tool.updated",
+    "file.changed",
+    "command.started",
+    "command.finished",
+    "plan.updated",
+    "approval.requested",
+    "approval.resolved",
+    "mode.changed",
+];
+
+/// Raw CLI line types that are progress / streaming keep-alives.
+const NOISE_RAW_TYPES: [&str; 2] = ["tool_progress", "stream_event"];
+
+/// Raw CLI `system` subtypes that are keep-alive counters.
+const NOISE_RAW_SYSTEM_SUBTYPES: [&str; 1] = ["thinking_tokens"];
+
+/// `record` re-typed as a legacy SDK message carrying `payload`, so a
+/// normalized or raw record reuses the stream-json classifiers verbatim.
+fn retyped(record: &SdkMessageRecord, message_type: &str, payload: JsonObject) -> SdkMessageRecord {
+    SdkMessageRecord {
+        message_type: message_type.to_owned(),
+        payload,
+        ..record.clone()
+    }
+}
+
+/// A content block of type `kind` carrying the `(block key, payload key)`
+/// fields of `inner` that are present.
+fn block_from(kind: &str, fields: &[(&str, &str)], inner: &JsonObject) -> JsonObject {
+    let mut block = JsonObject::new();
+    block.insert("type".to_owned(), Value::String(kind.to_owned()));
+    for (to, from) in fields {
+        if let Some(value) = inner.get(*from) {
+            block.insert((*to).to_owned(), value.clone());
+        }
+    }
+    block
+}
+
+fn system_entry(
+    record: &SdkMessageRecord,
+    sequence: u64,
+    header: impl Into<String>,
+    body: impl Into<String>,
+) -> Vec<TranscriptEntry> {
+    vec![entry(
+        record.ts,
+        sequence,
+        0,
+        EntryKind::System,
+        header,
+        body,
+        Some(record.attempt_number),
+        Some(record.iteration_number),
+    )]
+}
+
+/// Render one record of the `flywheel-agents` normalized stream
+/// (`{"type": <kind>, "payload": {...}, "source": ...}` under the record's
+/// payload), or `None` when `message_type` is not a normalized kind.
+///
+/// Agent turns funnel through the stream-json block classifiers so a
+/// normalized run renders exactly like a raw one: `tool.started` as a
+/// `tool_use` block, `tool.finished` as a `tool_result` block,
+/// `message.assistant` / `message.user` as text blocks, `thought` as a
+/// thinking block (empty thinking is suppressed). `session.finished` is the
+/// result line, `raw` unwraps its original CLI line, counters and deltas
+/// render nothing, and the rest render one compact system line.
+fn classify_normalized(record: &SdkMessageRecord, sequence: u64) -> Option<Vec<TranscriptEntry>> {
+    let kind = record.message_type.as_str();
+    let inner = match record.payload.get("payload") {
+        Some(Value::Object(map)) => map.clone(),
+        _ => JsonObject::new(),
+    };
+    let field = |key: &str| inner.get(key).map_or_else(|| "?".to_owned(), value_to_text);
+    let entries = match kind {
+        "tool.started" => {
+            let block = block_from(
+                "tool_use",
+                &[("name", "tool_name"), ("input", "tool_input")],
+                &inner,
+            );
+            classify_assistant_block(record, sequence, 0, &Value::Object(block))
+                .into_iter()
+                .collect()
+        }
+        "tool.finished" => {
+            let mut block = block_from(
+                "tool_result",
+                &[("content", "content"), ("is_error", "is_error")],
+                &inner,
+            );
+            let id = inner.get("tool_use_id").cloned().unwrap_or(Value::Null);
+            block.insert("tool_use_id".to_owned(), id);
+            classify_user_block(record, sequence, 0, &Value::Object(block))
+                .into_iter()
+                .collect()
+        }
+        "thought" => {
+            let block = block_from("thinking", &[("thinking", "thinking")], &inner);
+            classify_assistant_block(record, sequence, 0, &Value::Object(block))
+                .into_iter()
+                .collect()
+        }
+        "message.assistant" | "message.user" => {
+            let text = inner.get("text").and_then(Value::as_str).unwrap_or("");
+            let block = serde_json::json!({"type": "text", "text": text});
+            let classified = if kind == "message.user" {
+                classify_user_block(record, sequence, 0, &block)
+            } else {
+                classify_assistant_block(record, sequence, 0, &block)
+            };
+            classified.into_iter().collect()
+        }
+        "raw" => classify_raw(record, sequence, &inner),
+        "session.started" => system_entry(record, sequence, "system", "init"),
+        "session.finished" => {
+            let cost = inner
+                .get("total_cost_usd")
+                .and_then(as_number)
+                .map(|c| format!(" cost=${c:.4}"))
+                .unwrap_or_default();
+            vec![entry(
+                record.ts,
+                sequence,
+                0,
+                EntryKind::Result,
+                "result",
+                format!(
+                    "subtype={} turns={}{cost}",
+                    field("subtype"),
+                    field("num_turns")
+                ),
+                Some(record.attempt_number),
+                Some(record.iteration_number),
+            )]
+        }
+        "permission.denied" => {
+            let tool = field("tool_name");
+            let body = match inner.get("denial") {
+                Some(Value::Object(denial)) if denial.contains_key("tool_input") => short(
+                    &summarise_tool_input(&tool, denial.get("tool_input")),
+                    COLLAPSED_BODY_LIMIT,
+                ),
+                _ => String::new(),
+            };
+            system_entry(record, sequence, format!("denied({tool})"), body)
+        }
+        "rate.limited" => {
+            let body = format!("{} {}", field("limit_type"), field("status"));
+            system_entry(record, sequence, "rate_limit", body)
+        }
+        "warning" | "error" => {
+            let body = optional_str(&inner, "message").unwrap_or_else(|| payload_digest(&inner));
+            system_entry(record, sequence, kind, short(&body, COLLAPSED_BODY_LIMIT))
+        }
+        _ if SILENT_NORMALIZED_KINDS.contains(&kind) => Vec::new(),
+        _ if OTHER_NORMALIZED_KINDS.contains(&kind) => system_entry(
+            record,
+            sequence,
+            kind,
+            short(&payload_digest(&inner), COLLAPSED_BODY_LIMIT),
+        ),
+        _ => return None,
+    };
+    Some(entries)
+}
+
+/// Render a `raw` normalized record through the stream-json path its
+/// original CLI line (`payload.data`) belongs to: `assistant` / `user`
+/// lines expand their `message` content blocks, `system` and `result`
+/// lines render as before. Keep-alive noise renders nothing; any other
+/// line is one `raw` system line naming its type (or the unparsed line).
+fn classify_raw(
+    record: &SdkMessageRecord,
+    sequence: u64,
+    inner: &JsonObject,
+) -> Vec<TranscriptEntry> {
+    let Some(Value::Object(data)) = inner.get("data") else {
+        return Vec::new();
+    };
+    let message = || match data.get("message") {
+        Some(Value::Object(message)) => message.clone(),
+        _ => data.clone(),
+    };
+    match data.get("type").and_then(Value::as_str) {
+        Some("assistant") => {
+            classify_assistant(&retyped(record, "AssistantMessage", message()), sequence)
+        }
+        Some("user") => classify_user(&retyped(record, "UserMessage", message()), sequence),
+        Some("system") => {
+            let subtype = data.get("subtype").and_then(Value::as_str).unwrap_or("");
+            if NOISE_RAW_SYSTEM_SUBTYPES.contains(&subtype) {
+                return Vec::new();
+            }
+            classify_system(&retyped(record, "SystemMessage", data.clone()), sequence)
+        }
+        Some("result") => {
+            classify_result(&retyped(record, "ResultMessage", data.clone()), sequence)
+        }
+        Some(other) if NOISE_RAW_TYPES.contains(&other) => Vec::new(),
+        Some(other) => {
+            let body = match data.get("subtype").and_then(Value::as_str) {
+                Some(subtype) => format!("{other} {subtype}"),
+                None => other.to_owned(),
+            };
+            system_entry(record, sequence, "raw", short(&body, COLLAPSED_BODY_LIMIT))
+        }
+        None => {
+            let body = data.get("line").map_or_else(
+                || short(&payload_digest(data), COLLAPSED_BODY_LIMIT),
+                |line| short_value(line, COLLAPSED_BODY_LIMIT),
+            );
+            system_entry(record, sequence, "raw", body)
+        }
+    }
+}
+
 // --- Event classification -------------------------------------------------------
 
 fn command_id_of(payload: &JsonObject) -> Option<i64> {
@@ -1122,8 +1350,11 @@ fn fmt_recheck_attempted(payload: &JsonObject) -> (String, String) {
 
 /// Convert one [`AuditRecord`] into ordered transcript entries.
 ///
-/// The record's `sequence` is normally assigned by the file reader; a
-/// defensive `0` is substituted for a synthetic record without one.
+/// Both transcript shapes classify: legacy SDK messages (`AssistantMessage`
+/// and friends) and the `flywheel-agents` normalized stream (`tool.started`,
+/// `raw`, ...; see [`classify_normalized`]). The record's `sequence` is
+/// normally assigned by the file reader; a defensive `0` is substituted for
+/// a synthetic record without one.
 pub fn classify(record: &AuditRecord) -> Vec<TranscriptEntry> {
     let sequence = record.sequence().unwrap_or(0);
     match record {
@@ -1134,6 +1365,9 @@ pub fn classify(record: &AuditRecord) -> Vec<TranscriptEntry> {
             "SystemMessage" => classify_system(message, sequence),
             "ResultMessage" => classify_result(message, sequence),
             other => {
+                if let Some(entries) = classify_normalized(message, sequence) {
+                    return entries;
+                }
                 let header = if other.is_empty() { "sdk" } else { other };
                 vec![entry(
                     message.ts,
@@ -1891,6 +2125,269 @@ mod tests {
         assert_eq!(e.body, "{\"a\":2,\"b\":1}");
         let e = one(&mk("", json!({})));
         assert_eq!(e.header, "sdk");
+    }
+
+    /// A `flywheel-agents` normalized record of `kind` as the transcript
+    /// writer persists it (the event nested under the record's payload).
+    fn normalized(kind: &str, payload: Value) -> AuditRecord {
+        AuditRecord::SdkMessage(SdkMessageRecord {
+            run_id: "run-x".into(),
+            attempt_number: 1,
+            iteration_number: 1,
+            message_type: kind.into(),
+            payload: obj(json!({
+                "type": kind,
+                "payload": payload,
+                "source": "claude-code",
+                "sequence": 7,
+            })),
+            ts: now(),
+            sequence: Some(1),
+            id: None,
+        })
+    }
+
+    fn shape(entries: &[TranscriptEntry]) -> Vec<(EntryKind, String, String)> {
+        entries
+            .iter()
+            .map(|e| (e.kind, e.header.clone(), e.body.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn normalized_tool_started_renders_like_a_raw_tool_use_block() {
+        let input = json!({"command": "cargo test -p flywheel\n--lib", "timeout": 5});
+        let e = one(&normalized(
+            "tool.started",
+            json!({"tool_use_id": "toolu_1", "tool_name": "Bash", "tool_input": input}),
+        ));
+        assert_eq!(e.kind, EntryKind::ToolCall);
+        assert_eq!(e.header, "tool(Bash)");
+        assert_eq!(
+            e.body,
+            summarise_tool_input("Bash", Some(&input)),
+            "the raw tool_use summary"
+        );
+        assert_eq!(e.body, "cargo test -p flywheel --lib");
+        assert_eq!((e.attempt_number, e.iteration_number), (Some(1), Some(1)));
+        let raw = one(&assistant(
+            json!([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": input}]),
+            1,
+        ));
+        assert_eq!(shape(&[e]), shape(&[raw]));
+        let e = one(&normalized(
+            "tool.started",
+            json!({"tool_use_id": "t", "tool_name": "Frobnicate", "tool_input": {"a": 1}}),
+        ));
+        assert_eq!(
+            (e.header.as_str(), e.body.as_str()),
+            ("tool(Frobnicate)", "a=1")
+        );
+    }
+
+    #[test]
+    fn normalized_tool_finished_renders_like_a_raw_tool_result_block() {
+        let cases = [
+            json!({"tool_use_id": "t", "is_error": false, "content": "line 1\nline 2"}),
+            json!({"tool_use_id": "t", "is_error": false, "content": "file written"}),
+            json!({"tool_use_id": "t", "is_error": null, "content": ""}),
+            json!({"tool_use_id": "t", "is_error": true, "content": "boom\nmore"}),
+            json!({"tool_use_id": "t", "is_error": null, "content": [{"type": "text", "text": "x"}]}),
+            json!({"tool_use_id": "t"}),
+        ];
+        for payload in cases {
+            let e = one(&normalized("tool.finished", payload.clone()));
+            assert_eq!(e.kind, EntryKind::ToolResult, "{payload}");
+            let raw = one(&user(json!([payload])));
+            assert_eq!(shape(&[e]), shape(&[raw]), "{payload}");
+        }
+        let e = one(&normalized(
+            "tool.finished",
+            json!({"tool_use_id": "t", "is_error": false, "content": "file written"}),
+        ));
+        assert_eq!(
+            (e.header.as_str(), e.body.as_str()),
+            ("tool_result", "ok: file written")
+        );
+        let e = one(&normalized(
+            "tool.finished",
+            json!({"tool_use_id": "t", "is_error": true, "content": "boom"}),
+        ));
+        assert_eq!(
+            (e.header.as_str(), e.body.as_str()),
+            ("tool_result(error)", "boom")
+        );
+    }
+
+    #[test]
+    fn normalized_agent_text_and_thinking_follow_the_raw_rules() {
+        let e = one(&normalized(
+            "message.assistant",
+            json!({"text": "Para one.\r\n\nPara two.  "}),
+        ));
+        assert_eq!(e.kind, EntryKind::AgentText);
+        assert_eq!(e.header, "agent");
+        assert_eq!(e.body, "Para one.\n\nPara two.");
+        let e = one(&normalized(
+            "thought",
+            json!({"thinking": "weigh the options"}),
+        ));
+        assert_eq!(e.kind, EntryKind::AgentText);
+        assert_eq!(e.header, "agent(thinking)");
+        assert_eq!(e.body, "weigh the options");
+        // Signature-only keep-alive thinking and empty text leave no trace.
+        for record in [
+            normalized("thought", json!({"thinking": ""})),
+            normalized("thought", json!({"thinking": null})),
+            normalized("message.assistant", json!({"text": "  "})),
+            normalized("message.assistant", json!({})),
+        ] {
+            assert!(classify(&record).is_empty(), "{record:?}");
+        }
+        let e = one(&normalized("message.user", json!({"text": "thanks"})));
+        assert_eq!((e.kind, e.body.as_str()), (EntryKind::UserText, "thanks"));
+    }
+
+    #[test]
+    fn raw_records_classify_their_original_cli_line() {
+        let raw = |data: Value| normalized("raw", json!({"data": data}));
+        let content = json!([
+            {"type": "text", "text": "hello"},
+            {"type": "tool_use", "id": "t", "name": "Read", "input": {"file_path": "/a.rs"}},
+        ]);
+        let entries = classify(&raw(
+            json!({"type": "assistant", "message": {"content": content}}),
+        ));
+        assert_eq!(shape(&entries), shape(&classify(&assistant(content, 1))));
+        assert_eq!(entries[1].header, "tool(Read)");
+        let blocks = json!([{"tool_use_id": "t", "content": "boom", "is_error": true}]);
+        let entries = classify(&raw(
+            json!({"type": "user", "message": {"content": blocks}}),
+        ));
+        assert_eq!(shape(&entries), shape(&classify(&user(blocks))));
+        // Keep-alive noise renders nothing.
+        for data in [
+            json!({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 50}),
+            json!({"type": "tool_progress", "tool_name": "Bash", "heartbeat": true}),
+            json!({"type": "stream_event", "event": {"type": "message_start"}}),
+        ] {
+            assert!(classify(&raw(data.clone())).is_empty(), "{data}");
+        }
+        let e = one(&raw(
+            json!({"type": "system", "subtype": "task_started", "description": "cargo test"}),
+        ));
+        assert_eq!(
+            (e.kind, e.header.as_str(), e.body.as_str()),
+            (EntryKind::System, "system", "task_started")
+        );
+        let e = one(&raw(
+            json!({"type": "result", "subtype": "success", "num_turns": 3, "duration_ms": 90}),
+        ));
+        assert_eq!(e.kind, EntryKind::Result);
+        assert_eq!(e.body, "subtype=success turns=3 dur=90ms");
+        let e = one(&raw(
+            json!({"type": "control_request", "request": {"subtype": "hook_callback"}}),
+        ));
+        assert_eq!(
+            (e.header.as_str(), e.body.as_str()),
+            ("raw", "control_request")
+        );
+        let e = one(&raw(json!({"type": "system", "subtype": "hook_started"})));
+        assert_eq!(e.body, "hook_started");
+        let e = one(&raw(json!({"line": "plain text line"})));
+        assert_eq!(
+            (e.header.as_str(), e.body.as_str()),
+            ("raw", "plain text line")
+        );
+        assert!(classify(&normalized("raw", json!({}))).is_empty());
+    }
+
+    #[test]
+    fn normalized_status_records_render_compactly_or_not_at_all() {
+        let usage = json!({"usage": {"input_tokens": 2, "output_tokens": 7}});
+        assert!(classify(&normalized("context.usage", usage)).is_empty());
+        assert!(
+            classify(&normalized(
+                "message.assistant.delta",
+                json!({"text": "he"})
+            ))
+            .is_empty()
+        );
+        let e = one(&normalized(
+            "session.started",
+            json!({"session_id": "s", "model": "m"}),
+        ));
+        assert_eq!(
+            (e.kind, e.header.as_str(), e.body.as_str()),
+            (EntryKind::System, "system", "init")
+        );
+        let e = one(&normalized(
+            "session.finished",
+            json!({"subtype": "success", "num_turns": 140, "total_cost_usd": 10.0830264, "result_text": "long"}),
+        ));
+        assert_eq!(e.kind, EntryKind::Result);
+        assert_eq!(e.body, "subtype=success turns=140 cost=$10.0830");
+        let e = one(&normalized(
+            "rate.limited",
+            json!({"status": "allowed", "limit_type": "seven_day", "resets_at_epoch": 1.0, "detail": {"big": "x"}}),
+        ));
+        assert_eq!(
+            (e.kind, e.header.as_str(), e.body.as_str()),
+            (EntryKind::System, "rate_limit", "seven_day allowed")
+        );
+        let e = one(&normalized(
+            "permission.denied",
+            json!({"tool_name": "Bash", "denial": {"tool_name": "Bash", "tool_use_id": "t", "tool_input": {"command": "rm -rf /tmp/x"}}}),
+        ));
+        assert_eq!(
+            (e.kind, e.header.as_str(), e.body.as_str()),
+            (EntryKind::System, "denied(Bash)", "rm -rf /tmp/x")
+        );
+        let e = one(&normalized("error", json!({"message": "overloaded"})));
+        assert_eq!(
+            (e.header.as_str(), e.body.as_str()),
+            ("error", "overloaded")
+        );
+        let e = one(&normalized(
+            "file.changed",
+            json!({"path": "x".repeat(400)}),
+        ));
+        assert_eq!(e.header, "file.changed");
+        assert_eq!(e.body.chars().count(), COLLAPSED_BODY_LIMIT);
+    }
+
+    #[test]
+    fn normalized_transcript_lines_classify_through_the_file_reader() {
+        let lines = [
+            r#"{"kind": "tool.started", "ts": "2026-11-10T15:30:34.247779+00:00", "run_id": "run-x", "attempt_number": 1, "iteration_number": 1, "payload": {"type": "tool.started", "payload": {"tool_use_id": "toolu_1", "tool_name": "Bash", "tool_input": {"command": "ls"}}, "source": "claude-code", "native_type": "assistant", "sequence": 11}}"#,
+            r#"{"kind": "raw", "ts": "2026-11-10T15:30:39.529020+00:00", "run_id": "run-x", "attempt_number": 1, "iteration_number": 1, "payload": {"type": "raw", "payload": {"data": {"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 50}}, "source": "claude-code", "native_type": "system", "sequence": 26}}"#,
+            r#"{"kind": "tool.finished", "ts": "2026-11-10T15:30:40.000000+00:00", "run_id": "run-x", "attempt_number": 1, "iteration_number": 1, "payload": {"type": "tool.finished", "payload": {"tool_use_id": "toolu_1", "is_error": false, "content": "a.rs"}, "source": "claude-code", "native_type": "user", "sequence": 27}}"#,
+        ];
+        let entries: Vec<TranscriptEntry> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                flywheel_core::audit::record_from_line(line.as_bytes(), i as u64 + 1)
+            })
+            .flat_map(|record| classify(&record))
+            .collect();
+        assert_eq!(
+            shape(&entries),
+            [
+                (
+                    EntryKind::ToolCall,
+                    "tool(Bash)".to_owned(),
+                    "ls".to_owned()
+                ),
+                (
+                    EntryKind::ToolResult,
+                    "tool_result".to_owned(),
+                    "ok: a.rs".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 3);
     }
 
     #[test]

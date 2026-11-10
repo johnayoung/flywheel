@@ -957,3 +957,96 @@ pub fn partition_values(db: &Path) -> Vec<(String, String)> {
     }
     out
 }
+
+// --- hubs a self-update hands off ---------------------------------------------
+
+/// Stops whatever hub serves a fixture home when dropped -- the one a
+/// test started, or the process a self-update handed it off to (spawned
+/// by the test's own run) -- with `fw hub stop --force`, then SIGKILLs
+/// every pid it was told about and every pid listed in its pid files
+/// (agents the test's processes started). Declare it after the
+/// [`Spawned`] it complements so it runs first.
+pub struct HubCleanup {
+    program: PathBuf,
+    home: PathBuf,
+    flywheel_home: PathBuf,
+    pid_files: Vec<PathBuf>,
+    pids: Vec<u32>,
+}
+
+impl HubCleanup {
+    pub fn new(program: &Path, home: &Path, flywheel_home: &Path, pid_files: &[&Path]) -> Self {
+        Self {
+            program: program.to_path_buf(),
+            home: home.to_path_buf(),
+            flywheel_home: flywheel_home.to_path_buf(),
+            pid_files: pid_files.iter().map(|p| p.to_path_buf()).collect(),
+            pids: Vec::new(),
+        }
+    }
+
+    /// Kill `pid` (and what runs under it) at drop: a process the test's
+    /// own processes started.
+    pub fn track(&mut self, pid: u32) {
+        self.pids.push(pid);
+    }
+
+    /// The pid `server.json` names now.
+    pub fn hub_pid(&self) -> Option<u32> {
+        server_pid(&self.flywheel_home)
+    }
+}
+
+/// Whether `pid` runs with `FLYWHEEL_HOME=<flywheel_home>`.
+pub fn of_home(pid: u32, flywheel_home: &Path) -> bool {
+    let wanted = format!("FLYWHEEL_HOME={}", flywheel_home.display());
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .any(|kv| kv == wanted.as_bytes())
+}
+
+/// The pid this home's `server.json` names.
+pub fn server_pid(flywheel_home: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(flywheel_home.join("hub/server.json")).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    value["pid"].as_u64().and_then(|p| u32::try_from(p).ok())
+}
+
+impl Drop for HubCleanup {
+    fn drop(&mut self) {
+        let mut doomed: Vec<u32> = self.pids.clone();
+        if let Some(hub) = self.hub_pid() {
+            doomed.push(hub);
+        }
+        for pid in doomed.clone() {
+            doomed.extend(descendants_of(pid));
+        }
+        let mut stop = Command::new(&self.program);
+        stop.args(["hub", "stop", "--force", "--timeout", "10"])
+            .current_dir(&self.home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        confine(&mut stop, &self.home, &self.flywheel_home, &[]);
+        let _ = stop.status();
+        for file in &self.pid_files {
+            let listed = std::fs::read_to_string(file).unwrap_or_default();
+            // A listed pid may have been reused: only one still running
+            // with this home in its environment is the test's.
+            doomed.extend(
+                listed
+                    .lines()
+                    .filter_map(|l| l.trim().parse::<u32>().ok())
+                    .filter(|pid| of_home(*pid, &self.flywheel_home)),
+            );
+        }
+        for pid in doomed.clone() {
+            doomed.extend(descendants_of(pid));
+        }
+        for pid in doomed {
+            signal(pid, libc::SIGCONT);
+            signal(pid, libc::SIGKILL);
+        }
+    }
+}

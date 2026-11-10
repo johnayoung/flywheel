@@ -324,6 +324,15 @@ fn a_mid_turn_hub_worker_is_interrupted_before_the_install() {
     let repo = fx.root.join("repo");
     let project = project_repo(&repo, &fx.home, &fx.flywheel_home);
     write_task(&project, "mid-turn");
+    // The hub is handed off and the worker restarted by the run: stop
+    // whatever serves this home afterwards, and the agents it started.
+    let agents = fx.control.join("agents.pids");
+    let mut cleanup = support::HubCleanup::new(
+        &fx.install.join("fw"),
+        &fx.home,
+        &fx.flywheel_home,
+        &[&agents],
+    );
 
     let hub = Hub::start(
         &mut spawned,
@@ -345,6 +354,11 @@ fn a_mid_turn_hub_worker_is_interrupted_before_the_install() {
         lifecycle_statuses(&project),
         vec![("mid-turn".to_owned(), "running".to_owned())]
     );
+    let run_before = run_of(&project, "mid-turn");
+    let held = claims(&project);
+    assert_eq!(held.len(), 1, "{held:?}");
+    let drained_worker_id = held[0].1.clone();
+    assert_eq!(transitions(&project, &run_before), ["ready", "running"]);
     let pre_update = sha256(&fx.install.join("fw"));
 
     let run = fx.run(&fx.checkout, &["--json"]);
@@ -366,15 +380,64 @@ fn a_mid_turn_hub_worker_is_interrupted_before_the_install() {
         "{hashes:?} vs {pre_update}"
     );
     assert_ne!(sha256(&fx.install.join("fw")), pre_update);
-    assert_eq!(
-        lifecycle_statuses(&project),
-        vec![("mid-turn".to_owned(), "interrupted".to_owned())]
+    // The drained run ended `interrupted` and the drained worker's claim
+    // is gone. The hub worker restarted after the handoff resumes the
+    // same run under a new worker id, so the evidence is the run's own
+    // ledger and the drained worker's id, not the latest row.
+    let ledger = transitions(&project, &run_before);
+    assert!(
+        ledger.starts_with(&["ready".into(), "running".into(), "interrupted".into()])
+            && ledger[3..]
+                .iter()
+                .zip(["ready", "running"])
+                .all(|(got, want)| got == want),
+        "the drained run did not end interrupted (then, at most, resume): {ledger:?}"
     );
-    assert_eq!(claims(&project), Vec::new());
+    let claims_after = claims(&project);
+    assert!(
+        claims_after.iter().all(|(_, w)| *w != drained_worker_id),
+        "the drained worker's claim survives: {claims_after:?}"
+    );
     assert_eq!(summary["unidentified_claims"], serde_json::json!([]));
-    // The hub itself and its session are untouched (only the worker was
-    // signalled).
-    assert!(!gone(hub.pid));
+    // Only the worker was signalled: its session (the wrapper) is the
+    // same process, now served by the hub it was handed off to.
+    assert_eq!(summary["hub"]["action"], "handoff", "{summary}");
+    assert_eq!(summary["hub"]["old_pid"], u64::from(hub.pid));
+    let new_hub = support::server_pid(&fx.flywheel_home).expect("no hub serves");
+    cleanup.track(new_hub);
+    assert!(!gone(new_hub));
+    assert!(!gone(wrapper), "the worker's session was ended");
+}
+
+/// The `transitioned_to` targets run `run_id` recorded, in order.
+fn transitions(project: &Path, run_id: &str) -> Vec<String> {
+    let db = rusqlite::Connection::open(project.join("flywheel.sqlite")).unwrap();
+    db.busy_timeout(Duration::from_secs(30)).unwrap();
+    let mut stmt = db
+        .prepare(
+            "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = 'transitioned_to' \
+             ORDER BY sequence",
+        )
+        .unwrap();
+    stmt.query_map([run_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(|payload| {
+            let payload: Value = serde_json::from_str(&payload.unwrap()).unwrap();
+            payload["target"].as_str().unwrap().to_owned()
+        })
+        .collect()
+}
+
+/// The run id of task `task_id`'s lifecycle.
+fn run_of(project: &Path, task_id: &str) -> String {
+    let db = rusqlite::Connection::open(project.join("flywheel.sqlite")).unwrap();
+    db.busy_timeout(Duration::from_secs(30)).unwrap();
+    db.query_row(
+        "SELECT run_id FROM lifecycles WHERE task_id = ?1",
+        [task_id],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 /// Criterion #15: an operator console of this home, under a pty, refuses

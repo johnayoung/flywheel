@@ -22,16 +22,25 @@
 //! --project ID` per store. A db-upgrade failure restores every upgraded
 //! store from its backup, puts the previous pair and record back, and
 //! exits 1 with install and db-upgrade `reverted`. Every refusal (exit 3)
-//! happens before anything outside the lock file changes. The hub and
-//! restart steps report `skipped` (`planned` under `--dry-run`): this
-//! build does not perform them.
+//! happens before anything outside the lock file changes. Hub ([`hub`]):
+//! a serving hub of this home is handed off to the installed `fw` as `fw
+//! hub upgrade --binary` does (never `--allow-restart`; no hub is started
+//! when none runs); a refused or failed handoff is not reverted and exits
+//! 4 (`updated-hub-pending`). Restart ([`restart`]): drained hub workers
+//! and autopilots get new sessions through the hub API; terminal
+//! processes get a shell-quoted `manual` command. Every revert (drain
+//! timeout, backup, install, or db-upgrade failure) restarts the
+//! hub-owned processes it stopped on the previous binary, leaving the hub
+//! itself alone.
 //!
 //! Spec: `docs/cli.md` (`self-update`).
 
 pub mod args;
 pub mod drain;
+pub mod hub;
 pub mod install;
 pub mod output;
+pub mod restart;
 pub mod source;
 pub mod stores;
 
@@ -264,6 +273,9 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
     }
 
     // --- drain -----------------------------------------------------------------
+    // What the drain stopped: restarted after the hub step, or on the
+    // previous binary by any revert.
+    let mut stopped: Vec<drain::Drainable> = Vec::new();
     if set.is_empty() {
         let detail = "no worker, autopilot, or triage process of this home is running";
         reporter.step(Step::Drain, Status::Skipped, Some(detail));
@@ -287,10 +299,17 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
                 describe(&drained.not_stopped)
             );
             reporter.step(Step::Drain, Status::Failed, Some(&detail));
-            return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
+            return finish_reverted(
+                reporter,
+                &mut summary,
+                &home,
+                &drained.stopped,
+                &install_dir,
+            );
         }
         let detail = format!("stopped {}", describe(&drained.stopped));
         reporter.step(Step::Drain, Status::Ok, Some(&detail));
+        stopped = drained.stopped;
     }
     summary.unidentified_claims = drain::live_claims(&home);
 
@@ -315,7 +334,7 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
             Err(why) => {
                 let detail = format!("{why}; no store was upgraded and nothing was installed");
                 reporter.step(Step::Backup, Status::Failed, Some(&detail));
-                return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
+                return finish_reverted(reporter, &mut summary, &home, &stopped, &install_dir);
             }
         }
     }
@@ -370,12 +389,12 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
             summary.to = summary.from.clone();
             let detail = format!("{why}; the previous pair is back in place");
             reporter.step(Step::Install, Status::Reverted, Some(&detail));
-            return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
+            return finish_reverted(reporter, &mut summary, &home, &stopped, &install_dir);
         }
         Err(InstallError::NothingChanged(why)) => {
             summary.to = summary.from.clone();
             reporter.step(Step::Install, Status::Failed, Some(&why));
-            return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
+            return finish_reverted(reporter, &mut summary, &home, &stopped, &install_dir);
         }
         Err(InstallError::RevertFailed(why)) => {
             let detail = format!(
@@ -383,7 +402,7 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
                 home.self_update_previous_dir().display()
             );
             reporter.step(Step::Install, Status::Failed, Some(&detail));
-            return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
+            return finish_reverted(reporter, &mut summary, &home, &stopped, &install_dir);
         }
     }
     let install_detail = format!(
@@ -433,7 +452,7 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
             }
             reporter.step(Step::DbUpgrade, Status::Ok, Some(&detail));
         }
-        return reporter.finish(Status::Skipped, Outcome::Updated, &summary);
+        return hub_and_restart(reporter, &mut summary, &home, &stopped, &installed_fw);
     };
 
     // --- revert ----------------------------------------------------------------
@@ -498,7 +517,143 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
         let detail = format!("{why}; {restored_detail}; {}", store_errors.join("; "));
         reporter.step(Step::DbUpgrade, Status::Failed, Some(&detail));
     }
-    reporter.finish(Status::Skipped, Outcome::Failed, &summary)
+    finish_reverted(reporter, &mut summary, &home, &stopped, &install_dir)
+}
+
+/// The hub and restart steps after a successful install and db-upgrade.
+fn hub_and_restart(
+    mut reporter: Reporter<'_>,
+    summary: &mut Summary,
+    home: &Home,
+    stopped: &[drain::Drainable],
+    installed_fw: &Path,
+) -> i32 {
+    // --- hub -------------------------------------------------------------------
+    let hub_dir = home.hub_dir();
+    let handoff = hub::hand_off(installed_fw, &hub_dir);
+    summary.hub = Some(handoff.to_json());
+    let client = match &handoff {
+        hub::Handoff::NotRunning => {
+            let detail = "no hub is serving this home; none was started";
+            reporter.step(Step::Hub, Status::Skipped, Some(detail));
+            Err("no hub serves this home to restart it in".to_owned())
+        }
+        hub::Handoff::Done { old_pid, new_pid } => {
+            let detail = format!(
+                "handed off from pid {old_pid} to pid {new_pid} ({}); every session kept running",
+                installed_fw.display()
+            );
+            reporter.step(Step::Hub, Status::Ok, Some(&detail));
+            hub::Client::connect(&hub_dir)
+                .and_then(|client| client.wait_ready().map(|()| client))
+                .map_err(|why| format!("the handed-off hub cannot be reached: {why}"))
+        }
+        hub::Handoff::Refused { old_pid, why } | hub::Handoff::Failed { old_pid, why } => {
+            // Not reverted: binaries and stores are consistent, and the
+            // hub can be upgraded alone.
+            let command = hub::upgrade_command(installed_fw, &hub_dir, true);
+            let detail = format!(
+                "not handed off: {why}; the hub (pid {old_pid}) carries on on the previous                  binary; `{command}` stops and starts it instead"
+            );
+            reporter.step(Step::Hub, Status::Failed, Some(&detail));
+            summary.manual.push(json!({
+                "pid": old_pid,
+                "cwd": hub_dir.display().to_string(),
+                "command": command,
+                "notes": [format!(
+                    "the hub was not handed off ({why}); this stops and starts it: sessions are                      restored, their processes restarted"
+                )],
+            }));
+            let note = "not restarted: the hub was not handed off (it runs the previous binary)";
+            let left = restart::restart(stopped, None, installed_fw, note);
+            summary.manual.extend(left.manual);
+            let detail = format!(
+                "hub workers are not restarted while the hub runs the previous binary; {}",
+                if stopped.is_empty() {
+                    "nothing was stopped".to_owned()
+                } else {
+                    format!(
+                        "{} process(es) left to the operator (see manual)",
+                        stopped.len()
+                    )
+                }
+            );
+            reporter.step(Step::Restart, Status::Skipped, Some(&detail));
+            return reporter.finish(Status::Skipped, Outcome::UpdatedHubPending, summary);
+        }
+    };
+
+    // --- restart ---------------------------------------------------------------
+    let wants_hub = stopped.iter().any(|d| d.kind != drain::Kind::Terminal);
+    let (client, no_hub) = match client {
+        Ok(client) => (Some(client), String::new()),
+        Err(why) => (None, why),
+    };
+    let out = restart::restart(
+        stopped,
+        client.as_ref().filter(|_| wants_hub),
+        installed_fw,
+        &no_hub,
+    );
+    let status = restart_status(stopped, &out);
+    reporter.step(Step::Restart, status, Some(&out.detail()));
+    summary.restarted = out.restarted;
+    summary.manual.extend(out.manual);
+    reporter.finish(Status::Skipped, Outcome::Updated, summary)
+}
+
+/// End a reverted run (exit 1): the hub is not touched; every hub-owned
+/// process in `stopped` is restarted through the still-running hub on the
+/// previous binary, every terminal one listed under `manual`.
+fn finish_reverted(
+    mut reporter: Reporter<'_>,
+    summary: &mut Summary,
+    home: &Home,
+    stopped: &[drain::Drainable],
+    install_dir: &Path,
+) -> i32 {
+    let hub_dir = home.hub_dir();
+    let wants_hub = stopped.iter().any(|d| d.kind != drain::Kind::Terminal);
+    let client = if !wants_hub {
+        Err(String::new())
+    } else if drain::hub_pid(&hub_dir).is_none() {
+        Err("no hub serves this home to restart it in".to_owned())
+    } else {
+        hub::Client::connect(&hub_dir).map_err(|why| format!("the hub cannot be reached: {why}"))
+    };
+    let (client, no_hub) = match client {
+        Ok(client) => (Some(client), String::new()),
+        Err(why) => (None, why),
+    };
+    let out = restart::restart(stopped, client.as_ref(), &install_dir.join("fw"), &no_hub);
+    reporter.step(
+        Step::Hub,
+        Status::Skipped,
+        Some("not touched: the run was reverted"),
+    );
+    let status = restart_status(stopped, &out);
+    let detail = if stopped.is_empty() {
+        out.detail()
+    } else {
+        format!("on the previous binary: {}", out.detail())
+    };
+    reporter.step(Step::Restart, status, Some(&detail));
+    summary.restarted = out.restarted;
+    summary.manual.extend(out.manual);
+    reporter.finish(Status::Skipped, Outcome::Failed, summary)
+}
+
+/// `failed` when a hub restart did not happen, `ok` when one did,
+/// `skipped` when none was attempted (nothing stopped, or only `manual`
+/// entries).
+fn restart_status(stopped: &[drain::Drainable], out: &restart::Restarted) -> Status {
+    if !out.failures.is_empty() {
+        Status::Failed
+    } else if stopped.is_empty() || !out.attempted() {
+        Status::Skipped
+    } else {
+        Status::Ok
+    }
 }
 
 /// `<id> (<store> run N -> T, orchestrator M -> U[, backup PATH])`, comma-separated.

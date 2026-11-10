@@ -36,6 +36,13 @@ pub const HUB_SESSION_ENV: &str = "FLYWHEEL_HUB_SESSION";
 const HUB_STATE_FILE: &str = "state.json";
 /// How often the drain re-checks its processes.
 const POLL: Duration = Duration::from_millis(100);
+/// The credential variables a drained process's environment is checked
+/// for: named in its `manual` entry, never valued.
+pub const SECRET_ENV: [&str; 3] = [
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+];
 
 /// What a drained process is, for the summary and the later restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +179,19 @@ fn nul_split(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// `/proc/<pid>/cmdline` as argv: NUL-terminated arguments, empty ones
+/// kept (a restart command must reproduce them exactly).
+fn cmdline_split(bytes: &[u8]) -> Vec<String> {
+    let bytes = bytes.strip_suffix(&[0]).unwrap_or(bytes);
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    bytes
+        .split(|b| *b == 0)
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
+}
+
 fn read_proc(pid: u32, uid: u32) -> Option<Proc> {
     if uid_of(pid)? != uid {
         return None;
@@ -180,7 +200,7 @@ fn read_proc(pid: u32, uid: u32) -> Option<Proc> {
     if state == 'Z' {
         return None;
     }
-    let argv = nul_split(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?);
+    let argv = cmdline_split(&std::fs::read(format!("/proc/{pid}/cmdline")).ok()?);
     if argv.is_empty() {
         return None;
     }
@@ -244,10 +264,24 @@ pub fn home_of(process: &Proc, fallback_home: Option<&str>) -> Option<PathBuf> {
     .map(|p| canonical(&p))
 }
 
-/// The hub sessions recorded in `hub_dir`'s state: session id -> the
-/// daemon marker its wrapper command carries.
-pub fn hub_sessions(hub_dir: &Path) -> HashMap<String, &'static str> {
-    fn walk(value: &Value, out: &mut HashMap<String, &'static str>) {
+/// A worker or autopilot session this home's hub records: what a restart
+/// through the hub API needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HubSession {
+    pub id: String,
+    /// The daemon marker its wrapper command carries.
+    pub marker: &'static str,
+    pub workspace_id: Option<String>,
+    /// The folder it was started in (the session's working directory).
+    pub folder: Option<PathBuf>,
+    /// The session's wrapper command (`/bin/sh -c SCRIPT <marker> fw ...`).
+    pub command: Vec<String>,
+}
+
+/// The worker and autopilot sessions recorded in `hub_dir`'s state, by
+/// session id.
+pub fn hub_sessions(hub_dir: &Path) -> HashMap<String, HubSession> {
+    fn walk(value: &Value, out: &mut HashMap<String, HubSession>) {
         match value {
             Value::Object(map) => {
                 if let (Some(Value::String(id)), Some(Value::Array(command))) =
@@ -258,7 +292,17 @@ pub fn hub_sessions(hub_dir: &Path) -> HashMap<String, &'static str> {
                         .filter_map(|a| a.as_str().map(str::to_owned))
                         .collect();
                     if let Some(marker) = wrapper_marker(&argv) {
-                        out.insert(id.clone(), marker);
+                        let text = |key: &str| map.get(key).and_then(Value::as_str);
+                        out.insert(
+                            id.clone(),
+                            HubSession {
+                                id: id.clone(),
+                                marker,
+                                workspace_id: text("workspace_id").map(str::to_owned),
+                                folder: text("cwd").map(PathBuf::from),
+                                command: argv,
+                            },
+                        );
                     }
                 }
                 map.values().for_each(|v| walk(v, out));
@@ -303,6 +347,13 @@ pub struct Drainable {
     pub project_id: Option<String>,
     /// The hub session it runs in (hub kinds only).
     pub session_id: Option<String>,
+    /// That session as the hub records it (hub kinds only).
+    pub session: Option<HubSession>,
+    /// Its full argv (argv[0] included), for a `manual` restart command.
+    pub argv: Vec<String>,
+    /// Which of [`SECRET_ENV`] its environment set (names only: a value
+    /// never leaves discovery).
+    pub secret_env: Vec<&'static str>,
 }
 
 impl Drainable {
@@ -358,7 +409,11 @@ pub fn classify(table: &[Proc], home: &Home, fallback_home: Option<&str>) -> Dis
             }
             Role::Other => continue,
         };
-        let (kind, session_id) = hub_session_of(process, &by_pid, &sessions);
+        let (kind, session) = hub_session_of(process, &by_pid, &sessions);
+        let secret_env = SECRET_ENV
+            .into_iter()
+            .filter(|key| process.env(key).is_some_and(|v| !v.is_empty()))
+            .collect();
         let project_id = process.cwd.as_deref().and_then(|cwd| {
             flywheel_orchestrator::home::stored_project_id(cwd)
                 .ok()
@@ -371,7 +426,10 @@ pub fn classify(table: &[Proc], home: &Home, fallback_home: Option<&str>) -> Dis
             verb,
             cwd: process.cwd.clone(),
             project_id,
-            session_id,
+            session_id: session.as_ref().map(|s| s.id.clone()),
+            session,
+            argv: process.argv.clone(),
+            secret_env,
         });
     }
     match consoles.first() {
@@ -385,8 +443,8 @@ pub fn classify(table: &[Proc], home: &Home, fallback_home: Option<&str>) -> Dis
 fn hub_session_of(
     process: &Proc,
     by_pid: &BTreeMap<u32, &Proc>,
-    sessions: &HashMap<String, &'static str>,
-) -> (Kind, Option<String>) {
+    sessions: &HashMap<String, HubSession>,
+) -> (Kind, Option<HubSession>) {
     let mut seen = BTreeSet::new();
     let mut next = process.ppid;
     while next > 1 && seen.insert(next) {
@@ -395,14 +453,14 @@ fn hub_session_of(
         };
         if let Some(marker) = wrapper_marker(&ancestor.argv)
             && let Some(id) = ancestor.env(HUB_SESSION_ENV)
-            && sessions.get(id) == Some(&marker)
+            && let Some(session) = sessions.get(id).filter(|s| s.marker == marker)
         {
             let kind = if marker == WORKER_MARKER {
                 Kind::HubWorker
             } else {
                 Kind::HubAutopilot
             };
-            return (kind, Some(id.to_owned()));
+            return (kind, Some(session.clone()));
         }
         next = ancestor.ppid;
     }

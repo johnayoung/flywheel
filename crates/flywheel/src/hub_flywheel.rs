@@ -1002,6 +1002,12 @@ fn task_runs(core: &dyn HarnessStore, task_id: &str) -> Result<Vec<TaskRun>, Str
                         number: a.number,
                         outcome: a.outcome.map(|o| o.as_str().to_owned()),
                         error: a.error.clone(),
+                        stop_reason: a
+                            .stop_reason
+                            .as_ref()
+                            .map(serde_json::to_value)
+                            .transpose()
+                            .map_err(|e| format!("encoding a stop reason: {e}"))?,
                         started_at: a.started_at,
                         ended_at: a.ended_at,
                         tokens: a.total_tokens(),

@@ -103,6 +103,9 @@ pub struct AttemptSummary {
     pub tokens: u64,
     pub cost_usd: f64,
     pub error: String,
+    /// Why the attempt stopped; `None` when not recorded (in flight, or
+    /// finalized before stop reasons existed).
+    pub stop_reason: Option<StopReason>,
     pub grader_results: Vec<GraderResultRecord>,
     pub checks: Vec<CheckResult>,
 }
@@ -742,6 +745,7 @@ where
             tokens: a.total_tokens(),
             cost_usd: a.total_cost_usd,
             error: a.error.clone(),
+            stop_reason: a.stop_reason.clone(),
             grader_results: receipts,
             checks,
         });
@@ -1080,6 +1084,7 @@ pub fn run_detail_to_json(detail: &RunDetail) -> Value {
             "tokens": a.tokens,
             "cost_usd": a.cost_usd,
             "error": a.error,
+            "stop_reason": a.stop_reason,
             "grader_results": a.grader_results.iter().map(grader_result_to_json).collect::<Vec<_>>(),
             "checks": a.checks.iter().map(check_to_json).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
@@ -1857,6 +1862,7 @@ attempts :
       "tokens": 1000,
       "cost_usd": 0.5,
       "error": "grader alpha failed\nwith a very long explanation that should be truncated by the short helper at eighty chars",
+      "stop_reason": null,
       "grader_results": [
         {
           "attempt_number": 1,
@@ -1887,6 +1893,7 @@ attempts :
       "tokens": 450,
       "cost_usd": 0.25,
       "error": "",
+      "stop_reason": null,
       "grader_results": [
         {
           "attempt_number": 2,
@@ -2062,6 +2069,7 @@ attempts :
       "tokens": 7,
       "cost_usd": 0.0001,
       "error": "",
+      "stop_reason": null,
       "grader_results": [],
       "checks": []
     }
@@ -2283,6 +2291,58 @@ attempts :
                 ("design", "not_run"),
                 ("docs", "not_run"),
             ])
+        );
+    }
+
+    #[test]
+    fn show_json_reports_each_attempts_stop_reason_with_its_detail_or_null() {
+        let store = InMemoryStore::new();
+        let task = Task::new("g", vec![named_cmd("unit")]).with_id("t-stop");
+        let reasons = [
+            Some(StopReason::ChecksFailed {
+                check: "unit".to_owned(),
+            }),
+            Some(StopReason::JudgeFailed {
+                check: "style".to_owned(),
+            }),
+            Some(StopReason::LandingBlocked {
+                reason: "base moved".to_owned(),
+            }),
+            Some(StopReason::AgentClaimedAlreadyDone),
+            Some(StopReason::Verified),
+            None,
+        ];
+        let attempts: Vec<Attempt> = reasons
+            .iter()
+            .zip(1..)
+            .map(|(reason, number)| {
+                let mut a = attempt("run-s", number, 0, 0.0, 0);
+                a.outcome = Some(Outcome::ValidationFailed);
+                a.stop_reason = reason.clone();
+                a
+            })
+            .collect();
+        seed_pinned_run(&store, "run-s", &task, &attempts);
+
+        let detail = collect_run_detail(&store, "run-s", &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        let shown: Vec<Value> = run_detail_to_json(&detail)["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["stop_reason"].clone())
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                json!({"kind": "checks_failed", "check": "unit"}),
+                json!({"kind": "judge_failed", "check": "style"}),
+                json!({"kind": "landing_blocked", "reason": "base moved"}),
+                json!({"kind": "agent_claimed_already_done"}),
+                json!({"kind": "verified"}),
+                Value::Null,
+            ]
         );
     }
 

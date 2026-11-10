@@ -248,6 +248,9 @@ pub struct RunAttempt {
     /// `succeeded`, `failed_validation`, ...; `None` while in flight.
     pub outcome: Option<String>,
     pub error: String,
+    /// Why it stopped, as `fw show --json` reports it
+    /// (`{"kind": ..., ...detail}`); `None` when not recorded.
+    pub stop_reason: Option<serde_json::Value>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub tokens: u64,

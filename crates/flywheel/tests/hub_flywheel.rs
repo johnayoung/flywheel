@@ -16,7 +16,7 @@ mod script;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use flywheel::hub_flywheel::{AUTOPILOT_ACTIVITY, HubFlywheel};
 use flywheel_core::events::{DomainEvent, DomainEventPayload, LandingParked};
-use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome, Status};
+use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome, Status, StopReason};
 use flywheel_core::store::{
     AttemptStore, ControlCommandStore, DomainEventStore, GraderResultRecord, GraderResultStore,
     LifecycleStore, TelemetryRecord, TelemetrySink,
@@ -1857,6 +1857,12 @@ fn seed_failed_run(
         let mut attempt = Attempt::new(number, at, run_id);
         attempt.outcome = Some(Outcome::ValidationFailed);
         attempt.error = error.clone();
+        // Only the first attempt records a stop reason; later ones read null.
+        if number == 1 {
+            attempt.stop_reason = Some(StopReason::ChecksFailed {
+                check: "unit".into(),
+            });
+        }
         attempt.total_cost_usd = 0.1;
         attempt.ended_at = Some(at + ChronoDuration::seconds(2));
         store.save_attempt(run_id, &attempt, None).unwrap();
@@ -1941,6 +1947,9 @@ fn task_history_lists_every_run_past_the_recent_window_with_each_attempts_outcom
         for (attempt, error) in run.attempts.iter().zip(errors) {
             assert_eq!(attempt.outcome.as_deref(), Some("validation_failed"));
             assert_eq!(&attempt.error, error);
+            let stop_reason =
+                (attempt.number == 1).then(|| json!({"kind": "checks_failed", "check": "unit"}));
+            assert_eq!(attempt.stop_reason, stop_reason);
             assert_eq!(attempt.graders.len(), 1);
             assert!(!attempt.graders[0].passed);
         }
@@ -2097,6 +2106,10 @@ fn task_history_route_and_last_tool_call_are_served_by_the_hub() {
             .unwrap();
         assert_eq!(run["attempts"][0]["error"], format!("boom-{n}"));
         assert_eq!(run["attempts"][0]["outcome"], "validation_failed");
+        assert_eq!(
+            run["attempts"][0]["stop_reason"],
+            json!({"kind": "checks_failed", "check": "unit"})
+        );
     }
     let text = history.to_string();
     assert!(text.contains(&held_name), "{text}");

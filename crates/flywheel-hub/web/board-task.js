@@ -206,6 +206,37 @@ window.FwHubBoardTask = function (ctx) {
     }
   }
 
+  // Re-land: shown exactly when the hub marks the task re-landable (its
+  // latest DONE run has an unresolved landing park); never derived here.
+  function relandButton(k) {
+    if (!k.info || !k.info.relandable) return null;
+    return el(
+      "button",
+      {
+        type: "button",
+        className: "slab",
+        "data-fw-action": "reland",
+        title: `Start fw reland ${cur.id} in a shell session here: one landing attempt of its parked run on the task branch's current head, through every gate`,
+        onclick: (event) => relandTask(event.currentTarget),
+      },
+      icon("wheel"),
+      "Re-land",
+    );
+  }
+
+  async function relandTask(button) {
+    if (button.disabled) return;
+    button.disabled = true;
+    const w = ctx.workspace();
+    try {
+      await flywheel.relandTask(cur.key, cur.id, w ? w.id : null);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  const waitVerb = (n, landing) => (landing ? (n === 1 ? "lands" : "land") : n === 1 ? "verifies" : "verify");
+
   // Its state and what can be done about it, loudest first.
   function band(k, state, status, lane) {
     const h = cur.history;
@@ -235,8 +266,9 @@ window.FwHubBoardTask = function (ctx) {
             el("button", { type: "button", className: "slab", onclick: watch(runId) }, icon("activity"), "Watch the agent"),
             local(cur.key) ? el("button", { type: "button", className: "slab ghost", title: "Open the run viewer's message bar", onclick: watch(runId, { say: true }) }, icon("send"), "Message it") : null,
             local(cur.key) ? el("button", { type: "button", className: "slab ghost fwb-act-end", title: "Open the run viewer: Interrupt there asks before it stops the agent", onclick: watch(runId) }, icon("stop"), "Interrupt...") : null,
+            relandButton(k),
           )
-          : null,
+          : relandButton(k) ? el("div", { className: "fwb-actions" }, relandButton(k)) : null,
       );
     }
     if (lane === "needs") return needsBand(k, state, status, latest);
@@ -249,10 +281,12 @@ window.FwHubBoardTask = function (ctx) {
           state === "parked" ? "verified, landing parked" : "verified",
           latest ? `${latest.updated_at ? `${age(latest.updated_at)} ago · ` : ""}${h.runs.length === 1 && latest.attempts.length === 1 ? "first try" : `after ${plural(h.runs.length, "run")}`}` : "",
         ),
-        latest ? el("div", { className: "fwb-actions" }, el("button", { type: "button", className: "slab ghost", onclick: watch(latest.run_id) }, icon("activity"), "Transcript")) : null,
+        latest || relandButton(k) ? el("div", { className: "fwb-actions" }, relandButton(k), latest ? el("button", { type: "button", className: "slab ghost", onclick: watch(latest.run_id) }, icon("activity"), "Transcript") : null) : null,
       );
     }
-    const waits = k.info ? k.info.prerequisites.filter((p) => !["verified", "parked"].includes(k.states.get(p) || "verified")) : [];
+    // Not verified yet, or verified but not landed (the hub's waiting_on).
+    const landing = (k.info && k.info.waiting_on) || [];
+    const waits = k.info ? k.info.prerequisites.filter((p) => landing.includes(p) || !["verified", "parked"].includes(k.states.get(p) || "verified")) : [];
     const queued = k.info && k.info.queued_in;
     return el(
       "div",
@@ -260,13 +294,14 @@ window.FwHubBoardTask = function (ctx) {
       bandHead(
         el("i", { className: "fw-dot idle", "aria-hidden": "true" }),
         state === "blocked" ? "blocked" : waits.length ? "waiting" : "ready",
-        queued ? `queued in ${queued.name}` : waits.length ? `until ${waits.join(", ")} verif${waits.length === 1 ? "ies" : "y"}` : "the next free worker claims it",
+        queued ? `queued in ${queued.name}` : waits.length ? `until ${waits.join(", ")} ${waitVerb(waits.length, landing.length > 0)}` : "the next free worker claims it",
       ),
       state === "blocked" && k.info && k.info.blocked_on ? el("p", { className: "fwb-hint", textContent: `waits on ${k.info.blocked_on}` }) : null,
       el(
         "div",
         { className: "fwb-actions" },
-        runButton(k, state, waits.length ? "Run it alone" : "Run now"),
+        relandButton(k),
+        runButton(k, state, waits.length ? "Run it alone" : "Run now", !!(k.info && k.info.relandable)),
         latest ? el("button", { type: "button", className: "slab ghost", onclick: watch(latest.run_id) }, icon("activity"), "Last run") : null,
       ),
       waits.length && local(cur.key) ? el("p", { className: "fwb-hint", textContent: `Run starts a worker on ${cur.id} only; it waits for its prerequisites to verify.` }) : null,
@@ -303,7 +338,8 @@ window.FwHubBoardTask = function (ctx) {
       el(
         "div",
         { className: "fwb-actions" },
-        runButton(k, state, state === "awaiting" ? "Run to apply" : "Run again", state === "awaiting"),
+        relandButton(k),
+        runButton(k, state, state === "awaiting" ? "Run to apply" : "Run again", state === "awaiting" || !!(k.info && k.info.relandable)),
         runId ? el("button", { type: "button", className: "slab ghost", onclick: watch(runId) }, icon("activity"), "What happened") : null,
       ),
     );

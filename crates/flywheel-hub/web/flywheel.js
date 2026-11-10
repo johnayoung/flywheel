@@ -699,6 +699,36 @@ window.FwHubFlywheel = function (ctx) {
     }
   }
 
+  // Re-land task `taskId` of folder `key` (the board drawer's action):
+  // POST /api/flywheel/reland starts `fw reland` in a hub session, which
+  // opens beside the pane in focus; the landing's outcome is read back
+  // from the store by the panel, never from this answer. A refusal (409
+  // nothing to re-land or one running, 404 unknown task) shows the
+  // route's error; a running re-land's session is revealed. True once
+  // started.
+  async function relandTask(key, taskId, workspaceId) {
+    const workspace = (workspaceId && workspaceById(workspaceId)) || workspaceFor(key);
+    if (!key || !workspace) return false;
+    try {
+      const request = { folder: pathOf(key), task: taskId, workspace_id: workspace.id, ...(ctx.termSize ? ctx.termSize() : {}) };
+      const out = await post(`${via(key)}/api/flywheel/reland`, request);
+      if (!out.ok) {
+        const why = (out.data && out.data.error) || `HTTP ${out.status}`;
+        toast(`Could not re-land ${taskId}: ${why}`, { tone: "bad" });
+        if (out.status === 409 && out.data && out.data.running) openSession(out.data.running.id, { split: "down" });
+        return false;
+      }
+      const view = out.data;
+      await ctx.refresh();
+      openSession(view.id, { split: "down" });
+      toast(el("span", {}, "Started ", el("b", { textContent: view.name }), ` in ${labelFor(key)}`), { timeout: 3500 });
+      return true;
+    } catch (error) {
+      toast(`Could not re-land ${taskId}: ${error.message}`, { tone: "bad" });
+      return false;
+    }
+  }
+
   function phaseBar(tasks) {
     const counts = {};
     for (const t of tasks) counts[t.state] = (counts[t.state] || 0) + 1;
@@ -1417,6 +1447,8 @@ window.FwHubFlywheel = function (ctx) {
     post,
     // Run `taskId` alone in folder `key` (its board's panel and workspace).
     runTask: (key, taskId, panel, workspaceId) => startWorker(taskId, { folder: key, panel, workspaceId, exact: true }),
+    // Re-land `taskId` of folder `key` (`fw reland` in a hub session).
+    relandTask,
     // Autopilot's gate decisions (shared pending state): send, pendingOf.
     gates: pilot,
     loaded: () => ui.loaded,

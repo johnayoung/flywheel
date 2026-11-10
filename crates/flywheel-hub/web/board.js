@@ -462,7 +462,7 @@ window.FwHubBoard = function (ctx) {
       const list = tasks.filter((t) => t.lane === lane.id);
       if (lane.id === "queued") {
         // Ready before waiting on a prerequisite, then by id.
-        const waits = (t) => (t.info ? t.info.prerequisites.some((p) => !done.has(p)) : false);
+        const waits = (t) => (t.info ? !!waitingOn(t) || t.info.prerequisites.some((p) => !done.has(p)) : false);
         list.sort((a, b) => waits(a) - waits(b) || a.id.localeCompare(b.id));
       }
       const rows = lane.id === "queued" || lane.id === "done";
@@ -503,6 +503,10 @@ window.FwHubBoard = function (ctx) {
 
   const picked = (t) => (task.openId() === t.id ? " selected" : "");
 
+  // The hub's DONE-but-unlanded prerequisites a task is held on, raw and
+  // comma-joined for data-fw-waiting-on (absent when none).
+  const waitingOn = (t) => (t.info && t.info.waiting_on && t.info.waiting_on.length ? t.info.waiting_on.join(",") : null);
+
   // Why a needs-you task stopped, from the panel's listing.
   function stopped(t) {
     const info = t.info;
@@ -520,7 +524,7 @@ window.FwHubBoard = function (ctx) {
       const why = stopped(t);
       return el(
         "button",
-        { type: "button", className: `fwb-card fwb-card-needs ${t.state}${picked(t)}`, "data-fw-task": t.id, title, onclick: () => activate(key, t) },
+        { type: "button", className: `fwb-card fwb-card-needs ${t.state}${picked(t)}`, "data-fw-task": t.id, "data-fw-waiting-on": waitingOn(t), title, onclick: () => activate(key, t) },
         el("span", { className: "fwb-card-top" }, el("span", { className: "fwb-card-id", textContent: t.id })),
         el("span", { className: "fwb-card-why" }, el("span", { className: `fw-light ${t.state}`, textContent: t.state }), el("b", { textContent: why.head })),
         why.detail ? el("span", { className: "fwb-card-error", title: why.detail, textContent: why.detail }) : null,
@@ -541,7 +545,7 @@ window.FwHubBoard = function (ctx) {
       : "";
     return el(
       "button",
-      { type: "button", className: `fwb-card fwb-card-live${checking ? " checking" : ""}${picked(t)}`, "data-fw-task": t.id, title, onclick: () => activate(key, t) },
+      { type: "button", className: `fwb-card fwb-card-live${checking ? " checking" : ""}${picked(t)}`, "data-fw-task": t.id, "data-fw-waiting-on": waitingOn(t), title, onclick: () => activate(key, t) },
       el(
         "span",
         { className: "fwb-card-top" },
@@ -555,11 +559,12 @@ window.FwHubBoard = function (ctx) {
   }
 
   function taskRow(key, t, done) {
-    const waits = t.lane === "queued" && t.info ? t.info.prerequisites.filter((p) => !done.has(p)) : [];
+    const landing = (t.info && t.info.waiting_on) || [];
+    const waits = t.lane === "queued" && t.info ? t.info.prerequisites.filter((p) => landing.includes(p) || !done.has(p)) : [];
     const right = t.state === "blocked"
       ? el("small", { textContent: "blocked", title: (t.info && t.info.blocked_on) || "interrupted" })
       : waits.length
-        ? el("small", { className: "fwb-row-after", title: `waits for ${waits.join(", ")}`, textContent: `after ${waits[0]}${waits.length > 1 ? ` +${waits.length - 1}` : ""}` })
+        ? el("small", { className: "fwb-row-after", title: `waits for ${waits.join(", ")}${landing.length ? ` (verified, not landed: ${landing.join(", ")})` : ""}`, textContent: `after ${waits[0]}${waits.length > 1 ? ` +${waits.length - 1}` : ""}` })
         : t.info && t.info.queued_in
           ? el("small", { textContent: `queued in ${t.info.queued_in.name}` })
           : null;
@@ -572,6 +577,7 @@ window.FwHubBoard = function (ctx) {
           type: "button",
           className: `fwb-row${waits.length || t.state === "blocked" ? " is-waiting" : ""}${picked(t)}`,
           "data-fw-task": t.id,
+          "data-fw-waiting-on": waitingOn(t),
           title: `${t.id}: ${t.state}. Open its drawer.`,
           onclick: () => activate(key, t),
         },

@@ -10,15 +10,18 @@
 //!
 //! [`plan_scope`] is the start-up gate: it refuses an unknown id, an
 //! unrunnable task, (unless prerequisites are pulled in) a named task
-//! whose prerequisites are not done, and one held behind a done
-//! prerequisite whose phase has not reached the base. [`evaluate_scope`]
+//! whose prerequisites are not done, one behind a done prerequisite whose
+//! landing parked unresolved or is still in flight, and one held behind a
+//! done prerequisite whose phase has not reached the base. [`evaluate_scope`]
 //! is the exit test: once every named task is settled -- verified, failed
 //! after the scope started, parked (including a sandbox that would not
 //! prepare [`PREPARE_SKIPS_TO_SETTLE`] times, a reachability hold, or a
 //! definition that went invalid), or blocked behind a member that settled
 //! unverified -- the scoped worker stops instead of idling.
 
-use super::prereqs::reachability_held_prerequisites;
+use super::prereqs::{
+    UnlandedPrerequisite, reachability_held_prerequisites, unlanded_prerequisites_of,
+};
 use crate::claims::{
     ClaimStore, ClaimStoreError, RESOLUTION_ATTRIBUTION_PROBE, RESOLUTION_ATTRIBUTION_RELAND,
     RESOLUTION_ATTRIBUTIONS, STOP_PREPARE_SKIP, STOP_RESOLVED,
@@ -157,6 +160,11 @@ pub enum ScopeError {
     Unrunnable(Vec<(String, String)>),
     #[error("{}", render_held(.0))]
     Held(Vec<(String, String)>),
+    /// A member waits on a DONE prerequisite whose landing parked
+    /// unresolved or is still in flight (spec 00086, D-4): selection would
+    /// never pick it until that prerequisite lands or is resolved.
+    #[error("{}", render_unlanded(.0))]
+    UnlandedPrerequisites(Vec<(String, Vec<UnlandedPrerequisite>)>),
     #[error("reading the store: {0}")]
     Store(#[from] StoreError),
     #[error("reading the orchestrator store: {0}")]
@@ -180,6 +188,24 @@ fn render_unmet(unmet: &[UnmetPrerequisite]) -> String {
                 "task {task} waits on unmet prerequisite{} {}",
                 if prereqs.len() == 1 { "" } else { "s" },
                 prereqs.join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn render_unlanded(tasks: &[(String, Vec<UnlandedPrerequisite>)]) -> String {
+    tasks
+        .iter()
+        .map(|(task, unlanded)| {
+            let names: Vec<String> = unlanded
+                .iter()
+                .map(UnlandedPrerequisite::describe)
+                .collect();
+            format!(
+                "task {task} waits on unlanded prerequisite{} {}",
+                if names.len() == 1 { "" } else { "s" },
+                names.join(", ")
             )
         })
         .collect::<Vec<_>>()
@@ -361,6 +387,33 @@ pub fn plan_scope(
     }
     if !unmet.is_empty() {
         return Err(ScopeError::UnmetPrerequisites(unmet));
+    }
+
+    // Landed-only satisfaction (spec 00086, D-4): a DONE prerequisite whose
+    // landing parked unresolved, or is still in flight, does not admit its
+    // dependent -- with or without `with_prerequisites`, since there is
+    // nothing to pull in. Checked before the phase hold (D-5).
+    if let Some(claims) = env.claims {
+        let now = Utc::now();
+        let mut unlanded: Vec<(String, Vec<UnlandedPrerequisite>)> = Vec::new();
+        for id in listing.order.iter().filter(|id| members.contains(*id)) {
+            if listing.state(id) == Some(TaskState::Done) {
+                continue;
+            }
+            let holds = unlanded_prerequisites_of(
+                control,
+                claims,
+                &listing.row_list,
+                &listing.items[id].prerequisites,
+                now,
+            )?;
+            if !holds.is_empty() {
+                unlanded.push((id.clone(), holds));
+            }
+        }
+        if !unlanded.is_empty() {
+            return Err(ScopeError::UnlandedPrerequisites(unlanded));
+        }
     }
 
     let mut unrunnable: Vec<(String, String)> = Vec::new();

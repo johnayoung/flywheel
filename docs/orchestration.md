@@ -25,6 +25,13 @@ An `ExcludedTask` carries a `reason` naming the offending id(s); cycles are dete
 
 A prerequisite that is absent from the listing is **satisfied by a `done` lifecycle in the store**. The store is the authoritative record of completion; the source listing is an input surface, not the record ([data-taxonomy.md](data-taxonomy.md)). When a prerequisite's defining task leaves the listing (e.g. its phase archived, moving the task JSON out of `active/`) while its lifecycle already reached `done`, the scheduler resolves the edge off the store — the dependent is dispatched, and **no** dangling witness or `prerequisite-missing` review entry is recorded for that edge. The caller consults the store only for ids no listed row provides (`satisfied_prerequisites_from_store`, `crates/flywheel-orchestrator/src/rollup.rs`) and hands the resulting set in as data, so `work_graph.rs` stays store-agnostic and no per-listed-task read is added. A `done` lifecycle satisfies; so does an archived task file (`archive/*/<id>.json` beside the directory source's `active/` tree), since a phase archives only after every task landed — this carries completion across a store-backend switch. Anything else — a `failed` / `running` id, or one absent from both store and archive — still dangles and the bounded re-driver applies.
 
+**A listed `done` prerequisite satisfies only once landed (spec 00086, D-4).** Predicate: `unlanded_prerequisite` (`crates/flywheel-orchestrator/src/orchestrate/prereqs.rs`), the one function selection, `plan_scope`, `fw next`, status, rollup and the hub share. It is unsatisfied when the latest `done` run has no `Landed` witness and either:
+
+- its latest `LandingParked` has no attributed `stop-resolved` (probe, operator, or reland) at least as recent (a newer park holds again), or
+- it never parked and its task claim is held by a live worker (landing in flight).
+
+A `Landed` witness (including `Landed{pr}`, D-8), a never-parked run with no live claim, or a resolution satisfies exactly as before. Fresh selection withholds the dependent and logs `<dep>: waits on unlanded prerequisite <P> (park kind <k>; run ...)` naming `fw reland <P>`. A scoped `fw worker --task` refuses it with exit 2 before claiming, with or without `--with-prereqs`. Unlisted (archived) prerequisites stay satisfied. The phase reachability hold runs after this rule and complements it (D-5).
+
 ### Eligibility (the scheduling query)
 
 `WorkGraph::ready_set(states, &ReadySetQuery { excluded, worker_capabilities, satisfied_prerequisites })` returns **every** runnable item this pass. An item is runnable iff all hold:

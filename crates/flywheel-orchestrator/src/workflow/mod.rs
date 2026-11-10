@@ -67,7 +67,7 @@ pub use ops::{
     cmd_recheck_blocked, cmd_recover, cmd_resolve, format_recheck_line, recover_stranded_lifecycles,
 };
 pub use select::{
-    LatestLifecycleRow, SelectOptions, StatusRow, build_status_rows, cmd_next,
+    LatestLifecycleRow, SelectOptions, StatusRow, build_status_rows, cmd_next, cmd_next_landed,
     latest_lifecycle_row, reachability_held_prerequisites, select_next_task, status_rows,
 };
 pub use show::{
@@ -865,9 +865,11 @@ pub fn dispatch(
             let items = source.list_work()?;
             let (repo_root, true_base) =
                 reachability_context(common.tasks_dir.as_deref(), policy.as_ref());
-            cmd_next(
+            cmd_next_landed(
                 &items,
-                &*stores.core,
+                stores.core.as_ref(),
+                stores.claims.as_ref(),
+                chrono::Utc::now(),
                 policy.as_ref(),
                 Some(&repo_root),
                 Some(&true_base),

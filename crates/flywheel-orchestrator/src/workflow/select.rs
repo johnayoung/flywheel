@@ -7,8 +7,11 @@ use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 
-use flywheel_core::store::{LifecycleStore, StoreError};
+use chrono::{DateTime, Utc};
+use flywheel_core::store::{HarnessStore, LifecycleStore, StoreError};
 
+use crate::claims::ClaimStore;
+use crate::orchestrate::unlanded_prerequisite_holds;
 use crate::policy::WorkPolicy;
 use crate::rollup::{
     TaskState, TaskStatusRow, satisfied_prerequisites_from_store, status_rows_for_items,
@@ -172,7 +175,8 @@ pub fn git_capture(repo_root: &Path, args: &[&str]) -> (i32, String) {
 /// Prerequisites absent from the listing but DONE in the store are
 /// satisfied off the authoritative record, and a dependent held by the
 /// phase-prerequisite reachability hold is withheld exactly as the worker
-/// would refuse to claim it.
+/// would refuse to claim it. This form has no orchestrator store, so it
+/// cannot apply the landed-only rule; [`cmd_next_landed`] does.
 pub fn cmd_next<S: LifecycleStore + ?Sized>(
     items: &[WorkItem],
     store: &S,
@@ -182,17 +186,71 @@ pub fn cmd_next<S: LifecycleStore + ?Sized>(
     out: &mut dyn Write,
 ) -> Result<i32, WorkflowError> {
     let rows = status_rows(items, store)?;
-    let plain = snapshots(&rows);
+    next_from_rows(
+        &rows,
+        store,
+        &BTreeSet::new(),
+        policy,
+        repo_root,
+        true_base,
+        out,
+    )
+}
+
+/// [`cmd_next`] with the landed-only prerequisite rule the worker applies
+/// (spec 00086, D-4): a dependent of a DONE prerequisite whose landing
+/// parked unresolved, or is still in flight in a live worker, is withheld.
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_next_landed(
+    items: &[WorkItem],
+    control: &dyn HarnessStore,
+    claims: &dyn ClaimStore,
+    now: DateTime<Utc>,
+    policy: Option<&WorkPolicy>,
+    repo_root: Option<&Path>,
+    true_base: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<i32, WorkflowError> {
+    let rows = status_rows(items, control)?;
+    let landing_held: BTreeSet<String> =
+        unlanded_prerequisite_holds(control, claims, &snapshots(&rows), now)?
+            .into_keys()
+            .collect();
+    next_from_rows(
+        &rows,
+        control,
+        &landing_held,
+        policy,
+        repo_root,
+        true_base,
+        out,
+    )
+}
+
+fn next_from_rows<S: LifecycleStore + ?Sized>(
+    rows: &[StatusRow],
+    store: &S,
+    landing_held: &BTreeSet<String>,
+    policy: Option<&WorkPolicy>,
+    repo_root: Option<&Path>,
+    true_base: Option<&str>,
+    out: &mut dyn Write,
+) -> Result<i32, WorkflowError> {
+    let plain = snapshots(rows);
     let satisfied = satisfied_prerequisites_from_store(&plain, store)?;
     let held = reachability_held_prerequisites(&plain, repo_root, true_base);
     let options = SelectOptions {
-        exclude_ids: held.into_keys().collect(),
+        exclude_ids: landing_held
+            .iter()
+            .cloned()
+            .chain(held.into_keys())
+            .collect(),
         worker_capabilities: policy
             .map(|p| p.execution_capabilities.clone())
             .unwrap_or_default(),
         satisfied_prerequisites: satisfied,
     };
-    let Some(pick) = select_next_task(&rows, &options) else {
+    let Some(pick) = select_next_task(rows, &options) else {
         return Ok(1);
     };
     match pick.task_file() {

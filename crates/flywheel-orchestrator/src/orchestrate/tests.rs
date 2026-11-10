@@ -4945,3 +4945,385 @@ async fn pending_members_say_why_they_wait() {
          held pending (claimed by peer-worker); fresh pending"
     );
 }
+
+// --- landed-only prerequisite satisfaction (spec 00086, D-4) ----------------------
+
+/// Append `payload` to `run_id`'s ledger at `ts`.
+fn unlanded_prereq_append(
+    f: &Fixture,
+    run_id: &str,
+    ts: DateTime<Utc>,
+    payload: DomainEventPayload,
+) {
+    let lc = f.lifecycle(run_id);
+    f.control
+        .append_domain_event(&DomainEvent::new(run_id, ts, payload), lc.version)
+        .unwrap();
+}
+
+fn unlanded_prereq_park(kind: &str) -> DomainEventPayload {
+    DomainEventPayload::LandingParked(LandingParked {
+        park_kind: kind.to_owned(),
+        detail: format!("parked {kind}"),
+        ..LandingParked::default()
+    })
+}
+
+fn unlanded_prereq_landed() -> DomainEventPayload {
+    DomainEventPayload::Landed(Landed {
+        strategy: "pr".into(),
+        landed_ref: "https://example.invalid/pr/1".into(),
+        rung: String::new(),
+        agent_turns: None,
+        agent_wall_seconds: None,
+    })
+}
+
+fn unlanded_prereq_resolve(f: &Fixture, task_id: &str, at: DateTime<Utc>, attribution: &str) {
+    f.claims
+        .record_stop_event(STOP_RESOLVED, task_id, "resolved", at, attribution)
+        .unwrap();
+}
+
+fn unlanded_prereq_verdict(
+    f: &Fixture,
+    task_id: &str,
+    now: DateTime<Utc>,
+) -> Option<UnlandedPrerequisite> {
+    unlanded_prerequisite(f.control.as_ref(), f.claims.as_ref(), task_id, now).unwrap()
+}
+
+#[test]
+fn unlanded_prereq_predicate_covers_park_resolution_landed_and_in_flight() {
+    let f = Fixture::new();
+    let now = t0();
+    // No DONE run at all: not this predicate's concern.
+    assert_eq!(unlanded_prereq_verdict(&f, "absent", now), None);
+    f.seed("failing", "run-failing", Status::Failed, "boom");
+    assert_eq!(unlanded_prereq_verdict(&f, "failing", now), None);
+
+    // DONE, never parked, no claim: satisfied as before.
+    f.seed("clean", "run-clean", Status::Done, "");
+    assert_eq!(unlanded_prereq_verdict(&f, "clean", now), None);
+
+    // DONE with an unresolved park: unsatisfied, naming the park kind.
+    f.seed("parked", "run-parked", Status::Done, "");
+    unlanded_prereq_append(
+        &f,
+        "run-parked",
+        now,
+        unlanded_prereq_park(PARK_KIND_HELD_OUT_GATE),
+    );
+    let hold = unlanded_prereq_verdict(&f, "parked", now).unwrap();
+    assert_eq!(hold.task_id, "parked");
+    assert_eq!(hold.run_id, "run-parked");
+    assert_eq!(hold.park_kind, PARK_KIND_HELD_OUT_GATE);
+    assert!(!hold.in_flight());
+    assert_eq!(
+        hold.describe(),
+        format!("parked (park kind {PARK_KIND_HELD_OUT_GATE}; run `fw reland parked`)")
+    );
+
+    // A resolution older than the park does not release it.
+    unlanded_prereq_resolve(
+        &f,
+        "parked",
+        now - ChronoDuration::seconds(10),
+        RESOLUTION_ATTRIBUTION_OPERATOR,
+    );
+    assert!(unlanded_prereq_verdict(&f, "parked", now).is_some());
+    // One at least as recent as the park does (probe, operator, or reland).
+    unlanded_prereq_resolve(
+        &f,
+        "parked",
+        now,
+        crate::claims::RESOLUTION_ATTRIBUTION_PROBE,
+    );
+    assert_eq!(unlanded_prereq_verdict(&f, "parked", now), None);
+    // A park newer than the resolution holds again.
+    unlanded_prereq_append(
+        &f,
+        "run-parked",
+        now + ChronoDuration::seconds(5),
+        unlanded_prereq_park(PARK_KIND_DIVERGENT_BASE),
+    );
+    assert_eq!(
+        unlanded_prereq_verdict(&f, "parked", now).map(|h| h.park_kind),
+        Some(PARK_KIND_DIVERGENT_BASE.to_owned())
+    );
+    unlanded_prereq_resolve(
+        &f,
+        "parked",
+        now + ChronoDuration::seconds(6),
+        RESOLUTION_ATTRIBUTION_RELAND,
+    );
+    assert_eq!(unlanded_prereq_verdict(&f, "parked", now), None);
+
+    // A Landed witness (Landed{pr} included, D-8) satisfies even after a park.
+    f.seed("relanded", "run-relanded", Status::Done, "");
+    unlanded_prereq_append(
+        &f,
+        "run-relanded",
+        now,
+        unlanded_prereq_park(PARK_KIND_DIVERGENT_BASE),
+    );
+    unlanded_prereq_append(
+        &f,
+        "run-relanded",
+        now + ChronoDuration::seconds(1),
+        unlanded_prereq_landed(),
+    );
+    assert_eq!(unlanded_prereq_verdict(&f, "relanded", now), None);
+
+    // DONE, no witness yet, its claim live in another worker: mid-landing.
+    f.seed("landing", "run-landing", Status::Done, "");
+    f.claims
+        .acquire_claim("landing", "worker-b", now, 60.0, &BTreeSet::new())
+        .unwrap()
+        .unwrap();
+    let hold = unlanded_prereq_verdict(&f, "landing", now).unwrap();
+    assert!(hold.in_flight());
+    assert_eq!(hold.describe(), "landing (landing in progress)");
+    // A lapsed lease is no live worker: satisfied.
+    assert_eq!(
+        unlanded_prereq_verdict(&f, "landing", now + ChronoDuration::seconds(61)),
+        None
+    );
+    // ... and a landed one is satisfied while its claim is still held.
+    unlanded_prereq_append(&f, "run-landing", now, unlanded_prereq_landed());
+    assert_eq!(unlanded_prereq_verdict(&f, "landing", now), None);
+}
+
+#[test]
+fn unlanded_prereq_holds_key_dependents_and_skip_unlisted_prerequisites() {
+    let f = Fixture::new();
+    f.seed("parked", "run-parked", Status::Done, "");
+    unlanded_prereq_append(
+        &f,
+        "run-parked",
+        t0(),
+        unlanded_prereq_park(PARK_KIND_HELD_OUT_GATE),
+    );
+    f.seed("archived", "run-archived", Status::Done, "");
+    unlanded_prereq_append(
+        &f,
+        "run-archived",
+        t0(),
+        unlanded_prereq_park(PARK_KIND_HELD_OUT_GATE),
+    );
+    let items = vec![
+        item("parked"),
+        item("child").with_prerequisites(["parked", "archived"]),
+        item("other").with_prerequisites(["archived"]),
+    ];
+    let rows = status_rows_for_items(&items, f.control.as_ref()).unwrap();
+    let holds =
+        unlanded_prerequisite_holds(f.control.as_ref(), f.claims.as_ref(), &rows, t0()).unwrap();
+    assert_eq!(holds.keys().collect::<Vec<_>>(), ["child"]);
+    assert_eq!(
+        holds["child"]
+            .iter()
+            .map(|h| h.task_id.as_str())
+            .collect::<Vec<_>>(),
+        ["parked"]
+    );
+    let of = unlanded_prerequisites_of(
+        f.control.as_ref(),
+        f.claims.as_ref(),
+        &rows,
+        &["archived".to_owned(), "parked".to_owned()],
+        t0(),
+    )
+    .unwrap();
+    assert_eq!(of.len(), 1);
+    assert_eq!(of[0].task_id, "parked");
+}
+
+#[tokio::test]
+async fn unlanded_prereq_parked_prerequisite_never_selects_its_dependent() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parent", vec![Some(PARK_KIND_HELD_OUT_GATE)]);
+    let source = MemorySource::new(vec![
+        item("parent"),
+        item("child").with_prerequisites(["parent"]),
+    ]);
+    let mut req = f.request(source);
+    req.strategy = Some(strategy.clone());
+    req.landing_redrive_bound = Some(0);
+    let report = run(req.clone()).await;
+    assert_eq!(ids(&report), ["parent"]);
+    for _ in 0..3 {
+        assert!(run(req.clone()).await.runs.is_empty());
+    }
+    assert!(lifecycles_of(&f, "child").is_empty());
+    assert!(f.claims.load_claim("child").unwrap().is_none());
+    assert!(strategy.prepares().iter().all(|(id, _)| id != "child"));
+    assert!(f.log.contains(&format!(
+        "child: waits on unlanded prerequisite parent (park kind {PARK_KIND_HELD_OUT_GATE}; run `fw reland parent`)"
+    )));
+
+    // `fw resolve` (an operator stop-resolved after the park) releases it.
+    unlanded_prereq_resolve(&f, "parent", Utc::now(), RESOLUTION_ATTRIBUTION_OPERATOR);
+    assert_eq!(ids(&run(req.clone()).await), ["child"]);
+}
+
+#[tokio::test]
+async fn unlanded_prereq_probe_resolution_releases_the_dependent() {
+    let f = Fixture::new();
+    f.seed("parent", "run-parent", Status::Done, "");
+    unlanded_prereq_append(
+        &f,
+        "run-parent",
+        t0(),
+        unlanded_prereq_park(PARK_KIND_DIVERGENT_BASE),
+    );
+    let source = MemorySource::new(vec![
+        item("parent"),
+        item("child").with_prerequisites(["parent"]),
+    ]);
+    assert!(run(f.request(source.clone())).await.runs.is_empty());
+    assert!(lifecycles_of(&f, "child").is_empty());
+    // The archive probe confirmed a hand merge.
+    unlanded_prereq_resolve(
+        &f,
+        "parent",
+        t0(),
+        crate::claims::RESOLUTION_ATTRIBUTION_PROBE,
+    );
+    assert_eq!(ids(&run(f.request(source)).await), ["child"]);
+}
+
+#[tokio::test]
+async fn unlanded_prereq_landed_chain_runs_in_one_session() {
+    let f = Fixture::new();
+    let strategy = f.strategy().park_sequence("parent", vec![None]);
+    let source = MemorySource::new(vec![
+        item("child").with_prerequisites(["parent"]),
+        item("parent"),
+    ]);
+    let mut req = f.request(source);
+    req.strategy = Some(strategy.clone());
+    let report = run(req).await;
+    assert_eq!(ids(&report), ["parent", "child"]);
+    assert!(report.runs.iter().all(|r| r.status == Status::Done));
+}
+
+#[tokio::test]
+async fn unlanded_prereq_in_flight_landing_in_another_worker_holds_the_dependent() {
+    let f = Fixture::new();
+    f.seed("parent", "run-parent", Status::Done, "");
+    let peer = f
+        .claims
+        .acquire_claim("parent", "worker-b", t0(), 600.0, &BTreeSet::new())
+        .unwrap()
+        .unwrap();
+    let source = MemorySource::new(vec![
+        item("parent"),
+        item("child").with_prerequisites(["parent"]),
+    ]);
+    assert!(run(f.request(source.clone())).await.runs.is_empty());
+    assert!(lifecycles_of(&f, "child").is_empty());
+    assert!(
+        f.log
+            .contains("child: waits on unlanded prerequisite parent (landing in progress)")
+    );
+    // The peer lands and releases: the dependent runs.
+    unlanded_prereq_append(&f, "run-parent", t0(), unlanded_prereq_landed());
+    f.claims.release_claim(&peer, Some(t0())).unwrap();
+    assert_eq!(ids(&run(f.request(source)).await), ["child"]);
+}
+
+#[tokio::test]
+async fn unlanded_prereq_unlisted_archived_prerequisite_stays_satisfied() {
+    let f = Fixture::new();
+    f.seed("archived", "run-archived", Status::Done, "");
+    unlanded_prereq_append(
+        &f,
+        "run-archived",
+        t0(),
+        unlanded_prereq_park(PARK_KIND_HELD_OUT_GATE),
+    );
+    let source = MemorySource::new(vec![item("child").with_prerequisites(["archived"])]);
+    assert_eq!(ids(&run(f.request(source)).await), ["child"]);
+}
+
+#[test]
+fn unlanded_prereq_scope_refuses_named_dependent_with_and_without_with_prereqs() {
+    let f = Fixture::new();
+    f.seed("parent", "run-parent", Status::Done, "");
+    unlanded_prereq_append(
+        &f,
+        "run-parent",
+        t0(),
+        unlanded_prereq_park(PARK_KIND_HELD_OUT_GATE),
+    );
+    let source = MemorySource::new(vec![
+        item("parent"),
+        item("child").with_prerequisites(["parent"]),
+    ]);
+    let env = ScopeEnv {
+        claims: Some(f.claims.as_ref()),
+        ..ScopeEnv::default()
+    };
+    for with_prerequisites in [false, true] {
+        let err = plan_scope(
+            source.as_ref(),
+            f.control.as_ref(),
+            &scope_request(&["child"], with_prerequisites),
+            &env,
+        )
+        .unwrap_err();
+        assert!(matches!(&err, ScopeError::UnlandedPrerequisites(u) if u.len() == 1));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "task child waits on unlanded prerequisite parent (park kind {PARK_KIND_HELD_OUT_GATE}; run `fw reland parent`)"
+            )
+        );
+    }
+    assert!(lifecycles_of(&f, "child").is_empty());
+    assert!(f.claims.list_claims().unwrap().is_empty());
+    // Resolved: admitted.
+    unlanded_prereq_resolve(&f, "parent", Utc::now(), RESOLUTION_ATTRIBUTION_OPERATOR);
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["child"], false),
+        &env,
+    )
+    .unwrap();
+    assert_eq!(plan.named, ["child"]);
+}
+
+#[test]
+fn unlanded_prereq_next_withholds_the_dependent() {
+    let f = Fixture::new();
+    f.seed("parent", "run-parent", Status::Done, "");
+    unlanded_prereq_append(
+        &f,
+        "run-parent",
+        t0(),
+        unlanded_prereq_park(PARK_KIND_HELD_OUT_GATE),
+    );
+    let items = vec![item("parent"), item("child").with_prerequisites(["parent"])];
+    let next = |f: &Fixture| {
+        let mut out = Vec::new();
+        let code = crate::workflow::cmd_next_landed(
+            &items,
+            f.control.as_ref(),
+            f.claims.as_ref(),
+            t0(),
+            None,
+            None,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        (code, String::from_utf8(out).unwrap())
+    };
+    assert_eq!(next(&f), (1, String::new()));
+    unlanded_prereq_resolve(&f, "parent", Utc::now(), RESOLUTION_ATTRIBUTION_OPERATOR);
+    assert_eq!(next(&f), (0, "ref:child\n".to_owned()));
+}

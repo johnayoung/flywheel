@@ -6,8 +6,8 @@
 use crate::claims::{
     ClaimStore, ClaimStoreError, REASON_ABORTED, REASON_AWAITING_APPROVAL, REASON_BUDGET_CEILING,
     REASON_NO_PROGRESS, REASON_PREREQUISITE_MISSING, REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
-    RESOLUTION_ATTRIBUTIONS, STOP_DANGLING_PREREQUISITE, STOP_NO_PROGRESS, STOP_NO_PROGRESS_RESET,
-    STOP_RESOLVED, STOP_RETRIES_ESCALATED, TaskClaim,
+    STOP_DANGLING_PREREQUISITE, STOP_NO_PROGRESS, STOP_NO_PROGRESS_RESET, STOP_RETRIES_ESCALATED,
+    TaskClaim,
 };
 use crate::held_out_gate::{GateOptions, HeldOutGraderSource, LandingDecision, gate_landing};
 use crate::sources::LogSink;
@@ -17,9 +17,8 @@ use crate::strategy::{
 };
 use crate::work_graph::GraphValidationIssue;
 use flywheel_core::events::{
-    DomainEvent, DomainEventKind, DomainEventPayload, LANDING_PARK_KINDS, LandingParked,
-    LandingRedriven, PARK_KIND_HELD_OUT_GATE, REDRIVE_RESULT_LANDED, REDRIVE_RESULT_REPARKED,
-    REDRIVE_RESULT_ROUTED,
+    DomainEvent, DomainEventPayload, LANDING_PARK_KINDS, LandingParked, LandingRedriven,
+    PARK_KIND_HELD_OUT_GATE, REDRIVE_RESULT_LANDED, REDRIVE_RESULT_REPARKED, REDRIVE_RESULT_ROUTED,
 };
 use flywheel_core::harness::BUDGET_CEILING_ERROR_PREFIX;
 use flywheel_core::invoker_client::Clock;
@@ -141,21 +140,9 @@ pub(super) fn resolved_since_latest_park(
     task_id: &str,
     run_id: &str,
 ) -> Result<bool, OrchestrateError> {
-    let Some(resolved_at) = claims
-        .list_subject_stop_events(task_id)?
-        .into_iter()
-        .filter(|event| {
-            event.kind == STOP_RESOLVED
-                && RESOLUTION_ATTRIBUTIONS.contains(&event.attribution.as_str())
-        })
-        .map(|event| event.occurred_at)
-        .next_back()
-    else {
-        return Ok(false);
-    };
-    Ok(control
-        .latest_domain_event_of_kind(run_id, DomainEventKind::LandingParked)?
-        .is_some_and(|park| park.ts <= resolved_at))
+    Ok(super::prereqs::resolved_since_latest_park(
+        control, claims, task_id, run_id,
+    )?)
 }
 
 /// The `initiator` an automatic re-drive's `LandingRedriven` record carries:

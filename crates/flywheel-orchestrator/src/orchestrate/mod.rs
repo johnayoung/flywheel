@@ -34,8 +34,10 @@ mod tests;
 pub use drive::{ProgressProbeFactory, final_grader_receipts};
 pub use heartbeat::ClaimHeartbeat;
 pub use prereqs::{
-    DEFAULT_MAX_RETRIES, DEFAULT_MAX_TURNS, LatestLifecycleRow, STRANDED_STATUSES,
-    latest_lifecycle_row, reachability_held_prerequisites, stranded_run_ids,
+    DEFAULT_MAX_RETRIES, DEFAULT_MAX_TURNS, LandingRecordError, LatestLifecycleRow,
+    STRANDED_STATUSES, UnlandedPrerequisite, latest_lifecycle_row, reachability_held_prerequisites,
+    resolved_since_latest_park, stranded_run_ids, unlanded_prerequisite,
+    unlanded_prerequisite_holds, unlanded_prerequisites_of,
 };
 pub use primitives::{
     AttemptBudgetPrimitives, SandboxLimitPrimitives, attempt_budget_primitives,
@@ -593,6 +595,29 @@ pub async fn orchestrate(
         )
         .into_keys()
         .collect();
+        // Landed-only satisfaction (spec 00086, D-4), complemented -- not
+        // replaced -- by the phase hold above (D-5): a dependent of a DONE
+        // prerequisite whose landing parked unresolved, or is still in
+        // flight in a live worker, is withheld from fresh selection.
+        let landing_held =
+            unlanded_prerequisite_holds(control.as_ref(), claims.as_ref(), &rows, clock())?;
+        for (dependent, unlanded) in &landing_held {
+            if !in_scope(scope, dependent) || attempted_fresh.contains(dependent) {
+                continue;
+            }
+            let names: Vec<String> = unlanded
+                .iter()
+                .map(UnlandedPrerequisite::describe)
+                .collect();
+            emit(
+                log.as_ref(),
+                format!(
+                    "[orchestrate] {dependent}: waits on unlanded prerequisite{} {}; not selecting",
+                    if names.len() == 1 { "" } else { "s" },
+                    names.join(", ")
+                ),
+            );
+        }
         let dangling: Vec<_> = validation
             .issues
             .iter()
@@ -1052,6 +1077,7 @@ pub async fn orchestrate(
                 .iter()
                 .chain(blocked_ids.iter())
                 .chain(held.iter())
+                .chain(landing_held.keys())
                 .chain(reachability_held.iter())
                 .chain(out_of_scope.iter())
                 .cloned()

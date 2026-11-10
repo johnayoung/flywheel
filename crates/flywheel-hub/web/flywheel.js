@@ -15,7 +15,7 @@
 "use strict";
 
 window.FwHubFlywheel = function (ctx) {
-  const { $, el, icon, api, state, workspaceById, folderLabel, openSession, toast, confirmDialog } = ctx;
+  const { $, el, icon, api, state, store, workspaceById, folderLabel, openSession, toast, confirmDialog } = ctx;
 
   const RUN_POLL_MS = 2000;
   // Transcript entries the run viewer keeps (the oldest are dropped).
@@ -27,6 +27,10 @@ window.FwHubFlywheel = function (ctx) {
   // one row that opens its panel.
   const ATTENTION_PER_FOLDER = 2;
   const SEEN_KEY = "fw-hub.flywheel-seen";
+  // The drawer's sections collapsed by title (this browser), kept across
+  // closing and reopening it.
+  const COLLAPSED_KEY = "flywheel-collapsed";
+  const collapsed = new Set(store.get(COLLAPSED_KEY, []));
   const ui = {
     enabled: false,
     summaries: new Map(), // folder path -> summary
@@ -477,13 +481,40 @@ window.FwHubFlywheel = function (ctx) {
     }
   });
 
+  // A drawer section; its heading folds it, remembered per title.
   function section(title, count, ...body) {
-    return el(
-      "section",
-      { className: "fw-sec" },
-      el("h3", {}, title, count !== undefined && count !== null ? el("span", { className: "fw-n", textContent: String(count) }) : null),
-      ...body,
+    const shut = collapsed.has(title);
+    const content = el("div", { className: "fw-sec-body", hidden: shut }, ...body);
+    const toggle = el(
+      "button",
+      {
+        type: "button",
+        className: "fw-sec-toggle",
+        "aria-expanded": String(!shut),
+        title: shut ? `Expand ${title}` : `Collapse ${title}`,
+        dataset: { fwAction: "toggle-section" },
+        onclick: () => {
+          const fold = !collapsed.has(title);
+          if (fold) collapsed.add(title);
+          else collapsed.delete(title);
+          store.set(COLLAPSED_KEY, [...collapsed]);
+          content.hidden = fold;
+          node.classList.toggle("collapsed", fold);
+          toggle.setAttribute("aria-expanded", String(!fold));
+          toggle.title = `${fold ? "Expand" : "Collapse"} ${title}`;
+        },
+      },
+      icon("chev"),
+      title,
+      count !== undefined && count !== null ? el("span", { className: "fw-n", textContent: String(count) }) : null,
     );
+    const node = el(
+      "section",
+      { className: `fw-sec${shut ? " collapsed" : ""}`, dataset: { fwSection: title } },
+      el("h3", {}, toggle),
+      content,
+    );
+    return node;
   }
 
   function outputButton(run_id, task) {
@@ -872,6 +903,28 @@ window.FwHubFlywheel = function (ctx) {
     );
   }
 
+  // Open (or select) the folder's board tab in its workspace.
+  function boardButton(folder) {
+    const workspace = workspaceFor(folder);
+    if (!workspace) return null;
+    return el(
+      "div",
+      { className: "fw-board-link" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "text-btn",
+          title: `Show the flywheel board of ${pathOf(folder)} in workspace ${workspace.name}`,
+          dataset: { fwAction: "open-board", fwFolder: pathOf(folder) },
+          onclick: () => ctx.openBoard(workspace.id, pathOf(folder)),
+        },
+        icon("wheel"),
+        "open board",
+      ),
+    );
+  }
+
   function renderDrawer() {
     const drawer = $("#flywheel");
     drawer.hidden = !ui.folder;
@@ -930,6 +983,8 @@ window.FwHubFlywheel = function (ctx) {
         el("div", { className: "fw-where" }, el("span", { textContent: panel.source }), el("span", { textContent: panel.store })),
       ),
     ];
+    const board = boardButton(folder);
+    if (board) children.unshift(board);
     if (ui.error) children.push(el("p", { className: "fw-problem", role: "alert", textContent: ui.error }));
     if (untrusted) {
       children.push(el(

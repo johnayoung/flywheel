@@ -138,6 +138,29 @@
   letter-spacing: .06em;
   text-transform: uppercase;
 }
+.fw-sec h3 { margin: 0; }
+.fw-sec-toggle {
+  display: flex;
+  align-items: baseline;
+  gap: .6rem;
+  width: 100%;
+  margin: 0 0 .45rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.fw-sec-toggle svg { width: .7rem; height: .7rem; align-self: center; color: var(--ink-3); transform: rotate(90deg); transition: transform .2s var(--ease); }
+.fw-sec.collapsed .fw-sec-toggle svg { transform: none; }
+.fw-sec.collapsed .fw-sec-toggle { margin-bottom: 0; }
+.fw-sec-toggle:focus-visible { outline: 1px solid var(--signal); outline-offset: 2px; }
+.fw-board-link { display: flex; justify-content: flex-end; margin-top: .6rem; }
+.fw-board-link svg { width: .8rem; height: .8rem; margin-right: .35rem; vertical-align: -.1em; }
 .fw-n { font: 500 10px/1 var(--mono); letter-spacing: .08em; color: var(--ink-3); text-transform: none; }
 
 .fw-list { list-style: none; margin: 0; padding: 0; }

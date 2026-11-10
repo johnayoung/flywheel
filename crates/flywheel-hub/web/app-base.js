@@ -417,8 +417,10 @@ function closeOverlays(keep) {
 // The Flywheel panel (flywheel.js): verified-loop state for the
 // flywheel-adopted folders.
 const flywheel = window.FwHubFlywheel({
-  $, el, icon, api, age, span, state, workspaceById, sessionById, folderLabel,
+  $, el, icon, api, age, span, state, store, workspaceById, sessionById, folderLabel,
   keyOf: (id) => settings.keyOf(id),
+  // The drawer's "open board" (app-layout.js).
+  openBoard: (workspaceId, folder) => openBoard(workspaceId, folder),
   machinePrefix: (machine) => machines.prefix(machine),
   openSession: (id, place) => openSession(id, place),
   toast: commands.toast,

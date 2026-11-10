@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use super::pauses::PauseSelector;
+
 /// Default `--max-turns` (mirrors `flywheel_core.workflow.DEFAULT_MAX_TURNS`).
 pub const DEFAULT_MAX_TURNS: i64 = 500;
 /// Default `--max-retries` (mirrors `flywheel_core.workflow.DEFAULT_MAX_RETRIES`).
@@ -21,7 +23,7 @@ pub const DEFAULT_LEASE_SECONDS: f64 = 300.0;
 pub const DEFAULT_RECONCILE_SECONDS: f64 = 15.0;
 
 /// The verb names in declaration order (the `{...}` choice list).
-pub const COMMANDS: [&str; 12] = [
+pub const COMMANDS: [&str; 13] = [
     "init",
     "next",
     "orchestrate",
@@ -34,6 +36,7 @@ pub const COMMANDS: [&str; 12] = [
     "recheck-blocked",
     "recover",
     "resolve",
+    "pauses",
 ];
 
 /// `--status` choices for `history`.
@@ -135,6 +138,25 @@ pub struct ResolveArgs {
     pub db: Option<String>,
 }
 
+/// What a `pauses` invocation does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PausesAction {
+    /// `fw pauses [--json]`: list every pause, newest first.
+    List { json: bool },
+    /// `fw pauses clear (ID... | --account NAME | --default | --all)
+    /// --reason TEXT`.
+    Clear {
+        selector: PauseSelector,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PausesArgs {
+    pub action: PausesAction,
+    pub db: Option<String>,
+}
+
 /// One parsed verb invocation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
@@ -150,6 +172,7 @@ pub enum Command {
     RecheckBlocked(RecheckBlockedArgs),
     Recover(RecoverArgs),
     Resolve(ResolveArgs),
+    Pauses(PausesArgs),
 }
 
 impl Command {
@@ -168,6 +191,7 @@ impl Command {
             Command::RecheckBlocked(_) => "recheck-blocked",
             Command::Recover(_) => "recover",
             Command::Resolve(_) => "resolve",
+            Command::Pauses(_) => "pauses",
         }
     }
 }
@@ -300,6 +324,14 @@ fn options_for(verb: &str) -> Vec<OptSpec> {
         }
         "recover" => opts.extend([one("--db"), one("--task-id")]),
         "resolve" => opts.extend([one("--reason"), one("--db")]),
+        "pauses" => opts.extend([
+            flag("--json"),
+            one("--account"),
+            flag("--default"),
+            flag("--all"),
+            one("--reason"),
+            one("--db"),
+        ]),
         _ => {}
     }
     opts
@@ -501,6 +533,9 @@ struct Collected {
     dry_run: bool,
     task_id: Option<String>,
     reason: Option<String>,
+    account: Option<String>,
+    default_account: bool,
+    all: bool,
     positionals: Vec<String>,
     extras: Vec<String>,
     help: bool,
@@ -544,6 +579,9 @@ fn collect(verb: &str, tokens: Vec<Token>) -> Result<Collected, ArgError> {
                     "--dry-run" => c.dry_run = true,
                     "--task-id" => c.task_id = Some(v),
                     "--reason" => c.reason = Some(v),
+                    "--account" => c.account = Some(v),
+                    "--default" => c.default_account = true,
+                    "--all" => c.all = true,
                     _ => {}
                 }
             }
@@ -660,6 +698,7 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
                 db: c.common.db.clone(),
             })
         }
+        "pauses" => Command::Pauses(parse_pauses(verb, &c, &mut positionals)?),
         _ => unreachable!("verb membership checked above"),
     };
     // Surplus positionals and unknown options bubble to the top-level
@@ -677,20 +716,106 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
     Ok(Parsed::Command(command))
 }
 
+/// The `pauses` verb: bare (list) or `clear` with exactly one selector and
+/// a required `--reason`. Every positional after `clear` is a pause id.
+fn parse_pauses(
+    verb: &str,
+    c: &Collected,
+    positionals: &mut std::vec::IntoIter<String>,
+) -> Result<PausesArgs, ArgError> {
+    let db = c.common.db.clone();
+    let Some(action) = positionals.next() else {
+        let clear_only = [
+            ("--account", c.account.is_some()),
+            ("--default", c.default_account),
+            ("--all", c.all),
+            ("--reason", c.reason.is_some()),
+        ];
+        if let Some((name, _)) = clear_only.iter().find(|(_, given)| *given) {
+            return Err(ArgError::sub(
+                verb,
+                format!("argument {name}: only valid with 'pauses clear'"),
+            ));
+        }
+        return Ok(PausesArgs {
+            action: PausesAction::List {
+                json: c.status_json,
+            },
+            db,
+        });
+    };
+    if action != "clear" {
+        return Err(ArgError::sub(
+            verb,
+            format!("argument action: invalid choice: '{action}' (choose from clear)"),
+        ));
+    }
+    if c.status_json {
+        return Err(ArgError::sub(
+            verb,
+            "argument --json: not allowed with 'pauses clear'",
+        ));
+    }
+    let ids = positionals
+        .map(|raw| parse_int(verb, "ID", &raw))
+        .collect::<Result<Vec<i64>, ArgError>>()?;
+    let mut selectors: Vec<(&str, PauseSelector)> = Vec::new();
+    if !ids.is_empty() {
+        selectors.push(("ID", PauseSelector::Ids(ids)));
+    }
+    if let Some(account) = &c.account {
+        selectors.push(("--account", PauseSelector::Account(account.clone())));
+    }
+    if c.default_account {
+        selectors.push((
+            "--default",
+            PauseSelector::Account(crate::claims::DEFAULT_PAUSE_ACCOUNT.to_owned()),
+        ));
+    }
+    if c.all {
+        selectors.push(("--all", PauseSelector::All));
+    }
+    if selectors.len() > 1 {
+        return Err(ArgError::sub(
+            verb,
+            format!(
+                "argument {}: not allowed with argument {}",
+                selectors[1].0, selectors[0].0
+            ),
+        ));
+    }
+    let Some((_, selector)) = selectors.pop() else {
+        return Err(ArgError::sub(
+            verb,
+            "one of the arguments ID --account --default --all is required",
+        ));
+    };
+    let Some(reason) = c.reason.clone() else {
+        return Err(ArgError::sub(
+            verb,
+            "the following arguments are required: --reason",
+        ));
+    };
+    Ok(PausesArgs {
+        action: PausesAction::Clear { selector, reason },
+        db,
+    })
+}
+
 // --- Usage and help text ----------------------------------------------------------
 
 pub const TOP_USAGE: &str = "usage: flywheel [-h]
-                {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve} ...
+                {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve,pauses} ...
 ";
 
 pub const TOP_HELP: &str = "usage: flywheel [-h]
-                {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve} ...
+                {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve,pauses} ...
 
 Schedule and drive many flywheel tasks laid out under the project's
 tasks/active/<phase>/ ($FLYWHEEL_HOME/projects/<id>/).
 
 positional arguments:
-  {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve}
+  {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve,pauses}
     init                Resolve this repo's project under $FLYWHEEL_HOME,
                         create the user config if missing, install the fw-*
                         skills at user level, and print a suggested
@@ -731,6 +856,8 @@ positional arguments:
                         operator-attributed resolution with a reason so the
                         next archive sweep archives the otherwise-landed
                         phase. The only non-probe path to clearing a strand.
+    pauses              List session-limit pauses newest first; 'pauses clear'
+                        clears active ones with a recorded reason.
 
 options:
   -h, --help            show this help message and exit
@@ -916,6 +1043,28 @@ options:
                    under $FLYWHEEL_HOME).
 ";
 
+const PAUSES_USAGE: &str = "usage: flywheel pauses [-h] [--json] [--db DB]
+       flywheel pauses clear [-h] (ID [ID ...] | --account NAME | --default |
+                             --all) --reason REASON [--db DB]
+";
+
+const PAUSES_BODY: &str = "
+positional arguments:
+  clear            Clear the matching active pauses: append a cli-attributed
+                   record (time, reason); the pause row is never deleted.
+  ID               Pause id to clear (see 'flywheel pauses').
+
+options:
+  -h, --help       show this help message and exit
+  --json           Emit every pause as a JSON array, newest first.
+  --account NAME   Clear the active pauses recorded under account NAME.
+  --default        Clear the active pauses of the default (cli login) account.
+  --all            Clear every active pause, pre-account pauses included.
+  --reason REASON  Why the pauses are cleared. Recorded verbatim.
+  --db DB          SQLite database path (default: the project's flywheel.sqlite
+                   under $FLYWHEEL_HOME).
+";
+
 const OPTIONS_HEAD_WIDE: &str = "
 options:
   -h, --help            show this help message and exit
@@ -936,6 +1085,7 @@ pub fn usage_for(verb: &str) -> &'static str {
         "recheck-blocked" => RECHECK_USAGE,
         "recover" => RECOVER_USAGE,
         "resolve" => RESOLVE_USAGE,
+        "pauses" => PAUSES_USAGE,
         _ => TOP_USAGE,
     }
 }
@@ -965,6 +1115,7 @@ pub fn help_for(verb: &str) -> String {
         }
         "recover" => format!("{RECOVER_USAGE}{RECOVER_OPTIONS}"),
         "resolve" => format!("{RESOLVE_USAGE}{RESOLVE_BODY}"),
+        "pauses" => format!("{PAUSES_USAGE}{PAUSES_BODY}"),
         _ => TOP_HELP.to_owned(),
     }
 }
@@ -1004,7 +1155,7 @@ mod tests {
         assert_eq!(
             err(&["bogus"]),
             format!(
-                "{TOP_USAGE}flywheel: error: argument command: invalid choice: 'bogus' (choose from init, next, orchestrate, status, live, history, show, archive, validate, recheck-blocked, recover, resolve)\n"
+                "{TOP_USAGE}flywheel: error: argument command: invalid choice: 'bogus' (choose from init, next, orchestrate, status, live, history, show, archive, validate, recheck-blocked, recover, resolve, pauses)\n"
             )
         );
     }
@@ -1061,7 +1212,7 @@ mod tests {
         );
         assert_eq!(
             err(&["init", "--store", "postgres"]),
-            "usage: flywheel [-h]\n                {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve} ...\nflywheel: error: unrecognized arguments: --store postgres\n"
+            "usage: flywheel [-h]\n                {init,next,orchestrate,status,live,history,show,archive,validate,recheck-blocked,recover,resolve,pauses} ...\nflywheel: error: unrecognized arguments: --store postgres\n"
         );
         assert_eq!(
             err(&["status", "--json=1"]),
@@ -1229,6 +1380,96 @@ mod tests {
                 limit: -1,
                 ..HistoryArgs::default()
             })
+        );
+    }
+
+    fn clear(selector: PauseSelector, reason: &str) -> Command {
+        Command::Pauses(PausesArgs {
+            action: PausesAction::Clear {
+                selector,
+                reason: reason.into(),
+            },
+            db: None,
+        })
+    }
+
+    #[test]
+    fn pauses_verb_parses_list_and_every_clear_selector() {
+        assert_eq!(
+            cmd(&["pauses"]),
+            Command::Pauses(PausesArgs {
+                action: PausesAction::List { json: false },
+                db: None,
+            })
+        );
+        assert_eq!(
+            cmd(&["pauses", "--json", "--db", "d"]),
+            Command::Pauses(PausesArgs {
+                action: PausesAction::List { json: true },
+                db: Some("d".into()),
+            })
+        );
+        assert_eq!(
+            cmd(&["pauses", "clear", "3", "7", "--reason", " r  verbatim "]),
+            clear(PauseSelector::Ids(vec![3, 7]), " r  verbatim ")
+        );
+        assert_eq!(
+            cmd(&["pauses", "clear", "--account", "work", "--reason", "r"]),
+            clear(PauseSelector::Account("work".into()), "r")
+        );
+        assert_eq!(
+            cmd(&["pauses", "clear", "--default", "--reason=r"]),
+            clear(PauseSelector::Account(String::new()), "r")
+        );
+        assert_eq!(
+            cmd(&["pauses", "clear", "--all", "--reason", ""]),
+            clear(PauseSelector::All, "")
+        );
+        assert!(help_for("pauses").contains("--reason REASON"));
+        assert_eq!(
+            parse_args(&argv(&["pauses", "clear", "-h"])),
+            Ok(Parsed::Help(help_for("pauses")))
+        );
+    }
+
+    #[test]
+    fn pauses_verb_usage_errors() {
+        let sub = |message: &str| format!("{PAUSES_USAGE}flywheel pauses: error: {message}\n");
+        assert_eq!(
+            err(&["pauses", "clear", "--all"]),
+            sub("the following arguments are required: --reason")
+        );
+        assert_eq!(
+            err(&["pauses", "clear", "--reason", "r"]),
+            sub("one of the arguments ID --account --default --all is required")
+        );
+        assert_eq!(
+            err(&["pauses", "clear", "--all", "--default", "--reason", "r"]),
+            sub("argument --all: not allowed with argument --default")
+        );
+        assert_eq!(
+            err(&["pauses", "clear", "1", "--account", "a", "--reason", "r"]),
+            sub("argument --account: not allowed with argument ID")
+        );
+        assert_eq!(
+            err(&["pauses", "clear", "x", "--reason", "r"]),
+            sub("argument ID: invalid int value: 'x'")
+        );
+        assert_eq!(
+            err(&["pauses", "drop"]),
+            sub("argument action: invalid choice: 'drop' (choose from clear)")
+        );
+        assert_eq!(
+            err(&["pauses", "--all"]),
+            sub("argument --all: only valid with 'pauses clear'")
+        );
+        assert_eq!(
+            err(&["pauses", "clear", "--json", "--all", "--reason", "r"]),
+            sub("argument --json: not allowed with 'pauses clear'")
+        );
+        assert_eq!(
+            err(&["pauses", "clear", "--all", "--reason"]),
+            sub("argument --reason: expected one argument")
         );
     }
 }

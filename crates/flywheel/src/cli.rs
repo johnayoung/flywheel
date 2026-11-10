@@ -12,7 +12,7 @@
 //! The verb map is fixed by spec 00021's FR-4:
 //!
 //! * orchestrator: `init`, `status`, `live`, `history`, `show`, `archive`,
-//!   `recover`, `resolve`, `recheck-blocked`, `validate`
+//!   `recover`, `resolve`, `recheck-blocked`, `validate`, `pauses`
 //! * core (single-task producer verbs): `interrupt`, `approve`, `reject`,
 //!   `say` (surface name) -> `steer` (core verb)
 //! * worker: `worker [--once] [--task ID]` -> the git-worktree daemon loop
@@ -104,7 +104,7 @@ pub const PROG: &str = "fw";
 /// layer): its parser already owns their flags (`--tasks-dir`
 /// / `--db` / `--json` / `--watch`) and exit codes, so the router hands the
 /// argv through.
-pub const ORCHESTRATOR_VERBS: [&str; 10] = [
+pub const ORCHESTRATOR_VERBS: [&str; 11] = [
     "init",
     "status",
     "live",
@@ -115,6 +115,7 @@ pub const ORCHESTRATOR_VERBS: [&str; 10] = [
     "resolve",
     "recheck-blocked",
     "validate",
+    "pauses",
 ];
 
 /// Producer verbs that enqueue control commands against an existing
@@ -167,6 +168,7 @@ Verbs:
   archive          move done phases out of active/
   recover          finalize stranded lifecycles
   resolve ID        abandon a strand (--reason TEXT) so its phase archives
+  pauses [--json]  list session-limit pauses; pauses clear SEL --reason TEXT
   reland TASK_ID   retry a parked task's landing on its branch head (--db PATH)
   recheck-blocked  re-evaluate blocked lifecycles' requires
   validate         statically validate active tasks' graders (lint)

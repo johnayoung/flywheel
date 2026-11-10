@@ -1,6 +1,6 @@
 //! The orchestrator's operator verbs (`next`, `status`, `live`, `history`,
-//! `show`, `validate`, `recheck-blocked`, `recover`, `resolve`, `init`) and
-//! the argparse-identical entry point the product shell calls in-process.
+//! `show`, `validate`, `recheck-blocked`, `recover`, `resolve`, `pauses`,
+//! `init`) and the argparse-identical entry point the product shell calls in-process.
 //!
 //! Every verb is a library function taking parsed arguments, already-open
 //! stores, and the two output sinks, and returning the process exit code.
@@ -19,6 +19,7 @@ pub mod args;
 pub mod init;
 pub mod live;
 pub mod ops;
+pub mod pauses;
 pub mod select;
 pub mod show;
 pub mod status;
@@ -56,7 +57,8 @@ use crate::store_registry::{
 
 pub use args::{
     ArgError, Command, CommonArgs, HistoryArgs, InitArgs, LiveArgs, OrchestrateArgs, Parsed,
-    RecheckBlockedArgs, RecoverArgs, ResolveArgs, ShowArgs, StatusArgs, parse_args,
+    PausesAction, PausesArgs, RecheckBlockedArgs, RecoverArgs, ResolveArgs, ShowArgs, StatusArgs,
+    parse_args,
 };
 pub use init::{
     DetectedVerify, InitHost, ProductionInitHost, cmd_init, detect_verify,
@@ -66,6 +68,10 @@ pub use live::{LiveRunRow, cmd_live, cmd_live_until, collect_live_rows, format_l
 pub use ops::{
     cmd_recheck_blocked, cmd_recover, cmd_resolve, cmd_resolve_releasing, format_recheck_line,
     recover_stranded_lifecycles,
+};
+pub use pauses::{
+    PauseEntry, PauseSelector, active_pauses, clear_session_pauses, cmd_pauses, format_pause_time,
+    pause_entries, pause_label,
 };
 pub use select::{
     LatestLifecycleRow, SelectOptions, StatusRow, build_status_rows, cmd_next, cmd_next_landed,
@@ -1064,6 +1070,21 @@ pub fn dispatch(
                 out,
                 err,
             )
+        }
+        Command::Pauses(args) => {
+            // A blank reason is refused before the store is opened, so it
+            // never touches pause data.
+            if let PausesAction::Clear { reason, .. } = &args.action
+                && reason.trim().is_empty()
+            {
+                writeln!(err, "error: --reason must not be empty")?;
+                return Ok(2);
+            }
+            let policy = policy_of(given(&args.db))?;
+            let db_path = resolve_db_path(args.db.as_deref(), policy.as_ref());
+            ensure_db_parent(&db_path)?;
+            let stores = open_stores_for(policy.as_ref(), &db_path, &registries, &environ)?;
+            cmd_pauses(&args, &*stores.claims, chrono::Utc::now(), out, err)
         }
     }
 }

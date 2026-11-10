@@ -11,7 +11,7 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 **Every table except the two schema-version sentinels has a `project_id TEXT NOT NULL` column, and every query reads and writes only the opener's `project_id`.** One SQLite file or one Postgres DSN can therefore hold many projects (no schema-per-project).
 
 - `project_id` leads the primary key of every naturally keyed table (`tasks`, `task_versions`, `lifecycles`, `attempts`, `task_claims`, `work_items`, `work_item_dependencies`, `graph_snapshot_items`).
-- Surrogate-id ledgers (`events`, `grader_results`, `control_commands`, `transcripts`, `audit_log`, `source_syncs`, `orchestrator_events`, `orchestrator_stop_events`, `graph_snapshots`, `orchestrator_session_pauses`) keep their `id` primary key; `project_id` leads every unique constraint and hot lookup index on them.
+- Surrogate-id ledgers (`events`, `grader_results`, `control_commands`, `transcripts`, `audit_log`, `source_syncs`, `orchestrator_events`, `orchestrator_stop_events`, `graph_snapshots`, `orchestrator_session_pauses`, `orchestrator_session_pause_clears`) keep their `id` primary key; `project_id` leads every unique constraint and hot lookup index on them.
 - Foreign keys are composite and carry `project_id`, so a row can only reference rows of its own project.
 - In flywheel-core the column is an opaque partition key supplied by whoever opens the store (`SqliteStoreOptions::partition`, `PostgresStoreOptions::partition`; default `default`); core never resolves projects. The shell passes the bound project id (config `project_id` override, else the repo's `.git/config` id); invocations that skip project resolution (`--db` with `--tasks-dir`) use `default`.
 
@@ -37,7 +37,7 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 | `task_claims` | `(project_id, task_id)` | Multi-worker lease (transient coordination). |
 | `work_items` / `work_item_dependencies` | `(project_id, task_id)` / `(project_id, task_id, prerequisite_task_id)` | The persisted work graph and its prerequisite edges. |
 | `source_syncs`, `graph_snapshots`, `graph_snapshot_items` | `id` / `id` / `(project_id, snapshot_id, task_id)` | Work-source sync runs and point-in-time graph snapshots. |
-| `orchestrator_events`, `orchestrator_stop_events`, `orchestrator_session_pauses` | `id` | Claim ledger, stop/strand ledger, rate-limit pauses. |
+| `orchestrator_events`, `orchestrator_stop_events`, `orchestrator_session_pauses`, `orchestrator_session_pause_clears` | `id` | Claim ledger, stop/strand ledger, rate-limit pauses and their clears. |
 | `orchestrator_schema_version` | `id = 1` | Sentinel `(version, id)`; no `project_id`. |
 
 ## Schema versions and upgrade

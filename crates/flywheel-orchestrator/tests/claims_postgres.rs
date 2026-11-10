@@ -30,8 +30,9 @@ use flywheel_core::lifecycle::Lifecycle;
 use flywheel_core::store::{CURRENT_SCHEMA_VERSION, LifecycleStore};
 use flywheel_core::store_postgres::PostgresStore;
 use flywheel_orchestrator::claims::{
-    CURRENT_ORCH_SCHEMA_VERSION, ClaimStore, ClaimStoreError, EVENT_ACQUIRED, EVENT_EXPIRED,
-    GraphSnapshotItem, ORCH_PARTITIONED_TABLES, REASON_AWAITING_APPROVAL,
+    CURRENT_ORCH_SCHEMA_VERSION, ClaimStore, ClaimStoreError, DEFAULT_PAUSE_ACCOUNT,
+    EVENT_ACQUIRED, EVENT_EXPIRED, GraphSnapshotItem, ORCH_PARTITIONED_TABLES,
+    ORCH_PAUSE_CLEARS_TABLE, PAUSE_CLEAR_VIA_HUB, REASON_AWAITING_APPROVAL,
     REASON_PREREQUISITE_MISSING, STOP_PREPARE_SKIP, SqliteClaimStore, WorkItemObservation,
     conflict_keys,
 };
@@ -461,6 +462,125 @@ fn a_v9_schema_upgrades_in_place_keyed_by_the_partition() {
     assert!(other.load_claim("t1").unwrap().is_none());
 }
 
+/// Every row of `table` as JSON text minus `skip` (the upgrade's added
+/// columns), sorted, so pre- and post-upgrade dumps compare row for row.
+fn dump_pg_table(client: &mut Client, table: &str, skip: &[&str]) -> Vec<String> {
+    let minus: String = skip.iter().map(|c| format!(" - '{c}'")).collect();
+    client
+        .query(
+            &format!("SELECT (to_jsonb(x){minus})::text FROM {table} x ORDER BY 1"),
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect()
+}
+
+#[test]
+fn pause_account_postgres_v10_schema_upgrades_in_place_keeping_every_row() {
+    let Some(pg) = Postgres::acquire() else {
+        return;
+    };
+    let schema = pg.fresh_schema("fw_v10");
+    pg.admin()
+        .batch_execute(&format!(
+            "CREATE SCHEMA \"{schema}\"; SET search_path TO \"{schema}\", public;\n{}",
+            include_str!("fixtures/orchestrator-schema-postgres-v10.sql")
+        ))
+        .unwrap();
+    let mut admin = pg.admin_in(&schema);
+    let before: Vec<Vec<String>> = ORCH_PARTITIONED_TABLES
+        .iter()
+        .map(|table| dump_pg_table(&mut admin, table, &[]))
+        .collect();
+    assert!(
+        before.iter().all(|rows| !rows.is_empty()),
+        "every table seeded"
+    );
+    let err = PostgresClaimStore::connect_partition(&pg.dsn(), &schema, "proj").unwrap_err();
+    assert!(err.to_string().contains("fw db upgrade"), "{err}");
+
+    let upgrade = PostgresClaimStore::upgrade(&pg.dsn(), &schema, "proj").unwrap();
+    assert_eq!(upgrade.from, Some(10));
+    assert_eq!(upgrade.to, CURRENT_ORCH_SCHEMA_VERSION);
+    assert!(upgrade.partitioned.is_empty());
+    for (table, rows) in ORCH_PARTITIONED_TABLES.iter().zip(&before) {
+        assert_eq!(
+            &dump_pg_table(&mut admin, table, &["account"]),
+            rows,
+            "{table}"
+        );
+    }
+    let nulls: i64 = scalar(
+        &mut admin,
+        "SELECT COUNT(*) FROM orchestrator_session_pauses WHERE account IS NULL",
+    );
+    assert_eq!(nulls, 2, "legacy pauses read back NULL, never backfilled");
+    let clears: i64 = scalar(
+        &mut admin,
+        &format!("SELECT COUNT(*) FROM {ORCH_PAUSE_CLEARS_TABLE}"),
+    );
+    assert_eq!(clears, 0);
+
+    let store = PostgresClaimStore::connect_partition(&pg.dsn(), &schema, "proj").unwrap();
+    let pauses = store.list_session_pauses().unwrap();
+    assert_eq!(pauses.len(), 2);
+    assert!(
+        pauses
+            .iter()
+            .all(|p| p.account.is_none() && p.cleared.is_none())
+    );
+    assert_eq!(pauses[1].run_id, "run-limit");
+    for account in ["alice", "bob", DEFAULT_PAUSE_ACCOUNT] {
+        assert_eq!(
+            store.session_pause_until(t(10), account).unwrap(),
+            Some(t(30)),
+            "{account:?}"
+        );
+    }
+    store
+        .record_session_pause(t(50), t(10), 35.0, "run-a", "alice")
+        .unwrap();
+    assert_eq!(
+        store.session_pause_until(t(11), "bob").unwrap(),
+        Some(t(30))
+    );
+    assert_eq!(
+        store.session_pause_until(t(11), "alice").unwrap(),
+        Some(t(45))
+    );
+    assert!(
+        store
+            .clear_session_pause(pauses[1].id, t(12), PAUSE_CLEAR_VIA_HUB, "legacy")
+            .unwrap()
+    );
+    assert_eq!(store.session_pause_until(t(13), "bob").unwrap(), None);
+    // The cleared legacy row is untouched.
+    let after = store.list_session_pauses().unwrap();
+    assert_eq!(
+        (
+            after[1].run_id.as_str(),
+            after[1].reset_at,
+            after[1].pause_until,
+            after[1].recorded_at
+        ),
+        (
+            pauses[1].run_id.as_str(),
+            pauses[1].reset_at,
+            pauses[1].pause_until,
+            pauses[1].recorded_at
+        )
+    );
+    assert_eq!(store.load_claim("t1").unwrap().unwrap().version, 2);
+    assert_eq!(store.load_work_item_dependencies("t1").unwrap(), vec!["t0"]);
+    assert!(
+        PostgresClaimStore::upgrade(&pg.dsn(), &schema, "proj")
+            .unwrap()
+            .is_noop()
+    );
+}
+
 #[test]
 fn a_keyed_schema_behind_only_in_its_version_row_is_refused_then_repaired() {
     let Some(pg) = Postgres::acquire() else {
@@ -519,7 +639,9 @@ fn partitions_sharing_one_schema_never_see_each_other() {
         store
             .record_human_review(REASON_AWAITING_APPROVAL, "t1", t(0), "r", "")
             .unwrap();
-        store.record_session_pause(t(50), t(0), 30.0, "r").unwrap();
+        store
+            .record_session_pause(t(50), t(0), 30.0, "r", "")
+            .unwrap();
         store
             .record_source_sync_start("directory", "d", t(0))
             .unwrap();

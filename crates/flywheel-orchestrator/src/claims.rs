@@ -34,7 +34,8 @@ use flywheel_core::loaders::{canonical_json, task_digest};
 use flywheel_core::schema_ddl::without_pragmas;
 use flywheel_core::store::{DEFAULT_PARTITION, SchemaUpgrade, schema_version_message};
 use flywheel_core::store_sqlite::{
-    Recorded, any_table_exists, partition_table, recorded_version, version_column_first,
+    Recorded, add_missing_columns, any_table_exists, partition_table, recorded_version,
+    version_column_first,
 };
 use flywheel_core::task::Task;
 
@@ -44,9 +45,10 @@ use flywheel_core::task::Task;
 /// flywheel-core's `schema_version` so the two can share one backend without
 /// colliding.
 ///
-/// History (v1..v9 were additive; v10 re-keys every table by `project_id`).
-/// A store behind this version is refused on open naming `fw db upgrade`
-/// ([`SqliteClaimStore::upgrade`]), which migrates any of v1..v9 in place:
+/// History (v1..v9 and v11 are additive; v10 re-keys every table by
+/// `project_id`). A store behind this version is refused on open naming
+/// `fw db upgrade` ([`SqliteClaimStore::upgrade`]), which migrates any of
+/// v1..v10 in place:
 ///
 /// * v1 `task_claims` + `orchestrator_schema_version`
 /// * v2 `work_items`, `work_item_dependencies`, `source_syncs`
@@ -59,10 +61,14 @@ use flywheel_core::task::Task;
 /// * v9 `orchestrator_stop_events.attribution`
 /// * v10 every table partitioned by the opaque `project_id` key (leading
 ///   each primary key or hot index); the sentinel is `(version, id)`
-pub const CURRENT_ORCH_SCHEMA_VERSION: u32 = 10;
+/// * v11 the nullable `orchestrator_session_pauses.account` (pre-v11 rows
+///   read back `NULL`, never backfilled) and the append-only
+///   `orchestrator_session_pause_clears` ledger
+pub const CURRENT_ORCH_SCHEMA_VERSION: u32 = 11;
 
-/// The orchestrator tables, every one partitioned by `project_id`. The
-/// sentinel ([`ORCH_VERSION_TABLE`]) is the one table without it.
+/// The orchestrator tables that predate the v10 `project_id` re-key: the
+/// tables the in-place upgrade partitions when they lack the column.
+/// Tables added later are created keyed and listed only in [`ORCH_TABLES`].
 pub const ORCH_PARTITIONED_TABLES: [&str; 9] = [
     "task_claims",
     "work_items",
@@ -75,8 +81,55 @@ pub const ORCH_PARTITIONED_TABLES: [&str; 9] = [
     "orchestrator_session_pauses",
 ];
 
+/// The append-only ledger of session-pause clears (v11).
+pub const ORCH_PAUSE_CLEARS_TABLE: &str = "orchestrator_session_pause_clears";
+
+/// Every orchestrator table, each partitioned by `project_id`. The sentinel
+/// ([`ORCH_VERSION_TABLE`]) is the one table without it.
+pub const ORCH_TABLES: [&str; 10] = [
+    "task_claims",
+    "work_items",
+    "work_item_dependencies",
+    "source_syncs",
+    "orchestrator_events",
+    "orchestrator_stop_events",
+    "graph_snapshots",
+    "graph_snapshot_items",
+    "orchestrator_session_pauses",
+    ORCH_PAUSE_CLEARS_TABLE,
+];
+
 /// The orchestrator's schema-version sentinel table.
 pub const ORCH_VERSION_TABLE: &str = "orchestrator_schema_version";
+
+// --- Session-pause vocabulary ----------------------------------------------------
+
+/// The account of a pause recorded by a worker with no `--account`: the
+/// agent CLI's own login. Distinct from `None` (a pre-v11 row, which applies
+/// to every account).
+pub const DEFAULT_PAUSE_ACCOUNT: &str = "";
+
+/// A pause cleared from the CLI (`fw pauses clear`).
+pub const PAUSE_CLEAR_VIA_CLI: &str = "cli";
+/// A pause cleared from the hub.
+pub const PAUSE_CLEAR_VIA_HUB: &str = "hub";
+/// Every accepted `via` of a pause clear.
+pub const PAUSE_CLEAR_VIAS: [&str; 2] = [PAUSE_CLEAR_VIA_CLI, PAUSE_CLEAR_VIA_HUB];
+
+/// Refuse a clear whose `via` is unknown or whose `reason` is blank, before
+/// anything is read or written (shared by every backend).
+pub(crate) fn require_pause_clear(via: &str, reason: &str) -> Result<(), ClaimStoreError> {
+    if !PAUSE_CLEAR_VIAS.contains(&via) {
+        return Err(ClaimStoreError::UnknownPauseClearVia {
+            via: via.to_owned(),
+            known: PAUSE_CLEAR_VIAS.map(str::to_owned).to_vec(),
+        });
+    }
+    if reason.trim().is_empty() {
+        return Err(ClaimStoreError::EmptyPauseClearReason);
+    }
+    Ok(())
+}
 
 // --- Claim-event vocabulary --------------------------------------------------------
 
@@ -261,6 +314,14 @@ pub enum ClaimStoreError {
     /// is recorded.
     #[error("graph snapshot names task {task_id:?} more than once")]
     DuplicateSnapshotItem { task_id: String },
+    /// A session-pause clear named a `via` outside [`PAUSE_CLEAR_VIAS`];
+    /// nothing is recorded.
+    #[error("unknown session-pause clear via {via:?}; must be one of {known:?}")]
+    UnknownPauseClearVia { via: String, known: Vec<String> },
+    /// A session-pause clear carried an empty (or blank) reason; a clear is
+    /// always attributed, so nothing is recorded.
+    #[error("a session-pause clear requires a non-empty reason")]
+    EmptyPauseClearReason,
     /// A lease of `lease_seconds` from `now` lands outside the representable
     /// timestamp range (or is not a number); nothing is recorded.
     #[error(
@@ -424,13 +485,44 @@ pub struct OrchestratorStopEventRecord {
 /// session-limited run whose derived reset was still in the future when seen.
 /// `pause_until` is the clamped horizon (`min(reset_at, recorded_at +
 /// ceiling)`) drivers gate on.
+///
+/// `account` is the account the refused run ran under: a name,
+/// [`DEFAULT_PAUSE_ACCOUNT`] (`""`) for the agent CLI's own login, or `None`
+/// for a row recorded before v11, which holds back every account.
+/// `cleared` joins the row's clear record, if any; the row itself is never
+/// rewritten.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPauseRecord {
     pub id: i64,
+    pub account: Option<String>,
     pub run_id: String,
     pub reset_at: DateTime<Utc>,
     pub pause_until: DateTime<Utc>,
     pub recorded_at: DateTime<Utc>,
+    pub cleared: Option<SessionPauseClear>,
+}
+
+impl SessionPauseRecord {
+    /// Whether the pause still holds at `now`: its horizon is strictly in
+    /// the future and it was not cleared.
+    pub fn is_active(&self, now: DateTime<Utc>) -> bool {
+        self.cleared.is_none() && self.pause_until > to_micros(now)
+    }
+
+    /// Whether the pause holds back a worker under `account`: its own
+    /// account, or every account for a pre-v11 (`None`) row.
+    pub fn applies_to(&self, account: &str) -> bool {
+        self.account.as_deref().is_none_or(|a| a == account)
+    }
+}
+
+/// One appended `orchestrator_session_pause_clears` record: who-how-why a
+/// pause was made inactive. `via` is a member of [`PAUSE_CLEAR_VIAS`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPauseClear {
+    pub at: DateTime<Utc>,
+    pub via: String,
+    pub reason: String,
 }
 
 /// One entry in the single visible human-review queue: a projection of an
@@ -665,27 +757,46 @@ pub trait ClaimStore: Send + Sync {
         subject: &str,
     ) -> Result<Vec<OrchestratorStopEventRecord>, ClaimStoreError>;
 
-    /// Record a pool-wide claim pause for a structural session-limit reset.
-    /// Appends one row with `pause_until = min(reset_at, now + ceiling)` and
-    /// returns that horizon; records nothing and returns `None` when
-    /// `ceiling_seconds <= 0` or the clamped horizon is not after `now`.
+    /// Record a claim pause on `account` for a structural session-limit
+    /// reset. Appends one row with `pause_until = min(reset_at, now +
+    /// ceiling)` and returns that horizon; records nothing and returns
+    /// `None` when `ceiling_seconds <= 0` or the clamped horizon is not
+    /// after `now`. `account` is a name or [`DEFAULT_PAUSE_ACCOUNT`].
     fn record_session_pause(
         &self,
         reset_at: DateTime<Utc>,
         now: DateTime<Utc>,
         ceiling_seconds: f64,
         run_id: &str,
+        account: &str,
     ) -> Result<Option<DateTime<Utc>>, ClaimStoreError>;
 
-    /// The high-water `pause_until` over rows still in the future at `now`,
-    /// or `None` when none remain.
+    /// The high-water `pause_until` over the pauses that hold back a worker
+    /// under `account` at `now` -- uncleared rows still in the future whose
+    /// account is `account` or `NULL` (pre-v11, every account) -- or `None`
+    /// when none remain.
     fn session_pause_until(
         &self,
         now: DateTime<Utc>,
+        account: &str,
     ) -> Result<Option<DateTime<Utc>>, ClaimStoreError>;
 
-    /// Every recorded pause row in id order.
+    /// Every recorded pause row in id order, each joined with its clear
+    /// record (if any).
     fn list_session_pauses(&self) -> Result<Vec<SessionPauseRecord>, ClaimStoreError>;
+
+    /// Clear pause `pause_id` by appending one attributed clear record
+    /// (`at = now`, `via`, `reason` verbatim); the pause row is untouched.
+    /// Returns whether a record was appended: a pause that does not exist,
+    /// has expired at `now`, or is already cleared records nothing. An
+    /// unknown `via` or a blank `reason` is refused before anything is read.
+    fn clear_session_pause(
+        &self,
+        pause_id: i64,
+        now: DateTime<Utc>,
+        via: &str,
+        reason: &str,
+    ) -> Result<bool, ClaimStoreError>;
 
     /// Route one unit into the human-review queue by appending a stop row
     /// whose `kind` is the machine-readable `reason` (which must be a member
@@ -798,6 +909,7 @@ struct InMemoryState {
     events: Vec<OrchestratorEventRecord>,
     stop_events: Vec<OrchestratorStopEventRecord>,
     session_pauses: Vec<SessionPauseRecord>,
+    pause_clears: BTreeMap<i64, SessionPauseClear>,
     snapshots: Vec<GraphSnapshotRecord>,
     snapshot_items: BTreeMap<i64, Vec<GraphSnapshotItem>>,
     work_items: BTreeMap<String, WorkItemRecord>,
@@ -1108,6 +1220,7 @@ impl ClaimStore for InMemoryClaimStore {
         now: DateTime<Utc>,
         ceiling_seconds: f64,
         run_id: &str,
+        account: &str,
     ) -> Result<Option<DateTime<Utc>>, ClaimStoreError> {
         let Some(pause_until) = clamp_pause(reset_at, now, ceiling_seconds) else {
             return Ok(None);
@@ -1116,10 +1229,12 @@ impl ClaimStore for InMemoryClaimStore {
         let id = state.session_pauses.len() as i64 + 1;
         state.session_pauses.push(SessionPauseRecord {
             id,
+            account: Some(account.to_owned()),
             run_id: run_id.to_owned(),
             reset_at: to_micros(reset_at),
             pause_until,
             recorded_at: to_micros(now),
+            cleared: None,
         });
         Ok(Some(pause_until))
     }
@@ -1127,19 +1242,54 @@ impl ClaimStore for InMemoryClaimStore {
     fn session_pause_until(
         &self,
         now: DateTime<Utc>,
+        account: &str,
     ) -> Result<Option<DateTime<Utc>>, ClaimStoreError> {
-        let now = to_micros(now);
-        Ok(self
-            .lock()?
+        let state = self.lock()?;
+        Ok(state
             .session_pauses
             .iter()
+            .filter(|p| !state.pause_clears.contains_key(&p.id))
+            .filter(|p| p.applies_to(account) && p.is_active(now))
             .map(|p| p.pause_until)
-            .filter(|&p| p > now)
             .max())
     }
 
     fn list_session_pauses(&self) -> Result<Vec<SessionPauseRecord>, ClaimStoreError> {
-        Ok(self.lock()?.session_pauses.clone())
+        let state = self.lock()?;
+        Ok(state
+            .session_pauses
+            .iter()
+            .map(|p| SessionPauseRecord {
+                cleared: state.pause_clears.get(&p.id).cloned(),
+                ..p.clone()
+            })
+            .collect())
+    }
+
+    fn clear_session_pause(
+        &self,
+        pause_id: i64,
+        now: DateTime<Utc>,
+        via: &str,
+        reason: &str,
+    ) -> Result<bool, ClaimStoreError> {
+        require_pause_clear(via, reason)?;
+        let mut state = self.lock()?;
+        let Some(pause) = state.session_pauses.iter().find(|p| p.id == pause_id) else {
+            return Ok(false);
+        };
+        if !pause.is_active(now) || state.pause_clears.contains_key(&pause_id) {
+            return Ok(false);
+        }
+        state.pause_clears.insert(
+            pause_id,
+            SessionPauseClear {
+                at: to_micros(now),
+                via: via.to_owned(),
+                reason: reason.to_owned(),
+            },
+        );
+        Ok(true)
     }
 
     fn record_human_review(
@@ -1535,11 +1685,24 @@ CREATE TABLE IF NOT EXISTS orchestrator_session_pauses (
   run_id      TEXT NOT NULL DEFAULT '',
   reset_at    TEXT NOT NULL,
   pause_until TEXT NOT NULL,
-  recorded_at TEXT NOT NULL
+  recorded_at TEXT NOT NULL,
+  account     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_session_pauses_pause_until
   ON orchestrator_session_pauses (project_id, pause_until);
+
+CREATE TABLE IF NOT EXISTS orchestrator_session_pause_clears (
+  project_id TEXT NOT NULL,
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  pause_id   INTEGER NOT NULL,
+  cleared_at TEXT NOT NULL,
+  via        TEXT NOT NULL,
+  reason     TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orchestrator_session_pause_clears_pause
+  ON orchestrator_session_pause_clears (project_id, pause_id);
 ";
 
 /// SQLite [`ClaimStore`]. Owns the orchestrator tables and their schema
@@ -1603,7 +1766,9 @@ impl SqliteClaimStore {
     /// One `BEGIN IMMEDIATE` transaction (with `foreign_keys` off for its
     /// duration): every orchestrator table lacking `project_id` is rebuilt
     /// from the current DDL (columns an older version lacked take their
-    /// declared defaults, so any of v1..v9 converges), the sentinel is
+    /// declared defaults, so any of v1..v9 converges), columns a keyed table
+    /// lacks are added (v10's pauses gain the nullable `account`, existing
+    /// rows reading `NULL`), the sentinel is
     /// re-created version-first, missing tables and indexes are created, and
     /// the version is set current. Each step inspects the live layout, so
     /// the upgrade is idempotent and also repairs a keyed store whose version
@@ -1720,7 +1885,7 @@ fn bootstrap(conn: &mut Connection) -> Result<(), ClaimStoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     match recorded_version(&tx, ORCH_VERSION_TABLE)? {
         Recorded::Missing => {
-            if any_table_exists(&tx, &ORCH_PARTITIONED_TABLES)? {
+            if any_table_exists(&tx, &ORCH_TABLES)? {
                 return Err(OrchestratorSchemaError::new(None).into());
             }
         }
@@ -1743,7 +1908,7 @@ fn upgrade_in_transaction(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let from = match recorded_version(&tx, ORCH_VERSION_TABLE)? {
         Recorded::Missing => {
-            if any_table_exists(&tx, &ORCH_PARTITIONED_TABLES)? {
+            if any_table_exists(&tx, &ORCH_TABLES)? {
                 return Err(OrchestratorSchemaError::new(None).into());
             }
             None
@@ -1759,6 +1924,11 @@ fn upgrade_in_transaction(
         if partition_table(&tx, &ddl, table, partition)? {
             partitioned.push(table.to_owned());
         }
+    }
+    // v11's additive columns (the nullable `orchestrator_session_pauses.account`)
+    // on tables that were already keyed: existing rows read them as NULL.
+    for table in ORCH_TABLES {
+        add_missing_columns(&tx, &ddl, table)?;
     }
     version_column_first(&tx, &ddl, ORCH_VERSION_TABLE)?;
     tx.execute_batch(&ddl)?;
@@ -1991,13 +2161,33 @@ fn row_to_source_sync(row: &rusqlite::Row<'_>) -> Result<SourceSyncRecord, Claim
     })
 }
 
+/// The pause columns joined with the row's clear record (`p` the pause,
+/// `c` its clear).
+const PAUSE_COLUMNS: &str = "p.id, p.account, p.run_id, p.reset_at, p.pause_until, \
+     p.recorded_at, c.cleared_at, c.via, c.reason";
+
+/// The pause table left-joined with its clear record in the same partition.
+const PAUSE_JOIN: &str = "orchestrator_session_pauses p \
+     LEFT JOIN orchestrator_session_pause_clears c \
+     ON c.project_id = p.project_id AND c.pause_id = p.id";
+
 fn row_to_pause(row: &rusqlite::Row<'_>) -> Result<SessionPauseRecord, ClaimStoreError> {
+    let cleared = match row.get::<_, Option<String>>(6)? {
+        Some(at) => Some(SessionPauseClear {
+            at: parse_timestamp(&at)?,
+            via: row.get(7)?,
+            reason: row.get(8)?,
+        }),
+        None => None,
+    };
     Ok(SessionPauseRecord {
         id: row.get(0)?,
-        run_id: row.get(1)?,
-        reset_at: parse_timestamp(&row.get::<_, String>(2)?)?,
-        pause_until: parse_timestamp(&row.get::<_, String>(3)?)?,
-        recorded_at: parse_timestamp(&row.get::<_, String>(4)?)?,
+        account: row.get(1)?,
+        run_id: row.get(2)?,
+        reset_at: parse_timestamp(&row.get::<_, String>(3)?)?,
+        pause_until: parse_timestamp(&row.get::<_, String>(4)?)?,
+        recorded_at: parse_timestamp(&row.get::<_, String>(5)?)?,
+        cleared,
     })
 }
 
@@ -2369,6 +2559,7 @@ impl ClaimStore for SqliteClaimStore {
         now: DateTime<Utc>,
         ceiling_seconds: f64,
         run_id: &str,
+        account: &str,
     ) -> Result<Option<DateTime<Utc>>, ClaimStoreError> {
         let Some(pause_until) = clamp_pause(reset_at, now, ceiling_seconds) else {
             return Ok(None);
@@ -2377,13 +2568,14 @@ impl ClaimStore for SqliteClaimStore {
         self.write(|tx| {
             tx.execute(
                 "INSERT INTO orchestrator_session_pauses (project_id, run_id, reset_at, \
-                 pause_until, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                 pause_until, recorded_at, account) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     p,
                     run_id,
                     format_timestamp(&reset_at),
                     format_timestamp(&pause_until),
                     format_timestamp(&now),
+                    account,
                 ],
             )?;
             Ok(())
@@ -2394,18 +2586,23 @@ impl ClaimStore for SqliteClaimStore {
     fn session_pause_until(
         &self,
         now: DateTime<Utc>,
+        account: &str,
     ) -> Result<Option<DateTime<Utc>>, ClaimStoreError> {
         let now = to_micros(now);
         // Index-friendly prefilter on the date prefix (every persisted format
         // starts `YYYY-MM-DD`; a day of slack covers any offset), then the
-        // real comparison on parsed instants.
+        // real comparison on parsed instants. Only this account's pauses and
+        // the pre-v11 (NULL, every-account) ones count; cleared ones never.
         let floor = format_timestamp(&(now - Duration::days(1)));
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT pause_until FROM orchestrator_session_pauses \
-             WHERE project_id = ?1 AND pause_until >= ?2",
+            "SELECT p.pause_until FROM orchestrator_session_pauses p \
+             WHERE p.project_id = ?1 AND p.pause_until >= ?2 \
+             AND (p.account IS NULL OR p.account = ?3) \
+             AND NOT EXISTS (SELECT 1 FROM orchestrator_session_pause_clears c \
+               WHERE c.project_id = p.project_id AND c.pause_id = p.id)",
         )?;
-        let mut rows = stmt.query(params![self.partition(), &floor[..10]])?;
+        let mut rows = stmt.query(params![self.partition(), &floor[..10], account])?;
         let mut horizon: Option<DateTime<Utc>> = None;
         while let Some(row) = rows.next()? {
             let candidate = parse_timestamp(&row.get::<_, String>(0)?)?;
@@ -2420,11 +2617,44 @@ impl ClaimStore for SqliteClaimStore {
         let conn = self.lock()?;
         query_all(
             &conn,
-            "SELECT id, run_id, reset_at, pause_until, recorded_at \
-             FROM orchestrator_session_pauses WHERE project_id = ?1 ORDER BY id",
+            &format!(
+                "SELECT {PAUSE_COLUMNS} FROM {PAUSE_JOIN} WHERE p.project_id = ?1 ORDER BY p.id"
+            ),
             params![self.partition()],
             row_to_pause,
         )
+    }
+
+    fn clear_session_pause(
+        &self,
+        pause_id: i64,
+        now: DateTime<Utc>,
+        via: &str,
+        reason: &str,
+    ) -> Result<bool, ClaimStoreError> {
+        require_pause_clear(via, reason)?;
+        let p = self.partition();
+        // Read and append in one immediate transaction, so a concurrent
+        // clear of the same pause serializes and the second records nothing.
+        self.write(|tx| {
+            let pause = query_one(
+                tx,
+                &format!(
+                    "SELECT {PAUSE_COLUMNS} FROM {PAUSE_JOIN} WHERE p.project_id = ?1 AND p.id = ?2"
+                ),
+                params![p, pause_id],
+                row_to_pause,
+            )?;
+            if !pause.is_some_and(|pause| pause.is_active(now)) {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO orchestrator_session_pause_clears (project_id, pause_id, \
+                 cleared_at, via, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![p, pause_id, format_timestamp(&to_micros(now)), via, reason],
+            )?;
+            Ok(true)
+        })
     }
 
     fn record_human_review(
@@ -2793,7 +3023,7 @@ mod tests {
 
     #[test]
     fn schema_version_sentinel_is_pinned() {
-        assert_eq!(CURRENT_ORCH_SCHEMA_VERSION, 10);
+        assert_eq!(CURRENT_ORCH_SCHEMA_VERSION, 11);
     }
 
     #[test]
@@ -2910,7 +3140,7 @@ mod tests {
         assert_eq!(
             behind.to_string(),
             "orchestrator store schema is behind: orchestrator_schema_version=9, this flywheel \
-             expects 10; run `fw db upgrade` to migrate it in place"
+             expects 11; run `fw db upgrade` to migrate it in place"
         );
         let ahead = OrchestratorSchemaError::new(Some(12));
         assert!(!ahead.is_behind());
@@ -3077,12 +3307,12 @@ mod tests {
         let store = SqliteClaimStore::in_memory().unwrap();
         assert_eq!(store.partition(), DEFAULT_PARTITION);
         let conn = store.lock().unwrap();
-        for table in ORCH_PARTITIONED_TABLES {
+        for table in ORCH_TABLES {
             assert_eq!(columns(&conn, table)[0], "project_id", "{table}");
         }
         let sentinel = columns(&conn, ORCH_VERSION_TABLE);
         assert_eq!(sentinel, vec!["version", "id"]);
-        for table in ORCH_PARTITIONED_TABLES.iter().chain([&ORCH_VERSION_TABLE]) {
+        for table in ORCH_TABLES.iter().chain([&ORCH_VERSION_TABLE]) {
             assert!(
                 flywheel_core::schema_ddl::create_table_statement(SCHEMA_SQL, table).is_some(),
                 "{table}"
@@ -3131,7 +3361,9 @@ mod tests {
             store
                 .record_stop_event(STOP_NO_OP_CYCLE, "t1", "d", t(0), "")
                 .unwrap();
-            store.record_session_pause(t(50), t(0), 30.0, "r").unwrap();
+            store
+                .record_session_pause(t(50), t(0), 30.0, "r", "")
+                .unwrap();
             store
                 .record_source_sync_start("directory", "d", t(0))
                 .unwrap();

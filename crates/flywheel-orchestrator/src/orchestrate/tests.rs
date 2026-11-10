@@ -3061,7 +3061,7 @@ async fn session_pause_ceiling_zero_never_pauses() {
     let a = run(f.request(MemorySource::new(vec![item("limit")]))).await;
     assert_eq!(ids(&a), ["limit"]);
     assert!(f.claims.list_session_pauses().unwrap().is_empty());
-    assert!(f.claims.session_pause_until(t0()).unwrap().is_none());
+    assert!(f.claims.session_pause_until(t0(), "").unwrap().is_none());
     let mut req_b = f.request(MemorySource::new(vec![item("work")]));
     req_b.now = Some(fixed(t0() + ChronoDuration::seconds(10)));
     let b = run(req_b).await;

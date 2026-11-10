@@ -106,7 +106,7 @@ The loop runs it in-process (spec 00069): with `OrchestrateRequest.sweep_seconds
 
 ### The orchestrator's own store
 
-The orchestrator owns a store separate from core's: its own `task_claims` plus an `orchestrator_schema_version` sentinel, currently at `CURRENT_ORCH_SCHEMA_VERSION = 9` (`crates/flywheel-orchestrator/src/claims.rs`). A single SQLite file (or one Postgres database) can hold **both** stores; each layer touches only its own tables and never references the other's, and the two `*_schema_version` sentinels migrate independently. The SQLite backend opens both on one file: the core lifecycle store and `SqliteClaimStore::open(db_path)` on the same path (`crates/flywheel-orchestrator/src/store_registry.rs`).
+The orchestrator owns a store separate from core's: its own `task_claims` plus an `orchestrator_schema_version` sentinel, currently at `CURRENT_ORCH_SCHEMA_VERSION = 11` (`crates/flywheel-orchestrator/src/claims.rs`). A single SQLite file (or one Postgres database) can hold **both** stores; each layer touches only its own tables and never references the other's, and the two `*_schema_version` sentinels migrate independently. The SQLite backend opens both on one file: the core lifecycle store and `SqliteClaimStore::open(db_path)` on the same path (`crates/flywheel-orchestrator/src/store_registry.rs`).
 
 Migrations are additive forward only — `CREATE TABLE IF NOT EXISTS` plus `ALTER TABLE ADD COLUMN` and sentinel convergence, never drop-and-recreate. A store newer than the running code trips `OrchestratorSchemaError`. The orchestrator DDL lives inline in `claims.rs` (SQLite) and `claims_postgres.rs` (Postgres) — there is no `.sql` mirror, and no `docs/` table reference yet documents the orchestrator table set ([persistence-tables.md](persistence-tables.md) covers only the core store).
 
@@ -120,7 +120,9 @@ Migrations are additive forward only — `CREATE TABLE IF NOT EXISTS` plus `ALTE
 | v6 | `orchestrator_stop_events` |
 | v7 | `orchestrator_stop_events.run_id` |
 | v8 | `orchestrator_session_pauses` |
-| v9 (current) | `orchestrator_stop_events.attribution` |
+| v9 | `orchestrator_stop_events.attribution` |
+| v10 | `project_id` partition key on every table (re-key) |
+| v11 (current) | nullable `orchestrator_session_pauses.account` (pre-v11 rows `NULL` = every account; `""` = default login) + append-only `orchestrator_session_pause_clears` (`pause_id`, `cleared_at`, `via` `cli`/`hub`, `reason`); a clear never rewrites the pause row |
 
 ## The orchestrator ledgers
 

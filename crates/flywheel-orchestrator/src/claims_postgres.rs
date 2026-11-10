@@ -38,7 +38,7 @@
 //!   each other's leases, ledgers, or catalog;
 //! * the schema version is checked before any DDL: a behind schema is
 //!   refused naming `fw db upgrade` ([`PostgresClaimStore::upgrade`]), which
-//!   migrates any of v1..v9 in place -- nothing migrates implicitly on open;
+//!   migrates any of v1..v10 in place -- nothing migrates implicitly on open;
 //! * `idx_orchestrator_stop_events_kind` backs the human-review queue read,
 //!   matching the index the SQLite port declares;
 //! * free-form text -- stop-event `detail` and `source_syncs.error` -- is
@@ -72,10 +72,10 @@ use crate::claims::{
     CURRENT_ORCH_SCHEMA_VERSION, ClaimLostError, ClaimStore, ClaimStoreError, EVENT_ACQUIRED,
     EVENT_EXPIRED, EVENT_RELEASED, EVENT_RENEWED, EVENT_STOLEN, GraphSnapshotItem,
     GraphSnapshotRecord, HUMAN_REVIEW_QUEUE_REASONS, HumanReviewQueueEntry,
-    ORCH_PARTITIONED_TABLES, ORCH_VERSION_TABLE, OrchestratorEventRecord, OrchestratorSchemaError,
-    OrchestratorStopEventRecord, STOP_PREPARE_SKIP, SessionPauseRecord, SourceSyncRecord,
-    TaskClaim, WorkItemObservation, WorkItemRecord, decode_str_set, encode_str_set,
-    is_human_review_reason,
+    ORCH_PARTITIONED_TABLES, ORCH_TABLES, ORCH_VERSION_TABLE, OrchestratorEventRecord,
+    OrchestratorSchemaError, OrchestratorStopEventRecord, STOP_PREPARE_SKIP, SessionPauseClear,
+    SessionPauseRecord, SourceSyncRecord, TaskClaim, WorkItemObservation, WorkItemRecord,
+    decode_str_set, encode_str_set, is_human_review_reason, require_pause_clear,
 };
 use crate::store_factory::{StoreConfigError, resolve_postgres_dsn};
 use crate::store_registry::{
@@ -234,11 +234,24 @@ CREATE TABLE IF NOT EXISTS orchestrator_session_pauses (
   run_id      TEXT NOT NULL DEFAULT '',
   reset_at    TIMESTAMPTZ NOT NULL,
   pause_until TIMESTAMPTZ NOT NULL,
-  recorded_at TIMESTAMPTZ NOT NULL
+  recorded_at TIMESTAMPTZ NOT NULL,
+  account     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_orchestrator_session_pauses_pause_until
   ON orchestrator_session_pauses (project_id, pause_until);
+
+CREATE TABLE IF NOT EXISTS orchestrator_session_pause_clears (
+  project_id TEXT NOT NULL,
+  id         BIGSERIAL PRIMARY KEY,
+  pause_id   BIGINT NOT NULL,
+  cleared_at TIMESTAMPTZ NOT NULL,
+  via        TEXT NOT NULL,
+  reason     TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orchestrator_session_pause_clears_pause
+  ON orchestrator_session_pause_clears (project_id, pause_id);
 ";
 
 // --- Error and value helpers ------------------------------------------------------------
@@ -414,15 +427,33 @@ fn row_to_review_entry(row: &Row) -> Result<HumanReviewQueueEntry, ClaimStoreErr
     })
 }
 
-const PAUSE_COLUMNS: &str = "id, run_id, reset_at, pause_until, recorded_at";
+/// The pause columns joined with the row's clear record (`p` the pause,
+/// `c` its clear).
+const PAUSE_COLUMNS: &str = "p.id, p.account, p.run_id, p.reset_at, p.pause_until, \
+     p.recorded_at, c.cleared_at, c.via, c.reason";
+
+/// The pause table left-joined with its clear record in the same partition.
+const PAUSE_JOIN: &str = "orchestrator_session_pauses p \
+     LEFT JOIN orchestrator_session_pause_clears c \
+     ON c.project_id = p.project_id AND c.pause_id = p.id";
 
 fn row_to_pause(row: &Row) -> Result<SessionPauseRecord, ClaimStoreError> {
+    let cleared = match col::<Option<DateTime<Utc>>>(row, 6)? {
+        Some(at) => Some(SessionPauseClear {
+            at,
+            via: col(row, 7)?,
+            reason: col(row, 8)?,
+        }),
+        None => None,
+    };
     Ok(SessionPauseRecord {
         id: col(row, 0)?,
-        run_id: col(row, 1)?,
-        reset_at: col(row, 2)?,
-        pause_until: col(row, 3)?,
-        recorded_at: col(row, 4)?,
+        account: col(row, 1)?,
+        run_id: col(row, 2)?,
+        reset_at: col(row, 3)?,
+        pause_until: col(row, 4)?,
+        recorded_at: col(row, 5)?,
+        cleared,
     })
 }
 
@@ -658,7 +689,7 @@ fn bootstrap(client: &mut Client, schema: &str) -> Result<(), ClaimStoreError> {
     lock_and_pin(&mut tx, schema)?;
     match recorded_version(&mut tx, schema, ORCH_VERSION_TABLE).map_err(db)? {
         Recorded::Missing => {
-            if any_table_exists(&mut tx, schema, &ORCH_PARTITIONED_TABLES).map_err(db)? {
+            if any_table_exists(&mut tx, schema, &ORCH_TABLES).map_err(db)? {
                 return Err(schema_error(None));
             }
         }
@@ -686,7 +717,7 @@ pub fn upgrade_client(
     lock_and_pin(&mut tx, schema)?;
     let from = match recorded_version(&mut tx, schema, ORCH_VERSION_TABLE).map_err(db)? {
         Recorded::Missing => {
-            if any_table_exists(&mut tx, schema, &ORCH_PARTITIONED_TABLES).map_err(db)? {
+            if any_table_exists(&mut tx, schema, &ORCH_TABLES).map_err(db)? {
                 return Err(schema_error(None));
             }
             None
@@ -700,8 +731,10 @@ pub fn upgrade_client(
     let ddl = without_pragmas(SCHEMA_SQL);
     // The legacy additive columns (v3 conflict_keys_json, v7 run_id, v9
     // attribution) arrive with their declared defaults first, so every row
-    // of any v1..v9 schema survives the re-key.
-    for table in ORCH_PARTITIONED_TABLES {
+    // of any v1..v9 schema survives the re-key; v11's nullable
+    // session-pause `account` arrives the same way, existing rows reading
+    // NULL (never backfilled).
+    for table in ORCH_TABLES {
         add_missing_columns(&mut tx, schema, &ddl, table, &["project_id"]).map_err(db)?;
     }
     let partitioned =
@@ -1267,6 +1300,7 @@ impl ClaimStore for PostgresClaimStore {
         now: DateTime<Utc>,
         ceiling_seconds: f64,
         run_id: &str,
+        account: &str,
     ) -> Result<Option<DateTime<Utc>>, ClaimStoreError> {
         let Some(pause_until) = clamp_pause(reset_at, now, ceiling_seconds) else {
             return Ok(None);
@@ -1277,8 +1311,8 @@ impl ClaimStore for PostgresClaimStore {
         self.write(|tx| {
             tx.execute(
                 "INSERT INTO orchestrator_session_pauses (run_id, reset_at, pause_until, \
-                 recorded_at, project_id) VALUES ($1, $2, $3, $4, $5)",
-                &[&run_id, &reset_at, &pause_until, &now, &p],
+                 recorded_at, project_id, account) VALUES ($1, $2, $3, $4, $5, $6)",
+                &[&run_id, &reset_at, &pause_until, &now, &p, &account],
             )
             .map_err(db)?;
             Ok(())
@@ -1289,18 +1323,24 @@ impl ClaimStore for PostgresClaimStore {
     fn session_pause_until(
         &self,
         now: DateTime<Utc>,
+        account: &str,
     ) -> Result<Option<DateTime<Utc>>, ClaimStoreError> {
         let now = to_micros(now);
         // High-water horizon over rows still in the future; each row was
         // individually clamped so the max never exceeds the latest
         // min(reset, recorded_at + ceiling). Index-backed on pause_until.
+        // Only this account's pauses and the pre-v11 (NULL, every-account)
+        // ones count; cleared ones never.
         let p = self.partition.as_str();
         self.read(|c| {
             let row = c
                 .query_one(
-                    "SELECT MAX(pause_until) FROM orchestrator_session_pauses \
-                     WHERE project_id = $2 AND pause_until > $1",
-                    &[&now, &p],
+                    "SELECT MAX(p.pause_until) FROM orchestrator_session_pauses p \
+                     WHERE p.project_id = $2 AND p.pause_until > $1 \
+                     AND (p.account IS NULL OR p.account = $3) \
+                     AND NOT EXISTS (SELECT 1 FROM orchestrator_session_pause_clears c \
+                       WHERE c.project_id = p.project_id AND c.pause_id = p.id)",
+                    &[&now, &p, &account],
                 )
                 .map_err(db)?;
             col(&row, 0)
@@ -1313,12 +1353,48 @@ impl ClaimStore for PostgresClaimStore {
             query_all(
                 c,
                 &format!(
-                    "SELECT {PAUSE_COLUMNS} FROM orchestrator_session_pauses WHERE project_id = $1 \
-                     ORDER BY id"
+                    "SELECT {PAUSE_COLUMNS} FROM {PAUSE_JOIN} WHERE p.project_id = $1 \
+                     ORDER BY p.id"
                 ),
                 &[&p],
                 row_to_pause,
             )
+        })
+    }
+
+    fn clear_session_pause(
+        &self,
+        pause_id: i64,
+        now: DateTime<Utc>,
+        via: &str,
+        reason: &str,
+    ) -> Result<bool, ClaimStoreError> {
+        require_pause_clear(via, reason)?;
+        let now = to_micros(now);
+        let p = self.partition.as_str();
+        // The unique (project_id, pause_id) index makes a concurrent second
+        // clear of the same pause a no-op rather than a second record.
+        self.write(|tx| {
+            let pause = query_one(
+                tx,
+                &format!(
+                    "SELECT {PAUSE_COLUMNS} FROM {PAUSE_JOIN} WHERE p.project_id = $1 AND p.id = $2"
+                ),
+                &[&p, &pause_id],
+                row_to_pause,
+            )?;
+            if !pause.is_some_and(|pause| pause.is_active(now)) {
+                return Ok(false);
+            }
+            let appended = tx
+                .execute(
+                    "INSERT INTO orchestrator_session_pause_clears (project_id, pause_id, \
+                     cleared_at, via, reason) VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (project_id, pause_id) DO NOTHING",
+                    &[&p, &pause_id, &now, &via, &reason],
+                )
+                .map_err(db)?;
+            Ok(appended == 1)
         })
     }
 
@@ -1872,7 +1948,7 @@ mod tests {
         assert!(!SCHEMA_SQL.contains("AUTOINCREMENT"));
         // Lockstep with the SQLite DDL: the same tables, every partitioned
         // one leading with project_id, the sentinel version-first.
-        for table in ORCH_PARTITIONED_TABLES {
+        for table in ORCH_TABLES {
             let columns = flywheel_core::schema_ddl::declared_columns(SCHEMA_SQL, table);
             assert_eq!(columns[0], "project_id", "{table}");
         }

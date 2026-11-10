@@ -19,10 +19,12 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use rusqlite::Connection;
 
 use flywheel_orchestrator::claims::{
-    CURRENT_ORCH_SCHEMA_VERSION, ClaimStore, ClaimStoreError, EVENT_ACQUIRED, EVENT_EXPIRED,
-    EVENT_RELEASED, EVENT_RENEWED, EVENT_STOLEN, GraphSnapshotItem, InMemoryClaimStore,
-    REASON_AWAITING_APPROVAL, REASON_PREREQUISITE_MISSING, STOP_DANGLING_PREREQUISITE,
-    STOP_NO_OP_CYCLE, STOP_PREPARE_SKIP, SqliteClaimStore, WorkItemObservation, conflict_keys,
+    CURRENT_ORCH_SCHEMA_VERSION, ClaimStore, ClaimStoreError, DEFAULT_PAUSE_ACCOUNT,
+    EVENT_ACQUIRED, EVENT_EXPIRED, EVENT_RELEASED, EVENT_RENEWED, EVENT_STOLEN, GraphSnapshotItem,
+    InMemoryClaimStore, ORCH_PARTITIONED_TABLES, ORCH_PAUSE_CLEARS_TABLE, PAUSE_CLEAR_VIA_CLI,
+    PAUSE_CLEAR_VIA_HUB, REASON_AWAITING_APPROVAL, REASON_PREREQUISITE_MISSING,
+    STOP_DANGLING_PREREQUISITE, STOP_NO_OP_CYCLE, STOP_PREPARE_SKIP, SessionPauseClear,
+    SqliteClaimStore, WorkItemObservation, conflict_keys,
 };
 use flywheel_orchestrator::claims_postgres::PostgresClaimStore;
 use pg_container::Postgres;
@@ -836,28 +838,32 @@ fn human_review_with_free_text_reason_is_refused_and_writes_nothing() {
 #[test]
 fn session_pause_records_clamped_horizon_and_lifts_on_its_own() {
     each(|store| {
-        assert_eq!(store.session_pause_until(t(0)).unwrap(), None);
+        assert_eq!(store.session_pause_until(t(0), "").unwrap(), None);
         // Within the ceiling: the reset itself.
         assert_eq!(
             store
-                .record_session_pause(t(20), t(0), 60.0, "run-1")
+                .record_session_pause(t(20), t(0), 60.0, "run-1", "")
                 .unwrap(),
             Some(t(20))
         );
         // Far-future reset clamps to now + ceiling.
         assert_eq!(
             store
-                .record_session_pause(t(50), t(0), 30.0, "run-2")
+                .record_session_pause(t(50), t(0), 30.0, "run-2", "")
                 .unwrap(),
             Some(t(30))
         );
         // Past reset and disabled ceiling record nothing.
         assert_eq!(
-            store.record_session_pause(t(0), t(5), 30.0, "").unwrap(),
+            store
+                .record_session_pause(t(0), t(5), 30.0, "", "")
+                .unwrap(),
             None
         );
         assert_eq!(
-            store.record_session_pause(t(50), t(5), 0.0, "").unwrap(),
+            store
+                .record_session_pause(t(50), t(5), 0.0, "", "")
+                .unwrap(),
             None
         );
         let rows = store.list_session_pauses().unwrap();
@@ -869,20 +875,252 @@ fn session_pause_records_clamped_horizon_and_lifts_on_its_own() {
         assert_eq!(rows[0].recorded_at, t(0));
         assert_eq!(rows[1].pause_until, t(30));
         // High-water over rows still in the future.
-        assert_eq!(store.session_pause_until(t(10)).unwrap(), Some(t(30)));
-        assert_eq!(store.session_pause_until(t(25)).unwrap(), Some(t(30)));
+        assert_eq!(store.session_pause_until(t(10), "").unwrap(), Some(t(30)));
+        assert_eq!(store.session_pause_until(t(25), "").unwrap(), Some(t(30)));
         // Lifted once the horizon passes (strictly after now).
-        assert_eq!(store.session_pause_until(t(30)).unwrap(), None);
+        assert_eq!(store.session_pause_until(t(30), "").unwrap(), None);
     });
 }
 
 #[test]
 fn session_pause_recorded_twice_does_not_accumulate() {
     each(|store| {
-        store.record_session_pause(t(50), t(0), 30.0, "r").unwrap();
-        store.record_session_pause(t(50), t(0), 30.0, "r").unwrap();
+        store
+            .record_session_pause(t(50), t(0), 30.0, "r", "")
+            .unwrap();
+        store
+            .record_session_pause(t(50), t(0), 30.0, "r", "")
+            .unwrap();
         assert_eq!(store.list_session_pauses().unwrap().len(), 2);
-        assert_eq!(store.session_pause_until(t(1)).unwrap(), Some(t(30)));
+        assert_eq!(store.session_pause_until(t(1), "").unwrap(), Some(t(30)));
+    });
+}
+
+#[test]
+fn pause_account_records_carry_their_account_and_match_only_it() {
+    each(|store| {
+        store
+            .record_session_pause(t(50), t(0), 30.0, "run-a", "alice")
+            .unwrap();
+        store
+            .record_session_pause(t(50), t(0), 20.0, "run-d", DEFAULT_PAUSE_ACCOUNT)
+            .unwrap();
+        let rows = store.list_session_pauses().unwrap();
+        assert_eq!(rows[0].account.as_deref(), Some("alice"));
+        assert_eq!(rows[1].account.as_deref(), Some(""));
+        assert!(rows.iter().all(|r| r.cleared.is_none()));
+        assert_eq!(
+            store.session_pause_until(t(1), "alice").unwrap(),
+            Some(t(30))
+        );
+        // "" is the default-credentials account: distinct from every name.
+        assert_eq!(store.session_pause_until(t(1), "").unwrap(), Some(t(20)));
+        assert_eq!(store.session_pause_until(t(1), "bob").unwrap(), None);
+        assert!(rows[0].applies_to("alice") && !rows[0].applies_to("bob"));
+        assert!(!rows[1].applies_to("alice"));
+    });
+}
+
+#[test]
+fn pause_account_two_active_pauses_on_one_account_return_the_later_horizon() {
+    each(|store| {
+        store
+            .record_session_pause(t(50), t(0), 20.0, "r1", "alice")
+            .unwrap();
+        store
+            .record_session_pause(t(50), t(0), 40.0, "r2", "alice")
+            .unwrap();
+        store
+            .record_session_pause(t(10), t(0), 30.0, "r3", "alice")
+            .unwrap();
+        assert_eq!(
+            store.session_pause_until(t(1), "alice").unwrap(),
+            Some(t(40))
+        );
+        assert_eq!(
+            store.session_pause_until(t(39), "alice").unwrap(),
+            Some(t(40))
+        );
+        assert_eq!(store.session_pause_until(t(40), "alice").unwrap(), None);
+    });
+}
+
+#[test]
+fn pause_account_clear_appends_an_attributed_record_and_deactivates_only_that_pause() {
+    each(|store| {
+        store
+            .record_session_pause(t(50), t(0), 30.0, "run-a", "alice")
+            .unwrap();
+        store
+            .record_session_pause(t(50), t(0), 20.0, "run-b", "bob")
+            .unwrap();
+        let before = store.list_session_pauses().unwrap();
+        let reason = "token rotated  -- verbatim, with \"quotes\"";
+        assert!(
+            store
+                .clear_session_pause(before[0].id, t(5), PAUSE_CLEAR_VIA_CLI, reason)
+                .unwrap()
+        );
+        let after = store.list_session_pauses().unwrap();
+        assert_eq!(after.len(), 2);
+        assert_eq!(
+            after[0].cleared,
+            Some(SessionPauseClear {
+                at: t(5),
+                via: PAUSE_CLEAR_VIA_CLI.to_owned(),
+                reason: reason.to_owned(),
+            })
+        );
+        assert!(!after[0].is_active(t(6)));
+        assert!(after[1].is_active(t(6)));
+        assert_eq!(after[1], before[1]);
+        assert_eq!(store.session_pause_until(t(6), "alice").unwrap(), None);
+        assert_eq!(store.session_pause_until(t(6), "bob").unwrap(), Some(t(20)));
+        assert!(
+            store
+                .clear_session_pause(before[1].id, t(6), PAUSE_CLEAR_VIA_HUB, "r")
+                .unwrap()
+        );
+        assert_eq!(
+            store.list_session_pauses().unwrap()[1]
+                .cleared
+                .as_ref()
+                .unwrap()
+                .via,
+            "hub"
+        );
+    });
+}
+
+#[test]
+fn pause_account_clear_does_not_alter_the_pause_row() {
+    each(|store| {
+        store
+            .record_session_pause(t(50), t(0), 30.0, "run-a", "alice")
+            .unwrap();
+        let before = store.list_session_pauses().unwrap().remove(0);
+        store
+            .clear_session_pause(before.id, t(5), PAUSE_CLEAR_VIA_CLI, "why")
+            .unwrap();
+        let after = store.list_session_pauses().unwrap().remove(0);
+        assert!(after.cleared.is_some());
+        assert_eq!(
+            (
+                after.id,
+                &after.account,
+                &after.run_id,
+                after.reset_at,
+                after.pause_until,
+                after.recorded_at
+            ),
+            (
+                before.id,
+                &before.account,
+                &before.run_id,
+                before.reset_at,
+                before.pause_until,
+                before.recorded_at
+            ),
+        );
+    });
+}
+
+#[test]
+fn pause_account_clear_of_a_cleared_expired_or_missing_pause_records_nothing() {
+    each(|store| {
+        store
+            .record_session_pause(t(50), t(0), 30.0, "run-a", "alice")
+            .unwrap();
+        store
+            .record_session_pause(t(10), t(0), 30.0, "run-e", "alice")
+            .unwrap();
+        let rows = store.list_session_pauses().unwrap();
+        let (live, short) = (rows[0].id, rows[1].id);
+        // Expired at `now`: nothing recorded.
+        assert!(
+            !store
+                .clear_session_pause(short, t(10), PAUSE_CLEAR_VIA_CLI, "late")
+                .unwrap()
+        );
+        // Nonexistent.
+        assert!(
+            !store
+                .clear_session_pause(9999, t(1), PAUSE_CLEAR_VIA_CLI, "ghost")
+                .unwrap()
+        );
+        assert!(
+            store
+                .clear_session_pause(live, t(1), PAUSE_CLEAR_VIA_CLI, "first")
+                .unwrap()
+        );
+        let once = store.list_session_pauses().unwrap();
+        // Already cleared: the first record stands, nothing appended.
+        assert!(
+            !store
+                .clear_session_pause(live, t(2), PAUSE_CLEAR_VIA_HUB, "second")
+                .unwrap()
+        );
+        assert_eq!(store.list_session_pauses().unwrap(), once);
+        assert_eq!(once[0].cleared.as_ref().unwrap().reason, "first");
+        assert!(once[1].cleared.is_none());
+    });
+}
+
+#[test]
+fn pause_account_clear_with_an_empty_reason_or_unknown_via_is_rejected() {
+    each(|store| {
+        store
+            .record_session_pause(t(50), t(0), 30.0, "run-a", "alice")
+            .unwrap();
+        let id = store.list_session_pauses().unwrap()[0].id;
+        for reason in ["", "   \t"] {
+            let err = store
+                .clear_session_pause(id, t(1), PAUSE_CLEAR_VIA_CLI, reason)
+                .unwrap_err();
+            assert!(
+                matches!(err, ClaimStoreError::EmptyPauseClearReason),
+                "{err}"
+            );
+        }
+        let err = store
+            .clear_session_pause(id, t(1), "shell", "why")
+            .unwrap_err();
+        assert!(
+            matches!(err, ClaimStoreError::UnknownPauseClearVia { .. }),
+            "{err}"
+        );
+        assert!(store.list_session_pauses().unwrap()[0].cleared.is_none());
+        assert_eq!(
+            store.session_pause_until(t(1), "alice").unwrap(),
+            Some(t(30))
+        );
+    });
+}
+
+#[test]
+fn pause_account_repause_after_clear_holds() {
+    each(|store| {
+        store
+            .record_session_pause(t(50), t(0), 30.0, "run-1", "alice")
+            .unwrap();
+        let id = store.list_session_pauses().unwrap()[0].id;
+        store
+            .clear_session_pause(id, t(5), PAUSE_CLEAR_VIA_CLI, "cleared")
+            .unwrap();
+        assert_eq!(store.session_pause_until(t(6), "alice").unwrap(), None);
+        assert_eq!(
+            store
+                .record_session_pause(t(50), t(7), 20.0, "run-2", "alice")
+                .unwrap(),
+            Some(t(27))
+        );
+        assert_eq!(
+            store.session_pause_until(t(8), "alice").unwrap(),
+            Some(t(27))
+        );
+        let rows = store.list_session_pauses().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].cleared.is_some() && rows[1].cleared.is_none());
     });
 }
 
@@ -1426,7 +1664,7 @@ fn sqlite_state_survives_reopen() {
             .unwrap()
             .unwrap();
         store
-            .record_session_pause(t(50), t(0), 30.0, "run-1")
+            .record_session_pause(t(50), t(0), 30.0, "run-1", "")
             .unwrap();
         store.record_graph_snapshot(&[item_a()], t(1)).unwrap();
     }
@@ -1435,7 +1673,7 @@ fn sqlite_state_survives_reopen() {
         store.load_claim("task-a").unwrap().unwrap().worker_id,
         "worker-1"
     );
-    assert_eq!(store.session_pause_until(t(10)).unwrap(), Some(t(30)));
+    assert_eq!(store.session_pause_until(t(10), "").unwrap(), Some(t(30)));
     assert_eq!(store.list_graph_snapshot_items(1).unwrap(), vec![item_a()]);
     assert!(
         store
@@ -1544,4 +1782,135 @@ fn v3_store_is_refused_then_upgrades_keeping_rows_with_empty_ledgers() {
         )
         .unwrap();
     assert_eq!(version, i64::from(CURRENT_ORCH_SCHEMA_VERSION));
+}
+
+/// Every row of `table` as text, ordered, over the columns the live table
+/// has minus `skip` (the upgrade's added columns), so a pre- and
+/// post-upgrade dump compare row for row.
+fn dump_table(conn: &Connection, table: &str, skip: &[&str]) -> Vec<String> {
+    let columns: Vec<String> = conn
+        .prepare(&format!(
+            "SELECT name FROM pragma_table_info('{table}') ORDER BY cid"
+        ))
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|c| !skip.contains(&c.as_str()))
+        .collect();
+    assert!(!columns.is_empty(), "{table} missing");
+    let select = columns
+        .iter()
+        .map(|c| format!("quote({c})"))
+        .collect::<Vec<_>>()
+        .join(" || '|' || ");
+    let mut rows: Vec<String> = conn
+        .prepare(&format!("SELECT {select} FROM {table}"))
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn pause_account_sqlite_v10_store_upgrades_in_place_keeping_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v10.db");
+    let before: Vec<Vec<String>> = {
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("fixtures/orchestrator-schema-v10.sql"))
+            .unwrap();
+        ORCH_PARTITIONED_TABLES
+            .iter()
+            .map(|table| dump_table(&conn, table, &[]))
+            .collect()
+    };
+    assert!(
+        before.iter().all(|rows| !rows.is_empty()),
+        "every table seeded"
+    );
+    // A behind store is refused naming the upgrade, untouched.
+    let err = SqliteClaimStore::open_partition(&path, "proj").unwrap_err();
+    assert!(err.is_schema_mismatch(), "{err}");
+    assert!(err.to_string().contains("fw db upgrade"), "{err}");
+
+    let upgrade = SqliteClaimStore::upgrade(&path, "proj").unwrap();
+    assert_eq!(upgrade.from, Some(10));
+    assert_eq!(upgrade.to, CURRENT_ORCH_SCHEMA_VERSION);
+    assert_eq!(CURRENT_ORCH_SCHEMA_VERSION, 11);
+    assert!(upgrade.partitioned.is_empty());
+    {
+        let conn = Connection::open(&path).unwrap();
+        for (table, rows) in ORCH_PARTITIONED_TABLES.iter().zip(&before) {
+            assert_eq!(&dump_table(&conn, table, &["account"]), rows, "{table}");
+        }
+        let nulls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM orchestrator_session_pauses WHERE account IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 2, "legacy pauses read back NULL, never backfilled");
+        let clears: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {ORCH_PAUSE_CLEARS_TABLE}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(clears, 0);
+    }
+
+    let store = SqliteClaimStore::open_partition(&path, "proj").unwrap();
+    let pauses = store.list_session_pauses().unwrap();
+    assert_eq!(pauses.len(), 2);
+    assert!(
+        pauses
+            .iter()
+            .all(|p| p.account.is_none() && p.cleared.is_none())
+    );
+    assert_eq!(pauses[1].run_id, "run-limit");
+    assert_eq!(pauses[1].pause_until, t(30));
+    // The legacy (NULL) active pause holds back every account.
+    for account in ["alice", "bob", DEFAULT_PAUSE_ACCOUNT] {
+        assert_eq!(
+            store.session_pause_until(t(10), account).unwrap(),
+            Some(t(30)),
+            "{account:?}"
+        );
+    }
+    // Active NULL + active A: a lookup for B returns the NULL horizon, one
+    // for A the later of the two.
+    store
+        .record_session_pause(t(50), t(10), 35.0, "run-a", "alice")
+        .unwrap();
+    assert_eq!(
+        store.session_pause_until(t(11), "bob").unwrap(),
+        Some(t(30))
+    );
+    assert_eq!(
+        store.session_pause_until(t(11), "alice").unwrap(),
+        Some(t(45))
+    );
+    // A clear of the legacy pause lifts it for everyone without touching it.
+    assert!(
+        store
+            .clear_session_pause(pauses[1].id, t(12), PAUSE_CLEAR_VIA_CLI, "legacy")
+            .unwrap()
+    );
+    assert_eq!(store.session_pause_until(t(13), "bob").unwrap(), None);
+    assert_eq!(
+        store.session_pause_until(t(13), "alice").unwrap(),
+        Some(t(45))
+    );
+    // The rest of the migrated store still works.
+    assert_eq!(store.load_claim("t1").unwrap().unwrap().version, 2);
+    assert_eq!(store.load_work_item_dependencies("t1").unwrap(), vec!["t0"]);
+    assert_eq!(store.list_human_review_queue().unwrap().len(), 1);
+    drop(store);
+    assert!(SqliteClaimStore::upgrade(&path, "proj").unwrap().is_noop());
 }

@@ -703,7 +703,8 @@ pub async fn orchestrate(
         // bookkeeping is deliberately not gated.
         let mut claim_pause_until: Option<DateTime<Utc>> = None;
         if request.session_pause_ceiling_seconds > 0.0 {
-            claim_pause_until = claims.session_pause_until(clock())?;
+            claim_pause_until =
+                claims.session_pause_until(clock(), crate::claims::DEFAULT_PAUSE_ACCOUNT)?;
             if let Some(until) = claim_pause_until {
                 emit(
                     log.as_ref(),

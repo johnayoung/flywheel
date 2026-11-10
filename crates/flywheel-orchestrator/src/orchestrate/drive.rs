@@ -321,6 +321,7 @@ pub(super) async fn drive_under_lease(
             (ctx.now)(),
             ctx.session_pause_ceiling_seconds,
             &outcome.lifecycle.run_id,
+            crate::claims::DEFAULT_PAUSE_ACCOUNT,
         );
         match paused_until {
             Ok(Some(until)) => emit(

@@ -19,6 +19,11 @@
 //!   request); 409 (no session) when the task's latest DONE run has no
 //!   unresolved landing park or a re-land of it already runs, 404 for a
 //!   task the folder does not know;
+//! * `POST /api/flywheel/pauses/clear {"folder", "ids"? | "account"? |
+//!   "all"?, "reason"}` -- clear the matching active session-limit pauses
+//!   (a hub-attributed record, `reason` verbatim): `{"cleared": [id...]}`;
+//!   400 for a blank reason or not exactly one target, 409 when no active
+//!   pause matches (nothing recorded); refused to peers;
 //! * `POST /api/flywheel/steer/say {"folder", "run", "message"}` and
 //!   `POST /api/flywheel/steer/interrupt {"folder", "run"}` -- enqueue one
 //!   `say` / `interrupt` control command for a running or validating run
@@ -30,9 +35,10 @@
 use super::ApiQuery;
 use super::{AppState, error_response};
 use crate::flywheel::{
-    FlywheelEvent, FlywheelMonitor, FlywheelSummary, MAX_SAY_CHARS, RelandRefused, Steer,
-    SteerRefused, WorkerScope, mark_queued, reland_session_command, reland_session_name,
-    runs_reland, runs_worker, valid_run_id, worker_session_command, worker_session_name,
+    FlywheelEvent, FlywheelMonitor, FlywheelSummary, MAX_SAY_CHARS, PauseClearRefused, PauseTarget,
+    RelandRefused, Steer, SteerRefused, WorkerScope, mark_queued, reland_session_command,
+    reland_session_name, runs_reland, runs_worker, valid_run_id, worker_session_command,
+    worker_session_name,
 };
 use crate::hub::{CreateSession, Hub};
 use crate::state::Workspace;
@@ -542,6 +548,73 @@ pub(super) async fn start_reland(
         Err(join) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("starting the re-land failed: {join}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ClearPausesRequest {
+    folder: String,
+    #[serde(default)]
+    ids: Option<Vec<i64>>,
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    all: Option<bool>,
+    reason: String,
+}
+
+/// The one target a clear request names; `Err` answers 400.
+fn pause_target(request: &ClearPausesRequest) -> Result<PauseTarget, &'static str> {
+    let all = request.all == Some(true);
+    match (&request.ids, &request.account, all) {
+        (Some(ids), None, false) if !ids.is_empty() => Ok(PauseTarget::Ids(ids.clone())),
+        (Some(_), None, false) => Err("ids must name at least one pause"),
+        (None, Some(account), false) => Ok(PauseTarget::Account(account.clone())),
+        (None, None, true) => Ok(PauseTarget::All),
+        _ => Err("name exactly one of ids, account, or all: true"),
+    }
+}
+
+/// Clear session-limit pauses as `fw pauses clear` does, attributed `hub`.
+pub(super) async fn clear_pauses(
+    State(app): State<AppState>,
+    super::ApiJson(request): super::ApiJson<ClearPausesRequest>,
+) -> Response {
+    let monitor = match monitor(&app) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if request.reason.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "reason must be non-empty");
+    }
+    let target = match pause_target(&request) {
+        Ok(target) => target,
+        Err(why) => return error_response(StatusCode::BAD_REQUEST, why),
+    };
+    let (path, _) = match adopted_folder(&app, &monitor, request.folder).await {
+        Ok(found) => found,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let provider = Arc::clone(monitor.provider());
+    let folder = path.clone();
+    let reason = request.reason;
+    // An action: no timeout (see `steer_run`).
+    let cleared =
+        tokio::task::spawn_blocking(move || provider.clear_pauses(&folder, &target, &reason)).await;
+    match cleared {
+        Ok(Ok(ids)) => {
+            monitor.refresh(&path);
+            Json(json!({ "cleared": ids })).into_response()
+        }
+        Ok(Err(PauseClearRefused::NoMatch(m))) => error_response(StatusCode::CONFLICT, &m),
+        Ok(Err(PauseClearRefused::Store(m))) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &m)
+        }
+        Err(join) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("clearing the pauses failed: {join}"),
         ),
     }
 }

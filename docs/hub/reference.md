@@ -4,9 +4,9 @@ Every `fw hub` verb, flag, and file (`docs_drift.rs` checks). Front door: [hub](
 
 ## Conventions
 
-- `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; `activity` also takes names its journal or a machine knows).
-- A closed output pipe (`| head -1`) ends a verb quietly, exit 0.
-- Exit codes: 0 ok, 1 failed, 2 bad usage/config, 3 no hub for the state dir, 4 handoff refused as incompatible, 5 hub busy (retry). `doctor`, `tls`, `config` work without a hub (exit 0) and say so.
+- `SESSION` / `WS`: id, unique id prefix, or name (exact name beats prefix; `activity` also takes names its journal or a machine knows).
+- A closed output pipe (`| head -1`) ends a verb quietly (exit 0).
+- Exit codes: 0 ok, 1 failed, 2 bad usage/config, 3 no hub for the state dir, 4 handoff refused as incompatible, 5 hub busy (retry). `doctor`, `tls`, `config` work hubless (exit 0) and say so.
 - Every verb but `report` takes `--state-dir DIR` (default `$FLYWHEEL_HOME/hub`).
 - `{remote}` = `[--url URL] [--token T] [--fingerprint SHA256]`: a hub elsewhere; prefer `FW_HUB_TOKEN` (argv is world-readable).
 - `{machine}` = `[--machine NAME]`: a machine registered on that hub, via its proxy; `{where}` = `{remote} {machine}`.

@@ -350,6 +350,57 @@ pub struct UntrustedRepoFile {
     pub command: String,
 }
 
+/// One active session-limit pause, exactly as `fw pauses --json` reports
+/// it (times RFC 3339 UTC; `account` `None` = a pre-account row holding
+/// back every account, `""` = the CLI login).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelPause {
+    pub id: i64,
+    pub account: Option<String>,
+    pub run_id: String,
+    pub reset_at: String,
+    pub pause_until: String,
+    pub recorded_at: String,
+    pub active: bool,
+    pub cleared: Option<PanelPauseClear>,
+}
+
+/// A pause's clear record (`via` is `cli` or `hub`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelPauseClear {
+    pub at: String,
+    pub via: String,
+    pub reason: String,
+}
+
+/// Which active pauses a clear targets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseTarget {
+    /// These pause ids.
+    Ids(Vec<i64>),
+    /// Pauses recorded under exactly this account (`""` = the CLI login).
+    Account(String),
+    /// Every active pause, pre-account rows included.
+    All,
+}
+
+/// Why a pause clear recorded nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseClearRefused {
+    /// No active pause matched the target.
+    NoMatch(String),
+    /// The store could not be read or written.
+    Store(String),
+}
+
+impl std::fmt::Display for PauseClearRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoMatch(m) | Self::Store(m) => f.write_str(m),
+        }
+    }
+}
+
 /// Everything the panel shows for one adopted folder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlywheelPanel {
@@ -387,6 +438,10 @@ pub struct FlywheelPanel {
     /// hub that predates it.
     #[serde(default)]
     pub intake: Option<AutopilotView>,
+    /// The active session-limit pauses (the active entries of `fw pauses
+    /// --json`), newest first.
+    #[serde(default)]
+    pub pauses: Vec<PanelPause>,
 }
 
 impl FlywheelPanel {
@@ -416,6 +471,7 @@ impl FlywheelPanel {
             claims: Vec::new(),
             alerts: Vec::new(),
             intake: None,
+            pauses: Vec::new(),
         }
     }
 
@@ -663,6 +719,17 @@ pub trait FlywheelProvider: Send + Sync + 'static {
     /// The argv that re-lands task `task_id` of `folder` (run there), e.g.
     /// `[/path/to/fw, reland, ID]`.
     fn reland_command(&self, folder: &Path, task_id: &str) -> Vec<String>;
+
+    /// Clear the active session-limit pauses of `folder` that `target`
+    /// matches as `fw pauses clear` does, attributed `hub` with `reason`
+    /// verbatim; the cleared ids, ascending. Nothing matching records
+    /// nothing ([`PauseClearRefused::NoMatch`]).
+    fn clear_pauses(
+        &self,
+        folder: &Path,
+        target: &PauseTarget,
+        reason: &str,
+    ) -> Result<Vec<i64>, PauseClearRefused>;
 
     /// Drop whatever is kept open for `folder` (stores, listings,
     /// transcripts): it left every workspace. A later read reopens.

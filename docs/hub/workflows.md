@@ -14,30 +14,30 @@ fw hub new demo --name build -- sh -c "$(cat next.sh)" && fw hub wait build --un
 fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it waits on a prompt
 ```
 
-`wait`: 0 met, 124 timeout, 1 error (or session ended). `--changed`: only statuses begun after it started. `--until idle` accepts `done`; `exit` prints `exited N` / `killed (SIG)`; `--timeout 0` checks once.
+`wait`: 0 met, 124 timeout, 1 error (or session ended). `--changed`: only statuses begun after it started. `--until idle` accepts `done`; `exit` prints `exited N` / `killed (SIG)`; `--timeout 0`: check once.
 
 ## Agent launcher
 
-- **Resume** (`--resume ID`, `--continue`, the dialog's **Conversation**): a new session picks up a folder's Claude Code or Codex conversation (`fw hub conversations WS --kind K`); one open in a running session is refused. Relaunch and restarts resume a session's own.
+- **Resume** (`--resume ID`, `--continue`, the dialog's **Conversation**): a new session resumes a folder's Claude Code or Codex conversation (`fw hub conversations WS --kind K`), unless a running one has it open. Relaunch and restarts resume a session's own.
 - **Accounts** (Claude): `claude setup-token` as the other account, Settings > Agents (or `fw hub account add work`), then `--account work` or the dialog's **Account** (per workspace). Spawns get `CLAUDE_CODE_OAUTH_TOKEN` (one `~/.claude` serves both; rows show `@work`); Claude's settings `env` outranks it.
-- **First prompt** (`--prompt`, 32 KiB): the first user turn, on create only. **Model**: `claude --model` / `codex -m`.
-- **Permissions**: Claude `--permission-mode` (`bypassPermissions` warns, marks the session `unchecked`); Codex `-a` approval, `-s` sandbox; reapplied on relaunch and restore.
+- **First prompt** (`--prompt`, 32 KiB): first user turn, create only. **Model**: `claude --model` / `codex -m`.
+- **Permissions**: Claude `--permission-mode` (`bypassPermissions` warns, marks it `unchecked`); Codex `-a` approval, `-s` sandbox; reapplied on relaunch and restore.
 - **Templates** (per workspace): kind, prompt, model, permissions, worktree; a taken name needs `--replace` (all) or `--edit` (given flags). Launch: palette, `new --template NAME` (flags win). Defaults: `[agents.*]`.
 
 ## Suggested commands
 
-Fenced blocks come from the agent's own record, **exactly as written**.
+Fenced blocks from the agent's own record, **exactly as written**.
 
-- Sources: Claude's transcript (or the Stop hook's `last_assistant_message`, so blocks are in before `done`), Codex's rollout, else its `notify` payload. Tailed each second and per hook report; newest 500 per session persist.
-- Shell blocks: `bash sh zsh shell console fish ...`, or untagged ones that start like a command; `console` keeps only the commands.
+- Sources: Claude's transcript (or the Stop hook's `last_assistant_message`, so blocks are in before `done`), Codex's rollout, else its `notify` payload. Tailed per second and per hook report; newest 500 per session kept.
+- Shell blocks: `bash sh zsh shell console fish ...`, or untagged ones starting like a command; `console` keeps only commands.
 - In-session commands (Claude Code's `!` bash mode): an inline `` `! cmd` `` or a block of `! cmd` lines is a shell command; Copy / Send drop the `!`.
-- Send pastes (bracketed when enabled), Send + Run adds Enter; multi-line without bracketed paste: 409, use Copy. `--copy`: OSC 52, over SSH too (tmux: `set -g set-clipboard on`).
-- **Commands drawer** (`Alt C`): newest first; Send targets the companion shell (opened if needed). Keys: `j`/`k`, `c` copy, `1`-`9` a card, `s` send, `Shift S` send + run.
-- **Replies**: every assistant message as written (newest 100, 64 KiB each). `Alt Y` copies the last; the Replies tab copies one whole or by block. A reply in an agent's pane (not a tool call) has a hover copy button.
+- Send pastes (bracketed if enabled), Send + Run adds Enter; multi-line without bracketed paste: 409, use Copy. `--copy`: OSC 52, over SSH too (tmux: `set -g set-clipboard on`).
+- **Commands drawer** (`Alt C`): newest first; Send targets the companion shell (opened as needed). Keys: `j`/`k`, `c` copy, `1`-`9` a card, `s` send, `Shift S` send + run.
+- **Replies**: every assistant message as written (newest 100, 64 KiB each). `Alt Y` copies the last; the Replies tab copies one whole or by block. A reply in an agent's pane (not a tool call) has a hover copy.
 
 ## Usage and cost
 
-- From transcripts (Claude `message.usage` incl. subagents, Codex `token_count`) at list prices (`usage.rs` `PRICES`; unknown models: tokens only); ~1-2% under Claude's own (side calls untranscribed).
+- From transcripts (Claude `message.usage` incl. subagents, Codex `token_count`) at list prices (`usage.rs` `PRICES`; unknown models: tokens only); ~1-2% under Claude's (side calls untranscribed).
 - Header meter, sidebar, `fw hub ls`; 62 days per session.
 
 ## Worktrees and companion shells
@@ -47,12 +47,12 @@ fw hub new WS --kind claude --worktree fix-retry [--base main]  # git worktree a
 fw hub kill fix-retry --rm --remove-worktree  # refused if work would be lost, unless --force
 ```
 
-- A sibling of the **main** checkout; base `--base`, else the current branch; bad names, existing dirs or branches refused. Removal: 409 while another session uses it, or (without `--force`) over uncommitted, untracked, or unmerged work; the branch goes only when nothing is lost.
-- **Companion shell**: one per agent, in its directory (`Alt \``, the drawer, the API), closed with it; the `shell` / `agent` pill flips.
+- A sibling of the **main** checkout; base `--base`, else the current branch; bad names, existing dirs or branches refused. Removal: 409 while another session uses it, or (without `--force`) over uncommitted, untracked, or unmerged work; the branch goes only if nothing is lost.
+- **Companion shell**: one per agent, in its dir (`Alt \``, the drawer, the API), closed with it; the `shell`/`agent` pill flips.
 
 ## Review
 
-Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the worktree's, else the upstream (`--base`). **Every action is planned first**, then run by its `fingerprint` ([hub-api](api.md#review-handoff-peer-review)).
+Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the worktree's, else upstream (`--base`). **Every action is planned first**, then run by its `fingerprint` ([hub-api](api.md#review-handoff-peer-review)).
 
 | Action | Runs | Refused when |
 |---|---|---|
@@ -69,10 +69,10 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 ## Pull requests and CI
 
-A branch with a pull request: a badge on its row (`#7`, checks), a PR section in Review, `fw hub pr SESSION`. All through `gh` (missing or signed out: the section says why).
+A branch with a PR: a badge on its row (`#7`, checks), a PR section in Review, `fw hub pr SESSION`. All via `gh` (missing or signed out: the section says why).
 
-- **Asked** per (folder, branch) by head (`gh pr list --head B`; `123` never binds PR #123), if pushed, not default: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, its own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, stale).
-- **View log**: `gh run view --job J --log-failed`, the last 400 lines, escapes stripped, secrets redacted (Activity's rules).
+- **Asked** per (folder, branch) by head (`gh pr list --head B`; `123` never binds PR #123), if pushed, not default: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, stale).
+- **View log**: `gh run view --job J --log-failed`, last 400 lines, escapes stripped, secrets redacted (Activity's rules).
 - **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued (`done`). One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; not re-pasted within 5 min.
 - **Re-run failed** (`gh run rerun R --failed`), **Ready** (`gh pr ready`),
   **Merge** (`gh pr merge N --<method> --match-head-commit SHA`, the repo's default method): planned, fingerprint-checked against a GitHub re-read (unreadable: refused). Refuses closed, draft, conflicting; checks failing or running, changes requested, review required: only with the number typed back (`--force N`).
@@ -101,13 +101,13 @@ fw hub fanout cleanup "$id" [--force] --yes
 
 - **Agent claims are untrusted**: a finished turn only queues grading; graders' exit codes decide. Needs you: once per unseen grading.
 - **Graders are held out of the prompt only** (agents run as you): `--protect` a tracked grader's inputs (a change fails) or keep it outside the repo ([held-out gate](../held-out-gate.md)); absolute-path scripts are pinned by hash.
-- Grading: flywheel-core's runner (in order, `/bin/sh -c`, exit 0 passes, `--timeout` 900 s each, first failure stops); 2 at once. Rank: passing (smaller diff, then lower cost), failing, stale, grading, ungraded; a pass changing nothing cannot be picked.
-- **Pick** needs a fresh pass on a clean tree at exactly the graded commit, then ff-merges it (plan + fingerprint); base moved: `--rebase`, which grades again.
+- Grading: flywheel-core's runner (in order, `/bin/sh -c`, exit 0 passes, `--timeout` 900 s each, first failure stops); 2 at once. Rank: passing (smaller diff, then lower cost), failing, stale, grading, ungraded; a no-change pass cannot be picked.
+- **Pick** needs a fresh pass on a clean tree at exactly the graded commit, then ff-merges it (plan + fingerprint); base moved: `--rebase` (grades again).
 - **Cleanup** removes losers' worktrees and sessions (unique work: `--force`; `--stop-only` keeps worktrees); `rm` forgets. Max 50 fan-outs; cut-short gradings rerun.
 
 ## Fan-outs and flywheel tasks
 
-For a folder with a flywheel **directory** work source:
+A folder with a flywheel **directory** work source:
 
 ```bash
 fw hub fanout promote "$id" --reference c1  # instead of pick; dry run: path and exact bytes
@@ -115,7 +115,7 @@ fw hub fanout promote "$id" --reference c1 --yes  # writes <project>/tasks/activ
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote** (not pick) to land via `fw worker` (refused after a pick): goal (`--goal`, seed task's, else the prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
+- **Promote** (not pick) to land via `fw worker` (refused after a pick): goal (`--goal`, seed task's, else prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
 - **Fan out this task** (Flywheel panel): prompt = its goal and context; graders = its command plus **held-out** graders, added server-side (none/unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
@@ -123,21 +123,21 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 Repos flywheel knows (project id) get the verified loop, read-only (`--no-flywheel`: off); state: `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else hub env.
 
 - Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs (last tool call), 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's `verified/total` badge, `Alt F`, the palette.
-- **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (offers unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted transcript, live; message, interrupt (confirmed).
-- **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) = `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = its `--pause|--resume`.
+- **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (offers unmet prerequisites); a second asks (409); `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted live transcript; message, interrupt (confirmed).
+- **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) = `fw autopilot` in a session; stop = Ctrl-C; pause / resume = its `--pause|--resume`.
 - Shown (ledger): tier verdicts, newest deciding cycle (emitted, dropped + why), 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row.
-- A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. A watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
-- **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`). No project: no row. Seam: `AuditSink` (`hub_audit.rs`).
+- A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. Per-folder watcher (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
+- **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`), if any. Seam: `AuditSink` (`hub_audit.rs`).
 
 ## Prompt queue
 
-Per agent session, prompts the hub types in itself, in order ("when done, do X"): `fw hub queue add api --when idle "now the changelog"`.
+Per agent session, prompts the hub types itself, in order ("when done, do X"): `fw hub queue add api --when idle "now the changelog"`.
 
 | | |
 |---|---|
 | `--when` | `done` (default): at rest (turn finished, or awaiting a first prompt); `idle`: at rest and viewed; `blocked-cleared`: at the front, blocked, answered, finished |
 | Never | `working`, `blocked`, `unknown`; within 1.5 s of the rest or `queue.typing_quiet` of typing; during a grading, handoff, review, or edit |
-| Drafts | text left in the agent's input line holds it (keys answering a prompt do not count) |
+| Drafts | text left in the agent's input line holds it (keys answering a prompt don't count) |
 | One at a time | the next waits for a rest begun after the last delivery (bracketed paste, Enter); 20 delivered kept |
 | Exactly once | `sending` saved before the paste, `delivered` after; a crash between: the transcript decides (`reconciled`) or it is pending again |
 | Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched |

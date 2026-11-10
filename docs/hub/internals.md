@@ -41,7 +41,7 @@ Front door: [hub](../hub.md).
 Replaces the hub process **ending no session**: same pids, screens, scrollback, port, status, hook secrets. Linux only.
 
 - Binary: `--binary`, else `fw` on `PATH`, else this one; it inherits the old hub's environment. Earlier agents' hooks keep the old binary's path: upgrade in place.
-- Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring, and exits on the new hub's ack. Input meanwhile is `nack`ed for a resend: never lost or doubled.
+- Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring, and exits on the new hub's ack; input meanwhile is `nack`ed for resend (never lost/doubled).
 - Failure before commit thaws the old hub; a stuck new one dies at `--timeout`. Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` restarts instead (sessions restored, not kept); systemd: `systemctl --user restart <unit>`.
 - Handed-over processes are not children: exits via pidfd, no code. `attach`, `wait` reconnect within 2 min.
 

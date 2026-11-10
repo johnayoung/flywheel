@@ -4,9 +4,9 @@ Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Fr
 
 ## Conventions
 
-- JSON under `/api`: `Authorization: Bearer <token>`, a login cookie, or a peer credential ([hub-security](security.md#auth)).
+- JSON under `/api`: `Authorization: Bearer <token>`, login cookie, or peer credential ([hub-security](security.md#auth)).
 - Errors `{"error"}`: 400 malformed, 404 unknown, 405 method, 409 refused by state, 422 wrong JSON shape. `cols`/`rows` 0: 120x32.
-- Tables: bodies, status codes; full responses: `curl -sH "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq`, or a verb's `--json`.
+- Tables: bodies, codes; full responses: `curl -sH "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq`, or a verb's `--json`.
 
 ## Workspaces
 
@@ -14,7 +14,7 @@ Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Fr
 |---|---|---|
 | GET / POST | `/api/workspaces` | list (with `templates`) / create `{"name","folders"}` |
 | GET / PATCH / DELETE | `/api/workspaces/{id}` | PATCH `name` / `folders`; 409 a running session's folder / sessions running |
-| GET / PUT | `/api/workspaces/{id}/layout` | `{"rev","tabs":[{"id","name","root"}]}`; node `{"type":"pane","id","session"?}` or `{"type":"split","dir":"right\|down","ratio","a","b"}`; tab root may be `{"type":"board","id","folder"}` (a workspace folder, one each); PUT -> `rev`+1; 409 stale; 400 invalid (ratio 0.05..0.95, 12 tabs/panes) |
+| GET / PUT | `/api/workspaces/{id}/layout` | `{"rev","tabs":[{"id","name","root"}]}`; node `{"type":"pane","id","session"?}` or `{"type":"split","dir":"right\|down","ratio","a","b"}`; tab root may be `{"type":"board","id","folder"}` (one per folder); PUT -> `rev`+1; 409 stale; 400 invalid (ratio 0.05..0.95, 12 tabs/panes) |
 | POST | `/api/workspaces/import` | `{"path","name"?,"update"?}` (hub-side file): 201 / 200 updated / 409 taken |
 | GET | `/api/code-workspaces[?root=]` | `.code-workspace` files under `--import-root` |
 | GET | `/api/folders/check?path=` | `ok`, `git` / `error` |
@@ -53,7 +53,7 @@ Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Fr
 | GET | `/api/claude-accounts` | `{accounts:[{name,updated}]}` (never tokens); `"account":NAME` on `POST /api/sessions` launches under one |
 | POST | `/api/claude-accounts` | `{name,token,replace?}` -> 201 `{name,updated}` (taken: 409 unless `replace`) |
 | DELETE | `/api/claude-accounts/{name}` | 204 |
-| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, 30): the folder's past conversations, newest first, `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `POST /api/sessions` `"resume":ID\|"latest"` resumes one |
+| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, 30): the folder's past conversations, newest first `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `POST /api/sessions` `"resume":ID\|"latest"` resumes one |
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
@@ -100,7 +100,7 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/fanouts/{id}/cleanup` | `{"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}` |
 | POST | `/api/fanouts/{id}/promote` | `{"task_id"?,"goal"?,...}`, two-step (plan: path, contents); 409 exists / changed |
 | GET | `/api/flywheel` | per adopted folder: counts, `plans`, alerts, live runs, worker |
-| GET | `/api/flywheel/panel?folder=` | panel (`queued_in`: scoped worker runs it; `relandable`, `waiting_on`; live `last_tool`, `plans[].tasks`); 404 unadopted |
+| GET | `/api/flywheel/panel?folder=` | panel (`queued_in`: scoped worker runs it; `relandable`, `waiting_on`; `pauses`: active `fw pauses --json`; live `last_tool`, `plans[].tasks`); 404 unadopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next","attempts"}` (poll `since=next`); 503 read waits |
 | GET | `/api/flywheel/history?folder=&task=` | every run; attempts' `outcome`/`error`/`checks` (= `fw show`); task `goal`, `checks` (held-out: names) |
 | GET | `/api/flywheel/task?folder=&task=` | task as a fan-out seed |
@@ -113,6 +113,7 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/flywheel/autopilot/decide` | `{"folder","run","decision":"approve"/"deny","confirm":true}` + `gate`, `attempt`, `feedback` (as `fw hub autopilot`); 409 not that gate or one queued; 404 no run |
 | POST | `/api/flywheel/steer/say` | `{"folder","run","message"}` -> 201 one `fw say` command; 400 empty; 409 not running/validating |
 | POST | `/api/flywheel/steer/interrupt` | `{"folder","run"}`: as `say`, for `fw interrupt` |
+| POST | `/api/flywheel/pauses/clear` | `{"folder","ids"?\|"account"?\|"all"?,"reason"}` -> `{"cleared":[id]}`, via `hub`; 400 empty reason; 409 no match |
 | POST | `/api/flywheel/reland` | `{"folder","task","workspace_id"?,"cols"?,"rows"?}` -> 201 the `fw reland <task>` session; 409 nothing to re-land / running; 404 unknown task |
 | POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"cols"?,"rows"?}` -> 201 the `fw worker` session; 409 running, unless `another` |
 
@@ -217,7 +218,7 @@ Unreadable queries / login bodies: a 4xx page (JSON if `Accept: application/json
 
 ## Terminal WebSocket
 
-`/api/sessions/{id}/ws`: `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then binary (those `bytes`, then output). Clients size to it, replay, fit, send `resize`.
+`/api/sessions/{id}/ws`: `{"type":"snapshot","cols","rows","alt_screen","bytes"}`, then binary (those `bytes`, then output). Clients size, replay, fit, send `resize`.
 
 | Server text message | |
 |---|---|
@@ -236,7 +237,7 @@ Client sends `input` `{"data"}`, `resize` `{"cols","rows"}`, `theme` `{"foregrou
 - Lite: at most `fps` updates/s (raw when <= 1 KiB, else a frame); a raw viewer 64+ chunks behind gets one update.
 - `z=1`: binary = `0` + bytes, or `1` + u32 BE length + raw deflate (one stream per socket, sync-flushed).
 - `input` may carry `id` (growing per `client`): `{"type":"ack","id"}` once taken (never typed twice); `{"type":"nack","id","retry"}` refused (`retry`: mid-handoff, resend).
-- `{"type":"mode","lite","fps"?,"paused"?}` switches pacing (`paused`: nothing until unpaused). `{"type":"ping"}` -> `{"type":"pong"}`.
+- `{"type":"mode","lite","fps"?,"paused"?}` switches pacing (`paused`: silent until unpaused). `{"type":"ping"}` -> `{"type":"pong"}`.
 
 Close codes: **4001** token rotated, **4002** logout / login expired, **4003** peer revoked, **4004** share ended, **4005** relaunched, **1012** live handoff (both: reconnect). Machine proxy: **4010** (its 4001-4003), **4011** removed, **1011** link lost.
 
@@ -261,19 +262,19 @@ Close codes: **4001** token rotated, **4002** logout / login expired, **4003** p
 | `away` | `"since","until"` | back after 10+ min: its digest span |
 | `digest` | `"id"` | a digest was sent (`GET /api/digests/{id}`) |
 
-Client sends `{"type":"view","session_id","visible"?:[ids],"present"?}`: what is on screen counts as viewed; `present`: someone is at the page.
+Client sends `{"type":"view","session_id","visible"?:[ids],"present"?}`: on screen counts as viewed; `present`: someone is at the page.
 
 ## Plugins
 
 Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
 
 - **Run**: cwd the plugin dir, own process group; stdin `{"version":1,"type":"event"|"action","plugin","event"|"action","at","hub","payload"}`; env an allowlist (`PATH HOME USER LANG ...`) + `FW_HUB_PLUGIN`, `FW_HUB_PLUGIN_DIR`, `FW_HUB_PLUGIN_TRIGGER` (`event:<name>` / `action:<id>`), `FW_HUB_STATE_DIR`, never the token.
-- **Limits**: SIGTERM at `timeout_secs`, SIGKILL 0.5 s on; 64 KiB output kept; `plugins.max_concurrent` at once; past 64 waiting, events drop. Logs: `plugin-logs/<name>.jsonl` (200 runs past 512 KiB).
+- **Limits**: SIGTERM at `timeout_secs`, SIGKILL 0.5 s later; 64 KiB output kept; `plugins.max_concurrent` at once; over 64 waiting, events drop. Logs: `plugin-logs/<name>.jsonl` (200 runs past 512 KiB).
 - **Response** (stdout JSON): `{"toast": "text" | {"message","tone":"info|ok|warn|error"}}`; actions also `{"paste":{"text","run"?,"session"?}}` (64 KiB).
 
 ### Plugin events
 
-`payload.session` (if any): id, name, kind, state, workspace, cwd, worktree, branch, agent. Rows name main fields; full payloads: log a plugin's stdin.
+`payload.session` (if any): id, name, kind, state, workspace, cwd, worktree, branch, agent. Rows name main fields; full payloads: a plugin's stdin.
 
 | Event | Payload adds |
 |---|---|

@@ -2575,3 +2575,221 @@ fn hub_reland_route_starts_fw_reland_only_for_a_parked_task() {
     let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{sid}"), None);
     assert_eq!(code, 204);
 }
+
+/// `fw pauses --json` run in `root` under the flywheel home `home`: every
+/// pause, newest first.
+fn fw_pauses_json(home: &Path, root: &Path) -> Vec<Value> {
+    let output = Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["pauses", "--json"])
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .env("HOME", root.join("no-home"))
+        .env("FLYWHEEL_HOME", home)
+        .env_remove("FLYWHEEL_PG_DSN")
+        .env_remove("DATABASE_URL")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice::<Value>(&output.stdout)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn active_only(entries: &[Value]) -> Vec<Value> {
+    entries
+        .iter()
+        .filter(|e| e["active"] == json!(true))
+        .cloned()
+        .collect()
+}
+
+/// Seed pauses on account `A`, account `B`, the CLI login `""`, and an
+/// expired one on `A`, a minute apart: ids 1..=4, 4 expired.
+fn seed_pauses(project: &Project) {
+    let claims = SqliteClaimStore::open_partition(project.db(), &project.id).unwrap();
+    let base = Utc::now() - ChronoDuration::minutes(30);
+    let seed = [
+        ("A", "run-a", ChronoDuration::hours(5)),
+        ("B", "run-b", ChronoDuration::hours(5)),
+        ("", "run-d", ChronoDuration::hours(5)),
+        ("A", "run-a-old", ChronoDuration::minutes(10)),
+    ];
+    for (i, (account, run, reset)) in seed.into_iter().enumerate() {
+        let at = base + ChronoDuration::minutes(i as i64);
+        claims
+            .record_session_pause(at + reset, at, 86_400.0, run, account)
+            .unwrap()
+            .unwrap();
+    }
+}
+
+#[test]
+fn hub_pauses_panel_equals_active_fw_pauses_and_clear_records_via_hub() {
+    use flywheel_hub::flywheel::{PauseClearRefused, PauseTarget};
+    let fx = temp_repo();
+    let provider = fx.provider();
+    assert!(provider.panel(&fx.root).pauses.is_empty());
+    seed_pauses(&fx.project);
+
+    let listed = fw_pauses_json(&fx.home, &fx.root);
+    assert_eq!(listed.len(), 4);
+    let panel = provider.panel(&fx.root);
+    assert_eq!(panel.problem, None, "{panel:#?}");
+    let wire = serde_json::to_value(&panel).unwrap();
+    assert_eq!(wire["pauses"], json!(active_only(&listed)));
+    assert_eq!(panel.pauses.len(), 3);
+
+    // Nothing active matches: refused, nothing recorded.
+    for target in [
+        PauseTarget::Account("nobody".into()),
+        PauseTarget::Ids(vec![4, 99]),
+    ] {
+        assert!(matches!(
+            provider.clear_pauses(&fx.root, &target, "why"),
+            Err(PauseClearRefused::NoMatch(_))
+        ));
+    }
+    assert_eq!(fw_pauses_json(&fx.home, &fx.root), listed);
+
+    // A clear appends a hub record, the reason verbatim.
+    let reason = "  quota reset early: \"A\" is back  ";
+    assert_eq!(
+        provider.clear_pauses(&fx.root, &PauseTarget::Account("A".into()), reason),
+        Ok(vec![1])
+    );
+    let after = fw_pauses_json(&fx.home, &fx.root);
+    let one = after.iter().find(|e| e["id"] == 1).unwrap();
+    assert_eq!(one["active"], json!(false));
+    assert_eq!(one["cleared"]["via"], "hub");
+    assert_eq!(one["cleared"]["reason"], reason);
+    let wire = serde_json::to_value(provider.panel(&fx.root)).unwrap();
+    assert_eq!(wire["pauses"], json!(active_only(&after)));
+
+    // The CLI login is account "", and `All` takes the rest.
+    assert_eq!(
+        provider.clear_pauses(&fx.root, &PauseTarget::Account(String::new()), "r"),
+        Ok(vec![3])
+    );
+    assert_eq!(
+        provider.clear_pauses(&fx.root, &PauseTarget::All, "r"),
+        Ok(vec![2])
+    );
+    assert!(provider.panel(&fx.root).pauses.is_empty());
+    assert!(active_only(&fw_pauses_json(&fx.home, &fx.root)).is_empty());
+}
+
+#[test]
+fn hub_pauses_clear_route_refuses_peers_empty_reasons_and_no_match() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let project = adopted_repo(&fw_home(&dir), &root);
+    seed_pauses(&project);
+    let server = start(&dir);
+    let (code, workspace) = http(
+        &server,
+        "POST",
+        "/api/workspaces",
+        Some(json!({ "name": "loop", "folders": [{"path": root}] })),
+    );
+    assert_eq!(code, 201, "{workspace}");
+    let query = root
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('/', "%2F");
+    let panel_pauses = || {
+        let (code, panel) = http(
+            &server,
+            "GET",
+            &format!("/api/flywheel/panel?folder={query}"),
+            None,
+        );
+        assert_eq!(code, 200, "{panel}");
+        panel["pauses"].clone()
+    };
+    let listed = || fw_pauses_json(&fw_home(&dir), &root);
+    let clear_as = |bearer: &str, body: Value| {
+        http_as(
+            &server,
+            bearer,
+            "POST",
+            "/api/flywheel/pauses/clear",
+            Some(body),
+        )
+    };
+    let clear = |body: Value| clear_as(&server.token, body);
+
+    let before = listed();
+    assert_eq!(before.len(), 4);
+    assert_eq!(panel_pauses(), json!(active_only(&before)));
+
+    // An empty reason: 400, the pause data unchanged.
+    for reason in ["", "   "] {
+        let (code, refused) = clear(json!({ "folder": root, "all": true, "reason": reason }));
+        assert_eq!(code, 400, "{refused}");
+    }
+    assert_eq!(listed(), before);
+    // Not exactly one target: 400.
+    for body in [
+        json!({ "folder": root, "reason": "r" }),
+        json!({ "folder": root, "ids": [1], "all": true, "reason": "r" }),
+        json!({ "folder": root, "ids": [], "reason": "r" }),
+    ] {
+        let (code, refused) = clear(body);
+        assert_eq!(code, 400, "{refused}");
+    }
+    // A peer: 403.
+    let (code, issued) = http(
+        &server,
+        "POST",
+        "/api/peers",
+        Some(json!({ "name": "hub-a" })),
+    );
+    assert_eq!(code, 201, "{issued}");
+    let peer = issued["credential"].as_str().unwrap().to_owned();
+    let (code, _) = clear_as(
+        &peer,
+        json!({ "folder": root, "all": true, "reason": "from a peer" }),
+    );
+    assert_eq!(code, 403);
+    // Nothing active matches (unknown account, the expired id): 409.
+    for body in [
+        json!({ "folder": root, "account": "nobody", "reason": "r" }),
+        json!({ "folder": root, "ids": [4], "reason": "r" }),
+    ] {
+        let (code, refused) = clear(body);
+        assert_eq!(code, 409, "{refused}");
+    }
+    assert_eq!(listed(), before);
+
+    // Ids: cleared with a hub record carrying the reason verbatim.
+    let reason = "reset early, see #42 ";
+    let (code, cleared) = clear(json!({ "folder": root, "ids": [2, 4], "reason": reason }));
+    assert_eq!(code, 200, "{cleared}");
+    assert_eq!(cleared, json!({ "cleared": [2] }));
+    let after = listed();
+    let two = after.iter().find(|e| e["id"] == 2).unwrap();
+    assert_eq!(two["active"], json!(false));
+    assert_eq!(
+        two["cleared"]["via"], "hub",
+        "a clear must record its hub attribution"
+    );
+    assert_eq!(two["cleared"]["reason"], reason);
+    assert_eq!(panel_pauses(), json!(active_only(&after)));
+
+    // The CLI login by account "", then everything left by all.
+    let (code, cleared) = clear(json!({ "folder": root, "account": "", "reason": "r" }));
+    assert_eq!((code, cleared), (200, json!({ "cleared": [3] })));
+    let (code, cleared) = clear(json!({ "folder": root, "all": true, "reason": "r" }));
+    assert_eq!((code, cleared), (200, json!({ "cleared": [1] })));
+    assert_eq!(panel_pauses(), json!([]));
+    assert!(active_only(&listed()).is_empty());
+}

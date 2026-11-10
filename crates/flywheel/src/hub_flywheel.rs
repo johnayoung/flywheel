@@ -59,15 +59,18 @@ use flywheel_hub::autopilot::{GateDecided, GateDecision, GateRefused};
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, AttemptChecks, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome,
-    LiveRun, Note, PanelClaim, PanelPhase, PanelPlan, PanelTask, PlanTask, RecentRun,
-    RelandRefused, RunAttempt, RunEntry, RunOutput, Steer, SteerRefused, Steered, TaskHistory,
-    TaskLight, TaskRun, ToolCall, UntrustedRepoFile, WorkerScope, valid_run_id,
+    LiveRun, Note, PanelClaim, PanelPause, PanelPauseClear, PanelPhase, PanelPlan, PanelTask,
+    PauseClearRefused, PauseTarget, PlanTask, RecentRun, RelandRefused, RunAttempt, RunEntry,
+    RunOutput, Steer, SteerRefused, Steered, TaskHistory, TaskLight, TaskRun, ToolCall,
+    UntrustedRepoFile, WorkerScope, valid_run_id,
 };
 use flywheel_hub::util::path_identity as file_identity;
 use flywheel_orchestrator::autopilot_activity::{
     PHASE_STOPPED, epoch_now, is_paused, is_record_live, read_activity, set_paused,
 };
-use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore, REASON_AWAITING_APPROVAL};
+use flywheel_orchestrator::claims::{
+    ClaimStore, InMemoryClaimStore, PAUSE_CLEAR_VIA_HUB, REASON_AWAITING_APPROVAL,
+};
 use flywheel_orchestrator::config::Access;
 use flywheel_orchestrator::config::{REPO_CONFIG_FILENAME, read_repo_file};
 use flywheel_orchestrator::history::{check_to_json, run_attempt_checks};
@@ -79,8 +82,9 @@ use flywheel_orchestrator::store_factory::{StoreBundle, resolve_postgres_dsn};
 use flywheel_orchestrator::trust;
 use flywheel_orchestrator::workflow::status::format_blocked_on;
 use flywheel_orchestrator::workflow::{
-    CommonArgs, ShowArgs, StatusArgs, cmd_show, cmd_status, known_project, project_policy_at,
-    resolve_fallback_phases,
+    CommonArgs, PauseEntry, PauseSelector, ShowArgs, StatusArgs, active_pauses,
+    clear_session_pauses, cmd_show, cmd_status, format_pause_time, known_project,
+    project_policy_at, resolve_fallback_phases,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -1363,6 +1367,33 @@ fn repo_file_trust(
     }))
 }
 
+/// A pause as the panel carries it: the `fw pauses --json` entry's fields.
+fn panel_pause(entry: &PauseEntry) -> PanelPause {
+    PanelPause {
+        id: entry.id,
+        account: entry.account.clone(),
+        run_id: entry.run_id.clone(),
+        reset_at: format_pause_time(entry.reset_at),
+        pause_until: format_pause_time(entry.pause_until),
+        recorded_at: format_pause_time(entry.recorded_at),
+        active: entry.active,
+        cleared: entry.cleared.as_ref().map(|clear| PanelPauseClear {
+            at: format_pause_time(clear.at),
+            via: clear.via.clone(),
+            reason: clear.reason.clone(),
+        }),
+    }
+}
+
+/// The `fw pauses clear` selector a hub target names.
+fn pause_selector(target: &PauseTarget) -> PauseSelector {
+    match target {
+        PauseTarget::Ids(ids) => PauseSelector::Ids(ids.clone()),
+        PauseTarget::Account(account) => PauseSelector::Account(account.clone()),
+        PauseTarget::All => PauseSelector::All,
+    }
+}
+
 impl FlywheelProvider for HubFlywheel {
     fn adopted(&self, folder: &Path) -> bool {
         // A git repo flywheel already knows (its project id is recorded and
@@ -1494,6 +1525,10 @@ impl FlywheelProvider for HubFlywheel {
                 panel.worker = worker;
             }
             Err(message) => problems.push(message),
+        }
+        match active_pauses(claims.as_ref(), now) {
+            Ok(entries) => panel.pauses = entries.iter().map(panel_pause).collect(),
+            Err(e) => problems.push(format!("reading session pauses: {e}")),
         }
         let intake = crate::hub_autopilot::read_view(
             activity.as_deref(),
@@ -1661,6 +1696,48 @@ impl FlywheelProvider for HubFlywheel {
             RelandRefused::Store(message)
         })?;
         reland_verdict(&entries, has_runs, task_id, folder)
+    }
+
+    fn clear_pauses(
+        &self,
+        folder: &Path,
+        target: &PauseTarget,
+        reason: &str,
+    ) -> Result<Vec<i64>, PauseClearRefused> {
+        let state = self.folder(folder);
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let resolved = state
+            .resolve(&self.home(), folder)
+            .map_err(PauseClearRefused::Store)?;
+        let selector = pause_selector(target);
+        let Some(bundle) = resolved.stores(folder).map_err(PauseClearRefused::Store)? else {
+            // No store yet: nothing ever ran, so nothing paused.
+            return Err(PauseClearRefused::NoMatch(format!(
+                "no active session pause matches {}",
+                selector.describe()
+            )));
+        };
+        let claims = Arc::clone(&bundle.claims);
+        drop(state);
+        let cleared = clear_session_pauses(
+            claims.as_ref(),
+            &selector,
+            Utc::now(),
+            PAUSE_CLEAR_VIA_HUB,
+            reason,
+        )
+        .map_err(|e| {
+            // A dead handle: reopen on the next read.
+            self.drop_stores(folder);
+            PauseClearRefused::Store(format!("clearing session pauses: {e}"))
+        })?;
+        if cleared.is_empty() {
+            return Err(PauseClearRefused::NoMatch(format!(
+                "no active session pause matches {}",
+                selector.describe()
+            )));
+        }
+        Ok(cleared)
     }
 
     fn reland_command(&self, _folder: &Path, task_id: &str) -> Vec<String> {

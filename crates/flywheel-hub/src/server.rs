@@ -449,6 +449,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/flywheel/history", get(flywheel_api::task_history))
         .route("/api/flywheel/worker", post(flywheel_api::start_worker))
         .route("/api/flywheel/reland", post(flywheel_api::start_reland))
+        .route(
+            "/api/flywheel/pauses/clear",
+            post(flywheel_api::clear_pauses),
+        )
         .route("/api/flywheel/steer/say", post(flywheel_api::say))
         .route(
             "/api/flywheel/steer/interrupt",

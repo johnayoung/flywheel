@@ -270,6 +270,7 @@ pub fn peer_forbidden(path: &str) -> bool {
         || path.starts_with("/api/flywheel/autopilot/")
         || under("/api/flywheel/steer")
         || under("/api/flywheel/tasks")
+        || under("/api/flywheel/pauses")
         || is_record_control(path)
         || under("/m")
         || !path.starts_with("/api")
@@ -522,6 +523,8 @@ mod tests {
             "/api/flywheel/steer/interrupt",
             // And writing a task.
             "/api/flywheel/tasks",
+            // Or clearing a session-limit pause.
+            "/api/flywheel/pauses/clear",
             "/m/b/api/sessions",
             "/",
             "/login",

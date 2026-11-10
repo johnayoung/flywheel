@@ -71,7 +71,7 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 A branch with a pull request: a badge on its row (`#7`, checks), a PR section in Review, `fw hub pr SESSION`. All through `gh` (missing or signed out: the section says why).
 
-- **Asked** per (folder, branch) by head (`gh pr list --head B`; branch `123` never binds PR #123), if pushed and not a default branch: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, its own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, stale).
+- **Asked** per (folder, branch) by head (`gh pr list --head B`; `123` never binds PR #123), if pushed, not default: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, its own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, stale).
 - **View log**: `gh run view --job J --log-failed`, the last 400 lines, escapes stripped, secrets redacted (Activity's rules).
 - **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued (`done`). One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; not re-pasted within 5 min.
 - **Re-run failed** (`gh run rerun R --failed`), **Ready** (`gh pr ready`),
@@ -115,18 +115,18 @@ fw hub fanout promote "$id" --reference c1 --yes  # writes <project>/tasks/activ
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote** (not pick) to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
-- **Fan out this task** (Flywheel panel): prompt = its goal and context; graders = its command plus **held-out** graders, added server-side (none or unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
+- **Promote** (not pick) to land via `fw worker` (refused after a pick): goal (`--goal`, seed task's, else the prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
+- **Fan out this task** (Flywheel panel): prompt = its goal and context; graders = its command plus **held-out** graders, added server-side (none/unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
 
 Repos flywheel knows (project id) get the verified loop, read-only (`--no-flywheel`: off); state: `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else hub env.
 
-- Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs (last tool call), the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's `verified/total` badge, `Alt F`, the palette.
-- **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (offers unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
+- Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs (last tool call), 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's `verified/total` badge, `Alt F`, the palette.
+- **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (offers unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted transcript, live; message, interrupt (confirmed).
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`.
-- Shown (ledger): tier verdicts, the newest deciding cycle (emitted, dropped + why), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
-- A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
+- Shown (ledger): tier verdicts, newest deciding cycle (emitted, dropped + why), 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
+- A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. A watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
 - **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`). No project: no row. Seam: `AuditSink` (`hub_audit.rs`).
 
 ## Prompt queue

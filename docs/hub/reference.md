@@ -328,13 +328,13 @@ command = ["./summarize.py"]  # optional: else the top-level one
 
 `Alt ,` or the sidebar gear; stored by the hub (`settings.json`), any can be kept for **this device** only.
 
-Sections: Appearance, Terminal (incl. lite mode), Keyboard (pane prefix, key bar, shortcuts), Notifications, Agents (new-session defaults), Plugins (enable, runs, logs), Digest (writes hub.toml `[digest]` only), Server (effective hub.toml, read-only).
+Sections: Appearance, Terminal (lite mode), Keyboard (pane prefix, key bar, shortcuts), Notifications, Agents (new-session defaults), Plugins (enable, runs, logs), Digest (writes only hub.toml `[digest]`), Server (effective hub.toml, read-only).
 
-**Key bindings**: up to 4 per action, `mod+...+key`. Refused (422): keys the browser/OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates in a scope. Warned: `alt+b/f`, `ctrl+<letter>`.
+**Key bindings**: up to 4 per action, `mod+...+key`. Refused (422): keys the browser/OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates per scope. Warned: `alt+b/f`, `ctrl+<letter>`.
 
 ## Keyboard shortcuts
 
-In a terminal (fixed): **Shift+Enter** types a newline (`^J`: a new prompt line in agents, Enter in a shell). **Ctrl+C** copies a selection (none: `^C`); **Ctrl+V** pastes (image-only clipboard: `^V`, for Claude Code). macOS: Cmd+C/V. Shift+drag selects under mouse reporting.
+In a terminal (fixed): **Shift+Enter** types a newline (`^J`: a new prompt line in agents, Enter in a shell). **Ctrl+C** copies a selection (none: `^C`); **Ctrl+V** pastes (image-only clipboard: `^V`, for Claude Code). macOS: Cmd+C/V. Shift+drag selects under mouse mode.
 
 `session.reference` (`alt+i`) puts another session into the focused one, at the cursor and unsent: a reference its agent reads live (`fw hub read <id> --source recent --lines 200`, same machine only), or that session's last 200 lines, pasted.
 

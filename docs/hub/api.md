@@ -14,7 +14,7 @@ Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Fr
 |---|---|---|
 | GET / POST | `/api/workspaces` | list (with `templates`) / create `{"name","folders"}` |
 | GET / PATCH / DELETE | `/api/workspaces/{id}` | PATCH `name` / `folders`; 409 a running session's folder / sessions running |
-| GET / PUT | `/api/workspaces/{id}/layout` | `{"rev","tabs":[{"id","name","root"}]}`; node `{"type":"pane","id","session"?}` or `{"type":"split","dir":"right\|down","ratio","a","b"}`; tab root may be `{"type":"board","id","folder"}` (workspace folder, one each); PUT -> `rev`+1; 409 stale; 400 invalid (ratio 0.05..0.95, 12 tabs / 12 panes) |
+| GET / PUT | `/api/workspaces/{id}/layout` | `{"rev","tabs":[{"id","name","root"}]}`; node `{"type":"pane","id","session"?}` or `{"type":"split","dir":"right\|down","ratio","a","b"}`; tab root may be `{"type":"board","id","folder"}` (a workspace folder, one each); PUT -> `rev`+1; 409 stale; 400 invalid (ratio 0.05..0.95, 12 tabs/panes) |
 | POST | `/api/workspaces/import` | `{"path","name"?,"update"?}` (hub-side file): 201 / 200 updated / 409 taken |
 | GET | `/api/code-workspaces[?root=]` | `.code-workspace` files under `--import-root` |
 | GET | `/api/folders/check?path=` | `ok`, `git` / `error` |
@@ -102,7 +102,7 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | GET | `/api/flywheel` | per adopted folder: counts, `plans`, alerts, live runs, worker |
 | GET | `/api/flywheel/panel?folder=` | panel (`queued_in`: scoped worker runs it; live `last_tool`, `plans[].tasks`); 404 unadopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next","attempts"}` (poll `since=next`); 503 read waits |
-| GET | `/api/flywheel/history?folder=&task=` | every run; attempts' `outcome`/`error`/`checks` (= `fw show`); task `checks` (held-out: names) |
+| GET | `/api/flywheel/history?folder=&task=` | every run; attempts' `outcome`/`error`/`checks` (= `fw show`); task `goal`, `checks` (held-out: names) |
 | GET | `/api/flywheel/task?folder=&task=` | task as a fan-out seed |
 | POST | `/api/flywheel/tasks` | `{"folder","task_id","goal","phase"?,"prerequisites"?,"checks":[{"run","name"?}]}`, two-step; 400 invalid; peers 403 |
 | GET | `/api/flywheel/autopilot?folder=` | `intake` (+ 20 newest decisions), this hub's autopilot sessions |

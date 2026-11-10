@@ -1,10 +1,10 @@
 # Hub
 
-`fw hub` is a web workspace for AI coding agents (Claude Code, Codex, shells) whose server owns every terminal: browsers, phones, `fw hub attach` come and go; sessions carry on. Workspaces group folders; agents run there or in sibling worktrees, with live status, exact-copy commands, review, and verified fan-outs. Crate: `crates/flywheel-hub`.
+`fw hub` is a web workspace for AI coding agents (Claude Code, Codex, shells) whose server owns every terminal: browsers, phones, `fw hub attach` come and go. Workspaces group folders; agents run there or in sibling worktrees, with live status, exact-copy commands, review, and verified fan-outs. Crate: `crates/flywheel-hub`.
 
 ## Security first
 
-**A hub is a shell over HTTP**: its token, a login cookie, a peer credential, or a shell in one of its sessions is a shell as you; agents and plugins are not sandboxed. Keep the bind on `127.0.0.1`; reach it from other devices via `tailscale serve` or `--tls auto`, never plain HTTP on an untrusted network. Share links show everything. More: [hub-security](hub/security.md#trust-model).
+**A hub is a shell over HTTP**: its token, a login cookie, a peer credential, or a shell in one of its sessions is a shell as you; agents and plugins are not sandboxed. Keep the bind on `127.0.0.1`; reach it from other devices via `tailscale serve` or `--tls auto`, never plain HTTP on untrusted networks. Share links show everything. More: [hub-security](hub/security.md#trust-model).
 
 ## 60-second quickstart
 

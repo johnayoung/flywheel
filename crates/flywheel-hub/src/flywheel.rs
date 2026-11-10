@@ -228,6 +228,9 @@ pub struct RecentRun {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskHistory {
     pub task_id: String,
+    /// Its task file's goal; `None` when no task file defines the id.
+    #[serde(default)]
+    pub goal: Option<String>,
     pub runs: Vec<TaskRun>,
     /// Its task file's graders, then its held-out ones (by name only:
     /// never a held-out command or oracle path); empty when no task file

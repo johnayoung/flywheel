@@ -1552,12 +1552,13 @@ impl FlywheelProvider for HubFlywheel {
             })?,
             None => Vec::new(),
         };
-        let (checks, problem) = match crate::hub_tasks::task_checks(self, folder, task_id) {
-            Ok(checks) => (checks, None),
-            Err(message) => (Vec::new(), Some(message)),
+        let (goal, checks, problem) = match crate::hub_tasks::task_checks(self, folder, task_id) {
+            Ok((goal, checks)) => (goal, checks, None),
+            Err(message) => (None, Vec::new(), Some(message)),
         };
         Ok(TaskHistory {
             task_id: task_id.to_owned(),
+            goal,
             runs,
             checks,
             problem,

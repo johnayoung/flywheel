@@ -5,7 +5,7 @@ Front door: [hub](../hub.md).
 ## Trust model
 
 - **The hub is a shell over HTTP.** The token, a login cookie, and a peer credential each mean a shell as you.
-- **Agents and plugins run as you, unsandboxed.** Agents never get the token but can read every state-dir file (`token`, `machines.json`): run untrusted ones as another user or in a container. Protect the state dir like `~/.ssh`; secrets 0600, the dir 0700.
+- **Agents and plugins run as you, unsandboxed.** Agents never get the token but can read every state-dir file (`token`, `machines.json`): run untrusted ones as another user or containerized. Protect the state dir like `~/.ssh`; secrets 0600, the dir 0700.
 - **Status reports are advisory**: hooks report over `<state-dir>/report.sock` (unix socket, never the network) with a per-spawn secret for one session; they cannot start, stop, or change a session.
 - The folder picker (`/api/fs/*`) lists directory names on the hub's machine (never files or contents) to whoever can create a workspace: token, login, peer; never a share link.
 - Share links show everything the terminal shows. Plugins are disabled until enabled. Held-out graders: kept out of what the hub tells agents, not out of their reach ([hub-workflows](workflows.md#fan-outs-and-flywheel-tasks)).
@@ -14,7 +14,7 @@ Front door: [hub](../hub.md).
 
 - Token: 256 random bits in `<state-dir>/token`. `fw hub token --rotate` ends every cookie, code, and socket of the old one (4001); agent hooks are unaffected.
 - One-time codes: 100 bits, single use, 5 minutes, 64 outstanding at most; typing forgives case, `-`, spaces, `i l o` look-alikes.
-- `/login?code=` (or `?token=`) sets an `HttpOnly; SameSite=Strict` cookie holding a fresh per-login secret, never the token (`Secure` under https); it lasts `server.login_days` (30) after its last use (sliding; written at most hourly), 256 at most; `POST /logout` ends one.
+- `/login?code=` (or `?token=`) sets an `HttpOnly; SameSite=Strict` cookie holding a fresh per-login secret, never the token (`Secure` under https); it lasts `server.login_days` (30) after its last use (sliding, written at most hourly), 256 max; `POST /logout` ends one.
 - Scripts: `Authorization: Bearer <token>`. Cross-origin `Origin` is refused on WebSocket upgrades and every non-GET.
 - 10 wrong credentials per client address (IPv6 /64) in 10 minutes -> 429, except with a live login cookie; direct local connections (and local tunnels such as `ssh -L`) are exempt.
 - Unauthenticated connections get their own pool and 3 s for a request head: a flood never locks you out. A WebSocket that stops reading is dropped after 60 s.
@@ -39,7 +39,7 @@ fw hub tls rotate  # new CA, old key deleted; every device re-installs
 - **The local CA is name-constrained** (critical `nameConstraints`: this hub's names and addresses only): a stolen key cannot impersonate other sites. Bare hosts become `<host>.local`. Check the fingerprint (`fw hub tls ca`) before installing.
 - `--tls-name`: private names (`.local` `.lan` `.home.arpa` `.internal` `.localhost` `<tailnet>.ts.net`) and addresses only; one you own: `--tls-allow-public-name NAME`, warned.
 - One port, both schemes: with TLS on, plain http from the network reaches only `/ca` (else 308 to https); local and `--trusted-proxy` peers keep http.
-- `<state-dir>/tls/`: `ca-key.pem` (never leaves it), `ca-cert.pem`; ECDSA P-256; CA 10 years; leaf 14 days, re-issued 5 days before expiry or when names change. A name outside the constraints (a new DHCP lease) is left out, warned: add a network to `tls_names`, then `tls rotate`.
+- `<state-dir>/tls/`: `ca-key.pem` (never leaves it), `ca-cert.pem`; ECDSA P-256; CA 10 years; leaf 14 days, re-issued 5 days before expiry or when names change. A name outside the constraints (new DHCP lease) is left out, warned: add a network to `tls_names`, then `tls rotate`.
 - `/ca` (public, plain http): the CA files, per-OS steps, a trust probe; the login code only goes to https.
 - **Rotation is revocation**: the old key is deleted, its connections close, session resumption is off, so old-CA devices fail their next request.
 - CLI: local verbs use http to loopback; `--url https://...` trusts system roots plus this state dir's CA, or `--fingerprint <CA SHA-256>`. `--tls CERT,KEY`: your PEM chain + key, re-read on change; no `/ca`.

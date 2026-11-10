@@ -411,6 +411,7 @@ function closeOverlays(keep) {
   if (keep !== "flywheel") flywheel.close();
   if (keep !== "review") review.close();
   if (keep !== "queue") promptQueue.close();
+  if (keep !== "board-task") flywheelBoard.closeTask();
   explain.close();
 }
 
@@ -440,7 +441,12 @@ const flywheel = window.FwHubFlywheel({
 
 // The flywheel board (board.js): a board tab's portfolio of plans and a
 // plan's lanes, read through the Flywheel panel's data.
-const flywheelBoard = window.FwHubBoard({ el, icon, span, state, workspaceById, flywheel });
+const flywheelBoard = window.FwHubBoard({
+  el, icon, span, age, state, workspaceById, flywheel,
+  toast: (...args) => commands.toast(...args),
+  // A task drawer opening closes the other drawers.
+  onOpen: () => closeOverlays("board-task"),
+});
 
 // Verified fan-outs (fanout.js): one prompt to several agents in
 // worktrees, graded by the hub, ranked, the winner merged.

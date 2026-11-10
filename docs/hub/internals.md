@@ -42,7 +42,7 @@ Replaces the hub process **ending no session**: same pids, screens, scrollback, 
 
 - Binary: `--binary`, else `fw` on `PATH`, else this one; it inherits the old hub's environment. Earlier agents' hooks keep the old binary's path: upgrade in place.
 - Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring, and exits on the new hub's ack. Input meanwhile is `nack`ed for a resend: never lost or doubled.
-- Failure before commit thaws the old hub; a stuck new one is killed at `--timeout`. Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` restarts instead (sessions restored, not kept); systemd: `systemctl --user restart <unit>`.
+- Failure before commit thaws the old hub; a stuck new one dies at `--timeout`. Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` restarts instead (sessions restored, not kept); systemd: `systemctl --user restart <unit>`.
 - Handed-over processes are not children: exits via pidfd, no code. `attach`, `wait` reconnect within 2 min.
 
 ## Agent status
@@ -65,7 +65,7 @@ Replaces the hub process **ending no session**: same pids, screens, scrollback, 
 
 Per-kind TOML rules read against the screen's **live bottom**: `crates/flywheel-hub/detect/{claude,codex,shell}.toml`, each replaced wholesale by `<state-dir>/agent-detection/<kind>.toml` (re-read within 1 s; invalid: logged, ignored).
 
-Start from a shipped (commented) file. Fields: `kind` (the file name), `version` (shown by `explain`); `[[rule]]`s, the first whose every clause holds wins: `id`, `state` (`working` | `blocked` | `idle` | `hold`: keep the status), `detail`, `detail_line` (regexes; capture 1 becomes the detail);
+Start from a shipped (commented) file. Fields: `kind` (file name), `version` (`explain` shows it); `[[rule]]`s, first whose every clause holds wins: `id`, `state` (`working` | `blocked` | `idle` | `hold`: keep the status), `detail`, `detail_line` (regexes; capture 1 is the detail);
 `[[rule.when]]` clauses: `lines` (the last N non-empty rows, 1-100, 30), `line` / `not_line` (regexes), `any` / `all` / `none` (case-insensitive text).
 
 - Pin `blocked` rules to a dialog's footer (quoted text must not match). Limits: 64 rules, 8 clauses, 16 patterns per list, 400 chars, 64 KiB per file; read at most every 250 ms. Shell rules only answer `explain`.
@@ -85,7 +85,7 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 
 - Tab bar: `+`, double-click renames, middle-click closes. A sidebar session dropped on a pane edge splits, mid-pane shows it. A new-shell split opens an agent's companion first.
 - Panes stay 40x8 cells+ (else a new tab). Closing a pane leaves its session running; removing one closes its panes, empty tabs. Only the active tab attaches; 12 tabs, 12 panes each. Phones (< 760 px): one pane, a chip row switches.
-- Board tab (tab strip, palette `Board:`), root only; outlives sessions, closes with its folder. Portfolio: the workspace's plans, needs-you first; a plan opens into five lanes.
+- Board tab (tab strip, palette `Board:`), root only; outlives sessions, closes with its folder. Portfolio: the workspace's plans, needs-you first; a plan opens into five lanes, a task into its drawer (state, actions, checks, runs).
 - Browser checks (opt-in; env `FW`, `PLAYWRIGHT`, `CHROMIUM`): `node crates/flywheel-hub/e2e/{layout,network}.mjs` (network: 400/150 kbps, 300 ms).
 
 ## Web UI
@@ -120,7 +120,7 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
 `fw hub record start|stop SESSION` (or the `rec` pill); `fw hub record get NAME -o demo.cast; asciinema play demo.cast`.
 
-- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after falling behind, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on the prior part's final screen; `recordings.dir_cap` deletes the oldest finished.
+- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after falling behind, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on the prior part's last screen; `recordings.dir_cap` deletes the oldest finished.
 - Ends on stop, exit, relaunch, hub stop; `upgrade` continues the file. Peers 403; an active one is not deleted (409).
 - `/replay#<name>`: seek with marker ticks, 0.5-8x, idle gaps cut to 2 s, follows parts.
 

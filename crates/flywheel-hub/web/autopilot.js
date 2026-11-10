@@ -135,7 +135,18 @@ window.FwHubAutopilot = function (ctx) {
       tone: approve ? "plain" : undefined,
     });
     if (!ok || pendingOf(gate)) return;
-    const body = { run: gate.run_id, decision: approve ? "approve" : "deny", confirm: true, gate: gate.gate, attempt: gate.attempt };
+    await send(key, gate, approve, feedback);
+  }
+
+  // Enqueue the decision (the human's: the caller has confirmed it). The
+  // board's task drawer decides here too, so both show it pending at once.
+  // `gate.gate`/`gate.attempt` may be unknown (the hub then binds the
+  // run's parked gate). The answer, or null when refused (toasted).
+  async function send(key, gate, approve, feedback) {
+    if (pendingOf(gate)) return null;
+    const body = { run: gate.run_id, decision: approve ? "approve" : "deny", confirm: true };
+    if (gate.gate !== undefined && gate.gate !== null) body.gate = gate.gate;
+    if (gate.attempt !== undefined && gate.attempt !== null) body.attempt = gate.attempt;
     if (feedback) body.feedback = feedback;
     const mark = gateKey(gate);
     sent.set(mark, { folder: key, kind: approve ? "approve" : "reject", command_id: null, enqueued_at: new Date().toISOString() });
@@ -144,11 +155,12 @@ window.FwHubAutopilot = function (ctx) {
     if (!done) {
       sent.delete(mark);
       ctx.render();
-      return;
+      return null;
     }
     sent.set(mark, { folder: key, kind: done.kind, command_id: done.command_id, enqueued_at: new Date().toISOString() });
     denying.delete(gate.run_id);
     toast(`${approve ? "Approved" : "Denied"} ${gate.task_id} (command #${done.command_id}): the next worker run applies it.`, { timeout: 5000 });
+    return done;
   }
 
   // --- the daemon row ----------------------------------------------------
@@ -520,5 +532,5 @@ window.FwHubAutopilot = function (ctx) {
     );
   }
 
-  return { row, section, alertActions };
+  return { row, section, alertActions, send, pendingOf };
 };

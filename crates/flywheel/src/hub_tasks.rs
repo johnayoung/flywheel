@@ -503,17 +503,17 @@ fn defined_task(tasks_dir: &Path, task_id: &str) -> Result<Option<Task>, String>
         .find(|task| task.id == task_id))
 }
 
-/// See `FlywheelProvider::task_history`: task `task_id`'s checks by name,
-/// its task file's graders then its held-out ones (never a held-out
-/// command or oracle path); none when no task file defines it.
+/// See `FlywheelProvider::task_history`: task `task_id`'s goal and its
+/// checks by name, its task file's graders then its held-out ones (never
+/// a held-out command or oracle path); none when no task file defines it.
 pub(crate) fn task_checks(
     provider: &HubFlywheel,
     folder: &Path,
     task_id: &str,
-) -> Result<Vec<TaskCheck>, String> {
+) -> Result<(Option<String>, Vec<TaskCheck>), String> {
     let layout = provider.task_layout(folder)?;
     let Some(task) = defined_task(&layout.tasks_dir, task_id)? else {
-        return Ok(Vec::new());
+        return Ok((None, Vec::new()));
     };
     let mut checks: Vec<TaskCheck> = task
         .graders
@@ -537,7 +537,7 @@ pub(crate) fn task_checks(
             held_out: true,
         }
     }));
-    Ok(checks)
+    Ok((Some(task.goal), checks))
 }
 
 /// See `FlywheelProvider::task_seed`.

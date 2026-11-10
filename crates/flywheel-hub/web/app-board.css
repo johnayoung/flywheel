@@ -156,3 +156,125 @@
   .fwb-lanes { grid-template-columns: repeat(5, minmax(12rem, 1fr)); overflow-x: auto; }
   .fwb-cols, .fwb-pf-row { grid-template-columns: 1rem minmax(0, 1fr) 7rem 3rem 3.6rem 3.6rem 4rem .8rem; gap: .6rem; }
 }
+
+/* --- the board scrolls under its head; the task drawer stays put ------------ */
+.board-stage.fwb { position: relative; overflow: hidden; }
+.fwb .fwb-body { flex: 1; min-height: 0; overflow: auto; }
+.fwb-new-btn { align-self: center; padding: .3rem .65rem; }
+.fwb-new-btn svg { width: .7rem; height: .7rem; }
+.fwb-card.selected, .fwb-row.selected { border-color: var(--fw-ok); background: var(--bg-4); color: var(--ink); }
+
+/* --- task drawer: state and actions, goal, checks, runs --------------------- */
+/* An open drawer takes the board's right edge: lanes and head reflow
+   beside it, never under it. */
+.fwb { --fwb-drawer-w: min(34rem, 42vw); }
+.board-stage.fwb.has-task { padding-right: var(--fwb-drawer-w); }
+.fwb.has-task .fwb-lanes { grid-template-columns: repeat(5, minmax(9rem, 1fr)); overflow-x: auto; }
+.fwb-drawer { width: var(--fwb-drawer-w); }
+.fwb-drawer .cmd-title h2 { font-size: 1.45rem; overflow-wrap: anywhere; }
+.fwb-agent { margin: 0 -1rem; padding: .8rem 1rem .85rem; border-bottom: 1px solid var(--rule); background: var(--bg-3); }
+.fwb-agent.failed, .fwb-agent.blocked { box-shadow: inset 3px 0 var(--alert); }
+.fwb-agent.awaiting, .fwb-agent.parked { box-shadow: inset 3px 0 var(--brass); }
+.fwb-agent.live { box-shadow: inset 3px 0 var(--signal); }
+.fwb-agent-line { display: flex; align-items: center; gap: .55rem; }
+.fwb-agent-line b { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; }
+.fwb-agent.failed .fwb-agent-line b, .fwb-agent.blocked .fwb-agent-line b { color: var(--alert); }
+.fwb-agent.awaiting .fwb-agent-line b, .fwb-agent.parked .fwb-agent-line b { color: var(--brass); }
+.fwb-agent.live .fwb-agent-line b { color: var(--signal); }
+.fwb-agent-line small { margin-left: auto; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.fwb-agent-now { display: flex; gap: .5rem; min-width: 0; margin: .55rem 0 0; padding: .35rem .5rem; border: 1px solid var(--rule); background: var(--bg); font: 400 10.5px/1.6 var(--term); }
+.fwb-agent-now b { flex: none; color: var(--signal); font-weight: 600; }
+.fwb-agent-now span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.fwb-actions { display: flex; flex-wrap: wrap; gap: .45rem; margin-top: .7rem; }
+.fwb-actions .slab { padding: .38rem .7rem; }
+.fwb-actions .slab svg { width: .75rem; height: .75rem; }
+.fwb-drawer .fwb-act-end { margin-left: auto; }
+.fwb-hint { margin: .45rem 0 0; color: var(--ink-3); font-size: 10.5px; line-height: 1.5; overflow-wrap: anywhere; }
+.fwb-hint b { color: var(--ink-2); }
+.fwb-gate-ask { margin: .5rem 0 0; color: var(--ink); line-height: 1.55; overflow-wrap: anywhere; }
+.fwb-gate textarea { display: block; width: 100%; box-sizing: border-box; margin-top: .55rem; padding: .45rem .6rem; border: 1px solid var(--rule-2); border-radius: 2px; background: var(--bg); color: var(--ink); font: 400 12px/1.5 var(--mono); resize: vertical; }
+.fwb-gate textarea:focus { outline: none; border-color: var(--signal); }
+.fwb-tries { list-style: none; margin: .55rem 0 0; padding: 0; }
+.fwb-tries li { display: grid; grid-template-columns: 1.1rem minmax(0, 1fr) auto; gap: .6rem; padding: .3rem 0; border-top: 1px solid var(--rule); }
+.fwb-tries li:first-child { border-top: 0; }
+.fwb-try-n { color: var(--ink-3); font-size: 10px; line-height: 1.8; font-variant-numeric: tabular-nums; }
+.fwb-try-what { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .5rem; color: var(--ink-2); line-height: 1.5; }
+.fwb-try-what b { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink); }
+.fwb-tries li.fail .fwb-try-what b { color: var(--alert); }
+.fwb-try-what > span { flex-basis: 100%; overflow-wrap: anywhere; font: 400 11px/1.5 var(--term); }
+.fwb-tries small { color: var(--ink-3); font-size: 10px; font-variant-numeric: tabular-nums; }
+.fwb-goal-sec { margin-top: .9rem; }
+.fwb-goal { margin: 0; color: var(--ink); line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
+.fwb-facts { display: grid; grid-template-columns: 4.2rem minmax(0, 1fr); gap: .25rem .8rem; margin: .6rem 0 0; color: var(--ink-2); font-size: 10.5px; }
+.fwb-facts dt { color: var(--ink-3); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; padding-top: .1rem; }
+.fwb-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.fwb-facts .text-btn { padding: 0; }
+.fwb-req-fact { display: inline-flex; align-items: center; gap: .35rem; margin-right: .6rem; }
+.fwb-checks { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+.fwb-check { display: grid; grid-template-columns: 1rem minmax(0, 1fr) auto; align-items: center; gap: .55rem; padding: .4rem .1rem; border-bottom: 1px solid var(--rule); }
+.fwb-check b { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.fwb-check small { color: var(--ink-3); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
+.fwb-check-mark { font-weight: 700; text-align: center; color: var(--ink-3); }
+.fwb-check.pass .fwb-check-mark { color: var(--fw-ok); }
+.fwb-check.fail .fwb-check-mark, .fwb-check.fail b { color: var(--alert); }
+.fwb-run { cursor: pointer; }
+.fwb-run:hover { background: var(--bg-3); }
+.fwb-run .fw-run-line b { font-weight: 500; color: var(--ink-2); }
+.fwb-attempts { list-style: none; margin: .3rem 0 0 7.2rem; padding: 0; display: grid; gap: .15rem; color: var(--ink-3); font-size: 10.5px; line-height: 1.45; }
+.fwb-attempts li { display: flex; flex-wrap: wrap; gap: 0 .5rem; min-width: 0; }
+.fwb-attempts b { color: var(--ink-2); font-weight: 600; }
+.fwb-attempts li.ok .fwb-att-outcome { color: var(--fw-ok); }
+.fwb-attempts li.fail .fwb-att-outcome { color: var(--alert); }
+.fwb-att-error { flex-basis: 100%; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; overflow-wrap: anywhere; color: var(--ink-2); font: 400 10.5px/1.45 var(--term); }
+
+/* --- run viewer: the live run's message bar ---------------------------------- */
+.fwb-say { display: grid; gap: .35rem; padding: .7rem 1.4rem .6rem; border-top: 1px solid var(--rule); background: var(--bg-3); }
+.fwb-say[hidden] { display: none; }
+.fwb-say-row { display: flex; gap: .5rem; align-items: center; }
+.fwb-say input { flex: 1; min-width: 0; padding: .5rem .65rem; border: 1px solid var(--rule-2); border-radius: 2px; background: var(--bg); color: var(--ink); font: 400 12px var(--mono); }
+.fwb-say input:focus { outline: none; border-color: var(--signal); }
+.fwb-say .slab svg { width: .75rem; height: .75rem; }
+.fwb-say .fwb-stop:hover { border-color: var(--alert); color: var(--alert); }
+.fwb-stop-confirm { display: inline-flex; align-items: center; gap: .6rem; color: var(--alert); font-size: 11px; }
+.fwb-stop-confirm[hidden] { display: none; }
+.fwb-say-note { margin: 0; color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
+.fwb-say-note:empty { display: none; }
+.fwb-say-note.bad { color: var(--alert); }
+
+/* --- New task: the fields, then where and when it lands ---------------------- */
+.fwb-new { width: min(64rem, calc(100vw - 2rem)); }
+.fwb-new-grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 1.4rem; }
+.fwb-new-fields { display: grid; gap: 1rem; align-content: start; }
+.fwb-new textarea { width: 100%; box-sizing: border-box; padding: .55rem .65rem; border: 1px solid var(--rule-2); border-radius: 2px; background: var(--bg); color: var(--ink); font: 400 12px/1.5 var(--mono); resize: vertical; }
+.fwb-new textarea:focus { outline: none; border-color: var(--signal); box-shadow: 0 0 0 3px var(--signal-soft); }
+.fwb-mono { font: 400 11.5px/1.5 var(--term); }
+.fwb-new .fwb-mono { font: 400 11.5px/1.5 var(--term); }
+.fwb-new-error { margin: 0; color: var(--alert); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.fwb-new-error:empty { display: none; }
+.fwb-reqs { display: flex; flex-wrap: wrap; gap: .3rem; }
+.fwb-reqs:empty { display: none; }
+.fwb-req { display: inline-flex; align-items: center; gap: .35rem; padding: .2rem .45rem; border: 1px solid var(--rule-2); border-radius: 2px; background: none; color: var(--ink-2); font-size: 10.5px; }
+.fwb-req.on { border-color: var(--signal); color: var(--ink); background: var(--signal-soft); }
+.fwb-req.fwb-req-done:not(.on) { border-style: dashed; color: var(--ink-3); }
+.fwb-req .fw-light, .fwb-new-waits .fw-light { flex: none; max-width: none; padding: 0 .25rem; font-size: 8px; }
+.fwb-new-preview { align-self: start; padding: .9rem 1rem; border: 1px solid var(--rule-2); background: var(--bg); }
+.fwb-new-preview h5 { margin: 0 0 .3rem; color: var(--ink-3); font: 500 9.5px var(--mono); letter-spacing: .2em; text-transform: uppercase; }
+.fwb-new-preview section + section { margin-top: .85rem; padding-top: .75rem; border-top: 1px solid var(--rule); }
+.fwb-new-preview code { overflow-wrap: anywhere; }
+.fwb-new-preview p { margin: 0; color: var(--ink-2); line-height: 1.55; }
+.fwb-new-preview .fwb-new-answer { color: var(--ink); font: 700 1.2rem/1.15 var(--display); letter-spacing: .02em; text-transform: uppercase; }
+.fwb-new-preview .fwb-new-answer + * { margin-top: .3rem; }
+.fwb-new-dim, .fwb-new-preview .fwb-new-dim { color: var(--ink-3); font-size: 10.5px; line-height: 1.5; }
+.fwb-new-preview pre { max-height: 14rem; overflow: auto; }
+.fwb-new-waits, .fwb-new-cmds { list-style: none; margin: 0; padding: 0; display: grid; gap: .2rem; }
+.fwb-new-waits li { display: flex; align-items: center; gap: .4rem; min-width: 0; font-size: 10.5px; color: var(--ink-2); }
+.fwb-new-cmds code { display: block; font: 400 10.5px/1.45 var(--term); color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fwb-new-actions { display: inline-flex; gap: .5rem; }
+.fwb-new-actions svg { width: .75rem; height: .75rem; }
+
+@media (max-width: 760px) {
+  .board-stage.fwb.has-task { padding-right: 0; }
+  .fwb-drawer { width: 100%; }
+  .fwb-new-grid { grid-template-columns: minmax(0, 1fr); }
+  .fwb-attempts { margin-left: 0; }
+}

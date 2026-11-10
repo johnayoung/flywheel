@@ -6,12 +6,13 @@
 // flywheel.js's summaries (kept current by the {"type":"flywheel"}
 // pushes) and, while a plan is open, its folder's panel (GET
 // /api/flywheel/panel, re-read on the folder's push and every few
-// seconds). Hooks for checks: the data-fw-* attributes, raw values beside
-// the formatted ones.
+// seconds). A task card opens its drawer, and New task its form
+// (board-task.js). Hooks for checks: the data-fw-* attributes, raw values
+// beside the formatted ones.
 "use strict";
 
 window.FwHubBoard = function (ctx) {
-  const { el, icon, state, workspaceById, flywheel, span } = ctx;
+  const { el, icon, state, workspaceById, flywheel, span, age, toast } = ctx;
   const { dollars, plural, pathTail } = window.FwHubFmt;
 
   // An open plan re-reads its panel this often (pushes come sooner).
@@ -42,7 +43,7 @@ window.FwHubBoard = function (ctx) {
 
   const views = new Map(); // board tab id -> { plan: { key, name } | null }
   const panels = new Map(); // folder key -> { panel, error, seq, loading }
-  let mounted = null; // { node, root, html }
+  let mounted = null; // { node, root, html, top, box }
 
   const viewOf = (id) => {
     if (!views.has(id)) views.set(id, { plan: null });
@@ -50,6 +51,20 @@ window.FwHubBoard = function (ctx) {
   };
   const shown = () => (mounted && mounted.root.isConnected ? mounted : null);
   const workspace = () => workspaceById(state.view) || null;
+
+  // The task drawer and New task form; the drawer sits in the shown board.
+  const task = window.FwHubBoardTask({
+    el, icon, span, age, toast, flywheel,
+    laneOf: (light, status) => laneOf(light, status),
+    panelOf: (key) => (panels.get(key) || {}).panel || null,
+    loadPanel: (key) => loadPanel(key),
+    projects: () => projects(workspace()).out,
+    workspace,
+    root: () => (shown() ? shown().root : null),
+    onChange: () => paint(),
+    onOpen: () => ctx.onOpen(),
+  });
+  let taskTab = null; // the board tab its drawer belongs to
 
   // --- mount and paint -------------------------------------------------------
 
@@ -60,17 +75,20 @@ window.FwHubBoard = function (ctx) {
       "aria-label": `Flywheel board of ${node.folder}`,
       onkeydown: (event) => {
         const v = viewOf(node.id);
-        if (event.key === "Escape" && v.plan && !document.querySelector("dialog[open]")) {
+        if (event.key === "Escape" && v.plan && !task.isOpen() && !document.querySelector("dialog[open]")) {
           event.stopPropagation();
           closePlan();
         }
       },
     });
-    mounted = { node, root, html: null };
+    mounted = { node, root, html: null, top: null, box: null };
+    if (taskTab !== node.id) task.close();
     // Painted before the stage attaches it.
     paint(mounted);
+    root.append(task.node);
     const v = viewOf(node.id);
     if (v.plan) loadPanel(v.plan.key);
+    else task.close();
     return root;
   }
 
@@ -81,16 +99,25 @@ window.FwHubBoard = function (ctx) {
     if (!m) return;
     const w = workspace();
     const v = viewOf(m.node.id);
+    m.root.classList.toggle("has-task", task.isOpen());
     const top = head(w, v);
     const box = el("div", { className: "fwb-body" }, ...(v.plan ? planView(w, v.plan) : portfolio(w)));
     const html = top.outerHTML + box.outerHTML;
     if (html === m.html) return;
     m.html = html;
     const active = document.activeElement;
-    const hook = active && m.root.contains(active) ? hookOf(active) : null;
-    const scroll = m.root.scrollTop;
-    m.root.replaceChildren(top, box);
-    m.root.scrollTop = scroll;
+    const hook = active && m.top && (m.top.contains(active) || m.box.contains(active)) ? hookOf(active) : null;
+    const scroll = m.box ? m.box.scrollTop : 0;
+    if (m.top) {
+      // Swapped in place: the drawer beside them keeps its focus.
+      m.top.replaceWith(top);
+      m.box.replaceWith(box);
+    } else {
+      m.root.prepend(top, box);
+    }
+    m.top = top;
+    m.box = box;
+    box.scrollTop = scroll;
     if (hook) {
       const again = m.root.querySelector(`[${hook.name}="${CSS.escape(hook.value)}"]`);
       if (again) again.focus({ preventScroll: true });
@@ -158,6 +185,7 @@ window.FwHubBoard = function (ctx) {
     }
     entry.loading = false;
     paint();
+    if (task.openKey() === key) task.render();
   }
 
   const openKey = () => {
@@ -179,15 +207,18 @@ window.FwHubBoard = function (ctx) {
     const key = openKey();
     if (!key) return;
     const folder = message.type === "flywheel_reset" ? flywheel.pathOf(key) : message.folder;
-    if (flywheel.keyOf(machine || null, folder) === key) loadPanel(key);
+    if (flywheel.keyOf(machine || null, folder) === key) {
+      loadPanel(key);
+      task.refresh(key);
+    }
   }
 
   function openPlan(key, name) {
     const m = shown();
     if (!m) return;
     viewOf(m.node.id).plan = { key, name };
-    m.root.scrollTop = 0;
     paint();
+    m.box.scrollTop = 0;
     loadPanel(key);
   }
 
@@ -197,6 +228,7 @@ window.FwHubBoard = function (ctx) {
     const v = viewOf(m.node.id);
     const was = v.plan;
     v.plan = null;
+    task.close();
     paint();
     const row = was && m.root.querySelector(`[data-fw-project="${CSS.escape(flywheel.pathOf(was.key))}"] [data-fw-plan="${CSS.escape(was.name)}"]`);
     if (row) row.focus();
@@ -234,7 +266,25 @@ window.FwHubBoard = function (ctx) {
         el("span", { className: "fwb-crumb", textContent: (w && w.name) || "" }),
       );
     }
-    return el("header", { className: "board-head fwb-head" }, el("nav", { className: "fwb-crumbs", "aria-label": "Board" }, crumbs), pulse(w, v));
+    return el("header", { className: "board-head fwb-head" }, el("nav", { className: "fwb-crumbs", "aria-label": "Board" }, crumbs), pulse(w, v), newTaskButton(w, v));
+  }
+
+  // New task: into the open plan's project (and phase, when active),
+  // else the first of this hub's adopted folders.
+  function newTaskButton(w, v) {
+    if (!projects(w).out.some((p) => !flywheel.machineOfKey(p.key))) return null;
+    return el(
+      "button",
+      {
+        type: "button",
+        className: "slab ghost fwb-new-btn",
+        "data-fw-action": "new-task",
+        title: "Plan a new task file and add it to the queue",
+        onclick: () => task.openNew(v.plan ? { key: v.plan.key, phase: v.plan.name } : {}),
+      },
+      icon("plus"),
+      "New task",
+    );
   }
 
   // The head's answer to "what needs me, what is moving": the open plan's
@@ -443,11 +493,15 @@ window.FwHubBoard = function (ctx) {
     ].filter(Boolean);
   }
 
-  // A task's latest run's output (the run viewer), when it has one.
+  // A task's drawer.
   function activate(key, t) {
-    const run = (t.live && t.live.run_id) || (t.info && t.info.run_id);
-    if (run) flywheel.openRun(key, run, t.id);
+    const m = shown();
+    if (!m) return;
+    taskTab = m.node.id;
+    task.open(key, t.id, viewOf(m.node.id).plan.name);
   }
+
+  const picked = (t) => (task.openId() === t.id ? " selected" : "");
 
   // Why a needs-you task stopped, from the panel's listing.
   function stopped(t) {
@@ -461,12 +515,12 @@ window.FwHubBoard = function (ctx) {
   }
 
   function taskCard(key, t) {
-    const title = `${t.id}: ${t.state}${t.info && t.info.run_id ? `. Open run ${t.info.run_id}'s output.` : ""}`;
+    const title = `${t.id}: ${t.state}. Open its drawer.`;
     if (t.lane === "needs") {
       const why = stopped(t);
       return el(
         "button",
-        { type: "button", className: `fwb-card fwb-card-needs ${t.state}`, "data-fw-task": t.id, title, onclick: () => activate(key, t) },
+        { type: "button", className: `fwb-card fwb-card-needs ${t.state}${picked(t)}`, "data-fw-task": t.id, title, onclick: () => activate(key, t) },
         el("span", { className: "fwb-card-top" }, el("span", { className: "fwb-card-id", textContent: t.id })),
         el("span", { className: "fwb-card-why" }, el("span", { className: `fw-light ${t.state}`, textContent: t.state }), el("b", { textContent: why.head })),
         why.detail ? el("span", { className: "fwb-card-error", title: why.detail, textContent: why.detail }) : null,
@@ -487,7 +541,7 @@ window.FwHubBoard = function (ctx) {
       : "";
     return el(
       "button",
-      { type: "button", className: `fwb-card fwb-card-live${checking ? " checking" : ""}`, "data-fw-task": t.id, title, onclick: () => activate(key, t) },
+      { type: "button", className: `fwb-card fwb-card-live${checking ? " checking" : ""}${picked(t)}`, "data-fw-task": t.id, title, onclick: () => activate(key, t) },
       el(
         "span",
         { className: "fwb-card-top" },
@@ -516,9 +570,9 @@ window.FwHubBoard = function (ctx) {
         "button",
         {
           type: "button",
-          className: `fwb-row${waits.length || t.state === "blocked" ? " is-waiting" : ""}`,
+          className: `fwb-row${waits.length || t.state === "blocked" ? " is-waiting" : ""}${picked(t)}`,
           "data-fw-task": t.id,
-          title: `${t.id}: ${t.state}`,
+          title: `${t.id}: ${t.state}. Open its drawer.`,
           onclick: () => activate(key, t),
         },
         el("span", { className: "fwb-row-id", textContent: t.id }),
@@ -527,5 +581,5 @@ window.FwHubBoard = function (ctx) {
     );
   }
 
-  return { mount, paint, onFlywheel, laneOf, LANES };
+  return { mount, paint, onFlywheel, laneOf, LANES, closeTask: () => task.close() };
 };

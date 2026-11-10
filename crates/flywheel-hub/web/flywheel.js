@@ -153,6 +153,12 @@ window.FwHubFlywheel = function (ctx) {
     return keyed(machineOfKey(key), await api("GET", `${via(key)}/api/flywheel/panel?folder=${encodeURIComponent(pathOf(key))}`));
   }
 
+  // Task `taskId`'s every run, goal and checks (held-out ones by name),
+  // read through its folder's machine's hub.
+  function readHistory(key, taskId) {
+    return api("GET", `${via(key)}/api/flywheel/history?folder=${encodeURIComponent(pathOf(key))}&task=${encodeURIComponent(taskId)}`);
+  }
+
   async function loadPanel() {
     const folder = ui.folder;
     if (!folder) return;
@@ -613,16 +619,21 @@ window.FwHubFlywheel = function (ctx) {
 
   // Start a worker in the open panel's folder: the whole queue, or only
   // `taskId` (`fw worker --task`), with its unmet prerequisites if asked.
-  async function startWorker(taskId) {
-    const folder = ui.folder;
-    const panel = ui.panel;
-    const workspace = workspaceFor(folder);
-    if (!folder || !workspace) return;
+  // `where` (the board): its folder key, panel and workspace instead of
+  // the open panel's; `exact` runs only `taskId`, never asking about its
+  // prerequisites or another worker's leases (a running worker session of
+  // this hub there is still asked about). True once started.
+  async function startWorker(taskId, where) {
+    const folder = where ? where.folder : ui.folder;
+    const panel = where ? where.panel : ui.panel;
+    const exact = !!(where && where.exact);
+    const workspace = (where && where.workspaceId && workspaceById(where.workspaceId)) || workspaceFor(folder);
+    if (!folder || !workspace) return false;
     const scoped = typeof taskId === "string" && taskId !== "";
     let withPrereqs = false;
     // What this worker runs, in order (for the confirms below).
     let runs = scoped ? [taskId] : [];
-    if (scoped && panel) {
+    if (scoped && panel && !exact) {
       const unmet = unmetPrerequisites(panel, taskId);
       if (unmet.length) {
         const ok = await confirmDialog({
@@ -631,13 +642,13 @@ window.FwHubFlywheel = function (ctx) {
           body: `${taskId} waits on ${unmet.join(", ")}, not verified yet. The worker runs ${unmet.length === 1 ? "it" : "them"} first, then ${taskId}, and nothing else; it stops if one fails.`,
           ok: `Run ${unmet.length + 1} tasks`,
         });
-        if (!ok) return;
+        if (!ok) return false;
         withPrereqs = true;
         runs = [...unmet, taskId];
       }
     }
     let another = false;
-    if (panel && panel.worker.live) {
+    if (panel && panel.worker.live && !exact) {
       const ok = await confirmDialog({
         kicker: "flywheel",
         title: "Start another worker?",
@@ -646,7 +657,7 @@ window.FwHubFlywheel = function (ctx) {
           : `A worker already holds leases in ${labelFor(folder)} (${panel.worker.detail}). Workers claim tasks, so a second one runs tasks in parallel with it.`,
         ok: "Start another",
       });
-      if (!ok) return;
+      if (!ok) return false;
       another = true;
     }
     try {
@@ -669,7 +680,7 @@ window.FwHubFlywheel = function (ctx) {
         if (!ok) {
           close();
           openSession(running.id);
-          return;
+          return false;
         }
         out = await post(workerPath, { ...request, another: true });
       }
@@ -681,8 +692,10 @@ window.FwHubFlywheel = function (ctx) {
       close();
       openSession(view.id, { split: "down" });
       toast(el("span", {}, "Started ", el("b", { textContent: view.name }), ` in ${labelFor(folder)}`), { timeout: 3500 });
+      return true;
     } catch (error) {
       toast(`Could not start a worker: ${error.message}`, { tone: "bad" });
+      return false;
     }
   }
 
@@ -1102,15 +1115,113 @@ window.FwHubFlywheel = function (ctx) {
 
   const runDialog = $("#dlg-run");
 
-  function openRun(folder, runId, task) {
+  // `opts.say`: focus the message box once the run reads as live.
+  function openRun(folder, runId, task, opts = {}) {
     if (ui.run) clearTimeout(ui.run.timer);
-    ui.run = { folder, runId, task, next: 0, from: 0, entries: [], summary: "", status: null, active: false, tab: "transcript", timer: null, error: "", seq: 0, shown: null };
+    ui.run = { folder, runId, task, next: 0, from: 0, entries: [], summary: "", status: null, active: false, tab: "transcript", timer: null, error: "", seq: 0, shown: null, focusSay: !!opts.say };
+    runDialog.setAttribute("data-fw-run-viewer", runId);
     $("#run-title").textContent = task || runId;
     $("#run-meta").textContent = runId;
     $("#run-body").replaceChildren(el("p", { className: "fw-empty", textContent: "Reading the run..." }));
+    sayBar(ui.run);
     selectTab("transcript");
     if (!runDialog.open) runDialog.showModal();
     pollRun();
+  }
+
+  // The live run's message bar: say (POST /api/flywheel/steer/say) and
+  // interrupt, which sends nothing until its confirm. This hub's folders
+  // only (peers are refused steering); shown while the run reads live.
+  function sayBar(run) {
+    const foot = $("#run-say");
+    if (machineOfKey(run.folder)) {
+      foot.hidden = true;
+      foot.replaceChildren();
+      return;
+    }
+    const input = el("input", {
+      type: "text",
+      maxLength: 4000,
+      placeholder: "Tell the agent something: it arrives as its next turn",
+      "aria-label": "Message to the agent",
+      "data-fw-input": "message",
+      onkeydown: (event) => {
+        if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+          event.preventDefault();
+          send();
+        }
+      },
+    });
+    const note = el("p", { className: "fwb-say-note", role: "status" });
+    const tell = (text, bad) => {
+      note.textContent = text;
+      note.classList.toggle("bad", !!bad);
+    };
+    const sendBtn = el("button", { type: "button", className: "slab", "data-fw-action": "say", onclick: () => send() }, icon("send"), "Send");
+    const confirmBox = el("span", { className: "fwb-stop-confirm", hidden: true });
+    const stop = el("button", {
+      type: "button",
+      className: "slab ghost fwb-stop",
+      title: "Stops the agent mid-step; the run waits for you (asks first)",
+      "data-fw-action": "interrupt",
+      onclick: () => {
+        if (!confirmBox.hidden) return;
+        confirmBox.replaceChildren(
+          el("span", { textContent: "Stop the agent mid-step?" }),
+          el("button", { type: "button", className: "text-btn", textContent: "cancel", onclick: disarm }),
+          el("button", { type: "button", className: "slab danger", "data-fw-action": "interrupt-confirm", onclick: interrupt }, icon("stop"), "Confirm interrupt"),
+        );
+        confirmBox.hidden = false;
+        stop.hidden = true;
+        confirmBox.querySelector(".danger").focus();
+      },
+    }, icon("stop"), "Interrupt");
+    function disarm() {
+      confirmBox.hidden = true;
+      confirmBox.replaceChildren();
+      stop.hidden = false;
+    }
+    async function steer(verb, body) {
+      const out = await post(`/api/flywheel/steer/${verb}`, { folder: pathOf(run.folder), run: run.runId, ...body });
+      if (!out.ok) throw new Error((out.data && out.data.error) || `HTTP ${out.status}`);
+      return out.data;
+    }
+    async function send() {
+      const text = input.value.trim();
+      if (!text) {
+        input.focus();
+        return;
+      }
+      if (sendBtn.disabled) return;
+      sendBtn.disabled = true;
+      tell("Sending...");
+      try {
+        const done = await steer("say", { message: text });
+        if (ui.run !== run) return;
+        input.value = "";
+        tell(`Queued as command #${done.command_id}: the agent gets it as its next turn.`);
+      } catch (error) {
+        if (ui.run === run) tell(`Not sent: ${error.message}`, true);
+      } finally {
+        sendBtn.disabled = false;
+      }
+    }
+    async function interrupt() {
+      const go = confirmBox.querySelector("[data-fw-action=interrupt-confirm]");
+      if (!go || go.disabled) return;
+      go.disabled = true;
+      tell("Interrupting...");
+      try {
+        const done = await steer("interrupt", {});
+        if (ui.run !== run) return;
+        tell(`Interrupt queued (command #${done.command_id}): the run stops at its next step and waits for you.`);
+      } catch (error) {
+        if (ui.run === run) tell(`Not interrupted: ${error.message}`, true);
+      }
+      if (ui.run === run) disarm();
+    }
+    foot.replaceChildren(el("div", { className: "fwb-say-row" }, input, sendBtn, stop, confirmBox), note);
+    foot.hidden = true;
   }
 
   async function pollRun() {
@@ -1169,6 +1280,9 @@ window.FwHubFlywheel = function (ctx) {
   runDialog.addEventListener("close", () => {
     if (ui.run) clearTimeout(ui.run.timer);
     ui.run = null;
+    runDialog.removeAttribute("data-fw-run-viewer");
+    $("#run-say").hidden = true;
+    $("#run-say").replaceChildren();
   });
 
   function entryNode(entry) {
@@ -1185,7 +1299,7 @@ window.FwHubFlywheel = function (ctx) {
       : body ? el("pre", { className: "run-text", textContent: body }) : null;
     return el(
       "div",
-      { className: `run-entry ${entry.kind}${entry.error ? " error" : ""}` },
+      { className: `run-entry ${entry.kind}${entry.error ? " error" : ""}`, "data-fw-entry": "" },
       el("span", { className: "run-ts", textContent: clock(entry.ts) }),
       el("span", { className: "run-header", textContent: entry.header }),
       text,
@@ -1196,6 +1310,16 @@ window.FwHubFlywheel = function (ctx) {
     const run = ui.run;
     $("#run-meta").textContent = [run.runId, run.status, run.active ? "live" : null].filter(Boolean).join(" · ");
     $("#run-follow-wrap").hidden = !run.active;
+    // The message bar stays up while a refusal it just got is showing.
+    const foot = $("#run-say");
+    if (foot.firstChild) {
+      const refused = foot.querySelector(".fwb-say-note.bad");
+      foot.hidden = !run.active && !(refused && refused.textContent);
+      if (run.active && run.focusSay) {
+        run.focusSay = false;
+        foot.querySelector("[data-fw-input=message]").focus();
+      }
+    }
   }
 
   const earlierText = (from) => `${from} earlier entries not shown (the newest are).`;
@@ -1282,12 +1406,19 @@ window.FwHubFlywheel = function (ctx) {
     openGate,
     startWorkerIn,
     pendingTasks,
-    // For the board (board.js).
+    // For the board (board.js, board-task.js).
     summary,
     readPanel,
+    readHistory,
     keyOf,
     pathOf,
+    machineOfKey,
     labelFor,
+    post,
+    // Run `taskId` alone in folder `key` (its board's panel and workspace).
+    runTask: (key, taskId, panel, workspaceId) => startWorker(taskId, { folder: key, panel, workspaceId, exact: true }),
+    // Autopilot's gate decisions (shared pending state): send, pendingOf.
+    gates: pilot,
     loaded: () => ui.loaded,
     enabled: () => ui.enabled,
   };

@@ -125,6 +125,9 @@ fn task_value(draft: &TaskDraft) -> Value {
     if !draft.tags.is_empty() {
         task.insert("tags".into(), json!(draft.tags));
     }
+    if !draft.prerequisites.is_empty() {
+        task.insert("prerequisites".into(), json!(draft.prerequisites));
+    }
     if !context.is_empty() {
         task.insert("context".into(), Value::Object(context));
     }
@@ -205,6 +208,23 @@ pub fn plan_task(
             draft.task_id,
             relative(folder, &tasks_dir)
         ));
+    }
+    for prerequisite in &draft.prerequisites {
+        check_segment("prerequisite", prerequisite)?;
+        if prerequisite == &draft.task_id {
+            return Err(format!(
+                "task {prerequisite} cannot be its own prerequisite"
+            ));
+        }
+        if !task_id_defined(&tasks_dir, prerequisite)
+            .map_err(|e| format!("listing {}: {e}", tasks_dir.display()))?
+        {
+            return Err(format!(
+                "unknown prerequisite {prerequisite}: no task by that id under {} (active or \
+                 archived)",
+                relative(folder, &tasks_dir)
+            ));
+        }
     }
     let runs = provider.task_runs(folder, &draft.task_id)?;
     if runs > 0 {
@@ -611,6 +631,7 @@ mod tests {
                 },
             ],
             protect: vec!["check.sh".into()],
+            prerequisites: Vec::new(),
         }
     }
 
@@ -878,5 +899,49 @@ mod tests {
         assert_eq!(seed.context.edge_cases, ["an empty file"]);
         assert_eq!(seed.tags, ["core"]);
         assert_eq!(seed.not_run, ["rubric friendly"]);
+    }
+
+    #[test]
+    fn create_task_prerequisites_are_written_and_must_be_defined() {
+        let f = repo();
+        let root = f.root.clone();
+        std::fs::write(
+            f.tasks.join("archive/04-old/done.json"),
+            r#"{"id":"done","goal":"Done.","graders":[{"type":"command","run":"true"}]}"#,
+        )
+        .unwrap();
+        let provider = f.provider();
+        let mut with = draft("answer-42");
+        with.phase = Some("01-first".into());
+        with.prerequisites = vec!["existing".into(), "done".into()];
+        let plan = provider.plan_task(&root, &with).unwrap();
+        let written = provider.write_task(&root, &with, &plan.contents).unwrap();
+        assert_eq!(
+            flywheel_orchestrator::sources::read_prerequisites(&written.path),
+            ["existing", "done"]
+        );
+        assert!(load_task_file(&written.path).is_ok());
+
+        let before: Vec<_> = std::fs::read_dir(f.tasks.join("active/01-first"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let mut unknown = draft("second");
+        unknown.phase = Some("01-first".into());
+        unknown.prerequisites = vec!["existing".into(), "nope".into()];
+        let err = provider.plan_task(&root, &unknown).unwrap_err();
+        assert!(err.contains("unknown prerequisite nope"), "{err}");
+        let err = provider
+            .write_task(&root, &unknown, &plan.contents)
+            .unwrap_err();
+        assert!(err.contains("unknown prerequisite nope"), "{err}");
+        unknown.prerequisites = vec!["second".into()];
+        let err = provider.plan_task(&root, &unknown).unwrap_err();
+        assert!(err.contains("own prerequisite"), "{err}");
+        let after: Vec<_> = std::fs::read_dir(f.tasks.join("active/01-first"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before.len(), after.len(), "nothing written");
     }
 }

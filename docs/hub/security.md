@@ -56,7 +56,7 @@ fw hub ls --machine desktop; fw hub attach --machine desktop SESSION
 ```
 
 - **A peer credential is equivalent to B's token** (its sessions can read B's token file); API and sockets only, never a browser login. `fw hub peer revoke` ends its requests and sockets (4003); it survives B's token rotation.
-- Peers get 403 (defense in depth, not a boundary) on token rotation, login codes, peers, machines, import, plugins, settings, config, shares, recordings, permissions, autopilot control, run steering, `/m/*`, and every page.
+- Peers get 403 (defense in depth, not a boundary) on token rotation, login codes, peers, machines, import, plugins, settings, config, shares, recordings, permissions, autopilot control, steering, task writes, `/m/*`, and every page.
 - `machines.json` on A holds credentials in plaintext (0600) on purpose: a keyring hands them to the same user, and headless and WSL hosts lack one.
 - `machine add` verifies the credential (`/api/whoami`), refusing a hub token, this hub, or a duplicate; `--replace` swaps credential / URL / pin; `rm` asks B to revoke.
 - Proxy: `/api/...` of registered URLs only (SSRF guard), 8 MiB requests, 32 MiB answers, 120 s, as attachments with CSP `sandbox`; B's 401 becomes 502.

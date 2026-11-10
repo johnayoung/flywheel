@@ -1600,3 +1600,213 @@ fn steer_say_and_interrupt_enqueue_one_command_for_a_live_run_only() {
     assert_eq!(commands("run-live").len(), 1);
     assert_eq!(commands("run-checking").len(), 1);
 }
+
+/// The names under `dir` (sorted; none when it does not exist).
+fn listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+#[test]
+fn create_task_plans_then_writes_one_loader_valid_file_under_the_home_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let root = dir.join("planned");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    std::fs::write(root.join("README.md"), "planned\n").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "init"]);
+    let project = adopt(&fw_home(&dir), &root);
+    let tasks = project.tasks();
+    write_task(&tasks, "01-core", "alpha", &[]);
+    let archived = tasks.join("archive/00-done/old.json");
+    std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+    std::fs::write(
+        &archived,
+        r#"{"id":"old","goal":"Done long ago.","graders":[{"type":"command","run":"true"}]}"#,
+    )
+    .unwrap();
+    let server = start(&dir);
+    let (code, workspace) = http(
+        &server,
+        "POST",
+        "/api/workspaces",
+        Some(json!({ "name": "planned", "folders": [{"path": root}] })),
+    );
+    assert_eq!(code, 201, "{workspace}");
+    let body = |id: &str| {
+        json!({
+            "folder": root,
+            "task_id": id,
+            "goal": format!("Ship {id} with a passing unit check."),
+            "phase": "01-core",
+            "prerequisites": ["alpha", "old"],
+            "checks": [
+                {"run": "cargo test -p beta", "name": "unit"},
+                {"run": "test -f README.md"},
+            ],
+        })
+    };
+    let with = |mut value: Value, extra: Value| {
+        for (key, v) in extra.as_object().unwrap() {
+            value[key] = v.clone();
+        }
+        value
+    };
+    let post = |value: Value| http(&server, "POST", "/api/flywheel/tasks", Some(value));
+    let core = tasks.join("active/01-core");
+    let before = listing(&core);
+    let repo_clean = || {
+        let out = Command::new("git")
+            .args(["status", "--porcelain", "--ignored"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "",
+            "repo tree changed"
+        );
+    };
+
+    // The dry run names the file and its bytes, writes nothing.
+    let (code, planned) = post(with(body("beta"), json!({"dry_run": true})));
+    assert_eq!(code, 200, "{planned}");
+    let path = core.join("beta.json");
+    assert_eq!(planned["plan"]["path"], json!(path));
+    assert_eq!(planned["plan"]["new_phase"], false);
+    let fingerprint = planned["fingerprint"].as_str().unwrap().to_owned();
+    assert_eq!(listing(&core), before);
+
+    // No confirmation, a stale one, or one whose plan no longer matches:
+    // refused, nothing written.
+    let (code, _) = post(body("beta"));
+    assert_eq!(code, 400);
+    let (code, _) = post(with(body("beta"), json!({"confirm": "0000000000000000"})));
+    assert_eq!(code, 409);
+    let changed = with(
+        body("beta"),
+        json!({"goal": "Something else entirely.", "confirm": fingerprint}),
+    );
+    let (code, refused) = post(changed);
+    assert_eq!(code, 409, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .unwrap()
+            .contains("review it again"),
+        "{refused}"
+    );
+    assert_eq!(listing(&core), before);
+
+    // Confirmed: exactly one file, the loader's task with those values.
+    let (code, written) = post(with(body("beta"), json!({"confirm": fingerprint})));
+    assert_eq!(code, 201, "{written}");
+    assert_eq!(written["written"]["path"], json!(path));
+    let mut after = before.clone();
+    after.push("beta.json".into());
+    after.sort();
+    assert_eq!(listing(&core), after);
+    let contents = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(contents, planned["plan"]["contents"].as_str().unwrap());
+    let task = flywheel_core::loaders::load_task_file(&path).unwrap();
+    assert_eq!(task.id, "beta");
+    assert_eq!(task.goal, "Ship beta with a passing unit check.");
+    let checks: Vec<(String, Option<String>)> = task
+        .graders
+        .iter()
+        .map(|g| match g {
+            flywheel_core::task::Grader::Command(c) => (c.run.clone(), c.name.clone()),
+            other => panic!("not a command check: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        checks,
+        vec![
+            ("cargo test -p beta".to_owned(), Some("unit".to_owned())),
+            ("test -f README.md".to_owned(), None),
+        ]
+    );
+    assert_eq!(
+        flywheel_orchestrator::sources::read_prerequisites(&path),
+        ["alpha", "old"]
+    );
+    repo_clean();
+
+    // Invalid input: refused with the problem named, nothing written.
+    let after = listing(&core);
+    let phases = listing(&tasks.join("active"));
+    let refusals = [
+        (with(body("gamma"), json!({"goal": "  "})), "goal"),
+        (body("Has Space"), "task id"),
+        (with(body("alpha"), json!({"prerequisites": []})), "already"),
+        (with(body("old"), json!({"prerequisites": []})), "already"),
+        (body("beta"), "already"),
+        (
+            with(body("gamma"), json!({"prerequisites": ["alpha", "nope"]})),
+            "unknown prerequisite nope",
+        ),
+        (
+            with(
+                body("gamma"),
+                json!({"checks": [{"run": "sh oracle.sh", "held_out": true}]}),
+            ),
+            "held-out",
+        ),
+        (with(body("gamma"), json!({"checks": []})), "check"),
+        (
+            with(body("gamma"), json!({"phase": "02_New"})),
+            "kebab-case",
+        ),
+    ];
+    for (request, named) in refusals {
+        for step in [json!({"dry_run": true}), json!({"confirm": fingerprint})] {
+            let (code, refused) = post(with(request.clone(), step));
+            assert_eq!(code, 400, "{request}: {refused}");
+            let error = refused["error"].as_str().unwrap();
+            assert!(error.contains(named), "{named:?} not in {error:?}");
+        }
+    }
+    assert_eq!(listing(&core), after);
+    assert_eq!(listing(&tasks.join("active")), phases);
+
+    // A brand-new kebab-case phase is accepted.
+    let fresh = with(body("gamma"), json!({"phase": "02-extra"}));
+    let (code, planned) = post(with(fresh.clone(), json!({"dry_run": true})));
+    assert_eq!(code, 200, "{planned}");
+    assert_eq!(planned["plan"]["new_phase"], true);
+    let fingerprint = planned["fingerprint"].as_str().unwrap().to_owned();
+    let (code, written) = post(with(fresh, json!({"confirm": fingerprint})));
+    assert_eq!(code, 201, "{written}");
+    assert!(tasks.join("active/02-extra/gamma.json").is_file());
+    repo_clean();
+
+    // A peer credential is refused, writing nothing.
+    let (code, issued) = http(
+        &server,
+        "POST",
+        "/api/peers",
+        Some(json!({ "name": "hub-a" })),
+    );
+    assert_eq!(code, 201, "{issued}");
+    let peer = issued["credential"].as_str().unwrap().to_owned();
+    let (code, _) = http_as(
+        &server,
+        &peer,
+        "POST",
+        "/api/flywheel/tasks",
+        Some(with(body("delta"), json!({"dry_run": true}))),
+    );
+    assert_eq!(code, 403);
+    assert!(!core.join("delta.json").exists());
+}

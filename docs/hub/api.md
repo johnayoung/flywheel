@@ -6,7 +6,7 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 
 - JSON under `/api`: `Authorization: Bearer <token>`, a login cookie, or a peer credential ([hub-security](security.md#auth)).
 - Errors `{"error"}`: 400 malformed, 404 unknown, 405 method, 409 refused by state, 422 wrong JSON shape. `cols`/`rows` 0: 120x32.
-- Tables give bodies and status codes; full response shapes: `curl -sH "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq`, or a verb's `--json`.
+- Tables: bodies, status codes; full responses: `curl -sH "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq`, or a verb's `--json`.
 
 ## Workspaces
 
@@ -103,6 +103,7 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | GET | `/api/flywheel/panel?folder=` | the panel (`queued_in`: a scoped worker will run it); 404 not adopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next"}` (poll `since=next`); 503 a read still waits |
 | GET | `/api/flywheel/task?folder=&task=` | the task as a fan-out seed |
+| POST | `/api/flywheel/tasks` | `{"folder","task_id","goal","phase"?,"prerequisites"?,"checks":[{"run","name"?}]}`, two-step; 400 invalid; peers 403 |
 | GET | `/api/flywheel/autopilot?folder=` | `intake` (+ 20 newest decisions), this hub's autopilot sessions |
 | POST | `/api/flywheel/autopilot/start` | `{"folder","confirm":true}` -> 201 the `fw autopilot` session; 400 unconfirmed; 409 running here or elsewhere |
 | POST | `/api/flywheel/autopilot/stop` | `{"folder"}` -> 202 (Ctrl-C); 409 none of this hub's |

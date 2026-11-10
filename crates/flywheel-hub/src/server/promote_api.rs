@@ -8,13 +8,20 @@
 //!   `{"written":{...},"plan","warnings","fanout"}`. 409 when the plan
 //!   changed since the dry run or the file exists; 404 without the
 //!   Flywheel panel or for a repo flywheel does not drive;
+//! * `POST /api/flywheel/tasks {"folder","task_id","goal","phase"?,
+//!   "prerequisites"?,"checks":[{"run","name"?}],"dry_run"|"confirm"}` --
+//!   a new task from scratch, planned and written the same way (into the
+//!   project's tasks dir under the flywheel home, never the repo tree);
+//!   held-out checks, unknown prerequisites, a used id, or a new phase
+//!   name that is not kebab-case are refused (400) with nothing written;
+//!   refused to peers;
 //! * `GET /api/flywheel/task?folder=P&task=ID` -- the task as a fan-out
 //!   seed (held-out graders by name only);
 //! * `POST /api/fanouts` with `"from_task"`: seeded server-side
 //!   ([`seed_request`]).
 
 use super::{ApiJson, ApiQuery, ApiResult, AppState, blocking, error_response};
-use crate::fanout::promote::{self, PromoteRequest};
+use crate::fanout::promote::{self, CreateTaskRequest, PromoteRequest};
 use crate::fanout::{CreateFanout, Promotion};
 use crate::flywheel::FlywheelProvider;
 use crate::hub::HubError;
@@ -145,6 +152,69 @@ pub(super) async fn promote(
     })
     .await?;
     Ok(Json(answer).into_response())
+}
+
+/// Write a new task (dry run, then confirm).
+pub(super) async fn create_task(
+    State(app): State<AppState>,
+    ApiJson(body): ApiJson<CreateTaskRequest>,
+) -> ApiResult<Response> {
+    let provider = provider(&app)?;
+    let monitor = app.options.flywheel.clone();
+    let answer = blocking(move || {
+        let folder = workspace_folder(&app, &body.folder)?;
+        require_adopted(provider.as_ref(), &folder)?;
+        let draft = promote::create_draft(&body).map_err(invalid)?;
+        let plan = provider.plan_task(&folder, &draft).map_err(invalid)?;
+        if plan.new_phase && !promote::kebab_case(&plan.phase) {
+            return Err(invalid(format!(
+                "a new phase name must be kebab-case (lowercase letters and digits in \
+                 '-'-separated words), not {:?}; or name an active phase: {}",
+                plan.phase,
+                if plan.phases.is_empty() {
+                    "none yet".to_owned()
+                } else {
+                    plan.phases.join(", ")
+                }
+            )));
+        }
+        let fingerprint = promote::fingerprint(&plan);
+        if body.dry_run {
+            return Ok(json!({ "plan": plan, "fingerprint": fingerprint }));
+        }
+        match body.confirm.as_deref() {
+            None => {
+                return Err(invalid(
+                    "pass dry_run to see what is written, then confirm with its fingerprint",
+                ));
+            }
+            Some(confirm) if confirm != fingerprint => {
+                return Err(conflict(
+                    "what would be written changed since the dry run: review it again",
+                ));
+            }
+            Some(_) => {}
+        }
+        let written = provider
+            .write_task(&folder, &draft, &plan.contents)
+            .map_err(conflict)?;
+        eprintln!(
+            "fw hub: new flywheel task {} ({})",
+            written.task_id,
+            written.path.display()
+        );
+        if let Some(monitor) = &monitor {
+            monitor.refresh(&folder);
+        }
+        Ok(json!({ "written": written, "plan": plan }))
+    })
+    .await?;
+    let status = if answer.get("written").is_some() {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(answer)).into_response())
 }
 
 #[derive(Deserialize)]

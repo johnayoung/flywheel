@@ -26,7 +26,7 @@ fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it wait
 
 ## Suggested commands
 
-Each fenced block comes from the agent's own record, **exactly as written**.
+Fenced blocks come from the agent's own record, **exactly as written**.
 
 - Sources: Claude's transcript (or the Stop hook's `last_assistant_message`, so blocks are in before `done`), Codex's rollout, else its `notify` payload. Tailed each second and per hook report; newest 500 per session persist.
 - Shell blocks: `bash sh zsh shell console fish ...`, or untagged ones that start like a command; `console` keeps only the commands.
@@ -71,7 +71,7 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 A branch with a pull request: a badge on its row (`#7`, checks), a PR section in Review, `fw hub pr SESSION`. All through `gh` (missing or signed out: the section says why).
 
-- **Asked** per (folder, branch) by head (`gh pr list --head B`; branch `123` never binds PR #123), if pushed and not a default branch: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, its own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, marked stale).
+- **Asked** per (folder, branch) by head (`gh pr list --head B`; branch `123` never binds PR #123), if pushed and not a default branch: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, its own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, stale).
 - **View log**: `gh run view --job J --log-failed`, the last 400 lines, escapes stripped, secrets redacted (Activity's rules, `NAME=value`, `password:`, `--password V`, AWS keys, URL passwords).
 - **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued (`done`). One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; not re-pasted within 5 min.
 - **Re-run failed** (`gh run rerun R --failed`), **Ready** (`gh pr ready`),
@@ -115,8 +115,8 @@ fw hub fanout promote "$id" --reference c1 --yes  # writes <project>/tasks/activ
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote instead of picking** to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, `--reference` (default winner, else leader); refused for an existing file or id. Then **Run <id> with worker here**.
-- **Fan out this task** (Flywheel panel): prompt from its goal and context; graders = its command plus **held-out** graders, added server-side (none or unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
+- **Promote instead of picking** to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
+- **Fan out this task** (Flywheel panel): prompt = its goal and context; graders = its command plus **held-out** graders, added server-side (none or unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
 
@@ -125,8 +125,8 @@ Repos with a project id flywheel knows get the verified loop, read-only (`--no-f
 - Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
 - **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks to add unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`.
-- Shown (decisions from the ledger): tier verdicts, the newest deciding cycle (emitted, dropped + why), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
-- A linked worktree reads its own store; `github*` sources: not listed; no SQLite store is made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
+- Shown (from the ledger): tier verdicts, the newest deciding cycle (emitted, dropped + why), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
+- A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store is made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
 - **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`). No project: no row, none made. Seam: `AuditSink` (`hub_audit.rs`).
 
 ## Prompt queue
@@ -143,7 +143,7 @@ Per agent session, prompts the hub types in itself, in order ("when done, do X")
 | Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched |
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
-**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase on main"`); a workspace means its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), else refused (why). `--header` names the recipients.
+**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase on main"`); a workspace: its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), else refused (why). `--header` names the recipients.
 
 ## Activity
 
@@ -159,7 +159,7 @@ Off until `hub.toml` `[digest] times` is set ([hub-reference](reference.md#hubto
 
 - **Says**, since the last digest, per workspace: turns finished, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, longest blocked, red PRs, stalled queues) with links.
 - **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty ones are skipped (`quiet_if_empty`). `delivery.channels` lists only what heard it.
-- **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it. A send claim over 5 min old is dropped, live pid or not (reused).
+- **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it. A send claim over 5 min old is dropped (pids are reused).
 
 ## Permissions
 

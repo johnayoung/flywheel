@@ -269,6 +269,7 @@ pub fn peer_forbidden(path: &str) -> bool {
         || under("/api/perms")
         || path.starts_with("/api/flywheel/autopilot/")
         || under("/api/flywheel/steer")
+        || under("/api/flywheel/tasks")
         || is_record_control(path)
         || under("/m")
         || !path.starts_with("/api")
@@ -519,6 +520,8 @@ mod tests {
             // So is steering a live run.
             "/api/flywheel/steer/say",
             "/api/flywheel/steer/interrupt",
+            // And writing a task.
+            "/api/flywheel/tasks",
             "/m/b/api/sessions",
             "/",
             "/login",

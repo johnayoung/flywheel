@@ -5,9 +5,9 @@ How the hub works underneath. Front door: [hub](../hub.md).
 ## Model
 
 - **Workspace**: unique name + 1..32 **folders** (existing dirs, git or plain), optionally labelled; a **missing** one refuses new sessions.
-- **Session**: one PTY in one folder: `shell` (`$SHELL` or an argv), `claude`, or `codex` (on the hub's `PATH`, else 400). `running`, `exited` (code or signal; scrollback stays), or `stopped` (hub stopped under it; `last_cwd`, `restore_error`).
+- **Session**: one PTY in one folder: `shell` (`$SHELL` or an argv), `claude`, or `codex` (on the hub's `PATH`, else 400). `running`, `exited` (code or signal; scrollback stays), or `stopped` (hub stopped; `last_cwd`, `restore_error`).
 - `state.json`: atomic, schema 5; older migrate, newer refused. Kill hangs up the leader's group and background jobs (Linux: `/proc`).
-- One terminal size (max 500x300): a pane resizes the PTY only while focused or sole viewer; others clip. Input past 4 MiB queued for a terminal not reading is dropped (`nack` + `error`).
+- One terminal size (max 500x300): a pane resizes the PTY only while focused or sole viewer; others clip. Input past 4 MiB queued for a stalled terminal is dropped (`nack` + `error`).
 - Env: [hub-reference](reference.md#environment), minus enclosing-agent markers (`CLAUDECODE`, `CLAUDE_CODE_*`, `AI_AGENT`, `CODEX_SANDBOX`, ...).
 
 ## Terminal emulation
@@ -21,7 +21,7 @@ How the hub works underneath. Front door: [hub](../hub.md).
 ## Lifecycle and restore
 
 - `start` runs `fw hub serve` detached into `hub.log` (10 MiB, 3 kept); not ready (`server.json`) by `--timeout`: SIGTERM, log tail. `stop` SIGTERMs, waits for the lock; `--force` SIGKILLs (no restore record).
-- One hub per state dir (`serve.lock`); a stale `server.json` is removed (the CLI never sends the token to whatever listens there now).
+- One hub per state dir (`serve.lock`); a stale `server.json` is removed (the token is never sent to whatever listens there now).
 - Shutdown records running sessions `stopped`, then SIGHUP, SIGKILL (`nohup`ed children too); SIGTERM during startup waits until serving.
 - `install-service`: `~/.config/systemd/user/<name>.service` (`KillMode=mixed`) + enable/linger steps.
 
@@ -41,7 +41,7 @@ How the hub works underneath. Front door: [hub](../hub.md).
 Replaces the hub process **ending no session**: same pids, screens, scrollback, port, status, hook secrets. Linux only.
 
 - Binary: `--binary`, else `fw` on `PATH`, else this one; it inherits the old hub's environment. Earlier agents' hooks keep the old binary's path: upgrade in place.
-- Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring, and exits once the new hub acks. Input meanwhile is `nack`ed for a resend: never lost or doubled.
+- Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring, and exits on the new hub's ack. Input meanwhile is `nack`ed for a resend: never lost or doubled.
 - Failure before commit thaws the old hub; a stuck new one is killed at `--timeout`. Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` restarts instead (sessions restored, not kept); systemd: `systemctl --user restart <unit>`.
 - Handed-over processes are not children: exits via pidfd, no code. `attach`, `wait` reconnect within 2 min.
 
@@ -68,12 +68,12 @@ Per-kind TOML rules read against the screen's **live bottom**: `crates/flywheel-
 Start from a shipped (commented) file. Fields: `kind` (the file name), `version` (shown by `explain`); `[[rule]]`s, the first whose every clause holds wins: `id`, `state` (`working` | `blocked` | `idle` | `hold`: keep the status), `detail`, `detail_line` (regexes; capture 1 becomes the detail);
 `[[rule.when]]` clauses: `lines` (the last N non-empty rows, 1-100, 30), `line` / `not_line` (regexes), `any` / `all` / `none` (case-insensitive text).
 
-- Pin `blocked` rules to a dialog's footer so quoted text does not match. Limits: 64 rules, 8 clauses, 16 patterns per list, 400 chars, 64 KiB per file; read at most every 250 ms. Shell rules only answer `explain`.
+- Pin `blocked` rules to a dialog's footer (quoted text must not match). Limits: 64 rules, 8 clauses, 16 patterns per list, 400 chars, 64 KiB per file; read at most every 250 ms. Shell rules only answer `explain`.
 - `fw hub explain S` (UI `why?`): status, source (`hook`, `manifest` + rule, `heuristic`, `hub`), a fresh screen read with evidence, why each rule missed.
 
 ## Terminal client: `fw hub attach`
 
-Any terminal, local or over SSH (`--url`, `FW_HUB_TOKEN`).
+Local or over SSH (`--url`, `FW_HUB_TOKEN`).
 
 - No SESSION: a picker. Attached: snapshot, then raw bytes; typing verbatim; the PTY follows this terminal; a relaunch elsewhere reattaches.
 - Prefix `C-b` (`--prefix C-a`): `d` detach, `s` switch, `t` status bar (`--no-status`), `r` redraw, `?` keys, twice sends it.
@@ -90,42 +90,42 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 ## Web UI
 
 - Sidebar: machines > workspaces (rollup) > sessions (status dot, `↑ahead ↓behind ~changed ?untracked`, companions, a blocked row's question). Folder chips: filled git, hollow plain, struck missing.
-- Title and favicon count blocked and done; `#session=<id>` survives reloads. A dropped or silent (no pong in 6 s) socket keeps the screen, reconnects (2 s, up to 10 s) with what it missed.
-- Keys typed while down wait (`N queued`) and go in order once back; dropped, and said, if the session changed (epoch). Unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
+- Title, favicon count blocked and done; `#session=<id>` survives reloads. A dropped or silent (no pong in 6 s) socket keeps the screen, reconnects (2 s, up to 10 s) with what it missed.
+- Keys typed while down wait (`N queued`), sent in order once back; dropped, and said, if the session changed (epoch). Unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
 - Drawers (Commands, Flywheel, Review, Queue) share the stage's right edge; phones: full-screen sheets. Ended sessions: Relaunch, Close. First run: import offers, a 30 s tour. Themes: auto, dark, light (dim TUI colours lifted to 4.5:1).
-- Vendored (`web/vendor/`, with licenses): xterm.js 6.0.0 (+ fit, web-links, search); JetBrains Mono 2.304, then JuliaMono for its gaps.
+- Vendored (`web/vendor/`, licensed): xterm.js 6.0.0 (+ fit, web-links, search); JetBrains Mono 2.304, then JuliaMono for its gaps.
 
 ## Phone
 
-Pinned to the visual viewport (the keyboard shrinks the terminal); the PTY keeps 16+ rows.
+Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
 - **Needs you**: blocked and done agents of every workspace (blocked, longest waiting, first) head the sidebar and start screen. Footer utilities: one **More** row.
 - **Key bar** (touch): `esc` arrows `enter` `^c`; then `tab` `shift-tab` sticky `ctrl` `alt`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd`, `compose`.
 - **Quick answers**: a blocked dialog's options as buttons (AskUserQuestion's from its input, only while its question is on screen). **Compose**: multi-line text as one bracketed paste + Enter; history per device, drafts per session.
 - Swipe scrolls, long-press selects, pinch zooms. **Alerts** (per device, https or localhost): blocked or done while hidden or idle 5 min.
 - **Lite mode** (Settings > Terminal; `auto`: the browser says slow, under 64 KB/s, or 3+ round trips at 300 ms+): paced terminals (protocol 2 `lite`), hidden panes none, side panels wait (60 s), re-lists every 3 s at most.
-- **Install**: PWA; the service worker serves the cached page only when the hub is down.
+- **Install**: PWA; the service worker serves the cached page only with the hub down.
 
 ## Search
 
-`Ctrl Shift F`, `fw hub search`, `GET /api/search`: one query across every session.
+`Ctrl Shift F`, `fw hub search`, `GET /api/search`: one query across all sessions.
 
 - Sources: `scrollback` (exited sessions too), `transcript` (text, tool calls, results; no thinking), `commands`.
 - Literal or `regex` (linear-time), case-insensitive unless `case`, at most 1 KiB, one line. Newest first; 20 per session and source, 200 total; `offset` pages.
-- Bounds: 1.5 s (then `partial`), 2 at once, transcript indexes 256 MiB (dropped after 10 min unused); 20 sessions x 5k lines: ~30 ms.
+- Bounds: 1.5 s (then `partial`), 2 at once, transcript indexes 256 MiB (dropped 10 min unused); 20 sessions x 5k lines: ~30 ms.
 - The UI also asks every reachable machine (6 s each), naming offline ones; CLI `--machine`.
 
 ## Recording
 
 `fw hub record start|stop SESSION` (or the `rec` pill); `fw hub record get NAME -o demo.cast; asciinema play demo.cast`.
 
-- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after falling behind, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on the screen the last part ended on: no output is skipped; `recordings.dir_cap` deletes the oldest finished.
+- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after falling behind, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on the last part's final screen: nothing skipped; `recordings.dir_cap` deletes the oldest finished.
 - Ends on stop, exit, relaunch, hub stop; `upgrade` continues the file. Peers 403; an active one is not deleted (409).
 - `/replay#<name>`: seek with marker ticks, 0.5-8x, idle gaps cut to 2 s, follows parts.
 
 ## Push notifications
 
-ntfy-compatible POST when an agent becomes **blocked** or **done**, so a phone hears it with every browser closed. Config: [hub-reference](reference.md#notifytoml); test: palette "Send a test push".
+ntfy-compatible POST when an agent becomes **blocked** or **done**: a phone hears it with browsers closed. Config: [hub-reference](reference.md#notifytoml); test: palette "Send a test push".
 
 - `<session> is blocked|done`, workspace, kind, branch, the blocked detail, `Click:` the session URL (`Priority: high` if blocked); never terminal content, paths, tokens.
 - Sent once the status held `settle_secs`, nobody views it, and a done turn is unseen; once per spell, `debounce_secs` per session and status. One POST (10 s, no redirects or proxy env); failures logged.

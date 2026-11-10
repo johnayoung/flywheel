@@ -480,6 +480,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/fanouts/{id}/seen", post(fanout_api::seen))
         .route("/api/fanouts/{id}/promote", post(promote_api::promote))
         .route("/api/flywheel/task", get(promote_api::task_seed))
+        .route("/api/flywheel/tasks", post(promote_api::create_task))
         // Read-only share links and session recordings.
         .route(
             "/api/shares",

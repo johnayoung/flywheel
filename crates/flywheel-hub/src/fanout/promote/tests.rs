@@ -502,3 +502,66 @@ fn a_broken_held_out_pin_never_names_the_oracle_to_the_agent() {
     grade.operator = true;
     assert_eq!(crate::fanout::fix_prompt(&grade), None);
 }
+
+fn create(checks: Vec<GraderSpec>) -> CreateTaskRequest {
+    CreateTaskRequest {
+        folder: PathBuf::from("/repo"),
+        task_id: " new-task ".into(),
+        goal: " Ship it. ".into(),
+        phase: Some(" ".into()),
+        prerequisites: vec!["a".into(), " a ".into(), "b".into()],
+        checks,
+        dry_run: true,
+        confirm: None,
+    }
+}
+
+#[test]
+fn create_task_draft_keeps_visible_checks_and_refuses_held_out_ones() {
+    let draft = create_draft(&create(vec![
+        spec("cargo test", Some(" unit "), false),
+        spec("true", Some(""), false),
+    ]))
+    .unwrap();
+    assert_eq!(draft.task_id, "new-task");
+    assert_eq!(draft.goal, "Ship it.");
+    assert_eq!(draft.phase, None, "a blank phase is a new one");
+    assert_eq!(draft.prerequisites, ["a", "b"]);
+    assert_eq!(
+        draft.graders,
+        [
+            spec("cargo test", Some("unit"), false),
+            spec("true", None, false)
+        ]
+    );
+    assert!(draft.tags.is_empty() && draft.protect.is_empty());
+
+    let held = create_draft(&create(vec![spec("sh oracle.sh", None, true)])).unwrap_err();
+    assert!(held.contains("held-out"), "{held}");
+    assert!(
+        create_draft(&create(Vec::new()))
+            .unwrap_err()
+            .contains("check")
+    );
+    assert!(
+        create_draft(&create(vec![spec("  ", None, false)]))
+            .unwrap_err()
+            .contains("no command")
+    );
+    let mut no_goal = create(vec![spec("true", None, false)]);
+    no_goal.goal = "  ".into();
+    assert!(create_draft(&no_goal).unwrap_err().contains("goal"));
+    let mut own = create(vec![spec("true", None, false)]);
+    own.prerequisites = vec!["new-task".into()];
+    assert!(create_draft(&own).unwrap_err().contains("own prerequisite"));
+}
+
+#[test]
+fn create_task_phase_names_are_kebab_case() {
+    for ok in ["02-extra", "phase", "1-a-b"] {
+        assert!(kebab_case(ok), "{ok}");
+    }
+    for bad in ["", "-a", "a-", "a--b", "02_New", "Phase", "a.b", "a b"] {
+        assert!(!kebab_case(bad), "{bad}");
+    }
+}

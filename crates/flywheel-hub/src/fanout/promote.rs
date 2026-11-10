@@ -214,6 +214,10 @@ pub struct TaskDraft {
     /// landing.
     #[serde(default)]
     pub protect: Vec<String>,
+    /// Task ids this one waits on (the orchestrator's DAG edges): each must
+    /// be defined in the same tasks dir, active or archived.
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
 }
 
 /// Exactly what a promotion writes.
@@ -632,6 +636,7 @@ pub fn draft(
             tags,
             graders,
             protect: fanout.protect.clone(),
+            prerequisites: Vec::new(),
         },
         reference: reference.map(|(_, head)| head),
         warnings,
@@ -651,6 +656,122 @@ pub fn fingerprint(plan: &TaskFilePlan) -> String {
         .take(8)
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+// --- a new task -------------------------------------------------------------------
+
+/// A task written from scratch (`POST /api/flywheel/tasks`, the board's New
+/// task form): validated and written through the same provider seam as a
+/// promotion, dry run first, then confirmed by the plan's fingerprint.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateTaskRequest {
+    pub folder: PathBuf,
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub goal: String,
+    /// An active phase, or a new kebab-case one; `None`: a new phase after
+    /// the existing ones.
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub prerequisites: Vec<String>,
+    /// Command checks, in order.
+    #[serde(default)]
+    pub checks: Vec<GraderSpec>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+/// Whether `name` is kebab-case: lowercase letters and digits in
+/// `-`-separated words.
+pub fn kebab_case(name: &str) -> bool {
+    !name.is_empty()
+        && name.split('-').all(|word| {
+            !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+}
+
+/// `request` as a draft for the provider to plan. Held-out checks are
+/// refused: a task's graders are shown to its agent, so an oracle is
+/// registered outside the task file (`/fw-verify`), never through it.
+pub fn create_draft(request: &CreateTaskRequest) -> Result<TaskDraft, String> {
+    let task_id = request.task_id.trim();
+    if task_id.is_empty() {
+        return Err("task_id is required".into());
+    }
+    let goal = request.goal.trim();
+    if goal.is_empty() {
+        return Err("goal is required: one sentence saying what the change does".into());
+    }
+    if goal.chars().count() > MAX_GOAL_CHARS {
+        return Err(format!(
+            "goal is limited to {MAX_GOAL_CHARS} characters (one or two sentences)"
+        ));
+    }
+    let phase = match request.phase.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(phase) => Some(phase.to_owned()),
+    };
+    if request.checks.is_empty() {
+        return Err("name at least one command check: the loop verifies a task by them".into());
+    }
+    let mut graders = Vec::new();
+    for (i, check) in request.checks.iter().enumerate() {
+        if check.held_out {
+            return Err(format!(
+                "check {} is held-out: held-out checks are registered apart from the task                  (its agent reads the task's checks), never written by this route",
+                i + 1
+            ));
+        }
+        if check.run.trim().is_empty() {
+            return Err(format!("check {} has no command to run", i + 1));
+        }
+        let name = check
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned);
+        graders.push(GraderSpec {
+            run: check.run.clone(),
+            name,
+            held_out: false,
+        });
+    }
+    let mut prerequisites: Vec<String> = Vec::new();
+    for prerequisite in request.prerequisites.iter().map(|p| p.trim()) {
+        if prerequisite.is_empty() {
+            return Err("a prerequisite is empty: name a task id".into());
+        }
+        if prerequisite == task_id {
+            return Err(format!("task {task_id} cannot be its own prerequisite"));
+        }
+        if !prerequisites.iter().any(|p| p == prerequisite) {
+            prerequisites.push(prerequisite.to_owned());
+        }
+    }
+    Ok(TaskDraft {
+        task_id: task_id.to_owned(),
+        phase,
+        goal: goal.to_owned(),
+        notes: String::new(),
+        relevant: Vec::new(),
+        constraints: Vec::new(),
+        references: Vec::new(),
+        non_goals: Vec::new(),
+        edge_cases: Vec::new(),
+        tags: Vec::new(),
+        graders,
+        protect: Vec::new(),
+        prerequisites,
+    })
 }
 
 // --- seed -------------------------------------------------------------------------

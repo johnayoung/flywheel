@@ -6,8 +6,10 @@
 // there (the whole queue, or one task: `fw worker --task ID`, which runs
 // only it and exits once it settles), open a run's output (its `fw show` summary and redacted
 // agent transcript), and drive autopilot (autopilot.js). app-base.js creates it with its helpers; protocol:
-// GET /api/flywheel, /api/flywheel/panel, /api/flywheel/run, POST
-// /api/flywheel/worker, and the events socket's {"type":"flywheel"} and
+// GET /api/flywheel, /api/flywheel/panel, /api/flywheel/run,
+// /api/claude-accounts (the start-worker account picker, launcher.js's
+// FwHubAccounts), POST /api/flywheel/worker, /api/flywheel/pauses/clear
+// (the panel's active session-limit pauses), and the events socket's {"type":"flywheel"} and
 // {"type":"flywheel_reset"} pushes. Another machine's folders
 // (machines.js) are read through this hub's proxy; their keys here are
 // `<machine>\u0001<path>` (a path alone is this hub's), so the same repo
@@ -43,6 +45,8 @@ window.FwHubFlywheel = function (ctx) {
     seq: 0,
     run: null, // the run viewer's state
     pillSession: undefined, // the attached session the pill last showed
+    accounts: null, // {folder, workspaceId, list, pick}: the start-worker account picker
+    pauseReasons: new Map(), // pause id -> the clear reason being typed
   };
 
   const LIGHTS = ["failed", "parked", "awaiting", "blocked", "running", "pending", "verified"];
@@ -458,6 +462,7 @@ window.FwHubFlywheel = function (ctx) {
     ctx.onOpen();
     renderDrawer();
     $("#flywheel").focus({ preventScroll: true });
+    loadAccounts(folder);
     const loaded = loadPanel();
     changed();
     return loaded;
@@ -662,6 +667,9 @@ window.FwHubFlywheel = function (ctx) {
     }
     try {
       const request = { folder, workspace_id: workspace.id, another };
+      // The drawer's account pick (none for the CLI login or the board).
+      const account = where ? "" : chosenAccount(folder);
+      if (account) request.account = account;
       if (scoped) {
         request.tasks = [taskId];
         request.with_prereqs = withPrereqs;
@@ -1019,6 +1027,7 @@ window.FwHubFlywheel = function (ctx) {
       icon("plus"),
       untrusted ? "Run fw trust first" : broken ? "Fix the config first" : panel.worker.live ? "Start another worker" : "Start worker here",
     );
+    const accountPick = accountSelect(folder, broken || !!untrusted);
     const goto = workers.length
       ? el("button", {
         type: "button",
@@ -1033,7 +1042,7 @@ window.FwHubFlywheel = function (ctx) {
       el(
         "div",
         { className: "fw-daemons" },
-        daemonRow("worker", panel.worker, el("span", { className: "fw-daemon-actions" }, goto, start)),
+        daemonRow("worker", panel.worker, el("span", { className: "fw-daemon-actions" }, goto, accountPick, start)),
         panel.intake ? pilot.row(folder, panel, daemonRow) : daemonRow("autopilot", panel.autopilot),
         el("div", { className: "fw-where" }, el("span", { textContent: panel.source }), el("span", { textContent: panel.store })),
       ),
@@ -1052,6 +1061,7 @@ window.FwHubFlywheel = function (ctx) {
     const note = worktreeNote(panel);
     if (note) children.push(el("p", { className: "fw-note", textContent: note }));
     if (panel.problem) children.push(el("p", { className: "fw-problem", textContent: panel.problem }));
+    if (panel.pauses && panel.pauses.length) children.push(pausesSection(folder, panel.pauses));
     if (panel.alerts.length) children.push(alertsSection(folder, panel.alerts));
     const autopilot = pilot.section(folder, panel);
     if (autopilot) children.push(autopilot);
@@ -1090,8 +1100,122 @@ window.FwHubFlywheel = function (ctx) {
       children.push(section("Claims", panel.claims.length, el("ul", { className: "fw-list fw-claims" }, panel.claims.map(claimRow))));
     }
     const scroll = body.scrollTop;
+    // A clear reason being typed keeps its focus across a re-render.
+    const typing = document.activeElement && document.activeElement.closest("[data-fw-pause]");
+    const typingId = typing && document.activeElement.matches("input") ? typing.dataset.fwPauseId : null;
     body.replaceChildren(...children);
     body.scrollTop = scroll;
+    if (typingId) {
+      const input = body.querySelector(`[data-fw-pause-id="${CSS.escape(typingId)}"] input`);
+      if (input) input.focus({ preventScroll: true });
+    }
+  }
+
+  // --- start-worker account ------------------------------------------------
+
+  // Folder `key`'s workspace's Claude accounts (read through its machine's
+  // hub), for the start-worker picker; the pick starts as the workspace's
+  // remembered one (launcher.js's FwHubAccounts).
+  async function loadAccounts(key) {
+    const workspace = (ui.workspaceId && workspaceById(ui.workspaceId)) || workspaceFor(key);
+    const workspaceId = workspace ? workspace.id : null;
+    const list = (await window.FwHubAccounts.list(api, `${via(key)}/api/claude-accounts`)) || [];
+    if (ui.folder !== key) return;
+    const remembered = workspaceId ? window.FwHubAccounts.remembered(workspaceId) : "";
+    const pick = list.some((a) => a.name === remembered) ? remembered : "";
+    ui.accounts = { folder: key, workspaceId, list, pick };
+    renderDrawer();
+  }
+
+  // The account the drawer starts a worker in folder `key` under: "" for
+  // the CLI login.
+  function chosenAccount(key) {
+    const a = ui.accounts;
+    return a && a.folder === key ? a.pick : "";
+  }
+
+  function accountSelect(key, disabled) {
+    const a = ui.accounts && ui.accounts.folder === key ? ui.accounts : { list: [], pick: "", workspaceId: null };
+    const select = el("select", {
+      className: "fw-account",
+      disabled,
+      title: "Claude account the worker's agents run under (fw worker --account); CLI login uses the CLI's own",
+      "aria-label": "Worker account",
+    });
+    select.setAttribute("data-fw-worker-account", "");
+    window.FwHubAccounts.fill(select, el, a.list, a.workspaceId, a.pick);
+    select.addEventListener("change", () => {
+      a.pick = select.value;
+      if (a.workspaceId) window.FwHubAccounts.remember(a.workspaceId, select.value);
+    });
+    return select;
+  }
+
+  // --- session-limit pauses ------------------------------------------------
+
+  // The panel's active pauses (`fw pauses --json` entries), each with a
+  // clear that takes a reason; cleared elsewhere, one leaves with the
+  // next panel read.
+  function pausesSection(folder, pauses) {
+    const live = new Set(pauses.map((p) => String(p.id)));
+    for (const id of ui.pauseReasons.keys()) if (!live.has(id)) ui.pauseReasons.delete(id);
+    return section("Session pauses", pauses.length, el("ul", { className: "fw-list fw-pauses" }, pauses.map((p) => pauseRow(folder, p))));
+  }
+
+  function pauseLabel(account) {
+    return account === null || account === undefined ? "all accounts" : account === "" ? "cli login" : `@${account}`;
+  }
+
+  function pauseRow(folder, pause) {
+    const id = String(pause.id);
+    const reason = el("input", {
+      type: "text",
+      placeholder: "reason",
+      value: ui.pauseReasons.get(id) || "",
+      "aria-label": `Reason to clear pause ${id}`,
+      spellcheck: false,
+    });
+    const clear = el("button", { type: "button", className: "text-btn", textContent: "clear", title: "Clear this pause (fw pauses clear): the reason is recorded" });
+    reason.addEventListener("input", () => ui.pauseReasons.set(id, reason.value));
+    const go = () => clearPause(folder, pause, reason, clear);
+    reason.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") go();
+    });
+    clear.addEventListener("click", go);
+    const row = el(
+      "li",
+      { className: "fw-pause" },
+      el("b", { textContent: pauseLabel(pause.account) }),
+      el("span", { textContent: `until ${clock(pause.pause_until)}`, title: `${pause.pause_until} (run ${pause.run_id})` }),
+      el("span", { className: "fw-pause-clear" }, reason, clear),
+    );
+    row.setAttribute("data-fw-pause", "");
+    row.setAttribute("data-fw-pause-id", id);
+    // A pre-account row (account null, holding back every account) has no
+    // account attribute; "" is the CLI login.
+    if (typeof pause.account === "string") row.setAttribute("data-fw-pause-account", pause.account);
+    row.setAttribute("data-fw-pause-until", pause.pause_until);
+    return row;
+  }
+
+  // Clear one pause with the typed reason; an empty reason sends nothing.
+  async function clearPause(folder, pause, input, button) {
+    const reason = input.value.trim();
+    if (!reason) {
+      input.focus();
+      return;
+    }
+    button.disabled = true;
+    try {
+      const out = await post(`${via(folder)}/api/flywheel/pauses/clear`, { folder: pathOf(folder), ids: [pause.id], reason });
+      if (!out.ok) throw new Error((out.data && out.data.error) || `HTTP ${out.status}`);
+      ui.pauseReasons.delete(String(pause.id));
+      toast(`Cleared the ${pauseLabel(pause.account)} pause`, { timeout: 3000 });
+      await loadPanel();
+    } catch (error) {
+      button.disabled = false;
+      toast(`Could not clear the pause: ${error.message}`, { tone: "bad" });
+    }
   }
 
   // The panel's Needs you: unseen alerts first, a seen toggle, and long

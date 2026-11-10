@@ -295,38 +295,19 @@ window.FwHubLauncher = function (ctx) {
 
   // The account a Claude session launches with (`fw hub account`): the
   // CLI's own login unless one is picked; the pick is remembered per
-  // workspace.
-  const accountKey = () => `fw-hub.claude-account.${workspaceId}`;
+  // workspace (FwHubAccounts, below).
   let accountsSeq = 0;
   async function loadAccounts() {
     const seq = ++accountsSeq;
-    accountSelect.replaceChildren(el("option", { value: "", textContent: "CLI login" }));
+    window.FwHubAccounts.fill(accountSelect, el, [], workspaceId);
     accountBox.hidden = true;
     if (kind !== "claude" || !workspaceId) return;
-    let list = [];
-    try {
-      list = (await api("GET", "/api/claude-accounts")).accounts || [];
-    } catch (_) {
-      return;
-    }
-    if (seq !== accountsSeq || !list.length) return;
-    accountSelect.append(...list.map((a) => el("option", { value: a.name, textContent: a.name })));
-    let remembered = "";
-    try {
-      remembered = localStorage.getItem(accountKey()) || "";
-    } catch (_) {
-      // Private mode: no memory.
-    }
-    if (list.some((a) => a.name === remembered)) accountSelect.value = remembered;
+    const list = await window.FwHubAccounts.list(api);
+    if (seq !== accountsSeq || !list || !list.length) return;
+    window.FwHubAccounts.fill(accountSelect, el, list, workspaceId);
     accountBox.hidden = false;
   }
-  accountSelect.addEventListener("change", () => {
-    try {
-      localStorage.setItem(accountKey(), accountSelect.value);
-    } catch (_) {
-      // Private mode: the pick lasts this dialog.
-    }
-  });
+  accountSelect.addEventListener("change", () => window.FwHubAccounts.remember(workspaceId, accountSelect.value));
 
   // --- resuming a conversation ---------------------------------------------------
 
@@ -716,4 +697,44 @@ window.FwHubLauncher = function (ctx) {
     setKind, setFolder, reset, request, renderHeader, rowChip, workspaceChip, paletteItems, templateItems, render, onUsage,
     loadRollups, rollupsSoon, PALETTE_PREFIX, tokens, costText, taskFrom,
   };
+};
+
+// The hub's Claude account picker, shared by the new-session form and the
+// Flywheel drawer's start-worker control (flywheel.js): "CLI login" ("")
+// then each account of GET /api/claude-accounts, the pick remembered per
+// workspace (one memory for both).
+window.FwHubAccounts = {
+  key: (workspaceId) => `fw-hub.claude-account.${workspaceId}`,
+  // The account list from `path` (a machine's hub), or null when unread.
+  async list(api, path = "/api/claude-accounts") {
+    try {
+      return (await api("GET", path)).accounts || [];
+    } catch (_) {
+      return null;
+    }
+  },
+  remembered(workspaceId) {
+    try {
+      return localStorage.getItem(this.key(workspaceId)) || "";
+    } catch (_) {
+      return ""; // Private mode: no memory.
+    }
+  },
+  remember(workspaceId, name) {
+    try {
+      localStorage.setItem(this.key(workspaceId), name);
+    } catch (_) {
+      // Private mode: the pick lasts this view.
+    }
+  },
+  // Fill `select` with "CLI login" plus `list`, picking `pick` (default:
+  // the workspace's remembered account) when it is still listed.
+  fill(select, el, list, workspaceId, pick) {
+    select.replaceChildren(
+      el("option", { value: "", textContent: "CLI login" }),
+      ...list.map((a) => el("option", { value: a.name, textContent: a.name })),
+    );
+    const want = pick === undefined ? this.remembered(workspaceId) : pick;
+    select.value = list.some((a) => a.name === want) ? want : "";
+  },
 };

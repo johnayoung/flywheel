@@ -10,6 +10,10 @@
 //!   (`fw worker --task ID ...` when `tasks` names any) in a new hub shell
 //!   session there; 409 (with the running session) while a worker this
 //!   hub started still runs in the folder, unless `another` is true;
+//! * `POST /api/flywheel/steer/say {"folder", "run", "message"}` and
+//!   `POST /api/flywheel/steer/interrupt {"folder", "run"}` -- enqueue one
+//!   `say` / `interrupt` control command for a running or validating run
+//!   (409, nothing enqueued, for any other state); refused to peers;
 //! * `{"type":"flywheel"}` messages on the events socket.
 //!
 //! Only folders of the hub's workspaces are served, and only adopted ones.
@@ -17,8 +21,9 @@
 use super::ApiQuery;
 use super::{AppState, error_response};
 use crate::flywheel::{
-    FlywheelEvent, FlywheelMonitor, FlywheelSummary, WorkerScope, mark_queued, runs_worker,
-    valid_run_id, worker_session_command, worker_session_name,
+    FlywheelEvent, FlywheelMonitor, FlywheelSummary, MAX_SAY_CHARS, Steer, SteerRefused,
+    WorkerScope, mark_queued, runs_worker, valid_run_id, worker_session_command,
+    worker_session_name,
 };
 use crate::hub::{CreateSession, Hub};
 use crate::state::Workspace;
@@ -372,6 +377,82 @@ pub(super) async fn start_worker(
         Err(join) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("starting the worker failed: {join}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct SayRequest {
+    folder: String,
+    run: String,
+    message: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct InterruptRequest {
+    folder: String,
+    run: String,
+}
+
+pub(super) async fn say(
+    State(app): State<AppState>,
+    super::ApiJson(request): super::ApiJson<SayRequest>,
+) -> Response {
+    if request.message.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "message must be non-empty");
+    }
+    if request.message.chars().count() > MAX_SAY_CHARS {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("message is limited to {MAX_SAY_CHARS} characters"),
+        );
+    }
+    let steer = Steer::Say {
+        text: request.message,
+    };
+    steer_run(app, request.folder, request.run, steer).await
+}
+
+pub(super) async fn interrupt(
+    State(app): State<AppState>,
+    super::ApiJson(request): super::ApiJson<InterruptRequest>,
+) -> Response {
+    steer_run(app, request.folder, request.run, Steer::Interrupt).await
+}
+
+/// Enqueue `steer` for live run `run` of `folder`.
+async fn steer_run(app: AppState, folder: String, run: String, steer: Steer) -> Response {
+    let monitor = match monitor(&app) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.into_response(),
+    };
+    if !valid_run_id(&run) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "run must be 1-128 letters, digits, '-' or '_'",
+        );
+    }
+    let (path, _) = match adopted_folder(&app, &monitor, folder).await {
+        Ok(found) => found,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let provider = Arc::clone(monitor.provider());
+    let folder = path.clone();
+    // An action: no timeout (a command enqueued after a give-up would read
+    // as failed, inviting a duplicate).
+    let steered =
+        tokio::task::spawn_blocking(move || provider.steer_run(&folder, &run, &steer)).await;
+    match steered {
+        Ok(Ok(done)) => {
+            monitor.refresh(&path);
+            (StatusCode::CREATED, Json(done)).into_response()
+        }
+        Ok(Err(SteerRefused::UnknownRun(m))) => error_response(StatusCode::NOT_FOUND, &m),
+        Ok(Err(SteerRefused::NotLive(m))) => error_response(StatusCode::CONFLICT, &m),
+        Ok(Err(SteerRefused::Store(m))) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &m),
+        Err(join) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("steering the run failed: {join}"),
         ),
     }
 }

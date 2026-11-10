@@ -441,6 +441,60 @@ pub struct RunOutput {
     pub next: usize,
 }
 
+/// A steering command for a live run, as `fw say` / `fw interrupt`
+/// enqueue it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Steer {
+    /// One operator message, injected as a user turn.
+    Say { text: String },
+    /// Drive the run to INTERRUPTED.
+    Interrupt,
+}
+
+impl Steer {
+    /// The control command kind (`say` / `interrupt`).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Say { .. } => "say",
+            Self::Interrupt => "interrupt",
+        }
+    }
+}
+
+/// A steering command enqueued for the run's worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Steered {
+    pub run_id: String,
+    pub task_id: String,
+    /// `say` or `interrupt`.
+    pub kind: String,
+    /// The control command's id in the store.
+    pub command_id: i64,
+}
+
+/// Why a steering command was not enqueued (nothing was).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SteerRefused {
+    /// No such run in this folder's store.
+    UnknownRun(String),
+    /// The run is not running or validating.
+    NotLive(String),
+    /// The store could not be read or written.
+    Store(String),
+}
+
+impl std::fmt::Display for SteerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownRun(m) | Self::NotLive(m) | Self::Store(m) => f.write_str(m),
+        }
+    }
+}
+
+/// The longest message a say carries (characters).
+pub const MAX_SAY_CHARS: usize = 4000;
+
 /// Reads flywheel state for a folder. Implemented by the embedding binary
 /// (see the module doc); every method may block (filesystem, store) and is
 /// only ever called off the async runtime.
@@ -506,6 +560,16 @@ pub trait FlywheelProvider: Send + Sync + 'static {
         folder: &Path,
         decision: &GateDecision,
     ) -> Result<GateDecided, GateRefused>;
+
+    /// Enqueue `steer` for live run `run_id` as `fw say` / `fw interrupt`
+    /// do, refused (nothing enqueued) unless the run is running or
+    /// validating.
+    fn steer_run(
+        &self,
+        folder: &Path,
+        run_id: &str,
+        steer: &Steer,
+    ) -> Result<Steered, SteerRefused>;
 }
 
 /// What a browser hears about a folder.

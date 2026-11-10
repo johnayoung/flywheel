@@ -268,6 +268,7 @@ pub fn peer_forbidden(path: &str) -> bool {
         || under("/api/recordings")
         || under("/api/perms")
         || path.starts_with("/api/flywheel/autopilot/")
+        || under("/api/flywheel/steer")
         || is_record_control(path)
         || under("/m")
         || !path.starts_with("/api")
@@ -515,6 +516,9 @@ mod tests {
             // Autopilot is read-only for peers.
             "/api/flywheel/autopilot/start",
             "/api/flywheel/autopilot/decide",
+            // So is steering a live run.
+            "/api/flywheel/steer/say",
+            "/api/flywheel/steer/interrupt",
             "/m/b/api/sessions",
             "/",
             "/login",

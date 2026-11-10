@@ -1,6 +1,6 @@
 # Hub
 
-`fw hub` is a web workspace for AI coding agents (Claude Code, Codex, shells) whose server owns every terminal: browsers, phones, and `fw hub attach` come and go without disturbing a session. Workspaces group folders; agents run there or in sibling worktrees, with live status, exact-copy commands, review, and verified fan-outs. Crate: `crates/flywheel-hub`.
+`fw hub` is a web workspace for AI coding agents (Claude Code, Codex, shells) whose server owns every terminal: browsers, phones, and `fw hub attach` come and go; sessions carry on. Workspaces group folders; agents run there or in sibling worktrees, with live status, exact-copy commands, review, and verified fan-outs. Crate: `crates/flywheel-hub`.
 
 ## Security first
 
@@ -19,7 +19,7 @@ fw hub wait "$id" --until done --timeout 900
 fw hub commands "$id" --last --copy  # newest suggested shell block, exact, to clipboard
 ```
 
-Phone or another machine: `tailscale serve --bg http://127.0.0.1:7420`, then `fw hub url --qr` and scan; without Tailscale see [hub-security](hub/security.md#https-without-tailscale). After a rebuild: `fw hub upgrade` (live handoff, no session restarts), not stop/start.
+Phone or another machine: `tailscale serve --bg http://127.0.0.1:7420`, then `fw hub url --qr` and scan; without Tailscale see [hub-security](hub/security.md#https-without-tailscale). After a rebuild: `fw hub upgrade` (live handoff, sessions kept), not stop/start.
 
 ## Feature map
 
@@ -35,7 +35,7 @@ Phone or another machine: `tailscale serve --bg http://127.0.0.1:7420`, then `fw
 
 ## Verbs
 
-Full syntax, flags, and files: [hub-reference](hub/reference.md). `fw hub <verb> --help` is authoritative.
+Syntax, flags, files: [hub-reference](hub/reference.md); `fw hub <verb> --help` is authoritative.
 
 | Group | Verbs |
 |---|---|
@@ -45,5 +45,5 @@ Full syntax, flags, and files: [hub-reference](hub/reference.md). `fw hub <verb>
 | Agent output | `commands` `search` `activity` `digest` `record` |
 | Git and agents together | `review` `merge` `pr` `handoff` `ask-review` `fanout` `autopilot` |
 | Settings | `config` `plugin` `perms` |
-| Hooks | `report` (agent status hooks) |
+| Hooks | `report` |
 

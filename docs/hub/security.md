@@ -17,11 +17,11 @@ Front door: [hub](../hub.md).
 - `/login?code=` (or `?token=`) sets an `HttpOnly; SameSite=Strict` cookie holding a fresh per-login secret, never the token (`Secure` under https); it lasts `server.login_days` (30) after its last use (sliding; written at most hourly), 256 at most; `POST /logout` ends one.
 - Scripts: `Authorization: Bearer <token>`. Cross-origin `Origin` is refused on WebSocket upgrades and every non-GET.
 - 10 wrong credentials per client address (IPv6 /64) in 10 minutes -> 429, except with a live login cookie; direct local connections (and local tunnels such as `ssh -L`) are exempt.
-- Unauthenticated connections have their own pool and 3 s for a request head: a flood never locks you out. A WebSocket that stops reading is dropped after 60 s.
+- Unauthenticated connections get their own pool and 3 s for a request head: a flood never locks you out. A WebSocket that stops reading is dropped after 60 s.
 
 ## Remote access
 
-Recommended: Tailscale (https on the tailnet, which phones need for clipboard, notifications, install): the hub on loopback, `tailscale serve --bg http://127.0.0.1:7420` (`https://<machine>.<tailnet>.ts.net`), `fw hub url --qr` to scan.
+Recommended: Tailscale (tailnet https, which phones need for clipboard, notifications, install): the hub on loopback, `tailscale serve --bg http://127.0.0.1:7420` (`https://<machine>.<tailnet>.ts.net`), `fw hub url --qr` to scan.
 
 - `serve` and `url` detect a `tailscale serve` of the hub's port, else print the command.
 - `X-Forwarded-*` is believed from loopback and `--trusted-proxy` peers only; a proxy elsewhere: `--public-url` + `--trusted-proxy`.
@@ -56,8 +56,8 @@ fw hub ls --machine desktop; fw hub attach --machine desktop SESSION
 ```
 
 - **A peer credential is equivalent to B's token** (its sessions can read B's token file); API and sockets only, never a browser login. `fw hub peer revoke` ends its requests and sockets (4003); it survives B's token rotation.
-- Peers get 403 (defense in depth, not a boundary) on token rotation, login codes, peers, machines, import, plugins, settings, config, shares, recordings, permissions, `/m/*`, and every page.
-- `machines.json` on A holds credentials in plaintext (0600) on purpose: a keyring hands them to the same user anyway, and is absent on headless and WSL hosts.
+- Peers get 403 (defense in depth, not a boundary) on token rotation, login codes, peers, machines, import, plugins, settings, config, shares, recordings, permissions, autopilot control, run steering, `/m/*`, and every page.
+- `machines.json` on A holds credentials in plaintext (0600) on purpose: a keyring hands them to the same user, and headless and WSL hosts lack one.
 - `machine add` verifies the credential (`/api/whoami`), refusing a hub token, this hub, or a duplicate; `--replace` swaps credential / URL / pin; `rm` asks B to revoke.
 - Proxy: `/api/...` of registered URLs only (SSRF guard), 8 MiB requests, 32 MiB answers, 120 s, as attachments with CSP `sandbox`; B's 401 becomes 502.
 - https machines verify against system roots or `--fingerprint` (a CA, or a self-signed leaf); a refusal names the fingerprint to pin.

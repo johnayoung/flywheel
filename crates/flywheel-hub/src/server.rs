@@ -447,6 +447,11 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/flywheel/panel", get(flywheel_api::panel))
         .route("/api/flywheel/run", get(flywheel_api::run_output))
         .route("/api/flywheel/worker", post(flywheel_api::start_worker))
+        .route("/api/flywheel/steer/say", post(flywheel_api::say))
+        .route(
+            "/api/flywheel/steer/interrupt",
+            post(flywheel_api::interrupt),
+        )
         .route("/api/flywheel/autopilot", get(autopilot_api::view))
         .route("/api/flywheel/autopilot/start", post(autopilot_api::start))
         .route("/api/flywheel/autopilot/stop", post(autopilot_api::stop))

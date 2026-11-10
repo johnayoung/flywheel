@@ -28,9 +28,11 @@
 //! * run output: `fw show <run>` ([`cmd_show`]) plus the console's
 //!   redacted transcript ([`TranscriptTailer`]), tailed incrementally.
 //!
-//! Read-only: nothing here writes the store or the task tree (opening a
-//! store runs its idempotent schema bootstrap, as every `fw` read verb
-//! does). A missing SQLite store is never created: the panel lists the
+//! Read-only but for the operator's commands (gate decisions, and `say` /
+//! `interrupt` for a live run, enqueued as `control_commands` rows exactly
+//! as the CLI verbs do): nothing else writes the store or the task tree
+//! (opening a store runs its idempotent schema bootstrap, as every `fw`
+//! read verb does). A missing SQLite store is never created: the panel lists the
 //! tasks as pending against an empty in-memory store instead.
 //!
 //! Postgres: like every `fw` verb, the DSN comes from the effective config
@@ -46,6 +48,7 @@ use crate::snapshot::{CachedWorkSource, collect_live_rows, directory_fingerprint
 use crate::tui::{open_store_bundle, process_environ};
 use chrono::{DateTime, Utc};
 use flywheel_core::audit::run_file_path;
+use flywheel_core::invoker_client::{CONTROL_COMMAND_INTERRUPT, CONTROL_COMMAND_SAY};
 use flywheel_core::lifecycle::{Lifecycle, Status};
 use flywheel_core::store::{HarnessStore, LifecycleFilter};
 use flywheel_core::store_memory::InMemoryStore;
@@ -53,8 +56,8 @@ use flywheel_hub::autopilot::{GateDecided, GateDecision, GateRefused};
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome, LiveRun, Note,
-    PanelClaim, PanelPhase, PanelPlan, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight,
-    UntrustedRepoFile, WorkerScope,
+    PanelClaim, PanelPhase, PanelPlan, PanelTask, RecentRun, RunEntry, RunOutput, Steer,
+    SteerRefused, Steered, TaskLight, UntrustedRepoFile, WorkerScope,
 };
 use flywheel_hub::util::path_identity as file_identity;
 use flywheel_orchestrator::autopilot_activity::{
@@ -1448,11 +1451,72 @@ impl FlywheelProvider for HubFlywheel {
         drop(state);
         crate::hub_autopilot::decide(core.as_ref(), decision)
     }
+
+    fn steer_run(
+        &self,
+        folder: &Path,
+        run_id: &str,
+        steer: &Steer,
+    ) -> Result<Steered, SteerRefused> {
+        let state = self.folder(folder);
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let resolved = state
+            .resolve(&self.home(), folder)
+            .map_err(SteerRefused::Store)?;
+        let core = match resolved.stores(folder).map_err(SteerRefused::Store)? {
+            Some(bundle) => Arc::clone(&bundle.core),
+            None => {
+                return Err(SteerRefused::UnknownRun(
+                    "this repo has no store yet: no runs were recorded".into(),
+                ));
+            }
+        };
+        drop(state);
+        enqueue_steer(core.as_ref(), run_id, steer)
+    }
+}
+
+/// Enqueue `steer` for `run_id` through the store's `control_commands`
+/// queue, as `fw say` / `fw interrupt` do, but only while the run is
+/// running or validating: any other state enqueues nothing.
+fn enqueue_steer(
+    core: &dyn HarnessStore,
+    run_id: &str,
+    steer: &Steer,
+) -> Result<Steered, SteerRefused> {
+    let lifecycle = core
+        .load_lifecycle(run_id)
+        .map_err(|e| SteerRefused::Store(format!("reading run {run_id}: {e}")))?
+        .ok_or_else(|| SteerRefused::UnknownRun(format!("no run {run_id} in this repo's store")))?;
+    if !matches!(lifecycle.status, Status::Running | Status::Validating) {
+        return Err(SteerRefused::NotLive(format!(
+            "run {run_id} is {}, not running or validating: nothing enqueued",
+            lifecycle.status.as_str()
+        )));
+    }
+    let (kind, payload) = match steer {
+        Steer::Say { text } => {
+            let mut payload = Map::new();
+            payload.insert("text".into(), Value::String(text.clone()));
+            (CONTROL_COMMAND_SAY, payload)
+        }
+        Steer::Interrupt => (CONTROL_COMMAND_INTERRUPT, Map::new()),
+    };
+    let record = core
+        .enqueue_command(run_id, kind, payload, Utc::now())
+        .map_err(|e| SteerRefused::Store(format!("enqueueing the {kind}: {e}")))?;
+    Ok(Steered {
+        run_id: run_id.to_owned(),
+        task_id: lifecycle.task_id,
+        kind: kind.to_owned(),
+        command_id: record.id.unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flywheel_core::store::{ControlCommandStore, LifecycleStore};
 
     fn git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
@@ -1679,5 +1743,90 @@ mod tests {
                 files("02-new", false, &["task-a", "task-c"]),
             ]
         );
+    }
+
+    /// An in-memory store holding one run of `task-a` through `path`.
+    fn store_with_run(run_id: &str, path: &[Status]) -> InMemoryStore {
+        let store = InMemoryStore::new();
+        let mut lc = Lifecycle::new("task-a");
+        lc.run_id = run_id.to_owned();
+        for status in path {
+            let error = if *status == Status::Failed {
+                "boom"
+            } else {
+                ""
+            };
+            lc.transition_to(*status, error, None).unwrap();
+        }
+        store.create_lifecycle(&lc).unwrap();
+        store
+    }
+
+    #[test]
+    fn steer_enqueues_exactly_one_say_or_interrupt_for_a_live_run() {
+        for live in [
+            &[Status::Ready, Status::Running][..],
+            &[Status::Ready, Status::Running, Status::Validating][..],
+        ] {
+            let store = store_with_run("run-1", live);
+            let said = Steer::Say {
+                text: "add docstrings".into(),
+            };
+            let steered = enqueue_steer(&store, "run-1", &said).unwrap();
+            assert_eq!(
+                (steered.kind.as_str(), steered.task_id.as_str()),
+                ("say", "task-a")
+            );
+            let commands = store.pending_commands("run-1").unwrap();
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].kind, CONTROL_COMMAND_SAY);
+            assert_eq!(commands[0].payload["text"], "add docstrings");
+            assert_eq!(commands[0].id, Some(steered.command_id));
+
+            let steered = enqueue_steer(&store, "run-1", &Steer::Interrupt).unwrap();
+            assert_eq!(steered.kind, "interrupt");
+            let commands = store.pending_commands("run-1").unwrap();
+            assert_eq!(commands.len(), 2);
+            assert_eq!(commands[1].kind, CONTROL_COMMAND_INTERRUPT);
+            assert!(commands[1].payload.is_empty());
+        }
+    }
+
+    #[test]
+    fn steer_refuses_runs_not_running_or_validating_and_enqueues_nothing() {
+        let not_live: [&[Status]; 4] = [
+            &[],
+            &[
+                Status::Ready,
+                Status::Running,
+                Status::Validating,
+                Status::Done,
+            ],
+            &[Status::Ready, Status::Running, Status::Failed],
+            &[
+                Status::Ready,
+                Status::Running,
+                Status::Validating,
+                Status::AwaitingApproval,
+            ],
+        ];
+        for path in not_live {
+            let store = store_with_run("run-1", path);
+            for steer in [Steer::Say { text: "hi".into() }, Steer::Interrupt] {
+                let refused = enqueue_steer(&store, "run-1", &steer).unwrap_err();
+                assert!(
+                    matches!(refused, SteerRefused::NotLive(_)),
+                    "{path:?}: {refused}"
+                );
+            }
+            assert!(
+                store.pending_commands("run-1").unwrap().is_empty(),
+                "{path:?}"
+            );
+        }
+        let store = store_with_run("run-1", &[Status::Ready, Status::Running]);
+        let refused = enqueue_steer(&store, "run-2", &Steer::Interrupt).unwrap_err();
+        assert!(matches!(refused, SteerRefused::UnknownRun(_)));
+        assert!(store.pending_commands("run-2").unwrap().is_empty());
     }
 }

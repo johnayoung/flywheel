@@ -18,7 +18,7 @@ fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it wait
 
 ## Agent launcher
 
-- **Resume** (`--resume ID`, `--continue`, the dialog's **Conversation**): a new session picks up one of the folder's Claude Code or Codex conversations (`fw hub conversations WS --kind K`); one open in a running session is refused. Relaunch and restarts resume a session's own.
+- **Resume** (`--resume ID`, `--continue`, the dialog's **Conversation**): a new session picks up a folder's Claude Code or Codex conversation (`fw hub conversations WS --kind K`); one open in a running session is refused. Relaunch and restarts resume a session's own.
 - **Accounts** (Claude): `claude setup-token` as the other account, Settings > Agents (or `fw hub account add work`), then `--account work` or the dialog's **Account** (per workspace). Spawns get `CLAUDE_CODE_OAUTH_TOKEN` (one `~/.claude` serves both; rows show `@work`); Claude's settings `env` outranks it.
 - **First prompt** (`--prompt`, 32 KiB): the first user turn, on create only. **Model**: `claude --model` / `codex -m`.
 - **Permissions**: Claude `--permission-mode` (`bypassPermissions` warns, marks the session `unchecked`); Codex `-a` approval, `-s` sandbox; reapplied on relaunch and restore.
@@ -26,14 +26,14 @@ fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it wait
 
 ## Suggested commands
 
-Each fenced block is read from the agent's own record and served **exactly as written**.
+Each fenced block comes from the agent's own record, **exactly as written**.
 
 - Sources: Claude's transcript (or the Stop hook's `last_assistant_message`, so blocks are in before `done`), Codex's rollout, else its `notify` payload. Tailed each second and per hook report; newest 500 per session persist.
 - Shell blocks: `bash sh zsh shell console fish ...`, or untagged ones that start like a command; `console` keeps only the commands.
 - In-session commands (Claude Code's `!` bash mode): an inline `` `! cmd` `` or a block of `! cmd` lines is a shell command; Copy / Send drop the `!`.
 - Send pastes (bracketed when enabled), Send + Run adds Enter; multi-line without bracketed paste: 409, use Copy. `--copy`: OSC 52, over SSH too (tmux: `set -g set-clipboard on`).
 - **Commands drawer** (`Alt C`): newest first; Send targets the companion shell (opened if needed). Keys: `j`/`k`, `c` copy, `1`-`9` a card, `s` send, `Shift S` send + run.
-- **Replies**: every assistant message as written (newest 100, 64 KiB each). `Alt Y` copies the last; the Replies tab copies one whole or by block. Hovering a reply in an agent's pane (not a tool call) shows a copy button.
+- **Replies**: every assistant message as written (newest 100, 64 KiB each). `Alt Y` copies the last; the Replies tab copies one whole or by block. A reply in an agent's pane (not a tool call) has a hover copy button.
 
 ## Usage and cost
 
@@ -71,18 +71,18 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 A branch with a pull request: a badge on its row (`#7`, checks), a PR section in Review, `fw hub pr SESSION`. All through `gh` (missing or signed out: the section says why).
 
-- **Asked** per (folder, branch) by head (`gh pr list --head B`; a branch named `123` never binds PR #123), if pushed and not a default branch: checks running 1 min, open 5 min, merged/closed 30 min, none 5 min; at once after Push, Open PR, its own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, marked stale).
+- **Asked** per (folder, branch) by head (`gh pr list --head B`; branch `123` never binds PR #123), if pushed and not a default branch: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, its own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, marked stale).
 - **View log**: `gh run view --job J --log-failed`, the last 400 lines, escapes stripped, secrets redacted (Activity's rules, `NAME=value`, `password:`, `--password V`, AWS keys, URL passwords).
-- **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued (`done`). One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; never pasted twice in 5 min.
+- **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued (`done`). One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; not re-pasted within 5 min.
 - **Re-run failed** (`gh run rerun R --failed`), **Ready** (`gh pr ready`),
-  **Merge** (`gh pr merge N --<method> --match-head-commit SHA`, the repo's default method): planned, confirmed by fingerprint against GitHub read again (unreadable: refused). Merge refuses closed, draft, conflicting; checks failing or running, changes requested, review required: only with the number typed back (`--force N`).
+  **Merge** (`gh pr merge N --<method> --match-head-commit SHA`, the repo's default method): planned, confirmed by fingerprint against GitHub re-read (unreadable: refused). Merge refuses closed, draft, conflicting; checks failing or running, changes requested, review required: only with the number typed back (`--force N`).
 - **Events** `pr.checks_failed`, `pr.checks_passed` (from running or red), `pr.review_changes_requested`, `pr.merged`; a hub start announces nothing.
 
 ## Handoff and peer review
 
 - **Send to agent** (`fw hub handoff FROM TO`, `handoff.send`): a selection, message, block, or diff to another agent (any workspace or machine) as one editable prompt (32 KiB).
 - **Shell output to agent** (`Alt O`, header **to <agent>** on a shell, the send icon or pane menu on a shell pane, `fw hub handoff SHELL AGENT --output`): the output of the last command typed at the shell's prompt, else its last 200 lines; a companion shell: its own agent.
-- **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author. Model: `--model`, else the author's (same kind), else `agents.<kind>.model`.
+- **Ask for a review** (`fw hub ask-review`, Review drawer, `review.ask`): a read-only reviewer of the other kind (`review.reviewer`; Claude `plan`, Codex `-a never -s read-only`) in the author's worktree, prompted with `git diff <base>...HEAD`; one per author. Model: `--model` > the author's (same kind) > `agents.<kind>.model`.
 - **Send findings to <author>** pastes the reviewer's latest reply back. Pairing survives restarts; closing the author closes its reviewers.
 
 ## Verified fan-out
@@ -99,7 +99,7 @@ fw hub fanout pick "$id" c1 --yes [--rebase]
 fw hub fanout cleanup "$id" [--force] --yes
 ```
 
-- **Agent claims are untrusted**: a finished turn only queues grading; the verdict is the graders' exit codes. Needs you: once per unseen grading.
+- **Agent claims are untrusted**: a finished turn only queues grading; graders' exit codes decide. Needs you: once per unseen grading.
 - **Graders are held out of the prompt only** (agents run as you): `--protect` a tracked grader's inputs (a change fails) or keep it outside the repo ([held-out gate](../held-out-gate.md)); absolute-path scripts are pinned by hash.
 - Grading: flywheel-core's runner (in order, `/bin/sh -c`, exit 0 passes, `--timeout` 900 s each, first failure stops); 2 at once. Rank: passing (smaller diff, then lower cost), failing, stale, grading, ungraded; a pass changing nothing cannot be picked.
 - **Pick** needs a fresh pass on a clean tree at exactly the graded commit, then ff-merges it (plan + fingerprint); base moved: `--rebase`, which grades again.
@@ -115,7 +115,7 @@ fw hub fanout promote "$id" --reference c1 --yes  # writes <project>/tasks/activ
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote instead of picking** to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, `--reference` (default winner, else leader); refused for an existing file or id. **Run <id> with worker here** runs `fw worker --task <id>`.
+- **Promote instead of picking** to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, `--reference` (default winner, else leader); refused for an existing file or id. Then **Run <id> with worker here**.
 - **Fan out this task** (Flywheel panel): prompt from its goal and context; graders = its command plus **held-out** graders, added server-side (none or unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
@@ -143,14 +143,14 @@ Per agent session, prompts the hub types in itself, in order ("when done, do X")
 | Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched |
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
-**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase on main"`); a workspace means its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), else refused with why. `--header` names the recipients.
+**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase on main"`); a workspace means its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), else refused (why). `--header` names the recipients.
 
 ## Activity
 
 What happened, newest first: palette **Activity**, the header pill, `fw hub activity` (24 h: the digest, then the timeline; `--since last-seen`: since this CLI last looked).
 
 - **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A row opens its object, else attaches.
-- **Kept** in `activity.jsonl` (rotated at 1 MiB or a week, 30 days): kind, ids, names, short facts; never terminal output, prompts, commands, grader output, paths; token-shaped words are `[redacted]`.
+- **Kept** in `activity.jsonl` (rotated at 1 MiB or weekly, 30 days): kind, ids, names, short facts; never terminal output, prompts, commands, grader output, paths; token-shaped words are `[redacted]`.
 - **While you were away** (back after 10+ min): turns finished, blocked now, fan-outs graded, commands suggested, cost. **Machines**: asked at once (4 s each), merged, labelled; a silent one makes it `partial`.
 
 ## Digests
@@ -159,7 +159,7 @@ Off until `hub.toml` `[digest] times` is set ([hub-reference](reference.md#hubto
 
 - **Says**, since the last digest, per workspace: turns finished, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, longest blocked, red PRs, stalled queues) with links.
 - **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty ones are skipped (`quiet_if_empty`). `delivery.channels` lists only what heard it.
-- **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it. A send claim older than 5 min is dropped even if its pid runs (reused).
+- **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it. A send claim over 5 min old is dropped, live pid or not (reused).
 
 ## Permissions
 

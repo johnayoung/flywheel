@@ -18,8 +18,8 @@ use flywheel::hub_flywheel::{AUTOPILOT_ACTIVITY, HubFlywheel};
 use flywheel_core::events::{DomainEvent, DomainEventPayload, LandingParked};
 use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome, Status};
 use flywheel_core::store::{
-    AttemptStore, DomainEventStore, GraderResultRecord, GraderResultStore, LifecycleStore,
-    TelemetryRecord, TelemetrySink,
+    AttemptStore, ControlCommandStore, DomainEventStore, GraderResultRecord, GraderResultStore,
+    LifecycleStore, TelemetryRecord, TelemetrySink,
 };
 use flywheel_core::store_sqlite::SqliteStore;
 use flywheel_core::task::GraderType;
@@ -724,6 +724,17 @@ impl Drop for Server {
 }
 
 fn http(server: &Server, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    http_as(server, &server.token, method, path, body)
+}
+
+/// [`http`] with `bearer` (a peer credential, say) instead of the token.
+fn http_as(
+    server: &Server,
+    bearer: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
     let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -734,7 +745,7 @@ fn http(server: &Server, method: &str, path: &str, body: Option<Value>) -> (u16,
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         server.port,
-        server.token,
+        bearer,
         body.len()
     )
     .unwrap();
@@ -1440,4 +1451,152 @@ fn pending_tasks_a_running_scoped_worker_will_run_say_which() {
         ("pending".into(), Value::Null)
     );
     assert_eq!(std::fs::read_to_string(&ran).unwrap(), "alpha\ndelta\n");
+}
+
+#[test]
+fn steer_say_and_interrupt_enqueue_one_command_for_a_live_run_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let root = dir.join("steered");
+    std::fs::create_dir_all(&root).unwrap();
+    git(&root, &["init", "-q"]);
+    std::fs::write(root.join("README.md"), "steered\n").unwrap();
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "init"]);
+    let project = adopt(&fw_home(&dir), &root);
+    let at = Utc::now();
+    {
+        let store = project.store();
+        seed_run(
+            &store,
+            "task-live",
+            "run-live",
+            &[Status::Ready, Status::Running],
+            at,
+            None,
+            &[],
+        );
+        seed_run(
+            &store,
+            "task-checking",
+            "run-checking",
+            &[Status::Ready, Status::Running, Status::Validating],
+            at,
+            None,
+            &[],
+        );
+        seed_run(
+            &store,
+            "task-done",
+            "run-done",
+            &DONE,
+            at,
+            Some(Outcome::Succeeded),
+            &[],
+        );
+        seed_run(
+            &store,
+            "task-failed",
+            "run-failed",
+            &[
+                Status::Ready,
+                Status::Running,
+                Status::Validating,
+                Status::FailedValidation,
+            ],
+            at,
+            Some(Outcome::ValidationFailed),
+            &[],
+        );
+    }
+    let commands = |run: &str| -> Vec<(String, Value)> {
+        project
+            .store()
+            .pending_commands(run)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.kind, Value::Object(c.payload)))
+            .collect()
+    };
+    let server = start(&dir);
+    let (code, workspace) = http(
+        &server,
+        "POST",
+        "/api/workspaces",
+        Some(json!({ "name": "steered", "folders": [{"path": root}] })),
+    );
+    assert_eq!(code, 201, "{workspace}");
+    let say = |bearer: &str, run: &str, message: &str| {
+        http_as(
+            &server,
+            bearer,
+            "POST",
+            "/api/flywheel/steer/say",
+            Some(json!({ "folder": root, "run": run, "message": message })),
+        )
+    };
+    let interrupt = |bearer: &str, run: &str| {
+        http_as(
+            &server,
+            bearer,
+            "POST",
+            "/api/flywheel/steer/interrupt",
+            Some(json!({ "folder": root, "run": run })),
+        )
+    };
+    let token = server.token.clone();
+
+    // A running run: exactly one say carrying exactly the text.
+    let (code, steered) = say(&token, "run-live", "please add docstrings");
+    assert_eq!(code, 201, "{steered}");
+    assert_eq!(steered["kind"], "say");
+    assert_eq!(steered["task_id"], "task-live");
+    assert_eq!(
+        commands("run-live"),
+        vec![("say".to_owned(), json!({"text": "please add docstrings"}))]
+    );
+    // A validating run: exactly one interrupt.
+    let (code, steered) = interrupt(&token, "run-checking");
+    assert_eq!(code, 201, "{steered}");
+    assert_eq!(steered["kind"], "interrupt");
+    assert_eq!(
+        commands("run-checking"),
+        vec![("interrupt".to_owned(), json!({}))]
+    );
+
+    // Done, failed, and unknown runs are refused; nothing is enqueued.
+    for run in ["run-done", "run-failed"] {
+        let (code, body) = say(&token, run, "hello");
+        assert_eq!(code, 409, "{run}: {body}");
+        let (code, body) = interrupt(&token, run);
+        assert_eq!(code, 409, "{run}: {body}");
+        assert_eq!(commands(run), vec![], "{run}");
+    }
+    let (code, _) = interrupt(&token, "run-nope");
+    assert_eq!(code, 404);
+    assert_eq!(commands("run-nope"), vec![]);
+
+    // An empty message is refused.
+    for empty in ["", "   "] {
+        let (code, _) = say(&token, "run-live", empty);
+        assert_eq!(code, 400);
+    }
+    assert_eq!(commands("run-live").len(), 1);
+
+    // A peer credential is refused on both routes, enqueueing nothing.
+    let (code, issued) = http(
+        &server,
+        "POST",
+        "/api/peers",
+        Some(json!({ "name": "hub-a" })),
+    );
+    assert_eq!(code, 201, "{issued}");
+    let peer = issued["credential"].as_str().unwrap().to_owned();
+    let (code, _) = say(&peer, "run-live", "from a peer");
+    assert_eq!(code, 403);
+    let (code, _) = interrupt(&peer, "run-live");
+    assert_eq!(code, 403);
+    assert_eq!(commands("run-live").len(), 1);
+    assert_eq!(commands("run-checking").len(), 1);
 }

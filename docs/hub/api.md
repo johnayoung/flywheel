@@ -6,7 +6,7 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 
 - JSON under `/api`: `Authorization: Bearer <token>`, a login cookie, or a peer credential ([hub-security](security.md#auth)).
 - Errors `{"error"}`: 400 malformed, 404 unknown, 405 method, 409 refused by state, 422 wrong JSON shape. `cols`/`rows` 0: 120x32.
-- Tables give request bodies, status codes; a response's full shape: `curl -sH "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq`, or a verb's `--json`.
+- Tables give bodies and status codes; full response shapes: `curl -sH "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq`, or a verb's `--json`.
 
 ## Workspaces
 
@@ -109,6 +109,8 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/flywheel/autopilot/pause` | `{"folder"}` -> `{"paused","changed"}` |
 | POST | `/api/flywheel/autopilot/resume` | as `pause` |
 | POST | `/api/flywheel/autopilot/decide` | `{"folder","run","decision":"approve"/"deny","confirm":true}` + `gate`, `attempt`, `feedback` (as `fw hub autopilot`); 409 not that gate or one queued; 404 no run |
+| POST | `/api/flywheel/steer/say` | `{"folder","run","message"}` -> 201 one `fw say` command; 400 empty; 409 not running/validating; peers 403 |
+| POST | `/api/flywheel/steer/interrupt` | `{"folder","run"}`: as `say`, for `fw interrupt` |
 | POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"cols"?,"rows"?}` -> 201 the `fw worker` session; 409 running, unless `another` |
 
 Fan-outs off: 503.

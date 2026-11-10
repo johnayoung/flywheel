@@ -26,16 +26,21 @@
 
 use chrono::{DateTime, Utc};
 use flywheel_core::event_serde::{event_kind, event_payload, format_timestamp};
-use flywheel_core::events::{DomainEvent, DomainEventKind, DomainEventPayload};
-use flywheel_core::lifecycle::{Attempt, Lifecycle, Status};
-use flywheel_core::store::{
-    DomainEventStore, GraderResultRecord, GraderResultStore, LifecycleFilter, LifecycleStore,
-    StoreError, TaskStore,
+use flywheel_core::events::{
+    DomainEvent, DomainEventKind, DomainEventPayload, HeldOutGateEvaluated,
 };
-use flywheel_core::task::Task;
+use flywheel_core::lifecycle::{Attempt, Lifecycle, Status, StopReason};
+use flywheel_core::redaction::{Redactor, default_policy};
+use flywheel_core::store::{
+    AuditRecord, DomainEventStore, EventRecord, GraderResultRecord, GraderResultStore,
+    LifecycleFilter, LifecycleStore, StoreError, TaskStore,
+};
+use flywheel_core::task::{Grader, GraderType, Task};
+use regex::Regex;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::LazyLock;
 
 /// A run is history once it can no longer move on its own. INTERRUPTED and
 /// AWAITING_APPROVAL are parked-but-live (an operator owes an action) and
@@ -99,6 +104,119 @@ pub struct AttemptSummary {
     pub cost_usd: f64,
     pub error: String,
     pub grader_results: Vec<GraderResultRecord>,
+    pub checks: Vec<CheckResult>,
+}
+
+/// What kind of check a [`CheckResult`] reports: a task grader's type, or a
+/// held-out gate oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    Command,
+    Transcript,
+    Rubric,
+    Manual,
+    HeldOut,
+}
+
+impl CheckKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CheckKind::Command => "command",
+            CheckKind::Transcript => "transcript",
+            CheckKind::Rubric => "rubric",
+            CheckKind::Manual => "manual",
+            CheckKind::HeldOut => "held_out",
+        }
+    }
+}
+
+impl From<GraderType> for CheckKind {
+    fn from(grader_type: GraderType) -> Self {
+        match grader_type {
+            GraderType::Command => CheckKind::Command,
+            GraderType::Transcript => CheckKind::Transcript,
+            GraderType::Rubric => CheckKind::Rubric,
+            GraderType::Manual => CheckKind::Manual,
+        }
+    }
+}
+
+/// One check's verdict on one attempt.
+///
+/// `NotRun` is derived, never stored (spec 00084 D-2): the harness writes a
+/// receipt for every grader it runs and stops at the first failure, so a
+/// task check without a receipt on its attempt never ran. `JudgeFaulted` is
+/// the rubric check whose judge itself failed, read from the attempt's
+/// recorded `judge_failed` stop reason (the harness writes no receipt).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckStatus {
+    Passed,
+    Failed,
+    JudgeFaulted,
+    NotRun,
+}
+
+impl CheckStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            CheckStatus::Passed => "passed",
+            CheckStatus::Failed => "failed",
+            CheckStatus::JudgeFaulted => "judge_faulted",
+            CheckStatus::NotRun => "not_run",
+        }
+    }
+
+    fn from_passed(passed: bool) -> Self {
+        if passed {
+            CheckStatus::Passed
+        } else {
+            CheckStatus::Failed
+        }
+    }
+}
+
+/// One entry of an attempt's `checks` list (spec 00084 testability
+/// contract). Absent values are omitted from the JSON.
+///
+/// For a command check that ran: `exit_code` / `termination` / `signal` /
+/// `timeout_seconds` / `duration_ms` exactly as the receipt stored them,
+/// and redacted `stdout_tail` / `stderr_tail`. A rubric check carries the
+/// judge's redacted `summary`. A held-out check (`held_out` true) carries
+/// only its name, verdict, and the gate's redacted combined output excerpt
+/// in `stdout_tail` -- never the oracle's command or path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckResult {
+    pub name: Option<String>,
+    pub kind: CheckKind,
+    pub status: CheckStatus,
+    pub exit_code: Option<i64>,
+    pub termination: Option<String>,
+    pub signal: Option<i64>,
+    pub timeout_seconds: Option<f64>,
+    pub duration_ms: Option<u64>,
+    pub stdout_tail: Option<String>,
+    pub stderr_tail: Option<String>,
+    pub summary: Option<String>,
+    pub held_out: bool,
+}
+
+impl CheckResult {
+    fn new(name: Option<String>, kind: CheckKind, status: CheckStatus) -> Self {
+        Self {
+            name,
+            kind,
+            status,
+            exit_code: None,
+            termination: None,
+            signal: None,
+            timeout_seconds: None,
+            duration_ms: None,
+            stdout_tail: None,
+            stderr_tail: None,
+            summary: None,
+            held_out: kind == CheckKind::HeldOut,
+        }
+    }
 }
 
 /// Everything `show` renders for one run.
@@ -390,6 +508,199 @@ fn landing_decisions<S: DomainEventStore + ?Sized>(store: &S, run_id: &str) -> V
         .unwrap_or_default()
 }
 
+/// Pass `text` through `redactor` the way the audit stream scrubs an event
+/// payload's string leaves.
+fn redact_text(redactor: &dyn Redactor, text: &str) -> String {
+    let mut payload = Map::new();
+    payload.insert("text".to_owned(), Value::String(text.to_owned()));
+    let record = AuditRecord::Event(EventRecord {
+        run_id: String::new(),
+        ts: DateTime::<Utc>::UNIX_EPOCH,
+        kind: "check_output".to_owned(),
+        payload,
+        attempt_number: None,
+        id: None,
+        sequence: None,
+    });
+    match redactor.redact(&record) {
+        AuditRecord::Event(redacted) => redacted
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_default(),
+        AuditRecord::SdkMessage(_) => String::new(),
+    }
+}
+
+/// Any path-like token naming a file under a held-out root
+/// (`<project>/held-out/...`); oracles must live directly under it.
+static HELD_OUT_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"[^\s'"`]*held-out/[^\s'"`:]*"#).expect("static held-out path pattern")
+});
+
+/// Redact a held-out gate excerpt: the default secret patterns, then any
+/// held-out oracle path an oracle's own output (e.g. a shell error) echoed.
+fn redact_held_out_excerpt(redactor: &dyn Redactor, excerpt: &str) -> String {
+    let redacted = redact_text(redactor, excerpt);
+    HELD_OUT_PATH
+        .replace_all(&redacted, "[held-out oracle]")
+        .into_owned()
+}
+
+/// One stored receipt as a check entry, its outputs redacted.
+fn check_from_receipt(record: &GraderResultRecord, redactor: &dyn Redactor) -> CheckResult {
+    let mut check = CheckResult::new(
+        record.grader_name.clone(),
+        record.grader_type.into(),
+        CheckStatus::from_passed(record.passed),
+    );
+    check.duration_ms = Some(record.duration_ms);
+    let payload = &record.payload;
+    let text = |key: &str| {
+        payload
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|s| redact_text(redactor, s))
+    };
+    match record.grader_type {
+        GraderType::Command => {
+            check.exit_code = payload.get("exit_code").and_then(Value::as_i64);
+            check.termination = payload
+                .get("termination")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            check.signal = payload.get("signal").and_then(Value::as_i64);
+            check.timeout_seconds = payload.get("timeout_seconds").and_then(Value::as_f64);
+            check.stdout_tail = text("stdout_tail");
+            check.stderr_tail = text("stderr_tail");
+        }
+        GraderType::Rubric => check.summary = text("summary"),
+        GraderType::Transcript | GraderType::Manual => {}
+    }
+    check
+}
+
+/// The ordinal of the rubric check whose judge failed on `attempt`, from its
+/// recorded `judge_failed` stop reason: the unreceipted rubric the reason
+/// names, else the first unreceipted rubric in task order (rubrics run in
+/// task order and the judge failure ends the attempt).
+fn judge_faulted_ordinal(
+    task: &Task,
+    attempt: &Attempt,
+    receipts: &[GraderResultRecord],
+) -> Option<usize> {
+    let Some(StopReason::JudgeFailed { check }) = &attempt.stop_reason else {
+        return None;
+    };
+    let unreceipted: Vec<(usize, &Grader)> = task
+        .graders
+        .iter()
+        .enumerate()
+        .filter(|(index, grader)| {
+            matches!(grader, Grader::Rubric(_)) && receipt_for(receipts, *index, grader).is_none()
+        })
+        .collect();
+    unreceipted
+        .iter()
+        .find(|(_, grader)| grader.name() == Some(check.as_str()))
+        .or_else(|| unreceipted.first())
+        .map(|(index, _)| *index)
+}
+
+/// The receipt the harness wrote for the task grader at `index`, if any.
+fn receipt_for<'a>(
+    receipts: &'a [GraderResultRecord],
+    index: usize,
+    grader: &Grader,
+) -> Option<&'a GraderResultRecord> {
+    receipts.iter().rev().find(|r| {
+        usize::try_from(r.ordinal).is_ok_and(|ordinal| ordinal == index)
+            && r.grader_type == grader.grader_type()
+    })
+}
+
+/// Every check of one attempt (spec 00084): the pinned task's checks in task
+/// order, then the held-out gate's checks for this attempt.
+///
+/// A task check reads its receipt; without one it is `judge_faulted` when
+/// the attempt's stop reason names its judge's failure, else `not_run`. When
+/// the run's task pin cannot resolve, the attempt's receipts stand in, in
+/// ordinal order (no not-run checks can be derived without the task).
+pub fn attempt_checks(
+    task: Option<&Task>,
+    attempt: &Attempt,
+    receipts: &[GraderResultRecord],
+    gate: Option<&HeldOutGateEvaluated>,
+    redactor: &dyn Redactor,
+) -> Vec<CheckResult> {
+    let mut checks: Vec<CheckResult> = match task {
+        Some(task) => {
+            let faulted = judge_faulted_ordinal(task, attempt, receipts);
+            task.graders
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, grader)| match receipt_for(receipts, index, grader) {
+                        Some(record) => check_from_receipt(record, redactor),
+                        None => {
+                            let status = if faulted == Some(index) {
+                                CheckStatus::JudgeFaulted
+                            } else {
+                                CheckStatus::NotRun
+                            };
+                            CheckResult::new(
+                                grader.name().map(str::to_owned),
+                                grader.grader_type().into(),
+                                status,
+                            )
+                        }
+                    },
+                )
+                .collect()
+        }
+        None => receipts
+            .iter()
+            .map(|record| check_from_receipt(record, redactor))
+            .collect(),
+    };
+    if let Some(gate) = gate {
+        checks.extend(gate.receipts.iter().map(|receipt| {
+            let mut check = CheckResult::new(
+                receipt.grader_name.clone(),
+                CheckKind::HeldOut,
+                CheckStatus::from_passed(receipt.passed),
+            );
+            check.stdout_tail = Some(redact_held_out_excerpt(redactor, &receipt.output_excerpt));
+            check
+        }));
+    }
+    checks
+}
+
+/// The held-out gate verdict that graded attempt `number`: the latest gate
+/// event stamped with that attempt, or -- the gate runs after the run's
+/// final attempt and records no attempt number -- the latest unstamped one
+/// when `number` is the final attempt.
+fn gate_for_attempt(
+    decisions: &[DomainEvent],
+    number: u32,
+    is_final: bool,
+) -> Option<&HeldOutGateEvaluated> {
+    decisions
+        .iter()
+        .rev()
+        .find_map(|event| match &event.payload {
+            DomainEventPayload::HeldOutGateEvaluated(gate)
+                if event.attempt_number == Some(number)
+                    || (event.attempt_number.is_none() && is_final) =>
+            {
+                Some(gate)
+            }
+            _ => None,
+        })
+}
+
 /// Assemble the full `show` payload for one run, or `None`.
 ///
 /// Unlike [`collect_history_rows`] this accepts any status -- an operator
@@ -409,8 +720,16 @@ where
     let run = history_run_from_lifecycle(&lifecycle);
     let phase = derive_phase(&run.source, &run.task_id, fallback_phases);
 
+    let task = store.load_task_for_run(run_id)?;
+    let decisions = landing_decisions(store, run_id);
+    let redactor = default_policy(None);
+    let final_number = lifecycle.attempts.iter().map(|a| a.number).max();
+
     let mut attempts = Vec::with_capacity(lifecycle.attempts.len());
     for a in &lifecycle.attempts {
+        let receipts = store.list_grader_results(run_id, a.number)?;
+        let gate = gate_for_attempt(&decisions, a.number, Some(a.number) == final_number);
+        let checks = attempt_checks(task.as_ref(), a, &receipts, gate, &redactor);
         attempts.push(AttemptSummary {
             number: a.number,
             outcome: a
@@ -423,7 +742,8 @@ where
             tokens: a.total_tokens(),
             cost_usd: a.total_cost_usd,
             error: a.error.clone(),
-            grader_results: store.list_grader_results(run_id, a.number)?,
+            grader_results: receipts,
+            checks,
         });
     }
     // Every attempt's receipts, not just the last one's. Each record
@@ -444,12 +764,12 @@ where
     Ok(Some(RunDetail {
         run,
         phase,
-        task: store.load_task_for_run(run_id)?,
+        task,
         agent_output: lifecycle.agent_output.clone(),
         attempts,
         grader_results,
         related_runs: related,
-        decisions: landing_decisions(store, run_id),
+        decisions,
     }))
 }
 
@@ -568,6 +888,32 @@ fn grader_result_to_json(g: &GraderResultRecord) -> Value {
         "passed": g.passed,
         "duration_ms": g.duration_ms,
     })
+}
+
+/// One `checks` entry as the spec 00084 contract object; absent optional
+/// values are omitted.
+pub fn check_to_json(check: &CheckResult) -> Value {
+    let mut map = Map::new();
+    map.insert("name".to_owned(), json!(check.name));
+    map.insert("kind".to_owned(), json!(check.kind.as_str()));
+    map.insert("status".to_owned(), json!(check.status.as_str()));
+    let optional = [
+        ("exit_code", check.exit_code.map(Value::from)),
+        ("termination", check.termination.clone().map(Value::from)),
+        ("signal", check.signal.map(Value::from)),
+        ("timeout_seconds", check.timeout_seconds.map(Value::from)),
+        ("duration_ms", check.duration_ms.map(Value::from)),
+        ("stdout_tail", check.stdout_tail.clone().map(Value::from)),
+        ("stderr_tail", check.stderr_tail.clone().map(Value::from)),
+        ("summary", check.summary.clone().map(Value::from)),
+    ];
+    for (key, value) in optional {
+        if let Some(value) = value {
+            map.insert(key.to_owned(), value);
+        }
+    }
+    map.insert("held_out".to_owned(), json!(check.held_out));
+    Value::Object(map)
 }
 
 /// One landing-stage decision event as a JSON object: a `kind`
@@ -735,6 +1081,7 @@ pub fn run_detail_to_json(detail: &RunDetail) -> Value {
             "cost_usd": a.cost_usd,
             "error": a.error,
             "grader_results": a.grader_results.iter().map(grader_result_to_json).collect::<Vec<_>>(),
+            "checks": a.checks.iter().map(check_to_json).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "grader_results": detail.grader_results.iter().map(grader_result_to_json).collect::<Vec<_>>(),
         "related_runs": detail.related_runs.iter().map(history_run_to_json).collect::<Vec<_>>(),
@@ -1519,6 +1866,15 @@ attempts :
           "passed": false,
           "duration_ms": 1
         }
+      ],
+      "checks": [
+        {
+          "name": "alpha",
+          "kind": "command",
+          "status": "failed",
+          "duration_ms": 1,
+          "held_out": false
+        }
       ]
     },
     {
@@ -1547,6 +1903,36 @@ attempts :
           "grader_name": null,
           "passed": true,
           "duration_ms": 1
+        }
+      ],
+      "checks": [
+        {
+          "name": "alpha",
+          "kind": "command",
+          "status": "passed",
+          "duration_ms": 1,
+          "held_out": false
+        },
+        {
+          "name": null,
+          "kind": "command",
+          "status": "passed",
+          "duration_ms": 1,
+          "held_out": false
+        },
+        {
+          "name": "oracle",
+          "kind": "held_out",
+          "status": "passed",
+          "stdout_tail": "3 passed\nin 0.1s",
+          "held_out": true
+        },
+        {
+          "name": null,
+          "kind": "held_out",
+          "status": "failed",
+          "stdout_tail": "",
+          "held_out": true
         }
       ]
     }
@@ -1676,7 +2062,8 @@ attempts :
       "tokens": 7,
       "cost_usd": 0.0001,
       "error": "",
-      "grader_results": []
+      "grader_results": [],
+      "checks": []
     }
   ],
   "grader_results": [],
@@ -1688,6 +2075,419 @@ attempts :
             .unwrap();
         let json = serde_json::to_string_pretty(&run_detail_to_json(&detail)).unwrap();
         assert_eq!(json, expected_open);
+    }
+
+    // --- per-check results (spec 00084) ----------------------------------
+
+    fn named_cmd(name: &str) -> Grader {
+        Grader::Command(flywheel_core::task::CommandGrader {
+            run: format!("run-{name}"),
+            name: Some(name.to_owned()),
+        })
+    }
+
+    fn named_rubric(name: &str) -> Grader {
+        let mut rubric = flywheel_core::task::RubricGrader::new(vec!["ok".to_owned()]).unwrap();
+        rubric.name = Some(name.to_owned());
+        Grader::Rubric(rubric)
+    }
+
+    /// Seed a run pinned to `task` with `attempts`, returning nothing; the
+    /// caller appends receipts and events.
+    fn seed_pinned_run(store: &InMemoryStore, run_id: &str, task: &Task, attempts: &[Attempt]) {
+        let digest = store.save_task(task, t0()).unwrap();
+        let mut lc = Lifecycle::new(&task.id).with_run_id(run_id);
+        lc.task_content_hash = digest;
+        lc.transition_to(Status::Ready, "", Some(t0())).unwrap();
+        store.create_lifecycle(&lc).unwrap();
+        for a in attempts {
+            store.save_attempt(run_id, a, None).unwrap();
+        }
+    }
+
+    fn receipt(
+        run_id: &str,
+        ordinal: u32,
+        grader_type: GraderType,
+        name: &str,
+        passed: bool,
+        payload: Value,
+    ) -> GraderResultRecord {
+        GraderResultRecord {
+            grader_type,
+            grader_name: Some(name.to_owned()),
+            duration_ms: 40 + u64::from(ordinal),
+            payload: payload.as_object().cloned().unwrap_or_default(),
+            ..grader(run_id, 1, ordinal, passed, None)
+        }
+    }
+
+    fn checks_json(store: &InMemoryStore, run_id: &str) -> Vec<Value> {
+        let detail = collect_run_detail(store, run_id, &BTreeMap::new())
+            .unwrap()
+            .unwrap();
+        let json = run_detail_to_json(&detail);
+        json["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["checks"].clone())
+            .collect()
+    }
+
+    fn statuses(checks: &Value) -> Vec<(String, String)> {
+        checks
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().unwrap_or("").to_owned(),
+                    c["status"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(n, s)| ((*n).to_owned(), (*s).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn checks_list_every_task_check_in_task_order_marking_unrun_ones_not_run() {
+        let store = InMemoryStore::new();
+        let task = Task::new(
+            "g",
+            vec![
+                named_cmd("first"),
+                named_rubric("judge"),
+                named_cmd("second"),
+                named_cmd("third"),
+            ],
+        )
+        .with_id("t-order");
+        seed_pinned_run(&store, "run-o", &task, &[attempt("run-o", 1, 0, 0.0, 0)]);
+        let exited = |code: i64| json!({"exit_code": code, "termination": "exited", "stdout_tail": "", "stderr_tail": ""});
+        store
+            .append_grader_result(&receipt(
+                "run-o",
+                0,
+                GraderType::Command,
+                "first",
+                true,
+                exited(0),
+            ))
+            .unwrap();
+        store
+            .append_grader_result(&receipt(
+                "run-o",
+                2,
+                GraderType::Command,
+                "second",
+                false,
+                exited(1),
+            ))
+            .unwrap();
+
+        let checks = checks_json(&store, "run-o");
+        assert_eq!(
+            statuses(&checks[0]),
+            pairs(&[
+                ("first", "passed"),
+                ("judge", "not_run"),
+                ("second", "failed"),
+                ("third", "not_run"),
+            ])
+        );
+        let kinds: Vec<&str> = checks[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["command", "rubric", "command", "command"]);
+        // A not-run check carries no fabricated execution values.
+        let unrun = &checks[0][3];
+        assert_eq!(
+            unrun,
+            &json!({"name": "third", "kind": "command", "status": "not_run", "held_out": false})
+        );
+    }
+
+    #[test]
+    fn checks_report_judge_faulted_only_from_the_recorded_stop_reason() {
+        let store = InMemoryStore::new();
+        let task = Task::new(
+            "g",
+            vec![
+                named_cmd("build"),
+                named_rubric("style"),
+                named_rubric("design"),
+                named_rubric("docs"),
+            ],
+        )
+        .with_id("t-judge");
+        let mut faulted = attempt("run-j", 1, 0, 0.0, 0);
+        faulted.outcome = Some(Outcome::InternalError);
+        faulted.error = "rubric judge failed: design: timeout".to_owned();
+        faulted.stop_reason = Some(StopReason::JudgeFailed {
+            check: "design".to_owned(),
+        });
+        // Same error text, no recorded stop reason: never judge_faulted.
+        let mut unrecorded = attempt("run-j", 2, 0, 0.0, 0);
+        unrecorded.outcome = Some(Outcome::InternalError);
+        unrecorded.error = faulted.error.clone();
+        seed_pinned_run(&store, "run-j", &task, &[faulted, unrecorded]);
+        for number in [1, 2] {
+            let ok = json!({"exit_code": 0, "termination": "exited", "stdout_tail": "", "stderr_tail": ""});
+            store
+                .append_grader_result(&GraderResultRecord {
+                    attempt_number: number,
+                    ..receipt("run-j", 0, GraderType::Command, "build", true, ok)
+                })
+                .unwrap();
+            store
+                .append_grader_result(&GraderResultRecord {
+                    attempt_number: number,
+                    ..receipt(
+                        "run-j",
+                        1,
+                        GraderType::Rubric,
+                        "style",
+                        true,
+                        json!({"summary": "reads cleanly"}),
+                    )
+                })
+                .unwrap();
+        }
+
+        let checks = checks_json(&store, "run-j");
+        assert_eq!(
+            statuses(&checks[0]),
+            pairs(&[
+                ("build", "passed"),
+                ("style", "passed"),
+                ("design", "judge_faulted"),
+                ("docs", "not_run"),
+            ])
+        );
+        assert_eq!(checks[0][1]["summary"], "reads cleanly");
+        assert_eq!(
+            statuses(&checks[1]),
+            pairs(&[
+                ("build", "passed"),
+                ("style", "passed"),
+                ("design", "not_run"),
+                ("docs", "not_run"),
+            ])
+        );
+    }
+
+    #[test]
+    fn checks_carry_the_stored_exit_termination_signal_timeout_and_duration() {
+        let store = InMemoryStore::new();
+        let task = Task::new(
+            "g",
+            vec![
+                named_cmd("zero"),
+                named_cmd("three"),
+                named_cmd("killed"),
+                named_cmd("slow"),
+            ],
+        )
+        .with_id("t-term");
+        seed_pinned_run(&store, "run-t", &task, &[attempt("run-t", 1, 0, 0.0, 0)]);
+        let payloads = [
+            (
+                "zero",
+                true,
+                json!({"exit_code": 0, "termination": "exited", "stdout_tail": "z", "stderr_tail": ""}),
+            ),
+            (
+                "three",
+                false,
+                json!({"exit_code": 3, "termination": "exited", "stdout_tail": "", "stderr_tail": "e"}),
+            ),
+            (
+                "killed",
+                false,
+                json!({"exit_code": -9, "termination": "signal", "signal": 9, "stdout_tail": "", "stderr_tail": ""}),
+            ),
+            (
+                "slow",
+                false,
+                json!({"exit_code": null, "termination": "timeout", "timeout_seconds": 2.5, "stdout_tail": "", "stderr_tail": ""}),
+            ),
+        ];
+        for (ordinal, (name, passed, payload)) in payloads.into_iter().enumerate() {
+            store
+                .append_grader_result(&receipt(
+                    "run-t",
+                    u32::try_from(ordinal).unwrap(),
+                    GraderType::Command,
+                    name,
+                    passed,
+                    payload,
+                ))
+                .unwrap();
+        }
+
+        let checks = checks_json(&store, "run-t");
+        let stored = store.list_grader_results("run-t", 1).unwrap();
+        for (check, record) in checks[0].as_array().unwrap().iter().zip(&stored) {
+            for key in ["exit_code", "termination", "signal", "timeout_seconds"] {
+                let expected = record.payload.get(key).cloned().unwrap_or(Value::Null);
+                assert_eq!(
+                    check.get(key).cloned().unwrap_or(Value::Null),
+                    expected,
+                    "{key} of {}",
+                    check["name"]
+                );
+            }
+            assert_eq!(check["duration_ms"], json!(record.duration_ms));
+        }
+        assert_eq!(checks[0][0]["stdout_tail"], "z");
+        assert_eq!(checks[0][1]["stderr_tail"], "e");
+        assert_eq!(checks[0][2]["signal"], 9);
+        assert_eq!(checks[0][3]["timeout_seconds"], 2.5);
+        assert!(checks[0][3].get("exit_code").is_none());
+    }
+
+    #[test]
+    fn checks_redact_secrets_from_tails_and_keep_the_surrounding_output() {
+        let store = InMemoryStore::new();
+        let task = Task::new("g", vec![named_cmd("leaky"), named_rubric("judge")]).with_id("t-r");
+        seed_pinned_run(&store, "run-r", &task, &[attempt("run-r", 1, 0, 0.0, 0)]);
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        store
+            .append_grader_result(&receipt(
+                "run-r",
+                0,
+                GraderType::Command,
+                "leaky",
+                true,
+                json!({
+                    "exit_code": 0,
+                    "termination": "exited",
+                    "stdout_tail": format!("marker-out-7f3a token={secret}\n"),
+                    "stderr_tail": format!("marker-err-7f3a {secret}"),
+                }),
+            ))
+            .unwrap();
+        store
+            .append_grader_result(&receipt(
+                "run-r",
+                1,
+                GraderType::Rubric,
+                "judge",
+                true,
+                json!({"summary": format!("marker-sum-7f3a saw {secret}")}),
+            ))
+            .unwrap();
+
+        let checks = checks_json(&store, "run-r");
+        let rendered = checks[0].to_string();
+        assert!(!rendered.contains(secret), "{rendered}");
+        assert!(
+            checks[0][0]["stdout_tail"]
+                .as_str()
+                .unwrap()
+                .contains("marker-out-7f3a")
+        );
+        assert!(
+            checks[0][0]["stderr_tail"]
+                .as_str()
+                .unwrap()
+                .contains("marker-err-7f3a")
+        );
+        assert!(
+            checks[0][1]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("marker-sum-7f3a")
+        );
+    }
+
+    #[test]
+    fn checks_include_held_out_gate_results_on_the_gated_attempt_without_the_oracle() {
+        let store = InMemoryStore::new();
+        let task = Task::new("g", vec![named_cmd("unit")]).with_id("t-h");
+        let mut first = attempt("run-h", 1, 0, 0.0, 0);
+        first.outcome = Some(Outcome::ValidationFailed);
+        seed_pinned_run(
+            &store,
+            "run-h",
+            &task,
+            &[first, attempt("run-h", 2, 0, 0.0, 0)],
+        );
+        let ok =
+            json!({"exit_code": 0, "termination": "exited", "stdout_tail": "", "stderr_tail": ""});
+        store
+            .append_grader_result(&GraderResultRecord {
+                attempt_number: 2,
+                ..receipt("run-h", 0, GraderType::Command, "unit", true, ok)
+            })
+            .unwrap();
+        let oracle = "/home/u/.flywheel/projects/p/held-out/oracle-q9z.sh";
+        let gate = DomainEventPayload::HeldOutGateEvaluated(HeldOutGateEvaluated {
+            outcome: "fail".to_owned(),
+            reason: "held-out grader failed".to_owned(),
+            receipts: vec![
+                GateGraderReceipt {
+                    grader_name: Some("hidden-pass".to_owned()),
+                    passed: true,
+                    output_excerpt: "marker-ok-55 all good".to_owned(),
+                },
+                GateGraderReceipt {
+                    grader_name: Some("hidden-fail".to_owned()),
+                    passed: false,
+                    output_excerpt: format!(
+                        "marker-bad-55\n{oracle}: line 3: sk-ant-abcdefghijklmnopqrstu: not found"
+                    ),
+                },
+            ],
+        });
+        let version = store.load_lifecycle("run-h").unwrap().unwrap().version;
+        store
+            .append_domain_event(&DomainEvent::new("run-h", t0(), gate), version)
+            .unwrap();
+
+        let checks = checks_json(&store, "run-h");
+        assert_eq!(statuses(&checks[0]), pairs(&[("unit", "not_run")]));
+        assert_eq!(
+            statuses(&checks[1]),
+            pairs(&[
+                ("unit", "passed"),
+                ("hidden-pass", "passed"),
+                ("hidden-fail", "failed"),
+            ])
+        );
+        for held in &checks[1].as_array().unwrap()[1..] {
+            assert_eq!(held["kind"], "held_out");
+            assert_eq!(held["held_out"], true);
+        }
+        assert_eq!(checks[1][0]["held_out"], false);
+        let excerpt = checks[1][2]["stdout_tail"].as_str().unwrap();
+        assert!(excerpt.contains("marker-bad-55"), "{excerpt}");
+        assert!(excerpt.contains("not found"), "{excerpt}");
+        let rendered = Value::Array(checks).to_string();
+        assert!(!rendered.contains("oracle-q9z"), "{rendered}");
+        assert!(!rendered.contains("held-out/"), "{rendered}");
+        assert!(
+            !rendered.contains("sk-ant-abcdefghijklmnopqrstu"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn checks_are_empty_for_a_task_without_checks() {
+        let store = InMemoryStore::new();
+        let task = Task::new("g", Vec::new()).with_id("t-empty");
+        seed_pinned_run(&store, "run-e", &task, &[attempt("run-e", 1, 0, 0.0, 0)]);
+        assert_eq!(checks_json(&store, "run-e"), vec![json!([])]);
     }
 
     #[test]

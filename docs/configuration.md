@@ -65,6 +65,7 @@ Distinct features that a config key would not fit are flags on the verb that use
 | `--sandbox worktree\|container` | `fw worker` | the execution backend; [container-backend.md](container-backend.md) |
 | `--image IMAGE` | `fw worker --sandbox container` | the container image (required there) |
 | `--agent claude-code\|codex` | `fw worker`, `fw autopilot` | the agent adapter; [agent-harness.md](agent-harness.md) |
+| `--account NAME` | `fw worker` (worktree backend, claude-code) | the Claude account token (`$FLYWHEEL_HOME/hub/claude-accounts/NAME.token`, read at each agent spawn); no config key or env var selects it; [cli.md](cli.md) |
 
 A pool (`--concurrency > 1`) hands every flag to its members. Existing path flags (`--db`, `--tasks-dir`, `--sandbox-root`) still name paths explicitly.
 

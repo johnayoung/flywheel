@@ -84,6 +84,11 @@ pub struct AgentConfiguration {
     pub command_override: Option<Vec<String>>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Variables removed from the agent process's environment (after
+    /// `environment` is merged over the inherited one): a caller handing the
+    /// agent one credential removes the ones that would outrank it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_environment: Vec<String>,
     #[serde(default)]
     pub adapter_options: AdapterOptions,
 }
@@ -101,6 +106,7 @@ impl AgentConfiguration {
             max_turns: None,
             command_override: None,
             environment: BTreeMap::new(),
+            denied_environment: Vec::new(),
             adapter_options: AdapterOptions::new(),
         }
     }

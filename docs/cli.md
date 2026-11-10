@@ -178,6 +178,7 @@ The blessed headless drain, delegated in-process to the worktree daemon (`main`,
 | `--source`, `--repo`, `--label`, `--require-triage-receipt` | GitHub work sources ([configuration.md](configuration.md#verb-flags)) |
 | `--sandbox container --image IMAGE` | the container backend ([container-backend.md](container-backend.md)) |
 | `--agent ID` | agent adapter (`claude-code` default, `codex`) |
+| `--account NAME` | run every Claude agent under that account: `$FLYWHEEL_HOME/hub/claude-accounts/NAME.token` (`fw hub account add`), re-read at each agent spawn, as `CLAUDE_CODE_OAUTH_TOKEN` with `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` removed. Exit 2 before any claim on an invalid name, a missing token file, `--sandbox container`, or `--agent codex`; pool members inherit it |
 | `--concurrency N` | pool size (overrides `concurrency`; default 1) |
 | `--model` | agent model (overrides `model`) |
 | `--max-turns`, `--max-retries` | per-run ceilings |

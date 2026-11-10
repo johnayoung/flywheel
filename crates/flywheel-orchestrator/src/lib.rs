@@ -9,6 +9,7 @@
 //! `docs/strategy.md`, `docs/held-out-gate.md`, `docs/configuration.md`,
 //! `docs/autopilot.md`.
 
+pub mod account;
 pub mod autopilot;
 pub mod autopilot_activity;
 pub mod autopilot_context;

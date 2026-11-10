@@ -1808,6 +1808,24 @@ mod tests {
     }
 
     #[test]
+    fn worker_account_pool_members_inherit_the_account() {
+        let args = WorkerArgs {
+            run: flywheel_orchestrator::policy::RunFlags {
+                account: Some("work".into()),
+                ..Default::default()
+            },
+            ..full_args()
+        };
+        let argv = pool_member_argv(&program(), &args, &[], "fleet-0", None);
+        assert!(argv.iter().any(|a| a == "--account=work"), "{argv:?}");
+        let plain = pool_member_argv(&program(), &full_args(), &[], "fleet-0", None);
+        assert!(
+            !plain.iter().any(|a| a.starts_with("--account")),
+            "{plain:?}"
+        );
+    }
+
+    #[test]
     fn pool_member_argv_forwards_run_knobs() {
         let args = WorkerArgs {
             max_turns: 9,

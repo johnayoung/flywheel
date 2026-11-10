@@ -50,6 +50,7 @@ pub fn sandbox_agent_primitives(
         exec_auto_allow: sandbox.exec.auto_allow,
         agent_env: resolve_agent_env(&sandbox.env, Some(environ)),
         grader_env: resolve_grader_env(&sandbox.env, Some(environ)),
+        credential: policy.and_then(|p| p.agent_credential.clone()),
     }
 }
 

@@ -32,7 +32,9 @@
 //! normalized agent events ([`flywheel_agents::AgentEvent`]) rather than SDK
 //! message objects.
 
-use crate::agents_invoke::{AgentsInvoker, ColdSession, InvokeFn, MessageObserver};
+use crate::agents_invoke::{
+    AgentCredential, AgentsInvoker, ColdSession, InvokeFn, MessageObserver,
+};
 use crate::deadline_config::DeadlineConfig;
 use crate::event_serde::format_timestamp;
 use crate::grader_rubric::{AgentsJudgeInvoke, JudgeInvoke};
@@ -632,6 +634,10 @@ pub struct AgentOptions {
     pub transport: Option<String>,
     /// Replace the agent's launch argv (the test fixture and container seam).
     pub command_override: Option<Vec<String>>,
+    /// The credential every agent spawn of the run (task iterations, the
+    /// rubric judge, the recovery summarizer) authenticates with, read at
+    /// each spawn; `None` leaves the inherited environment's auth as is.
+    pub credential: Option<AgentCredential>,
 }
 
 impl Default for AgentOptions {
@@ -651,6 +657,7 @@ impl Default for AgentOptions {
             agent_env: BTreeMap::new(),
             transport: None,
             command_override: None,
+            credential: None,
         }
     }
 }
@@ -740,7 +747,9 @@ pub fn make_claude_code_invoke(
 ) -> InvokeFn {
     let configuration = build_agent_configuration(agent_id, options);
     let current_attempt: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
-    let mut invoker = AgentsInvoker::new(configuration, sandbox).with_host(Arc::new(LocalHost));
+    let mut invoker = AgentsInvoker::new(configuration, sandbox)
+        .with_host(Arc::new(LocalHost))
+        .with_credential(options.credential.clone());
     if let Some(route) = control {
         let mut plane = ControlPlane::new(route.store, route.run_id.clone());
         if let Some(sink) = telemetry_sink {
@@ -1203,9 +1212,12 @@ async fn drive_run(
                 .rubric_judge_max_turns
                 .unwrap_or(HarnessConfig::default().rubric_judge_max_turns);
             let transport = options.agent.transport.as_deref();
-            let mut judge_session = ColdSession::new(agent_id, None, judge_max_turns);
+            let credential = options.agent.credential.clone();
+            let mut judge_session = ColdSession::new(agent_id, None, judge_max_turns)
+                .with_credential(credential.clone());
             let mut summarizer_session =
-                ColdSession::new(agent_id, None, DEFAULT_SUMMARIZER_MAX_TURNS);
+                ColdSession::new(agent_id, None, DEFAULT_SUMMARIZER_MAX_TURNS)
+                    .with_credential(credential);
             if let Some(transport) = transport {
                 judge_session = judge_session.with_transport(transport);
                 summarizer_session = summarizer_session.with_transport(transport);
@@ -2887,6 +2899,7 @@ mod tests {
             agent_env: BTreeMap::from([("FOO".to_owned(), "bar".to_owned())]),
             transport: Some("cli".into()),
             command_override: Some(strings(&["/bin/true"])),
+            credential: None,
         };
         let configuration = build_agent_configuration("claude-code", &options);
         assert_eq!(configuration.model_id.as_deref(), Some("claude-sonnet-4-5"));

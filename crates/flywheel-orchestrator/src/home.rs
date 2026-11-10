@@ -9,6 +9,7 @@
 //! $FLYWHEEL_HOME/config.toml              user config
 //! $FLYWHEEL_HOME/trust.json               trust approvals
 //! $FLYWHEEL_HOME/hub/                     hub state
+//!   claude-accounts/<name>.token          Claude account tokens (`fw worker --account`)
 //! $FLYWHEEL_HOME/projects/<id>/
 //!   meta.json                             path, git common dir, remote, first/last seen
 //!   config.toml                           personal per-project overrides
@@ -37,6 +38,9 @@ use serde::{Deserialize, Serialize};
 
 /// The environment variable naming the flywheel home.
 pub const HOME_ENV: &str = "FLYWHEEL_HOME";
+/// The Claude account token directory under the hub state dir (mirrors
+/// `flywheel_hub::accounts::DIR`; a test in the `flywheel` crate pins them).
+pub const CLAUDE_ACCOUNTS_DIRNAME: &str = "claude-accounts";
 /// The home directory name under `$HOME` when [`HOME_ENV`] is unset.
 pub const DEFAULT_HOME_DIRNAME: &str = ".flywheel";
 /// The git config key (in the repo's common config) holding the project id.
@@ -146,6 +150,18 @@ impl Home {
     /// `hub/`: the hub's state dir.
     pub fn hub_dir(&self) -> PathBuf {
         self.root.join("hub")
+    }
+
+    /// `hub/claude-accounts/`: the Claude account token files `fw hub
+    /// account add` writes.
+    pub fn claude_accounts_dir(&self) -> PathBuf {
+        self.hub_dir().join(CLAUDE_ACCOUNTS_DIRNAME)
+    }
+
+    /// `hub/claude-accounts/<name>.token`: account `name`'s token file. The
+    /// name is not validated here (`crate::account::validate_name` is).
+    pub fn account_token_path(&self, name: &str) -> PathBuf {
+        self.claude_accounts_dir().join(format!("{name}.token"))
     }
 
     /// `projects/`: one directory per project id.

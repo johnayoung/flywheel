@@ -59,11 +59,16 @@ pub fn build_cli_plan(request: &RunRequest) -> Result<ProcessPlan, AgentError> {
     }
     // The positional prompt "-" tells codex exec to read the prompt on stdin.
     argv.push("-".to_string());
-    let denied_environment = if cfg.authentication_policy == AuthenticationPolicy::AccountOnly {
+    let mut denied_environment = if cfg.authentication_policy == AuthenticationPolicy::AccountOnly {
         vec![OPENAI_API_KEY.to_string()]
     } else {
         Vec::new()
     };
+    for name in &cfg.denied_environment {
+        if !denied_environment.contains(name) {
+            denied_environment.push(name.clone());
+        }
+    }
     Ok(ProcessPlan {
         argv,
         cwd: Some(request.working_directory.clone()),

@@ -72,6 +72,10 @@ pub struct AgentPrimitives {
     pub exec_auto_allow: bool,
     pub agent_env: BTreeMap<String, String>,
     pub grader_env: Option<BTreeMap<String, String>>,
+    /// `fw worker --account`: the credential every agent spawn of the run
+    /// authenticates with (its token file is read at each spawn); `None`
+    /// keeps the inherited agent auth.
+    pub credential: Option<flywheel_core::agents_invoke::AgentCredential>,
 }
 
 /// Everything the loop hands the runner for one task execution.

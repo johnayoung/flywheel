@@ -5327,3 +5327,38 @@ fn unlanded_prereq_next_withholds_the_dependent() {
     unlanded_prereq_resolve(&f, "parent", Utc::now(), RESOLUTION_ATTRIBUTION_OPERATOR);
     assert_eq!(next(&f), (0, "ref:child\n".to_owned()));
 }
+
+#[test]
+fn worker_account_credential_flows_into_agent_primitives_and_nothing_else() {
+    let environ = BTreeMap::from([("ANTHROPIC_API_KEY".to_owned(), "decoy".to_owned())]);
+    // No account: today's primitives exactly.
+    let plain = sandbox_agent_primitives(Some(&WorkPolicy::default()), &environ);
+    assert_eq!(plain.credential, None);
+    assert_eq!(plain, sandbox_agent_primitives(None, &environ));
+
+    let credential = flywheel_core::agents_invoke::AgentCredential {
+        env: crate::account::TOKEN_ENV.to_owned(),
+        token_file: PathBuf::from("/home/x/hub/claude-accounts/work.token"),
+        removed_env: crate::account::OUTRANKING_ENV
+            .iter()
+            .map(|v| (*v).to_owned())
+            .collect(),
+    };
+    let policy = WorkPolicy {
+        account: Some("work".into()),
+        agent_credential: Some(credential.clone()),
+        ..WorkPolicy::default()
+    };
+    let agent = sandbox_agent_primitives(Some(&policy), &environ);
+    assert_eq!(agent.credential, Some(credential));
+    // The token reaches the agent only through the credential, never as
+    // a static agent_env entry resolved at startup.
+    assert!(agent.agent_env.is_empty());
+    assert_eq!(
+        AgentPrimitives {
+            credential: None,
+            ..agent
+        },
+        plain
+    );
+}

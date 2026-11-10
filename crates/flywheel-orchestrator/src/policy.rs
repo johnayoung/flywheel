@@ -350,7 +350,8 @@ impl Default for AutopilotWeights {
 ///   that carries none is verified by).
 /// * **paths** -- `db_path` / `sandbox_root` under the project dir.
 /// * **agent** -- `model` (config), `agent_id` (`--agent`; `None` is the
-///   claude-code adapter).
+///   claude-code adapter), `account` / `agent_credential` (`--account`;
+///   `None` keeps the inherited agent auth).
 /// * **store** -- `store_backend` / `store_dsn` (config `store`). A
 ///   postgres store is what enables cross-machine claims
 ///   ([`WorkPolicy::distributed`]).
@@ -377,6 +378,12 @@ pub struct WorkPolicy {
     pub sandbox_root: Option<PathBuf>,
     pub model: Option<String>,
     pub agent_id: Option<String>,
+    /// `fw worker --account NAME`: the Claude account the agents run under
+    /// (validated by [`RunFlags::apply`]); `None` is the inherited auth.
+    pub account: Option<String>,
+    /// The account's credential, bound by [`WorkPolicy::bind_account`]
+    /// (the token file path, read at every agent spawn; never the token).
+    pub agent_credential: Option<flywheel_core::agents_invoke::AgentCredential>,
     pub store_backend: String,
     pub execution_capabilities: BTreeSet<String>,
     pub worker_concurrency: i64,
@@ -457,6 +464,24 @@ impl ProjectBinding {
     }
 }
 
+/// The claude-code adapter id (`--agent`'s default).
+pub const CLAUDE_CODE_AGENT: &str = "claude-code";
+
+impl WorkPolicy {
+    /// Bind [`WorkPolicy::account`] to its token file under `home`,
+    /// refusing an account with no usable token now (the file is re-read at
+    /// every agent spawn). A policy with no account is left unchanged.
+    pub fn bind_account(&mut self, home: &crate::home::Home) -> Result<(), PolicyError> {
+        self.agent_credential = match &self.account {
+            Some(name) => {
+                Some(crate::account::resolve_credential(home, name).map_err(PolicyError::Invalid)?)
+            }
+            None => None,
+        };
+        Ok(())
+    }
+}
+
 impl Default for WorkPolicy {
     /// Every built-in default, with a `directory` source whose `tasks_dir`
     /// is unset.
@@ -476,6 +501,8 @@ impl Default for WorkPolicy {
             sandbox_root: None,
             model: None,
             agent_id: None,
+            account: None,
+            agent_credential: None,
             store_backend: "sqlite".to_string(),
             execution_capabilities: BTreeSet::new(),
             worker_concurrency: DEFAULT_WORKER_CONCURRENCY,
@@ -532,6 +559,10 @@ pub struct RunFlags {
     pub image: Option<String>,
     /// `--agent ID`: the agent adapter (`claude-code` default, `codex`).
     pub agent: Option<String>,
+    /// `--account NAME`: the Claude account the agents authenticate with
+    /// (the token file under `$FLYWHEEL_HOME/hub/claude-accounts/`). Only
+    /// for the worktree backend and the claude-code adapter.
+    pub account: Option<String>,
 }
 
 fn valid_repo(repo: &str) -> bool {
@@ -594,6 +625,28 @@ impl RunFlags {
                 SANDBOX_BACKENDS.join(", ")
             ));
         }
+        if let Some(account) = &self.account {
+            if backend == "container" {
+                return invalid(
+                    "--account is not supported with --sandbox container (the container \
+                     backend authenticates on its own)"
+                        .to_owned(),
+                );
+            }
+            let agent = self
+                .agent
+                .as_deref()
+                .filter(|a| !a.is_empty())
+                .or(policy.agent_id.as_deref())
+                .unwrap_or(CLAUDE_CODE_AGENT);
+            if agent != CLAUDE_CODE_AGENT {
+                return invalid(format!(
+                    "--account is a Claude account and needs the claude-code agent, not \
+                     --agent {agent}"
+                ));
+            }
+            crate::account::validate_name(account).map_err(PolicyError::Invalid)?;
+        }
         if backend != "container" && self.image.is_some() {
             return invalid("--image needs --sandbox container".to_owned());
         }
@@ -607,6 +660,7 @@ impl RunFlags {
         if let Some(agent) = self.agent.as_deref().filter(|a| !a.is_empty()) {
             policy.agent_id = Some(agent.to_owned());
         }
+        policy.account.clone_from(&self.account);
         Ok(())
     }
 
@@ -625,6 +679,7 @@ impl RunFlags {
         one("--sandbox", &self.sandbox);
         one("--image", &self.image);
         one("--agent", &self.agent);
+        one("--account", &self.account);
         if self.require_triage_receipt {
             argv.push("--require-triage-receipt".to_owned());
         }
@@ -979,6 +1034,7 @@ mod tests {
             sandbox: Some("container".into()),
             image: Some("img".into()),
             agent: Some("codex".into()),
+            account: None,
         };
         assert_eq!(
             flags.to_argv(),
@@ -992,6 +1048,74 @@ mod tests {
                 "--require-triage-receipt"
             ]
         );
+    }
+
+    #[test]
+    fn worker_account_flag_is_validated_and_forwarded_to_pool_members() {
+        let flags = |account: &str, sandbox: Option<&str>, agent: Option<&str>| RunFlags {
+            account: Some(account.into()),
+            sandbox: sandbox.map(str::to_owned),
+            image: sandbox.map(|_| "img".to_owned()),
+            agent: agent.map(str::to_owned),
+            ..RunFlags::default()
+        };
+        let refusal = |f: RunFlags| f.apply(&mut WorkPolicy::default()).unwrap_err().to_string();
+
+        let mut policy = WorkPolicy::default();
+        flags("work", None, None).apply(&mut policy).unwrap();
+        assert_eq!(policy.account.as_deref(), Some("work"));
+        assert_eq!(policy.agent_credential, None, "bound only by bind_account");
+        flags("work", None, Some("claude-code"))
+            .apply(&mut WorkPolicy::default())
+            .unwrap();
+        assert_eq!(flags("work", None, None).to_argv(), ["--account=work"]);
+
+        for bad in ["", "../x", "Work"] {
+            let err = refusal(flags(bad, None, None));
+            assert!(err.contains("not a valid account name"), "{bad:?}: {err}");
+        }
+        let err = refusal(flags("work", Some("container"), None));
+        assert!(err.contains("--sandbox container"), "{err}");
+        // Refused for the account, not for the missing image.
+        let err = refusal(RunFlags {
+            account: Some("work".into()),
+            sandbox: Some("container".into()),
+            ..RunFlags::default()
+        });
+        assert!(err.contains("--account"), "{err}");
+        let err = refusal(flags("work", None, Some("codex")));
+        assert!(err.contains("--agent codex"), "{err}");
+
+        // No flag, no account: the policy keeps the inherited auth.
+        let mut policy = WorkPolicy::default();
+        RunFlags::default().apply(&mut policy).unwrap();
+        assert_eq!(policy.account, None);
+        policy
+            .bind_account(&crate::home::Home::at("/nonexistent"))
+            .unwrap();
+        assert_eq!(policy.agent_credential, None);
+    }
+
+    #[test]
+    fn worker_account_binds_to_the_home_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::at(dir.path());
+        let mut policy = WorkPolicy::default();
+        RunFlags {
+            account: Some("work".into()),
+            ..RunFlags::default()
+        }
+        .apply(&mut policy)
+        .unwrap();
+        let err = policy.bind_account(&home).unwrap_err().to_string();
+        assert!(err.contains("no Claude account \"work\""), "{err}");
+        let file = home.account_token_path("work");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "sk-ant-oat01-x\n").unwrap();
+        policy.bind_account(&home).unwrap();
+        let credential = policy.agent_credential.as_ref().unwrap();
+        assert_eq!(credential.token_file, file);
+        assert_eq!(credential.env, "CLAUDE_CODE_OAUTH_TOKEN");
     }
 
     #[test]

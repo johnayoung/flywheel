@@ -408,3 +408,25 @@ fn command_override_replaces_executable() {
     assert_eq!(argv[..2], ["/usr/bin/env", "fake"].map(String::from));
     assert_eq!(argv[2], "--print");
 }
+
+#[test]
+fn configured_denied_environment_reaches_the_plan_once() {
+    let plan = build_cli_plan(&request_with(|c| {
+        c.authentication_policy = AuthenticationPolicy::AccountOnly;
+        c.environment
+            .insert("CLAUDE_CODE_OAUTH_TOKEN".into(), "sk-marker-7f3a".into());
+        c.denied_environment = vec!["ANTHROPIC_API_KEY".into(), "ANTHROPIC_AUTH_TOKEN".into()];
+    }))
+    .unwrap();
+    assert_eq!(
+        plan.denied_environment,
+        ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+    );
+    assert!(!plan.argv.iter().any(|a| a.contains("sk-marker-7f3a")));
+    assert_eq!(
+        plan.environment
+            .get("CLAUDE_CODE_OAUTH_TOKEN")
+            .map(String::as_str),
+        Some("sk-marker-7f3a")
+    );
+}

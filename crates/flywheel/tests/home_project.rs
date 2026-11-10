@@ -717,3 +717,63 @@ fn spec_export_reproduces_the_central_specs_byte_for_byte() {
 
     assert_eq!(tree(&repo), before, "the repo tree changed");
 }
+
+/// `fw worker --account` reads the token `fw hub account add` writes: the
+/// home's account token path is the hub state dir's `accounts::DIR` file,
+/// the two crates agree on the name rule and the variables, and a token the
+/// hub stores is the token the worker's credential reads (trailing newline
+/// dropped).
+#[test]
+fn account_token_path_is_the_hub_accounts_file() {
+    use flywheel_hub::accounts;
+    use flywheel_orchestrator::{account, home::Home};
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::at(dir.path());
+    assert_eq!(home.hub_dir(), dir.path().join("hub"));
+    assert_eq!(
+        home.account_token_path("work"),
+        home.hub_dir().join(accounts::DIR).join("work.token")
+    );
+    assert_eq!(
+        home.claude_accounts_dir(),
+        home.hub_dir().join(accounts::DIR)
+    );
+    assert_eq!(account::TOKEN_ENV, accounts::TOKEN_ENV);
+    assert_eq!(account::OUTRANKING_ENV, accounts::OUTRANKING_ENV);
+    assert_eq!(account::MAX_NAME_CHARS, accounts::MAX_NAME_CHARS);
+    let forty = "a".repeat(40);
+    let forty_one = "a".repeat(41);
+    for name in [
+        "work",
+        "a",
+        "0x",
+        "per_sonal-2",
+        "",
+        "../x",
+        "x/y",
+        "Work",
+        "-x",
+        "_x",
+        "a b",
+        "..",
+        "é",
+        &forty,
+        &forty_one,
+    ] {
+        assert_eq!(
+            account::validate_name(name).is_ok(),
+            accounts::validate_name(name).is_ok(),
+            "{name:?}"
+        );
+    }
+
+    accounts::add(&home.hub_dir(), "work", "sk-ant-oat01-pin", false).unwrap();
+    assert!(home.account_token_path("work").is_file());
+    let credential = account::resolve_credential(&home, "work").unwrap();
+    assert_eq!(credential.read_token().unwrap(), "sk-ant-oat01-pin");
+    assert_eq!(
+        credential.read_token().unwrap(),
+        accounts::token(&home.hub_dir(), "work").unwrap()
+    );
+}

@@ -343,6 +343,80 @@ pub fn completed_run_to_iteration_result(
     }
 }
 
+/// Largest credential file accepted (matches the hub's account token cap).
+pub const MAX_CREDENTIAL_BYTES: usize = 4096;
+
+/// A credential the agent process authenticates with: the token in
+/// `token_file`, handed to the agent as `env` with `removed_env` (the
+/// variables that would outrank it) removed from its environment.
+///
+/// The file is read at every spawn ([`AgentCredential::apply`]), never
+/// cached, so a token replaced between attempts reaches the next one. The
+/// token itself is never held here: `Debug` shows only the variable name
+/// and the path, and read errors name the path, never the contents.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentCredential {
+    pub env: String,
+    pub token_file: PathBuf,
+    pub removed_env: Vec<String>,
+}
+
+impl fmt::Debug for AgentCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentCredential")
+            .field("env", &self.env)
+            .field("token_file", &self.token_file)
+            .field("removed_env", &self.removed_env)
+            .finish()
+    }
+}
+
+impl AgentCredential {
+    /// The token, read now: surrounding whitespace trimmed (a trailing
+    /// newline is not part of it), one non-empty printable word.
+    pub fn read_token(&self) -> Result<String, AgentError> {
+        let path = self.token_file.display();
+        let raw = std::fs::read(&self.token_file).map_err(|e| {
+            AgentError::AgentAuthentication(match e.kind() {
+                std::io::ErrorKind::NotFound => format!("credential file {path} is missing"),
+                _ => format!("credential file {path}: {}", e.kind()),
+            })
+        })?;
+        let invalid =
+            |why: &str| AgentError::AgentAuthentication(format!("credential file {path}: {why}"));
+        if raw.len() > MAX_CREDENTIAL_BYTES + 2 {
+            return Err(invalid("larger than a token"));
+        }
+        let text = std::str::from_utf8(&raw).map_err(|_| invalid("not UTF-8"))?;
+        let token = text.trim();
+        if token.is_empty() {
+            return Err(invalid("empty"));
+        }
+        if token.len() > MAX_CREDENTIAL_BYTES {
+            return Err(invalid("larger than a token"));
+        }
+        if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(invalid("not a single token"));
+        }
+        Ok(token.to_owned())
+    }
+
+    /// Put the current token onto `configuration`: `env` set to it, every
+    /// `removed_env` variable dropped from the configured extras and denied
+    /// from the inherited environment.
+    pub fn apply(&self, configuration: &mut AgentConfiguration) -> Result<(), AgentError> {
+        let token = self.read_token()?;
+        for name in &self.removed_env {
+            configuration.environment.remove(name);
+            if !configuration.denied_environment.contains(name) {
+                configuration.denied_environment.push(name.clone());
+            }
+        }
+        configuration.environment.insert(self.env.clone(), token);
+        Ok(())
+    }
+}
+
 /// The result for a run that never started (adapter lookup, spawn, or
 /// authentication-policy failure): no transcript, a missing envelope, and
 /// the runtime's error code as the failure type.
@@ -376,6 +450,7 @@ pub struct AgentsInvoker {
     sink: Option<Arc<dyn EventSink>>,
     control_plane: Option<ControlPlane>,
     salvage_lost_envelope: bool,
+    credential: Option<AgentCredential>,
 }
 
 impl fmt::Debug for AgentsInvoker {
@@ -405,6 +480,7 @@ impl AgentsInvoker {
             sink: None,
             control_plane: None,
             salvage_lost_envelope: true,
+            credential: None,
         }
     }
 
@@ -437,6 +513,12 @@ impl AgentsInvoker {
     /// Wire the store-routed control plane (operator steering).
     pub fn with_control_plane(mut self, plane: ControlPlane) -> Self {
         self.control_plane = Some(plane);
+        self
+    }
+
+    /// Authenticate every spawn with `credential` (read at each spawn).
+    pub fn with_credential(mut self, credential: Option<AgentCredential>) -> Self {
+        self.credential = credential;
         self
     }
 
@@ -477,19 +559,22 @@ impl AgentsInvoker {
         }
     }
 
-    fn run_request(&self, prompt: &str, resume: Option<&str>) -> RunRequest {
+    fn run_request(&self, prompt: &str, resume: Option<&str>) -> Result<RunRequest, AgentError> {
         let mut configuration = self.configuration.clone();
+        if let Some(credential) = &self.credential {
+            credential.apply(&mut configuration)?;
+        }
         if let Some(session_id) = resume {
             configuration
                 .adapter_options
                 .insert("resume".into(), json!(session_id));
         }
-        RunRequest {
+        Ok(RunRequest {
             prompt: prompt.to_owned(),
             working_directory: self.working_directory.clone(),
             configuration,
             timeout_seconds: self.timeout_seconds,
-        }
+        })
     }
 
     /// Drive exactly one agent iteration and return its structured result.
@@ -548,11 +633,11 @@ impl AgentsInvoker {
         prompt: &str,
         resume: Option<&str>,
     ) -> IterationResult {
-        let mut active = match self
-            .runtime
-            .start(self.run_request(prompt, resume), self.run_options())
-            .await
-        {
+        let run_request = match self.run_request(prompt, resume) {
+            Ok(run_request) => run_request,
+            Err(err) => return startup_failure_result(&err),
+        };
+        let mut active = match self.runtime.start(run_request, self.run_options()).await {
             Ok(active) => active,
             Err(err) => return startup_failure_result(&err),
         };
@@ -795,6 +880,7 @@ pub struct ColdSession {
     host: Option<Arc<dyn ExecutionHost>>,
     configuration: AgentConfiguration,
     timeout_seconds: Option<f64>,
+    credential: Option<AgentCredential>,
 }
 
 impl fmt::Debug for ColdSession {
@@ -822,7 +908,14 @@ impl ColdSession {
             host: None,
             configuration,
             timeout_seconds: None,
+            credential: None,
         }
+    }
+
+    /// Authenticate every run with `credential` (read at each run).
+    pub fn with_credential(mut self, credential: Option<AgentCredential>) -> Self {
+        self.credential = credential;
+        self
     }
 
     pub fn with_runtime(mut self, runtime: Arc<AgentRuntime>) -> Self {
@@ -862,6 +955,11 @@ impl ColdSession {
         let mut configuration = self.configuration.clone();
         if let Some(model) = model_override {
             configuration.model_id = Some(model.to_owned());
+        }
+        if let Some(credential) = &self.credential {
+            credential
+                .apply(&mut configuration)
+                .map_err(ColdSessionError::Start)?;
         }
         let request = RunRequest {
             prompt: prompt.to_owned(),
@@ -1644,5 +1742,60 @@ mod tests {
             ColdSessionError::Start(AgentError::UnknownAgent(_))
         ));
         assert!(err.to_string().contains("nope"));
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    fn credential(file: &Path) -> AgentCredential {
+        AgentCredential {
+            env: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            token_file: file.to_path_buf(),
+            removed_env: vec!["ANTHROPIC_API_KEY".into(), "ANTHROPIC_AUTH_TOKEN".into()],
+        }
+    }
+
+    #[test]
+    fn credential_is_read_at_every_apply_and_strips_outranking_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("work.token");
+        std::fs::write(&file, "sk-first\n").unwrap();
+        let credential = credential(&file);
+        let mut base = AgentConfiguration::new("claude-code");
+        base.environment
+            .insert("ANTHROPIC_API_KEY".into(), "decoy".into());
+        base.environment.insert("KEEP".into(), "1".into());
+
+        let mut first = base.clone();
+        credential.apply(&mut first).unwrap();
+        assert_eq!(first.environment["CLAUDE_CODE_OAUTH_TOKEN"], "sk-first");
+        assert!(!first.environment.contains_key("ANTHROPIC_API_KEY"));
+        assert_eq!(first.environment["KEEP"], "1");
+        assert_eq!(
+            first.denied_environment,
+            ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+        );
+
+        std::fs::write(&file, "sk-second").unwrap();
+        let mut second = base.clone();
+        credential.apply(&mut second).unwrap();
+        assert_eq!(second.environment["CLAUDE_CODE_OAUTH_TOKEN"], "sk-second");
+    }
+
+    #[test]
+    fn credential_errors_name_the_file_never_the_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("work.token");
+        let credential = credential(&file);
+        let missing = credential.read_token().unwrap_err().to_string();
+        assert!(missing.contains("missing"), "{missing}");
+        std::fs::write(&file, "two words-secret\n").unwrap();
+        let bad = credential.read_token().unwrap_err().to_string();
+        assert!(!bad.contains("words-secret"), "{bad}");
+        assert!(!format!("{credential:?}").contains("words-secret"));
+        std::fs::write(&file, "\n").unwrap();
+        assert!(credential.read_token().is_err());
     }
 }

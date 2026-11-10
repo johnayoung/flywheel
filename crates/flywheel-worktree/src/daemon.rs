@@ -48,7 +48,7 @@ use flywheel_container::{
     ConfigError, ContainerInvokeSpec, HostInvokeBuilder, maybe_wrap_for_backend,
     spawn_container_orphan_reap,
 };
-use flywheel_core::agents_invoke::{AgentsInvoker, InvokeFn};
+use flywheel_core::agents_invoke::{AgentCredential, AgentsInvoker, InvokeFn};
 use flywheel_core::audit::StopFlag;
 use flywheel_core::faults::{FaultClass, classify_error};
 use flywheel_core::harness::{DEFAULT_AGENT_ID, HarnessError, ShutdownSignal};
@@ -61,6 +61,7 @@ use flywheel_core::workflow::{
 };
 use flywheel_orchestrator::claims::ClaimStoreError;
 use flywheel_orchestrator::held_out_gate::{FilesystemHeldOutGraderSource, HeldOutGraderSource};
+use flywheel_orchestrator::home::Home;
 use flywheel_orchestrator::orchestrate::{
     DEFAULT_LANDING_REDRIVE_BOUND, DEFAULT_PREREQ_REDRIVE_BOUND,
     DEFAULT_SESSION_PAUSE_CEILING_SECONDS, DEFAULT_SWEEP_SECONDS, DEFAULT_WORKER_CONCURRENCY,
@@ -345,6 +346,18 @@ pub fn make_agents_resolve_conflict(
     transport: Option<&str>,
     command_override: Option<Vec<String>>,
 ) -> ConflictResolver {
+    make_agents_resolve_conflict_with_credential(agent_id, transport, command_override, None)
+}
+
+/// [`make_agents_resolve_conflict`] whose sessions authenticate with
+/// `credential` (`fw worker --account`), its token file read at every
+/// session start; `None` keeps the inherited agent auth.
+pub fn make_agents_resolve_conflict_with_credential(
+    agent_id: &str,
+    transport: Option<&str>,
+    command_override: Option<Vec<String>>,
+    credential: Option<AgentCredential>,
+) -> ConflictResolver {
     let runtime = Arc::new(AgentRuntime::new());
     let agent_id = agent_id.to_owned();
     let transport = transport.map(str::to_owned);
@@ -358,6 +371,11 @@ pub fn make_agents_resolve_conflict(
             configuration
                 .adapter_options
                 .insert("transport".to_owned(), json!(transport));
+        }
+        if let Some(credential) = &credential {
+            credential
+                .apply(&mut configuration)
+                .map_err(|err| ConflictResolutionError(err.to_string()))?;
         }
         let run_request = RunRequest {
             prompt: request.prompt.clone(),
@@ -625,6 +643,7 @@ pub fn run_task_options_for(
             agent_env: agent.agent_env.clone(),
             transport: agent.agent_transport.clone(),
             command_override: None,
+            credential: agent.credential.clone(),
         },
         max_retries: Some(config.max_retries),
         grader_env: config.grader_env.clone(),
@@ -1537,7 +1556,7 @@ pub const USAGE: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--
                        [--task TASK] [--with-prereqs] [--source SOURCE]
                        [--repo OWNER/NAME] [--label LABEL]
                        [--require-triage-receipt] [--sandbox SANDBOX]
-                       [--image IMAGE] [--agent AGENT]
+                       [--image IMAGE] [--agent AGENT] [--account ACCOUNT]
 ";
 
 /// The argparse `-h` text (`COLUMNS=80`).
@@ -1553,7 +1572,7 @@ pub const HELP: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--d
                        [--task TASK] [--with-prereqs] [--source SOURCE]
                        [--repo OWNER/NAME] [--label LABEL]
                        [--require-triage-receipt] [--sandbox SANDBOX]
-                       [--image IMAGE] [--agent AGENT]
+                       [--image IMAGE] [--agent AGENT] [--account ACCOUNT]
 
 Git-worktree worker: drive the project's tasks (under $FLYWHEEL_HOME/projects/
 <id>/tasks/active/), each in its own worktree, landing on done and parking on
@@ -1616,6 +1635,10 @@ options:
   --image IMAGE         The container backend's image (required with
                         --sandbox container).
   --agent AGENT         The agent adapter: claude-code (default) or codex.
+  --account ACCOUNT     Run every Claude agent under this Claude account (its
+                        token file under $FLYWHEEL_HOME/hub/claude-accounts/,
+                        read at each agent spawn). Not with --sandbox
+                        container or --agent codex.
 ";
 
 /// The internal flag a pool member receives its supervisor lifeline on
@@ -1630,7 +1653,7 @@ enum Arity {
 }
 
 /// The option table in declaration order (argparse's prefix-match order).
-const OPTIONS: [(&str, Arity); 28] = [
+const OPTIONS: [(&str, Arity); 29] = [
     ("-h", Arity::Flag),
     ("--help", Arity::Flag),
     ("--tasks-dir", Arity::One),
@@ -1657,6 +1680,7 @@ const OPTIONS: [(&str, Arity); 28] = [
     ("--sandbox", Arity::One),
     ("--image", Arity::One),
     ("--agent", Arity::One),
+    ("--account", Arity::One),
     (SUPERVISOR_FD_FLAG, Arity::One),
     (crate::scoped::SCOPE_SINCE_FLAG, Arity::One),
 ];
@@ -1802,6 +1826,7 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
             "--sandbox" => args.run.sandbox = Some(v),
             "--image" => args.run.image = Some(v),
             "--agent" => args.run.agent = Some(v),
+            "--account" => args.run.account = Some(v),
             "--tasks-dir" => args.tasks_dir = Some(v),
             "--db" => args.db = Some(v),
             "--sandbox-root" => args.sandbox_root = Some(v),
@@ -1947,6 +1972,10 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
             .filter(|p| p.project.is_some())
             .ok_or_else(|| PolicyError::Invalid("no home project for this repo".to_owned()))?;
         args.run.apply(&mut policy)?;
+        if policy.account.is_some() {
+            let home = Home::from_env().map_err(|e| PolicyError::Invalid(e.to_string()))?;
+            policy.bind_account(&home)?;
+        }
         let policy = Some(Arc::new(policy));
         let phase_base = resolve_landing_base(&repo_root, policy.as_deref(), Some(&log))?;
         let concurrency = resolve_concurrency(args.concurrency.as_deref(), policy.as_deref())?;
@@ -2134,13 +2163,14 @@ pub fn main_with(argv: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
     .with_protected_paths(protected_paths)
     .with_retention(on_done, on_failure)
     .with_store(ledger)
-    .with_resolve_conflict(make_agents_resolve_conflict(
+    .with_resolve_conflict(make_agents_resolve_conflict_with_credential(
         policy
             .as_deref()
             .and_then(|p| p.agent_id.as_deref())
             .unwrap_or(DEFAULT_AGENT_ID),
         None,
         None,
+        policy.as_deref().and_then(|p| p.agent_credential.clone()),
     ));
     if let Some(policy) = policy.clone() {
         build_request = build_request.with_policy(policy);
@@ -2760,6 +2790,7 @@ mod tests {
                 exec_auto_allow: false,
                 agent_env: BTreeMap::from([("A".to_owned(), "1".to_owned())]),
                 grader_env: None,
+                credential: None,
             },
             invoke: None,
             config,
@@ -2986,6 +3017,107 @@ esac
         assert_eq!(report.turns, 7);
         assert_eq!(report.wall_seconds, 1.0);
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A resolver stand-in that records the credential it was handed (the
+    /// token and whether either outranking variable reached it).
+    const ACCOUNT_RESOLVER_FAKE: &str = r#"#!/bin/sh
+IFS= read -r FIRST_LINE || true
+printf '%s|%s|%s\n' "${CLAUDE_CODE_OAUTH_TOKEN-unset}" "${ANTHROPIC_API_KEY+set}" \
+  "${ANTHROPIC_AUTH_TOKEN+set}" >> "$0.log"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-resolve","model":"claude-fake-1"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"conflicts staged","num_turns":2,"total_cost_usd":0.01,"usage":{"input_tokens":7,"output_tokens":2}}'
+"#;
+
+    #[test]
+    fn worker_account_conflict_resolver_reads_the_token_at_every_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("fake_account.sh");
+        fs::write(&script, ACCOUNT_RESOLVER_FAKE).unwrap();
+        let token_file = tmp.path().join("work.token");
+        fs::write(&token_file, "sk-first\n").unwrap();
+        let credential = AgentCredential {
+            env: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            token_file: token_file.clone(),
+            removed_env: vec!["ANTHROPIC_API_KEY".into(), "ANTHROPIC_AUTH_TOKEN".into()],
+        };
+        let resolver = make_agents_resolve_conflict_with_credential(
+            "claude-code",
+            None,
+            Some(vec![
+                "/bin/sh".to_owned(),
+                script.to_string_lossy().into_owned(),
+            ]),
+            Some(credential),
+        );
+        let request = ConflictResolutionRequest {
+            prompt: "resolve the conflict markers".into(),
+            worktree: tmp.path().to_path_buf(),
+            max_turns: 4,
+            max_wall_seconds: 60.0,
+            model: None,
+        };
+        resolver(&request).unwrap();
+        fs::write(&token_file, "sk-second").unwrap();
+        resolver(&request).unwrap();
+        let log = fs::read_to_string(tmp.path().join("fake_account.sh.log")).unwrap();
+        assert_eq!(log, "sk-first||\nsk-second||\n");
+
+        fs::remove_file(&token_file).unwrap();
+        let err = resolver(&request).unwrap_err();
+        assert!(err.0.contains("missing"), "{}", err.0);
+    }
+
+    #[test]
+    fn worker_account_credential_reaches_the_task_agent_options() {
+        let credential = AgentCredential {
+            env: "CLAUDE_CODE_OAUTH_TOKEN".into(),
+            token_file: PathBuf::from("/h/hub/claude-accounts/work.token"),
+            removed_env: vec!["ANTHROPIC_API_KEY".into(), "ANTHROPIC_AUTH_TOKEN".into()],
+        };
+        let store = Arc::new(flywheel_core::store_memory::InMemoryStore::new());
+        let request = RunTaskRequest {
+            task: Task::new("goal", Vec::new()).with_id("t1"),
+            lifecycle: Lifecycle::new("t1").with_run_id("run-7"),
+            mode: RunMode::Fresh,
+            store,
+            sandbox: PathBuf::from("/sb"),
+            agent: AgentPrimitives {
+                credential: Some(credential.clone()),
+                ..AgentPrimitives::default()
+            },
+            invoke: None,
+            config: HarnessConfig::default(),
+            model: None,
+            max_turns: 3,
+            max_retries: 1,
+            worker_id: "w-1".into(),
+            source_ref: "ref:t1".into(),
+            telemetry_root: None,
+            sink: None,
+            now: Arc::new(Utc::now),
+            shutdown: None,
+            log: None,
+        };
+        let options = run_task_options_for(&request, None, EventsMode::Json);
+        assert_eq!(options.agent.credential, Some(credential));
+        assert!(options.agent.agent_env.is_empty());
+    }
+
+    #[test]
+    fn worker_account_flag_parses_and_is_in_the_help() {
+        assert_eq!(
+            args(&["--account", "work"]).run.account.as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            args(&["--account=work"]).run.account.as_deref(),
+            Some("work")
+        );
+        assert_eq!(args(&[]).run.account, None);
+        assert!(HELP.contains("--account ACCOUNT") && USAGE.contains("[--account ACCOUNT]"));
+        // `--ag` still reaches --agent alone.
+        assert_eq!(args(&["--ag", "codex"]).run.agent.as_deref(), Some("codex"));
     }
 
     #[test]
@@ -3770,6 +3902,7 @@ esac
                 sandbox: Some("container".into()),
                 image: Some("img".into()),
                 agent: Some("codex".into()),
+                account: None,
             }
         );
     }

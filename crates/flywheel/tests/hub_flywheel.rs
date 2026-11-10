@@ -2331,3 +2331,247 @@ fn hub_checks_are_empty_for_a_run_whose_task_has_no_checks() {
     assert_eq!(out.attempts.len(), 1);
     assert!(out.attempts[0].checks.is_empty(), "{:?}", out.attempts);
 }
+
+/// Every task of `panel`, keyed by id.
+fn panel_tasks(
+    panel: &flywheel_hub::flywheel::FlywheelPanel,
+) -> std::collections::HashMap<String, flywheel_hub::flywheel::PanelTask> {
+    panel
+        .phases
+        .iter()
+        .flat_map(|p| p.tasks.iter().cloned())
+        .map(|t| (t.id.clone(), t))
+        .collect()
+}
+
+#[test]
+fn hub_reland_panel_marks_relandable_tasks_and_waiting_dependents() {
+    let fx = temp_repo();
+    // `zed` waits on `eps`, DONE but parked; `delta` on `alpha`, landed.
+    write_task(&fx.project.tasks(), "02-land", "zed", &["eps", "alpha"]);
+    let panel = fx.provider().panel(&fx.root);
+    assert_eq!(panel.problem, None, "{panel:#?}");
+    let tasks = panel_tasks(&panel);
+    assert!(tasks["eps"].relandable, "{:#?}", tasks["eps"]);
+    for id in ["alpha", "beta", "gamma", "delta", "zed"] {
+        assert!(!tasks[id].relandable, "{id}");
+    }
+    assert_eq!(tasks["zed"].waiting_on, ["eps"]);
+    for id in ["alpha", "beta", "gamma", "delta", "eps"] {
+        assert!(tasks[id].waiting_on.is_empty(), "{id}");
+    }
+
+    // Additive on the wire: absent unless set.
+    let wire = serde_json::to_value(&panel).unwrap();
+    let task = |id: &str| -> Value {
+        wire["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|p| p["tasks"].as_array().unwrap().iter())
+            .find(|t| t["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(task("eps")["relandable"], json!(true));
+    assert_eq!(task("zed")["waiting_on"], json!(["eps"]));
+    assert!(task("alpha").get("relandable").is_none());
+    assert!(task("alpha").get("waiting_on").is_none());
+
+    // A resolved park releases the dependent and leaves nothing to re-land.
+    let claims = SqliteClaimStore::open_partition(fx.project.db(), &fx.project.id).unwrap();
+    claims
+        .record_stop_event(
+            flywheel_orchestrator::claims::STOP_RESOLVED,
+            "eps",
+            "landed by hand",
+            Utc::now(),
+            flywheel_orchestrator::claims::RESOLUTION_ATTRIBUTION_OPERATOR,
+        )
+        .unwrap();
+    let tasks = panel_tasks(&fx.provider().panel(&fx.root));
+    assert!(!tasks["eps"].relandable);
+    assert!(tasks["zed"].waiting_on.is_empty());
+}
+
+#[test]
+fn hub_reland_check_accepts_only_a_latest_done_run_with_an_unresolved_park() {
+    use flywheel_hub::flywheel::RelandRefused;
+    let fx = temp_repo();
+    let provider = fx.provider();
+    assert_eq!(provider.relandable(&fx.root, "eps"), Ok(()));
+    // Done and landed, failed, running, never run: nothing to re-land.
+    for id in ["alpha", "beta", "gamma", "delta"] {
+        match provider.relandable(&fx.root, id) {
+            Err(RelandRefused::NothingToReland(why)) => {
+                assert!(why.contains(id), "{why}");
+            }
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+    assert!(matches!(
+        provider.relandable(&fx.root, "nope"),
+        Err(RelandRefused::UnknownTask(_))
+    ));
+    assert_eq!(
+        provider.reland_command(&fx.root, "eps"),
+        ["/usr/bin/false", "reland", "eps"]
+    );
+
+    // A later park resolution is not re-landable either.
+    let claims = SqliteClaimStore::open_partition(fx.project.db(), &fx.project.id).unwrap();
+    claims
+        .record_stop_event(
+            flywheel_orchestrator::claims::STOP_RESOLVED,
+            "eps",
+            "abandoned",
+            Utc::now(),
+            flywheel_orchestrator::claims::RESOLUTION_ATTRIBUTION_OPERATOR,
+        )
+        .unwrap();
+    assert!(matches!(
+        provider.relandable(&fx.root, "eps"),
+        Err(RelandRefused::NothingToReland(_))
+    ));
+}
+
+#[test]
+fn hub_reland_route_starts_fw_reland_only_for_a_parked_task() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    write_script(
+        &dir.join("bin/claude"),
+        "#!/bin/sh\necho fake claude >&2\nexit 1\n",
+    );
+    let root = dir.join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    let project = adopted_repo(&fw_home(&dir), &root);
+    write_task(&project.tasks(), "02-land", "zed", &["eps"]);
+    let plain = dir.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let server = start(&dir);
+    let (code, workspace) = http(
+        &server,
+        "POST",
+        "/api/workspaces",
+        Some(json!({ "name": "loop", "folders": [{"path": root}, {"path": plain}] })),
+    );
+    assert_eq!(code, 201, "{workspace}");
+    let workspace_id = workspace["id"].as_str().unwrap().to_owned();
+    let session_count = || {
+        let (code, sessions) = http(&server, "GET", "/api/sessions", None);
+        assert_eq!(code, 200, "{sessions}");
+        sessions["sessions"].as_array().unwrap().len()
+    };
+    let reland = |folder: &Path, task: &str| {
+        http(
+            &server,
+            "POST",
+            "/api/flywheel/reland",
+            Some(json!({ "folder": folder, "task": task, "workspace_id": workspace_id })),
+        )
+    };
+
+    // The panel tells the board which tasks are re-landable and what a
+    // waiting dependent is held on.
+    let query = root
+        .to_string_lossy()
+        .replace('%', "%25")
+        .replace('/', "%2F");
+    let (code, panel) = http(
+        &server,
+        "GET",
+        &format!("/api/flywheel/panel?folder={query}"),
+        None,
+    );
+    assert_eq!(code, 200, "{panel}");
+    let task = |id: &str| -> Value {
+        panel["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|p| p["tasks"].as_array().unwrap().iter())
+            .find(|t| t["id"] == id)
+            .unwrap_or_else(|| panic!("{id} in {panel}"))
+            .clone()
+    };
+    assert_eq!(task("eps")["relandable"], json!(true));
+    assert!(task("alpha").get("relandable").is_none());
+    assert_eq!(task("zed")["waiting_on"], json!(["eps"]));
+
+    // Nothing to re-land (landed, failed, never run): 409, no session.
+    assert_eq!(session_count(), 0);
+    for id in ["alpha", "beta", "zed"] {
+        let (code, refused) = reland(&root, id);
+        assert_eq!(code, 409, "{id}: {refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("nothing to re-land"),
+            "{refused}"
+        );
+    }
+    // Unknown task: 404; unknown or unadopted folder: the worker route's
+    // refusal; a dash-led id: 400. None makes a session.
+    let (code, refused) = reland(&root, "nope");
+    assert_eq!(code, 404, "{refused}");
+    for folder in [&plain, &dir] {
+        let (code, refused) = reland(folder, "eps");
+        let (worker_code, worker_refused) = http(
+            &server,
+            "POST",
+            "/api/flywheel/worker",
+            Some(json!({ "folder": folder })),
+        );
+        assert_eq!(code, 404, "{refused}");
+        assert_eq!((code, &refused), (worker_code, &worker_refused));
+    }
+    let (code, _) = reland(&root, "--once");
+    assert_eq!(code, 400);
+    assert_eq!(session_count(), 0);
+
+    // A parked DONE run: 201, a hub session running `fw reland eps` there
+    // (the repo has no commit, so the attempt refuses and the shell stays).
+    let (code, session) = reland(&root, "eps");
+    assert_eq!(code, 201, "{session}");
+    assert_eq!(session["name"], "fw reland eps");
+    assert_eq!(session["kind"], "shell");
+    assert_eq!(session["cwd"], json!(root));
+    let argv: Vec<String> = session["command"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(argv[3], "fw-reland");
+    assert!(argv[4].ends_with("fw"), "{argv:?}");
+    assert_eq!(&argv[5..], ["reland", "eps"]);
+    assert_eq!(session_count(), 1);
+    let sid = session["id"].as_str().unwrap().to_owned();
+    let screen = wait_for("fw reland's last words", || {
+        let text = screen_text(&server, &sid);
+        text.contains("fw reland exited with status")
+            .then_some(text)
+    });
+    assert!(!screen.contains("exited with status 2"), "{screen}");
+    // The route never lands or clears the card itself.
+    let (_, panel) = http(
+        &server,
+        "GET",
+        &format!("/api/flywheel/panel?folder={query}"),
+        None,
+    );
+    let eps = panel["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|p| p["tasks"].as_array().unwrap().iter())
+        .find(|t| t["id"] == "eps")
+        .unwrap()
+        .clone();
+    assert_eq!(eps["relandable"], json!(true), "{screen}");
+    let (code, _) = http(&server, "DELETE", &format!("/api/sessions/{sid}"), None);
+    assert_eq!(code, 204);
+}

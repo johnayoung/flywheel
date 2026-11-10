@@ -21,7 +21,7 @@ Front door: [hub](../hub.md).
 ## Lifecycle and restore
 
 - `start` runs `fw hub serve` detached into `hub.log` (10 MiB, 3 kept); not ready (`server.json`) by `--timeout`: SIGTERM, log tail. `stop` SIGTERMs, waits for the lock; `--force` SIGKILLs (no restore record).
-- One hub per state dir (`serve.lock`); a stale `server.json` is removed (the token is never sent to whatever listens there now).
+- One hub per state dir (`serve.lock`); a stale `server.json` is removed (never sending the token to whatever listens there now).
 - Shutdown records running sessions `stopped`, then SIGHUP, SIGKILL (`nohup`ed children too); SIGTERM during startup waits until serving.
 - `install-service`: `~/.config/systemd/user/<name>.service` (`KillMode=mixed`) + enable/linger steps.
 
@@ -109,7 +109,7 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
 ## Search
 
-`Ctrl Shift F`, `fw hub search`, `GET /api/search`: one query across all sessions.
+`Ctrl Shift F`, `fw hub search`: one query across all sessions.
 
 - Sources: `scrollback` (exited sessions too), `transcript` (text, tool calls, results; no thinking), `commands`.
 - Literal or `regex` (linear-time), case-insensitive unless `case`, at most 1 KiB, one line. Newest first; 20 per session and source, 200 total; `offset` pages.
@@ -121,7 +121,7 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 `fw hub record start|stop SESSION` (or the `rec` pill); `fw hub record get NAME -o demo.cast; asciinema play demo.cast`.
 
 - Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after falling behind, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on the prior part's last screen; `recordings.dir_cap` deletes the oldest finished.
-- Ends on stop, exit, relaunch, hub stop; `upgrade` continues the file. Peers 403; an active one is not deleted (409).
+- Ends on stop, exit, relaunch, hub stop; `upgrade` continues the file. An active one is not deleted (409).
 - `/replay#<name>`: seek with marker ticks, 0.5-8x, idle gaps cut to 2 s, follows parts.
 
 ## Push notifications

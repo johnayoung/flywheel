@@ -13,6 +13,12 @@
 //!   (`fw worker --task ID ...` when `tasks` names any) in a new hub shell
 //!   session there; 409 (with the running session) while a worker this
 //!   hub started still runs in the folder, unless `another` is true;
+//! * `POST /api/flywheel/reland {"folder", "task", "workspace_id"?,
+//!   "cols"?, "rows"?}` -- start `fw reland <task>` in a new hub shell
+//!   session there (it lands, or re-parks, in the session, never in the
+//!   request); 409 (no session) when the task's latest DONE run has no
+//!   unresolved landing park or a re-land of it already runs, 404 for a
+//!   task the folder does not know;
 //! * `POST /api/flywheel/steer/say {"folder", "run", "message"}` and
 //!   `POST /api/flywheel/steer/interrupt {"folder", "run"}` -- enqueue one
 //!   `say` / `interrupt` control command for a running or validating run
@@ -24,9 +30,9 @@
 use super::ApiQuery;
 use super::{AppState, error_response};
 use crate::flywheel::{
-    FlywheelEvent, FlywheelMonitor, FlywheelSummary, MAX_SAY_CHARS, Steer, SteerRefused,
-    WorkerScope, mark_queued, runs_worker, valid_run_id, worker_session_command,
-    worker_session_name,
+    FlywheelEvent, FlywheelMonitor, FlywheelSummary, MAX_SAY_CHARS, RelandRefused, Steer,
+    SteerRefused, WorkerScope, mark_queued, reland_session_command, reland_session_name,
+    runs_reland, runs_worker, valid_run_id, worker_session_command, worker_session_name,
 };
 use crate::hub::{CreateSession, Hub};
 use crate::state::Workspace;
@@ -353,17 +359,9 @@ pub(super) async fn start_worker(
         Ok(found) => found,
         Err(refusal) => return refusal.into_response(),
     };
-    let workspace = match &request.workspace_id {
-        Some(id) => match workspaces.iter().find(|w| &w.id == id) {
-            Some(w) => w.clone(),
-            None => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    &format!("{} is not a folder of workspace {id}", path.display()),
-                );
-            }
-        },
-        None => workspaces[0].clone(),
+    let workspace = match session_workspace(&path, &workspaces, request.workspace_id.as_deref()) {
+        Ok(w) => w,
+        Err(refusal) => return refusal.into_response(),
     };
     let hub = Arc::clone(&app.hub);
     let starter = Arc::clone(&monitor);
@@ -419,6 +417,131 @@ pub(super) async fn start_worker(
         Err(join) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("starting the worker failed: {join}"),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct RelandRequest {
+    folder: String,
+    task: String,
+    workspace_id: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+}
+
+/// Why a re-land start did not create a session.
+enum RelandStartRefused {
+    Refused(RelandRefused),
+    Running { id: String, name: String },
+    Hub(crate::hub::HubError),
+}
+
+/// The workspace a session in `path` opens under: `requested`, else the
+/// first holding it (`Err` answers 400).
+fn session_workspace(
+    path: &Path,
+    workspaces: &[Workspace],
+    requested: Option<&str>,
+) -> Result<Workspace, Refusal> {
+    match requested {
+        Some(id) => workspaces
+            .iter()
+            .find(|w| w.id == id)
+            .cloned()
+            .ok_or_else(|| {
+                Refusal::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("{} is not a folder of workspace {id}", path.display()),
+                )
+            }),
+        None => Ok(workspaces[0].clone()),
+    }
+}
+
+/// Start `fw reland <task>` in a hub session (D-6: the landing runs
+/// there; its outcome is read from the store and the session, never
+/// from this response).
+pub(super) async fn start_reland(
+    State(app): State<AppState>,
+    super::ApiJson(request): super::ApiJson<RelandRequest>,
+) -> Response {
+    let monitor = match monitor(&app) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let task = request.task.trim().to_owned();
+    if let Err(why) = WorkerScope::new(vec![task.clone()], false) {
+        return error_response(StatusCode::BAD_REQUEST, &why);
+    }
+    let (path, workspaces) = match adopted_folder(&app, &monitor, request.folder).await {
+        Ok(found) => found,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let workspace = match session_workspace(&path, &workspaces, request.workspace_id.as_deref()) {
+        Ok(w) => w,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let hub = Arc::clone(&app.hub);
+    let starter = Arc::clone(&monitor);
+    let folder = path.clone();
+    let (cols, rows) = (request.cols, request.rows);
+    // An action: no timeout (see `start_worker`).
+    let created = tokio::task::spawn_blocking(move || {
+        // Check-then-create under one lock: concurrent starts serialize.
+        let _starting = starter.starting();
+        let sessions = hub.sessions(None);
+        if let Some(running) = sessions.iter().find(|s| runs_reland(s, &folder, &task)) {
+            return Err(RelandStartRefused::Running {
+                id: running.record.id.clone(),
+                name: running.record.name.clone(),
+            });
+        }
+        starter
+            .provider()
+            .relandable(&folder, &task)
+            .map_err(RelandStartRefused::Refused)?;
+        let name = reland_session_name(&task, sessions.iter().map(|s| s.record.name.as_str()));
+        let command = reland_session_command(&starter.provider().reland_command(&folder, &task));
+        hub.create_session(CreateSession {
+            workspace_id: workspace.id,
+            repo: Some(folder),
+            name: Some(name),
+            kind: Default::default(),
+            command: Some(command),
+            cols,
+            rows,
+            worktree: None,
+            ..CreateSession::default()
+        })
+        .map_err(RelandStartRefused::Hub)
+    })
+    .await;
+    match created {
+        Ok(Ok(view)) => {
+            monitor.refresh(&path);
+            (StatusCode::CREATED, Json(view)).into_response()
+        }
+        Ok(Err(RelandStartRefused::Refused(refused))) => {
+            let status = match &refused {
+                RelandRefused::UnknownTask(_) => StatusCode::NOT_FOUND,
+                RelandRefused::NothingToReland(_) => StatusCode::CONFLICT,
+                RelandRefused::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error_response(status, &refused.to_string())
+        }
+        Ok(Err(RelandStartRefused::Running { id, name })) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("a re-land of this task is already running (session {name:?})"),
+                "running": { "id": id, "name": name },
+            })),
+        )
+            .into_response(),
+        Ok(Err(RelandStartRefused::Hub(e))) => super::ApiError(e).into_response(),
+        Err(join) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("starting the re-land failed: {join}"),
         ),
     }
 }

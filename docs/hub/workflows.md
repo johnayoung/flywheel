@@ -37,8 +37,8 @@ Fenced blocks come from the agent's own record, **exactly as written**.
 
 ## Usage and cost
 
-- From transcripts (Claude `message.usage` incl. subagents, Codex `token_count`) at list prices (`usage.rs` `PRICES`; unknown models: tokens only); ~1-2% under Claude's own (side calls are untranscribed).
-- Header meter, sidebar, `fw hub ls`, `GET /api/usage`; 62 days per session.
+- From transcripts (Claude `message.usage` incl. subagents, Codex `token_count`) at list prices (`usage.rs` `PRICES`; unknown models: tokens only); ~1-2% under Claude's own (side calls untranscribed).
+- Header meter, sidebar, `fw hub ls`; 62 days per session.
 
 ## Worktrees and companion shells
 
@@ -123,9 +123,9 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 Repos flywheel knows (project id) get the verified loop, read-only (`--no-flywheel`: off); state: `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else hub env.
 
 - Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs (last tool call), 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's `verified/total` badge, `Alt F`, the palette.
-- **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (offers unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted transcript, live; message, interrupt (confirmed).
-- **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`.
-- Shown (ledger): tier verdicts, newest deciding cycle (emitted, dropped + why), 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
+- **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (offers unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted transcript, live; message, interrupt (confirmed).
+- **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) = `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = its `--pause|--resume`.
+- Shown (ledger): tier verdicts, newest deciding cycle (emitted, dropped + why), 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row.
 - A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. A watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
 - **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`). No project: no row. Seam: `AuditSink` (`hub_audit.rs`).
 
@@ -155,7 +155,7 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 ## Digests
 
-Off until `hub.toml` `[digest] times` is set ([hub-reference](reference.md#hubtoml); Settings > Digest writes that table). `fw hub digest` previews; `--send` sends now.
+Off until `hub.toml` `[digest] times` is set ([hub-reference](reference.md#hubtoml); or Settings > Digest).
 
 - **Says**, since the last digest, per workspace: turns done, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, blocked, red PRs, stalled queues), linked.
 - **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty: skipped (`quiet_if_empty`). `delivery.channels`: only those that heard it.

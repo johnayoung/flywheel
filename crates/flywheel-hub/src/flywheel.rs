@@ -106,6 +106,14 @@ pub struct PanelTask {
     pub awaiting: Option<String>,
     /// The predicates an interrupted run waits on (`type=name, ...`).
     pub blocked_on: Option<String>,
+    /// The latest DONE run has an unresolved landing park, so `fw reland`
+    /// has a landing to re-drive (the `stranded` rule of `fw status`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relandable: bool,
+    /// The DONE-but-unlanded prerequisites this task is held on, in
+    /// prerequisite order (`fw status --json` `unlanded_prerequisites`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_on: Vec<String>,
     /// A pending task a running scoped worker this hub started will run
     /// (the hub fills it in per answer; see [`mark_queued`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -595,6 +603,26 @@ impl std::fmt::Display for SteerRefused {
     }
 }
 
+/// Why a re-land was not started (no session was created).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelandRefused {
+    /// The folder neither lists the task nor records a strand for it.
+    UnknownTask(String),
+    /// The task's latest DONE run has no unresolved landing park (never
+    /// done, failed, landed, or its park was resolved).
+    NothingToReland(String),
+    /// The store or the listing could not be read.
+    Store(String),
+}
+
+impl std::fmt::Display for RelandRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownTask(m) | Self::NothingToReland(m) | Self::Store(m) => f.write_str(m),
+        }
+    }
+}
+
 /// The longest message a say carries (characters).
 pub const MAX_SAY_CHARS: usize = 4000;
 
@@ -626,6 +654,15 @@ pub trait FlywheelProvider: Send + Sync + 'static {
     /// working directory), e.g. `[/path/to/fw, worker]`; restricted to
     /// `scope`'s tasks when it names any (`[.., worker, --task=ID]`).
     fn worker_command(&self, folder: &Path, scope: &WorkerScope) -> Vec<String>;
+
+    /// `Ok` when task `task_id` of `folder` has a landing to re-drive: its
+    /// latest DONE run has an unresolved landing park, read fresh as `fw
+    /// status` reads `stranded`.
+    fn relandable(&self, folder: &Path, task_id: &str) -> Result<(), RelandRefused>;
+
+    /// The argv that re-lands task `task_id` of `folder` (run there), e.g.
+    /// `[/path/to/fw, reland, ID]`.
+    fn reland_command(&self, folder: &Path, task_id: &str) -> Vec<String>;
 
     /// Drop whatever is kept open for `folder` (stores, listings,
     /// transcripts): it left every workspace. A later read reopens.
@@ -1073,6 +1110,12 @@ pub fn worker_session_command(worker: &[String]) -> Vec<String> {
     daemon_session_command(WORKER_MARKER, "fw worker", worker)
 }
 
+/// [`worker_session_command`] for `fw reland <task>` (`reland`, the
+/// provider's argv): one landing attempt, then the user's shell.
+pub fn reland_session_command(reland: &[String]) -> Vec<String> {
+    daemon_session_command(RELAND_MARKER, "fw reland", reland)
+}
+
 /// [`worker_session_command`] for any daemon verb: `marker` names it in
 /// the wrapper's argv, `label` in its last words.
 pub(crate) fn daemon_session_command(marker: &str, label: &str, argv: &[String]) -> Vec<String> {
@@ -1094,6 +1137,8 @@ pub(crate) fn daemon_session_command(marker: &str, label: &str, argv: &[String])
 pub const WORKER_MARKER: &str = "fw-worker";
 /// The same for an autopilot session (`crate::autopilot`).
 pub const AUTOPILOT_MARKER: &str = "fw-autopilot";
+/// The same for a re-land session ([`reland_session_command`]).
+pub const RELAND_MARKER: &str = "fw-reland";
 /// The variable the shell a finished worker leaves behind carries its
 /// exit status in.
 pub const WORKER_EXIT_ENV: &str = "FLYWHEEL_WORKER_EXIT";
@@ -1118,6 +1163,7 @@ fn daemon_marker(record: &crate::state::SessionRecord) -> Option<&'static str> {
     match record.command.get(3).map(String::as_str) {
         Some(WORKER_MARKER) => Some(WORKER_MARKER),
         Some(AUTOPILOT_MARKER) => Some(AUTOPILOT_MARKER),
+        Some(RELAND_MARKER) => Some(RELAND_MARKER),
         _ => None,
     }
 }
@@ -1321,6 +1367,36 @@ pub fn runs_autopilot(view: &SessionView, folder: &Path) -> bool {
     process_runs(pid, AUTOPILOT_MARKER)
 }
 
+/// Whether `view` is a hub re-land session for task `task_id` in `folder`
+/// whose `fw reland` still runs (see [`runs_worker`]).
+pub fn runs_reland(view: &SessionView, folder: &Path, task_id: &str) -> bool {
+    let record = &view.record;
+    if record.cwd != folder
+        || daemon_marker(record) != Some(RELAND_MARKER)
+        || record.command.last().map(String::as_str) != Some(task_id)
+    {
+        return false;
+    }
+    let Some(pid) = view.live.as_ref().and_then(|l| l.pid) else {
+        return false;
+    };
+    process_runs(pid, RELAND_MARKER)
+}
+
+/// The name a re-land session for `task_id` gets: `fw reland <id>`,
+/// numbered when taken.
+pub fn reland_session_name<'a>(task_id: &str, taken: impl IntoIterator<Item = &'a str>) -> String {
+    let taken: HashSet<&str> = taken.into_iter().map(str::trim).collect();
+    let base = format!("fw reland {task_id}");
+    if !taken.contains(base.as_str()) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|name| !taken.contains(name.as_str()))
+        .expect("an unbounded range has a free name")
+}
+
 /// Whether session process `pid` is still the daemon wrapper carrying
 /// `marker` (not yet the shell it leaves behind).
 #[cfg(target_os = "linux")]
@@ -1445,6 +1521,8 @@ mod tests {
             stopped: None,
             awaiting: None,
             blocked_on: None,
+            relandable: false,
+            waiting_on: Vec::new(),
             queued_in: None,
         }
     }
@@ -1616,6 +1694,21 @@ mod tests {
         assert!(session.exit_info().is_none(), "the session must survive ^C");
         session.kill(Duration::from_millis(200));
         assert!(session.wait_exit(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn hub_reland_session_runs_the_verb_under_its_own_marker() {
+        let argv = vec!["/bin/fw".to_owned(), "reland".into(), "eps".into()];
+        let command = reland_session_command(&argv);
+        assert_eq!(command[..2], ["/bin/sh", "-c"]);
+        assert!(command[2].contains("[fw reland exited with status"));
+        assert_eq!(command[3], RELAND_MARKER);
+        assert_eq!(command[4..], argv[..]);
+        assert_eq!(reland_session_name("eps", ["fw worker"]), "fw reland eps");
+        assert_eq!(
+            reland_session_name("eps", ["fw reland eps", "fw reland eps 2"]),
+            "fw reland eps 3"
+        );
     }
 
     #[test]

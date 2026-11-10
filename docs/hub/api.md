@@ -42,7 +42,7 @@ Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Fr
 | POST | `/api/sessions/{id}/paste` | `{"text","run"?}`: `/input` with `paste`, trailing newlines dropped, 1 MiB; 409 unsafe multi-line |
 | GET | `/api/sessions/{id}/commands[?limit=N&all=true]` | newest first (shell unless `all`; `limit` 1..500, 50) |
 | GET | `/api/sessions/{id}/replies[?limit=N]` | newest first (`limit` 1..100, 20): `text`, `blocks`, `match_key` |
-| GET | `/api/sessions/{id}/file?path=` | a file the session names: relative to its cwd, worktree, or workspace folders, or absolute / `~/`; must resolve (symlinks too) under those; `{"path","size","text","truncated"}` (first 2 MiB); 403 outside, 404 none, 415 binary |
+| GET | `/api/sessions/{id}/file?path=` | a file the session names (relative to its cwd, worktree, workspace folders; absolute; `~/`), resolving (symlinks too) under those; `{"path","size","text","truncated"}` (first 2 MiB); 403 outside, 404 none, 415 binary |
 | POST | `/api/sessions/{id}/files/check` | `{"paths":[...]}` (64): `{"files":[{"path","size"}\|null]}`, in order |
 | GET | `/api/sessions/{id}/transcript[?around=N&before=N&after=N]` | messages, paged (30, max 200); 400 a shell |
 | POST | `/api/sessions/{id}/companion` | `{"text"?,"run"?}`: companion shell (201 / 200 running), `text` pasted when ready |
@@ -50,10 +50,10 @@ Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Fr
 | GET | `/api/worktrees/plan?folder=&task=&base=` | `{"plan"\|null,"error"}` |
 | GET | `/api/sessions/{id}/ws` | terminal WebSocket (below) |
 | GET | `/api/kinds` | session kinds, each `available` |
-| GET | `/api/claude-accounts` | `{accounts:[{name,updated}]}` (never tokens); `POST /api/sessions` `"account":NAME` launches a claude session under one |
+| GET | `/api/claude-accounts` | `{accounts:[{name,updated}]}` (never tokens); `"account":NAME` on `POST /api/sessions` launches under one |
 | POST | `/api/claude-accounts` | `{name,token,replace?}` -> 201 `{name,updated}` (taken: 409 unless `replace`) |
 | DELETE | `/api/claude-accounts/{name}` | 204 |
-| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, default 30): past conversations of the folder, newest first, `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `POST /api/sessions` `"resume":ID\|"latest"` resumes one |
+| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, 30): the folder's past conversations, newest first, `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `POST /api/sessions` `"resume":ID\|"latest"` resumes one |
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
@@ -100,19 +100,20 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/fanouts/{id}/cleanup` | `{"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}` |
 | POST | `/api/fanouts/{id}/promote` | `{"task_id"?,"goal"?,...}`, two-step (plan: path, contents); 409 exists / changed |
 | GET | `/api/flywheel` | per adopted folder: counts, `plans`, alerts, live runs, worker |
-| GET | `/api/flywheel/panel?folder=` | panel (`queued_in`: scoped worker runs it; live `last_tool`, `plans[].tasks`); 404 unadopted |
+| GET | `/api/flywheel/panel?folder=` | panel (`queued_in`: scoped worker runs it; `relandable`, `waiting_on`; live `last_tool`, `plans[].tasks`); 404 unadopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next","attempts"}` (poll `since=next`); 503 read waits |
 | GET | `/api/flywheel/history?folder=&task=` | every run; attempts' `outcome`/`error`/`checks` (= `fw show`); task `goal`, `checks` (held-out: names) |
 | GET | `/api/flywheel/task?folder=&task=` | task as a fan-out seed |
-| POST | `/api/flywheel/tasks` | `{"folder","task_id","goal","phase"?,"prerequisites"?,"checks":[{"run","name"?}]}`, two-step; 400 invalid; peers 403 |
+| POST | `/api/flywheel/tasks` | `{"folder","task_id","goal","phase"?,"prerequisites"?,"checks":[{"run","name"?}]}`, two-step; 400 invalid |
 | GET | `/api/flywheel/autopilot?folder=` | `intake` (+ 20 newest decisions), this hub's autopilot sessions |
 | POST | `/api/flywheel/autopilot/start` | `{"folder","confirm":true}` -> 201 the `fw autopilot` session; 400 unconfirmed; 409 running here or elsewhere |
 | POST | `/api/flywheel/autopilot/stop` | `{"folder"}` -> 202 (Ctrl-C); 409 none of this hub's |
 | POST | `/api/flywheel/autopilot/pause` | `{"folder"}` -> `{"paused","changed"}` |
 | POST | `/api/flywheel/autopilot/resume` | as `pause` |
 | POST | `/api/flywheel/autopilot/decide` | `{"folder","run","decision":"approve"/"deny","confirm":true}` + `gate`, `attempt`, `feedback` (as `fw hub autopilot`); 409 not that gate or one queued; 404 no run |
-| POST | `/api/flywheel/steer/say` | `{"folder","run","message"}` -> 201 one `fw say` command; 400 empty; 409 not running/validating; peers 403 |
+| POST | `/api/flywheel/steer/say` | `{"folder","run","message"}` -> 201 one `fw say` command; 400 empty; 409 not running/validating |
 | POST | `/api/flywheel/steer/interrupt` | `{"folder","run"}`: as `say`, for `fw interrupt` |
+| POST | `/api/flywheel/reland` | `{"folder","task","workspace_id"?,"cols"?,"rows"?}` -> 201 the `fw reland <task>` session; 409 nothing to re-land / running; 404 unknown task |
 | POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"cols"?,"rows"?}` -> 201 the `fw worker` session; 409 running, unless `another` |
 
 Fan-outs off: 503.
@@ -138,7 +139,7 @@ Fan-outs off: 503.
 | GET | `/api/digest` | schedule, `next`, `recent`, `push` host ([hub-workflows](workflows.md#digests)) |
 | GET | `/api/digest/preview[?since=]` | a digest, neither sent nor kept |
 | POST | `/api/digest/send` | `{"since"?}` -> the digest sent, `delivery` |
-| PUT | `/api/digest/config` | `{"times"?,"timezone"?,"channels"?,"quiet_if_empty"?,"rev"?}` (omitted: kept; `timezone:""`: system) -> rewrites hub.toml `[digest]`; 422; 409 (`stale`: `rev` moved on) |
+| PUT | `/api/digest/config` | `{"times"?,"timezone"?,"channels"?,"quiet_if_empty"?,"rev"?}` (omitted: kept; `timezone:""`: system) -> rewrites hub.toml `[digest]`; 422; 409 stale `rev` |
 | GET | `/api/digests/{id}` | one of the last 14 |
 
 Times: RFC 3339, unix ms, an age (`90m`), `last-seen`. `ws`, `session`: id, prefix, or name. `kind`: comma list (`review` = `review.*`); beyond plugin events: `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A peer or `machines=none`: this hub alone.
@@ -161,7 +162,7 @@ Times: RFC 3339, unix ms, an age (`90m`), `last-seen`. `ws`, `session`: id, pref
 
 ## Permissions
 
-Behaviour: [hub-workflows](workflows.md#permissions). `?folder=` (absolute, in a workspace) or `?session=` (bodies: same keys); peers 403.
+Behaviour: [hub-workflows](workflows.md#permissions). `?folder=` (absolute, in a workspace) or `?session=` (bodies: same keys).
 
 | Method | Path | |
 |---|---|---|

@@ -59,9 +59,9 @@ use flywheel_hub::autopilot::{GateDecided, GateDecision, GateRefused};
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, AttemptChecks, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome,
-    LiveRun, Note, PanelClaim, PanelPhase, PanelPlan, PanelTask, PlanTask, RecentRun, RunAttempt,
-    RunEntry, RunOutput, Steer, SteerRefused, Steered, TaskHistory, TaskLight, TaskRun, ToolCall,
-    UntrustedRepoFile, WorkerScope, valid_run_id,
+    LiveRun, Note, PanelClaim, PanelPhase, PanelPlan, PanelTask, PlanTask, RecentRun,
+    RelandRefused, RunAttempt, RunEntry, RunOutput, Steer, SteerRefused, Steered, TaskHistory,
+    TaskLight, TaskRun, ToolCall, UntrustedRepoFile, WorkerScope, valid_run_id,
 };
 use flywheel_hub::util::path_identity as file_identity;
 use flywheel_orchestrator::autopilot_activity::{
@@ -506,6 +506,8 @@ struct StatusEntry {
     latest_error: String,
     #[serde(default)]
     prerequisites: Vec<String>,
+    #[serde(default)]
+    unlanded_prerequisites: Vec<String>,
     worker_id: Option<String>,
     blocked_requires: Option<Vec<Map<String, Value>>>,
     awaiting_on: Option<AwaitingOn>,
@@ -645,6 +647,8 @@ fn fold_status(entries: Vec<StatusEntry>, panel: &mut FlywheelPanel) {
                 .as_deref()
                 .filter(|p| !p.is_empty())
                 .map(format_blocked_on),
+            relandable: entry.stranded.is_some(),
+            waiting_on: entry.unlanded_prerequisites.clone(),
             // The hub's to fill in (its running worker sessions).
             queued_in: None,
         };
@@ -703,6 +707,40 @@ fn fold_status(entries: Vec<StatusEntry>, panel: &mut FlywheelPanel) {
         .into_iter()
         .map(|(name, tasks)| PanelPhase { name, tasks })
         .collect();
+}
+
+/// Whether `task_id` has a landing to re-drive, by `fw status --json`'s
+/// `entries`: re-landable exactly when an entry for it carries `stranded`
+/// (its latest DONE run's landing park, unresolved). Known when listed, a
+/// status subject, or recorded in the store (`has_runs`).
+fn reland_verdict(
+    entries: &[StatusEntry],
+    has_runs: bool,
+    task_id: &str,
+    folder: &Path,
+) -> Result<(), RelandRefused> {
+    let mine: Vec<&StatusEntry> = entries
+        .iter()
+        .filter(|e| e.task_id.as_deref().or(e.subject.as_deref()) == Some(task_id))
+        .collect();
+    if mine.iter().any(|e| e.stranded.is_some()) {
+        return Ok(());
+    }
+    if mine.is_empty() && !has_runs {
+        return Err(RelandRefused::UnknownTask(format!(
+            "{task_id} is not a task of {}",
+            folder.display()
+        )));
+    }
+    let state = mine.iter().find_map(|e| e.state.as_deref());
+    let why = match state {
+        Some("done") => "its latest DONE run has no unresolved landing park".to_owned(),
+        Some(state) => format!("it has no parked DONE run (state {state})"),
+        None => "it has no parked DONE run".to_owned(),
+    };
+    Err(RelandRefused::NothingToReland(format!(
+        "{task_id} has nothing to re-land: {why}"
+    )))
 }
 
 // --- plans -------------------------------------------------------------------
@@ -1585,6 +1623,52 @@ impl FlywheelProvider for HubFlywheel {
         ];
         argv.extend(scope.flags());
         argv
+    }
+
+    fn relandable(&self, folder: &Path, task_id: &str) -> Result<(), RelandRefused> {
+        let state = self.folder(folder);
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let resolved = state
+            .resolve(&self.home(), folder)
+            .map_err(RelandRefused::Store)?;
+        let (core, claims): (Arc<dyn HarnessStore>, Arc<dyn ClaimStore>) =
+            match resolved.stores(folder).map_err(RelandRefused::Store)? {
+                Some(bundle) => (Arc::clone(&bundle.core), Arc::clone(&bundle.claims)),
+                // No store yet: nothing ever ran, so nothing parked.
+                None => (
+                    Arc::new(InMemoryStore::new()),
+                    Arc::new(InMemoryClaimStore::new()),
+                ),
+            };
+        let items = match &resolved.source {
+            Some(source) => source
+                .list_work()
+                .map_err(|e| RelandRefused::Store(format!("listing tasks: {e}")))?,
+            None => Vec::new(),
+        };
+        drop(state);
+        let read =
+            status_entries(&items, core.as_ref(), claims.as_ref(), folder).and_then(|entries| {
+                let filter = LifecycleFilter::default().with_task_id(task_id);
+                let runs = core
+                    .list_lifecycles(&filter)
+                    .map_err(|e| format!("reading the task's runs: {e}"))?;
+                Ok((entries, !runs.is_empty()))
+            });
+        let (entries, has_runs) = read.map_err(|message| {
+            // A dead handle: reopen on the next read.
+            self.drop_stores(folder);
+            RelandRefused::Store(message)
+        })?;
+        reland_verdict(&entries, has_runs, task_id, folder)
+    }
+
+    fn reland_command(&self, _folder: &Path, task_id: &str) -> Vec<String> {
+        vec![
+            self.program.to_string_lossy().into_owned(),
+            "reland".to_owned(),
+            task_id.to_owned(),
+        ]
     }
 
     fn plan_task(&self, folder: &Path, draft: &TaskDraft) -> Result<TaskFilePlan, String> {

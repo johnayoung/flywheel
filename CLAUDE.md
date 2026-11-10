@@ -83,3 +83,5 @@ The `serena` MCP server (auto-loaded from the committed `.mcp.json`) provides la
 ## After editing Rust
 
 Before reporting the task done, run the full gate with `scripts/check.sh` (rustfmt -> clippy -D warnings -> cargo test, the same checks CI runs) and confirm it is green. Treat clippy warnings as build failures; fix them in the same turn.
+
+**Exception: flywheel worker runs** (your prompt asks for a `<!-- LOOP_STATUS -->` envelope). Do not run `scripts/check.sh`: the landing runs it as the standing verify on the exact tree that lands, so running it yourself only repeats a ~7 min suite. Instead run `cargo fmt`, `cargo clippy -p <each crate you touched> --all-targets -- -D warnings`, and the targeted tests your change affects (`cargo test -p <crate> <filter>`), then the task's own graders.

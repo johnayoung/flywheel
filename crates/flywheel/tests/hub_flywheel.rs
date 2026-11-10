@@ -2158,3 +2158,176 @@ fn task_history_route_and_last_tool_call_are_served_by_the_hub() {
         appended.elapsed()
     );
 }
+
+/// `fw show RUN --json` in `fx`'s repo and home: each attempt's `checks`.
+fn shown_checks(fx: &Fixture, run_id: &str) -> Vec<Value> {
+    let out = Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["show", run_id, "--json"])
+        .current_dir(&fx.root)
+        .env("HOME", hermetic_home(fx._tmp.path()))
+        .env("FLYWHEEL_HOME", &fx.home)
+        .env_remove("FLYWHEEL_PG_DSN")
+        .env_remove("DATABASE_URL")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "fw show {run_id}: {out:?}");
+    let detail: Value = serde_json::from_slice(&out.stdout).unwrap();
+    detail["attempts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{detail}"))
+        .iter()
+        .map(|attempt| attempt["checks"].clone())
+        .collect()
+}
+
+#[test]
+fn hub_checks_of_a_run_past_the_recent_window_equal_fw_show_json() {
+    use flywheel_core::store::TaskStore;
+    use flywheel_core::task::{CommandGrader, Grader, Task};
+
+    let fx = temp_repo();
+    let root = fx.root.clone();
+    let store = fx.project.store();
+    let names: Vec<String> = ["first", "second", "third"]
+        .iter()
+        .map(|n| token(n))
+        .collect();
+    let graders = names
+        .iter()
+        .map(|name| {
+            let mut grader = CommandGrader::new("true").unwrap();
+            grader.name = Some(name.clone());
+            Grader::Command(grader)
+        })
+        .collect();
+    let task = Task::new("checked", graders).with_id("omega");
+    let t0 = Utc::now() - ChronoDuration::hours(2);
+    let digest = store.save_task(&task, t0).unwrap();
+    let marker = token("marker");
+    let secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+
+    // 14 runs; the oldest has a failed attempt (second check fails, the
+    // third never runs) then a passing one.
+    for n in 0..14 {
+        let run_id = format!("run-omega-{n:02}");
+        let at = t0 + ChronoDuration::minutes(n);
+        let mut lc = Lifecycle::new("omega");
+        lc.run_id = run_id.clone();
+        lc.task_content_hash = digest.clone();
+        for (i, status) in DONE.iter().enumerate() {
+            lc.transition_to(*status, "", Some(at + ChronoDuration::seconds(i as i64)))
+                .unwrap();
+        }
+        store.create_lifecycle(&lc).unwrap();
+        let tries: &[&[(bool, i64)]] = if n == 0 {
+            &[&[(true, 0), (false, 3)], &[(true, 0), (true, 0), (true, 0)]]
+        } else {
+            &[&[(true, 0), (true, 0), (true, 0)]]
+        };
+        for (a, receipts) in tries.iter().enumerate() {
+            let number = a as u32 + 1;
+            let mut attempt = Attempt::new(number, at, &run_id);
+            attempt.outcome = Some(if number == tries.len() as u32 {
+                Outcome::Succeeded
+            } else {
+                Outcome::ValidationFailed
+            });
+            attempt.ended_at = Some(at + ChronoDuration::seconds(2));
+            store.save_attempt(&run_id, &attempt, None).unwrap();
+            for (ordinal, (passed, exit)) in receipts.iter().enumerate() {
+                store
+                    .append_grader_result(&GraderResultRecord {
+                        run_id: run_id.clone(),
+                        attempt_number: number,
+                        ordinal: ordinal as u32,
+                        grader_type: GraderType::Command,
+                        grader_spec: obj(
+                            json!({"type": "command", "name": names[ordinal], "run": "true"}),
+                        ),
+                        passed: *passed,
+                        duration_ms: 10 + ordinal as u64,
+                        payload: obj(json!({
+                            "exit_code": exit,
+                            "termination": "exited",
+                            "stdout_tail": format!("{marker} token={secret}\n"),
+                            "stderr_tail": "",
+                        })),
+                        ts: at + ChronoDuration::seconds(1),
+                        grader_name: Some(names[ordinal].clone()),
+                        id: None,
+                    })
+                    .unwrap();
+            }
+        }
+    }
+    let provider = fx.provider();
+    assert!(
+        provider
+            .panel(&root)
+            .runs
+            .iter()
+            .all(|r| r.run_id != "run-omega-00"),
+        "the oldest run is outside the recent window"
+    );
+
+    let shown = shown_checks(&fx, "run-omega-00");
+    let statuses: Vec<Vec<&str>> = shown
+        .iter()
+        .map(|checks| {
+            checks
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["status"].as_str().unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            vec!["passed", "failed", "not_run"],
+            vec!["passed", "passed", "passed"]
+        ]
+    );
+    assert_eq!(shown[0][1]["exit_code"], 3);
+
+    // The run detail route's read.
+    let out = provider.run_output(&root, "run-omega-00", 0).unwrap();
+    let numbers: Vec<u32> = out.attempts.iter().map(|a| a.number).collect();
+    assert_eq!(numbers, [1, 2]);
+    let detail: Vec<Value> = out
+        .attempts
+        .iter()
+        .map(|a| Value::Array(a.checks.clone()))
+        .collect();
+    assert_eq!(detail, shown);
+
+    // The task history's same run.
+    let history = provider.task_history(&root, "omega").unwrap();
+    let run = history
+        .runs
+        .iter()
+        .find(|r| r.run_id == "run-omega-00")
+        .unwrap();
+    let per_attempt: Vec<Value> = run
+        .attempts
+        .iter()
+        .map(|a| Value::Array(a.checks.clone()))
+        .collect();
+    assert_eq!(per_attempt, shown);
+
+    // Redacted on the hub's wire too: the marker stays, the secret does not.
+    let wire = serde_json::to_string(&out).unwrap() + &serde_json::to_string(&history).unwrap();
+    assert!(!wire.contains(secret), "{wire}");
+    assert!(wire.contains(&marker), "{wire}");
+}
+
+#[test]
+fn hub_checks_are_empty_for_a_run_whose_task_has_no_checks() {
+    let fx = temp_repo();
+    let provider = fx.provider();
+    let out = provider.run_output(&fx.root, "run-gamma", 0).unwrap();
+    assert_eq!(out.attempts.len(), 1);
+    assert!(out.attempts[0].checks.is_empty(), "{:?}", out.attempts);
+}

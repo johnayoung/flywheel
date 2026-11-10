@@ -257,6 +257,9 @@ pub struct RunAttempt {
     pub cost_usd: f64,
     /// Its grader receipts.
     pub graders: Vec<GraderOutcome>,
+    /// Every check, as `fw show --json` reports it.
+    #[serde(default)]
+    pub checks: Vec<serde_json::Value>,
 }
 
 /// One check of a task, by name.
@@ -512,6 +515,17 @@ pub struct RunOutput {
     pub entries: Vec<RunEntry>,
     /// The cursor for the next poll.
     pub next: usize,
+    /// Every attempt (in order) with its `checks`, identical to `fw show
+    /// --json`'s.
+    #[serde(default)]
+    pub attempts: Vec<AttemptChecks>,
+}
+
+/// One attempt's `checks` list, as `fw show --json` reports it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AttemptChecks {
+    pub number: u32,
+    pub checks: Vec<serde_json::Value>,
 }
 
 /// A steering command for a live run, as `fw say` / `fw interrupt`

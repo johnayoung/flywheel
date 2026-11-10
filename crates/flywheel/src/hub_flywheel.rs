@@ -58,10 +58,10 @@ use flywheel_core::store_memory::InMemoryStore;
 use flywheel_hub::autopilot::{GateDecided, GateDecision, GateRefused};
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
-    Alert, AlertKind, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome, LiveRun, Note,
-    PanelClaim, PanelPhase, PanelPlan, PanelTask, RecentRun, RunAttempt, RunEntry, RunOutput,
-    Steer, SteerRefused, Steered, TaskHistory, TaskLight, TaskRun, ToolCall, UntrustedRepoFile,
-    WorkerScope, valid_run_id,
+    Alert, AlertKind, AttemptChecks, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome,
+    LiveRun, Note, PanelClaim, PanelPhase, PanelPlan, PanelTask, RecentRun, RunAttempt, RunEntry,
+    RunOutput, Steer, SteerRefused, Steered, TaskHistory, TaskLight, TaskRun, ToolCall,
+    UntrustedRepoFile, WorkerScope, valid_run_id,
 };
 use flywheel_hub::util::path_identity as file_identity;
 use flywheel_orchestrator::autopilot_activity::{
@@ -70,6 +70,7 @@ use flywheel_orchestrator::autopilot_activity::{
 use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore, REASON_AWAITING_APPROVAL};
 use flywheel_orchestrator::config::Access;
 use flywheel_orchestrator::config::{REPO_CONFIG_FILENAME, read_repo_file};
+use flywheel_orchestrator::history::{check_to_json, run_attempt_checks};
 use flywheel_orchestrator::home::{Home, stored_project_id};
 use flywheel_orchestrator::pg_preflight::dsn_target;
 use flywheel_orchestrator::policy::WorkPolicy;
@@ -994,6 +995,7 @@ fn task_runs(core: &dyn HarnessStore, task_id: &str) -> Result<Vec<TaskRun>, Str
     lifecycles
         .iter()
         .map(|lc| {
+            let mut checks = attempt_checks(core, lc)?.into_iter();
             let attempts = lc
                 .attempts
                 .iter()
@@ -1013,6 +1015,7 @@ fn task_runs(core: &dyn HarnessStore, task_id: &str) -> Result<Vec<TaskRun>, Str
                         tokens: a.total_tokens(),
                         cost_usd: a.total_cost_usd,
                         graders: grader_outcomes(core, &lc.run_id, a.number)?,
+                        checks: checks.next().map(|c| c.checks).unwrap_or_default(),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -1028,6 +1031,19 @@ fn task_runs(core: &dyn HarnessStore, task_id: &str) -> Result<Vec<TaskRun>, Str
             })
         })
         .collect()
+}
+
+/// Every attempt's `checks` of one run, from the read model `fw show
+/// --json` renders, as its JSON.
+fn attempt_checks(core: &dyn HarnessStore, lc: &Lifecycle) -> Result<Vec<AttemptChecks>, String> {
+    Ok(run_attempt_checks(core, lc)
+        .map_err(|e| format!("reading checks of run {}: {e}", lc.run_id))?
+        .into_iter()
+        .map(|(number, checks)| AttemptChecks {
+            number,
+            checks: checks.iter().map(check_to_json).collect(),
+        })
+        .collect())
 }
 
 fn recent_runs(core: &dyn HarnessStore) -> Result<Vec<RecentRun>, String> {
@@ -1479,6 +1495,7 @@ impl FlywheelProvider for HubFlywheel {
             json: false,
             raw: false,
         };
+        let attempts = attempt_checks(core.as_ref(), &lifecycle)?;
         let mut summary: Vec<u8> = Vec::new();
         cmd_show(&args, core.as_ref(), folder, &fallback, &mut summary)
             .map_err(|e| format!("reading run {run_id}: {e}"))?;
@@ -1503,6 +1520,7 @@ impl FlywheelProvider for HubFlywheel {
             next: transcript.total(),
             from,
             entries,
+            attempts,
         })
     }
 

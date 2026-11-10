@@ -704,6 +704,54 @@ fn gate_for_attempt(
         })
 }
 
+/// One attempt's receipts and its [`attempt_checks`] list.
+type GradedAttempt = (Vec<GraderResultRecord>, Vec<CheckResult>);
+
+/// Each attempt of `lifecycle` (in order) with its receipts and checks.
+fn graded_attempts<S>(
+    store: &S,
+    lifecycle: &Lifecycle,
+    task: Option<&Task>,
+    decisions: &[DomainEvent],
+) -> Result<Vec<GradedAttempt>, StoreError>
+where
+    S: GraderResultStore + ?Sized,
+{
+    let redactor = default_policy(None);
+    let final_number = lifecycle.attempts.iter().map(|a| a.number).max();
+    lifecycle
+        .attempts
+        .iter()
+        .map(|a| {
+            let receipts = store.list_grader_results(&lifecycle.run_id, a.number)?;
+            let gate = gate_for_attempt(decisions, a.number, Some(a.number) == final_number);
+            let checks = attempt_checks(task, a, &receipts, gate, &redactor);
+            Ok((receipts, checks))
+        })
+        .collect()
+}
+
+/// Every attempt's `checks` list for one run, keyed by attempt number in
+/// order: exactly what [`collect_run_detail`] reports, for surfaces that
+/// need only the checks (the hub's run detail and task history).
+pub fn run_attempt_checks<S>(
+    store: &S,
+    lifecycle: &Lifecycle,
+) -> Result<Vec<(u32, Vec<CheckResult>)>, StoreError>
+where
+    S: GraderResultStore + TaskStore + DomainEventStore + ?Sized,
+{
+    let task = store.load_task_for_run(&lifecycle.run_id)?;
+    let decisions = landing_decisions(store, &lifecycle.run_id);
+    let graded = graded_attempts(store, lifecycle, task.as_ref(), &decisions)?;
+    Ok(lifecycle
+        .attempts
+        .iter()
+        .zip(graded)
+        .map(|(a, (_, checks))| (a.number, checks))
+        .collect())
+}
+
 /// Assemble the full `show` payload for one run, or `None`.
 ///
 /// Unlike [`collect_history_rows`] this accepts any status -- an operator
@@ -725,14 +773,10 @@ where
 
     let task = store.load_task_for_run(run_id)?;
     let decisions = landing_decisions(store, run_id);
-    let redactor = default_policy(None);
-    let final_number = lifecycle.attempts.iter().map(|a| a.number).max();
+    let graded = graded_attempts(store, &lifecycle, task.as_ref(), &decisions)?;
 
     let mut attempts = Vec::with_capacity(lifecycle.attempts.len());
-    for a in &lifecycle.attempts {
-        let receipts = store.list_grader_results(run_id, a.number)?;
-        let gate = gate_for_attempt(&decisions, a.number, Some(a.number) == final_number);
-        let checks = attempt_checks(task.as_ref(), a, &receipts, gate, &redactor);
+    for (a, (receipts, checks)) in lifecycle.attempts.iter().zip(graded) {
         attempts.push(AttemptSummary {
             number: a.number,
             outcome: a

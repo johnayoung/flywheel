@@ -157,7 +157,7 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 Off until `hub.toml` `[digest] times` is set ([hub-reference](reference.md#hubtoml); Settings > Digest writes that table). `fw hub digest` previews; `--send` sends now.
 
-- **Says**, since the last digest, per workspace: turns done, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, longest blocked, red PRs, stalled queues) with links.
+- **Says**, since the last digest, per workspace: turns done, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, blocked, red PRs, stalled queues), linked.
 - **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty: skipped (`quiet_if_empty`). `delivery.channels`: only those that heard it.
 - **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it. A send claim over 5 min old is dropped.
 

@@ -85,7 +85,7 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 
 - Tab bar: `+`, double-click renames, middle-click closes. A sidebar session dropped on a pane edge splits, mid-pane shows it. A new-shell split opens an agent's companion first.
 - Panes stay 40x8 cells+ (else a new tab). Closing a pane leaves its session running; removing one closes its panes, empty tabs. Only the active tab attaches; 12 tabs, 12 panes each. Phones (< 760 px): one pane, a chip row switches.
-- Board tab: a folder's flywheel board (tab strip, palette `Board:`), root only; outlives sessions, closes with its folder.
+- Board tab (tab strip, palette `Board:`), root only; outlives sessions, closes with its folder. Portfolio: the workspace's plans, needs-you first; a plan opens into five lanes.
 - Browser checks (opt-in; env `FW`, `PLAYWRIGHT`, `CHROMIUM`): `node crates/flywheel-hub/e2e/{layout,network}.mjs` (network: 400/150 kbps, 300 ms).
 
 ## Web UI
@@ -120,7 +120,7 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
 `fw hub record start|stop SESSION` (or the `rec` pill); `fw hub record get NAME -o demo.cast; asciinema play demo.cast`.
 
-- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after falling behind, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on the last part's final screen: nothing skipped; `recordings.dir_cap` deletes the oldest finished.
+- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after falling behind, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on the prior part's final screen; `recordings.dir_cap` deletes the oldest finished.
 - Ends on stop, exit, relaunch, hub stop; `upgrade` continues the file. Peers 403; an active one is not deleted (409).
 - `/replay#<name>`: seek with marker ticks, 0.5-8x, idle gaps cut to 2 s, follows parts.
 

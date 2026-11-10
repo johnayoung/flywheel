@@ -133,17 +133,9 @@ function restyle(node, path) {
   restyle(node.b, path + "b");
 }
 
-// A board tab's stage: the container the flywheel board of `folder`
-// renders into.
+// A board tab's stage: the flywheel board (board.js) of its workspace.
 function boardStage(node) {
-  const folder = (workspaceById(state.view) || { folders: [] }).folders.find((f) => f.path === node.folder);
-  return el(
-    "section",
-    { className: "board-stage", dataset: { fwBoard: node.folder }, "aria-label": `Flywheel board of ${node.folder}` },
-    el("header", { className: "board-head" },
-      el("strong", { textContent: (folder && folder.name) || node.folder.split("/").pop() || node.folder }),
-      el("span", { className: "path-tail", textContent: node.folder, title: node.folder })),
-  );
+  return flywheelBoard.mount(node);
 }
 
 // A pane with no session (its session was closed, or a new tab): the

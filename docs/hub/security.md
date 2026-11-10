@@ -21,7 +21,7 @@ Front door: [hub](../hub.md).
 
 ## Remote access
 
-Recommended: Tailscale (tailnet https, which phones need for clipboard, notifications, install): the hub on loopback, `tailscale serve --bg http://127.0.0.1:7420` (`https://<machine>.<tailnet>.ts.net`), `fw hub url --qr` to scan.
+Recommended: Tailscale (https: phones need it for clipboard, notifications, install): the hub on loopback, `tailscale serve --bg http://127.0.0.1:7420` (`https://<machine>.<tailnet>.ts.net`), `fw hub url --qr` to scan.
 
 - `serve` and `url` detect a `tailscale serve` of the hub's port, else print the command.
 - `X-Forwarded-*` is believed from loopback and `--trusted-proxy` peers only; a proxy elsewhere: `--public-url` + `--trusted-proxy`.

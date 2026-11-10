@@ -59,8 +59,8 @@ use flywheel_hub::autopilot::{GateDecided, GateDecision, GateRefused};
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, AttemptChecks, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome,
-    LiveRun, Note, PanelClaim, PanelPhase, PanelPlan, PanelTask, RecentRun, RunAttempt, RunEntry,
-    RunOutput, Steer, SteerRefused, Steered, TaskHistory, TaskLight, TaskRun, ToolCall,
+    LiveRun, Note, PanelClaim, PanelPhase, PanelPlan, PanelTask, PlanTask, RecentRun, RunAttempt,
+    RunEntry, RunOutput, Steer, SteerRefused, Steered, TaskHistory, TaskLight, TaskRun, ToolCall,
     UntrustedRepoFile, WorkerScope, valid_run_id,
 };
 use flywheel_hub::util::path_identity as file_identity;
@@ -831,6 +831,7 @@ fn fold_plans(
                 verified_24h: 0,
                 needs: 0,
                 running: 0,
+                tasks: Vec::new(),
             };
             for task in &plan.tasks {
                 let task_runs = runs.get(task.as_str()).map_or(&[][..], Vec::as_slice);
@@ -856,6 +857,11 @@ fn fold_plans(
                     TaskLight::Running => out.running += 1,
                     _ => {}
                 }
+                out.tasks.push(PlanTask {
+                    id: task.clone(),
+                    state: light,
+                    status: task_runs.first().map(|lc| lc.status.as_str().to_owned()),
+                });
             }
             out
         })
@@ -1902,6 +1908,16 @@ mod tests {
             "the unlisted gate is classified from its run"
         );
         assert!((done.spend_usd - 3.0).abs() < 1e-9);
+        let gate = done.tasks.iter().find(|t| t.id == "gate").unwrap();
+        assert_eq!(gate.state, TaskLight::Awaiting);
+        assert_eq!(gate.status.as_deref(), Some("awaiting_approval"));
+        let ids: Vec<&str> = live.tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["fresh", "idle", "redo", "stale"],
+            "every task file, once"
+        );
+        assert_eq!(live.tasks[1].status, None, "idle never ran");
     }
 
     #[test]

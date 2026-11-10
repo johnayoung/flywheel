@@ -365,6 +365,7 @@ function onPush(message, machine) {
     launcher.onUsage(message);
   } else if (message.type === "flywheel" || message.type === "flywheel_reset") {
     flywheel.onEvent(message, machine);
+    flywheelBoard.onFlywheel(message, machine);
   } else if (message.type === "layout") {
     onLayoutEvent(message);
   } else if (message.type === "fanout" && !machine) {

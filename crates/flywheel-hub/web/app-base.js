@@ -434,7 +434,13 @@ const flywheel = window.FwHubFlywheel({
   termSize: () => sizeHint(),
   // Autopilot work newly waiting on a gate (notify.js, below).
   notifyGate: (folder, label, count) => notify.gate(folder, label, count),
+  // A summary changed: the shown board repaints (board.js, below).
+  onSummaries: () => flywheelBoard.paint(),
 });
+
+// The flywheel board (board.js): a board tab's portfolio of plans and a
+// plan's lanes, read through the Flywheel panel's data.
+const flywheelBoard = window.FwHubBoard({ el, icon, span, state, workspaceById, flywheel });
 
 // Verified fan-outs (fanout.js): one prompt to several agents in
 // worktrees, graded by the hub, ranked, the winner merged.

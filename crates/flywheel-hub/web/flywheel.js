@@ -33,6 +33,7 @@ window.FwHubFlywheel = function (ctx) {
   const collapsed = new Set(store.get(COLLAPSED_KEY, []));
   const ui = {
     enabled: false,
+    loaded: false, // this hub's folders were read once
     summaries: new Map(), // folder path -> summary
     folder: null, // folder whose panel is open
     workspaceId: null, // workspace it was opened from
@@ -79,7 +80,10 @@ window.FwHubFlywheel = function (ctx) {
   async function reloadMachine(machine) {
     try {
       const data = await api("GET", `${ctx.machinePrefix(machine)}/api/flywheel`);
-      if (!machine) ui.enabled = !!data.enabled;
+      if (!machine) {
+        ui.enabled = !!data.enabled;
+        ui.loaded = true;
+      }
       for (const key of [...ui.summaries.keys()]) {
         if (machineOfKey(key) === (machine || null)) ui.summaries.delete(key);
       }
@@ -89,6 +93,11 @@ window.FwHubFlywheel = function (ctx) {
         prune(kept.folder, kept);
       }
     } catch (_) {
+      // Unread: the board stops saying "reading" (its empty state shows).
+      if (!machine && !ui.loaded) {
+        ui.loaded = true;
+        changed();
+      }
       return;
     }
     changed();
@@ -127,6 +136,7 @@ window.FwHubFlywheel = function (ctx) {
   function changed() {
     ctx.rerender();
     renderPill();
+    if (ctx.onSummaries) ctx.onSummaries();
   }
 
   // The panel ignoring when it was read (and in-flight runs' ages).
@@ -138,6 +148,11 @@ window.FwHubFlywheel = function (ctx) {
     });
   }
 
+  // Folder `key`'s panel, read through its machine's hub.
+  async function readPanel(key) {
+    return keyed(machineOfKey(key), await api("GET", `${via(key)}/api/flywheel/panel?folder=${encodeURIComponent(pathOf(key))}`));
+  }
+
   async function loadPanel() {
     const folder = ui.folder;
     if (!folder) return;
@@ -145,10 +160,7 @@ window.FwHubFlywheel = function (ctx) {
     ui.loading = !ui.panel || ui.panel.folder !== folder;
     if (ui.loading) renderDrawer();
     try {
-      const panel = keyed(
-        machineOfKey(folder),
-        await api("GET", `${via(folder)}/api/flywheel/panel?folder=${encodeURIComponent(pathOf(folder))}`),
-      );
+      const panel = await readPanel(folder);
       if (seq !== ui.seq || ui.folder !== folder) return;
       const same = ui.panel && ui.panel.folder === folder && !ui.error && content(ui.panel) === content(panel);
       ui.panel = panel;
@@ -1270,5 +1282,13 @@ window.FwHubFlywheel = function (ctx) {
     openGate,
     startWorkerIn,
     pendingTasks,
+    // For the board (board.js).
+    summary,
+    readPanel,
+    keyOf,
+    pathOf,
+    labelFor,
+    loaded: () => ui.loaded,
+    enabled: () => ui.enabled,
   };
 };

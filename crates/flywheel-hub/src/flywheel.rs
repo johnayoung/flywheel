@@ -148,6 +148,19 @@ pub struct PanelPlan {
     pub needs: usize,
     /// Its tasks with a run in flight.
     pub running: usize,
+    /// Its tasks, in task-file id order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<PlanTask>,
+}
+
+/// One task of a plan: its light and its latest run's lifecycle status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanTask {
+    pub id: String,
+    pub state: TaskLight,
+    /// The latest run's lifecycle status (`running`, `validating`, ...);
+    /// none before its first run.
+    pub status: Option<String>,
 }
 
 /// An in-flight run (RUNNING / VALIDATING / AWAITING_APPROVAL), as the
@@ -1467,9 +1480,18 @@ mod tests {
             verified_24h: 1,
             needs: 0,
             running: 0,
+            tasks: vec![PlanTask {
+                id: "a".into(),
+                state: TaskLight::Verified,
+                status: Some("done".into()),
+            }],
         }];
         let summary = panel.summary();
         assert_eq!(summary.plans, panel.plans);
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap()["plans"][0]["tasks"][0]["status"],
+            "done"
+        );
         let mut value = serde_json::to_value(&summary).unwrap();
         assert_eq!(value["plans"][0]["verified_24h"], 1);
         value.as_object_mut().unwrap().remove("plans");

@@ -334,7 +334,7 @@ Sections: Appearance, Terminal (incl. lite mode), Keyboard (pane prefix, key bar
 
 ## Keyboard shortcuts
 
-In a terminal (fixed): **Shift+Enter** types a newline (`^J`: a new prompt line in agents, Enter in a shell). **Ctrl+C** copies a selection (none: `^C`); **Ctrl+V** pastes (image-only clipboard: `^V`, for Claude Code). macOS: Cmd+C/V (Ctrl stays the terminal's). Shift+drag selects under mouse reporting.
+In a terminal (fixed): **Shift+Enter** types a newline (`^J`: a new prompt line in agents, Enter in a shell). **Ctrl+C** copies a selection (none: `^C`); **Ctrl+V** pastes (image-only clipboard: `^V`, for Claude Code). macOS: Cmd+C/V. Shift+drag selects under mouse reporting.
 
 `session.reference` (`alt+i`) puts another session into the focused one, at the cursor and unsent: a reference its agent reads live (`fw hub read <id> --source recent --lines 200`, same machine only), or that session's last 200 lines, pasted.
 

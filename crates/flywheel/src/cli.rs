@@ -16,6 +16,8 @@
 //! * core (single-task producer verbs): `interrupt`, `approve`, `reject`,
 //!   `say` (surface name) -> `steer` (core verb)
 //! * worker: `worker [--once] [--task ID]` -> the git-worktree daemon loop
+//! * reland: `reland TASK_ID [--db PATH]` -> one landing attempt for a
+//!   parked task (`flywheel_worktree::reland`)
 //! * daemons: `autopilot`, `triage` (and the headless
 //!   `autopilot-supervised` run path)
 //! * audit: `audit RUN_ID` -> the core audit stream; `audit --project
@@ -165,6 +167,7 @@ Verbs:
   archive          move done phases out of active/
   recover          finalize stranded lifecycles
   resolve ID        abandon a strand (--reason TEXT) so its phase archives
+  reland TASK_ID   retry a parked task's landing on its branch head (--db PATH)
   recheck-blocked  re-evaluate blocked lifecycles' requires
   validate         statically validate active tasks' graders (lint)
   audit RUN_ID     stream the totally-ordered audit records for a run
@@ -357,6 +360,11 @@ pub fn route(
                 2
             }
         };
+    }
+    if verb == flywheel_worktree::reland::RELAND_VERB {
+        // One operator-initiated landing attempt for a parked task, through
+        // the worker's strategy and the orchestrator's re-land entry point.
+        return flywheel_worktree::reland::main_with(rest, out, err);
     }
     if verb == AUTOPILOT_VERB {
         // The autopilot intake daemon: neverending by default; --once runs
@@ -1357,6 +1365,22 @@ mod tests {
             .into_iter()
             .map(|c| (c.kind, serde_json::Value::Object(c.payload)))
             .collect()
+    }
+
+    // --- reland ------------------------------------------------------------------
+
+    #[test]
+    fn reland_is_listed_and_routes_help_and_usage() {
+        assert!(USAGE.contains("\n  reland TASK_ID"));
+        let (code, out, err) = run(&["reland", "--help"], &unbound());
+        assert_eq!(code, 0, "{err}");
+        assert!(out.contains("fw reland TASK_ID [--db PATH]"), "{out}");
+        let (code, out, err) = run(&["reland"], &unbound());
+        assert_eq!(code, 2);
+        assert_eq!(out, "");
+        assert!(err.contains("TASK_ID"), "{err}");
+        let (code, _out, _err) = run(&["reland", "a", "b"], &unbound());
+        assert_eq!(code, 2);
     }
 
     // --- top-level surface ---------------------------------------------------

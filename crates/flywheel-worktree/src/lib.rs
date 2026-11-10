@@ -14,6 +14,7 @@ pub mod disk_preflight;
 pub mod phase;
 pub mod pool;
 pub mod pr;
+pub mod reland;
 pub mod retention;
 pub mod scoped;
 pub mod submit_registry;

@@ -1,6 +1,6 @@
 # Hub API
 
-Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads. Front door: [hub](../hub.md).
+Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Front door: [hub](../hub.md).
 
 ## Conventions
 
@@ -14,7 +14,7 @@ Routes (`docs_drift.rs`: exactly the mounted ones), WebSockets, plugin payloads.
 |---|---|---|
 | GET / POST | `/api/workspaces` | list (with `templates`) / create `{"name","folders"}` |
 | GET / PATCH / DELETE | `/api/workspaces/{id}` | PATCH `name` / `folders`; 409 a running session's folder / sessions running |
-| GET / PUT | `/api/workspaces/{id}/layout` | `{"rev","tabs":[{"id","name","root"}]}`; node `{"type":"pane","id","session"?}` or `{"type":"split","dir":"right\|down","ratio","a","b"}`; PUT -> `rev`+1; 409 stale; 400 invalid (ratio 0.05..0.95, 12 tabs / 12 panes) |
+| GET / PUT | `/api/workspaces/{id}/layout` | `{"rev","tabs":[{"id","name","root"}]}`; node `{"type":"pane","id","session"?}` or `{"type":"split","dir":"right\|down","ratio","a","b"}`; tab root may be `{"type":"board","id","folder"}` (workspace folder, one each); PUT -> `rev`+1; 409 stale; 400 invalid (ratio 0.05..0.95, 12 tabs / 12 panes) |
 | POST | `/api/workspaces/import` | `{"path","name"?,"update"?}` (hub-side file): 201 / 200 updated / 409 taken |
 | GET | `/api/code-workspaces[?root=]` | `.code-workspace` files under `--import-root` |
 | GET | `/api/folders/check?path=` | `ok`, `git` / `error` |

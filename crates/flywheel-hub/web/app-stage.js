@@ -87,9 +87,11 @@ function renderStage() {
 // changes and the stage is rebuilt with its terminal.
 const shape = (node) => (!node ? null : node.type === "pane"
   ? (node.session === null || !state.panes.has(node.id) ? `${node.id}:empty` : node.id)
+  : L.isBoard(node) ? ["board", node.id, node.folder]
   : [node.dir, shape(node.a), shape(node.b)]);
 
 function buildNode(node, path) {
+  if (L.isBoard(node)) return boardStage(node);
   if (node.type === "pane") {
     const pane = state.panes.get(node.id);
     if (pane) return pane.el;
@@ -129,6 +131,19 @@ function restyle(node, path) {
   if (box) styleSplit(box, node);
   restyle(node.a, path + "a");
   restyle(node.b, path + "b");
+}
+
+// A board tab's stage: the container the flywheel board of `folder`
+// renders into.
+function boardStage(node) {
+  const folder = (workspaceById(state.view) || { folders: [] }).folders.find((f) => f.path === node.folder);
+  return el(
+    "section",
+    { className: "board-stage", dataset: { fwBoard: node.folder }, "aria-label": `Flywheel board of ${node.folder}` },
+    el("header", { className: "board-head" },
+      el("strong", { textContent: (folder && folder.name) || node.folder.split("/").pop() || node.folder }),
+      el("span", { className: "path-tail", textContent: node.folder, title: node.folder })),
+  );
 }
 
 // A pane with no session (its session was closed, or a new tab): the

@@ -62,8 +62,21 @@ impl Hub {
     }
 
     pub fn update_workspace(&self, id: &str, input: WorkspaceInput) -> Result<Workspace, HubError> {
-        let workspace = self.store().update_workspace(id, input)?;
+        let (workspace, relaid) = {
+            let mut store = self.store();
+            let before = store.layout(id)?.rev;
+            let workspace = store.update_workspace(id, input)?;
+            let rev = store.layout(id)?.rev;
+            (workspace, (rev != before).then_some(rev))
+        };
         self.emit(HubEvent::Sessions);
+        if let Some(rev) = relaid {
+            // A board of a dropped folder closed.
+            self.emit(HubEvent::Layout {
+                workspace_id: id.to_owned(),
+                rev,
+            });
+        }
         Ok(workspace)
     }
 

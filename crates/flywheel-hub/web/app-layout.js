@@ -197,12 +197,21 @@ function activeTab(workspaceId = state.view) {
   return layout.tabs.find((t) => t.id === view.tab) || layout.tabs[0];
 }
 
-// The leaf (data, not pane object) that has focus in the active tab.
+// The tab sessions open into: the active one, or -- while a board is
+// active -- the first tab of panes (null: there is none).
+function paneTab(workspaceId = state.view) {
+  const tab = activeTab(workspaceId);
+  if (!tab || !L.isBoard(tab.root)) return tab;
+  return layoutOf(workspaceId).tabs.find((t) => !L.isBoard(t.root)) || null;
+}
+
+// The leaf (data, not pane object) that has focus in the active tab
+// (null on a board).
 function focusedLeaf() {
   const tab = activeTab();
   if (!tab) return null;
   const leaves = L.panes(tab.root);
-  return leaves.find((p) => p.id === viewOf(state.view).focus[tab.id]) || leaves[0];
+  return leaves.find((p) => p.id === viewOf(state.view).focus[tab.id]) || leaves[0] || null;
 }
 
 const zoomedIn = (tab) => {
@@ -362,7 +371,9 @@ async function openSession(id, place = {}) {
     return;
   }
   const layout = layoutOf(workspaceId);
-  const tab = activeTab();
+  // On a board, the session opens in a tab of panes, which comes forward.
+  const onBoard = L.isBoard((activeTab() || {}).root);
+  const tab = paneTab();
   const where = [tab, ...layout.tabs.filter((t) => t !== tab)].filter(Boolean)
     .map((t) => ({ tab: t, leaf: L.paneShowing(t.root, id) }))
     .find((hit) => hit.leaf);
@@ -386,21 +397,28 @@ async function openSession(id, place = {}) {
     return;
   }
   if (!tab) {
-    const fresh = L.tab("main", id);
+    if (layout.tabs.length >= L.MAX_TABS) {
+      commands.toast(`At most ${L.MAX_TABS} tabs per workspace.`, { timeout: 3000 });
+      return;
+    }
+    const fresh = L.tab(L.uniqueTabName(layout, "main"), id);
     view.tab = fresh.id;
     view.focus[fresh.id] = fresh.root.id;
     saveViews();
     await editLayout(workspaceId, (draft) => {
-      if (draft.tabs.length) {
+      const panesTab = draft.tabs.find((t) => !L.isBoard(t.root));
+      if (panesTab) {
         // Another browser laid it out meanwhile: show it in its first tab.
-        const first = L.panes(draft.tabs[0].root)[0];
-        if (!L.sessionsOf(draft.tabs[0].root).includes(id)) first.session = id;
+        const first = L.panes(panesTab.root)[0];
+        if (!L.sessionsOf(panesTab.root).includes(id)) first.session = id;
         return;
       }
+      if (draft.tabs.length >= L.MAX_TABS || draft.tabs.some((t) => t.name.toLowerCase() === fresh.name.toLowerCase())) return false;
       draft.tabs.push(L.clone(fresh));
     });
     return;
   }
+  if (onBoard) view.tab = tab.id;
   const target = place.pane ? L.findPane(tab.root, place.pane) : focusedLeaf();
   if (!target) return;
   if (place.split && !roomToSplit(tab, target.id, place.split, place.ratio || 0.5)) {
@@ -437,6 +455,7 @@ async function openSession(id, place = {}) {
       done.pane.id = freshId;
       t.root = done.root;
     });
+    if (onBoard) renderStage();
     return;
   }
   view.focus[tab.id] = target.id;
@@ -450,6 +469,48 @@ async function openSession(id, place = {}) {
     if (other) other.session = leaf.session;
     leaf.session = id;
     if (other && !other.session) t.root = L.close(t.root, other.id) || t.root;
+  });
+  if (onBoard) renderStage();
+}
+
+// Show folder `folder`'s board in workspace `workspaceId`: its board tab
+// comes forward, added when it has none (desktop only).
+async function openBoard(workspaceId, folder) {
+  const workspace = workspaceById(workspaceId);
+  if (!workspace || phone() || !workspace.folders.some((f) => f.path === folder)) return;
+  try {
+    await ensureLayout(workspaceId);
+  } catch (error) {
+    commands.toast(`Layout not loaded: ${error.message}`, { tone: "bad", timeout: 5000 });
+    return;
+  }
+  state.view = workspaceId;
+  rememberWorkspace(workspaceId);
+  const layout = layoutOf(workspaceId);
+  const have = L.boardOf(layout, folder);
+  if (have) {
+    selectTab(have.id);
+    return;
+  }
+  if (layout.tabs.length >= L.MAX_TABS) {
+    commands.toast(`At most ${L.MAX_TABS} tabs per workspace.`, { timeout: 3000 });
+    return;
+  }
+  const named = workspace.folders.find((f) => f.path === folder);
+  const fresh = L.boardTab(L.uniqueTabName(layout, `board ${(named && named.name) || folder.split("/").pop() || folder}`), folder);
+  const view = viewOf(workspaceId);
+  view.tab = fresh.id;
+  saveViews();
+  await editLayout(workspaceId, (draft) => {
+    const other = L.boardOf(draft, folder);
+    if (other) {
+      // Another browser added it meanwhile: show theirs.
+      view.tab = other.id;
+      saveViews();
+      return false;
+    }
+    if (draft.tabs.length >= L.MAX_TABS || draft.tabs.some((t) => t.name.toLowerCase() === fresh.name.toLowerCase())) return false;
+    draft.tabs.push(L.clone(fresh));
   });
 }
 

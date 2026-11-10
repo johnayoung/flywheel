@@ -1,18 +1,18 @@
 # Hub internals
 
-How the hub works underneath. Front door: [hub](../hub.md).
+Front door: [hub](../hub.md).
 
 ## Model
 
 - **Workspace**: unique name + 1..32 **folders** (existing dirs, git or plain), optionally labelled; a **missing** one refuses new sessions.
 - **Session**: one PTY in one folder: `shell` (`$SHELL` or an argv), `claude`, or `codex` (on the hub's `PATH`, else 400). `running`, `exited` (code or signal; scrollback stays), or `stopped` (hub stopped; `last_cwd`, `restore_error`).
-- `state.json`: atomic, schema 5; older migrate, newer refused. Kill hangs up the leader's group and background jobs (Linux: `/proc`).
+- `state.json`: atomic, schema 6; older migrate, newer refused. Kill hangs up the leader's group and background jobs (Linux: `/proc`).
 - One terminal size (max 500x300): a pane resizes the PTY only while focused or sole viewer; others clip. Input past 4 MiB queued for a stalled terminal is dropped (`nack` + `error`).
 - Env: [hub-reference](reference.md#environment), minus enclosing-agent markers (`CLAUDECODE`, `CLAUDE_CODE_*`, `AI_AGENT`, `CODEX_SANDBOX`, ...).
 
 ## Terminal emulation
 
-- One `alacritty_terminal` emulator per session; attach = a **snapshot** (scrollback, screens, cursor, pen, modes, title, palette), then live bytes, no gap or overlap. 2 MiB of scrollback; a client behind gets the screen only.
+- One `alacritty_terminal` emulator per session; attach = a **snapshot** (scrollback, screens, cursor, pen, modes, title, palette), then live bytes, no gap. 2 MiB of scrollback; a client behind gets the screen only.
 - Weak links: recent output (kept across `upgrade`) resumes a dropped viewer, row diffs pace slow ones ([hub-api](api.md#terminal-websocket)).
 - Not replayed: custom tab stops, blink/overline. Not emulated: `?47`/`?1047`, kitty keyboard.
 - The server answers terminal queries (DA, DSR, DECRQM, OSC 4/10/11/12) once; clients must not. Colours: the last viewer-reported theme (dark first).
@@ -85,6 +85,7 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 
 - Tab bar: `+`, double-click renames, middle-click closes. A sidebar session dropped on a pane edge splits, mid-pane shows it. A new-shell split opens an agent's companion first.
 - Panes stay 40x8 cells+ (else a new tab). Closing a pane leaves its session running; removing one closes its panes, empty tabs. Only the active tab attaches; 12 tabs, 12 panes each. Phones (< 760 px): one pane, a chip row switches.
+- Board tab: a folder's flywheel board (tab strip, palette `Board:`), root only; outlives sessions, closes with its folder.
 - Browser checks (opt-in; env `FW`, `PLAYWRIGHT`, `CHROMIUM`): `node crates/flywheel-hub/e2e/{layout,network}.mjs` (network: 400/150 kbps, 300 ms).
 
 ## Web UI

@@ -73,13 +73,20 @@ function paletteCommands() {
     const layout = viewLayout();
     if (layout) {
       layout.tabs.forEach((t, i) => {
-        if (t !== tab) cmd(`Tab: ${t.name}`, `${L.panes(t.root).length} panes${prefix.on && i < 9 ? ` · ${prefixLabel} ${i + 1}` : ""}`, () => selectTab(t.id), "chev");
+        if (t !== tab) cmd(`Tab: ${t.name}`, `${L.isBoard(t.root) ? "board" : `${L.panes(t.root).length} panes`}${prefix.on && i < 9 ? ` · ${prefixLabel} ${i + 1}` : ""}`, () => selectTab(t.id), "chev");
       });
       if (tab) {
         cmd(`Rename tab ${tab.name}`, prefix.on ? `${prefixLabel} ${settings.keyOf("prefix.rename_tab")}` : "double-click the tab", () => {
           tabRenaming = tab.id;
           renderTabs();
         }, "pen");
+      }
+    }
+  }
+  if (!phone()) {
+    for (const w of state.workspaces) {
+      for (const f of w.folders || []) {
+        cmd(`Board: ${w.name} / ${f.name || f.path.split("/").pop() || f.path}`, f.path, () => openBoard(w.id, f.path), "wheel");
       }
     }
   }

@@ -85,6 +85,10 @@ impl HubStore {
             fanouts.retain(|f| workspaces.iter().any(|w| w.id == f.workspace_id));
             pruned |= fanouts.len() != before;
             for (workspace_id, layout) in layouts.iter_mut() {
+                let workspace = workspaces.iter().find(|w| &w.id == workspace_id);
+                let boards_gone = layout.prune_boards(|folder| {
+                    workspace.is_some_and(|w| w.has_folder(Path::new(folder)))
+                });
                 let mut stale: Vec<String> = Vec::new();
                 for tab in &layout.tabs {
                     for (_, session) in tab.root.panes() {
@@ -97,7 +101,7 @@ impl HubStore {
                         }
                     }
                 }
-                let mut changed = false;
+                let mut changed = boards_gone;
                 for session in stale {
                     changed |= layout.prune_session(&session);
                 }
@@ -237,6 +241,7 @@ impl HubStore {
             )));
         }
         let previous = self.doc.workspaces[index].clone();
+        let previous_layout = self.doc.layouts.get(id).cloned();
         let workspace = &mut self.doc.workspaces[index];
         if let Some(name) = name {
             workspace.name = name;
@@ -245,7 +250,18 @@ impl HubStore {
             workspace.folders = folders;
         }
         let updated = workspace.clone();
-        self.save_or_rollback(|doc| doc.workspaces[index] = previous)?;
+        // A board of a dropped folder closes with it.
+        if let Some(layout) = self.doc.layouts.get_mut(id)
+            && layout.prune_boards(|folder| updated.has_folder(Path::new(folder)))
+        {
+            layout.rev += 1;
+        }
+        self.save_or_rollback(|doc| {
+            doc.workspaces[index] = previous;
+            if let Some(layout) = previous_layout {
+                doc.layouts.insert(id.to_owned(), layout);
+            }
+        })?;
         Ok(updated)
     }
 
@@ -628,7 +644,8 @@ impl HubStore {
 
     /// Replace a workspace's layout, written against revision `rev` (the
     /// one the client last read): a stale `rev` is a conflict. Panes may
-    /// show only the workspace's own sessions. Returns the saved layout
+    /// show only the workspace's own sessions, boards only its own folders.
+    /// Returns the saved layout
     /// (its `rev` one higher).
     pub fn set_layout(
         &mut self,
@@ -650,7 +667,12 @@ impl HubStore {
             .filter(|s| s.workspace_id == workspace_id)
             .map(|s| s.id.as_str())
             .collect();
-        crate::layout::validate(&mut tabs, &sessions).map_err(StateError::Invalid)?;
+        let folders: HashSet<&str> = self.doc.workspaces[self.workspace_index(workspace_id)?]
+            .folders
+            .iter()
+            .filter_map(|f| f.path.to_str())
+            .collect();
+        crate::layout::validate(&mut tabs, &sessions, &folders).map_err(StateError::Invalid)?;
         let layout = Layout {
             rev: current.rev + 1,
             tabs,

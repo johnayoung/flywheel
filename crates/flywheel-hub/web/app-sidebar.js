@@ -635,8 +635,10 @@ function renderMain() {
   // An empty tab of a workspace that is open (a new tab, its sessions
   // closed): the stage offers that workspace's sessions.
   const emptyTab = !session && !phone() && state.view && workspaceById(state.view) && activeTab() ? focusedLeaf() : null;
-  const workspace = session ? workspaceById(session.workspace_id) : emptyTab ? workspaceById(state.view) : null;
-  $("#empty").hidden = !!session;
+  // A board tab fills the stage itself.
+  const onBoard = !session && !phone() && !!state.view && L.isBoard((activeTab() || {}).root);
+  const workspace = session ? workspaceById(session.workspace_id) : emptyTab || onBoard ? workspaceById(state.view) : null;
+  $("#empty").hidden = !!session || onBoard;
   $("#crumb-workspace").textContent = workspace ? workspace.name : "";
   // Its own element: it stays when a phone hides the workspace name.
   const onMachine = workspace && workspace.machine;
@@ -644,7 +646,7 @@ function renderMain() {
   $("#crumb-machine").replaceChildren(...(onMachine ? [machineBadge(workspace.machine)] : []));
   // A hub with nothing yet: the start screen, not a missing session.
   const nothingYet = !session && !emptyTab && !state.workspaces.length && !machines.any();
-  $("#crumb-session").textContent = session ? session.name : emptyTab ? "Empty pane" : nothingYet ? "Get started" : "No session";
+  $("#crumb-session").textContent = session ? session.name : emptyTab ? "Empty pane" : onBoard ? "Board" : nothingYet ? "Get started" : "No session";
   // Without a session the header's session controls mean nothing.
   $("#cmd-toggle").hidden = !session;
   $("#link").hidden = !session;

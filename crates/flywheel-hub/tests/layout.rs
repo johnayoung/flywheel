@@ -421,3 +421,64 @@ async fn every_viewer_hears_when_another_resizes_the_terminal() {
     drop((big, small));
     hub.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_tabs_are_refused_off_root_or_off_workspace_and_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let repo = dir.path().join("repo");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let hub = TestHub::start(state_dir.clone()).await;
+    use reqwest::Method;
+
+    let (status, ws) = hub
+        .call(
+            Method::POST,
+            "/api/workspaces",
+            Some(json!({ "name": "w", "folders": [repo] })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let wid = ws["id"].as_str().unwrap().to_owned();
+    let folder = ws["folders"][0]["path"].as_str().unwrap().to_owned();
+    let path = format!("/api/workspaces/{wid}/layout");
+    let board = |id: &str, folder: &str| json!({ "type": "board", "id": id, "folder": folder });
+
+    let tabs = json!([
+        { "id": "t1", "name": "shell", "root": pane("p1", None) },
+        { "id": "t2", "name": "board", "root": board("b1", &folder) },
+    ]);
+    let (status, saved) = hub
+        .call(Method::PUT, &path, Some(json!({ "rev": 0, "tabs": tabs })))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["tabs"][1]["root"], board("b1", &folder));
+
+    let outside = elsewhere.canonicalize().unwrap();
+    for (tabs, why) in [
+        (
+            json!([{ "id": "t1", "name": "a", "root": board("b1", outside.to_str().unwrap()) }]),
+            "not a folder of this workspace",
+        ),
+        (
+            json!([{ "id": "t1", "name": "a", "root": split("right", 0.5, pane("p1", None), board("b1", &folder)) }]),
+            "tab's root",
+        ),
+    ] {
+        let (status, body) = hub
+            .call(Method::PUT, &path, Some(json!({ "rev": 1, "tabs": tabs })))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap().contains(why), "{body}");
+    }
+    let (_, read) = hub.call(Method::GET, &path, None).await;
+    assert_eq!(read, saved, "a refused write leaves the layout unchanged");
+
+    hub.shutdown().await;
+    let restarted = TestHub::start(state_dir).await;
+    let (_, after) = restarted.call(Method::GET, &path, None).await;
+    assert_eq!(after, saved);
+    restarted.shutdown().await;
+}

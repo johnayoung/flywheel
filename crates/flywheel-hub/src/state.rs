@@ -24,11 +24,11 @@ use std::path::{Path, PathBuf};
 pub const STATE_FILE: &str = "state.json";
 /// On-disk schema version: 2 added per-workspace `layouts`, 3 launch
 /// `templates` (and sessions' `launch` options), 4 verified `fanouts`, 5
-/// per-session prompt `queues`.
+/// per-session prompt `queues`, 6 board tabs in layouts.
 /// Older files load and are written back as the current version; a newer
 /// hub's file is refused rather than rewritten without what it does not
 /// know.
-pub const STATE_VERSION: u32 = 5;
+pub const STATE_VERSION: u32 = 6;
 /// The oldest schema version still loaded.
 pub const STATE_VERSION_MIN: u32 = 1;
 /// Limits on workspace input.

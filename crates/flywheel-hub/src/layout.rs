@@ -15,6 +15,10 @@
 //!    "a": {"type": "pane", "id": "p1", "session": "<session id>"},
 //!    "b": {"type": "pane", "id": "p2", "session": null}}}]}
 //! ```
+//!
+//! A tab's root may instead be a flywheel board bound to one of the
+//! workspace's folders (never nested in a split; one per folder):
+//! `{"type": "board", "id": "b1", "folder": "/abs/path"}`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -56,7 +60,8 @@ pub enum SplitDir {
     Down,
 }
 
-/// A tab's tree: a pane, or a split of two subtrees.
+/// A tab's tree: a pane, or a split of two subtrees -- or, only as a
+/// tab's root, a board.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Node {
@@ -72,6 +77,13 @@ pub enum Node {
         ratio: f64,
         a: Box<Node>,
         b: Box<Node>,
+    },
+    /// The flywheel board of one of the workspace's folders. Holds no
+    /// panes, so session pruning never closes it.
+    Board {
+        id: String,
+        /// Canonical absolute path of the workspace folder it shows.
+        folder: String,
     },
 }
 
@@ -90,6 +102,7 @@ impl Node {
                 a.collect(out);
                 b.collect(out);
             }
+            Self::Board { .. } => {}
         }
     }
 
@@ -104,6 +117,7 @@ impl Node {
                     Pruned::Unchanged
                 }
             }
+            Self::Board { .. } => Pruned::Unchanged,
             Self::Split { a, b, .. } => match (a.prune(session_id), b.prune(session_id)) {
                 (Pruned::Closed, Pruned::Closed) => Pruned::Closed,
                 (Pruned::Closed, _) => {
@@ -142,8 +156,8 @@ impl Layout {
     /// Close every pane showing `session_id`: its sibling takes the
     /// split's place, and a tab left without panes closes -- as closing
     /// its last pane does in the UI -- unless it is the workspace's only
-    /// tab, which stays as one empty pane. Returns whether the layout
-    /// changed (the caller bumps `rev`).
+    /// tab of panes, which stays as one empty pane. Board tabs are never
+    /// closed. Returns whether the layout changed (the caller bumps `rev`).
     pub fn prune_session(&mut self, session_id: &str) -> bool {
         let mut changed = false;
         let mut emptied = Vec::new();
@@ -164,12 +178,25 @@ impl Layout {
                 }
             }
         }
-        // Emptied tabs go, the first one staying when nothing else would.
-        let keep_one = emptied.len() == self.tabs.len();
+        // Emptied tabs go, the first one staying when no other pane tab
+        // would.
+        let pane_tabs = self.tabs.iter().filter(|t| !t.is_board()).count();
+        let keep_one = emptied.len() == pane_tabs;
         for index in emptied.into_iter().skip(usize::from(keep_one)).rev() {
             self.tabs.remove(index);
         }
         changed
+    }
+
+    /// Close every board tab whose folder `keep` refuses (one the
+    /// workspace no longer has). Returns whether the layout changed.
+    pub fn prune_boards(&mut self, keep: impl Fn(&str) -> bool) -> bool {
+        let before = self.tabs.len();
+        self.tabs.retain(|t| match &t.root {
+            Node::Board { folder, .. } => keep(folder),
+            _ => true,
+        });
+        self.tabs.len() != before
     }
 
     /// Whether any pane shows `session_id`.
@@ -188,15 +215,29 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+impl Tab {
+    /// Whether this tab is a board (rather than panes).
+    pub fn is_board(&self) -> bool {
+        matches!(self.root, Node::Board { .. })
+    }
+}
+
 /// Check `tabs` (as a client sent them) and normalize tab names (trimmed).
 /// `sessions`: the ids of the workspace's sessions; a pane may show only
-/// one of those, and a session at most once per tab.
-pub fn validate(tabs: &mut [Tab], sessions: &HashSet<&str>) -> Result<(), String> {
+/// one of those, and a session at most once per tab. `folders`: the
+/// workspace's folder paths; a board may show only one of those, at most
+/// once per layout, and only as a tab's root.
+pub fn validate(
+    tabs: &mut [Tab],
+    sessions: &HashSet<&str>,
+    folders: &HashSet<&str>,
+) -> Result<(), String> {
     if tabs.len() > MAX_TABS {
         return Err(format!("at most {MAX_TABS} tabs per workspace"));
     }
     let mut ids: HashSet<String> = HashSet::new();
     let mut names: HashSet<String> = HashSet::new();
+    let mut boards: HashSet<String> = HashSet::new();
     for tab in tabs.iter_mut() {
         if !valid_id(&tab.id) {
             return Err(format!(
@@ -223,6 +264,18 @@ pub fn validate(tabs: &mut [Tab], sessions: &HashSet<&str>) -> Result<(), String
             return Err(format!("two tabs are named {name:?}"));
         }
         tab.name = name.to_owned();
+        if let Node::Board { id, folder } = &tab.root {
+            check_id("board", id, &mut ids)?;
+            if !folders.contains(folder.as_str()) {
+                return Err(format!(
+                    "board folder {folder:?} is not a folder of this workspace"
+                ));
+            }
+            if !boards.insert(folder.clone()) {
+                return Err(format!("two boards show folder {folder:?}"));
+            }
+            continue;
+        }
         let mut shown: HashSet<&str> = HashSet::new();
         let mut count = 0;
         check_node(
@@ -246,14 +299,7 @@ fn check_node<'a>(
             if *count > MAX_PANES {
                 return Err(format!("tab {tab:?}: at most {MAX_PANES} panes"));
             }
-            if !valid_id(id) {
-                return Err(format!(
-                    "pane id {id:?}: 1-{MAX_ID} letters, digits, '-' or '_'"
-                ));
-            }
-            if !ids.insert(id.clone()) {
-                return Err(format!("id {id:?} is used twice"));
-            }
+            check_id("pane", id, ids)?;
             if let Some(session) = session {
                 if !sessions.contains(session.as_str()) {
                     return Err(format!(
@@ -276,7 +322,22 @@ fn check_node<'a>(
             check_node(a, tab, sessions, ids, shown, count)?;
             check_node(b, tab, sessions, ids, shown, count)
         }
+        Node::Board { .. } => Err(format!(
+            "tab {tab:?}: a board must be a tab's root, not inside a split"
+        )),
     }
+}
+
+fn check_id(kind: &str, id: &str, ids: &mut HashSet<String>) -> Result<(), String> {
+    if !valid_id(id) {
+        return Err(format!(
+            "{kind} id {id:?}: 1-{MAX_ID} letters, digits, '-' or '_'"
+        ));
+    }
+    if !ids.insert(id.to_owned()) {
+        return Err(format!("id {id:?} is used twice"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -311,6 +372,17 @@ mod tests {
         ["s1", "s2", "s3"].into_iter().collect()
     }
 
+    fn folders() -> HashSet<&'static str> {
+        ["/w/one", "/w/two"].into_iter().collect()
+    }
+
+    fn board(id: &str, folder: &str) -> Node {
+        Node::Board {
+            id: id.into(),
+            folder: folder.into(),
+        }
+    }
+
     #[test]
     fn parses_and_round_trips_the_documented_shape() {
         let json = r#"{"rev":3,"tabs":[{"id":"t1","name":"agents","root":
@@ -331,7 +403,7 @@ mod tests {
     fn validates_ids_names_ratios_sessions_and_limits() {
         let ok = |tabs: Vec<Tab>| {
             let mut tabs = tabs;
-            validate(&mut tabs, &sessions()).map(|()| tabs)
+            validate(&mut tabs, &sessions(), &folders()).map(|()| tabs)
         };
         let tabs = ok(vec![
             tab(
@@ -444,5 +516,85 @@ mod tests {
         assert_eq!(layout.tabs.len(), 1);
         assert_eq!(layout.tabs[0].id, "t1");
         assert_eq!(layout.tabs[0].root, pane("p1", None));
+    }
+
+    #[test]
+    fn board_tab_parses_as_the_documented_shape() {
+        let json = r#"{"rev":1,"tabs":[{"id":"t1","name":"board","root":
+            {"type":"board","id":"b1","folder":"/w/one"}}]}"#;
+        let layout: Layout = serde_json::from_str(json).unwrap();
+        assert_eq!(layout.tabs[0].root, board("b1", "/w/one"));
+        assert!(layout.tabs[0].is_board());
+        assert!(layout.tabs[0].root.panes().is_empty());
+        let raw: serde_json::Value = serde_json::to_value(&layout.tabs[0].root).unwrap();
+        assert_eq!(
+            raw,
+            serde_json::json!({"type": "board", "id": "b1", "folder": "/w/one"})
+        );
+    }
+
+    #[test]
+    fn board_tabs_validate_only_as_roots_of_workspace_folders() {
+        let check = |tabs: Vec<Tab>| {
+            let mut tabs = tabs;
+            validate(&mut tabs, &sessions(), &folders())
+        };
+        check(vec![
+            tab("t1", "a", pane("p1", Some("s1"))),
+            tab("t2", "one", board("b1", "/w/one")),
+            tab("t3", "two", board("b2", "/w/two")),
+        ])
+        .unwrap();
+        let err = |tabs: Vec<Tab>| check(tabs).unwrap_err();
+        assert!(err(vec![tab("t1", "a", board("b1", "/elsewhere"))]).contains("not a folder"));
+        assert!(
+            err(vec![tab(
+                "t1",
+                "a",
+                split(SplitDir::Right, pane("p1", None), board("b1", "/w/one"))
+            )])
+            .contains("tab's root")
+        );
+        assert!(
+            err(vec![
+                tab("t1", "a", board("b1", "/w/one")),
+                tab("t2", "b", board("b2", "/w/one"))
+            ])
+            .contains("two boards")
+        );
+        assert!(err(vec![tab("t1", "a", board("b/1", "/w/one"))]).contains("board id"));
+        assert!(err(vec![tab("t1", "a", board("t1", "/w/one"))]).contains("twice"));
+    }
+
+    #[test]
+    fn pruning_the_last_session_keeps_the_board_tab() {
+        let mut layout = Layout {
+            rev: 1,
+            tabs: vec![
+                tab("t1", "a", pane("p1", Some("s1"))),
+                tab("t2", "board", board("b1", "/w/one")),
+                tab("t3", "c", pane("p2", Some("s1"))),
+            ],
+        };
+        assert!(layout.prune_session("s1"));
+        assert_eq!(layout.tabs.len(), 2);
+        assert_eq!(layout.tabs[0].root, pane("p1", None));
+        assert_eq!(layout.tabs[1].root, board("b1", "/w/one"));
+    }
+
+    #[test]
+    fn pruning_boards_drops_only_those_of_removed_folders() {
+        let mut layout = Layout {
+            rev: 1,
+            tabs: vec![
+                tab("t1", "a", pane("p1", None)),
+                tab("t2", "one", board("b1", "/w/one")),
+                tab("t3", "two", board("b2", "/w/two")),
+            ],
+        };
+        assert!(!layout.prune_boards(|_| true));
+        assert!(layout.prune_boards(|f| f == "/w/one"));
+        let ids: Vec<&str> = layout.tabs.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["t1", "t2"]);
     }
 }

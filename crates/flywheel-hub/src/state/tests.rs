@@ -946,6 +946,76 @@ fn layouts_persist_per_workspace_with_revisions() {
     assert!(raw["layouts"].get(&ws.id).is_none(), "{raw}");
 }
 
+fn board_tab(id: &str, folder: &Path) -> Tab {
+    Tab {
+        id: id.into(),
+        name: format!("board {id}"),
+        root: crate::layout::Node::Board {
+            id: format!("{id}b"),
+            folder: folder.to_str().unwrap().into(),
+        },
+    }
+}
+
+#[test]
+fn board_tabs_persist_refuse_foreign_folders_and_close_with_their_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo(dir.path(), "r").canonicalize().unwrap();
+    let other = git_repo(dir.path(), "o").canonicalize().unwrap();
+    let mut store = HubStore::open(dir.path()).unwrap();
+    let ws = store
+        .create_workspace(input("w", vec![repo.clone(), other.clone()]))
+        .unwrap();
+    let s1 = running_session(&ws.id, &repo);
+    store.insert_session(s1.clone()).unwrap();
+    let saved = store
+        .set_layout(
+            &ws.id,
+            0,
+            vec![
+                Tab {
+                    id: "t1".into(),
+                    name: "a".into(),
+                    root: pane("p1", Some(&s1.id)),
+                },
+                board_tab("t2", &repo),
+                board_tab("t3", &other),
+            ],
+        )
+        .unwrap();
+    // A folder outside the workspace is refused; nothing changes.
+    let outside = dir.path().canonicalize().unwrap();
+    assert!(matches!(
+        store.set_layout(&ws.id, 1, vec![board_tab("t9", &outside)]),
+        Err(StateError::Invalid(_))
+    ));
+    assert_eq!(store.layout(&ws.id).unwrap(), saved);
+    drop(store);
+
+    let mut store = HubStore::open(dir.path()).unwrap();
+    assert_eq!(store.layout(&ws.id).unwrap(), saved);
+    // Removing the workspace's last session keeps its boards.
+    store.remove_session(&s1.id).unwrap();
+    let layout = store.layout(&ws.id).unwrap();
+    let ids: Vec<&str> = layout.tabs.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["t1", "t2", "t3"]);
+    assert_eq!(layout.tabs[0].root, pane("p1", None));
+    // Dropping a folder closes its board.
+    store
+        .update_workspace(
+            &ws.id,
+            WorkspaceInput {
+                repos: Some(vec![repo.clone()]),
+                ..WorkspaceInput::default()
+            },
+        )
+        .unwrap();
+    let layout = store.layout(&ws.id).unwrap();
+    assert_eq!(layout.rev, 3);
+    let ids: Vec<&str> = layout.tabs.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids, ["t1", "t2"]);
+}
+
 #[test]
 fn version_1_files_migrate_and_stale_layout_entries_are_pruned_on_load() {
     let dir = tempfile::tempdir().unwrap();
@@ -1066,7 +1136,7 @@ fn a_version_4_file_with_promoted_fanouts_migrates_to_queues_losing_neither() {
     let mut store = HubStore::open(dir.path()).unwrap();
     let written: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(written["version"], STATE_VERSION);
-    const _: () = assert!(STATE_VERSION == 5, "queues arrived in schema 5");
+    const _: () = assert!(STATE_VERSION >= 5, "queues arrived in schema 5");
     assert_eq!(store.fanout("f1").unwrap(), &fanout);
     let now = Utc::now();
     store

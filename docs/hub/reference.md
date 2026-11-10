@@ -1,12 +1,12 @@
 # Hub reference
 
-Every `fw hub` verb and flag and the hub's files (`docs_drift.rs` checks). Front door: [hub](../hub.md).
+Every `fw hub` verb, flag, and file (`docs_drift.rs` checks). Front door: [hub](../hub.md).
 
 ## Conventions
 
 - `SESSION` / `WS`: id, unique id prefix, or name (an exact name beats a prefix; `activity` also takes names its journal or a machine knows).
 - A closed output pipe (`| head -1`) ends a verb quietly, exit 0.
-- Exit codes: 0 ok, 1 failed, 2 bad usage/config, 3 no hub running for the state dir, 4 handoff refused as incompatible, 5 hub busy (retry). `doctor`, `tls`, `config` work without a hub (exit 0) and say so.
+- Exit codes: 0 ok, 1 failed, 2 bad usage/config, 3 no hub for the state dir, 4 handoff refused as incompatible, 5 hub busy (retry). `doctor`, `tls`, `config` work without a hub (exit 0) and say so.
 - Every verb but `report` takes `--state-dir DIR` (default `$FLYWHEEL_HOME/hub`).
 - `{remote}` = `[--url URL] [--token T] [--fingerprint SHA256]`: a hub elsewhere; prefer `FW_HUB_TOKEN` (argv is world-readable).
 - `{machine}` = `[--machine NAME]`: a machine registered on that hub, via its proxy; `{where}` = `{remote} {machine}`.
@@ -423,7 +423,7 @@ Also: `F2` / double-click renames and `Delete` closes a focused sidebar row.
 
 All files 0600, the dir 0700.
 
-- `token`; `logins.json` (login-cookie digests); `state.json` (workspaces, sessions, layouts, templates, fan-outs, queues; schema 5); `settings.json`; `hub.toml`, `notify.toml`.
+- `token`; `logins.json` (login-cookie digests); `state.json` (workspaces, sessions, layouts, templates, fan-outs, queues; schema 6); `settings.json`; `hub.toml`, `notify.toml`.
 - `server.json`, `serve.lock`, `report.sock`, `handoff.sock` (the running hub's address, lock, sockets); `hub.log[.1..3]`.
 - `machines.json` (plaintext credentials), `peers.json`, `shares.json` (digests); `commands/<id>.json` (blocks, replies, usage), `usage-archive.json` (removed sessions').
-- `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` (local CA); `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` (clients' last-active times); `digest.json`, `digest.lock` (last slot, recent digests); `open-<id>.html` (`open` redirect pages); `claude-accounts/<name>.token`.
+- `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` (local CA); `activity.jsonl`, `activity.<n>.jsonl`, `activity-clients.json` (clients' last activity); `digest.json`, `digest.lock` (last slot, recent digests); `open-<id>.html` (`open` redirect pages); `claude-accounts/<name>.token`.

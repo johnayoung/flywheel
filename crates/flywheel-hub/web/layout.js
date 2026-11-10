@@ -1,8 +1,10 @@
 // flywheel hub: pane layout trees (pure data, no DOM). A workspace's
 // layout is {rev, tabs:[{id, name, root}]}; a root is a pane
 // {type:"pane", id, session|null} or a split {type:"split", dir:"right"|
-// "down", ratio, a, b} (a: left / top). The server validates and stores
-// them (crates/flywheel-hub/src/layout.rs; keep the limits in step).
+// "down", ratio, a, b} (a: left / top), or -- only as a tab's root -- a
+// board {type:"board", id, folder} of one workspace folder. The server
+// validates and stores them (crates/flywheel-hub/src/layout.rs; keep the
+// limits in step).
 "use strict";
 
 window.FwHubLayout = (function () {
@@ -20,12 +22,16 @@ window.FwHubLayout = (function () {
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const pane = (session) => ({ type: "pane", id: newId("p"), session: session || null });
   const tab = (name, session) => ({ id: newId("t"), name, root: pane(session) });
+  const isBoard = (node) => !!node && node.type === "board";
+  const boardTab = (name, folder) => ({ id: newId("t"), name, root: { type: "board", id: newId("b"), folder } });
+  // The board tab showing `folder`, if any.
+  const boardOf = (layout, folder) => layout.tabs.find((t) => isBoard(t.root) && t.root.folder === folder) || null;
 
   // Every pane of a tree, left to right / top to bottom.
   function panes(node, out = []) {
     if (!node) return out;
     if (node.type === "pane") out.push(node);
-    else {
+    else if (node.type === "split") {
       panes(node.a, out);
       panes(node.b, out);
     }
@@ -39,7 +45,7 @@ window.FwHubLayout = (function () {
   // Replace the node with id `id` (pane) by `replacement`; returns the new
   // root (the tree is edited in place where possible).
   function replaceNode(root, id, replacement) {
-    if (root.type === "pane") return root.id === id ? replacement : root;
+    if (root.type !== "split") return root.id === id ? replacement : root;
     root.a = replaceNode(root.a, id, replacement);
     root.b = replaceNode(root.b, id, replacement);
     return root;
@@ -67,7 +73,7 @@ window.FwHubLayout = (function () {
   // Remove pane `id`; its sibling takes the split's place. Returns the new
   // root, or null when it was the last pane.
   function close(root, id) {
-    if (root.type === "pane") return root.id === id ? null : root;
+    if (root.type !== "split") return root.id === id ? null : root;
     if (root.a.type === "pane" && root.a.id === id) return root.b;
     if (root.b.type === "pane" && root.b.id === id) return root.a;
     root.a = close(root.a, id) || root.a;
@@ -77,7 +83,7 @@ window.FwHubLayout = (function () {
 
   // The split that directly contains pane / node `id`, with which side.
   function parentOf(root, id, parent = null, side = null) {
-    if (root.type === "pane") return root.id === id ? { parent, side } : null;
+    if (root.type !== "split") return root.id === id ? { parent, side } : null;
     return parentOf(root.a, id, root, "a") || parentOf(root.b, id, root, "b");
   }
 
@@ -89,7 +95,7 @@ window.FwHubLayout = (function () {
     // Walk up from the pane to the first split of `axis`.
     const path = [];
     (function walk(node) {
-      if (node.type === "pane") return node.id === id;
+      if (node.type !== "split") return node.id === id;
       for (const side of ["a", "b"]) {
         if (walk(node[side])) {
           path.push({ node, side });
@@ -143,6 +149,7 @@ window.FwHubLayout = (function () {
       out.set(root.id, { w: Math.max(0, w), h: Math.max(0, h) });
       return out;
     }
+    if (root.type !== "split") return out;
     if (root.dir === "right") {
       const inner = w - gap;
       boxes(root.a, inner * root.ratio, h, gap, out);
@@ -164,9 +171,19 @@ window.FwHubLayout = (function () {
     }
   }
 
+  // `base` itself when no tab has that name, else "base N".
+  function uniqueTabName(layout, base) {
+    const taken = new Set(layout.tabs.map((t) => t.name.toLowerCase()));
+    const stem = base.slice(0, MAX_TAB_NAME - 3);
+    if (!taken.has(stem.toLowerCase())) return stem;
+    for (let n = 2; ; n++) {
+      if (!taken.has(`${stem} ${n}`.toLowerCase())) return `${stem} ${n}`;
+    }
+  }
+
   return {
     MAX_TABS, MAX_PANES, MAX_TAB_NAME, MIN_RATIO,
-    newId, clone, pane, tab, panes, findPane, paneShowing, sessionsOf, split, close, parentOf,
+    newId, clone, pane, tab, isBoard, boardTab, boardOf, uniqueTabName, panes, findPane, paneShowing, sessionsOf, split, close, parentOf,
     resizePane, clampRatio, splitAt, prune, nextTabName, boxes,
   };
 })();

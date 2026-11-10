@@ -1,6 +1,6 @@
 # Hub
 
-`fw hub` is a web workspace for AI coding agents (Claude Code, Codex, shells) whose server owns every terminal: browsers, phones, and `fw hub attach` come and go; sessions carry on. Workspaces group folders; agents run there or in sibling worktrees, with live status, exact-copy commands, review, and verified fan-outs. Crate: `crates/flywheel-hub`.
+`fw hub` is a web workspace for AI coding agents (Claude Code, Codex, shells) whose server owns every terminal: browsers, phones, `fw hub attach` come and go; sessions carry on. Workspaces group folders; agents run there or in sibling worktrees, with live status, exact-copy commands, review, and verified fan-outs. Crate: `crates/flywheel-hub`.
 
 ## Security first
 

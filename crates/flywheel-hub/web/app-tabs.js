@@ -136,6 +136,7 @@ function renderTabs() {
       });
       return el("span", { className: "tab renaming" }, input);
     }
+    const board = L.isBoard(t.root);
     const count = L.sessionsOf(t.root).length;
     const urgent = L.sessionsOf(t.root).map(sessionById).filter(Boolean)
       .map((s) => agentStatus(s)?.status).find((s) => s === "blocked") ||
@@ -151,7 +152,7 @@ function renderTabs() {
       el("button", {
         type: "button",
         className: "tab-pick",
-        title: `${t.name}: ${count} pane${count === 1 ? "" : "s"}${i < 9 && settings.keyOf("prefix.arm") && settings.keyOf("prefix.tab") ? ` (${settings.keyOf("prefix.arm")} ${settings.keyOf("prefix.tab").replace("1-9", String(i + 1))} with the prefix on)` : ""}; double-click to rename`,
+        title: `${t.name}: ${board ? `board of ${t.root.folder}` : `${count} pane${count === 1 ? "" : "s"}`}${i < 9 && settings.keyOf("prefix.arm") && settings.keyOf("prefix.tab") ? ` (${settings.keyOf("prefix.arm")} ${settings.keyOf("prefix.tab").replace("1-9", String(i + 1))} with the prefix on)` : ""}; double-click to rename`,
         // The first click of a double-click on another tab switches to
         // it and rebuilds the bar, so the second lands on a new button:
         // a click's `detail` (2 on the second) starts the rename either way.
@@ -172,6 +173,7 @@ function renderTabs() {
           if (e.button === 1) closeTab(t.id);
         },
       },
+      board ? icon("wheel") : null,
       urgent ? el("span", { className: `tab-dot ${urgent}`, title: `an agent here is ${urgent}` }) : null,
       t.name,
       count > 1 ? el("b", { className: "tab-count", textContent: count }) : null),
@@ -183,8 +185,27 @@ function renderTabs() {
     el("span", { className: "tabs-ws", textContent: workspace ? workspace.name : "" }),
     el("div", { className: "tab-list", role: "tablist", "aria-label": "Tabs" }, tabs),
     layout.tabs.length < L.MAX_TABS ? iconButton("plus", withKey("New tab", "tab.new"), newTab) : null,
+    boardAdds(workspace, layout),
     zoomedIn(active) ? el("button", { type: "button", className: "zoom-pill", onclick: () => toggleZoom(zoomedIn(active)), title: withKey("Unzoom", "pane.zoom") }, "zoomed") : null,
   ].filter(Boolean));
+}
+
+// One control per folder of the workspace: show (or add) its board tab.
+function boardAdds(workspace, layout) {
+  if (!workspace || !workspace.folders || !workspace.folders.length) return null;
+  const several = workspace.folders.length > 1;
+  return el("div", { className: "board-adds", role: "group", "aria-label": "Boards" }, workspace.folders.map((f) => {
+    const name = f.name || f.path.split("/").pop() || f.path;
+    const shown = L.boardOf(layout, f.path);
+    return el("button", {
+      type: "button",
+      className: `board-add${shown && shown === activeTab() ? " active" : ""}`,
+      title: `${shown ? "Show" : "Open"} the flywheel board of ${f.path}`,
+      "aria-label": `Board: ${name}`,
+      dataset: { fwAction: "add-board", fwFolder: f.path },
+      onclick: () => openBoard(workspace.id, f.path),
+    }, icon("wheel"), several ? el("span", { textContent: name }) : null);
+  }));
 }
 
 // Phones: the sessions laid out in the viewed workspace as one row of

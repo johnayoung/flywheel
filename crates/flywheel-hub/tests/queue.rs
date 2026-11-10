@@ -868,7 +868,7 @@ async fn pause_resume_holds_and_stalls_that_surface() {
 fn mark_sending(state: &Path, sid: &str, text: &str) {
     let path = state.join("state.json");
     let mut doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(doc["version"], 5);
+    assert_eq!(doc["version"], 6);
     let items = doc["queues"][sid]["items"].as_array_mut().unwrap();
     let item = items.iter_mut().find(|i| i["text"] == text).unwrap();
     item["state"] = json!("sending");

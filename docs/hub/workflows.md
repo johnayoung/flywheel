@@ -1,6 +1,6 @@
 # Hub workflows
 
-Driving agents from scripts and the UI. Front door: [hub](../hub.md).
+Front door: [hub](../hub.md).
 
 ## Scripting agents
 
@@ -9,12 +9,12 @@ id=$(fw hub new demo --kind claude --name fixer)
 fw hub wait "$id" --until idle --timeout 60  # agent up, waiting for a prompt
 fw hub send "$id" $'Fix the failing test in src/lib.rs\n'
 fw hub wait "$id" --until done --changed --timeout 900 || { fw hub read "$id"; exit 1; }
-fw hub commands "$id" --last > next.sh  # newest shell block it suggested, exactly
+fw hub commands "$id" --last > next.sh  # newest shell block it suggested
 fw hub new demo --name build -- sh -c "$(cat next.sh)" && fw hub wait build --until exit  # or send it to a shell
 fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it waits on a prompt
 ```
 
-`wait`: 0 met, 124 timeout, 1 error (or the session ended). `--changed`: only statuses begun after it started. `--until idle` accepts `done`; `exit` prints `exited N` / `killed (SIG)`; `--timeout 0` checks once.
+`wait`: 0 met, 124 timeout, 1 error (or session ended). `--changed`: only statuses begun after it started. `--until idle` accepts `done`; `exit` prints `exited N` / `killed (SIG)`; `--timeout 0` checks once.
 
 ## Agent launcher
 
@@ -75,7 +75,7 @@ A branch with a pull request: a badge on its row (`#7`, checks), a PR section in
 - **View log**: `gh run view --job J --log-failed`, the last 400 lines, escapes stripped, secrets redacted (Activity's rules).
 - **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued (`done`). One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; not re-pasted within 5 min.
 - **Re-run failed** (`gh run rerun R --failed`), **Ready** (`gh pr ready`),
-  **Merge** (`gh pr merge N --<method> --match-head-commit SHA`, the repo's default method): planned, fingerprint-checked against a GitHub re-read (unreadable: refused). Merge refuses closed, draft, conflicting; checks failing or running, changes requested, review required: only with the number typed back (`--force N`).
+  **Merge** (`gh pr merge N --<method> --match-head-commit SHA`, the repo's default method): planned, fingerprint-checked against a GitHub re-read (unreadable: refused). Refuses closed, draft, conflicting; checks failing or running, changes requested, review required: only with the number typed back (`--force N`).
 - **Events** `pr.checks_failed`, `pr.checks_passed` (from running or red), `pr.review_changes_requested`, `pr.merged`; a hub start announces nothing.
 
 ## Handoff and peer review
@@ -115,7 +115,7 @@ fw hub fanout promote "$id" --reference c1 --yes  # writes <project>/tasks/activ
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote instead of picking** to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
+- **Promote** (not pick) to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
 - **Fan out this task** (Flywheel panel): prompt = its goal and context; graders = its command plus **held-out** graders, added server-side (none or unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
@@ -143,23 +143,23 @@ Per agent session, prompts the hub types in itself, in order ("when done, do X")
 | Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched |
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
-**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase on main"`); a workspace: its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), else refused (why). `--header` names the recipients.
+**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase"`); a workspace: its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), else refused (why). `--header` names the recipients.
 
 ## Activity
 
-What happened, newest first: palette **Activity**, the header pill, `fw hub activity` (24 h: the digest, then the timeline; `--since last-seen`: since this CLI last looked).
+What happened, newest first: palette **Activity**, the header pill, `fw hub activity` (24 h: digest, then timeline; `--since last-seen`: since this CLI last looked).
 
-- **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A row opens its object, else attaches.
-- **Kept** in `activity.jsonl` (rotated at 1 MiB or weekly, 30 days): kind, ids, names, short facts; never terminal output, prompts, commands, grader output, paths; token-shaped words are `[redacted]`.
-- **While you were away** (back after 10+ min): turns finished, blocked now, fan-outs graded, commands suggested, cost. **Machines**: asked at once (4 s each), merged, labelled; a silent one makes it `partial`.
+- **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A row opens its object or attaches.
+- **Kept** in `activity.jsonl` (rotated at 1 MiB or weekly, 30 days): kind, ids, names, short facts; never terminal output, prompts, commands, grader output, paths; token-shaped words: `[redacted]`.
+- **While you were away** (back after 10+ min): turns done, blocked now, fan-outs graded, commands suggested, cost. **Machines**: asked at once (4 s each), merged, labelled; a silent one: `partial`.
 
 ## Digests
 
 Off until `hub.toml` `[digest] times` is set ([hub-reference](reference.md#hubtoml); Settings > Digest writes that table). `fw hub digest` previews; `--send` sends now.
 
-- **Says**, since the last digest, per workspace: turns finished, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, longest blocked, red PRs, stalled queues) with links.
-- **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty ones are skipped (`quiet_if_empty`). `delivery.channels` lists only what heard it.
-- **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it. A send claim over 5 min old is dropped (pids are reused).
+- **Says**, since the last digest, per workspace: turns done, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, longest blocked, red PRs, stalled queues) with links.
+- **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty: skipped (`quiet_if_empty`). `delivery.channels`: only those that heard it.
+- **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it. A send claim over 5 min old is dropped.
 
 ## Permissions
 
@@ -170,6 +170,6 @@ Palette **Permissions: FOLDER**, `fw hub perms show`.
 - Written to `.claude/settings.local.json` (warned when tracked; `--gitignore` ignores it) or, opt-in, user. Preview: file, diff, "This lets the agent ...", an overriding deny/ask. Atomic, keys and layout kept; Yes is typed only if the dialog on screen is that request; the rule is typed back to confirm.
 - **Never proposed**: every command, `rm`, `sudo`, `curl`/`wget`, interpreters, `git push` (also `git -C dir push`), `git *`, `cp`/`mv`/`tee`/`sed`/`awk *`, `gh pr merge`, `fw`/`flywheel`, `find *`, exec subcommands (`npm exec`, `git rebase`), `timeout 5 *`, whole MCP servers, pipes into a shell,
   substitutions, `&&` `;` `|`, writes outside the repo or to `.claude/` `.codex/` `.git/` `.gitmodules` `.mcp.json`.
-- **Suggestions**: `permission-requests.jsonl` (0600, 30 days; rules, never commands) per repo, most frequent first, minus what a rule covers.
+- **Suggestions**: `permission-requests.jsonl` (0600, 30 days; rules, never commands) per repo, most frequent first, minus covered ones.
 - **Codex**: prefix rules to `.codex/rules/default.rules` (loaded once trusted) or `~/.codex`; `trust_level` in `$CODEX_HOME/config.toml`, `approval_policy` / `sandbox_mode` in `.codex/config.toml`.
   Typed back: `never`, `danger-full-access`, trusting a project whose `.codex/` holds those, a dangerous rule, or `notify`/`mcp_servers`/hooks; a symlinked `.codex` is refused. Writes log and emit `perms.allowed`.

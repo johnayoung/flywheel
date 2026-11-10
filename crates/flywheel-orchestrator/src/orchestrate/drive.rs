@@ -60,6 +60,9 @@ pub(super) struct DriveContext {
     pub lease_seconds: f64,
     pub heartbeat_interval: f64,
     pub session_pause_ceiling_seconds: f64,
+    /// The account a session-limit refusal's pause is recorded on
+    /// ([`crate::policy::WorkPolicy::pause_account`]).
+    pub pause_account: String,
     pub telemetry_root: Option<PathBuf>,
     pub sink: Option<SharedSink>,
     pub shutdown: Option<ShutdownSignal>,
@@ -321,15 +324,16 @@ pub(super) async fn drive_under_lease(
             (ctx.now)(),
             ctx.session_pause_ceiling_seconds,
             &outcome.lifecycle.run_id,
-            crate::claims::DEFAULT_PAUSE_ACCOUNT,
+            &ctx.pause_account,
         );
         match paused_until {
             Ok(Some(until)) => emit(
                 ctx.log.as_ref(),
                 format!(
-                    "[orchestrate] {task_id}: session limit reached (reset {}); pausing pool-wide claiming until {}",
+                    "[orchestrate] {task_id}: session limit reached (reset {}); pausing pool-wide claiming until {} ({})",
                     reset_at.to_rfc3339(),
-                    until.to_rfc3339()
+                    until.to_rfc3339(),
+                    crate::workflow::pause_label(Some(&ctx.pause_account))
                 ),
             ),
             Ok(None) => {}

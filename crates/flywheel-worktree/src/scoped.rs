@@ -16,7 +16,9 @@ use flywheel_orchestrator::orchestrate::{
     ScopeEnv, ScopeError, ScopePlan, ScopeRequest, ScopeVerdict, TaskScope, evaluate_scope,
     plan_scope,
 };
-use flywheel_orchestrator::policy::WorkPolicy;
+use flywheel_orchestrator::policy::{
+    DEFAULT_SESSION_PAUSE_CEILING_SECONDS, WorkPolicy, pause_account_of,
+};
 use flywheel_orchestrator::sources::DirectoryWorkSource;
 use flywheel_orchestrator::store_registry::environ_from_process;
 use flywheel_orchestrator::workflow::{default_store_registries, open_stores_for};
@@ -36,6 +38,10 @@ pub struct WorkerScope {
     claims: Arc<dyn ClaimStore>,
     repo_root: PathBuf,
     true_base: String,
+    /// The account whose session-limit pauses hold this worker back, when
+    /// it honors pauses (a positive ceiling): a member the pause keeps
+    /// unclaimed is reported waiting on it.
+    pause_account: Option<String>,
 }
 
 impl std::fmt::Debug for WorkerScope {
@@ -98,6 +104,7 @@ impl WorkerScope {
             repo_root: Some(repo_root),
             true_base: Some(&true_base),
             claims: Some(stores.claims.as_ref()),
+            ..ScopeEnv::default()
         };
         let plan =
             plan_scope(&source, stores.core.as_ref(), &request, &env).map_err(|err| match err {
@@ -107,6 +114,10 @@ impl WorkerScope {
                 other => other.to_string(),
             })?;
         let scope = plan.scope(since);
+        let ceiling = policy.map_or(DEFAULT_SESSION_PAUSE_CEILING_SECONDS, |p| {
+            p.worker_session_pause_ceiling_seconds
+        });
+        let pause_account = (ceiling > 0.0).then(|| pause_account_of(policy).to_owned());
         Ok(Some(Self {
             plan,
             scope,
@@ -115,6 +126,7 @@ impl WorkerScope {
             claims: stores.claims,
             repo_root: repo_root.to_path_buf(),
             true_base,
+            pause_account,
         }))
     }
 
@@ -145,6 +157,8 @@ impl WorkerScope {
             repo_root: Some(&self.repo_root),
             true_base: Some(&self.true_base),
             claims: Some(self.claims.as_ref()),
+            pause_account: self.pause_account.as_deref(),
+            now: None,
         };
         evaluate_scope(
             &self.source,

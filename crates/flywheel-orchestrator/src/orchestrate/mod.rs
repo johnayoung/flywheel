@@ -417,6 +417,7 @@ pub async fn orchestrate(
         .unwrap_or_else(|| format!("worker-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
     let log = request.log.clone();
     let policy = request.policy.as_ref();
+    let pause_account = crate::policy::pause_account_of(policy).to_owned();
     let worker_capabilities: BTreeSet<String> = policy
         .map(|p| p.execution_capabilities.clone())
         .unwrap_or_default();
@@ -480,6 +481,7 @@ pub async fn orchestrate(
         lease_seconds: request.lease_seconds,
         heartbeat_interval,
         session_pause_ceiling_seconds: request.session_pause_ceiling_seconds,
+        pause_account: pause_account.clone(),
         telemetry_root: request.telemetry_root.clone(),
         sink: sink.clone(),
         shutdown: shutdown.clone(),
@@ -703,14 +705,14 @@ pub async fn orchestrate(
         // bookkeeping is deliberately not gated.
         let mut claim_pause_until: Option<DateTime<Utc>> = None;
         if request.session_pause_ceiling_seconds > 0.0 {
-            claim_pause_until =
-                claims.session_pause_until(clock(), crate::claims::DEFAULT_PAUSE_ACCOUNT)?;
+            claim_pause_until = claims.session_pause_until(clock(), &pause_account)?;
             if let Some(until) = claim_pause_until {
                 emit(
                     log.as_ref(),
                     format!(
-                        "[orchestrate] session-limit pause active until {}; declining fresh and resume claims this pass",
-                        until.to_rfc3339()
+                        "[orchestrate] session-limit pause active until {} ({}); declining fresh and resume claims this pass",
+                        until.to_rfc3339(),
+                        crate::workflow::pause_label(Some(&pause_account))
                     ),
                 );
             }

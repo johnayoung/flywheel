@@ -99,6 +99,14 @@ pub struct ScopeEnv<'a> {
     /// The orchestrator store: prepare skips, resolution markers, and the
     /// claims a peer holds.
     pub claims: Option<&'a dyn ClaimStore>,
+    /// The account whose session-limit pauses hold this worker back
+    /// ([`crate::policy::WorkPolicy::pause_account`]), when the worker
+    /// honors pauses: a member the pause keeps unclaimed reports it as a
+    /// waiting reason (it expires or is cleared; never a park). Read from
+    /// `claims`; `None` skips the check.
+    pub pause_account: Option<&'a str>,
+    /// The instant pauses are judged active at; the wall clock when `None`.
+    pub now: Option<DateTime<Utc>>,
 }
 
 /// Whether the member's latest lifecycle failed at or after the scope
@@ -723,16 +731,25 @@ fn prepare_skips(
 }
 
 /// Why a member still pending is not running, for the summary.
-fn pending_detail(
-    claims: Option<&dyn ClaimStore>,
-    row: &TaskStatusRow,
-) -> Result<String, ClaimStoreError> {
-    if let Some(claims) = claims
+fn pending_detail(env: &ScopeEnv<'_>, row: &TaskStatusRow) -> Result<String, ClaimStoreError> {
+    if let Some(claims) = env.claims
         && let Some(claim) = claims.load_claim(&row.task_id)?
     {
         // No lease instant: a live peer's heartbeat moves it every few
         // seconds, and the waiting line is logged once per change.
         return Ok(format!("claimed by {}", claim.worker_id));
+    }
+    // An unclaimed member this worker's account is paused from claiming
+    // waits the pause out: it expires, or an operator clears it.
+    if row.state != TaskState::InProgress
+        && let (Some(claims), Some(account)) = (env.claims, env.pause_account)
+        && let Some(until) =
+            claims.session_pause_until(env.now.unwrap_or_else(Utc::now), account)?
+    {
+        return Ok(format!(
+            "session-limit pause until {}",
+            crate::workflow::format_pause_time(until)
+        ));
     }
     Ok(match row.state {
         TaskState::Fresh => String::new(),
@@ -816,7 +833,7 @@ fn pending_outcome(
             }
         }
     }
-    let mut detail = pending_detail(env.claims, row)?;
+    let mut detail = pending_detail(env, row)?;
     if let Some(last) = skips.last() {
         let note = format!("sandbox failed to prepare: {last}");
         detail = if detail.is_empty() {

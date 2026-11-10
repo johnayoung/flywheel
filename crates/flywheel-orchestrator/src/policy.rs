@@ -480,6 +480,24 @@ impl WorkPolicy {
         };
         Ok(())
     }
+
+    /// The account a session-limit pause this worker records carries, and
+    /// the one whose pauses hold it back: the `--account` name, or
+    /// [`crate::claims::DEFAULT_PAUSE_ACCOUNT`] (`""`) without one.
+    pub fn pause_account(&self) -> &str {
+        self.account
+            .as_deref()
+            .unwrap_or(crate::claims::DEFAULT_PAUSE_ACCOUNT)
+    }
+}
+
+/// [`WorkPolicy::pause_account`] for an optional policy (no policy is the
+/// default credentials).
+pub fn pause_account_of(policy: Option<&WorkPolicy>) -> &str {
+    policy.map_or(
+        crate::claims::DEFAULT_PAUSE_ACCOUNT,
+        WorkPolicy::pause_account,
+    )
 }
 
 impl Default for WorkPolicy {

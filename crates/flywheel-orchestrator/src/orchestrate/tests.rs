@@ -5362,3 +5362,302 @@ fn worker_account_credential_flows_into_agent_primitives_and_nothing_else() {
         plain
     );
 }
+
+// --- account-keyed session pauses --------------------------------------------------
+
+/// A policy for a worker under `account` (`None`: the default credentials).
+fn account_policy(account: Option<&str>) -> WorkPolicy {
+    WorkPolicy {
+        account: account.map(str::to_owned),
+        ..WorkPolicy::default()
+    }
+}
+
+/// A request for a worker `worker_id` under `account`, honoring pauses
+/// with a 100s ceiling, judged at `t0() + at_seconds`.
+fn account_request(
+    f: &Fixture,
+    source: Arc<MemorySource>,
+    worker_id: &str,
+    account: Option<&str>,
+    at_seconds: i64,
+) -> OrchestrateRequest {
+    let mut req = f.request(source);
+    req.worker_id = Some(worker_id.into());
+    req.policy = Some(account_policy(account));
+    req.session_pause_ceiling_seconds = 100.0;
+    req.now = Some(fixed(t0() + ChronoDuration::seconds(at_seconds)));
+    req
+}
+
+/// Drive a session-limit refusal of task `limit` under `account` at
+/// `t0() + at_seconds`; returns the refused run's id.
+async fn refuse_under(f: &Fixture, account: Option<&str>, at_seconds: i64) -> String {
+    f.runner.script(
+        "limit",
+        vec![Scripted::SessionLimit {
+            reset_at: t0() + ChronoDuration::hours(5),
+        }],
+    );
+    let report = run(account_request(
+        f,
+        MemorySource::new(vec![item("limit")]),
+        "worker-refused",
+        account,
+        at_seconds,
+    ))
+    .await;
+    assert_eq!(ids(&report), ["limit"]);
+    report.runs[0].run_id.clone()
+}
+
+#[tokio::test]
+async fn account_pause_gate_records_the_refused_workers_account() {
+    // Named account: the pause carries exactly the --account name, never
+    // the worker id or a constant.
+    let f = Fixture::new();
+    let run_id = refuse_under(&f, Some("acct-7f3a"), 0).await;
+    let pauses = f.claims.list_session_pauses().unwrap();
+    assert_eq!(pauses.len(), 1);
+    assert_eq!(pauses[0].account.as_deref(), Some("acct-7f3a"));
+    assert_ne!(pauses[0].account.as_deref(), Some("worker-refused"));
+    assert_eq!(pauses[0].run_id, run_id);
+
+    // No --account: the pause carries "".
+    let g = Fixture::new();
+    refuse_under(&g, None, 0).await;
+    let pauses = g.claims.list_session_pauses().unwrap();
+    assert_eq!(pauses.len(), 1);
+    assert_eq!(
+        pauses[0].account.as_deref(),
+        Some(crate::claims::DEFAULT_PAUSE_ACCOUNT)
+    );
+}
+
+#[tokio::test]
+async fn account_pause_gate_a_paused_holds_a_but_not_b_or_default() {
+    let f = Fixture::new();
+    refuse_under(&f, Some("acct-a"), 0).await;
+
+    let a = run(account_request(
+        &f,
+        MemorySource::new(vec![item("work-a")]),
+        "worker-a2",
+        Some("acct-a"),
+        10,
+    ))
+    .await;
+    assert!(a.runs.is_empty(), "A's pause holds the A worker back");
+    assert!(lifecycles_of(&f, "work-a").is_empty());
+    assert!(f.log.contains("session-limit pause active until"));
+
+    let b = run(account_request(
+        &f,
+        MemorySource::new(vec![item("work-b")]),
+        "worker-b",
+        Some("acct-b"),
+        10,
+    ))
+    .await;
+    assert_eq!(ids(&b), ["work-b"]);
+    assert_eq!(b.runs[0].status, Status::Done);
+
+    let default = run(account_request(
+        &f,
+        MemorySource::new(vec![item("work-default")]),
+        "worker-default",
+        None,
+        10,
+    ))
+    .await;
+    assert_eq!(ids(&default), ["work-default"]);
+    assert_eq!(default.runs[0].status, Status::Done);
+
+    // A default-credentials refusal holds the default worker, not A.
+    let g = Fixture::new();
+    refuse_under(&g, None, 0).await;
+    let plain = run(account_request(
+        &g,
+        MemorySource::new(vec![item("work")]),
+        "worker-plain",
+        None,
+        10,
+    ))
+    .await;
+    assert!(
+        plain.runs.is_empty(),
+        "a \"\" pause holds the default worker"
+    );
+    let named = run(account_request(
+        &g,
+        MemorySource::new(vec![item("work")]),
+        "worker-named",
+        Some("acct-a"),
+        10,
+    ))
+    .await;
+    assert_eq!(ids(&named), ["work"]);
+}
+
+#[tokio::test]
+async fn account_pause_gate_null_pause_holds_every_account() {
+    let f = Fixture::new();
+    let path = f.dir.path().join("claims.db");
+    let claims = Arc::new(SqliteClaimStore::open_partition(&path, "proj").unwrap());
+    // A pre-account (v10) pause row: account NULL.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO orchestrator_session_pauses (project_id, run_id, reset_at, \
+             pause_until, recorded_at, account) VALUES ('proj', 'run-legacy', ?1, ?2, ?3, NULL)",
+            rusqlite::params![
+                flywheel_core::event_serde::format_timestamp(&(t0() + ChronoDuration::hours(5))),
+                flywheel_core::event_serde::format_timestamp(
+                    &(t0() + ChronoDuration::seconds(100))
+                ),
+                flywheel_core::event_serde::format_timestamp(&t0()),
+            ],
+        )
+        .unwrap();
+    assert_eq!(claims.list_session_pauses().unwrap()[0].account, None);
+    for (worker, account) in [
+        ("worker-a", Some("acct-a")),
+        ("worker-b", Some("acct-b")),
+        ("worker-default", None),
+    ] {
+        let mut req = account_request(
+            &f,
+            MemorySource::new(vec![item("work")]),
+            worker,
+            account,
+            10,
+        );
+        req.claims = claims.clone();
+        let report = run(req).await;
+        assert!(report.runs.is_empty(), "{account:?} held by the null pause");
+    }
+    assert!(lifecycles_of(&f, "work").is_empty());
+    // Expired: every worker claims again.
+    let mut req = account_request(
+        &f,
+        MemorySource::new(vec![item("work")]),
+        "worker-a",
+        Some("acct-a"),
+        200,
+    );
+    req.claims = claims.clone();
+    assert_eq!(ids(&run(req).await), ["work"]);
+}
+
+#[tokio::test]
+async fn account_pause_gate_scoped_waits_then_claims_after_clear() {
+    let f = Fixture::new();
+    refuse_under(&f, Some("acct-a"), 0).await;
+    let pause = f.claims.list_session_pauses().unwrap()[0].clone();
+    let source = MemorySource::new(vec![item("scoped")]);
+    let plan = plan_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &scope_request(&["scoped"], false),
+        &ScopeEnv::default(),
+    )
+    .unwrap();
+    let scope = plan.scope(t0());
+    let at = t0() + ChronoDuration::seconds(10);
+    let env = ScopeEnv {
+        claims: Some(f.claims.as_ref()),
+        pause_account: Some("acct-a"),
+        now: Some(at),
+        ..ScopeEnv::default()
+    };
+
+    let mut req = account_request(&f, source.clone(), "worker-scoped", Some("acct-a"), 10);
+    req.scope = Some(scope.clone());
+    assert!(run(req).await.runs.is_empty(), "the pause holds the scope");
+    assert!(f.claims.load_claim("scoped").unwrap().is_none());
+    let verdict = evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &scope, &env).unwrap();
+    assert!(!verdict.settled(), "a pause is a wait, never a park");
+    assert_eq!(
+        verdict.waiting_line(),
+        format!(
+            "scope: waiting -- scoped pending (session-limit pause until {})",
+            crate::workflow::format_pause_time(pause.pause_until)
+        )
+    );
+    // Another account's view of the same store reports no pause.
+    let other = ScopeEnv {
+        pause_account: Some("acct-b"),
+        ..env
+    };
+    assert_eq!(
+        evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &scope, &other)
+            .unwrap()
+            .waiting_line(),
+        "scope: waiting -- scoped pending"
+    );
+
+    assert!(
+        f.claims
+            .clear_session_pause(pause.id, at, crate::claims::PAUSE_CLEAR_VIA_CLI, "switched")
+            .unwrap()
+    );
+    let after = evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &scope, &env).unwrap();
+    assert_eq!(after.waiting_line(), "scope: waiting -- scoped pending");
+    let mut req = account_request(&f, source.clone(), "worker-scoped", Some("acct-a"), 20);
+    req.scope = Some(scope.clone());
+    let report = run(req).await;
+    assert_eq!(ids(&report), ["scoped"]);
+    assert_eq!(report.runs[0].status, Status::Done);
+    let done = evaluate_scope(source.as_ref(), f.control.as_ref(), &plan, &scope, &env).unwrap();
+    assert!(done.all_verified(), "{}", done.summary());
+}
+
+#[tokio::test]
+async fn account_pause_gate_re_pause_after_clear_holds_again() {
+    let f = Fixture::new();
+    refuse_under(&f, Some("acct-a"), 0).await;
+    let first = f.claims.list_session_pauses().unwrap()[0].id;
+    let at = t0() + ChronoDuration::seconds(10);
+    assert!(
+        f.claims
+            .clear_session_pause(first, at, crate::claims::PAUSE_CLEAR_VIA_CLI, "cleared")
+            .unwrap()
+    );
+    let cleared = run(account_request(
+        &f,
+        MemorySource::new(vec![item("between")]),
+        "worker-a2",
+        Some("acct-a"),
+        10,
+    ))
+    .await;
+    assert_eq!(ids(&cleared), ["between"], "the clear lifts A's pause");
+
+    // A second refusal under A records a new pause that holds A again.
+    refuse_under(&f, Some("acct-a"), 20).await;
+    let pauses = f.claims.list_session_pauses().unwrap();
+    assert_eq!(pauses.len(), 2);
+    assert_eq!(pauses[1].account.as_deref(), Some("acct-a"));
+    assert!(pauses[1].cleared.is_none());
+    let held = run(account_request(
+        &f,
+        MemorySource::new(vec![item("after")]),
+        "worker-a3",
+        Some("acct-a"),
+        30,
+    ))
+    .await;
+    assert!(
+        held.runs.is_empty(),
+        "the new pause holds the next A worker"
+    );
+    let other = run(account_request(
+        &f,
+        MemorySource::new(vec![item("other")]),
+        "worker-b",
+        Some("acct-b"),
+        30,
+    ))
+    .await;
+    assert_eq!(ids(&other), ["other"]);
+}

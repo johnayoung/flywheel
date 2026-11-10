@@ -178,6 +178,68 @@ impl std::str::FromStr for Outcome {
     }
 }
 
+/// Why an attempt stopped, chosen by the harness from a fixed vocabulary.
+///
+/// Orthogonal to [`Outcome`]: the outcome drives transitions, the stop
+/// reason records the cause. Serialized internally tagged by `kind`, e.g.
+/// `{"kind": "checks_failed", "check": "unit"}` or `{"kind": "verified"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StopReason {
+    Verified,
+    ChecksFailed { check: String },
+    JudgeFailed { check: String },
+    AgentGaveUp,
+    AgentClaimedAlreadyDone,
+    TransientExhausted,
+    ProviderRateLimited,
+    DeadlineExceeded,
+    Hang,
+    ProtocolFailure,
+    DidNotConverge,
+    OperatorInterrupted,
+    WorkerInterrupted,
+    LandingBlocked { reason: String },
+    BudgetExceeded,
+    Crash,
+}
+
+impl StopReason {
+    /// The vocabulary name, i.e. the serialized `kind`.
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            StopReason::Verified => "verified",
+            StopReason::ChecksFailed { .. } => "checks_failed",
+            StopReason::JudgeFailed { .. } => "judge_failed",
+            StopReason::AgentGaveUp => "agent_gave_up",
+            StopReason::AgentClaimedAlreadyDone => "agent_claimed_already_done",
+            StopReason::TransientExhausted => "transient_exhausted",
+            StopReason::ProviderRateLimited => "provider_rate_limited",
+            StopReason::DeadlineExceeded => "deadline_exceeded",
+            StopReason::Hang => "hang",
+            StopReason::ProtocolFailure => "protocol_failure",
+            StopReason::DidNotConverge => "did_not_converge",
+            StopReason::OperatorInterrupted => "operator_interrupted",
+            StopReason::WorkerInterrupted => "worker_interrupted",
+            StopReason::LandingBlocked { .. } => "landing_blocked",
+            StopReason::BudgetExceeded => "budget_exceeded",
+            StopReason::Crash => "crash",
+        }
+    }
+}
+
+impl fmt::Display for StopReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StopReason::ChecksFailed { check } | StopReason::JudgeFailed { check } => {
+                write!(f, "{}{{{check}}}", self.kind())
+            }
+            StopReason::LandingBlocked { reason } => write!(f, "{}{{{reason}}}", self.kind()),
+            _ => f.write_str(self.kind()),
+        }
+    }
+}
+
 /// Raised when a `Lifecycle` transition violates `docs/task-lifecycle.md`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LifecycleTransitionError {
@@ -220,6 +282,10 @@ pub struct Attempt {
     pub turns: u64,
     pub total_cost_usd: f64,
     pub last_activity_at: Option<DateTime<Utc>>,
+    /// Why the attempt stopped; `None` until finalized with a reason, and
+    /// for attempts recorded before stop reasons existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
 }
 
 impl Attempt {
@@ -241,6 +307,7 @@ impl Attempt {
             turns: 0,
             total_cost_usd: 0.0,
             last_activity_at: None,
+            stop_reason: None,
         }
     }
 
@@ -647,5 +714,63 @@ mod tests {
         for o in Outcome::ALL {
             assert_eq!(o.as_str().parse::<Outcome>().unwrap(), o);
         }
+    }
+
+    #[test]
+    fn stop_reason_kind_matches_the_serialized_tag() {
+        let reasons = [
+            StopReason::Verified,
+            StopReason::ChecksFailed { check: "c".into() },
+            StopReason::JudgeFailed { check: "j".into() },
+            StopReason::AgentGaveUp,
+            StopReason::AgentClaimedAlreadyDone,
+            StopReason::TransientExhausted,
+            StopReason::ProviderRateLimited,
+            StopReason::DeadlineExceeded,
+            StopReason::Hang,
+            StopReason::ProtocolFailure,
+            StopReason::DidNotConverge,
+            StopReason::OperatorInterrupted,
+            StopReason::WorkerInterrupted,
+            StopReason::LandingBlocked { reason: "r".into() },
+            StopReason::BudgetExceeded,
+            StopReason::Crash,
+        ];
+        for reason in reasons {
+            let value = serde_json::to_value(&reason).unwrap();
+            assert_eq!(value["kind"], reason.kind(), "{reason}");
+            let back: StopReason = serde_json::from_value(value).unwrap();
+            assert_eq!(back, reason);
+        }
+        assert_eq!(
+            serde_json::to_value(StopReason::JudgeFailed { check: "j".into() }).unwrap(),
+            serde_json::json!({"kind": "judge_failed", "check": "j"})
+        );
+        assert_eq!(
+            StopReason::ChecksFailed {
+                check: "unit".into()
+            }
+            .to_string(),
+            "checks_failed{unit}"
+        );
+        assert!(serde_json::from_value::<StopReason>(serde_json::json!({"kind": "nope"})).is_err());
+    }
+
+    #[test]
+    fn stop_reason_absent_is_omitted_from_attempt_json_and_defaults_on_read() {
+        let attempt = Attempt::new(1, at(0), "run-1");
+        let value = serde_json::to_value(&attempt).unwrap();
+        assert!(value.get("stop_reason").is_none());
+        let back: Attempt = serde_json::from_value(value).unwrap();
+        assert_eq!(back.stop_reason, None);
+
+        let mut stopped = attempt.clone();
+        stopped.stop_reason = Some(StopReason::OperatorInterrupted);
+        let value = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(
+            value["stop_reason"],
+            serde_json::json!({"kind": "operator_interrupted"})
+        );
+        assert_eq!(serde_json::from_value::<Attempt>(value).unwrap(), stopped);
     }
 }

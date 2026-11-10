@@ -269,6 +269,7 @@ impl Run {
                 ended_at,
                 agent_output: agent_output.to_owned(),
                 error: error.to_owned(),
+                stop_reason: None,
             }),
         )?;
         self.emit_attempt_finalized(attempt.number, outcome, error);
@@ -350,6 +351,7 @@ impl Run {
                     ended_at,
                     agent_output: attempt.agent_output.clone(),
                     error: reason.to_owned(),
+                    stop_reason: None,
                 }),
             );
             // Mirror finalize_stranded_lifecycle's telemetry shape so the

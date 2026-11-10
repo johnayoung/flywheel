@@ -131,6 +131,7 @@ pub fn finalize_stranded_lifecycle(
                 ended_at,
                 agent_output: attempt.agent_output.clone(),
                 error: options.reason.clone(),
+                stop_reason: None,
             }),
         )?;
         run.emit_attempt_finalized(attempt.number, Outcome::InternalError, &options.reason);

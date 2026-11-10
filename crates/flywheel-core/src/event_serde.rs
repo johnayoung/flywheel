@@ -278,7 +278,7 @@ mod tests {
         LifecycleInitialized, REDRIVE_RESULT_LANDED, REDRIVE_RESULT_REPARKED,
         REDRIVE_RESULT_ROUTED, RetryScheduled, TransitionedTo,
     };
-    use crate::lifecycle::{Outcome, Status};
+    use crate::lifecycle::{Outcome, Status, StopReason};
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -392,6 +392,83 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(text, r#"{"target":"ready","error":""}"#);
+    }
+
+    fn finalized(stop_reason: Option<StopReason>) -> DomainEventPayload {
+        DomainEventPayload::AttemptFinalized(AttemptFinalized {
+            number: 1,
+            outcome: Outcome::ValidationFailed,
+            ended_at: at(6),
+            agent_output: "out".into(),
+            error: "boom".into(),
+            stop_reason,
+        })
+    }
+
+    #[test]
+    fn stop_reason_absent_keeps_the_attempt_finalized_payload_byte_identical() {
+        let text = event_payload_json(&finalized(None)).unwrap();
+        assert_eq!(
+            text,
+            r#"{"number":1,"outcome":"validation_failed","ended_at":"2026-05-28T20:26:46+00:00","agent_output":"out","error":"boom"}"#
+        );
+        let restored = payload_from_json("attempt_finalized", &text).unwrap();
+        assert_eq!(restored, finalized(None));
+    }
+
+    #[test]
+    fn stop_reason_present_is_an_additive_tagged_key() {
+        let text = event_payload_json(&finalized(Some(StopReason::ChecksFailed {
+            check: "pytest".into(),
+        })))
+        .unwrap();
+        assert!(
+            text.ends_with(
+                r#","error":"boom","stop_reason":{"kind":"checks_failed","check":"pytest"}}"#
+            ),
+            "{text}"
+        );
+        let unit = event_payload(&finalized(Some(StopReason::AgentClaimedAlreadyDone))).unwrap();
+        assert_eq!(
+            unit["stop_reason"],
+            json!({"kind": "agent_claimed_already_done"})
+        );
+        let landing = event_payload(&finalized(Some(StopReason::LandingBlocked {
+            reason: "divergent-base".into(),
+        })))
+        .unwrap();
+        assert_eq!(
+            landing["stop_reason"],
+            json!({"kind": "landing_blocked", "reason": "divergent-base"})
+        );
+    }
+
+    #[test]
+    fn stop_reason_round_trips_through_a_row_for_every_kind() {
+        for reason in [
+            StopReason::Verified,
+            StopReason::ChecksFailed { check: "c".into() },
+            StopReason::JudgeFailed { check: "j".into() },
+            StopReason::AgentGaveUp,
+            StopReason::AgentClaimedAlreadyDone,
+            StopReason::TransientExhausted,
+            StopReason::ProviderRateLimited,
+            StopReason::DeadlineExceeded,
+            StopReason::Hang,
+            StopReason::ProtocolFailure,
+            StopReason::DidNotConverge,
+            StopReason::OperatorInterrupted,
+            StopReason::WorkerInterrupted,
+            StopReason::LandingBlocked { reason: "r".into() },
+            StopReason::BudgetExceeded,
+            StopReason::Crash,
+        ] {
+            let event = round_trip(finalized(Some(reason.clone())));
+            let DomainEventPayload::AttemptFinalized(f) = event.payload else {
+                panic!("wrong kind");
+            };
+            assert_eq!(f.stop_reason, Some(reason));
+        }
     }
 
     #[test]
@@ -614,6 +691,7 @@ mod tests {
                 ended_at: at(6),
                 agent_output: "all done".into(),
                 error: String::new(),
+                stop_reason: None,
             }),
             DomainEventPayload::SessionRecorded(crate::events::SessionRecorded {
                 session_id: "sess-42".into(),

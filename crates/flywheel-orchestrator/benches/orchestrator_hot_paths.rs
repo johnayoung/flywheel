@@ -357,6 +357,7 @@ fn finished_run_events(index: usize) -> Vec<DomainEvent> {
                 ended_at: at(6),
                 agent_output: "implemented and verified".into(),
                 error: String::new(),
+                stop_reason: None,
             }),
         )
         .with_attempt_number(1),

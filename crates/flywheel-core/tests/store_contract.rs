@@ -157,6 +157,7 @@ fn attempt_finalized(run_id: &str, second: i64, number: u32, output: &str) -> Do
             ended_at: t(second),
             agent_output: output.into(),
             error: String::new(),
+            stop_reason: None,
         }),
     )
     .with_attempt_number(number)

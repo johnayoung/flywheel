@@ -53,7 +53,7 @@ pub use harness::{
     RunOptions, ShutdownSignal, finalize_stranded_lifecycle, recheck_blocked_lifecycle,
     resolve_manual_approval, run_task,
 };
-pub use lifecycle::{Attempt, Lifecycle, LifecycleTransitionError, Outcome, Status};
+pub use lifecycle::{Attempt, Lifecycle, LifecycleTransitionError, Outcome, Status, StopReason};
 pub use task::{
     CommandGrader, Context, Grader, GraderType, ManualGrader, RubricGrader, Task, TaskBudgets,
     TranscriptGrader, ValidationError,

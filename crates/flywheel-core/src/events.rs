@@ -25,7 +25,7 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::lifecycle::{Attempt, Lifecycle, LifecycleTransitionError, Outcome, Status};
+use crate::lifecycle::{Attempt, Lifecycle, LifecycleTransitionError, Outcome, Status, StopReason};
 
 /// Discriminator for the closed domain-event set.
 ///
@@ -208,6 +208,10 @@ pub struct AttemptFinalized {
     pub agent_output: String,
     #[serde(default)]
     pub error: String,
+    /// Why the attempt stopped. Additive: omitted from the payload when
+    /// absent, so events without a reason serialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
 }
 
 /// Records the agent session id for resumption.
@@ -679,6 +683,7 @@ pub fn fold_into(state: &mut Lifecycle, event: &DomainEvent) -> Result<(), Event
             attempt.outcome = Some(f.outcome);
             attempt.agent_output = f.agent_output.clone();
             attempt.error = f.error.clone();
+            attempt.stop_reason = f.stop_reason.clone();
             state.agent_output = f.agent_output.clone();
         }
         DomainEventPayload::SessionRecorded(s) => {
@@ -831,6 +836,7 @@ mod tests {
                     ended_at: ts(6),
                     agent_output: "all done".into(),
                     error: String::new(),
+                    stop_reason: None,
                 }),
             )
             .with_attempt_number(1),
@@ -880,6 +886,54 @@ mod tests {
         let events = happy_path();
         let lc = replay(&events).unwrap();
         assert_eq!(lc.version as usize, events.len());
+    }
+
+    #[test]
+    fn stop_reason_on_the_finalizing_event_survives_replay() {
+        let reasons = [
+            None,
+            Some(StopReason::Verified),
+            Some(StopReason::ChecksFailed {
+                check: "pytest".into(),
+            }),
+            Some(StopReason::LandingBlocked {
+                reason: "divergent-base".into(),
+            }),
+            Some(StopReason::Crash),
+        ];
+        for reason in reasons {
+            let events: Vec<DomainEvent> = happy_path()
+                .into_iter()
+                .map(|mut event| {
+                    if let DomainEventPayload::AttemptFinalized(f) = &mut event.payload {
+                        f.stop_reason = reason.clone();
+                    }
+                    event
+                })
+                .collect();
+            let lc = replay(&events).unwrap();
+            assert_eq!(lc.attempts[0].stop_reason, reason);
+            // Rebuilding from the serialized ledger reproduces the same reason.
+            let rows: Vec<_> = events
+                .iter()
+                .map(|e| crate::event_serde::event_to_row(e).unwrap())
+                .collect();
+            let restored: Vec<DomainEvent> = rows
+                .iter()
+                .map(|r| crate::event_serde::event_from_row(r).unwrap())
+                .collect();
+            assert_eq!(replay(&restored).unwrap(), lc);
+        }
+    }
+
+    #[test]
+    fn stop_reason_is_none_for_an_attempt_that_never_finalized() {
+        let events: Vec<DomainEvent> = happy_path()
+            .into_iter()
+            .filter(|e| !matches!(e.payload, DomainEventPayload::AttemptFinalized(_)))
+            .collect();
+        let lc = replay(&events).unwrap();
+        assert_eq!(lc.attempts[0].stop_reason, None);
     }
 
     #[test]
@@ -1163,6 +1217,7 @@ mod tests {
                     ended_at: ts(3),
                     agent_output: String::new(),
                     error: String::new(),
+                    stop_reason: None,
                 }),
             ),
         ])

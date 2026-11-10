@@ -99,7 +99,7 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/fanouts/{id}/seen` | `{"graded_at"}` -> 204 (`needs_you` false) |
 | POST | `/api/fanouts/{id}/cleanup` | `{"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}` |
 | POST | `/api/fanouts/{id}/promote` | `{"task_id"?,"goal"?,...}`, two-step (plan: path, contents); 409 exists / changed |
-| GET | `/api/flywheel` | per adopted folder: counts, alerts, live runs, worker |
+| GET | `/api/flywheel` | per adopted folder: counts, `plans`, alerts, live runs, worker |
 | GET | `/api/flywheel/panel?folder=` | the panel (`queued_in`: a scoped worker will run it); 404 not adopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next"}` (poll `since=next`); 503 a read still waits |
 | GET | `/api/flywheel/task?folder=&task=` | the task as a fan-out seed |

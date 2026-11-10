@@ -127,6 +127,29 @@ pub struct PanelPhase {
     pub tasks: Vec<PanelTask>,
 }
 
+/// A plan (a phase directory under `tasks/active/` or `tasks/archive/`)
+/// and its progress, folded from every run of its tasks (never the
+/// recent-run window).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PanelPlan {
+    pub name: String,
+    /// Only under `tasks/archive/`.
+    pub archived: bool,
+    /// Its task files.
+    pub total: usize,
+    /// Its tasks whose latest run is DONE.
+    pub verified: usize,
+    /// Every recorded attempt cost of its tasks.
+    pub spend_usd: f64,
+    /// Its verified tasks whose verifying run ended in the 24 hours before
+    /// the read (`generated_at`).
+    pub verified_24h: usize,
+    /// Its tasks failed, parked, or awaiting approval.
+    pub needs: usize,
+    /// Its tasks with a run in flight.
+    pub running: usize,
+}
+
 /// An in-flight run (RUNNING / VALIDATING / AWAITING_APPROVAL), as the
 /// console's live rows show it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -248,6 +271,10 @@ pub struct FlywheelPanel {
     #[serde(default)]
     pub untrusted: Option<UntrustedRepoFile>,
     pub phases: Vec<PanelPhase>,
+    /// Every plan, active and archived: those needing someone first, then
+    /// by name.
+    #[serde(default)]
+    pub plans: Vec<PanelPlan>,
     /// Said instead of tasks when the source is not listed here.
     pub tasks_note: Option<String>,
     pub live: Vec<LiveRun>,
@@ -274,6 +301,7 @@ impl FlywheelPanel {
             problem: None,
             untrusted: None,
             phases: Vec::new(),
+            plans: Vec::new(),
             tasks_note: None,
             live: Vec::new(),
             runs: Vec::new(),
@@ -320,6 +348,7 @@ impl FlywheelPanel {
             folder: self.folder.clone(),
             generated_at: self.generated_at,
             phases: self.phases.iter().map(|p| p.name.clone()).collect(),
+            plans: self.plans.clone(),
             counts,
             alerts,
             live_runs: self.live.len(),
@@ -357,6 +386,9 @@ pub struct FlywheelSummary {
     pub folder: PathBuf,
     pub generated_at: DateTime<Utc>,
     pub phases: Vec<String>,
+    /// See [`FlywheelPanel::plans`].
+    #[serde(default)]
+    pub plans: Vec<PanelPlan>,
     /// Tasks per [`TaskLight`] name (absent states have none).
     pub counts: BTreeMap<String, usize>,
     pub alerts: Vec<Alert>,
@@ -1265,6 +1297,28 @@ mod tests {
         assert_eq!(summary.counts["failed"], 1);
         assert!(!summary.counts.contains_key("pending"));
         assert!(summary.worker_live && !summary.autopilot_live);
+    }
+
+    #[test]
+    fn summary_carries_the_plans_and_older_answers_read_without_them() {
+        let mut panel = FlywheelPanel::empty("/r".into(), Utc::now());
+        panel.plans = vec![PanelPlan {
+            name: "00-old".into(),
+            archived: true,
+            total: 3,
+            verified: 2,
+            spend_usd: 1.25,
+            verified_24h: 1,
+            needs: 0,
+            running: 0,
+        }];
+        let summary = panel.summary();
+        assert_eq!(summary.plans, panel.plans);
+        let mut value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(value["plans"][0]["verified_24h"], 1);
+        value.as_object_mut().unwrap().remove("plans");
+        let older: FlywheelSummary = serde_json::from_value(value).unwrap();
+        assert!(older.plans.is_empty());
     }
 
     #[test]

@@ -21,6 +21,8 @@
 //! * in-flight runs: the console's live rows ([`collect_live_rows`]);
 //! * recent runs: the newest lifecycles with their latest attempt's grader
 //!   receipts from `grader_results`;
+//! * plans: every phase under `tasks/active/` and `tasks/archive/`, folded
+//!   from every lifecycle of its tasks ([`fold_plans`]);
 //! * worker liveness: a live lease in `task_claims` (as the console's
 //!   supervisor reads it); autopilot liveness: its activity record;
 //! * run output: `fw show <run>` ([`cmd_show`]) plus the console's
@@ -51,7 +53,7 @@ use flywheel_hub::autopilot::{GateDecided, GateDecision, GateRefused};
 use flywheel_hub::fanout::promote::{TaskDraft, TaskFilePlan, TaskSeed, TaskWritten};
 use flywheel_hub::flywheel::{
     Alert, AlertKind, DaemonState, FlywheelPanel, FlywheelProvider, GraderOutcome, LiveRun, Note,
-    PanelClaim, PanelPhase, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight,
+    PanelClaim, PanelPhase, PanelPlan, PanelTask, RecentRun, RunEntry, RunOutput, TaskLight,
     UntrustedRepoFile, WorkerScope,
 };
 use flywheel_hub::util::path_identity as file_identity;
@@ -64,7 +66,7 @@ use flywheel_orchestrator::config::{REPO_CONFIG_FILENAME, read_repo_file};
 use flywheel_orchestrator::home::{Home, stored_project_id};
 use flywheel_orchestrator::pg_preflight::dsn_target;
 use flywheel_orchestrator::policy::WorkPolicy;
-use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkSource};
+use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkSource, phase_task_files};
 use flywheel_orchestrator::store_factory::{StoreBundle, resolve_postgres_dsn};
 use flywheel_orchestrator::trust;
 use flywheel_orchestrator::workflow::status::format_blocked_on;
@@ -75,7 +77,7 @@ use flywheel_orchestrator::workflow::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -692,6 +694,205 @@ fn fold_status(entries: Vec<StatusEntry>, panel: &mut FlywheelPanel) {
         .collect();
 }
 
+// --- plans -------------------------------------------------------------------
+
+/// The window `verified_24h` counts verifying runs in.
+const VERIFIED_WINDOW_HOURS: i64 = 24;
+
+/// One plan's task ids, as its task files define them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanFiles {
+    name: String,
+    archived: bool,
+    tasks: BTreeSet<String>,
+}
+
+/// The id a task file defines: its `id` field, else its file stem (the
+/// rule `task_id_defined` applies).
+fn file_task_id(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|data| data.get("id").and_then(Value::as_str).map(str::to_owned))
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+}
+
+/// Every phase directory under `tasks_dir`'s `active/` and `archive/` with
+/// its task files' ids (the directory source's file rule); a phase in both
+/// is one plan, active.
+fn plan_files(tasks_dir: &Path) -> Result<Vec<PlanFiles>, String> {
+    let mut plans: BTreeMap<String, PlanFiles> = BTreeMap::new();
+    for bucket in ["active", "archive"] {
+        let root = tasks_dir.join(bucket);
+        if !root.is_dir() {
+            continue;
+        }
+        let entries =
+            std::fs::read_dir(&root).map_err(|e| format!("listing {}: {e}", root.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("listing {}: {e}", root.display()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let dir = entry.path();
+            if name.starts_with('.') || !dir.is_dir() {
+                continue;
+            }
+            let files = phase_task_files(&dir).map_err(|e| format!("listing tasks: {e}"))?;
+            let plan = plans.entry(name.clone()).or_insert_with(|| PlanFiles {
+                name,
+                archived: true,
+                tasks: BTreeSet::new(),
+            });
+            plan.archived &= bucket == "archive";
+            plan.tasks.extend(files.iter().map(|f| file_task_id(f)));
+        }
+    }
+    Ok(plans.into_values().collect())
+}
+
+/// The plans of a source with no task tree: its listed phases.
+fn listed_plans(phases: &[PanelPhase]) -> Vec<PlanFiles> {
+    phases
+        .iter()
+        .map(|p| PlanFiles {
+            name: p.name.clone(),
+            archived: false,
+            tasks: p.tasks.iter().map(|t| t.id.clone()).collect(),
+        })
+        .collect()
+}
+
+/// The light of a task the listing does not carry (an archived one), from
+/// its runs newest first: what `fw status` would classify it as, short of
+/// a landing park (archived work has landed).
+fn unlisted_light(runs: &[&Lifecycle]) -> TaskLight {
+    let Some(latest) = runs.first() else {
+        return TaskLight::Pending;
+    };
+    if runs.iter().any(|lc| lc.status == Status::Done) {
+        return TaskLight::Verified;
+    }
+    match latest.status {
+        Status::Failed | Status::FailedValidation | Status::InternalError => TaskLight::Failed,
+        Status::AwaitingApproval => TaskLight::Awaiting,
+        Status::Interrupted => TaskLight::Blocked,
+        Status::Pending | Status::Ready | Status::Running | Status::Validating | Status::Done => {
+            TaskLight::Running
+        }
+    }
+}
+
+/// When a DONE run ended: its DONE transition, else its last attempt's end.
+fn verified_at(lc: &Lifecycle) -> Option<DateTime<Utc>> {
+    lc.timestamps
+        .get(&Status::Done)
+        .copied()
+        .or_else(|| lc.attempts.last().and_then(|a| a.ended_at))
+}
+
+/// Fold `lifecycles` (every run of the plans' tasks, newest first, as the
+/// store lists them) into the plans' progress. `lights`: the listed tasks'
+/// panel states (an unlisted task is classified from its runs).
+fn fold_plans(
+    files: Vec<PlanFiles>,
+    lifecycles: &[Lifecycle],
+    lights: &HashMap<&str, TaskLight>,
+    now: DateTime<Utc>,
+) -> Vec<PanelPlan> {
+    let mut runs: HashMap<&str, Vec<&Lifecycle>> = HashMap::new();
+    for lc in lifecycles {
+        runs.entry(lc.task_id.as_str()).or_default().push(lc);
+    }
+    let since = now - chrono::Duration::hours(VERIFIED_WINDOW_HOURS);
+    let mut plans: Vec<PanelPlan> = files
+        .into_iter()
+        .map(|plan| {
+            let mut out = PanelPlan {
+                name: plan.name,
+                archived: plan.archived,
+                total: plan.tasks.len(),
+                verified: 0,
+                spend_usd: 0.0,
+                verified_24h: 0,
+                needs: 0,
+                running: 0,
+            };
+            for task in &plan.tasks {
+                let task_runs = runs.get(task.as_str()).map_or(&[][..], Vec::as_slice);
+                out.spend_usd += task_runs
+                    .iter()
+                    .flat_map(|lc| &lc.attempts)
+                    .map(|a| a.total_cost_usd)
+                    .sum::<f64>();
+                if let Some(latest) = task_runs.first()
+                    && latest.status == Status::Done
+                {
+                    out.verified += 1;
+                    if verified_at(latest).is_some_and(|at| at > since && at <= now) {
+                        out.verified_24h += 1;
+                    }
+                }
+                let light = lights
+                    .get(task.as_str())
+                    .copied()
+                    .unwrap_or_else(|| unlisted_light(task_runs));
+                match light {
+                    TaskLight::Failed | TaskLight::Parked | TaskLight::Awaiting => out.needs += 1,
+                    TaskLight::Running => out.running += 1,
+                    _ => {}
+                }
+            }
+            out
+        })
+        .collect();
+    plans.sort_by(|a, b| (a.needs == 0, &a.name).cmp(&(b.needs == 0, &b.name)));
+    plans
+}
+
+/// The panel's plans: the task tree's phases (else the listed ones) folded
+/// from every run of their tasks in `core`. What cannot be read is pushed
+/// to `problems`; the plans are still listed from their files.
+fn read_plans(
+    tasks_dir: Option<&Path>,
+    core: &dyn HarnessStore,
+    panel: &FlywheelPanel,
+    problems: &mut Vec<String>,
+) -> Vec<PanelPlan> {
+    let files = match tasks_dir.map(plan_files) {
+        Some(Ok(files)) => files,
+        Some(Err(message)) => {
+            problems.push(message);
+            return Vec::new();
+        }
+        None => listed_plans(&panel.phases),
+    };
+    let ids: BTreeSet<&str> = files
+        .iter()
+        .flat_map(|p| &p.tasks)
+        .map(String::as_str)
+        .collect();
+    let lifecycles = if ids.is_empty() {
+        Vec::new()
+    } else {
+        core.list_lifecycles(&LifecycleFilter::default().with_task_ids(ids))
+            .unwrap_or_else(|e| {
+                problems.push(format!("reading plan runs: {e}"));
+                Vec::new()
+            })
+    };
+    let lights: HashMap<&str, TaskLight> = panel
+        .phases
+        .iter()
+        .flat_map(|p| &p.tasks)
+        .map(|t| (t.id.as_str(), t.state))
+        .collect();
+    fold_plans(files, &lifecycles, &lights, panel.generated_at)
+}
+
 // --- runs, claims, daemons ---------------------------------------------------
 
 fn elapsed(now: DateTime<Utc>, since: DateTime<Utc>) -> i64 {
@@ -1076,6 +1277,7 @@ impl FlywheelProvider for HubFlywheel {
             Ok(runs) => panel.runs = runs,
             Err(message) => problems.push(message),
         }
+        panel.plans = read_plans(tasks_dir.as_deref(), core.as_ref(), &panel, &mut problems);
         match claims_and_worker(claims.as_ref(), now) {
             Ok((rows, worker)) => {
                 panel.claims = rows;
@@ -1372,6 +1574,110 @@ mod tests {
         assert_eq!(
             stopped.detail,
             "abort -- The safe_div(a, b) implementation is already present on the base"
+        );
+    }
+
+    /// A run of `task` ending in `status` at `at`, its attempts costing
+    /// `costs`.
+    fn run(
+        task: &str,
+        run_id: &str,
+        status: Status,
+        at: DateTime<Utc>,
+        costs: &[f64],
+    ) -> Lifecycle {
+        let mut lc = Lifecycle::new(task);
+        lc.run_id = run_id.to_owned();
+        lc.status = status;
+        lc.timestamps.insert(status, at);
+        for (i, cost) in costs.iter().enumerate() {
+            let mut attempt = flywheel_core::lifecycle::Attempt::new(i as u32 + 1, at, run_id);
+            attempt.total_cost_usd = *cost;
+            attempt.ended_at = Some(at);
+            lc.attempts.push(attempt);
+        }
+        lc
+    }
+
+    fn files(name: &str, archived: bool, tasks: &[&str]) -> PlanFiles {
+        PlanFiles {
+            name: name.to_owned(),
+            archived,
+            tasks: tasks.iter().map(|t| (*t).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn portfolio_plans_fold_every_run_of_their_tasks() {
+        let now = Utc::now();
+        let hours = |h: i64| now - chrono::Duration::hours(h);
+        // Newest first, as the store lists them.
+        let lifecycles = vec![
+            // redo: a DONE run superseded by a newer failed one.
+            run("redo", "r-redo-2", Status::Failed, hours(1), &[0.5]),
+            run("fresh", "r-fresh", Status::Done, hours(23), &[1.0, 0.25]),
+            run("stale", "r-stale", Status::Done, hours(25), &[2.0]),
+            run("redo", "r-redo-1", Status::Done, hours(2), &[0.125]),
+            run("old", "r-old", Status::Done, hours(400), &[3.0]),
+            run("gate", "r-gate", Status::AwaitingApproval, hours(3), &[]),
+            run("stranger", "r-stranger", Status::Done, hours(1), &[9.0]),
+        ];
+        let lights: HashMap<&str, TaskLight> = [
+            ("redo", TaskLight::Verified),
+            ("fresh", TaskLight::Verified),
+        ]
+        .into();
+        let plans = fold_plans(
+            vec![
+                files("01-live", false, &["fresh", "stale", "redo", "idle"]),
+                files("00-done", true, &["old", "gate"]),
+            ],
+            &lifecycles,
+            &lights,
+            now,
+        );
+        // Needing someone first (the archived plan's parked gate).
+        let names: Vec<&str> = plans.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["00-done", "01-live"]);
+        let live = &plans[1];
+        assert!(!live.archived);
+        assert_eq!(live.total, 4, "a task with no runs still counts");
+        assert_eq!(live.verified, 2, "redo's latest run is not DONE");
+        assert_eq!(live.verified_24h, 1, "only fresh ended inside 24h");
+        assert!((live.spend_usd - 3.875).abs() < 1e-9, "{}", live.spend_usd);
+        assert_eq!(live.needs, 0);
+        let done = &plans[0];
+        assert!(done.archived);
+        assert_eq!((done.verified, done.total), (1, 2));
+        assert_eq!(done.verified_24h, 0);
+        assert_eq!(
+            done.needs, 1,
+            "the unlisted gate is classified from its run"
+        );
+        assert!((done.spend_usd - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn portfolio_plans_cover_active_and_archived_phase_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let write = |rel: &str, body: &str| {
+            let path = tmp.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        };
+        write("active/02-new/a.json", r#"{"id": "task-a"}"#);
+        write("active/02-new/_notes.json", "{}");
+        write("active/02-new/readme.md", "");
+        write("archive/01-old/b.json", "not json");
+        write("archive/02-new/c.json", r#"{"id": "task-c"}"#);
+        write("archive/.hidden/d.json", r#"{"id": "task-d"}"#);
+        let plans = plan_files(tmp.path()).unwrap();
+        assert_eq!(
+            plans,
+            [
+                files("01-old", true, &["b"]),
+                files("02-new", false, &["task-a", "task-c"]),
+            ]
         );
     }
 }

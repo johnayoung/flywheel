@@ -107,7 +107,7 @@ fw hub fanout cleanup "$id" [--force] --yes
 
 ## Fan-outs and flywheel tasks
 
-For a folder flywheel drives with a **directory** work source:
+For a folder with a flywheel **directory** work source:
 
 ```bash
 fw hub fanout promote "$id" --reference c1  # instead of pick; dry run: path and exact bytes
@@ -116,18 +116,18 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 ```
 
 - **Promote instead of picking** to land via `fw worker` (refused after a pick): goal (`--goal`, the seed task's, or the prompt's first line), prompt -> `context.notes`, graders -> `command` graders, `--protect` -> constraints, `--reference` (default winner, else leader); refused for an existing file or id. **Run <id> with worker here** runs `fw worker --task <id>`.
-- **Fan out this task** (Flywheel panel): prompt from its goal and context; graders = its command plus **held-out** graders, added server-side (none, or an unreadable registry: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
+- **Fan out this task** (Flywheel panel): prompt from its goal and context; graders = its command plus **held-out** graders, added server-side (none or unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
 
-Folders whose git repo has a project id flywheel knows get the verified loop, read-only (`--no-flywheel`: off); state comes from `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else the hub's env.
+Repos with a project id flywheel knows get the verified loop, read-only (`--no-flywheel`: off); state: `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else the hub's env.
 
-- Phases, tasks, live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
+- Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs, the 12 newest runs with grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the folder chip's `verified/total` badge, `Alt F`, the palette.
 - **Start worker here**: `fw worker` in a split below; a task's **run**: `fw worker --task <id>` (asks to add unmet prerequisites); a second asks first (409); `queued in <session>`: a scoped worker will run it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary and redacted transcript, live.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) runs `fw autopilot` in a hub session; stop = Ctrl-C; pause / resume = `fw autopilot --pause|--resume`.
-- Shown (decisions from the ledger): tier verdicts, the newest deciding cycle (emitted, dropped with reasons), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
-- A linked worktree reads its own store; `github*` sources are not listed; a missing SQLite store is not made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
-- **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the touched folder's project store (`fw audit --project`). No project: no row, none made. Seam: `AuditSink` (`hub_audit.rs`).
+- Shown (decisions from the ledger): tier verdicts, the newest deciding cycle (emitted, dropped + why), the 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row. Peers: read-only.
+- A linked worktree reads its own store; `github*` sources: not listed; no SQLite store is made. One watcher per folder (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
+- **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`). No project: no row, none made. Seam: `AuditSink` (`hub_audit.rs`).
 
 ## Prompt queue
 

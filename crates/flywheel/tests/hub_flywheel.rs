@@ -377,6 +377,94 @@ fn panel_reads_phases_runs_graders_claims_daemons_and_alerts() {
 }
 
 #[test]
+fn portfolio_reports_every_plan_with_progress_spend_and_verified_per_day() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("fw-home");
+    let (good, broken) = (base.join("good"), base.join("broken"));
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::create_dir_all(&broken).unwrap();
+    let project = adopted_repo(&home, &good);
+    let broken_project = adopted_repo(&home, &broken);
+
+    // An archived phase whose runs outnumber the recent-run window, its
+    // verifying runs straddling the 24h boundary.
+    let archived = project.tasks().join("archive").join("00-seed");
+    std::fs::create_dir_all(&archived).unwrap();
+    let store = project.store();
+    for i in 0..14 {
+        let id = format!("seed-{i}");
+        let task =
+            json!({"id": id, "goal": "Seed.", "graders": [{"type": "command", "run": "true"}]});
+        std::fs::write(archived.join(format!("{id}.json")), task.to_string()).unwrap();
+        let hours = if i < 10 { 30 } else { 2 };
+        seed_run(
+            &store,
+            &id,
+            &format!("run-seed-{i}"),
+            &DONE,
+            Utc::now() - ChronoDuration::hours(hours),
+            Some(Outcome::Succeeded),
+            &[],
+        );
+    }
+    // The broken folder's store cannot be read.
+    std::fs::write(broken_project.db(), b"not a sqlite database at all").unwrap();
+
+    let provider = HubFlywheel::new("/usr/bin/false").with_home(&home);
+    let panel = provider.panel(&good);
+    assert_eq!(panel.problem, None, "{panel:#?}");
+    assert_eq!(
+        panel.runs.len(),
+        12,
+        "the recent window is bounded; plans are not"
+    );
+    let plan = |name: &str| {
+        panel
+            .plans
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("plan {name}: {:#?}", panel.plans))
+            .clone()
+    };
+    let names: Vec<&str> = panel.plans.iter().map(|p| p.name.as_str()).collect();
+    // Needing someone first: 01-core (beta failed), 02-land (eps parked).
+    assert_eq!(names, ["01-core", "02-land", "00-seed"]);
+
+    let seed = plan("00-seed");
+    assert!(seed.archived);
+    assert_eq!((seed.verified, seed.total), (14, 14));
+    assert_eq!(seed.verified_24h, 4);
+    assert!((seed.spend_usd - 3.5).abs() < 1e-9, "{}", seed.spend_usd);
+    assert_eq!((seed.needs, seed.running), (0, 0));
+
+    let core = plan("01-core");
+    assert!(!core.archived);
+    // alpha DONE; beta failed; gamma running; delta never ran.
+    assert_eq!((core.verified, core.total), (1, 4));
+    assert_eq!(core.verified_24h, 1);
+    assert!((core.spend_usd - 0.75).abs() < 1e-9, "{}", core.spend_usd);
+    assert_eq!((core.needs, core.running), (1, 1));
+
+    let land = plan("02-land");
+    assert_eq!((land.verified, land.total, land.verified_24h), (1, 1, 1));
+    assert_eq!(land.needs, 1, "its DONE run's landing parked");
+    assert_eq!(panel.summary().plans, panel.plans);
+
+    // The broken folder names its problem and still lists its plans from
+    // the task files; the good folder reads on.
+    let failed = provider.panel(&broken);
+    assert!(failed.problem.is_some(), "{failed:#?}");
+    let listed: Vec<(&str, usize, usize)> = failed
+        .plans
+        .iter()
+        .map(|p| (p.name.as_str(), p.verified, p.total))
+        .collect();
+    assert_eq!(listed, [("01-core", 0, 4), ("02-land", 0, 1)]);
+    assert_eq!(provider.panel(&good).plans.len(), 3);
+}
+
+#[test]
 fn run_output_is_fw_show_plus_the_transcript_tailed_incrementally() {
     let fx = temp_repo();
     let root = fx.root.clone();

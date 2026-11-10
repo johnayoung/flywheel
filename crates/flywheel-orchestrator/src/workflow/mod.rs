@@ -71,7 +71,7 @@ pub use ops::{
 };
 pub use pauses::{
     PauseEntry, PauseSelector, active_pauses, clear_session_pauses, cmd_pauses, format_pause_time,
-    pause_entries, pause_label,
+    pause_entries, pause_label, session_pause_line,
 };
 pub use select::{
     LatestLifecycleRow, SelectOptions, StatusRow, build_status_rows, cmd_next, cmd_next_landed,

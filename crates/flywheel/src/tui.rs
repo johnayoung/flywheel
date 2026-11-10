@@ -54,7 +54,7 @@ use flywheel_orchestrator::store_factory::{
 };
 use flywheel_orchestrator::store_registry::{Environ, SqliteCoreOpener, StoreRegistries};
 use flywheel_orchestrator::workflow::{
-    Access, load_effective_policy, repo_root_for, store_config_for, store_partition,
+    Access, active_pauses, load_effective_policy, repo_root_for, store_config_for, store_partition,
 };
 use flywheel_worktree::phase::{ArchiveOptions, archive_completed_phases};
 use ratatui::Frame;
@@ -938,14 +938,19 @@ pub fn build_dashboard(
     let store = Arc::clone(&bundle.core);
     let poll_store = Arc::clone(&store);
     let poll_source = Arc::clone(&work_source);
+    let poll_claims = Arc::clone(&bundle.claims);
     let poll = move || -> Result<DashboardSnapshot, String> {
-        build_snapshot(
+        let now = Utc::now();
+        let mut snapshot = build_snapshot(
             poll_store.as_ref(),
             Some(poll_source.as_ref()),
-            Utc::now(),
+            now,
             started_at,
         )
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+        snapshot.pauses =
+            active_pauses(poll_claims.as_ref(), now).map_err(|err| err.to_string())?;
+        Ok(snapshot)
     };
 
     let enqueue_store = Arc::clone(&store);

@@ -43,6 +43,7 @@ use flywheel_core::store::JsonObject;
 use flywheel_orchestrator::autopilot_activity::{
     AutopilotActivity, PHASE_IDLE, PHASE_RUNNING, PHASE_STARTING,
 };
+use flywheel_orchestrator::workflow::session_pause_line;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -98,6 +99,9 @@ pub const MAX_DETAIL_WIDTH: usize = 60;
 
 /// Most lines the inline notice occupies (the `/help` listing fits).
 const MAX_NOTICE_ROWS: u16 = 12;
+
+/// The most session-pause lines the status area gives up rows for.
+const MAX_PAUSE_ROWS: u16 = 6;
 
 /// Statuses against which the watcher applies `interrupt`.
 pub const STEERABLE_STATUSES: [Status; 2] = [Status::Running, Status::Validating];
@@ -528,6 +532,15 @@ impl DashboardApp {
         } else {
             Some(Line::from(spans))
         }
+    }
+
+    /// One `session-pause: <label> until <pause_until> (run <id>)` line per
+    /// session pause active at the last good poll, newest first.
+    pub fn pause_lines(&self) -> Vec<String> {
+        self.last_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.pauses.iter().map(session_pause_line).collect())
+            .unwrap_or_default()
     }
 
     // ----- Timers ------------------------------------------------------------
@@ -1143,6 +1156,14 @@ impl DashboardApp {
             |s| format_summary(&s.summary),
         );
         let daemon_bar = self.daemon_bar();
+        let pause_lines: Vec<Line<'static>> = self
+            .pause_lines()
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Yellow))))
+            .collect();
+        let pause_rows = u16::try_from(pause_lines.len())
+            .unwrap_or(MAX_PAUSE_ROWS)
+            .min(MAX_PAUSE_ROWS);
         let empty_state = self.empty_state_text();
         let notice_lines: Vec<Line<'static>> = self
             .notice
@@ -1160,6 +1181,7 @@ impl DashboardApp {
         let chunks = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(u16::from(daemon_bar.is_some())),
+            Constraint::Length(pause_rows),
             Constraint::Min(2),
             Constraint::Length(u16::from(empty_state.is_some())),
             Constraint::Length(u16::from(self.last_error.is_some())),
@@ -1168,36 +1190,39 @@ impl DashboardApp {
             Constraint::Length(1),
         ])
         .split(area);
-        self.input_area = chunks[7];
+        self.input_area = chunks[8];
 
         frame.render_widget(Paragraph::new(summary), chunks[0]);
         if let Some(bar) = daemon_bar {
             frame.render_widget(Paragraph::new(bar), chunks[1]);
         }
-        self.render_table(frame, chunks[2]);
+        if !pause_lines.is_empty() {
+            frame.render_widget(Paragraph::new(Text::from(pause_lines)), chunks[2]);
+        }
+        self.render_table(frame, chunks[3]);
         if let Some(text) = empty_state {
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().add_modifier(Modifier::DIM)),
-                chunks[3],
+                chunks[4],
             );
         }
         if let Some(error) = &self.last_error {
             frame.render_widget(
                 Paragraph::new(error.clone()).style(Style::default().fg(Color::Yellow)),
-                chunks[4],
+                chunks[5],
             );
         }
         if !notice_lines.is_empty() {
             frame.render_widget(
                 Paragraph::new(Text::from(notice_lines)).style(Style::default().fg(Color::Yellow)),
-                chunks[5],
+                chunks[6],
             );
         }
         if self.help_visible {
             let lines: Vec<Line<'static>> = HELP_LINES.iter().map(|l| Line::from(*l)).collect();
-            frame.render_widget(Paragraph::new(Text::from(lines)), chunks[6]);
+            frame.render_widget(Paragraph::new(Text::from(lines)), chunks[7]);
         }
-        self.input.render(frame, chunks[7]);
+        self.input.render(frame, chunks[8]);
     }
 
     fn render_table(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1606,6 +1631,7 @@ mod tests {
                 runtime_seconds: 0,
             },
             rows: rows.to_vec(),
+            pauses: Vec::new(),
         }
     }
 
@@ -1842,6 +1868,7 @@ mod tests {
                 runtime_seconds: 125,
             },
             rows: vec![row("alpha"), row("beta")],
+            pauses: Vec::new(),
         };
         let mut app = DashboardApp::new(move || Ok(snap.clone()));
         app.refresh_now();
@@ -1856,6 +1883,96 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("> alpha  running  1/2           3s   42      $0.1230  ASSISTANT Edit(file_path=README.md)"), "{text}");
+    }
+
+    #[test]
+    fn console_pause_status_area_shows_each_active_pause_label_and_expiry() {
+        use flywheel_orchestrator::claims::{
+            ClaimStore, DEFAULT_PAUSE_ACCOUNT, InMemoryClaimStore, PAUSE_CLEAR_VIA_CLI,
+        };
+        use flywheel_orchestrator::workflow::{
+            PauseSelector, active_pauses, clear_session_pauses, format_pause_time,
+        };
+
+        let now = Utc::now();
+        let claims = InMemoryClaimStore::new();
+        let record = |reset: chrono::Duration, at: DateTime<Utc>, run: &str, account: &str| {
+            claims
+                .record_session_pause(at + reset, at, 86_400.0, run, account)
+                .unwrap()
+                .unwrap()
+        };
+        let a_until = record(chrono::Duration::hours(2), now, "run-a", "A");
+        let d_until = record(
+            chrono::Duration::hours(3),
+            now - chrono::Duration::minutes(1),
+            "run-d",
+            DEFAULT_PAUSE_ACCOUNT,
+        );
+        record(
+            chrono::Duration::hours(1),
+            now - chrono::Duration::hours(3),
+            "run-expired",
+            "A",
+        );
+        record(
+            chrono::Duration::hours(4),
+            now - chrono::Duration::minutes(2),
+            "run-cleared",
+            "B",
+        );
+        let cleared_id = active_pauses(&claims, now)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.run_id == "run-cleared")
+            .unwrap()
+            .id;
+        clear_session_pauses(
+            &claims,
+            &PauseSelector::Ids(vec![cleared_id]),
+            now,
+            PAUSE_CLEAR_VIA_CLI,
+            "switched accounts",
+        )
+        .unwrap();
+
+        let mut snap = snapshot(&[row("alpha")]);
+        snap.pauses = active_pauses(&claims, now).unwrap();
+        let mut app = DashboardApp::new(move || Ok(snap.clone()));
+        app.refresh_now();
+        let a_line = format!(
+            "session-pause: @A until {} (run run-a)",
+            format_pause_time(a_until)
+        );
+        let d_line = format!(
+            "session-pause: cli login until {} (run run-d)",
+            format_pause_time(d_until)
+        );
+        assert_eq!(app.pause_lines(), vec![a_line.clone(), d_line.clone()]);
+
+        let mut term = terminal(120, 12);
+        term.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(&term);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("active=1"), "{text}");
+        assert_eq!(lines[1].trim_end(), a_line, "{text}");
+        assert_eq!(lines[2].trim_end(), d_line, "{text}");
+        assert!(text.contains("@A"), "{text}");
+        assert!(text.contains(&format_pause_time(a_until)), "{text}");
+        assert!(!text.contains("run-expired"), "{text}");
+        assert!(!text.contains("run-cleared"), "{text}");
+        assert!(text.contains("> alpha  running"), "{text}");
+    }
+
+    #[test]
+    fn console_pause_area_is_absent_without_active_pauses() {
+        let mut app = app_with(vec![row("alpha")]);
+        assert!(app.pause_lines().is_empty());
+        let mut term = terminal(100, 10);
+        term.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(&term);
+        assert!(!text.contains("session-pause:"), "{text}");
+        assert!(text.lines().nth(1).unwrap().contains("task"), "{text}");
     }
 
     #[test]

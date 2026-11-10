@@ -20,6 +20,7 @@ use flywheel_core::task::Grader;
 use flywheel_core::telemetry_file::{JsonStyle, python_json_dumps};
 use flywheel_orchestrator::rollup::status_rows_for_items;
 use flywheel_orchestrator::sources::{WorkItem, WorkReport, WorkSource, WorkSourceError};
+use flywheel_orchestrator::workflow::PauseEntry;
 use serde_json::{Map, Value, json};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -233,11 +234,16 @@ impl SummaryData {
 }
 
 /// One full dashboard frame: header summary plus active-run rows, sorted by
-/// `(task_id, run_id)`.
+/// `(task_id, run_id)`, and the session pauses active at poll time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DashboardSnapshot {
     pub summary: SummaryData,
     pub rows: Vec<RowSnapshot>,
+    /// The active session pauses (newest first) from the shared
+    /// [`flywheel_orchestrator::workflow::active_pauses`] read; the console
+    /// poll fills it, [`build_snapshot`] leaves it empty, and
+    /// [`snapshot_to_json`] does not render it.
+    pub pauses: Vec<PauseEntry>,
 }
 
 impl DashboardSnapshot {
@@ -246,6 +252,7 @@ impl DashboardSnapshot {
         Self {
             summary: SummaryData::empty(),
             rows: Vec::new(),
+            pauses: Vec::new(),
         }
     }
 }
@@ -312,7 +319,11 @@ pub fn build_snapshot<S: LifecycleStore + TaskStore + ?Sized>(
         cost_usd_total: live.iter().fold(0.0, |total, r| total + r.cost_usd_total),
         runtime_seconds: elapsed_seconds(now, started_at),
     };
-    Ok(DashboardSnapshot { summary, rows })
+    Ok(DashboardSnapshot {
+        summary,
+        rows,
+        pauses: Vec::new(),
+    })
 }
 
 /// Render a snapshot as plain JSON data with stable field names: scripts
@@ -972,6 +983,7 @@ mod tests {
                 runtime_seconds: 3,
             },
             rows: Vec::new(),
+            pauses: Vec::new(),
         };
         let rendered = render_snapshot_json(&snap);
         assert!(

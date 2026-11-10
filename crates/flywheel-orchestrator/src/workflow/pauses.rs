@@ -101,6 +101,17 @@ impl PauseEntry {
     }
 }
 
+/// The one-line form of an active pause every status surface prints:
+/// `session-pause: <label> until <pause_until RFC 3339> (run <run_id>)`.
+pub fn session_pause_line(entry: &PauseEntry) -> String {
+    format!(
+        "session-pause: {} until {} (run {})",
+        entry.label(),
+        format_pause_time(entry.pause_until),
+        entry.run_id
+    )
+}
+
 /// Every recorded pause, newest first (by `recorded_at`, then id), each
 /// marked active or not at `now`.
 pub fn pause_entries(

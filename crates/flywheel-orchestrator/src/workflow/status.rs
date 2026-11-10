@@ -23,6 +23,7 @@ use crate::rollup::{build_rollup_landed, render_rollup_text, rollup_to_json};
 use crate::sources::WorkItem;
 
 use super::args::StatusArgs;
+use super::pauses::{active_pauses, session_pause_line};
 use super::select::{StatusRow, reachability_held_prerequisites, snapshots, status_rows};
 use super::{WorkflowError, py_json_dumps_indent2, python_path_str};
 
@@ -276,7 +277,9 @@ fn cmd_status_rollup(
 /// stop keyed to a task renders `stopped:`, and subjects with no active row
 /// (source-level stops, strands whose task file left the listing) render as
 /// their own `[no active row]` entries. An attributed resolution marker
-/// clears a strand; a park appended after it is a fresh recurrence.
+/// clears a strand; a park appended after it is a fresh recurrence. The
+/// text form leads with one `session-pause:` line per active pause; the
+/// `--json` array is unchanged.
 pub fn cmd_status(
     args: &StatusArgs,
     items: &[WorkItem],
@@ -431,6 +434,11 @@ pub fn cmd_status(
         return Ok(0);
     }
 
+    // Account-scoped session pauses lead the listing: one line per pause
+    // still holding workers back; expired and cleared ones print nothing.
+    for pause in active_pauses(claims, Utc::now())? {
+        writeln!(out, "{}", session_pause_line(&pause))?;
+    }
     if rows.is_empty() && stops_by_subject.is_empty() && rowless_strands.is_empty() {
         writeln!(out, "(no active tasks)")?;
         return Ok(0);
@@ -511,12 +519,14 @@ pub fn cmd_status(
 
 #[cfg(test)]
 mod tests {
+    use super::super::pauses::{PauseSelector, clear_session_pauses, format_pause_time};
     use super::super::test_support::*;
     use super::*;
     use crate::claims::{
-        InMemoryClaimStore, RESOLUTION_ATTRIBUTION_OPERATOR, RESOLUTION_ATTRIBUTION_PROBE,
+        DEFAULT_PAUSE_ACCOUNT, InMemoryClaimStore, PAUSE_CLEAR_VIA_CLI,
+        RESOLUTION_ATTRIBUTION_OPERATOR, RESOLUTION_ATTRIBUTION_PROBE,
         RESOLUTION_ATTRIBUTION_RELAND, STOP_DANGLING_PREREQUISITE, STOP_NO_OP_CYCLE,
-        STOP_PREPARE_SKIP, STOP_SOURCE_TRUNCATION, STOP_ZERO_GRADER_DROP,
+        STOP_PREPARE_SKIP, STOP_SOURCE_TRUNCATION, STOP_ZERO_GRADER_DROP, SqliteClaimStore,
     };
     use crate::sources::{DirectoryWorkSource, WorkSource};
     use chrono::Duration;
@@ -1526,5 +1536,156 @@ mod tests {
             wrapped.replace("lone", "other"),
             String::from_utf8(out).unwrap()
         );
+    }
+
+    /// `fw status` (text or `--json`) over `claims` with an empty listing.
+    fn pause_status(claims: &dyn ClaimStore, json: bool) -> String {
+        let args = StatusArgs {
+            json,
+            ..StatusArgs::default()
+        };
+        let mut out = Vec::new();
+        let code = cmd_status(
+            &args,
+            &[],
+            &InMemoryStore::new(),
+            claims,
+            None,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Record an active pause on `account` for `run_id`, `hours` out.
+    fn active_pause(claims: &dyn ClaimStore, account: &str, run_id: &str, hours: i64) -> String {
+        let now = Utc::now();
+        let until = claims
+            .record_session_pause(now + Duration::hours(hours), now, 86_400.0, run_id, account)
+            .unwrap()
+            .unwrap();
+        format_pause_time(until)
+    }
+
+    /// A SQLite claim store plus a pre-account (`NULL`) row for `run_id`,
+    /// written the way a pre-v11 store reads back.
+    fn store_with_legacy_pause(dir: &TempDir, run_id: &str) -> (SqliteClaimStore, String) {
+        let db = dir.path().join("claims.sqlite");
+        let claims = SqliteClaimStore::open(&db).unwrap();
+        let until = active_pause(&claims, "legacy", run_id, 3);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE orchestrator_session_pauses SET account = NULL WHERE run_id = ?1",
+                [run_id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        (claims, until)
+    }
+
+    fn expired_pause(claims: &dyn ClaimStore, account: &str, run_id: &str) {
+        let then = Utc::now() - Duration::hours(3);
+        claims
+            .record_session_pause(then + Duration::hours(1), then, 86_400.0, run_id, account)
+            .unwrap()
+            .unwrap();
+    }
+
+    fn cleared_pause(claims: &dyn ClaimStore, account: &str, run_id: &str) {
+        active_pause(claims, account, run_id, 4);
+        let id = active_pauses(claims, Utc::now())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.run_id == run_id)
+            .unwrap()
+            .id;
+        let cleared = clear_session_pauses(
+            claims,
+            &PauseSelector::Ids(vec![id]),
+            Utc::now(),
+            PAUSE_CLEAR_VIA_CLI,
+            "operator cleared it",
+        )
+        .unwrap();
+        assert_eq!(cleared, vec![id]);
+    }
+
+    #[test]
+    fn pause_status_line_active_on_account_a() {
+        let claims = InMemoryClaimStore::new();
+        let until = active_pause(&claims, "A", "run-a", 2);
+        assert_eq!(
+            pause_status(&claims, false),
+            format!("session-pause: @A until {until} (run run-a)\n(no active tasks)\n")
+        );
+    }
+
+    #[test]
+    fn pause_status_line_legacy_null_reads_all_accounts() {
+        let dir = TempDir::new().unwrap();
+        let (claims, until) = store_with_legacy_pause(&dir, "run-legacy");
+        assert_eq!(
+            pause_status(&claims, false),
+            format!(
+                "session-pause: all accounts until {until} (run run-legacy)\n(no active tasks)\n"
+            )
+        );
+    }
+
+    #[test]
+    fn pause_status_line_default_account_reads_cli_login() {
+        let claims = InMemoryClaimStore::new();
+        let until = active_pause(&claims, DEFAULT_PAUSE_ACCOUNT, "run-d", 2);
+        assert_eq!(
+            pause_status(&claims, false),
+            format!("session-pause: cli login until {until} (run run-d)\n(no active tasks)\n")
+        );
+    }
+
+    #[test]
+    fn pause_status_line_expired_prints_nothing() {
+        let claims = InMemoryClaimStore::new();
+        expired_pause(&claims, "A", "run-expired");
+        assert_eq!(pause_status(&claims, false), "(no active tasks)\n");
+    }
+
+    #[test]
+    fn pause_status_line_cleared_prints_nothing() {
+        let claims = InMemoryClaimStore::new();
+        cleared_pause(&claims, "A", "run-cleared");
+        assert_eq!(pause_status(&claims, false), "(no active tasks)\n");
+    }
+
+    #[test]
+    fn pause_status_line_exactly_one_per_active_pause_and_json_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let (claims, legacy_until) = store_with_legacy_pause(&dir, "run-legacy");
+        expired_pause(&claims, "A", "run-a-old");
+        cleared_pause(&claims, "A", "run-a-cleared");
+        let a_until = active_pause(&claims, "A", "run-a", 2);
+        assert_eq!(
+            pause_status(&claims, false),
+            format!(
+                "session-pause: @A until {a_until} (run run-a)\n\
+                 session-pause: all accounts until {legacy_until} (run run-legacy)\n\
+                 (no active tasks)\n"
+            )
+        );
+        assert_eq!(pause_status(&claims, true), "[]\n");
+    }
+
+    #[test]
+    fn pause_status_line_leads_the_task_listing() {
+        let (tmp, store, claims) = scenario();
+        let until = active_pause(&claims, "A", "run-a", 2);
+        assert_eq!(
+            run_status(&tmp, &store, &claims, false, false),
+            format!("session-pause: @A until {until} (run run-a)\n{EXPECTED_TEXT}")
+        );
+        let expected = EXPECTED_JSON.replace("<TMP>", &tmp.path().display().to_string());
+        assert_eq!(run_status(&tmp, &store, &claims, true, false), expected);
     }
 }

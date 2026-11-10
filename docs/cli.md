@@ -20,6 +20,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Specs | `fw spec ls [--json]` / `export DIR [--force]` | The cwd project's central specs; copy them out (see [Specs](#specs)) |
 | Config | `fw config [--json]` / `fw trust [--revoke]` | The effective config with sources; approve the repo's `.flywheel.toml` (see [Config and trust](#config-and-trust)) |
 | Store | `fw db upgrade [--db PATH]` | Migrate the store in place to this build's schema (see [The store](#the-store)) |
+| Self-update | `fw self-update [--dry-run] [--json]` | Build a clean, landed flywheel checkout and install the new `fw` / `flywheel` in place (see [`self-update`](#self-update)) |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.
 
@@ -101,6 +102,45 @@ Every table carries a `project_id` partition column, so one store (one Postgres 
 | `db upgrade --db PATH` | Upgrade that sqlite file (partition `default`). |
 
 Schema versions: run store `schema_version` 15 (v15 added `attempts.stop_reason_json`), orchestrator store `orchestrator_schema_version` 10. Catalog: [persistence-tables.md](persistence-tables.md).
+
+## `self-update`
+
+`fw self-update [--from PATH] [--install-dir DIR] [--allow-unlanded] [--force] [--drain-timeout SECS] [--upgrade-postgres] [--dry-run] [--json]` builds a flywheel checkout with `cargo build --release --locked -p flywheel` and replaces `fw` and `flywheel` in place by atomic rename. It never runs `scripts/check.sh`: a landed commit is already verified. Component upgrades stay separate verbs: `fw db upgrade` (one store) and `fw hub upgrade` (hub handoff).
+
+**Bootstrap:** a flywheel without this verb moves to one that has it by one manual `cargo install --path crates/flywheel`; every later move uses `fw self-update`.
+
+| Flag | Meaning |
+|---|---|
+| `--from PATH` | The checkout to build. Default: the cwd repo when it is a flywheel checkout, else the checkout the last successful self-update recorded. |
+| `--install-dir DIR` | Where both binaries are replaced. Default: the running executable's directory. Refused when it lacks `fw` or `flywheel`, is inside a cargo `target/` dir, or is not writable. |
+| `--allow-unlanded` | Build a HEAD not reachable from the default branch. |
+| `--force` | Update even when already current. |
+| `--drain-timeout SECS` | Wait per drained process after SIGTERM (default 120). |
+| `--upgrade-postgres` | Allow upgrading a Postgres store that is behind (no backup). |
+| `--dry-run` | Build, then report every later step `planned`; writes nothing but the lock. |
+| `--json` | JSON Lines on stdout (below). |
+
+Refusals (exit 3, before `cargo` runs, nothing changed but the lock file): not a git work tree whose `crates/flywheel/Cargo.toml` declares package `flywheel` with bins `fw` and `flywheel`; a modified tracked or untracked non-ignored file; HEAD not reachable from the default branch (`refs/remotes/origin/HEAD`'s target, else `main`; local or `origin/` ref); another run holding `$FLYWHEEL_HOME/self-update/lock` (names its pid); a refused install dir. A failed build, or an artifact (`${CARGO_TARGET_DIR:-<checkout>/target}/release/{fw,flywheel}`) whose `--version` does not exit 0 printing `fw <version>`, also exits 3 with the install dir untouched.
+
+**Already current:** HEAD equals the recorded commit and the installed `fw` / `flywheel` bytes equal the recorded sha256 (never the version string): outcome `current`, no `cargo`. State lives in `$FLYWHEEL_HOME/self-update/`: `lock`, `previous/{fw,flywheel}` (the pair the last update replaced), `state.json` (commit, checkout, install dir, version, sha256 of both).
+
+Exit codes: `0` updated, current, or planned; `1` a step failed after changes began (reverted); `2` usage error; `3` refused before any change; `4` binaries and stores updated, hub not handed off.
+
+Human output is one line per step in the fixed order `preflight build drain backup install db-upgrade hub restart`, then `manual:` / `not-stopped:` / `unidentified-claim:` lines, then `self-update: <outcome>`:
+
+```
+self-update: preflight ok -- /src/flywheel at 3f2a9c1d0b7e, install dir /home/me/.cargo/bin
+self-update: build ok -- fw 0.6.1 at 3f2a9c1d0b7e
+self-update: drain skipped
+...
+self-update: install ok -- fw and flywheel 0.6.1 (3f2a9c1d0b7e) in /home/me/.cargo/bin
+...
+self-update: updated
+```
+
+Status is `ok`, `skipped`, `failed`, `reverted`, or `planned`; a step a refused run never reached is `skipped`. This build performs preflight, build, and install; drain, backup, db-upgrade, hub, and restart report `skipped` (`planned` under `--dry-run`).
+
+`--json` prints one `{"step","status","detail"}` object per step, then exactly one `{"summary":{...}}` with keys `outcome` (`updated` / `current` / `planned` / `refused` / `failed` / `updated-hub-pending`), `source` (`{kind:"checkout", path, commit}`), `from` / `to` (`{version, commit|null, sha256}`), `drained`, `not_stopped`, `unidentified_claims`, `backups`, `upgraded`, `hub`, `restarted`, `manual`. Build output goes to stderr, so stdout stays JSON Lines.
 
 ## Read verbs
 

@@ -31,6 +31,7 @@
 //! * config: `config [--json]` -> the effective config with sources
 //! * trust: `trust [--revoke]` -> approve (or revoke) the repo's `.flywheel.toml`
 //! * db: `db upgrade [--db PATH]` -> migrate the store in place
+//! * self-update: build a landed checkout and install `fw` / `flywheel`
 //!
 //! `next`, `orchestrate`, and the core single-task CLI (`run`, `is-done`,
 //! `set-model`, ... under `workflow`) are plumbing, not product verbs -- the
@@ -185,6 +186,7 @@ Verbs:
   config [--json]  print the effective config, each key with its source
   trust            approve this repo's .flywheel.toml (--revoke to withdraw)
   db upgrade       migrate the store in place to this build's schema
+  self-update      build a landed checkout and install fw + flywheel in place (--dry-run, --json)
 
 Store verbs work in any git repo: state lives under
 $FLYWHEEL_HOME/projects/<id>/ (default ~/.flywheel), keyed by the id in
@@ -432,6 +434,10 @@ pub fn route(
     if verb == crate::db_verbs::DB_VERB {
         // Migrate the store in place to this build's schema.
         return crate::db_verbs::run_db(rest, out, err);
+    }
+    if verb == crate::self_update::SELF_UPDATE_VERB {
+        // Build a clean, landed checkout and install the new pair in place.
+        return crate::self_update::run_with(rest, out, err);
     }
     if verb == exec::EXEC_VERB {
         // One agent call: no config, no store, no worktree.
@@ -1414,10 +1420,25 @@ mod tests {
             "audit",
             "docs",
             "hub",
+            "self-update",
         ] {
             assert!(out.contains(&format!("\n  {verb}")), "verb {verb} missing");
         }
         assert_eq!(run(&["-h"], &unbound()).0, 0);
+    }
+
+    #[test]
+    fn self_update_routes_help_and_refuses_unknown_flags() {
+        let (code, out, err) = run(&["self-update", "--help"], &unbound());
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(out, crate::self_update::SELF_UPDATE_USAGE);
+        let (code, out, err) = run(&["self-update", "--no-such-flag"], &unbound());
+        assert_eq!(code, 2);
+        assert_eq!(out, "");
+        assert!(
+            err.contains("unrecognized argument: --no-such-flag"),
+            "{err}"
+        );
     }
 
     #[test]

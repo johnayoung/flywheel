@@ -164,6 +164,29 @@ impl Home {
         self.claude_accounts_dir().join(format!("{name}.token"))
     }
 
+    /// `self-update/`: `fw self-update`'s state dir (lock, previous pair,
+    /// the record of the last successful update).
+    pub fn self_update_dir(&self) -> PathBuf {
+        self.root.join("self-update")
+    }
+
+    /// `self-update/lock`: the exclusive flock one `fw self-update` holds.
+    pub fn self_update_lock(&self) -> PathBuf {
+        self.self_update_dir().join("lock")
+    }
+
+    /// `self-update/previous/`: the `fw` / `flywheel` pair the last update
+    /// replaced.
+    pub fn self_update_previous_dir(&self) -> PathBuf {
+        self.self_update_dir().join("previous")
+    }
+
+    /// `self-update/state.json`: commit, checkout, and installed sha256 of
+    /// the last successful update.
+    pub fn self_update_state(&self) -> PathBuf {
+        self.self_update_dir().join("state.json")
+    }
+
     /// `projects/`: one directory per project id.
     pub fn projects_dir(&self) -> PathBuf {
         self.root.join("projects")
@@ -862,6 +885,16 @@ mod tests {
         assert_eq!(home.config_file(), Path::new("/h/config.toml"));
         assert_eq!(home.trust_file(), Path::new("/h/trust.json"));
         assert_eq!(home.hub_dir(), Path::new("/h/hub"));
+        assert_eq!(home.self_update_dir(), Path::new("/h/self-update"));
+        assert_eq!(home.self_update_lock(), Path::new("/h/self-update/lock"));
+        assert_eq!(
+            home.self_update_previous_dir(),
+            Path::new("/h/self-update/previous")
+        );
+        assert_eq!(
+            home.self_update_state(),
+            Path::new("/h/self-update/state.json")
+        );
         let p = home.project("abc");
         assert_eq!(p.root(), Path::new("/h/projects/abc"));
         assert_eq!(p.meta(), Path::new("/h/projects/abc/meta.json"));

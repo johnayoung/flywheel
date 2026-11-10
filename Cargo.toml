@@ -60,6 +60,11 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Hashing whole binaries (`fw self-update`, its tests) is CPU-bound and an
+# unoptimized sha256 takes seconds per 100 MB debug binary.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

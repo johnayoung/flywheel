@@ -22,6 +22,7 @@ pub mod hub_tasks;
 pub mod ledger_verbs;
 pub mod project;
 pub mod quit_prompt;
+pub mod self_update;
 pub mod session;
 pub mod session_screen;
 pub mod slash;

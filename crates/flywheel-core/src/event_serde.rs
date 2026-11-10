@@ -274,7 +274,7 @@ mod tests {
     use super::*;
     use crate::events::{
         AttemptFinalized, AttemptStarted, CommandApplied, GateGraderReceipt, GraderEvaluated,
-        HeldOutGateEvaluated, Landed, LandingParked, LandingRedriven, LandingRouted,
+        HeldOutGateEvaluated, Landed, LandedBatch, LandingParked, LandingRedriven, LandingRouted,
         LifecycleInitialized, REDRIVE_INITIATOR_OPERATOR, REDRIVE_RESULT_LANDED,
         REDRIVE_RESULT_REPARKED, REDRIVE_RESULT_ROUTED, RetryScheduled, TransitionedTo,
     };
@@ -530,6 +530,7 @@ mod tests {
             rung: "rebase".into(),
             agent_turns: Some(3),
             agent_wall_seconds: Some(1.25),
+            batch: None,
         }));
         assert_eq!(
             Value::Object(event_payload(&pr.payload).unwrap()),
@@ -540,6 +541,62 @@ mod tests {
                 "agent_turns": 3,
                 "agent_wall_seconds": 1.25
             })
+        );
+    }
+
+    #[test]
+    fn landed_batch_round_trips_on_the_landed_witness() {
+        let sha = "89abcdef0123456789abcdef0123456789abcdef";
+        let event = round_trip(DomainEventPayload::Landed(Landed {
+            strategy: "merge".into(),
+            landed_ref: sha.into(),
+            rung: "fast-forward".into(),
+            batch: Some(LandedBatch {
+                id: "batch-7f3a".into(),
+                index: 2,
+                size: 3,
+            }),
+            ..Landed::default()
+        }));
+        assert_eq!(
+            Value::Object(event_payload(&event.payload).unwrap()),
+            json!({
+                "strategy": "merge",
+                "landed_ref": sha,
+                "rung": "fast-forward",
+                "batch": {"id": "batch-7f3a", "index": 2, "size": 3}
+            })
+        );
+        match &event.payload {
+            DomainEventPayload::Landed(landed) => {
+                assert_eq!(
+                    landed.batch,
+                    Some(LandedBatch {
+                        id: "batch-7f3a".into(),
+                        index: 2,
+                        size: 3,
+                    })
+                );
+            }
+            other => panic!("expected Landed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn landed_batch_is_absent_on_a_pre_change_row() {
+        let row = json!({"strategy": "merge", "landed_ref": "abc123", "rung": "rebase"});
+        let landed: Landed = serde_json::from_value(row.clone()).unwrap();
+        assert_eq!(landed.batch, None);
+        assert_eq!(landed.rung, "rebase");
+        // Re-encoding a pre-change row omits the absent batch.
+        assert_eq!(serde_json::to_value(&landed).unwrap(), row);
+        assert_eq!(
+            LandedBatch::single("b-1"),
+            LandedBatch {
+                id: "b-1".into(),
+                index: 1,
+                size: 1,
+            }
         );
     }
 

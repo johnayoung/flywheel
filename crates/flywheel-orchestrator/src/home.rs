@@ -253,6 +253,10 @@ impl ProjectPaths {
     pub fn merge_lock(&self) -> PathBuf {
         self.root.join(".merge.lock")
     }
+    /// The machine-local landing queue beside the merge lock (spec 00089).
+    pub fn landing_queue(&self) -> PathBuf {
+        crate::landing_queue::queue_dir_beside(&self.merge_lock())
+    }
 }
 
 // --- meta.json -------------------------------------------------------------------

@@ -33,11 +33,12 @@ use crate::submitter::{
     GitError, GitOutput, GitWorktreeSubmitter, SubmitError, build_merge_submitter, git,
 };
 use flywheel_core::events::{
-    LANDING_STRATEGY_PR, Landed, LandingParked, PARK_KIND_PROTECTED_PATHS, PARK_KIND_PUSH_FAILED,
-    PARK_KIND_SUBMIT_ERROR, PARK_KIND_UNCOMMITTED_WORK,
+    LANDING_STRATEGY_PR, Landed, LandedBatch, LandingParked, PARK_KIND_PROTECTED_PATHS,
+    PARK_KIND_PUSH_FAILED, PARK_KIND_SUBMIT_ERROR, PARK_KIND_UNCOMMITTED_WORK,
 };
 use flywheel_core::lifecycle::Status;
 use flywheel_orchestrator::github::{GhRunner, ProcessGhRunner, run_gh};
+use flywheel_orchestrator::landing_queue::fresh_batch_id;
 use flywheel_orchestrator::sources::GraderReceipt;
 use flywheel_orchestrator::strategy::{
     LandabilityVerdict, PrepareError, SandboxHandle, SandboxRequest, SubmitOutcome, SubmitRequest,
@@ -394,6 +395,9 @@ impl GitPullRequestSubmitter {
             &Landed {
                 strategy: LANDING_STRATEGY_PR.to_owned(),
                 landed_ref: url.clone(),
+                // The PR strategy never queues: every land is a lone,
+                // size-1 batch with a fresh id (spec 00089).
+                batch: Some(LandedBatch::single(fresh_batch_id())),
                 ..Landed::default()
             },
         );
@@ -814,6 +818,10 @@ mod tests {
         assert_eq!(landed[0].strategy, LANDING_STRATEGY_PR);
         assert_eq!(landed[0].landed_ref, CREATED_URL);
         assert_eq!(landed[0].rung, "");
+        // A PR land is a lone, size-1 batch (spec 00089); PR never queues.
+        let batch = landed[0].batch.clone().expect("PR Landed carries a batch");
+        assert_eq!((batch.index, batch.size), (1, 1));
+        assert!(batch.id.starts_with("batch-"));
         assert!(parked(&store).is_empty());
         assert!(
             lines.lock().unwrap().iter().any(|l| l
@@ -973,6 +981,11 @@ mod tests {
         assert_eq!(rev(&remote, &format!("refs/heads/{BRANCH}^{{tree}}")), tree);
         assert!(parked(&store).is_empty(), "{:?}", parked(&store));
         assert_eq!(landed(&store).len(), 2);
+        let ids: Vec<String> = landed(&store)
+            .into_iter()
+            .map(|l| l.batch.expect("PR Landed carries a batch").id)
+            .collect();
+        assert_ne!(ids[0], ids[1], "each PR land gets a fresh batch id");
         assert!(!wt.exists());
     }
 

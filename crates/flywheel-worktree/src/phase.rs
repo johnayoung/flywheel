@@ -1244,6 +1244,7 @@ mod tests {
                 DomainEventPayload::Landed(Landed {
                     strategy: LANDING_STRATEGY_MERGE.into(),
                     landed_ref: "abc".into(),
+                    batch: Some(flywheel_core::events::LandedBatch::single("batch-abc")),
                     ..Landed::default()
                 }),
             );

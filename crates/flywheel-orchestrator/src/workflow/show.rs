@@ -238,8 +238,8 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use flywheel_core::events::{
-        DomainEventPayload, GateGraderReceipt, HeldOutGateEvaluated, Landed, LandingParked,
-        LandingRedriven,
+        DomainEventPayload, GateGraderReceipt, HeldOutGateEvaluated, Landed, LandedBatch,
+        LandingParked, LandingRedriven,
     };
     use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome};
     use flywheel_core::store::{AttemptStore, DomainEventStore, LifecycleStore};
@@ -317,6 +317,7 @@ mod tests {
             DomainEventPayload::Landed(Landed {
                 strategy: "merge".into(),
                 landed_ref: "abc123".into(),
+                batch: Some(LandedBatch::single("batch-5e0d")),
                 ..Landed::default()
             }),
         );
@@ -374,6 +375,10 @@ mod tests {
         assert_eq!(payload["decisions"][1]["park_kind"], "held-out-gate");
         assert_eq!(payload["decisions"][2]["result"], "landed");
         assert_eq!(payload["decisions"][3]["landed_ref"], "abc123");
+        assert_eq!(
+            payload["decisions"][3]["batch"],
+            serde_json::json!({"id": "batch-5e0d", "index": 1, "size": 1})
+        );
         // By task id resolves to the latest run.
         let (code, by_task) = show(&store, tmp.path(), "t-decide", true, false);
         assert_eq!(code, 0);
@@ -391,6 +396,7 @@ mod tests {
         let (code, text) = show(&store, tmp.path(), "run-1", false, false);
         assert_eq!(code, 0);
         assert!(text.contains("decisions:\n  gate      fail  held-out oracle failed\n      FAIL  oracle-x  stderr [REDACTED:github_token] tail\n  parked    held-out-gate  gate blocked the land\n  redriven  landed  (was held-out-gate)\n  landed    merge  abc123\n"));
+        assert!(text.contains("  landed    merge  abc123\n      batch  batch-5e0d  1/1\n"));
         assert!(!text.contains(SECRET));
         let (_, raw) = show(&store, tmp.path(), "run-1", false, true);
         assert!(raw.contains(SECRET));

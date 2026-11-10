@@ -302,6 +302,9 @@ fn finished_run_events(index: usize) -> Vec<DomainEvent> {
         DomainEventPayload::Landed(Landed {
             strategy: "merge".into(),
             landed_ref: format!("{index:040x}"),
+            batch: Some(flywheel_core::events::LandedBatch::single(format!(
+                "batch-{index:08x}"
+            ))),
             ..Default::default()
         })
     };

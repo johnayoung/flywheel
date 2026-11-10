@@ -24,6 +24,7 @@
 //! backend returns, and [`PlainDirectoryStrategy`], the no-landing default
 //! the orchestrator falls back to when no strategy is wired.
 
+use crate::landing_queue::LandingTicket;
 use crate::sources::{GraderReceipt, WorkItem};
 use flywheel_core::events::PARK_KIND_SUBMIT_ERROR;
 use flywheel_core::lifecycle::Status;
@@ -124,6 +125,11 @@ pub struct SubmitRequest {
     pub source_ref: String,
     #[serde(default)]
     pub receipts: Vec<GraderReceipt>,
+    /// Set only by the orchestrator's normal landing: the merge strategy
+    /// enters the machine-local landing queue under this ticket instead of
+    /// landing directly (spec 00089). Never persisted.
+    #[serde(skip)]
+    pub landing_ticket: Option<LandingTicket>,
 }
 
 impl SubmitRequest {
@@ -143,6 +149,7 @@ impl SubmitRequest {
             sandbox: sandbox.into(),
             source_ref: String::new(),
             receipts: Vec::new(),
+            landing_ticket: None,
         }
     }
 
@@ -155,6 +162,12 @@ impl SubmitRequest {
 
     pub fn with_receipts(mut self, receipts: Vec<GraderReceipt>) -> Self {
         self.receipts = receipts;
+        self
+    }
+
+    /// Route this landing through the landing queue under `ticket`.
+    pub fn queued_by(mut self, ticket: LandingTicket) -> Self {
+        self.landing_ticket = Some(ticket);
         self
     }
 }

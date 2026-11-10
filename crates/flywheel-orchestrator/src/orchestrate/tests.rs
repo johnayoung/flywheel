@@ -772,6 +772,7 @@ impl SubmitStrategy for ScriptedStrategy {
                         rung: String::new(),
                         agent_turns: None,
                         agent_wall_seconds: None,
+                        batch: Some(flywheel_core::events::LandedBatch::single("batch-fixture")),
                     }),
                 );
                 // A landed branch has no commits beyond the base any more:
@@ -4652,6 +4653,7 @@ async fn parked_landings_and_approval_gates_settle_as_parked() {
                     rung: String::new(),
                     agent_turns: None,
                     agent_wall_seconds: None,
+                    batch: Some(flywheel_core::events::LandedBatch::single("batch-fixture")),
                 }),
             ),
             landed.version,
@@ -4976,6 +4978,7 @@ fn unlanded_prereq_landed() -> DomainEventPayload {
         rung: String::new(),
         agent_turns: None,
         agent_wall_seconds: None,
+        batch: Some(flywheel_core::events::LandedBatch::single("batch-fixture")),
     })
 }
 

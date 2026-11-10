@@ -3,6 +3,7 @@
 
 use crate::claims::{ClaimStore, TaskClaim};
 use crate::held_out_gate::{GateOptions, GateOutcome, HeldOutGraderSource, gate_landing};
+use crate::landing_queue::LandingTicket;
 use crate::sources::{GraderReceipt, LogSink, WorkItem, WorkReport, WorkSource};
 use crate::strategy::{SandboxHandle, SubmitRequest, SubmitStrategy, submit_guarded};
 use flywheel_core::harness::ShutdownSignal;
@@ -400,7 +401,15 @@ pub(super) async fn drive_under_lease(
         return Err(DriveError::ClaimLost(task_id));
     }
     if decision.lands() {
-        submit_guarded(ctx.strategy.as_ref(), &submit_request);
+        // The normal landing enters the machine-local landing queue (spec
+        // 00089): the lease (heartbeat-renewed) and conflict keys stay held
+        // through the queue wait until the landing settles.
+        let queued = submit_request.clone().queued_by(LandingTicket::new(
+            ctx.worker_id.clone(),
+            Arc::clone(&ctx.claims),
+            ctx.now.clone(),
+        ));
+        submit_guarded(ctx.strategy.as_ref(), &queued);
     }
     let report = WorkReport {
         task_id: task_id.clone(),

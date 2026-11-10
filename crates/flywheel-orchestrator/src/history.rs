@@ -1018,10 +1018,17 @@ fn format_decision_lines(event: &DomainEvent) -> Vec<String> {
             vec![line]
         }
         DomainEventPayload::Landed(landed) => {
-            vec![format!(
+            let mut lines = vec![format!(
                 "  landed    {}  {}",
                 landed.strategy, landed.landed_ref
-            )]
+            )];
+            if let Some(batch) = &landed.batch {
+                lines.push(format!(
+                    "      batch  {}  {}/{}",
+                    batch.id, batch.index, batch.size
+                ));
+            }
+            lines
         }
         DomainEventPayload::LandingRedriven(redriven) => {
             let mut line = format!("  redriven  {}", redriven.result);
@@ -1147,8 +1154,8 @@ mod tests {
     use super::*;
     use chrono::{Duration, TimeZone};
     use flywheel_core::events::{
-        GateGraderReceipt, HeldOutGateEvaluated, Landed, LandingParked, LandingRedriven,
-        LandingRouted,
+        GateGraderReceipt, HeldOutGateEvaluated, Landed, LandedBatch, LandingParked,
+        LandingRedriven, LandingRouted,
     };
     use flywheel_core::lifecycle::Outcome;
     use flywheel_core::store::{AttemptStore, DomainEventStore};
@@ -1643,6 +1650,7 @@ mod tests {
             DomainEventPayload::Landed(Landed {
                 strategy: "merge".to_owned(),
                 landed_ref: "abc123".to_owned(),
+                batch: Some(LandedBatch::single("batch-7c1e")),
                 ..Landed::default()
             }),
             // Routing is not a landing decision; the surface must drop it.
@@ -1850,6 +1858,7 @@ decisions:
       FAIL  (unnamed)  \n  parked    divergent-base  rebase conflict in src/x.rs
   redriven  landed  (was divergent-base)
   landed    merge  abc123
+      batch  batch-7c1e  1/1
 agent output:
 All done.
 Second line.
@@ -2078,7 +2087,12 @@ attempts :
       "attempt_number": null,
       "sequence": 4,
       "strategy": "merge",
-      "landed_ref": "abc123"
+      "landed_ref": "abc123",
+      "batch": {
+        "id": "batch-7c1e",
+        "index": 1,
+        "size": 1
+      }
     }
   ]
 }"#;

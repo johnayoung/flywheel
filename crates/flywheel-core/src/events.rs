@@ -349,6 +349,10 @@ pub struct LandingParked {
 /// `agent_turns` / `agent_wall_seconds` record the resolution session's usage
 /// on an `agent-resolved` land. Both default to `None` and are omitted from
 /// the wire payload when absent.
+///
+/// `batch` is the landing batch the work landed through (spec 00089): a
+/// lone landing is `{fresh id, 1, 1}`. It defaults to `None` and is omitted
+/// when absent, so a record written before the field existed stays valid.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Landed {
     pub strategy: String,
@@ -359,6 +363,31 @@ pub struct Landed {
     pub agent_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_wall_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<LandedBatch>,
+}
+
+/// The landing batch a [`Landed`] witness landed through (spec 00089).
+///
+/// `id` is shared by exactly the tasks that landed through one passing
+/// standing verify; `index` is the 1-based stack position and `size` the
+/// number of tasks in the batch. A lone landing has a fresh id and size 1.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LandedBatch {
+    pub id: String,
+    pub index: u32,
+    pub size: u32,
+}
+
+impl LandedBatch {
+    /// A size-1 batch: the identity of a lone landing.
+    pub fn single(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            index: 1,
+            size: 1,
+        }
+    }
 }
 
 /// Records the disposition of one bounded landing re-drive of a parked run.
@@ -1130,6 +1159,7 @@ mod tests {
             DomainEventPayload::Landed(Landed {
                 strategy: LANDING_STRATEGY_MERGE.into(),
                 landed_ref: "a".repeat(40),
+                batch: Some(LandedBatch::single("batch-1")),
                 ..Landed::default()
             }),
             DomainEventPayload::HeldOutGateEvaluated(HeldOutGateEvaluated {
@@ -1178,6 +1208,7 @@ mod tests {
             DomainEventPayload::Landed(Landed {
                 strategy: LANDING_STRATEGY_PR.into(),
                 landed_ref: "https://example.test/pr/7".into(),
+                batch: Some(LandedBatch::single("batch-1")),
                 ..Landed::default()
             }),
             DomainEventPayload::HeldOutGateEvaluated(HeldOutGateEvaluated {

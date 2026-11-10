@@ -24,7 +24,7 @@ use crate::trailers::{TrailerError, provenance_trailers, stamp_commit_messages};
 use chrono::Utc;
 use flywheel_core::events::{
     DomainEvent, DomainEventPayload, GATE_EXCERPT_MAX_BYTES, GateGraderReceipt,
-    LANDING_STRATEGY_MERGE, Landed, LandingParked, PARK_KIND_DIVERGENT_BASE,
+    LANDING_STRATEGY_MERGE, Landed, LandedBatch, LandingParked, PARK_KIND_DIVERGENT_BASE,
     PARK_KIND_HELD_OUT_GATE, PARK_KIND_MERGE_CONFLICT, PARK_KIND_PROTECTED_PATHS,
     PARK_KIND_STANDING_VERIFY, PARK_KIND_SUBMIT_ERROR, PARK_KIND_UNCOMMITTED_WORK,
     RUNG_AGENT_RESOLVED, RUNG_FAST_FORWARD, RUNG_MERGE_FALLBACK, RUNG_REBASE,
@@ -38,10 +38,13 @@ use flywheel_core::task::Grader;
 use flywheel_orchestrator::held_out_gate::{
     GateOptions, HeldOutGraderSource, evaluate_held_out_gate,
 };
+use flywheel_orchestrator::landing_queue::{
+    LandingQueue, LandingQueueError, LandingTicket, QueueEntry, fresh_batch_id,
+};
 use flywheel_orchestrator::sources::{LogSink, ROOT_PHASE, phase_of_task_file};
 use flywheel_orchestrator::strategy::{
     CandidateTree, LandabilityVerdict, LandingCandidate, PrepareError, SandboxHandle,
-    SandboxRequest, SubmitOutcome, SubmitRequest, SubmitStrategy,
+    SandboxRequest, SubmitOutcome, SubmitRequest, SubmitStrategy, panic_message,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -119,6 +122,8 @@ pub enum SubmitError {
     Lock(std::io::Error),
     #[error("cannot start the grader runtime: {0}")]
     Runtime(std::io::Error),
+    #[error("landing queue: {0}")]
+    Queue(#[from] LandingQueueError),
 }
 
 impl SubmitError {
@@ -129,6 +134,7 @@ impl SubmitError {
             SubmitError::Trailers(_) => "TrailerError",
             SubmitError::Lock(_) => "MergeLockError",
             SubmitError::Runtime(_) => "RuntimeError",
+            SubmitError::Queue(_) => "LandingQueueError",
         }
     }
 }
@@ -729,6 +735,8 @@ struct Landing<'a> {
     branch: String,
     base: String,
     commit_count: u64,
+    /// The batch recorded on this landing's `Landed` witness.
+    batch: LandedBatch,
 }
 
 // --- the submitter ---------------------------------------------------------------------------
@@ -1259,19 +1267,148 @@ impl GitWorktreeSubmitter {
 
     /// The landing ladder proper. Every leaf returns an outcome; an `Err` is
     /// the failure that [`SubmitStrategy::submit`] contains.
+    ///
+    /// A DONE request carrying a [`LandingTicket`] (the orchestrator's normal
+    /// landing) enters the machine-local landing queue; every other request
+    /// (`fw reland`, the landing re-driver) lands directly under the merge
+    /// lock. Either way each landing is a size-1 batch with a fresh id.
     pub fn submit_inner(&self, req: &SubmitRequest) -> Result<SubmitOutcome, SubmitError> {
-        let phase = self.phase_of(req.task_file.as_deref());
-        let worktree = self.worktree(&req.task_id);
-        let branch = self.branch(&req.task_id, &phase);
-
         if req.status != Status::Done {
+            let phase = self.phase_of(req.task_file.as_deref());
+            let worktree = self.worktree(&req.task_id);
+            let branch = self.branch(&req.task_id, &phase);
             // failed / interrupted / any non-done terminal: park for forensics
             // (default), or destroy when [sandbox.retention] on_failure asks.
             return Ok(self.teardown_on_failure(&worktree, &branch, req.status)?);
         }
-
+        if let Some(ticket) = req.landing_ticket.as_ref() {
+            return self.submit_queued(req, ticket);
+        }
         // All base-branch mutations are serialized across worker processes.
         let _lock = merge_lock(&self.lock_path).map_err(SubmitError::Lock)?;
+        self.land_locked(req, LandedBatch::single(fresh_batch_id()))
+    }
+
+    /// The queued landing (spec 00089): enqueue `req`, take the merge lock,
+    /// and -- unless the previous lock holder already settled this entry --
+    /// drain every queued entry in `queued_at` order, then return the
+    /// outcome recorded for this entry (D-6), whichever worker landed it.
+    ///
+    /// The owner's lease and conflict keys are untouched here: they stay
+    /// held by the caller until the settlement is returned (D-9).
+    fn submit_queued(
+        &self,
+        req: &SubmitRequest,
+        ticket: &LandingTicket,
+    ) -> Result<SubmitOutcome, SubmitError> {
+        let queue = LandingQueue::beside_lock(&self.lock_path);
+        let entry = queue.enqueue(req, &ticket.owner, (ticket.now)())?;
+        self.log(format!(
+            "{} queued for landing (run {}, owner {})",
+            req.task_id, req.run_id, ticket.owner
+        ));
+        let _lock = merge_lock(&self.lock_path).map_err(SubmitError::Lock)?;
+        if let Some(settlement) = queue.take_settlement(&req.run_id)? {
+            queue.drop_entry(&entry)?;
+            return Ok(settlement.outcome);
+        }
+        self.drain_queue(&queue, ticket)?;
+        if let Some(settlement) = queue.take_settlement(&req.run_id)? {
+            return Ok(settlement.outcome);
+        }
+        if queue.contains(&entry)? {
+            // The drain could not read this entry's liveness (a claim-store
+            // error); the owner itself holds its heartbeat-renewed lease, so
+            // it lands its own entry exactly as an unqueued landing would.
+            let batch = LandedBatch::single(fresh_batch_id());
+            let marked = queue.mark_verifying(&entry, batch.clone())?;
+            let outcome = self.land_locked(req, batch);
+            queue.drop_entry(&marked)?;
+            return outcome;
+        }
+        let reason = format!(
+            "{} left the landing queue unlanded: its lease is no longer held by {} \
+             (run {} stays DONE for the existing recovery paths)",
+            req.task_id, ticket.owner, req.run_id
+        );
+        self.log(&reason);
+        Ok(SubmitOutcome::no_op(reason))
+    }
+
+    /// Under the merge lock: land every live queued entry one at a time in
+    /// `queued_at` order, including entries other workers queued, recording
+    /// each settlement for its owner. An entry whose owner no longer holds a
+    /// live lease is dropped, never landed (D-7).
+    fn drain_queue(&self, queue: &LandingQueue, ticket: &LandingTicket) -> Result<(), SubmitError> {
+        if let Err(err) = queue.prune_settlements(ticket.claims.as_ref(), (ticket.now)()) {
+            self.log(format!(
+                "landing queue: settlement prune failed ({err}); continuing"
+            ));
+        }
+        for entry in queue.entries()? {
+            match ticket.entry_is_live(&entry) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.log(format!(
+                        "landing queue: dropping {} (run {}): owner {} no longer holds a live lease",
+                        entry.task_id, entry.run_id, entry.owner
+                    ));
+                    queue.drop_entry(&entry)?;
+                    continue;
+                }
+                Err(err) => {
+                    self.log(format!(
+                        "landing queue: cannot read the claim of {} ({err}); leaving it queued",
+                        entry.task_id
+                    ));
+                    continue;
+                }
+            }
+            let outcome = self.land_entry(queue, &entry)?;
+            let verdict = match &outcome {
+                SubmitOutcome::Landed { .. } => "landed",
+                SubmitOutcome::Parked { .. } => "parked",
+                SubmitOutcome::NoOp { .. } => "no-op",
+            };
+            self.log(format!(
+                "landing queue: settled {} (run {}, owner {}): {verdict}",
+                entry.task_id, entry.run_id, entry.owner
+            ));
+        }
+        Ok(())
+    }
+
+    /// Land one live entry as a size-1 batch and record its settlement. A
+    /// ladder failure or panic is contained into the entry's own
+    /// `submit-error` park, never the lock holder's.
+    fn land_entry(
+        &self,
+        queue: &LandingQueue,
+        entry: &QueueEntry,
+    ) -> Result<SubmitOutcome, SubmitError> {
+        let batch = LandedBatch::single(fresh_batch_id());
+        let marked = queue.mark_verifying(entry, batch.clone())?;
+        let request = &marked.request;
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.land_locked(request, batch)
+        })) {
+            Ok(result) => self.contain(request, result),
+            Err(payload) => self.contain_panic(request, &panic_message(payload.as_ref())),
+        };
+        queue.settle(&marked, &outcome)?;
+        Ok(outcome)
+    }
+
+    /// The ladder for one DONE request, under the caller's merge lock,
+    /// recording `batch` on its `Landed` witness.
+    fn land_locked(
+        &self,
+        req: &SubmitRequest,
+        batch: LandedBatch,
+    ) -> Result<SubmitOutcome, SubmitError> {
+        let phase = self.phase_of(req.task_file.as_deref());
+        let worktree = self.worktree(&req.task_id);
+        let branch = self.branch(&req.task_id, &phase);
         // The ref this task lands onto, resolved per request under the lock.
         let base = self.landing_base_for(&phase)?;
         let porcelain = git(&worktree, &["status", "--porcelain"])?;
@@ -1313,6 +1450,7 @@ impl GitWorktreeSubmitter {
             branch,
             base,
             commit_count,
+            batch,
         };
 
         let violations = self.protected_violations(&landing.branch, &landing.base)?;
@@ -1685,6 +1823,7 @@ impl GitWorktreeSubmitter {
             branch,
             base,
             commit_count,
+            ..
         } = landing;
         let label = rung.label();
         let prefix = rung.detail_prefix();
@@ -1819,10 +1958,57 @@ impl GitWorktreeSubmitter {
                 rung: rung.to_owned(),
                 agent_turns: usage.map(|u| u.turns),
                 agent_wall_seconds: usage.map(|u| u.wall_seconds),
+                batch: Some(landing.batch.clone()),
             },
         );
         self.teardown_on_done(&landing.worktree, &landing.branch)?;
         Ok(SubmitOutcome::landed(LANDING_STRATEGY_MERGE, landed_ref))
+    }
+
+    /// Contain a ladder failure into `request`'s own `submit-error` park.
+    fn contain(
+        &self,
+        request: &SubmitRequest,
+        result: Result<SubmitOutcome, SubmitError>,
+    ) -> SubmitOutcome {
+        match result {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                let worktree = self.worktree(&request.task_id);
+                self.log(format!(
+                    "submit error for {} ({}: {err}); worktree left parked at {}",
+                    request.task_id,
+                    err.kind(),
+                    worktree.display()
+                ));
+                self.park(
+                    &request.run_id,
+                    PARK_KIND_SUBMIT_ERROR,
+                    format!(
+                        "submit raised {}: {err}; worktree left parked at {}",
+                        err.kind(),
+                        worktree.display()
+                    ),
+                    Vec::new(),
+                    None,
+                )
+            }
+        }
+    }
+
+    /// Contain a panic while landing a queued entry into that entry's own
+    /// `submit-error` park (the shape [`flywheel_orchestrator::strategy::submit_guarded`]
+    /// gives a panicking direct landing).
+    fn contain_panic(&self, request: &SubmitRequest, message: &str) -> SubmitOutcome {
+        let detail = format!("submit strategy panicked: {message}");
+        self.log(format!("submit panic for {}: {message}", request.task_id));
+        self.park(
+            &request.run_id,
+            PARK_KIND_SUBMIT_ERROR,
+            detail,
+            Vec::new(),
+            None,
+        )
     }
 
     /// Record the park witness and return the park outcome; the worktree and
@@ -2308,29 +2494,8 @@ impl SubmitStrategy for GitWorktreeSubmitter {
     /// any git failure is logged, witnessed as a `submit-error` park, and
     /// the worktree left parked for inspection.
     fn submit(&self, request: &SubmitRequest) -> SubmitOutcome {
-        match self.submit_inner(request) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                let worktree = self.worktree(&request.task_id);
-                self.log(format!(
-                    "submit error for {} ({}: {err}); worktree left parked at {}",
-                    request.task_id,
-                    err.kind(),
-                    worktree.display()
-                ));
-                self.park(
-                    &request.run_id,
-                    PARK_KIND_SUBMIT_ERROR,
-                    format!(
-                        "submit raised {}: {err}; worktree left parked at {}",
-                        err.kind(),
-                        worktree.display()
-                    ),
-                    Vec::new(),
-                    None,
-                )
-            }
-        }
+        let result = self.submit_inner(request);
+        self.contain(request, result)
     }
 
     fn is_landable(&self, request: &SubmitRequest) -> LandabilityVerdict {
@@ -3138,6 +3303,11 @@ mod tests {
         assert_eq!(lands[0].rung, RUNG_FAST_FORWARD);
         assert_eq!(lands[0].landed_ref, after);
         assert_eq!(lands[0].agent_turns, None);
+        let batch = lands[0]
+            .batch
+            .clone()
+            .expect("every Landed carries a batch");
+        assert_eq!((batch.index, batch.size), (1, 1));
         assert!(parked(&store).is_empty());
     }
 
@@ -3973,4 +4143,5 @@ mod tests {
     }
 
     mod landing_invariants;
+    mod landing_queue;
 }

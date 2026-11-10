@@ -470,7 +470,7 @@ fn section_envelope_contract() -> String {
          {OPENING_FENCE}\n\
          {{\"intent\": {intent_list}, \"reason\": \"...\"}}\n\
          {CLOSING_FENCE}\n\n\
-         `intent` is a closed enum — only these four values are accepted:\n\n\
+         `intent` is a closed enum — only these five values are accepted:\n\n\
          {intent_bullets}\n\n\
          ## `blocked` requires a `requires` array\n\n\
          An `intent=blocked` envelope MUST additionally carry a non-empty \
@@ -489,9 +489,10 @@ fn section_envelope_contract() -> String {
          \"requires\": [{{\"type\": \"env_var_set\", \"name\": \"DATABASE_URL\"}}]}}\n\
          {CLOSING_FENCE}\n\n\
          If you cannot proceed and there is NOTHING for the harness to \
-         re-check — the task's premise is false or already satisfied, the work \
-         is already on the base, or no correct change is possible — emit \
-         `abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` \
+         re-check — the task's premise is false or no correct change is \
+         possible — emit `abort` with your diagnosis in `reason`, NOT \
+         `blocked`. If the goal already holds on the base (the work is already \
+         there), emit `already_satisfied`, NOT `verify` or `abort`. A `blocked` \
          envelope with no `requires` array is a protocol failure that discards \
          your reasoning.\n\n\
          Missing, malformed, duplicated, or truncated envelopes are protocol \
@@ -516,10 +517,16 @@ const fn intent_description(intent: Intent) -> &'static str {
         Intent::Continue => "more iterations needed; carry context forward.",
         Intent::Abort => {
             "you cannot complete the task and there is nothing for the harness to \
-             re-check — e.g. the task's premise is false or already satisfied, the \
-             work is already on the base, or no correct change is possible without \
-             fabricating one. The harness records your `reason` and stops (no \
-             retry). Put your full diagnosis in `reason`."
+             re-check — e.g. the task's premise is false or no correct change is \
+             possible without fabricating one. The harness records your `reason` \
+             and stops (no retry). Put your full diagnosis in `reason`."
+        }
+        Intent::AlreadySatisfied => {
+            "the goal already holds on the base before any change of yours (the \
+             work is already there), so there is nothing to do. Put the evidence \
+             in `reason`. This is recorded as your claim, to be verified, not \
+             trusted: it never marks the task done or verified, and the harness \
+             stops the run (no retry)."
         }
     }
 }
@@ -560,15 +567,16 @@ No prior attempts on this task — this is the first iteration.
 Every iteration MUST end with exactly one envelope, fenced like so:
 
 <!-- LOOP_STATUS -->
-{"intent": "verify" | "blocked" | "continue" | "abort", "reason": "..."}
+{"intent": "verify" | "blocked" | "continue" | "abort" | "already_satisfied", "reason": "..."}
 <!-- /LOOP_STATUS -->
 
-`intent` is a closed enum — only these four values are accepted:
+`intent` is a closed enum — only these five values are accepted:
 
 - `verify`: work claims to be complete; the harness runs the graders above. Emit only when you believe every grader will pass.
 - `blocked`: you cannot proceed until a concrete, RE-CHECKABLE external prerequisite is met (a named command grader passing, a file appearing, an env var being set). This intent REQUIRES a non-empty `requires` array (see below) and pauses the lifecycle until the harness re-checks those predicates. Do NOT use `blocked` for a task you simply cannot complete — use `abort`.
 - `continue`: more iterations needed; carry context forward.
-- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `already_satisfied`: the goal already holds on the base before any change of yours (the work is already there), so there is nothing to do. Put the evidence in `reason`. This is recorded as your claim, to be verified, not trusted: it never marks the task done or verified, and the harness stops the run (no retry).
 
 ## `blocked` requires a `requires` array
 
@@ -584,7 +592,7 @@ Example:
 {"intent": "blocked", "reason": "needs the integration database up", "requires": [{"type": "env_var_set", "name": "DATABASE_URL"}]}
 <!-- /LOOP_STATUS -->
 
-If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
+If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. If the goal already holds on the base (the work is already there), emit `already_satisfied`, NOT `verify` or `abort`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
 
 Missing, malformed, duplicated, or truncated envelopes are protocol failures and may end the run.
 "##;
@@ -645,15 +653,16 @@ No prior attempts on this task — this is the first iteration.
 Every iteration MUST end with exactly one envelope, fenced like so:
 
 <!-- LOOP_STATUS -->
-{"intent": "verify" | "blocked" | "continue" | "abort", "reason": "..."}
+{"intent": "verify" | "blocked" | "continue" | "abort" | "already_satisfied", "reason": "..."}
 <!-- /LOOP_STATUS -->
 
-`intent` is a closed enum — only these four values are accepted:
+`intent` is a closed enum — only these five values are accepted:
 
 - `verify`: work claims to be complete; the harness runs the graders above. Emit only when you believe every grader will pass.
 - `blocked`: you cannot proceed until a concrete, RE-CHECKABLE external prerequisite is met (a named command grader passing, a file appearing, an env var being set). This intent REQUIRES a non-empty `requires` array (see below) and pauses the lifecycle until the harness re-checks those predicates. Do NOT use `blocked` for a task you simply cannot complete — use `abort`.
 - `continue`: more iterations needed; carry context forward.
-- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `already_satisfied`: the goal already holds on the base before any change of yours (the work is already there), so there is nothing to do. Put the evidence in `reason`. This is recorded as your claim, to be verified, not trusted: it never marks the task done or verified, and the harness stops the run (no retry).
 
 ## `blocked` requires a `requires` array
 
@@ -669,7 +678,7 @@ Example:
 {"intent": "blocked", "reason": "needs the integration database up", "requires": [{"type": "env_var_set", "name": "DATABASE_URL"}]}
 <!-- /LOOP_STATUS -->
 
-If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
+If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. If the goal already holds on the base (the work is already there), emit `already_satisfied`, NOT `verify` or `abort`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
 
 Missing, malformed, duplicated, or truncated envelopes are protocol failures and may end the run.
 "##;
@@ -702,15 +711,16 @@ No prior attempts on this task — this is the first iteration.
 Every iteration MUST end with exactly one envelope, fenced like so:
 
 <!-- LOOP_STATUS -->
-{"intent": "verify" | "blocked" | "continue" | "abort", "reason": "..."}
+{"intent": "verify" | "blocked" | "continue" | "abort" | "already_satisfied", "reason": "..."}
 <!-- /LOOP_STATUS -->
 
-`intent` is a closed enum — only these four values are accepted:
+`intent` is a closed enum — only these five values are accepted:
 
 - `verify`: work claims to be complete; the harness runs the graders above. Emit only when you believe every grader will pass.
 - `blocked`: you cannot proceed until a concrete, RE-CHECKABLE external prerequisite is met (a named command grader passing, a file appearing, an env var being set). This intent REQUIRES a non-empty `requires` array (see below) and pauses the lifecycle until the harness re-checks those predicates. Do NOT use `blocked` for a task you simply cannot complete — use `abort`.
 - `continue`: more iterations needed; carry context forward.
-- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `already_satisfied`: the goal already holds on the base before any change of yours (the work is already there), so there is nothing to do. Put the evidence in `reason`. This is recorded as your claim, to be verified, not trusted: it never marks the task done or verified, and the harness stops the run (no retry).
 
 ## `blocked` requires a `requires` array
 
@@ -726,7 +736,7 @@ Example:
 {"intent": "blocked", "reason": "needs the integration database up", "requires": [{"type": "env_var_set", "name": "DATABASE_URL"}]}
 <!-- /LOOP_STATUS -->
 
-If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
+If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. If the goal already holds on the base (the work is already there), emit `already_satisfied`, NOT `verify` or `abort`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
 
 Missing, malformed, duplicated, or truncated envelopes are protocol failures and may end the run.
 "##;
@@ -761,15 +771,16 @@ Do not blindly repeat approaches that already failed above.
 Every iteration MUST end with exactly one envelope, fenced like so:
 
 <!-- LOOP_STATUS -->
-{"intent": "verify" | "blocked" | "continue" | "abort", "reason": "..."}
+{"intent": "verify" | "blocked" | "continue" | "abort" | "already_satisfied", "reason": "..."}
 <!-- /LOOP_STATUS -->
 
-`intent` is a closed enum — only these four values are accepted:
+`intent` is a closed enum — only these five values are accepted:
 
 - `verify`: work claims to be complete; the harness runs the graders above. Emit only when you believe every grader will pass.
 - `blocked`: you cannot proceed until a concrete, RE-CHECKABLE external prerequisite is met (a named command grader passing, a file appearing, an env var being set). This intent REQUIRES a non-empty `requires` array (see below) and pauses the lifecycle until the harness re-checks those predicates. Do NOT use `blocked` for a task you simply cannot complete — use `abort`.
 - `continue`: more iterations needed; carry context forward.
-- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `already_satisfied`: the goal already holds on the base before any change of yours (the work is already there), so there is nothing to do. Put the evidence in `reason`. This is recorded as your claim, to be verified, not trusted: it never marks the task done or verified, and the harness stops the run (no retry).
 
 ## `blocked` requires a `requires` array
 
@@ -785,7 +796,7 @@ Example:
 {"intent": "blocked", "reason": "needs the integration database up", "requires": [{"type": "env_var_set", "name": "DATABASE_URL"}]}
 <!-- /LOOP_STATUS -->
 
-If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
+If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. If the goal already holds on the base (the work is already there), emit `already_satisfied`, NOT `verify` or `abort`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
 
 Missing, malformed, duplicated, or truncated envelopes are protocol failures and may end the run.
 "##;
@@ -819,15 +830,16 @@ Do not blindly repeat approaches that already failed above.
 Every iteration MUST end with exactly one envelope, fenced like so:
 
 <!-- LOOP_STATUS -->
-{"intent": "verify" | "blocked" | "continue" | "abort", "reason": "..."}
+{"intent": "verify" | "blocked" | "continue" | "abort" | "already_satisfied", "reason": "..."}
 <!-- /LOOP_STATUS -->
 
-`intent` is a closed enum — only these four values are accepted:
+`intent` is a closed enum — only these five values are accepted:
 
 - `verify`: work claims to be complete; the harness runs the graders above. Emit only when you believe every grader will pass.
 - `blocked`: you cannot proceed until a concrete, RE-CHECKABLE external prerequisite is met (a named command grader passing, a file appearing, an env var being set). This intent REQUIRES a non-empty `requires` array (see below) and pauses the lifecycle until the harness re-checks those predicates. Do NOT use `blocked` for a task you simply cannot complete — use `abort`.
 - `continue`: more iterations needed; carry context forward.
-- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `already_satisfied`: the goal already holds on the base before any change of yours (the work is already there), so there is nothing to do. Put the evidence in `reason`. This is recorded as your claim, to be verified, not trusted: it never marks the task done or verified, and the harness stops the run (no retry).
 
 ## `blocked` requires a `requires` array
 
@@ -843,7 +855,7 @@ Example:
 {"intent": "blocked", "reason": "needs the integration database up", "requires": [{"type": "env_var_set", "name": "DATABASE_URL"}]}
 <!-- /LOOP_STATUS -->
 
-If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
+If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. If the goal already holds on the base (the work is already there), emit `already_satisfied`, NOT `verify` or `abort`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
 
 Missing, malformed, duplicated, or truncated envelopes are protocol failures and may end the run.
 "##;
@@ -918,15 +930,16 @@ No prior attempts on this task — this is the first iteration.
 Every iteration MUST end with exactly one envelope, fenced like so:
 
 <!-- LOOP_STATUS -->
-{"intent": "verify" | "blocked" | "continue" | "abort", "reason": "..."}
+{"intent": "verify" | "blocked" | "continue" | "abort" | "already_satisfied", "reason": "..."}
 <!-- /LOOP_STATUS -->
 
-`intent` is a closed enum — only these four values are accepted:
+`intent` is a closed enum — only these five values are accepted:
 
 - `verify`: work claims to be complete; the harness runs the graders above. Emit only when you believe every grader will pass.
 - `blocked`: you cannot proceed until a concrete, RE-CHECKABLE external prerequisite is met (a named command grader passing, a file appearing, an env var being set). This intent REQUIRES a non-empty `requires` array (see below) and pauses the lifecycle until the harness re-checks those predicates. Do NOT use `blocked` for a task you simply cannot complete — use `abort`.
 - `continue`: more iterations needed; carry context forward.
-- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `already_satisfied`: the goal already holds on the base before any change of yours (the work is already there), so there is nothing to do. Put the evidence in `reason`. This is recorded as your claim, to be verified, not trusted: it never marks the task done or verified, and the harness stops the run (no retry).
 
 ## `blocked` requires a `requires` array
 
@@ -942,7 +955,7 @@ Example:
 {"intent": "blocked", "reason": "needs the integration database up", "requires": [{"type": "env_var_set", "name": "DATABASE_URL"}]}
 <!-- /LOOP_STATUS -->
 
-If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
+If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. If the goal already holds on the base (the work is already there), emit `already_satisfied`, NOT `verify` or `abort`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
 
 Missing, malformed, duplicated, or truncated envelopes are protocol failures and may end the run.
 "##;
@@ -995,15 +1008,16 @@ Do not blindly repeat approaches that already failed above.
 Every iteration MUST end with exactly one envelope, fenced like so:
 
 <!-- LOOP_STATUS -->
-{"intent": "verify" | "blocked" | "continue" | "abort", "reason": "..."}
+{"intent": "verify" | "blocked" | "continue" | "abort" | "already_satisfied", "reason": "..."}
 <!-- /LOOP_STATUS -->
 
-`intent` is a closed enum — only these four values are accepted:
+`intent` is a closed enum — only these five values are accepted:
 
 - `verify`: work claims to be complete; the harness runs the graders above. Emit only when you believe every grader will pass.
 - `blocked`: you cannot proceed until a concrete, RE-CHECKABLE external prerequisite is met (a named command grader passing, a file appearing, an env var being set). This intent REQUIRES a non-empty `requires` array (see below) and pauses the lifecycle until the harness re-checks those predicates. Do NOT use `blocked` for a task you simply cannot complete — use `abort`.
 - `continue`: more iterations needed; carry context forward.
-- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `already_satisfied`: the goal already holds on the base before any change of yours (the work is already there), so there is nothing to do. Put the evidence in `reason`. This is recorded as your claim, to be verified, not trusted: it never marks the task done or verified, and the harness stops the run (no retry).
 
 ## `blocked` requires a `requires` array
 
@@ -1019,7 +1033,7 @@ Example:
 {"intent": "blocked", "reason": "needs the integration database up", "requires": [{"type": "env_var_set", "name": "DATABASE_URL"}]}
 <!-- /LOOP_STATUS -->
 
-If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
+If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. If the goal already holds on the base (the work is already there), emit `already_satisfied`, NOT `verify` or `abort`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
 
 Missing, malformed, duplicated, or truncated envelopes are protocol failures and may end the run.
 "##;
@@ -1052,15 +1066,16 @@ Do not blindly repeat approaches that already failed above.
 Every iteration MUST end with exactly one envelope, fenced like so:
 
 <!-- LOOP_STATUS -->
-{"intent": "verify" | "blocked" | "continue" | "abort", "reason": "..."}
+{"intent": "verify" | "blocked" | "continue" | "abort" | "already_satisfied", "reason": "..."}
 <!-- /LOOP_STATUS -->
 
-`intent` is a closed enum — only these four values are accepted:
+`intent` is a closed enum — only these five values are accepted:
 
 - `verify`: work claims to be complete; the harness runs the graders above. Emit only when you believe every grader will pass.
 - `blocked`: you cannot proceed until a concrete, RE-CHECKABLE external prerequisite is met (a named command grader passing, a file appearing, an env var being set). This intent REQUIRES a non-empty `requires` array (see below) and pauses the lifecycle until the harness re-checks those predicates. Do NOT use `blocked` for a task you simply cannot complete — use `abort`.
 - `continue`: more iterations needed; carry context forward.
-- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `abort`: you cannot complete the task and there is nothing for the harness to re-check — e.g. the task's premise is false or no correct change is possible without fabricating one. The harness records your `reason` and stops (no retry). Put your full diagnosis in `reason`.
+- `already_satisfied`: the goal already holds on the base before any change of yours (the work is already there), so there is nothing to do. Put the evidence in `reason`. This is recorded as your claim, to be verified, not trusted: it never marks the task done or verified, and the harness stops the run (no retry).
 
 ## `blocked` requires a `requires` array
 
@@ -1076,7 +1091,7 @@ Example:
 {"intent": "blocked", "reason": "needs the integration database up", "requires": [{"type": "env_var_set", "name": "DATABASE_URL"}]}
 <!-- /LOOP_STATUS -->
 
-If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or already satisfied, the work is already on the base, or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
+If you cannot proceed and there is NOTHING for the harness to re-check — the task's premise is false or no correct change is possible — emit `abort` with your diagnosis in `reason`, NOT `blocked`. If the goal already holds on the base (the work is already there), emit `already_satisfied`, NOT `verify` or `abort`. A `blocked` envelope with no `requires` array is a protocol failure that discards your reasoning.
 
 Missing, malformed, duplicated, or truncated envelopes are protocol failures and may end the run.
 "##;
@@ -1377,6 +1392,18 @@ Missing, malformed, duplicated, or truncated envelopes are protocol failures and
         let lowered = prompt.to_lowercase();
         assert!(lowered.contains("closed enum"));
         assert!(lowered.contains("required"));
+    }
+
+    #[test]
+    fn stop_reason_already_satisfied_intent_is_described_as_an_unverified_claim() {
+        let task = minimal_task();
+        let prompt =
+            build_iteration_prompt(&task, &lifecycle(&task, "run-1"), &IterationInputs::new(1));
+        assert!(prompt.contains("\"already_satisfied\""));
+        assert!(prompt.contains("- `already_satisfied`: the goal already holds on the base"));
+        assert!(prompt.contains("recorded as your claim, to be verified, not trusted"));
+        assert!(prompt.contains("never marks the task done or verified"));
+        assert!(prompt.contains("emit `already_satisfied`, NOT `verify` or `abort`"));
     }
 
     #[test]

@@ -22,14 +22,18 @@ pub enum Intent {
     Blocked,
     Continue,
     Abort,
+    /// The goal already holds on the base before any change. Recorded as an
+    /// agent claim, never as success: it does not verify the task.
+    AlreadySatisfied,
 }
 
 impl Intent {
-    pub const ALL: [Intent; 4] = [
+    pub const ALL: [Intent; 5] = [
         Intent::Verify,
         Intent::Blocked,
         Intent::Continue,
         Intent::Abort,
+        Intent::AlreadySatisfied,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -38,6 +42,7 @@ impl Intent {
             Intent::Blocked => "blocked",
             Intent::Continue => "continue",
             Intent::Abort => "abort",
+            Intent::AlreadySatisfied => "already_satisfied",
         }
     }
 
@@ -53,7 +58,13 @@ impl fmt::Display for Intent {
 }
 
 /// Valid intent strings, sorted (for error messages).
-pub const VALID_INTENTS: [&str; 4] = ["abort", "blocked", "continue", "verify"];
+pub const VALID_INTENTS: [&str; 5] = [
+    "abort",
+    "already_satisfied",
+    "blocked",
+    "continue",
+    "verify",
+];
 /// Valid `requires` predicate types, sorted (for error messages).
 pub const VALID_REQUIREMENT_TYPES: [&str; 3] = ["command_grader", "env_var_set", "file_exists"];
 
@@ -431,6 +442,24 @@ mod tests {
                 requires: vec![],
             })
         );
+    }
+
+    #[test]
+    fn already_satisfied_is_a_valid_intent() {
+        let r = parse_envelope(&wrap(
+            r#"{"intent":"already_satisfied","reason":"goal holds on base"}"#,
+        ));
+        assert_eq!(
+            r,
+            EnvelopeResult::Valid(ValidEnvelope {
+                intent: Intent::AlreadySatisfied,
+                reason: Some("goal holds on base".into()),
+                requires: vec![],
+            })
+        );
+        let mut sorted: Vec<&str> = Intent::ALL.iter().map(|i| i.as_str()).collect();
+        sorted.sort_unstable();
+        assert_eq!(sorted, VALID_INTENTS);
     }
 
     #[test]

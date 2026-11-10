@@ -19,7 +19,7 @@ use super::telemetry::{MirroringStore, RunTelemetry, store_error_type};
 use crate::events::{AttemptFinalized, DomainEvent, DomainEventPayload, TransitionedTo};
 use crate::grader_transcript::MonotonicClock;
 use crate::invoker_client::Clock;
-use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status};
+use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status, StopReason};
 use crate::store::{DomainEventStore, JsonObject, StoreError};
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -246,10 +246,15 @@ impl Run {
     }
 
     /// Persist the attempt's terminal fields and emit the finalization event.
+    ///
+    /// `stop_reason` is required: every finalize path names why the attempt
+    /// stopped, and a path the vocabulary does not name passes
+    /// [`StopReason::Crash`].
     pub fn finalize_attempt(
         &self,
         attempt: &mut Attempt,
         outcome: Outcome,
+        stop_reason: StopReason,
         error: &str,
         agent_output: &str,
     ) -> Result<(), StoreError> {
@@ -257,6 +262,7 @@ impl Run {
         attempt.ended_at = Some(ended_at);
         attempt.outcome = Some(outcome);
         attempt.error = error.to_owned();
+        attempt.stop_reason = Some(stop_reason.clone());
         if !agent_output.is_empty() {
             attempt.agent_output = agent_output.to_owned();
         }
@@ -269,7 +275,7 @@ impl Run {
                 ended_at,
                 agent_output: agent_output.to_owned(),
                 error: error.to_owned(),
-                stop_reason: None,
+                stop_reason: Some(stop_reason),
             }),
         )?;
         self.emit_attempt_finalized(attempt.number, outcome, error);
@@ -297,10 +303,11 @@ impl Run {
     pub fn handle_timeout_class(
         &self,
         attempt: &mut Attempt,
+        stop_reason: StopReason,
         error: &str,
     ) -> Result<(), StoreError> {
         if attempt.ended_at.is_none() {
-            self.finalize_attempt(attempt, Outcome::InternalError, error, "")?;
+            self.finalize_attempt(attempt, Outcome::InternalError, stop_reason, error, "")?;
         }
         if self.status() != Status::InternalError {
             self.transition(Status::InternalError, error)?;
@@ -342,6 +349,7 @@ impl Run {
             attempt.ended_at = Some(ended_at);
             attempt.outcome = Some(Outcome::InternalError);
             attempt.error = reason.to_owned();
+            attempt.stop_reason = Some(StopReason::OperatorInterrupted);
             let _ = self.append_payload(
                 ended_at,
                 Some(attempt.number),
@@ -351,7 +359,7 @@ impl Run {
                     ended_at,
                     agent_output: attempt.agent_output.clone(),
                     error: reason.to_owned(),
-                    stop_reason: None,
+                    stop_reason: Some(StopReason::OperatorInterrupted),
                 }),
             );
             // Mirror finalize_stranded_lifecycle's telemetry shape so the

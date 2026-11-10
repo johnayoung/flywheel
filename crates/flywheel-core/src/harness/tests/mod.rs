@@ -8,6 +8,7 @@ mod mirroring;
 mod ops;
 mod recovery;
 mod run;
+mod stop_reason;
 mod support;
 mod teardown;
 mod validate;

@@ -34,6 +34,7 @@ flowchart TD
     VP -->|no| FV
     K -->|"blocked (+ requires)"| INT2["interrupted; persist requires; recheck-blocked promotes to ready when every predicate holds"]
     K -->|abort| FAIL["failed (reason recorded)"]
+    K -->|already_satisfied| FAIL2["failed; claim recorded, never verified"]
     K -->|"malformed / missing / duplicate / truncated"| FV2["protocol failure, then failed_validation, then retry or failed"]
 ```
 
@@ -47,7 +48,7 @@ The signal column names Claude Code stream-json message types and CLI flags. Re-
 |---|---|---|---|
 | `done` | Agent's turn ended cleanly and it believes the work is complete. Candidate for verification, not final. | `AssistantMessage.StopReason == "end_turn"` with no pending `ToolUseBlock`; `ResultMessage` with `IsError: false` | Run the task's graders in cost order and promote to lifecycle `done` only on all-pass. When automated graders all pass and the task declares any `ManualGrader`, the attempt is finalized `succeeded` and the lifecycle parks at `AWAITING_APPROVAL` instead of promoting to `done`; an operator resolves each gate out-of-band via `flywheel approve` / `flywheel reject`. |
 | `working` | Agent is making productive progress — tool calls succeeding, novel actions, diff growing. Default healthy state. | `ToolResultBlock.IsError == false`; `TaskProgressMessage` arriving | **Simple:** reset watchdog timer, append event to progress window, continue. Pure bookkeeping. |
-| `blocked_explicit` | Agent has declared it needs external input to proceed. | Text content in `AssistantMessage`; simplified intent envelope | **Simple** if the intent envelope is a closed enum (`blocked`, `verify`, `continue`, `abort`) — trivial parse and pause. **Open question:** how the `reason` field is handled without it becoming free-form conditional logic inside the loop. |
+| `blocked_explicit` | Agent has declared it needs external input to proceed. | Text content in `AssistantMessage`; simplified intent envelope | **Simple** if the intent envelope is a closed enum (`blocked`, `verify`, `continue`, `abort`, `already_satisfied`) — trivial parse and pause. **Open question:** how the `reason` field is handled without it becoming free-form conditional logic inside the loop. |
 | `blocked_implicit` | Agent is stuck but doesn't know it — same tool failing repeatedly, same permission denied, same question re-asked. | `ToolResultBlock.IsError == true`; `ResultMessage.PermissionDenials` | **Shipped — mechanical case:** counter keyed on `(tool_name, sha256(input))` in `crates/flywheel-core/src/loop_guard.rs`, tripped after repeated consecutive `is_error` results and routed to `interrupted` (blocked, operator-recoverable) via the harness `STUCK` path. Permission denials surfaced as `is_error` tool results feed the same counter; a dedicated resource-keyed `(tool_name, resource)` counter is still deferred. **TODO — "same question re-asked":** requires semantic similarity between assistant text blocks; not deterministic. Research options include embedding-model similarity with a threshold study; each requires its own research phase. |
 | `thrashing` | Tool calls succeed but produce no net progress — same files edited with zero-sum diffs, input novelty collapsing. | `ToolUseBlock` tool name + input | Three sub-problems with different difficulty. **(a) Shipped — tuple repetition** across a rolling window via the loop guard's `Thrash` verdict, routed through `failed_validation` -> the existing retry policy. **TODO (b) — net-diff-near-zero:** needs filesystem snapshots and a "meaningful change" heuristic (whitespace? comments? line count threshold?). **TODO (c) — input novelty score:** needs a distance metric over structured inputs, which is research. Each remaining sub-problem requires its own research phase. |
 | `hanging` | No output of any kind for longer than threshold — not thinking, not rate-limited, just silent. | The stream delivers messages one-by-one; `ThinkingBlock` and `RateLimitEvent` are valid liveness signals | **Shipped — mechanism:** an inter-message watchdog in the harness (`crates/flywheel-core/src/harness/iterate.rs`) resets on every agent stream message (including `ThinkingBlock` and `RateLimitEvent`); on silence past `hang_timeout_seconds` it cancels the in-flight invocation and routes the attempt to `internal_error`. **TODO — threshold default value:** `hang_timeout_seconds` ships unset (disabled). A grounded default still requires research informed by extended-thinking budgets and telemetry; the watchdog only runs once an operator supplies a value. |
@@ -63,13 +64,13 @@ The envelope carries agent intent only; observed state comes from agent stream s
 ```html
 <!-- LOOP_STATUS -->
 {
-  "intent": "verify" | "blocked" | "continue" | "abort",
+  "intent": "verify" | "blocked" | "continue" | "abort" | "already_satisfied",
   "reason": "..."
 }
 <!-- /LOOP_STATUS -->
 ```
 
-`intent=blocked` MUST additionally carry a non-empty `requires` array describing what would unblock the lifecycle. Non-blocked intents omit `requires`; any payload-level `requires` on `verify`, `continue`, or `abort` is ignored. Three predicate shapes are recognized in v1 (and only these three):
+`intent=blocked` MUST additionally carry a non-empty `requires` array describing what would unblock the lifecycle. Non-blocked intents omit `requires`; any payload-level `requires` on `verify`, `continue`, `abort`, or `already_satisfied` is ignored. Three predicate shapes are recognized in v1 (and only these three):
 
 ```json
 {"type": "command_grader", "name": "<grader-name>"}
@@ -78,6 +79,8 @@ The envelope carries agent intent only; observed state comes from agent stream s
 ```
 
 `file_exists.present` defaults to `true` when omitted. A blocked envelope without `requires`, with a non-list `requires`, with an empty list, or with an entry of unknown `type` or missing per-type field is a protocol failure.
+
+`intent=already_satisfied` declares the goal already holds on the base. It is an untrusted claim: the attempt finalizes `agent_error` with stop reason `agent_claimed_already_done`, the lifecycle goes `running -> failed` without entering `validating`, and the task is never marked done or verified on it.
 
 The envelope is untrusted protocol input. The harness must handle malformed JSON, missing fences, duplicates, truncation, and contradictory claims as first-class cases.
 

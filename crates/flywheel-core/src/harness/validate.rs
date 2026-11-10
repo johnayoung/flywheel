@@ -15,7 +15,7 @@ use crate::grader_rubric::{
     run_rubric_graders,
 };
 use crate::grader_transcript::{TranscriptObservation, run_transcript_graders};
-use crate::lifecycle::{Attempt, Outcome, Status};
+use crate::lifecycle::{Attempt, Outcome, Status, StopReason};
 use crate::store::GraderResultRecord;
 use crate::task::Task;
 use serde_json::{Value, json};
@@ -27,30 +27,51 @@ fn all_passed(results: &[GraderResultRecord]) -> bool {
     results.iter().all(|r| r.passed)
 }
 
+/// The grader name a result is reported under (its type when unnamed).
+fn grader_label(record: &GraderResultRecord) -> String {
+    record
+        .grader_name
+        .clone()
+        .unwrap_or_else(|| record.grader_type.as_str().to_owned())
+}
+
 fn grader_failure_error(results: &[GraderResultRecord]) -> String {
     results
         .iter()
         .find(|r| !r.passed)
         .map(|r| {
-            let name = r
-                .grader_name
-                .clone()
-                .unwrap_or_else(|| r.grader_type.as_str().to_owned());
-            format!("{} grader {name:?} failed", r.grader_type.as_str())
+            format!(
+                "{} grader {:?} failed",
+                r.grader_type.as_str(),
+                grader_label(r)
+            )
         })
         .unwrap_or_else(|| "grader failure".to_owned())
 }
 
-/// Finalize `attempt` with `outcome` / `error` and transition `target`.
+/// `checks_failed{check}` naming the first failing grader in `results`.
+fn checks_failed(results: &[GraderResultRecord]) -> StopReason {
+    StopReason::ChecksFailed {
+        check: results
+            .iter()
+            .find(|r| !r.passed)
+            .map(grader_label)
+            .unwrap_or_default(),
+    }
+}
+
+/// Finalize `attempt` with `outcome` / `stop_reason` / `error` and
+/// transition `target`.
 fn finalize_and_transition(
     run: &Run,
     attempt: &mut Attempt,
     outcome: Outcome,
+    stop_reason: StopReason,
     error: &str,
     agent_output: &str,
     target: Status,
 ) -> Result<(), AttemptError> {
-    run.finalize_attempt(attempt, outcome, error, agent_output)?;
+    run.finalize_attempt(attempt, outcome, stop_reason, error, agent_output)?;
     run.transition(target, error)?;
     Ok(())
 }
@@ -173,6 +194,9 @@ pub(super) async fn validate(
             Err(RubricGraderError::Store(err)) => return Err(err.into()),
             Err(RubricGraderError::Judge(exc)) => {
                 let error = format!("rubric judge failed: {}: {}", exc.grader_name, exc.reason);
+                let stop_reason = StopReason::JudgeFailed {
+                    check: exc.grader_name.clone(),
+                };
                 run.emit(
                     "harness.crash",
                     object(json!({
@@ -187,6 +211,7 @@ pub(super) async fn validate(
                     run,
                     attempt,
                     Outcome::InternalError,
+                    stop_reason,
                     &error,
                     agent_output,
                     Status::InternalError,
@@ -203,7 +228,13 @@ pub(super) async fn validate(
         // A declared ManualGrader: the attempt passed every automated grader
         // but still owes a human decision -- finalize SUCCEEDED and park.
         if let Some(first_gate) = next_pending_manual_gate(task, None) {
-            run.finalize_attempt(attempt, Outcome::Succeeded, "", agent_output)?;
+            run.finalize_attempt(
+                attempt,
+                Outcome::Succeeded,
+                StopReason::Verified,
+                "",
+                agent_output,
+            )?;
             enter_manual_gate(run, attempt, &first_gate, attempt_dir)?;
             return Ok(());
         }
@@ -216,6 +247,9 @@ pub(super) async fn validate(
             .filter(|reason| !reason.is_empty());
         if let Some(reason) = landability_reason {
             let error = format!("change not landable: {reason}");
+            let stop_reason = StopReason::LandingBlocked {
+                reason: reason.clone(),
+            };
             run.emit(
                 "harness.landability_gate_blocked",
                 object(json!({"reason": reason, "message": error})),
@@ -225,12 +259,19 @@ pub(super) async fn validate(
                 run,
                 attempt,
                 Outcome::ValidationFailed,
+                stop_reason,
                 &error,
                 agent_output,
                 Status::FailedValidation,
             );
         }
-        run.finalize_attempt(attempt, Outcome::Succeeded, "", agent_output)?;
+        run.finalize_attempt(
+            attempt,
+            Outcome::Succeeded,
+            StopReason::Verified,
+            "",
+            agent_output,
+        )?;
         run.transition(Status::Done, "")?;
         return Ok(());
     }
@@ -256,7 +297,13 @@ pub(super) async fn validate(
                 })),
                 Some(attempt_number),
             );
-            run.finalize_attempt(attempt, Outcome::InternalError, &error, agent_output)?;
+            run.finalize_attempt(
+                attempt,
+                Outcome::InternalError,
+                StopReason::OperatorInterrupted,
+                &error,
+                agent_output,
+            )?;
             run.transition(Status::Interrupted, "")?;
             return Ok(());
         }
@@ -288,6 +335,8 @@ pub(super) async fn validate(
                 run,
                 attempt,
                 Outcome::InternalError,
+                // A grader that never ran has no vocabulary name.
+                StopReason::Crash,
                 &error,
                 agent_output,
                 Status::InternalError,
@@ -298,6 +347,7 @@ pub(super) async fn validate(
             run,
             attempt,
             Outcome::ValidationFailed,
+            checks_failed(&command_results),
             &error,
             agent_output,
             Status::FailedValidation,
@@ -310,6 +360,7 @@ pub(super) async fn validate(
             run,
             attempt,
             Outcome::ValidationFailed,
+            checks_failed(&transcript_results),
             &error,
             agent_output,
             Status::FailedValidation,
@@ -325,7 +376,13 @@ pub(super) async fn validate(
             Status::FailedValidation,
         ),
     };
-    run.finalize_attempt(attempt, Outcome::ValidationFailed, &error, agent_output)?;
+    run.finalize_attempt(
+        attempt,
+        Outcome::ValidationFailed,
+        checks_failed(&rubric_results),
+        &error,
+        agent_output,
+    )?;
     run.transition(target, &error)?;
     Ok(())
 }

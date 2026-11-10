@@ -18,7 +18,7 @@ use crate::grader_manual::{
 use crate::invoker_client::{
     CONTROL_COMMAND_APPROVE, CONTROL_COMMAND_REJECT, Clock, GateBinding, command_applied_event,
 };
-use crate::lifecycle::{Lifecycle, Outcome, Status};
+use crate::lifecycle::{Lifecycle, Outcome, Status, StopReason};
 use crate::store::{
     AttemptStore, ControlCommandRecord, ControlCommandStore, GraderResultStore, HarnessStore,
     JsonObject, LifecycleStore, StoreError,
@@ -35,6 +35,8 @@ use std::time::Duration;
 pub struct FinalizeStrandedOptions {
     pub reason: String,
     pub classification: String,
+    /// The stop reason recorded on each open attempt it closes.
+    pub stop_reason: StopReason,
     pub sink: Option<SharedSink>,
     pub now: Option<Clock>,
 }
@@ -44,6 +46,7 @@ impl Default for FinalizeStrandedOptions {
         Self {
             reason: "worker interrupted before finalization".to_owned(),
             classification: "worker_interrupted".to_owned(),
+            stop_reason: StopReason::WorkerInterrupted,
             sink: None,
             now: None,
         }
@@ -55,6 +58,7 @@ impl fmt::Debug for FinalizeStrandedOptions {
         f.debug_struct("FinalizeStrandedOptions")
             .field("reason", &self.reason)
             .field("classification", &self.classification)
+            .field("stop_reason", &self.stop_reason)
             .field("sink", &self.sink.is_some())
             .finish_non_exhaustive()
     }
@@ -131,7 +135,7 @@ pub fn finalize_stranded_lifecycle(
                 ended_at,
                 agent_output: attempt.agent_output.clone(),
                 error: options.reason.clone(),
-                stop_reason: None,
+                stop_reason: Some(options.stop_reason.clone()),
             }),
         )?;
         run.emit_attempt_finalized(attempt.number, Outcome::InternalError, &options.reason);

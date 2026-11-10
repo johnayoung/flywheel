@@ -16,7 +16,7 @@ use crate::envelope::{EnvelopeResult, Intent};
 use crate::events::{AttemptStarted, Blocked, DomainEventPayload};
 use crate::grader_transcript::first_breach;
 use crate::grader_transcript::run_transcript_graders;
-use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status};
+use crate::lifecycle::{Attempt, Lifecycle, Outcome, Status, StopReason};
 use crate::loop_guard::{LoopGuard, LoopGuardVerdict, LoopGuardVerdictKind};
 use crate::prompt::RecoveryHandoff;
 use crate::recovery_summarizer::{
@@ -99,7 +99,11 @@ pub(super) async fn run_attempt(
         // containment path (INTERNAL_ERROR), never the operator-interrupt
         // path. The audit event was emitted before the cancel.
         Err(err @ (AttemptError::Hang { .. } | AttemptError::Deadline { .. })) => {
-            run.handle_timeout_class(&mut attempt, &err.error_text())?;
+            let stop_reason = match err {
+                AttemptError::Hang { .. } => StopReason::Hang,
+                _ => StopReason::DeadlineExceeded,
+            };
+            run.handle_timeout_class(&mut attempt, stop_reason, &err.error_text())?;
             Ok(())
         }
         // Operator-driven shutdown: close the in-flight attempt to
@@ -116,23 +120,31 @@ pub(super) async fn run_attempt(
         Err(AttemptError::Failed(err)) => {
             if attempt.ended_at.is_none() {
                 let error = format!("attempt crashed: {}: {err}", err.error_type());
-                let _ = run.finalize_attempt(&mut attempt, Outcome::InternalError, &error, "");
+                let _ = run.finalize_attempt(
+                    &mut attempt,
+                    Outcome::InternalError,
+                    StopReason::Crash,
+                    &error,
+                    "",
+                );
             }
             Err(err)
         }
     }
 }
 
-/// Finalize `attempt` with `outcome` / `error` and transition `target`.
+/// Finalize `attempt` with `outcome` / `stop_reason` / `error` and
+/// transition `target`.
 fn finalize_and_transition(
     run: &Run,
     attempt: &mut Attempt,
     outcome: Outcome,
+    stop_reason: StopReason,
     error: &str,
     agent_output: &str,
     target: Status,
 ) -> Result<(), AttemptError> {
-    run.finalize_attempt(attempt, outcome, error, agent_output)?;
+    run.finalize_attempt(attempt, outcome, stop_reason, error, agent_output)?;
     run.transition(target, error)?;
     Ok(())
 }
@@ -191,6 +203,8 @@ async fn run_attempt_body(
                 run,
                 attempt,
                 Outcome::AgentError,
+                // No vocabulary name covers a zero-iteration attempt.
+                StopReason::Crash,
                 error,
                 "",
                 Status::FailedValidation,
@@ -204,23 +218,30 @@ async fn run_attempt_body(
     // Transient rate-limit exhaustion / session-limit fast-abort: an
     // infrastructure fault routed to the retryable INTERNAL_ERROR class.
     if transient_exhausted {
-        let error = match session_limit_reset {
+        let (stop_reason, error) = match session_limit_reset {
             Some(reset) => {
                 session_state.reset_at = Some(reset);
-                format!(
-                    "session-limit refusal; reset at {}",
-                    crate::event_serde::format_timestamp(&reset)
+                (
+                    StopReason::ProviderRateLimited,
+                    format!(
+                        "session-limit refusal; reset at {}",
+                        crate::event_serde::format_timestamp(&reset)
+                    ),
                 )
             }
-            None => format!(
-                "transient rate-limit retries exhausted after {} invocations",
-                config.max_transient_retries + 1
+            None => (
+                StopReason::TransientExhausted,
+                format!(
+                    "transient rate-limit retries exhausted after {} invocations",
+                    config.max_transient_retries + 1
+                ),
             ),
         };
         return finalize_and_transition(
             run,
             attempt,
             Outcome::InternalError,
+            stop_reason,
             &error,
             &result.transcript,
             Status::InternalError,
@@ -245,6 +266,7 @@ async fn run_attempt_body(
             run,
             attempt,
             Outcome::InternalError,
+            StopReason::Crash,
             &crash_error,
             &result.transcript,
             Status::InternalError,
@@ -337,7 +359,28 @@ async fn run_attempt_body(
                 run,
                 attempt,
                 Outcome::AgentError,
+                StopReason::AgentGaveUp,
                 &reason,
+                &result.transcript,
+                Status::Failed,
+            );
+        }
+        // An already-satisfied declaration is an untrusted claim: it ends
+        // the run on the ABORT shape and never enters VALIDATING, so the
+        // claim alone can never verify the task.
+        if envelope.intent == Intent::AlreadySatisfied {
+            let reason = envelope
+                .reason
+                .clone()
+                .filter(|r| !r.is_empty())
+                .unwrap_or_else(|| "agent claimed the goal is already satisfied".to_owned());
+            let error = format!("agent claimed already satisfied (unverified): {reason}");
+            return finalize_and_transition(
+                run,
+                attempt,
+                Outcome::AgentError,
+                StopReason::AgentClaimedAlreadyDone,
+                &error,
                 &result.transcript,
                 Status::Failed,
             );
@@ -364,6 +407,7 @@ async fn run_attempt_body(
                     run,
                     attempt,
                     Outcome::AgentError,
+                    StopReason::ProtocolFailure,
                     &protocol_error,
                     &result.transcript,
                     Status::FailedValidation,
@@ -375,7 +419,14 @@ async fn run_attempt_body(
                 .filter(|r| !r.is_empty())
                 .unwrap_or_else(|| "agent reported blocked intent".to_owned());
             let requires_payload = serialize_requires(&envelope.requires);
-            run.finalize_attempt(attempt, Outcome::Cancelled, &reason, &result.transcript)?;
+            // A benign pause has no vocabulary name.
+            run.finalize_attempt(
+                attempt,
+                Outcome::Cancelled,
+                StopReason::Crash,
+                &reason,
+                &result.transcript,
+            )?;
             // Persist the structured snapshot before the INTERRUPTED
             // transition so the projection carries it when the status
             // change lands; the reducer clears it on every -> READY edge.
@@ -431,6 +482,7 @@ async fn run_attempt_body(
             run,
             attempt,
             Outcome::ValidationFailed,
+            StopReason::BudgetExceeded,
             &error,
             &result.transcript,
             Status::FailedValidation,
@@ -460,6 +512,7 @@ async fn run_attempt_body(
                 run,
                 attempt,
                 Outcome::AgentError,
+                StopReason::DidNotConverge,
                 &error,
                 &result.transcript,
                 Status::FailedValidation,
@@ -477,6 +530,7 @@ async fn run_attempt_body(
                 run,
                 attempt,
                 Outcome::AgentError,
+                StopReason::ProtocolFailure,
                 &protocol_error,
                 &result.transcript,
                 Status::FailedValidation,
@@ -506,7 +560,13 @@ fn handle_loop_guard_stuck(
     transcript: &str,
 ) -> Result<(), AttemptError> {
     let requires_payload = loop_guard_requires_payload(verdict);
-    run.finalize_attempt(attempt, Outcome::Cancelled, &verdict.reason, transcript)?;
+    run.finalize_attempt(
+        attempt,
+        Outcome::Cancelled,
+        StopReason::DidNotConverge,
+        &verdict.reason,
+        transcript,
+    )?;
     run.append_payload(
         run.now(),
         Some(attempt.number),
@@ -551,6 +611,7 @@ fn handle_loop_guard_thrash(
         run,
         attempt,
         Outcome::AgentError,
+        StopReason::DidNotConverge,
         &verdict.reason,
         transcript,
         Status::FailedValidation,
@@ -631,6 +692,7 @@ async fn handle_context_recovery(
                 run,
                 attempt,
                 Outcome::InternalError,
+                StopReason::Crash,
                 &error,
                 &trigger.transcript_tail,
                 Status::InternalError,
@@ -662,7 +724,15 @@ async fn handle_context_recovery(
         })),
         Some(attempt.number),
     );
-    run.finalize_attempt(attempt, Outcome::Recovered, "", &trigger.transcript_tail)?;
+    // A context-recovery restart has no vocabulary name; the RECOVERED
+    // outcome carries the distinction.
+    run.finalize_attempt(
+        attempt,
+        Outcome::Recovered,
+        StopReason::Crash,
+        "",
+        &trigger.transcript_tail,
+    )?;
     // Walk the legal edge set back to READY without consuming a validation
     // retry (RUNNING has no direct edge to READY).
     run.transition(Status::Interrupted, "")?;
@@ -703,7 +773,13 @@ fn finalize_budget_breach(
         python_number(&observed),
         python_number(&limit)
     );
-    run.finalize_attempt(attempt, Outcome::AgentError, &breach_error, transcript)?;
+    run.finalize_attempt(
+        attempt,
+        Outcome::AgentError,
+        StopReason::BudgetExceeded,
+        &breach_error,
+        transcript,
+    )?;
     run.emit(
         "harness.budget_ceiling_breached",
         object(json!({"ceiling": ceiling, "limit": limit, "observed": observed})),

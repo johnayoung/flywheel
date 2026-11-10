@@ -8,14 +8,19 @@
 //! smoke-checks both artifacts; install keeps the previous pair under
 //! `$FLYWHEEL_HOME/self-update/previous/` and replaces both binaries by
 //! atomic rename, then records commit, checkout, and installed sha256.
-//! Every refusal (exit 3) happens before anything outside the lock file
-//! changes. The drain, backup, db-upgrade, hub, and restart steps report
-//! `skipped` (`planned` under `--dry-run`): this build does not perform
-//! them.
+//! Preflight also refuses while an operator console of this home runs.
+//! Drain (after the build, before the install) SIGTERMs this home's
+//! `worker` / `autopilot` / `triage` daemons found from `/proc` and waits
+//! up to `--drain-timeout`; a survivor aborts the run (exit 1) with the
+//! install dir untouched ([`drain`]). Every refusal (exit 3) happens
+//! before anything outside the lock file changes. The backup, db-upgrade,
+//! hub, and restart steps report `skipped` (`planned` under `--dry-run`):
+//! this build does not perform them.
 //!
 //! Spec: `docs/cli.md` (`self-update`).
 
 pub mod args;
+pub mod drain;
 pub mod install;
 pub mod output;
 pub mod source;
@@ -146,6 +151,9 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
         reporter.step(Step::Preflight, Status::Ok, Some(&detail));
         return reporter.finish(Status::Skipped, Outcome::Current, &summary);
     }
+    if let drain::Discovery::Console(pid) = drain::discover(&home) {
+        return refuse(reporter, Step::Preflight, &console_refusal(pid), &summary);
+    }
     let detail = format!(
         "{} at {short}, install dir {}",
         checkout.root.display(),
@@ -176,18 +184,76 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
     let detail = format!("fw {version} at {short}");
     reporter.step(Step::Build, Status::Ok, Some(&detail));
 
+    // --- drain (discovery) -------------------------------------------------------
+    // Re-read now: the build took a while and processes come and go.
+    let set = match drain::discover(&home) {
+        drain::Discovery::Drain(set) => set,
+        drain::Discovery::Console(pid) => {
+            return refuse(reporter, Step::Drain, &console_refusal(pid), &summary);
+        }
+    };
+
     // --- dry run ---------------------------------------------------------------
     if args.dry_run {
+        summary.drained = set.iter().map(drain::Drainable::to_json).collect();
+        let hub_pid = drain::hub_pid(&home.hub_dir());
+        summary.hub = Some(serde_json::json!({
+            "action": if hub_pid.is_some() { "handoff" } else { "not-running" },
+            "old_pid": hub_pid,
+            "new_pid": null,
+        }));
+        let drain_detail = if set.is_empty() {
+            "no worker, autopilot, or triage process of this home is running".to_owned()
+        } else {
+            format!("would stop {}", describe(&set))
+        };
         let detail = format!(
             "would replace fw and flywheel in {} (previous pair to {})",
             install_dir.display(),
             home.self_update_previous_dir().display()
         );
-        reporter.step(Step::Drain, Status::Planned, None);
+        let hub_detail = match hub_pid {
+            Some(pid) => format!("hub pid {pid} is serving this home"),
+            None => "no hub is serving this home".to_owned(),
+        };
+        reporter.step(Step::Drain, Status::Planned, Some(&drain_detail));
         reporter.step(Step::Backup, Status::Planned, None);
         reporter.step(Step::Install, Status::Planned, Some(&detail));
+        reporter.step(Step::DbUpgrade, Status::Planned, None);
+        reporter.step(Step::Hub, Status::Planned, Some(&hub_detail));
         return reporter.finish(Status::Planned, Outcome::Planned, &summary);
     }
+
+    // --- drain -----------------------------------------------------------------
+    if set.is_empty() {
+        let detail = "no worker, autopilot, or triage process of this home is running";
+        reporter.step(Step::Drain, Status::Skipped, Some(detail));
+    } else {
+        let timeout = std::time::Duration::from_secs(args.drain_timeout_secs);
+        let drained = drain::drain(&set, timeout);
+        summary.drained = drained
+            .stopped
+            .iter()
+            .map(drain::Drainable::to_json)
+            .collect();
+        if !drained.not_stopped.is_empty() {
+            summary.not_stopped = drained
+                .not_stopped
+                .iter()
+                .map(drain::Drainable::to_json)
+                .collect();
+            let detail = format!(
+                "still running {}s after SIGTERM: {}; nothing was installed",
+                args.drain_timeout_secs,
+                describe(&drained.not_stopped)
+            );
+            reporter.step(Step::Drain, Status::Failed, Some(&detail));
+            return reporter.finish(Status::Skipped, Outcome::Failed, &summary);
+        }
+        let detail = format!("stopped {}", describe(&drained.stopped));
+        reporter.step(Step::Drain, Status::Ok, Some(&detail));
+    }
+    summary.unidentified_claims = drain::live_claims(&home);
 
     // --- install ---------------------------------------------------------------
     let installed = install::install(
@@ -244,6 +310,30 @@ fn run(args: &args::Args, env: &Environment, out: &mut dyn Write) -> i32 {
             reporter.finish(Status::Skipped, Outcome::Failed, &summary)
         }
     }
+}
+
+/// The preflight / drain refusal while an operator console of this home
+/// runs: its supervisor would respawn a stopped worker mid-swap.
+fn console_refusal(pid: u32) -> String {
+    format!(
+        "an operator console of this home is running (pid {pid}); quit it, then run fw self-update again"
+    )
+}
+
+/// `<pid> <kind> <verb> in <cwd>`, comma-separated.
+fn describe(set: &[drain::Drainable]) -> String {
+    set.iter()
+        .map(|d| {
+            format!(
+                "{} {} {} in {}",
+                d.pid,
+                d.kind.name(),
+                d.verb,
+                d.cwd_display()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Put the `previous/` pair back after a failure that follows a complete

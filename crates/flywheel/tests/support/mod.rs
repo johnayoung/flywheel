@@ -436,3 +436,353 @@ impl Fixture {
         }
     }
 }
+
+// --- processes the drain tests spawn ------------------------------------------
+
+/// Clear every inherited `FLYWHEEL_*` / `FAKE_CARGO_*` variable and confine
+/// `command` to `home` / `flywheel_home`, with `extra_path` first on PATH.
+pub fn confine(command: &mut Command, home: &Path, flywheel_home: &Path, extra_path: &[&Path]) {
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy().into_owned();
+        if key.starts_with("FLYWHEEL_") || key.starts_with("FAKE_CARGO_") {
+            command.env_remove(&key);
+        }
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths: Vec<PathBuf> = extra_path.iter().map(|p| p.to_path_buf()).collect();
+    paths.extend(std::env::split_paths(&path));
+    command
+        .env("HOME", home)
+        .env("FLYWHEEL_HOME", flywheel_home)
+        .env("XDG_STATE_HOME", home.join("xdg-state"))
+        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
+        .env("CLAUDE_CONFIG_DIR", home.join("claude-config"))
+        .env("CODEX_HOME", home.join("codex-home"))
+        .env("SHELL", "/bin/sh")
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("DATABASE_URL")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE");
+}
+
+/// A git repo with one commit at `dir`, registered as a project of the
+/// home at `flywheel_home` (`fw project path` run there); returns the
+/// project dir.
+pub fn project_repo(dir: &Path, home: &Path, flywheel_home: &Path) -> PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-q", "-b", "main"]);
+    std::fs::write(dir.join("README.md"), "drain test\n").unwrap();
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-qm", "init", "--no-gpg-sign"]);
+    let mut command = Command::new(fw_under_test());
+    command
+        .args(["project", "path"])
+        .current_dir(dir)
+        .stdin(Stdio::null());
+    confine(&mut command, home, flywheel_home, &[]);
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "fw project path: {output:?}");
+    PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+}
+
+/// `(ppid, starttime, state)` of `pid`.
+pub fn stat_of(pid: u32) -> Option<(u32, u64, char)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    Some((
+        fields.get(1)?.parse().ok()?,
+        fields.get(19)?.parse().ok()?,
+        fields.first()?.chars().next()?,
+    ))
+}
+
+/// Gone, or a zombie awaiting its reaper.
+pub fn gone(pid: u32) -> bool {
+    stat_of(pid).is_none_or(|(_, _, state)| state == 'Z')
+}
+
+/// `/proc/<pid>/cmdline` as argv.
+pub fn argv_of(pid: u32) -> Vec<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .unwrap_or_default()
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect()
+}
+
+/// Live (non-zombie) children of `parent`.
+pub fn children_of(parent: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if let Some((ppid, _, state)) = stat_of(pid)
+            && ppid == parent
+            && state != 'Z'
+        {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// Every live descendant of `root` (not `root` itself).
+pub fn descendants_of(root: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
+        for child in children_of(pid) {
+            out.push(child);
+            queue.push(child);
+        }
+    }
+    out
+}
+
+pub fn signal(pid: u32, sig: libc::c_int) {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // SAFETY: kill(2) on a pid (or the group) of a process this test
+    // spawned; a vanished target yields ESRCH.
+    unsafe {
+        libc::kill(pid, sig);
+    }
+}
+
+pub fn wait_until<T>(
+    what: &str,
+    timeout: std::time::Duration,
+    mut probe: impl FnMut() -> Option<T>,
+) -> T {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Processes this test spawned (and their descendants, recorded as they
+/// are learned), SIGKILLed with their groups on drop so a failed
+/// assertion leaks nothing. Only pids the test itself started go in.
+#[derive(Default)]
+pub struct Spawned {
+    children: Vec<Child>,
+    pids: Vec<u32>,
+}
+
+impl Spawned {
+    pub fn push(&mut self, child: Child) -> u32 {
+        let pid = child.id();
+        self.children.push(child);
+        pid
+    }
+
+    /// Record a descendant of a spawned process.
+    pub fn track(&mut self, pid: u32) {
+        self.pids.push(pid);
+    }
+
+    /// The child spawned with `pid`.
+    pub fn child(&mut self, pid: u32) -> &mut Child {
+        self.children.iter_mut().find(|c| c.id() == pid).unwrap()
+    }
+}
+
+impl Drop for Spawned {
+    fn drop(&mut self) {
+        let roots: Vec<u32> = self.children.iter().map(Child::id).collect();
+        let mut all: Vec<u32> = self.pids.clone();
+        for root in &roots {
+            all.extend(descendants_of(*root));
+        }
+        for pid in roots.iter().chain(&all) {
+            signal(*pid, libc::SIGCONT);
+            signal(*pid, libc::SIGKILL);
+        }
+        for root in &roots {
+            // Group leaders (setsid) take their groups down with them.
+            if let Ok(pgid) = libc::pid_t::try_from(*root) {
+                signal_group(pgid, libc::SIGKILL);
+            }
+        }
+        for child in &mut self.children {
+            let _ = child.wait();
+        }
+    }
+}
+
+fn signal_group(pgid: libc::pid_t, sig: libc::c_int) {
+    // SAFETY: kill(2) on the negative pgid of a group this test's own
+    // setsid child leads.
+    unsafe {
+        libc::kill(-pgid, sig);
+    }
+}
+
+/// `command` runs as the leader of a new session and process group.
+pub fn new_session(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setsid(2) is async-signal-safe and touches no memory.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// A running `fw hub serve` for a fixture home (state dir
+/// `$FLYWHEEL_HOME/hub`, the default).
+pub struct Hub {
+    pub pid: u32,
+    pub port: u16,
+    pub token: String,
+}
+
+impl Hub {
+    /// Start `program hub serve --port 0` confined to `home` /
+    /// `flywheel_home`, with `extra_path` first on PATH.
+    pub fn start(
+        spawned: &mut Spawned,
+        program: &Path,
+        home: &Path,
+        flywheel_home: &Path,
+        extra_path: &[&Path],
+    ) -> Self {
+        use std::io::BufRead;
+        let mut command = Command::new(program);
+        command
+            .args(["hub", "serve", "--port", "0"])
+            .current_dir(home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        confine(&mut command, home, flywheel_home, extra_path);
+        new_session(&mut command);
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let pid = spawned.push(child);
+        let mut lines = std::io::BufReader::new(stdout).lines();
+        let first = lines.next().unwrap().unwrap();
+        let port = first
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.trim().parse().ok())
+            .unwrap_or_else(|| panic!("unexpected banner {first:?}"));
+        std::thread::spawn(move || for _ in lines {});
+        let token = std::fs::read_to_string(flywheel_home.join("hub/token"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        Self { pid, port, token }
+    }
+
+    /// One HTTP request with the hub token: `(status, JSON body)`.
+    pub fn http(&self, method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        let body = body.map(|b| b.to_string()).unwrap_or_default();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.port,
+            self.token,
+            body.len()
+        )
+        .unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let raw = String::from_utf8_lossy(&raw);
+        let (head, payload) = raw.split_once("\r\n\r\n").unwrap();
+        let status: u16 = head.split(' ').nth(1).unwrap().parse().unwrap();
+        let payload = if head
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            dechunk(payload)
+        } else {
+            payload.to_owned()
+        };
+        (
+            status,
+            serde_json::from_str(&payload).unwrap_or(Value::Null),
+        )
+    }
+
+    /// A workspace holding `folder`, and a hub worker session started in
+    /// it: `(session id, the session's wrapper pid)`.
+    pub fn start_worker(&self, folder: &Path) -> (String, u32) {
+        let (code, workspace) = self.http(
+            "POST",
+            "/api/workspaces",
+            Some(serde_json::json!({ "name": "drain", "folders": [{"path": folder}] })),
+        );
+        assert_eq!(code, 201, "{workspace}");
+        let (code, session) = self.http(
+            "POST",
+            "/api/flywheel/worker",
+            Some(serde_json::json!({ "folder": folder, "workspace_id": workspace["id"] })),
+        );
+        assert_eq!(code, 201, "{session}");
+        assert_eq!(session["command"][3], "fw-worker", "{session}");
+        let sid = session["id"].as_str().unwrap().to_owned();
+        let wrapper = wait_until(
+            "the session's process",
+            std::time::Duration::from_secs(30),
+            || {
+                let (_, view) = self.http("GET", &format!("/api/sessions/{sid}"), None);
+                view["live"]["pid"].as_u64().map(|p| p as u32)
+            },
+        );
+        (sid, wrapper)
+    }
+}
+
+fn dechunk(body: &str) -> String {
+    let mut out = String::new();
+    let mut rest = body;
+    while let Some((size, tail)) = rest.split_once("\r\n") {
+        let size = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
+        if size == 0 {
+            break;
+        }
+        out.push_str(&tail[..size]);
+        rest = &tail[size + 2..];
+    }
+    out
+}
+
+/// The `fw worker` child of a hub worker session's wrapper `wrapper`.
+pub fn worker_under(wrapper: u32) -> u32 {
+    wait_until(
+        "the hub worker process",
+        std::time::Duration::from_secs(30),
+        || {
+            children_of(wrapper)
+                .into_iter()
+                .find(|pid| argv_of(*pid).get(1).map(String::as_str) == Some("worker"))
+        },
+    )
+}

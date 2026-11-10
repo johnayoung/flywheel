@@ -33,6 +33,7 @@ hex.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tokio.workspace = true
+rusqlite.workspace = true
 toml.workspace = true
 clap.workspace = true
 ratatui = "0.29"

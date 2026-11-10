@@ -371,11 +371,16 @@ pub struct Landed {
 /// real re-attempt is the foreclosed cheat. An audit-witness event: its fold
 /// is the identity. `result` is one of [`LANDING_REDRIVE_RESULTS`];
 /// `park_kind` snapshots the park cause the re-drive was clearing.
+/// `initiator` names who asked for the attempt: empty (and omitted from the
+/// payload) for the automatic re-driver, [`REDRIVE_INITIATOR_OPERATOR`] for
+/// an operator-initiated re-land (spec 00086).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandingRedriven {
     pub result: String,
     #[serde(default)]
     pub park_kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub initiator: String,
 }
 
 /// Records a held-out landing-gate evaluation's verdict on the run's ledger.
@@ -603,6 +608,10 @@ pub const LANDING_REDRIVE_RESULTS: [&str; 3] = [
     REDRIVE_RESULT_REPARKED,
     REDRIVE_RESULT_ROUTED,
 ];
+
+/// The `initiator` of a `LandingRedriven` record an operator's one-shot
+/// re-land appended; automatic re-drives leave the field empty.
+pub const REDRIVE_INITIATOR_OPERATOR: &str = "operator";
 
 // --- Reducer ------------------------------------------------------------------
 
@@ -1135,6 +1144,7 @@ mod tests {
             DomainEventPayload::LandingRedriven(LandingRedriven {
                 result: REDRIVE_RESULT_LANDED.into(),
                 park_kind: PARK_KIND_STANDING_VERIFY.into(),
+                ..LandingRedriven::default()
             }),
             DomainEventPayload::LandingRouted(LandingRouted {
                 winning_tier: 1,
@@ -1177,6 +1187,7 @@ mod tests {
             DomainEventPayload::LandingRedriven(LandingRedriven {
                 result: REDRIVE_RESULT_ROUTED.into(),
                 park_kind: String::new(),
+                ..LandingRedriven::default()
             }),
             DomainEventPayload::LandingRouted(LandingRouted {
                 winning_tier: 2,

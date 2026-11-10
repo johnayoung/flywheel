@@ -307,6 +307,7 @@ mod tests {
             DomainEventPayload::LandingRedriven(LandingRedriven {
                 result: "landed".into(),
                 park_kind: "held-out-gate".into(),
+                ..LandingRedriven::default()
             }),
         );
         append(
@@ -401,6 +402,52 @@ mod tests {
         assert!(!text.contains("decisions:"));
         let (_, json_text) = show(&plain, tmp.path(), "run-1", true, false);
         assert!(json_text.contains("\"decisions\": []"));
+    }
+
+    #[test]
+    fn show_surfaces_a_reland_decisions_operator_initiator() {
+        let store = InMemoryStore::new();
+        let mut lc = done_run(&store, "t-reland", "run-1");
+        append(
+            &store,
+            &mut lc,
+            t0() + Duration::minutes(6),
+            DomainEventPayload::LandingParked(LandingParked {
+                park_kind: "held-out-gate".into(),
+                detail: "gate blocked the land".into(),
+                ..LandingParked::default()
+            }),
+        );
+        append(
+            &store,
+            &mut lc,
+            t0() + Duration::minutes(7),
+            DomainEventPayload::Landed(Landed {
+                strategy: "merge".into(),
+                landed_ref: "def456".into(),
+                ..Landed::default()
+            }),
+        );
+        append(
+            &store,
+            &mut lc,
+            t0() + Duration::minutes(7) + Duration::seconds(1),
+            DomainEventPayload::LandingRedriven(LandingRedriven {
+                result: "landed".into(),
+                park_kind: "held-out-gate".into(),
+                initiator: "operator".into(),
+            }),
+        );
+        let tmp = TempDir::new().unwrap();
+        let (code, text) = show(&store, tmp.path(), "run-1", true, false);
+        assert_eq!(code, 0);
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        let last = &payload["decisions"][2];
+        assert_eq!(last["kind"], "landing_redriven");
+        assert_eq!(last["result"], "landed");
+        assert_eq!(last["initiator"], "operator");
+        let (_, text) = show(&store, tmp.path(), "run-1", false, false);
+        assert!(text.contains("  redriven  landed  (was held-out-gate)  by operator\n"));
     }
 
     fn git(repo: &Path, args: &[&str]) -> String {

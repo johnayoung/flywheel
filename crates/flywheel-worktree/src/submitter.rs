@@ -40,8 +40,8 @@ use flywheel_orchestrator::held_out_gate::{
 };
 use flywheel_orchestrator::sources::{LogSink, ROOT_PHASE, phase_of_task_file};
 use flywheel_orchestrator::strategy::{
-    LandabilityVerdict, PrepareError, SandboxHandle, SandboxRequest, SubmitOutcome, SubmitRequest,
-    SubmitStrategy,
+    CandidateTree, LandabilityVerdict, LandingCandidate, PrepareError, SandboxHandle,
+    SandboxRequest, SubmitOutcome, SubmitRequest, SubmitStrategy,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -2203,6 +2203,101 @@ impl GitWorktreeSubmitter {
     }
 }
 
+// --- re-land candidate ---------------------------------------------------------------
+
+impl GitWorktreeSubmitter {
+    /// The tree an operator re-land's held-out gate grades (spec 00086): the
+    /// task branch's current head rebased onto the current landing base,
+    /// checked out detached in a scratch worktree outside the repo. The task
+    /// branch, its worktree, and the base are never touched, so `submit`
+    /// still finds the branch behind the base and takes its own rebase +
+    /// re-verify path. When the rebase conflicts, the candidate is the base
+    /// merged into the head instead -- the tree the merge-fallback rung
+    /// would land. Dropping the returned tree removes the scratch worktree.
+    pub fn landing_candidate(&self, req: &SubmitRequest) -> Result<CandidateTree, String> {
+        let phase = self.phase_of(req.task_file.as_deref());
+        let branch = self.branch(&req.task_id, &phase);
+        let base = self.landing_base_for(&phase).map_err(|e| e.to_string())?;
+        if !self.branch_exists(&branch).map_err(|e| e.to_string())? {
+            return Err(format!("task branch {branch} does not exist"));
+        }
+        let scratch = std::env::temp_dir().join(format!(
+            "flywheel-candidate-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let scratch_arg = scratch.to_string_lossy().into_owned();
+        let added = git(
+            &self.repo_root,
+            &["worktree", "add", "--detach", &scratch_arg, &branch],
+        )
+        .map_err(|e| e.to_string())?;
+        if !added.ok() {
+            let _ = fs::remove_dir_all(&scratch);
+            return Err(format!(
+                "cannot check out {branch} into a scratch tree: {}",
+                added.stderr.trim()
+            ));
+        }
+        let repo_root = self.repo_root.clone();
+        let tree = CandidateTree::new(scratch.clone()).with_cleanup(move || {
+            let _ = git(&repo_root, &["worktree", "remove", "--force", &scratch_arg]);
+            let _ = fs::remove_dir_all(&scratch);
+            let _ = git(&repo_root, &["worktree", "prune"]);
+        });
+        if self
+            .is_ancestor(&base, &branch)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(tree);
+        }
+        let identity = [
+            "-c",
+            &format!("user.name={WORKTREE_COMMIT_IDENTITY_NAME}"),
+            "-c",
+            &format!("user.email={WORKTREE_COMMIT_IDENTITY_EMAIL}"),
+        ]
+        .map(str::to_owned);
+        let with_identity = |args: &[&str]| -> Vec<String> {
+            identity
+                .iter()
+                .cloned()
+                .chain(args.iter().map(|a| (*a).to_owned()))
+                .collect()
+        };
+        let run = |args: Vec<String>| {
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            git(tree.path(), &argv).map_err(|e| e.to_string())
+        };
+        if run(with_identity(&["rebase", &base]))?.ok() {
+            self.log(format!(
+                "re-land candidate: {branch} rebased onto {base} in {}",
+                tree.path().display()
+            ));
+            return Ok(tree);
+        }
+        run(vec!["rebase".into(), "--abort".into()])?;
+        let merged = run(with_identity(&["merge", "--no-ff", "--no-edit", &base]))?;
+        if merged.ok() {
+            self.log(format!(
+                "re-land candidate: {branch} conflicts rebasing onto {base}; grading {base} \
+                 merged into it in {}",
+                tree.path().display()
+            ));
+            return Ok(tree);
+        }
+        run(vec!["merge".into(), "--abort".into()])?;
+        Err(format!(
+            "{branch} conflicts with {base} both rebased and merged; no candidate tree to grade"
+        ))
+    }
+}
+
+impl LandingCandidate for GitWorktreeSubmitter {
+    fn candidate_tree(&self, request: &SubmitRequest) -> Result<CandidateTree, String> {
+        self.landing_candidate(request)
+    }
+}
+
 impl SubmitStrategy for GitWorktreeSubmitter {
     fn prepare_sandbox(&self, request: &SandboxRequest) -> Result<SandboxHandle, PrepareError> {
         Ok(SandboxHandle::new(self.prepare_worktree(request)?))
@@ -3278,6 +3373,82 @@ mod tests {
             parks[0].receipts[0]
                 .output_excerpt
                 .contains("STANDING_REBASE_NONCE_A17")
+        );
+    }
+
+    // --- re-land candidate ------------------------------------------------------------
+
+    fn worktree_listed(repo: &Path, path: &Path) -> bool {
+        git_ok(repo, &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|listed| Path::new(listed).ends_with(path.file_name().unwrap()))
+    }
+
+    #[test]
+    fn reland_candidate_is_the_branch_rebased_onto_the_base_and_leaves_submit_its_rebase() {
+        let (_dir, repo) = repo();
+        let store = ledger();
+        let s = submitter(&repo, Arc::clone(&store));
+        let (tf, wt) = prepared(&s, &repo, "01-phase", "t1", "test -f base.txt");
+        commit(&wt, "feature.txt", "work\n", "task work");
+        commit(&repo, "base.txt", "advanced\n", "base advances");
+        let branch = s.branch("t1", "01-phase");
+        let (head_before, base_before) = (rev(&repo, &branch), rev(&repo, "main"));
+        let req = submit_req(&tf, "t1", &wt, Status::Done, &["test -f base.txt"]);
+
+        let tree = s.landing_candidate(&req).unwrap();
+        let scratch = tree.path().to_path_buf();
+        assert!(scratch.join("feature.txt").is_file() && scratch.join("base.txt").is_file());
+        assert!(is_ancestor(
+            &repo,
+            &base_before,
+            &git_ok(&scratch, &["rev-parse", "HEAD"])
+        ));
+        // Nothing the landing reads moved: branch, sandbox, and base intact.
+        assert_eq!(rev(&repo, &branch), head_before);
+        assert_eq!(rev(&repo, "main"), base_before);
+        assert!(!wt.join("base.txt").exists());
+        assert!(!is_ancestor(&repo, &base_before, &branch));
+        assert!(worktree_listed(&repo, &scratch));
+        drop(tree);
+        assert!(!scratch.exists(), "the scratch tree is removed on drop");
+        assert!(!worktree_listed(&repo, &scratch));
+
+        // So submit still rebases and re-runs the task's command graders.
+        let outcome = s.submit(&req);
+        assert!(outcome.is_landed(), "{outcome:?}");
+        assert_eq!(landed(&store)[0].rung, RUNG_REBASE);
+    }
+
+    #[test]
+    fn reland_candidate_falls_back_to_the_merged_tree_when_the_rebase_conflicts() {
+        let (_dir, repo) = repo();
+        let s = submitter(&repo, ledger());
+        let (tf, wt) = prepared(&s, &repo, "01-phase", "t1", "true");
+        let head = merge_bearing_branch(&wt);
+        commit(&repo, "file.txt", "line1-main\n", "base advances");
+        let req = submit_req(&tf, "t1", &wt, Status::Done, &["true"]);
+        let tree = s.landing_candidate(&req).unwrap();
+        assert_eq!(
+            fs::read_to_string(tree.path().join("file.txt")).unwrap(),
+            "line1-main\n"
+        );
+        let merged = git_ok(tree.path(), &["rev-parse", "HEAD"]);
+        assert!(is_ancestor(&repo, &head, &merged) && is_ancestor(&repo, "main", &merged));
+        assert_eq!(rev(&repo, &s.branch("t1", "01-phase")), head);
+    }
+
+    #[test]
+    fn reland_candidate_refuses_a_missing_task_branch() {
+        let (_dir, repo) = repo();
+        let s = submitter(&repo, ledger());
+        let tf = task_file(&repo, "01-phase", "ghost", "true");
+        let req = submit_req(&tf, "ghost", &repo.join("nowhere"), Status::Done, &["true"]);
+        let err = s.landing_candidate(&req).unwrap_err();
+        assert!(
+            err.contains("flywheel/01-phase/ghost does not exist"),
+            "{err}"
         );
     }
 

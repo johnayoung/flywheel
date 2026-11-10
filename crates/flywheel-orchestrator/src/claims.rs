@@ -144,11 +144,16 @@ pub const STOP_INDETERMINATE_LANDING: &str = "indeterminate-landing";
 pub const RESOLUTION_ATTRIBUTION_PROBE: &str = "probe";
 /// A `stop-resolved` marker cleared by a deliberate operator decision.
 pub const RESOLUTION_ATTRIBUTION_OPERATOR: &str = "operator";
+/// A `stop-resolved` marker an operator-initiated re-land appended after it
+/// actually landed the task's parked run (spec 00086, D-3): distinct from
+/// `operator`, which abandons the strand without landing.
+pub const RESOLUTION_ATTRIBUTION_RELAND: &str = "reland";
 
 /// The resolution-marker attribution vocabulary.
-pub const RESOLUTION_ATTRIBUTIONS: [&str; 2] = [
+pub const RESOLUTION_ATTRIBUTIONS: [&str; 3] = [
     RESOLUTION_ATTRIBUTION_PROBE,
     RESOLUTION_ATTRIBUTION_OPERATOR,
+    RESOLUTION_ATTRIBUTION_RELAND,
 ];
 
 // --- Human-review queue vocabulary ---------------------------------------------------

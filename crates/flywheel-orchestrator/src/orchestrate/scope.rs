@@ -20,8 +20,8 @@
 
 use super::prereqs::reachability_held_prerequisites;
 use crate::claims::{
-    ClaimStore, ClaimStoreError, RESOLUTION_ATTRIBUTION_PROBE, RESOLUTION_ATTRIBUTIONS,
-    STOP_PREPARE_SKIP, STOP_RESOLVED,
+    ClaimStore, ClaimStoreError, RESOLUTION_ATTRIBUTION_PROBE, RESOLUTION_ATTRIBUTION_RELAND,
+    RESOLUTION_ATTRIBUTIONS, STOP_PREPARE_SKIP, STOP_RESOLVED,
 };
 use crate::rollup::{TaskState, TaskStatusRow, status_rows_for_items, task_state};
 use crate::sources::{WorkItem, WorkSource, WorkSourceError};
@@ -557,7 +557,8 @@ fn one_line(text: &str) -> String {
 
 /// The latest attributed `stop-resolved` marker for `task_id`: its instant
 /// and attribution (`probe` = the archive probe confirmed it landed;
-/// `operator` = `fw resolve` abandoned the strand).
+/// `operator` = `fw resolve` abandoned the strand; `reland` = an operator
+/// re-land merged it).
 fn latest_resolution(
     claims: Option<&dyn ClaimStore>,
     task_id: &str,
@@ -574,6 +575,13 @@ fn latest_resolution(
         })
         .map(|event| (event.occurred_at, event.attribution))
         .next_back())
+}
+
+/// True when a resolution marker's attribution records that the work landed
+/// (the archive probe confirmed it, or an operator re-land merged it) rather
+/// than an operator abandoning the strand.
+fn landed_resolution(attribution: &str) -> bool {
+    attribution == RESOLUTION_ATTRIBUTION_PROBE || attribution == RESOLUTION_ATTRIBUTION_RELAND
 }
 
 /// The landing verdict of a DONE task's latest DONE run: parked when its
@@ -607,7 +615,7 @@ fn landing_park(
     if let Some((resolved_at, attribution)) = latest_resolution(claims, task_id)?
         && park.ts <= resolved_at
     {
-        return Ok(if attribution == RESOLUTION_ATTRIBUTION_PROBE {
+        return Ok(if landed_resolution(&attribution) {
             None
         } else {
             Some("landing parked, then resolved by the operator without landing".to_owned())

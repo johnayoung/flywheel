@@ -456,6 +456,64 @@ pub trait SubmitStrategy: Send + Sync {
     }
 }
 
+// --- Landing candidate -----------------------------------------------------------
+
+/// A scratch tree holding exactly the content a landing would produce, for a
+/// held-out gate to grade before `submit` runs. Its cleanup (removing a
+/// scratch worktree, say) runs when it drops, containing a panic.
+pub struct CandidateTree {
+    path: PathBuf,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl CandidateTree {
+    /// A tree at `path` with nothing to dispose.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            cleanup: None,
+        }
+    }
+
+    /// Run `cleanup` when the tree drops.
+    pub fn with_cleanup(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
+        self.cleanup = Some(Box::new(cleanup));
+        self
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl fmt::Debug for CandidateTree {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CandidateTree")
+            .field("path", &self.path)
+            .field("cleanup", &self.cleanup.is_some())
+            .finish()
+    }
+}
+
+impl Drop for CandidateTree {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            let _ = catch_unwind(AssertUnwindSafe(cleanup));
+        }
+    }
+}
+
+/// Builds the candidate tree an operator re-land's held-out gate grades: the
+/// run's task branch head rebased onto the current landing base, in a
+/// scratch location that leaves the run's sandbox untouched -- so `submit`
+/// still takes its own rebase path and re-runs the task's command graders
+/// on the rebased tree (spec 00086). Called under the task's claim. An
+/// `Err` (the scratch tree cannot be built) aborts the attempt before any
+/// gate runs or anything is recorded.
+pub trait LandingCandidate: Send + Sync {
+    fn candidate_tree(&self, request: &SubmitRequest) -> Result<CandidateTree, String>;
+}
+
 /// The standalone provisioning hook, for consumers wiring callables rather
 /// than a bundled strategy.
 pub type SandboxProvider =

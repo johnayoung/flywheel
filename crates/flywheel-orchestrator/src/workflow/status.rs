@@ -475,8 +475,8 @@ mod tests {
     use super::*;
     use crate::claims::{
         InMemoryClaimStore, RESOLUTION_ATTRIBUTION_OPERATOR, RESOLUTION_ATTRIBUTION_PROBE,
-        STOP_DANGLING_PREREQUISITE, STOP_NO_OP_CYCLE, STOP_PREPARE_SKIP, STOP_SOURCE_TRUNCATION,
-        STOP_ZERO_GRADER_DROP,
+        RESOLUTION_ATTRIBUTION_RELAND, STOP_DANGLING_PREREQUISITE, STOP_NO_OP_CYCLE,
+        STOP_PREPARE_SKIP, STOP_SOURCE_TRUNCATION, STOP_ZERO_GRADER_DROP,
     };
     use crate::sources::{DirectoryWorkSource, WorkSource};
     use chrono::Duration;
@@ -1188,6 +1188,65 @@ mod tests {
         assert!(
             run_status(&tmp, &store, &claims, false, false).contains("stranded: standing-verify")
         );
+    }
+
+    #[test]
+    fn reland_resolution_clears_the_routed_stop_and_the_strand_like_the_others() {
+        let tmp = TempDir::new().unwrap();
+        write_task(&tmp.path().join("active/01/a.json"), "a", &[]);
+        let store = InMemoryStore::new();
+        let lc = walk(
+            "a",
+            "run-a",
+            &[
+                Status::Ready,
+                Status::Running,
+                Status::Validating,
+                Status::Done,
+            ],
+            "",
+        );
+        store.create_lifecycle(&lc).unwrap();
+        park(
+            &store,
+            "run-a",
+            PARK_KIND_STANDING_VERIFY,
+            "verify failed",
+            t0(),
+        );
+        let claims = InMemoryClaimStore::new();
+        claims
+            .record_human_review(
+                PARK_KIND_STANDING_VERIFY,
+                "a",
+                t0(),
+                "run-a",
+                "landing re-drive exhausted",
+            )
+            .unwrap();
+        // A re-land that parks appends no resolution: stop and strand stay.
+        park(
+            &store,
+            "run-a",
+            PARK_KIND_STANDING_VERIFY,
+            "re-land parked",
+            t0() + Duration::minutes(1),
+        );
+        let entry = &status_json(&tmp, &store, &claims)[0];
+        assert_eq!(entry["stopped"]["kind"], json!(PARK_KIND_STANDING_VERIFY));
+        assert_eq!(entry["stranded"]["detail"], json!("re-land parked"));
+        // A landed re-land's `reland` resolution clears both.
+        resolution(
+            &claims,
+            "a",
+            RESOLUTION_ATTRIBUTION_RELAND,
+            t0() + Duration::minutes(2),
+        );
+        let entry = &status_json(&tmp, &store, &claims)[0];
+        assert!(entry.get("stopped").is_none(), "{entry}");
+        assert!(entry.get("stranded").is_none(), "{entry}");
+        let text = run_status(&tmp, &store, &claims, false, false);
+        assert!(!text.contains("stopped:") && !text.contains("stranded:"));
     }
 
     #[test]

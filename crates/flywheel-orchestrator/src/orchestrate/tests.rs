@@ -5,11 +5,15 @@
 use super::*;
 use crate::claims::{
     EVENT_ACQUIRED, EVENT_RELEASED, EVENT_RENEWED, InMemoryClaimStore,
-    RESOLUTION_ATTRIBUTION_OPERATOR, STOP_PREPARE_SKIP, STOP_RESOLVED, SqliteClaimStore,
+    RESOLUTION_ATTRIBUTION_OPERATOR, RESOLUTION_ATTRIBUTION_RELAND, STOP_PREPARE_SKIP,
+    STOP_RESOLVED, SqliteClaimStore,
 };
 use crate::held_out_gate::FilesystemHeldOutGraderSource;
 use crate::sources::{WorkReport, WorkSourceError};
-use crate::strategy::{LandabilityVerdict, PrepareError, SandboxMode, SubmitOutcome, Teardown};
+use crate::strategy::{
+    CandidateTree, LandabilityVerdict, LandingCandidate, PrepareError, SandboxMode, SubmitOutcome,
+    Teardown,
+};
 use crate::work_graph::GraphValidationIssue;
 use chrono::TimeZone;
 use flywheel_core::envelope::BlockedRequirement;
@@ -2360,6 +2364,647 @@ async fn landing_redrive_never_lands_a_strand_the_operator_resolved_after_its_pa
     assert_eq!(redriven_results(&f, &run_id), ["landed"]);
 }
 
+// --- operator re-land ---------------------------------------------------------------
+
+/// Stands in for the git candidate builder: each build is a fresh scratch
+/// directory (holding `marker` when set, the stand-in for content only the
+/// rebased tree carries), removed again when the tree drops.
+#[derive(Default)]
+struct ScratchCandidate {
+    root: PathBuf,
+    marker: Option<&'static str>,
+    fail: Option<&'static str>,
+    builds: Mutex<Vec<PathBuf>>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl ScratchCandidate {
+    fn new(f: &Fixture, marker: Option<&'static str>) -> Self {
+        Self {
+            root: f.dir.path().join("candidates"),
+            marker,
+            ..Self::default()
+        }
+    }
+
+    fn builds(&self) -> Vec<PathBuf> {
+        self.builds.lock().unwrap().clone()
+    }
+}
+
+impl LandingCandidate for ScratchCandidate {
+    fn candidate_tree(&self, request: &SubmitRequest) -> Result<CandidateTree, String> {
+        if let Some(reason) = self.fail {
+            return Err(reason.to_owned());
+        }
+        let mut builds = self.builds.lock().unwrap();
+        let dir = self
+            .root
+            .join(format!("{}-{}", request.task_id, builds.len()));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(marker) = self.marker {
+            std::fs::write(dir.join(marker), "rebased").unwrap();
+        }
+        builds.push(dir.clone());
+        let dropped = self.dropped.clone();
+        Ok(CandidateTree::new(dir.clone()).with_cleanup(move || {
+            let _ = std::fs::remove_dir_all(&dir);
+            dropped.fetch_add(1, Ordering::SeqCst);
+        }))
+    }
+}
+
+/// A workspace seam that records its calls (and who held the claim during
+/// `materialize`), optionally refusing the preflight.
+#[derive(Default)]
+struct RecordingWorkspace {
+    claims: Option<Arc<dyn ClaimStore>>,
+    refuse: Option<&'static str>,
+    calls: Mutex<Vec<(String, Option<String>)>>,
+}
+
+impl RelandWorkspace for RecordingWorkspace {
+    fn preflight(&self, request: &SubmitRequest) -> Result<(), String> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("preflight".to_owned(), None));
+        match self.refuse {
+            Some(reason) => Err(format!("{reason} for {}", request.task_id)),
+            None => Ok(()),
+        }
+    }
+
+    fn materialize(&self, request: &SubmitRequest) -> Result<(), String> {
+        let holder = self.claims.as_ref().and_then(|claims| {
+            claims
+                .load_claim(&request.task_id)
+                .unwrap()
+                .map(|c| c.worker_id)
+        });
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("materialize".to_owned(), holder));
+        Ok(())
+    }
+}
+
+/// Register a held-out oracle for `parked` that passes only when `marker`
+/// exists in the tree it grades.
+fn reland_oracle(f: &Fixture, marker: &str) -> FilesystemHeldOutGraderSource {
+    let root = f.dir.path().join("held-out");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("parked.json"),
+        format!(r#"{{"graders":[{{"type":"command","run":"test -f {marker}","name":"oracle"}}]}}"#),
+    )
+    .unwrap();
+    FilesystemHeldOutGraderSource::new(root)
+}
+
+/// Run one operator re-land of `parked` on the wall clock (so its records
+/// postdate the scripted parks) as `operator-1`.
+async fn reland_directly(
+    f: &Fixture,
+    strategy: &ScriptedStrategy,
+    candidate: &dyn LandingCandidate,
+    workspace: Option<&dyn RelandWorkspace>,
+    held_out: Option<&dyn HeldOutGraderSource>,
+) -> RelandOutcome {
+    let control: Arc<dyn HarnessStore> = f.control.clone();
+    let claims: Arc<dyn ClaimStore> = f.claims.clone();
+    let clock: Clock = Arc::new(Utc::now);
+    let gate_options = GateOptions::default();
+    let sink = f.log.sink();
+    let ctx = RelandContext {
+        control: &control,
+        claims: &claims,
+        strategy,
+        candidate,
+        workspace,
+        worker_id: "operator-1",
+        held_out_source: held_out,
+        gate_options: &gate_options,
+        lease_seconds: 60.0,
+        heartbeat_interval: 20.0,
+        steal_grace_seconds: 0.0,
+        now: &clock,
+        log: Some(&sink),
+    };
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        reland(&ctx, &item("parked"), f.sandbox_root().join("parked")),
+    )
+    .await
+    .expect("a re-land makes one bounded attempt")
+    .unwrap()
+}
+
+fn decision_kinds(f: &Fixture, run_id: &str) -> Vec<&'static str> {
+    f.control
+        .list_domain_events(run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.payload,
+                DomainEventPayload::HeldOutGateEvaluated(_)
+                    | DomainEventPayload::LandingParked(_)
+                    | DomainEventPayload::Landed(_)
+                    | DomainEventPayload::LandingRedriven(_)
+            )
+        })
+        .map(|e| e.payload.kind().as_str())
+        .collect()
+}
+
+fn redriven_records(f: &Fixture, run_id: &str) -> Vec<(String, String, String)> {
+    f.control
+        .list_domain_events(run_id)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            DomainEventPayload::LandingRedriven(r) => Some((r.result, r.park_kind, r.initiator)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reland_resolutions(f: &Fixture) -> usize {
+    f.claims
+        .list_subject_stop_events("parked")
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == STOP_RESOLVED && e.attribution == RESOLUTION_ATTRIBUTION_RELAND)
+        .count()
+}
+
+/// Every row a refused re-land must leave untouched.
+fn reland_ledger_snapshot(f: &Fixture, run_id: &str, strategy: &ScriptedStrategy) -> [usize; 5] {
+    [
+        f.control.list_domain_events(run_id).unwrap().len(),
+        f.claims.list_stop_events().unwrap().len(),
+        f.claims.list_events().unwrap().len(),
+        f.claims.list_claims().unwrap().len(),
+        strategy.submits().len(),
+    ]
+}
+
+/// Park `parked` and route it to the human-review queue, as the bounded
+/// re-driver leaves a run it gave up on.
+async fn routed_parked_run(f: &Fixture, strategy: &Arc<ScriptedStrategy>, kind: &str) -> String {
+    let run_id = parked_run(f, strategy).await;
+    f.claims
+        .record_human_review(kind, "parked", t0(), &run_id, "landing re-drive exhausted")
+        .unwrap();
+    run_id
+}
+
+#[tokio::test]
+async fn reland_lands_after_the_gate_grades_the_candidate_tree_and_resolves_with_reland() {
+    let f = Fixture::new();
+    // The first land parks; the re-land's submit lands.
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_HELD_OUT_GATE), None]);
+    let run_id = routed_parked_run(&f, &strategy, PARK_KIND_HELD_OUT_GATE).await;
+    // The oracle passes only on the candidate (rebased) tree: the run's own
+    // sandbox lacks the marker.
+    let source = reland_oracle(&f, "REBASED_MARKER");
+    let candidate = ScratchCandidate::new(&f, Some("REBASED_MARKER"));
+    let workspace = RecordingWorkspace {
+        claims: Some(f.claims.clone()),
+        ..RecordingWorkspace::default()
+    };
+
+    let outcome = reland_directly(&f, &strategy, &candidate, Some(&workspace), Some(&source)).await;
+    assert_eq!(
+        outcome,
+        RelandOutcome::Landed {
+            run_id: run_id.clone(),
+            strategy: "scripted".into(),
+            landed_ref: "abc123".into(),
+        }
+    );
+    // Exactly one gate on the candidate tree, then one submit from the
+    // run's sandbox (so submit's own rebase path still runs) under the
+    // operator's claim.
+    assert_eq!(candidate.builds().len(), 1);
+    assert_eq!(
+        candidate.dropped.load(Ordering::SeqCst),
+        1,
+        "scratch tree removed"
+    );
+    assert!(!candidate.builds()[0].exists());
+    let submits = strategy.submits();
+    assert_eq!(submits.len(), 2);
+    assert_eq!(submits[1].claim_held_by.as_deref(), Some("operator-1"));
+    assert_eq!(submits[1].sandbox, f.sandbox_root().join("parked"));
+    assert_eq!(
+        *workspace.calls.lock().unwrap(),
+        [
+            ("preflight".to_owned(), None),
+            ("materialize".to_owned(), Some("operator-1".to_owned()))
+        ],
+        "materialize runs under the operator's claim"
+    );
+    let events = f.control.list_domain_events(&run_id).unwrap();
+    let gate = events
+        .iter()
+        .find_map(|e| match &e.payload {
+            DomainEventPayload::HeldOutGateEvaluated(g) => Some(g.clone()),
+            _ => None,
+        })
+        .expect("the fresh gate recorded its verdict");
+    assert_eq!(gate.outcome, "pass");
+    assert_eq!(
+        decision_kinds(&f, &run_id),
+        [
+            "landing_parked",
+            "held_out_gate_evaluated",
+            "landed",
+            "landing_redriven"
+        ]
+    );
+    assert_eq!(
+        redriven_records(&f, &run_id),
+        [(
+            "landed".to_owned(),
+            PARK_KIND_HELD_OUT_GATE.to_owned(),
+            "operator".to_owned()
+        )]
+    );
+    assert_eq!(reland_resolutions(&f), 1);
+    let last_stop = f
+        .claims
+        .list_subject_stop_events("parked")
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(last_stop.kind, STOP_RESOLVED);
+    assert_eq!(last_stop.attribution, RESOLUTION_ATTRIBUTION_RELAND);
+    assert!(f.claims.list_claims().unwrap().is_empty(), "claim released");
+    // The routed entry stays a queue record; the re-driver's bound is never
+    // re-armed and it makes no further attempt for the landed run.
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 3).await;
+    assert_eq!(outcomes[0].result, RedriveResult::Queued);
+    assert_eq!(outcomes[0].attempts, 0);
+    assert_eq!(strategy.submits().len(), 2);
+    assert_eq!(redriven_records(&f, &run_id).len(), 1);
+}
+
+#[tokio::test]
+async fn reland_landed_run_gets_no_further_attempt_from_later_worker_passes() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE), None]);
+    // Parked once, never routed: the re-driver would still re-drive it.
+    let run_id = parked_run(&f, &strategy).await;
+    let candidate = ScratchCandidate::new(&f, None);
+    let outcome = reland_directly(&f, &strategy, &candidate, None, None).await;
+    assert!(outcome.is_landed());
+    // No held-out source: the gate never grades a tree, so none is built.
+    assert!(candidate.builds().is_empty());
+    let before = decision_kinds(&f, &run_id);
+    assert_eq!(before.last(), Some(&"landing_redriven"));
+
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 3).await;
+    assert_eq!(outcomes[0].result, RedriveResult::Skipped);
+    assert_eq!(outcomes[0].attempts, 0);
+    let mut req = f.request(MemorySource::new(vec![item("parked")]));
+    req.strategy = Some(strategy.clone());
+    req.landing_redrive_bound = Some(3);
+    for _ in 0..3 {
+        run(req.clone()).await;
+    }
+    assert_eq!(
+        strategy.submits().len(),
+        2,
+        "no landing attempt after the re-land"
+    );
+    assert_eq!(decision_kinds(&f, &run_id), before);
+    assert_eq!(reland_resolutions(&f), 1);
+}
+
+#[tokio::test]
+async fn reland_gate_failure_reparks_held_out_gate_and_never_resolves() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_HELD_OUT_GATE), None]);
+    let run_id = routed_parked_run(&f, &strategy, PARK_KIND_HELD_OUT_GATE).await;
+    let source = reland_oracle(&f, "REBASED_MARKER");
+    // The candidate lacks what the oracle requires: the gate fails.
+    let candidate = ScratchCandidate::new(&f, None);
+    let stops_before = f.claims.list_stop_events().unwrap().len();
+
+    let outcome = reland_directly(&f, &strategy, &candidate, None, Some(&source)).await;
+    let RelandOutcome::Reparked {
+        run_id: reparked_run,
+        park_kind,
+        detail,
+    } = outcome
+    else {
+        panic!("expected a re-park, got {outcome:?}");
+    };
+    assert_eq!(reparked_run, run_id);
+    assert_eq!(park_kind, PARK_KIND_HELD_OUT_GATE);
+    assert!(detail.contains("held-out gate FAILED"));
+    assert_eq!(
+        strategy.submits().len(),
+        1,
+        "a blocked gate never reaches submit"
+    );
+    assert_eq!(
+        decision_kinds(&f, &run_id),
+        [
+            "landing_parked",
+            "held_out_gate_evaluated",
+            "landing_parked",
+            "landing_redriven"
+        ]
+    );
+    assert_eq!(
+        redriven_records(&f, &run_id),
+        [(
+            "re-parked".to_owned(),
+            PARK_KIND_HELD_OUT_GATE.to_owned(),
+            "operator".to_owned()
+        )]
+    );
+    assert_eq!(f.claims.list_stop_events().unwrap().len(), stops_before);
+    assert_eq!(reland_resolutions(&f), 0);
+    assert!(f.claims.list_claims().unwrap().is_empty());
+    // Still routed: the re-driver stays disarmed.
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 3).await;
+    assert_eq!(outcomes[0].result, RedriveResult::Queued);
+    assert_eq!(strategy.submits().len(), 1);
+}
+
+#[tokio::test]
+async fn reland_records_each_submit_gates_park_kind_and_never_resolves() {
+    for kind in [
+        PARK_KIND_DIVERGENT_BASE,
+        flywheel_core::events::PARK_KIND_STANDING_VERIFY,
+        flywheel_core::events::PARK_KIND_PROTECTED_PATHS,
+    ] {
+        let f = Fixture::new();
+        let strategy = f
+            .strategy()
+            .park_sequence("parked", vec![Some(PARK_KIND_HELD_OUT_GATE), Some(kind)]);
+        let run_id = routed_parked_run(&f, &strategy, PARK_KIND_HELD_OUT_GATE).await;
+        let source = reland_oracle(&f, "REBASED_MARKER");
+        let candidate = ScratchCandidate::new(&f, Some("REBASED_MARKER"));
+
+        let outcome = reland_directly(&f, &strategy, &candidate, None, Some(&source)).await;
+        match &outcome {
+            RelandOutcome::Reparked { park_kind, .. } => assert_eq!(park_kind, kind),
+            other => panic!("{kind}: expected a re-park, got {other:?}"),
+        }
+        assert_eq!(
+            strategy.submits().len(),
+            2,
+            "{kind}: the gate passed into submit"
+        );
+        assert_eq!(
+            decision_kinds(&f, &run_id),
+            [
+                "landing_parked",
+                "held_out_gate_evaluated",
+                "landing_parked",
+                "landing_redriven"
+            ],
+            "{kind}"
+        );
+        assert_eq!(
+            redriven_records(&f, &run_id),
+            [(
+                "re-parked".to_owned(),
+                kind.to_owned(),
+                "operator".to_owned()
+            )]
+        );
+        assert_eq!(reland_resolutions(&f), 0, "{kind}");
+        assert!(
+            f.claims
+                .list_subject_stop_events("parked")
+                .unwrap()
+                .iter()
+                .all(|e| e.kind != STOP_RESOLVED),
+            "{kind}: no stop-resolved of any attribution"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reland_automatic_redrives_carry_no_initiator_and_the_operator_attempt_does() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE)]);
+    let run_id = parked_run(&f, &strategy).await;
+    let outcomes = redrive_directly(&f, &strategy, "parked", &run_id, 2).await;
+    assert_eq!(outcomes[0].result, RedriveResult::Queued);
+    let candidate = ScratchCandidate::new(&f, None);
+    let outcome = reland_directly(&f, &strategy, &candidate, None, None).await;
+    assert!(matches!(outcome, RelandOutcome::Reparked { .. }));
+    let initiators: Vec<(String, String)> = redriven_records(&f, &run_id)
+        .into_iter()
+        .map(|(result, _, initiator)| (result, initiator))
+        .collect();
+    assert_eq!(
+        initiators,
+        [
+            ("re-parked".to_owned(), String::new()),
+            ("re-parked".to_owned(), String::new()),
+            ("routed".to_owned(), String::new()),
+            ("re-parked".to_owned(), "operator".to_owned()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn reland_refuses_without_recording_or_claiming_when_nothing_is_relandable() {
+    // No DONE run at all.
+    let f = Fixture::new();
+    let strategy = f.strategy();
+    f.seed("parked", "run-failed", Status::Failed, "boom");
+    let before = reland_ledger_snapshot(&f, "run-failed", &strategy);
+    let candidate = ScratchCandidate::new(&f, None);
+    let outcome = reland_directly(&f, &strategy, &candidate, None, None).await;
+    assert_eq!(
+        outcome,
+        RelandOutcome::Refused(RelandRefusal::NoDoneRun {
+            task_id: "parked".into()
+        })
+    );
+    assert_eq!(reland_ledger_snapshot(&f, "run-failed", &strategy), before);
+
+    // A DONE run that never parked.
+    let f = Fixture::new();
+    let strategy = f.strategy();
+    f.seed("parked", "run-clean", Status::Done, "");
+    let before = reland_ledger_snapshot(&f, "run-clean", &strategy);
+    let outcome = reland_directly(&f, &strategy, &candidate, None, None).await;
+    assert_eq!(
+        outcome,
+        RelandOutcome::Refused(RelandRefusal::NeverParked {
+            run_id: "run-clean".into()
+        })
+    );
+    assert_eq!(reland_ledger_snapshot(&f, "run-clean", &strategy), before);
+
+    // Already landed after its latest park.
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE), None]);
+    let run_id = parked_run(&f, &strategy).await;
+    std::thread::sleep(Duration::from_millis(5));
+    strategy.append(
+        &run_id,
+        DomainEventPayload::Landed(Landed {
+            strategy: "merge".into(),
+            landed_ref: "def456".into(),
+            ..Landed::default()
+        }),
+    );
+    let before = reland_ledger_snapshot(&f, &run_id, &strategy);
+    let outcome = reland_directly(&f, &strategy, &candidate, None, None).await;
+    assert_eq!(
+        outcome,
+        RelandOutcome::Refused(RelandRefusal::AlreadyLanded {
+            run_id: run_id.clone()
+        })
+    );
+    assert_eq!(reland_ledger_snapshot(&f, &run_id, &strategy), before);
+
+    // Resolved (abandoned) after its latest park.
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE), None]);
+    let run_id = parked_run(&f, &strategy).await;
+    f.claims
+        .record_stop_event(
+            STOP_RESOLVED,
+            "parked",
+            "operator abandoned the strand",
+            Utc::now(),
+            RESOLUTION_ATTRIBUTION_OPERATOR,
+        )
+        .unwrap();
+    let before = reland_ledger_snapshot(&f, &run_id, &strategy);
+    let outcome = reland_directly(&f, &strategy, &candidate, None, None).await;
+    assert_eq!(
+        outcome,
+        RelandOutcome::Refused(RelandRefusal::ResolvedSinceLatestPark {
+            run_id: run_id.clone()
+        })
+    );
+    assert_eq!(reland_ledger_snapshot(&f, &run_id, &strategy), before);
+
+    // The workspace preflight refuses (the CLI's missing-branch check).
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE), None]);
+    let run_id = parked_run(&f, &strategy).await;
+    let workspace = RecordingWorkspace {
+        refuse: Some("task branch is gone"),
+        ..RecordingWorkspace::default()
+    };
+    let before = reland_ledger_snapshot(&f, &run_id, &strategy);
+    let outcome = reland_directly(&f, &strategy, &candidate, Some(&workspace), None).await;
+    assert_eq!(
+        outcome,
+        RelandOutcome::Refused(RelandRefusal::Workspace {
+            run_id: run_id.clone(),
+            reason: "task branch is gone for parked".into()
+        })
+    );
+    assert_eq!(reland_ledger_snapshot(&f, &run_id, &strategy), before);
+    assert_eq!(
+        workspace.calls.lock().unwrap().len(),
+        1,
+        "never materialized"
+    );
+    assert!(candidate.builds().is_empty());
+}
+
+#[tokio::test]
+async fn reland_refuses_naming_the_holder_while_another_worker_holds_the_claim() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_DIVERGENT_BASE), None]);
+    let run_id = routed_parked_run(&f, &strategy, PARK_KIND_DIVERGENT_BASE).await;
+    f.claims
+        .acquire_claim(
+            "parked",
+            "worker-busy-7",
+            Utc::now(),
+            600.0,
+            &BTreeSet::new(),
+        )
+        .unwrap()
+        .expect("the peer takes the free claim");
+    let before = reland_ledger_snapshot(&f, &run_id, &strategy);
+    let candidate = ScratchCandidate::new(&f, None);
+    let outcome = reland_directly(&f, &strategy, &candidate, None, None).await;
+    assert_eq!(
+        outcome,
+        RelandOutcome::Refused(RelandRefusal::ClaimHeld {
+            run_id: run_id.clone(),
+            holder: "worker-busy-7".into()
+        })
+    );
+    let RelandOutcome::Refused(refusal) = &outcome else {
+        unreachable!()
+    };
+    assert!(refusal.to_string().contains("worker-busy-7"));
+    assert_eq!(reland_ledger_snapshot(&f, &run_id, &strategy), before);
+    assert_eq!(
+        f.claims.load_claim("parked").unwrap().map(|c| c.worker_id),
+        Some("worker-busy-7".to_owned()),
+        "the peer's claim is left untouched"
+    );
+}
+
+#[tokio::test]
+async fn reland_candidate_failure_aborts_before_the_gate_with_nothing_recorded() {
+    let f = Fixture::new();
+    let strategy = f
+        .strategy()
+        .park_sequence("parked", vec![Some(PARK_KIND_HELD_OUT_GATE), None]);
+    let run_id = routed_parked_run(&f, &strategy, PARK_KIND_HELD_OUT_GATE).await;
+    let source = reland_oracle(&f, "REBASED_MARKER");
+    let candidate = ScratchCandidate {
+        fail: Some("rebase onto main conflicted"),
+        ..ScratchCandidate::new(&f, None)
+    };
+    let events_before = f.control.list_domain_events(&run_id).unwrap().len();
+    let stops_before = f.claims.list_stop_events().unwrap().len();
+    let outcome = reland_directly(&f, &strategy, &candidate, None, Some(&source)).await;
+    assert_eq!(
+        outcome,
+        RelandOutcome::Refused(RelandRefusal::Workspace {
+            run_id: run_id.clone(),
+            reason: "rebase onto main conflicted".into()
+        })
+    );
+    assert_eq!(
+        f.control.list_domain_events(&run_id).unwrap().len(),
+        events_before,
+        "no gate verdict, park, or redrive record"
+    );
+    assert_eq!(f.claims.list_stop_events().unwrap().len(), stops_before);
+    assert_eq!(strategy.submits().len(), 1);
+    assert!(f.claims.list_claims().unwrap().is_empty(), "claim released");
+}
+
 // --- session pause ------------------------------------------------------------------
 
 #[tokio::test]
@@ -4214,6 +4859,58 @@ async fn an_attributed_resolution_clears_a_landing_park_the_way_status_does() {
     )
     .unwrap();
     assert_eq!(blind.outcomes[0].1.label(), "parked");
+}
+
+#[tokio::test]
+async fn reland_resolution_reads_as_landed_in_scope_not_abandoned() {
+    let f = Fixture::new();
+    let lc = f.seed("relanded", "run-relanded", Status::Done, "");
+    f.control
+        .append_domain_event(
+            &DomainEvent::new(
+                "run-relanded",
+                t0(),
+                DomainEventPayload::LandingParked(LandingParked {
+                    park_kind: PARK_KIND_HELD_OUT_GATE.into(),
+                    detail: "oracle failed".into(),
+                    ..LandingParked::default()
+                }),
+            ),
+            lc.version,
+        )
+        .unwrap();
+    // A re-land writes its resolution only after landing; even read alone
+    // (no `Landed` witness in view) it means landed, never abandoned.
+    f.claims
+        .record_stop_event(
+            STOP_RESOLVED,
+            "relanded",
+            "operator re-land landed",
+            t0() + ChronoDuration::seconds(5),
+            RESOLUTION_ATTRIBUTION_RELAND,
+        )
+        .unwrap();
+    let source = MemorySource::new(vec![item("relanded")]);
+    let plan = ScopePlan {
+        named: vec!["relanded".to_owned()],
+        added: Vec::new(),
+    };
+    let env = ScopeEnv {
+        claims: Some(f.claims.as_ref()),
+        ..ScopeEnv::default()
+    };
+    let verdict = evaluate_scope(
+        source.as_ref(),
+        f.control.as_ref(),
+        &plan,
+        &plan.scope(t0()),
+        &env,
+    )
+    .unwrap();
+    assert_eq!(
+        verdict.summary(),
+        "scope: 1/1 verified -- relanded verified"
+    );
 }
 
 #[tokio::test]

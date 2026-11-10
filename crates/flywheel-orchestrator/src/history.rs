@@ -968,7 +968,8 @@ pub fn check_to_json(check: &CheckResult) -> Value {
 /// discriminator, the ledger coordinates, and the event-specific payload
 /// flattened beside them (the gate `outcome`/`receipts`, a park's
 /// `park_kind`/`detail`, a landing's `strategy`/`landed_ref`, a redrive's
-/// `result`). Rendered verbatim from the store.
+/// `result`, and an operator re-land's `initiator`). Rendered verbatim from
+/// the store.
 pub fn decision_to_json(event: &DomainEvent) -> Value {
     let mut map = Map::new();
     map.insert(
@@ -1026,6 +1027,9 @@ fn format_decision_lines(event: &DomainEvent) -> Vec<String> {
             let mut line = format!("  redriven  {}", redriven.result);
             if !redriven.park_kind.is_empty() {
                 line.push_str(&format!("  (was {})", redriven.park_kind));
+            }
+            if !redriven.initiator.is_empty() {
+                line.push_str(&format!("  by {}", redriven.initiator));
             }
             vec![line]
         }
@@ -1634,6 +1638,7 @@ mod tests {
             DomainEventPayload::LandingRedriven(LandingRedriven {
                 result: "landed".to_owned(),
                 park_kind: "divergent-base".to_owned(),
+                ..LandingRedriven::default()
             }),
             DomainEventPayload::Landed(Landed {
                 strategy: "merge".to_owned(),
@@ -2602,6 +2607,41 @@ attempts :
         assert_eq!(short("\u{e9}\u{e9}\u{e9}", 2), "\u{e9}\u{2026}");
         assert_eq!(short("xyz", 1), "x\u{2026}");
         assert_eq!(short("xyz", 0), "x\u{2026}");
+    }
+
+    #[test]
+    fn reland_decision_renders_its_operator_initiator_and_automatic_ones_do_not() {
+        let reland = DomainEvent::new(
+            "run-r",
+            t0(),
+            DomainEventPayload::LandingRedriven(LandingRedriven {
+                result: "landed".to_owned(),
+                park_kind: "held-out-gate".to_owned(),
+                initiator: "operator".to_owned(),
+            }),
+        );
+        assert_eq!(
+            format_decision_lines(&reland),
+            ["  redriven  landed  (was held-out-gate)  by operator"]
+        );
+        let json = decision_to_json(&reland);
+        assert_eq!(json["initiator"], "operator");
+        assert_eq!(json["result"], "landed");
+
+        let automatic = DomainEvent::new(
+            "run-r",
+            t0(),
+            DomainEventPayload::LandingRedriven(LandingRedriven {
+                result: "re-parked".to_owned(),
+                park_kind: "held-out-gate".to_owned(),
+                ..LandingRedriven::default()
+            }),
+        );
+        assert_eq!(
+            format_decision_lines(&automatic),
+            ["  redriven  re-parked  (was held-out-gate)"]
+        );
+        assert!(decision_to_json(&automatic).get("initiator").is_none());
     }
 
     #[test]

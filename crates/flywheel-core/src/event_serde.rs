@@ -275,8 +275,8 @@ mod tests {
     use crate::events::{
         AttemptFinalized, AttemptStarted, CommandApplied, GateGraderReceipt, GraderEvaluated,
         HeldOutGateEvaluated, Landed, LandingParked, LandingRedriven, LandingRouted,
-        LifecycleInitialized, REDRIVE_RESULT_LANDED, REDRIVE_RESULT_REPARKED,
-        REDRIVE_RESULT_ROUTED, RetryScheduled, TransitionedTo,
+        LifecycleInitialized, REDRIVE_INITIATOR_OPERATOR, REDRIVE_RESULT_LANDED,
+        REDRIVE_RESULT_REPARKED, REDRIVE_RESULT_ROUTED, RetryScheduled, TransitionedTo,
     };
     use crate::lifecycle::{Outcome, Status, StopReason};
     use serde_json::json;
@@ -603,6 +603,7 @@ mod tests {
             let event = round_trip(DomainEventPayload::LandingRedriven(LandingRedriven {
                 result: result.into(),
                 park_kind: "divergent-base".into(),
+                ..LandingRedriven::default()
             }));
             assert_eq!(event_kind(&event), "landing_redriven");
             assert_eq!(
@@ -616,6 +617,43 @@ mod tests {
             DomainEventPayload::LandingRedriven(LandingRedriven {
                 result: REDRIVE_RESULT_ROUTED.into(),
                 park_kind: String::new(),
+                ..LandingRedriven::default()
+            })
+        );
+    }
+
+    #[test]
+    fn landing_redriven_round_trips_an_operator_initiator_and_omits_an_empty_one() {
+        let event = round_trip(DomainEventPayload::LandingRedriven(LandingRedriven {
+            result: REDRIVE_RESULT_LANDED.into(),
+            park_kind: "held-out-gate".into(),
+            initiator: REDRIVE_INITIATOR_OPERATOR.into(),
+        }));
+        assert_eq!(
+            Value::Object(event_payload(&event.payload).unwrap()),
+            json!({"result": "landed", "park_kind": "held-out-gate", "initiator": "operator"})
+        );
+        // An automatic re-drive carries no initiator: the key is absent, so
+        // pre-existing rows and new automatic rows serialize identically.
+        let automatic = round_trip(DomainEventPayload::LandingRedriven(LandingRedriven {
+            result: REDRIVE_RESULT_REPARKED.into(),
+            park_kind: "held-out-gate".into(),
+            ..LandingRedriven::default()
+        }));
+        let payload = event_payload(&automatic.payload).unwrap();
+        assert!(!payload.contains_key("initiator"));
+        // An old row without the key reads back with an empty initiator.
+        let restored = payload_from_json(
+            "landing_redriven",
+            r#"{"result": "re-parked", "park_kind": "held-out-gate"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            restored,
+            DomainEventPayload::LandingRedriven(LandingRedriven {
+                result: REDRIVE_RESULT_REPARKED.into(),
+                park_kind: "held-out-gate".into(),
+                initiator: String::new(),
             })
         );
     }

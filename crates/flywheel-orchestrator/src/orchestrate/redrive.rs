@@ -7,12 +7,13 @@ use crate::claims::{
     ClaimStore, ClaimStoreError, REASON_ABORTED, REASON_AWAITING_APPROVAL, REASON_BUDGET_CEILING,
     REASON_NO_PROGRESS, REASON_PREREQUISITE_MISSING, REASON_RETRIES_EXHAUSTED_AFTER_ESCALATION,
     RESOLUTION_ATTRIBUTIONS, STOP_DANGLING_PREREQUISITE, STOP_NO_PROGRESS, STOP_NO_PROGRESS_RESET,
-    STOP_RESOLVED, STOP_RETRIES_ESCALATED,
+    STOP_RESOLVED, STOP_RETRIES_ESCALATED, TaskClaim,
 };
 use crate::held_out_gate::{GateOptions, HeldOutGraderSource, LandingDecision, gate_landing};
 use crate::sources::LogSink;
 use crate::strategy::{
-    LandabilityVerdict, SubmitOutcome, SubmitRequest, SubmitStrategy, panic_message, submit_guarded,
+    CandidateTree, LandabilityVerdict, SubmitOutcome, SubmitRequest, SubmitStrategy, panic_message,
+    submit_guarded,
 };
 use crate::work_graph::GraphValidationIssue;
 use flywheel_core::events::{
@@ -26,6 +27,7 @@ use flywheel_core::lifecycle::{Lifecycle, Outcome, Status};
 use flywheel_core::store::HarnessStore;
 use flywheel_core::task::Task;
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
@@ -133,7 +135,7 @@ fn landing_already_queued(
 /// confirming it landed) is at least as recent as the run's latest landing
 /// park -- the recency rule `status` and `resolve` apply. A park appended
 /// after the marker is a fresh strand and is re-driven as usual.
-fn resolved_since_latest_park(
+pub(super) fn resolved_since_latest_park(
     control: &dyn HarnessStore,
     claims: &dyn ClaimStore,
     task_id: &str,
@@ -156,14 +158,27 @@ fn resolved_since_latest_park(
         .is_some_and(|park| park.ts <= resolved_at))
 }
 
+/// The `initiator` an automatic re-drive's `LandingRedriven` record carries:
+/// none, so the field is omitted from the payload.
+const AUTOMATIC_REDRIVE: &str = "";
+
+/// A `LandingRedriven` record: one disposition, the park cause it was
+/// clearing, and who asked for the attempt.
+pub(super) fn redrive_record(result: &str, park_kind: &str, initiator: &str) -> LandingRedriven {
+    LandingRedriven {
+        result: result.to_owned(),
+        park_kind: park_kind.to_owned(),
+        initiator: initiator.to_owned(),
+    }
+}
+
 /// Append a `LandingRedriven` record pairing one re-drive disposition with
 /// the outcome witness it just produced. Best-effort: any failure is logged
 /// and swallowed so the re-drive loop never unwinds on a recording failure.
-fn record_landing_redrive(
+pub(super) fn record_landing_redrive(
     control: &dyn HarnessStore,
     run_id: &str,
-    result: &str,
-    park_kind: &str,
+    record: LandingRedriven,
     task_id: &str,
     now: &Clock,
     log: Option<&LogSink>,
@@ -172,14 +187,7 @@ fn record_landing_redrive(
         let Some(lifecycle) = lifecycle else {
             return Ok(());
         };
-        let event = DomainEvent::new(
-            run_id,
-            now(),
-            DomainEventPayload::LandingRedriven(LandingRedriven {
-                result: result.to_owned(),
-                park_kind: park_kind.to_owned(),
-            }),
-        );
+        let event = DomainEvent::new(run_id, now(), DomainEventPayload::LandingRedriven(record));
         control
             .append_domain_event(&event, lifecycle.version)
             .map(|_| ())
@@ -190,6 +198,109 @@ fn record_landing_redrive(
             format!("[orchestrate] {task_id}: failed to record landing-redrive event ({err})"),
         );
     }
+}
+
+/// The stores, strategy, and gate wiring one sanctioned landing attempt
+/// runs through -- shared by the automatic re-driver and an operator's
+/// one-shot re-land so both take exactly one path.
+pub(super) struct LandingPath<'a> {
+    pub control: &'a Arc<dyn HarnessStore>,
+    pub claims: &'a Arc<dyn ClaimStore>,
+    pub strategy: &'a dyn SubmitStrategy,
+    pub held_out_source: Option<&'a dyn HeldOutGraderSource>,
+    pub gate_options: &'a GateOptions,
+    pub lease_seconds: f64,
+    pub heartbeat_interval: f64,
+    pub now: &'a Clock,
+    pub log: Option<&'a LogSink>,
+}
+
+/// What one [`land_once`] call did.
+pub(super) enum LandingAttempt<E> {
+    /// The gate ran and `submit` (or the gate's own park) produced this
+    /// outcome; the claim is released.
+    Submitted(SubmitOutcome),
+    /// The lease was lost before the irreversible step; nothing was
+    /// submitted and the claim is released.
+    LeaseLost,
+    /// `prepare` failed under the claim; no gate ran, nothing was recorded,
+    /// and the claim is released.
+    Unprepared(E),
+}
+
+/// One sanctioned landing attempt under `claim` (already acquired): renew
+/// it on a heartbeat, run `prepare`, clear a FRESH held-out landing gate
+/// (spec 00074) against the tree `prepare` returned (or the run's sandbox
+/// when it returns `None`), confirm the lease synchronously, then hand a
+/// passing run to `submit_guarded`. A gate FAIL becomes a `held-out-gate`
+/// park (the gate records its own witness). The claim is always released
+/// before returning `Ok`.
+pub(super) async fn land_once<E>(
+    path: &LandingPath<'_>,
+    claim: TaskClaim,
+    request: &SubmitRequest,
+    prepare: impl FnOnce() -> Result<Option<CandidateTree>, E>,
+) -> Result<LandingAttempt<E>, OrchestrateError> {
+    let heartbeat = match ClaimHeartbeat::start(
+        path.claims.clone(),
+        claim.clone(),
+        path.lease_seconds,
+        path.heartbeat_interval,
+        path.now.clone(),
+    ) {
+        Ok(heartbeat) => heartbeat,
+        Err(err) => {
+            path.claims.release_claim(&claim, Some((path.now)()))?;
+            return Err(err.into());
+        }
+    };
+    let candidate = match prepare() {
+        Ok(candidate) => candidate,
+        Err(err) => {
+            let latest = heartbeat.stop();
+            path.claims.release_claim(&latest, Some((path.now)()))?;
+            return Ok(LandingAttempt::Unprepared(err));
+        }
+    };
+    let graded = candidate.as_ref().map(|tree| SubmitRequest {
+        sandbox: tree.path().to_path_buf(),
+        ..request.clone()
+    });
+    let mut log_line = |line: &str| emit(path.log, line);
+    let decision = gate_landing(
+        path.control.as_ref(),
+        path.held_out_source,
+        graded.as_ref().unwrap_or(request),
+        path.gate_options,
+        || (path.now)(),
+        &mut log_line,
+    )
+    .await;
+    drop(candidate);
+    // Landing is irreversible: confirm the lease synchronously first (the
+    // heartbeat flag only reflects its last tick).
+    match heartbeat.confirm() {
+        Ok(true) => {}
+        Ok(false) => {
+            let latest = heartbeat.stop();
+            path.claims.release_claim(&latest, Some((path.now)()))?;
+            return Ok(LandingAttempt::LeaseLost);
+        }
+        Err(err) => {
+            let latest = heartbeat.stop();
+            path.claims.release_claim(&latest, Some((path.now)()))?;
+            return Err(err.into());
+        }
+    }
+    let outcome = match &decision {
+        LandingDecision::Land { .. } => submit_guarded(path.strategy, request),
+        LandingDecision::Park { detail, .. } => {
+            SubmitOutcome::parked(PARK_KIND_HELD_OUT_GATE, detail.clone())
+        }
+    };
+    let latest = heartbeat.stop();
+    path.claims.release_claim(&latest, Some((path.now)()))?;
+    Ok(LandingAttempt::Submitted(outcome))
 }
 
 /// Inputs shared by every call of [`redrive_parked_landings`].
@@ -206,6 +317,22 @@ pub struct LandingRedriveContext<'a> {
     pub steal_grace_seconds: f64,
     pub now: &'a Clock,
     pub log: Option<&'a LogSink>,
+}
+
+impl LandingRedriveContext<'_> {
+    fn landing_path(&self) -> LandingPath<'_> {
+        LandingPath {
+            control: self.control,
+            claims: self.claims,
+            strategy: self.strategy,
+            held_out_source: self.held_out_source,
+            gate_options: self.gate_options,
+            lease_seconds: self.lease_seconds,
+            heartbeat_interval: self.heartbeat_interval,
+            now: self.now,
+            log: self.log,
+        }
+    }
 }
 
 /// Bounded re-drive of runs parked unlanded (spec 00069, criteria #3/#4).
@@ -322,53 +449,17 @@ pub async fn redrive_parked_landings(
             else {
                 break; // a peer holds the claim; retry on a later pass
             };
-            let heartbeat = match ClaimHeartbeat::start(
-                ctx.claims.clone(),
-                claim.clone(),
-                ctx.lease_seconds,
-                ctx.heartbeat_interval,
-                ctx.now.clone(),
-            ) {
-                Ok(heartbeat) => heartbeat,
-                Err(err) => {
-                    ctx.claims.release_claim(&claim, Some((ctx.now)()))?;
-                    return Err(err.into());
-                }
+            let submit_outcome = match land_once(&ctx.landing_path(), claim, request, || {
+                Ok::<_, Infallible>(None)
+            })
+            .await?
+            {
+                LandingAttempt::Submitted(outcome) => outcome,
+                // A peer that stole the lease owns the task now; retry on a
+                // later pass.
+                LandingAttempt::LeaseLost => break,
+                LandingAttempt::Unprepared(never) => match never {},
             };
-            let mut log_line = |line: &str| emit(ctx.log, line);
-            let decision = gate_landing(
-                ctx.control.as_ref(),
-                ctx.held_out_source,
-                request,
-                ctx.gate_options,
-                || (ctx.now)(),
-                &mut log_line,
-            )
-            .await;
-            // Landing is irreversible: confirm the lease synchronously first
-            // (the heartbeat flag only reflects its last tick). A peer that
-            // stole it owns the task now; retry on a later pass.
-            match heartbeat.confirm() {
-                Ok(true) => {}
-                Ok(false) => {
-                    let latest = heartbeat.stop();
-                    ctx.claims.release_claim(&latest, Some((ctx.now)()))?;
-                    break;
-                }
-                Err(err) => {
-                    let latest = heartbeat.stop();
-                    ctx.claims.release_claim(&latest, Some((ctx.now)()))?;
-                    return Err(err.into());
-                }
-            }
-            let submit_outcome = match &decision {
-                LandingDecision::Land { .. } => submit_guarded(ctx.strategy, request),
-                LandingDecision::Park { detail, .. } => {
-                    SubmitOutcome::parked(PARK_KIND_HELD_OUT_GATE, detail.clone())
-                }
-            };
-            let latest = heartbeat.stop();
-            ctx.claims.release_claim(&latest, Some((ctx.now)()))?;
             attempts += 1;
             match submit_outcome {
                 SubmitOutcome::Landed { .. } => {
@@ -376,11 +467,14 @@ pub async fn redrive_parked_landings(
                     record_landing_redrive(
                         ctx.control.as_ref(),
                         &run_id,
-                        REDRIVE_RESULT_LANDED,
-                        &parks
-                            .last()
-                            .map(|p| p.park_kind.clone())
-                            .unwrap_or_default(),
+                        redrive_record(
+                            REDRIVE_RESULT_LANDED,
+                            &parks
+                                .last()
+                                .map(|p| p.park_kind.clone())
+                                .unwrap_or_default(),
+                            AUTOMATIC_REDRIVE,
+                        ),
                         &task_id,
                         ctx.now,
                         ctx.log,
@@ -430,8 +524,7 @@ pub async fn redrive_parked_landings(
                     record_landing_redrive(
                         ctx.control.as_ref(),
                         &run_id,
-                        REDRIVE_RESULT_REPARKED,
-                        &kind,
+                        redrive_record(REDRIVE_RESULT_REPARKED, &kind, AUTOMATIC_REDRIVE),
                         &task_id,
                         ctx.now,
                         ctx.log,
@@ -487,8 +580,7 @@ pub async fn redrive_parked_landings(
             record_landing_redrive(
                 ctx.control.as_ref(),
                 &run_id,
-                REDRIVE_RESULT_ROUTED,
-                &park_kind,
+                redrive_record(REDRIVE_RESULT_ROUTED, &park_kind, AUTOMATIC_REDRIVE),
                 &task_id,
                 ctx.now,
                 ctx.log,

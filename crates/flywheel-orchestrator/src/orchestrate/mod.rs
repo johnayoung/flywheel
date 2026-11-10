@@ -24,6 +24,7 @@ mod heartbeat;
 mod prereqs;
 mod primitives;
 mod redrive;
+mod reland;
 mod run_task;
 mod scope;
 mod sweep;
@@ -51,6 +52,7 @@ pub use redrive::{
     redrive_exhausted_retries, redrive_human_gates, redrive_missing_prerequisites,
     redrive_no_progress, redrive_parked_landings,
 };
+pub use reland::{RelandContext, RelandOutcome, RelandRefusal, RelandWorkspace, reland};
 pub use run_task::{
     AgentPrimitives, RunMode, RunTask, RunTaskError, RunTaskFuture, RunTaskRequest, SharedRunTask,
 };

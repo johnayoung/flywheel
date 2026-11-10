@@ -65,6 +65,7 @@ impl TestHub {
         let server = tokio::spawn(serve(listener, hub, ServerOptions::default(), async {
             let _ = stopped.await;
         }));
+        flywheel_hub::install_crypto_provider();
         let http = reqwest::Client::new();
         let login = http
             .get(format!("http://{addr}/login?token={token}"))

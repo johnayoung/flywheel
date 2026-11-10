@@ -35,6 +35,9 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      # Includes the doctests of every library crate.
+      - uses: taiki-e/install-action@nextest
       - name: Tests
-        run: cargo test --workspace --no-fail-fast
+        run: cargo nextest run --workspace --no-fail-fast
+      # nextest does not run doctests.
+      - name: Doctests
+        run: cargo test --workspace --doc

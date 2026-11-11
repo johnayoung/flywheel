@@ -31,6 +31,7 @@ pub mod claude;
 pub mod codex;
 pub mod event;
 pub mod forward;
+pub mod lanes;
 pub mod mcp;
 pub mod reduce;
 pub mod store;

@@ -14,6 +14,8 @@
 //! credential (a peer's included):
 //!
 //! * `GET /api/telemetry/fleet`: the fleet board, one page.
+//! * `GET /api/telemetry/lanes`: the fleet in lanes (needs you, moving,
+//!   waiting on time, finished, idle), grouped by project.
 //! * `GET /api/telemetry/sessions/{id}`: one session in full.
 //! * `GET /api/telemetry/sessions/{id}/events`: its event log, paged.
 //! * `GET /api/telemetry/capture/hooks`: the user-level hooks
@@ -295,18 +297,9 @@ pub(super) async fn fleet(
     };
     let hub = Arc::clone(&app.hub);
     let own = hub.telemetry().host().to_owned();
-    let named = own.clone();
     let fleet = move || {
         let mut page = hub.telemetry().fleet(&query)?;
-        // A batch under one of this hub's sessions is named for it.
-        let store = hub.store();
-        for batch in &mut page.batches {
-            if batch.host == named
-                && let Some(parent) = &batch.parent
-            {
-                batch.parent_name = store.session(parent).ok().map(|r| r.name.clone());
-            }
-        }
+        hub.name_batches(&mut page.batches);
         Ok(page)
     };
     match read(fleet).await {
@@ -319,6 +312,39 @@ pub(super) async fn fleet(
             "counts": page.counts,
             "hosts": page.hosts,
             "batches": page.batches,
+        }))
+        .into_response(),
+        Err(refused) => refused,
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct LanesParams {
+    host: Option<String>,
+    /// Sessions with an event in the last N hours (`0`: any age).
+    hours: Option<String>,
+}
+
+pub(super) async fn lanes(
+    State(app): State<AppState>,
+    ApiQuery(params): ApiQuery<LanesParams>,
+) -> Response {
+    let hours: i64 = match number(params.hours.as_deref(), "hours") {
+        Ok(hours) => hours.unwrap_or(DEFAULT_FLEET_HOURS),
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let since = (hours > 0).then(|| crate::telemetry::now_ms() - hours.saturating_mul(3_600_000));
+    let host = host_of(&app, params.host.as_deref());
+    let hub = Arc::clone(&app.hub);
+    let own = hub.telemetry().host().to_owned();
+    match read(move || hub.lanes(host, since)).await {
+        Ok(view) => Json(json!({
+            "host": own,
+            "now": crate::telemetry::now_ms(),
+            "total": view.total,
+            "placed": view.placed,
+            "runs": view.runs,
+            "lanes": view.lanes,
         }))
         .into_response(),
         Err(refused) => refused,

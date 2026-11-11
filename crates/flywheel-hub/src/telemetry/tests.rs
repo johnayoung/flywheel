@@ -1453,3 +1453,32 @@ fn a_store_from_before_rollups_gains_the_batch_column() {
         .unwrap();
     assert_eq!(page.total, 1);
 }
+
+#[test]
+fn an_unanswered_ask_survives_a_relaunch_but_not_a_new_conversation() {
+    let (_dir, telemetry) = open();
+    let start = |conversation: &str| json!({"session_id": conversation, "source": "resume"});
+    hooks(
+        &telemetry,
+        "s",
+        0,
+        &[
+            ("SessionStart", start("c1")),
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            (
+                "Stop",
+                json!({"last_assistant_message": "Should I ship it?"}),
+            ),
+            ("SessionEnd", json!({"reason": "other"})),
+        ],
+    );
+    assert_eq!(telemetry.snapshot("s").unwrap().status, "ended");
+    // Resumed: the question still waits.
+    hooks(&telemetry, "s", 100, &[("SessionStart", start("c1"))]);
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!(snap.status, "asking");
+    assert_eq!(snap.ask.unwrap().text, "Should I ship it?");
+    // `/clear`: a new conversation asks nothing.
+    hooks(&telemetry, "s", 200, &[("SessionStart", start("c2"))]);
+    assert_ne!(telemetry.snapshot("s").unwrap().status, "asking");
+}

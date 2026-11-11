@@ -277,6 +277,91 @@ impl Hub {
     }
 }
 
+/// The fleet in lanes (see [`crate::telemetry::lanes`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LanesView {
+    /// Sessions in the window (captured runs aside).
+    pub total: u64,
+    /// How many of them were placed (the most urgent, when there are more
+    /// than one page holds).
+    pub placed: u64,
+    /// Captured runs in the window, placed as their batches.
+    pub runs: u64,
+    pub lanes: Vec<crate::telemetry::lanes::Lane>,
+}
+
+impl Hub {
+    /// Name each batch for the session of this hub it ran under.
+    pub fn name_batches(&self, batches: &mut [crate::telemetry::BatchRollup]) {
+        let own = self.telemetry.host();
+        let store = self.store();
+        for batch in batches {
+            if batch.host == own
+                && let Some(parent) = &batch.parent
+            {
+                batch.parent_name = store.session(parent).ok().map(|r| r.name.clone());
+            }
+        }
+    }
+
+    /// The fleet in lanes: sessions active since `since` (of `host`, else
+    /// every hub's this one holds), each placed by its snapshot and by
+    /// whether anyone looked at its finished turn; captured runs by batch.
+    pub fn lanes(
+        &self,
+        host: Option<String>,
+        since: Option<i64>,
+    ) -> Result<LanesView, crate::telemetry::StoreError> {
+        use crate::telemetry::lanes::{self, Known};
+        let mut page = self.telemetry.fleet(&crate::telemetry::FleetQuery {
+            host,
+            active_since: since,
+            limit: crate::telemetry::store::FLEET_PAGE_MAX,
+            rollup: true,
+            ..Default::default()
+        })?;
+        self.name_batches(&mut page.batches);
+        let own = self.telemetry.host().to_owned();
+        let known: Vec<Known> = {
+            let store = self.store();
+            page.sessions
+                .iter()
+                .map(|snap| {
+                    let record = (snap.host == own)
+                        .then(|| store.session(&snap.session).ok())
+                        .flatten();
+                    Known {
+                        project: record
+                            .and_then(|r| store.workspace(&r.workspace_id).ok())
+                            .map(|w| w.name.clone()),
+                        seen: None,
+                    }
+                })
+                .collect()
+        };
+        let sessions: Vec<_> = page
+            .sessions
+            .into_iter()
+            .zip(known)
+            .map(|(snap, mut known)| {
+                if snap.host == own {
+                    known.seen = self
+                        .agent_status(&snap.session)
+                        .map(|view| view.status == crate::status::AgentStatus::Idle);
+                }
+                (snap, known)
+            })
+            .collect();
+        let runs: u64 = page.batches.iter().map(|b| b.sessions).sum();
+        Ok(LanesView {
+            total: page.total,
+            placed: sessions.len() as u64,
+            runs,
+            lanes: lanes::lanes(sessions, page.batches, now_ms()),
+        })
+    }
+}
+
 /// The context window assumed for a call that used `used` tokens, when
 /// nobody reported its size.
 pub(super) fn assumed_window(used: u64) -> u64 {

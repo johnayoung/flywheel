@@ -123,7 +123,7 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 Repos flywheel knows (project id) get the verified loop, read-only (`--no-flywheel`: off); state: `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else hub env.
 
 - Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs (last tool call), 12 newest runs + grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's `verified/total` badge, `Alt F`, palette.
-- **Start worker here**: `fw worker` in a split; a task's **run**: `fw worker --task <id>` (offers unmet prereqs); a second asks (409); `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted live transcript; message, interrupt (confirmed).
+- **Start worker here**: `fw worker` in a split; a task's **run**: `fw worker --task <id>` (offers unmet prereqs); a second gets 409; `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted transcript; message, interrupt.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) = `fw autopilot` in a session; stop = Ctrl-C; pause/resume = its `--pause|--resume`.
 - Shown (ledger): tier verdicts, newest deciding cycle (emitted, dropped + why), 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row.
 - A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. Per-folder watcher (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
@@ -157,13 +157,13 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 Every agent session's turns, tool calls (duration, outcome), subagents, plan, waits on you, context window, cost, and rate limits are recorded (`telemetry.db`, 30 days) and folded into what it is doing now.
 
-- **Fleet** (the live count, palette **Fleet board**, `fw hub fleet [SESSION]`): every session, urgent first: status, turn and tool, progress, context %, cost, links. Machines' sessions too.
+- **Fleet** (live count, `fw hub fleet [--lanes]`): lanes (needs you, moving, waiting on time, finished, idle) by project, or a list.
 - **Needs you** (sidebar, `fw hub inbox`): blocked, then `asking` (a closing question, or an `ask_operator` reply, pick, or command), answered in the row.
 - **Handoffs**: an agent's `handoff` prompt waits on Needs you; **Start session** (`fw hub continue`) runs it in the same directory, linked. Agents coordinate with `list_sessions` and `message_session` (asks until allowed; typed in or queued under `From <session>`). `fw hub new` inside an agent links to it.
-- **Captured runs** (`fw hub capture install`): `claude -p`, SDK, terminal runs roll up under their hub session or `FLYWHEEL_BATCH` (`fw worker` sets it) vs `FLYWHEEL_BATCH_BUDGET`.
+- **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (`fw worker` sets it) vs `FLYWHEEL_BATCH_BUDGET`.
 - **Work** (the header's **work** pill): one session's plan, then its turns with their subagents and calls. A working session's sidebar row shows its plan's bar and step, else its tool.
-- **Progress** is observed (turns, subagents, calls) and, when the agent keeps a plan, declared: its todo or task tools, Codex's plan, or the hub's `report_progress` tool (every Claude session gets the hub's tools and one system-prompt paragraph on them). A declared status is the agent's claim, shown beside its calls; no plan, no percentage.
-- **Capture**: Claude Code's hooks POST to the hub (a process per event only for `SessionStart`, until a status line has shown a CLI of 2.1.322 or later, or under `allowedHttpHookUrls`); its status line carries the context window, cost, and the 5 h / 7 d gauges (your own status line still shows: the hub's runs it). Codex is read from its rollout.
+- **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` tool (Claude sessions get the hub's tools and a system-prompt paragraph). A declared status is a claim, shown beside its calls; no plan, no percentage.
+- **Capture**: Claude Code's hooks POST to the hub (a process per event only for `SessionStart`, until a status line has shown a CLI of 2.1.322 or later, or under `allowedHttpHookUrls`); its status line carries context, cost, and the 5 h / 7 d gauges (yours still shows: the hub's runs it). Codex: its rollout.
 - **Many hosts**: `[telemetry] upstream = "NAME"` sends this hub's events to that machine (`fw hub machine add`) in batches; while it is down they wait here. Its Fleet lists every hub's sessions.
 
 ## Digests

@@ -19,6 +19,13 @@
 // sessions: one row a batch (its launcher's, the hub session they ran
 // under, or outside the hub) with its runs' statuses and what they spent
 // against its budget; a batch row opens to list its runs.
+//
+// Lanes (the default view) place every session by what it needs from the
+// operator now: needs you, moving, waiting on time (rate limited, or a
+// long tool call), finished (nobody has looked since), idle; each lane
+// grouped by project, batches of captured runs as one card. They come
+// from GET /api/telemetry/lanes (the CLI's `fw hub fleet --lanes`), read
+// again on each push (at most every 1.5 s) and every 15 s.
 // app-base.js creates it with its helpers.
 "use strict";
 
@@ -42,6 +49,10 @@ window.FwHubFleet = function (ctx) {
     rows: [], // { key, machine, snap }, most urgent first
     batches: [], // { key, machine, batch }, the latest active first
     opened: new Map(), // batch row key -> its runs' rows (null while loading)
+    view: localStorage.getItem("fw-fleet-view") === "list" ? "list" : "lanes",
+    lanes: null, // the last lanes page
+    lanesSeq: 0,
+    lanesTimer: 0,
     counts: new Map(), // status -> { sessions, cost }
     copied: new Set(), // machines' hub ids this hub also holds rows of
     loading: false,
@@ -53,6 +64,7 @@ window.FwHubFleet = function (ctx) {
 
   const dialog = $("#dlg-fleet");
   const list = $("#fl-list");
+  const board = $("#fl-lanes");
 
   const keyOf = (machine, snap) => `${machine || ""}|${snap.host}|${snap.session}`;
   const costOf = (snap) => (snap.usage && snap.usage.cost_usd) || 0;
@@ -205,7 +217,8 @@ window.FwHubFleet = function (ctx) {
     const session = sessionById(row.snap.session);
     if (!session) return null;
     if (row.machine) return session.machine === row.machine ? session : null;
-    return !session.machine && row.snap.host === ownHost() ? session : null;
+    const own = ownHost() || (ui.lanes && ui.lanes.host) || "";
+    return !session.machine && row.snap.host === own ? session : null;
   }
 
   const cell = (name, ...lines) => el("span", { className: `fl-c fl-c-${name}` }, ...lines);
@@ -553,6 +566,21 @@ window.FwHubFleet = function (ctx) {
   }
 
   function render() {
+    renderViews();
+    const lanes = ui.view === "lanes";
+    $("#fl-filters").hidden = lanes;
+    list.hidden = lanes;
+    board.hidden = !lanes;
+    if (lanes) {
+      renderStatus();
+      const page = ui.lanes;
+      const bits = page ? [plural(page.total, "session")] : [];
+      if (page && page.runs) bits.push(plural(page.runs, "captured run"));
+      if (page && page.total > page.placed) bits.push(`lanes place the ${page.placed} most urgent`);
+      $("#fl-sum").replaceChildren(el("b", { textContent: `last ${HOURS} h` }), bits.length ? ` ${bits.join(" · ")}` : "");
+      renderLanes();
+      return;
+    }
     renderFilters();
     renderSummary();
     renderStatus();
@@ -600,11 +628,131 @@ window.FwHubFleet = function (ctx) {
     else refocus(held);
   }
 
+  // --- lanes ---------------------------------------------------------------
+
+  async function loadLanes() {
+    const seq = ++ui.lanesSeq;
+    try {
+      const page = await rawApi("GET", `/api/telemetry/lanes?hours=${HOURS}`);
+      if (seq !== ui.lanesSeq || !dialog.open) return;
+      ui.lanes = page;
+      ui.error = "";
+      parts.setClock(page.now);
+    } catch (error) {
+      if (seq !== ui.lanesSeq) return;
+      ui.error = error.message;
+    }
+    if (ui.view === "lanes") render();
+  }
+
+  function lanesSoon() {
+    if (ui.lanesTimer) return;
+    ui.lanesTimer = setTimeout(() => {
+      ui.lanesTimer = 0;
+      if (dialog.open && ui.view === "lanes") loadLanes();
+    }, 1500);
+  }
+
+  // A batch card: its runs, in the list.
+  function openBatchInList(batch) {
+    ui.opened.set(`|${batch.host}|${batch.key}`, null);
+    if (ui.view === "list") load(false);
+    else setView("list");
+  }
+
+  function card(item) {
+    const snap = item.session;
+    const batch = item.batch;
+    const status = snap ? snap.status : (batch.counts[0] || {}).status || "idle";
+    const look = parts.lookOf(status);
+    const name = snap
+      ? (() => {
+          const known = snap.host === ui.lanes.host ? sessionById(snap.session) : null;
+          return known && !known.machine ? known.name : snap.label || snap.session.slice(0, 8);
+        })()
+      : batchName({ batch });
+    const host = snap && snap.host !== ui.lanes.host ? parts.shortHost(snap.host) : "";
+    return el(
+      "button",
+      {
+        type: "button",
+        className: `fl-card ${status}${batch ? " fl-card-batch" : ""}${batch && batch.over_budget ? " over" : ""}`,
+        title: item.why,
+        onclick: () => (snap ? follow({ machine: null, snap }) : openBatchInList(batch)),
+      },
+      el(
+        "span",
+        { className: "fl-card-top" },
+        el("span", { className: `dot ${look.dot}` }),
+        el("b", { className: "fl-name", textContent: name }),
+        host ? el("span", { className: "act-machine fl-host", textContent: host }) : null,
+        el("span", { className: "fl-card-age fl-num" }, parts.live(item.since, 0, true)),
+      ),
+      el("span", { className: "fl-card-why", textContent: item.why }),
+      batch
+        ? el("span", { className: "fl-card-sub fl-num", textContent: `${dollars(batch.cost_usd)}${batch.budget_usd ? ` of ${dollars(batch.budget_usd)}` : ""} · ${plural(batch.sessions, "run")}` })
+        : snap && snap.usage && snap.usage.cost_usd != null
+          ? el("span", { className: "fl-card-sub fl-num", textContent: `${dollars(snap.usage.cost_usd)}${snap.context ? ` · ctx ${Math.round(snap.context.pct)}%` : ""}` })
+          : null,
+    );
+  }
+
+  function renderLanes() {
+    const page = ui.lanes;
+    if (!page) {
+      board.replaceChildren(el("p", { className: "act-empty", textContent: ui.error ? "" : "Loading..." }));
+      return;
+    }
+    board.replaceChildren(...page.lanes.map((lane) => el(
+      "section",
+      { className: `fl-lane fl-lane-${lane.id}`, "aria-label": `${lane.title}: ${lane.count}` },
+      el("h3", { className: "fl-lane-head" }, el("span", { textContent: lane.title }), el("b", { className: "fl-num", textContent: String(lane.count) })),
+      ...(lane.groups.length
+        ? lane.groups.map((group) => el(
+            "div",
+            { className: "fl-group" },
+            el("h4", { className: "fl-group-head", textContent: group.project }),
+            ...group.cards.map(card),
+          ))
+        : [el("p", { className: "fl-lane-empty", textContent: "Nothing" })]),
+      lane.count > lane.groups.reduce((n, g) => n + g.cards.length, 0)
+        ? el("p", { className: "fl-lane-empty", textContent: `and ${lane.count - lane.groups.reduce((n, g) => n + g.cards.length, 0)} more: the list has them all` })
+        : null,
+    )));
+  }
+
+  function renderViews() {
+    $("#fl-views").replaceChildren(...[["lanes", "Lanes"], ["list", "List"]].map(([key, label]) => el(
+      "button",
+      {
+        type: "button",
+        role: "tab",
+        className: `rv-tab${ui.view === key ? " on" : ""}`,
+        "aria-selected": String(ui.view === key),
+        onclick: () => setView(key),
+      },
+      label,
+    )));
+  }
+
+  function setView(view) {
+    if (ui.view === view) return;
+    ui.view = view;
+    localStorage.setItem("fw-fleet-view", view);
+    if (view === "lanes") loadLanes();
+    else load(false);
+    render();
+  }
+
   // --- live ----------------------------------------------------------------
 
   // A `telemetry` push (this hub's, or `machine`'s) while the board is open.
   function onSnapshot(snap, machine) {
     if (!dialog.open || !snap || typeof snap !== "object" || !snap.session) return;
+    if (ui.view === "lanes") {
+      if (!machine) lanesSoon();
+      return;
+    }
     const source = ui.sources.find((s) => s.machine === (machine || null));
     if (!source) return;
     if (!source.ok) {
@@ -667,13 +815,19 @@ window.FwHubFleet = function (ctx) {
     ui.sources = [];
     ui.counts = new Map();
     ui.error = "";
-    ui.loading = true;
+    ui.loading = ui.view === "list";
+    ui.lanes = null;
     render();
     if (!dialog.open) dialog.showModal();
-    load(false);
+    if (ui.view === "lanes") loadLanes();
+    else load(false);
     clearInterval(ui.timer);
+    let ticks = 0;
     ui.timer = setInterval(() => {
-      if (document.visibilityState === "visible") parts.tick(list);
+      if (document.visibilityState !== "visible") return;
+      parts.tick(ui.view === "lanes" ? board : list);
+      // A tool call becomes a wait with time alone.
+      if (ui.view === "lanes" && ++ticks % 15 === 0) loadLanes();
     }, 1000);
   }
 
@@ -688,13 +842,16 @@ window.FwHubFleet = function (ctx) {
     ui.loading = false;
     clearInterval(ui.timer);
     clearTimeout(ui.reload);
+    clearTimeout(ui.lanesTimer);
+    ui.lanesSeq++;
     ui.timer = 0;
     ui.reload = 0;
+    ui.lanesTimer = 0;
   });
   $("#fl-close").addEventListener("click", () => close());
 
   function paletteItems(cmd) {
-    cmd("Fleet board", "every agent session, most urgent first: status, plan, context, cost", () => open(), "fleet");
+    cmd("Fleet board", "every agent session in lanes: needs you, moving, waiting, finished, idle", () => open(), "fleet");
   }
 
   return { open, close, isOpen: () => dialog.open, onSnapshot, onMachine, paletteItems };

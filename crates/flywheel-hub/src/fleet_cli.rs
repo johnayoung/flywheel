@@ -36,6 +36,10 @@ pub(crate) struct FleetArgs {
     /// List captured runs one by one instead of counted in their batches.
     #[arg(long)]
     all: bool,
+    /// The fleet in lanes: needs you, moving, waiting on time, finished
+    /// (nobody has looked since), idle; each grouped by project.
+    #[arg(long, conflicts_with_all = ["session", "status", "batch", "all", "limit"])]
+    lanes: bool,
     /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
@@ -72,6 +76,21 @@ fn run(args: &FleetArgs, out: &mut dyn Write) -> Result<(), String> {
             print_json(out, &found);
         } else {
             print_session(out, &found);
+        }
+        return Ok(());
+    }
+    if args.lanes {
+        let mut params = vec![format!("hours={}", args.hours)];
+        params.extend(host);
+        let view = conn.blocking_call(
+            "GET",
+            &format!("/api/telemetry/lanes?{}", params.join("&")),
+            None,
+        )?;
+        if args.json {
+            print_json(out, &view);
+        } else {
+            print_lanes(out, &view);
         }
         return Ok(());
     }
@@ -332,6 +351,80 @@ fn print_batches(out: &mut dyn Write, batches: &[Value], sessions: &[Value], now
         );
     }
     let _ = writeln!(out, "runs of one batch: fw hub fleet --batch KEY");
+}
+
+/// The fleet in lanes: a line of counts, then each lane but idle with its
+/// cards grouped by project (idle: how many per project).
+fn print_lanes(out: &mut dyn Write, view: &Value) {
+    let now = view["now"].as_i64().unwrap_or(0);
+    let own = str_field(view, "host");
+    let lanes = view["lanes"].as_array().map_or(&[][..], Vec::as_slice);
+    let counts: Vec<String> = lanes
+        .iter()
+        .map(|l| format!("{} {}", str_field(l, "title").to_lowercase(), l["count"]))
+        .collect();
+    let _ = writeln!(out, "{}", counts.join(" · "));
+    let placed = view["placed"].as_u64().unwrap_or(0);
+    let total = view["total"].as_u64().unwrap_or(0);
+    if total > placed {
+        let _ = writeln!(
+            out,
+            "(the {placed} most urgent of {total} sessions; fw hub fleet lists them all)"
+        );
+    }
+    for lane in lanes {
+        let groups = lane["groups"].as_array().map_or(&[][..], Vec::as_slice);
+        if groups.is_empty() {
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "\n{} ({})",
+            str_field(lane, "title").to_uppercase(),
+            lane["count"]
+        );
+        if lane["id"] == "idle" {
+            let per: Vec<String> = groups
+                .iter()
+                .map(|g| {
+                    let n = g["cards"].as_array().map_or(0, Vec::len);
+                    format!("{} {n}", str_field(g, "project"))
+                })
+                .collect();
+            let _ = writeln!(out, "  {}", shown(&per.join(", "), 200));
+            continue;
+        }
+        for group in groups {
+            let _ = writeln!(out, "  {}", shown(str_field(group, "project"), 60));
+            for card in group["cards"].as_array().into_iter().flatten() {
+                let since = card["since"].as_i64().unwrap_or(now);
+                let (name, key) = match card.get("session").filter(|s| s.is_object()) {
+                    Some(snap) => {
+                        let host = str_field(snap, "host");
+                        let mut name = snap["label"]
+                            .as_str()
+                            .map_or_else(|| str_field(snap, "session").to_owned(), str::to_owned);
+                        if host != own {
+                            name = format!("{name}@{}", &host[..host.len().min(8)]);
+                        }
+                        (name, str_field(snap, "session").to_owned())
+                    }
+                    None => (
+                        batch_name(&card["batch"], &[]),
+                        format!("--batch {}", str_field(&card["batch"], "key")),
+                    ),
+                };
+                let _ = writeln!(
+                    out,
+                    "    {:>5}  {:<24} {}  [{}]",
+                    span(now - since),
+                    shown(&name, 24),
+                    shown(str_field(card, "why"), 80),
+                    shown(&key, 40)
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, clap::Args)]

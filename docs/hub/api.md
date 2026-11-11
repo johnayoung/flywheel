@@ -249,6 +249,7 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 | Method | Path | |
 |---|---|---|
 | GET | `/api/telemetry/fleet[?status=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `host` (this hub's id), `sessions` (snapshots, urgent first), `total`, `counts` per status, `hosts`; `hours=0`: any age; `rollup=1`: captured runs as `batches` (`key`, `counts`, `cost_usd`, `budget_usd`, `over_budget`); `batch=KEY`: one's runs |
+| GET | `/api/telemetry/lanes[?host=&hours=]` | `lanes` (`id`, `count`, `groups` of `cards`: `why`, `since`, `session`/`batch`), `total`, `placed`, `runs` |
 | GET | `/api/telemetry/capture/hooks` | the user-level hooks `fw hub capture install` writes |
 | GET | `/api/telemetry/sessions/{id}[?host=]` | `session`: its snapshot, `work` tree, `plans`; 404 before any event |
 | GET | `/api/telemetry/sessions/{id}/events[?host=&after=&limit=&newest=1]` | `events` by `seq`, oldest first |

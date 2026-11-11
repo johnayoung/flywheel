@@ -949,3 +949,53 @@ async fn captured_runs_report_under_their_parent_and_batch_and_are_priced() {
     );
     hub.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lanes_place_sessions_by_what_they_need_grouped_by_workspace() {
+    let hub = TestHub::start(None).await;
+    let (sid, args, env) = hub.claude().await;
+    let settings: Value = serde_json::from_str(arg_after(&args, "--settings")).unwrap();
+    let headers = settings["hooks"]["Stop"][0]["hooks"][0]["headers"].clone();
+    for body in [
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "Ship it"}),
+        json!({"hook_event_name": "Stop", "last_assistant_message": "Ready. Should I push?"}),
+    ] {
+        let sent = hub
+            .as_agent("/api/telemetry/hook", &headers, &env, &body)
+            .await;
+        assert_eq!(sent.status(), StatusCode::OK);
+    }
+    // And a captured run, as its batch.
+    let installed = hub.get("/api/telemetry/capture/hooks").await;
+    let hook = installed["hooks"]["UserPromptSubmit"][0]["hooks"][0].clone();
+    let mut batch_env = HashMap::new();
+    batch_env.insert("FLYWHEEL_BATCH".to_owned(), "nightly".to_owned());
+    let sent = as_captured(
+        &hub,
+        &hook,
+        &batch_env,
+        &json!({"hook_event_name": "UserPromptSubmit", "session_id": "run-1", "prompt": "go"}),
+    )
+    .await;
+    assert_eq!(sent.status(), StatusCode::OK);
+
+    let view = hub.get("/api/telemetry/lanes").await;
+    let lanes = view["lanes"].as_array().unwrap();
+    let ids: Vec<&str> = lanes.iter().map(|l| l["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["needs", "moving", "waiting", "finished", "idle"]);
+    let needs = &lanes[0];
+    assert_eq!(needs["count"], 1, "{view}");
+    assert_eq!(needs["groups"][0]["project"], "ws");
+    let card = &needs["groups"][0]["cards"][0];
+    assert_eq!(card["session"]["session"], sid.as_str());
+    assert_eq!(card["why"], "Should I push?");
+    let moving = &lanes[1];
+    assert_eq!(moving["groups"][0]["project"], "captured runs");
+    assert_eq!(
+        moving["groups"][0]["cards"][0]["batch"]["key"],
+        "batch:nightly"
+    );
+    assert_eq!(view["total"], 1);
+    assert_eq!(view["runs"], 1);
+    hub.shutdown().await;
+}

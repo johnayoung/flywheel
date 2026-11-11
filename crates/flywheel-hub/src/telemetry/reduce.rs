@@ -504,6 +504,10 @@ impl SessionState {
                     self.dir.clone_from(dir);
                 }
                 if conversation.is_some() {
+                    if *conversation != self.conversation {
+                        // Another conversation (`/clear`): asks nothing.
+                        self.ask = None;
+                    }
                     self.conversation = conversation.clone();
                 }
                 if model.is_some() {
@@ -517,7 +521,9 @@ impl SessionState {
                 self.continued_by = Some(successor.clone());
             }
             What::SessionFinished { .. } => {
-                self.ask = None;
+                // An unanswered ask outlives the process: a resumed
+                // session still waits on it (its status shows `ended`
+                // until then).
                 self.close_wait(ts);
                 self.finish_turn(ts, WorkStatus::Cancelled);
                 self.finish_subagents(ts);

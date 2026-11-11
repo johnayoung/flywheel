@@ -13,6 +13,12 @@
 // sockets update a row in place and the counts with it. A row opens the
 // session and its Work drawer (work.js), or the read-only Work sheet for
 // a session held only as telemetry.
+//
+// Runs the hub did not start (`fw hub capture install`: `claude -p`, SDK
+// runs, a plain terminal's session) are counted per batch below the
+// sessions: one row a batch (its launcher's, the hub session they ran
+// under, or outside the hub) with its runs' statuses and what they spent
+// against its budget; a batch row opens to list its runs.
 // app-base.js creates it with its helpers.
 "use strict";
 
@@ -34,6 +40,8 @@ window.FwHubFleet = function (ctx) {
     filter: new Set(), // statuses shown (none: all)
     sources: [], // this hub (machine: null), then each machine
     rows: [], // { key, machine, snap }, most urgent first
+    batches: [], // { key, machine, batch }, the latest active first
+    opened: new Map(), // batch row key -> its runs' rows (null while loading)
     counts: new Map(), // status -> { sessions, cost }
     copied: new Set(), // machines' hub ids this hub also holds rows of
     loading: false,
@@ -53,9 +61,11 @@ window.FwHubFleet = function (ctx) {
 
   // --- fetching ------------------------------------------------------------
 
-  function query(machine, offset, limit) {
+  function query(machine, offset, limit, batch) {
     const p = new URLSearchParams({ hours: String(HOURS), limit: String(limit), offset: String(offset) });
     if (ui.filter.size) p.set("status", [...ui.filter].join(","));
+    if (batch) p.set("batch", batch);
+    else p.set("rollup", "1");
     // A machine answers for the sessions that live on it; what it collects
     // from other hubs is those hubs' to show.
     if (machine) p.set("host", "local");
@@ -68,7 +78,7 @@ window.FwHubFleet = function (ctx) {
     }
     try {
       const page = await rawApi("GET", query(machine, offset, limit));
-      return { machine, ok: true, host: page.host, now: page.now, sessions: page.sessions || [], total: page.total || 0, counts: page.counts || [], hosts: page.hosts || 0, fetched: (page.sessions || []).length };
+      return { machine, ok: true, host: page.host, now: page.now, sessions: page.sessions || [], total: page.total || 0, counts: page.counts || [], hosts: page.hosts || 0, batches: page.batches || [], fetched: (page.sessions || []).length };
     } catch (error) {
       if (!machine) throw error;
       return { machine, ok: false, error: error.message, sessions: [], total: 0, counts: [], fetched: 0 };
@@ -93,10 +103,25 @@ window.FwHubFleet = function (ctx) {
     if (!more) {
       ui.sources = pages.map((page) => ({ ...page, loaded: page.fetched }));
       ui.rows = [];
+      ui.batches = [];
       ui.copied = new Set();
       ui.counts = new Map();
       for (const page of pages) {
         for (const count of page.counts) bump(count.status, count.sessions, count.cost_usd || 0);
+      }
+      const theirs = machineHosts();
+      for (const page of pages) {
+        for (const batch of page.batches || []) {
+          if (!page.machine && theirs.has(batch.host)) continue;
+          ui.batches.push({ key: `${page.machine || ""}|${batch.host}|${batch.key}`, machine: page.machine, batch });
+        }
+      }
+      ui.batches.sort((a, b) => b.batch.last_ts - a.batch.last_ts);
+      // An open batch's runs are read again with the board.
+      for (const key of ui.opened.keys()) {
+        const row = ui.batches.find((b) => b.key === key);
+        if (row) openBatch(row, true);
+        else ui.opened.delete(key);
       }
     } else {
       for (const page of pages) {
@@ -220,7 +245,8 @@ window.FwHubFleet = function (ctx) {
     const bits = [];
     const l = snap.links || {};
     if (l.continues) bits.push(`continues ${name(l.continues)}`);
-    if (l.opened_by) bits.push(`opened by ${name(l.opened_by)}`);
+    if (l.captured) bits.push(l.batch ? `captured run · ${l.batch}` : "captured run");
+    if (l.opened_by) bits.push(`${l.captured ? "ran under" : "opened by"} ${name(l.opened_by)}`);
     if (snap.continued_by) bits.push(`continued in ${name(snap.continued_by)}`);
     return bits.length ? el("span", { className: "fl-line fl-sub fl-links", textContent: bits.join(" · ") }) : null;
   }
@@ -300,7 +326,7 @@ window.FwHubFleet = function (ctx) {
     const snap = row.snap;
     return el(
       "li",
-      { className: "fl-item", dataset: { key: row.key } },
+      { className: `fl-item${row.batch ? " fl-run" : ""}`, dataset: { key: row.key } },
       el(
         "button",
         { type: "button", className: `fl-row ${snap.status}`, onclick: () => follow(row) },
@@ -313,6 +339,109 @@ window.FwHubFleet = function (ctx) {
         last(snap),
       ),
     );
+  }
+
+  // --- a batch of captured runs ------------------------------------------
+
+  function batchName(row) {
+    const batch = row.batch;
+    if (batch.label) return batch.label;
+    if (batch.parent) {
+      const known = sessionById(batch.parent);
+      return `under ${batch.parent_name || (known ? known.name : batch.parent.slice(0, 8))}`;
+    }
+    return "outside the hub";
+  }
+
+  function renderBatch(row) {
+    const batch = row.batch;
+    const open = ui.opened.has(row.key);
+    const counts = (batch.counts || []).map((c) => `${c.sessions} ${parts.lookOf(c.status).label}`).join(" · ");
+    const top = (batch.counts || [])[0];
+    const budget = batch.budget_usd;
+    const spentPct = budget ? Math.min(100, (batch.cost_usd / budget) * 100) : 0;
+    const host = row.machine || (batch.host !== ownHost() ? parts.shortHost(batch.host) : "");
+    return el(
+      "li",
+      { className: `fl-item fl-batch${open ? " open" : ""}`, dataset: { key: row.key } },
+      el(
+        "button",
+        {
+          type: "button",
+          className: `fl-row ${top ? top.status : "idle"}`,
+          "aria-expanded": open ? "true" : "false",
+          title: open ? "Hide its runs" : "List its runs",
+          onclick: () => toggleBatch(row),
+        },
+        cell("status", top ? parts.statusNode({ status: top.status, since: batch.last_ts }) : dash()),
+        cell(
+          "who",
+          el(
+            "span",
+            { className: "fl-line" },
+            el("span", { className: "fl-caret", textContent: open ? "\u25be" : "\u25b8", "aria-hidden": "true" }),
+            el("b", { className: "fl-name", textContent: batchName(row), title: batch.key }),
+            host ? el("span", { className: "act-machine fl-host", textContent: host }) : null,
+          ),
+          el("span", { className: "fl-line fl-sub", textContent: `${plural(batch.sessions, "captured run")}` }),
+        ),
+        cell("doing", el("span", { className: "fl-line fl-facts", textContent: counts, title: counts })),
+        cell(
+          "prog",
+          budget
+            ? el(
+                "span",
+                { className: "prog fl-prog", title: `${dollars(batch.cost_usd)} of a ${dollars(budget)} budget` },
+                parts.bar(spentPct, batch.over_budget),
+                el("small", { className: batch.over_budget ? "fl-err" : "", textContent: `${Math.round((batch.cost_usd / budget) * 100)}%` }),
+              )
+            : el("span", { className: "fl-line fl-none", textContent: "no budget", title: "Its launcher set no FLYWHEEL_BATCH_BUDGET" }),
+        ),
+        cell("ctx", dash()),
+        cell(
+          "cost",
+          el("span", { className: "fl-line fl-num", textContent: dollars(batch.cost_usd) }),
+          budget
+            ? el("span", { className: `fl-line fl-sub fl-num${batch.over_budget ? " hot" : ""}`, textContent: `of ${dollars(budget)}`, title: batch.over_budget ? `Over its ${dollars(budget)} budget` : `Its budget: ${dollars(budget)}` })
+            : null,
+        ),
+        cell("last", el("span", { className: "fl-line fl-num", title: `Last event ${new Date(batch.last_ts).toLocaleString()}` }, parts.live(batch.last_ts, 0, true))),
+      ),
+    );
+  }
+
+  function batchRows(row) {
+    const runs = ui.opened.get(row.key);
+    if (runs === null) return [el("li", { className: "act-empty fl-run fl-tail-run", textContent: "Loading its runs..." })];
+    if (!runs || !runs.length) return runs ? [el("li", { className: "act-empty fl-run", textContent: "No run in it with that status." })] : [];
+    return runs.map(renderRow);
+  }
+
+  // Read one batch's runs (`again`: the board reloaded, keep what is shown
+  // until they arrive).
+  async function openBatch(row, again) {
+    if (!again) ui.opened.set(row.key, null);
+    const seq = ui.seq;
+    try {
+      const page = await rawApi("GET", query(row.machine, 0, PAGE_MAX, row.batch.key));
+      if (seq !== ui.seq || !ui.opened.has(row.key)) return;
+      ui.opened.set(row.key, (page.sessions || []).map((snap) => ({ key: keyOf(row.machine, snap), machine: row.machine, snap, batch: row.batch.key })));
+    } catch (error) {
+      if (!ui.opened.has(row.key)) return;
+      ui.opened.set(row.key, []);
+      ui.error = error.message;
+    }
+    render();
+  }
+
+  function toggleBatch(row) {
+    if (ui.opened.has(row.key)) {
+      ui.opened.delete(row.key);
+      render();
+      return;
+    }
+    openBatch(row, false);
+    render();
   }
 
   // A session this browser can attach opens, with its Work drawer; one held
@@ -408,7 +537,7 @@ window.FwHubFleet = function (ctx) {
 
   function tail() {
     const out = [];
-    if (!ui.rows.length && !ui.loading && !ui.error) {
+    if (!ui.rows.length && !ui.batches.length && !ui.loading && !ui.error) {
       out.push(el("li", { className: "act-empty fl-tail", textContent: ui.filter.size ? "No session with that status." : "No agent session has reported yet." }));
     }
     if (hasMore()) {
@@ -428,10 +557,16 @@ window.FwHubFleet = function (ctx) {
     renderSummary();
     renderStatus();
     const held = heldKey();
-    const head = ui.rows.length
+    const head = ui.rows.length || ui.batches.length
       ? [el("li", { className: "fl-head", "aria-hidden": "true" }, HEAD.map(([name, label]) => el("span", { className: `fl-c fl-c-${name}`, textContent: label })))]
       : [];
-    list.replaceChildren(...head, ...ui.rows.map(renderRow), ...tail());
+    const batches = ui.batches.length
+      ? [
+          el("li", { className: "fl-section", textContent: `Captured runs · ${plural(ui.batches.reduce((n, b) => n + b.batch.sessions, 0), "run")} in ${ui.batches.length} ${ui.batches.length === 1 ? "batch" : "batches"}` }),
+          ...ui.batches.flatMap((row) => [renderBatch(row), ...batchRows(row)]),
+        ]
+      : [];
+    list.replaceChildren(...head, ...ui.rows.map(renderRow), ...tail(), ...batches);
     refocus(held);
   }
 
@@ -458,7 +593,7 @@ window.FwHubFleet = function (ctx) {
       const fresh = renderRow(row);
       if (old) old.remove();
       const next = ui.rows[ui.rows.indexOf(row) + 1];
-      const before = (next && itemOf(next.key)) || list.querySelector(".fl-tail");
+      const before = (next && itemOf(next.key)) || list.querySelector(".fl-tail") || list.querySelector(".fl-section");
       list.insertBefore(fresh, before || null);
     }
     if (!list.querySelector(".fl-head") || !ui.rows.length) render();
@@ -478,6 +613,11 @@ window.FwHubFleet = function (ctx) {
       return;
     }
     if (machine ? snap.host !== source.host : machineHosts().has(snap.host)) return;
+    if (snap.links && snap.links.captured) {
+      // A captured run is counted in its batch: the rollups are read again.
+      reloadSoon();
+      return;
+    }
     const key = keyOf(machine, snap);
     const at = ui.rows.findIndex((r) => r.key === key);
     if (at < 0) {
@@ -522,6 +662,8 @@ window.FwHubFleet = function (ctx) {
     if (ctx.onOpen) ctx.onOpen();
     document.body.classList.remove("side-open");
     ui.rows = [];
+    ui.batches = [];
+    ui.opened = new Map();
     ui.sources = [];
     ui.counts = new Map();
     ui.error = "";

@@ -105,21 +105,55 @@ impl AskKind {
 }
 
 /// How a session is tied to others on its hub (their hub session ids).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionLinks {
     /// The session whose work this one continues (a handoff).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continues: Option<String>,
-    /// The agent session that opened this one.
+    /// The agent session that opened this one (for a captured run: the
+    /// hub session it ran under).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_by: Option<String>,
+    /// A run the hub did not start, reported by the user-level capture
+    /// hooks (`fw hub capture install`): `claude -p`, an SDK run, a
+    /// terminal session. It has no terminal on the hub.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub captured: bool,
+    /// The batch its launcher named (`FLYWHEEL_BATCH`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<String>,
+    /// What its launcher allows the batch to spend, in USD
+    /// (`FLYWHEEL_BATCH_BUDGET`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
 }
 
 impl SessionLinks {
     pub fn is_empty(&self) -> bool {
-        self.continues.is_none() && self.opened_by.is_none()
+        self.continues.is_none()
+            && self.opened_by.is_none()
+            && !self.captured
+            && self.batch.is_none()
+            && self.budget_usd.is_none()
+    }
+
+    /// The rollup a captured run is counted in: its launcher's batch,
+    /// else the hub session it ran under, else everything run outside
+    /// the hub. `None` for the hub's own sessions.
+    pub fn rollup_key(&self) -> Option<String> {
+        if !self.captured {
+            return None;
+        }
+        Some(match (&self.batch, &self.opened_by) {
+            (Some(batch), _) => format!("batch:{batch}"),
+            (None, Some(parent)) => format!("under:{parent}"),
+            (None, None) => OUTSIDE_ROLLUP.to_owned(),
+        })
     }
 }
+
+/// The rollup of captured runs with no batch and no parent session.
+pub const OUTSIDE_ROLLUP: &str = "outside";
 
 /// A plan item's status, in the agent's words normalized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

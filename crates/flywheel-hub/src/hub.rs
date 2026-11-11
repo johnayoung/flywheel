@@ -1,6 +1,8 @@
 //! The hub: persisted workspaces and session records plus the live PTY
 //! sessions the server owns.
 
+mod capture;
+pub use capture::{CAPTURE_TOKEN_FILE, CAPTURED_PREFIX, CaptureFrom, CaptureRefused};
 mod links;
 mod restore;
 mod sessions;

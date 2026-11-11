@@ -78,9 +78,12 @@ Agent output:
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N] {where}
 fw hub search QUERY [--regex] [--case] [--session S] [--workspace W] [--kind K]... [--source scrollback|transcript|commands]... [--limit N] [--per-session N] [--offset N] [--json] {where}  # 1: no hits
 fw hub activity [--since AGE|TIME|last-seen] [--until T] [--workspace W] [--session S] [--kind K]... [--limit N] [--json] {where}
-fw hub fleet [SESSION] [--status STATUS]... [--hours N] [--host HUB_ID] [--limit N] [--json] {where}
+fw hub fleet [SESSION] [--status STATUS]... [--hours N] [--host HUB_ID] [--limit N] [--batch KEY | --all] [--json] {where}
 fw hub inbox [--hours N] [--host HUB_ID] [--json] {where}  # blocked and asking sessions, with how to answer
 fw hub continue SESSION [--prompt TEXT|-] [--json] {where}  # a linked successor (default prompt: its handoff's)
+fw hub capture install [--settings FILE]  # runs the hub did not start report to it
+fw hub capture uninstall [--settings FILE]
+fw hub capture status [--settings FILE]
 fw hub digest [--since AGE|TIME] [--send] [--json] {where}  # a preview unless --send
 fw hub record start SESSION [--json] {remote}
 fw hub record stop SESSION [--json] {remote}

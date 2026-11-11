@@ -518,6 +518,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         // Multiple machines: this hub's peers (remote side) and machines
         // (local side), and the proxy to them.
         .route("/api/telemetry/fleet", get(telemetry_api::fleet))
+        .route(
+            "/api/telemetry/capture/hooks",
+            get(telemetry_api::capture_hooks),
+        )
         .route("/api/telemetry/sessions/{id}", get(telemetry_api::session))
         .route(
             "/api/telemetry/sessions/{id}/events",
@@ -580,12 +584,14 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             bound_body,
         ));
     // What agent sessions send (hooks, the progress tool): each request
-    // carries its session's report secret, checked by the handler. No
+    // carries its session's report secret (a captured run's hooks: the
+    // capture token), checked by the handler. No
     // browser is involved, so these sit outside the origin guard; the
     // body is read whole within a bound, as for the public routes.
     let agents = Router::new()
         .route("/api/telemetry/hook", post(telemetry_api::hook))
         .route("/api/telemetry/mcp", post(telemetry_api::progress_tool))
+        .route("/api/telemetry/capture", post(telemetry_api::capture))
         .route_layer(middleware::from_fn_with_state(
             telemetry_api::AGENT_BODY,
             bound_body,

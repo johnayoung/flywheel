@@ -794,3 +794,158 @@ async fn a_handoff_is_continued_in_a_linked_session_and_agents_message_each_othe
     assert_eq!(status, StatusCode::BAD_REQUEST);
     hub.shutdown().await;
 }
+
+/// POST a capture hook as Claude Code would: the installed hook's
+/// headers, `$VAR` ones filled from `env` (empty when unset), the rest as
+/// written.
+async fn as_captured(
+    hub: &TestHub,
+    hook: &Value,
+    env: &HashMap<String, String>,
+    body: &Value,
+) -> reqwest::Response {
+    let mut request = hub.http.post(hook["url"].as_str().unwrap());
+    for (name, value) in hook["headers"].as_object().unwrap() {
+        let value = value.as_str().unwrap();
+        let value = match value.strip_prefix('$') {
+            Some(var) => env.get(var).cloned().unwrap_or_default(),
+            None => value.to_owned(),
+        };
+        request = request.header(name.as_str(), value);
+    }
+    request.json(body).send().await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn captured_runs_report_under_their_parent_and_batch_and_are_priced() {
+    let hub = TestHub::start(None).await;
+    let (sid, args, parent_env) = hub.claude().await;
+    let installed = hub.get("/api/telemetry/capture/hooks").await;
+    assert!(
+        installed["hooks"].get("SessionStart").is_none(),
+        "{installed}"
+    );
+    let hook = installed["hooks"]["Stop"][0]["hooks"][0].clone();
+    assert_eq!(
+        hook["url"],
+        format!("{}/api/telemetry/capture", hub.base()),
+        "{hook}"
+    );
+    // The token is the hub's alone, made once.
+    assert_eq!(
+        hub.get("/api/telemetry/capture/hooks").await["hooks"]["Stop"][0]["hooks"][0],
+        hook
+    );
+
+    // A transcript with one priced response.
+    let projects = hub.dir.path().join("claude-config/projects/p");
+    std::fs::create_dir_all(&projects).unwrap();
+    let transcript = |conversation: &str| {
+        let path = projects.join(format!("{conversation}.jsonl"));
+        let line = json!({"type": "assistant", "timestamp": "2026-11-11T10:00:00Z",
+            "message": {"id": format!("m-{conversation}"), "model": "claude-sonnet-4-5",
+                        "usage": {"input_tokens": 1000, "output_tokens": 2000,
+                                  "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}});
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let run = |conversation: &str, event: &str| {
+        json!({"hook_event_name": event, "session_id": conversation,
+               "cwd": "/work/analyses/49", "prompt": "Analyse order 0xdaf3",
+               "transcript_path": transcript(conversation),
+               "last_assistant_message": "Report written."})
+    };
+
+    // A `claude -p` inside the hub session, in a named batch with a budget.
+    let mut child_env = parent_env.clone();
+    child_env.insert("FLYWHEEL_BATCH".into(), "post-trade analysts".into());
+    child_env.insert("FLYWHEEL_BATCH_BUDGET".into(), "0.01".into());
+    for event in ["UserPromptSubmit", "Stop", "SessionEnd"] {
+        let sent = as_captured(&hub, &hook, &child_env, &run("c0ffee-1", event)).await;
+        assert_eq!(sent.status(), StatusCode::OK);
+    }
+    // One with no batch: counted under the hub session it ran in.
+    let sent = as_captured(
+        &hub,
+        &hook,
+        &parent_env,
+        &run("c0ffee-2", "UserPromptSubmit"),
+    )
+    .await;
+    assert_eq!(sent.status(), StatusCode::OK);
+    // One from a plain terminal: outside the hub.
+    let sent = as_captured(
+        &hub,
+        &hook,
+        &HashMap::new(),
+        &run("c0ffee-3", "UserPromptSubmit"),
+    )
+    .await;
+    assert_eq!(sent.status(), StatusCode::OK);
+    // The hub session's own conversation: its own hooks report it.
+    let own = arg_after(&args, "--session-id").to_owned();
+    let sent = as_captured(&hub, &hook, &parent_env, &run(&own, "UserPromptSubmit")).await;
+    assert_eq!(sent.status(), StatusCode::OK);
+    // A wrong token is refused.
+    let mut forged = hook.clone();
+    forged["headers"]["x-flywheel-capture"] = json!("0".repeat(64));
+    let sent = as_captured(
+        &hub,
+        &forged,
+        &HashMap::new(),
+        &run("c0ffee-4", "UserPromptSubmit"),
+    )
+    .await;
+    assert_eq!(sent.status(), StatusCode::UNAUTHORIZED);
+
+    let page = hub.get("/api/telemetry/fleet?rollup=1").await;
+    let listed: Vec<&str> = page["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["session"].as_str().unwrap())
+        .collect();
+    assert!(listed.iter().all(|s| !s.starts_with("cc-")), "{page}");
+    let batches = page["batches"].as_array().unwrap();
+    let mut keys: Vec<&str> = batches.iter().map(|b| b["key"].as_str().unwrap()).collect();
+    keys.sort_unstable();
+    let under = format!("under:{sid}");
+    assert_eq!(
+        keys,
+        ["batch:post-trade analysts", "outside", under.as_str()],
+        "{page}"
+    );
+    let analysts = batches
+        .iter()
+        .find(|b| b["key"] == "batch:post-trade analysts")
+        .unwrap();
+    assert_eq!(analysts["sessions"], 1);
+    assert_eq!(analysts["budget_usd"], 0.01);
+    assert_eq!(analysts["over_budget"], true, "{analysts}");
+    assert!(analysts["cost_usd"].as_f64().unwrap() > 0.01, "{analysts}");
+
+    // The run itself: linked to its parent, priced, ended.
+    let detail = hub
+        .get("/api/telemetry/fleet?batch=batch:post-trade%20analysts")
+        .await;
+    let snap = &detail["sessions"][0];
+    assert_eq!(snap["session"], "cc-c0ffee-1");
+    assert_eq!(snap["status"], "ended", "{snap}");
+    assert_eq!(snap["links"]["opened_by"], sid.as_str());
+    assert_eq!(snap["links"]["captured"], true);
+    assert_eq!(snap["label"], "49");
+    assert_eq!(snap["model"], "claude-sonnet-4-5");
+    assert_eq!(snap["usage"]["output"], 2000);
+    // The hub session's own conversation made no captured run.
+    let all = hub.get("/api/telemetry/fleet").await;
+    let own_run = format!("cc-{own}");
+    assert!(
+        all["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["session"] != own_run.as_str()),
+        "{all}"
+    );
+    hub.shutdown().await;
+}

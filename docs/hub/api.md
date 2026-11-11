@@ -248,16 +248,18 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/telemetry/fleet[?status=&host=&hours=&limit=&offset=]` | `host` (this hub's id), `sessions` (snapshots, urgent first), `total`, `counts` per status, `hosts`; `hours=0`: any age |
+| GET | `/api/telemetry/fleet[?status=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `host` (this hub's id), `sessions` (snapshots, urgent first), `total`, `counts` per status, `hosts`; `hours=0`: any age; `rollup=1`: captured runs as `batches` (`key`, `counts`, `cost_usd`, `budget_usd`, `over_budget`); `batch=KEY`: one's runs |
+| GET | `/api/telemetry/capture/hooks` | the user-level hooks `fw hub capture install` writes |
 | GET | `/api/telemetry/sessions/{id}[?host=]` | `session`: its snapshot, `work` tree, `plans`; 404 before any event |
 | GET | `/api/telemetry/sessions/{id}/events[?host=&after=&limit=&newest=1]` | `events` by `seq`, oldest first |
 | POST | `/api/telemetry/batch` | another hub's events, NDJSON (or `Content-Encoding: deflate`) -> `received`, `accepted` |
 | POST | `/api/telemetry/hook` | a Claude Code hook; no login: `x-flywheel-session`, `x-flywheel-secret` |
 | POST | `/api/telemetry/mcp` | agent tools (MCP over http); same headers |
+| POST | `/api/telemetry/capture` | a hook of a run the hub did not start: `x-flywheel-capture`; optional session, `-batch`, `-budget` headers |
 
 Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: turn or subagent; `item`: plan item).
 
-Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?,prompt?}`), `failed`, `working`, `done`, `idle`, `ended`; `links`.
+Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?,prompt?}`), `failed`, `working`, `done`, `idle`, `ended`; `links` (a captured run, `cc-<conversation>`: `captured`, `batch`, `budget_usd`).
 
 Kinds: `session.started`, `session.continued`, `session.finished`, `turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
 

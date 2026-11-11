@@ -31,6 +31,8 @@ pub(super) struct Capture {
     /// in [`CLAUDE_VERSION_FILE`]): what decides http hooks. Never asked
     /// of the CLI itself: the hub runs no agent program on its own.
     claude_version: Mutex<Option<(u32, u32, u32)>>,
+    /// The capture token, once read or made (see [`super::capture`]).
+    pub(super) token: Mutex<Option<String>>,
 }
 
 /// Where the last seen Claude Code version is kept in the state dir.
@@ -245,11 +247,7 @@ impl Hub {
                 now,
                 What::ContextUsage {
                     used,
-                    window: if used > ASSUMED_WINDOW {
-                        ASSUMED_LONG_WINDOW
-                    } else {
-                        ASSUMED_WINDOW
-                    },
+                    window: assumed_window(used),
                     exact: false,
                 },
             ));
@@ -279,11 +277,22 @@ impl Hub {
     }
 }
 
+/// The context window assumed for a call that used `used` tokens, when
+/// nobody reported its size.
+pub(super) fn assumed_window(used: u64) -> u64 {
+    if used > ASSUMED_WINDOW {
+        ASSUMED_LONG_WINDOW
+    } else {
+        ASSUMED_WINDOW
+    }
+}
+
 /// How a session is tied to others, from its record.
 fn links_of(record: &SessionRecord) -> crate::telemetry::SessionLinks {
     crate::telemetry::SessionLinks {
         continues: record.continues.clone(),
         opened_by: record.opened_by.clone(),
+        ..Default::default()
     }
 }
 

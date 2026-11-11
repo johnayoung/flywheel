@@ -111,3 +111,19 @@
   .fl-chip { min-height: 44px; }
 }
 .fl-links { color: var(--ink-3); }
+
+/* --- captured runs, counted per batch ---------------------------------------- */
+.fl-section {
+  padding: .9rem 1.4rem .35rem;
+  border-bottom: 1px solid var(--rule);
+  color: var(--ink-3);
+  font-size: 9.5px;
+  letter-spacing: .2em;
+  text-transform: uppercase;
+}
+.fl-batch .fl-row { background: var(--bg-3); }
+.fl-batch .fl-row:hover, .fl-batch .fl-row:focus-visible { background: var(--bg-4); }
+.fl-caret { flex: none; width: .8rem; color: var(--ink-3); }
+.fl-run .fl-row { padding-left: 2.6rem; }
+.fl-run.act-empty { padding-left: 2.6rem; }
+.fl-prog .wk-bar.hot i { background: var(--alert); }

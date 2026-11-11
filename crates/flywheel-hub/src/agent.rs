@@ -159,6 +159,22 @@ pub const MCP_PATH: &str = "/api/telemetry/mcp";
 pub const SESSION_HEADER: &str = "x-flywheel-session";
 pub const SECRET_HEADER: &str = "x-flywheel-secret";
 
+/// The path the user-level capture hooks POST to (see
+/// [`capture_settings`]).
+pub const CAPTURE_PATH: &str = "/api/telemetry/capture";
+/// The capture token's header, and the headers a captured run's launcher
+/// fills from [`BATCH_ENV`] and [`BUDGET_ENV`].
+pub const CAPTURE_HEADER: &str = "x-flywheel-capture";
+pub const BATCH_HEADER: &str = "x-flywheel-batch";
+pub const BUDGET_HEADER: &str = "x-flywheel-budget";
+/// The batch a launcher counts its runs in, and what the batch may spend
+/// (USD).
+pub const BATCH_ENV: &str = "FLYWHEEL_BATCH";
+pub const BUDGET_ENV: &str = "FLYWHEEL_BATCH_BUDGET";
+/// How long a capture hook may wait on the hub (seconds): it runs in
+/// every Claude Code process on the machine, so it gives up quickly.
+const CAPTURE_TIMEOUT_SECS: u64 = 3;
+
 /// How a Claude Code session is wired to its hub.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeWiring<'a> {
@@ -296,6 +312,50 @@ pub fn claude_settings(wiring: &ClaudeWiring<'_>) -> serde_json::Value {
         ] });
     }
     settings
+}
+
+/// The user-level hooks `fw hub capture install` adds to Claude Code's
+/// settings: every hook the hub's own sessions send (but `SessionStart`,
+/// which Claude Code runs no http hook for), POSTed to `hub_url`'s
+/// [`CAPTURE_PATH`] with the capture `token`. The run's environment fills
+/// in the hub session it runs under and its launcher's batch.
+pub fn capture_settings(hub_url: &str, token: &str) -> serde_json::Value {
+    let handler = serde_json::json!({
+        "type": "http",
+        "url": format!("{hub_url}{CAPTURE_PATH}"),
+        "timeout": CAPTURE_TIMEOUT_SECS,
+        "headers": {
+            CAPTURE_HEADER: token,
+            SESSION_HEADER: format!("${}", crate::report::SESSION_ENV),
+            BATCH_HEADER: format!("${BATCH_ENV}"),
+            BUDGET_HEADER: format!("${BUDGET_ENV}"),
+        },
+        "allowedEnvVars": [
+            crate::report::SESSION_ENV,
+            BATCH_ENV,
+            BUDGET_ENV,
+        ],
+    });
+    let mut hooks = serde_json::Map::new();
+    let extra = crate::telemetry::claude::EXTRA_HOOKS
+        .iter()
+        .map(|event| (*event, None));
+    for (event, detail) in CLAUDE_HOOKS.iter().copied().chain(extra) {
+        if event == "SessionStart" {
+            continue;
+        }
+        let mut group = serde_json::json!({ "hooks": [handler.clone()] });
+        if let Some(detail) = detail {
+            group["matcher"] = serde_json::Value::String(detail.to_owned());
+        }
+        hooks
+            .entry(event.to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("hook groups are arrays")
+            .push(group);
+    }
+    serde_json::json!({ "hooks": hooks })
 }
 
 /// `--mcp-config` JSON giving a session the hub's progress tool

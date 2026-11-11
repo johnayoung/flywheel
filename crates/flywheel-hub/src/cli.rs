@@ -151,6 +151,11 @@ enum HubCommand {
     /// decision, or a command only you can run (asking), each with what
     /// it asks and how to answer.
     Inbox(crate::fleet_cli::InboxArgs),
+    /// Report runs the hub did not start (`claude -p`, Agent SDK runs, a
+    /// session in a plain terminal): `capture install` adds user-level
+    /// hooks to Claude Code's settings, `capture uninstall` removes them,
+    /// `capture status` says where they report.
+    Capture(crate::capture_cli::CaptureArgs),
     /// The digest since the last one (or --since): per workspace, turns
     /// finished, agents blocked, fan-outs graded, PRs, autopilot, queue
     /// stalls, spend, and the top items that need you; previewed, or sent
@@ -744,6 +749,7 @@ fn dispatch_verb(
     match command {
         HubCommand::Token(args) => token(&args, out, err),
         HubCommand::Tls(args) => crate::tls_cli::main(&args, out, err),
+        HubCommand::Capture(args) => crate::capture_cli::main(&args, out, err),
         HubCommand::Url(args) => url_cmd(&args, out, err),
         HubCommand::Serve(args) => serve_cmd(args, out, err, extensions),
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),

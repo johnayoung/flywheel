@@ -38,9 +38,11 @@ pub mod summary;
 #[cfg(test)]
 mod tests;
 
-pub use event::{Draft, Event, ItemStatus, Outcome, PlanStep, SessionLinks, WaitReason, What};
+pub use event::{
+    Draft, Event, ItemStatus, OUTSIDE_ROLLUP, Outcome, PlanStep, SessionLinks, WaitReason, What,
+};
 pub use reduce::{Detail, SessionState, Snapshot};
-pub use store::{FleetPage, FleetQuery, StoreError};
+pub use store::{BatchRollup, FleetPage, FleetQuery, StoreError};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

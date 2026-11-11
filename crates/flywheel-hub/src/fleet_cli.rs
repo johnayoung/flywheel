@@ -29,6 +29,13 @@ pub(crate) struct FleetArgs {
     /// The most sessions listed.
     #[arg(long, value_name = "N", default_value_t = 200)]
     limit: u32,
+    /// Only the captured runs of one batch (the KEY the board shows:
+    /// `batch:LABEL`, `under:SESSION`, or `outside`).
+    #[arg(long, value_name = "KEY", conflicts_with = "all")]
+    batch: Option<String>,
+    /// List captured runs one by one instead of counted in their batches.
+    #[arg(long)]
+    all: bool,
     /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
@@ -74,6 +81,11 @@ fn run(args: &FleetArgs, out: &mut dyn Write) -> Result<(), String> {
     ];
     if !args.status.is_empty() {
         params.push(format!("status={}", query_escape(&args.status.join(","))));
+    }
+    match &args.batch {
+        Some(batch) => params.push(format!("batch={}", query_escape(batch))),
+        None if !args.all => params.push("rollup=1".to_owned()),
+        None => {}
     }
     params.extend(host);
     let page = conn.blocking_call(
@@ -169,7 +181,8 @@ fn print_board(out: &mut dyn Write, page: &Value) {
     let now = page["now"].as_i64().unwrap_or(0);
     let own = str_field(page, "host");
     let sessions = page["sessions"].as_array().map_or(&[][..], Vec::as_slice);
-    if sessions.is_empty() {
+    let batches = page["batches"].as_array().map_or(&[][..], Vec::as_slice);
+    if sessions.is_empty() && batches.is_empty() {
         let _ = writeln!(out, "no agent session has reported");
         return;
     }
@@ -186,10 +199,16 @@ fn print_board(out: &mut dyn Write, page: &Value) {
         .filter_map(|c| c["cost_usd"].as_f64())
         .sum();
     let hosts = page["hosts"].as_u64().unwrap_or(1);
+    let runs: u64 = batches.iter().filter_map(|b| b["sessions"].as_u64()).sum();
     let _ = writeln!(
         out,
-        "{} sessions ({}), {}{}",
+        "{} sessions{} ({}), {}{}",
         page["total"],
+        if runs > 0 {
+            format!(" + {runs} captured")
+        } else {
+            String::new()
+        },
         counts.join(", "),
         dollars(spent),
         if hosts > 1 {
@@ -240,6 +259,79 @@ fn print_board(out: &mut dyn Write, page: &Value) {
     if total > listed {
         let _ = writeln!(out, "... and {} more (--limit)", total - listed);
     }
+    print_batches(out, batches, sessions, now);
+}
+
+/// What a batch is called: its launcher's label, the hub session it ran
+/// under (by name when that session is on the page), or the runs from
+/// outside the hub.
+fn batch_name(batch: &Value, sessions: &[Value]) -> String {
+    if let Some(label) = batch["label"].as_str() {
+        return label.to_owned();
+    }
+    match batch["parent"].as_str() {
+        Some(parent) => {
+            let name = batch["parent_name"]
+                .as_str()
+                .or_else(|| {
+                    sessions
+                        .iter()
+                        .find(|s| s["session"].as_str() == Some(parent))
+                        .and_then(|s| s["label"].as_str())
+                })
+                .map_or_else(|| parent[..parent.len().min(8)].to_owned(), str::to_owned);
+            format!("under {name}")
+        }
+        None => "outside the hub".to_owned(),
+    }
+}
+
+/// The captured runs, counted per batch: how many, in what status, what
+/// they spent against the budget, and the key that lists them.
+fn print_batches(out: &mut dyn Write, batches: &[Value], sessions: &[Value], now: i64) {
+    if batches.is_empty() {
+        return;
+    }
+    let runs: u64 = batches.iter().filter_map(|b| b["sessions"].as_u64()).sum();
+    let _ = writeln!(
+        out,
+        "\n{runs} captured run{} in {} batch{}:",
+        if runs == 1 { "" } else { "s" },
+        batches.len(),
+        if batches.len() == 1 { "" } else { "es" }
+    );
+    let _ = writeln!(
+        out,
+        "{:<30} {:>5} {:<30} {:>18} {:>6}  KEY",
+        "BATCH", "RUNS", "STATUS", "COST", "LAST"
+    );
+    for batch in batches {
+        let counts: Vec<String> = batch["counts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| format!("{} {}", c["sessions"], str_field(c, "status")))
+            .collect();
+        let spent = batch["cost_usd"].as_f64().unwrap_or(0.0);
+        let cost = match batch["budget_usd"].as_f64() {
+            Some(budget) if batch["over_budget"] == true => {
+                format!("{} of {} OVER", dollars(spent), dollars(budget))
+            }
+            Some(budget) => format!("{} of {}", dollars(spent), dollars(budget)),
+            None => dollars(spent),
+        };
+        let _ = writeln!(
+            out,
+            "{:<30} {:>5} {:<30} {:>18} {:>6}  {}",
+            shown(&batch_name(batch, sessions), 30),
+            batch["sessions"].as_u64().unwrap_or(0),
+            shown(&counts.join(", "), 30),
+            cost,
+            span(now - batch["last_ts"].as_i64().unwrap_or(now)),
+            shown(str_field(batch, "key"), 60)
+        );
+    }
+    let _ = writeln!(out, "runs of one batch: fw hub fleet --batch KEY");
 }
 
 #[derive(Debug, clap::Args)]
@@ -362,8 +454,11 @@ fn print_inbox(out: &mut dyn Write, page: &Value) {
             );
         }
         // A dialog is answered in the session; an ask, by the next prompt
-        // (another hub's session: on that hub).
-        if ask["kind"] == "handoff" && host == own {
+        // (another hub's session: on that hub; a captured run: where it
+        // runs).
+        if session["links"]["captured"] == true {
+            let _ = writeln!(out, "  a captured run: answer it where it runs");
+        } else if ask["kind"] == "handoff" && host == own {
             let _ = writeln!(out, "  start: fw hub continue {id}");
         } else if session["status"] == "asking" && host == own {
             let _ = writeln!(out, "  reply: fw hub broadcast {id} 'TEXT'");
@@ -599,6 +694,38 @@ mod tests {
             text(|out| print_board(out, &json!({"sessions": []}))),
             "no agent session has reported\n"
         );
+    }
+
+    #[test]
+    fn captured_runs_are_counted_per_batch_with_spend_against_budget() {
+        let own = "aaaaaaaabbbbbbbbccccccccdddddddd";
+        let page = json!({
+            "host": own, "now": 600_000, "total": 1,
+            "counts": [{"status": "working", "sessions": 4, "cost_usd": 3.5}],
+            "sessions": [{"host": own, "session": "p1", "label": "lead", "status": "working",
+                          "since": 0, "last_ts": 0, "turns": 1, "turn_tools": 0,
+                          "open_tools": 0, "tools": 0, "tool_errors": 0, "denied": 0,
+                          "subagents_active": 0, "subagents_total": 0}],
+            "batches": [
+                {"key": "batch:analysts", "host": own, "label": "analysts", "sessions": 2,
+                 "counts": [{"status": "working", "sessions": 1, "cost_usd": 0.5},
+                            {"status": "ended", "sessions": 1, "cost_usd": 2.0}],
+                 "cost_usd": 2.5, "budget_usd": 2.0, "over_budget": true,
+                 "first_ts": 0, "last_ts": 540_000},
+                {"key": "under:p1", "host": own, "parent": "p1", "sessions": 1,
+                 "counts": [{"status": "working", "sessions": 1, "cost_usd": 1.0}],
+                 "cost_usd": 1.0, "over_budget": false, "first_ts": 0, "last_ts": 600_000},
+            ],
+        });
+        let board = text(|out| print_board(out, &page));
+        assert!(board.contains("3 captured runs in 2 batches:"), "{board}");
+        assert!(board.contains("analysts"), "{board}");
+        assert!(board.contains("1 working, 1 ended"), "{board}");
+        assert!(board.contains("$2.50 of $2.00 OVER"), "{board}");
+        assert!(board.contains("batch:analysts"), "{board}");
+        // A parent on the page is named.
+        assert!(board.contains("under lead"), "{board}");
+        assert!(board.contains("fw hub fleet --batch KEY"), "{board}");
     }
 
     #[test]

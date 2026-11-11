@@ -7,6 +7,8 @@
 //! * `POST /api/telemetry/hook`: one Claude Code hook's JSON. An empty
 //!   200 tells Claude Code the hook passed; the hub never blocks a tool.
 //! * `POST /api/telemetry/mcp`: the progress tool (an MCP server).
+//! * `POST /api/telemetry/capture`: a hook of a run the hub did not start,
+//!   with the capture token (see [`crate::hub`]'s capture).
 //!
 //! What the UI, the CLI, and other hubs read and write, with the hub's
 //! credential (a peer's included):
@@ -14,11 +16,14 @@
 //! * `GET /api/telemetry/fleet`: the fleet board, one page.
 //! * `GET /api/telemetry/sessions/{id}`: one session in full.
 //! * `GET /api/telemetry/sessions/{id}/events`: its event log, paged.
+//! * `GET /api/telemetry/capture/hooks`: the user-level hooks
+//!   `fw hub capture install` writes.
 //! * `POST /api/telemetry/batch`: another hub's events (a collector's
 //!   intake; see [`crate::telemetry::forward`]).
 
 use super::{ApiQuery, AppState, BodyBound, error_response};
-use crate::agent::{SECRET_HEADER, SESSION_HEADER};
+use crate::agent::{BATCH_HEADER, BUDGET_HEADER, CAPTURE_HEADER, SECRET_HEADER, SESSION_HEADER};
+use crate::hub::{CaptureFrom, CaptureRefused};
 use crate::telemetry::{FleetQuery, forward, mcp};
 use axum::Json;
 use axum::body::Bytes;
@@ -80,6 +85,69 @@ pub(super) async fn hook(State(app): State<AppState>, headers: HeaderMap, body: 
         // No body: Claude Code reads an empty 2xx as "the hook passed".
         Ok(Ok(())) => StatusCode::OK.into_response(),
         Ok(Err(message)) => error_response(StatusCode::FORBIDDEN, &message),
+        Err(join) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("worker task failed: {join}"),
+        ),
+    }
+}
+
+pub(super) async fn capture(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    let Some(token) = value(CAPTURE_HEADER) else {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "a captured run's hook carries the x-flywheel-capture token `fw hub capture install` \
+             wrote",
+        );
+    };
+    let Ok(payload) = serde_json::from_slice::<Value>(&body) else {
+        return error_response(StatusCode::BAD_REQUEST, "the hook payload is not JSON");
+    };
+    let from = CaptureFrom {
+        parent: value(SESSION_HEADER),
+        batch: value(BATCH_HEADER),
+        budget: value(BUDGET_HEADER),
+    };
+    let hub = Arc::clone(&app.hub);
+    // Off the async workers: pricing a run reads its transcript.
+    let handled =
+        tokio::task::spawn_blocking(move || hub.capture_report(&token, from, payload)).await;
+    match handled {
+        Ok(Ok(())) => StatusCode::OK.into_response(),
+        Ok(Err(CaptureRefused::Token)) => error_response(
+            StatusCode::UNAUTHORIZED,
+            "the capture token is not this hub's: run `fw hub capture install` again",
+        ),
+        Ok(Err(CaptureRefused::Payload(why))) => {
+            error_response(StatusCode::BAD_REQUEST, &format!("the hook payload {why}"))
+        }
+        Ok(Err(CaptureRefused::Hub(why))) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &why)
+        }
+        Err(join) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("worker task failed: {join}"),
+        ),
+    }
+}
+
+pub(super) async fn capture_hooks(State(app): State<AppState>) -> Response {
+    let hub = Arc::clone(&app.hub);
+    match tokio::task::spawn_blocking(move || hub.capture_hooks()).await {
+        Ok(Ok(settings)) => Json(settings).into_response(),
+        Ok(Err(why)) => error_response(StatusCode::SERVICE_UNAVAILABLE, &why),
         Err(join) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("worker task failed: {join}"),
@@ -150,6 +218,10 @@ pub(super) struct FleetParams {
     hours: Option<String>,
     limit: Option<String>,
     offset: Option<String>,
+    /// `1`: captured runs are counted in their rollups, not listed.
+    rollup: Option<String>,
+    /// Only one rollup's runs (its key).
+    batch: Option<String>,
 }
 
 fn number<T: std::str::FromStr>(raw: Option<&str>, name: &str) -> Result<Option<T>, String> {
@@ -208,15 +280,36 @@ pub(super) async fn fleet(
                 .then(|| crate::telemetry::now_ms() - hours.saturating_mul(3_600_000)),
             limit: number(params.limit.as_deref(), "limit")?.unwrap_or(DEFAULT_FLEET_LIMIT),
             offset: number(params.offset.as_deref(), "offset")?.unwrap_or(0),
+            rollup: params.rollup.as_deref() == Some("1"),
+            batch: params
+                .batch
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(str::to_owned),
         })
     })();
     let query = match parsed {
         Ok(query) => query,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
     };
-    let telemetry = Arc::clone(app.hub.telemetry());
-    let own = telemetry.host().to_owned();
-    match read(move || telemetry.fleet(&query)).await {
+    let hub = Arc::clone(&app.hub);
+    let own = hub.telemetry().host().to_owned();
+    let named = own.clone();
+    let fleet = move || {
+        let mut page = hub.telemetry().fleet(&query)?;
+        // A batch under one of this hub's sessions is named for it.
+        let store = hub.store();
+        for batch in &mut page.batches {
+            if batch.host == named
+                && let Some(parent) = &batch.parent
+            {
+                batch.parent_name = store.session(parent).ok().map(|r| r.name.clone());
+            }
+        }
+        Ok(page)
+    };
+    match read(fleet).await {
         Ok(page) => Json(json!({
             // This hub's id: the `host` of the sessions it owns.
             "host": own,
@@ -225,6 +318,7 @@ pub(super) async fn fleet(
             "total": page.total,
             "counts": page.counts,
             "hosts": page.hosts,
+            "batches": page.batches,
         }))
         .into_response(),
         Err(refused) => refused,

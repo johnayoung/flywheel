@@ -614,6 +614,30 @@ pub fn core_skills(skills: &PolicySkills) -> CoreSkills {
     }
 }
 
+/// The variable a launcher names its batch of agent runs with: a hub
+/// capturing runs (`fw hub capture install`) counts a worker's runs
+/// together.
+pub const BATCH_ENV: &str = "FLYWHEEL_BATCH";
+
+/// `agent_env` with the worker's runs named as one batch, `fw worker:
+/// <folder>` (the folder the worker runs in), unless `[sandbox.env]` or
+/// the worker's own environment already names one.
+fn with_batch(agent_env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut env = agent_env.clone();
+    if env.contains_key(BATCH_ENV) || std::env::var_os(BATCH_ENV).is_some() {
+        return env;
+    }
+    let label = std::env::current_dir()
+        .ok()
+        .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .map_or_else(
+            || "fw worker".to_owned(),
+            |folder| format!("fw worker: {folder}"),
+        );
+    env.insert(BATCH_ENV.to_owned(), label);
+    env
+}
+
 /// The [`RunTaskOptions`] one [`RunTaskRequest`] maps onto: every primitive
 /// the loop decomposed (agent options, budgets, deadlines, the bound
 /// landability gate and checkpoint probe, the seed's run id / worker id /
@@ -640,7 +664,7 @@ pub fn run_task_options_for(
             mcp_strict: agent.mcp_strict,
             exec_enabled: agent.exec_enabled,
             exec_auto_allow: agent.exec_auto_allow,
-            agent_env: agent.agent_env.clone(),
+            agent_env: with_batch(&agent.agent_env),
             transport: agent.agent_transport.clone(),
             command_override: None,
             credential: agent.credential.clone(),
@@ -3101,7 +3125,13 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"c
         };
         let options = run_task_options_for(&request, None, EventsMode::Json);
         assert_eq!(options.agent.credential, Some(credential));
-        assert!(options.agent.agent_env.is_empty());
+        // The credential is not in the environment; the worker's batch
+        // name is all that is added there.
+        assert!(
+            options.agent.agent_env.keys().all(|k| k == BATCH_ENV),
+            "{:?}",
+            options.agent.agent_env
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod autopilot_cli;
 pub mod broadcast;
 pub mod broadcast_cli;
 pub mod browser;
+mod capture_cli;
 pub mod cli;
 pub mod commands;
 pub mod commands_cli;

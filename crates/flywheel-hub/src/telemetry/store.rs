@@ -17,7 +17,7 @@ use std::path::Path;
 /// The store's file in the state dir.
 pub const DB_FILE: &str = "telemetry.db";
 /// The schema this build reads and writes (`PRAGMA user_version`).
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 2;
 /// Most sessions one fleet page returns.
 pub const FLEET_PAGE_MAX: usize = 1000;
 /// Most events one page returns.
@@ -46,6 +46,11 @@ pub struct FleetQuery {
     pub active_since: Option<i64>,
     pub limit: usize,
     pub offset: usize,
+    /// Captured runs are counted in their rollups ([`FleetPage::batches`])
+    /// rather than listed one by one.
+    pub rollup: bool,
+    /// Only the runs of this rollup (a [`BatchRollup::key`]).
+    pub batch: Option<String>,
 }
 
 /// How many sessions are in a status, and what they cost.
@@ -67,7 +72,41 @@ pub struct FleetPage {
     /// Every status's count under the same host and time filter.
     pub counts: Vec<StatusCount>,
     pub hosts: u64,
+    /// With [`FleetQuery::rollup`]: the captured runs' rollups, the latest
+    /// active first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub batches: Vec<BatchRollup>,
 }
+
+/// Captured runs counted together: one launcher's batch, the runs under
+/// one hub session, or those from outside the hub.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BatchRollup {
+    /// `batch:LABEL`, `under:SESSION`, or `outside`.
+    pub key: String,
+    pub host: String,
+    /// The launcher's label (`batch:`), or the parent session (`under:`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// The parent's name on its hub (filled in by the hub that has it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_name: Option<String>,
+    pub sessions: u64,
+    /// How many are in each status, most urgent first.
+    pub counts: Vec<StatusCount>,
+    pub cost_usd: f64,
+    /// The most any run in it was given to spend (USD).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
+    pub over_budget: bool,
+    pub first_ts: i64,
+    pub last_ts: i64,
+}
+
+/// Most rollups one fleet page returns.
+pub const ROLLUPS_MAX: usize = 200;
 
 pub struct Store {
     conn: Connection,
@@ -121,6 +160,18 @@ impl Store {
                  at   INTEGER NOT NULL
              ) WITHOUT ROWID;",
         )?;
+        // Schema 2: the rollup a captured run is counted in.
+        let has_batch: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'batch'",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_batch {
+            conn.execute_batch("ALTER TABLE sessions ADD COLUMN batch TEXT")?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS sessions_batch ON sessions (batch, last_ts)",
+        )?;
         conn.pragma_update(None, "user_version", SCHEMA)?;
         Ok(Self { conn })
     }
@@ -147,11 +198,12 @@ impl Store {
                 ])?;
             }
             let mut upsert = tx.prepare_cached(
-                "INSERT INTO sessions (host, session, status, rank, last_ts, cost, snap, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                "INSERT INTO sessions (host, session, status, rank, last_ts, cost, snap, state, batch)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT (host, session) DO UPDATE SET
                      status = excluded.status, rank = excluded.rank, last_ts = excluded.last_ts,
-                     cost = excluded.cost, snap = excluded.snap, state = excluded.state",
+                     cost = excluded.cost, snap = excluded.snap, state = excluded.state,
+                     batch = excluded.batch",
             )?;
             for state in states {
                 let snap = state.snapshot();
@@ -175,6 +227,7 @@ impl Store {
                     snap.usage.as_ref().and_then(|u| u.cost_usd).unwrap_or(0.0),
                     snap_json,
                     state_json,
+                    snap.links.rollup_key(),
                 ])?;
             }
         }
@@ -295,17 +348,23 @@ impl Store {
         // statement is built from the request.
         let statuses = serde_json::to_string(&query.statuses).unwrap_or_else(|_| "[]".to_owned());
         let any = query.statuses.is_empty();
+        // Which rows: one rollup's runs, else (rolled up) the hub's own
+        // sessions only, else all.
+        let batch = query.batch.as_deref();
+        let own_only = query.rollup && batch.is_none();
         let total: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sessions
              WHERE last_ts >= ?1 AND (?2 IS NULL OR host = ?2)
-               AND (?3 OR status IN (SELECT value FROM json_each(?4)))",
-            params![since, host, any, statuses],
+               AND (?3 OR status IN (SELECT value FROM json_each(?4)))
+               AND (?5 IS NULL OR batch = ?5) AND (NOT ?6 OR batch IS NULL)",
+            params![since, host, any, statuses, batch, own_only],
             |row| row.get(0),
         )?;
         let mut page = self.conn.prepare_cached(
             "SELECT snap FROM sessions
              WHERE last_ts >= ?1 AND (?2 IS NULL OR host = ?2)
                AND (?3 OR status IN (SELECT value FROM json_each(?4)))
+               AND (?7 IS NULL OR batch = ?7) AND (NOT ?8 OR batch IS NULL)
              ORDER BY rank, last_ts DESC, host, session LIMIT ?5 OFFSET ?6",
         )?;
         let sessions = page
@@ -316,19 +375,120 @@ impl Store {
                     any,
                     statuses,
                     query.limit.clamp(1, FLEET_PAGE_MAX) as i64,
-                    query.offset as i64
+                    query.offset as i64,
+                    batch,
+                    own_only
                 ],
                 |row| row.get::<_, String>(0),
             )?
             .filter_map(Result::ok)
             .filter_map(|raw| serde_json::from_str(&raw).ok())
             .collect();
+        let batches = if own_only {
+            self.rollups(since, host)?
+        } else {
+            Vec::new()
+        };
         Ok(FleetPage {
             sessions,
             total: total as u64,
             counts,
             hosts: hosts as u64,
+            batches,
         })
+    }
+
+    /// The captured runs' rollups active since `since`, the latest first.
+    fn rollups(&self, since: i64, host: Option<&str>) -> Result<Vec<BatchRollup>, StoreError> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT host, batch, status, COUNT(*), SUM(cost), MIN(last_ts), MAX(last_ts),
+                    MAX(json_extract(snap, '$.links.budget_usd')),
+                    MAX(json_extract(snap, '$.links.batch')),
+                    MAX(json_extract(snap, '$.links.opened_by')),
+                    MIN(rank)
+             FROM sessions
+             WHERE batch IS NOT NULL AND last_ts >= ?1 AND (?2 IS NULL OR host = ?2)
+             GROUP BY host, batch, status",
+        )?;
+        let rows = query.query_map(params![since, host], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                StatusCount {
+                    status: row.get(2)?,
+                    sessions: row.get::<_, i64>(3)? as u64,
+                    cost_usd: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
+                },
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<f64>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, i64>(10)?,
+            ))
+        })?;
+        let mut rollups: Vec<(BatchRollup, Vec<i64>)> = Vec::new();
+        for row in rows {
+            let (host, key, count, first, last, budget, label, parent, rank) = row?;
+            let at = match rollups
+                .iter()
+                .position(|(r, _)| r.key == key && r.host == host)
+            {
+                Some(at) => at,
+                None => {
+                    let under = key.starts_with("under:");
+                    rollups.push((
+                        BatchRollup {
+                            key,
+                            host,
+                            label: None,
+                            parent: None,
+                            parent_name: None,
+                            sessions: 0,
+                            counts: Vec::new(),
+                            cost_usd: 0.0,
+                            budget_usd: None,
+                            over_budget: false,
+                            first_ts: first,
+                            last_ts: last,
+                        },
+                        Vec::new(),
+                    ));
+                    let (rollup, _) = rollups.last_mut().expect("just pushed");
+                    if under {
+                        rollup.parent = parent;
+                    } else {
+                        rollup.label = label;
+                    }
+                    rollups.len() - 1
+                }
+            };
+            let (rollup, ranks) = &mut rollups[at];
+            rollup.sessions += count.sessions;
+            rollup.cost_usd += count.cost_usd;
+            rollup.first_ts = rollup.first_ts.min(first);
+            rollup.last_ts = rollup.last_ts.max(last);
+            rollup.budget_usd = match (rollup.budget_usd, budget) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            ranks.push(rank);
+            rollup.counts.push(count);
+        }
+        let mut rollups: Vec<BatchRollup> = rollups
+            .into_iter()
+            .map(|(mut rollup, ranks)| {
+                let mut ordered: Vec<(i64, StatusCount)> =
+                    ranks.into_iter().zip(rollup.counts).collect();
+                ordered.sort_by_key(|(rank, _)| *rank);
+                rollup.counts = ordered.into_iter().map(|(_, c)| c).collect();
+                rollup.over_budget = rollup.budget_usd.is_some_and(|b| rollup.cost_usd > b);
+                rollup
+            })
+            .collect();
+        rollups.sort_by(|a, b| b.last_ts.cmp(&a.last_ts).then_with(|| a.key.cmp(&b.key)));
+        rollups.truncate(ROLLUPS_MAX);
+        Ok(rollups)
     }
 
     /// Forget events and sessions with nothing since `before` (unix ms).

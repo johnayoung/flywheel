@@ -1186,11 +1186,8 @@ fn asking_sessions_rank_right_after_blocked_ones() {
     );
     let page = telemetry
         .fleet(&FleetQuery {
-            statuses: Vec::new(),
-            host: None,
-            active_since: None,
             limit: 10,
-            offset: 0,
+            ..FleetQuery::default()
         })
         .unwrap();
     let order: Vec<&str> = page.sessions.iter().map(|s| s.session.as_str()).collect();
@@ -1257,7 +1254,7 @@ fn a_handoff_waits_with_its_prompt_until_a_successor_takes_it() {
                 dir: None,
                 links: Some(event::SessionLinks {
                     continues: Some("old".into()),
-                    opened_by: None,
+                    ..Default::default()
                 }),
             },
         )],
@@ -1277,7 +1274,7 @@ fn a_handoff_waits_with_its_prompt_until_a_successor_takes_it() {
                 dir: None,
                 links: Some(event::SessionLinks {
                     continues: Some("old".into()),
-                    opened_by: None,
+                    ..Default::default()
                 }),
             },
         )],
@@ -1305,4 +1302,154 @@ fn a_handoff_without_a_prompt_is_not_an_ask() {
         ],
     );
     assert_eq!(telemetry.snapshot("s").unwrap().status, "done");
+}
+
+#[test]
+fn captured_runs_are_rolled_up_by_batch_parent_or_outside() {
+    let (_dir, telemetry) = open();
+    let run = |id: &str, links: SessionLinks, at: i64, cost: f64, end: bool| {
+        let mut drafts = vec![
+            Draft::new(
+                at,
+                What::SessionStarted {
+                    harness: "claude".to_owned(),
+                    conversation: Some(id.to_owned()),
+                    model: None,
+                    label: Some(id.to_owned()),
+                    dir: None,
+                    links: Some(links),
+                },
+            ),
+            Draft::new(
+                at,
+                What::TurnStarted {
+                    title: "go".to_owned(),
+                },
+            ),
+            Draft::new(
+                at,
+                What::Usage {
+                    input: 1,
+                    output: 1,
+                    cache_read: 0,
+                    cache_write: 0,
+                    cost_usd: Some(cost),
+                },
+            ),
+        ];
+        if end {
+            drafts.push(Draft::new(at, What::SessionFinished { reason: None }));
+        }
+        telemetry.record(id, drafts);
+    };
+    let batch = |b: &str| SessionLinks {
+        captured: true,
+        batch: Some(b.to_owned()),
+        budget_usd: Some(1.0),
+        ..SessionLinks::default()
+    };
+    run("a1", batch("analysts"), 100, 0.75, true);
+    run("a2", batch("analysts"), 200, 0.5, false);
+    run(
+        "c1",
+        SessionLinks {
+            captured: true,
+            opened_by: Some("lead".to_owned()),
+            ..SessionLinks::default()
+        },
+        300,
+        0.25,
+        false,
+    );
+    run(
+        "t1",
+        SessionLinks {
+            captured: true,
+            ..SessionLinks::default()
+        },
+        50,
+        0.0,
+        false,
+    );
+    // The hub's own session is listed, never rolled up.
+    run("lead", SessionLinks::default(), 400, 2.0, false);
+    let page = telemetry
+        .fleet(&FleetQuery {
+            limit: 50,
+            rollup: true,
+            ..FleetQuery::default()
+        })
+        .unwrap();
+    let listed: Vec<&str> = page.sessions.iter().map(|s| s.session.as_str()).collect();
+    assert_eq!(listed, ["lead"]);
+    assert_eq!(page.total, 1);
+    let keys: Vec<&str> = page.batches.iter().map(|b| b.key.as_str()).collect();
+    assert_eq!(keys, ["under:lead", "batch:analysts", "outside"]);
+    let analysts = &page.batches[1];
+    assert_eq!(analysts.label.as_deref(), Some("analysts"));
+    assert_eq!(analysts.sessions, 2);
+    assert!((analysts.cost_usd - 1.25).abs() < 1e-9);
+    assert_eq!(analysts.budget_usd, Some(1.0));
+    assert!(analysts.over_budget);
+    // Most urgent status first.
+    let statuses: Vec<&str> = analysts.counts.iter().map(|c| c.status.as_str()).collect();
+    assert_eq!(statuses, ["working", "ended"]);
+    assert_eq!(page.batches[0].parent.as_deref(), Some("lead"));
+    assert!(!page.batches[0].over_budget);
+    // One batch's runs.
+    let one = telemetry
+        .fleet(&FleetQuery {
+            limit: 50,
+            batch: Some("batch:analysts".to_owned()),
+            ..FleetQuery::default()
+        })
+        .unwrap();
+    let mut runs: Vec<&str> = one.sessions.iter().map(|s| s.session.as_str()).collect();
+    runs.sort_unstable();
+    assert_eq!(runs, ["a1", "a2"]);
+    assert!(one.batches.is_empty());
+    // Not rolled up: every session.
+    let all = telemetry
+        .fleet(&FleetQuery {
+            limit: 50,
+            ..FleetQuery::default()
+        })
+        .unwrap();
+    assert_eq!(all.total, 5);
+}
+
+#[test]
+fn a_store_from_before_rollups_gains_the_batch_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(store::DB_FILE);
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 host TEXT NOT NULL, session TEXT NOT NULL, status TEXT NOT NULL,
+                 rank INTEGER NOT NULL, last_ts INTEGER NOT NULL, cost REAL NOT NULL DEFAULT 0,
+                 snap TEXT NOT NULL, state TEXT NOT NULL, PRIMARY KEY (host, session)
+             ) WITHOUT ROWID;
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+    telemetry.record(
+        "s",
+        vec![Draft::new(
+            1,
+            What::TurnStarted {
+                title: "go".to_owned(),
+            },
+        )],
+    );
+    let page = telemetry
+        .fleet(&FleetQuery {
+            limit: 5,
+            rollup: true,
+            ..FleetQuery::default()
+        })
+        .unwrap();
+    assert_eq!(page.total, 1);
 }

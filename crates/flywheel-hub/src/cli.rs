@@ -136,6 +136,11 @@ enum HubCommand {
     /// now, fan-outs graded, commands suggested, cost; then the activity
     /// timeline (this hub and its machines), newest first.
     Activity(crate::activity_cli::ActivityArgs),
+    /// The fleet board: every agent session's status, what it is doing,
+    /// its progress (the plan it declared, else what was observed),
+    /// context window, and cost, most urgent first; with SESSION, that
+    /// session's plan and its turns with their subagents.
+    Fleet(crate::fleet_cli::FleetArgs),
     /// The digest since the last one (or --since): per workspace, turns
     /// finished, agents blocked, fan-outs graded, PRs, autopilot, queue
     /// stalls, spend, and the top items that need you; previewed, or sent
@@ -734,6 +739,7 @@ fn dispatch_verb(
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),
         HubCommand::Search(args) => crate::search_cli::run(&args, out, err),
         HubCommand::Activity(args) => crate::activity_cli::run(&args, out, err),
+        HubCommand::Fleet(args) => crate::fleet_cli::fleet(&args, out, err),
         HubCommand::Digest(args) => crate::digest_cli::run(&args, out, err),
         HubCommand::Review(args) => crate::review_cli::review(&args, out, err),
         HubCommand::Merge(args) => crate::review_cli::merge(&args, out, err),

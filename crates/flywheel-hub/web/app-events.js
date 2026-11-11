@@ -373,6 +373,9 @@ function onPush(message, machine) {
   } else if (message.type === "activity") {
     activity.onRow(message.row, machine);
     pullRequests.onActivity(message.row);
+  } else if (message.type === "telemetry") {
+    fleet.onSnapshot(message.session, machine);
+    work.onSnapshot(message.session, machine);
   } else if (message.type === "away" && !machine) {
     activity.onAway(message);
   } else if (message.type === "digest" && !machine) {

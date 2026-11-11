@@ -145,9 +145,9 @@ const CLAUDE_HOOKS: &[(&str, Option<&str>)] = &[
 /// milliseconds; this only bounds a wedged hub).
 pub const CLAUDE_HOOK_TIMEOUT_SECS: u64 = 10;
 
-/// The Claude Code release the hub's http hooks were verified on; an
-/// older CLI gets a command hook per event instead (the same reports,
-/// one process each).
+/// The Claude Code release the hub's http hooks were verified on. Until
+/// a session's status line has shown a CLI at or past it, sessions get a
+/// command hook per event instead (the same reports, one process each).
 pub const CLAUDE_HTTP_HOOKS_SINCE: (u32, u32, u32) = (2, 1, 322);
 
 /// The path agent hooks POST to on their hub.

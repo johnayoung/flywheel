@@ -41,6 +41,7 @@ pub mod endpoint;
 pub mod fanout;
 pub mod fanout_cli;
 pub mod files;
+mod fleet_cli;
 pub mod flywheel;
 pub mod fsbrowse;
 pub mod git;

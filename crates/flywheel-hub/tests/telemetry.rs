@@ -27,15 +27,14 @@ struct TestHub {
     server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
 }
 
-/// A stand-in Claude Code: answers `--version` like a current CLI, else
-/// records its argv (a line each) and environment and waits.
+/// A stand-in Claude Code: records its argv (a line each) and environment
+/// and waits.
 fn fake_claude(dir: &Path) -> PathBuf {
     let path = dir.join("claude");
     support::write_script(
         &path,
         &format!(
             "#!/bin/sh\n\
-             if [ \"$1\" = \"--version\" ]; then echo '2.1.322 (Claude Code)'; exit 0; fi\n\
              for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{d}.args'\n\
              env > '{d}.env.tmp' && mv '{d}.env.tmp' '{d}.env'\n\
              sleep 600\n",
@@ -47,9 +46,19 @@ fn fake_claude(dir: &Path) -> PathBuf {
 
 impl TestHub {
     async fn start(upstream: Option<&str>) -> Self {
+        Self::start_knowing(upstream, Some("2.1.322")).await
+    }
+
+    /// A hub that has seen Claude Code `version` in an earlier run (the
+    /// file a status line leaves), or none yet.
+    async fn start_knowing(upstream: Option<&str>, version: Option<&str>) -> Self {
         flywheel_hub::install_crypto_provider();
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("repo")).unwrap();
+        if let Some(version) = version {
+            std::fs::create_dir_all(dir.path().join("state")).unwrap();
+            std::fs::write(dir.path().join("state/claude-version"), version).unwrap();
+        }
         let mut options = HubOptions::new(dir.path().join("state"));
         options.default_shell = vec!["/bin/sh".into()];
         options.agents.claude = fake_claude(dir.path()).to_string_lossy().into_owned();
@@ -555,4 +564,70 @@ async fn a_hub_forwards_its_events_to_its_collector() {
     }
     edge.shutdown().await;
     collector.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_hooks_wait_for_a_status_line_to_show_a_new_enough_cli() {
+    let hub = TestHub::start_knowing(None, None).await;
+    // The hub's first session ever: it runs no CLI to ask its version, so
+    // every hook is the report command.
+    let (sid, args, env) = hub.claude().await;
+    let settings: Value = serde_json::from_str(arg_after(&args, "--settings")).unwrap();
+    assert_eq!(
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["type"],
+        "command"
+    );
+    assert_eq!(
+        settings["hooks"]["SubagentStart"][0]["hooks"][0]["type"],
+        "command"
+    );
+    let status_line = |version: &str| flywheel_hub::report::Report {
+        session: env[flywheel_hub::report::SESSION_ENV].clone(),
+        secret: env[flywheel_hub::report::SECRET_ENV].clone(),
+        source: "claude".into(),
+        event: "statusline".into(),
+        detail: None,
+        payload: Some(json!({ "version": version, "cost": {"total_cost_usd": 0.1} })),
+    };
+    let socket = PathBuf::from(&env[flywheel_hub::report::SOCKET_ENV]);
+    // Too old a CLI changes nothing; a current one is remembered.
+    flywheel_hub::report::send(&socket, &status_line("2.1.100")).unwrap();
+    let saved = hub.dir.path().join("state/claude-version");
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "2.1.100\n");
+    flywheel_hub::report::send(&socket, &status_line("2.1.322")).unwrap();
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "2.1.322\n");
+    // Its next launch POSTs.
+    std::fs::remove_file(hub.dir.path().join("claude.env")).unwrap();
+    hub.post(&format!("/api/sessions/{sid}/kill"), json!({}))
+        .await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (status, _) = hub
+            .call(
+                reqwest::Method::POST,
+                &format!("/api/sessions/{sid}/relaunch"),
+                Some(json!({})),
+            )
+            .await;
+        if status.is_success() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never exited: {status}");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    while !hub.dir.path().join("claude.env").exists() {
+        assert!(Instant::now() < deadline, "never relaunched");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let args: Vec<String> = std::fs::read_to_string(hub.dir.path().join("claude.args"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let settings: Value = serde_json::from_str(arg_after(&args, "--settings")).unwrap();
+    assert_eq!(
+        settings["hooks"]["PreToolUse"][0]["hooks"][0]["type"],
+        "http"
+    );
+    hub.shutdown().await;
 }

@@ -254,7 +254,9 @@ What every agent session does ([hub-workflows](workflows.md#fleet-and-work)).
 | POST | `/api/telemetry/hook` | a Claude Code hook's JSON; no login: `x-flywheel-session`, `x-flywheel-secret` |
 | POST | `/api/telemetry/mcp` | the progress tool (MCP over http); same headers |
 
-Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: its turn or subagent; `item`: its plan item). Kinds: `session.started`, `session.finished`, `turn.started`, `turn.finished`, `turn.failed`, `tool.started`, `tool.finished` (paired by `id`), `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
+Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: its turn or subagent; `item`: its plan item).
+
+Kinds: `session.started`, `session.finished`, `turn.started`, `turn.finished`, `turn.failed`, `tool.started`, `tool.finished` (paired by `id`), `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
 
 ## Events WebSocket
 

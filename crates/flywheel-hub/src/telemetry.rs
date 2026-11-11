@@ -349,9 +349,11 @@ impl Inner {
         live: &'a mut HashMap<Key, SessionState>,
         key: &Key,
     ) -> &'a mut SessionState {
+        // A session not in memory has nothing queued: it left memory only
+        // after a commit saved it whole (see `evict`), so its row is
+        // current. Read on the readers' connection: recording never waits
+        // on the writer's commit.
         live.entry(key.clone()).or_insert_with(|| {
-            // Queued writes for it first: the saved row must be current.
-            self.flush_pending();
             lock(&self.read)
                 .state(&key.0, &key.1)
                 .ok()
@@ -396,22 +398,6 @@ impl Inner {
                 announce(snapshot);
             }
         }
-    }
-
-    /// Commit the queue from inside a holder of `live` that is about to
-    /// read a saved state (nothing of the session being loaded is queued
-    /// under that lock, so its states need no re-read).
-    fn flush_pending(&self) {
-        let pending = std::mem::take(&mut *lock(&self.pending));
-        if pending.events.is_empty() {
-            return;
-        }
-        // The states are saved by the next full flush; the events must
-        // not be lost meanwhile.
-        if let Err(e) = lock(&self.db).write(&pending.events, &[]) {
-            eprintln!("fw hub: {e}");
-        }
-        lock(&self.pending).dirty.extend(pending.dirty);
     }
 
     /// One commit; the caller holds `gate`.

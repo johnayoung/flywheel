@@ -103,6 +103,8 @@ function paletteCommands() {
   launcher.paletteItems(cmd);
   search.paletteItems(cmd);
   activity.paletteItems(cmd);
+  fleet.paletteItems(cmd);
+  work.paletteItems(cmd);
   digests.paletteItems(cmd);
   commands.paletteItems(cmd);
   flywheel.paletteItems(cmd);
@@ -597,6 +599,8 @@ const actions = {
   "toggle-flywheel": () => flywheel.togglePill(),
   "toggle-review": () => review.togglePill(),
   "toggle-queue": () => promptQueue.togglePill(),
+  "toggle-work": () => work.togglePill(),
+  fleet: () => fleet.open(),
   search: () => search.open(),
   activity: () => activity.open(),
   settings: () => {

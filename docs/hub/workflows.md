@@ -157,10 +157,10 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 Every agent session's turns, tool calls (duration, outcome), subagents, plan, waits on you, context window, cost, and rate limits are recorded (`telemetry.db`, 30 days) and folded into what it is doing now.
 
-- **Fleet** (the sidebar chip, palette **Fleet board**): every session, what needs you first: status, the running turn and tool, progress, context %, cost. Machines' sessions are listed with this hub's.
+- **Fleet** (the sidebar chip, palette **Fleet board**, `fw hub fleet [SESSION]`): every session, what needs you first: status, the running turn and tool, progress, context %, cost. Machines' sessions are listed with this hub's.
 - **Work** (the header's **work** pill): one session's plan, then its turns with their subagents and calls.
 - **Progress** is observed (turns, subagents, calls) and, when the agent keeps a plan, declared: its todo or task tools, Codex's plan, or the hub's `report_progress` tool, which every Claude session gets with one system-prompt sentence asking for its use. A declared status is the agent's claim, shown beside the calls made under it; with no plan there is no percentage.
-- **Capture**: Claude Code's hooks POST to the hub (a process per event only for `SessionStart`, a CLI before 2.1.322, or under `allowedHttpHookUrls`); its status line carries the context window, cost, and the 5 h / 7 d gauges (your own status line still shows: the hub's runs it). Codex is read from its rollout.
+- **Capture**: Claude Code's hooks POST to the hub (a process per event only for `SessionStart`, until a status line has shown a CLI of 2.1.322 or later, or under `allowedHttpHookUrls`); its status line carries the context window, cost, and the 5 h / 7 d gauges (your own status line still shows: the hub's runs it). Codex is read from its rollout.
 - **Many hosts**: `[telemetry] upstream = "NAME"` sends this hub's events to that machine (`fw hub machine add`) in batches; while it is down they wait here. Its Fleet lists every hub's sessions.
 
 ## Digests

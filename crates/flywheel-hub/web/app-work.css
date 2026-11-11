@@ -1,0 +1,204 @@
+/* flywheel hub -- Work (work.js): what one agent session is working on,
+ * from its telemetry. A drawer over the terminal (the commands drawer's
+ * frame; a full-screen sheet on phones) and the same content in a
+ * read-only sheet. The fleet board (app-fleet.css) shares the status
+ * word, the meter, and the small tags.
+ * Loaded after app-board.css, in index.html's order. */
+
+/* --- shared with the fleet board ------------------------------------------- */
+.wk-status { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .6rem; min-width: 0; }
+.wk-status-word { display: inline-flex; align-items: center; gap: .5rem; }
+.wk-status-word b { font-size: 10px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); }
+.wk-status.working b { color: var(--signal); }
+.wk-status.blocked b, .wk-status.failed b { color: var(--alert); }
+.wk-status.done b { color: var(--brass); }
+.wk-status.ended b { color: var(--ink-3); }
+.wk-status-on { color: var(--alert); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+.wk-ctx { display: inline-flex; align-items: center; gap: .45rem; min-width: 0; }
+.wk-bar { display: inline-block; flex: none; width: 3.4rem; }
+.wk-bar.hot i { background: var(--alert); }
+.wk-ctx.hot .wk-num { color: var(--alert); }
+.wk-num { font-variant-numeric: tabular-nums; }
+.wk-tag {
+  flex: none;
+  padding: .05rem .35rem;
+  border: 1px solid var(--rule-2);
+  color: var(--ink-2);
+  font: 400 9.5px/1.5 var(--mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.wk-rev { flex: none; color: var(--brass); font: 400 10px/1.5 var(--mono); letter-spacing: .04em; text-transform: none; white-space: nowrap; }
+/* On a sheet the dot's ring is the sheet's ground. */
+.sheet .dot { box-shadow: 0 0 0 2px var(--bg-3); }
+.sheet .dot.agent-done { box-shadow: 0 0 0 2px var(--bg-3), 0 0 0 3.5px var(--brass); }
+
+/* --- the frame ----------------------------------------------------------------- */
+.wk-drawer .cmd-head { gap: .6rem; padding-bottom: .7rem; border-bottom: 1px solid var(--rule-2); }
+.wk-drawer .cmd-head > .icon { flex: none; }
+.wk-drawer .cmd-title, .wk-sheet-title { min-width: 0; }
+.wk-drawer .cmd-title h2, .wk-sheet-title h2 { overflow-wrap: anywhere; }
+/* A session's name, as every title that is one (app-dialogs.css). */
+#wk-title, #wkd-title {
+  font-family: var(--mono);
+  font-size: 1.3rem;
+  font-weight: 700;
+  font-stretch: 87.5%;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.wk-read { margin-left: .35rem; color: var(--ink-3); letter-spacing: .02em; text-transform: none; }
+.wk-where {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .3rem .6rem;
+  margin-top: .4rem;
+  min-width: 0;
+  color: var(--ink-3);
+  font-size: 10.5px;
+}
+.wk-where .kind-tag { padding: 0 .3rem; font-size: 8.5px; letter-spacing: .1em; }
+.wk-where .act-machine { font-size: 9px; text-transform: uppercase; }
+.wk-ws { color: var(--ink-2); }
+.wk-dir { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.wk-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 1rem 1.2rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--rule-2) transparent;
+}
+#dlg-work { width: min(52rem, calc(100vw - 2rem)); height: min(48rem, calc(100dvh - 3rem)); overflow: hidden; }
+.wk-sheet .wk-body { padding: 0 1.4rem 1.2rem; }
+.wk-empty { padding-left: 0; padding-right: 0; }
+.wk-error { overflow-wrap: anywhere; }
+
+/* --- the summary strip ----------------------------------------------------- */
+.wk-facts { grid-template-columns: 4.6rem minmax(0, 1fr); margin-top: .8rem; font-size: 11px; }
+.wk-facts dd { color: var(--ink); }
+.wk-facts .wk-ctx { align-items: baseline; }
+.wk-facts .wk-bar { align-self: center; }
+.wk-dim { color: var(--ink-3); }
+.wk-bad { color: var(--alert); }
+.wk-mono { font-family: var(--term); }
+/* The path keeps its slashes in place under direction: rtl. */
+.wk-dir::before, .wk-dir::after { content: "\200e"; }
+
+/* --- the plan -------------------------------------------------------------- */
+.wk-plan h3, .wk-work h3 { flex-wrap: wrap; margin-bottom: .45rem; }
+.wk-plan-bar .wk-bar { display: block; width: auto; }
+.wk-plan-bar .wk-bar i { background: var(--ink-2); }
+.wk-items { list-style: none; margin: .5rem 0 0; padding: 0; border-top: 1px solid var(--rule); }
+.wk-item {
+  display: grid;
+  grid-template-columns: .8rem minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: .55rem;
+  padding: .32rem .1rem .32rem .45rem;
+  border-bottom: 1px solid var(--rule);
+  box-shadow: inset 2px 0 0 transparent;
+  color: var(--ink-2);
+  font-size: 11.5px;
+}
+.wk-item-title { min-width: 0; overflow-wrap: anywhere; }
+.wk-item.active { color: var(--ink); background: var(--signal-soft); box-shadow: inset 2px 0 0 var(--signal); }
+.wk-item.done { color: var(--ink-3); }
+.wk-item.cancelled .wk-item-title { color: var(--ink-3); text-decoration: line-through; }
+.wk-meta { color: var(--ink-3); font-size: 10.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wk-note { margin-top: .5rem; }
+.wk-cap { display: block; margin: .45rem 0 0; color: var(--ink-3); font-size: 10px; }
+.wk-items.compact { margin-top: .15rem; border-top: 0; }
+.wk-items.compact .wk-item { padding: .14rem 0 .14rem .45rem; border-bottom: 0; font-size: 11px; }
+.wk-subplan { margin-top: .3rem; }
+.wk-subplan-head { display: flex; align-items: baseline; gap: .5rem; }
+
+/* A status mark: a plan item's, a tool call's. */
+.wk-mark {
+  display: inline-grid;
+  place-items: center;
+  align-self: center;
+  flex: none;
+  width: .62rem;
+  height: .62rem;
+  border: 1.5px solid var(--ink-3);
+  border-radius: 1px;
+  color: var(--ink-3);
+}
+.wk-mark svg { width: .7rem; height: .7rem; }
+.wk-mark.active { border-color: var(--signal); background: var(--signal); }
+.wk-mark.done, .wk-mark.ok { border-color: transparent; }
+.wk-mark.cancelled, .wk-mark.unfinished { border-style: dotted; }
+.wk-mark.error { border-color: var(--alert); background: var(--alert); }
+.wk-mark.denied { border-color: var(--alert); border-style: dashed; }
+.wk-mark.interrupted { border-color: var(--brass); }
+.wk-mark.running { border: 0; }
+.wk-mark.running .dot { width: .4rem; height: .4rem; box-shadow: none; }
+
+/* --- the tree: turns, their subagents, their calls ------------------------- */
+.wk-st { flex: none; font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); white-space: nowrap; }
+.wk-st.active { color: var(--signal); }
+.wk-st.failed, .wk-st.error, .wk-st.denied { color: var(--alert); }
+.wk-st.interrupted { color: var(--brass); }
+.wk-turns, .wk-subs, .wk-calls { list-style: none; margin: 0; padding: 0; }
+.wk-turns { border-bottom: 1px solid var(--rule); }
+.wk-turn { border-top: 1px solid var(--rule); }
+.wk-turn-head {
+  display: grid;
+  grid-template-columns: .7rem minmax(0, 1fr) auto auto;
+  align-items: baseline;
+  gap: .55rem;
+  width: 100%;
+  padding: .45rem .1rem;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font-size: 11.5px;
+  text-align: left;
+}
+.wk-turn-head:hover { background: var(--bg-3); }
+.wk-sheet .wk-turn-head:hover { background: var(--bg-4); }
+.wk-turn-head:focus-visible { outline: 1px solid var(--signal); outline-offset: -1px; }
+.wk-turn-head svg { width: .65rem; height: .65rem; align-self: center; color: var(--ink-3); transition: transform .2s var(--ease); }
+.wk-turn.open > .wk-turn-head svg { transform: rotate(90deg); }
+.wk-turn-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.wk-turn.open > .wk-turn-head .wk-turn-title { white-space: normal; overflow-wrap: anywhere; }
+.wk-turn-title.none { color: var(--ink-3); font-weight: 400; }
+.wk-subs { margin: 0 0 .35rem 1.25rem; border-left: 1px solid var(--rule-2); }
+.wk-sub { padding: .22rem 0 .22rem .7rem; min-width: 0; }
+.wk-sub-head { display: flex; align-items: baseline; gap: .5rem; min-width: 0; color: var(--ink-2); font-size: 11px; }
+.wk-sub-title { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.wk-sub-head .wk-meta { margin-left: auto; }
+.wk-doing { margin-top: .15rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font: 400 11px/1.4 var(--term); }
+.wk-sub .wk-subs { margin: .2rem 0 0; }
+.wk-calls { margin: 0 0 .5rem 1.25rem; }
+.wk-call { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 .5rem; padding: .16rem 0; color: var(--ink-2); font-size: 11px; }
+.wk-call-name { flex: none; color: var(--ink); font-weight: 600; white-space: nowrap; }
+.wk-call-sum { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 400 11px/1.4 var(--term); }
+.wk-call .wk-meta { flex: none; min-width: 2.6rem; text-align: right; }
+.wk-call-err { flex: 0 0 100%; padding-left: 1.15rem; color: var(--alert); font: 400 10.5px/1.4 var(--term); overflow-wrap: anywhere; }
+.wk-note-line { display: flex; align-items: baseline; gap: .5rem; padding: .16rem 0 .16rem 1.15rem; color: var(--ink-3); font-size: 10.5px; }
+.wk-note-line > span { min-width: 0; overflow-wrap: anywhere; }
+.wk-note-line.wait { color: var(--brass); }
+.wk-note-line.bad { color: var(--alert); }
+.wk-at { flex: none; font: 400 10.5px var(--term); }
+.wk-quiet { margin: 0 0 .5rem 1.25rem; color: var(--ink-3); font-size: 10.5px; }
+.wk-work > .wk-quiet { margin-left: 0; }
+.wk-stray { margin-top: .6rem; }
+.wk-stray .wk-calls { margin-left: 0; }
+
+/* --- phones: full-screen sheets, thumb-sized controls ----------------------- */
+@media (max-width: 760px) {
+  .wk-drawer .cmd-head { padding: .6rem .8rem .6rem; }
+  .wk-body, .wk-sheet .wk-body { padding: 0 .8rem calc(1rem + env(safe-area-inset-bottom)); }
+  #dlg-work { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; border-radius: 0; }
+  .wk-turn-head { min-height: 44px; grid-template-columns: .7rem minmax(0, 1fr) auto; }
+  .wk-turn-head .wk-meta { grid-column: 2 / -1; }
+  .wk-sub-head { flex-wrap: wrap; }
+  .wk-sub-title { flex: 1 1 100%; white-space: normal; overflow-wrap: anywhere; }
+  .wk-sub-head .wk-meta { margin-left: 0; }
+  .wk-call-sum { flex-basis: 6rem; }
+}

@@ -353,6 +353,7 @@ const machines = window.FwHubMachines({
   onMachineFlywheel: (machine) => {
     flywheel.reloadMachine(machine);
     activity.onMachine(machine);
+    fleet.onMachine(machine);
   },
   signedOut: (why) => window.location.replace("/?signed_out=" + why + window.location.hash),
 });
@@ -411,6 +412,7 @@ function closeOverlays(keep) {
   if (keep !== "flywheel") flywheel.close();
   if (keep !== "review") review.close();
   if (keep !== "queue") promptQueue.close();
+  if (keep !== "work") work.closeDrawer();
   if (keep !== "board-task") flywheelBoard.closeTask();
   explain.close();
 }
@@ -668,6 +670,30 @@ const activity = window.FwHubActivity({
   openQueue: (id) => promptQueue.open(id),
   openFanout: (id) => fanout.open(id),
   openTranscript: (group, index) => search.openTranscript(group, index),
+  onOpen: () => {
+    if (search.isOpen()) search.close(false);
+    explain.close();
+  },
+});
+
+// Work (work.js): what a session is working on, from its telemetry -- the
+// drawer for a session this browser attaches, the read-only sheet for one
+// a collector holds only as telemetry.
+const work = window.FwHubWork({
+  $, el, icon, rawApi, span, state, sessionById, workspaceById, isAgent,
+  agentLook: AGENT_LOOK,
+  machinePrefix: (machine) => machines.prefix(machine),
+  focusTerminal: () => focusTerminal(),
+  onOpen: () => closeOverlays("work"),
+});
+
+// The fleet board (fleet.js): every agent session the hub has telemetry
+// for, most urgent first.
+const fleet = window.FwHubFleet({
+  $, el, rawApi, machines, sessionById, workspaceById, work,
+  openSession: (id) => openSession(id),
+  openWork: (id) => work.open(id),
+  showWork: (options) => work.show(options),
   onOpen: () => {
     if (search.isOpen()) search.close(false);
     explain.close();

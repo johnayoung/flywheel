@@ -190,6 +190,18 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ),
     ("activity.js", include_bytes!("../web/activity.js"), JS),
     (
+        "app-work.css",
+        include_bytes!("../web/app-work.css"),
+        "text/css; charset=utf-8",
+    ),
+    ("work.js", include_bytes!("../web/work.js"), JS),
+    (
+        "app-fleet.css",
+        include_bytes!("../web/app-fleet.css"),
+        "text/css; charset=utf-8",
+    ),
+    ("fleet.js", include_bytes!("../web/fleet.js"), JS),
+    (
         "app-digest.css",
         include_bytes!("../web/app-digest.css"),
         "text/css; charset=utf-8",

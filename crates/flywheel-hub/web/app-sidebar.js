@@ -663,6 +663,7 @@ function renderMain() {
   launcher.renderHeader(session);
   sharing.renderHeader(session);
   promptQueue.renderHeader(session);
+  work.renderHeader();
   renderFlip(session);
   renderSendOutput(session);
   updateMeters();

@@ -114,6 +114,8 @@ impl Store {
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS sessions_board ON sessions (rank, last_ts DESC);
              CREATE INDEX IF NOT EXISTS sessions_last ON sessions (last_ts);
+             CREATE INDEX IF NOT EXISTS sessions_counts
+                 ON sessions (last_ts, host, status, rank, cost);
              CREATE TABLE IF NOT EXISTS cursors (
                  name TEXT PRIMARY KEY,
                  at   INTEGER NOT NULL

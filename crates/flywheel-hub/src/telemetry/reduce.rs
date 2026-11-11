@@ -785,8 +785,12 @@ impl SessionState {
                     None => {}
                 }
             }
-            What::RateLimited { .. } => self.limited_at = Some(ts),
+            What::RateLimited { .. } => {
+                event.work = self.turn.clone();
+                self.limited_at = Some(ts);
+            }
             What::Compact { phase, .. } => {
+                event.work = self.turn.clone();
                 if phase == "pre" {
                     self.compactions += 1;
                 }

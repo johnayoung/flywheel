@@ -648,7 +648,7 @@ impl Hub {
         }
         Ok(Arc::new(Self {
             telemetry,
-            capture: telemetry::Capture::default(),
+            capture: telemetry::Capture::load(&options.state_dir),
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),
                 options.codex_home.clone(),

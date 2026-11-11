@@ -15,8 +15,8 @@ use crate::agent::{self, SessionKind};
 use crate::report::{self, Report};
 use crate::state::SessionRecord;
 use crate::telemetry::{Draft, Telemetry, What, claude, now_ms};
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 /// What capture knows beside the store.
@@ -27,8 +27,26 @@ pub(super) struct Capture {
     /// Sessions whose status line has reported: their context window and
     /// totals come from it, not from the transcript.
     status_lines: Mutex<HashSet<String>>,
-    /// Whether each Claude Code program is new enough for http hooks.
-    http_hooks: Mutex<HashMap<PathBuf, bool>>,
+    /// The Claude Code version a session's status line last showed (kept
+    /// in [`CLAUDE_VERSION_FILE`]): what decides http hooks. Never asked
+    /// of the CLI itself: the hub runs no agent program on its own.
+    claude_version: Mutex<Option<(u32, u32, u32)>>,
+}
+
+/// Where the last seen Claude Code version is kept in the state dir.
+pub const CLAUDE_VERSION_FILE: &str = "claude-version";
+
+impl Capture {
+    /// What a previous run of the hub saw.
+    pub(super) fn load(state_dir: &Path) -> Self {
+        let seen = std::fs::read_to_string(state_dir.join(CLAUDE_VERSION_FILE))
+            .ok()
+            .and_then(|text| agent::parse_claude_version(&text));
+        Self {
+            claude_version: Mutex::new(seen),
+            ..Self::default()
+        }
+    }
 }
 
 /// The context window assumed for a model whose size nobody reported.
@@ -61,37 +79,40 @@ impl Hub {
             .clone()
     }
 
-    /// Whether `program` (a Claude Code CLI) is new enough for http hooks
-    /// ([`agent::CLAUDE_HTTP_HOOKS_SINCE`]); asked once per program.
-    pub(super) fn claude_takes_http_hooks(&self, program: &Path) -> bool {
-        let known = self
-            .capture
-            .http_hooks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(program)
-            .copied();
-        if let Some(known) = known {
-            return known;
-        }
-        let version = crate::review::runner::run(&crate::review::runner::Spec {
-            program: &program.to_string_lossy(),
-            dir: Path::new("/"),
-            args: vec!["--version".to_owned()],
-            stdin: None,
-            timeout: std::time::Duration::from_secs(10),
-            limit: 4096,
-        })
-        .ok()
-        .filter(crate::review::runner::Output::success)
-        .and_then(|out| agent::parse_claude_version(&String::from_utf8_lossy(&out.stdout)));
-        let takes = version.is_some_and(|v| v >= agent::CLAUDE_HTTP_HOOKS_SINCE);
+    /// Whether Claude Code sessions get http hooks: a session's status
+    /// line has shown a CLI at or past
+    /// [`agent::CLAUDE_HTTP_HOOKS_SINCE`]. Until one has (a hub's first
+    /// session ever), hooks run the report command.
+    pub(super) fn claude_takes_http_hooks(&self) -> bool {
         self.capture
-            .http_hooks
+            .claude_version
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(program.to_path_buf(), takes);
-        takes
+            .is_some_and(|seen| seen >= agent::CLAUDE_HTTP_HOOKS_SINCE)
+    }
+
+    /// Note the CLI version a status line input names.
+    fn note_claude_version(&self, payload: &serde_json::Value) {
+        let Some(seen) = payload
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .and_then(agent::parse_claude_version)
+        else {
+            return;
+        };
+        let mut known = self
+            .capture
+            .claude_version
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *known != Some(seen) {
+            *known = Some(seen);
+            let text = format!("{}.{}.{}\n", seen.0, seen.1, seen.2);
+            let path = self.options.state_dir.join(CLAUDE_VERSION_FILE);
+            if let Err(e) = crate::auth::write_private(&path, text.as_bytes()) {
+                eprintln!("fw hub: cannot save {}: {e}", path.display());
+            }
+        }
     }
 
     /// Whether `secret` is the running spawn's secret for agent session
@@ -143,6 +164,7 @@ impl Hub {
             return false;
         }
         if event == claude::STATUS_LINE_EVENT {
+            self.note_claude_version(payload);
             self.capture
                 .status_lines
                 .lock()

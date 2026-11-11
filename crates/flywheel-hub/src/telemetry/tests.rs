@@ -821,3 +821,197 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
         );
     }
 }
+
+/// The collector's side at the scale the design is for: ten thousand
+/// sessions on a hundred hosts, delivered in forwarder-sized batches in
+/// the order hosts would interleave them.
+#[test]
+fn ten_thousand_sessions_on_a_hundred_hosts_fold_and_list() {
+    const HOSTS: usize = 100;
+    const PER_HOST: usize = 100;
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Telemetry::open(dir.path(), OTHER).unwrap();
+    let start = now_ms() - 60_000;
+    let event = |host: usize, session: usize, seq: u64, what: What| Event {
+        host: format!("{host:032x}"),
+        session: format!("s{session}"),
+        seq,
+        ts: start + seq as i64 * 1000,
+        agent: None,
+        work: None,
+        item: None,
+        what,
+    };
+    // Per session: a prompt, three paired calls, a usage reading; then a
+    // tenth block on a person and a tenth finish.
+    let mut events = Vec::new();
+    for round in 0..9u64 {
+        for host in 0..HOSTS {
+            for session in 0..PER_HOST {
+                let n = host * PER_HOST + session;
+                let call = format!("c{}", (round.max(1) - 1) / 2);
+                let what = match round {
+                    0 => What::TurnStarted {
+                        title: format!("task {n}"),
+                    },
+                    1 | 3 | 5 => What::ToolStarted {
+                        id: call,
+                        name: "Bash".to_owned(),
+                        summary: Some("cargo test".to_owned()),
+                        subagent: None,
+                    },
+                    2 | 4 | 6 => What::ToolFinished {
+                        id: call,
+                        name: "Bash".to_owned(),
+                        outcome: Outcome::Ok,
+                        duration_ms: Some(900),
+                        error: None,
+                        tokens: None,
+                    },
+                    7 => What::Usage {
+                        input: 1000,
+                        output: 100,
+                        cache_read: 0,
+                        cache_write: 0,
+                        cost_usd: Some(0.01),
+                    },
+                    _ if n.is_multiple_of(10) => What::WaitStarted {
+                        reason: WaitReason::Question,
+                        tool: None,
+                    },
+                    _ if n % 10 == 1 => What::TurnFinished {},
+                    _ => continue,
+                };
+                events.push(event(host, session, round + 1, what));
+            }
+        }
+    }
+    let total = events.len();
+    let began = std::time::Instant::now();
+    let mut accepted = 0;
+    for batch in events.chunks(forward::BATCH_EVENTS) {
+        accepted += collector.ingest(batch.to_vec()).unwrap();
+    }
+    let ingested = began.elapsed();
+    assert_eq!(accepted, total);
+    let began = std::time::Instant::now();
+    let page = collector
+        .fleet(&FleetQuery {
+            limit: 200,
+            ..FleetQuery::default()
+        })
+        .unwrap();
+    let first_page = began.elapsed();
+    let began = std::time::Instant::now();
+    let again = collector
+        .fleet(&FleetQuery {
+            limit: 200,
+            offset: 5000,
+            ..FleetQuery::default()
+        })
+        .unwrap();
+    let later_page = began.elapsed();
+    eprintln!(
+        "telemetry scale: {total} events for {} sessions ingested in {ingested:?} \
+         ({:.0} events/s); first board page (commit included) {first_page:?}; a later page {later_page:?}",
+        HOSTS * PER_HOST,
+        total as f64 / ingested.as_secs_f64()
+    );
+    assert_eq!((page.total, page.hosts), (10_000, 100));
+    let count = |status: &str| {
+        page.counts
+            .iter()
+            .find(|c| c.status == status)
+            .map_or(0, |c| c.sessions)
+    };
+    assert_eq!(
+        (count("blocked"), count("done"), count("working")),
+        (1000, 1000, 8000)
+    );
+    assert_eq!(page.sessions.len(), 200);
+    assert!(page.sessions.iter().all(|s| s.status == "blocked"));
+    assert!(
+        page.sessions
+            .iter()
+            .all(|s| s.tools == 3 && s.open_tools == 0)
+    );
+    assert_eq!(again.sessions.len(), 200);
+    assert!(again.sessions.iter().all(|s| s.status == "working"));
+    // Every event is in the log once; a whole batch again changes nothing.
+    assert_eq!(
+        collector
+            .ingest(events[..forward::BATCH_EVENTS].to_vec())
+            .unwrap(),
+        0
+    );
+    let one = collector
+        .events(Some(&format!("{:032x}", 42)), "s7", 0, 100, false)
+        .unwrap();
+    assert_eq!(one.len(), 8);
+}
+
+#[test]
+fn a_new_session_arriving_as_one_large_batch_is_on_the_board_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Telemetry::open(dir.path(), OTHER).unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    collector.on_change(move |snapshot| sink.lock().unwrap().push(snapshot.seq));
+    let start = now_ms() - 1_000_000;
+    let events: Vec<Event> = (1..=924u64)
+        .map(|seq| Event {
+            host: HOST.to_owned(),
+            session: "big".to_owned(),
+            seq,
+            ts: start + seq as i64,
+            agent: None,
+            work: None,
+            item: None,
+            what: if seq == 1 {
+                What::TurnStarted {
+                    title: "long".to_owned(),
+                }
+            } else if seq == 500 {
+                What::Compact {
+                    phase: "pre".to_owned(),
+                    trigger: Some("auto".to_owned()),
+                }
+            } else if seq.is_multiple_of(2) {
+                What::ToolStarted {
+                    id: format!("c{seq}"),
+                    name: "Read".to_owned(),
+                    summary: None,
+                    subagent: None,
+                }
+            } else {
+                What::ToolFinished {
+                    id: format!("c{}", seq - 1),
+                    name: "Read".to_owned(),
+                    outcome: Outcome::Ok,
+                    duration_ms: Some(1),
+                    error: None,
+                    tokens: None,
+                }
+            },
+        })
+        .collect();
+    assert_eq!(collector.ingest(events).unwrap(), 924);
+    let page = collector
+        .fleet(&FleetQuery {
+            limit: 10,
+            active_since: Some(now_ms() - 3_600_000),
+            ..FleetQuery::default()
+        })
+        .unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.sessions[0].seq, 924);
+    assert_eq!(page.sessions[0].compactions, 1);
+    assert_eq!(*seen.lock().unwrap(), [924], "announced once, whole");
+    // A compaction belongs to the turn it happened in.
+    let compact = collector
+        .events(Some(HOST), "big", 499, 1, false)
+        .unwrap()
+        .remove(0);
+    assert_eq!(compact.what.kind(), "compact");
+    assert_eq!(compact.work.as_deref(), Some("t1"));
+}

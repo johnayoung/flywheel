@@ -14,7 +14,7 @@ use crate::report;
 use crate::state::{SessionRecord, SessionState, StateError, new_id, validate_name};
 use crate::status::{Audience, Signal, StatusSource};
 use chrono::Utc;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, Weak};
 use std::time::Duration;
 
@@ -651,9 +651,7 @@ impl Hub {
                         );
                         let http_hooks = hub_url.is_some()
                             && !theirs.restricts_http_hooks
-                            && argv
-                                .first()
-                                .is_some_and(|p| self.claude_takes_http_hooks(Path::new(p)));
+                            && self.claude_takes_http_hooks();
                         let wiring = agent::ClaudeWiring {
                             report,
                             hub_url: hub_url.as_deref(),

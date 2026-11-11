@@ -335,7 +335,7 @@ function progressLine(session, st) {
   if (!t || (st.dot !== "working" && st.dot !== "blocked")) return null;
   const parts = [];
   if (t.plan && t.plan.total) {
-    const bar = el("span", { className: "fwb-bar" }, el("i"));
+    const bar = el("span", { className: "prog-bar" }, el("i"));
     bar.firstChild.style.width = `${Math.round((t.plan.done / t.plan.total) * 100)}%`;
     parts.push(bar, el("b", { textContent: `${t.plan.done}/${t.plan.total}` }));
     if (t.plan.current) parts.push(el("span", { className: "session-step", textContent: t.plan.current }));
@@ -669,10 +669,8 @@ function renderMain() {
   // An empty tab of a workspace that is open (a new tab, its sessions
   // closed): the stage offers that workspace's sessions.
   const emptyTab = !session && !phone() && state.view && workspaceById(state.view) && activeTab() ? focusedLeaf() : null;
-  // A board tab fills the stage itself.
-  const onBoard = !session && !phone() && !!state.view && L.isBoard((activeTab() || {}).root);
-  const workspace = session ? workspaceById(session.workspace_id) : emptyTab || onBoard ? workspaceById(state.view) : null;
-  $("#empty").hidden = !!session || onBoard;
+  const workspace = session ? workspaceById(session.workspace_id) : emptyTab ? workspaceById(state.view) : null;
+  $("#empty").hidden = !!session;
   $("#crumb-workspace").textContent = workspace ? workspace.name : "";
   // Its own element: it stays when a phone hides the workspace name.
   const onMachine = workspace && workspace.machine;
@@ -680,7 +678,7 @@ function renderMain() {
   $("#crumb-machine").replaceChildren(...(onMachine ? [machineBadge(workspace.machine)] : []));
   // A hub with nothing yet: the start screen, not a missing session.
   const nothingYet = !session && !emptyTab && !state.workspaces.length && !machines.any();
-  $("#crumb-session").textContent = session ? session.name : emptyTab ? "Empty pane" : onBoard ? "Board" : nothingYet ? "Get started" : "No session";
+  $("#crumb-session").textContent = session ? session.name : emptyTab ? "Empty pane" : nothingYet ? "Get started" : "No session";
   // Without a session the header's session controls mean nothing.
   $("#cmd-toggle").hidden = !session;
   $("#link").hidden = !session;

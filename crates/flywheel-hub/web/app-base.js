@@ -413,7 +413,6 @@ function closeOverlays(keep) {
   if (keep !== "review") review.close();
   if (keep !== "queue") promptQueue.close();
   if (keep !== "work") work.closeDrawer();
-  if (keep !== "board-task") flywheelBoard.closeTask();
   explain.close();
 }
 
@@ -422,8 +421,6 @@ function closeOverlays(keep) {
 const flywheel = window.FwHubFlywheel({
   $, el, icon, api, age, span, state, store, workspaceById, sessionById, folderLabel,
   keyOf: (id) => settings.keyOf(id),
-  // The drawer's "open board" (app-layout.js).
-  openBoard: (workspaceId, folder) => openBoard(workspaceId, folder),
   machinePrefix: (machine) => machines.prefix(machine),
   openSession: (id, place) => openSession(id, place),
   toast: commands.toast,
@@ -437,17 +434,6 @@ const flywheel = window.FwHubFlywheel({
   termSize: () => sizeHint(),
   // Autopilot work newly waiting on a gate (notify.js, below).
   notifyGate: (folder, label, count) => notify.gate(folder, label, count),
-  // A summary changed: the shown board repaints (board.js, below).
-  onSummaries: () => flywheelBoard.paint(),
-});
-
-// The flywheel board (board.js): a board tab's portfolio of plans and a
-// plan's lanes, read through the Flywheel panel's data.
-const flywheelBoard = window.FwHubBoard({
-  el, icon, span, age, state, workspaceById, flywheel,
-  toast: (...args) => commands.toast(...args),
-  // A task drawer opening closes the other drawers.
-  onOpen: () => closeOverlays("board-task"),
 });
 
 // Verified fan-outs (fanout.js): one prompt to several agents in

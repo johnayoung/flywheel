@@ -676,26 +676,6 @@ body.resizing-y, body.resizing-y * { cursor: row-resize !important; user-select:
 .tabs > .icon { align-self: center; width: 1.5rem; height: 1.5rem; }
 .tabs > .icon svg { width: .7rem; height: .7rem; }
 .tab-pick svg { width: .65rem; height: .65rem; }
-.board-adds { display: flex; align-self: center; gap: .15rem; min-width: 0; max-width: 18rem; overflow-x: auto; scrollbar-width: none; }
-.board-add {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: .3rem;
-  height: 1.5rem;
-  padding: 0 .4rem;
-  border: 1px solid transparent;
-  background: none;
-  color: var(--ink-3);
-  font: 500 10px/1 var(--mono);
-  cursor: pointer;
-}
-.board-add:hover, .board-add.active { color: var(--ink); border-color: var(--rule-2); }
-.board-add svg { width: .7rem; height: .7rem; }
-.board-stage { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: auto; background: var(--bg); }
-.board-head { display: flex; align-items: baseline; gap: .7rem; min-width: 0; padding: .8rem 1.2rem; border-bottom: 1px solid var(--rule); }
-.board-head strong { font: 600 12px/1.2 var(--mono); color: var(--ink); }
-.board-head .path-tail { flex: 1 1 0; min-width: 0; color: var(--ink-3); font: 10.5px/1.2 var(--mono); }
 .zoom-pill {
   align-self: center;
   margin-left: auto;

@@ -90,7 +90,7 @@ window.FwHubWork = function (ctx) {
   // The existing progress bar at `pct` percent.
   function bar(pct, hot) {
     const width = Math.max(0, Math.min(100, Number(pct) || 0));
-    return el("span", { className: `fwb-bar wk-bar${hot ? " hot" : ""}` }, el("i", { style: `width:${width}%` }));
+    return el("span", { className: `prog-bar wk-bar${hot ? " hot" : ""}` }, el("i", { style: `width:${width}%` }));
   }
 
   const contextTitle = (c) => `${tokens(c.used)} of ${tokens(c.window)} tokens${c.exact === false ? " (an estimate)" : ""}`;
@@ -348,7 +348,7 @@ window.FwHubWork = function (ctx) {
     ));
     if (d.compactions) rows.push(fact("compact", plural(d.compactions, "compaction")));
     if (d.last_error) rows.push(fact("error", el("span", { className: "wk-bad wk-mono", textContent: d.last_error })));
-    return el("dl", { className: "fwb-facts wk-facts" }, rows.flat());
+    return el("dl", { className: "facts-grid wk-facts" }, rows.flat());
   }
 
   // --- rendering: plans ----------------------------------------------------

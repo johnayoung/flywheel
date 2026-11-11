@@ -96,8 +96,6 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ("attention.js", include_bytes!("../web/attention.js"), JS),
     ("autopilot.js", include_bytes!("../web/autopilot.js"), JS),
     ("flywheel.js", include_bytes!("../web/flywheel.js"), JS),
-    ("board.js", include_bytes!("../web/board.js"), JS),
-    ("board-task.js", include_bytes!("../web/board-task.js"), JS),
     ("fanout.js", include_bytes!("../web/fanout.js"), JS),
     (
         "fanout-task.js",
@@ -271,11 +269,6 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     (
         "app-autopilot.css",
         include_bytes!("../web/app-autopilot.css"),
-        "text/css; charset=utf-8",
-    ),
-    (
-        "app-board.css",
-        include_bytes!("../web/app-board.css"),
         "text/css; charset=utf-8",
     ),
     (

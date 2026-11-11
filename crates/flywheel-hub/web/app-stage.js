@@ -87,11 +87,9 @@ function renderStage() {
 // changes and the stage is rebuilt with its terminal.
 const shape = (node) => (!node ? null : node.type === "pane"
   ? (node.session === null || !state.panes.has(node.id) ? `${node.id}:empty` : node.id)
-  : L.isBoard(node) ? ["board", node.id, node.folder]
   : [node.dir, shape(node.a), shape(node.b)]);
 
 function buildNode(node, path) {
-  if (L.isBoard(node)) return boardStage(node);
   if (node.type === "pane") {
     const pane = state.panes.get(node.id);
     if (pane) return pane.el;
@@ -131,11 +129,6 @@ function restyle(node, path) {
   if (box) styleSplit(box, node);
   restyle(node.a, path + "a");
   restyle(node.b, path + "b");
-}
-
-// A board tab's stage: the flywheel board (board.js) of its workspace.
-function boardStage(node) {
-  return flywheelBoard.mount(node);
 }
 
 // A pane with no session (its session was closed, or a new tab): the

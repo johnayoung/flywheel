@@ -22,10 +22,6 @@ window.FwHubLayout = (function () {
   const clone = (value) => JSON.parse(JSON.stringify(value));
   const pane = (session) => ({ type: "pane", id: newId("p"), session: session || null });
   const tab = (name, session) => ({ id: newId("t"), name, root: pane(session) });
-  const isBoard = (node) => !!node && node.type === "board";
-  const boardTab = (name, folder) => ({ id: newId("t"), name, root: { type: "board", id: newId("b"), folder } });
-  // The board tab showing `folder`, if any.
-  const boardOf = (layout, folder) => layout.tabs.find((t) => isBoard(t.root) && t.root.folder === folder) || null;
 
   // Every pane of a tree, left to right / top to bottom.
   function panes(node, out = []) {
@@ -183,7 +179,7 @@ window.FwHubLayout = (function () {
 
   return {
     MAX_TABS, MAX_PANES, MAX_TAB_NAME, MIN_RATIO,
-    newId, clone, pane, tab, isBoard, boardTab, boardOf, uniqueTabName, panes, findPane, paneShowing, sessionsOf, split, close, parentOf,
+    newId, clone, pane, tab, uniqueTabName, panes, findPane, paneShowing, sessionsOf, split, close, parentOf,
     resizePane, clampRatio, splitAt, prune, nextTabName, boxes,
   };
 })();

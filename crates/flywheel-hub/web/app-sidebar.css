@@ -274,8 +274,8 @@
   font: 400 10.5px/1.3 var(--mono);
   color: var(--ink-2);
 }
-.session-progress .fwb-bar { flex: 0 0 2.6rem; }
-.session-progress .fwb-bar i { background: var(--signal); }
+.session-progress .prog-bar { flex: 0 0 2.6rem; }
+.session-progress .prog-bar i { background: var(--signal); }
 .session-progress b { flex: none; font-weight: 600; font-variant-numeric: tabular-nums; }
 .session-progress .session-step { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-progress .session-step.tool { color: var(--ink-3); }

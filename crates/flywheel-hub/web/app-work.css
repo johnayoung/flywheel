@@ -3,7 +3,7 @@
  * frame; a full-screen sheet on phones) and the same content in a
  * read-only sheet. The fleet board (app-fleet.css) shares the status
  * word, the meter, and the small tags.
- * Loaded after app-board.css, in index.html's order. */
+ * Loaded after app-drawers.css, in index.html's order. */
 
 /* --- shared with the fleet board ------------------------------------------- */
 .wk-status { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .6rem; min-width: 0; }

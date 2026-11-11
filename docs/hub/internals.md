@@ -85,7 +85,6 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 
 - Tab bar: `+`, double-click renames, middle-click closes. A sidebar session dropped on a pane edge splits, mid-pane shows it. A new-shell split opens an agent's companion first.
 - Panes stay 40x8 cells+ (else a new tab). Closing a pane leaves its session running; removing one closes its panes, empty tabs. Only the active tab attaches; 12 tabs, 12 panes each. Phones (< 760 px): one pane, a chip row switches.
-- Board tab (tab strip, palette `Board:`), root only; outlives sessions, closes with its folder. Portfolio: the workspace's plans, needs-you first; a plan opens into five lanes, a task into its drawer (state, actions, checks, runs).
 - Browser checks (opt-in; env `FW`, `PLAYWRIGHT`, `CHROMIUM`): `node crates/flywheel-hub/e2e/{layout,network}.mjs` (network: 400/150 kbps, 300 ms).
 
 ## Web UI

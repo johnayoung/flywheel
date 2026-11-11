@@ -172,8 +172,6 @@
 .fw-sec.collapsed .fw-sec-toggle svg { transform: none; }
 .fw-sec.collapsed .fw-sec-toggle { margin-bottom: 0; }
 .fw-sec-toggle:focus-visible { outline: 1px solid var(--signal); outline-offset: 2px; }
-.fw-board-link { display: flex; justify-content: flex-end; margin-top: .6rem; }
-.fw-board-link svg { width: .8rem; height: .8rem; margin-right: .35rem; vertical-align: -.1em; }
 .fw-n { font: 500 10px/1 var(--mono); letter-spacing: .08em; color: var(--ink-3); text-transform: none; }
 
 .fw-list { list-style: none; margin: 0; padding: 0; }
@@ -860,3 +858,28 @@ button.meter.usage[hidden] { display: none; }
   .palette-item { grid-template-columns: 1.1rem 1fr; row-gap: .1rem; }
   .palette-item .hint { grid-column: 2; white-space: normal; overflow-wrap: anywhere; }
 }
+
+/* Shared by the fleet board, the work view, and the session rows: a thin
+   progress bar with its count, and a two-column list of facts. */
+.prog { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: .5rem; }
+.prog-bar { height: 3px; overflow: hidden; background: var(--rule); }
+.prog-bar i { display: block; height: 100%; background: var(--ink-3); }
+.prog small { color: var(--ink-3); font-size: 10px; font-variant-numeric: tabular-nums; }
+.facts-grid { display: grid; grid-template-columns: 4.2rem minmax(0, 1fr); gap: .25rem .8rem; margin: .6rem 0 0; color: var(--ink-2); font-size: 10.5px; }
+.facts-grid dt { color: var(--ink-3); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; padding-top: .1rem; }
+.facts-grid dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.facts-grid .text-btn { padding: 0; }
+
+/* --- run viewer: the live run's message bar ---------------------------------- */
+.run-say { display: grid; gap: .35rem; padding: .7rem 1.4rem .6rem; border-top: 1px solid var(--rule); background: var(--bg-3); }
+.run-say[hidden] { display: none; }
+.run-say-row { display: flex; gap: .5rem; align-items: center; }
+.run-say input { flex: 1; min-width: 0; padding: .5rem .65rem; border: 1px solid var(--rule-2); border-radius: 2px; background: var(--bg); color: var(--ink); font: 400 12px var(--mono); }
+.run-say input:focus { outline: none; border-color: var(--signal); }
+.run-say .slab svg { width: .75rem; height: .75rem; }
+.run-say .run-stop:hover { border-color: var(--alert); color: var(--alert); }
+.run-stop-confirm { display: inline-flex; align-items: center; gap: .6rem; color: var(--alert); font-size: 11px; }
+.run-stop-confirm[hidden] { display: none; }
+.run-say-note { margin: 0; color: var(--ink-3); font-size: 10.5px; overflow-wrap: anywhere; }
+.run-say-note:empty { display: none; }
+.run-say-note.bad { color: var(--alert); }

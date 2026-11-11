@@ -228,7 +228,7 @@ window.FwHubFleet = function (ctx) {
         "prog",
         el(
           "span",
-          { className: "fwb-prog fl-prog", title: `The agent's ${plan.source} plan: ${plan.done} of ${plan.total} done` },
+          { className: "prog fl-prog", title: `The agent's ${plan.source} plan: ${plan.done} of ${plan.total} done` },
           parts.bar((plan.done / plan.total) * 100),
           el("small", { textContent: `${plan.done}/${plan.total}` }),
         ),

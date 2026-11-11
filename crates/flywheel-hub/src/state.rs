@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 pub const STATE_FILE: &str = "state.json";
 /// On-disk schema version: 2 added per-workspace `layouts`, 3 launch
 /// `templates` (and sessions' `launch` options), 4 verified `fanouts`, 5
-/// per-session prompt `queues`, 6 board tabs in layouts.
+/// per-session prompt `queues`, 6 board tabs in layouts (since removed:
+/// dropped on load, see [`crate::layout`]).
 /// Older files load and are written back as the current version; a newer
 /// hub's file is refused rather than rewritten without what it does not
 /// know.

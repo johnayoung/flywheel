@@ -157,12 +157,6 @@ window.FwHubFlywheel = function (ctx) {
     return keyed(machineOfKey(key), await api("GET", `${via(key)}/api/flywheel/panel?folder=${encodeURIComponent(pathOf(key))}`));
   }
 
-  // Task `taskId`'s every run, goal and checks (held-out ones by name),
-  // read through its folder's machine's hub.
-  function readHistory(key, taskId) {
-    return api("GET", `${via(key)}/api/flywheel/history?folder=${encodeURIComponent(pathOf(key))}&task=${encodeURIComponent(taskId)}`);
-  }
-
   async function loadPanel() {
     const folder = ui.folder;
     if (!folder) return;
@@ -707,36 +701,6 @@ window.FwHubFlywheel = function (ctx) {
     }
   }
 
-  // Re-land task `taskId` of folder `key` (the board drawer's action):
-  // POST /api/flywheel/reland starts `fw reland` in a hub session, which
-  // opens beside the pane in focus; the landing's outcome is read back
-  // from the store by the panel, never from this answer. A refusal (409
-  // nothing to re-land or one running, 404 unknown task) shows the
-  // route's error; a running re-land's session is revealed. True once
-  // started.
-  async function relandTask(key, taskId, workspaceId) {
-    const workspace = (workspaceId && workspaceById(workspaceId)) || workspaceFor(key);
-    if (!key || !workspace) return false;
-    try {
-      const request = { folder: pathOf(key), task: taskId, workspace_id: workspace.id, ...(ctx.termSize ? ctx.termSize() : {}) };
-      const out = await post(`${via(key)}/api/flywheel/reland`, request);
-      if (!out.ok) {
-        const why = (out.data && out.data.error) || `HTTP ${out.status}`;
-        toast(`Could not re-land ${taskId}: ${why}`, { tone: "bad" });
-        if (out.status === 409 && out.data && out.data.running) openSession(out.data.running.id, { split: "down" });
-        return false;
-      }
-      const view = out.data;
-      await ctx.refresh();
-      openSession(view.id, { split: "down" });
-      toast(el("span", {}, "Started ", el("b", { textContent: view.name }), ` in ${labelFor(key)}`), { timeout: 3500 });
-      return true;
-    } catch (error) {
-      toast(`Could not re-land ${taskId}: ${error.message}`, { tone: "bad" });
-      return false;
-    }
-  }
-
   function phaseBar(tasks) {
     const counts = {};
     for (const t of tasks) counts[t.state] = (counts[t.state] || 0) + 1;
@@ -966,28 +930,6 @@ window.FwHubFlywheel = function (ctx) {
     );
   }
 
-  // Open (or select) the folder's board tab in its workspace.
-  function boardButton(folder) {
-    const workspace = workspaceFor(folder);
-    if (!workspace) return null;
-    return el(
-      "div",
-      { className: "fw-board-link" },
-      el(
-        "button",
-        {
-          type: "button",
-          className: "text-btn",
-          title: `Show the flywheel board of ${pathOf(folder)} in workspace ${workspace.name}`,
-          dataset: { fwAction: "open-board", fwFolder: pathOf(folder) },
-          onclick: () => ctx.openBoard(workspace.id, pathOf(folder)),
-        },
-        icon("wheel"),
-        "open board",
-      ),
-    );
-  }
-
   function renderDrawer() {
     const drawer = $("#flywheel");
     drawer.hidden = !ui.folder;
@@ -1047,8 +989,6 @@ window.FwHubFlywheel = function (ctx) {
         el("div", { className: "fw-where" }, el("span", { textContent: panel.source }), el("span", { textContent: panel.store })),
       ),
     ];
-    const board = boardButton(folder);
-    if (board) children.unshift(board);
     if (ui.error) children.push(el("p", { className: "fw-problem", role: "alert", textContent: ui.error }));
     if (untrusted) {
       children.push(el(
@@ -1306,16 +1246,16 @@ window.FwHubFlywheel = function (ctx) {
         }
       },
     });
-    const note = el("p", { className: "fwb-say-note", role: "status" });
+    const note = el("p", { className: "run-say-note", role: "status" });
     const tell = (text, bad) => {
       note.textContent = text;
       note.classList.toggle("bad", !!bad);
     };
     const sendBtn = el("button", { type: "button", className: "slab", "data-fw-action": "say", onclick: () => send() }, icon("send"), "Send");
-    const confirmBox = el("span", { className: "fwb-stop-confirm", hidden: true });
+    const confirmBox = el("span", { className: "run-stop-confirm", hidden: true });
     const stop = el("button", {
       type: "button",
-      className: "slab ghost fwb-stop",
+      className: "slab ghost run-stop",
       title: "Stops the agent mid-step; the run waits for you (asks first)",
       "data-fw-action": "interrupt",
       onclick: () => {
@@ -1374,7 +1314,7 @@ window.FwHubFlywheel = function (ctx) {
       }
       if (ui.run === run) disarm();
     }
-    foot.replaceChildren(el("div", { className: "fwb-say-row" }, input, sendBtn, stop, confirmBox), note);
+    foot.replaceChildren(el("div", { className: "run-say-row" }, input, sendBtn, stop, confirmBox), note);
     foot.hidden = true;
   }
 
@@ -1467,7 +1407,7 @@ window.FwHubFlywheel = function (ctx) {
     // The message bar stays up while a refusal it just got is showing.
     const foot = $("#run-say");
     if (foot.firstChild) {
-      const refused = foot.querySelector(".fwb-say-note.bad");
+      const refused = foot.querySelector(".run-say-note.bad");
       foot.hidden = !run.active && !(refused && refused.textContent);
       if (run.active && run.focusSay) {
         run.focusSay = false;
@@ -1560,22 +1500,5 @@ window.FwHubFlywheel = function (ctx) {
     openGate,
     startWorkerIn,
     pendingTasks,
-    // For the board (board.js, board-task.js).
-    summary,
-    readPanel,
-    readHistory,
-    keyOf,
-    pathOf,
-    machineOfKey,
-    labelFor,
-    post,
-    // Run `taskId` alone in folder `key` (its board's panel and workspace).
-    runTask: (key, taskId, panel, workspaceId) => startWorker(taskId, { folder: key, panel, workspaceId, exact: true }),
-    // Re-land `taskId` of folder `key` (`fw reland` in a hub session).
-    relandTask,
-    // Autopilot's gate decisions (shared pending state): send, pendingOf.
-    gates: pilot,
-    loaded: () => ui.loaded,
-    enabled: () => ui.enabled,
   };
 };

@@ -316,6 +316,22 @@ window.FwHubWork = function (ctx) {
     const rows = [fact("status", statusNode(d))];
     // What an asking session asks, in full (the sidebar's Needs you
     // answers it).
+    const linked = (label, id) => {
+      if (!id) return;
+      const known = sessionById(id);
+      rows.push(fact(
+        label,
+        known
+          ? el("button", { type: "button", className: "tach wk-link", textContent: known.name, title: "Open it", onclick: () => ctx.openSession(known.id) })
+          : el("span", { className: "wk-mono", textContent: id.slice(0, 8), title: id }),
+      ));
+    };
+    linked("continues", d.links && d.links.continues);
+    linked("opened by", d.links && d.links.opened_by);
+    linked("continued", d.continued_by);
+    if (d.ask && d.ask.prompt) {
+      rows.push(fact("handoff", el("pre", { className: "wk-ask-cmd wk-handoff", textContent: d.ask.prompt })));
+    }
     if (d.ask) {
       rows.push(fact(
         "asks",

@@ -108,10 +108,35 @@ pub(super) async fn progress_tool(
         }))
         .into_response();
     };
-    match mcp::answer_body(&message) {
-        Some(answer) => Json(answer).into_response(),
+    let host = AgentHost {
+        hub: Arc::clone(&app.hub),
+        session,
+    };
+    // The acting tools take the hub's locks: off the async runtime.
+    let answered = tokio::task::spawn_blocking(move || mcp::answer_body(&message, &host)).await;
+    match answered {
+        Ok(Some(answer)) => Json(answer).into_response(),
         // Notifications only: accepted, nothing to say.
-        None => StatusCode::ACCEPTED.into_response(),
+        Ok(None) => StatusCode::ACCEPTED.into_response(),
+        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "the tool call failed"),
+    }
+}
+
+/// The hub, as the session calling a tool sees it.
+struct AgentHost {
+    hub: Arc<crate::hub::Hub>,
+    session: String,
+}
+
+impl mcp::Host for AgentHost {
+    fn list_sessions(&self) -> String {
+        self.hub.agent_sessions(&self.session)
+    }
+
+    fn message(&self, to: &str, text: &str) -> Result<String, String> {
+        self.hub
+            .agent_message(&self.session, to, text)
+            .map_err(|e| e.to_string())
     }
 }
 

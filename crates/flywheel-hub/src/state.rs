@@ -263,6 +263,14 @@ pub struct SessionRecord {
     /// token instead of the CLI's own login, on every relaunch and restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// The session this one continues (a handoff: its agent handed its
+    /// work on): its id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<String>,
+    /// The agent session that opened this one (`fw hub new` run inside
+    /// it): its id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
 }
 
 /// A saved way to start an agent in a workspace: kind, first prompt,

@@ -89,6 +89,8 @@ pub enum AskKind {
     /// A command only the operator can run (`sudo`, another machine),
     /// and its output back.
     Run,
+    /// Continue the work in a new session, from the prompt it wrote.
+    Handoff,
 }
 
 impl AskKind {
@@ -96,8 +98,26 @@ impl AskKind {
         match word.to_ascii_lowercase().as_str() {
             "decide" | "decision" | "choose" => Self::Decide,
             "run" | "command" => Self::Run,
+            "handoff" => Self::Handoff,
             _ => Self::Answer,
         }
+    }
+}
+
+/// How a session is tied to others on its hub (their hub session ids).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLinks {
+    /// The session whose work this one continues (a handoff).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<String>,
+    /// The agent session that opened this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opened_by: Option<String>,
+}
+
+impl SessionLinks {
+    pub fn is_empty(&self) -> bool {
+        self.continues.is_none() && self.opened_by.is_none()
     }
 }
 
@@ -157,7 +177,13 @@ pub enum What {
         label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dir: Option<String>,
+        /// The sessions it is tied to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        links: Option<SessionLinks>,
     },
+    /// A new session took over this one's work (a handoff accepted).
+    #[serde(rename = "session.continued")]
+    Continued { successor: String },
     #[serde(rename = "session.finished")]
     SessionFinished {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -219,6 +245,9 @@ pub enum What {
         command: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         options: Vec<String>,
+        /// The successor's first prompt (`handoff`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
     },
     /// The session started waiting on a person.
     #[serde(rename = "wait.started")]
@@ -311,6 +340,7 @@ impl What {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::SessionStarted { .. } => "session.started",
+            Self::Continued { .. } => "session.continued",
             Self::SessionFinished { .. } => "session.finished",
             Self::TurnStarted { .. } => "turn.started",
             Self::TurnFinished { .. } => "turn.finished",
@@ -348,6 +378,7 @@ impl What {
 /// Every event kind (documented in `docs/hub/api.md`).
 pub const KINDS: &[&str] = &[
     "session.started",
+    "session.continued",
     "session.finished",
     "turn.started",
     "turn.finished",

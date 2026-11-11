@@ -229,7 +229,9 @@ async fn hooks_posted_to_the_hub_drive_status_and_are_recorded() {
         settings["permissions"]["allow"],
         json!([
             "mcp__flywheel__report_progress",
-            "mcp__flywheel__ask_operator"
+            "mcp__flywheel__ask_operator",
+            "mcp__flywheel__handoff",
+            "mcp__flywheel__list_sessions"
         ])
     );
     let mcp: Value = serde_json::from_str(arg_after(&args, "--mcp-config")).unwrap();
@@ -652,5 +654,143 @@ async fn http_hooks_wait_for_a_status_line_to_show_a_new_enough_cli() {
         settings["hooks"]["PreToolUse"][0]["hooks"][0]["type"],
         "http"
     );
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handoff_is_continued_in_a_linked_session_and_agents_message_each_other() {
+    let hub = TestHub::start(None).await;
+    let (sid, args, env) = hub.claude().await;
+    let settings: Value = serde_json::from_str(arg_after(&args, "--settings")).unwrap();
+    let hook_headers = settings["hooks"]["PreToolUse"][0]["hooks"][0]["headers"].clone();
+    let mcp: Value = serde_json::from_str(arg_after(&args, "--mcp-config")).unwrap();
+    let mcp_headers = mcp["mcpServers"]["flywheel"]["headers"].clone();
+    let workspaces = hub.get("/api/workspaces").await;
+    let ws = workspaces["workspaces"][0]["id"].clone();
+
+    // Another agent, opened by the first (`fw hub new` inside it).
+    let other = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws, "kind": "claude", "name": "reviewer", "opened_by": sid }),
+        )
+        .await;
+    assert_eq!(other["opened_by"], sid.as_str(), "{other}");
+    // An opener this hub does not know is no link.
+    let stray = hub
+        .post(
+            "/api/sessions",
+            json!({ "workspace_id": ws, "kind": "shell", "opened_by": "f".repeat(32) }),
+        )
+        .await;
+    assert!(stray.get("opened_by").is_none(), "{stray}");
+
+    // The first lists the others and messages one.
+    let call = |name: &str, arguments: Value| {
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": name, "arguments": arguments}})
+    };
+    let path = "/api/telemetry/mcp";
+    let listed: Value = hub
+        .as_agent(path, &mcp_headers, &env, &call("list_sessions", json!({})))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let listed = listed["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(listed.contains("reviewer (id "), "{listed}");
+    assert!(
+        !listed.contains("builder"),
+        "the asker is left out: {listed}"
+    );
+    let sent: Value = hub
+        .as_agent(
+            path,
+            &mcp_headers,
+            &env,
+            &call(
+                "message_session",
+                json!({"to": "reviewer", "text": "rebased on main"}),
+            ),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let said = sent["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(sent["result"]["isError"], false, "{sent}");
+    assert!(
+        said.starts_with("Delivered to reviewer") || said.starts_with("Queued for reviewer"),
+        "{said}"
+    );
+    let to_self: Value = hub
+        .as_agent(
+            path,
+            &mcp_headers,
+            &env,
+            &call("message_session", json!({"to": "builder", "text": "hi"})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(to_self["result"]["isError"], true, "{to_self}");
+
+    // The first proposes a handoff and ends its turn on it.
+    for play in [
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "wrap up"}),
+        json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__flywheel__handoff",
+               "tool_use_id": "h1", "tool_input": {"reason": "Long context",
+               "prompt": "Goal: finish the route.\nDone: the store."}}),
+        json!({"hook_event_name": "Stop", "last_assistant_message": "Handed off."}),
+    ] {
+        let response = hub
+            .as_agent("/api/telemetry/hook", &hook_headers, &env, &play)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{play}");
+    }
+    let asking = hub.get(&format!("/api/telemetry/sessions/{sid}")).await;
+    assert_eq!(asking["session"]["ask"]["kind"], "handoff", "{asking}");
+
+    // Continuing it starts a linked session from the proposed prompt.
+    let (status, next) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{sid}/continue"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{next}");
+    assert_eq!(next["continues"], sid.as_str(), "{next}");
+    assert_eq!(next["kind"], "claude");
+    let next_id = next["id"].as_str().unwrap().to_owned();
+    let args_file = hub.dir.path().join("claude.args");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let args = std::fs::read_to_string(&args_file).unwrap_or_default();
+        if args.contains("Goal: finish the route.") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the successor never got its prompt: {args}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let old = hub.get(&format!("/api/telemetry/sessions/{sid}")).await;
+    assert_eq!(old["session"]["status"], "done", "{old}");
+    assert_eq!(old["session"]["continued_by"], next_id.as_str());
+    // Nothing proposed: a prompt must be given.
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{next_id}/continue"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     hub.shutdown().await;
 }

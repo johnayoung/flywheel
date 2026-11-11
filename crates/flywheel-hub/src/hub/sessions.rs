@@ -173,6 +173,17 @@ impl Hub {
             (kind, None) => vec![self.agent_program(kind)?.to_string_lossy().into_owned()],
         };
         let name = request.name.as_deref().map(validate_name).transpose()?;
+        let opened_by = match request.opened_by.as_deref().map(str::trim) {
+            None | Some("") => None,
+            // An opener on another hub (`fw hub new --url` from inside a
+            // session) is not a link here.
+            Some(id) => self
+                .store()
+                .session(id)
+                .ok()
+                .filter(|opener| opener.runs_agent())
+                .map(|opener| opener.id.clone()),
+        };
         let tunables = self.tunables();
         let options = tunables
             .agent_defaults
@@ -237,6 +248,8 @@ impl Hub {
             reviewer: None,
             review_of: None,
             account,
+            continues: None,
+            opened_by: opened_by.clone(),
         };
         if record
             .launch
@@ -537,6 +550,8 @@ impl Hub {
             reviewer: None,
             review_of: None,
             account: None,
+            continues: None,
+            opened_by: None,
         };
         Ok((self.launch(record, cols, rows, false, None)?, true))
     }
@@ -794,7 +809,7 @@ impl Hub {
             .unwrap_or(base)
     }
 
-    fn default_session_name(&self, workspace_id: &str, command: &[String]) -> String {
+    pub(super) fn default_session_name(&self, workspace_id: &str, command: &[String]) -> String {
         let program = command
             .first()
             .and_then(|p| std::path::Path::new(p).file_name())

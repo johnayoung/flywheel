@@ -31,18 +31,19 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 
 | Method | Path | |
 |---|---|---|
-| GET / POST | `/api/sessions[?workspace_id=]` | list / create `{"workspace_id","folder"?,"kind"?,"command"?:[argv],"worktree"?:{"task","base"?},"prompt"?,...}` (`new`'s flags) |
+| GET / POST | `/api/sessions[?workspace_id=]` | list / create `{"workspace_id","folder"?,"kind"?,"command"?:[argv],"worktree"?:{"task","base"?},"prompt"?,...}` |
 | GET / PATCH / DELETE | `/api/sessions/{id}` | PATCH `{"name"}`; DELETE kills, forgets (204; `?remove_worktree=true[&force=true]`) |
 | POST | `/api/sessions/{id}/kill` | 202: SIGHUP (3 s: SIGKILL), kept |
 | POST | `/api/sessions/{id}/relaunch` | `{"cols"?,"rows"?}`: an ended session, same id; 409 running |
 | POST | `/api/sessions/{id}/restart` | old `/relaunch` |
+| POST | `/api/sessions/{id}/continue` | `{"prompt"?}` (default: the `handoff`'s): linked successor; 201 |
 | GET | `/api/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered text: `visible` rows, or `recent` lines (1..100000, 100); cursor, modes |
 | GET | `/api/sessions/{id}/explain` | as `fw hub explain --json` |
 | POST | `/api/sessions/{id}/input` | `{"data","paste"?,"enter"?}`; 409 not running / not reading |
 | POST | `/api/sessions/{id}/paste` | `{"text","run"?}`: `/input` with `paste`, trailing newlines dropped, 1 MiB; 409 unsafe multi-line |
 | GET | `/api/sessions/{id}/commands[?limit=N&all=true]` | newest first (shell unless `all`; `limit` 1..500, 50) |
 | GET | `/api/sessions/{id}/replies[?limit=N]` | newest first (`limit` 1..100, 20): `text`, `blocks`, `match_key` |
-| GET | `/api/sessions/{id}/file?path=` | a file the session names (relative to its cwd, worktree, workspace folders; absolute; `~/`), resolving (symlinks too) under those; `{"path","size","text","truncated"}` (first 2 MiB); 403 outside, 404 none, 415 binary |
+| GET | `/api/sessions/{id}/file?path=` | a file the session names (relative to its cwd, worktree, workspace folders; absolute; `~/`), resolved (symlinks too) under those; `{"path","size","text","truncated"}` (first 2 MiB); 403 outside, 404 none, 415 binary |
 | POST | `/api/sessions/{id}/files/check` | `{"paths":[...]}` (64): `{"files":[{"path","size"}\|null]}`, in order |
 | GET | `/api/sessions/{id}/transcript[?around=N&before=N&after=N]` | messages, paged (30, max 200); 400 a shell |
 | POST | `/api/sessions/{id}/companion` | `{"text"?,"run"?}`: companion shell (201 / 200 running), `text` pasted when ready |
@@ -50,14 +51,14 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET | `/api/worktrees/plan?folder=&task=&base=` | `{"plan"\|null,"error"}` |
 | GET | `/api/sessions/{id}/ws` | terminal WebSocket (below) |
 | GET | `/api/kinds` | session kinds, each `available` |
-| GET | `/api/claude-accounts` | `{accounts:[{name,updated}]}` (never tokens); `"account":NAME` on `POST /api/sessions` launches under one |
+| GET | `/api/claude-accounts` | `{accounts:[{name,updated}]}` (never tokens); `"account":NAME` on create launches under one |
 | POST | `/api/claude-accounts` | `{name,token,replace?}` -> 201 `{name,updated}` (taken: 409 unless `replace`) |
 | DELETE | `/api/claude-accounts/{name}` | 204 |
-| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, 30): past conversations, newest first `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `POST /api/sessions` `"resume":ID\|"latest"` resumes one |
+| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, 30): past conversations, newest first `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `"resume":ID\|"latest"` on create resumes one |
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
-A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings.
+A session lists `agent` (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`.
 
 ## Review, handoff, peer review
 
@@ -243,22 +244,22 @@ Close: **4001** token rotated, **4002** logout / login expired, **4003** peer re
 
 ## Telemetry
 
-What every agent session does ([hub-workflows](workflows.md#fleet-and-work)).
+Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/telemetry/fleet[?status=&host=&hours=&limit=&offset=]` | `host` (this hub's id), `sessions` (snapshots, most urgent first), `total`, `counts` per status, `hosts`; `hours=0`: any age |
-| GET | `/api/telemetry/sessions/{id}[?host=]` | `session`: its snapshot, `work` tree, `plans`; 404 before its first event |
+| GET | `/api/telemetry/fleet[?status=&host=&hours=&limit=&offset=]` | `host` (this hub's id), `sessions` (snapshots, urgent first), `total`, `counts` per status, `hosts`; `hours=0`: any age |
+| GET | `/api/telemetry/sessions/{id}[?host=]` | `session`: its snapshot, `work` tree, `plans`; 404 before any event |
 | GET | `/api/telemetry/sessions/{id}/events[?host=&after=&limit=&newest=1]` | `events` by `seq`, oldest first |
 | POST | `/api/telemetry/batch` | another hub's events, NDJSON (or `Content-Encoding: deflate`) -> `received`, `accepted` |
-| POST | `/api/telemetry/hook` | a Claude Code hook's JSON; no login: `x-flywheel-session`, `x-flywheel-secret` |
-| POST | `/api/telemetry/mcp` | `report_progress`, `ask_operator` (MCP over http); same headers |
+| POST | `/api/telemetry/hook` | a Claude Code hook; no login: `x-flywheel-session`, `x-flywheel-secret` |
+| POST | `/api/telemetry/mcp` | agent tools (MCP over http); same headers |
 
 Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: turn or subagent; `item`: plan item).
 
-Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?}`), `failed`, `working`, `done`, `idle`, `ended`.
+Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?,prompt?}`), `failed`, `working`, `done`, `idle`, `ended`; `links`.
 
-Kinds: `session.started`, `session.finished`, `turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished` (paired by `id`), `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
+Kinds: `session.started`, `session.continued`, `session.finished`, `turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
 
 ## Events WebSocket
 
@@ -280,7 +281,7 @@ Kinds: `session.started`, `session.finished`, `turn.started`, `turn.finished` (`
 | `activity` | `"row"` | a journal row was written |
 | `away` | `"since","until"` | back after 10+ min: its digest span |
 | `digest` | `"id"` | a digest was sent (`GET /api/digests/{id}`) |
-| `telemetry` | `"session"`: its snapshot | a session's telemetry changed (4 a second each at most) |
+| `telemetry` | `"session"`: its snapshot | a session's telemetry changed (4/s each at most) |
 
 Client sends `{"type":"view","session_id","visible"?:[ids],"present"?}`: on screen counts as viewed; `present`: someone is at the page.
 

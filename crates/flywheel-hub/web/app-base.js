@@ -405,6 +405,7 @@ const files = window.FwHubFiles({
   api,
   toast: (...args) => commands.toast(...args),
   copyText: (text) => commands.copyText(text),
+  refresh: () => refresh(true),
 });
 
 // One overlay over the terminal at a time: opening a drawer closes the
@@ -679,6 +680,8 @@ const work = window.FwHubWork({
   machinePrefix: (machine) => machines.prefix(machine),
   focusTerminal: () => focusTerminal(),
   onOpen: () => closeOverlays("work"),
+  // A linked session (continues, continued in) opens.
+  openSession: (id) => openSession(id),
 });
 
 // The fleet board (fleet.js): every agent session the hub has telemetry

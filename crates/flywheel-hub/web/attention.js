@@ -21,7 +21,9 @@ window.FwHubAttention = function (ctx) {
     const snap = ctx.telemetryOf ? ctx.telemetryOf(session.id) : null;
     return snap && snap.status === "asking" && snap.ask ? snap.ask : null;
   }
-  const ASK_WORD = { answer: "asks", decide: "decide", run: "run this" };
+  const ASK_WORD = { answer: "asks", decide: "decide", run: "run this", handoff: "hand off" };
+  // Handoff prompts being edited, by session.
+  const handoffs = new Map();
   // Replies being typed, by session: a re-render keeps them.
   const drafts = new Map();
 
@@ -69,6 +71,45 @@ window.FwHubAttention = function (ctx) {
     }
   }
 
+  // Accept a handoff: a new session in the same directory continues the
+  // work from the (possibly edited) prompt; it opens.
+  async function startSuccessor(session, prompt, button) {
+    if (button) button.disabled = true;
+    try {
+      const next = await ctx.api("POST", `/api/sessions/${encodeURIComponent(session.id)}/continue`, { prompt });
+      handoffs.delete(session.id);
+      ctx.toast(`Started ${next.name}, continuing ${session.name}`);
+      // The new session is listed before it is opened.
+      if (ctx.refresh) await ctx.refresh();
+      openSession(next.id);
+    } catch (error) {
+      ctx.toast(`Not started: ${error.message}`, { tone: "bad" });
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  // A handoff: the new session's prompt, editable, and the button that
+  // starts it.
+  function handoffBox(session, ask) {
+    const area = el("textarea", {
+      className: "attn-handoff-text",
+      rows: 5,
+      spellcheck: false,
+      "aria-label": `${session.name}'s prompt for the new session`,
+      value: handoffs.has(session.id) ? handoffs.get(session.id) : ask.prompt || "",
+      oninput: (event) => handoffs.set(session.id, event.target.value),
+    });
+    const start = el("button", {
+      type: "button",
+      className: "slab attn-start",
+      textContent: "Start session",
+      title: "Start a new session here with this prompt; it continues this one's work",
+      onclick: () => startSuccessor(session, area.value, start),
+    });
+    return el("div", { className: "attn-handoff attn-reply" }, area, start);
+  }
+
   // An ask answered in place: its command to copy, its options to pick,
   // and a one-line reply.
   function askBox(session, ask) {
@@ -112,6 +153,7 @@ window.FwHubAttention = function (ctx) {
             }),
           )
         : null,
+      ask.kind === "handoff" && ask.prompt ? handoffBox(session, ask) : null,
       (ask.options || []).length
         ? el(
             "div",

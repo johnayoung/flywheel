@@ -18,7 +18,7 @@
 //!   claim: it is shown beside the observed calls, never instead of them.
 
 use super::ask::{self, Ask};
-use super::event::{AskKind, Event, ItemStatus, Outcome, PlanStep, WaitReason, What};
+use super::event::{AskKind, Event, ItemStatus, Outcome, PlanStep, SessionLinks, WaitReason, What};
 use serde::{Deserialize, Serialize};
 
 /// Work items (turns and subagents) kept per session; the oldest finished
@@ -223,6 +223,11 @@ pub struct SessionState {
     #[serde(default)]
     dir: Option<String>,
     #[serde(default)]
+    links: SessionLinks,
+    /// The session that took this one's work over.
+    #[serde(default)]
+    continued_by: Option<String>,
+    #[serde(default)]
     started: Option<i64>,
     #[serde(default)]
     pub last_ts: i64,
@@ -320,6 +325,13 @@ pub struct Snapshot {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
+    /// The sessions it is tied to: the one it continues, the agent that
+    /// opened it.
+    #[serde(default, skip_serializing_if = "SessionLinks::is_empty")]
+    pub links: SessionLinks,
+    /// The session that took its work over (its handoff accepted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_by: Option<String>,
     /// `working`, `blocked` (a harness dialog waits on a person),
     /// `asking` (the last turn ended asking the operator something: see
     /// `ask`), `done` (awaiting the next prompt), `failed` (the last turn
@@ -429,9 +441,11 @@ impl SessionState {
                 model,
                 label,
                 dir,
+                links,
                 ..
             } => {
-                !self.ended
+                links.as_ref().is_none_or(|l| *l == self.links)
+                    && !self.ended
                     && self.harness.is_some()
                     && (conversation.is_none() || *conversation == self.conversation)
                     && (model.is_none() || *model == self.model)
@@ -477,8 +491,12 @@ impl SessionState {
                 model,
                 label,
                 dir,
+                links,
             } => {
                 self.harness = Some(harness.clone());
+                if let Some(links) = links {
+                    self.links = links.clone();
+                }
                 if label.is_some() {
                     self.label.clone_from(label);
                 }
@@ -492,6 +510,11 @@ impl SessionState {
                     self.model = model.clone();
                 }
                 self.ended = false;
+            }
+            What::Continued { successor } => {
+                // Its work went on there: whatever it asked is answered.
+                self.ask = None;
+                self.continued_by = Some(successor.clone());
             }
             What::SessionFinished { .. } => {
                 self.ask = None;
@@ -669,6 +692,7 @@ impl SessionState {
                 text,
                 command,
                 options,
+                prompt,
             } => {
                 event.work = self.turn.clone();
                 // A subagent's ask does not end the session's turn: its
@@ -679,6 +703,7 @@ impl SessionState {
                         text: text.clone(),
                         command: command.clone(),
                         options: options.clone(),
+                        prompt: prompt.clone(),
                         source: "declared".to_owned(),
                         since: ts,
                     });
@@ -888,6 +913,7 @@ impl SessionState {
             text,
             command: None,
             options: Vec::new(),
+            prompt: None,
             source: "inferred".to_owned(),
             since: ts,
         })
@@ -1134,6 +1160,8 @@ impl SessionState {
             model: self.model.clone(),
             label: self.label.clone(),
             dir: self.dir.clone(),
+            links: self.links.clone(),
+            continued_by: self.continued_by.clone(),
             status: status.to_owned(),
             since,
             blocked_on: self.wait.as_ref().map(|w| w.reason),

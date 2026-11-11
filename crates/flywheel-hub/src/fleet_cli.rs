@@ -259,6 +259,8 @@ pub(crate) struct InboxArgs {
 
 /// The most asks listed.
 const INBOX_LIMIT: u32 = 1000;
+/// Lines of a handoff's prompt the inbox shows.
+const HANDOFF_PREVIEW: usize = 6;
 
 /// `fw hub inbox`: every session that waits on the operator, most urgent
 /// first: harness dialogs (`blocked`), then turns that ended asking for
@@ -338,6 +340,19 @@ fn print_inbox(out: &mut dyn Write, page: &Value) {
                 let _ = writeln!(out, "    $ {}", shown(line, 400));
             }
         }
+        if let Some(prompt) = ask["prompt"].as_str() {
+            let lines: Vec<&str> = prompt.lines().collect();
+            for line in lines.iter().take(HANDOFF_PREVIEW) {
+                let _ = writeln!(out, "    > {}", shown(line, 200));
+            }
+            if lines.len() > HANDOFF_PREVIEW {
+                let _ = writeln!(
+                    out,
+                    "    > ... {} more lines",
+                    lines.len() - HANDOFF_PREVIEW
+                );
+            }
+        }
         for (n, option) in ask["options"].as_array().into_iter().flatten().enumerate() {
             let _ = writeln!(
                 out,
@@ -348,7 +363,9 @@ fn print_inbox(out: &mut dyn Write, page: &Value) {
         }
         // A dialog is answered in the session; an ask, by the next prompt
         // (another hub's session: on that hub).
-        if session["status"] == "asking" && host == own {
+        if ask["kind"] == "handoff" && host == own {
+            let _ = writeln!(out, "  start: fw hub continue {id}");
+        } else if session["status"] == "asking" && host == own {
             let _ = writeln!(out, "  reply: fw hub broadcast {id} 'TEXT'");
         } else if session["status"] == "blocked" && host == own {
             let _ = writeln!(out, "  answer: fw hub attach {id}");
@@ -385,6 +402,14 @@ fn print_session(out: &mut dyn Write, found: &Value) {
             .unwrap_or_default(),
         status(session, now)
     );
+    for (key, said) in [("continues", "continues"), ("opened_by", "opened by")] {
+        if let Some(other) = session["links"][key].as_str() {
+            let _ = writeln!(out, "{said} session {}", shown(other, 40));
+        }
+    }
+    if let Some(next) = session["continued_by"].as_str() {
+        let _ = writeln!(out, "continued in session {}", shown(next, 40));
+    }
     let blocked = session["blocked_ms"].as_i64().unwrap_or(0)
         + if session["status"] == "blocked" {
             now - session["since"].as_i64().unwrap_or(now)
@@ -515,6 +540,19 @@ mod tests {
         assert_eq!(
             text(|out| print_inbox(out, &json!({"sessions": []}))),
             "nothing needs you\n"
+        );
+        let handoff = json!({"host": own, "now": 0, "sessions": [
+            {"host": own, "session": "s5", "status": "asking", "since": 0,
+             "ask": {"kind": "handoff", "text": "Context is long", "source": "declared", "since": 0,
+                     "prompt": "Goal: ship C2\nDone: links\n1\n2\n3\n4\n5"}}]});
+        let inbox = text(|out| print_inbox(out, &handoff));
+        assert!(
+            inbox.contains("  Context is long\n    > Goal: ship C2\n    > Done: links\n"),
+            "{inbox}"
+        );
+        assert!(
+            inbox.contains("    > ... 1 more lines\n  start: fw hub continue s5\n"),
+            "{inbox}"
         );
     }
 

@@ -130,6 +130,25 @@ pub(super) async fn restart_session(
     Ok(Json(view).into_response())
 }
 
+#[derive(Deserialize, Default)]
+pub(super) struct ContinueRequest {
+    /// The new session's first prompt; default: the one the agent
+    /// proposed with its handoff tool.
+    prompt: Option<String>,
+}
+
+/// Start a new session that continues an agent session's work (its
+/// handoff accepted): 201 with the new session.
+pub(super) async fn continue_session(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(request): ApiJson<ContinueRequest>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let view = blocking(move || hub.continue_session(&id, request.prompt.as_deref())).await?;
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
 #[derive(Deserialize)]
 pub(super) struct ScreenQuery {
     source: Option<String>,

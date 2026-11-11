@@ -32,6 +32,15 @@ pub const PROGRESS_TOOL: &str = "mcp__flywheel__report_progress";
 /// The hub's ask tool as Claude Code names it.
 pub const ASK_TOOL: &str = "mcp__flywheel__ask_operator";
 
+/// The hub's handoff tool as Claude Code names it.
+pub const HANDOFF_TOOL: &str = "mcp__flywheel__handoff";
+
+/// The hub's session list tool as Claude Code names it.
+pub const LIST_TOOL: &str = "mcp__flywheel__list_sessions";
+
+/// The hub's message tool as Claude Code names it.
+pub const MESSAGE_TOOL: &str = "mcp__flywheel__message_session";
+
 /// Most options an ask keeps.
 const ASK_OPTIONS: usize = 8;
 
@@ -89,6 +98,7 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
             model: owned(payload, "model"),
             label: None,
             dir: None,
+            links: None,
         })],
         "SessionEnd" => vec![main(What::SessionFinished {
             reason: owned(payload, "reason"),
@@ -247,6 +257,17 @@ fn declared(tool: &str, input: &Value) -> Option<What> {
                         .collect()
                 })
                 .unwrap_or_default(),
+            prompt: None,
+        }),
+        HANDOFF_TOOL => Some(What::Asked {
+            kind: AskKind::Handoff,
+            text: str_of(input, "reason")
+                .map(summary::text)
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "Continue this work in a new session".to_owned()),
+            command: None,
+            options: Vec::new(),
+            prompt: Some(summary::prompt(str_of(input, "prompt")?)?),
         }),
         "TodoWrite" => Some(What::PlanSet {
             source: "todo".to_owned(),
@@ -282,6 +303,7 @@ pub fn status_line(payload: &Value, ts: i64) -> Vec<Draft> {
                 model: Some(model),
                 label: None,
                 dir: None,
+                links: None,
             },
         ));
     }

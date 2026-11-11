@@ -744,6 +744,13 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
     if let Some(account) = &args.account {
         body["account"] = json!(account);
     }
+    // Run inside an agent session: that session opened this one (the
+    // hub links them when it is one of its own).
+    if let Ok(opener) = std::env::var(crate::report::SESSION_ENV)
+        && !opener.trim().is_empty()
+    {
+        body["opened_by"] = json!(opener.trim());
+    }
     if let Some(id) = &args.resume {
         body["resume"] = json!(id);
     } else if args.continue_ {
@@ -1306,6 +1313,56 @@ pub(crate) fn relaunch(args: &RelaunchArgs, out: &mut dyn Write, err: &mut dyn W
                 str_field(&view, "id"),
                 str_field(&view, "cwd")
             );
+            0
+        }
+        Err(message) => fail(err, &message),
+    }
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ContinueArgs {
+    #[command(flatten)]
+    target: SessionArg,
+    /// The new session's first prompt (`-` reads it from stdin). Default:
+    /// the prompt the agent proposed with its handoff tool.
+    #[arg(long, allow_hyphen_values = true)]
+    prompt: Option<String>,
+    /// Print the new session as JSON instead of its id.
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+}
+
+pub(crate) fn continue_session(
+    args: &ContinueArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let result = connect(&args.endpoint).and_then(|conn| {
+        let prompt = match args.prompt.as_deref() {
+            Some("-") => {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                    .map_err(|e| format!("cannot read the prompt from stdin: {e}"))?;
+                Some(text)
+            }
+            other => other.map(str::to_owned),
+        };
+        let (id, _) = find_session(&conn, &args.target.session)?;
+        conn.blocking_call(
+            "POST",
+            &format!("/api/sessions/{id}/continue"),
+            Some(&json!({ "prompt": prompt })),
+        )
+    });
+    match result {
+        Ok(view) if args.json => {
+            print_json(out, &view);
+            0
+        }
+        Ok(view) => {
+            let _ = writeln!(out, "{}", str_field(&view, "id"));
             0
         }
         Err(message) => fail(err, &message),

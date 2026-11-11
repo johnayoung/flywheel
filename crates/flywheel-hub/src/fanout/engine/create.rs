@@ -145,6 +145,7 @@ impl Fanouts {
                 launch: launch.clone(),
                 resume: None,
                 account: None,
+                opened_by: None,
             });
             let view = match created {
                 Ok(view) => view,

@@ -25,6 +25,9 @@ pub struct Ask {
     /// The choices (`decide`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    /// The successor's first prompt (`handoff`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
     /// `declared` (the agent's tool) or `inferred` (its closing message).
     pub source: String,
     /// When the turn that asked ended (or, while it runs, when it asked).

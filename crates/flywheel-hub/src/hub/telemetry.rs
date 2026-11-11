@@ -279,6 +279,14 @@ impl Hub {
     }
 }
 
+/// How a session is tied to others, from its record.
+fn links_of(record: &SessionRecord) -> crate::telemetry::SessionLinks {
+    crate::telemetry::SessionLinks {
+        continues: record.continues.clone(),
+        opened_by: record.opened_by.clone(),
+    }
+}
+
 /// Say whose events these are: the session's name on this hub and its
 /// directory, on its start, else ahead of the rest (a session whose start
 /// was not seen, or that was renamed; recording drops it when it says
@@ -293,9 +301,13 @@ fn name_session(drafts: &mut Vec<Draft>, kind: SessionKind, record: &SessionReco
     ));
     let mut named = false;
     for draft in drafts.iter_mut() {
-        if let What::SessionStarted { label, dir, .. } = &mut draft.what {
+        if let What::SessionStarted {
+            label, dir, links, ..
+        } = &mut draft.what
+        {
             label.clone_from(&name);
             dir.clone_from(&cwd);
+            *links = Some(links_of(record));
             named = true;
         }
     }
@@ -310,6 +322,7 @@ fn name_session(drafts: &mut Vec<Draft>, kind: SessionKind, record: &SessionReco
                     model: None,
                     label: name,
                     dir: cwd,
+                    links: Some(links_of(record)),
                 },
             ),
         );

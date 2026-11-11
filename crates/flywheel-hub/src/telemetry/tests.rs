@@ -748,6 +748,10 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             model: None,
             label: None,
             dir: None,
+            links: None,
+        },
+        What::Continued {
+            successor: "s2".into(),
         },
         What::SessionFinished { reason: None },
         What::TurnStarted { title: "t".into() },
@@ -775,6 +779,7 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             text: "pick".into(),
             command: None,
             options: vec!["a".into()],
+            prompt: None,
         },
         What::WaitStarted {
             reason: WaitReason::Permission,
@@ -1190,4 +1195,114 @@ fn asking_sessions_rank_right_after_blocked_ones() {
         .unwrap();
     let order: Vec<&str> = page.sessions.iter().map(|s| s.session.as_str()).collect();
     assert_eq!(order, ["blocked", "asking", "failed", "done"]);
+}
+
+#[test]
+fn a_handoff_waits_with_its_prompt_until_a_successor_takes_it() {
+    let (_dir, telemetry) = open();
+    hooks(
+        &telemetry,
+        "old",
+        0,
+        &[
+            (
+                "UserPromptSubmit",
+                json!({"prompt": "give me a prompt for a new session"}),
+            ),
+            (
+                "PreToolUse",
+                json!({"tool_name": claude::HANDOFF_TOOL, "tool_use_id": "h1",
+                       "tool_input": {"reason": "Context is at 64%",
+                                      "prompt": "Goal: build C2.\nDone: C1 (528d3993).\nToken ghp_0123456789abcdefghijklmnopqrstuvwxyzAB"}}),
+            ),
+            (
+                "Stop",
+                json!({"last_assistant_message": "Handed off. Anything else?"}),
+            ),
+        ],
+    );
+    let snap = telemetry.snapshot("old").unwrap();
+    assert_eq!(snap.status, "asking");
+    let ask = snap.ask.unwrap();
+    assert_eq!(ask.kind, AskKind::Handoff);
+    assert_eq!(ask.text, "Context is at 64%");
+    let prompt = ask.prompt.unwrap();
+    assert!(prompt.starts_with("Goal: build C2.\nDone: C1"), "{prompt}");
+    assert!(!prompt.contains("ghp_"), "scrubbed: {prompt}");
+    // The successor starts: the old session's handoff is answered and it
+    // names who took over; the new one names what it continues.
+    telemetry.record(
+        "old",
+        vec![Draft::new(
+            9_000,
+            What::Continued {
+                successor: "new".into(),
+            },
+        )],
+    );
+    let old = telemetry.snapshot("old").unwrap();
+    assert_eq!(
+        (old.status.as_str(), old.continued_by.as_deref()),
+        ("done", Some("new"))
+    );
+    telemetry.record(
+        "new",
+        vec![Draft::new(
+            9_500,
+            What::SessionStarted {
+                harness: "claude".into(),
+                conversation: None,
+                model: None,
+                label: Some("claude 7".into()),
+                dir: None,
+                links: Some(event::SessionLinks {
+                    continues: Some("old".into()),
+                    opened_by: None,
+                }),
+            },
+        )],
+    );
+    let new = telemetry.snapshot("new").unwrap();
+    assert_eq!(new.links.continues.as_deref(), Some("old"));
+    // Saying the same links again is not news.
+    telemetry.record(
+        "new",
+        vec![Draft::new(
+            9_600,
+            What::SessionStarted {
+                harness: "claude".into(),
+                conversation: None,
+                model: None,
+                label: Some("claude 7".into()),
+                dir: None,
+                links: Some(event::SessionLinks {
+                    continues: Some("old".into()),
+                    opened_by: None,
+                }),
+            },
+        )],
+    );
+    assert_eq!(
+        telemetry.events(None, "new", 0, 10, false).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn a_handoff_without_a_prompt_is_not_an_ask() {
+    let (_dir, telemetry) = open();
+    hooks(
+        &telemetry,
+        "s",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            (
+                "PreToolUse",
+                json!({"tool_name": claude::HANDOFF_TOOL, "tool_use_id": "h1", "tool_input": {"prompt": "  "}}),
+            ),
+            ("Stop", json!({"last_assistant_message": "Done."})),
+        ],
+    );
+    assert_eq!(telemetry.snapshot("s").unwrap().status, "done");
 }

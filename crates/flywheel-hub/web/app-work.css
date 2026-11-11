@@ -204,3 +204,5 @@
 }
 .wk-ask { color: var(--ink); }
 .wk-ask-cmd { margin: .3rem 0 0; padding: .3rem .45rem; border: 1px solid var(--rule); background: var(--bg); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10.5px; }
+.wk-handoff { max-height: 12rem; overflow: auto; }
+.wk-link { color: var(--ink); }

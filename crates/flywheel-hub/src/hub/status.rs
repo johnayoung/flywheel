@@ -560,6 +560,13 @@ impl Hub {
                 .and_then(|git| git.branch)
                 .unwrap_or_else(|| worktree.branch.clone())
         });
+        // A finished turn that asks the operator something (telemetry's
+        // `asking`): what it asks.
+        let ask = self
+            .telemetry()
+            .snapshot(&session.id)
+            .and_then(|snap| snap.ask)
+            .map(|ask| ask.text);
         Some(crate::notify::Subject {
             session_id: session.id,
             session: session.name,
@@ -567,6 +574,7 @@ impl Hub {
             branch,
             kind: session.kind,
             alert,
+            ask,
         })
     }
 

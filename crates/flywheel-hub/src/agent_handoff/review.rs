@@ -535,6 +535,8 @@ impl Hub {
                 .account
                 .clone()
                 .filter(|_| kind == SessionKind::Claude),
+            continues: None,
+            opened_by: None,
         };
         let view = self.launch(record, None, None, false, prompt.as_deref())?;
         let paired = self.store().set_review_pair(&author.id, &view.record.id);

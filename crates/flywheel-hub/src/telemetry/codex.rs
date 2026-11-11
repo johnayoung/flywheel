@@ -58,6 +58,7 @@ pub fn line(value: &Value, now: i64) -> Vec<Draft> {
             model: None,
             label: None,
             dir: None,
+            links: None,
         })],
         Some("turn_context") => str_of(payload, "model")
             .map(|model| {
@@ -67,6 +68,7 @@ pub fn line(value: &Value, now: i64) -> Vec<Draft> {
                     model: Some(model.to_owned()),
                     label: None,
                     dir: None,
+                    links: None,
                 })
             })
             .into_iter()

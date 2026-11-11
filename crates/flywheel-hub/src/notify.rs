@@ -261,6 +261,8 @@ pub struct Subject {
     pub branch: Option<String>,
     pub kind: SessionKind,
     pub alert: Alert,
+    /// What a done agent asks the operator (its turn ended on them).
+    pub ask: Option<String>,
 }
 
 /// One webhook message (ntfy's publish-by-headers form).
@@ -307,11 +309,22 @@ pub fn compose(subject: &Subject, click_base: Option<&str>, detail: bool) -> Opt
             },
             "high",
         ),
-        AgentStatus::Done => (
-            format!("{session} is done"),
-            format!("{place} finished its turn."),
-            "default",
-        ),
+        AgentStatus::Done => match subject.ask.as_deref().map(clean) {
+            Some(ask) if !ask.is_empty() => (
+                format!("{session} asks you"),
+                if detail {
+                    format!("{place} asks: {ask}")
+                } else {
+                    format!("{place} asks you something.")
+                },
+                "high",
+            ),
+            _ => (
+                format!("{session} is done"),
+                format!("{place} finished its turn."),
+                "default",
+            ),
+        },
         _ => return None,
     };
     Some(Push {
@@ -754,7 +767,26 @@ mod tests {
                 watched: false,
                 seen: false,
             },
+            ask: None,
         }
+    }
+
+    #[test]
+    fn a_done_agent_that_asks_says_what_it_asks() {
+        let mut asking = subject(AgentStatus::Done, None);
+        asking.ask = Some("Which name should the module use?".into());
+        let push = compose(&asking, None, true).unwrap();
+        assert_eq!(push.title, "claude 1 asks you");
+        assert_eq!(
+            push.message,
+            "infrared / claude 1 (claude) asks: Which name should the module use?"
+        );
+        assert_eq!(push.priority, "high");
+        let quiet = compose(&asking, None, false).unwrap();
+        assert_eq!(
+            quiet.message,
+            "infrared / claude 1 (claude) asks you something."
+        );
     }
 
     #[test]

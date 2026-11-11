@@ -206,7 +206,23 @@ window.FwHubFleet = function (ctx) {
         workspace ? el("span", { className: "fl-ws", textContent: workspace.name }) : null,
         snap.model ? el("span", { className: "fl-model", textContent: snap.model, title: snap.model }) : null,
       ),
+      links(snap),
     );
+  }
+
+  // How it is tied to other sessions: what it continues, who opened it,
+  // where its work went on.
+  function links(snap) {
+    const name = (id) => {
+      const known = sessionById(id);
+      return known ? known.name : id.slice(0, 8);
+    };
+    const bits = [];
+    const l = snap.links || {};
+    if (l.continues) bits.push(`continues ${name(l.continues)}`);
+    if (l.opened_by) bits.push(`opened by ${name(l.opened_by)}`);
+    if (snap.continued_by) bits.push(`continued in ${name(snap.continued_by)}`);
+    return bits.length ? el("span", { className: "fl-line fl-sub fl-links", textContent: bits.join(" · ") }) : null;
   }
 
   function doing(snap) {

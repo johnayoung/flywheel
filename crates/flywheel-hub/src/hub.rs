@@ -1,6 +1,7 @@
 //! The hub: persisted workspaces and session records plus the live PTY
 //! sessions the server owns.
 
+mod links;
 mod restore;
 mod sessions;
 mod status;
@@ -213,6 +214,9 @@ pub struct CreateSession {
     /// A Claude session's account ([`crate::accounts`]); default: the
     /// CLI's own login.
     pub account: Option<String>,
+    /// The agent session that opens this one (its id): `fw hub new` run
+    /// inside an agent session names it.
+    pub opened_by: Option<String>,
 }
 
 /// [`CreateSession::resume`]'s value for the folder's newest conversation.

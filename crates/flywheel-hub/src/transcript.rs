@@ -1717,6 +1717,8 @@ mod tests {
             reviewer: None,
             review_of: None,
             account: None,
+            continues: None,
+            opened_by: None,
         }
     }
 

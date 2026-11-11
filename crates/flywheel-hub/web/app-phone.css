@@ -476,3 +476,19 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 .attn-reply-input:focus { outline: none; border-color: var(--brass); }
 .attn-copy, .attn-send { padding: .3rem .65rem; font-size: 10px; }
 @media (pointer: coarse) { .attn-copy, .attn-send, .attn-option, .attn-reply-input { min-height: 44px; } }
+.attn-handoff { grid-template-columns: minmax(0, 1fr); }
+.attn-handoff-text {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 5.5rem;
+  max-height: 14rem;
+  resize: vertical;
+  padding: .35rem .45rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 10.5px/1.4 var(--mono);
+}
+.attn-handoff-text:focus { outline: none; border-color: var(--brass); }
+.attn-start { justify-self: end; padding: .3rem .65rem; font-size: 10px; }

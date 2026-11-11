@@ -108,8 +108,8 @@ use auth::{
 pub use events_ws::SESSIONS_PUSH_INTERVAL;
 use events_ws::{events_ws, text};
 use sessions_api::{
-    check_folder, create_session, get_session, kill_session, list_kinds, list_sessions,
-    restart_session, session_input, session_screen, update_session,
+    check_folder, continue_session, create_session, get_session, kill_session, list_kinds,
+    list_sessions, restart_session, session_input, session_screen, update_session,
 };
 use terminal_ws::{handoff_restarting, session_ws};
 use workspaces_api::{
@@ -333,6 +333,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         )
         .route("/api/sessions/{id}/kill", post(kill_session))
         .route("/api/sessions/{id}/relaunch", post(restart_session))
+        .route("/api/sessions/{id}/continue", post(continue_session))
         // The route's first name, kept for older clients.
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))

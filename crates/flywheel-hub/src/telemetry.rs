@@ -38,7 +38,7 @@ pub mod summary;
 #[cfg(test)]
 mod tests;
 
-pub use event::{Draft, Event, ItemStatus, Outcome, PlanStep, WaitReason, What};
+pub use event::{Draft, Event, ItemStatus, Outcome, PlanStep, SessionLinks, WaitReason, What};
 pub use reduce::{Detail, SessionState, Snapshot};
 pub use store::{FleetPage, FleetQuery, StoreError};
 

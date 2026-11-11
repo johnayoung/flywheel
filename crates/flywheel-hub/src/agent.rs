@@ -285,10 +285,12 @@ pub fn claude_settings(wiring: &ClaudeWiring<'_>) -> serde_json::Value {
         settings["statusLine"] = line;
     }
     if wiring.hub_url.is_some() {
-        // The hub's own progress tool never waits on a permission prompt
-        // (it changes nothing on the machine).
-        settings["permissions"] =
-            serde_json::json!({ "allow": [crate::telemetry::claude::PROGRESS_TOOL] });
+        // The hub's own tools never wait on a permission prompt (they
+        // change nothing on the machine).
+        settings["permissions"] = serde_json::json!({ "allow": [
+            crate::telemetry::claude::PROGRESS_TOOL,
+            crate::telemetry::claude::ASK_TOOL,
+        ] });
     }
     settings
 }
@@ -1031,8 +1033,11 @@ mod tests {
         assert_eq!(args[6], "--append-system-prompt");
         assert_eq!(
             settings["permissions"]["allow"],
-            serde_json::json!(["mcp__flywheel__report_progress"]),
-            "the progress tool never prompts"
+            serde_json::json!([
+                "mcp__flywheel__report_progress",
+                "mcp__flywheel__ask_operator"
+            ]),
+            "the hub's tools never prompt"
         );
         // Without http hooks (an older CLI, a restricting policy) the
         // same events run the report command.

@@ -68,8 +68,11 @@ window.FwHubWork = function (ctx) {
   };
   const lookOf = (status) => LOOK[status] || { dot: "stopped", label: status || "unknown", tone: "" };
 
-  // What a blocked session waits on: "permission: Bash", "question".
+  const ASKS = { answer: "a reply", decide: "a decision", run: "a command run" };
+  // What a blocked session waits on: "permission: Bash", "question"; an
+  // asking one: "a decision".
   function blockedOn(snap) {
+    if (snap.status === "asking") return (snap.ask && ASKS[snap.ask.kind]) || "a reply";
     if (snap.status !== "blocked") return "";
     if (snap.blocked_on === "permission") return `permission${snap.blocked_tool ? `: ${snap.blocked_tool}` : ""}`;
     return snap.blocked_on || "a person";
@@ -311,6 +314,17 @@ window.FwHubWork = function (ctx) {
 
   function summary(d) {
     const rows = [fact("status", statusNode(d))];
+    // What an asking session asks, in full (the sidebar's Needs you
+    // answers it).
+    if (d.ask) {
+      rows.push(fact(
+        "asks",
+        el("span", { className: "wk-ask", textContent: d.ask.text }),
+        d.ask.command ? el("pre", { className: "wk-ask-cmd wk-mono", textContent: d.ask.command }) : null,
+        (d.ask.options || []).length ? el("span", { className: "wk-dim", textContent: ` options: ${d.ask.options.join(" · ")}` }) : null,
+        el("span", { className: "wk-dim", textContent: d.ask.source === "declared" ? " (declared)" : " (its closing question)" }),
+      ));
+    }
     if (d.context) rows.push(fact("context", contextNode(d.context), el("span", { className: "wk-dim", textContent: ` ${contextTitle(d.context)}` })));
     if (d.usage) {
       rows.push(fact(

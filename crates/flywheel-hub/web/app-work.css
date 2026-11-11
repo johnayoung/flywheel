@@ -10,7 +10,7 @@
 .wk-status-word { display: inline-flex; align-items: center; gap: .5rem; }
 .wk-status-word b { font-size: 10px; font-weight: 600; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); }
 .wk-status.working b { color: var(--signal); }
-.wk-status.blocked b, .wk-status.failed b { color: var(--alert); }
+.wk-status.blocked b, .wk-status.asking b, .wk-status.failed b { color: var(--alert); }
 .wk-status.done b { color: var(--brass); }
 .wk-status.ended b { color: var(--ink-3); }
 .wk-status-on { color: var(--alert); font-size: 10.5px; font-variant-numeric: tabular-nums; }
@@ -202,3 +202,5 @@
   .wk-sub-head .wk-meta { margin-left: 0; }
   .wk-call-sum { flex-basis: 6rem; }
 }
+.wk-ask { color: var(--ink); }
+.wk-ask-cmd { margin: .3rem 0 0; padding: .3rem .45rem; border: 1px solid var(--rule); background: var(--bg); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 10.5px; }

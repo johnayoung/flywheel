@@ -11,6 +11,10 @@ use serde_json::Value;
 /// Longest summary kept (characters).
 pub const SUMMARY_CAP: usize = 200;
 
+/// Longest turn ending kept (characters): enough for a closing question
+/// or a command handed to the operator, never the whole reply.
+pub const ENDING_CAP: usize = 1500;
+
 /// The input fields that say what a call acts on, most telling first.
 const TELLING: &[&str] = &[
     "command",
@@ -52,6 +56,38 @@ pub fn text(raw: &str) -> String {
         return cut;
     }
     out
+}
+
+/// The end of a turn's closing message: its last [`ENDING_CAP`]
+/// characters (a cut start is marked with an ellipsis), scrubbed, line
+/// breaks kept (a fenced command stays runnable), blank runs collapsed.
+pub fn ending(raw: &str) -> Option<String> {
+    let total = raw.chars().count();
+    let skip = total.saturating_sub(ENDING_CAP);
+    let tail: String = raw.chars().skip(skip).collect();
+    let scrubbed = crate::activity::redact(&tail);
+    let mut out = String::with_capacity(scrubbed.len());
+    let mut blank = 0;
+    for line in scrubbed.lines() {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            blank += 1;
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(if blank > 0 { "\n\n" } else { "\n" });
+        }
+        blank = 0;
+        out.push_str(line);
+    }
+    if out.is_empty() {
+        return None;
+    }
+    Some(if skip > 0 {
+        format!("\u{2026}{out}")
+    } else {
+        out
+    })
 }
 
 /// What the call `name` with `input` acts on (`None`: nothing telling).

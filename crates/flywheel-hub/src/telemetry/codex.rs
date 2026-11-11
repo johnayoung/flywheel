@@ -85,7 +85,10 @@ fn event_msg(payload: &Value, ts: i64) -> Vec<Draft> {
         Some("task_started") => vec![draft(What::TurnStarted {
             title: String::new(),
         })],
-        Some("task_complete" | "turn_aborted") => vec![draft(What::TurnFinished {})],
+        Some("task_complete") => vec![draft(What::TurnFinished {
+            ending: str_of(payload, "last_agent_message").and_then(summary::ending),
+        })],
+        Some("turn_aborted") => vec![draft(What::TurnFinished { ending: None })],
         Some("user_message") => str_of(payload, "message")
             .map(|text| {
                 draft(What::TurnStarted {

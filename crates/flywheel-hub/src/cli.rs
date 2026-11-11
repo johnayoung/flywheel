@@ -141,6 +141,11 @@ enum HubCommand {
     /// context window, and cost, most urgent first; with SESSION, that
     /// session's plan and its turns with their subagents.
     Fleet(crate::fleet_cli::FleetArgs),
+    /// Every agent session that waits on you, most urgent first: harness
+    /// dialogs (blocked), then turns that ended asking for an answer, a
+    /// decision, or a command only you can run (asking), each with what
+    /// it asks and how to answer.
+    Inbox(crate::fleet_cli::InboxArgs),
     /// The digest since the last one (or --since): per workspace, turns
     /// finished, agents blocked, fan-outs graded, PRs, autopilot, queue
     /// stalls, spend, and the top items that need you; previewed, or sent
@@ -740,6 +745,7 @@ fn dispatch_verb(
         HubCommand::Search(args) => crate::search_cli::run(&args, out, err),
         HubCommand::Activity(args) => crate::activity_cli::run(&args, out, err),
         HubCommand::Fleet(args) => crate::fleet_cli::fleet(&args, out, err),
+        HubCommand::Inbox(args) => crate::fleet_cli::inbox(&args, out, err),
         HubCommand::Digest(args) => crate::digest_cli::run(&args, out, err),
         HubCommand::Review(args) => crate::review_cli::review(&args, out, err),
         HubCommand::Merge(args) => crate::review_cli::merge(&args, out, err),

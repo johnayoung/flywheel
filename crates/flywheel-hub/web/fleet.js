@@ -1,6 +1,6 @@
 // flywheel hub: the Fleet board. Every agent session the hub has
 // telemetry for (its own, and the ones other hubs forward to it when it
-// is their collector), most urgent first: blocked, failed, working, done,
+// is their collector), most urgent first: blocked, asking, failed, working, done,
 // idle, ended. One row a session: its status, who it is, what it is
 // doing, its declared plan's progress (observed counts when it declared
 // none: never an invented percentage), context, cost and rate limits,
@@ -24,7 +24,7 @@ window.FwHubFleet = function (ctx) {
   const PAGE = 200;
   const PAGE_MAX = 1000;
   const HOURS = 24;
-  const ORDER = ["blocked", "failed", "working", "done", "idle", "ended"];
+  const ORDER = ["blocked", "asking", "failed", "working", "done", "idle", "ended"];
   const rank = (status) => {
     const at = ORDER.indexOf(status);
     return at < 0 ? ORDER.length : at;
@@ -217,7 +217,9 @@ window.FwHubFleet = function (ctx) {
       snap.turn_title
         ? el("span", { className: "fl-line fl-title", textContent: snap.turn_title, title: snap.turn_title })
         : el("span", { className: "fl-line fl-none", textContent: snap.turns ? "-" : "no prompt yet" }),
-      tool ? el("span", { className: "fl-line fl-tool", textContent: text, title: text }) : null,
+      snap.ask
+        ? el("span", { className: "fl-line fl-ask", textContent: snap.ask.text, title: snap.ask.command ? `${snap.ask.text}\n$ ${snap.ask.command}` : snap.ask.text })
+        : tool ? el("span", { className: "fl-line fl-tool", textContent: text, title: text }) : null,
     );
   }
 

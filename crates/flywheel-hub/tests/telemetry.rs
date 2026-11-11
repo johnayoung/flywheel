@@ -227,7 +227,10 @@ async fn hooks_posted_to_the_hub_drive_status_and_are_recorded() {
     );
     assert_eq!(
         settings["permissions"]["allow"],
-        json!(["mcp__flywheel__report_progress"])
+        json!([
+            "mcp__flywheel__report_progress",
+            "mcp__flywheel__ask_operator"
+        ])
     );
     let mcp: Value = serde_json::from_str(arg_after(&args, "--mcp-config")).unwrap();
     let server = &mcp["mcpServers"]["flywheel"];
@@ -360,6 +363,26 @@ async fn hooks_posted_to_the_hub_drive_status_and_are_recorded() {
     assert_eq!(row["rate"][0]["window"], "five_hour");
     assert_eq!(row["model"], "claude-fable-5-2");
     assert_eq!(row["tool_errors"], 1);
+
+    // The agent declares what it needs, then ends its turn on it: the
+    // session is asking, first after blocked ones, until the next prompt.
+    for play in [
+        json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__flywheel__ask_operator",
+               "tool_use_id": "tu9", "tool_input": {"kind": "run",
+               "text": "Restart the relay; it needs sudo.",
+               "command": "sudo systemctl restart rh-relay"}}),
+        json!({"hook_event_name": "Stop",
+               "last_assistant_message": "Over to you: run it and paste the output."}),
+    ] {
+        let response = hub.as_agent(hook_path, &headers, &env, &play).await;
+        assert_eq!(response.status(), StatusCode::OK, "{play}");
+    }
+    let asking = hub.get("/api/telemetry/fleet?status=asking").await;
+    assert_eq!(asking["total"], 1, "{asking}");
+    let ask = &asking["sessions"][0]["ask"];
+    assert_eq!(ask["kind"], "run", "{asking}");
+    assert_eq!(ask["source"], "declared");
+    assert_eq!(ask["command"], "sudo systemctl restart rh-relay");
 
     // Who may not: a wrong secret, no headers, no credential.
     let mut forged = env.clone();

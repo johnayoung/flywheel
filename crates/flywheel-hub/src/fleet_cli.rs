@@ -14,8 +14,8 @@ pub(crate) struct FleetArgs {
     /// One session in full (id, unique id prefix, or name): its plan and
     /// its turns with their subagents. Default: the board.
     session: Option<String>,
-    /// Only sessions in this status (working, blocked, done, failed, idle,
-    /// ended); repeatable.
+    /// Only sessions in this status (blocked, asking, failed, working,
+    /// done, idle, ended); repeatable.
     #[arg(long, value_name = "STATUS")]
     status: Vec<String>,
     /// Only sessions with an event in the last N hours (0: any age).
@@ -142,7 +142,10 @@ fn progress(session: &Value) -> String {
 fn status(session: &Value, now: i64) -> String {
     let word = str_field(session, "status");
     let since = session["since"].as_i64().unwrap_or(now);
-    match session["blocked_on"].as_str() {
+    match session["blocked_on"]
+        .as_str()
+        .or_else(|| session["ask"]["kind"].as_str())
+    {
         Some(on) => format!("{word} {} ({on})", span(now - since)),
         None => format!("{word} {}", span(now - since)),
     }
@@ -209,6 +212,9 @@ fn print_board(out: &mut dyn Write, page: &Value) {
             name = format!("{name}@{}", &host[..host.len().min(8)]);
         }
         let doing = match session["tool"]["name"].as_str() {
+            _ if session["ask"]["text"].is_string() => {
+                str_field(&session["ask"], "text").to_owned()
+            }
             Some(tool) => match session["tool"]["summary"].as_str() {
                 Some(summary) => format!("{tool}: {summary}"),
                 None => tool.to_owned(),
@@ -233,6 +239,120 @@ fn print_board(out: &mut dyn Write, page: &Value) {
     let total = page["total"].as_u64().unwrap_or(listed);
     if total > listed {
         let _ = writeln!(out, "... and {} more (--limit)", total - listed);
+    }
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct InboxArgs {
+    /// Only sessions with an event in the last N hours (0: any age).
+    #[arg(long, value_name = "N", default_value_t = 24)]
+    hours: u32,
+    /// Only the sessions of the hub with this id (`local`: the hub asked).
+    #[arg(long, value_name = "HUB_ID")]
+    host: Option<String>,
+    /// Print JSON (the fleet page of blocked and asking sessions).
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+}
+
+/// The most asks listed.
+const INBOX_LIMIT: u32 = 1000;
+
+/// `fw hub inbox`: every session that waits on the operator, most urgent
+/// first: harness dialogs (`blocked`), then turns that ended asking for
+/// an answer, a decision, or a command run (`asking`), with what to do.
+pub(crate) fn inbox(args: &InboxArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let mut run = || -> Result<(), String> {
+        let conn = Endpoint::resolve(&args.endpoint)?;
+        let mut params = vec![
+            format!("hours={}", args.hours),
+            format!("limit={INBOX_LIMIT}"),
+            "status=blocked,asking".to_owned(),
+        ];
+        if let Some(host) = &args.host {
+            params.push(format!("host={}", query_escape(host)));
+        }
+        let page = conn.blocking_call(
+            "GET",
+            &format!("/api/telemetry/fleet?{}", params.join("&")),
+            None,
+        )?;
+        if args.json {
+            print_json(out, &page);
+        } else {
+            print_inbox(out, &page);
+        }
+        Ok(())
+    };
+    match run() {
+        Ok(()) => 0,
+        Err(message) => fail(err, &message),
+    }
+}
+
+fn print_inbox(out: &mut dyn Write, page: &Value) {
+    let now = page["now"].as_i64().unwrap_or(0);
+    let own = str_field(page, "host");
+    let sessions = page["sessions"].as_array().map_or(&[][..], Vec::as_slice);
+    if sessions.is_empty() {
+        let _ = writeln!(out, "nothing needs you");
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "{} need{} you",
+        sessions.len(),
+        if sessions.len() == 1 { "s" } else { "" }
+    );
+    for session in sessions {
+        let host = str_field(session, "host");
+        let id = str_field(session, "session");
+        let mut name = session["label"].as_str().unwrap_or(id).to_owned();
+        if let Some(dir) = session["dir"].as_str() {
+            let folder = dir.rsplit('/').find(|p| !p.is_empty()).unwrap_or(dir);
+            name = format!("{name} ({folder})");
+        }
+        if host != own {
+            name = format!("{name}@{}", &host[..host.len().min(8)]);
+        }
+        let ask = &session["ask"];
+        let what = match ask["text"].as_str() {
+            Some(text) => text.to_owned(),
+            None => match session["blocked_tool"].as_str() {
+                Some(tool) => format!("permission: {tool}"),
+                None => "waiting on you".to_owned(),
+            },
+        };
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "{}  {}",
+            shown(&status(session, now), 26),
+            shown(&name, 60)
+        );
+        let _ = writeln!(out, "  {}", shown(&what, 400));
+        if let Some(command) = ask["command"].as_str() {
+            for line in command.lines() {
+                let _ = writeln!(out, "    $ {}", shown(line, 400));
+            }
+        }
+        for (n, option) in ask["options"].as_array().into_iter().flatten().enumerate() {
+            let _ = writeln!(
+                out,
+                "    {}. {}",
+                n + 1,
+                shown(option.as_str().unwrap_or_default(), 200)
+            );
+        }
+        // A dialog is answered in the session; an ask, by the next prompt
+        // (another hub's session: on that hub).
+        if session["status"] == "asking" && host == own {
+            let _ = writeln!(out, "  reply: fw hub broadcast {id} 'TEXT'");
+        } else if session["status"] == "blocked" && host == own {
+            let _ = writeln!(out, "  answer: fw hub attach {id}");
+        }
     }
 }
 
@@ -362,6 +482,40 @@ mod tests {
         let mut out = Vec::new();
         print(&mut out);
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_inbox_says_what_each_session_needs_and_how_to_answer() {
+        let own = "aaaaaaaabbbbbbbbccccccccdddddddd";
+        let page = json!({
+            "host": own, "now": 600_000, "total": 3,
+            "sessions": [
+                {"host": own, "session": "s1", "label": "claude 3", "dir": "/r/flywheel",
+                 "status": "blocked", "since": 540_000, "blocked_on": "permission", "blocked_tool": "Bash"},
+                {"host": own, "session": "s2", "label": "claude 4", "dir": "/r/infrared/",
+                 "status": "asking", "since": 420_000,
+                 "ask": {"kind": "run", "text": "Restart the relay; it needs sudo.",
+                         "command": "sudo systemctl restart rh-relay\nsystemctl status rh-relay",
+                         "source": "declared", "since": 420_000}},
+                {"host": "11111111222222223333333344444444", "session": "s3", "status": "asking",
+                 "since": 0, "ask": {"kind": "decide", "text": "Which plan?", "options": ["A", "B"],
+                                     "source": "declared", "since": 0}},
+            ],
+        });
+        let inbox = text(|out| print_inbox(out, &page));
+        assert!(inbox.starts_with("3 need you\n"), "{inbox}");
+        assert!(inbox.contains("blocked 1m (permission)  claude 3 (flywheel)\n  permission: Bash\n  answer: fw hub attach s1"), "{inbox}");
+        assert!(inbox.contains("asking 3m (run)  claude 4 (infrared)\n  Restart the relay; it needs sudo.\n    $ sudo systemctl restart rh-relay\n    $ systemctl status rh-relay\n  reply: fw hub broadcast s2 'TEXT'"), "{inbox}");
+        // Another hub's ask is answered there.
+        assert!(
+            inbox.contains("s3@11111111\n  Which plan?\n    1. A\n    2. B\n"),
+            "{inbox}"
+        );
+        assert!(!inbox.contains("broadcast s3"), "{inbox}");
+        assert_eq!(
+            text(|out| print_inbox(out, &json!({"sessions": []}))),
+            "nothing needs you\n"
+        );
     }
 
     #[test]

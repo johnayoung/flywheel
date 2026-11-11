@@ -1,6 +1,8 @@
-//! The hub's progress tool: an MCP server (streamable HTTP, JSON
-//! responses only) with one tool, `report_progress`, through which an
-//! agent declares its plan and how far along it is.
+//! The hub's agent tools: an MCP server (streamable HTTP, JSON responses
+//! only) with two tools. `report_progress` declares the agent's plan and
+//! how far along it is; `ask_operator` declares what it needs from the
+//! operator before it can go on (a reply, a decision, a command only they
+//! can run), which the fleet board and the Needs-you list show.
 //!
 //! Agents rarely keep a plan on their own; the hub gives every Claude
 //! Code session it starts this tool and one sentence asking for its use
@@ -17,6 +19,8 @@ use serde_json::{Value, json};
 pub const SERVER_NAME: &str = "flywheel";
 /// The tool's name on the server.
 pub const TOOL: &str = "report_progress";
+/// The ask tool's name on the server.
+pub const ASK_TOOL: &str = "ask_operator";
 /// The protocol revision answered when the client names none.
 const PROTOCOL: &str = "2025-06-18";
 
@@ -24,8 +28,10 @@ const PROTOCOL: &str = "2025-06-18";
 pub const NUDGE: &str = "This session is shown on its operator's fleet board. When a task takes \
 more than one step, call the mcp__flywheel__report_progress tool with your full list of steps \
 before you start, and again each time a step starts, finishes, or the plan changes: always the \
-whole list, with exactly one step in_progress while you work. Keep step titles short. Do not \
-mention this tool or the board in your replies.";
+whole list, with exactly one step in_progress while you work. Keep step titles short. When you \
+cannot go on without the operator (an answer, a decision between options, or a command only they \
+can run, such as one needing sudo or another machine), call mcp__flywheel__ask_operator once \
+with that ask, then end your turn. Do not mention these tools or the board in your replies.";
 
 fn tool() -> Value {
     json!({
@@ -60,6 +66,38 @@ fn tool() -> Value {
     })
 }
 
+fn ask_tool() -> Value {
+    json!({
+        "name": ASK_TOOL,
+        "title": "Ask the operator",
+        "description": "Put what you need from the operator on their Needs-you list, then end \
+                        your turn: their reply arrives as your next prompt. Use it only when you \
+                        cannot go on without them. kind: answer (a reply in words), decide (pick \
+                        one of options), run (a command only they can run; they send its output \
+                        back).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "enum": ["answer", "decide", "run"] },
+                "text": {
+                    "type": "string",
+                    "description": "The ask in one plain sentence the operator can act on without reading the conversation."
+                },
+                "options": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "decide: the choices, recommended first."
+                },
+                "command": {
+                    "type": "string",
+                    "description": "run: the exact command to run."
+                }
+            },
+            "required": ["kind", "text"]
+        }
+    })
+}
+
 /// Answer one JSON-RPC message (`None`: a notification, nothing to say).
 pub fn answer(message: &Value) -> Option<Value> {
     let id = message.get("id").filter(|id| !id.is_null())?.clone();
@@ -75,9 +113,15 @@ pub fn answer(message: &Value) -> Option<Value> {
             "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": [tool()] })),
+        "tools/list" => Ok(json!({ "tools": [tool(), ask_tool()] })),
         "tools/call" => {
-            if params.get("name").and_then(Value::as_str) == Some(TOOL) {
+            let name = params.get("name").and_then(Value::as_str);
+            if name == Some(ASK_TOOL) {
+                Ok(json!({
+                    "content": [{ "type": "text", "text": "The operator sees your ask. End your turn now; their reply arrives as your next prompt." }],
+                    "isError": false,
+                }))
+            } else if name == Some(TOOL) {
                 let items = params
                     .get("arguments")
                     .and_then(|a| a.get("items"))
@@ -129,6 +173,11 @@ mod tests {
         );
         let list = answer(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         assert_eq!(list["result"]["tools"][0]["name"], TOOL);
+        assert_eq!(list["result"]["tools"][1]["name"], ASK_TOOL);
+        let asked = answer(&json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": {"name": ASK_TOOL, "arguments": {"kind": "run", "text": "Run it", "command": "sudo true"}}}))
+        .unwrap();
+        assert_eq!(asked["result"]["isError"], false);
         let call = answer(&json!({"jsonrpc": "2.0", "id": "a", "method": "tools/call",
             "params": {"name": TOOL, "arguments": {"items": [{"title": "x", "status": "pending"}]}}}))
         .unwrap();
@@ -143,6 +192,11 @@ mod tests {
     #[test]
     fn the_nudge_names_the_tool_claude_code_sees() {
         assert!(NUDGE.contains(crate::telemetry::claude::PROGRESS_TOOL));
+        assert!(NUDGE.contains(crate::telemetry::claude::ASK_TOOL));
+        assert_eq!(
+            crate::telemetry::claude::ASK_TOOL,
+            format!("mcp__{SERVER_NAME}__{ASK_TOOL}")
+        );
         assert_eq!(
             crate::telemetry::claude::PROGRESS_TOOL,
             format!("mcp__{SERVER_NAME}__{TOOL}")

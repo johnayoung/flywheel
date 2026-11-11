@@ -26,6 +26,7 @@
 //! [`FLUSH_EVERY`] in one transaction and then announces the sessions that
 //! changed (at most once each per flush, however many events arrived).
 
+pub mod ask;
 pub mod claude;
 pub mod codex;
 pub mod event;

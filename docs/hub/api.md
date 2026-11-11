@@ -1,12 +1,12 @@
 # Hub API
 
-Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Front door: [hub](../hub.md).
+Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](../hub.md).
 
 ## Conventions
 
 - JSON under `/api`: `Authorization: Bearer <token>`, login cookie, or peer credential ([hub-security](security.md#auth)).
-- Errors `{"error"}`: 400 malformed, 404 unknown, 405 method, 409 refused by state, 422 wrong JSON shape. `cols`/`rows` 0: 120x32.
-- Tables: bodies, codes; full responses: `curl -sH "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq`, or a verb's `--json`.
+- Errors `{"error"}`: 400 malformed, 404 unknown, 405 method, 409 refused by state, 422 bad JSON shape. `cols`/`rows` 0: 120x32.
+- Full responses: `curl -sH "Authorization: Bearer $(cat <state-dir>/token)" localhost:7420/api/sessions | jq`, or a verb's `--json`.
 
 ## Workspaces
 
@@ -18,9 +18,9 @@ Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Fr
 | POST | `/api/workspaces/import` | `{"path","name"?,"update"?}` (hub-side file): 201 / 200 updated / 409 taken |
 | GET | `/api/code-workspaces[?root=]` | `.code-workspace` files under `--import-root` |
 | GET | `/api/folders/check?path=` | `ok`, `git` / `error` |
-| GET | `/api/repos/check` | old name |
+| GET | `/api/repos/check` | alias |
 | GET | `/api/fs/dirs?path=[&prefix=]` | subdirectories (never files): `path`, `parent`, `entries:[{"name","path","git","hidden","link"?,"error"?}]`, `truncated` (2000) |
-| GET | `/api/fs/suggestions` | `suggestions:[{"path","source":"used\|found","workspace"?}]`: used folders, then repos found under `~` (cached 60 s) |
+| GET | `/api/fs/suggestions` | `suggestions:[{"path","source":"used\|found","workspace"?}]`: used folders, then repos under `~` (60 s cache) |
 | GET | `/api/templates[?workspace_id=]` | launch templates |
 | POST | `/api/workspaces/{id}/templates` | create (a taken `name`: 409 unless `"replace":true`) |
 | DELETE | `/api/workspaces/{id}/templates/{name}` | |
@@ -252,11 +252,13 @@ What every agent session does ([hub-workflows](workflows.md#fleet-and-work)).
 | GET | `/api/telemetry/sessions/{id}/events[?host=&after=&limit=&newest=1]` | `events` by `seq`, oldest first |
 | POST | `/api/telemetry/batch` | another hub's events, NDJSON (or `Content-Encoding: deflate`) -> `received`, `accepted` |
 | POST | `/api/telemetry/hook` | a Claude Code hook's JSON; no login: `x-flywheel-session`, `x-flywheel-secret` |
-| POST | `/api/telemetry/mcp` | the progress tool (MCP over http); same headers |
+| POST | `/api/telemetry/mcp` | `report_progress`, `ask_operator` (MCP over http); same headers |
 
-Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: its turn or subagent; `item`: its plan item).
+Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: turn or subagent; `item`: plan item).
 
-Kinds: `session.started`, `session.finished`, `turn.started`, `turn.finished`, `turn.failed`, `tool.started`, `tool.finished` (paired by `id`), `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
+Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?}`), `failed`, `working`, `done`, `idle`, `ended`.
+
+Kinds: `session.started`, `session.finished`, `turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished` (paired by `id`), `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
 
 ## Events WebSocket
 
@@ -284,10 +286,10 @@ Client sends `{"type":"view","session_id","visible"?:[ids],"present"?}`: on scre
 
 ## Plugins
 
-Manifest: [hub-reference: plugin.toml](reference.md#plugintoml). A run:
+Manifest: [hub-reference](reference.md#plugintoml).
 
-- **Run**: cwd the plugin dir, own process group; stdin `{"version":1,"type":"event"|"action","plugin","event"|"action","at","hub","payload"}`; env an allowlist (`PATH HOME USER LANG ...`) + `FW_HUB_PLUGIN`, `FW_HUB_PLUGIN_DIR`, `FW_HUB_PLUGIN_TRIGGER` (`event:<name>` / `action:<id>`), `FW_HUB_STATE_DIR`, never the token.
-- **Limits**: SIGTERM at `timeout_secs`, SIGKILL 0.5 s later; 64 KiB output kept; `plugins.max_concurrent` at once; over 64 waiting, events drop. Logs: `plugin-logs/<name>.jsonl` (200 runs past 512 KiB).
+- **Run**: cwd the plugin dir, own group; stdin `{"version":1,"type":"event"|"action","plugin","event"|"action","at","hub","payload"}`; env an allowlist (`PATH HOME USER LANG ...`) + `FW_HUB_PLUGIN`, `FW_HUB_PLUGIN_DIR`, `FW_HUB_PLUGIN_TRIGGER` (`event:<name>` / `action:<id>`), `FW_HUB_STATE_DIR`, never the token.
+- **Limits**: SIGTERM at `timeout_secs`, SIGKILL 0.5 s later; 64 KiB output kept; `plugins.max_concurrent` at once; over 64 waiting, drop. Logs: `plugin-logs/<name>.jsonl` (200 runs past 512 KiB).
 - **Response** (stdout JSON): `{"toast": "text" | {"message","tone":"info|ok|warn|error"}}`; actions also `{"paste":{"text","run"?,"session"?}}` (64 KiB).
 
 ### Plugin events

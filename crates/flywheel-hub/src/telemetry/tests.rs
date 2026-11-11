@@ -1,3 +1,4 @@
+use super::event::AskKind;
 use super::reduce::{WorkSource, WorkStatus};
 use super::*;
 use serde_json::json;
@@ -653,7 +654,7 @@ fn the_fleet_lists_what_needs_a_person_first_and_counts_by_status() {
     let h2 = "a".repeat(32);
     push(HOST, "working", 1, 1_000, turn());
     push(HOST, "done", 1, 2_000, turn());
-    push(HOST, "done", 2, 3_000, What::TurnFinished {});
+    push(HOST, "done", 2, 3_000, What::TurnFinished { ending: None });
     push(&h2, "blocked", 1, 500, turn());
     push(
         &h2,
@@ -750,7 +751,7 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
         },
         What::SessionFinished { reason: None },
         What::TurnStarted { title: "t".into() },
-        What::TurnFinished {},
+        What::TurnFinished { ending: None },
         What::TurnFailed {
             error: "e".into(),
             detail: None,
@@ -768,6 +769,12 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             duration_ms: None,
             error: None,
             tokens: None,
+        },
+        What::Asked {
+            kind: AskKind::Decide,
+            text: "pick".into(),
+            command: None,
+            options: vec!["a".into()],
         },
         What::WaitStarted {
             reason: WaitReason::Permission,
@@ -879,7 +886,7 @@ fn ten_thousand_sessions_on_a_hundred_hosts_fold_and_list() {
                         reason: WaitReason::Question,
                         tool: None,
                     },
-                    _ if n % 10 == 1 => What::TurnFinished {},
+                    _ if n % 10 == 1 => What::TurnFinished { ending: None },
                     _ => continue,
                 };
                 events.push(event(host, session, round + 1, what));
@@ -1014,4 +1021,173 @@ fn a_new_session_arriving_as_one_large_batch_is_on_the_board_at_once() {
         .remove(0);
     assert_eq!(compact.what.kind(), "compact");
     assert_eq!(compact.work.as_deref(), Some("t1"));
+}
+
+#[test]
+fn a_turn_that_ends_on_a_question_is_asking_until_the_next_prompt() {
+    let (_dir, telemetry) = open();
+    hooks(
+        &telemetry,
+        "s",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "remove the board"})),
+            (
+                "Stop",
+                json!({"last_assistant_message": "Removed it.\n\nShould I delete the mockup branch too?"}),
+            ),
+        ],
+    );
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!(snap.status, "asking");
+    assert_eq!(snap.since, 1_000);
+    let ask = snap.ask.unwrap();
+    assert_eq!(ask.kind, AskKind::Answer);
+    assert_eq!(ask.source, "inferred");
+    assert_eq!(ask.text, "Should I delete the mockup branch too?");
+    // The turn's ending is in the log, for whoever reads it later.
+    let events = telemetry.events(None, "s", 0, 10, false).unwrap();
+    assert!(matches!(
+        &events[1].what,
+        What::TurnFinished { ending: Some(e) } if e.ends_with("branch too?")
+    ));
+    // The reply is the next prompt: the ask is answered.
+    hooks(
+        &telemetry,
+        "s",
+        5_000,
+        &[("UserPromptSubmit", json!({"prompt": "yes"}))],
+    );
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!((snap.status.as_str(), snap.ask), ("working", None));
+    // A report is not an ask.
+    hooks(
+        &telemetry,
+        "s",
+        6_000,
+        &[(
+            "Stop",
+            json!({"last_assistant_message": "Deleted. Nothing else is pending."}),
+        )],
+    );
+    assert_eq!(telemetry.snapshot("s").unwrap().status, "done");
+}
+
+#[test]
+fn a_declared_ask_holds_once_its_turn_ends() {
+    let (_dir, telemetry) = open();
+    let ask = |agent: Option<&str>, kind: &str, text: &str| {
+        let mut payload = json!({"tool_name": claude::ASK_TOOL, "tool_use_id": format!("a-{text}"),
+            "tool_input": {"kind": kind, "text": text, "command": "sudo systemctl restart rh-relay",
+                           "options": ["keep", "drop"]}});
+        if let Some(agent) = agent {
+            payload["agent_id"] = json!(agent);
+        }
+        payload
+    };
+    hooks(
+        &telemetry,
+        "s",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "cut over the relay"})),
+            // A subagent's ask is its main agent's to pass on.
+            ("PreToolUse", ask(Some("sub1"), "decide", "sub asks")),
+            (
+                "PreToolUse",
+                ask(None, "run", "Restart the relay; it needs sudo."),
+            ),
+        ],
+    );
+    // While the turn runs the session is working, not asking.
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!(
+        (snap.status.as_str(), snap.ask.is_none()),
+        ("working", true)
+    );
+    hooks(
+        &telemetry,
+        "s",
+        10_000,
+        &[(
+            "Stop",
+            json!({"last_assistant_message": "Over to you. Paste the output when done?"}),
+        )],
+    );
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!((snap.status.as_str(), snap.since), ("asking", 10_000));
+    let ask = snap.ask.unwrap();
+    // The declared ask wins over the inferred question.
+    assert_eq!(ask.kind, AskKind::Run);
+    assert_eq!(ask.source, "declared");
+    assert_eq!(ask.text, "Restart the relay; it needs sudo.");
+    assert_eq!(
+        ask.command.as_deref(),
+        Some("sudo systemctl restart rh-relay")
+    );
+    assert_eq!(ask.options, ["keep", "drop"]);
+    // A declared ask does not outlive the turn after it.
+    hooks(
+        &telemetry,
+        "s",
+        20_000,
+        &[
+            (
+                "UserPromptSubmit",
+                json!({"prompt": "done: active (running)"}),
+            ),
+            (
+                "Stop",
+                json!({"last_assistant_message": "Relay is healthy."}),
+            ),
+        ],
+    );
+    assert_eq!(telemetry.snapshot("s").unwrap().status, "done");
+}
+
+#[test]
+fn asking_sessions_rank_right_after_blocked_ones() {
+    let (_dir, telemetry) = open();
+    let turn = |s: &str, at: i64, end: &str| {
+        hooks(
+            &telemetry,
+            s,
+            at,
+            &[
+                ("UserPromptSubmit", json!({"prompt": "go"})),
+                ("Stop", json!({"last_assistant_message": end})),
+            ],
+        );
+    };
+    turn("done", 0, "All done.");
+    turn("asking", 0, "Which one do you want?");
+    hooks(
+        &telemetry,
+        "failed",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            ("StopFailure", json!({"error": "server_error"})),
+        ],
+    );
+    hooks(
+        &telemetry,
+        "blocked",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            ("PermissionRequest", json!({"tool_name": "Bash"})),
+        ],
+    );
+    let page = telemetry
+        .fleet(&FleetQuery {
+            statuses: Vec::new(),
+            host: None,
+            active_since: None,
+            limit: 10,
+            offset: 0,
+        })
+        .unwrap();
+    let order: Vec<&str> = page.sessions.iter().map(|s| s.session.as_str()).collect();
+    assert_eq!(order, ["blocked", "asking", "failed", "done"]);
 }

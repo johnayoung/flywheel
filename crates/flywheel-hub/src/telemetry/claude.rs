@@ -6,7 +6,7 @@
 //! rate limits. Those come from the status line's input, the only place
 //! Claude Code hands the 5-hour and 7-day gauges to another program.
 
-use super::event::{Draft, ItemStatus, Outcome, PlanStep, WaitReason, What};
+use super::event::{AskKind, Draft, ItemStatus, Outcome, PlanStep, WaitReason, What};
 use super::summary;
 use serde_json::Value;
 
@@ -28,6 +28,12 @@ pub const STATUS_LINE_EVENT: &str = "statusline";
 /// The hub's own progress tool as Claude Code names it (see
 /// [`super::mcp`]).
 pub const PROGRESS_TOOL: &str = "mcp__flywheel__report_progress";
+
+/// The hub's ask tool as Claude Code names it.
+pub const ASK_TOOL: &str = "mcp__flywheel__ask_operator";
+
+/// Most options an ask keeps.
+const ASK_OPTIONS: usize = 8;
 
 fn str_of<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value
@@ -90,7 +96,9 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
         "UserPromptSubmit" => vec![main(What::TurnStarted {
             title: prompt_title(str_of(payload, "prompt").unwrap_or_default()),
         })],
-        "Stop" => vec![main(What::TurnFinished {})],
+        "Stop" => vec![main(What::TurnFinished {
+            ending: str_of(payload, "last_assistant_message").and_then(summary::ending),
+        })],
         "StopFailure" => {
             let error = owned(payload, "error").unwrap_or_else(|| "error".to_owned());
             let detail = str_of(payload, "error_details").map(summary::text);
@@ -110,7 +118,7 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
                 summary: summary::tool(tool_name, input),
                 subagent: owned(input, "subagent_type"),
             })];
-            drafts.extend(plan_of(tool_name, input).map(draft));
+            drafts.extend(declared(tool_name, input).map(draft));
             drafts
         }
         "PostToolUse" => vec![draft(What::ToolFinished {
@@ -219,9 +227,27 @@ fn prompt_title(prompt: &str) -> String {
     summary::text(prompt)
 }
 
-/// The plan a plan tool's call declares.
-fn plan_of(tool: &str, input: &Value) -> Option<What> {
+/// What a plan tool's call (or the hub's ask tool's) declares.
+fn declared(tool: &str, input: &Value) -> Option<What> {
     match tool {
+        ASK_TOOL => Some(What::Asked {
+            kind: AskKind::parse(str_of(input, "kind").unwrap_or("answer")),
+            text: summary::text(str_of(input, "text").or_else(|| str_of(input, "question"))?),
+            command: str_of(input, "command").and_then(summary::ending),
+            options: input
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(summary::text)
+                        .filter(|o| !o.is_empty())
+                        .take(ASK_OPTIONS)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }),
         "TodoWrite" => Some(What::PlanSet {
             source: "todo".to_owned(),
             items: steps(input.get("todos"), &["content", "title"]),

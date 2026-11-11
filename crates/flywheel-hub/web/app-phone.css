@@ -442,3 +442,37 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   #link { display: none; }
   #stage { margin: .25rem .2rem .2rem; }
 }
+
+/* An asking agent (attention.js): its ask answered in the row. */
+.attn-row.asking { border-left-color: var(--alert); }
+.attn-status.asking { background: var(--alert); }
+.attn-ask { display: grid; gap: .35rem; padding: 0 .7rem .5rem calc(.7rem + 3px + 1rem + .55rem); }
+.attn-cmd { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: .4rem; }
+.attn-cmd pre {
+  margin: 0;
+  padding: .3rem .45rem;
+  max-height: 6.5rem;
+  overflow: auto;
+  border: 1px solid var(--rule);
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 10.5px/1.4 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.attn-options { display: flex; flex-wrap: wrap; gap: .3rem; }
+.attn-option { font-size: 10.5px; }
+.attn-reply { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .35rem; }
+.attn-reply.busy { opacity: .6; pointer-events: none; }
+.attn-reply-input {
+  min-width: 0;
+  padding: .3rem .45rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 11px var(--mono);
+}
+.attn-reply-input:focus { outline: none; border-color: var(--brass); }
+.attn-copy, .attn-send { padding: .3rem .65rem; font-size: 10px; }
+@media (pointer: coarse) { .attn-copy, .attn-send, .attn-option, .attn-reply-input { min-height: 44px; } }

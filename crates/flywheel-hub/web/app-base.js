@@ -207,6 +207,8 @@ const attachable = () => orderedSessions().filter((s) => s.live);
 const AGENT_LOOK = {
   working: { dot: "working", label: "working", tone: "live" },
   blocked: { dot: "blocked", label: "blocked", tone: "bad" },
+  // Telemetry's: the turn ended asking the operator (attention.js).
+  asking: { dot: "blocked", label: "asking", tone: "bad" },
   done: { dot: "agent-done", label: "done", tone: "brass" },
   idle: { dot: "idle", label: "idle", tone: "" },
 };
@@ -491,6 +493,12 @@ const attention = window.FwHubAttention({
   fanout,
   // Stalled prompt queues (queue.js).
   queue: () => promptQueue,
+  // What an asking agent asks (its telemetry snapshot), and the reply's
+  // path.
+  telemetryOf: (id) => sessionTelemetry.get(id) || null,
+  api: (...args) => api(...args),
+  toast: (...args) => commands.toast(...args),
+  copyText: (text) => commands.copyText(text),
 });
 const notify = window.FwHubNotify({
   $, state, store, prefs: settings, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,

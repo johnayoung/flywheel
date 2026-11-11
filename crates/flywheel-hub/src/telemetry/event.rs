@@ -78,6 +78,29 @@ pub enum WaitReason {
     Question,
 }
 
+/// What an agent asks the operator for when it ends its turn on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskKind {
+    /// A reply in words.
+    Answer,
+    /// A choice between named options.
+    Decide,
+    /// A command only the operator can run (`sudo`, another machine),
+    /// and its output back.
+    Run,
+}
+
+impl AskKind {
+    pub fn parse(word: &str) -> Self {
+        match word.to_ascii_lowercase().as_str() {
+            "decide" | "decision" | "choose" => Self::Decide,
+            "run" | "command" => Self::Run,
+            _ => Self::Answer,
+        }
+    }
+}
+
 /// A plan item's status, in the agent's words normalized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -144,7 +167,13 @@ pub enum What {
     #[serde(rename = "turn.started")]
     TurnStarted { title: String },
     #[serde(rename = "turn.finished")]
-    TurnFinished {},
+    TurnFinished {
+        /// The end of the turn's closing message, scrubbed and capped
+        /// (see [`super::summary::ending`]): what the agent left the
+        /// operator with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ending: Option<String>,
+    },
     /// The turn ended on an error (an API failure, a rate limit).
     #[serde(rename = "turn.failed")]
     TurnFailed {
@@ -178,6 +207,18 @@ pub enum What {
         /// Tokens a subagent-spawning call's subagent used.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tokens: Option<u64>,
+    },
+    /// The agent declared what it needs from the operator (the hub's
+    /// `ask_operator` tool); it holds once the turn ends, until the next
+    /// prompt.
+    #[serde(rename = "ask")]
+    Asked {
+        kind: AskKind,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
     },
     /// The session started waiting on a person.
     #[serde(rename = "wait.started")]
@@ -272,10 +313,11 @@ impl What {
             Self::SessionStarted { .. } => "session.started",
             Self::SessionFinished { .. } => "session.finished",
             Self::TurnStarted { .. } => "turn.started",
-            Self::TurnFinished {} => "turn.finished",
+            Self::TurnFinished { .. } => "turn.finished",
             Self::TurnFailed { .. } => "turn.failed",
             Self::ToolStarted { .. } => "tool.started",
             Self::ToolFinished { .. } => "tool.finished",
+            Self::Asked { .. } => "ask",
             Self::WaitStarted { .. } => "wait.started",
             Self::SubagentStarted { .. } => "subagent.started",
             Self::SubagentFinished { .. } => "subagent.finished",
@@ -312,6 +354,7 @@ pub const KINDS: &[&str] = &[
     "turn.failed",
     "tool.started",
     "tool.finished",
+    "ask",
     "wait.started",
     "subagent.started",
     "subagent.finished",

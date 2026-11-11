@@ -17,7 +17,8 @@
 //!   a changed plan shows as a revision. A declared status is the agent's
 //!   claim: it is shown beside the observed calls, never instead of them.
 
-use super::event::{Event, ItemStatus, Outcome, PlanStep, WaitReason, What};
+use super::ask::{self, Ask};
+use super::event::{AskKind, Event, ItemStatus, Outcome, PlanStep, WaitReason, What};
 use serde::{Deserialize, Serialize};
 
 /// Work items (turns and subagents) kept per session; the oldest finished
@@ -241,6 +242,10 @@ pub struct SessionState {
     awaiting_ms: u64,
     #[serde(default)]
     wait: Option<Wait>,
+    /// What the session asks the operator for: declared during the
+    /// running turn, or held since the last one ended on it.
+    #[serde(default)]
+    ask: Option<Ask>,
     #[serde(default)]
     blocked_ms: u64,
     #[serde(default)]
@@ -315,8 +320,10 @@ pub struct Snapshot {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dir: Option<String>,
-    /// `working`, `blocked`, `done` (awaiting the next prompt), `failed`
-    /// (the last turn ended on an error), `idle` (no turn yet), `ended`.
+    /// `working`, `blocked` (a harness dialog waits on a person),
+    /// `asking` (the last turn ended asking the operator something: see
+    /// `ask`), `done` (awaiting the next prompt), `failed` (the last turn
+    /// ended on an error), `idle` (no turn yet), `ended`.
     pub status: String,
     /// Since when it has been in that status.
     pub since: i64,
@@ -325,6 +332,9 @@ pub struct Snapshot {
     pub blocked_on: Option<WaitReason>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_tool: Option<String>,
+    /// What an `asking` session asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<Ask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<i64>,
     pub last_ts: i64,
@@ -484,6 +494,7 @@ impl SessionState {
                 self.ended = false;
             }
             What::SessionFinished { .. } => {
+                self.ask = None;
                 self.close_wait(ts);
                 self.finish_turn(ts, WorkStatus::Cancelled);
                 self.finish_subagents(ts);
@@ -506,17 +517,21 @@ impl SessionState {
                     event.work = Some(id);
                     return;
                 }
+                // A prompt answers whatever was asked.
+                self.ask = None;
                 // A prompt while a turn runs: the agent was interrupted.
                 self.finish_turn(ts, WorkStatus::Cancelled);
                 event.work = Some(self.start_turn(ts, title));
             }
-            What::TurnFinished {} => {
+            What::TurnFinished { ending } => {
                 self.close_wait(ts);
                 event.work = self.turn.clone();
+                self.ask = self.ask_at_end(ending.as_deref(), ts);
                 self.last_turn_failed = false;
                 self.finish_turn(ts, WorkStatus::Done);
             }
             What::TurnFailed { error, detail } => {
+                self.ask = None;
                 self.close_wait(ts);
                 event.work = self.turn.clone();
                 self.errors += 1;
@@ -648,6 +663,26 @@ impl SessionState {
                     }
                 }
                 event.work = Some(work);
+            }
+            What::Asked {
+                kind,
+                text,
+                command,
+                options,
+            } => {
+                event.work = self.turn.clone();
+                // A subagent's ask does not end the session's turn: its
+                // main agent decides what reaches the operator.
+                if agent.is_none() {
+                    self.ask = Some(Ask {
+                        kind: *kind,
+                        text: text.clone(),
+                        command: command.clone(),
+                        options: options.clone(),
+                        source: "declared".to_owned(),
+                        since: ts,
+                    });
+                }
             }
             What::WaitStarted { reason, tool } => {
                 event.work = self.turn.clone();
@@ -828,6 +863,34 @@ impl SessionState {
         });
         self.turn = Some(id.clone());
         id
+    }
+
+    /// What a turn ending at `ts` leaves asked: the ask its agent declared
+    /// while it ran, else the question its closing message ends on.
+    fn ask_at_end(&self, ending: Option<&str>, ts: i64) -> Option<Ask> {
+        let started = self
+            .turn
+            .as_deref()
+            .and_then(|id| self.item(id))
+            .map(|turn| turn.started);
+        if let Some(declared) = self
+            .ask
+            .as_ref()
+            .filter(|a| started.is_none_or(|s| a.since >= s))
+        {
+            return Some(Ask {
+                since: ts,
+                ..declared.clone()
+            });
+        }
+        ask::question(ending?).map(|text| Ask {
+            kind: AskKind::Answer,
+            text,
+            command: None,
+            options: Vec::new(),
+            source: "inferred".to_owned(),
+            since: ts,
+        })
     }
 
     fn finish_turn(&mut self, ts: i64, status: WorkStatus) {
@@ -1029,6 +1092,8 @@ impl SessionState {
             ("blocked", wait.since)
         } else if let Some(turn) = self.turn.as_deref().and_then(|id| self.item(id)) {
             ("working", turn.started)
+        } else if let Some(ask) = &self.ask {
+            ("asking", ask.since)
         } else if self.last_turn_failed {
             ("failed", self.idle_since.unwrap_or(self.last_ts))
         } else if self.turns > 0 {
@@ -1073,6 +1138,7 @@ impl SessionState {
             since,
             blocked_on: self.wait.as_ref().map(|w| w.reason),
             blocked_tool: self.wait.as_ref().and_then(|w| w.tool.clone()),
+            ask: (status == "asking").then(|| self.ask.clone()).flatten(),
             started: self.started,
             last_ts: self.last_ts,
             turns: self.turns,

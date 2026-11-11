@@ -12,7 +12,7 @@
 .fl-chip .dot { box-shadow: none; }
 .fl-chip b { color: var(--ink-2); font-weight: 700; font-variant-numeric: tabular-nums; }
 .fl-chip.working b { color: var(--signal); }
-.fl-chip.blocked b, .fl-chip.failed b { color: var(--alert); }
+.fl-chip.blocked b, .fl-chip.asking b, .fl-chip.failed b { color: var(--alert); }
 .fl-chip.done b { color: var(--brass); }
 .fl-chip[aria-pressed="true"] { color: var(--ink); border-color: var(--signal); background: var(--signal-soft); }
 
@@ -49,7 +49,8 @@
   font-size: 11.5px;
   text-align: left;
 }
-.fl-row.blocked, .fl-row.failed { border-left-color: var(--alert); }
+.fl-row.blocked, .fl-row.asking, .fl-row.failed { border-left-color: var(--alert); }
+.fl-ask { color: var(--ink); }
 .fl-row:hover, .fl-row:focus-visible { background: var(--bg-4); border-left-color: var(--signal); outline: none; }
 .fl-row:hover .dot, .fl-row:focus-visible .dot { box-shadow: 0 0 0 2px var(--bg-4); }
 .fl-row:hover .dot.agent-done, .fl-row:focus-visible .dot.agent-done { box-shadow: 0 0 0 2px var(--bg-4), 0 0 0 3.5px var(--brass); }

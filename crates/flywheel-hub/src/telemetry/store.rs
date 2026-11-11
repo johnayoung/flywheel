@@ -345,11 +345,12 @@ impl Store {
 fn rank(status: &str) -> i64 {
     match status {
         "blocked" => 0,
-        "failed" => 1,
-        "working" => 2,
-        "done" => 3,
-        "idle" => 4,
-        _ => 5,
+        "asking" => 1,
+        "failed" => 2,
+        "working" => 3,
+        "done" => 4,
+        "idle" => 5,
+        _ => 6,
     }
 }
 

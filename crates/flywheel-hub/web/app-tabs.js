@@ -190,11 +190,16 @@ function renderTabs() {
   ].filter(Boolean));
 }
 
-// One control per folder of the workspace: show (or add) its board tab.
+// One control per flywheel-adopted folder of the workspace (and per
+// folder whose board tab is already open): show (or add) its board tab.
+// A folder flywheel knows nothing about has no board to open.
 function boardAdds(workspace, layout) {
-  if (!workspace || !workspace.folders || !workspace.folders.length) return null;
+  if (!workspace || !workspace.folders) return null;
+  const folders = workspace.folders.filter((f) =>
+    L.boardOf(layout, f.path) || flywheel.summary(flywheel.keyOf(workspace.machine, f.path)));
+  if (!folders.length) return null;
   const several = workspace.folders.length > 1;
-  return el("div", { className: "board-adds", role: "group", "aria-label": "Boards" }, workspace.folders.map((f) => {
+  return el("div", { className: "board-adds", role: "group", "aria-label": "Boards" }, folders.map((f) => {
     const name = f.name || f.path.split("/").pop() || f.path;
     const shown = L.boardOf(layout, f.path);
     return el("button", {

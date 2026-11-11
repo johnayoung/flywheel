@@ -315,6 +315,7 @@ function renderSession(session, index) {
     st.dot === "blocked" && st.detail
       ? el("span", { className: "session-detail", textContent: st.detail })
       : null,
+    progressLine(session, st),
     // A companion (or a reviewer) sits under its agent: the agent's
     // line says it all.
     (session.companion_of && sessionById(session.companion_of)) || (session.review_of && sessionById(session.review_of))
@@ -323,6 +324,39 @@ function renderSession(session, index) {
     // Author <-> reviewer (handoff.js).
     handoff.pairChip(session),
   );
+}
+
+// How far along a working (or blocked) agent is, from its telemetry: the
+// plan it declared (a bar, done/total, the step it is on), else what is
+// observed (the tool it is in); and its context window once that is
+// nearly full. Nothing is shown for a session at rest.
+function progressLine(session, st) {
+  const t = sessionTelemetry.get(session.id);
+  if (!t || (st.dot !== "working" && st.dot !== "blocked")) return null;
+  const parts = [];
+  if (t.plan && t.plan.total) {
+    const bar = el("span", { className: "fwb-bar" }, el("i"));
+    bar.firstChild.style.width = `${Math.round((t.plan.done / t.plan.total) * 100)}%`;
+    parts.push(bar, el("b", { textContent: `${t.plan.done}/${t.plan.total}` }));
+    if (t.plan.current) parts.push(el("span", { className: "session-step", textContent: t.plan.current }));
+  } else if (t.tool) {
+    parts.push(el("span", {
+      className: "session-step tool",
+      textContent: t.tool.summary ? `${t.tool.name}: ${t.tool.summary}` : t.tool.name,
+    }));
+  } else if (t.turn_title) {
+    parts.push(el("span", { className: "session-step", textContent: t.turn_title }));
+  }
+  if (t.context && t.context.pct >= 80) {
+    parts.push(el("span", {
+      className: "session-ctx",
+      textContent: `ctx ${t.context.exact === false ? "~" : ""}${Math.round(t.context.pct)}%`,
+      title: "context window used",
+    }));
+  }
+  if (!parts.length) return null;
+  const said = t.plan && t.plan.current ? `step ${t.plan.done + 1} of ${t.plan.total}: ${t.plan.current}` : (t.tool && t.tool.summary) || t.turn_title || "";
+  return el("span", { className: "session-progress", title: said }, parts);
 }
 
 // Where a session runs, as its workspace names it: the folder it was

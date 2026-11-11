@@ -22,15 +22,32 @@ button#meter-usage { max-width: 16rem; text-align: left; }
   button#meter-usage { min-width: 6.5rem; }
   .crumbs .why-btn, .crumb-machine { flex-shrink: 0; }
 }
-/* Below a wide desktop: the pills are their icons (the label is still their
-   accessible name and tooltip), the link pill its dot, the size meter goes. */
-@media (max-width: 1599px) {
+/* Below a very wide desktop: the pills are their icons (the label is still
+   their accessible name and tooltip), the link pill its dot, the size meter
+   goes. Twelve labelled pills need about 2200px beside the sidebar; under
+   that the labels pushed the row past the window. */
+@media (max-width: 2199px) {
   .meters { gap: .55rem; }
   .meters .cmd-pill { font-size: 0; gap: 0; padding: .3rem .4rem; }
   .meters .cmd-pill svg { width: .8rem; height: .8rem; }
   .meters .cmd-pill b { font-size: 10px; margin-left: .3rem; }
   #meter-size { display: none; }
   #link { font-size: 0; gap: 0; padding: .3rem; }
+}
+/* Beside the sidebar, search is the sidebar's own button. As the header
+   narrows the viewer count and the path go, then sharing and recording
+   (both stay in the palette), then the usage text (it is on the session's
+   sidebar row): the name, status, and why? are never painted over. */
+@media (min-width: 821px) {
+  #search-toggle { display: none; }
+}
+@media (min-width: 821px) and (max-width: 1799px) {
+  #meter-viewers { display: none; }
+  #meter-cwd:not(:empty) { min-width: 0; }
+}
+@media (min-width: 821px) and (max-width: 1399px) {
+  .meters > #share-toggle, .meters > #rec-toggle { display: none; }
+  button#meter-usage { min-width: 0; }
 }
 /* A phone: the cost is on the session's sidebar row; the header keeps the
    name, status pill and why? whole. */

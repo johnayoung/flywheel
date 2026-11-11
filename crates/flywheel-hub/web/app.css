@@ -264,6 +264,9 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 }
 
 .tach.on { color: var(--signal); }
+/* The count opens the fleet board. */
+button.tach { padding: 0; border: 0; background: none; font: inherit; letter-spacing: inherit; text-transform: inherit; cursor: pointer; }
+button.tach:hover, button.tach:focus-visible { text-decoration: underline; text-underline-offset: 2px; }
 
 .offline {
   margin: .6rem .9rem 0;

@@ -290,6 +290,7 @@ function connectEvents() {
       return;
     }
     if (message.type === "snapshot") {
+      loadTelemetry();
       // This hub's statuses; the machines' stay (they have their own
       // sockets).
       const local = (id) => !machines.machineOf(id);
@@ -374,6 +375,7 @@ function onPush(message, machine) {
     activity.onRow(message.row, machine);
     pullRequests.onActivity(message.row);
   } else if (message.type === "telemetry") {
+    noteTelemetry(message.session, machine);
     fleet.onSnapshot(message.session, machine);
     work.onSnapshot(message.session, machine);
   } else if (message.type === "away" && !machine) {

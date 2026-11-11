@@ -734,6 +734,36 @@ const sharing = window.FwHubSharing({
 // Refreshes overlap (events, the poller, actions); each response is
 // tagged so one answered after a newer one is dropped, and only a list
 // fetched after the attach may declare the attached session gone.
+// What each of this hub's sessions is doing now: its telemetry snapshot
+// (the fleet board's row), by session id. The sidebar rows read it for
+// their progress line, so progress is visible without opening anything.
+const sessionTelemetry = new Map();
+let telemetryPaint = null;
+
+// A snapshot arrived (the events socket's `telemetry`, this hub's only).
+function noteTelemetry(snapshot, machine) {
+  if (machine || !snapshot || !snapshot.session) return;
+  sessionTelemetry.set(snapshot.session, snapshot);
+  // Several a second per session at most: one repaint for all of them.
+  if (telemetryPaint) return;
+  telemetryPaint = setTimeout(() => {
+    telemetryPaint = null;
+    render();
+  }, 400);
+}
+
+// Every session's snapshot as of now (on connect: pushes carry the rest).
+async function loadTelemetry() {
+  try {
+    const page = await rawApi("GET", "/api/telemetry/fleet?host=local&hours=0&limit=1000");
+    sessionTelemetry.clear();
+    for (const snapshot of page.sessions || []) sessionTelemetry.set(snapshot.session, snapshot);
+    render();
+  } catch (_) {
+    // An older hub, or none recorded yet: the rows stay as they were.
+  }
+}
+
 async function refresh(force = true) {
   const seq = ++state.refreshSeq;
   let ws;

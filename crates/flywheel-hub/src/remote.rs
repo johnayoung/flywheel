@@ -21,6 +21,19 @@ pub const LOCK_FILE: &str = "serve.lock";
 /// How long a `tailscale` CLI call may take before it is abandoned.
 pub const TAILSCALE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Where this machine's own agent sessions reach a hub listening on
+/// `local`, over plain http: loopback when it listens everywhere, else
+/// the address it bound (plain http from this machine passes the TLS
+/// policy either way).
+pub fn agent_url(local: SocketAddr) -> String {
+    let ip = match local.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    format!("http://{}", SocketAddr::new(ip, local.port()))
+}
+
 /// What a running hub records about itself for the CLI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeInfo {

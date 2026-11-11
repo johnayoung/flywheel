@@ -162,6 +162,8 @@ pub(super) fn serve_cmd(
         }
     };
     let local = listener.local_addr().unwrap_or(bind);
+    // Before any session starts: agents POST their hooks here.
+    hub.set_agent_url(crate::remote::agent_url(local));
     if !effective.bind.is_loopback() {
         let advice = if effective.tls.is_on() {
             "Traffic from the network is https (--tls); plain http from it reaches only /ca."
@@ -454,6 +456,7 @@ pub(super) fn serve_cmd(
         plugins: Some(plugins),
         tls: tls.clone(),
         ws_send_timeout: None,
+        telemetry_upstream: effective.telemetry_upstream.clone(),
     };
     if let Some(tls) = &tls {
         let _enter = runtime.enter();

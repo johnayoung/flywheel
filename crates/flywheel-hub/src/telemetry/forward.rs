@@ -31,8 +31,7 @@ pub const DEFLATED: &str = "deflate";
 
 /// One batch's body: an event a line, deflated.
 pub fn encode(events: &[Event]) -> std::io::Result<Vec<u8>> {
-    let mut encoder =
-        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
     for event in events {
         serde_json::to_writer(&mut encoder, event)?;
         encoder.write_all(b"\n")?;
@@ -146,13 +145,7 @@ async fn send_one(
     let sent = events.len();
     let body = encode(&events).map_err(|e| e.to_string())?;
     let response = machine
-        .send_encoded(
-            "/api/telemetry/batch",
-            body,
-            NDJSON,
-            DEFLATED,
-            SEND_TIMEOUT,
-        )
+        .send_encoded("/api/telemetry/batch", body, NDJSON, DEFLATED, SEND_TIMEOUT)
         .await
         .map_err(|e| e.to_string())?;
     let status = response.status();
@@ -161,7 +154,10 @@ async fn send_one(
             .await
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default();
-        return Err(format!("the collector answered {status}: {}", detail.trim()));
+        return Err(format!(
+            "the collector answered {status}: {}",
+            detail.trim()
+        ));
     }
     let telemetry = telemetry.clone();
     let cursor = cursor.to_owned();

@@ -145,29 +145,133 @@ const CLAUDE_HOOKS: &[(&str, Option<&str>)] = &[
 /// milliseconds; this only bounds a wedged hub).
 pub const CLAUDE_HOOK_TIMEOUT_SECS: u64 = 10;
 
-/// `--settings` JSON that makes Claude Code run `report` (an argv prefix
-/// such as `[/path/to/fw, hub]`) with `report --source claude --event E
-/// [--detail D] --stdin` on every status-relevant hook. The hook gets the
-/// event's JSON on stdin; `args` spawns the program directly (no shell).
-pub fn claude_settings(report: &[String]) -> serde_json::Value {
+/// The Claude Code release the hub's http hooks were verified on; an
+/// older CLI gets a command hook per event instead (the same reports,
+/// one process each).
+pub const CLAUDE_HTTP_HOOKS_SINCE: (u32, u32, u32) = (2, 1, 322);
+
+/// The path agent hooks POST to on their hub.
+pub const HOOK_PATH: &str = "/api/telemetry/hook";
+/// The path of the hub's progress tool (an MCP server over http).
+pub const MCP_PATH: &str = "/api/telemetry/mcp";
+/// The request headers a session names itself with on those two paths
+/// (Claude Code fills them from the session's environment).
+pub const SESSION_HEADER: &str = "x-flywheel-session";
+pub const SECRET_HEADER: &str = "x-flywheel-secret";
+
+/// How a Claude Code session is wired to its hub.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClaudeWiring<'a> {
+    /// The argv prefix of this binary's `hub` verb (`[/path/to/fw, hub]`).
+    pub report: Option<&'a [String]>,
+    /// The hub's own http address (`http://127.0.0.1:7420`), once it
+    /// listens: where the progress tool is.
+    pub hub_url: Option<&'a str>,
+    /// Hooks POST to `hub_url` instead of running a process per event.
+    pub http_hooks: bool,
+    /// The user's own `statusLine` setting: its command runs after the
+    /// hub's, and its other fields are kept.
+    pub status_line: Option<&'a serde_json::Value>,
+}
+
+/// One hook handler: a POST to the hub when the wiring allows it for
+/// `event`, else the report command. `SessionStart` is always a command
+/// (Claude Code runs no http hook for it).
+fn claude_hook(
+    wiring: &ClaudeWiring<'_>,
+    event: &str,
+    detail: Option<&str>,
+) -> Option<serde_json::Value> {
+    if let Some(url) = wiring
+        .hub_url
+        .filter(|_| wiring.http_hooks && event != "SessionStart")
+    {
+        return Some(serde_json::json!({
+            "type": "http",
+            "url": format!("{url}{HOOK_PATH}"),
+            "timeout": CLAUDE_HOOK_TIMEOUT_SECS,
+            "headers": {
+                SESSION_HEADER: format!("${}", crate::report::SESSION_ENV),
+                SECRET_HEADER: format!("${}", crate::report::SECRET_ENV),
+            },
+            "allowedEnvVars": [crate::report::SESSION_ENV, crate::report::SECRET_ENV],
+        }));
+    }
+    let report = wiring.report.filter(|r| !r.is_empty())?;
+    let mut args: Vec<String> = report[1..].to_vec();
+    args.extend(["report", "--source", "claude", "--event", event].map(str::to_owned));
+    if let Some(detail) = detail {
+        args.extend(["--detail".to_owned(), detail.to_owned()]);
+    }
+    args.push("--stdin".to_owned());
+    Some(serde_json::json!({
+        "type": "command",
+        "command": report[0],
+        "args": args,
+        "timeout": CLAUDE_HOOK_TIMEOUT_SECS,
+    }))
+}
+
+/// A word quoted for `sh`.
+pub fn sh_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// The hub's status line: the report command, told to run the user's own
+/// command (`--chain`) for what is shown. The user's other fields (its
+/// padding, its refresh interval) are kept.
+fn claude_status_line(wiring: &ClaudeWiring<'_>) -> Option<serde_json::Value> {
+    let report = wiring.report.filter(|r| !r.is_empty())?;
+    let mut words: Vec<String> = report.iter().map(|w| sh_quote(w)).collect();
+    words.extend(
+        [
+            "report",
+            "--source",
+            "claude",
+            "--event",
+            crate::telemetry::claude::STATUS_LINE_EVENT,
+            "--stdin",
+        ]
+        .map(str::to_owned),
+    );
+    let theirs = wiring
+        .status_line
+        .filter(|s| s.get("type").and_then(serde_json::Value::as_str) == Some("command"));
+    if let Some(command) = theirs
+        .and_then(|s| s.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|c| !c.trim().is_empty())
+    {
+        words.push("--chain".to_owned());
+        words.push(sh_quote(command));
+    }
+    let mut line = match theirs {
+        Some(serde_json::Value::Object(theirs)) => theirs.clone(),
+        _ => serde_json::Map::new(),
+    };
+    line.insert("type".to_owned(), "command".into());
+    line.insert("command".to_owned(), words.join(" ").into());
+    Some(serde_json::Value::Object(line))
+}
+
+/// `--settings` JSON that makes Claude Code tell its hub what it does:
+/// every status-relevant hook ([`CLAUDE_HOOKS`]) and the telemetry-only
+/// ones ([`crate::telemetry::claude::EXTRA_HOOKS`]) as a POST to the hub
+/// (or `report --source claude --event E [--detail D] --stdin`, spawned
+/// directly with no shell, where http is not wired), and the status line
+/// that carries the context window, cost, and rate limits.
+pub fn claude_settings(wiring: &ClaudeWiring<'_>) -> serde_json::Value {
     let mut hooks = serde_json::Map::new();
-    for (event, detail) in CLAUDE_HOOKS {
-        let mut args: Vec<String> = report[1..].to_vec();
-        args.extend(["report", "--source", "claude", "--event", event].map(str::to_owned));
+    let extra = crate::telemetry::claude::EXTRA_HOOKS
+        .iter()
+        .map(|event| (*event, None));
+    for (event, detail) in CLAUDE_HOOKS.iter().copied().chain(extra) {
+        let Some(handler) = claude_hook(wiring, event, detail) else {
+            continue;
+        };
+        let mut group = serde_json::json!({ "hooks": [handler] });
         if let Some(detail) = detail {
-            args.extend(["--detail".to_owned(), (*detail).to_owned()]);
-        }
-        args.push("--stdin".to_owned());
-        let mut group = serde_json::json!({
-            "hooks": [{
-                "type": "command",
-                "command": report[0],
-                "args": args,
-                "timeout": CLAUDE_HOOK_TIMEOUT_SECS,
-            }]
-        });
-        if let Some(detail) = detail {
-            group["matcher"] = serde_json::Value::String((*detail).to_owned());
+            group["matcher"] = serde_json::Value::String(detail.to_owned());
         }
         hooks
             .entry(event.to_string())
@@ -176,20 +280,110 @@ pub fn claude_settings(report: &[String]) -> serde_json::Value {
             .expect("hook groups are arrays")
             .push(group);
     }
-    serde_json::json!({ "hooks": hooks })
+    let mut settings = serde_json::json!({ "hooks": hooks });
+    if let Some(line) = claude_status_line(wiring) {
+        settings["statusLine"] = line;
+    }
+    if wiring.hub_url.is_some() {
+        // The hub's own progress tool never waits on a permission prompt
+        // (it changes nothing on the machine).
+        settings["permissions"] =
+            serde_json::json!({ "allow": [crate::telemetry::claude::PROGRESS_TOOL] });
+    }
+    settings
+}
+
+/// `--mcp-config` JSON giving a session the hub's progress tool
+/// ([`crate::telemetry::mcp`]); Claude Code fills the headers from the
+/// session's environment.
+pub fn claude_mcp_config(hub_url: &str) -> serde_json::Value {
+    serde_json::json!({
+        "mcpServers": {
+            crate::telemetry::mcp::SERVER_NAME: {
+                "type": "http",
+                "url": format!("{hub_url}{MCP_PATH}"),
+                "headers": {
+                    SESSION_HEADER: format!("${{{}}}", crate::report::SESSION_ENV),
+                    SECRET_HEADER: format!("${{{}}}", crate::report::SECRET_ENV),
+                },
+            }
+        }
+    })
 }
 
 /// Extra argv for a Claude Code session: its conversation id (`--resume`
 /// when a transcript for it already exists, so a relaunch continues the
-/// conversation) and, when the hub can take reports, the status hooks.
-pub fn claude_args(session_id: &str, resume: bool, report: Option<&[String]>) -> Vec<String> {
+/// conversation) and, when the hub can take reports, its hooks, status
+/// line, and progress tool.
+pub fn claude_args(session_id: &str, resume: bool, wiring: &ClaudeWiring<'_>) -> Vec<String> {
     let flag = if resume { "--resume" } else { "--session-id" };
     let mut args = vec![flag.to_owned(), session_id.to_owned()];
-    if let Some(report) = report.filter(|r| !r.is_empty()) {
+    if wiring.report.is_some_and(|r| !r.is_empty()) {
         args.push("--settings".to_owned());
-        args.push(claude_settings(report).to_string());
+        args.push(claude_settings(wiring).to_string());
+        if let Some(url) = wiring.hub_url {
+            // `--mcp-config` takes several values: a flag follows it.
+            args.push("--mcp-config".to_owned());
+            args.push(claude_mcp_config(url).to_string());
+            args.push("--append-system-prompt".to_owned());
+            args.push(crate::telemetry::mcp::NUDGE.to_owned());
+        }
     }
     args
+}
+
+/// What the user's own Claude Code settings say that the hub's wiring
+/// must respect.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClaudeUserSettings {
+    /// Their `statusLine` (the most specific file's).
+    pub status_line: Option<serde_json::Value>,
+    /// Some settings file lists `allowedHttpHookUrls`: only those URLs'
+    /// http hooks run, so the hub keeps to command hooks.
+    pub restricts_http_hooks: bool,
+}
+
+/// Read the settings files Claude Code would for a session in `cwd`: the
+/// user's, the project's, the project's local ones, and managed policy.
+pub fn claude_user_settings(config_dir: Option<&Path>, cwd: &Path) -> ClaudeUserSettings {
+    let mut found = ClaudeUserSettings::default();
+    let files = [
+        Some(PathBuf::from("/etc/claude-code/managed-settings.json")),
+        config_dir.map(|dir| dir.join("settings.json")),
+        Some(cwd.join(".claude").join("settings.json")),
+        Some(cwd.join(".claude").join("settings.local.json")),
+    ];
+    // Least specific first: a later file's status line wins.
+    for file in files.into_iter().flatten() {
+        let Some(settings) = std::fs::read(&file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        else {
+            continue;
+        };
+        if settings.get("allowedHttpHookUrls").is_some() {
+            found.restricts_http_hooks = true;
+        }
+        if let Some(line) = settings.get("statusLine").filter(|l| l.is_object()) {
+            found.status_line = Some(line.clone());
+        }
+    }
+    found
+}
+
+/// The `major.minor.patch` in a `claude --version` line.
+pub fn parse_claude_version(text: &str) -> Option<(u32, u32, u32)> {
+    let word = text
+        .split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut parts = word.split('.').map(|p| {
+        p.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u32>()
+            .ok()
+    });
+    Some((parts.next()??, parts.next()??, parts.next()??))
 }
 
 // --- launch options -----------------------------------------------------------
@@ -678,9 +872,18 @@ mod tests {
         vec!["/usr/local/bin/fw".into(), "hub".into()]
     }
 
+    /// Wired with the report command alone (no hub address yet).
+    fn wired(report: &[String]) -> ClaudeWiring<'_> {
+        ClaudeWiring {
+            report: Some(report),
+            ..ClaudeWiring::default()
+        }
+    }
+
     #[test]
     fn claude_settings_register_every_status_hook_without_a_shell() {
-        let settings = claude_settings(&report_prefix());
+        let report = report_prefix();
+        let settings = claude_settings(&wired(&report));
         let hooks = settings["hooks"].as_object().unwrap();
         for event in [
             "SessionStart",
@@ -737,8 +940,13 @@ mod tests {
                 "--stdin"
             ])
         );
-        // Every hook maps to a signal (nothing registered is ignored).
+        // Every status hook maps to a signal (nothing registered is
+        // ignored); the telemetry-only ones change no status.
         for (event, groups) in hooks {
+            if crate::telemetry::claude::EXTRA_HOOKS.contains(&event.as_str()) {
+                assert!(claude_signal(event, None).is_none(), "{event}");
+                continue;
+            }
             for group in groups.as_array().unwrap() {
                 let detail = group.get("matcher").and_then(|m| m.as_str());
                 assert!(claude_signal(event, detail).is_some(), "{event} {detail:?}");
@@ -749,12 +957,124 @@ mod tests {
     #[test]
     fn claude_args_pick_session_id_or_resume() {
         let id = "8d2c4f8e-2f4b-4d7e-9a51-0c6f3b0a1e22";
-        assert_eq!(claude_args(id, false, None), ["--session-id", id]);
-        assert_eq!(claude_args(id, true, Some(&[])), ["--resume", id]);
-        let args = claude_args(id, false, Some(&report_prefix()));
+        let none = ClaudeWiring::default();
+        assert_eq!(claude_args(id, false, &none), ["--session-id", id]);
+        assert_eq!(claude_args(id, true, &wired(&[])), ["--resume", id]);
+        let report = report_prefix();
+        let args = claude_args(id, false, &wired(&report));
         assert_eq!(args[..3], ["--session-id", id, "--settings"]);
+        assert_eq!(args.len(), 4, "no hub address: no progress tool");
         let settings: serde_json::Value = serde_json::from_str(&args[3]).unwrap();
         assert!(settings["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
+    fn a_listening_hub_gets_http_hooks_a_status_line_and_the_progress_tool() {
+        let report = report_prefix();
+        let theirs = serde_json::json!({
+            "type": "command", "command": "~/.claude/line.sh 'x'", "padding": 0
+        });
+        let wiring = ClaudeWiring {
+            report: Some(&report),
+            hub_url: Some("http://127.0.0.1:7420"),
+            http_hooks: true,
+            status_line: Some(&theirs),
+        };
+        let settings = claude_settings(&wiring);
+        // No process per event: every hook but SessionStart is a POST
+        // that names its session from the environment.
+        let pre = &settings["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert_eq!(pre["type"], "http");
+        assert_eq!(pre["url"], "http://127.0.0.1:7420/api/telemetry/hook");
+        assert_eq!(pre["headers"][SECRET_HEADER], "$FLYWHEEL_HUB_REPORT_SECRET");
+        assert_eq!(pre["headers"][SESSION_HEADER], "$FLYWHEEL_HUB_SESSION");
+        assert_eq!(
+            pre["allowedEnvVars"],
+            serde_json::json!(["FLYWHEEL_HUB_SESSION", "FLYWHEEL_HUB_REPORT_SECRET"])
+        );
+        assert_eq!(
+            settings["hooks"]["SessionStart"][0]["hooks"][0]["type"],
+            "command"
+        );
+        for event in crate::telemetry::claude::EXTRA_HOOKS {
+            assert_eq!(
+                settings["hooks"][event][0]["hooks"][0]["type"], "http",
+                "{event}"
+            );
+        }
+        assert_eq!(
+            settings["hooks"]["Notification"].as_array().unwrap().len(),
+            5,
+            "the matchers stay"
+        );
+        // The user's status line still shows: the hub's runs it.
+        let line = &settings["statusLine"];
+        assert_eq!(line["padding"], 0);
+        assert_eq!(sh_quote("a'b"), r"'a'\''b'");
+        assert_eq!(
+            line["command"],
+            format!(
+                "'/usr/local/bin/fw' 'hub' report --source claude --event statusline --stdin \
+                 --chain {}",
+                sh_quote("~/.claude/line.sh 'x'")
+            )
+        );
+        let args = claude_args("id", false, &wiring);
+        assert_eq!(args[4], "--mcp-config");
+        let mcp: serde_json::Value = serde_json::from_str(&args[5]).unwrap();
+        let server = &mcp["mcpServers"]["flywheel"];
+        assert_eq!(server["url"], "http://127.0.0.1:7420/api/telemetry/mcp");
+        assert_eq!(
+            server["headers"][SECRET_HEADER],
+            "${FLYWHEEL_HUB_REPORT_SECRET}"
+        );
+        assert_eq!(args[6], "--append-system-prompt");
+        assert_eq!(
+            settings["permissions"]["allow"],
+            serde_json::json!(["mcp__flywheel__report_progress"]),
+            "the progress tool never prompts"
+        );
+        // Without http hooks (an older CLI, a restricting policy) the
+        // same events run the report command.
+        let commands = claude_settings(&ClaudeWiring {
+            http_hooks: false,
+            ..wiring
+        });
+        assert_eq!(
+            commands["hooks"]["SubagentStart"][0]["hooks"][0]["type"],
+            "command"
+        );
+    }
+
+    #[test]
+    fn the_users_settings_are_read_most_specific_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let (config, cwd) = (dir.path().join("config"), dir.path().join("repo"));
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(cwd.join(".claude")).unwrap();
+        assert_eq!(
+            claude_user_settings(Some(&config), &cwd),
+            ClaudeUserSettings::default()
+        );
+        std::fs::write(
+            config.join("settings.json"),
+            r#"{"statusLine": {"type": "command", "command": "user"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".claude/settings.local.json"),
+            r#"{"statusLine": {"type": "command", "command": "local"}, "allowedHttpHookUrls": []}"#,
+        )
+        .unwrap();
+        let found = claude_user_settings(Some(&config), &cwd);
+        assert_eq!(found.status_line.unwrap()["command"], "local");
+        assert!(found.restricts_http_hooks);
+        assert_eq!(
+            parse_claude_version("2.1.322 (Claude Code)"),
+            Some((2, 1, 322))
+        );
+        assert_eq!(parse_claude_version("claude 2.2.0-beta.1"), Some((2, 2, 0)));
+        assert_eq!(parse_claude_version("nope"), None);
     }
 
     #[test]

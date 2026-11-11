@@ -59,7 +59,7 @@ Replaces the hub process **ending no session**: same pids, screens, scrollback, 
 - Hook / `notify` reports win; screen rules fill gaps. Esc fires no Claude hook: a seen turn showing the prompt 3 s reads `idle`, a dialog closing onto a running turn `working`.
 - Seen is per client id (REST: anyone). A view counts while the page is visible, focused, used in 5 min; a turn watched from its start counts to 30 min.
 - Rollup: a workspace's most urgent session, blocked > working > done > idle. Fan-out candidates roll up `idle` until a pick; an unseen grading is one `done`.
-- Claude: `--session-id <uuid>` (`agent_session_id`, follows `/clear`), hooks via `--settings` (merged with yours) running `<this binary> hub report`. Codex: `-c notify=[<this binary> hub report --source codex --event notify]`; `thread-id` is `agent_session_id`.
+- Claude: `--session-id <uuid>` (`agent_session_id`, follows `/clear`), hooks via `--settings` (merged with yours) POSTing to the hub, or running `<this binary> hub report` ([hub-workflows](workflows.md#fleet-and-work)). Codex: `-c notify=[<this binary> hub report --source codex --event notify]`; `thread-id` is `agent_session_id`.
 
 ## Detection manifests
 

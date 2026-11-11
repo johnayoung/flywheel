@@ -218,6 +218,10 @@ pub struct SessionState {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    dir: Option<String>,
+    #[serde(default)]
     started: Option<i64>,
     #[serde(default)]
     pub last_ts: i64,
@@ -306,6 +310,11 @@ pub struct Snapshot {
     pub conversation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The session's name on its hub, and its directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     /// `working`, `blocked`, `done` (awaiting the next prompt), `failed`
     /// (the last turn ended on an error), `idle` (no turn yet), `ended`.
     pub status: String,
@@ -408,13 +417,20 @@ impl SessionState {
             What::SessionStarted {
                 conversation,
                 model,
+                label,
+                dir,
                 ..
             } => {
                 !self.ended
-                    && self.started.is_some()
+                    && self.harness.is_some()
                     && (conversation.is_none() || *conversation == self.conversation)
                     && (model.is_none() || *model == self.model)
+                    && (label.is_none() || *label == self.label)
+                    && (dir.is_none() || *dir == self.dir)
             }
+            What::SessionFinished { .. } => self.ended,
+            // A second notice of the prompt already waited on.
+            What::WaitStarted { .. } => self.wait.is_some(),
             _ => false,
         }
     }
@@ -449,8 +465,16 @@ impl SessionState {
                 harness,
                 conversation,
                 model,
+                label,
+                dir,
             } => {
                 self.harness = Some(harness.clone());
+                if label.is_some() {
+                    self.label.clone_from(label);
+                }
+                if dir.is_some() {
+                    self.dir.clone_from(dir);
+                }
                 if conversation.is_some() {
                     self.conversation = conversation.clone();
                 }
@@ -471,10 +495,10 @@ impl SessionState {
                 self.ended = false;
                 // The prompt's text arriving after its turn began (Codex
                 // writes the two apart) titles that turn.
-                let untitled = self
-                    .turn
-                    .clone()
-                    .filter(|id| self.item(id).is_some_and(|t| t.title.is_empty() && t.tools == 0));
+                let untitled = self.turn.clone().filter(|id| {
+                    self.item(id)
+                        .is_some_and(|t| t.title.is_empty() && t.tools == 0)
+                });
                 if let Some(id) = untitled {
                     if let Some(turn) = self.item_mut(&id) {
                         turn.title.clone_from(title);
@@ -874,7 +898,8 @@ impl SessionState {
             None => {
                 // One plan per agent; a bound on subagents that declare.
                 if self.plans.len() >= 32 {
-                    self.plans.remove(usize::from(self.plans[0].owner.is_none()));
+                    self.plans
+                        .remove(usize::from(self.plans[0].owner.is_none()));
                 }
                 self.plans.push(Plan {
                     owner,
@@ -1038,6 +1063,8 @@ impl SessionState {
             harness: self.harness.clone(),
             conversation: self.conversation.clone(),
             model: self.model.clone(),
+            label: self.label.clone(),
+            dir: self.dir.clone(),
             status: status.to_owned(),
             since,
             blocked_on: self.wait.as_ref().map(|w| w.reason),

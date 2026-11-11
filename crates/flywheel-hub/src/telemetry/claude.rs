@@ -30,7 +30,10 @@ pub const STATUS_LINE_EVENT: &str = "statusline";
 pub const PROGRESS_TOOL: &str = "mcp__flywheel__report_progress";
 
 fn str_of<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 fn owned(value: &Value, key: &str) -> Option<String> {
@@ -78,12 +81,14 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
             harness: "claude".to_owned(),
             conversation: owned(payload, "session_id"),
             model: owned(payload, "model"),
+            label: None,
+            dir: None,
         })],
         "SessionEnd" => vec![main(What::SessionFinished {
             reason: owned(payload, "reason"),
         })],
         "UserPromptSubmit" => vec![main(What::TurnStarted {
-            title: summary::text(str_of(payload, "prompt").unwrap_or_default()),
+            title: prompt_title(str_of(payload, "prompt").unwrap_or_default()),
         })],
         "Stop" => vec![main(What::TurnFinished {})],
         "StopFailure" => {
@@ -203,6 +208,17 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
     }
 }
 
+/// A turn's title from its prompt. Claude Code also submits prompts of
+/// its own (a background task's result, in a `<task-notification>`
+/// block): those are named for what they are, not shown as markup.
+fn prompt_title(prompt: &str) -> String {
+    let prompt = prompt.trim_start();
+    if prompt.starts_with("<task-notification>") {
+        return "(a background task finished)".to_owned();
+    }
+    summary::text(prompt)
+}
+
 /// The plan a plan tool's call declares.
 fn plan_of(tool: &str, input: &Value) -> Option<What> {
     match tool {
@@ -238,6 +254,8 @@ pub fn status_line(payload: &Value, ts: i64) -> Vec<Draft> {
                 harness: "claude".to_owned(),
                 conversation: owned(payload, "session_id"),
                 model: Some(model),
+                label: None,
+                dir: None,
             },
         ));
     }
@@ -261,7 +279,11 @@ pub fn status_line(payload: &Value, ts: i64) -> Vec<Draft> {
         .filter(|c| c.is_finite() && *c >= 0.0);
     let input = num(window, "total_input_tokens");
     let output = num(window, "total_output_tokens");
-    if cost.is_some() || input.is_some() || output.is_some() {
+    // Before the first response everything reads zero: nothing to say.
+    let any = [cost, input, output]
+        .iter()
+        .any(|n| n.is_some_and(|n| n > 0.0));
+    if any {
         drafts.push(Draft::new(
             ts,
             What::Usage {

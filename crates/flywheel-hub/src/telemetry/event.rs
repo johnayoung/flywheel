@@ -128,6 +128,12 @@ pub enum What {
         conversation: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// The session's name on its hub, and the directory it runs in
+        /// (what a collector shows for a session it does not own).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
     },
     #[serde(rename = "session.finished")]
     SessionFinished {

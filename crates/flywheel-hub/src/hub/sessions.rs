@@ -14,7 +14,7 @@ use crate::report;
 use crate::state::{SessionRecord, SessionState, StateError, new_id, validate_name};
 use crate::status::{Audience, Signal, StatusSource};
 use chrono::Utc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, PoisonError, Weak};
 use std::time::Duration;
 
@@ -636,6 +636,7 @@ impl Hub {
                 .map_err(HubError::Internal)?;
             generation = Some(key.generation);
             let report = self.options.report_command.as_deref();
+            let hub_url = self.agent_url();
             let options = record.launch.clone().unwrap_or_default();
             // The first prompt goes to a new conversation only.
             let mut resuming = resume;
@@ -644,7 +645,22 @@ impl Hub {
                     if let Some(conversation) = &record.agent_session_id {
                         let exists = self.claude_transcript_exists(record, conversation);
                         resuming |= exists;
-                        argv.extend(agent::claude_args(conversation, exists, report));
+                        let theirs = agent::claude_user_settings(
+                            self.options.claude_config_dir.as_deref(),
+                            &record.cwd,
+                        );
+                        let http_hooks = hub_url.is_some()
+                            && !theirs.restricts_http_hooks
+                            && argv
+                                .first()
+                                .is_some_and(|p| self.claude_takes_http_hooks(Path::new(p)));
+                        let wiring = agent::ClaudeWiring {
+                            report,
+                            hub_url: hub_url.as_deref(),
+                            http_hooks,
+                            status_line: theirs.status_line.as_ref(),
+                        };
+                        argv.extend(agent::claude_args(conversation, exists, &wiring));
                     }
                     argv.extend(options.args(kind));
                 }
@@ -808,6 +824,7 @@ impl Hub {
     pub(super) fn on_session_exit(&self, id: &str, generation: Option<u64>, exit: ExitInfo) {
         let exit_json = serde_json::json!({ "code": exit.code, "signal": exit.signal });
         let _ = self.store().mark_exited(id, exit);
+        self.record_exit(id);
         if let Some(generation) = generation {
             let source = StatusSource::Hub {
                 reason: "the agent's process exited".into(),

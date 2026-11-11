@@ -29,8 +29,14 @@ fn a_tool_call_is_paired_by_its_id_with_duration_and_outcome() {
         "s1",
         10_000,
         &[
-            ("SessionStart", json!({"session_id": "conv", "model": "claude-x"})),
-            ("UserPromptSubmit", json!({"prompt": "fix the failing test"})),
+            (
+                "SessionStart",
+                json!({"session_id": "conv", "model": "claude-x"}),
+            ),
+            (
+                "UserPromptSubmit",
+                json!({"prompt": "fix the failing test"}),
+            ),
             (
                 "PreToolUse",
                 json!({"tool_name": "Bash", "tool_use_id": "tu1", "tool_input": {"command": "cargo test"}}),
@@ -97,8 +103,12 @@ fn a_tool_call_is_paired_by_its_id_with_duration_and_outcome() {
 #[test]
 fn time_blocked_on_a_person_excludes_the_tools_own_run_time() {
     let (_dir, telemetry) = open();
-    let bash = json!({"tool_name": "Bash", "tool_use_id": "tu1", "tool_input": {"command": "rm -rf x"}});
-    telemetry.record("s", claude::hook("UserPromptSubmit", &json!({"prompt": "clean"}), 0));
+    let bash =
+        json!({"tool_name": "Bash", "tool_use_id": "tu1", "tool_input": {"command": "rm -rf x"}});
+    telemetry.record(
+        "s",
+        claude::hook("UserPromptSubmit", &json!({"prompt": "clean"}), 0),
+    );
     telemetry.record("s", claude::hook("PreToolUse", &bash, 1_000));
     telemetry.record("s", claude::hook("PermissionRequest", &bash, 1_100));
     let blocked = telemetry.snapshot("s").unwrap();
@@ -122,7 +132,10 @@ fn time_blocked_on_a_person_excludes_the_tools_own_run_time() {
     // Finished, then a new prompt 30 s later: that is awaiting, not blocked.
     telemetry.record("s", claude::hook("Stop", &json!({}), 70_000));
     assert_eq!(telemetry.snapshot("s").unwrap().status, "done");
-    telemetry.record("s", claude::hook("UserPromptSubmit", &json!({"prompt": "more"}), 100_000));
+    telemetry.record(
+        "s",
+        claude::hook("UserPromptSubmit", &json!({"prompt": "more"}), 100_000),
+    );
     let again = telemetry.snapshot("s").unwrap();
     assert_eq!((again.blocked_ms, again.awaiting_ms), (60_000, 30_000));
     assert_eq!(again.turns, 2);
@@ -142,7 +155,10 @@ fn subagents_hang_under_their_turn_and_own_their_calls() {
                 json!({"tool_name": "Agent", "tool_use_id": "tuA", "tool_input":
                     {"description": "Map routes", "subagent_type": "Explore", "prompt": "..."}}),
             ),
-            ("SubagentStart", json!({"agent_id": "ag1", "agent_type": "Explore"})),
+            (
+                "SubagentStart",
+                json!({"agent_id": "ag1", "agent_type": "Explore"}),
+            ),
             (
                 "PreToolUse",
                 json!({"agent_id": "ag1", "tool_name": "Grep", "tool_use_id": "tuG",
@@ -156,13 +172,19 @@ fn subagents_hang_under_their_turn_and_own_their_calls() {
     );
     let running = telemetry.snapshot("s").unwrap();
     assert_eq!((running.subagents_active, running.subagents_total), (1, 1));
-    assert_eq!(running.turn_tools, 2, "the turn's own call and its subagent's");
+    assert_eq!(
+        running.turn_tools, 2,
+        "the turn's own call and its subagent's"
+    );
     hooks(
         &telemetry,
         "s",
         10_000,
         &[
-            ("SubagentStop", json!({"agent_id": "ag1", "agent_type": "Explore"})),
+            (
+                "SubagentStop",
+                json!({"agent_id": "ag1", "agent_type": "Explore"}),
+            ),
             (
                 "PostToolUse",
                 json!({"tool_name": "Agent", "tool_use_id": "tuA", "duration_ms": 9_000,
@@ -174,13 +196,19 @@ fn subagents_hang_under_their_turn_and_own_their_calls() {
     let detail = telemetry.detail(None, "s").unwrap();
     assert_eq!(detail.work.len(), 2);
     let (turn, sub) = (&detail.work[0], &detail.work[1]);
-    assert_eq!((turn.source, turn.status), (WorkSource::Turn, WorkStatus::Done));
+    assert_eq!(
+        (turn.source, turn.status),
+        (WorkSource::Turn, WorkStatus::Done)
+    );
     assert_eq!(sub.source, WorkSource::Subagent);
     assert_eq!(sub.parent.as_deref(), Some("t1"));
     assert_eq!(sub.title, "Map routes");
     assert_eq!(sub.kind.as_deref(), Some("Explore"));
     assert_eq!(sub.agent.as_deref(), Some("ag1"));
-    assert_eq!((sub.status, sub.tools, sub.tokens), (WorkStatus::Done, 1, Some(4321)));
+    assert_eq!(
+        (sub.status, sub.tools, sub.tokens),
+        (WorkStatus::Done, 1, Some(4321))
+    );
     assert_eq!(detail.snapshot.subagents_active, 0);
     let events = telemetry.events(None, "s", 0, 100, false).unwrap();
     let grep = events
@@ -194,10 +222,11 @@ fn subagents_hang_under_their_turn_and_own_their_calls() {
 #[test]
 fn a_declared_plan_is_diffed_and_its_calls_counted_on_the_active_item() {
     let (_dir, telemetry) = open();
-    let plan = |items: serde_json::Value| {
-        json!({"tool_name": claude::PROGRESS_TOOL, "tool_use_id": "p", "tool_input": {"items": items}})
-    };
-    telemetry.record("s", claude::hook("UserPromptSubmit", &json!({"prompt": "ship it"}), 0));
+    let plan = |items: serde_json::Value| json!({"tool_name": claude::PROGRESS_TOOL, "tool_use_id": "p", "tool_input": {"items": items}});
+    telemetry.record(
+        "s",
+        claude::hook("UserPromptSubmit", &json!({"prompt": "ship it"}), 0),
+    );
     telemetry.record(
         "s",
         claude::hook(
@@ -237,7 +266,10 @@ fn a_declared_plan_is_diffed_and_its_calls_counted_on_the_active_item() {
     );
     let detail = telemetry.detail(None, "s").unwrap();
     let declared = &detail.plans[0];
-    assert_eq!((declared.revision, declared.added, declared.dropped), (2, 1, 1));
+    assert_eq!(
+        (declared.revision, declared.added, declared.dropped),
+        (2, 1, 1)
+    );
     let store = &declared.items[0];
     assert_eq!(store.status, ItemStatus::Done);
     assert_eq!((store.started, store.finished), (Some(1_000), Some(3_000)));
@@ -284,25 +316,40 @@ fn todo_and_task_tools_are_plans_too() {
         ),
     );
     let todo = telemetry.snapshot("todo").unwrap().plan.unwrap();
-    assert_eq!((todo.source.as_str(), todo.done, todo.total), ("todo", 1, 2));
+    assert_eq!(
+        (todo.source.as_str(), todo.done, todo.total),
+        ("todo", 1, 2)
+    );
 
     hooks(
         &telemetry,
         "task",
         0,
         &[
-            ("TaskCreated", json!({"task_id": "1", "task_subject": "Explore"})),
-            ("TaskCreated", json!({"task_id": "2", "task_subject": "Implement"})),
+            (
+                "TaskCreated",
+                json!({"task_id": "1", "task_subject": "Explore"}),
+            ),
+            (
+                "TaskCreated",
+                json!({"task_id": "2", "task_subject": "Implement"}),
+            ),
             (
                 "PreToolUse",
                 json!({"tool_name": "TaskUpdate", "tool_use_id": "u", "tool_input":
                     {"taskId": "1", "status": "in_progress"}}),
             ),
-            ("TaskCompleted", json!({"task_id": "1", "task_subject": "Explore"})),
+            (
+                "TaskCompleted",
+                json!({"task_id": "1", "task_subject": "Explore"}),
+            ),
         ],
     );
     let task = telemetry.snapshot("task").unwrap().plan.unwrap();
-    assert_eq!((task.source.as_str(), task.done, task.total), ("task", 1, 2));
+    assert_eq!(
+        (task.source.as_str(), task.done, task.total),
+        ("task", 1, 2)
+    );
     assert_eq!(task.current.as_deref(), Some("Implement"));
 }
 
@@ -322,7 +369,10 @@ fn the_status_line_gives_context_cost_and_rate_limits_once_per_change() {
     telemetry.record("s", claude::status_line(&line, 2_000));
     let snap = telemetry.snapshot("s").unwrap();
     let context = snap.context.unwrap();
-    assert_eq!((context.used, context.window, context.pct), (85_000, 200_000, 42.5));
+    assert_eq!(
+        (context.used, context.window, context.pct),
+        (85_000, 200_000, 42.5)
+    );
     assert!(context.exact);
     assert_eq!(snap.usage.unwrap().cost_usd, Some(1.25));
     assert_eq!(snap.rate.len(), 2);
@@ -330,7 +380,51 @@ fn the_status_line_gives_context_cost_and_rate_limits_once_per_change() {
     assert_eq!(snap.rate[1].resets_at, Some(1_900_500_000));
     // The second, identical reading recorded nothing.
     assert_eq!(telemetry.events(None, "s", 0, 100, false).unwrap().len(), 5);
-    assert_eq!(claude::default_line(&line), "Fable 5.2 \u{b7} ctx 42% \u{b7} $1.25");
+    assert_eq!(
+        claude::default_line(&line),
+        "Fable 5.2 \u{b7} ctx 42% \u{b7} $1.25"
+    );
+}
+
+#[test]
+fn a_prompt_claude_code_submits_itself_is_named_not_shown() {
+    let (_dir, telemetry) = open();
+    telemetry.record(
+        "s",
+        claude::hook(
+            "UserPromptSubmit",
+            &json!({"prompt": "<task-notification>\n<task-id>a1</task-id>\n</task-notification>"}),
+            0,
+        ),
+    );
+    assert_eq!(
+        telemetry.snapshot("s").unwrap().turn_title.as_deref(),
+        Some("(a background task finished)")
+    );
+}
+
+#[test]
+fn a_second_notice_of_the_same_prompt_is_not_a_second_wait() {
+    let (_dir, telemetry) = open();
+    let bash = json!({"tool_name": "Bash", "tool_use_id": "t"});
+    telemetry.record("s", claude::hook("PreToolUse", &bash, 0));
+    telemetry.record("s", claude::hook("PermissionRequest", &bash, 10));
+    telemetry.record(
+        "s",
+        claude::hook(
+            "Notification",
+            &json!({"notification_type": "permission_prompt"}),
+            20,
+        ),
+    );
+    let waits = telemetry
+        .events(None, "s", 0, 100, false)
+        .unwrap()
+        .iter()
+        .filter(|e| e.what.kind() == "wait.started")
+        .count();
+    assert_eq!(waits, 1);
+    assert_eq!(telemetry.snapshot("s").unwrap().waits, 1);
 }
 
 #[test]
@@ -401,11 +495,17 @@ fn a_codex_rollout_reads_as_the_same_events() {
     assert_eq!((snap.tools, snap.tool_errors), (2, 1));
     assert_eq!(snap.context.as_ref().unwrap().used, 600);
     let usage = snap.usage.as_ref().unwrap();
-    assert_eq!((usage.input, usage.cache_read, usage.output), (600, 400, 50));
+    assert_eq!(
+        (usage.input, usage.cache_read, usage.output),
+        (600, 400, 50)
+    );
     assert_eq!(snap.rate[0].window, "five_hour");
     assert_eq!(snap.rate[1].window, "seven_day");
     let plan = snap.plan.as_ref().unwrap();
-    assert_eq!((plan.source.as_str(), plan.done, plan.total), ("codex", 0, 2));
+    assert_eq!(
+        (plan.source.as_str(), plan.done, plan.total),
+        ("codex", 0, 2)
+    );
     // The shell call's duration is the time between its two lines.
     assert_eq!(detail.work[0].tool_ms, 100 + 2_500);
     let finished: Vec<_> = telemetry
@@ -429,7 +529,10 @@ fn a_codex_rollout_reads_as_the_same_events() {
     for line in &lines[..9] {
         telemetry.record_log("cx", codex::line(line, 0));
     }
-    assert_eq!(telemetry.events(None, "cx", 0, 100, false).unwrap().len(), before);
+    assert_eq!(
+        telemetry.events(None, "cx", 0, 100, false).unwrap().len(),
+        before
+    );
 }
 
 #[test]
@@ -502,7 +605,11 @@ fn a_collector_takes_batches_once_and_folds_the_same_state() {
     let wire = forward::encode(&batch).unwrap();
     let received = forward::decode(&wire, true, 1 << 20).unwrap();
     assert_eq!(collector.ingest(received.clone()).unwrap(), 3);
-    assert_eq!(collector.ingest(received).unwrap(), 0, "a repeat is ignored");
+    assert_eq!(
+        collector.ingest(received).unwrap(),
+        0,
+        "a repeat is ignored"
+    );
     assert_eq!(
         collector.detail(Some(HOST), "s").unwrap().snapshot,
         edge.snapshot("s").unwrap(),
@@ -579,7 +686,10 @@ fn the_fleet_lists_what_needs_a_person_first_and_counts_by_status() {
         })
         .unwrap();
     assert_eq!(
-        all.sessions.iter().map(|s| s.session.as_str()).collect::<Vec<_>>(),
+        all.sessions
+            .iter()
+            .map(|s| s.session.as_str())
+            .collect::<Vec<_>>(),
         ["blocked", "working", "done"]
     );
     assert_eq!((all.total, all.hosts), (3, 2));
@@ -635,6 +745,8 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             harness: "claude".into(),
             conversation: None,
             model: None,
+            label: None,
+            dir: None,
         },
         What::SessionFinished { reason: None },
         What::TurnStarted { title: "t".into() },

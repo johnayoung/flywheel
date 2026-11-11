@@ -369,6 +369,9 @@ impl Hub {
             ));
         };
         let payload = report.payload.clone().unwrap_or(serde_json::Value::Null);
+        if self.record_report(&report.session, kind, &report.event, &payload) {
+            return Ok(());
+        }
         let (signal, detail) = match kind {
             SessionKind::Claude => (
                 claude_signal(&report.event, report.detail.as_deref()),

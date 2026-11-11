@@ -123,7 +123,10 @@ pub(crate) fn hooks_check(claude: Option<&Path>, exe: Option<&Path>) -> Check {
     let Some(claude) = claude else {
         return Check::new(id, Level::Info, "skipped (no claude)");
     };
-    let value = agent::claude_settings(&report);
+    let value = agent::claude_settings(&agent::ClaudeWiring {
+        report: Some(&report),
+        ..agent::ClaudeWiring::default()
+    });
     if let Err(problem) = hooks_shape(&value) {
         return Check::new(
             id,
@@ -165,7 +168,8 @@ pub(crate) fn hooks_check(claude: Option<&Path>, exe: Option<&Path>) -> Check {
 }
 
 /// The shape Claude Code's settings give hooks: `hooks` maps each event to
-/// matcher groups, each a `hooks` list of `{"type":"command","command"}`.
+/// matcher groups, each a `hooks` list of `{"type":"command","command"}`
+/// or `{"type":"http","url"}`.
 pub fn hooks_shape(settings: &serde_json::Value) -> Result<(), String> {
     let hooks = settings["hooks"]
         .as_object()
@@ -186,6 +190,12 @@ pub fn hooks_shape(settings: &serde_json::Value) -> Result<(), String> {
                 .filter(|e| !e.is_empty())
                 .ok_or(format!("a `{event}` group has no `hooks` list"))?;
             for entry in entries {
+                if entry["type"] == "http" {
+                    if entry["url"].as_str().is_none_or(str::is_empty) {
+                        return Err(format!("a `{event}` http hook has no url"));
+                    }
+                    continue;
+                }
                 if entry["type"] != "command" {
                     return Err(format!("a `{event}` hook is not of type command"));
                 }

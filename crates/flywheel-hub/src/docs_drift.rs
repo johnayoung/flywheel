@@ -509,6 +509,18 @@ fn api_lists_every_activity_kind() {
 }
 
 #[test]
+fn api_lists_every_telemetry_kind() {
+    let api = read_doc("hub/api.md");
+    let body = section(&api, "Telemetry");
+    for kind in crate::telemetry::event::KINDS {
+        assert!(
+            body.contains(&format!("`{kind}`")),
+            "docs/hub/api.md ## Telemetry does not name `{kind}`"
+        );
+    }
+}
+
+#[test]
 fn front_door_is_short_and_names_every_verb() {
     let front = read_doc("hub.md");
     assert!(
@@ -650,9 +662,12 @@ const PAGES: [(&str, &str); 6] = [
 /// Condensed again to 77,762 bytes (iteration 54: under 76 KiB = 77,824
 /// bytes, request bodies and WebSocket frames kept), leaving about 8 KB
 /// for new features before the next pass.
-const HUB_DOCS_MAX_BYTES: usize = 84 * 1024;
+/// Raised from 84 KiB to 88 and a page from 24 KiB to 25 for session
+/// telemetry (six routes, an event log, a config key, two views): the
+/// earlier budget had 2 bytes left.
+const HUB_DOCS_MAX_BYTES: usize = 88 * 1024;
 /// One reference page's budget.
-const PAGE_MAX_BYTES: usize = 24 * 1024;
+const PAGE_MAX_BYTES: usize = 25 * 1024;
 /// The longest line any hub page may hold: a line longer than this is a
 /// paragraph that wants splitting or cutting.
 const LINE_MAX_CHARS: usize = 400;

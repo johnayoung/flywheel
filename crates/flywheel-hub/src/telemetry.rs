@@ -213,9 +213,7 @@ impl Telemetry {
     /// new. An event claiming this hub as its host is refused.
     pub fn ingest(&self, events: Vec<Event>) -> Result<usize, String> {
         if events.len() > BATCH_MAX_EVENTS {
-            return Err(format!(
-                "a batch carries at most {BATCH_MAX_EVENTS} events"
-            ));
+            return Err(format!("a batch carries at most {BATCH_MAX_EVENTS} events"));
         }
         if let Some(bad) = events.iter().find(|e| !valid_origin(e, &self.inner.host)) {
             return Err(format!(

@@ -94,6 +94,7 @@ mod sessions_api;
 mod settings_api;
 mod share_api;
 mod slots;
+mod telemetry_api;
 mod templates_api;
 mod terminal_ws;
 mod tls_listen;
@@ -215,6 +216,9 @@ pub struct ServerOptions {
     /// revoked credential, shutdown, a handoff), forever. `None`:
     /// [`WS_SEND_TIMEOUT`].
     pub ws_send_timeout: Option<Duration>,
+    /// The registered machine this hub forwards its session telemetry to
+    /// (`[telemetry] upstream`); `None`: it keeps its events to itself.
+    pub telemetry_upstream: Option<String>,
 }
 
 impl ServerOptions {
@@ -266,6 +270,14 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         machines,
         repo_scan: Arc::default(),
     };
+    if let Some(upstream) = state.options.telemetry_upstream.clone() {
+        tokio::spawn(crate::telemetry::forward::run(
+            Arc::clone(state.hub.telemetry()),
+            Arc::clone(&state.machines),
+            upstream,
+            state.shutdown.clone(),
+        ));
+    }
     let protected = Router::new()
         .route(
             "/api/workspaces",
@@ -504,6 +516,18 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route("/api/sessions/{id}/record/stop", post(record_api::stop))
         // Multiple machines: this hub's peers (remote side) and machines
         // (local side), and the proxy to them.
+        .route("/api/telemetry/fleet", get(telemetry_api::fleet))
+        .route("/api/telemetry/sessions/{id}", get(telemetry_api::session))
+        .route(
+            "/api/telemetry/sessions/{id}/events",
+            get(telemetry_api::events),
+        )
+        .route(
+            "/api/telemetry/batch",
+            post(telemetry_api::batch).layer(axum::extract::DefaultBodyLimit::max(
+                telemetry_api::BATCH_WIRE_MAX,
+            )),
+        )
         .route("/api/whoami", get(proxy::whoami))
         .route("/api/peer", delete(proxy::revoke_self))
         .route("/api/peers", get(proxy::list_peers).post(proxy::issue_peer))
@@ -554,9 +578,21 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             BodyBound::PUBLIC,
             bound_body,
         ));
+    // What agent sessions send (hooks, the progress tool): each request
+    // carries its session's report secret, checked by the handler. No
+    // browser is involved, so these sit outside the origin guard; the
+    // body is read whole within a bound, as for the public routes.
+    let agents = Router::new()
+        .route("/api/telemetry/hook", post(telemetry_api::hook))
+        .route("/api/telemetry/mcp", post(telemetry_api::progress_tool))
+        .route_layer(middleware::from_fn_with_state(
+            telemetry_api::AGENT_BODY,
+            bound_body,
+        ));
     public
         .merge(protected)
         .layer(middleware::from_fn_with_state(state.clone(), origin_guard))
+        .merge(agents)
         .layer(middleware::from_fn_with_state(
             state.clone(),
             tls_listen::plain_http_policy,

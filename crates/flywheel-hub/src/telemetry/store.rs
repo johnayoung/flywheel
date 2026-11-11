@@ -170,10 +170,7 @@ impl Store {
                     snap.status,
                     rank(&snap.status),
                     snap.last_ts,
-                    snap.usage
-                        .as_ref()
-                        .and_then(|u| u.cost_usd)
-                        .unwrap_or(0.0),
+                    snap.usage.as_ref().and_then(|u| u.cost_usd).unwrap_or(0.0),
                     snap_json,
                     state_json,
                 ])?;

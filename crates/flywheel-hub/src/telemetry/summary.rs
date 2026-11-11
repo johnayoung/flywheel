@@ -145,7 +145,11 @@ mod tests {
     #[test]
     fn each_tool_says_what_it_acts_on() {
         assert_eq!(
-            tool("Read", &json!({"file_path": "/repo/src/main.rs", "limit": 20})).as_deref(),
+            tool(
+                "Read",
+                &json!({"file_path": "/repo/src/main.rs", "limit": 20})
+            )
+            .as_deref(),
             Some("/repo/src/main.rs")
         );
         assert_eq!(
@@ -153,7 +157,11 @@ mod tests {
             Some("fn main in src")
         );
         assert_eq!(
-            tool("Agent", &json!({"description": "Map the routes", "prompt": "long"})).as_deref(),
+            tool(
+                "Agent",
+                &json!({"description": "Map the routes", "prompt": "long"})
+            )
+            .as_deref(),
             Some("Map the routes")
         );
         assert_eq!(

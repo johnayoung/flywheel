@@ -773,7 +773,17 @@ mod tests {
     #[test]
     fn the_hubs_hook_settings_have_claudes_shape() {
         let report = vec!["/x/fw".to_owned(), "hub".to_owned()];
-        assert_eq!(hooks_shape(&agent::claude_settings(&report)), Ok(()));
+        let wiring = agent::ClaudeWiring {
+            report: Some(&report),
+            ..agent::ClaudeWiring::default()
+        };
+        assert_eq!(hooks_shape(&agent::claude_settings(&wiring)), Ok(()));
+        let http = agent::ClaudeWiring {
+            hub_url: Some("http://127.0.0.1:7420"),
+            http_hooks: true,
+            ..wiring
+        };
+        assert_eq!(hooks_shape(&agent::claude_settings(&http)), Ok(()));
         let bad = |v: serde_json::Value| hooks_shape(&v).unwrap_err();
         assert!(bad(serde_json::json!({ "hooks": "notanobject" })).contains("not an object"));
         assert!(bad(serde_json::json!({ "hooks": { "Stop": {} } })).contains("not a list"));

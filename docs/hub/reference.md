@@ -120,7 +120,7 @@ fw hub plugin ls [--json]
 fw hub plugin enable NAME
 fw hub plugin disable NAME
 fw hub plugin logs NAME [--lines|-n N] [--json]
-fw hub report --source claude|codex --event E [--detail D] [--stdin] [PAYLOAD]
+fw hub report --source claude|codex --event E [--detail D] [--stdin] [--chain COMMAND] [PAYLOAD]
 fw hub perms show FOLDER|SESSION [--json] {remote}
 fw hub perms allow FOLDER|SESSION RULE... [--file local|project|user] [--agent claude|codex] [--gitignore] [--no-answer] [--yes] [--json] {remote}
 fw hub perms suggest FOLDER|SESSION [--days N] [--json] {remote}
@@ -161,7 +161,7 @@ fw hub autopilot FOLDER deny RUN [--feedback TEXT] [--gate N] [--attempt N] [--y
 | `import` | VS Code `*.code-workspace` (JSONC) `folders` (non-local skipped, listed); `--update` replaces them |
 | `open` | a one-time code via a 0600 redirect page (never argv); opener `$BROWSER`, else `wslview`, `cmd.exe /c start`, `xdg-open` / `open` |
 | `url` | a fresh code under every URL reaching the hub; `--qr` draws the first remote one; never the token |
-| `report` | the hook entry point: needs the session's env, prints nothing, fails with 1 (2 would stop a Claude `Stop`) |
+| `report` | the hook entry point: needs the session's env, prints nothing, fails with 1 (2 would stop a Claude `Stop`). `--event statusline`: Claude Code's status line; prints `--chain`'s output (your own status line command) or a short default, exits 0 |
 
 The rest: [hub-workflows](workflows.md), [hub-internals](internals.md).
 
@@ -253,6 +253,9 @@ times = ["08:00", "18:00"] # local times in timezone
 timezone = "Europe/Berlin" # IANA name; default the system's
 channels = ["push", "browser", "plugin"]
 quiet_if_empty = true      # skip a scheduled one with nothing in it
+
+[telemetry]
+upstream = "collector"     # the machine that takes this hub's session events
 ```
 
 | Key | Flag | Default | Applies |
@@ -289,6 +292,7 @@ quiet_if_empty = true      # skip a scheduled one with nothing in it
 | `digest.timezone` | - | the system's, else UTC | live |
 | `digest.channels` | - | all three | live |
 | `digest.quiet_if_empty` | - | `true` | live |
+| `telemetry.upstream` | - | none | restart |
 
 Elsewhere: push (`notify.toml`: secrets), detection overrides (`agent-detection/`), plugins (`plugins/`), UI settings (`settings.json`).
 

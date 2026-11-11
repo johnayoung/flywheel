@@ -71,6 +71,17 @@ pub struct FileConfig {
     /// Scheduled digests (see [`crate::digest`]).
     #[serde(default)]
     pub digest: crate::digest::DigestSection,
+    #[serde(default)]
+    pub telemetry: TelemetrySection,
+}
+
+/// Session telemetry (see [`crate::telemetry`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetrySection {
+    /// The registered machine (`fw hub machine add`) this hub sends its
+    /// sessions' events to: the fleet's collector.
+    pub upstream: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -391,6 +402,8 @@ pub struct Effective {
     pub queue_typing_quiet: Duration,
     pub login_days: u32,
     pub digest: crate::digest::DigestConfig,
+    /// The machine this hub forwards its telemetry to.
+    pub telemetry_upstream: Option<String>,
     sources: Vec<(&'static str, Source)>,
 }
 
@@ -437,6 +450,7 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("digest.timezone", Apply::Live),
     ("digest.channels", Apply::Live),
     ("digest.quiet_if_empty", Apply::Live),
+    ("telemetry.upstream", Apply::Restart),
 ];
 
 impl Effective {
@@ -528,6 +542,7 @@ impl Effective {
             "digest.timezone" => json!(self.digest.timezone.name()),
             "digest.channels" => json!(self.digest.channels.names()),
             "digest.quiet_if_empty" => json!(self.digest.quiet_if_empty),
+            "telemetry.upstream" => json!(self.telemetry_upstream),
             _ => Value::Null,
         }
     }
@@ -954,10 +969,26 @@ pub fn resolve(
     ] {
         sources.push((key, if set { Source::File } else { Source::Default }));
     }
+    let file_upstream = file.telemetry.upstream.as_deref().and_then(|raw| {
+        match crate::machines::validate_machine_name(raw) {
+            Ok(name) => Some(Some(name)),
+            Err(e) => {
+                errors.push(format!("telemetry.upstream: {e}"));
+                None
+            }
+        }
+    });
+    let telemetry_upstream = pick!(
+        "telemetry.upstream",
+        None::<Option<String>>,
+        file_upstream,
+        None
+    );
     if !errors.is_empty() {
         return Err(errors);
     }
     Ok(Effective {
+        telemetry_upstream,
         bind,
         port,
         public_urls,
@@ -1518,6 +1549,9 @@ times = ["08:00", "18:00"] # local times in timezone
 timezone = "Europe/Berlin" # IANA name; default the system's
 channels = ["push", "browser", "plugin"]
 quiet_if_empty = true      # skip a scheduled one with nothing in it
+
+[telemetry]
+upstream = "collector"     # the machine that takes this hub's session events
 "#;
 
 #[cfg(test)]

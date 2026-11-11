@@ -161,7 +161,19 @@ impl Tail {
     /// replies and usage in the complete lines as they are read (so a
     /// long backlog is never held whole). A missing or unreadable file
     /// reads as nothing (it is tried again at the next poll).
+    #[cfg(test)]
     fn read(&mut self, each: &mut dyn FnMut(Item)) {
+        self.read_with(each, None);
+    }
+
+    /// [`Tail::read`], also collecting into `telemetry` what a Codex
+    /// rollout's lines say the session did (see
+    /// [`crate::telemetry::codex`]).
+    fn read_with(
+        &mut self,
+        each: &mut dyn FnMut(Item),
+        mut telemetry: Option<&mut Vec<crate::telemetry::Draft>>,
+    ) {
         let Self {
             log,
             format,
@@ -172,7 +184,20 @@ impl Tail {
         let _ = log.read(None, &mut |read| match read {
             // A new file counts from nothing.
             Read::Restart => codex.total = None,
-            Read::Line { bytes, start } => line(*format, *usage_only, codex, bytes, start, each),
+            Read::Line { bytes, start } => {
+                if let Some(drafts) = telemetry
+                    .as_deref_mut()
+                    .filter(|_| *format == Format::Codex && !*usage_only)
+                    && crate::telemetry::codex::relevant(bytes)
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
+                {
+                    drafts.extend(crate::telemetry::codex::line(
+                        &value,
+                        crate::telemetry::now_ms(),
+                    ));
+                }
+                line(*format, *usage_only, codex, bytes, start, each);
+            }
         });
     }
 }
@@ -615,17 +640,22 @@ impl SessionCommands {
     fn drain(&mut self, mut tail: Tail, added: &mut Refreshed) -> Tail {
         let source = source_of(tail.format);
         let conversation = tail.conversation.clone();
-        tail.read(&mut |item| match item {
-            Item::Reply(reply) => {
-                let more = self.add(&reply, conversation.as_deref(), source, false);
-                push_bounded(&mut added.commands, more);
-                self.add_reply(&reply, conversation.as_deref(), source, added);
-            }
-            Item::Usage(turn) => {
-                let changed = self.usage().observe(&turn);
-                self.usage_changed |= changed;
-            }
-        });
+        let mut telemetry = Vec::new();
+        tail.read_with(
+            &mut |item| match item {
+                Item::Reply(reply) => {
+                    let more = self.add(&reply, conversation.as_deref(), source, false);
+                    push_bounded(&mut added.commands, more);
+                    self.add_reply(&reply, conversation.as_deref(), source, added);
+                }
+                Item::Usage(turn) => {
+                    let changed = self.usage().observe(&turn);
+                    self.usage_changed |= changed;
+                }
+            },
+            Some(&mut telemetry),
+        );
+        added.telemetry.extend(telemetry);
         tail
     }
 
@@ -749,6 +779,8 @@ pub struct Refreshed {
     /// first.
     pub replies: Vec<AgentReply>,
     pub usage_changed: bool,
+    /// What a Codex rollout's new lines say the session did.
+    pub telemetry: Vec<crate::telemetry::Draft>,
 }
 
 /// A session's replies, newest first.
@@ -1454,7 +1486,9 @@ impl Hub {
             self.emit(HubEvent::Usage {
                 session_id: record.id.clone(),
             });
+            self.record_usage_fallback(record);
         }
+        self.record_rollout(record, refreshed.telemetry);
     }
 
     /// Token usage and cost: the whole hub's and each workspace's, today,

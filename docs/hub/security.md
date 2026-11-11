@@ -6,7 +6,8 @@ Front door: [hub](../hub.md).
 
 - **The hub is a shell over HTTP.** The token, a login cookie, and a peer credential each mean a shell as you.
 - **Agents and plugins run as you, unsandboxed.** Agents never get the token but can read every state-dir file (`token`, `machines.json`): run untrusted ones as another user or containerized. Protect the state dir like `~/.ssh`; secrets 0600, the dir 0700.
-- **Status reports are advisory**: hooks report over `<state-dir>/report.sock` (unix socket, never the network) with a per-spawn secret for one session; they cannot start, stop, or change a session.
+- **Status reports are advisory**: hooks report with a per-spawn secret for one session, over `<state-dir>/report.sock` (unix socket) or as a POST to the hub from this machine (`/api/telemetry/hook`); they cannot start, stop, or change a session.
+- **Telemetry** (`telemetry.db`, 0600) keeps one scrubbed line of what each tool call acts on (a path, the start of a command; never its output) and the start of each prompt, which the activity journal never does. It goes to no plugin, digest, or share link; the token, a login, or a peer reads it, and `[telemetry] upstream` sends it to that machine.
 - The folder picker (`/api/fs/*`) lists directory names on the hub's machine (never files or contents) to whoever can create a workspace: token, login, peer; never a share link.
 - Share links show everything the terminal shows. Plugins are disabled until enabled. Held-out graders: kept out of what the hub tells agents, not out of their reach ([hub-workflows](workflows.md#fan-outs-and-flywheel-tasks)).
 

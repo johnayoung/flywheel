@@ -270,6 +270,9 @@ fn event_message(hub: &Hub, client: &str, event: HubEvent) -> Option<Message> {
         }
         HubEvent::Activity { row } => text(json!({ "type": "activity", "row": row })),
         HubEvent::Digest { id } => text(json!({ "type": "digest", "id": id })),
+        HubEvent::Telemetry { snapshot } => {
+            text(json!({ "type": "telemetry", "session": snapshot }))
+        }
         HubEvent::Sessions
         | HubEvent::Unwatched { .. }
         | HubEvent::Lifecycle { .. }

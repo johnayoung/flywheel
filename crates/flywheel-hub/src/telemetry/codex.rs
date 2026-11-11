@@ -34,7 +34,10 @@ pub fn relevant(bytes: &[u8]) -> bool {
 }
 
 fn str_of<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str).filter(|s| !s.is_empty())
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
 }
 
 fn count(value: &Value, key: &str) -> u64 {
@@ -53,6 +56,8 @@ pub fn line(value: &Value, now: i64) -> Vec<Draft> {
             harness: "codex".to_owned(),
             conversation: str_of(payload, "id").map(str::to_owned),
             model: None,
+            label: None,
+            dir: None,
         })],
         Some("turn_context") => str_of(payload, "model")
             .map(|model| {
@@ -60,6 +65,8 @@ pub fn line(value: &Value, now: i64) -> Vec<Draft> {
                     harness: "codex".to_owned(),
                     conversation: None,
                     model: Some(model.to_owned()),
+                    label: None,
+                    dir: None,
                 })
             })
             .into_iter()
@@ -225,8 +232,8 @@ fn response_item(item: &Value, ts: i64) -> Vec<Draft> {
             subagent: None,
         })],
         Some("function_call_output" | "custom_tool_call_output" | "local_shell_call_output") => {
-            let failed = exit_code(item.get("output").unwrap_or(&Value::Null))
-                .is_some_and(|code| code != 0);
+            let failed =
+                exit_code(item.get("output").unwrap_or(&Value::Null)).is_some_and(|code| code != 0);
             vec![draft(What::ToolFinished {
                 id: call_id.to_owned(),
                 // The output names no tool: the reducer pairs it by id.

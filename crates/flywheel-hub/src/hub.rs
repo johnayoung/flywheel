@@ -4,6 +4,7 @@
 mod restore;
 mod sessions;
 mod status;
+mod telemetry;
 mod workspaces;
 mod worktrees;
 
@@ -154,6 +155,8 @@ pub enum HubError {
     Token(#[from] TokenError),
     #[error(transparent)]
     Report(#[from] ReportError),
+    #[error(transparent)]
+    Telemetry(#[from] crate::telemetry::StoreError),
     #[error("internal error: {0}")]
     Internal(String),
     /// Another hub holds the state dir's serve lock.
@@ -446,6 +449,9 @@ pub enum HubEvent {
     Activity { row: serde_json::Value },
     /// A scheduled or hand-sent digest is ready (see [`crate::digest`]).
     Digest { id: String },
+    /// A session's telemetry changed: its row on the fleet board (see
+    /// [`crate::telemetry`]). At most one per session per flush.
+    Telemetry { snapshot: serde_json::Value },
 }
 
 /// Facts about the server-owned PTY (present until the session is removed
@@ -544,6 +550,11 @@ pub struct Hub {
     activity: crate::activity::Activity,
     /// Pending permission requests and their journal (`crate::perms`).
     perms: Arc<crate::perms::Runtime>,
+    /// What every agent session does (see [`crate::telemetry`]).
+    telemetry: Arc<crate::telemetry::Telemetry>,
+    /// What the telemetry capture knows beside the store (see
+    /// `hub/telemetry.rs`).
+    capture: telemetry::Capture,
     /// Hub actions recorded in their projects' stores, once the embedding
     /// binary plugged in a sink (see [`crate::audit`]).
     audit: std::sync::OnceLock<crate::audit::AuditRecorder>,
@@ -623,7 +634,21 @@ impl Hub {
             options.claude_config_dir.clone(),
             options.codex_home.clone(),
         );
+        let telemetry = Arc::new(crate::telemetry::Telemetry::open(
+            &options.state_dir,
+            &crate::machines::load_hub_id(&options.state_dir),
+        )?);
+        {
+            let events = events.clone();
+            telemetry.on_change(move |snapshot| {
+                if let Ok(snapshot) = serde_json::to_value(&snapshot) {
+                    let _ = events.send(HubEvent::Telemetry { snapshot });
+                }
+            });
+        }
         Ok(Arc::new(Self {
+            telemetry,
+            capture: telemetry::Capture::default(),
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),
                 options.codex_home.clone(),

@@ -241,6 +241,21 @@ Client sends `input` `{"data"}`, `resize` `{"cols","rows"}`, `theme` `{"foregrou
 
 Close: **4001** token rotated, **4002** logout / login expired, **4003** peer revoked, **4004** share ended, **4005** relaunched, **1012** live handoff (both: reconnect). Machine proxy: **4010** (its 4001-4003), **4011** removed, **1011** link lost.
 
+## Telemetry
+
+What every agent session does ([hub-workflows](workflows.md#fleet-and-work)).
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/telemetry/fleet[?status=&host=&hours=&limit=&offset=]` | `host` (this hub's id), `sessions` (snapshots, most urgent first), `total`, `counts` per status, `hosts`; `hours=0`: any age |
+| GET | `/api/telemetry/sessions/{id}[?host=]` | `session`: its snapshot, `work` tree, `plans`; 404 before its first event |
+| GET | `/api/telemetry/sessions/{id}/events[?host=&after=&limit=&newest=1]` | `events` by `seq`, oldest first |
+| POST | `/api/telemetry/batch` | another hub's events, NDJSON (or `Content-Encoding: deflate`) -> `received`, `accepted` |
+| POST | `/api/telemetry/hook` | a Claude Code hook's JSON; no login: `x-flywheel-session`, `x-flywheel-secret` |
+| POST | `/api/telemetry/mcp` | the progress tool (MCP over http); same headers |
+
+Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: its turn or subagent; `item`: its plan item). Kinds: `session.started`, `session.finished`, `turn.started`, `turn.finished`, `turn.failed`, `tool.started`, `tool.finished` (paired by `id`), `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
+
 ## Events WebSocket
 
 `/api/events[?client=ID]` (as `client` above; default its own). Server sends `{"type",...}`:
@@ -261,6 +276,7 @@ Close: **4001** token rotated, **4002** logout / login expired, **4003** peer re
 | `activity` | `"row"` | a journal row was written |
 | `away` | `"since","until"` | back after 10+ min: its digest span |
 | `digest` | `"id"` | a digest was sent (`GET /api/digests/{id}`) |
+| `telemetry` | `"session"`: its snapshot | a session's telemetry changed (4 a second each at most) |
 
 Client sends `{"type":"view","session_id","visible"?:[ids],"present"?}`: on screen counts as viewed; `present`: someone is at the page.
 

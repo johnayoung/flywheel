@@ -262,6 +262,10 @@ struct ReportArgs {
     /// Read the event's JSON payload from stdin (Claude Code hooks).
     #[arg(long)]
     stdin: bool,
+    /// With `--event statusline`: the user's own status line command,
+    /// run with the same input for the line that is shown.
+    #[arg(long, value_name = "COMMAND")]
+    chain: Option<String>,
     /// The event's JSON payload (Codex passes it as the last argument).
     payload: Option<String>,
 }
@@ -634,7 +638,13 @@ pub fn run_with(
     extensions: &HubExtensions,
 ) -> i32 {
     if args.first().map(String::as_str) == Some("report") {
-        return report_main(&args[1..], &mut std::io::stdin().lock(), &EnvReport, err);
+        return report_main(
+            &args[1..],
+            &mut std::io::stdin().lock(),
+            &EnvReport,
+            &mut std::io::stdout().lock(),
+            err,
+        );
     }
     // argv[0] becomes clap's bin name, so usage reads `fw hub ...`.
     let argv = std::iter::once("fw hub".to_owned()).chain(args.iter().cloned());
@@ -785,10 +795,16 @@ impl ReportEnv for EnvReport {
 /// (Claude Code parses hook stdout) and never exits 2 (which would make a
 /// `Stop` hook keep the agent going): failures are exit 1 plus a line on
 /// stderr, which the agent shows as a non-blocking hook error.
+///
+/// The one exception is `--event statusline` (Claude Code's status line
+/// runs it): its stdout is the line Claude Code shows -- the user's own
+/// command's output (`--chain`), else a short default -- and it exits 0
+/// whether or not the hub took the report.
 fn report_main(
     args: &[String],
     stdin: &mut dyn std::io::Read,
     env: &dyn ReportEnv,
+    out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
     #[derive(Debug, Parser)]
@@ -810,7 +826,15 @@ fn report_main(
             return if e.use_stderr() { 1 } else { 0 };
         }
     };
-    match send_report(cli.args, stdin, env) {
+    let status_line = cli.args.event == crate::telemetry::claude::STATUS_LINE_EVENT;
+    let chain = cli.args.chain.clone();
+    let mut input = None;
+    let sent = send_report(cli.args, stdin, env, &mut input);
+    if status_line {
+        let _ = out.write_all(&status_line_text(chain.as_deref(), input.as_deref()));
+        return 0;
+    }
+    match sent {
         Ok(()) => 0,
         Err(message) => {
             let _ = writeln!(err, "fw hub report: {message}");
@@ -819,19 +843,46 @@ fn report_main(
     }
 }
 
+/// The status line to show for `input` (the JSON Claude Code handed
+/// over): what the user's own command prints for it, else the hub's
+/// default line.
+fn status_line_text(chain: Option<&str>, input: Option<&[u8]>) -> Vec<u8> {
+    use std::process::{Command, Stdio};
+    let input = input.unwrap_or_default();
+    if let Some(command) = chain.filter(|c| !c.trim().is_empty()) {
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        if let Ok(mut child) = child {
+            if let Some(mut pipe) = child.stdin.take() {
+                // A command that reads none of it is not an error.
+                let _ = pipe.write_all(input);
+            }
+            if let Ok(output) = child.wait_with_output() {
+                return output.stdout;
+            }
+        }
+        return Vec::new();
+    }
+    let payload = serde_json::from_slice(input).unwrap_or(serde_json::Value::Null);
+    let mut line = crate::telemetry::claude::default_line(&payload).into_bytes();
+    line.push(b'\n');
+    line
+}
+
+/// Send the report; `input` is left holding the payload's bytes as read.
 fn send_report(
     args: ReportArgs,
     stdin: &mut dyn std::io::Read,
     env: &dyn ReportEnv,
+    input: &mut Option<Vec<u8>>,
 ) -> Result<(), String> {
     use crate::report;
-    let need = |name: &str| {
-        env.var(name)
-            .ok_or_else(|| format!("{name} is not set: not running inside a hub agent session"))
-    };
-    let session = need(report::SESSION_ENV)?;
-    let socket = need(report::SOCKET_ENV)?;
-    let secret = need(report::SECRET_ENV)?;
+    // Read before anything can fail: a status line shows either way.
     let raw = match (&args.payload, args.stdin) {
         (Some(payload), _) => Some(payload.clone().into_bytes()),
         (None, true) => {
@@ -844,6 +895,14 @@ fn send_report(
         }
         (None, false) => None,
     };
+    input.clone_from(&raw);
+    let need = |name: &str| {
+        env.var(name)
+            .ok_or_else(|| format!("{name} is not set: not running inside a hub agent session"))
+    };
+    let session = need(report::SESSION_ENV)?;
+    let socket = need(report::SOCKET_ENV)?;
+    let secret = need(report::SECRET_ENV)?;
     // A payload that is not JSON is dropped, not fatal: the event itself
     // still carries the status.
     let payload = raw
@@ -1126,10 +1185,44 @@ mod tests {
     }
 
     fn report_args(args: &[&str], stdin: &str, env: &FakeEnv) -> (i32, String) {
+        let (code, out, err) = report_out(args, stdin, env);
+        assert_eq!(out, "", "a hook's report prints nothing to stdout");
+        (code, err)
+    }
+
+    fn report_out(args: &[&str], stdin: &str, env: &FakeEnv) -> (i32, String, String) {
         let args: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
-        let mut err = Vec::new();
-        let code = report_main(&args, &mut stdin.as_bytes(), env, &mut err);
-        (code, String::from_utf8(err).unwrap())
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = report_main(&args, &mut stdin.as_bytes(), env, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_status_line_report_always_prints_a_line_and_exits_0() {
+        let input = r#"{"model": {"display_name": "Fable"}, "cost": {"total_cost_usd": 0.5},
+            "context_window": {"used_percentage": 9.6}}"#;
+        // Outside a hub session nothing is sent; the line still shows.
+        let none = FakeEnv(Vec::new());
+        let args = ["--source", "claude", "--event", "statusline", "--stdin"];
+        let (code, out, err) = report_out(&args, input, &none);
+        assert_eq!((code, err.as_str()), (0, ""));
+        assert_eq!(out, "Fable \u{b7} ctx 10% \u{b7} $0.50\n");
+        // The user's own command gets the same input and its output shows.
+        let chained = [
+            "--source",
+            "claude",
+            "--event",
+            "statusline",
+            "--stdin",
+            "--chain",
+            "printf 'mine: '; tr -d '\\n' | wc -c | tr -d ' '",
+        ];
+        let (code, out, _) = report_out(&chained, "{\"a\": 1}", &none);
+        assert_eq!((code, out.as_str()), (0, "mine: 8\n"));
     }
 
     #[test]

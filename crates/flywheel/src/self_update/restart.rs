@@ -2,7 +2,10 @@
 //!
 //! A `hub-worker` gets a new worker session through `POST
 //! /api/flywheel/worker` with its session's `folder`, `workspace_id`,
-//! `tasks`, and `with_prereqs`; a `hub-autopilot` restarts through `POST
+//! `tasks`, and `with_prereqs` (always with `another`: it brings back a
+//! worker this run stopped, so a sibling still running in the folder -- one
+//! left `not_stopped` by a drain timeout, or one restarted just before it --
+//! is no duplicate); a `hub-autopilot` restarts through `POST
 //! /api/flywheel/autopilot/start`. Either runs whatever binary the hub
 //! runs: the newly installed `fw` after a handoff, the previous one when a
 //! reverted run restarts what it stopped. A restart counts only once its
@@ -101,7 +104,6 @@ pub fn restart(
     no_hub: &str,
 ) -> Restarted {
     let mut out = Restarted::default();
-    let mut workers_in: Vec<std::path::PathBuf> = Vec::new();
     for process in stopped {
         if process.kind == Kind::Terminal {
             out.manual.push(manual_entry(process, install_fw, None));
@@ -125,8 +127,6 @@ pub fn restart(
             .unwrap_or_default();
         let (path, verb, body) = if process.kind == Kind::HubWorker {
             let scope = WorkerScope::of_command(&session.command).unwrap_or_default();
-            let another = workers_in.contains(&folder);
-            workers_in.push(folder.clone());
             (
                 "/api/flywheel/worker",
                 "worker",
@@ -135,7 +135,7 @@ pub fn restart(
                     "workspace_id": session.workspace_id,
                     "tasks": scope.tasks,
                     "with_prereqs": scope.with_prereqs,
-                    "another": another,
+                    "another": true,
                 }),
             )
         } else {

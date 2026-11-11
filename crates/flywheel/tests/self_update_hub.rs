@@ -617,6 +617,18 @@ fn a_refused_handoff_exits_4_and_leaves_the_hub_to_allow_restart() {
 /// the untouched hub.
 #[test]
 fn a_drain_timeout_restarts_the_other_hub_worker_on_the_previous_fw() {
+    drain_timeout_restarts_the_other_hub_worker(false);
+}
+
+/// Criterion #16 with both hub workers in one folder (the second started
+/// with `another`): the frozen worker still runs there, so the restart of
+/// the stopped one must not be refused as a duplicate worker.
+#[test]
+fn a_drain_timeout_restarts_the_other_hub_worker_of_the_same_folder() {
+    drain_timeout_restarts_the_other_hub_worker(true);
+}
+
+fn drain_timeout_restarts_the_other_hub_worker(same_folder: bool) {
     let fx = Fixture::new();
     let mut spawned = Spawned::default();
     let agent_bin = fake_claude(&fx);
@@ -639,17 +651,19 @@ fn a_drain_timeout_restarts_the_other_hub_worker_on_the_previous_fw() {
         &[&agent_bin],
     );
     let ws = workspace(&hub, "two", &[&repo_a, &repo_b]);
-    let start = |folder: &Path| {
+    let start = |folder: &Path, another: bool| {
         let (code, session) = hub.http(
             "POST",
             "/api/flywheel/worker",
-            Some(json!({ "folder": folder, "workspace_id": ws })),
+            Some(json!({ "folder": folder, "workspace_id": ws, "another": another })),
         );
         assert_eq!(code, 201, "{session}");
         session_pid(&hub, session["id"].as_str().unwrap())
     };
-    let wrapper_a = start(&repo_a);
-    let wrapper_b = start(&repo_b);
+    // The worker that stops runs in `repo_b`, or beside the frozen one.
+    let repo_b = if same_folder { repo_a.clone() } else { repo_b };
+    let wrapper_a = start(&repo_a, false);
+    let wrapper_b = start(&repo_b, same_folder);
     let frozen = worker_under(wrapper_a);
     let other = worker_under(wrapper_b);
     for pid in [wrapper_a, wrapper_b, frozen] {

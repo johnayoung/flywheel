@@ -1,0 +1,10 @@
+# nextest runs every test of every binary at once (cargo test ran one binary
+# at a time). The flywheel crate's integration tests spawn real hubs, workers
+# and agents under time budgets; dozens of them at once starve each other and
+# fail on timing. Cap that group's concurrency; unit tests stay fully parallel.
+[test-groups]
+process-heavy = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = "package(flywheel) & kind(test)"
+test-group = "process-heavy"

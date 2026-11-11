@@ -18,6 +18,7 @@ use serde_json::{Map, Value, json};
 use crate::claims::{
     ClaimStore, OrchestratorStopEventRecord, RESOLUTION_ATTRIBUTIONS, STOP_RESOLVED,
 };
+use crate::landing_queue::{LandingQueue, LandingState, LandingView};
 use crate::orchestrate::unlanded_prerequisite_holds;
 use crate::rollup::{build_rollup_landed, render_rollup_text, rollup_to_json};
 use crate::sources::WorkItem;
@@ -195,6 +196,32 @@ fn live_worker_ids(
         .collect())
 }
 
+/// The `landing` object of a queued task's `--json` entry:
+/// `{state, position, queued_at, batch: null|{id, index, size}}`.
+fn landing_json(view: &LandingView) -> Value {
+    json!({
+        "state": view.state.as_str(),
+        "position": view.position,
+        "queued_at": view.queued_at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+        "batch": view.batch.as_ref().map(|batch| json!({
+            "id": batch.id,
+            "index": batch.index,
+            "size": batch.size,
+        })),
+    })
+}
+
+/// The text form's `landing:` value: `queued #<position>` while waiting,
+/// `batch <id> <index>/<size>` while its batch is under the standing verify.
+fn landing_text(view: &LandingView) -> String {
+    match (view.state, &view.batch) {
+        (LandingState::Verifying, Some(batch)) => {
+            format!("batch {} {}/{}", batch.id, batch.index, batch.size)
+        }
+        _ => format!("queued #{}", view.position),
+    }
+}
+
 fn stop_json(stop: &OrchestratorStopEventRecord) -> Value {
     json!({"kind": stop.kind, "detail": stop.detail})
 }
@@ -279,18 +306,24 @@ fn cmd_status_rollup(
 /// their own `[no active row]` entries. An attributed resolution marker
 /// clears a strand; a park appended after it is a fresh recurrence. The
 /// text form leads with one `session-pause:` line per active pause; the
-/// `--json` array is unchanged.
+/// `--json` array is unchanged. A task with a live entry in
+/// `landing_queue` (spec 00089) carries `landing: queued #<position>` /
+/// `landing: batch <id> <index>/<size>` and the `--json` `landing` object;
+/// every other task carries neither.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_status(
     args: &StatusArgs,
     items: &[WorkItem],
     store: &dyn HarnessStore,
     claims: &dyn ClaimStore,
+    landing_queue: Option<&LandingQueue>,
     repo_root: Option<&Path>,
     true_base: Option<&str>,
     out: &mut dyn Write,
 ) -> Result<i32, WorkflowError> {
     let rows = status_rows(items, store)?;
-    let landing_holds = waiting_on_landing(&rows, store, claims, Utc::now())?;
+    let now = Utc::now();
+    let landing_holds = waiting_on_landing(&rows, store, claims, now)?;
     if args.rollup {
         return cmd_status_rollup(
             args,
@@ -303,6 +336,12 @@ pub fn cmd_status(
         );
     }
     let worker_ids = live_worker_ids(store)?;
+    let landing: BTreeMap<String, LandingView> = match landing_queue {
+        Some(queue) => queue
+            .landing_views(claims, now)
+            .map_err(|err| WorkflowError::Message(format!("reading the landing queue: {err}")))?,
+        None => BTreeMap::new(),
+    };
 
     // One ledger read per DONE run, shared by the per-row annotation and
     // the store-backed strand surface.
@@ -419,6 +458,9 @@ pub fn cmd_status(
             if let Some(stop) = stops_by_subject.get(row.task_id()) {
                 entry.insert("stopped".into(), stop_json(stop));
             }
+            if let Some(view) = landing.get(row.task_id()) {
+                entry.insert("landing".into(), landing_json(view));
+            }
             entries.push(Value::Object(entry));
         }
         for (subject, stop) in &stops_by_subject {
@@ -472,6 +514,9 @@ pub fn cmd_status(
         }
         if let Some(unlanded) = landing_holds.get(row.task_id()) {
             writeln!(out, "    waiting_on_landing: {}", unlanded.join(", "))?;
+        }
+        if let Some(view) = landing.get(row.task_id()) {
+            writeln!(out, "    landing: {}", landing_text(view))?;
         }
         if let Some(park) = row
             .status
@@ -585,7 +630,7 @@ mod tests {
             ..StatusArgs::default()
         };
         let mut out = Vec::new();
-        let code = cmd_status(&args, &items, store, claims, None, None, &mut out).unwrap();
+        let code = cmd_status(&args, &items, store, claims, None, None, None, &mut out).unwrap();
         assert_eq!(code, 0);
         String::from_utf8(out).unwrap()
     }
@@ -1334,6 +1379,253 @@ mod tests {
         assert!(parse_blocked_requires(Some("nope")).is_none());
     }
 
+    // --- landing queue (spec 00089) ---------------------------------------
+
+    /// `fw status` over a listing of DONE tasks `a`, `b`, `c` with the
+    /// landing queue at `queue`.
+    fn landing_status(
+        tmp: &TempDir,
+        store: &InMemoryStore,
+        claims: &InMemoryClaimStore,
+        queue: &LandingQueue,
+        json: bool,
+    ) -> String {
+        let items = DirectoryWorkSource::new(tmp.path().join("tasks"))
+            .list_work()
+            .unwrap();
+        let args = StatusArgs {
+            json,
+            ..StatusArgs::default()
+        };
+        let mut out = Vec::new();
+        let code = cmd_status(
+            &args,
+            &items,
+            store,
+            claims,
+            Some(queue),
+            None,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        String::from_utf8(out).unwrap()
+    }
+
+    fn landing_scenario() -> (TempDir, InMemoryStore, InMemoryClaimStore, LandingQueue) {
+        let tmp = TempDir::new().unwrap();
+        let ph = tmp.path().join("tasks").join("active").join("01-phase");
+        let store = InMemoryStore::new();
+        for task in ["a", "b", "c"] {
+            write_task(&ph.join(format!("{task}.json")), task, &[]);
+            seed_done(&store, task);
+        }
+        let queue = LandingQueue::at(tmp.path().join("queue"));
+        (tmp, store, InMemoryClaimStore::new(), queue)
+    }
+
+    /// Hold `task_id`'s claim as `worker` with a lease well past now.
+    fn hold_claim(claims: &InMemoryClaimStore, task_id: &str, worker: &str) {
+        claims
+            .acquire_claim(
+                task_id,
+                worker,
+                Utc::now(),
+                3_600.0,
+                &crate::claims::conflict_keys::<_, String>([]),
+            )
+            .unwrap()
+            .expect("claim acquired");
+    }
+
+    /// Enqueue `task_id`'s DONE run as owned by `owner`, `secs` after `t0()`.
+    fn enqueue(
+        queue: &LandingQueue,
+        task_id: &str,
+        owner: &str,
+        secs: i64,
+    ) -> crate::landing_queue::QueueEntry {
+        let task = Task::new(
+            format!("land {task_id}"),
+            vec![Grader::Command(CommandGrader::new("true").unwrap())],
+        )
+        .with_id(task_id);
+        let request = crate::strategy::SubmitRequest::new(
+            task,
+            format!("run-{task_id}-ok"),
+            Status::Done,
+            format!("/wt/{task_id}"),
+        );
+        queue
+            .enqueue(&request, owner, t0() + Duration::seconds(secs))
+            .unwrap()
+    }
+
+    fn entry_for(payload: &[Value], task_id: &str) -> Value {
+        payload
+            .iter()
+            .find(|e| e["task_id"] == json!(task_id))
+            .cloned()
+            .unwrap()
+    }
+
+    #[test]
+    fn landing_status_gives_each_queued_task_its_fifo_position() {
+        let (tmp, store, claims, queue) = landing_scenario();
+        hold_claim(&claims, "a", "w1");
+        hold_claim(&claims, "b", "w2");
+        // b queued first: it is #1 even though a sorts first by id.
+        enqueue(&queue, "a", "w1", 20);
+        enqueue(&queue, "b", "w2", 10);
+
+        let text = landing_status(&tmp, &store, &claims, &queue, false);
+        assert!(
+            text.contains("  01-phase/a  done             \n    landing: queued #2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  01-phase/b  done             \n    landing: queued #1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("  01-phase/c  done             \n")
+                && !text.contains("c  done             \n    landing:"),
+            "{text}"
+        );
+        assert_eq!(text.matches("landing:").count(), 2, "{text}");
+
+        let payload: Vec<Value> =
+            serde_json::from_str(&landing_status(&tmp, &store, &claims, &queue, true)).unwrap();
+        assert_eq!(
+            entry_for(&payload, "a")["landing"],
+            json!({
+                "state": "queued",
+                "position": 2,
+                "queued_at": "2026-07-08T12:00:20Z",
+                "batch": null,
+            })
+        );
+        assert_eq!(
+            entry_for(&payload, "b")["landing"],
+            json!({
+                "state": "queued",
+                "position": 1,
+                "queued_at": "2026-07-08T12:00:10Z",
+                "batch": null,
+            })
+        );
+        // Every pre-existing key is still carried.
+        let a = entry_for(&payload, "a");
+        for key in [
+            "task_id",
+            "task_file",
+            "source_ref",
+            "state",
+            "latest_run_id",
+            "latest_status",
+            "latest_error",
+            "prerequisites",
+        ] {
+            assert!(a.get(key).is_some(), "missing {key}: {a}");
+        }
+    }
+
+    #[test]
+    fn landing_status_shows_batch_id_index_and_size_while_verifying() {
+        let (tmp, store, claims, queue) = landing_scenario();
+        hold_claim(&claims, "a", "w1");
+        hold_claim(&claims, "b", "w2");
+        hold_claim(&claims, "c", "w3");
+        let a = enqueue(&queue, "a", "w1", 10);
+        let b = enqueue(&queue, "b", "w2", 20);
+        enqueue(&queue, "c", "w3", 30);
+        let batch = |index| flywheel_core::events::LandedBatch {
+            id: "batch-7".to_owned(),
+            index,
+            size: 2,
+        };
+        queue.mark_verifying(&a, batch(1)).unwrap();
+        queue.mark_verifying(&b, batch(2)).unwrap();
+
+        let text = landing_status(&tmp, &store, &claims, &queue, false);
+        assert!(
+            text.contains("01-phase/a  done             \n    landing: batch batch-7 1/2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("01-phase/b  done             \n    landing: batch batch-7 2/2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("01-phase/c  done             \n    landing: queued #3\n"),
+            "{text}"
+        );
+
+        let payload: Vec<Value> =
+            serde_json::from_str(&landing_status(&tmp, &store, &claims, &queue, true)).unwrap();
+        assert_eq!(
+            entry_for(&payload, "b")["landing"],
+            json!({
+                "state": "verifying",
+                "position": 2,
+                "queued_at": "2026-07-08T12:00:20Z",
+                "batch": {"id": "batch-7", "index": 2, "size": 2},
+            })
+        );
+        assert_eq!(
+            entry_for(&payload, "c")["landing"]["state"],
+            json!("queued")
+        );
+        assert_eq!(entry_for(&payload, "c")["landing"]["position"], json!(3));
+    }
+
+    #[test]
+    fn landing_status_is_omitted_when_not_queued() {
+        let (tmp, store, claims, queue) = landing_scenario();
+        // An empty (absent) queue: every DONE task carries no landing.
+        let text = landing_status(&tmp, &store, &claims, &queue, false);
+        assert!(!text.contains("landing:"), "{text}");
+        let payload: Vec<Value> =
+            serde_json::from_str(&landing_status(&tmp, &store, &claims, &queue, true)).unwrap();
+        assert!(
+            payload.iter().all(|e| e.get("landing").is_none()),
+            "{payload:?}"
+        );
+
+        // Only the queued one gains it; the landed ones without an entry don't.
+        hold_claim(&claims, "b", "w2");
+        enqueue(&queue, "b", "w2", 10);
+        let payload: Vec<Value> =
+            serde_json::from_str(&landing_status(&tmp, &store, &claims, &queue, true)).unwrap();
+        assert!(entry_for(&payload, "a").get("landing").is_none());
+        assert!(entry_for(&payload, "c").get("landing").is_none());
+        assert_eq!(entry_for(&payload, "b")["landing"]["position"], json!(1));
+    }
+
+    #[test]
+    fn landing_status_drops_a_dead_owner_entry() {
+        let (tmp, store, claims, queue) = landing_scenario();
+        // a's owner holds no claim; c's claim is held by another worker.
+        enqueue(&queue, "a", "w-dead", 10);
+        hold_claim(&claims, "c", "w-other");
+        enqueue(&queue, "c", "w3", 15);
+        hold_claim(&claims, "b", "w2");
+        enqueue(&queue, "b", "w2", 20);
+
+        let text = landing_status(&tmp, &store, &claims, &queue, false);
+        assert_eq!(text.matches("landing:").count(), 1, "{text}");
+        assert!(
+            text.contains("01-phase/b  done             \n    landing: queued #1\n"),
+            "{text}"
+        );
+        let payload: Vec<Value> =
+            serde_json::from_str(&landing_status(&tmp, &store, &claims, &queue, true)).unwrap();
+        assert!(entry_for(&payload, "a").get("landing").is_none());
+        assert!(entry_for(&payload, "c").get("landing").is_none());
+        assert_eq!(entry_for(&payload, "b")["landing"]["position"], json!(1));
+    }
+
     /// Two parked DONE prerequisites (`p2` listed before `p1` in `dep`'s
     /// prerequisites), one landed-clean DONE prerequisite `q` with its own
     /// dependent `free`.
@@ -1550,6 +1842,7 @@ mod tests {
             &[],
             &InMemoryStore::new(),
             claims,
+            None,
             None,
             None,
             &mut out,

@@ -974,13 +974,8 @@ fn run_orchestrate_pass(request: OrchestrateRequest<'_>, err: &mut dyn Write) ->
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
     // The project's merge lock; an explicit --db/--tasks-dir run (no
     // project) locks beside its store.
-    let lock_path = policy
-        .as_deref()
-        .and_then(|p| p.project.as_ref())
-        .map_or_else(
-            || db_parent.join(".merge.lock"),
-            |project| project.paths().merge_lock(),
-        );
+    let lock_path =
+        flywheel_orchestrator::workflow::resolve_merge_lock_path(policy.as_deref(), &db_path);
     if let Err(failure) =
         std::fs::create_dir_all(&worktrees_dir).and_then(|()| std::fs::create_dir_all(&db_parent))
     {

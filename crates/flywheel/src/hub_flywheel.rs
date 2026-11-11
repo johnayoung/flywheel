@@ -551,7 +551,7 @@ fn status_entries(
         rollup: false,
     };
     let mut out: Vec<u8> = Vec::new();
-    cmd_status(&args, items, core, claims, Some(root), None, &mut out)
+    cmd_status(&args, items, core, claims, None, Some(root), None, &mut out)
         .map_err(|e| format!("reading task status: {e}"))?;
     serde_json::from_slice(&out).map_err(|e| format!("reading task status: {e}"))
 }

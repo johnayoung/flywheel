@@ -1330,7 +1330,9 @@ pub fn table_widths(labels: &[&str], cells: &[[String; 7]]) -> Vec<Constraint> {
 }
 
 fn status_style(status: &str) -> Option<Style> {
-    if status == Status::Running.as_str() {
+    if status.starts_with("landing #") {
+        Some(Style::default().fg(Color::Magenta))
+    } else if status == Status::Running.as_str() {
         Some(
             Style::default()
                 .fg(Color::Green)
@@ -1471,7 +1473,8 @@ pub fn format_autopilot_status(status: &DaemonStatus, now: f64) -> Span<'static>
 }
 
 /// The summary header: one line so it stays readable on narrow terminals;
-/// counts roll up to match `flywheel status`. Zero counts render dim so
+/// counts roll up to match `flywheel status`; `landing=` counts the tasks
+/// in the machine's landing queue. Zero counts render dim so
 /// the populated ones carry the eye; `failed` goes red once non-zero.
 pub fn format_summary(summary: &SummaryData) -> Line<'static> {
     let queued = summary.count("fresh");
@@ -1516,6 +1519,11 @@ pub fn format_summary(summary: &SummaryData) -> Line<'static> {
             "runtime={}",
             format_duration(summary.runtime_seconds)
         )),
+        Span::raw("  "),
+        Span::styled(
+            format!("landing={}", summary.landing),
+            pick(summary.landing > 0, Style::default().fg(Color::Magenta)),
+        ),
     ])
 }
 
@@ -1629,6 +1637,7 @@ mod tests {
                 tokens_total: 0,
                 cost_usd_total: 0.0,
                 runtime_seconds: 0,
+                landing: 0,
             },
             rows: rows.to_vec(),
             pauses: Vec::new(),
@@ -1866,6 +1875,7 @@ mod tests {
                 tokens_total: 12345,
                 cost_usd_total: 1.2345,
                 runtime_seconds: 125,
+                landing: 0,
             },
             rows: vec![row("alpha"), row("beta")],
             pauses: Vec::new(),
@@ -1883,6 +1893,65 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("> alpha  running  1/2           3s   42      $0.1230  ASSISTANT Edit(file_path=README.md)"), "{text}");
+    }
+
+    #[test]
+    fn console_landing_header_counts_and_rows_each_queued_task() {
+        use crate::snapshot::apply_landing;
+        use flywheel_core::lifecycle::Status;
+        use flywheel_core::task::{CommandGrader, Grader, Task};
+        use flywheel_orchestrator::claims::{ClaimStore, InMemoryClaimStore, conflict_keys};
+        use flywheel_orchestrator::landing_queue::LandingQueue;
+        use flywheel_orchestrator::strategy::SubmitRequest;
+
+        let now = Utc::now();
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = LandingQueue::at(tmp.path());
+        let claims = InMemoryClaimStore::new();
+        // beta queued before gamma: #1 and #2 in queued_at order, not id order.
+        for (task_id, worker, ago) in [("gamma", "w1", 10), ("beta", "w2", 30)] {
+            claims
+                .acquire_claim(
+                    task_id,
+                    worker,
+                    now,
+                    3_600.0,
+                    &conflict_keys::<_, String>([]),
+                )
+                .unwrap()
+                .expect("claim acquired");
+            let task = Task::new(
+                format!("land {task_id}"),
+                vec![Grader::Command(CommandGrader::new("true").unwrap())],
+            )
+            .with_id(task_id);
+            let request = SubmitRequest::new(task, format!("run-{task_id}"), Status::Done, "/wt");
+            queue
+                .enqueue(&request, worker, now - chrono::Duration::seconds(ago))
+                .unwrap();
+        }
+        let mut snap = snapshot(&[row("alpha")]);
+        apply_landing(&mut snap, &queue.live_entries(&claims, now).unwrap(), now);
+        assert_eq!(snap.summary.landing, 2);
+
+        let mut app = DashboardApp::new(move || Ok(snap.clone()));
+        app.refresh_now();
+        let mut term = terminal(120, 10);
+        term.draw(|f| app.render(f)).unwrap();
+        let text = buffer_text(&term);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains("landing=2"), "{text}");
+        let row_of = |task: &str| {
+            lines
+                .iter()
+                .find(|l| l.trim_start_matches("> ").trim_start().starts_with(task))
+                .copied()
+                .unwrap_or_else(|| panic!("no {task} row: {text}"))
+        };
+        assert!(row_of("beta").contains("landing #1"), "{text}");
+        assert!(row_of("gamma").contains("landing #2"), "{text}");
+        assert!(row_of("alpha").contains("running"), "{text}");
+        assert_eq!(text.matches("landing #").count(), 2, "{text}");
     }
 
     #[test]

@@ -386,8 +386,17 @@ fn bench_operator_status(c: &mut Criterion) {
     let claims = SqliteClaimStore::open(dir.path().join("claims.db")).expect("open claim store");
     let args = StatusArgs::default();
     let mut rendered = Vec::new();
-    let code = cmd_status(&args, &items, &store, &claims, None, None, &mut rendered)
-        .expect("status renders");
+    let code = cmd_status(
+        &args,
+        &items,
+        &store,
+        &claims,
+        None,
+        None,
+        None,
+        &mut rendered,
+    )
+    .expect("status renders");
     assert_eq!(code, 0);
     let text = String::from_utf8(rendered).expect("utf-8 status");
     let strands = STATUS_DONE_RUNS.div_ceil(STATUS_PARK_EVERY * STATUS_STRAND_EVERY);
@@ -410,6 +419,7 @@ fn bench_operator_status(c: &mut Criterion) {
                 black_box(&items),
                 &store,
                 &claims,
+                None,
                 None,
                 None,
                 &mut out,

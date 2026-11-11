@@ -18,6 +18,7 @@ use flywheel_core::lifecycle::{Lifecycle, Status};
 use flywheel_core::store::{LifecycleFilter, LifecycleStore, StoreError, TaskStore};
 use flywheel_core::task::Grader;
 use flywheel_core::telemetry_file::{JsonStyle, python_json_dumps};
+use flywheel_orchestrator::landing_queue::{LandingState, QueueEntry, landing_views};
 use flywheel_orchestrator::rollup::status_rows_for_items;
 use flywheel_orchestrator::sources::{WorkItem, WorkReport, WorkSource, WorkSourceError};
 use flywheel_orchestrator::workflow::PauseEntry;
@@ -210,6 +211,9 @@ pub struct SummaryData {
     pub tokens_total: u64,
     pub cost_usd_total: f64,
     pub runtime_seconds: i64,
+    /// Tasks in the machine's landing queue (spec 00089): the console
+    /// header's `landing=<N>`. Filled by [`apply_landing`].
+    pub landing: usize,
 }
 
 impl SummaryData {
@@ -221,6 +225,7 @@ impl SummaryData {
             tokens_total: 0,
             cost_usd_total: 0.0,
             runtime_seconds: 0,
+            landing: 0,
         }
     }
 
@@ -318,12 +323,65 @@ pub fn build_snapshot<S: LifecycleStore + TaskStore + ?Sized>(
         // would render as `-0.0`.
         cost_usd_total: live.iter().fold(0.0, |total, r| total + r.cost_usd_total),
         runtime_seconds: elapsed_seconds(now, started_at),
+        landing: 0,
     };
     Ok(DashboardSnapshot {
         summary,
         rows,
         pauses: Vec::new(),
     })
+}
+
+/// The `last_kind` of a landing-queue row.
+pub const LANDING_ROW_KIND: &str = "LANDING";
+
+/// The console status of a queued task: `landing #<position>`.
+pub fn landing_status(position: u32) -> String {
+    format!("landing #{position}")
+}
+
+/// Fold the machine's live landing-queue `entries` (the
+/// [`flywheel_orchestrator::landing_queue::LandingQueue::live_entries`]
+/// read) into `snapshot`: one row per queued task whose status reads
+/// `landing #<position>` (position from
+/// [`landing_views`]), and the header's landing count. Rows stay sorted by
+/// `(task_id, run_id)`.
+pub fn apply_landing(snapshot: &mut DashboardSnapshot, entries: &[QueueEntry], now: DateTime<Utc>) {
+    let views = landing_views(entries);
+    for entry in entries {
+        let Some(view) = views.get(&entry.task_id) else {
+            continue;
+        };
+        let last_detail = match (view.state, &view.batch) {
+            (LandingState::Verifying, Some(batch)) => {
+                format!("batch {} {}/{}", batch.id, batch.index, batch.size)
+            }
+            _ => LandingState::Queued.as_str().to_owned(),
+        };
+        snapshot.rows.push(RowSnapshot {
+            run_id: entry.run_id.clone(),
+            task_id: entry.task_id.clone(),
+            status: landing_status(view.position),
+            attempt: None,
+            iteration: None,
+            age_seconds: Some(elapsed_seconds(now, view.queued_at)),
+            idle_seconds: None,
+            tokens: 0,
+            cost_usd: 0.0,
+            turns: 0,
+            iterations_completed: 0,
+            last_kind: LANDING_ROW_KIND.to_owned(),
+            last_detail,
+            awaiting_instruction: None,
+            awaiting_gate: None,
+        });
+    }
+    snapshot.rows.sort_by(|a, b| {
+        a.task_id
+            .cmp(&b.task_id)
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
+    snapshot.summary.landing = views.len();
 }
 
 /// Render a snapshot as plain JSON data with stable field names: scripts
@@ -981,6 +1039,7 @@ mod tests {
                 tokens_total: 0,
                 cost_usd_total: 1.5,
                 runtime_seconds: 3,
+                landing: 0,
             },
             rows: Vec::new(),
             pauses: Vec::new(),

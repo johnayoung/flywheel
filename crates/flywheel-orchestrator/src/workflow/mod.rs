@@ -450,6 +450,21 @@ pub fn resolve_work_source(
     .into())
 }
 
+/// The landing lock every worker of a store serializes on: the policy's
+/// project merge lock, else (an explicit `--db`/`--tasks-dir` run, no
+/// project) a `.merge.lock` beside the store at `db_path`.
+pub fn resolve_merge_lock_path(policy: Option<&WorkPolicy>, db_path: &Path) -> PathBuf {
+    policy.and_then(|p| p.project.as_ref()).map_or_else(
+        || {
+            db_path
+                .parent()
+                .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+                .join(".merge.lock")
+        },
+        |project| project.paths().merge_lock(),
+    )
+}
+
 /// Resolve the SQLite store path with orchestrate's precedence: the
 /// explicit `--db` flag, else the policy's store (the home project's
 /// `flywheel.sqlite`), else [`DEFAULT_DB_PATH`] (direct library callers
@@ -927,11 +942,15 @@ pub fn dispatch(
             let items = source.list_work()?;
             let (repo_root, true_base) =
                 reachability_context(args.common.tasks_dir.as_deref(), policy.as_ref());
+            let landing_queue = crate::landing_queue::LandingQueue::beside_lock(
+                &resolve_merge_lock_path(policy.as_ref(), &db_path),
+            );
             cmd_status(
                 &args,
                 &items,
                 &*stores.core,
                 &*stores.claims,
+                Some(&landing_queue),
                 Some(&repo_root),
                 Some(&true_base),
                 out,

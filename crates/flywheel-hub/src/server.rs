@@ -519,6 +519,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         // (local side), and the proxy to them.
         .route("/api/telemetry/fleet", get(telemetry_api::fleet))
         .route("/api/telemetry/lanes", get(telemetry_api::lanes))
+        .route("/api/telemetry/insights", get(telemetry_api::insights))
         .route(
             "/api/telemetry/capture/hooks",
             get(telemetry_api::capture_hooks),

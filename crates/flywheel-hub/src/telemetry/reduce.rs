@@ -469,7 +469,23 @@ impl SessionState {
         // A finish that names no call id the reducer knows (or no tool:
         // Codex's outputs) is paired with the oldest running call of its
         // name, else of its agent.
-        if let What::ToolFinished { id, name, .. } = &mut event.what {
+        // Whether the agent measured a finished call itself (the reducer
+        // fills the measure in below when it did not).
+        let measured = matches!(
+            &event.what,
+            What::ToolFinished {
+                duration_ms: Some(_),
+                ..
+            }
+        );
+        if let What::ToolFinished {
+            id,
+            name,
+            summary,
+            duration_ms,
+            ..
+        } = &mut event.what
+        {
             let known = self.open.iter().find(|o| o.id == *id);
             let paired = known.or_else(|| {
                 self.open
@@ -480,6 +496,12 @@ impl SessionState {
             if let Some(open) = paired {
                 id.clone_from(&open.id);
                 name.clone_from(&open.name);
+                if summary.is_none() {
+                    summary.clone_from(&open.summary);
+                }
+                if duration_ms.is_none() {
+                    *duration_ms = u64::try_from(ts - open.ts).ok();
+                }
             } else if name.is_empty() {
                 "tool".clone_into(name);
             }
@@ -633,6 +655,7 @@ impl SessionState {
                 name,
                 outcome,
                 duration_ms,
+                summary: _,
                 error,
                 tokens,
             } => {
@@ -652,7 +675,7 @@ impl SessionState {
                     .is_some_and(|w| w.tool.as_deref().is_none_or(|t| t == name))
                 {
                     let ran = i64::try_from(took).unwrap_or(0);
-                    self.close_wait(if duration_ms.is_some() { ts - ran } else { ts });
+                    self.close_wait(if measured { ts - ran } else { ts });
                 }
                 let work = match open.and_then(|o| o.work) {
                     Some(work) => work,

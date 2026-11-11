@@ -31,9 +31,11 @@ pub mod claude;
 pub mod codex;
 pub mod event;
 pub mod forward;
+pub mod insights;
 pub mod lanes;
 pub mod mcp;
 pub mod reduce;
+pub mod shape;
 pub mod store;
 pub mod summary;
 #[cfg(test)]
@@ -292,6 +294,17 @@ impl Telemetry {
             limit,
             newest,
         )
+    }
+
+    /// Where time and money went (see [`insights`]).
+    pub fn insights(
+        &self,
+        since: i64,
+        host: Option<&str>,
+        project: Option<&str>,
+    ) -> Result<insights::Insights, StoreError> {
+        self.flush();
+        lock(&self.inner.read).insights(since, host, project)
     }
 
     /// A page of the fleet board.

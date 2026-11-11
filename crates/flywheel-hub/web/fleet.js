@@ -26,6 +26,10 @@
 // grouped by project, batches of captured runs as one card. They come
 // from GET /api/telemetry/lanes (the CLI's `fw hub fleet --lanes`), read
 // again on each push (at most every 1.5 s) and every 15 s.
+//
+// Insights say where time and money went (GET /api/telemetry/insights,
+// `fw hub insights`): per project, tool time by command, polling, what
+// keeps failing, files written again and again, and the context tax.
 // app-base.js creates it with its helpers.
 "use strict";
 
@@ -49,7 +53,9 @@ window.FwHubFleet = function (ctx) {
     rows: [], // { key, machine, snap }, most urgent first
     batches: [], // { key, machine, batch }, the latest active first
     opened: new Map(), // batch row key -> its runs' rows (null while loading)
-    view: localStorage.getItem("fw-fleet-view") === "list" ? "list" : "lanes",
+    view: ["list", "insights"].includes(localStorage.getItem("fw-fleet-view")) ? localStorage.getItem("fw-fleet-view") : "lanes",
+    insights: null, // the last insights page
+    insightHours: 168,
     lanes: null, // the last lanes page
     lanesSeq: 0,
     lanesTimer: 0,
@@ -65,6 +71,7 @@ window.FwHubFleet = function (ctx) {
   const dialog = $("#dlg-fleet");
   const list = $("#fl-list");
   const board = $("#fl-lanes");
+  const report = $("#fl-insights");
 
   const keyOf = (machine, snap) => `${machine || ""}|${snap.host}|${snap.session}`;
   const costOf = (snap) => (snap.usage && snap.usage.cost_usd) || 0;
@@ -568,9 +575,18 @@ window.FwHubFleet = function (ctx) {
   function render() {
     renderViews();
     const lanes = ui.view === "lanes";
-    $("#fl-filters").hidden = lanes;
-    list.hidden = lanes;
+    const insights = ui.view === "insights";
+    $("#fl-filters").hidden = lanes || insights;
+    list.hidden = lanes || insights;
     board.hidden = !lanes;
+    report.hidden = !insights;
+    if (insights) {
+      renderStatus();
+      const hours = ui.insightHours;
+      $("#fl-sum").replaceChildren(el("b", { textContent: hours % 24 ? `last ${hours} h` : `last ${hours / 24 === 1 ? "24 h" : `${hours / 24} days`}` }), " where time and money went");
+      renderInsights();
+      return;
+    }
     if (lanes) {
       renderStatus();
       const page = ui.lanes;
@@ -721,8 +737,92 @@ window.FwHubFleet = function (ctx) {
     )));
   }
 
+  // --- insights ------------------------------------------------------------
+
+  async function loadInsights() {
+    const seq = ++ui.lanesSeq;
+    try {
+      const page = await rawApi("GET", `/api/telemetry/insights?hours=${ui.insightHours}`);
+      if (seq !== ui.lanesSeq || !dialog.open) return;
+      ui.insights = page.insights;
+      ui.error = "";
+    } catch (error) {
+      if (seq !== ui.lanesSeq) return;
+      ui.error = error.message;
+    }
+    if (ui.view === "insights") render();
+  }
+
+  const took = (ms) => {
+    const s = Math.floor((ms || 0) / 1000);
+    if (s < 60) return `${s}s`;
+    if (s < 3600) return `${Math.floor(s / 60)}m`;
+    return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+  };
+  const tokens = (n) => (n >= 1e7 ? `${Math.round(n / 1e6)}M` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n || 0));
+  const pctOf = (part, whole) => (whole > 0 ? Math.round((part / whole) * 100) : 0);
+  const shapeName = (row) => row.shape || row.tool;
+
+  // One section: a heading, a note, and rows of cells.
+  function section(title, note, head, rows) {
+    if (!rows.length) return null;
+    return el(
+      "section",
+      { className: "fl-ins" },
+      el("h3", { className: "fl-lane-head" }, el("span", { textContent: title })),
+      note ? el("p", { className: "fl-ins-note", textContent: note }) : null,
+      el(
+        "table",
+        { className: "fl-ins-table" },
+        el("thead", {}, el("tr", {}, ...head.map(([label, num]) => el("th", { className: num ? "fl-num" : "", textContent: label })))),
+        el("tbody", {}, ...rows.map((cells) => el("tr", {}, ...cells.map(([text, num, extra]) => el("td", { className: `${num ? "fl-num" : ""} ${extra || ""}`.trim(), textContent: text, title: text }))))),
+      ),
+    );
+  }
+
+  function renderInsights() {
+    const found = ui.insights;
+    const windows = el("div", { className: "search-filters fl-filters" }, ...[[24, "24 h"], [168, "7 days"], [720, "30 days"]].map(([hours, label]) => el("button", {
+      type: "button",
+      className: "chip fl-chip",
+      "aria-pressed": String(ui.insightHours === hours),
+      textContent: label,
+      onclick: () => {
+        ui.insightHours = hours;
+        loadInsights();
+        render();
+      },
+    })));
+    if (!found) {
+      report.replaceChildren(windows, el("p", { className: "act-empty", textContent: ui.error ? "" : "Loading..." }));
+      return;
+    }
+    if (!found.projects.length) {
+      report.replaceChildren(windows, el("p", { className: "act-empty", textContent: "Nothing recorded in this window." }));
+      return;
+    }
+    const toolMs = found.projects.reduce((n, p) => n + p.tool_ms, 0);
+    const poll = found.polling;
+    const ctxTax = found.context;
+    report.replaceChildren(
+      windows,
+      section("Projects", "", [["project"], ["sessions", 1], ["tool time", 1], ["calls", 1], ["failed", 1], ["cost", 1]],
+        found.projects.map((p) => [[p.project], [String(p.sessions), 1], [took(p.tool_ms), 1], [String(p.calls), 1], [String(p.errors), 1, p.errors ? "fl-err" : ""], [dollars(p.cost_usd), 1]])),
+      section("Time by command", poll.ms ? `Polling (sleep, until, while loops) took ${took(poll.ms)}: ${pctOf(poll.ms, poll.shell_ms)}% of shell time. Blocking on the event itself (gh run watch, wait) or a background run frees the turn.` : "",
+        [["command"], ["time", 1], ["share", 1], ["calls", 1], ["sessions", 1], ["failed", 1]],
+        found.time.map((row) => [[shapeName(row), 0, row.shape === "poll" ? "fl-err" : ""], [took(row.ms), 1], [`${pctOf(row.ms, toolMs)}%`, 1], [String(row.calls), 1], [String(row.sessions), 1], [String(row.errors || ""), 1]])),
+      section("Keeps failing", "", [["command"], ["failed", 1], ["of", 1], ["last error"]],
+        found.failing.map((row) => [[shapeName(row)], [String(row.errors), 1, "fl-err"], [String(row.calls), 1], [row.last_error || "", 0, "fl-ins-err"]])),
+      section("Written again and again", "Files written whole three times or more: keep one script and run it instead.", [["file"], ["writes", 1], ["sessions", 1]],
+        found.rewritten.map((row) => [[row.path], [String(row.writes), 1], [String(row.sessions), 1]])),
+      section("Context tax", `${tokens(ctxTax.cache_read)} tokens re-read from cache for ${tokens(ctxTax.output)} written${ctxTax.priced_cost_usd ? ` (${pctOf(ctxTax.cache_read_usd, ctxTax.priced_cost_usd)}% of spend where priced)` : ""}. A handoff or /compact sooner reads less.`,
+        [["session"], ["project"], ["re-read", 1], ["written", 1], ["re-read cost", 1], ["context now", 1]],
+        ctxTax.sessions.map((row) => [[row.label || row.session.slice(0, 8)], [row.project], [tokens(row.cache_read), 1], [tokens(row.output), 1], [row.cache_read_usd == null ? "-" : dollars(row.cache_read_usd), 1], [row.context ? tokens(row.context) : "-", 1]])),
+    );
+  }
+
   function renderViews() {
-    $("#fl-views").replaceChildren(...[["lanes", "Lanes"], ["list", "List"]].map(([key, label]) => el(
+    $("#fl-views").replaceChildren(...[["lanes", "Lanes"], ["list", "List"], ["insights", "Insights"]].map(([key, label]) => el(
       "button",
       {
         type: "button",
@@ -740,6 +840,7 @@ window.FwHubFleet = function (ctx) {
     ui.view = view;
     localStorage.setItem("fw-fleet-view", view);
     if (view === "lanes") loadLanes();
+    else if (view === "insights") loadInsights();
     else load(false);
     render();
   }
@@ -753,6 +854,7 @@ window.FwHubFleet = function (ctx) {
       if (!machine) lanesSoon();
       return;
     }
+    if (ui.view === "insights") return;
     const source = ui.sources.find((s) => s.machine === (machine || null));
     if (!source) return;
     if (!source.ok) {
@@ -819,7 +921,9 @@ window.FwHubFleet = function (ctx) {
     ui.lanes = null;
     render();
     if (!dialog.open) dialog.showModal();
+    ui.insights = null;
     if (ui.view === "lanes") loadLanes();
+    else if (ui.view === "insights") loadInsights();
     else load(false);
     clearInterval(ui.timer);
     let ticks = 0;

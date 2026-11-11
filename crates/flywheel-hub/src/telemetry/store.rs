@@ -17,7 +17,7 @@ use std::path::Path;
 /// The store's file in the state dir.
 pub const DB_FILE: &str = "telemetry.db";
 /// The schema this build reads and writes (`PRAGMA user_version`).
-const SCHEMA: i64 = 2;
+const SCHEMA: i64 = 3;
 /// Most sessions one fleet page returns.
 pub const FLEET_PAGE_MAX: usize = 1000;
 /// Most events one page returns.
@@ -113,6 +113,11 @@ pub struct Store {
 }
 
 impl Store {
+    /// The connection, for the queries kept beside the store.
+    pub(super) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -172,8 +177,31 @@ impl Store {
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS sessions_batch ON sessions (batch, last_ts)",
         )?;
-        conn.pragma_update(None, "user_version", SCHEMA)?;
-        Ok(Self { conn })
+        // Schema 3: finished tool calls counted per day, session, and
+        // shape (see `super::insights`), from the events already kept.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tool_use (
+                 day        INTEGER NOT NULL,
+                 host       TEXT NOT NULL,
+                 session    TEXT NOT NULL,
+                 tool       TEXT NOT NULL,
+                 shape      TEXT NOT NULL,
+                 project    TEXT NOT NULL,
+                 calls      INTEGER NOT NULL,
+                 ms         INTEGER NOT NULL,
+                 errors     INTEGER NOT NULL,
+                 last_error TEXT,
+                 last_ts    INTEGER NOT NULL,
+                 PRIMARY KEY (day, host, session, tool, shape)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS tool_use_ts ON tool_use (last_ts);",
+        )?;
+        let mut store = Self { conn };
+        if found < 3 {
+            store.backfill_tool_use()?;
+        }
+        store.conn.pragma_update(None, "user_version", SCHEMA)?;
+        Ok(store)
     }
 
     /// Append `events` and save `states`, in one transaction.
@@ -184,8 +212,19 @@ impl Store {
                 "INSERT OR IGNORE INTO events (host, session, seq, ts, kind, agent, work, item, body)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
+            let projects: std::collections::HashMap<(&str, &str), String> = states
+                .iter()
+                .map(|state| {
+                    let snap = state.snapshot();
+                    (
+                        (state.host.as_str(), state.session.as_str()),
+                        super::lanes::project_of(snap.dir.as_deref()),
+                    )
+                })
+                .collect();
+            let mut counted = tx.prepare_cached(TOOL_USE_UPSERT)?;
             for event in events {
-                insert.execute(params![
+                let new = insert.execute(params![
                     event.host,
                     event.session,
                     event.seq as i64,
@@ -196,6 +235,16 @@ impl Store {
                     event.item,
                     event.what.body().to_string(),
                 ])?;
+                // A finished call is counted once, as its event is kept.
+                if new == 1
+                    && let Some(call) = Call::of(event)
+                {
+                    let project = projects
+                        .get(&(event.host.as_str(), event.session.as_str()))
+                        .cloned()
+                        .unwrap_or_else(|| super::lanes::project_of(None));
+                    call.count(&mut counted, event, &project)?;
+                }
             }
             let mut upsert = tx.prepare_cached(
                 "INSERT INTO sessions (host, session, status, rank, last_ts, cost, snap, state, batch)
@@ -496,8 +545,163 @@ impl Store {
         let tx = self.conn.transaction()?;
         let events = tx.execute("DELETE FROM events WHERE ts < ?1", params![before])?;
         tx.execute("DELETE FROM sessions WHERE last_ts < ?1", params![before])?;
+        tx.execute("DELETE FROM tool_use WHERE last_ts < ?1", params![before])?;
         tx.commit()?;
         Ok(events)
+    }
+}
+
+const TOOL_USE_UPSERT: &str = "INSERT INTO tool_use
+         (day, host, session, tool, shape, project, calls, ms, errors, last_error, last_ts)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9, ?10)
+     ON CONFLICT (day, host, session, tool, shape) DO UPDATE SET
+         calls = calls + 1, ms = ms + excluded.ms, errors = errors + excluded.errors,
+         last_error = COALESCE(excluded.last_error, last_error),
+         last_ts = MAX(last_ts, excluded.last_ts), project = excluded.project";
+
+/// One finished tool call, as counted.
+struct Call<'a> {
+    tool: &'a str,
+    shape: String,
+    ms: u64,
+    error: Option<&'a str>,
+    failed: bool,
+}
+
+impl<'a> Call<'a> {
+    /// The call a `tool.finished` event closes (a denied one never ran).
+    fn of(event: &'a Event) -> Option<Self> {
+        let What::ToolFinished {
+            name,
+            summary,
+            outcome,
+            duration_ms,
+            error,
+            ..
+        } = &event.what
+        else {
+            return None;
+        };
+        if *outcome == super::event::Outcome::Denied {
+            return None;
+        }
+        Some(Self {
+            tool: name,
+            shape: super::shape::of(name, summary.as_deref()),
+            ms: duration_ms.unwrap_or(0),
+            error: error.as_deref(),
+            failed: *outcome == super::event::Outcome::Error,
+        })
+    }
+
+    fn count(
+        &self,
+        upsert: &mut rusqlite::CachedStatement<'_>,
+        event: &Event,
+        project: &str,
+    ) -> rusqlite::Result<usize> {
+        upsert.execute(params![
+            event.ts.div_euclid(DAY_MS),
+            event.host,
+            event.session,
+            self.tool,
+            self.shape,
+            project,
+            i64::try_from(self.ms).unwrap_or(i64::MAX),
+            i64::from(self.failed),
+            self.error.filter(|_| self.failed),
+            event.ts,
+        ])
+    }
+}
+
+/// A day in milliseconds (`tool_use` counts by UTC day).
+pub const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+impl Store {
+    /// Count the finished calls of the events already kept (a store from
+    /// before `tool_use`): each finish paired with its start, as the
+    /// reducer pairs them, session by session.
+    fn backfill_tool_use(&mut self) -> Result<(), StoreError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut dirs =
+                tx.prepare("SELECT host, session, json_extract(snap, '$.dir') FROM sessions")?;
+            let projects: std::collections::HashMap<(String, String), String> = dirs
+                .query_map([], |row| {
+                    Ok((
+                        (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                        super::lanes::project_of(row.get::<_, Option<String>>(2)?.as_deref()),
+                    ))
+                })?
+                .filter_map(Result::ok)
+                .collect();
+            let mut scan = tx.prepare(
+                "SELECT host, session, seq, ts, kind, agent, work, item, body FROM events
+                 WHERE kind IN ('tool.started', 'tool.finished') ORDER BY host, session, seq",
+            )?;
+            let mut upsert = tx.prepare_cached(TOOL_USE_UPSERT)?;
+            let mut open: std::collections::HashMap<String, (String, Option<String>, i64)> =
+                std::collections::HashMap::new();
+            let mut current: Option<(String, String)> = None;
+            let mut rows = scan.query([])?;
+            while let Some(row) = rows.next()? {
+                let Some(mut event) = read_event(row)? else {
+                    continue;
+                };
+                let key = (event.host.clone(), event.session.clone());
+                if current.as_ref() != Some(&key) {
+                    open.clear();
+                    current = Some(key.clone());
+                }
+                match &mut event.what {
+                    What::ToolStarted {
+                        id, name, summary, ..
+                    } => {
+                        open.insert(id.clone(), (name.clone(), summary.clone(), event.ts));
+                    }
+                    What::ToolFinished {
+                        id,
+                        name,
+                        summary,
+                        duration_ms,
+                        ..
+                    } => {
+                        let started = open.remove(id.as_str()).or_else(|| {
+                            // A finish without a known id: the oldest call of
+                            // its name.
+                            let by_name = open
+                                .iter()
+                                .filter(|(_, (n, _, _))| name.is_empty() || n == name)
+                                .min_by_key(|(_, (_, _, ts))| *ts)
+                                .map(|(id, _)| id.clone())?;
+                            open.remove(&by_name)
+                        });
+                        if let Some((started_name, started_summary, at)) = started {
+                            if name.is_empty() {
+                                *name = started_name;
+                            }
+                            if summary.is_none() {
+                                *summary = started_summary;
+                            }
+                            if duration_ms.is_none() {
+                                *duration_ms = u64::try_from(event.ts - at).ok();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(call) = Call::of(&event) {
+                    let project = projects
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| super::lanes::project_of(None));
+                    call.count(&mut upsert, &event, &project)?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 }
 

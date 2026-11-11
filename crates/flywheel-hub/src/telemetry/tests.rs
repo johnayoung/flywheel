@@ -767,6 +767,7 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             subagent: None,
         },
         What::ToolFinished {
+            summary: None,
             id: "i".into(),
             name: "n".into(),
             outcome: Outcome::Denied,
@@ -873,6 +874,7 @@ fn ten_thousand_sessions_on_a_hundred_hosts_fold_and_list() {
                         subagent: None,
                     },
                     2 | 4 | 6 => What::ToolFinished {
+                        summary: None,
                         id: call,
                         name: "Bash".to_owned(),
                         outcome: Outcome::Ok,
@@ -997,6 +999,7 @@ fn a_new_session_arriving_as_one_large_batch_is_on_the_board_at_once() {
                 }
             } else {
                 What::ToolFinished {
+                    summary: None,
                     id: format!("c{}", seq - 1),
                     name: "Read".to_owned(),
                     outcome: Outcome::Ok,
@@ -1481,4 +1484,197 @@ fn an_unanswered_ask_survives_a_relaunch_but_not_a_new_conversation() {
     // `/clear`: a new conversation asks nothing.
     hooks(&telemetry, "s", 200, &[("SessionStart", start("c2"))]);
     assert_ne!(telemetry.snapshot("s").unwrap().status, "asking");
+}
+
+/// An hour ago, to the hour: recent enough to outlive pruning.
+fn recent() -> i64 {
+    now_ms() / 3_600_000 * 3_600_000 - 3_600_000
+}
+
+/// One tool call through the hooks: started `at` ms after [`recent`],
+/// finished `ms` later.
+fn call(
+    telemetry: &Telemetry,
+    session: &str,
+    at: i64,
+    ms: i64,
+    tool: &str,
+    input: serde_json::Value,
+    ok: bool,
+) {
+    let id = format!("t{at}");
+    let at = recent() + at;
+    let start = json!({"tool_name": tool, "tool_input": input, "tool_use_id": id});
+    telemetry.record(session, claude::hook("PreToolUse", &start, at));
+    let end = if ok {
+        claude::hook(
+            "PostToolUse",
+            &json!({"tool_name": tool, "tool_use_id": id}),
+            at + ms,
+        )
+    } else {
+        claude::hook(
+            "PostToolUseFailure",
+            &json!({"tool_name": tool, "tool_use_id": id, "error": "exit 1"}),
+            at + ms,
+        )
+    };
+    telemetry.record(session, end);
+}
+
+#[test]
+fn insights_count_time_by_command_polling_failures_rewrites_and_context() {
+    let (_dir, telemetry) = open();
+    let start = |s: &str, dir: &str| {
+        telemetry.record(
+            s,
+            vec![Draft::new(
+                recent(),
+                What::SessionStarted {
+                    harness: "claude".into(),
+                    conversation: None,
+                    model: Some("claude-opus-5-5".into()),
+                    label: Some(s.into()),
+                    dir: Some(dir.into()),
+                    links: None,
+                },
+            )],
+        );
+    };
+    start("a", "/c/flywheel.worktrees/x");
+    start("b", "/c/infrared");
+    let bash = |c: &str| json!({"command": c});
+    call(
+        &telemetry,
+        "a",
+        1_000,
+        60_000,
+        "Bash",
+        bash("cd x && cargo test -p hub"),
+        true,
+    );
+    call(
+        &telemetry,
+        "a",
+        70_000,
+        30_000,
+        "Bash",
+        bash("cargo test"),
+        false,
+    );
+    call(
+        &telemetry,
+        "b",
+        1_000,
+        120_000,
+        "Bash",
+        bash("sleep 60; gh run view 1"),
+        true,
+    );
+    for at in [200_000, 210_000, 220_000] {
+        call(
+            &telemetry,
+            "a",
+            at,
+            10,
+            "Write",
+            json!({"file_path": "/tmp/probe.py"}),
+            true,
+        );
+        call(
+            &telemetry,
+            "b",
+            at,
+            5_000,
+            "Bash",
+            bash("gh run view 9"),
+            false,
+        );
+    }
+    call(
+        &telemetry,
+        "b",
+        300_000,
+        1_000,
+        "Read",
+        json!({"file_path": "/c/infrared/a.rs"}),
+        true,
+    );
+    telemetry.record(
+        "b",
+        vec![Draft::new(
+            recent() + 400_000,
+            What::Usage {
+                input: 10,
+                output: 1_000,
+                cache_read: 5_000_000,
+                cache_write: 0,
+                cost_usd: Some(3.0),
+            },
+        )],
+    );
+    let found = telemetry.insights(0, None, None).unwrap();
+    let time: Vec<(&str, u64, u64)> = found
+        .time
+        .iter()
+        .map(|t| (t.shape.as_str(), t.ms, t.calls))
+        .collect();
+    assert_eq!(time[0], ("poll", 120_000, 1), "{time:?}");
+    assert_eq!(time[1], ("cargo test", 90_000, 2), "{time:?}");
+    assert_eq!(found.polling.ms, 120_000);
+    assert_eq!(found.polling.shell_ms, 120_000 + 90_000 + 15_000);
+    let failing: Vec<(&str, u64)> = found
+        .failing
+        .iter()
+        .map(|f| (f.shape.as_str(), f.errors))
+        .collect();
+    assert_eq!(failing, [("gh run view", 3)]);
+    assert_eq!(found.failing[0].last_error.as_deref(), Some("exit 1"));
+    assert_eq!(found.rewritten.len(), 1);
+    assert_eq!(found.rewritten[0].path, "/tmp/probe.py");
+    assert_eq!(found.rewritten[0].writes, 3);
+    let projects: Vec<&str> = found.projects.iter().map(|p| p.project.as_str()).collect();
+    assert_eq!(projects, ["infrared", "flywheel"]);
+    assert_eq!(found.context.sessions[0].session, "b");
+    assert_eq!(found.context.sessions[0].cache_read, 5_000_000);
+    // Opus 5.5 reads cache at $0.20 per million.
+    assert!((found.context.sessions[0].cache_read_usd.unwrap() - 1.0).abs() < 1e-9);
+    // One project only.
+    let one = telemetry.insights(0, None, Some("flywheel")).unwrap();
+    assert!(one.time.iter().all(|t| t.shape != "poll"));
+}
+
+#[test]
+fn a_store_from_before_tool_counts_is_backfilled_from_its_events() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+        call(
+            &telemetry,
+            "s",
+            1_000,
+            4_000,
+            "Bash",
+            json!({"command": "cargo build"}),
+            true,
+        );
+        telemetry.stop();
+    }
+    {
+        let conn = rusqlite::Connection::open(dir.path().join(store::DB_FILE)).unwrap();
+        // As a schema 2 store: the call's events, no counts, and its
+        // finish without what the reducer now copies in.
+        conn.execute_batch(
+            "DROP TABLE tool_use;
+             UPDATE events SET body = json_remove(body, '$.summary', '$.duration_ms')
+                 WHERE kind = 'tool.finished';
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+    let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+    let found = telemetry.insights(0, None, None).unwrap();
+    assert_eq!(found.time.len(), 1, "{found:?}");
+    assert_eq!(found.time[0].shape, "cargo build");
+    assert_eq!(found.time[0].ms, 4_000);
 }

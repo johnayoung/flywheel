@@ -149,6 +149,16 @@ pub fn tool(name: &str, input: &Value) -> Option<String> {
             _ => str_of("cmd")?.to_owned(),
         },
         "apply_patch" => patch_files(str_of("input").or_else(|| str_of("patch"))?),
+        // A command run in the background ends its line with `&`, as in
+        // a shell: its call returns at once, the work goes on.
+        "Bash" if input.get("run_in_background") == Some(&Value::Bool(true)) => {
+            // Cut first, so the `&` survives the summary's cap.
+            let command: String = first_line(str_of("command")?)
+                .chars()
+                .take(SUMMARY_CAP.saturating_sub(4))
+                .collect();
+            format!("{} &", command.trim_end())
+        }
         _ => TELLING.iter().find_map(|key| str_of(key))?.to_owned(),
     };
     some(text(&line))

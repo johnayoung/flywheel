@@ -257,6 +257,10 @@ pub enum What {
     ToolFinished {
         id: String,
         name: String,
+        /// What the call acted on, as its start said (the reducer copies
+        /// it here, so a finished call is whole on its own).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
         outcome: Outcome,
         /// The agent's own measure (permission prompts excluded); else
         /// the reducer measures start to finish.

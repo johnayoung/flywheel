@@ -48,6 +48,7 @@ pub mod fsbrowse;
 pub mod git;
 pub mod handoff;
 pub mod hub;
+mod insights_cli;
 pub mod layout;
 pub mod lifecycle;
 pub mod machine_cli;

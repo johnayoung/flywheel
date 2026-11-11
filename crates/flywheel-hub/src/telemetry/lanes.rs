@@ -173,6 +173,13 @@ pub fn project_of(dir: Option<&str>) -> String {
         return "elsewhere".to_owned();
     };
     let parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    // A worker's sandbox: `$FLYWHEEL_HOME/projects/<id>/worktrees/<task>`.
+    if parts
+        .windows(2)
+        .any(|w| w[0] == ".flywheel" && w[1] == "projects")
+    {
+        return "fw worker".to_owned();
+    }
     if let Some(repo) = parts
         .iter()
         .rev()
@@ -320,6 +327,10 @@ mod tests {
         );
         assert_eq!(project_of(Some("/c/infrared/")), "infrared");
         assert_eq!(project_of(None), "elsewhere");
+        assert_eq!(
+            project_of(Some("/h/.flywheel/projects/8b/worktrees/landing-queue")),
+            "fw worker"
+        );
     }
 
     #[test]

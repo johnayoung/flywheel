@@ -240,6 +240,7 @@ fn response_item(item: &Value, ts: i64) -> Vec<Draft> {
             let failed =
                 exit_code(item.get("output").unwrap_or(&Value::Null)).is_some_and(|code| code != 0);
             vec![draft(What::ToolFinished {
+                summary: None,
                 id: call_id.to_owned(),
                 // The output names no tool: the reducer pairs it by id.
                 name: String::new(),

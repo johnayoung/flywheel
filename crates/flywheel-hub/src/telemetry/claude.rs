@@ -132,6 +132,7 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
             drafts
         }
         "PostToolUse" => vec![draft(What::ToolFinished {
+            summary: None,
             id: call_id(),
             name: tool_name.to_owned(),
             outcome: Outcome::Ok,
@@ -145,6 +146,7 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
         "PostToolUseFailure" => {
             let interrupted = payload.get("is_interrupt").and_then(Value::as_bool) == Some(true);
             vec![draft(What::ToolFinished {
+                summary: None,
                 id: call_id(),
                 name: tool_name.to_owned(),
                 outcome: if interrupted {
@@ -158,6 +160,7 @@ pub fn hook(event: &str, payload: &Value, ts: i64) -> Vec<Draft> {
             })]
         }
         "PermissionDenied" => vec![draft(What::ToolFinished {
+            summary: None,
             id: call_id(),
             name: tool_name.to_owned(),
             outcome: Outcome::Denied,

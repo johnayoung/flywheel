@@ -156,6 +156,11 @@ enum HubCommand {
     /// hooks to Claude Code's settings, `capture uninstall` removes them,
     /// `capture status` says where they report.
     Capture(crate::capture_cli::CaptureArgs),
+    /// Where time and money went: per project (sessions, tool time,
+    /// failures, cost), tool time by command, time spent polling, what
+    /// keeps failing, files written again and again, and what re-reading
+    /// context cost each session.
+    Insights(crate::insights_cli::InsightsArgs),
     /// The digest since the last one (or --since): per workspace, turns
     /// finished, agents blocked, fan-outs graded, PRs, autopilot, queue
     /// stalls, spend, and the top items that need you; previewed, or sent
@@ -750,6 +755,7 @@ fn dispatch_verb(
         HubCommand::Token(args) => token(&args, out, err),
         HubCommand::Tls(args) => crate::tls_cli::main(&args, out, err),
         HubCommand::Capture(args) => crate::capture_cli::main(&args, out, err),
+        HubCommand::Insights(args) => crate::insights_cli::insights(&args, out, err),
         HubCommand::Url(args) => url_cmd(&args, out, err),
         HubCommand::Serve(args) => serve_cmd(args, out, err, extensions),
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),

@@ -16,6 +16,7 @@
 //! * `GET /api/telemetry/fleet`: the fleet board, one page.
 //! * `GET /api/telemetry/lanes`: the fleet in lanes (needs you, moving,
 //!   waiting on time, finished, idle), grouped by project.
+//! * `GET /api/telemetry/insights`: where time and money went.
 //! * `GET /api/telemetry/sessions/{id}`: one session in full.
 //! * `GET /api/telemetry/sessions/{id}/events`: its event log, paged.
 //! * `GET /api/telemetry/capture/hooks`: the user-level hooks
@@ -312,6 +313,48 @@ pub(super) async fn fleet(
             "counts": page.counts,
             "hosts": page.hosts,
             "batches": page.batches,
+        }))
+        .into_response(),
+        Err(refused) => refused,
+    }
+}
+
+/// Insights look back this far unless asked (hours): a week.
+const DEFAULT_INSIGHTS_HOURS: i64 = 7 * 24;
+
+#[derive(Deserialize, Default)]
+pub(super) struct InsightsParams {
+    host: Option<String>,
+    /// The last N hours (`0`: everything kept).
+    hours: Option<String>,
+    /// One project only.
+    project: Option<String>,
+}
+
+pub(super) async fn insights(
+    State(app): State<AppState>,
+    ApiQuery(params): ApiQuery<InsightsParams>,
+) -> Response {
+    let hours: i64 = match number(params.hours.as_deref(), "hours") {
+        Ok(hours) => hours.unwrap_or(DEFAULT_INSIGHTS_HOURS),
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let since = if hours > 0 {
+        crate::telemetry::now_ms() - hours.saturating_mul(3_600_000)
+    } else {
+        i64::MIN
+    };
+    let host = host_of(&app, params.host.as_deref());
+    let project = params
+        .project
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty());
+    let telemetry = Arc::clone(app.hub.telemetry());
+    match read(move || telemetry.insights(since, host.as_deref(), project.as_deref())).await {
+        Ok(found) => Json(json!({
+            "now": crate::telemetry::now_ms(),
+            "hours": hours,
+            "insights": found,
         }))
         .into_response(),
         Err(refused) => refused,

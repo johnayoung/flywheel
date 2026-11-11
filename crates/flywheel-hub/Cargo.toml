@@ -54,6 +54,9 @@ percent-encoding = "2"
 # A session's recent output inside a live handoff's JSON (`pty/recent.rs`).
 base64 = "0.22"
 toml.workspace = true
+# The session telemetry store (`telemetry/store.rs`): events and per-session
+# snapshots, WAL, one file in the state dir.
+rusqlite.workspace = true
 # Detection manifests (`detect.rs`): linear-time, size-capped screen rules.
 regex.workspace = true
 # `fw hub attach` (terminal client) and `fw hub wait`: the hub's WebSocket

@@ -543,6 +543,36 @@ impl Machine {
         outcome
     }
 
+    /// `POST` an encoded body (`Content-Encoding: encoding`) to
+    /// `path_and_query` with the peer credential, as [`Machine::send`].
+    pub async fn send_encoded(
+        &self,
+        path_and_query: &str,
+        body: Vec<u8>,
+        content_type: &str,
+        encoding: &str,
+        timeout: Duration,
+    ) -> Result<reqwest::Response, LinkError> {
+        let url = self.target(path_and_query)?;
+        let request = self
+            .http
+            .post(url)
+            .timeout(timeout)
+            .bearer_auth(&self.record.credential)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::CONTENT_ENCODING, encoding)
+            .body(body);
+        let outcome = match request.send().await {
+            Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                Err(LinkError::Refused(self.refused_message()))
+            }
+            Ok(response) => Ok(response),
+            Err(e) => Err(self.unreachable(&crate::net::describe(&e))),
+        };
+        self.note(outcome.as_ref().map(|_| ()));
+        outcome
+    }
+
     /// `GET /api/whoami` there: what the credential is on the machine.
     pub async fn whoami(&self) -> Result<Whoami, LinkError> {
         let response = self
@@ -954,7 +984,7 @@ fn duplicate(name: &str) -> MachineError {
 
 /// This hub's id in `state_dir` (made on first use). Unreadable or
 /// unwritable: a fresh one for this process.
-fn load_hub_id(state_dir: &Path) -> String {
+pub(crate) fn load_hub_id(state_dir: &Path) -> String {
     let path = state_dir.join(HUB_ID_FILE);
     if let Ok(text) = fs::read_to_string(&path) {
         let id = text.trim();

@@ -4,6 +4,14 @@
 # fail on timing. Cap that group's concurrency; unit tests stay fully parallel.
 [test-groups]
 process-heavy = { max-threads = 4 }
+# self-update tests scan the process table, signal and freeze workers, and
+# back up stores; two at once interfere, so they run one at a time.
+self-update-serial = { max-threads = 1 }
+
+# First matching override wins: the serial group before the general one.
+[[profile.default.overrides]]
+filter = "package(flywheel) & kind(test) & binary(/^self_update/)"
+test-group = "self-update-serial"
 
 [[profile.default.overrides]]
 filter = "package(flywheel) & kind(test)"

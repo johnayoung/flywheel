@@ -114,6 +114,24 @@ pub fn stamp_commit_messages(
     branch: &str,
     trailers: &[(String, String)],
 ) -> Result<String, TrailerError> {
+    stamp_commit_messages_chained(repo, base, branch, trailers, &mut Default::default())
+}
+
+/// [`stamp_commit_messages`] over one link of a stacked chain (spec 00089).
+///
+/// `remap` maps every already-rewritten commit (old sha -> new sha) of the
+/// links stamped before this one: a parent found there is replaced by its
+/// rewritten sha, so the next task's commits chain onto the previous task's
+/// stamped tip instead of its unstamped one. This link's rewrites are added
+/// to `remap` for the link after it. Message-only, exactly as the single
+/// form: each tree object is kept.
+pub fn stamp_commit_messages_chained(
+    repo: &Path,
+    base: &str,
+    branch: &str,
+    trailers: &[(String, String)],
+    remap: &mut std::collections::BTreeMap<String, String>,
+) -> Result<String, TrailerError> {
     let range = format!("{base}..{branch}");
     let revs = run(
         repo,
@@ -124,9 +142,8 @@ pub fn stamp_commit_messages(
     let old_tip = run(repo, &["rev-parse", branch], None, &[])?;
     let revs: Vec<&str> = revs.split_whitespace().collect();
     if revs.is_empty() {
-        return Ok(old_tip);
+        return Ok(remap.get(&old_tip).cloned().unwrap_or(old_tip));
     }
-    let mut remap: std::collections::BTreeMap<String, String> = Default::default();
     for sha in revs {
         let record = read_commit(repo, sha)?;
         let message = stamped_message(repo, &record.body, trailers)?;

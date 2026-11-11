@@ -360,6 +360,18 @@ impl LandingQueue {
         Ok(marked)
     }
 
+    /// Return a verifying `entry` to the waiting state (state `queued`):
+    /// its batch's stacked tip failed or could not land, so the entry no
+    /// longer belongs to that batch and waits for its one-at-a-time turn.
+    pub fn unmark(&self, entry: &QueueEntry) -> Result<QueueEntry, LandingQueueError> {
+        let waiting = QueueEntry {
+            batch: None,
+            ..entry.clone()
+        };
+        self.write_json(&waiting.file_name(), &waiting)?;
+        Ok(waiting)
+    }
+
     /// Drop `entry` unlanded (its owner is not live).
     pub fn drop_entry(&self, entry: &QueueEntry) -> Result<(), LandingQueueError> {
         self.remove(&entry.file_name())

@@ -1335,49 +1335,6 @@ impl GitWorktreeSubmitter {
         Ok(SubmitOutcome::no_op(reason))
     }
 
-    /// Under the merge lock: land every live queued entry one at a time in
-    /// `queued_at` order, including entries other workers queued, recording
-    /// each settlement for its owner. An entry whose owner no longer holds a
-    /// live lease is dropped, never landed (D-7).
-    fn drain_queue(&self, queue: &LandingQueue, ticket: &LandingTicket) -> Result<(), SubmitError> {
-        if let Err(err) = queue.prune_settlements(ticket.claims.as_ref(), (ticket.now)()) {
-            self.log(format!(
-                "landing queue: settlement prune failed ({err}); continuing"
-            ));
-        }
-        for entry in queue.entries()? {
-            match ticket.entry_is_live(&entry) {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.log(format!(
-                        "landing queue: dropping {} (run {}): owner {} no longer holds a live lease",
-                        entry.task_id, entry.run_id, entry.owner
-                    ));
-                    queue.drop_entry(&entry)?;
-                    continue;
-                }
-                Err(err) => {
-                    self.log(format!(
-                        "landing queue: cannot read the claim of {} ({err}); leaving it queued",
-                        entry.task_id
-                    ));
-                    continue;
-                }
-            }
-            let outcome = self.land_entry(queue, &entry)?;
-            let verdict = match &outcome {
-                SubmitOutcome::Landed { .. } => "landed",
-                SubmitOutcome::Parked { .. } => "parked",
-                SubmitOutcome::NoOp { .. } => "no-op",
-            };
-            self.log(format!(
-                "landing queue: settled {} (run {}, owner {}): {verdict}",
-                entry.task_id, entry.run_id, entry.owner
-            ));
-        }
-        Ok(())
-    }
-
     /// Land one live entry as a size-1 batch and record its settlement. A
     /// ladder failure or panic is contained into the entry's own
     /// `submit-error` park, never the lock holder's.
@@ -2778,6 +2735,8 @@ pub(crate) mod test_support {
     }
 }
 
+mod batch;
+
 #[cfg(test)]
 mod tests {
     use super::test_support::*;
@@ -4142,6 +4101,7 @@ mod tests {
         assert_eq!(recorder.records().len(), 2);
     }
 
+    mod landing_batch;
     mod landing_invariants;
     mod landing_queue;
 }

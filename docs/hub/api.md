@@ -53,7 +53,7 @@ Routes (`docs_drift.rs`: exactly those mounted), WebSockets, plugin payloads. Fr
 | GET | `/api/claude-accounts` | `{accounts:[{name,updated}]}` (never tokens); `"account":NAME` on `POST /api/sessions` launches under one |
 | POST | `/api/claude-accounts` | `{name,token,replace?}` -> 201 `{name,updated}` (taken: 409 unless `replace`) |
 | DELETE | `/api/claude-accounts/{name}` | 204 |
-| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, 30): the folder's past conversations, newest first `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `POST /api/sessions` `"resume":ID\|"latest"` resumes one |
+| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, 30): past conversations, newest first `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `POST /api/sessions` `"resume":ID\|"latest"` resumes one |
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
@@ -84,7 +84,7 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/sessions/{id}/handoff/compose` | `{"source":{"kind":"selection\|transcript\|command\|last_command\|output\|diff",...},"max_bytes"?}` -> `{"prompt"}` |
 | POST | `/api/sessions/{id}/handoff` | `{"prompt","from"?,"source"?}`: pasted + Enter (128 KiB) |
 
-**Two-step**: `{"dry_run":true}` -> a plan (summary, exact `commands`, warnings, `refusal`, `needs_rebase`, `fingerprint`; commit adds `suspects`), then the body with `"confirm":fingerprint` runs it -> `{"ok","ran","url"?}`; 409 refused / changed since.
+**Two-step**: `{"dry_run":true}` -> a plan (summary, `commands`, warnings, `refusal`, `needs_rebase`, `fingerprint`; commit adds `suspects`), then the body with `"confirm":fingerprint` runs it -> `{"ok","ran","url"?}`; 409 refused / changed since.
 
 ## Fan-outs and Flywheel
 
@@ -100,7 +100,7 @@ A session lists `agent` status (`detail`, `since`, AskUserQuestion's `questions`
 | POST | `/api/fanouts/{id}/cleanup` | `{"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}` |
 | POST | `/api/fanouts/{id}/promote` | `{"task_id"?,"goal"?,...}`, two-step (plan: path, contents); 409 exists / changed |
 | GET | `/api/flywheel` | per adopted folder: counts, `plans`, alerts, live runs, worker |
-| GET | `/api/flywheel/panel?folder=` | panel (`queued_in`: scoped worker runs it; `relandable`, `waiting_on`; `pauses`: active `fw pauses --json`; live `last_tool`, `plans[].tasks`); 404 unadopted |
+| GET | `/api/flywheel/panel?folder=` | panel (`queued_in`: scoped worker runs it; `relandable`, `waiting_on`; `landing` = `fw status --json`'s; `pauses` = `fw pauses --json`; live `last_tool`, `plans[].tasks`); 404 unadopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next","attempts"}` (poll `since=next`); 503 read waits |
 | GET | `/api/flywheel/history?folder=&task=` | every run; attempts' `outcome`/`error`/`checks` (= `fw show`); task `goal`, `checks` (held-out: names) |
 | GET | `/api/flywheel/task?folder=&task=` | task as a fan-out seed |
@@ -239,7 +239,7 @@ Client sends `input` `{"data"}`, `resize` `{"cols","rows"}`, `theme` `{"foregrou
 - `input` may carry `id` (growing per `client`): `{"type":"ack","id"}` once taken (never typed twice); `{"type":"nack","id","retry"}` refused (`retry`: mid-handoff, resend).
 - `{"type":"mode","lite","fps"?,"paused"?}` switches pacing (`paused`: silent until unpaused). `{"type":"ping"}` -> `{"type":"pong"}`.
 
-Close codes: **4001** token rotated, **4002** logout / login expired, **4003** peer revoked, **4004** share ended, **4005** relaunched, **1012** live handoff (both: reconnect). Machine proxy: **4010** (its 4001-4003), **4011** removed, **1011** link lost.
+Close: **4001** token rotated, **4002** logout / login expired, **4003** peer revoked, **4004** share ended, **4005** relaunched, **1012** live handoff (both: reconnect). Machine proxy: **4010** (its 4001-4003), **4011** removed, **1011** link lost.
 
 ## Events WebSocket
 

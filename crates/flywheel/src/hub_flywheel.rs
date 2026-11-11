@@ -75,6 +75,7 @@ use flywheel_orchestrator::config::Access;
 use flywheel_orchestrator::config::{REPO_CONFIG_FILENAME, read_repo_file};
 use flywheel_orchestrator::history::{check_to_json, run_attempt_checks};
 use flywheel_orchestrator::home::{Home, stored_project_id};
+use flywheel_orchestrator::landing_queue::LandingQueue;
 use flywheel_orchestrator::pg_preflight::dsn_target;
 use flywheel_orchestrator::policy::WorkPolicy;
 use flywheel_orchestrator::sources::{DirectoryWorkSource, WorkSource, phase_task_files};
@@ -84,7 +85,7 @@ use flywheel_orchestrator::workflow::status::format_blocked_on;
 use flywheel_orchestrator::workflow::{
     CommonArgs, PauseEntry, PauseSelector, ShowArgs, StatusArgs, active_pauses,
     clear_session_pauses, cmd_show, cmd_status, format_pause_time, known_project,
-    project_policy_at, resolve_fallback_phases,
+    project_policy_at, resolve_fallback_phases, resolve_merge_lock_path,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -512,6 +513,8 @@ struct StatusEntry {
     prerequisites: Vec<String>,
     #[serde(default)]
     unlanded_prerequisites: Vec<String>,
+    /// The live landing-queue entry, kept verbatim for the panel.
+    landing: Option<Value>,
     worker_id: Option<String>,
     blocked_requires: Option<Vec<Map<String, Value>>>,
     awaiting_on: Option<AwaitingOn>,
@@ -543,6 +546,7 @@ fn status_entries(
     items: &[flywheel_orchestrator::sources::WorkItem],
     core: &dyn HarnessStore,
     claims: &dyn ClaimStore,
+    landing_queue: Option<&LandingQueue>,
     root: &Path,
 ) -> Result<Vec<StatusEntry>, String> {
     let args = StatusArgs {
@@ -551,8 +555,17 @@ fn status_entries(
         rollup: false,
     };
     let mut out: Vec<u8> = Vec::new();
-    cmd_status(&args, items, core, claims, None, Some(root), None, &mut out)
-        .map_err(|e| format!("reading task status: {e}"))?;
+    cmd_status(
+        &args,
+        items,
+        core,
+        claims,
+        landing_queue,
+        Some(root),
+        None,
+        &mut out,
+    )
+    .map_err(|e| format!("reading task status: {e}"))?;
     serde_json::from_slice(&out).map_err(|e| format!("reading task status: {e}"))
 }
 
@@ -653,6 +666,7 @@ fn fold_status(entries: Vec<StatusEntry>, panel: &mut FlywheelPanel) {
                 .map(format_blocked_on),
             relandable: entry.stranded.is_some(),
             waiting_on: entry.unlanded_prerequisites.clone(),
+            landing: entry.landing.clone(),
             // The hub's to fill in (its running worker sessions).
             queued_in: None,
         };
@@ -1501,7 +1515,15 @@ impl FlywheelProvider for HubFlywheel {
         };
         drop(state);
         let opened = problems.len();
-        match status_entries(&items, core.as_ref(), claims.as_ref(), folder) {
+        let landing_queue =
+            LandingQueue::beside_lock(&resolve_merge_lock_path(policy.as_ref(), &db_path));
+        match status_entries(
+            &items,
+            core.as_ref(),
+            claims.as_ref(),
+            Some(&landing_queue),
+            folder,
+        ) {
             Ok(entries) => fold_status(entries, &mut panel),
             Err(message) => problems.push(message),
         }
@@ -1682,14 +1704,15 @@ impl FlywheelProvider for HubFlywheel {
             None => Vec::new(),
         };
         drop(state);
-        let read =
-            status_entries(&items, core.as_ref(), claims.as_ref(), folder).and_then(|entries| {
+        let read = status_entries(&items, core.as_ref(), claims.as_ref(), None, folder).and_then(
+            |entries| {
                 let filter = LifecycleFilter::default().with_task_id(task_id);
                 let runs = core
                     .list_lifecycles(&filter)
                     .map_err(|e| format!("reading the task's runs: {e}"))?;
                 Ok((entries, !runs.is_empty()))
-            });
+            },
+        );
         let (entries, has_runs) = read.map_err(|message| {
             // A dead handle: reopen on the next read.
             self.drop_stores(folder);

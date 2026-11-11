@@ -2793,3 +2793,146 @@ fn hub_pauses_clear_route_refuses_peers_empty_reasons_and_no_match() {
     assert_eq!(panel_pauses(), json!([]));
     assert!(active_only(&listed()).is_empty());
 }
+
+// --- landing queue (spec 00089) ---------------------------------------------
+
+/// Enqueue `task_id`'s DONE run on `fx`'s project landing queue as owned
+/// by `owner`, which holds the task's claim (a live entry).
+fn panel_landing_enqueue(
+    fx: &Fixture,
+    task_id: &str,
+    owner: &str,
+    queued_at: DateTime<Utc>,
+) -> flywheel_orchestrator::landing_queue::QueueEntry {
+    let claims = SqliteClaimStore::open_partition(fx.project.db(), &fx.project.id).unwrap();
+    claims
+        .acquire_claim(task_id, owner, Utc::now(), 3_600.0, &BTreeSet::new())
+        .unwrap()
+        .expect("claimed");
+    panel_landing_enqueue_unclaimed(fx, task_id, owner, queued_at)
+}
+
+/// Enqueue `task_id`'s DONE run as owned by `owner` without claiming it.
+fn panel_landing_enqueue_unclaimed(
+    fx: &Fixture,
+    task_id: &str,
+    owner: &str,
+    queued_at: DateTime<Utc>,
+) -> flywheel_orchestrator::landing_queue::QueueEntry {
+    use flywheel_core::task::{CommandGrader, Grader, Task};
+    let task = Task::new(
+        format!("land {task_id}"),
+        vec![Grader::Command(CommandGrader::new("true").unwrap())],
+    )
+    .with_id(task_id);
+    let request = flywheel_orchestrator::strategy::SubmitRequest::new(
+        task,
+        format!("run-{task_id}"),
+        Status::Done,
+        format!("/wt/{task_id}"),
+    );
+    flywheel_orchestrator::landing_queue::LandingQueue::beside_lock(&fx.project.paths.merge_lock())
+        .enqueue(&request, owner, queued_at)
+        .unwrap()
+}
+
+/// `fw status --json` in `fx`'s repo and home, keyed by task id.
+fn panel_landing_fw_status(fx: &Fixture) -> std::collections::HashMap<String, Value> {
+    let out = Command::new(env!("CARGO_BIN_EXE_fw"))
+        .args(["status", "--json"])
+        .current_dir(&fx.root)
+        .env("HOME", hermetic_home(fx._tmp.path()))
+        .env("FLYWHEEL_HOME", &fx.home)
+        .env_remove("FLYWHEEL_PG_DSN")
+        .env_remove("DATABASE_URL")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "fw status --json: {out:?}");
+    let entries: Vec<Value> = serde_json::from_slice(&out.stdout).unwrap();
+    entries
+        .into_iter()
+        .filter_map(|e| Some((e["task_id"].as_str()?.to_owned(), e)))
+        .collect()
+}
+
+/// The panel's wire task `id`.
+fn panel_landing_wire_task(panel: &flywheel_hub::flywheel::FlywheelPanel, id: &str) -> Value {
+    let wire = serde_json::to_value(panel).unwrap();
+    wire["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|p| p["tasks"].as_array().unwrap().iter())
+        .find(|t| t["id"] == id)
+        .unwrap_or_else(|| panic!("no task {id}: {wire}"))
+        .clone()
+}
+
+#[test]
+fn panel_landing_queued_and_verifying_entries_equal_fw_status_json() {
+    let fx = temp_repo();
+    let t0 = Utc::now() - ChronoDuration::minutes(2);
+    // eps lands first (verifying in a batch), alpha waits behind it.
+    let eps = panel_landing_enqueue(&fx, "eps", "worker-1", t0);
+    panel_landing_enqueue(&fx, "alpha", "worker-2", t0 + ChronoDuration::seconds(5));
+    flywheel_orchestrator::landing_queue::LandingQueue::beside_lock(&fx.project.paths.merge_lock())
+        .mark_verifying(
+            &eps,
+            flywheel_core::events::LandedBatch {
+                id: "batch-1".into(),
+                index: 1,
+                size: 2,
+            },
+        )
+        .unwrap();
+
+    let status = panel_landing_fw_status(&fx);
+    let panel = fx.provider().panel(&fx.root);
+    assert_eq!(panel.problem, None, "{panel:#?}");
+    let tasks = panel_tasks(&panel);
+    for id in ["eps", "alpha"] {
+        let landing = status[id].get("landing").cloned().expect(id);
+        assert_eq!(tasks[id].landing.as_ref(), Some(&landing), "{id}");
+        assert_eq!(
+            panel_landing_wire_task(&panel, id)["landing"],
+            landing,
+            "{id}"
+        );
+    }
+    assert_eq!(status["eps"]["landing"]["state"], json!("verifying"));
+    assert_eq!(
+        status["eps"]["landing"]["batch"],
+        json!({"id": "batch-1", "index": 1, "size": 2})
+    );
+    assert_eq!(status["alpha"]["landing"]["state"], json!("queued"));
+    // A null batch while queued stays on the wire as null.
+    let alpha = panel_landing_wire_task(&panel, "alpha");
+    assert!(
+        alpha["landing"].as_object().unwrap().contains_key("batch"),
+        "{alpha}"
+    );
+    assert_eq!(alpha["landing"]["batch"], Value::Null);
+}
+
+#[test]
+fn panel_landing_absent_for_a_task_without_a_queue_entry() {
+    let fx = temp_repo();
+    panel_landing_enqueue(&fx, "eps", "worker-1", Utc::now());
+    // A dead owner's entry (it holds no claim on the task) is not live.
+    panel_landing_enqueue_unclaimed(&fx, "beta", "ghost", Utc::now());
+
+    let status = panel_landing_fw_status(&fx);
+    let panel = fx.provider().panel(&fx.root);
+    assert_eq!(panel.problem, None, "{panel:#?}");
+    let tasks = panel_tasks(&panel);
+    assert!(tasks["eps"].landing.is_some());
+    for id in ["alpha", "beta", "gamma", "delta"] {
+        assert!(status[id].get("landing").is_none(), "{id}");
+        assert_eq!(tasks[id].landing, None, "{id}");
+        assert!(
+            panel_landing_wire_task(&panel, id).get("landing").is_none(),
+            "{id}"
+        );
+    }
+}

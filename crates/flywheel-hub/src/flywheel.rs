@@ -114,6 +114,10 @@ pub struct PanelTask {
     /// prerequisite order (`fw status --json` `unlanded_prerequisites`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waiting_on: Vec<String>,
+    /// Its live landing-queue entry: `fw status --json`'s `landing` object
+    /// (`{state, position, queued_at, batch}`), passed through unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<serde_json::Value>,
     /// A pending task a running scoped worker this hub started will run
     /// (the hub fills it in per answer; see [`mark_queued`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1609,6 +1613,7 @@ mod tests {
             blocked_on: None,
             relandable: false,
             waiting_on: Vec::new(),
+            landing: None,
             queued_in: None,
         }
     }

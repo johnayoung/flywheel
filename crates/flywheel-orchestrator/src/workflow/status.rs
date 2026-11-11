@@ -109,17 +109,28 @@ pub fn awaiting_instruction_for_row(row: &StatusRow) -> Option<&str> {
     }
 }
 
-/// The most recent `LandingParked` on `run_id`, or `None`.
+/// The most recent `LandingParked` on `run_id` that no later landing of the
+/// same run superseded, or `None`. A re-drive or `reland` that lands the run
+/// after a park appends a `Landed` witness at or after the park's timestamp
+/// (the rule `reland` applies to refuse an already-landed run); that park is
+/// history, not a strand.
 fn landing_park_for_run(
     store: &dyn HarnessStore,
     run_id: &str,
 ) -> Result<Option<Park>, StoreError> {
-    Ok(store
+    let Some(park) = store
         .latest_domain_event_of_kind(run_id, DomainEventKind::LandingParked)?
         .and_then(|event| match &event.payload {
             DomainEventPayload::LandingParked(parked) => Some(Park::from_event(event.ts, parked)),
             _ => None,
-        }))
+        })
+    else {
+        return Ok(None);
+    };
+    let landed_after = store
+        .latest_domain_event_of_kind(run_id, DomainEventKind::Landed)?
+        .is_some_and(|landed| landed.ts >= park.ts);
+    Ok((!landed_after).then_some(park))
 }
 
 /// The landing strand `task_id` still surfaces on: the park on its latest
@@ -576,8 +587,9 @@ mod tests {
     use crate::sources::{DirectoryWorkSource, WorkSource};
     use chrono::Duration;
     use flywheel_core::events::{
-        DomainEvent, PARK_KIND_DIVERGENT_BASE, PARK_KIND_HELD_OUT_GATE, PARK_KIND_PROTECTED_PATHS,
-        PARK_KIND_PUSH_FAILED, PARK_KIND_STANDING_VERIFY, PARK_KIND_SUBMIT_ERROR,
+        DomainEvent, Landed, PARK_KIND_DIVERGENT_BASE, PARK_KIND_HELD_OUT_GATE,
+        PARK_KIND_PROTECTED_PATHS, PARK_KIND_PUSH_FAILED, PARK_KIND_STANDING_VERIFY,
+        PARK_KIND_SUBMIT_ERROR,
     };
     use flywheel_core::lifecycle::{Attempt, Lifecycle};
     use flywheel_core::store::{AttemptStore, DomainEventStore, LifecycleStore, TaskStore};
@@ -594,6 +606,20 @@ mod tests {
                 park_kind: kind.into(),
                 detail: detail.into(),
                 ..LandingParked::default()
+            }),
+        );
+        store.append_domain_event(&event, loaded.version).unwrap();
+    }
+
+    fn landed(store: &InMemoryStore, run_id: &str, ts: DateTime<Utc>) {
+        let loaded = store.load_lifecycle(run_id).unwrap().unwrap();
+        let event = DomainEvent::new(
+            run_id,
+            ts,
+            DomainEventPayload::Landed(Landed {
+                strategy: "merge".into(),
+                landed_ref: "5ca6e5d".into(),
+                ..Landed::default()
             }),
         );
         store.append_domain_event(&event, loaded.version).unwrap();
@@ -1058,6 +1084,58 @@ mod tests {
             run_status(&tmp, &store, &claims, false, false),
             "(no active tasks)\n"
         );
+    }
+
+    #[test]
+    fn a_park_the_same_run_later_landed_past_is_not_a_strand() {
+        let later = t0() + chrono::Duration::seconds(30);
+        for kind in [PARK_KIND_HELD_OUT_GATE, PARK_KIND_STANDING_VERIFY] {
+            // Listed row: re-drive landed the run after its park.
+            let tmp = TempDir::new().unwrap();
+            write_task(&tmp.path().join("active/01/a.json"), "a", &[]);
+            let store = InMemoryStore::new();
+            let lc = seed_done(&store, "a");
+            park(&store, &lc.run_id, kind, "red once", t0());
+            landed(&store, &lc.run_id, later);
+            let claims = InMemoryClaimStore::new();
+            assert!(!run_status(&tmp, &store, &claims, false, false).contains("stranded:"));
+            assert!(
+                status_json(&tmp, &store, &claims)[0]
+                    .get("stranded")
+                    .is_none()
+            );
+            // A park after that landing is a fresh strand again.
+            park(
+                &store,
+                &lc.run_id,
+                kind,
+                "red again",
+                later + chrono::Duration::seconds(5),
+            );
+            assert!(
+                run_status(&tmp, &store, &claims, false, false)
+                    .contains(&format!("stranded: {kind} -- red again"))
+            );
+        }
+        // Rowless strand (task file left the listing): same rule, and
+        // resolve has nothing to abandon once the run landed.
+        let tmp = TempDir::new().unwrap();
+        let store = InMemoryStore::new();
+        let lc = seed_done(&store, "zz");
+        park(
+            &store,
+            &lc.run_id,
+            PARK_KIND_STANDING_VERIFY,
+            "red once",
+            t0(),
+        );
+        landed(&store, &lc.run_id, later);
+        let claims = InMemoryClaimStore::new();
+        assert_eq!(
+            run_status(&tmp, &store, &claims, false, false),
+            "(no active tasks)\n"
+        );
+        assert_eq!(unresolved_landing_strand(&store, &[], "zz").unwrap(), None);
     }
 
     #[test]

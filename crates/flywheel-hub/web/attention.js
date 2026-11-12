@@ -38,6 +38,10 @@ window.FwHubAttention = function (ctx) {
       const agent = agentStatus(session);
       if (!agent || (agent.status !== "blocked" && agent.status !== "done")) continue;
       if (agent.status === "done" && graded.has(session.id)) continue;
+      // A handoff accepted: its successor carries the work on, so the
+      // turn that ended asking for it needs nobody.
+      const snap = agent.status === "done" && ctx.telemetryOf ? ctx.telemetryOf(session.id) : null;
+      if (snap && snap.continued_by) continue;
       const ask = agent.status === "done" ? askOf(session) : null;
       out.push({ session, agent, ask, level: agent.status === "blocked" ? 0 : ask ? 1 : 2 });
     }
@@ -261,6 +265,10 @@ window.FwHubAttention = function (ctx) {
   // A reply being typed is never torn down under the user: the render
   // waits for the field to lose focus.
   let held = false;
+  // The sessions the list shows now (frozen with it while a reply is
+  // typed): the Everything list leaves out exactly these, so a session is
+  // never in both.
+  let shown = new Set();
   const typing = () => !!(document.activeElement && document.activeElement.closest(".attn-reply"));
   document.addEventListener("focusout", (event) => {
     if (!held || !event.target.closest || !event.target.closest(".attn-reply")) return;
@@ -268,7 +276,9 @@ window.FwHubAttention = function (ctx) {
     setTimeout(() => {
       if (held && !typing()) {
         held = false;
-        render();
+        // The whole sidebar: the list below follows what this shows.
+        if (ctx.rerender) ctx.rerender();
+        else render();
       }
     }, 0);
   });
@@ -280,6 +290,7 @@ window.FwHubAttention = function (ctx) {
     }
     held = false;
     const list = entries();
+    shown = new Set(list.map((e) => e.session.id));
     const loop = flywheel ? flywheel.attention() : [];
     const graded = fanout ? fanout.attention() : [];
     const queues = ctx.queue ? ctx.queue().attention() : [];
@@ -329,8 +340,11 @@ window.FwHubAttention = function (ctx) {
 
   // Ages tick while the list shows.
   setInterval(() => {
-    if (document.visibilityState === "visible" && !$("#attention").hidden) render();
+    if (document.visibilityState === "visible" && !$("#attention").hidden) {
+      if (ctx.rerender) ctx.rerender();
+      else render();
+    }
   }, 30000);
 
-  return { render, entries, branchOf };
+  return { render, entries, branchOf, shownIds: () => shown };
 };

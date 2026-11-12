@@ -494,6 +494,10 @@ const attention = window.FwHubAttention({
   // path.
   telemetryOf: (id) => sessionTelemetry.get(id) || null,
   api: (...args) => api(...args),
+  // A handoff's successor is listed before it opens.
+  refresh: () => refresh(),
+  // Repaint the sidebar (Needs you first, then the list it leaves out).
+  rerender: () => render(),
   toast: (...args) => commands.toast(...args),
   copyText: (text) => commands.copyText(text),
 });

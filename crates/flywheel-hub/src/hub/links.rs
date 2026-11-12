@@ -23,6 +23,23 @@ use super::SessionView;
 /// Most sessions [`Hub::agent_sessions`] lists.
 const LIST_MAX: usize = 200;
 
+/// A handoff successor's name: its predecessor's, numbered on (`docs` ->
+/// `docs 2`, `docs 2` -> `docs 3`), the first one free across the hub, so
+/// the pair reads as one line of work and the name still addresses it.
+fn successor_name(parent: &str, taken: &[&str]) -> String {
+    let base = match parent.rsplit_once(' ') {
+        Some((stem, n)) if !stem.is_empty() && n.parse::<u32>().is_ok() => stem,
+        _ => parent,
+    };
+    // Session names are at most 100 characters; leave room for the number.
+    let base: String = base.chars().take(90).collect();
+    let base = base.trim_end();
+    (2u32..)
+        .map(|n| format!("{base} {n}"))
+        .find(|name| !taken.contains(&name.as_str()))
+        .unwrap_or_else(|| base.to_owned())
+}
+
 impl Hub {
     /// Start a new session that continues agent session `id`'s work: its
     /// directory, worktree, kind, model, permission options, and account,
@@ -75,7 +92,11 @@ impl Hub {
         let record = SessionRecord {
             id: new_id(),
             workspace_id: from.workspace_id.clone(),
-            name: self.default_session_name(&from.workspace_id, &command),
+            name: {
+                let store = self.store();
+                let taken: Vec<&str> = store.sessions().iter().map(|s| s.name.as_str()).collect();
+                successor_name(&from.name, &taken)
+            },
             kind: from.kind,
             cwd: from.cwd.clone(),
             command,
@@ -209,5 +230,35 @@ impl Hub {
             lines.push(line);
         }
         lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod successor_name_tests {
+    use super::successor_name;
+
+    #[test]
+    fn numbers_on_from_the_predecessor() {
+        assert_eq!(successor_name("docs", &["docs"]), "docs 2");
+        assert_eq!(successor_name("docs 2", &["docs", "docs 2"]), "docs 3");
+        assert_eq!(
+            successor_name("claude 1", &["claude 1", "claude 2"]),
+            "claude 3"
+        );
+        // A taken number is skipped, hub-wide.
+        assert_eq!(
+            successor_name("docs", &["docs", "docs 2", "docs 3"]),
+            "docs 4"
+        );
+        // A trailing word that is not a number is part of the name.
+        assert_eq!(successor_name("fix v2", &["fix v2"]), "fix v2 2");
+    }
+
+    #[test]
+    fn stays_within_the_name_limit() {
+        let long = "x".repeat(100);
+        let name = successor_name(&long, &[long.as_str()]);
+        assert!(name.chars().count() <= 100, "{name}");
+        assert!(name.ends_with(" 2"));
     }
 }

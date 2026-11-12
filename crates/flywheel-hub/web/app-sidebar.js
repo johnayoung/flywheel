@@ -631,16 +631,43 @@ const listGroup = (name, count) =>
 // Everything: Needs you (attention.js, above this list) first, then the
 // agents at work, then the rest folded into one line. A session is listed
 // once, in its most urgent group.
+// An agent that stops working stays in Moving this long: a pause between
+// two steps does not bounce its row to Resting and back.
+const MOVING_HOLD_MS = 20000;
+const lastWorking = new Map(); // session id -> ms it was last seen working
+let movingTimer = 0;
+
 function renderAllList() {
-  const needs = new Set(attention.entries().map((e) => e.session.id));
+  // What Needs you shows above (held while a reply is typed there).
+  const needs = attention.shownIds();
   const moving = [];
   const resting = [];
+  const now = Date.now();
+  let nextExpiry = Infinity;
   for (const session of orderedSessions()) {
-    if (needs.has(session.id)) continue;
+    // A turn that ended went to Needs you: no hold after it is seen.
+    if (needs.has(session.id)) {
+      lastWorking.delete(session.id);
+      continue;
+    }
     const agent = agentStatus(session);
-    if (agent && agent.status === "working") moving.push(session);
-    else resting.push(session);
+    if (agent && agent.status === "working") {
+      lastWorking.set(session.id, now);
+      moving.push(session);
+      continue;
+    }
+    const until = (lastWorking.get(session.id) || 0) + MOVING_HOLD_MS;
+    if (session.live && until > now) {
+      moving.push(session);
+      nextExpiry = Math.min(nextExpiry, until);
+    } else {
+      lastWorking.delete(session.id);
+      resting.push(session);
+    }
   }
+  // Settle a held row once its hold ends.
+  clearTimeout(movingTimer);
+  if (nextExpiry !== Infinity) movingTimer = setTimeout(() => render(), nextExpiry - now + 50);
   const rows = (list) => el("ul", { className: "sessions" }, list.map((s) => renderSession(s, { tag: true, flat: true })));
   const out = [];
   if (!state.sessions.length) {
@@ -746,6 +773,8 @@ function render() {
   $("#sidebar").classList.toggle("scope-ws", !!workspace);
   renderRail();
   renderListHead(workspace);
+  // Needs you first: the Everything list below leaves out what it shows.
+  attention.render();
   const root = $("#workspaces");
   root.replaceChildren(...(!state.workspaces.length && !machines.any()
     ? [el(
@@ -763,7 +792,6 @@ function render() {
   wheel.style.setProperty("--spin", running ? `${Math.max(1.1, 9 / running)}s` : "0s");
   wheel.style.setProperty("--spin-state", running ? "running" : "paused");
 
-  attention.render();
   launcher.render();
   broadcast.render();
   if (!tabRenaming) renderTabs();

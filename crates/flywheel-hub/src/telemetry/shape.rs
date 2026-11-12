@@ -69,7 +69,8 @@ pub fn is_poll(shape: &str) -> bool {
     shape == POLL || shape.starts_with("poll ")
 }
 
-const POLL: &str = "poll";
+/// The shape every wait loop is counted as.
+pub const POLL: &str = "poll";
 
 /// A shell command's shape.
 pub fn command(line: &str) -> String {
@@ -138,6 +139,9 @@ pub fn command(line: &str) -> String {
             continue;
         };
         let program = first.rsplit('/').next().unwrap_or(first);
+        if matches!(program, "for" | "select") {
+            return mark(format!("{program} loop"));
+        }
         if matches!(
             program,
             "cd" | "export" | "source" | "." | "set" | "pushd" | "popd" | "true"
@@ -269,6 +273,7 @@ mod tests {
             ("export A=1; npm run build", "npm run"),
             ("cargo test &", "cargo test &"),
             ("ls -la", "ls"),
+            ("for f in a b; do echo $f; done", "for loop"),
             ("", ""),
         ];
         for (line, shape) in cases {

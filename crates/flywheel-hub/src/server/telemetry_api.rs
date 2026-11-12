@@ -452,6 +452,36 @@ pub(super) async fn events(
     }
 }
 
+/// GET /api/telemetry/sessions/{id}/turns: the session's newest turns,
+/// each folded into where its time went, what it touched, and how it ended.
+pub(super) async fn turns(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiQuery(params): ApiQuery<SessionParams>,
+) -> Response {
+    let limit = match number::<usize>(params.limit.as_deref(), "limit") {
+        Ok(limit) => limit.unwrap_or(DEFAULT_TURNS),
+        Err(message) => return error_response(StatusCode::BAD_REQUEST, &message),
+    };
+    let host = host_of(&app, params.host.as_deref());
+    let telemetry = Arc::clone(app.hub.telemetry());
+    match read(move || telemetry.turns(host.as_deref(), &id, limit)).await {
+        Ok(Some(turns)) => Json(json!({
+            "now": crate::telemetry::now_ms(),
+            "turns": turns,
+        }))
+        .into_response(),
+        Ok(None) => error_response(
+            StatusCode::NOT_FOUND,
+            "no telemetry for that session (it has reported nothing yet)",
+        ),
+        Err(refused) => refused,
+    }
+}
+
+/// Turns a turns read gives by default.
+const DEFAULT_TURNS: usize = 20;
+
 pub(super) async fn batch(
     State(app): State<AppState>,
     headers: HeaderMap,

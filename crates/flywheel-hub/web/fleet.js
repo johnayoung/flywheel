@@ -802,20 +802,20 @@ window.FwHubFleet = function (ctx) {
       return;
     }
     const toolMs = found.projects.reduce((n, p) => n + p.tool_ms, 0);
-    const poll = found.polling;
+    const wait = found.waiting;
     const ctxTax = found.context;
     report.replaceChildren(
       windows,
       section("Projects", "", [["project"], ["sessions", 1], ["tool time", 1], ["calls", 1], ["failed", 1], ["cost", 1]],
         found.projects.map((p) => [[p.project], [String(p.sessions), 1], [took(p.tool_ms), 1], [String(p.calls), 1], [String(p.errors), 1, p.errors ? "fl-err" : ""], [dollars(p.cost_usd), 1]])),
-      section("Time by command", poll.ms ? `Polling (sleep, until, while loops) took ${took(poll.ms)}: ${pctOf(poll.ms, poll.shell_ms)}% of shell time. Blocking on the event itself (gh run watch, wait) or a background run frees the turn.` : "",
+      section("Time by command", wait.ms ? `Wait loops (sleep, until, while) took ${took(wait.ms)}: ${pctOf(wait.ms, wait.shell_ms)}% of shell time, ${took(wait.ms / Math.max(1, wait.calls))} each on average${wait.reread ? `; the steps after them re-read about ${tokens(wait.reread)} tokens of context${wait.reread_usd ? ` (${dollars(wait.reread_usd)} where priced)` : ""}` : ""}. Waiting on a run is not waste; each wait is one more step that re-reads the context, so a few long waits cost less than many short ones.` : "",
         [["command"], ["time", 1], ["share", 1], ["calls", 1], ["sessions", 1], ["failed", 1]],
-        found.time.map((row) => [[shapeName(row), 0, row.shape === "poll" ? "fl-err" : ""], [took(row.ms), 1], [`${pctOf(row.ms, toolMs)}%`, 1], [String(row.calls), 1], [String(row.sessions), 1], [String(row.errors || ""), 1]])),
+        found.time.map((row) => [[shapeName(row), 0, row.shape.startsWith("wait loop") ? "fl-warn" : ""], [took(row.ms), 1], [`${pctOf(row.ms, toolMs)}%`, 1], [String(row.calls), 1], [String(row.sessions), 1], [String(row.errors || ""), 1]])),
       section("Keeps failing", "", [["command"], ["failed", 1], ["of", 1], ["last error"]],
         found.failing.map((row) => [[shapeName(row)], [String(row.errors), 1, "fl-err"], [String(row.calls), 1], [row.last_error || "", 0, "fl-ins-err"]])),
       section("Written again and again", "Files written whole three times or more: keep one script and run it instead.", [["file"], ["writes", 1], ["sessions", 1]],
         found.rewritten.map((row) => [[row.path], [String(row.writes), 1], [String(row.sessions), 1]])),
-      section("Context tax", `${tokens(ctxTax.cache_read)} tokens re-read from cache for ${tokens(ctxTax.output)} written${ctxTax.priced_cost_usd ? ` (${pctOf(ctxTax.cache_read_usd, ctxTax.priced_cost_usd)}% of spend where priced)` : ""}. A handoff or /compact sooner reads less.`,
+      section("Context tax", `${tokens(ctxTax.cache_read)} tokens re-read from cache for ${tokens(ctxTax.output)} written${ctxTax.priced_cost_usd ? ` (${pctOf(ctxTax.cache_read_usd, ctxTax.priced_cost_usd)}% of spend where priced)` : ""}. Where a long context is re-read most.`,
         [["session"], ["project"], ["re-read", 1], ["written", 1], ["re-read cost", 1], ["context now", 1]],
         ctxTax.sessions.map((row) => [[row.label || row.session.slice(0, 8)], [row.project], [tokens(row.cache_read), 1], [tokens(row.output), 1], [row.cache_read_usd == null ? "-" : dollars(row.cache_read_usd), 1], [row.context ? tokens(row.context) : "-", 1]])),
     );

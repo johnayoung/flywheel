@@ -1523,7 +1523,7 @@ fn call(
 }
 
 #[test]
-fn insights_count_time_by_command_polling_failures_rewrites_and_context() {
+fn insights_count_time_by_command_waits_failures_rewrites_and_context() {
     let (_dir, telemetry) = open();
     let start = |s: &str, dir: &str| {
         telemetry.record(
@@ -1619,10 +1619,10 @@ fn insights_count_time_by_command_polling_failures_rewrites_and_context() {
         .iter()
         .map(|t| (t.shape.as_str(), t.ms, t.calls))
         .collect();
-    assert_eq!(time[0], ("poll", 120_000, 1), "{time:?}");
+    assert_eq!(time[0], ("wait loop", 120_000, 1), "{time:?}");
     assert_eq!(time[1], ("cargo test", 90_000, 2), "{time:?}");
-    assert_eq!(found.polling.ms, 120_000);
-    assert_eq!(found.polling.shell_ms, 120_000 + 90_000 + 15_000);
+    assert_eq!(found.waiting.ms, 120_000);
+    assert_eq!(found.waiting.shell_ms, 120_000 + 90_000 + 15_000);
     let failing: Vec<(&str, u64)> = found
         .failing
         .iter()

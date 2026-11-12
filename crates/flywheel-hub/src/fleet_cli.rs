@@ -36,6 +36,11 @@ pub(crate) struct FleetArgs {
     /// List captured runs one by one instead of counted in their batches.
     #[arg(long)]
     all: bool,
+    /// With SESSION: its newest N turns (default 10), each as where its
+    /// time went, the files and commands it touched, cost, and ending.
+    #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "10",
+          requires = "session", conflicts_with_all = ["status", "batch", "all", "lanes"])]
+    turns: Option<u32>,
     /// The fleet in lanes: needs you, moving, waiting on time, finished
     /// (nobody has looked since), idle; each grouped by project.
     #[arg(long, conflicts_with_all = ["session", "status", "batch", "all", "limit"])]
@@ -66,6 +71,25 @@ fn run(args: &FleetArgs, out: &mut dyn Write) -> Result<(), String> {
             Some(_) => query.clone(),
             None => find_session(&conn, query)?.0,
         };
+        if let Some(limit) = args.turns {
+            let mut params = vec![format!("limit={limit}")];
+            params.extend(host);
+            let found = conn.blocking_call(
+                "GET",
+                &format!(
+                    "/api/telemetry/sessions/{}/turns?{}",
+                    query_escape(&id),
+                    params.join("&")
+                ),
+                None,
+            )?;
+            if args.json {
+                print_json(out, &found);
+            } else {
+                print_turns(out, &found);
+            }
+            return Ok(());
+        }
         let path = format!(
             "/api/telemetry/sessions/{}{}",
             query_escape(&id),
@@ -571,6 +595,153 @@ fn mark(status: &str) -> &'static str {
     }
 }
 
+/// A session's turns, newest first: one block each.
+pub(crate) fn print_turns(out: &mut dyn Write, found: &Value) {
+    let now = found["now"].as_i64().unwrap_or(0);
+    let turns = found["turns"].as_array().map_or(&[][..], Vec::as_slice);
+    if turns.is_empty() {
+        let _ = writeln!(out, "no turn yet");
+        return;
+    }
+    for (i, turn) in turns.iter().enumerate() {
+        if i > 0 {
+            let _ = writeln!(out);
+        }
+        let started = turn["started"].as_i64().unwrap_or(now);
+        let took = turn["finished"].as_i64().unwrap_or(now) - started;
+        let mut facts = vec![
+            str_field(turn, "status").to_owned(),
+            span(took),
+            format!("{} calls", turn["calls"].as_u64().unwrap_or(0)),
+        ];
+        if let Some(errors) = turn["errors"].as_u64().filter(|e| *e > 0) {
+            facts.push(format!("{errors} failed"));
+        }
+        if let Some(cost) = turn["cost_usd"].as_f64() {
+            facts.push(dollars(cost));
+        }
+        if turn["compacted"] == true {
+            facts.push("compacted".to_owned());
+        }
+        if turn["partial"] == true {
+            facts.push("older calls not read".to_owned());
+        }
+        let title = str_field(turn, "title");
+        let _ = writeln!(
+            out,
+            "{} ({})",
+            shown(
+                if title.is_empty() {
+                    "(prompt not seen)"
+                } else {
+                    title
+                },
+                90
+            ),
+            facts.join(", ")
+        );
+        let stations: Vec<String> = turn["stations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|s| {
+                format!(
+                    "{} {} ({})",
+                    str_field(s, "station"),
+                    span(s["ms"].as_i64().unwrap_or(0)),
+                    s["calls"]
+                )
+            })
+            .collect();
+        if !stations.is_empty() {
+            let _ = writeln!(out, "  time   {}", stations.join(", "));
+        }
+        let read = turn["read"].as_u64().unwrap_or(0);
+        let edited = turn["edited"].as_u64().unwrap_or(0);
+        if read + edited > 0 {
+            let names: Vec<String> = turn["edits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|f| {
+                    let path = str_field(f, "path");
+                    let name = path.rsplit('/').next().unwrap_or(path);
+                    match f["edits"].as_u64().unwrap_or(1) {
+                        1 => shown(name, 40),
+                        n => format!("{} x{n}", shown(name, 40)),
+                    }
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "  files  read {read}, edited {edited}{}",
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", names.join(", "))
+                }
+            );
+        }
+        let commands: Vec<String> = turn["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| {
+                let calls = c["calls"].as_u64().unwrap_or(0);
+                let errors = c["errors"].as_u64().unwrap_or(0);
+                format!(
+                    "{}{}{}",
+                    shown(str_field(c, "shape"), 30),
+                    if calls > 1 {
+                        format!(" x{calls}")
+                    } else {
+                        String::new()
+                    },
+                    if errors > 0 {
+                        format!(" ({errors} failed)")
+                    } else {
+                        String::new()
+                    }
+                )
+            })
+            .collect();
+        if !commands.is_empty() {
+            let _ = writeln!(out, "  ran    {}", commands.join(", "));
+        }
+        if let Some(failure) = turn["failure"].as_object() {
+            let _ = writeln!(
+                out,
+                "  failed {} {}{}",
+                failure
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool"),
+                shown(
+                    failure.get("summary").and_then(Value::as_str).unwrap_or(""),
+                    60
+                ),
+                failure
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(|e| format!(": {}", shown(e, 80)))
+                    .unwrap_or_default()
+            );
+        }
+        if let Some(error) = turn["error"].as_str() {
+            let _ = writeln!(out, "  error  {}", shown(error, 160));
+        } else if let Some(ending) = turn["ending"].as_str() {
+            // Its last line of prose (a table row says little alone).
+            let last = ending
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && !l.starts_with('|') && !l.starts_with("```"))
+                .unwrap_or("");
+            let _ = writeln!(out, "  ended  {}", shown(last.trim(), 160));
+        }
+    }
+}
+
 fn print_session(out: &mut dyn Write, found: &Value) {
     let now = found["now"].as_i64().unwrap_or(0);
     let session = &found["session"];
@@ -690,6 +861,31 @@ fn print_session(out: &mut dyn Write, found: &Value) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn turns_read_as_time_files_commands_and_ending() {
+        let found = json!({"now": 100_000, "turns": [{
+            "id": "t1", "title": "fix the build", "status": "done", "started": 0,
+            "finished": 90_000, "calls": 5, "errors": 1, "cost_usd": 0.42,
+            "compacted": false, "stations": [
+                {"station": "shell", "calls": 2, "ms": 60_000, "errors": 1},
+                {"station": "files", "calls": 3, "ms": 2_000, "errors": 0}],
+            "read": 3, "edited": 1, "edits": [{"path": "/r/src/main.rs", "edits": 2}],
+            "commands": [{"shape": "cargo test", "calls": 2, "errors": 1, "ms": 60_000}],
+            "failure": {"tool": "Bash", "summary": "cargo test", "error": "exit 101"},
+            "ending": "Done.\n| a | b |\nThe build is green."}]});
+        let shown = text(|out| print_turns(out, &found));
+        for want in [
+            "fix the build (done, 1m, 5 calls, 1 failed, $0.42)",
+            "time   shell 1m (2), files 2s (3)",
+            "files  read 3, edited 1: main.rs x2",
+            "ran    cargo test x2 (1 failed)",
+            "failed Bash cargo test: exit 101",
+            "ended  The build is green.",
+        ] {
+            assert!(shown.contains(want), "missing {want:?} in:\n{shown}");
+        }
+    }
 
     fn text(print: impl Fn(&mut dyn Write)) -> String {
         let mut out = Vec::new();

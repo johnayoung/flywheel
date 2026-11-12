@@ -530,6 +530,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             get(telemetry_api::events),
         )
         .route(
+            "/api/telemetry/sessions/{id}/turns",
+            get(telemetry_api::turns),
+        )
+        .route(
             "/api/telemetry/batch",
             post(telemetry_api::batch).layer(axum::extract::DefaultBodyLimit::max(
                 telemetry_api::BATCH_WIRE_MAX,

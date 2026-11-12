@@ -329,6 +329,27 @@ impl Store {
         Ok(events)
     }
 
+    /// A session's events at or after `from` (unix ms), oldest first: the
+    /// last `cap` of them.
+    pub fn events_from(
+        &self,
+        host: &str,
+        session: &str,
+        from: i64,
+        cap: usize,
+    ) -> Result<Vec<Event>, StoreError> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT host, session, seq, ts, kind, agent, work, item, body FROM events
+             WHERE host = ?1 AND session = ?2 AND ts >= ?3 ORDER BY seq DESC LIMIT ?4",
+        )?;
+        let mut events: Vec<Event> = query
+            .query_map(params![host, session, from, cap as i64], read_event)?
+            .filter_map(|row| row.ok().flatten())
+            .collect();
+        events.reverse();
+        Ok(events)
+    }
+
     /// Events `host` observed that reached this store after row `after`,
     /// in that order, with the row each is at (the forwarder's cursor).
     pub fn outbox(

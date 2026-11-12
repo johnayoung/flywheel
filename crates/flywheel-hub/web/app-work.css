@@ -190,6 +190,34 @@
 .wk-stray { margin-top: .6rem; }
 .wk-stray .wk-calls { margin-left: 0; }
 
+/* --- a turn's digest: its calls on its clock, where the time went ---------- */
+.wk-turn-digest { margin: -.1rem 0 .45rem 1.25rem; display: grid; gap: .3rem; min-width: 0; }
+.wk-strip { position: relative; height: 10px; background: var(--bg-3); border: 1px solid var(--rule); overflow: hidden; }
+.wk-seg { position: absolute; top: 0; bottom: 0; background: var(--st, var(--ink-3)); opacity: .9; }
+.wk-seg.sub { top: 50%; opacity: .7; }
+.wk-seg.failed { box-shadow: inset 0 -3px 0 var(--alert); }
+.wk-seg.running { animation: wk-pulse 1.6s var(--ease) infinite; }
+@keyframes wk-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .wk-seg.running { animation: none; } }
+.st-files { --st: color-mix(in srgb, var(--ink) 45%, transparent); }
+.st-edits { --st: var(--signal); }
+.st-shell { --st: var(--brass); }
+.st-wait { --st: repeating-linear-gradient(135deg, var(--brass) 0 2px, transparent 2px 5px); }
+.st-network { --st: color-mix(in srgb, var(--brass) 45%, var(--ink)); }
+.st-browser, .st-agents { --st: color-mix(in srgb, var(--signal) 45%, var(--ink)); }
+.st-memory, .st-plan, .st-skills { --st: color-mix(in srgb, var(--ink) 70%, transparent); }
+.st-you { --st: var(--alert); }
+.st-other { --st: var(--ink-3); }
+.wk-digest { display: flex; flex-wrap: wrap; gap: .1rem .8rem; color: var(--ink-2); font-size: 10.5px; min-width: 0; }
+.wk-dg { display: inline-flex; align-items: center; gap: .3rem; min-width: 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.wk-dg.bad { color: var(--alert); }
+.wk-dg.warn { color: var(--brass); }
+.wk-dg.quiet { color: var(--ink-3); }
+.wk-dot { flex: none; width: .55rem; height: .55rem; background: var(--st, var(--ink-3)); border: 1px solid var(--rule); }
+.wk-end { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink-2); font: 400 11px/1.4 var(--term); }
+.wk-end.full { max-height: 14rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: .35rem .5rem; border-left: 2px solid var(--rule-2); background: var(--bg); }
+.wk-end.bad { color: var(--alert); white-space: normal; overflow-wrap: anywhere; }
+
 /* --- phones: full-screen sheets, thumb-sized controls ----------------------- */
 @media (max-width: 760px) {
   .wk-drawer .cmd-head { padding: .6rem .8rem .6rem; }

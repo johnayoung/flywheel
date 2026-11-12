@@ -155,14 +155,14 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 ## Fleet and work
 
-Every agent session's turns, tool calls (duration, outcome), subagents, plan, waits on you, context window, cost, and rate limits are recorded (`telemetry.db`, 30 days) and folded into what it is doing now.
+Each session's turns, calls, subagents, plan, waits, context, cost, and rate limits are recorded (`telemetry.db`, 30 days) and folded into what it is doing now.
 
-- **Fleet** (live count, `fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle) by project; list; **Insights**.
+- **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle); list; **Insights**.
 - **Needs you** (sidebar, `fw hub inbox`): blocked, then `asking` (a closing question or an `ask_operator` ask), answered in the row.
-- **Handoffs**: a `handoff` prompt waits on Needs you; **Start session** (`fw hub continue`) runs it there, linked. Agents coordinate with `list_sessions` and `message_session` (typed in or queued, signed). `fw hub new` inside an agent links to it.
-- **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (set by `fw worker`); over `_BUDGET` is flagged.
-- **Work** (the header's **work** pill): one session's plan, then its turns with their subagents and calls. A working session's sidebar row shows its plan's bar and step, else its tool.
-- **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` tool (Claude sessions get the hub's tools and a system-prompt paragraph). A declared status is a claim, shown beside its calls; no plan, no percentage.
+- **Handoffs**: a `handoff` prompt waits on Needs you; **Start session** (`fw hub continue`) runs it there, linked. Agents coordinate via `list_sessions`, `message_session` (typed or queued, signed). `fw hub new` inside an agent links to it.
+- **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (set by `fw worker`); over `_BUDGET`: flagged.
+- **Work** (the header's **work** pill, `fw hub fleet SESSION --turns`): plan; per turn a strip of calls by kind, files, commands, cost, ending, subagents. A working sidebar row shows its plan step, else its tool.
+- **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` tool (Claude sessions get the hub's tools and a system-prompt paragraph). Declared status is a claim; no plan, no percentage.
 - **Capture**: Claude Code's hooks POST to the hub (a process per event only for `SessionStart`, until a status line has shown a CLI of 2.1.322 or later, or under `allowedHttpHookUrls`); its status line carries context, cost, and the 5 h / 7 d gauges (yours still shows: the hub's runs it). Codex: its rollout.
 - **Many hosts**: `[telemetry] upstream = "NAME"` sends this hub's events to that machine (`fw hub machine add`) in batches; while it is down they wait here. Its Fleet lists every hub's sessions.
 

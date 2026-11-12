@@ -1,6 +1,6 @@
 //! `fw hub insights`: where time and money went (see
 //! [`crate::telemetry::insights`]): per project, tool time by command,
-//! time spent polling, what keeps failing, files written again and again,
+//! time spent waiting, what keeps failing, files written again and again,
 //! and what re-reading context costs.
 
 use crate::endpoint::{Endpoint, EndpointArgs};
@@ -163,14 +163,34 @@ pub(crate) fn print_insights(out: &mut dyn Write, page: &Value) {
         }
     }
 
-    let polling = &found["polling"];
-    if num(polling, "ms") > 0 {
+    let waiting = &found["waiting"];
+    if num(waiting, "ms") > 0 {
+        let calls = num(waiting, "calls");
+        let _ = write!(
+            out,
+            "\nWAITING: {} in {} wait loops ({} of shell time, {} each on average)",
+            took(num(waiting, "ms")),
+            calls,
+            pct(num(waiting, "ms") as f64, num(waiting, "shell_ms") as f64),
+            took(num(waiting, "ms") / calls.max(1))
+        );
+        let reread = num(waiting, "reread");
+        if reread > 0 {
+            let usd = waiting["reread_usd"].as_f64().unwrap_or(0.0);
+            let _ = write!(
+                out,
+                "; the steps after them re-read about {} tokens of context{}",
+                tokens(reread),
+                if usd > 0.0 {
+                    format!(" ({} where priced)", dollars(usd))
+                } else {
+                    String::new()
+                }
+            );
+        }
         let _ = writeln!(
             out,
-            "\nPOLLING: {} in {} wait loops ({} of shell time): blocking on the event itself (gh run watch, wait) or a background run frees the turn.",
-            took(num(polling, "ms")),
-            num(polling, "calls"),
-            pct(num(polling, "ms") as f64, num(polling, "shell_ms") as f64)
+            ".\n  Waiting on a run is not waste; each wait is one more step that re-reads the context, so a few long waits (gh run watch, wait PID) cost less than many short ones."
         );
     }
 
@@ -227,7 +247,7 @@ pub(crate) fn print_insights(out: &mut dyn Write, page: &Value) {
                 dollars(priced)
             );
         }
-        let _ = writeln!(out, "; a handoff or /compact sooner reads less. The most:");
+        let _ = writeln!(out, "; where a long context is re-read most:");
         for row in sessions {
             let name = row["label"]
                 .as_str()
@@ -276,7 +296,8 @@ mod tests {
                       "errors": 2, "sessions": 2},
                      {"tool": "Read", "shape": "", "calls": 20, "ms": 60_000, "errors": 0,
                       "sessions": 3}],
-            "polling": {"ms": 600_000, "calls": 5, "shell_ms": 2_400_000},
+            "waiting": {"ms": 600_000, "calls": 5, "shell_ms": 2_400_000,
+                        "reread": 3_000_000, "reread_usd": 1.5},
             "failing": [{"tool": "Bash", "shape": "gh run view", "calls": 6, "ms": 1, "errors": 4,
                          "sessions": 1, "last_error": "run not found"}],
             "rewritten": [{"path": "/tmp/probe.py", "writes": 5, "sessions": 3}],
@@ -295,7 +316,7 @@ mod tests {
             "flywheel",
             "50%  cargo test",
             "10 calls in 2 sessions, 2 failed",
-            "POLLING: 10m in 5 wait loops (25% of shell time)",
+            "WAITING: 10m in 5 wait loops (25% of shell time, 2m each on average); the steps after them re-read about 3.0M tokens of context ($1.50 where priced)",
             "4 of 6    gh run view  last: run not found",
             "5x in 3 sessions  /tmp/probe.py",
             "CONTEXT TAX: 435M tokens re-read from cache for 1.3M written (48% of $12.50 spend where priced)",

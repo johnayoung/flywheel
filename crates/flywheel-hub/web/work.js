@@ -4,6 +4,11 @@
 // the palette, a fleet row); the same content in a read-only sheet for a
 // session a collector holds only as telemetry (fleet.js).
 //
+// .../turns folds each of the newest turns: a strip of its calls along its
+// own clock (coloured by kind of work: files, edits, shell, wait, network,
+// agents...), a one-line digest (files read and edited, commands run and
+// how they failed, cost), and how it ended. The drawer opens over the
+// terminal and never replaces it.
 // GET /api/telemetry/sessions/{id} gives the session in full: its status,
 // context, cost, rate limits, the agent's declared plan, and the tree of
 // turns and subagents. .../events gives the event log the tool calls are
@@ -19,6 +24,7 @@ window.FwHubWork = function (ctx) {
   const { tokens, dollars, plural } = window.FwHubFmt;
 
   const PAGE = 300;
+  const TURNS = 30;
   const OLDER_PAGE = 1000;
 
   // --- shared parts (fleet.js draws its rows with these) -------------------
@@ -141,6 +147,7 @@ window.FwHubWork = function (ctx) {
     after: false, // newer events are being loaded
     again: false, // ...and a push came meanwhile
     expanded: new Map(), // turn id -> whether its calls show (the user's choice)
+    turns: new Map(), // turn id -> its digest (GET .../turns)
     seq: 0,
     abort: null,
     timer: 0,
@@ -178,6 +185,7 @@ window.FwHubWork = function (ctx) {
       view.missing = false;
       view.error = "";
       catchUp();
+      loadTurns();
     } catch (error) {
       if (seq !== view.seq) return;
       if (error.status === 404) {
@@ -189,6 +197,21 @@ window.FwHubWork = function (ctx) {
       }
     }
     render();
+  }
+
+  // The newest turns' digests (with each detail read: at most once a second).
+  async function loadTurns() {
+    const target = view.target;
+    const seq = view.seq;
+    try {
+      const data = await rawApi("GET", path(target, "/turns", { limit: String(TURNS) }), undefined, view.abort.signal);
+      if (seq !== view.seq) return;
+      view.turns = new Map((data.turns || []).map((t) => [t.id, t]));
+      render();
+    } catch (error) {
+      // The digests only add to the tree: without them it shows as before.
+      if (seq !== view.seq || error.name === "AbortError") return;
+    }
   }
 
   async function loadNewest() {
@@ -472,6 +495,94 @@ window.FwHubWork = function (ctx) {
     return item.status === "active" ? live(item.started, 0) : null;
   }
 
+  // --- rendering: a turn's digest ------------------------------------------
+
+  const STATION_LABEL = {
+    files: "reading", edits: "editing", shell: "shell", wait: "waiting", network: "network",
+    browser: "browser", agents: "agents", skills: "skills", plan: "plan", memory: "memory",
+    you: "asking you", other: "other",
+  };
+
+  // The turn's calls along its own clock: where each started and how long
+  // it took, coloured by kind of work, failures marked.
+  function strip(t) {
+    // A subagent can outlast its turn: the strip runs to its last call.
+    const last = t.strip.reduce((n, seg) => Math.max(n, t.started + seg.at + (seg.ms || 0)), 0);
+    const end = Math.max(t.finished || now(), last);
+    const total = Math.max(1, end - t.started);
+    const pct = (ms) => Math.min(100, Math.max(0, (ms / total) * 100));
+    return el("div", { className: "wk-strip", role: "img", "aria-label": `Calls of this turn along its ${dur(total, true)}` },
+      t.strip.map((seg) => {
+        const ms = seg.ms == null ? Math.max(0, end - t.started - seg.at) : seg.ms;
+        const left = pct(seg.at);
+        const what = `${seg.what}${seg.calls > 1 ? ` (+${seg.calls - 1} more)` : ""}`;
+        return el("span", {
+          className: `wk-seg st-${seg.station}${seg.failed ? " failed" : ""}${seg.sub ? " sub" : ""}${seg.ms == null ? " running" : ""}`,
+          style: `left:${left}%;width:max(2px,${Math.min(100 - left, pct(ms))}%)`,
+          title: `${STATION_LABEL[seg.station] || seg.station} ${seg.ms == null ? "(running)" : dur(seg.ms)} at +${dur(seg.at, true)}\n${what}${seg.failed ? "\nfailed" : ""}`,
+        });
+      }));
+  }
+
+  const baseName = (path) => path.split("/").filter(Boolean).pop() || path;
+
+  // One line: time by kind of work, files, commands, cost.
+  function digestLine(t) {
+    const parts = [];
+    for (const st of t.stations.slice(0, 4)) {
+      if (st.ms < 1000) continue;
+      parts.push(el("span", { className: `wk-dg st-${st.station}${st.errors ? " bad" : ""}`, title: `${plural(st.calls, "call")}${st.errors ? `, ${st.errors} failed` : ""}` },
+        el("i", { className: "wk-dot" }), `${STATION_LABEL[st.station] || st.station} ${dur(st.ms, true)}`));
+    }
+    if (t.read || t.edited) {
+      const names = t.edits.slice(0, 3).map((f) => `${baseName(f.path)}${f.edits > 1 ? ` x${f.edits}` : ""}`);
+      parts.push(el("span", { className: "wk-dg", title: t.edits.map((f) => `${f.path} (${plural(f.edits, "edit")})`).join("\n") },
+        `read ${t.read}`, t.edited ? `, edited ${t.edited}${names.length ? `: ${names.join(", ")}${t.edited > names.length ? ", ..." : ""}` : ""}` : ""));
+    }
+    if (t.commands.length) {
+      const top = t.commands.slice(0, 3).map((c) => `${c.shape}${c.calls > 1 ? ` x${c.calls}` : ""}${c.errors ? ` (${c.errors} failed)` : ""}`);
+      parts.push(el("span", { className: `wk-dg${t.commands.some((c) => c.errors) ? " bad" : ""}`, title: t.commands.map((c) => `${c.shape}: ${plural(c.calls, "call")}, ${dur(c.ms, true)}${c.errors ? `, ${c.errors} failed` : ""}`).join("\n") },
+        `ran ${top.join(", ")}${t.commands.length > 3 ? ", ..." : ""}`));
+    }
+    if (t.cost_usd != null) parts.push(el("span", { className: "wk-dg", textContent: dollars(t.cost_usd) }));
+    if (t.compacted) parts.push(el("span", { className: "wk-dg warn", textContent: "compacted" }));
+    if (t.waits) parts.push(el("span", { className: "wk-dg warn", textContent: `waited on you ${t.waits > 1 ? `${t.waits}x` : ""}`.trim() }));
+    if (t.partial) parts.push(el("span", { className: "wk-dg quiet", textContent: "earlier calls not read" }));
+    return parts.length ? el("div", { className: "wk-digest" }, parts) : null;
+  }
+
+  // Its last line of prose: what the agent left the operator with.
+  function endingLine(text) {
+    const lines = text.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("|") && !l.startsWith("```"));
+    return lines.length ? lines[lines.length - 1] : "";
+  }
+
+  function digest(t, expanded) {
+    if (!t) return null;
+    const out = [];
+    if (t.strip.length) out.push(strip(t));
+    out.push(digestLine(t));
+    if (t.error) out.push(el("p", { className: "wk-end bad", textContent: t.error }));
+    else if (t.ending) {
+      out.push(expanded
+        ? el("pre", { className: "wk-end full", textContent: t.ending })
+        : el("p", { className: "wk-end", textContent: endingLine(t.ending), title: "How the turn ended (open the turn for more)" }));
+    }
+    if (expanded && t.failure) {
+      out.push(el("p", { className: "wk-end bad" }, `last failure: ${t.failure.tool}${t.failure.summary ? ` ${t.failure.summary}` : ""}${t.failure.error ? ` -- ${t.failure.error}` : ""}`));
+    }
+    return el("div", { className: "wk-turn-digest" }, out.filter(Boolean));
+  }
+
+  // A prompt another agent sent (Claude Code wraps it in an
+  // <agent-message from="..."> tag) reads as such.
+  function promptTitle(title) {
+    const m = /^<agent-message[^>]*>\s*(?:\[([^\]]+)\]\s*)?/i.exec(title || "");
+    if (!m) return title;
+    const rest = title.slice(m[0].length).replace(/<\/agent-message>\s*$/i, "");
+    return `${m[1] ? m[1].toLowerCase() : "agent message"}: ${rest}`;
+  }
+
   // Turns newest first, each with its subagents and (expanded) its calls.
   function tree(d) {
     const work = d.work || [];
@@ -595,7 +706,7 @@ window.FwHubWork = function (ctx) {
           },
         },
         icon("chev"),
-        el("span", { className: `wk-turn-title${item.title ? "" : " none"}`, textContent: item.title || "(prompt not seen)", title: item.title || "" }),
+        el("span", { className: `wk-turn-title${item.title ? "" : " none"}`, textContent: promptTitle(item.title) || "(prompt not seen)", title: item.title || "" }),
         statusTag(item.status),
         tally(item, ""),
       );
@@ -614,6 +725,7 @@ window.FwHubWork = function (ctx) {
         "li",
         { className: `wk-turn ${item.status}${expanded ? " open" : ""}` },
         head,
+        digest(view.turns.get(item.id), expanded),
         below.length ? el("ul", { className: "wk-subs" }, below.map(subagent)) : null,
         calls,
       );
@@ -705,6 +817,7 @@ window.FwHubWork = function (ctx) {
     view.detailTimer = 0;
     view.target = null;
     view.detail = null;
+    view.turns = new Map();
     view.events = [];
     view.after = false;
     view.again = false;

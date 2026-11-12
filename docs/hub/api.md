@@ -250,10 +250,11 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 |---|---|---|
 | GET | `/api/telemetry/fleet[?status=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `host` (this hub's id), `sessions` (urgent first), `total`, `counts`, `hosts`; `hours=0`: any age; `rollup=1`: captured runs as `batches` (counts, cost, budget); `batch=KEY`: its runs |
 | GET | `/api/telemetry/lanes[?host=&hours=]` | `lanes` (`id`, `count`, `groups` of `cards`), `total`, `placed`, `runs` |
-| GET | `/api/telemetry/insights[?host=&hours=&project=]` | `insights`: `projects`, `time`, `polling`, `failing`, `rewritten`, `context` |
+| GET | `/api/telemetry/insights[?host=&hours=&project=]` | `insights`: `projects`, `time`, `waiting`, `failing`, `rewritten`, `context` |
 | GET | `/api/telemetry/capture/hooks` | what `capture install` writes |
 | GET | `/api/telemetry/sessions/{id}[?host=]` | `session`: its snapshot, `work` tree, `plans`; 404 before any event |
 | GET | `/api/telemetry/sessions/{id}/events[?host=&after=&limit=&newest=1]` | `events` by `seq`, oldest first |
+| GET | `/api/telemetry/sessions/{id}/turns[?host=&limit=]` | `turns`, newest first, folded |
 | POST | `/api/telemetry/batch` | another hub's events, NDJSON (or `Content-Encoding: deflate`) -> `received`, `accepted` |
 | POST | `/api/telemetry/hook` | a Claude Code hook; no login: `x-flywheel-session`, `x-flywheel-secret` |
 | POST | `/api/telemetry/mcp` | agent tools (MCP over http); same headers |

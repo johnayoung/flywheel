@@ -248,4 +248,5 @@
 .fl-ins-table td:first-child { color: var(--ink); font-family: var(--term); }
 .fl-ins-table .fl-num { text-align: right; }
 .fl-ins-table td.fl-err { color: var(--alert); }
+.fl-ins-table td.fl-warn { color: var(--brass); }
 .fl-ins-err { max-width: 28rem; color: var(--ink-3); }

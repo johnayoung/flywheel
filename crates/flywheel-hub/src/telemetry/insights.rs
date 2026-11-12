@@ -5,7 +5,10 @@
 //! * `projects`: per project, sessions, tool time, calls, failures, cost.
 //! * `time`: tool time by shape (a shell command by program and verb, any
 //!   other tool by name), the most first.
-//! * `polling`: time spent in wait loops (`sleep`, `until`, `while`).
+//! * `waiting`: time spent in wait loops (`sleep`, `until`, `while`), and
+//!   what the waits cost in model steps: waiting on a run is no waste, but
+//!   each wait call is one more step that re-reads the session's context,
+//!   so many short waits cost what one long one does not.
 //! * `failing`: shapes that keep failing, with their last error.
 //! * `rewritten`: files written whole again and again (throwaway scripts
 //!   an agent writes anew instead of keeping one).
@@ -31,7 +34,7 @@ const REWRITTEN_MIN: i64 = 3;
 pub struct Insights {
     pub projects: Vec<ProjectUse>,
     pub time: Vec<ShapeUse>,
-    pub polling: Polling,
+    pub waiting: Waiting,
     pub failing: Vec<ShapeUse>,
     pub rewritten: Vec<Rewritten>,
     pub context: ContextTax,
@@ -61,11 +64,16 @@ pub struct ShapeUse {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub struct Polling {
+pub struct Waiting {
     pub ms: u64,
     pub calls: u64,
     /// Of all shell time.
     pub shell_ms: u64,
+    /// Context tokens the steps after the waits re-read, estimated as each
+    /// wait call times its session's context now; and their price where
+    /// the session's model is known.
+    pub reread: u64,
+    pub reread_usd: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -142,14 +150,40 @@ impl Store {
             .query_map(params![since, host, project], shape_use)?
             .filter_map(Result::ok)
             .collect();
-        let mut polling = Polling::default();
+        let mut waiting = Waiting::default();
         for kind in &all {
             if shell(&kind.tool) {
-                polling.shell_ms += kind.ms;
+                waiting.shell_ms += kind.ms;
                 if shape::is_poll(&kind.shape) {
-                    polling.ms += kind.ms;
-                    polling.calls += kind.calls;
+                    waiting.ms += kind.ms;
+                    waiting.calls += kind.calls;
                 }
+            }
+        }
+        let rereads = conn
+            .prepare_cached(&format!(
+                "SELECT SUM(t.calls), json_extract(s.snap, '$.context.used'),
+                        json_extract(s.snap, '$.model')
+                 FROM tool_use t JOIN sessions s ON s.host = t.host AND s.session = t.session
+                 WHERE t.tool IN {SHELLS} AND (t.shape = 'poll' OR t.shape LIKE 'poll %')
+                   AND t.last_ts >= ?1 AND (?2 IS NULL OR t.host = ?2)
+                   AND (?3 IS NULL OR t.project = ?3)
+                 GROUP BY t.host, t.session"
+            ))?
+            .query_map(params![since, host, project], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        for (calls, used, model) in rereads {
+            let read = calls.max(0) as u64 * used.map_or(0, |u| u.max(0) as u64);
+            waiting.reread += read;
+            if let Some(rate) = cache_read_rate(model.as_deref()) {
+                waiting.reread_usd += read as f64 * rate / 1_000_000.0;
             }
         }
         let mut failing: Vec<ShapeUse> = all
@@ -161,9 +195,12 @@ impl Store {
         failing.truncate(LIST_MAX);
         all.sort_by(|a, b| b.ms.cmp(&a.ms));
         all.truncate(LIST_MAX);
-        for kind in &mut all {
+        for kind in all.iter_mut().chain(failing.iter_mut()) {
             if kind.errors == 0 {
                 kind.last_error = None;
+            }
+            if shell(&kind.tool) && shape::is_poll(&kind.shape) {
+                kind.shape = kind.shape.replacen(shape::POLL, WAIT_LABEL, 1);
             }
         }
 
@@ -252,11 +289,7 @@ impl Store {
             };
             let output = output.map_or(0, |o| o.max(0) as u64);
             // `claude-opus-5-5[1m]`: the model is what is priced.
-            let rate = model
-                .as_deref()
-                .map(|m| m.split('[').next().unwrap_or(m))
-                .and_then(crate::usage::price_of)
-                .map(|price| price.base.cache_read);
+            let rate = cache_read_rate(model.as_deref());
             let read_usd = rate.map(|rate| read as f64 * rate / 1_000_000.0);
             context.cache_read += read;
             context.output += output;
@@ -288,12 +321,24 @@ impl Store {
         Ok(Insights {
             projects,
             time: all,
-            polling,
+            waiting,
             failing,
             rewritten,
             context,
         })
     }
+}
+
+/// What a wait loop is called in the lists.
+const WAIT_LABEL: &str = "wait loop";
+
+/// A model's cache-read price per million tokens (`claude-opus-5-5[1m]`:
+/// the model is what is priced).
+fn cache_read_rate(model: Option<&str>) -> Option<f64> {
+    model
+        .map(|m| m.split('[').next().unwrap_or(m))
+        .and_then(crate::usage::price_of)
+        .map(|price| price.base.cache_read)
 }
 
 fn shell(tool: &str) -> bool {

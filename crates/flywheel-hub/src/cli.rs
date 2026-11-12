@@ -157,7 +157,7 @@ enum HubCommand {
     /// `capture status` says where they report.
     Capture(crate::capture_cli::CaptureArgs),
     /// Where time and money went: per project (sessions, tool time,
-    /// failures, cost), tool time by command, time spent polling, what
+    /// failures, cost), tool time by command, time spent waiting, what
     /// keeps failing, files written again and again, and what re-reading
     /// context cost each session.
     Insights(crate::insights_cli::InsightsArgs),

@@ -36,10 +36,12 @@ pub mod lanes;
 pub mod mcp;
 pub mod reduce;
 pub mod shape;
+pub mod station;
 pub mod store;
 pub mod summary;
 #[cfg(test)]
 mod tests;
+pub mod turns;
 
 pub use event::{
     Draft, Event, ItemStatus, OUTSIDE_ROLLUP, Outcome, PlanStep, SessionLinks, WaitReason, What,
@@ -71,6 +73,10 @@ type Key = (String, String);
 type Announce = dyn Fn(Snapshot) + Send + Sync;
 
 /// Unix milliseconds now.
+/// Most turns one read folds, and most events it reads for them.
+pub const TURNS_MAX: usize = 60;
+const TURN_EVENTS_MAX: usize = 20_000;
+
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -294,6 +300,42 @@ impl Telemetry {
             limit,
             newest,
         )
+    }
+
+    /// The newest `limit` turns of a session, each folded (see
+    /// [`turns`]); `None`: the session has reported nothing.
+    pub fn turns(
+        &self,
+        host: Option<&str>,
+        session: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<turns::Turn>>, StoreError> {
+        let Some(detail) = self.detail(host, session) else {
+            return Ok(None);
+        };
+        let limit = limit.clamp(1, TURNS_MAX);
+        let mut starts: Vec<i64> = detail
+            .work
+            .iter()
+            .filter(|w| w.source == reduce::WorkSource::Turn)
+            .map(|w| w.started)
+            .collect();
+        starts.sort_unstable();
+        let from = starts
+            .len()
+            .checked_sub(limit)
+            .and_then(|at| starts.get(at))
+            .copied()
+            .unwrap_or(0);
+        self.flush();
+        let events = lock(&self.inner.read).events_from(
+            host.unwrap_or(&self.inner.host),
+            session,
+            from,
+            TURN_EVENTS_MAX,
+        )?;
+        let complete = events.first().is_some_and(|e| e.seq == 1);
+        Ok(Some(turns::fold(&detail.work, &events, limit, complete)))
     }
 
     /// Where time and money went (see [`insights`]).

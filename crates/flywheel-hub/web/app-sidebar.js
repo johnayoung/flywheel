@@ -766,6 +766,15 @@ function renderWorkspaceList(workspace) {
 }
 
 function render() {
+  // An inline rename being typed is never torn down under the user, by
+  // any repaint (a status push, a timer, a refresh): rebuilding the list
+  // would drop the field's focus, and its blur ends the rename. The list
+  // repaints when the rename ends (renameSession).
+  if (state.renaming && $(".session .rename")) {
+    attention.render();
+    renderMain();
+    return;
+  }
   search.refreshFilters();
   followAttached();
   const workspace = scopedWorkspace();

@@ -276,8 +276,10 @@
             <h2 id="wk-title"></h2>
             <span id="wk-where" class="wk-where"></span>
           </div>
+          <button type="button" class="text-btn wk-map-toggle" id="wk-map-toggle" aria-controls="wk-map">map</button>
           <button type="button" class="icon" id="wk-close" title="Close (Esc)" aria-label="Close the work view"><svg><use href="#i-x"/></svg></button>
         </header>
+        <div id="wk-map" class="wk-map"></div>
         <div id="wk-body" class="wk-body"></div>
       </aside>
       <div id="empty" class="empty">
@@ -774,8 +776,10 @@
         <h2 id="wkd-title"></h2>
         <span id="wkd-where" class="wk-where"></span>
       </div>
+      <button type="button" class="text-btn wk-map-toggle" id="wkd-map-toggle" aria-controls="wkd-map">map</button>
       <button type="button" class="icon" id="wkd-close" title="Close (Esc)" aria-label="Close the work view"><svg><use href="#i-x"/></svg></button>
     </header>
+    <div id="wkd-map" class="wk-map"></div>
     <div id="wkd-body" class="wk-body"></div>
   </div>
 </dialog>
@@ -857,6 +861,7 @@
 <script src="/assets/queue.js"></script>
 <script src="/assets/broadcast.js"></script>
 <script src="/assets/activity.js"></script>
+<script src="/assets/map.js"></script>
 <script src="/assets/work.js"></script>
 <script src="/assets/fleet.js"></script>
 <script src="/assets/digest.js"></script>

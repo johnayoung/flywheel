@@ -22,6 +22,9 @@
 window.FwHubWork = function (ctx) {
   const { $, el, icon, rawApi, span, state, sessionById, workspaceById, isAgent } = ctx;
   const { tokens, dollars, plural } = window.FwHubFmt;
+  // The live map above the tree (map.js), one for whichever view is open.
+  const map = window.FwHubMap();
+  let mapShown = ctx.store.get("work-map", true) !== false;
 
   const PAGE = 300;
   const TURNS = 30;
@@ -184,6 +187,7 @@ window.FwHubWork = function (ctx) {
       view.detail = data.session;
       view.missing = false;
       view.error = "";
+      map.detail(view.detail);
       catchUp();
       loadTurns();
     } catch (error) {
@@ -223,6 +227,7 @@ window.FwHubWork = function (ctx) {
       view.events = data.events || [];
       view.complete = view.events.length < PAGE || view.events[0].seq <= 1;
       view.loaded = true;
+      map.feed(view.events, false);
       catchUp();
     } catch (error) {
       if (seq !== view.seq) return;
@@ -247,6 +252,7 @@ window.FwHubWork = function (ctx) {
         if (seq !== view.seq) return;
         const fresh = (data.events || []).filter((e) => e.seq > last);
         view.events = view.events.concat(fresh);
+        map.feed(fresh, last > 0);
         if (last === 0) view.complete = true;
         if (fresh.length < PAGE && !view.again) break;
         view.again = false;
@@ -323,6 +329,7 @@ window.FwHubWork = function (ctx) {
     if (view.detail && snap.seq >= view.detail.seq) {
       // The strip follows at once; the tree and plans with the refetch.
       view.detail = { ...snap, work: view.detail.work, plans: view.detail.plans };
+      map.detail(view.detail);
       render();
     }
     if (view.loaded && snap.seq > lastSeq()) loadAfter();
@@ -835,6 +842,9 @@ window.FwHubWork = function (ctx) {
     view.complete = false;
     view.expanded = new Map();
     view.detailAt = Date.now();
+    map.reset();
+    $(target.mode === "drawer" ? "#wk-map" : "#wkd-map").replaceChildren(map.node);
+    showMap();
     render();
     bodyOf(target).scrollTop = 0;
     loadDetail();
@@ -842,7 +852,25 @@ window.FwHubWork = function (ctx) {
     view.timer = setInterval(() => {
       if (!view.target || document.visibilityState !== "visible") return;
       tick(view.target.mode === "drawer" ? drawer : dialog);
+      if (mapShown) map.tick();
     }, 1000);
+  }
+
+  // The map shown or folded away (kept per browser).
+  function showMap() {
+    for (const [host, toggle] of [["#wk-map", "#wk-map-toggle"], ["#wkd-map", "#wkd-map-toggle"]]) {
+      $(host).hidden = !mapShown;
+      const button = $(toggle);
+      button.setAttribute("aria-expanded", mapShown ? "true" : "false");
+      button.title = mapShown ? "Fold the live map away" : "Show the live map: where the session's calls go";
+      button.classList.toggle("on", mapShown);
+    }
+  }
+  function toggleMap() {
+    mapShown = !mapShown;
+    ctx.store.set("work-map", mapShown);
+    showMap();
+    if (mapShown) map.tick();
   }
 
   // The drawer, for a session this browser knows (attach it first).
@@ -912,6 +940,8 @@ window.FwHubWork = function (ctx) {
   // --- wiring --------------------------------------------------------------
 
   $("#wk-close").addEventListener("click", () => closeDrawer());
+  $("#wk-map-toggle").addEventListener("click", () => toggleMap());
+  $("#wkd-map-toggle").addEventListener("click", () => toggleMap());
   $("#wkd-close").addEventListener("click", () => close());
   drawer.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !document.querySelector("dialog[open]")) {

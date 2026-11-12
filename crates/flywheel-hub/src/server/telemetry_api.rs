@@ -27,7 +27,7 @@
 use super::{ApiQuery, AppState, BodyBound, error_response};
 use crate::agent::{BATCH_HEADER, BUDGET_HEADER, CAPTURE_HEADER, SECRET_HEADER, SESSION_HEADER};
 use crate::hub::{CaptureFrom, CaptureRefused};
-use crate::telemetry::{FleetQuery, forward, mcp};
+use crate::telemetry::{FleetQuery, What, forward, mcp, station};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -447,7 +447,28 @@ pub(super) async fn events(
     let host = host_of(&app, params.host.as_deref());
     let telemetry = Arc::clone(app.hub.telemetry());
     match read(move || telemetry.events(host.as_deref(), &id, after, limit, newest)).await {
-        Ok(events) => Json(json!({ "events": events })).into_response(),
+        Ok(events) => {
+            // Each call carries the kind of work it is (the live map's
+            // station; see `telemetry::station`).
+            let events: Vec<Value> = events
+                .into_iter()
+                .map(|event| {
+                    let station = match &event.what {
+                        What::ToolStarted { name, summary, .. }
+                        | What::ToolFinished { name, summary, .. } => {
+                            Some(station::of(name, summary.as_deref()).name())
+                        }
+                        _ => None,
+                    };
+                    let mut value = serde_json::to_value(&event).unwrap_or(Value::Null);
+                    if let (Some(station), Some(fields)) = (station, value.as_object_mut()) {
+                        fields.insert("station".into(), Value::from(station));
+                    }
+                    value
+                })
+                .collect();
+            Json(json!({ "events": events })).into_response()
+        }
         Err(refused) => refused,
     }
 }

@@ -192,6 +192,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         include_bytes!("../web/app-work.css"),
         "text/css; charset=utf-8",
     ),
+    ("map.js", include_bytes!("../web/map.js"), JS),
     ("work.js", include_bytes!("../web/work.js"), JS),
     (
         "app-fleet.css",

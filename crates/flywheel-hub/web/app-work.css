@@ -218,6 +218,45 @@
 .wk-end.full { max-height: 14rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: .35rem .5rem; border-left: 2px solid var(--rule-2); background: var(--bg); }
 .wk-end.bad { color: var(--alert); white-space: normal; overflow-wrap: anywhere; }
 
+/* --- the live map (map.js) ------------------------------------------------- */
+.wk-map-toggle { margin-left: auto; align-self: center; font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); }
+.wk-map-toggle.on { color: var(--signal); }
+.wk-map { flex: none; padding: .2rem 1rem .1rem; border-bottom: 1px solid var(--rule-2); }
+.wk-sheet .wk-map { padding: .2rem 1.4rem .1rem; }
+.wk-map[hidden] { display: none; }
+.mp-svg { display: block; width: 100%; height: auto; aspect-ratio: 440 / 236; max-height: 15rem; overflow: visible; font-family: var(--term); }
+.mp-spoke { stroke: var(--rule-2); stroke-linecap: round; transition: stroke-width .4s var(--ease); }
+.mp-spoke.used { stroke: color-mix(in srgb, var(--ink) 28%, transparent); }
+.mp-spoke.on { stroke: var(--signal); }
+.mp-leg { stroke: var(--signal); stroke-width: 1.2; stroke-dasharray: 3 3; }
+.mp-leg.newest { stroke-dasharray: 200; animation: mp-draw .7s var(--ease) both; }
+@keyframes mp-draw { from { stroke-dashoffset: 200; } to { stroke-dashoffset: 0; } }
+.mp-ring-bed { fill: none; stroke: var(--rule-2); stroke-width: 4; }
+.mp-ring { fill: none; stroke: var(--ink-2); stroke-width: 4; stroke-linecap: butt; transition: stroke-dasharray .6s var(--ease); }
+.mp-ring.warm { stroke: var(--brass); }
+.mp-ring.hot { stroke: var(--alert); }
+.mp-ring.flash { animation: mp-flash .8s var(--ease) 3; }
+@keyframes mp-flash { 50% { stroke: var(--signal); stroke-width: 7; } }
+.mp-core { fill: var(--bg); stroke: var(--rule-2); }
+.mp-svg.working .mp-core { stroke: var(--signal); }
+.mp-pct { fill: var(--ink); font-size: 13px; font-weight: 600; text-anchor: middle; }
+.mp-status { fill: var(--ink-3); font-size: 7.5px; letter-spacing: .12em; text-transform: uppercase; text-anchor: middle; }
+.mp-node { fill: var(--bg-3); stroke: var(--st, var(--ink-3)); stroke-width: 1.5; transition: fill .3s var(--ease); }
+.mp-st.idle .mp-node { stroke: var(--rule-2); }
+.mp-st.on .mp-node { fill: var(--signal-soft); stroke: var(--signal); stroke-width: 2; }
+.mp-node.st-wait { stroke: var(--brass); }
+.mp-count { fill: var(--ink-2); font-size: 8.5px; text-anchor: middle; font-variant-numeric: tabular-nums; }
+.mp-label { fill: var(--ink-3); font-size: 8.5px; letter-spacing: .08em; text-anchor: middle; text-transform: uppercase; }
+.mp-st.on .mp-label { fill: var(--signal); }
+.mp-many { fill: var(--signal); font-size: 8.5px; font-weight: 600; }
+.mp-hand { fill: none; stroke: var(--signal); stroke-width: 1.6; }
+.mp-hand.outer { stroke: var(--brass); stroke-width: 1.2; }
+.mp-err circle { fill: var(--alert); }
+.mp-err text { fill: var(--bg); font-size: 7.5px; font-weight: 700; text-anchor: middle; }
+.mp-pulse { fill: var(--signal); }
+.mp-pulse.back { fill: none; stroke: var(--signal); stroke-width: 1.4; }
+@media (prefers-reduced-motion: reduce) { .mp-leg.newest, .mp-ring.flash { animation: none; } }
+
 /* --- phones: full-screen sheets, thumb-sized controls ----------------------- */
 @media (max-width: 760px) {
   .wk-drawer .cmd-head { padding: .6rem .8rem .6rem; }

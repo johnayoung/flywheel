@@ -675,7 +675,7 @@ const activity = window.FwHubActivity({
 // drawer for a session this browser attaches, the read-only sheet for one
 // a collector holds only as telemetry.
 const work = window.FwHubWork({
-  $, el, icon, rawApi, span, state, sessionById, workspaceById, isAgent,
+  $, el, icon, rawApi, span, state, sessionById, workspaceById, isAgent, store,
   agentLook: AGENT_LOOK,
   machinePrefix: (machine) => machines.prefix(machine),
   focusTerminal: () => focusTerminal(),

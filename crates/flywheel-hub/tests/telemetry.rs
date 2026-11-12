@@ -328,6 +328,24 @@ async fn hooks_posted_to_the_hub_drive_status_and_are_recorded() {
     let finished = events.last().unwrap();
     assert_eq!(finished["body"]["id"], "tu1");
     assert_eq!(finished["body"]["outcome"], "error");
+    // Each call carries the kind of work it is (the live map's station).
+    assert_eq!(finished["station"], "shell");
+    assert!(events[0].get("station").is_none());
+    // Its turn, folded: the failed shell call on the turn's own clock.
+    let turns = hub
+        .get(&format!("/api/telemetry/sessions/{sid}/turns"))
+        .await;
+    let turn = &turns["turns"][0];
+    assert_eq!(turn["id"], "t1", "{turns}");
+    assert_eq!(turn["errors"], 1, "{turns}");
+    assert!(
+        turn["strip"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["station"] == "shell" && s["failed"] == true),
+        "{turns}"
+    );
     // The call ran under the plan item that was active.
     assert_eq!(events[5]["item"], "p1");
     assert_eq!(events[5]["work"], "t1");

@@ -159,7 +159,7 @@ Each session's turns, calls, subagents, plan, waits, context, cost, and rate lim
 
 - **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle); list; **Insights**.
 - **Needs you** (sidebar, `fw hub inbox`): blocked, then `asking` (a closing question or an `ask_operator` ask), answered in the row.
-- **Handoffs**: a `handoff` prompt waits on Needs you; **Start session** (`fw hub continue`) runs it there, linked. Agents coordinate via `list_sessions`, `message_session` (typed or queued, signed). `fw hub new` inside an agent links to it.
+- **Handoffs**: the `handoff` tool (`prompt`, `name`?, `reason`?) saves a pending handoff on the session; a Needs you row each until **Start** (**Review** edits) or **Dismiss**; nothing else clears it. `fw hub continue SESSION [--handoff ID]` starts one, linked. Agents coordinate via `list_sessions`, `message_session` (typed or queued, signed). `fw hub new` inside an agent links to it.
 - **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (set by `fw worker`); over `_BUDGET`: flagged.
 - **Work** (the header's **work** pill, `fw hub fleet SESSION --turns`): live **map** (stations open; turns replay); plan; per turn a call strip, files, commands, cost, ending. Sidebar rows: plan step, else tool.
 - **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` tool (Claude sessions get the hub's tools and a system-prompt paragraph). Declared status is a claim; no plan, no percentage.

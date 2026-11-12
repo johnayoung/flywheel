@@ -757,33 +757,121 @@ async fn a_handoff_is_continued_in_a_linked_session_and_agents_message_each_othe
         .unwrap();
     assert_eq!(to_self["result"]["isError"], true, "{to_self}");
 
-    // The first proposes a handoff and ends its turn on it.
+    // The first proposes a handoff: the tool call itself keeps it.
+    let proposed: Value = hub
+        .as_agent(
+            path,
+            &mcp_headers,
+            &env,
+            &call(
+                "handoff",
+                json!({"prompt": "Goal: finish the route.\nDone: the store.",
+                       "name": "route work", "reason": "Long context"}),
+            ),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(proposed["result"]["isError"], false, "{proposed}");
+    let pending =
+        |view: &Value| -> Vec<Value> { view["handoffs"].as_array().cloned().unwrap_or_default() };
+    let first = pending(&hub.get(&format!("/api/sessions/{sid}")).await);
+    assert_eq!(first.len(), 1, "{first:?}");
+    let first_id = first[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(first[0]["name"], "route work");
+    assert_eq!(first[0]["reason"], "Long context");
+    let said = proposed["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        said.contains(&format!("fw hub continue {sid} --handoff {first_id}")),
+        "{said}"
+    );
+    // The hook path sees a tool call, not an ask; a new prompt, a view,
+    // and the turn ending clear nothing.
     for play in [
-        json!({"hook_event_name": "UserPromptSubmit", "prompt": "wrap up"}),
         json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__flywheel__handoff",
-               "tool_use_id": "h1", "tool_input": {"reason": "Long context",
-               "prompt": "Goal: finish the route.\nDone: the store."}}),
+               "tool_use_id": "h1", "tool_input": {"prompt": "Goal: finish the route."}}),
         json!({"hook_event_name": "Stop", "last_assistant_message": "Handed off."}),
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "one more thing"}),
+        json!({"hook_event_name": "Stop", "last_assistant_message": "Done."}),
     ] {
         let response = hub
             .as_agent("/api/telemetry/hook", &hook_headers, &env, &play)
             .await;
         assert_eq!(response.status(), StatusCode::OK, "{play}");
     }
-    let asking = hub.get(&format!("/api/telemetry/sessions/{sid}")).await;
-    assert_eq!(asking["session"]["ask"]["kind"], "handoff", "{asking}");
-
-    // Continuing it starts a linked session from the proposed prompt.
-    let (status, next) = hub
+    let snap = hub.get(&format!("/api/telemetry/sessions/{sid}")).await;
+    assert!(snap["session"]["ask"].is_null(), "{snap}");
+    assert_eq!(
+        pending(&hub.get(&format!("/api/sessions/{sid}")).await).len(),
+        1
+    );
+    // A second handoff waits beside the first.
+    let again: Value = hub
+        .as_agent(
+            path,
+            &mcp_headers,
+            &env,
+            &call("handoff", json!({"prompt": "Goal: write the docs."})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(again["result"]["isError"], false, "{again}");
+    let both = pending(&hub.get(&format!("/api/sessions/{sid}")).await);
+    assert_eq!(both.len(), 2, "{both:?}");
+    let second_id = both[1]["id"].as_str().unwrap().to_owned();
+    // An empty prompt is refused, and kept nowhere.
+    let empty: Value = hub
+        .as_agent(
+            path,
+            &mcp_headers,
+            &env,
+            &call("handoff", json!({"prompt": " "})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(empty["result"]["isError"], true, "{empty}");
+    // Two pending: which one must be said.
+    let (status, refused) = hub
         .call(
             reqwest::Method::POST,
             &format!("/api/sessions/{sid}/continue"),
             Some(json!({})),
         )
         .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let why = refused.to_string();
+    assert!(why.contains(&first_id) && why.contains(&second_id), "{why}");
+
+    // Starting the first: a linked session from its prompt, under its
+    // name; the second still waits.
+    let (status, next) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{sid}/continue"),
+            Some(json!({"handoff": first_id})),
+        )
+        .await;
     assert_eq!(status, StatusCode::CREATED, "{next}");
     assert_eq!(next["continues"], sid.as_str(), "{next}");
     assert_eq!(next["kind"], "claude");
+    assert_eq!(next["name"], "route work");
+    let left = pending(&hub.get(&format!("/api/sessions/{sid}")).await);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["id"], second_id.as_str());
+    // Started once: a second start of it is refused.
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{sid}/continue"),
+            Some(json!({"handoff": first_id})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let next_id = next["id"].as_str().unwrap().to_owned();
     let args_file = hub.dir.path().join("claude.args");
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -810,6 +898,76 @@ async fn a_handoff_is_continued_in_a_linked_session_and_agents_message_each_othe
         )
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Dismissed: gone, unstarted.
+    let (status, _) = hub
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{sid}/handoffs/{second_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(pending(&hub.get(&format!("/api/sessions/{sid}")).await).is_empty());
+    let (status, _) = hub
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{sid}/handoffs/{second_id}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The only one pending is the default; a taken name is numbered on.
+    let third: Value = hub
+        .as_agent(
+            path,
+            &mcp_headers,
+            &env,
+            &call(
+                "handoff",
+                json!({"prompt": "Goal: polish.", "name": "route work"}),
+            ),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(third["result"]["isError"], false, "{third}");
+    let (status, polished) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{sid}/continue"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{polished}");
+    assert_eq!(polished["name"], "route work 2");
+    assert!(pending(&hub.get(&format!("/api/sessions/{sid}")).await).is_empty());
+    // A requested name wins, and is checked as a rename is.
+    let fourth: Value = hub
+        .as_agent(
+            path,
+            &mcp_headers,
+            &env,
+            &call("handoff", json!({"prompt": "Goal: ship.", "name": "x"})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(fourth["result"]["isError"], false, "{fourth}");
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{sid}/continue"),
+            Some(json!({"name": "a\u{7}b"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        pending(&hub.get(&format!("/api/sessions/{sid}")).await).len(),
+        1,
+        "a refused start keeps the handoff"
+    );
     hub.shutdown().await;
 }
 

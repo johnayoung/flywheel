@@ -103,9 +103,9 @@ enum HubCommand {
     /// command, and folder; a fresh terminal).
     Relaunch(script::RelaunchArgs),
     /// Continue an agent session's work in a new session (same directory,
-    /// worktree, model, and account), linked to it: from the prompt its
-    /// agent proposed with the handoff tool, or --prompt. Prints the new
-    /// session's id.
+    /// worktree, model, and account), linked to it: from a handoff its
+    /// agent proposed (--handoff, default the only one pending), or
+    /// --prompt. Prints the new session's id.
     Continue(script::ContinueArgs),
     /// Import VS Code multi-root workspace files (*.code-workspace) as
     /// workspaces: their folders (git repos or plain directories) and

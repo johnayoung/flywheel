@@ -250,6 +250,7 @@ impl Hub {
             account,
             continues: None,
             opened_by: opened_by.clone(),
+            handoffs: Vec::new(),
         };
         if record
             .launch
@@ -552,6 +553,7 @@ impl Hub {
             account: None,
             continues: None,
             opened_by: None,
+            handoffs: Vec::new(),
         };
         Ok((self.launch(record, cols, rows, false, None)?, true))
     }

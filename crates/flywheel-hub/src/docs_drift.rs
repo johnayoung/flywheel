@@ -666,8 +666,10 @@ const PAGES: [(&str, &str); 6] = [
 /// telemetry (six routes, an event log, a config key, two views): the
 /// earlier budget had 2 bytes left. Raised to 89 KiB for asks, handoffs,
 /// and session links (two verbs, a route, two event kinds, three agent
-/// tools), after condensing the fleet section they extend.
-const HUB_DOCS_MAX_BYTES: usize = 89 * 1024;
+/// tools), after condensing the fleet section they extend. Raised to 90
+/// KiB for durable handoffs (a route, three verb flags, a session field):
+/// 28 bytes were left.
+const HUB_DOCS_MAX_BYTES: usize = 90 * 1024;
 /// One reference page's budget. Raised from 25 KiB to 26 for asks,
 /// handoffs, and session links (a route, two event kinds, the snapshot's
 /// `ask` and `links`): api.md was condensed first and still 80 bytes over.

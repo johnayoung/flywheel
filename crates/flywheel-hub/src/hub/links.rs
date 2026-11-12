@@ -2,18 +2,22 @@
 //! a message from one agent to another ([`Hub::agent_message`]), and the
 //! list an agent picks a recipient from ([`Hub::agent_sessions`]).
 //!
-//! An agent proposes a handoff with the hub's `handoff` tool: its prompt
-//! for a fresh session waits on the operator's Needs-you list, and
-//! continuing starts that session in the same directory (worktree, model,
-//! account) with that prompt, linked both ways. A message is typed into
+//! An agent proposes a handoff with the hub's `handoff` tool
+//! ([`Hub::propose_handoff`]): its prompt for a fresh session is kept on
+//! its session record and waits on the operator's Needs-you list until it
+//! is started or dismissed (never cleared by a prompt, a view, or another
+//! handoff); continuing starts that session in the same directory
+//! (worktree, model, account) with that prompt, linked both ways. A message is typed into
 //! the recipient the way a broadcast is, under a provenance line naming
 //! its sender: now when the recipient is at rest, else queued for when
 //! its turn is done.
 
-use super::{Hub, HubError};
+use super::{Hub, HubError, HubEvent};
 use crate::agent::{self, SessionKind};
 use crate::queue::Delivery;
-use crate::state::{SessionRecord, SessionState, StateError, new_id};
+use crate::state::{
+    PendingHandoff, SessionRecord, SessionState, StateError, new_id, validate_name,
+};
 use crate::telemetry::{Draft, What, now_ms};
 use chrono::Utc;
 use std::sync::Arc;
@@ -40,16 +44,75 @@ fn successor_name(parent: &str, taken: &[&str]) -> String {
         .unwrap_or_else(|| base.to_owned())
 }
 
+/// A pending handoff in an error's list: its id, and its name if any.
+fn described(handoff: &PendingHandoff) -> String {
+    match &handoff.name {
+        Some(name) => format!("{} ({name:?})", handoff.id),
+        None => handoff.id.clone(),
+    }
+}
+
 impl Hub {
+    /// Agent session `id` proposes continuing its work in a fresh session
+    /// from `prompt` (the `handoff` tool): kept on its record until the
+    /// operator starts or dismisses it.
+    pub fn propose_handoff(
+        &self,
+        id: &str,
+        prompt: &str,
+        name: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<PendingHandoff, HubError> {
+        let from = self.store().session(id)?.clone();
+        if !from.runs_agent() {
+            return Err(StateError::Invalid(format!(
+                "{} is not an agent session: only an agent hands its work off",
+                from.name
+            ))
+            .into());
+        }
+        let prompt = agent::validate_prompt(Some(prompt))
+            .map_err(StateError::Invalid)?
+            .ok_or_else(|| StateError::Invalid("give the new session's whole prompt".into()))?;
+        let name = name
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(validate_name)
+            .transpose()?;
+        let reason = reason
+            .map(crate::telemetry::summary::text)
+            .filter(|r| !r.is_empty());
+        let handoff = PendingHandoff {
+            id: new_id(),
+            name,
+            reason,
+            prompt,
+            created_at: Utc::now(),
+        };
+        self.store().add_handoff(&from.id, handoff.clone())?;
+        self.emit(HubEvent::Sessions);
+        Ok(handoff)
+    }
+
+    /// Drop session `id`'s pending handoff `handoff` unstarted.
+    pub fn dismiss_handoff(&self, id: &str, handoff: &str) -> Result<(), HubError> {
+        self.store().remove_handoff(id, handoff)?;
+        self.emit(HubEvent::Sessions);
+        Ok(())
+    }
+
     /// Start a new session that continues agent session `id`'s work: its
-    /// directory, worktree, kind, model, permission options, and account,
-    /// with `prompt` (default: the one its agent proposed with the
-    /// `handoff` tool). The two are linked, and the old one's handoff is
-    /// answered.
+    /// directory, worktree, kind, model, permission options, and account.
+    /// The prompt is `prompt` when given, else that of its pending handoff
+    /// `handoff` (default: the only one pending). The name is `name`, else
+    /// the handoff's, made unique, else the predecessor's numbered on. The
+    /// two are linked, and the handoff it started is no longer pending.
     pub fn continue_session(
         self: &Arc<Self>,
         id: &str,
         prompt: Option<&str>,
+        handoff: Option<&str>,
+        name: Option<&str>,
     ) -> Result<SessionView, HubError> {
         let from = self.store().session(id)?.clone();
         if !from.runs_agent() {
@@ -59,14 +122,47 @@ impl Hub {
             ))
             .into());
         }
-        let proposed = self
-            .telemetry()
-            .snapshot(&from.id)
-            .and_then(|snap| snap.ask)
-            .and_then(|ask| ask.prompt);
-        let prompt = match prompt.filter(|p| !p.trim().is_empty()) {
-            Some(prompt) => prompt.to_owned(),
-            None => proposed.ok_or_else(|| {
+        let prompt = prompt.filter(|p| !p.trim().is_empty());
+        let chosen = match handoff.map(str::trim).filter(|h| !h.is_empty()) {
+            Some(wanted) => Some(
+                from.handoffs
+                    .iter()
+                    .find(|h| h.id == wanted)
+                    .cloned()
+                    .ok_or_else(|| {
+                        StateError::NotFound(format!(
+                            "{} has no pending handoff {wanted}",
+                            from.name
+                        ))
+                    })?,
+            ),
+            None if prompt.is_some() => None,
+            None => match from.handoffs.as_slice() {
+                [] => None,
+                [one] => Some(one.clone()),
+                many => {
+                    return Err(StateError::Invalid(format!(
+                        "{} has {} pending handoffs, pick one: {}",
+                        from.name,
+                        many.len(),
+                        many.iter().map(described).collect::<Vec<_>>().join("; ")
+                    ))
+                    .into());
+                }
+            },
+        };
+        // A handoff proposed before handoffs were kept on the session: its
+        // telemetry ask.
+        let legacy = || {
+            self.telemetry()
+                .snapshot(&from.id)
+                .and_then(|snap| snap.ask)
+                .and_then(|ask| ask.prompt)
+        };
+        let prompt = match (prompt, &chosen) {
+            (Some(prompt), _) => prompt.to_owned(),
+            (None, Some(chosen)) => chosen.prompt.clone(),
+            (None, None) => legacy().ok_or_else(|| {
                 StateError::Invalid(format!(
                     "{} proposed no handoff: give the new session's prompt",
                     from.name
@@ -76,6 +172,12 @@ impl Hub {
         let prompt = agent::validate_prompt(Some(&prompt))
             .map_err(StateError::Invalid)?
             .ok_or_else(|| StateError::Invalid("the prompt is empty".into()))?;
+        let wanted_name = name
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .or_else(|| chosen.as_ref().and_then(|h| h.name.as_deref()))
+            .map(validate_name)
+            .transpose()?;
         if !from.cwd.is_dir() {
             return Err(StateError::Invalid(format!(
                 "{}'s directory {} no longer exists",
@@ -89,14 +191,18 @@ impl Hub {
                 .to_string_lossy()
                 .into_owned(),
         ];
-        let record = SessionRecord {
-            id: new_id(),
-            workspace_id: from.workspace_id.clone(),
-            name: {
+        let name = match wanted_name {
+            Some(wanted) => self.unique_session_name(&wanted),
+            None => {
                 let store = self.store();
                 let taken: Vec<&str> = store.sessions().iter().map(|s| s.name.as_str()).collect();
                 successor_name(&from.name, &taken)
-            },
+            }
+        };
+        let record = SessionRecord {
+            id: new_id(),
+            workspace_id: from.workspace_id.clone(),
+            name,
             kind: from.kind,
             cwd: from.cwd.clone(),
             command,
@@ -114,8 +220,24 @@ impl Hub {
             account: from.account.clone(),
             continues: Some(from.id.clone()),
             opened_by: None,
+            handoffs: Vec::new(),
         };
-        let view = self.launch(record, None, None, false, Some(&prompt))?;
+        // Taken before the launch, so two starts of one handoff start one
+        // session; put back if the launch fails.
+        if let Some(chosen) = &chosen {
+            self.store().remove_handoff(&from.id, &chosen.id)?;
+        }
+        let view = match self.launch(record, None, None, false, Some(&prompt)) {
+            Ok(view) => view,
+            Err(failed) => {
+                if let Some(chosen) = chosen {
+                    // The session may be gone meanwhile: nothing to put back.
+                    let _ = self.store().add_handoff(&from.id, chosen);
+                    self.emit(HubEvent::Sessions);
+                }
+                return Err(failed);
+            }
+        };
         self.telemetry().record(
             &from.id,
             vec![Draft::new(

@@ -2,9 +2,9 @@
 //! atomically (rolled back in memory when the save fails).
 
 use super::{
-    FolderSpec, LaunchTemplate, MAX_TEMPLATES, STATE_FILE, STATE_VERSION, STATE_VERSION_MIN,
-    SessionRecord, SessionState, StateDoc, StateError, UNCLEAN_STOP, Workspace, WorkspaceInput,
-    new_id, validate_folders, validate_name,
+    FolderSpec, LaunchTemplate, MAX_PENDING_HANDOFFS, MAX_TEMPLATES, PendingHandoff, STATE_FILE,
+    STATE_VERSION, STATE_VERSION_MIN, SessionRecord, SessionState, StateDoc, StateError,
+    UNCLEAN_STOP, Workspace, WorkspaceInput, new_id, validate_folders, validate_name,
 };
 use crate::auth::write_private;
 use crate::fanout::{Fanout, MAX_FANOUTS};
@@ -518,6 +518,40 @@ impl HubStore {
             .replace(agent_session_id.to_owned());
         self.save_or_rollback(|doc| doc.sessions[index].agent_session_id = previous)?;
         Ok(true)
+    }
+
+    /// Add a handoff session `id`'s agent proposed. At most
+    /// [`MAX_PENDING_HANDOFFS`] wait per session.
+    pub fn add_handoff(&mut self, id: &str, handoff: PendingHandoff) -> Result<(), StateError> {
+        let index = self.session_index(id)?;
+        let pending = &mut self.doc.sessions[index].handoffs;
+        if pending.len() >= MAX_PENDING_HANDOFFS {
+            return Err(StateError::Invalid(format!(
+                "{MAX_PENDING_HANDOFFS} handoffs already wait on the operator: start or dismiss one first"
+            )));
+        }
+        pending.push(handoff);
+        self.save_or_rollback(|doc| {
+            doc.sessions[index].handoffs.pop();
+        })
+    }
+
+    /// Remove session `id`'s pending handoff `handoff`; it is returned.
+    pub fn remove_handoff(
+        &mut self,
+        id: &str,
+        handoff: &str,
+    ) -> Result<PendingHandoff, StateError> {
+        let index = self.session_index(id)?;
+        let at = self.doc.sessions[index]
+            .handoffs
+            .iter()
+            .position(|h| h.id == handoff)
+            .ok_or_else(|| StateError::NotFound(format!("handoff {handoff}")))?;
+        let removed = self.doc.sessions[index].handoffs.remove(at);
+        let undo = removed.clone();
+        self.save_or_rollback(|doc| doc.sessions[index].handoffs.insert(at, undo))?;
+        Ok(removed)
     }
 
     /// Pair `author` with the reviewer agent `reviewer` (both records

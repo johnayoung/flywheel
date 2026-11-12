@@ -138,6 +138,7 @@ fn running_session(workspace_id: &str, cwd: &Path) -> SessionRecord {
         account: None,
         continues: None,
         opened_by: None,
+        handoffs: Vec::new(),
     }
 }
 
@@ -1207,4 +1208,59 @@ fn a_queue_edit_that_records_what_happened_survives_a_failed_save() {
         .unwrap();
     let reopened = HubStore::open(dir.path()).unwrap();
     assert!(reopened.queue(&session.id).unwrap().items[0].is_delivered());
+}
+
+#[test]
+fn pending_handoffs_persist_until_removed_and_go_with_their_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo(dir.path(), "r");
+    let mut store = HubStore::open(dir.path()).unwrap();
+    let ws = store
+        .create_workspace(input("w", vec![repo.clone()]))
+        .unwrap();
+    let session = running_session(&ws.id, &repo);
+    store.insert_session(session.clone()).unwrap();
+    let raw = fs::read_to_string(dir.path().join(STATE_FILE)).unwrap();
+    assert!(!raw.contains("handoffs"), "omitted when none: {raw}");
+    let handoff = |id: &str| PendingHandoff {
+        id: id.into(),
+        name: Some("docs 2".into()),
+        reason: None,
+        prompt: format!("Goal: {id}"),
+        created_at: Utc::now(),
+    };
+    store.add_handoff(&session.id, handoff("h1")).unwrap();
+    store.add_handoff(&session.id, handoff("h2")).unwrap();
+    assert!(matches!(
+        store.add_handoff("missing", handoff("h3")),
+        Err(StateError::NotFound(_))
+    ));
+    // On disk, and loaded back.
+    let mut store = HubStore::open(dir.path()).unwrap();
+    let kept = &store.session(&session.id).unwrap().handoffs;
+    assert_eq!(
+        kept.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        ["h1", "h2"]
+    );
+    assert_eq!(kept[1].prompt, "Goal: h2");
+    // Removing one leaves the other.
+    assert_eq!(store.remove_handoff(&session.id, "h1").unwrap().id, "h1");
+    assert!(matches!(
+        store.remove_handoff(&session.id, "h1"),
+        Err(StateError::NotFound(_))
+    ));
+    assert_eq!(store.session(&session.id).unwrap().handoffs.len(), 1);
+    // A bounded number wait.
+    for n in 0..MAX_PENDING_HANDOFFS - 1 {
+        store
+            .add_handoff(&session.id, handoff(&format!("x{n}")))
+            .unwrap();
+    }
+    assert!(matches!(
+        store.add_handoff(&session.id, handoff("over")),
+        Err(StateError::Invalid(_))
+    ));
+    // The session's removal takes them.
+    store.remove_session(&session.id).unwrap();
+    assert!(store.session(&session.id).is_err());
 }

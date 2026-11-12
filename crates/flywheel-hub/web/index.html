@@ -602,6 +602,28 @@
   </form>
 </dialog>
 
+<dialog id="dlg-successor" class="sheet ho-sheet" aria-labelledby="sc-title">
+  <form method="dialog" novalidate>
+    <header class="sheet-head">
+      <span class="sheet-kicker">handoff</span>
+      <h2 id="sc-title">Start the new session</h2>
+    </header>
+    <p class="ho-from" id="sc-from"></p>
+    <label class="field">
+      <span class="field-label">Name</span>
+      <input type="text" id="sc-name" maxlength="100" spellcheck="false" autocomplete="off">
+    </label>
+    <label class="field ho-prompt">
+      <span class="field-label">Prompt <span class="field-hint" id="sc-size"></span></span>
+      <textarea id="sc-text" rows="20" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
+    </label>
+    <footer class="sheet-foot">
+      <button type="button" class="slab ghost" value="cancel" data-close>Cancel</button>
+      <button type="button" class="slab" id="sc-start" title="Start it here with this prompt; it continues the old session's work">Start session</button>
+    </footer>
+  </form>
+</dialog>
+
 <dialog id="dlg-broadcast" class="sheet bc-sheet" aria-labelledby="bc-title">
   <form method="dialog" novalidate>
     <header class="sheet-head">

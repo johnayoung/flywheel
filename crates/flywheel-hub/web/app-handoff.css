@@ -2,8 +2,10 @@
  * dialog, the Review drawer's peer-review panel, and the sidebar's
  * author <-> reviewer chips. */
 
-#dlg-handoff { width: min(48rem, calc(100vw - 2rem)); }
-#dlg-handoff form { display: grid; gap: .8rem; }
+#dlg-handoff, #dlg-successor { width: min(48rem, calc(100vw - 2rem)); }
+#dlg-handoff form, #dlg-successor form { display: grid; gap: .8rem; }
+/* An agent's proposed successor (attention.js): the whole prompt. */
+#dlg-successor .ho-prompt textarea { min-height: 24rem; max-height: 65vh; }
 .ho-from { margin: 0; font: 600 12px var(--mono); color: var(--ink-2); }
 .ho-prompt textarea {
   width: 100%;

@@ -262,16 +262,6 @@ fn declared(tool: &str, input: &Value) -> Option<What> {
                 .unwrap_or_default(),
             prompt: None,
         }),
-        HANDOFF_TOOL => Some(What::Asked {
-            kind: AskKind::Handoff,
-            text: str_of(input, "reason")
-                .map(summary::text)
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| "Continue this work in a new session".to_owned()),
-            command: None,
-            options: Vec::new(),
-            prompt: Some(summary::prompt(str_of(input, "prompt")?)?),
-        }),
         "TodoWrite" => Some(What::PlanSet {
             source: "todo".to_owned(),
             items: steps(input.get("todos"), &["content", "title"]),

@@ -446,3 +446,25 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 }
 .attn-handoff-text:focus { outline: none; border-color: var(--brass); }
 .attn-start { justify-self: end; padding: .3rem .65rem; font-size: 10px; }
+/* A pending handoff (attention.js): its own row, the prompt's first
+   lines, and Dismiss / Review / Start. */
+.attn-row.handoff { border-left-color: var(--alert); }
+.attn-status.handoff { background: var(--alert); }
+.attn-next { color: var(--ink-2); font: 600 10.5px var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.attn-handoff-preview {
+  margin: 0;
+  padding: .3rem .45rem;
+  max-height: 5.2rem;
+  overflow: hidden;
+  border: 1px solid var(--rule);
+  background: var(--bg);
+  color: var(--ink-2);
+  font: 400 10.5px/1.4 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Less indent than an ask's: the prompt and three buttons get the room. */
+.attn-ask.attn-pending { grid-template-columns: minmax(0, 1fr); padding-left: calc(.7rem + 3px); }
+.attn-handoff-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .3rem; }
+.attn-handoff-actions .slab { padding: .3rem .5rem; font-size: 10px; }
+@media (pointer: coarse) { .attn-handoff-actions .slab { min-height: 44px; } }

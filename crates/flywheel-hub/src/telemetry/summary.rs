@@ -90,32 +90,6 @@ pub fn ending(raw: &str) -> Option<String> {
     })
 }
 
-/// Longest handoff prompt kept (bytes): it becomes the successor's first
-/// prompt, under the hub's own limit for one.
-pub const PROMPT_CAP: usize = 24 * 1024;
-
-/// A prompt an agent wrote for another session: scrubbed, kept whole up
-/// to [`PROMPT_CAP`] bytes (cut at a line break, with a notice).
-pub fn prompt(raw: &str) -> Option<String> {
-    let scrubbed = crate::activity::redact(raw.trim());
-    if scrubbed.trim().is_empty() {
-        return None;
-    }
-    if scrubbed.len() <= PROMPT_CAP {
-        return Some(scrubbed.trim_end().to_owned());
-    }
-    let mut end = PROMPT_CAP;
-    while !scrubbed.is_char_boundary(end) {
-        end -= 1;
-    }
-    let kept = &scrubbed[..end];
-    let kept = kept.rfind('\n').map_or(kept, |at| &kept[..at]);
-    Some(format!(
-        "{}\n\n[cut by fw hub at {PROMPT_CAP} bytes]",
-        kept.trim_end()
-    ))
-}
-
 /// What the call `name` with `input` acts on (`None`: nothing telling).
 pub fn tool(name: &str, input: &Value) -> Option<String> {
     // Codex hands a call's arguments over as a JSON string.

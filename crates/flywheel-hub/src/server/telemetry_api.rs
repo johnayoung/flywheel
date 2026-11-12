@@ -6,7 +6,7 @@
 //!
 //! * `POST /api/telemetry/hook`: one Claude Code hook's JSON. An empty
 //!   200 tells Claude Code the hook passed; the hub never blocks a tool.
-//! * `POST /api/telemetry/mcp`: the progress tool (an MCP server).
+//! * `POST /api/telemetry/mcp`: the agent tools (an MCP server).
 //! * `POST /api/telemetry/capture`: a hook of a run the hub did not start,
 //!   with the capture token (see [`crate::hub`]'s capture).
 //!
@@ -208,6 +208,25 @@ impl mcp::Host for AgentHost {
         self.hub
             .agent_message(&self.session, to, text)
             .map_err(|e| e.to_string())
+    }
+
+    fn handoff(
+        &self,
+        prompt: &str,
+        name: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<String, String> {
+        let kept = self
+            .hub
+            .propose_handoff(&self.session, prompt, name, reason)
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "Handoff {hid} is saved on the operator's Needs-you list; they start the new session \
+             from it. End your turn now. If it does not show in Needs you, the operator can run: \
+             fw hub continue {session} --handoff {hid}",
+            hid = kept.id,
+            session = self.session,
+        ))
     }
 }
 

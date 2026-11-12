@@ -679,7 +679,7 @@ function renderAllList() {
     ));
     return out;
   }
-  if (!needs.size && !moving.length) {
+  if (!needs.size && !attention.handoffCount() && !moving.length) {
     out.push(el("div", { className: "list-calm", textContent: "Nothing needs you. Nothing is moving." }));
   }
   if (moving.length) out.push(listGroup("Moving", moving.length), rows(moving));

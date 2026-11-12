@@ -1198,7 +1198,7 @@ fn asking_sessions_rank_right_after_blocked_ones() {
 }
 
 #[test]
-fn a_handoff_waits_with_its_prompt_until_a_successor_takes_it() {
+fn a_handoff_call_is_a_tool_call_and_its_successor_links_back() {
     let (_dir, telemetry) = open();
     hooks(
         &telemetry,
@@ -1213,22 +1213,22 @@ fn a_handoff_waits_with_its_prompt_until_a_successor_takes_it() {
                 "PreToolUse",
                 json!({"tool_name": claude::HANDOFF_TOOL, "tool_use_id": "h1",
                        "tool_input": {"reason": "Context is at 64%",
-                                      "prompt": "Goal: build C2.\nDone: C1 (528d3993).\nToken ghp_0123456789abcdefghijklmnopqrstuvwxyzAB"}}),
+                                      "prompt": "Goal: build C2.\nDone: C1 (528d3993)."}}),
             ),
-            (
-                "Stop",
-                json!({"last_assistant_message": "Handed off. Anything else?"}),
-            ),
+            ("Stop", json!({"last_assistant_message": "Handed off."})),
         ],
     );
+    // The handoff itself is hub state (the tool call keeps it): the log
+    // has the call, not an ask a later prompt would clear.
     let snap = telemetry.snapshot("old").unwrap();
-    assert_eq!(snap.status, "asking");
-    let ask = snap.ask.unwrap();
-    assert_eq!(ask.kind, AskKind::Handoff);
-    assert_eq!(ask.text, "Context is at 64%");
-    let prompt = ask.prompt.unwrap();
-    assert!(prompt.starts_with("Goal: build C2.\nDone: C1"), "{prompt}");
-    assert!(!prompt.contains("ghp_"), "scrubbed: {prompt}");
+    assert_eq!(snap.status, "done");
+    assert!(snap.ask.is_none(), "{:?}", snap.ask);
+    let events = telemetry.events(None, "old", 0, 50, false).unwrap();
+    assert!(
+        events.iter().any(|e| matches!(&e.what,
+            What::ToolStarted { name, .. } if name == claude::HANDOFF_TOOL)),
+        "the call is in the timeline"
+    );
     // The successor starts: the old session's handoff is answered and it
     // names who took over; the new one names what it continues.
     telemetry.record(

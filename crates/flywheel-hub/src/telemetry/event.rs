@@ -90,6 +90,8 @@ pub enum AskKind {
     /// and its output back.
     Run,
     /// Continue the work in a new session, from the prompt it wrote.
+    /// Only in logs from before handoffs were kept on the session record
+    /// (see [`crate::hub`]'s `propose_handoff`); never recorded now.
     Handoff,
 }
 

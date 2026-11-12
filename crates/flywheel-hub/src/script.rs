@@ -1324,9 +1324,17 @@ pub(crate) struct ContinueArgs {
     #[command(flatten)]
     target: SessionArg,
     /// The new session's first prompt (`-` reads it from stdin). Default:
-    /// the prompt the agent proposed with its handoff tool.
+    /// the pending handoff's.
     #[arg(long, allow_hyphen_values = true)]
     prompt: Option<String>,
+    /// The pending handoff to start (its id). Default: the only one
+    /// pending; with several, the error lists them.
+    #[arg(long, value_name = "ID")]
+    handoff: Option<String>,
+    /// The new session's name. Default: the handoff's, else the old
+    /// session's numbered on (`docs` -> `docs 2`).
+    #[arg(long)]
+    name: Option<String>,
     /// Print the new session as JSON instead of its id.
     #[arg(long)]
     json: bool,
@@ -1353,7 +1361,7 @@ pub(crate) fn continue_session(
         conn.blocking_call(
             "POST",
             &format!("/api/sessions/{id}/continue"),
-            Some(&json!({ "prompt": prompt })),
+            Some(&json!({ "prompt": prompt, "handoff": args.handoff, "name": args.name })),
         )
     });
     match result {

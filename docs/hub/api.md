@@ -36,7 +36,8 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | POST | `/api/sessions/{id}/kill` | 202: SIGHUP (3 s: SIGKILL), kept |
 | POST | `/api/sessions/{id}/relaunch` | `{"cols"?,"rows"?}`: an ended session, same id; 409 running |
 | POST | `/api/sessions/{id}/restart` | old `/relaunch` |
-| POST | `/api/sessions/{id}/continue` | `{"prompt"?}` (default: the `handoff`'s): linked successor; 201 |
+| POST | `/api/sessions/{id}/continue` | `{"handoff"?,"prompt"?,"name"?}` (default: the only pending handoff's): linked successor; 201 |
+| DELETE | `/api/sessions/{id}/handoffs/{handoff}` | dismiss a pending handoff; 204 |
 | GET | `/api/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered text: `visible` rows, or `recent` lines (1..100000, 100); cursor, modes |
 | GET | `/api/sessions/{id}/explain` | as `fw hub explain --json` |
 | POST | `/api/sessions/{id}/input` | `{"data","paste"?,"enter"?}`; 409 not running / not reading |
@@ -58,7 +59,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
-A session lists `agent` (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`.
+A session lists `agent` (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs` (pending: `id`, `name`?, `reason`?, `prompt`, `created_at`; kept until started or dismissed).
 
 ## Review, handoff, peer review
 
@@ -257,7 +258,7 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 | GET | `/api/telemetry/sessions/{id}/turns[?host=&limit=]` | `turns`, newest first, folded |
 | POST | `/api/telemetry/batch` | another hub's events, NDJSON (or `Content-Encoding: deflate`) -> `received`, `accepted` |
 | POST | `/api/telemetry/hook` | a Claude Code hook; no login: `x-flywheel-session`, `x-flywheel-secret` |
-| POST | `/api/telemetry/mcp` | agent tools (MCP over http); same headers |
+| POST | `/api/telemetry/mcp` | agent tools (MCP over http; `handoff` saves a pending handoff, returns its id); same headers |
 | POST | `/api/telemetry/capture` | an outside run's hook: `x-flywheel-capture`; session, `-batch`, `-budget` headers |
 
 Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: turn or subagent; `item`: plan item).

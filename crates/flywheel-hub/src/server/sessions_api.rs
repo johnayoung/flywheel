@@ -132,9 +132,13 @@ pub(super) async fn restart_session(
 
 #[derive(Deserialize, Default)]
 pub(super) struct ContinueRequest {
-    /// The new session's first prompt; default: the one the agent
-    /// proposed with its handoff tool.
+    /// The new session's first prompt; default: the pending handoff's.
     prompt: Option<String>,
+    /// The pending handoff to start (its id); default: the only one.
+    handoff: Option<String>,
+    /// The new session's name; default: the handoff's, else the old
+    /// session's numbered on.
+    name: Option<String>,
 }
 
 /// Start a new session that continues an agent session's work (its
@@ -145,8 +149,26 @@ pub(super) async fn continue_session(
     ApiJson(request): ApiJson<ContinueRequest>,
 ) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
-    let view = blocking(move || hub.continue_session(&id, request.prompt.as_deref())).await?;
+    let view = blocking(move || {
+        hub.continue_session(
+            &id,
+            request.prompt.as_deref(),
+            request.handoff.as_deref(),
+            request.name.as_deref(),
+        )
+    })
+    .await?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+/// Dismiss a pending handoff unstarted: 204.
+pub(super) async fn dismiss_handoff(
+    State(app): State<AppState>,
+    Path((id, handoff)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    blocking(move || hub.dismiss_handoff(&id, &handoff)).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[derive(Deserialize)]

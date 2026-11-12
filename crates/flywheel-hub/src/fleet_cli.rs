@@ -459,7 +459,8 @@ pub(crate) struct InboxArgs {
     /// Only the sessions of the hub with this id (`local`: the hub asked).
     #[arg(long, value_name = "HUB_ID")]
     host: Option<String>,
-    /// Print JSON (the fleet page of blocked and asking sessions).
+    /// Print JSON (the fleet page of blocked and asking sessions, plus
+    /// this hub's pending `handoffs`).
     #[arg(long)]
     json: bool,
     #[command(flatten)]
@@ -471,9 +472,10 @@ const INBOX_LIMIT: u32 = 1000;
 /// Lines of a handoff's prompt the inbox shows.
 const HANDOFF_PREVIEW: usize = 6;
 
-/// `fw hub inbox`: every session that waits on the operator, most urgent
-/// first: harness dialogs (`blocked`), then turns that ended asking for
-/// an answer, a decision, or a command run (`asking`), with what to do.
+/// `fw hub inbox`: everything that waits on the operator: this hub's
+/// pending handoffs (oldest first), then sessions most urgent first:
+/// harness dialogs (`blocked`), then turns that ended asking for an
+/// answer, a decision, or a command run (`asking`), with what to do.
 pub(crate) fn inbox(args: &InboxArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let mut run = || -> Result<(), String> {
         let conn = Endpoint::resolve(&args.endpoint)?;
@@ -490,6 +492,12 @@ pub(crate) fn inbox(args: &InboxArgs, out: &mut dyn Write, err: &mut dyn Write) 
             &format!("/api/telemetry/fleet?{}", params.join("&")),
             None,
         )?;
+        let mut page = page;
+        // Handoffs wait on this hub's session records, not its telemetry.
+        if args.host.as_deref().is_none_or(|h| h == "local") {
+            let listed = conn.blocking_call("GET", "/api/sessions", None)?;
+            page["handoffs"] = Value::Array(pending_handoffs(&listed));
+        }
         if args.json {
             print_json(out, &page);
         } else {
@@ -503,20 +511,73 @@ pub(crate) fn inbox(args: &InboxArgs, out: &mut dyn Write, err: &mut dyn Write) 
     }
 }
 
+/// Every pending handoff in a `/api/sessions` listing, oldest first:
+/// each with its session's id (`session`) and name (`label`).
+fn pending_handoffs(listed: &Value) -> Vec<Value> {
+    let mut found = Vec::new();
+    for session in listed["sessions"].as_array().into_iter().flatten() {
+        for handoff in session["handoffs"].as_array().into_iter().flatten() {
+            let mut entry = handoff.clone();
+            entry["session"] = session["id"].clone();
+            entry["label"] = session["name"].clone();
+            found.push(entry);
+        }
+    }
+    found.sort_by(|a, b| str_field(a, "created_at").cmp(str_field(b, "created_at")));
+    found
+}
+
+/// The prompt's first lines, then how many more.
+fn print_prompt(out: &mut dyn Write, prompt: &str) {
+    let lines: Vec<&str> = prompt.lines().collect();
+    for line in lines.iter().take(HANDOFF_PREVIEW) {
+        let _ = writeln!(out, "    > {}", shown(line, 200));
+    }
+    if lines.len() > HANDOFF_PREVIEW {
+        let _ = writeln!(
+            out,
+            "    > ... {} more lines",
+            lines.len() - HANDOFF_PREVIEW
+        );
+    }
+}
+
 fn print_inbox(out: &mut dyn Write, page: &Value) {
     let now = page["now"].as_i64().unwrap_or(0);
     let own = str_field(page, "host");
     let sessions = page["sessions"].as_array().map_or(&[][..], Vec::as_slice);
-    if sessions.is_empty() {
+    let handoffs = page["handoffs"].as_array().map_or(&[][..], Vec::as_slice);
+    let waiting = sessions.len() + handoffs.len();
+    if waiting == 0 {
         let _ = writeln!(out, "nothing needs you");
         return;
     }
     let _ = writeln!(
         out,
-        "{} need{} you",
-        sessions.len(),
-        if sessions.len() == 1 { "s" } else { "" }
+        "{waiting} need{} you",
+        if waiting == 1 { "s" } else { "" }
     );
+    for handoff in handoffs {
+        let session = str_field(handoff, "session");
+        let age = chrono::DateTime::parse_from_rfc3339(str_field(handoff, "created_at"))
+            .map(|at| span(now - at.timestamp_millis()))
+            .unwrap_or_default();
+        let mut line = format!("handoff {age}  {}", shown(str_field(handoff, "label"), 60));
+        if let Some(name) = handoff["name"].as_str() {
+            line.push_str(&format!(" -> {}", shown(name, 60)));
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(out, "{line}");
+        if let Some(reason) = handoff["reason"].as_str() {
+            let _ = writeln!(out, "  {}", shown(reason, 400));
+        }
+        print_prompt(out, str_field(handoff, "prompt"));
+        let _ = writeln!(
+            out,
+            "  start: fw hub continue {session} --handoff {}",
+            str_field(handoff, "id")
+        );
+    }
     for session in sessions {
         let host = str_field(session, "host");
         let id = str_field(session, "session");
@@ -550,17 +611,7 @@ fn print_inbox(out: &mut dyn Write, page: &Value) {
             }
         }
         if let Some(prompt) = ask["prompt"].as_str() {
-            let lines: Vec<&str> = prompt.lines().collect();
-            for line in lines.iter().take(HANDOFF_PREVIEW) {
-                let _ = writeln!(out, "    > {}", shown(line, 200));
-            }
-            if lines.len() > HANDOFF_PREVIEW {
-                let _ = writeln!(
-                    out,
-                    "    > ... {} more lines",
-                    lines.len() - HANDOFF_PREVIEW
-                );
-            }
+            print_prompt(out, prompt);
         }
         for (n, option) in ask["options"].as_array().into_iter().flatten().enumerate() {
             let _ = writeln!(
@@ -891,6 +942,43 @@ mod tests {
         let mut out = Vec::new();
         print(&mut out);
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_inbox_lists_pending_handoffs_first_with_how_to_start_each() {
+        let listed = json!({"sessions": [
+            {"id": "s1", "name": "docs", "handoffs": [
+                {"id": "h2", "prompt": "Goal: two", "created_at": "2026-11-12T10:05:00Z"},
+                {"id": "h1", "name": "docs next", "reason": "Context is long",
+                 "prompt": "Goal: one\nDone: a\n1\n2\n3\n4\n5", "created_at": "2026-11-12T10:00:00Z"}]},
+            {"id": "s2", "name": "shell"}]});
+        let found = pending_handoffs(&listed);
+        assert_eq!(
+            found.iter().map(|h| str_field(h, "id")).collect::<Vec<_>>(),
+            ["h1", "h2"],
+            "oldest first"
+        );
+        assert_eq!(found[0]["session"], "s1");
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-12T10:10:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let page = json!({"now": now, "sessions": [], "handoffs": found});
+        let inbox = text(|out| print_inbox(out, &page));
+        assert!(inbox.starts_with("2 need you\n"), "{inbox}");
+        assert!(
+            inbox.contains("handoff 10m  docs -> docs next\n  Context is long\n    > Goal: one\n"),
+            "{inbox}"
+        );
+        assert!(
+            inbox.contains("    > ... 1 more lines\n  start: fw hub continue s1 --handoff h1\n"),
+            "{inbox}"
+        );
+        assert!(
+            inbox.contains(
+                "handoff 5m  docs\n    > Goal: two\n  start: fw hub continue s1 --handoff h2\n"
+            ),
+            "{inbox}"
+        );
     }
 
     #[test]

@@ -3,9 +3,11 @@
 //! is; `ask_operator` declares what it needs from the operator before it
 //! can go on (a reply, a decision, a command only they can run);
 //! `handoff` proposes continuing the work in a fresh session from a
-//! prompt it wrote. Those three only declare: the hook path records them.
-//! `list_sessions` and `message_session` act, through a [`Host`]: the
-//! other agent sessions on the hub, and a message typed into one.
+//! prompt it wrote. The first two only declare: the hook path records
+//! them. `handoff`, `list_sessions`, and `message_session` act, through a
+//! [`Host`]: a handoff kept on the session until the operator starts or
+//! dismisses it, the other agent sessions on the hub, and a message typed
+//! into one.
 //!
 //! Agents rarely keep a plan on their own; the hub gives every Claude
 //! Code session it starts this tool and one sentence asking for its use
@@ -37,6 +39,13 @@ pub trait Host {
     fn list_sessions(&self) -> String;
     /// Send `text` to the session `to` names; what became of it.
     fn message(&self, to: &str, text: &str) -> Result<String, String>;
+    /// Keep a proposed handoff for the operator; what to tell the agent.
+    fn handoff(
+        &self,
+        prompt: &str,
+        name: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<String, String>;
 }
 /// The protocol revision answered when the client names none.
 const PROTOCOL: &str = "2025-06-18";
@@ -131,6 +140,7 @@ fn handoff_tool() -> Value {
             "type": "object",
             "properties": {
                 "prompt": { "type": "string", "description": "The new session's first prompt, in full." },
+                "name": { "type": "string", "description": "Optional: a short name for the new session." },
                 "reason": { "type": "string", "description": "One line: why hand off now." }
             },
             "required": ["prompt"]
@@ -195,13 +205,14 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
             let args = params.get("arguments").unwrap_or(&Value::Null);
             let arg = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default();
             if name == Some(HANDOFF_TOOL) {
+                let given = |key: &str| Some(arg(key)).filter(|v| !v.trim().is_empty());
                 Ok(if arg("prompt").trim().is_empty() {
                     text_result("Give the new session's whole prompt.", true)
                 } else {
-                    text_result(
-                        "The operator sees your handoff and can start the new session. End your turn now.",
-                        false,
-                    )
+                    match host.handoff(arg("prompt"), given("name"), given("reason")) {
+                        Ok(said) => text_result(said, false),
+                        Err(why) => text_result(format!("Not handed off: {why}"), true),
+                    }
                 })
             } else if name == Some(LIST_TOOL) {
                 Ok(text_result(host.list_sessions(), false))
@@ -268,6 +279,18 @@ mod tests {
                 Err(format!("no session matches {to:?}"))
             }
         }
+        fn handoff(
+            &self,
+            prompt: &str,
+            name: Option<&str>,
+            _reason: Option<&str>,
+        ) -> Result<String, String> {
+            if prompt.contains('\0') {
+                Err("the prompt holds a NUL byte".to_owned())
+            } else {
+                Ok(format!("Kept as h1 ({})", name.unwrap_or("unnamed")))
+            }
+        }
     }
 
     fn answer(message: &Value) -> Option<Value> {
@@ -298,11 +321,16 @@ mod tests {
                 .unwrap()
                 .starts_with("Not sent: ")
         );
-        assert_eq!(
-            call(HANDOFF_TOOL, json!({"prompt": "Goal: ..."}))["isError"],
-            false
-        );
+        let kept = call(HANDOFF_TOOL, json!({"prompt": "Goal: ...", "name": "docs"}));
+        assert_eq!(kept["isError"], false);
+        assert_eq!(kept["content"][0]["text"], "Kept as h1 (docs)");
         assert_eq!(call(HANDOFF_TOOL, json!({"prompt": " "}))["isError"], true);
+        let failed = call(HANDOFF_TOOL, json!({"prompt": "a\u{0}b"}));
+        assert_eq!(failed["isError"], true);
+        assert_eq!(
+            failed["content"][0]["text"],
+            "Not handed off: the prompt holds a NUL byte"
+        );
     }
 
     #[test]

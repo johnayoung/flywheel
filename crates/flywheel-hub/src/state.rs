@@ -34,6 +34,8 @@ pub const STATE_VERSION: u32 = 6;
 pub const STATE_VERSION_MIN: u32 = 1;
 /// Limits on workspace input.
 pub const MAX_NAME_CHARS: usize = 100;
+/// Most handoffs that wait on the operator per session.
+pub const MAX_PENDING_HANDOFFS: usize = 20;
 pub const MAX_FOLDERS: usize = 32;
 /// Launch templates kept per workspace.
 pub const MAX_TEMPLATES: usize = 50;
@@ -271,6 +273,26 @@ pub struct SessionRecord {
     /// it): its id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_by: Option<String>,
+    /// Handoffs its agent proposed (the `handoff` tool) that wait on the
+    /// operator: each is removed only when started or dismissed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoffs: Vec<PendingHandoff>,
+}
+
+/// A fresh session an agent proposed to continue its work in: the new
+/// session's first prompt, waiting until the operator starts or
+/// dismisses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingHandoff {
+    pub id: String,
+    /// The new session's name, as the agent proposed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Why hand off now, in a line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub prompt: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// A saved way to start an agent in a workspace: kind, first prompt,

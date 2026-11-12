@@ -537,6 +537,7 @@ impl Hub {
                 .filter(|_| kind == SessionKind::Claude),
             continues: None,
             opened_by: None,
+            handoffs: Vec::new(),
         };
         let view = self.launch(record, None, None, false, prompt.as_deref())?;
         let paired = self.store().set_review_pair(&author.id, &view.record.id);

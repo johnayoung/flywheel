@@ -1719,6 +1719,7 @@ mod tests {
             account: None,
             continues: None,
             opened_by: None,
+            handoffs: Vec::new(),
         }
     }
 

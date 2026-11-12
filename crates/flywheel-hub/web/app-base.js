@@ -500,6 +500,8 @@ const attention = window.FwHubAttention({
   rerender: () => render(),
   toast: (...args) => commands.toast(...args),
   copyText: (text) => commands.copyText(text),
+  // Dismissing a handoff drops its prompt: asked first.
+  confirm: (options) => confirmDialog(options),
 });
 const notify = window.FwHubNotify({
   $, state, store, prefs: settings, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,

@@ -676,6 +676,7 @@ const activity = window.FwHubActivity({
 // a collector holds only as telemetry.
 const work = window.FwHubWork({
   $, el, icon, rawApi, span, state, sessionById, workspaceById, isAgent, store,
+  toast: (...args) => commands.toast(...args),
   agentLook: AGENT_LOOK,
   machinePrefix: (machine) => machines.prefix(machine),
   focusTerminal: () => focusTerminal(),

@@ -23,7 +23,15 @@ window.FwHubWork = function (ctx) {
   const { $, el, icon, rawApi, span, state, sessionById, workspaceById, isAgent } = ctx;
   const { tokens, dollars, plural } = window.FwHubFmt;
   // The live map above the tree (map.js), one for whichever view is open.
-  const map = window.FwHubMap();
+  const map = window.FwHubMap({
+    // Back from a replay: the session as it is, again.
+    onLive: () => map.feed(view.events, false),
+    onReplayLast: () => {
+      const turns = ((view.detail && view.detail.work) || []).filter((w) => !w.parent);
+      const newest = turns[turns.length - 1];
+      if (newest) replayTurn(newest.id);
+    },
+  });
   let mapShown = ctx.store.get("work-map", true) !== false;
 
   const PAGE = 300;
@@ -555,6 +563,16 @@ window.FwHubWork = function (ctx) {
     if (t.compacted) parts.push(el("span", { className: "wk-dg warn", textContent: "compacted" }));
     if (t.waits) parts.push(el("span", { className: "wk-dg warn", textContent: `waited on you ${t.waits > 1 ? `${t.waits}x` : ""}`.trim() }));
     if (t.partial) parts.push(el("span", { className: "wk-dg quiet", textContent: "earlier calls not read" }));
+    if (t.calls) {
+      parts.push(el("button", {
+        type: "button",
+        className: "wk-replay",
+        textContent: "replay",
+        title: "Play this turn back on the map",
+        dataset: { wk: `replay:${t.id}` },
+        onclick: () => replayTurn(t.id),
+      }));
+    }
     return parts.length ? el("div", { className: "wk-digest" }, parts) : null;
   }
 
@@ -854,6 +872,24 @@ window.FwHubWork = function (ctx) {
       tick(view.target.mode === "drawer" ? drawer : dialog);
       if (mapShown) map.tick();
     }, 1000);
+  }
+
+  // A turn played back on the map: its events (older ones loaded first
+  // when the turn began before those held).
+  async function replayTurn(id) {
+    const item = ((view.detail && view.detail.work) || []).find((w) => w.id === id);
+    if (!item || !view.target) return;
+    if (!view.complete && (!view.events.length || view.events[0].ts > item.started)) await loadOlder();
+    const end = item.finished || Date.now();
+    const events = view.events.filter((e) => e.ts >= item.started && e.ts <= end);
+    // The context as the turn began: the last reading before it.
+    const before = view.events.filter((e) => e.kind === "context.usage" && e.ts < item.started).pop();
+    if (before) events.unshift({ ...before, ts: item.started });
+    if (!mapShown) toggleMap();
+    if (map.replay(events, promptTitle(item.title) || "turn")) {
+      const host = $(view.target.mode === "drawer" ? "#wk-map" : "#wkd-map");
+      host.scrollIntoView({ block: "nearest" });
+    } else if (ctx.toast) ctx.toast("No events of that turn are held to replay.");
   }
 
   // The map shown or folded away (kept per browser).

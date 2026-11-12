@@ -89,7 +89,7 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 
 ## Web UI
 
-- Sidebar: machines > workspaces (rollup) > sessions (status dot, `↑ahead ↓behind ~changed ?untracked`, companions, a blocked row's question). Folder chips: filled git, hollow plain, struck missing.
+- Sidebar: **rail** (wheel = Everything, workspace tiles, More) + **list** (Everything: Needs you, Moving, Resting; a tile: its folders, sessions). Active row: folder, `↑ahead ↓behind ~changed ?untracked`.
 - Title, favicon count blocked and done; `#session=<id>` survives reloads. A dropped or silent (no pong in 6 s) socket keeps the screen, reconnects (2 s, up to 10 s) with what it missed.
 - Keys typed while down wait (`N queued`), sent in order once back; dropped, and said, if the session changed (epoch). Unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
 - Drawers (Commands, Flywheel, Review, Queue) share the stage's right edge; phones: full-screen sheets. Ended sessions: Relaunch, Close. First run: import offers, a 30 s tour. Themes: auto, dark, light (dim TUI colours lifted to 4.5:1).
@@ -99,7 +99,7 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 
 Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
-- **Needs you**: blocked and done agents of every workspace (blocked, longest waiting, first) head the sidebar and start screen. Footer utilities: one **More** row.
+- **Needs you**: blocked and done agents of every workspace (blocked, longest waiting, first) head Everything and the start screen.
 - **Key bar** (touch): `esc` arrows `enter` `^c`; then `tab` `shift-tab` sticky `ctrl` `alt`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd`, `compose`.
 - **Quick answers**: a blocked dialog's options as buttons (AskUserQuestion's from its input, only while its question is on screen). **Compose**: multi-line text as one bracketed paste + Enter; history per device, drafts per session.
 - Swipe scrolls, long-press selects, pinch zooms. **Alerts** (per device, https or localhost): blocked or done while hidden or idle 5 min.

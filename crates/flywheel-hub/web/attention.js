@@ -1,5 +1,6 @@
 // flywheel hub: the attention list. Every agent that needs you, across all
-// workspaces, at the top of the sidebar (the phone's session switcher):
+// workspaces, heading the sidebar's Everything list (and the phone's
+// start screen):
 // blocked ones first (longest waiting first), then agents whose turn
 // ended asking you something (telemetry's `asking`: a reply, a decision,
 // or a command only you can run; answered in the row: the reply goes
@@ -171,7 +172,6 @@ window.FwHubAttention = function (ctx) {
     const workspace = workspaceById(session.workspace_id);
     const active = state.attached === session.id;
     const branch = branchOf(session);
-    const num = ctx.numberOf ? ctx.numberOf(session.id) : null;
     return el(
       "li",
       {},
@@ -179,12 +179,11 @@ window.FwHubAttention = function (ctx) {
         "button",
         {
           type: "button",
-          className: `attn-row ${ask ? "asking" : agent.status}${active ? " active" : ""}${num ? " numbered" : ""}`,
+          className: `attn-row ${ask ? "asking" : agent.status}${active ? " active" : ""}`,
           dataset: { id: session.id },
           "aria-current": active ? "true" : undefined,
           onclick: () => openSession(session.id),
         },
-        num ? el("span", { className: "attn-num", textContent: num }) : null,
         el("span", { className: `glyph ${session.kind}` }, icon(session.kind === "codex" ? "codex" : "claude")),
         el(
           "span",
@@ -287,41 +286,8 @@ window.FwHubAttention = function (ctx) {
     for (const root of [$("#attention"), $("#empty-attention")]) {
       if (!root) continue;
       const any = list.length || loop.length || graded.length || queues.length;
-      // A re-render keeps where its own short scroll was (a row the
-      // phone's "N in Needs you" line scrolled to stays in view).
-      const kept = root.querySelector(".attn-list")?.scrollTop || 0;
       root.hidden = !any;
       root.replaceChildren(...(any ? content(list, loop, graded, queues) : []));
-      const inner = root.querySelector(".attn-list");
-      if (inner) {
-        inner.scrollTop = kept;
-        inner.addEventListener("scroll", () => moreBelow(inner), { passive: true });
-        moreBelow(inner);
-      }
-    }
-  }
-
-  // Rows past the bottom of a capped list fade out there: there is more.
-  function moreBelow(list) {
-    list.classList.toggle("more-below", list.scrollTop + list.clientHeight < list.scrollHeight - 2);
-  }
-
-  // Bring these sessions' rows into view (the list scrolled to the first,
-  // then the box onto the screen) and mark them a moment.
-  function reveal(ids) {
-    const box = $("#attention");
-    if (!box || box.hidden) return;
-    const list = box.querySelector(".attn-list");
-    const rows = [...box.querySelectorAll(".attn-row[data-id]")].filter((r) => ids.includes(r.dataset.id));
-    if (list && rows.length) {
-      list.scrollTop += rows[0].getBoundingClientRect().top - list.getBoundingClientRect().top;
-      moreBelow(list);
-    }
-    box.scrollIntoView({ block: "start", behavior: "smooth" });
-    for (const r of rows) {
-      r.classList.remove("pointed");
-      void r.offsetWidth;
-      r.classList.add("pointed");
     }
   }
 
@@ -366,5 +332,5 @@ window.FwHubAttention = function (ctx) {
     if (document.visibilityState === "visible" && !$("#attention").hidden) render();
   }, 30000);
 
-  return { render, entries, branchOf, reveal };
+  return { render, entries, branchOf };
 };

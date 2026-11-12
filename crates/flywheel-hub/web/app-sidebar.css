@@ -1,139 +1,291 @@
 /* flywheel hub -- The sidebar: workspaces, their folders, session rows, status dots.
  * Loaded after app.css, in index.html's order (the cascade depends on it). */
 
-/* --- workspaces ---------------------------------------------------------- */
+/* --- the rail ------------------------------------------------------------ */
 
-#workspaces {
-  flex: 1;
+/* Everything (the wheel), each workspace as a tile, new workspace, then
+   the tools. A tile's marker: a red count of what needs you, else a brass
+   pip for a finished turn, else a signal pip for work under way. */
+.rail {
+  flex: none;
+  width: var(--rail);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: .5rem;
+  padding: .75rem 0 .6rem;
+  background: var(--bg);
+  border-right: 1px solid var(--rule);
   overflow-y: auto;
-  padding: .4rem 0 1rem;
+  overflow-x: hidden;
+  scrollbar-width: none;
+}
+
+.rail-tiles { display: contents; }
+
+.rail-tile {
+  position: relative;
+  flex: none;
+  width: 2.35rem;
+  height: 2.35rem;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--rule-2);
+  border-radius: .55rem;
+  background: var(--bg-3);
+  color: var(--ink-2);
+  transition: border-radius .15s var(--ease), background .12s, color .12s, border-color .12s;
+}
+.rail-tile:hover { color: var(--ink); border-color: var(--ink-3); border-radius: .7rem; }
+.rail-tile.on { background: var(--bg-4); color: var(--ink); border-color: var(--ink-3); border-radius: .7rem; }
+/* The picked tile: a bar on the rail's left edge. */
+.rail-tile.on::before {
+  content: "";
+  position: absolute;
+  left: calc((var(--rail) - 2.35rem) / -2 - 1px);
+  top: 22%;
+  bottom: 22%;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: var(--ink);
+}
+/* Names in the UI mono: it tells 1 from l and 0 from O. */
+.rail-initials { font: 700 12px/1 var(--mono); font-stretch: 87.5%; letter-spacing: .04em; }
+/* The workspace of the attached session. */
+.rail-tile.here .rail-initials { color: var(--signal); }
+
+.rail-all { border-color: transparent; background: none; }
+.rail-all .wheel { width: 1.85rem; height: 1.85rem; }
+.rail-all.on { background: var(--bg-3); }
+.rail-all + .rail-tiles > :first-child { margin-top: .1rem; }
+
+.rail-add { border-style: dashed; background: none; color: var(--ink-3); }
+.rail-add svg { width: .8rem; height: .8rem; }
+
+.rail-badge {
+  position: absolute;
+  top: -.35rem;
+  right: -.4rem;
+  min-width: 1rem;
+  height: 1rem;
+  padding: 0 .22rem;
+  border-radius: .5rem;
+  background: var(--alert);
+  box-shadow: 0 0 0 2px var(--bg);
+  color: #fff;
+  font: 700 9px/1rem var(--mono);
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.rail-pip {
+  position: absolute;
+  right: -.2rem;
+  bottom: -.2rem;
+  width: .6rem;
+  height: .6rem;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--bg);
+}
+.rail-pip.done { background: var(--brass); }
+.rail-pip.working { background: var(--signal); }
+
+/* Another machine's workspaces follow its mark, lit by its link. */
+.rail-machine {
+  flex: none;
+  width: 2.35rem;
+  margin-top: .2rem;
+  padding: .25rem 0 0;
+  border: 0;
+  border-top: 1px solid var(--rule-2);
+  background: none;
+  color: var(--ink-3);
+  font: 600 8.5px/1 var(--mono);
+  letter-spacing: .14em;
+}
+.rail-machine.link-online { color: var(--signal); }
+.rail-machine.link-connecting, .rail-machine.link-offline { color: var(--brass); }
+.rail-machine.link-refused { color: var(--alert); }
+
+.rail-tools {
+  margin-top: auto;
+  padding-top: .5rem;
+  display: grid;
+  gap: .15rem;
+}
+.rail-tool {
+  width: 2.1rem;
+  height: 2.1rem;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: .35rem;
+  background: none;
+  color: var(--ink-3);
+}
+.rail-tool:hover, .rail-tool[aria-expanded="true"] { color: var(--ink); background: var(--bg-3); }
+.rail-tool svg { width: .95rem; height: .95rem; }
+.rail-tool.warn { color: var(--alert); }
+
+/* --- the list ------------------------------------------------------------ */
+
+.side-list {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+/* The rail alone (a desktop's picked tile, picked again). */
+body.list-hidden .side-list { display: none; }
+
+.list-head {
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  padding: .85rem .7rem .7rem .95rem;
+  border-bottom: 1px solid var(--rule);
+}
+.list-heading { flex: 1; min-width: 0; display: grid; gap: .3rem; }
+/* A workspace's name in the UI mono (1 vs l, 0 vs O); the brand in the
+   display face. */
+.list-title {
+  margin: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font: 700 15px/1.1 var(--mono);
+  font-stretch: 87.5%;
+}
+.list-title.brand-title { font: 800 1.7rem/.9 var(--display); text-transform: uppercase; letter-spacing: .015em; }
+.list-sub {
+  display: flex;
+  align-items: baseline;
+  gap: .6rem;
+  min-width: 0;
+  font-size: 10px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.list-sub:empty { display: none; }
+#list-sub { display: flex; gap: .6rem; min-width: 0; }
+.list-tools { display: inline-flex; opacity: 0; transition: opacity .15s; }
+.list-head:hover .list-tools, .list-head:focus-within .list-tools { opacity: 1; }
+@media (hover: none) { .list-tools { opacity: 1; } }
+.list-new {
+  flex: none;
+  width: 1.75rem;
+  height: 1.75rem;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: var(--signal);
+  color: var(--signal-ink);
+}
+.list-new svg { width: .8rem; height: .8rem; }
+.list-new:hover { filter: brightness(1.1); }
+
+.side-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 1rem;
   scrollbar-width: thin;
   scrollbar-color: var(--rule-2) transparent;
 }
 
-.workspace {
-  padding-top: .55rem;
-  animation: rise .5s var(--ease) both;
-  animation-delay: calc(var(--i, 0) * 45ms);
-}
-
-@keyframes rise {
-  from { opacity: 0; transform: translateY(6px); }
-}
-
-.ws-head-row {
-  position: relative;
+/* Groups inside the list: Moving, the folded Resting. */
+.list-group {
   display: flex;
-  align-items: center;
-  padding-right: .6rem;
-}
-
-.ws-head {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: .4rem;
+  align-items: baseline;
+  gap: .45rem;
   width: 100%;
-  padding: .3rem .4rem .3rem 1.1rem;
+  min-width: 0;
+  padding: .85rem .95rem .3rem;
   border: 0;
   background: none;
   text-align: left;
-}
-
-.ws-head .chev {
+  font-size: 9.5px;
+  letter-spacing: .16em;
+  text-transform: uppercase;
   color: var(--ink-3);
-  transition: transform .2s var(--ease);
-  transform: rotate(90deg);
 }
-
-.workspace.collapsed .ws-head .chev { transform: rotate(0deg); }
-.workspace.collapsed .ws-body { display: none; }
-
-/* One line, cut with an ellipsis (the full name is its title): a name
-   that wrapped would flip between one and two lines as the status pill and
-   cost next to it come and go, pushing every row below it down. */
-.ws-name {
+.list-group-n { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.list-group.fold { cursor: pointer; }
+.list-group.fold:hover { color: var(--ink-2); }
+.list-group .chev { align-self: center; display: inline-grid; transition: transform .2s var(--ease); }
+.list-group .chev svg { width: .65rem; height: .65rem; }
+.list-group.fold.open .chev { transform: rotate(90deg); }
+.list-group-names {
   flex: 1;
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font: 700 13px/1.25 var(--mono);
-  font-stretch: 87.5%;
+  letter-spacing: .02em;
+  text-transform: none;
+  font-size: 10.5px;
 }
+.list-calm { padding: 1rem .95rem .2rem; font-size: 10.5px; color: var(--ink-3); }
 
-.workspace.current .ws-name { color: var(--signal); }
-
-.ws-count {
-  font-size: 10px;
-  color: var(--ink-3);
-  font-variant-numeric: tabular-nums;
+/* A workspace's list: agents elsewhere need you; Everything is a tap. */
+.list-elsewhere {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  width: calc(100% - 1.2rem);
+  margin: .6rem .6rem .1rem;
+  padding: .4rem .6rem;
+  border: 1px solid color-mix(in srgb, var(--alert) 40%, transparent);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--alert) 7%, transparent);
+  color: var(--alert);
+  font-size: 10.5px;
+  text-align: left;
 }
+.list-elsewhere:hover { background: color-mix(in srgb, var(--alert) 13%, transparent); }
 
-.ws-count b { color: var(--signal); font-weight: 600; }
+/* In Everything, Needs you is the first group: flat, like the others. */
+#sidebar .attention { margin: 0; border: 0; background: none; animation: none; }
+#sidebar .attn-head { padding: .85rem .95rem .3rem; }
+#sidebar .attn-title { font: 400 9.5px/1.5 var(--mono); letter-spacing: .16em; color: var(--alert); }
+#sidebar .attn-list { max-height: none; overflow: visible; }
+/* A workspace's list has its own: Needs you shows in Everything only. */
+#sidebar.scope-ws .attention { display: none; }
 
-/* Workspace rollup: the most urgent agent status inside, readable even
-   with the workspace collapsed. */
-.ws-status {
-  flex: none;
-  padding: .06rem .32rem;
-  border-radius: 2px;
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: .12em;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-.ws-status.working { color: var(--signal); box-shadow: inset 0 0 0 1px var(--signal); }
-.ws-status.blocked { color: var(--signal-ink); background: var(--alert); animation: alarm 1.6s ease-in-out infinite; }
-.ws-status.done { color: var(--signal-ink); background: var(--brass); }
-
-@keyframes alarm { 50% { opacity: .6; } }
-
-/* Hidden tools must not take clicks: visibility, not just opacity. They
-   float over the row's right end, shown or not, so showing them never
-   squeezes the name. Only the head row's own hover shows them, so the status
-   pill and count they cover stay readable while you work in its sessions. */
-.ws-tools {
+/* The rail's More: a popover off the rail's foot. */
+.side-foot {
   position: absolute;
-  top: 50%;
-  right: .5rem;
-  transform: translateY(-50%);
-  display: inline-flex;
-  padding-left: .9rem;
-  background: linear-gradient(90deg, transparent, var(--bg-2) .9rem);
-  opacity: 0;
-  visibility: hidden;
-  transition: opacity .15s, visibility 0s .15s;
+  left: calc(var(--rail) + .35rem);
+  bottom: .6rem;
+  z-index: 20;
+  display: none;
+  min-width: 12rem;
+  padding: .35rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 4px;
+  background: var(--bg-3);
+  box-shadow: var(--shadow);
+  animation: rise .15s var(--ease);
 }
-.ws-head-row:hover .ws-tools, .ws-head-row:focus-within .ws-tools {
-  opacity: 1;
-  visibility: visible;
-  transition: opacity .15s;
+.side-foot.more-open { display: block; }
+.side-more { display: grid; gap: .1rem; }
+.side-more .chip {
+  width: 100%;
+  justify-content: flex-start;
+  gap: .55rem;
+  padding: .45rem .55rem;
+  border-color: transparent;
 }
+.side-more .chip:hover { background: var(--bg-4); }
+.side-more .chip kbd { min-width: 3.4rem; }
 
-/* Touch screens have no hover: the tools sit on their own line under an
-   open workspace's name, and
-   the attached row's actions sit on a line under it. */
-@media (hover: none) {
-  .ws-head-row { flex-wrap: wrap; }
-  .ws-tools {
-    position: static;
-    transform: none;
-    flex-basis: 100%;
-    justify-content: flex-end;
-    padding: 0 0 .15rem;
-    background: none;
-    opacity: 1;
-    visibility: visible;
-  }
-  .workspace.collapsed .ws-tools { display: none; }
-  /* The attached row keeps its whole name: its state and actions take a
-     line of their own under it. */
-  .session.active .session-meta { grid-column: 3 / -1; justify-content: flex-end; }
-  .session.active .session-actions { display: inline-flex; margin: 0; }
-  .session.active .session-meta .session-state { display: inline; }
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
 }
 
 /* A workspace's folders: one inline list, each chip marked by kind --
@@ -143,7 +295,7 @@
   display: flex;
   flex-wrap: wrap;
   gap: .2rem .65rem;
-  padding: .05rem 1rem .45rem 2.05rem;
+  padding: .6rem .95rem .45rem;
   font-size: 10px;
   color: var(--ink-2);
 }
@@ -162,14 +314,23 @@
 
 .sessions { list-style: none; margin: 0; padding: 0; }
 
+/* A list's count line (a workspace's running / sessions). */
+.ws-count { font-variant-numeric: tabular-nums; }
+.ws-count b { color: var(--signal); font-weight: 600; }
+
+/* One line: the kind's glyph (its status dot on the corner), the name,
+   a short word at the right end. Under it only what matters now: what a
+   blocked agent asks, a working one's step, and on the active row where
+   it runs. */
 .session {
   position: relative;
   display: grid;
-  grid-template-columns: 1.1rem .5rem minmax(0, 1fr) auto;
+  grid-template-columns: 1.1rem minmax(0, 1fr) auto;
   align-items: center;
-  gap: .55rem;
-  min-height: 2.05rem;
-  padding: .2rem .7rem .2rem 1.95rem;
+  column-gap: .6rem;
+  row-gap: .1rem;
+  min-height: 2rem;
+  padding: .2rem .7rem .2rem .95rem;
   cursor: pointer;
   color: var(--ink-2);
   transition: background .12s, color .12s;
@@ -192,14 +353,6 @@
   background: var(--signal);
 }
 
-.session .num {
-  position: absolute;
-  left: .85rem;
-  font-size: 9px;
-  color: var(--ink-3);
-  font-variant-numeric: tabular-nums;
-}
-
 .glyph {
   position: relative;
   width: 1.1rem;
@@ -214,11 +367,15 @@
 .glyph.codex { color: var(--brass); }
 .glyph.as-shell { color: var(--ink-3); opacity: .6; }
 
-.session > .dot {
-  position: relative;
-  flex: none;
-  margin-left: -.3rem;
+/* The status dot rides the glyph's lower right corner. */
+.glyph > .dot {
+  position: absolute;
+  right: -.22rem;
+  bottom: -.18rem;
+  width: .45rem;
+  height: .45rem;
 }
+.glyph.shell { color: var(--ink-3); }
 
 .session-name {
   min-width: 0;
@@ -229,7 +386,24 @@
   font-weight: 500;
 }
 
-.session-meta { display: flex; align-items: center; gap: .2rem; }
+.session-meta { display: flex; align-items: center; gap: .3rem; min-width: 0; }
+.session-state:empty { display: none; }
+/* The cost is for a look closer: hover, focus, the active row. */
+.session .session-cost { display: none; }
+.session:hover .session-cost, .session:focus-within .session-cost, .session.active .session-cost { display: inline; }
+/* In Everything: the row's workspace, as its rail tile says it. */
+.ws-tag {
+  flex: none;
+  min-width: 1.45rem;
+  padding: 0 .2rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 3px;
+  font: 600 8.5px/1.45 var(--mono);
+  letter-spacing: .06em;
+  text-align: center;
+  color: var(--ink-3);
+}
+.session:hover .ws-tag, .session:focus-within .ws-tag { display: none; }
 
 .session-state {
   font-size: 9.5px;
@@ -261,11 +435,18 @@
 .session:hover .session-actions, .session:focus-within .session-actions { display: inline-flex; }
 .session:hover .session-state, .session:focus-within .session-state { display: none; }
 
+/* Touch screens have no hover: the active row's actions show in place of
+   its word. */
+@media (hover: none) {
+  .session.active .session-actions { display: inline-flex; }
+  .session.active .session-state, .session.active .ws-tag { display: none; }
+}
+
 .session.gone { opacity: .55; }
 
 /* A working agent's progress: its plan's bar and step, else its tool. */
 .session-progress {
-  grid-column: 3 / -1;
+  grid-column: 2 / -1;
   display: flex;
   align-items: center;
   gap: .4rem;
@@ -282,7 +463,7 @@
 .session-progress .session-ctx { flex: none; color: var(--alert); }
 
 .session-detail {
-  grid-column: 3 / -1;
+  grid-column: 2 / -1;
   min-width: 0;
   margin-top: -.25rem;
   overflow: hidden;

@@ -73,7 +73,9 @@
   --display: "FW Display", "Oswald", "Arial Narrow", sans-serif;
   --mono: "FW Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   --term: "FW Term", "FW Symbols", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  /* The sidebar: the rail of workspace tiles, then the list. */
   --side: 18.5rem;
+  --rail: 3.4rem;
   /* Every drawer over the terminal (Commands, Flywheel, Review, Queue):
      one width, one edge (the stage's right). Narrow enough to leave the
      terminal a drawer acts on in view at 1440 px, wide enough for a
@@ -206,9 +208,14 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   height: 100dvh;
 }
 
+/* The rail alone: the list folded away (app-sidebar.js). */
+@media (min-width: 761px) {
+  body.list-hidden { --side: var(--rail); }
+}
+
 #sidebar {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   min-height: 0;
   background:
     linear-gradient(90deg, transparent calc(100% - 1px), var(--rule) 0),
@@ -217,15 +224,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
   z-index: 3;
 }
 
-/* --- brand --------------------------------------------------------------- */
-
-.brand {
-  display: flex;
-  align-items: center;
-  gap: .8rem;
-  padding: 1.1rem 1.1rem 1rem;
-  border-bottom: 1px solid var(--rule);
-}
+/* --- the wheel: the rail's Everything tile, spinning with the fleet ----- */
 
 .wheel {
   width: 2.35rem;
@@ -238,27 +237,8 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.brand-text { display: grid; line-height: 1; }
-
-.brand-name {
-  font: 800 1.9rem/0.85 var(--display);
-  text-transform: uppercase;
-  letter-spacing: .015em;
-}
-
-.brand-sub {
-  display: flex;
-  align-items: baseline;
-  gap: .6rem;
-  margin-top: .32rem;
-  font-size: 10px;
-  letter-spacing: .32em;
-  text-transform: uppercase;
-  color: var(--ink-3);
-}
-
 .tach {
-  letter-spacing: .08em;
+  letter-spacing: .14em;
   color: var(--ink-2);
   font-variant-numeric: tabular-nums;
 }

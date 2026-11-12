@@ -109,7 +109,7 @@
 .pair-chip svg { flex: none; width: .7rem; height: .7rem; }
 .pair-chip:hover, .pair-chip:focus-visible { border-color: var(--brass); outline: none; }
 .pair-chip .dot { flex: none; }
-.session > .pair-chip { grid-column: 3 / -1; justify-self: start; margin-top: -.25rem; }
+.session > .pair-chip { grid-column: 2 / -1; justify-self: start; margin-top: -.25rem; }
 .cmd-handoff, .tx-send { margin-left: auto; }
 .tx-send { font-size: 10.5px; }
 

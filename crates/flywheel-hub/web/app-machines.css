@@ -2,16 +2,14 @@
  * Loaded after app.css, in index.html's order (the cascade depends on it). */
 
 /* --- machines (machines.js) ------------------------------------------------
-   With other machines registered, the sidebar is a rack: this hub's
-   workspaces, then each machine's, each under a stencilled head with its
-   link lamp (online steady, connecting pulsing, offline hollow, refused in
-   alert red) and its own reconnect. */
-.machine-group + .machine-group { margin-top: .35rem; border-top: 1px solid var(--rule); }
+   With other machines registered, the rail lists each machine's workspaces
+   after this hub's, under its mark; a machine workspace's list opens with a
+   stencilled head: its link lamp (online steady, connecting pulsing,
+   offline hollow, refused in alert red) and its own reconnect. */
 .machine-head {
   position: sticky;
-  /* Flush with #workspaces' top edge (past its .4rem padding), so no
-     scrolled row shows above the head. */
-  top: -.4rem;
+  /* Flush with the list's scroll edge: no scrolled row shows above it. */
+  top: 0;
   z-index: 2;
   display: flex;
   align-items: center;
@@ -61,11 +59,10 @@
 .machine-dot.link-refused { background: var(--alert); border-color: var(--alert); }
 @keyframes machine-pulse { 50% { opacity: .25; } }
 @media (prefers-reduced-motion: reduce) { .machine-dot.link-connecting { animation: none; } }
-.machine-head.link-offline ~ .workspace, .machine-head.link-refused ~ .workspace { opacity: .62; }
-.machine-empty { padding-left: 1.35rem; }
+.machine-head.link-offline ~ *, .machine-head.link-refused ~ * { opacity: .62; }
 /* What is scrolled into view (the active row, a keyboard move) stops
    below the sticky head instead of under it. */
-.machine-group .ws-head-row, .machine-group .session { scroll-margin-top: 2.4rem; }
+.machine-head ~ .sessions .session { scroll-margin-top: 2.4rem; }
 
 /* A machine's name on its sessions: a stamped tag. */
 .machine-badge {

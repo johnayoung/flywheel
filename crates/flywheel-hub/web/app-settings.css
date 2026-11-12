@@ -107,7 +107,7 @@
 
 /* Density: compact tightens the sidebar rows and pane title bars. */
 body.density-compact .session { min-height: 1.6rem; padding-top: .05rem; padding-bottom: .05rem; }
-body.density-compact .side-foot, body.density-compact .side-actions { gap: .25rem; }
+body.density-compact .rail { gap: .35rem; }
 body.density-compact .pane-head { height: 1.35rem; }
 
 /* Transcripts, suggested commands, run output, diffs, terminals, and the

@@ -7,7 +7,7 @@
    line, the branch name cut first, so counts that come and go never wrap
    the row taller. */
 .session-git {
-  grid-column: 3 / -1;
+  grid-column: 2 / -1;
   display: flex;
   align-items: center;
   gap: .4rem;
@@ -38,7 +38,7 @@
 /* The folder a session runs in, then its branch line, on one line under
    the row; the folder gives up room first. */
 .session-where {
-  grid-column: 3 / -1;
+  grid-column: 2 / -1;
   display: flex;
   align-items: center;
   gap: .6rem;
@@ -59,12 +59,15 @@
 .session-account { flex: none; color: var(--brass); white-space: nowrap; }
 .session.active .session-folder { color: var(--ink-2); }
 
+/* Where a session runs: on the active row only (the rest stay one line). */
+.session:not(.active) > .session-where { display: none; }
+
 /* A companion shell hangs under its agent. */
-.session.companion { padding-left: 2.9rem; min-height: 1.8rem; }
+.session.companion { padding-left: 2.1rem; min-height: 1.8rem; }
 .session.companion::after {
   content: "";
   position: absolute;
-  left: 2.15rem;
+  left: 1.35rem;
   top: 0;
   height: 50%;
   width: .45rem;
@@ -72,10 +75,7 @@
   border-bottom: 1px solid var(--rule-2);
   pointer-events: none;
 }
-.session.companion.needs-you::after, .session.companion.orphan::after { border: 0; }
-.session.companion.orphan { padding-left: 1.95rem; }
-.session.companion .num { left: 1.5rem; }
-.session.companion.orphan .num { left: .85rem; }
+.session.companion.needs-you::after { border: 0; }
 
 /* New-session form: the worktree option. */
 .wt-pick { gap: .35rem; }

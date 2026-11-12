@@ -119,7 +119,7 @@ window.matchMedia(NARROW).addEventListener("change", () => {
     state.stageKey = "";
     renderStage();
   }
-  // The sidebar lists differently on each side (see renderWorkspace).
+  // The sidebar differs on each side (a desktop folds its list to the rail).
   render();
 });
 

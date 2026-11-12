@@ -243,7 +243,6 @@
 .attn-status.fo.pass { background: var(--fw-ok); color: var(--fw-ok-ink); }
 
 /* The sidebar's buttons: Fan-out shares the second row. */
-.side-actions [data-action="fanouts"] { grid-column: span 1; }
 
 /* --- phones ------------------------------------------------------------- */
 

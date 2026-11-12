@@ -103,48 +103,51 @@
 
 <div id="app">
   <aside id="sidebar" aria-label="Workspaces and sessions">
-    <header class="brand">
-      <svg class="wheel" id="wheel" aria-hidden="true"><use href="#i-wheel"/></svg>
-      <div class="brand-text">
-        <span class="brand-name">Flywheel</span>
-        <span class="brand-sub">hub <button type="button" id="tach" class="tach" data-action="fleet" title="Running sessions. Open the fleet board: every agent session, most urgent first">00 live</button></span>
+    <nav id="rail" class="rail" aria-label="Workspaces">
+      <button type="button" id="rail-all" class="rail-tile rail-all" aria-label="Everything" title="Everything: what needs you, what is moving, the rest">
+        <svg class="wheel" id="wheel" aria-hidden="true"><use href="#i-wheel"/></svg>
+        <span id="rail-all-badge" class="rail-badge" hidden></span>
+      </button>
+      <div id="rail-tiles" class="rail-tiles"></div>
+      <button type="button" class="rail-tile rail-add" data-action="new-workspace" data-key-title="workspace.new" data-title="New workspace" title="New workspace (Alt Shift N)" aria-label="New workspace"><svg aria-hidden="true"><use href="#i-plus"/></svg></button>
+      <div class="rail-tools">
+        <button type="button" class="rail-tool" data-action="search" data-key-title="search.open" data-title="Search every session" title="Search every session (Ctrl Shift F)" aria-label="Search every session"><svg aria-hidden="true"><use href="#i-search"/></svg></button>
+        <button type="button" class="rail-tool" data-action="fleet" title="Fleet board: every agent session, most urgent first" aria-label="Fleet board"><svg aria-hidden="true"><use href="#i-fleet"/></svg></button>
+        <button type="button" class="rail-tool" data-action="activity" title="Activity: what happened, on every machine" aria-label="Activity"><svg aria-hidden="true"><use href="#i-activity"/></svg></button>
+        <button type="button" class="rail-tool settings-gear" id="settings-gear" data-action="settings" title="Settings" aria-label="Settings"><svg aria-hidden="true"><use href="#i-gear"/></svg></button>
+        <button type="button" class="rail-tool" id="side-more-toggle" aria-expanded="false" aria-controls="side-more" title="More: palette, fan-out, broadcast, theme, alerts, machines, sharing, sign out" aria-label="More"><svg aria-hidden="true"><use href="#i-dots"/></svg></button>
       </div>
-    </header>
-    <div id="offline" class="offline" hidden role="status">hub unreachable &mdash; retrying</div>
-    <section id="attention" class="attention" hidden aria-label="Agents that need you"></section>
-    <nav id="workspaces" aria-label="Workspaces"></nav>
-    <div id="bc-bar" class="bc-bar" hidden role="region" aria-label="Selected agents"></div>
-    <div id="spend" class="spend" hidden aria-label="Agent spend"></div>
-    <div class="side-actions">
-      <button type="button" class="slab" data-action="new-session" data-key-title="session.new" data-title="New session" title="New session (Alt N)"><svg><use href="#i-plus"/></svg>Session</button>
-      <button type="button" class="slab ghost" data-action="new-workspace" data-key-title="workspace.new" data-title="New workspace" title="New workspace (Alt Shift N)"><svg><use href="#i-plus"/></svg>Workspace</button>
-      <button type="button" class="slab ghost" id="from-template" data-action="from-template" title="New agent from a saved template" hidden><svg><use href="#i-plus"/></svg>From template</button>
-      <button type="button" class="slab ghost" data-action="fanouts" title="Verified fan-out: one prompt to several agents, graded and ranked"><svg><use href="#i-branch"/></svg>Fan-out</button>
-      <button type="button" class="slab ghost" id="bc-open" data-action="broadcast" title="Broadcast: one prompt to several agents (Ctrl-click rows to pick)" hidden><svg><use href="#i-broadcast"/></svg>Broadcast</button>
+    </nav>
+    <div id="side-list" class="side-list">
+      <header class="list-head">
+        <div class="list-heading">
+          <h2 id="list-title" class="list-title">Flywheel</h2>
+          <span class="list-sub"><button type="button" id="tach" class="tach" data-action="fleet" title="Running sessions. Open the fleet board: every agent session, most urgent first">00 live</button><span id="list-sub"></span></span>
+        </div>
+        <span id="list-tools" class="list-tools"></span>
+        <button type="button" class="list-new" id="list-new" data-key-title="session.new" data-title="New session" title="New session (Alt N)" aria-label="New session"><svg aria-hidden="true"><use href="#i-plus"/></svg></button>
+      </header>
+      <div id="offline" class="offline" hidden role="status">hub unreachable &mdash; retrying</div>
+      <div id="side-scroll" class="side-scroll">
+        <section id="attention" class="attention" hidden aria-label="Agents that need you"></section>
+        <nav id="workspaces" aria-label="Sessions"></nav>
+      </div>
+      <div id="bc-bar" class="bc-bar" hidden role="region" aria-label="Selected agents"></div>
+      <div id="spend" class="spend" hidden aria-label="Agent spend"></div>
     </div>
-    <footer class="side-foot" id="side-foot">
-      <button type="button" class="side-more-toggle" id="side-more-toggle" aria-expanded="false" aria-controls="side-more"><svg aria-hidden="true"><use href="#i-dots"/></svg><span>More</span><span class="side-more-hint">palette, search, theme, alerts, activity, settings&hellip;</span></button>
-      <div class="side-more" id="side-more">
-      <button type="button" class="chip" data-action="palette" data-key-title="palette.open" data-title="Command palette" title="Command palette (Ctrl K)">
-        <kbd data-key="palette.open">Ctrl K</kbd><span>palette</span>
-      </button>
-      <button type="button" class="chip" data-action="search" data-key-title="search.open" data-title="Search every session" title="Search every session (Ctrl Shift F)">
-        <svg class="chip-icon" aria-hidden="true"><use href="#i-search"/></svg><kbd data-key="search.open">Ctrl Shift F</kbd><span class="chip-label">search</span>
-      </button>
-      <div class="side-tools">
-        <button type="button" class="chip tool" id="theme-toggle" data-action="cycle-theme" title="Theme">
-          <span class="theme-swatch" aria-hidden="true"></span><span id="theme-label" class="chip-label">auto</span>
-        </button>
+    <div class="side-foot" id="side-foot">
+      <div class="side-more" id="side-more" role="group" aria-label="More">
+        <button type="button" class="chip" data-action="palette" data-key-title="palette.open" data-title="Command palette" title="Command palette (Ctrl K)"><kbd data-key="palette.open">Ctrl K</kbd><span>palette</span></button>
+        <button type="button" class="chip" data-action="fanouts" title="Verified fan-out: one prompt to several agents, graded and ranked"><svg aria-hidden="true"><use href="#i-branch"/></svg><span class="chip-label">fan-out</span></button>
+        <button type="button" class="chip" id="from-template" data-action="from-template" title="New agent from a saved template" hidden><svg aria-hidden="true"><use href="#i-plus"/></svg><span class="chip-label">from template</span></button>
+        <button type="button" class="chip" id="bc-open" data-action="broadcast" title="Broadcast: one prompt to several agents (Ctrl-click rows to pick)" hidden><svg aria-hidden="true"><use href="#i-broadcast"/></svg><span class="chip-label">broadcast</span></button>
+        <button type="button" class="chip tool" id="theme-toggle" data-action="cycle-theme" title="Theme"><span class="theme-swatch" aria-hidden="true"></span><span class="chip-label">theme <span id="theme-label">auto</span></span></button>
         <button type="button" class="chip tool alerts" id="alerts-toggle" aria-pressed="false"><span class="alerts-dot" aria-hidden="true"></span><span id="alerts-label" class="chip-label">alerts off</span></button>
-        <button type="button" class="chip tool" data-action="activity" title="Activity: what happened, on every machine"><svg aria-hidden="true"><use href="#i-activity"/></svg><span class="chip-label">activity</span></button>
-        <button type="button" class="chip tool" data-action="fleet" title="Fleet board: every agent session, most urgent first"><svg aria-hidden="true"><use href="#i-fleet"/></svg><span class="chip-label">fleet</span></button>
         <button type="button" class="chip tool" data-action="machines" title="Other machines' hubs"><svg aria-hidden="true"><use href="#i-machines"/></svg><span class="chip-label">machines</span></button>
         <button type="button" class="chip tool" data-action="sharing" title="Share links and recordings"><svg aria-hidden="true"><use href="#i-link"/></svg><span class="chip-label">sharing</span></button>
-        <button type="button" class="chip tool settings-gear" id="settings-gear" data-action="settings" title="Settings"><svg aria-hidden="true"><use href="#i-gear"/></svg><span class="chip-label">settings</span></button>
         <button type="button" class="chip tool" data-action="logout" title="Sign out of this browser"><svg aria-hidden="true"><use href="#i-exit"/></svg><span class="chip-label">sign out</span></button>
       </div>
-      </div>
-    </footer>
+    </div>
   </aside>
 
   <main id="main">

@@ -156,7 +156,7 @@ function mayTakeFocus() {
 function startRename(id) {
   const session = sessionById(id);
   if (!session) return;
-  state.collapsed.delete(session.workspace_id);
+  revealInList(session);
   if (window.matchMedia(NARROW).matches) document.body.classList.add("side-open");
   state.renaming = id;
   render();
@@ -214,7 +214,26 @@ async function deleteWorkspace(workspace) {
 
 // --- sidebar ---------------------------------------------------------
 
-function renderSession(session, index) {
+// What a row says at its right end, short: an agent that needs you
+// (blocked, asking), a finished turn, a plan's count; a shell or an idle
+// agent says nothing (its dot does), an ended one how it ended.
+function rowMeta(session, st) {
+  const agent = agentStatus(session);
+  if (agent) {
+    if (agent.status === "working") {
+      const t = sessionTelemetry.get(session.id);
+      return t && t.plan && t.plan.total ? `${t.plan.done}/${t.plan.total}` : "";
+    }
+    if (agent.status === "idle") return "";
+    if (agent.status === "done") return agent.since ? `done ${age(agent.since)}` : "done";
+    return st.label;
+  }
+  return st.dot === "live" ? "" : st.label;
+}
+
+// `opts.tag`: the All list's rows carry their workspace's rail initials;
+// `opts.flat`: no companion connector (its agent may sit in another group).
+function renderSession(session, opts = {}) {
   const st = statusLook(session);
   const active = state.attached === session.id;
   // In another pane on screen.
@@ -249,10 +268,12 @@ function renderSession(session, index) {
       : iconButton("redo", "Relaunch in place", () => relaunch(session.id)),
     iconButton("x", "Close session", () => closeSession(session.id), true),
   );
+  const workspace = opts.tag ? workspaceById(session.workspace_id) : null;
+  const parent = opts.flat ? null : session.companion_of || session.review_of;
   return el(
     "li",
     {
-      className: `session${active ? " active" : ""}${shown ? " shown" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${session.companion_of || session.review_of ? " companion" : ""}${broadcast.isPicked(session.id) ? " picked" : ""}`,
+      className: `session${active ? " active" : ""}${shown ? " shown" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${parent ? " companion" : ""}${broadcast.isPicked(session.id) ? " picked" : ""}`,
       dataset: { id: session.id },
       tabIndex: 0,
       role: "button",
@@ -288,27 +309,33 @@ function renderSession(session, index) {
         }
       },
     },
-    index < 9 ? el("span", { className: "num", textContent: index + 1 }) : null,
+    // The kind's glyph wears the status dot on its corner. Restored as a
+    // plain shell: the agent's glyph, dimmed, says so.
     el(
       "span",
-      // Restored as a plain shell: the agent's glyph, dimmed, says so.
       {
         className: `glyph ${glyphFor(session.kind)}${session.fallback_command ? " as-shell" : ""}`,
-        title: window.FwHubFmt.kindLabel(session),
+        title: `${window.FwHubFmt.kindLabel(session)}: ${st.title || st.label}`,
       },
       icon(glyphFor(session.kind)),
+      el("span", { className: `dot ${st.dot}`, "aria-hidden": "true" }),
     ),
-    el("span", { className: `dot ${st.dot}`, title: st.title || st.label }),
     nameNode,
     el(
       "span",
       { className: "session-meta" },
-      // No machine badge: a machine's rows sit under its own head.
+      // A workspace's list has no machine badge: its tile says where.
+      opts.tag && session.machine ? machineBadge(session.machine) : null,
       recBadge(session),
-      el("span", { className: `session-state ${st.tone}`, textContent: st.label, title: st.title || undefined }),
       launcher.rowChip(session),
       promptQueue.rowChip(session),
       pullRequests.rowChip(session),
+      el("span", {
+        className: `session-state ${st.tone}`,
+        textContent: rowMeta(session, st),
+        title: st.title || st.label,
+      }),
+      workspace ? el("span", { className: "ws-tag", textContent: initials(workspace.name), title: workspace.name }) : null,
       actions,
     ),
     // What a blocked agent asks, readable without hover (touch).
@@ -316,11 +343,9 @@ function renderSession(session, index) {
       ? el("span", { className: "session-detail", textContent: st.detail })
       : null,
     progressLine(session, st),
-    // A companion (or a reviewer) sits under its agent: the agent's
-    // line says it all.
-    (session.companion_of && sessionById(session.companion_of)) || (session.review_of && sessionById(session.review_of))
-      ? null
-      : whereLine(session),
+    // Where it runs (shown on the active row); a companion (or a
+    // reviewer) under its agent: the agent's line says it all.
+    parent && sessionById(parent) ? null : whereLine(session),
     // Author <-> reviewer (handoff.js).
     handoff.pairChip(session),
   );
@@ -337,7 +362,7 @@ function progressLine(session, st) {
   if (t.plan && t.plan.total) {
     const bar = el("span", { className: "prog-bar" }, el("i"));
     bar.firstChild.style.width = `${Math.round((t.plan.done / t.plan.total) * 100)}%`;
-    parts.push(bar, el("b", { textContent: `${t.plan.done}/${t.plan.total}` }));
+    parts.push(bar);
     if (t.plan.current) parts.push(el("span", { className: "session-step", textContent: t.plan.current }));
   } else if (t.tool) {
     parts.push(el("span", {
@@ -414,202 +439,321 @@ function recBadge(session) {
 
 const machineBadge = (name) => el("span", { className: "machine-badge", textContent: name, title: `on machine ${name}` });
 
-// The workspace's most urgent agent status (idle and unknown stay quiet),
-// counted by the hub's one rule for done (docs/hub/internals.md): an open
-// fan-out's candidates' finished turns are the hub's to grade, and a
-// fan-out whose latest grading nobody has looked at is one done. The hub's
-// rollup, Needs you, and `fw hub attach` count the same way.
-function rollupChip(workspace) {
-  let rolled = state.rollup[workspace.id];
+// --- the rail and the list --------------------------------------------
+
+// A workspace's rail initials: the first letters of its first two words
+// ("infrared-rust" -> IR), else its first two letters.
+function initials(name) {
+  const words = String(name || "").split(/[\s_\-./]+/).filter(Boolean);
+  const out = words.length > 1 ? words[0][0] + words[1][0] : (words[0] || "?").slice(0, 2);
+  return out.toUpperCase();
+}
+
+// An agent whose turn ended asking you something (telemetry's `asking`).
+function askingNow(session) {
+  const t = sessionTelemetry.get(session.id);
+  return !!(t && t.status === "asking" && t.ask);
+}
+
+// What agents need, in one workspace (or all, `null`), counted as Needs
+// you counts them: blocked or asking; finished turns nobody here has
+// looked at (an open fan-out's candidates are its one row); working.
+function workspaceNeeds(workspaceId) {
   const graded = fanout.candidateSessions();
-  const here = state.sessions.filter((s) => s.workspace_id === workspace.id);
-  const counted = (status) =>
-    here.filter((s) => agentStatus(s)?.status === status && !(status === "done" && graded.has(s.id))).length;
-  let count;
-  if (rolled === "blocked" || rolled === "working") {
-    count = counted(rolled);
-  } else {
-    count = counted("done") + fanout.attention().filter((f) => f.workspace_id === workspace.id).length;
-    rolled = count ? "done" : null;
+  const out = { blocked: 0, done: 0, working: 0 };
+  for (const session of state.sessions) {
+    if (workspaceId && session.workspace_id !== workspaceId) continue;
+    const agent = agentStatus(session);
+    if (!agent) continue;
+    if (agent.status === "blocked" || (agent.status === "done" && askingNow(session))) out.blocked += 1;
+    else if (agent.status === "done" && !graded.has(session.id)) out.done += 1;
+    else if (agent.status === "working") out.working += 1;
   }
-  if (!["blocked", "working", "done"].includes(rolled)) return null;
-  return el("span", {
-    className: `ws-status ${rolled}`,
-    textContent: count > 1 ? `${count} ${rolled}` : rolled,
-    title: `agents here: ${rolled}`,
-  });
+  out.done += fanout.attention().filter((f) => !workspaceId || f.workspace_id === workspaceId).length;
+  return out;
 }
 
-// On a phone the Needs you list (attention.js) sits right above the
-// workspaces in the one scroll: a session it lists is not listed again
-// under its workspace, which says how many it holds there instead.
-function listedInNeedsYou() {
-  return phone() ? new Set(attention.entries().map((e) => e.session.id)) : new Set();
-}
-
-function needsYouLine(ids) {
-  return el(
-    "li",
-    {},
-    el("button", {
-      type: "button",
-      className: "ws-needs",
-      textContent: `${ids.length} in Needs you`,
-      title: "Listed in Needs you, at the top",
-      onclick: () => attention.reveal(ids),
-    }),
-  );
-}
-
-function renderWorkspace(workspace, i, numbering, needsYou = new Set()) {
-  const sessions = state.sessions.filter((s) => s.workspace_id === workspace.id);
-  const listed = sessions.filter((s) => !needsYou.has(s.id));
-  const elsewhere = sessions.filter((s) => needsYou.has(s.id)).map((s) => s.id);
-  const live = sessions.filter((s) => s.live && s.state === "running" && reachable(s)).length;
-  const collapsed = state.collapsed.has(workspace.id);
-  const attachedHere = sessionById(state.attached)?.workspace_id === workspace.id;
-  const toggle = () => {
-    if (state.collapsed.has(workspace.id)) state.collapsed.delete(workspace.id);
-    else state.collapsed.add(workspace.id);
-    store.set("collapsed", [...state.collapsed]);
-    render();
-  };
-  const error = state.wsErrors[workspace.id];
-  return el(
-    "section",
-    {
-      className: `workspace${collapsed ? " collapsed" : ""}${attachedHere ? " current" : ""}`,
-      style: `--i:${i}`,
-      dataset: { id: workspace.id },
-    },
-    el(
-      "div",
-      { className: "ws-head-row" },
-      el(
-        "button",
-        { type: "button", className: "ws-head", onclick: toggle, "aria-expanded": String(!collapsed) },
-        el("span", { className: "chev" }, icon("chev")),
-        el("span", { className: "ws-name", textContent: workspace.name, title: workspace.name }),
-        rollupChip(workspace),
-        launcher.workspaceChip(workspace.id),
-        el(
-          "span",
-          { className: "ws-count", title: `${live} running of ${sessions.length}` },
-          live ? el("b", { textContent: `${live}` }) : null,
-          live ? "/" : "",
-          `${sessions.length}`,
-        ),
-      ),
-      el(
-        "span",
-        { className: "ws-tools" },
-        iconButton("plus", "New session here", () => openSessionDialog(workspace.id)),
-        broadcast.workspaceTool(workspace, iconButton),
-        iconButton("gear", "Edit workspace", () => openWorkspaceDialog(workspace)),
-        iconButton("x", "Delete workspace", () => deleteWorkspace(workspace), true),
-      ),
-    ),
-    el(
-      "div",
-      { className: "ws-body" },
-      el(
-        "div",
-        { className: "ws-repos" },
-        workspace.folders.map((f) =>
-          flywheel.folderChip(f, el("span", {
-            className: f.missing ? "missing" : f.git ? "git" : "plain",
-            textContent: folderLabel(f),
-            title: f.missing
-              ? `${f.path} (missing: moved or deleted?)`
-              : f.git ? `${f.path} (git repo)` : `${f.path} (plain folder, no git)`,
-          }), workspace.id)),
-      ),
-      error
-        ? el("p", {
-          className: "ws-error",
-          role: "alert",
-          textContent: error,
-          onclick: () => {
-            delete state.wsErrors[workspace.id];
-            render();
-          },
-        })
-        : null,
-      sessions.length
-        ? el(
-          "ul",
-          { className: "sessions" },
-          listed.map((s) => {
-            const row = renderSession(s, numbering.get(s.id));
-            // Its agent is listed in Needs you: no connector to a row that
-            // is not above it.
-            const parent = s.companion_of || s.review_of;
-            if (parent && needsYou.has(parent)) row.classList.add("orphan");
-            return row;
-          }),
-          elsewhere.length ? needsYouLine(elsewhere) : null,
-        )
-        : el(
-          "div",
-          { className: "ws-empty" },
-          "No sessions. ",
-          el("button", {
-            type: "button",
-            className: "text-btn",
-            textContent: "start one",
-            onclick: () => openSessionDialog(workspace.id),
-          }),
-        ),
-    ),
-  );
-}
-
-// With machines: this hub's workspaces, then each machine's, each group
-// under a head with its connection state.
-function machineGroups(numbering, needsYou) {
-  let i = 0;
-  const group = (name, list, empty) => el(
-    "section",
-    { className: `machine-group${name ? "" : " local"}`, dataset: { machine: name || "" } },
-    machines.header(name),
-    list.length
-      ? list.map((w) => renderWorkspace(w, i++, numbering, needsYou))
-      : el("div", { className: "ws-empty machine-empty", textContent: empty }),
-  );
-  const local = state.workspaces.filter((w) => !w.machine);
+function needsText({ blocked, done, working }) {
   return [
-    group(null, local, "No workspaces on this machine."),
-    ...machines.names().map((name) => {
-      const list = state.workspaces.filter((w) => w.machine === name);
-      const link = machines.linkOf(name);
-      return group(name, list, link === "online" ? "No workspaces there." : link === "connecting" ? "Connecting…" : "Not reachable yet.");
-    }),
-  ];
+    blocked ? `${blocked} need${blocked === 1 ? "s" : ""} you` : "",
+    done ? `${done} done` : "",
+    working ? `${working} working` : "",
+  ].filter(Boolean).join(", ");
+}
+
+// A tile's marker: a count of what needs you, else a pip for a finished
+// turn, else one for work under way.
+function railMarker(needs, badgeId) {
+  if (needs.blocked) return el("span", { className: "rail-badge", id: badgeId, textContent: String(needs.blocked) });
+  if (needs.done) return el("span", { className: "rail-pip done", id: badgeId });
+  if (needs.working) return el("span", { className: "rail-pip working", id: badgeId });
+  return null;
+}
+
+// The workspace the list shows, or null for Everything. A scope whose
+// workspace is not listed (yet: a machine's lists load later) reads as
+// Everything without being forgotten.
+function scopedWorkspace() {
+  return state.scope === "all" ? null : workspaceById(state.scope) || null;
+}
+
+// A tile picked: its list. The picked one again folds the list away (a
+// desktop's rail alone), and back.
+function pickScope(scope) {
+  if (state.scope === scope && !window.matchMedia(NARROW).matches) {
+    state.listHidden = !state.listHidden;
+  } else {
+    state.scope = scope;
+    state.listHidden = false;
+  }
+  store.set("scope", state.scope);
+  store.set("list-hidden", state.listHidden);
+  render();
+}
+
+// A session about to be acted on in the list (a rename): its row on
+// screen -- its workspace's list, or Everything with Resting unfolded.
+function revealInList(session) {
+  if (state.scope !== "all" && state.scope !== session.workspace_id) {
+    state.scope = session.workspace_id;
+    store.set("scope", state.scope);
+  }
+  if (state.scope === "all" && !state.restingOpen) {
+    state.restingOpen = true;
+    store.set("resting-open", true);
+  }
+  if (state.listHidden) {
+    state.listHidden = false;
+    store.set("list-hidden", false);
+  }
+}
+
+// A session opened from elsewhere (Alt 1-9, the palette, a link) while
+// the list shows another workspace: the list follows it there.
+function followAttached() {
+  const session = sessionById(state.attached);
+  if (!session || state.scopeFollows === session.id) return;
+  state.scopeFollows = session.id;
+  if (state.scope !== "all" && state.scope !== session.workspace_id && workspaceById(session.workspace_id)) {
+    state.scope = session.workspace_id;
+    store.set("scope", state.scope);
+  }
+}
+
+function railTile(workspace) {
+  const needs = workspaceNeeds(workspace.id);
+  const picked = state.scope === workspace.id;
+  const here = sessionById(state.attached)?.workspace_id === workspace.id;
+  const said = needsText(needs);
+  const label = `${workspace.name}${workspace.machine ? ` on ${workspace.machine}` : ""}${said ? `: ${said}` : ""}`;
+  return el(
+    "button",
+    {
+      type: "button",
+      className: `rail-tile ws${picked ? " on" : ""}${here ? " here" : ""}`,
+      dataset: { id: workspace.id },
+      title: picked && !window.matchMedia(NARROW).matches ? `${label} (again: ${state.listHidden ? "show" : "hide"} the list)` : label,
+      "aria-label": label,
+      "aria-current": picked ? "true" : undefined,
+      onclick: () => pickScope(workspace.id),
+    },
+    el("span", { className: "rail-initials", textContent: initials(workspace.name) }),
+    railMarker(needs),
+  );
+}
+
+// This hub's workspaces, then each machine's under its own mark (its
+// link's colour; a tap opens Machines).
+function renderRail() {
+  const tiles = state.workspaces.filter((w) => !w.machine).map(railTile);
+  for (const name of machines.names()) {
+    const link = machines.linkOf(name) || "offline";
+    tiles.push(
+      el("button", {
+        type: "button",
+        className: `rail-machine link-${link}`,
+        textContent: initials(name),
+        title: `machine ${name}: ${link}`,
+        "aria-label": `machine ${name}: ${link}`,
+        onclick: () => machines.openDialog(),
+      }),
+      ...state.workspaces.filter((w) => w.machine === name).map(railTile),
+    );
+  }
+  $("#rail-tiles").replaceChildren(...tiles);
+  const all = $("#rail-all");
+  const needs = workspaceNeeds(null);
+  const picked = state.scope === "all" || !scopedWorkspace();
+  all.classList.toggle("on", picked);
+  if (picked) all.setAttribute("aria-current", "true");
+  else all.removeAttribute("aria-current");
+  const said = needsText(needs);
+  all.title = `Everything${said ? `: ${said}` : ": what needs you, what is moving, the rest"}`;
+  all.setAttribute("aria-label", all.title);
+  $("#rail-all-badge")?.remove();
+  const marker = railMarker(needs, "rail-all-badge");
+  if (marker) all.append(marker);
+}
+
+function renderListHead(workspace) {
+  const title = $("#list-title");
+  title.textContent = workspace ? workspace.name : "Flywheel";
+  title.title = workspace ? workspace.name : "";
+  title.classList.toggle("brand-title", !workspace);
+  $("#tach").hidden = !!workspace;
+  const sub = $("#list-sub");
+  if (workspace) {
+    const here = state.sessions.filter((s) => s.workspace_id === workspace.id);
+    const live = here.filter((s) => s.live && s.state === "running" && reachable(s)).length;
+    sub.replaceChildren(
+      el("span", { className: "ws-count", title: `${live} running of ${here.length}` }, live ? el("b", { textContent: `${live}` }) : null, live ? "/" : "", `${here.length} session${here.length === 1 ? "" : "s"}`),
+      launcher.workspaceChip(workspace.id) || "",
+    );
+  } else {
+    sub.replaceChildren();
+  }
+  $("#list-tools").replaceChildren(...(workspace
+    ? [
+      broadcast.workspaceTool(workspace, iconButton),
+      iconButton("gear", "Edit workspace", () => openWorkspaceDialog(workspace)),
+      iconButton("x", "Delete workspace", () => deleteWorkspace(workspace), true),
+    ].filter(Boolean)
+    : []));
+  const add = $("#list-new");
+  add.title = withKey(workspace ? `New session in ${workspace.name}` : "New session", "session.new");
+  add.setAttribute("aria-label", add.title);
+}
+
+// A small heading inside the list.
+const listGroup = (name, count) =>
+  el("div", { className: "list-group" }, el("span", { className: "list-group-name", textContent: name }), el("span", { className: "list-group-n", textContent: String(count) }));
+
+// Everything: Needs you (attention.js, above this list) first, then the
+// agents at work, then the rest folded into one line. A session is listed
+// once, in its most urgent group.
+function renderAllList() {
+  const needs = new Set(attention.entries().map((e) => e.session.id));
+  const moving = [];
+  const resting = [];
+  for (const session of orderedSessions()) {
+    if (needs.has(session.id)) continue;
+    const agent = agentStatus(session);
+    if (agent && agent.status === "working") moving.push(session);
+    else resting.push(session);
+  }
+  const rows = (list) => el("ul", { className: "sessions" }, list.map((s) => renderSession(s, { tag: true, flat: true })));
+  const out = [];
+  if (!state.sessions.length) {
+    out.push(el(
+      "div",
+      { className: "ws-empty" },
+      "No sessions yet. ",
+      el("button", { type: "button", className: "text-btn", textContent: "start one", onclick: () => openSessionDialog() }),
+    ));
+    return out;
+  }
+  if (!needs.size && !moving.length) {
+    out.push(el("div", { className: "list-calm", textContent: "Nothing needs you. Nothing is moving." }));
+  }
+  if (moving.length) out.push(listGroup("Moving", moving.length), rows(moving));
+  if (resting.length) {
+    const open = state.restingOpen;
+    out.push(el(
+      "button",
+      {
+        type: "button",
+        className: `list-group fold${open ? " open" : ""}`,
+        "aria-expanded": String(open),
+        title: open ? "Fold the resting sessions" : "Show the resting sessions",
+        onclick: () => {
+          state.restingOpen = !open;
+          store.set("resting-open", state.restingOpen);
+          render();
+        },
+      },
+      el("span", { className: "chev" }, icon("chev")),
+      el("span", { className: "list-group-name", textContent: "Resting" }),
+      el("span", { className: "list-group-n", textContent: String(resting.length) }),
+      open ? null : el("span", { className: "list-group-names", textContent: resting.map((s) => s.name).join(", ") }),
+    ));
+    // Folded, the attached session still shows.
+    const shown = open ? resting : resting.filter((s) => s.id === state.attached);
+    if (shown.length) out.push(rows(shown));
+  }
+  return out;
+}
+
+// One workspace: its machine (when another's), a way back when agents
+// elsewhere need you, its folders, its sessions.
+function renderWorkspaceList(workspace) {
+  const sessions = state.sessions.filter((s) => s.workspace_id === workspace.id);
+  const error = state.wsErrors[workspace.id];
+  const elsewhere = attention.entries().filter((e) => e.level < 2 && e.session.workspace_id !== workspace.id).length;
+  return [
+    workspace.machine ? machines.header(workspace.machine) : null,
+    elsewhere
+      ? el(
+        "button",
+        { type: "button", className: "list-elsewhere", title: "Show Everything", onclick: () => pickScope("all") },
+        el("span", { className: "dot blocked", "aria-hidden": "true" }),
+        `${elsewhere} need${elsewhere === 1 ? "s" : ""} you elsewhere`,
+      )
+      : null,
+    el(
+      "div",
+      { className: "ws-repos" },
+      workspace.folders.map((f) =>
+        flywheel.folderChip(f, el("span", {
+          className: f.missing ? "missing" : f.git ? "git" : "plain",
+          textContent: folderLabel(f),
+          title: f.missing
+            ? `${f.path} (missing: moved or deleted?)`
+            : f.git ? `${f.path} (git repo)` : `${f.path} (plain folder, no git)`,
+        }), workspace.id)),
+    ),
+    error
+      ? el("p", {
+        className: "ws-error",
+        role: "alert",
+        textContent: error,
+        onclick: () => {
+          delete state.wsErrors[workspace.id];
+          render();
+        },
+      })
+      : null,
+    sessions.length
+      ? el("ul", { className: "sessions" }, sessions.map((s) => renderSession(s)))
+      : el(
+        "div",
+        { className: "ws-empty" },
+        "No sessions. ",
+        el("button", {
+          type: "button",
+          className: "text-btn",
+          textContent: "start one",
+          onclick: () => openSessionDialog(workspace.id),
+        }),
+      ),
+  ].filter(Boolean);
 }
 
 function render() {
   search.refreshFilters();
-  const numbering = new Map(attachable().map((s, i) => [s.id, i]));
-  const needsYou = listedInNeedsYou();
+  followAttached();
+  const workspace = scopedWorkspace();
+  document.body.classList.toggle("list-hidden", state.listHidden && !window.matchMedia(NARROW).matches);
+  $("#sidebar").classList.toggle("scope-ws", !!workspace);
+  renderRail();
+  renderListHead(workspace);
   const root = $("#workspaces");
-  if (machines.any()) {
-    root.replaceChildren(...machineGroups(numbering, needsYou));
-  } else if (state.workspaces.length === 0) {
-    root.replaceChildren(
-      el(
-        "div",
-        { className: "no-workspaces" },
-        "A workspace is a name and the folders (git repos or plain directories) you work on together. Create or import one to start sessions.",
-      ),
-    );
-  } else {
-    root.replaceChildren(...state.workspaces.map((w, i) => renderWorkspace(w, i, numbering, needsYou)));
-  }
-  // The workspace animation plays once, on first paint only.
-  root.querySelectorAll(".workspace").forEach((node) => {
-    if (state.painted) node.style.animation = "none";
-  });
-  state.painted = true;
+  root.replaceChildren(...(!state.workspaces.length && !machines.any()
+    ? [el(
+      "div",
+      { className: "no-workspaces" },
+      "A workspace is a name and the folders (git repos or plain directories) you work on together. Create or import one to start sessions.",
+    )]
+    : workspace ? renderWorkspaceList(workspace) : renderAllList()));
 
   const running = state.sessions.filter(runningNow).length;
   const tach = $("#tach");
@@ -816,16 +960,27 @@ function showError(error) {
   showBanner(`Error: ${error.message}`, [], false);
 }
 
-// The phone footer's More row (app-phone.css): it unfolds the utilities;
-// picking one folds them again, except the theme and alerts toggles,
+// The rail's More: the rarer actions and the utilities, in a popover off
+// the rail. Picking one closes it, except the theme and alerts toggles,
 // which are tapped through their states.
+const moreOpen = () => $("#side-foot").classList.contains("more-open");
 function setMore(open) {
   $("#side-foot").classList.toggle("more-open", open);
   $("#side-more-toggle").setAttribute("aria-expanded", String(open));
-  if (open) $("#side-foot").scrollIntoView({ block: "end", behavior: "smooth" });
 }
-$("#side-more-toggle").addEventListener("click", () => setMore(!$("#side-foot").classList.contains("more-open")));
+$("#side-more-toggle").addEventListener("click", () => setMore(!moreOpen()));
 $("#side-more").addEventListener("click", (event) => {
   const picked = event.target.closest("button");
   if (picked && picked.dataset.action !== "cycle-theme" && picked.id !== "alerts-toggle") setMore(false);
 });
+document.addEventListener("click", (event) => {
+  if (moreOpen() && !event.target.closest("#side-foot, #side-more-toggle")) setMore(false);
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape" || !moreOpen()) return;
+  event.stopPropagation();
+  setMore(false);
+  $("#side-more-toggle").focus();
+}, true);
+$("#rail-all").addEventListener("click", () => pickScope("all"));
+$("#list-new").addEventListener("click", () => openSessionDialog(scopedWorkspace()?.id));

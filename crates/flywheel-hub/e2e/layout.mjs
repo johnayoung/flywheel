@@ -116,25 +116,23 @@ async function glyphChecks(page, label) {
 // characters. Each place's computed features say so, and that text drawn
 // in the terminal's own style matches it drawn with the features off,
 // not on (on, JetBrains Mono joins "->" and "!=").
-// A workspace header's status pill and count: never under its shown
-// tools, never clipped.
-async function wsHeadClear(page) {
+// A workspace list's head: its count never under its shown tools, never
+// clipped.
+async function listHeadClear(page) {
   return page.evaluate(() => {
     const bad = [];
-    for (const wsNode of document.querySelectorAll("#workspaces .workspace")) {
-      if (wsNode.offsetParent === null) continue;
-      const toolsNode = wsNode.querySelector(".ws-tools");
-      // Visible counts even mid fade-in (opacity still rising).
-      const shown = toolsNode && getComputedStyle(toolsNode).visibility === "visible";
-      const tools = shown ? [...toolsNode.querySelectorAll("button")].map((b) => b.getBoundingClientRect()) : [];
-      for (const sel of [".ws-status", ".ws-count"]) {
-        const n = wsNode.querySelector(sel);
-        if (!n || n.offsetParent === null) continue;
-        const r = n.getBoundingClientRect();
-        if (n.scrollWidth > n.clientWidth + 1) bad.push(`${sel} clipped`);
-        for (const t of tools) {
-          if (t.left < r.right - 0.5 && t.right > r.left + 0.5 && t.top < r.bottom - 0.5 && t.bottom > r.top + 0.5) bad.push(`${sel} "${n.textContent}" under a tool`);
-        }
+    const head = document.querySelector(".list-head");
+    if (!head || head.offsetParent === null) return bad;
+    const tools = [...head.querySelectorAll("#list-tools button, #list-new")]
+      .filter((b) => getComputedStyle(b.closest("#list-tools") || b).opacity !== "0")
+      .map((b) => b.getBoundingClientRect());
+    for (const sel of [".ws-count", "#list-title"]) {
+      const n = head.querySelector(sel);
+      if (!n || n.offsetParent === null) continue;
+      const r = n.getBoundingClientRect();
+      if (sel === ".ws-count" && n.scrollWidth > n.clientWidth + 1) bad.push(`${sel} clipped`);
+      for (const t of tools) {
+        if (t.left < r.right - 0.5 && t.right > r.left + 0.5 && t.top < r.bottom - 0.5 && t.bottom > r.top + 0.5) bad.push(`${sel} "${n.textContent}" under a tool`);
       }
     }
     return bad;
@@ -383,7 +381,7 @@ try {
   await exactTextChecks(page, "desktop", [".xterm-rows", "#cmd-list", "#tx-body", "#ho-text"]);
   // Session and workspace names in a face that tells 1 from l and 0 from
   // O ("c1" and "cl" read alike in the condensed display face).
-  const nameFaces = await page.evaluate(() => [".ws-name", ".session-name", ".crumb-session", ".crumb-ws", ".pane-name", ".tab-list [role=tab]", "#rv-title", "#q-title", "#tx-title"]
+  const nameFaces = await page.evaluate(() => ["#rail-tiles .rail-initials", ".ws-tag", ".session-name", ".crumb-session", ".crumb-ws", ".pane-name", ".tab-list [role=tab]", "#rv-title", "#q-title", "#tx-title"]
     .map((sel) => [sel, document.querySelector(sel) && getComputedStyle(document.querySelector(sel)).fontFamily]));
   const displayed = nameFaces.filter(([, face]) => !face || !/^"FW (Mono|Term)"/.test(face));
   check(!displayed.length, `desktop: names in the UI mono (${JSON.stringify(displayed)})`);
@@ -446,7 +444,9 @@ try {
     const want = key === "Alt+4" ? h.ws === "e2e-two" && h.panes === 1 : h.ws === "e2e" && h.panes === 3;
     if (!want || /Empty pane/.test(h.crumb)) jumps.push(`${key}: ${JSON.stringify(h)}`);
   }
-  await page.locator(`.session[data-id="${other.id}"]`).click();
+  // Its rail tile, then its row (a shell rests, folded, in Everything).
+  await page.locator(`#rail-tiles .rail-tile[data-id="${ws2.id}"]`).click();
+  await page.locator(`#workspaces .session[data-id="${other.id}"]`).click();
   await page.waitForTimeout(600);
   const clicked = await header();
   if (clicked.ws !== "e2e-two" || clicked.panes !== 1) jumps.push(`sidebar: ${JSON.stringify(clicked)}`);
@@ -579,20 +579,21 @@ try {
   const agree = await pp.evaluate(({ ws, ids }) => {
     const rows = [...document.querySelectorAll("#attention .attn-row")];
     const here = rows.filter((r) => r.querySelector(".attn-ws")?.textContent === ws);
-    const chip = document.querySelector(`section.workspace[data-id="${state.workspaces.find((w) => w.name === ws).id}"] .ws-status`);
+    const tile = document.querySelector(`#rail-tiles .rail-tile[data-id="${state.workspaces.find((w) => w.name === ws).id}"]`);
+    const chip = tile && tile.querySelector(".rail-pip.done") ? "done" : null;
     return {
       done: ids.map((id) => agentStatus(state.sessions.find((x) => x.id === id))?.status),
       listed: here.length,
       fanoutRow: here.some((r) => r.classList.contains("fo")),
       candidateRows: rows.filter((r) => ids.includes(r.dataset.id)).length,
-      chip: chip ? chip.textContent : null,
+      chip,
       server: state.rollup[state.workspaces.find((w) => w.name === ws).id] || null,
     };
   }, { ws: "fanned", ids: [...candidates] });
   check(
     agree.done.every((s) => s === "done") && agree.fanoutRow && agree.candidateRows === 0 && agree.listed === 1 &&
       agree.chip === "done" && agree.server === "done",
-    `desktop: Needs you, the chip and the hub's rollup count a fan-out's finished candidates as its one done (${JSON.stringify(agree)})`,
+    `desktop: Needs you, the rail tile and the hub's rollup count a fan-out's finished candidates as its one done (${JSON.stringify(agree)})`,
   );
   await pp.locator("#attention .attn-row.fo").first().click();
   await pp.waitForSelector("#dlg-fanout[open]", { timeout: 10000 }).catch(() => {});
@@ -602,13 +603,13 @@ try {
   await pp.waitForFunction((id) => state.rollup[id] !== "done", fannedId, { timeout: 10000 }).catch(() => {});
   const looked = await pp.evaluate((id) => ({
     rows: [...document.querySelectorAll("#attention .attn-row.fo")].length,
-    chip: document.querySelector(`section.workspace[data-id="${id}"] .ws-status`)?.textContent || null,
+    chip: document.querySelector(`#rail-tiles .rail-tile[data-id="${id}"] .rail-pip.done, #rail-tiles .rail-tile[data-id="${id}"] .rail-badge`) ? "marked" : null,
     server: state.rollup[id] || null,
   }), fannedId);
   const listedAfter = (await api("GET", "/api/fanouts")).fanouts.find((x) => x.id === fo.id);
   check(
     looked.rows === 0 && looked.chip === null && looked.server !== "done" && listedAfter && listedAfter.needs_you === false,
-    `desktop: opening the fan-out's board clears it from Needs you, the chip and the hub's rollup (${JSON.stringify({ ...looked, needs_you: listedAfter?.needs_you })})`,
+    `desktop: opening the fan-out's board clears it from Needs you, the rail tile and the hub's rollup (${JSON.stringify({ ...looked, needs_you: listedAfter?.needs_you })})`,
   );
   const rectOf = (sel) => pp.evaluate((sel) => {
     const n = document.querySelector(sel);
@@ -616,35 +617,51 @@ try {
     const r = n.getBoundingClientRect();
     return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
   }, sel);
-  // The sidebar's footer (actions + utilities) keeps to a strip, its
-  // utilities whole, named, and not covered.
-  const foot = await pp.evaluate(() => {
-    const top = document.querySelector(".side-actions").getBoundingClientRect().top;
+  // The rail's tools are whole, named, and not covered.
+  const rail = await pp.evaluate(() => {
     const bad = [];
-    for (const n of document.querySelectorAll(".side-foot .chip")) {
+    for (const n of document.querySelectorAll(".rail-tool, .rail-tile")) {
+      const r = n.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      if (!hit || !n.contains(hit)) bad.push(`${n.id || n.dataset.action || n.dataset.id} covered`);
+      if (r.bottom > innerHeight || r.right > document.querySelector("#rail").getBoundingClientRect().right) bad.push(`${n.id || n.dataset.action || n.dataset.id} cut off`);
+      if (!(n.getAttribute("aria-label") || "").trim()) bad.push(`${n.id || n.dataset.action || n.dataset.id} has no name`);
+    }
+    return bad;
+  });
+  check(rail.length === 0, `desktop: every rail tile and tool whole, uncovered and named (${rail.join(", ")})`);
+  // More: a popover of named utilities, each whole and on top; Escape closes it.
+  await pp.locator("#side-more-toggle").click();
+  await pp.waitForTimeout(250);
+  const deskMore = await pp.evaluate(() => {
+    const bad = [];
+    const chips = [...document.querySelectorAll("#side-more .chip")].filter((n) => !n.hidden);
+    for (const n of chips) {
       const r = n.getBoundingClientRect();
       const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
       if (!hit || !n.contains(hit)) bad.push(`${n.id || n.dataset.action} covered`);
-      if (r.bottom > innerHeight || r.right > document.querySelector("#sidebar").getBoundingClientRect().right) bad.push(`${n.id || n.dataset.action} cut off`);
+      if (r.top < 0 || r.bottom > innerHeight) bad.push(`${n.id || n.dataset.action} cut off`);
       if (!n.textContent.trim()) bad.push(`${n.id || n.dataset.action} has no name`);
     }
-    return { height: Math.round(innerHeight - top), bad };
+    return { shown: chips.length, bad, expanded: document.querySelector("#side-more-toggle").getAttribute("aria-expanded") };
   });
-  check(foot.height <= 180 && foot.bad.length === 0, `desktop: sidebar footer is ${foot.height}px (at most 180), every utility whole and named (${foot.bad.join(", ")})`);
-  // The phone's More row is not a desktop thing: the utilities show as they are.
-  const deskMore = await pp.evaluate(() => ({
-    toggle: document.querySelector("#side-more-toggle").offsetParent !== null,
-    hidden: [...document.querySelectorAll(".side-foot .chip")].filter((n) => n.offsetParent === null).length,
-  }));
-  check(!deskMore.toggle && deskMore.hidden === 0, `desktop: no More row, every utility shown (${JSON.stringify(deskMore)})`);
-  // Nor is folding Needs you out of the workspaces: the blocked agent is
-  // listed under its workspace too.
-  const deskListed = await pp.evaluate((id) => ({
+  await pp.keyboard.press("Escape");
+  await pp.waitForTimeout(200);
+  const deskShut = await pp.evaluate(() => document.querySelector("#side-more-toggle").getAttribute("aria-expanded"));
+  check(deskMore.shown >= 7 && deskMore.bad.length === 0 && deskMore.expanded === "true" && deskShut === "false", `desktop: More opens every utility whole and on top, Escape shuts it (${JSON.stringify({ ...deskMore, deskShut })})`);
+  // Everything lists a blocked agent once (in Needs you); its workspace's
+  // list has it too.
+  const allListed = await pp.evaluate((id) => ({
     needs: !!document.querySelector(`#attention .attn-row[data-id="${id}"]`),
-    listed: !!document.querySelector(`#workspaces .session[data-id="${id}"]`),
-    lines: document.querySelectorAll("#workspaces .ws-needs").length,
+    again: !!document.querySelector(`#workspaces .session[data-id="${id}"]`),
   }), agent.id);
-  check(deskListed.needs && deskListed.listed && deskListed.lines === 0, `desktop: a blocked agent stays in its workspace's list (${JSON.stringify(deskListed)})`);
+  await pp.locator(`#rail-tiles .rail-tile[data-id="${ws3.id}"]`).click();
+  await pp.waitForTimeout(250);
+  const wsListed = await pp.evaluate((id) => ({
+    listed: !!document.querySelector(`#workspaces .session[data-id="${id}"]`),
+    needsHidden: getComputedStyle(document.querySelector("#attention")).display === "none",
+  }), agent.id);
+  check(allListed.needs && !allListed.again && wsListed.listed && wsListed.needsHidden, `desktop: a blocked agent is listed once in Everything, and in its workspace's list (${JSON.stringify({ allListed, wsListed })})`);
   // A long session name never squeezes the path or the usage button to
   // nothing: both keep a readable, clickable width.
   const meters = await pp.evaluate(() => ["#meter-cwd", "#meter-usage", ".crumb-session"].map((sel) => {
@@ -707,7 +724,8 @@ try {
   await pp.waitForTimeout(300);
   // A toast while the fan-out board is open: above the board, clickable,
   // and never over it.
-  await pp.locator('[data-action="fanouts"]').click();
+  await pp.locator("#side-more-toggle").click();
+  await pp.locator('#side-more [data-action="fanouts"]').click();
   await pp.waitForSelector("#dlg-fanout[open] .fo-card, #dlg-fanout[open] button", { timeout: 10000 });
   await pp.locator("#dlg-fanout button", { hasText: "Re-grade" }).first().click();
   await pp.waitForSelector(".toast", { timeout: 5000 });
@@ -729,7 +747,7 @@ try {
   await pp.keyboard.press("Escape");
   await pp.waitForTimeout(300);
   // ... and over a dialog opened while it shows.
-  await pp.locator('.side-actions [data-action="new-session"]').click();
+  await pp.locator("#list-new").click();
   await pp.waitForSelector("#dlg-session[open]");
   await pp.waitForTimeout(300);
   const sheet = await overBoard("#dlg-session");
@@ -1052,61 +1070,57 @@ try {
     () => check(false, "phone: menu opens the sessions sidebar"),
   );
   await mp.screenshot({ path: path.join(out, "phone-sidebar.png") });
-  // Needs you is right above the workspaces: a session it lists is not
-  // listed again, its workspace says "N in Needs you" (a 44px row).
+  // Everything lists a session in Needs you once.
   const twice = await mp.evaluate((id) => {
     const needs = [...document.querySelectorAll("#attention .attn-row[data-id]")].map((r) => r.dataset.id);
     return {
       needs: needs.includes(id),
       again: needs.filter((n) => document.querySelector(`#workspaces .session[data-id="${n}"]`)),
-      lines: [...document.querySelectorAll("#workspaces .ws-needs")].map((n) => [n.textContent, Math.round(n.getBoundingClientRect().height)]),
     };
   }, agent.id);
-  check(
-    twice.needs && twice.again.length === 0 && twice.lines.some(([t]) => t === "1 in Needs you") && twice.lines.every(([, h]) => h >= 44),
-    `phone: a session in Needs you is one "N in Needs you" line under its workspace (${JSON.stringify(twice)})`,
-  );
-  // The footer's utilities are one More row (44px) ...
+  check(twice.needs && twice.again.length === 0, `phone: a session in Needs you is not listed again (${JSON.stringify(twice)})`);
+  // More is a 44px rail tool, its utilities folded away ...
   const folded = await mp.evaluate(() => ({
     toggle: Math.round(document.querySelector("#side-more-toggle").getBoundingClientRect().height),
-    shown: [...document.querySelectorAll(".side-foot .chip")].filter((n) => n.offsetParent !== null).length,
+    shown: [...document.querySelectorAll("#side-more .chip")].filter((n) => n.offsetParent !== null).length,
   }));
-  check(folded.toggle >= 44 && folded.shown === 0, `phone: the footer is one More row (${JSON.stringify(folded)})`);
+  check(folded.toggle >= 44 && folded.shown === 0, `phone: More is one 44px rail tool, folded (${JSON.stringify(folded)})`);
   // ... unfolding into rows, each whole, uncovered and at least 44px.
   await mp.locator("#side-more-toggle").tap();
   await mp.waitForTimeout(500);
   const unfolded = await mp.evaluate(() => {
     const bad = [];
-    const chips = [...document.querySelectorAll(".side-foot .chip")];
+    const chips = [...document.querySelectorAll("#side-more .chip")].filter((n) => !n.hidden);
     for (const n of chips) {
       if (n.offsetParent === null) { bad.push(`${n.id || n.dataset.action} hidden`); continue; }
-      n.scrollIntoView({ block: "center" });
       const r = n.getBoundingClientRect();
       const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
       if (!hit || !n.contains(hit)) bad.push(`${n.id || n.dataset.action} covered`);
       if (r.height < 44 || r.width < 44) bad.push(`${n.id || n.dataset.action} ${Math.round(r.width)}x${Math.round(r.height)}`);
+      if (r.top < 0 || r.bottom > innerHeight || r.right > innerWidth) bad.push(`${n.id || n.dataset.action} cut off`);
       if (!n.textContent.trim()) bad.push(`${n.id || n.dataset.action} has no name`);
     }
     return { count: chips.length, expanded: document.querySelector("#side-more-toggle").getAttribute("aria-expanded"), bad };
   });
-  check(unfolded.count >= 9 && unfolded.expanded === "true" && unfolded.bad.length === 0, `phone: More unfolds every utility as a 44px row (${JSON.stringify(unfolded)})`);
+  check(unfolded.count >= 7 && unfolded.expanded === "true" && unfolded.bad.length === 0, `phone: More unfolds every utility as a 44px row (${JSON.stringify(unfolded)})`);
   await mp.screenshot({ path: path.join(out, "phone-sidebar-more.png") });
   // Picking one folds them again.
-  await mp.locator('.side-foot [data-action="activity"]').tap();
+  await mp.locator('#side-more [data-action="machines"]').tap();
   await mp.waitForTimeout(400);
   const refolded = await mp.evaluate(() => document.querySelector("#side-more-toggle").getAttribute("aria-expanded"));
   check(refolded === "false", `phone: picking a utility folds More again (${refolded})`);
   await mp.keyboard.press("Escape");
   await mp.waitForTimeout(300);
-  // More agents blocked than Needs you's short scroll shows: three in one
-  // workspace, then one in another (blocked last, so listed last, below
-  // the fold). The list says there is more, and that workspace's
-  // "1 in Needs you" line brings its agent into view.
+  // Agents blocked in two workspaces: each tile counts its own; a tile's
+  // list says what needs you elsewhere, and that line goes back to
+  // Everything.
   const crowded = [];
+  const crowdWs = {};
   for (const [name, n] of [["crowd", 3], ["stray", 1]]) {
     const dir = path.join(tmp, "code", name);
     fs.mkdirSync(path.join(dir, ".git"), { recursive: true });
     const ws = await api("POST", "/api/workspaces", { name, folders: [dir] });
+    crowdWs[name] = ws.id;
     for (let i = 0; i < n; i++) {
       crowded.push(await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", prompt: "polish", name: `${name}-${i}`, cols: 80, rows: 24 }));
       await sleep(300);
@@ -1114,26 +1128,25 @@ try {
   }
   const stray = crowded[crowded.length - 1];
   if (!(await mp.evaluate(() => document.body.classList.contains("side-open")))) await mp.locator(".menu-toggle").tap();
-  const seen = (id) => mp.evaluate((id) => {
-    const row = document.querySelector(`#attention .attn-row[data-id="${id}"]`);
-    if (!row) return { row: false };
-    const r = row.getBoundingClientRect();
-    const hit = document.elementFromPoint(r.left + r.width / 2, r.top + Math.min(r.height / 2, 10));
-    return { row: true, visible: !!hit && row.contains(hit), more: document.querySelector("#sidebar .attn-list").classList.contains("more-below") };
-  }, id);
   await mp.waitForFunction((id) => !!document.querySelector(`#attention .attn-row[data-id="${id}"]`), stray.id, { timeout: 15000 }).catch(() => {});
-  await mp.evaluate(() => { document.querySelector("#sidebar").scrollTop = 0; });
+  const badges = await mp.evaluate((ids) => Object.fromEntries(Object.entries(ids).map(([name, id]) =>
+    [name, document.querySelector(`#rail-tiles .rail-tile[data-id="${id}"] .rail-badge`)?.textContent || null])), crowdWs);
+  check(badges.crowd === "3" && badges.stray === "1", `phone: each rail tile counts its blocked agents (${JSON.stringify(badges)})`);
+  await mp.locator(`#rail-tiles .rail-tile[data-id="${crowdWs.stray}"]`).tap();
   await mp.waitForTimeout(300);
-  const before = await seen(stray.id);
-  check(before.row && !before.visible && before.more, `phone: a capped Needs you says there is more below (${JSON.stringify(before)})`);
-  const line = mp.locator(`#workspaces section.workspace:has(.ws-name:text-is("stray")) .ws-needs`).first();
-  await line.scrollIntoViewIfNeeded();
-  await line.tap();
-  await mp.waitForTimeout(900);
-  const after = await seen(stray.id);
-  check(after.visible, `phone: "1 in Needs you" brings that workspace's agent into view (${JSON.stringify(after)})`);
-  await mp.screenshot({ path: path.join(out, "phone-needs-reveal.png") });
+  const strayList = await mp.evaluate((id) => ({
+    row: !!document.querySelector(`#workspaces .session[data-id="${id}"].needs-you`),
+    elsewhere: document.querySelector(".list-elsewhere")?.textContent || null,
+    height: Math.round(document.querySelector(".list-elsewhere")?.getBoundingClientRect().height || 0),
+  }), stray.id);
+  check(strayList.row && /need you elsewhere/.test(strayList.elsewhere || "") && strayList.height >= 44, `phone: a tile's list holds its blocked agent and says what needs you elsewhere (${JSON.stringify(strayList)})`);
+  await mp.locator(".list-elsewhere").tap();
+  await mp.waitForTimeout(300);
+  const backAll = await mp.evaluate(() => ({ all: document.querySelector("#rail-all").classList.contains("on"), needs: getComputedStyle(document.querySelector("#attention")).display !== "none" }));
+  check(backAll.all && backAll.needs, `phone: "need you elsewhere" goes back to Everything (${JSON.stringify(backAll)})`);
+  await mp.screenshot({ path: path.join(out, "phone-needs-tiles.png") });
   for (const s of crowded) await api("DELETE", `/api/sessions/${s.id}`);
+  for (const id of Object.values(crowdWs)) await api("DELETE", `/api/workspaces/${id}`);
   await mp.waitForTimeout(500);
   // Drawers on a phone, over an agent in a real repo (Review needs git).
   await mp.goto(`${base}/login?token=${token}#session=${agent.id}`);
@@ -1178,9 +1191,8 @@ try {
 
   // --- phone-width companion rows -----------------------------------------
   // With a finger or a mouse: every session row and row action is a 44px
-  // target; a companion's actions stay on its one line; and with its
-  // agent in Needs you (an orphaned companion) the numbers run on without
-  // a gap (the Needs you row carries the agent's).
+  // target; a companion's actions stay on its one line, its agent in
+  // Needs you.
   const compAgent = await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", name: "comp agent", prompt: "polish", cols: 100, rows: 30 });
   const comp = await api("POST", `/api/sessions/${compAgent.id}/companion`, { cols: 100, rows: 30 });
   for (const touch of [true, false]) {
@@ -1203,39 +1215,36 @@ try {
       const name = r.querySelector(".session-name").getBoundingClientRect();
       const mid = (b) => b.top + b.height / 2;
       const buttons = [...r.querySelectorAll(".session-actions button")].filter((n) => n.offsetParent !== null).map((n) => n.getBoundingClientRect());
-      const nums = [...document.querySelectorAll("#attention .attn-num, #workspaces .session .num")].map((n) => Number(n.textContent)).sort((a, b) => a - b);
       return {
         short,
-        orphan: r.classList.contains("orphan"),
         buttons: buttons.length,
         small: buttons.filter((b) => b.width < 44 || b.height < 44).length,
         offLine: buttons.filter((b) => Math.abs(mid(b) - mid(name)) > 6).length,
         height: Math.round(r.getBoundingClientRect().height),
-        nums,
       };
     }, comp.id);
     check(got.short.length === 0, `${label}: every session row at least 44px tall (${JSON.stringify(got.short)})`);
-    check(got.orphan && got.buttons === 3 && got.small === 0 && got.offLine === 0 && got.height < 60,
+    check(got.buttons === 3 && got.small === 0 && got.offLine === 0 && got.height < 60,
       `${label}: a companion's actions are 44x44 on its one line (${JSON.stringify(got)})`);
-    check(got.nums.length > 1 && got.nums.every((n, i) => n === i + 1), `${label}: an orphaned companion's numbers run on from Needs you (${JSON.stringify(got.nums)})`);
-    const headBad = await wsHeadClear(cp);
-    check(headBad.length === 0, `${label}: workspace status pills and counts are not under its tools (${JSON.stringify(headBad)})`);
+    const headBad = await listHeadClear(cp);
+    check(headBad.length === 0, `${label}: the list head's count and title are not under its tools (${JSON.stringify(headBad)})`);
     await cp.screenshot({ path: path.join(out, `phone-companion-${touch ? "touch" : "mouse"}.png`) });
     await cc.close();
   }
-  // Desktop: the workspace holding the attached row (its tools shown,
-  // hovered or focused) keeps its BLOCKED pill and count whole.
+  // Desktop: the attached row's workspace list (its tools shown, hovered)
+  // keeps its count whole.
   {
     const dc = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     const dp = await dc.newPage();
     await dp.goto(`${base}/login?token=${token}#session=${comp.id}`);
     await dp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
     await dp.locator(`#workspaces .session[data-id="${comp.id}"]`).click();
-    await dp.locator(`#workspaces .workspace[data-id="${ws.id}"] .ws-head`).hover();
+    await dp.locator(`#rail-tiles .rail-tile[data-id="${ws.id}"]`).click();
+    await dp.locator(".list-head").hover();
     await dp.waitForTimeout(250);
-    const bad = await wsHeadClear(dp);
-    const pill = await dp.evaluate((id) => document.querySelector(`#workspaces .workspace[data-id="${id}"] .ws-status`)?.textContent || "", ws.id);
-    check(bad.length === 0 && pill.length > 1, `desktop: a hovered workspace's ${pill || "status"} pill and count are whole beside its tools (${JSON.stringify(bad)})`);
+    const bad = await listHeadClear(dp);
+    const count = await dp.evaluate(() => document.querySelector(".list-head .ws-count")?.textContent || "");
+    check(bad.length === 0 && count.length > 1, `desktop: a hovered workspace list's count "${count}" is whole beside its tools (${JSON.stringify(bad)})`);
     await dp.screenshot({ path: path.join(out, "desktop-ws-tools.png") });
     await dc.close();
   }

@@ -146,7 +146,12 @@ const state = {
   stageKey: "", // shape of the tree on the stage
   stageView: null, // the workspace the desktop stage was last built for
   currentWorkspace: store.get("workspace", null), // last workspace touched
-  collapsed: new Set(store.get("collapsed", [])),
+  // The sidebar's list: "all" (what needs you, what moves, the rest) or
+  // one workspace's id (its rail tile).
+  scope: store.get("scope", "all"),
+  restingOpen: store.get("resting-open", false), // the All list's Resting group unfolded
+  listHidden: store.get("list-hidden", false), // desktop: the rail alone
+  scopeFollows: null, // the attached session the list last followed
   repoChoice: store.get("repo-choice", {}), // workspace id -> repo
   wsErrors: {}, // workspace id -> last action error
   renaming: null, // session id being renamed inline
@@ -159,7 +164,6 @@ const state = {
   closing: new Set(), // session ids this browser is removing (no "removed elsewhere" notice)
   refreshSeq: 0, // refreshes started (each response is tagged with its number)
   refreshApplied: 0, // the newest refresh whose response was applied
-  painted: false, // first sidebar paint done (entry animation plays once)
   agent: {}, // session id -> {status, detail, since}, as this client sees it
   rollup: {}, // workspace id -> most urgent agent status
   events: null, // the hub-wide events socket
@@ -188,7 +192,7 @@ const CLIENT_ID = (() => {
 const sessionById = (id) => state.sessions.find((s) => s.id === id);
 const workspaceById = (id) => state.workspaces.find((w) => w.id === id);
 
-// Sessions in sidebar order (workspace order, then creation order).
+// Sessions in rail order (workspace order, then creation order).
 function orderedSessions() {
   const out = [];
   for (const workspace of state.workspaces) {
@@ -200,7 +204,7 @@ function orderedSessions() {
 }
 
 // Sessions with a terminal on the hub (running, or ended with their
-// scrollback), in sidebar order: what Alt+1..9 and Alt+Up/Down reach.
+// scrollback), in rail order: what Alt+1..9 and Alt+Up/Down reach.
 const attachable = () => orderedSessions().filter((s) => s.live);
 
 // A running agent's status, as pushed for this client.
@@ -482,14 +486,6 @@ const fanoutTask = window.FwHubFanoutTask({
 const pwa = window.FwHubPwa();
 const attention = window.FwHubAttention({
   $, el, icon, age, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
-  // A phone lists these rows here instead of under their workspace: they
-  // carry their number (Alt+N) there, so the workspace's list (an
-  // orphaned companion's included) does not start past a gap.
-  numberOf: (id) => {
-    if (!phone()) return null;
-    const i = attachable().findIndex((s) => s.id === id);
-    return i >= 0 && i < 9 ? i + 1 : null;
-  },
   flywheel,
   fanout,
   // Stalled prompt queues (queue.js).

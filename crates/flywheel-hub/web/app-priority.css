@@ -86,7 +86,7 @@ button#meter-usage { max-width: 16rem; text-align: left; }
    its seven keys share the phone's width so every one stays in view. */
 @media (pointer: coarse) {
   .slab, .chip, .qa, .qa-esc, .kb-key, .fw-chip, .sel-pop .slab,
-  .commands select, .cmd-check, .cmd-field, .sheet select, .empty-actions button, .ws-head {
+  .commands select, .cmd-check, .cmd-field, .sheet select, .empty-actions button, .list-group.fold {
     min-height: 44px;
   }
   .icon, .kb-second .kb-key, #compose-prev, #compose-next { min-width: 44px; min-height: 44px; }

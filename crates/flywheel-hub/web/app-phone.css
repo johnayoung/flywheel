@@ -5,7 +5,7 @@
 /* --- tablets: a narrower sidebar ------------------------------------------ */
 
 @media (min-width: 761px) and (max-width: 1100px) {
-  :root { --side: 15.5rem; }
+  :root { --side: 16.5rem; }
 }
 
 /* --- narrow screens ------------------------------------------------------ */
@@ -17,7 +17,7 @@
   #sidebar {
     position: fixed;
     inset: 0 auto 0 0;
-    width: min(var(--side), 86vw);
+    width: min(var(--side), 92vw);
     transform: translateX(-102%);
     visibility: hidden;
     transition: transform .25s var(--ease), visibility 0s .25s;
@@ -101,8 +101,6 @@
   background: none;
   text-align: left;
 }
-.attn-row.numbered { grid-template-columns: auto auto 1fr auto; padding-left: .45rem; }
-.attn-num { font-size: 9px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .attn-row:hover, .attn-row.active { background: var(--bg-4); }
 .attn-row.blocked { border-left-color: var(--alert); }
 .attn-row.done { border-left-color: var(--brass); }
@@ -350,65 +348,21 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   input, select, textarea, .xterm .xterm-helper-textarea { font-size: 16px !important; }
   button { touch-action: manipulation; }
   .session { min-height: 2.75rem; }
-  .ws-head { min-height: 2.6rem; }
-  .side-foot .chip { padding: .5rem .65rem; }
+  .rail-tool, .rail-tile, .list-new { width: 44px; height: 44px; }
+  .rail-machine { min-height: 44px; }
+  .list-elsewhere { min-height: 44px; }
+  .side-more .chip { min-height: 44px; }
   /* No keyboard here: the chips are their names, not chords. */
-  .side-foot .chip kbd { display: none; }
+  .side-more .chip kbd { display: none; }
   .icon { min-width: 2.2rem; min-height: 2.2rem; }
 }
 
 @media (max-width: 760px) {
   #sidebar {
     padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom) env(safe-area-inset-left);
-    /* One scroll for the whole drawer: blocked agents, the actions and
-       the footer never squeeze the session list into a strip. */
-    overflow-y: auto;
     overscroll-behavior: contain;
   }
-  #sidebar > * { flex: none; }
-  #sidebar > #workspaces { overflow: visible; min-height: 40vh; }
-  /* Its own short scroll inside that one (about three agents). */
-  #sidebar .attn-list { max-height: 11.5rem; }
-  /* More rows past its bottom: they fade out there. */
-  #sidebar .attn-list.more-below { mask-image: linear-gradient(to bottom, #000 calc(100% - 2.2rem), transparent); }
-  /* The rows a workspace's "N in Needs you" line pointed at. */
-  #sidebar .attn-row.pointed { animation: attn-pointed 1.6s ease-out; }
-  @keyframes attn-pointed { from { background: color-mix(in srgb, var(--alert) 28%, transparent); } }
-  @media (prefers-reduced-motion: reduce) { #sidebar .attn-row.pointed { animation: none; outline: 1px solid var(--alert); } }
-  /* A session Needs you lists is one line under its workspace. */
-  .ws-needs {
-    width: 100%;
-    min-height: 44px;
-    padding: 0 1.1rem 0 2.2rem;
-    border: 0;
-    background: none;
-    color: var(--alert);
-    font-size: 12px;
-    letter-spacing: .04em;
-    text-align: left;
-  }
-  /* The footer's utilities: one More row, unfolding into a list of rows. */
-  .side-foot { display: block; padding: .35rem 0 .5rem; }
-  .side-more-toggle {
-    display: flex;
-    align-items: center;
-    gap: .6rem;
-    width: 100%;
-    min-height: 44px;
-    padding: 0 1.1rem;
-    border: 0;
-    background: none;
-    color: var(--ink-2);
-    font-size: 13px;
-    text-align: left;
-  }
-  .side-more-toggle svg { width: 1rem; height: 1rem; flex: none; }
-  .side-more-hint { min-width: 0; overflow: hidden; color: var(--ink-3); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
-  .side-more-toggle[aria-expanded="true"] .side-more-hint { display: none; }
-  .side-more { display: none; }
-  .side-foot.more-open .side-more { display: grid; gap: .3rem; padding: .2rem 1.1rem 0; }
-  .side-foot.more-open .side-tools { display: grid; gap: .3rem; }
-  .side-foot.more-open .chip { width: 100%; min-height: 44px; justify-content: flex-start; }
+  .side-scroll { overscroll-behavior: contain; }
   .menu-toggle { min-width: 2.6rem; min-height: 2.6rem; }
   .crumbs { gap: .45rem; align-items: center; }
   .cmd-pill b { margin-left: .2rem; }

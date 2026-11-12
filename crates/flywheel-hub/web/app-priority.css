@@ -35,14 +35,17 @@ button#meter-usage { max-width: 16rem; text-align: left; }
   #link { font-size: 0; gap: 0; padding: .3rem; }
 }
 /* Beside the sidebar, search is the sidebar's own button. As the header
-   narrows the viewer count and the path go, then sharing and recording
-   (both stay in the palette), then the usage text (it is on the session's
-   sidebar row): the name, status, and why? are never painted over. */
+   narrows the viewer count goes, then sharing and recording (both stay in
+   the palette), then the usage text (it is on the session's sidebar row),
+   then the path: the name, status, and why? are never painted over. Down
+   to 1200px there is room for the path's floor: a long name gives way. */
 @media (min-width: 821px) {
   #search-toggle { display: none; }
 }
 @media (min-width: 821px) and (max-width: 1799px) {
   #meter-viewers { display: none; }
+}
+@media (min-width: 821px) and (max-width: 1199px) {
   #meter-cwd:not(:empty) { min-width: 0; }
 }
 @media (min-width: 821px) and (max-width: 1399px) {

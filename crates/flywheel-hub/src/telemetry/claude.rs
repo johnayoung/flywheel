@@ -41,6 +41,12 @@ pub const LIST_TOOL: &str = "mcp__flywheel__list_sessions";
 /// The hub's message tool as Claude Code names it.
 pub const MESSAGE_TOOL: &str = "mcp__flywheel__message_session";
 
+/// The hub's start tool as Claude Code names it.
+pub const START_TOOL: &str = "mcp__flywheel__start_session";
+
+/// The hub's session status tool as Claude Code names it.
+pub const STATUS_TOOL: &str = "mcp__flywheel__session_status";
+
 /// Most options an ask keeps.
 const ASK_OPTIONS: usize = 8;
 

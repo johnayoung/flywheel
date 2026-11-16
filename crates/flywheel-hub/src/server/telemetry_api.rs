@@ -200,8 +200,47 @@ struct AgentHost {
 }
 
 impl mcp::Host for AgentHost {
-    fn list_sessions(&self) -> String {
-        self.hub.agent_sessions(&self.session)
+    fn list_sessions(&self, mine: bool) -> String {
+        self.hub.agent_sessions(&self.session, mine)
+    }
+
+    fn start_session(&self, args: &mcp::StartArgs) -> Result<String, String> {
+        let start = crate::hub::AgentStart {
+            name: args.name.clone(),
+            prompt: args.prompt.clone(),
+            folder: args.folder.as_deref().map(std::path::PathBuf::from),
+            worktree: args
+                .worktree
+                .as_ref()
+                .map(|(task, base)| crate::state::WorktreeRequest {
+                    task: task.clone(),
+                    base: base.clone(),
+                }),
+            model: args.model.clone(),
+        };
+        match self
+            .hub
+            .agent_start(&self.session, start)
+            .map_err(|e| e.to_string())?
+        {
+            crate::hub::Opened::Started(view) => Ok(format!(
+                "Started {name} (id {id}), opened by you. It shows in list_sessions; message it \
+                 with message_session, check on it with session_status.",
+                name = view.record.name,
+                id = view.record.id,
+            )),
+            crate::hub::Opened::Waiting { request, .. } => Ok(format!(
+                "Waiting for the operator (request {rid}). You will get a message when it starts \
+                 or is declined. Keep working.",
+                rid = request.id,
+            )),
+        }
+    }
+
+    fn session_status(&self, to: &str) -> Result<String, String> {
+        self.hub
+            .agent_session_status(&self.session, to)
+            .map_err(|e| e.to_string())
     }
 
     fn message(&self, to: &str, text: &str) -> Result<String, String> {

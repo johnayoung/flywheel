@@ -4,7 +4,8 @@
 // blocked ones first (longest waiting first), then handoffs agents
 // proposed (each its own row, oldest first, whatever the agent's status
 // and whoever watches it; kept on the session until started or
-// dismissed), then agents whose turn
+// dismissed), then sessions agents asked to start (the same, until
+// started or declined), then agents whose turn
 // ended asking you something (telemetry's `asking`: a reply, a decision,
 // or a command only you can run; answered in the row: the reply goes
 // through POST /api/broadcast, typed in now or queued), then prompt queues that
@@ -64,6 +65,17 @@ window.FwHubAttention = function (ctx) {
       for (const handoff of session.handoffs || []) out.push({ session, handoff });
     }
     out.sort((a, b) => Date.parse(a.handoff.created_at) - Date.parse(b.handoff.created_at) || (a.handoff.id < b.handoff.id ? -1 : 1));
+    return out;
+  }
+
+  // Every agent start waiting on the operator, oldest first (like
+  // handoffs: a new one goes last).
+  function startEntries() {
+    const out = [];
+    for (const session of state.sessions) {
+      for (const start of session.start_requests || []) out.push({ session, start });
+    }
+    out.sort((a, b) => Date.parse(a.start.created_at) - Date.parse(b.start.created_at) || (a.start.id < b.start.id ? -1 : 1));
     return out;
   }
 
@@ -139,10 +151,21 @@ window.FwHubAttention = function (ctx) {
     }
   }
 
+  // The review sheet (shared by handoffs and agent starts), worded for
+  // one of them.
+  function sheet(kicker, title, startTitle) {
+    const dialog = $("#dlg-successor");
+    if (!dialog) return null;
+    dialog.querySelector(".sheet-kicker").textContent = kicker;
+    $("#sc-title").textContent = title;
+    $("#sc-start").title = startTitle;
+    return dialog;
+  }
+
   // Review a handoff in a large editor: its name and whole prompt, then
   // Start.
   function review(session, pending) {
-    const dialog = $("#dlg-successor");
+    const dialog = sheet("handoff", "Start the new session", "Start it here with this prompt; it continues the old session's work");
     if (!dialog) return;
     $("#sc-from").textContent = `${session.name} proposes${pending.reason ? `: ${pending.reason}` : " a new session"}`;
     const name = $("#sc-name");
@@ -169,6 +192,159 @@ window.FwHubAttention = function (ctx) {
     text.focus();
     text.setSelectionRange(0, 0);
     text.scrollTop = 0;
+  }
+
+  // Start a session an agent asked for (limits are checked again); the
+  // agent is told. `edits`: a changed prompt or name from Review.
+  async function approveStart(session, pending, edits, button) {
+    if (button) button.disabled = true;
+    try {
+      const body = {};
+      if (edits && edits.prompt != null && edits.prompt !== (pending.prompt || "")) body.prompt = edits.prompt;
+      if (edits && edits.name && edits.name !== (pending.name || "")) body.name = edits.name;
+      const next = await ctx.api("POST", `/api/sessions/${encodeURIComponent(session.id)}/starts/${encodeURIComponent(pending.id)}`, body);
+      ctx.toast(`Started ${next.name} for ${session.name}`);
+      if (ctx.refresh) await ctx.refresh();
+      return true;
+    } catch (error) {
+      ctx.toast(`Not started: ${error.message}`, { tone: "bad" });
+      return false;
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function declineStart(session, pending, button) {
+    const sure = ctx.confirm
+      ? await ctx.confirm({
+          kicker: "start request",
+          title: `Decline ${session.name}'s request?`,
+          body: `The session${pending.name ? ` "${pending.name}"` : ""} is not started; ${session.name} is told.`,
+          ok: "Decline",
+        })
+      : true;
+    if (!sure) return;
+    if (button) button.disabled = true;
+    try {
+      await ctx.api("DELETE", `/api/sessions/${encodeURIComponent(session.id)}/starts/${encodeURIComponent(pending.id)}`);
+      if (ctx.refresh) await ctx.refresh();
+    } catch (error) {
+      ctx.toast(`Not declined: ${error.message}`, { tone: "bad" });
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  // Where a requested session runs, in a few words.
+  function startWhere(session, pending) {
+    const dir = (path) => String(path || "").split("/").filter(Boolean).pop() || path;
+    const bits = [pending.folder ? `in ${dir(pending.folder)}` : `in ${session.name}'s folder`];
+    if (pending.worktree) bits.push(`new worktree ${pending.worktree.task}`);
+    if (pending.launch && pending.launch.model) bits.push(pending.launch.model);
+    return bits.join(", ");
+  }
+
+  function reviewStart(session, pending) {
+    const dialog = sheet("start request", "Start the requested session", `Start it; ${session.name} is told`);
+    if (!dialog) return;
+    $("#sc-from").textContent = `${session.name} asks to start a ${pending.kind} session ${startWhere(session, pending)}`;
+    const name = $("#sc-name");
+    const text = $("#sc-text");
+    name.value = pending.name || "";
+    name.placeholder = "";
+    text.value = pending.prompt || "";
+    const size = () => {
+      $("#sc-size").textContent = `${text.value.length.toLocaleString()} chars`;
+    };
+    size();
+    text.oninput = size;
+    const start = $("#sc-start");
+    start.onclick = async () => {
+      const started = await approveStart(session, pending, { prompt: text.value, name: name.value.trim() }, start);
+      if (started) dialog.close("ok");
+    };
+    dialog.showModal();
+    text.focus();
+    text.setSelectionRange(0, 0);
+    text.scrollTop = 0;
+  }
+
+  // A waiting agent start's row: who asks, the new session's name, where
+  // it runs, the prompt's first lines, and Decline / Review / Start.
+  function startRow({ session, start: pending }) {
+    const workspace = workspaceById(session.workspace_id);
+    const active = state.attached === session.id;
+    const lines = (pending.prompt || "").split("\n");
+    const preview = lines.slice(0, HANDOFF_PREVIEW).join("\n") + (lines.length > HANDOFF_PREVIEW ? `\n... ${lines.length - HANDOFF_PREVIEW} more lines` : "");
+    const start = el("button", {
+      type: "button",
+      className: "slab attn-start",
+      textContent: "Start",
+      title: `Start ${pending.name ? `"${pending.name}"` : "the session"} as ${session.name} asked; it is told`,
+      onclick: () => approveStart(session, pending, null, start),
+    });
+    const drop = el("button", {
+      type: "button",
+      className: "slab ghost attn-dismiss",
+      textContent: "Decline",
+      title: `Do not start it; ${session.name} is told`,
+      onclick: () => declineStart(session, pending, drop),
+    });
+    return el(
+      "li",
+      { dataset: { start: pending.id } },
+      el(
+        "button",
+        {
+          type: "button",
+          className: `attn-row handoff${active ? " active" : ""}`,
+          dataset: { id: session.id },
+          title: `Open ${session.name}`,
+          onclick: () => openSession(session.id),
+        },
+        el("span", { className: `glyph ${session.kind}` }, icon(session.kind === "codex" ? "codex" : "claude")),
+        el(
+          "span",
+          { className: "attn-text" },
+          el(
+            "span",
+            { className: "attn-line" },
+            el("b", { className: "attn-name", textContent: session.name }),
+            pending.name ? el("span", { className: "attn-next", textContent: `+ ${pending.name}`, title: "The new session's name" }) : null,
+            el("span", { className: "attn-ws", textContent: workspace ? workspace.name : "" }),
+          ),
+          el("span", {
+            className: "attn-detail",
+            textContent: `new session ${startWhere(session, pending)}`,
+            title: `${session.name} asks to start a ${pending.kind} session ${startWhere(session, pending)}`,
+          }),
+        ),
+        el(
+          "span",
+          { className: "attn-meta" },
+          el("span", { className: "attn-status handoff", textContent: "start" }),
+          el("span", { className: "attn-age", textContent: age(pending.created_at) }),
+        ),
+      ),
+      el(
+        "div",
+        { className: "attn-ask attn-pending" },
+        preview.trim() ? el("pre", { className: "attn-handoff-preview", textContent: preview }) : null,
+        el(
+          "div",
+          { className: "attn-handoff-actions" },
+          drop,
+          el("button", {
+            type: "button",
+            className: "slab ghost attn-review",
+            textContent: "Review",
+            title: "Read and edit the whole prompt and the name, then start",
+            onclick: () => reviewStart(session, pending),
+          }),
+          start,
+        ),
+      ),
+    );
   }
 
   // A pending handoff's row: who proposes it, the new session's name, why,
@@ -425,8 +601,8 @@ window.FwHubAttention = function (ctx) {
   // typed): the Everything list leaves out exactly these, so a session is
   // never in both.
   let shown = new Set();
-  // Pending handoffs the list shows now (rows of their own: their
-  // sessions stay in the Everything list).
+  // Pending handoffs and agent starts the list shows now (rows of their
+  // own: their sessions stay in the Everything list).
   let pendingCount = 0;
   const typing = () => !!(document.activeElement && document.activeElement.closest(".attn-reply"));
   document.addEventListener("focusout", (event) => {
@@ -450,20 +626,21 @@ window.FwHubAttention = function (ctx) {
     held = false;
     const list = entries();
     const passed = handoffEntries();
+    const starts = startEntries();
     shown = new Set(list.map((e) => e.session.id));
-    pendingCount = passed.length;
+    pendingCount = passed.length + starts.length;
     const loop = flywheel ? flywheel.attention() : [];
     const graded = fanout ? fanout.attention() : [];
     const queues = ctx.queue ? ctx.queue().attention() : [];
     for (const root of [$("#attention"), $("#empty-attention")]) {
       if (!root) continue;
-      const any = list.length || passed.length || loop.length || graded.length || queues.length;
+      const any = list.length || passed.length || starts.length || loop.length || graded.length || queues.length;
       root.hidden = !any;
-      root.replaceChildren(...(any ? content(list, passed, loop, graded, queues) : []));
+      root.replaceChildren(...(any ? content(list, passed, starts, loop, graded, queues) : []));
     }
   }
 
-  function content(list, passed, loop, graded, queues) {
+  function content(list, passed, starts, loop, graded, queues) {
     const blocked = list.filter((e) => e.level === 0).length;
     const asking = list.filter((e) => e.level === 1).length;
     const alerts = loop.reduce((n, e) => n + (e.count || 1), 0);
@@ -477,6 +654,7 @@ window.FwHubAttention = function (ctx) {
           textContent: [
             blocked ? `${blocked} blocked` : "",
             passed.length ? `${passed.length} handoff${passed.length === 1 ? "" : "s"}` : "",
+            starts.length ? `${starts.length} start${starts.length === 1 ? "" : "s"}` : "",
             asking ? `${asking} asking` : "",
             list.length - blocked - asking ? `${list.length - blocked - asking} done` : "",
             alerts ? `${alerts} flywheel` : "",
@@ -494,6 +672,7 @@ window.FwHubAttention = function (ctx) {
         { className: "attn-list" },
         list.filter((e) => e.level === 0).map(row),
         passed.map(handoffRow),
+        starts.map(startRow),
         list.filter((e) => e.level === 1).map(row),
         queues.map((s) => ctx.queue().attentionRow(s)),
         graded.map((f) => fanout.attentionRow(f)),

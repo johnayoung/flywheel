@@ -4,6 +4,8 @@
 mod capture;
 pub use capture::{CAPTURE_TOKEN_FILE, CAPTURED_PREFIX, CaptureFrom, CaptureRefused};
 mod links;
+mod starts;
+pub use starts::{AgentStart, Opened};
 mod restore;
 mod sessions;
 mod status;
@@ -109,6 +111,8 @@ pub struct HubOptions {
     /// Days a browser login lasts after its last use
     /// (`server.login_days`).
     pub login_days: u32,
+    /// Agent sessions starting agent sessions (`[agent_starts]`).
+    pub agent_starts: crate::config::AgentStarts,
 }
 
 impl HubOptions {
@@ -143,6 +147,7 @@ impl HubOptions {
             reviewer: crate::config::ReviewerChoice::Other,
             queue_typing_quiet: crate::queue::DEFAULT_TYPING_QUIET,
             login_days: crate::auth::DEFAULT_LOGIN_DAYS,
+            agent_starts: crate::config::AgentStarts::default(),
         }
     }
 }
@@ -219,6 +224,10 @@ pub struct CreateSession {
     /// The agent session that opens this one (its id): `fw hub new` run
     /// inside an agent session names it.
     pub opened_by: Option<String>,
+    /// Run in this existing worktree instead of a workspace folder (an
+    /// agent's start in its own directory; not part of the API).
+    #[serde(skip)]
+    pub shared_worktree: Option<WorktreeRef>,
 }
 
 /// [`CreateSession::resume`]'s value for the folder's newest conversation.
@@ -366,6 +375,10 @@ pub struct SessionView {
     /// Its branch's pull request, when one is known (see [`crate::pr`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr: Option<crate::pr::PrBrief>,
+    /// An agent session's start policy in force: its own setting
+    /// (`start_sessions`), else the hub's `agent_starts.policy`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_policy: Option<crate::state::StartPolicy>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes &T
@@ -546,6 +559,9 @@ pub struct Hub {
     /// The settings `hub.toml` can change while the hub runs (seeded
     /// from the options; see [`crate::config`]).
     tunables: RwLock<crate::config::Tunables>,
+    /// Held across an agent start's limit check and its launch, so two
+    /// starts at once cannot both pass a limit with room for one.
+    start_gate: Mutex<()>,
     /// Read-only share links (`fw hub share`).
     shares: crate::share::ShareStore,
     /// Session recordings (`fw hub record`).
@@ -631,6 +647,7 @@ impl Hub {
             reviewer: options.reviewer,
             queue_typing_quiet: options.queue_typing_quiet,
             login_days: options.login_days,
+            agent_starts: options.agent_starts,
         };
         let record_limits = options.record_limits;
         let perms_env = crate::perms::Env::new(
@@ -681,6 +698,7 @@ impl Hub {
             search: crate::search::SearchIndex::default(),
             grading: Arc::default(),
             tunables: RwLock::new(tunables),
+            start_gate: Mutex::new(()),
             shares: crate::share::ShareStore::load(&options_state_dir),
             recordings: Arc::new(crate::record::Recordings::new(
                 &options_state_dir,

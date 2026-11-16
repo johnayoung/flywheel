@@ -107,6 +107,11 @@ enum HubCommand {
     /// agent proposed (--handoff, default the only one pending), or
     /// --prompt. Prints the new session's id.
     Continue(script::ContinueArgs),
+    /// Whether an agent session may start agent sessions (its
+    /// start_session tool, `fw hub new` inside it): show its setting and
+    /// the starts waiting on you, set it (--policy), or start or decline
+    /// one.
+    Starts(script::StartsArgs),
     /// Import VS Code multi-root workspace files (*.code-workspace) as
     /// workspaces: their folders (git repos or plain directories) and
     /// folder names; missing folders are reported and skipped.
@@ -788,6 +793,7 @@ fn dispatch_verb(
         HubCommand::Kill(args) => script::kill(&args, out, err),
         HubCommand::Relaunch(args) => script::relaunch(&args, out, err),
         HubCommand::Continue(args) => script::continue_session(&args, out, err),
+        HubCommand::Starts(args) => script::starts(&args, out, err),
         HubCommand::Import(args) => script::import(&args, out, err),
         HubCommand::Open(args) => browser::open(&args, out, err),
         HubCommand::Machine(args) => crate::machine_cli::machine(&args, out, err),

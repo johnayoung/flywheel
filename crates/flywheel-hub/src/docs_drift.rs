@@ -668,12 +668,14 @@ const PAGES: [(&str, &str); 6] = [
 /// and session links (two verbs, a route, two event kinds, three agent
 /// tools), after condensing the fleet section they extend. Raised to 90
 /// KiB for durable handoffs (a route, three verb flags, a session field):
-/// 28 bytes were left.
-const HUB_DOCS_MAX_BYTES: usize = 90 * 1024;
+/// 28 bytes were left. Raised to 91 KiB for agent starts (a verb, two
+/// routes, five keys, two agent tools, four session fields).
+const HUB_DOCS_MAX_BYTES: usize = 91 * 1024;
 /// One reference page's budget. Raised from 25 KiB to 26 for asks,
 /// handoffs, and session links (a route, two event kinds, the snapshot's
 /// `ask` and `links`): api.md was condensed first and still 80 bytes over.
-const PAGE_MAX_BYTES: usize = 26 * 1024;
+/// Raised to 27 KiB for agent starts (two routes, four session fields).
+const PAGE_MAX_BYTES: usize = 27 * 1024;
 /// The longest line any hub page may hold: a line longer than this is a
 /// paragraph that wants splitting or cutting.
 const LINE_MAX_CHARS: usize = 400;

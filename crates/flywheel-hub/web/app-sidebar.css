@@ -412,6 +412,15 @@ body.list-hidden .side-list { display: none; }
   color: var(--ink-3);
 }
 
+/* A started session's starter: a name, so not shouted. */
+.session-state.session-starter {
+  max-width: 7rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-transform: none;
+  letter-spacing: 0;
+}
 .session-state.bad { color: var(--alert); }
 .session-state.live { color: var(--signal); }
 .session-state.brass { color: var(--brass); font-weight: 700; }

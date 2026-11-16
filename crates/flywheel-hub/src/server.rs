@@ -108,8 +108,9 @@ use auth::{
 pub use events_ws::SESSIONS_PUSH_INTERVAL;
 use events_ws::{events_ws, text};
 use sessions_api::{
-    check_folder, continue_session, create_session, dismiss_handoff, get_session, kill_session,
-    list_kinds, list_sessions, restart_session, session_input, session_screen, update_session,
+    approve_start, check_folder, continue_session, create_session, decline_start, dismiss_handoff,
+    get_session, kill_session, list_kinds, list_sessions, restart_session, session_input,
+    session_screen, set_start_policy, update_session,
 };
 use terminal_ws::{handoff_restarting, session_ws};
 use workspaces_api::{
@@ -124,7 +125,7 @@ use axum::extract::{FromRequest, Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, get, post};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde_json::json;
@@ -338,6 +339,11 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             "/api/sessions/{id}/handoffs/{handoff}",
             axum::routing::delete(dismiss_handoff),
         )
+        .route(
+            "/api/sessions/{id}/starts/{start}",
+            post(approve_start).delete(decline_start),
+        )
+        .route("/api/sessions/{id}/start-policy", put(set_start_policy))
         // The route's first name, kept for older clients.
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))

@@ -72,6 +72,7 @@ impl Hub {
         let queue = self.queue_brief(&record.id);
         let worker = crate::flywheel::worker_run(&record, live.as_ref().and_then(|l| l.pid));
         let pr = self.pr_watch().brief(&record, git.as_ref());
+        let start_policy = record.runs_agent().then(|| self.start_policy(&record));
         SessionView {
             record,
             live,
@@ -83,6 +84,7 @@ impl Hub {
             queue,
             worker,
             pr,
+            start_policy,
         }
     }
 
@@ -98,23 +100,16 @@ impl Hub {
         request: CreateSession,
     ) -> Result<SessionView, HubError> {
         let workspace = self.workspace(&request.workspace_id)?;
-        let cwd = match &request.repo {
-            None => workspace.first_folder().to_path_buf(),
-            Some(repo) if workspace.has_folder(repo) => repo.clone(),
-            Some(repo) => {
-                let canonical = repo
-                    .canonicalize()
-                    .map_err(|e| StateError::Invalid(format!("folder {}: {e}", repo.display())))?;
-                if !workspace.has_folder(&canonical) {
-                    return Err(StateError::Invalid(format!(
-                        "folder {} is not part of workspace {}",
-                        canonical.display(),
-                        workspace.name
-                    ))
-                    .into());
-                }
-                canonical
+        let cwd = match (&request.shared_worktree, &request.repo) {
+            (Some(shared), _) if request.worktree.is_none() => shared.path.clone(),
+            (Some(_), _) => {
+                return Err(StateError::Invalid(
+                    "a session in an existing worktree cuts no new one".into(),
+                )
+                .into());
             }
+            (None, None) => workspace.first_folder().to_path_buf(),
+            (None, Some(repo)) => self.workspace_folder(&workspace, repo)?,
         };
         if !cwd.is_dir() {
             return Err(StateError::Invalid(format!(
@@ -242,7 +237,9 @@ impl Hub {
             created_at: Utc::now(),
             state: SessionState::Running,
             fallback_command: None,
-            worktree: worktree.clone(),
+            // A new worktree, else the one it shares (as a handoff
+            // successor shares its predecessor's).
+            worktree: worktree.clone().or_else(|| request.shared_worktree.clone()),
             companion_of: None,
             launch: (!options.is_empty()).then_some(options),
             reviewer: None,
@@ -251,6 +248,9 @@ impl Hub {
             continues: None,
             opened_by: opened_by.clone(),
             handoffs: Vec::new(),
+            start_sessions: None,
+            start_requests: Vec::new(),
+            starts_made: 0,
         };
         if record
             .launch
@@ -279,6 +279,29 @@ impl Hub {
             let _ = git::remove(worktree, true);
         }
         launched
+    }
+
+    /// `repo` as one of `workspace`'s folders (canonical), else refused.
+    pub(crate) fn workspace_folder(
+        &self,
+        workspace: &crate::state::Workspace,
+        repo: &std::path::Path,
+    ) -> Result<PathBuf, HubError> {
+        if workspace.has_folder(repo) {
+            return Ok(repo.to_path_buf());
+        }
+        let canonical = repo
+            .canonicalize()
+            .map_err(|e| StateError::Invalid(format!("folder {}: {e}", repo.display())))?;
+        if !workspace.has_folder(&canonical) {
+            return Err(StateError::Invalid(format!(
+                "folder {} is not part of workspace {}",
+                canonical.display(),
+                workspace.name
+            ))
+            .into());
+        }
+        Ok(canonical)
     }
 
     /// Spawn and record a new session.
@@ -554,6 +577,9 @@ impl Hub {
             continues: None,
             opened_by: None,
             handoffs: Vec::new(),
+            start_sessions: None,
+            start_requests: Vec::new(),
+            starts_made: 0,
         };
         Ok((self.launch(record, cols, rows, false, None)?, true))
     }

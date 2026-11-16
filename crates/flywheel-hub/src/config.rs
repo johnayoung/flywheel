@@ -41,6 +41,10 @@ pub const MAX_SCROLLBACK_LINES: usize = 1_000_000;
 /// Default and bounds of `plugins.max_concurrent`.
 pub const DEFAULT_PLUGIN_CONCURRENCY: usize = 4;
 pub const MAX_PLUGIN_CONCURRENCY: usize = 16;
+/// Upper bound of `agent_starts.max_running`, `max_total`, and `max_hub`.
+pub const MAX_AGENT_STARTS: usize = 1000;
+/// Upper bound of `agent_starts.max_depth`.
+pub const MAX_START_DEPTH: usize = 20;
 
 /// The file as written. Every key is optional; unknown keys are refused.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -68,6 +72,8 @@ pub struct FileConfig {
     pub review: ReviewSection,
     #[serde(default)]
     pub queue: QueueSection,
+    #[serde(default)]
+    pub agent_starts: AgentStartsSection,
     /// Scheduled digests (see [`crate::digest`]).
     #[serde(default)]
     pub digest: crate::digest::DigestSection,
@@ -188,6 +194,47 @@ pub struct QueueSection {
     /// How long a session must go without typed input before its queue
     /// delivers: seconds, or `"8s"` / `"1m"`.
     pub typing_quiet: Option<DurationSetting>,
+}
+
+/// Agent sessions starting agent sessions (the `start_session` tool, `fw
+/// hub new` inside a session): the default policy and the limits.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStartsSection {
+    /// `ask` (default), `allowed`, or `off`.
+    pub policy: Option<String>,
+    pub max_running: Option<usize>,
+    pub max_total: Option<usize>,
+    pub max_depth: Option<usize>,
+    pub max_hub: Option<usize>,
+}
+
+/// `[agent_starts]` resolved: whether a session's agent may start
+/// sessions when the session says nothing, and the limits every start
+/// is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct AgentStarts {
+    pub policy: crate::state::StartPolicy,
+    /// Running sessions one agent started.
+    pub max_running: usize,
+    /// Sessions one agent ever started.
+    pub max_total: usize,
+    /// Sessions in an opened-by chain above a new one.
+    pub max_depth: usize,
+    /// Running agent-started sessions on the hub.
+    pub max_hub: usize,
+}
+
+impl Default for AgentStarts {
+    fn default() -> Self {
+        Self {
+            policy: crate::state::StartPolicy::Ask,
+            max_running: 10,
+            max_total: 40,
+            max_depth: 3,
+            max_hub: 40,
+        }
+    }
 }
 
 /// Which agent kind "ask for a review" launches, relative to the author's.
@@ -374,6 +421,7 @@ pub struct Tunables {
     pub queue_typing_quiet: Duration,
     /// Days a browser login lasts after its last use.
     pub login_days: u32,
+    pub agent_starts: AgentStarts,
 }
 
 /// Every setting resolved, with where each came from.
@@ -401,6 +449,7 @@ pub struct Effective {
     pub reviewer: ReviewerChoice,
     pub queue_typing_quiet: Duration,
     pub login_days: u32,
+    pub agent_starts: AgentStarts,
     pub digest: crate::digest::DigestConfig,
     /// The machine this hub forwards its telemetry to.
     pub telemetry_upstream: Option<String>,
@@ -446,6 +495,11 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("shares.max_expiry", Apply::Live),
     ("review.reviewer", Apply::Live),
     ("queue.typing_quiet", Apply::Live),
+    ("agent_starts.policy", Apply::Live),
+    ("agent_starts.max_running", Apply::Live),
+    ("agent_starts.max_total", Apply::Live),
+    ("agent_starts.max_depth", Apply::Live),
+    ("agent_starts.max_hub", Apply::Live),
     ("digest.times", Apply::Live),
     ("digest.timezone", Apply::Live),
     ("digest.channels", Apply::Live),
@@ -473,6 +527,7 @@ impl Effective {
             reviewer: self.reviewer,
             queue_typing_quiet: self.queue_typing_quiet,
             login_days: self.login_days,
+            agent_starts: self.agent_starts,
         }
     }
 
@@ -538,6 +593,11 @@ impl Effective {
             "shares.max_expiry" => json!(crate::share::format_ttl(self.share_policy.max_ttl)),
             "review.reviewer" => json!(self.reviewer.as_str()),
             "queue.typing_quiet" => json!(crate::share::format_ttl(self.queue_typing_quiet)),
+            "agent_starts.policy" => json!(self.agent_starts.policy.as_str()),
+            "agent_starts.max_running" => json!(self.agent_starts.max_running),
+            "agent_starts.max_total" => json!(self.agent_starts.max_total),
+            "agent_starts.max_depth" => json!(self.agent_starts.max_depth),
+            "agent_starts.max_hub" => json!(self.agent_starts.max_hub),
             "digest.times" => json!(self.digest.times_text()),
             "digest.timezone" => json!(self.digest.timezone.name()),
             "digest.channels" => json!(self.digest.channels.names()),
@@ -929,6 +989,7 @@ pub fn resolve(
         file_quiet,
         crate::queue::DEFAULT_TYPING_QUIET
     );
+    let agent_starts = resolve_agent_starts(&file.agent_starts, &mut sources, &mut errors);
     let days_in = |key: &str, days: u32, errors: &mut Vec<String>| {
         use crate::auth::{MAX_LOGIN_DAYS, MIN_LOGIN_DAYS};
         if (MIN_LOGIN_DAYS..=MAX_LOGIN_DAYS).contains(&days) {
@@ -1010,9 +1071,68 @@ pub fn resolve(
         reviewer,
         queue_typing_quiet,
         login_days,
+        agent_starts,
         digest,
         sources,
     })
+}
+
+/// `[agent_starts]`: the file over the defaults, each limit in its bounds.
+fn resolve_agent_starts(
+    section: &AgentStartsSection,
+    sources: &mut Vec<(&'static str, Source)>,
+    errors: &mut Vec<String>,
+) -> AgentStarts {
+    let defaults = AgentStarts::default();
+    let mut source = |key: &'static str, set: bool| {
+        sources.push((key, if set { Source::File } else { Source::Default }));
+    };
+    let policy = match section.policy.as_deref() {
+        None => defaults.policy,
+        Some(raw) => crate::state::StartPolicy::parse(raw).unwrap_or_else(|message| {
+            errors.push(format!("agent_starts.policy: {message}"));
+            defaults.policy
+        }),
+    };
+    source("agent_starts.policy", section.policy.is_some());
+    let mut bounded = |key: &'static str, value: Option<usize>, max: usize, default: usize| {
+        source(key, value.is_some());
+        match value {
+            None => default,
+            Some(n) if (1..=max).contains(&n) => n,
+            Some(n) => {
+                errors.push(format!("{key}: {n} is outside 1..={max}"));
+                default
+            }
+        }
+    };
+    AgentStarts {
+        policy,
+        max_running: bounded(
+            "agent_starts.max_running",
+            section.max_running,
+            MAX_AGENT_STARTS,
+            defaults.max_running,
+        ),
+        max_total: bounded(
+            "agent_starts.max_total",
+            section.max_total,
+            MAX_AGENT_STARTS,
+            defaults.max_total,
+        ),
+        max_depth: bounded(
+            "agent_starts.max_depth",
+            section.max_depth,
+            MAX_START_DEPTH,
+            defaults.max_depth,
+        ),
+        max_hub: bounded(
+            "agent_starts.max_hub",
+            section.max_hub,
+            MAX_AGENT_STARTS,
+            defaults.max_hub,
+        ),
+    }
 }
 
 /// `[recordings]` and `[shares]`, flag over file over default, each value
@@ -1544,6 +1664,13 @@ reviewer = "other"         # other (claude <-> codex) | same | claude | codex
 [queue]
 typing_quiet = "8s"        # no typing this long before a queue delivers
 
+[agent_starts]             # agents starting agent sessions
+policy = "ask"             # ask | allowed | off
+max_running = 10           # per starter; max_total: ever
+max_total = 40
+max_depth = 3              # opened-by chain length
+max_hub = 40               # agent-started, hub-wide
+
 [digest]                   # scheduled summaries; off until times are set
 times = ["08:00", "18:00"] # local times in timezone
 timezone = "Europe/Berlin" # IANA name; default the system's
@@ -1574,6 +1701,8 @@ mod tests {
             Some("acceptEdits")
         );
         assert_eq!(effective.source("server.port"), Source::File);
+        assert_eq!(effective.agent_starts, AgentStarts::default());
+        assert_eq!(effective.source("agent_starts.max_hub"), Source::File);
         // Every documented key is in the example and in KEYS.
         for (key, _) in KEYS {
             let leaf = key.rsplit('.').next().unwrap();
@@ -1708,6 +1837,10 @@ permission_mode = "yolo"
 approval = "sometimes"
 [plugins]
 max_concurrent = 99
+[agent_starts]
+policy = "sometimes"
+max_depth = 0
+max_hub = 5000
 "#,
         )
         .unwrap();
@@ -1723,6 +1856,9 @@ max_concurrent = 99
             "agents.claude",
             "agents.codex",
             "plugins.max_concurrent",
+            "agent_starts.policy",
+            "agent_starts.max_depth",
+            "agent_starts.max_hub",
         ] {
             assert!(
                 errors.iter().any(|e| e.starts_with(key)),

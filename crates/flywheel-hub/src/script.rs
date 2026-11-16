@@ -625,6 +625,21 @@ pub(crate) fn new(args: &NewArgs, out: &mut dyn Write, err: &mut dyn Write) -> i
             print_json(out, &view);
             0
         }
+        // Run inside an agent session whose starts wait on the operator.
+        Ok(view) if view.get("waiting").is_some() => {
+            let _ = writeln!(
+                out,
+                "Waiting for the operator (request {}): the session starts when they approve it; \
+                 {} gets a message when it starts or is declined.",
+                str_field(&view["waiting"], "id"),
+                str_field(&view["opened_by"], "name")
+            );
+            0
+        }
+        Ok(view) if args.json => {
+            print_json(out, &view);
+            0
+        }
         Ok(view) => {
             let _ = writeln!(out, "{}", str_field(&view, "id"));
             0
@@ -1375,6 +1390,114 @@ pub(crate) fn continue_session(
         }
         Err(message) => fail(err, &message),
     }
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct StartsArgs {
+    #[command(flatten)]
+    target: SessionArg,
+    /// Whether its agent may start agent sessions (the start_session
+    /// tool, `fw hub new` inside it): ask (each waits on you), allowed (at
+    /// once, within hub.toml [agent_starts] limits), off, or default (the
+    /// hub's agent_starts.policy).
+    #[arg(long, value_name = "POLICY")]
+    policy: Option<String>,
+    /// Start its pending start request ID; prints the new session's id.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["decline", "policy"])]
+    start: Option<String>,
+    /// Decline its pending start request ID.
+    #[arg(long, value_name = "ID", conflicts_with = "policy")]
+    decline: Option<String>,
+    /// Print the session (or the started one) as JSON.
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+}
+
+/// `fw hub starts`: a session's start policy and the starts waiting on
+/// the operator; set the policy, or start or decline one.
+pub(crate) fn starts(args: &StartsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let result = connect(&args.endpoint).and_then(|conn| {
+        let (id, session) = find_session(&conn, &args.target.session)?;
+        if let Some(start) = &args.start {
+            let view = conn.blocking_call(
+                "POST",
+                &format!("/api/sessions/{id}/starts/{}", query_escape(start)),
+                Some(&json!({})),
+            )?;
+            return Ok((view, true));
+        }
+        if let Some(start) = &args.decline {
+            conn.blocking_call(
+                "DELETE",
+                &format!("/api/sessions/{id}/starts/{}", query_escape(start)),
+                None,
+            )?;
+            return Ok((Value::Null, false));
+        }
+        let session = match &args.policy {
+            Some(policy) => conn.blocking_call(
+                "PUT",
+                &format!("/api/sessions/{id}/start-policy"),
+                Some(&json!({ "policy": policy })),
+            )?,
+            None => session,
+        };
+        Ok((session, false))
+    });
+    let (view, started) = match result {
+        Ok(found) => found,
+        Err(message) => return fail(err, &message),
+    };
+    if args.json {
+        if !view.is_null() {
+            print_json(out, &view);
+        }
+        return 0;
+    }
+    if started {
+        let _ = writeln!(out, "{}", str_field(&view, "id"));
+        return 0;
+    }
+    if view.is_null() {
+        let _ = writeln!(err, "fw hub: declined");
+        return 0;
+    }
+    let own = view.get("start_sessions").and_then(Value::as_str);
+    let policy = view
+        .get("start_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("none (not an agent session)");
+    let _ = writeln!(
+        out,
+        "{}: starts sessions: {policy}{}",
+        str_field(&view, "name"),
+        if own.is_some() { "" } else { " (hub default)" }
+    );
+    for start in view
+        .get("start_requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let first = start
+            .get("prompt")
+            .and_then(Value::as_str)
+            .and_then(|p| p.lines().find(|l| !l.trim().is_empty()))
+            .unwrap_or("");
+        let _ = writeln!(
+            out,
+            "  waiting {}  {}  {}",
+            str_field(start, "id"),
+            start
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("(unnamed)"),
+            first
+        );
+    }
+    0
 }
 
 #[cfg(test)]

@@ -31,13 +31,15 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 
 | Method | Path | |
 |---|---|---|
-| GET / POST | `/api/sessions[?workspace_id=]` | list / create `{"workspace_id","folder"?,"kind"?,"command"?:[argv],"worktree"?:{"task","base"?},"prompt"?,...}` |
+| GET / POST | `/api/sessions[?workspace_id=]` | list / create `{"workspace_id","folder"?,"kind"?,"command"?:[argv],"worktree"?:{"task","base"?},"prompt"?,...}`; an agent's start under `ask`: 202 `{"waiting","opened_by"}` |
 | GET / PATCH / DELETE | `/api/sessions/{id}` | PATCH `{"name"}`; DELETE kills, forgets (204; `?remove_worktree=true[&force=true]`) |
 | POST | `/api/sessions/{id}/kill` | 202: SIGHUP (3 s: SIGKILL), kept |
 | POST | `/api/sessions/{id}/relaunch` | `{"cols"?,"rows"?}`: an ended session, same id; 409 running |
 | POST | `/api/sessions/{id}/restart` | old `/relaunch` |
 | POST | `/api/sessions/{id}/continue` | `{"handoff"?,"prompt"?,"name"?}` (default: the only pending handoff's): linked successor; 201 |
 | DELETE | `/api/sessions/{id}/handoffs/{handoff}` | dismiss a pending handoff; 204 |
+| POST / DELETE | `/api/sessions/{id}/starts/{start}` | start `{"prompt"?,"name"?}` (201) / decline (204) a waiting agent start |
+| PUT | `/api/sessions/{id}/start-policy` | `{"policy"}`: `ask` `allowed` `off` `default` |
 | GET | `/api/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered text: `visible` rows, or `recent` lines (1..100000, 100); cursor, modes |
 | GET | `/api/sessions/{id}/explain` | as `fw hub explain --json` |
 | POST | `/api/sessions/{id}/input` | `{"data","paste"?,"enter"?}`; 409 not running / not reading |
@@ -59,7 +61,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
-A session lists `agent` (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs` (pending: `id`, `name`?, `reason`?, `prompt`, `created_at`; kept until started or dismissed).
+A session lists `agent` (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs` (`id`, `name`?, `reason`?, `prompt`, `created_at`; kept until started or dismissed), `start_sessions`, `start_policy` (in force), `start_requests`, `starts_made`.
 
 ## Review, handoff, peer review
 

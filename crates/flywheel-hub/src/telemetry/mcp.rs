@@ -3,10 +3,12 @@
 //! is; `ask_operator` declares what it needs from the operator before it
 //! can go on (a reply, a decision, a command only they can run);
 //! `handoff` proposes continuing the work in a fresh session from a
-//! prompt it wrote. The first two only declare: the hook path records
-//! them. `handoff`, `list_sessions`, and `message_session` act, through a
+//! prompt it wrote; `start_session` starts another agent session (within
+//! the operator's setting and limits) to take on parallel work. The first
+//! two only declare: the hook path records them. The rest act, through a
 //! [`Host`]: a handoff kept on the session until the operator starts or
-//! dismisses it, the other agent sessions on the hub, and a message typed
+//! dismisses it, a session started (or kept for the operator), the other
+//! agent sessions on the hub, one session's status, and a message typed
 //! into one.
 //!
 //! Agents rarely keep a plan on their own; the hub gives every Claude
@@ -32,11 +34,32 @@ pub const HANDOFF_TOOL: &str = "handoff";
 pub const LIST_TOOL: &str = "list_sessions";
 /// The message tool's name on the server.
 pub const MESSAGE_TOOL: &str = "message_session";
+/// The start tool's name on the server.
+pub const START_TOOL: &str = "start_session";
+/// The status tool's name on the server.
+pub const STATUS_TOOL: &str = "session_status";
+
+/// What an agent asks `start_session` for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartArgs {
+    pub name: String,
+    pub prompt: String,
+    pub folder: Option<String>,
+    /// A new worktree's task, and the branch to cut it from.
+    pub worktree: Option<(String, Option<String>)>,
+    pub model: Option<String>,
+}
 
 /// What the tools that act do, for the session calling them.
 pub trait Host {
-    /// The other agent sessions, one line each.
-    fn list_sessions(&self) -> String;
+    /// The other agent sessions, one line each (`mine`: only those the
+    /// caller started).
+    fn list_sessions(&self, mine: bool) -> String;
+    /// Start a new agent session (or keep the start for the operator);
+    /// what to tell the agent.
+    fn start_session(&self, args: &StartArgs) -> Result<String, String>;
+    /// The session `to` names, as text.
+    fn session_status(&self, to: &str) -> Result<String, String>;
     /// Send `text` to the session `to` names; what became of it.
     fn message(&self, to: &str, text: &str) -> Result<String, String>;
     /// Keep a proposed handoff for the operator; what to tell the agent.
@@ -58,8 +81,9 @@ whole list, with exactly one step in_progress while you work. Keep step titles s
 cannot go on without the operator (an answer, a decision between options, or a command only they \
 can run, such as one needing sudo or another machine), call mcp__flywheel__ask_operator once \
 with that ask, then end your turn. When the work should go on in a fresh session, call \
-mcp__flywheel__handoff with that session's whole prompt instead of printing one. Do not mention \
-these tools or the board in your replies.";
+mcp__flywheel__handoff with that session's whole prompt instead of printing one. To delegate \
+parallel work to a new agent session, call mcp__flywheel__start_session (handoff stays for \
+continuing your own work). Do not mention these tools or the board in your replies.";
 
 fn tool() -> Value {
     json!({
@@ -154,7 +178,68 @@ fn list_tool() -> Value {
         "title": "List agent sessions",
         "description": "The other agent sessions running on this hub: name, id, kind, folder, \
                         branch, status, and what each is doing. Use it to find who to message.",
-        "inputSchema": { "type": "object", "properties": {} }
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "mine": {
+                    "type": "boolean",
+                    "description": "Only the sessions you started (exited ones included)."
+                }
+            }
+        }
+    })
+}
+
+fn start_tool() -> Value {
+    json!({
+        "name": START_TOOL,
+        "title": "Start an agent session",
+        "description": "Start a new agent session to work in parallel (same kind, account, and \
+                        permission options as you; it is linked to you). Write its complete \
+                        first prompt: it has none of this conversation. It starts at once, or \
+                        waits for the operator's approval if they set it so; either way keep \
+                        working, and call it again for more sessions. Message it with \
+                        message_session; check on it with session_status. To continue your own \
+                        work in a fresh session, use handoff instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "A short name for the new session." },
+                "prompt": { "type": "string", "description": "The new session's first prompt, in full." },
+                "folder": {
+                    "type": "string",
+                    "description": "Optional: one of the workspace's folders (absolute path). Default: your own directory."
+                },
+                "worktree": {
+                    "type": "object",
+                    "description": "Optional: run it in a new sibling git worktree.",
+                    "properties": {
+                        "task": { "type": "string", "description": "Short kebab-case task name (the worktree and branch name)." },
+                        "base": { "type": "string", "description": "Optional: the branch to cut it from." }
+                    },
+                    "required": ["task"]
+                },
+                "model": { "type": "string", "description": "Optional: its model. Default: yours." }
+            },
+            "required": ["name", "prompt"]
+        }
+    })
+}
+
+fn status_tool() -> Value {
+    json!({
+        "name": STATUS_TOOL,
+        "title": "Check on an agent session",
+        "description": "Read another session's status without messaging it: state (idle, \
+                        working, asking, done, exited), its plan and current step, what it asks \
+                        the operator, its last note, who started it, runtime, and cost.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": { "type": "string", "description": "The session's name or id." }
+            },
+            "required": ["to"]
+        }
     })
 }
 
@@ -197,9 +282,15 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
             "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(
-            json!({ "tools": [tool(), ask_tool(), handoff_tool(), list_tool(), message_tool()] }),
-        ),
+        "tools/list" => Ok(json!({ "tools": [
+                tool(),
+                ask_tool(),
+                handoff_tool(),
+                list_tool(),
+                message_tool(),
+                start_tool(),
+                status_tool(),
+            ] })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str);
             let args = params.get("arguments").unwrap_or(&Value::Null);
@@ -215,7 +306,39 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                     }
                 })
             } else if name == Some(LIST_TOOL) {
-                Ok(text_result(host.list_sessions(), false))
+                let mine = args.get("mine").and_then(Value::as_bool) == Some(true);
+                Ok(text_result(host.list_sessions(mine), false))
+            } else if name == Some(START_TOOL) {
+                let given = |v: Option<&Value>, key: &str| {
+                    v.and_then(|v| v.get(key))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                };
+                let start = StartArgs {
+                    name: arg("name").to_owned(),
+                    prompt: arg("prompt").to_owned(),
+                    folder: given(Some(args), "folder"),
+                    worktree: given(args.get("worktree"), "task")
+                        .map(|task| (task, given(args.get("worktree"), "base"))),
+                    model: given(Some(args), "model"),
+                };
+                Ok(
+                    if start.name.trim().is_empty() || start.prompt.trim().is_empty() {
+                        text_result("Give the new session a name and its whole prompt.", true)
+                    } else {
+                        match host.start_session(&start) {
+                            Ok(said) => text_result(said, false),
+                            Err(why) => text_result(format!("Not started: {why}"), true),
+                        }
+                    },
+                )
+            } else if name == Some(STATUS_TOOL) {
+                Ok(match host.session_status(arg("to")) {
+                    Ok(said) => text_result(said, false),
+                    Err(why) => text_result(format!("No status: {why}"), true),
+                })
             } else if name == Some(MESSAGE_TOOL) {
                 Ok(match host.message(arg("to"), arg("text")) {
                     Ok(said) => text_result(said, false),
@@ -269,8 +392,29 @@ mod tests {
     struct OneOther;
 
     impl Host for OneOther {
-        fn list_sessions(&self) -> String {
-            "claude 4 (id s4) [claude] in /r: working".to_owned()
+        fn list_sessions(&self, mine: bool) -> String {
+            if mine {
+                "You started no session.".to_owned()
+            } else {
+                "claude 4 (id s4) [claude] in /r: working".to_owned()
+            }
+        }
+        fn start_session(&self, args: &StartArgs) -> Result<String, String> {
+            if args.folder.as_deref() == Some("/elsewhere") {
+                Err("folder /elsewhere is not part of workspace w".to_owned())
+            } else {
+                Ok(format!(
+                    "Started {} ({:?}, {:?})",
+                    args.name, args.worktree, args.model
+                ))
+            }
+        }
+        fn session_status(&self, to: &str) -> Result<String, String> {
+            if to == "claude 4" {
+                Ok("state: working".to_owned())
+            } else {
+                Err(format!("no session matches {to:?}"))
+            }
         }
         fn message(&self, to: &str, text: &str) -> Result<String, String> {
             if to == "claude 4" {
@@ -310,6 +454,39 @@ mod tests {
             listed["content"][0]["text"],
             "claude 4 (id s4) [claude] in /r: working"
         );
+        assert_eq!(
+            call(LIST_TOOL, json!({"mine": true}))["content"][0]["text"],
+            "You started no session."
+        );
+        let started = call(
+            START_TOOL,
+            json!({"name": "docs", "prompt": "Goal: ...", "worktree": {"task": "docs-fix"}, "model": "sonnet"}),
+        );
+        assert_eq!(started["isError"], false);
+        assert_eq!(
+            started["content"][0]["text"],
+            "Started docs (Some((\"docs-fix\", None)), Some(\"sonnet\"))"
+        );
+        assert_eq!(
+            call(START_TOOL, json!({"name": "docs", "prompt": " "}))["isError"],
+            true
+        );
+        let outside = call(
+            START_TOOL,
+            json!({"name": "x", "prompt": "p", "folder": "/elsewhere"}),
+        );
+        assert_eq!(outside["isError"], true);
+        assert!(
+            outside["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Not started: folder /elsewhere")
+        );
+        assert_eq!(
+            call(STATUS_TOOL, json!({"to": "claude 4"}))["content"][0]["text"],
+            "state: working"
+        );
+        assert_eq!(call(STATUS_TOOL, json!({"to": "nobody"}))["isError"], true);
         let sent = call(MESSAGE_TOOL, json!({"to": "claude 4", "text": "rebased"}));
         assert_eq!(sent["isError"], false);
         assert_eq!(sent["content"][0]["text"], "Delivered to claude 4: rebased");
@@ -355,7 +532,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            [TOOL, ASK_TOOL, HANDOFF_TOOL, LIST_TOOL, MESSAGE_TOOL]
+            [
+                TOOL,
+                ASK_TOOL,
+                HANDOFF_TOOL,
+                LIST_TOOL,
+                MESSAGE_TOOL,
+                START_TOOL,
+                STATUS_TOOL
+            ]
         );
         let asked = answer(&json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
             "params": {"name": ASK_TOOL, "arguments": {"kind": "run", "text": "Run it", "command": "sudo true"}}}))
@@ -377,10 +562,13 @@ mod tests {
         assert!(NUDGE.contains(crate::telemetry::claude::PROGRESS_TOOL));
         assert!(NUDGE.contains(crate::telemetry::claude::ASK_TOOL));
         assert!(NUDGE.contains(crate::telemetry::claude::HANDOFF_TOOL));
+        assert!(NUDGE.contains(crate::telemetry::claude::START_TOOL));
         for (claude, ours) in [
             (crate::telemetry::claude::HANDOFF_TOOL, HANDOFF_TOOL),
             (crate::telemetry::claude::LIST_TOOL, LIST_TOOL),
             (crate::telemetry::claude::MESSAGE_TOOL, MESSAGE_TOOL),
+            (crate::telemetry::claude::START_TOOL, START_TOOL),
+            (crate::telemetry::claude::STATUS_TOOL, STATUS_TOOL),
         ] {
             assert_eq!(claude, format!("mcp__{SERVER_NAME}__{ours}"));
         }

@@ -3,7 +3,7 @@
 
 use super::ApiQuery;
 use super::{ApiError, ApiJson, ApiResult, AppState, MAX_SCREEN_LINES, blocking, error_response};
-use crate::hub::{CreateSession, HubError};
+use crate::hub::{CreateSession, HubError, Opened};
 use crate::pty::WriteOutcome;
 use crate::state::{is_git_root, validate_folder};
 use crate::vt::{DEFAULT_RECENT_LINES, TextSource};
@@ -39,8 +39,15 @@ pub(super) async fn create_session(
     ApiJson(request): ApiJson<CreateSession>,
 ) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
-    let view = blocking(move || hub.create_session(request)).await?;
-    Ok((StatusCode::CREATED, Json(view)).into_response())
+    Ok(match blocking(move || hub.open_session(request)).await? {
+        Opened::Started(view) => (StatusCode::CREATED, Json(view)).into_response(),
+        // An agent session's start that waits on the operator.
+        Opened::Waiting { from, request } => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "waiting": request, "opened_by": from })),
+        )
+            .into_response(),
+    })
 }
 
 #[derive(Deserialize)]
@@ -159,6 +166,67 @@ pub(super) async fn continue_session(
     })
     .await?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct StartApproval {
+    /// The new session's first prompt; default: the one asked for.
+    prompt: Option<String>,
+    /// Its name; default: the one asked for.
+    name: Option<String>,
+}
+
+/// Start a session an agent asked to start: 201 with the new session.
+pub(super) async fn approve_start(
+    State(app): State<AppState>,
+    Path((id, start)): Path<(String, String)>,
+    ApiJson(request): ApiJson<StartApproval>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let view = blocking(move || {
+        hub.approve_start(
+            &id,
+            &start,
+            request.prompt.as_deref(),
+            request.name.as_deref(),
+        )
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+/// Decline a session an agent asked to start: 204.
+pub(super) async fn decline_start(
+    State(app): State<AppState>,
+    Path((id, start)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    blocking(move || hub.decline_start(&id, &start)).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Deserialize)]
+pub(super) struct StartPolicyRequest {
+    /// `ask`, `allowed`, `off`, or `default` (the hub's).
+    policy: String,
+}
+
+/// Set whether a session's agent may start sessions: the session.
+pub(super) async fn set_start_policy(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(request): ApiJson<StartPolicyRequest>,
+) -> ApiResult<Response> {
+    let policy = match request.policy.trim() {
+        "default" => None,
+        raw => Some(
+            crate::state::StartPolicy::parse(raw)
+                .map_err(|why| HubError::from(crate::state::StateError::Invalid(why)))?,
+        ),
+    };
+    let hub = Arc::clone(&app.hub);
+    let view = blocking(move || hub.set_start_policy(&id, policy)).await?;
+    Ok(Json(view).into_response())
 }
 
 /// Dismiss a pending handoff unstarted: 204.

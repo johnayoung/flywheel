@@ -325,6 +325,14 @@ function paneMenu(pane, x, y) {
     { label: "Close pane (keeps running)", hint: keyHint("pane.close"), run: () => closePane(pane.id) },
     { label: `Close session ${session.name}`, hint: keyHint("session.close"), danger: true, run: () => closeSession(session.id) },
   ];
+  if (isAgent(session) && session.start_policy) {
+    // May its agent start agent sessions (start_session, fw hub new)?
+    const own = session.start_sessions;
+    items.push({ group: `starts sessions: ${START_WORDS[session.start_policy]}${own ? "" : " (hub default)"}` });
+    for (const [policy, label] of [["ask", "Ask me first"], ["allowed", "Allowed, within limits"], ["off", "Off"], ["default", "Hub default"]]) {
+      items.push({ label, disabled: (own || "default") === policy, run: () => setStartPolicy(session, policy) });
+    }
+  }
   if (others.length) {
     items.push({ group: "show beside" });
     for (const other of others.slice(0, 8)) {
@@ -336,6 +344,17 @@ function paneMenu(pane, x, y) {
     }
   }
   showMenu(x, y, items);
+}
+
+const START_WORDS = { ask: "ask first", allowed: "allowed", off: "off" };
+
+async function setStartPolicy(session, policy) {
+  try {
+    await api("PUT", `/api/sessions/${encodeURIComponent(session.id)}/start-policy`, { policy });
+    await refresh();
+  } catch (error) {
+    commands.toast(`Not changed: ${error.message}`, { timeout: 5000 });
+  }
 }
 
 function tabMenu(t, x, y) {

@@ -366,6 +366,17 @@ window.FwHubWork = function (ctx) {
     };
     linked("continues", d.links && d.links.continues);
     linked("opened by", d.links && d.links.opened_by);
+    // The sessions this one's agent started (start_session, fw hub new).
+    const started = state.sessions.filter((s) => s.opened_by && s.opened_by === d.session);
+    if (started.length) {
+      rows.push(fact(
+        "started",
+        ...started.flatMap((s, i) => [
+          i ? el("span", { className: "wk-dim", textContent: " \u00b7 " }) : null,
+          el("button", { type: "button", className: "tach wk-link", textContent: s.name, title: "Open it", onclick: () => ctx.openSession(s.id) }),
+        ]),
+      ));
+    }
     linked("continued", d.continued_by);
     if (d.ask && d.ask.prompt) {
       rows.push(fact("handoff", el("pre", { className: "wk-ask-cmd wk-handoff", textContent: d.ask.prompt })));

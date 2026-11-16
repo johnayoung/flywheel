@@ -146,6 +146,7 @@ impl Fanouts {
                 resume: None,
                 account: None,
                 opened_by: None,
+                shared_worktree: None,
             });
             let view = match created {
                 Ok(view) => view,

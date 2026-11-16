@@ -126,6 +126,12 @@ impl TestHub {
     /// Launch a Claude session; its id, the argv it got, and its
     /// environment.
     async fn claude(&self) -> (String, Vec<String>, HashMap<String, String>) {
+        self.claude_with(json!({ "name": "builder" })).await
+    }
+
+    /// A claude session in a new workspace over `repo`, `extra` merged
+    /// into its create request.
+    async fn claude_with(&self, extra: Value) -> (String, Vec<String>, HashMap<String, String>) {
         let repo = self.dir.path().join("repo").canonicalize().unwrap();
         let ws = self
             .post(
@@ -133,12 +139,11 @@ impl TestHub {
                 json!({ "name": "ws", "folders": [repo] }),
             )
             .await;
-        let session = self
-            .post(
-                "/api/sessions",
-                json!({ "workspace_id": ws["id"], "kind": "claude", "name": "builder" }),
-            )
-            .await;
+        let mut body = json!({ "workspace_id": ws["id"], "kind": "claude" });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        let session = self.post("/api/sessions", body).await;
         let id = session["id"].as_str().unwrap().to_owned();
         let env_file = self.dir.path().join("claude.env");
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -231,7 +236,9 @@ async fn hooks_posted_to_the_hub_drive_status_and_are_recorded() {
             "mcp__flywheel__report_progress",
             "mcp__flywheel__ask_operator",
             "mcp__flywheel__handoff",
-            "mcp__flywheel__list_sessions"
+            "mcp__flywheel__list_sessions",
+            "mcp__flywheel__start_session",
+            "mcp__flywheel__session_status"
         ])
     );
     let mcp: Value = serde_json::from_str(arg_after(&args, "--mcp-config")).unwrap();
@@ -686,7 +693,16 @@ async fn a_handoff_is_continued_in_a_linked_session_and_agents_message_each_othe
     let workspaces = hub.get("/api/workspaces").await;
     let ws = workspaces["workspaces"][0]["id"].clone();
 
-    // Another agent, opened by the first (`fw hub new` inside it).
+    // Another agent, opened by the first (`fw hub new` inside it, which
+    // its start policy allows).
+    let (status, _) = hub
+        .call(
+            reqwest::Method::PUT,
+            &format!("/api/sessions/{sid}/start-policy"),
+            Some(json!({ "policy": "allowed" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
     let other = hub
         .post(
             "/api/sessions",
@@ -1173,5 +1189,348 @@ async fn lanes_place_sessions_by_what_they_need_grouped_by_workspace() {
     );
     assert_eq!(view["total"], 1);
     assert_eq!(view["runs"], 1);
+    hub.shutdown().await;
+}
+
+/// Wait until session `id` was told `needle`: typed in (its screen) or
+/// queued for when its turn is done.
+async fn told(hub: &TestHub, id: &str, needle: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, screen) = hub
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/sessions/{id}/screen?source=recent&lines=200"),
+                None,
+            )
+            .await;
+        let (_, queue) = hub
+            .call(
+                reqwest::Method::GET,
+                &format!("/api/sessions/{id}/queue"),
+                None,
+            )
+            .await;
+        // Pasted text wraps on the screen: compare without line breaks.
+        let flat = |v: &Value| v.to_string().replace("\\n", "").replace('\n', "");
+        if flat(&screen).contains(needle) || queue.to_string().contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{id} was never told {needle:?}: {screen} {queue}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait until the newest claude launch's argv holds `needle`.
+async fn launched_with(hub: &TestHub, needle: &str) -> String {
+    let args_file = hub.dir.path().join("claude.args");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let args = std::fs::read_to_string(&args_file).unwrap_or_default();
+        if args.contains(needle) {
+            return args;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never launched with {needle:?}: {args}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_start_sessions_within_their_policy_and_limits() {
+    let hub = TestHub::start(None).await;
+    let (lead, args, env) = hub
+        .claude_with(json!({ "name": "lead", "model": "opus", "permission_mode": "acceptEdits" }))
+        .await;
+    let mcp: Value = serde_json::from_str(arg_after(&args, "--mcp-config")).unwrap();
+    let headers = mcp["mcpServers"]["flywheel"]["headers"].clone();
+    let ws = hub.get(&format!("/api/sessions/{lead}")).await["workspace_id"].clone();
+    let tool = |name: &str, arguments: Value| {
+        let message = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                             "params": {"name": name, "arguments": arguments}});
+        let hub = &hub;
+        let headers = &headers;
+        let env = &env;
+        async move {
+            let answer: Value = hub
+                .as_agent("/api/telemetry/mcp", headers, env, &message)
+                .await
+                .json()
+                .await
+                .unwrap();
+            let result = answer["result"].clone();
+            (
+                result["isError"] == true,
+                result["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_owned(),
+            )
+        }
+    };
+    let set_policy = |policy: &str| {
+        let body = json!({ "policy": policy });
+        let path = format!("/api/sessions/{lead}/start-policy");
+        let hub = &hub;
+        async move {
+            let (status, view) = hub.call(reqwest::Method::PUT, &path, Some(body)).await;
+            assert_eq!(status, StatusCode::OK, "{view}");
+            view
+        }
+    };
+    let requests = |view: &Value| -> Vec<Value> {
+        view["start_requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    // The default is ask: two starts in one turn wait, the agent keeps
+    // working; a folder outside the workspace is refused.
+    let lead_view = hub.get(&format!("/api/sessions/{lead}")).await;
+    assert_eq!(lead_view["start_policy"], "ask", "{lead_view}");
+    let (error, said) = tool(
+        "start_session",
+        json!({"name": "worker", "prompt": "Goal: build part A."}),
+    )
+    .await;
+    assert!(!error, "{said}");
+    assert!(
+        said.starts_with("Waiting for the operator (request "),
+        "{said}"
+    );
+    assert!(said.contains("Keep working."), "{said}");
+    let (error, said) = tool(
+        "start_session",
+        json!({"name": "docs", "prompt": "Goal: write the docs.", "model": "sonnet"}),
+    )
+    .await;
+    assert!(!error, "{said}");
+    let (error, said) = tool(
+        "start_session",
+        json!({"name": "far", "prompt": "Goal: x", "folder": "/"}),
+    )
+    .await;
+    assert!(error, "{said}");
+    assert!(said.contains("is not part of workspace"), "{said}");
+    let waiting = requests(&hub.get(&format!("/api/sessions/{lead}")).await);
+    assert_eq!(waiting.len(), 2, "{waiting:?}");
+    assert_eq!(waiting[0]["name"], "worker");
+    assert_eq!(waiting[0]["kind"], "claude");
+    // The caller's own launch options; only the model may differ.
+    assert_eq!(waiting[0]["launch"]["permission_mode"], "acceptEdits");
+    assert_eq!(waiting[0]["launch"]["model"], "opus");
+    assert_eq!(waiting[1]["launch"]["model"], "sonnet");
+    assert_eq!(waiting[1]["launch"]["permission_mode"], "acceptEdits");
+    let (worker_rid, docs_rid) = (
+        waiting[0]["id"].as_str().unwrap().to_owned(),
+        waiting[1]["id"].as_str().unwrap().to_owned(),
+    );
+
+    // Declined: gone, and the agent is told.
+    let (status, _) = hub
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{lead}/starts/{docs_rid}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    told(
+        &hub,
+        &lead,
+        &format!("declined your start request {docs_rid}"),
+    )
+    .await;
+
+    // Started: linked, named, its prompt under who started it; the agent
+    // is told; a second start of it finds nothing.
+    let (status, worker) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{lead}/starts/{worker_rid}"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{worker}");
+    assert_eq!(worker["name"], "worker");
+    assert_eq!(worker["opened_by"], lead.as_str());
+    assert_eq!(worker["launch"]["permission_mode"], "acceptEdits");
+    assert_eq!(worker["launch"]["model"], "opus");
+    let argv = launched_with(&hub, "Goal: build part A.").await;
+    assert!(argv.contains("From lead in repo: "), "{argv}");
+    assert!(
+        argv.contains(&format!("message_session (to: {lead})")),
+        "{argv}"
+    );
+    let worker_id = worker["id"].as_str().unwrap().to_owned();
+    told(&hub, &lead, &format!("started worker (id {worker_id})")).await;
+    assert!(requests(&hub.get(&format!("/api/sessions/{lead}")).await).is_empty());
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{lead}/starts/{worker_rid}"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Allowed: started at once, with its own model.
+    let view = set_policy("allowed").await;
+    assert_eq!(view["start_sessions"], "allowed");
+    let (error, said) = tool(
+        "start_session",
+        json!({"name": "docs", "prompt": "Goal: write the docs.", "model": "sonnet"}),
+    )
+    .await;
+    assert!(!error, "{said}");
+    assert!(said.starts_with("Started docs (id "), "{said}");
+    assert!(said.contains("opened by you"), "{said}");
+    launched_with(&hub, "Goal: write the docs.").await;
+    let sessions = hub.get("/api/sessions").await;
+    let docs = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "docs")
+        .cloned()
+        .unwrap();
+    assert_eq!(docs["opened_by"], lead.as_str());
+    assert_eq!(docs["launch"]["model"], "sonnet");
+    assert_eq!(docs["launch"]["permission_mode"], "acceptEdits");
+    // A taken name is made unique.
+    let (error, said) = tool(
+        "start_session",
+        json!({"name": "docs", "prompt": "Goal: more docs."}),
+    )
+    .await;
+    assert!(!error, "{said}");
+    assert!(said.starts_with("Started docs 2 (id "), "{said}");
+
+    // Its status, read without messaging it; the caller's own list.
+    let (error, status_text) = tool("session_status", json!({"to": "docs"})).await;
+    assert!(!error, "{status_text}");
+    assert!(status_text.starts_with("docs (id "), "{status_text}");
+    assert!(status_text.contains("\nstate: "), "{status_text}");
+    assert!(
+        status_text.contains("started by: you (lead"),
+        "{status_text}"
+    );
+    assert!(status_text.contains("\nruntime: "), "{status_text}");
+    let (_, mine) = tool("list_sessions", json!({"mine": true})).await;
+    for name in ["worker (id", "docs (id", "docs 2 (id"] {
+        assert!(mine.contains(name), "{mine}");
+    }
+    assert!(mine.contains("started by you"), "{mine}");
+
+    // `fw hub new` inside the agent obeys the same policy: allowed opens,
+    // ask waits, off refuses; a shell is not an agent start.
+    let (status, made) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/sessions",
+            Some(json!({"workspace_id": ws, "kind": "claude", "name": "cli-made", "opened_by": lead})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{made}");
+    assert_eq!(made["opened_by"], lead.as_str());
+    set_policy("ask").await;
+    let (status, held) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/sessions",
+            Some(json!({"workspace_id": ws, "kind": "claude", "name": "cli-held", "prompt": "Goal: y", "opened_by": lead})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{held}");
+    assert_eq!(held["opened_by"]["name"], "lead");
+    assert_eq!(held["waiting"]["name"], "cli-held");
+    let view = set_policy("off").await;
+    assert_eq!(view["start_policy"], "off");
+    let (error, said) = tool(
+        "start_session",
+        json!({"name": "nope", "prompt": "Goal: z"}),
+    )
+    .await;
+    assert!(error, "{said}");
+    assert!(said.contains("starting sessions is off for lead"), "{said}");
+    let (status, refused) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/sessions",
+            Some(json!({"workspace_id": ws, "kind": "claude", "opened_by": lead})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    let (status, shell) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/sessions",
+            Some(json!({"workspace_id": ws, "kind": "shell", "opened_by": lead})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{shell}");
+
+    // Each limit refuses by name. Four starts made (worker, docs, docs 2,
+    // cli-made); removing one gives nothing back.
+    set_policy("default").await;
+    set_policy("allowed").await;
+    let limit = |change: fn(&mut flywheel_hub::config::AgentStarts)| {
+        let mut tunables = hub.hub.tunables();
+        change(&mut tunables.agent_starts);
+        hub.hub.set_tunables(tunables);
+    };
+    let refused_by = |name: &'static str| {
+        let tool = &tool;
+        async move {
+            let (error, said) = tool(
+                "start_session",
+                json!({"name": "one more", "prompt": "Goal: w"}),
+            )
+            .await;
+            assert!(error, "{name}: {said}");
+            assert!(said.contains(name), "{name}: {said}");
+        }
+    };
+    assert_eq!(
+        hub.get(&format!("/api/sessions/{lead}")).await["starts_made"],
+        4
+    );
+    limit(|l| l.max_total = 4);
+    refused_by("agent_starts.max_total").await;
+    let docs_id = docs["id"].as_str().unwrap();
+    let (status, _) = hub
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{docs_id}"),
+            None,
+        )
+        .await;
+    assert!(status.is_success(), "{status}");
+    refused_by("agent_starts.max_total").await;
+    // Three of its sessions still run: worker, docs 2, cli-made.
+    limit(|l| {
+        l.max_total = 40;
+        l.max_running = 3;
+    });
+    refused_by("agent_starts.max_running").await;
+    limit(|l| {
+        l.max_running = 10;
+        l.max_hub = 3;
+    });
+    refused_by("agent_starts.max_hub").await;
+    limit(|l| {
+        l.max_hub = 40;
+        l.max_depth = 0;
+    });
+    refused_by("agent_starts.max_depth").await;
+    // Under ask a start over a limit is refused at once, not kept.
+    set_policy("ask").await;
+    refused_by("agent_starts.max_depth").await;
     hub.shutdown().await;
 }

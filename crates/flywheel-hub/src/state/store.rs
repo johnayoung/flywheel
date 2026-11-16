@@ -2,9 +2,10 @@
 //! atomically (rolled back in memory when the save fails).
 
 use super::{
-    FolderSpec, LaunchTemplate, MAX_PENDING_HANDOFFS, MAX_TEMPLATES, PendingHandoff, STATE_FILE,
-    STATE_VERSION, STATE_VERSION_MIN, SessionRecord, SessionState, StateDoc, StateError,
-    UNCLEAN_STOP, Workspace, WorkspaceInput, new_id, validate_folders, validate_name,
+    FolderSpec, LaunchTemplate, MAX_PENDING_HANDOFFS, MAX_PENDING_STARTS, MAX_TEMPLATES,
+    PendingHandoff, PendingStart, STATE_FILE, STATE_VERSION, STATE_VERSION_MIN, SessionRecord,
+    SessionState, StartPolicy, StateDoc, StateError, UNCLEAN_STOP, Workspace, WorkspaceInput,
+    new_id, validate_folders, validate_name,
 };
 use crate::auth::write_private;
 use crate::fanout::{Fanout, MAX_FANOUTS};
@@ -552,6 +553,61 @@ impl HubStore {
         let undo = removed.clone();
         self.save_or_rollback(|doc| doc.sessions[index].handoffs.insert(at, undo))?;
         Ok(removed)
+    }
+
+    /// Add a session start session `id`'s agent asked for. At most
+    /// [`MAX_PENDING_STARTS`] wait per session.
+    pub fn add_start_request(&mut self, id: &str, start: PendingStart) -> Result<(), StateError> {
+        let index = self.session_index(id)?;
+        let pending = &mut self.doc.sessions[index].start_requests;
+        if pending.len() >= MAX_PENDING_STARTS {
+            return Err(StateError::Invalid(format!(
+                "{MAX_PENDING_STARTS} session starts already wait on the operator: wait until they start or decline one"
+            )));
+        }
+        pending.push(start);
+        self.save_or_rollback(|doc| {
+            doc.sessions[index].start_requests.pop();
+        })
+    }
+
+    /// Remove session `id`'s pending start `start`; it is returned.
+    pub fn remove_start_request(
+        &mut self,
+        id: &str,
+        start: &str,
+    ) -> Result<PendingStart, StateError> {
+        let index = self.session_index(id)?;
+        let at = self.doc.sessions[index]
+            .start_requests
+            .iter()
+            .position(|h| h.id == start)
+            .ok_or_else(|| StateError::NotFound(format!("start request {start}")))?;
+        let removed = self.doc.sessions[index].start_requests.remove(at);
+        let undo = removed.clone();
+        self.save_or_rollback(|doc| doc.sessions[index].start_requests.insert(at, undo))?;
+        Ok(removed)
+    }
+
+    /// Set whether session `id`'s agent may start sessions (`None`: the
+    /// hub's default).
+    pub fn set_start_policy(
+        &mut self,
+        id: &str,
+        policy: Option<StartPolicy>,
+    ) -> Result<SessionRecord, StateError> {
+        let index = self.session_index(id)?;
+        let previous = std::mem::replace(&mut self.doc.sessions[index].start_sessions, policy);
+        self.save_or_rollback(|doc| doc.sessions[index].start_sessions = previous)?;
+        Ok(self.doc.sessions[index].clone())
+    }
+
+    /// Count one more session started by session `id`'s agent.
+    pub fn count_start(&mut self, id: &str) -> Result<(), StateError> {
+        let index = self.session_index(id)?;
+        let previous = self.doc.sessions[index].starts_made;
+        self.doc.sessions[index].starts_made = previous.saturating_add(1);
+        self.save_or_rollback(|doc| doc.sessions[index].starts_made = previous)
     }
 
     /// Pair `author` with the reviewer agent `reviewer` (both records

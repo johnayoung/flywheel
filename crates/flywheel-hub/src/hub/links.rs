@@ -221,6 +221,9 @@ impl Hub {
             continues: Some(from.id.clone()),
             opened_by: None,
             handoffs: Vec::new(),
+            start_sessions: None,
+            start_requests: Vec::new(),
+            starts_made: 0,
         };
         // Taken before the launch, so two starts of one handoff start one
         // session; put back if the launch fails.
@@ -309,24 +312,48 @@ impl Hub {
     }
 
     /// The running agent sessions on this hub, one line each: name, id,
-    /// folder, status, and what it is doing. `except` (the asker) is left
-    /// out.
-    pub fn agent_sessions(&self, except: &str) -> String {
-        let records: Vec<SessionRecord> = self
-            .store()
-            .sessions()
-            .iter()
-            .filter(|s| s.id != except && s.runs_agent() && s.state == SessionState::Running)
-            .take(LIST_MAX)
-            .cloned()
-            .collect();
+    /// folder, status, who started it, and what it is doing. `except`
+    /// (the asker) is left out; `mine`: only the sessions it started,
+    /// exited ones too.
+    pub fn agent_sessions(&self, except: &str, mine: bool) -> String {
+        let (records, names): (Vec<SessionRecord>, Vec<(String, String)>) = {
+            let store = self.store();
+            let records = store
+                .sessions()
+                .iter()
+                .filter(|s| s.id != except && s.runs_agent())
+                .filter(|s| {
+                    if mine {
+                        s.opened_by.as_deref() == Some(except)
+                    } else {
+                        s.state == SessionState::Running
+                    }
+                })
+                .take(LIST_MAX)
+                .cloned()
+                .collect();
+            let names = store
+                .sessions()
+                .iter()
+                .map(|s| (s.id.clone(), s.name.clone()))
+                .collect();
+            (records, names)
+        };
         if records.is_empty() {
-            return "No other agent session runs on this hub.".to_owned();
+            return if mine {
+                "You started no session that is still on this hub.".to_owned()
+            } else {
+                "No other agent session runs on this hub.".to_owned()
+            };
         }
         let mut lines = Vec::with_capacity(records.len());
         for record in &records {
             let snap = self.telemetry().snapshot(&record.id);
-            let status = snap.as_ref().map_or("unknown", |s| s.status.as_str());
+            let status = if record.state == SessionState::Running {
+                snap.as_ref().map_or("unknown", |s| s.status.as_str())
+            } else {
+                "exited"
+            };
             let doing = snap
                 .as_ref()
                 .and_then(|s| {
@@ -345,6 +372,13 @@ impl Hub {
             );
             if let Some(worktree) = &record.worktree {
                 line.push_str(&format!(", branch {}", worktree.branch));
+            }
+            if let Some(by) = &record.opened_by {
+                if by == except {
+                    line.push_str(", started by you");
+                } else if let Some((_, name)) = names.iter().find(|(id, _)| id == by) {
+                    line.push_str(&format!(", started by {name}"));
+                }
             }
             if !doing.is_empty() {
                 line.push_str(&format!(" -- {doing}"));

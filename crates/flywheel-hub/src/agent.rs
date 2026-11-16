@@ -302,13 +302,17 @@ pub fn claude_settings(wiring: &ClaudeWiring<'_>) -> serde_json::Value {
     }
     if wiring.hub_url.is_some() {
         // The hub's own tools that only declare or read never wait on a
-        // permission prompt; message_session types into another agent, so
-        // it asks like any tool until the operator allows it.
+        // permission prompt, nor does start_session (the hub's own
+        // agent_starts setting governs it); message_session types into
+        // another agent, so it asks like any tool until the operator
+        // allows it.
         settings["permissions"] = serde_json::json!({ "allow": [
             crate::telemetry::claude::PROGRESS_TOOL,
             crate::telemetry::claude::ASK_TOOL,
             crate::telemetry::claude::HANDOFF_TOOL,
             crate::telemetry::claude::LIST_TOOL,
+            crate::telemetry::claude::START_TOOL,
+            crate::telemetry::claude::STATUS_TOOL,
         ] });
     }
     settings
@@ -1100,7 +1104,9 @@ mod tests {
                 "mcp__flywheel__report_progress",
                 "mcp__flywheel__ask_operator",
                 "mcp__flywheel__handoff",
-                "mcp__flywheel__list_sessions"
+                "mcp__flywheel__list_sessions",
+                "mcp__flywheel__start_session",
+                "mcp__flywheel__session_status"
             ]),
             "the hub's tools never prompt"
         );

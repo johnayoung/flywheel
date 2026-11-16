@@ -330,6 +330,7 @@ function renderSession(session, opts = {}) {
       launcher.rowChip(session),
       promptQueue.rowChip(session),
       pullRequests.rowChip(session),
+      starterHint(session),
       el("span", {
         className: `session-state ${st.tone}`,
         textContent: rowMeta(session, st),
@@ -349,6 +350,18 @@ function renderSession(session, opts = {}) {
     // Author <-> reviewer (handoff.js).
     handoff.pairChip(session),
   );
+}
+
+// The agent session that started this one (start_session, fw hub new
+// inside it): "<- its name".
+function starterHint(session) {
+  const starter = session.opened_by ? sessionById(session.opened_by) : null;
+  if (!starter) return null;
+  return el("span", {
+    className: "session-state session-starter",
+    textContent: `\u2190 ${starter.name}`,
+    title: `Started by ${starter.name}`,
+  });
 }
 
 // How far along a working (or blocked) agent is, from its telemetry: the

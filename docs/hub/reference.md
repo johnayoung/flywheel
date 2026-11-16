@@ -81,6 +81,7 @@ fw hub activity [--since AGE|TIME|last-seen] [--until T] [--workspace W] [--sess
 fw hub fleet [SESSION [--turns [N]]] [--status STATUS]... [--hours N] [--host HUB_ID] [--limit N] [--batch KEY | --all | --lanes] [--json] {where}
 fw hub inbox [--hours N] [--host HUB_ID] [--json] {where}  # pending handoffs, blocked and asking sessions, with how to answer
 fw hub continue SESSION [--handoff ID] [--name NAME] [--prompt TEXT|-] [--json] {where}  # a linked successor (default: the only pending handoff)
+fw hub starts SESSION [--policy ask|allowed|off|default] [--start ID | --decline ID] [--json] {where}
 fw hub insights [--hours N] [--project NAME] [--host HUB_ID] [--json] {where}
 fw hub capture install [--settings FILE]  # outside runs report
 fw hub capture uninstall [--settings FILE]
@@ -255,6 +256,13 @@ reviewer = "other"         # other (claude <-> codex) | same | claude | codex
 [queue]
 typing_quiet = "8s"        # no typing this long before a queue delivers
 
+[agent_starts]             # agents starting agent sessions
+policy = "ask"             # ask | allowed | off
+max_running = 10           # per starter; max_total: ever
+max_total = 40
+max_depth = 3              # opened-by chain length
+max_hub = 40               # agent-started, hub-wide
+
 [digest]                   # scheduled summaries; off until times are set
 times = ["08:00", "18:00"] # local times in timezone
 timezone = "Europe/Berlin" # IANA name; default the system's
@@ -295,6 +303,11 @@ upstream = "collector"     # the machine that takes this hub's session events
 | `shares.max_expiry` | `--share-max-expiry` | `"30d"` | live |
 | `review.reviewer` | - | `"other"` | live |
 | `queue.typing_quiet` | - | `"8s"` (1s-10m) | live |
+| `agent_starts.policy` | - | `"ask"` | live |
+| `agent_starts.max_running` | - | `10` (1-1000) | live |
+| `agent_starts.max_total` | - | `40` (1-1000) | live |
+| `agent_starts.max_depth` | - | `3` (1-20) | live |
+| `agent_starts.max_hub` | - | `40` (1-1000) | live |
 | `digest.times` | - | `[]` (off; at most 8) | live |
 | `digest.timezone` | - | the system's, else UTC | live |
 | `digest.channels` | - | all three | live |

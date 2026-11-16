@@ -36,6 +36,8 @@ pub const STATE_VERSION_MIN: u32 = 1;
 pub const MAX_NAME_CHARS: usize = 100;
 /// Most handoffs that wait on the operator per session.
 pub const MAX_PENDING_HANDOFFS: usize = 20;
+/// Most session starts that wait on the operator per session.
+pub const MAX_PENDING_STARTS: usize = 20;
 pub const MAX_FOLDERS: usize = 32;
 /// Launch templates kept per workspace.
 pub const MAX_TEMPLATES: usize = 50;
@@ -277,6 +279,94 @@ pub struct SessionRecord {
     /// operator: each is removed only when started or dismissed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handoffs: Vec<PendingHandoff>,
+    /// Whether its agent may start other agent sessions (the
+    /// `start_session` tool, `fw hub new` run inside it); `None`: the
+    /// hub's `agent_starts.policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_sessions: Option<StartPolicy>,
+    /// Sessions its agent asked to start that wait on the operator: each
+    /// is removed only when started or declined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub start_requests: Vec<PendingStart>,
+    /// Sessions its agent has started, ever (`agent_starts.max_total`):
+    /// removing one does not give the start back.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub starts_made: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes &T
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// May an agent session start other agent sessions?
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StartPolicy {
+    /// Each start waits on the operator's Needs-you list.
+    #[default]
+    Ask,
+    /// Starts at once, within the hub's limits.
+    Allowed,
+    /// Refused.
+    Off,
+}
+
+impl StartPolicy {
+    pub const ALL: [Self; 3] = [Self::Ask, Self::Allowed, Self::Off];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Allowed => "allowed",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        Self::ALL
+            .into_iter()
+            .find(|p| p.as_str().eq_ignore_ascii_case(raw))
+            .ok_or_else(|| format!("{raw:?} is not one of ask, allowed, off"))
+    }
+}
+
+/// A session an agent asked to start, waiting until the operator starts
+/// or declines it. Its options are fixed when asked (the agent's own,
+/// for the `start_session` tool); its directory is resolved at start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingStart {
+    pub id: String,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub kind: SessionKind,
+    /// Its first prompt, as the agent wrote it (the provenance line is
+    /// added at start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// One of the workspace's folders; `None`: the asking session's own
+    /// directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
+    /// Run it in a new sibling worktree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<AgentLaunch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A new worktree a pending start asks for: its task, and the branch to
+/// cut it from (default: the repo's current one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeRequest {
+    pub task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// A fresh session an agent proposed to continue its work in: the new

@@ -281,6 +281,9 @@ pub struct SessionState {
     limited_at: Option<i64>,
     #[serde(default)]
     compactions: u32,
+    /// When a compaction under way began (its `pre` seen, no `post` yet).
+    #[serde(default)]
+    compacting: Option<i64>,
     #[serde(default)]
     subagents: u32,
     /// Numbers plan items declared without ids.
@@ -389,6 +392,11 @@ pub struct Snapshot {
     /// Time spent finished, awaiting the next prompt (closed spans).
     pub awaiting_ms: u64,
     pub compactions: u32,
+    /// A compaction under way: when it began. Claude compacts before the
+    /// prompt that triggered it is reported, so the session is busy while
+    /// its status still reads as finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacting: Option<i64>,
 }
 
 /// A session in full: its snapshot, work tree, and plans.
@@ -557,6 +565,7 @@ impl SessionState {
                 self.finish_turn(ts, WorkStatus::Cancelled);
                 self.finish_subagents(ts);
                 self.open.clear();
+                self.compacting = None;
                 self.ended = true;
             }
             What::TurnStarted { title } => {
@@ -577,8 +586,15 @@ impl SessionState {
                 }
                 // A prompt answers whatever was asked.
                 self.ask = None;
-                // A prompt while a turn runs: the agent was interrupted.
-                self.finish_turn(ts, WorkStatus::Cancelled);
+                self.compacting = None;
+                // A prompt while a turn runs (one typed while the agent
+                // works, a background task's result) is taken into that
+                // turn: the agent goes on, and its one Stop ends both.
+                // An interrupt ends the turn when it happens (below).
+                if let Some(running) = self.turn.clone() {
+                    event.work = Some(running);
+                    return;
+                }
                 event.work = Some(self.start_turn(ts, title));
             }
             What::TurnFinished { ending } => {
@@ -586,6 +602,7 @@ impl SessionState {
                 event.work = self.turn.clone();
                 self.ask = self.ask_at_end(ending.as_deref(), ts);
                 self.last_turn_failed = false;
+                self.compacting = None;
                 self.finish_turn(ts, WorkStatus::Done);
             }
             What::TurnFailed { error, detail } => {
@@ -606,8 +623,9 @@ impl SessionState {
                 summary,
                 subagent,
             } => {
-                // A call no prompt was waiting on a tool for: it answered.
-                if self.wait.as_ref().is_some_and(|w| w.tool.is_none()) {
+                // A call no prompt was waiting on a tool for: it answered
+                // (the main agent's own; a subagent's runs on regardless).
+                if agent.is_none() && self.wait.as_ref().is_some_and(|w| w.tool.is_none()) {
                     self.close_wait(ts);
                 }
                 let work = self.work_of(agent.as_deref(), ts);
@@ -699,6 +717,9 @@ impl SessionState {
                     Outcome::Denied => self.denied += 1,
                     Outcome::Ok | Outcome::Interrupted => {}
                 }
+                // The person stopped the main agent mid-call: Claude
+                // reports no Stop for an interrupted turn.
+                let interrupted = *outcome == Outcome::Interrupted && agent.is_none();
                 if let Some(item) = self.item_mut(&work) {
                     item.tool_ms += took;
                     item.tool_errors += u32::from(failed);
@@ -722,6 +743,10 @@ impl SessionState {
                     }
                 }
                 event.work = Some(work);
+                if interrupted {
+                    self.close_wait(ts);
+                    self.finish_turn(ts, WorkStatus::Cancelled);
+                }
             }
             What::Asked {
                 kind,
@@ -889,6 +914,9 @@ impl SessionState {
                 event.work = self.turn.clone();
                 if phase == "pre" {
                     self.compactions += 1;
+                    self.compacting = Some(ts);
+                } else {
+                    self.compacting = None;
                 }
             }
         }
@@ -1240,6 +1268,7 @@ impl SessionState {
             waits: self.waits,
             awaiting_ms: self.awaiting_ms,
             compactions: self.compactions,
+            compacting: self.compacting,
         }
     }
 

@@ -380,6 +380,26 @@ impl Hub {
             SessionKind::Codex if report.event == "notify" => (codex_signal(&payload), None),
             _ => (None, None),
         };
+        // A subagent still running after its session's turn ended (one
+        // started in the background) does not make the session working
+        // again: the turn is over, and the idle notice Claude sends a
+        // minute later must not then read as a question. A subagent's
+        // calls still unblock a prompt it raised.
+        let signal = match signal {
+            Some(Signal::Working)
+                if kind == SessionKind::Claude
+                    && agent::claude_subagent(&payload)
+                    && matches!(
+                        self.board()
+                            .raw_status(&report.session, generation)
+                            .map(|(status, ..)| status),
+                        Some(AgentStatus::Done | AgentStatus::Idle)
+                    ) =>
+            {
+                None
+            }
+            other => other,
+        };
         if kind == SessionKind::Claude {
             self.perms_note_report(&report.session, &report.event, signal, &payload);
         }

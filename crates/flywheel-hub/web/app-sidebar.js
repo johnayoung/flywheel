@@ -400,7 +400,9 @@ function progressLine(session, st) {
   const t = sessionTelemetry.get(session.id);
   if (!t || (st.dot !== "working" && st.dot !== "blocked")) return null;
   const parts = [];
-  if (t.plan && t.plan.total) {
+  if (compactingNow(session)) {
+    parts.push(el("span", { className: "session-step", textContent: "compacting context" }));
+  } else if (t.plan && t.plan.total) {
     const bar = el("span", { className: "prog-bar" }, el("i"));
     bar.firstChild.style.width = `${Math.round((t.plan.done / t.plan.total) * 100)}%`;
     parts.push(bar);
@@ -708,8 +710,9 @@ function renderAllList() {
   }
   // Settle a held row once its hold ends.
   clearTimeout(movingTimer);
-  if (nextExpiry !== Infinity) movingTimer = setTimeout(() => render(), nextExpiry - now + 50);
-  const rows = (list) => el("ul", { className: "sessions" }, list.map((s) => renderSession(s, { tag: true, flat: true })));
+  if (nextExpiry !== Infinity) movingTimer = setTimeout(() => backgroundRender(), nextExpiry - now + 50);
+  // Keyed by group, so a repaint keeps each group's rows (morph).
+  const rows = (list, group) => el("ul", { className: "sessions", dataset: { id: `group:${group}` } }, list.map((s) => renderSession(s, { tag: true, flat: true })));
   const out = [];
   if (!state.sessions.length) {
     out.push(el(
@@ -723,7 +726,7 @@ function renderAllList() {
   if (!needs.size && !attention.handoffCount() && !moving.length) {
     out.push(el("div", { className: "list-calm", textContent: "Nothing needs you. Nothing is moving." }));
   }
-  if (moving.length) out.push(listGroup("Moving", moving.length), rows(moving));
+  if (moving.length) out.push(listGroup("Moving", moving.length), rows(moving, "moving"));
   if (resting.length) {
     const open = state.restingOpen;
     out.push(el(
@@ -746,7 +749,7 @@ function renderAllList() {
     ));
     // Folded, the attached session still shows.
     const shown = open ? resting : resting.filter((s) => s.id === state.attached);
-    if (shown.length) out.push(rows(shown));
+    if (shown.length) out.push(rows(shown, "resting"));
   }
   return out;
 }
@@ -806,6 +809,61 @@ function renderWorkspaceList(workspace) {
   ].filter(Boolean);
 }
 
+// A press on the sidebar or a pane head holds background repaints (status
+// and telemetry pushes, timers, the periodic refresh) until its release:
+// a row that moved (to another group, or down the list) between the two
+// would take the click with it, or leave it on whatever slid under the
+// pointer. A press is never held longer than PRESS_HOLD_MS.
+const PRESS_HOLD_MS = 4000;
+let pressed = 0;
+let pressTimer = 0;
+let missedRender = false;
+function release() {
+  if (!pressed) return;
+  pressed = 0;
+  clearTimeout(pressTimer);
+  if (missedRender) {
+    missedRender = false;
+    render();
+  }
+}
+document.addEventListener("pointerdown", (event) => {
+  if (!event.target.closest || !event.target.closest("#sidebar, .pane-head")) return;
+  pressed = Date.now();
+  clearTimeout(pressTimer);
+  pressTimer = setTimeout(release, PRESS_HOLD_MS);
+}, { capture: true });
+// After the click the release makes (same task), not before it.
+for (const type of ["pointerup", "pointercancel"]) {
+  window.addEventListener(type, () => setTimeout(release, 0), { capture: true });
+}
+
+// A pointer moving over the lists is aiming at a row: a repaint then
+// could slide another row under it (a session changing group). Such
+// repaints wait until it has been still for AIM_MS.
+const AIM_MS = 700;
+let aimedAt = 0;
+let aimTimer = 0;
+document.addEventListener("pointermove", (event) => {
+  if (event.pointerType === "mouse" && event.target.closest && event.target.closest("#side-scroll")) aimedAt = Date.now();
+}, { capture: true, passive: true });
+
+// A repaint nobody asked for: held while a press is down or a pointer
+// aims at a row.
+function backgroundRender() {
+  if (pressed) {
+    missedRender = true;
+    return;
+  }
+  const aiming = aimedAt + AIM_MS - Date.now();
+  if (aiming > 0) {
+    clearTimeout(aimTimer);
+    aimTimer = setTimeout(backgroundRender, aiming + 20);
+    return;
+  }
+  render();
+}
+
 function render() {
   // An inline rename being typed is never torn down under the user, by
   // any repaint (a status push, a timer, a refresh): rebuilding the list
@@ -826,7 +884,7 @@ function render() {
   // Needs you first: the Everything list below leaves out what it shows.
   attention.render();
   const root = $("#workspaces");
-  root.replaceChildren(...(!state.workspaces.length && !machines.any()
+  morph(root, (!state.workspaces.length && !machines.any()
     ? [el(
       "div",
       { className: "no-workspaces" },

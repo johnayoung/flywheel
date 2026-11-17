@@ -251,7 +251,7 @@ function renderStatusNow() {
     attention.render();
     renderMain();
   } else {
-    render();
+    backgroundRender();
   }
 }
 

@@ -805,6 +805,16 @@ pub fn claude_signal(event: &str, detail: Option<&str>) -> Option<Signal> {
     })
 }
 
+/// Whether a Claude Code hook payload is a subagent's (it names the
+/// agent it ran in): its tool calls are that agent's work, not the
+/// session's turn.
+pub fn claude_subagent(payload: &serde_json::Value) -> bool {
+    payload
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| !id.is_empty())
+}
+
 /// A human line for a blocked Claude Code session, from its hook payload
 /// (a notification without a message: from its type, `qualifier`).
 pub fn claude_detail(

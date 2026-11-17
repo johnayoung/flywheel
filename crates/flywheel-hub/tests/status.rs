@@ -438,6 +438,20 @@ async fn claude_hooks_drive_status_with_per_client_seen_tracking() {
         hub.get(&format!("/api/sessions/{sid}")).await["agent"]["status"],
         "done"
     );
+    // A subagent still running in the background after the turn ended
+    // leaves it done, and Claude's idle notice after that asks nothing.
+    let sub = json!({ "tool_name": "Read", "agent_id": "ag1" });
+    claude
+        .fire("PreToolUse", None, payload(sub.clone()))
+        .unwrap();
+    claude.fire("PostToolUse", None, payload(sub)).unwrap();
+    claude
+        .fire("Notification", Some("idle_prompt"), payload(json!({})))
+        .unwrap();
+    assert_eq!(
+        hub.get(&format!("/api/sessions/{sid}")).await["agent"]["status"],
+        "done"
+    );
 
     // The laptop views it: idle for the laptop, still done for the phone.
     view(&mut laptop, Some(&sid)).await;

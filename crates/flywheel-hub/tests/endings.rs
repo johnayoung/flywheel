@@ -597,6 +597,11 @@ async fn an_owner_ends_its_sessions_gracefully_and_never_mid_flight() {
     busy.hook("SubagentStop", json!({"agent_id": "sub1"})).await;
     sleep(WOULD_HAVE).await;
     assert_eq!(hub.session(&busy.id).await["state"], "running");
+    busy.hook(
+        "UserPromptSubmit",
+        json!({"prompt": "<task-notification>\n<task-id>sub1</task-id>\n</task-notification>"}),
+    )
+    .await;
     busy.hook("Stop", json!({})).await;
     let view = hub.ended(&busy.id).await;
     assert_eq!(view["ended"]["by"]["id"], lead.id.as_str());

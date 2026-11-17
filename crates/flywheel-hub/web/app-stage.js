@@ -257,7 +257,7 @@ function renderPaneHead(pane) {
   const tab = activeTab();
   const zoomed = tab && zoomedIn(tab) === pane.id;
   const size = pane.term ? `${pane.term.cols}×${pane.term.rows}` : "";
-  pane.head.replaceChildren(...[
+  morph(pane.head, [
     el("span", { className: `glyph ${glyphFor(session.kind)}` }, icon(glyphFor(session.kind))),
     el("span", { className: `dot ${st.dot}`, title: st.title || st.label }),
     el("span", { className: "pane-name", textContent: session.name, title: session.cwd }),

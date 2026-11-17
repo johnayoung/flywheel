@@ -1338,12 +1338,29 @@ impl Hub {
         {
             return Err("a tool call is open".to_owned());
         }
-        if self.telemetry().detail(None, &record.id).is_some_and(|d| {
-            d.work
+        if let Some(detail) = self.telemetry().detail(None, &record.id) {
+            let work = &detail.work;
+            if work
                 .iter()
                 .any(|w| w.source == WorkSource::Subagent && w.status == WorkStatus::Active)
-        }) {
-            return Err("a subagent runs".to_owned());
+            {
+                return Err("a subagent runs".to_owned());
+            }
+            // A subagent that ended after the last turn did (one run in
+            // the background) wakes its agent for one more turn: Claude
+            // submits its result as a prompt. Not at rest until then.
+            let turn_end = work
+                .iter()
+                .filter(|w| w.source == WorkSource::Turn)
+                .filter_map(|w| w.finished)
+                .max();
+            if work.iter().any(|w| {
+                w.source == WorkSource::Subagent
+                    && w.finished
+                        .is_some_and(|f| turn_end.is_none_or(|end| f > end))
+            }) {
+                return Err("a background subagent finished: its agent takes it up".to_owned());
+            }
         }
         Ok(())
     }

@@ -9,12 +9,22 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const SVG_NS = "http://www.w3.org/2000/svg";
 
+// A listener el() attaches: it calls the node's own handler for the
+// event, so a node morph() keeps takes on its replacement's handlers.
+function dispatchOn(event) {
+  const handler = this.__on && this.__on[event.type];
+  return handler ? handler.call(this, event) : undefined;
+}
+
 function el(tag, props, ...children) {
   const node = document.createElement(tag);
   for (const [key, value] of Object.entries(props || {})) {
     if (value === undefined || value === null) continue;
     if (key === "dataset") Object.assign(node.dataset, value);
-    else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+    else if (key.startsWith("on")) {
+      (node.__on || (node.__on = {}))[key.slice(2)] = value;
+      node.addEventListener(key.slice(2), dispatchOn);
+    }
     else if (key in node && key !== "role") node[key] = value;
     else if (value !== false) node.setAttribute(key, value === true ? "" : value);
   }
@@ -22,6 +32,74 @@ function el(tag, props, ...children) {
     if (child !== null && child !== undefined && child !== false) node.append(child);
   }
   return node;
+}
+
+// Make `parent`'s children look like `next` (freshly built nodes) while
+// keeping every node that is still there: a repaint that changes one
+// word changes that word, not the list. Rebuilding whole lists restarted
+// every CSS animation in them (the working spinners, the needs-you
+// pulse) and swapped a row out between a press and its release, so the
+// click never landed. Children match by key (data-id, data-wk, id),
+// else by tag in order; a kept node takes the new one's attributes,
+// handlers, form values (not under focus), and children.
+const MORPH_FORM = new Set(["INPUT", "TEXTAREA", "SELECT"]);
+function morphKey(node) {
+  if (node.nodeType !== 1) return null;
+  const key = node.getAttribute("data-id") || node.getAttribute("data-wk") || node.id;
+  return key ? `${node.tagName}#${key}` : null;
+}
+function morphNode(old, next) {
+  if (old.nodeType !== 1) {
+    if (old.nodeValue !== next.nodeValue) old.nodeValue = next.nodeValue;
+    return old;
+  }
+  for (const { name } of [...old.attributes]) if (!next.hasAttribute(name)) old.removeAttribute(name);
+  for (const { name, value } of next.attributes) if (old.getAttribute(name) !== value) old.setAttribute(name, value);
+  old.__on = next.__on;
+  if (next.__on) for (const type of Object.keys(next.__on)) old.addEventListener(type, dispatchOn);
+  if (old.onclick !== next.onclick) old.onclick = next.onclick;
+  if (MORPH_FORM.has(old.tagName) && old !== document.activeElement) {
+    if (old.value !== next.value) old.value = next.value;
+    if (old.checked !== next.checked) old.checked = next.checked;
+  }
+  if (!MORPH_FORM.has(old.tagName) || old.tagName === "SELECT") morph(old, [...next.childNodes]);
+  return old;
+}
+function morph(parent, next) {
+  const kids = next.flat().filter((n) => n !== null && n !== undefined && n !== false)
+    .map((n) => (typeof n === "string" ? document.createTextNode(n) : n));
+  const keyed = new Map();
+  const loose = [];
+  for (const child of parent.childNodes) {
+    const key = morphKey(child);
+    if (key && !keyed.has(key)) keyed.set(key, child);
+    else loose.push(child);
+  }
+  const used = new Set();
+  const wanted = kids.map((n) => {
+    // A node that is already on the page (a component's own) is placed as is.
+    if (n.isConnected) {
+      used.add(n);
+      return n;
+    }
+    const key = morphKey(n);
+    let match = key ? keyed.get(key) : null;
+    if (!match) {
+      const at = loose.findIndex((o) => !used.has(o) && o.nodeType === n.nodeType &&
+        (o.nodeType !== 1 || (o.tagName === n.tagName && !morphKey(o))));
+      if (at >= 0) match = loose[at];
+    }
+    if (match && !used.has(match) && match.nodeType === n.nodeType && (match.nodeType !== 1 || match.tagName === n.tagName)) {
+      used.add(match);
+      return morphNode(match, n);
+    }
+    return n;
+  });
+  const keep = new Set(wanted);
+  for (const child of [...parent.childNodes]) if (!keep.has(child)) child.remove();
+  wanted.forEach((node, i) => {
+    if (parent.childNodes[i] !== node) parent.insertBefore(node, parent.childNodes[i] || null);
+  });
 }
 
 function icon(id) {
@@ -225,11 +303,25 @@ const reachable = (session) => !session.machine || machines.reachable(session.ma
 // an exited session keeps its `live` record.
 const runningNow = (session) => !!session.live && session.state === "running" && reachable(session);
 
+// Compacting its context, per its telemetry. Claude compacts before the
+// prompt that set it off is reported, so the agent is busy while its
+// status still says its last turn finished (a minute or two). A
+// compaction whose end never came stops counting after COMPACT_STALE_MS.
+const COMPACT_STALE_MS = 10 * 60 * 1000;
+function compactingNow(session) {
+  const t = sessionTelemetry.get(session.id);
+  return !!(t && t.compacting && Date.now() - t.compacting < COMPACT_STALE_MS);
+}
+
 function agentStatus(session) {
   if (session.kind === "shell" || session.state !== "running" || !session.live) return null;
   if (!reachable(session)) return null;
   const pushed = state.agent[session.id];
-  return pushed && AGENT_LOOK[pushed.status] ? pushed : null;
+  if (!pushed || !AGENT_LOOK[pushed.status]) return null;
+  if ((pushed.status === "done" || pushed.status === "idle") && compactingNow(session)) {
+    return { ...pushed, status: "working", detail: "compacting context" };
+  }
+  return pushed;
 }
 
 // The record's own state, kept across hub restarts (a session without a
@@ -505,7 +597,7 @@ const fanoutTask = window.FwHubFanoutTask({
 // mobile.js).
 const pwa = window.FwHubPwa();
 const attention = window.FwHubAttention({
-  $, el, icon, age, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
+  $, el, morph, icon, age, state, workspaceById, agentStatus, openSession: (id) => openSession(id),
   flywheel,
   fanout,
   // Stalled prompt queues (queue.js).
@@ -518,6 +610,8 @@ const attention = window.FwHubAttention({
   refresh: () => refresh(),
   // Repaint the sidebar (Needs you first, then the list it leaves out).
   rerender: () => render(),
+  // A repaint nobody asked for (the ages ticking): held under a press.
+  tick: () => backgroundRender(),
   toast: (...args) => commands.toast(...args),
   copyText: (text) => commands.copyText(text),
   // Dismissing a handoff drops its prompt: asked first.
@@ -566,7 +660,7 @@ const launcher = window.FwHubLauncher({
   onRollups: () => {
     const busy = $("#sidebar").contains(document.activeElement) &&
       document.activeElement.matches("input, select, textarea");
-    if (!busy) render();
+    if (!busy) backgroundRender();
   },
   // The push carries the usage (set on the session already): redraw
   // from it, never refetch every list per push.
@@ -576,7 +670,7 @@ const launcher = window.FwHubLauncher({
     state.usageRender = setTimeout(() => {
       const busy = $("#sidebar").contains(document.activeElement) &&
         document.activeElement.matches("input, select, textarea");
-      if (!busy) render();
+      if (!busy) backgroundRender();
     }, 300);
   },
   confirmDialog: (options) => confirmDialog(options),
@@ -697,7 +791,7 @@ const activity = window.FwHubActivity({
 // drawer for a session this browser attaches, the read-only sheet for one
 // a collector holds only as telemetry.
 const work = window.FwHubWork({
-  $, el, icon, rawApi, span, state, sessionById, workspaceById, isAgent, store,
+  $, el, morph, icon, rawApi, span, state, sessionById, workspaceById, isAgent, store,
   toast: (...args) => commands.toast(...args),
   agentLook: AGENT_LOOK,
   machinePrefix: (machine) => machines.prefix(machine),
@@ -761,14 +855,25 @@ const sessionTelemetry = new Map();
 let telemetryPaint = null;
 
 // A snapshot arrived (the events socket's `telemetry`, this hub's only).
+// What of a snapshot the sidebar shows (rows, Needs you, pane heads):
+// most pushes change only counters and gauges it never draws.
+function shownOfTelemetry(t) {
+  if (!t) return "";
+  const ctx = t.context && t.context.pct >= 80 ? Math.round(t.context.pct) : 0;
+  return JSON.stringify([t.status, t.ask, t.continued_by, t.plan, t.tool && [t.tool.name, t.tool.summary],
+    t.turn_title, ctx, t.context && t.context.exact, t.compacting]);
+}
+
 function noteTelemetry(snapshot, machine) {
   if (machine || !snapshot || !snapshot.session) return;
+  const before = shownOfTelemetry(sessionTelemetry.get(snapshot.session));
   sessionTelemetry.set(snapshot.session, snapshot);
+  if (shownOfTelemetry(snapshot) === before) return;
   // Several a second per session at most: one repaint for all of them.
   if (telemetryPaint) return;
   telemetryPaint = setTimeout(() => {
     telemetryPaint = null;
-    render();
+    backgroundRender();
   }, 400);
 }
 
@@ -842,7 +947,8 @@ async function refresh(force = true) {
     return;
   }
   state.snapshot = snapshot;
-  render();
+  if (force) render();
+  else backgroundRender();
   // A pane whose session this page had not heard of yet stood empty.
   const tab = !phone() && state.view ? activeTab() : null;
   if (tab && L.panes(tab.root).some((leaf) => leaf.session && !state.panes.has(leaf.id) && sessionById(leaf.session))) renderStage();

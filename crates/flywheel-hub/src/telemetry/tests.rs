@@ -583,7 +583,7 @@ fn a_collector_takes_batches_once_and_folds_the_same_state() {
     hooks(
         &edge,
         "s",
-        0,
+        recent(),
         &[
             ("UserPromptSubmit", json!({"prompt": "build"})),
             (
@@ -1196,12 +1196,12 @@ fn asking_sessions_rank_right_after_blocked_ones() {
             ],
         );
     };
-    turn("done", 0, "All done.");
-    turn("asking", 0, "Which one do you want?");
+    turn("done", recent(), "All done.");
+    turn("asking", recent(), "Which one do you want?");
     hooks(
         &telemetry,
         "failed",
-        0,
+        recent(),
         &[
             ("UserPromptSubmit", json!({"prompt": "go"})),
             ("StopFailure", json!({"error": "server_error"})),
@@ -1210,7 +1210,7 @@ fn asking_sessions_rank_right_after_blocked_ones() {
     hooks(
         &telemetry,
         "blocked",
-        0,
+        recent(),
         &[
             ("UserPromptSubmit", json!({"prompt": "go"})),
             ("PermissionRequest", json!({"tool_name": "Bash"})),
@@ -1340,6 +1340,8 @@ fn a_handoff_without_a_prompt_is_not_an_ask() {
 fn captured_runs_are_rolled_up_by_batch_parent_or_outside() {
     let (_dir, telemetry) = open();
     let run = |id: &str, links: SessionLinks, at: i64, cost: f64, end: bool| {
+        // Recent: the store prunes what is past its retention.
+        let at = recent() + at;
         let mut drafts = vec![
             Draft::new(
                 at,
@@ -1706,4 +1708,124 @@ fn a_store_from_before_tool_counts_is_backfilled_from_its_events() {
     assert_eq!(found.time.len(), 1, "{found:?}");
     assert_eq!(found.time[0].shape, "cargo build");
     assert_eq!(found.time[0].ms, 4_000);
+}
+
+#[test]
+fn a_prompt_while_a_turn_runs_is_taken_into_that_turn() {
+    let (_dir, telemetry) = open();
+    hooks(
+        &telemetry,
+        "s",
+        recent(),
+        &[
+            ("UserPromptSubmit", json!({"prompt": "build it"})),
+            (
+                "PreToolUse",
+                json!({"tool_name": "Bash", "tool_use_id": "t1"}),
+            ),
+            (
+                "UserPromptSubmit",
+                json!({"prompt": "<task-notification>\n<task-id>a1</task-id>\n</task-notification>"}),
+            ),
+            (
+                "PostToolUse",
+                json!({"tool_name": "Bash", "tool_use_id": "t1"}),
+            ),
+            ("UserPromptSubmit", json!({"prompt": "also run the docs"})),
+            ("Stop", json!({})),
+        ],
+    );
+    let detail = telemetry.detail(None, "s").unwrap();
+    let turns: Vec<_> = detail
+        .work
+        .iter()
+        .filter(|w| w.source == WorkSource::Turn)
+        .map(|w| (w.title.as_str(), w.status))
+        .collect();
+    assert_eq!(turns, vec![("build it", WorkStatus::Done)]);
+    assert_eq!(detail.snapshot.status, "done");
+}
+
+#[test]
+fn an_interrupted_call_ends_its_turn() {
+    let (_dir, telemetry) = open();
+    hooks(
+        &telemetry,
+        "s",
+        recent(),
+        &[
+            ("UserPromptSubmit", json!({"prompt": "build it"})),
+            (
+                "PreToolUse",
+                json!({"tool_name": "Bash", "tool_use_id": "t1"}),
+            ),
+            (
+                "PostToolUseFailure",
+                json!({"tool_name": "Bash", "tool_use_id": "t1", "is_interrupt": true}),
+            ),
+            ("UserPromptSubmit", json!({"prompt": "no, do this"})),
+        ],
+    );
+    let detail = telemetry.detail(None, "s").unwrap();
+    let turns: Vec<_> = detail
+        .work
+        .iter()
+        .filter(|w| w.source == WorkSource::Turn)
+        .map(|w| (w.title.as_str(), w.status))
+        .collect();
+    assert_eq!(
+        turns,
+        vec![
+            ("build it", WorkStatus::Cancelled),
+            ("no, do this", WorkStatus::Active)
+        ]
+    );
+}
+
+#[test]
+fn a_compaction_under_way_shows_until_it_ends() {
+    let (_dir, telemetry) = open();
+    let start = recent();
+    hooks(
+        &telemetry,
+        "s",
+        start,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            ("Stop", json!({})),
+            ("PreCompact", json!({"trigger": "auto"})),
+        ],
+    );
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!(
+        (snap.status.as_str(), snap.compacting),
+        ("done", Some(start + 2000))
+    );
+    telemetry.record(
+        "s",
+        claude::hook("PostCompact", &json!({"trigger": "auto"}), start + 9000),
+    );
+    assert_eq!(telemetry.snapshot("s").unwrap().compacting, None);
+}
+
+#[test]
+fn a_subagents_call_does_not_answer_its_sessions_prompt() {
+    let (_dir, telemetry) = open();
+    hooks(
+        &telemetry,
+        "s",
+        recent(),
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            (
+                "Notification",
+                json!({"notification_type": "permission_prompt"}),
+            ),
+            (
+                "PreToolUse",
+                json!({"tool_name": "Read", "tool_use_id": "r1", "agent_id": "ag1"}),
+            ),
+        ],
+    );
+    assert_eq!(telemetry.snapshot("s").unwrap().status, "blocked");
 }

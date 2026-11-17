@@ -100,6 +100,16 @@ window.FwHubWork = function (ctx) {
 
   // The dot and the status word; blocked: on what, and for how long.
   function statusNode(snap) {
+    // Compacting before the prompt that set it off is reported: busy,
+    // though its turn reads as finished.
+    if (snap.compacting && (snap.status === "done" || snap.status === "idle" || snap.status === "asking")) {
+      return el(
+        "span",
+        { className: "wk-status working" },
+        el("span", { className: "wk-status-word" }, el("span", { className: "dot working" }), el("b", { textContent: "compacting" })),
+        el("span", { className: "wk-status-on" }, "context ", live(snap.compacting, 0, true)),
+      );
+    }
     const look = lookOf(snap.status);
     const on = blockedOn(snap);
     return el(
@@ -825,7 +835,7 @@ window.FwHubWork = function (ctx) {
       dir ? el("span", { className: "wk-dir", textContent: dir, title: dir }) : null,
     ];
     $(target.mode === "drawer" ? "#wk-title" : "#wkd-title").textContent = title;
-    $(target.mode === "drawer" ? "#wk-where" : "#wkd-where").replaceChildren(...where.filter(Boolean));
+    ctx.morph($(target.mode === "drawer" ? "#wk-where" : "#wkd-where"), where.filter(Boolean));
   }
 
   function render() {
@@ -848,7 +858,7 @@ window.FwHubWork = function (ctx) {
     } else if (!view.error) {
       out.push(el("p", { className: "act-empty wk-empty", textContent: "Loading..." }));
     }
-    body.replaceChildren(...out);
+    ctx.morph(body, out);
     if (held) {
       const again = [...body.querySelectorAll("[data-wk]")].find((node) => node.dataset.wk === held);
       if (again) again.focus({ preventScroll: true });

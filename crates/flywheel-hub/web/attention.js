@@ -21,7 +21,7 @@
 "use strict";
 
 window.FwHubAttention = function (ctx) {
-  const { $, el, icon, age, state, workspaceById, agentStatus, openSession, flywheel, fanout } = ctx;
+  const { $, el, morph, icon, age, state, workspaceById, agentStatus, openSession, flywheel, fanout } = ctx;
 
   // What an asking session's telemetry says it asks (else null).
   function askOf(session) {
@@ -755,7 +755,7 @@ window.FwHubAttention = function (ctx) {
       if (!root) continue;
       const any = list.length || passed.length || starts.length || ends.length || loop.length || graded.length || queues.length;
       root.hidden = !any;
-      root.replaceChildren(...(any ? content(list, passed, starts, ends, loop, graded, queues) : []));
+      morph(root, any ? content(list, passed, starts, ends, loop, graded, queues) : []);
     }
   }
 
@@ -806,7 +806,8 @@ window.FwHubAttention = function (ctx) {
   // Ages tick while the list shows.
   setInterval(() => {
     if (document.visibilityState === "visible" && !$("#attention").hidden) {
-      if (ctx.rerender) ctx.rerender();
+      if (ctx.tick) ctx.tick();
+      else if (ctx.rerender) ctx.rerender();
       else render();
     }
   }, 30000);

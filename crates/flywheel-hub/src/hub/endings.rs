@@ -178,7 +178,136 @@ fn command_of(pid: u32) -> String {
     one_line(&argv, COMMAND_CHARS)
 }
 
-fn processes_text(killed: &[ProcessNote]) -> String {
+/// How deep a process's parents are walked looking for the agent.
+const ANCESTRY_MAX: usize = 64;
+
+/// Whether `command` is a shell an agent runs its commands in (Claude
+/// Code's Bash tool sources a shell snapshot; Codex runs `bash -lc`).
+fn tool_shell(command: &str, codex: bool) -> bool {
+    command.contains("/shell-snapshots/")
+        || (codex
+            && command
+                .split_whitespace()
+                .nth(1)
+                .is_some_and(|a| a == "-lc"))
+}
+
+/// Whether process `pid` is the agent's own helper (an MCP server and
+/// what it runs): reached from `leader` (the agent) through its parents
+/// with no shell the agent runs commands in on the way. Work it started
+/// through such a shell, or that left it (a `nohup` job, reparented), is
+/// not. `parent` and `command` read a process's parent pid and command.
+fn is_helper(
+    pid: u32,
+    leader: u32,
+    codex: bool,
+    parent: &dyn Fn(u32) -> Option<u32>,
+    command: &dyn Fn(u32) -> String,
+) -> bool {
+    let mut at = pid;
+    for _ in 0..ANCESTRY_MAX {
+        if at == leader {
+            return true;
+        }
+        if tool_shell(&command(at), codex) {
+            return false;
+        }
+        match parent(at) {
+            Some(up) if up > 1 => at = up,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Process `pid`'s parent (Linux `/proc`; the field after the state).
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// Every process whose parents lead to `leader` (Linux `/proc`; empty
+/// elsewhere). Claude Code runs each Bash-tool command in a session of
+/// its own, so what an agent starts that way is outside its terminal's
+/// session: only its parents tie it to the agent.
+fn descendants(leader: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let parents: std::collections::HashMap<u32, u32> = entries
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| Some((pid, parent_of(pid)?)))
+        .collect();
+    let mut found = Vec::new();
+    for &pid in parents.keys() {
+        let mut at = pid;
+        for _ in 0..ANCESTRY_MAX {
+            match parents.get(&at) {
+                Some(&up) if up == leader => {
+                    found.push(pid);
+                    break;
+                }
+                Some(&up) if up > 1 => at = up,
+                _ => break,
+            }
+        }
+    }
+    found.sort_unstable();
+    found
+}
+
+/// Hang up the processes an end found outside the terminal's session
+/// (`pids`, with the command each had): SIGHUP, then SIGKILL after
+/// [`super::KILL_GRACE`] to any still running the same command (a pid
+/// reused meanwhile is left alone).
+fn hang_up_outside(pids: Vec<(u32, String)>) {
+    if pids.is_empty() {
+        return;
+    }
+    let same = |pid: u32, command: &str| command_of(pid) == command;
+    let signal = |pid: u32, sig: libc::c_int| {
+        if let Ok(pid) = libc::pid_t::try_from(pid) {
+            // SAFETY: kill(2) has no memory-safety preconditions.
+            unsafe { libc::kill(pid, sig) };
+        }
+    };
+    for (pid, command) in &pids {
+        if same(*pid, command) {
+            signal(*pid, libc::SIGHUP);
+        }
+    }
+    let spawned = std::thread::Builder::new()
+        .name("hub-end-reap".into())
+        .spawn(move || {
+            std::thread::sleep(super::KILL_GRACE);
+            for (pid, command) in &pids {
+                if same(*pid, command) {
+                    signal(*pid, libc::SIGKILL);
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        eprintln!("fw hub: ending: cannot wait to kill what outlived its hangup: {e}");
+    }
+}
+
+/// The processes worth naming: work, not the agent's own helpers.
+fn work_of(killed: &[ProcessNote]) -> Vec<&ProcessNote> {
+    killed.iter().filter(|p| !p.helper).collect()
+}
+
+fn helpers_text(killed: &[ProcessNote]) -> Option<String> {
+    let helpers = killed.iter().filter(|p| p.helper).count();
+    (helpers > 0).then(|| {
+        format!(
+            "{} of the agent's own (MCP servers and their tooling, which end with any session)",
+            plural(helpers, "helper process")
+        )
+    })
+}
+
+fn processes_text(killed: &[&ProcessNote]) -> String {
     let mut named: Vec<String> = killed
         .iter()
         .take(PROCESSES_NAMED)
@@ -215,10 +344,11 @@ fn dirty_text(note: &DirtyNote) -> String {
 /// with it, and the work left in its directory (never touched).
 fn loss_text(killed: &[ProcessNote], dirty: Option<&DirtyNote>) -> String {
     let mut said = Vec::new();
-    if !killed.is_empty() {
+    let work = work_of(killed);
+    if !work.is_empty() {
         said.push(format!(
             "processes in its terminal that end with it: {}",
-            processes_text(killed)
+            processes_text(&work)
         ));
     }
     if let Some(note) = dirty {
@@ -227,11 +357,16 @@ fn loss_text(killed: &[ProcessNote], dirty: Option<&DirtyNote>) -> String {
             dirty_text(note)
         ));
     }
-    if said.is_empty() {
-        "nothing I can see (a process that left its terminal session cannot be seen)".to_owned()
+    let mut text = if said.is_empty() {
+        "nothing I can see (a process that left the agent, reparented away from it, cannot be seen)"
+            .to_owned()
     } else {
         said.join("; ")
+    };
+    if let Some(helpers) = helpers_text(killed) {
+        text.push_str(&format!("; besides, {helpers}"));
     }
+    text
 }
 
 impl Hub {
@@ -305,12 +440,24 @@ impl Hub {
             .live_session(&record.id)
             .map(|pty| {
                 let leader = pty.pid();
-                pty.session_processes()
-                    .into_iter()
+                let codex = record.kind == crate::agent::SessionKind::Codex;
+                let full = |pid: u32| {
+                    std::fs::read(format!("/proc/{pid}/cmdline"))
+                        .map(|raw| String::from_utf8_lossy(&raw).replace('\0', " "))
+                        .unwrap_or_default()
+                };
+                let mut pids = pty.session_processes();
+                if let Some(leader) = leader {
+                    pids.extend(descendants(leader));
+                }
+                pids.sort_unstable();
+                pids.dedup();
+                pids.into_iter()
                     .filter(|p| Some(*p) != leader)
                     .map(|pid| ProcessNote {
                         pid,
                         command: command_of(pid),
+                        helper: leader.is_some_and(|l| is_helper(pid, l, codex, &parent_of, &full)),
                     })
                     .collect()
             })
@@ -553,11 +700,15 @@ impl Hub {
             ),
         };
         let id = pending.id.clone();
+        let kind = request_kind(&pending);
+        let (killed, dirty) = self.end_losses(target);
         self.store().add_end_request(&from.id, pending)?;
         self.emit(HubEvent::Sessions);
         Ok(format!(
-            "Waiting for the operator's approval (request {id}): {why}. You get a message when \
-             they approve or decline it. Keep working."
+            "Waiting for the operator's approval ({kind} request {id}): {why}. You get a message \
+             when they approve or decline it. Keep working. If it goes ahead, what I can see \
+             would be lost: {}.",
+            loss_text(&killed, dirty.as_ref())
         ))
     }
 
@@ -826,8 +977,9 @@ impl Hub {
                 self.tell(
                     &from.id,
                     &format!(
-                        "From the flywheel hub: your end request {end} is dropped: its session \
-                         was removed."
+                        "From the flywheel hub: your {} request {end} is dropped: its session \
+                         was removed.",
+                        request_kind(&pending)
                     ),
                 );
                 return Err(StateError::NotFound(format!(
@@ -865,7 +1017,8 @@ impl Hub {
                 self.tell(
                     &from.id,
                     &format!(
-                        "From the flywheel hub: the operator approved your end request {end}. {said}"
+                        "From the flywheel hub: the operator approved your {} request {end}. {said}",
+                        request_kind(&pending)
                     ),
                 );
                 let record = self.store().session(&target.id)?.clone();
@@ -888,8 +1041,9 @@ impl Hub {
         self.tell(
             id,
             &format!(
-                "From the flywheel hub: the operator declined your end request {end}; {name} keeps \
+                "From the flywheel hub: the operator declined your {} request {end}; {name} keeps \
                  running{}.",
+                request_kind(&removed),
                 if removed.replace.is_some() {
                     " and its replacement was not started"
                 } else {
@@ -919,7 +1073,17 @@ impl Hub {
     pub fn operator_kill(&self, id: &str) -> Result<(), HubError> {
         let record = self.store().session(id)?.clone();
         let (killed, dirty) = self.end_losses(&record);
+        let inside: Vec<u32> = self
+            .live_session(id)
+            .map(|pty| pty.session_processes())
+            .unwrap_or_default();
+        let outside: Vec<(u32, String)> = killed
+            .iter()
+            .filter(|p| !inside.contains(&p.pid))
+            .map(|p| (p.pid, p.command.clone()))
+            .collect();
         self.kill_session(id)?;
+        hang_up_outside(outside);
         let end = EndRecord {
             by: Actor::Operator,
             at: Utc::now(),
@@ -1105,10 +1269,22 @@ impl Hub {
                     return;
                 }
                 let (killed, dirty) = self.end_losses(&fresh);
+                // What the agent started outside its terminal's session
+                // (its Bash tool's commands) goes with it too.
+                let inside: Vec<u32> = self
+                    .live_session(&fresh.id)
+                    .map(|pty| pty.session_processes())
+                    .unwrap_or_default();
+                let outside: Vec<(u32, String)> = killed
+                    .iter()
+                    .filter(|p| !inside.contains(&p.pid))
+                    .map(|p| (p.pid, p.command.clone()))
+                    .collect();
                 let end = self.record_end(&fresh, &ending, killed, dirty);
                 if let Err(e) = self.kill_session(&fresh.id) {
                     eprintln!("fw hub: session {}: ending: {e}", fresh.id);
                 }
+                hang_up_outside(outside);
                 drop(turn);
                 self.announce_end(&fresh, &ending, &end, true);
             }
@@ -1288,10 +1464,11 @@ impl Hub {
             ),
         };
         let mut said = format!("From the flywheel hub: {head} (end request {}).", ending.id);
-        if !end.killed.is_empty() {
+        let work = work_of(&end.killed);
+        if !work.is_empty() {
             said.push_str(&format!(
                 " Processes that ended with it: {}.",
-                processes_text(&end.killed)
+                processes_text(&work)
             ));
         }
         if let Some(dirty) = &end.dirty {
@@ -1564,6 +1741,15 @@ impl Hub {
     }
 }
 
+/// What an asked-for end is, in a word: `end` or `replace`.
+fn request_kind(pending: &PendingEnd) -> &'static str {
+    if pending.replace.is_some() {
+        "replace"
+    } else {
+        "end"
+    }
+}
+
 /// The start request a replacement makes, as `record`'s agent would ask
 /// it: its kind, account, and launch options, only the model changed.
 fn successor_start(record: &SessionRecord, successor: &Successor) -> PendingStart {
@@ -1588,8 +1774,7 @@ fn successor_start(record: &SessionRecord, successor: &Successor) -> PendingStar
 fn ended_event(end: &EndRecord, target: Option<String>) -> What {
     What::Ended {
         by: end.by.tag(),
-        killed: end
-            .killed
+        killed: work_of(&end.killed)
             .iter()
             .map(|p| format!("{} {}", p.pid, p.command))
             .collect(),
@@ -1744,10 +1929,18 @@ mod tests {
     fn losses_read_plainly() {
         assert!(loss_text(&[], None).starts_with("nothing I can see"));
         let said = loss_text(
-            &[ProcessNote {
-                pid: 7,
-                command: "npm run dev".into(),
-            }],
+            &[
+                ProcessNote {
+                    pid: 7,
+                    command: "npm run dev".into(),
+                    helper: false,
+                },
+                ProcessNote {
+                    pid: 8,
+                    command: "npx @playwright/mcp".into(),
+                    helper: true,
+                },
+            ],
             Some(&DirtyNote {
                 path: PathBuf::from("/wt/x"),
                 branch: Some("feat/x".into()),
@@ -1761,5 +1954,70 @@ mod tests {
             said.contains("/wt/x (branch feat/x) has 2 uncommitted changes, 1 untracked file, 3 commits not merged"),
             "{said}"
         );
+        assert!(
+            !said.contains("playwright"),
+            "helpers are counted, not named: {said}"
+        );
+        assert!(
+            said.ends_with(
+                "besides, 1 helper process of the agent's own (MCP servers and their tooling, \
+                 which end with any session)"
+            ),
+            "{said}"
+        );
+        let only_helpers = loss_text(
+            &[ProcessNote {
+                pid: 8,
+                command: "serena".into(),
+                helper: true,
+            }],
+            None,
+        );
+        assert!(
+            only_helpers.starts_with("nothing I can see"),
+            "{only_helpers}"
+        );
+    }
+
+    #[test]
+    fn the_agents_own_helpers_are_told_from_work_it_started() {
+        // 10 claude
+        //   11 serena (an MCP server), 12 its python
+        //   13 sh -c playwright-mcp (an MCP config's own shell)
+        //   20 the Bash tool's shell, 21 the dev server it started
+        //   40 bash -lc (Codex's shell tool), 41 what it runs
+        // 30 a nohup job left behind (reparented to 1)
+        let tree: &[(u32, u32, &str)] = &[
+            (11, 10, "uvx serena start-mcp-server"),
+            (12, 11, "python serena"),
+            (13, 10, "sh -c playwright-mcp"),
+            (
+                20,
+                10,
+                "/bin/bash -c source /home/u/.claude/shell-snapshots/x.sh && eval 'npm run dev'",
+            ),
+            (21, 20, "node dev-server"),
+            (30, 1, "node worker.js"),
+            (40, 10, "bash -lc cargo watch"),
+            (41, 40, "cargo watch"),
+        ];
+        let parent = |pid: u32| tree.iter().find(|t| t.0 == pid).map(|t| t.1);
+        let command = |pid: u32| {
+            tree.iter()
+                .find(|t| t.0 == pid)
+                .map_or(String::new(), |t| t.2.to_owned())
+        };
+        let helper = |pid, codex| is_helper(pid, 10, codex, &parent, &command);
+        assert!(helper(11, false));
+        assert!(helper(12, false));
+        assert!(
+            helper(13, false),
+            "a shell an MCP config runs is not the Bash tool's"
+        );
+        assert!(!helper(20, false));
+        assert!(!helper(21, false), "started through the Bash tool");
+        assert!(!helper(30, false), "left the agent: work");
+        assert!(helper(41, false));
+        assert!(!helper(41, true), "Codex's shell tool");
     }
 }

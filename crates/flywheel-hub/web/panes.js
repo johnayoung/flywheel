@@ -920,14 +920,17 @@ window.FwHubPanes = function (ctx) {
     }
 
     function onExit(id, message) {
-      const how = ctx.exitHow(message);
+      // Ended on purpose (its end record is saved before the hangup):
+      // say how, not the hangup's exit code.
+      const purposeful = ctx.endedHow ? ctx.endedHow(sessionById(id)) : null;
+      const how = purposeful || ctx.exitHow(message);
       pane.exited = message;
       pane.term.write(`\r\n\x1b[2m[process ended: ${how}]\x1b[0m\r\n`);
       setLink("exited", "ended");
       showBanner(
         `Process ended (${how}). Scrollback stays until the session is closed or relaunched.`,
         endedActions(id),
-        !message.signal && message.code === 0,
+        !!purposeful || (!message.signal && message.code === 0),
       );
       ctx.onExit(pane);
     }

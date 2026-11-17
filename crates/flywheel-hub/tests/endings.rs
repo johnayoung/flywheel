@@ -28,7 +28,10 @@ const WOULD_HAVE: Duration = Duration::from_millis(4500);
 
 /// A stand-in `claude`: per hub session, its argv (`claude-<id>.argv`,
 /// NUL-separated), environment (`.env`), and every byte typed into it
-/// (`.in`), in raw mode with bracketed paste.
+/// (`.in`), in raw mode with bracketed paste. With `spawn-next` in the
+/// log dir (taken by the next one to start), it first starts a background
+/// job the way Claude Code's Bash tool does (a session of its own, under
+/// a shell-snapshot shell) and writes the job's pid to `.bg`.
 fn fake_claude(bin: &Path, log: &Path) -> PathBuf {
     let path = bin.join("claude");
     support::write_script(
@@ -36,6 +39,9 @@ fn fake_claude(bin: &Path, log: &Path) -> PathBuf {
         &format!(
             "#!/bin/sh\nn='{log}/claude-'\"$FLYWHEEL_HUB_SESSION\"\n\
              for a in \"$@\"; do printf '%s\\000' \"$a\"; done > \"$n.argv\"\n\
+             if rm '{log}/spawn-next' 2>/dev/null; then \
+             setsid sh -c 'sleep 300; true' /u/.claude/shell-snapshots/t.sh & \
+             echo $! > \"$n.bg\"; fi\n\
              env > \"$n.env.tmp\" && mv \"$n.env.tmp\" \"$n.env\"\n\
              stty raw -echo\nprintf '\\033[?2004h'\nexec cat >> \"$n.in\"\n",
             log = log.display()
@@ -421,7 +427,22 @@ async fn an_owner_ends_its_sessions_gracefully_and_never_mid_flight() {
     let mut hub = TestHub::start().await;
     let lead = hub.claude("lead", None, json!({})).await;
     hub.policy(&lead, "allowed").await;
+    // Its agent left a background job running (Claude's Bash tool: a
+    // session of its own, outside the terminal's).
+    std::fs::write(hub.root.join("log/spawn-next"), "").unwrap();
     let idle = hub.claude("idle", Some(&lead), json!({})).await;
+    let job: u32 = std::fs::read_to_string(idle.path("bg"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let alive = |pid: u32| {
+        Path::new(&format!("/proc/{pid}")).exists() && {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            !stat.contains(") Z ")
+        }
+    };
+    assert!(alive(job));
     let busy = hub.claude("busy", Some(&lead), json!({})).await;
     let other = hub.claude("other", Some(&lead), json!({})).await;
     for agent in [&lead, &idle, &busy, &other] {
@@ -456,6 +477,12 @@ async fn an_owner_ends_its_sessions_gracefully_and_never_mid_flight() {
     assert!(said.starts_with("Ending idle (id "), "{said}");
     assert!(said.contains("scheduled, request "), "{said}");
     assert!(said.contains("What I can see would be lost: "), "{said}");
+    assert!(
+        said.contains(&format!(
+            "{job} sh -c sleep 300; true /u/.claude/shell-snapshots/t.sh"
+        )),
+        "the job outside its terminal's session is named: {said}"
+    );
     idle.typed_has("This is your final prompt").await;
     idle.typed_has("Commit and stop.").await;
     assert!(
@@ -478,6 +505,15 @@ async fn an_owner_ends_its_sessions_gracefully_and_never_mid_flight() {
     assert_eq!(view["ended"]["mode"], "graceful");
     hub.told(&lead, &format!("idle (id {}) ended", idle.id))
         .await;
+    // The job went with it.
+    let deadline = Instant::now() + WAIT;
+    while alive(job) {
+        assert!(
+            Instant::now() < deadline,
+            "the background job outlived its end"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
     let kinds = hub.kinds(&idle.id).await;
     for kind in ["session.end_requested", "session.ended"] {
         assert!(kinds.iter().any(|k| k == kind), "{kinds:?}");
@@ -711,7 +747,7 @@ async fn ownership_passes_on_and_everything_else_asks_the_operator() {
         )
         .await;
     assert!(
-        said.starts_with("Waiting for the operator's approval (request "),
+        said.starts_with("Waiting for the operator's approval (end request "),
         "{said}"
     );
     assert!(said.contains("its owner is lead"), "{said}");
@@ -858,6 +894,16 @@ async fn a_replacement_starts_its_successor_then_ends_the_old_one() {
     assert_eq!(new["cwd"], view["cwd"]);
     let successor = hub.agent(&new);
     successor.env(None).await;
+    let status = lead.ok("session_status", json!({"to": "new"})).await;
+    assert!(
+        status.contains("\nmodel: sonnet (as launched; not reported yet)\n"),
+        "{status}"
+    );
+    successor
+        .hook("SessionStart", json!({"model": "claude-sonnet-5-5"}))
+        .await;
+    let status = lead.ok("session_status", json!({"to": "new"})).await;
+    assert!(status.contains("\nmodel: claude-sonnet-5-5\n"), "{status}");
     let argv = std::fs::read_to_string(successor.path("argv")).unwrap();
     assert!(argv.contains("Goal: carry on from old."), "{argv:?}");
     assert!(argv.contains("You were started by lead"), "{argv:?}");
@@ -881,10 +927,14 @@ async fn a_replacement_starts_its_successor_then_ends_the_old_one() {
         )
         .await;
     assert!(
-        said.starts_with("Waiting for the operator's approval"),
+        said.starts_with("Waiting for the operator's approval (replace request "),
         "{said}"
     );
     assert!(said.contains("start-sessions setting asks"), "{said}");
+    assert!(
+        said.contains("If it goes ahead, what I can see would be lost: "),
+        "{said}"
+    );
     let asked = hub.session(&lead.id).await["end_requests"][0].clone();
     assert_eq!(asked["why"], "start_policy_ask");
     assert_eq!(asked["replace"]["name"], "newer");
@@ -897,6 +947,7 @@ async fn a_replacement_starts_its_successor_then_ends_the_old_one() {
         json!({}),
     )
     .await;
+    hub.told(&lead, "approved your replace request").await;
     successor.typed_has("Stop.").await;
     successor.turn().await;
     let view = hub.ended(&successor.id).await;

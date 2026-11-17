@@ -279,6 +279,13 @@ function statusLook(session) {
       : { dot: "gone", label: "gone", tone: "" };
   }
   if (session.state === "exited") {
+    // Ended on purpose (an agent's end or replacement, your kill): how,
+    // not an exit code (a hangup reads as 129 or SIGHUP).
+    if (session.ended) {
+      const e = session.ended;
+      const label = e.successor ? "replaced" : e.by && e.by.kind === "session" ? "ended" : "killed";
+      return { dot: "done", label, tone: "", title: endedHow(session) };
+    }
     if (session.signal) return { dot: "bad", label: session.signal, tone: "bad" };
     // Code unknown: it exited after a live handoff (not our child).
     if (session.code == null) return { dot: "done", label: "exited", tone: "" };
@@ -290,8 +297,20 @@ function statusLook(session) {
   return { dot: "stopped", label: "stopped", tone: "" };
 }
 
+// How a session that was ended on purpose ended ("replaced by w2 at the
+// request of lead"); null for one that exited by itself.
+function endedHow(session) {
+  const e = session && session.ended;
+  if (!e) return null;
+  const name = (id) => (sessionById(id) || {}).name || String(id || "").slice(0, 8);
+  const by = e.by && e.by.kind === "session" ? name(e.by.id) : "you";
+  if (e.successor) return `replaced by ${name(e.successor)} at the request of ${by}`;
+  return e.by && e.by.kind === "session" ? `ended by ${by}` : "killed by you";
+}
+
 const exitHow = (info) =>
-  info.signal ? `killed by ${info.signal}` : info.code == null ? "exit code unknown" : `exit code ${info.code}`;
+  endedHow(info) ||
+  (info.signal ? `killed by ${info.signal}` : info.code == null ? "exit code unknown" : `exit code ${info.code}`);
 
 // Why a session has no terminal on this hub.
 function goneText(session) {

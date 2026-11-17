@@ -110,7 +110,7 @@ function claimsSize(pane) {
 }
 
 const panes = window.FwHubPanes({
-  el, state, sessionById, TERM_FONT, status: statusLook, goneText, exitHow,
+  el, state, sessionById, TERM_FONT, status: statusLook, goneText, exitHow, endedHow,
   net,
   // Copy buttons on an agent's replies in its terminal (reply-marks.js).
   replyMarks: window.FwHubReplyMarks({

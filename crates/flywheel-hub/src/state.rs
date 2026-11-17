@@ -438,6 +438,10 @@ pub struct Ending {
 pub struct ProcessNote {
     pub pid: u32,
     pub command: String,
+    /// The agent's own (an MCP server, its tooling): it ends with any
+    /// session, so it is counted, not named, as a loss.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub helper: bool,
 }
 
 /// Work an ended session left in its directory (nothing is removed).

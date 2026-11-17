@@ -551,6 +551,17 @@ impl Hub {
             }
         };
         lines.push(format!("state: {state}"));
+        // What the agent reports it runs, else what it was launched with.
+        let reported = snap.as_ref().and_then(|s| s.model.clone());
+        let launched = target.launch.as_ref().and_then(|l| l.model.clone());
+        lines.push(format!(
+            "model: {}",
+            match (reported, launched) {
+                (Some(model), _) => model,
+                (None, Some(model)) => format!("{model} (as launched; not reported yet)"),
+                (None, None) => "its CLI's default (not reported yet)".to_owned(),
+            }
+        ));
         lines.push(format!(
             "started by: {}",
             starter.unwrap_or_else(|| "the operator".to_owned())

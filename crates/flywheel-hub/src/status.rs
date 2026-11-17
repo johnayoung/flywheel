@@ -111,8 +111,10 @@ pub enum Signal {
     Working,
     /// The agent waits on a person.
     Blocked,
-    /// The agent has waited for input a while: blocked if it was working
-    /// (a question mid-turn), otherwise nothing new (a finished turn).
+    /// The agent has waited at its prompt a while (Claude's idle notice):
+    /// idle if it still read as working (a turn interrupted with Esc
+    /// reports no end), otherwise nothing new. Never blocked: a question
+    /// or a permission prompt has its own report.
     AwaitingInput,
     /// The agent finished a turn.
     Done,
@@ -170,9 +172,7 @@ fn transition(raw: Raw, signal: Signal) -> Option<Raw> {
         Signal::Ready => reported(AgentStatus::Idle),
         Signal::Working => reported(AgentStatus::Working),
         Signal::Blocked => reported(AgentStatus::Blocked),
-        Signal::AwaitingInput if raw.status == AgentStatus::Working => {
-            reported(AgentStatus::Blocked)
-        }
+        Signal::AwaitingInput if raw.status == AgentStatus::Working => reported(AgentStatus::Idle),
         Signal::AwaitingInput => None,
         Signal::Done => reported(AgentStatus::Done),
         Signal::Ended => reported(AgentStatus::Unknown),
@@ -743,13 +743,16 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_input_blocks_only_a_working_agent() {
+    fn awaiting_input_never_blocks_and_rests_a_working_agent() {
         let (mut board, g) = board_with("s", "w");
         board.apply("s", g, Signal::Done, None);
         assert!(!board.apply("s", g, Signal::AwaitingInput, None));
         assert_eq!(status(&board, "s", "a"), AgentStatus::Done);
         board.apply("s", g, Signal::Working, None);
-        assert!(board.apply("s", g, Signal::AwaitingInput, Some("question")));
+        assert!(board.apply("s", g, Signal::AwaitingInput, None));
+        assert_eq!(status(&board, "s", "a"), AgentStatus::Idle);
+        board.apply("s", g, Signal::Blocked, None);
+        assert!(!board.apply("s", g, Signal::AwaitingInput, None));
         assert_eq!(status(&board, "s", "a"), AgentStatus::Blocked);
     }
 

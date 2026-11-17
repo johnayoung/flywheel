@@ -49,14 +49,14 @@ Replaces the hub process **ending no session**: same pids, screens, scrollback, 
 
 | Status | Meaning | Claude Code | Codex |
 |---|---|---|---|
-| `working` | busy; UI: compacting too | `UserPromptSubmit`, `PreToolUse`, `PostToolUse[Failure]` (a subagent's after `Stop`: no change) | screen: `Working (12s • esc to interrupt)` |
+| `working` | busy (UI: compacting too) | `UserPromptSubmit`, `PreToolUse`, `PostToolUse[Failure]` (a subagent's after `Stop`: no change) | screen: `Working (12s • esc to interrupt)` |
 | `blocked` | waits on a person | `PermissionRequest`; `Notification` permission / elicitation / `agent_needs_input`; screen: a known dialog 3 s unhooked | screen: approvals, `request_user_input`, folder trust |
 | `done` | finished a turn **this client** has not viewed | `Stop`, `StopFailure` | `notify` `agent-turn-complete` |
-| `idle` | seen, or waiting for a first prompt | `SessionStart`; viewed `done`; an interrupted turn | viewed `done`; screen: the composer (`›`) |
+| `idle` | seen, or waiting for a first prompt | `SessionStart`; viewed `done`; `idle_prompt` while working | viewed `done`; screen: the composer (`›`) |
 | `unknown` | no signal, or agent ended | `SessionEnd`, exit | exit; status line frozen 5 s; no rule matches 3 s |
 
-- **Idle is not authorization**: an unknown prompt reads idle or unknown.
-- Hook / `notify` reports win; screen rules fill gaps. Esc fires no Claude hook: a seen turn showing the prompt 3 s reads `idle`, a dialog closing onto a running turn `working`.
+- **Idle is not authorization**: an unknown prompt is idle or unknown.
+- Hook / `notify` reports win; screen rules fill gaps. Esc fires no Claude hook: a seen turn at the prompt 3 s is `idle`, a dialog closing onto a running turn `working`.
 - Seen is per client id (REST: anyone): a visible, focused page used in 5 min; a turn watched from its start, to 30 min.
 - Rollup: a workspace's most urgent session, blocked > working > done > idle. Fan-out candidates roll up `idle` until a pick; an unseen grading is one `done`.
 - Claude: `--session-id <uuid>` (`agent_session_id`, follows `/clear`), hooks via `--settings` (merged with yours) POSTing to the hub, or running `<this binary> hub report` ([hub-workflows](workflows.md#fleet-and-work)). Codex: `-c notify=[<this binary> hub report --source codex --event notify]`; `thread-id` is `agent_session_id`.

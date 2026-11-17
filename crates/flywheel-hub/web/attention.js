@@ -24,9 +24,27 @@ window.FwHubAttention = function (ctx) {
   const { $, el, morph, icon, age, state, workspaceById, agentStatus, openSession, flywheel, fanout } = ctx;
 
   // What an asking session's telemetry says it asks (else null).
-  function askOf(session) {
+  function askOf(session, agent) {
     const snap = ctx.telemetryOf ? ctx.telemetryOf(session.id) : null;
-    return snap && snap.status === "asking" && snap.ask ? snap.ask : null;
+    return agent.state === "asking" && snap && snap.ask ? snap.ask : null;
+  }
+
+  // What a row says it needs, its kind first, the rest quieter:
+  // "permission: Bash  rm -rf build", "decide: which parser API?",
+  // "done: fix the failing test".
+  function needLine(session, agent, ask) {
+    const snap = ctx.telemetryOf ? ctx.telemetryOf(session.id) : null;
+    const said = (kind, rest) => [`${kind}: `, el("span", { className: "muted", textContent: rest || "" })];
+    if (agent.status === "blocked") {
+      if (snap && snap.blocked_tool) {
+        const call = snap.tool && snap.tool.name === snap.blocked_tool ? snap.tool.summary : "";
+        return said("permission", call ? `${snap.blocked_tool} ${call}` : snap.blocked_tool);
+      }
+      return agent.detail || "waiting on you";
+    }
+    if (ask) return said(ASK_WORD[ask.kind] || "asks", ask.text);
+    if (agent.state === "failed") return said("failed", snap && snap.last_error);
+    return said("done", (snap && snap.turn_title) || "finished its turn");
   }
   const ASK_WORD = { answer: "asks", decide: "decide", run: "run this", handoff: "hand off" };
   // Lines of a pending handoff's prompt its row shows.
@@ -50,7 +68,7 @@ window.FwHubAttention = function (ctx) {
       // turn that ended asking for it needs nobody.
       const snap = agent.status === "done" && ctx.telemetryOf ? ctx.telemetryOf(session.id) : null;
       if (snap && snap.continued_by) continue;
-      const ask = agent.status === "done" ? askOf(session) : null;
+      const ask = agent.status === "done" ? askOf(session, agent) : null;
       out.push({ session, agent, ask, level: agent.status === "blocked" ? 0 : ask ? 1 : 2 });
     }
     const time = (e) => (e.ask ? e.ask.since : Date.parse(e.agent.since)) || 0;
@@ -633,7 +651,7 @@ window.FwHubAttention = function (ctx) {
         "button",
         {
           type: "button",
-          className: `attn-row ${ask ? "asking" : agent.status}${active ? " active" : ""}`,
+          className: `attn-row ${ask ? "asking" : agent.state}${active ? " active" : ""}`,
           dataset: { id: session.id },
           "aria-current": active ? "true" : undefined,
           onclick: () => openSession(session.id),
@@ -656,16 +674,13 @@ window.FwHubAttention = function (ctx) {
           ),
           el("span", {
             className: "attn-detail",
-            textContent: agent.status === "blocked"
-              ? (agent.detail || "waiting on you")
-              : ask ? ask.text : "finished its turn",
-            title: ask ? ask.text : "",
-          }),
+            title: ask ? ask.text : agent.detail || "",
+          }, needLine(session, agent, ask)),
         ),
         el(
           "span",
           { className: "attn-meta" },
-          el("span", { className: `attn-status ${ask ? "asking" : agent.status}`, textContent: ask ? ASK_WORD[ask.kind] || "asks" : agent.status }),
+          el("span", { className: `attn-status ${ask ? "asking" : agent.state}`, textContent: ask ? ASK_WORD[ask.kind] || "asks" : agent.state }),
           el("span", { className: "attn-age", textContent: age(ask ? new Date(ask.since).toISOString() : agent.since) }),
         ),
       ),

@@ -142,6 +142,7 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
     ("launcher.js", include_bytes!("../web/launcher.js"), JS),
     ("review.js", include_bytes!("../web/review.js"), JS),
     ("explain.js", include_bytes!("../web/explain.js"), JS),
+    ("legend.js", include_bytes!("../web/legend.js"), JS),
     ("layout.js", include_bytes!("../web/layout.js"), JS),
     ("machines.js", include_bytes!("../web/machines.js"), JS),
     ("panes.js", include_bytes!("../web/panes.js"), JS),

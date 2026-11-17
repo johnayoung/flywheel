@@ -12,7 +12,7 @@ use crate::git;
 use crate::pty::{ExitInfo, PtySession, SpawnSpec};
 use crate::report;
 use crate::state::{SessionRecord, SessionState, StateError, new_id, validate_name};
-use crate::status::{Audience, Signal, StatusSource};
+use crate::status::{Signal, StatusSource};
 use chrono::Utc;
 use std::path::PathBuf;
 use std::sync::{Arc, PoisonError, Weak};
@@ -59,7 +59,7 @@ impl Hub {
         });
         let agent = record
             .runs_agent()
-            .then(|| self.board().status(&record.id, Audience::Anyone))
+            .then(|| self.agent_status(&record.id))
             .flatten();
         let git = self.git.get(&badge_key(&record));
         let usage = self

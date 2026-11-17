@@ -128,6 +128,10 @@ function age(iso) {
   return Number.isFinite(seconds) ? span(seconds) : "";
 }
 
+// A span of `ms` milliseconds, and how long ago unix-ms `ts` was.
+const ageMs = (ms) => span(Math.max(0, ms) / 1000);
+const sinceMs = (ts) => (ts ? ageMs(Date.now() - ts) : "");
+
 function iconButton(id, title, onclick, danger) {
   return el(
     "button",
@@ -285,15 +289,29 @@ function orderedSessions() {
 // scrollback), in rail order: what Alt+1..9 and Alt+Up/Down reach.
 const attachable = () => orderedSessions().filter((s) => s.live);
 
-// A running agent's status, as pushed for this client.
+// A running agent's state, as the hub works it out for this client (one
+// state for every surface: status.rs shown_state), most urgent first.
 const AGENT_LOOK = {
-  working: { dot: "working", label: "working", tone: "live" },
   blocked: { dot: "blocked", label: "blocked", tone: "bad" },
-  // Telemetry's: the turn ended asking the operator (attention.js).
-  asking: { dot: "blocked", label: "asking", tone: "bad" },
+  // The turn ended asking the operator (attention.js says what).
+  asking: { dot: "asking", label: "asking", tone: "bad" },
+  compacting: { dot: "compacting", label: "compacting", tone: "live" },
+  working: { dot: "working", label: "working", tone: "live" },
+  failed: { dot: "bad", label: "failed", tone: "bad" },
+  // The turn is over; subagents it started still run.
+  background: { dot: "background", label: "background", tone: "live" },
   done: { dot: "agent-done", label: "done", tone: "brass" },
-  idle: { dot: "idle", label: "idle", tone: "" },
+  idle: { dot: "idle", label: "resting", tone: "" },
 };
+// What each state counts as where only blocked, working, done, and idle
+// are told apart (Needs you, Moving, tab and rail markers).
+const AGENT_COARSE = {
+  blocked: "blocked", asking: "done", compacting: "working", working: "working",
+  failed: "done", background: "working", done: "done", idle: "idle",
+};
+// A moving agent with no event for this long reads "quiet": an age, not
+// a guess that it is stuck.
+const QUIET_MS = 5 * 60 * 1000;
 
 // A session this hub can reach now: its own, or one on a machine that
 // is not offline or refusing this hub (an unreachable machine's lists
@@ -303,25 +321,59 @@ const reachable = (session) => !session.machine || machines.reachable(session.ma
 // an exited session keeps its `live` record.
 const runningNow = (session) => !!session.live && session.state === "running" && reachable(session);
 
-// Compacting its context, per its telemetry. Claude compacts before the
-// prompt that set it off is reported, so the agent is busy while its
-// status still says its last turn finished (a minute or two). A
-// compaction whose end never came stops counting after COMPACT_STALE_MS.
-const COMPACT_STALE_MS = 10 * 60 * 1000;
-function compactingNow(session) {
-  const t = sessionTelemetry.get(session.id);
-  return !!(t && t.compacting && Date.now() - t.compacting < COMPACT_STALE_MS);
-}
-
+// A running agent's pushed status: `state` what it shows, `status` what
+// that counts as (AGENT_COARSE). A hub too old to say its state shows its
+// status.
 function agentStatus(session) {
   if (session.kind === "shell" || session.state !== "running" || !session.live) return null;
   if (!reachable(session)) return null;
   const pushed = state.agent[session.id];
-  if (!pushed || !AGENT_LOOK[pushed.status]) return null;
-  if ((pushed.status === "done" || pushed.status === "idle") && compactingNow(session)) {
-    return { ...pushed, status: "working", detail: "compacting context" };
+  if (!pushed) return null;
+  const shown = AGENT_LOOK[pushed.state] ? pushed.state : pushed.status;
+  if (!AGENT_LOOK[shown]) return null;
+  return { ...pushed, state: shown, status: AGENT_COARSE[shown] };
+}
+
+// What a moving agent is doing, said one way on every surface:
+// `what` (a tool, "thinking", "compacting context", "turn done"), `count`
+// (a background's agents), `more` (said quieter), `age`. Null when its
+// state says it all.
+function doingOf(session, agent) {
+  const t = sessionTelemetry.get(session.id);
+  if (!agent || !t) return null;
+  const call = (c) => (c.summary ? `${c.name} ${c.summary}` : c.name);
+  if (agent.state === "working") {
+    if (t.tool) return { what: t.tool.name, more: t.tool.summary || "", age: sinceMs(t.tool.since) };
+    if (t.last_call) return { what: "thinking", more: `after ${call(t.last_call)}`, age: sinceMs(t.last_call.since) };
+    return { what: "thinking", more: t.turn_title || "", age: sinceMs(t.turn_started) };
   }
-  return pushed;
+  if (agent.state === "compacting") {
+    const pct = t.context ? `${t.context.exact === false ? "~" : ""}${Math.round(t.context.pct)}% used` : "";
+    return { what: "compacting context", more: pct, age: sinceMs(t.compacting || t.since) };
+  }
+  if (agent.state === "background") {
+    const n = t.background || 0;
+    return { what: "turn done", count: n ? `${n} agent${n === 1 ? "" : "s"}` : "", more: "still running", age: sinceMs(t.since) };
+  }
+  return null;
+}
+
+// The session a finished agent's work went on in (its handoff accepted):
+// it rests, its turn needs nobody.
+function handedTo(session, agent) {
+  if (!agent || (agent.state !== "idle" && agent.state !== "done")) return null;
+  const t = sessionTelemetry.get(session.id);
+  if (!t || !t.continued_by) return null;
+  const next = sessionById(t.continued_by);
+  return next ? next.name : String(t.continued_by).slice(0, 8);
+}
+
+// How long a moving agent has said nothing (0: it has, or is not moving).
+function quietFor(session, agent) {
+  if (!agent || agent.status !== "working") return 0;
+  const t = sessionTelemetry.get(session.id);
+  const quiet = t && t.last_ts ? Date.now() - t.last_ts : 0;
+  return quiet >= QUIET_MS ? quiet : 0;
 }
 
 // The record's own state, kept across hub restarts (a session without a
@@ -339,12 +391,18 @@ function statusLook(session) {
   }
   const agent = agentStatus(session);
   if (agent) {
-    const look = AGENT_LOOK[agent.status];
-    return {
-      ...look,
-      detail: agent.detail || "",
-      title: agent.detail ? `${look.label}: ${agent.detail}` : look.label,
-    };
+    const look = AGENT_LOOK[agent.state];
+    const quiet = quietFor(session, agent);
+    const title = agent.detail ? `${look.label}: ${agent.detail}` : look.label;
+    if (quiet) {
+      const label = `quiet ${ageMs(quiet)}`;
+      return { dot: "quiet", label, tone: "quiet", state: agent.state, quiet, detail: agent.detail || "", title: `${title}, no event for ${ageMs(quiet)}` };
+    }
+    const handed = handedTo(session, agent);
+    if (handed) {
+      return { dot: "handed", label: "handed off", tone: "", state: agent.state, quiet: 0, detail: "", title: `handed off to ${handed}` };
+    }
+    return { ...look, state: agent.state, quiet: 0, detail: agent.detail || "", title };
   }
   // A worker session whose worker exited is its shell now: say how the
   // worker ended (a scoped run's 0 = every named task verified, 2 = refused).
@@ -706,7 +764,16 @@ const review = window.FwHubReview({
   pr: () => pullRequests,
 });
 // The "why?" beside the status pill (explain.js).
-const explain = window.FwHubExplain({ $, el, api, allowAlways: (id) => perms.allowFor(id) });
+// The state legend (legend.js): in "why?", and from the sidebar.
+const legend = window.FwHubLegend({ el });
+const explain = window.FwHubExplain({
+  $, el, api, legend,
+  allowAlways: (id) => perms.allowFor(id),
+  lookOf: (id) => {
+    const session = sessionById(id);
+    return session ? statusLook(session) : null;
+  },
+});
 // Search across sessions (search.js): scrollback, transcripts, commands.
 const search = window.FwHubSearch({
   $, el, icon, api, rawApi, machines, state, sessionById, workspaceById, age, glyphFor,
@@ -794,6 +861,14 @@ const work = window.FwHubWork({
   $, el, morph, icon, rawApi, span, state, sessionById, workspaceById, isAgent, store,
   toast: (...args) => commands.toast(...args),
   agentLook: AGENT_LOOK,
+  // The state this hub shows for one of its own sessions (the sidebar's,
+  // header's, and Needs you's), else null: another hub's, or not running.
+  shownOf: (snap) => {
+    const own = snap && sessionTelemetry.get(snap.session);
+    const session = own && own.host === snap.host ? sessionById(snap.session) : null;
+    const agent = session ? agentStatus(session) : null;
+    return agent ? { state: agent.state, look: statusLook(session) } : null;
+  },
   machinePrefix: (machine) => machines.prefix(machine),
   focusTerminal: () => focusTerminal(),
   onOpen: () => closeOverlays("work"),
@@ -861,6 +936,7 @@ function shownOfTelemetry(t) {
   if (!t) return "";
   const ctx = t.context && t.context.pct >= 80 ? Math.round(t.context.pct) : 0;
   return JSON.stringify([t.status, t.ask, t.continued_by, t.plan, t.tool && [t.tool.name, t.tool.summary],
+    t.last_call && [t.last_call.name, t.last_call.summary], t.background, t.blocked_tool,
     t.turn_title, ctx, t.context && t.context.exact, t.compacting]);
 }
 

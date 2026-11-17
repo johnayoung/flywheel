@@ -49,17 +49,18 @@ Replaces the hub process **ending no session**: same pids, screens, scrollback, 
 
 | Status | Meaning | Claude Code | Codex |
 |---|---|---|---|
-| `working` | busy (UI: compacting too) | `UserPromptSubmit`, `PreToolUse`, `PostToolUse[Failure]` (a subagent's after `Stop`: no change) | screen: `Working (12s • esc to interrupt)` |
+| `working` | busy | `UserPromptSubmit`, `PreToolUse`, `PostToolUse[Failure]` (not a subagent's after `Stop`) | screen: `Working (12s • esc to interrupt)` |
 | `blocked` | waits on a person | `PermissionRequest`; `Notification` permission / elicitation / `agent_needs_input`; screen: a known dialog 3 s unhooked | screen: approvals, `request_user_input`, folder trust |
 | `done` | finished a turn **this client** has not viewed | `Stop`, `StopFailure` | `notify` `agent-turn-complete` |
 | `idle` | seen, or waiting for a first prompt | `SessionStart`; viewed `done`; `idle_prompt` while working | viewed `done`; screen: the composer (`›`) |
 | `unknown` | no signal, or agent ended | `SessionEnd`, exit | exit; status line frozen 5 s; no rule matches 3 s |
 
+- **Shown** (`state`, the UI): adds `asking`, `compacting`, `failed`, `background` (subagents outlive the turn).
 - **Idle is not authorization**: an unknown prompt is idle or unknown.
 - Hook / `notify` reports win; screen rules fill gaps. Esc fires no Claude hook: a seen turn at the prompt 3 s is `idle`, a dialog closing onto a running turn `working`.
-- Seen is per client id (REST: anyone): a visible, focused page used in 5 min; a turn watched from its start, to 30 min.
-- Rollup: a workspace's most urgent session, blocked > working > done > idle. Fan-out candidates roll up `idle` until a pick; an unseen grading is one `done`.
-- Claude: `--session-id <uuid>` (`agent_session_id`, follows `/clear`), hooks via `--settings` (merged with yours) POSTing to the hub, or running `<this binary> hub report` ([hub-workflows](workflows.md#fleet-and-work)). Codex: `-c notify=[<this binary> hub report --source codex --event notify]`; `thread-id` is `agent_session_id`.
+- Seen is per client id (REST: anyone): a visible, focused page used in 5 min; a turn watched from start, to 30 min.
+- Rollup: a workspace's most urgent shown session, blocked > working > done > idle. Fan-out candidates roll up `idle` until a pick; an unseen grading is one `done`.
+- Claude: `--session-id <uuid>` (`agent_session_id`, follows `/clear`), hooks via `--settings` (merged with yours) POST to the hub or run `<this binary> hub report` ([hub-workflows](workflows.md#fleet-and-work)). Codex: `-c notify=[<this binary> hub report --source codex --event notify]`; `thread-id` is `agent_session_id`.
 
 ## Detection manifests
 
@@ -119,7 +120,7 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
 `fw hub record start|stop SESSION` (or the `rec` pill); `fw hub record get NAME -o demo.cast; asciinema play demo.cast`.
 
-- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after falling behind, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on the prior part's last screen; `recordings.dir_cap` deletes the oldest finished.
+- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after lag, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on its last screen; `recordings.dir_cap` deletes the oldest finished.
 - Ends on stop, exit, relaunch, hub stop; `upgrade` continues the file. An active one is not deleted (409).
 - `/replay#<name>`: seek with marker ticks, 0.5-8x, idle gaps cut to 2 s, follows parts.
 

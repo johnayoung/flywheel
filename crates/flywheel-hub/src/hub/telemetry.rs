@@ -343,11 +343,18 @@ impl Hub {
             .sessions
             .into_iter()
             .zip(known)
-            .map(|(snap, mut known)| {
-                if snap.host == own {
-                    known.seen = self
-                        .agent_status(&snap.session)
-                        .map(|view| view.status == crate::status::AgentStatus::Idle);
+            .map(|(mut snap, mut known)| {
+                if snap.host == own
+                    && let Some(view) = self.agent_status(&snap.session)
+                {
+                    known.seen = Some(view.status == crate::status::AgentStatus::Idle);
+                    // The state its own hub shows (a dialog or an Esc the
+                    // screen saw), not telemetry's alone; at rest, telemetry
+                    // tells a finished turn from none and `seen` the rest.
+                    use crate::status::State;
+                    if !matches!(view.state, State::Done | State::Idle | State::Unknown) {
+                        view.state.as_str().clone_into(&mut snap.status);
+                    }
                 }
                 (snap, known)
             })

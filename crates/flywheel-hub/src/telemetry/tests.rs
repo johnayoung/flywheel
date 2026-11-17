@@ -1798,14 +1798,15 @@ fn a_compaction_under_way_shows_until_it_ends() {
     );
     let snap = telemetry.snapshot("s").unwrap();
     assert_eq!(
-        (snap.status.as_str(), snap.compacting),
-        ("done", Some(start + 2000))
+        (snap.status.as_str(), snap.since, snap.compacting),
+        ("compacting", start + 2000, Some(start + 2000))
     );
     telemetry.record(
         "s",
         claude::hook("PostCompact", &json!({"trigger": "auto"}), start + 9000),
     );
-    assert_eq!(telemetry.snapshot("s").unwrap().compacting, None);
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!((snap.status.as_str(), snap.compacting), ("done", None));
 }
 
 #[test]
@@ -1828,4 +1829,180 @@ fn a_subagents_call_does_not_answer_its_sessions_prompt() {
         ],
     );
     assert_eq!(telemetry.snapshot("s").unwrap().status, "blocked");
+}
+
+#[test]
+fn subagents_that_outlive_their_turn_show_as_background_until_the_last_ends() {
+    let (_dir, telemetry) = open();
+    let start = recent();
+    hooks(
+        &telemetry,
+        "s",
+        start,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "research"})),
+            (
+                "PreToolUse",
+                json!({"tool_name": "Agent", "tool_use_id": "t1",
+                       "tool_input": {"subagent_type": "Explore", "run_in_background": true}}),
+            ),
+            (
+                "SubagentStart",
+                json!({"agent_id": "ag1", "agent_type": "Explore"}),
+            ),
+            (
+                "PostToolUse",
+                json!({"tool_name": "Agent", "tool_use_id": "t1"}),
+            ),
+            ("Stop", json!({})),
+            (
+                "PreToolUse",
+                json!({"tool_name": "Read", "tool_use_id": "r1", "agent_id": "ag1"}),
+            ),
+        ],
+    );
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!(
+        (
+            snap.status.as_str(),
+            snap.since,
+            snap.background,
+            snap.turns
+        ),
+        ("background", start + 4000, 1, 1)
+    );
+    telemetry.record(
+        "s",
+        claude::hook("SubagentStop", &json!({"agent_id": "ag1"}), start + 9000),
+    );
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!((snap.status.as_str(), snap.background), ("done", 0));
+}
+
+#[test]
+fn an_unannounced_subagents_call_after_the_turn_is_background_not_a_turn() {
+    let (_dir, telemetry) = open();
+    hooks(
+        &telemetry,
+        "s",
+        recent(),
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            ("Stop", json!({})),
+            (
+                "PreToolUse",
+                json!({"tool_name": "Read", "tool_use_id": "r1", "agent_id": "ag9"}),
+            ),
+        ],
+    );
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!(
+        (snap.status.as_str(), snap.turns, snap.background),
+        ("background", 1, 1)
+    );
+}
+
+#[test]
+fn an_interrupted_spawn_takes_its_subagent_down() {
+    let (_dir, telemetry) = open();
+    hooks(
+        &telemetry,
+        "s",
+        recent(),
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            (
+                "PreToolUse",
+                json!({"tool_name": "Agent", "tool_use_id": "t1"}),
+            ),
+            ("SubagentStart", json!({"agent_id": "ag1"})),
+            (
+                "PostToolUseFailure",
+                json!({"tool_name": "Agent", "tool_use_id": "t1", "is_interrupt": true}),
+            ),
+        ],
+    );
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!((snap.status.as_str(), snap.background), ("done", 0));
+}
+
+#[test]
+fn between_calls_the_last_one_shows_what_it_thinks_over() {
+    let (_dir, telemetry) = open();
+    let start = recent();
+    hooks(
+        &telemetry,
+        "s",
+        start,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            (
+                "PreToolUse",
+                json!({"tool_name": "Read", "tool_use_id": "r1",
+                       "tool_input": {"file_path": "/src/api.rs"}}),
+            ),
+            (
+                "PostToolUse",
+                json!({"tool_name": "Read", "tool_use_id": "r1"}),
+            ),
+        ],
+    );
+    let snap = telemetry.snapshot("s").unwrap();
+    let last = snap.last_call.expect("a last call between calls");
+    assert_eq!((last.name.as_str(), last.since), ("Read", start + 2000));
+    assert!(snap.tool.is_none());
+    // A call running: that call, not the last one.
+    telemetry.record(
+        "s",
+        claude::hook(
+            "PreToolUse",
+            &json!({"tool_name": "Bash", "tool_use_id": "b1"}),
+            start + 3000,
+        ),
+    );
+    assert!(telemetry.snapshot("s").unwrap().last_call.is_none());
+    // The turn over: none.
+    telemetry.record("s", claude::hook("Stop", &json!({}), start + 4000));
+    assert!(telemetry.snapshot("s").unwrap().last_call.is_none());
+}
+
+#[test]
+fn a_subagent_id_seen_again_finishes_its_newest_run() {
+    let (_dir, telemetry) = open();
+    let run = [
+        ("UserPromptSubmit", json!({"prompt": "review"})),
+        ("SubagentStart", json!({"agent_id": "ag1"})),
+        ("Stop", json!({})),
+        ("SubagentStop", json!({"agent_id": "ag1"})),
+    ];
+    hooks(&telemetry, "s", recent(), &run);
+    hooks(&telemetry, "s", recent() + 10_000, &run);
+    let snap = telemetry.snapshot("s").unwrap();
+    assert_eq!((snap.status.as_str(), snap.background), ("done", 0));
+}
+
+#[test]
+fn what_refines_a_shown_state_is_read_back_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+        hooks(
+            &telemetry,
+            "s",
+            recent(),
+            &[
+                ("UserPromptSubmit", json!({"prompt": "pick one"})),
+                (
+                    "Stop",
+                    json!({"last_assistant_message": "Which parser API do you want?"}),
+                ),
+            ],
+        );
+        telemetry.stop();
+    }
+    let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+    assert!(telemetry.snapshot("s").is_none(), "not in memory yet");
+    let got = telemetry.refinements(&["s", "never-reported"]);
+    assert_eq!(got.len(), 1);
+    assert_eq!((got["s"].0, got["s"].2), ("asking", false));
 }

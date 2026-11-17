@@ -286,6 +286,10 @@ pub struct SessionState {
     compacting: Option<i64>,
     #[serde(default)]
     subagents: u32,
+    /// The main agent's last finished call in the running turn (what it
+    /// thinks over between calls).
+    #[serde(default)]
+    last_call: Option<ToolNow>,
     /// Numbers plan items declared without ids.
     #[serde(default)]
     next_item: u32,
@@ -335,10 +339,13 @@ pub struct Snapshot {
     /// The session that took its work over (its handoff accepted).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_by: Option<String>,
-    /// `working`, `blocked` (a harness dialog waits on a person),
-    /// `asking` (the last turn ended asking the operator something: see
-    /// `ask`), `done` (awaiting the next prompt), `failed` (the last turn
-    /// ended on an error), `idle` (no turn yet), `ended`.
+    /// Most urgent first: `ended`; `blocked` (a harness dialog waits on
+    /// a person); `compacting` (its context is being compacted); `working`
+    /// (a turn runs); `asking` (the last turn ended asking the operator
+    /// something: see `ask`); `failed` (the last turn ended on an error);
+    /// `background` (the turn is over, subagents it started still run:
+    /// see `background`); `done` (awaiting the next prompt); `idle` (no
+    /// turn yet).
     pub status: String,
     /// Since when it has been in that status.
     pub since: i64,
@@ -373,6 +380,13 @@ pub struct Snapshot {
     /// Subagents of the running (else last) turn: running, and all.
     pub subagents_active: u32,
     pub subagents_total: u32,
+    /// Subagents running from any turn (the ones a finished turn left
+    /// running in the background).
+    #[serde(default)]
+    pub background: u32,
+    /// Between the main agent's calls: its last finished call this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_call: Option<ToolNow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Context>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -535,8 +549,12 @@ impl SessionState {
                 }
                 if conversation.is_some() {
                     if *conversation != self.conversation {
-                        // Another conversation (`/clear`): asks nothing.
+                        // Another conversation (`/clear`): asks nothing,
+                        // and the old one's subagents are gone.
                         self.ask = None;
+                        if self.conversation.is_some() {
+                            self.finish_subagents(ts);
+                        }
                     }
                     self.conversation = conversation.clone();
                 }
@@ -595,6 +613,7 @@ impl SessionState {
                     event.work = Some(running);
                     return;
                 }
+                self.last_call = None;
                 event.work = Some(self.start_turn(ts, title));
             }
             What::TurnFinished { ending } => {
@@ -680,7 +699,7 @@ impl SessionState {
                 name,
                 outcome,
                 duration_ms,
-                summary: _,
+                summary: call_summary,
                 error,
                 tokens,
             } => {
@@ -733,7 +752,9 @@ impl SessionState {
                     if tokens.is_some() {
                         item.tokens = *tokens;
                     }
-                    if item.agent.is_none() && item.status == WorkStatus::Active {
+                    // An interrupted call took its subagent down with it.
+                    let gone = item.agent.is_none() || *outcome == Outcome::Interrupted;
+                    if gone && item.status == WorkStatus::Active {
                         item.status = if *outcome == Outcome::Ok {
                             WorkStatus::Done
                         } else {
@@ -741,6 +762,13 @@ impl SessionState {
                         };
                         item.finished = Some(ts);
                     }
+                }
+                if agent.is_none() && self.turn.is_some() {
+                    self.last_call = Some(ToolNow {
+                        name: name.clone(),
+                        summary: call_summary.clone(),
+                        since: ts,
+                    });
                 }
                 event.work = Some(work);
                 if interrupted {
@@ -800,33 +828,17 @@ impl SessionState {
                 event.work = Some(match claimed {
                     Some(work) => work,
                     None => {
-                        let parent = self.work_of(None, ts);
-                        self.subagents += 1;
-                        let work = format!("a:{id}");
-                        self.push_work(WorkItem {
-                            id: work.clone(),
-                            parent: Some(parent),
-                            source: WorkSource::Subagent,
-                            title: kind.clone().unwrap_or_else(|| "subagent".to_owned()),
-                            status: WorkStatus::Active,
-                            agent: Some(id.clone()),
-                            kind: kind.clone(),
-                            started: ts,
-                            finished: None,
-                            tools: 0,
-                            tool_errors: 0,
-                            tool_ms: 0,
-                            tokens: None,
-                            doing: None,
-                        });
-                        work
+                        let kind = kind.clone();
+                        self.adopt_subagent(id, kind.as_ref(), ts)
                     }
                 });
             }
             What::SubagentFinished { id } => {
+                // Its newest item: an id seen again is a new run.
                 if let Some(item) = self
                     .work
                     .iter_mut()
+                    .rev()
                     .find(|item| item.agent.as_deref() == Some(id))
                 {
                     if item.status == WorkStatus::Active {
@@ -1025,10 +1037,49 @@ impl SessionState {
     /// the running turn (one is begun when events arrive without a prompt:
     /// the hub started watching mid-turn).
     fn work_of(&mut self, agent: Option<&str>, ts: i64) -> String {
-        match self.existing_work_of(agent) {
-            Some(work) => work,
-            None => self.start_turn(ts, ""),
+        match (self.existing_work_of(agent), agent) {
+            (Some(work), _) => work,
+            // A subagent nobody reported started, calling after its turn
+            // ended: one left running in the background, not a new turn.
+            (None, Some(agent)) if self.turns > 0 => self.adopt_subagent(agent, None, ts),
+            (None, _) => self.start_turn(ts, ""),
         }
+    }
+
+    /// A work item for subagent `agent` no spawning call claimed, under
+    /// the running (else last) turn.
+    fn adopt_subagent(&mut self, agent: &str, kind: Option<&String>, ts: i64) -> String {
+        let parent = match self.existing_work_of(None) {
+            Some(turn) => turn,
+            None => match self
+                .work
+                .iter()
+                .rev()
+                .find(|item| item.source == WorkSource::Turn)
+            {
+                Some(turn) => turn.id.clone(),
+                None => self.start_turn(ts, ""),
+            },
+        };
+        self.subagents += 1;
+        let work = format!("a:{agent}");
+        self.push_work(WorkItem {
+            id: work.clone(),
+            parent: Some(parent),
+            source: WorkSource::Subagent,
+            title: kind.cloned().unwrap_or_else(|| "subagent".to_owned()),
+            status: WorkStatus::Active,
+            agent: Some(agent.to_owned()),
+            kind: kind.cloned(),
+            started: ts,
+            finished: None,
+            tools: 0,
+            tool_errors: 0,
+            tool_ms: 0,
+            tokens: None,
+            doing: None,
+        });
+        work
     }
 
     fn item_mut(&mut self, id: &str) -> Option<&mut WorkItem> {
@@ -1174,23 +1225,51 @@ impl SessionState {
         }
     }
 
-    /// The session on the fleet board.
-    pub fn snapshot(&self) -> Snapshot {
-        let (status, since) = if self.ended {
+    /// Subagents running from any turn.
+    fn background(&self) -> u32 {
+        self.work
+            .iter()
+            .filter(|item| item.source == WorkSource::Subagent && item.status == WorkStatus::Active)
+            .count() as u32
+    }
+
+    /// What it adds to the state its hub shows: its status, and whether
+    /// what it asks was declared.
+    pub fn refinement(&self) -> (&'static str, i64, bool) {
+        let (status, since) = self.status();
+        let declared = self.ask.as_ref().is_some_and(|a| a.source == "declared");
+        (status, since, declared)
+    }
+
+    /// Its status ([`Snapshot::status`]) and since when.
+    pub fn status(&self) -> (&'static str, i64) {
+        let background = self.background();
+        let rested = self.idle_since.unwrap_or(self.last_ts);
+        if self.ended {
             ("ended", self.last_ts)
         } else if let Some(wait) = &self.wait {
             ("blocked", wait.since)
+        } else if let Some(at) = self.compacting {
+            ("compacting", at)
         } else if let Some(turn) = self.turn.as_deref().and_then(|id| self.item(id)) {
             ("working", turn.started)
         } else if let Some(ask) = &self.ask {
             ("asking", ask.since)
         } else if self.last_turn_failed {
-            ("failed", self.idle_since.unwrap_or(self.last_ts))
+            ("failed", rested)
+        } else if background > 0 {
+            ("background", rested)
         } else if self.turns > 0 {
-            ("done", self.idle_since.unwrap_or(self.last_ts))
+            ("done", rested)
         } else {
             ("idle", self.started.unwrap_or(self.last_ts))
-        };
+        }
+    }
+
+    /// The session on the fleet board.
+    pub fn snapshot(&self) -> Snapshot {
+        let (status, since) = self.status();
+        let background = self.background();
         let turn = self
             .turn
             .as_deref()
@@ -1258,6 +1337,13 @@ impl SessionState {
                 .filter(|item| item.status == WorkStatus::Active)
                 .count() as u32,
             subagents_total: subagents.len() as u32,
+            background,
+            last_call: self
+                .turn
+                .is_some()
+                .then(|| self.last_call.clone())
+                .flatten()
+                .filter(|_| tool.is_none_or(|o| o.agent.is_some())),
             context: self.context.clone(),
             usage: self.usage.clone(),
             rate: self.rate.clone(),

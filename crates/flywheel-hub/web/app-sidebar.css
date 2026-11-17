@@ -215,6 +215,19 @@ body.list-hidden .side-list { display: none; }
   color: var(--ink-3);
 }
 .list-group-n { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+/* What each state means (legend.js): a quiet word at the heading's end. */
+.list-group-legend {
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+.list-group-legend:hover, .list-group-legend[aria-expanded="true"] { color: var(--signal); }
 .list-group.fold { cursor: pointer; }
 .list-group.fold:hover { color: var(--ink-2); }
 .list-group .chev { align-self: center; display: inline-grid; transition: transform .2s var(--ease); }
@@ -425,6 +438,7 @@ body.list-hidden .side-list { display: none; }
 .session-state.bad { color: var(--alert); }
 .session-state.live { color: var(--signal); }
 .session-state.brass { color: var(--brass); font-weight: 700; }
+.session-state.quiet { color: var(--brass); font-weight: 700; }
 
 /* A blocked agent wants a person: an alert tick on the row's edge. */
 .session.needs-you::after {
@@ -468,6 +482,9 @@ body.list-hidden .side-list { display: none; }
 .session-progress .prog-bar { flex: 0 0 2.6rem; }
 .session-progress .prog-bar i { background: var(--signal); }
 .session-progress b { flex: none; font-weight: 600; font-variant-numeric: tabular-nums; }
+/* What a step says quieter: a call's argument, "still running". */
+.session-step .muted { color: var(--ink-3); }
+.session-step b { color: var(--signal); }
 .session-progress .session-step { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-progress .session-step.tool { color: var(--ink-3); }
 .session-progress .session-ctx { flex: none; color: var(--alert); }
@@ -541,11 +558,29 @@ body.list-hidden .side-list { display: none; }
 .session:hover .dot.agent-done { box-shadow: 0 0 0 2px var(--bg-3), 0 0 0 3.5px var(--brass); }
 .session.active .dot.agent-done { box-shadow: 0 0 0 2px var(--bg-4), 0 0 0 3.5px var(--brass); }
 .dot.idle { background: transparent; border: 1.5px solid var(--ink-2); }
+/* Background: the turn is over, agents it started still run: a hollow
+   dot with a slow sweep. Compacting: a dimmed dot, a dashed ring. Asking:
+   the alert, round. Quiet: no event a while (brass). Handed off: hollow. */
+.dot.background { background: transparent; border: 1.5px solid var(--signal); }
+.dot.background::after, .dot.compacting::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1.5px solid transparent;
+  pointer-events: none;
+}
+.dot.background::after { border-top-color: var(--signal); opacity: .7; animation: sweep 2.4s linear infinite; }
+.dot.compacting { background: color-mix(in srgb, var(--signal) 55%, transparent); }
+.dot.compacting::after { border: 1.5px dashed var(--signal); animation: sweep 3s linear infinite; }
+.dot.asking { background: var(--alert); }
+.dot.quiet { background: var(--brass); }
+.dot.handed { background: transparent; border: 1.5px solid var(--ink-3); }
 
 @keyframes sweep { to { transform: rotate(360deg); } }
 
 @media (prefers-reduced-motion: reduce) {
-  .dot.working::after, .ws-status.blocked, .session.needs-you::after, .agent-pill.working::before { animation: none; }
+  .dot.working::after, .dot.background::after, .dot.compacting::after, .ws-status.blocked, .session.needs-you::after, .agent-pill.working::before { animation: none; }
 }
 .dot.bad { background: var(--alert); }
 .dot.stopped, .dot.gone { background: transparent; border: 1.5px solid var(--ink-3); }

@@ -2,11 +2,12 @@
 // a popover with GET /api/sessions/{id}/explain: what set the status (a
 // hook, a detection manifest rule, a heuristic), the rule the live screen
 // matches now with its evidence lines, every rule tried, and the note
-// that idle is not authorization. app-base.js creates it with its helpers.
+// that idle is not authorization; then the state legend, the session's
+// state marked (legend.js). app-base.js creates it with its helpers.
 "use strict";
 
 window.FwHubExplain = function (ctx) {
-  const { $, el, api, allowAlways } = ctx;
+  const { $, el, api, allowAlways, legend, lookOf } = ctx;
 
   const button = $("#crumb-why");
   const pop = el("div", { className: "why-pop", id: "why-pop", role: "dialog", "aria-label": "Why this status" });
@@ -42,7 +43,8 @@ window.FwHubExplain = function (ctx) {
   }
 
   function draw(data) {
-    const status = data.status ? data.status.status : "none";
+    const status = data.status ? data.status.state || data.status.status : "none";
+    const here = legend && view.session ? legend.keyOf(lookOf(view.session)) : "";
     const manifest = data.manifest || {};
     const origin = manifest.origin === "override" ? `override ${manifest.path}` : "bundled";
     const screen = data.screen;
@@ -72,6 +74,9 @@ window.FwHubExplain = function (ctx) {
       rules.length ? el("details", { className: "why-rules" }, el("summary", {}, `${rules.length} rules, in order`), el("ol", {}, rules)) : null,
       problems.length ? el("div", { className: "why-problems" }, el("b", {}, "overrides not in force"), el("ul", {}, problems)) : null,
       el("p", { className: "why-note" }, data.note || ""),
+      legend && data.status
+        ? el("div", { className: "why-legend" }, el("span", { className: "why-key", textContent: "states, most urgent first" }), legend.table(here))
+        : null,
       // Blocked on a permission (not a question or a trust dialog: the
       // quick-answer bar's own test): write the narrowest rule (perms.js).
       status === "blocked" && allowAlways && view.session &&
@@ -93,7 +98,7 @@ window.FwHubExplain = function (ctx) {
 
   // Under the button, anchored to it.
   function place() {
-    window.FwHubFmt.placeUnder(pop, button, 440);
+    window.FwHubFmt.placeUnder(pop, button, 720);
   }
 
   function schedule() {
@@ -164,7 +169,7 @@ window.FwHubExplain = function (ctx) {
       close();
     }
     if (!agent) return;
-    button.title = `Why ${agent.status}? (what set it, what the screen shows)`;
+    button.title = `Why ${agent.state || agent.status}? (what set it, what the screen shows, what each state means)`;
     const stamp = `${agent.status} ${agent.since}`;
     if (stamp !== view.stamp) {
       view.stamp = stamp;

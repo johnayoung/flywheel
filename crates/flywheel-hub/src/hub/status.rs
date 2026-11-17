@@ -7,11 +7,17 @@ use crate::detect::Detection;
 use crate::detect::tracker::{Look, ScreenTracker};
 use crate::pty::{PtySession, SessionEvent};
 use crate::report::Report;
-use crate::status::{AgentStatus, Audience, Graded, Signal, Snapshot, StatusSource, StatusView};
+use crate::status::{
+    AgentStatus, Audience, Graded, Refinement, Refinements, Signal, Snapshot, StatusSource,
+    StatusView,
+};
 use crate::vt::TextSource;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Notify, broadcast};
+
+/// A compaction whose end never came stops counting after this (ms).
+const COMPACT_STALE_MS: i64 = 10 * 60 * 1000;
 
 /// What one session event means to a screen monitor.
 enum Seen {
@@ -56,7 +62,7 @@ pub(super) struct StatusAt {
 impl StatusAt {
     fn of(board: &crate::status::StatusBoard, id: &str) -> Self {
         Self {
-            view: board.status(id, Audience::Anyone),
+            view: board.status(id, Audience::Anyone, None),
             turn: board.alert(id).map(|a| (a.status, a.spell)),
         }
     }
@@ -279,8 +285,9 @@ impl Hub {
             name: record.name.clone(),
         });
         if record.kind.is_agent() {
+            let refine = self.refinements(Some(id)).remove(id);
             let board = self.board();
-            explanation.status = board.status(id, Audience::Anyone);
+            explanation.status = board.status(id, Audience::Anyone, refine);
             explanation.source = board.source(id).cloned();
             explanation.source_label = explanation.source.as_ref().map(StatusSource::label);
         }
@@ -607,7 +614,28 @@ impl Hub {
     /// An agent session's status, a finished turn counted as seen once
     /// any client viewed it (`None` once untracked).
     pub fn agent_status(&self, id: &str) -> Option<StatusView> {
-        self.board().status(id, Audience::Anyone)
+        let refine = self.refinements(Some(id)).remove(id);
+        self.board().status(id, Audience::Anyone, refine)
+    }
+
+    /// What telemetry adds to the state each session shows (`only`: just
+    /// that one); see [`crate::status::shown_state`]. A compaction whose
+    /// end never came stops counting after [`COMPACT_STALE_MS`].
+    pub(crate) fn refinements(&self, only: Option<&str>) -> Refinements {
+        let now = crate::telemetry::now_ms();
+        let ids = match only {
+            Some(id) => vec![id.to_owned()],
+            None => self.board().tracked(),
+        };
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        self.telemetry
+            .refinements(&ids)
+            .into_iter()
+            .filter(|(_, (status, since, _))| {
+                *status != "compacting" || now - since < COMPACT_STALE_MS
+            })
+            .map(|(id, (status, _, declared))| (id, Refinement { status, declared }))
+            .collect()
     }
 
     /// What the hub grades itself (see [`Graded`]).
@@ -631,7 +659,9 @@ impl Hub {
     /// Every agent session's status and workspace rollup, for one client.
     pub fn status_snapshot(&self, client: &str) -> Snapshot {
         let graded = self.graded();
-        self.board().snapshot(Audience::Client(client), &graded)
+        let refine = self.refinements(None);
+        self.board()
+            .snapshot(Audience::Client(client), &graded, &refine)
     }
 
     /// One session's status and its workspace's rollup, for one client
@@ -642,10 +672,15 @@ impl Hub {
         session_id: &str,
     ) -> Option<(StatusView, String, Option<AgentStatus>)> {
         let graded = self.graded();
+        let refine = self.refinements(None);
         let board = self.board();
-        let view = board.status(session_id, Audience::Client(client))?;
+        let view = board.status(
+            session_id,
+            Audience::Client(client),
+            refine.get(session_id).copied(),
+        )?;
         let workspace = board.workspace_of(session_id)?.to_owned();
-        let rollup = board.workspace_status(&workspace, Audience::Client(client), &graded);
+        let rollup = board.workspace_status(&workspace, Audience::Client(client), &graded, &refine);
         Some((view, workspace, rollup))
     }
 }

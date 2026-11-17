@@ -3,7 +3,8 @@
 //! finished turn was looked at, which the hub knows).
 //!
 //! * `needs`: blocked on a dialog, asking, or its last turn failed.
-//! * `moving`: working, and not merely waiting.
+//! * `moving`: working (compacting, or a finished turn's subagents still
+//!   running), and not merely waiting.
 //! * `waiting`: working but waiting on time: rate limited, or one tool
 //!   call running for [`WAIT_AFTER_MS`] or longer (a build, a test run,
 //!   a poll).
@@ -127,6 +128,16 @@ pub fn place(snap: &Snapshot, seen: Option<bool>, now: i64) -> (&'static str, St
                 .or_else(|| snap.turn_title.clone())
                 .unwrap_or_else(|| "working".to_owned());
             ("moving", doing, snap.since)
+        }
+        "compacting" => ("moving", "compacting context".to_owned(), snap.since),
+        "background" => {
+            let n = snap.background;
+            let agents = if n == 1 { "agent" } else { "agents" };
+            (
+                "moving",
+                format!("turn done, {n} {agents} still running"),
+                snap.since,
+            )
         }
         "done" if seen != Some(true) => (
             "finished",
@@ -316,6 +327,17 @@ mod tests {
         assert_eq!(place(&snap("a", "done", 0), Some(true), now).0, "idle");
         assert_eq!(place(&snap("a", "ended", 0), None, now).0, "idle");
         assert_eq!(place(&snap("a", "idle", 0), None, now).0, "idle");
+        // Compacting, and a turn's subagents still running: moving.
+        assert_eq!(
+            place(&snap("a", "compacting", 7), None, now),
+            ("moving", "compacting context".into(), 7)
+        );
+        let mut background = snap("a", "background", 9);
+        background.background = 2;
+        assert_eq!(
+            place(&background, None, now),
+            ("moving", "turn done, 2 agents still running".into(), 9)
+        );
     }
 
     #[test]

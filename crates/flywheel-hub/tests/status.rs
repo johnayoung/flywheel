@@ -225,6 +225,16 @@ async fn next_event(ws: &mut Ws, kind: &str) -> Value {
 }
 
 /// Wait until `session`'s status on this events socket is `want`.
+/// Wait for a status push for `session` showing state `want`.
+async fn state_becomes(ws: &mut Ws, session: &str, want: &str) -> Value {
+    loop {
+        let event = next_event(ws, "status").await;
+        if event["session_id"] == session && event["status"]["state"] == want {
+            return event;
+        }
+    }
+}
+
 async fn status_becomes(ws: &mut Ws, session: &str, want: &str) -> Value {
     loop {
         let event = next_event(ws, "status").await;
@@ -439,7 +449,8 @@ async fn claude_hooks_drive_status_with_per_client_seen_tracking() {
         "done"
     );
     // A subagent still running in the background after the turn ended
-    // leaves it done, and Claude's idle notice after that asks nothing.
+    // shows as that (its turn stays done), and Claude's idle notice after
+    // that asks nothing.
     let sub = json!({ "tool_name": "Read", "agent_id": "ag1" });
     claude
         .fire("PreToolUse", None, payload(sub.clone()))
@@ -448,10 +459,24 @@ async fn claude_hooks_drive_status_with_per_client_seen_tracking() {
     claude
         .fire("Notification", Some("idle_prompt"), payload(json!({})))
         .unwrap();
+    let agent = &hub.get(&format!("/api/sessions/{sid}")).await["agent"];
     assert_eq!(
-        hub.get(&format!("/api/sessions/{sid}")).await["agent"]["status"],
-        "done"
+        (&agent["status"], &agent["state"]),
+        (&json!("done"), &json!("background"))
     );
+    // Telemetry alone changed it: the state is pushed, rolled up as moving.
+    let pushed = state_becomes(&mut laptop, &sid, "background").await;
+    assert_eq!(pushed["workspace_status"], "working");
+    // Its last subagent finishes: done, as everywhere.
+    claude
+        .fire("SubagentStop", None, payload(json!({ "agent_id": "ag1" })))
+        .unwrap();
+    let agent = &hub.get(&format!("/api/sessions/{sid}")).await["agent"];
+    assert_eq!(
+        (&agent["status"], &agent["state"]),
+        (&json!("done"), &json!("done"))
+    );
+    state_becomes(&mut laptop, &sid, "done").await;
 
     // The laptop views it: idle for the laptop, still done for the phone.
     view(&mut laptop, Some(&sid)).await;

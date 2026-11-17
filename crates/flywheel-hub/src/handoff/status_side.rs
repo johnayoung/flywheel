@@ -143,7 +143,7 @@ mod tests {
             copy.authenticate("s1", key.secret.expose()),
             Some(key.generation)
         );
-        let view = copy.status("s1", Audience::Anyone).unwrap();
+        let view = copy.status("s1", Audience::Anyone, None).unwrap();
         assert_eq!(view.status, AgentStatus::Blocked);
         assert_eq!(view.detail.as_deref(), Some("may I?"));
         // What set each status crosses over too (`fw hub explain`).

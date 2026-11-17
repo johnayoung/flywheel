@@ -63,7 +63,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
-A session lists `agent` (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs` (`id`, `name`?, `reason`?, `prompt`, `created_at`), `start_sessions`, `start_policy` (in force), `start_requests`, `starts_made`,
+A session lists `agent` (`state`, `detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs` (`id`, `name`?, `reason`?, `prompt`, `created_at`), `start_sessions`, `start_policy` (in force), `start_requests`, `starts_made`,
 `owner`, `ending`, `ended`, `end_requests`; queue items: `from`, `priority`.
 
 ## Review, handoff, peer review
@@ -268,7 +268,7 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 
 Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: turn or subagent; `item`: plan item).
 
-Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?,prompt?}`), `failed`, `working`, `done`, `idle`, `ended`; `links` (captured `cc-<id>`: `captured`, `batch`, `budget_usd`).
+Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?,prompt?}`), `failed`, `compacting`, `working`, `background`, `done`, `idle`, `ended`; `links` (captured `cc-<id>`: `captured`, `batch`, `budget_usd`).
 
 Kinds: `session.started`, `session.continued`, `session.end_requested`, `session.end_cancelled`, `session.ended`, `session.replaced`, `session.owner_changed`, `queue.cancelled`, `session.finished`,
 `turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.

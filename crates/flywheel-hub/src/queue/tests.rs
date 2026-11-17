@@ -31,6 +31,8 @@ fn queue(items: Vec<QueueItem>) -> SessionQueue {
 fn status(status: AgentStatus, since: i64) -> Option<StatusView> {
     Some(StatusView {
         status,
+        state: crate::status::shown_state(status, false, None),
+        screen: false,
         detail: None,
         since: at(since),
         questions: Vec::new(),

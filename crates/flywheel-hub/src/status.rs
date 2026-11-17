@@ -67,6 +67,90 @@ impl AgentStatus {
     }
 }
 
+/// What a session shows: the one state every surface (sidebar, header,
+/// pane, Needs you, Work pane, fleet board) draws, from the board's status
+/// (hooks, the screen, per-client seen) refined by its telemetry status
+/// ([`crate::telemetry::Snapshot::status`]). See [`shown_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum State {
+    Blocked,
+    Asking,
+    Compacting,
+    Working,
+    Failed,
+    Background,
+    Done,
+    Idle,
+    Unknown,
+}
+
+impl State {
+    /// The status it rolls up as.
+    pub fn coarse(self) -> AgentStatus {
+        match self {
+            Self::Blocked => AgentStatus::Blocked,
+            Self::Compacting | Self::Working | Self::Background => AgentStatus::Working,
+            Self::Asking | Self::Failed | Self::Done => AgentStatus::Done,
+            Self::Idle => AgentStatus::Idle,
+            Self::Unknown => AgentStatus::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Asking => "asking",
+            Self::Compacting => "compacting",
+            Self::Working => "working",
+            Self::Failed => "failed",
+            Self::Background => "background",
+            Self::Done => "done",
+            Self::Idle => "idle",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// What a session's telemetry adds to its board status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refinement {
+    /// Its telemetry status ([`crate::telemetry::Snapshot::status`]).
+    pub status: &'static str,
+    /// What it asks was declared (`ask_operator`), not read off its
+    /// closing words: it is asked until answered, seen or not.
+    pub declared: bool,
+}
+
+/// Per session, what its telemetry adds ([`Refinement`]).
+pub type Refinements = HashMap<String, Refinement>;
+
+/// The state a session shows: its board `status` (as one client sees it;
+/// `screen`: the screen, not a report, set it) refined by its telemetry
+/// `status`, if any. The board decides blocked, working, and at rest (it
+/// hears every hook, and the screen sees what hooks miss: an Esc, a trust
+/// dialog); telemetry says what kind: compacting, asking, failed, or a
+/// finished turn's subagents still running (background). A screen-read
+/// rest wins over subagents telemetry still thinks run (an Esc reports no
+/// end). An ask read off a turn's closing words is shown until seen; a
+/// declared one until answered.
+pub fn shown_state(status: AgentStatus, screen: bool, telemetry: Option<Refinement>) -> State {
+    let refined = telemetry.map(|t| t.status);
+    match (status, refined) {
+        (AgentStatus::Unknown, _) => State::Unknown,
+        (AgentStatus::Blocked, _) => State::Blocked,
+        (AgentStatus::Working, Some("compacting")) => State::Compacting,
+        (AgentStatus::Working, _) => State::Working,
+        (_, Some("compacting")) => State::Compacting,
+        (AgentStatus::Done, Some("asking")) => State::Asking,
+        (_, Some("asking")) if telemetry.is_some_and(|t| t.declared) => State::Asking,
+        (_, Some("background")) if !screen => State::Background,
+        (AgentStatus::Done, Some("failed")) => State::Failed,
+        (AgentStatus::Done, _) => State::Done,
+        _ => State::Idle,
+    }
+}
+
 /// The most urgent of `statuses` (`None` when there are none).
 pub fn rollup(statuses: impl IntoIterator<Item = AgentStatus>) -> Option<AgentStatus> {
     statuses.into_iter().max_by_key(|s| s.urgency())
@@ -184,6 +268,12 @@ fn transition(raw: Raw, signal: Signal) -> Option<Raw> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StatusView {
     pub status: AgentStatus,
+    /// What to show ([`shown_state`]): the board's status until the hub
+    /// refines it with telemetry.
+    pub state: State,
+    /// The screen, not a report, set the status.
+    #[serde(skip)]
+    pub screen: bool,
     /// Why, when known (e.g. the permission the agent asked for).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -287,7 +377,7 @@ struct Entry {
 }
 
 impl Entry {
-    fn view(&self, audience: Audience<'_>) -> StatusView {
+    fn view(&self, audience: Audience<'_>, refine: Option<Refinement>) -> StatusView {
         let seen = match audience {
             Audience::Client(client) => self.seen_by.contains(client),
             Audience::Anyone => !self.seen_by.is_empty(),
@@ -298,6 +388,8 @@ impl Entry {
         };
         StatusView {
             status,
+            state: shown_state(status, self.raw.heuristic, refine),
+            screen: self.raw.heuristic,
             detail: self.detail.clone(),
             since: self.since,
             questions: self.questions.clone(),
@@ -379,6 +471,11 @@ impl StatusBoard {
             },
         );
         Ok(key)
+    }
+
+    /// Every tracked session.
+    pub fn tracked(&self) -> Vec<String> {
+        self.entries.keys().cloned().collect()
     }
 
     /// Stop tracking a removed session.
@@ -626,9 +723,16 @@ impl StatusBoard {
         })
     }
 
-    /// One session's status for `audience`.
-    pub fn status(&self, session_id: &str, audience: Audience<'_>) -> Option<StatusView> {
-        self.entries.get(session_id).map(|e| e.view(audience))
+    /// One session's status for `audience`, its state refined by `refine`.
+    pub fn status(
+        &self,
+        session_id: &str,
+        audience: Audience<'_>,
+        refine: Option<Refinement>,
+    ) -> Option<StatusView> {
+        self.entries
+            .get(session_id)
+            .map(|e| e.view(audience, refine))
     }
 
     /// The workspace a tracked session belongs to.
@@ -639,24 +743,34 @@ impl StatusBoard {
     }
 
     /// A workspace's rollup for `audience` (`None` without agent sessions
-    /// or a fan-out needing you), counted as [`Graded`] says.
+    /// or a fan-out needing you), counted as [`Graded`] says: each
+    /// session as the state it shows ([`State::coarse`]).
     pub fn workspace_status(
         &self,
         workspace_id: &str,
         audience: Audience<'_>,
         graded: &Graded,
+        refine: &Refinements,
     ) -> Option<AgentStatus> {
         rollup(
             self.entries
                 .iter()
                 .filter(|(_, e)| e.workspace_id == workspace_id)
-                .map(|(id, e)| graded.rolled(id, e.view(audience).status))
+                .map(|(id, e)| {
+                    let shown = e.view(audience, refine.get(id).copied()).state;
+                    graded.rolled(id, shown.coarse())
+                })
                 .chain(graded.fanouts_in(workspace_id)),
         )
     }
 
     /// Everything, for `audience`; rollups as [`StatusBoard::workspace_status`].
-    pub fn snapshot(&self, audience: Audience<'_>, graded: &Graded) -> Snapshot {
+    pub fn snapshot(
+        &self,
+        audience: Audience<'_>,
+        graded: &Graded,
+        refine: &Refinements,
+    ) -> Snapshot {
         let mut snapshot = Snapshot {
             graded: graded.sessions.iter().cloned().collect(),
             fanouts: graded
@@ -673,8 +787,8 @@ impl StatusBoard {
                 .insert(workspace.clone(), AgentStatus::Done);
         }
         for (id, entry) in &self.entries {
-            let view = entry.view(audience);
-            let status = graded.rolled(id, view.status);
+            let view = entry.view(audience, refine.get(id).copied());
+            let status = graded.rolled(id, view.state.coarse());
             let rolled = snapshot
                 .workspaces
                 .entry(entry.workspace_id.clone())
@@ -711,7 +825,7 @@ mod tests {
 
     fn status(board: &StatusBoard, session: &str, client: &str) -> AgentStatus {
         board
-            .status(session, Audience::Client(client))
+            .status(session, Audience::Client(client), None)
             .unwrap()
             .status
     }
@@ -731,11 +845,14 @@ mod tests {
             Signal::Blocked,
             Some("  Claude needs\n your permission ")
         ));
-        let view = board.status("s", Audience::Anyone).unwrap();
+        let view = board.status("s", Audience::Anyone, None).unwrap();
         assert_eq!(view.status, AgentStatus::Blocked);
         assert_eq!(view.detail.as_deref(), Some("Claude needs your permission"));
         assert!(board.apply("s", g, Signal::Working, None));
-        assert_eq!(board.status("s", Audience::Anyone).unwrap().detail, None);
+        assert_eq!(
+            board.status("s", Audience::Anyone, None).unwrap().detail,
+            None
+        );
         assert!(board.apply("s", g, Signal::Done, None));
         assert_eq!(status(&board, "s", "a"), AgentStatus::Done);
         assert!(board.apply("s", g, Signal::Ended, None));
@@ -778,7 +895,7 @@ mod tests {
             board.raw_status("s", g),
             Some((AgentStatus::Blocked, 1, false))
         );
-        let view = board.status("s", Audience::Anyone).unwrap();
+        let view = board.status("s", Audience::Anyone, None).unwrap();
         assert_eq!(view.detail.as_deref(), Some("run ls?"));
         assert_eq!(
             board.source("s").unwrap().label(),
@@ -794,7 +911,10 @@ mod tests {
         assert_eq!(board.source("s"), Some(&hook));
         assert_eq!(board.raw_status("s", g), Some((AgentStatus::Done, 2, true)));
         assert!(board.apply_screen("s", g, 2, AgentStatus::Working, None, rule()));
-        assert_eq!(board.status("s", Audience::Anyone).unwrap().detail, None);
+        assert_eq!(
+            board.status("s", Audience::Anyone, None).unwrap().detail,
+            None
+        );
     }
 
     #[test]
@@ -807,7 +927,7 @@ mod tests {
         board.apply("s", g, Signal::Done, None);
         assert_eq!(status(&board, "s", "laptop"), AgentStatus::Done);
         assert_eq!(
-            board.status("s", Audience::Anyone).unwrap().status,
+            board.status("s", Audience::Anyone, None).unwrap().status,
             AgentStatus::Done
         );
         // Viewing something else does not count.
@@ -816,7 +936,7 @@ mod tests {
         assert_eq!(status(&board, "s", "laptop"), AgentStatus::Idle);
         assert_eq!(status(&board, "s", "phone"), AgentStatus::Done);
         assert_eq!(
-            board.status("s", Audience::Anyone).unwrap().status,
+            board.status("s", Audience::Anyone, None).unwrap().status,
             AgentStatus::Idle
         );
         // A turn that finishes while the laptop looks is idle for it at once.
@@ -846,16 +966,19 @@ mod tests {
         let anyone = Audience::Anyone;
         let none = Graded::default();
         assert_eq!(
-            board.workspace_status("w1", anyone, &none),
+            board.workspace_status("w1", anyone, &none, &Refinements::new()),
             Some(AgentStatus::Done)
         );
         assert_eq!(
-            board.workspace_status("w2", anyone, &none),
+            board.workspace_status("w2", anyone, &none, &Refinements::new()),
             Some(AgentStatus::Working)
         );
-        assert_eq!(board.workspace_status("w3", anyone, &none), None);
+        assert_eq!(
+            board.workspace_status("w3", anyone, &none, &Refinements::new()),
+            None
+        );
         board.apply("b", b, Signal::Blocked, None);
-        let snap = board.snapshot(anyone, &none);
+        let snap = board.snapshot(anyone, &none, &Refinements::new());
         assert_eq!(snap.workspaces["w1"], AgentStatus::Blocked);
         assert_eq!(snap.workspaces["w2"], AgentStatus::Working);
         assert_eq!(snap.sessions.len(), 3);
@@ -866,7 +989,7 @@ mod tests {
         assert_eq!(rollup([]), None);
         board.untrack("b");
         assert_eq!(
-            board.workspace_status("w1", anyone, &none),
+            board.workspace_status("w1", anyone, &none, &Refinements::new()),
             Some(AgentStatus::Done)
         );
     }
@@ -884,10 +1007,10 @@ mod tests {
             ..Graded::default()
         };
         assert_eq!(
-            board.workspace_status("w", anyone, &graded),
+            board.workspace_status("w", anyone, &graded, &Refinements::new()),
             Some(AgentStatus::Idle)
         );
-        let snap = board.snapshot(anyone, &graded);
+        let snap = board.snapshot(anyone, &graded, &Refinements::new());
         assert_eq!(snap.workspaces["w"], AgentStatus::Idle);
         assert_eq!(snap.sessions["a"].status, AgentStatus::Done);
         assert_eq!(snap.graded, ["a".to_owned()].into());
@@ -895,12 +1018,14 @@ mod tests {
         // graded one that blocks is blocked.
         board.apply("b", b, Signal::Done, None);
         assert_eq!(
-            board.workspace_status("w", anyone, &graded),
+            board.workspace_status("w", anyone, &graded, &Refinements::new()),
             Some(AgentStatus::Done)
         );
         board.apply("a", a, Signal::Blocked, None);
         assert_eq!(
-            board.snapshot(anyone, &graded).workspaces["w"],
+            board
+                .snapshot(anyone, &graded, &Refinements::new())
+                .workspaces["w"],
             AgentStatus::Blocked
         );
     }
@@ -918,21 +1043,23 @@ mod tests {
         // Its candidate's turn is the hub's; the fan-out itself is done,
         // in a workspace with no agent session of its own too.
         assert_eq!(
-            board.workspace_status("w", anyone, &graded),
+            board.workspace_status("w", anyone, &graded, &Refinements::new()),
             Some(AgentStatus::Done)
         );
         assert_eq!(
-            board.workspace_status("empty", anyone, &graded),
+            board.workspace_status("empty", anyone, &graded, &Refinements::new()),
             Some(AgentStatus::Done)
         );
-        let snap = board.snapshot(anyone, &graded);
+        let snap = board.snapshot(anyone, &graded, &Refinements::new());
         assert_eq!(snap.workspaces["w"], AgentStatus::Done);
         assert_eq!(snap.workspaces["empty"], AgentStatus::Done);
         assert_eq!(snap.fanouts["w"], 1);
         // A working agent there still outranks it.
         board.apply("a", a, Signal::Working, None);
         assert_eq!(
-            board.snapshot(anyone, &graded).workspaces["w"],
+            board
+                .snapshot(anyone, &graded, &Refinements::new())
+                .workspaces["w"],
             AgentStatus::Working
         );
     }
@@ -1065,7 +1192,7 @@ mod tests {
             "unchanged"
         );
         assert!(board.apply("a", generation, Signal::Blocked, Some("Which color?")));
-        let view = board.status("a", Audience::Anyone).unwrap();
+        let view = board.status("a", Audience::Anyone, None).unwrap();
         assert_eq!(view.questions, questions);
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(
@@ -1074,7 +1201,7 @@ mod tests {
         );
         // Answered: the agent works again, and the options go.
         assert!(board.apply("a", generation, Signal::Working, None));
-        let view = board.status("a", Audience::Anyone).unwrap();
+        let view = board.status("a", Audience::Anyone, None).unwrap();
         assert!(view.questions.is_empty());
         assert!(
             serde_json::to_value(&view)
@@ -1086,8 +1213,81 @@ mod tests {
         board.note_questions("a", generation, questions.clone());
         let copy = StatusBoard::handoff_import(board.handoff_export());
         assert_eq!(
-            copy.status("a", Audience::Anyone).unwrap().questions,
+            copy.status("a", Audience::Anyone, None).unwrap().questions,
             questions
         );
+    }
+
+    #[test]
+    fn the_shown_state_is_the_board_refined_by_telemetry() {
+        use AgentStatus::*;
+        let t = |status| {
+            Some(Refinement {
+                status,
+                declared: false,
+            })
+        };
+        let declared = Some(Refinement {
+            status: "asking",
+            declared: true,
+        });
+        let cases = [
+            // The board decides blocked and working; telemetry says what kind.
+            (Blocked, false, t("working"), State::Blocked),
+            (Working, false, t("done"), State::Working),
+            (Working, false, t("compacting"), State::Compacting),
+            // At rest, telemetry says what kind of rest.
+            (Done, false, t("compacting"), State::Compacting),
+            (Idle, false, t("compacting"), State::Compacting),
+            (Done, false, t("background"), State::Background),
+            (Idle, false, t("background"), State::Background),
+            (Done, false, t("asking"), State::Asking),
+            // A closing question is asked until seen; a declared ask until
+            // answered.
+            (Idle, false, t("asking"), State::Idle),
+            (Idle, false, declared, State::Asking),
+            (Done, false, t("failed"), State::Failed),
+            (Idle, false, t("failed"), State::Idle),
+            // The screen saw the prompt (an Esc): at rest, whatever
+            // telemetry still thinks runs.
+            (Idle, true, t("background"), State::Idle),
+            (Idle, true, t("working"), State::Idle),
+            (Done, false, None, State::Done),
+            (Unknown, false, t("working"), State::Unknown),
+        ];
+        for (status, screen, refine, want) in cases {
+            assert_eq!(
+                shown_state(status, screen, refine),
+                want,
+                "{status:?} {screen} {refine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollups_count_the_state_shown() {
+        let (mut board, generation) = board_with("s", "w");
+        board.apply("s", generation, Signal::Done, None);
+        let mut refine = Refinements::new();
+        let none = Graded::default();
+        assert_eq!(
+            board.workspace_status("w", Audience::Anyone, &none, &refine),
+            Some(AgentStatus::Done)
+        );
+        refine.insert(
+            "s".into(),
+            Refinement {
+                status: "background",
+                declared: false,
+            },
+        );
+        assert_eq!(
+            board.workspace_status("w", Audience::Anyone, &none, &refine),
+            Some(AgentStatus::Working)
+        );
+        let snap = board.snapshot(Audience::Anyone, &none, &refine);
+        assert_eq!(snap.workspaces["w"], AgentStatus::Working);
+        assert_eq!(snap.sessions["s"].state, State::Background);
+        assert_eq!(snap.sessions["s"].status, AgentStatus::Done);
     }
 }

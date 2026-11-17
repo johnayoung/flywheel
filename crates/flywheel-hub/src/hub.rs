@@ -665,7 +665,20 @@ impl Hub {
         )?);
         {
             let events = events.clone();
+            let own = telemetry.host().to_owned();
+            // Each own session's last telemetry status: a change refines
+            // the state it shows, so its status is pushed again.
+            let shown: Mutex<HashMap<String, String>> = Mutex::default();
             telemetry.on_change(move |snapshot| {
+                if snapshot.host == own {
+                    let mut shown = shown.lock().unwrap_or_else(PoisonError::into_inner);
+                    let before = shown.insert(snapshot.session.clone(), snapshot.status.clone());
+                    if before.as_ref() != Some(&snapshot.status) {
+                        let _ = events.send(HubEvent::Status {
+                            session_id: snapshot.session.clone(),
+                        });
+                    }
+                }
                 if let Ok(snapshot) = serde_json::to_value(&snapshot) {
                     let _ = events.send(HubEvent::Telemetry { snapshot });
                 }

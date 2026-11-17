@@ -287,9 +287,15 @@ case "$*" in
 esac
 echo 'fake claude'
 printf '> '
-# Typed "e2e-go" / "e2e-stop": a turn starts / finishes (seen-on-view).
+# Typed "e2e-go" / "e2e-stop": a turn starts / finishes (seen-on-view);
+# "e2e-bg": a turn ends leaving a subagent running, "e2e-bgend" ends it.
 while IFS= read -r line; do
   case "$line" in
+  *e2e-bgend*) printf '{"agent_id":"ag-e2e"}' | "$FW_BIN" hub report --source claude --event SubagentStop --stdin >/dev/null 2>&1 ;;
+  *e2e-bg*)
+    "$FW_BIN" hub report --source claude --event UserPromptSubmit </dev/null >/dev/null 2>&1
+    printf '{"agent_id":"ag-e2e","agent_type":"general-purpose"}' | "$FW_BIN" hub report --source claude --event SubagentStart --stdin >/dev/null 2>&1
+    "$FW_BIN" hub report --source claude --event Stop </dev/null >/dev/null 2>&1 ;;
   *e2e-go*) "$FW_BIN" hub report --source claude --event UserPromptSubmit </dev/null >/dev/null 2>&1 ;;
   *e2e-stop*) "$FW_BIN" hub report --source claude --event Stop </dev/null >/dev/null 2>&1 ;;
   esac
@@ -1377,6 +1383,67 @@ try {
   for (const s of pair) await api("DELETE", `/api/sessions/${s.id}`);
   await seenPage.goto(`${base}/#session=${watch.id}`);
   await seenPage.waitForSelector("#terminal .pane.focused .xterm", { timeout: 15000 });
+  // One state everywhere: a turn that ends leaving a subagent running
+  // reads "background" on the API, the row, and the header, and is not in
+  // Needs you; its last subagent ending, it rests.
+  await seenPage.waitForTimeout(1500);
+  const stateOf = async () => ((await api("GET", `/api/sessions/${watch.id}`)).agent || {}).state;
+  const untilState = async (want) => {
+    for (let i = 0; i < 100 && (await stateOf()) !== want; i++) await sleep(50);
+    return stateOf();
+  };
+  const shownNow = () => seenPage.evaluate((id) => {
+    const row = document.querySelector(`#workspaces li.session[data-id="${id}"]`);
+    return {
+      state: (agentStatus(sessionById(id)) || {}).state,
+      dot: row ? row.querySelector(".glyph .dot").className : "",
+      step: row ? (row.querySelector(".session-step") || {}).textContent || "" : "",
+      pill: document.querySelector("#crumb-status").className,
+      needs: !!document.querySelector(`#attention .attn-row[data-id="${id}"]`),
+    };
+  }, watch.id);
+  say("e2e-bg");
+  got = await untilState("background");
+  await seenPage.waitForTimeout(800);
+  let shown = await shownNow();
+  // This page's clock ran ahead (the seen checks above): its last event
+  // is long ago, so a moving row reads quiet; else background.
+  const looks = (re) => re.test(shown.dot) && re.test(shown.pill);
+  check(got === "background" && shown.state === "background" && !shown.needs &&
+    ((looks(/\bbackground\b/) && /turn done/.test(shown.step)) || (looks(/\bquiet\b/) && /no word/.test(shown.step))),
+    `states: subagents outliving their turn read background everywhere (${got}, ${JSON.stringify(shown)})`);
+  // The state legend: from "why?" and from the Moving heading, the
+  // session's state marked, every state's row there.
+  await seenPage.click("#crumb-why");
+  await seenPage.waitForSelector("#why-pop .why-legend tr.here", { timeout: 10000 }).catch(() => {});
+  const whyLegend = await seenPage.evaluate(() => ({
+    rows: document.querySelectorAll("#why-pop .legend tbody tr").length,
+    here: (document.querySelector("#why-pop .legend tr.here b") || {}).textContent || "",
+  }));
+  await seenPage.keyboard.press("Escape");
+  await seenPage.click(".list-group-legend").catch(() => {});
+  await seenPage.waitForTimeout(300);
+  const sideLegend = await seenPage.evaluate(() => {
+    const pop = document.querySelector("#legend-pop");
+    const box = pop && !pop.hidden ? pop.getBoundingClientRect() : null;
+    return {
+      rows: pop ? pop.querySelectorAll(".legend tbody tr").length : 0,
+      here: (document.querySelector("#legend-pop .legend tr.here b") || {}).textContent || "",
+      fits: !!box && box.right <= innerWidth && box.left >= 0,
+    };
+  });
+  await seenPage.keyboard.press("Escape");
+  const marked = (h) => h === "background" || h === "quiet Nm";
+  check(whyLegend.rows === 11 && marked(whyLegend.here) && sideLegend.rows === 11 && marked(sideLegend.here) && sideLegend.fits,
+    `states: the legend opens from why? and the Moving heading, this state marked (${JSON.stringify({ whyLegend, sideLegend })})`);
+  say("e2e-bgend");
+  for (let i = 0; i < 100 && (await stateOf()) === "background"; i++) await sleep(50);
+  got = await stateOf();
+  await seenPage.waitForTimeout(800);
+  shown = await shownNow();
+  const rest = got === "idle" ? "idle" : "done";
+  check((got === "idle" || got === "done") && shown.dot.includes(got === "idle" ? "idle" : "agent-done") && new RegExp(`\\b${rest}\\b`).test(shown.pill),
+    `states: the last subagent ending rests it everywhere (${got}, ${JSON.stringify(shown)})`);
 
   // Transcript viewer: tool results are collapsible blocks under their
   // calls (named for the call's tool): a long Bash output shows its first

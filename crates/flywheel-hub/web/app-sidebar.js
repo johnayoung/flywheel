@@ -220,12 +220,16 @@ async function deleteWorkspace(workspace) {
 function rowMeta(session, st) {
   const agent = agentStatus(session);
   if (agent) {
+    if (st.quiet) return st.label;
+    if (st.dot === "handed") return "";
     if (agent.status === "working") {
       const t = sessionTelemetry.get(session.id);
-      return t && t.plan && t.plan.total ? `${t.plan.done}/${t.plan.total}` : "";
+      const doing = doingOf(session, agent);
+      const plan = agent.state === "working" && t && t.plan && t.plan.total ? `${t.plan.done}/${t.plan.total}` : "";
+      return [doing && doing.age, plan].filter(Boolean).join(" \u00b7 ");
     }
-    if (agent.status === "idle") return "";
-    if (agent.status === "done") return agent.since ? `done ${age(agent.since)}` : "done";
+    if (agent.state === "idle") return "";
+    if (agent.state === "done") return agent.since ? `done ${age(agent.since)}` : "done";
     return st.label;
   }
   return st.dot === "live" ? "" : st.label;
@@ -396,24 +400,41 @@ function endingHint(session) {
 // plan it declared (a bar, done/total, the step it is on), else what is
 // observed (the tool it is in); and its context window once that is
 // nearly full. Nothing is shown for a session at rest.
+// What a moving agent does, as a row's step: what, then more said
+// quieter ("Bash cargo test", "thinking after Read src/api.rs", "turn
+// done · 2 agents still running").
+function stepNode(doing, className = "session-step") {
+  return el(
+    "span",
+    { className },
+    doing.what,
+    doing.count ? [" \u00b7 ", el("b", { textContent: doing.count })] : null,
+    doing.more ? [" ", el("span", { className: "muted", textContent: doing.more })] : null,
+  );
+}
+
 function progressLine(session, st) {
   const t = sessionTelemetry.get(session.id);
-  if (!t || (st.dot !== "working" && st.dot !== "blocked")) return null;
+  const agent = agentStatus(session);
+  const handed = handedTo(session, agent);
+  if (handed) {
+    return el("span", { className: "session-progress", title: st.title },
+      el("span", { className: "session-step" }, el("span", { className: "muted", textContent: `handed off \u2192 ${handed}` })));
+  }
+  if (!t || !agent || (agent.status !== "working" && agent.status !== "blocked")) return null;
   const parts = [];
-  if (compactingNow(session)) {
-    parts.push(el("span", { className: "session-step", textContent: "compacting context" }));
-  } else if (t.plan && t.plan.total) {
+  const doing = doingOf(session, agent);
+  if (st.quiet) {
+    const last = doing && agent.state === "working" && doing.what !== "thinking" ? `\u00b7 ${doing.what}${doing.more ? ` ${doing.more}` : ""}` : "";
+    parts.push(stepNode({ what: `no word for ${ageMs(st.quiet)}`, more: last }));
+  } else if (agent.state === "working" && t.plan && t.plan.total) {
     const bar = el("span", { className: "prog-bar" }, el("i"));
     bar.firstChild.style.width = `${Math.round((t.plan.done / t.plan.total) * 100)}%`;
     parts.push(bar);
-    if (t.plan.current) parts.push(el("span", { className: "session-step", textContent: t.plan.current }));
-  } else if (t.tool) {
-    parts.push(el("span", {
-      className: "session-step tool",
-      textContent: t.tool.summary ? `${t.tool.name}: ${t.tool.summary}` : t.tool.name,
-    }));
-  } else if (t.turn_title) {
-    parts.push(el("span", { className: "session-step", textContent: t.turn_title }));
+    if (doing) parts.push(stepNode(doing, "session-step tool"));
+    else if (t.plan.current) parts.push(el("span", { className: "session-step", textContent: t.plan.current }));
+  } else if (doing) {
+    parts.push(stepNode(doing, `session-step${agent.state === "working" && t.tool ? " tool" : ""}`));
   }
   if (t.context && t.context.pct >= 80) {
     parts.push(el("span", {
@@ -423,7 +444,7 @@ function progressLine(session, st) {
     }));
   }
   if (!parts.length) return null;
-  const said = t.plan && t.plan.current ? `step ${t.plan.done + 1} of ${t.plan.total}: ${t.plan.current}` : (t.tool && t.tool.summary) || t.turn_title || "";
+  const said = t.plan && t.plan.current ? `step ${t.plan.done + 1} of ${t.plan.total}: ${t.plan.current}` : doing ? [doing.what, doing.count, doing.more].filter(Boolean).join(" ") : t.turn_title || "";
   return el("span", { className: "session-progress", title: said }, parts);
 }
 
@@ -494,8 +515,8 @@ function initials(name) {
 
 // An agent whose turn ended asking you something (telemetry's `asking`).
 function askingNow(session) {
-  const t = sessionTelemetry.get(session.id);
-  return !!(t && t.status === "asking" && t.ask);
+  const agent = agentStatus(session);
+  return !!(agent && agent.state === "asking");
 }
 
 // What agents need, in one workspace (or all, `null`), counted as Needs
@@ -726,7 +747,24 @@ function renderAllList() {
   if (!needs.size && !attention.handoffCount() && !moving.length) {
     out.push(el("div", { className: "list-calm", textContent: "Nothing needs you. Nothing is moving." }));
   }
-  if (moving.length) out.push(listGroup("Moving", moving.length), rows(moving, "moving"));
+  if (moving.length) {
+    const heading = listGroup("Moving", moving.length);
+    // What each state means (legend.js), the attached session's marked.
+    heading.append(el("button", {
+      type: "button",
+      className: "list-group-legend",
+      dataset: { id: "legend" },
+      textContent: "legend",
+      title: "What each state means",
+      "aria-haspopup": "dialog",
+      "aria-expanded": "false",
+      onclick: (e) => {
+        const attached = sessionById(state.attached);
+        legend.toggle(e.currentTarget, attached ? legend.keyOf(statusLook(attached)) : "");
+      },
+    }));
+    out.push(heading, rows(moving, "moving"));
+  }
   if (resting.length) {
     const open = state.restingOpen;
     out.push(el(
@@ -1008,9 +1046,14 @@ function renderMain() {
   const pill = $("#crumb-status");
   pill.hidden = !agent;
   if (agent) {
-    pill.textContent = agent.status;
-    pill.className = `agent-pill ${agent.status}`;
-    pill.title = agent.detail ? `${agent.status}: ${agent.detail}` : agent.status;
+    // The state's word, and what it does beside it ("2 agents · 6m").
+    const st = agent.state ? statusLook(session) : null;
+    const word = st ? st.label : agent.status;
+    const doing = st && !st.quiet ? doingOf(session, agent) : null;
+    const sub = doing ? [doing.count || (doing.what === "thinking" || doing.what === "turn done" || doing.what === "compacting context" ? "" : doing.what), doing.age].filter(Boolean).join(" \u00b7 ") : "";
+    pill.className = `agent-pill ${st ? (st.quiet ? "quiet" : st.dot === "handed" ? "handed" : agent.state) : agent.status}`;
+    pill.replaceChildren(word, sub ? el("span", { className: "pill-sub", textContent: sub }) : "");
+    pill.title = st ? st.title : agent.status;
   }
   explain.render(session, agent);
 

@@ -277,6 +277,34 @@ impl Telemetry {
         }
     }
 
+    /// [`SessionState::refinement`] of each of `sessions` (this hub's own)
+    /// that has reported anything: one out of memory (a hub just
+    /// upgraded or restarted) is read back.
+    pub fn refinements(&self, sessions: &[&str]) -> HashMap<String, (&'static str, i64, bool)> {
+        let mut live = lock(&self.inner.live);
+        let mut out = HashMap::new();
+        for session in sessions {
+            let key = (self.inner.host.clone(), (*session).to_owned());
+            if !live.contains_key(&key) {
+                let saved = lock(&self.inner.read).state(&key.0, &key.1);
+                match saved {
+                    Ok(Some(state)) => {
+                        live.insert(key.clone(), state);
+                    }
+                    Ok(None) => continue,
+                    Err(e) => {
+                        eprintln!("fw hub: {e}");
+                        continue;
+                    }
+                }
+            }
+            if let Some(state) = live.get(&key) {
+                out.insert((*session).to_owned(), state.refinement());
+            }
+        }
+        out
+    }
+
     /// This hub's own session on the board, if it has reported anything.
     pub fn snapshot(&self, session: &str) -> Option<Snapshot> {
         let key = (self.inner.host.clone(), session.to_owned());

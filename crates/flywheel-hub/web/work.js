@@ -98,25 +98,23 @@ window.FwHubWork = function (ctx) {
     return snap.blocked_on || "a person";
   }
 
-  // The dot and the status word; blocked: on what, and for how long.
+  // The dot and the state word; blocked: on what, and for how long. One
+  // of this hub's own sessions shows the state the sidebar shows (the hub
+  // works it out for both); another hub's, its telemetry's.
   function statusNode(snap) {
-    // Compacting before the prompt that set it off is reported: busy,
-    // though its turn reads as finished.
-    if (snap.compacting && (snap.status === "done" || snap.status === "idle" || snap.status === "asking")) {
-      return el(
-        "span",
-        { className: "wk-status working" },
-        el("span", { className: "wk-status-word" }, el("span", { className: "dot working" }), el("b", { textContent: "compacting" })),
-        el("span", { className: "wk-status-on" }, "context ", live(snap.compacting, 0, true)),
-      );
-    }
-    const look = lookOf(snap.status);
-    const on = blockedOn(snap);
+    const shown = ctx.shownOf ? ctx.shownOf(snap) : null;
+    const status = shown ? shown.state : snap.status;
+    const look = shown ? shown.look : lookOf(status);
+    const on = blockedOn({ ...snap, status });
+    const n = snap.background || 0;
+    const what = on ? `${on} `
+      : status === "compacting" ? "context "
+      : status === "background" && n ? `${n} agent${n === 1 ? "" : "s"} ` : "";
     return el(
       "span",
-      { className: `wk-status ${snap.status || ""}` },
+      { className: `wk-status ${status || ""}` },
       el("span", { className: "wk-status-word" }, el("span", { className: `dot ${look.dot}` }), el("b", { textContent: look.label })),
-      on ? el("span", { className: "wk-status-on" }, `${on} `, live(snap.since, 0, true)) : null,
+      what ? el("span", { className: "wk-status-on" }, what, live(snap.since, 0, true)) : null,
     );
   }
 

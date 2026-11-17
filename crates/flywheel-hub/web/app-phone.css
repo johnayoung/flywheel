@@ -400,6 +400,9 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
 /* An asking agent (attention.js): its ask answered in the row. */
 .attn-row.asking { border-left-color: var(--alert); }
 .attn-status.asking { background: var(--alert); }
+.attn-row.failed { border-left-color: var(--alert); }
+.attn-status.failed { background: var(--alert); }
+.attn-detail .muted { color: var(--ink-3); }
 .attn-ask { display: grid; gap: .35rem; padding: 0 .7rem .5rem calc(.7rem + 3px + 1rem + .55rem); }
 .attn-cmd { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: .4rem; }
 .attn-cmd pre {

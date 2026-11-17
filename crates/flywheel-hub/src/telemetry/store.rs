@@ -732,10 +732,11 @@ fn rank(status: &str) -> i64 {
         "blocked" => 0,
         "asking" => 1,
         "failed" => 2,
-        "working" => 3,
-        "done" => 4,
-        "idle" => 5,
-        _ => 6,
+        "compacting" | "working" => 3,
+        "background" => 4,
+        "done" => 5,
+        "idle" => 6,
+        _ => 7,
     }
 }
 

@@ -165,9 +165,9 @@ Each session's turns, calls, subagents, plan, waits, context, cost, and rate lim
 - **While ending**: its queue is set aside (senders told); answers name what dies (its processes, not orphans; MCP ones counted) and dirty work (kept); outcome by message.
 - **Who may**: the owner (`owner`, else the opener; ended: its newest successor) at once; else, or an operator-started session, a Needs you **Approve** (`fw hub ends`): succession: no click, the rest one. Not itself; force: `fw hub kill`. `give_session`; `queued_messages` / `cancel_message` (own); `message_session` `priority`.
 - **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (set by `fw worker`); over `_BUDGET`: flagged.
-- **Work** (the header's **work** pill, `fw hub fleet SESSION --turns`): live **map** (stations open; turns replay); plan; per turn a call strip, files, commands, cost, ending. Sidebar rows: plan step, else tool.
-- **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` (Claude sessions get the hub's tools and a system-prompt paragraph). Declared: a claim; no plan, no percentage.
-- **Capture**: Claude Code's hooks POST to the hub (a process per event only for `SessionStart`, until a status line has shown a CLI of 2.1.322 or later, or under `allowedHttpHookUrls`); its status line carries context, cost, and the 5 h / 7 d gauges (yours still shows: the hub's runs it). Codex: its rollout.
+- **Work** (the header's **work** pill, `fw hub fleet SESSION --turns`): live **map** (stations open; turns replay); plan; per turn a call strip, files, commands, cost, ending. Rows: call or thinking, its age.
+- **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` (Claude gets the hub's tools and a prompt paragraph). Declared: a claim; no plan, no percentage.
+- **Capture**: Claude Code's hooks POST to the hub (a process per event only for `SessionStart`, until a status line shows CLI 2.1.322+, or under `allowedHttpHookUrls`); its status line: context, cost, 5 h / 7 d gauges (yours still shows). Codex: its rollout.
 - **Many hosts**: `[telemetry] upstream = "NAME"` sends this hub's events to that machine (`fw hub machine add`) in batches, held while down; its Fleet lists every hub's sessions.
 
 ## Digests

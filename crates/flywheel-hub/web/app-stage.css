@@ -202,6 +202,15 @@
 .agent-pill.blocked { color: var(--signal-ink); background: var(--alert); }
 .agent-pill.done { color: var(--signal-ink); background: var(--brass); }
 .agent-pill.idle::before { background: transparent; box-shadow: inset 0 0 0 1.5px currentColor; }
+.agent-pill.compacting { color: var(--signal); background: var(--signal-soft); }
+.agent-pill.compacting::before { opacity: .55; }
+.agent-pill.background { color: var(--signal); background: transparent; box-shadow: inset 0 0 0 1px var(--signal); }
+.agent-pill.background::before, .agent-pill.handed::before { background: transparent; box-shadow: inset 0 0 0 1.5px currentColor; }
+.agent-pill.asking, .agent-pill.failed { color: var(--signal-ink); background: var(--alert); }
+.agent-pill.quiet { color: var(--brass); box-shadow: inset 0 0 0 1px var(--brass); }
+.agent-pill.handed { color: var(--ink-3); }
+/* What it does beside the word: "2 agents · 6m". */
+.agent-pill .pill-sub { font: 500 9.5px/1 var(--mono); letter-spacing: .04em; text-transform: none; opacity: .75; }
 .agent-pill.unknown { color: var(--ink-3); }
 .agent-pill.unknown::before { background: transparent; box-shadow: inset 0 0 0 1px currentColor; opacity: .6; }
 
@@ -263,6 +272,20 @@
 .why-problems { margin-top: .4rem; color: var(--alert); }
 .why-problems ul { margin: .2rem 0 0; padding-left: 1.1rem; }
 .why-note { margin: .5rem 0 0; color: var(--ink-3); font-size: 10px; }
+
+/* The state legend (legend.js): in "why?", and its own popover. */
+.why-legend { margin-top: .7rem; padding-top: .5rem; border-top: 1px solid var(--rule); }
+.why-legend > .why-key { display: block; margin-bottom: .3rem; letter-spacing: .1em; text-transform: uppercase; font-size: 9.5px; }
+.legend { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+.legend th, .legend td { padding: .3rem .4rem; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: top; }
+.legend th { color: var(--ink-3); font-weight: 600; font-size: 9px; letter-spacing: .1em; text-transform: uppercase; }
+.legend td { color: var(--ink-2); }
+.legend .lg-state { white-space: nowrap; }
+.legend .lg-state b { color: var(--ink); font-weight: 600; }
+.legend .lg-state .dot { display: inline-block; margin-right: .5rem; vertical-align: middle; box-shadow: none; }
+.legend tr.here td { background: var(--bg-4); }
+.legend tr.here .lg-state { box-shadow: inset 3px 0 0 var(--signal); }
+.legend tr.here .lg-state b { color: var(--signal); }
 /* The usage meter's breakdown: the why? popover's frame, its lines as
    written. */
 .usage-lines { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-2); }
@@ -447,7 +470,7 @@ body.resizing-y, body.resizing-y * { cursor: row-resize !important; user-select:
 .pane-state { flex: none; font-size: 9px; letter-spacing: .12em; text-transform: uppercase; }
 .pane-state.live { color: var(--signal); }
 .pane-state.bad { color: var(--alert); }
-.pane-state.brass { color: var(--brass); }
+.pane-state.brass, .pane-state.quiet { color: var(--brass); }
 .pane-follow {
   flex: 0 1000 auto;
   min-width: 0;

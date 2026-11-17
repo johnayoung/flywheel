@@ -41,7 +41,7 @@ window.FwHubFleet = function (ctx) {
   const PAGE = 200;
   const PAGE_MAX = 1000;
   const HOURS = 24;
-  const ORDER = ["blocked", "asking", "failed", "working", "done", "idle", "ended"];
+  const ORDER = ["blocked", "asking", "failed", "compacting", "working", "background", "done", "idle", "ended"];
   const rank = (status) => {
     const at = ORDER.indexOf(status);
     return at < 0 ? ORDER.length : at;

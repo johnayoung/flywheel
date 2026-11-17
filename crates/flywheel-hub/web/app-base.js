@@ -302,9 +302,10 @@ function statusLook(session) {
 function endedHow(session) {
   const e = session && session.ended;
   if (!e) return null;
-  const name = (id) => (sessionById(id) || {}).name || String(id || "").slice(0, 8);
-  const by = e.by && e.by.kind === "session" ? name(e.by.id) : "you";
-  if (e.successor) return `replaced by ${name(e.successor)} at the request of ${by}`;
+  // Its name now, else the one it had when this ended (it may be gone).
+  const name = (id, then) => (sessionById(id) || {}).name || then || String(id || "").slice(0, 8);
+  const by = e.by && e.by.kind === "session" ? name(e.by.id, e.by_name) : "you";
+  if (e.successor) return `replaced by ${name(e.successor, e.successor_name)} at the request of ${by}`;
   return e.by && e.by.kind === "session" ? `ended by ${by}` : "killed by you";
 }
 

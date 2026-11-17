@@ -568,7 +568,13 @@ impl Hub {
         ));
         lines.push(format!(
             "runtime: {}",
-            span(now - target.created_at.timestamp_millis())
+            // An ended session ran until it ended.
+            span(
+                match &target.state {
+                    SessionState::Exited { at, .. } => at.timestamp_millis(),
+                    _ => now,
+                } - target.created_at.timestamp_millis()
+            )
         ));
         if let Some(cost) = snap
             .as_ref()

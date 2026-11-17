@@ -302,7 +302,11 @@ fn helpers_text(killed: &[ProcessNote]) -> Option<String> {
     (helpers > 0).then(|| {
         format!(
             "{} of the agent's own (MCP servers and their tooling, which end with any session)",
-            plural(helpers, "helper process")
+            if helpers == 1 {
+                "1 helper process".to_owned()
+            } else {
+                format!("{helpers} helper processes")
+            }
         )
     })
 }
@@ -1091,6 +1095,8 @@ impl Hub {
             killed,
             dirty,
             successor: None,
+            by_name: None,
+            successor_name: None,
         };
         let ending = record.ending.clone();
         let saved = end.clone();
@@ -1385,6 +1391,8 @@ impl Hub {
             killed,
             dirty,
             successor: ending.successor.clone(),
+            by_name: ending.by.session().map(|id| self.session_name(id)),
+            successor_name: ending.successor.as_deref().map(|id| self.session_name(id)),
         };
         let saved = end.clone();
         let final_item = ending.final_item.clone();
@@ -1866,6 +1874,8 @@ mod tests {
             killed: Vec::new(),
             dirty: None,
             successor: Some("lead3".into()),
+            by_name: Some("s-x".into()),
+            successor_name: Some("s-lead3".into()),
         });
         let mut lead3 = record("lead3", Some("x"), false);
         lead3.continues = Some("lead1".into());

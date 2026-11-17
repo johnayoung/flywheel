@@ -886,6 +886,8 @@ async fn a_replacement_starts_its_successor_then_ends_the_old_one() {
     let view = hub.ended(&old.id).await;
     let new = hub.named("new").await.expect("the successor started");
     assert_eq!(view["ended"]["successor"], new["id"]);
+    assert_eq!(view["ended"]["successor_name"], "new");
+    assert_eq!(view["ended"]["by_name"], "lead");
     assert_eq!(new["opened_by"], lead.id.as_str());
     assert_eq!(new["owner"], lead.id.as_str());
     assert_eq!(new["continues"], old.id.as_str());

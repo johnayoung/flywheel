@@ -117,6 +117,18 @@ pub fn state_label(session: &Value) -> String {
             }
         }
         "running" => "gone".into(),
+        // Ended on purpose: who ended it, not the hangup's exit code.
+        "exited" if session.get("ended").is_some_and(|e| !e.is_null()) => {
+            let ended = &session["ended"];
+            let name = |key: &str| ended.get(key).and_then(Value::as_str);
+            match (name("successor_name"), ended["by"]["kind"].as_str()) {
+                (Some(next), _) => format!("replaced by {next}"),
+                (None, Some("session")) => {
+                    format!("ended by {}", name("by_name").unwrap_or("an agent"))
+                }
+                _ => "killed by you".to_owned(),
+            }
+        }
         "exited" => match session.get("signal").and_then(Value::as_str) {
             Some(signal) => format!("killed ({signal})"),
             // No code: a process an earlier hub started (handed over by
@@ -1712,6 +1724,28 @@ mod tests {
             "killed (Hangup)"
         );
         assert_eq!(label(json!({"state": "stopped"})), "stopped");
+        // Ended on purpose: by whom, not the hangup.
+        let ended = |e: Value| label(json!({"state": "exited", "code": 129, "ended": e}));
+        assert_eq!(
+            ended(
+                json!({"by": {"kind": "session", "id": "a"}, "by_name": "lead",
+                         "successor": "b", "successor_name": "worker 2"})
+            ),
+            "replaced by worker 2"
+        );
+        assert_eq!(
+            ended(json!({"by": {"kind": "session", "id": "a"}, "by_name": "lead"})),
+            "ended by lead"
+        );
+        assert_eq!(
+            ended(json!({"by": {"kind": "session", "id": "a"}})),
+            "ended by an agent"
+        );
+        assert_eq!(ended(json!({"by": {"kind": "operator"}})), "killed by you");
+        assert_eq!(
+            label(json!({"state": "exited", "code": 129, "ended": null})),
+            "exited 129"
+        );
         assert_eq!(
             label(json!({"state": "stopped", "restore_error": "cwd gone"})),
             "not restored"

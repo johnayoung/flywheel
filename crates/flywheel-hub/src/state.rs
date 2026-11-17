@@ -469,6 +469,12 @@ pub struct EndRecord {
     /// The session that replaced it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor: Option<String>,
+    /// The asking session's and the successor's names when it ended (so
+    /// a listing says who without looking them up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_name: Option<String>,
 }
 
 /// Why an end waits on the operator.

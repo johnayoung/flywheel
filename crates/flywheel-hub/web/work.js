@@ -22,6 +22,9 @@
 window.FwHubWork = function (ctx) {
   const { $, el, icon, rawApi, span, state, sessionById, workspaceById, isAgent } = ctx;
   const { tokens, dollars, plural } = window.FwHubFmt;
+  // A session an event names (a lifecycle record's `by`, `target`), or
+  // the operator.
+  const nameOf = (id) => (id === "operator" ? "the operator" : (sessionById(id) || {}).name || String(id || "").slice(0, 8));
   // The live map above the tree (map.js), one for whichever view is open.
   const map = window.FwHubMap({
     // Back from a replay: the session as it is, again.
@@ -671,6 +674,17 @@ window.FwHubWork = function (ctx) {
         push(event, { note: `${body.phase === "post" ? "context compacted" : "compacting context"}${body.trigger ? ` (${body.trigger})` : ""}`, tone: "", ts: event.ts });
       } else if (event.kind === "rate.limited") {
         push(event, { note: `rate limit refused${body.detail ? `: ${body.detail}` : ""}`, tone: "bad", ts: event.ts });
+      } else if (event.kind === "session.end_requested") {
+        push(event, { note: `${body.target ? `asked to end ${nameOf(body.target)}` : `end asked by ${nameOf(body.by)}`} (${String(body.mode || "").replace(/_/g, " ")})${body.dropped ? `; ${plural(body.dropped, "queued message")} set aside` : ""}`, tone: "wait", ts: event.ts });
+      } else if (event.kind === "session.end_cancelled") {
+        push(event, { note: `${body.target ? `end of ${nameOf(body.target)}` : "end"} called off: ${body.why}`, tone: "", ts: event.ts });
+      } else if (event.kind === "session.ended") {
+        const extra = [body.killed && body.killed.length ? `${body.killed.length} process${body.killed.length === 1 ? "" : "es"} went with it` : "", body.dirty ? `left: ${body.dirty}` : ""].filter(Boolean).join("; ");
+        push(event, { note: `${body.target ? `${nameOf(body.target)} ended` : `ended by ${nameOf(body.by)}`}${body.successor ? `, replaced by ${nameOf(body.successor)}` : ""}${extra ? ` (${extra})` : ""}`, tone: "bad", ts: event.ts });
+      } else if (event.kind === "session.owner_changed") {
+        push(event, { note: `given to ${nameOf(body.to)} by ${nameOf(body.by)}`, tone: "", ts: event.ts });
+      } else if (event.kind === "queue.cancelled") {
+        push(event, { note: `${nameOf(body.by)} took back ${plural(body.items, "queued message")}`, tone: "", ts: event.ts });
       } else if (event.kind === "turn.failed") {
         push(event, { note: `turn failed: ${body.error || "unknown error"}${body.detail ? ` -- ${body.detail}` : ""}`, tone: "bad", ts: event.ts });
       }

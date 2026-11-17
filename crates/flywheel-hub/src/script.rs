@@ -1500,6 +1500,113 @@ pub(crate) fn starts(args: &StartsArgs, out: &mut dyn Write, err: &mut dyn Write
     0
 }
 
+#[derive(Debug, clap::Args)]
+pub(crate) struct EndsArgs {
+    #[command(flatten)]
+    target: SessionArg,
+    /// Start its agent's pending end (or replacement) request ID.
+    #[arg(long, value_name = "ID", conflicts_with_all = ["decline", "cancel"])]
+    approve: Option<String>,
+    /// Decline its agent's pending end request ID.
+    #[arg(long, value_name = "ID", conflicts_with = "cancel")]
+    decline: Option<String>,
+    /// Call off the end of this session in progress.
+    #[arg(long)]
+    cancel: bool,
+    /// Print the session as JSON.
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    endpoint: EndpointArgs,
+}
+
+/// `fw hub ends`: the ends an agent session asked for that wait on the
+/// operator, and its own end in progress; approve, decline, or cancel.
+pub(crate) fn ends(args: &EndsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let result = connect(&args.endpoint).and_then(|conn| {
+        let (id, session) = find_session(&conn, &args.target.session)?;
+        if let Some(end) = &args.approve {
+            return conn.blocking_call(
+                "POST",
+                &format!("/api/sessions/{id}/ends/{}", query_escape(end)),
+                Some(&json!({})),
+            );
+        }
+        if let Some(end) = &args.decline {
+            conn.blocking_call(
+                "DELETE",
+                &format!("/api/sessions/{id}/ends/{}", query_escape(end)),
+                None,
+            )?;
+            return Ok(Value::Null);
+        }
+        if args.cancel {
+            return conn.blocking_call("DELETE", &format!("/api/sessions/{id}/ending"), None);
+        }
+        Ok(session)
+    });
+    let view = match result {
+        Ok(view) => view,
+        Err(message) => return fail(err, &message),
+    };
+    if args.json {
+        if !view.is_null() {
+            print_json(out, &view);
+        }
+        return 0;
+    }
+    if view.is_null() {
+        let _ = writeln!(err, "fw hub: declined");
+        return 0;
+    }
+    let name = str_field(&view, "name");
+    match view.get("ending").filter(|e| !e.is_null()) {
+        Some(ending) => {
+            let _ = writeln!(
+                out,
+                "{name}: ending ({}, {}), request {}, until {}",
+                str_field(ending, "mode"),
+                str_field(ending, "phase"),
+                str_field(ending, "id"),
+                str_field(ending, "deadline")
+            );
+        }
+        None => match view.get("ended").filter(|e| !e.is_null()) {
+            Some(ended) => {
+                let _ = writeln!(
+                    out,
+                    "{name}: ended ({}) at {}",
+                    str_field(ended, "mode"),
+                    str_field(ended, "at")
+                );
+            }
+            None => {
+                let _ = writeln!(out, "{name}: no end in progress");
+            }
+        },
+    }
+    for end in view
+        .get("end_requests")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let _ = writeln!(
+            out,
+            "  waiting {}  {} {}  ({})",
+            str_field(end, "id"),
+            if end.get("replace").is_some_and(|r| !r.is_null()) {
+                "replace"
+            } else {
+                "end"
+            },
+            str_field(end, "target"),
+            str_field(end, "why")
+        );
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

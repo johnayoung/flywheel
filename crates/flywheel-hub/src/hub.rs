@@ -2,7 +2,9 @@
 //! sessions the server owns.
 
 mod capture;
+mod endings;
 pub use capture::{CAPTURE_TOKEN_FILE, CAPTURED_PREFIX, CaptureFrom, CaptureRefused};
+pub use endings::{AgentEnd, AgentReplace, FORCE_REFUSED};
 mod links;
 mod starts;
 pub use starts::{AgentStart, Opened};

@@ -224,6 +224,10 @@ impl Hub {
             start_sessions: None,
             start_requests: Vec::new(),
             starts_made: 0,
+            owner: None,
+            ending: None,
+            ended: None,
+            end_requests: Vec::new(),
         };
         // Taken before the launch, so two starts of one handoff start one
         // session; put back if the launch fails.
@@ -254,9 +258,16 @@ impl Hub {
     }
 
     /// Agent session `from` sends `text` to the session `to` names (id, id
-    /// prefix, or name) on this hub: typed in now, or queued. What became
-    /// of it, in words for the sender.
-    pub fn agent_message(&self, from: &str, to: &str, text: &str) -> Result<String, HubError> {
+    /// prefix, or name) on this hub: typed in now, or queued (`priority`:
+    /// ahead of the waiting messages that are not). What became of it, in
+    /// words for the sender.
+    pub fn agent_message(
+        &self,
+        from: &str,
+        to: &str,
+        text: &str,
+        priority: bool,
+    ) -> Result<String, HubError> {
         let text = text.trim();
         if text.is_empty() {
             return Err(StateError::Invalid("the message is empty".into()).into());
@@ -302,13 +313,29 @@ impl Hub {
             "a message from that agent session",
         );
         let prompt = crate::queue::validate_text(&format!("{from_line}\n\n{text}"))?;
-        Ok(match self.send_or_queue(&target.id, &prompt)? {
-            Delivery::Pasted { .. } => format!("Delivered to {}: it reads it now.", target.name),
-            Delivery::Queued { why, .. } => format!(
-                "Queued for {} ({why}): it reads it when its turn is done.",
-                target.name
-            ),
-        })
+        Ok(
+            match self.send_or_queue_from(&target.id, &prompt, Some(&sender.id), priority)? {
+                Delivery::Pasted { .. } => {
+                    format!("Delivered to {}: it reads it now.", target.name)
+                }
+                Delivery::Queued { item, .. } if priority => {
+                    let place = self
+                        .store()
+                        .queue(&target.id)
+                        .and_then(|q| q.waiting().position(|i| i.id == item))
+                        .map_or(1, |at| at + 1);
+                    format!(
+                        "Queued for {} as priority (id {item}, #{place} in its queue): it reads it \
+                         when its turn is done.",
+                        target.name
+                    )
+                }
+                Delivery::Queued { why, .. } => format!(
+                    "Queued for {} ({why}): it reads it when its turn is done.",
+                    target.name
+                ),
+            },
+        )
     }
 
     /// The running agent sessions on this hub, one line each: name, id,

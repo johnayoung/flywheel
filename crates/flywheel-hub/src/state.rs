@@ -38,6 +38,8 @@ pub const MAX_NAME_CHARS: usize = 100;
 pub const MAX_PENDING_HANDOFFS: usize = 20;
 /// Most session starts that wait on the operator per session.
 pub const MAX_PENDING_STARTS: usize = 20;
+/// Most ends that wait on the operator per session.
+pub const MAX_PENDING_ENDS: usize = 20;
 pub const MAX_FOLDERS: usize = 32;
 /// Launch templates kept per workspace.
 pub const MAX_TEMPLATES: usize = 50;
@@ -292,6 +294,206 @@ pub struct SessionRecord {
     /// removing one does not give the start back.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub starts_made: u32,
+    /// The agent session given control of this one (`give_session`): its
+    /// id. `None`: whoever opened it (see [`crate::hub`]'s endings for the
+    /// effective owner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// An end in progress (`end_session`, `replace_session`): kept until
+    /// it ends the session or is called off, across a hub restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ending: Option<Ending>,
+    /// How it was ended, when an agent or the operator ended it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<EndRecord>,
+    /// Ends and replacements its agent asked for that wait on the
+    /// operator: each is removed only when approved or declined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub end_requests: Vec<PendingEnd>,
+}
+
+/// Who acted: an agent session (its id), or the operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum Actor {
+    Session(String),
+    Operator,
+}
+
+impl Actor {
+    /// The session id, for an agent.
+    pub fn session(&self) -> Option<&str> {
+        match self {
+            Self::Session(id) => Some(id),
+            Self::Operator => None,
+        }
+    }
+
+    /// As telemetry records it: the session's id, or `operator`.
+    pub fn tag(&self) -> String {
+        self.session().unwrap_or("operator").to_owned()
+    }
+}
+
+/// How a session is ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndMode {
+    /// A final prompt first (its wind-down), then the end once that turn
+    /// is over and nothing runs.
+    Graceful,
+    /// At its next rest: no final prompt.
+    AtRest,
+    /// At once (the operator only: the pane menu, `fw hub kill`).
+    Force,
+}
+
+impl EndMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::AtRest => "at_rest",
+            Self::Force => "force",
+        }
+    }
+}
+
+/// Where an end in progress is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndPhase {
+    /// The final prompt waits in its queue for the turn boundary.
+    AwaitFinal,
+    /// The final prompt went: its turn runs.
+    FinalTurn,
+    /// Waiting for the agent to rest with nothing running.
+    Settling,
+}
+
+impl EndPhase {
+    /// In words, for the agent told where an end stuck.
+    pub fn words(self) -> &'static str {
+        match self {
+            Self::AwaitFinal => "waiting for its final prompt to be delivered",
+            Self::FinalTurn => "running the final prompt's turn",
+            Self::Settling => "waiting for it to rest with no tool call or subagent running",
+        }
+    }
+}
+
+/// The session a replacement starts once the old one is at rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Successor {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub prompt: String,
+    /// One of the workspace's folders; `None`: the old session's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folder: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeRequest>,
+}
+
+/// A queued message an end set aside.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DroppedItem {
+    pub id: String,
+    /// Its sender session (`None`: the operator).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Its first line.
+    pub preview: String,
+}
+
+/// An end in progress (see [`crate::hub`]'s endings).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ending {
+    pub id: String,
+    pub by: Actor,
+    pub mode: EndMode,
+    /// The final prompt's queue item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_item: Option<String>,
+    /// When the final prompt was delivered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_at: Option<DateTime<Utc>>,
+    pub phase: EndPhase,
+    pub deadline: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<DroppedItem>,
+    /// The set-aside items themselves: put back when the end is called off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<crate::queue::QueueItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace: Option<Successor>,
+    /// The successor, once started (it starts before the old one ends).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor: Option<String>,
+    pub requested_at: DateTime<Utc>,
+}
+
+/// A process an end killed with the session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessNote {
+    pub pid: u32,
+    pub command: String,
+}
+
+/// Work an ended session left in its directory (nothing is removed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirtyNote {
+    pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub dirty: u32,
+    pub untracked: u32,
+    pub unmerged: u32,
+}
+
+/// How a session was ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndRecord {
+    pub by: Actor,
+    pub at: DateTime<Utc>,
+    pub mode: EndMode,
+    /// Processes other than the agent that went with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub killed: Vec<ProcessNote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty: Option<DirtyNote>,
+    /// The session that replaced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor: Option<String>,
+}
+
+/// Why an end waits on the operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalWhy {
+    /// The asker does not own the session.
+    NotOwner,
+    /// A replacement starts a session, and the asker's start policy is ask.
+    StartPolicyAsk,
+    Both,
+}
+
+/// An end (or replacement) an agent asked for, waiting until the
+/// operator approves or declines it. Kept on the asker's record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEnd {
+    pub id: String,
+    /// The session to end: its id.
+    pub target: String,
+    pub mode: EndMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace: Option<Successor>,
+    pub why: ApprovalWhy,
+    pub created_at: DateTime<Utc>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes &T

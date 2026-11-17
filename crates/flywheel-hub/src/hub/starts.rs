@@ -52,11 +52,11 @@ pub enum Opened {
     },
 }
 
-fn refused(why: impl Into<String>) -> HubError {
+pub(super) fn refused(why: impl Into<String>) -> HubError {
     StateError::Invalid(why.into()).into()
 }
 
-fn running_agent(record: &SessionRecord) -> bool {
+pub(super) fn running_agent(record: &SessionRecord) -> bool {
     record.runs_agent() && record.state == SessionState::Running
 }
 
@@ -123,7 +123,7 @@ fn over_limit(
     None
 }
 
-fn trimmed(value: Option<&str>) -> Option<String> {
+pub(super) fn trimmed(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -140,7 +140,7 @@ fn plan_mark(status: ItemStatus) -> &'static str {
 }
 
 /// `ms` milliseconds as `3h 12m`, `12m`, or `40s`.
-fn span(ms: i64) -> String {
+pub(super) fn span(ms: i64) -> String {
     let secs = ms.max(0) / 1000;
     match secs {
         s if s >= 3600 => format!("{}h {}m", s / 3600, s % 3600 / 60),
@@ -179,7 +179,7 @@ impl Hub {
     }
 
     /// Why agent session `id` may not start one more session now.
-    fn check_start_limits(&self, id: &str) -> Result<SessionRecord, HubError> {
+    pub(super) fn check_start_limits(&self, id: &str) -> Result<SessionRecord, HubError> {
         let limits = self.tunables().agent_starts;
         let store = self.store();
         let caller = store.session(id)?.clone();
@@ -192,7 +192,7 @@ impl Hub {
     /// Start `request` for agent session `caller`, within the limits:
     /// linked to it, its prompt under a line saying who started it, and
     /// counted against its total.
-    fn start_for(
+    pub(super) fn start_for(
         self: &Arc<Self>,
         caller: &str,
         mut request: CreateSession,
@@ -369,7 +369,7 @@ impl Hub {
     /// The session request `pending` (asked by `from`) opens: its folder,
     /// else `from`'s own directory (a new worktree is cut from `from`'s
     /// repo; without one it shares `from`'s worktree).
-    fn start_request(
+    pub(super) fn start_request(
         &self,
         from: &SessionRecord,
         pending: &PendingStart,
@@ -480,7 +480,7 @@ impl Hub {
 
     /// Type `text` into the agent that asked for a start, now or once its
     /// turn is done. A starter that no longer runs is not told.
-    fn tell_starter(&self, from: &SessionRecord, text: &str) {
+    pub(super) fn tell_starter(&self, from: &SessionRecord, text: &str) {
         if !running_agent(from) {
             return;
         }
@@ -662,6 +662,10 @@ mod tests {
             start_sessions: None,
             start_requests: Vec::new(),
             starts_made: 0,
+            owner: None,
+            ending: None,
+            ended: None,
+            end_requests: Vec::new(),
         }
     }
 

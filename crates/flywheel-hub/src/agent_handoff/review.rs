@@ -541,6 +541,10 @@ impl Hub {
             start_sessions: None,
             start_requests: Vec::new(),
             starts_made: 0,
+            owner: None,
+            ending: None,
+            ended: None,
+            end_requests: Vec::new(),
         };
         let view = self.launch(record, None, None, false, prompt.as_deref())?;
         let paired = self.store().set_review_pair(&author.id, &view.record.id);

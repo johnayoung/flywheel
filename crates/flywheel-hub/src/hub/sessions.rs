@@ -251,6 +251,10 @@ impl Hub {
             start_sessions: None,
             start_requests: Vec::new(),
             starts_made: 0,
+            owner: None,
+            ending: None,
+            ended: None,
+            end_requests: Vec::new(),
         };
         if record
             .launch
@@ -580,6 +584,10 @@ impl Hub {
             start_sessions: None,
             start_requests: Vec::new(),
             starts_made: 0,
+            owner: None,
+            ending: None,
+            ended: None,
+            end_requests: Vec::new(),
         };
         Ok((self.launch(record, cols, rows, false, None)?, true))
     }
@@ -905,6 +913,7 @@ impl Hub {
     /// Kill (if running) and forget a session.
     pub fn remove_session(&self, id: &str) -> Result<(), HubError> {
         let described = self.event_session(id);
+        let ending = self.store().session(id).ok().cloned();
         let mut store = self.store();
         let queued = store
             .queue(id)
@@ -917,6 +926,9 @@ impl Hub {
         drop(store);
         self.board().untrack(id);
         self.queue_runtime().forget(id);
+        if let Some(record) = ending {
+            self.ending_removed(&record);
+        }
         if let Some(session) = live {
             forget(&session);
         }

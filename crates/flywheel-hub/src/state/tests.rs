@@ -142,6 +142,10 @@ fn running_session(workspace_id: &str, cwd: &Path) -> SessionRecord {
         start_sessions: None,
         start_requests: Vec::new(),
         starts_made: 0,
+        owner: None,
+        ending: None,
+        ended: None,
+        end_requests: Vec::new(),
     }
 }
 
@@ -1137,6 +1141,8 @@ fn a_version_4_file_with_promoted_fanouts_migrates_to_queues_losing_neither() {
                 when: When::Done,
                 added_at: now,
                 blocked_at: None,
+                from: None,
+                priority: false,
                 state: ItemState::Pending,
             });
         })
@@ -1170,6 +1176,8 @@ fn a_queue_edit_that_records_what_happened_survives_a_failed_save() {
                 when: When::Done,
                 added_at: sending_at,
                 blocked_at: None,
+                from: None,
+                priority: false,
                 state: ItemState::Sending { sending_at },
             });
         })

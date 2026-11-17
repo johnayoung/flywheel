@@ -47,6 +47,21 @@ pub const START_TOOL: &str = "mcp__flywheel__start_session";
 /// The hub's session status tool as Claude Code names it.
 pub const STATUS_TOOL: &str = "mcp__flywheel__session_status";
 
+/// The hub's end tool as Claude Code names it.
+pub const END_TOOL: &str = "mcp__flywheel__end_session";
+
+/// The hub's replace tool as Claude Code names it.
+pub const REPLACE_TOOL: &str = "mcp__flywheel__replace_session";
+
+/// The hub's queued-messages tool as Claude Code names it.
+pub const QUEUED_TOOL: &str = "mcp__flywheel__queued_messages";
+
+/// The hub's cancel tool as Claude Code names it.
+pub const CANCEL_TOOL: &str = "mcp__flywheel__cancel_message";
+
+/// The hub's give tool as Claude Code names it.
+pub const GIVE_TOOL: &str = "mcp__flywheel__give_session";
+
 /// Most options an ask keeps.
 const ASK_OPTIONS: usize = 8;
 

@@ -537,11 +537,18 @@ impl SessionState {
                 }
                 self.ended = false;
             }
-            What::Continued { successor } => {
+            What::Continued { successor } | What::Replaced { successor } => {
                 // Its work went on there: whatever it asked is answered.
                 self.ask = None;
                 self.continued_by = Some(successor.clone());
             }
+            // Records of the session's lifecycle and queue: the timeline
+            // shows them; its state follows the process and the turns.
+            What::EndRequested { .. }
+            | What::EndCancelled { .. }
+            | What::Ended { .. }
+            | What::OwnerChanged { .. }
+            | What::QueueCancelled { .. } => {}
             What::SessionFinished { .. } => {
                 // An unanswered ask outlives the process: a resumed
                 // session still waits on it (its status shows `ended`

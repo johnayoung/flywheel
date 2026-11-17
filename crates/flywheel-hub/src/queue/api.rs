@@ -219,7 +219,21 @@ impl Hub {
 
     /// Queue `item` at the end of session `id`'s queue.
     pub fn queue_add(&self, id: &str, item: &NewItem) -> Result<(QueueItem, QueueView), HubError> {
+        self.queue_add_from(id, item, None, false)
+    }
+
+    /// Queue `item` for session `id`, sent by agent session `from`
+    /// (`None`: the operator); `priority`: ahead of every waiting item
+    /// that is not. Refused while the session is ending.
+    pub(crate) fn queue_add_from(
+        &self,
+        id: &str,
+        item: &NewItem,
+        from: Option<&str>,
+        priority: bool,
+    ) -> Result<(QueueItem, QueueView), HubError> {
         let record = self.queue_record(id)?;
+        Self::refuse_if_ending(&record)?;
         let text = validate_text(&item.text)?;
         let when = parse_when(item.when.as_deref())?;
         let new = QueueItem {
@@ -228,6 +242,8 @@ impl Hub {
             when,
             added_at: Utc::now(),
             blocked_at: None,
+            from: from.map(str::to_owned),
+            priority,
             state: ItemState::Pending,
         };
         let added = new.clone();
@@ -238,7 +254,7 @@ impl Hub {
                     "{label} has {MAX_PENDING} prompts queued already: remove some first"
                 )));
             }
-            queue.items.push(new);
+            queue.insert_pending(new);
             Ok(())
         })??;
         eprintln!(
@@ -473,7 +489,34 @@ impl Hub {
     /// once to one agent at rest only the first is typed in: the rest wait
     /// in its queue until the agent has taken it up and finished.
     pub fn send_or_queue(&self, id: &str, text: &str) -> Result<Delivery, HubError> {
+        self.send_or_queue_from(id, text, None, false)
+    }
+
+    /// An ending session takes nothing more (its final prompt is queued
+    /// apart from this).
+    fn refuse_if_ending(record: &SessionRecord) -> Result<(), HubError> {
+        match &record.ending {
+            Some(ending) => Err(StateError::Conflict(format!(
+                "{} is ending (request {}): it takes no more messages",
+                record.name, ending.id
+            ))
+            .into()),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Hub::send_or_queue`] for agent session `from` (`None`: the
+    /// operator); `priority`: queued ahead of every waiting item that is
+    /// not, when it cannot go now.
+    pub(crate) fn send_or_queue_from(
+        &self,
+        id: &str,
+        text: &str,
+        from: Option<&str>,
+        priority: bool,
+    ) -> Result<Delivery, HubError> {
         let record = self.queue_record(id)?;
+        Self::refuse_if_ending(&record)?;
         let text = validate_text(text)?;
         let runtime = self.queue_runtime();
         let _turn = runtime.paste_turn();
@@ -488,6 +531,8 @@ impl Hub {
             when: super::When::Done,
             added_at: Utc::now(),
             blocked_at: None,
+            from: from.map(str::to_owned),
+            priority,
             state: ItemState::Pending,
         });
         let facts = self.queue_facts(&record, &alone);
@@ -535,12 +580,14 @@ impl Hub {
                 Ok(Delivery::Pasted { paste })
             }
             Some(why) => {
-                let (item, view) = self.queue_add(
+                let (item, view) = self.queue_add_from(
                     id,
                     &NewItem {
                         text,
                         when: Some("done".into()),
                     },
+                    from,
+                    priority,
                 )?;
                 Ok(Delivery::Queued {
                     item: item.id,

@@ -159,13 +159,16 @@ Each session's turns, calls, subagents, plan, waits, context, cost, and rate lim
 
 - **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle); list; **Insights**.
 - **Needs you** (sidebar, `fw hub inbox`): blocked, then `asking` (a closing question or an `ask_operator` ask), answered in the row.
-- **Handoffs**: the `handoff` tool (`prompt`, `name`?, `reason`?) saves a pending handoff on the session; a Needs you row each until **Start** (**Review** edits) or **Dismiss**; nothing else clears it. `fw hub continue SESSION [--handoff ID]` starts one, linked. Agents coordinate via `list_sessions`, `message_session` (typed or queued, signed). `fw hub new` inside an agent links to it.
-- **Agent starts**: `start_session` starts a linked session as the caller (kind, account, permissions; `model`?); `session_status` reads one. Policy (pane menu, `fw hub starts --policy`, `agent_starts.policy`): `ask` (a Needs you row), `allowed`, `off`; `[agent_starts]` limits. `fw hub new` inside an agent obeys it.
+- **Handoffs**: the `handoff` tool (`prompt`, `name`?, `reason`?) saves one on the session: a Needs you row until **Start** (**Review** edits) or **Dismiss**. `fw hub continue SESSION [--handoff ID]` starts one, linked. Agents talk via `list_sessions`, `message_session` (typed or queued, signed).
+- **Agent starts**: `start_session` starts a linked session as the caller (kind, account, permissions; `model`?); `session_status` reads one. Policy (pane menu, `fw hub starts --policy`, `agent_starts.policy`): `ask` (a Needs you row), `allowed`, `off`; `[agent_starts]` limits. `fw hub new` inside an agent links to it and obeys it.
+- **Agent ends**: `end_session` (`graceful`: `final_prompt` at the turn boundary, then the end; `at_rest`); `replace_session` (successor first; only `model` changes). Never mid-flight (queue rest rules, no open call or subagent); not in `wait_minutes` (20, max 120): called off, queue restored.
+- **While ending**: its queue is set aside (senders told); answers name what dies (terminal processes, not setsid ones) and dirty work (kept); outcome by message.
+- **Who may**: the owner (`owner`, else the opener; once ended, its newest successor) at once; else, or an operator-started session, a Needs you **Approve** (`fw hub ends`): succession needs no click, the rest one. Not itself; force: `fw hub kill`. `give_session`; `queued_messages` / `cancel_message` (own); `message_session` `priority`.
 - **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (set by `fw worker`); over `_BUDGET`: flagged.
 - **Work** (the header's **work** pill, `fw hub fleet SESSION --turns`): live **map** (stations open; turns replay); plan; per turn a call strip, files, commands, cost, ending. Sidebar rows: plan step, else tool.
-- **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` tool (Claude sessions get the hub's tools and a system-prompt paragraph). Declared status is a claim; no plan, no percentage.
+- **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` (Claude sessions get the hub's tools and a system-prompt paragraph). Declared: a claim; no plan, no percentage.
 - **Capture**: Claude Code's hooks POST to the hub (a process per event only for `SessionStart`, until a status line has shown a CLI of 2.1.322 or later, or under `allowedHttpHookUrls`); its status line carries context, cost, and the 5 h / 7 d gauges (yours still shows: the hub's runs it). Codex: its rollout.
-- **Many hosts**: `[telemetry] upstream = "NAME"` sends this hub's events to that machine (`fw hub machine add`) in batches; while it is down they wait here. Its Fleet lists every hub's sessions.
+- **Many hosts**: `[telemetry] upstream = "NAME"` sends this hub's events to that machine (`fw hub machine add`) in batches, held while down; its Fleet lists every hub's sessions.
 
 ## Digests
 

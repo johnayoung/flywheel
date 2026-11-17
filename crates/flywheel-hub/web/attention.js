@@ -5,7 +5,9 @@
 // proposed (each its own row, oldest first, whatever the agent's status
 // and whoever watches it; kept on the session until started or
 // dismissed), then sessions agents asked to start (the same, until
-// started or declined), then agents whose turn
+// started or declined), then sessions agents asked to end or replace
+// (a session they do not own, or a replacement their start policy asks
+// about; the same, until approved or declined), then agents whose turn
 // ended asking you something (telemetry's `asking`: a reply, a decision,
 // or a command only you can run; answered in the row: the reply goes
 // through POST /api/broadcast, typed in now or queued), then prompt queues that
@@ -76,6 +78,16 @@ window.FwHubAttention = function (ctx) {
       for (const start of session.start_requests || []) out.push({ session, start });
     }
     out.sort((a, b) => Date.parse(a.start.created_at) - Date.parse(b.start.created_at) || (a.start.id < b.start.id ? -1 : 1));
+    return out;
+  }
+
+  // Every agent end or replacement waiting on the operator, oldest first.
+  function endEntries() {
+    const out = [];
+    for (const session of state.sessions) {
+      for (const end of session.end_requests || []) out.push({ session, end });
+    }
+    out.sort((a, b) => Date.parse(a.end.created_at) - Date.parse(b.end.created_at) || (a.end.id < b.end.id ? -1 : 1));
     return out;
   }
 
@@ -343,6 +355,112 @@ window.FwHubAttention = function (ctx) {
           }),
           start,
         ),
+      ),
+    );
+  }
+
+  const END_WHY = {
+    not_owner: "not its owner",
+    start_policy_ask: "its start policy asks you",
+    both: "not its owner; its start policy asks you",
+  };
+
+  async function approveEnd(session, pending, target, button) {
+    if (button) button.disabled = true;
+    try {
+      await ctx.api("POST", `/api/sessions/${encodeURIComponent(session.id)}/ends/${encodeURIComponent(pending.id)}`, {});
+      ctx.toast(`${pending.replace ? "Replacing" : "Ending"} ${target} for ${session.name}`);
+      if (ctx.refresh) await ctx.refresh();
+    } catch (error) {
+      ctx.toast(`Not approved: ${error.message}`, { tone: "bad" });
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  async function declineEnd(session, pending, target, button) {
+    if (button) button.disabled = true;
+    try {
+      await ctx.api("DELETE", `/api/sessions/${encodeURIComponent(session.id)}/ends/${encodeURIComponent(pending.id)}`);
+      ctx.toast(`Declined; ${target} keeps running`);
+      if (ctx.refresh) await ctx.refresh();
+    } catch (error) {
+      ctx.toast(`Not declined: ${error.message}`, { tone: "bad" });
+    } finally {
+      if (button) button.disabled = false;
+    }
+  }
+
+  // An end (or replacement) an agent asks for: who asks, which session,
+  // why it waits on you, the final prompt's first lines, and Decline /
+  // Approve. Approving starts the end: it still waits for the session's
+  // turn to finish and nothing to run.
+  function endRow({ session, end: pending }) {
+    const workspace = workspaceById(session.workspace_id);
+    const active = state.attached === session.id;
+    const targetSession = state.sessions.find((s) => s.id === pending.target);
+    const target = targetSession ? targetSession.name : pending.target.slice(0, 8);
+    const verb = pending.replace ? `replace ${target} with ${pending.replace.name}` : `end ${target}`;
+    const text = pending.replace
+      ? `${pending.final_prompt || ""}\n\n-- ${pending.replace.name}'s prompt --\n${pending.replace.prompt}`
+      : pending.final_prompt || (pending.mode === "at_rest" ? "(at its next rest, no final prompt)" : "");
+    const lines = text.split("\n");
+    const preview = lines.slice(0, HANDOFF_PREVIEW).join("\n") + (lines.length > HANDOFF_PREVIEW ? `\n... ${lines.length - HANDOFF_PREVIEW} more lines` : "");
+    const approve = el("button", {
+      type: "button",
+      className: "slab attn-start",
+      textContent: "Approve",
+      title: `${pending.replace ? "Replace" : "End"} ${target} as ${session.name} asks: once its turn is over and nothing runs; ${session.name} is told`,
+      onclick: () => approveEnd(session, pending, target, approve),
+    });
+    const drop = el("button", {
+      type: "button",
+      className: "slab ghost attn-dismiss",
+      textContent: "Decline",
+      title: `${target} keeps running; ${session.name} is told`,
+      onclick: () => declineEnd(session, pending, target, drop),
+    });
+    return el(
+      "li",
+      { dataset: { end: pending.id } },
+      el(
+        "button",
+        {
+          type: "button",
+          className: `attn-row handoff${active ? " active" : ""}`,
+          dataset: { id: session.id },
+          title: `Open ${session.name}`,
+          onclick: () => openSession(session.id),
+        },
+        el("span", { className: `glyph ${session.kind}` }, icon(session.kind === "codex" ? "codex" : "claude")),
+        el(
+          "span",
+          { className: "attn-text" },
+          el(
+            "span",
+            { className: "attn-line" },
+            el("b", { className: "attn-name", textContent: session.name }),
+            el("span", { className: "attn-next", textContent: `\u00d7 ${target}`, title: "The session it would end" }),
+            el("span", { className: "attn-ws", textContent: workspace ? workspace.name : "" }),
+          ),
+          el("span", {
+            className: "attn-detail",
+            textContent: `${verb} (${END_WHY[pending.why] || pending.why})`,
+            title: `${session.name} asks to ${verb}`,
+          }),
+        ),
+        el(
+          "span",
+          { className: "attn-meta" },
+          el("span", { className: "attn-status handoff", textContent: pending.replace ? "replace" : "end" }),
+          el("span", { className: "attn-age", textContent: age(pending.created_at) }),
+        ),
+      ),
+      el(
+        "div",
+        { className: "attn-ask attn-pending" },
+        preview.trim() ? el("pre", { className: "attn-handoff-preview", textContent: preview }) : null,
+        el("div", { className: "attn-handoff-actions" }, drop, approve),
       ),
     );
   }
@@ -627,20 +745,21 @@ window.FwHubAttention = function (ctx) {
     const list = entries();
     const passed = handoffEntries();
     const starts = startEntries();
+    const ends = endEntries();
     shown = new Set(list.map((e) => e.session.id));
-    pendingCount = passed.length + starts.length;
+    pendingCount = passed.length + starts.length + ends.length;
     const loop = flywheel ? flywheel.attention() : [];
     const graded = fanout ? fanout.attention() : [];
     const queues = ctx.queue ? ctx.queue().attention() : [];
     for (const root of [$("#attention"), $("#empty-attention")]) {
       if (!root) continue;
-      const any = list.length || passed.length || starts.length || loop.length || graded.length || queues.length;
+      const any = list.length || passed.length || starts.length || ends.length || loop.length || graded.length || queues.length;
       root.hidden = !any;
-      root.replaceChildren(...(any ? content(list, passed, starts, loop, graded, queues) : []));
+      root.replaceChildren(...(any ? content(list, passed, starts, ends, loop, graded, queues) : []));
     }
   }
 
-  function content(list, passed, starts, loop, graded, queues) {
+  function content(list, passed, starts, ends, loop, graded, queues) {
     const blocked = list.filter((e) => e.level === 0).length;
     const asking = list.filter((e) => e.level === 1).length;
     const alerts = loop.reduce((n, e) => n + (e.count || 1), 0);
@@ -655,6 +774,7 @@ window.FwHubAttention = function (ctx) {
             blocked ? `${blocked} blocked` : "",
             passed.length ? `${passed.length} handoff${passed.length === 1 ? "" : "s"}` : "",
             starts.length ? `${starts.length} start${starts.length === 1 ? "" : "s"}` : "",
+            ends.length ? `${ends.length} end${ends.length === 1 ? "" : "s"}` : "",
             asking ? `${asking} asking` : "",
             list.length - blocked - asking ? `${list.length - blocked - asking} done` : "",
             alerts ? `${alerts} flywheel` : "",
@@ -673,6 +793,7 @@ window.FwHubAttention = function (ctx) {
         list.filter((e) => e.level === 0).map(row),
         passed.map(handoffRow),
         starts.map(startRow),
+        ends.map(endRow),
         list.filter((e) => e.level === 1).map(row),
         queues.map((s) => ctx.queue().attentionRow(s)),
         graded.map((f) => fanout.attentionRow(f)),

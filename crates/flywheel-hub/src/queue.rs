@@ -63,7 +63,7 @@ mod delivery;
 mod runtime;
 
 pub use api::Delivery;
-pub(crate) use deciding::{event_item, event_text};
+pub(crate) use deciding::{Presence, event_item, event_text};
 pub use runtime::{EDIT_LEASE, QueueRuntime, SessionHold, TypingExport};
 
 /// Pending items per session.
@@ -151,6 +151,14 @@ pub struct QueueItem {
     /// (a `blocked-cleared` item waits for the rest after it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_at: Option<DateTime<Utc>>,
+    /// The agent session that sent it (`message_session`): its id.
+    /// `None`: the operator, the API, or the hub itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Sent ahead of every waiting item that is not (behind earlier
+    /// priority items; never ahead of one being sent).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub priority: bool,
     #[serde(flatten)]
     pub state: ItemState,
 }
@@ -229,6 +237,30 @@ impl SessionQueue {
                 true
             }
         });
+    }
+
+    /// Insert `item` among the pending items: a priority item behind the
+    /// waiting priority items, ahead of the rest; any other at the end.
+    /// Never ahead of an item being sent (it is not pending). The item
+    /// that loses the front forgets a block it saw.
+    pub(crate) fn insert_pending(&mut self, item: QueueItem) {
+        let old_head = self.head().map(|i| i.id.clone());
+        let at = if item.priority {
+            self.items
+                .iter()
+                .position(|i| matches!(i.state, ItemState::Pending) && !i.priority)
+                .unwrap_or(self.items.len())
+        } else {
+            self.items.len()
+        };
+        self.items.insert(at, item);
+        self.settle_order();
+        if let Some(old) = old_head
+            && self.head().is_some_and(|h| h.id != old)
+            && let Some(item) = self.item_mut(&old)
+        {
+            item.blocked_at = None;
+        }
     }
 
     /// Put delivered items first (their delivery order), the rest after

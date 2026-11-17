@@ -753,6 +753,35 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
         What::Continued {
             successor: "s2".into(),
         },
+        What::EndRequested {
+            by: "s1".into(),
+            mode: "graceful".into(),
+            dropped: 2,
+            target: Some("s3".into()),
+        },
+        What::EndCancelled {
+            why: "the operator called it off".into(),
+            target: None,
+        },
+        What::Ended {
+            by: "operator".into(),
+            killed: vec!["7 npm run dev".into()],
+            dirty: Some("/wt has 1 untracked file".into()),
+            successor: Some("s2".into()),
+            target: None,
+        },
+        What::Replaced {
+            successor: "s2".into(),
+        },
+        What::OwnerChanged {
+            from: Some("s1".into()),
+            to: "s2".into(),
+            by: "s1".into(),
+        },
+        What::QueueCancelled {
+            by: "s1".into(),
+            items: 2,
+        },
         What::SessionFinished { reason: None },
         What::TurnStarted { title: "t".into() },
         What::TurnFinished { ending: None },

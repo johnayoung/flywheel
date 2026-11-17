@@ -39,6 +39,8 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | POST | `/api/sessions/{id}/continue` | `{"handoff"?,"prompt"?,"name"?}` (default: the only pending handoff's): linked successor; 201 |
 | DELETE | `/api/sessions/{id}/handoffs/{handoff}` | dismiss a pending handoff; 204 |
 | POST / DELETE | `/api/sessions/{id}/starts/{start}` | start `{"prompt"?,"name"?}` (201) / decline (204) a waiting agent start |
+| POST / DELETE | `/api/sessions/{id}/ends/{end}` | approve (200) / decline (204) an agent's end |
+| DELETE | `/api/sessions/{id}/ending` | call off its end |
 | PUT | `/api/sessions/{id}/start-policy` | `{"policy"}`: `ask` `allowed` `off` `default` |
 | GET | `/api/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered text: `visible` rows, or `recent` lines (1..100000, 100); cursor, modes |
 | GET | `/api/sessions/{id}/explain` | as `fw hub explain --json` |
@@ -61,7 +63,8 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
-A session lists `agent` (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs` (`id`, `name`?, `reason`?, `prompt`, `created_at`; kept until started or dismissed), `start_sessions`, `start_policy` (in force), `start_requests`, `starts_made`.
+A session lists `agent` (`detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs` (`id`, `name`?, `reason`?, `prompt`, `created_at`), `start_sessions`, `start_policy` (in force), `start_requests`, `starts_made`,
+`owner`, `ending`, `ended`, `end_requests`; queue items: `from`, `priority`.
 
 ## Review, handoff, peer review
 
@@ -260,14 +263,15 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 | GET | `/api/telemetry/sessions/{id}/turns[?host=&limit=]` | `turns`, newest first, folded |
 | POST | `/api/telemetry/batch` | another hub's events, NDJSON (or `Content-Encoding: deflate`) -> `received`, `accepted` |
 | POST | `/api/telemetry/hook` | a Claude Code hook; no login: `x-flywheel-session`, `x-flywheel-secret` |
-| POST | `/api/telemetry/mcp` | agent tools (MCP over http; `handoff` saves a pending handoff, returns its id); same headers |
+| POST | `/api/telemetry/mcp` | agent tools (MCP over http; [hub-workflows](workflows.md#fleet-and-work)); same headers |
 | POST | `/api/telemetry/capture` | an outside run's hook: `x-flywheel-capture`; session, `-batch`, `-budget` headers |
 
 Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`work`: turn or subagent; `item`: plan item).
 
 Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?,prompt?}`), `failed`, `working`, `done`, `idle`, `ended`; `links` (captured `cc-<id>`: `captured`, `batch`, `budget_usd`).
 
-Kinds: `session.started`, `session.continued`, `session.finished`, `turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
+Kinds: `session.started`, `session.continued`, `session.end_requested`, `session.end_cancelled`, `session.ended`, `session.replaced`, `session.owner_changed`, `queue.cancelled`, `session.finished`,
+`turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
 
 ## Events WebSocket
 

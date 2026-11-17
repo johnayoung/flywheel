@@ -112,6 +112,10 @@ enum HubCommand {
     /// the starts waiting on you, set it (--policy), or start or decline
     /// one.
     Starts(script::StartsArgs),
+    /// The ends an agent session asked for that wait on you (end_session,
+    /// replace_session on a session it does not own), and its own end in
+    /// progress: approve or decline one, or cancel the end.
+    Ends(script::EndsArgs),
     /// Import VS Code multi-root workspace files (*.code-workspace) as
     /// workspaces: their folders (git repos or plain directories) and
     /// folder names; missing folders are reported and skipped.
@@ -794,6 +798,7 @@ fn dispatch_verb(
         HubCommand::Relaunch(args) => script::relaunch(&args, out, err),
         HubCommand::Continue(args) => script::continue_session(&args, out, err),
         HubCommand::Starts(args) => script::starts(&args, out, err),
+        HubCommand::Ends(args) => script::ends(&args, out, err),
         HubCommand::Import(args) => script::import(&args, out, err),
         HubCommand::Open(args) => browser::open(&args, out, err),
         HubCommand::Machine(args) => crate::machine_cli::machine(&args, out, err),

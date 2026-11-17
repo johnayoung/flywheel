@@ -243,9 +243,67 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
-    fn message(&self, to: &str, text: &str) -> Result<String, String> {
+    fn message(&self, to: &str, text: &str, priority: bool) -> Result<String, String> {
         self.hub
-            .agent_message(&self.session, to, text)
+            .agent_message(&self.session, to, text, priority)
+            .map_err(|e| e.to_string())
+    }
+
+    fn end_session(
+        &self,
+        to: &str,
+        mode: crate::state::EndMode,
+        final_prompt: Option<&str>,
+        wait_minutes: Option<u32>,
+    ) -> Result<String, String> {
+        let end = crate::hub::AgentEnd {
+            to: to.to_owned(),
+            mode,
+            final_prompt: final_prompt.map(str::to_owned),
+            wait_minutes,
+        };
+        self.hub
+            .agent_end(&self.session, end)
+            .map_err(|e| e.to_string())
+    }
+
+    fn replace_session(&self, args: &mcp::ReplaceArgs) -> Result<String, String> {
+        let replace = crate::hub::AgentReplace {
+            to: args.to.clone(),
+            name: args.name.clone(),
+            prompt: args.prompt.clone(),
+            final_prompt: args.final_prompt.clone(),
+            model: args.model.clone(),
+            folder: args.folder.as_deref().map(std::path::PathBuf::from),
+            worktree: args
+                .worktree
+                .as_ref()
+                .map(|(task, base)| crate::state::WorktreeRequest {
+                    task: task.clone(),
+                    base: base.clone(),
+                }),
+            wait_minutes: args.wait_minutes,
+        };
+        self.hub
+            .agent_replace(&self.session, replace)
+            .map_err(|e| e.to_string())
+    }
+
+    fn queued_messages(&self, to: &str) -> Result<String, String> {
+        self.hub
+            .agent_queued(&self.session, to)
+            .map_err(|e| e.to_string())
+    }
+
+    fn cancel_message(&self, to: &str, item: Option<&str>) -> Result<String, String> {
+        self.hub
+            .agent_cancel(&self.session, to, item)
+            .map_err(|e| e.to_string())
+    }
+
+    fn give_session(&self, to: &str, new_owner: &str) -> Result<String, String> {
+        self.hub
+            .give_session(&self.session, to, new_owner)
             .map_err(|e| e.to_string())
     }
 

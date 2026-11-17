@@ -344,6 +344,9 @@ function renderSession(session, opts = {}) {
       ? el("span", { className: "session-detail", textContent: st.detail })
       : null,
     progressLine(session, st),
+    // An agent's end in progress, or how one ended it: a line of its own
+    // (the meta strip has no room beside the name).
+    endingHint(session),
     // Where it runs (shown on the active row); a companion (or a
     // reviewer) under its agent: the agent's line says it all.
     parent && sessionById(parent) ? null : whereLine(session),
@@ -362,6 +365,31 @@ function starterHint(session) {
     textContent: `\u2190 ${starter.name}`,
     title: `Started by ${starter.name}`,
   });
+}
+
+// An end in progress ("ending (by lead)"), or how an agent or the
+// operator ended it ("replaced by new", "ended by lead").
+function endingHint(session) {
+  const nameOf = (id) => (sessionById(id) || {}).name || String(id || "").slice(0, 8);
+  const byName = (by) => (by && by.kind === "session" ? nameOf(by.id) : "you");
+  if (session.ending) {
+    const e = session.ending;
+    const what = e.replace ? `replacing with ${e.replace.name}` : "ending";
+    return el("span", {
+      className: "session-detail session-ending",
+      textContent: `${what} (by ${byName(e.by)})`,
+      title: `${byName(e.by)} asked to ${e.replace ? "replace" : "end"} it (${e.mode}); now ${e.phase.replace(/_/g, " ")}; called off at ${new Date(e.deadline).toLocaleTimeString()} if not done`,
+    });
+  }
+  if (session.ended && session.ended.by.kind === "session") {
+    const e = session.ended;
+    return el("span", {
+      className: "session-detail session-ending",
+      textContent: e.successor ? `replaced by ${nameOf(e.successor)}` : `ended by ${byName(e.by)}`,
+      title: `Ended by ${byName(e.by)} (${e.mode}) at ${new Date(e.at).toLocaleString()}`,
+    });
+  }
+  return null;
 }
 
 // How far along a working (or blocked) agent is, from its telemetry: the

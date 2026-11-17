@@ -220,6 +220,54 @@ pub enum What {
     /// A new session took over this one's work (a handoff accepted).
     #[serde(rename = "session.continued")]
     Continued { successor: String },
+    /// An end was asked for (`end_session`, `replace_session`): by whom
+    /// (a session id, or `operator`), how, and how many queued messages it
+    /// set aside. On the asker's log, `target` names the session.
+    #[serde(rename = "session.end_requested")]
+    EndRequested {
+        by: String,
+        mode: String,
+        #[serde(default)]
+        dropped: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
+    /// An end in progress was called off (its deadline passed, the
+    /// operator cancelled it, a successor did not start).
+    #[serde(rename = "session.end_cancelled")]
+    EndCancelled {
+        why: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
+    /// The session was ended: by whom, the processes that went with it
+    /// (`pid command`), the work left in its directory, its successor.
+    #[serde(rename = "session.ended")]
+    Ended {
+        by: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        killed: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dirty: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        successor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
+    /// A replacement took over this session's work (it then ended).
+    #[serde(rename = "session.replaced")]
+    Replaced { successor: String },
+    /// Control of the session passed to another (`give_session`).
+    #[serde(rename = "session.owner_changed")]
+    OwnerChanged {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        to: String,
+        by: String,
+    },
+    /// A sender took back queued messages it had sent (`cancel_message`).
+    #[serde(rename = "queue.cancelled")]
+    QueueCancelled { by: String, items: u32 },
     #[serde(rename = "session.finished")]
     SessionFinished {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -381,6 +429,12 @@ impl What {
         match self {
             Self::SessionStarted { .. } => "session.started",
             Self::Continued { .. } => "session.continued",
+            Self::EndRequested { .. } => "session.end_requested",
+            Self::EndCancelled { .. } => "session.end_cancelled",
+            Self::Ended { .. } => "session.ended",
+            Self::Replaced { .. } => "session.replaced",
+            Self::OwnerChanged { .. } => "session.owner_changed",
+            Self::QueueCancelled { .. } => "queue.cancelled",
             Self::SessionFinished { .. } => "session.finished",
             Self::TurnStarted { .. } => "turn.started",
             Self::TurnFinished { .. } => "turn.finished",
@@ -419,6 +473,12 @@ impl What {
 pub const KINDS: &[&str] = &[
     "session.started",
     "session.continued",
+    "session.end_requested",
+    "session.end_cancelled",
+    "session.ended",
+    "session.replaced",
+    "session.owner_changed",
+    "queue.cancelled",
     "session.finished",
     "turn.started",
     "turn.finished",

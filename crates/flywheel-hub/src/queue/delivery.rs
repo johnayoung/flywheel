@@ -36,7 +36,13 @@ impl Hub {
                     if hub.queue_runtime().is_stopped() {
                         break;
                     }
-                    let sending = !hub.queue_runtime().is_paused() && hub.queue_tick();
+                    // Ends in progress are driven here too: they wait on
+                    // the same turn boundaries the queue does.
+                    let sending = !hub.queue_runtime().is_paused() && {
+                        let queued = hub.queue_tick();
+                        let ending = hub.endings_tick();
+                        queued || ending
+                    };
                     wait = sending.then_some(TICK);
                 }
             });
@@ -286,6 +292,10 @@ impl Hub {
                         0
                     }
                 };
+                // An end's final prompt: its turn is the one after this
+                // paste began (the agent may take it up before the paste
+                // returns).
+                self.final_prompt_sent(id, item_id, now);
                 eprintln!(
                     "fw hub: queue {id}: delivered {} ({} bytes, {}); {pending} pending",
                     &item_id[..item_id.len().min(8)],

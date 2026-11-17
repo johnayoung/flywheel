@@ -333,6 +333,11 @@ function paneMenu(pane, x, y) {
       items.push({ label, disabled: (own || "default") === policy, run: () => setStartPolicy(session, policy) });
     }
   }
+  if (session.ending) {
+    const by = session.ending.by && session.ending.by.kind === "session" ? (sessionById(session.ending.by.id) || {}).name : null;
+    items.push({ group: `ending${by ? ` (by ${by})` : ""}: ${session.ending.phase.replace(/_/g, " ")}` });
+    items.push({ label: "Call off the end (keeps running)", run: () => cancelEnding(session) });
+  }
   if (others.length) {
     items.push({ group: "show beside" });
     for (const other of others.slice(0, 8)) {
@@ -354,6 +359,17 @@ async function setStartPolicy(session, policy) {
     await refresh();
   } catch (error) {
     commands.toast(`Not changed: ${error.message}`, { timeout: 5000 });
+  }
+}
+
+// Call off an agent's end of this session: its queue comes back, and the
+// agent that asked is told.
+async function cancelEnding(session) {
+  try {
+    await api("DELETE", `/api/sessions/${encodeURIComponent(session.id)}/ending`);
+    await refresh();
+  } catch (error) {
+    commands.toast(`Not called off: ${error.message}`, { timeout: 5000 });
   }
 }
 

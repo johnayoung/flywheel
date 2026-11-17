@@ -108,9 +108,10 @@ use auth::{
 pub use events_ws::SESSIONS_PUSH_INTERVAL;
 use events_ws::{events_ws, text};
 use sessions_api::{
-    approve_start, check_folder, continue_session, create_session, decline_start, dismiss_handoff,
-    get_session, kill_session, list_kinds, list_sessions, restart_session, session_input,
-    session_screen, set_start_policy, update_session,
+    approve_end, approve_start, cancel_ending, check_folder, continue_session, create_session,
+    decline_end, decline_start, dismiss_handoff, get_session, kill_session, list_kinds,
+    list_sessions, restart_session, session_input, session_screen, set_start_policy,
+    update_session,
 };
 use terminal_ws::{handoff_restarting, session_ws};
 use workspaces_api::{
@@ -342,6 +343,14 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route(
             "/api/sessions/{id}/starts/{start}",
             post(approve_start).delete(decline_start),
+        )
+        .route(
+            "/api/sessions/{id}/ends/{end}",
+            post(approve_end).delete(decline_end),
+        )
+        .route(
+            "/api/sessions/{id}/ending",
+            axum::routing::delete(cancel_ending),
         )
         .route("/api/sessions/{id}/start-policy", put(set_start_policy))
         // The route's first name, kept for older clients.

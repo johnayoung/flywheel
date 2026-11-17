@@ -421,6 +421,7 @@ body.list-hidden .side-list { display: none; }
   text-transform: none;
   letter-spacing: 0;
 }
+.session-detail.session-ending { color: var(--brass); }
 .session-state.bad { color: var(--alert); }
 .session-state.live { color: var(--signal); }
 .session-state.brass { color: var(--brass); font-weight: 700; }

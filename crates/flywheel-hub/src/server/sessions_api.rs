@@ -117,7 +117,8 @@ pub(super) async fn kill_session(
     Path(id): Path<String>,
 ) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
-    blocking(move || hub.kill_session(&id)).await?;
+    // The operator's force: recorded as ended by the operator.
+    blocking(move || hub.operator_kill(&id)).await?;
     Ok(StatusCode::ACCEPTED.into_response())
 }
 
@@ -203,6 +204,37 @@ pub(super) async fn decline_start(
     let hub = Arc::clone(&app.hub);
     blocking(move || hub.decline_start(&id, &start)).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Start an end (or replacement) an agent asked for: 200 with the
+/// session being ended.
+pub(super) async fn approve_end(
+    State(app): State<AppState>,
+    Path((id, end)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let view = blocking(move || hub.approve_end(&id, &end)).await?;
+    Ok(Json(view).into_response())
+}
+
+/// Decline an end an agent asked for: 204.
+pub(super) async fn decline_end(
+    State(app): State<AppState>,
+    Path((id, end)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    blocking(move || hub.decline_end(&id, &end)).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// Call off a session's end in progress: 200 with the session.
+pub(super) async fn cancel_ending(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let hub = Arc::clone(&app.hub);
+    let view = blocking(move || hub.cancel_ending(&id)).await?;
+    Ok(Json(view).into_response())
 }
 
 #[derive(Deserialize)]

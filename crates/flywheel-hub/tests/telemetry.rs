@@ -238,7 +238,12 @@ async fn hooks_posted_to_the_hub_drive_status_and_are_recorded() {
             "mcp__flywheel__handoff",
             "mcp__flywheel__list_sessions",
             "mcp__flywheel__start_session",
-            "mcp__flywheel__session_status"
+            "mcp__flywheel__session_status",
+            "mcp__flywheel__end_session",
+            "mcp__flywheel__replace_session",
+            "mcp__flywheel__queued_messages",
+            "mcp__flywheel__cancel_message",
+            "mcp__flywheel__give_session"
         ])
     );
     let mcp: Value = serde_json::from_str(arg_after(&args, "--mcp-config")).unwrap();

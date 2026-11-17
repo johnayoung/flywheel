@@ -1723,6 +1723,10 @@ mod tests {
             start_sessions: None,
             start_requests: Vec::new(),
             starts_made: 0,
+            owner: None,
+            ending: None,
+            ended: None,
+            end_requests: Vec::new(),
         }
     }
 

@@ -82,6 +82,7 @@ fw hub fleet [SESSION [--turns [N]]] [--status STATUS]... [--hours N] [--host HU
 fw hub inbox [--hours N] [--host HUB_ID] [--json] {where}  # pending handoffs, blocked and asking sessions, with how to answer
 fw hub continue SESSION [--handoff ID] [--name NAME] [--prompt TEXT|-] [--json] {where}  # a linked successor (default: the only pending handoff)
 fw hub starts SESSION [--policy ask|allowed|off|default] [--start ID | --decline ID] [--json] {where}
+fw hub ends SESSION [--approve ID | --decline ID | --cancel] [--json] {where}  # --cancel: its own end
 fw hub insights [--hours N] [--project NAME] [--host HUB_ID] [--json] {where}
 fw hub capture install [--settings FILE]  # outside runs report
 fw hub capture uninstall [--settings FILE]

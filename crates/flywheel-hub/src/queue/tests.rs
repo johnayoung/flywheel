@@ -15,6 +15,8 @@ fn item(id: &str, when: When) -> QueueItem {
         when,
         added_at: at(0),
         blocked_at: None,
+        from: None,
+        priority: false,
         state: ItemState::Pending,
     }
 }
@@ -389,4 +391,56 @@ fn the_delivery_wakeup_keeps_nudges_and_closes_with_the_runtime() {
     std::thread::sleep(Duration::from_millis(50));
     drop(rt);
     assert!(!waiter.join().unwrap(), "a closed wakeup ends the wait");
+}
+
+#[test]
+fn a_priority_item_goes_behind_earlier_priority_items_and_never_ahead_of_one_being_sent() {
+    let sending = QueueItem {
+        state: ItemState::Sending { sending_at: at(1) },
+        ..item("s1", When::Done)
+    };
+    let delivered = QueueItem {
+        state: ItemState::Delivered {
+            delivered_at: at(0),
+            reconciled: false,
+        },
+        ..item("d1", When::Done)
+    };
+    let mut q = queue(vec![
+        delivered,
+        sending,
+        item("p1", When::Done),
+        item("p2", When::Done),
+    ]);
+    q.items[2].blocked_at = Some(at(2));
+    let urgent = |id: &str| QueueItem {
+        priority: true,
+        from: Some("lead".into()),
+        ..item(id, When::Done)
+    };
+    q.insert_pending(urgent("u1"));
+    q.insert_pending(urgent("u2"));
+    q.insert_pending(item("p3", When::Done));
+    let order: Vec<&str> = q.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(order, ["d1", "s1", "u1", "u2", "p1", "p2", "p3"]);
+    // The item being sent stays the head.
+    assert_eq!(q.head().unwrap().id, "s1");
+    // With nothing being sent, a priority item takes the front, and the
+    // old head forgets the block it saw.
+    let mut q = queue(vec![
+        item("p1", When::BlockedCleared),
+        item("p2", When::Done),
+    ]);
+    q.items[0].blocked_at = Some(at(2));
+    q.insert_pending(urgent("u1"));
+    let order: Vec<&str> = q.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(order, ["u1", "p1", "p2"]);
+    assert_eq!(q.items[1].blocked_at, None);
+    // Stored items from before senders were kept read as the operator's.
+    let old: QueueItem = serde_json::from_str(
+        r#"{"id":"x1","text":"t","added_at":"2027-01-15T08:00:00Z","state":"pending"}"#,
+    )
+    .unwrap();
+    assert_eq!(old.from, None);
+    assert!(!old.priority);
 }

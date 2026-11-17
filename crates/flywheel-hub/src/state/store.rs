@@ -2,10 +2,10 @@
 //! atomically (rolled back in memory when the save fails).
 
 use super::{
-    FolderSpec, LaunchTemplate, MAX_PENDING_HANDOFFS, MAX_PENDING_STARTS, MAX_TEMPLATES,
-    PendingHandoff, PendingStart, STATE_FILE, STATE_VERSION, STATE_VERSION_MIN, SessionRecord,
-    SessionState, StartPolicy, StateDoc, StateError, UNCLEAN_STOP, Workspace, WorkspaceInput,
-    new_id, validate_folders, validate_name,
+    FolderSpec, LaunchTemplate, MAX_PENDING_ENDS, MAX_PENDING_HANDOFFS, MAX_PENDING_STARTS,
+    MAX_TEMPLATES, PendingEnd, PendingHandoff, PendingStart, STATE_FILE, STATE_VERSION,
+    STATE_VERSION_MIN, SessionRecord, SessionState, StartPolicy, StateDoc, StateError,
+    UNCLEAN_STOP, Workspace, WorkspaceInput, new_id, validate_folders, validate_name,
 };
 use crate::auth::write_private;
 use crate::fanout::{Fanout, MAX_FANOUTS};
@@ -608,6 +608,54 @@ impl HubStore {
         let previous = self.doc.sessions[index].starts_made;
         self.doc.sessions[index].starts_made = previous.saturating_add(1);
         self.save_or_rollback(|doc| doc.sessions[index].starts_made = previous)
+    }
+
+    /// Change session `id`'s record with `edit` and save (put back as it
+    /// was when the save fails). For the end and ownership fields, which
+    /// change together.
+    pub fn update_session<R>(
+        &mut self,
+        id: &str,
+        edit: impl FnOnce(&mut SessionRecord) -> R,
+    ) -> Result<R, StateError> {
+        let index = self.session_index(id)?;
+        let previous = self.doc.sessions[index].clone();
+        let result = edit(&mut self.doc.sessions[index]);
+        if self.doc.sessions[index] == previous {
+            return Ok(result);
+        }
+        self.save_or_rollback(|doc| doc.sessions[index] = previous)?;
+        Ok(result)
+    }
+
+    /// Add an end session `id`'s agent asked for. At most
+    /// [`MAX_PENDING_ENDS`] wait per session.
+    pub fn add_end_request(&mut self, id: &str, end: PendingEnd) -> Result<(), StateError> {
+        let index = self.session_index(id)?;
+        let pending = &mut self.doc.sessions[index].end_requests;
+        if pending.len() >= MAX_PENDING_ENDS {
+            return Err(StateError::Invalid(format!(
+                "{MAX_PENDING_ENDS} ends already wait on the operator: wait until they approve or decline one"
+            )));
+        }
+        pending.push(end);
+        self.save_or_rollback(|doc| {
+            doc.sessions[index].end_requests.pop();
+        })
+    }
+
+    /// Remove session `id`'s pending end `end`; it is returned.
+    pub fn remove_end_request(&mut self, id: &str, end: &str) -> Result<PendingEnd, StateError> {
+        let index = self.session_index(id)?;
+        let at = self.doc.sessions[index]
+            .end_requests
+            .iter()
+            .position(|e| e.id == end)
+            .ok_or_else(|| StateError::NotFound(format!("end request {end}")))?;
+        let removed = self.doc.sessions[index].end_requests.remove(at);
+        let undo = removed.clone();
+        self.save_or_rollback(|doc| doc.sessions[index].end_requests.insert(at, undo))?;
+        Ok(removed)
     }
 
     /// Pair `author` with the reviewer agent `reviewer` (both records

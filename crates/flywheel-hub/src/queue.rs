@@ -24,10 +24,9 @@
 //!   hub makes: a handoff, send findings, a plugin action);
 //! * nothing typed into the agent's input line sits there unsent (a
 //!   [`Draft`] someone left half-typed: the paste and its Enter would send
-//!   the two merged) -- keys answering a blocked prompt do not count --
-//!   and its screen shows none there either (the input line is read off
-//!   the screen too: the typed bytes miss text that reached the line
-//!   while the hub took the agent for blocked);
+//!   the two merged). The input line is read off the screen, which
+//!   wins either way when it shows one; else the bytes typed into the
+//!   session say (keys answering a blocked prompt do not count);
 //! * no editor has the item open (a lease the drawer renews);
 //! * no fan-out grading is queued or running on it, and no review action
 //!   (commit, push, merge, ask for a review, send findings) or handoff is

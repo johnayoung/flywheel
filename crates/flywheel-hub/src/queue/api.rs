@@ -33,21 +33,28 @@ impl Hub {
         self.queue_runtime().note(id, bytes, !blocked);
     }
 
-    /// Characters sitting unsent in `record`'s input line: what was typed
-    /// into it and never sent, or what its screen shows there, whichever
-    /// is more. The typed bytes miss what the hub never saw reach the line
-    /// (keys typed while a dialog was up that the agent kept once it
-    /// closed, a draft from before a restart), so the screen is read too:
-    /// nothing the hub sends is ever typed onto unsent text.
+    /// Characters sitting unsent in `record`'s input line. Its screen
+    /// says, when the input line can be read off it: text there holds
+    /// every delivery, and an empty line holds none and resets the typed
+    /// count. The typed bytes are wrong both ways around a blocked prompt
+    /// (keys typed while the hub takes the agent for blocked are left out
+    /// of them, yet can reach the line or send it), so they count only
+    /// when the screen shows no input line to read.
     pub(crate) fn unsent_input(&self, record: &SessionRecord) -> usize {
-        let typed = self.queue_runtime().draft_chars(&record.id);
         let shown = record
             .runs_agent()
             .then(|| self.live_session(&record.id))
             .flatten()
             .filter(|s| s.exit_info().is_none())
             .and_then(|s| unsent_on_screen(record.kind, &s.undimmed_rows()));
-        typed.max(shown.unwrap_or(0))
+        match shown {
+            Some(0) => {
+                self.queue_runtime().clear_draft(&record.id);
+                0
+            }
+            Some(shown) => shown,
+            None => self.queue_runtime().draft_chars(&record.id),
+        }
     }
 
     /// Paste a prompt the hub wrote (a handoff, review findings, a fix

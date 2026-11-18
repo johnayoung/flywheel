@@ -1072,3 +1072,32 @@ async fn text_left_in_the_input_line_while_blocked_holds_every_delivery() {
     want.extend(pasted("queued behind it"));
     agent.typed_becomes(&want).await;
 }
+
+/// The other way round: the typed bytes say text sits unsent (its Enter
+/// was typed while the hub took the agent for blocked, so never counted)
+/// but the screen shows the input line empty. The screen wins: nothing
+/// waits forever on a draft that is not there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_input_line_the_screen_shows_empty_holds_nothing() {
+    let hub = TestHub::start().await;
+    std::fs::create_dir_all(hub.root.join("log")).unwrap();
+    std::fs::write(hub.root.join("log/draft"), "").unwrap();
+    let agent = hub.claude().await;
+    agent.fire("SessionStart", None).await;
+    status_is(&hub, &agent.id, "idle").await;
+    let mut term = hub.ws(&format!("/api/sessions/{}/ws", agent.id)).await;
+    term.send(Message::Binary(b"hey".to_vec().into()))
+        .await
+        .unwrap();
+    let mut want = b"hey".to_vec();
+    agent.typed_becomes(&want).await;
+    drop(term);
+    hub.add(&agent.id, "onto an empty line", None).await;
+    want.extend(pasted("onto an empty line"));
+    agent.typed_becomes(&want).await;
+    // The typed count was reset with it: the next one is not held either.
+    agent.turn().await;
+    hub.add(&agent.id, "and the next", None).await;
+    want.extend(pasted("and the next"));
+    agent.typed_becomes(&want).await;
+}

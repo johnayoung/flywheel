@@ -2,6 +2,7 @@
 //! and CLI make.
 
 use super::deciding::{Decision, Facts, Presence, decide, exit_text};
+use super::input_line::unsent_on_screen;
 use super::runtime::{SessionHold, lock};
 use super::{
     ItemEdit, ItemState, ItemView, MAX_PENDING, NewItem, QueueBrief, QueueItem, QueueView,
@@ -30,6 +31,46 @@ impl Hub {
             .agent_status(id)
             .is_some_and(|s| s.status == AgentStatus::Blocked);
         self.queue_runtime().note(id, bytes, !blocked);
+    }
+
+    /// Characters sitting unsent in `record`'s input line: what was typed
+    /// into it and never sent, or what its screen shows there, whichever
+    /// is more. The typed bytes miss what the hub never saw reach the line
+    /// (keys typed while a dialog was up that the agent kept once it
+    /// closed, a draft from before a restart), so the screen is read too:
+    /// nothing the hub sends is ever typed onto unsent text.
+    pub(crate) fn unsent_input(&self, record: &SessionRecord) -> usize {
+        let typed = self.queue_runtime().draft_chars(&record.id);
+        let shown = record
+            .runs_agent()
+            .then(|| self.live_session(&record.id))
+            .flatten()
+            .filter(|s| s.exit_info().is_none())
+            .and_then(|s| unsent_on_screen(record.kind, &s.undimmed_rows()));
+        typed.max(shown.unwrap_or(0))
+    }
+
+    /// Paste a prompt the hub wrote (a handoff, review findings, a fix
+    /// request) into agent session `id`, then Enter: refused while its
+    /// input line holds unsent text, which the Enter would send glued to
+    /// the prompt.
+    pub(crate) fn paste_prompt(
+        &self,
+        id: &str,
+        text: &str,
+    ) -> Result<crate::transcript::PasteOutcome, HubError> {
+        let _turn = self.queue_runtime().paste_turn();
+        let record = self.session(id)?.record;
+        let unsent = self.unsent_input(&record);
+        if unsent > 0 {
+            return Err(StateError::Conflict(format!(
+                "{} has {unsent} character{} typed into its input never sent: send or clear them (Ctrl-U), then send this again",
+                record.label(),
+                if unsent == 1 { "" } else { "s" }
+            ))
+            .into());
+        }
+        self.paste_turn_held(id, text, true, true)
     }
 
     /// Keep pending item `item` of session `id` back while an editor has
@@ -168,7 +209,7 @@ impl Hub {
                 None
             },
             typed_ago: runtime.typed_ago(&record.id),
-            draft: runtime.draft_chars(&record.id),
+            draft: self.unsent_input(record),
             editing: queue.head().is_some_and(|h| runtime.is_editing(&h.id)),
             quiet: self.tunables().queue_typing_quiet,
             owner,

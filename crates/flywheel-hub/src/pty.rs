@@ -951,6 +951,11 @@ impl PtySession {
         self.lock().screen.text(source)
     }
 
+    /// The rows on screen without dim text (see [`Emulator::undimmed_rows`]).
+    pub fn undimmed_rows(&self) -> Vec<String> {
+        self.lock().screen.undimmed_rows()
+    }
+
     /// Every line the terminal retains (see [`Emulator::search_text`]).
     pub fn search_text(&self) -> crate::vt::SearchText {
         self.lock().screen.search_text()

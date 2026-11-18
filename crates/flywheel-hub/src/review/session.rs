@@ -531,7 +531,7 @@ impl Hub {
             paste: None,
         };
         if run {
-            let pasted = self.paste(&plan.agent.id, &plan.prompt, true);
+            let pasted = self.paste_prompt(&plan.agent.id, &plan.prompt);
             eprintln!(
                 "fw hub: review {}: ask {} ({kind:?}) -> {}",
                 record.label(),

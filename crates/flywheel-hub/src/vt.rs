@@ -55,7 +55,8 @@ pub use text::{Lines, SearchText};
 use guard::{Guarded, OscScan, Tracked};
 use snapshot::Writer;
 use text::{
-    HistoryText, HistoryWatch, recent_lines, row_text, sanitize, update_history_text, wrapped,
+    HistoryText, HistoryWatch, recent_lines, row_text, row_text_undimmed, sanitize,
+    update_history_text, wrapped,
 };
 
 /// Default scrollback retained per session, in lines.
@@ -668,6 +669,21 @@ impl Emulator {
                 .collect(),
             lines,
         }
+    }
+
+    /// The rows on screen now with dim and hidden text left out (trailing
+    /// whitespace trimmed): an agent's input line read off them holds what
+    /// was typed, never its placeholder.
+    pub fn undimmed_rows(&mut self) -> Vec<String> {
+        self.flush();
+        let grid = self.term.grid();
+        (0..grid.screen_lines())
+            .map(|r| {
+                row_text_undimmed(grid, Line(r as i32))
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
     }
 
     /// Every logical line the terminal retains, for search: the primary

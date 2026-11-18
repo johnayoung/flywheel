@@ -34,15 +34,28 @@ const WOULD_HAVE: Duration = Duration::from_millis(3000);
 /// A stand-in `claude`: per hub session, its argv (`claude-<id>.argv`,
 /// NUL-separated), environment (`.env`), and every byte typed into it
 /// (`.in`, appended across relaunches), in raw mode with bracketed paste.
+///
+/// With a `draft` file in `log` when it starts, it also draws Claude
+/// Code's prompt box holding that file's text (unsent text in its input
+/// line), and draws the box empty -- its dim placeholder only -- once a
+/// `claude-<id>.sent` file appears.
 fn fake_claude(bin: &Path, log: &Path) -> PathBuf {
     let path = bin.join("claude");
+    let rule = "\u{2500}".repeat(100);
     support::write_script(
         &path,
         &format!(
             "#!/bin/sh\nn='{log}/claude-'\"$FLYWHEEL_HUB_SESSION\"\n\
              for a in \"$@\"; do printf '%s\\000' \"$a\"; done > \"$n.argv\"\n\
              env > \"$n.env.tmp\" && mv \"$n.env.tmp\" \"$n.env\"\n\
-             stty raw -echo\nprintf '\\033[?2004h'\nexec cat >> \"$n.in\"\n",
+             stty raw -echo\nprintf '\\033[?2004h'\n\
+             box() {{ printf '\\033[2J\\033[H\\r\\n{rule}\\r\\n\u{276f} %s\\r\\n{rule}\\r\\n  ? for shortcuts' \"$1\"; }}\n\
+             if [ -f '{log}/draft' ]; then\n\
+             box \"$(cat '{log}/draft')\"\n\
+             ( while [ ! -e \"$n.sent\" ]; do sleep 0.05; done\n\
+             box \"$(printf '\\033[2mTry \"fix lint errors\"\\033[0m')\" ) &\n\
+             fi\n\
+             exec cat >> \"$n.in\"\n",
             log = log.display()
         ),
     );
@@ -993,4 +1006,69 @@ async fn a_queue_on_another_machine_works_through_the_proxy() {
         .await;
     assert_eq!(paused["paused"], true);
     assert_eq!(b.queue(&agent.id).await["paused"], true);
+}
+
+/// The live failure: a question dialog was up (blocked) while the operator
+/// typed, and Claude Code kept that text in its input line once the
+/// dialog closed. Keys typed while blocked never count as a draft, so the
+/// hub believed the line empty and typed a start notice onto it: one
+/// prompt, the two glued. The screen's input line is read before every
+/// delivery, and one holding text keeps it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_left_in_the_input_line_while_blocked_holds_every_delivery() {
+    let hub = TestHub::start().await;
+    let draft = "Is Wintermute doing LP activity?";
+    std::fs::create_dir_all(hub.root.join("log")).unwrap();
+    std::fs::write(hub.root.join("log/draft"), draft).unwrap();
+    let agent = hub.claude().await;
+    agent.fire("UserPromptSubmit", None).await;
+    agent.fire("Notification", Some("permission_prompt")).await;
+    status_is(&hub, &agent.id, "blocked").await;
+    let mut term = hub.ws(&format!("/api/sessions/{}/ws", agent.id)).await;
+    term.send(Message::Binary(draft.as_bytes().to_vec().into()))
+        .await
+        .unwrap();
+    let mut want = draft.as_bytes().to_vec();
+    agent.typed_becomes(&want).await;
+    drop(term);
+    agent.fire("PreToolUse", None).await;
+    status_is(&hub, &agent.id, "working").await;
+    agent.fire("Stop", None).await;
+    status_is(&hub, &agent.id, "done").await;
+    // At rest, settled, nobody typing: all that keeps a delivery back is
+    // the text in the input line.
+    sleep(QUIET + Duration::from_millis(500)).await;
+
+    // A notice sent now (a start approved, a message from another agent)
+    // is queued, not typed onto the draft.
+    let (sender, id) = (Arc::clone(&hub.hub), agent.id.clone());
+    let sent = tokio::task::spawn_blocking(move || {
+        sender.send_or_queue(&id, "From the flywheel hub: the operator started it.")
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let sent = serde_json::to_value(&sent).unwrap();
+    assert_eq!(sent["delivery"], "queued", "{sent}");
+    assert!(
+        sent["why"].as_str().unwrap().contains("32 characters"),
+        "{sent}"
+    );
+    // So is a queued prompt, however long the draft sits there.
+    hub.add(&agent.id, "queued behind it", None).await;
+    agent.stays(&want).await;
+    let waiting = hub.queue(&agent.id).await["waiting"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(waiting.contains("never sent"), "{waiting}");
+
+    // The line empties (its dim placeholder is not text): they go, one a
+    // turn.
+    std::fs::write(agent.path("sent"), "").unwrap();
+    want.extend(pasted("From the flywheel hub: the operator started it."));
+    agent.typed_becomes(&want).await;
+    agent.turn().await;
+    want.extend(pasted("queued behind it"));
+    agent.typed_becomes(&want).await;
 }

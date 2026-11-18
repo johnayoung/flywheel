@@ -321,6 +321,16 @@ pub(crate) fn wrapped(grid: &Grid<Cell>, line: Line) -> bool {
 
 /// A row's characters (wide-char spacers skipped, tabs as spaces).
 pub(crate) fn row_text(grid: &Grid<Cell>, line: Line) -> String {
+    row_text_without(grid, line, Flags::empty())
+}
+
+/// [`row_text`] with dim and hidden cells as spaces: what a program drew
+/// as content, not as a hint (an input line's placeholder).
+pub(crate) fn row_text_undimmed(grid: &Grid<Cell>, line: Line) -> String {
+    row_text_without(grid, line, Flags::DIM | Flags::HIDDEN)
+}
+
+fn row_text_without(grid: &Grid<Cell>, line: Line, blank: Flags) -> String {
     let row = &grid[line];
     let mut text = String::with_capacity(grid.columns());
     for col in 0..grid.columns() {
@@ -329,6 +339,10 @@ pub(crate) fn row_text(grid: &Grid<Cell>, line: Line) -> String {
             .flags
             .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
         {
+            continue;
+        }
+        if cell.flags.intersects(blank) {
+            text.push(' ');
             continue;
         }
         text.push(printable(cell.c));

@@ -68,7 +68,7 @@ impl Fanouts {
             paste: None,
         };
         if run {
-            let pasted = hub.paste(&candidate.session_id, &plan.prompt, true)?;
+            let pasted = hub.paste_prompt(&candidate.session_id, &plan.prompt)?;
             plan.paste = Some(pasted);
             let _ = hub.store().update_fanout(id, |f| {
                 if let Some(c) = f.candidate_mut(label) {

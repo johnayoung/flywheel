@@ -459,7 +459,7 @@ impl Hub {
         }
         let reviewer = match reusable {
             Some(reviewer) => {
-                self.paste(&reviewer.record.id, &outcome.prompt, true)?;
+                self.paste_prompt(&reviewer.record.id, &outcome.prompt)?;
                 self.session(&reviewer.record.id)?
             }
             None => self.launch_reviewer(&author.record, kind, launch, &outcome.prompt)?,

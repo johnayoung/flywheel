@@ -363,9 +363,13 @@ fn relaunch_label(session: &Value) -> String {
     if stale.get("hung_up_at").is_some_and(|h| !h.is_null()) {
         return " (relaunching)".to_owned();
     }
-    match stale.get("held").and_then(Value::as_str) {
-        Some(why) => format!(" (relaunch pending, not automatic: {why})"),
-        None => " (relaunch pending)".to_owned(),
+    match (
+        stale.get("held").and_then(Value::as_str),
+        stale.get("waits").and_then(Value::as_str),
+    ) {
+        (Some(why), _) => format!(" (relaunch pending, not automatic: {why})"),
+        (None, Some(why)) => format!(" (relaunch pending, waits: {why})"),
+        (None, None) => " (relaunch pending)".to_owned(),
     }
 }
 

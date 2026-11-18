@@ -46,6 +46,9 @@ const PROCESSES_NAMED: usize = 20;
 const COMMAND_CHARS: usize = 120;
 /// Characters of a set-aside message's first line kept.
 const PREVIEW_CHARS: usize = 100;
+/// How long after a background subagent finished its agent may still
+/// take its result up (a turn of its own): not at rest meanwhile.
+const WAKE_WINDOW_MS: i64 = 120_000;
 /// What a refused force says.
 pub const FORCE_REFUSED: &str = "force is operator only (pane menu or fw hub kill)";
 
@@ -497,11 +500,13 @@ impl Hub {
     /// own helpers): what it is, else `None`.
     pub(super) fn work_running(&self, record: &SessionRecord) -> Option<String> {
         let processes = self.end_processes(record);
-        match work_of(&processes).len() {
-            0 => None,
-            1 => Some("a process it started still runs".to_owned()),
-            n => Some(format!("{n} processes it started still run")),
-        }
+        let work = work_of(&processes);
+        let first = work.first()?;
+        let named = format!("{} {}", first.pid, one_line(&first.command, 60));
+        Some(match work.len() {
+            1 => format!("a process it started still runs: {named}"),
+            n => format!("{n} processes it started still run: {named}, ..."),
+        })
     }
 
     /// Why agent session `from` may not end `target` at all.
@@ -1393,10 +1398,16 @@ impl Hub {
                 .filter(|w| w.source == WorkSource::Turn)
                 .filter_map(|w| w.finished)
                 .max();
+            // A subagent cut short (its session ended, an Esc) wakes
+            // nothing, and one not taken up within [`WAKE_WINDOW_MS`] never
+            // will be.
+            let now = now_ms();
             if work.iter().any(|w| {
                 w.source == WorkSource::Subagent
-                    && w.finished
-                        .is_some_and(|f| turn_end.is_none_or(|end| f > end))
+                    && matches!(w.status, WorkStatus::Done | WorkStatus::Failed)
+                    && w.finished.is_some_and(|f| {
+                        turn_end.is_none_or(|end| f > end) && now - f < WAKE_WINDOW_MS
+                    })
             }) {
                 return Err("a background subagent finished: its agent takes it up".to_owned());
             }

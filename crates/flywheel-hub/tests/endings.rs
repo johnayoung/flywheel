@@ -1168,6 +1168,8 @@ async fn an_upgrade_relaunches_agents_at_rest_and_never_interrupts_busy_ones() {
     let view = hub.session(&busy.id).await;
     assert!(view["stale"].is_object(), "{view}");
     assert!(view["stale"]["held"].is_null(), "{view}");
+    // It says why it waits.
+    assert_eq!(view["stale"]["waits"], "working", "{view}");
     assert!(!busy.typed().contains("AFTER-UPGRADE"));
     // Opted out, nothing to resume: they keep the note, never relaunched.
     assert_eq!(secret(&kept), kept_secret);
@@ -1241,4 +1243,37 @@ async fn an_agent_asking_the_operator_is_relaunched_only_once_answered() {
     assert_eq!(asker.env(None).await[report::SECRET_ENV], before);
     asker.hook("Stop", json!({})).await;
     respawned(&hub, &asker, &before).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagents_cut_short_by_an_exit_do_not_hold_a_relaunch() {
+    let mut hub = TestHub::start().await;
+    let agent = hub.claude("leaked", None, json!({})).await;
+    // A turn ends with a subagent still running (background) ...
+    agent
+        .hook("UserPromptSubmit", json!({"prompt": "go"}))
+        .await;
+    agent
+        .hook(
+            "SubagentStart",
+            json!({"agent_id": "sub1", "agent_type": "general-purpose"}),
+        )
+        .await;
+    agent.hook("Stop", json!({})).await;
+    // ... and the operator relaunches it by hand: the exit cuts the
+    // subagent short, after the last turn ended. It wakes nothing.
+    let first = agent.env(None).await[report::SECRET_ENV].clone();
+    hub.hub.kill_session(&agent.id).unwrap();
+    let deadline = Instant::now() + WAIT;
+    while hub.session(&agent.id).await["state"] != "exited" {
+        assert!(Instant::now() < deadline, "never exited");
+        sleep(Duration::from_millis(25)).await;
+    }
+    hub.post(&format!("/api/sessions/{}/relaunch", agent.id), json!({}))
+        .await;
+    let second = agent.env(Some(&first)).await[report::SECRET_ENV].clone();
+    agent.hook("SessionStart", json!({})).await;
+
+    hub.hub.mark_stale("0.0.1");
+    respawned(&hub, &agent, &second).await;
 }

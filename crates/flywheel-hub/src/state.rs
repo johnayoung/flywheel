@@ -373,6 +373,10 @@ pub struct Stale {
     /// a relaunch that failed): `held` keeps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gave_up: Option<String>,
+    /// Why it is not relaunched yet, when not held: what keeps it from a
+    /// safe point now (working, a process it started still runs, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waits: Option<String>,
 }
 
 /// Who acted: an agent session (its id), or the operator.

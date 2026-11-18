@@ -408,7 +408,7 @@ function relaunchHint(session) {
     textContent: busy,
     title: s.held
       ? `Runs a process from before the hub upgrade (flywheel ${s.from}); not relaunched on its own: ${s.held}. Relaunch it yourself to get the new tools.`
-      : `Runs a process from before the hub upgrade (flywheel ${s.from}); relaunched (its conversation resumed) once its turn is over and nothing runs.`,
+      : `Runs a process from before the hub upgrade (flywheel ${s.from}); relaunched (its conversation resumed) once its turn is over and nothing runs.${s.waits ? ` Waits: ${s.waits}.` : ""}`,
   });
 }
 

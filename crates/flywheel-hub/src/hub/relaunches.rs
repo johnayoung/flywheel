@@ -59,7 +59,10 @@ pub fn stale_note(stale: &Stale) -> String {
     match &stale.held {
         Some(why) => format!("relaunch pending (not automatic: {why})"),
         None if stale.hung_up_at.is_some() => "relaunching".to_owned(),
-        None => "relaunch pending (at its next safe point)".to_owned(),
+        None => match &stale.waits {
+            Some(why) => format!("relaunch pending (waits: {why})"),
+            None => "relaunch pending (at its next safe point)".to_owned(),
+        },
     }
 }
 
@@ -104,6 +107,7 @@ impl Hub {
                             held: held.clone(),
                             hung_up_at: None,
                             gave_up: None,
+                            waits: None,
                         });
                     }
                 });
@@ -256,8 +260,12 @@ impl Hub {
                 self.set_stale(&record.id, |s| s.held = held.clone());
                 changed = true;
             }
-            if held.is_none() && record.ending.is_none() {
-                candidates.push(record);
+            if held.is_none() {
+                if record.ending.is_some() {
+                    changed |= self.note_wait(&record, "an end of it is in progress");
+                } else {
+                    candidates.push(record);
+                }
             }
         }
         if changed {
@@ -279,6 +287,9 @@ impl Hub {
                     return true;
                 }
                 Err(why) => {
+                    if self.note_wait(&record, &why) {
+                        self.emit(HubEvent::Sessions);
+                    }
                     let after = (Utc::now() - stale.since).to_std().unwrap_or_default();
                     if stale.mode == RelaunchMode::Idle && after >= IDLE_GRACE {
                         let held = format!("busy at the upgrade (--relaunch idle): {why}");
@@ -291,6 +302,17 @@ impl Hub {
                 }
             }
         }
+        true
+    }
+
+    /// Record why stale `record` waits for its relaunch; whether that
+    /// changed.
+    fn note_wait(&self, record: &SessionRecord, why: &str) -> bool {
+        let stale = record.stale.as_ref();
+        if stale.and_then(|s| s.waits.as_deref()) == Some(why) {
+            return false;
+        }
+        self.set_stale(&record.id, |s| s.waits = Some(why.to_owned()));
         true
     }
 
@@ -430,6 +452,7 @@ mod tests {
             held: held.map(str::to_owned),
             hung_up_at: hung_up.then(Utc::now),
             gave_up: None,
+            waits: None,
         }
     }
 

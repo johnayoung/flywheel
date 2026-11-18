@@ -351,6 +351,24 @@ fn pairing_label(session: &Value, sessions: &[Value]) -> String {
 
 /// ` (queue: 2)`, ` (queue: 2, paused)`, ` (queue stalled: why)` for a
 /// session with a prompt queue, else empty.
+/// ` (relaunch pending)` for a running agent session whose process
+/// predates the hub's last upgrade.
+fn relaunch_label(session: &Value) -> String {
+    let Some(stale) = session.get("stale").filter(|s| s.is_object()) else {
+        return String::new();
+    };
+    if str_field(session, "state") != "running" {
+        return String::new();
+    }
+    if stale.get("hung_up_at").is_some_and(|h| !h.is_null()) {
+        return " (relaunching)".to_owned();
+    }
+    match stale.get("held").and_then(Value::as_str) {
+        Some(why) => format!(" (relaunch pending, not automatic: {why})"),
+        None => " (relaunch pending)".to_owned(),
+    }
+}
+
 fn queue_label(session: &Value) -> String {
     let Some(queue) = session.get("queue").filter(|q| q.is_object()) else {
         return String::new();
@@ -483,8 +501,9 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                     state_label(s),
                     str_field(s, "name").to_owned(),
                     format!(
-                        "{}{}{}{}{}{}",
+                        "{}{}{}{}{}{}{}",
                         live_cwd(s),
+                        relaunch_label(s),
                         git_label(s),
                         companion_label(s, &sessions),
                         pairing_label(s, &sessions),
@@ -1318,6 +1337,12 @@ pub(crate) fn conversations(
 pub(crate) struct RelaunchArgs {
     #[command(flatten)]
     target: SessionArg,
+    /// Do not relaunch it: opt it out of relaunches after `fw hub upgrade`.
+    #[arg(long, conflicts_with = "auto")]
+    never: bool,
+    /// Do not relaunch it: opt it back in to relaunches after upgrades.
+    #[arg(long)]
+    auto: bool,
     #[command(flatten)]
     endpoint: EndpointArgs,
 }
@@ -1325,13 +1350,23 @@ pub(crate) struct RelaunchArgs {
 pub(crate) fn relaunch(args: &RelaunchArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let result = connect(&args.endpoint).and_then(|conn| {
         let (id, _) = find_session(&conn, &args.target.session)?;
-        conn.blocking_call(
-            "POST",
-            &format!("/api/sessions/{id}/relaunch"),
-            Some(&json!({})),
-        )
+        let body = if args.never || args.auto {
+            json!({ "never": args.never })
+        } else {
+            json!({})
+        };
+        conn.blocking_call("POST", &format!("/api/sessions/{id}/relaunch"), Some(&body))
     });
     match result {
+        Ok(view) if args.never || args.auto => {
+            let _ = writeln!(
+                out,
+                "session {:?} {} relaunched after hub upgrades",
+                str_field(&view, "name"),
+                if args.never { "will not be" } else { "will be" }
+            );
+            0
+        }
         Ok(view) => {
             let _ = writeln!(
                 out,

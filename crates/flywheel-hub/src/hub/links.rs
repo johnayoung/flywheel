@@ -228,6 +228,8 @@ impl Hub {
             ending: None,
             ended: None,
             end_requests: Vec::new(),
+            stale: None,
+            never_relaunch: false,
         };
         // Taken before the launch, so two starts of one handoff start one
         // session; put back if the launch fails.

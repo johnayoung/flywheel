@@ -265,6 +265,14 @@ pub enum What {
         to: String,
         by: String,
     },
+    /// The hub relaunched it in place, resuming its conversation (`why`:
+    /// after an upgrade); `error`: the relaunch failed and it stays exited.
+    #[serde(rename = "session.relaunched")]
+    Relaunched {
+        why: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// A sender took back queued messages it had sent (`cancel_message`).
     #[serde(rename = "queue.cancelled")]
     QueueCancelled { by: String, items: u32 },
@@ -434,6 +442,7 @@ impl What {
             Self::Ended { .. } => "session.ended",
             Self::Replaced { .. } => "session.replaced",
             Self::OwnerChanged { .. } => "session.owner_changed",
+            Self::Relaunched { .. } => "session.relaunched",
             Self::QueueCancelled { .. } => "queue.cancelled",
             Self::SessionFinished { .. } => "session.finished",
             Self::TurnStarted { .. } => "turn.started",
@@ -478,6 +487,7 @@ pub const KINDS: &[&str] = &[
     "session.ended",
     "session.replaced",
     "session.owner_changed",
+    "session.relaunched",
     "queue.cancelled",
     "session.finished",
     "turn.started",

@@ -310,6 +310,69 @@ pub struct SessionRecord {
     /// operator: each is removed only when approved or declined.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub end_requests: Vec<PendingEnd>,
+    /// Its process predates the hub serving it (a live upgrade): relaunched
+    /// at its next safe point unless held ([`crate::hub`]'s relaunches).
+    /// Cleared by any relaunch or restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<Stale>,
+    /// The operator opted it out of relaunches after an upgrade.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub never_relaunch: bool,
+}
+
+/// How a live upgrade relaunches the agent sessions it took over
+/// (`fw hub upgrade --relaunch`, hub.toml `sessions.relaunch_on_upgrade`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RelaunchMode {
+    /// Only sessions at rest right after the upgrade.
+    Idle,
+    /// Each at its next safe point (a turn over with nothing running).
+    #[default]
+    SafePoints,
+    /// None: they keep the note until relaunched by hand.
+    Off,
+}
+
+impl RelaunchMode {
+    pub const ALL: [Self; 3] = [Self::Idle, Self::SafePoints, Self::Off];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::SafePoints => "safe-points",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.as_str() == raw.trim())
+            .ok_or_else(|| format!("{raw:?}: expected idle, safe-points, or off"))
+    }
+}
+
+/// An agent session running a process from before the hub's last live
+/// upgrade (an older binary, older MCP tools).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stale {
+    /// When the upgrade found it.
+    pub since: DateTime<Utc>,
+    /// The flywheel version of the hub it was taken over from.
+    pub from: String,
+    pub mode: RelaunchMode,
+    /// Why it is not relaunched on its own (opted out, mode off, nothing
+    /// to resume, a relaunch that failed); `None`: at its next safe point.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<String>,
+    /// A relaunch under way: when its process was hung up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hung_up_at: Option<DateTime<Utc>>,
+    /// Why its relaunch was given up for good (busy at an `idle` upgrade,
+    /// a relaunch that failed): `held` keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gave_up: Option<String>,
 }
 
 /// Who acted: an agent session (its id), or the operator.

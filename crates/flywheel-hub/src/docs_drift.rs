@@ -672,8 +672,10 @@ const PAGES: [(&str, &str); 6] = [
 /// routes, five keys, two agent tools, four session fields). Raised to 92
 /// KiB for agent ends (a verb, two routes, six event kinds, five agent
 /// tools, four session fields), after condensing the fleet section they
-/// extend: 1.6 KB over before.
-const HUB_DOCS_MAX_BYTES: usize = 92 * 1024;
+/// extend: 1.6 KB over before. Raised to 93 KiB for relaunch on upgrade
+/// (two verb flags, a key, a session field, an event kind), after
+/// condensing the PR and digest sections by 0.5 KB.
+const HUB_DOCS_MAX_BYTES: usize = 93 * 1024;
 /// One reference page's budget. Raised from 25 KiB to 26 for asks,
 /// handoffs, and session links (a route, two event kinds, the snapshot's
 /// `ask` and `links`): api.md was condensed first and still 80 bytes over.

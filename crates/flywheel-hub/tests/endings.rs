@@ -1070,3 +1070,175 @@ async fn an_end_survives_a_restart_and_one_that_never_settles_is_called_off() {
     .await;
     hub.told(&lead, "new was not started").await;
 }
+
+/// Wait until session `agent` runs a new process (a relaunch; the old
+/// secret was `previous`): its environment.
+async fn respawned(hub: &TestHub, agent: &Agent, previous: &str) -> HashMap<String, String> {
+    let env = agent.env(Some(previous)).await;
+    // The hub records it running (and no longer stale) once spawned.
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let view = hub.session(&agent.id).await;
+        if view["state"] == "running" && view["stale"].is_null() {
+            return env;
+        }
+        assert!(Instant::now() < deadline, "never running again: {view}");
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// The argv of session `agent`'s current process.
+fn argv(agent: &Agent) -> Vec<String> {
+    String::from_utf8_lossy(&std::fs::read(agent.path("argv")).unwrap())
+        .split('\0')
+        .filter(|a| !a.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_upgrade_relaunches_agents_at_rest_and_never_interrupts_busy_ones() {
+    let mut hub = TestHub::start().await;
+    let idle = hub.claude("idle", None, json!({})).await;
+    let busy = hub.claude("busy", None, json!({})).await;
+    let kept = hub.claude("kept", None, json!({})).await;
+    let fresh = hub.claude("fresh", None, json!({})).await;
+    // `fresh` has no conversation to resume yet.
+    std::fs::remove_file(&fresh.transcript).unwrap();
+    idle.turn().await;
+    busy.hook("UserPromptSubmit", json!({"prompt": "long job"}))
+        .await;
+    kept.turn().await;
+    hub.post(
+        &format!("/api/sessions/{}/relaunch", kept.id),
+        json!({ "never": true }),
+    )
+    .await;
+    let secret = |a: &Agent| {
+        let path = a.path("env");
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix(&format!("{}=", report::SECRET_ENV))
+                    .map(str::to_owned)
+            })
+            .unwrap()
+    };
+    let (idle_secret, busy_secret, kept_secret, fresh_secret) =
+        (secret(&idle), secret(&busy), secret(&kept), secret(&fresh));
+    // A prompt waits in the busy one's queue for its turn to end.
+    hub.post(
+        &format!("/api/sessions/{}/queue", busy.id),
+        json!({ "text": "AFTER-UPGRADE" }),
+    )
+    .await;
+
+    let (marked, _) = hub.hub.mark_stale("0.0.1");
+    assert_eq!(marked, 4);
+
+    // At rest: relaunched at once, resuming its conversation in place.
+    respawned(&hub, &idle, &idle_secret).await;
+    let args = argv(&idle);
+    let conversation = hub.session(&idle.id).await["agent_session_id"].clone();
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--resume" && json!(w[1]) == conversation),
+        "{args:?}"
+    );
+    let view = hub.session(&idle.id).await;
+    assert_eq!(view["state"], "running", "{view}");
+    assert!(view["stale"].is_null(), "{view}");
+    // The timeline says so (recorded once the new process is up).
+    let deadline = Instant::now() + WAIT;
+    while !hub
+        .kinds(&idle.id)
+        .await
+        .iter()
+        .any(|k| k == "session.relaunched")
+    {
+        assert!(Instant::now() < deadline, "no session.relaunched event");
+        sleep(Duration::from_millis(50)).await;
+    }
+    idle.hook("SessionStart", json!({})).await;
+
+    // Busy: never interrupted, its prompt still queued.
+    sleep(WOULD_HAVE).await;
+    assert_eq!(secret(&busy), busy_secret);
+    let view = hub.session(&busy.id).await;
+    assert!(view["stale"].is_object(), "{view}");
+    assert!(view["stale"]["held"].is_null(), "{view}");
+    assert!(!busy.typed().contains("AFTER-UPGRADE"));
+    // Opted out, nothing to resume: they keep the note, never relaunched.
+    assert_eq!(secret(&kept), kept_secret);
+    assert_eq!(secret(&fresh), fresh_secret);
+    let view = hub.session(&kept.id).await;
+    assert!(
+        view["stale"]["held"]
+            .as_str()
+            .unwrap()
+            .contains("opted out"),
+        "{view}"
+    );
+    let view = hub.session(&fresh.id).await;
+    assert!(
+        view["stale"]["held"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be resumed"),
+        "{view}"
+    );
+
+    // Its turn ends: relaunched before the queue delivers, so the prompt
+    // reaches the new process once it reports.
+    busy.hook("Stop", json!({})).await;
+    respawned(&hub, &busy, &busy_secret).await;
+    let typed_before = busy.typed();
+    assert!(!typed_before.contains("AFTER-UPGRADE"), "{typed_before}");
+    let view = hub.session(&busy.id).await;
+    assert!(view["stale"].is_null(), "{view}");
+    busy.hook("SessionStart", json!({})).await;
+    busy.typed_has("AFTER-UPGRADE").await;
+    assert!(
+        !busy.typed()[..typed_before.len()].contains("AFTER-UPGRADE"),
+        "delivered into the old process"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_asking_the_operator_is_relaunched_only_once_answered() {
+    let mut hub = TestHub::start().await;
+    let asker = hub.claude("asker", None, json!({})).await;
+    asker
+        .hook("UserPromptSubmit", json!({"prompt": "deploy"}))
+        .await;
+    let ask = json!({"tool_name": "mcp__flywheel__ask_operator", "tool_use_id": "tu1",
+                     "tool_input": {"kind": "answer", "text": "Which region?"}});
+    asker.hook("PreToolUse", ask.clone()).await;
+    asker.hook("PostToolUse", ask).await;
+    asker
+        .hook("Stop", json!({"last_assistant_message": "Which region?"}))
+        .await;
+    let before = asker.env(None).await[report::SECRET_ENV].clone();
+    hub.hub.mark_stale("0.0.1");
+    sleep(WOULD_HAVE).await;
+    assert_eq!(asker.env(None).await[report::SECRET_ENV], before);
+    let view = hub.session(&asker.id).await;
+    assert_eq!(view["agent"]["state"], "asking", "{view}");
+
+    // The answer reaches the old process (never held back), its turn runs,
+    // and only then is it relaunched.
+    hub.post(
+        &format!("/api/sessions/{}/input", asker.id),
+        json!({ "data": "eu-west\r" }),
+    )
+    .await;
+    asker.typed_has("eu-west").await;
+    asker
+        .hook("UserPromptSubmit", json!({"prompt": "eu-west"}))
+        .await;
+    sleep(WOULD_HAVE).await;
+    assert_eq!(asker.env(None).await[report::SECRET_ENV], before);
+    asker.hook("Stop", json!({})).await;
+    respawned(&hub, &asker, &before).await;
+}

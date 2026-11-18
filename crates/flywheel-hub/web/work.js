@@ -689,6 +689,8 @@ window.FwHubWork = function (ctx) {
       } else if (event.kind === "session.ended") {
         const extra = [body.killed && body.killed.length ? `${body.killed.length} process${body.killed.length === 1 ? "" : "es"} went with it` : "", body.dirty ? `left: ${body.dirty}` : ""].filter(Boolean).join("; ");
         push(event, { note: `${body.target ? `${nameOf(body.target)} ended` : `ended by ${nameOf(body.by)}`}${body.successor ? `, replaced by ${nameOf(body.successor)}` : ""}${extra ? ` (${extra})` : ""}`, tone: "bad", ts: event.ts });
+      } else if (event.kind === "session.relaunched") {
+        push(event, { note: body.error ? `relaunch ${body.why} failed: ${body.error}` : `relaunched ${body.why}`, tone: body.error ? "bad" : "", ts: event.ts });
       } else if (event.kind === "session.owner_changed") {
         push(event, { note: `given to ${nameOf(body.to)} by ${nameOf(body.by)}`, tone: "", ts: event.ts });
       } else if (event.kind === "queue.cancelled") {

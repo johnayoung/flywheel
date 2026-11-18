@@ -114,6 +114,7 @@ pub struct SessionsSection {
     pub scrollback_lines: Option<usize>,
     pub restore: Option<bool>,
     pub agent_resume: Option<bool>,
+    pub relaunch_on_upgrade: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -438,6 +439,8 @@ pub struct Effective {
     pub scrollback_lines: usize,
     pub restore: bool,
     pub agent_resume: bool,
+    /// How a live upgrade relaunches the agent sessions it takes over.
+    pub relaunch_on_upgrade: crate::state::RelaunchMode,
     pub worktree_branch_prefix: String,
     pub import_root: Option<PathBuf>,
     pub flywheel: bool,
@@ -479,6 +482,7 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("sessions.scrollback_lines", Apply::Live),
     ("sessions.restore", Apply::Restart),
     ("sessions.agent_resume", Apply::Restart),
+    ("sessions.relaunch_on_upgrade", Apply::Restart),
     ("worktrees.branch_prefix", Apply::Live),
     ("import.root", Apply::Live),
     ("flywheel.enabled", Apply::Restart),
@@ -564,6 +568,7 @@ impl Effective {
             "sessions.scrollback_lines" => json!(self.scrollback_lines),
             "sessions.restore" => json!(self.restore),
             "sessions.agent_resume" => json!(self.agent_resume),
+            "sessions.relaunch_on_upgrade" => json!(self.relaunch_on_upgrade.as_str()),
             "worktrees.branch_prefix" => json!(self.worktree_branch_prefix),
             "import.root" => self
                 .import_root
@@ -861,6 +866,21 @@ pub fn resolve(
         file.sessions.agent_resume,
         true
     );
+    let file_relaunch = file
+        .sessions
+        .relaunch_on_upgrade
+        .as_deref()
+        .and_then(|raw| {
+            crate::state::RelaunchMode::parse(raw)
+                .map_err(|message| errors.push(format!("sessions.relaunch_on_upgrade: {message}")))
+                .ok()
+        });
+    let relaunch_on_upgrade = pick!(
+        "sessions.relaunch_on_upgrade",
+        None::<crate::state::RelaunchMode>,
+        file_relaunch,
+        crate::state::RelaunchMode::default()
+    );
     let file_prefix = file.worktrees.branch_prefix.as_deref().and_then(|raw| {
         match crate::git::validate_prefix(raw) {
             Ok(prefix) => Some(prefix),
@@ -1060,6 +1080,7 @@ pub fn resolve(
         scrollback_lines,
         restore,
         agent_resume,
+        relaunch_on_upgrade,
         worktree_branch_prefix,
         import_root,
         flywheel,
@@ -1628,6 +1649,7 @@ login_days = 30            # a login lasts this long after its last use
 scrollback_lines = 5000
 restore = true
 agent_resume = true
+relaunch_on_upgrade = "safe-points"
 
 [worktrees]
 branch_prefix = "agent/"

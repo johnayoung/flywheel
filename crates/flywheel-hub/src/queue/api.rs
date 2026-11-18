@@ -139,7 +139,21 @@ impl Hub {
         }
     }
 
+    /// What `queue`'s head is decided on. A session about to be relaunched
+    /// after an upgrade (or being relaunched) takes nothing until its new
+    /// process runs.
     pub(crate) fn queue_facts(&self, record: &SessionRecord, queue: &SessionQueue) -> Facts {
+        let mut facts = self.rest_facts(record, queue);
+        if facts.presence == Presence::Ready
+            && let Some(why) = self.relaunch_hold(record)
+        {
+            facts.presence = Presence::Starting(why);
+        }
+        facts
+    }
+
+    /// [`Hub::queue_facts`] without a relaunch's hold.
+    pub(crate) fn rest_facts(&self, record: &SessionRecord, queue: &SessionQueue) -> Facts {
         let runtime = self.queue_runtime();
         let owner = runtime.holder(&record.id).or_else(|| {
             self.grading_owns(&record.id)

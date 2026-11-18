@@ -39,9 +39,12 @@ impl Hub {
                     // Ends in progress are driven here too: they wait on
                     // the same turn boundaries the queue does.
                     let sending = !hub.queue_runtime().is_paused() && {
+                        // First: a session due a relaunch after an upgrade
+                        // goes before its queue delivers again.
+                        let relaunching = hub.relaunch_tick();
                         let queued = hub.queue_tick();
                         let ending = hub.endings_tick();
-                        queued || ending
+                        relaunching || queued || ending
                     };
                     wait = sending.then_some(TICK);
                 }

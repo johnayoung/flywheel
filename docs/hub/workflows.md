@@ -71,9 +71,9 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 A branch with a PR: a badge on its row (`#7`, checks), a PR section in Review, `fw hub pr SESSION`. All via `gh` (missing or signed out: the section says why).
 
-- **Asked** per (folder, branch) by head (`gh pr list --head B`; `123` never binds PR #123), if pushed, not default: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, own actions; Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min (state kept, stale).
+- **Asked** per (folder, branch) by head (`gh pr list --head B`), if pushed, not default: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, own actions, Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min.
 - **View log**: `gh run view --job J --log-failed`, last 400 lines, escapes stripped, secrets redacted (Activity's rules).
-- **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued (`done`). One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; not re-pasted within 5 min.
+- **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued. One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; not re-pasted within 5 min.
 - **Re-run failed** (`gh run rerun R --failed`), **Ready** (`gh pr ready`),
   **Merge** (`gh pr merge N --<method> --match-head-commit SHA`, the repo's default method): planned, fingerprint-checked against a GitHub re-read (unreadable: refused). Refuses closed, draft, conflicting; checks failing or running, changes requested, review required: only with the number typed back (`--force N`).
 - **Events** `pr.checks_failed`, `pr.checks_passed` (from running or red), `pr.review_changes_requested`, `pr.merged`; a hub start announces nothing.
@@ -115,7 +115,7 @@ fw hub fanout promote "$id" --reference c1 --yes  # writes <project>/tasks/activ
 fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:sonnet
 ```
 
-- **Promote** to land via `fw worker` (refused after a pick): goal (`--goal`, seed task's, else prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (default winner, else leader); refused for a used id. Then **Run <id> with worker here**.
+- **Promote** to land via `fw worker` (refused after a pick or for a used id): goal (`--goal`, seed task's, else prompt's first line), prompt -> `context.notes`, graders -> `command`, `--protect` -> constraints, `--reference` (winner, else leader). Then **Run <id> with worker here**.
 - **Fan out this task** (Flywheel panel): prompt = its goal, context; graders = its command plus **held-out** graders, added server-side (none/unreadable: refused). A prompt naming a held-out grader is refused; Ask to fix only says one failed. Not a sandbox.
 
 ## Flywheel panel
@@ -157,7 +157,7 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 Each session's turns, calls, subagents, plan, waits, context, cost, and rate limits are recorded (`telemetry.db`, 30 days) and folded into what it is doing now.
 
-- **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle); list; **Insights**.
+- **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle), list, **Insights**.
 - **Needs you** (sidebar, `fw hub inbox`): blocked, then `asking` (a closing question or an `ask_operator` ask), answered in the row.
 - **Handoffs**: the `handoff` tool (`prompt`, `name`?, `reason`?) saves one on the session: a Needs you row until **Start** (**Review** edits) or **Dismiss**. `fw hub continue SESSION [--handoff ID]` starts one, linked. Agents talk via `list_sessions`, `message_session` (typed or queued, signed).
 - **Agent starts**: `start_session` starts a linked session as the caller (kind, account, permissions; `model`?); `session_status` reads one. Policy (pane menu, `fw hub starts --policy`, `agent_starts.policy`): `ask` (a Needs you row), `allowed`, `off`; `[agent_starts]` limits. `fw hub new` inside an agent links to it and obeys it.
@@ -167,16 +167,16 @@ Each session's turns, calls, subagents, plan, waits, context, cost, and rate lim
 - **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (set by `fw worker`); over `_BUDGET`: flagged.
 - **Work** (the header's **work** pill, `fw hub fleet SESSION --turns`): live **map** (stations open; turns replay); plan; per turn a call strip, files, commands, cost, ending. Rows: call or thinking, its age.
 - **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` (Claude gets the hub's tools and a prompt paragraph). Declared: a claim; no plan, no percentage.
-- **Capture**: Claude Code's hooks POST to the hub (a process per event only for `SessionStart`, until a status line shows CLI 2.1.322+, or under `allowedHttpHookUrls`); its status line: context, cost, 5 h / 7 d gauges (yours still shows). Codex: its rollout.
+- **Capture**: Claude Code hooks POST to the hub (a process per event only for `SessionStart` before CLI 2.1.322, or under `allowedHttpHookUrls`); its status line: context, cost, 5 h / 7 d gauges (yours still shows). Codex: its rollout.
 - **Many hosts**: `[telemetry] upstream = "NAME"` sends this hub's events to that machine (`fw hub machine add`) in batches, held while down; its Fleet lists every hub's sessions.
 
 ## Digests
 
 Off until `hub.toml` `[digest] times` is set ([hub-reference](reference.md#hubtoml); or Settings > Digest).
 
-- **Says**, since the last digest, per workspace: turns done, agents blocked now, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and gates waiting, queue stalls, spend today and this week (local midnight, Monday); then the top 3 needs-you (gates, blocked, red PRs, stalled queues), linked.
+- **Says**, since the last, per workspace: turns done, agents blocked, fan-outs graded (winner / leader), PRs red / green / merged, autopilot decisions and waiting gates, queue stalls, spend today and this week; then the top 3 needs-you, linked.
 - **To** `channels`: `push` (notify.toml; names and counts only, the 3 as ntfy buttons), `browser` (a card; with alerts on, a notification), `plugin` (`digest.ready`). Empty: skipped (`quiet_if_empty`). `delivery.channels`: only those that heard it.
-- **Once per slot**: local times per date (a skipped 02:30 runs at 03:00, a repeated 01:30 once); `digest.json` under a lock across restarts and `upgrade`. A slot missed while down is sent on start within 2 h, else skipped; a new schedule owes nothing before it. A send claim over 5 min old is dropped.
+- **Once per slot** per local date (a skipped 02:30 runs at 03:00, a repeated 01:30 once), in `digest.json` under a lock. Missed while down: sent on start within 2 h, else skipped; a new schedule owes nothing earlier. Send claims expire in 5 min.
 
 ## Permissions
 

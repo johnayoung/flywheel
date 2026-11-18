@@ -8,6 +8,7 @@ use crate::daemon::{self, LOG_FILE};
 use crate::handoff::{self, EXIT_BUSY, EXIT_NO_HUB, EXIT_REFUSED, HandoffError, Link, Refusal};
 use crate::hub::{Hub, HubOptions};
 use crate::remote::RuntimeInfo;
+use crate::state::RelaunchMode;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -120,9 +121,10 @@ impl TakenOver {
     pub(crate) fn finish(self, hub: &Arc<Hub>) -> Result<String, String> {
         self.link.ready(hub).map_err(|e| e.to_string())?;
         let exited = self.sessions - self.running;
+        let (stale, mode) = hub.mark_stale(&self.old_version);
         Ok(format!(
             "took over {} running session{}{} from the hub at pid {} (flywheel {}); nothing was \
-             restarted",
+             restarted{}",
             self.running,
             if self.running == 1 { "" } else { "s" },
             if exited == 0 {
@@ -131,7 +133,15 @@ impl TakenOver {
                 format!(" (and {exited} exited)")
             },
             self.old_pid,
-            self.old_version
+            self.old_version,
+            match stale {
+                0 => String::new(),
+                n => format!(
+                    "; {n} agent session{} to relaunch ({})",
+                    if n == 1 { "" } else { "s" },
+                    mode.as_str()
+                ),
+            }
         ))
     }
 }
@@ -146,10 +156,11 @@ impl TakenOver {
 pub(crate) fn start_handoff(
     hub: &HubArgs,
     timeout: Duration,
+    relaunch: Option<RelaunchMode>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    match run_start_handoff(hub, timeout, out, err) {
+    match run_start_handoff(hub, timeout, relaunch, out, err) {
         Ok(code) => code,
         Err(message) => fail(err, &message),
     }
@@ -158,6 +169,7 @@ pub(crate) fn start_handoff(
 fn run_start_handoff(
     hub: &HubArgs,
     timeout: Duration,
+    relaunch: Option<RelaunchMode>,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32, String> {
@@ -177,6 +189,9 @@ fn run_start_handoff(
         "--handoff-timeout".to_owned(),
         timeout.as_secs().max(1).to_string(),
     ];
+    if let Some(mode) = relaunch {
+        argv.extend(["--relaunch".to_owned(), mode.as_str().to_owned()]);
+    }
     argv.extend(hub.to_argv(&dir));
     argv.extend(["--log-file".to_owned(), log.to_string_lossy().into_owned()]);
     let mut child = daemon::spawn_detached(&exe, &argv, &log)
@@ -325,6 +340,13 @@ pub(crate) struct UpgradeArgs {
     /// busy (nothing changed; retry).
     #[arg(long, value_name = "SECS", default_value_t = 90)]
     timeout: u64,
+    /// After a live handoff, relaunch the agent sessions (resuming their
+    /// conversations, so they get the new tools): idle (those at rest
+    /// now), safe-points (each at its next rest; busy ones are never
+    /// interrupted), or off [default: hub.toml
+    /// sessions.relaunch_on_upgrade, else safe-points].
+    #[arg(long, value_name = "MODE", value_parser = RelaunchMode::parse)]
+    relaunch: Option<RelaunchMode>,
     #[command(flatten)]
     state: StateDirArg,
 }
@@ -332,6 +354,8 @@ pub(crate) struct UpgradeArgs {
 /// What a binary can do, from `<binary> hub start --help`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Support {
+    /// A flywheel with `fw hub start --handoff --relaunch`.
+    Relaunch,
     /// A flywheel with `fw hub start --handoff`.
     Handoff,
     /// A flywheel with `fw hub`, from before live handoff.
@@ -380,7 +404,9 @@ fn probe(binary: &Path) -> Result<Support, String> {
             status.map_or_else(|| "no status".to_owned(), |s| s.to_string())
         ));
     }
-    Ok(if help.contains("--handoff") {
+    Ok(if help.contains("--relaunch") {
+        Support::Relaunch
+    } else if help.contains("--handoff") {
         Support::Handoff
     } else {
         Support::HubOnly
@@ -513,8 +539,21 @@ fn run_upgrade(
     let mut command = Command::new(&binary);
     command
         .args(["hub", "start", "--handoff", "--timeout"])
-        .arg(args.timeout.to_string())
-        .args(&old.serve_args);
+        .arg(args.timeout.to_string());
+    match args.relaunch {
+        Some(mode) if support == Support::Relaunch => {
+            command.args(["--relaunch", mode.as_str()]);
+        }
+        Some(_) => {
+            let _ = writeln!(
+                err,
+                "fw hub: {} predates --relaunch: its sessions are not relaunched",
+                binary.display()
+            );
+        }
+        None => {}
+    }
+    command.args(&old.serve_args);
     with_env(&mut command, old.env.as_deref());
     let output = command
         .output()

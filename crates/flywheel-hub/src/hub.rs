@@ -5,7 +5,9 @@ mod capture;
 mod endings;
 pub use capture::{CAPTURE_TOKEN_FILE, CAPTURED_PREFIX, CaptureFrom, CaptureRefused};
 pub use endings::{AgentEnd, AgentReplace, FORCE_REFUSED};
+pub use relaunches::stale_note;
 mod links;
+mod relaunches;
 mod starts;
 pub use starts::{AgentStart, Opened};
 mod restore;
@@ -89,6 +91,9 @@ pub struct HubOptions {
     /// Code's `--resume`, `codex resume`). Off: they come back as fresh
     /// shells (`fw hub serve --no-agent-resume`).
     pub agent_resume: bool,
+    /// How a live upgrade relaunches the agent sessions it took over
+    /// (`--relaunch`, hub.toml `sessions.relaunch_on_upgrade`).
+    pub relaunch_on_upgrade: crate::state::RelaunchMode,
     /// Where the UI's "Import VS Code workspace" looks for
     /// `*.code-workspace` files (to [`vscode::DEFAULT_SEARCH_DEPTH`]) when
     /// the browser names no root. Defaults to `~/code`.
@@ -139,6 +144,7 @@ impl HubOptions {
                 std::env::var_os("HOME").as_deref(),
             ),
             agent_resume: true,
+            relaunch_on_upgrade: crate::state::RelaunchMode::default(),
             import_root: std::env::var_os("HOME")
                 .filter(|h| !h.is_empty())
                 .map(|h| PathBuf::from(h).join("code")),
@@ -570,6 +576,8 @@ pub struct Hub {
     recordings: Arc<crate::record::Recordings>,
     /// Prompt queues' typing times, holds, and delivery gate.
     queue: crate::queue::QueueRuntime,
+    /// Relaunches after a live upgrade (`hub/relaunches.rs`).
+    relaunch: Mutex<relaunches::RelaunchRuntime>,
     /// The activity journal and each client's presence.
     activity: crate::activity::Activity,
     /// Pending permission requests and their journal (`crate::perms`).
@@ -720,6 +728,7 @@ impl Hub {
                 record_limits,
             )),
             queue: crate::queue::QueueRuntime::default(),
+            relaunch: Mutex::default(),
             activity: crate::activity::Activity::open(&options_state_dir),
             perms: Arc::new(crate::perms::Runtime::new(&options_state_dir, perms_env)),
             audit: std::sync::OnceLock::new(),

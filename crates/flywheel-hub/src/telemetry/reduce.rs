@@ -574,6 +574,7 @@ impl SessionState {
             | What::EndCancelled { .. }
             | What::Ended { .. }
             | What::OwnerChanged { .. }
+            | What::Relaunched { .. }
             | What::QueueCancelled { .. } => {}
             What::SessionFinished { .. } => {
                 // An unanswered ask outlives the process: a resumed

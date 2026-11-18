@@ -146,6 +146,8 @@ fn running_session(workspace_id: &str, cwd: &Path) -> SessionRecord {
         ending: None,
         ended: None,
         end_requests: Vec::new(),
+        stale: None,
+        never_relaunch: false,
     }
 }
 

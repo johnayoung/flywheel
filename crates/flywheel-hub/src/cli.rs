@@ -333,6 +333,10 @@ struct ServeArgs {
     /// each step of this one, in seconds (`fw hub upgrade --timeout`).
     #[arg(long, value_name = "SECS", hide = true, requires = "handoff")]
     handoff_timeout: Option<u64>,
+    /// With --handoff: how the agent sessions taken over are relaunched
+    /// (`fw hub upgrade --relaunch`).
+    #[arg(long, value_name = "MODE", hide = true, requires = "handoff", value_parser = crate::state::RelaunchMode::parse)]
+    relaunch: Option<crate::state::RelaunchMode>,
 }
 
 /// How the hub serves: shared by `serve`, `start`, and `install-service`.

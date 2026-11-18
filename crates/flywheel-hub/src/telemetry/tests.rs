@@ -778,6 +778,10 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             to: "s2".into(),
             by: "s1".into(),
         },
+        What::Relaunched {
+            why: "after the hub upgrade from flywheel 0.1.0".into(),
+            error: None,
+        },
         What::QueueCancelled {
             by: "s1".into(),
             items: 2,

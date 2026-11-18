@@ -428,7 +428,9 @@ impl Hub {
                 // Hung up by the hub stopping: not an exit of their own
                 // (the `hub.stopped` row says it).
                 if event == "session.exited"
-                    && payload.get("hub_stopping").and_then(Value::as_bool) == Some(true)
+                    && ["hub_stopping", "relaunching"]
+                        .iter()
+                        .any(|k| payload.get(*k).and_then(Value::as_bool) == Some(true))
                 {
                     return;
                 }

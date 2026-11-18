@@ -126,6 +126,9 @@ pub(super) async fn kill_session(
 pub(super) struct RestartRequest {
     cols: Option<u16>,
     rows: Option<u16>,
+    /// Set instead of relaunching: opt it out of relaunches after hub
+    /// upgrades (`true`) or back in.
+    never: Option<bool>,
 }
 
 pub(super) async fn restart_session(
@@ -134,7 +137,11 @@ pub(super) async fn restart_session(
     ApiJson(request): ApiJson<RestartRequest>,
 ) -> ApiResult<Response> {
     let hub = Arc::clone(&app.hub);
-    let view = blocking(move || hub.restart_session(&id, request.cols, request.rows)).await?;
+    let view = blocking(move || match request.never {
+        Some(never) => hub.set_never_relaunch(&id, never),
+        None => hub.restart_session(&id, request.cols, request.rows),
+    })
+    .await?;
     Ok(Json(view).into_response())
 }
 

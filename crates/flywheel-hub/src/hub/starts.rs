@@ -551,6 +551,13 @@ impl Hub {
             }
         };
         lines.push(format!("state: {state}"));
+        if let Some(stale) = target.stale.as_ref().filter(|_| target.state.is_running()) {
+            lines.push(format!(
+                "{} (its process predates the hub upgrade from flywheel {})",
+                super::stale_note(stale),
+                stale.from
+            ));
+        }
         // What the agent reports it runs, else what it was launched with.
         let reported = snap.as_ref().and_then(|s| s.model.clone());
         let launched = target.launch.as_ref().and_then(|l| l.model.clone());
@@ -683,6 +690,8 @@ mod tests {
             ending: None,
             ended: None,
             end_requests: Vec::new(),
+            stale: None,
+            never_relaunch: false,
         }
     }
 

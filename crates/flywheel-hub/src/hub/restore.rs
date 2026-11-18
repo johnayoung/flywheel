@@ -23,6 +23,19 @@ impl Hub {
         cols: Option<u16>,
         rows: Option<u16>,
     ) -> Result<SessionView, HubError> {
+        self.restart_in_place(id, cols, rows, false)
+    }
+
+    /// [`Hub::restart_session`]; `resume`: a Codex agent resumes its
+    /// recorded thread too (Claude Code resumes whenever its transcript
+    /// exists).
+    pub(super) fn restart_in_place(
+        self: &Arc<Self>,
+        id: &str,
+        cols: Option<u16>,
+        rows: Option<u16>,
+        resume: bool,
+    ) -> Result<SessionView, HubError> {
         let mut store = self.store();
         let record = store.session(id)?.clone();
         if record.state.is_running() {
@@ -52,7 +65,7 @@ impl Hub {
             store.set_agent_session_id(id, &conversation)?;
             record.agent_session_id = Some(conversation);
         }
-        let session = self.spawn_pty(&record, cols, rows, false, None)?;
+        let session = self.spawn_pty(&record, cols, rows, resume, None)?;
         let record = match store.mark_running(id) {
             Ok(record) => record,
             Err(e) => {

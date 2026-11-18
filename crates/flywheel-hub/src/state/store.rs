@@ -385,6 +385,7 @@ impl HubStore {
         let session = &mut self.doc.sessions[index];
         session.state = SessionState::Running;
         session.fallback_command = None;
+        session.stale = None;
         self.save_or_rollback(|doc| doc.sessions[index] = previous)?;
         Ok(self.doc.sessions[index].clone())
     }
@@ -431,6 +432,7 @@ impl HubStore {
         let session = &mut self.doc.sessions[index];
         session.fallback_command = fallback;
         session.state = SessionState::Running;
+        session.stale = None;
         self.save_or_rollback(|doc| doc.sessions[index] = previous)?;
         Ok(self.doc.sessions[index].clone())
     }

@@ -28,7 +28,7 @@ use crate::state::{
     PendingStart, ProcessNote, SessionRecord, SessionState, StartPolicy, StateError, Successor,
     WorktreeRequest, new_id, validate_name,
 };
-use crate::status::AgentStatus;
+use crate::status::{AgentStatus, State};
 use crate::telemetry::reduce::{WorkSource, WorkStatus};
 use crate::telemetry::{Draft, What, now_ms};
 use chrono::Utc;
@@ -440,8 +440,33 @@ impl Hub {
     /// The processes other than its agent in session `record`'s terminal,
     /// and the work in its directory: what ending it would take or leave.
     fn end_losses(&self, record: &SessionRecord) -> (Vec<ProcessNote>, Option<DirtyNote>) {
-        let killed = self
-            .live_session(&record.id)
+        let killed = self.end_processes(record);
+        let dirty = match &record.worktree {
+            Some(worktree) => git::removal_check(worktree).ok().map(|c| DirtyNote {
+                path: c.path,
+                branch: Some(c.branch),
+                dirty: c.dirty,
+                untracked: c.untracked,
+                unmerged: c.unmerged,
+            }),
+            None if record.cwd.is_dir() => git::status(&record.cwd, None).ok().map(|s| DirtyNote {
+                path: record.cwd.clone(),
+                branch: s.branch,
+                dirty: s.dirty,
+                untracked: s.untracked,
+                unmerged: 0,
+            }),
+            None => None,
+        }
+        .filter(|n| n.dirty + n.untracked + n.unmerged > 0);
+        (killed, dirty)
+    }
+
+    /// The processes other than its agent in session `record`'s terminal
+    /// or started by it (its Bash tool runs commands in sessions of their
+    /// own), each marked when it is the agent's own helper.
+    fn end_processes(&self, record: &SessionRecord) -> Vec<ProcessNote> {
+        self.live_session(&record.id)
             .map(|pty| {
                 let leader = pty.pid();
                 let codex = record.kind == crate::agent::SessionKind::Codex;
@@ -465,26 +490,18 @@ impl Hub {
                     })
                     .collect()
             })
-            .unwrap_or_default();
-        let dirty = match &record.worktree {
-            Some(worktree) => git::removal_check(worktree).ok().map(|c| DirtyNote {
-                path: c.path,
-                branch: Some(c.branch),
-                dirty: c.dirty,
-                untracked: c.untracked,
-                unmerged: c.unmerged,
-            }),
-            None if record.cwd.is_dir() => git::status(&record.cwd, None).ok().map(|s| DirtyNote {
-                path: record.cwd.clone(),
-                branch: s.branch,
-                dirty: s.dirty,
-                untracked: s.untracked,
-                unmerged: 0,
-            }),
-            None => None,
+            .unwrap_or_default()
+    }
+
+    /// Work session `record`'s agent started that still runs (not its
+    /// own helpers): what it is, else `None`.
+    pub(super) fn work_running(&self, record: &SessionRecord) -> Option<String> {
+        let processes = self.end_processes(record);
+        match work_of(&processes).len() {
+            0 => None,
+            1 => Some("a process it started still runs".to_owned()),
+            n => Some(format!("{n} processes it started still run")),
         }
-        .filter(|n| n.dirty + n.untracked + n.unmerged > 0);
-        (killed, dirty)
     }
 
     /// Why agent session `from` may not end `target` at all.
@@ -1300,7 +1317,25 @@ impl Hub {
     /// Why session `record` is not at rest to be ended now: the queue's
     /// rest rules, nothing queued, and no tool call or subagent open.
     fn end_ready(&self, record: &SessionRecord) -> Result<(), String> {
-        let facts = self.queue_facts(record, &SessionQueue::default());
+        self.at_rest(record, false)?;
+        if self
+            .store()
+            .queue(&record.id)
+            .is_some_and(|q| q.pending_count() > 0)
+        {
+            return Err("a queued prompt waits".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Why agent session `record` is not at rest: the queue's rest rules
+    /// (its status settled at done or idle, nobody using or typing into
+    /// it, nothing unsent at its prompt), no tool call open, and no
+    /// subagent running or about to wake it. `shown`: the state it shows
+    /// must be done, idle, or failed too (not asking, background, or
+    /// compacting).
+    pub(super) fn at_rest(&self, record: &SessionRecord, shown: bool) -> Result<(), String> {
+        let facts = self.rest_facts(record, &SessionQueue::default());
         match facts.presence {
             crate::queue::Presence::Ready => {}
             crate::queue::Presence::Starting(why) => return Err(why.to_owned()),
@@ -1311,6 +1346,9 @@ impl Hub {
             .ok_or_else(|| "no status reported yet".to_owned())?;
         if !matches!(status.status, AgentStatus::Done | AgentStatus::Idle) {
             return Err(format!("{:?}", status.status).to_lowercase());
+        }
+        if shown && !matches!(status.state, State::Done | State::Idle | State::Failed) {
+            return Err(status.state.as_str().to_owned());
         }
         if (facts.now - status.since).to_std().unwrap_or_default() < SETTLE {
             return Err("just finished: settling".to_owned());
@@ -1327,9 +1365,10 @@ impl Hub {
         if self
             .store()
             .queue(&record.id)
-            .is_some_and(|q| q.pending_count() > 0)
+            .and_then(|q| q.last_delivered_at)
+            .is_some_and(|at| at >= status.since)
         {
-            return Err("a queued prompt waits".to_owned());
+            return Err("a prompt sent to it has not started yet".to_owned());
         }
         if self
             .telemetry()
@@ -1857,6 +1896,8 @@ mod tests {
             ending: None,
             ended: None,
             end_requests: Vec::new(),
+            stale: None,
+            never_relaunch: false,
         }
     }
 

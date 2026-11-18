@@ -17,9 +17,9 @@ Every `fw hub` verb, flag, and file (`docs_drift.rs` checks). Front door: [hub](
 Server and lifecycle:
 
 ```bash
-fw hub start {serve} [--timeout SECS] [--handoff]  # detached; prints login URLs; --handoff exits as upgrade
+fw hub start {serve} [--timeout SECS] [--handoff [--relaunch MODE]]  # detached; prints login URLs; --handoff exits as upgrade
 fw hub stop [--timeout SECS] [--force]  # exit 3 none running
-fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS]  # exit 1 failed (hub carries on), 3, 4, 5
+fw hub upgrade [--binary PATH] [--allow-restart] [--timeout SECS] [--relaunch MODE]  # exit 1 failed (hub carries on), 3, 4, 5
 fw hub status [--json]  # exit 3 not running, 1 not answering
 fw hub logs [--follow|-f] [--lines|-n N]  # -n 0: all
 fw hub serve {serve} [--handoff]  # foreground
@@ -67,7 +67,7 @@ fw hub read SESSION [--source visible|recent] [--lines N] [--json] {where}
 fw hub wait SESSION --until done|blocked|idle|working|exit [--timeout SECS] [--changed] {where}
 fw hub attach [SESSION] [--prefix C-b] [--no-status] {where}
 fw hub kill SESSION [--rm] [--remove-worktree] [--force] {where}  # --rm forgets
-fw hub relaunch SESSION {where}
+fw hub relaunch SESSION [--never|--auto] {where}
 fw hub explain [SESSION] [--file SCREEN.txt|-] [--kind claude|codex|shell] [--json] {where}
 fw hub import FILE.code-workspace... [--name N] [--update] [--json]
 ```
@@ -221,6 +221,7 @@ login_days = 30            # a login lasts this long after its last use
 scrollback_lines = 5000
 restore = true
 agent_resume = true
+relaunch_on_upgrade = "safe-points"
 
 [worktrees]
 branch_prefix = "agent/"
@@ -288,6 +289,7 @@ upstream = "collector"     # the machine that takes this hub's session events
 | `sessions.scrollback_lines` | `--scrollback-lines` | `5000` (new sessions) | live |
 | `sessions.restore` | `--no-restore` | `true` | restart |
 | `sessions.agent_resume` | `--no-agent-resume` | `true` | restart |
+| `sessions.relaunch_on_upgrade` | - | `"safe-points"`, `idle`, `off` | restart |
 | `worktrees.branch_prefix` | `--worktree-branch-prefix` | `""` | live |
 | `import.root` | `--import-root` | `"~/code"` | live |
 | `flywheel.enabled` | `--no-flywheel` | `true` | restart |

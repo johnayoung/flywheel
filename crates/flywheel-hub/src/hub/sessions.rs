@@ -255,6 +255,8 @@ impl Hub {
             ending: None,
             ended: None,
             end_requests: Vec::new(),
+            stale: None,
+            never_relaunch: false,
         };
         if record
             .launch
@@ -588,6 +590,8 @@ impl Hub {
             ending: None,
             ended: None,
             end_requests: Vec::new(),
+            stale: None,
+            never_relaunch: false,
         };
         Ok((self.launch(record, cols, rows, false, None)?, true))
     }
@@ -886,6 +890,14 @@ impl Hub {
             if self.activity().is_stopping() {
                 // Hung up by `fw hub stop`, not ended of its own.
                 payload["hub_stopping"] = serde_json::Value::Bool(true);
+            }
+            if self
+                .store()
+                .session(id)
+                .is_ok_and(|r| r.stale.as_ref().is_some_and(|s| s.hung_up_at.is_some()))
+            {
+                // Hung up to be relaunched after an upgrade.
+                payload["relaunching"] = serde_json::Value::Bool(true);
             }
             self.emit_lifecycle("session.exited", payload);
         }

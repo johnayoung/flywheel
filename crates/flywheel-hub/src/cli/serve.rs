@@ -83,6 +83,7 @@ pub(super) fn serve_cmd(
     options.scrollback_lines = effective.scrollback_lines;
     options.report_command = report_command();
     options.agent_resume = effective.agent_resume;
+    options.relaunch_on_upgrade = args.relaunch.unwrap_or(effective.relaunch_on_upgrade);
     options.worktree_branch_prefix = effective.worktree_branch_prefix.clone();
     options.import_root = effective.import_root.clone();
     options.agent_defaults = effective.agent_defaults.clone();

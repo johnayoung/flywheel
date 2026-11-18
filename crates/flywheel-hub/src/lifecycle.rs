@@ -62,6 +62,12 @@ pub(crate) struct StartArgs {
     /// handoff to this binary; `fw hub upgrade` runs this).
     #[arg(long)]
     handoff: bool,
+    /// With --handoff: relaunch the agent sessions taken over (resuming
+    /// their conversations) idle (those at rest now), safe-points (each
+    /// at its next rest), or off [default: hub.toml
+    /// sessions.relaunch_on_upgrade, else safe-points].
+    #[arg(long, value_name = "MODE", requires = "handoff", value_parser = crate::state::RelaunchMode::parse)]
+    relaunch: Option<crate::state::RelaunchMode>,
 }
 
 pub(crate) fn start(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -76,6 +82,7 @@ fn start_daemon(args: &StartArgs, out: &mut dyn Write, err: &mut dyn Write) -> R
         return Ok(crate::upgrade::start_handoff(
             &args.hub,
             Duration::from_secs(args.timeout),
+            args.relaunch,
             out,
             err,
         ));

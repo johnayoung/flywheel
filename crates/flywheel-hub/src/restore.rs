@@ -167,6 +167,8 @@ mod tests {
             ending: None,
             ended: None,
             end_requests: Vec::new(),
+            stale: None,
+            never_relaunch: false,
         }
     }
 

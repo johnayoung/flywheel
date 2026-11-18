@@ -351,6 +351,7 @@ function renderSession(session, opts = {}) {
     // An agent's end in progress, or how one ended it: a line of its own
     // (the meta strip has no room beside the name).
     endingHint(session),
+    relaunchHint(session),
     // Where it runs (shown on the active row); a companion (or a
     // reviewer) under its agent: the agent's line says it all.
     parent && sessionById(parent) ? null : whereLine(session),
@@ -394,6 +395,21 @@ function endingHint(session) {
     });
   }
   return null;
+}
+
+// An agent whose process predates the hub's last upgrade: relaunched in
+// place (its conversation resumed) at its next rest, unless held.
+function relaunchHint(session) {
+  const s = session.stale;
+  if (!s || session.state !== "running") return null;
+  const busy = s.hung_up_at ? "relaunching" : "relaunch pending";
+  return el("span", {
+    className: "session-detail session-relaunch",
+    textContent: busy,
+    title: s.held
+      ? `Runs a process from before the hub upgrade (flywheel ${s.from}); not relaunched on its own: ${s.held}. Relaunch it yourself to get the new tools.`
+      : `Runs a process from before the hub upgrade (flywheel ${s.from}); relaunched (its conversation resumed) once its turn is over and nothing runs.`,
+  });
 }
 
 // How far along a working (or blocked) agent is, from its telemetry: the

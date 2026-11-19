@@ -304,6 +304,7 @@ window.FwHubQueue = function (ctx) {
           { className: "q-meta" },
           el("span", { className: `q-when ${item.when}`, textContent: WHEN_LABEL[item.when] || item.when }),
           el("span", { className: "q-age", textContent: sending ? "sending" : `queued ${age(item.added_at)} ago` }),
+          item.topic ? el("span", { className: "q-age", title: "a newer message on this topic replaces it", textContent: `topic ${item.topic}` }) : null,
         ),
         editing
           ? editForm(item)

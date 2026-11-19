@@ -243,9 +243,15 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
-    fn message(&self, to: &str, text: &str, priority: bool) -> Result<String, String> {
+    fn message(
+        &self,
+        to: &str,
+        text: &str,
+        priority: bool,
+        topic: Option<&str>,
+    ) -> Result<String, String> {
         self.hub
-            .agent_message(&self.session, to, text, priority)
+            .agent_message(&self.session, to, text, priority, topic)
             .map_err(|e| e.to_string())
     }
 
@@ -289,7 +295,7 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
-    fn queued_messages(&self, to: &str) -> Result<String, String> {
+    fn queued_messages(&self, to: Option<&str>) -> Result<String, String> {
         self.hub
             .agent_queued(&self.session, to)
             .map_err(|e| e.to_string())

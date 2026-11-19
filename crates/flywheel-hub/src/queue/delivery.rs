@@ -78,6 +78,7 @@ impl Hub {
                 .as_ref()
                 .is_some_and(|r| self.transcript_has(r, &text, sending_at));
             let result = self.store().update_queue(&sid, |queue| {
+                let mut topic = None;
                 if let Some(item) = queue.item_mut(&item_id) {
                     item.state = if found {
                         ItemState::Delivered {
@@ -87,6 +88,10 @@ impl Hub {
                     } else {
                         ItemState::Pending
                     };
+                    topic = item.topic.clone().map(|t| (item.from.clone(), t));
+                }
+                if found && let Some((from, topic)) = topic {
+                    queue.note_topic(from.as_deref(), &topic, Some(&item_id), sending_at);
                 }
                 if found && queue.last_delivered_at.is_none_or(|t| t < sending_at) {
                     queue.last_delivered_at = Some(sending_at);
@@ -278,11 +283,16 @@ impl Hub {
                 // happened, and the file's `sending` is settled from the
                 // transcript on the next start.
                 let saved = self.store().update_queue_keeping(id, |queue| {
+                    let mut topic = None;
                     if let Some(i) = queue.item_mut(item_id) {
                         i.state = ItemState::Delivered {
                             delivered_at,
                             reconciled: false,
                         };
+                        topic = i.topic.clone().map(|t| (i.from.clone(), t));
+                    }
+                    if let Some((from, topic)) = topic {
+                        queue.note_topic(from.as_deref(), &topic, Some(item_id), delivered_at);
                     }
                     queue.last_delivered_at = Some(delivered_at);
                     queue.settle_order();

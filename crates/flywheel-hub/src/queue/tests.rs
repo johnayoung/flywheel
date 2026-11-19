@@ -18,6 +18,7 @@ fn item(id: &str, when: When) -> QueueItem {
         from: None,
         priority: false,
         watch: None,
+        topic: None,
         state: ItemState::Pending,
     }
 }
@@ -468,4 +469,113 @@ fn a_priority_item_goes_behind_earlier_priority_items_and_never_ahead_of_one_bei
     .unwrap();
     assert_eq!(old.from, None);
     assert!(!old.priority);
+}
+
+fn from(id: &str, sender: &str, topic: Option<&str>) -> QueueItem {
+    QueueItem {
+        from: Some(sender.to_owned()),
+        topic: topic.map(str::to_owned),
+        ..item(id, When::Done)
+    }
+}
+
+#[test]
+fn a_topic_replaces_the_senders_waiting_item_in_place() {
+    let mut q = queue(vec![
+        from("a", "lead", Some("t")),
+        from("b", "other", Some("t")),
+        from("c", "lead", None),
+        from("d", "lead", Some("t")),
+    ]);
+    let got = q.supersede(Some("lead"), "t", false, |read| {
+        assert_eq!(read, None, "nothing was read");
+        "new".to_owned()
+    });
+    assert_eq!(
+        got,
+        Supersede::Replaced {
+            item: "a".into(),
+            place: 1
+        }
+    );
+    let ids: Vec<&str> = q.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, ["a", "b", "c"], "the older duplicate went");
+    assert_eq!(q.items[0].text, "new");
+    assert_eq!(q.items[1].text, "prompt b", "another sender's stays");
+}
+
+#[test]
+fn raising_priority_moves_the_replaced_item_up() {
+    let mut q = queue(vec![from("a", "other", None), from("b", "lead", Some("t"))]);
+    let got = q.supersede(Some("lead"), "t", true, |_| "urgent".to_owned());
+    assert_eq!(
+        got,
+        Supersede::Replaced {
+            item: "b".into(),
+            place: 1
+        }
+    );
+    assert!(q.items[0].priority && q.items[0].id == "b");
+}
+
+#[test]
+fn a_read_topic_is_remembered_and_reported() {
+    let mut q = queue(vec![]);
+    assert_eq!(
+        q.supersede(Some("lead"), "t", false, |_| unreachable!()),
+        Supersede::None
+    );
+    q.note_topic(Some("lead"), "t", None, at(5));
+    assert_eq!(
+        q.supersede(Some("lead"), "t", false, |_| unreachable!()),
+        Supersede::AfterRead { at: at(5) }
+    );
+    assert_eq!(q.topic_read_at(None, "t"), None, "the operator's are apart");
+    // Sending counts as read; a pending one on top takes the line.
+    let mut sending = from("s", "lead", Some("u"));
+    sending.state = ItemState::Sending { sending_at: at(9) };
+    q.items = vec![sending, from("p", "lead", Some("u"))];
+    let mut seen = None;
+    q.supersede(Some("lead"), "u", false, |read| {
+        seen = read;
+        "x".to_owned()
+    });
+    assert_eq!(seen, Some(at(9)));
+    assert!(!q.is_vacant(), "a remembered topic keeps the queue");
+}
+
+#[test]
+fn topics_seen_keep_only_the_newest() {
+    let mut q = queue(vec![]);
+    for n in 0..(MAX_TOPICS_SEEN as i64 + 3) {
+        q.note_topic(Some("lead"), &format!("t{n}"), None, at(n));
+    }
+    assert_eq!(q.topics_seen.len(), MAX_TOPICS_SEEN);
+    assert!(q.topic_read_at(Some("lead"), "t0").is_none());
+    assert!(q.topic_read_at(Some("lead"), "t3").is_some());
+}
+
+#[test]
+fn topics_are_checked() {
+    assert_eq!(
+        validate_topic(" ruling:schema/v2 ").unwrap(),
+        "ruling:schema/v2"
+    );
+    for bad in ["", "has space", "x".repeat(65).as_str(), "emoji\u{2603}"] {
+        assert!(validate_topic(bad).is_err(), "{bad:?}");
+    }
+    assert!(superseded_line("t", at(0)).starts_with("superseded: t ("));
+}
+
+#[test]
+fn an_item_without_a_topic_reads_and_writes_as_before() {
+    let json = serde_json::to_value(item("a", When::Done)).unwrap();
+    assert!(json.get("topic").is_none());
+    let q = queue(vec![item("a", When::Done)]);
+    assert!(
+        serde_json::to_value(&q)
+            .unwrap()
+            .get("topics_seen")
+            .is_none()
+    );
 }

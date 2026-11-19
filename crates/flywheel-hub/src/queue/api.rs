@@ -281,8 +281,82 @@ impl Hub {
     }
 
     /// Queue `item` at the end of session `id`'s queue.
+    /// With a topic, the operator's waiting item on it is replaced in
+    /// place instead (see [`super::Supersede`]); the item returned is it.
     pub fn queue_add(&self, id: &str, item: &NewItem) -> Result<(QueueItem, QueueView), HubError> {
-        self.queue_add_from(id, item, None, false)
+        let Some(topic) = item.topic.as_deref() else {
+            return self.queue_add_from(id, item, None, false);
+        };
+        let topic = super::validate_topic(topic)?;
+        let record = self.queue_record(id)?;
+        Self::refuse_if_ending(&record)?;
+        let text = validate_text(&item.text)?;
+        let _turn = self.queue_runtime().paste_turn();
+        let compose = |read: Option<chrono::DateTime<Utc>>| match read {
+            Some(at) => format!("{}\n\n{text}", super::superseded_line(&topic, at)),
+            None => text.clone(),
+        };
+        let done =
+            self.store()
+                .update_queue(id, |q| match q.supersede(None, &topic, false, compose) {
+                    super::Supersede::Replaced { item, .. } => Some(item),
+                    _ => None,
+                })?;
+        if let Some(replaced) = done {
+            self.note_superseded(id, None, &topic, &replaced, true, false);
+            self.queue_changed();
+            let view = self.queue_view(id)?;
+            let item = view
+                .items
+                .iter()
+                .find(|v| v.item.id == replaced)
+                .map(|v| v.item.clone())
+                .ok_or_else(|| StateError::NotFound(format!("queue item {replaced}")))?;
+            return Ok((item, view));
+        }
+        let read = self
+            .store()
+            .queue(id)
+            .and_then(|q| q.topic_read_at(None, &topic));
+        let added = self.queue_add_from(
+            id,
+            &NewItem {
+                text: compose(read),
+                when: item.when.clone(),
+                topic: Some(topic.clone()),
+            },
+            None,
+            false,
+        )?;
+        if read.is_some() {
+            self.note_superseded(id, None, &topic, &added.0.id, false, true);
+        }
+        Ok(added)
+    }
+
+    /// Announce that a message on `topic` superseded an earlier one in
+    /// session `id`'s queue (`replaced`: in place, unread; `read`: the
+    /// agent had read the earlier one).
+    pub(crate) fn note_superseded(
+        &self,
+        id: &str,
+        from: Option<&str>,
+        topic: &str,
+        item: &str,
+        replaced: bool,
+        read: bool,
+    ) {
+        self.log_hub_event(
+            "message.superseded",
+            Some(id),
+            serde_json::json!({
+                "from": from.unwrap_or("operator"),
+                "topic": topic,
+                "item": item,
+                "replaced": replaced,
+                "read": read,
+            }),
+        );
     }
 
     /// Queue `item` for session `id`, sent by agent session `from`
@@ -308,6 +382,7 @@ impl Hub {
             from: from.map(str::to_owned),
             priority,
             watch: None,
+            topic: item.topic.clone(),
             state: ItemState::Pending,
         };
         let added = new.clone();
@@ -556,6 +631,81 @@ impl Hub {
         self.send_or_queue_from(id, text, None, false)
     }
 
+    /// [`Hub::send_or_queue_from`] for a message on `topic` (`None`: as
+    /// that): `head` (the sender line) and `body` make the prompt. A
+    /// waiting message from `from` on the topic takes the new text in its
+    /// place (same id, same place: it is not sent now); else, if the agent
+    /// read one, the new one says it supersedes it after `head`.
+    pub(crate) fn send_or_queue_topic(
+        &self,
+        id: &str,
+        head: &str,
+        body: &str,
+        from: Option<&str>,
+        priority: bool,
+        topic: Option<&str>,
+    ) -> Result<(Delivery, super::Supersede), HubError> {
+        let compose = |read: Option<chrono::DateTime<Utc>>, topic: &str| match read {
+            Some(at) => format!("{head}\n\n{}\n\n{body}", super::superseded_line(topic, at)),
+            None => format!("{head}\n\n{body}"),
+        };
+        let Some(topic) = topic else {
+            let delivery =
+                self.send_or_queue_from(id, &format!("{head}\n\n{body}"), from, priority)?;
+            return Ok((delivery, super::Supersede::None));
+        };
+        let topic = super::validate_topic(topic)?;
+        let record = self.queue_record(id)?;
+        Self::refuse_if_ending(&record)?;
+        validate_text(&compose(Some(Utc::now()), &topic))?;
+        let runtime = self.queue_runtime();
+        let turn = runtime.paste_turn();
+        let found = self.store().update_queue(id, |q| {
+            q.supersede(from, &topic, priority, |read| compose(read, &topic))
+        })?;
+        match found {
+            super::Supersede::Replaced { item, place } => {
+                drop(turn);
+                self.note_superseded(id, from, &topic, &item, true, false);
+                self.queue_changed();
+                let pending = self
+                    .store()
+                    .queue(id)
+                    .map_or(0, SessionQueue::pending_count);
+                Ok((
+                    Delivery::Queued {
+                        item: item.clone(),
+                        why: format!("replaced your unread message on topic {topic}"),
+                        pending,
+                    },
+                    super::Supersede::Replaced { item, place },
+                ))
+            }
+            found => {
+                let read = match &found {
+                    super::Supersede::AfterRead { at } => Some(*at),
+                    _ => None,
+                };
+                let delivery = self.send_or_queue_held(
+                    &record,
+                    &compose(read, &topic),
+                    from,
+                    priority,
+                    Some(&topic),
+                    turn,
+                )?;
+                if read.is_some() {
+                    let item = match &delivery {
+                        Delivery::Queued { item, .. } => item.clone(),
+                        Delivery::Pasted { .. } => String::new(),
+                    };
+                    self.note_superseded(id, from, &topic, &item, false, true);
+                }
+                Ok((delivery, found))
+            }
+        }
+    }
+
     /// An ending session takes nothing more (its final prompt is queued
     /// apart from this).
     fn refuse_if_ending(record: &SessionRecord) -> Result<(), HubError> {
@@ -581,9 +731,24 @@ impl Hub {
     ) -> Result<Delivery, HubError> {
         let record = self.queue_record(id)?;
         Self::refuse_if_ending(&record)?;
-        let text = validate_text(text)?;
         let runtime = self.queue_runtime();
-        let _turn = runtime.paste_turn();
+        let turn = runtime.paste_turn();
+        self.send_or_queue_held(&record, text, from, priority, None, turn)
+    }
+
+    /// [`Hub::send_or_queue_from`] under the paste turn `_turn`, for a
+    /// message on `topic` (kept on its item, noted when it is typed in).
+    fn send_or_queue_held(
+        &self,
+        record: &SessionRecord,
+        text: &str,
+        from: Option<&str>,
+        priority: bool,
+        topic: Option<&str>,
+        _turn: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<Delivery, HubError> {
+        let id = record.id.as_str();
+        let text = validate_text(text)?;
         let current = self.store().queue(id).cloned().unwrap_or_default();
         let mut alone = SessionQueue {
             last_delivered_at: current.last_delivered_at,
@@ -598,9 +763,10 @@ impl Hub {
             from: from.map(str::to_owned),
             priority,
             watch: None,
+            topic: topic.map(str::to_owned),
             state: ItemState::Pending,
         });
-        let facts = self.queue_facts(&record, &alone);
+        let facts = self.queue_facts(record, &alone);
         if let Presence::Gone(why) = &facts.presence {
             // Refused, not queued: a relaunch will not bring it.
             let why = why.strip_suffix(RELAUNCH_HINT).unwrap_or(why);
@@ -638,6 +804,9 @@ impl Hub {
                 if let Err(e) = self.store().update_queue_keeping(id, |queue| {
                     queue.last_delivered_at =
                         Some(queue.last_delivered_at.map_or(at, |t| t.max(at)));
+                    if let Some(topic) = topic {
+                        queue.note_topic(from, topic, None, at);
+                    }
                 }) {
                     eprintln!("fw hub: queue {id}: sent, but not recorded: {e}");
                 }
@@ -650,6 +819,7 @@ impl Hub {
                     &NewItem {
                         text,
                         when: Some("done".into()),
+                        topic: topic.map(str::to_owned),
                     },
                     from,
                     priority,

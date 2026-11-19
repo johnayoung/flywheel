@@ -49,6 +49,10 @@ struct AddArgs {
     /// prompt it hits is answered and that turn finished.
     #[arg(long, value_parser = ["done", "idle", "blocked-cleared"], default_value = "done")]
     when: String,
+    /// What it is about: replaces your waiting item on TOPIC in place;
+    /// if one was delivered, this one says it supersedes it.
+    #[arg(long, value_name = "TOPIC")]
+    topic: Option<String>,
     /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
@@ -206,6 +210,10 @@ fn print_queue(out: &mut dyn Write, view: &Value, sent_shown: Option<usize>) {
         let id = str_field(item, "id");
         let short = &id[..id.len().min(8)];
         let text = first_line(str_field(item, "text"), 60);
+        let text = match item.get("topic").and_then(Value::as_str) {
+            Some(topic) => format!("[{topic}] {text}"),
+            None => text,
+        };
         let when = str_field(item, "when");
         let line = match str_field(item, "state") {
             "delivered" => format!(
@@ -253,7 +261,7 @@ fn run(args: &QueueArgs, out: &mut dyn Write) -> Result<i32, String> {
             let added = conn.blocking_call(
                 "POST",
                 &format!("/api/sessions/{id}/queue"),
-                Some(&json!({ "text": text, "when": a.when })),
+                Some(&json!({ "text": text, "when": a.when, "topic": a.topic })),
             )?;
             if a.json {
                 print_json(out, &added);

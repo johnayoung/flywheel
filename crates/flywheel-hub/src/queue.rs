@@ -57,6 +57,7 @@
 use crate::state::StateError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 mod api;
@@ -73,6 +74,10 @@ pub use runtime::{EDIT_LEASE, QueueRuntime, SessionHold, TypingExport};
 pub const MAX_PENDING: usize = 50;
 /// Delivered items kept per session (oldest dropped first).
 pub const MAX_DELIVERED_KEPT: usize = 20;
+/// The longest topic.
+pub const MAX_TOPIC_CHARS: usize = 64;
+/// Topics remembered as delivered per session.
+pub const MAX_TOPICS_SEEN: usize = 256;
 /// Largest prompt queued.
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 /// Default `queue.typing_quiet`, and its bounds.
@@ -166,6 +171,11 @@ pub struct QueueItem {
     /// pending, the watch's next matches join it rather than queue more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<String>,
+    /// What it is about, as its sender keyed it (`message_session`'s
+    /// `topic`, `fw hub queue add --topic`): a newer item from the same
+    /// sender with the same topic supersedes it (see [`Supersede`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
     #[serde(flatten)]
     pub state: ItemState,
 }
@@ -199,6 +209,70 @@ pub struct SessionQueue {
     pub last_delivered_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub items: Vec<QueueItem>,
+    /// Topics delivered to this session, by sender (see [`topic_key`]):
+    /// a newer message on one of them arrives saying it supersedes the
+    /// one the agent already read. At most [`MAX_TOPICS_SEEN`], the
+    /// oldest dropped first.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub topics_seen: BTreeMap<String, TopicSeen>,
+}
+
+/// A topic's latest delivery to a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicSeen {
+    /// The item delivered (`None`: typed in at once, never queued).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+    pub delivered_at: DateTime<Utc>,
+}
+
+/// What a message with a topic did to its sender's earlier one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Supersede {
+    /// No earlier message on the topic.
+    None,
+    /// The earlier one still waited: its text was replaced in place (same
+    /// id); `place`: 1-based among the items not yet delivered.
+    Replaced { item: String, place: usize },
+    /// The earlier one was delivered (or is being sent) at `at`: the new
+    /// one says it supersedes it.
+    AfterRead { at: DateTime<Utc> },
+}
+
+/// The key of `topic` from `sender` (a session id; `None`: the operator)
+/// in [`SessionQueue::topics_seen`].
+pub fn topic_key(sender: Option<&str>, topic: &str) -> String {
+    format!("{}\u{1f}{topic}", sender.unwrap_or("operator"))
+}
+
+/// `item` is `sender`'s message on `topic` (not a watch's prompt).
+fn is_on_topic(item: &QueueItem, sender: Option<&str>, topic: &str) -> bool {
+    item.from.as_deref() == sender && item.watch.is_none() && item.topic.as_deref() == Some(topic)
+}
+
+/// A topic as given: trimmed, 1-[`MAX_TOPIC_CHARS`] of `A-Z a-z 0-9 . _ : / -`.
+pub fn validate_topic(raw: &str) -> Result<String, StateError> {
+    let topic = raw.trim();
+    let ok = !topic.is_empty()
+        && topic.chars().count() <= MAX_TOPIC_CHARS
+        && topic
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '-'));
+    if ok {
+        Ok(topic.to_owned())
+    } else {
+        Err(StateError::Invalid(format!(
+            "topic {topic:?}: 1-{MAX_TOPIC_CHARS} characters of letters, digits, and . _ : / -"
+        )))
+    }
+}
+
+/// The line a superseding message starts with (after its sender line).
+pub fn superseded_line(topic: &str, at: DateTime<Utc>) -> String {
+    format!(
+        "superseded: {topic} (replaces the message on this topic delivered at {}; act on this one)",
+        at.format("%H:%M UTC")
+    )
 }
 
 impl SessionQueue {
@@ -217,6 +291,103 @@ impl SessionQueue {
             && !self.paused
             && self.stalled.is_none()
             && self.last_delivered_at.is_none()
+            && self.topics_seen.is_empty()
+    }
+
+    /// Note `topic` from `sender` delivered at `at` (`item`: its queue
+    /// item), keeping the newest [`MAX_TOPICS_SEEN`].
+    pub(crate) fn note_topic(
+        &mut self,
+        sender: Option<&str>,
+        topic: &str,
+        item: Option<&str>,
+        at: DateTime<Utc>,
+    ) {
+        self.topics_seen.insert(
+            topic_key(sender, topic),
+            TopicSeen {
+                item: item.map(str::to_owned),
+                delivered_at: at,
+            },
+        );
+        while self.topics_seen.len() > MAX_TOPICS_SEEN {
+            let oldest = self
+                .topics_seen
+                .iter()
+                .min_by_key(|(_, seen)| seen.delivered_at)
+                .map(|(key, _)| key.clone());
+            match oldest {
+                Some(key) => self.topics_seen.remove(&key),
+                None => break,
+            };
+        }
+    }
+
+    /// When the agent read `sender`'s latest message on `topic`: its
+    /// delivery (or the send under way now), else the topic's record.
+    pub(crate) fn topic_read_at(&self, sender: Option<&str>, topic: &str) -> Option<DateTime<Utc>> {
+        let mine = |i: &QueueItem| is_on_topic(i, sender, topic);
+        let sending = self.items.iter().find_map(|i| match i.state {
+            ItemState::Sending { sending_at } if mine(i) => Some(sending_at),
+            _ => None,
+        });
+        let delivered = self.items.iter().rev().find_map(|i| match i.state {
+            ItemState::Delivered { delivered_at, .. } if mine(i) => Some(delivered_at),
+            _ => None,
+        });
+        let seen = self
+            .topics_seen
+            .get(&topic_key(sender, topic))
+            .map(|s| s.delivered_at);
+        sending.or(delivered).or(seen)
+    }
+
+    /// Supersede `sender`'s earlier message on `topic` with the text
+    /// `compose` makes (given when the agent read an earlier one, if it
+    /// did): a waiting one takes that text (and `priority`, if raised) in
+    /// place, keeping its id and place, and any other waiting one on the
+    /// topic goes. Nothing waiting: whether the agent read one.
+    pub(crate) fn supersede(
+        &mut self,
+        sender: Option<&str>,
+        topic: &str,
+        priority: bool,
+        compose: impl FnOnce(Option<DateTime<Utc>>) -> String,
+    ) -> Supersede {
+        let read_at = self.topic_read_at(sender, topic);
+        let pending: Vec<String> = self
+            .items
+            .iter()
+            .filter(|i| is_on_topic(i, sender, topic) && matches!(i.state, ItemState::Pending))
+            .map(|i| i.id.clone())
+            .collect();
+        let Some((keep, rest)) = pending.split_first() else {
+            return match read_at {
+                Some(at) => Supersede::AfterRead { at },
+                None => Supersede::None,
+            };
+        };
+        self.items.retain(|i| !rest.contains(&i.id));
+        let text = compose(read_at);
+        let raise = self.item_mut(keep).is_some_and(|item| {
+            item.text = text;
+            item.added_at = Utc::now();
+            let raise = priority && !item.priority;
+            item.priority |= priority;
+            raise
+        });
+        if raise && let Some(at) = self.items.iter().position(|i| &i.id == keep) {
+            let item = self.items.remove(at);
+            self.insert_pending(item);
+        }
+        let place = self
+            .waiting()
+            .position(|i| &i.id == keep)
+            .map_or(1, |at| at + 1);
+        Supersede::Replaced {
+            item: keep.clone(),
+            place,
+        }
     }
 
     /// Items not yet delivered (the one being sent first, if any).
@@ -350,6 +521,10 @@ pub struct NewItem {
     pub text: String,
     #[serde(default)]
     pub when: Option<String>,
+    /// Supersedes the sender's earlier item on this topic (see
+    /// [`Supersede`]).
+    #[serde(default)]
+    pub topic: Option<String>,
 }
 
 /// An edit of a pending item.

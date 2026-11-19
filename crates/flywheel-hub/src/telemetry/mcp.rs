@@ -95,8 +95,15 @@ pub trait Host {
     /// The session `to` names, as text.
     fn session_status(&self, to: &str) -> Result<String, String>;
     /// Send `text` to the session `to` names (`priority`: ahead of its
-    /// waiting messages that are not); what became of it.
-    fn message(&self, to: &str, text: &str, priority: bool) -> Result<String, String>;
+    /// waiting messages that are not; `topic`: superseding the caller's
+    /// earlier message on it); what became of it.
+    fn message(
+        &self,
+        to: &str,
+        text: &str,
+        priority: bool,
+        topic: Option<&str>,
+    ) -> Result<String, String>;
     /// End the session `to` names (or ask the operator to); what to tell
     /// the agent now (the outcome arrives as a message).
     fn end_session(
@@ -108,8 +115,9 @@ pub trait Host {
     ) -> Result<String, String>;
     /// Replace the session `to` names with a new one.
     fn replace_session(&self, args: &ReplaceArgs) -> Result<String, String>;
-    /// The caller's messages still waiting in `to`'s queue.
-    fn queued_messages(&self, to: &str) -> Result<String, String>;
+    /// The caller's messages still waiting in `to`'s queue (`None`: in
+    /// every queue).
+    fn queued_messages(&self, to: Option<&str>) -> Result<String, String>;
     /// Take back one (`item`) or all of the caller's waiting messages.
     fn cancel_message(&self, to: &str, item: Option<&str>) -> Result<String, String>;
     /// Give control of `to` to `new_owner`.
@@ -331,7 +339,9 @@ fn message_tool() -> Value {
                         list_sessions): it arrives as that agent's next prompt, under a line \
                         naming you, now if it is idle or once its current turn is done. For \
                         coordinating shared work: a heads-up, a result it needs, a request. Do \
-                        not use it to reach the operator (ask_operator does that).",
+                        not use it to reach the operator (ask_operator does that). Give a \
+                        topic to one decision or request so a later change to it replaces \
+                        the earlier message instead of arriving after it.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -340,6 +350,10 @@ fn message_tool() -> Value {
                 "priority": {
                     "type": "boolean",
                     "description": "Optional: true queues it ahead of the other messages waiting for that session (behind earlier priority ones); it still waits for the current turn to end. Default false."
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Optional: a short key for what this message is about (ruling:schema, stop). A newer message from you with the same topic replaces your older one while it is still unread in that session's queue (keeping its place); if the older one was already delivered, the new one arrives with a first line saying it supersedes it. Letters, digits, . _ : / -; at most 64."
                 }
             },
             "required": ["to", "text"]
@@ -441,14 +455,14 @@ fn queued_tool() -> Value {
         "name": QUEUED_TOOL,
         "title": "List your queued messages",
         "description": "Your messages (message_session) that still wait in another session's \
-                        queue, not yet delivered: id, place in its queue, priority, when sent, \
-                        and first line. Only your own are shown.",
+                        queue, not yet delivered: id, place in its queue, priority, topic, when \
+                        sent, and first line. Only your own are shown. Without to: every \
+                        session you have messages waiting for.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "to": { "type": "string", "description": "The session's name or id." }
-            },
-            "required": ["to"]
+                "to": { "type": "string", "description": "Optional: the session's name or id. Default: every session." }
+            }
         }
     })
 }
@@ -694,10 +708,13 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                 })
             } else if name == Some(MESSAGE_TOOL) {
                 let priority = args.get("priority").and_then(Value::as_bool) == Some(true);
-                Ok(match host.message(arg("to"), arg("text"), priority) {
-                    Ok(said) => text_result(said, false),
-                    Err(why) => text_result(format!("Not sent: {why}"), true),
-                })
+                let topic = Some(arg("topic")).filter(|v| !v.trim().is_empty());
+                Ok(
+                    match host.message(arg("to"), arg("text"), priority, topic) {
+                        Ok(said) => text_result(said, false),
+                        Err(why) => text_result(format!("Not sent: {why}"), true),
+                    },
+                )
             } else if name == Some(END_TOOL) {
                 let given = |key: &str| Some(arg(key)).filter(|v| !v.trim().is_empty());
                 let wait = args
@@ -753,7 +770,8 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                     },
                 )
             } else if name == Some(QUEUED_TOOL) {
-                Ok(match host.queued_messages(arg("to")) {
+                let to = Some(arg("to")).filter(|v| !v.trim().is_empty());
+                Ok(match host.queued_messages(to) {
                     Ok(said) => text_result(said, false),
                     Err(why) => text_result(format!("No list: {why}"), true),
                 })
@@ -863,7 +881,18 @@ mod tests {
                 Err(format!("no session matches {to:?}"))
             }
         }
-        fn message(&self, to: &str, text: &str, priority: bool) -> Result<String, String> {
+        fn message(
+            &self,
+            to: &str,
+            text: &str,
+            priority: bool,
+            topic: Option<&str>,
+        ) -> Result<String, String> {
+            if let Some(topic) = topic {
+                return Ok(format!(
+                    "Replaced your unread message on topic {topic} for {to}"
+                ));
+            }
             if to == "claude 4" {
                 Ok(format!(
                     "{} claude 4: {text}",
@@ -899,8 +928,11 @@ mod tests {
                 args.to, args.name, args.model, args.worktree
             ))
         }
-        fn queued_messages(&self, to: &str) -> Result<String, String> {
-            Ok(format!("None of your messages wait for {to}."))
+        fn queued_messages(&self, to: Option<&str>) -> Result<String, String> {
+            Ok(match to {
+                Some(to) => format!("None of your messages wait for {to}."),
+                None => "None of your messages wait in any session's queue.".to_owned(),
+            })
         }
         fn cancel_message(&self, to: &str, item: Option<&str>) -> Result<String, String> {
             Ok(format!("Cancelled {} for {to}", item.unwrap_or("all")))

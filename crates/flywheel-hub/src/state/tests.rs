@@ -1147,6 +1147,7 @@ fn a_version_4_file_with_promoted_fanouts_migrates_to_queues_losing_neither() {
                 from: None,
                 priority: false,
                 watch: None,
+                topic: None,
                 state: ItemState::Pending,
             });
         })
@@ -1183,6 +1184,7 @@ fn a_queue_edit_that_records_what_happened_survives_a_failed_save() {
                 from: None,
                 priority: false,
                 watch: None,
+                topic: None,
                 state: ItemState::Sending { sending_at },
             });
         })

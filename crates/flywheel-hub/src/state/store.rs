@@ -1195,6 +1195,7 @@ impl HubStore {
                     from: None,
                     priority: false,
                     watch: Some(id.to_owned()),
+                    topic: None,
                     state: ItemState::Pending,
                 });
                 watch.fired += 1;

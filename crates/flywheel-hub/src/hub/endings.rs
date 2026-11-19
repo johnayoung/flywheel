@@ -786,6 +786,7 @@ impl Hub {
                         from: Some(by_id),
                         priority: true,
                         watch: None,
+                        topic: None,
                         state: ItemState::Pending,
                     };
                     let id = item.id.clone();
@@ -1662,8 +1663,11 @@ impl Hub {
 
     /// Agent session `caller`'s view of the queued messages it sent to
     /// session `to` that wait (the `queued_messages` tool).
-    pub fn agent_queued(&self, caller: &str, to: &str) -> Result<String, HubError> {
+    pub fn agent_queued(&self, caller: &str, to: Option<&str>) -> Result<String, HubError> {
         self.store().session(caller)?;
+        let Some(to) = to.map(str::trim).filter(|t| !t.is_empty()) else {
+            return self.agent_queued_everywhere(caller);
+        };
         let target = self.session_named(to)?;
         let queue = self.store().queue(&target.id).cloned().unwrap_or_default();
         let total = queue.pending_count();
@@ -1676,10 +1680,14 @@ impl Hub {
             })
             .map(|(at, i)| {
                 format!(
-                    "  {} #{} {}sent {} ago: {}",
+                    "  {} #{} {}{}sent {} ago: {}",
                     i.id,
                     at + 1,
                     if i.priority { "priority, " } else { "" },
+                    i.topic
+                        .as_deref()
+                        .map(|t| format!("topic {t}, "))
+                        .unwrap_or_default(),
                     span(now - i.added_at.timestamp_millis()),
                     preview(i)
                 )
@@ -1723,6 +1731,62 @@ impl Hub {
             ));
         }
         Ok(said)
+    }
+
+    /// `caller`'s waiting messages in every session's queue, by session
+    /// (the `queued_messages` tool without `to`).
+    fn agent_queued_everywhere(&self, caller: &str) -> Result<String, HubError> {
+        let now = now_ms();
+        let mut lines = Vec::new();
+        let mut count = 0;
+        {
+            let store = self.store();
+            for (id, queue) in store.queues() {
+                let mine: Vec<String> = queue
+                    .waiting()
+                    .enumerate()
+                    .filter(|(_, i)| {
+                        i.from.as_deref() == Some(caller) && matches!(i.state, ItemState::Pending)
+                    })
+                    .map(|(at, i)| {
+                        format!(
+                            "  {} #{} {}{}sent {} ago: {}",
+                            i.id,
+                            at + 1,
+                            if i.priority { "priority, " } else { "" },
+                            i.topic
+                                .as_deref()
+                                .map(|t| format!("topic {t}, "))
+                                .unwrap_or_default(),
+                            span(now - i.added_at.timestamp_millis()),
+                            preview(i)
+                        )
+                    })
+                    .collect();
+                if mine.is_empty() {
+                    continue;
+                }
+                count += mine.len();
+                let name = store
+                    .session(id)
+                    .map_or_else(|_| id.clone(), |s| s.name.clone());
+                lines.push(format!(
+                    "{name} (id {id}), {} queued in all:",
+                    plural(queue.pending_count(), "message")
+                ));
+                lines.extend(mine);
+            }
+        }
+        Ok(if count == 0 {
+            "None of your messages wait in any session's queue.".to_owned()
+        } else {
+            format!(
+                "{} of yours wait{} (#: place in that queue):\n{}",
+                plural(count, "message"),
+                if count == 1 { "s" } else { "" },
+                lines.join("\n")
+            )
+        })
     }
 
     /// Agent session `caller` takes back its waiting messages to session
@@ -2017,6 +2081,7 @@ mod tests {
             from: Some("lead".into()),
             priority: false,
             watch: None,
+            topic: None,
             state: ItemState::Pending,
         };
         assert_eq!(preview(&item), "stop the build");

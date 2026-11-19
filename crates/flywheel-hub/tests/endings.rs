@@ -734,6 +734,132 @@ async fn senders_see_and_cancel_only_their_own_messages_and_priority_goes_first(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_message_on_a_topic_supersedes_the_older_one() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let other = hub.claude("other", Some(&lead), json!({})).await;
+    let worker = hub.claude("worker", Some(&lead), json!({})).await;
+    for agent in [&lead, &other, &worker] {
+        agent.turn().await;
+    }
+    worker
+        .hook("UserPromptSubmit", json!({"prompt": "work"}))
+        .await;
+    lead.ok(
+        "message_session",
+        json!({"to": "worker", "text": "stop the capture", "topic": "ruling:capture"}),
+    )
+    .await;
+    other
+        .ok(
+            "message_session",
+            json!({"to": "worker", "text": "O1", "topic": "ruling:capture"}),
+        )
+        .await;
+    lead.ok("message_session", json!({"to": "worker", "text": "L2"}))
+        .await;
+    let first = hub.queue(&worker.id).await["items"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Unread: replaced in place, same id and place; another sender's
+    // message on the same topic is its own.
+    let said = lead
+        .ok(
+            "message_session",
+            json!({"to": "worker", "text": "keep capturing until 12:00", "topic": "ruling:capture"}),
+        )
+        .await;
+    assert!(said.starts_with("Replaced your unread message"), "{said}");
+    assert!(said.contains("still #1 in its queue"), "{said}");
+    let view = hub.queue(&worker.id).await;
+    assert_eq!(
+        waiting(&view),
+        ["keep capturing until 12:00", "O1", "L2"],
+        "{view}"
+    );
+    assert_eq!(view["items"][0]["id"], first.as_str());
+    assert_eq!(view["items"][0]["topic"], "ruling:capture");
+    assert!(
+        !view.to_string().contains("stop the capture"),
+        "the old text is gone"
+    );
+    let log = hub
+        .get(&format!(
+            "/api/log?filter=kind%3Dmessage.superseded%20session%3D{}",
+            worker.id
+        ))
+        .await;
+    let event = &log["events"][0];
+    assert_eq!(event["body"]["from"], lead.id.as_str(), "{log}");
+    assert_eq!(event["body"]["topic"], "ruling:capture");
+    assert_eq!(event["body"]["replaced"], true);
+    // The sender's view lists every target with topics.
+    let mine = lead.ok("queued_messages", json!({})).await;
+    assert!(mine.starts_with("2 messages of yours wait"), "{mine}");
+    assert!(mine.contains("worker (id"), "{mine}");
+    assert!(mine.contains("topic ruling:capture, sent"), "{mine}");
+
+    // Read: the next one on the topic says it supersedes it.
+    worker.hook("Stop", json!({})).await;
+    worker.typed_has("keep capturing until 12:00").await;
+    worker
+        .hook("UserPromptSubmit", json!({"prompt": "go"}))
+        .await;
+    let said = lead
+        .ok(
+            "message_session",
+            json!({"to": "worker", "text": "capture done: stop", "topic": "ruling:capture"}),
+        )
+        .await;
+    assert!(said.contains("this one says it supersedes it"), "{said}");
+    let view = hub.queue(&worker.id).await;
+    let text = view["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["text"].as_str().unwrap().ends_with("capture done: stop"))
+        .unwrap()["text"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("From lead"), "{text}");
+    assert!(lines[2].starts_with("superseded: ruling:capture"), "{text}");
+
+    // A bad topic is refused; no topic is today's message.
+    let (error, said) = lead
+        .tool(
+            "message_session",
+            json!({"to": "worker", "text": "x", "topic": "has space"}),
+        )
+        .await;
+    assert!(error && said.contains("topic"), "{said}");
+
+    // The operator's topics are its own, replaced the same way.
+    let path = format!("/api/sessions/{}/queue", worker.id);
+    for text in ["op first", "op second"] {
+        let (status, _) = hub
+            .call(
+                reqwest::Method::POST,
+                &path,
+                Some(json!({"text": text, "topic": "ruling:capture"})),
+            )
+            .await;
+        assert!(status.is_success());
+    }
+    let waiting = waiting(&hub.queue(&worker.id).await);
+    assert!(waiting.iter().any(|t| t == "op second"), "{waiting:?}");
+    assert!(!waiting.iter().any(|t| t == "op first"), "{waiting:?}");
+    assert!(
+        waiting.iter().any(|t| t.ends_with("capture done: stop")),
+        "the lead's message on the same topic stays: {waiting:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ownership_passes_on_and_everything_else_asks_the_operator() {
     let mut hub = TestHub::start().await;
     let lead = hub.claude("lead", None, json!({})).await;

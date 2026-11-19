@@ -145,7 +145,7 @@ fw hub perms codex FOLDER|SESSION trust_level|approval_policy|sandbox_mode VALUE
 Prompt queues; `ITEM` = a position (1 = next) or an id prefix:
 
 ```bash
-fw hub queue add SESSION TEXT|- [--when done|idle|blocked-cleared] [--json] {where}
+fw hub queue add SESSION TEXT|- [--when done|idle|blocked-cleared] [--topic T] [--json] {where}
 fw hub queue ls [SESSION] [--json] {where}
 fw hub queue rm SESSION ITEM [--json] {where}
 fw hub queue clear SESSION [--all] [--json] {where}

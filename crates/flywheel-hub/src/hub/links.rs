@@ -262,14 +262,17 @@ impl Hub {
 
     /// Agent session `from` sends `text` to the session `to` names (id, id
     /// prefix, or name) on this hub: typed in now, or queued (`priority`:
-    /// ahead of the waiting messages that are not). What became of it, in
-    /// words for the sender.
+    /// ahead of the waiting messages that are not). With a `topic`, it
+    /// supersedes `from`'s earlier message on it (see
+    /// [`crate::queue::Supersede`]). What became of it, in words for the
+    /// sender.
     pub fn agent_message(
         &self,
         from: &str,
         to: &str,
         text: &str,
         priority: bool,
+        topic: Option<&str>,
     ) -> Result<String, HubError> {
         let text = text.trim();
         if text.is_empty() {
@@ -315,30 +318,50 @@ impl Hub {
             sender.cwd.file_name().and_then(|n| n.to_str()),
             "a message from that agent session",
         );
-        let prompt = crate::queue::validate_text(&format!("{from_line}\n\n{text}"))?;
-        Ok(
-            match self.send_or_queue_from(&target.id, &prompt, Some(&sender.id), priority)? {
-                Delivery::Pasted { .. } => {
-                    format!("Delivered to {}: it reads it now.", target.name)
-                }
-                Delivery::Queued { item, .. } if priority => {
-                    let place = self
-                        .store()
-                        .queue(&target.id)
-                        .and_then(|q| q.waiting().position(|i| i.id == item))
-                        .map_or(1, |at| at + 1);
-                    format!(
-                        "Queued for {} as priority (id {item}, #{place} in its queue): it reads it \
-                         when its turn is done.",
-                        target.name
-                    )
-                }
-                Delivery::Queued { why, .. } => format!(
-                    "Queued for {} ({why}): it reads it when its turn is done.",
+        let topic = topic.map(str::trim).filter(|t| !t.is_empty());
+        let (delivery, superseded) = self.send_or_queue_topic(
+            &target.id,
+            &from_line,
+            text,
+            Some(&sender.id),
+            priority,
+            topic,
+        )?;
+        let after_read = match (&superseded, topic) {
+            (crate::queue::Supersede::Replaced { item, place }, Some(topic)) => {
+                return Ok(format!(
+                    "Replaced your unread message {} on topic {topic} for {} (still #{place} in \
+                     its queue): it reads only the new text, when its turn is done.",
+                    &item[..item.len().min(8)],
                     target.name
-                ),
-            },
-        )
+                ));
+            }
+            (crate::queue::Supersede::AfterRead { .. }, Some(topic)) => format!(
+                " It had read your earlier message on topic {topic}: this one says it supersedes it."
+            ),
+            _ => String::new(),
+        };
+        Ok(match delivery {
+            Delivery::Pasted { .. } => {
+                format!("Delivered to {}: it reads it now.{after_read}", target.name)
+            }
+            Delivery::Queued { item, .. } if priority => {
+                let place = self
+                    .store()
+                    .queue(&target.id)
+                    .and_then(|q| q.waiting().position(|i| i.id == item))
+                    .map_or(1, |at| at + 1);
+                format!(
+                    "Queued for {} as priority (id {item}, #{place} in its queue): it reads it \
+                         when its turn is done.{after_read}",
+                    target.name
+                )
+            }
+            Delivery::Queued { why, .. } => format!(
+                "Queued for {} ({why}): it reads it when its turn is done.{after_read}",
+                target.name
+            ),
+        })
     }
 
     /// The running agent sessions on this hub, one line each: name, id,

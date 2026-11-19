@@ -365,7 +365,7 @@ Behaviour: [hub-workflows](workflows.md#prompt-queue). `{item}`: id prefix (4+) 
 | GET | `/api/queues` | every session's queue |
 | GET / POST | `/api/watches[?session=]` | list / arm `{"owner","filter","prompt","window_secs"?,"after"?}` -> 201; 400 not an agent; 409 20 per owner, 2000 per hub |
 | DELETE | `/api/watches/{id}` | disarm (id or 4+ prefix) |
-| GET / POST | `/api/sessions/{id}/queue` | `paused`, `stalled`, `items` (`watch`?), `waiting` (why the next waits; 400 a shell), `watches`; POST `{"text","when"?}` -> 201 |
+| GET / POST | `/api/sessions/{id}/queue` | `paused`, `stalled`, `items` (`watch`?), `waiting` (why the next waits; 400 a shell), `watches`; POST `{"text","when"?,"topic"?}` -> 201 |
 | PATCH / DELETE | `/api/sessions/{id}/queue/items/{item}` | PATCH `{"text"?,"when"?}`; 409 one being sent |
 | POST | `/api/sessions/{id}/queue/items/{item}/move` | `{"position"}` (1-based among pending) |
 | POST | `/api/sessions/{id}/queue/items/{item}/editing` | `{"editing"}` -> 204: an editor holds it (renew in 30 s) or lets go |

@@ -22,7 +22,6 @@ pub use crate::telemetry::HoldKind;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
 
 /// The decision store's file in the state dir.
 pub const DECISIONS_FILE: &str = "decisions.db";
@@ -252,25 +251,18 @@ pub struct DecisionQuery {
 /// cannot be opened keeps running and says why on each use).
 #[derive(Debug)]
 pub struct DecisionStore {
-    path: PathBuf,
-    conn: Mutex<Option<Connection>>,
+    db: crate::sqlite_store::LazyDb,
 }
 
 impl DecisionStore {
     pub fn new(state_dir: &Path) -> Self {
         Self {
-            path: state_dir.join(DECISIONS_FILE),
-            conn: Mutex::new(None),
+            db: crate::sqlite_store::LazyDb::new(state_dir.join(DECISIONS_FILE), SCHEMA, migrate),
         }
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
-        let mut guard = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        if guard.is_none() {
-            *guard = Some(open(&self.path)?);
-        }
-        let conn = guard.as_ref().expect("opened above");
-        f(conn).map_err(|e| format!("{}: {e}", self.path.display()))
+        self.db.with(f)
     }
 
     /// Keep `new`; the decision as kept.
@@ -371,26 +363,8 @@ impl DecisionStore {
     }
 }
 
-fn open(path: &Path) -> Result<Connection, String> {
-    let fail = |e: rusqlite::Error| format!("{}: {e}", path.display());
-    let fresh = !path.exists();
-    let conn = Connection::open(path).map_err(fail)?;
-    if fresh {
-        restrict(path);
-    }
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(fail)?;
-    conn.pragma_update(None, "journal_mode", "WAL")
-        .map_err(fail)?;
-    let found: i64 = conn
-        .query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(fail)?;
-    if found > SCHEMA {
-        return Err(format!(
-            "{} was written by a newer hub (schema {found}, this one reads {SCHEMA})",
-            path.display()
-        ));
-    }
+/// Make the decisions table (a new file, schema 0).
+fn migrate(conn: &Connection, _from: i64) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS decisions (
              id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -411,20 +385,7 @@ fn open(path: &Path) -> Result<Connection, String> {
          CREATE INDEX IF NOT EXISTS decisions_kind ON decisions (kind, at);
          CREATE INDEX IF NOT EXISTS decisions_hold ON decisions (hold);",
     )
-    .map_err(fail)?;
-    conn.pragma_update(None, "user_version", SCHEMA)
-        .map_err(fail)?;
-    Ok(conn)
 }
-
-#[cfg(unix)]
-fn restrict(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn restrict(_path: &Path) {}
 
 /// Who answered, from a prompt: an agent's message (the hub's signed
 /// sender line, `From <name> ...: a message from that agent session`) is

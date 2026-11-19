@@ -1346,6 +1346,123 @@ async fn an_end_closes_its_worktree_only_when_nothing_is_lost() {
     log_has(&hub, "close", &["close.checked", "close.recorded"]).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worktree_made_with_plain_git_is_adopted_and_closed_by_the_rules() {
+    let mut hub = TestHub::start().await;
+    let repo = hub.root.join("repo");
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("f"), "0").unwrap();
+    git(&repo, &["add", "f"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let old = hub.root.join("repo.worktrees/old-work");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "old-work",
+            old.to_str().unwrap(),
+            "main",
+        ],
+    );
+    std::fs::write(old.join("g"), "1").unwrap();
+    git(&old, &["add", "g"]);
+    git(&old, &["commit", "-q", "-m", "work"]);
+    let detached = hub.root.join("repo.worktrees/detached");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            detached.to_str().unwrap(),
+        ],
+    );
+    let lead = hub.claude("lead", None, json!({})).await;
+    lead.turn().await;
+
+    // Not tracked yet: listed.
+    let view = hub.get("/api/changes?untracked=1").await;
+    let untracked: Vec<String> = view["untracked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["path"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(untracked.iter().any(|p| p.ends_with("old-work")), "{view}");
+
+    let said = lead
+        .ok("adopt_worktree", json!({"path": old, "session": "lead"}))
+        .await;
+    assert!(said.starts_with("Tracking "), "{said}");
+    assert!(
+        said.contains("branch old-work, base main (from the branch's reflog"),
+        "{said}"
+    );
+    assert!(said.contains("1 unmerged"), "{said}");
+    let again = lead.ok("adopt_worktree", json!({"path": old})).await;
+    assert!(again.starts_with("Already tracked:"), "{again}");
+    for (bad, why) in [
+        (repo.clone(), "main checkout"),
+        (detached.clone(), "detached HEAD"),
+    ] {
+        let (error, said) = lead.tool("adopt_worktree", json!({"path": bad})).await;
+        assert!(error && said.contains(why), "{said}");
+    }
+    let view = hub.get("/api/changes?untracked=1").await;
+    let change = &view["changes"][0];
+    assert_eq!(change["worktree"]["branch"], "old-work", "{view}");
+    assert_eq!(change["check"]["unmerged"], 1);
+    assert_eq!(change["session_name"], "lead");
+    assert!(
+        !view["untracked"].to_string().contains("old-work"),
+        "{view}"
+    );
+
+    // Closed by the rules: untracked work refuses; once clean it goes and
+    // its unmerged branch stays.
+    std::fs::write(old.join("notes"), "x").unwrap();
+    let path = format!("/api/changes/{}/close", change["id"].as_str().unwrap());
+    let remove = || Some(json!({"worktree": "remove"}));
+    let (status, done) = hub.call(reqwest::Method::POST, &path, remove()).await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(done["close"]["worktree"]["outcome"], "refused", "{done}");
+    assert!(old.join("notes").exists());
+    std::fs::remove_file(old.join("notes")).unwrap();
+    // Its linked session still runs: refused too.
+    let (_, done) = hub.call(reqwest::Method::POST, &path, remove()).await;
+    assert_eq!(
+        done["close"]["worktree"]["why"], "lead also work there",
+        "{done}"
+    );
+    hub.call(
+        reqwest::Method::POST,
+        &format!("/api/sessions/{}/kill", lead.id),
+        None,
+    )
+    .await;
+    let deadline = Instant::now() + WAIT;
+    while hub.session(&lead.id).await["state"] != "exited" {
+        assert!(Instant::now() < deadline, "lead never exited");
+        sleep(Duration::from_millis(50)).await;
+    }
+    let (_, done) = hub.call(reqwest::Method::POST, &path, remove()).await;
+    assert_eq!(done["close"]["worktree"]["outcome"], "done", "{done}");
+    assert!(!old.exists());
+    assert!(git(&repo, &["branch", "--list", "old-work"]).contains("old-work"));
+    assert!(
+        hub.get("/api/changes").await["changes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    log_has(&hub, "change", &["change.adopted"]).await;
+}
+
 fn urlencode(text: &str) -> String {
     text.bytes()
         .map(|b| match b {

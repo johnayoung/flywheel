@@ -766,6 +766,10 @@ struct StateDoc {
     /// Armed watches (see [`crate::watch`]), oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     watches: Vec<crate::watch::Watch>,
+    /// Worktrees the hub tracks apart from a session's own (see
+    /// [`crate::changes`]), oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    changes: Vec<crate::changes::Change>,
 }
 
 /// Store and validation failures.

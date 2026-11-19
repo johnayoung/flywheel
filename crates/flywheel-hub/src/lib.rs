@@ -27,6 +27,8 @@ pub mod broadcast;
 pub mod broadcast_cli;
 pub mod browser;
 mod capture_cli;
+mod change_cli;
+pub mod changes;
 pub mod cli;
 pub mod close;
 mod close_cli;

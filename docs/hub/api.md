@@ -37,6 +37,9 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET | `/api/sessions/{id}/checklist` | close checklist |
 | POST | `/api/sessions/{id}/close` | `{"worktree"?,"build"?,"report"?,"dry_run"?}`; 409 not at rest |
 | GET | `/api/sessions/{id}/report` | its kept final report |
+| GET | `/api/changes[?untracked=1]` | adopted worktrees, counts; `untracked` |
+| POST | `/api/changes/adopt` | `{"path","base"?,"session"?}` -> 201 (200: tracked) |
+| POST | `/api/changes/{id}/close` | as `/close` above |
 | POST | `/api/sessions/{id}/relaunch` | `{"cols"?,"rows"?}`: an ended session, same id; 409 running. `{"never"}`: opt out of upgrade relaunches |
 | POST | `/api/sessions/{id}/restart` | old `/relaunch` |
 | POST | `/api/sessions/{id}/continue` | `{"handoff"?,"prompt"?,"name"?}` (default: the only pending handoff's): linked successor; 201 |

@@ -357,6 +357,12 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
+    fn adopt_worktree(&self, adopt: &crate::hub::changes::Adopt) -> Result<String, String> {
+        self.hub
+            .agent_adopt(&self.session, adopt)
+            .map_err(|e| e.to_string())
+    }
+
     fn check_reviewed(
         &self,
         repo: &str,

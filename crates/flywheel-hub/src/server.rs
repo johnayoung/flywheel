@@ -66,6 +66,7 @@ mod auth;
 mod autopilot_api;
 mod broadcast_api;
 mod ca_page;
+mod changes_api;
 mod close_api;
 mod commands_api;
 mod conversations_api;
@@ -333,6 +334,15 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         )
         .route("/api/verdicts/coverage", get(verdicts_api::coverage))
         .route("/api/sessions/{id}/checklist", get(close_api::checklist))
+        .route("/api/changes", get(changes_api::list_changes))
+        .route(
+            "/api/changes/adopt",
+            axum::routing::post(changes_api::adopt),
+        )
+        .route(
+            "/api/changes/{id}/close",
+            axum::routing::post(changes_api::close_change),
+        )
         .route("/api/sessions/{id}/report", get(close_api::report))
         .route(
             "/api/sessions/{id}/close",

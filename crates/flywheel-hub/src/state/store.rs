@@ -1078,6 +1078,42 @@ impl HubStore {
         })
     }
 
+    /// The tracked worktrees (see [`crate::changes`]).
+    pub fn changes(&self) -> &[crate::changes::Change] {
+        &self.doc.changes
+    }
+
+    /// Track `change` (at most `max` on the hub).
+    pub fn add_change(
+        &mut self,
+        change: crate::changes::Change,
+        max: usize,
+    ) -> Result<(), StateError> {
+        if self.doc.changes.len() >= max {
+            return Err(StateError::Conflict(format!(
+                "the hub tracks {max} adopted worktrees already: close some first"
+            )));
+        }
+        self.doc.changes.push(change);
+        self.save_or_rollback(|doc| {
+            doc.changes.pop();
+        })
+    }
+
+    /// Stop tracking change `id`.
+    pub fn remove_change(&mut self, id: &str) -> Result<crate::changes::Change, StateError> {
+        let at = self
+            .doc
+            .changes
+            .iter()
+            .position(|c| c.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("change {id}")))?;
+        let removed = self.doc.changes.remove(at);
+        let back = removed.clone();
+        self.save_or_rollback(move |doc| doc.changes.insert(at, back))?;
+        Ok(removed)
+    }
+
     /// Disarm watch `id`.
     pub fn remove_watch(&mut self, id: &str) -> Result<crate::watch::Watch, StateError> {
         let at = self

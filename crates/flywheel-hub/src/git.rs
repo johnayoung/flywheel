@@ -1129,6 +1129,124 @@ pub fn remove_keeping_work(worktree: &WorktreeRef) -> Result<Removed, String> {
     })
 }
 
+// --- Adopted worktrees (see crate::changes) ----------------------------------
+
+/// A linked worktree as `git worktree list` gives it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    /// `None`: detached.
+    pub branch: Option<String>,
+    pub head: String,
+}
+
+/// The linked worktrees of the repo at `repo` (its main one left out).
+pub fn linked_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>, String> {
+    let out = git(repo, &["worktree", "list", "--porcelain"])?;
+    let mut all = Vec::new();
+    for block in out.split("\n\n") {
+        let mut path = None;
+        let mut branch = None;
+        let mut head = String::new();
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p));
+            } else if let Some(b) = line.strip_prefix("branch refs/heads/") {
+                branch = Some(b.to_owned());
+            } else if let Some(h) = line.strip_prefix("HEAD ") {
+                head = h.to_owned();
+            }
+        }
+        if let Some(path) = path {
+            all.push(WorktreeEntry { path, branch, head });
+        }
+    }
+    // The first is the main worktree.
+    Ok(all.into_iter().skip(1).collect())
+}
+
+/// For a linked worktree at `dir`: its main checkout (the repo) and its
+/// checked-out branch. Refused for a main checkout, a detached HEAD, or
+/// no repo at all.
+pub fn linked_worktree_of(dir: &Path) -> Result<(PathBuf, String), String> {
+    let git_dir = git(dir, &["rev-parse", "--path-format=absolute", "--git-dir"])
+        .map_err(|_| format!("{} is not in a git repo", dir.display()))?;
+    let common = common_dir(dir)?;
+    let git_dir = PathBuf::from(git_dir.trim())
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if git_dir == common {
+        return Err(format!(
+            "{} is a repo's main checkout, not a linked worktree",
+            dir.display()
+        ));
+    }
+    let top = git(dir, &["rev-parse", "--show-toplevel"])?;
+    if PathBuf::from(top.trim()).canonicalize().ok().as_deref()
+        != dir.canonicalize().ok().as_deref()
+    {
+        return Err(format!(
+            "{} is inside a worktree, not its top",
+            dir.display()
+        ));
+    }
+    let branch = git(dir, &["symbolic-ref", "--quiet", "--short", "HEAD"]).map_err(|_| {
+        format!(
+            "{} has a detached HEAD: check out a branch first",
+            dir.display()
+        )
+    })?;
+    let repo = common
+        .parent()
+        .ok_or_else(|| format!("{} has no parent", common.display()))?
+        .to_path_buf();
+    Ok((repo, branch.trim().to_owned()))
+}
+
+/// What `branch` was cut from, by its reflog's first entry ("branch:
+/// Created from X"), when that names a branch.
+pub fn created_from(repo: &Path, branch: &str) -> Option<String> {
+    let out = git(
+        repo,
+        &[
+            "reflog",
+            "show",
+            "--format=%gs",
+            &format!("refs/heads/{branch}"),
+        ],
+    )
+    .ok()?;
+    let first = out.lines().last()?.trim();
+    let from = first.strip_prefix("branch: Created from ")?.trim();
+    let from = from.strip_prefix("refs/heads/").unwrap_or(from);
+    (from != "HEAD"
+        && git_ok(
+            repo,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{from}"),
+            ],
+        ))
+    .then(|| from.to_owned())
+}
+
+/// `branch`'s upstream, as a local branch name, if it tracks one.
+pub fn upstream_branch(repo: &Path, branch: &str) -> Option<String> {
+    git(
+        repo,
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            &format!("{branch}@{{upstream}}"),
+        ],
+    )
+    .ok()
+    .map(|s| s.trim().to_owned())
+    .filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

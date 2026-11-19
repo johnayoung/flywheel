@@ -682,8 +682,10 @@ const PAGES: [(&str, &str); 6] = [
 /// nine actions, seven routes, three agent tools, three state files),
 /// after condensing the activity, fleet, and internals text by 0.7 KB;
 /// to 98 KiB for the close checklist (a verb, three routes, an end
-/// option), after condensing the agent-ends text it extends.
-const HUB_DOCS_MAX_BYTES: usize = 98 * 1024;
+/// option), after condensing the agent-ends text it extends; to 99 KiB
+/// for adopted worktrees and time watches (two verbs, three routes, an
+/// agent tool), with a condensing pass across docs/hub after them.
+const HUB_DOCS_MAX_BYTES: usize = 99 * 1024;
 /// One reference page's budget. Raised from 25 KiB to 26 for asks,
 /// handoffs, and session links (a route, two event kinds, the snapshot's
 /// `ask` and `links`): api.md was condensed first and still 80 bytes over.

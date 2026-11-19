@@ -2,6 +2,7 @@
 //! sessions the server owns.
 
 mod capture;
+pub mod changes;
 mod close;
 mod endings;
 mod holds;

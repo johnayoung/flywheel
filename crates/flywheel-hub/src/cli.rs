@@ -104,6 +104,9 @@ enum HubCommand {
     /// there), or its end at rest with cleanups that lose nothing
     /// (--remove-worktree, --clean-build) and its final report kept.
     Close(crate::close_cli::CloseArgs),
+    /// Worktrees made outside the hub: adopt one (tracked as if a session
+    /// had made it), ls them (--untracked: those nothing tracks), close one.
+    Change(crate::change_cli::ChangeArgs),
     /// Start an ended or stopped session again in place (same id, name,
     /// command, and folder; a fresh terminal).
     Relaunch(script::RelaunchArgs),
@@ -837,6 +840,7 @@ fn dispatch_verb(
         HubCommand::Attach(args) => crate::attach::attach(&args, out, err),
         HubCommand::Kill(args) => script::kill(&args, out, err),
         HubCommand::Close(args) => crate::close_cli::close(&args, out, err),
+        HubCommand::Change(args) => crate::change_cli::main(&args, out, err),
         HubCommand::Relaunch(args) => script::relaunch(&args, out, err),
         HubCommand::Continue(args) => script::continue_session(&args, out, err),
         HubCommand::Starts(args) => script::starts(&args, out, err),

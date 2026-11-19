@@ -63,6 +63,8 @@ pub const LEASE_TOOL: &str = "lease";
 /// The review record tools' names on the server.
 pub const RECORD_REVIEW_TOOL: &str = "record_review";
 pub const CHECK_REVIEWED_TOOL: &str = "check_reviewed";
+/// The adopt tool's name on the server.
+pub const ADOPT_TOOL: &str = "adopt_worktree";
 
 /// What an agent asks the `lease` tool for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -168,6 +170,8 @@ pub trait Host {
         range: &str,
         patch_equivalent: bool,
     ) -> Result<String, String>;
+    /// Track a worktree made outside the hub.
+    fn adopt_worktree(&self, adopt: &crate::hub::changes::Adopt) -> Result<String, String>;
     /// Keep a proposed handoff for the operator; what to tell the agent.
     fn handoff(
         &self,
@@ -700,6 +704,29 @@ fn record_review_tool() -> Value {
     })
 }
 
+fn adopt_tool() -> Value {
+    json!({
+        "name": ADOPT_TOOL,
+        "title": "Adopt a worktree",
+        "description": "Have the hub track a git worktree that was made outside it (plain git \
+                        worktree add, an older session), as if start_session had made it: its \
+                        uncommitted, untracked, and unmerged counts are kept in view, and the \
+                        hub never removes it while it holds work. path: the worktree's \
+                        directory. base: the branch it merges into (default: worked out from \
+                        git, and the reply says how). session: optionally a session you own \
+                        that works in it. Changes nothing on disk.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "The worktree's directory (absolute, or relative to yours)." },
+                "base": { "type": "string", "description": "Optional: the branch it merges into." },
+                "session": { "type": "string", "description": "Optional: a session you own that works in it (name or id)." }
+            },
+            "required": ["path"]
+        }
+    })
+}
+
 fn check_reviewed_tool() -> Value {
     json!({
         "name": CHECK_REVIEWED_TOOL,
@@ -803,6 +830,7 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                 lease_tool(),
                 record_review_tool(),
                 check_reviewed_tool(),
+                adopt_tool(),
             ] })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str);
@@ -992,6 +1020,21 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                         Err(why) => text_result(format!("Not recorded: {why}"), true),
                     },
                 })
+            } else if name == Some(ADOPT_TOOL) {
+                let given = |key: &str| {
+                    Some(arg(key).trim())
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                };
+                let adopt = crate::hub::changes::Adopt {
+                    path: arg("path").to_owned(),
+                    base: given("base"),
+                    session: given("session"),
+                };
+                Ok(match host.adopt_worktree(&adopt) {
+                    Ok(said) => text_result(said, false),
+                    Err(why) => text_result(format!("Not adopted: {why}"), true),
+                })
             } else if name == Some(CHECK_REVIEWED_TOOL) {
                 let twins = args.get("patch_equivalent").and_then(Value::as_bool) == Some(true);
                 Ok(
@@ -1159,6 +1202,9 @@ mod tests {
             _patch_equivalent: bool,
         ) -> Result<String, String> {
             Ok(format!("ok {repo} {range}"))
+        }
+        fn adopt_worktree(&self, adopt: &crate::hub::changes::Adopt) -> Result<String, String> {
+            Ok(format!("Tracking {}", adopt.path))
         }
         fn label(
             &self,
@@ -1378,7 +1424,8 @@ mod tests {
                 UNWATCH_TOOL,
                 LEASE_TOOL,
                 RECORD_REVIEW_TOOL,
-                CHECK_REVIEWED_TOOL
+                CHECK_REVIEWED_TOOL,
+                ADOPT_TOOL
             ]
         );
         let asked = answer(&json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",

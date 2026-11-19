@@ -71,6 +71,9 @@ fw hub wait --fleet FILTER [--after CURSOR] [--json] [--timeout SECS] {where}  #
 fw hub attach [SESSION] [--prefix C-b] [--no-status] {where}
 fw hub kill SESSION [--rm] [--remove-worktree] [--force] {where}  # --rm forgets
 fw hub close SESSION [--remove-worktree] [--clean-build] [--report P] [--dry-run] [--json] {where}  # at rest
+fw hub change adopt PATH [--base B] [--session S] [--json] {where}
+fw hub change ls [--untracked] [--json] {where}
+fw hub change close ID [--remove-worktree] [--clean-build] [--report P] [--dry-run] [--json] {where}
 fw hub relaunch SESSION [--never|--auto] {where}
 fw hub explain [SESSION] [--file SCREEN.txt|-] [--kind claude|codex|shell] [--json] {where}
 fw hub import FILE.code-workspace... [--name N] [--update] [--json]

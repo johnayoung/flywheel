@@ -235,11 +235,19 @@ impl Hub {
             } => return Ok(Outcome::Busy { holders }),
             Acquired::Waiting { waiter, place, .. } => (waiter, place),
         };
-        if let Some(lease) = self.lease_wait(&waiter.id, block)? {
-            return Ok(Outcome::Granted { lease });
+        let whole_wait_in_call = block >= wait_secs;
+        match self.lease_wait(&waiter.id, block) {
+            Ok(Some(lease)) => return Ok(Outcome::Granted { lease }),
+            Ok(None) => {}
+            // Out of line without a grant. When the whole wait was this
+            // call's, that is its deadline passing: the expiry tick may get
+            // there before the call's own wait ends (or even starts, when
+            // saving the ask was slow). Not free, not an error.
+            Err(_) if whole_wait_in_call => {}
+            Err(e) => return Err(e),
         }
         // Its whole wait was in the call: out of line, not granted.
-        if block >= wait_secs && wants_wake {
+        if whole_wait_in_call {
             let _ = self.lease_cancel_wait(None, &waiter.id);
             if let Some(lease) = runtime.book().collect(&waiter.id) {
                 return Ok(Outcome::Granted { lease });

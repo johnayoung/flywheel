@@ -331,8 +331,15 @@ window.FwHubWorktree = function (ctx) {
     return rows;
   }
 
-  function closeChecklist(session) {
+  function closeChecklist(session, change) {
     const id = session.id;
+    // An adopted worktree (a change) closes through its own routes.
+    const readList = change
+      ? () => api("POST", `/api/changes/${encodeURIComponent(change.id)}/close`, { dry_run: true })
+      : () => api("GET", `/api/sessions/${encodeURIComponent(id)}/checklist`);
+    const closeUrl = change
+      ? `/api/changes/${encodeURIComponent(change.id)}/close`
+      : `/api/sessions/${encodeURIComponent(id)}/close`;
     $("#cl-title").textContent = `Close ${session.name}?`;
     $("#cl-list").replaceChildren(el("li", { textContent: "Checking…" }));
     const wtKeep = $("#cl-wt-keep");
@@ -349,7 +356,8 @@ window.FwHubWorktree = function (ctx) {
     wtRemove.disabled = true;
     buildClean.disabled = true;
     report.value = "";
-    forget.checked = true;
+    forget.checked = !change;
+    forget.parentElement.hidden = !!change;
     status.textContent = session.state === "running" && session.live
       ? "It ends once at rest (never mid-turn or mid tool call); then the choices run."
       : "";
@@ -359,7 +367,7 @@ window.FwHubWorktree = function (ctx) {
     $("#cl-wt-why").textContent = "";
     $("#cl-build-why").textContent = "";
     let settled = null;
-    api("GET", `/api/sessions/${encodeURIComponent(id)}/checklist`).then(
+    readList().then(
       (answer) => {
         if (!cl.open) return;
         const list = answer.checklist;
@@ -385,7 +393,7 @@ window.FwHubWorktree = function (ctx) {
       status.textContent = "Closing…";
       status.className = "cwt-state";
       try {
-        const done = await api("POST", `/api/sessions/${encodeURIComponent(id)}/close`, {
+        const done = await api("POST", closeUrl, {
           worktree: wtRemove.checked ? "remove" : "keep",
           build: buildClean.checked ? "clean" : "keep",
           report: report.value.trim() || null,
@@ -411,5 +419,75 @@ window.FwHubWorktree = function (ctx) {
     });
   }
 
-  return { setFolder, reset, request, use, taskName, blocked, badge, confirmClose, closeChecklist };
+  // Adopted worktrees (changes) of a workspace and the ones nothing
+  // tracks (GET /api/changes?untracked=1, read at most once a minute):
+  // a row each, Close for a change, Adopt for an untracked one.
+  let changesSeen = { at: 0, view: null, asking: false };
+  function readChanges(rerender, now) {
+    if (changesSeen.asking || (!now && Date.now() - changesSeen.at < 60000)) return;
+    changesSeen.asking = true;
+    api("GET", "/api/changes?untracked=1").then(
+      (view) => {
+        changesSeen = { at: Date.now(), view, asking: false };
+        rerender();
+      },
+      () => {
+        changesSeen = { at: Date.now(), view: changesSeen.view, asking: false };
+      },
+    );
+  }
+
+  function changesBlock(workspace, rerender) {
+    readChanges(rerender, false);
+    const view = changesSeen.view;
+    if (!view) return null;
+    const folders = workspace.folders.map((f) => f.path);
+    const mine = (repo) => folders.includes(repo);
+    const changes = view.changes.filter((c) => mine(c.worktree.repo));
+    const untracked = view.untracked.filter((u) => mine(u.repo));
+    if (!changes.length && !untracked.length) return null;
+    const changeRow = (c) => {
+      const k = c.check || {};
+      return el("li", { className: "ws-change", dataset: { change: c.id }, title: c.worktree.path },
+        el("code", { textContent: c.worktree.branch }),
+        el("span", { className: "muted", textContent: `${k.dirty || 0} dirty · ${k.untracked || 0} untracked · ${k.unmerged || 0} unmerged${c.session_name ? ` · ${c.session_name}` : ""}` }),
+        el("button", {
+          type: "button",
+          className: "text-btn",
+          textContent: "close",
+          onclick: async () => {
+            const how = await closeChecklist({ id: c.id, name: c.worktree.branch, state: "exited" }, c);
+            if (how) readChanges(rerender, true);
+          },
+        }));
+    };
+    const untrackedRow = (u) =>
+      el("li", { className: "ws-change", title: u.path },
+        el("code", { textContent: u.branch || "detached" }),
+        el("span", { className: "muted", textContent: pathTail(u.path) }),
+        u.branch
+          ? el("button", {
+            type: "button",
+            className: "text-btn",
+            textContent: "adopt",
+            onclick: async (event) => {
+              event.currentTarget.disabled = true;
+              try {
+                await api("POST", "/api/changes/adopt", { path: u.path });
+              } finally {
+                readChanges(rerender, true);
+              }
+            },
+          })
+          : el("span", { className: "muted", textContent: "check out a branch to adopt" }));
+    return el("div", { className: "ws-changes" },
+      changes.length ? el("ul", { className: "ws-change-list", "aria-label": "Adopted worktrees" }, changes.map(changeRow)) : null,
+      untracked.length
+        ? el("details", { className: "ws-untracked" },
+          el("summary", { textContent: `Not tracked (${untracked.length})` }),
+          el("ul", { className: "ws-change-list" }, untracked.map(untrackedRow)))
+        : null);
+  }
+
+  return { setFolder, reset, request, use, taskName, blocked, badge, confirmClose, closeChecklist, changesBlock };
 };

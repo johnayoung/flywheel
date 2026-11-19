@@ -101,6 +101,9 @@ try {
   fs.writeFileSync(path.join(wt, "target/debug/blob"), Buffer.alloc(3 * 1024 * 1024));
   // An agent that never reports a status: not at rest.
   const busy = await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", name: "busy", worktree: { task: "feat-y" }, cols: 100, rows: 30 });
+  fs.writeFileSync(path.join(busy.worktree.path, "y"), "y");
+  git(busy.worktree.path, "add", "y");
+  git(busy.worktree.path, "commit", "-q", "-m", "y");
   fs.writeFileSync(path.join(busy.worktree.path, "notes.md"), "unsaved");
   for (let i = 0; (await api("GET", `/api/sessions/${done.id}`)).state !== "exited"; i++) {
     if (i > 100) throw new Error("worker never exited");
@@ -150,8 +153,14 @@ try {
   check(/feat-x/.test(git(repo, "branch", "--list", "*feat-x")), "its unmerged branch is kept");
   check(after.id === done.id, "kept in the list when asked to (its outcome on its record)");
 
-  // From the inspector: an agent not at rest.
+  // From the inspector: an agent not at rest. Its row says its branch's
+  // review coverage once a review is recorded.
+  await api("POST", "/api/verdicts", { repo: busy.worktree.path, base: "main", head: "feat-y", verdict: "READY" })
+    .catch(async () => api("POST", "/api/verdicts", { repo: busy.worktree.path, base: "main", head: git(busy.worktree.path, "rev-parse", "HEAD"), verdict: "READY" }));
   await page.evaluate((id) => inspector.toggle(id), busy.id);
+  await page.waitForFunction(() => /all 1 commits READY/.test(document.querySelector("#inspector [data-wk=reviews]")?.textContent || ""), null, { timeout: 15000 })
+    .then(() => check(true, "the inspector shows review coverage of its branch"))
+    .catch(async () => check(false, `the inspector shows review coverage (${await page.locator("#inspector").textContent()})`));
   const inspectClose = page.locator(".inspector").getByRole("button", { name: "Close session" });
   check(await inspectClose.count() >= 1, "the inspector offers Close session");
   await inspectClose.first().click();
@@ -170,6 +179,30 @@ try {
   await page.click("#dlg-close button[value=cancel]");
   check((await api("GET", `/api/sessions/${busy.id}`)).state === "running", "cancelled: it still runs");
   check(fs.existsSync(path.join(busy.worktree.path, "notes.md")), "its untracked work stays");
+
+  // A worktree made with plain git: listed as not tracked, adopted from
+  // the list, then closed by the same dialog.
+  const plain = path.join(tmp, "repo.worktrees", "plain-work");
+  git(repo, "worktree", "add", "-q", "-b", "plain-work", plain, "main");
+  await page.evaluate((id) => pickScope(id), ws.id);
+  await page.waitForSelector(".ws-untracked summary", { timeout: 70000 });
+  check(/Not tracked \(1\)/.test(await page.locator(".ws-untracked summary").textContent()), "the workspace list counts the untracked worktree");
+  await page.click(".ws-untracked summary");
+  await page.locator(".ws-untracked button", { hasText: "adopt" }).click();
+  await page.waitForSelector(".ws-change-list .ws-change[data-change]", { timeout: 15000 });
+  const adopted = await api("GET", "/api/changes");
+  check(adopted.changes.length === 1 && adopted.changes[0].worktree.branch === "plain-work", "adopted from the list");
+  check(adopted.changes[0].base_from === "reflog", `its base came from its reflog (${adopted.changes[0].base_from})`);
+  await page.screenshot({ path: path.join(out, "adopted.png") });
+  await page.locator(".ws-change[data-change] button", { hasText: "close" }).click();
+  await page.waitForSelector("#dlg-close[open]", { timeout: 5000 });
+  await page.waitForFunction(() => !document.querySelector("#cl-ok").disabled, null, { timeout: 15000 });
+  check(await page.locator("#cl-forget").isHidden(), "a change has no list entry to forget");
+  await page.check("#cl-wt-remove");
+  await page.click("#cl-ok");
+  await page.waitForSelector("#dlg-close", { state: "hidden", timeout: 15000 });
+  check(!fs.existsSync(plain), "the adopted worktree is removed (clean, nothing lost)");
+  check((await api("GET", "/api/changes")).changes.length === 0, "and no longer tracked");
 } catch (error) {
   console.error(error);
   failures.push(String(error));

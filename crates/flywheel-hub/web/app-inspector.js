@@ -111,6 +111,39 @@ const inspector = (() => {
     })];
   }
 
+  // Review coverage of its worktree's branch (fw hub verdict check
+  // BASE..BRANCH): every commit covered by a READY review, or how many
+  // are and why the rest are not. Read on open, kept 30 s.
+  const coverage = new Map();
+  function reviewsLine(session) {
+    const wt = session.worktree;
+    if (!wt) return null;
+    const key = session.id;
+    const known = coverage.get(key);
+    if (!known || Date.now() - known.at > 30000) {
+      coverage.set(key, { at: Date.now(), answer: known ? known.answer : null });
+      const query = `repo=${encodeURIComponent(wt.path)}&range=${encodeURIComponent(`${wt.base}..${wt.branch}`)}`;
+      api("GET", `/api/verdicts/coverage?${query}`).then(
+        (answer) => {
+          coverage.set(key, { at: Date.now(), answer });
+          if (shownId === key) draw();
+        },
+        () => {},
+      );
+    }
+    const answer = coverage.get(key).answer;
+    if (!answer) return muted("checking…");
+    if (!answer.commits) return muted("no commits to review");
+    if (answer.ok) return el("span", { textContent: `all ${answer.commits} commits READY` });
+    const why = { no_review: "no review", not_ready: "NOT_READY", ready_with_changes: "changes asked", self_review: "self-reviewed" };
+    const first = answer.uncovered[0];
+    return [
+      el("b", { textContent: `${answer.covered}/${answer.commits} covered` }),
+      " ",
+      muted(first ? `${first.sha.slice(0, 8)}: ${why[first.why] || first.why}` : ""),
+    ];
+  }
+
   // Leases it holds (resource, mode, time left) and waits for.
   function leasesLine(session) {
     const view = session.leases;
@@ -182,6 +215,7 @@ const inspector = (() => {
       row("review", handoff.pairChip(session)),
       row("queue", promptQueue.rowChip(session)),
       row("leases", leasesLine(session)),
+      row("reviews", reviewsLine(session)),
       row("pr", pullRequests.rowChip(session)),
       row("relaunch", relaunchLine(session)),
       row("end", endLine(session)),

@@ -1036,6 +1036,7 @@ function renderWorkspaceList(workspace) {
       : filtering
         ? renderMatches(sessions)
         : el("ul", { className: "sessions" }, families(sessions).flatMap((f) => familyRows(f))),
+    filtering ? null : worktrees.changesBlock(workspace, render),
   ].flat().filter(Boolean);
 }
 

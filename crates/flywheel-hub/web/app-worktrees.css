@@ -69,6 +69,13 @@
 .cl-list li.bad { color: var(--alert); }
 .cl-list code { font-size: 10.5px; }
 .cl-where { display: flex; gap: .6rem; min-width: 0; }
+.ws-changes { margin: .6rem .9rem .2rem; font-size: 10.5px; color: var(--ink-2); }
+.ws-change-list { list-style: none; margin: 0; padding: 0; }
+.ws-change { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: .5rem; padding: .2rem 0; }
+.ws-change code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-change button { grid-row: 1; grid-column: 2; }
+.ws-change .muted { grid-column: 1 / -1; color: var(--ink-3); overflow-wrap: anywhere; }
+.ws-untracked summary { cursor: pointer; color: var(--ink-3); letter-spacing: .12em; text-transform: uppercase; font-size: 9.5px; padding: .2rem 0; }
 .cl-where .path-tail { flex: 1 1 0; min-width: 0; }
 .cl-choices { display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .8rem; margin: .25rem 0; font-size: 11px; }
 .cl-choices label { white-space: nowrap; }

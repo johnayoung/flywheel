@@ -825,17 +825,23 @@ try {
   await lp.keyboard.press("Escape");
   check(!chips.onRow && chips.all.includes("area=db") && chips.all.includes("team=web") && chips.all.some((c) => c.startsWith("tier=")),
     `labels: a row's labels are in its inspector, not on the row (${JSON.stringify(chips)})`);
-  const groupBy = lp.locator("#list-tools select.group-by");
-  check(await groupBy.count() === 1, "labels: Everything offers a group-by-label control");
+  const groupBy = lp.locator("#list-sub select.group-by");
+  check(await groupBy.count() === 1, "labels: Everything offers a group-by picker");
   await groupBy.selectOption("team");
-  await lp.waitForSelector(".group-by-chip", { timeout: 5000 });
+  await lp.waitForSelector("#list-sub select.group-by.on", { timeout: 5000 });
   const groups = await lp.evaluate(() => [...document.querySelectorAll(".side-scroll .list-group .list-group-name")].map((n) => n.textContent));
   check(groups.includes("team=web") && groups.includes("team=api") && groups.includes("no team"),
     `labels: grouped by team, one group per value and one for the rest (${JSON.stringify(groups)})`);
   await lp.screenshot({ path: path.join(out, "desktop-labels-grouped.png") });
-  await lp.click(".group-by-chip");
+  await groupBy.selectOption("");
   const back = await lp.evaluate(() => [...document.querySelectorAll(".side-scroll .list-group .list-group-name")].map((n) => n.textContent));
-  check(!back.some((g) => g.startsWith("team=")), `labels: the chip puts the list back by activity (${JSON.stringify(back)})`);
+  check(!back.some((g) => g.startsWith("team=")), `labels: picking state puts the list back by state (${JSON.stringify(back)})`);
+  // The filter reads labels: label:KEY=VALUE.
+  await lp.fill("#list-filter", "label:team=web");
+  await lp.waitForTimeout(300);
+  const byLabel = await lp.evaluate(() => [...document.querySelectorAll("#workspaces li.session")].map((r) => r.dataset.id));
+  await lp.fill("#list-filter", "");
+  check(byLabel.length === 1 && byLabel[0] === sids[0], `labels: the filter's label:team=web finds the one session (${JSON.stringify(byLabel)})`);
   await lab.close();
 
   // --- watches: the Queue drawer lists what wakes the agent -----------------
@@ -1675,6 +1681,25 @@ try {
     const cleared = await sp.evaluate(() => ({ value: document.querySelector("#list-filter").value, rows: document.querySelectorAll("#workspaces li.session").length }));
     check(focused === "list-filter" && byName.join() === "sb-kid-a,sb-kid-b" && byState.includes("sb-lead") && byState.includes("sb-kid-b") && !byState.includes("sb-finished") && cleared.value === "" && cleared.rows > 2,
       `sidebar: the filter narrows by name and is:STATE, Alt+/ focuses it, Escape clears it (${JSON.stringify({ focused, byName, byState, cleared })})`);
+    // Group by lead, then workspace, then back to state.
+    const groupNames = () => sp.evaluate(() => [...document.querySelectorAll("#workspaces .list-group .list-group-name")].map((n) => n.textContent));
+    await sp.selectOption("#list-sub select.group-by", "@lead");
+    await sp.waitForTimeout(300);
+    const byLead = await groupNames();
+    const leadGroup = await sp.evaluate((id) => {
+      const ul = document.querySelector(`#workspaces ul[data-id="group:lead:${id}"]`);
+      return ul ? [...ul.querySelectorAll("li.session .session-name")].map((n) => n.textContent) : [];
+    }, lead.id);
+    await sp.selectOption("#list-sub select.group-by", "@workspace");
+    await sp.waitForTimeout(300);
+    const byWs = await groupNames();
+    const chip = await sp.evaluate(() => { const p = document.querySelector("#list-sub select.group-by"); return p ? p.selectedOptions[0].textContent : ""; });
+    await sp.selectOption("#list-sub select.group-by", "");
+    await sp.waitForTimeout(300);
+    const backByState = (await groupNames()).filter((g) => g === "Moving" || g === "Resting");
+    check(byLead.includes("sb-lead") && byLead.includes("no lead") && leadGroup.join() === "sb-lead,sb-kid-a,sb-kid-b" &&
+      byWs.includes("e2e") && /workspace/.test(chip) && backByState.length > 0,
+      `sidebar: the group-by picker groups by lead (a lead with what it started), by workspace, and back by state (${JSON.stringify({ byLead, leadGroup, byWs, chip, backByState })})`);
     // Dense rows.
     const height = () => sp.evaluate((id) => document.querySelector(`#workspaces li.session[data-id="${id}"]`).getBoundingClientRect().height, kids[1].id);
     const roomy = await height();

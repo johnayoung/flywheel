@@ -465,7 +465,7 @@ pub(crate) struct LsArgs {
     needs: bool,
     /// Only sessions matching WORDS, as the sidebar's filter box reads
     /// them: words of a name, `ws:WORKSPACE`, `is:STATE` (blocked, asking,
-    /// working, background, done, resting, ended, ...).
+    /// working, background, done, resting, ended, ...), `label:KEY[=VALUE]`.
     #[arg(long, value_name = "WORDS")]
     filter: Option<String>,
     #[command(flatten)]
@@ -530,7 +530,8 @@ fn state_words(session: &Value) -> Vec<String> {
 
 /// Whether `session` (in `workspace`, by name) matches the filter's
 /// `words` (lowercase): each a part of its name, `ws:NAME` a part of its
-/// workspace's name, `is:STATE` the start of one of its state words.
+/// workspace's name, `is:STATE` the start of one of its state words,
+/// `label:KEY` a label it holds, `label:KEY=VALUE` one whose value starts so.
 fn matches_filter(session: &Value, workspace: &str, words: &[String]) -> bool {
     let name = str_field(session, "name").to_lowercase();
     let workspace = workspace.to_lowercase();
@@ -539,6 +540,23 @@ fn matches_filter(session: &Value, workspace: &str, words: &[String]) -> bool {
             workspace.contains(ws)
         } else if let Some(state) = word.strip_prefix("is:") {
             state_words(session).iter().any(|w| w.starts_with(state))
+        } else if let Some(label) = word.strip_prefix("label:") {
+            let (key, value) = match label.split_once('=') {
+                Some((key, value)) => (key, Some(value)),
+                None => (label, None),
+            };
+            session
+                .get("labels")
+                .and_then(Value::as_object)
+                .and_then(|labels| labels.iter().find(|(k, _)| k.to_lowercase() == key))
+                .is_some_and(|(_, held)| {
+                    value.is_none_or(|v| {
+                        held.as_str()
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .starts_with(v)
+                    })
+                })
         } else {
             name.contains(word.as_str())
         }
@@ -2103,6 +2121,11 @@ mod tests {
             "w",
             &words("is:resting")
         ));
+        let labelled = json!({"name": "a", "labels": {"team": "Web", "fw.kind": "claude"}});
+        assert!(matches_filter(&labelled, "w", &words("label:team")));
+        assert!(matches_filter(&labelled, "w", &words("label:team=we")));
+        assert!(!matches_filter(&labelled, "w", &words("label:team=api")));
+        assert!(!matches_filter(&labelled, "w", &words("label:area")));
         let ended = json!({"name": "alert-fix", "state": "exited", "code": 0});
         assert!(matches_filter(&ended, "w", &words("is:ended")));
         assert!(matches_filter(&ended, "w", &words("")));

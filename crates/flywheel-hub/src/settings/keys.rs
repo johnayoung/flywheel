@@ -111,12 +111,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     },
     global("session.prev", "Sessions", "Previous session", &["alt+up"]),
     global("session.next", "Sessions", "Next session", &["alt+down"]),
-    global(
-        "list.filter",
-        "Sessions",
-        "Filter sessions",
-        &["alt+/"],
-    ),
+    global("list.filter", "Sessions", "Filter sessions", &["alt+/"]),
     global(
         "session.rename",
         "Sessions",

@@ -5,7 +5,7 @@ Front door: [hub](../hub.md).
 ## Model
 
 - **Workspace**: unique name + 1..32 **folders** (existing dirs, git or plain), optionally labelled; a **missing** one refuses new sessions.
-- **Session**: one PTY in one folder: `shell` (`$SHELL` or an argv), `claude`, or `codex` (on the hub's `PATH`, else 400). `running`, `exited` (code or signal; scrollback stays), or `stopped` (hub stopped; `last_cwd`, `restore_error`).
+- **Session**: one PTY in one folder: `shell` (`$SHELL` or an argv), `claude`, or `codex` (on `PATH`, else 400). `running`, `exited` (code or signal; scrollback stays), or `stopped` (hub stopped; `last_cwd`, `restore_error`).
 - `state.json`: atomic, schema 6; older migrate, newer refused. Kill hangs up the leader's group and background jobs (Linux: `/proc`).
 - One terminal size (max 500x300): a pane resizes the PTY only while focused or sole viewer; others clip. Input past 4 MiB queued for a stalled terminal is dropped (`nack` + `error`).
 - Env: [hub-reference](reference.md#environment), minus enclosing-agent markers (`CLAUDECODE`, `CLAUDE_CODE_*`, `AI_AGENT`, `CODEX_SANDBOX`, ...).
@@ -43,7 +43,7 @@ Replaces the hub process **ending no session**: same pids, screens, scrollback, 
 - Binary: `--binary`, else `fw` on `PATH`, else this one; it inherits the old hub's environment. Earlier agents' hooks keep the old binary's path: upgrade in place.
 - Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring; exits on the new hub's ack. Input meanwhile: `nack`ed, resent.
 - Failure before commit thaws the old hub; a stuck new one dies at `--timeout`. Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` restarts instead (sessions restored, not kept); systemd: `systemctl --user restart <unit>`.
-- Agents keep their old tools, so each is marked `stale` (inspector: relaunch). `--relaunch safe-points` (default) kills and resumes each in place, one at a time, once its turn ends with nothing running or typed; its queue waits. Busy, asking, blocked: never interrupted. Never: `--never`, unresumable, ending. A failed resume stays exited; timeline `session.relaunched`.
+- Agents keep old tools; each marked `stale` (inspector: relaunch). `--relaunch safe-points` (default) kills and resumes each in place, one at a time, once its turn ends with nothing running or typed; its queue waits. Busy, asking, blocked: never interrupted. Never: `--never`, unresumable, ending. A failed resume stays exited; timeline `session.relaunched`.
 - Handed-over processes are not children: exits via pidfd, no code. `attach`, `wait` reconnect within 2 min.
 
 ## Agent status
@@ -91,11 +91,11 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 
 ## Web UI
 
-- Sidebar: **rail** (wheel = Everything, workspace tiles, More) + **list** (Everything: Needs you, Moving, Resting; a tile: its folders, sessions). Row: dot, name, one fact; leads nest children; the rest: inspector (hover, `I`).
+- Sidebar: **rail** (wheel = Everything, workspace tiles, More) + **list** (Everything: Needs you, Moving, Resting; a tile: its folders, sessions). Row: dot, name, one fact; leads nest kids; rest: inspector (hover, `I`); group by state/workspace/lead/label.
 - Title, favicon count blocked and done; `#session=<id>` survives reloads. A dropped or silent (no pong in 6 s) socket keeps the screen and reconnects (2-10 s), catching up.
 - Keys typed while down wait (`N queued`), sent in order once back; dropped, and said, if the session changed (epoch). Unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
 - Drawers (Commands, Flywheel, Review, Queue) share the stage's right edge; phones: sheets. Ended sessions: Relaunch, Close. First run: import offers, a 30 s tour. Themes: auto, dark, light (dim TUI colours lifted to 4.5:1).
-- Vendored (`web/vendor/`, licensed): xterm.js 6.0.0 (+ fit, web-links, search); JetBrains Mono 2.304, then JuliaMono for its gaps.
+- Vendored (`web/vendor/`, licensed): xterm.js 6.0.0 (+ fit, web-links, search); JetBrains Mono 2.304, JuliaMono for gaps.
 
 ## Phone
 

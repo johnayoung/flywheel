@@ -401,12 +401,16 @@ function renderSession(session, opts = {}) {
   );
 }
 
-// The label keys the Everything list may be grouped by: those any session
-// holds (the hub's fw.* keys after the rest).
+// What the Everything list may be grouped by: state (its own groups:
+// Needs you, Moving, Resting), workspace, lead, or a label key any
+// session holds (the hub's fw.* keys after the rest). `state.groupBy`:
+// "" (state), "@workspace", "@lead", or the label key.
+const GROUP_WORKSPACE = "@workspace";
+const GROUP_LEAD = "@lead";
 function groupKeys() {
   const keys = new Set();
   for (const s of state.sessions) for (const k of Object.keys(s.labels || {})) keys.add(k);
-  if (state.groupBy) keys.add(state.groupBy);
+  if (state.groupBy && !state.groupBy.startsWith("@")) keys.add(state.groupBy);
   return [...keys].sort((a, b) => (a.startsWith("fw.") - b.startsWith("fw.")) || a.localeCompare(b));
 }
 
@@ -416,21 +420,23 @@ function setGroupBy(key) {
   render();
 }
 
-// The Everything list's group-by control: a select of label keys.
-function groupBySelect() {
+// The group-by picker in the list head (Everything only).
+function groupByPicker() {
   const keys = groupKeys();
-  if (!keys.length) return null;
   return el(
     "select",
     {
-      className: "group-by",
-      title: "Group the list by a label",
-      "aria-label": "Group by label",
-      onclick: (e) => e.stopPropagation(),
+      className: `group-by${state.groupBy ? " on" : ""}`,
+      title: "Group the list by state, workspace, lead, or a label",
+      "aria-label": "Group the list by",
       onchange: (e) => setGroupBy(e.target.value),
     },
-    el("option", { value: "", textContent: "by activity", selected: !state.groupBy }),
-    keys.map((k) => el("option", { value: k, textContent: `by ${k}`, selected: k === state.groupBy })),
+    el("option", { value: "", textContent: "by state", selected: !state.groupBy }),
+    el("option", { value: GROUP_WORKSPACE, textContent: "by workspace", selected: state.groupBy === GROUP_WORKSPACE }),
+    el("option", { value: GROUP_LEAD, textContent: "by lead", selected: state.groupBy === GROUP_LEAD }),
+    keys.length
+      ? el("optgroup", { label: "by label" }, keys.map((k) => el("option", { value: k, textContent: `by ${k}`, selected: k === state.groupBy })))
+      : null,
   );
 }
 
@@ -640,20 +646,9 @@ function renderListHead(workspace) {
       launcher.workspaceChip(workspace.id) || "",
     );
   } else {
-    // Grouped by a label: said where it stays visible, with a way back.
-    sub.replaceChildren(...(state.groupBy
-      ? [el(
-        "button",
-        {
-          type: "button",
-          className: "group-by-chip",
-          title: "Group by activity again",
-          onclick: () => setGroupBy(""),
-        },
-        `grouped by ${state.groupBy} `,
-        icon("x"),
-      )]
-      : []));
+    // How the list is grouped, beside its count: the picker says it and
+    // changes it (morphed: an open picker survives a repaint).
+    morph(sub, [groupByPicker()]);
   }
   $("#list-tools").replaceChildren(...(workspace
     ? [
@@ -661,7 +656,7 @@ function renderListHead(workspace) {
       iconButton("gear", "Edit workspace", () => openWorkspaceDialog(workspace)),
       iconButton("x", "Delete workspace", () => deleteWorkspace(workspace), true),
     ].filter(Boolean)
-    : [groupBySelect()].filter(Boolean)));
+    : []));
   const add = $("#list-new");
   add.title = withKey(workspace ? `New session in ${workspace.name}` : "New session", "session.new");
   add.setAttribute("aria-label", add.title);
@@ -745,7 +740,8 @@ function familyRows({ root, kids }, needs = new Set()) {
 
 // Words a session is found by: its name (every plain word a part of it),
 // `ws:NAME` its workspace, `is:STATE` its state as the legend names it
-// (blocked, asking, working, quiet, background, done, resting, ended, ...).
+// (blocked, asking, working, quiet, background, done, resting, ended, ...),
+// `label:KEY` a label it holds, `label:KEY=VALUE` (a value's start) its value.
 // `fw hub ls --filter` reads the same words.
 function filterTerms(query) {
   return String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
@@ -765,6 +761,11 @@ function matchesFilter(session, terms) {
       return !!ws && ws.name.toLowerCase().includes(term.slice(3));
     }
     if (term.startsWith("is:")) return stateWords(session).some((w) => w.startsWith(term.slice(3)));
+    if (term.startsWith("label:")) {
+      const [key, value] = term.slice(6).split(/=(.*)/s);
+      const held = Object.entries(session.labels || {}).find(([k]) => k.toLowerCase() === key);
+      return !!held && (value === undefined || String(held[1]).toLowerCase().startsWith(value));
+    }
     return session.name.toLowerCase().includes(term);
   });
 }
@@ -883,7 +884,7 @@ function renderAllList() {
   // Keyed by group, so a repaint keeps each group's rows (morph).
   const rows = (list, group) => el("ul", { className: "sessions", dataset: { id: `group:${group}` } }, list.flatMap((f) => familyRows(f, needs)));
   const count = (list) => list.reduce((n, f) => n + 1 + f.kids.filter((k) => !needs.has(k.id) && !endedSession(k)).length, 0);
-  if (state.groupBy && state.sessions.length) return labelGroups([...moving, ...resting], rows, count);
+  if (state.groupBy && state.sessions.length) return groupedList([...moving, ...resting], rows, count);
   const out = [];
   if (!needs.size && !attention.handoffCount() && !moving.length) {
     out.push(el("div", { className: "list-calm", textContent: "Nothing needs you. Nothing is moving." }));
@@ -935,25 +936,36 @@ function renderAllList() {
   return out;
 }
 
-// Everything grouped by one label key: a group per value (most sessions
-// first), then those without it; a family goes by its lead's label. Needs
-// you stays above, as always.
-function labelGroups(families, rows, count) {
-  const key = state.groupBy;
-  const groups = new Map();
-  const without = [];
+// Everything grouped other than by state (Needs you stays above, as
+// always), most sessions first:
+// - workspace: one group a workspace, in rail order;
+// - lead: one group a lead with what it started, then the rest;
+// - a label key: one group a value, then those without it.
+// A family goes by its lead's workspace and labels.
+function groupedList(families, rows, count) {
+  const by = state.groupBy;
+  const groups = new Map(); // key -> { title, list, rank }
+  const add = (key, title, f, rank = 0) => {
+    if (!groups.has(key)) groups.set(key, { title, list: [], rank });
+    groups.get(key).list.push(f);
+  };
   for (const f of families) {
-    const value = (f.root.labels || {})[key];
-    if (value === undefined) without.push(f);
-    else {
-      if (!groups.has(value)) groups.set(value, []);
-      groups.get(value).push(f);
+    if (by === GROUP_WORKSPACE) {
+      const ws = workspaceById(f.root.workspace_id);
+      add(`ws:${f.root.workspace_id}`, ws ? ws.name : "no workspace", f, ws ? state.workspaces.indexOf(ws) : Infinity);
+    } else if (by === GROUP_LEAD) {
+      if (f.kids.length) add(`lead:${f.root.id}`, f.root.name, f);
+      else add("lead:", "no lead", f, 1);
+    } else {
+      const value = (f.root.labels || {})[by];
+      if (value === undefined) add("label:", `no ${by}`, f, 1);
+      else add(`label:${value}`, `${by}=${value}`, f);
     }
   }
-  const ordered = [...groups.entries()].sort((a, b) => count(b[1]) - count(a[1]) || a[0].localeCompare(b[0]));
+  const ordered = [...groups.entries()].sort(([ka, a], [kb, b]) =>
+    a.rank - b.rank || (by === GROUP_WORKSPACE ? 0 : count(b.list) - count(a.list)) || ka.localeCompare(kb));
   const out = [];
-  for (const [value, list] of ordered) out.push(listGroup(`${key}=${value}`, count(list)), rows(list, `label:${value}`));
-  if (without.length) out.push(listGroup(`no ${key}`, count(without)), rows(without, "label:"));
+  for (const [key, g] of ordered) out.push(listGroup(g.title, count(g.list)), rows(g.list, key));
   if (!out.length) out.push(el("div", { className: "list-calm", textContent: "Everything else needs you." }));
   return out;
 }

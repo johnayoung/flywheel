@@ -1463,6 +1463,90 @@ async fn a_worktree_made_with_plain_git_is_adopted_and_closed_by_the_rules() {
     log_has(&hub, "change", &["change.adopted"]).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_time_watch_wakes_its_owner_and_passes_to_its_successor() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let old = hub.claude("old", Some(&lead), json!({})).await;
+    lead.turn().await;
+    old.turn().await;
+
+    // Once, soon: it fires, then it is gone.
+    let said = old
+        .ok(
+            "watch",
+            json!({"at": "+2s", "prompt": "check the captures are done"}),
+        )
+        .await;
+    assert!(said.starts_with("Watch w"), "{said}");
+    assert!(said.contains("survives hub restarts"), "{said}");
+    old.typed_has("check the captures are done").await;
+    old.typed_has("] due ").await;
+    let deadline = Instant::now() + WAIT;
+    while !hub.get("/api/watches").await["watches"]
+        .as_array()
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "a one-shot stayed armed");
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // Refused: both a filter and a time, too short a period, the past.
+    for (args, why) in [
+        (
+            json!({"filter": "children", "at": "+1h", "prompt": "x"}),
+            "not both",
+        ),
+        (json!({"every": "1m", "prompt": "x"}), "at least 5m"),
+        (
+            json!({"at": "2020-01-01T00:00Z", "prompt": "x"}),
+            "in the past",
+        ),
+    ] {
+        let (error, said) = old.tool("watch", args).await;
+        assert!(error && said.contains(why), "{said}");
+    }
+
+    // A repeating one survives a restart and passes to the successor.
+    old.turn().await;
+    old.ok("watch", json!({"every": "6h", "prompt": "rotate the logs"}))
+        .await;
+    let mut hub = hub.restart(|_| {}).await;
+    let watches = hub.get("/api/watches").await;
+    assert_eq!(
+        watches["watches"][0]["time"]["every_secs"], 21600,
+        "{watches}"
+    );
+    let lead = hub.agent(&hub.session(&lead.id).await);
+    let old = hub.agent(&hub.session(&old.id).await);
+    lead.env(None).await;
+    old.env(None).await;
+    lead.turn().await;
+    old.turn().await;
+    lead.ok(
+        "replace_session",
+        json!({"to": "old", "name": "new", "prompt": "Carry on.", "final_prompt": "Wrap up."}),
+    )
+    .await;
+    old.typed_has("Wrap up.").await;
+    old.turn().await;
+    hub.ended(&old.id).await;
+    let new = hub.named("new").await.expect("the successor started");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let watches = hub.get("/api/watches").await;
+        if watches["watches"][0]["owner"] == new["id"] {
+            break;
+        }
+        assert!(Instant::now() < deadline, "not passed on: {watches}");
+        sleep(Duration::from_millis(100)).await;
+    }
+    log_has(&hub, "watch", &["watch.fired", "watch.moved"]).await;
+    let _ = &mut hub;
+}
+
 fn urlencode(text: &str) -> String {
     text.bytes()
         .map(|b| match b {

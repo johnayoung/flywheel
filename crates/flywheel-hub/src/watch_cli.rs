@@ -33,8 +33,15 @@ struct AddArgs {
     session: String,
     /// What to match (`state=done|blocked|failed children`, `team=web
     /// kind=review`; see `fw hub tail`). Its own events never match.
-    #[arg(long = "on", value_name = "FILTER")]
-    on: String,
+    #[arg(long = "on", value_name = "FILTER", required_unless_present_any = ["at", "every"])]
+    on: Option<String>,
+    /// Wake it once at this time instead (2026-11-23T12:00Z, or +36h).
+    #[arg(long, value_name = "TIME", conflicts_with = "on")]
+    at: Option<String>,
+    /// Wake it this often instead (6h, 1d; at least 5m); with --at, from
+    /// then.
+    #[arg(long, value_name = "SPAN", conflicts_with = "on")]
+    every: Option<String>,
     /// What the session is told when it fires (`-`: read stdin).
     #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
     prompt: String,
@@ -92,9 +99,11 @@ fn run(args: &WatchArgs, out: &mut dyn Write) -> Result<(), String> {
             } else {
                 add.prompt.clone()
             };
-            crate::eventlog::Filter::parse(&add.on)?;
+            let on = add.on.clone().unwrap_or_default();
+            crate::eventlog::Filter::parse(&on)?;
             let conn = Endpoint::resolve(&add.endpoint)?;
-            let mut body = json!({ "owner": add.session, "filter": add.on, "prompt": prompt });
+            let mut body = json!({ "owner": add.session, "filter": on, "prompt": prompt,
+                                   "at": add.at, "every": add.every });
             if let Some(window) = add.window {
                 body["window_secs"] = json!(window);
             }
@@ -157,7 +166,17 @@ fn print_watches(out: &mut dyn Write, listed: &Value, conn: &Endpoint) {
     };
     for watch in watches {
         let filter = &watch["filter"];
-        let shown = filter_text(filter);
+        let shown = match watch.get("time").filter(|t| t.is_object()) {
+            Some(time) => format!(
+                "{}next {}",
+                time["every_secs"]
+                    .as_u64()
+                    .map(|s| format!("every {}s, ", s))
+                    .unwrap_or_default(),
+                str_field(time, "next")
+            ),
+            None => filter_text(filter),
+        };
         let _ = writeln!(
             out,
             "{}  {}  {}  fired {}, {} events{}",

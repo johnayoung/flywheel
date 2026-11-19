@@ -46,6 +46,12 @@ pub const MAX_PER_HUB: usize = 2000;
 pub const MAX_PROMPT_BYTES: usize = 4096;
 /// Events a queued prompt lists; the rest are counted.
 pub const MAX_LINES: usize = 40;
+/// The shortest and longest `every`, and how far ahead (or behind) `at`
+/// may be.
+pub const MIN_EVERY_SECS: u32 = 300;
+pub const MAX_EVERY_SECS: u32 = 30 * 86_400;
+pub const MAX_AHEAD_DAYS: i64 = 366;
+pub const MAX_BEHIND_DAYS: i64 = 1;
 /// How often the engine looks at the log.
 const TICK: Duration = Duration::from_millis(250);
 /// Rows one tick reads.
@@ -100,6 +106,113 @@ pub struct Watch {
     /// Its prompt still waiting in the owner's queue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch: Option<Batch>,
+    /// A time watch: when it wakes its owner (its filter is empty and
+    /// never matches the log). Passes to the owner's successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<TimeTrigger>,
+}
+
+/// When a time watch fires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeTrigger {
+    /// Once at this time (with `every`: the first time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<DateTime<Utc>>,
+    /// Again this often.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_secs: Option<u32>,
+    /// When it fires next.
+    pub next: DateTime<Utc>,
+}
+
+impl TimeTrigger {
+    /// After firing at `now`: the next time (past `now`), or `None` for a
+    /// one-shot.
+    pub fn after(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        let every = chrono::Duration::seconds(i64::from(self.every_secs?));
+        let mut next = self.next;
+        while next <= now {
+            next += every;
+        }
+        Some(next)
+    }
+
+    /// In words.
+    pub fn words(&self) -> String {
+        match (self.at, self.every_secs) {
+            (Some(at), Some(every)) => format!(
+                "from {} every {}",
+                at.format("%Y-%m-%d %H:%M UTC"),
+                crate::share::format_ttl(Duration::from_secs(u64::from(every)))
+            ),
+            (Some(at), None) => format!("at {}", at.format("%Y-%m-%d %H:%M UTC")),
+            (None, Some(every)) => format!(
+                "every {}",
+                crate::share::format_ttl(Duration::from_secs(u64::from(every)))
+            ),
+            (None, None) => String::new(),
+        }
+    }
+}
+
+/// The time trigger `new` asks for (`None`: an event watch).
+fn time_trigger(new: &NewWatch, now: DateTime<Utc>) -> Result<Option<TimeTrigger>, String> {
+    let given = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    let (at, every) = (given(&new.at), given(&new.every));
+    if at.is_none() && every.is_none() {
+        return Ok(None);
+    }
+    let at = at.map(|a| parse_at(&a, now)).transpose()?;
+    if let Some(at) = at {
+        if at > now + chrono::Duration::days(MAX_AHEAD_DAYS) {
+            return Err(format!("at is at most {MAX_AHEAD_DAYS} days ahead"));
+        }
+        if at < now - chrono::Duration::days(MAX_BEHIND_DAYS) {
+            return Err("at is in the past".into());
+        }
+    }
+    let every_secs = every
+        .map(|e| crate::lease_cli::parse_span(&e))
+        .transpose()?;
+    if let Some(secs) = every_secs
+        && !(MIN_EVERY_SECS..=MAX_EVERY_SECS).contains(&secs)
+    {
+        return Err(format!(
+            "every is {}-{} (at least 5m, at most 30d)",
+            MIN_EVERY_SECS, MAX_EVERY_SECS
+        ));
+    }
+    let next = at.unwrap_or_else(|| {
+        now + chrono::Duration::seconds(i64::from(every_secs.unwrap_or(MIN_EVERY_SECS)))
+    });
+    Ok(Some(TimeTrigger {
+        at,
+        every_secs,
+        next,
+    }))
+}
+
+/// `raw` as a time: RFC 3339 (`2026-11-23T12:00:00Z`, also without
+/// seconds), or `+SPAN` from `now` (`+36h`).
+pub fn parse_at(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    let raw = raw.trim();
+    if let Some(span) = raw.strip_prefix('+') {
+        let secs = crate::lease_cli::parse_span(span)?;
+        return Ok(now + chrono::Duration::seconds(i64::from(secs)));
+    }
+    let with_seconds = if raw.len() == 17 && raw.ends_with('Z') {
+        format!("{}:00Z", &raw[..16])
+    } else {
+        raw.to_owned()
+    };
+    DateTime::parse_from_rfc3339(&with_seconds)
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|_| format!("at {raw:?}: a time like 2026-11-23T12:00Z, or +36h"))
 }
 
 impl Watch {
@@ -110,6 +223,21 @@ impl Watch {
 
     /// The queued prompt's text for `batch`.
     pub fn text(&self, batch: &Batch) -> String {
+        if let Some(time) = &self.time {
+            let count = batch.lines.len() + batch.more as usize;
+            return format!(
+                "{}\n\n[watch {}, {}] due {}{}\n",
+                self.prompt.trim_end(),
+                self.short(),
+                time.words(),
+                batch.lines.join(", "),
+                if count > 1 {
+                    format!(" ({count} times while this waited)")
+                } else {
+                    String::new()
+                }
+            );
+        }
         let count = batch.lines.len() + batch.more as usize;
         let mut text = format!(
             "{}\n\n[watch {} on `{}`] {count} event{} (cursor {} .. {}):\n",
@@ -148,6 +276,12 @@ pub struct NewWatch {
     /// Match from this cursor on (default: from now).
     #[serde(default)]
     pub after: Option<String>,
+    /// A time watch: once at this time (RFC 3339, or `+36h`)...
+    #[serde(default)]
+    pub at: Option<String>,
+    /// ...and/or this often (`6h`, at least 5m).
+    #[serde(default)]
+    pub every: Option<String>,
 }
 
 /// One event in a watch's prompt: when, who, what.
@@ -228,15 +362,27 @@ impl Hub {
             ))
             .into());
         }
+        let time = time_trigger(new, Utc::now()).map_err(StateError::Invalid)?;
         let parsed = Filter::parse(&new.filter).map_err(StateError::Invalid)?;
-        if parsed.is_empty() {
+        if time.is_some() && !parsed.is_empty() {
             return Err(StateError::Invalid(
-                "a watch needs a filter (state=done|blocked children, kind=review, team=web, ...)"
+                "a watch wakes on events (filter) or on time (at, every), not both".into(),
+            )
+            .into());
+        }
+        if parsed.is_empty() && time.is_none() {
+            return Err(StateError::Invalid(
+                "a watch needs a filter (state=done|blocked children, kind=review, team=web, ...) \
+                 or a time (at, every)"
                     .into(),
             )
             .into());
         }
-        let filter = self.resolve_filter(&parsed, Some(&owner.id))?;
+        let filter = if time.is_some() {
+            Filter::default()
+        } else {
+            self.resolve_filter(&parsed, Some(&owner.id))?
+        };
         let window_secs = new.window_secs.unwrap_or(DEFAULT_WINDOW_SECS);
         if window_secs > MAX_WINDOW_SECS {
             return Err(StateError::Invalid(format!(
@@ -261,6 +407,7 @@ impl Hub {
             last_fired: None,
             events: 0,
             batch: None,
+            time,
         };
         self.store()
             .add_watch(watch.clone(), MAX_PER_OWNER, MAX_PER_HUB)?;
@@ -275,6 +422,8 @@ impl Hub {
         filter: &str,
         prompt: &str,
         window_secs: Option<u32>,
+        at: Option<&str>,
+        every: Option<&str>,
     ) -> Result<String, HubError> {
         let watch = self.watch_add(
             &NewWatch {
@@ -283,9 +432,22 @@ impl Hub {
                 prompt: prompt.to_owned(),
                 window_secs,
                 after: None,
+                at: at.map(str::to_owned),
+                every: every.map(str::to_owned),
             },
             Some(caller),
         )?;
+        if let Some(time) = &watch.time {
+            return Ok(format!(
+                "Watch {} armed {}: next {}. It wakes you with your prompt then (queued, \
+                 delivered once your turn is over), survives hub restarts, and passes to your \
+                 successor; unwatch {} stops it.",
+                watch.short(),
+                time.words(),
+                time.next.format("%Y-%m-%d %H:%M:%S UTC"),
+                watch.short()
+            ));
+        }
         Ok(format!(
             "Watch {} armed on `{}` (window {} s): matching events wake you as your next prompt, \
              with their cursors. Keep working or end your turn; unwatch {} stops it.",
@@ -370,6 +532,43 @@ impl Hub {
 
     /// Disarm every watch `owner` has (it was removed, ended, or exited).
     pub(crate) fn drop_watches_of(&self, owner: &str) {
+        // Its time watches pass to its successor (a replacement, or a
+        // session continuing its work), if one runs.
+        let successor = {
+            let store = self.store();
+            let named = store
+                .session(owner)
+                .ok()
+                .and_then(|r| r.ended.as_ref().and_then(|e| e.successor.clone()));
+            named
+                .or_else(|| {
+                    store
+                        .sessions()
+                        .iter()
+                        .filter(|s| s.continues.as_deref() == Some(owner))
+                        .max_by_key(|s| s.created_at)
+                        .map(|s| s.id.clone())
+                })
+                .filter(|id| {
+                    store.session(id).is_ok_and(|s| {
+                        s.runs_agent() && s.state == crate::state::SessionState::Running
+                    })
+                })
+        };
+        if let Some(to) = successor {
+            match self.store().move_time_watches(owner, &to, MAX_PER_OWNER) {
+                Ok(moved) => {
+                    for watch in &moved {
+                        self.log_hub_event(
+                            "watch.moved",
+                            Some(&to),
+                            serde_json::json!({ "watch": watch.id, "from": owner, "to": to }),
+                        );
+                    }
+                }
+                Err(e) => eprintln!("fw hub: watches of {owner}: not passed on: {e}"),
+            }
+        }
         let removed = match self.store().remove_watches_of(owner) {
             Ok(removed) => removed,
             Err(e) => {
@@ -395,7 +594,13 @@ impl Hub {
     /// One look at the log for every watch: gather what matches, queue
     /// what has waited its window. Whether anything is still gathering.
     pub(crate) fn watch_tick(&self) -> bool {
-        let watches = self.store().watches().to_vec();
+        let (timed, watches): (Vec<Watch>, Vec<Watch>) = self
+            .store()
+            .watches()
+            .iter()
+            .cloned()
+            .partition(|w| w.time.is_some());
+        self.time_tick(&timed, Utc::now());
         if watches.is_empty() {
             return false;
         }
@@ -568,6 +773,67 @@ impl Hub {
         gathering
     }
 
+    /// Fire the time watches due at `now`: a prompt queued (or, while
+    /// the last waits, a line added to it), the next time set (a one-shot
+    /// gone), in one write.
+    fn time_tick(&self, timed: &[Watch], now: DateTime<Utc>) {
+        for watch in timed {
+            let Some(time) = &watch.time else { continue };
+            if time.next > now {
+                continue;
+            }
+            let late = (now - time.next).num_seconds();
+            let line = format!(
+                "{}{}",
+                time.next.format("%Y-%m-%d %H:%M UTC"),
+                if late >= 60 {
+                    format!(
+                        " (late {})",
+                        crate::share::format_ttl(Duration::from_secs(late.unsigned_abs()))
+                    )
+                } else {
+                    String::new()
+                }
+            );
+            let queued = self.store().queue_watch(
+                &watch.id,
+                std::slice::from_ref(&line),
+                "",
+                "",
+                watch.cursor,
+                Some(now),
+            );
+            match queued {
+                Ok(fresh) => {
+                    eprintln!(
+                        "fw hub: watch {} -> {}: due {line} {}",
+                        watch.short(),
+                        watch.owner,
+                        if fresh {
+                            "queued"
+                        } else {
+                            "joined its waiting prompt"
+                        }
+                    );
+                    self.log_hub_event(
+                        "watch.fired",
+                        Some(&watch.owner),
+                        serde_json::json!({
+                            "watch": watch.id,
+                            "trigger": if time.every_secs.is_some() { "every" } else { "at" },
+                            "due": time.next,
+                            "late_ms": (now - time.next).num_milliseconds(),
+                        }),
+                    );
+                    self.queue_changed();
+                }
+                // Not queued (its owner is ending, its queue is full): tried
+                // again next tick.
+                Err(e) => eprintln!("fw hub: watch {}: not queued: {e}", watch.short()),
+            }
+        }
+    }
+
     /// Queue `rows` for `watch`'s owner: into its waiting prompt, else a
     /// new one; the watch's cursor moves to `looked` in the same write.
     fn watch_queue(&self, watch: &Watch, rows: &[LogRow], looked: i64) -> Result<(), HubError> {
@@ -586,7 +852,7 @@ impl Hub {
         let lines: Vec<String> = rows.iter().map(line).collect();
         let delivered = self
             .store()
-            .queue_watch(&watch.id, &lines, &from, &to, looked)?;
+            .queue_watch(&watch.id, &lines, &from, &to, looked, None)?;
         eprintln!(
             "fw hub: watch {} -> {}: {} event(s) {}",
             watch.short(),
@@ -634,5 +900,82 @@ impl Hub {
         if let Err(e) = spawned {
             eprintln!("fw hub: watches are off: cannot start their thread: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+    }
+
+    #[test]
+    fn a_repeating_time_moves_past_now_and_a_one_shot_ends() {
+        let every = TimeTrigger {
+            at: None,
+            every_secs: Some(3600),
+            next: at(0),
+        };
+        // Down for 2.5 periods: fires once, next is the first time ahead.
+        assert_eq!(every.after(at(9000)), Some(at(10_800)));
+        let once = TimeTrigger {
+            at: Some(at(0)),
+            every_secs: None,
+            next: at(0),
+        };
+        assert_eq!(once.after(at(5)), None);
+    }
+
+    #[test]
+    fn times_read_as_rfc3339_or_from_now() {
+        let now = at(0);
+        assert_eq!(
+            parse_at("+36h", now).unwrap(),
+            now + chrono::Duration::hours(36)
+        );
+        assert_eq!(
+            parse_at("2026-11-23T12:00Z", now).unwrap().to_rfc3339(),
+            "2026-11-23T12:00:00+00:00"
+        );
+        assert!(parse_at("tomorrow", now).is_err());
+    }
+
+    #[test]
+    fn a_time_watch_says_when_and_counts_times_it_was_due_while_waiting() {
+        let watch = Watch {
+            id: "abcdef0123".into(),
+            owner: "o".into(),
+            filter: Filter::default(),
+            prompt: "check".into(),
+            window_secs: 3,
+            cursor: 0,
+            created_at: at(0),
+            by: None,
+            fired: 0,
+            last_fired: None,
+            events: 0,
+            batch: None,
+            time: Some(TimeTrigger {
+                at: None,
+                every_secs: Some(21600),
+                next: at(0),
+            }),
+        };
+        let batch = Batch {
+            item: "i".into(),
+            lines: vec!["a".into(), "b".into()],
+            more: 0,
+            from: String::new(),
+            to: String::new(),
+        };
+        let text = watch.text(&batch);
+        assert!(
+            text.starts_with(
+                "check\n\n[watch wabcdef0, every 6h] due a, b (2 times while this waited)"
+            ),
+            "{text}"
+        );
     }
 }

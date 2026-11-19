@@ -370,7 +370,12 @@ window.FwHubQueue = function (ctx) {
     $("#q-watch-list").replaceChildren(...watches.map((w) => el(
       "li",
       { className: "q-watch", dataset: { id: w.id }, title: w.prompt },
-      el("span", { className: "q-watch-filter", textContent: filterText(w.filter) }),
+      el("span", {
+        className: "q-watch-filter",
+        textContent: w.time
+          ? `${w.time.every_secs ? `every ${Math.round(w.time.every_secs / 60)}m, ` : ""}next ${new Date(w.time.next).toLocaleString()}`
+          : filterText(w.filter),
+      }),
       el("span", {
         className: "q-watch-n",
         textContent: `${w.fired} fired \u00b7 ${w.events} event${w.events === 1 ? "" : "s"}${w.last_fired ? ` \u00b7 ${age(w.last_fired)} ago` : ""}`,

@@ -333,9 +333,11 @@ impl mcp::Host for AgentHost {
         filter: &str,
         prompt: &str,
         window_secs: Option<u32>,
+        at: Option<&str>,
+        every: Option<&str>,
     ) -> Result<String, String> {
         self.hub
-            .agent_watch(&self.session, filter, prompt, window_secs)
+            .agent_watch(&self.session, filter, prompt, window_secs, at, every)
             .map_err(|e| e.to_string())
     }
 

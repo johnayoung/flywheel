@@ -144,7 +144,7 @@ Per agent session, prompts the hub types itself, in order ("when done, do X"): `
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
 **Watches** (`fw hub watch add lead --on 'children state=done|failed' --prompt ...`, `watch`/`unwatch` tools, the Queue drawer): a matching log event queues the prompt, events, and cursors into the owner (queue rules apply).
-Matches within `--window` (3 s), or while that prompt waits, join it (40 listed, the rest counted): 500 children finishing wake a lead once. Its own events never match; it ends with its owner.
+Matches within `--window` (3 s), or while that prompt waits, join it (40 listed, the rest counted): 500 children finishing wake a lead once. Its own events never match; it ends with its owner. Time watches (`--at`, `--every` 5m+) fire by clock, survive restarts, and pass to the owner's successor.
 
 **Leases** (`lease` tool, `fw hub lease`): shared or exclusive, a ttl, a fair line per resource; a wait past 50 s is granted by prompt. Ends: release, ttl, holder end, `break`.
 

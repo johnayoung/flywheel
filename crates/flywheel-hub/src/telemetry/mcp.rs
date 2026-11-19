@@ -153,9 +153,16 @@ pub trait Host {
         change: &crate::labels::Change,
         cond: Option<&crate::labels::Cond>,
     ) -> Result<String, String>;
-    /// Arm a watch that wakes the caller when the log matches `filter`.
-    fn watch(&self, filter: &str, prompt: &str, window_secs: Option<u32>)
-    -> Result<String, String>;
+    /// Arm a watch that wakes the caller when the log matches `filter`,
+    /// or at a time (`at`, `every`).
+    fn watch(
+        &self,
+        filter: &str,
+        prompt: &str,
+        window_secs: Option<u32>,
+        at: Option<&str>,
+        every: Option<&str>,
+    ) -> Result<String, String>;
     /// Disarm one of the caller's watches (`all`: every one).
     fn unwatch(&self, id: &str) -> Result<String, String>;
     /// Acquire, release, or list leases for the caller.
@@ -599,11 +606,16 @@ fn watch_tool() -> Value {
                         state=done|blocked|failed|asking (a session moving there), \
                         kind=review|pr|queue (event kinds or families), or labels (team=web). \
                         Example: \"children state=done|blocked|failed\". Your own events never \
-                        match. A watch lasts until unwatch or until you end.",
+                        match. By time instead of filter: at (\"2026-11-23T12:00Z\" or \
+                        \"+36h\") wakes you once; every (\"6h\", at least 5m) wakes you \
+                        repeatedly; a time watch survives hub restarts and passes to your \
+                        successor. A watch lasts until unwatch or until you end.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "filter": { "type": "string", "description": "What to watch for (see above)." },
+                "filter": { "type": "string", "description": "What to watch for (see above); not with at or every." },
+                "at": { "type": "string", "description": "Optional: wake once at this time (RFC 3339 UTC, or +36h)." },
+                "every": { "type": "string", "description": "Optional: wake this often (6h, 1d; at least 5m); with at, from then." },
                 "prompt": { "type": "string", "description": "What to tell yourself when it fires: what to do next." },
                 "window_secs": {
                     "type": "integer",
@@ -612,7 +624,7 @@ fn watch_tool() -> Value {
                     "description": "Optional: gather matches this long before waking you. Default 3."
                 }
             },
-            "required": ["filter", "prompt"]
+            "required": ["prompt"]
         }
     })
 }
@@ -982,10 +994,19 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                     .get("window_secs")
                     .and_then(Value::as_u64)
                     .map(|w| u32::try_from(w).unwrap_or(u32::MAX));
-                Ok(match host.watch(arg("filter"), arg("prompt"), window) {
-                    Ok(said) => text_result(said, false),
-                    Err(why) => text_result(format!("Not watching: {why}"), true),
-                })
+                let given = |key: &str| Some(arg(key).trim()).filter(|v| !v.is_empty());
+                Ok(
+                    match host.watch(
+                        arg("filter"),
+                        arg("prompt"),
+                        window,
+                        given("at"),
+                        given("every"),
+                    ) {
+                        Ok(said) => text_result(said, false),
+                        Err(why) => text_result(format!("Not watching: {why}"), true),
+                    },
+                )
             } else if name == Some(LEASE_TOOL) {
                 let text = |key: &str| {
                     Some(arg(key).trim())
@@ -1219,6 +1240,8 @@ mod tests {
             filter: &str,
             prompt: &str,
             window_secs: Option<u32>,
+            _at: Option<&str>,
+            _every: Option<&str>,
         ) -> Result<String, String> {
             Ok(format!("{filter} / {prompt} / {window_secs:?}"))
         }

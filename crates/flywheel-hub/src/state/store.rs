@@ -1145,6 +1145,33 @@ impl HubStore {
         Ok(gone)
     }
 
+    /// Pass `from`'s time watches to `to` (at most `per_owner` in all):
+    /// the ones passed on.
+    pub fn move_time_watches(
+        &mut self,
+        from: &str,
+        to: &str,
+        per_owner: usize,
+    ) -> Result<Vec<crate::watch::Watch>, StateError> {
+        let room =
+            per_owner.saturating_sub(self.doc.watches.iter().filter(|w| w.owner == to).count());
+        let previous = self.doc.watches.clone();
+        let mut moved = Vec::new();
+        for watch in &mut self.doc.watches {
+            if moved.len() < room && watch.owner == from && watch.time.is_some() {
+                watch.owner = to.to_owned();
+                watch.by = Some(to.to_owned());
+                watch.batch = None;
+                moved.push(watch.clone());
+            }
+        }
+        if moved.is_empty() {
+            return Ok(moved);
+        }
+        self.save_or_rollback(|doc| doc.watches = previous)?;
+        Ok(moved)
+    }
+
     /// Save how far quiet watches have looked (`(id, row)`); a watch gone
     /// meanwhile is skipped.
     pub fn set_watch_cursors(&mut self, cursors: &[(String, i64)]) -> Result<(), StateError> {
@@ -1170,6 +1197,7 @@ impl HubStore {
         from: &str,
         to: &str,
         looked: i64,
+        time_now: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool, StateError> {
         use crate::queue::{ItemState, MAX_PENDING, QueueItem, When};
         use crate::watch::{Batch, MAX_LINES};
@@ -1241,9 +1269,28 @@ impl HubStore {
         watch.events += lines.len() as u64;
         watch.cursor = watch.cursor.max(looked);
         watch.batch = Some(batch);
-        self.doc.watches[at] = watch;
+        // A time watch moves to its next time; a one-shot is done.
+        let done = match (time_now, watch.time.as_mut()) {
+            (Some(now), Some(time)) => match time.after(now) {
+                Some(next) => {
+                    time.next = next;
+                    false
+                }
+                None => true,
+            },
+            _ => false,
+        };
+        if done {
+            self.doc.watches.remove(at);
+        } else {
+            self.doc.watches[at] = watch;
+        }
         self.save_or_rollback(|doc| {
-            doc.watches[at] = previous_watch;
+            if done {
+                doc.watches.insert(at, previous_watch);
+            } else {
+                doc.watches[at] = previous_watch;
+            }
             match previous_queue {
                 Some(queue) => {
                     doc.queues.insert(owner, queue);

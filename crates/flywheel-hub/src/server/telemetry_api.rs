@@ -341,6 +341,12 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
+    fn lease(&self, args: &mcp::LeaseArgs) -> Result<String, String> {
+        self.hub
+            .agent_lease(&self.session, args)
+            .map_err(|e| e.to_string())
+    }
+
     fn handoff(
         &self,
         prompt: &str,

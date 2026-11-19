@@ -49,7 +49,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | POST | `/api/sessions/{id}/paste` | `{"text","run"?}`: `/input` with `paste`, trailing newlines dropped, 1 MiB; 409 unsafe multi-line |
 | GET | `/api/sessions/{id}/commands[?limit=N&all=true]` | newest first (shell unless `all`; `limit` 1..500, 50) |
 | GET | `/api/sessions/{id}/replies[?limit=N]` | newest first (`limit` 1..100, 20): `text`, `blocks`, `match_key` |
-| GET | `/api/sessions/{id}/file?path=` | a file under its cwd, worktree, or workspace folders (relative, absolute, `~/`; symlinks resolved): `{"path","size","text","truncated"}` (2 MiB); 403 outside, 404, 415 binary |
+| GET | `/api/sessions/{id}/file?path=` | a file under its cwd, worktree, or workspace folders (symlinks resolved): `{"path","size","text","truncated"}` (2 MiB); 403 outside, 404, 415 binary |
 | POST | `/api/sessions/{id}/files/check` | `{"paths":[...]}` (64): `{"files":[{"path","size"}\|null]}`, in order |
 | GET | `/api/sessions/{id}/transcript[?around=N&before=N&after=N]` | messages, paged (30, max 200); 400 a shell |
 | POST | `/api/sessions/{id}/companion` | `{"text"?,"run"?}`: companion shell (201 / 200 running), `text` pasted when ready |
@@ -60,12 +60,12 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET | `/api/claude-accounts` | `{accounts:[{name,updated}]}` (never tokens); `"account":NAME` on create launches under one |
 | POST | `/api/claude-accounts` | `{name,token,replace?}` -> 201 `{name,updated}` (taken: 409 unless `replace`) |
 | DELETE | `/api/claude-accounts/{name}` | 204 |
-| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, 30): past conversations, newest first `{id,kind,modified,title?,prompt?,bytes,open_in?}`; `"resume":ID\|"latest"` on create resumes one |
+| GET | `/api/workspaces/{id}/conversations` | `?kind=claude\|codex&folder?&limit?` (1-200, 30): past conversations, newest first; `"resume":ID\|"latest"` on create resumes one |
 | GET | `/api/usage` | hub and per-workspace `today` / `week` / `total` |
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
-A session lists `agent` (`state`, `detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs` (`id`, `name`?, `reason`?, `prompt`, `created_at`), `start_sessions`, `start_policy` (in force), `start_requests`, `starts_made`, `stale`, `never_relaunch`,
-`owner`, `ending`, `ended`, `end_requests`, `labels`; queue items: `from`, `priority`. `label`: `k=v\|w,k2` (all hold).
+A session lists `agent` (`state`, `detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs`, `start_sessions`, `start_policy` (in force), `start_requests`, `starts_made`, `stale`, `never_relaunch`,
+`owner`, `ending`, `ended`, `end_requests`, `labels`, `leases`; queue items: `from`, `priority`. `label`: `k=v\|w,k2` (all hold).
 
 ## Review, handoff, peer review
 
@@ -256,7 +256,7 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/telemetry/fleet[?status=&label=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `host` (this hub's id), `sessions` (urgent first), `total`, `counts`, `hosts`; `hours=0`: any age; `rollup=1`: captured runs as `batches` (counts, cost, budget); `batch=KEY`: its runs |
+| GET | `/api/telemetry/fleet[?status=&label=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `host`, `sessions` (urgent first), `total`, `counts`, `hosts`; `hours=0`: any age; `rollup=1`: captured runs as `batches` (counts, cost, budget); `batch=KEY`: its runs |
 | GET | `/api/telemetry/lanes[?host=&hours=]` | `lanes` (`id`, `count`, `groups` of `cards`), `total`, `placed`, `runs` |
 | GET | `/api/telemetry/insights[?host=&hours=&project=]` | `insights`: `projects`, `time`, `waiting`, `failing`, `rewritten`, `context` |
 | GET | `/api/telemetry/capture/hooks` | what `capture install` writes |
@@ -277,7 +277,7 @@ Kinds: `session.started`, `session.continued`, `session.end_requested`, `session
 
 ## Events WebSocket
 
-`/api/events[?client=ID&after=CURSOR]` (as `client` above; default its own). `after`: only sessions with log rows since, then `resumed` (a foreign or 50k-rows-old cursor: a snapshot). Server sends `{"type",...}`:
+`/api/events[?client=ID&after=CURSOR]`. `after`: only sessions with log rows since, then `resumed` (a foreign or 50k-rows-old cursor: a snapshot). Server sends `{"type",...}`:
 
 | `type` | Other fields | When |
 |---|---|---|
@@ -365,10 +365,14 @@ Behaviour: [hub-workflows](workflows.md#prompt-queue). `{item}`: id prefix (4+) 
 | GET | `/api/queues` | every session's queue |
 | GET / POST | `/api/watches[?session=]` | list / arm `{"owner","filter","prompt","window_secs"?,"after"?}` -> 201; 400 not an agent; 409 20 per owner, 2000 per hub |
 | DELETE | `/api/watches/{id}` | disarm (id or 4+ prefix) |
+| GET / POST | `/api/leases[?resource=]` | ask `{"resource","mode"?,"ttl_secs"?,"wait_secs"?,"note"?,"holder"?}`: 202 waiting, 409 busy |
+| GET / DELETE | `/api/leases/waiters/{id}[?wait=]` | collect (202: waiting) / cancel |
+| POST | `/api/leases/{id}/renew` | `{"holder"?,"ttl_secs"?}` |
+| POST | `/api/leases/{id}/release` | `{"holder"?,"break"?}` |
 | GET / POST | `/api/sessions/{id}/queue` | `paused`, `stalled`, `items` (`watch`?), `waiting` (why the next waits; 400 a shell), `watches`; POST `{"text","when"?,"topic"?}` -> 201 |
 | PATCH / DELETE | `/api/sessions/{id}/queue/items/{item}` | PATCH `{"text"?,"when"?}`; 409 one being sent |
 | POST | `/api/sessions/{id}/queue/items/{item}/move` | `{"position"}` (1-based among pending) |
-| POST | `/api/sessions/{id}/queue/items/{item}/editing` | `{"editing"}` -> 204: an editor holds it (renew in 30 s) or lets go |
+| POST | `/api/sessions/{id}/queue/items/{item}/editing` | `{"editing"}` -> 204: an editor holds it (30 s) |
 | POST | `/api/sessions/{id}/queue/pause` | |
 | POST | `/api/sessions/{id}/queue/resume` | also clears a stall |
 | POST | `/api/sessions/{id}/queue/clear` | `{"all"?}`: the delivered history too |

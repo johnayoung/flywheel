@@ -43,7 +43,7 @@ Replaces the hub process **ending no session**: same pids, screens, scrollback, 
 - Binary: `--binary`, else `fw` on `PATH`, else this one; it inherits the old hub's environment. Earlier agents' hooks keep the old binary's path: upgrade in place.
 - Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring; exits on the new hub's ack. Input meanwhile: `nack`ed, resent.
 - Failure before commit thaws the old hub; a stuck new one dies at `--timeout`. Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` restarts instead (sessions restored, not kept); systemd: `systemctl --user restart <unit>`.
-- Agents keep old tools; each marked `stale` (inspector: relaunch). `--relaunch safe-points` (default) kills and resumes each in place, one at a time, once its turn ends with nothing running or typed; its queue waits. Busy, asking, blocked: never interrupted. Never: `--never`, unresumable, ending. A failed resume stays exited; timeline `session.relaunched`.
+- Agents keep old tools; each marked `stale`. `--relaunch safe-points` (default) resumes each in place, one at a time, once its turn ends with nothing running or typed. Busy, asking, blocked: never interrupted. Never: `--never`, unresumable, ending. A failed resume stays exited; timeline `session.relaunched`.
 - Handed-over processes are not children: exits via pidfd, no code. `attach`, `wait` reconnect within 2 min.
 
 ## Agent status
@@ -121,7 +121,7 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
 `fw hub record start|stop SESSION` (or the `rec` pill); `fw hub record get NAME -o demo.cast; asciinema play demo.cast`.
 
-- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after lag, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on its last screen; `dir_cap` deletes the oldest finished.
+- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on its last screen; `dir_cap` deletes the oldest finished.
 - Ends on stop, exit, relaunch, hub stop; `upgrade` continues the file. An active one is not deleted (409).
 - `/replay#<name>`: seek with marker ticks, 0.5-8x, idle gaps cut to 2 s, follows parts.
 

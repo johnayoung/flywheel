@@ -58,6 +58,22 @@ pub const LABEL_TOOL: &str = "label";
 /// The watch tools' names on the server.
 pub const WATCH_TOOL: &str = "watch";
 pub const UNWATCH_TOOL: &str = "unwatch";
+/// The lease tool's name on the server.
+pub const LEASE_TOOL: &str = "lease";
+
+/// What an agent asks the `lease` tool for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeaseArgs {
+    /// acquire, release, or list.
+    pub action: String,
+    pub resource: Option<String>,
+    pub mode: Option<String>,
+    pub ttl_secs: Option<u32>,
+    pub wait_secs: Option<u32>,
+    pub note: Option<String>,
+    /// release: a lease id instead of the resource.
+    pub lease: Option<String>,
+}
 
 /// What an agent asks `start_session` for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -135,6 +151,8 @@ pub trait Host {
     -> Result<String, String>;
     /// Disarm one of the caller's watches (`all`: every one).
     fn unwatch(&self, id: &str) -> Result<String, String>;
+    /// Acquire, release, or list leases for the caller.
+    fn lease(&self, args: &LeaseArgs) -> Result<String, String>;
     /// Keep a proposed handoff for the operator; what to tell the agent.
     fn handoff(
         &self,
@@ -578,6 +596,37 @@ fn unwatch_tool() -> Value {
     })
 }
 
+fn lease_tool() -> Value {
+    json!({
+        "name": LEASE_TOOL,
+        "title": "Lease a shared resource",
+        "description": "Coordinate a shared resource with other sessions (a quiet machine for a \
+                        benchmark, a node only one session may stream at, a test-suite slot). \
+                        action acquire: take resource, shared or exclusive, for ttl_secs; if \
+                        others hold it you wait in line, first come first served, up to \
+                        wait_secs. A wait over 50 s goes on after this call returns: you are \
+                        told your place, and the grant arrives as your next prompt (keep \
+                        working or end your turn). The lease ends when you release it, when \
+                        ttl_secs runs out (acquire again to renew), or when you end. action \
+                        release: give it back (resource, or lease: its id). action list: holders \
+                        and waiters, all or one resource. Release as soon as you are done: \
+                        others may be waiting.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": { "type": "string", "enum": ["acquire", "release", "list"], "description": "acquire, release, or list." },
+                "resource": { "type": "string", "description": "The resource's name: lowercase letters, digits, . _ : / - (cpu:quiet, node:desktop:heavy)." },
+                "mode": { "type": "string", "enum": ["shared", "exclusive"], "description": "Optional: shared (others may share it) or exclusive (default)." },
+                "ttl_secs": { "type": "integer", "minimum": 30, "maximum": 86400, "description": "Optional: how long you may hold it before it must be renewed. Default 1800." },
+                "wait_secs": { "type": "integer", "minimum": 0, "maximum": 86400, "description": "Optional: how long to wait in line. Default 0: answer at once." },
+                "note": { "type": "string", "description": "Optional: what it is for, shown to others." },
+                "lease": { "type": "string", "description": "release: the lease's id instead of the resource." }
+            },
+            "required": ["action"]
+        }
+    })
+}
+
 /// The `label` tool's arguments as a change and its condition.
 fn label_args(
     args: &Value,
@@ -657,6 +706,7 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                 label_tool(),
                 watch_tool(),
                 unwatch_tool(),
+                lease_tool(),
             ] })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str);
@@ -799,6 +849,30 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                     Ok(said) => text_result(said, false),
                     Err(why) => text_result(format!("Not watching: {why}"), true),
                 })
+            } else if name == Some(LEASE_TOOL) {
+                let text = |key: &str| {
+                    Some(arg(key).trim())
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned)
+                };
+                let number = |key: &str| {
+                    args.get(key)
+                        .and_then(Value::as_u64)
+                        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+                };
+                let lease = LeaseArgs {
+                    action: arg("action").trim().to_ascii_lowercase(),
+                    resource: text("resource"),
+                    mode: text("mode"),
+                    ttl_secs: number("ttl_secs"),
+                    wait_secs: number("wait_secs"),
+                    note: text("note"),
+                    lease: text("lease"),
+                };
+                Ok(match host.lease(&lease) {
+                    Ok(said) => text_result(said, false),
+                    Err(why) => text_result(format!("No lease: {why}"), true),
+                })
             } else if name == Some(UNWATCH_TOOL) {
                 Ok(match host.unwatch(arg("id")) {
                     Ok(said) => text_result(said, false),
@@ -939,6 +1013,9 @@ mod tests {
         }
         fn give_session(&self, to: &str, new_owner: &str) -> Result<String, String> {
             Ok(format!("{to} is now {new_owner}'s"))
+        }
+        fn lease(&self, args: &LeaseArgs) -> Result<String, String> {
+            Ok(format!("{} {:?}", args.action, args.resource))
         }
         fn label(
             &self,
@@ -1155,7 +1232,8 @@ mod tests {
                 GIVE_TOOL,
                 LABEL_TOOL,
                 WATCH_TOOL,
-                UNWATCH_TOOL
+                UNWATCH_TOOL,
+                LEASE_TOOL
             ]
         );
         let asked = answer(&json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",

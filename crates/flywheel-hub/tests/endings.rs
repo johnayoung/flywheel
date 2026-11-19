@@ -82,6 +82,7 @@ impl TestHub {
         options.report_command = Some(vec!["/opt/flywheel/bin/fw".into(), "hub".into()]);
         options.claude_config_dir = Some(root.join("claude-config"));
         options.queue_typing_quiet = QUIET;
+        options.lease_block_secs = 1;
         let hub = support::open_hub(options);
         hub.restore_sessions();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -857,6 +858,211 @@ async fn a_newer_message_on_a_topic_supersedes_the_older_one() {
         waiting.iter().any(|t| t.ends_with("capture done: stop")),
         "the lead's message on the same topic stays: {waiting:?}"
     );
+}
+
+/// The hub's lease events (`kind=lease`), oldest first.
+async fn lease_events(hub: &TestHub) -> Vec<String> {
+    hub.get("/api/log?filter=kind%3Dlease&limit=1000").await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leases_wait_in_line_wake_a_long_wait_and_end_with_their_holder() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let w1 = hub.claude("w1", Some(&lead), json!({})).await;
+    let w2 = hub.claude("w2", Some(&lead), json!({})).await;
+    for agent in [&lead, &w1, &w2] {
+        agent.turn().await;
+    }
+    let said = w1
+        .ok(
+            "lease",
+            json!({"action": "acquire", "resource": "cpu:quiet", "note": "bench"}),
+        )
+        .await;
+    assert!(said.starts_with("Granted l"), "{said}");
+    // Not free, and no wait asked: answered at once.
+    let said = w2
+        .ok(
+            "lease",
+            json!({"action": "acquire", "resource": "cpu:quiet"}),
+        )
+        .await;
+    assert!(said.starts_with("Not free: held by l"), "{said}");
+    assert!(said.contains("w1"), "{said}");
+    // A wait inside the call that runs out: out of line.
+    let said = w2
+        .ok(
+            "lease",
+            json!({"action": "acquire", "resource": "cpu:quiet", "wait_secs": 1}),
+        )
+        .await;
+    assert!(said.starts_with("Not free"), "{said}");
+    assert!(
+        hub.get("/api/leases").await["waiters"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // A longer wait goes on after the call: the grant is a prompt.
+    let said = w2
+        .ok(
+            "lease",
+            json!({"action": "acquire", "resource": "cpu:quiet", "wait_secs": 600}),
+        )
+        .await;
+    assert!(said.starts_with("Waiting: #1 in line"), "{said}");
+    // Only the holder (or its owner) releases it.
+    let (error, said) = w2
+        .tool(
+            "lease",
+            json!({"action": "release", "resource": "cpu:quiet"}),
+        )
+        .await;
+    assert!(!error && said.starts_with("Stopped waiting"), "{said}");
+    w2.ok(
+        "lease",
+        json!({"action": "acquire", "resource": "cpu:quiet", "wait_secs": 600}),
+    )
+    .await;
+    let lease = hub.get("/api/leases").await["leases"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (error, said) = w2
+        .tool("lease", json!({"action": "release", "lease": lease}))
+        .await;
+    assert!(error && said.contains("held by"), "{said}");
+    let said = w1
+        .ok(
+            "lease",
+            json!({"action": "release", "resource": "cpu:quiet"}),
+        )
+        .await;
+    assert!(said.starts_with("Released l"), "{said}");
+    w2.typed_has("your lease on cpu:quiet (exclusive) is granted")
+        .await;
+    let list = lead.ok("lease", json!({"action": "list"})).await;
+    assert!(list.contains("cpu:quiet w2 (exclusive"), "{list}");
+
+    // A process holder: the operator's API, ended when its process is.
+    let (status, got) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/leases",
+            Some(json!({"resource": "node:x", "ttl_secs": 60, "holder": {
+                "host": flywheel_hub::machines::host_name(), "pid": 999_999_999u32,
+                "label": "gone"}})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let deadline = Instant::now() + WAIT;
+    while hub.get("/api/leases?resource=node:x").await["leases"]
+        .as_array()
+        .is_some_and(|l| !l.is_empty())
+    {
+        assert!(Instant::now() < deadline, "the dead process's lease stayed");
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // Its holder ends: the lease goes.
+    let (status, _) = hub
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{}", w2.id),
+            None,
+        )
+        .await;
+    assert!(status.is_success());
+    assert!(
+        hub.get("/api/leases").await["leases"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let kinds = lease_events(&hub).await;
+    for want in [
+        "lease.granted",
+        "lease.waiting",
+        "lease.cancelled",
+        "lease.released",
+        "lease.dropped",
+    ] {
+        assert!(kinds.iter().any(|k| k == want), "{want}: {kinds:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leases_and_waits_outlive_a_restart() {
+    let hub = TestHub::start().await;
+    let me = json!({"host": flywheel_hub::machines::host_name(), "pid": std::process::id(),
+                    "label": "test"});
+    let (status, first) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/leases",
+            Some(json!({"resource": "cpu:test-suite", "ttl_secs": 600, "holder": me})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, waiting) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/leases",
+            Some(
+                json!({"resource": "cpu:test-suite", "wait_secs": 600, "holder": {
+                "host": "elsewhere", "pid": 4, "label": "other"}}),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{waiting}");
+    let waiter = waiting["waiter"]["id"].as_str().unwrap().to_owned();
+    let hub = hub.restart(|_| {}).await;
+    let view = hub.get("/api/leases").await;
+    assert_eq!(view["leases"][0]["id"], first["lease"]["id"], "{view}");
+    assert_eq!(view["waiters"][0]["id"], waiter.as_str(), "{view}");
+    // Released by its holder: the wait is granted, collected by its id.
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!(
+                "/api/leases/{}/release",
+                first["lease"]["id"].as_str().unwrap()
+            ),
+            Some(json!({"holder": me})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let got = hub
+        .get(&format!("/api/leases/waiters/{waiter}?wait=1"))
+        .await;
+    assert_eq!(got["state"], "granted", "{got}");
+    assert_eq!(got["lease"]["holder"]["host"], "elsewhere");
+    // Someone else's lease: refused without break, broken with it.
+    let id = got["lease"]["id"].as_str().unwrap();
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/leases/{id}/release"),
+            Some(json!({"holder": me})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, broken) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/leases/{id}/release"),
+            Some(json!({"break": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{broken}");
+    assert!(lease_events(&hub).await.iter().any(|k| k == "lease.broken"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

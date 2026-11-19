@@ -73,6 +73,8 @@ impl Hub {
         let worker = crate::flywheel::worker_run(&record, live.as_ref().and_then(|l| l.pid));
         let pr = self.pr_watch().brief(&record, git.as_ref());
         let start_policy = record.runs_agent().then(|| self.start_policy(&record));
+        let leases = Some(self.leases_of(&record.id))
+            .filter(|v| !v.leases.is_empty() || !v.waiters.is_empty());
         SessionView {
             record,
             live,
@@ -85,6 +87,7 @@ impl Hub {
             worker,
             pr,
             start_policy,
+            leases,
         }
     }
 
@@ -903,6 +906,7 @@ impl Hub {
         let _ = self.store().mark_exited(id, exit);
         if !stopping && !relaunching {
             self.drop_watches_of(id);
+            self.drop_leases_of(id);
         }
         self.record_exit(id);
         if let Some(generation) = generation {
@@ -964,6 +968,7 @@ impl Hub {
         let live = self.live().remove(id);
         drop(store);
         self.drop_watches_of(id);
+        self.drop_leases_of(id);
         self.board().untrack(id);
         self.queue_runtime().forget(id);
         if let Some(record) = ending {

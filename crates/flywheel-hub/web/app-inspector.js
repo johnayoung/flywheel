@@ -95,6 +95,18 @@ const inspector = (() => {
     return endedHow(session);
   }
 
+  // Leases it holds (resource, mode, time left) and waits for.
+  function leasesLine(session) {
+    const view = session.leases;
+    if (!view) return "";
+    const now = Date.now();
+    const mins = (ms) => `${Math.max(0, Math.round(ms / 60000))}m`;
+    const held = (view.leases || []).map((l) =>
+      `${l.resource} ${l.mode === "shared" ? "shared" : "excl"} ${mins(l.expires_at - now)} left`);
+    const waits = (view.waiters || []).map((w) => `waiting ${w.resource} ${mins(now - w.queued_at)}`);
+    return [...held, ...waits].join(", ");
+  }
+
   // Its labels (key=value): the operator's first, then the hub's fw.*
   // keys a row above does not already say (fw.kind: the kind tag;
   // fw.parent: family; fw.change: branch; fw.pr: pr; fw.state: now). A
@@ -153,6 +165,7 @@ const inspector = (() => {
       row("family", familyLine(session)),
       row("review", handoff.pairChip(session)),
       row("queue", promptQueue.rowChip(session)),
+      row("leases", leasesLine(session)),
       row("pr", pullRequests.rowChip(session)),
       row("relaunch", relaunchLine(session)),
       row("end", endLine(session)),

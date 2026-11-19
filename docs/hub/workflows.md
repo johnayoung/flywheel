@@ -146,17 +146,19 @@ Per agent session, prompts the hub types itself, in order ("when done, do X"): `
 **Watches** (`fw hub watch add lead --on 'children state=done|failed' --prompt ...`, `watch`/`unwatch` tools, the Queue drawer): a matching log event queues the prompt, events, and cursors into the owner (queue rules apply).
 Matches within `--window` (3 s), or while that prompt waits, join it (40 listed, the rest counted): 500 children finishing wake a lead once. Its own events never match; it ends with its owner.
 
-**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase"`); a workspace: its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), else refused (why). `--header` names the recipients.
+**Leases** (`lease` tool, `fw hub lease`): shared or exclusive, a ttl, a fair line per resource; a wait past 50 s is granted by prompt. Ends: release, ttl, holder end, `break`.
+
+**Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase"`). Each: sent if its queue would deliver now, else queued, else refused (why). `--header` names the recipients.
 
 ## Activity
 
 What happened, newest first: palette **Activity**, the header pill, `fw hub activity` (24 h: digest, then timeline; `--since last-seen`: since this CLI last looked).
 
 - **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A row opens its object or attaches.
-- **Kept** in `activity.jsonl` (rotated at 1 MiB or weekly, 30 days): kind, ids, names, short facts; never terminal output, prompts, commands, grader output, paths; token-shaped words: `[redacted]`.
+- **Kept** in `activity.jsonl` (1 MiB or weekly, 30 days): kind, ids, names, short facts; never output, prompts, commands, paths; token-shaped words: `[redacted]`.
 - **Event log** (`fw hub tail [-f]`): every telemetry, label, and hub event (the rows above, `status.changed`, `queue.*`, `decision.made`, `flywheel.changed` pointing at the run ledger) in arrival order, 30 days, by opaque cursor; a collector's holds every hub's.
 - **Filters** (FILTER: `state=done|failed children=lead team=web kind=review`): session, ws, state (events that moved a session there), labels (now, or either side of a change), kind or family. `fw hub wait --fleet FILTER` blocks for one.
-- **While you were away** (back after 10+ min): turns done, blocked now, fan-outs graded, commands suggested, cost. **Machines**: asked at once (4 s each), merged, labelled; a silent one: `partial`.
+- **While you were away** (10+ min): turns done, blocked now, fan-outs graded, commands suggested, cost. **Machines**: asked at once (4 s each), merged; silent: `partial`.
 
 ## Fleet and work
 
@@ -169,11 +171,11 @@ Each session's turns, calls, subagents, plan, waits, context, cost, and rate lim
 - **Agent ends**: `end_session` (`graceful`: `final_prompt` at the turn boundary, then the end; `at_rest`); `replace_session` (successor first; only `model` changes). Never mid-flight (queue rest rules, no open call or subagent); not in `wait_minutes` (20, max 120): called off, queue restored.
 - **While ending**: its queue is set aside (senders told); answers name what dies (its processes, not orphans; MCP ones counted) and dirty work (kept); outcome by message.
 - **Who may**: the owner (`owner`, else the opener; ended: its newest successor) at once; else, or an operator-started session, a Needs you **Approve** (`fw hub ends`): succession: no click, the rest one. Not itself; force: `fw hub kill`. `give_session`; `queued_messages` / `cancel_message` (own); `message_session` `priority`, `topic`: replaces your unread one, else starts `superseded: T`.
-- **Labels**: `key=value`, one value per key (`fw hub label`, `label` tool, `--label` filters); `--if V`/`--if-unset` claim. The hub's: `fw.kind`, `fw.parent`, `fw.change` (branch), `fw.pr`, `fw.verified`; `fw.state` = live status. Sidebar: inspector, group-by, `label:` filter.
+- **Labels**: `key=value`, one per key (`fw hub label`, `label` tool, `--label`); `--if V`/`--if-unset` claim. The hub's: `fw.kind`, `fw.parent`, `fw.change` (branch), `fw.pr`, `fw.verified`; `fw.state` = live status. Sidebar: inspector, group-by, `label:` filter.
 - **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (set by `fw worker`); over `_BUDGET`: flagged.
 - **Work** (the header's **work** pill, `fw hub fleet SESSION --turns`): live **map** (stations open; turns replay); plan; per turn a call strip, files, commands, cost, ending. Rows: call or thinking, its age.
-- **Progress** is observed (turns, subagents, calls) and, with a plan, declared: todo or task tools, Codex's plan, or the hub's `report_progress` (Claude gets the hub's tools and a prompt paragraph). Declared: a claim; no plan, no percentage.
-- **Capture**: Claude Code hooks POST to the hub (a process per event only for `SessionStart` before CLI 2.1.322, or under `allowedHttpHookUrls`); its status line: context, cost, 5 h / 7 d gauges (yours still shows). Codex: its rollout.
+- **Progress** is observed (turns, subagents, calls) and declared (todo or task tools, Codex's plan, `report_progress`): a claim; no plan, no percentage.
+- **Capture**: Claude Code hooks POST to the hub (a process per event only for `SessionStart` before CLI 2.1.322, or under `allowedHttpHookUrls`); its status line: context, cost, 5 h / 7 d gauges. Codex: its rollout.
 - **Many hosts**: `[telemetry] upstream = "NAME"` sends this hub's events to that machine (`fw hub machine add`) in batches, held while down; its Fleet lists every hub's sessions.
 
 ## Digests

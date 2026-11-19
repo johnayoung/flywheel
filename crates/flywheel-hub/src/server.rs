@@ -79,6 +79,7 @@ mod fs_api;
 mod handoff_api;
 mod holds_api;
 mod import_api;
+mod leases_api;
 mod listen;
 mod log_api;
 mod notify_api;
@@ -307,6 +308,22 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route(
             "/api/watches/{id}",
             axum::routing::delete(watches_api::remove_watch),
+        )
+        .route(
+            "/api/leases",
+            get(leases_api::list_leases).post(leases_api::acquire_lease),
+        )
+        .route(
+            "/api/leases/waiters/{id}",
+            get(leases_api::collect_wait).delete(leases_api::cancel_wait),
+        )
+        .route(
+            "/api/leases/{id}/renew",
+            axum::routing::post(leases_api::renew_lease),
+        )
+        .route(
+            "/api/leases/{id}/release",
+            axum::routing::post(leases_api::release_lease),
         )
         .route(
             "/api/sessions/{id}",

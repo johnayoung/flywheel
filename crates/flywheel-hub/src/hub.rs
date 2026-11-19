@@ -9,6 +9,7 @@ pub use endings::{AgentEnd, AgentReplace, FORCE_REFUSED};
 pub(crate) use holds::permission_decision;
 pub use relaunches::stale_note;
 mod labels;
+pub mod leases;
 mod links;
 mod log;
 mod relaunches;
@@ -124,6 +125,9 @@ pub struct HubOptions {
     pub login_days: u32,
     /// Agent sessions starting agent sessions (`[agent_starts]`).
     pub agent_starts: crate::config::AgentStarts,
+    /// The longest a lease ask waits inside one call (see
+    /// [`crate::leases::MAX_BLOCK_SECS`]); tests shorten it.
+    pub lease_block_secs: u32,
 }
 
 impl HubOptions {
@@ -160,6 +164,7 @@ impl HubOptions {
             queue_typing_quiet: crate::queue::DEFAULT_TYPING_QUIET,
             login_days: crate::auth::DEFAULT_LOGIN_DAYS,
             agent_starts: crate::config::AgentStarts::default(),
+            lease_block_secs: crate::leases::MAX_BLOCK_SECS,
         }
     }
 }
@@ -394,6 +399,9 @@ pub struct SessionView {
     /// (`start_sessions`), else the hub's `agent_starts.policy`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_policy: Option<crate::state::StartPolicy>,
+    /// The leases it holds and waits for (see [`crate::leases`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leases: Option<leases::LeaseView>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes &T
@@ -597,6 +605,8 @@ pub struct Hub {
     telemetry: Arc<crate::telemetry::Telemetry>,
     /// How far each watch has looked in the log (see [`crate::watch`]).
     watches: crate::watch::Engine,
+    /// Leases on named resources (see [`crate::leases`]).
+    leases: leases::LeaseRuntime,
     /// What the telemetry capture knows beside the store (see
     /// `hub/telemetry.rs`).
     capture: telemetry::Capture,
@@ -708,6 +718,7 @@ impl Hub {
         Ok(Arc::new(Self {
             telemetry,
             watches: crate::watch::Engine::default(),
+            leases: leases::LeaseRuntime::open(&options.state_dir),
             capture: telemetry::Capture::load(&options.state_dir),
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),

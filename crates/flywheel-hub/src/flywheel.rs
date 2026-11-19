@@ -1117,6 +1117,21 @@ impl FlywheelMonitor {
                     }
                 }
                 if let Some(summary) = changed {
+                    // The event log indexes the orchestrator's ledger (the
+                    // project store keeps it): what changed, and where.
+                    if let Some(hub) = hub.upgrade() {
+                        hub.log_hub_event(
+                            "flywheel.changed",
+                            None,
+                            serde_json::json!({
+                                "folder": summary.folder,
+                                "counts": summary.counts,
+                                "live_runs": summary.live_runs,
+                                "alerts": summary.alerts.len(),
+                                "worker_live": summary.worker_live,
+                            }),
+                        );
+                    }
                     let folders = self.folders();
                     if slot.stop.load(Ordering::SeqCst) {
                         break;

@@ -251,6 +251,7 @@ const state = {
   rollup: {}, // workspace id -> most urgent agent status
   events: null, // the hub-wide events socket
   eventsRetry: 0,
+  eventsCursor: "", // where the events socket is in the hub's event log (resume point)
   // The events socket closed for a hub restart (1012); the version it served.
   restarted: false,
   hubVersion: null,

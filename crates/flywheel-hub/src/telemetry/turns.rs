@@ -476,6 +476,7 @@ mod tests {
 
     fn ev(seq: u64, ts: i64, work: &str, what: What) -> Event {
         Event {
+            moved: None,
             host: "h".into(),
             session: "s".into(),
             seq,

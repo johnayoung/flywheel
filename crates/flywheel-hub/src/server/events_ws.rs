@@ -34,6 +34,9 @@ async fn sleep_until(at: Option<Instant>) {
 #[derive(Deserialize)]
 pub(super) struct EventsQuery {
     client: Option<String>,
+    /// The event-log cursor of the last `cursor` this client was sent: it
+    /// resumes from there instead of a snapshot.
+    after: Option<String>,
 }
 
 /// A client id: 1..=64 of `[A-Za-z0-9_-]`.
@@ -86,8 +89,9 @@ pub(super) async fn events_ws(
         gate,
         limit: app.options.send_timeout(),
     };
+    let after = query.after.filter(|a| !a.trim().is_empty());
     ws.max_message_size(64 * 1024)
-        .on_upgrade(move |socket| events_pump(socket, hub, client, ends, flywheel))
+        .on_upgrade(move |socket| events_pump(socket, hub, client, ends, flywheel, after))
 }
 
 #[derive(Deserialize)]
@@ -134,7 +138,7 @@ pub(super) fn text(value: serde_json::Value) -> Message {
     Message::Text(value.to_string().into())
 }
 
-fn snapshot_message(hub: &Hub, client: &str) -> Message {
+fn snapshot_message(hub: &Hub, client: &str, cursor: Option<&str>) -> Message {
     let snapshot = hub.status_snapshot(client);
     text(json!({
         "type": "snapshot",
@@ -143,7 +147,52 @@ fn snapshot_message(hub: &Hub, client: &str) -> Message {
         "graded": snapshot.graded,
         "fanouts": snapshot.fanouts,
         "version": env!("CARGO_PKG_VERSION"),
+        "cursor": cursor,
     }))
+}
+
+/// Most log rows a resume replays; past it, a snapshot is cheaper.
+pub const RESUME_MAX_ROWS: usize = 50_000;
+/// Least time between two `cursor` messages to one client.
+pub const CURSOR_EVERY: Duration = Duration::from_secs(2);
+
+/// The log's end now, as a cursor (`None`: the store does not read).
+fn log_head(hub: &Hub) -> Option<(i64, String)> {
+    hub.telemetry()
+        .log_head()
+        .ok()
+        .map(|head| (head.at, head.encode()))
+}
+
+/// What a client that last saw log row `after` missed: the status and
+/// telemetry of each session with rows since, a re-list, then `resumed`
+/// with the cursor it is now at. `None`: the cursor is not this log's, or
+/// too much happened since (a snapshot is cheaper).
+fn resume_messages(hub: &Hub, client: &str, after: i64) -> Option<(Vec<Message>, i64, String)> {
+    let (at, cursor) = log_head(hub)?;
+    let (sessions, _listed) = hub
+        .telemetry()
+        .sessions_since(after, RESUME_MAX_ROWS)
+        .ok()
+        .flatten()?;
+    let mut messages = Vec::with_capacity(sessions.len() * 2 + 2);
+    for id in &sessions {
+        messages.push(status_message(hub, client, id));
+        if let Some(snapshot) = hub.telemetry().snapshot(id)
+            && let Ok(snapshot) = serde_json::to_value(snapshot)
+        {
+            messages.push(text(json!({ "type": "telemetry", "session": snapshot })));
+        }
+    }
+    // The list itself (names, labels, queues) is one read away.
+    messages.push(sessions_message());
+    messages.push(text(json!({
+        "type": "resumed",
+        "cursor": cursor,
+        "sessions": sessions.len(),
+        "version": env!("CARGO_PKG_VERSION"),
+    })));
+    Some((messages, at, cursor))
 }
 
 fn status_message(hub: &Hub, client: &str, session_id: &str) -> Message {
@@ -302,6 +351,7 @@ async fn events_pump(
     client: String,
     ends: Ends,
     mut flywheel: Option<broadcast::Receiver<crate::flywheel::FlywheelEvent>>,
+    after: Option<String>,
 ) {
     let Ends {
         mut shutdown,
@@ -315,9 +365,31 @@ async fn events_pump(
         hub: Arc::clone(&hub),
         client: client.clone(),
     };
-    if !write_within(limit, socket.send(snapshot_message(&hub, &client))).await {
-        return;
-    }
+    // Where this client is in the log: resumed from its cursor when that
+    // is this log's and not too far back, else a snapshot.
+    let resumed = after
+        .as_deref()
+        .and_then(|raw| hub.log_cursor(Some(raw)).ok().flatten())
+        .and_then(|at| resume_messages(&hub, &client, at));
+    let mut cursor_sent = Instant::now();
+    let mut seen_at: Option<i64> = match resumed {
+        Some((messages, at, _)) => {
+            for message in messages {
+                if !write_within(limit, socket.send(message)).await {
+                    return;
+                }
+            }
+            Some(at)
+        }
+        None => {
+            let head = log_head(&hub);
+            let message = snapshot_message(&hub, &client, head.as_ref().map(|h| h.1.as_str()));
+            if !write_within(limit, socket.send(message)).await {
+                return;
+            }
+            head.map(|h| h.0)
+        }
+    };
     let mut ping = tokio::time::interval(WS_PING_INTERVAL);
     ping.reset();
     let mut recheck = login_recheck();
@@ -334,11 +406,28 @@ async fn events_pump(
                 let Ok(batch) = Batch::drain(first, &mut events) else {
                     break;
                 };
+                // Read before the messages are built: what they say is at
+                // least as new as this.
+                let head = log_head(&hub);
                 let mut sent = true;
                 if batch.lagged {
-                    // What was lost is unknown: everything afresh.
-                    sent = write_within(limit, socket.send(snapshot_message(&hub, &client))).await
-                        && write_within(limit, socket.send(sessions_message())).await;
+                    // What was lost: what the log says changed since the
+                    // last cursor; else everything afresh.
+                    match seen_at.and_then(|at| resume_messages(&hub, &client, at)) {
+                        Some((messages, _, _)) => {
+                            for message in messages {
+                                if !sent {
+                                    break;
+                                }
+                                sent = write_within(limit, socket.send(message)).await;
+                            }
+                        }
+                        None => {
+                            let cursor = head.as_ref().map(|h| h.1.as_str());
+                            sent = write_within(limit, socket.send(snapshot_message(&hub, &client, cursor))).await
+                                && write_within(limit, socket.send(sessions_message())).await;
+                        }
+                    }
                     sessions_sent = Some(Instant::now());
                     sessions_due = false;
                 }
@@ -356,7 +445,18 @@ async fn events_pump(
                     }
                 }
                 if sent && fanout {
-                    sent = write_within(limit, socket.send(snapshot_message(&hub, &client))).await;
+                    let cursor = head.as_ref().map(|h| h.1.as_str());
+                    sent = write_within(limit, socket.send(snapshot_message(&hub, &client, cursor))).await;
+                }
+                // Where this client now is in the log, now and then.
+                if sent
+                    && let Some((at, cursor)) = head
+                    && seen_at != Some(at)
+                    && (batch.lagged || cursor_sent.elapsed() >= CURSOR_EVERY)
+                {
+                    seen_at = Some(at);
+                    cursor_sent = Instant::now();
+                    sent = write_within(limit, socket.send(text(json!({ "type": "cursor", "cursor": cursor })))).await;
                 }
                 if sent && batch.sessions && !batch.lagged {
                     if sessions_sent.is_none_or(|at| at.elapsed() >= SESSIONS_PUSH_INTERVAL) {

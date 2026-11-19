@@ -99,10 +99,27 @@ impl Until {
 #[derive(Debug, clap::Args)]
 pub(crate) struct WaitArgs {
     /// Session id, unique id prefix, or name.
-    session: String,
+    #[arg(required_unless_present = "fleet", conflicts_with = "fleet")]
+    session: Option<String>,
     /// The state to wait for (done/blocked/idle/working: agent sessions).
-    #[arg(long, value_enum)]
-    until: Until,
+    #[arg(
+        long,
+        value_enum,
+        required_unless_present = "fleet",
+        conflicts_with = "fleet"
+    )]
+    until: Option<Until>,
+    /// Wait for the first event in the hub's log that matches FILTER
+    /// (`state=done|blocked children=lead team=web kind=review`, see `fw
+    /// hub tail`); prints it and its cursor (resume with --after).
+    #[arg(long, value_name = "FILTER")]
+    fleet: Option<String>,
+    /// With --fleet: only events after this cursor (default: from now).
+    #[arg(long, value_name = "CURSOR", requires = "fleet")]
+    after: Option<String>,
+    /// With --fleet: print the event as JSON (with its `cursor`).
+    #[arg(long, requires = "fleet")]
+    json: bool,
     /// Give up after this many seconds (exit 124). Default: wait forever.
     #[arg(long, value_name = "SECS")]
     timeout: Option<f64>,
@@ -146,6 +163,16 @@ pub(crate) fn wait(args: &WaitArgs, out: &mut dyn Write, err: &mut dyn Write) ->
             return FAILED;
         }
     };
+    if let Some(filter) = &args.fleet {
+        return wait_fleet(args, filter, timeout, out, err);
+    }
+    let (Some(session), Some(until)) = (args.session.as_deref(), args.until) else {
+        let _ = writeln!(
+            err,
+            "fw hub wait: name a SESSION and --until, or --fleet FILTER"
+        );
+        return FAILED;
+    };
     let started = process_started();
     let start = Instant::now();
     let deadline = timeout.map(|t| start + t);
@@ -159,8 +186,8 @@ pub(crate) fn wait(args: &WaitArgs, out: &mut dyn Write, err: &mut dyn Write) ->
         let started = endpoint.local_info().map(|_| started);
         run(
             &endpoint,
-            &args.session,
-            args.until,
+            session,
+            until,
             Changed {
                 after_baseline: args.changed,
                 started,
@@ -180,6 +207,79 @@ pub(crate) fn wait(args: &WaitArgs, out: &mut dyn Write, err: &mut dyn Write) ->
             TIMED_OUT
         }
         Outcome::Failed(message) => {
+            let _ = writeln!(err, "fw hub wait: {message}");
+            FAILED
+        }
+    }
+}
+
+/// How long one read of the log waits on the hub.
+const FLEET_WAIT_SECS: u64 = 25;
+
+/// `--fleet`: long-poll the hub's log from `--after` (default: its end
+/// now) until an event matches; print it and its cursor.
+fn wait_fleet(
+    args: &WaitArgs,
+    filter: &str,
+    timeout: Option<Duration>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    let found = (|| -> Result<Option<Value>, String> {
+        crate::eventlog::Filter::parse(filter)?;
+        let conn = Endpoint::resolve(&args.endpoint)?
+            .with_timeout(Duration::from_secs(FLEET_WAIT_SECS + 15));
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let mut after = args.after.clone().unwrap_or_else(|| "now".to_owned());
+        loop {
+            let left = deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+            let wait = left.map_or(FLEET_WAIT_SECS, |l| l.as_secs().min(FLEET_WAIT_SECS));
+            let page = conn.blocking_call(
+                "GET",
+                &format!(
+                    "/api/log?filter={}&after={}&limit=1&wait={wait}",
+                    crate::script::query_escape(filter),
+                    crate::script::query_escape(&after)
+                ),
+                None,
+            )?;
+            if let Some(event) = page["events"].as_array().and_then(|e| e.first()) {
+                return Ok(Some(event.clone()));
+            }
+            after = page["cursor"].as_str().unwrap_or(&after).to_owned();
+            if left.is_some_and(|l| l.is_zero() || l.as_secs() == 0) {
+                return Ok(None);
+            }
+        }
+    })();
+    match found {
+        Ok(Some(event)) => {
+            if args.json {
+                let _ = writeln!(out, "{event}");
+            } else {
+                let who = event
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| event["session"].as_str().unwrap_or(""));
+                let moved = event
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .map(|s| format!(" -> {s}"))
+                    .unwrap_or_default();
+                let _ = writeln!(
+                    out,
+                    "{who} {}{moved}\ncursor {}",
+                    event["kind"].as_str().unwrap_or(""),
+                    event["cursor"].as_str().unwrap_or("")
+                );
+            }
+            MET
+        }
+        Ok(None) => {
+            let _ = writeln!(err, "fw hub wait: nothing matched {filter:?} in time");
+            TIMED_OUT
+        }
+        Err(message) => {
             let _ = writeln!(err, "fw hub wait: {message}");
             FAILED
         }

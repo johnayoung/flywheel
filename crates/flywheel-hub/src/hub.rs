@@ -8,6 +8,7 @@ pub use endings::{AgentEnd, AgentReplace, FORCE_REFUSED};
 pub use relaunches::stale_note;
 mod labels;
 mod links;
+mod log;
 mod relaunches;
 mod starts;
 pub use starts::{AgentStart, Opened};
@@ -763,8 +764,50 @@ impl Hub {
     }
 
     pub(crate) fn emit(&self, event: HubEvent) {
+        // The rows the activity journal keeps beside the plugin events go
+        // into the event log on the same path.
+        match &event {
+            HubEvent::Commands { session_id, added } if !added.is_empty() => {
+                self.log_hub_event(
+                    "commands.suggested",
+                    Some(session_id),
+                    serde_json::json!({ "count": added.len() }),
+                );
+            }
+            HubEvent::PluginRan {
+                plugin,
+                trigger,
+                ok,
+            } => self.log_hub_event(
+                "plugin.ran",
+                None,
+                serde_json::json!({ "plugin": plugin, "trigger": trigger, "ok": ok }),
+            ),
+            _ => {}
+        }
         // No subscribers is fine.
         let _ = self.events.send(event);
+    }
+
+    /// Put a hub event into the event log (see [`crate::telemetry::log`]):
+    /// on `session`'s log, else the hub's own.
+    pub(crate) fn log_hub_event(
+        &self,
+        event: &str,
+        session: Option<&str>,
+        data: serde_json::Value,
+    ) {
+        let session = session.unwrap_or(crate::telemetry::HUB_SCOPE);
+        self.telemetry.record(
+            session,
+            vec![crate::telemetry::Draft::new(
+                crate::telemetry::now_ms(),
+                crate::telemetry::What::Hub {
+                    event: event.to_owned(),
+                    data,
+                },
+            )],
+        );
     }
 
     /// Announce a plugin lifecycle event (one of
@@ -781,6 +824,21 @@ impl Hub {
                 recorder.submit(record);
             }
         }
+        // Into the event log: the session it is about named in short (its
+        // full record is a lookup away), the rest as announced.
+        let session = payload
+            .get("session")
+            .and_then(|s| s.get("id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let mut data = payload.clone();
+        if let Some(about) = data.get_mut("session").filter(|s| s.is_object()) {
+            let keep = ["id", "name", "kind", "workspace_id", "workspace"];
+            if let Some(map) = about.as_object_mut() {
+                map.retain(|k, _| keep.contains(&k.as_str()));
+            }
+        }
+        self.log_hub_event(event, session.as_deref(), data);
         self.emit(HubEvent::Lifecycle { event, payload });
     }
 

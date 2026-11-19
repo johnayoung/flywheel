@@ -150,6 +150,11 @@ enum HubCommand {
     /// now, fan-outs graded, commands suggested, cost; then the activity
     /// timeline (this hub and its machines), newest first.
     Activity(crate::activity_cli::ActivityArgs),
+    /// The hub's event log: every telemetry, label, and hub event (status
+    /// changes, reviews, PRs, queues, decisions, ...) in one ordered
+    /// stream, filtered by session, workspace, state, label, or kind, read
+    /// from a cursor; --follow keeps reading. A collector's is the fleet's.
+    Tail(crate::tail_cli::TailArgs),
     /// The fleet board: every agent session's status, what it is doing,
     /// its progress (the plan it declared, else what was observed),
     /// context window, and cost, most urgent first; with SESSION, that
@@ -778,6 +783,7 @@ fn dispatch_verb(
         HubCommand::Commands(args) => crate::commands_cli::run(&args, out, err),
         HubCommand::Search(args) => crate::search_cli::run(&args, out, err),
         HubCommand::Activity(args) => crate::activity_cli::run(&args, out, err),
+        HubCommand::Tail(args) => crate::tail_cli::tail(&args, out, err),
         HubCommand::Fleet(args) => crate::fleet_cli::fleet(&args, out, err),
         HubCommand::Inbox(args) => crate::fleet_cli::inbox(&args, out, err),
         HubCommand::Digest(args) => crate::digest_cli::run(&args, out, err),

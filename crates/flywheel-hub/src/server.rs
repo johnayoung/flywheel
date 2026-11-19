@@ -79,6 +79,7 @@ mod fs_api;
 mod handoff_api;
 mod import_api;
 mod listen;
+mod log_api;
 mod notify_api;
 mod perms_api;
 mod plugins_api;
@@ -296,6 +297,7 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             get(get_layout).put(put_layout),
         )
         .route("/api/sessions", get(list_sessions).post(create_session))
+        .route("/api/log", get(log_api::read_log))
         .route(
             "/api/sessions/{id}",
             get(get_session)

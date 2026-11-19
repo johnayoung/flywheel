@@ -269,8 +269,11 @@ function stopPolling() {
 function connectEvents() {
   clearTimeout(state.eventsTimer);
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  // Back from a drop: resume from the hub's event log where this page
+  // last was (the hub sends what changed since, or a snapshot).
+  const after = state.eventsCursor ? `&after=${encodeURIComponent(state.eventsCursor)}` : "";
   const socket = new WebSocket(
-    `${scheme}://${window.location.host}/api/events?client=${encodeURIComponent(CLIENT_ID)}`,
+    `${scheme}://${window.location.host}/api/events?client=${encodeURIComponent(CLIENT_ID)}${after}`,
   );
   state.events = socket;
   socket.onopen = () => {
@@ -289,7 +292,16 @@ function connectEvents() {
     } catch (_) {
       return;
     }
+    if (message.type === "cursor" || message.type === "resumed") {
+      state.eventsCursor = message.cursor || state.eventsCursor;
+      if (message.type === "resumed") {
+        noteVersion(message);
+        renderStatus();
+      }
+      return;
+    }
     if (message.type === "snapshot") {
+      if (message.cursor) state.eventsCursor = message.cursor;
       loadTelemetry();
       // This hub's statuses; the machines' stay (they have their own
       // sockets).
@@ -298,13 +310,7 @@ function connectEvents() {
       for (const id of Object.keys(state.rollup)) if (local(id)) delete state.rollup[id];
       Object.assign(state.agent, message.sessions || {});
       Object.assign(state.rollup, message.workspaces || {});
-      if (state.restarted) {
-        // Back after a live handoff (`fw hub upgrade`, close 1012).
-        state.restarted = false;
-        const was = state.hubVersion && state.hubVersion !== message.version ? ` (was ${state.hubVersion})` : "";
-        commands.toast(`Hub upgraded to flywheel ${message.version}${was}; every session kept running.`, { timeout: 5000 });
-      }
-      if (message.version) state.hubVersion = message.version;
+      noteVersion(message);
       renderStatus();
     } else if (message.type === "status") {
       applyStatus(message);
@@ -339,6 +345,17 @@ function connectEvents() {
     const delay = Math.min(10000, 500 * 2 ** Math.min(state.eventsRetry - 1, 5));
     state.eventsTimer = setTimeout(connectEvents, delay);
   };
+}
+
+// The hub's version, from a snapshot or a resume; back after a live
+// handoff (`fw hub upgrade`, close 1012), said once.
+function noteVersion(message) {
+  if (state.restarted) {
+    state.restarted = false;
+    const was = state.hubVersion && state.hubVersion !== message.version ? ` (was ${state.hubVersion})` : "";
+    commands.toast(`Hub upgraded to flywheel ${message.version}${was}; every session kept running.`, { timeout: 5000 });
+  }
+  if (message.version) state.hubVersion = message.version;
 }
 
 // A status push (this hub's or a machine's).

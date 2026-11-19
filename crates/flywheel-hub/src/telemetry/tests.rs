@@ -638,6 +638,7 @@ fn the_fleet_lists_what_needs_a_person_first_and_counts_by_status() {
     let mut events = Vec::new();
     let mut push = |host: &str, session: &str, seq: u64, ts: i64, what: What| {
         events.push(Event {
+            moved: None,
             host: host.to_owned(),
             session: session.to_owned(),
             seq,
@@ -861,6 +862,10 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             set: [("team".to_owned(), Some("web".to_owned()))].into(),
             before: [("team".to_owned(), None)].into(),
         },
+        What::Hub {
+            event: "review.merged".into(),
+            data: json!({"branch": "x"}),
+        },
     ];
     let kinds: Vec<&str> = whats.iter().map(What::kind).collect();
     assert_eq!(kinds, event::KINDS);
@@ -956,6 +961,165 @@ fn labels_filter_the_fleet_and_a_session_only_labelled_is_not_on_it() {
     assert!(page.sessions.iter().all(|s| s.session != "shell"));
 }
 
+fn hub_event(event: &str, data: serde_json::Value, ts: i64) -> Draft {
+    Draft::new(
+        ts,
+        What::Hub {
+            event: event.into(),
+            data,
+        },
+    )
+}
+
+#[test]
+fn hub_events_never_take_a_telemetry_kind() {
+    for event in crate::plugins::EVENTS {
+        assert!(!event::KINDS.contains(event), "{event}");
+    }
+}
+
+#[test]
+fn the_log_reads_every_kind_by_cursor_and_filter() {
+    use super::log::{Cursor, LogQuery};
+    let dir = tempfile::tempdir().unwrap();
+    let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+    let t = now_ms();
+    let epoch = telemetry.log_epoch().unwrap();
+    let start = telemetry.log_head().unwrap();
+    assert_eq!(start.epoch, epoch);
+    for (session, team) in [("a", "web"), ("b", "api")] {
+        telemetry.record(session, vec![labels_changed(&[("team", Some(team))], t)]);
+        telemetry.record(
+            session,
+            claude::hook("UserPromptSubmit", &json!({"prompt": "go"}), t + 1),
+        );
+    }
+    telemetry.record("a", claude::hook("Stop", &json!({}), t + 2));
+    telemetry.record(
+        "b",
+        vec![hub_event("review.merged", json!({"branch": "b1"}), t + 3)],
+    );
+    telemetry.record(
+        HUB_SCOPE,
+        vec![hub_event("decision.made", json!({"kind": "gate"}), t + 4)],
+    );
+    let read = |query: LogQuery| telemetry.log(&query).unwrap();
+    let all = read(LogQuery {
+        after: Some(start.at),
+        limit: 100,
+        ..LogQuery::default()
+    });
+    let kinds: Vec<&str> = all.events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(
+        kinds.contains(&"review.merged") && kinds.contains(&"decision.made"),
+        "{kinds:?}"
+    );
+    assert!(!all.more);
+    assert_eq!(all.cursor, telemetry.log_head().unwrap().encode());
+    // A state filter matches the moves, not every row: a's turn started
+    // (working) and finished (done); b's started.
+    let moves = read(LogQuery {
+        after: Some(start.at),
+        states: vec!["done".into(), "working".into()],
+        limit: 100,
+        ..LogQuery::default()
+    });
+    let moved: Vec<(&str, &str)> = moves
+        .events
+        .iter()
+        .map(|e| (e.session.as_str(), e.state.as_deref().unwrap()))
+        .collect();
+    assert_eq!(moved, [("a", "working"), ("b", "working"), ("a", "done")]);
+    // Families, labels, sessions.
+    let review = read(LogQuery {
+        after: Some(start.at),
+        kinds: vec!["review".into()],
+        limit: 10,
+        ..LogQuery::default()
+    });
+    assert_eq!(review.events.len(), 1);
+    assert_eq!(review.events[0].body["branch"], "b1");
+    let web = read(LogQuery {
+        after: Some(start.at),
+        labels: crate::labels::parse_terms(&["team=web"]).unwrap(),
+        limit: 100,
+        ..LogQuery::default()
+    });
+    assert!(
+        web.events.iter().all(|e| e.session == "a"),
+        "{:?}",
+        web.events
+    );
+    let done = read(LogQuery {
+        after: Some(start.at),
+        labels: crate::labels::parse_terms(&["fw.state=done"]).unwrap(),
+        limit: 100,
+        ..LogQuery::default()
+    });
+    assert_eq!(done.events.len(), 1);
+    // Paging: one at a time, each cursor going on where the last stopped.
+    let mut cursor = start.at;
+    let mut seen = 0;
+    loop {
+        let page = read(LogQuery {
+            after: Some(cursor),
+            limit: 1,
+            ..LogQuery::default()
+        });
+        seen += page.events.len();
+        cursor = Cursor::parse(&page.cursor, epoch).unwrap().at;
+        if !page.more {
+            break;
+        }
+    }
+    assert_eq!(seen, all.events.len());
+    // The newest N, without a cursor.
+    let newest = read(LogQuery {
+        limit: 2,
+        ..LogQuery::default()
+    });
+    assert_eq!(newest.events.len(), 2);
+    assert_eq!(newest.events[1].kind, "decision.made");
+    // A label change matches a filter on either side of it.
+    let mark = telemetry.log_head().unwrap().at;
+    telemetry.record(
+        "a",
+        vec![Draft::new(
+            t + 5,
+            What::LabelsChanged {
+                set: [("team".to_owned(), Some("api".to_owned()))].into(),
+                before: [("team".to_owned(), Some("web".to_owned()))].into(),
+            },
+        )],
+    );
+    let left = read(LogQuery {
+        after: Some(mark),
+        labels: crate::labels::parse_terms(&["team=web"]).unwrap(),
+        limit: 10,
+        ..LogQuery::default()
+    });
+    assert_eq!(
+        left.events.len(),
+        1,
+        "the change that took a out of team web"
+    );
+    // The hub's own events reach the agent's timeline never; the fleet
+    // has no `hub` session.
+    let own = telemetry.events(None, "b", 0, 100, false).unwrap();
+    assert!(own.iter().all(|e| !matches!(e.what, What::Hub { .. })));
+    let fleet = telemetry
+        .fleet(&FleetQuery {
+            limit: 100,
+            ..FleetQuery::default()
+        })
+        .unwrap();
+    assert!(fleet.sessions.iter().all(|s| s.session != HUB_SCOPE));
+    // Which sessions moved since a cursor (the events socket's resume).
+    let (since, _) = telemetry.sessions_since(mark, 1000).unwrap().unwrap();
+    assert_eq!(since, ["a"]);
+    assert!(telemetry.sessions_since(start.at, 2).unwrap().is_none());
+}
+
 /// The collector's side at the scale the design is for: ten thousand
 /// sessions on a hundred hosts, delivered in forwarder-sized batches in
 /// the order hosts would interleave them.
@@ -967,6 +1131,7 @@ fn ten_thousand_sessions_on_a_hundred_hosts_fold_and_list() {
     let collector = Telemetry::open(dir.path(), OTHER).unwrap();
     let start = now_ms() - 60_000;
     let event = |host: usize, session: usize, seq: u64, what: What| Event {
+        moved: None,
         host: format!("{host:032x}"),
         session: format!("s{session}"),
         seq,
@@ -1095,6 +1260,7 @@ fn a_new_session_arriving_as_one_large_batch_is_on_the_board_at_once() {
     let start = now_ms() - 1_000_000;
     let events: Vec<Event> = (1..=924u64)
         .map(|seq| Event {
+            moved: None,
             host: HOST.to_owned(),
             session: "big".to_owned(),
             seq,

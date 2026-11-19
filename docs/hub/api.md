@@ -194,7 +194,8 @@ Behaviour: [hub-workflows](workflows.md#permissions). `?folder=` (absolute, in a
 | DELETE | `/api/machines/{name}` | also asks it to revoke the peer |
 | POST | `/api/machines/{name}/test` | ok, latency, its `whoami` or error |
 | any | `/m/{name}/{*rest}` | proxy to machine `name`'s API and sockets |
-| GET | `/api/events[?client=ID]` | events WebSocket (below) |
+| GET | `/api/events[?client=ID&after=CURSOR]` | events WebSocket (below) |
+| GET | `/api/log` | `after`, `filter`, `session`, `ws`, `state`, `kind`, `label`, `host`, `limit`, `wait` (s) -> `events` (`cursor`, `kind`, `state`?, `body`), `cursor`, `more`; 400 foreign cursor |
 
 ## Pages (no `/api`)
 
@@ -272,15 +273,16 @@ Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`
 Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?,prompt?}`), `failed`, `compacting`, `working`, `background`, `done`, `idle`, `ended`; `links` (captured `cc-<id>`: `captured`, `batch`, `budget_usd`).
 
 Kinds: `session.started`, `session.continued`, `session.end_requested`, `session.end_cancelled`, `session.ended`, `session.replaced`, `session.owner_changed`, `session.relaunched` (`why`, `error`?), `queue.cancelled`, `session.finished`,
-`turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`, `labels.changed` (`set`, `before`).
+`turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`, `labels.changed` (`set`, `before`), `hub` (stored and logged under the plugin event's name).
 
 ## Events WebSocket
 
-`/api/events[?client=ID]` (as `client` above; default its own). Server sends `{"type",...}`:
+`/api/events[?client=ID&after=CURSOR]` (as `client` above; default its own). `after`: only sessions with log rows since, then `resumed` (a foreign or 50k-rows-old cursor: a snapshot). Server sends `{"type",...}`:
 
 | `type` | Other fields | When |
 |---|---|---|
-| `snapshot` | `"sessions":{id:status},"workspaces":{id:rollup},"graded":[id],"fanouts":{ws:n}` | on connect, falling behind, a fan-out change |
+| `snapshot` | `"sessions":{id:status},"workspaces":{id:rollup},"graded":[id],"fanouts":{ws:n},"cursor"` | on connect, a fan-out change |
+| `resumed` / `cursor` | `"cursor"` | a resume or catch-up after falling behind is done / every 2 s at most |
 | `status` | `"session_id","status"\|null,"workspace_id","workspace_status"` | per change, as this client sees it |
 | `sessions` | | sessions, workspaces, viewers changed: re-list (250 ms apart at most) |
 | `usage` | the session's usage | changed |

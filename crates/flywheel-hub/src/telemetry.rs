@@ -33,6 +33,7 @@ pub mod event;
 pub mod forward;
 pub mod insights;
 pub mod lanes;
+pub mod log;
 pub mod mcp;
 pub mod reduce;
 pub mod shape;
@@ -68,6 +69,9 @@ const PRUNE_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 const EVICT_AFTER_MS: i64 = 6 * 60 * 60 * 1000;
 /// Most events one batch from another hub may carry.
 pub const BATCH_MAX_EVENTS: usize = 5000;
+/// The session the log files a hub event under when it is about no
+/// session (a gate decision, a digest): never on the fleet board.
+pub const HUB_SCOPE: &str = "hub";
 
 type Key = (String, String);
 type Announce = dyn Fn(Snapshot) + Send + Sync;
@@ -107,6 +111,9 @@ struct Inner {
     gate: Mutex<()>,
     stop: AtomicBool,
     wake: (Mutex<()>, Condvar),
+    /// The log's last committed row (see [`log`]): waiters on the log
+    /// wake when it moves.
+    head: tokio::sync::watch::Sender<i64>,
 }
 
 /// The hub's telemetry: the store, the live states, and the writer.
@@ -126,6 +133,7 @@ impl Telemetry {
         let path = state_dir.join(store::DB_FILE);
         let db = Store::open(&path)?;
         let read = Store::open(&path)?;
+        let head = tokio::sync::watch::Sender::new(read.head()?);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -141,6 +149,7 @@ impl Telemetry {
             gate: Mutex::new(()),
             stop: AtomicBool::new(false),
             wake: (Mutex::new(()), Condvar::new()),
+            head,
         });
         let writer = {
             let inner = inner.clone();
@@ -180,6 +189,7 @@ impl Telemetry {
                 continue;
             }
             let mut event = Event {
+                moved: None,
                 host: key.0.clone(),
                 session: key.1.clone(),
                 seq: state.seq + 1,
@@ -189,7 +199,7 @@ impl Telemetry {
                 item: None,
                 what: draft.what,
             };
-            state.apply(&mut event);
+            apply_noting_moves(state, &mut event);
             events.push(event);
         }
         if events.is_empty() {
@@ -244,7 +254,7 @@ impl Telemetry {
                 if event.seq <= state.seq {
                     continue;
                 }
-                state.apply(&mut event);
+                apply_noting_moves(state, &mut event);
                 dirty.insert(key);
                 fresh.push(event);
             }
@@ -392,6 +402,41 @@ impl Telemetry {
         read.outbox(&self.inner.host, after, limit)
     }
 
+    /// One read of the event log (see [`log`]).
+    pub fn log(&self, query: &log::LogQuery) -> Result<log::LogPage, StoreError> {
+        self.flush();
+        lock(&self.inner.read).log(query)
+    }
+
+    /// The log's epoch (what its cursors carry).
+    pub fn log_epoch(&self) -> Result<u32, StoreError> {
+        lock(&self.inner.read).epoch()
+    }
+
+    /// The cursor at the log's end now.
+    pub fn log_head(&self) -> Result<log::Cursor, StoreError> {
+        Ok(log::Cursor {
+            epoch: self.log_epoch()?,
+            at: *self.inner.head.borrow(),
+        })
+    }
+
+    /// Wakes when the log's end moves (a commit added rows).
+    pub fn log_moves(&self) -> tokio::sync::watch::Receiver<i64> {
+        self.inner.head.subscribe()
+    }
+
+    /// This hub's sessions with log rows after `after` (`None`: more than
+    /// `max` rows since), and whether the session list itself changed.
+    pub fn sessions_since(
+        &self,
+        after: i64,
+        max: usize,
+    ) -> Result<Option<(Vec<String>, bool)>, StoreError> {
+        self.flush();
+        lock(&self.inner.read).sessions_since(&self.inner.host, after, max)
+    }
+
     /// Move the forwarder's cursor `name` (its batch was accepted).
     pub fn advance(&self, name: &str, at: i64) -> Result<(), StoreError> {
         lock(&self.inner.db).set_cursor(name, at)
@@ -416,6 +461,19 @@ impl Telemetry {
 impl Drop for Telemetry {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Fold `event` into `state`, noting on it the status it moved the
+/// session to (the log's state filter): both the hub that saw it and a
+/// collector derive the same.
+fn apply_noting_moves(state: &mut SessionState, event: &mut Event) {
+    let before = state.status().0;
+    let observed = state.observed();
+    state.apply(event);
+    let after = state.status().0;
+    if state.observed() && (after != before || !observed) {
+        event.moved = Some(after.to_owned());
     }
 }
 
@@ -509,8 +567,18 @@ impl Inner {
         if pending.events.is_empty() && states.is_empty() {
             return Vec::new();
         }
-        if let Err(e) = lock(&self.db).write(&pending.events, &states) {
-            eprintln!("fw hub: {e}");
+        {
+            let mut db = lock(&self.db);
+            if let Err(e) = db.write(&pending.events, &states) {
+                eprintln!("fw hub: {e}");
+            }
+            match db.head() {
+                Ok(head) => {
+                    self.head
+                        .send_if_modified(|at| std::mem::replace(at, head) != head);
+                }
+                Err(e) => eprintln!("fw hub: {e}"),
+            }
         }
         states
             .iter()

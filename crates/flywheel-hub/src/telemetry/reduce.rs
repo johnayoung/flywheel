@@ -950,6 +950,8 @@ impl SessionState {
                     self.compacting = None;
                 }
             }
+            // What the hub announced: the log's, not the agent's state.
+            What::Hub { .. } => {}
             What::LabelsChanged { set, .. } => {
                 for (key, value) in set {
                     match value {

@@ -17,7 +17,7 @@ use std::path::Path;
 /// The store's file in the state dir.
 pub const DB_FILE: &str = "telemetry.db";
 /// The schema this build reads and writes (`PRAGMA user_version`).
-const SCHEMA: i64 = 4;
+const SCHEMA: i64 = 5;
 /// Most sessions one fleet page returns.
 pub const FLEET_PAGE_MAX: usize = 1000;
 /// Most events one page returns.
@@ -251,6 +251,27 @@ impl Store {
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS session_labels_value ON session_labels (key, value);",
         )?;
+        // Schema 5: the event log (see `super::log`): the status an event
+        // moved its session to, and indexes for the log's filters.
+        let has_state: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('events') WHERE name = 'state'",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_state {
+            conn.execute_batch("ALTER TABLE events ADD COLUMN state TEXT")?;
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS events_session_id ON events (session, id);
+             CREATE INDEX IF NOT EXISTS events_state ON events (state, id) WHERE state IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS events_kind ON events (kind, id);",
+        )?;
+        // The log's epoch: cursors from another store (a wiped one) are
+        // told apart, never read as this one's rows.
+        conn.execute(
+            "INSERT OR IGNORE INTO cursors (name, at) VALUES ('log.epoch', ABS(RANDOM() % 4294967295) + 1)",
+            [],
+        )?;
         let mut store = Self { conn };
         if found < 3 {
             store.backfill_tool_use()?;
@@ -264,8 +285,8 @@ impl Store {
         let tx = self.conn.transaction()?;
         {
             let mut insert = tx.prepare_cached(
-                "INSERT OR IGNORE INTO events (host, session, seq, ts, kind, agent, work, item, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT OR IGNORE INTO events (host, session, seq, ts, kind, agent, work, item, body, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             let projects: std::collections::HashMap<(&str, &str), String> = states
                 .iter()
@@ -291,11 +312,12 @@ impl Store {
                     event.session,
                     event.seq as i64,
                     event.ts,
-                    event.what.kind(),
+                    event.what.stored_kind(),
                     event.agent,
                     event.work,
                     event.item,
-                    event.what.body().to_string(),
+                    event.what.stored_body().to_string(),
+                    event.moved,
                 ])?;
                 if new == 1
                     && let What::LabelsChanged { set, .. } = &event.what
@@ -379,6 +401,15 @@ impl Store {
         }
     }
 
+    /// The log's last row (0: none).
+    pub fn head(&self) -> Result<i64, StoreError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })?)
+    }
+
     /// The highest `seq` kept for a session (0: none): where a session
     /// whose state was never saved goes on numbering.
     pub fn max_seq(&self, host: &str, session: &str) -> Result<u64, StoreError> {
@@ -415,10 +446,15 @@ impl Store {
         let order = if newest { "DESC" } else { "ASC" };
         let mut query = self.conn.prepare_cached(&format!(
             "SELECT host, session, seq, ts, kind, agent, work, item, body FROM events
-             WHERE host = ?1 AND session = ?2 AND seq > ?3 ORDER BY seq {order} LIMIT ?4"
+             WHERE host = ?1 AND session = ?2 AND seq > ?3
+               AND kind IN (SELECT value FROM json_each(?5))
+             ORDER BY seq {order} LIMIT ?4"
         ))?;
         let mut events: Vec<Event> = query
-            .query_map(params![host, session, after as i64, limit], read_event)?
+            .query_map(
+                params![host, session, after as i64, limit, own_kinds()],
+                read_event,
+            )?
             .filter_map(|row| row.ok().flatten())
             .collect();
         if newest {
@@ -438,10 +474,15 @@ impl Store {
     ) -> Result<Vec<Event>, StoreError> {
         let mut query = self.conn.prepare_cached(
             "SELECT host, session, seq, ts, kind, agent, work, item, body FROM events
-             WHERE host = ?1 AND session = ?2 AND ts >= ?3 ORDER BY seq DESC LIMIT ?4",
+             WHERE host = ?1 AND session = ?2 AND ts >= ?3
+               AND kind IN (SELECT value FROM json_each(?5))
+             ORDER BY seq DESC LIMIT ?4",
         )?;
         let mut events: Vec<Event> = query
-            .query_map(params![host, session, from, cap as i64], read_event)?
+            .query_map(
+                params![host, session, from, cap as i64, own_kinds()],
+                read_event,
+            )?
             .filter_map(|row| row.ok().flatten())
             .collect();
         events.reverse();
@@ -851,18 +892,25 @@ fn rank(status: &str) -> i64 {
     }
 }
 
-fn read_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Event>> {
+/// The kinds an agent's own timeline reads (every telemetry kind; hub
+/// events are the log's), as the JSON array the queries take.
+fn own_kinds() -> &'static str {
+    static KINDS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    KINDS.get_or_init(|| serde_json::to_string(super::event::KINDS).unwrap_or_default())
+}
+
+pub(super) fn read_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Event>> {
     read_event_at(row, 0)
 }
 
 /// An event from a row whose event columns start at `at`; `None` for a
 /// kind this build does not know (a newer hub's event on a collector).
-fn read_event_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Option<Event>> {
+pub(super) fn read_event_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Option<Event>> {
     let kind: String = row.get(at + 4)?;
     let body: String = row.get(at + 8)?;
     let Some(what) = serde_json::from_str(&body)
         .ok()
-        .and_then(|body| What::from_parts(&kind, body))
+        .and_then(|body| What::from_stored(&kind, body))
     else {
         return Ok(None);
     };
@@ -875,5 +923,6 @@ fn read_event_at(row: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Option<
         work: row.get(at + 6)?,
         item: row.get(at + 7)?,
         what,
+        moved: None,
     }))
 }

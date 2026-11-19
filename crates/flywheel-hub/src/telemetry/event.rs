@@ -31,6 +31,11 @@ pub struct Event {
     pub item: Option<String>,
     #[serde(flatten)]
     pub what: What,
+    /// The session's fleet status when this event changed it (the
+    /// reducer's, so a collector derives the same): what the event log's
+    /// state filter matches. Never sent: each hub folds its own.
+    #[serde(skip)]
+    pub moved: Option<String>,
 }
 
 /// An observation before the session's log numbers it.
@@ -425,6 +430,15 @@ pub enum What {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger: Option<String>,
     },
+    /// Something the hub announced (a plugin lifecycle event such as
+    /// `review.merged`, `queue.delivered`, `decision.made`): stored under
+    /// its own name as the kind, with its payload as the body.
+    #[serde(rename = "hub")]
+    Hub {
+        event: String,
+        #[serde(default)]
+        data: serde_json::Value,
+    },
     /// The session's labels changed (see [`crate::labels`]): each key
     /// set to its new value (`null`: unset), and what it held before.
     #[serde(rename = "labels.changed")]
@@ -470,13 +484,44 @@ impl What {
             Self::RateLimited { .. } => "rate.limited",
             Self::Compact { .. } => "compact",
             Self::LabelsChanged { .. } => "labels.changed",
+            Self::Hub { .. } => "hub",
         }
     }
 
     /// A record the hub keeps about a session (its labels), not
     /// something its agent did.
     pub fn is_hub_record(&self) -> bool {
-        matches!(self, Self::LabelsChanged { .. })
+        matches!(self, Self::LabelsChanged { .. } | Self::Hub { .. })
+    }
+
+    /// The kind the store keeps: a hub event's own name, else
+    /// [`What::kind`].
+    pub fn stored_kind(&self) -> &str {
+        match self {
+            Self::Hub { event, .. } => event,
+            other => other.kind(),
+        }
+    }
+
+    /// The body the store keeps beside [`What::stored_kind`].
+    pub fn stored_body(&self) -> serde_json::Value {
+        match self {
+            Self::Hub { data, .. } => data.clone(),
+            other => other.body(),
+        }
+    }
+
+    /// Back from what the store keeps: a kind this build does not know
+    /// as its own is a hub event's name.
+    pub fn from_stored(kind: &str, body: serde_json::Value) -> Option<Self> {
+        if KINDS.contains(&kind) {
+            Self::from_parts(kind, body)
+        } else {
+            Some(Self::Hub {
+                event: kind.to_owned(),
+                data: body,
+            })
+        }
     }
 
     /// The body alone, as stored beside the kind.
@@ -522,4 +567,5 @@ pub const KINDS: &[&str] = &[
     "rate.limited",
     "compact",
     "labels.changed",
+    "hub",
 ];

@@ -587,6 +587,18 @@ async fn a_hub_forwards_its_events_to_its_collector() {
     // Its creation labels, then what the agent did.
     assert_eq!(events["events"].as_array().unwrap().len(), 6);
     assert_eq!(events["events"][0]["kind"], "labels.changed");
+    // The collector's event log is the fleet's: the edge's hub events
+    // (its session's creation) are in it, under the edge's host.
+    let log = collector
+        .get(&format!(
+            "/api/log?after=start&host={edge_host}&kind=session.created&limit=10"
+        ))
+        .await;
+    let created = log["events"].as_array().unwrap();
+    assert!(
+        created.iter().any(|e| e["session"] == sid.as_str()),
+        "{log}"
+    );
     // Its own board is unchanged, and it lists two hubs' worth at most.
     let own = collector.get("/api/telemetry/fleet?host=local").await;
     assert_eq!(own["total"], 0);

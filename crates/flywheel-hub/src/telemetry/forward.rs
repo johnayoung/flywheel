@@ -176,6 +176,7 @@ mod tests {
     #[test]
     fn a_batch_round_trips_and_is_bounded() {
         let event = |seq| Event {
+            moved: None,
             host: "a".repeat(32),
             session: "s1".to_owned(),
             seq,

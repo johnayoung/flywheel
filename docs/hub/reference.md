@@ -67,6 +67,7 @@ fw hub template rm WS NAME {where}
 fw hub send SESSION TEXT|- [--enter] [--raw] {where}
 fw hub read SESSION [--source visible|recent] [--lines N] [--json] {where}
 fw hub wait SESSION --until done|blocked|idle|working|exit [--timeout SECS] [--changed] {where}
+fw hub wait --fleet FILTER [--after CURSOR] [--json] [--timeout SECS] {where}  # first match; prints its cursor
 fw hub attach [SESSION] [--prefix C-b] [--no-status] {where}
 fw hub kill SESSION [--rm] [--remove-worktree] [--force] {where}  # --rm forgets
 fw hub relaunch SESSION [--never|--auto] {where}
@@ -80,6 +81,7 @@ Agent output:
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N] {where}
 fw hub search QUERY [--regex] [--case] [--session S] [--workspace W] [--kind K]... [--source scrollback|transcript|commands]... [--limit N] [--per-session N] [--offset N] [--json] {where}  # 1: no hits
 fw hub activity [--since AGE|TIME|last-seen] [--until T] [--workspace W] [--session S] [--kind K]... [--limit N] [--json] {where}
+fw hub tail [--session S]... [--ws W]... [--state S]... [--label K[=V]]... [--kind K]... [--after CURSOR|now] [--follow|-f] [--limit N] [--host HUB_ID] [--json] {where}
 fw hub fleet [SESSION [--turns [N]]] [--status STATUS]... [--label K[=V]]... [--hours N] [--host HUB_ID] [--limit N] [--batch KEY | --all | --lanes] [--json] {where}
 fw hub inbox [--hours N] [--host HUB_ID] [--json] {where}  # pending handoffs, blocked and asking sessions, with how to answer
 fw hub continue SESSION [--handoff ID] [--name NAME] [--prompt TEXT|-] [--json] {where}  # a linked successor (default: the only pending handoff)

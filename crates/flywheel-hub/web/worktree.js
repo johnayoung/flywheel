@@ -423,6 +423,7 @@ window.FwHubWorktree = function (ctx) {
   // tracks (GET /api/changes?untracked=1, read at most once a minute):
   // a row each, Close for a change, Adopt for an untracked one.
   let changesSeen = { at: 0, view: null, asking: false };
+  const worktreesOpen = new Set();
   function readChanges(rerender, now) {
     if (changesSeen.asking || (!now && Date.now() - changesSeen.at < 60000)) return;
     changesSeen.asking = true;
@@ -480,12 +481,32 @@ window.FwHubWorktree = function (ctx) {
             },
           })
           : el("span", { className: "muted", textContent: "check out a branch to adopt" }));
+    // One quiet folded line, like the list's Resting: never a row per
+    // worktree until opened.
+    const open = worktreesOpen.has(workspace.id);
+    const words = [
+      changes.length ? `${changes.length} adopted` : "",
+      untracked.length ? `${untracked.length} not tracked` : "",
+    ].filter(Boolean).join(", ");
     return el("div", { className: "ws-changes" },
-      changes.length ? el("ul", { className: "ws-change-list", "aria-label": "Adopted worktrees" }, changes.map(changeRow)) : null,
-      untracked.length
-        ? el("details", { className: "ws-untracked" },
-          el("summary", { textContent: `Not tracked (${untracked.length})` }),
-          el("ul", { className: "ws-change-list" }, untracked.map(untrackedRow)))
+      el("button", {
+        type: "button",
+        className: `list-group fold ws-worktrees${open ? " open" : ""}`,
+        "aria-expanded": String(open),
+        title: open ? "Fold the worktrees" : "Worktrees made outside the hub: adopt or close them",
+        onclick: () => {
+          if (open) worktreesOpen.delete(workspace.id);
+          else worktreesOpen.add(workspace.id);
+          rerender();
+        },
+      },
+      el("span", { className: "chev" }, icon("chev")),
+      el("span", { className: "list-group-name", textContent: "Worktrees" }),
+      el("span", { className: "list-group-n", textContent: String(changes.length + untracked.length) }),
+      open ? null : el("span", { className: "list-group-names", textContent: words })),
+      open
+        ? el("ul", { className: "ws-change-list", "aria-label": "Worktrees" },
+          changes.map(changeRow), untracked.map(untrackedRow))
         : null);
   }
 

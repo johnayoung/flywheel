@@ -185,15 +185,29 @@ try {
   const plain = path.join(tmp, "repo.worktrees", "plain-work");
   git(repo, "worktree", "add", "-q", "-b", "plain-work", plain, "main");
   await page.evaluate((id) => pickScope(id), ws.id);
-  await page.waitForSelector(".ws-untracked summary", { timeout: 70000 });
-  check(/Not tracked \(1\)/.test(await page.locator(".ws-untracked summary").textContent()), "the workspace list counts the untracked worktree");
-  await page.click(".ws-untracked summary");
-  await page.locator(".ws-untracked button", { hasText: "adopt" }).click();
+  await page.waitForSelector(".ws-worktrees", { timeout: 70000 });
+  const folded = await page.evaluate(() => ({
+    line: document.querySelector(".ws-worktrees").textContent,
+    rows: document.querySelectorAll(".ws-change").length,
+    height: document.querySelector(".ws-worktrees").getBoundingClientRect().height,
+  }));
+  check(/1 not tracked/.test(folded.line) && folded.rows === 0 && folded.height < 40, `one quiet folded line, no row per worktree (${JSON.stringify(folded)})`);
+  await page.click(".ws-worktrees");
+  await page.locator(".ws-change button", { hasText: "adopt" }).click();
   await page.waitForSelector(".ws-change-list .ws-change[data-change]", { timeout: 15000 });
+  check(await page.locator(".ws-worktrees").getAttribute("aria-expanded") === "true", "it stays open, the worktree now adopted");
   const adopted = await api("GET", "/api/changes");
   check(adopted.changes.length === 1 && adopted.changes[0].worktree.branch === "plain-work", "adopted from the list");
   check(adopted.changes[0].base_from === "reflog", `its base came from its reflog (${adopted.changes[0].base_from})`);
   await page.screenshot({ path: path.join(out, "adopted.png") });
+  // Close reads its dry-run checklist: untracked work refuses remove.
+  fs.writeFileSync(path.join(plain, "scratch.md"), "keep me");
+  await page.locator(".ws-change[data-change] button", { hasText: "close" }).click();
+  await page.waitForSelector("#dlg-close[open]", { timeout: 5000 });
+  await page.waitForFunction(() => !document.querySelector("#cl-ok").disabled, null, { timeout: 15000 });
+  check(await page.locator("#cl-wt-remove").isDisabled(), "remove is refused while the adopted worktree holds untracked work");
+  await page.click("#dlg-close button[value=cancel]");
+  fs.rmSync(path.join(plain, "scratch.md"));
   await page.locator(".ws-change[data-change] button", { hasText: "close" }).click();
   await page.waitForSelector("#dlg-close[open]", { timeout: 5000 });
   await page.waitForFunction(() => !document.querySelector("#cl-ok").disabled, null, { timeout: 15000 });

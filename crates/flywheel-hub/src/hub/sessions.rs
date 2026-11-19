@@ -168,6 +168,13 @@ impl Hub {
             (kind, None) => vec![self.agent_program(kind)?.to_string_lossy().into_owned()],
         };
         let name = request.name.as_deref().map(validate_name).transpose()?;
+        let mut first_labels = crate::labels::Labels::new();
+        let given: crate::labels::Change = request
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .collect();
+        crate::labels::apply(&mut first_labels, &given, None, false)?;
         let opened_by = match request.opened_by.as_deref().map(str::trim) {
             None | Some("") => None,
             // An opener on another hub (`fw hub new --url` from inside a
@@ -257,6 +264,7 @@ impl Hub {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            labels: first_labels,
         };
         if record
             .launch
@@ -313,13 +321,14 @@ impl Hub {
     /// Spawn and record a new session.
     pub(crate) fn launch(
         self: &Arc<Self>,
-        record: SessionRecord,
+        mut record: SessionRecord,
         cols: Option<u16>,
         rows: Option<u16>,
         resume: bool,
         prompt: Option<&str>,
     ) -> Result<SessionView, HubError> {
         let id = record.id.clone();
+        super::labels::seed(&mut record);
         // Insert the live entry and the record under the store lock so the
         // exit callback (which also takes it) cannot observe a session that
         // is live but unrecorded.
@@ -340,6 +349,13 @@ impl Hub {
         }
         self.live().insert(id, session);
         drop(store);
+        let set: crate::labels::Change = record
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .collect();
+        let before = set.keys().map(|k| (k.clone(), None)).collect();
+        self.record_labels(&record.id, set, before);
         self.git.nudge(badge_key(&record));
         self.emit(HubEvent::Sessions);
         if let Some(session) = self.event_session(&record.id) {
@@ -592,6 +608,7 @@ impl Hub {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            labels: Default::default(),
         };
         Ok((self.launch(record, cols, rows, false, None)?, true))
     }

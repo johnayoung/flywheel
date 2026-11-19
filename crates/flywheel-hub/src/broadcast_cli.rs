@@ -14,6 +14,10 @@ pub(crate) struct BroadcastArgs {
     /// (`-`: read stdin).
     #[arg(required = true, num_args = 1.., value_name = "TARGET... TEXT")]
     words: Vec<String>,
+    /// Also every running agent session whose labels hold KEY or
+    /// KEY=V1|V2 (repeatable, all must hold); TARGETs are then optional.
+    #[arg(long = "label", value_name = "KEY[=VALUE]")]
+    labels: Vec<String>,
     /// Open the prompt with a line naming every session it went to.
     #[arg(long)]
     header: bool,
@@ -32,7 +36,7 @@ pub(crate) fn broadcast(args: &BroadcastArgs, out: &mut dyn Write, err: &mut dyn
 }
 
 fn run(args: &BroadcastArgs, out: &mut dyn Write) -> Result<i32, String> {
-    let (text, targets) = split(&args.words)?;
+    let (text, targets) = split(&args.words, !args.labels.is_empty())?;
     let text = if text == "-" {
         let mut text = String::new();
         std::io::stdin()
@@ -42,11 +46,18 @@ fn run(args: &BroadcastArgs, out: &mut dyn Write) -> Result<i32, String> {
     } else {
         text.clone()
     };
+    let terms = crate::labels::parse_terms(&args.labels).map_err(|e| e.to_string())?;
+    let label = (!terms.is_empty()).then(|| crate::labels::query_value(&terms));
     let conn = Endpoint::resolve(&args.endpoint)?;
     let done = conn.blocking_call(
         "POST",
         "/api/broadcast",
-        Some(&json!({ "targets": targets, "text": text, "header": args.header })),
+        Some(&json!({
+            "targets": targets,
+            "text": text,
+            "header": args.header,
+            "label": label,
+        })),
     )?;
     if args.json {
         print_json(out, &done);
@@ -57,11 +68,12 @@ fn run(args: &BroadcastArgs, out: &mut dyn Write) -> Result<i32, String> {
     Ok(i32::from(refused > 0))
 }
 
-/// The targets and the text (the last word).
-fn split(words: &[String]) -> Result<(&String, &[String]), String> {
+/// The targets and the text (the last word); `labelled`: targets may be
+/// none.
+fn split(words: &[String], labelled: bool) -> Result<(&String, &[String]), String> {
     match words.split_last() {
-        Some((text, targets)) if !targets.is_empty() => Ok((text, targets)),
-        _ => Err("name the sessions or workspaces, then the prompt".into()),
+        Some((text, targets)) if labelled || !targets.is_empty() => Ok((text, targets)),
+        _ => Err("name the sessions or workspaces (or --label), then the prompt".into()),
     }
 }
 
@@ -125,9 +137,9 @@ mod tests {
         assert_eq!(args.words, ["api", "-"]);
         assert!(args.json);
         // A target and the text, at least.
-        assert!(split(&parse(&["only-text"]).unwrap().words).is_err());
+        assert!(split(&parse(&["only-text"]).unwrap().words, false).is_err());
         let words = parse(&["a", "b", "go"]).unwrap().words;
-        let (text, targets) = split(&words).unwrap();
+        let (text, targets) = split(&words, false).unwrap();
         assert_eq!((text.as_str(), targets), ("go", &words[..2]));
     }
 }

@@ -53,6 +53,8 @@ pub const QUEUED_TOOL: &str = "queued_messages";
 pub const CANCEL_TOOL: &str = "cancel_message";
 /// The give tool's name on the server.
 pub const GIVE_TOOL: &str = "give_session";
+/// The label tool's name on the server.
+pub const LABEL_TOOL: &str = "label";
 
 /// What an agent asks `start_session` for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -109,6 +111,14 @@ pub trait Host {
     fn cancel_message(&self, to: &str, item: Option<&str>) -> Result<String, String>;
     /// Give control of `to` to `new_owner`.
     fn give_session(&self, to: &str, new_owner: &str) -> Result<String, String>;
+    /// Change the labels of `to` (the caller when `None`) when `cond`
+    /// holds; what to tell the agent.
+    fn label(
+        &self,
+        to: Option<&str>,
+        change: &crate::labels::Change,
+        cond: Option<&crate::labels::Cond>,
+    ) -> Result<String, String>;
     /// Keep a proposed handoff for the operator; what to tell the agent.
     fn handoff(
         &self,
@@ -460,6 +470,65 @@ fn give_tool() -> Value {
     })
 }
 
+fn label_tool() -> Value {
+    json!({
+        "name": LABEL_TOOL,
+        "title": "Label a session",
+        "description": "Set or remove key=value labels on a session (yours by default): one value \
+                        per key, used to group and filter sessions (fw hub ls --label team=web) \
+                        and to route watches and broadcasts. Keys are lowercase words; fw.* keys \
+                        are the hub's. if: change only when the one key now holds that value; \
+                        if_unset: only when it holds none (a claim: the first one wins).",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": { "type": "string", "description": "Optional: the session's name or id. Default: you." },
+                "set": {
+                    "type": "object",
+                    "description": "Each key to its new value, or null to remove it.",
+                    "additionalProperties": { "type": ["string", "null"] }
+                },
+                "if": { "type": "string", "description": "Optional: change only if the one key holds this value now." },
+                "if_unset": { "type": "boolean", "description": "Optional: change only if the one key holds no value now." }
+            },
+            "required": ["set"]
+        }
+    })
+}
+
+/// The `label` tool's arguments as a change and its condition.
+fn label_args(
+    args: &Value,
+) -> Result<(crate::labels::Change, Option<crate::labels::Cond>), String> {
+    let set = args
+        .get("set")
+        .and_then(Value::as_object)
+        .ok_or("give set: an object of key to value (null removes it)")?;
+    let mut change = crate::labels::Change::new();
+    for (key, value) in set {
+        let value = match value {
+            Value::Null => None,
+            Value::String(v) if v.is_empty() => None,
+            Value::String(v) => Some(v.clone()),
+            other => Some(other.to_string()),
+        };
+        change.insert(key.clone(), value);
+    }
+    if change.is_empty() {
+        return Err("set names no label".into());
+    }
+    let cond = match (
+        args.get("if").and_then(Value::as_str),
+        args.get("if_unset").and_then(Value::as_bool) == Some(true),
+    ) {
+        (Some(_), true) => return Err("give if or if_unset, not both".into()),
+        (Some(value), false) => Some(crate::labels::Cond::Is(value.to_owned())),
+        (None, true) => Some(crate::labels::Cond::Unset),
+        (None, false) => None,
+    };
+    Ok((change, cond))
+}
+
 /// `end_session`'s mode: graceful (also when not given) or at_rest;
 /// force is refused by name.
 fn end_mode(raw: &str) -> Result<EndMode, String> {
@@ -503,6 +572,7 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                 queued_tool(),
                 cancel_tool(),
                 give_tool(),
+                label_tool(),
             ] })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str);
@@ -622,6 +692,15 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                 Ok(match host.cancel_message(arg("to"), item) {
                     Ok(said) => text_result(said, false),
                     Err(why) => text_result(format!("Not cancelled: {why}"), true),
+                })
+            } else if name == Some(LABEL_TOOL) {
+                let to = Some(arg("to")).filter(|v| !v.trim().is_empty());
+                Ok(match label_args(args) {
+                    Err(why) => text_result(format!("Not labelled: {why}"), true),
+                    Ok((change, cond)) => match host.label(to, &change, cond.as_ref()) {
+                        Ok(said) => text_result(said, false),
+                        Err(why) => text_result(format!("Not labelled: {why}"), true),
+                    },
                 })
             } else if name == Some(GIVE_TOOL) {
                 Ok(match host.give_session(arg("to"), arg("owner")) {
@@ -744,6 +823,14 @@ mod tests {
         }
         fn give_session(&self, to: &str, new_owner: &str) -> Result<String, String> {
             Ok(format!("{to} is now {new_owner}'s"))
+        }
+        fn label(
+            &self,
+            to: Option<&str>,
+            change: &crate::labels::Change,
+            cond: Option<&crate::labels::Cond>,
+        ) -> Result<String, String> {
+            Ok(format!("{to:?} {change:?} {cond:?}"))
         }
         fn handoff(
             &self,
@@ -904,6 +991,17 @@ mod tests {
             answer(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"})),
             None
         );
+        let labelled = answer(&json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+            "params": {"name": LABEL_TOOL, "arguments": {"set": {"team": "web", "old": null}, "if_unset": true}}}))
+        .unwrap();
+        assert_eq!(
+            labelled["result"]["content"][0]["text"],
+            "None {\"old\": None, \"team\": Some(\"web\")} Some(Unset)"
+        );
+        let refused = answer(&json!({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+            "params": {"name": LABEL_TOOL, "arguments": {"set": {}}}}))
+        .unwrap();
+        assert_eq!(refused["result"]["isError"], true);
         let list = answer(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         assert_eq!(list["result"]["tools"][0]["name"], TOOL);
         assert_eq!(list["result"]["tools"][1]["name"], ASK_TOOL);
@@ -927,7 +1025,8 @@ mod tests {
                 REPLACE_TOOL,
                 QUEUED_TOOL,
                 CANCEL_TOOL,
-                GIVE_TOOL
+                GIVE_TOOL,
+                LABEL_TOOL
             ]
         );
         let asked = answer(&json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",

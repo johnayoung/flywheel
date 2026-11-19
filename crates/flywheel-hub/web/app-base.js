@@ -232,6 +232,7 @@ const state = {
   // one workspace's id (its rail tile).
   scope: store.get("scope", "all"),
   restingOpen: store.get("resting-open", false), // the All list's Resting group unfolded
+  groupBy: store.get("group-by", ""), // the All list grouped by this label key ("": by activity)
   listHidden: store.get("list-hidden", false), // desktop: the rail alone
   scopeFollows: null, // the attached session the list last followed
   repoChoice: store.get("repo-choice", {}), // workspace id -> repo

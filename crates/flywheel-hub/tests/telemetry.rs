@@ -327,6 +327,8 @@ async fn hooks_posted_to_the_hub_drive_status_and_are_recorded() {
     assert_eq!(
         kinds,
         [
+            // The labels it was created with (fw.kind).
+            "labels.changed",
             "session.started",
             "turn.started",
             "tool.started",
@@ -359,15 +361,15 @@ async fn hooks_posted_to_the_hub_drive_status_and_are_recorded() {
         "{turns}"
     );
     // The call ran under the plan item that was active.
-    assert_eq!(events[5]["item"], "p1");
-    assert_eq!(events[5]["work"], "t1");
+    assert_eq!(events[6]["item"], "p1");
+    assert_eq!(events[6]["work"], "t1");
     let after = hub
         .get(&format!(
-            "/api/telemetry/sessions/{sid}/events?after=6&limit=1"
+            "/api/telemetry/sessions/{sid}/events?after=7&limit=1"
         ))
         .await;
     assert_eq!(after["events"].as_array().unwrap().len(), 1);
-    assert_eq!(after["events"][0]["seq"], 7);
+    assert_eq!(after["events"][0]["seq"], 8);
 
     // The status line's input arrives over the report socket (it is a
     // command) and is telemetry alone.
@@ -582,7 +584,9 @@ async fn a_hub_forwards_its_events_to_its_collector() {
             "/api/telemetry/sessions/{sid}/events?host={edge_host}"
         ))
         .await;
-    assert_eq!(events["events"].as_array().unwrap().len(), 5);
+    // Its creation labels, then what the agent did.
+    assert_eq!(events["events"].as_array().unwrap().len(), 6);
+    assert_eq!(events["events"][0]["kind"], "labels.changed");
     // Its own board is unchanged, and it lists two hubs' worth at most.
     let own = collector.get("/api/telemetry/fleet?host=local").await;
     assert_eq!(own["total"], 0);

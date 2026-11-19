@@ -293,6 +293,18 @@ pub struct SessionState {
     /// Numbers plan items declared without ids.
     #[serde(default)]
     next_item: u32,
+    /// Its labels (see [`crate::labels`]), as `labels.changed` set them.
+    #[serde(default)]
+    labels: crate::labels::Labels,
+    /// Something its agent did was observed: a session the hub only
+    /// labelled or announced (a shell) is in the log, never on the fleet
+    /// board. States saved before this existed were all observed.
+    #[serde(default = "observed")]
+    observed: bool,
+}
+
+fn observed() -> bool {
+    true
 }
 
 /// The running tool call a snapshot names.
@@ -411,6 +423,9 @@ pub struct Snapshot {
     /// its status still reads as finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacting: Option<i64>,
+    /// Its labels (`fw.state` is the status above, never stored).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: crate::labels::Labels,
 }
 
 /// A session in full: its snapshot, work tree, and plans.
@@ -484,6 +499,9 @@ impl SessionState {
     /// Fold one event in, naming the work and plan items it belongs to.
     pub fn apply(&mut self, event: &mut Event) {
         let ts = event.ts;
+        if !event.what.is_hub_record() {
+            self.observed = true;
+        }
         self.seq = self.seq.max(event.seq);
         self.last_ts = self.last_ts.max(ts);
         self.started.get_or_insert(ts);
@@ -932,7 +950,31 @@ impl SessionState {
                     self.compacting = None;
                 }
             }
+            What::LabelsChanged { set, .. } => {
+                for (key, value) in set {
+                    match value {
+                        Some(value) => self.labels.insert(key.clone(), value.clone()),
+                        None => self.labels.remove(key),
+                    };
+                }
+            }
         }
+    }
+
+    /// Whether its agent was ever observed (see the field).
+    pub fn observed(&self) -> bool {
+        self.observed
+    }
+
+    /// Its labels.
+    pub fn labels(&self) -> &crate::labels::Labels {
+        &self.labels
+    }
+
+    /// Put back labels known from elsewhere (a state rebuilt for a
+    /// session whose saved state the fleet never kept).
+    pub fn restore_labels(&mut self, labels: crate::labels::Labels) {
+        self.labels = labels;
     }
 
     fn close_wait(&mut self, at: i64) {
@@ -1356,6 +1398,7 @@ impl SessionState {
             awaiting_ms: self.awaiting_ms,
             compactions: self.compactions,
             compacting: self.compacting,
+            labels: self.labels.clone(),
         }
     }
 

@@ -31,7 +31,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 
 | Method | Path | |
 |---|---|---|
-| GET / POST | `/api/sessions[?workspace_id=]` | list / create `{"workspace_id","folder"?,"kind"?,"command"?:[argv],"worktree"?:{"task","base"?},"prompt"?,...}`; an agent's start under `ask`: 202 `{"waiting","opened_by"}` |
+| GET / POST | `/api/sessions[?workspace_id=&label=]` | list / create `{"workspace_id","folder"?,"kind"?,"command"?:[argv],"worktree"?:{"task","base"?},"prompt"?,"labels"?,...}`; an agent's start under `ask`: 202 `{"waiting","opened_by"}` |
 | GET / PATCH / DELETE | `/api/sessions/{id}` | PATCH `{"name"}`; DELETE kills, forgets (204; `?remove_worktree=true[&force=true]`) |
 | POST | `/api/sessions/{id}/kill` | 202: SIGHUP (3 s: SIGKILL), kept |
 | POST | `/api/sessions/{id}/relaunch` | `{"cols"?,"rows"?}`: an ended session, same id; 409 running. `{"never"}`: opt out of upgrade relaunches |
@@ -41,6 +41,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | POST / DELETE | `/api/sessions/{id}/starts/{start}` | start `{"prompt"?,"name"?}` (201) / decline (204) a waiting agent start |
 | POST / DELETE | `/api/sessions/{id}/ends/{end}` | approve (200) / decline (204) an agent's end |
 | DELETE | `/api/sessions/{id}/ending` | call off its end |
+| GET / PATCH | `/api/sessions/{id}/labels` | `{"labels","state"}` / `{"labels":{k:v\|null},"if"?\|"if_unset"?}`; 409 condition failed |
 | PUT | `/api/sessions/{id}/start-policy` | `{"policy"}`: `ask` `allowed` `off` `default` |
 | GET | `/api/sessions/{id}/screen[?source=visible\|recent&lines=N]` | rendered text: `visible` rows, or `recent` lines (1..100000, 100); cursor, modes |
 | GET | `/api/sessions/{id}/explain` | as `fw hub explain --json` |
@@ -48,7 +49,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | POST | `/api/sessions/{id}/paste` | `{"text","run"?}`: `/input` with `paste`, trailing newlines dropped, 1 MiB; 409 unsafe multi-line |
 | GET | `/api/sessions/{id}/commands[?limit=N&all=true]` | newest first (shell unless `all`; `limit` 1..500, 50) |
 | GET | `/api/sessions/{id}/replies[?limit=N]` | newest first (`limit` 1..100, 20): `text`, `blocks`, `match_key` |
-| GET | `/api/sessions/{id}/file?path=` | a file the session names (relative to its cwd, worktree, workspace folders; absolute; `~/`), resolved (symlinks too) under those; `{"path","size","text","truncated"}` (first 2 MiB); 403 outside, 404 none, 415 binary |
+| GET | `/api/sessions/{id}/file?path=` | a file under its cwd, worktree, or workspace folders (relative, absolute, `~/`; symlinks resolved): `{"path","size","text","truncated"}` (2 MiB); 403 outside, 404, 415 binary |
 | POST | `/api/sessions/{id}/files/check` | `{"paths":[...]}` (64): `{"files":[{"path","size"}\|null]}`, in order |
 | GET | `/api/sessions/{id}/transcript[?around=N&before=N&after=N]` | messages, paged (30, max 200); 400 a shell |
 | POST | `/api/sessions/{id}/companion` | `{"text"?,"run"?}`: companion shell (201 / 200 running), `text` pasted when ready |
@@ -64,7 +65,7 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET | `/api/search?q=[&regex=&case=&ws=&session=&kind=&source=&limit=&per_session=&offset=]` | hits grouped per session; `truncated`, `partial` ([hub-internals](internals.md#search)) |
 
 A session lists `agent` (`state`, `detail`, `since`, AskUserQuestion's `questions`), `agent_session_id`, `launch`, `usage`, `worktree`, `git`, `pr`, `queue`, `recording`, `live` (`epoch`), pairings, `continues`, `opened_by`, `handoffs` (`id`, `name`?, `reason`?, `prompt`, `created_at`), `start_sessions`, `start_policy` (in force), `start_requests`, `starts_made`, `stale`, `never_relaunch`,
-`owner`, `ending`, `ended`, `end_requests`; queue items: `from`, `priority`.
+`owner`, `ending`, `ended`, `end_requests`, `labels`; queue items: `from`, `priority`. `label`: `k=v\|w,k2` (all hold).
 
 ## Review, handoff, peer review
 
@@ -107,7 +108,7 @@ A session lists `agent` (`state`, `detail`, `since`, AskUserQuestion's `question
 | POST | `/api/fanouts/{id}/cleanup` | `{"candidates"?,"remove_worktrees"?,"force"?,"dry_run"?}` |
 | POST | `/api/fanouts/{id}/promote` | `{"task_id"?,"goal"?,...}`, two-step (plan: path, contents); 409 exists / changed |
 | GET | `/api/flywheel` | per adopted folder: counts, `plans`, alerts, live runs, worker |
-| GET | `/api/flywheel/panel?folder=` | panel (`queued_in`: scoped worker runs it; `relandable`, `waiting_on`; `landing` = `fw status --json`'s; `pauses` = `fw pauses --json`; live `last_tool`, `plans[].tasks`); 404 unadopted |
+| GET | `/api/flywheel/panel?folder=` | `queued_in`, `relandable`, `waiting_on`, `landing` (`fw status --json`), `pauses` (`fw pauses --json`), `last_tool`, `plans[].tasks`; 404 unadopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next","attempts"}` (poll `since=next`); 503 read waits |
 | GET | `/api/flywheel/history?folder=&task=` | every run; attempts' `outcome`/`error`/`checks` (= `fw show`); task `goal`, `checks` (held-out: names) |
 | GET | `/api/flywheel/task?folder=&task=` | task as a fan-out seed |
@@ -254,7 +255,7 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/telemetry/fleet[?status=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `host` (this hub's id), `sessions` (urgent first), `total`, `counts`, `hosts`; `hours=0`: any age; `rollup=1`: captured runs as `batches` (counts, cost, budget); `batch=KEY`: its runs |
+| GET | `/api/telemetry/fleet[?status=&label=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `host` (this hub's id), `sessions` (urgent first), `total`, `counts`, `hosts`; `hours=0`: any age; `rollup=1`: captured runs as `batches` (counts, cost, budget); `batch=KEY`: its runs |
 | GET | `/api/telemetry/lanes[?host=&hours=]` | `lanes` (`id`, `count`, `groups` of `cards`), `total`, `placed`, `runs` |
 | GET | `/api/telemetry/insights[?host=&hours=&project=]` | `insights`: `projects`, `time`, `waiting`, `failing`, `rewritten`, `context` |
 | GET | `/api/telemetry/capture/hooks` | what `capture install` writes |
@@ -271,7 +272,7 @@ Event: `{"host","session","seq","ts","agent"?,"work"?,"item"?,"kind","body"}` (`
 Snapshot `status`: `blocked`, `asking` (`ask`: `{kind,text,command?,options?,prompt?}`), `failed`, `compacting`, `working`, `background`, `done`, `idle`, `ended`; `links` (captured `cc-<id>`: `captured`, `batch`, `budget_usd`).
 
 Kinds: `session.started`, `session.continued`, `session.end_requested`, `session.end_cancelled`, `session.ended`, `session.replaced`, `session.owner_changed`, `session.relaunched` (`why`, `error`?), `queue.cancelled`, `session.finished`,
-`turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`.
+`turn.started`, `turn.finished` (`ending`), `turn.failed`, `tool.started`, `tool.finished`, `ask`, `wait.started`, `subagent.started`, `subagent.finished`, `plan.set`, `plan.item`, `context.usage`, `usage`, `rate.limit`, `rate.limited`, `compact`, `labels.changed` (`set`, `before`).
 
 ## Events WebSocket
 
@@ -315,7 +316,7 @@ Manifest: [hub-reference](reference.md#plugintoml).
 | `session.created` | - |
 | `session.exited` | `exit`, `hub_stopping` (`fw hub stop` hung it up) |
 | `session.removed` | - |
-| `status.changed` | `status`, `previous`, `detail`; each finished turn: one `done` (`seen`: watched). Deprecated (gone in 0.8): `turn_finished`, true on the turn's status (watched: the `idle` after it) |
+| `status.changed` | `status`, `previous`, `detail`; each finished turn: one `done` (`seen`: watched). Deprecated (0.8): `turn_finished` |
 | `review.committed` | `dir`, `head`, `branch`, `base`, `url`, `summary` (every `review.*`) |
 | `review.pushed` | as above |
 | `review.pr_opened` | as above |
@@ -324,7 +325,7 @@ Manifest: [hub-reference](reference.md#plugintoml).
 | `review.requested` | `author`, `reviewer`, `reused`, `kind`, `base` |
 | `broadcast.sent` | `broadcast` (`id`, `text` to 2000 chars, `counts`), `workspace` (one, or null), `targets[]` (`session`, `result`, `why`) |
 | `handoff.sent` | `from`, `to`, `source` (findings: `review_findings`), `bytes`, `truncated`; target's hub |
-| `fanout.finished` | `fanout` once settled (no agent working, nothing queued): candidates best first with `verdict`, `rank`, `tail` (last 400 stderr chars of the first failing grader); no `session` |
+| `fanout.finished` | `fanout` once settled: candidates best first with `verdict`, `rank`, `tail` (first failing grader's last 400 stderr chars); no `session` |
 | `queue.delivered` | `item` (`text` to 2000 chars), `pending` |
 | `queue.stalled` | `reason`, `item` (the next, or null), `pending` |
 | `share.created` | `share` (no credential) |
@@ -358,4 +359,4 @@ Behaviour: [hub-workflows](workflows.md#prompt-queue). `{item}`: id prefix (4+) 
 | POST | `/api/sessions/{id}/queue/pause` | |
 | POST | `/api/sessions/{id}/queue/resume` | also clears a stall |
 | POST | `/api/sessions/{id}/queue/clear` | `{"all"?}`: the delivered history too |
-| POST | `/api/broadcast` | `{"targets","text","header"?,"recipients"?}` (header names) -> `counts`, `results[]` (`result` `sent`/`queued`/`refused`, `why`) |
+| POST | `/api/broadcast` | `{"targets","label"?,"text","header"?,"recipients"?}` (header names) -> `counts`, `results[]` (`result` `sent`/`queued`/`refused`, `why`) |

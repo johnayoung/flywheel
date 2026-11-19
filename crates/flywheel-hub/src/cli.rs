@@ -203,6 +203,10 @@ enum HubCommand {
     /// target's result (sent, queued, refused and why). Exit 1 when any
     /// was refused.
     Broadcast(crate::broadcast_cli::BroadcastArgs),
+    /// A session's labels (key=value, one value per key): printed, or set
+    /// and removed; --if VALUE / --if-unset change only when the key holds
+    /// that value / none (exit 1 otherwise). fw.* keys are the hub's.
+    Label(crate::label_cli::LabelArgs),
     /// A session's pull request: state, review decision, mergeability,
     /// and CI checks (from gh, cached by the hub); log prints a failing
     /// check's log, fix-ci asks the agent to fix it (queued while it
@@ -817,6 +821,7 @@ fn dispatch_verb(
         HubCommand::AskReview(args) => crate::agent_handoff_cli::ask_review(&args, out, err),
         HubCommand::Queue(args) => crate::queue_cli::main(&args, out, err),
         HubCommand::Broadcast(args) => crate::broadcast_cli::broadcast(&args, out, err),
+        HubCommand::Label(args) => crate::label_cli::label(&args, out, err),
         HubCommand::Pr(args) => crate::pr_cli::main(&args, out, err),
         HubCommand::Autopilot(args) => crate::autopilot_cli::main(&args, out, err),
     }

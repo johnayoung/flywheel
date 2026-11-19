@@ -857,6 +857,10 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             phase: "pre".into(),
             trigger: None,
         },
+        What::LabelsChanged {
+            set: [("team".to_owned(), Some("web".to_owned()))].into(),
+            before: [("team".to_owned(), None)].into(),
+        },
     ];
     let kinds: Vec<&str> = whats.iter().map(What::kind).collect();
     assert_eq!(kinds, event::KINDS);
@@ -866,6 +870,90 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             Some(&what)
         );
     }
+}
+
+fn labels_changed(set: &[(&str, Option<&str>)], ts: i64) -> Draft {
+    Draft::new(
+        ts,
+        What::LabelsChanged {
+            set: set
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.map(str::to_owned)))
+                .collect(),
+            before: Default::default(),
+        },
+    )
+}
+
+#[test]
+fn labels_filter_the_fleet_and_a_session_only_labelled_is_not_on_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+    // Recent times: a reopened store prunes what is older than 30 days.
+    let t = now_ms();
+    for (session, team) in [("a", "web"), ("b", "api"), ("c", "web")] {
+        telemetry.record(
+            session,
+            vec![labels_changed(&[("team", Some(team))], t + 1_000)],
+        );
+        telemetry.record(
+            session,
+            claude::hook("UserPromptSubmit", &json!({"prompt": "go"}), t + 2_000),
+        );
+    }
+    telemetry.record("c", claude::hook("Stop", &json!({}), t + 3_000));
+    // A shell the hub labelled: in the log, never on the board.
+    telemetry.record(
+        "shell",
+        vec![labels_changed(&[("team", Some("web"))], t + 1_000)],
+    );
+    let page = |terms: &[&str]| {
+        let page = telemetry
+            .fleet(&FleetQuery {
+                labels: crate::labels::parse_terms(terms).unwrap(),
+                limit: 100,
+                ..FleetQuery::default()
+            })
+            .unwrap();
+        let mut ids: Vec<String> = page.sessions.iter().map(|s| s.session.clone()).collect();
+        ids.sort();
+        (ids, page.total)
+    };
+    assert_eq!(page(&[]), (vec!["a".into(), "b".into(), "c".into()], 3));
+    assert_eq!(page(&["team=web"]), (vec!["a".into(), "c".into()], 2));
+    assert_eq!(page(&["team=web", "fw.state=done"]), (vec!["c".into()], 1));
+    assert_eq!(page(&["team=api|web", "fw.state=working"]).1, 2);
+    assert_eq!(page(&["missing"]).1, 0);
+    // An unset drops it from the filter; the snapshot carries its labels.
+    telemetry.record("a", vec![labels_changed(&[("team", None)], t + 4_000)]);
+    assert_eq!(page(&["team"]), (vec!["b".into(), "c".into()], 2));
+    telemetry.flush();
+    assert_eq!(
+        telemetry
+            .snapshot("c")
+            .unwrap()
+            .labels
+            .get("team")
+            .map(String::as_str),
+        Some("web")
+    );
+    // The shell's numbering goes on across a restart (it has no saved
+    // state): its next event is not dropped as a repeat.
+    drop(telemetry);
+    let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+    telemetry.record(
+        "shell",
+        vec![labels_changed(&[("area", Some("db"))], t + 5_000)],
+    );
+    let events = telemetry.events(None, "shell", 0, 10, false).unwrap();
+    assert_eq!(events.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2]);
+    let page = telemetry
+        .fleet(&FleetQuery {
+            limit: 100,
+            ..FleetQuery::default()
+        })
+        .unwrap();
+    assert!(page.sessions.iter().all(|s| s.session != "shell"));
 }
 
 /// The collector's side at the scale the design is for: ten thousand

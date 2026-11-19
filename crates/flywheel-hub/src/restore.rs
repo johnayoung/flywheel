@@ -169,6 +169,7 @@ mod tests {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            labels: Default::default(),
         }
     }
 

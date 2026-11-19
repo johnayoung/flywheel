@@ -272,6 +272,7 @@ impl Hub {
             launch: (!launch.is_empty()).then_some(launch),
             account: from.account.clone(),
             created_at: Utc::now(),
+            labels: Default::default(),
         };
         // Resolved now, so a bad folder is refused now.
         self.start_request(&from, &pending)?;
@@ -313,6 +314,13 @@ impl Hub {
             Some(repo) => self.workspace_folder(&workspace, repo)?,
             None => workspace.first_folder().to_path_buf(),
         };
+        // Refused now, not when the operator approves it.
+        let given: crate::labels::Change = request
+            .labels
+            .iter()
+            .map(|(k, v)| (k.clone(), Some(v.clone())))
+            .collect();
+        crate::labels::apply(&mut crate::labels::Labels::new(), &given, None, false)?;
         let pending = PendingStart {
             id: new_id(),
             workspace_id: workspace.id.clone(),
@@ -328,6 +336,7 @@ impl Hub {
             launch: (!request.launch.is_empty()).then_some(request.launch),
             account: trimmed(request.account.as_deref()),
             created_at: Utc::now(),
+            labels: request.labels,
         };
         self.decide_start(&opener, policy, pending)
     }
@@ -399,6 +408,7 @@ impl Hub {
             launch: pending.launch.clone().unwrap_or_default(),
             account: pending.account.clone(),
             shared_worktree: shared,
+            labels: pending.labels.clone(),
             ..CreateSession::default()
         })
     }
@@ -692,6 +702,7 @@ mod tests {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            labels: Default::default(),
         }
     }
 

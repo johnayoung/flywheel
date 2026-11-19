@@ -613,6 +613,13 @@ impl Hub {
         let Some(after) = entry.snap() else {
             return entry;
         };
+        if before.snap().map(|s| s.pr.number) != Some(after.pr.number) {
+            // A pull request newly known for the branch: on its sessions.
+            let number = after.pr.number.to_string();
+            for view in self.sessions_on(key) {
+                self.set_hub_label(&view.record.id, crate::labels::PR, Some(&number));
+            }
+        }
         if !(after.pr.is_open() && after.summary.rollup == Rollup::Failing) {
             self.drop_stale_fix_asks(key, &after.pr);
         }

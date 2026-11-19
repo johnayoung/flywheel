@@ -50,11 +50,13 @@ fw hub share revoke [ID|LABEL] [--all] [--session S] {remote}
 Sessions:
 
 ```bash
-fw hub ls [--json] {where}
+fw hub ls [--label K[=V]]... [--json] {where}  # K=A|B: any of; fw.state: live status
 fw hub new WS [--kind shell|claude|codex] [--folder PATH|LABEL] [--name N] [--create] [--worktree TASK] [--base REF] [--json] {where} [-- ARGV...]
     [--prompt TEXT|-] [--model M] [--permission-mode P] [--approval A] [--sandbox S] [--template NAME]
     [--resume ID | --continue]  # agents: pick up a conversation of the folder (no --prompt, no --worktree)
     [--account NAME]  # claude: run under that account's token instead of the CLI's login
+    [--label K=V]...
+fw hub label SESSION [K=V]... [--unset K]... [--if V | --if-unset] [--json] {where}  # no K=V: print; exit 1 condition failed
 fw hub account ls [--json] [--state-dir DIR]
 fw hub account add NAME [--replace] [--state-dir DIR]  # token from `claude setup-token`, on stdin (no echo)
 fw hub account rm NAME [--state-dir DIR]
@@ -78,7 +80,7 @@ Agent output:
 fw hub commands SESSION [--last] [--all] [--json] [--copy] [--limit N] {where}
 fw hub search QUERY [--regex] [--case] [--session S] [--workspace W] [--kind K]... [--source scrollback|transcript|commands]... [--limit N] [--per-session N] [--offset N] [--json] {where}  # 1: no hits
 fw hub activity [--since AGE|TIME|last-seen] [--until T] [--workspace W] [--session S] [--kind K]... [--limit N] [--json] {where}
-fw hub fleet [SESSION [--turns [N]]] [--status STATUS]... [--hours N] [--host HUB_ID] [--limit N] [--batch KEY | --all | --lanes] [--json] {where}
+fw hub fleet [SESSION [--turns [N]]] [--status STATUS]... [--label K[=V]]... [--hours N] [--host HUB_ID] [--limit N] [--batch KEY | --all | --lanes] [--json] {where}
 fw hub inbox [--hours N] [--host HUB_ID] [--json] {where}  # pending handoffs, blocked and asking sessions, with how to answer
 fw hub continue SESSION [--handoff ID] [--name NAME] [--prompt TEXT|-] [--json] {where}  # a linked successor (default: the only pending handoff)
 fw hub starts SESSION [--policy ask|allowed|off|default] [--start ID | --decline ID] [--json] {where}
@@ -146,7 +148,7 @@ fw hub queue clear SESSION [--all] [--json] {where}
 fw hub queue move SESSION ITEM POS [--json] {where}
 fw hub queue pause SESSION [--json] {where}
 fw hub queue resume SESSION [--json] {where}
-fw hub broadcast TARGET... TEXT|- [--header] [--json] {where}  # exit 1: any refused
+fw hub broadcast [TARGET]... TEXT|- [--label K[=V]]... [--header] [--json] {where}  # exit 1: any refused
 ```
 
 A folder's autopilot (`start`, `approve`, `deny` ask; `--yes` skips):

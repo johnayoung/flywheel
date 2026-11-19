@@ -17,7 +17,7 @@ use std::path::Path;
 /// The store's file in the state dir.
 pub const DB_FILE: &str = "telemetry.db";
 /// The schema this build reads and writes (`PRAGMA user_version`).
-const SCHEMA: i64 = 3;
+const SCHEMA: i64 = 4;
 /// Most sessions one fleet page returns.
 pub const FLEET_PAGE_MAX: usize = 1000;
 /// Most events one page returns.
@@ -51,6 +51,49 @@ pub struct FleetQuery {
     pub rollup: bool,
     /// Only the runs of this rollup (a [`BatchRollup::key`]).
     pub batch: Option<String>,
+    /// Only sessions whose labels hold every term (`fw.state` terms
+    /// match the status).
+    pub labels: Vec<crate::labels::Term>,
+}
+
+/// SQL true when the `sessions` row's labels hold every term of the JSON
+/// array parameter `?N` (`[{"key","values"?}]`): no statement is built
+/// from a request.
+fn labels_clause(n: usize) -> String {
+    format!(
+        "NOT EXISTS (SELECT 1 FROM json_each(?{n}) t WHERE NOT EXISTS (
+             SELECT 1 FROM session_labels l
+             WHERE l.host = sessions.host AND l.session = sessions.session
+               AND l.key = json_extract(t.value, '$.key')
+               AND (COALESCE(json_array_length(t.value, '$.values'), 0) = 0
+                    OR l.value IN (SELECT value FROM json_each(t.value, '$.values')))))"
+    )
+}
+
+/// A query's statuses with its `fw.state` terms folded in, and its other
+/// label terms as the JSON array [`labels_clause`] reads.
+fn status_and_labels(statuses: &[String], terms: &[crate::labels::Term]) -> (Vec<String>, String) {
+    let mut statuses = statuses.to_vec();
+    for term in terms.iter().filter(|t| t.key == crate::labels::STATE) {
+        statuses = if statuses.is_empty() {
+            term.values.clone()
+        } else {
+            statuses
+                .into_iter()
+                .filter(|s| term.values.contains(s))
+                .collect()
+        };
+        if statuses.is_empty() {
+            // Terms no status satisfies: none matches.
+            statuses.push(String::new());
+        }
+    }
+    let rest: Vec<&crate::labels::Term> = terms
+        .iter()
+        .filter(|t| t.key != crate::labels::STATE)
+        .collect();
+    let json = serde_json::to_string(&rest).unwrap_or_else(|_| "[]".to_owned());
+    (statuses, json)
 }
 
 /// How many sessions are in a status, and what they cost.
@@ -196,6 +239,18 @@ impl Store {
              ) WITHOUT ROWID;
              CREATE INDEX IF NOT EXISTS tool_use_ts ON tool_use (last_ts);",
         )?;
+        // Schema 4: each session's labels, for filters in SQL (the fleet,
+        // the event log), kept from its `labels.changed` events.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_labels (
+                 host    TEXT NOT NULL,
+                 session TEXT NOT NULL,
+                 key     TEXT NOT NULL,
+                 value   TEXT NOT NULL,
+                 PRIMARY KEY (host, session, key)
+             ) WITHOUT ROWID;
+             CREATE INDEX IF NOT EXISTS session_labels_value ON session_labels (key, value);",
+        )?;
         let mut store = Self { conn };
         if found < 3 {
             store.backfill_tool_use()?;
@@ -223,6 +278,13 @@ impl Store {
                 })
                 .collect();
             let mut counted = tx.prepare_cached(TOOL_USE_UPSERT)?;
+            let mut label_set = tx.prepare_cached(
+                "INSERT INTO session_labels (host, session, key, value) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (host, session, key) DO UPDATE SET value = excluded.value",
+            )?;
+            let mut label_unset = tx.prepare_cached(
+                "DELETE FROM session_labels WHERE host = ?1 AND session = ?2 AND key = ?3",
+            )?;
             for event in events {
                 let new = insert.execute(params![
                     event.host,
@@ -235,6 +297,18 @@ impl Store {
                     event.item,
                     event.what.body().to_string(),
                 ])?;
+                if new == 1
+                    && let What::LabelsChanged { set, .. } = &event.what
+                {
+                    for (key, value) in set {
+                        match value {
+                            Some(value) => {
+                                label_set.execute(params![event.host, event.session, key, value])?
+                            }
+                            None => label_unset.execute(params![event.host, event.session, key])?,
+                        };
+                    }
+                }
                 // A finished call is counted once, as its event is kept.
                 if new == 1
                     && let Some(call) = Call::of(event)
@@ -254,7 +328,9 @@ impl Store {
                      cost = excluded.cost, snap = excluded.snap, state = excluded.state,
                      batch = excluded.batch",
             )?;
-            for state in states {
+            // A session only the hub recorded (a labelled shell) is not
+            // on the board.
+            for state in states.iter().filter(|s| s.observed()) {
                 let snap = state.snapshot();
                 let (snap_json, state_json) =
                     match (serde_json::to_string(&snap), serde_json::to_string(state)) {
@@ -301,6 +377,28 @@ impl Store {
                 why: e.to_string(),
             }),
         }
+    }
+
+    /// The highest `seq` kept for a session (0: none): where a session
+    /// whose state was never saved goes on numbering.
+    pub fn max_seq(&self, host: &str, session: &str) -> Result<u64, StoreError> {
+        let seq: Option<i64> = self.conn.query_row(
+            "SELECT MAX(seq) FROM events WHERE host = ?1 AND session = ?2",
+            params![host, session],
+            |row| row.get(0),
+        )?;
+        Ok(seq.unwrap_or(0).max(0) as u64)
+    }
+
+    /// A session's labels as kept.
+    pub fn labels(&self, host: &str, session: &str) -> Result<crate::labels::Labels, StoreError> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT key, value FROM session_labels WHERE host = ?1 AND session = ?2",
+        )?;
+        let rows = query.query_map(params![host, session], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     /// A session's events after `after` (a `seq`), oldest first; with
@@ -395,12 +493,15 @@ impl Store {
     pub fn fleet(&self, query: &FleetQuery) -> Result<FleetPage, StoreError> {
         let since = query.active_since.unwrap_or(i64::MIN);
         let host = query.host.as_deref();
-        let mut counts_query = self.conn.prepare_cached(
+        let (statuses, labels) = status_and_labels(&query.statuses, &query.labels);
+        let mut counts_query = self.conn.prepare_cached(&format!(
             "SELECT status, COUNT(*), SUM(cost) FROM sessions
-             WHERE last_ts >= ?1 AND (?2 IS NULL OR host = ?2) GROUP BY status ORDER BY MIN(rank)",
-        )?;
+             WHERE last_ts >= ?1 AND (?2 IS NULL OR host = ?2) AND {}
+             GROUP BY status ORDER BY MIN(rank)",
+            labels_clause(3)
+        ))?;
         let counts: Vec<StatusCount> = counts_query
-            .query_map(params![since, host], |row| {
+            .query_map(params![since, host, labels], |row| {
                 Ok(StatusCount {
                     status: row.get(0)?,
                     sessions: row.get::<_, i64>(1)? as u64,
@@ -416,27 +517,31 @@ impl Store {
         )?;
         // The statuses are matched in SQL through a JSON array: no
         // statement is built from the request.
-        let statuses = serde_json::to_string(&query.statuses).unwrap_or_else(|_| "[]".to_owned());
-        let any = query.statuses.is_empty();
+        let any = statuses.is_empty();
+        let statuses = serde_json::to_string(&statuses).unwrap_or_else(|_| "[]".to_owned());
         // Which rows: one rollup's runs, else (rolled up) the hub's own
         // sessions only, else all.
         let batch = query.batch.as_deref();
         let own_only = query.rollup && batch.is_none();
         let total: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sessions
-             WHERE last_ts >= ?1 AND (?2 IS NULL OR host = ?2)
-               AND (?3 OR status IN (SELECT value FROM json_each(?4)))
-               AND (?5 IS NULL OR batch = ?5) AND (NOT ?6 OR batch IS NULL)",
-            params![since, host, any, statuses, batch, own_only],
+            &format!(
+                "SELECT COUNT(*) FROM sessions
+                 WHERE last_ts >= ?1 AND (?2 IS NULL OR host = ?2)
+                   AND (?3 OR status IN (SELECT value FROM json_each(?4)))
+                   AND (?5 IS NULL OR batch = ?5) AND (NOT ?6 OR batch IS NULL) AND {}",
+                labels_clause(7)
+            ),
+            params![since, host, any, statuses, batch, own_only, labels],
             |row| row.get(0),
         )?;
-        let mut page = self.conn.prepare_cached(
+        let mut page = self.conn.prepare_cached(&format!(
             "SELECT snap FROM sessions
              WHERE last_ts >= ?1 AND (?2 IS NULL OR host = ?2)
                AND (?3 OR status IN (SELECT value FROM json_each(?4)))
-               AND (?7 IS NULL OR batch = ?7) AND (NOT ?8 OR batch IS NULL)
+               AND (?7 IS NULL OR batch = ?7) AND (NOT ?8 OR batch IS NULL) AND {}
              ORDER BY rank, last_ts DESC, host, session LIMIT ?5 OFFSET ?6",
-        )?;
+            labels_clause(9)
+        ))?;
         let sessions = page
             .query_map(
                 params![
@@ -447,7 +552,8 @@ impl Store {
                     query.limit.clamp(1, FLEET_PAGE_MAX) as i64,
                     query.offset as i64,
                     batch,
-                    own_only
+                    own_only,
+                    labels
                 ],
                 |row| row.get::<_, String>(0),
             )?
@@ -567,6 +673,11 @@ impl Store {
         let events = tx.execute("DELETE FROM events WHERE ts < ?1", params![before])?;
         tx.execute("DELETE FROM sessions WHERE last_ts < ?1", params![before])?;
         tx.execute("DELETE FROM tool_use WHERE last_ts < ?1", params![before])?;
+        tx.execute(
+            "DELETE FROM session_labels WHERE NOT EXISTS (SELECT 1 FROM events e
+                 WHERE e.host = session_labels.host AND e.session = session_labels.session)",
+            [],
+        )?;
         tx.commit()?;
         Ok(events)
     }

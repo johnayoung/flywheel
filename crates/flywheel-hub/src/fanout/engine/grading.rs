@@ -442,6 +442,15 @@ impl Fanouts {
         });
         self.inner().trees.remove(&dir);
         let saved = recorded.is_ok();
+        if saved {
+            // What its graders said, on the session the work is in.
+            let verdict = if passed { "pass" } else { "fail" };
+            hub.set_hub_label(
+                &candidate.session_id,
+                crate::labels::VERIFIED,
+                Some(verdict),
+            );
+        }
         match recorded {
             Ok(()) => eprintln!("fw hub: fan-out {} {label}: graded {summary}", fanout.name),
             Err(e) => eprintln!(

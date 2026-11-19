@@ -147,6 +147,7 @@ impl Fanouts {
                 account: None,
                 opened_by: None,
                 shared_worktree: None,
+                labels: Default::default(),
             });
             let view = match created {
                 Ok(view) => view,

@@ -318,6 +318,10 @@ pub struct SessionRecord {
     /// The operator opted it out of relaunches after an upgrade.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub never_relaunch: bool,
+    /// Its labels (see [`crate::labels`]): `fw.*` keys set by the hub,
+    /// the rest by the operator and agents.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: crate::labels::Labels,
 }
 
 /// How a live upgrade relaunches the agent sessions it took over
@@ -637,6 +641,9 @@ pub struct PendingStart {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// The labels it starts with.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: crate::labels::Labels,
 }
 
 /// A new worktree a pending start asks for: its task, and the branch to

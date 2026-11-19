@@ -18,6 +18,10 @@ pub(crate) struct FleetArgs {
     /// done, idle, ended); repeatable.
     #[arg(long, value_name = "STATUS")]
     status: Vec<String>,
+    /// Only sessions whose labels hold KEY or KEY=V1|V2; repeatable (all
+    /// must hold). A collector filters every hub's sessions.
+    #[arg(long = "label", value_name = "KEY[=VALUE]", conflicts_with = "lanes")]
+    labels: Vec<String>,
     /// Only sessions with an event in the last N hours (0: any age).
     #[arg(long, value_name = "N", default_value_t = 24)]
     hours: u32,
@@ -124,6 +128,13 @@ fn run(args: &FleetArgs, out: &mut dyn Write) -> Result<(), String> {
     ];
     if !args.status.is_empty() {
         params.push(format!("status={}", query_escape(&args.status.join(","))));
+    }
+    if !args.labels.is_empty() {
+        let terms = crate::labels::parse_terms(&args.labels).map_err(|e| e.to_string())?;
+        params.push(format!(
+            "label={}",
+            query_escape(&crate::labels::query_value(&terms))
+        ));
     }
     match &args.batch {
         Some(batch) => params.push(format!("batch={}", query_escape(batch))),

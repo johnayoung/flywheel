@@ -18,13 +18,65 @@ use std::sync::Arc;
 #[derive(Deserialize)]
 pub(super) struct SessionFilter {
     workspace_id: Option<String>,
+    /// Label terms, comma-separated (`team=web,fw.state=done|blocked`).
+    label: Option<String>,
 }
 
 pub(super) async fn list_sessions(
     State(app): State<AppState>,
     ApiQuery(filter): ApiQuery<SessionFilter>,
-) -> Response {
-    Json(json!({ "sessions": app.hub.sessions(filter.workspace_id.as_deref()) })).into_response()
+) -> ApiResult<Response> {
+    let terms =
+        crate::labels::parse_terms(&[filter.label.unwrap_or_default()]).map_err(HubError::from)?;
+    let hub = Arc::clone(&app.hub);
+    let workspace = filter.workspace_id;
+    let sessions =
+        blocking(move || Ok(hub.sessions_labelled(workspace.as_deref(), &terms))).await?;
+    Ok(Json(json!({ "sessions": sessions })).into_response())
+}
+
+/// `PATCH /api/sessions/{id}/labels`: `{"labels":{key: value|null}}`,
+/// when `if` (the one key's value now) or `if_unset` holds.
+#[derive(Deserialize)]
+pub(super) struct LabelsPatch {
+    labels: crate::labels::Change,
+    #[serde(default, rename = "if")]
+    if_value: Option<String>,
+    #[serde(default)]
+    if_unset: bool,
+}
+
+pub(super) async fn get_labels(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let record = app.hub.session(&id)?.record;
+    let state = app
+        .hub
+        .fleet_states(&[record.id.as_str()])
+        .remove(&record.id);
+    Ok(Json(json!({ "labels": record.labels, "state": state })).into_response())
+}
+
+pub(super) async fn patch_labels(
+    State(app): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(patch): ApiJson<LabelsPatch>,
+) -> ApiResult<Response> {
+    let cond = match (patch.if_value, patch.if_unset) {
+        (Some(_), true) => {
+            return Err(HubError::from(crate::state::StateError::Invalid(
+                "give if or if_unset, not both".into(),
+            ))
+            .into());
+        }
+        (Some(value), false) => Some(crate::labels::Cond::Is(value)),
+        (None, true) => Some(crate::labels::Cond::Unset),
+        (None, false) => None,
+    };
+    let hub = Arc::clone(&app.hub);
+    let labels = blocking(move || hub.set_labels(&id, &patch.labels, cond.as_ref(), false)).await?;
+    Ok(Json(json!({ "labels": labels })).into_response())
 }
 
 pub(super) async fn get_session(

@@ -335,6 +335,7 @@ function renderSession(session, opts = {}) {
       promptQueue.rowChip(session),
       pullRequests.rowChip(session),
       starterHint(session),
+      labelChips(session),
       el("span", {
         className: `session-state ${st.tone}`,
         textContent: rowMeta(session, st),
@@ -357,6 +358,55 @@ function renderSession(session, opts = {}) {
     parent && sessionById(parent) ? null : whereLine(session),
     // Author <-> reviewer (handoff.js).
     handoff.pairChip(session),
+  );
+}
+
+// Its labels as chips (the hub's fw.* keys left out, and the key the list
+// is grouped by): two shown, the rest counted; all in the title.
+const LABEL_CHIPS = 2;
+function labelChips(session) {
+  const labels = Object.entries(session.labels || {})
+    .filter(([k]) => !k.startsWith("fw.") && k !== state.groupBy);
+  if (!labels.length) return null;
+  const all = labels.map(([k, v]) => `${k}=${v}`).join("\n");
+  return el(
+    "span",
+    { className: "label-chips", title: all },
+    labels.slice(0, LABEL_CHIPS).map(([k, v]) => el("span", { className: "label-chip", textContent: `${k}:${v}` })),
+    labels.length > LABEL_CHIPS ? el("span", { className: "label-chip more", textContent: `+${labels.length - LABEL_CHIPS}` }) : null,
+  );
+}
+
+// The label keys the Everything list may be grouped by: those any session
+// holds (the hub's fw.* keys after the rest).
+function groupKeys() {
+  const keys = new Set();
+  for (const s of state.sessions) for (const k of Object.keys(s.labels || {})) keys.add(k);
+  if (state.groupBy) keys.add(state.groupBy);
+  return [...keys].sort((a, b) => (a.startsWith("fw.") - b.startsWith("fw.")) || a.localeCompare(b));
+}
+
+function setGroupBy(key) {
+  state.groupBy = key;
+  store.set("group-by", key);
+  render();
+}
+
+// The Everything list's group-by control: a select of label keys.
+function groupBySelect() {
+  const keys = groupKeys();
+  if (!keys.length) return null;
+  return el(
+    "select",
+    {
+      className: "group-by",
+      title: "Group the list by a label",
+      "aria-label": "Group by label",
+      onclick: (e) => e.stopPropagation(),
+      onchange: (e) => setGroupBy(e.target.value),
+    },
+    el("option", { value: "", textContent: "by activity", selected: !state.groupBy }),
+    keys.map((k) => el("option", { value: k, textContent: `by ${k}`, selected: k === state.groupBy })),
   );
 }
 
@@ -690,7 +740,20 @@ function renderListHead(workspace) {
       launcher.workspaceChip(workspace.id) || "",
     );
   } else {
-    sub.replaceChildren();
+    // Grouped by a label: said where it stays visible, with a way back.
+    sub.replaceChildren(...(state.groupBy
+      ? [el(
+        "button",
+        {
+          type: "button",
+          className: "group-by-chip",
+          title: "Group by activity again",
+          onclick: () => setGroupBy(""),
+        },
+        `grouped by ${state.groupBy} `,
+        icon("x"),
+      )]
+      : []));
   }
   $("#list-tools").replaceChildren(...(workspace
     ? [
@@ -698,7 +761,7 @@ function renderListHead(workspace) {
       iconButton("gear", "Edit workspace", () => openWorkspaceDialog(workspace)),
       iconButton("x", "Delete workspace", () => deleteWorkspace(workspace), true),
     ].filter(Boolean)
-    : []));
+    : [groupBySelect()].filter(Boolean)));
   const add = $("#list-new");
   add.title = withKey(workspace ? `New session in ${workspace.name}` : "New session", "session.new");
   add.setAttribute("aria-label", add.title);
@@ -750,6 +813,7 @@ function renderAllList() {
   if (nextExpiry !== Infinity) movingTimer = setTimeout(() => backgroundRender(), nextExpiry - now + 50);
   // Keyed by group, so a repaint keeps each group's rows (morph).
   const rows = (list, group) => el("ul", { className: "sessions", dataset: { id: `group:${group}` } }, list.map((s) => renderSession(s, { tag: true, flat: true })));
+  if (state.groupBy && state.sessions.length) return labelGroups([...moving, ...resting], rows);
   const out = [];
   if (!state.sessions.length) {
     out.push(el(
@@ -805,6 +869,28 @@ function renderAllList() {
     const shown = open ? resting : resting.filter((s) => s.id === state.attached);
     if (shown.length) out.push(rows(shown, "resting"));
   }
+  return out;
+}
+
+// Everything grouped by one label key: a group per value (most sessions
+// first), then those without it. Needs you stays above, as always.
+function labelGroups(sessions, rows) {
+  const key = state.groupBy;
+  const groups = new Map();
+  const without = [];
+  for (const s of sessions) {
+    const value = (s.labels || {})[key];
+    if (value === undefined) without.push(s);
+    else {
+      if (!groups.has(value)) groups.set(value, []);
+      groups.get(value).push(s);
+    }
+  }
+  const ordered = [...groups.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  const out = [];
+  for (const [value, list] of ordered) out.push(listGroup(`${key}=${value}`, list.length), rows(list, `label:${value}`));
+  if (without.length) out.push(listGroup(`no ${key}`, without.length), rows(without, "label:"));
+  if (!out.length) out.push(el("div", { className: "list-calm", textContent: "Everything else needs you." }));
   return out;
 }
 

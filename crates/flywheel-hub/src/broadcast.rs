@@ -34,6 +34,8 @@ use serde_json::{Value, json};
 /// The most targets (selectors, and sessions they name) one broadcast
 /// reaches.
 pub const MAX_TARGETS: usize = 64;
+/// The most sessions a label selects for one broadcast.
+pub const MAX_LABEL_TARGETS: usize = 1000;
 /// The most names a request may hand the header (`recipients`).
 pub const MAX_RECIPIENTS: usize = 1024;
 /// Sessions the provenance header names before `+N more`.
@@ -55,6 +57,10 @@ pub struct BroadcastRequest {
     /// own agents.
     #[serde(default)]
     pub recipients: Vec<String>,
+    /// Also every agent session (not exited) whose labels hold these
+    /// terms (`team=web,fw.state=done`).
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// What became of the prompt for one target.
@@ -239,10 +245,12 @@ impl Hub {
             .map(|t| t.trim())
             .filter(|t| !t.is_empty())
             .collect();
-        if selectors.is_empty() {
-            return Err(
-                StateError::Invalid("name the sessions or workspaces to send to".into()).into(),
-            );
+        let terms = crate::labels::parse_terms(&[request.label.clone().unwrap_or_default()])?;
+        if selectors.is_empty() && terms.is_empty() {
+            return Err(StateError::Invalid(
+                "name the sessions or workspaces to send to, or a label".into(),
+            )
+            .into());
         }
         if selectors.len() > MAX_TARGETS {
             return Err(StateError::Invalid(format!(
@@ -273,6 +281,34 @@ impl Hub {
                 targets.len()
             ))
             .into());
+        }
+        if !terms.is_empty() {
+            let selector = crate::labels::query_value(&terms);
+            let labelled: Vec<SessionRecord> = self
+                .sessions_labelled(None, &terms)
+                .into_iter()
+                .map(|v| v.record)
+                .filter(|r| r.kind.is_agent() && !matches!(r.state, SessionState::Exited { .. }))
+                .collect();
+            if labelled.len() > MAX_LABEL_TARGETS {
+                return Err(StateError::Invalid(format!(
+                    "{selector} selects {} sessions: at most {MAX_LABEL_TARGETS} per broadcast",
+                    labelled.len()
+                ))
+                .into());
+            }
+            if labelled.is_empty() {
+                refused.push(TargetResult::refused(
+                    &selector,
+                    None,
+                    "no running agent session has those labels".to_owned(),
+                ));
+            }
+            for record in labelled {
+                if !targets.iter().any(|(_, t)| t.id == record.id) {
+                    targets.push((selector.clone(), record));
+                }
+            }
         }
         let prompt = if request.header {
             let given: Vec<&str> = request

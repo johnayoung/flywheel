@@ -307,6 +307,17 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
+    fn label(
+        &self,
+        to: Option<&str>,
+        change: &crate::labels::Change,
+        cond: Option<&crate::labels::Cond>,
+    ) -> Result<String, String> {
+        self.hub
+            .agent_label(&self.session, to, change, cond)
+            .map_err(|e| e.to_string())
+    }
+
     fn handoff(
         &self,
         prompt: &str,
@@ -341,6 +352,8 @@ pub(super) struct FleetParams {
     rollup: Option<String>,
     /// Only one rollup's runs (its key).
     batch: Option<String>,
+    /// Label terms, comma-separated (`team=web,pr`).
+    label: Option<String>,
 }
 
 fn number<T: std::str::FromStr>(raw: Option<&str>, name: &str) -> Result<Option<T>, String> {
@@ -406,6 +419,8 @@ pub(super) async fn fleet(
                 .map(str::trim)
                 .filter(|b| !b.is_empty())
                 .map(str::to_owned),
+            labels: crate::labels::parse_terms(&[params.label.unwrap_or_default()])
+                .map_err(|e| e.to_string())?,
         })
     })();
     let query = match parsed {

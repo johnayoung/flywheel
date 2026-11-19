@@ -412,6 +412,22 @@ pub fn cost_label(cost: &Value) -> String {
     }
 }
 
+/// `  team=web area=db`: its labels but the hub's own, else empty.
+fn labels_label(session: &Value) -> String {
+    let shown: Vec<String> = session["labels"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| !k.starts_with(crate::labels::HUB_PREFIX))
+        .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default()))
+        .collect();
+    if shown.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", shown.join(" "))
+    }
+}
+
 /// ` · 12.3k tok $0.42` for an agent session with usage, else empty.
 fn usage_label(session: &Value) -> String {
     match session.get("usage").filter(|u| u.is_object()) {
@@ -436,8 +452,26 @@ pub(crate) struct LsArgs {
     /// each workspace's today, this week, and all time).
     #[arg(long)]
     json: bool,
+    /// Only sessions whose labels hold KEY (any value) or KEY=V1|V2;
+    /// repeatable (all must hold). `fw.state=done` reads the live status.
+    #[arg(long = "label", value_name = "KEY[=VALUE]")]
+    labels: Vec<String>,
     #[command(flatten)]
     endpoint: EndpointArgs,
+}
+
+/// Sessions whose labels hold every `--label` term (all: none given).
+pub(crate) fn sessions_labelled(conn: &Endpoint, labels: &[String]) -> Result<Vec<Value>, String> {
+    if labels.is_empty() {
+        return conn.blocking_sessions();
+    }
+    let terms = crate::labels::parse_terms(labels).map_err(|e| e.to_string())?;
+    let path = format!(
+        "/api/sessions?label={}",
+        query_escape(&crate::labels::query_value(&terms))
+    );
+    let listed = conn.blocking_call("GET", &path, None)?;
+    Ok(listed["sessions"].as_array().cloned().unwrap_or_default())
 }
 
 pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
@@ -447,11 +481,19 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
     };
     let listed = conn
         .blocking_workspaces()
-        .and_then(|w| Ok((w, conn.blocking_sessions()?)));
-    let (workspaces, sessions) = match listed {
+        .and_then(|w| Ok((w, sessions_labelled(&conn, &args.labels)?)));
+    let (mut workspaces, sessions) = match listed {
         Ok(lists) => lists,
         Err(message) => return fail(err, &message),
     };
+    if !args.labels.is_empty() {
+        // Filtered: only the workspaces something matched in.
+        workspaces.retain(|w| {
+            sessions
+                .iter()
+                .any(|s| str_field(s, "workspace_id") == str_field(w, "id"))
+        });
+    }
     // A hub from before usage has no /api/usage: the listing stands.
     let usage = conn.blocking_call("GET", "/api/usage", None).ok();
     let of = |w: &Value| -> Vec<Value> {
@@ -505,14 +547,15 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                     state_label(s),
                     str_field(s, "name").to_owned(),
                     format!(
-                        "{}{}{}{}{}{}{}",
+                        "{}{}{}{}{}{}{}{}",
                         live_cwd(s),
                         relaunch_label(s),
                         git_label(s),
                         companion_label(s, &sessions),
                         pairing_label(s, &sessions),
                         queue_label(s),
-                        usage_label(s)
+                        usage_label(s),
+                        labels_label(s)
                     ),
                 ]
             })
@@ -636,6 +679,9 @@ pub(crate) struct NewArgs {
     /// --continue`).
     #[arg(long = "continue", conflicts_with = "worktree")]
     continue_: bool,
+    /// Label it KEY=VALUE; repeatable (fw.* keys are the hub's).
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    labels: Vec<String>,
     /// Print the new session as JSON instead of its id.
     #[arg(long)]
     json: bool,
@@ -793,6 +839,14 @@ fn new_session(args: &NewArgs, err: &mut dyn Write) -> Result<Value, String> {
     }
     if let Some(account) = &args.account {
         body["account"] = json!(account);
+    }
+    if !args.labels.is_empty() {
+        let change = crate::labels::parse_change(&args.labels, &[]).map_err(|e| e.to_string())?;
+        let labels: serde_json::Map<String, Value> = change
+            .into_iter()
+            .filter_map(|(k, v)| v.map(|v| (k, json!(v))))
+            .collect();
+        body["labels"] = Value::Object(labels);
     }
     // Run inside an agent session: that session opened this one (the
     // hub links them when it is one of its own).

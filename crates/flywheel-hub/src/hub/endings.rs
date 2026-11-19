@@ -1843,6 +1843,13 @@ fn successor_start(record: &SessionRecord, successor: &Successor) -> PendingStar
         launch: (!launch.is_empty()).then_some(launch),
         account: record.account.clone(),
         created_at: Utc::now(),
+        // The work goes on under the same labels (the hub sets its own).
+        labels: record
+            .labels
+            .iter()
+            .filter(|(k, _)| !k.starts_with(crate::labels::HUB_PREFIX))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     }
 }
 
@@ -1909,6 +1916,7 @@ mod tests {
             end_requests: Vec::new(),
             stale: None,
             never_relaunch: false,
+            labels: Default::default(),
         }
     }
 

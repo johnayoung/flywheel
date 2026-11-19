@@ -353,6 +353,10 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             axum::routing::delete(cancel_ending),
         )
         .route("/api/sessions/{id}/start-policy", put(set_start_policy))
+        .route(
+            "/api/sessions/{id}/labels",
+            get(sessions_api::get_labels).patch(sessions_api::patch_labels),
+        )
         // The route's first name, kept for older clients.
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))

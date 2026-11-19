@@ -441,11 +441,18 @@ impl Inner {
         // current. Read on the readers' connection: recording never waits
         // on the writer's commit.
         live.entry(key.clone()).or_insert_with(|| {
-            lock(&self.read)
-                .state(&key.0, &key.1)
+            let read = lock(&self.read);
+            read.state(&key.0, &key.1)
                 .ok()
                 .flatten()
-                .unwrap_or_else(|| SessionState::new(&key.0, &key.1))
+                .unwrap_or_else(|| {
+                    // Never saved (a session only the hub recorded): its
+                    // numbering and labels go on from what is kept.
+                    let mut state = SessionState::new(&key.0, &key.1);
+                    state.seq = read.max_seq(&key.0, &key.1).unwrap_or(0);
+                    state.restore_labels(read.labels(&key.0, &key.1).unwrap_or_default());
+                    state
+                })
         })
     }
 
@@ -505,7 +512,11 @@ impl Inner {
         if let Err(e) = lock(&self.db).write(&pending.events, &states) {
             eprintln!("fw hub: {e}");
         }
-        states.iter().map(SessionState::snapshot).collect()
+        states
+            .iter()
+            .filter(|s| s.observed())
+            .map(SessionState::snapshot)
+            .collect()
     }
 
     /// Drop from memory the sessions with nothing since `before`. Under

@@ -802,6 +802,44 @@ try {
   check(unseen === "done" && seenAs === "idle", `desktop: a done turn opened by link after 6 idle minutes is seen (${unseen} -> ${seenAs})`);
   await away.close();
 
+  // --- labels: chips on rows, Everything grouped by a label ---------------
+  await api("PATCH", `/api/sessions/${sids[0]}/labels`, { labels: { team: "web", area: "db", tier: "a-long-label-value-to-truncate" } });
+  await api("PATCH", `/api/sessions/${sids[1]}/labels`, { labels: { team: "api" } });
+  const lab = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const lp = await lab.newPage();
+  await lp.goto(`${base}/login?token=${token}`);
+  await lp.waitForSelector("#rail-all", { timeout: 15000 });
+  // Everything (a fresh browser's scope); a click on it while picked would
+  // hide the list.
+  if (!(await lp.evaluate(() => document.querySelector("#rail-all").classList.contains("on")))) await lp.click("#rail-all");
+  // The shells rest: unfold Resting to see their rows.
+  const fold = lp.locator(".list-group.fold:not(.open)");
+  if (await fold.count()) await fold.first().click();
+  await lp.waitForSelector(`.session[data-id="${sids[0]}"] .label-chip`, { timeout: 10000 });
+  const chips = await lp.evaluate((id) => {
+    const row = document.querySelector(`.session[data-id="${id}"]`);
+    const side = document.querySelector(".side-list").getBoundingClientRect();
+    const all = [...row.querySelectorAll(".label-chip")].map((c) => c.textContent);
+    const r = row.getBoundingClientRect();
+    return { all, title: row.querySelector(".label-chips").title, fits: r.right <= side.right + 1 && r.height < 60 };
+  }, sids[0]);
+  check(chips.all.length === 3 && chips.all[0] === "area:db" && chips.all[2] === "+1" && chips.title.includes("tier=") && chips.fits,
+    `labels: a row shows two label chips and a count, all in its title, within the sidebar (${JSON.stringify(chips)})`);
+  const groupBy = lp.locator("#list-tools select.group-by");
+  check(await groupBy.count() === 1, "labels: Everything offers a group-by-label control");
+  await groupBy.selectOption("team");
+  await lp.waitForSelector(".group-by-chip", { timeout: 5000 });
+  const groups = await lp.evaluate(() => [...document.querySelectorAll(".side-scroll .list-group .list-group-name")].map((n) => n.textContent));
+  check(groups.includes("team=web") && groups.includes("team=api") && groups.includes("no team"),
+    `labels: grouped by team, one group per value and one for the rest (${JSON.stringify(groups)})`);
+  const chipsGrouped = await lp.evaluate((id) => [...document.querySelectorAll(`.session[data-id="${id}"] .label-chip`)].map((c) => c.textContent), sids[0]);
+  check(!chipsGrouped.some((c) => c.startsWith("team:")), `labels: the grouped-by key is not repeated as a chip (${JSON.stringify(chipsGrouped)})`);
+  await lp.screenshot({ path: path.join(out, "desktop-labels-grouped.png") });
+  await lp.click(".group-by-chip");
+  const back = await lp.evaluate(() => [...document.querySelectorAll(".side-scroll .list-group .list-group-name")].map((n) => n.textContent));
+  check(!back.some((g) => g.startsWith("team=")), `labels: the chip puts the list back by activity (${JSON.stringify(back)})`);
+  await lab.close();
+
   // --- phone 390x844 ------------------------------------------------------
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
   const mp = await phone.newPage();

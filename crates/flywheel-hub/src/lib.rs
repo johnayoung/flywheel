@@ -49,6 +49,8 @@ pub mod git;
 pub mod handoff;
 pub mod hub;
 mod insights_cli;
+mod label_cli;
+pub mod labels;
 pub mod layout;
 pub mod lifecycle;
 pub mod machine_cli;

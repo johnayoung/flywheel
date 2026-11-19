@@ -6,6 +6,7 @@ mod endings;
 pub use capture::{CAPTURE_TOKEN_FILE, CAPTURED_PREFIX, CaptureFrom, CaptureRefused};
 pub use endings::{AgentEnd, AgentReplace, FORCE_REFUSED};
 pub use relaunches::stale_note;
+mod labels;
 mod links;
 mod relaunches;
 mod starts;
@@ -236,6 +237,9 @@ pub struct CreateSession {
     /// agent's start in its own directory; not part of the API).
     #[serde(skip)]
     pub shared_worktree: Option<WorktreeRef>,
+    /// Its first labels (no `fw.*` keys: the hub sets those).
+    #[serde(default)]
+    pub labels: crate::labels::Labels,
 }
 
 /// [`CreateSession::resume`]'s value for the folder's newest conversation.
@@ -822,6 +826,7 @@ impl Hub {
             "review_of": record.review_of,
             "branch": view.git.as_ref().and_then(|g| g.branch.clone()),
             "agent": view.agent,
+            "labels": record.labels,
         }))
     }
 

@@ -425,6 +425,14 @@ pub enum What {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         trigger: Option<String>,
     },
+    /// The session's labels changed (see [`crate::labels`]): each key
+    /// set to its new value (`null`: unset), and what it held before.
+    #[serde(rename = "labels.changed")]
+    LabelsChanged {
+        set: crate::labels::Change,
+        #[serde(default)]
+        before: crate::labels::Change,
+    },
 }
 
 fn yes() -> bool {
@@ -461,7 +469,14 @@ impl What {
             Self::RateLimit { .. } => "rate.limit",
             Self::RateLimited { .. } => "rate.limited",
             Self::Compact { .. } => "compact",
+            Self::LabelsChanged { .. } => "labels.changed",
         }
+    }
+
+    /// A record the hub keeps about a session (its labels), not
+    /// something its agent did.
+    pub fn is_hub_record(&self) -> bool {
+        matches!(self, Self::LabelsChanged { .. })
     }
 
     /// The body alone, as stored beside the kind.
@@ -506,4 +521,5 @@ pub const KINDS: &[&str] = &[
     "rate.limit",
     "rate.limited",
     "compact",
+    "labels.changed",
 ];

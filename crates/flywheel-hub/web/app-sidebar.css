@@ -417,6 +417,46 @@ body.list-hidden .side-list { display: none; }
   color: var(--ink-3);
 }
 .session:hover .ws-tag, .session:focus-within .ws-tag { display: none; }
+/* Its labels (key:value), in the ws-tag's quiet frame. */
+.label-chips { display: inline-flex; gap: .2rem; min-width: 0; overflow: hidden; }
+.label-chip {
+  flex: none;
+  max-width: 6.5rem;
+  overflow: hidden;
+  padding: 0 .25rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 3px;
+  font: 500 8.5px/1.45 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2);
+}
+.label-chip.more { color: var(--ink-3); }
+.session:hover .label-chips, .session:focus-within .label-chips { display: none; }
+/* Everything grouped by a label: the control, and the chip saying so. */
+.group-by {
+  max-width: 8rem;
+  padding: .1rem .2rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 3px;
+  background: var(--bg-2);
+  color: var(--ink-2);
+  font: 500 10px/1.2 var(--mono);
+}
+.group-by-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .25rem;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--signal);
+  font: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  cursor: pointer;
+}
+.group-by-chip svg { width: .55rem; height: .55rem; }
 
 .session-state {
   font-size: 9.5px;

@@ -262,7 +262,7 @@ Behaviour: [hub-workflows](workflows.md#fleet-and-work).
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/telemetry/fleet[?status=&label=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `host`, `sessions` (urgent first), `total`, `counts`, `hosts`; `hours=0`: any age; `rollup=1`: captured runs as `batches` (counts, cost, budget); `batch=KEY`: its runs |
+| GET | `/api/telemetry/fleet[?status=&label=&host=&hours=&limit=&offset=&rollup=1&batch=]` | `sessions` (urgent first), `total`, `counts`, `hosts`; `hours=0`: any age; `rollup=1`: runs as `batches`; `batch=KEY`: its runs |
 | GET | `/api/telemetry/lanes[?host=&hours=]` | `lanes` (`id`, `count`, `groups` of `cards`), `total`, `placed`, `runs` |
 | GET | `/api/telemetry/insights[?host=&hours=&project=]` | `insights`: `projects`, `time`, `waiting`, `failing`, `rewritten`, `context` |
 | GET | `/api/telemetry/capture/hooks` | what `capture install` writes |

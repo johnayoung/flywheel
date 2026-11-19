@@ -91,10 +91,10 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 
 ## Web UI
 
-- Sidebar: **rail** (wheel = Everything, workspace tiles, More) + **list** (Everything: Needs you, Moving, Resting; a tile: its folders, sessions). Row: dot, name, one fact; leads nest kids; rest: inspector (hover, `I`); group by state/workspace/lead/label.
+- Sidebar: **rail** (Everything, workspace tiles) + **list** (Needs you, Moving, Resting; a tile: its sessions). Row: dot, name, one fact; leads nest kids; the rest: inspector (hover, `I`).
 - Title, favicon count blocked and done; `#session=<id>` survives reloads. A dropped or silent (no pong in 6 s) socket keeps the screen and reconnects (2-10 s), catching up.
 - Keys typed while down wait (`N queued`), sent in order once back; dropped, and said, if the session changed (epoch). Unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
-- Drawers (Commands, Flywheel, Review, Queue) share the stage's right edge; phones: sheets. Ended sessions: Relaunch, Close. First run: import offers, a 30 s tour. Themes: auto, dark, light (dim TUI colours lifted to 4.5:1).
+- Drawers share the stage's right edge; phones: sheets. First run: import offers, a 30 s tour. Themes: auto, dark, light (dim TUI colours lifted to 4.5:1).
 - Vendored (`web/vendor/`, licensed): xterm.js 6.0.0 (+ fit, web-links, search); JetBrains Mono 2.304, JuliaMono for gaps.
 
 ## Phone

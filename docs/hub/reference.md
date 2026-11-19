@@ -225,7 +225,7 @@ Taken by `serve`, `start`, `install-service`; each sets the [hub.toml](#hubtoml)
 
 ## hub.toml
 
-`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors (`serve` exits 2). Edits are re-read within 1 s: live keys apply, the rest at restart; an invalid edit keeps the last good.
+`<state-dir>/hub.toml`; **flag > file > default** (a list flag replaces the list). Unknown keys and bad values are errors (`serve` exits 2). Re-read within 1 s: live keys apply, the rest at restart; an invalid edit keeps the last good.
 
 ```toml
 [server]
@@ -377,7 +377,7 @@ command = ["./summarize.py"]  # optional: else the top-level one
 
 `Alt ,` or the sidebar gear; stored by the hub (`settings.json`), any can be kept for **this device** only.
 
-Sections: Appearance, Terminal (lite mode), Keyboard (pane prefix, key bar, shortcuts), Notifications, Agents (new-session defaults), Plugins (enable, runs, logs), Digest (writes only hub.toml `[digest]`), Server (effective hub.toml, read-only).
+Sections: Appearance, Terminal, Keyboard, Notifications, Agents, Plugins, Digest (writes hub.toml `[digest]`), Server (hub.toml, read-only).
 
 **Key bindings**: up to 4 per action, `mod+...+key`. Refused (422): keys the browser/OS keep (`ctrl+w`, `ctrl+t`, `alt+tab`, `meta+`), keys terminals need (no modifier, `ctrl+c`, `ctrl+d`, ...), duplicates per scope. Warned: `alt+b/f`, `ctrl+<letter>`.
 

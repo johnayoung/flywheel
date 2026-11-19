@@ -19,7 +19,7 @@ fw hub wait "$id" --until blocked --timeout 5 && fw hub read "$id"  # 0: it wait
 ## Agent launcher
 
 - **Resume** (`--resume ID`, `--continue`, the dialog's **Conversation**): a new session resumes a folder's Claude Code or Codex conversation (`fw hub conversations WS --kind K`), unless a running one has it open. Relaunch and restarts resume a session's own.
-- **Accounts** (Claude): `claude setup-token` as the other account, Settings > Agents (or `fw hub account add work`), then `--account work` or the dialog's **Account** (per workspace). Spawns get `CLAUDE_CODE_OAUTH_TOKEN` (one `~/.claude` serves both; rows show `@work`); Claude's settings `env` outranks it.
+- **Accounts** (Claude): `claude setup-token` as the other account, Settings > Agents (or `fw hub account add work`), then `--account work` or the dialog's **Account** (per workspace). Spawns get `CLAUDE_CODE_OAUTH_TOKEN` (rows show `@work`); Claude's settings `env` outranks it.
 - **First prompt** (`--prompt`, 32 KiB): first user turn, create only. **Model**: `claude --model` / `codex -m`.
 - **Permissions**: Claude `--permission-mode` (`bypassPermissions` warns, marks it `unchecked`); Codex `-a` approval, `-s` sandbox; reapplied on relaunch and restore.
 - **Templates** (per workspace): kind, prompt, model, permissions, worktree; a taken name needs `--replace` (all) or `--edit` (given flags). Launch: palette, `new --template NAME` (flags win). Defaults: `[agents.*]`.
@@ -47,7 +47,7 @@ fw hub new WS --kind claude --worktree fix-retry [--base main]  # git worktree a
 fw hub kill fix-retry --rm --remove-worktree  # refused if work would be lost, unless --force
 ```
 
-- A sibling of the **main** checkout; base `--base`, else the current branch; bad names, existing dirs or branches refused. Removal: 409 while another session uses it, or (without `--force`) over uncommitted, untracked, or unmerged work; the branch goes only if nothing is lost.
+- A sibling of the **main** checkout; base `--base`, else the current branch; bad names, existing dirs or branches refused. Removal: 409 while another session uses it, or (no `--force`) over unsaved or unmerged work; the branch goes only if nothing is lost.
 - **Companion shell**: one per agent, in its dir (`Alt \``, the drawer, the API), closed with it; the `shell`/`agent` pill flips.
 
 ## Review
@@ -71,7 +71,7 @@ Any session in a git folder: pill `review`, `Alt G`, `fw hub review`. Base: the 
 
 A branch with a PR: a badge on its row (`#7`, checks), a PR section in Review, `fw hub pr SESSION`. All via `gh` (missing or signed out: the section says why).
 
-- **Asked** per (folder, branch) by head (`gh pr list --head B`), if pushed, not default: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after Push, Open PR, own actions, Refresh (5 s apart). At most 30 gh calls/min; a rate limit pauses 15 min.
+- **Asked** per (folder, branch) by head (`gh pr list --head B`), if pushed, not default: checks running 1 min, open or none 5 min, merged/closed 30 min; at once after our actions or Refresh. At most 30 gh calls/min; a rate limit pauses 15 min.
 - **View log**: `gh run view --job J --log-failed`, last 400 lines, escapes stripped, secrets redacted (Activity's rules).
 - **Ask agent to fix CI**: failing checks + the log's last 150 lines, pasted at rest, else queued. One ask per PR waits (newer replaces it), dropped once checks pass or the PR closes; not re-pasted within 5 min.
 - **Re-run failed** (`gh run rerun R --failed`), **Ready** (`gh pr ready`),
@@ -122,8 +122,8 @@ fw hub fanout new demo --from-task fix-retry --agent claude:opus --agent claude:
 
 Repos flywheel knows (project id) get the verified loop, read-only (`--no-flywheel`: off); state: `$FLYWHEEL_HOME/projects/<id>/`. Untrusted `.flywheel.toml`: shows `fw trust`. **Postgres DSN:** `store`, else hub env.
 
-- Phases, tasks, `plans` (+archived: verified/total, spend, 24h verified), live runs (last tool call), 12 newest runs + grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's `verified/total` badge, `Alt F`, palette.
-- **Start worker here**: `fw worker` in a split; a task's **run**: `fw worker --task <id>` (offers unmet prereqs); a second gets 409; `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted transcript; message, interrupt.
+- Phases, tasks, `plans` (verified/total, spend), live runs, 12 newest runs + grader receipts, worker and autopilot liveness, claims, alerts (**Needs you** until **Mark seen**). Open: the chip's badge, `Alt F`, palette.
+- **Start worker here**: `fw worker` in a split; a task's **run**: `fw worker --task <id>` (offers unmet prereqs); a second gets 409; `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted transcript.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) = `fw autopilot` in a session; stop = Ctrl-C; pause/resume = its `--pause|--resume`.
 - Shown (ledger): tier verdicts, newest deciding cycle (emitted, dropped + why), 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row.
 - A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. Per-folder watcher (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
@@ -144,7 +144,7 @@ Per agent session, prompts the hub types itself, in order ("when done, do X"): `
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
 **Watches** (`fw hub watch add lead --on 'children state=done|failed' --prompt ...`, `watch`/`unwatch` tools, the Queue drawer): a matching log event queues the prompt, events, and cursors into the owner (queue rules apply).
-Matches within `--window` (3 s), or while that prompt waits, join it (40 listed, the rest counted): 500 children finishing wake a lead once. Its own events never match; it ends with its owner. Time watches (`--at`, `--every` 5m+) fire by clock, survive restarts, and pass to the owner's successor.
+Matches within `--window` (3 s), or while that prompt waits, join it (40 listed): 500 children finishing wake a lead once. Its own events never match; it ends with its owner. Time watches (`--at`, `--every` 5m+) fire by clock, survive restarts, and pass to the owner's successor.
 
 **Leases** (`lease` tool, `fw hub lease`): shared or exclusive, a ttl, a fair line per resource; a wait past 50 s is granted by prompt. Ends: release, ttl, holder end, `break`.
 
@@ -158,7 +158,7 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 - **Rows**: the plugin events (`status.changed` only to `blocked`), `turn.finished`, `commands.suggested`, `usage`, `plugin.ran`, `hub.stopped`. A row opens its object or attaches.
 - **Kept** in `activity.jsonl` (1 MiB or weekly, 30 days): kind, ids, names, short facts; never output, prompts, commands, paths; token-shaped words: `[redacted]`.
-- **Event log** (`fw hub tail [-f]`): every telemetry, label, and hub event (the rows above, `status.changed`, `queue.*`, `decision.made`, `flywheel.changed` pointing at the run ledger) in arrival order, 30 days, by opaque cursor; a collector's holds every hub's.
+- **Event log** (`fw hub tail [-f]`): every telemetry, label, and hub event (the rows above, `status.changed`, `queue.*`, `decision.made`, `flywheel.changed`) in arrival order, 30 days, by opaque cursor; a collector's holds every hub's.
 - **Filters** (FILTER: `state=done|failed children=lead team=web kind=review`): session, ws, state (events that moved a session there), labels (now, or either side of a change), kind or family. `fw hub wait --fleet FILTER` blocks for one.
 - **While you were away** (10+ min): turns done, blocked now, fan-outs graded, commands suggested, cost. **Machines**: asked at once (4 s each), merged; silent: `partial`.
 
@@ -167,15 +167,15 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 Each session's turns, calls, subagents, plan, waits, context, cost, and rate limits are recorded (`telemetry.db`, 30 days) and folded into what it is doing now.
 
 - **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle), list, **Insights**.
-- **Needs you** (sidebar, `fw hub inbox`, `fw hub holds`): blocked, then `asking` (a closing question or an `ask_operator` ask), answered in the row. Holds: kind (`needs_input` `awaiting_approval` `permission` `gate`) + cause; alike ones fold into one row (tap: members), answered at once. `ask_operator`: `hold`?, `cause`?, `recommendation`?. Answers kept: `fw hub decisions`.
-- **Handoffs**: the `handoff` tool (`prompt`, `name`?, `reason`?) saves one on the session: a Needs you row until **Start** (**Review** edits) or **Dismiss**. `fw hub continue SESSION [--handoff ID]` starts one, linked. Agents talk via `list_sessions`, `message_session` (typed or queued, signed).
-- **Agent starts**: `start_session` starts a linked session as the caller (kind, account, permissions; `model`?); `session_status` reads one. Policy (pane menu, `fw hub starts --policy`, `agent_starts.policy`): `ask` (a Needs you row), `allowed`, `off`; `[agent_starts]` limits. `fw hub new` inside an agent links to it and obeys it.
+- **Needs you** (sidebar, `fw hub inbox`, `fw hub holds`): blocked, then `asking` (a closing question or an `ask_operator` ask), answered in the row. Holds: kind (`needs_input` `awaiting_approval` `permission` `gate`) + cause; alike ones fold into one row, answered at once. Answers kept: `fw hub decisions`.
+- **Handoffs**: the `handoff` tool (`prompt`, `name`?, `reason`?) saves one: a Needs you row until **Start** (**Review** edits) or **Dismiss**. `fw hub continue SESSION [--handoff ID]` starts one, linked. Agents talk via `list_sessions`, `message_session` (typed or queued, signed).
+- **Agent starts**: `start_session` starts a linked session as the caller (kind, account, permissions; `model`?); `session_status` reads one. Policy (pane menu, `fw hub starts --policy`, `agent_starts.policy`): `ask`, `allowed`, `off`; `[agent_starts]` limits; `fw hub new` inside an agent obeys it.
 - **Agent ends**: `end_session` (`graceful`: `final_prompt` at the turn boundary, then the end; `at_rest`); `replace_session` (successor first; only `model` changes). Never mid-flight (rest rules, no open call or subagent); past `wait_minutes` (20, max 120): called off.
 - **Close** (`end_session` `dry_run` / `close`, `fw hub close`): checklist (merged?, dirty, untracked, `target/` size, sharers); `remove` only if clean and unshared (branch kept unless merged), `clean` its own `target/`, `report` kept. Rechecked after the end.
 - **Adopt** (`adopt_worktree`, `fw hub change`): a plain-git worktree tracked as if started (base from its reflog, upstream, or the repo's branch); `ls --untracked` finds the rest.
 - **While ending**: its queue is set aside (senders told); answers name what dies (its processes; MCP ones counted) and dirty work (kept).
-- **Who may**: the owner (`owner`, else the opener; ended: its newest successor) at once; else, or an operator-started session, a Needs you **Approve** (`fw hub ends`): succession: no click, the rest one. Not itself; force: `fw hub kill`. `give_session`; `queued_messages` / `cancel_message` (own); `message_session` `priority`, `topic`: replaces your unread one, else starts `superseded: T`.
-- **Labels**: `key=value`, one per key (`fw hub label`, `label` tool, `--label`); `--if V`/`--if-unset` claim. The hub's: `fw.kind`, `fw.parent`, `fw.change` (branch), `fw.pr`, `fw.verified`; `fw.state` = live status. Sidebar: inspector, group-by, `label:` filter.
+- **Who may**: the owner (`owner`, else the opener; ended: its newest successor) at once; else a Needs you **Approve** (`fw hub ends`; a succession needs none). Not itself; force: `fw hub kill`. `give_session`; `queued_messages` / `cancel_message` (own); `message_session` `priority`, `topic`: replaces your unread one, else starts `superseded: T`.
+- **Labels**: `key=value`, one per key (`fw hub label`, `label` tool, `--label`); `--if V`/`--if-unset` claim. The hub's: `fw.kind`, `fw.parent`, `fw.change`, `fw.pr`, `fw.verified`, `fw.state` (live). Sidebar: group-by, `label:` filter.
 - **Captured runs** (`fw hub capture install`): `claude -p`/SDK/terminal runs roll up by hub session or `FLYWHEEL_BATCH` (set by `fw worker`); over `_BUDGET`: flagged.
 - **Work** (the header's **work** pill, `fw hub fleet SESSION --turns`): live **map** (stations open; turns replay); plan; per turn a call strip, files, commands, cost, ending. Rows: call or thinking, its age.
 - **Progress** is observed (turns, subagents, calls) and declared (todo or task tools, Codex's plan, `report_progress`): a claim; no plan, no percentage.
@@ -196,7 +196,7 @@ Palette **Permissions: FOLDER**, `fw hub perms show`.
 
 - **View**: Claude Code sources highest first (managed `/etc/claude-code` + `managed-settings.d`, the hub's `--settings` + `--permission-mode`, local, project, user) with each rule; Codex trust (`[projects."<repo>"]`), `approval_policy`, `sandbox_mode`, `rules/*.rules`, and their sources.
 - **Always allow** (why?, quick answers' `always`, the sheet): the request from the `PermissionRequest` hook, else the dialog on screen, as the narrowest rule (`Bash(cargo test -p app *)`: program, subcommand, scoping flags; else the exact command; one per command of a line).
-- Written to `.claude/settings.local.json` (warned when tracked; `--gitignore` ignores it) or, opt-in, user. Preview: file, diff, "This lets the agent ...", an overriding deny/ask. Atomic, keys and layout kept; Yes is typed only if the dialog on screen is that request; the rule is typed back to confirm.
+- Written to `.claude/settings.local.json` (warned when tracked; `--gitignore`) or, opt-in, user. Preview: file, diff, sentence, an overriding deny/ask. Atomic, layout kept; Yes is typed only if the dialog on screen is that request; the rule is typed back to confirm.
 - **Never proposed**: every command, `rm`, `sudo`, `curl`/`wget`, interpreters, `git push` (also `git -C dir push`), `git *`, `cp`/`mv`/`tee`/`sed`/`awk *`, `gh pr merge`, `fw`/`flywheel`, `find *`, exec subcommands (`npm exec`, `git rebase`), `timeout 5 *`, whole MCP servers, pipes into a shell,
   substitutions, `&&` `;` `|`, writes outside the repo or to `.claude/` `.codex/` `.git/` `.gitmodules` `.mcp.json`.
 - **Suggestions**: `permission-requests.jsonl` (0600, 30 days; rules, never commands) per repo, most frequent first, minus covered ones.

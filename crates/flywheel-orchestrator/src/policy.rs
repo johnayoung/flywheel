@@ -581,6 +581,11 @@ pub struct RunFlags {
     /// (the token file under `$FLYWHEEL_HOME/hub/claude-accounts/`). Only
     /// for the worktree backend and the claude-code adapter.
     pub account: Option<String>,
+    /// `--base BRANCH`: the local branch tasks are cut from and land onto,
+    /// instead of the checked-out branch (sets [`WorkPolicy::submit_base`]).
+    /// A branch created at a past commit replays a task at that commit
+    /// without touching the operator's branch.
+    pub base: Option<String>,
 }
 
 fn valid_repo(repo: &str) -> bool {
@@ -679,6 +684,13 @@ impl RunFlags {
             policy.agent_id = Some(agent.to_owned());
         }
         policy.account.clone_from(&self.account);
+        if let Some(base) = &self.base {
+            if base.trim().is_empty() || base.starts_with('-') || base.contains(char::is_whitespace)
+            {
+                return invalid(format!("--base must name a local branch, got {base:?}"));
+            }
+            policy.submit_base = Some(base.clone());
+        }
         Ok(())
     }
 
@@ -698,6 +710,7 @@ impl RunFlags {
         one("--image", &self.image);
         one("--agent", &self.agent);
         one("--account", &self.account);
+        one("--base", &self.base);
         if self.require_triage_receipt {
             argv.push("--require-triage-receipt".to_owned());
         }
@@ -1007,6 +1020,25 @@ mod tests {
     }
 
     #[test]
+    fn base_flag_sets_the_landing_base_and_reaches_pool_members() {
+        let flags = RunFlags {
+            base: Some("eval/replay-1".into()),
+            ..RunFlags::default()
+        };
+        let policy = applied(flags.clone()).unwrap();
+        assert_eq!(policy.submit_base.as_deref(), Some("eval/replay-1"));
+        assert!(flags.to_argv().contains(&"--base=eval/replay-1".to_owned()));
+        for bad in ["", " ", "-x", "a b"] {
+            let err = applied(RunFlags {
+                base: Some(bad.into()),
+                ..RunFlags::default()
+            })
+            .unwrap_err();
+            assert!(err.contains("--base must name a local branch"), "{err}");
+        }
+    }
+
+    #[test]
     fn container_flags_select_the_container_backend() {
         let policy = applied(RunFlags {
             sandbox: Some("container".into()),
@@ -1053,6 +1085,7 @@ mod tests {
             image: Some("img".into()),
             agent: Some("codex".into()),
             account: None,
+            base: None,
         };
         assert_eq!(
             flags.to_argv(),

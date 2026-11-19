@@ -515,6 +515,23 @@ pub fn resolve_landing_base(
         }
         fetch_base_fresh(repo_root, &configured, log)
             .map_err(|err| PolicyError::Invalid(err.to_string()))?;
+        let local = git(
+            repo_root,
+            &[
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{configured}"),
+            ],
+        )
+        .map_err(|err| PolicyError::Invalid(err.to_string()))?;
+        if !local.ok() {
+            return Err(PolicyError::Invalid(format!(
+                "landing base {} is not a local branch (create it first: git branch {} <commit>)",
+                py_str_repr(&configured),
+                configured
+            )));
+        }
         return Ok(configured);
     }
     checked_out.ok_or_else(|| {
@@ -1581,6 +1598,7 @@ pub const USAGE: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--
                        [--repo OWNER/NAME] [--label LABEL]
                        [--require-triage-receipt] [--sandbox SANDBOX]
                        [--image IMAGE] [--agent AGENT] [--account ACCOUNT]
+                       [--base BASE]
 ";
 
 /// The argparse `-h` text (`COLUMNS=80`).
@@ -1597,6 +1615,7 @@ pub const HELP: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--d
                        [--repo OWNER/NAME] [--label LABEL]
                        [--require-triage-receipt] [--sandbox SANDBOX]
                        [--image IMAGE] [--agent AGENT] [--account ACCOUNT]
+                       [--base BASE]
 
 Git-worktree worker: drive the project's tasks (under $FLYWHEEL_HOME/projects/
 <id>/tasks/active/), each in its own worktree, landing on done and parking on
@@ -1663,6 +1682,11 @@ options:
                         token file under $FLYWHEEL_HOME/hub/claude-accounts/,
                         read at each agent spawn). Not with --sandbox
                         container or --agent codex.
+  --base BASE           Cut every task's worktree from this local branch and
+                        land onto it, instead of the checked-out branch. A
+                        branch made at a past commit (git branch NAME SHA)
+                        replays tasks at that commit, off the operator's
+                        branch.
 ";
 
 /// The internal flag a pool member receives its supervisor lifeline on
@@ -1677,7 +1701,7 @@ enum Arity {
 }
 
 /// The option table in declaration order (argparse's prefix-match order).
-const OPTIONS: [(&str, Arity); 29] = [
+const OPTIONS: [(&str, Arity); 30] = [
     ("-h", Arity::Flag),
     ("--help", Arity::Flag),
     ("--tasks-dir", Arity::One),
@@ -1705,6 +1729,7 @@ const OPTIONS: [(&str, Arity); 29] = [
     ("--image", Arity::One),
     ("--agent", Arity::One),
     ("--account", Arity::One),
+    ("--base", Arity::One),
     (SUPERVISOR_FD_FLAG, Arity::One),
     (crate::scoped::SCOPE_SINCE_FLAG, Arity::One),
 ];
@@ -1851,6 +1876,7 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
             "--image" => args.run.image = Some(v),
             "--agent" => args.run.agent = Some(v),
             "--account" => args.run.account = Some(v),
+            "--base" => args.run.base = Some(v),
             "--tasks-dir" => args.tasks_dir = Some(v),
             "--db" => args.db = Some(v),
             "--sandbox-root" => args.sandbox_root = Some(v),
@@ -2725,6 +2751,37 @@ mod tests {
             .to_string();
         assert!(err.starts_with("worker started on detached HEAD"), "{err}");
         assert_eq!(resolve_landing_base(&repo, Some(&p), None).unwrap(), "main");
+    }
+
+    #[test]
+    fn base_flag_replays_at_a_past_commit_and_refuses_a_missing_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo(&repo);
+        let past = rev(&repo, "main");
+        commit(&repo, "later.txt", "x", "a later commit");
+        let p = |base: &str| WorkPolicy {
+            submit_base: Some(base.into()),
+            ..policy()
+        };
+        let err = resolve_landing_base(&repo, Some(&p("eval/t1")), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("landing base 'eval/t1' is not a local branch"),
+            "{err}"
+        );
+        git_ok(&repo, &["branch", "eval/t1", &past]);
+        assert_eq!(
+            resolve_landing_base(&repo, Some(&p("eval/t1")), None).unwrap(),
+            "eval/t1"
+        );
+        assert_eq!(rev(&repo, "eval/t1"), past);
+        assert_eq!(
+            args(&["--base", "eval/t1"]).run.base.as_deref(),
+            Some("eval/t1")
+        );
+        assert!(HELP.contains("--base BASE") && USAGE.contains("[--base BASE]"));
     }
 
     #[test]
@@ -3933,6 +3990,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"c
                 image: Some("img".into()),
                 agent: Some("codex".into()),
                 account: None,
+                base: None,
             }
         );
     }

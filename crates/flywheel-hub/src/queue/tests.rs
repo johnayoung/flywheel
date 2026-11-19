@@ -130,6 +130,27 @@ fn the_next_item_waits_for_a_rest_after_the_last_delivery() {
 }
 
 #[test]
+fn a_retry_after_a_lost_prompt_delivers_instead_of_stalling_again() {
+    // A prompt delivered at t=15 that the agent never took up (its
+    // process was replaced, say): its rest still dates from t=10.
+    let mut q = queue(vec![item("b2", When::Done)]);
+    q.last_delivered_at = Some(at(15));
+    let mut late = facts(status(AgentStatus::Done, 10));
+    late.now = at(15) + chrono::Duration::from_std(ACK_TIMEOUT).unwrap();
+    let Decision::Stall(reason) = decide(&q, &late) else {
+        panic!("expected a stall");
+    };
+    q.stalled = Some(Stall {
+        at: late.now,
+        reason,
+        item: Some("b2".into()),
+    });
+    // Resumed (or relaunched): the next item goes, it does not stall again.
+    q.retry();
+    assert_eq!(decide(&q, &late), Decision::Deliver("b2".into()));
+}
+
+#[test]
 fn idle_waits_until_someone_has_seen_the_answer() {
     let q = queue(vec![item("a1", When::Idle)]);
     waits(&decide(&q, &facts(status(AgentStatus::Done, 10))), "looked");

@@ -502,14 +502,14 @@ impl Hub {
         self.queue_view(id)
     }
 
-    /// Pause (`true`) or resume session `id`'s queue. Resuming also
-    /// clears a stall (the next item is tried again).
+    /// Pause (`true`) or resume session `id`'s queue. Resuming a stalled
+    /// queue tries the next item again ([`SessionQueue::retry`]).
     pub fn queue_set_paused(&self, id: &str, paused: bool) -> Result<QueueView, HubError> {
         self.queue_record(id)?;
         self.store().update_queue(id, |queue| {
             queue.paused = paused;
-            if !paused {
-                queue.stalled = None;
+            if !paused && queue.stalled.is_some() {
+                queue.retry();
             }
         })?;
         eprintln!(

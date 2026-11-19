@@ -76,9 +76,13 @@ impl Hub {
             }
         };
         // Relaunching is what a stalled queue asked for: it carries on
-        // once the new agent is at rest.
-        if store.queue(id).is_some_and(|q| q.stalled.is_some()) {
-            match store.update_queue(id, |q| q.stalled = None) {
+        // once the new agent is at rest. The new process owes no turn for
+        // a prompt pasted into the old one, so that wait ends too.
+        if store
+            .queue(id)
+            .is_some_and(|q| q.stalled.is_some() || q.last_delivered_at.is_some())
+        {
+            match store.update_queue(id, crate::queue::SessionQueue::retry) {
                 Ok(()) => {
                     eprintln!("fw hub: queue {id}: relaunched, so its stall is cleared");
                     self.queue_runtime().wakeup.nudge();

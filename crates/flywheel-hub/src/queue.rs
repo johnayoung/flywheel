@@ -198,6 +198,15 @@ pub struct SessionQueue {
 }
 
 impl SessionQueue {
+    /// Try again after a stall (the operator resumed it, or the session
+    /// was relaunched): the stall is cleared, and so is the wait for the
+    /// agent to take up the last delivered prompt, which is what stalls
+    /// a queue whose prompt was lost (else it would stall straight back).
+    pub fn retry(&mut self) {
+        self.stalled = None;
+        self.last_delivered_at = None;
+    }
+
     /// Nothing worth keeping (the store drops it).
     pub fn is_vacant(&self) -> bool {
         self.items.is_empty()

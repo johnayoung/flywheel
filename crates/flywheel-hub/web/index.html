@@ -686,6 +686,36 @@
   </form>
 </dialog>
 
+<dialog id="dlg-close" class="sheet narrow" aria-labelledby="cl-title">
+  <form method="dialog">
+    <header class="sheet-head">
+      <span class="sheet-kicker">close session</span>
+      <h2 id="cl-title"></h2>
+    </header>
+    <ul class="cl-list" id="cl-list" aria-label="Close checklist"></ul>
+    <div class="cl-choices">
+      <span class="cl-choice-name">worktree</span>
+      <label><input type="radio" name="cl-wt" value="keep" id="cl-wt-keep" checked> keep</label>
+      <label><input type="radio" name="cl-wt" value="remove" id="cl-wt-remove"> remove</label>
+      <span class="cl-why" id="cl-wt-why"></span>
+    </div>
+    <div class="cl-choices">
+      <span class="cl-choice-name">build</span>
+      <label><input type="radio" name="cl-build" value="keep" id="cl-build-keep" checked> keep</label>
+      <label><input type="radio" name="cl-build" value="clean" id="cl-build-clean"> clean target/</label>
+      <span class="cl-why" id="cl-build-why"></span>
+    </div>
+    <label class="cl-report">report <input type="text" id="cl-report" placeholder="STATUS.md (optional: the hub keeps a copy)" spellcheck="false"></label>
+    <label class="import-update"><input type="checkbox" id="cl-forget" checked> then remove it from the list</label>
+    <p class="cwt-state" id="cl-state" role="status"></p>
+    <footer class="sheet-foot">
+      <button type="submit" class="slab ghost" value="cancel">Cancel</button>
+      <button type="button" class="slab danger" id="cl-kill" hidden>Kill and close</button>
+      <button type="button" class="slab" id="cl-ok" disabled>Close</button>
+    </footer>
+  </form>
+</dialog>
+
 <dialog id="dlg-review" class="sheet rv-sheet" aria-labelledby="rva-title">
   <form method="dialog">
     <header class="sheet-head">

@@ -723,9 +723,10 @@ try {
   await pp.locator(`.session[data-id="${agent.id}"] .session-name`).hover();
   await pp.waitForSelector("#inspector:not([hidden])", { timeout: 3000 }).catch(() => {});
   await pp.locator('#inspector [aria-label="Close session"]').click();
-  await pp.waitForSelector("#dlg-close-wt[open] #cwt-where .path-tail", { timeout: 5000 });
+  // An agent's close is the close checklist (dlg-close).
+  await pp.waitForSelector("#dlg-close[open] #cl-list .path-tail", { timeout: 5000 });
   await pp.waitForTimeout(300);
-  const dialogTail = await tail("#cwt-where .path-tail");
+  const dialogTail = await tail("#cl-list .path-tail");
   check(dialogTail.ok, `desktop: the close dialog's worktree path is cut from its start (${JSON.stringify(dialogTail)})`);
   await pp.screenshot({ path: path.join(out, "desktop-close-worktree.png") });
   await pp.keyboard.press("Escape");

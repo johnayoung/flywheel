@@ -65,6 +65,19 @@
 .cwt-state.bad { color: var(--alert); }
 .cwt-also { margin: 0 0 .1rem; font-size: 11px; line-height: 1.55; color: var(--ink-3); }
 .cwt-also:empty { display: none; }
+.cl-list { list-style: none; margin: .2rem 0 .5rem; padding: 0; font-size: 11px; line-height: 1.6; color: var(--ink-2); }
+.cl-list li.bad { color: var(--alert); }
+.cl-list code { font-size: 10.5px; }
+.cl-where { display: flex; gap: .6rem; min-width: 0; }
+.cl-where .path-tail { flex: 1 1 0; min-width: 0; }
+.cl-choices { display: flex; flex-wrap: wrap; align-items: baseline; gap: .1rem .8rem; margin: .25rem 0; font-size: 11px; }
+.cl-choices label { white-space: nowrap; }
+.cl-choice-name { width: 4.5rem; color: var(--ink-3); text-transform: uppercase; letter-spacing: .12em; font-size: 9.5px; }
+.cl-choices label:has(input:disabled) { color: var(--ink-3); }
+.cl-why { flex-basis: 100%; padding-left: 5.3rem; color: var(--ink-3); font-size: 10.5px; }
+.cl-why:empty { display: none; }
+.cl-report { display: flex; align-items: center; gap: .6rem; margin: .4rem 0; font-size: 11px; color: var(--ink-3); }
+.cl-report input { flex: 1; min-width: 0; }
 #dlg-close-wt code { font-family: var(--term); font-size: 11px; color: var(--ink); overflow-wrap: anywhere; }
 #dlg-close-wt .slab:disabled { opacity: .45; cursor: not-allowed; }
 

@@ -296,5 +296,120 @@ window.FwHubWorktree = function (ctx) {
     });
   }
 
-  return { setFolder, reset, request, use, taskName, blocked, badge, confirmClose };
+  // The close checklist (GET /api/sessions/{id}/checklist: merged?,
+  // untracked files and sizes, target/ size, who else works there) and
+  // its choices, run as `fw hub close` runs them (POST
+  // /api/sessions/{id}/close: ended at rest, cleanups that lose nothing).
+  // Resolves {closed, forget}, {kill, remove} (it was busy and the user
+  // chose to hang it up), or null.
+  const cl = $("#dlg-close");
+  const size = (bytes, partial) => {
+    const mib = bytes / (1024 * 1024);
+    const text = mib >= 102.4 ? `${(mib / 1024).toFixed(1)} GiB`
+      : mib >= 1 ? `${Math.round(mib)} MiB`
+        : bytes >= 1024 ? `${Math.round(bytes / 1024)} KiB` : `${bytes} B`;
+    return partial ? `at least ${text}` : text;
+  };
+
+  function checklistRows(list) {
+    const rows = [];
+    const row = (text, bad) => rows.push(el("li", { className: bad ? "bad" : "" }, ...[].concat(text)));
+    rows.push(el("li", { className: "cl-where" }, pathLine(list.path), list.branch ? el("code", { textContent: list.branch }) : null));
+    if (list.merged && list.base) {
+      const m = list.merged;
+      row(m.state === "ancestor" ? `merged into ${list.base}`
+        : m.state === "patch_equivalent" ? `merged into ${list.base} by patch (${m.commits} squashed or rebased in); the branch is kept`
+          : `not merged: ${m.commits} commit(s) ${list.base} lacks; the branch is kept`, m.state === "unmerged");
+    }
+    row(`${list.dirty} uncommitted change(s), ${list.untracked_count} untracked`, list.dirty + list.untracked_count > 0);
+    for (const u of list.untracked || []) {
+      const rel = u.path.startsWith(list.path) ? u.path.slice(list.path.length).replace(/^\//, "") : u.path;
+      row(`  untracked: ${rel} (${size(u.bytes, u.partial)})`, true);
+    }
+    row(list.build ? `build output target/: ${size(list.build.bytes, list.build.partial)}` : "no build output to clean");
+    if (list.shared_with && list.shared_with.length) row(`also used by ${list.shared_with.join(", ")}`, true);
+    return rows;
+  }
+
+  function closeChecklist(session) {
+    const id = session.id;
+    $("#cl-title").textContent = `Close ${session.name}?`;
+    $("#cl-list").replaceChildren(el("li", { textContent: "Checking…" }));
+    const wtKeep = $("#cl-wt-keep");
+    const wtRemove = $("#cl-wt-remove");
+    const buildKeep = $("#cl-build-keep");
+    const buildClean = $("#cl-build-clean");
+    const report = $("#cl-report");
+    const forget = $("#cl-forget");
+    const status = $("#cl-state");
+    const ok = $("#cl-ok");
+    const kill = $("#cl-kill");
+    wtKeep.checked = true;
+    buildKeep.checked = true;
+    wtRemove.disabled = true;
+    buildClean.disabled = true;
+    report.value = "";
+    forget.checked = true;
+    status.textContent = session.state === "running" && session.live
+      ? "It ends once at rest (never mid-turn or mid tool call); then the choices run."
+      : "";
+    status.className = "cwt-state";
+    ok.disabled = true;
+    kill.hidden = true;
+    $("#cl-wt-why").textContent = "";
+    $("#cl-build-why").textContent = "";
+    let settled = null;
+    api("GET", `/api/sessions/${encodeURIComponent(id)}/checklist`).then(
+      (answer) => {
+        if (!cl.open) return;
+        const list = answer.checklist;
+        $("#cl-list").replaceChildren(...checklistRows(list));
+        wtRemove.disabled = !!list.cannot_remove;
+        $("#cl-wt-why").textContent = list.cannot_remove
+          ? list.cannot_remove
+          : list.removes_branch ? "its branch is deleted too (fully merged)" : "its branch is kept";
+        buildClean.disabled = !!list.cannot_clean;
+        // Its own path is the dialog's first line: not again here.
+        $("#cl-build-why").textContent = (list.cannot_clean || "").split(`${list.path}/`).join("").split(list.path).join("it");
+        ok.disabled = false;
+      },
+      (error) => {
+        if (!cl.open) return;
+        status.textContent = `Could not read its checklist: ${error.message}`;
+        status.className = "cwt-state bad";
+        ok.disabled = false;
+      },
+    );
+    ok.onclick = async () => {
+      ok.disabled = true;
+      status.textContent = "Closing…";
+      status.className = "cwt-state";
+      try {
+        const done = await api("POST", `/api/sessions/${encodeURIComponent(id)}/close`, {
+          worktree: wtRemove.checked ? "remove" : "keep",
+          build: buildClean.checked ? "clean" : "keep",
+          report: report.value.trim() || null,
+        });
+        settled = { closed: true, forget: forget.checked, text: done.text };
+        cl.close("done");
+      } catch (error) {
+        status.textContent = `${error.message}`;
+        status.className = "cwt-state bad";
+        // Busy: it can still be hung up the old way.
+        kill.hidden = !/at rest/.test(error.message);
+        ok.disabled = false;
+      }
+    };
+    kill.onclick = () => {
+      settled = { kill: true, remove: wtRemove.checked };
+      cl.close("kill");
+    };
+    cl.returnValue = "";
+    cl.showModal();
+    return new Promise((resolve) => {
+      cl.addEventListener("close", () => resolve(settled), { once: true });
+    });
+  }
+
+  return { setFolder, reset, request, use, taskName, blocked, badge, confirmClose, closeChecklist };
 };

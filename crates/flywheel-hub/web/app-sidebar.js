@@ -72,7 +72,18 @@ async function closeSession(id) {
   // removes that (the agent's close does).
   // Its reviewers go with it too (the server closes them along).
   const companions = state.sessions.filter((s) => s.companion_of === id || s.review_of === id);
-  if (session.worktree && !session.companion_of && !session.review_of) {
+  // An agent, or a session in a worktree of its own: the close checklist,
+  // run as `fw hub close` runs it.
+  if ((isAgent(session) || session.worktree) && !session.companion_of && !session.review_of) {
+    const how = await worktrees.closeChecklist(session);
+    if (!how) return;
+    if (how.closed) {
+      if (how.text) commands.toast(`Closed ${session.name}: ${how.text}`, { timeout: 9000 });
+      if (!how.forget) return refresh();
+    } else if (how.kill && how.remove) {
+      query = "?remove_worktree=true";
+    }
+  } else if (session.worktree && !session.companion_of && !session.review_of) {
     const how = await worktrees.confirmClose(session);
     if (!how) return;
     if (how.remove) query = `?remove_worktree=true${how.force ? "&force=true" : ""}`;

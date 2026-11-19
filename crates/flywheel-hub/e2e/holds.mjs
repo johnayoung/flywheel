@@ -2,7 +2,8 @@
 // start requests from one lead show as one group (their own rows step
 // aside), one member is left out, "Approve all" starts the others as one
 // decision (one batch in the decision record), and the one left out
-// stays, now a row of its own; on a phone the group fits the screen.
+// stays, now a row of its own. Folded in the sidebar until tapped; on
+// the phone's start screen open, and it fits the screen.
 // Opt-in, like layout.mjs:
 //
 //   node crates/flywheel-hub/e2e/holds.mjs [OUT_DIR]
@@ -104,6 +105,13 @@ try {
         buttons: group ? [...group.querySelectorAll(".attn-group-answer")].map((b) => b.textContent) : [],
       };
     });
+  // Folded in the sidebar: one line naming who; tapped, it opens.
+  const folded = await page.evaluate(() => {
+    const group = document.querySelector("#attention .attn-group");
+    return group ? { members: group.querySelectorAll(".attn-members li").length, detail: group.querySelector(".attn-detail").textContent, height: group.getBoundingClientRect().height } : null;
+  });
+  check(folded && folded.members === 0 && folded.detail === "w1, w2, w3" && folded.height < 60, `desktop: the group is one folded row naming who (${JSON.stringify(folded)})`);
+  await page.locator("#attention .attn-row.group").click();
   let s = await shape();
   check(s.groups === 1 && s.members === 3, `desktop: one group of 3 (${JSON.stringify(s)})`);
   check(s.cause === "start_session from lead" && s.kind === "approval", `desktop: the group names its cause and kind (${s.cause}, ${s.kind})`);
@@ -150,7 +158,7 @@ try {
   });
   check(fit && fit.members === 3 && fit.over === 0 && fit.right <= 391, `phone: the group of 3 fits the screen (${JSON.stringify(fit)})`);
   check(fit && fit.buttons.every((h) => h >= 44), `phone: group buttons are tap-sized (${fit && fit.buttons})`);
-  check(fit && fit.texts.every((t) => /^start a claude session "w\d": task \d$/.test(t)), `phone: members say what each starts, once (${fit && JSON.stringify(fit.texts)})`);
+  check(fit && fit.texts.every((t) => /^"w\d": task \d$/.test(t)), `phone: members say what each starts, once (${fit && JSON.stringify(fit.texts)})`);
   await pp.screenshot({ path: path.join(out, "phone-hold-group.png") });
 } finally {
   if (browser) await browser.close();

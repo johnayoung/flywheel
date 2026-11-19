@@ -1040,6 +1040,9 @@ impl Hub {
         })();
         match started {
             Ok(said) => {
+                // As it is now: a session at rest may be gone by the time
+                // the decision is kept and the asker told.
+                let record = self.store().session(&target.id)?.clone();
                 self.emit(HubEvent::Sessions);
                 self.record_decision(super::holds::approval_decision(
                     super::holds::end_hold(&from, &taken, &target.name),
@@ -1052,7 +1055,6 @@ impl Hub {
                         request_kind(&pending)
                     ),
                 );
-                let record = self.store().session(&target.id)?.clone();
                 Ok(self.view(record))
             }
             Err(failed) => {

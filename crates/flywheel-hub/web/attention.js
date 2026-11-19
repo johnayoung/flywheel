@@ -226,13 +226,16 @@ window.FwHubAttention = function (ctx) {
   }
 
   // What tells a member from the rest: its session (when they differ)
-  // and its question without the asker's name ("start a claude session
-  // \"w1\": task 1").
+  // and its question without the asker's name or the start's kind
+  // ("\"w1\": task 1").
   function memberText(g, h) {
     const sessions = new Set(g.holds.map((m) => m.session || m.folder || ""));
     const name = sessions.size > 1 ? h.session_name || (h.folder || "").split("/").pop() : null;
     let text = h.question || "";
     if (h.session_name && text.startsWith(`${h.session_name} asks to `)) text = text.slice(`${h.session_name} asks to `.length);
+    // A start's kind is the same down the group: what tells them apart is
+    // the name and the task.
+    text = text.replace(/^start an? \S+ session /, "");
     return { name, text };
   }
 
@@ -272,7 +275,7 @@ window.FwHubAttention = function (ctx) {
       el(
         "span",
         { className: "attn-text" },
-        el("span", { className: "attn-line" }, el("b", { className: "attn-name", textContent: g.cause })),
+        el("span", { className: "attn-line" }, el("b", { className: "attn-name", textContent: g.cause, title: g.cause })),
         el("span", { className: "attn-detail", textContent: detail, title: detail }),
       ),
       el(

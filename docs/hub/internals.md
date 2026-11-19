@@ -106,7 +106,7 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 - **Quick answers**: a blocked dialog's options as buttons (AskUserQuestion's from its input, only while its question is on screen). **Compose**: multi-line text as one bracketed paste + Enter; history per device, drafts per session.
 - Swipe scrolls, long-press selects, pinch zooms. **Alerts** (per device, https or localhost): blocked or done while hidden or idle 5 min.
 - **Lite mode** (Settings > Terminal; `auto`: the browser says slow, under 64 KB/s, or 3+ round trips at 300 ms+): paced terminals (protocol 2 `lite`), hidden panes none, side panels wait (60 s), re-lists every 3 s at most.
-- **Install**: PWA; the service worker serves the cached page only with the hub down.
+- **Install**: PWA; offline, the cached page.
 
 ## Search
 
@@ -114,8 +114,8 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
 - Sources: `scrollback` (exited sessions too), `transcript` (text, tool calls, results; no thinking), `commands`.
 - Literal or `regex` (linear-time), case-insensitive unless `case`, at most 1 KiB, one line. Newest first; 20 per session and source, 200 total; `offset` pages.
-- Bounds: 1.5 s (then `partial`), 2 at once, transcript indexes 256 MiB (dropped 10 min unused); 20 sessions x 5k lines: ~30 ms.
-- The UI also asks every reachable machine (6 s each), naming offline ones; CLI `--machine`.
+- Bounds: 1.5 s (then `partial`), 2 at once, transcript indexes 256 MiB (dropped 10 min unused).
+- The UI also asks every reachable machine (6 s each); CLI `--machine`.
 
 ## Recording
 
@@ -129,12 +129,12 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
 ntfy-compatible POST when an agent becomes **blocked** or **done**: a phone hears it with browsers closed. Config: [hub-reference](reference.md#notifytoml); test: palette "Send a test push".
 
-- `<session> is blocked|done`, workspace, kind, branch, the blocked detail, `Click:` the session URL (`Priority: high` if blocked); never terminal content, paths, tokens.
+- `<session> is blocked|done`, workspace, kind, branch, detail, `Click:` its URL (`Priority: high` if blocked); never terminal content, paths, tokens.
 - Sent once the status held `settle_secs`, nobody views it, and a done turn is unseen; once per spell, `debounce_secs` per session and status. One POST (10 s, no redirects or proxy env); failures logged.
 
 ## Doctor
 
-`fw hub doctor`: `ok | info | warn | FAIL` per finding, each with a `fix:`; read-only (binds the port a moment, runs `--version`/`--help` only).
+`fw hub doctor`: `ok | info | warn | FAIL` per finding, each with a `fix:`; read-only.
 
 Checks: `fw` / `flywheel` on PATH (a script or other program: FAIL; another build: warn), the running `hub`'s version, `claude` / `codex` and `claude hooks` (missing, no `--version`, `--settings` rejects the hooks),
 state dir and secrets (owner, 0700 / 0600), config files (`fw hub config check`), `recordings` (90%: info, past `dir_cap`: warn), `port`, `tailscale`, `browser`, `systemd` (linger, WSL), `clock`, `disk` (< 2 GiB warn, < 512 MiB FAIL).

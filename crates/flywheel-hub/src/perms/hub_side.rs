@@ -203,6 +203,13 @@ impl Hub {
             signal,
             Some(Signal::Working | Signal::Done | Signal::Ready | Signal::Ended)
         ) {
+            // Moved on without the hub answering it: the terminal did
+            // (an exit answers nothing).
+            if signal != Some(Signal::Ended)
+                && let Some(request) = self.perms().pending_for(session)
+            {
+                self.note_permission_moved_on(session, &request);
+            }
             self.perms().clear_pending(session);
         }
     }
@@ -794,7 +801,7 @@ impl Hub {
 
     /// Answer a blocked session's permission prompt "Yes" (once), if it
     /// still shows the request the rules were proposed for.
-    fn perms_answer(
+    pub(crate) fn perms_answer(
         &self,
         record: &SessionRecord,
         folder: &Folder,
@@ -841,6 +848,11 @@ impl Hub {
         match pty.write(keys.as_bytes().to_vec()) {
             WriteOutcome::Queued => {
                 self.perms().clear_pending(&record.id);
+                self.record_decision(crate::hub::permission_decision(
+                    record,
+                    &request,
+                    "yes (once)",
+                ));
                 (true, "answered Yes".into())
             }
             other => (false, format!("could not type the answer ({other:?})")),

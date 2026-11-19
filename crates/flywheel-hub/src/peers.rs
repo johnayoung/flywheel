@@ -267,6 +267,7 @@ pub fn peer_forbidden(path: &str) -> bool {
         || under("/api/shares")
         || under("/api/recordings")
         || under("/api/perms")
+        || under("/api/holds/answer")
         || path.starts_with("/api/flywheel/autopilot/")
         || under("/api/flywheel/steer")
         || under("/api/flywheel/tasks")
@@ -525,6 +526,8 @@ mod tests {
             "/api/flywheel/tasks",
             // Or clearing a session-limit pause.
             "/api/flywheel/pauses/clear",
+            // And answering holds (permission prompts, gates).
+            "/api/holds/answer",
             "/m/b/api/sessions",
             "/",
             "/login",

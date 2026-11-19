@@ -77,6 +77,7 @@ mod files_api;
 mod flywheel_api;
 mod fs_api;
 mod handoff_api;
+mod holds_api;
 mod import_api;
 mod listen;
 mod log_api;
@@ -368,6 +369,9 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             "/api/sessions/{id}/labels",
             get(sessions_api::get_labels).patch(sessions_api::patch_labels),
         )
+        .route("/api/holds", get(holds_api::list))
+        .route("/api/holds/answer", post(holds_api::answer))
+        .route("/api/decisions", get(holds_api::decisions))
         // The route's first name, kept for older clients.
         .route("/api/sessions/{id}/restart", post(restart_session))
         .route("/api/sessions/{id}/screen", get(session_screen))

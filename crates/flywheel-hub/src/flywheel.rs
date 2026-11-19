@@ -962,6 +962,17 @@ impl FlywheelMonitor {
         self.folders().get(folder).and_then(|slot| slot.panel())
     }
 
+    /// Every watched folder's latest panel, by folder.
+    pub fn panels(&self) -> Vec<(PathBuf, Arc<FlywheelPanel>)> {
+        let mut out: Vec<(PathBuf, Arc<FlywheelPanel>)> = self
+            .folders()
+            .iter()
+            .filter_map(|(folder, slot)| slot.panel().map(|p| (folder.clone(), p)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Every watched folder's latest summary, by folder.
     pub fn summaries(&self) -> Vec<FlywheelSummary> {
         let mut out: Vec<FlywheelSummary> = self

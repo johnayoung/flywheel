@@ -3,8 +3,10 @@
 
 mod capture;
 mod endings;
+mod holds;
 pub use capture::{CAPTURE_TOKEN_FILE, CAPTURED_PREFIX, CaptureFrom, CaptureRefused};
 pub use endings::{AgentEnd, AgentReplace, FORCE_REFUSED};
+pub(crate) use holds::permission_decision;
 pub use relaunches::stale_note;
 mod labels;
 mod links;
@@ -587,6 +589,10 @@ pub struct Hub {
     activity: crate::activity::Activity,
     /// Pending permission requests and their journal (`crate::perms`).
     perms: Arc<crate::perms::Runtime>,
+    /// Every hold's answer (see [`crate::holds`]), and the batch answers
+    /// on their way to the sessions they answer (`hub/holds.rs`).
+    decisions: crate::holds::DecisionStore,
+    batches: Mutex<std::collections::HashMap<String, String>>,
     /// What every agent session does (see [`crate::telemetry`]).
     telemetry: Arc<crate::telemetry::Telemetry>,
     /// How far each watch has looked in the log (see [`crate::watch`]).
@@ -739,6 +745,8 @@ impl Hub {
             relaunch: Mutex::default(),
             activity: crate::activity::Activity::open(&options_state_dir),
             perms: Arc::new(crate::perms::Runtime::new(&options_state_dir, perms_env)),
+            decisions: crate::holds::DecisionStore::new(&options_state_dir),
+            batches: Mutex::default(),
             audit: std::sync::OnceLock::new(),
             _serve_lock: serve_lock,
         }))

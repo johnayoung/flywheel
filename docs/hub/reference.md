@@ -87,6 +87,8 @@ fw hub inbox [--hours N] [--host HUB_ID] [--json] {where}  # pending handoffs, b
 fw hub continue SESSION [--handoff ID] [--name NAME] [--prompt TEXT|-] [--json] {where}  # a linked successor (default: the only pending handoff)
 fw hub starts SESSION [--policy ask|allowed|off|default] [--start ID | --decline ID] [--json] {where}
 fw hub ends SESSION [--approve ID | --decline ID | --cancel] [--json] {where}  # --cancel: its own end
+fw hub holds [--kind K] [--answer A HOLD|N... [--except ID[=A]]...] [--json] {where}  # N: a group's number
+fw hub decisions [--kind K] [--session S] [--since AGE|TIME] [--limit N] [--json] {where}
 fw hub insights [--hours N] [--project NAME] [--host HUB_ID] [--json] {where}
 fw hub capture install [--settings FILE]  # outside runs report
 fw hub capture uninstall [--settings FILE]

@@ -181,6 +181,11 @@ impl Hub {
                 .record(session, claude::status_line(payload, now_ms()));
             return true;
         }
+        if event == "UserPromptSubmit"
+            && let Some(prompt) = payload.get("prompt").and_then(serde_json::Value::as_str)
+        {
+            self.note_prompt(session, prompt);
+        }
         let mut drafts = claude::hook(event, payload, now_ms());
         if let Ok(record) = self.store().session(session) {
             name_session(&mut drafts, SessionKind::Claude, record);
@@ -197,6 +202,14 @@ impl Hub {
             return;
         }
         name_session(&mut drafts, SessionKind::Codex, record);
+        // A turn's prompt answers what the last one asked (Codex logs
+        // only its title).
+        if let Some(title) = drafts.iter().find_map(|d| match &d.what {
+            What::TurnStarted { title } => Some(title.clone()),
+            _ => None,
+        }) {
+            self.note_prompt(&record.id, &title);
+        }
         if drafts.iter().any(|d| matches!(d.what, What::Usage { .. })) {
             let priced = self
                 .commands

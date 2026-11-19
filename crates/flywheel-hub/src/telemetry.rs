@@ -45,7 +45,8 @@ mod tests;
 pub mod turns;
 
 pub use event::{
-    Draft, Event, ItemStatus, OUTSIDE_ROLLUP, Outcome, PlanStep, SessionLinks, WaitReason, What,
+    Draft, Event, HoldKind, ItemStatus, OUTSIDE_ROLLUP, Outcome, PlanStep, SessionLinks,
+    WaitReason, What,
 };
 pub use reduce::{Detail, SessionState, Snapshot};
 pub use store::{BatchRollup, FleetPage, FleetQuery, StoreError};

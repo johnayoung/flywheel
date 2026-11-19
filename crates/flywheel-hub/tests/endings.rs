@@ -1277,3 +1277,206 @@ async fn subagents_cut_short_by_an_exit_do_not_hold_a_relaunch() {
     hub.hub.mark_stale("0.0.1");
     respawned(&hub, &agent, &second).await;
 }
+
+/// The hold ids of the group of `kind` and `cause` in a `/api/holds`
+/// listing, waiting until it has `n`.
+async fn group_of(hub: &TestHub, kind: &str, cause: &str, n: usize) -> Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let listed = hub.get("/api/holds").await;
+        let found = listed["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["kind"] == kind && g["cause"] == cause)
+            .cloned();
+        if let Some(group) = found.filter(|g| g["holds"].as_array().unwrap().len() == n) {
+            return group;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never {n} {kind} holds for {cause:?}: {listed}"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn decisions(hub: &TestHub, query: &str) -> Vec<Value> {
+    hub.get(&format!("/api/decisions?{query}")).await["decisions"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn like_holds_are_answered_as_one_and_every_answer_is_kept() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    lead.turn().await;
+
+    // Three start requests from one lead: one group, answered at once
+    // with one left to its own answer.
+    for n in 1..=3 {
+        let said = lead
+            .ok(
+                "start_session",
+                json!({"name": format!("w{n}"), "prompt": format!("task {n}")}),
+            )
+            .await;
+        assert!(said.contains("operator"), "{said}");
+    }
+    let group = group_of(&hub, "awaiting_approval", "start_session from lead", 3).await;
+    let ids: Vec<String> = group["holds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(group["holds"][0]["answers"], json!(["approve", "decline"]));
+    let answered = hub
+        .post(
+            "/api/holds/answer",
+            json!({"holds": ids, "answer": "approve", "overrides": {ids[2].clone(): "decline"}}),
+        )
+        .await;
+    let batch = answered["batch"].as_str().expect("a batch").to_owned();
+    assert!(
+        answered["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["ok"] == true),
+        "{answered}"
+    );
+    assert!(hub.named("w1").await.is_some() && hub.named("w2").await.is_some());
+    assert!(hub.named("w3").await.is_none());
+    hub.told(&lead, "declined your start request").await;
+    let kept = decisions(&hub, "kind=awaiting_approval").await;
+    assert_eq!(kept.len(), 3, "{kept:?}");
+    let mut answers: Vec<&str> = kept.iter().map(|d| d["answer"].as_str().unwrap()).collect();
+    answers.sort_unstable();
+    assert_eq!(answers, ["approved", "approved", "declined"]);
+    for d in &kept {
+        assert_eq!(d["batch"], batch.as_str(), "{d}");
+        assert_eq!(d["by"], "operator");
+        assert_eq!(d["session_name"], "lead");
+        assert!(
+            d["question"]
+                .as_str()
+                .unwrap()
+                .starts_with("lead asks to start"),
+            "{d}"
+        );
+    }
+    // Each is on the bus once (the activity journal's row: kind and who,
+    // never the question or the answer).
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let rows = hub.get("/api/activity?kind=decision.made").await;
+        let rows = rows["rows"].as_array().cloned().unwrap_or_default();
+        if rows.len() == 3 {
+            let text = serde_json::to_string(&rows).unwrap();
+            assert!(
+                !text.contains("asks to start") && !text.contains("task 1"),
+                "{text}"
+            );
+            assert!(
+                text.contains("awaiting approval hold answered by operator"),
+                "{text}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "no decision rows: {rows:?}");
+        sleep(Duration::from_millis(50)).await;
+    }
+    // A hold answered is gone; answering it again says so.
+    let (status, again) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/holds/answer",
+            Some(json!({"holds": [ids[0].clone()], "answer": "approve"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again["results"][0]["ok"], false, "{again}");
+
+    // Two agents ask the same thing (the agent's kind, cause, and
+    // recommendation): one group. One is answered with the group, the
+    // other left out and answered in its terminal.
+    let a = hub.claude("asker-a", None, json!({})).await;
+    let b = hub.claude("asker-b", None, json!({})).await;
+    for agent in [&a, &b] {
+        agent
+            .hook("UserPromptSubmit", json!({"prompt": "deploy"}))
+            .await;
+        let ask = json!({"tool_name": "mcp__flywheel__ask_operator", "tool_use_id": "tu1",
+                         "tool_input": {"kind": "decide", "text": "Which region?",
+                                        "options": ["eu-west", "us-east"], "hold": "awaiting_approval",
+                                        "cause": "deploy region", "recommendation": "eu-west"}});
+        agent.hook("PreToolUse", ask.clone()).await;
+        agent.hook("PostToolUse", ask).await;
+        agent
+            .hook("Stop", json!({"last_assistant_message": "Which region?"}))
+            .await;
+    }
+    let group = group_of(&hub, "awaiting_approval", "deploy region", 2).await;
+    assert_eq!(group["holds"][0]["recommendation"], "eu-west");
+    let hold_of = |agent: &Agent| {
+        group["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["session"] == agent.id.as_str())
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (ha, hb) = (hold_of(&a), hold_of(&b));
+    let answered = hub
+        .post(
+            "/api/holds/answer",
+            json!({"holds": [ha, hb.clone()], "answer": "eu-west", "overrides": {hb: "skip"}}),
+        )
+        .await;
+    assert!(answered["batch"].is_null(), "one answered: {answered}");
+    a.typed_has("eu-west").await;
+    assert!(!b.typed().contains("eu-west"));
+    // The prompts arrive (the agents' hooks): each answers its ask.
+    a.hook("UserPromptSubmit", json!({"prompt": "eu-west"}))
+        .await;
+    b.hook(
+        "UserPromptSubmit",
+        json!({"prompt": "us-east, it is cheaper"}),
+    )
+    .await;
+    let kept = decisions(&hub, "kind=awaiting_approval&session=asker-a").await;
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0]["question"], "Which region?");
+    assert_eq!(kept[0]["recommendation"], "eu-west");
+    assert_eq!(kept[0]["answer"], "eu-west");
+    assert_eq!(kept[0]["cause"], "deploy region");
+    let kept = decisions(&hub, &format!("session={}", b.id)).await;
+    assert_eq!(kept[0]["answer"], "us-east, it is cheaper");
+    assert_eq!(kept[0]["by"], "operator");
+    // An agent's signed message that answers is the agent's.
+    a.hook("Stop", json!({"last_assistant_message": "Ship it now?"}))
+        .await;
+    a.hook(
+        "UserPromptSubmit",
+        json!({"prompt": "From lead in repo: a message from that agent session\n\nyes"}),
+    )
+    .await;
+    let kept = decisions(&hub, "session=asker-a&kind=needs_input").await;
+    assert_eq!(kept[0]["by"], "agent:lead", "{kept:?}");
+    assert_eq!(kept[0]["question"], "Ship it now?");
+    // Newest first, all kinds, and only since a time.
+    let all = decisions(&hub, "").await;
+    assert_eq!(all.len(), 6);
+    let newest = all[0]["at"].as_i64().unwrap();
+    assert_eq!(decisions(&hub, &format!("since={newest}")).await.len(), 1);
+    let (status, _) = hub
+        .call(reqwest::Method::GET, "/api/decisions?kind=bogus", None)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

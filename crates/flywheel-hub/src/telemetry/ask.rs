@@ -11,7 +11,7 @@
 use super::summary;
 use serde::{Deserialize, Serialize};
 
-use super::event::AskKind;
+use super::event::{AskKind, HoldKind};
 
 /// What a session waits on the operator for, once its turn has ended.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,6 +28,15 @@ pub struct Ask {
     /// The successor's first prompt (`handoff`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// The hold's kind the agent named (else read from `kind`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<HoldKind>,
+    /// The agent's grouping key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+    /// The answer the agent recommends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommendation: Option<String>,
     /// `declared` (the agent's tool) or `inferred` (its closing message).
     pub source: String,
     /// When the turn that asked ended (or, while it runs, when it asked).

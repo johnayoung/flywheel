@@ -453,6 +453,15 @@ impl Hub {
             }
         };
         self.emit(HubEvent::Sessions);
+        let edited = prompt.is_some_and(|p| !p.trim().is_empty()) || trimmed(name).is_some();
+        self.record_decision(super::holds::approval_decision(
+            super::holds::start_hold(&from, &taken),
+            if edited {
+                "approved (edited)"
+            } else {
+                "approved"
+            },
+        ));
         self.tell_starter(
             &from,
             &format!(
@@ -473,6 +482,10 @@ impl Hub {
         // Read, then let go of the store: telling it takes it again.
         let from = self.store().session(id).cloned();
         if let Ok(from) = from {
+            self.record_decision(super::holds::approval_decision(
+                super::holds::start_hold(&from, &removed),
+                "declined",
+            ));
             let named = removed
                 .name
                 .as_deref()

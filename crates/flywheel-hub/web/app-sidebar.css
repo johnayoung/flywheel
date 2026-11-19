@@ -319,6 +319,8 @@ body.list-hidden .side-list { display: none; }
 #sidebar .attn-meta { grid-column: 3; grid-row: 1; display: flex; align-items: baseline; gap: .3rem; padding-top: .15rem; }
 #sidebar .attn-status { padding: 0; background: none; color: var(--alert); font-size: 9.5px; letter-spacing: .06em; }
 #sidebar .attn-status.done { color: var(--brass); }
+#sidebar .attn-status.group { color: var(--signal); }
+#sidebar .attn-group.open .attn-row { background: var(--bg-3); }
 #sidebar .attn-age { font-size: 9.5px; }
 .attn-row .glyph.state > .dot { position: relative; }
 /* Finished turns: one quiet line, their rows once tapped. */

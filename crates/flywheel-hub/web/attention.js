@@ -18,6 +18,10 @@
 // stranded, stopped, or wait on a gate (flywheel.js; a folder with many
 // is one row, and alerts marked seen in its panel drop out). Tap one to open it (a flywheel row opens its folder's
 // Flywheel panel, a fan-out row its board).
+// Holds (GET /api/holds) of one kind and cause, two or more, are one
+// group row answered at once (POST /api/holds/answer); tapped (always on
+// the start screen) it lists its members, each one can be left out or
+// answered its own way. Their own rows step aside while it shows.
 "use strict";
 
 window.FwHubAttention = function (ctx) {
@@ -107,6 +111,244 @@ window.FwHubAttention = function (ctx) {
     }
     out.sort((a, b) => Date.parse(a.end.created_at) - Date.parse(b.end.created_at) || (a.end.id < b.end.id ? -1 : 1));
     return out;
+  }
+
+  // --- hold groups -------------------------------------------------------
+
+  const KIND_WORD = { needs_input: "needs input", awaiting_approval: "approval", permission: "permission", gate: "gate" };
+  // Groups of two or more holds, as the hub last listed them.
+  let holdGroups = [];
+  let holdsSig = "";
+  let holdsAt = 0;
+  let holdsBusy = false;
+  // Members left out of their group's answer, and members answered their
+  // own way, by hold id; a group's reply being typed, by group key.
+  const leftOut = new Set();
+  const ownAnswer = new Map();
+  const groupDrafts = new Map();
+  const groupKey = (g) => `${g.kind}\u0000${g.cause}`;
+
+  // Re-read the holds when what this browser sees waiting changes (and at
+  // most every 20 s otherwise); repaint only when the groups changed.
+  function refreshHolds(sig) {
+    if (holdsBusy || (sig === holdsSig && Date.now() - holdsAt < 20000)) return;
+    holdsBusy = true;
+    holdsSig = sig;
+    ctx
+      .api("GET", "/api/holds")
+      .then((listed) => {
+        const next = (listed.groups || []).filter((g) => (g.holds || []).length > 1);
+        const changed = JSON.stringify(next) !== JSON.stringify(holdGroups);
+        holdGroups = next;
+        if (!changed) return;
+        if (ctx.rerender) ctx.rerender();
+        else render();
+      })
+      .catch(() => {})
+      .finally(() => {
+        holdsAt = Date.now();
+        holdsBusy = false;
+      });
+  }
+
+  // Hold ids (and permission-blocked sessions) a group stands for.
+  function grouped() {
+    const ids = new Set();
+    const blocked = new Set();
+    for (const g of holdGroups) {
+      for (const h of g.holds) {
+        ids.add(h.id);
+        if (h.kind === "permission" && h.session) blocked.add(h.session);
+      }
+    }
+    return { ids, blocked };
+  }
+
+  async function answerGroup(g, answer, node) {
+    const text = String(answer || "").trim();
+    if (!text) return;
+    const overrides = {};
+    for (const h of g.holds) {
+      if (leftOut.has(h.id)) overrides[h.id] = "skip";
+      else if (ownAnswer.get(h.id)) overrides[h.id] = ownAnswer.get(h.id);
+    }
+    if (g.holds.every((h) => overrides[h.id] === "skip")) {
+      ctx.toast("Every hold in the group is left out");
+      return;
+    }
+    if (node) node.classList.add("busy");
+    try {
+      const done = await ctx.api("POST", "/api/holds/answer", { holds: g.holds.map((h) => h.id), answer: text, overrides });
+      const results = done.results || [];
+      const failed = results.filter((r) => !r.ok);
+      const answered = results.filter((r) => r.ok && r.said !== "skipped").length;
+      for (const h of g.holds) {
+        leftOut.delete(h.id);
+        ownAnswer.delete(h.id);
+      }
+      groupDrafts.delete(groupKey(g));
+      ctx.toast(
+        failed.length ? `Answered ${answered}; ${failed.length} not: ${failed[0].error}` : `Answered ${answered} as one decision`,
+        { tone: failed.length ? "bad" : "" },
+      );
+    } catch (error) {
+      ctx.toast(`Not answered: ${error.message}`, { tone: "bad" });
+    } finally {
+      if (node) node.classList.remove("busy");
+      holdsAt = 0;
+      refreshHolds(holdsSig);
+    }
+  }
+
+  // A member's own answer: approvals and gates pick, asks type.
+  function memberChoice(g, h) {
+    if (g.kind === "permission") return null;
+    if (g.kind === "needs_input") {
+      return el("input", {
+        type: "text",
+        className: "attn-reply-input attn-own",
+        placeholder: "own reply",
+        "aria-label": `Own reply to ${h.session_name || h.id}`,
+        value: ownAnswer.get(h.id) || "",
+        oninput: (event) => (event.target.value.trim() ? ownAnswer.set(h.id, event.target.value) : ownAnswer.delete(h.id)),
+      });
+    }
+    const no = g.kind === "gate" ? "deny" : "decline";
+    return el(
+      "select",
+      {
+        className: "attn-own",
+        "aria-label": `Answer for ${h.session_name || h.id}`,
+        onchange: (event) => (event.target.value ? ownAnswer.set(h.id, event.target.value) : ownAnswer.delete(h.id)),
+      },
+      ["", "approve", no].map((v) => el("option", { value: v, selected: (ownAnswer.get(h.id) || "") === v, textContent: v || "as group" })),
+    );
+  }
+
+  // What tells a member from the rest: its session (when they differ)
+  // and its question without the asker's name ("start a claude session
+  // \"w1\": task 1").
+  function memberText(g, h) {
+    const sessions = new Set(g.holds.map((m) => m.session || m.folder || ""));
+    const name = sessions.size > 1 ? h.session_name || (h.folder || "").split("/").pop() : null;
+    let text = h.question || "";
+    if (h.session_name && text.startsWith(`${h.session_name} asks to `)) text = text.slice(`${h.session_name} asks to `.length);
+    return { name, text };
+  }
+
+
+  // Groups opened in the sidebar (the start screen shows every group open).
+  const groupOpen = new Set();
+
+  // One group: a line like the others (its count, its cause, its kind,
+  // since when; who it is under it), then, once tapped (always on the
+  // start screen), its members and the answer for them all.
+  function groupRow(g, full) {
+    const key = groupKey(g);
+    const open = full || groupOpen.has(key);
+    const oldest = Math.min(...g.holds.map((h) => h.since || Date.now()));
+    const recommended = g.holds.map((h) => h.recommendation).filter(Boolean);
+    const who = g.holds.map((h) => {
+      const m = memberText(g, h);
+      return m.name || (m.text.match(/"([^"]+)"/) || [])[1] || h.session_name || h.id;
+    });
+    const detail = recommended.length && recommended.every((r) => r === recommended[0]) ? `recommended: ${recommended[0]}` : who.join(", ");
+    const head = el(
+      "button",
+      {
+        type: "button",
+        className: `attn-row group ${g.kind}`,
+        "aria-expanded": full ? undefined : String(open),
+        title: full ? g.cause : open ? "Fold the group" : `${g.holds.length} like holds, answered as one: open`,
+        onclick: () => {
+          if (full) return;
+          if (groupOpen.has(key)) groupOpen.delete(key);
+          else groupOpen.add(key);
+          if (ctx.rerender) ctx.rerender();
+          else render();
+        },
+      },
+      el("span", { className: "glyph count", textContent: String(g.holds.length) }),
+      el(
+        "span",
+        { className: "attn-text" },
+        el("span", { className: "attn-line" }, el("b", { className: "attn-name", textContent: g.cause })),
+        el("span", { className: "attn-detail", textContent: detail, title: detail }),
+      ),
+      el(
+        "span",
+        { className: "attn-meta" },
+        el("span", { className: `attn-status group ${g.kind}`, textContent: KIND_WORD[g.kind] || g.kind }),
+        el("span", { className: "attn-age", textContent: age(new Date(oldest).toISOString()) }),
+      ),
+    );
+    if (!open) return el("li", { dataset: { id: `group:${key}` }, className: "attn-group" }, head);
+    const members = el(
+      "ul",
+      { className: "attn-members" },
+      g.holds.map((h) =>
+        el(
+          "li",
+          { dataset: { id: h.id }, className: leftOut.has(h.id) ? "out" : "" },
+          el(
+            "label",
+            { className: "attn-member", title: h.question },
+            el("input", {
+              type: "checkbox",
+              checked: !leftOut.has(h.id),
+              "aria-label": `Include ${h.session_name || h.id}`,
+              onchange: (event) => {
+                if (event.target.checked) leftOut.delete(h.id);
+                else leftOut.add(h.id);
+                event.target.closest("li").classList.toggle("out", !event.target.checked);
+              },
+            }),
+            memberText(g, h).name ? el("b", { textContent: memberText(g, h).name }) : null,
+            el("span", { className: "muted", textContent: memberText(g, h).text }),
+          ),
+          memberChoice(g, h),
+        ),
+      ),
+    );
+    const button = (label, answer, ghost) =>
+      el("button", { type: "button", className: `slab${ghost ? " ghost" : ""} attn-group-answer`, textContent: label, onclick: (event) => answerGroup(g, answer, event.target.closest(".attn-group")) });
+    let actions;
+    if (g.kind === "awaiting_approval" && g.holds.every((h) => (h.answers || []).includes("approve"))) {
+      actions = el("div", { className: "attn-handoff-actions" }, button("Decline all", "decline", true), button("Approve all", "approve"));
+    } else if (g.kind === "gate") {
+      actions = el("div", { className: "attn-handoff-actions" }, button("Deny all", "deny", true), button("Approve all", "approve"));
+    } else if (g.kind === "permission") {
+      actions = el("div", { className: "attn-handoff-actions" }, button("Yes to all (once)", "yes"));
+    } else {
+      const field = el("input", {
+        type: "text",
+        className: "attn-reply-input",
+        placeholder: "Reply to all",
+        "aria-label": `Reply to all ${g.holds.length}`,
+        value: groupDrafts.get(key) || "",
+        oninput: (event) => groupDrafts.set(key, event.target.value),
+      });
+      const shared = (g.holds[0].answers || []).filter((a) => g.holds.every((h) => (h.answers || []).includes(a)));
+      const form = el(
+        "form",
+        {
+          className: "attn-reply",
+          onsubmit: (event) => {
+            event.preventDefault();
+            answerGroup(g, field.value, form);
+          },
+        },
+        field,
+        el("button", { type: "submit", className: "slab attn-send", textContent: "Send all" }),
+      );
+      actions = el(
+        "div",
+        { className: "attn-group-reply" },
+        shared.length ? el("div", { className: "attn-options" }, shared.map((a) => el("button", { type: "button", className: "chip attn-option", textContent: a, title: `Reply "${a}" to all`, onclick: () => answerGroup(g, a, null) }))) : null,
+        form,
+      );
+    }
+    return el("li", { dataset: { id: `group:${key}` }, className: "attn-group open" }, head, el("div", { className: "attn-ask attn-pending" }, members, actions));
   }
 
   // A worktree session's branch (the badge cache's, else the one it was
@@ -784,30 +1026,49 @@ window.FwHubAttention = function (ctx) {
       return;
     }
     held = false;
-    const list = entries();
+    const all = entries();
     const passed = handoffEntries();
-    const starts = startEntries();
-    const ends = endEntries();
+    const allStarts = startEntries();
+    const allEnds = endEntries();
+    // What waits changed: re-read the holds (their groups).
+    refreshHolds(
+      [
+        ...all.filter((e) => e.level < 2).map((e) => `${e.session.id}:${e.ask ? e.ask.since : e.agent.since}`),
+        ...allStarts.map((e) => e.start.id),
+        ...allEnds.map((e) => e.end.id),
+        flywheel ? flywheel.attention().length : 0,
+      ].join(","),
+    );
+    // Rows a group stands for step aside.
+    const inGroup = grouped();
+    const list = all.filter((e) =>
+      e.level === 0 ? !inGroup.blocked.has(e.session.id) : e.level === 1 ? !inGroup.ids.has(`ask:${e.session.id}:${e.ask.since}`) : true,
+    );
+    const starts = allStarts.filter((e) => !inGroup.ids.has(`start:${e.session.id}:${e.start.id}`));
+    const ends = allEnds.filter((e) => !inGroup.ids.has(`end:${e.session.id}:${e.end.id}`));
+    const groups = holdGroups;
     shown = new Set(list.map((e) => e.session.id));
-    pendingCount = passed.length + starts.length + ends.length;
+    for (const g of groups) for (const h of g.holds) if (h.session && !/^(start|end):/.test(h.id)) shown.add(h.session);
+    pendingCount = passed.length + starts.length + ends.length + groups.reduce((n, g) => n + g.holds.filter((h) => /^(start|end):/.test(h.id)).length, 0);
     const loop = flywheel ? flywheel.attention() : [];
     const graded = fanout ? fanout.attention() : [];
     const queues = ctx.queue ? ctx.queue().attention() : [];
     for (const root of [$("#attention"), $("#empty-attention")]) {
       if (!root) continue;
-      const any = list.length || passed.length || starts.length || ends.length || loop.length || graded.length || queues.length;
+      const any = groups.length || list.length || passed.length || starts.length || ends.length || loop.length || graded.length || queues.length;
       root.hidden = !any;
-      morph(root, any ? content(list, passed, starts, ends, loop, graded, queues, root.id === "empty-attention") : []);
+      morph(root, any ? content(list, passed, starts, ends, loop, graded, queues, groups, root.id === "empty-attention") : []);
     }
   }
 
-  function content(list, passed, starts, ends, loop, graded, queues, full) {
+  function content(list, passed, starts, ends, loop, graded, queues, groups, full) {
     const blocked = list.filter((e) => e.level === 0).length;
     const asking = list.filter((e) => e.level === 1).length;
     const failed = list.filter((e) => e.level === 2 && e.agent.state === "failed").length;
     const alerts = loop.reduce((n, e) => n + (e.count || 1), 0);
     // The heading's counts, on one line.
     const said = [
+      groups.length ? `${groups.reduce((n, g) => n + g.holds.length, 0)} in ${groups.length} group${groups.length === 1 ? "" : "s"}` : "",
       blocked ? `${blocked} blocked` : "",
       passed.length ? `${passed.length} handoff${passed.length === 1 ? "" : "s"}` : "",
       starts.length ? `${starts.length} start${starts.length === 1 ? "" : "s"}` : "",
@@ -832,6 +1093,7 @@ window.FwHubAttention = function (ctx) {
       el(
         "ul",
         { className: "attn-list" },
+        groups.map((g) => groupRow(g, full)),
         list.filter((e) => e.level === 0).map((e) => row(e, full)),
         passed.map(handoffRow),
         starts.map(startRow),

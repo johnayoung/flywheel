@@ -801,6 +801,9 @@ impl SessionState {
                 command,
                 options,
                 prompt,
+                hold,
+                cause,
+                recommendation,
             } => {
                 event.work = self.turn.clone();
                 // A subagent's ask does not end the session's turn: its
@@ -812,6 +815,9 @@ impl SessionState {
                         command: command.clone(),
                         options: options.clone(),
                         prompt: prompt.clone(),
+                        hold: *hold,
+                        cause: cause.clone(),
+                        recommendation: recommendation.clone(),
                         source: "declared".to_owned(),
                         since: ts,
                     });
@@ -1035,6 +1041,9 @@ impl SessionState {
             command: None,
             options: Vec::new(),
             prompt: None,
+            hold: None,
+            cause: None,
+            recommendation: None,
             source: "inferred".to_owned(),
             since: ts,
         })

@@ -1041,6 +1041,10 @@ impl Hub {
         match started {
             Ok(said) => {
                 self.emit(HubEvent::Sessions);
+                self.record_decision(super::holds::approval_decision(
+                    super::holds::end_hold(&from, &taken, &target.name),
+                    "approved",
+                ));
                 self.tell(
                     &from.id,
                     &format!(
@@ -1065,6 +1069,14 @@ impl Hub {
         let removed = self.store().remove_end_request(id, end)?;
         self.emit(HubEvent::Sessions);
         let name = self.session_name(&removed.target);
+        // Read, then let go of the store: recording takes it again.
+        let from = self.store().session(id).cloned();
+        if let Ok(from) = from {
+            self.record_decision(super::holds::approval_decision(
+                super::holds::end_hold(&from, &removed, &name),
+                "declined",
+            ));
+        }
         self.tell(
             id,
             &format!(

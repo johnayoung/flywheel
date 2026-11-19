@@ -48,6 +48,8 @@ pub mod flywheel;
 pub mod fsbrowse;
 pub mod git;
 pub mod handoff;
+pub mod holds;
+mod holds_cli;
 pub mod hub;
 mod insights_cli;
 mod label_cli;

@@ -400,6 +400,7 @@ pub(super) async fn decide(
         Err(response) => return response,
     };
     let with_feedback = feedback.is_some();
+    let kept_feedback = feedback.clone();
     let decision = GateDecision {
         run_id: request.run,
         approve,
@@ -419,6 +420,32 @@ pub(super) async fn decide(
             // has the command; this is the timeline's and plugins' copy).
             let (event, payload) = gate_decided_event(&path, &done, with_feedback);
             app.hub.emit_lifecycle(event, payload);
+            // The decision record keeps the gate as it was shown.
+            let shown = monitor.panel(&path).and_then(|panel| {
+                panel.intake.as_ref().and_then(|i| {
+                    i.gates
+                        .iter()
+                        .find(|g| {
+                            g.run_id == done.run_id
+                                && g.gate == done.gate
+                                && g.attempt == done.attempt
+                        })
+                        .and_then(|g| {
+                            crate::holds::gate_hold(
+                                &path,
+                                &crate::autopilot::PilotGate {
+                                    pending: None,
+                                    ..g.clone()
+                                },
+                            )
+                        })
+                })
+            });
+            app.hub.record_decision(crate::holds::gate_decision(
+                shown,
+                &done,
+                kept_feedback.as_deref(),
+            ));
             monitor.refresh(&path);
             Json(done).into_response()
         }

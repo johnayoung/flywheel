@@ -584,6 +584,20 @@ pub(crate) fn draft_for(event: &str, payload: &Value) -> Option<Draft> {
             draft(how).with("code", code).with("signal", signal)
         }
         "session.removed" => draft("was removed".to_owned()),
+        "decision.made" => {
+            // Kind, who, and the batch: never the question or the answer.
+            let kind = str_at(payload, "/kind").unwrap_or("needs_input");
+            let by = str_at(payload, "/by").unwrap_or("operator");
+            let text = format!("{} hold answered by {by}", kind.replace('_', " "));
+            let row = if session.is_object() {
+                draft(text)
+            } else {
+                Draft::new(event, text)
+            };
+            row.with("kind", kind)
+                .with("by", by)
+                .with("batch", str_at(payload, "/batch"))
+        }
         "status.changed" => {
             if str_at(payload, "/status") != Some("blocked") {
                 return None;

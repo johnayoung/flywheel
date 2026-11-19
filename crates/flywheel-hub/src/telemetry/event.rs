@@ -83,6 +83,43 @@ pub enum WaitReason {
     Question,
 }
 
+/// What kind of hold a session waits on the operator for (see
+/// [`crate::holds`]): the axis Needs you groups by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HoldKind {
+    /// A reply in words, or a command's output.
+    NeedsInput,
+    /// A yes or no on something the agent wants to do.
+    AwaitingApproval,
+    /// A harness permission prompt.
+    Permission,
+    /// A flywheel manual gate.
+    Gate,
+}
+
+impl HoldKind {
+    pub const ALL: [Self; 4] = [
+        Self::NeedsInput,
+        Self::AwaitingApproval,
+        Self::Permission,
+        Self::Gate,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsInput => "needs_input",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Permission => "permission",
+            Self::Gate => "gate",
+        }
+    }
+
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == word)
+    }
+}
+
 /// What an agent asks the operator for when it ends its turn on them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -349,6 +386,15 @@ pub enum What {
         /// The successor's first prompt (`handoff`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        /// The hold's kind, when the agent named one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold: Option<HoldKind>,
+        /// What groups it with like asks (the agent's key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<String>,
+        /// The answer the agent recommends.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recommendation: Option<String>,
     },
     /// The session started waiting on a person.
     #[serde(rename = "wait.started")]

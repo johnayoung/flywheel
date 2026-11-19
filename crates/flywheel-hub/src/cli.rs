@@ -165,6 +165,14 @@ enum HubCommand {
     /// decision, or a command only you can run (asking), each with what
     /// it asks and how to answer.
     Inbox(crate::fleet_cli::InboxArgs),
+    /// What waits on you, grouped by kind (needs_input,
+    /// awaiting_approval, permission, gate) and cause; `--answer` answers
+    /// holds or whole groups at once, `--except` leaves some out or
+    /// answers them their own way.
+    Holds(crate::holds_cli::HoldsArgs),
+    /// Every hold's answer, kept: the question, the agent's
+    /// recommendation, the answer, who gave it, when, for which session.
+    Decisions(crate::holds_cli::DecisionsArgs),
     /// Report runs the hub did not start (`claude -p`, Agent SDK runs, a
     /// session in a plain terminal): `capture install` adds user-level
     /// hooks to Claude Code's settings, `capture uninstall` removes them,
@@ -790,6 +798,8 @@ fn dispatch_verb(
         HubCommand::Tail(args) => crate::tail_cli::tail(&args, out, err),
         HubCommand::Fleet(args) => crate::fleet_cli::fleet(&args, out, err),
         HubCommand::Inbox(args) => crate::fleet_cli::inbox(&args, out, err),
+        HubCommand::Holds(args) => crate::holds_cli::holds(&args, out, err),
+        HubCommand::Decisions(args) => crate::holds_cli::decisions(&args, out, err),
         HubCommand::Digest(args) => crate::digest_cli::run(&args, out, err),
         HubCommand::Review(args) => crate::review_cli::review(&args, out, err),
         HubCommand::Merge(args) => crate::review_cli::merge(&args, out, err),

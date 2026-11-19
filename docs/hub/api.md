@@ -98,7 +98,7 @@ A session lists `agent` (`state`, `detail`, `since`, AskUserQuestion's `question
 
 | Method | Path | |
 |---|---|---|
-| GET / POST | `/api/fanouts` | list / launch `{"workspace_id","prompt","candidates":[{"kind","model"?,...}],"graders":[CMD\|{"run","name"?}],"base"?,"protect"?,"from_task"?,...}` (`fanout new`'s flags) -> 201 |
+| GET / POST | `/api/fanouts` | list / launch `{"workspace_id","prompt","candidates":[{"kind","model"?,...}],"graders":[CMD\|{"run","name"?}],"base"?,"protect"?,"from_task"?,...}` -> 201 |
 | GET / DELETE | `/api/fanouts/{id}` | the ranked board / forget it (204; sessions, worktrees stay) |
 | POST | `/api/fanouts/{id}/grade` | `{"candidate"}` -> 202 |
 | POST | `/api/fanouts/{id}/fix` | `{"candidate","dry_run"?}` |
@@ -110,20 +110,20 @@ A session lists `agent` (`state`, `detail`, `since`, AskUserQuestion's `question
 | GET | `/api/flywheel` | per adopted folder: counts, `plans`, alerts, live runs, worker |
 | GET | `/api/flywheel/panel?folder=` | `queued_in`, `relandable`, `waiting_on`, `landing` (`fw status --json`), `pauses` (`fw pauses --json`), `last_tool`, `plans[].tasks`; 404 unadopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next","attempts"}` (poll `since=next`); 503 read waits |
-| GET | `/api/flywheel/history?folder=&task=` | every run; attempts' `outcome`/`error`/`checks` (= `fw show`); task `goal`, `checks` (held-out: names) |
-| GET | `/api/flywheel/task?folder=&task=` | task as a fan-out seed |
+| GET | `/api/flywheel/history?folder=&task=` | every run; attempts' `outcome`/`error`/`checks`; task `goal`, `checks` (held-out: names) |
+| GET | `/api/flywheel/task?folder=&task=` | as a fan-out seed |
 | POST | `/api/flywheel/tasks` | `{"folder","task_id","goal","phase"?,"prerequisites"?,"checks":[{"run","name"?}]}`, two-step; 400 invalid |
-| GET | `/api/flywheel/autopilot?folder=` | `intake` (+ 20 newest decisions), this hub's autopilot sessions |
-| POST | `/api/flywheel/autopilot/start` | `{"folder","confirm":true}` -> 201 the `fw autopilot` session; 400 unconfirmed; 409 running here or elsewhere |
+| GET | `/api/flywheel/autopilot?folder=` | `intake` (+ 20 newest decisions), its sessions here |
+| POST | `/api/flywheel/autopilot/start` | `{"folder","confirm":true}` -> 201 its session; 400 unconfirmed; 409 running |
 | POST | `/api/flywheel/autopilot/stop` | `{"folder"}` -> 202 (Ctrl-C); 409 none of this hub's |
 | POST | `/api/flywheel/autopilot/pause` | `{"folder"}` -> `{"paused","changed"}` |
 | POST | `/api/flywheel/autopilot/resume` | as `pause` |
-| POST | `/api/flywheel/autopilot/decide` | `{"folder","run","decision":"approve"/"deny","confirm":true}` + `gate`, `attempt`, `feedback` (as `fw hub autopilot`); 409 not that gate or one queued; 404 no run |
+| POST | `/api/flywheel/autopilot/decide` | `{"folder","run","decision":"approve"/"deny","confirm":true}` + `gate`, `attempt`, `feedback`; 409 not that gate or one queued; 404 no run |
 | POST | `/api/flywheel/steer/say` | `{"folder","run","message"}` -> 201 one `fw say` command; 400 empty; 409 not running/validating |
 | POST | `/api/flywheel/steer/interrupt` | `{"folder","run"}`: as `say`, for `fw interrupt` |
 | POST | `/api/flywheel/pauses/clear` | `{"folder","ids"?\|"account"?\|"all"?,"reason"}` -> `{"cleared":[id]}`, via `hub`; 400 empty reason; 409 no match |
-| POST | `/api/flywheel/reland` | `{"folder","task","workspace_id"?,"cols"?,"rows"?}` -> 201 the `fw reland <task>` session; 409 nothing to re-land / running; 404 unknown task |
-| POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"account"?,"cols"?,"rows"?}` -> 201 the `fw worker [--account A]` session; 409 running, unless `another`; 400 unknown account, `--state-dir` hub |
+| POST | `/api/flywheel/reland` | `{"folder","task","workspace_id"?,"cols"?,"rows"?}` -> 201 its session; 409 nothing to re-land / running; 404 unknown task |
+| POST | `/api/flywheel/worker` | `{"folder","workspace_id"?,"another"?,"tasks"?,"with_prereqs"?,"account"?,"cols"?,"rows"?}` -> 201 its session; 409 running, unless `another`; 400 unknown account, `--state-dir` hub |
 
 Fan-outs off: 503.
 
@@ -304,7 +304,7 @@ Client sends `{"type":"view","session_id","visible"?:[ids],"present"?}`: on scre
 
 Manifest: [hub-reference](reference.md#plugintoml).
 
-- **Run**: cwd the plugin dir, own group; stdin `{"version":1,"type":"event"|"action","plugin","event"|"action","at","hub","payload"}`; env an allowlist (`PATH HOME USER LANG ...`) + `FW_HUB_PLUGIN`, `FW_HUB_PLUGIN_DIR`, `FW_HUB_PLUGIN_TRIGGER` (`event:<name>` / `action:<id>`), `FW_HUB_STATE_DIR`, never the token.
+- **Run**: cwd the plugin dir, own group; stdin `{"version":1,"type":"event"|"action","plugin","event"|"action","at","hub","payload"}`; env an allowlist + `FW_HUB_PLUGIN`, `FW_HUB_PLUGIN_DIR`, `FW_HUB_PLUGIN_TRIGGER` (`event:<name>` / `action:<id>`), `FW_HUB_STATE_DIR`, never the token.
 - **Limits**: SIGTERM at `timeout_secs`, SIGKILL 0.5 s later; 64 KiB output kept; `plugins.max_concurrent` at once; over 64 waiting, drop. Logs: `plugin-logs/<name>.jsonl` (200 runs past 512 KiB).
 - **Response** (stdout JSON): `{"toast": "text" | {"message","tone":"info|ok|warn|error"}}`; actions also `{"paste":{"text","run"?,"session"?}}` (64 KiB).
 
@@ -346,6 +346,15 @@ Manifest: [hub-reference](reference.md#plugintoml).
 | `autopilot.approved` | `task_id`, `run_id`, `gate`, `attempt`, `command_id`, `feedback` (bool, not the text) |
 | `autopilot.denied` | as `approved` |
 | `digest.ready` | `digest`: as `GET /api/digests/{id}`; no `session` |
+| `decision.made` | a decision (as `/api/decisions`), less `question`, `answer` to 2000 chars |
+
+## Holds
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/holds[?kind=]` | `groups`: `kind`, `cause`, `holds` |
+| POST | `/api/holds/answer` | `{"holds","answer","overrides"?:{id:answer\|"skip"}}` -> `batch`, `results`; not peers |
+| GET | `/api/decisions[?kind=&session=&since=MS&limit=]` | newest first |
 
 ## Prompt queues
 

@@ -6,7 +6,7 @@
 //! rate limits. Those come from the status line's input, the only place
 //! Claude Code hands the 5-hour and 7-day gauges to another program.
 
-use super::event::{AskKind, Draft, ItemStatus, Outcome, PlanStep, WaitReason, What};
+use super::event::{AskKind, Draft, HoldKind, ItemStatus, Outcome, PlanStep, WaitReason, What};
 use super::summary;
 use serde_json::Value;
 
@@ -282,6 +282,13 @@ fn declared(tool: &str, input: &Value) -> Option<What> {
                 })
                 .unwrap_or_default(),
             prompt: None,
+            hold: str_of(input, "hold").and_then(HoldKind::parse),
+            cause: str_of(input, "cause")
+                .map(summary::text)
+                .filter(|c| !c.is_empty()),
+            recommendation: str_of(input, "recommendation")
+                .map(summary::text)
+                .filter(|r| !r.is_empty()),
         }),
         "TodoWrite" => Some(What::PlanSet {
             source: "todo".to_owned(),

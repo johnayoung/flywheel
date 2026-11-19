@@ -815,6 +815,9 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             command: None,
             options: vec!["a".into()],
             prompt: None,
+            hold: None,
+            cause: None,
+            recommendation: None,
         },
         What::WaitStarted {
             reason: WaitReason::Permission,

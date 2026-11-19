@@ -195,7 +195,9 @@ fn ask_tool() -> Value {
                         your turn: their reply arrives as your next prompt. Use it only when you \
                         cannot go on without them. kind: answer (a reply in words), decide (pick \
                         one of options), run (a command only they can run; they send its output \
-                        back).",
+                        back). Optional: hold (needs_input, the default, or awaiting_approval: a \
+                        yes or no on something you want to do), cause (a short key shared by asks \
+                        the operator can answer together), recommendation (your answer).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -212,6 +214,15 @@ fn ask_tool() -> Value {
                 "command": {
                     "type": "string",
                     "description": "run: the exact command to run."
+                },
+                "hold": { "type": "string", "enum": ["needs_input", "awaiting_approval"] },
+                "cause": {
+                    "type": "string",
+                    "description": "A short key; asks with the same one are answered together."
+                },
+                "recommendation": {
+                    "type": "string",
+                    "description": "The answer you recommend (decide: default the first option)."
                 }
             },
             "required": ["kind", "text"]

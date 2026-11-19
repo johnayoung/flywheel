@@ -598,8 +598,16 @@ async fn codex_prompts_rules_and_settings() {
     );
     assert_eq!(view["codex"]["trust_level"], Value::Null);
 
-    // Journaled on the screen's blocked status.
-    let suggested = hub.get(&format!("/api/perms/suggest?session={sid}")).await;
+    // Journaled on the screen's blocked status (the journal is written off
+    // the status path, so wait for it rather than race it).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let suggested = loop {
+        let suggested = hub.get(&format!("/api/perms/suggest?session={sid}")).await;
+        if !suggested["suggestions"][0].is_null() || std::time::Instant::now() > deadline {
+            break suggested;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
     assert_eq!(suggested["suggestions"][0]["agent"], "codex", "{suggested}");
 
     // A prefix rule in the project's rules file, then the prompt answered y.

@@ -228,6 +228,10 @@ enum HubCommand {
     /// (shared or exclusive, waiting in a fair line), run a command
     /// holding one, release, ls, break (operator).
     Lease(crate::lease_cli::LeaseArgs),
+    /// Review records: record a verdict on BASE..HEAD, ls them (by repo
+    /// or commit), check that a range is covered by READY reviews (exit 1
+    /// when not), retract one (operator).
+    Verdict(crate::verdict_cli::VerdictArgs),
     /// A session's pull request: state, review decision, mergeability,
     /// and CI checks (from gh, cached by the hub); log prints a failing
     /// check's log, fix-ci asks the agent to fix it (queued while it
@@ -848,6 +852,7 @@ fn dispatch_verb(
         HubCommand::Label(args) => crate::label_cli::label(&args, out, err),
         HubCommand::Watch(args) => crate::watch_cli::main(&args, out, err),
         HubCommand::Lease(args) => crate::lease_cli::main(&args, out, err),
+        HubCommand::Verdict(args) => crate::verdict_cli::main(&args, out, err),
         HubCommand::Pr(args) => crate::pr_cli::main(&args, out, err),
         HubCommand::Autopilot(args) => crate::autopilot_cli::main(&args, out, err),
     }

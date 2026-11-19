@@ -369,6 +369,9 @@ Behaviour: [hub-workflows](workflows.md#prompt-queue). `{item}`: id prefix (4+) 
 | GET / DELETE | `/api/leases/waiters/{id}[?wait=]` | collect (202: waiting) / cancel |
 | POST | `/api/leases/{id}/renew` | `{"holder"?,"ttl_secs"?}` |
 | POST | `/api/leases/{id}/release` | `{"holder"?,"break"?}` |
+| GET / POST | `/api/verdicts[?repo=&sha=&reviewer=]` | list / record `{"repo","base","head","verdict","findings"?,"report"?,"follow_up_of"?}` |
+| GET | `/api/verdicts/coverage?repo=&range=` | `ok`, `uncovered` (`why`) |
+| POST | `/api/verdicts/{id}/retract` | `{"reason"}` |
 | GET / POST | `/api/sessions/{id}/queue` | `paused`, `stalled`, `items` (`watch`?), `waiting` (why the next waits; 400 a shell), `watches`; POST `{"text","when"?,"topic"?}` -> 201 |
 | PATCH / DELETE | `/api/sessions/{id}/queue/items/{item}` | PATCH `{"text"?,"when"?}`; 409 one being sent |
 | POST | `/api/sessions/{id}/queue/items/{item}/move` | `{"position"}` (1-based among pending) |

@@ -60,6 +60,9 @@ pub const WATCH_TOOL: &str = "watch";
 pub const UNWATCH_TOOL: &str = "unwatch";
 /// The lease tool's name on the server.
 pub const LEASE_TOOL: &str = "lease";
+/// The review record tools' names on the server.
+pub const RECORD_REVIEW_TOOL: &str = "record_review";
+pub const CHECK_REVIEWED_TOOL: &str = "check_reviewed";
 
 /// What an agent asks the `lease` tool for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -153,6 +156,16 @@ pub trait Host {
     fn unwatch(&self, id: &str) -> Result<String, String>;
     /// Acquire, release, or list leases for the caller.
     fn lease(&self, args: &LeaseArgs) -> Result<String, String>;
+    /// Record a review the caller made (or ran).
+    fn record_review(&self, input: &crate::hub::reviews::ReviewInput) -> Result<String, String>;
+    /// Whether every commit of `range` in `repo` is covered by a READY
+    /// review.
+    fn check_reviewed(
+        &self,
+        repo: &str,
+        range: &str,
+        patch_equivalent: bool,
+    ) -> Result<String, String>;
     /// Keep a proposed handoff for the operator; what to tell the agent.
     fn handoff(
         &self,
@@ -627,6 +640,67 @@ fn lease_tool() -> Value {
     })
 }
 
+fn record_review_tool() -> Value {
+    json!({
+        "name": RECORD_REVIEW_TOOL,
+        "title": "Record a review",
+        "description": "Record your review of a commit range so leads and the operator can \
+                        check it later by SHA. Give repo (any path inside it; default your \
+                        directory), base and head (SHAs or refs, resolved now), verdict READY, \
+                        READY_WITH_CHANGES or NOT_READY, findings counted by severity, and \
+                        report (path to your full review; the hub keeps a copy). follow_up_of: \
+                        the review id this re-review answers. If you record for a subagent you \
+                        ran, set reviewer to its label. Records cannot be changed: record a \
+                        follow-up instead.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string", "description": "Optional: a path inside the repo. Default: your directory." },
+                "base": { "type": "string", "description": "The commit the reviewed range starts after." },
+                "head": { "type": "string", "description": "The last commit reviewed." },
+                "verdict": { "type": "string", "enum": ["READY", "READY_WITH_CHANGES", "NOT_READY"] },
+                "findings": {
+                    "type": "object",
+                    "description": "Optional: findings counted by severity.",
+                    "properties": {
+                        "critical": { "type": "integer", "minimum": 0 },
+                        "high": { "type": "integer", "minimum": 0 },
+                        "medium": { "type": "integer", "minimum": 0 },
+                        "low": { "type": "integer", "minimum": 0 },
+                        "info": { "type": "integer", "minimum": 0 }
+                    }
+                },
+                "report": { "type": "string", "description": "Optional: path to the full review (at most 256 KiB)." },
+                "follow_up_of": { "type": "string", "description": "Optional: the review id this one answers." },
+                "reviewer": { "type": "string", "description": "Optional: the label of a subagent you ran that did the review. Default: you." },
+                "note": { "type": "string", "description": "Optional: a short note." }
+            },
+            "required": ["base", "head", "verdict"]
+        }
+    })
+}
+
+fn check_reviewed_tool() -> Value {
+    json!({
+        "name": CHECK_REVIEWED_TOOL,
+        "title": "Check review coverage",
+        "description": "Check that every commit in repo's base..head is covered by a READY \
+                        review (directly or through follow-ups). Answers ok, then each uncovered \
+                        commit with why: no review, NOT_READY, READY_WITH_CHANGES with no READY \
+                        follow-up, or reviewed only by its author. Use it before merging or \
+                        releasing reviewed work.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string", "description": "Optional: a path inside the repo. Default: your directory." },
+                "range": { "type": "string", "description": "BASE..HEAD (SHAs or refs)." },
+                "patch_equivalent": { "type": "boolean", "description": "Optional: a commit with no review counts if a covered commit has the same patch (a rebase). Default false." }
+            },
+            "required": ["range"]
+        }
+    })
+}
+
 /// The `label` tool's arguments as a change and its condition.
 fn label_args(
     args: &Value,
@@ -707,6 +781,8 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                 watch_tool(),
                 unwatch_tool(),
                 lease_tool(),
+                record_review_tool(),
+                check_reviewed_tool(),
             ] })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str);
@@ -873,6 +949,24 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                     Ok(said) => text_result(said, false),
                     Err(why) => text_result(format!("No lease: {why}"), true),
                 })
+            } else if name == Some(RECORD_REVIEW_TOOL) {
+                let input: Result<crate::hub::reviews::ReviewInput, _> =
+                    serde_json::from_value(args.clone());
+                Ok(match input {
+                    Err(e) => text_result(format!("Not recorded: {e}"), true),
+                    Ok(input) => match host.record_review(&input) {
+                        Ok(said) => text_result(said, false),
+                        Err(why) => text_result(format!("Not recorded: {why}"), true),
+                    },
+                })
+            } else if name == Some(CHECK_REVIEWED_TOOL) {
+                let twins = args.get("patch_equivalent").and_then(Value::as_bool) == Some(true);
+                Ok(
+                    match host.check_reviewed(arg("repo"), arg("range"), twins) {
+                        Ok(said) => text_result(said, false),
+                        Err(why) => text_result(format!("Not checked: {why}"), true),
+                    },
+                )
             } else if name == Some(UNWATCH_TOOL) {
                 Ok(match host.unwatch(arg("id")) {
                     Ok(said) => text_result(said, false),
@@ -1016,6 +1110,20 @@ mod tests {
         }
         fn lease(&self, args: &LeaseArgs) -> Result<String, String> {
             Ok(format!("{} {:?}", args.action, args.resource))
+        }
+        fn record_review(
+            &self,
+            input: &crate::hub::reviews::ReviewInput,
+        ) -> Result<String, String> {
+            Ok(format!("Recorded {}", input.verdict))
+        }
+        fn check_reviewed(
+            &self,
+            repo: &str,
+            range: &str,
+            _patch_equivalent: bool,
+        ) -> Result<String, String> {
+            Ok(format!("ok {repo} {range}"))
         }
         fn label(
             &self,
@@ -1233,7 +1341,9 @@ mod tests {
                 LABEL_TOOL,
                 WATCH_TOOL,
                 UNWATCH_TOOL,
-                LEASE_TOOL
+                LEASE_TOOL,
+                RECORD_REVIEW_TOOL,
+                CHECK_REVIEWED_TOOL
             ]
         );
         let asked = answer(&json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",

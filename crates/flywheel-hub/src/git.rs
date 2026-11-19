@@ -955,6 +955,122 @@ pub fn spawn_watcher<T: BadgeSource>(owner: &Arc<T>) {
         });
 }
 
+// --- Review records (see crate::reviews) ------------------------------------
+
+/// The repo `dir` is in, as one key for all its worktrees: its common git
+/// dir, canonical.
+pub fn common_dir(dir: &Path) -> Result<PathBuf, String> {
+    let out = git(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    PathBuf::from(out.trim())
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", out.trim()))
+}
+
+/// `rev` as a full commit id.
+pub fn commit_id(dir: &Path, rev: &str) -> Result<String, String> {
+    let rev = rev.trim();
+    if rev.is_empty() || rev.starts_with('-') {
+        return Err(format!("{rev:?} is not a commit"));
+    }
+    git(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .map(|s| s.trim().to_owned())
+    .map_err(|_| format!("{rev:?} is not a commit in {}", dir.display()))
+}
+
+/// Whether `ancestor` is an ancestor of (or is) `of`.
+pub fn is_ancestor(dir: &Path, ancestor: &str, of: &str) -> bool {
+    git_ok(dir, &["merge-base", "--is-ancestor", ancestor, of])
+}
+
+/// The commits of `base..head`, oldest first, with subjects; at most
+/// `cap` (an error past it).
+pub fn range_commits(
+    dir: &Path,
+    base: &str,
+    head: &str,
+    cap: usize,
+) -> Result<Vec<(String, String)>, String> {
+    let out = git(
+        dir,
+        &[
+            "log",
+            "--reverse",
+            "--format=%H%x00%s",
+            &format!("--max-count={}", cap + 1),
+            &format!("{base}..{head}"),
+        ],
+    )?;
+    let commits: Vec<(String, String)> = out
+        .lines()
+        .filter_map(|l| l.split_once('\0'))
+        .map(|(sha, subject)| (sha.to_owned(), subject.to_owned()))
+        .collect();
+    if commits.len() > cap {
+        return Err(format!("{base}..{head} has more than {cap} commits"));
+    }
+    Ok(commits)
+}
+
+/// Each of `shas`' stable patch id (merges and empty commits have none).
+pub fn patch_ids(dir: &Path, shas: &[String]) -> HashMap<String, String> {
+    if shas.is_empty() {
+        return HashMap::new();
+    }
+    let mut args = vec![
+        "-C".to_owned(),
+        dir.to_string_lossy().into_owned(),
+        "show".to_owned(),
+        "--no-color".to_owned(),
+        "--no-ext-diff".to_owned(),
+        "--format=commit %H".to_owned(),
+    ];
+    args.extend(shas.iter().cloned());
+    let Ok(shown) = runner::run(&runner::Spec {
+        program: "git",
+        dir: Path::new("/"),
+        args,
+        stdin: None,
+        timeout: GIT_TIMEOUT,
+        limit: GIT_OUTPUT_LIMIT,
+    }) else {
+        return HashMap::new();
+    };
+    if !shown.success() {
+        return HashMap::new();
+    }
+    let Ok(ids) = runner::run(&runner::Spec {
+        program: "git",
+        dir: Path::new("/"),
+        args: vec![
+            "-C".to_owned(),
+            dir.to_string_lossy().into_owned(),
+            "patch-id".to_owned(),
+            "--stable".to_owned(),
+        ],
+        stdin: Some(shown.stdout_text().into_bytes()),
+        timeout: GIT_TIMEOUT,
+        limit: GIT_OUTPUT_LIMIT,
+    }) else {
+        return HashMap::new();
+    };
+    ids.stdout_text()
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(patch, sha)| (sha.trim().to_owned(), patch.to_owned()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -160,6 +160,10 @@ fw hub lease run RESOURCE [--shared] [--ttl SPAN] [--wait SPAN] [--note T] [--or
 fw hub lease release LEASE|RESOURCE [--json] {where}
 fw hub lease ls [RESOURCE] [--json] {where}
 fw hub lease break LEASE [--json] {where}
+fw hub verdict record BASE..HEAD --verdict V [--repo P] [--findings high=1,..] [--report P] [--follow-up-of ID] [--reviewer L] [--note T] [--json] {where}
+fw hub verdict ls [--repo P] [--sha SHA] [--limit N] [--json] {where}
+fw hub verdict check BASE..HEAD [--repo P] [--patch-equivalent] [--json] {where}  # exit 1: uncovered
+fw hub verdict retract ID --reason T [--json] {where}
 fw hub broadcast [TARGET]... TEXT|- [--label K[=V]]... [--header] [--json] {where}  # exit 1: any refused
 ```
 
@@ -465,7 +469,7 @@ Also: `F2` / double-click renames and `Delete` closes a focused sidebar row.
 
 All files 0600, the dir 0700.
 
-- `token`; `logins.json` (login-cookie digests); `state.json` (workspaces, sessions, layouts, templates, fan-outs, queues; schema 6); `settings.json`; `hub.toml`, `notify.toml`; `coord.db` (leases).
+- `token`; `logins.json` (login-cookie digests); `state.json` (workspaces, sessions, layouts, templates, fan-outs, queues; schema 6); `settings.json`; `hub.toml`, `notify.toml`; `coord.db` (leases), `reviews.db`, `reports/`.
 - `server.json`, `serve.lock`, `report.sock`, `handoff.sock` (the running hub's address, lock, sockets); `hub.log[.1..3]`.
 - `machines.json` (plaintext credentials), `peers.json`, `shares.json` (digests); `commands/<id>.json` (blocks, replies, usage), `usage-archive.json` (removed sessions').
 - `recordings/`, `plugins/`, `plugins.json`, `plugin-logs/`, `agent-detection/`, `tls/` (local CA); `activity*.jsonl`, `activity-clients.json`; `digest.json`, `digest.lock`; `open-<id>.html` (`open` redirects); `claude-accounts/<name>.token`.

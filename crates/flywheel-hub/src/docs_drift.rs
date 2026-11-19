@@ -678,15 +678,18 @@ const PAGES: [(&str, &str); 6] = [
 /// labels and the event log (three verbs, two routes, a filter syntax,
 /// socket resume), after condensing api.md's sessions and plugin rows;
 /// to 96 KiB for watches (a verb with three actions, two routes, two
-/// agent tools).
-const HUB_DOCS_MAX_BYTES: usize = 96 * 1024;
+/// agent tools); to 97 KiB for leases and review records (two verbs with
+/// nine actions, seven routes, three agent tools, three state files),
+/// after condensing the activity, fleet, and internals text by 0.7 KB.
+const HUB_DOCS_MAX_BYTES: usize = 97 * 1024;
 /// One reference page's budget. Raised from 25 KiB to 26 for asks,
 /// handoffs, and session links (a route, two event kinds, the snapshot's
 /// `ask` and `links`): api.md was condensed first and still 80 bytes over.
 /// Raised to 27 KiB for agent starts (two routes, four session fields),
 /// and to 28 KiB for labels and the event log (two routes, a socket
-/// parameter, two message types).
-const PAGE_MAX_BYTES: usize = 28 * 1024;
+/// parameter, two message types); to 29 KiB for leases and review records
+/// (seven routes), after condensing api.md's session and file rows.
+const PAGE_MAX_BYTES: usize = 29 * 1024;
 /// The longest line any hub page may hold: a line longer than this is a
 /// paragraph that wants splitting or cutting.
 const LINE_MAX_CHARS: usize = 400;

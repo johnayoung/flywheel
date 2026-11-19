@@ -1065,6 +1065,166 @@ async fn leases_and_waits_outlive_a_restart() {
     assert!(lease_events(&hub).await.iter().any(|k| k == "lease.broken"));
 }
 
+/// `git` in `dir`, its trimmed output.
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviews_are_recorded_by_sha_and_coverage_says_what_is_missing() {
+    let mut hub = TestHub::start().await;
+    let proj = hub.root.join("repo/proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    git(&proj, &["init", "-q", "-b", "main"]);
+    let mut shas = Vec::new();
+    for n in 0..4 {
+        std::fs::write(proj.join("f"), format!("{n}\n")).unwrap();
+        git(&proj, &["add", "f"]);
+        git(&proj, &["commit", "-q", "-m", &format!("c{n}")]);
+        shas.push(git(&proj, &["rev-parse", "HEAD"]));
+    }
+    std::fs::write(proj.join("REVIEW.md"), "# Review of c1..c2\n\nfine\n").unwrap();
+    let lead = hub.claude("lead", None, json!({})).await;
+    let rev = hub.claude("rev", None, json!({})).await;
+    for agent in [&lead, &rev] {
+        agent.turn().await;
+    }
+    let repo = proj.to_str().unwrap();
+    let said = rev
+        .ok(
+            "record_review",
+            json!({"repo": repo, "base": shas[0], "head": shas[2], "verdict": "READY",
+                   "findings": {"low": 2}, "report": "proj/REVIEW.md"}),
+        )
+        .await;
+    assert!(said.starts_with("Recorded review r"), "{said}");
+    assert!(said.contains("(2 commits): READY, 2 findings"), "{said}");
+    // A report outside the session's directories is refused.
+    let (error, said) = rev
+        .tool(
+            "record_review",
+            json!({"repo": repo, "base": shas[0], "head": shas[1], "verdict": "READY",
+                   "report": "/etc/hostname"}),
+        )
+        .await;
+    assert!(error && said.contains("outside"), "{said}");
+    // base must be an ancestor of head.
+    let (error, said) = rev
+        .tool(
+            "record_review",
+            json!({"repo": repo, "base": shas[2], "head": shas[1], "verdict": "READY"}),
+        )
+        .await;
+    assert!(error && said.contains("not an ancestor"), "{said}");
+
+    let said = lead
+        .ok(
+            "check_reviewed",
+            json!({"repo": repo, "range": format!("{}..{}", shas[0], shas[3])}),
+        )
+        .await;
+    assert!(
+        said.starts_with("NOT ok: 1 of 3 commits uncovered"),
+        "{said}"
+    );
+    assert!(said.contains("c3: no review"), "{said}");
+    let said = lead
+        .ok(
+            "check_reviewed",
+            json!({"repo": repo, "range": format!("{}..{}", shas[0], shas[2])}),
+        )
+        .await;
+    assert!(said.starts_with("ok: all 2 commits"), "{said}");
+
+    // By SHA, with the hub's copy of the report.
+    let found = hub
+        .get(&format!(
+            "/api/verdicts?repo={}&sha={}",
+            urlencode(repo),
+            shas[1]
+        ))
+        .await;
+    let review = &found["reviews"][0];
+    assert_eq!(review["verdict"], "READY", "{found}");
+    assert_eq!(review["reviewer"], rev.id.as_str());
+    let stored = review["report"]["stored"].as_str().unwrap();
+    assert!(std::fs::read_to_string(stored).unwrap().contains("fine"));
+
+    // The operator's NOT_READY follow-up uncovers; retracting it covers again.
+    let (status, follow) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/verdicts",
+            Some(json!({"repo": repo, "base": shas[1], "head": shas[2],
+                        "verdict": "NOT_READY", "follow_up_of": review["id"]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{follow}");
+    let range = format!("{}..{}", shas[0], shas[2]);
+    let coverage = hub
+        .get(&format!(
+            "/api/verdicts/coverage?repo={}&range={range}",
+            urlencode(repo)
+        ))
+        .await;
+    assert_eq!(coverage["ok"], false, "{coverage}");
+    assert_eq!(coverage["uncovered"][0]["why"], "not_ready");
+    let (status, _) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/verdicts/{}/retract", follow["id"].as_str().unwrap()),
+            Some(json!({"reason": "recorded on the wrong range"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let coverage = hub
+        .get(&format!(
+            "/api/verdicts/coverage?repo={}&range={range}",
+            urlencode(repo)
+        ))
+        .await;
+    assert_eq!(coverage["ok"], true, "{coverage}");
+    let kinds: Vec<String> = hub.get("/api/log?filter=kind%3Dverdict&limit=100").await["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_owned())
+        .collect();
+    for want in ["verdict.recorded", "verdict.coverage", "verdict.retracted"] {
+        assert!(kinds.iter().any(|k| k == want), "{want}: {kinds:?}");
+    }
+}
+
+fn urlencode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ownership_passes_on_and_everything_else_asks_the_operator() {
     let mut hub = TestHub::start().await;

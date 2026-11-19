@@ -13,6 +13,7 @@ pub mod leases;
 mod links;
 mod log;
 mod relaunches;
+pub mod reviews;
 mod starts;
 pub use starts::{AgentStart, Opened};
 mod restore;
@@ -607,6 +608,8 @@ pub struct Hub {
     watches: crate::watch::Engine,
     /// Leases on named resources (see [`crate::leases`]).
     leases: leases::LeaseRuntime,
+    /// Review records (see [`crate::reviews`]).
+    reviews: crate::reviews::ReviewStore,
     /// What the telemetry capture knows beside the store (see
     /// `hub/telemetry.rs`).
     capture: telemetry::Capture,
@@ -719,6 +722,7 @@ impl Hub {
             telemetry,
             watches: crate::watch::Engine::default(),
             leases: leases::LeaseRuntime::open(&options.state_dir),
+            reviews: crate::reviews::ReviewStore::new(&options.state_dir),
             capture: telemetry::Capture::load(&options.state_dir),
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),

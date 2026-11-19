@@ -101,6 +101,7 @@ mod telemetry_api;
 mod templates_api;
 mod terminal_ws;
 mod tls_listen;
+mod verdicts_api;
 mod watches_api;
 mod workspaces_api;
 mod worktree_api;
@@ -324,6 +325,15 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         .route(
             "/api/leases/{id}/release",
             axum::routing::post(leases_api::release_lease),
+        )
+        .route(
+            "/api/verdicts",
+            get(verdicts_api::list_verdicts).post(verdicts_api::record_verdict),
+        )
+        .route("/api/verdicts/coverage", get(verdicts_api::coverage))
+        .route(
+            "/api/verdicts/{id}/retract",
+            axum::routing::post(verdicts_api::retract_verdict),
         )
         .route(
             "/api/sessions/{id}",

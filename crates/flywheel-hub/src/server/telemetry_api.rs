@@ -347,6 +347,23 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
+    fn record_review(&self, input: &crate::hub::reviews::ReviewInput) -> Result<String, String> {
+        self.hub
+            .agent_record_review(&self.session, input)
+            .map_err(|e| e.to_string())
+    }
+
+    fn check_reviewed(
+        &self,
+        repo: &str,
+        range: &str,
+        patch_equivalent: bool,
+    ) -> Result<String, String> {
+        self.hub
+            .agent_check_reviewed(&self.session, repo, range, patch_equivalent)
+            .map_err(|e| e.to_string())
+    }
+
     fn handoff(
         &self,
         prompt: &str,

@@ -148,6 +148,8 @@ Matches within `--window` (3 s), or while that prompt waits, join it (40 listed,
 
 **Leases** (`lease` tool, `fw hub lease`): shared or exclusive, a ttl, a fair line per resource; a wait past 50 s is granted by prompt. Ends: release, ttl, holder end, `break`.
 
+**Reviews** (`record_review` / `check_reviewed` tools, `fw hub verdict`): a verdict on `base..head`, kept once (re-review: `follow_up_of`). Covered: a READY chain tip, no later NOT_READY, not by its author.
+
 **Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase"`). Each: sent if its queue would deliver now, else queued, else refused (why). `--header` names the recipients.
 
 ## Activity

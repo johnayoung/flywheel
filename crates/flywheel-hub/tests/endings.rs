@@ -787,6 +787,7 @@ async fn a_newer_message_on_a_topic_supersedes_the_older_one() {
         !view.to_string().contains("stop the capture"),
         "the old text is gone"
     );
+    log_has(&hub, "message", &["message.superseded"]).await;
     let log = hub
         .get(&format!(
             "/api/log?filter=kind%3Dmessage.superseded%20session%3D{}",
@@ -860,14 +861,29 @@ async fn a_newer_message_on_a_topic_supersedes_the_older_one() {
     );
 }
 
-/// The hub's lease events (`kind=lease`), oldest first.
-async fn lease_events(hub: &TestHub) -> Vec<String> {
-    hub.get("/api/log?filter=kind%3Dlease&limit=1000").await["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["kind"].as_str().unwrap().to_owned())
-        .collect()
+/// Wait until the log holds an event of each of `kinds` (`family`: its
+/// filter family); the kinds it holds. Events reach the log at its next
+/// flush, not at once.
+async fn log_has(hub: &TestHub, family: &str, kinds: &[&str]) -> Vec<String> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let found: Vec<String> = hub
+            .get(&format!("/api/log?filter=kind%3D{family}&limit=1000"))
+            .await["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap().to_owned())
+            .collect();
+        if kinds.iter().all(|k| found.iter().any(|f| f == k)) {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "want {kinds:?}, log has {found:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -986,16 +1002,18 @@ async fn leases_wait_in_line_wake_a_long_wait_and_end_with_their_holder() {
             .unwrap()
             .is_empty()
     );
-    let kinds = lease_events(&hub).await;
-    for want in [
-        "lease.granted",
-        "lease.waiting",
-        "lease.cancelled",
-        "lease.released",
-        "lease.dropped",
-    ] {
-        assert!(kinds.iter().any(|k| k == want), "{want}: {kinds:?}");
-    }
+    log_has(
+        &hub,
+        "lease",
+        &[
+            "lease.granted",
+            "lease.waiting",
+            "lease.cancelled",
+            "lease.released",
+            "lease.dropped",
+        ],
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1062,7 +1080,7 @@ async fn leases_and_waits_outlive_a_restart() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{broken}");
-    assert!(lease_events(&hub).await.iter().any(|k| k == "lease.broken"));
+    log_has(&hub, "lease", &["lease.broken"]).await;
 }
 
 /// `git` in `dir`, its trimmed output.
@@ -1203,15 +1221,129 @@ async fn reviews_are_recorded_by_sha_and_coverage_says_what_is_missing() {
         ))
         .await;
     assert_eq!(coverage["ok"], true, "{coverage}");
-    let kinds: Vec<String> = hub.get("/api/log?filter=kind%3Dverdict&limit=100").await["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["kind"].as_str().unwrap().to_owned())
-        .collect();
-    for want in ["verdict.recorded", "verdict.coverage", "verdict.retracted"] {
-        assert!(kinds.iter().any(|k| k == want), "{want}: {kinds:?}");
+    log_has(
+        &hub,
+        "verdict",
+        &["verdict.recorded", "verdict.coverage", "verdict.retracted"],
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_end_closes_its_worktree_only_when_nothing_is_lost() {
+    let mut hub = TestHub::start().await;
+    let repo = hub.root.join("repo");
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("Cargo.toml"), "[package]\n").unwrap();
+    std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let worker = hub
+        .claude(
+            "worker",
+            Some(&lead),
+            json!({"worktree": {"task": "feat-x"}}),
+        )
+        .await;
+    let messy = hub
+        .claude(
+            "messy",
+            Some(&lead),
+            json!({"worktree": {"task": "feat-y"}}),
+        )
+        .await;
+    for agent in [&lead, &worker, &messy] {
+        agent.turn().await;
     }
+    let dir_of = |view: &Value| PathBuf::from(view["worktree"]["path"].as_str().unwrap());
+    let wt = dir_of(&hub.session(&worker.id).await);
+    std::fs::write(wt.join("STATUS.md"), "# Worker done\n\nshipped x\n").unwrap();
+    git(&wt, &["add", "STATUS.md"]);
+    git(&wt, &["commit", "-q", "-m", "x"]);
+    std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+    std::fs::write(wt.join("target/debug/blob"), vec![0u8; 2048]).unwrap();
+    let messy_wt = dir_of(&hub.session(&messy.id).await);
+    std::fs::write(messy_wt.join("notes.md"), "unsaved").unwrap();
+
+    // The checklist: nothing ends.
+    let said = lead
+        .ok(
+            "end_session",
+            json!({"to": "worker", "mode": "at_rest", "dry_run": true}),
+        )
+        .await;
+    assert!(
+        said.contains("NOT merged: 1 commit(s) main lacks"),
+        "{said}"
+    );
+    assert!(
+        said.contains("remove: allowed (its branch is kept)"),
+        "{said}"
+    );
+    assert!(said.contains("clean build: allowed"), "{said}");
+    assert_eq!(hub.session(&worker.id).await["state"], "running");
+
+    // Ended with cleanups: the report is kept, the build and worktree
+    // go, the branch stays (its commit is nowhere else).
+    lead.ok(
+        "end_session",
+        json!({"to": "worker", "mode": "at_rest",
+               "close": {"worktree": "remove", "build": "clean", "report": "STATUS.md"}}),
+    )
+    .await;
+    hub.ended(&worker.id).await;
+    let deadline = Instant::now() + WAIT;
+    let close = loop {
+        let view = hub.session(&worker.id).await;
+        if !view["ended"]["close"].is_null() {
+            break view["ended"]["close"].clone();
+        }
+        assert!(Instant::now() < deadline, "no close recorded: {view}");
+        sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(close["worktree"]["outcome"], "done", "{close}");
+    assert_eq!(close["build"]["outcome"], "done", "{close}");
+    assert_eq!(close["report"]["title"], "Worker done", "{close}");
+    assert!(!wt.exists());
+    assert!(git(&repo, &["branch", "--list", "*feat-x"]).contains("feat-x"));
+    let stored = close["report"]["stored"].as_str().unwrap();
+    assert!(
+        std::fs::read_to_string(stored)
+            .unwrap()
+            .contains("shipped x")
+    );
+    let text = hub
+        .http
+        .get(format!(
+            "http://{}/api/sessions/{}/report",
+            hub.addr, worker.id
+        ))
+        .bearer_auth(hub.hub.token().expose())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("shipped x"), "{text}");
+    hub.told(&lead, "closed worker").await;
+
+    // The operator's close: refused while untracked work would be lost,
+    // and the work stays.
+    let (status, done) = hub
+        .call(
+            reqwest::Method::POST,
+            &format!("/api/sessions/{}/close", messy.id),
+            Some(json!({"worktree": "remove"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{done}");
+    assert_eq!(done["close"]["worktree"]["outcome"], "refused", "{done}");
+    assert!(messy_wt.join("notes.md").exists());
+    log_has(&hub, "close", &["close.checked", "close.recorded"]).await;
 }
 
 fn urlencode(text: &str) -> String {

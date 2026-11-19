@@ -680,8 +680,10 @@ const PAGES: [(&str, &str); 6] = [
 /// to 96 KiB for watches (a verb with three actions, two routes, two
 /// agent tools); to 97 KiB for leases and review records (two verbs with
 /// nine actions, seven routes, three agent tools, three state files),
-/// after condensing the activity, fleet, and internals text by 0.7 KB.
-const HUB_DOCS_MAX_BYTES: usize = 97 * 1024;
+/// after condensing the activity, fleet, and internals text by 0.7 KB;
+/// to 98 KiB for the close checklist (a verb, three routes, an end
+/// option), after condensing the agent-ends text it extends.
+const HUB_DOCS_MAX_BYTES: usize = 98 * 1024;
 /// One reference page's budget. Raised from 25 KiB to 26 for asks,
 /// handoffs, and session links (a route, two event kinds, the snapshot's
 /// `ask` and `links`): api.md was condensed first and still 80 bytes over.

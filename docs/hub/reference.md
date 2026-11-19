@@ -70,6 +70,7 @@ fw hub wait SESSION --until done|blocked|idle|working|exit [--timeout SECS] [--c
 fw hub wait --fleet FILTER [--after CURSOR] [--json] [--timeout SECS] {where}  # first match; prints its cursor
 fw hub attach [SESSION] [--prefix C-b] [--no-status] {where}
 fw hub kill SESSION [--rm] [--remove-worktree] [--force] {where}  # --rm forgets
+fw hub close SESSION [--remove-worktree] [--clean-build] [--report P] [--dry-run] [--json] {where}  # at rest
 fw hub relaunch SESSION [--never|--auto] {where}
 fw hub explain [SESSION] [--file SCREEN.txt|-] [--kind claude|codex|shell] [--json] {where}
 fw hub import FILE.code-workspace... [--name N] [--update] [--json]

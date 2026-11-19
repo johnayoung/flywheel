@@ -61,6 +61,11 @@ pub struct AgentEnd {
     /// A graceful end's last prompt to it.
     pub final_prompt: Option<String>,
     pub wait_minutes: Option<u32>,
+    /// What to do with its directory once it ended (see
+    /// [`crate::close`]).
+    pub close: Option<crate::close::CloseChoices>,
+    /// Only answer the close checklist; end nothing.
+    pub dry_run: bool,
 }
 
 /// What an agent asks `replace_session` for.
@@ -424,7 +429,7 @@ impl Hub {
 
     /// Tell session `id`'s agent `text` (now, or once its turn is done);
     /// one no longer running is not told.
-    fn tell(&self, id: &str, text: &str) {
+    pub(super) fn tell(&self, id: &str, text: &str) {
         let record = self.store().session(id).cloned();
         if let Ok(record) = record {
             self.tell_starter(&record, text);
@@ -567,6 +572,16 @@ impl Hub {
         let from = self.store().session(caller)?.clone();
         let target = self.session_named(&end.to)?;
         Self::check_end(&from, &target)?;
+        if end.dry_run {
+            let list = self.close_checklist(&target.id)?;
+            return Ok(format!(
+                "Close checklist for {} (nothing ended):\n{}\nTo end it with cleanups, call \
+                 end_session again with close (worktree remove, build clean, report).",
+                target.name,
+                list.text()
+            ));
+        }
+        let close = self.close_choices(&target, end.close)?;
         let final_prompt = trimmed(end.final_prompt.as_deref());
         match end.mode {
             EndMode::Force => return Err(refused(FORCE_REFUSED)),
@@ -598,6 +613,7 @@ impl Hub {
                     replace: None,
                     why: ApprovalWhy::NotOwner,
                     created_at: Utc::now(),
+                    close,
                 },
                 owner.as_deref(),
             );
@@ -609,6 +625,7 @@ impl Hub {
             final_prompt.as_deref(),
             wait,
             None,
+            close,
         )
     }
 
@@ -686,6 +703,7 @@ impl Hub {
                     replace: Some(successor),
                     why,
                     created_at: Utc::now(),
+                    close: None,
                 },
                 owner.as_deref(),
             );
@@ -697,6 +715,7 @@ impl Hub {
             Some(&final_prompt),
             wait,
             Some(successor),
+            None,
         )
     }
 
@@ -741,6 +760,7 @@ impl Hub {
     /// Start ending `target` for `by` (an agent; its request approved, or
     /// it owns the target): set its queue aside, queue the final prompt,
     /// and keep the end on its record. What to tell the agent.
+    #[allow(clippy::too_many_arguments)]
     fn begin_end(
         &self,
         target: &SessionRecord,
@@ -749,6 +769,7 @@ impl Hub {
         final_prompt: Option<&str>,
         wait: u32,
         replace: Option<Successor>,
+        close: Option<crate::close::CloseChoices>,
     ) -> Result<String, HubError> {
         let id = new_id();
         let now = Utc::now();
@@ -820,6 +841,7 @@ impl Hub {
                 replace,
                 successor: None,
                 requested_at: now,
+                close,
             };
             if let Err(e) = store.update_session(&target.id, |r| r.ending = Some(ending)) {
                 // Put the queue back as it was.
@@ -1037,6 +1059,7 @@ impl Hub {
                 pending.final_prompt.as_deref(),
                 pending.wait_minutes.unwrap_or(DEFAULT_WAIT_MINUTES),
                 pending.replace.clone(),
+                pending.close.clone(),
             )
         })();
         match started {
@@ -1135,6 +1158,7 @@ impl Hub {
             successor: None,
             by_name: None,
             successor_name: None,
+            close: None,
         };
         let ending = record.ending.clone();
         let saved = end.clone();
@@ -1476,6 +1500,7 @@ impl Hub {
             successor: ending.successor.clone(),
             by_name: ending.by.session().map(|id| self.session_name(id)),
             successor_name: ending.successor.as_deref().map(|id| self.session_name(id)),
+            close: None,
         };
         let saved = end.clone();
         let final_item = ending.final_item.clone();
@@ -1498,7 +1523,7 @@ impl Hub {
     }
 
     /// Record the end of a session that exited before it was hung up.
-    fn finish_end(&self, record: &SessionRecord, ending: &Ending, killed: bool) {
+    fn finish_end(self: &Arc<Self>, record: &SessionRecord, ending: &Ending, killed: bool) {
         let (_, dirty) = self.end_losses(record);
         let end = self.record_end(record, ending, Vec::new(), dirty);
         self.announce_end(record, ending, &end, killed);
@@ -1506,7 +1531,16 @@ impl Hub {
 
     /// Tell everyone `record` ended: its log, the asker's, clients, and
     /// the asker's agent.
-    fn announce_end(&self, record: &SessionRecord, ending: &Ending, end: &EndRecord, killed: bool) {
+    fn announce_end(
+        self: &Arc<Self>,
+        record: &SessionRecord,
+        ending: &Ending,
+        end: &EndRecord,
+        killed: bool,
+    ) {
+        if let Some(close) = ending.close.clone().filter(|c| !c.is_empty()) {
+            self.close_after_end(record, close, &ending.id, ending.by.session());
+        }
         eprintln!(
             "fw hub: session {}: ended (request {}){}",
             record.id,
@@ -2032,6 +2066,7 @@ mod tests {
             successor: Some("lead3".into()),
             by_name: Some("s-x".into()),
             successor_name: Some("s-lead3".into()),
+            close: None,
         });
         let mut lead3 = record("lead3", Some("x"), false);
         lead3.continues = Some("lead1".into());

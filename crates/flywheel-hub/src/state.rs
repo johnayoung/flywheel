@@ -502,6 +502,10 @@ pub struct Ending {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor: Option<String>,
     pub requested_at: DateTime<Utc>,
+    /// What to do with its directory once it ended (see
+    /// [`crate::close`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close: Option<crate::close::CloseChoices>,
 }
 
 /// A process an end killed with the session.
@@ -546,6 +550,9 @@ pub struct EndRecord {
     pub by_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub successor_name: Option<String>,
+    /// How its directory was closed, when the end carried choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close: Option<crate::close::CloseRecord>,
 }
 
 /// Why an end waits on the operator.
@@ -575,6 +582,9 @@ pub struct PendingEnd {
     pub replace: Option<Successor>,
     pub why: ApprovalWhy,
     pub created_at: DateTime<Utc>,
+    /// What to do with its directory once it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close: Option<crate::close::CloseChoices>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if takes &T

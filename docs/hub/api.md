@@ -34,6 +34,9 @@ Routes (`docs_drift.rs`: those mounted), WebSockets, plugins. Front door: [hub](
 | GET / POST | `/api/sessions[?workspace_id=&label=]` | list / create `{"workspace_id","folder"?,"kind"?,"command"?:[argv],"worktree"?:{"task","base"?},"prompt"?,"labels"?,...}`; an agent's start under `ask`: 202 `{"waiting","opened_by"}` |
 | GET / PATCH / DELETE | `/api/sessions/{id}` | PATCH `{"name"}`; DELETE kills, forgets (204; `?remove_worktree=true[&force=true]`) |
 | POST | `/api/sessions/{id}/kill` | 202: SIGHUP (3 s: SIGKILL), kept |
+| GET | `/api/sessions/{id}/checklist` | close checklist |
+| POST | `/api/sessions/{id}/close` | `{"worktree"?,"build"?,"report"?,"dry_run"?}`; 409 not at rest |
+| GET | `/api/sessions/{id}/report` | its kept final report |
 | POST | `/api/sessions/{id}/relaunch` | `{"cols"?,"rows"?}`: an ended session, same id; 409 running. `{"never"}`: opt out of upgrade relaunches |
 | POST | `/api/sessions/{id}/restart` | old `/relaunch` |
 | POST | `/api/sessions/{id}/continue` | `{"handoff"?,"prompt"?,"name"?}` (default: the only pending handoff's): linked successor; 201 |

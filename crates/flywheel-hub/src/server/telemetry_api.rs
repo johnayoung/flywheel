@@ -261,12 +261,16 @@ impl mcp::Host for AgentHost {
         mode: crate::state::EndMode,
         final_prompt: Option<&str>,
         wait_minutes: Option<u32>,
+        close: Option<crate::close::CloseChoices>,
+        dry_run: bool,
     ) -> Result<String, String> {
         let end = crate::hub::AgentEnd {
             to: to.to_owned(),
             mode,
             final_prompt: final_prompt.map(str::to_owned),
             wait_minutes,
+            close,
+            dry_run,
         };
         self.hub
             .agent_end(&self.session, end)

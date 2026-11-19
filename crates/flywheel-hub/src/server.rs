@@ -66,6 +66,7 @@ mod auth;
 mod autopilot_api;
 mod broadcast_api;
 mod ca_page;
+mod close_api;
 mod commands_api;
 mod conversations_api;
 mod deflate;
@@ -331,6 +332,12 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
             get(verdicts_api::list_verdicts).post(verdicts_api::record_verdict),
         )
         .route("/api/verdicts/coverage", get(verdicts_api::coverage))
+        .route("/api/sessions/{id}/checklist", get(close_api::checklist))
+        .route("/api/sessions/{id}/report", get(close_api::report))
+        .route(
+            "/api/sessions/{id}/close",
+            axum::routing::post(close_api::close),
+        )
         .route(
             "/api/verdicts/{id}/retract",
             axum::routing::post(verdicts_api::retract_verdict),

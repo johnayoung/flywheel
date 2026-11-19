@@ -1071,6 +1071,64 @@ pub fn patch_ids(dir: &Path, shas: &[String]) -> HashMap<String, String> {
         .collect()
 }
 
+// --- Close checklists (see crate::close) -------------------------------------
+
+/// The untracked files and directories in `dir` (ignored ones not
+/// counted), as git lists them: a wholly untracked directory once.
+pub fn untracked_paths(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let out = git(
+        dir,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+    )?;
+    Ok(out
+        .split('\0')
+        .filter_map(|entry| entry.strip_prefix("?? "))
+        .map(|path| dir.join(path.trim_end_matches('/')))
+        .collect())
+}
+
+/// Commits of `branch` whose patch `base` lacks (`git cherry`): 0 when
+/// every commit was merged, squashed, or rebased in.
+pub fn unmerged_patches(repo: &Path, branch: &str, base: &str) -> Result<u32, String> {
+    let out = git(repo, &["cherry", base, &format!("refs/heads/{branch}")])?;
+    Ok(u32::try_from(out.lines().filter(|l| l.starts_with('+')).count()).unwrap_or(u32::MAX))
+}
+
+/// Whether `path` (inside `dir`) is ignored by git there.
+pub fn is_ignored(dir: &Path, path: &Path) -> bool {
+    let rel = path.strip_prefix(dir).unwrap_or(path);
+    git_ok(dir, &["check-ignore", "-q", "--", &rel.to_string_lossy()])
+}
+
+/// Remove `worktree` without force (git itself refuses one with changes
+/// or untracked files); its branch is deleted only when its base has
+/// every commit of it, else kept: nothing is lost either way.
+pub fn remove_keeping_work(worktree: &WorktreeRef) -> Result<Removed, String> {
+    let check = removal_check(worktree)?;
+    if check.dirty + check.untracked > 0 {
+        return Err(format!(
+            "{} has {} uncommitted change(s) and {} untracked file(s)",
+            worktree.path.display(),
+            check.dirty,
+            check.untracked
+        ));
+    }
+    let repo = &worktree.repo;
+    if check.missing {
+        git(repo, &["worktree", "prune"])?;
+    } else {
+        let path = worktree.path.to_string_lossy().into_owned();
+        git(repo, &["worktree", "remove", &path])
+            .map_err(|e| format!("git worktree remove failed: {e}"))?;
+    }
+    let branch_deleted = check.unmerged == 0 && delete_branch(repo, &worktree.branch);
+    Ok(Removed {
+        path: worktree.path.clone(),
+        branch: worktree.branch.clone(),
+        branch_deleted,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

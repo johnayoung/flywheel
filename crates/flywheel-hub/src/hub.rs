@@ -2,9 +2,11 @@
 //! sessions the server owns.
 
 mod capture;
+mod close;
 mod endings;
 mod holds;
 pub use capture::{CAPTURE_TOKEN_FILE, CAPTURED_PREFIX, CaptureFrom, CaptureRefused};
+pub use close::close_words;
 pub use endings::{AgentEnd, AgentReplace, FORCE_REFUSED};
 pub(crate) use holds::permission_decision;
 pub use relaunches::stale_note;

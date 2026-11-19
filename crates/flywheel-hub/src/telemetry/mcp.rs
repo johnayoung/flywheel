@@ -131,6 +131,8 @@ pub trait Host {
         mode: EndMode,
         final_prompt: Option<&str>,
         wait_minutes: Option<u32>,
+        close: Option<crate::close::CloseChoices>,
+        dry_run: bool,
     ) -> Result<String, String>;
     /// Replace the session `to` names with a new one.
     fn replace_session(&self, args: &ReplaceArgs) -> Result<String, String>;
@@ -407,7 +409,15 @@ fn end_tool() -> Value {
                         what would be lost (processes in its terminal, uncommitted work, which \
                         is never touched); the outcome arrives later as a message. Ending a \
                         session you do not own waits for the operator's approval. You cannot \
-                        end yourself.",
+                        end yourself. dry_run: true answers its close checklist and ends \
+                        nothing (branch merged into its base?, uncommitted and untracked \
+                        files, build output size, other sessions there, which cleanups are \
+                        allowed). close: what to do once it ended: worktree remove (only if \
+                        clean and unshared; its branch is kept unless fully merged) or keep; \
+                        build clean (deletes its target/ only) or keep; report: its final \
+                        status file, kept by the hub and shown after the worktree is gone. \
+                        Each is checked again at the end; one that no longer holds is \
+                        refused and kept.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -426,6 +436,16 @@ fn end_tool() -> Value {
                     "minimum": 1,
                     "maximum": 120,
                     "description": "Optional: how long the end may take before it is called off. Default 20."
+                },
+                "dry_run": { "type": "boolean", "description": "Optional: answer the close checklist only; end nothing." },
+                "close": {
+                    "type": "object",
+                    "description": "Optional: cleanups once it ended.",
+                    "properties": {
+                        "worktree": { "type": "string", "enum": ["keep", "remove"] },
+                        "build": { "type": "string", "enum": ["keep", "clean"] },
+                        "report": { "type": "string", "description": "Its final status file (relative to its directory, or absolute)." }
+                    }
                 }
             },
             "required": ["to"]
@@ -847,10 +867,23 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                     .get("wait_minutes")
                     .and_then(Value::as_u64)
                     .map(|m| u32::try_from(m).unwrap_or(u32::MAX));
-                Ok(match end_mode(arg("mode")) {
-                    Err(why) => text_result(format!("Not ended: {why}"), true),
-                    Ok(mode) => {
-                        match host.end_session(arg("to"), mode, given("final_prompt"), wait) {
+                let dry_run = args.get("dry_run").and_then(Value::as_bool) == Some(true);
+                let close: Result<Option<crate::close::CloseChoices>, String> = args
+                    .get("close")
+                    .filter(|c| !c.is_null())
+                    .map(|c| serde_json::from_value(c.clone()).map_err(|e| format!("close: {e}")))
+                    .transpose();
+                Ok(match (end_mode(arg("mode")), close) {
+                    (Err(why), _) | (_, Err(why)) => text_result(format!("Not ended: {why}"), true),
+                    (Ok(mode), Ok(close)) => {
+                        match host.end_session(
+                            arg("to"),
+                            mode,
+                            given("final_prompt"),
+                            wait,
+                            close,
+                            dry_run,
+                        ) {
                             Ok(said) => text_result(said, false),
                             Err(why) => text_result(format!("Not ended: {why}"), true),
                         }
@@ -1080,6 +1113,8 @@ mod tests {
             mode: EndMode,
             final_prompt: Option<&str>,
             wait_minutes: Option<u32>,
+            _close: Option<crate::close::CloseChoices>,
+            _dry_run: bool,
         ) -> Result<String, String> {
             if to == "claude 4" {
                 Ok(format!(

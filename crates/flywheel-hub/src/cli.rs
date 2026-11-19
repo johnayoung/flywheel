@@ -99,6 +99,11 @@ enum HubCommand {
     Attach(crate::attach::AttachArgs),
     /// Hang up a session's processes (the record stays, as exited).
     Kill(script::KillArgs),
+    /// Close a session: its checklist (--dry-run: branch merged?,
+    /// uncommitted and untracked files, build size, who else works
+    /// there), or its end at rest with cleanups that lose nothing
+    /// (--remove-worktree, --clean-build) and its final report kept.
+    Close(crate::close_cli::CloseArgs),
     /// Start an ended or stopped session again in place (same id, name,
     /// command, and folder; a fresh terminal).
     Relaunch(script::RelaunchArgs),
@@ -831,6 +836,7 @@ fn dispatch_verb(
         HubCommand::Wait(args) => crate::wait::wait(&args, out, err),
         HubCommand::Attach(args) => crate::attach::attach(&args, out, err),
         HubCommand::Kill(args) => script::kill(&args, out, err),
+        HubCommand::Close(args) => crate::close_cli::close(&args, out, err),
         HubCommand::Relaunch(args) => script::relaunch(&args, out, err),
         HubCommand::Continue(args) => script::continue_session(&args, out, err),
         HubCommand::Starts(args) => script::starts(&args, out, err),

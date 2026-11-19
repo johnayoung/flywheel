@@ -95,6 +95,22 @@ const inspector = (() => {
     return endedHow(session);
   }
 
+  // How its directory was closed, and its final report (opens the hub's
+  // copy).
+  function closeLine(session) {
+    const close = session.ended && session.ended.close;
+    if (!close) return "";
+    const word = (o) => (o.outcome === "done" ? "done" : o.outcome === "refused" ? "refused" : "kept");
+    const parts = [`worktree ${word(close.worktree)}`, `build ${word(close.build)}`];
+    if (!close.report) return parts.join(", ");
+    return [parts.join(", "), " ", el("a", {
+      href: `/api/sessions/${encodeURIComponent(session.id)}/report`,
+      target: "_blank",
+      rel: "noopener",
+      textContent: close.report.title || "report",
+    })];
+  }
+
   // Leases it holds (resource, mode, time left) and waits for.
   function leasesLine(session) {
     const view = session.leases;
@@ -169,6 +185,7 @@ const inspector = (() => {
       row("pr", pullRequests.rowChip(session)),
       row("relaunch", relaunchLine(session)),
       row("end", endLine(session)),
+      row("closed", closeLine(session)),
       row("recording", session.recording || ""),
       row("labels", labelsLine(session)),
       actions(session),

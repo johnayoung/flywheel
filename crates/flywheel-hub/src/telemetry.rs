@@ -75,6 +75,7 @@ pub const HUB_SCOPE: &str = "hub";
 
 type Key = (String, String);
 type Announce = dyn Fn(Snapshot) + Send + Sync;
+type Moved = dyn Fn(&str) + Send + Sync;
 
 /// Unix milliseconds now.
 /// Most turns one read folds, and most events it reads for them.
@@ -107,6 +108,8 @@ struct Inner {
     /// A second connection, for reads that must not wait on a commit.
     read: Mutex<Store>,
     announce: OnceLock<Box<Announce>>,
+    /// Told of each own session whose status an event just moved.
+    moved: OnceLock<Box<Moved>>,
     /// Serializes commits and evictions (taken before `live`).
     gate: Mutex<()>,
     stop: AtomicBool,
@@ -146,6 +149,7 @@ impl Telemetry {
             db: Mutex::new(db),
             read: Mutex::new(read),
             announce: OnceLock::new(),
+            moved: OnceLock::new(),
             gate: Mutex::new(()),
             stop: AtomicBool::new(false),
             wake: (Mutex::new(()), Condvar::new()),
@@ -172,6 +176,14 @@ impl Telemetry {
     /// Call `announce` with each changed session's snapshot after a flush.
     pub fn on_change(&self, announce: impl Fn(Snapshot) + Send + Sync + 'static) {
         let _ = self.inner.announce.set(Box::new(announce));
+    }
+
+    /// Call `moved` with an own session's id as soon as an event recorded
+    /// for it moves its status (not at the next flush): whatever reads the
+    /// live state from then on (a status push) already sees the new one,
+    /// so a change and its undoing between two flushes are both told.
+    pub fn on_move(&self, moved: impl Fn(&str) + Send + Sync + 'static) {
+        let _ = self.inner.moved.set(Box::new(moved));
     }
 
     /// Record what this hub observed in its own session `session`. Gauge
@@ -205,9 +217,16 @@ impl Telemetry {
         if events.is_empty() {
             return;
         }
-        let mut pending = lock(&self.inner.pending);
-        pending.events.extend(events);
-        pending.dirty.insert(key);
+        let moved = events.iter().any(|e| e.moved.is_some());
+        {
+            let mut pending = lock(&self.inner.pending);
+            pending.events.extend(events);
+            pending.dirty.insert(key);
+        }
+        drop(live);
+        if moved && let Some(tell) = self.inner.moved.get() {
+            tell(session);
+        }
     }
 
     /// Record what a log this hub tails says (a Codex rollout's lines,

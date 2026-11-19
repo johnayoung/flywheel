@@ -1120,6 +1120,39 @@ fn the_log_reads_every_kind_by_cursor_and_filter() {
     assert!(telemetry.sessions_since(start.at, 2).unwrap().is_none());
 }
 
+/// A status moved and moved back between two flushes is told twice, as
+/// it happens: a push in between read the live state, so the flush's
+/// snapshot (the same as the last one) cannot be what tells the second.
+#[test]
+fn every_status_move_is_told_at_once_not_at_the_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+    let told = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = told.clone();
+    telemetry.on_move(move |session| sink.lock().unwrap().push(session.to_owned()));
+    let t = now_ms();
+    telemetry.record(
+        "s",
+        claude::hook("UserPromptSubmit", &json!({"prompt": "go"}), t),
+    );
+    telemetry.record("s", claude::hook("Stop", &json!({}), t + 1));
+    let sub = json!({"tool_name": "Read", "tool_use_id": "u1", "agent_id": "ag1"});
+    telemetry.record("s", claude::hook("PreToolUse", &json!({"tool_name": "Task", "tool_use_id": "t1", "tool_input": {"description": "look"}}), t + 2));
+    let before = told.lock().unwrap().len();
+    telemetry.record("s", claude::hook("PostToolUse", &sub, t + 3));
+    telemetry.record(
+        "s",
+        claude::hook("SubagentStop", &json!({"agent_id": "ag1"}), t + 4),
+    );
+    // Nothing flushed yet: each move was told when recorded.
+    assert!(before >= 2, "working, done: {:?}", told.lock().unwrap());
+    assert!(told.lock().unwrap().iter().all(|s| s == "s"));
+    // A record that moves nothing tells nothing.
+    let n = told.lock().unwrap().len();
+    telemetry.record("s", vec![labels_changed(&[("team", Some("web"))], t + 5)]);
+    assert_eq!(told.lock().unwrap().len(), n);
+}
+
 /// The collector's side at the scale the design is for: ten thousand
 /// sessions on a hundred hosts, delivered in forwarder-sized batches in
 /// the order hosts would interleave them.

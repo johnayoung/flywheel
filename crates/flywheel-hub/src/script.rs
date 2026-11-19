@@ -106,10 +106,12 @@ fn short(id: &str) -> &str {
 pub fn state_label(session: &Value) -> String {
     match str_field(session, "state") {
         "running" if session.get("live").is_some_and(|l| !l.is_null()) => {
-            // An agent's status (working, waiting, done, ...) alongside.
-            match session
-                .get("agent")
-                .and_then(|a| a.get("status"))
+            // An agent's shown state (working, asking, background, ...;
+            // the one every surface shows), else its status, alongside.
+            let agent = session.get("agent");
+            match agent
+                .and_then(|a| a.get("state"))
+                .or_else(|| agent.and_then(|a| a.get("status")))
                 .and_then(Value::as_str)
             {
                 Some(status) => format!("running ({status})"),
@@ -456,6 +458,16 @@ pub(crate) struct LsArgs {
     /// repeatable (all must hold). `fw.state=done` reads the live status.
     #[arg(long = "label", value_name = "KEY[=VALUE]")]
     labels: Vec<String>,
+    /// Only what needs you, as the sidebar's Needs you lists it: blocked,
+    /// asking, and failed agents (each with what it waits on), then a
+    /// count of finished turns.
+    #[arg(long)]
+    needs: bool,
+    /// Only sessions matching WORDS, as the sidebar's filter box reads
+    /// them: words of a name, `ws:WORKSPACE`, `is:STATE` (blocked, asking,
+    /// working, background, done, resting, ended, ...).
+    #[arg(long, value_name = "WORDS")]
+    filter: Option<String>,
     #[command(flatten)]
     endpoint: EndpointArgs,
 }
@@ -474,6 +486,65 @@ pub(crate) fn sessions_labelled(conn: &Endpoint, labels: &[String]) -> Result<Ve
     Ok(listed["sessions"].as_array().cloned().unwrap_or_default())
 }
 
+/// An agent session's shown state (`agent.state`), when it has one.
+fn agent_state(session: &Value) -> Option<&str> {
+    session
+        .get("agent")
+        .and_then(|a| a.get("state"))
+        .and_then(Value::as_str)
+}
+
+/// Blocked, asking, or failed: what the sidebar's Needs you lists as rows.
+fn needs_you(session: &Value) -> bool {
+    matches!(agent_state(session), Some("blocked" | "asking" | "failed"))
+}
+
+/// The words `is:` matches: its shown state and status, `resting` for an
+/// idle agent, `ended` for a session not running, and its state label.
+fn state_words(session: &Value) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    if let Some(state) = agent_state(session) {
+        words.push(state.to_owned());
+        if state == "idle" {
+            words.push("resting".to_owned());
+        }
+    }
+    if let Some(status) = session
+        .get("agent")
+        .and_then(|a| a.get("status"))
+        .and_then(Value::as_str)
+    {
+        words.push(status.to_owned());
+    }
+    if str_field(session, "state") != "running" {
+        words.push("ended".to_owned());
+    }
+    words.extend(
+        state_label(session)
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_owned),
+    );
+    words.into_iter().map(|w| w.to_lowercase()).collect()
+}
+
+/// Whether `session` (in `workspace`, by name) matches the filter's
+/// `words` (lowercase): each a part of its name, `ws:NAME` a part of its
+/// workspace's name, `is:STATE` the start of one of its state words.
+fn matches_filter(session: &Value, workspace: &str, words: &[String]) -> bool {
+    let name = str_field(session, "name").to_lowercase();
+    let workspace = workspace.to_lowercase();
+    words.iter().all(|word| {
+        if let Some(ws) = word.strip_prefix("ws:") {
+            workspace.contains(ws)
+        } else if let Some(state) = word.strip_prefix("is:") {
+            state_words(session).iter().any(|w| w.starts_with(state))
+        } else {
+            name.contains(word.as_str())
+        }
+    })
+}
+
 pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let conn = match connect(&args.endpoint) {
         Ok(conn) => conn,
@@ -482,16 +553,36 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
     let listed = conn
         .blocking_workspaces()
         .and_then(|w| Ok((w, sessions_labelled(&conn, &args.labels)?)));
-    let (mut workspaces, sessions) = match listed {
+    let (workspaces, mut sessions) = match listed {
         Ok(lists) => lists,
         Err(message) => return fail(err, &message),
     };
-    if !args.labels.is_empty() {
-        // Filtered: only the workspaces something matched in.
-        workspaces.retain(|w| {
-            sessions
+    let words: Vec<String> = args
+        .filter
+        .as_deref()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect();
+    let narrowed = args.needs || !words.is_empty() || !args.labels.is_empty();
+    // Finished turns (--needs): counted, not listed.
+    let mut finished: Vec<String> = Vec::new();
+    if args.needs || !words.is_empty() {
+        let ws_name = |s: &Value| {
+            workspaces
                 .iter()
-                .any(|s| str_field(s, "workspace_id") == str_field(w, "id"))
+                .find(|w| str_field(w, "id") == str_field(s, "workspace_id"))
+                .map(|w| str_field(w, "name").to_owned())
+                .unwrap_or_default()
+        };
+        sessions.retain(|s| {
+            if !matches_filter(s, &ws_name(s), &words) {
+                return false;
+            }
+            if args.needs && agent_state(s) == Some("done") {
+                finished.push(str_field(s, "name").to_owned());
+            }
+            !args.needs || needs_you(s)
         });
     }
     // A hub from before usage has no /api/usage: the listing stands.
@@ -503,6 +594,11 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
             .cloned()
             .collect()
     };
+    // Narrowed: only the workspaces with a session left.
+    let workspaces: Vec<Value> = workspaces
+        .into_iter()
+        .filter(|w| !narrowed || !of(w).is_empty())
+        .collect();
     if args.json {
         let nested: Vec<Value> = workspaces
             .iter()
@@ -513,10 +609,33 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
             })
             .collect();
         let mut listing = json!({ "workspaces": nested });
+        if args.needs {
+            listing["finished"] = json!(finished);
+        }
         if let Some(usage) = usage {
             listing["usage"] = usage;
         }
         print_json(out, &listing);
+        return 0;
+    }
+    if workspaces.is_empty() && narrowed {
+        let _ = writeln!(
+            out,
+            "{}",
+            if args.needs {
+                "nothing needs you"
+            } else {
+                "no session matches"
+            }
+        );
+        if !finished.is_empty() {
+            let _ = writeln!(
+                out,
+                "finished: {} ({})",
+                finished.len(),
+                finished.join(", ")
+            );
+        }
         return 0;
     }
     if workspaces.is_empty() {
@@ -581,6 +700,16 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
                 w2 = widths[2],
                 w3 = widths[3],
             );
+            // What a session that needs you waits on.
+            if args.needs
+                && let Some(detail) = session
+                    .get("agent")
+                    .and_then(|a| a.get("detail"))
+                    .and_then(Value::as_str)
+                    .filter(|d| !d.trim().is_empty())
+            {
+                let _ = writeln!(out, "  {:w0$}  {detail}", "", w0 = widths[0]);
+            }
             if let Some(error) = restore_error(session) {
                 let _ = writeln!(
                     out,
@@ -592,7 +721,15 @@ pub(crate) fn ls(args: &LsArgs, out: &mut dyn Write, err: &mut dyn Write) -> i32
             }
         }
     }
-    if let Some(line) = usage.as_ref().and_then(usage_footer) {
+    if !finished.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nfinished: {} ({})",
+            finished.len(),
+            finished.join(", ")
+        );
+    }
+    if let Some(line) = usage.as_ref().filter(|_| !narrowed).and_then(usage_footer) {
         let _ = writeln!(out, "\n{line}");
     }
     0
@@ -1793,6 +1930,12 @@ mod tests {
             label(json!({"state": "running", "live": {"pid": 1}, "agent": {"status": "done"}})),
             "running (done)"
         );
+        // The shown state wins over the coarse status.
+        assert_eq!(
+            label(json!({"state": "running", "live": {"pid": 1},
+                         "agent": {"status": "done", "state": "asking"}})),
+            "running (asking)"
+        );
         assert_eq!(kind_label(&json!({"kind": "claude"})), "claude");
         assert_eq!(
             kind_label(&json!({"kind": "claude", "fallback_command": ["/bin/sh"]})),
@@ -1930,5 +2073,50 @@ mod tests {
         let s = json!({"cwd": "/repo", "live": {"cwd": "/repo/sub"}});
         assert_eq!(live_cwd(&s), "/repo/sub");
         assert_eq!(live_cwd(&json!({"cwd": "/repo", "live": null})), "/repo");
+    }
+
+    #[test]
+    fn ls_filter_reads_names_workspaces_and_states() {
+        let words = |q: &str| {
+            q.split_whitespace()
+                .map(str::to_lowercase)
+                .collect::<Vec<_>>()
+        };
+        let agent = |state: &str, status: &str| {
+            json!({"name": "fade-1118", "state": "running", "live": {"pid": 1},
+                   "agent": {"state": state, "status": status}})
+        };
+        let working = agent("working", "working");
+        assert!(matches_filter(&working, "infrared", &words("fade")));
+        assert!(matches_filter(&working, "infrared", &words("FADE 1118")));
+        assert!(!matches_filter(&working, "infrared", &words("paper")));
+        assert!(matches_filter(
+            &working,
+            "infrared",
+            &words("ws:infra is:work")
+        ));
+        assert!(!matches_filter(&working, "personal", &words("ws:infra")));
+        assert!(!matches_filter(&working, "infrared", &words("is:asking")));
+        // An idle agent rests; a session not running has ended.
+        assert!(matches_filter(
+            &agent("idle", "idle"),
+            "w",
+            &words("is:resting")
+        ));
+        let ended = json!({"name": "alert-fix", "state": "exited", "code": 0});
+        assert!(matches_filter(&ended, "w", &words("is:ended")));
+        assert!(matches_filter(&ended, "w", &words("")));
+    }
+
+    #[test]
+    fn needs_you_is_blocked_asking_or_failed() {
+        let with = |state: &str| json!({"agent": {"state": state}});
+        for state in ["blocked", "asking", "failed"] {
+            assert!(needs_you(&with(state)), "{state}");
+        }
+        for state in ["working", "background", "compacting", "done", "idle"] {
+            assert!(!needs_you(&with(state)), "{state}");
+        }
+        assert!(!needs_you(&json!({"kind": "shell"})));
     }
 }

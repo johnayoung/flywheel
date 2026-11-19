@@ -640,13 +640,17 @@ window.FwHubAttention = function (ctx) {
     );
   }
 
-  function row({ session, agent, ask }) {
-    const workspace = workspaceById(session.workspace_id);
+  // One agent that needs you: its dot, its name, what it needs and since
+  // when; what it asks under it (two lines at most). Its reply box opens
+  // under the attached one in the sidebar, under every ask on the start
+  // screen (`full`). Its other facts are the inspector's (hover, the row's
+  // I, `fw hub ls`).
+  function row({ session, agent, ask }, full) {
     const active = state.attached === session.id;
-    const branch = branchOf(session);
+    const look = ctx.statusLook ? ctx.statusLook(session) : { dot: ask ? "asking" : agent.state };
     return el(
       "li",
-      {},
+      { dataset: { id: `need:${session.id}` } },
       el(
         "button",
         {
@@ -655,23 +659,20 @@ window.FwHubAttention = function (ctx) {
           dataset: { id: session.id },
           "aria-current": active ? "true" : undefined,
           onclick: () => openSession(session.id),
+          onmouseenter: (event) => ctx.inspect && ctx.inspect.hover(session.id, event.currentTarget),
+          onmouseleave: () => ctx.inspect && ctx.inspect.leave(),
+          onkeydown: (event) => {
+            if ((event.key === "i" || event.key === "I") && ctx.inspect) {
+              event.preventDefault();
+              ctx.inspect.toggle(session.id, event.currentTarget);
+            }
+          },
         },
-        el("span", { className: `glyph ${session.kind}` }, icon(session.kind === "codex" ? "codex" : "claude")),
+        el("span", { className: "glyph state" }, el("span", { className: `dot ${look.dot}`, "aria-hidden": "true" })),
         el(
           "span",
           { className: "attn-text" },
-          el(
-            "span",
-            { className: "attn-line" },
-            el("b", { className: "attn-name", textContent: session.name }),
-            session.machine
-              ? el("span", { className: "machine-badge", textContent: session.machine, title: `on machine ${session.machine}` })
-              : null,
-            el("span", { className: "attn-ws", textContent: workspace ? workspace.name : "" }),
-            branch
-              ? el("span", { className: "attn-branch", title: `worktree branch ${branch}` }, icon("branch"), el("span", { textContent: branch }))
-              : null,
-          ),
+          el("span", { className: "attn-line" }, el("b", { className: "attn-name", textContent: session.name })),
           el("span", {
             className: "attn-detail",
             title: ask ? ask.text : agent.detail || "",
@@ -684,8 +685,34 @@ window.FwHubAttention = function (ctx) {
           el("span", { className: "attn-age", textContent: age(ask ? new Date(ask.since).toISOString() : agent.since) }),
         ),
       ),
-      ask ? askBox(session, ask) : null,
+      ask && (full || active) ? askBox(session, ask) : null,
     );
+  }
+
+  // Finished turns nobody here has looked at: one quiet line (newest
+  // first), their rows under it once tapped.
+  let finishedOpen = false;
+  function finishedRows(done, full) {
+    if (!done.length) return [];
+    const names = done.map((e) => e.session.name).join(", ");
+    return [
+      el("li", { dataset: { id: "finished" } },
+        el("button", {
+          type: "button",
+          className: "attn-finished",
+          "aria-expanded": String(finishedOpen),
+          title: finishedOpen ? "Fold the finished turns" : `Finished, not looked at yet: ${names}`,
+          onclick: () => {
+            finishedOpen = !finishedOpen;
+            if (ctx.rerender) ctx.rerender();
+            else render();
+          },
+        },
+        el("span", { className: "dot agent-done", "aria-hidden": "true" }),
+        el("b", { textContent: `${done.length} finished` }),
+        el("span", { className: "attn-finished-names", textContent: finishedOpen ? "" : names }))),
+      ...(finishedOpen ? done.map((e) => row(e, full)) : []),
+    ];
   }
 
   // A flywheel task that needs you: opens its folder's panel.
@@ -770,13 +797,14 @@ window.FwHubAttention = function (ctx) {
       if (!root) continue;
       const any = list.length || passed.length || starts.length || ends.length || loop.length || graded.length || queues.length;
       root.hidden = !any;
-      morph(root, any ? content(list, passed, starts, ends, loop, graded, queues) : []);
+      morph(root, any ? content(list, passed, starts, ends, loop, graded, queues, root.id === "empty-attention") : []);
     }
   }
 
-  function content(list, passed, starts, ends, loop, graded, queues) {
+  function content(list, passed, starts, ends, loop, graded, queues, full) {
     const blocked = list.filter((e) => e.level === 0).length;
     const asking = list.filter((e) => e.level === 1).length;
+    const failed = list.filter((e) => e.level === 2 && e.agent.state === "failed").length;
     const alerts = loop.reduce((n, e) => n + (e.count || 1), 0);
     return [
       el(
@@ -791,7 +819,7 @@ window.FwHubAttention = function (ctx) {
             starts.length ? `${starts.length} start${starts.length === 1 ? "" : "s"}` : "",
             ends.length ? `${ends.length} end${ends.length === 1 ? "" : "s"}` : "",
             asking ? `${asking} asking` : "",
-            list.length - blocked - asking ? `${list.length - blocked - asking} done` : "",
+            failed ? `${failed} failed` : "",
             alerts ? `${alerts} flywheel` : "",
             graded.length ? `${graded.length} fan-out${graded.length === 1 ? "" : "s"}` : "",
             queues.length ? `${queues.length} queue${queues.length === 1 ? "" : "s"} stalled` : "",
@@ -805,14 +833,16 @@ window.FwHubAttention = function (ctx) {
       el(
         "ul",
         { className: "attn-list" },
-        list.filter((e) => e.level === 0).map(row),
+        list.filter((e) => e.level === 0).map((e) => row(e, full)),
         passed.map(handoffRow),
         starts.map(startRow),
         ends.map(endRow),
-        list.filter((e) => e.level === 1).map(row),
+        list.filter((e) => e.level === 1).map((e) => row(e, full)),
         queues.map((s) => ctx.queue().attentionRow(s)),
         graded.map((f) => fanout.attentionRow(f)),
-        list.filter((e) => e.level === 2).map(row),
+        // A failed turn is acted on: a row of its own, not folded.
+        list.filter((e) => e.level === 2 && e.agent.state === "failed").map((e) => row(e, full)),
+        finishedRows(list.filter((e) => e.level === 2 && e.agent.state !== "failed"), full),
         loop.map(flywheelRow),
       ),
     ];

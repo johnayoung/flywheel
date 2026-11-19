@@ -50,7 +50,7 @@ fw hub share revoke [ID|LABEL] [--all] [--session S] {remote}
 Sessions:
 
 ```bash
-fw hub ls [--label K[=V]]... [--json] {where}  # K=A|B: any of; fw.state: live status
+fw hub ls [--label K[=V]]... [--needs] [--filter WORDS] [--json] {where}  # K=A|B: any of; fw.state: live status
 fw hub new WS [--kind shell|claude|codex] [--folder PATH|LABEL] [--name N] [--create] [--worktree TASK] [--base REF] [--json] {where} [-- ARGV...]
     [--prompt TEXT|-] [--model M] [--permission-mode P] [--approval A] [--sandbox S] [--template NAME]
     [--resume ID | --continue]  # agents: pick up a conversation of the folder (no --prompt, no --worktree)
@@ -385,6 +385,7 @@ Defaults, all rebindable (Settings > Keyboard). `mod` = Ctrl (Cmd on macOS); `al
 | `session.jump` | `alt+1..9` | Jump to the nth session |
 | `session.prev` | `alt+up` | Previous session |
 | `session.next` | `alt+down` | Next session |
+| `list.filter` | `alt+/` | Filter sessions |
 | `session.rename` | `alt+r` | Rename the attached session |
 | `session.close` | `alt+w` | Close the attached session |
 | `session.reference` | `alt+i` | Reference another session in the focused one |

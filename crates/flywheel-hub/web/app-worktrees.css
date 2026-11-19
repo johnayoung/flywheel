@@ -33,50 +33,6 @@
 .session-git .ahead { color: var(--signal); }
 .session-git .behind { color: var(--ink-2); }
 .session-git .dirty, .session-git .untracked { color: var(--brass); }
-.session.active .session-git { color: var(--ink-2); }
-
-/* The folder a session runs in, then its branch line, on one line under
-   the row; the folder gives up room first. */
-.session-where {
-  grid-column: 2 / -1;
-  display: flex;
-  align-items: center;
-  gap: .6rem;
-  min-width: 0;
-  margin-top: -.3rem;
-  font-size: 10px;
-  color: var(--ink-3);
-}
-.session-where .session-git { flex: 0 1 auto; margin-top: 0; }
-.session-folder {
-  flex: 0 1 auto;
-  min-width: 2.5rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.session-folder.outside { font-style: italic; }
-.session-account { flex: none; color: var(--brass); white-space: nowrap; }
-.session.active .session-folder { color: var(--ink-2); }
-
-/* Where a session runs: on the active row only (the rest stay one line). */
-.session:not(.active) > .session-where { display: none; }
-
-/* A companion shell hangs under its agent. */
-.session.companion { padding-left: 2.1rem; min-height: 1.8rem; }
-.session.companion::after {
-  content: "";
-  position: absolute;
-  left: 1.35rem;
-  top: 0;
-  height: 50%;
-  width: .45rem;
-  border-left: 1px solid var(--rule-2);
-  border-bottom: 1px solid var(--rule-2);
-  pointer-events: none;
-}
-.session.companion.needs-you::after { border: 0; }
-
 /* New-session form: the worktree option. */
 .wt-pick { gap: .35rem; }
 .wt-toggle { display: flex; align-items: center; gap: .45rem; font-size: 11.5px; color: var(--ink); cursor: pointer; }
@@ -128,27 +84,14 @@
 
 /* --- worktrees on the phone ---------------------------------------------- */
 
-/* Which of an agent's parallel tasks needs you: its worktree branch. */
-.attn-branch {
-  display: inline-flex;
-  align-items: center;
-  gap: .25rem;
-  min-width: 0;
-  max-width: 100%;
-  color: var(--ink-2);
-  font-size: 10.5px;
-}
-.attn-branch svg { flex: none; width: .7rem; height: .7rem; }
-.attn-branch span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-/* Phone width or a finger: every row and row action is a 44px target,
-   and a companion keeps one line (its name gives way to the actions:
-   its agent's row above says whose it is). */
+/* Phone width or a finger: every row and row action is a 44px target
+   (a row's name gives way to its actions). */
 @media (pointer: coarse), (max-width: 760px) {
-  .session, .session.companion { min-height: 44px; }
+  .session { min-height: 44px; }
   .session-actions .icon { min-width: 44px; min-height: 44px; }
-  .session.companion .session-meta { grid-column: auto; flex-wrap: nowrap; }
-  .session.companion.active .session-meta .session-state { display: none; }
+  .attn-finished, .fold-line { min-height: 44px; }
+  /* Three 44px actions leave the name room; rename is in the palette. */
+  .session-actions .rename-action { display: none; }
 }
 
 /* The agent / shell flip keeps its word on phones: an icon alone does not

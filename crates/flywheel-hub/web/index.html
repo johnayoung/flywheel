@@ -128,6 +128,10 @@
         <button type="button" class="list-new" id="list-new" data-key-title="session.new" data-title="New session" title="New session (Alt N)" aria-label="New session"><svg aria-hidden="true"><use href="#i-plus"/></svg></button>
       </header>
       <div id="offline" class="offline" hidden role="status">hub unreachable &mdash; retrying</div>
+      <div class="list-find">
+        <label class="list-filter"><svg aria-hidden="true"><use href="#i-search"/></svg><input id="list-filter" type="search" placeholder="filter" aria-label="Filter sessions: words of a name, ws:WORKSPACE, is:STATE" autocomplete="off" spellcheck="false" data-key-title="list.filter" data-title="Filter sessions"></label>
+        <button type="button" id="list-density" class="list-density" aria-pressed="false" aria-label="Dense rows" title="Dense rows"><svg aria-hidden="true"><use href="#i-menu"/></svg></button>
+      </div>
       <div id="side-scroll" class="side-scroll">
         <section id="attention" class="attention" hidden aria-label="Agents that need you"></section>
         <nav id="workspaces" aria-label="Sessions"></nav>
@@ -899,6 +903,7 @@
 <script src="/assets/app-tabs.js"></script>
 <script src="/assets/app-events.js"></script>
 <script src="/assets/app-sidebar.js"></script>
+<script src="/assets/app-inspector.js"></script>
 <script src="/assets/app-dialogs.js"></script>
 <script src="/assets/app-keyboard.js"></script>
 <script src="/assets/app.js"></script>

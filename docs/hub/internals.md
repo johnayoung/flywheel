@@ -41,9 +41,9 @@ Front door: [hub](../hub.md).
 Replaces the hub process **ending no session**: same pids, screens, scrollback, port, status, hook secrets. Linux only.
 
 - Binary: `--binary`, else `fw` on `PATH`, else this one; it inherits the old hub's environment. Earlier agents' hooks keep the old binary's path: upgrade in place.
-- Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring; exits on the new hub's ack. Input meanwhile is `nack`ed for resend.
+- Over `handoff.sock` the old hub freezes (503, PTYs paused), closes WebSockets (**1012**), passes listener, locks, PTY masters, pidfds (`SCM_RIGHTS`), snapshots, held input, input ids, the resume ring; exits on the new hub's ack. Input meanwhile: `nack`ed, resent.
 - Failure before commit thaws the old hub; a stuck new one dies at `--timeout`. Refused (exit 4, nothing changed): protocol skew, a pre-handoff hub, a binary without `--handoff`; `--allow-restart` restarts instead (sessions restored, not kept); systemd: `systemctl --user restart <unit>`.
-- Agents keep their old tools, so each is marked `stale` ("relaunch pending"). `--relaunch safe-points` (default) kills and resumes each in place, one at a time, once its turn is over with nothing running or typed; its queue waits. Busy, asking, blocked: never interrupted. Never: `--never`, unresumable, ending. A failed resume stays exited; timeline `session.relaunched`.
+- Agents keep their old tools, so each is marked `stale` (inspector: relaunch). `--relaunch safe-points` (default) kills and resumes each in place, one at a time, once its turn ends with nothing running or typed; its queue waits. Busy, asking, blocked: never interrupted. Never: `--never`, unresumable, ending. A failed resume stays exited; timeline `session.relaunched`.
 - Handed-over processes are not children: exits via pidfd, no code. `attach`, `wait` reconnect within 2 min.
 
 ## Agent status
@@ -67,7 +67,7 @@ Replaces the hub process **ending no session**: same pids, screens, scrollback, 
 
 Per-kind TOML rules read against the screen's **live bottom**: `crates/flywheel-hub/detect/{claude,codex,shell}.toml`, each replaced wholesale by `<state-dir>/agent-detection/<kind>.toml` (re-read within 1 s; invalid: logged, ignored).
 
-Start from a shipped (commented) file. Fields: `kind` (file name), `version` (`explain` shows it); `[[rule]]`s, first whose every clause holds wins: `id`, `state` (`working` | `blocked` | `idle` | `hold`: keep the status), `detail`, `detail_line` (regexes; capture 1 is the detail);
+Start from a shipped file. Fields: `kind` (file name), `version` (`explain` shows it); `[[rule]]`s, first whose every clause holds wins: `id`, `state` (`working` | `blocked` | `idle` | `hold`: keep the status), `detail`, `detail_line` (regexes; capture 1 is the detail);
 `[[rule.when]]` clauses: `lines` (the last N non-empty rows, 1-100, 30), `line` / `not_line` (regexes), `any` / `all` / `none` (case-insensitive text).
 
 - Pin `blocked` rules to a dialog's footer (quoted text must not match). Limits: 64 rules, 8 clauses, 16 patterns per list, 400 chars, 64 KiB per file; read at most every 250 ms. Shell rules only answer `explain`.
@@ -91,17 +91,17 @@ Per workspace: tabs of split trees, one session per pane, stored on the hub; act
 
 ## Web UI
 
-- Sidebar: **rail** (wheel = Everything, workspace tiles, More) + **list** (Everything: Needs you, Moving, Resting; a tile: its folders, sessions). Active row: folder, `↑ahead ↓behind ~changed ?untracked`.
-- Title, favicon count blocked and done; `#session=<id>` survives reloads. A dropped or silent (no pong in 6 s) socket keeps the screen, reconnects (2 s, up to 10 s) with what it missed.
+- Sidebar: **rail** (wheel = Everything, workspace tiles, More) + **list** (Everything: Needs you, Moving, Resting; a tile: its folders, sessions). Row: dot, name, one fact; leads nest children; the rest: inspector (hover, `I`).
+- Title, favicon count blocked and done; `#session=<id>` survives reloads. A dropped or silent (no pong in 6 s) socket keeps the screen and reconnects (2-10 s), catching up.
 - Keys typed while down wait (`N queued`), sent in order once back; dropped, and said, if the session changed (epoch). Unacked 500 ms: `sending…`. Assets: gzipped, `?v=`-addressed, cached for good.
-- Drawers (Commands, Flywheel, Review, Queue) share the stage's right edge; phones: full-screen sheets. Ended sessions: Relaunch, Close. First run: import offers, a 30 s tour. Themes: auto, dark, light (dim TUI colours lifted to 4.5:1).
+- Drawers (Commands, Flywheel, Review, Queue) share the stage's right edge; phones: sheets. Ended sessions: Relaunch, Close. First run: import offers, a 30 s tour. Themes: auto, dark, light (dim TUI colours lifted to 4.5:1).
 - Vendored (`web/vendor/`, licensed): xterm.js 6.0.0 (+ fit, web-links, search); JetBrains Mono 2.304, then JuliaMono for its gaps.
 
 ## Phone
 
 Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
-- **Needs you**: blocked and done agents of every workspace (blocked, longest waiting, first) head Everything and the start screen.
+- **Needs you** (atop Everything, start screen): blocked, asking, failed (oldest first), `N finished`.
 - **Key bar** (touch): `esc` arrows `enter` `^c`; then `tab` `shift-tab` sticky `ctrl` `alt`, `/ | ~ -`, `pgup` `pgdn`, text size, `kbd`, `compose`.
 - **Quick answers**: a blocked dialog's options as buttons (AskUserQuestion's from its input, only while its question is on screen). **Compose**: multi-line text as one bracketed paste + Enter; history per device, drafts per session.
 - Swipe scrolls, long-press selects, pinch zooms. **Alerts** (per device, https or localhost): blocked or done while hidden or idle 5 min.
@@ -121,7 +121,7 @@ Pinned to the visual viewport (the keyboard shrinks the terminal); PTY 16+ rows.
 
 `fw hub record start|stop SESSION` (or the `rec` pill); `fw hub record get NAME -o demo.cast; asciinema play demo.cast`.
 
-- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after lag, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on its last screen; `recordings.dir_cap` deletes the oldest finished.
+- Opt-in: `recordings/<session>-<UTC time>.cast`, asciinema v2 (`o`, `r` resizes, `m` markers: `exit: N`, `resync` after lag, `continued in`), from a screen snapshot. `recordings.part_cap` rotates to `<base>.part<N>.cast`, opening on its last screen; `dir_cap` deletes the oldest finished.
 - Ends on stop, exit, relaunch, hub stop; `upgrade` continues the file. An active one is not deleted (409).
 - `/replay#<name>`: seek with marker ticks, 0.5-8x, idle gaps cut to 2 s, follows parts.
 
@@ -137,4 +137,4 @@ ntfy-compatible POST when an agent becomes **blocked** or **done**: a phone hear
 `fw hub doctor`: `ok | info | warn | FAIL` per finding, each with a `fix:`; read-only (binds the port a moment, runs `--version`/`--help` only).
 
 Checks: `fw` / `flywheel` on PATH (a script or other program: FAIL; another build: warn), the running `hub`'s version, `claude` / `codex` and `claude hooks` (missing, no `--version`, `--settings` rejects the hooks),
-state dir and secrets (owner, 0700 / 0600), the config files (as `fw hub config check`), `recordings` (90%: info, past `dir_cap`: warn), `port`, `tailscale`, `browser`, `systemd` (linger, WSL), `clock`, `disk` (< 2 GiB warn, < 512 MiB FAIL).
+state dir and secrets (owner, 0700 / 0600), config files (`fw hub config check`), `recordings` (90%: info, past `dir_cap`: warn), `port`, `tailscale`, `browser`, `systemd` (linger, WSL), `clock`, `disk` (< 2 GiB warn, < 512 MiB FAIL).

@@ -92,7 +92,7 @@
 .ho-review-foot .slab svg { width: .85rem; height: .85rem; margin-right: .3rem; }
 .rv-file-foot { display: flex; justify-content: flex-end; padding: .3rem .6rem; border-top: 1px solid var(--rule); }
 
-/* Author <-> reviewer chips (the sidebar row, the drawer's head). */
+/* Author <-> reviewer chips (the inspector, the drawer's head). */
 .pair-chip {
   display: inline-flex;
   align-items: center;
@@ -111,7 +111,6 @@
 .pair-chip svg { flex: none; width: .7rem; height: .7rem; }
 .pair-chip:hover, .pair-chip:focus-visible { border-color: var(--brass); outline: none; }
 .pair-chip .dot { flex: none; }
-.session > .pair-chip { grid-column: 2 / -1; justify-self: start; margin-top: -.25rem; }
 .cmd-handoff, .tx-send { margin-left: auto; }
 .tx-send { font-size: 10.5px; }
 

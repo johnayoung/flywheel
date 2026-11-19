@@ -84,6 +84,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         JS,
     ),
     (
+        "app-inspector.js",
+        include_bytes!("../web/app-inspector.js"),
+        JS,
+    ),
+    (
         "app-dialogs.js",
         include_bytes!("../web/app-dialogs.js"),
         JS,

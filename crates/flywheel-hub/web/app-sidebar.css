@@ -262,11 +262,100 @@ body.list-hidden .side-list { display: none; }
 }
 .list-elsewhere:hover { background: color-mix(in srgb, var(--alert) 13%, transparent); }
 
+/* The list's filter and density toggle, under its head. */
+.list-find { display: flex; gap: .4rem; align-items: center; padding: .55rem .7rem .15rem .95rem; }
+.list-filter {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: .4rem;
+  height: 1.65rem;
+  padding: 0 .45rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--ink-3);
+}
+.list-filter:focus-within { border-color: var(--signal); }
+.list-filter svg { flex: none; width: .7rem; height: .7rem; }
+.list-filter input { flex: 1; min-width: 0; padding: 0; border: 0; outline: 0; background: none; color: var(--ink); font: 400 10.5px/1 var(--mono); }
+.list-filter input::placeholder { color: var(--ink-3); }
+.list-density {
+  flex: none;
+  width: 1.65rem;
+  height: 1.65rem;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--rule-2);
+  border-radius: 3px;
+  background: none;
+  color: var(--ink-3);
+}
+.list-density svg { width: .7rem; height: .7rem; }
+.list-density:hover { color: var(--ink); }
+.list-density[aria-pressed="true"] { color: var(--ink); background: var(--bg-4); }
+
 /* In Everything, Needs you is the first group: flat, like the others. */
 #sidebar .attention { margin: 0; border: 0; background: none; animation: none; }
 #sidebar .attn-head { padding: .85rem .95rem .3rem; }
 #sidebar .attn-title { font: 400 9.5px/1.5 var(--mono); letter-spacing: .16em; color: var(--alert); }
 #sidebar .attn-list { max-height: none; overflow: visible; }
+/* Its rows, as the list's: the dot, the name, what and since when on the
+   right; what it asks under the name. */
+#sidebar .attn-row { grid-template-columns: 1.1rem minmax(0, 1fr) auto; align-items: start; column-gap: .6rem; row-gap: .05rem; padding: .3rem .7rem .3rem calc(.95rem - 3px); }
+#sidebar .attn-row .glyph { height: 1.25rem; }
+#sidebar .attn-name { font-weight: 500; font-size: 12px; }
+/* Its text's lines are the row's grid items: what it asks runs under the
+   name and the meta, the row's full width. */
+#sidebar .attn-text { display: contents; }
+#sidebar .attn-line { grid-column: 2; grid-row: 1; }
+#sidebar .attn-detail { grid-column: 2 / -1; grid-row: 2; color: var(--ink); }
+#sidebar .attn-row .glyph { grid-row: 1; }
+#sidebar .attn-meta { grid-column: 3; grid-row: 1; display: flex; align-items: baseline; gap: .3rem; padding-top: .15rem; }
+#sidebar .attn-status { padding: 0; background: none; color: var(--alert); font-size: 9.5px; letter-spacing: .06em; }
+#sidebar .attn-status.done { color: var(--brass); }
+#sidebar .attn-age { font-size: 9.5px; }
+.attn-row .glyph.state > .dot { position: relative; }
+/* Finished turns: one quiet line, their rows once tapped. */
+.attn-finished {
+  /* Its names never widen the box it is in (the start screen sizes
+     Needs you to its content). */
+  contain: inline-size;
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  width: 100%;
+  min-width: 0;
+  padding: .35rem .7rem .35rem .95rem;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font: 400 10.5px/1.3 var(--mono);
+  text-align: left;
+}
+.attn-finished:hover { color: var(--ink-2); background: var(--bg-3); }
+.attn-finished b { flex: none; color: var(--ink-2); font-weight: 600; }
+.attn-finished .dot { width: .42rem; height: .42rem; }
+.attn-finished-names { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+/* The inspector (app-inspector.js): a why-pop beside the sidebar, never
+   in the list; a sheet on a phone. */
+.inspector { width: 20rem; }
+.inspector .why-head { gap: .45rem; }
+.insp-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.inspector .why-row { grid-template-columns: 4.6rem minmax(0, 1fr); }
+.inspector .why-val .muted { color: var(--ink-3); }
+.inspector .why-val .dot { display: inline-block; vertical-align: 0; }
+.inspector .why-val .hot { color: var(--alert); }
+.inspector .prog-bar { display: inline-block; width: 3rem; vertical-align: middle; }
+.inspector .prog-bar i { background: var(--signal); }
+.inspector .session-cost { display: inline; }
+.inspector .session-git { margin-top: 0; }
+.insp-label { display: inline-block; margin: 0 .3rem .15rem 0; padding: 0 .3rem; border: 1px solid var(--rule-2); border-radius: 3px; font-size: 10px; color: var(--ink-2); }
+.insp-cli { margin: .5rem 0 0; padding-top: .45rem; border-top: 1px solid var(--rule); color: var(--ink-3); font-size: 10px; }
+.inspector.sheet { left: 0; right: 0; top: auto; bottom: 0; width: auto; max-height: 60vh; z-index: 60; padding: .8rem 1rem calc(.8rem + env(safe-area-inset-bottom)); }
 /* A workspace's list has its own: Needs you shows in Everything only. */
 #sidebar.scope-ws .attention { display: none; }
 
@@ -331,10 +420,10 @@ body.list-hidden .side-list { display: none; }
 .ws-count { font-variant-numeric: tabular-nums; }
 .ws-count b { color: var(--signal); font-weight: 600; }
 
-/* One line: the kind's glyph (its status dot on the corner), the name,
-   a short word at the right end. Under it only what matters now: what a
-   blocked agent asks, a working one's step, and on the active row where
-   it runs. */
+/* One line: the state's dot, the name, one fact at the right end (a
+   lead: its family's rollup). A second line only when it is acted on:
+   what a blocked agent waits on, a failed turn, a context window nearly
+   full. Everything else is the inspector's (app-inspector.js). */
 .session {
   position: relative;
   display: grid;
@@ -342,8 +431,8 @@ body.list-hidden .side-list { display: none; }
   align-items: center;
   column-gap: .6rem;
   row-gap: .1rem;
-  min-height: 2rem;
-  padding: .2rem .7rem .2rem .95rem;
+  min-height: 1.9rem;
+  padding: .15rem .7rem .15rem .95rem;
   cursor: pointer;
   color: var(--ink-2);
   transition: background .12s, color .12s;
@@ -389,6 +478,10 @@ body.list-hidden .side-list { display: none; }
   height: .45rem;
 }
 .glyph.shell { color: var(--ink-3); }
+/* A row's one state channel: the dot alone, centred where the kind's
+   glyph was. */
+.glyph.state > .dot { position: relative; right: auto; bottom: auto; width: .5rem; height: .5rem; }
+.glyph.state.as-shell { opacity: .6; }
 
 .session-name {
   min-width: 0;
@@ -401,38 +494,6 @@ body.list-hidden .side-list { display: none; }
 
 .session-meta { display: flex; align-items: center; gap: .3rem; min-width: 0; }
 .session-state:empty { display: none; }
-/* The cost is for a look closer: hover, focus, the active row. */
-.session .session-cost { display: none; }
-.session:hover .session-cost, .session:focus-within .session-cost, .session.active .session-cost { display: inline; }
-/* In Everything: the row's workspace, as its rail tile says it. */
-.ws-tag {
-  flex: none;
-  min-width: 1.45rem;
-  padding: 0 .2rem;
-  border: 1px solid var(--rule-2);
-  border-radius: 3px;
-  font: 600 8.5px/1.45 var(--mono);
-  letter-spacing: .06em;
-  text-align: center;
-  color: var(--ink-3);
-}
-.session:hover .ws-tag, .session:focus-within .ws-tag { display: none; }
-/* Its labels (key:value), in the ws-tag's quiet frame. */
-.label-chips { display: inline-flex; gap: .2rem; min-width: 0; overflow: hidden; }
-.label-chip {
-  flex: none;
-  max-width: 6.5rem;
-  overflow: hidden;
-  padding: 0 .25rem;
-  border: 1px solid var(--rule-2);
-  border-radius: 3px;
-  font: 500 8.5px/1.45 var(--mono);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--ink-2);
-}
-.label-chip.more { color: var(--ink-3); }
-.session:hover .label-chips, .session:focus-within .label-chips { display: none; }
 /* Everything grouped by a label: the control, and the chip saying so. */
 .group-by {
   max-width: 8rem;
@@ -465,17 +526,6 @@ body.list-hidden .side-list { display: none; }
   color: var(--ink-3);
 }
 
-/* A started session's starter: a name, so not shouted. */
-.session-state.session-starter {
-  max-width: 7rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-transform: none;
-  letter-spacing: 0;
-}
-.session-detail.session-ending { color: var(--brass); }
-.session-detail.session-relaunch { color: var(--ink-3); }
 .session-state.bad { color: var(--alert); }
 .session-state.live { color: var(--signal); }
 .session-state.brass { color: var(--brass); font-weight: 700; }
@@ -498,48 +548,66 @@ body.list-hidden .side-list { display: none; }
    taller buttons from growing the row (and shifting every row below). */
 .session-actions { display: none; gap: 0; margin: -.35rem 0; }
 .session:hover .session-actions, .session:focus-within .session-actions { display: inline-flex; }
-.session:hover .session-state, .session:focus-within .session-state { display: none; }
+.session:hover .session-state, .session:focus-within .session-state,
+.session:hover .session-roll, .session:focus-within .session-roll { display: none; }
 
 /* Touch screens have no hover: the active row's actions show in place of
    its word. */
 @media (hover: none) {
   .session.active .session-actions { display: inline-flex; }
-  .session.active .session-state, .session.active .ws-tag { display: none; }
+  .session.active .session-state, .session.active .session-roll { display: none; }
 }
 
 .session.gone { opacity: .55; }
 
-/* A working agent's progress: its plan's bar and step, else its tool. */
-.session-progress {
-  grid-column: 2 / -1;
-  display: flex;
-  align-items: center;
-  gap: .4rem;
-  min-width: 0;
-  margin-top: -.2rem;
-  font: 400 10.5px/1.3 var(--mono);
-  color: var(--ink-2);
-}
-.session-progress .prog-bar { flex: 0 0 2.6rem; }
-.session-progress .prog-bar i { background: var(--signal); }
-.session-progress b { flex: none; font-weight: 600; font-variant-numeric: tabular-nums; }
-/* What a step says quieter: a call's argument, "still running". */
-.session-step .muted { color: var(--ink-3); }
-.session-step b { color: var(--signal); }
-.session-progress .session-step { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-progress .session-step.tool { color: var(--ink-3); }
-.session-progress .session-ctx { flex: none; color: var(--alert); }
-
 .session-detail {
   grid-column: 2 / -1;
   min-width: 0;
-  margin-top: -.25rem;
+  margin-top: -.2rem;
+  padding-bottom: .1rem;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 10.5px;
   color: var(--alert);
 }
+
+.session-detail .muted { color: var(--ink-3); }
+
+/* A lead: its name stronger, its family's rollup at the right end (a
+   glyph and a count each: needs you, moving, quiet). */
+.session.lead .session-name { color: var(--ink); font-weight: 600; }
+.session-roll { display: inline-flex; align-items: center; gap: .25rem; font: 600 9.5px/1 var(--mono); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.session-roll .dot { width: .4rem; height: .4rem; margin-left: .2rem; }
+.session-roll .dot:first-child { margin-left: 0; }
+/* Its children: their own names, on a guide rule under it. */
+.session-kids { display: block; }
+.sessions.kids { margin: 0 0 .15rem 1.45rem; border-left: 1px solid var(--rule-2); }
+.sessions.kids .session { padding-left: .6rem; }
+.sessions.kids .session.active::before { left: -1px; }
+/* Quiet lines: ended children, children Needs you shows. */
+.fold-line {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  width: 100%;
+  min-width: 0;
+  padding: .25rem .7rem .25rem .6rem;
+  border: 0;
+  background: none;
+  color: var(--ink-3);
+  font: 400 10.5px/1.3 var(--mono);
+  text-align: left;
+}
+.fold-line:hover { color: var(--ink-2); background: var(--bg-3); }
+.fold-line b { flex: none; color: var(--ink-2); font-weight: 600; }
+.fold-line .dot { width: .42rem; height: .42rem; }
+.fold-names { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+
+/* Dense rows (the list head's toggle): more of a big fleet on screen. */
+#sidebar.dense .session { min-height: 1.45rem; padding-top: 0; padding-bottom: 0; }
+#sidebar.dense .session-name { font-size: 11.5px; }
+#sidebar.dense .attn-row { padding-top: .2rem; padding-bottom: .2rem; }
 
 .rename {
   width: 100%;

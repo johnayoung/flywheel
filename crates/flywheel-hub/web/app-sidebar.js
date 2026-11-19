@@ -214,29 +214,84 @@ async function deleteWorkspace(workspace) {
 
 // --- sidebar ---------------------------------------------------------
 
-// What a row says at its right end, short: an agent that needs you
-// (blocked, asking), a finished turn, a plan's count; a shell or an idle
-// agent says nothing (its dot does), an ended one how it ended.
-function rowMeta(session, st) {
+// A row says one thing at its right end: what its dot alone cannot.
+// Working: its plan's count, else how long its step has run; background:
+// how many agents still run; quiet: for how long; resting: since when;
+// ended: how. Everything else is the inspector's (app-inspector.js).
+function rowFact(session, st) {
+  if (session.ending) return { text: "ending", tone: "brass" };
   const agent = agentStatus(session);
   if (agent) {
-    if (st.quiet) return st.label;
-    if (st.dot === "handed") return "";
-    if (agent.status === "working") {
-      const t = sessionTelemetry.get(session.id);
-      const doing = doingOf(session, agent);
-      const plan = agent.state === "working" && t && t.plan && t.plan.total ? `${t.plan.done}/${t.plan.total}` : "";
-      return [doing && doing.age, plan].filter(Boolean).join(" \u00b7 ");
+    if (st.quiet) return { text: st.label, tone: "quiet" };
+    if (st.dot === "handed") return { text: "handed off", tone: "" };
+    const t = sessionTelemetry.get(session.id);
+    const doing = doingOf(session, agent);
+    switch (agent.state) {
+      case "working":
+      case "compacting":
+        if (t && t.plan && t.plan.total) return { text: `${t.plan.done}/${t.plan.total}`, tone: "" };
+        return { text: (doing && doing.age) || "", tone: "" };
+      case "background":
+        return { text: (doing && doing.count) || "background", tone: "" };
+      case "idle":
+        return { text: agent.since ? age(agent.since) : "", tone: "" };
+      case "done":
+        return { text: "done", tone: "brass" };
+      default:
+        return { text: st.label, tone: st.tone };
     }
-    if (agent.state === "idle") return "";
-    if (agent.state === "done") return agent.since ? `done ${age(agent.since)}` : "done";
-    return st.label;
   }
-  return st.dot === "live" ? "" : st.label;
+  return { text: st.dot === "live" ? "" : st.label, tone: st.tone };
 }
 
-// `opts.tag`: the All list's rows carry their workspace's rail initials;
-// `opts.flat`: no companion connector (its agent may sit in another group).
+// The one line a row adds under its name, only when it is acted on: what
+// a blocked agent waits on, a failed turn's error, a context window
+// nearly full.
+const CTX_WARN = 85;
+function rowAlert(session, st) {
+  const t = sessionTelemetry.get(session.id);
+  if (st.dot === "blocked" && st.detail) return el("span", { className: "session-detail", textContent: st.detail });
+  const agent = agentStatus(session);
+  if (agent && agent.state === "failed") {
+    return el("span", { className: "session-detail", textContent: `failed: ${(t && t.last_error) || st.detail || "the turn ended on an error"}` });
+  }
+  if (agent && agent.status === "working" && t && t.context && t.context.pct >= CTX_WARN) {
+    const pct = `${t.context.exact === false ? "~" : ""}${Math.round(t.context.pct)}%`;
+    return el("span", { className: "session-detail session-ctx", title: "context window used" }, `ctx ${pct}`, el("span", { className: "muted", textContent: " · compacts soon" }));
+  }
+  return null;
+}
+
+// A family's rollup on its lead's row: what its children are, at most
+// three glyphs with counts (needs you, moving, quiet).
+const ROLL_NEEDS = ["blocked", "asking", "bad"];
+function rollup(children) {
+  const looks = children.map((c) => statusLook(c));
+  const needs = looks.filter((l) => ROLL_NEEDS.includes(l.dot));
+  const moving = looks.filter((l) => ["working", "compacting", "background"].includes(l.dot)).length;
+  const quiet = looks.filter((l) => l.dot === "quiet").length;
+  const parts = [];
+  const said = [];
+  if (needs.length) {
+    const worst = ROLL_NEEDS.find((d) => needs.some((l) => l.dot === d));
+    parts.push(el("span", { className: `dot ${worst}`, "aria-hidden": "true" }), String(needs.length));
+    said.push(`${needs.length} need${needs.length === 1 ? "s" : ""} you`);
+  }
+  if (moving) {
+    parts.push(el("span", { className: "dot working", "aria-hidden": "true" }), String(moving));
+    said.push(`${moving} moving`);
+  }
+  if (quiet) {
+    parts.push(el("span", { className: "dot quiet", "aria-hidden": "true" }), String(quiet));
+    said.push(`${quiet} quiet`);
+  }
+  if (!parts.length) return null;
+  return el("span", { className: "session-roll", title: `its sessions: ${said.join(", ")}` }, parts);
+}
+
+// `opts.kids`: the sessions this one started (a lead's children, its
+// companion shell, its reviewer), listed under it; `opts.child`: it is
+// one of them.
 function renderSession(session, opts = {}) {
   const st = statusLook(session);
   const active = state.attached === session.id;
@@ -262,35 +317,43 @@ function renderSession(session, opts = {}) {
         if (state.renaming === session.id) renameSession(session.id, e.target.value);
       },
     })
-    : el("span", { className: "session-name", textContent: session.name, title: session.cwd });
+    : el("span", { className: "session-name", textContent: session.name });
   const actions = el(
     "span",
     { className: "session-actions" },
-    iconButton("pen", "Rename (F2)", () => startRename(session.id)),
+    iconButton("dots", "Details (I)", () => inspector.toggle(session.id)),
+    Object.assign(iconButton("pen", "Rename (F2)", () => startRename(session.id)), { className: "icon rename-action" }),
     session.state === "running" && session.live
       ? iconButton("stop", "Stop: hang up, keep the scrollback", () => stopSession(session.id))
       : iconButton("redo", "Relaunch in place", () => relaunch(session.id)),
     iconButton("x", "Close session", () => closeSession(session.id), true),
   );
-  const workspace = opts.tag ? workspaceById(session.workspace_id) : null;
-  const parent = opts.flat ? null : session.companion_of || session.review_of;
+  const fact = rowFact(session, st);
+  const kids = opts.kids || [];
+  const roll = kids.length ? rollup(kids) : null;
+  const kind = window.FwHubFmt.kindLabel(session);
   return el(
     "li",
     {
-      className: `session${active ? " active" : ""}${shown ? " shown" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${parent ? " companion" : ""}${broadcast.isPicked(session.id) ? " picked" : ""}`,
+      className: `session${active ? " active" : ""}${shown ? " shown" : ""}${session.live ? "" : " gone"}${st.dot === "blocked" ? " needs-you" : ""}${opts.child ? " child" : ""}${kids.length ? " lead" : ""}${broadcast.isPicked(session.id) ? " picked" : ""}`,
       dataset: { id: session.id },
       tabIndex: 0,
       role: "button",
       "aria-current": active ? "true" : undefined,
-      title: session.live ? undefined : goneText(session),
+      "aria-label": `${session.name}, ${kind}, ${st.title || st.label}${fact.text ? `, ${fact.text}` : ""}`,
       // Drag onto a pane: its edge splits that way, its middle shows it there.
       draggable: !window.matchMedia(NARROW).matches,
       ondragstart: (e) => {
         dragged = session.id;
+        inspector.close();
         e.dataTransfer.setData(DRAG_TYPE, session.id);
         e.dataTransfer.setData("text/plain", session.name);
         e.dataTransfer.effectAllowed = "copyMove";
       },
+      // The inspector floats beside the row it is over (never in the
+      // list: no row moves for it).
+      onmouseenter: (e) => inspector.hover(session.id, e.currentTarget),
+      onmouseleave: () => inspector.leave(),
       // Ctrl/Cmd-click picks agents for a broadcast (broadcast.js).
       onclick: (e) => {
         if ((e.ctrlKey || e.metaKey) && !e.target.closest("button") && broadcast.toggle(session)) return;
@@ -310,70 +373,31 @@ function renderSession(session, opts = {}) {
         } else if (e.key === "Delete") {
           e.preventDefault();
           closeSession(session.id);
+        } else if (e.key === "i" || e.key === "I") {
+          e.preventDefault();
+          inspector.toggle(session.id, e.currentTarget);
+        } else if (e.key === "Escape" && inspector.isOpen()) {
+          e.preventDefault();
+          inspector.close();
         }
       },
     },
-    // The kind's glyph wears the status dot on its corner. Restored as a
-    // plain shell: the agent's glyph, dimmed, says so.
+    // One state channel: the dot. Its kind is in the title and the
+    // inspector; a restored-as-shell agent's dot is dimmed.
     el(
       "span",
-      {
-        className: `glyph ${glyphFor(session.kind)}${session.fallback_command ? " as-shell" : ""}`,
-        title: `${window.FwHubFmt.kindLabel(session)}: ${st.title || st.label}`,
-      },
-      icon(glyphFor(session.kind)),
+      { className: `glyph state${session.fallback_command ? " as-shell" : ""}`, title: `${kind}: ${st.title || st.label}` },
       el("span", { className: `dot ${st.dot}`, "aria-hidden": "true" }),
     ),
     nameNode,
     el(
       "span",
       { className: "session-meta" },
-      // A workspace's list has no machine badge: its tile says where.
-      opts.tag && session.machine ? machineBadge(session.machine) : null,
       recBadge(session),
-      launcher.rowChip(session),
-      promptQueue.rowChip(session),
-      pullRequests.rowChip(session),
-      starterHint(session),
-      labelChips(session),
-      el("span", {
-        className: `session-state ${st.tone}`,
-        textContent: rowMeta(session, st),
-        title: st.title || st.label,
-      }),
-      workspace ? el("span", { className: "ws-tag", textContent: initials(workspace.name), title: workspace.name }) : null,
+      roll || el("span", { className: `session-state ${fact.tone}`, textContent: fact.text, title: st.title || st.label }),
       actions,
     ),
-    // What a blocked agent asks, readable without hover (touch).
-    st.dot === "blocked" && st.detail
-      ? el("span", { className: "session-detail", textContent: st.detail })
-      : null,
-    progressLine(session, st),
-    // An agent's end in progress, or how one ended it: a line of its own
-    // (the meta strip has no room beside the name).
-    endingHint(session),
-    relaunchHint(session),
-    // Where it runs (shown on the active row); a companion (or a
-    // reviewer) under its agent: the agent's line says it all.
-    parent && sessionById(parent) ? null : whereLine(session),
-    // Author <-> reviewer (handoff.js).
-    handoff.pairChip(session),
-  );
-}
-
-// Its labels as chips (the hub's fw.* keys left out, and the key the list
-// is grouped by): two shown, the rest counted; all in the title.
-const LABEL_CHIPS = 2;
-function labelChips(session) {
-  const labels = Object.entries(session.labels || {})
-    .filter(([k]) => !k.startsWith("fw.") && k !== state.groupBy);
-  if (!labels.length) return null;
-  const all = labels.map(([k, v]) => `${k}=${v}`).join("\n");
-  return el(
-    "span",
-    { className: "label-chips", title: all },
-    labels.slice(0, LABEL_CHIPS).map(([k, v]) => el("span", { className: "label-chip", textContent: `${k}:${v}` })),
-    labels.length > LABEL_CHIPS ? el("span", { className: "label-chip more", textContent: `+${labels.length - LABEL_CHIPS}` }) : null,
+    rowAlert(session, st),
   );
 }
 
@@ -410,110 +434,6 @@ function groupBySelect() {
   );
 }
 
-// The agent session that started this one (start_session, fw hub new
-// inside it): "<- its name".
-function starterHint(session) {
-  const starter = session.opened_by ? sessionById(session.opened_by) : null;
-  if (!starter) return null;
-  return el("span", {
-    className: "session-state session-starter",
-    textContent: `\u2190 ${starter.name}`,
-    title: `Started by ${starter.name}`,
-  });
-}
-
-// An end in progress ("ending (by lead)"), or how an agent or the
-// operator ended it ("replaced by new", "ended by lead").
-function endingHint(session) {
-  const nameOf = (id) => (sessionById(id) || {}).name || String(id || "").slice(0, 8);
-  const byName = (by) => (by && by.kind === "session" ? nameOf(by.id) : "you");
-  if (session.ending) {
-    const e = session.ending;
-    const what = e.replace ? `replacing with ${e.replace.name}` : "ending";
-    return el("span", {
-      className: "session-detail session-ending",
-      textContent: `${what} (by ${byName(e.by)})`,
-      title: `${byName(e.by)} asked to ${e.replace ? "replace" : "end"} it (${e.mode}); now ${e.phase.replace(/_/g, " ")}; called off at ${new Date(e.deadline).toLocaleTimeString()} if not done`,
-    });
-  }
-  if (session.ended && session.ended.by.kind === "session") {
-    const e = session.ended;
-    return el("span", {
-      className: "session-detail session-ending",
-      textContent: e.successor ? `replaced by ${nameOf(e.successor)}` : `ended by ${byName(e.by)}`,
-      title: `Ended by ${byName(e.by)} (${e.mode}) at ${new Date(e.at).toLocaleString()}`,
-    });
-  }
-  return null;
-}
-
-// An agent whose process predates the hub's last upgrade: relaunched in
-// place (its conversation resumed) at its next rest, unless held.
-function relaunchHint(session) {
-  const s = session.stale;
-  if (!s || session.state !== "running") return null;
-  const busy = s.hung_up_at ? "relaunching" : "relaunch pending";
-  return el("span", {
-    className: "session-detail session-relaunch",
-    textContent: busy,
-    title: s.held
-      ? `Runs a process from before the hub upgrade (flywheel ${s.from}); not relaunched on its own: ${s.held}. Relaunch it yourself to get the new tools.`
-      : `Runs a process from before the hub upgrade (flywheel ${s.from}); relaunched (its conversation resumed) once its turn is over and nothing runs.${s.waits ? ` Waits: ${s.waits}.` : ""}`,
-  });
-}
-
-// How far along a working (or blocked) agent is, from its telemetry: the
-// plan it declared (a bar, done/total, the step it is on), else what is
-// observed (the tool it is in); and its context window once that is
-// nearly full. Nothing is shown for a session at rest.
-// What a moving agent does, as a row's step: what, then more said
-// quieter ("Bash cargo test", "thinking after Read src/api.rs", "turn
-// done · 2 agents still running").
-function stepNode(doing, className = "session-step") {
-  return el(
-    "span",
-    { className },
-    doing.what,
-    doing.count ? [" \u00b7 ", el("b", { textContent: doing.count })] : null,
-    doing.more ? [" ", el("span", { className: "muted", textContent: doing.more })] : null,
-  );
-}
-
-function progressLine(session, st) {
-  const t = sessionTelemetry.get(session.id);
-  const agent = agentStatus(session);
-  const handed = handedTo(session, agent);
-  if (handed) {
-    return el("span", { className: "session-progress", title: st.title },
-      el("span", { className: "session-step" }, el("span", { className: "muted", textContent: `handed off \u2192 ${handed}` })));
-  }
-  if (!t || !agent || (agent.status !== "working" && agent.status !== "blocked")) return null;
-  const parts = [];
-  const doing = doingOf(session, agent);
-  if (st.quiet) {
-    const last = doing && agent.state === "working" && doing.what !== "thinking" ? `\u00b7 ${doing.what}${doing.more ? ` ${doing.more}` : ""}` : "";
-    parts.push(stepNode({ what: `no word for ${ageMs(st.quiet)}`, more: last }));
-  } else if (agent.state === "working" && t.plan && t.plan.total) {
-    const bar = el("span", { className: "prog-bar" }, el("i"));
-    bar.firstChild.style.width = `${Math.round((t.plan.done / t.plan.total) * 100)}%`;
-    parts.push(bar);
-    if (doing) parts.push(stepNode(doing, "session-step tool"));
-    else if (t.plan.current) parts.push(el("span", { className: "session-step", textContent: t.plan.current }));
-  } else if (doing) {
-    parts.push(stepNode(doing, `session-step${agent.state === "working" && t.tool ? " tool" : ""}`));
-  }
-  if (t.context && t.context.pct >= 80) {
-    parts.push(el("span", {
-      className: "session-ctx",
-      textContent: `ctx ${t.context.exact === false ? "~" : ""}${Math.round(t.context.pct)}%`,
-      title: "context window used",
-    }));
-  }
-  if (!parts.length) return null;
-  const said = t.plan && t.plan.current ? `step ${t.plan.done + 1} of ${t.plan.total}: ${t.plan.current}` : doing ? [doing.what, doing.count, doing.more].filter(Boolean).join(" ") : t.turn_title || "";
-  return el("span", { className: "session-progress", title: said }, parts);
-}
-
 // Where a session runs, as its workspace names it: the folder it was
 // opened in (and the subdirectory, if deeper), for a worktree the folder
 // it was cut from. A cwd outside every folder shows its last component.
@@ -539,26 +459,6 @@ function sessionFolder(session) {
   }
   const label = folder ? folderLabel(folder) : basename(cwd);
   return { label: rest ? `${label}/${rest}` : label, outside: !folder };
-}
-
-// The line under a session row: its Claude account (when not the CLI's
-// login), its folder, then its branch (worktree.js).
-function whereLine(session) {
-  if (!session.cwd) return worktrees.badge(session);
-  const folder = sessionFolder(session);
-  return el(
-    "span",
-    { className: "session-where" },
-    session.account
-      ? el("span", { className: "session-account", textContent: `@${session.account}`, title: `Claude account ${session.account} (fw hub account)` })
-      : null,
-    el("span", {
-      className: `session-folder${folder.outside ? " outside" : ""}`,
-      textContent: folder.label,
-      title: folder.outside ? `${session.cwd} (outside the workspace's folders)` : session.cwd,
-    }),
-    worktrees.badge(session),
-  );
 }
 
 // A session being recorded says so on its row.
@@ -771,64 +671,225 @@ function renderListHead(workspace) {
 const listGroup = (name, count) =>
   el("div", { className: "list-group" }, el("span", { className: "list-group-name", textContent: name }), el("span", { className: "list-group-n", textContent: String(count) }));
 
+// --- families: a lead and the sessions it started -------------------------
+
+// The listed session that started this one: its lead (start_session),
+// the agent a companion shell belongs to, the author a reviewer reviews.
+function parentOf(session, listed) {
+  for (const id of [session.opened_by, session.companion_of, session.review_of]) {
+    if (id && id !== session.id && listed.has(id)) return id;
+  }
+  return null;
+}
+
+// `sessions` as families, in their order: each root with every session
+// under it (a child's own children list under the root too).
+function families(sessions) {
+  const listed = new Map(sessions.map((s) => [s.id, s]));
+  const rootOf = (session) => {
+    let at = session;
+    const seen = new Set([at.id]);
+    for (;;) {
+      const up = parentOf(at, listed);
+      if (!up || seen.has(up)) return at;
+      seen.add(up);
+      at = listed.get(up);
+    }
+  };
+  const roots = new Map();
+  const of = new Map(sessions.map((s) => [s.id, rootOf(s)]));
+  for (const s of sessions) if (of.get(s.id) === s) roots.set(s.id, { root: s, kids: [] });
+  for (const s of sessions) if (of.get(s.id) !== s) roots.get(of.get(s.id).id).kids.push(s);
+  return [...roots.values()];
+}
+
+const endedSession = (s) => s.state !== "running";
+
+// A family's rows: the root, then its children on a guide rule; ended
+// children fold into one line (a tap lists them), children Needs you
+// shows are one line pointing there.
+function familyRows({ root, kids }, needs = new Set()) {
+  const ended = kids.filter((k) => !needs.has(k.id) && endedSession(k));
+  const waiting = kids.filter((k) => needs.has(k.id));
+  const listed = kids.filter((k) => !needs.has(k.id) && !endedSession(k));
+  const open = state.endedOpen.has(root.id);
+  const rows = [renderSession(root, { kids: kids.filter((k) => !endedSession(k)) })];
+  if (!kids.length) return rows;
+  const quiet = (key, dot, label, names, title, onclick) =>
+    el("li", { className: "session-fold", dataset: { id: `${key}:${root.id}` } },
+      el("button", { type: "button", className: "fold-line", title, onclick },
+        el("span", { className: `dot ${dot}`, "aria-hidden": "true" }),
+        el("b", { textContent: label }),
+        el("span", { className: "fold-names", textContent: names })));
+  const inner = listed.map((k) => renderSession(k, { child: true }));
+  if (waiting.length) {
+    inner.push(quiet("needs", "asking", `${waiting.length} in Needs you`, waiting.map((k) => k.name).join(", "),
+      "Shown in Needs you above: open the first", () => openSession(waiting[0].id)));
+  }
+  if (ended.length) {
+    inner.push(quiet("ended", "stopped", `${ended.length} ended`, open ? "" : ended.map((k) => k.name).join(", "),
+      open ? "Fold the ended sessions" : "Show the ended sessions", () => {
+        if (open) state.endedOpen.delete(root.id);
+        else state.endedOpen.add(root.id);
+        render();
+      }));
+    if (open) inner.push(...ended.map((k) => renderSession(k, { child: true })));
+  }
+  if (inner.length) {
+    rows.push(el("li", { className: "session-kids", dataset: { id: `kids:${root.id}` } }, el("ul", { className: "sessions kids" }, inner)));
+  }
+  return rows;
+}
+
+// --- the filter -----------------------------------------------------------
+
+// Words a session is found by: its name (every plain word a part of it),
+// `ws:NAME` its workspace, `is:STATE` its state as the legend names it
+// (blocked, asking, working, quiet, background, done, resting, ended, ...).
+// `fw hub ls --filter` reads the same words.
+function filterTerms(query) {
+  return String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+}
+function stateWords(session) {
+  const st = statusLook(session);
+  const key = legend.keyOf(st);
+  const words = [key, st.state, st.label, st.dot].filter(Boolean).map((w) => String(w).toLowerCase());
+  if (key === "idle") words.push("resting");
+  if (endedSession(session)) words.push("ended");
+  return words;
+}
+function matchesFilter(session, terms) {
+  return terms.every((term) => {
+    if (term.startsWith("ws:")) {
+      const ws = workspaceById(session.workspace_id);
+      return !!ws && ws.name.toLowerCase().includes(term.slice(3));
+    }
+    if (term.startsWith("is:")) return stateWords(session).some((w) => w.startsWith(term.slice(3)));
+    return session.name.toLowerCase().includes(term);
+  });
+}
+
+const filterBox = $("#list-filter");
+filterBox.addEventListener("input", () => {
+  state.filter = filterBox.value;
+  render();
+});
+filterBox.addEventListener("keydown", (event) => {
+  event.stopPropagation();
+  if (event.key === "Escape") {
+    filterBox.value = "";
+    state.filter = "";
+    render();
+    focusTerminal();
+  } else if (event.key === "ArrowDown" || event.key === "Enter") {
+    // Into the matches: the first row.
+    const first = $("#workspaces li.session");
+    if (first) {
+      event.preventDefault();
+      if (event.key === "Enter") first.click();
+      else first.focus();
+    }
+  }
+});
+// Dense rows: more of a big fleet on screen.
+const densityToggle = $("#list-density");
+function applyDensity() {
+  $("#sidebar").classList.toggle("dense", state.dense);
+  densityToggle.setAttribute("aria-pressed", String(state.dense));
+  densityToggle.title = state.dense ? "Roomy rows" : "Dense rows";
+}
+densityToggle.addEventListener("click", () => {
+  state.dense = !state.dense;
+  store.set("dense", state.dense);
+  applyDensity();
+});
+applyDensity();
+
+// Matches across every list, flat (a family's members each on their own).
+function renderMatches(sessions) {
+  const terms = filterTerms(state.filter);
+  const found = sessions.filter((s) => matchesFilter(s, terms));
+  if (!found.length) return [el("div", { className: "list-calm", textContent: `Nothing matches "${state.filter.trim()}".` })];
+  return [listGroup("Matches", found.length), el("ul", { className: "sessions", dataset: { id: "group:matches" } }, found.map((s) => renderSession(s)))];
+}
+
+// --- Everything -------------------------------------------------------------
+
 // Everything: Needs you (attention.js, above this list) first, then the
 // agents at work, then the rest folded into one line. A session is listed
-// once, in its most urgent group.
+// once, in its most urgent group; a family (a lead and the sessions it
+// started) sits together in its most urgent member's group.
 // An agent that stops working stays in Moving this long: a pause between
 // two steps does not bounce its row to Resting and back.
 const MOVING_HOLD_MS = 20000;
 const lastWorking = new Map(); // session id -> ms it was last seen working
 let movingTimer = 0;
 
+// Newest first: when it came to rest (its status's change, its end).
+function restedAt(family) {
+  const s = family.root;
+  const agent = agentStatus(s);
+  return Date.parse((agent && agent.since) || (s.ended && s.ended.at) || s.created_at || 0) || 0;
+}
+
 function renderAllList() {
   // What Needs you shows above (held while a reply is typed there).
   const needs = attention.shownIds();
-  const moving = [];
-  const resting = [];
   const now = Date.now();
   let nextExpiry = Infinity;
-  for (const session of orderedSessions()) {
-    // A turn that ended went to Needs you: no hold after it is seen.
+  const movingNow = (session) => {
     if (needs.has(session.id)) {
       lastWorking.delete(session.id);
-      continue;
+      return false;
     }
     const agent = agentStatus(session);
     if (agent && agent.status === "working") {
       lastWorking.set(session.id, now);
-      moving.push(session);
-      continue;
+      return true;
     }
     const until = (lastWorking.get(session.id) || 0) + MOVING_HOLD_MS;
     if (session.live && until > now) {
-      moving.push(session);
       nextExpiry = Math.min(nextExpiry, until);
-    } else {
-      lastWorking.delete(session.id);
-      resting.push(session);
+      return true;
+    }
+    lastWorking.delete(session.id);
+    return false;
+  };
+  if (!state.sessions.length) {
+    return [el(
+      "div",
+      { className: "ws-empty" },
+      "No sessions yet. ",
+      el("button", { type: "button", className: "text-btn", textContent: "start one", onclick: () => openSessionDialog() }),
+    )];
+  }
+  if (filterTerms(state.filter).length) return renderMatches(orderedSessions());
+  const moving = [];
+  const resting = [];
+  for (const family of families(orderedSessions())) {
+    // A root Needs you shows: its children list on their own.
+    const groups = needs.has(family.root.id) ? family.kids.map((k) => ({ root: k, kids: [] })) : [family];
+    for (const f of groups) {
+      if (needs.has(f.root.id)) continue;
+      const members = [f.root, ...f.kids.filter((k) => !needs.has(k.id))];
+      // Every member's hold is kept (or ended) whichever group it lands in.
+      const flags = members.map(movingNow);
+      (flags.some(Boolean) ? moving : resting).push(f);
     }
   }
   // Settle a held row once its hold ends.
   clearTimeout(movingTimer);
   if (nextExpiry !== Infinity) movingTimer = setTimeout(() => backgroundRender(), nextExpiry - now + 50);
   // Keyed by group, so a repaint keeps each group's rows (morph).
-  const rows = (list, group) => el("ul", { className: "sessions", dataset: { id: `group:${group}` } }, list.map((s) => renderSession(s, { tag: true, flat: true })));
-  if (state.groupBy && state.sessions.length) return labelGroups([...moving, ...resting], rows);
+  const rows = (list, group) => el("ul", { className: "sessions", dataset: { id: `group:${group}` } }, list.flatMap((f) => familyRows(f, needs)));
+  const count = (list) => list.reduce((n, f) => n + 1 + f.kids.filter((k) => !needs.has(k.id) && !endedSession(k)).length, 0);
+  if (state.groupBy && state.sessions.length) return labelGroups([...moving, ...resting], rows, count);
   const out = [];
-  if (!state.sessions.length) {
-    out.push(el(
-      "div",
-      { className: "ws-empty" },
-      "No sessions yet. ",
-      el("button", { type: "button", className: "text-btn", textContent: "start one", onclick: () => openSessionDialog() }),
-    ));
-    return out;
-  }
   if (!needs.size && !attention.handoffCount() && !moving.length) {
     out.push(el("div", { className: "list-calm", textContent: "Nothing needs you. Nothing is moving." }));
   }
   if (moving.length) {
-    const heading = listGroup("Moving", moving.length);
+    const heading = listGroup("Moving", count(moving));
     // What each state means (legend.js), the attached session's marked.
     heading.append(el("button", {
       type: "button",
@@ -846,6 +907,7 @@ function renderAllList() {
     out.push(heading, rows(moving, "moving"));
   }
   if (resting.length) {
+    resting.sort((a, b) => restedAt(b) - restedAt(a));
     const open = state.restingOpen;
     out.push(el(
       "button",
@@ -853,7 +915,7 @@ function renderAllList() {
         type: "button",
         className: `list-group fold${open ? " open" : ""}`,
         "aria-expanded": String(open),
-        title: open ? "Fold the resting sessions" : "Show the resting sessions",
+        title: open ? "Fold the resting sessions" : "Show the resting sessions, newest first",
         onclick: () => {
           state.restingOpen = !open;
           store.set("resting-open", state.restingOpen);
@@ -862,44 +924,47 @@ function renderAllList() {
       },
       el("span", { className: "chev" }, icon("chev")),
       el("span", { className: "list-group-name", textContent: "Resting" }),
-      el("span", { className: "list-group-n", textContent: String(resting.length) }),
-      open ? null : el("span", { className: "list-group-names", textContent: resting.map((s) => s.name).join(", ") }),
+      el("span", { className: "list-group-n", textContent: String(count(resting)) }),
+      open ? null : el("span", { className: "list-group-names", textContent: resting.map((f) => f.root.name).join(", ") }),
     ));
-    // Folded, the attached session still shows.
-    const shown = open ? resting : resting.filter((s) => s.id === state.attached);
+    // Folded, the attached session's family still shows.
+    const attachedIn = (f) => f.root.id === state.attached || f.kids.some((k) => k.id === state.attached);
+    const shown = open ? resting : resting.filter(attachedIn);
     if (shown.length) out.push(rows(shown, "resting"));
   }
   return out;
 }
 
 // Everything grouped by one label key: a group per value (most sessions
-// first), then those without it. Needs you stays above, as always.
-function labelGroups(sessions, rows) {
+// first), then those without it; a family goes by its lead's label. Needs
+// you stays above, as always.
+function labelGroups(families, rows, count) {
   const key = state.groupBy;
   const groups = new Map();
   const without = [];
-  for (const s of sessions) {
-    const value = (s.labels || {})[key];
-    if (value === undefined) without.push(s);
+  for (const f of families) {
+    const value = (f.root.labels || {})[key];
+    if (value === undefined) without.push(f);
     else {
       if (!groups.has(value)) groups.set(value, []);
-      groups.get(value).push(s);
+      groups.get(value).push(f);
     }
   }
-  const ordered = [...groups.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  const ordered = [...groups.entries()].sort((a, b) => count(b[1]) - count(a[1]) || a[0].localeCompare(b[0]));
   const out = [];
-  for (const [value, list] of ordered) out.push(listGroup(`${key}=${value}`, list.length), rows(list, `label:${value}`));
-  if (without.length) out.push(listGroup(`no ${key}`, without.length), rows(without, "label:"));
+  for (const [value, list] of ordered) out.push(listGroup(`${key}=${value}`, count(list)), rows(list, `label:${value}`));
+  if (without.length) out.push(listGroup(`no ${key}`, count(without)), rows(without, "label:"));
   if (!out.length) out.push(el("div", { className: "list-calm", textContent: "Everything else needs you." }));
   return out;
 }
 
 // One workspace: its machine (when another's), a way back when agents
-// elsewhere need you, its folders, its sessions.
+// elsewhere need you, its folders, its sessions (families together).
 function renderWorkspaceList(workspace) {
   const sessions = state.sessions.filter((s) => s.workspace_id === workspace.id);
   const error = state.wsErrors[workspace.id];
   const elsewhere = attention.entries().filter((e) => e.level < 2 && e.session.workspace_id !== workspace.id).length;
+  const filtering = filterTerms(state.filter).length > 0;
   return [
     workspace.machine ? machines.header(workspace.machine) : null,
     elsewhere
@@ -933,9 +998,8 @@ function renderWorkspaceList(workspace) {
         },
       })
       : null,
-    sessions.length
-      ? el("ul", { className: "sessions" }, sessions.map((s) => renderSession(s)))
-      : el(
+    !sessions.length
+      ? el(
         "div",
         { className: "ws-empty" },
         "No sessions. ",
@@ -945,8 +1009,11 @@ function renderWorkspaceList(workspace) {
           textContent: "start one",
           onclick: () => openSessionDialog(workspace.id),
         }),
-      ),
-  ].filter(Boolean);
+      )
+      : filtering
+        ? renderMatches(sessions)
+        : el("ul", { className: "sessions" }, families(sessions).flatMap((f) => familyRows(f))),
+  ].flat().filter(Boolean);
 }
 
 // A press on the sidebar or a pane head holds background repaints (status
@@ -1045,6 +1112,7 @@ function render() {
   if (!tabRenaming) renderTabs();
   for (const pane of livePanes()) renderPaneHead(pane);
   renderMain();
+  inspector.refresh();
 }
 
 // The header's agent / companion-shell flip (Alt+`, which phones lack).

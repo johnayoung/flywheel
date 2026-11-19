@@ -387,7 +387,7 @@ try {
   await exactTextChecks(page, "desktop", [".xterm-rows", "#cmd-list", "#tx-body", "#ho-text"]);
   // Session and workspace names in a face that tells 1 from l and 0 from
   // O ("c1" and "cl" read alike in the condensed display face).
-  const nameFaces = await page.evaluate(() => ["#rail-tiles .rail-initials", ".ws-tag", ".session-name", ".crumb-session", ".crumb-ws", ".pane-name", ".tab-list [role=tab]", "#rv-title", "#q-title", "#tx-title"]
+  const nameFaces = await page.evaluate(() => ["#rail-tiles .rail-initials", ".session-name", ".crumb-session", ".crumb-ws", ".pane-name", ".tab-list [role=tab]", "#rv-title", "#q-title", "#tx-title"]
     .map((sel) => [sel, document.querySelector(sel) && getComputedStyle(document.querySelector(sel)).fontFamily]));
   const displayed = nameFaces.filter(([, face]) => !face || !/^"FW (Mono|Term)"/.test(face));
   check(!displayed.length, `desktop: names in the UI mono (${JSON.stringify(displayed)})`);
@@ -802,7 +802,7 @@ try {
   check(unseen === "done" && seenAs === "idle", `desktop: a done turn opened by link after 6 idle minutes is seen (${unseen} -> ${seenAs})`);
   await away.close();
 
-  // --- labels: chips on rows, Everything grouped by a label ---------------
+  // --- labels: in the inspector (never on the row), Everything grouped by a label
   await api("PATCH", `/api/sessions/${sids[0]}/labels`, { labels: { team: "web", area: "db", tier: "a-long-label-value-to-truncate" } });
   await api("PATCH", `/api/sessions/${sids[1]}/labels`, { labels: { team: "api" } });
   const lab = await browser.newContext({ viewport: { width: 1440, height: 900 } });
@@ -815,16 +815,16 @@ try {
   // The shells rest: unfold Resting to see their rows.
   const fold = lp.locator(".list-group.fold:not(.open)");
   if (await fold.count()) await fold.first().click();
-  await lp.waitForSelector(`.session[data-id="${sids[0]}"] .label-chip`, { timeout: 10000 });
-  const chips = await lp.evaluate((id) => {
-    const row = document.querySelector(`.session[data-id="${id}"]`);
-    const side = document.querySelector(".side-list").getBoundingClientRect();
-    const all = [...row.querySelectorAll(".label-chip")].map((c) => c.textContent);
-    const r = row.getBoundingClientRect();
-    return { all, title: row.querySelector(".label-chips").title, fits: r.right <= side.right + 1 && r.height < 60 };
-  }, sids[0]);
-  check(chips.all.length === 3 && chips.all[0] === "area:db" && chips.all[2] === "+1" && chips.title.includes("tier=") && chips.fits,
-    `labels: a row shows two label chips and a count, all in its title, within the sidebar (${JSON.stringify(chips)})`);
+  await lp.waitForSelector(`.session[data-id="${sids[0]}"]`, { timeout: 10000 });
+  await lp.locator(`.session[data-id="${sids[0]}"] .session-name`).hover();
+  await lp.waitForSelector("#inspector:not([hidden])", { timeout: 3000 }).catch(() => {});
+  const chips = await lp.evaluate((id) => ({
+    onRow: document.querySelectorAll(`.session[data-id="${id}"] .label-chip, .session[data-id="${id}"] .insp-label`).length,
+    all: [...document.querySelectorAll("#inspector .insp-label")].map((c) => c.textContent),
+  }), sids[0]);
+  await lp.keyboard.press("Escape");
+  check(!chips.onRow && chips.all.includes("area=db") && chips.all.includes("team=web") && chips.all.some((c) => c.startsWith("tier=")),
+    `labels: a row's labels are in its inspector, not on the row (${JSON.stringify(chips)})`);
   const groupBy = lp.locator("#list-tools select.group-by");
   check(await groupBy.count() === 1, "labels: Everything offers a group-by-label control");
   await groupBy.selectOption("team");
@@ -832,8 +832,6 @@ try {
   const groups = await lp.evaluate(() => [...document.querySelectorAll(".side-scroll .list-group .list-group-name")].map((n) => n.textContent));
   check(groups.includes("team=web") && groups.includes("team=api") && groups.includes("no team"),
     `labels: grouped by team, one group per value and one for the rest (${JSON.stringify(groups)})`);
-  const chipsGrouped = await lp.evaluate((id) => [...document.querySelectorAll(`.session[data-id="${id}"] .label-chip`)].map((c) => c.textContent), sids[0]);
-  check(!chipsGrouped.some((c) => c.startsWith("team:")), `labels: the grouped-by key is not repeated as a chip (${JSON.stringify(chipsGrouped)})`);
   await lp.screenshot({ path: path.join(out, "desktop-labels-grouped.png") });
   await lp.click(".group-by-chip");
   const back = await lp.evaluate(() => [...document.querySelectorAll(".side-scroll .list-group .list-group-name")].map((n) => n.textContent));
@@ -1459,7 +1457,7 @@ try {
     return {
       state: (agentStatus(sessionById(id)) || {}).state,
       dot: row ? row.querySelector(".glyph .dot").className : "",
-      step: row ? (row.querySelector(".session-step") || {}).textContent || "" : "",
+      fact: row ? (row.querySelector(".session-state") || {}).textContent || "" : "",
       pill: document.querySelector("#crumb-status").className,
       needs: !!document.querySelector(`#attention .attn-row[data-id="${id}"]`),
     };
@@ -1472,7 +1470,7 @@ try {
   // is long ago, so a moving row reads quiet; else background.
   const looks = (re) => re.test(shown.dot) && re.test(shown.pill);
   check(got === "background" && shown.state === "background" && !shown.needs &&
-    ((looks(/\bbackground\b/) && /turn done/.test(shown.step)) || (looks(/\bquiet\b/) && /no word/.test(shown.step))),
+    ((looks(/\bbackground\b/) && /agent|background/.test(shown.fact)) || (looks(/\bquiet\b/) && /quiet/.test(shown.fact))),
     `states: subagents outliving their turn read background everywhere (${got}, ${JSON.stringify(shown)})`);
   // The state legend: from "why?" and from the Moving heading, the
   // session's state marked, every state's row there.
@@ -1573,6 +1571,139 @@ try {
   await seenPage.screenshot({ path: path.join(out, "phone-transcript-results.png") });
   await seenPage.setViewportSize({ width: 1440, height: 900 });
   await seenCtx.close();
+
+  // --- the sidebar's rows ---------------------------------------------------
+  // A lead lists the sessions it started under it, by their own names,
+  // with its family's rollup; every row is one line with one state dot (no
+  // kind glyph, no workspace chip); a finished turn is one "N finished"
+  // line in Needs you, its row there once tapped; the inspector floats
+  // beside a row (hover, or I on a focused row) and moves no row; the
+  // filter narrows the list (Alt+/ focuses it, Escape clears it); dense
+  // rows are shorter; on a phone the attached row's Details opens it as a
+  // sheet.
+  {
+    const lead = await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", name: "sb-lead", cols: 80, rows: 24 });
+    await api("PUT", `/api/sessions/${lead.id}/start-policy`, { policy: "allowed" });
+    const kids = [];
+    for (const name of ["sb-kid-a", "sb-kid-b"]) {
+      kids.push(await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", name, opened_by: lead.id, cols: 80, rows: 24 }));
+    }
+    const fin = await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", name: "sb-finished", cols: 80, rows: 24 });
+    await sleep(1500);
+    const type = (id, text) => api("POST", `/api/sessions/${id}/input`, { data: `${text}\r` });
+    for (const s of [lead, ...kids, fin]) await type(s.id, "e2e-go");
+    await sleep(300);
+    await type(fin.id, "e2e-stop");
+    for (let i = 0; i < 100 && (await api("GET", `/api/sessions/${fin.id}`)).agent?.status !== "done"; i++) await sleep(100);
+    const sc = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const sp = await sc.newPage();
+    await sp.goto(`${base}/login?token=${token}`);
+    await sp.waitForFunction((id) => !!document.querySelector(`#workspaces li.session[data-id="${id}"]`), kids[1].id, { timeout: 15000 }).catch(() => {});
+    await sp.waitForTimeout(500);
+    const tree = await sp.evaluate(({ leadId, kidIds }) => {
+      const leadRow = document.querySelector(`#workspaces li.session[data-id="${leadId}"]`);
+      const box = leadRow && leadRow.nextElementSibling;
+      const rows = [...document.querySelectorAll("#workspaces li.session")];
+      const dots = (r) => r.querySelectorAll(":scope > .glyph .dot").length;
+      return {
+        under: kidIds.map((k) => !!(box && box.matches(".session-kids") && box.querySelector(`li.session.child[data-id="${k}"]`))),
+        names: kidIds.map((k) => (document.querySelector(`#workspaces li.session[data-id="${k}"] .session-name`) || {}).textContent),
+        roll: leadRow ? (leadRow.querySelector(".session-roll") || {}).textContent || "" : "",
+        oneDot: rows.every((r) => dots(r) === 1 && !r.querySelector(":scope > .glyph svg")),
+        oneLine: rows.filter((r) => !r.querySelector(".session-detail")).map((r) => Math.round(r.getBoundingClientRect().height)).filter((h) => h > 34),
+        chips: document.querySelectorAll("#workspaces .ws-tag, #workspaces .session-progress, #workspaces .session-where").length,
+      };
+    }, { leadId: lead.id, kidIds: kids.map((k) => k.id) });
+    check(tree.under.every(Boolean) && tree.names.join() === "sb-kid-a,sb-kid-b" && /2/.test(tree.roll) && tree.oneDot && !tree.oneLine.length && !tree.chips,
+      `sidebar: a lead lists what it started under it by name with a rollup; one line and one dot a row (${JSON.stringify(tree)})`);
+    const finished = await sp.evaluate((id) => ({
+      line: (document.querySelector("#attention .attn-finished") || {}).textContent || "",
+      row: !!document.querySelector(`#attention .attn-row[data-id="${id}"]`),
+      listed: !!document.querySelector(`#workspaces li.session[data-id="${id}"]`),
+    }), fin.id);
+    await sp.click("#attention .attn-finished");
+    await sp.waitForTimeout(300);
+    const opened = await sp.evaluate((id) => !!document.querySelector(`#attention .attn-row[data-id="${id}"]`), fin.id);
+    await sp.click("#attention .attn-finished");
+    check(/finished/.test(finished.line) && /sb-finished/.test(finished.line) && !finished.row && !finished.listed && opened,
+      `sidebar: a finished turn is one "N finished" line, its row there once tapped (${JSON.stringify({ ...finished, opened })})`);
+    await sp.screenshot({ path: path.join(out, "desktop-sidebar-rows.png") });
+    // The inspector, by hover: beside the list, no row moved.
+    const tops = () => sp.evaluate(() => [...document.querySelectorAll("#side-scroll li.session")].map((r) => Math.round(r.getBoundingClientRect().top)).join());
+    const before = await tops();
+    await sp.locator(`#workspaces li.session[data-id="${kids[0].id}"] .session-name`).hover();
+    await sp.waitForSelector("#inspector:not([hidden])", { timeout: 3000 }).catch(() => {});
+    const card = await sp.evaluate(() => {
+      const c = document.querySelector("#inspector");
+      const side = document.querySelector("#sidebar").getBoundingClientRect();
+      const r = c.getBoundingClientRect();
+      return { shown: !c.hidden, beside: r.left >= side.right - 1, name: (c.querySelector(".insp-name") || {}).textContent, keys: [...c.querySelectorAll(".why-key")].map((k) => k.textContent) };
+    });
+    const after = await tops();
+    await sp.screenshot({ path: path.join(out, "desktop-sidebar-inspector.png") });
+    await sp.keyboard.press("Escape");
+    const shut = await sp.evaluate(() => document.querySelector("#inspector").hidden);
+    check(card.shown && card.beside && card.name === "sb-kid-a" && card.keys.includes("family") && card.keys.includes("where") && before === after && shut,
+      `sidebar: hovering a row floats its inspector beside the list, no row moves, Escape shuts it (${JSON.stringify({ ...card, moved: before !== after, shut })})`);
+    // The inspector, by keyboard: I on a focused row.
+    await sp.mouse.move(900, 600);
+    await sp.focus(`#workspaces li.session[data-id="${lead.id}"]`);
+    await sp.keyboard.press("i");
+    await sp.waitForTimeout(200);
+    const keyed = await sp.evaluate(() => ({
+      shown: !document.querySelector("#inspector").hidden,
+      name: (document.querySelector("#inspector .insp-name") || {}).textContent,
+      family: (document.querySelector('#inspector [data-wk="family"]') || {}).textContent || "",
+    }));
+    await sp.keyboard.press("Escape");
+    check(keyed.shown && keyed.name === "sb-lead" && /started 2 running/.test(keyed.family),
+      `sidebar: I on a focused row opens its inspector (${JSON.stringify(keyed)})`);
+    // The filter: Alt+/ focuses it; names, is:STATE; Escape clears it.
+    await sp.locator(`#workspaces li.session[data-id="${lead.id}"]`).click();
+    await sp.waitForTimeout(300);
+    await sp.keyboard.press("Alt+/");
+    const focused = await sp.evaluate(() => document.activeElement && document.activeElement.id);
+    const names = () => sp.evaluate(() => [...document.querySelectorAll("#workspaces li.session .session-name")].map((n) => n.textContent));
+    await sp.fill("#list-filter", "sb-kid");
+    await sp.waitForTimeout(300);
+    const byName = await names();
+    await sp.fill("#list-filter", "is:work sb-");
+    await sp.waitForTimeout(300);
+    const byState = await names();
+    await sp.press("#list-filter", "Escape");
+    await sp.waitForTimeout(300);
+    const cleared = await sp.evaluate(() => ({ value: document.querySelector("#list-filter").value, rows: document.querySelectorAll("#workspaces li.session").length }));
+    check(focused === "list-filter" && byName.join() === "sb-kid-a,sb-kid-b" && byState.includes("sb-lead") && byState.includes("sb-kid-b") && !byState.includes("sb-finished") && cleared.value === "" && cleared.rows > 2,
+      `sidebar: the filter narrows by name and is:STATE, Alt+/ focuses it, Escape clears it (${JSON.stringify({ focused, byName, byState, cleared })})`);
+    // Dense rows.
+    const height = () => sp.evaluate((id) => document.querySelector(`#workspaces li.session[data-id="${id}"]`).getBoundingClientRect().height, kids[1].id);
+    const roomy = await height();
+    await sp.click("#list-density");
+    await sp.waitForTimeout(200);
+    const dense = await height();
+    await sp.click("#list-density");
+    check(dense < roomy, `sidebar: dense rows are shorter (${roomy} -> ${dense})`);
+    await sc.close();
+    // A phone: the attached row's Details opens the inspector as a sheet.
+    const pc = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const ph = await pc.newPage();
+    await ph.goto(`${base}/login?token=${token}#session=${kids[0].id}`);
+    await ph.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
+    await ph.locator(".menu-toggle").click();
+    await ph.waitForFunction(() => document.body.classList.contains("side-open"), null, { timeout: 5000 });
+    await ph.waitForTimeout(300);
+    await ph.locator(`#workspaces li.session[data-id="${kids[0].id}"] [aria-label="Details (I)"]`).tap();
+    await ph.waitForTimeout(300);
+    const sheet = await ph.evaluate(() => {
+      const c = document.querySelector("#inspector");
+      const r = c.getBoundingClientRect();
+      return { shown: !c.hidden, sheet: c.classList.contains("sheet"), inside: r.left >= 0 && r.right <= innerWidth + 1 && r.bottom <= innerHeight + 1, name: (c.querySelector(".insp-name") || {}).textContent };
+    });
+    await ph.screenshot({ path: path.join(out, "phone-sidebar-inspector.png") });
+    check(sheet.shown && sheet.sheet && sheet.inside && sheet.name === "sb-kid-a", `phone: a row's Details opens its inspector as a sheet (${JSON.stringify(sheet)})`);
+    await pc.close();
+    for (const s of [...kids, fin, lead]) await api("DELETE", `/api/sessions/${s.id}`);
+  }
 } finally {
   if (browser) await browser.close();
   hub.kill("SIGTERM");

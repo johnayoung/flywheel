@@ -385,6 +385,18 @@ const GLOBAL_ACTIONS = {
   },
   "session.next": () => jumpBy(1),
   "session.prev": () => jumpBy(-1),
+  // The list's filter box (the list shown first if it was folded away).
+  "list.filter": () => {
+    if (state.listHidden) {
+      state.listHidden = false;
+      store.set("list-hidden", false);
+      render();
+    }
+    if (window.matchMedia(NARROW).matches) document.body.classList.add("side-open");
+    $("#list-filter").focus();
+    $("#list-filter").select();
+    return true;
+  },
   "session.rename": () => (state.attached ? startRename(state.attached) : false),
   "session.close": () => (state.attached ? closeSession(state.attached) : false),
   "session.reference": () => referenceSession(),

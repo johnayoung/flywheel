@@ -233,6 +233,9 @@ const state = {
   scope: store.get("scope", "all"),
   restingOpen: store.get("resting-open", false), // the All list's Resting group unfolded
   groupBy: store.get("group-by", ""), // the All list grouped by this label key ("": by activity)
+  endedOpen: new Set(), // leads whose ended sessions are listed (not folded)
+  filter: "", // the list's filter box (app-sidebar.js matchesFilter)
+  dense: store.get("dense", false), // dense rows
   listHidden: store.get("list-hidden", false), // desktop: the rail alone
   scopeFollows: null, // the attached session the list last followed
   repoChoice: store.get("repo-choice", {}), // workspace id -> repo
@@ -676,6 +679,14 @@ const attention = window.FwHubAttention({
   copyText: (text) => commands.copyText(text),
   // Dismissing a handoff drops its prompt: asked first.
   confirm: (options) => confirmDialog(options),
+  // A row's dot (the one state every surface shows), and its inspector
+  // (app-inspector.js) on hover or I.
+  statusLook: (session) => statusLook(session),
+  inspect: {
+    hover: (id, node) => inspector.hover(id, node),
+    leave: () => inspector.leave(),
+    toggle: (id, node) => inspector.toggle(id, node),
+  },
 });
 const notify = window.FwHubNotify({
   $, state, store, prefs: settings, sessionById, workspaceById, pwa, api, attention, toast: commands.toast,

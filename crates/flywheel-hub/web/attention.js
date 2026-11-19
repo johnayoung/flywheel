@@ -806,27 +806,26 @@ window.FwHubAttention = function (ctx) {
     const asking = list.filter((e) => e.level === 1).length;
     const failed = list.filter((e) => e.level === 2 && e.agent.state === "failed").length;
     const alerts = loop.reduce((n, e) => n + (e.count || 1), 0);
+    // The heading's counts, on one line.
+    const said = [
+      blocked ? `${blocked} blocked` : "",
+      passed.length ? `${passed.length} handoff${passed.length === 1 ? "" : "s"}` : "",
+      starts.length ? `${starts.length} start${starts.length === 1 ? "" : "s"}` : "",
+      ends.length ? `${ends.length} end${ends.length === 1 ? "" : "s"}` : "",
+      asking ? `${asking} asking` : "",
+      failed ? `${failed} failed` : "",
+      alerts ? `${alerts} flywheel` : "",
+      graded.length ? `${graded.length} fan-out${graded.length === 1 ? "" : "s"}` : "",
+      queues.length ? `${queues.length} queue${queues.length === 1 ? "" : "s"} stalled` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
     return [
       el(
         "header",
         { className: "attn-head" },
         el("span", { className: "attn-title", textContent: "Needs you" }),
-        el("span", {
-          className: "attn-count",
-          textContent: [
-            blocked ? `${blocked} blocked` : "",
-            passed.length ? `${passed.length} handoff${passed.length === 1 ? "" : "s"}` : "",
-            starts.length ? `${starts.length} start${starts.length === 1 ? "" : "s"}` : "",
-            ends.length ? `${ends.length} end${ends.length === 1 ? "" : "s"}` : "",
-            asking ? `${asking} asking` : "",
-            failed ? `${failed} failed` : "",
-            alerts ? `${alerts} flywheel` : "",
-            graded.length ? `${graded.length} fan-out${graded.length === 1 ? "" : "s"}` : "",
-            queues.length ? `${queues.length} queue${queues.length === 1 ? "" : "s"} stalled` : "",
-          ]
-            .filter(Boolean)
-            .join(" / "),
-        }),
+        el("span", { className: "attn-count", textContent: said, title: said }),
       ),
       // Blocked agents, handoffs, asks, then fan-out verdicts, then
       // finished turns.

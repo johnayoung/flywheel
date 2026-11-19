@@ -719,8 +719,10 @@ try {
   }, { sel, task });
   const meterTail = await tail("#meter-cwd");
   check(meterTail.ok, `desktop: the header's worktree path is cut from its start (${JSON.stringify(meterTail)})`);
-  await pp.locator(`.session[data-id="${agent.id}"]`).hover();
-  await pp.locator(`.session[data-id="${agent.id}"] [aria-label="Close session"]`).click();
+  // On desktop a row's actions are in its inspector (hover opens it).
+  await pp.locator(`.session[data-id="${agent.id}"] .session-name`).hover();
+  await pp.waitForSelector("#inspector:not([hidden])", { timeout: 3000 }).catch(() => {});
+  await pp.locator('#inspector [aria-label="Close session"]').click();
   await pp.waitForSelector("#dlg-close-wt[open] #cwt-where .path-tail", { timeout: 5000 });
   await pp.waitForTimeout(300);
   const dialogTail = await tail("#cwt-where .path-tail");
@@ -1645,6 +1647,30 @@ try {
       const r = c.getBoundingClientRect();
       return { shown: !c.hidden, beside: r.left >= side.right - 1, name: (c.querySelector(".insp-name") || {}).textContent, keys: [...c.querySelectorAll(".why-key")].map((k) => k.textContent) };
     });
+    // Hovered, the row keeps its name whole (its actions are the
+    // inspector's); the inspector names, never ids, and leaves out the
+    // hub's labels other rows already say.
+    const hovered = await sp.evaluate((id) => {
+      const r = document.querySelector(`#workspaces li.session[data-id="${id}"]`);
+      const name = r.querySelector(".session-name");
+      const c = document.querySelector("#inspector");
+      return {
+        actions: getComputedStyle(r.querySelector(".session-actions")).display,
+        cut: name.scrollWidth > name.clientWidth,
+        labels: [...c.querySelectorAll(".insp-label")].map((n) => n.textContent),
+        ids: /\b[0-9a-f]{32}\b/.test(c.textContent),
+        cardActions: [...c.querySelectorAll(".insp-acts button")].map((b) => b.textContent),
+      };
+    }, kids[0].id);
+    check(hovered.actions === "none" && !hovered.cut && !hovered.ids && !hovered.labels.some((l) => /^fw\.(kind|parent)=/.test(l)) && hovered.cardActions.join() === "rename,stop,close",
+      `sidebar: a hovered row keeps its name whole; its inspector holds the actions and names, not ids or repeated fw.* labels (${JSON.stringify(hovered)})`);
+    const head = await sp.evaluate(() => {
+      const count = document.querySelector("#attention .attn-count");
+      const filter = document.querySelector(".list-filter");
+      return { countLines: count ? Math.round(count.getBoundingClientRect().height) : 0, filterWidth: Math.round(filter.getBoundingClientRect().width) };
+    });
+    check(head.countLines > 0 && head.countLines < 18 && head.filterWidth >= 150,
+      `sidebar: Needs you's counts keep one line; the filter has the row's width (${JSON.stringify(head)})`);
     const after = await tops();
     await sp.screenshot({ path: path.join(out, "desktop-sidebar-inspector.png") });
     await sp.keyboard.press("Escape");

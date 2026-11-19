@@ -95,11 +95,41 @@ const inspector = (() => {
     return endedHow(session);
   }
 
-  // Its labels (key=value), the hub's fw.* keys after the rest.
+  // Its labels (key=value): the operator's first, then the hub's fw.*
+  // keys a row above does not already say (fw.kind: the kind tag;
+  // fw.parent: family; fw.change: branch; fw.pr: pr; fw.state: now). A
+  // value naming a session reads as its name.
+  const SHOWN_ELSEWHERE = new Set(["fw.kind", "fw.parent", "fw.change", "fw.pr", "fw.state"]);
   function labelsLine(session) {
     const labels = Object.entries(session.labels || {})
+      .filter(([k]) => !SHOWN_ELSEWHERE.has(k))
       .sort(([a], [b]) => (a.startsWith("fw.") - b.startsWith("fw.")) || a.localeCompare(b));
-    return labels.map(([k, v]) => el("span", { className: "insp-label", textContent: `${k}=${v}` }));
+    return labels.map(([k, v]) => {
+      const named = sessionById(String(v));
+      return el("span", { className: "insp-label", textContent: `${k}=${named ? named.name : v}`, title: named ? `${k}=${v}` : undefined });
+    });
+  }
+
+  // Its actions (the row's, which a desktop row shows only to the
+  // keyboard): rename, stop or relaunch, close.
+  function actions(session) {
+    const act = (label, title, run, danger) => el("button", {
+      type: "button",
+      className: `chip${danger ? " danger" : ""}`,
+      textContent: label,
+      title,
+      "aria-label": title,
+      onclick: () => {
+        close();
+        run();
+      },
+    });
+    return el("div", { className: "insp-acts" },
+      act("rename", "Rename (F2)", () => startRename(session.id)),
+      session.state === "running" && session.live
+        ? act("stop", "Stop: hang up, keep the scrollback", () => stopSession(session.id))
+        : act("relaunch", "Relaunch in place", () => relaunch(session.id)),
+      act("close", "Close session", () => closeSession(session.id), true));
   }
 
   function content(session) {
@@ -128,6 +158,7 @@ const inspector = (() => {
       row("end", endLine(session)),
       row("recording", session.recording || ""),
       row("labels", labelsLine(session)),
+      actions(session),
       el("p", { className: "why-note insp-cli", textContent: `fw hub ls --filter ${/\s/.test(session.name) ? JSON.stringify(session.name) : session.name}` }),
     ];
   }

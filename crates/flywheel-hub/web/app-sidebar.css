@@ -302,6 +302,9 @@ body.list-hidden .side-list { display: none; }
 #sidebar .attn-head { padding: .85rem .95rem .3rem; }
 #sidebar .attn-title { font: 400 9.5px/1.5 var(--mono); letter-spacing: .16em; color: var(--alert); }
 #sidebar .attn-list { max-height: none; overflow: visible; }
+/* Its counts on the heading's one line, cut before they wrap. */
+#sidebar .attn-head { flex-wrap: nowrap; }
+#sidebar .attn-count { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 9.5px; letter-spacing: .04em; text-transform: none; }
 /* Its rows, as the list's: the dot, the name, what and since when on the
    right; what it asks under the name. */
 #sidebar .attn-row { grid-template-columns: 1.1rem minmax(0, 1fr) auto; align-items: start; column-gap: .6rem; row-gap: .05rem; padding: .3rem .7rem .3rem calc(.95rem - 3px); }
@@ -354,6 +357,9 @@ body.list-hidden .side-list { display: none; }
 .inspector .session-cost { display: inline; }
 .inspector .session-git { margin-top: 0; }
 .insp-label { display: inline-block; margin: 0 .3rem .15rem 0; padding: 0 .3rem; border: 1px solid var(--rule-2); border-radius: 3px; font-size: 10px; color: var(--ink-2); }
+.insp-acts { display: flex; flex-wrap: wrap; gap: .3rem; margin-top: .5rem; }
+.insp-acts .chip { padding: .2rem .5rem; font-size: 10px; }
+.insp-acts .chip.danger:hover { color: var(--alert); border-color: var(--alert); }
 .insp-cli { margin: .5rem 0 0; padding-top: .45rem; border-top: 1px solid var(--rule); color: var(--ink-3); font-size: 10px; }
 .inspector.sheet { left: 0; right: 0; top: auto; bottom: 0; width: auto; max-height: 60vh; z-index: 60; padding: .8rem 1rem calc(.8rem + env(safe-area-inset-bottom)); }
 /* A workspace's list has its own: Needs you shows in Everything only. */
@@ -539,12 +545,19 @@ body.list-hidden .side-list { display: none; }
 }
 .session.needs-you.active::before { background: var(--alert); }
 
-/* Shown on hover in place of the state label: negative margins keep the
-   taller buttons from growing the row (and shifting every row below). */
+/* A row's actions, in place of its fact, only where they never cut its
+   name on a mere hover: a row reached by keyboard, a narrow list under a
+   pointer (the same buttons are in the inspector on desktop). Negative
+   margins keep the taller buttons from growing the row (and shifting
+   every row below). */
 .session-actions { display: none; gap: 0; margin: -.35rem 0; }
-.session:hover .session-actions, .session:focus-within .session-actions { display: inline-flex; }
-.session:hover .session-state, .session:focus-within .session-state,
-.session:hover .session-roll, .session:focus-within .session-roll { display: none; }
+.session:focus-visible .session-actions, .session:has(.session-actions :focus-visible) .session-actions { display: inline-flex; }
+.session:focus-visible .session-state, .session:has(.session-actions :focus-visible) .session-state,
+.session:focus-visible .session-roll, .session:has(.session-actions :focus-visible) .session-roll { display: none; }
+@media (max-width: 760px) {
+  .session:hover .session-actions { display: inline-flex; }
+  .session:hover .session-state, .session:hover .session-roll { display: none; }
+}
 
 /* Touch screens have no hover: the active row's actions show in place of
    its word. */

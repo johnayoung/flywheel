@@ -753,6 +753,9 @@ struct StateDoc {
     /// Session id -> its prompt queue (see [`crate::queue`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     queues: BTreeMap<String, crate::queue::SessionQueue>,
+    /// Armed watches (see [`crate::watch`]), oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    watches: Vec<crate::watch::Watch>,
 }
 
 /// Store and validation failures.

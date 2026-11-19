@@ -421,6 +421,13 @@ impl Telemetry {
         })
     }
 
+    /// A session's labels as the store keeps them.
+    pub fn session_labels(&self, host: &str, session: &str) -> crate::labels::Labels {
+        lock(&self.inner.read)
+            .labels(host, session)
+            .unwrap_or_default()
+    }
+
     /// Wakes when the log's end moves (a commit added rows).
     pub fn log_moves(&self) -> tokio::sync::watch::Receiver<i64> {
         self.inner.head.subscribe()

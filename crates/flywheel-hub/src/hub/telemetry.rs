@@ -62,6 +62,11 @@ impl Hub {
         &self.telemetry
     }
 
+    /// The watch engine's memory (see [`crate::watch`]).
+    pub(crate) fn watch_engine(&self) -> &crate::watch::Engine {
+        &self.watches
+    }
+
     /// Tell the hub where it listens (`http://127.0.0.1:7420`): sessions
     /// started from now on POST their hooks there and get the progress
     /// tool.

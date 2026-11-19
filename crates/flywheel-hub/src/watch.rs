@@ -1,0 +1,638 @@
+//! Watches: a subscription that wakes a session. When an event in the
+//! hub's log ([`crate::telemetry::log`]) matches a watch's filter, the hub
+//! queues a prompt (the watch's text, then the events and their cursors)
+//! into the watch's owner through its prompt queue ([`crate::queue`]), so
+//! the wake keeps the queue's rules: delivered exactly once, one at a time,
+//! never while the agent works, is blocked, or has something half-typed.
+//!
+//! Bursts are coalesced: matches gather for the watch's window (default
+//! [`DEFAULT_WINDOW_SECS`]) before they are queued, and while the
+//! watch's queued prompt is still waiting, later matches join it (its
+//! text is rewritten, at most [`MAX_LINES`] events listed, the rest
+//! counted with the cursor to read them from). Five hundred children
+//! finishing together wake their lead with one prompt.
+//!
+//! Exactly once from log to queue: the prompt and the watch's cursor are
+//! saved in one write of `state.json`. A hub that stops in between reads
+//! the log again from the saved cursor.
+//!
+//! A watch belongs to its owner: removed with it, ended with it, gone
+//! when its process exits (not when the hub stops or relaunches it). The
+//! owner's own events never match its watches (no wake loops).
+//!
+//! Scale: one scan of the log per tick from the lowest watch's cursor;
+//! each row is matched only against the watches that can match its
+//! session (by id, by `fw.parent`, or fleet-wide), labels read once per
+//! session per tick.
+
+use crate::eventlog::Filter;
+use crate::hub::{Hub, HubError};
+use crate::state::{StateError, new_id};
+use crate::telemetry::log::{Cursor, LogQuery, LogRow};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+/// The window a watch gathers matches for, unless it names one.
+pub const DEFAULT_WINDOW_SECS: u32 = 3;
+/// The longest window.
+pub const MAX_WINDOW_SECS: u32 = 3600;
+/// Watches per owner, and per hub.
+pub const MAX_PER_OWNER: usize = 20;
+pub const MAX_PER_HUB: usize = 2000;
+/// The longest watch prompt.
+pub const MAX_PROMPT_BYTES: usize = 4096;
+/// Events a queued prompt lists; the rest are counted.
+pub const MAX_LINES: usize = 40;
+/// How often the engine looks at the log.
+const TICK: Duration = Duration::from_millis(250);
+/// Rows one tick reads.
+const SCAN_ROWS: usize = 5000;
+/// How often a quiet watch's cursor is saved (so a restart rescans less).
+const SAVE_EVERY: Duration = Duration::from_secs(60);
+
+fn default_window() -> u32 {
+    DEFAULT_WINDOW_SECS
+}
+
+/// The events a watch's waiting prompt lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Batch {
+    /// The queue item it is in.
+    pub item: String,
+    pub lines: Vec<String>,
+    /// Matches past [`MAX_LINES`], counted.
+    #[serde(default)]
+    pub more: u32,
+    /// The cursor just before its first event, and after its last.
+    pub from: String,
+    pub to: String,
+}
+
+/// One watch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Watch {
+    pub id: String,
+    /// The session it wakes (an agent).
+    pub owner: String,
+    /// What it matches, its sessions and workspaces named by id.
+    pub filter: Filter,
+    /// What the woken agent is told, before the events.
+    pub prompt: String,
+    #[serde(default = "default_window")]
+    pub window_secs: u32,
+    /// Every log row up to here was looked at and, matching, queued.
+    pub cursor: i64,
+    pub created_at: DateTime<Utc>,
+    /// The agent session that armed it (`None`: the operator).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// Prompts it queued, and when last.
+    #[serde(default)]
+    pub fired: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired: Option<DateTime<Utc>>,
+    /// Events matched so far, all prompts.
+    #[serde(default)]
+    pub events: u64,
+    /// Its prompt still waiting in the owner's queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<Batch>,
+}
+
+impl Watch {
+    /// The short id people type (`w` and 7 hex).
+    pub fn short(&self) -> String {
+        format!("w{}", &self.id[..7.min(self.id.len())])
+    }
+
+    /// The queued prompt's text for `batch`.
+    pub fn text(&self, batch: &Batch) -> String {
+        let count = batch.lines.len() + batch.more as usize;
+        let mut text = format!(
+            "{}\n\n[watch {} on `{}`] {count} event{} (cursor {} .. {}):\n",
+            self.prompt.trim_end(),
+            self.short(),
+            self.filter,
+            if count == 1 { "" } else { "s" },
+            batch.from,
+            batch.to
+        );
+        for line in &batch.lines {
+            text.push_str("- ");
+            text.push_str(line);
+            text.push('\n');
+        }
+        if batch.more > 0 {
+            text.push_str(&format!(
+                "- and {} more: fw hub tail --after {} (filter: {})\n",
+                batch.more, batch.from, self.filter
+            ));
+        }
+        text
+    }
+}
+
+/// Watch input, as the API, CLI, and agent tool give it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NewWatch {
+    /// The session it wakes (id, prefix, or name).
+    pub owner: String,
+    /// A filter string (see [`crate::eventlog`]).
+    pub filter: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub window_secs: Option<u32>,
+    /// Match from this cursor on (default: from now).
+    #[serde(default)]
+    pub after: Option<String>,
+}
+
+/// One event in a watch's prompt: when, who, what.
+pub fn line(row: &LogRow) -> String {
+    let when = DateTime::from_timestamp_millis(row.ts)
+        .map(|t| t.format("%H:%M:%S").to_string())
+        .unwrap_or_default();
+    let who = row
+        .name
+        .clone()
+        .unwrap_or_else(|| row.session.chars().take(8).collect());
+    let moved = row
+        .state
+        .as_deref()
+        .map(|s| format!(" -> {s}"))
+        .unwrap_or_default();
+    let what = crate::telemetry::log::summary(&row.body);
+    format!(
+        "{when} {who} ({}) {}{moved}{}{what}",
+        row.session,
+        row.kind,
+        if what.is_empty() { "" } else { " " }
+    )
+}
+
+/// The engine's memory: how far each watch has looked, and its matches
+/// gathering for their window.
+#[derive(Default)]
+pub struct Engine {
+    inner: Mutex<Scan>,
+}
+
+#[derive(Default)]
+struct Scan {
+    /// Watch id -> the last row it looked at.
+    looked: HashMap<String, i64>,
+    /// Watch id -> matches not yet queued, and when the first came.
+    gathered: HashMap<String, (Vec<LogRow>, Instant)>,
+    /// The log's end at the last scan.
+    head: i64,
+    saved: Option<Instant>,
+}
+
+impl Hub {
+    fn engine(&self) -> std::sync::MutexGuard<'_, Scan> {
+        self.watch_engine()
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Arm a watch (`by`: the agent session arming it; `None`: the
+    /// operator).
+    pub fn watch_add(&self, new: &NewWatch, by: Option<&str>) -> Result<Watch, HubError> {
+        let owner = {
+            let store = self.store();
+            crate::script::find_by(
+                store.sessions(),
+                |s| (s.id.as_str(), s.name.as_str()),
+                &new.owner,
+                "session",
+            )
+            .map_err(StateError::Invalid)?
+            .cloned()
+            .ok_or_else(|| StateError::Invalid(format!("no session matches {:?}", new.owner)))?
+        };
+        if !owner.runs_agent() {
+            return Err(StateError::Invalid(format!(
+                "{} is not an agent session: a watch wakes an agent through its prompt queue",
+                owner.label()
+            ))
+            .into());
+        }
+        let prompt = new.prompt.trim();
+        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+            return Err(StateError::Invalid(format!(
+                "a watch's prompt is 1-{MAX_PROMPT_BYTES} bytes: what to do when it fires"
+            ))
+            .into());
+        }
+        let parsed = Filter::parse(&new.filter).map_err(StateError::Invalid)?;
+        if parsed.is_empty() {
+            return Err(StateError::Invalid(
+                "a watch needs a filter (state=done|blocked children, kind=review, team=web, ...)"
+                    .into(),
+            )
+            .into());
+        }
+        let filter = self.resolve_filter(&parsed, Some(&owner.id))?;
+        let window_secs = new.window_secs.unwrap_or(DEFAULT_WINDOW_SECS);
+        if window_secs > MAX_WINDOW_SECS {
+            return Err(StateError::Invalid(format!(
+                "window is at most {MAX_WINDOW_SECS} seconds"
+            ))
+            .into());
+        }
+        let cursor = match self.log_cursor(new.after.as_deref())? {
+            Some(at) => at,
+            None => self.telemetry().log_head()?.at,
+        };
+        let watch = Watch {
+            id: new_id(),
+            owner: owner.id.clone(),
+            filter,
+            prompt: prompt.to_owned(),
+            window_secs,
+            cursor,
+            created_at: Utc::now(),
+            by: by.map(str::to_owned),
+            fired: 0,
+            last_fired: None,
+            events: 0,
+            batch: None,
+        };
+        self.store()
+            .add_watch(watch.clone(), MAX_PER_OWNER, MAX_PER_HUB)?;
+        self.queue_changed();
+        Ok(watch)
+    }
+
+    /// The `watch` agent tool: arm a watch that wakes `caller`.
+    pub fn agent_watch(
+        &self,
+        caller: &str,
+        filter: &str,
+        prompt: &str,
+        window_secs: Option<u32>,
+    ) -> Result<String, HubError> {
+        let watch = self.watch_add(
+            &NewWatch {
+                owner: caller.to_owned(),
+                filter: filter.to_owned(),
+                prompt: prompt.to_owned(),
+                window_secs,
+                after: None,
+            },
+            Some(caller),
+        )?;
+        Ok(format!(
+            "Watch {} armed on `{}` (window {} s): matching events wake you as your next prompt, \
+             with their cursors. Keep working or end your turn; unwatch {} stops it.",
+            watch.short(),
+            watch.filter,
+            watch.window_secs,
+            watch.short()
+        ))
+    }
+
+    /// The `unwatch` agent tool: disarm one of `caller`'s watches, or all.
+    pub fn agent_unwatch(&self, caller: &str, id: &str) -> Result<String, HubError> {
+        if id.trim() == "all" {
+            let mine = self.watches(Some(caller));
+            for watch in &mine {
+                self.watch_remove(&watch.id)?;
+            }
+            return Ok(format!("{} watch(es) disarmed.", mine.len()));
+        }
+        let watch = self.watch_named(id)?;
+        if watch.owner != caller {
+            return Err(
+                StateError::Invalid(format!("watch {} is not yours", watch.short())).into(),
+            );
+        }
+        self.watch_remove(&watch.id)?;
+        Ok(format!("Watch {} disarmed.", watch.short()))
+    }
+
+    /// A session's id from its id, prefix, or name.
+    pub fn session_id_named(&self, query: &str) -> Result<String, HubError> {
+        let store = self.store();
+        crate::script::find_by(
+            store.sessions(),
+            |s| (s.id.as_str(), s.name.as_str()),
+            query,
+            "session",
+        )
+        .map_err(StateError::Invalid)?
+        .map(|s| s.id.clone())
+        .ok_or_else(|| StateError::Invalid(format!("no session matches {query:?}")).into())
+    }
+
+    /// Every watch (`owner`: only that session's).
+    pub fn watches(&self, owner: Option<&str>) -> Vec<Watch> {
+        self.store()
+            .watches()
+            .iter()
+            .filter(|w| owner.is_none_or(|o| w.owner == o))
+            .cloned()
+            .collect()
+    }
+
+    /// A watch by id or unique id prefix (with or without its `w`).
+    pub fn watch_named(&self, reference: &str) -> Result<Watch, HubError> {
+        let reference = reference.trim();
+        let bare = reference.strip_prefix('w').filter(|r| r.len() >= 4);
+        let store = self.store();
+        let found: Vec<&Watch> = store
+            .watches()
+            .iter()
+            .filter(|w| w.id == reference || w.id.starts_with(bare.unwrap_or(reference)))
+            .collect();
+        match found.as_slice() {
+            [one] if reference.len() >= 4 => Ok((*one).clone()),
+            [] | [_] => Err(StateError::NotFound(format!("watch {reference}")).into()),
+            _ => Err(StateError::Invalid(format!(
+                "watch {reference} is ambiguous: give more of its id"
+            ))
+            .into()),
+        }
+    }
+
+    /// Disarm a watch; its prompt already queued stays (it is the
+    /// owner's now: `fw hub queue rm` takes it back).
+    pub fn watch_remove(&self, id: &str) -> Result<Watch, HubError> {
+        let removed = self.store().remove_watch(id)?;
+        self.forget_scan(std::slice::from_ref(&removed.id));
+        self.queue_changed();
+        Ok(removed)
+    }
+
+    /// Disarm every watch `owner` has (it was removed, ended, or exited).
+    pub(crate) fn drop_watches_of(&self, owner: &str) {
+        let removed = match self.store().remove_watches_of(owner) {
+            Ok(removed) => removed,
+            Err(e) => {
+                eprintln!("fw hub: watches of {owner}: {e}");
+                return;
+            }
+        };
+        if !removed.is_empty() {
+            let ids: Vec<String> = removed.iter().map(|w| w.id.clone()).collect();
+            eprintln!("fw hub: {} watch(es) of {owner} ended with it", ids.len());
+            self.forget_scan(&ids);
+        }
+    }
+
+    fn forget_scan(&self, ids: &[String]) {
+        let mut scan = self.engine();
+        for id in ids {
+            scan.looked.remove(id);
+            scan.gathered.remove(id);
+        }
+    }
+
+    /// One look at the log for every watch: gather what matches, queue
+    /// what has waited its window. Whether anything is still gathering.
+    pub(crate) fn watch_tick(&self) -> bool {
+        let watches = self.store().watches().to_vec();
+        if watches.is_empty() {
+            return false;
+        }
+        let head = *self.telemetry().log_moves().borrow();
+        let from = {
+            let mut scan = self.engine();
+            scan.looked
+                .retain(|id, _| watches.iter().any(|w| w.id == *id));
+            scan.gathered
+                .retain(|id, _| watches.iter().any(|w| w.id == *id));
+            for watch in &watches {
+                scan.looked.entry(watch.id.clone()).or_insert(watch.cursor);
+            }
+            let from = watches
+                .iter()
+                .map(|w| scan.looked[&w.id])
+                .min()
+                .unwrap_or(head);
+            scan.head = head;
+            from
+        };
+        if from < head {
+            self.watch_scan(&watches, from);
+        }
+        self.watch_deliver(&watches)
+    }
+
+    /// Match the log's rows after `from` against `watches`.
+    fn watch_scan(&self, watches: &[Watch], from: i64) {
+        let page = match self.read_log(&LogQuery {
+            after: Some(from),
+            limit: SCAN_ROWS,
+            ..LogQuery::default()
+        }) {
+            Ok(page) => page,
+            Err(e) => {
+                eprintln!("fw hub: watches: the log does not read: {e}");
+                return;
+            }
+        };
+        let epoch = self.telemetry().log_epoch().unwrap_or(0);
+        let looked_to = Cursor::parse(&page.cursor, epoch).map_or(from, |c| c.at);
+        // Which watches may match a row: by session, by parent, or any.
+        let mut by_session: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut by_parent: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut anywhere: Vec<usize> = Vec::new();
+        let queries: Vec<LogQuery> = watches
+            .iter()
+            .map(|w| {
+                let mut query = self.log_query(&w.filter, None, 1);
+                query.not_sessions.push(w.owner.clone());
+                query
+            })
+            .collect();
+        for (at, (watch, query)) in watches.iter().zip(&queries).enumerate() {
+            if !query.sessions.is_empty() {
+                for s in &query.sessions {
+                    by_session.entry(s.as_str()).or_default().push(at);
+                }
+            } else if let Some(parent) = &watch.filter.children {
+                by_parent.entry(parent.as_str()).or_default().push(at);
+            } else {
+                anywhere.push(at);
+            }
+        }
+        let mut labels: HashMap<(String, String), crate::labels::Labels> = HashMap::new();
+        let mut matched: Vec<(usize, LogRow)> = Vec::new();
+        {
+            let scan = self.engine();
+            for row in &page.events {
+                let key = (row.host.clone(), row.session.clone());
+                if !labels.contains_key(&key) {
+                    labels.insert(
+                        key.clone(),
+                        self.telemetry().session_labels(&row.host, &row.session),
+                    );
+                }
+                let now = &labels[&key];
+                let parent = now.get(crate::labels::PARENT).map(String::as_str);
+                let candidates = by_session
+                    .get(row.session.as_str())
+                    .into_iter()
+                    .flatten()
+                    .chain(parent.and_then(|p| by_parent.get(p)).into_iter().flatten())
+                    .chain(anywhere.iter());
+                for &at in candidates {
+                    if scan
+                        .looked
+                        .get(&watches[at].id)
+                        .is_some_and(|l| *l >= row.at)
+                    {
+                        continue;
+                    }
+                    if queries[at].matches(row, now) {
+                        matched.push((at, row.clone()));
+                    }
+                }
+            }
+        }
+        let mut scan = self.engine();
+        for (at, row) in matched {
+            let gathered = scan
+                .gathered
+                .entry(watches[at].id.clone())
+                .or_insert_with(|| (Vec::new(), Instant::now()));
+            gathered.0.push(row);
+        }
+        for watch in watches {
+            let looked = scan.looked.entry(watch.id.clone()).or_insert(watch.cursor);
+            *looked = (*looked).max(looked_to);
+        }
+    }
+
+    /// Queue what each watch gathered once its window passed; save quiet
+    /// watches' cursors now and then. Whether anything still gathers.
+    fn watch_deliver(&self, watches: &[Watch]) -> bool {
+        let due: Vec<(Watch, Vec<LogRow>, i64)> = {
+            let mut scan = self.engine();
+            let mut due = Vec::new();
+            for watch in watches {
+                let window = Duration::from_secs(u64::from(watch.window_secs));
+                let ready = scan
+                    .gathered
+                    .get(&watch.id)
+                    .is_some_and(|(rows, first)| !rows.is_empty() && first.elapsed() >= window);
+                if ready {
+                    let rows = scan
+                        .gathered
+                        .remove(&watch.id)
+                        .map(|(rows, _)| rows)
+                        .unwrap_or_default();
+                    let looked = scan.looked.get(&watch.id).copied().unwrap_or(watch.cursor);
+                    due.push((watch.clone(), rows, looked));
+                }
+            }
+            due
+        };
+        for (watch, rows, looked) in due {
+            if let Err(e) = self.watch_queue(&watch, &rows, looked) {
+                // Not queued (the owner is ending, its queue is full): the
+                // matches stay gathered and are tried again.
+                eprintln!("fw hub: watch {}: not queued: {e}", watch.short());
+                let mut scan = self.engine();
+                let entry = scan
+                    .gathered
+                    .entry(watch.id.clone())
+                    .or_insert_with(|| (Vec::new(), Instant::now()));
+                let mut rows = rows;
+                rows.append(&mut entry.0);
+                entry.0 = rows;
+            }
+        }
+        let mut scan = self.engine();
+        let gathering = scan.gathered.values().any(|(rows, _)| !rows.is_empty());
+        if scan.saved.is_none_or(|t| t.elapsed() >= SAVE_EVERY) {
+            scan.saved = Some(Instant::now());
+            let quiet: Vec<(String, i64)> = watches
+                .iter()
+                .filter(|w| !scan.gathered.contains_key(&w.id))
+                .filter_map(|w| scan.looked.get(&w.id).map(|l| (w.id.clone(), *l)))
+                .filter(|(id, l)| watches.iter().any(|w| w.id == *id && w.cursor < *l))
+                .collect();
+            drop(scan);
+            if !quiet.is_empty()
+                && let Err(e) = self.store().set_watch_cursors(&quiet)
+            {
+                eprintln!("fw hub: watches: cursors not saved: {e}");
+            }
+        }
+        gathering
+    }
+
+    /// Queue `rows` for `watch`'s owner: into its waiting prompt, else a
+    /// new one; the watch's cursor moves to `looked` in the same write.
+    fn watch_queue(&self, watch: &Watch, rows: &[LogRow], looked: i64) -> Result<(), HubError> {
+        let record = self.store().session(&watch.owner)?.clone();
+        if let Some(ending) = &record.ending {
+            return Err(StateError::Conflict(format!(
+                "{} is ending (request {})",
+                record.name, ending.id
+            ))
+            .into());
+        }
+        let epoch = self.telemetry().log_epoch()?;
+        let first = rows.first().map_or(looked, |r| r.at - 1);
+        let from = Cursor { epoch, at: first }.encode();
+        let to = Cursor { epoch, at: looked }.encode();
+        let lines: Vec<String> = rows.iter().map(line).collect();
+        let delivered = self
+            .store()
+            .queue_watch(&watch.id, &lines, &from, &to, looked)?;
+        eprintln!(
+            "fw hub: watch {} -> {}: {} event(s) {}",
+            watch.short(),
+            record.name,
+            rows.len(),
+            if delivered {
+                "queued"
+            } else {
+                "joined its waiting prompt"
+            }
+        );
+        self.log_hub_event(
+            "watch.fired",
+            Some(&watch.owner),
+            serde_json::json!({ "watch": watch.id, "events": rows.len(), "cursor": to }),
+        );
+        self.queue_changed();
+        Ok(())
+    }
+}
+
+impl Hub {
+    /// Look at the log for every watch every [`TICK`] (its own thread:
+    /// the queue's sleeps while nothing is queued).
+    pub(crate) fn start_watches(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name("hub-watches".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(TICK);
+                    let Some(hub) = weak.upgrade() else {
+                        break;
+                    };
+                    if hub.queue_runtime().is_stopped() {
+                        break;
+                    }
+                    // Frozen for a live handoff: the next hub goes on from
+                    // the saved cursors.
+                    if !hub.queue_runtime().is_paused() {
+                        hub.watch_tick();
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!("fw hub: watches are off: cannot start their thread: {e}");
+        }
+    }
+}

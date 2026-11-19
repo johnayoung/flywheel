@@ -1042,6 +1042,183 @@ impl HubStore {
         Ok(result)
     }
 
+    /// Armed watches, oldest first.
+    pub fn watches(&self) -> &[crate::watch::Watch] {
+        &self.doc.watches
+    }
+
+    /// Arm `watch`: at most `per_owner` per session and `per_hub` in all.
+    pub fn add_watch(
+        &mut self,
+        watch: crate::watch::Watch,
+        per_owner: usize,
+        per_hub: usize,
+    ) -> Result<(), StateError> {
+        self.session(&watch.owner)?;
+        if self.doc.watches.len() >= per_hub {
+            return Err(StateError::Conflict(format!(
+                "the hub holds {per_hub} watches already: remove some first"
+            )));
+        }
+        if self
+            .doc
+            .watches
+            .iter()
+            .filter(|w| w.owner == watch.owner)
+            .count()
+            >= per_owner
+        {
+            return Err(StateError::Conflict(format!(
+                "that session has {per_owner} watches already: remove some first"
+            )));
+        }
+        self.doc.watches.push(watch);
+        self.save_or_rollback(|doc| {
+            doc.watches.pop();
+        })
+    }
+
+    /// Disarm watch `id`.
+    pub fn remove_watch(&mut self, id: &str) -> Result<crate::watch::Watch, StateError> {
+        let at = self
+            .doc
+            .watches
+            .iter()
+            .position(|w| w.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("watch {id}")))?;
+        let removed = self.doc.watches.remove(at);
+        let back = removed.clone();
+        self.save_or_rollback(move |doc| doc.watches.insert(at, back))?;
+        Ok(removed)
+    }
+
+    /// Disarm every watch `owner` has.
+    pub fn remove_watches_of(
+        &mut self,
+        owner: &str,
+    ) -> Result<Vec<crate::watch::Watch>, StateError> {
+        if !self.doc.watches.iter().any(|w| w.owner == owner) {
+            return Ok(Vec::new());
+        }
+        let previous = self.doc.watches.clone();
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.doc.watches)
+            .into_iter()
+            .partition(|w| w.owner == owner);
+        self.doc.watches = kept;
+        self.save_or_rollback(|doc| doc.watches = previous)?;
+        Ok(gone)
+    }
+
+    /// Save how far quiet watches have looked (`(id, row)`); a watch gone
+    /// meanwhile is skipped.
+    pub fn set_watch_cursors(&mut self, cursors: &[(String, i64)]) -> Result<(), StateError> {
+        let mut changed = false;
+        for (id, at) in cursors {
+            if let Some(watch) = self.doc.watches.iter_mut().find(|w| w.id == *id)
+                && watch.cursor < *at
+            {
+                watch.cursor = *at;
+                changed = true;
+            }
+        }
+        if changed { self.save() } else { Ok(()) }
+    }
+
+    /// Queue `lines` (log events) for watch `id`'s owner, and move its
+    /// cursor to `looked`, in one write: into the prompt it has waiting in
+    /// that queue, else a new prompt. Whether a new prompt was queued.
+    pub fn queue_watch(
+        &mut self,
+        id: &str,
+        lines: &[String],
+        from: &str,
+        to: &str,
+        looked: i64,
+    ) -> Result<bool, StateError> {
+        use crate::queue::{ItemState, MAX_PENDING, QueueItem, When};
+        use crate::watch::{Batch, MAX_LINES};
+        let at = self
+            .doc
+            .watches
+            .iter()
+            .position(|w| w.id == id)
+            .ok_or_else(|| StateError::NotFound(format!("watch {id}")))?;
+        let owner = self.doc.watches[at].owner.clone();
+        self.session(&owner)?;
+        let previous_watch = self.doc.watches[at].clone();
+        let previous_queue = self.doc.queues.get(&owner).cloned();
+        let mut watch = previous_watch.clone();
+        let queue = self.doc.queues.entry(owner.clone()).or_default();
+        let waiting = watch.batch.as_ref().and_then(|b| {
+            queue
+                .items
+                .iter()
+                .position(|i| i.id == b.item && matches!(i.state, ItemState::Pending))
+        });
+        let fresh = waiting.is_none();
+        let mut batch = match (waiting, watch.batch.take()) {
+            (Some(_), Some(batch)) => batch,
+            _ => Batch {
+                item: crate::state::new_id(),
+                lines: Vec::new(),
+                more: 0,
+                from: from.to_owned(),
+                to: to.to_owned(),
+            },
+        };
+        for line in lines {
+            if batch.lines.len() < MAX_LINES {
+                batch.lines.push(line.clone());
+            } else {
+                batch.more += 1;
+            }
+        }
+        batch.to = to.to_owned();
+        let text = watch.text(&batch);
+        match waiting {
+            Some(index) => queue.items[index].text = text,
+            None => {
+                if queue.pending_count() >= MAX_PENDING {
+                    if previous_queue.is_none() && queue.is_vacant() {
+                        self.doc.queues.remove(&owner);
+                    }
+                    return Err(StateError::Conflict(format!(
+                        "its queue has {MAX_PENDING} prompts waiting"
+                    )));
+                }
+                queue.insert_pending(QueueItem {
+                    id: batch.item.clone(),
+                    text,
+                    when: When::Done,
+                    added_at: chrono::Utc::now(),
+                    blocked_at: None,
+                    from: None,
+                    priority: false,
+                    watch: Some(id.to_owned()),
+                    state: ItemState::Pending,
+                });
+                watch.fired += 1;
+                watch.last_fired = Some(chrono::Utc::now());
+            }
+        }
+        watch.events += lines.len() as u64;
+        watch.cursor = watch.cursor.max(looked);
+        watch.batch = Some(batch);
+        self.doc.watches[at] = watch;
+        self.save_or_rollback(|doc| {
+            doc.watches[at] = previous_watch;
+            match previous_queue {
+                Some(queue) => {
+                    doc.queues.insert(owner, queue);
+                }
+                None => {
+                    doc.queues.remove(&owner);
+                }
+            }
+        })?;
+        Ok(fresh)
+    }
+
     fn workspace_index(&self, id: &str) -> Result<usize, StateError> {
         self.doc
             .workspaces

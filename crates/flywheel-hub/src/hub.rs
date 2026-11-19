@@ -589,6 +589,8 @@ pub struct Hub {
     perms: Arc<crate::perms::Runtime>,
     /// What every agent session does (see [`crate::telemetry`]).
     telemetry: Arc<crate::telemetry::Telemetry>,
+    /// How far each watch has looked in the log (see [`crate::watch`]).
+    watches: crate::watch::Engine,
     /// What the telemetry capture knows beside the store (see
     /// `hub/telemetry.rs`).
     capture: telemetry::Capture,
@@ -699,6 +701,7 @@ impl Hub {
         }
         Ok(Arc::new(Self {
             telemetry,
+            watches: crate::watch::Engine::default(),
             capture: telemetry::Capture::load(&options.state_dir),
             commands: CommandBook::new(
                 options.claude_config_dir.clone(),

@@ -143,6 +143,9 @@ Per agent session, prompts the hub types itself, in order ("when done, do X"): `
 | Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched |
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
+**Watches** (`fw hub watch add lead --on 'children state=done|failed' --prompt ...`, `watch`/`unwatch` tools, the Queue drawer): a matching log event queues the prompt, events, and cursors into the owner (queue rules apply).
+Matches within `--window` (3 s), or while that prompt waits, join it (40 listed, the rest counted): 500 children finishing wake a lead once. Its own events never match; it ends with its owner.
+
 **Broadcast**: one prompt to many agents (Ctrl-click rows, a workspace's **Send to all agents**, palette, `fw hub broadcast api web-1 "rebase"`); a workspace: its non-exited agents. Each target: sent if its queue would deliver now, else queued (`done`), else refused (why). `--header` names the recipients.
 
 ## Activity

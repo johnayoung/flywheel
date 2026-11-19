@@ -893,7 +893,17 @@ impl Hub {
     /// scrollback remains attachable -- until the session is removed.
     pub(super) fn on_session_exit(&self, id: &str, generation: Option<u64>, exit: ExitInfo) {
         let exit_json = serde_json::json!({ "code": exit.code, "signal": exit.signal });
+        // Its watches end with it, unless the hub hung it up (a stop, a
+        // relaunch after an upgrade): it comes back as itself.
+        let stopping = self.activity().is_stopping();
+        let relaunching = self
+            .store()
+            .session(id)
+            .is_ok_and(|r| r.stale.as_ref().is_some_and(|s| s.hung_up_at.is_some()));
         let _ = self.store().mark_exited(id, exit);
+        if !stopping && !relaunching {
+            self.drop_watches_of(id);
+        }
         self.record_exit(id);
         if let Some(generation) = generation {
             let source = StatusSource::Hub {
@@ -953,6 +963,7 @@ impl Hub {
         let relaid = store.remove_session(id)?;
         let live = self.live().remove(id);
         drop(store);
+        self.drop_watches_of(id);
         self.board().untrack(id);
         self.queue_runtime().forget(id);
         if let Some(record) = ending {

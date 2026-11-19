@@ -162,6 +162,10 @@ pub struct QueueItem {
     /// priority items; never ahead of one being sent).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub priority: bool,
+    /// The watch that queued it (see [`crate::watch`]): while it is
+    /// pending, the watch's next matches join it rather than queue more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<String>,
     #[serde(flatten)]
     pub state: ItemState,
 }
@@ -335,6 +339,9 @@ pub struct QueueView {
     pub waiting: Option<String>,
     /// `queue.typing_quiet` in force, in seconds.
     pub typing_quiet_secs: u64,
+    /// The watches that queue prompts here (see [`crate::watch`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub watches: Vec<crate::watch::Watch>,
 }
 
 /// An item to add.

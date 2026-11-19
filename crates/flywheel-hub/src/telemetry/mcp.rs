@@ -55,6 +55,9 @@ pub const CANCEL_TOOL: &str = "cancel_message";
 pub const GIVE_TOOL: &str = "give_session";
 /// The label tool's name on the server.
 pub const LABEL_TOOL: &str = "label";
+/// The watch tools' names on the server.
+pub const WATCH_TOOL: &str = "watch";
+pub const UNWATCH_TOOL: &str = "unwatch";
 
 /// What an agent asks `start_session` for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -119,6 +122,11 @@ pub trait Host {
         change: &crate::labels::Change,
         cond: Option<&crate::labels::Cond>,
     ) -> Result<String, String>;
+    /// Arm a watch that wakes the caller when the log matches `filter`.
+    fn watch(&self, filter: &str, prompt: &str, window_secs: Option<u32>)
+    -> Result<String, String>;
+    /// Disarm one of the caller's watches (`all`: every one).
+    fn unwatch(&self, id: &str) -> Result<String, String>;
     /// Keep a proposed handoff for the operator; what to tell the agent.
     fn handoff(
         &self,
@@ -140,7 +148,9 @@ can run, such as one needing sudo or another machine), call mcp__flywheel__ask_o
 with that ask, then end your turn. When the work should go on in a fresh session, call \
 mcp__flywheel__handoff with that session's whole prompt instead of printing one. To delegate \
 parallel work to a new agent session, call mcp__flywheel__start_session (handoff stays for \
-continuing your own work); to retire one, call mcp__flywheel__end_session or \
+continuing your own work); to wait on the sessions you started, call mcp__flywheel__watch once \
+(for example filter \"children state=done|blocked|failed\") and end your turn instead of polling \
+session_status; to retire one, call mcp__flywheel__end_session or \
 mcp__flywheel__replace_session, never a shell kill. Do not mention these tools or the board in \
 your replies.";
 
@@ -496,6 +506,53 @@ fn label_tool() -> Value {
     })
 }
 
+fn watch_tool() -> Value {
+    json!({
+        "name": WATCH_TOOL,
+        "title": "Watch for events",
+        "description": "Get woken when something happens instead of polling: when an event on \
+                        this hub matches filter, prompt arrives as your next prompt (queued, \
+                        delivered once your turn is over), followed by the matching events and \
+                        their cursors; events within window_secs, and any while that prompt \
+                        waits, arrive together in it. filter: space-separated terms, all of \
+                        which must hold: children (sessions you started), session=NAME, \
+                        state=done|blocked|failed|asking (a session moving there), \
+                        kind=review|pr|queue (event kinds or families), or labels (team=web). \
+                        Example: \"children state=done|blocked|failed\". Your own events never \
+                        match. A watch lasts until unwatch or until you end.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filter": { "type": "string", "description": "What to watch for (see above)." },
+                "prompt": { "type": "string", "description": "What to tell yourself when it fires: what to do next." },
+                "window_secs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 3600,
+                    "description": "Optional: gather matches this long before waking you. Default 3."
+                }
+            },
+            "required": ["filter", "prompt"]
+        }
+    })
+}
+
+fn unwatch_tool() -> Value {
+    json!({
+        "name": UNWATCH_TOOL,
+        "title": "Stop watching",
+        "description": "Disarm one of your watches (its id, from watch) or all of yours (\"all\"). \
+                        A prompt it already queued for you stays queued.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "The watch's id, or all." }
+            },
+            "required": ["id"]
+        }
+    })
+}
+
 /// The `label` tool's arguments as a change and its condition.
 fn label_args(
     args: &Value,
@@ -573,6 +630,8 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                 cancel_tool(),
                 give_tool(),
                 label_tool(),
+                watch_tool(),
+                unwatch_tool(),
             ] })),
         "tools/call" => {
             let name = params.get("name").and_then(Value::as_str);
@@ -701,6 +760,20 @@ pub fn answer(message: &Value, host: &dyn Host) -> Option<Value> {
                         Ok(said) => text_result(said, false),
                         Err(why) => text_result(format!("Not labelled: {why}"), true),
                     },
+                })
+            } else if name == Some(WATCH_TOOL) {
+                let window = args
+                    .get("window_secs")
+                    .and_then(Value::as_u64)
+                    .map(|w| u32::try_from(w).unwrap_or(u32::MAX));
+                Ok(match host.watch(arg("filter"), arg("prompt"), window) {
+                    Ok(said) => text_result(said, false),
+                    Err(why) => text_result(format!("Not watching: {why}"), true),
+                })
+            } else if name == Some(UNWATCH_TOOL) {
+                Ok(match host.unwatch(arg("id")) {
+                    Ok(said) => text_result(said, false),
+                    Err(why) => text_result(format!("Not removed: {why}"), true),
                 })
             } else if name == Some(GIVE_TOOL) {
                 Ok(match host.give_session(arg("to"), arg("owner")) {
@@ -831,6 +904,17 @@ mod tests {
             cond: Option<&crate::labels::Cond>,
         ) -> Result<String, String> {
             Ok(format!("{to:?} {change:?} {cond:?}"))
+        }
+        fn watch(
+            &self,
+            filter: &str,
+            prompt: &str,
+            window_secs: Option<u32>,
+        ) -> Result<String, String> {
+            Ok(format!("{filter} / {prompt} / {window_secs:?}"))
+        }
+        fn unwatch(&self, id: &str) -> Result<String, String> {
+            Ok(format!("unwatched {id}"))
         }
         fn handoff(
             &self,
@@ -1026,7 +1110,9 @@ mod tests {
                 QUEUED_TOOL,
                 CANCEL_TOOL,
                 GIVE_TOOL,
-                LABEL_TOOL
+                LABEL_TOOL,
+                WATCH_TOOL,
+                UNWATCH_TOOL
             ]
         );
         let asked = answer(&json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",

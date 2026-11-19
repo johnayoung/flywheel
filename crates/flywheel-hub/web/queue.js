@@ -346,6 +346,44 @@ window.FwHubQueue = function (ctx) {
     );
   }
 
+  // A stored watch filter as the words that make it (eventlog.rs).
+  function filterText(f) {
+    const words = [];
+    const field = (name, values) => values && values.length && words.push(`${name}=${values.join("|")}`);
+    field("session", (f.sessions || []).map((id) => (sessionById(id) || { name: id.slice(0, 8) }).name));
+    field("ws", f.workspaces);
+    if (f.children !== undefined && f.children !== null) {
+      words.push(f.children === ui.id ? "children" : `children=${(sessionById(f.children) || { name: f.children.slice(0, 8) }).name}`);
+    }
+    field("state", f.states);
+    field("kind", f.kinds);
+    for (const t of f.labels || []) words.push(t.values && t.values.length ? `${t.key}=${t.values.join("|")}` : t.key);
+    return words.join(" ");
+  }
+
+  // The watches that queue prompts here, each with its filter, how often
+  // it fired, and a way to disarm it.
+  function renderWatches(view) {
+    const watches = (view && view.watches) || [];
+    $("#q-watches").hidden = !watches.length;
+    $("#q-watch-list").replaceChildren(...watches.map((w) => el(
+      "li",
+      { className: "q-watch", dataset: { id: w.id }, title: w.prompt },
+      el("span", { className: "q-watch-filter", textContent: filterText(w.filter) }),
+      el("span", {
+        className: "q-watch-n",
+        textContent: `${w.fired} fired \u00b7 ${w.events} event${w.events === 1 ? "" : "s"}${w.last_fired ? ` \u00b7 ${age(w.last_fired)} ago` : ""}`,
+      }),
+      el("button", {
+        type: "button",
+        className: "icon",
+        title: "Stop watching (a prompt it queued stays)",
+        "aria-label": "Stop watching",
+        onclick: () => act(() => api("DELETE", `/api/watches/${w.id}`), "Not removed").then(load),
+      }, icon("x")),
+    )));
+  }
+
   function renderDrawer() {
     if (!ui.id) {
       drawer.hidden = true;
@@ -369,6 +407,7 @@ window.FwHubQueue = function (ctx) {
       return;
     }
     $("#q-why").replaceChildren(...statusLine(view));
+    renderWatches(view);
     const waiting = view.items.filter((i) => i.state !== "delivered");
     const delivered = view.items.filter((i) => i.state === "delivered").reverse();
     // The item being edited went (sent before the edit was saved, or

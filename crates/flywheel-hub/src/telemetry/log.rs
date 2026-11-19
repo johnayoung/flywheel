@@ -21,6 +21,7 @@ use super::store::{Store, StoreError};
 use crate::labels::Term;
 use rusqlite::params;
 use serde::Serialize;
+use serde_json::Value;
 
 /// Most rows one read returns.
 pub const PAGE_MAX: usize = 1000;
@@ -337,14 +338,19 @@ impl LabelCache {
             let labels = store.labels(&row.host, &row.session)?;
             self.labels.insert(key.clone(), labels);
         }
-        let now = &self.labels[&key];
+        Ok(Self::holds_with(row, terms, &self.labels[&key]))
+    }
+
+    /// Whether `terms` hold for a session whose labels are `now`, or (a
+    /// label change) held on either side of `row`.
+    fn holds_with(row: &LogRow, terms: &[Term], now: &crate::labels::Labels) -> bool {
         if crate::labels::matches(terms, now, None) {
-            return Ok(true);
+            return true;
         }
         let Some(What::LabelsChanged { set, before }) =
             What::from_stored(&row.kind, row.body.clone())
         else {
-            return Ok(false);
+            return false;
         };
         let side = |change: &crate::labels::Change| {
             let mut labels = now.clone();
@@ -356,7 +362,68 @@ impl LabelCache {
             }
             crate::labels::matches(terms, &labels, None)
         };
-        Ok(side(&set) || side(&before))
+        side(&set) || side(&before)
+    }
+}
+
+impl LogQuery {
+    /// Whether `row` matches, its session's labels being `labels` now
+    /// (what [`Store::log`] selects, for one row in memory).
+    pub fn matches(&self, row: &LogRow, labels: &crate::labels::Labels) -> bool {
+        let (states, terms) = split_terms(&self.states, &self.labels);
+        if (!self.sessions.is_empty() && !self.sessions.contains(&row.session))
+            || self.not_sessions.contains(&row.session)
+            || self.host.as_ref().is_some_and(|h| *h != row.host)
+            || !kind_matches(&self.kinds, &row.kind)
+        {
+            return false;
+        }
+        if !states.is_empty() && !row.state.as_ref().is_some_and(|s| states.contains(s)) {
+            return false;
+        }
+        terms.is_empty() || LabelCache::holds_with(row, &terms, labels)
+    }
+}
+
+/// A value in a word: a string as is, `-` for null, `..` for nesting.
+fn scalar(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => "-".to_owned(),
+        Value::Number(_) | Value::Bool(_) => value.to_string(),
+        _ => "..".to_owned(),
+    }
+}
+
+/// A body in one short line: its plain fields, the session object left
+/// out (the line names it).
+pub fn summary(body: &Value) -> String {
+    let Some(map) = body.as_object() else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for (key, value) in map {
+        if key == "session" {
+            continue;
+        }
+        let shown = match value {
+            Value::Null => continue,
+            Value::Object(map) => format!(
+                "{{{}}}",
+                map.iter()
+                    .map(|(k, v)| format!("{k}={}", scalar(v)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            other => scalar(other),
+        };
+        parts.push(format!("{key}={shown}"));
+    }
+    let line = crate::commands_cli::visible_controls(&parts.join(" "));
+    if line.chars().count() > 120 {
+        format!("{}...", line.chars().take(117).collect::<String>())
+    } else {
+        line
     }
 }
 

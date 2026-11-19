@@ -150,6 +150,9 @@ fw hub queue clear SESSION [--all] [--json] {where}
 fw hub queue move SESSION ITEM POS [--json] {where}
 fw hub queue pause SESSION [--json] {where}
 fw hub queue resume SESSION [--json] {where}
+fw hub watch add SESSION --on FILTER --prompt TEXT|- [--window SECS] [--after CURSOR] [--json] {where}
+fw hub watch ls [SESSION] [--json] {where}
+fw hub watch rm WATCH [--json] {where}  # a prompt it queued stays
 fw hub broadcast [TARGET]... TEXT|- [--label K[=V]]... [--header] [--json] {where}  # exit 1: any refused
 ```
 

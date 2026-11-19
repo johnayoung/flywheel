@@ -261,6 +261,7 @@ impl Hub {
             items,
             waiting,
             typing_quiet_secs: self.tunables().queue_typing_quiet.as_secs(),
+            watches: self.watches(Some(&record.id)),
         })
     }
 
@@ -306,6 +307,7 @@ impl Hub {
             blocked_at: None,
             from: from.map(str::to_owned),
             priority,
+            watch: None,
             state: ItemState::Pending,
         };
         let added = new.clone();
@@ -595,6 +597,7 @@ impl Hub {
             blocked_at: None,
             from: from.map(str::to_owned),
             priority,
+            watch: None,
             state: ItemState::Pending,
         });
         let facts = self.queue_facts(&record, &alone);

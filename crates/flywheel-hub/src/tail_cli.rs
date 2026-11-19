@@ -157,53 +157,11 @@ fn print_events(out: &mut dyn Write, page: &Value) {
             out,
             "{when}  {who}  {}{moved}  {}",
             str_field(event, "kind"),
-            what(&event["body"])
+            crate::telemetry::log::summary(&event["body"])
         );
-    }
-}
-
-/// A value in a word: a string as is, `-` for null, `..` for nesting.
-fn scalar(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        Value::Null => "-".to_owned(),
-        Value::Number(_) | Value::Bool(_) => value.to_string(),
-        _ => "..".to_owned(),
     }
 }
 
 fn short(id: &str) -> String {
     id.chars().take(8).collect()
-}
-
-/// A body in one short line: its plain fields, the session object left
-/// out (the line names it).
-fn what(body: &Value) -> String {
-    let Some(map) = body.as_object() else {
-        return String::new();
-    };
-    let mut parts = Vec::new();
-    for (key, value) in map {
-        if key == "session" {
-            continue;
-        }
-        let shown = match value {
-            Value::Null => continue,
-            Value::Object(map) => format!(
-                "{{{}}}",
-                map.iter()
-                    .map(|(k, v)| format!("{k}={}", scalar(v)))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ),
-            other => scalar(other),
-        };
-        parts.push(format!("{key}={shown}"));
-    }
-    let line = crate::commands_cli::visible_controls(&parts.join(" "));
-    if line.chars().count() > 120 {
-        format!("{}...", line.chars().take(117).collect::<String>())
-    } else {
-        line
-    }
 }

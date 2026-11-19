@@ -99,6 +99,8 @@ pub mod vt;
 pub mod wait;
 /// Waking a thread blocked in `poll` (no timeout fallback).
 mod wake;
+pub mod watch;
+mod watch_cli;
 pub mod web;
 
 /// `docs/hub/*.md` checked against the CLI, hub.toml, keymap, and routes.

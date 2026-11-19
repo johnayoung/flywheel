@@ -17,6 +17,7 @@ fn item(id: &str, when: When) -> QueueItem {
         blocked_at: None,
         from: None,
         priority: false,
+        watch: None,
         state: ItemState::Pending,
     }
 }
@@ -438,6 +439,7 @@ fn a_priority_item_goes_behind_earlier_priority_items_and_never_ahead_of_one_bei
     q.items[2].blocked_at = Some(at(2));
     let urgent = |id: &str| QueueItem {
         priority: true,
+        watch: None,
         from: Some("lead".into()),
         ..item(id, When::Done)
     };

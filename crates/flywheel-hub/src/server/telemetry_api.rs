@@ -318,6 +318,23 @@ impl mcp::Host for AgentHost {
             .map_err(|e| e.to_string())
     }
 
+    fn watch(
+        &self,
+        filter: &str,
+        prompt: &str,
+        window_secs: Option<u32>,
+    ) -> Result<String, String> {
+        self.hub
+            .agent_watch(&self.session, filter, prompt, window_secs)
+            .map_err(|e| e.to_string())
+    }
+
+    fn unwatch(&self, id: &str) -> Result<String, String> {
+        self.hub
+            .agent_unwatch(&self.session, id)
+            .map_err(|e| e.to_string())
+    }
+
     fn handoff(
         &self,
         prompt: &str,

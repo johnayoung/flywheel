@@ -151,6 +151,22 @@
 .q-actions .icon { width: 1.7rem; height: 1.7rem; font: 600 13px var(--mono); }
 .q-actions .icon:disabled { opacity: .3; }
 
+/* Watches that queue prompts here (watch.rs): filter, how often fired. */
+.q-watches { margin: 0 1rem .6rem; border-top: 1px solid var(--rule-2); }
+.q-watches-head { margin: 0; padding: .5rem 0 .2rem; color: var(--ink-3); font-size: 10px; font-weight: 400; letter-spacing: .12em; text-transform: uppercase; }
+.q-watch {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: baseline;
+  gap: .5rem;
+  padding: .3rem 0;
+  border-bottom: 1px dotted var(--rule-2);
+  font-size: 11.5px;
+}
+.q-watch-filter { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--term); color: var(--ink); }
+.q-watch-n { color: var(--ink-3); font-size: 10.5px; white-space: nowrap; }
+.q-watch .icon { width: 1.6rem; height: 1.6rem; }
+
 .q-sent { margin: 0 1rem .6rem; border-top: 1px solid var(--rule-2); }
 .q-sent summary { padding: .5rem 0; cursor: pointer; color: var(--ink-3); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; }
 .q-history { padding: 0 0 .4rem; max-height: 14rem; overflow-y: auto; }

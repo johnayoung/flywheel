@@ -99,6 +99,7 @@ mod telemetry_api;
 mod templates_api;
 mod terminal_ws;
 mod tls_listen;
+mod watches_api;
 mod workspaces_api;
 mod worktree_api;
 
@@ -298,6 +299,14 @@ pub fn router(hub: Arc<Hub>, options: ServerOptions, shutdown: watch::Receiver<b
         )
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/log", get(log_api::read_log))
+        .route(
+            "/api/watches",
+            get(watches_api::list_watches).post(watches_api::add_watch),
+        )
+        .route(
+            "/api/watches/{id}",
+            axum::routing::delete(watches_api::remove_watch),
+        )
         .route(
             "/api/sessions/{id}",
             get(get_session)

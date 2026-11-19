@@ -840,6 +840,30 @@ try {
   check(!back.some((g) => g.startsWith("team=")), `labels: the chip puts the list back by activity (${JSON.stringify(back)})`);
   await lab.close();
 
+  // --- watches: the Queue drawer lists what wakes the agent -----------------
+  const armed = await api("POST", "/api/watches", { owner: agent.id, filter: "state=done|blocked team=web", prompt: "check" });
+  const wa = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const wp = await wa.newPage();
+  await wp.goto(`${base}/login?token=${token}#session=${agent.id}`);
+  await wp.waitForSelector("#terminal .pane .xterm", { timeout: 15000 });
+  await wp.evaluate(() => promptQueue.open(state.attached));
+  await wp.waitForSelector("#q-watches:not([hidden]) .q-watch", { timeout: 5000 });
+  const watchRow = await wp.evaluate(() => {
+    const row = document.querySelector(".q-watch");
+    const drawer = document.querySelector("#queue").getBoundingClientRect();
+    const r = row.getBoundingClientRect();
+    return { text: row.querySelector(".q-watch-filter").textContent, n: row.querySelector(".q-watch-n").textContent, fits: r.left >= drawer.left && r.right <= drawer.right + 1 };
+  });
+  check(watchRow.text === "state=done|blocked team=web" && watchRow.n.startsWith("0 fired") && watchRow.fits,
+    `watches: the Queue drawer lists an armed watch with its filter and count, within the drawer (${JSON.stringify(watchRow)})`);
+  await wp.screenshot({ path: path.join(out, "desktop-queue-watch.png") });
+  await wp.click(".q-watch [aria-label='Stop watching']");
+  await wp.waitForSelector("#q-watches[hidden]", { state: "attached", timeout: 5000 }).catch(() => {});
+  const left = (await api("GET", `/api/watches?session=${agent.id}`)).watches.length;
+  const sectionGone = await wp.evaluate(() => document.querySelector("#q-watches").hidden);
+  check(left === 0 && sectionGone && armed.id, `watches: Stop watching disarms it and the section goes (${left} left, hidden ${sectionGone})`);
+  await wa.close();
+
   // --- phone 390x844 ------------------------------------------------------
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
   const mp = await phone.newPage();

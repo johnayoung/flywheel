@@ -785,6 +785,7 @@ impl Hub {
                         blocked_at: None,
                         from: Some(by_id),
                         priority: true,
+                        watch: None,
                         state: ItemState::Pending,
                     };
                     let id = item.id.clone();
@@ -2001,6 +2002,7 @@ mod tests {
             blocked_at: None,
             from: Some("lead".into()),
             priority: false,
+            watch: None,
             state: ItemState::Pending,
         };
         assert_eq!(preview(&item), "stop the build");

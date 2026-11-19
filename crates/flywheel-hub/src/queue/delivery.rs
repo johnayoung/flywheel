@@ -22,6 +22,7 @@ impl Hub {
             return;
         }
         self.reconcile_queues();
+        self.start_watches();
         let weak = Arc::downgrade(self);
         let wakeup = Arc::clone(&self.queue_runtime().wakeup);
         let spawned = std::thread::Builder::new()

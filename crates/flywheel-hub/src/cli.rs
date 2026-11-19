@@ -212,6 +212,10 @@ enum HubCommand {
     /// and removed; --if VALUE / --if-unset change only when the key holds
     /// that value / none (exit 1 otherwise). fw.* keys are the hub's.
     Label(crate::label_cli::LabelArgs),
+    /// Watches: when an event in the hub's log matches a filter (`children
+    /// state=done|blocked|failed`), a prompt is queued into an agent
+    /// session (bursts coalesced into one): add, ls, rm.
+    Watch(crate::watch_cli::WatchArgs),
     /// A session's pull request: state, review decision, mergeability,
     /// and CI checks (from gh, cached by the hub); log prints a failing
     /// check's log, fix-ci asks the agent to fix it (queued while it
@@ -828,6 +832,7 @@ fn dispatch_verb(
         HubCommand::Queue(args) => crate::queue_cli::main(&args, out, err),
         HubCommand::Broadcast(args) => crate::broadcast_cli::broadcast(&args, out, err),
         HubCommand::Label(args) => crate::label_cli::label(&args, out, err),
+        HubCommand::Watch(args) => crate::watch_cli::main(&args, out, err),
         HubCommand::Pr(args) => crate::pr_cli::main(&args, out, err),
         HubCommand::Autopilot(args) => crate::autopilot_cli::main(&args, out, err),
     }

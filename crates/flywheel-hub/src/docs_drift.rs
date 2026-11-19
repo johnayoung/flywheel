@@ -676,8 +676,10 @@ const PAGES: [(&str, &str); 6] = [
 /// (two verb flags, a key, a session field, an event kind), after
 /// condensing the PR and digest sections by 0.5 KB. Raised to 95 KiB for
 /// labels and the event log (three verbs, two routes, a filter syntax,
-/// socket resume), after condensing api.md's sessions and plugin rows.
-const HUB_DOCS_MAX_BYTES: usize = 95 * 1024;
+/// socket resume), after condensing api.md's sessions and plugin rows;
+/// to 96 KiB for watches (a verb with three actions, two routes, two
+/// agent tools).
+const HUB_DOCS_MAX_BYTES: usize = 96 * 1024;
 /// One reference page's budget. Raised from 25 KiB to 26 for asks,
 /// handoffs, and session links (a route, two event kinds, the snapshot's
 /// `ask` and `links`): api.md was condensed first and still 80 bytes over.

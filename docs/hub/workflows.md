@@ -164,7 +164,7 @@ What happened, newest first: palette **Activity**, the header pill, `fw hub acti
 
 ## Fleet and work
 
-Each session's turns, calls, subagents, plan, waits, context, cost, and rate limits are recorded (`telemetry.db`, 30 days) and folded into what it is doing now.
+Each session's turns, calls, subagents, plan, waits, context, cost, and rate limits are recorded (`telemetry.db`, 30 days; a session labelled `eval=RUN` is kept) and folded into what it is doing now.
 
 - **Fleet** (`fw hub fleet [--lanes]`): lanes (needs you, moving, waiting, finished, idle), list, **Insights**.
 - **Needs you** (sidebar, `fw hub inbox`, `fw hub holds`): blocked, then `asking` (a closing question or an `ask_operator` ask), answered in the row. Holds: kind (`needs_input` `awaiting_approval` `permission` `gate`) + cause; alike ones fold into one row, answered at once. Answers kept: `fw hub decisions`.

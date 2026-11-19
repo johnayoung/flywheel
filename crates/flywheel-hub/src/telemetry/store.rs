@@ -711,9 +711,33 @@ impl Store {
     /// Forget events and sessions with nothing since `before` (unix ms).
     pub fn prune(&mut self, before: i64) -> Result<usize, StoreError> {
         let tx = self.conn.transaction()?;
-        let events = tx.execute("DELETE FROM events WHERE ts < ?1", params![before])?;
-        tx.execute("DELETE FROM sessions WHERE last_ts < ?1", params![before])?;
-        tx.execute("DELETE FROM tool_use WHERE last_ts < ?1", params![before])?;
+        // A session labelled `eval` (an eval run's trial) is kept past the
+        // window: its trace is the eval's evidence.
+        let pinned = |table: &str| {
+            format!(
+                "NOT EXISTS (SELECT 1 FROM session_labels p WHERE p.key = '{key}'
+                     AND p.host = {table}.host AND p.session = {table}.session)",
+                key = crate::labels::EVAL
+            )
+        };
+        let events = tx.execute(
+            &format!("DELETE FROM events WHERE ts < ?1 AND {}", pinned("events")),
+            params![before],
+        )?;
+        tx.execute(
+            &format!(
+                "DELETE FROM sessions WHERE last_ts < ?1 AND {}",
+                pinned("sessions")
+            ),
+            params![before],
+        )?;
+        tx.execute(
+            &format!(
+                "DELETE FROM tool_use WHERE last_ts < ?1 AND {}",
+                pinned("tool_use")
+            ),
+            params![before],
+        )?;
         tx.execute(
             "DELETE FROM session_labels WHERE NOT EXISTS (SELECT 1 FROM events e
                  WHERE e.host = session_labels.host AND e.session = session_labels.session)",

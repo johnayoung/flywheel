@@ -2300,3 +2300,35 @@ fn what_refines_a_shown_state_is_read_back_after_a_restart() {
     assert_eq!(got.len(), 1);
     assert_eq!((got["s"].0, got["s"].2), ("asking", false));
 }
+
+#[test]
+fn an_eval_labelled_session_outlives_the_retention_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = now_ms() - (super::RETENTION_DAYS + 5) * 24 * 3600 * 1000;
+    {
+        let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+        for (session, labels) in [
+            ("trial", vec![("eval", Some("nf-1"))]),
+            ("other", vec![("team", Some("web"))]),
+        ] {
+            telemetry.record(session, vec![labels_changed(&labels, old)]);
+            telemetry.record(
+                session,
+                claude::hook("UserPromptSubmit", &json!({"prompt": "go"}), old + 1),
+            );
+        }
+        telemetry.flush();
+    }
+    // Reopening prunes what is older than the window.
+    let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
+    assert_eq!(
+        telemetry.events(None, "trial", 0, 10, false).unwrap().len(),
+        2
+    );
+    assert!(
+        telemetry
+            .events(None, "other", 0, 10, false)
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -12,6 +12,8 @@
 //!   also a label change.
 //! * A set may be conditional ([`Cond`]): only if the key now holds a
 //!   value, or holds none (a claim: the first `--if-unset` wins).
+//! * A session labelled [`EVAL`] (`eval=<run>`, an eval trial) is exempt
+//!   from telemetry pruning: its trace outlives the retention window.
 //! * Every change is recorded in the session's telemetry log
 //!   (`labels.changed`), so a collector's fleet and the event log filter
 //!   by labels too.
@@ -22,6 +24,10 @@ use std::collections::BTreeMap;
 pub type Labels = BTreeMap<String, String>;
 /// A change: each key to its new value, or `None` to unset it.
 pub type Change = BTreeMap<String, Option<String>>;
+
+/// The label that pins a session's telemetry past the retention window
+/// (`eval=<run>`): an eval trial's trace is its evidence.
+pub const EVAL: &str = "eval";
 
 /// Most labels on one session.
 pub const MAX_LABELS: usize = 32;

@@ -1,0 +1,427 @@
+{
+ "source": "tmp/noise-floor/results.json (2026-11-20 noise-floor experiment, 30 trials)",
+ "expected": {
+  "cost_cv_mean_within_task": 0.103,
+  "mde_cost_pct_k3": 7.5,
+  "continuous": {
+   "cost_usd": {
+    "cv_mean_within_task": 0.103,
+    "cv_max_within_task": 0.193,
+    "mde_pct_k1": 12.9,
+    "mde_pct_k3": 7.5
+   },
+   "turns": {
+    "cv_mean_within_task": 0.129,
+    "cv_max_within_task": 0.347,
+    "mde_pct_k1": 16.1,
+    "mde_pct_k3": 9.3
+   },
+   "agent_seconds": {
+    "cv_mean_within_task": 0.339,
+    "cv_max_within_task": 0.801,
+    "mde_pct_k1": 42.5,
+    "mde_pct_k3": 24.5
+   },
+   "wall_seconds": {
+    "cv_mean_within_task": 0.278,
+    "cv_max_within_task": 0.53,
+    "mde_pct_k1": 34.9,
+    "mde_pct_k3": 20.1
+   },
+   "output_tokens": {
+    "cv_mean_within_task": 0.368,
+    "cv_max_within_task": 1.487,
+    "mde_pct_k1": 46.1,
+    "mde_pct_k3": 26.6
+   }
+  },
+  "cost_per_success": 2.25,
+  "total_cost_usd": 67.46,
+  "trials": 30,
+  "tasks": 10,
+  "per_task": {
+   "account-pause-store": {
+    "cost_per_success": 3.7,
+    "successes": 3,
+    "n": 3
+   },
+   "drawer-account-pauses": {
+    "cost_per_success": 1.55,
+    "successes": 3,
+    "n": 3
+   },
+   "hub-worker-account": {
+    "cost_per_success": 1.59,
+    "successes": 3,
+    "n": 3
+   },
+   "pauses-status-console": {
+    "cost_per_success": 1.69,
+    "successes": 3,
+    "n": 3
+   },
+   "pauses-verb": {
+    "cost_per_success": 2.5,
+    "successes": 3,
+    "n": 3
+   },
+   "reland-board-action": {
+    "cost_per_success": 1.24,
+    "successes": 3,
+    "n": 3
+   },
+   "reland-verb": {
+    "cost_per_success": 3.64,
+    "successes": 3,
+    "n": 3
+   },
+   "unlanded-prereq-hold": {
+    "cost_per_success": 2.92,
+    "successes": 3,
+    "n": 3
+   },
+   "unlanded-prereq-surfaces": {
+    "cost_per_success": 2.02,
+    "successes": 3,
+    "n": 3
+   },
+   "worker-account-pauses": {
+    "cost_per_success": 1.64,
+    "successes": 3,
+    "n": 3
+   }
+  }
+ },
+ "trials": [
+  {
+   "trial": "account-pause-store-t1",
+   "task": "account-pause-store",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 4.0978,
+   "turns": 81,
+   "agent_seconds": 3299,
+   "wall_seconds": 3823,
+   "output_tokens": 1998
+  },
+  {
+   "trial": "account-pause-store-t2",
+   "task": "account-pause-store",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 2.8781,
+   "turns": 42,
+   "agent_seconds": 825,
+   "wall_seconds": 1440,
+   "output_tokens": 45525
+  },
+  {
+   "trial": "account-pause-store-t3",
+   "task": "account-pause-store",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 4.1366,
+   "turns": 52,
+   "agent_seconds": 2174,
+   "wall_seconds": 2692,
+   "output_tokens": 2737
+  },
+  {
+   "trial": "drawer-account-pauses-t1",
+   "task": "drawer-account-pauses",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 1.674,
+   "turns": 31,
+   "agent_seconds": 311,
+   "wall_seconds": 601,
+   "output_tokens": 21772
+  },
+  {
+   "trial": "drawer-account-pauses-t2",
+   "task": "drawer-account-pauses",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 1.6762,
+   "turns": 37,
+   "agent_seconds": 451,
+   "wall_seconds": 880,
+   "output_tokens": 17663
+  },
+  {
+   "trial": "drawer-account-pauses-t3",
+   "task": "drawer-account-pauses",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 1.2975,
+   "turns": 27,
+   "agent_seconds": 215,
+   "wall_seconds": 582,
+   "output_tokens": 15213
+  },
+  {
+   "trial": "hub-worker-account-t1",
+   "task": "hub-worker-account",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 1.6143,
+   "turns": 34,
+   "agent_seconds": 373,
+   "wall_seconds": 874,
+   "output_tokens": 20007
+  },
+  {
+   "trial": "hub-worker-account-t2",
+   "task": "hub-worker-account",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 1.4955,
+   "turns": 34,
+   "agent_seconds": 808,
+   "wall_seconds": 1191,
+   "output_tokens": 18586
+  },
+  {
+   "trial": "hub-worker-account-t3",
+   "task": "hub-worker-account",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 1.6645,
+   "turns": 27,
+   "agent_seconds": 403,
+   "wall_seconds": 899,
+   "output_tokens": 19931
+  },
+  {
+   "trial": "pauses-status-console-t1",
+   "task": "pauses-status-console",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 1.6862,
+   "turns": 36,
+   "agent_seconds": 308,
+   "wall_seconds": 1961,
+   "output_tokens": 16742
+  },
+  {
+   "trial": "pauses-status-console-t2",
+   "task": "pauses-status-console",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 1.7742,
+   "turns": 37,
+   "agent_seconds": 348,
+   "wall_seconds": 1078,
+   "output_tokens": 20129
+  },
+  {
+   "trial": "pauses-status-console-t3",
+   "task": "pauses-status-console",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 1.6157,
+   "turns": 36,
+   "agent_seconds": 289,
+   "wall_seconds": 922,
+   "output_tokens": 18077
+  },
+  {
+   "trial": "pauses-verb-t1",
+   "task": "pauses-verb",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 2.3992,
+   "turns": 36,
+   "agent_seconds": 531,
+   "wall_seconds": 1281,
+   "output_tokens": 31990
+  },
+  {
+   "trial": "pauses-verb-t2",
+   "task": "pauses-verb",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 2.5191,
+   "turns": 35,
+   "agent_seconds": 495,
+   "wall_seconds": 1121,
+   "output_tokens": 32450
+  },
+  {
+   "trial": "pauses-verb-t3",
+   "task": "pauses-verb",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 2.5703,
+   "turns": 35,
+   "agent_seconds": 448,
+   "wall_seconds": 1042,
+   "output_tokens": 30439
+  },
+  {
+   "trial": "reland-board-action-t1",
+   "task": "reland-board-action",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 1.4752,
+   "turns": 30,
+   "agent_seconds": 296,
+   "wall_seconds": 1282,
+   "output_tokens": 16271
+  },
+  {
+   "trial": "reland-board-action-t2",
+   "task": "reland-board-action",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 1.0551,
+   "turns": 22,
+   "agent_seconds": 221,
+   "wall_seconds": 867,
+   "output_tokens": 10600
+  },
+  {
+   "trial": "reland-board-action-t3",
+   "task": "reland-board-action",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 1.176,
+   "turns": 21,
+   "agent_seconds": 223,
+   "wall_seconds": 931,
+   "output_tokens": 12401
+  },
+  {
+   "trial": "reland-verb-t1",
+   "task": "reland-verb",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 4.2743,
+   "turns": 72,
+   "agent_seconds": 1912,
+   "wall_seconds": 2453,
+   "output_tokens": 3327
+  },
+  {
+   "trial": "reland-verb-t2",
+   "task": "reland-verb",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 3.2914,
+   "turns": 54,
+   "agent_seconds": 864,
+   "wall_seconds": 1354,
+   "output_tokens": 35389
+  },
+  {
+   "trial": "reland-verb-t3",
+   "task": "reland-verb",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 3.3539,
+   "turns": 55,
+   "agent_seconds": 798,
+   "wall_seconds": 1262,
+   "output_tokens": 34484
+  },
+  {
+   "trial": "unlanded-prereq-hold-t1",
+   "task": "unlanded-prereq-hold",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 2.8903,
+   "turns": 50,
+   "agent_seconds": 978,
+   "wall_seconds": 2331,
+   "output_tokens": 34158
+  },
+  {
+   "trial": "unlanded-prereq-hold-t2",
+   "task": "unlanded-prereq-hold",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 3.0282,
+   "turns": 47,
+   "agent_seconds": 941,
+   "wall_seconds": 1569,
+   "output_tokens": 36341
+  },
+  {
+   "trial": "unlanded-prereq-hold-t3",
+   "task": "unlanded-prereq-hold",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 2.8363,
+   "turns": 50,
+   "agent_seconds": 1430,
+   "wall_seconds": 1975,
+   "output_tokens": 33132
+  },
+  {
+   "trial": "unlanded-prereq-surfaces-t1",
+   "task": "unlanded-prereq-surfaces",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 1.856,
+   "turns": 33,
+   "agent_seconds": 953,
+   "wall_seconds": 1784,
+   "output_tokens": 21566
+  },
+  {
+   "trial": "unlanded-prereq-surfaces-t2",
+   "task": "unlanded-prereq-surfaces",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 1.7659,
+   "turns": 34,
+   "agent_seconds": 653,
+   "wall_seconds": 1198,
+   "output_tokens": 21683
+  },
+  {
+   "trial": "unlanded-prereq-surfaces-t3",
+   "task": "unlanded-prereq-surfaces",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 2.4401,
+   "turns": 44,
+   "agent_seconds": 2847,
+   "wall_seconds": 3368,
+   "output_tokens": 2084
+  },
+  {
+   "trial": "worker-account-pauses-t1",
+   "task": "worker-account-pauses",
+   "k": 1,
+   "oracle_pass": true,
+   "cost_usd": 1.6058,
+   "turns": 32,
+   "agent_seconds": 303,
+   "wall_seconds": 898,
+   "output_tokens": 17913
+  },
+  {
+   "trial": "worker-account-pauses-t2",
+   "task": "worker-account-pauses",
+   "k": 2,
+   "oracle_pass": true,
+   "cost_usd": 1.6648,
+   "turns": 31,
+   "agent_seconds": 327,
+   "wall_seconds": 837,
+   "output_tokens": 17775
+  },
+  {
+   "trial": "worker-account-pauses-t3",
+   "task": "worker-account-pauses",
+   "k": 3,
+   "oracle_pass": true,
+   "cost_usd": 1.6471,
+   "turns": 29,
+   "agent_seconds": 336,
+   "wall_seconds": 824,
+   "output_tokens": 20472
+  }
+ ]
+}

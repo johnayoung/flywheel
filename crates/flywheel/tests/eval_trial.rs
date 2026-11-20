@@ -258,3 +258,110 @@ fn an_agent_that_does_nothing_fails_the_oracle_it_is_not_an_error() {
     assert_eq!(outcome["status"], "done", "{outcome}");
     assert_eq!(outcome["oracle"], "fail", "{outcome}");
 }
+
+#[test]
+fn a_replay_pauses_at_its_budget_and_a_resume_finishes_every_cell() {
+    let w = world();
+    let variants = w.project.join("evals/variants");
+    let off = std::fs::read_to_string(variants.join("rule-off.toml")).unwrap();
+    std::fs::write(
+        variants.join("rule-on.toml"),
+        off.replace("op = \"strip\"", "op = \"ensure\"").replace(
+            "pattern = '(?m)^RULE: skip check\\.sh\\n'",
+            "pattern = '(?m)^RULE: skip check'\nfrom = \"rule.md\"",
+        ),
+    )
+    .unwrap();
+    std::fs::write(variants.join("rule.md"), "RULE: skip check.sh\n").unwrap();
+    let est = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "estimate",
+            "core",
+            "--variant",
+            "rule-on",
+            "--variant",
+            "rule-off",
+            "-k",
+            "2",
+        ],
+    ));
+    assert!(est.contains("4 trials: $9.00 expected"), "{est}");
+    let paused = fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "replay",
+            "core",
+            "--variant",
+            "rule-on",
+            "--variant",
+            "rule-off",
+            "-k",
+            "2",
+            "--parallel",
+            "2",
+            "--budget",
+            "1",
+            "--worker-timeout",
+            "120s",
+        ],
+    );
+    assert_eq!(
+        paused.status.code(),
+        Some(75),
+        "{}",
+        String::from_utf8_lossy(&paused.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&paused.stderr);
+    assert!(
+        stderr.contains("paused at the budget") && stderr.contains("--resume"),
+        "{stderr}"
+    );
+    let run_id = stderr
+        .split("--resume ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let done = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "replay", "--resume", &run_id, "--budget", "100"],
+    ));
+    assert!(done.contains(&format!("run {run_id} done")), "{done}");
+    let runs = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "runs", "--json"],
+    ));
+    let runs: serde_json::Value = serde_json::from_str(&runs).unwrap();
+    let run = &runs["runs"][0];
+    assert_eq!(
+        (run["done"].as_u64(), run["total"].as_u64()),
+        (Some(4), Some(4)),
+        "{run}"
+    );
+    assert_eq!(run["status"], "done");
+    let st = flywheel_eval::store::EvalStore::open_sqlite(
+        &w.project.join("flywheel.sqlite"),
+        &project_id_of(&w.project),
+    )
+    .unwrap();
+    for t in st.trials(&run_id).unwrap() {
+        assert_eq!(t.oracle.as_deref(), Some("pass"), "{t:?}");
+    }
+    assert!(
+        (run["spent_usd"].as_f64().unwrap() - 1.0).abs() < 1e-6,
+        "{run}"
+    );
+}

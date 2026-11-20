@@ -678,6 +678,15 @@ impl EvalStore {
         rows.iter().map(trial_of).collect()
     }
 
+    /// Every trial of every run in the partition (the estimator's history).
+    pub fn all_trials(&self) -> Result<Vec<TrialRow>, EvalStoreError> {
+        let rows = self.db().query(
+            &format!("SELECT {TRIAL_COLUMNS} FROM eval_trials WHERE project_id = ?1 ORDER BY run_id, ordinal"),
+            &[self.p()],
+        )?;
+        rows.iter().map(trial_of).collect()
+    }
+
     pub fn trial(&self, run_id: &str, trial_id: &str) -> Result<TrialRow, EvalStoreError> {
         let rows = self.db().query(
             &format!(

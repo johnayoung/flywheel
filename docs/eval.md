@@ -92,3 +92,19 @@ fw eval trial core@v1 TASK --variant rule-off    # one trial, recorded as a one-
 ```
 
 Artifacts in each trial dir: `worker.log`, `attempts.json`, `transcripts/`, `overlay.json`, `final.diff`, `oracle.log`, `checks.json`, `trial.json`, `claude-projects/`.
+
+## Replays
+
+```bash
+fw eval estimate core@v1 --variant rule-on --variant rule-off -k 3      # $ mean/P90, wall hours, smallest detectable difference
+fw eval replay core@v1 --variant rule-on --variant rule-off -k 3 --budget 160 [--parallel 3] [--primary success,cost] [--hub-state-dir DIR]
+fw eval replay --resume RUN [--budget USD]                              # after a budget pause (exit 75)
+fw eval runs [--json]
+```
+
+- **Order:** tasks in a seeded order; for each task, k rounds; in each round, every variant. A run that stops early is still paired.
+- **Parallelism:** `--parallel` runners claim cells with a lease, and each cell runs as its own `fw eval trial --plan` process.
+- **Lone oracles:** a task whose oracle fails beside `fw` processes (V5) runs with no other cell in flight.
+- **Budget:** a cell starts only if spent + in-flight priors + its prior stays within the cap. Running trials are never cut. The default cap is P90 x 1.1, and an explicit `--budget` is required above $50.
+- **Priors:** the median cost of this task under this variant, else the median under any variant, else the original run's cost, else the set median.
+- **Errors and hub:** machinery errors are retried once. With `--hub-state-dir`, the hub's capture hooks label every trial `fw.eval=<run>`, and each cell holds the shared lease `eval:<run>`.

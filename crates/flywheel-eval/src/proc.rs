@@ -41,7 +41,7 @@ impl Ran {
 
 /// The turn-taking a command runs under.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "with", rename_all = "snake_case")]
 pub enum Locking {
     /// Run as is.
     #[default]

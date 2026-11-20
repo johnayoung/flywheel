@@ -12,6 +12,7 @@ pub mod config_verbs;
 pub mod dashboard;
 pub mod db_verbs;
 pub mod docs;
+pub mod eval_replay;
 pub mod eval_verbs;
 pub mod exec;
 pub mod history_screen;

@@ -43,15 +43,27 @@ enum EvalCommand {
     /// Run one trial: TASK of a frozen SET under --variant, recorded as a
     /// one-cell run (prints the trial's row as JSON last).
     Trial(TrialArgs),
+    /// What a replay would cost and how small a difference it could show.
+    Estimate(crate::eval_replay::EstimateArgs),
+    /// Replay SET under every --variant, k times each (or --resume RUN).
+    Replay(crate::eval_replay::ReplayArgs),
+    /// Every run: set, variants, progress, spend.
+    Runs(JsonArg),
 }
 
 #[derive(Debug, Args)]
 struct TrialArgs {
     /// NAME@vN (or NAME: its latest version).
-    set: String,
-    task: String,
-    #[arg(long, value_name = "NAME")]
-    variant: String,
+    #[arg(required_unless_present = "plan")]
+    set: Option<String>,
+    #[arg(required_unless_present = "plan")]
+    task: Option<String>,
+    #[arg(long, value_name = "NAME", required_unless_present = "plan")]
+    variant: Option<String>,
+    /// Run the trial a replay planned (its runner process); writes the
+    /// outcome beside the plan.
+    #[arg(long, value_name = "FILE", hide = true, conflicts_with_all = ["set", "task", "variant"])]
+    plan: Option<PathBuf>,
     /// The worker's wall-clock bound.
     #[arg(long, default_value = "2h", value_name = "SPAN")]
     worker_timeout: String,
@@ -110,10 +122,10 @@ enum SetCommand {
 }
 
 #[derive(Debug, Args)]
-struct JsonArg {
+pub(crate) struct JsonArg {
     /// Print JSON.
     #[arg(long)]
-    json: bool,
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -173,14 +185,14 @@ struct DiffArgs {
 }
 
 /// What every eval verb works on.
-struct Ctx {
-    project: Project,
-    policy: Option<WorkPolicy>,
-    evals: PathBuf,
+pub(crate) struct Ctx {
+    pub(crate) project: Project,
+    pub(crate) policy: Option<WorkPolicy>,
+    pub(crate) evals: PathBuf,
 }
 
 impl Ctx {
-    fn resolve() -> Result<Self, String> {
+    pub(crate) fn resolve() -> Result<Self, String> {
         let project = resolve_cwd_project().map_err(|e| e.to_string())?;
         let policy =
             load_effective_policy(Access::ReadOnly).map_err(|e| format!("policy error: {e}"))?;
@@ -192,12 +204,12 @@ impl Ctx {
         })
     }
 
-    fn repo(&self) -> &Path {
+    pub(crate) fn repo(&self) -> &Path {
         &self.project.meta.path
     }
 
     /// The eval tables of the project store.
-    fn store(&self) -> Result<EvalStore, String> {
+    pub(crate) fn store(&self) -> Result<EvalStore, String> {
         let partition = store_partition(self.policy.as_ref());
         let backend = self.policy.as_ref().map(|p| p.store_backend.as_str());
         if backend == Some("postgres") {
@@ -231,7 +243,7 @@ impl Ctx {
         crate::tui::open_store_bundle(self.policy.as_ref(), &db).map(|b| b.core)
     }
 
-    fn cache(&self) -> PathBuf {
+    pub(crate) fn cache(&self) -> PathBuf {
         self.evals.join("cache")
     }
 }
@@ -840,7 +852,7 @@ pub(crate) fn claude_dir() -> PathBuf {
 
 /// Prove the variant's Claude Code leaves out user layers (see
 /// `flywheel_eval::canary`), with the variant's own PATH.
-fn run_canary(ctx: &Ctx, v: &variant::ResolvedVariant) -> Result<(), String> {
+pub(crate) fn run_canary(ctx: &Ctx, v: &variant::ResolvedVariant) -> Result<(), String> {
     if !v.is_claude() {
         return Ok(());
     }
@@ -858,7 +870,7 @@ fn run_canary(ctx: &Ctx, v: &variant::ResolvedVariant) -> Result<(), String> {
     result
 }
 
-fn new_run_id(prefix: &str) -> String {
+pub(crate) fn new_run_id(prefix: &str) -> String {
     format!(
         "{prefix}-{}-{}",
         Utc::now().format("%Y%m%d%H%M%S"),
@@ -868,17 +880,25 @@ fn new_run_id(prefix: &str) -> String {
 
 fn one_trial(ctx: &Ctx, args: &TrialArgs, out: &mut dyn Write) -> Result<i32, String> {
     use flywheel_eval::store::{RunRow, RunStatus, RunVariantRow, TrialRow};
-    let set_ref = SetRef::parse(&args.set)?;
+    if let Some(plan) = &args.plan {
+        return crate::eval_replay::run_plan(plan, out);
+    }
+    let (set_arg, task_arg, variant_arg) = (
+        args.set.as_deref().unwrap_or_default(),
+        args.task.as_deref().unwrap_or_default(),
+        args.variant.as_deref().unwrap_or_default(),
+    );
+    let set_ref = SetRef::parse(set_arg)?;
     if set_ref.version == Some(VersionRef::Draft) {
         return Err("trials run on a frozen set: fw eval set freeze NAME".into());
     }
     let set_dir = set::resolve(&ctx.evals, &set_ref).map_err(|e| e.to_string())?;
     let manifest = set_dir.load().map_err(|e| e.to_string())?;
     let task = manifest
-        .task(&args.task)
+        .task(task_arg)
         .cloned()
-        .ok_or_else(|| format!("no task {} in {}", args.task, manifest.label()))?;
-    let v = resolve_variant(&ctx.evals, &args.variant, None)?;
+        .ok_or_else(|| format!("no task {task_arg} in {}", manifest.label()))?;
+    let v = resolve_variant(&ctx.evals, variant_arg, None)?;
     run_canary(ctx, &v)?;
     let store = ctx.store()?;
     store
@@ -1029,6 +1049,9 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         EvalCommand::Variant(VariantCommand::Diff(a)) => variant_diff(&ctx, a, out),
         EvalCommand::Variant(VariantCommand::Ls(a)) => variant_ls(&ctx, a, out),
         EvalCommand::Trial(a) => one_trial(&ctx, a, out),
+        EvalCommand::Estimate(a) => crate::eval_replay::estimate(&ctx, a, out),
+        EvalCommand::Replay(a) => crate::eval_replay::replay(&ctx, a, out, err),
+        EvalCommand::Runs(a) => crate::eval_replay::runs(&ctx, a.json, out),
     };
     match result {
         Ok(code) => code,

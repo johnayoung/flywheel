@@ -186,6 +186,7 @@ Verbs:
   config [--json]  print the effective config, each key with its source
   trust            approve this repo's .flywheel.toml (--revoke to withdraw)
   db upgrade       migrate the store in place to this build's schema
+  eval set|...     build task sets from past work; replay them under agent-setup variants
   self-update      build a landed checkout and install fw + flywheel in place (--dry-run, --json)
 
 Store verbs work in any git repo: state lives under
@@ -430,6 +431,10 @@ pub fn route(
     if verb == crate::config_verbs::TRUST_VERB {
         // Approve (or revoke) the cwd repo's `.flywheel.toml`.
         return crate::config_verbs::run_trust(rest, out, err);
+    }
+    if verb == crate::eval_verbs::EVAL_VERB {
+        // Eval sets, variant replays, and their reports.
+        return crate::eval_verbs::run_eval(rest, out, err);
     }
     if verb == crate::db_verbs::DB_VERB {
         // Migrate the store in place to this build's schema.

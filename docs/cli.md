@@ -227,6 +227,8 @@ The blessed headless drain, delegated in-process to the worktree daemon (`main`,
 | `--agent ID` | agent adapter (`claude-code` default, `codex`) |
 | `--account NAME` | run every Claude agent under that account: `$FLYWHEEL_HOME/hub/claude-accounts/NAME.token` (`fw hub account add`), re-read at each agent spawn, as `CLAUDE_CODE_OAUTH_TOKEN` with `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` removed. Exit 2 before any claim on an invalid name, a missing token file, `--sandbox container`, or `--agent codex`; pool members inherit it |
 | `--base BRANCH` | cut every worktree from local `BRANCH` and land onto it instead of the checked-out branch; `git branch NAME SHA` then `--base NAME` replays a task at a past commit off your branch. Exit 2 when `BRANCH` is missing or checked out; pool members inherit it |
+| `--setting-sources LIST` | Claude Code settings layers the task agent loads (`user,project,local`; default `user,project`). `project,local` drops every user-level layer: how `fw eval` pins agent setups |
+| `--permission-mode MODE` | task agent permission mode: `bypassPermissions` (default), `plan`, `default` |
 | `--concurrency N` | pool size (overrides `concurrency`; default 1) |
 | `--model` | agent model (overrides `model`) |
 | `--max-turns`, `--max-retries` | per-run ceilings |

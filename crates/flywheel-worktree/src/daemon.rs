@@ -1598,7 +1598,8 @@ pub const USAGE: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--
                        [--repo OWNER/NAME] [--label LABEL]
                        [--require-triage-receipt] [--sandbox SANDBOX]
                        [--image IMAGE] [--agent AGENT] [--account ACCOUNT]
-                       [--base BASE]
+                       [--base BASE] [--setting-sources LIST]
+                       [--permission-mode MODE]
 ";
 
 /// The argparse `-h` text (`COLUMNS=80`).
@@ -1615,7 +1616,8 @@ pub const HELP: &str = "usage: flywheel worker [-h] [--tasks-dir TASKS_DIR] [--d
                        [--repo OWNER/NAME] [--label LABEL]
                        [--require-triage-receipt] [--sandbox SANDBOX]
                        [--image IMAGE] [--agent AGENT] [--account ACCOUNT]
-                       [--base BASE]
+                       [--base BASE] [--setting-sources LIST]
+                       [--permission-mode MODE]
 
 Git-worktree worker: drive the project's tasks (under $FLYWHEEL_HOME/projects/
 <id>/tasks/active/), each in its own worktree, landing on done and parking on
@@ -1687,6 +1689,14 @@ options:
                         branch made at a past commit (git branch NAME SHA)
                         replays tasks at that commit, off the operator's
                         branch.
+  --setting-sources LIST
+                        The Claude Code settings layers the task agent loads,
+                        a comma list of user, project, local (default: user,
+                        project). project,local leaves out every user-level
+                        layer (fw eval pins agent setups this way).
+  --permission-mode MODE
+                        The task agent's permission mode: bypassPermissions
+                        (default), plan, or default.
 ";
 
 /// The internal flag a pool member receives its supervisor lifeline on
@@ -1701,7 +1711,7 @@ enum Arity {
 }
 
 /// The option table in declaration order (argparse's prefix-match order).
-const OPTIONS: [(&str, Arity); 30] = [
+const OPTIONS: [(&str, Arity); 32] = [
     ("-h", Arity::Flag),
     ("--help", Arity::Flag),
     ("--tasks-dir", Arity::One),
@@ -1730,6 +1740,8 @@ const OPTIONS: [(&str, Arity); 30] = [
     ("--agent", Arity::One),
     ("--account", Arity::One),
     ("--base", Arity::One),
+    ("--setting-sources", Arity::One),
+    ("--permission-mode", Arity::One),
     (SUPERVISOR_FD_FLAG, Arity::One),
     (crate::scoped::SCOPE_SINCE_FLAG, Arity::One),
 ];
@@ -1877,6 +1889,11 @@ pub fn parse_args(argv: &[String]) -> Result<Parsed, ArgError> {
             "--agent" => args.run.agent = Some(v),
             "--account" => args.run.account = Some(v),
             "--base" => args.run.base = Some(v),
+            "--setting-sources" => {
+                args.run.setting_sources =
+                    Some(v.split(',').map(|s| s.trim().to_owned()).collect());
+            }
+            "--permission-mode" => args.run.permission_mode = Some(v),
             "--tasks-dir" => args.tasks_dir = Some(v),
             "--db" => args.db = Some(v),
             "--sandbox-root" => args.sandbox_root = Some(v),
@@ -2782,6 +2799,20 @@ mod tests {
             Some("eval/t1")
         );
         assert!(HELP.contains("--base BASE") && USAGE.contains("[--base BASE]"));
+        let parsed = args(&[
+            "--setting-sources",
+            "project, local",
+            "--permission-mode",
+            "plan",
+        ]);
+        assert_eq!(
+            parsed.run.setting_sources,
+            Some(vec!["project".to_owned(), "local".to_owned()])
+        );
+        assert_eq!(parsed.run.permission_mode.as_deref(), Some("plan"));
+        assert!(
+            HELP.contains("--setting-sources LIST") && USAGE.contains("[--permission-mode MODE]")
+        );
     }
 
     #[test]
@@ -3991,6 +4022,8 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"c
                 agent: Some("codex".into()),
                 account: None,
                 base: None,
+                setting_sources: None,
+                permission_mode: None,
             }
         );
     }

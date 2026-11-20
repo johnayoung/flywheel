@@ -68,6 +68,7 @@ Distinct features that a config key would not fit are flags on the verb that use
 | `--account NAME` | `fw worker` (worktree backend, claude-code) | the Claude account token (`$FLYWHEEL_HOME/hub/claude-accounts/NAME.token`, read at each agent spawn); no config key or env var selects it; [cli.md](cli.md) |
 
 | `--base BRANCH` | `fw worker` | the local branch tasks are cut from and land onto (default: the checked-out branch); [cli.md](cli.md) |
+| `--setting-sources LIST`, `--permission-mode MODE` | `fw worker` | the task agent's Claude settings layers and permission mode (`fw eval` uses them); [cli.md](cli.md) |
 A pool (`--concurrency > 1`) hands every flag to its members. Existing path flags (`--db`, `--tasks-dir`, `--sandbox-root`) still name paths explicitly.
 
 ## Legacy layout
@@ -121,7 +122,7 @@ Fate: **key** (one of the eight), **flag** (above), **fixed** (a location under 
 | `[sandbox] preset` | deleted (`fast` behavior is the default) |
 | `[sandbox] backend` | flag `--sandbox` |
 | `[sandbox] setup` | deleted with the setup hook |
-| `[sandbox] permission_mode` | default `bypassPermissions` |
+| `[sandbox] permission_mode` | default `bypassPermissions` (flag `--permission-mode`) |
 | `[sandbox.exec]`, `[sandbox.capabilities]`, `[sandbox.network]`, `[sandbox.env]`, `[sandbox.limits]` | default (no exec isolation, all skills, MCP from the repo's `.mcp.json`, network allow, inherit the environment, 500 turns / 1 retry / 300s lease) |
 | `[sandbox.retention]` | default `on_done = destroy`, `on_failure = park` (`--worktree-retention-days` sweeps) |
 | `[sandbox.container] image` | flag `--image` |

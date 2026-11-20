@@ -586,7 +586,21 @@ pub struct RunFlags {
     /// A branch created at a past commit replays a task at that commit
     /// without touching the operator's branch.
     pub base: Option<String>,
+    /// `--setting-sources user,project,local`: which Claude Code settings
+    /// layers the task agent loads (sets
+    /// [`SandboxCapabilities::setting_sources`]). `project,local` leaves out
+    /// every user-level layer (CLAUDE.md, skills, plugins, MCP, settings):
+    /// how `fw eval` pins an agent setup without touching the user's.
+    pub setting_sources: Option<Vec<String>>,
+    /// `--permission-mode MODE`: the task agent's permission mode
+    /// (`bypassPermissions`, the default; `plan`; `default`).
+    pub permission_mode: Option<String>,
 }
+
+/// The Claude Code settings layers `--setting-sources` may name.
+pub const SETTING_SOURCES: [&str; 3] = ["user", "project", "local"];
+/// The permission modes `--permission-mode` may name.
+pub const PERMISSION_MODES: [&str; 3] = ["bypassPermissions", "plan", "default"];
 
 fn valid_repo(repo: &str) -> bool {
     let mut parts = repo.split('/');
@@ -691,6 +705,29 @@ impl RunFlags {
             }
             policy.submit_base = Some(base.clone());
         }
+        if let Some(sources) = &self.setting_sources {
+            if sources.is_empty()
+                || sources
+                    .iter()
+                    .any(|s| !SETTING_SOURCES.contains(&s.as_str()))
+            {
+                return invalid(format!(
+                    "--setting-sources is a comma list of {}, got {:?}",
+                    SETTING_SOURCES.join(", "),
+                    sources.join(",")
+                ));
+            }
+            policy.sandbox.capabilities.setting_sources = Some(sources.clone());
+        }
+        if let Some(mode) = &self.permission_mode {
+            if !PERMISSION_MODES.contains(&mode.as_str()) {
+                return invalid(format!(
+                    "--permission-mode must be one of {}, got {mode:?}",
+                    PERMISSION_MODES.join(", ")
+                ));
+            }
+            policy.sandbox.permission_mode.clone_from(mode);
+        }
         Ok(())
     }
 
@@ -711,6 +748,11 @@ impl RunFlags {
         one("--agent", &self.agent);
         one("--account", &self.account);
         one("--base", &self.base);
+        one(
+            "--setting-sources",
+            &self.setting_sources.as_ref().map(|s| s.join(",")),
+        );
+        one("--permission-mode", &self.permission_mode);
         if self.require_triage_receipt {
             argv.push("--require-triage-receipt".to_owned());
         }
@@ -1039,6 +1081,49 @@ mod tests {
     }
 
     #[test]
+    fn setting_sources_and_permission_mode_flags_reach_the_sandbox_and_pool_members() {
+        let flags = RunFlags {
+            setting_sources: Some(vec!["project".into(), "local".into()]),
+            permission_mode: Some("plan".into()),
+            ..RunFlags::default()
+        };
+        let policy = applied(flags.clone()).unwrap();
+        assert_eq!(
+            policy.sandbox.capabilities.setting_sources,
+            Some(vec!["project".to_owned(), "local".to_owned()])
+        );
+        assert_eq!(policy.sandbox.permission_mode, "plan");
+        let argv = flags.to_argv();
+        assert!(argv.contains(&"--setting-sources=project,local".to_owned()));
+        assert!(argv.contains(&"--permission-mode=plan".to_owned()));
+        for (bad, why) in [
+            (
+                RunFlags {
+                    setting_sources: Some(vec!["global".into()]),
+                    ..RunFlags::default()
+                },
+                "--setting-sources",
+            ),
+            (
+                RunFlags {
+                    setting_sources: Some(vec![]),
+                    ..RunFlags::default()
+                },
+                "--setting-sources",
+            ),
+            (
+                RunFlags {
+                    permission_mode: Some("yolo".into()),
+                    ..RunFlags::default()
+                },
+                "--permission-mode",
+            ),
+        ] {
+            assert!(applied(bad).unwrap_err().contains(why));
+        }
+    }
+
+    #[test]
     fn container_flags_select_the_container_backend() {
         let policy = applied(RunFlags {
             sandbox: Some("container".into()),
@@ -1086,6 +1171,8 @@ mod tests {
             agent: Some("codex".into()),
             account: None,
             base: None,
+            setting_sources: None,
+            permission_mode: None,
         };
         assert_eq!(
             flags.to_argv(),

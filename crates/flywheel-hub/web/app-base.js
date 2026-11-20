@@ -602,6 +602,7 @@ function closeOverlays(keep) {
 // flywheel-adopted folders.
 const flywheel = window.FwHubFlywheel({
   $, el, icon, api, age, span, state, store, workspaceById, sessionById, folderLabel,
+  copyText: (text) => commands.copyText(text),
   keyOf: (id) => settings.keyOf(id),
   machinePrefix: (machine) => machines.prefix(machine),
   openSession: (id, place) => openSession(id, place),

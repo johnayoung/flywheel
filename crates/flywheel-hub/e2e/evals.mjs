@@ -6,7 +6,9 @@
 //   - "open" shows the board: four paired comparisons, each with a verdict;
 //   - the task x variant grid has one mark per trial, pass and fail;
 //   - a mark opens that trial: its oracle verdict, trace checks, and diff;
-//   - on a phone the board fits the screen.
+//   - on a phone the board fits the screen;
+//   - a project with no runs shows the section anyway: a 0 count and the
+//     commands to start, each copied on a tap.
 // Opt-in, like layout.mjs:
 //
 //   node crates/flywheel-hub/e2e/evals.mjs [OUT_DIR]
@@ -109,6 +111,14 @@ const base = commit("base", { "CLAUDE.md": "# rules\nRULE: skip check.sh\n", "a.
 const ref2 = commit("feat: two", { "a.txt": "2\n" });
 const ref3 = commit("feat: three", { "b.txt": "x\n" });
 const project = run(fw, ["project", "path"], repo).trim();
+// A second adopted repo, with no eval runs.
+const bare = path.join(tmp, "bare");
+fs.mkdirSync(bare);
+spawnSync("git", ["init", "-q", "-b", "main"], { cwd: bare, env });
+fs.writeFileSync(path.join(bare, "README"), "bare\n");
+spawnSync("git", ["add", "-A"], { cwd: bare, env });
+spawnSync("git", ["-c", "user.email=e@x.invalid", "-c", "user.name=e", "commit", "-qm", "init"], { cwd: bare, env });
+run(fw, ["project", "path"], bare);
 const projectId = path.basename(project);
 
 // A draft set of the two tasks, written as the miner writes one.
@@ -170,12 +180,12 @@ try {
     if (!response.ok) throw new Error(`${method} ${url}: ${response.status} ${text}`);
     return text ? JSON.parse(text) : null;
   };
-  const ws = await api("POST", "/api/workspaces", { name: "evals", folders: [repo] });
+  const ws = await api("POST", "/api/workspaces", { name: "evals", folders: [repo, bare] });
   const report = await api("GET", `/api/flywheel/eval?folder=${encodeURIComponent(repo)}&run=${runId}`);
   check(report.schema === 1 && report.trials_total === 8, `the API serves the report (${report.trials_graded}/${report.trials_total})`);
 
   browser = await chromium.launch(process.env.CHROMIUM ? { executablePath: process.env.CHROMIUM } : {});
-  const desk = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const desk = await browser.newContext({ viewport: { width: 1440, height: 900 }, permissions: ["clipboard-read", "clipboard-write"] });
   const page = await desk.newPage();
   await page.goto(`${baseUrl}/login?token=${token}`);
   await page.waitForURL(`${baseUrl}/`);
@@ -222,6 +232,33 @@ try {
     `a mark opens its trial: oracle and trace checks (${trial && JSON.stringify(trial.facts)})`);
   check(trial && trial.diff, "the trial shows its final diff");
   await page.screenshot({ path: path.join(out, "desktop-eval-trial.png") });
+
+  // The empty state: the repo with no runs.
+  await page.keyboard.press("Escape");
+  await page.locator("#dlg-eval").evaluate((d) => d.open && d.close());
+  await page.locator(".fw-chip", { hasText: "bare" }).first().click();
+  await page.waitForSelector('[data-fw-section="Evals"] .ev-empty', { timeout: 30000 }).catch(() => {});
+  const empty = await page.evaluate(() => {
+    const sec = document.querySelector('[data-fw-section="Evals"]');
+    if (!sec) return null;
+    return {
+      count: sec.querySelector(".fw-n")?.textContent,
+      text: sec.querySelector(".ev-empty")?.textContent || "",
+      copies: [...sec.querySelectorAll("[data-ev-copy]")].map((b) => b.dataset.evCopy),
+      link: sec.querySelector(".ev-empty a")?.getAttribute("href") || "",
+    };
+  });
+  check(empty && empty.count === "0" && /No eval runs yet/.test(empty.text),
+    `a project with no runs shows Evals with 0 and the hint (${empty && empty.count}: ${empty && empty.text.slice(0, 60)})`);
+  check(empty && empty.copies.includes("fw eval set build core") && empty.copies.includes("fw eval replay core --variant A --variant B") && empty.copies.includes("fw docs eval"),
+    `its commands are copyable (${empty && empty.copies.join(" | ")})`);
+  check(empty && /docs\/eval\.md$/.test(empty.link), `it links the docs (${empty && empty.link})`);
+  await page.locator('[data-ev-copy="fw docs eval"]').click();
+  await page.waitForFunction(() => /copied: fw docs eval/.test(document.querySelector("#toasts")?.textContent || ""), null, { timeout: 5000 }).catch(() => {});
+  const toasted = await page.evaluate(() => document.querySelector("#toasts")?.textContent || "");
+  const clip = await page.evaluate(() => navigator.clipboard.readText().catch(() => ""));
+  check(/copied: fw docs eval/.test(toasted) && clip === "fw docs eval", `a tap copies the command (${clip})`);
+  await page.screenshot({ path: path.join(out, "desktop-evals-empty.png") });
 
   const phone = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
   const pp = await phone.newPage();

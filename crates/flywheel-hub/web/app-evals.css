@@ -118,3 +118,25 @@
   .ev-cmp .ev-ci { display: none; }
   .ev-run .ev-bar { margin-left: 0; }
 }
+
+/* The empty state: the drawer's empty text, with copyable commands. */
+.ev-empty p { margin: 0 0 .35rem; }
+.ev-steps { margin: 0 0 .35rem; padding-left: 1.2rem; display: grid; gap: .3rem; }
+.ev-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: .3rem;
+  max-width: 100%;
+  padding: .05rem .35rem;
+  border: 1px solid var(--rule-2);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  cursor: pointer;
+  vertical-align: baseline;
+}
+.ev-copy code { font: 400 10.5px var(--mono); color: var(--ink); background: none; overflow-wrap: anywhere; text-align: left; }
+.ev-empty a { color: var(--ink); text-decoration-color: var(--rule-2); text-underline-offset: 2px; }
+.ev-empty a:hover { text-decoration-color: var(--ink); }
+.ev-copy svg { width: .7rem; height: .7rem; flex: none; color: var(--ink-3); }
+.ev-copy:hover svg, .ev-copy:focus-visible svg { color: var(--ink); }

@@ -13,7 +13,8 @@
 "use strict";
 
 window.FwHubEvals = function (ctx) {
-  const { el, icon, api, ago, section, via, pathOf, toast } = ctx;
+  const { el, icon, api, ago, section, via, pathOf, toast, copyText } = ctx;
+  const DOCS_URL = "https://github.com/johnayoung/flywheel/blob/main/docs/eval.md";
   const { dollars } = window.FwHubFmt;
 
   const ui = { folder: null, run: null, report: null, trial: null, detail: null, loading: false };
@@ -344,9 +345,35 @@ window.FwHubEvals = function (ctx) {
     );
   }
 
+  // A command shown as code, copied on a tap.
+  function copyable(command) {
+    return el("button", {
+      type: "button",
+      className: "ev-copy",
+      title: `Copy: ${command}`,
+      dataset: { evCopy: command },
+      onclick: async () => {
+        const ok = await copyText(command);
+        toast(ok ? `copied: ${command}` : "could not copy: select the command instead");
+      },
+    }, el("code", { textContent: command }), icon("copy"));
+  }
+
+  function emptyState() {
+    return el(
+      "div",
+      { className: "fw-empty ev-empty" },
+      el("p", { textContent: "No eval runs yet. Measure whether a change to the agent setup makes agents better or worse, from this repo's past tasks:" }),
+      el("ol", { className: "ev-steps" },
+        el("li", {}, "Build a set: ", copyable("fw eval set build core"), " then ", copyable("fw eval set validate core@draft"), " and ", copyable("fw eval set freeze core")),
+        el("li", {}, "Run: ", copyable("fw eval replay core --variant A --variant B"))),
+      el("p", {}, "Docs: ", copyable("fw docs eval"), " or ", el("a", { href: DOCS_URL, target: "_blank", rel: "noopener", textContent: "docs/eval.md" })),
+    );
+  }
+
   function evalSection(folder, panel) {
     const runs = panel.evals || [];
-    if (!runs.length) return null;
+    if (!runs.length) return section("Evals", 0, emptyState());
     return section("Evals", runs.length, el("ul", { className: "fw-list" }, runs.map((r) => runRow(folder, r))));
   }
 

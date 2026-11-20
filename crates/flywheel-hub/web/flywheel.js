@@ -597,6 +597,7 @@ window.FwHubFlywheel = function (ctx) {
   // fw eval runs: the Evals section and its run board (evals.js).
   const evals = window.FwHubEvals({
     el, icon, api, ago, section, via, pathOf, toast,
+    copyText: (text) => (ctx.copyText ? ctx.copyText(text) : Promise.resolve(false)),
     focusTerminal: () => (ctx.focusTerminal ? ctx.focusTerminal() : undefined),
   });
 

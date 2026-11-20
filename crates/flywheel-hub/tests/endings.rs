@@ -2032,6 +2032,40 @@ async fn an_upgrade_relaunches_agents_at_rest_and_never_interrupts_busy_ones() {
     );
 }
 
+/// The noise-floor session (2026-11-19): a background task's notice
+/// started a turn, its last tool call returned, and while the model was
+/// still thinking Claude reported `idle_prompt`. The hub read that as at
+/// rest and relaunched it mid-turn, so the turn was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_report_inside_an_open_turn_does_not_relaunch_it() {
+    let mut hub = TestHub::start().await;
+    let agent = hub.claude("thinking", None, json!({})).await;
+    agent.turn().await;
+    agent
+        .hook(
+            "UserPromptSubmit",
+            json!({"prompt": "(a background task finished)"}),
+        )
+        .await;
+    let call = json!({"tool_name": "Bash", "tool_use_id": "tu1",
+                      "tool_input": {"command": "true"}});
+    agent.hook("PreToolUse", call.clone()).await;
+    agent.hook("PostToolUse", call).await;
+    agent
+        .hook("Notification", json!({"notification_type": "idle_prompt"}))
+        .await;
+    let before = agent.env(None).await[report::SECRET_ENV].clone();
+    hub.hub.mark_stale("0.0.1");
+    sleep(WOULD_HAVE).await;
+    assert_eq!(agent.env(None).await[report::SECRET_ENV], before);
+    let view = hub.session(&agent.id).await;
+    assert_eq!(view["stale"]["waits"], "its turn is still open", "{view}");
+
+    // The turn ends: relaunched then.
+    agent.hook("Stop", json!({})).await;
+    respawned(&hub, &agent, &before).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_agent_asking_the_operator_is_relaunched_only_once_answered() {
     let mut hub = TestHub::start().await;

@@ -49,6 +49,12 @@ const PREVIEW_CHARS: usize = 100;
 /// How long after a background subagent finished its agent may still
 /// take its result up (a turn of its own): not at rest meanwhile.
 const WAKE_WINDOW_MS: i64 = 120_000;
+/// How long a turn that started and never ended (no Stop) must have been
+/// quiet before it no longer holds its session busy. In telemetry.db
+/// (2026-11-20, 41,700 gaps between events inside a turn with no tool
+/// call open) the longest silence of a live turn was 232 s, 99.99% under
+/// 151 s; the model thinking makes no events.
+const OPEN_TURN_QUIET_MS: i64 = 300_000;
 /// What a refused force says.
 pub const FORCE_REFUSED: &str = "force is operator only (pane menu or fw hub kill)";
 
@@ -1415,12 +1421,17 @@ impl Hub {
         {
             return Err("a prompt sent to it has not started yet".to_owned());
         }
-        if self
-            .telemetry()
-            .snapshot(&record.id)
-            .is_some_and(|s| s.open_tools > 0)
-        {
-            return Err("a tool call is open".to_owned());
+        if let Some(snapshot) = self.telemetry().snapshot(&record.id) {
+            if snapshot.open_tools > 0 {
+                return Err("a tool call is open".to_owned());
+            }
+            // Claude reports `idle_prompt` (and the screen can read idle)
+            // while a turn still waits on the model: only the turn's own
+            // end says it is over. A turn quiet past [`OPEN_TURN_QUIET_MS`]
+            // lost its end (a missed Stop) and no longer holds.
+            if snapshot.status == "working" && now_ms() - snapshot.last_ts < OPEN_TURN_QUIET_MS {
+                return Err("its turn is still open".to_owned());
+            }
         }
         if let Some(detail) = self.telemetry().detail(None, &record.id) {
             let work = &detail.work;

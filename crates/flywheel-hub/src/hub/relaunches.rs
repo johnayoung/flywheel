@@ -6,7 +6,8 @@
 //!
 //! * never mid-flight: only at rest ([`Hub::at_rest`] with its shown
 //!   state done, idle, or failed: not working, compacting, asking,
-//!   blocked, or with subagents in the background), nothing it started
+//!   blocked, or with subagents in the background), its last turn ended
+//!   (an `idle_prompt` inside a turn is not its end), nothing it started
 //!   still running, and no prompt sent to it still unstarted;
 //! * one at a time, the next once the last one's new process reported;
 //! * before its queue delivers again: the queue holds while a relaunch is

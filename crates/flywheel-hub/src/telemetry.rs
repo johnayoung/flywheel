@@ -341,6 +341,12 @@ impl Telemetry {
         lock(&self.inner.live).get(&key).map(SessionState::snapshot)
     }
 
+    /// The newest `limit` released leases (see [`Store::lease_holds`]).
+    pub fn lease_holds(&self, limit: usize) -> Result<Vec<(String, i64)>, StoreError> {
+        self.flush();
+        lock(&self.inner.read).lease_holds(limit)
+    }
+
     /// A page of a session's events (see [`Store::events`]).
     pub fn events(
         &self,

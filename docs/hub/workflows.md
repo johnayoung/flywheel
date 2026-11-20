@@ -147,7 +147,9 @@ Per agent session, prompts the hub types itself, in order ("when done, do X"): `
 **Watches** (`fw hub watch add lead --on 'children state=done|failed' --prompt ...`, `watch`/`unwatch` tools, the Queue drawer): a matching log event queues the prompt, events, and cursors into the owner (queue rules apply).
 Matches within `--window` (3 s), or while that prompt waits, join it (40 listed): 500 children finishing wake a lead once. Its own events never match; it ends with its owner. Time watches (`--at`, `--every` 5m+) fire by clock, survive restarts, and pass to the owner's successor.
 
-**Leases** (`lease` tool, `fw hub lease`): shared or exclusive, a ttl, a fair line per resource; a wait past 50 s is granted by prompt. Ends: release, ttl, holder end, `break`.
+**Leases** (`lease` tool, `fw hub lease`): shared or exclusive, a ttl, a fair line per resource; a wait past 50 s is granted by prompt. Ends: release, ttl, holder end, `break`. An exclusive ask from inside its holder (an ancestor process) fails at once.
+
+**Stuck leases**: held past `max(3x p90, p90+10m)` (1 h, no history) while someone waits: a Needs-you hold (Release: break + SIGTERM its process group; Keep waiting), STUCK in the inspector, `lease.stuck` in waiters' logs.
 
 **Reviews** (`record_review` / `check_reviewed` tools, `fw hub verdict`): a verdict on `base..head`, kept once (re-review: `follow_up_of`). Covered: a READY chain tip, no later NOT_READY, not by its author. Inspector: its branch's coverage.
 

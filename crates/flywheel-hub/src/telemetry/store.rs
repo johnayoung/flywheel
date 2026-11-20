@@ -463,6 +463,26 @@ impl Store {
         Ok(events)
     }
 
+    /// The newest `limit` leases released (`lease.released` events), as
+    /// (resource, how long it was held in ms).
+    pub fn lease_holds(&self, limit: usize) -> Result<Vec<(String, i64)>, StoreError> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT json_extract(body, '$.resource'), ts - json_extract(body, '$.granted_at')
+             FROM events WHERE kind = 'lease.released'
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = query.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+            ))
+        })?;
+        Ok(rows
+            .filter_map(Result::ok)
+            .filter_map(|(resource, held)| Some((resource?, held.filter(|h| *h >= 0)?)))
+            .collect())
+    }
+
     /// A session's events at or after `from` (unix ms), oldest first: the
     /// last `cap` of them.
     pub fn events_from(

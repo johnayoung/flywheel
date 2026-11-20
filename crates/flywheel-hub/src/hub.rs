@@ -136,6 +136,12 @@ pub struct HubOptions {
     /// it is sent again, then the queue stalls ([`crate::queue::ACK_TIMEOUT`]);
     /// tests shorten it.
     pub queue_ack_timeout: Duration,
+    /// A lease is stuck past `max(3 x p90, p90 + .0)` of its resource's
+    /// typical hold, or past `.1` with no history (see
+    /// [`crate::leases::stuck_after`]); tests shorten them.
+    pub lease_stuck: (Duration, Duration),
+    /// How often the hub looks for stuck leases (ms); tests shorten it.
+    pub lease_stuck_look_ms: i64,
 }
 
 impl HubOptions {
@@ -174,6 +180,11 @@ impl HubOptions {
             agent_starts: crate::config::AgentStarts::default(),
             lease_block_secs: crate::leases::MAX_BLOCK_SECS,
             queue_ack_timeout: crate::queue::ACK_TIMEOUT,
+            lease_stuck: (
+                Duration::from_millis(crate::leases::STUCK_MARGIN_MS as u64),
+                Duration::from_millis(crate::leases::DEFAULT_STUCK_MS as u64),
+            ),
+            lease_stuck_look_ms: crate::hub::leases::STUCK_LOOK_MS,
         }
     }
 }

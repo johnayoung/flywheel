@@ -118,6 +118,8 @@ window.FwHubAttention = function (ctx) {
   const KIND_WORD = { needs_input: "needs input", awaiting_approval: "approval", permission: "permission", gate: "gate" };
   // Groups of two or more holds, as the hub last listed them.
   let holdGroups = [];
+  // Stuck leases (holds `lease:...`): a row each, whatever their count.
+  let leaseHolds = [];
   let holdsSig = "";
   let holdsAt = 0;
   let holdsBusy = false;
@@ -137,9 +139,14 @@ window.FwHubAttention = function (ctx) {
     ctx
       .api("GET", "/api/holds")
       .then((listed) => {
-        const next = (listed.groups || []).filter((g) => (g.holds || []).length > 1);
-        const changed = JSON.stringify(next) !== JSON.stringify(holdGroups);
+        const isLease = (h) => /^lease:/.test(h.id);
+        const leases = (listed.groups || []).flatMap((g) => (g.holds || []).filter(isLease));
+        const next = (listed.groups || [])
+          .map((g) => ({ ...g, holds: (g.holds || []).filter((h) => !isLease(h)) }))
+          .filter((g) => g.holds.length > 1);
+        const changed = JSON.stringify(next) !== JSON.stringify(holdGroups) || JSON.stringify(leases) !== JSON.stringify(leaseHolds);
         holdGroups = next;
+        leaseHolds = leases;
         if (!changed) return;
         if (ctx.rerender) ctx.rerender();
         else render();
@@ -622,6 +629,88 @@ window.FwHubAttention = function (ctx) {
     );
   }
 
+  // A lease held past its stuck threshold while sessions wait: who holds
+  // it, for how long, what its process is doing, who waits; Keep waiting
+  // or Release (confirmed: it breaks the lease and sends SIGTERM to the
+  // holder's process group).
+  function leaseRow(h) {
+    const resource = h.cause.replace(/^lease /, "").replace(/ stuck$/, "");
+    const keep = el("button", {
+      type: "button",
+      className: "slab ghost attn-dismiss",
+      textContent: "Keep waiting",
+      title: "Leave the lease be; asked again after another threshold",
+      onclick: () => answerLease(h, resource, "keep waiting", keep),
+    });
+    const release = el("button", {
+      type: "button",
+      className: "slab attn-start",
+      textContent: "Release",
+      title: "Break the lease and send SIGTERM to its holder's process group",
+      onclick: () => answerLease(h, resource, "release", release),
+    });
+    return el(
+      "li",
+      { dataset: { hold: h.id } },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "attn-row handoff",
+          dataset: { id: h.session || "" },
+          title: h.session ? `Open ${h.session_name || "the waiting session"}` : h.cause,
+          onclick: () => h.session && openSession(h.session),
+        },
+        el("span", { className: "glyph count", textContent: "!" }),
+        el(
+          "span",
+          { className: "attn-text" },
+          el("span", { className: "attn-line" }, el("b", { className: "attn-name", textContent: h.cause, title: h.cause })),
+          el("span", { className: "attn-detail", textContent: h.session_name ? `${h.session_name} waits` : "", title: h.question }),
+        ),
+        el(
+          "span",
+          { className: "attn-meta" },
+          el("span", { className: "attn-status group awaiting_approval", textContent: "lease" }),
+          el("span", { className: "attn-age", textContent: age(new Date(h.since).toISOString()) }),
+        ),
+      ),
+      el(
+        "div",
+        { className: "attn-ask attn-pending" },
+        el("pre", { className: "attn-handoff-preview", textContent: h.question }),
+        el("div", { className: "attn-handoff-actions" }, keep, release),
+      ),
+    );
+  }
+
+  async function answerLease(h, resource, answer, button) {
+    if (answer === "release") {
+      const sure = ctx.confirm
+        ? await ctx.confirm({
+            kicker: "lease",
+            title: `Release ${resource}?`,
+            body: "This breaks the lease and sends SIGTERM to its holder's process group: the run holding it stops, and the next in line gets it.",
+            ok: "Release",
+          })
+        : true;
+      if (!sure) return;
+    }
+    if (button) button.disabled = true;
+    try {
+      const done = await ctx.api("POST", "/api/holds/answer", { holds: [h.id], answer });
+      const result = (done.results || [])[0] || {};
+      if (result.ok === false) ctx.toast(`Not done: ${result.error}`, { tone: "bad" });
+      else ctx.toast(result.said || (answer === "release" ? `Released ${resource}` : `Keeping ${resource}`));
+    } catch (error) {
+      ctx.toast(`Not done: ${error.message}`, { tone: "bad" });
+    } finally {
+      if (button) button.disabled = false;
+      holdsAt = 0;
+      refreshHolds(holdsSig);
+    }
+  }
+
   const END_WHY = {
     not_owner: "not its owner",
     start_policy_ask: "its start policy asks you",
@@ -1039,6 +1128,8 @@ window.FwHubAttention = function (ctx) {
         ...all.filter((e) => e.level < 2).map((e) => `${e.session.id}:${e.ask ? e.ask.since : e.agent.since}`),
         ...allStarts.map((e) => e.start.id),
         ...allEnds.map((e) => e.end.id),
+        // A lease turning stuck (or not) shows on its sessions' views.
+        ...state.sessions.flatMap((s) => ((s.leases && s.leases.stuck) || []).map((x) => x.lease.id)),
         flywheel ? flywheel.attention().length : 0,
       ].join(","),
     );
@@ -1058,19 +1149,20 @@ window.FwHubAttention = function (ctx) {
     const queues = ctx.queue ? ctx.queue().attention() : [];
     for (const root of [$("#attention"), $("#empty-attention")]) {
       if (!root) continue;
-      const any = groups.length || list.length || passed.length || starts.length || ends.length || loop.length || graded.length || queues.length;
+      const any = leaseHolds.length || groups.length || list.length || passed.length || starts.length || ends.length || loop.length || graded.length || queues.length;
       root.hidden = !any;
-      morph(root, any ? content(list, passed, starts, ends, loop, graded, queues, groups, root.id === "empty-attention") : []);
+      morph(root, any ? content(list, passed, starts, ends, loop, graded, queues, groups, root.id === "empty-attention", leaseHolds) : []);
     }
   }
 
-  function content(list, passed, starts, ends, loop, graded, queues, groups, full) {
+  function content(list, passed, starts, ends, loop, graded, queues, groups, full, leases = []) {
     const blocked = list.filter((e) => e.level === 0).length;
     const asking = list.filter((e) => e.level === 1).length;
     const failed = list.filter((e) => e.level === 2 && e.agent.state === "failed").length;
     const alerts = loop.reduce((n, e) => n + (e.count || 1), 0);
     // The heading's counts, on one line.
     const said = [
+      leases.length ? `${leases.length} lease${leases.length === 1 ? "" : "s"} stuck` : "",
       groups.length ? `${groups.reduce((n, g) => n + g.holds.length, 0)} in ${groups.length} group${groups.length === 1 ? "" : "s"}` : "",
       blocked ? `${blocked} blocked` : "",
       passed.length ? `${passed.length} handoff${passed.length === 1 ? "" : "s"}` : "",
@@ -1096,6 +1188,7 @@ window.FwHubAttention = function (ctx) {
       el(
         "ul",
         { className: "attn-list" },
+        leases.map(leaseRow),
         groups.map((g) => groupRow(g, full)),
         list.filter((e) => e.level === 0).map((e) => row(e, full)),
         passed.map(handoffRow),

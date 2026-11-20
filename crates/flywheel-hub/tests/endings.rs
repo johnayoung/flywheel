@@ -83,6 +83,9 @@ impl TestHub {
         options.claude_config_dir = Some(root.join("claude-config"));
         options.queue_typing_quiet = QUIET;
         options.lease_block_secs = 1;
+        // A lease with no history is stuck after 3 s while someone waits.
+        options.lease_stuck = (Duration::from_secs(1), Duration::from_secs(3));
+        options.lease_stuck_look_ms = 200;
         let hub = support::open_hub(options);
         hub.restore_sessions();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1123,6 +1126,119 @@ async fn a_lease_wait_that_runs_out_names_who_holds_it() {
             )),
         "{err}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stuck_lease_holder_is_on_needs_you_and_released_from_there() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let w1 = hub.claude("w1", Some(&lead), json!({})).await;
+    for agent in [&lead, &w1] {
+        agent.turn().await;
+    }
+    lead.ok(
+        "watch",
+        json!({"filter": "children kind=lease", "prompt": "a lease your worker waits on is stuck"}),
+    )
+    .await;
+    // The holder: a suite runner whose child is stuck (in its own process
+    // group, as a shell command is).
+    use std::os::unix::process::CommandExt;
+    let mut holder = std::process::Command::new("sh")
+        .args(["-c", "sleep 61 & wait"])
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let (status, got) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/leases",
+            Some(
+                json!({"resource": "cpu:test-suite", "ttl_secs": 600, "holder": {
+                "host": flywheel_hub::machines::host_name(), "pid": holder.id(),
+                "started": flywheel_hub::hub::leases::process_start(holder.id()),
+                "label": "scripts/check.sh"}}),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let said = w1
+        .ok(
+            "lease",
+            json!({"action": "acquire", "resource": "cpu:test-suite", "wait_secs": 600}),
+        )
+        .await;
+    assert!(said.starts_with("Waiting"), "{said}");
+    // Past the threshold: a hold on Needs you says who holds it, what its
+    // process does, and who waits.
+    let hold = || async {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let holds = hub.get("/api/holds").await;
+            let found = holds["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["holds"].as_array().unwrap().clone())
+                .find(|h| h["cause"] == "lease cpu:test-suite stuck");
+            if let Some(found) = found {
+                return found;
+            }
+            assert!(Instant::now() < deadline, "no stuck hold: {holds}");
+            sleep(Duration::from_millis(100)).await;
+        }
+    };
+    let found = hold().await;
+    assert_eq!(found["kind"], "awaiting_approval", "{found}");
+    assert_eq!(found["session"].as_str(), Some(w1.id.as_str()), "{found}");
+    let question = found["question"].as_str().unwrap();
+    for needle in ["scripts/check.sh", "sleep 61", "w1 waits", "no history"] {
+        assert!(question.contains(needle), "{needle}: {question}");
+    }
+    assert_eq!(found["answers"], json!(["release", "keep waiting"]));
+    // The inspector's lease view says so too, and the lead's watch fires.
+    let leases = hub.session(&w1.id).await["leases"].clone();
+    assert_eq!(
+        leases["stuck"][0]["lease"]["resource"], "cpu:test-suite",
+        "{leases}"
+    );
+    log_has(&hub, "lease", &["lease.stuck"]).await;
+    lead.typed_has("a lease your worker waits on is stuck")
+        .await;
+
+    // Keep waiting: gone until another threshold passes.
+    let answer = |id: String, answer: &'static str| {
+        let hub = &hub;
+        async move {
+            hub.call(
+                reqwest::Method::POST,
+                "/api/holds/answer",
+                Some(json!({"holds": [id], "answer": answer})),
+            )
+            .await
+        }
+    };
+    let id = found["id"].as_str().unwrap().to_owned();
+    let (status, got) = answer(id.clone(), "keep waiting").await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(got.to_string().contains("keeping"), "{got}");
+    let holds = hub.get("/api/holds").await.to_string();
+    assert!(!holds.contains("cpu:test-suite stuck"), "{holds}");
+    // Back after it, then released: the lease is broken, the holder's
+    // process group ends, and the waiter is granted.
+    let again = hold().await;
+    let (status, got) = answer(again["id"].as_str().unwrap().to_owned(), "release").await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert!(got.to_string().contains("SIGTERM"), "{got}");
+    let deadline = Instant::now() + WAIT;
+    while holder.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the holder still runs");
+        sleep(Duration::from_millis(50)).await;
+    }
+    w1.typed_has("your lease on cpu:test-suite (exclusive) is granted")
+        .await;
+    log_has(&hub, "lease", &["lease.broken"]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

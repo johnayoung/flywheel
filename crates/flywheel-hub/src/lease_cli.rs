@@ -380,6 +380,28 @@ fn print_leases(out: &mut dyn Write, view: &Value) {
                 .unwrap_or_default()
         );
     }
+    for stuck in view["stuck"].as_array().cloned().unwrap_or_default() {
+        let _ = writeln!(
+            out,
+            "STUCK {}  {}  held {} by {} (stuck after {}); waiting: {}",
+            str_field(&stuck["lease"], "id"),
+            str_field(&stuck["lease"], "resource"),
+            ago(stuck["held_ms"].as_i64().unwrap_or(0)),
+            str_field(&stuck, "holder"),
+            ago(stuck["threshold_ms"].as_i64().unwrap_or(0)),
+            stuck["waiting"]
+                .as_array()
+                .map(|w| w
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .unwrap_or_default()
+        );
+        for line in stuck["doing"].as_array().cloned().unwrap_or_default() {
+            let _ = writeln!(out, "      {}", line.as_str().unwrap_or(""));
+        }
+    }
     for waiter in &waiters {
         let _ = writeln!(
             out,

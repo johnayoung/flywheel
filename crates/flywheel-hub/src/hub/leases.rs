@@ -46,7 +46,59 @@ pub struct LeaseRuntime {
     db: LazyDb,
     /// Order waits were queued in (their place in line across a restart).
     seq: Mutex<i64>,
+    /// Leases held past their stuck threshold while someone waits, as
+    /// last looked at (see [`Hub::stuck_tick`]).
+    stuck: Mutex<StuckLook>,
 }
+
+/// The stuck-holder look: what it found, and what it remembers between
+/// looks.
+#[derive(Debug, Default)]
+struct StuckLook {
+    /// When it last looked (unix ms).
+    at: i64,
+    found: Vec<Stuck>,
+    /// Typical holds per resource (its p90, ms) and when they were read.
+    typical: Option<(i64, std::collections::HashMap<String, i64>)>,
+    /// Leases already told of (`lease.stuck` logged once each).
+    told: std::collections::HashSet<String>,
+    /// Leases the operator chose to keep waiting on: not stuck again
+    /// before (unix ms).
+    kept: std::collections::HashMap<String, i64>,
+}
+
+/// A lease held past its stuck threshold while someone waits for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Stuck {
+    pub lease: Lease,
+    /// How long it has been held (ms).
+    pub held_ms: i64,
+    /// Held this long while someone waits, it reads as stuck (ms).
+    pub threshold_ms: i64,
+    /// The resource's typical (p90) hold, when its history says (ms).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub typical_ms: Option<i64>,
+    /// The holder in words.
+    pub holder: String,
+    /// What the holder's process is doing: its process tree, one line
+    /// each (a process on this machine).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub doing: Vec<String>,
+    /// Who waits, in words, first in line first.
+    pub waiting: Vec<String>,
+    /// The sessions that wait (ids).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub waiting_sessions: Vec<String>,
+}
+
+/// How often the hub looks for stuck holders (ms).
+pub const STUCK_LOOK_MS: i64 = 5_000;
+/// How often it reads the typical holds again (ms).
+const TYPICAL_READ_MS: i64 = 5 * 60 * 1000;
+/// Released holds read for the typical ones.
+const TYPICAL_SAMPLES: usize = 2000;
+/// Lines of a stuck holder's process tree kept.
+const DOING_LINES: usize = 12;
 
 impl std::fmt::Debug for LeaseRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,7 +145,12 @@ impl LeaseRuntime {
             changed: Condvar::new(),
             db,
             seq: Mutex::new(seq),
+            stuck: Mutex::new(StuckLook::default()),
         }
+    }
+
+    fn stuck(&self) -> MutexGuard<'_, StuckLook> {
+        self.stuck.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn book(&self) -> MutexGuard<'_, Book> {
@@ -169,6 +226,9 @@ fn json<T: Serialize>(value: &T) -> String {
 pub struct LeaseView {
     pub leases: Vec<Lease>,
     pub waiters: Vec<Waiter>,
+    /// Those of them held past their stuck threshold while someone waits.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub stuck: Vec<Stuck>,
 }
 
 /// What an acquire answered, after any wait in the call.
@@ -607,9 +667,15 @@ impl Hub {
 
     /// Every lease and wait (`resource`: only its).
     pub fn leases(&self, resource: Option<&str>) -> LeaseView {
+        let stuck = self
+            .stuck_leases()
+            .into_iter()
+            .filter(|s| resource.is_none_or(|want| want == s.lease.resource))
+            .collect();
         let book = self.lease_runtime().book();
         let keep = |r: &str| resource.is_none_or(|want| want == r);
         LeaseView {
+            stuck,
             leases: book
                 .leases()
                 .filter(|l| keep(&l.resource))
@@ -625,8 +691,16 @@ impl Hub {
 
     /// The leases and waits session `id` (or a process of it) has.
     pub fn leases_of(&self, id: &str) -> LeaseView {
+        let stuck = self
+            .stuck_leases()
+            .into_iter()
+            .filter(|s| {
+                s.lease.holder.session() == Some(id) || s.waiting_sessions.iter().any(|w| w == id)
+            })
+            .collect();
         let book = self.lease_runtime().book();
         LeaseView {
+            stuck,
             leases: book
                 .leases()
                 .filter(|l| l.holder.session() == Some(id))
@@ -683,6 +757,211 @@ impl Hub {
             );
         }
         self.lease_changed(changes);
+        self.stuck_tick(now);
+    }
+
+    /// The leases held past their stuck threshold while someone waits, as
+    /// last looked at.
+    pub fn stuck_leases(&self) -> Vec<Stuck> {
+        self.lease_runtime().stuck().found.clone()
+    }
+
+    /// Every [`STUCK_LOOK_MS`]: find the leases held past their resource's
+    /// stuck threshold (see [`crate::leases::stuck_after`], from the
+    /// typical holds in the event log) while someone waits, describe each
+    /// holder's process, and log `lease.stuck` once per lease in each
+    /// waiting session's log (a lead's watch on its children sees it).
+    fn stuck_tick(&self, now: i64) {
+        let runtime = self.lease_runtime();
+        let typical = {
+            let mut look = runtime.stuck();
+            if now - look.at < self.options.lease_stuck_look_ms {
+                return;
+            }
+            look.at = now;
+            look.kept.retain(|_, until| *until > now);
+            match &look.typical {
+                Some((read, typical)) if now - read < TYPICAL_READ_MS => typical.clone(),
+                _ => {
+                    let typical = self.typical_holds();
+                    look.typical = Some((now, typical.clone()));
+                    typical
+                }
+            }
+        };
+        let (leases, waiters): (Vec<Lease>, Vec<Waiter>) = {
+            let book = runtime.book();
+            (
+                book.leases().cloned().collect(),
+                book.waiters().cloned().collect(),
+            )
+        };
+        let kept = runtime.stuck().kept.clone();
+        let host = crate::machines::host_name();
+        let mut found = Vec::new();
+        for lease in leases {
+            let line: Vec<&Waiter> = waiters
+                .iter()
+                .filter(|w| w.resource == lease.resource)
+                .collect();
+            if line.is_empty() || kept.contains_key(&lease.id) {
+                continue;
+            }
+            let typical_ms = typical.get(&lease.resource).copied();
+            let (margin, unknown) = self.options.lease_stuck;
+            let threshold_ms = crate::leases::stuck_after(
+                typical_ms,
+                i64::try_from(margin.as_millis()).unwrap_or(i64::MAX),
+                i64::try_from(unknown.as_millis()).unwrap_or(i64::MAX),
+            );
+            let held_ms = now - lease.granted_at;
+            if held_ms < threshold_ms {
+                continue;
+            }
+            let doing = match &lease.holder {
+                Holder::Process {
+                    host: theirs, pid, ..
+                } if *theirs == host => crate::procs::tree(*pid, DOING_LINES),
+                _ => Vec::new(),
+            };
+            found.push(Stuck {
+                holder: self.holder_name(&lease.holder),
+                doing,
+                waiting: line.iter().map(|w| self.holder_name(&w.holder)).collect(),
+                waiting_sessions: line
+                    .iter()
+                    .filter_map(|w| w.holder.session().map(str::to_owned))
+                    .collect(),
+                held_ms,
+                threshold_ms,
+                typical_ms,
+                lease,
+            });
+        }
+        let new: Vec<Stuck> = {
+            let mut look = runtime.stuck();
+            look.told
+                .retain(|id| found.iter().any(|s| &s.lease.id == id));
+            let new = found
+                .iter()
+                .filter(|s| !look.told.contains(&s.lease.id))
+                .cloned()
+                .collect();
+            let changed = look.found != found;
+            for s in &found {
+                look.told.insert(s.lease.id.clone());
+            }
+            look.found = found;
+            if !changed {
+                return;
+            }
+            new
+        };
+        for stuck in new {
+            let data = serde_json::to_value(&stuck).unwrap_or_default();
+            eprintln!(
+                "fw hub: lease {} on {} stuck: held {} by {} while {} wait",
+                stuck.lease.id,
+                stuck.lease.resource,
+                super::starts::span(stuck.held_ms),
+                stuck.holder,
+                stuck.waiting.join(", ")
+            );
+            if stuck.waiting_sessions.is_empty() {
+                self.log_hub_event("lease.stuck", None, data.clone());
+            }
+            for session in &stuck.waiting_sessions {
+                self.log_hub_event("lease.stuck", Some(session), data.clone());
+            }
+        }
+        self.emit(super::HubEvent::Sessions);
+    }
+
+    /// The typical (p90) hold per resource, from the event log's released
+    /// leases; resources with too few say nothing.
+    fn typical_holds(&self) -> std::collections::HashMap<String, i64> {
+        let mut by: std::collections::HashMap<String, Vec<i64>> = Default::default();
+        match self.telemetry().lease_holds(TYPICAL_SAMPLES) {
+            Ok(rows) => {
+                for (resource, held) in rows {
+                    by.entry(resource).or_default().push(held);
+                }
+            }
+            Err(e) => eprintln!("fw hub: typical lease holds not read: {e}"),
+        }
+        by.into_iter()
+            .filter_map(|(resource, held)| Some((resource, crate::leases::p90(&held)?)))
+            .collect()
+    }
+
+    /// The operator's answer to stuck lease `id`: `release` breaks it and
+    /// signals its holder's process group (SIGTERM; a process on this
+    /// machine, never the hub's own group); `keep waiting` leaves it be
+    /// for another threshold.
+    pub fn answer_stuck_lease(&self, id: &str, answer: &str) -> Result<String, HubError> {
+        let stuck = self
+            .stuck_leases()
+            .into_iter()
+            .find(|s| s.lease.id == id)
+            .ok_or_else(|| {
+                StateError::NotFound(format!("a stuck lease {id} (released, or no longer stuck)"))
+            })?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "release" | "break" | "yes" => {
+                let lease = self.lease_release(None, &stuck.lease.id, true)?;
+                let signalled = match &lease.holder {
+                    Holder::Process {
+                        host, pid, started, ..
+                    } if *host == crate::machines::host_name()
+                        && started.is_none_or(|s| process_start(*pid) == Some(s)) =>
+                    {
+                        signal_group(*pid)
+                    }
+                    _ => None,
+                };
+                self.forget_stuck(&lease.id);
+                Ok(match signalled {
+                    Some(group) => format!(
+                        "released {} on {} and sent SIGTERM to {}'s process group {group}",
+                        lease.short(),
+                        lease.resource,
+                        stuck.holder
+                    ),
+                    None => format!(
+                        "released {} on {} (held by {})",
+                        lease.short(),
+                        lease.resource,
+                        stuck.holder
+                    ),
+                })
+            }
+            "keep waiting" | "keep" | "wait" | "no" => {
+                let mut look = self.lease_runtime().stuck();
+                look.kept
+                    .insert(stuck.lease.id.clone(), now_ms() + stuck.threshold_ms);
+                look.found.retain(|s| s.lease.id != stuck.lease.id);
+                look.told.remove(&stuck.lease.id);
+                drop(look);
+                self.emit(super::HubEvent::Sessions);
+                Ok(format!(
+                    "keeping {} on {}: asked again in {}",
+                    stuck.lease.short(),
+                    stuck.lease.resource,
+                    super::starts::span(stuck.threshold_ms)
+                ))
+            }
+            other => Err(
+                StateError::Invalid(format!("{other:?}: answer release or keep waiting")).into(),
+            ),
+        }
+    }
+
+    fn forget_stuck(&self, id: &str) {
+        let mut look = self.lease_runtime().stuck();
+        look.found.retain(|s| s.lease.id != id);
+        look.told.remove(id);
+        drop(look);
+        self.emit(super::HubEvent::Sessions);
     }
 
     /// Write, log, and tell `changes`.
@@ -820,6 +1099,21 @@ fn within(holder: &Holder, host: &str) -> Vec<String> {
             .map(|up| format!("p:{host}:{up}:{}", process_start(up).unwrap_or(0)))
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// SIGTERM to process `pid`'s group (its own when the group is the
+/// hub's, or init's): the group signalled, if any.
+fn signal_group(pid: u32) -> Option<i32> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    // SAFETY: getpgid and kill take plain integers.
+    let (group, ours) = unsafe { (libc::getpgid(pid), libc::getpgid(0)) };
+    if group > 1 && group != ours {
+        // SAFETY: as above.
+        (unsafe { libc::kill(-group, libc::SIGTERM) } == 0).then_some(group)
+    } else {
+        // SAFETY: as above.
+        (unsafe { libc::kill(pid, libc::SIGTERM) } == 0).then_some(pid)
     }
 }
 

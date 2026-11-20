@@ -79,6 +79,45 @@ pub(super) fn end_hold(from: &SessionRecord, pending: &PendingEnd, target: &str)
     }
 }
 
+/// A stuck lease as a hold: `lease:<lease>:<granted>`, held by the first
+/// session that waits (its owner hears it too).
+pub(super) fn stuck_hold(stuck: &super::leases::Stuck, name_of: &dyn Fn(&str) -> String) -> Hold {
+    let span = super::starts::span;
+    let typical = stuck.typical_ms.map_or_else(
+        || "no history".to_owned(),
+        |t| format!("typical {}", span(t)),
+    );
+    let doing = match stuck.doing.as_slice() {
+        [] => String::new(),
+        lines => format!(" Its process: {}.", lines.join(" / ")),
+    };
+    let session = stuck.waiting_sessions.first().cloned();
+    Hold {
+        id: format!("lease:{}:{}", stuck.lease.id, stuck.lease.granted_at),
+        kind: HoldKind::AwaitingApproval,
+        cause: format!("lease {} stuck", stuck.lease.resource),
+        session_name: session.as_deref().map(name_of),
+        session,
+        folder: None,
+        question: holds::cap(
+            &format!(
+                "{} held {} by {} ({typical}; stuck after {}) while {} wait{}.{doing} \
+                 Release breaks the lease and sends SIGTERM to its process group.",
+                stuck.lease.resource,
+                span(stuck.held_ms),
+                stuck.holder,
+                span(stuck.threshold_ms),
+                stuck.waiting.join(", "),
+                if stuck.waiting.len() == 1 { "s" } else { "" },
+            ),
+            holds::TEXT_CAP,
+        ),
+        recommendation: None,
+        answers: vec!["release".into(), "keep waiting".into()],
+        since: stuck.lease.granted_at + stuck.threshold_ms,
+    }
+}
+
 /// The decision on an approval hold.
 pub(super) fn approval_decision(hold: Hold, answer: &str) -> NewDecision {
     NewDecision {
@@ -229,6 +268,7 @@ impl Hub {
                 out.push(hold);
             }
         }
+        out.extend(self.stuck_leases().iter().map(|s| stuck_hold(s, &name_of)));
         out
     }
 
@@ -378,6 +418,9 @@ impl Hub {
             self.batches().insert(id.to_owned(), batch.to_owned());
         }
         let done = match prefix {
+            "lease" => self.answer_stuck_lease(session, answer).inspect(|_| {
+                self.record_decision(approval_decision(current.clone(), answer));
+            }),
             "start" => {
                 if yes_no(answer)? {
                     self.approve_start(session, rest, None, None)

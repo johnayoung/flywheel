@@ -32,6 +32,38 @@ pub const MAX_NOTE_CHARS: usize = 200;
 /// How long a granted wait is remembered for a caller to collect.
 const COLLECT_MS: i64 = 10 * 60 * 1000;
 
+/// Fewer released holds of a resource than this, and its typical hold
+/// is not known: [`DEFAULT_STUCK_MS`] stands in for the threshold.
+pub const MIN_SAMPLES: usize = 5;
+/// The stuck threshold of a resource with no history (ms): an hour.
+pub const DEFAULT_STUCK_MS: i64 = 60 * 60 * 1000;
+/// Never stuck before this (ms): ten minutes over the typical hold.
+pub const STUCK_MARGIN_MS: i64 = 10 * 60 * 1000;
+
+/// The 90th percentile of `held` (ms): `None` with fewer than
+/// [`MIN_SAMPLES`].
+pub fn p90(held: &[i64]) -> Option<i64> {
+    if held.len() < MIN_SAMPLES {
+        return None;
+    }
+    let mut sorted = held.to_vec();
+    sorted.sort_unstable();
+    // Nearest rank: the smallest value at or above 90% of them.
+    let rank = (sorted.len() * 9).div_ceil(10).max(1);
+    Some(sorted[rank - 1])
+}
+
+/// How long a lease may be held while someone waits before it reads as
+/// stuck (ms): `max(3 x p90, p90 + margin)` (`margin`: normally
+/// [`STUCK_MARGIN_MS`]), or `unknown` (normally [`DEFAULT_STUCK_MS`])
+/// with no typical hold to go by.
+pub fn stuck_after(p90: Option<i64>, margin: i64, unknown: i64) -> i64 {
+    match p90 {
+        Some(p) => (3 * p).max(p + margin),
+        None => unknown,
+    }
+}
+
 /// How a lease is held.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -784,6 +816,20 @@ mod tests {
             .acquire(inside(Mode::Shared, &child), 2, &mut id)
             .unwrap();
         assert!(matches!(got, Acquired::Granted(_)), "{got:?}");
+    }
+
+    #[test]
+    fn a_hold_is_stuck_past_three_typical_ones_or_ten_minutes_over() {
+        let min = 60 * 1000;
+        assert_eq!(p90(&[min; 4]), None, "too few to know");
+        let held: Vec<i64> = (1..=10).map(|m| m * min).collect();
+        assert_eq!(p90(&held), Some(9 * min));
+        let after = |p| stuck_after(p, STUCK_MARGIN_MS, DEFAULT_STUCK_MS);
+        // Long holds: three of them.
+        assert_eq!(after(Some(9 * min)), 27 * min);
+        // Short ones: ten minutes over.
+        assert_eq!(after(Some(2 * min)), 12 * min);
+        assert_eq!(after(None), DEFAULT_STUCK_MS);
     }
 
     #[test]

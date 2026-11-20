@@ -61,6 +61,62 @@ pub fn describe(pid: u32) -> String {
     }
 }
 
+/// The kernel function a process sleeps in (`/proc/<pid>/wchan`), when
+/// it sleeps in one: `locks_lock_inode_wait` is a process waiting for a
+/// file lock.
+pub fn wchan(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/wchan")).ok()?;
+    let text = text.trim();
+    (!text.is_empty() && text != "0").then(|| text.to_owned())
+}
+
+/// Every process's parent, read once: `(pid, parent)` pairs.
+fn parents() -> Vec<(u32, u32)> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| Some((pid, parent(pid)?)))
+        .collect()
+}
+
+/// What `pid` is doing, one line per process: it, then its descendants
+/// depth first (indented two spaces a level), each `pid command`, and
+/// `[waiting in WCHAN]` where it sleeps in a lock wait; at most `max`
+/// lines (a last line counts the rest).
+pub fn tree(pid: u32, max: usize) -> Vec<String> {
+    let all = parents();
+    let mut lines = Vec::new();
+    let mut left = 0usize;
+    let mut stack = vec![(pid, 0usize)];
+    while let Some((at, depth)) = stack.pop() {
+        if lines.len() >= max {
+            left += 1;
+            continue;
+        }
+        let Some(cmd) = command(at, 120) else {
+            continue;
+        };
+        let waiting = wchan(at)
+            .filter(|w| w.contains("lock") || w.contains("futex"))
+            .map(|w| format!(" [waiting in {w}]"))
+            .unwrap_or_default();
+        lines.push(format!("{}{at} {cmd}{waiting}", "  ".repeat(depth)));
+        let mut kids: Vec<u32> = all
+            .iter()
+            .filter(|(_, up)| *up == at)
+            .map(|(p, _)| *p)
+            .collect();
+        kids.sort_unstable_by(|a, b| b.cmp(a));
+        stack.extend(kids.into_iter().map(|k| (k, depth + 1)));
+    }
+    if left > 0 {
+        lines.push(format!("... {left} more"));
+    }
+    lines
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
@@ -76,6 +132,14 @@ mod tests {
         assert!(is_within(child.id(), me));
         assert!(!is_within(me, child.id()));
         assert!(command(child.id(), 100).unwrap().starts_with("sleep 5"));
+        let shown = tree(me, 400);
+        assert!(shown[0].starts_with(&format!("{me} ")), "{shown:?}");
+        assert!(
+            shown
+                .iter()
+                .any(|l| l.starts_with(&format!("  {} sleep 5", child.id()))),
+            "{shown:?}"
+        );
         let _ = child.kill();
         let _ = child.wait();
         assert!(!ancestors(me).is_empty());

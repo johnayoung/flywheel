@@ -157,7 +157,11 @@ const inspector = (() => {
     const held = (view.leases || []).map((l) =>
       `${l.resource} ${l.mode === "shared" ? "shared" : "excl"} ${mins(l.expires_at - now)} left`);
     const waits = (view.waiters || []).map((w) => `waiting ${w.resource} ${mins(now - w.queued_at)}`);
-    return [...held, ...waits].join(", ");
+    // Held past its stuck threshold while someone waits (Needs you has
+    // its Release / Keep waiting).
+    const stuck = (view.stuck || []).map((s) =>
+      `STUCK ${s.lease.resource}: held ${mins(s.held_ms)} by ${s.holder}${s.typical_ms ? ` (typical ${mins(s.typical_ms)})` : ""}${s.doing && s.doing.length ? `; doing: ${s.doing[s.doing.length - 1].trim()}` : ""}`);
+    return [...stuck, ...held, ...waits].join(", ");
   }
 
   // Its labels (key=value): the operator's first, then the hub's fw.*

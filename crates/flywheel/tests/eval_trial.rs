@@ -38,6 +38,11 @@ if [ ! -e "$HOME/idle" ]; then
 fi
 E='<!-- LOOP_STATUS -->\n{\"intent\":\"verify\",\"reason\":\"done\"}\n<!-- /LOOP_STATUS -->'
 printf '%s\n' '{"type":"system","subtype":"init","session_id":"sess-fake","model":"claude-fake-1"}'
+if [ -e "$HOME/peek" ]; then
+  p=$(cat "$HOME/peek")
+  printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cat '"$p"'"}}],"usage":{"input_tokens":1,"output_tokens":1}}}'
+  printf '%s\n' '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"x","is_error":false}]}}'
+fi
 printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"'"$E"'"}],"stop_reason":"end_turn","usage":{"input_tokens":7,"output_tokens":2}}}'
 printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"'"$E"'","num_turns":3,"total_cost_usd":0.25,"usage":{"input_tokens":7,"output_tokens":2}}'
 "#;
@@ -388,4 +393,41 @@ fn a_replay_pauses_at_its_budget_and_a_resume_finishes_every_cell() {
     assert_eq!(r["schema"], 1);
     assert_eq!(r["saturated_tasks"][0], "two");
     assert_eq!(r["overall"][0]["pass_hat_k"], 1.0);
+}
+
+#[test]
+fn an_agent_that_reads_the_held_out_oracle_is_contaminated_and_fails() {
+    let w = world();
+    std::fs::write(
+        w.home.join("peek"),
+        w.project.join("held-out/two.json").display().to_string(),
+    )
+    .unwrap();
+    let out = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "trial",
+            "core@v1",
+            "two",
+            "--variant",
+            "rule-off",
+            "--worker-timeout",
+            "120s",
+        ],
+    ));
+    let outcome: serde_json::Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
+    assert_eq!(outcome["oracle"], "pass", "it did the work: {outcome}");
+    assert_eq!(outcome["validity"], "contaminated", "{outcome}");
+    let trace: serde_json::Value =
+        serde_json::from_str(outcome["trace_json"].as_str().unwrap()).unwrap();
+    assert_eq!(trace["tool_calls"], 1, "{trace}");
+    assert!(
+        trace["reads_outside_trial"][0]
+            .as_str()
+            .unwrap()
+            .contains("held-out/two.json")
+    );
 }

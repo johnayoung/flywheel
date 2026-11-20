@@ -125,3 +125,12 @@ fw eval report RUN [--baseline LABEL] [--tier regression,discriminating] [--per-
 - **Metric labels:** the metrics named in `--primary` are starred; the rest are exploratory.
 - **Fastest passes:** listed as worth a read, since that is where fake passes hide.
 - **JSON:** the output is the hub view's data (`schema: 1`).
+
+## Trace checks
+
+The deterministic checks run over each trial's harness transcript (flywheel-agents' normalized events, so Claude Code and Codex read alike):
+- `check_sh_runs` counts runs of `scripts/check.sh`. A mention in text, a grep, or a pgrep does not count.
+- Also counted: unscoped test runs, Skill, MCP and subagent calls, test edits, `LOOP_STATUS` envelopes per attempt, and the longest streak of tool errors.
+- A tool input naming the operator's project home (held-out, verification, specs, tasks, eval sets) or the run's oracles marks the trial **contaminated**, which counts as a fail.
+
+`fw eval trace DIR [--forbid PATH]` prints them for any transcript dir.

@@ -418,6 +418,20 @@ fn execute(
         std::fs::copy(transcripts.join(&rel), &to).map_err(|e| e.to_string())?;
     }
 
+    // What the agent did, from the harness's transcript.
+    let trace =
+        crate::trace::read_dir(&dir.join("transcripts"), &trace_bounds(plan)).unwrap_or_default();
+    row.trace_json = serde_json::to_string(&trace).map_err(|e| e.to_string())?;
+    if trace.contaminated() {
+        row.validity = Some("contaminated".into());
+        row.validity_detail = Some(format!(
+            "read outside the trial: {}",
+            trace.reads_outside_trial.join(" | ")
+        ));
+    } else {
+        row.validity = Some("valid".into());
+    }
+
     // The final commit: landed, else the parked work branch, else the base.
     let landed = git::rev_parse(&clone, TRIAL_BRANCH).map_err(|e| e.to_string())?;
     let work_branch = format!("flywheel/{TRIAL_PHASE}/{}", task.id);
@@ -511,6 +525,35 @@ fn execute(
     };
     write_json(&dir.join("trial.json"), &record)?;
     Ok(())
+}
+
+/// What a trial's agent must not name: the operator's project home
+/// (held-out registrations, oracles, specs, tasks, eval sets and blobs)
+/// and the run's materialized oracles. Its own work dir lies under the
+/// project home too, so the forbidden paths are those subdirectories,
+/// never the whole home.
+pub fn trace_bounds(plan: &TrialPlan) -> crate::trace::Bounds {
+    let mut forbidden = vec![plan.run_dir.join("oracles").display().to_string()];
+    // run_dir = <project home>/evals/runs/<run>
+    if let Some(project) = plan
+        .run_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        for sub in [
+            "held-out",
+            "verification",
+            "specs",
+            "tasks",
+            "evals/sets",
+            "evals/blobs",
+            "flywheel.sqlite",
+        ] {
+            forbidden.push(project.join(sub).display().to_string());
+        }
+    }
+    crate::trace::Bounds { forbidden }
 }
 
 /// The per-run oracle dir for a task (materialized once per run).

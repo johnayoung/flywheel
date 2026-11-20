@@ -29,6 +29,7 @@ pub mod schedule;
 pub mod set;
 pub mod stats;
 pub mod store;
+pub mod trace;
 pub mod trial;
 pub mod validate;
 pub mod variant;

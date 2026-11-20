@@ -53,6 +53,17 @@ enum EvalCommand {
     /// baseline with its interval, smallest detectable difference, and
     /// verdict (better, worse, tie, no information).
     Report(crate::eval_replay::ReportArgs),
+    /// The deterministic trace checks over a transcript dir (a trial's
+    /// `transcripts/`), as JSON.
+    Trace(TraceArgs),
+}
+
+#[derive(Debug, Args)]
+struct TraceArgs {
+    dir: PathBuf,
+    /// A path the agent must not name (repeatable).
+    #[arg(long = "forbid", value_name = "PATH")]
+    forbid: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1057,6 +1068,18 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         EvalCommand::Replay(a) => crate::eval_replay::replay(&ctx, a, out, err),
         EvalCommand::Runs(a) => crate::eval_replay::runs(&ctx, a.json, out),
         EvalCommand::Report(a) => crate::eval_replay::report(&ctx, a, out),
+        EvalCommand::Trace(a) => flywheel_eval::trace::read_dir(
+            &a.dir,
+            &flywheel_eval::trace::Bounds {
+                forbidden: a.forbid.clone(),
+            },
+        )
+        .map_err(|e| format!("{}: {e}", a.dir.display()))
+        .and_then(|t| serde_json::to_string(&t).map_err(|e| e.to_string()))
+        .map(|j| {
+            let _ = writeln!(out, "{j}");
+            0
+        }),
     };
     match result {
         Ok(code) => code,

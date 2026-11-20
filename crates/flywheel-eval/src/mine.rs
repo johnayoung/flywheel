@@ -454,7 +454,7 @@ fn tokenize(text: &str, home: &str) -> String {
 
 /// Every absolute path under `home` a text mentions (up to a quote,
 /// whitespace, or a closing bracket).
-fn home_paths(text: &str, home: &str) -> BTreeSet<String> {
+pub(crate) fn home_paths(text: &str, home: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     let mut rest = text;
     while let Some(i) = rest.find(home) {
@@ -547,13 +547,6 @@ pub fn write_candidate(dir: &SetDir, paths: &ProjectPaths, c: &Candidate) -> Res
         format!("{}\n", set_task_json(&raw, &home)?),
     )
     .map_err(io(&dir.task_file(id)))?;
-    for path in home_paths(&raw, &home) {
-        let rel = path.trim_start_matches(&home);
-        if rel.starts_with("held-out") || rel.starts_with("verification") || rel.is_empty() {
-            continue;
-        }
-        copy_home_file(paths.root(), rel, &dir.spec_dir(id))?;
-    }
     let registration = paths.held_out().join(format!("{id}.json"));
     let reg_text = std::fs::read_to_string(&registration).map_err(io(&registration))?;
     let oracle_home = dir.oracle_dir(id).join("home");
@@ -588,7 +581,7 @@ pub fn write_candidate(dir: &SetDir, paths: &ProjectPaths, c: &Candidate) -> Res
         }
         if named
             && let Some(parent) = from.parent()
-            && parent != paths.root()
+            && parent != paths.root().join("verification")
             && parent.starts_with(paths.root().join("verification"))
             && packaged.insert(parent.to_owned())
         {
@@ -614,6 +607,15 @@ pub fn write_candidate(dir: &SetDir, paths: &ProjectPaths, c: &Candidate) -> Res
     let reg_out = dir.registration(id);
     std::fs::create_dir_all(dir.oracle_dir(id)).map_err(io(&dir.oracle_dir(id)))?;
     std::fs::write(&reg_out, tokenize(&reg_text, &home)).map_err(io(&reg_out))?;
+    // The files the task names (its spec, the scripts its own graders run),
+    // but never one the oracle is packaged from: those stay held out.
+    for path in home_paths(&raw, &home) {
+        let rel = path.trim_start_matches(&home);
+        if rel.is_empty() || rel.starts_with("held-out") || oracle_home.join(rel).exists() {
+            continue;
+        }
+        copy_home_file(paths.root(), rel, &dir.spec_dir(id))?;
+    }
     Ok(())
 }
 

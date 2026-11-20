@@ -286,3 +286,29 @@ fn the_oracle_sees_the_base_branch_at_the_tasks_base() {
     let proof = f.validate("fork", None);
     assert!(get(&proof, "V2").passed, "{proof:#?}");
 }
+
+#[test]
+fn a_grader_script_the_set_does_not_carry_fails_v7() {
+    let mut f = Fixture::new();
+    let base = f.repo.commit("base", &[("a.txt", "1")]);
+    let reference = f.repo.commit("ref", &[("a.txt", "2")]);
+    f.add("guarded", Source::Landed, &base, &reference, GOOD);
+    write_json(
+        &f.set.task_file("guarded"),
+        &serde_json::json!({"id": "guarded", "goal": "make a.txt 2", "graders": [
+            {"type": "command", "name": "guard",
+             "run": format!("bash {PROJECT_HOME_TOKEN}/verification/guard.sh")}]}),
+    )
+    .unwrap();
+    let proof = f.validate("guarded", None);
+    let v7 = get(&proof, "V7");
+    assert!(
+        !v7.passed && v7.detail.contains("verification/guard.sh"),
+        "{v7:?}"
+    );
+
+    let carried = f.set.spec_dir("guarded").join("verification/guard.sh");
+    std::fs::create_dir_all(carried.parent().unwrap()).unwrap();
+    std::fs::write(&carried, "true\n").unwrap();
+    assert!(get(&f.validate("guarded", None), "V7").passed);
+}

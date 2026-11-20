@@ -53,7 +53,7 @@ Standing-verify parks, and parks that re-landed unchanged, are flakes and are no
 | V3 | Every prerequisite's landed commit is in the base. If not, the base moves to the reference's parent. |
 | V4 | The base mirror holds no later commit. |
 | V5 | Two copies of the oracle pass at once. If it fails while `fw` processes run beside it, it is kept but graded alone. |
-| V6 / V7 | No oracle file or task names a live flywheel home. The task loads and has no prerequisites. |
+| V6 / V7 | No oracle file or task names a live flywheel home. The task loads, has no prerequisites, and the set carries every home file its own graders run. |
 
 **Test-suite lock:** oracle runs take turns with every other test suite on the machine through `scripts/check.sh`'s flock (`$XDG_RUNTIME_DIR/flywheel-check.lock`).
 - `FLYWHEEL_EVAL_LOCK=PATH` names a different lock; `FLYWHEEL_EVAL_LOCK=0` takes none.

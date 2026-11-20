@@ -43,7 +43,8 @@ impl Fixture {
             "goal": format!("do {id}"),
             "prerequisites": ["other"],
             "context": {"relevant": [format!("{home}specs/0001-spec.md -- the spec")],
-                        "non_goals": [format!("do not read {home}held-out/ or {home}verification/")]},
+                        "non_goals": [format!("do not read {home}held-out/, {home}verification/ or {home}verification/0001/oracle-{id}.sh")]},
+            "graders": [{"type": "command", "name": "guard", "run": format!("bash {home}verification/guard.sh")}],
         });
         let file = self
             .home
@@ -54,6 +55,8 @@ impl Fixture {
         std::fs::write(&file, serde_json::to_string(&task).unwrap()).unwrap();
         std::fs::create_dir_all(self.home.path().join("specs")).unwrap();
         std::fs::write(self.home.path().join("specs/0001-spec.md"), "# spec\n").unwrap();
+        std::fs::create_dir_all(self.home.path().join("verification")).unwrap();
+        std::fs::write(self.home.path().join("verification/guard.sh"), "true\n").unwrap();
         if with_oracle {
             let dir = self.home.path().join("verification/0001");
             std::fs::create_dir_all(&dir).unwrap();
@@ -306,6 +309,26 @@ fn the_draft_keeps_the_task_tokenized_its_specs_and_its_oracle_closure() {
     );
     assert!(dir.spec_dir("plain").join("specs/0001-spec.md").is_file());
     assert!(!dir.spec_dir("plain").join("held-out").exists());
+    // The script its own grader runs comes along; the oracle it names does not.
+    assert!(
+        dir.spec_dir("plain")
+            .join("verification/guard.sh")
+            .is_file()
+    );
+    assert!(
+        !dir.spec_dir("plain")
+            .join("verification/0001/oracle-plain.sh")
+            .exists()
+    );
+    // A top-level verification/ file an oracle names is not a package: the
+    // rest of verification/ (other tasks' oracles, guards) stays out.
+    let oracle_files = crate::set::files_under(&dir.oracle_dir("plain")).unwrap();
+    assert!(
+        !oracle_files
+            .iter()
+            .any(|f| f.ends_with("verification/guard.sh")),
+        "{oracle_files:?}"
+    );
     let reg = std::fs::read_to_string(dir.registration("plain")).unwrap();
     assert!(
         reg.contains("sh @EVAL_PROJECT_HOME@/verification/0001/oracle-plain.sh"),

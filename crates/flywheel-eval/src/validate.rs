@@ -79,6 +79,35 @@ fn names_live_home(text: &str) -> bool {
     text.contains("/.flywheel/projects/") || text.contains("~/.flywheel/projects")
 }
 
+/// The project-home files a task's own graders run that the set does not
+/// carry (a trial's fresh home would not have them, so every in-loop grade
+/// would fail on a missing file).
+fn grader_files_missing(set: &SetDir, id: &str, raw: &str) -> Vec<String> {
+    let runs: Vec<String> = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.get("graders").and_then(|g| g.as_array()).cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|g| g.get("run").and_then(|r| r.as_str()).map(str::to_owned))
+        .collect();
+    let mut missing = Vec::new();
+    for run in runs {
+        for path in crate::mine::home_paths(&run, PROJECT_HOME_TOKEN) {
+            let rel = path
+                .trim_start_matches(PROJECT_HOME_TOKEN)
+                .trim_start_matches('/');
+            if !rel.is_empty()
+                && !rel.starts_with("held-out")
+                && !set.spec_dir(id).join(rel).exists()
+                && !missing.contains(&rel.to_owned())
+            {
+                missing.push(rel.to_owned());
+            }
+        }
+    }
+    missing
+}
+
 struct Grader<'a> {
     oracle: Oracle,
     repo: &'a Path,
@@ -163,7 +192,19 @@ pub fn validate_task(
             Ok(_) if names_live_home(&raw) => {
                 check("V7", false, "the task names a live flywheel home")
             }
-            Ok(_) => check("V7", true, "loads; no prerequisites; home paths tokenized"),
+            Ok(_) => match grader_files_missing(set, id, &raw) {
+                missing if missing.is_empty() => {
+                    check("V7", true, "loads; no prerequisites; home paths tokenized")
+                }
+                missing => check(
+                    "V7",
+                    false,
+                    format!(
+                        "its graders run files the set does not carry: {}",
+                        missing.join(", ")
+                    ),
+                ),
+            },
         };
     checks.push(v7);
 

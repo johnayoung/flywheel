@@ -147,6 +147,18 @@ enum SetCommand {
     /// how often it passed: frontier (never), discriminating (sometimes),
     /// regression (always).
     Calibrate(crate::eval_replay::CalibrateArgs),
+    /// Add a recorded hub session to NAME's draft when it is a sound task
+    /// (one intent, merged, code); its oracle must then be blind-authored.
+    FromSession(FromSessionArgs),
+}
+
+#[derive(Debug, Args)]
+struct FromSessionArgs {
+    name: String,
+    session: String,
+    /// The hub that recorded it.
+    #[arg(long, value_name = "DIR")]
+    hub_state_dir: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -665,6 +677,91 @@ fn set_dont_act(ctx: &Ctx, args: &DontActArgs, out: &mut dyn Write) -> Result<i3
     Ok(0)
 }
 
+fn set_from_session(ctx: &Ctx, a: &FromSessionArgs, out: &mut dyn Write) -> Result<i32, String> {
+    use flywheel_eval::sessions;
+    let endpoint = flywheel_hub::endpoint::Endpoint::running(&a.hub_state_dir)?
+        .ok_or_else(|| format!("no hub runs for {}", a.hub_state_dir.display()))?;
+    let view = endpoint.blocking_call("GET", &format!("/api/sessions/{}", a.session), None)?;
+    let worktree = &view["worktree"];
+    let branch = worktree["branch"]
+        .as_str()
+        .ok_or("the session has no change branch (fw.change): nothing merged to compare")?;
+    let default_branch = worktree["base"].as_str().unwrap_or("main");
+    let repo = worktree["repo"]
+        .as_str()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ctx.repo().to_owned());
+    let started = view["created_at"]
+        .as_str()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&Utc))
+        .ok_or("the session has no start time")?;
+    let conversation = view["agent_session_id"]
+        .as_str()
+        .ok_or("the session has no agent conversation")?;
+    let cwd = view["cwd"]
+        .as_str()
+        .map(PathBuf::from)
+        .ok_or("the session has no cwd")?;
+    let transcript = claude_dir()
+        .join("projects")
+        .join(flywheel_eval::trial::claude_project_key(&cwd))
+        .join(format!("{conversation}.jsonl"));
+    let text = std::fs::read_to_string(&transcript)
+        .map_err(|e| format!("{}: {e}", transcript.display()))?;
+    let (prompts, reads) = sessions::from_transcript(&text);
+    let (base, merged_tip, changed) = sessions::git_facts(&repo, branch, default_branch, started)?;
+    let facts = sessions::SessionFacts {
+        session_id: a.session.clone(),
+        branch: branch.to_owned(),
+        base,
+        merged_tip,
+        prompts,
+        read_before_edit: reads
+            .into_iter()
+            .map(|p| {
+                p.strip_prefix(&format!("{}/", cwd.display()))
+                    .map_or(p.clone(), str::to_owned)
+            })
+            .collect(),
+        changed_files: changed,
+    };
+    let verdict = sessions::judge(&facts);
+    if !verdict.sound {
+        for r in &verdict.reasons {
+            let _ = writeln!(out, "  not sound: {r}");
+        }
+        return Ok(1);
+    }
+    let dir = SetDir::draft(&ctx.evals, &a.name);
+    let mut manifest = if dir.manifest().is_file() {
+        dir.load().map_err(|e| e.to_string())?
+    } else {
+        set::SetManifest {
+            name: a.name.clone(),
+            version: None,
+            project_id: ctx.project.id.clone(),
+            repo: ctx.repo().to_owned(),
+            created_at: Utc::now(),
+            tasks: Vec::new(),
+            hash: None,
+        }
+    };
+    let task = sessions::add_to_draft(&dir, &mut manifest, &facts).map_err(|e| e.to_string())?;
+    let _ = writeln!(
+        out,
+        "+ {} from session {} (base {}, reference {}).\nNext: blind-author its oracle (/fw-verify, from the goal and the reference diff) into {} with its files under {}, then fw eval set validate {}@draft",
+        task.id,
+        a.session,
+        short(&task.base),
+        short(&task.reference),
+        dir.registration(&task.id).display(),
+        dir.oracle_dir(&task.id).join("home").display(),
+        a.name
+    );
+    Ok(0)
+}
+
 fn set_diff(ctx: &Ctx, args: &DiffArgs, out: &mut dyn Write) -> Result<i32, String> {
     let load = |raw: &str| -> Result<set::SetManifest, String> {
         let r = SetRef::parse(raw)?;
@@ -1097,6 +1194,7 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         EvalCommand::Set(SetCommand::Show(a)) => set_show(&ctx, a, out),
         EvalCommand::Set(SetCommand::Diff(a)) => set_diff(&ctx, a, out),
         EvalCommand::Set(SetCommand::DontAct(a)) => set_dont_act(&ctx, a, out),
+        EvalCommand::Set(SetCommand::FromSession(a)) => set_from_session(&ctx, a, out),
         EvalCommand::Set(SetCommand::Calibrate(a)) => {
             crate::eval_replay::calibrate(&ctx, a, out, err)
         }

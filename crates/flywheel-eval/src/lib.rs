@@ -28,6 +28,7 @@ pub mod proc;
 pub mod report;
 pub mod review;
 pub mod schedule;
+pub mod sessions;
 pub mod set;
 pub mod stats;
 pub mod store;

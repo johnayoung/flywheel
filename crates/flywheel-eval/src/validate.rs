@@ -173,6 +173,19 @@ pub fn validate_task(
     });
 
     let work = options.work.join(id);
+    if !set.registration(id).is_file() {
+        checks.push(check(
+            "oracle",
+            false,
+            format!(
+                "no oracle yet: blind-author it (/fw-verify, from the goal and the reference \
+                 diff) into {}, its files under {} with project-home paths as {PROJECT_HOME_TOKEN}",
+                set.registration(id).display(),
+                set.oracle_dir(id).join("home").display()
+            ),
+        ));
+        return finish(set, manifest, index, checks, false, false, 0.0, now);
+    }
     let oracle = oracle::materialize(set, id, &work.join("oracle"))?;
     let log = work.join("oracle.log");
     let _ = std::fs::remove_file(&log);

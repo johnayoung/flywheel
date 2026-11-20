@@ -28,6 +28,13 @@ Which tasks qualify: only those with a held-out registration. The miner labels e
 
 Standing-verify parks, and parks that re-landed unchanged, are flakes and are not counted as hard.
 
+**Hub sessions** become tasks only when sound:
+- the change branch merged;
+- one operator prompt carries the requirements, and later prompts only approve or continue;
+- the change touches code.
+
+`fw eval set from-session NAME SESSION --hub-state-dir DIR` adds one, with no oracle. Blind-author its oracle (`/fw-verify`) into the printed paths, then validate. Until then, validation fails naming the paths.
+
 **Tiers are measured, not guessed:** `calibrate` runs the baseline on the validated draft and sets each task's tier:
 
 | Tier | Baseline result | Use |

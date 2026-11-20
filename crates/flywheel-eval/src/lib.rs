@@ -17,4 +17,9 @@
 //! `docs/eval.md`.
 
 pub mod db;
+pub mod git;
+pub mod set;
 pub mod store;
+
+#[cfg(test)]
+mod testutil;

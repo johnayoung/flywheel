@@ -238,6 +238,10 @@ impl ProjectPaths {
     pub fn held_out(&self) -> PathBuf {
         self.root.join("held-out")
     }
+    /// `evals`: `fw eval`'s sets, variants, and run artifacts.
+    pub fn evals(&self) -> PathBuf {
+        self.root.join("evals")
+    }
     pub fn logs(&self) -> PathBuf {
         self.root.join("logs")
     }

@@ -635,3 +635,80 @@ fn trial_dir_of(project: &Path, trial: &str) -> PathBuf {
         .find(|d| d.file_name().unwrap().to_string_lossy() == trial)
         .unwrap()
 }
+
+#[test]
+fn calibration_sets_each_tasks_tier_from_the_baseline() {
+    let w = world();
+    ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "set", "build", "core"],
+    ));
+    let unvalidated = fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "set",
+            "calibrate",
+            "core",
+            "--variant",
+            "rule-off",
+            "-k",
+            "2",
+            "--budget",
+            "10",
+        ],
+    );
+    assert!(String::from_utf8_lossy(&unvalidated.stderr).contains("not validated"));
+    ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "set",
+            "validate",
+            "core@draft",
+            "--no-noise",
+            "--timeout",
+            "60s",
+        ],
+    ));
+    let out = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "set",
+            "calibrate",
+            "core",
+            "--variant",
+            "rule-off",
+            "-k",
+            "2",
+            "--budget",
+            "10",
+            "--worker-timeout",
+            "120s",
+        ],
+    ));
+    assert!(out.contains("two") && out.contains("regression"), "{out}");
+    ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "set", "freeze", "core"],
+    ));
+    let shown = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "set", "show", "core@v2", "--json"],
+    ));
+    let m: serde_json::Value = serde_json::from_str(&shown).unwrap();
+    assert_eq!(m["tasks"][0]["tier"], "regression");
+}

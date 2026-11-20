@@ -109,7 +109,24 @@ fn load_set(ctx: &Ctx, raw: &str, allow_draft: bool) -> Result<(SetDir, SetManif
         return Err("replays run on a frozen set: fw eval set freeze NAME".into());
     }
     let dir = set::resolve(&ctx.evals, &r).map_err(|e| e.to_string())?;
-    let manifest = dir.load().map_err(|e| e.to_string())?;
+    let mut manifest = dir.load().map_err(|e| e.to_string())?;
+    if manifest.version.is_none() {
+        // A draft (calibration): only validated tasks, with what their
+        // proofs found (a frozen set carries these itself).
+        for t in &mut manifest.tasks {
+            match dir.proof(&t.id).map_err(|e| e.to_string())? {
+                Some(p) if p.passed && p.base == t.base && p.reference == t.reference => {
+                    t.parallel_safe = Some(p.parallel_safe);
+                }
+                _ => {
+                    return Err(format!(
+                        "{} is not validated: fw eval set validate {}@draft",
+                        t.id, manifest.name
+                    ));
+                }
+            }
+        }
+    }
     Ok((dir, manifest))
 }
 
@@ -352,6 +369,16 @@ pub(crate) fn replay(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<i32, String> {
+    replay_run(ctx, a, out, err).map(|(code, _)| code)
+}
+
+/// [`replay`], with the run's id.
+fn replay_run(
+    ctx: &Ctx,
+    a: &ReplayArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<(i32, String), String> {
     let store = ctx.store()?;
     let all = store.all_trials().map_err(|e| e.to_string())?;
     let (run, set_dir, manifest, variants) = if let Some(run_id) = &a.resume {
@@ -561,7 +588,7 @@ pub(crate) fn replay(
                 "run {} done. Next: fw eval report {}",
                 run.run_id, run.run_id
             );
-            Ok(0)
+            Ok((0, run.run_id.clone()))
         }
         Stopped::Budget {
             spent,
@@ -574,7 +601,7 @@ pub(crate) fn replay(
                  Continue with: fw eval replay --resume {} --budget USD",
                 run.run_id, run.run_id
             );
-            Ok(75)
+            Ok((75, run.run_id.clone()))
         }
         Stopped::Halted(why) => {
             let _ = writeln!(
@@ -582,7 +609,7 @@ pub(crate) fn replay(
                 "run {} paused: {why}. Continue with: fw eval replay --resume {}",
                 run.run_id, run.run_id
             );
-            Ok(75)
+            Ok((75, run.run_id.clone()))
         }
     }
 }
@@ -899,5 +926,106 @@ pub(crate) fn decide(ctx: &Ctx, a: &DecideArgs, out: &mut dyn Write) -> Result<i
         .decide_review(&a.run, &a.trial, decision, Utc::now())
         .map_err(|e| e.to_string())?;
     let _ = writeln!(out, "trial {}: {validity}", a.trial);
+    Ok(0)
+}
+
+#[derive(Debug, Args)]
+pub struct CalibrateArgs {
+    /// NAME or NAME@draft.
+    pub set: String,
+    /// The baseline variant.
+    #[arg(long, value_name = "NAME", required_unless_present = "from_run")]
+    pub variant: Option<String>,
+    #[arg(short, long, default_value_t = 3)]
+    pub k: u32,
+    #[arg(long, default_value_t = 3)]
+    pub parallel: u32,
+    #[arg(long, value_name = "USD")]
+    pub budget: Option<f64>,
+    #[arg(long, value_name = "DIR")]
+    pub hub_state_dir: Option<PathBuf>,
+    #[arg(long, default_value = "2h", value_name = "SPAN")]
+    pub worker_timeout: String,
+    /// Take the tiers from this finished run instead of running one.
+    #[arg(long, value_name = "RUN")]
+    pub from_run: Option<String>,
+}
+
+/// The tier each task's baseline trials put it in.
+pub fn tiers_of(trials: &[TrialRow]) -> BTreeMap<String, Tier> {
+    let mut counts: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    for t in trials
+        .iter()
+        .filter(|t| t.status() == flywheel_eval::store::TrialStatus::Done)
+    {
+        let c = counts.entry(t.task_id.clone()).or_insert((0, 0));
+        c.1 += 1;
+        if flywheel_eval::report::passed(t) {
+            c.0 += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(id, (p, n))| (id, Tier::of(p, n)))
+        .collect()
+}
+
+/// `fw eval set calibrate`.
+pub(crate) fn calibrate(
+    ctx: &Ctx,
+    a: &CalibrateArgs,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> Result<i32, String> {
+    let r = SetRef::parse(&a.set)?;
+    if matches!(r.version, Some(VersionRef::V(_))) {
+        return Err("calibrate a draft (tiers are fixed at freeze)".into());
+    }
+    let dir = SetDir::draft(&ctx.evals, &r.name);
+    let run_id = match &a.from_run {
+        Some(run) => run.clone(),
+        None => {
+            let args = ReplayArgs {
+                set: Some(format!("{}@draft", r.name)),
+                variants: a.variant.iter().cloned().collect(),
+                k: a.k,
+                parallel: a.parallel,
+                budget: a.budget,
+                primary: "success".into(),
+                seed: 1,
+                worker_timeout: a.worker_timeout.clone(),
+                oracle_timeout: "30m".into(),
+                hub_state_dir: a.hub_state_dir.clone(),
+                resume: None,
+                select: Select::default(),
+                allow_draft: true,
+            };
+            let (code, run_id) = replay_run(ctx, &args, out, err)?;
+            if code != 0 {
+                let _ = writeln!(
+                    err,
+                    "calibration paused; tiers are set once run {run_id} finishes (fw eval set calibrate {} --from-run {run_id})",
+                    r.name
+                );
+                return Ok(code);
+            }
+            run_id
+        }
+    };
+    let store = ctx.store()?;
+    let tiers = tiers_of(&store.trials(&run_id).map_err(|e| e.to_string())?);
+    let mut manifest = dir.load().map_err(|e| e.to_string())?;
+    for t in &mut manifest.tasks {
+        if let Some(tier) = tiers.get(&t.id) {
+            t.tier = *tier;
+            let _ = writeln!(out, "  {:<40} {}", t.id, tier.as_str());
+        }
+    }
+    dir.save(&manifest).map_err(|e| e.to_string())?;
+    let _ = writeln!(
+        out,
+        "tiers from run {run_id} set on {}@draft. Next: fw eval set freeze {}",
+        r.name, r.name
+    );
     Ok(0)
 }

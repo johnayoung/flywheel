@@ -143,6 +143,10 @@ enum SetCommand {
     /// at its own reference, where the right move is to check and change
     /// nothing (validate the twins next).
     DontAct(DontActArgs),
+    /// Run the baseline k times on each draft task and set its tier from
+    /// how often it passed: frontier (never), discriminating (sometimes),
+    /// regression (always).
+    Calibrate(crate::eval_replay::CalibrateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1093,6 +1097,9 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         EvalCommand::Set(SetCommand::Show(a)) => set_show(&ctx, a, out),
         EvalCommand::Set(SetCommand::Diff(a)) => set_diff(&ctx, a, out),
         EvalCommand::Set(SetCommand::DontAct(a)) => set_dont_act(&ctx, a, out),
+        EvalCommand::Set(SetCommand::Calibrate(a)) => {
+            crate::eval_replay::calibrate(&ctx, a, out, err)
+        }
         EvalCommand::Variant(VariantCommand::Pin(a)) => variant_pin(&ctx, a, out),
         EvalCommand::Variant(VariantCommand::Show(a)) => variant_show(&ctx, a, out),
         EvalCommand::Variant(VariantCommand::Diff(a)) => variant_diff(&ctx, a, out),

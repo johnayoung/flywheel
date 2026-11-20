@@ -12,6 +12,7 @@ Measure whether a change to the agent setup (CLAUDE.md, skills, MCP config, prom
 ```bash
 fw eval set build core               # mine past runs into core@draft (--include landed,hard; --since; --max; --tasks)
 fw eval set validate core@draft      # V1-V7 per task, holding the test-suite lock (see below)
+fw eval set calibrate core --variant BASE -k 3 --budget 100   # tiers from how often the baseline passed
 fw eval set freeze core              # -> core@v1: hashed, refs pinned, read-only (--split dev=.6,val=.2,test=.2)
 fw eval set ls | show core@v1 | diff core@v1 core@v2
 ```
@@ -26,6 +27,16 @@ Which tasks qualify: only those with a held-out registration. The miner labels e
 | `hard-failed` | Never landed. Its reference is bisected at validation. |
 
 Standing-verify parks, and parks that re-landed unchanged, are flakes and are not counted as hard.
+
+**Tiers are measured, not guessed:** `calibrate` runs the baseline on the validated draft and sets each task's tier:
+
+| Tier | Baseline result | Use |
+| --- | --- | --- |
+| `frontier` | never passed | headroom |
+| `discriminating` | sometimes passed | where success differences show |
+| `regression` | always passed | regressions and efficiency |
+
+`--from-run RUN` reuses a finished run instead of running one. `--split dev=.6,val=.2,test=.2` at freeze fixes the splits, seeded.
 
 **Base:** the parent of the landed commit's `Flywheel-Run` trailer chain.
 

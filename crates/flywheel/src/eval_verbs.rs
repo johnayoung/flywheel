@@ -586,10 +586,6 @@ fn describe_variant(v: &variant::ResolvedVariant) -> Vec<(String, String)> {
             v.model.clone().unwrap_or_else(|| "(agent default)".into()),
         ),
         (
-            "effort".to_owned(),
-            v.effort.clone().unwrap_or_else(|| "(default)".into()),
-        ),
-        (
             "fw".to_owned(),
             format!(
                 "{} {} sha256 {}",

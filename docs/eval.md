@@ -65,7 +65,7 @@ mcp_servers = ["context7"]           # from ~/.claude.json -> .mcp.json
 - No separate config dir is used, so credentials stay where Claude Code refreshes them.
 - Before each replay, a no-cost canary checks that this Claude Code build still honors the flag. It plants a skill, an MCP server, and a hook in a scratch config dir and runs once with `user` and once without.
 
-**Codex variants (v1)** take only `model`, `effort`, `env`, and `[[repo]]` overlays. The user's Codex files are hashed, so a change between runs shows up.
+**Codex variants (v1)** take only `model`, `env`, and `[[repo]]` overlays. The user's Codex files are hashed, so a change between runs shows up.
 
 ```bash
 fw eval variant ls | show NAME | diff A B | pin NAME

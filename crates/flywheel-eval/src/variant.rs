@@ -5,7 +5,6 @@
 //! # evals/variants/rule-off.toml
 //! agent = "claude"                     # claude | codex
 //! model = "opus"
-//! effort = "high"                      # optional
 //! fw = "current"                       # current | /path/to/fw
 //! permission_mode = "bypassPermissions"
 //! setting_sources = ["project", "local"]   # never "user": user layers come in below
@@ -28,7 +27,7 @@
 //! Credentials are untouched (Claude Code keeps refreshing them where they
 //! are). [`canary`] proves, before a replay, that this build of Claude Code
 //! still honors the flag. Codex has no such switch: a Codex variant (v1)
-//! may set model, effort, env, and repo overlays only, and its user files
+//! may set model, env, and repo overlays only, and its user files
 //! are hashed so a change shows.
 
 use std::collections::BTreeMap;
@@ -145,8 +144,6 @@ pub struct VariantFile {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
-    pub effort: Option<String>,
-    #[serde(default)]
     pub fw: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
@@ -189,7 +186,6 @@ pub struct ResolvedVariant {
     /// `claude-code` or `codex` (the worker's `--agent`).
     pub agent: String,
     pub model: Option<String>,
-    pub effort: Option<String>,
     /// The `fw` binary trials run, and its digest and version.
     pub fw_path: PathBuf,
     pub fw_sha256: String,
@@ -367,7 +363,7 @@ pub fn resolve(
             || file.permission_mode.is_some();
         if user_level {
             return invalid(
-                "a codex variant takes model, effort, env, and repo overlays only: Codex \
+                "a codex variant takes model, env, and repo overlays only: Codex \
                  cannot leave out user-level layers, so a variant cannot pin them",
             );
         }
@@ -571,7 +567,6 @@ pub fn resolve(
         name: name.to_owned(),
         agent: agent.to_owned(),
         model: file.model.clone(),
-        effort: file.effort.clone(),
         fw_path,
         fw_sha256,
         fw_version,

@@ -92,20 +92,22 @@ Rubric graders run an LLM-as-judge in a fresh (cold) agent session through the `
 
 ```html
 <!-- RUBRIC_VERDICT -->
-{"passed": true, "summary": "<one or two sentences>", "unknown": false}
+{"passed": true, "summary": "<one or two sentences>", "unknown": false,
+ "assertions": [{"passed": true, "reason": "<one sentence>"}]}
 <!-- /RUBRIC_VERDICT -->
 ```
 
 - `passed` (bool, required) — true if every assertion holds.
 - `summary` (str, required) — brief rationale; empty string accepted.
 - `unknown` (bool, optional, default false) — set true only when evidence is insufficient. Counts as a pass for lifecycle purposes; surfaced via `harness.rubric_unknown`.
+- `assertions` (list) — one `{passed, unknown?, reason}` per assertion, in order; stored as the payload's `per_assertion` (`{text, verdict, rationale}`). Absent = `[]`. A wrong count, or a `passed` that disagrees with the entries (unless `unknown`), is malformed. Diagnosis only: landing stays all-pass.
 
 The verdict is untrusted protocol input. The parser returns a closed taxonomy and each non-valid variant routes through `INTERNAL_ERROR` (judge-infrastructure failure, retry-eligible):
 
 - `MissingVerdict` — no opening fence in the judge's response.
 - `TruncatedVerdict` — opening fence with no matching closing fence.
 - `DuplicateVerdict` — more than one fence pair (guards against prompt-injection style fake verdicts).
-- `MalformedVerdict` — JSON decode failure or field-level shape violation (missing/wrong-type `passed`, `summary`, or `unknown`).
+- `MalformedVerdict` — JSON decode failure or field-level shape violation (missing/wrong-type `passed`, `summary`, `unknown`, or `assertions`).
 
 When a rubric `passed=false` verdict triggers an auto-retry (`retry_on_fail=True`), its `summary` is carried into the next attempt's prompt as a `# Reviewer feedback` section so the working agent sees the critique on its next iteration.
 

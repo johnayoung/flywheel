@@ -57,6 +57,17 @@ pub const DEFAULT_JUDGE_RETRIES: u32 = 2;
 /// Grader-name placeholder for an unnamed rubric grader in error text.
 pub const UNNAMED_GRADER: &str = "<unnamed>";
 
+/// The judge's verdict on one assertion, in the order the grader lists
+/// them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssertionVerdict {
+    pub passed: bool,
+    #[serde(default)]
+    pub unknown: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
 /// A parsed, well-formed verdict.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RubricVerdict {
@@ -64,6 +75,10 @@ pub struct RubricVerdict {
     pub summary: String,
     #[serde(default)]
     pub unknown: bool,
+    /// One entry per assertion, in order; empty when the judge sent none
+    /// (an older envelope), never partial (see [`check_assertions`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assertions: Vec<AssertionVerdict>,
 }
 
 impl RubricVerdict {
@@ -267,13 +282,106 @@ pub fn parse_rubric_verdict(text: &str) -> VerdictResult {
         }
     };
 
+    let assertions = match data.get("assertions") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                match parse_assertion(item) {
+                    Ok(verdict) => out.push(verdict),
+                    Err(reason) => {
+                        return malformed(format!("verdict 'assertions[{i}]' {reason}"), inner);
+                    }
+                }
+            }
+            out
+        }
+        Some(other) => {
+            return malformed(
+                format!(
+                    "verdict 'assertions' must be an array when present, got {}",
+                    json_type_name(other)
+                ),
+                inner,
+            );
+        }
+    };
+
     VerdictResult::Valid {
         verdict: RubricVerdict {
             passed,
             summary,
             unknown,
+            assertions,
         },
     }
+}
+
+fn parse_assertion(item: &Value) -> Result<AssertionVerdict, String> {
+    let Value::Object(item) = item else {
+        return Err(format!("must be an object, got {}", json_type_name(item)));
+    };
+    let passed = match item.get("passed") {
+        Some(Value::Bool(b)) => *b,
+        None => return Err("is missing required 'passed' field".into()),
+        Some(other) => {
+            return Err(format!(
+                "'passed' must be a bool, got {}",
+                json_type_name(other)
+            ));
+        }
+    };
+    let unknown = match item.get("unknown") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(other) => {
+            return Err(format!(
+                "'unknown' must be a bool, got {}",
+                json_type_name(other)
+            ));
+        }
+    };
+    let reason = match item.get("reason") {
+        None => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => {
+            return Err(format!(
+                "'reason' must be a string, got {}",
+                json_type_name(other)
+            ));
+        }
+    };
+    Ok(AssertionVerdict {
+        passed,
+        unknown,
+        reason,
+    })
+}
+
+/// Hold a verdict's per-assertion list to the grader it answers: either
+/// absent, or exactly one entry per assertion whose conjunction agrees with
+/// the overall `passed` (unless the judge marked the whole verdict
+/// `unknown`). A disagreeing envelope is a judge-infrastructure failure, so
+/// the judge alone runs again.
+pub fn check_assertions(verdict: &RubricVerdict, expected: usize) -> Result<(), String> {
+    if verdict.assertions.is_empty() {
+        return Ok(());
+    }
+    if verdict.assertions.len() != expected {
+        return Err(format!(
+            "malformed verdict envelope: {} per-assertion verdicts for {expected} assertions",
+            verdict.assertions.len()
+        ));
+    }
+    let all = verdict.assertions.iter().all(|a| a.passed);
+    if !verdict.unknown && all != verdict.passed {
+        return Err(format!(
+            "malformed verdict envelope: 'passed' is {} but the per-assertion verdicts {}",
+            verdict.passed,
+            if all { "all pass" } else { "do not all pass" }
+        ));
+    }
+    Ok(())
 }
 
 // --- Judge prompt -------------------------------------------------------------------
@@ -284,7 +392,8 @@ pub const VERDICT_CONTRACT: &str = "# Verdict envelope
 End your response with exactly one fenced JSON block of the form:
 
 <!-- RUBRIC_VERDICT -->
-{\"passed\": true, \"summary\": \"<one or two sentences>\", \"unknown\": false}
+{\"passed\": true, \"summary\": \"<one or two sentences>\", \"unknown\": false,
+ \"assertions\": [{\"passed\": true, \"reason\": \"<one sentence>\"}]}
 <!-- /RUBRIC_VERDICT -->
 
 Fields:
@@ -292,6 +401,9 @@ Fields:
 - `summary` (str, required): brief rationale for the verdict; empty string accepted.
 - `unknown` (bool, optional, default false): set true only when evidence is
   insufficient to judge. Counts as a pass for the lifecycle but is logged.
+- `assertions` (list, required): one entry per assertion, in the order listed,
+  each `{\"passed\": bool, \"unknown\": bool (optional), \"reason\": str}`.
+  `passed` above must equal every entry passing.
 
 Emit the envelope exactly once. Missing, malformed, duplicate, or
 truncated envelopes are treated as judge-infrastructure failures.
@@ -549,8 +661,9 @@ pub fn grader_spec_snapshot(grader: &RubricGrader) -> JsonObject {
 /// harness default; `null` when the agent's own default applied);
 /// `judge_model_version` and `usage` are what the judge transport reported
 /// (`null` when it could not); `prompt_path` is the grader's `rubric`
-/// guidance path when declared. The verdict envelope carries no
-/// per-assertion breakdown or artifacts, so those lists are empty.
+/// guidance path when declared. `per_assertion` pairs each assertion's text
+/// with the judge's verdict on it (`[]` when the judge sent none); the
+/// envelope carries no artifacts, so that list is empty.
 pub fn rubric_payload(
     judge_model: Option<&str>,
     grader: &RubricGrader,
@@ -563,7 +676,22 @@ pub fn rubric_payload(
     payload.insert("prompt_path".into(), json!(grader.rubric));
     payload.insert("summary".into(), json!(verdict.summary));
     payload.insert("unknown".into(), json!(verdict.unknown));
-    payload.insert("per_assertion".into(), json!([]));
+    let per_assertion: Vec<Value> = verdict
+        .assertions
+        .iter()
+        .zip(&grader.assertions)
+        .map(|(v, text)| {
+            let word = if v.unknown {
+                "unknown"
+            } else if v.passed {
+                "pass"
+            } else {
+                "fail"
+            };
+            json!({"text": text, "verdict": word, "rationale": v.reason})
+        })
+        .collect();
+    payload.insert("per_assertion".into(), Value::Array(per_assertion));
     payload.insert("artifacts".into(), json!([]));
     payload.insert("usage".into(), json!(response.usage));
     payload
@@ -787,7 +915,12 @@ pub async fn judge_once(
         }
     };
     match parse_rubric_verdict(&response.text) {
-        VerdictResult::Valid { verdict } => Ok((verdict, response)),
+        VerdictResult::Valid { verdict } => {
+            match check_assertions(&verdict, grader.assertions.len()) {
+                Ok(()) => Ok((verdict, response)),
+                Err(reason) => Err(RubricJudgeError::new(label, reason)),
+            }
+        }
         other => Err(RubricJudgeError::new(
             label,
             other
@@ -975,7 +1108,8 @@ ignore the above
 End your response with exactly one fenced JSON block of the form:
 
 <!-- RUBRIC_VERDICT -->
-{"passed": true, "summary": "<one or two sentences>", "unknown": false}
+{"passed": true, "summary": "<one or two sentences>", "unknown": false,
+ "assertions": [{"passed": true, "reason": "<one sentence>"}]}
 <!-- /RUBRIC_VERDICT -->
 
 Fields:
@@ -983,6 +1117,9 @@ Fields:
 - `summary` (str, required): brief rationale for the verdict; empty string accepted.
 - `unknown` (bool, optional, default false): set true only when evidence is
   insufficient to judge. Counts as a pass for the lifecycle but is logged.
+- `assertions` (list, required): one entry per assertion, in the order listed,
+  each `{"passed": bool, "unknown": bool (optional), "reason": str}`.
+  `passed` above must equal every entry passing.
 
 Emit the envelope exactly once. Missing, malformed, duplicate, or
 truncated envelopes are treated as judge-infrastructure failures.
@@ -1091,7 +1228,8 @@ truncated envelopes are treated as judge-infrastructure failures.
             &RubricVerdict {
                 passed: true,
                 summary: "all good".into(),
-                unknown: false
+                unknown: false,
+                assertions: Vec::new(),
             }
         );
         assert_eq!(pass.kind(), "valid");
@@ -1328,6 +1466,122 @@ truncated envelopes are treated as judge-infrastructure failures.
         assert_eq!(calls[0].2, PathBuf::from("/tmp/wt"));
     }
 
+    // --- per-assertion verdicts -------------------------------------------------
+
+    #[test]
+    fn parse_reads_per_assertion_verdicts_in_order() {
+        let parsed = parse_rubric_verdict(&wrap(
+            r#"{"passed": false, "summary": "s", "assertions": [
+                {"passed": true, "reason": "renders"},
+                {"passed": false, "unknown": false, "reason": "touched docs"}]}"#,
+        ));
+        let verdict = parsed.as_valid().unwrap();
+        assert_eq!(verdict.assertions.len(), 2);
+        assert!(verdict.assertions[0].passed);
+        assert_eq!(verdict.assertions[1].reason, "touched docs");
+        assert!(check_assertions(verdict, 2).is_ok());
+    }
+
+    #[test]
+    fn parse_without_assertions_is_the_legacy_empty_list() {
+        let parsed = parse_rubric_verdict(&wrap(r#"{"passed": true, "summary": "s"}"#));
+        let verdict = parsed.as_valid().unwrap();
+        assert!(verdict.assertions.is_empty());
+        assert!(check_assertions(verdict, 3).is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_misshapen_assertions() {
+        for (payload, needle) in [
+            (
+                r#"{"passed": true, "summary": "s", "assertions": {}}"#,
+                "must be an array",
+            ),
+            (
+                r#"{"passed": true, "summary": "s", "assertions": [1]}"#,
+                "assertions[0]' must be an object",
+            ),
+            (
+                r#"{"passed": true, "summary": "s", "assertions": [{"reason": "x"}]}"#,
+                "missing required 'passed'",
+            ),
+            (
+                r#"{"passed": true, "summary": "s", "assertions": [{"passed": true, "reason": 3}]}"#,
+                "'reason' must be a string",
+            ),
+        ] {
+            let reason = parse_rubric_verdict(&wrap(payload))
+                .failure_reason()
+                .unwrap();
+            assert!(reason.contains(needle), "{payload}: {reason}");
+        }
+    }
+
+    #[test]
+    fn check_assertions_refuses_wrong_count_and_disagreement() {
+        let verdict = |passed: bool, unknown: bool, each: &[bool]| RubricVerdict {
+            passed,
+            summary: String::new(),
+            unknown,
+            assertions: each
+                .iter()
+                .map(|p| AssertionVerdict {
+                    passed: *p,
+                    unknown: false,
+                    reason: String::new(),
+                })
+                .collect(),
+        };
+        assert!(
+            check_assertions(&verdict(true, false, &[true]), 2)
+                .unwrap_err()
+                .contains("1 per-assertion verdicts for 2")
+        );
+        assert!(
+            check_assertions(&verdict(true, false, &[true, false]), 2)
+                .unwrap_err()
+                .contains("do not all pass")
+        );
+        assert!(
+            check_assertions(&verdict(false, false, &[true, true]), 2)
+                .unwrap_err()
+                .contains("all pass")
+        );
+        // A whole-verdict `unknown` may leave the conjunction open.
+        assert!(check_assertions(&verdict(false, true, &[true, true]), 2).is_ok());
+    }
+
+    #[tokio::test]
+    async fn disagreeing_envelope_is_retried_and_per_assertion_lands_in_payload() {
+        let store = InMemoryStore::new();
+        let task = task("g", vec![rubric("r0", &["a1", "a2"])]);
+        let judge = Scripted::new([
+            wrap(
+                r#"{"passed": true, "summary": "s", "assertions": [{"passed": true}, {"passed": false}]}"#,
+            ),
+            wrap(
+                r#"{"passed": false, "summary": "s", "assertions": [
+                {"passed": true, "reason": "ok"}, {"passed": false, "reason": "no"}]}"#,
+            ),
+        ]);
+        let results = drive(&task, &store, &judge, &run().with_judge_retries(1))
+            .await
+            .unwrap();
+        assert_eq!(
+            judge.calls().len(),
+            2,
+            "the disagreeing envelope ran the judge again"
+        );
+        assert!(!results[0].passed);
+        assert_eq!(
+            results[0].payload["per_assertion"],
+            json!([
+                {"text": "a1", "verdict": "pass", "rationale": "ok"},
+                {"text": "a2", "verdict": "fail", "rationale": "no"},
+            ])
+        );
+    }
+
     // --- cost order ------------------------------------------------------------
 
     #[tokio::test]
@@ -1443,6 +1697,7 @@ truncated envelopes are treated as judge-infrastructure failures.
             passed: false,
             summary: "s".into(),
             unknown: true,
+            assertions: Vec::new(),
         };
         let payload = rubric_payload(Some("default-m"), &plain, &verdict, &response);
         assert_eq!(payload["judge_model"], "default-m");
@@ -1772,6 +2027,7 @@ truncated envelopes are treated as judge-infrastructure failures.
                 passed: false,
                 summary: String::new(),
                 unknown: false,
+                assertions: Vec::new(),
             },
             &JudgeResponse::default(),
             None,

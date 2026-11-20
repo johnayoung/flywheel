@@ -30,7 +30,7 @@ const PROG: &str = "fw";
 /// Topic names are the canonical `docs/<topic>.md` basenames; descriptions
 /// are the one-line summaries shown in the bare listing, condensed from
 /// `docs/README.md`.
-pub const TOPICS: [(&str, &str); 16] = [
+pub const TOPICS: [(&str, &str); 17] = [
     (
         "cli",
         "every verb, the interactive operator console, slash commands, and init.",
@@ -66,6 +66,10 @@ pub const TOPICS: [(&str, &str); 16] = [
     (
         "autopilot",
         "the autopilot intake daemon: tier model, scoring, CLI, and console activation.",
+    ),
+    (
+        "eval",
+        "fw eval: frozen task sets from past work, replayed under agent-setup variants, judged by held-out oracles.",
     ),
     (
         "team-mode",
@@ -131,6 +135,7 @@ pub fn render_topic(topic: &str) -> Option<&'static str> {
         "sandbox" => include_str!("../doc_pages/sandbox.md"),
         "held-out-gate" => include_str!("../doc_pages/held-out-gate.md"),
         "autopilot" => include_str!("../doc_pages/autopilot.md"),
+        "eval" => include_str!("../doc_pages/eval.md"),
         "team-mode" => include_str!("../doc_pages/team-mode.md"),
         "hub" => include_str!("../doc_pages/hub.md"),
         "hub-reference" => include_str!("../doc_pages/hub-reference.md"),

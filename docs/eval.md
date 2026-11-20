@@ -178,3 +178,17 @@ A don't-act task is a validated landed task, replayed at its own reference: the 
 3. **Inspected:** the harness transcript shows a read of a file the task names and a build or test command (the `inspected` check).
 
 Validation is inverted: the oracle passes at the base and fails once a commit is made on top of it. The report shows these tasks as abstain accuracy, apart from success.
+
+## Where results live
+
+| What | Where |
+| --- | --- |
+| Runs, resolved variants, trials, scores, reviews, artifact digests | the project store's `eval_*` tables (SQLite or Postgres) |
+| Frozen sets, variant blobs | `evals/sets/`, `evals/blobs/` (content-addressed) |
+| Trial artifacts, plans, `review.md`, final commits (`results.git`) | `evals/runs/<run>/` |
+| Live traces | the hub's `telemetry.db` (`--hub-state-dir`), labelled `fw.eval=<run>` and kept past retention |
+
+For a later harness-promotion loop:
+- **Splits:** a proposer reads `dev` results only; `test` is for promotion.
+- **Frozen inputs:** each run records the set hash, the review brief's hash, and every variant hash, so a changed evaluator shows.
+- **Stable contract:** the report JSON (`schema`).

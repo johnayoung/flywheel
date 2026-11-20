@@ -35,6 +35,7 @@ Driving many tasks over a prerequisite DAG, landing the results, and isolating t
 - [configuration.md](configuration.md) — the eight config keys (`config.toml`, the trust-gated `.flywheel.toml`), verb flags, and where every removed setting went.
 - [team-mode.md](team-mode.md) — the multi-operator runbook: GitHub App worker identity, ruleset requirements, and the merge queue as the distributed merge lock.
 - [autopilot.md](autopilot.md) — the autopilot intake daemon: tier model, scoring, CLI, and console activation.
+- [eval.md](eval.md) — `fw eval`: frozen task sets from past work, replayed under agent-setup variants, judged by held-out oracles, reported with the measured noise.
 - [workflow.md](workflow.md) — how flywheel develops itself: the spec-driven authoring pipeline (the `fw-*` skills) and the runtime loop.
 - [hub.md](hub.md) — `fw hub`: the web workspace of server-owned agent terminals. Front door: security, quickstart, feature map, verbs. Details:
   - [hub/reference.md](hub/reference.md) — every verb and flag, serve flags, `hub.toml`, `notify.toml`, `plugin.toml`, keys, state-dir files.

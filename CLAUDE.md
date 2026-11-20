@@ -43,8 +43,9 @@ Authoritative specs in `docs/` override any inferred behavior. Full index: `docs
 - `docs/autopilot.md` — the autopilot intake daemon (tiers, scoring, CLI, console)
 - `docs/workflow.md` — how flywheel develops itself: the spec-driven authoring pipeline and the runtime loop
 - `docs/team-mode.md` — team mode: GitHub as the shared control plane
+- `docs/eval.md` — `fw eval`: sets, variants, replays, judging, reports
 
-Curated docs (`cli`, `configuration`, `task-schema`, `loop`, `workflow`, `strategy`, `sandbox`, `held-out-gate`, `autopilot`, `team-mode`, `hub`, `hub-reference`, `hub-api`, `hub-security`, `hub-workflows`, `hub-internals`) are embedded in the binary for `fw docs` (`crates/flywheel/src/docs.rs`); a rebuild picks up edits.
+Curated docs (`cli`, `configuration`, `task-schema`, `loop`, `workflow`, `strategy`, `sandbox`, `held-out-gate`, `autopilot`, `eval`, `team-mode`, `hub`, `hub-reference`, `hub-api`, `hub-security`, `hub-workflows`, `hub-internals`) are embedded in the binary for `fw docs` (`crates/flywheel/src/docs.rs`); a rebuild picks up edits.
 
 New feature work is specced in the project's central specs dir (`fw project path --specs`, under `$FLYWHEEL_HOME/projects/<id>/specs/`; `fw spec export DIR` copies it out). There is no `docs/roadmap.md`.
 

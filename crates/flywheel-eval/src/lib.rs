@@ -18,6 +18,7 @@
 
 pub mod db;
 pub mod git;
+pub mod mine;
 pub mod set;
 pub mod store;
 

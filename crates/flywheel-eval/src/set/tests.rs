@@ -19,6 +19,7 @@ fn task(id: &str, base: &str, reference: &str) -> SetTask {
         parallel_safe: None,
         prior_cost_usd: Some(2.0),
         oracle_secs: None,
+        prerequisites: BTreeMap::new(),
         provenance: Provenance::default(),
     }
 }

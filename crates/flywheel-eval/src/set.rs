@@ -189,6 +189,10 @@ pub struct SetTask {
     /// How long the oracle took at the reference (seconds), from V2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle_secs: Option<f64>,
+    /// Each prerequisite task id and the commit it landed as (empty when
+    /// it never landed): V3 checks every one is in the base.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prerequisites: BTreeMap<String, String>,
     #[serde(default)]
     pub provenance: Provenance,
 }

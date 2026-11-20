@@ -110,7 +110,11 @@ fn a_discriminating_oracle_passes_every_check() {
     for name in ["V1", "V2", "V3", "V4", "V5", "V6", "V7"] {
         assert!(get(&proof, name).passed, "{name}: {proof:#?}");
     }
-    assert_eq!(f.set.proof("good").unwrap().unwrap(), proof);
+    // Saved as returned (a float may come back one ulp off through JSON).
+    let mut saved = f.set.proof("good").unwrap().unwrap();
+    assert!((saved.oracle_secs - proof.oracle_secs).abs() < 1e-9);
+    saved.oracle_secs = proof.oracle_secs;
+    assert_eq!(saved, proof);
     assert_eq!(proof.files_digest, files_digest(&f.set, "good").unwrap());
 }
 

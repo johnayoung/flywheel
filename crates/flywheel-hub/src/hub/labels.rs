@@ -61,6 +61,28 @@ impl Hub {
         Ok(after)
     }
 
+    /// Point every session's `fw.parent` at its effective parent (see
+    /// [`super::endings::effective_parent`]): after a give, a successor,
+    /// an end, a removal, and once at open (records from before owners
+    /// or labels existed).
+    pub(crate) fn refresh_parents(&self) {
+        let stale: Vec<(String, Option<String>)> = {
+            let store = self.store();
+            let sessions = store.sessions();
+            sessions
+                .iter()
+                .filter_map(|record| {
+                    let parent = super::endings::effective_parent(record, sessions);
+                    (record.labels.get(labels::PARENT) != parent.as_ref())
+                        .then(|| (record.id.clone(), parent))
+                })
+                .collect()
+        };
+        for (id, parent) in stale {
+            self.set_hub_label(&id, labels::PARENT, parent.as_deref());
+        }
+    }
+
     /// Set one `fw.*` label of session `id` (the hub's own; `None`
     /// unsets it), quietly: a session gone or a refused value is logged.
     pub(crate) fn set_hub_label(&self, id: &str, key: &str, value: Option<&str>) {

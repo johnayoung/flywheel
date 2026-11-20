@@ -75,8 +75,10 @@ impl Hub {
         let start_policy = record.runs_agent().then(|| self.start_policy(&record));
         let leases = Some(self.leases_of(&record.id))
             .filter(|v| !v.leases.is_empty() || !v.waiters.is_empty());
+        let parent = super::endings::effective_parent(&record, self.store().sessions());
         SessionView {
             record,
+            parent,
             live,
             agent,
             git,
@@ -359,6 +361,7 @@ impl Hub {
             .collect();
         let before = set.keys().map(|k| (k.clone(), None)).collect();
         self.record_labels(&record.id, set, before);
+        self.refresh_parents();
         self.git.nudge(badge_key(&record));
         self.emit(HubEvent::Sessions);
         if let Some(session) = self.event_session(&record.id) {
@@ -974,6 +977,7 @@ impl Hub {
         if let Some(record) = ending {
             self.ending_removed(&record);
         }
+        self.refresh_parents();
         if let Some(session) = live {
             forget(&session);
         }

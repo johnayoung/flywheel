@@ -1685,6 +1685,117 @@ async fn ownership_passes_on_and_everything_else_asks_the_operator() {
     assert_eq!(view["ended"]["by"]["id"], helper.id.as_str());
 }
 
+/// Session `sid`'s view once its `parent` (and `fw.parent`) reads `want`.
+async fn parent_is(hub: &TestHub, sid: &str, want: Option<&str>) -> Value {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let view = hub.session(sid).await;
+        if view["parent"].as_str() == want && view["labels"]["fw.parent"].as_str() == want {
+            return view;
+        }
+        assert!(Instant::now() < deadline, "parent never {want:?}: {view}");
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_given_session_moves_under_its_new_owner_and_stays_there() {
+    let mut hub = TestHub::start().await;
+    let old = hub.claude("old lead", None, json!({})).await;
+    hub.policy(&old, "allowed").await;
+    let worker = hub.claude("worker", Some(&old), json!({})).await;
+    let new = hub.claude("new lead", None, json!({})).await;
+    old.turn().await;
+    worker.turn().await;
+    new.turn().await;
+    parent_is(&hub, &worker.id, Some(&old.id)).await;
+
+    // Given: its parent is the new owner; who started it stays history.
+    old.ok("give_session", json!({"to": "worker", "owner": "new lead"}))
+        .await;
+    let view = parent_is(&hub, &worker.id, Some(&new.id)).await;
+    assert_eq!(view["opened_by"], old.id.as_str());
+    let mine = new.ok("list_sessions", json!({"mine": true})).await;
+    assert!(mine.contains("worker (id"), "{mine}");
+    assert!(
+        mine.contains("started by old lead, now led by you"),
+        "{mine}"
+    );
+    let theirs = old.ok("list_sessions", json!({"mine": true})).await;
+    assert!(!theirs.contains("worker (id"), "{theirs}");
+
+    // The old lead removed: nothing changes for the new one.
+    let (status, _) = hub
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{}", old.id),
+            None,
+        )
+        .await;
+    assert!(status.is_success());
+    parent_is(&hub, &worker.id, Some(&new.id)).await;
+    let mine = new.ok("list_sessions", json!({"mine": true})).await;
+    assert!(mine.contains("worker (id"), "{mine}");
+    let status_text = new.ok("session_status", json!({"to": "worker"})).await;
+    assert!(
+        status_text.contains(&format!(
+            "started by a removed session (id {}), now led by you (new lead",
+            old.id
+        )),
+        "{status_text}"
+    );
+
+    // Its `children` watch wakes the new lead.
+    new.ok(
+        "watch",
+        json!({"filter": "children state=done", "prompt": "children finished"}),
+    )
+    .await;
+    worker.turn().await;
+    hub.told(&new, "children finished").await;
+    hub.told(&new, " worker (").await;
+
+    // Its owner removed too, and its opener gone: a root.
+    let (status, _) = hub
+        .call(
+            reqwest::Method::DELETE,
+            &format!("/api/sessions/{}", new.id),
+            None,
+        )
+        .await;
+    assert!(status.is_success());
+    parent_is(&hub, &worker.id, None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn records_from_before_owners_and_labels_get_their_parent() {
+    let mut hub = TestHub::start().await;
+    let lead = hub.claude("lead", None, json!({})).await;
+    hub.policy(&lead, "allowed").await;
+    let worker = hub.claude("worker", Some(&lead), json!({})).await;
+    let given = hub.claude("given", Some(&lead), json!({})).await;
+    let other = hub.claude("other", None, json!({})).await;
+    lead.turn().await;
+    lead.ok("give_session", json!({"to": "given", "owner": "other"}))
+        .await;
+    parent_is(&hub, &given.id, Some(&other.id)).await;
+    // Their records as an older hub wrote them: no labels; one never given.
+    let (worker_id, given_id) = (worker.id.clone(), given.id.clone());
+    let hub = hub
+        .restart(|doc| {
+            for session in doc["sessions"].as_array_mut().unwrap() {
+                let record = session.as_object_mut().unwrap();
+                record.remove("labels");
+                if record["id"] == worker_id.as_str() {
+                    record.remove("owner");
+                }
+            }
+        })
+        .await;
+    parent_is(&hub, &worker_id, Some(&lead.id)).await;
+    parent_is(&hub, &given_id, Some(&other.id)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_starts_its_successor_then_ends_the_old_one() {
     let mut hub = TestHub::start().await;

@@ -532,7 +532,7 @@ impl Hub {
                     to.trim()
                 ))
             })?;
-            let starter = target.opened_by.as_deref().map(|id| {
+            let named = |id: &str| {
                 store.session(id).map_or_else(
                     |_| format!("a removed session (id {id})"),
                     |s| {
@@ -543,7 +543,12 @@ impl Hub {
                         }
                     },
                 )
-            });
+            };
+            let parent = super::endings::effective_parent(&target, store.sessions());
+            let starter = super::links::lineage_words(
+                target.opened_by.as_deref().map(named),
+                parent.as_deref().map(named),
+            );
             (target, starter)
         };
         let snap = self.telemetry().snapshot(&target.id);
@@ -592,10 +597,7 @@ impl Hub {
                 (None, None) => "its CLI's default (not reported yet)".to_owned(),
             }
         ));
-        lines.push(format!(
-            "started by: {}",
-            starter.unwrap_or_else(|| "the operator".to_owned())
-        ));
+        lines.push(starter.unwrap_or_else(|| "started by the operator".to_owned()));
         lines.push(format!(
             "runtime: {}",
             // An ended session ran until it ended.

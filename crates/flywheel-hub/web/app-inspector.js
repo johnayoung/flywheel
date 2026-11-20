@@ -65,13 +65,17 @@ const inspector = (() => {
     return el("span", { className: pct >= CTX_WARN ? "hot" : "", textContent: `${t.context.exact === false ? "~" : ""}${pct}% used` });
   }
 
-  // Started by, companion of, the sessions it started (live), its review pair.
+  // Started by (and led by, once given), companion of, the sessions it
+  // leads (live), its review pair.
   function familyLine(session) {
     const out = [];
-    if (session.opened_by) out.push(`started by ${nameOf(session.opened_by)}`);
+    const started = session.opened_by ? `started by ${nameOf(session.opened_by)}` : "";
+    const moved = session.parent && session.parent !== session.opened_by;
+    if (moved) out.push(started ? `${started}, now led by ${nameOf(session.parent)}` : `led by ${nameOf(session.parent)}`);
+    else if (started) out.push(started);
     if (session.companion_of) out.push(`companion shell of ${nameOf(session.companion_of)}`);
-    const kids = state.sessions.filter((s) => s.opened_by === session.id && !endedSession(s));
-    if (kids.length) out.push(`started ${kids.length} running: ${kids.map((s) => s.name).join(", ")}`);
+    const kids = state.sessions.filter((s) => s.parent === session.id && !endedSession(s));
+    if (kids.length) out.push(`leads ${kids.length} running: ${kids.map((s) => s.name).join(", ")}`);
     const companion = state.sessions.find((s) => s.companion_of === session.id && !endedSession(s));
     if (companion) out.push(`shell ${companion.name}`);
     return out.length ? out.join("; ") : null;

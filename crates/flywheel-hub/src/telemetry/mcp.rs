@@ -315,7 +315,7 @@ fn list_tool() -> Value {
             "properties": {
                 "mine": {
                     "type": "boolean",
-                    "description": "Only the sessions you started (exited ones included)."
+                    "description": "Only the sessions you lead: started, given, or inherited (exited ones included)."
                 }
             }
         }

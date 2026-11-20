@@ -372,6 +372,11 @@ pub struct WorktreePlanView {
 pub struct SessionView {
     #[serde(flatten)]
     pub record: SessionRecord,
+    /// The session it hangs under: its effective owner (given control,
+    /// else its opener, followed through successors), else a removed
+    /// owner's opener; absent for a root. `opened_by` stays who started it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     /// Present while the server holds the session's PTY.
     pub live: Option<LiveView>,
     /// An agent session's status (a finished turn counts as seen once any
@@ -654,6 +659,8 @@ impl Hub {
         let hub = Self::assemble(options, serve_lock, store, StatusBoard::default())?;
         // Recordings a previous hub left active ended with its processes.
         hub.recordings.clear_stale();
+        // Records from before owners or labels existed get their parent.
+        hub.refresh_parents();
         let server = ReportServer::bind(&hub.options.state_dir, hub.report_handler())?;
         *hub.report.lock().unwrap_or_else(PoisonError::into_inner) = Some(server);
         crate::transcript::spawn_watcher(&hub);

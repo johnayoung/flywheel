@@ -679,10 +679,11 @@ const listGroup = (name, count) =>
 
 // --- families: a lead and the sessions it started -------------------------
 
-// The listed session that started this one: its lead (start_session),
-// the agent a companion shell belongs to, the author a reviewer reviews.
+// The listed session this one hangs under: its lead (the hub's `parent`:
+// who it was given to, else who started it), the agent a companion shell
+// belongs to, the author a reviewer reviews.
 function parentOf(session, listed) {
-  for (const id of [session.opened_by, session.companion_of, session.review_of]) {
+  for (const id of [session.parent, session.companion_of, session.review_of]) {
     if (id && id !== session.id && listed.has(id)) return id;
   }
   return null;

@@ -288,9 +288,15 @@ esac
 echo 'fake claude'
 printf '> '
 # Typed "e2e-go" / "e2e-stop": a turn starts / finishes (seen-on-view);
-# "e2e-bg": a turn ends leaving a subagent running, "e2e-bgend" ends it.
+# "e2e-bg": a turn ends leaving a subagent running, "e2e-bgend" ends it;
+# "e2e-give TO OWNER": its give_session tool call.
 while IFS= read -r line; do
   case "$line" in
+  *e2e-give*)
+    set -- $line
+    curl -s -o /dev/null "$FW_E2E_HUB/api/telemetry/mcp" -H "x-flywheel-session: $FLYWHEEL_HUB_SESSION" \
+      -H "x-flywheel-secret: $FLYWHEEL_HUB_REPORT_SECRET" -H 'content-type: application/json' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"give_session","arguments":{"to":"'"$2"'","owner":"'"$3"'"}}}' ;;
   *e2e-bgend*) printf '{"agent_id":"ag-e2e"}' | "$FW_BIN" hub report --source claude --event SubagentStop --stdin >/dev/null 2>&1 ;;
   *e2e-bg*)
     "$FW_BIN" hub report --source claude --event UserPromptSubmit </dev/null >/dev/null 2>&1
@@ -309,7 +315,7 @@ const state = path.join(tmp, "state");
 const port = process.env.PORT ? Number(process.env.PORT) : await freePort();
 const base = `http://127.0.0.1:${port}`;
 const hub = spawn(fw, ["hub", "serve", "--state-dir", state, "--port", String(port), "--no-flywheel"], {
-  env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SHELL: "/bin/sh", CLAUDE_CONFIG_DIR: claudeConfig, FW_BIN: fw },
+  env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SHELL: "/bin/sh", CLAUDE_CONFIG_DIR: claudeConfig, FW_BIN: fw, FW_E2E_HUB: base },
   stdio: ["ignore", "ignore", "inherit"],
 });
 
@@ -1689,7 +1695,7 @@ try {
       family: (document.querySelector('#inspector [data-wk="family"]') || {}).textContent || "",
     }));
     await sp.keyboard.press("Escape");
-    check(keyed.shown && keyed.name === "sb-lead" && /started 2 running/.test(keyed.family),
+    check(keyed.shown && keyed.name === "sb-lead" && /leads 2 running/.test(keyed.family),
       `sidebar: I on a focused row opens its inspector (${JSON.stringify(keyed)})`);
     // The filter: Alt+/ focuses it; names, is:STATE; Escape clears it.
     await sp.locator(`#workspaces li.session[data-id="${lead.id}"]`).click();
@@ -1754,7 +1760,36 @@ try {
     await ph.screenshot({ path: path.join(out, "phone-sidebar-inspector.png") });
     check(sheet.shown && sheet.sheet && sheet.inside && sheet.name === "sb-kid-a", `phone: a row's Details opens its inspector as a sheet (${JSON.stringify(sheet)})`);
     await pc.close();
-    for (const s of [...kids, fin, lead]) await api("DELETE", `/api/sessions/${s.id}`);
+    // Given to another lead, then its old lead removed: the given session
+    // nests under its new lead ("now led by"); one never given has no lead
+    // left and is a root.
+    const lead2 = await api("POST", "/api/sessions", { workspace_id: ws.id, kind: "claude", name: "sb-lead2", cols: 80, rows: 24 });
+    await sleep(1500);
+    await type(lead.id, "e2e-give sb-kid-b sb-lead2");
+    for (let i = 0; i < 100 && (await api("GET", `/api/sessions/${kids[1].id}`)).parent !== lead2.id; i++) await sleep(100);
+    await api("DELETE", `/api/sessions/${lead.id}`);
+    const gc = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const gp = await gc.newPage();
+    await gp.goto(`${base}/login?token=${token}`);
+    await gp.waitForFunction((id) => !!document.querySelector(`#workspaces li.session[data-id="${id}"]`), lead2.id, { timeout: 15000 }).catch(() => {});
+    await gp.waitForTimeout(500);
+    const given = await gp.evaluate(({ lead2Id, givenId, rootId }) => {
+      const leadRow = document.querySelector(`#workspaces li.session[data-id="${lead2Id}"]`);
+      const box = leadRow && leadRow.nextElementSibling;
+      const root = document.querySelector(`#workspaces li.session[data-id="${rootId}"]`);
+      return {
+        under: !!(box && box.matches(".session-kids") && box.querySelector(`li.session.child[data-id="${givenId}"]`)),
+        rootIsRoot: !!root && !root.classList.contains("child"),
+      };
+    }, { lead2Id: lead2.id, givenId: kids[1].id, rootId: kids[0].id });
+    await gp.locator(`#workspaces li.session[data-id="${kids[1].id}"] .session-name`).hover();
+    await gp.waitForSelector("#inspector:not([hidden])", { timeout: 3000 }).catch(() => {});
+    given.family = await gp.evaluate(() => (document.querySelector('#inspector [data-wk="family"]') || {}).textContent || "");
+    await gp.screenshot({ path: path.join(out, "desktop-sidebar-given.png") });
+    await gc.close();
+    check(given.under && given.rootIsRoot && /now led by sb-lead2/.test(given.family),
+      `sidebar: a given session nests under its new lead once its old lead is removed (${JSON.stringify(given)})`);
+    for (const s of [...kids, fin, lead2]) await api("DELETE", `/api/sessions/${s.id}`);
   }
 } finally {
   if (browser) await browser.close();

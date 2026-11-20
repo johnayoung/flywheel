@@ -104,15 +104,46 @@ pub(crate) fn effective_owner(
     record: &SessionRecord,
     sessions: &[SessionRecord],
 ) -> Option<String> {
-    let mut at = record.owner.clone().or_else(|| record.opened_by.clone())?;
+    let start = record.owner.clone().or_else(|| record.opened_by.clone())?;
+    Some(controller(start, sessions))
+}
+
+/// The session `record` hangs under (the tree, `mine`, `children`
+/// watches, `fw.parent`): its [`effective_owner`] while that session is
+/// still on the hub; once it was removed, its opener's chain instead;
+/// that gone too, `None` (a root). `opened_by` stays the history.
+pub(crate) fn effective_parent(
+    record: &SessionRecord,
+    sessions: &[SessionRecord],
+) -> Option<String> {
+    let present = |id: &String| *id != record.id && sessions.iter().any(|s| s.id == *id);
+    record
+        .owner
+        .clone()
+        .map(|owner| controller(owner, sessions))
+        .filter(present)
+        .or_else(|| {
+            record
+                .opened_by
+                .clone()
+                .map(|opener| controller(opener, sessions))
+                .filter(present)
+        })
+}
+
+/// Who controls what `start` controlled: `start` while it lives, else
+/// its newest successor's controller; the last one reached when the chain
+/// ends (or loops).
+fn controller(start: String, sessions: &[SessionRecord]) -> String {
+    let mut at = start;
     let mut seen = HashSet::new();
     loop {
         if !seen.insert(at.clone()) {
-            return Some(at);
+            return at;
         }
         let current = sessions.iter().find(|s| s.id == at);
         if current.is_some_and(alive) {
-            return Some(at);
+            return at;
         }
         let next = current
             .and_then(|s| s.ended.as_ref())
@@ -126,7 +157,7 @@ pub(crate) fn effective_owner(
             });
         match next {
             Some(next) => at = next,
-            None => return Some(at),
+            None => return at,
         }
     }
 }
@@ -984,6 +1015,7 @@ impl Hub {
         let next_id = next.id.clone();
         self.store()
             .update_session(&target.id, |r| r.owner = Some(next_id))?;
+        self.refresh_parents();
         self.emit(HubEvent::Sessions);
         self.telemetry().record(
             &target.id,
@@ -1489,6 +1521,7 @@ impl Hub {
             r.owner = Some(owner);
             r.continues = Some(continues);
         })?;
+        self.refresh_parents();
         self.emit(HubEvent::Sessions);
         Ok(new_id)
     }
@@ -1530,6 +1563,8 @@ impl Hub {
                 !(matches!(i.state, ItemState::Pending) && Some(&i.id) == final_item.as_ref())
             });
         });
+        drop(store);
+        self.refresh_parents();
         end
     }
 
@@ -2095,6 +2130,43 @@ mod tests {
         );
         // An owner gone with no successor stays named (nobody running owns it).
         assert_eq!(effective_owner(&worker, &[gone]).as_deref(), Some("lead1"));
+    }
+
+    #[test]
+    fn the_parent_is_the_owner_while_on_the_hub_else_the_opener_else_none() {
+        let lead1 = record("lead1", None, false);
+        let lead2 = record("lead2", None, true);
+        let mut worker = record("worker", Some("lead1"), true);
+        // Never given: its opener, ended or not.
+        assert_eq!(
+            effective_parent(&worker, &[lead1.clone(), worker.clone()]).as_deref(),
+            Some("lead1")
+        );
+        // Given: the new owner, the opener still on the hub or not.
+        worker.owner = Some("lead2".into());
+        let all = [lead1.clone(), lead2.clone(), worker.clone()];
+        assert_eq!(effective_parent(&worker, &all).as_deref(), Some("lead2"));
+        let gone = [lead2.clone(), worker.clone()];
+        assert_eq!(effective_parent(&worker, &gone).as_deref(), Some("lead2"));
+        // Its owner removed with no successor: back to the opener.
+        assert_eq!(
+            effective_parent(&worker, &[lead1.clone(), worker.clone()]).as_deref(),
+            Some("lead1")
+        );
+        // Its owner's successor leads it.
+        let mut lead3 = record("lead3", None, true);
+        lead3.continues = Some("lead2".into());
+        let mut ended = lead2;
+        ended.state = lead1.state.clone();
+        assert_eq!(
+            effective_parent(&worker, &[ended, lead3, worker.clone()]).as_deref(),
+            Some("lead3")
+        );
+        // Both gone: a root.
+        assert_eq!(
+            effective_parent(&worker, std::slice::from_ref(&worker)),
+            None
+        );
     }
 
     #[test]

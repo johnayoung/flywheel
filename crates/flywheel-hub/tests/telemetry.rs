@@ -1473,7 +1473,7 @@ async fn agents_start_sessions_within_their_policy_and_limits() {
     assert!(status_text.starts_with("docs (id "), "{status_text}");
     assert!(status_text.contains("\nstate: "), "{status_text}");
     assert!(
-        status_text.contains("started by: you (lead"),
+        status_text.contains("started by you (lead"),
         "{status_text}"
     );
     assert!(status_text.contains("\nruntime: "), "{status_text}");

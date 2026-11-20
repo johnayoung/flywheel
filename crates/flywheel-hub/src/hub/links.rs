@@ -369,21 +369,23 @@ impl Hub {
     /// (the asker) is left out; `mine`: only the sessions it started,
     /// exited ones too.
     pub fn agent_sessions(&self, except: &str, mine: bool) -> String {
-        let (records, names): (Vec<SessionRecord>, Vec<(String, String)>) = {
+        type Listed = (SessionRecord, Option<String>);
+        let (records, names): (Vec<Listed>, Vec<(String, String)>) = {
             let store = self.store();
-            let records = store
-                .sessions()
+            let sessions = store.sessions();
+            let records = sessions
                 .iter()
                 .filter(|s| s.id != except && s.runs_agent())
-                .filter(|s| {
+                .map(|s| (s, super::endings::effective_parent(s, sessions)))
+                .filter(|(s, parent)| {
                     if mine {
-                        s.opened_by.as_deref() == Some(except)
+                        parent.as_deref() == Some(except)
                     } else {
                         s.state == SessionState::Running
                     }
                 })
                 .take(LIST_MAX)
-                .cloned()
+                .map(|(s, parent)| (s.clone(), parent))
                 .collect();
             let names = store
                 .sessions()
@@ -394,13 +396,13 @@ impl Hub {
         };
         if records.is_empty() {
             return if mine {
-                "You started no session that is still on this hub.".to_owned()
+                "You lead no session that is still on this hub.".to_owned()
             } else {
                 "No other agent session runs on this hub.".to_owned()
             };
         }
         let mut lines = Vec::with_capacity(records.len());
-        for record in &records {
+        for (record, parent) in &records {
             let snap = self.telemetry().snapshot(&record.id);
             let status = if record.state == SessionState::Running {
                 snap.as_ref().map_or("unknown", |s| s.status.as_str())
@@ -426,12 +428,21 @@ impl Hub {
             if let Some(worktree) = &record.worktree {
                 line.push_str(&format!(", branch {}", worktree.branch));
             }
-            if let Some(by) = &record.opened_by {
-                if by == except {
-                    line.push_str(", started by you");
-                } else if let Some((_, name)) = names.iter().find(|(id, _)| id == by) {
-                    line.push_str(&format!(", started by {name}"));
+            let named = |id: &str| {
+                if id == except {
+                    Some("you".to_owned())
+                } else {
+                    names
+                        .iter()
+                        .find(|(n, _)| n == id)
+                        .map(|(_, name)| name.clone())
                 }
+            };
+            if let Some(words) = lineage_words(
+                record.opened_by.as_deref().and_then(named),
+                parent.as_deref().and_then(named),
+            ) {
+                line.push_str(&format!(", {words}"));
             }
             if !doing.is_empty() {
                 line.push_str(&format!(" -- {doing}"));
@@ -439,6 +450,18 @@ impl Hub {
             lines.push(line);
         }
         lines.join("\n")
+    }
+}
+
+/// Who started a session and who leads it now, in words: "started by X",
+/// "started by X, now led by Y" when control moved, "led by Y" when its
+/// starter is unknown or gone.
+pub(crate) fn lineage_words(starter: Option<String>, parent: Option<String>) -> Option<String> {
+    match (starter, parent) {
+        (Some(s), Some(p)) if s != p => Some(format!("started by {s}, now led by {p}")),
+        (Some(s), _) => Some(format!("started by {s}")),
+        (None, Some(p)) => Some(format!("led by {p}")),
+        (None, None) => None,
     }
 }
 

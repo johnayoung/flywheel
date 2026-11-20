@@ -327,53 +327,30 @@ pub(crate) fn test_suite_lock() -> Option<PathBuf> {
 pub fn hold_test_suite_lock(
     wait: Duration,
     err: &mut dyn Write,
-) -> Result<Option<std::fs::File>, String> {
+) -> Result<Option<flywheel_hub::flock::Held>, String> {
     match test_suite_lock() {
         None => Ok(None),
         Some(path) => hold_lock(&path, wait, err).map(Some),
     }
 }
 
-/// Take `path`'s exclusive flock, waiting at most `wait`.
-fn hold_lock(path: &Path, wait: Duration, err: &mut dyn Write) -> Result<std::fs::File, String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    use std::os::fd::AsRawFd;
-    let deadline = std::time::Instant::now() + wait;
-    let mut told = false;
-    loop {
-        // SAFETY: flock on a descriptor this function owns.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(file);
-        }
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            return Err(format!("flock {}: {e}", path.display()));
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "waited {}s for the test-suite lock {} (another suite holds it; set {EVAL_LOCK_ENV}=0 to skip it when you already hold it)",
-                wait.as_secs(),
-                path.display()
-            ));
-        }
-        if !told {
-            let _ = writeln!(
-                err,
-                "fw eval: waiting for another test suite on this machine ({})",
-                path.display()
-            );
-            told = true;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
+/// Take `path`'s exclusive flock through the hub's lock helper
+/// ([`flywheel_hub::flock::hold`]): asked from inside a process that holds
+/// it (an ancestor), it fails at once; else it waits at most `wait`, and
+/// running out names the holder.
+fn hold_lock(
+    path: &Path,
+    wait: Duration,
+    err: &mut dyn Write,
+) -> Result<flywheel_hub::flock::Held, String> {
+    flywheel_hub::flock::hold(path, wait, "fw eval", &mut |holder| {
+        let _ = writeln!(
+            err,
+            "fw eval: waiting for another test suite on this machine ({}, held by {holder})",
+            path.display()
+        );
+    })
+    .map_err(|e| format!("{e} (set {EVAL_LOCK_ENV}=0 to skip the test-suite lock)"))
 }
 
 fn short(sha: &str) -> &str {
@@ -1260,6 +1237,54 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(held);
         hold_lock(&path, Duration::from_secs(1), &mut err).unwrap();
+    }
+
+    #[test]
+    fn a_lock_asked_for_inside_its_holder_fails_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("check.lock");
+        let mut err = Vec::new();
+        let _held = hold_lock(&path, Duration::from_secs(1), &mut err).unwrap();
+        // A child of the holder (a tool its test phase runs) asks with an
+        // hour to wait: it must answer at once, naming the ancestor.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "eval_verbs::tests::child_asks_for_the_lock",
+                "--nocapture",
+            ])
+            .env("FLYWHEEL_TEST_EVAL_LOCK", &path)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if started.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                panic!("the child waited on its own ancestor's lock");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut out).unwrap();
+        assert!(
+            out.contains("CHILD: ") && out.contains("already held by your ancestor"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by a_lock_asked_for_inside_its_holder_fails_at_once"]
+    fn child_asks_for_the_lock() {
+        let Some(path) = std::env::var_os("FLYWHEEL_TEST_EVAL_LOCK") else {
+            return;
+        };
+        let mut err = Vec::new();
+        match hold_lock(Path::new(&path), Duration::from_secs(3600), &mut err) {
+            Ok(_) => println!("CHILD: took it"),
+            Err(e) => println!("CHILD: {e}"),
+        }
     }
 
     #[test]

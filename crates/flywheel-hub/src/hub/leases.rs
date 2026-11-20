@@ -214,6 +214,9 @@ impl Hub {
                 .into());
             }
         }
+        let mut ask = ask;
+        ask.within
+            .extend(within(&ask.holder, &crate::machines::host_name()));
         let runtime = self.lease_runtime();
         let wants_wake = matches!(ask.holder, Holder::Session { .. });
         let wait_secs = ask.wait_secs;
@@ -334,6 +337,7 @@ impl Hub {
                         ttl_secs: args.ttl_secs.unwrap_or(crate::leases::DEFAULT_TTL_SECS),
                         wait_secs: wait,
                         note: args.note.clone(),
+                        within: Vec::new(),
                     },
                     MAX_BLOCK_SECS,
                 )?;
@@ -800,6 +804,22 @@ impl Hub {
         if let Err(e) = spawned {
             eprintln!("fw hub: lease expiry is off: cannot start its thread: {e}");
         }
+    }
+}
+
+/// The holder keys `holder` runs inside: for a process on this machine
+/// (`host`), its ancestor processes. One of them holding what it asks for
+/// makes the ask re-entrant. (A session holding it is not: the session
+/// may release it while a process it started in the background waits.)
+fn within(holder: &Holder, host: &str) -> Vec<String> {
+    match holder {
+        Holder::Process {
+            host: theirs, pid, ..
+        } if theirs == host => crate::procs::ancestors(*pid)
+            .into_iter()
+            .map(|up| format!("p:{host}:{up}:{}", process_start(up).unwrap_or(0)))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

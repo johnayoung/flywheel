@@ -147,6 +147,7 @@ pub(super) async fn acquire_lease(
                 ttl_secs: new.ttl_secs.unwrap_or(DEFAULT_TTL_SECS),
                 wait_secs: wait,
                 note: new.note,
+                within: Vec::new(),
             },
             new.block_secs.unwrap_or(MAX_BLOCK_SECS),
         )
@@ -217,6 +218,7 @@ pub(super) async fn renew_lease(
                 ttl_secs: by.ttl_secs.unwrap_or(lease.ttl_secs),
                 wait_secs: 0,
                 note: None,
+                within: Vec::new(),
             },
             0,
         )

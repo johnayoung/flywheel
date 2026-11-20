@@ -1017,6 +1017,60 @@ async fn leases_wait_in_line_wake_a_long_wait_and_end_with_their_holder() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_process_asking_for_a_lease_its_ancestor_holds_fails_at_once() {
+    let hub = TestHub::start().await;
+    let host = flywheel_hub::machines::host_name();
+    let me = std::process::id();
+    let holder = |pid: u32, label: &str| {
+        json!({"host": host, "pid": pid,
+               "started": flywheel_hub::hub::leases::process_start(pid),
+               "label": label})
+    };
+    let (status, got) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/leases",
+            Some(json!({"resource": "cpu:test-suite", "ttl_secs": 60,
+                        "holder": holder(me, "check.sh")})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    // A child of the holder (a test its suite runs) asks for it too,
+    // ready to wait an hour: refused at once, naming the holder.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let started = Instant::now();
+    let (status, got) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/leases",
+            Some(
+                json!({"resource": "cpu:test-suite", "ttl_secs": 60, "wait_secs": 3600,
+                        "block_secs": 5, "holder": holder(child.id(), "fw eval")}),
+            ),
+        )
+        .await;
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(started.elapsed() < Duration::from_secs(4), "it waited");
+    assert!(status.is_client_error(), "{status} {got}");
+    let text = got.to_string();
+    assert!(
+        text.contains("already held by your ancestor") && text.contains(&format!("pid {me}")),
+        "{text}"
+    );
+    assert!(
+        hub.get("/api/leases").await["waiters"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "it never joined the line"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leases_and_waits_outlive_a_restart() {
     let hub = TestHub::start().await;
     let me = json!({"host": flywheel_hub::machines::host_name(), "pid": std::process::id(),

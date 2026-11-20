@@ -48,17 +48,73 @@ scripts/run_silent.sh "build tests" cargo test --workspace --no-run
 # lease cpu:test-suite (fair, visible on the board, dropped if this run
 # dies) and the file lock too, so runs with and without a hub take turns;
 # else the file lock alone. FLYWHEEL_CHECK_LOCK=0 opts out.
+#
+# The wait is bounded (FLYWHEEL_CHECK_LOCK_WAIT seconds, default 4h) and
+# names the holder. A run nested inside one holding the lock (a tool or a
+# check.sh its tests start) fails at once instead of waiting on itself:
+# the holder lists itself in FLYWHEEL_FLOCKS_HELD for what it runs.
 lock="${XDG_RUNTIME_DIR:-/tmp}/flywheel-check.lock"
+wait_secs="${FLYWHEEL_CHECK_LOCK_WAIT:-14400}"
+
+# This shell's ancestors' pids, one per line.
+ancestors() {
+  local p=$$ up
+  while up=$(sed 's/.*) //' "/proc/$p/stat" 2>/dev/null | cut -d' ' -f2) \
+    && [[ -n "$up" && "$up" != 0 ]]; do
+    echo "$up"
+    p=$up
+  done
+}
+
+# Who holds the lock: a live holder /proc/locks names, else the one its
+# file names (a holder notes itself there).
+holder() {
+  local pid label ino
+  ino=$(stat -c %i "$lock" 2>/dev/null || true)
+  local taker=""
+  for pid in $(awk -v ino=":$ino" '$2 == "FLOCK" && substr($6, length($6) - length(ino) + 1) == ino { print $5 }' /proc/locks 2>/dev/null); do
+    if [[ -r "/proc/$pid/cmdline" ]]; then
+      echo "pid $pid ($(tr '\0' ' ' <"/proc/$pid/cmdline" | cut -c1-160))"
+      return
+    fi
+    taker=$pid
+  done
+  read -r pid label <"$lock" 2>/dev/null || true
+  if [[ -n "${pid:-}" && -e "/proc/$pid" ]]; then
+    echo "pid $pid (${label:-?})"
+  elif [[ -n "${taker}" ]]; then
+    echo "a process that inherited it from pid $taker, now exited (see: fuser -v $lock)"
+  else
+    echo "an unknown process (see: fuser -v $lock)"
+  fi
+}
+
+if [[ "${FLYWHEEL_CHECK_LOCK:-1}" != 0 && -n "${FLYWHEEL_FLOCKS_HELD:-}" && -e "$lock" ]]; then
+  ups=" $(ancestors | tr '\n' ' ') "
+  while read -r pid path; do
+    if [[ -n "${pid:-}" && "$ups" == *" $pid "* && "$path" -ef "$lock" ]]; then
+      cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | cut -c1-160)
+      echo "  FAIL scripts/check.sh: the test-suite lock $lock is already held by your ancestor pid $pid ($cmd): this run is inside that hold, so waiting would wait on itself (set FLYWHEEL_CHECK_LOCK=0 for nested runs)" >&2
+      exit 1
+    fi
+  done <<<"$FLYWHEEL_FLOCKS_HELD"
+fi
 if [[ "${FLYWHEEL_CHECK_LOCK:-1}" != 0 ]] && command -v fw >/dev/null 2>&1 \
   && fw hub lease --help >/dev/null 2>&1; then
-  FLYWHEEL_CHECK_PHASE=tests exec fw hub lease run cpu:test-suite --ttl 45m --wait 4h \
+  FLYWHEEL_CHECK_PHASE=tests exec fw hub lease run cpu:test-suite --ttl 45m --wait "$wait_secs" \
     --note "scripts/check.sh in $REPO_ROOT" --or-flock "$lock" -- "$REPO_ROOT/scripts/check.sh"
 fi
 if [[ "${FLYWHEEL_CHECK_LOCK:-1}" != 0 ]] && command -v flock >/dev/null 2>&1; then
-  exec 9>"$lock"
+  # Opened to append: a waiter must not wipe the holder's note.
+  exec 9>>"$lock"
   if ! flock -n 9; then
-    echo "  ..   waiting for another scripts/check.sh test run on this machine"
-    flock 9
+    echo "  ..   waiting for another scripts/check.sh test run on this machine: $(holder)"
+    if ! flock -w "$wait_secs" 9; then
+      echo "  FAIL waited ${wait_secs}s for the test-suite lock $lock, held by $(holder)" >&2
+      exit 1
+    fi
   fi
+  printf '%s %s\n' "$$" "scripts/check.sh in $REPO_ROOT" >"$lock"
+  export FLYWHEEL_FLOCKS_HELD="${FLYWHEEL_FLOCKS_HELD:+$FLYWHEEL_FLOCKS_HELD$'\n'}$$ $lock"
 fi
 run_tests

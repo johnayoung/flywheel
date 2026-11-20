@@ -176,6 +176,10 @@ pub struct Ask {
     pub ttl_secs: u32,
     pub wait_secs: u32,
     pub note: Option<String>,
+    /// The holder keys ([`Holder::key`]) the asker runs inside: its
+    /// ancestor processes. One of them holding the
+    /// resource makes the ask re-entrant (see [`Book::acquire`]).
+    pub within: Vec<String>,
 }
 
 /// What an ask got.
@@ -393,6 +397,33 @@ impl Book {
                 vec![Change::Renewed(lease)],
             ));
         }
+        // Re-entrant: a process the asker runs inside (an ancestor)
+        // holds it already. Waiting would wait
+        // on itself: the holder cannot release before the asker returns.
+        // Exclusive on either side is an error: two "only one" holders at
+        // once would be a lie, and the ask is nearly always a bug (a test
+        // taking the suite lock its own suite holds), best said at once.
+        // Both shared is granted beside the ancestor's, past the line (an
+        // exclusive ask in line waits on that ancestor too).
+        let mut nested = false;
+        if let Some(held) = self
+            .leases
+            .values()
+            .find(|l| l.resource == resource && ask.within.contains(&l.holder.key()))
+        {
+            if held.mode == Mode::Exclusive || ask.mode == Mode::Exclusive {
+                return Err(format!(
+                    "{resource} is already held by your ancestor {} ({}, {}): {} asks for it \
+                     from inside that hold, so waiting would wait on itself. Use the hold you \
+                     are in (scripts/check.sh: FLYWHEEL_CHECK_LOCK=0 for nested runs)",
+                    held.holder.label(),
+                    held.short(),
+                    held.mode.as_str(),
+                    ask.holder.label()
+                ));
+            }
+            nested = true;
+        }
         if let Some((at, waiting)) = self.lines.get_mut(&resource).and_then(|line| {
             line.iter_mut()
                 .enumerate()
@@ -421,7 +452,7 @@ impl Book {
             return Err(format!("this hub has {MAX_HUB} leases and waits already"));
         }
         let line_empty = self.lines.get(&resource).is_none_or(VecDeque::is_empty);
-        if line_empty && self.fits(&resource, ask.mode) {
+        if (nested || line_empty) && self.fits(&resource, ask.mode) {
             let lease = Lease {
                 id: new_id(),
                 resource,
@@ -639,6 +670,7 @@ mod tests {
             ttl_secs: 60,
             wait_secs: wait,
             note: None,
+            within: Vec::new(),
         }
     }
 
@@ -693,6 +725,65 @@ mod tests {
             granted_to(&book.end(&e2, Gone::Released, 4).unwrap()),
             ["s3"]
         );
+    }
+
+    #[test]
+    fn an_ask_from_inside_the_holder_fails_at_once_or_nests_when_both_are_shared() {
+        let parent = Holder::Process {
+            host: "h".into(),
+            pid: 10,
+            started: Some(5),
+            session: None,
+            label: "fw hub lease run scripts/check.sh".into(),
+        };
+        let child = Holder::Process {
+            host: "h".into(),
+            pid: 11,
+            started: Some(6),
+            session: None,
+            label: "fw hub lease run fw".into(),
+        };
+        let inside = |mode, holder: &Holder| Ask {
+            resource: "cpu:test-suite".into(),
+            mode,
+            holder: holder.clone(),
+            ttl_secs: 60,
+            wait_secs: 3600,
+            note: None,
+            within: vec![parent.key()],
+        };
+        for (held, asked) in [
+            (Mode::Exclusive, Mode::Exclusive),
+            (Mode::Exclusive, Mode::Shared),
+            (Mode::Shared, Mode::Exclusive),
+        ] {
+            let mut book = Book::default();
+            let mut id = ids();
+            let mut first = inside(held, &parent);
+            first.within.clear();
+            book.acquire(first, 0, &mut id).unwrap();
+            let e = book.acquire(inside(asked, &child), 1, &mut id).unwrap_err();
+            assert!(
+                e.contains("already held by your ancestor") && e.contains("pid 10"),
+                "{e}"
+            );
+            assert_eq!(book.waiters().count(), 0, "it never waits");
+        }
+        // Both shared: granted beside its ancestor's, even past an
+        // exclusive ask in line (which waits on the ancestor).
+        let mut book = Book::default();
+        let mut id = ids();
+        let mut first = inside(Mode::Shared, &parent);
+        first.within.clear();
+        book.acquire(first, 0, &mut id).unwrap();
+        let mut exclusive = ask("e", Mode::Exclusive, 100);
+        exclusive.resource = "cpu:test-suite".into();
+        let (got, _) = book.acquire(exclusive, 1, &mut id).unwrap();
+        assert!(matches!(got, Acquired::Waiting { .. }));
+        let (got, _) = book
+            .acquire(inside(Mode::Shared, &child), 2, &mut id)
+            .unwrap();
+        assert!(matches!(got, Acquired::Granted(_)), "{got:?}");
     }
 
     #[test]

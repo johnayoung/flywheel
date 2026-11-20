@@ -11,7 +11,7 @@ use crate::script::query_escape;
 use crate::util::{fail, print_json, str_field};
 use serde_json::{Value, json};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, clap::Args)]
@@ -371,6 +371,21 @@ fn print_leases(out: &mut dyn Write, view: &Value) {
 /// `fw hub lease run`.
 fn run_holding(a: &RunArgs, err: &mut dyn Write) -> Result<i32, String> {
     let label = format!("fw hub lease run {}", a.command[0]);
+    let wait = a.common.wait.as_deref().map_or(Ok(3600), parse_span)?;
+    // Inside a run that holds the file lock already: say so before
+    // queueing for the lease (the lease side says the same of a lease an
+    // ancestor holds).
+    if let Some(path) = &a.or_flock
+        && let Some(ancestor) = crate::flock::held_by_ancestor(path)
+    {
+        return Err(format!(
+            "the lock {} is already held by your ancestor {}: this run is inside that hold, \
+             so waiting for it would wait on itself (nested scripts/check.sh runs: \
+             FLYWHEEL_CHECK_LOCK=0)",
+            path.display(),
+            crate::procs::describe(ancestor)
+        ));
+    }
     let hub = connect(&a.endpoint).and_then(|conn| {
         let lease = take(&conn, &a.resource, &a.common, 3600, &me(&label), err)?;
         Ok((conn, lease))
@@ -383,8 +398,37 @@ fn run_holding(a: &RunArgs, err: &mut dyn Write) -> Result<i32, String> {
         }
         Err(e) => return Err(e),
     };
+    let release = |conn: &Option<Endpoint>, lease: &Option<Value>| {
+        if let (Some(conn), Some(lease)) = (conn, lease) {
+            let _ = conn.blocking_call(
+                "POST",
+                &format!("/api/leases/{}/release", str_field(lease, "id")),
+                Some(&json!({ "holder": me(&label) })),
+            );
+        }
+    };
     let flocked = match &a.or_flock {
-        Some(path) => Some(flock(path, err)?),
+        Some(path) => {
+            let held = crate::flock::hold(
+                path,
+                Duration::from_secs(u64::from(wait)),
+                &format!("{label} ({})", a.resource),
+                &mut |holder| {
+                    let _ = writeln!(
+                        err,
+                        "  ..   waiting for the file lock {}, held by {holder}",
+                        path.display()
+                    );
+                },
+            );
+            match held {
+                Ok(held) => Some(held),
+                Err(e) => {
+                    release(&conn, &lease);
+                    return Err(e);
+                }
+            }
+        }
         None => None,
     };
     let renewer = match (&conn, &lease) {
@@ -398,22 +442,20 @@ fn run_holding(a: &RunArgs, err: &mut dyn Write) -> Result<i32, String> {
         )),
         _ => None,
     };
-    let status = std::process::Command::new(&a.command[0])
-        .args(&a.command[1..])
-        .status();
+    let mut command = std::process::Command::new(&a.command[0]);
+    command.args(&a.command[1..]);
+    if let Some(held) = &flocked {
+        // What it runs knows it is inside this hold (see crate::flock).
+        command.env(crate::flock::HELD_ENV, held.child_env());
+    }
+    let status = command.status();
     if let Some((stop, handle)) = renewer {
         let _ = stop.send(());
         let _ = handle.join();
     }
     // The file lock first: whoever the lease goes to next takes it too.
     drop(flocked);
-    if let (Some(conn), Some(lease)) = (&conn, &lease) {
-        let _ = conn.blocking_call(
-            "POST",
-            &format!("/api/leases/{}/release", str_field(lease, "id")),
-            Some(&json!({ "holder": me(&label) })),
-        );
-    }
+    release(&conn, &lease);
     let status = status.map_err(|e| format!("cannot run {}: {e}", a.command[0]))?;
     Ok(status.code().unwrap_or(1))
 }
@@ -452,30 +494,6 @@ fn renew_in_background(
         }
     });
     (stop, handle)
-}
-
-/// Hold `flock(path)` (waiting for it) until dropped.
-fn flock(path: &Path, err: &mut dyn Write) -> Result<std::fs::File, String> {
-    use std::os::fd::AsRawFd;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    // SAFETY: flock on a file descriptor this function owns.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let _ = writeln!(err, "  ..   waiting for the file lock {}", path.display());
-        // SAFETY: as above.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(format!(
-                "flock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-    Ok(file)
 }
 
 #[cfg(test)]

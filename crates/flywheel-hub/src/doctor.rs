@@ -17,7 +17,7 @@ mod agents;
 mod files;
 mod machine;
 mod path;
-mod running;
+pub(crate) mod running;
 
 #[cfg(test)]
 use crate::review::runner;

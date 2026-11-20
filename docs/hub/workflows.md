@@ -141,7 +141,7 @@ Per agent session, prompts the hub types itself, in order ("when done, do X"): `
 | Drafts | text left in the agent's input line holds it (keys answering a prompt don't count) |
 | One at a time | the next waits for a rest begun after the last delivery (bracketed paste, Enter); 20 delivered kept |
 | Exactly once | `sending` saved before the paste, `delivered` after; a crash between: the transcript decides (`reconciled`) or it is pending again |
-| Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched |
+| Stalls | the agent exited, the paste was refused, or no turn started in 120 s (`queue.stalled`), until resumed or relaunched. A prompt (queued or typed in at once) that started no turn and is not in the agent's transcript was lost on its way in: it is typed again once first |
 | Order | drag, up/down, `queue move`; pending editable; 50 pending, 64 KiB each |
 
 **Watches** (`fw hub watch add lead --on 'children state=done|failed' --prompt ...`, `watch`/`unwatch` tools, the Queue drawer): a matching log event queues the prompt, events, and cursors into the owner (queue rules apply).

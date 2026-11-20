@@ -88,8 +88,9 @@ pub const MAX_TYPING_QUIET: Duration = Duration::from_secs(600);
 /// fan-out queues its grading on the finished turn in that time; hooks
 /// that fire right after `Stop` land).
 pub const SETTLE: Duration = Duration::from_millis(1500);
-/// A delivered prompt that has not started a turn after this long stalls
-/// the queue (the agent did not take it).
+/// A delivered prompt that has not started a turn after this long is sent
+/// again when the agent's transcript lacks it (the paste was lost), else
+/// (or lost again) stalls the queue.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(120);
 /// How often the hub looks at its queues.
 const TICK: Duration = Duration::from_millis(250);
@@ -209,6 +210,10 @@ pub struct SessionQueue {
     pub last_delivered_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub items: Vec<QueueItem>,
+    /// The delivered item sent again because the agent never took it up
+    /// (the agent rested past [`ACK_TIMEOUT`] with no turn): lost a second time, the queue stalls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resent: Option<String>,
     /// Topics delivered to this session, by sender (see [`topic_key`]):
     /// a newer message on one of them arrives saying it supersedes the
     /// one the agent already read. At most [`MAX_TOPICS_SEEN`], the

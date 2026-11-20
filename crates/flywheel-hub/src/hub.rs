@@ -132,6 +132,10 @@ pub struct HubOptions {
     /// The longest a lease ask waits inside one call (see
     /// [`crate::leases::MAX_BLOCK_SECS`]); tests shorten it.
     pub lease_block_secs: u32,
+    /// How long a delivered prompt may go without starting a turn before
+    /// it is sent again, then the queue stalls ([`crate::queue::ACK_TIMEOUT`]);
+    /// tests shorten it.
+    pub queue_ack_timeout: Duration,
 }
 
 impl HubOptions {
@@ -169,6 +173,7 @@ impl HubOptions {
             login_days: crate::auth::DEFAULT_LOGIN_DAYS,
             agent_starts: crate::config::AgentStarts::default(),
             lease_block_secs: crate::leases::MAX_BLOCK_SECS,
+            queue_ack_timeout: crate::queue::ACK_TIMEOUT,
         }
     }
 }
@@ -553,7 +558,7 @@ pub struct KindAvailability {
 
 /// The hub.
 pub struct Hub {
-    options: HubOptions,
+    pub(crate) options: HubOptions,
     token: RwLock<Token>,
     /// One-time login codes (cleared when the token rotates).
     login_codes: Mutex<LoginCodes>,

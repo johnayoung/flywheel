@@ -44,9 +44,10 @@ impl Hub {
                         // First: a session due a relaunch after an upgrade
                         // goes before its queue delivers again.
                         let relaunching = hub.relaunch_tick();
+                        let acking = hub.ack_tick();
                         let queued = hub.queue_tick();
                         let ending = hub.endings_tick();
-                        relaunching || queued || ending
+                        relaunching || acking || queued || ending
                     };
                     wait = sending.then_some(TICK);
                 }
@@ -159,6 +160,82 @@ impl Hub {
             });
         });
         found
+    }
+
+    /// One look at every delivered prompt the agent has not taken up yet;
+    /// returns whether any waits (look again in a [`TICK`]). One not
+    /// taken up within the ack timeout whose text the agent's transcript
+    /// lacks was lost on its way in (a paste the agent never read): it is
+    /// sent again, once. Lost again, or in the transcript yet no turn
+    /// started, the queue stalls (shown, and the sender's next message
+    /// queues behind it rather than vanishing too).
+    fn ack_tick(&self) -> bool {
+        let waiting: Vec<(SessionQueue, SessionRecord)> = {
+            let store = self.store();
+            store
+                .queues()
+                .iter()
+                .filter(|(_, q)| q.last_delivered_at.is_some() && q.stalled.is_none())
+                .filter_map(|(id, q)| Some((q.clone(), store.session(id).ok()?.clone())))
+                .collect()
+        };
+        let mut any = false;
+        for (queue, record) in waiting {
+            let facts = self.rest_facts(&record, &queue);
+            let resting = facts
+                .status
+                .as_ref()
+                .is_some_and(|s| queue.last_delivered_at.is_some_and(|last| s.since <= last));
+            any |= resting;
+            let Some(item) = super::deciding::unacked(&queue, &facts) else {
+                continue;
+            };
+            let lost = item.as_ref().and_then(|id| {
+                let it = queue.items.iter().find(|i| &i.id == id)?;
+                let ItemState::Delivered { delivered_at, .. } = it.state else {
+                    return None;
+                };
+                let first = queue.resent.as_deref() != Some(id.as_str());
+                (first && facts.draft == 0 && !self.transcript_has(&record, &it.text, delivered_at))
+                    .then(|| id.clone())
+            });
+            let secs = facts.ack.as_secs();
+            match lost {
+                Some(id) => {
+                    let saved = self.store().update_queue(&record.id, |q| {
+                        if let Some(i) = q.item_mut(&id) {
+                            i.state = ItemState::Pending;
+                        }
+                        q.resent = Some(id.clone());
+                        q.last_delivered_at = None;
+                        q.settle_order();
+                    });
+                    match saved {
+                        Ok(()) => eprintln!(
+                            "fw hub: queue {}: prompt {} started no turn in {secs}s and its \
+                             transcript does not have it (the paste was lost): sending it again",
+                            record.id,
+                            &id[..id.len().min(8)]
+                        ),
+                        Err(e) => eprintln!("fw hub: queue {}: not sent again: {e}", record.id),
+                    }
+                    self.queue_changed();
+                }
+                None => {
+                    let again = item.is_some() && queue.resent == item;
+                    self.stall_queue(
+                        &record.id,
+                        &format!(
+                            "the agent did not start a turn in the {secs}s after the last \
+                             delivered prompt{}",
+                            if again { " (sent twice)" } else { "" }
+                        ),
+                        item.as_deref(),
+                    );
+                }
+            }
+        }
+        any
     }
 
     /// One look at every queue with something to send; returns whether

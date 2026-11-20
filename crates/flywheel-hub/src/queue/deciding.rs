@@ -1,7 +1,9 @@
 //! Deciding: whether a session's head item may go now, from the facts
 //! the hub gathers.
 
-use super::{ACK_TIMEOUT, EVENT_TEXT_CHARS, ItemState, QueueItem, SETTLE, SessionQueue, When};
+#[cfg(doc)]
+use super::ACK_TIMEOUT;
+use super::{EVENT_TEXT_CHARS, ItemState, QueueItem, SETTLE, SessionQueue, When};
 use crate::pty::ExitInfo;
 use crate::status::{AgentStatus, StatusView};
 use chrono::{DateTime, Utc};
@@ -33,6 +35,9 @@ pub(crate) struct Facts {
     /// The head item is open in an editor.
     pub editing: bool,
     pub quiet: Duration,
+    /// How long a delivered prompt may go without starting a turn (see
+    /// [`ACK_TIMEOUT`]).
+    pub ack: Duration,
     /// What holds it now (a review action, a fan-out grading).
     pub owner: Option<String>,
 }
@@ -95,10 +100,10 @@ pub(crate) fn decide(queue: &SessionQueue, facts: &Facts) -> Decision {
         && status.since <= last
     {
         let ago = (facts.now - last).to_std().unwrap_or_default();
-        if ago >= ACK_TIMEOUT {
+        if ago >= facts.ack {
             return Decision::Stall(format!(
                 "the agent did not start a turn in the {}s after the last delivered prompt",
-                ACK_TIMEOUT.as_secs()
+                facts.ack.as_secs()
             ));
         }
         return wait("waiting for the agent to take up the last delivered prompt");
@@ -142,6 +147,41 @@ pub(crate) fn decide(queue: &SessionQueue, facts: &Facts) -> Decision {
         return wait("the next prompt is open in an editor");
     }
     Decision::Deliver(head.id.clone())
+}
+
+/// The delivered prompt the agent has not taken up within [`Facts::ack`]
+/// (no turn since, while it rests): its item id (`None`: not on record),
+/// for the hub to check the transcript and send it again or stall. `None`
+/// while there is no such prompt, or the queue is stalled or paused (or
+/// mid-delivery), or the agent is not resting where it can take one.
+pub(crate) fn unacked(queue: &SessionQueue, facts: &Facts) -> Option<Option<String>> {
+    if queue.stalled.is_some()
+        || queue.paused
+        || queue
+            .items
+            .iter()
+            .any(|i| matches!(i.state, ItemState::Sending { .. }))
+        || facts.presence != Presence::Ready
+    {
+        return None;
+    }
+    let last = queue.last_delivered_at?;
+    let status = facts.status.as_ref()?;
+    if !matches!(status.status, AgentStatus::Done | AgentStatus::Idle) || status.since > last {
+        return None;
+    }
+    if (facts.now - last).to_std().unwrap_or_default() < facts.ack {
+        return None;
+    }
+    let item = queue
+        .items
+        .iter()
+        .filter_map(|i| match i.state {
+            ItemState::Delivered { delivered_at, .. } if delivered_at == last => Some(i.id.clone()),
+            _ => None,
+        })
+        .next_back();
+    Some(item)
 }
 
 pub(crate) fn exit_text(exit: &ExitInfo) -> String {

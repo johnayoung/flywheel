@@ -52,6 +52,7 @@ fn facts(status_now: Option<StatusView>) -> Facts {
         draft: 0,
         editing: false,
         quiet: Duration::from_secs(8),
+        ack: ACK_TIMEOUT,
         owner: None,
     }
 }

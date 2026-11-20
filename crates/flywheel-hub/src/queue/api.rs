@@ -219,6 +219,7 @@ impl Hub {
             draft: self.unsent_input(record),
             editing: queue.head().is_some_and(|h| runtime.is_editing(&h.id)),
             quiet: self.tunables().queue_typing_quiet,
+            ack: self.options.queue_ack_timeout,
             owner,
         }
     }
@@ -801,7 +802,17 @@ impl Hub {
                 let at = Utc::now();
                 let paste = self.paste_turn_held(id, &text, true, false)?;
                 // Kept in memory even when the save fails: the paste went.
+                // On record as delivered, so a paste the agent never takes
+                // up is sent again (see the queue's ack tick).
+                let mut item = alone.items.remove(0);
+                item.state = ItemState::Delivered {
+                    delivered_at: at,
+                    reconciled: false,
+                };
                 if let Err(e) = self.store().update_queue_keeping(id, |queue| {
+                    queue.items.push(item);
+                    queue.settle_order();
+                    queue.trim_history();
                     queue.last_delivered_at =
                         Some(queue.last_delivered_at.map_or(at, |t| t.max(at)));
                     if let Some(topic) = topic {

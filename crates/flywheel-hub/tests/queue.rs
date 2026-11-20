@@ -62,6 +62,9 @@ fn fake_claude(bin: &Path, log: &Path) -> PathBuf {
     path
 }
 
+/// How long a delivered prompt may go without a turn here.
+const ACK: Duration = Duration::from_secs(4);
+
 /// What the hub types for one delivered prompt.
 fn pasted(text: &str) -> Vec<u8> {
     let mut bytes = flywheel_hub::pty::paste_bytes(text, true);
@@ -90,6 +93,20 @@ impl TestHub {
     }
 
     async fn open(dir: tempfile::TempDir, root: PathBuf) -> Self {
+        Self::open_with(dir, root, flywheel_hub::queue::ACK_TIMEOUT).await
+    }
+
+    /// A hub whose delivered prompts wait `ack` for a turn.
+    async fn start_with(ack: Duration) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for sub in ["repo/.git", "bin", "log"] {
+            std::fs::create_dir_all(root.join(sub)).unwrap();
+        }
+        Self::open_with(dir, root, ack).await
+    }
+
+    async fn open_with(dir: tempfile::TempDir, root: PathBuf, ack: Duration) -> Self {
         flywheel_hub::install_crypto_provider();
         let mut options = HubOptions::new(root.join("state"));
         options.default_shell = vec!["/bin/sh".into()];
@@ -100,6 +117,7 @@ impl TestHub {
         options.report_command = Some(vec!["/opt/flywheel/bin/fw".into(), "hub".into()]);
         options.claude_config_dir = Some(root.join("claude-config"));
         options.queue_typing_quiet = QUIET;
+        options.queue_ack_timeout = ack;
         let hub = support::open_hub(options);
         hub.restore_sessions();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1100,4 +1118,84 @@ async fn an_input_line_the_screen_shows_empty_holds_nothing() {
     hub.add(&agent.id, "and the next", None).await;
     want.extend(pasted("and the next"));
     agent.typed_becomes(&want).await;
+}
+
+/// A message typed straight into a resting agent that never starts a
+/// turn for it (the agent got the bytes and dropped them; its transcript
+/// never has it) is typed again once, then the queue stalls, shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_typed_in_message_the_agent_never_takes_up_is_sent_again_then_stalls() {
+    let hub = TestHub::start_with(ACK).await;
+    let agent = hub.claude().await;
+    agent.turn().await;
+    status_is(&hub, &agent.id, "done").await;
+    sleep(QUIET + Duration::from_millis(500)).await;
+    let text = "From lead in flywheel: stop your waiting gate run.";
+    let (sender, id) = (Arc::clone(&hub.hub), agent.id.clone());
+    let sent = tokio::task::spawn_blocking(move || sender.send_or_queue(&id, text))
+        .await
+        .unwrap()
+        .unwrap();
+    let sent = serde_json::to_value(&sent).unwrap();
+    assert_eq!(sent["delivery"], "pasted", "{sent}");
+    let mut want = pasted(text);
+    agent.typed_becomes(&want).await;
+    // No turn, and the transcript lacks it: after the ack timeout it is
+    // typed again.
+    want.extend(pasted(text));
+    let deadline = Instant::now() + ACK + WAIT;
+    while agent.typed() != want {
+        assert!(
+            Instant::now() < deadline,
+            "not sent again: typed {:?}",
+            String::from_utf8_lossy(&agent.typed())
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    // Lost again: the queue stalls, saying so; nothing is typed a third time.
+    let deadline = Instant::now() + ACK + WAIT;
+    loop {
+        let queue = hub.queue(&agent.id).await;
+        if let Some(reason) = queue["stalled"]["reason"].as_str() {
+            assert!(
+                reason.contains("did not start a turn") && reason.contains("sent twice"),
+                "{queue}"
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "never stalled: {queue}");
+        sleep(Duration::from_millis(100)).await;
+    }
+    agent.stays(&want).await;
+}
+
+/// The agent took the typed-in message up (its transcript has it) but no
+/// turn was reported: it is not typed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_typed_in_message_the_transcript_has_is_never_sent_again() {
+    let hub = TestHub::start_with(ACK).await;
+    let agent = hub.claude().await;
+    agent.turn().await;
+    status_is(&hub, &agent.id, "done").await;
+    sleep(QUIET + Duration::from_millis(500)).await;
+    let text = "From lead in flywheel: read this once.";
+    let (sender, id) = (Arc::clone(&hub.hub), agent.id.clone());
+    tokio::task::spawn_blocking(move || sender.send_or_queue(&id, text))
+        .await
+        .unwrap()
+        .unwrap();
+    let want = pasted(text);
+    agent.typed_becomes(&want).await;
+    let line = json!({
+        "type": "user", "uuid": "u-1", "sessionId": "c",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "message": {"role": "user", "content": text},
+    });
+    std::fs::write(&agent.transcript, format!("{line}\n")).unwrap();
+    sleep(ACK + Duration::from_millis(1500)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&agent.typed()),
+        String::from_utf8_lossy(&want),
+        "typed again though its transcript has it"
+    );
 }

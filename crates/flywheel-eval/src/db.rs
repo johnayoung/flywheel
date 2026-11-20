@@ -327,7 +327,8 @@ impl PostgresDb {
             tx.execute(
                 "INSERT INTO eval_schema_version (version, id) VALUES ($1, 1) \
                  ON CONFLICT (id) DO NOTHING",
-                &[&i64::from(crate::store::CURRENT_EVAL_SCHEMA_VERSION)],
+                &[&i32::try_from(crate::store::CURRENT_EVAL_SCHEMA_VERSION)
+                    .expect("the schema version fits in an int4")],
             )
             .map_err(backend)?;
             tx.commit().map_err(backend)?;

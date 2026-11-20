@@ -138,7 +138,9 @@ CREATE TABLE IF NOT EXISTS eval_trial_artifacts (
   PRIMARY KEY (project_id, run_id, trial_id, name)
 );
 
+-- The sentinel is INTEGER (int4) like every other store's: the shared
+-- version reader decodes it as i32.
 CREATE TABLE IF NOT EXISTS eval_schema_version (
-  version  BIGINT NOT NULL,
-  id       BIGINT PRIMARY KEY CHECK (id = 1)
+  version  INTEGER NOT NULL,
+  id       INTEGER PRIMARY KEY CHECK (id = 1)
 );

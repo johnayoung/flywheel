@@ -482,7 +482,9 @@ fn execute(
     std::fs::create_dir_all(&grade_root).map_err(|e| e.to_string())?;
     let _grading = crate::proc::FileLock::exclusive(&grade_root.join("lock"))
         .map_err(|e| format!("the grading lock: {e}"))?;
-    let tree = GradeTree::open(&clone, &grade_root.join("tree")).map_err(|e| e.to_string())?;
+    let tree = GradeTree::open(&clone, &grade_root.join("tree"))
+        .map_err(|e| e.to_string())?
+        .with_base(&git::default_branch(&plan.manifest.repo), &task.base);
     tree.checkout_from(&clone, &final_commit)
         .map_err(|e| e.to_string())?;
     let verdict = oracle::run(

@@ -88,6 +88,20 @@ pub fn update_ref(repo: &Path, name: &str, sha: &str) -> Result<(), GitError> {
     run(repo, &["update-ref", name, sha]).map(|_| ())
 }
 
+/// The branch `repo`'s work lands on: its remote's default branch, else the
+/// branch checked out, else `main`.
+pub fn default_branch(repo: &Path) -> String {
+    run(
+        repo,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|r| r.strip_prefix("origin/").map(str::to_owned))
+    .or_else(|| run(repo, &["symbolic-ref", "--short", "HEAD"]).ok())
+    .filter(|b| !b.is_empty())
+    .unwrap_or_else(|| "main".to_owned())
+}
+
 /// Whether `sha` is a 40-hex commit id.
 pub fn is_full_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())

@@ -269,3 +269,20 @@ fn a_dont_act_twin_validates_inverted() {
     );
     assert!(crate::dont_act::generate(&f.set, &mut f.manifest, "good-dont-act").is_err());
 }
+
+#[test]
+fn the_oracle_sees_the_base_branch_at_the_tasks_base() {
+    let mut f = Fixture::new();
+    let base = f.repo.commit("base", &[("a.txt", "1")]);
+    let reference = f.repo.commit("ref", &[("a.txt", "2")]);
+    // `main` has moved on; a fork-point check must still find the base.
+    f.repo.commit("later", &[("a.txt", "2"), ("b", "x")]);
+    let oracle = format!(
+        "test \"$(cat a.txt)\" = 2 || exit 1\n\
+         test \"$(git merge-base HEAD main)\" = {base} || exit 1\n\
+         test \"$(git merge-base HEAD origin/main)\" = {base}\n"
+    );
+    f.add("fork", Source::Landed, &base, &reference, &oracle);
+    let proof = f.validate("fork", None);
+    assert!(get(&proof, "V2").passed, "{proof:#?}");
+}

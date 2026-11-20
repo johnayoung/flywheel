@@ -225,6 +225,8 @@ pub fn run(oracle: &Oracle, tree: &Path, options: &RunOptions) -> std::io::Resul
 pub struct GradeTree {
     pub path: PathBuf,
     repo: PathBuf,
+    /// The base branch name and the task's base commit it is pinned to.
+    base: Option<(String, String)>,
 }
 
 impl GradeTree {
@@ -250,7 +252,16 @@ impl GradeTree {
         Ok(Self {
             path: path.to_owned(),
             repo: repo.to_owned(),
+            base: None,
         })
+    }
+
+    /// After every checkout, `branch` (and `origin/<branch>`) names `base`,
+    /// so an oracle's "fork point with the base branch" is the task's base
+    /// whether the tree came from the operator's repo or a trial's clone.
+    pub fn with_base(mut self, branch: &str, base: &str) -> Self {
+        self.base = Some((branch.to_owned(), base.to_owned()));
+        self
     }
 
     /// Move to `sha` with nothing left over from the last grading (fetching
@@ -262,28 +273,42 @@ impl GradeTree {
     /// [`Self::checkout`], fetching `sha` from `source` when it is missing
     /// (a trial's commit lives in the trial's own repository).
     pub fn checkout_from(&self, source: &Path, sha: &str) -> Result<(), SetError> {
-        if git::rev_parse(&self.path, sha).is_err() {
-            let tmp = format!("refs/flywheel/eval-grade/{}", &sha[..sha.len().min(12)]);
-            // A bare sha is fetched through a temporary ref in the source.
-            git::update_ref(source, &tmp, sha)?;
-            let fetched = git::run(
-                &self.path,
-                &[
-                    "fetch",
-                    "--quiet",
-                    "--no-tags",
-                    &source.display().to_string(),
-                    &tmp,
-                ],
-            );
-            let _ = git::run(source, &["update-ref", "-d", &tmp]);
-            fetched?;
+        self.fetch_missing(source, sha)?;
+        if let Some((_, base)) = &self.base {
+            self.fetch_missing(source, base)?;
         }
         git::run(
             &self.path,
             &["checkout", "--quiet", "--detach", "--force", sha],
         )?;
         git::run(&self.path, &["clean", "-qfdx", "-e", "target"])?;
+        if let Some((branch, base)) = &self.base {
+            git::update_ref(&self.path, &format!("refs/heads/{branch}"), base)?;
+            git::update_ref(&self.path, &format!("refs/remotes/origin/{branch}"), base)?;
+        }
+        Ok(())
+    }
+
+    /// Fetch `sha` from `source` unless the tree already has it.
+    fn fetch_missing(&self, source: &Path, sha: &str) -> Result<(), SetError> {
+        if git::rev_parse(&self.path, sha).is_ok() {
+            return Ok(());
+        }
+        let tmp = format!("refs/flywheel/eval-grade/{}", &sha[..sha.len().min(12)]);
+        // A bare sha is fetched through a temporary ref in the source.
+        git::update_ref(source, &tmp, sha)?;
+        let fetched = git::run(
+            &self.path,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                &source.display().to_string(),
+                &tmp,
+            ],
+        );
+        let _ = git::run(source, &["update-ref", "-d", &tmp]);
+        fetched?;
         Ok(())
     }
 }
@@ -307,6 +332,42 @@ mod tests {
         )
         .unwrap();
         (evals, set)
+    }
+
+    #[test]
+    fn a_tree_from_a_branchless_trial_clone_still_names_the_base_branch() {
+        let repo = TempRepo::new();
+        let base = repo.commit("base", &[("a.txt", "1")]);
+        // A trial's clone: only its own branch, no `main` anywhere.
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("clone");
+        git::run(
+            dir.path(),
+            &["clone", "-q", &repo.path().display().to_string(), "clone"],
+        )
+        .unwrap();
+        git::run(&clone, &["checkout", "-q", "-b", "eval/trial"]).unwrap();
+        git::run(&clone, &["branch", "-q", "-D", "main"]).unwrap();
+        git::run(&clone, &["remote", "remove", "origin"]).unwrap();
+        std::fs::write(clone.join("a.txt"), "2").unwrap();
+        git::run(&clone, &["commit", "-qam", "agent"]).unwrap();
+        let fin = git::rev_parse(&clone, "HEAD").unwrap();
+
+        let bare = GradeTree::open(&clone, &dir.path().join("bare")).unwrap();
+        bare.checkout_from(&clone, &fin).unwrap();
+        assert!(!git::ok(&bare.path, &["merge-base", "HEAD", "main"]));
+
+        let tree = GradeTree::open(&clone, &dir.path().join("tree"))
+            .unwrap()
+            .with_base("main", &base);
+        tree.checkout_from(&clone, &fin).unwrap();
+        for name in ["main", "origin/main"] {
+            assert_eq!(
+                git::run(&tree.path, &["merge-base", "HEAD", name]).unwrap(),
+                base
+            );
+        }
+        assert_eq!(git::default_branch(repo.path()), "main");
     }
 
     #[test]

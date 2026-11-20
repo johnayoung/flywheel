@@ -210,10 +210,12 @@ pub fn validate_task(
         log: Some(log.clone()),
         ..RunOptions::default()
     };
-    let grader = Grader {
+    let branch = git::default_branch(&repo);
+    let task_base = manifest.tasks[index].base.clone();
+    let mut grader = Grader {
         oracle: oracle.clone(),
         repo: &repo,
-        tree: GradeTree::open(&repo, &work.join("tree-a"))?,
+        tree: GradeTree::open(&repo, &work.join("tree-a"))?.with_base(&branch, &task_base),
         options: run_options.clone(),
         log,
     };
@@ -284,6 +286,8 @@ pub fn validate_task(
         }
     }
     let task = manifest.tasks[index].clone();
+    // The base may have moved to cover a prerequisite.
+    grader.tree = grader.tree.clone().with_base(&branch, &task.base);
 
     let (v2, oracle_secs) = if task.kind == crate::set::TaskKind::DontAct {
         // A don't-act task is inverted: the work is done at the base, so the
@@ -372,7 +376,7 @@ pub fn validate_task(
     // V5: concurrent copies, then fw processes coming and going beside it.
     let mut parallel_safe = false;
     if v2 {
-        let tree_b = GradeTree::open(&repo, &work.join("tree-b"))?;
+        let tree_b = GradeTree::open(&repo, &work.join("tree-b"))?.with_base(&branch, &task.base);
         grader.tree.checkout(&task.reference)?;
         tree_b.checkout(&task.reference)?;
         let (o1, o2) = (oracle.clone(), oracle.clone());

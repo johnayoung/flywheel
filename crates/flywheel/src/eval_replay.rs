@@ -654,3 +654,79 @@ pub(crate) fn runs(ctx: &Ctx, json: bool, out: &mut dyn Write) -> Result<i32, St
     }
     Ok(0)
 }
+
+#[derive(Debug, Args)]
+pub struct ReportArgs {
+    pub run: String,
+    /// The variant every other is compared with (default: the first).
+    #[arg(long, value_name = "LABEL")]
+    pub baseline: Option<String>,
+    /// Only tasks of these tiers (comma-separated).
+    #[arg(long, value_name = "TIERS")]
+    pub tier: Option<String>,
+    /// Every task's trials too.
+    #[arg(long)]
+    pub per_task: bool,
+    /// The report as JSON (the hub's view reads the same).
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// The report of `run_id` (shared with the hub's view).
+pub fn build_report(
+    store: &EvalStore,
+    evals: &Path,
+    run_id: &str,
+    filter: &flywheel_eval::report::Filter,
+) -> Result<flywheel_eval::report::EvalReport, String> {
+    let run = store.run(run_id).map_err(|e| e.to_string())?;
+    let variants = store.run_variants(run_id).map_err(|e| e.to_string())?;
+    let trials = store.trials(run_id).map_err(|e| e.to_string())?;
+    let set_dir = if run.set_version == 0 {
+        SetDir::draft(evals, &run.set_name)
+    } else {
+        SetDir::frozen(evals, &run.set_name, run.set_version)
+    };
+    let manifest = set_dir.load().map_err(|e| e.to_string())?;
+    flywheel_eval::report::build(&run, &variants, &trials, &manifest, filter)
+}
+
+/// `fw eval report`.
+pub(crate) fn report(ctx: &Ctx, a: &ReportArgs, out: &mut dyn Write) -> Result<i32, String> {
+    let tiers = a
+        .tier
+        .as_deref()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .map(|t| {
+                    [
+                        Tier::Uncalibrated,
+                        Tier::Frontier,
+                        Tier::Discriminating,
+                        Tier::Regression,
+                    ]
+                    .into_iter()
+                    .find(|x| x.as_str() == t)
+                    .ok_or_else(|| format!("--tier {t:?}"))
+                })
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        })
+        .transpose()?;
+    let filter = flywheel_eval::report::Filter {
+        tiers,
+        baseline: a.baseline.clone(),
+    };
+    let store = ctx.store()?;
+    let r = build_report(&store, &ctx.evals, &a.run, &filter)?;
+    if a.json {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string(&r).map_err(|e| e.to_string())?
+        );
+    } else {
+        let _ = write!(out, "{}", flywheel_eval::report::render(&r, a.per_task));
+    }
+    Ok(0)
+}

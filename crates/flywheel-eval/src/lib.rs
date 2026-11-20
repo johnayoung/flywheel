@@ -24,6 +24,7 @@ pub mod mine;
 pub mod mirror;
 pub mod oracle;
 pub mod proc;
+pub mod report;
 pub mod schedule;
 pub mod set;
 pub mod stats;

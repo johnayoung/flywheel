@@ -49,6 +49,10 @@ enum EvalCommand {
     Replay(crate::eval_replay::ReplayArgs),
     /// Every run: set, variants, progress, spend.
     Runs(JsonArg),
+    /// A run's numbers: per task and overall, and each variant against the
+    /// baseline with its interval, smallest detectable difference, and
+    /// verdict (better, worse, tie, no information).
+    Report(crate::eval_replay::ReportArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1052,6 +1056,7 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         EvalCommand::Estimate(a) => crate::eval_replay::estimate(&ctx, a, out),
         EvalCommand::Replay(a) => crate::eval_replay::replay(&ctx, a, out, err),
         EvalCommand::Runs(a) => crate::eval_replay::runs(&ctx, a.json, out),
+        EvalCommand::Report(a) => crate::eval_replay::report(&ctx, a, out),
     };
     match result {
         Ok(code) => code,

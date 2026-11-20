@@ -364,4 +364,28 @@ fn a_replay_pauses_at_its_budget_and_a_resume_finishes_every_cell() {
         (run["spent_usd"].as_f64().unwrap() - 1.0).abs() < 1e-6,
         "{run}"
     );
+    let report = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "report", &run_id, "--per-task"],
+    ));
+    assert!(
+        report.contains("rule-off vs rule-on (paired by task):"),
+        "{report}"
+    );
+    assert!(
+        report.contains("no information"),
+        "every trial passed: {report}"
+    );
+    let json = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "report", &run_id, "--json"],
+    ));
+    let r: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(r["schema"], 1);
+    assert_eq!(r["saturated_tasks"][0], "two");
+    assert_eq!(r["overall"][0]["pass_hat_k"], 1.0);
 }

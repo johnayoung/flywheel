@@ -70,7 +70,7 @@ impl Source {
 }
 
 /// The calibration tier: measured by running the baseline, never guessed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tier {
     #[default]

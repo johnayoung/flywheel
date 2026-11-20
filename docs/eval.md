@@ -108,3 +108,20 @@ fw eval runs [--json]
 - **Budget:** a cell starts only if spent + in-flight priors + its prior stays within the cap. Running trials are never cut. The default cap is P90 x 1.1, and an explicit `--budget` is required above $50.
 - **Priors:** the median cost of this task under this variant, else the median under any variant, else the original run's cost, else the set median.
 - **Errors and hub:** machinery errors are retried once. With `--hub-state-dir`, the hub's capture hooks label every trial `fw.eval=<run>`, and each cell holds the shared lease `eval:<run>`.
+
+## Reports
+
+```bash
+fw eval report RUN [--baseline LABEL] [--tier regression,discriminating] [--per-task] [--json]
+```
+
+- **Which trials count:** only graded trials. A contaminated or voided pass counts as a fail. A suspect pass counts as a pass until the operator decides. Infra errors are left out but counted.
+- **Per task and variant:** success rate, unbiased pass@k (`1 - C(n-c,k)/C(n,k)`) and pass^k (`C(c,k)/C(n,k)`), cost and turns per success (failed trials' cost included).
+- **Overall:** macro means over build tasks. Don't-act tasks are reported separately as abstain accuracy.
+- **Variant vs baseline, paired by task:** per-task effects (points for success; log ratios shown as % for cost, turns, and time). Each comes with:
+  - a 95% CI from a seeded paired bootstrap (10k resamples, trials resampled within each task);
+  - the MDE, `(z.975 + z.8) * sd(effects) / sqrt(tasks)`;
+  - a verdict: `better` or `worse` when the CI excludes 0, `tie` when it holds 0, and `no information` when every task is saturated for success.
+- **Metric labels:** the metrics named in `--primary` are starred; the rest are exploratory.
+- **Fastest passes:** listed as worth a read, since that is where fake passes hide.
+- **JSON:** the output is the hub view's data (`schema: 1`).

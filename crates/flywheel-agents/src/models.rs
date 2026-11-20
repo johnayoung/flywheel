@@ -274,7 +274,13 @@ pub struct AgentExit {
 /// One run folded to completion. The supported product contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompletedRun {
+    /// Every assistant text of the run, in order.
     pub final_text: String,
+    /// The text of the run's last segment that said anything. One process
+    /// can answer more than once (Claude Code re-enters its session when a
+    /// background task ends after the turn did); this is the latest answer.
+    #[serde(default)]
+    pub last_segment_text: String,
     pub stop: StopInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,

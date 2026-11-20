@@ -336,7 +336,15 @@ pub fn completed_run_to_iteration_result(
     IterationResult {
         transcript: completed.final_text.clone(),
         messages,
-        envelope: parse_envelope(&completed.final_text),
+        // The latest answer carries the envelope: a process that answered
+        // more than once (re-entered by a background task that ended after
+        // its turn) said one envelope per answer, and the last supersedes
+        // the rest. Two in one answer stay a duplicate.
+        envelope: parse_envelope(if completed.last_segment_text.is_empty() {
+            &completed.final_text
+        } else {
+            &completed.last_segment_text
+        }),
         signals,
         failure,
         usage: completed.usage.as_ref().map(to_core_usage),
@@ -1018,7 +1026,10 @@ pub(crate) mod test_support {
     /// (a RUBRIC_VERDICT naming the `--model` / `--max-turns` it received),
     /// `handoff` (a RECOVERY_HANDOFF), `no_verdict` (prose only), `tree`
     /// (records a graceful SIGTERM in `terminated.marker` and leaves a
-    /// SIGTERM-ignoring grandchild whose pid lands in `grandchild.pid`).
+    /// SIGTERM-ignoring grandchild whose pid lands in `grandchild.pid`),
+    /// `reentered` (answers with a `continue` envelope, then is re-entered
+    /// by a background task and answers again with `verify`), `twice`
+    /// (two envelopes in one answer).
     pub const FAKE_CLAUDE: &str = r#"#!/bin/sh
 IFS= read -r FIRST_LINE || true
 MODEL=default; MAXT=none; PREV=""
@@ -1043,6 +1054,20 @@ envelope)
   init
   text 'done\n<!-- LOOP_STATUS -->\n{\"intent\": \"verify\", \"reason\": \"complete\"}\n<!-- /LOOP_STATUS -->'
   result "done" 1
+  ;;
+reentered)
+  init
+  text 'gate running in the background\n<!-- LOOP_STATUS -->\n{\"intent\": \"continue\", \"reason\": \"gate running\"}\n<!-- /LOOP_STATUS -->'
+  result "gate running" 3
+  init
+  text 'gate green\n<!-- LOOP_STATUS -->\n{\"intent\": \"verify\", \"reason\": \"gate green\"}\n<!-- /LOOP_STATUS -->'
+  result "gate green" 2
+  ;;
+twice)
+  init
+  text '<!-- LOOP_STATUS -->\n{\"intent\": \"continue\", \"reason\": \"a\"}\n<!-- /LOOP_STATUS -->'
+  text '<!-- LOOP_STATUS -->\n{\"intent\": \"verify\", \"reason\": \"b\"}\n<!-- /LOOP_STATUS -->'
+  result "twice" 1
   ;;
 no_envelope)
   init
@@ -1176,6 +1201,7 @@ mod tests {
     fn completed() -> CompletedRun {
         CompletedRun {
             final_text: "did the work".into(),
+            last_segment_text: String::new(),
             stop: StopInfo {
                 reason: StopReason::Completed,
                 native: Some("end_turn".into()),
@@ -1441,6 +1467,29 @@ mod tests {
                     .push((kind.to_owned(), payload.clone()));
             }));
         (plane, log)
+    }
+
+    /// reland-verb-t1 (noise floor, 2026-11-19): a background check.sh
+    /// re-entered the session after its envelope; every answer's envelope
+    /// counted toward one, so the attempt failed "duplicate envelope".
+    #[tokio::test]
+    async fn a_re_entered_process_is_judged_by_its_latest_answer() {
+        let fx = fixture();
+        let result = invoker(&fx, "reentered")
+            .invoke(InvocationRequest::new("do the thing"))
+            .await;
+        assert!(result.failure.is_none(), "{:?}", result.failure);
+        let envelope = result.envelope.as_valid().expect("one valid envelope");
+        assert_eq!(envelope.intent, Intent::Verify);
+        assert_eq!(envelope.reason.as_deref(), Some("gate green"));
+        assert_eq!(result.signals.num_turns, Some(5));
+        assert!(result.transcript.contains("gate running"));
+
+        // Two envelopes in one answer are still a duplicate.
+        let result = invoker(&fx, "twice")
+            .invoke(InvocationRequest::new("do the thing"))
+            .await;
+        assert_eq!(result.envelope, EnvelopeResult::Duplicate { count: 2 });
     }
 
     #[tokio::test]

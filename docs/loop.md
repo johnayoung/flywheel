@@ -84,6 +84,8 @@ The envelope carries agent intent only; observed state comes from agent stream s
 
 The envelope is untrusted protocol input. The harness must handle malformed JSON, missing fences, duplicates, truncation, and contradictory claims as first-class cases.
 
+The envelope is read from the agent's latest answer. One process can answer more than once (Claude Code re-enters its session when a background task ends after the turn did); each answer carries its own envelope and the last supersedes the rest. Two envelopes in one answer are a duplicate.
+
 ## Rubric verdict envelope
 
 Rubric graders run an LLM-as-judge in a fresh (cold) agent session through the `flywheel-agents` runtime (`crates/flywheel-core/src/grader_rubric.rs`) and require the judge to terminate its response with one fenced JSON block:

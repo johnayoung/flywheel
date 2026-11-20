@@ -193,6 +193,7 @@ fn build_request(
 fn startup_failure(error_type: &str, message: String) -> CompletedRun {
     CompletedRun {
         final_text: String::new(),
+        last_segment_text: String::new(),
         stop: Default::default(),
         usage: None,
         total_cost_usd: None,

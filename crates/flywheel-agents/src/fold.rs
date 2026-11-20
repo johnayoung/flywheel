@@ -20,7 +20,9 @@
 //! session when a background task it started ends after the turn did, and
 //! each re-entry ends with its own `session.finished`. `num_turns` and
 //! `usage` there count that segment only, so they are summed;
-//! `total_cost_usd` is session-cumulative, so the last one stands.
+//! `total_cost_usd` is session-cumulative, so the last one stands. The
+//! text of the last segment that said anything is kept apart
+//! ([`CompletedRun::last_segment_text`]): it is the agent's latest answer.
 
 use crate::events::{AgentEvent, EventType, Payload};
 use crate::models::{
@@ -78,6 +80,8 @@ pub struct EventFolder {
     /// Summed over every `session.finished` (each counts its segment).
     finished_turns: Option<i64>,
     finished_usage: Usage,
+    /// Where each segment's text begins in `texts` (after the first).
+    segment_starts: Vec<usize>,
     event_count: u64,
 }
 
@@ -169,6 +173,7 @@ impl EventFolder {
                     *self.finished_usage.entry(key).or_insert(0) += n;
                 }
                 self.finished = Some(payload.clone());
+                self.segment_starts.push(self.texts.len());
             }
             _ => {}
         }
@@ -192,6 +197,19 @@ impl EventFolder {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_default()
+    }
+
+    /// The text of the last segment that has any (the whole text when the
+    /// run never re-entered).
+    fn last_segment_text(&self) -> String {
+        let mut end = self.texts.len();
+        for &start in self.segment_starts.iter().rev().chain(std::iter::once(&0)) {
+            if start < end {
+                return self.texts[start..end].concat();
+            }
+            end = end.min(start);
+        }
+        self.final_text()
     }
 
     fn stop(&self) -> StopInfo {
@@ -262,6 +280,7 @@ impl EventFolder {
             .collect();
         CompletedRun {
             final_text: self.final_text(),
+            last_segment_text: self.last_segment_text(),
             stop: self.stop(),
             usage: if usage.is_empty() { None } else { Some(usage) },
             total_cost_usd: finished.get("total_cost_usd").and_then(number_as_f64),
@@ -415,6 +434,38 @@ mod tests {
         assert_eq!(usage["output_tokens"], 35507);
         assert_eq!(usage["input_tokens"], 4);
         assert_eq!(run.total_cost_usd, Some(3.96));
+    }
+
+    #[test]
+    fn last_segment_text_is_the_latest_answer() {
+        let mut folder = EventFolder::new();
+        folder.feed(&event(EventType::AssistantMessage, json!({"text": "one "})));
+        folder.feed(&event(EventType::AssistantMessage, json!({"text": "A"})));
+        folder.feed(&finished(json!({"num_turns": 2})));
+        // A re-entry that said nothing, then one that did.
+        folder.feed(&finished(json!({"num_turns": 0})));
+        folder.feed(&event(EventType::AssistantMessage, json!({"text": "B"})));
+        folder.feed(&finished(json!({"num_turns": 1})));
+        folder.feed(&finished(json!({"num_turns": 0})));
+        let run = folder.completed(exit(), None, None);
+        assert_eq!(run.final_text, "one AB");
+        assert_eq!(run.last_segment_text, "B");
+
+        // Never re-entered: the whole text.
+        let mut single = EventFolder::new();
+        single.feed(&event(EventType::AssistantMessage, json!({"text": "x"})));
+        single.feed(&event(EventType::AssistantMessage, json!({"text": "y"})));
+        single.feed(&finished(json!({})));
+        assert_eq!(single.completed(exit(), None, None).last_segment_text, "xy");
+
+        // Cut off mid-segment: the unfinished tail is the latest.
+        folder.feed(&event(EventType::AssistantMessage, json!({"text": "C"})));
+        assert_eq!(folder.completed(exit(), None, None).last_segment_text, "C");
+
+        // No text blocks at all: the result text.
+        let mut bare = EventFolder::new();
+        bare.feed(&finished(json!({"result_text": "only"})));
+        assert_eq!(bare.completed(exit(), None, None).last_segment_text, "only");
     }
 
     #[test]

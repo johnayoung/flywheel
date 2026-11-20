@@ -104,6 +104,7 @@ impl ActiveRun {
             Ok(run) => run,
             Err(join) => CompletedRun {
                 final_text: String::new(),
+                last_segment_text: String::new(),
                 stop: Default::default(),
                 usage: None,
                 total_cost_usd: None,

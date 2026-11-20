@@ -15,6 +15,12 @@
 //!   adapter-computed), `stop_reason` (native), `subtype`, `is_error`,
 //!   `num_turns`, `total_cost_usd`, `usage` (authoritative when present),
 //!   `result_text` (transcript fallback), `session_id`
+//!
+//! One process can finish more than once: Claude Code re-enters the same
+//! session when a background task it started ends after the turn did, and
+//! each re-entry ends with its own `session.finished`. `num_turns` and
+//! `usage` there count that segment only, so they are summed;
+//! `total_cost_usd` is session-cumulative, so the last one stands.
 
 use crate::events::{AgentEvent, EventType, Payload};
 use crate::models::{
@@ -69,6 +75,9 @@ pub struct EventFolder {
     rate_limits: Vec<RateLimitInfo>,
     assistant_usage: Usage,
     finished: Option<Payload>,
+    /// Summed over every `session.finished` (each counts its segment).
+    finished_turns: Option<i64>,
+    finished_usage: Usage,
     event_count: u64,
 }
 
@@ -153,6 +162,12 @@ impl EventFolder {
                 if let Some(sid) = payload.get("session_id").and_then(Value::as_str) {
                     self.session_id = Some(sid.to_string());
                 }
+                if let Some(turns) = payload.get("num_turns").and_then(Value::as_i64) {
+                    *self.finished_turns.get_or_insert(0) += turns;
+                }
+                for (key, n) in usage_from(payload, "usage") {
+                    *self.finished_usage.entry(key).or_insert(0) += n;
+                }
                 self.finished = Some(payload.clone());
             }
             _ => {}
@@ -228,7 +243,7 @@ impl EventFolder {
     ) -> CompletedRun {
         let empty = Payload::new();
         let finished = self.finished.as_ref().unwrap_or(&empty);
-        let mut usage = usage_from(finished, "usage");
+        let mut usage = self.finished_usage.clone();
         if usage.is_empty() {
             usage = self.assistant_usage.clone();
         }
@@ -250,7 +265,7 @@ impl EventFolder {
             stop: self.stop(),
             usage: if usage.is_empty() { None } else { Some(usage) },
             total_cost_usd: finished.get("total_cost_usd").and_then(number_as_f64),
-            num_turns: finished.get("num_turns").and_then(Value::as_i64),
+            num_turns: self.finished_turns,
             native_session_id: self.session_id.clone(),
             tool_interactions: interactions,
             permission_denials: self.denials.clone(),
@@ -375,6 +390,31 @@ mod tests {
         let got = run.usage.unwrap();
         assert_eq!(got["input_tokens"], 99);
         assert_eq!(got["output_tokens"], 44);
+    }
+
+    /// reland-verb-t1 (noise floor, 2026-11-19): background check.sh runs
+    /// re-entered one process three times; the store kept 3 turns of 68.
+    #[test]
+    fn turns_and_usage_sum_over_re_entered_segments() {
+        let mut folder = EventFolder::new();
+        for (turns, output, cost) in [
+            (63, 33082, 3.69),
+            (0, 0, 3.69),
+            (2, 370, 3.79),
+            (3, 2055, 3.96),
+        ] {
+            folder.feed(&finished(json!({
+                "num_turns": turns,
+                "total_cost_usd": cost,
+                "usage": {"input_tokens": 1, "output_tokens": output},
+            })));
+        }
+        let run = folder.completed(exit(), None, None);
+        assert_eq!(run.num_turns, Some(68));
+        let usage = run.usage.unwrap();
+        assert_eq!(usage["output_tokens"], 35507);
+        assert_eq!(usage["input_tokens"], 4);
+        assert_eq!(run.total_cost_usd, Some(3.96));
     }
 
     #[test]

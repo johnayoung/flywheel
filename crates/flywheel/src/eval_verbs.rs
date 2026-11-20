@@ -13,6 +13,7 @@ use flywheel_eval::mine::{self, MineOptions};
 use flywheel_eval::set::{self, SetDir, SetRef, SplitRatios, VersionRef};
 use flywheel_eval::store::EvalStore;
 use flywheel_eval::validate::{self, ValidateOptions};
+use flywheel_eval::variant;
 use flywheel_orchestrator::config::Access;
 use flywheel_orchestrator::home::{Project, resolve_cwd_project};
 use flywheel_orchestrator::policy::WorkPolicy;
@@ -36,6 +37,42 @@ enum EvalCommand {
     /// Build, validate, freeze, and inspect task sets.
     #[command(subcommand)]
     Set(SetCommand),
+    /// Resolve, pin, and compare agent-setup variants.
+    #[command(subcommand)]
+    Variant(VariantCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum VariantCommand {
+    /// Resolve NAME (evals/variants/NAME.toml, or --file) and record it.
+    Pin(PinArgs),
+    /// What NAME resolves to now.
+    Show(VariantShowArgs),
+    /// What differs between two variants.
+    Diff(VariantDiffArgs),
+    /// Every variant file and every pinned hash.
+    Ls(JsonArg),
+}
+
+#[derive(Debug, Args)]
+struct PinArgs {
+    name: String,
+    /// The variant file (default: evals/variants/NAME.toml).
+    #[arg(long, value_name = "PATH")]
+    file: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct VariantShowArgs {
+    name: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct VariantDiffArgs {
+    a: String,
+    b: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -508,6 +545,217 @@ fn set_diff(ctx: &Ctx, args: &DiffArgs, out: &mut dyn Write) -> Result<i32, Stri
     Ok(0)
 }
 
+fn variants_dir(ctx: &Ctx) -> PathBuf {
+    ctx.evals.join("variants")
+}
+
+/// Resolve variant `name` (its file under `evals/variants/`, or `file`).
+pub(crate) fn resolve_variant(
+    evals: &Path,
+    name: &str,
+    file: Option<&Path>,
+) -> Result<variant::ResolvedVariant, String> {
+    let path = file.map_or_else(
+        || evals.join("variants").join(format!("{name}.toml")),
+        Path::to_owned,
+    );
+    let parsed = variant::load_file(&path).map_err(|e| e.to_string())?;
+    let base_dir = path.parent().unwrap_or(Path::new(".")).to_owned();
+    let env = variant::ResolveEnv::from_process(&base_dir, &evals.join("blobs"))?;
+    let name = parsed.name.clone().unwrap_or_else(|| name.to_owned());
+    variant::resolve(&name, &parsed, &env, None).map_err(|e| e.to_string())
+}
+
+fn describe_variant(v: &variant::ResolvedVariant) -> Vec<(String, String)> {
+    let mut rows = vec![
+        ("hash".to_owned(), v.short_hash().to_owned()),
+        (
+            "agent".to_owned(),
+            format!(
+                "{} ({})",
+                v.agent,
+                if v.agent_cli_version.is_empty() {
+                    "version unknown"
+                } else {
+                    &v.agent_cli_version
+                }
+            ),
+        ),
+        (
+            "model".to_owned(),
+            v.model.clone().unwrap_or_else(|| "(agent default)".into()),
+        ),
+        (
+            "effort".to_owned(),
+            v.effort.clone().unwrap_or_else(|| "(default)".into()),
+        ),
+        (
+            "fw".to_owned(),
+            format!(
+                "{} {} sha256 {}",
+                v.fw_path.display(),
+                v.fw_version,
+                &v.fw_sha256[..12]
+            ),
+        ),
+        ("permission_mode".to_owned(), v.permission_mode.clone()),
+        (
+            "setting_sources".to_owned(),
+            if v.setting_sources.is_empty() {
+                "(n/a: codex)".into()
+            } else {
+                v.setting_sources.join(",")
+            },
+        ),
+        (
+            "settings".to_owned(),
+            v.settings_blob
+                .as_deref()
+                .map_or_else(|| "-".into(), |b| b[..12].to_owned()),
+        ),
+        (
+            "env".to_owned(),
+            v.env
+                .iter()
+                .map(|(k, val)| format!("{k}={val}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        (
+            "claude_md (user)".to_owned(),
+            v.claude_md_blob
+                .as_deref()
+                .map_or_else(|| "-".into(), |b| b[..12].to_owned()),
+        ),
+        (
+            "skills (user)".to_owned(),
+            v.skills.keys().cloned().collect::<Vec<_>>().join(","),
+        ),
+        (
+            "mcp (user)".to_owned(),
+            v.mcp_servers.keys().cloned().collect::<Vec<_>>().join(","),
+        ),
+    ];
+    for op in &v.repo {
+        rows.push((
+            format!("repo {}", op.path),
+            format!(
+                "{:?}{}{}",
+                op.op,
+                op.blob
+                    .as_deref()
+                    .map(|b| format!(" {}", &b[..12]))
+                    .unwrap_or_default(),
+                op.pattern
+                    .as_deref()
+                    .map(|p| format!(" /{p}/"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+    for (k, d) in &v.unisolated {
+        rows.push((format!("unisolated {k}"), d[..12].to_owned()));
+    }
+    rows
+}
+
+fn variant_pin(ctx: &Ctx, args: &PinArgs, out: &mut dyn Write) -> Result<i32, String> {
+    let v = resolve_variant(&ctx.evals, &args.name, args.file.as_deref())?;
+    let store = ctx.store()?;
+    store
+        .put_variant(&flywheel_eval::store::VariantRow {
+            hash: v.hash.clone(),
+            name: v.name.clone(),
+            resolved_json: serde_json::to_string(&v).map_err(|e| e.to_string())?,
+            created_at: Utc::now(),
+        })
+        .map_err(|e| e.to_string())?;
+    let _ = writeln!(out, "pinned {}@{}", v.name, v.short_hash());
+    Ok(0)
+}
+
+fn variant_show(ctx: &Ctx, args: &VariantShowArgs, out: &mut dyn Write) -> Result<i32, String> {
+    let v = resolve_variant(&ctx.evals, &args.name, None)?;
+    if args.json {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string(&v).map_err(|e| e.to_string())?
+        );
+        return Ok(0);
+    }
+    let _ = writeln!(out, "{}", v.name);
+    for (k, val) in describe_variant(&v) {
+        let _ = writeln!(out, "  {k:<18} {val}");
+    }
+    Ok(0)
+}
+
+fn variant_diff(ctx: &Ctx, args: &VariantDiffArgs, out: &mut dyn Write) -> Result<i32, String> {
+    let a = describe_variant(&resolve_variant(&ctx.evals, &args.a, None)?);
+    let b = describe_variant(&resolve_variant(&ctx.evals, &args.b, None)?);
+    let keys: std::collections::BTreeSet<&String> =
+        a.iter().chain(b.iter()).map(|(k, _)| k).collect();
+    let get = |rows: &[(String, String)], k: &str| {
+        rows.iter()
+            .find(|(key, _)| key == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| "-".into())
+    };
+    let mut same = true;
+    for k in keys {
+        let (va, vb) = (get(&a, k), get(&b, k));
+        if va != vb {
+            same = false;
+            let _ = writeln!(out, "{k}\n  {}: {va}\n  {}: {vb}", args.a, args.b);
+        }
+    }
+    if same {
+        let _ = writeln!(out, "the same setup");
+    }
+    Ok(0)
+}
+
+fn variant_ls(ctx: &Ctx, args: &JsonArg, out: &mut dyn Write) -> Result<i32, String> {
+    let mut files: Vec<String> = std::fs::read_dir(variants_dir(ctx))
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| {
+                    e.file_name()
+                        .to_str()
+                        .and_then(|n| n.strip_suffix(".toml"))
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    if args.json {
+        let _ = writeln!(out, "{}", serde_json::json!({"files": files}));
+        return Ok(0);
+    }
+    if files.is_empty() {
+        let _ = writeln!(
+            out,
+            "no variants yet: write {}/NAME.toml (fw docs eval)",
+            variants_dir(ctx).display()
+        );
+    }
+    for f in files {
+        let line = match resolve_variant(&ctx.evals, &f, None) {
+            Ok(v) => format!(
+                "{f:<24} {}  {} {}",
+                v.short_hash(),
+                v.agent,
+                v.model.as_deref().unwrap_or_default()
+            ),
+            Err(e) => format!("{f:<24} INVALID: {e}"),
+        };
+        let _ = writeln!(out, "{line}");
+    }
+    Ok(0)
+}
+
 /// `fw eval ...`.
 pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let argv = std::iter::once("fw eval".to_owned()).chain(args.iter().cloned());
@@ -538,6 +786,10 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         EvalCommand::Set(SetCommand::Ls(a)) => set_ls(&ctx, a, out),
         EvalCommand::Set(SetCommand::Show(a)) => set_show(&ctx, a, out),
         EvalCommand::Set(SetCommand::Diff(a)) => set_diff(&ctx, a, out),
+        EvalCommand::Variant(VariantCommand::Pin(a)) => variant_pin(&ctx, a, out),
+        EvalCommand::Variant(VariantCommand::Show(a)) => variant_show(&ctx, a, out),
+        EvalCommand::Variant(VariantCommand::Diff(a)) => variant_diff(&ctx, a, out),
+        EvalCommand::Variant(VariantCommand::Ls(a)) => variant_ls(&ctx, a, out),
     };
     match result {
         Ok(code) => code,

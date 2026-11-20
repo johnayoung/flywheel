@@ -38,3 +38,35 @@ Standing-verify parks, and parks that re-landed unchanged, are flakes and are no
 | V6 / V7 | No oracle file or task names a live flywheel home. The task loads and has no prerequisites. |
 
 Layout: `$FLYWHEEL_HOME/projects/<id>/evals/sets/<name>/{draft,vN}/` holds `set.json`, `tasks/`, `oracles/<task>/`, `specs/<task>/`, and `proofs/`. Project-home paths appear as `@EVAL_PROJECT_HOME@`. Index: the `eval_*` tables ([persistence-tables.md](persistence-tables.md#eval-tables)).
+
+## Variants
+
+A variant is a declared agent setup: `evals/variants/NAME.toml`. Before a trial runs, it is resolved into content, kept in `evals/blobs/`, and hashed. The hash covers everything except the variant's name.
+
+```toml
+agent = "claude"                     # claude | codex
+model = "opus"
+fw = "current"                       # or a path to an fw binary (hashed)
+permission_mode = "bypassPermissions"
+settings = "settings/x.json"         # -> .claude/settings.local.json (hooks, env, permissions)
+[env]                                # set on the worker; the agent inherits it
+[[repo]]                             # one overlay commit per task base
+path = "CLAUDE.md"
+op = "strip"                         # replace | append | ensure | strip | delete | replace_dir
+pattern = '(?ms)^\*\*Exception: flywheel worker runs\*\*.*?\n\n'
+[user]
+claude_md = "inherit"                # none | inherit | PATH -> CLAUDE.local.md
+skills = ["fw-plan"]                 # none | inherit | [names] | DIR -> .claude/skills/
+mcp_servers = ["context7"]           # from ~/.claude.json -> .mcp.json
+```
+
+**Claude Code variants**
+- Trials never load user-level layers. The worker runs with `--setting-sources project,local`, so the user's CLAUDE.md, skills, and MCP servers reach the agent only through the `[user]` overlays.
+- No separate config dir is used, so credentials stay where Claude Code refreshes them.
+- Before each replay, a no-cost canary checks that this Claude Code build still honors the flag. It plants a skill, an MCP server, and a hook in a scratch config dir and runs once with `user` and once without.
+
+**Codex variants (v1)** take only `model`, `effort`, `env`, and `[[repo]]` overlays. The user's Codex files are hashed, so a change between runs shows up.
+
+```bash
+fw eval variant ls | show NAME | diff A B | pin NAME
+```

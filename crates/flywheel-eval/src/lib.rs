@@ -16,6 +16,7 @@
 //! eval tables are this crate's own ([`store`]). Design:
 //! `docs/eval.md`.
 
+pub mod canary;
 pub mod db;
 pub mod git;
 pub mod mine;
@@ -25,6 +26,7 @@ pub mod proc;
 pub mod set;
 pub mod store;
 pub mod validate;
+pub mod variant;
 
 #[cfg(test)]
 mod testutil;

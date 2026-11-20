@@ -283,8 +283,7 @@ impl GradeTree {
         )?;
         git::run(&self.path, &["clean", "-qfdx", "-e", "target"])?;
         if let Some((branch, base)) = &self.base {
-            git::update_ref(&self.path, &format!("refs/heads/{branch}"), base)?;
-            git::update_ref(&self.path, &format!("refs/remotes/origin/{branch}"), base)?;
+            git::pin_branch(&self.path, branch, base)?;
         }
         Ok(())
     }

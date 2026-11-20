@@ -102,6 +102,13 @@ pub fn default_branch(repo: &Path) -> String {
     .unwrap_or_else(|| "main".to_owned())
 }
 
+/// Point `branch` and its `origin/` twin at `sha`, so whatever measures
+/// "the fork point with the base branch" finds `sha`.
+pub fn pin_branch(repo: &Path, branch: &str, sha: &str) -> Result<(), GitError> {
+    update_ref(repo, &format!("refs/heads/{branch}"), sha)?;
+    update_ref(repo, &format!("refs/remotes/origin/{branch}"), sha)
+}
+
 /// Whether `sha` is a 40-hex commit id.
 pub fn is_full_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())

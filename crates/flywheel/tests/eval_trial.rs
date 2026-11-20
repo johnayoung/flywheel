@@ -108,7 +108,10 @@ fn world() -> World {
     std::fs::create_dir_all(project.join("verification")).unwrap();
     std::fs::write(
         project.join("verification/oracle-two.sh"),
-        "test \"$(cat a.txt)\" = 2\n",
+        // The fork point with the default branch, as 00086's oracles ask:
+        // the trial's clone (in-trial landing gate) and the grading tree
+        // must both name `main`.
+        "test \"$(cat a.txt)\" = 2 && git merge-base HEAD main >/dev/null\n",
     )
     .unwrap();
     std::fs::create_dir_all(project.join("held-out")).unwrap();

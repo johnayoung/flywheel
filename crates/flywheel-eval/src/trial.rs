@@ -278,6 +278,13 @@ fn execute(
         &["checkout", "--quiet", "-B", "eval/idle", &overlay.commit],
     )
     .map_err(|e| e.to_string())?;
+    // The operator's default branch names the base, as it did when the
+    // task first ran: an oracle the in-trial landing gate runs may measure
+    // against it (out-of-band grading pins the same in its tree).
+    let default_branch = git::default_branch(&plan.manifest.repo);
+    if default_branch != TRIAL_BRANCH && default_branch != "eval/idle" {
+        git::pin_branch(&clone, &default_branch, &task.base).map_err(|e| e.to_string())?;
+    }
     write_json(&dir.join("overlay.json"), &overlay)?;
 
     // 3. The trial's flywheel home.

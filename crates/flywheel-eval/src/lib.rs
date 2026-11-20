@@ -18,6 +18,7 @@
 
 pub mod canary;
 pub mod db;
+pub mod dont_act;
 pub mod estimate;
 pub mod git;
 pub mod mine;

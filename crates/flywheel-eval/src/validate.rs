@@ -57,6 +57,10 @@ fn check(name: &str, passed: bool, detail: impl Into<String>) -> ProofCheck {
     }
 }
 
+fn short(sha: &str) -> &str {
+    &sha[..12.min(sha.len())]
+}
+
 /// Strings that name a live flywheel home.
 fn names_live_home(text: &str) -> bool {
     text.contains("/.flywheel/projects/") || text.contains("~/.flywheel")
@@ -253,39 +257,79 @@ pub fn validate_task(
     }
     let task = manifest.tasks[index].clone();
 
-    // V1: fails at the base, twice.
-    let (a, b) = grader.twice(&task.base)?;
-    let v1 = !a.passed && !b.passed && !a.ran.timed_out && !b.ran.timed_out;
-    checks.push(check(
-        "V1",
-        v1,
-        format!(
-            "at base {}: {}, {}",
-            &task.base[..12.min(task.base.len())],
-            a.detail,
-            b.detail
-        ),
-    ));
-
-    // V2: passes at the reference, twice.
-    let (a, b) = grader.twice(&task.reference)?;
-    let v2 = a.passed && b.passed;
-    let oracle_secs = (a.secs + b.secs) / 2.0;
-    checks.push(check(
-        "V2",
-        v2,
-        format!(
-            "at reference {}: {}, {} ({oracle_secs:.0}s){}",
-            &task.reference[..12.min(task.reference.len())],
-            a.detail,
-            b.detail,
-            if v2 {
-                String::new()
-            } else {
-                format!("; log {}", grader.log.display())
-            }
-        ),
-    ));
+    let (v2, oracle_secs) = if task.kind == crate::set::TaskKind::DontAct {
+        // A don't-act task is inverted: the work is done at the base, so the
+        // oracle passes there (V1) and fails once anything is committed on
+        // top of it (V2).
+        let (a, b) = grader.twice(&task.base)?;
+        let v1 = a.passed && b.passed;
+        checks.push(check(
+            "V1",
+            v1,
+            format!(
+                "at base {} (the work is done): {}, {}",
+                short(&task.base),
+                a.detail,
+                b.detail
+            ),
+        ));
+        grader.tree.checkout(&task.base)?;
+        git::run(
+            &grader.tree.path,
+            &[
+                "-c",
+                "user.name=flywheel eval",
+                "-c",
+                "user.email=eval@flywheel.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--no-verify",
+                "-m",
+                "probe: an agent change",
+            ],
+        )?;
+        let probe = oracle::run(&grader.oracle, &grader.tree.path, &grader.options)
+            .map_err(|e| SetError::Invalid(format!("cannot run the oracle: {e}")))?;
+        let v2 = !probe.passed && !probe.ran.timed_out;
+        checks.push(check(
+            "V2",
+            v2,
+            format!("a commit on top of the base: {}", probe.detail),
+        ));
+        (v1 && v2, (a.secs + b.secs) / 2.0)
+    } else {
+        // V1: fails at the base, twice.
+        let (a, b) = grader.twice(&task.base)?;
+        let v1 = !a.passed && !b.passed && !a.ran.timed_out && !b.ran.timed_out;
+        checks.push(check(
+            "V1",
+            v1,
+            format!("at base {}: {}, {}", short(&task.base), a.detail, b.detail),
+        ));
+        // V2: passes at the reference, twice.
+        let (a, b) = grader.twice(&task.reference)?;
+        let v2 = a.passed && b.passed;
+        let oracle_secs = (a.secs + b.secs) / 2.0;
+        checks.push(check(
+            "V2",
+            v2,
+            format!(
+                "at reference {}: {}, {} ({oracle_secs:.0}s){}",
+                short(&task.reference),
+                a.detail,
+                b.detail,
+                if v2 {
+                    String::new()
+                } else {
+                    format!("; log {}", grader.log.display())
+                }
+            ),
+        ));
+        (v2, oracle_secs)
+    };
 
     // V4: a mirror of the base holds nothing past it.
     let mirror_dir = work.join("mirror");

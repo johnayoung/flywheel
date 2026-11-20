@@ -147,3 +147,16 @@ fw eval decide RUN TRIAL --confirm|--clear  # a suspect pass: void it, or let it
 - **Verdicts:** `clean`, `fake_pass`, `discovery_bug`, `access_bug`, `spec_ambiguity`, `harness_bug`, `gave_up`.
 - **Suspect passes:** a `fake_pass` at high confidence makes a pass **suspect**. A reader never changes a verdict; only `--confirm` voids a pass.
 - **Cost:** review is a separate, paid step, so a replay does not start it on its own.
+
+## Don't-act tasks
+
+```bash
+fw eval set dont-act core two,three     # adds two-dont-act, three-dont-act to core@draft; then validate
+```
+
+A don't-act task is a validated landed task, replayed at its own reference: the work is already done. It passes only if all three hold:
+1. **No change:** nothing is committed past the overlay (the first oracle command).
+2. **Still green:** the original oracle passes.
+3. **Inspected:** the harness transcript shows a read of a file the task names and a build or test command (the `inspected` check).
+
+Validation is inverted: the oracle passes at the base and fails once a commit is made on top of it. The report shows these tasks as abstain accuracy, apart from success.

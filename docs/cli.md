@@ -20,7 +20,7 @@ The `flywheel` / `fw` surface is the top-of-stack product shell: the operator's 
 | Specs | `fw spec ls [--json]` / `export DIR [--force]` | The cwd project's central specs; copy them out (see [Specs](#specs)) |
 | Config | `fw config [--json]` / `fw trust [--revoke]` | The effective config with sources; approve the repo's `.flywheel.toml` (see [Config and trust](#config-and-trust)) |
 | Store | `fw db upgrade [--project ID \| --db PATH]`, `fw db status [...] [--json]` | Migrate the store in place to this build's schema (see [The store](#the-store)) |
-| Eval | `fw eval set build\|validate\|freeze\|ls\|show\|diff`, `fw eval variant ls\|show\|diff\|pin`, `fw eval trial SET TASK --variant V`, `fw eval estimate\|replay\|runs\|report\|trace\|review\|decide` | Frozen task sets from past work, replayed under agent-setup variants (see [eval.md](eval.md)) |
+| Eval | `fw eval set build\|validate\|dont-act\|freeze\|ls\|show\|diff`, `fw eval variant ls\|show\|diff\|pin`, `fw eval trial SET TASK --variant V`, `fw eval estimate\|replay\|runs\|report\|trace\|review\|decide` | Frozen task sets from past work, replayed under agent-setup variants (see [eval.md](eval.md)) |
 | Self-update | `fw self-update [--dry-run] [--json]` | Build a clean, landed flywheel checkout and install the new `fw` / `flywheel` in place (see [`self-update`](#self-update)) |
 
 `flywheel` and `fw` are byte-identical binaries on one implementation (`crates/flywheel/src/cli.rs`, two `[[bin]]` targets in `crates/flywheel/Cargo.toml`). Use either; this doc writes `fw` for brevity.

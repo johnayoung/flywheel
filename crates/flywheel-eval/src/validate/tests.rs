@@ -213,3 +213,31 @@ fn live_home_paths_fail_v6_and_v7() {
     assert!(!get(&proof, "V7").passed);
     let _ = &f.evals;
 }
+
+#[test]
+fn a_dont_act_twin_validates_inverted() {
+    let mut f = Fixture::new();
+    let base = f.repo.commit("base", &[("a.txt", "1")]);
+    let reference = f.repo.commit("ref", &[("a.txt", "2")]);
+    f.add("good", Source::Landed, &base, &reference, GOOD);
+    assert!(f.validate("good", None).passed);
+    let twin = crate::dont_act::generate(&f.set, &mut f.manifest, "good").unwrap();
+    assert_eq!(
+        (twin.base.as_str(), twin.reference.as_str()),
+        (reference.as_str(), reference.as_str())
+    );
+    assert_eq!(twin.kind, crate::set::TaskKind::DontAct);
+    let proof = f.validate("good-dont-act", None);
+    assert!(proof.passed, "{proof:#?}");
+    assert!(get(&proof, "V1").detail.contains("the work is done"));
+    assert!(get(&proof, "V2").detail.contains("a commit on top"));
+    // Only a validated task gets a twin, and never a twin's twin.
+    f.add("raw", Source::Landed, &base, &reference, GOOD);
+    assert!(
+        crate::dont_act::generate(&f.set, &mut f.manifest, "raw")
+            .unwrap_err()
+            .to_string()
+            .contains("validate raw first")
+    );
+    assert!(crate::dont_act::generate(&f.set, &mut f.manifest, "good-dont-act").is_err());
+}

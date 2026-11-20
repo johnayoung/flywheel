@@ -495,15 +495,29 @@ fn execute(
     if verdict.ran.timed_out || (verdict.ran.code.is_none() && !verdict.passed) {
         return Err(format!("the oracle did not finish: {}", verdict.detail));
     }
-    row.oracle = Some(if verdict.passed { "pass" } else { "fail" }.into());
-    write_json(
-        &dir.join("checks.json"),
-        &verdict
-            .checks
-            .iter()
-            .map(|c| serde_json::json!({"id": c.id, "passed": c.passed, "note": c.note}))
-            .collect::<Vec<_>>(),
-    )?;
+    let mut passed = verdict.passed;
+    let mut detail = verdict.detail.clone();
+    let mut checks: Vec<serde_json::Value> = verdict
+        .checks
+        .iter()
+        .map(|c| serde_json::json!({"id": c.id, "passed": c.passed, "note": c.note}))
+        .collect();
+    // A don't-act task also needs evidence the agent looked, read from the
+    // harness's transcript (which the agent cannot write).
+    if task.kind == crate::set::TaskKind::DontAct {
+        let (looked, why) = crate::dont_act::inspected(
+            &dir.join("transcripts"),
+            &crate::dont_act::relevant_paths(&task_text),
+        )
+        .unwrap_or((false, "no transcript".into()));
+        checks.push(serde_json::json!({"id": "inspected", "passed": looked, "note": why}));
+        if passed && !looked {
+            passed = false;
+            detail = format!("no change, but {why}");
+        }
+    }
+    row.oracle = Some(if passed { "pass" } else { "fail" }.into());
+    write_json(&dir.join("checks.json"), &checks)?;
 
     let record = TrialRecord {
         trial_id: plan.trial_id.clone(),
@@ -518,7 +532,7 @@ fn execute(
         worker_exit: ran.code,
         worker_timed_out: ran.timed_out,
         oracle: row.oracle.clone().unwrap_or_default(),
-        oracle_detail: verdict.detail.clone(),
+        oracle_detail: detail,
         flywheel_status,
         started_at: row.started_at.unwrap_or_else(now),
         ended_at: now(),

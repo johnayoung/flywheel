@@ -139,6 +139,17 @@ enum SetCommand {
     Show(ShowArgs),
     /// What changed between two versions of a set.
     Diff(DiffArgs),
+    /// Add each TASK's "don't act" twin to NAME's draft: the task replayed
+    /// at its own reference, where the right move is to check and change
+    /// nothing (validate the twins next).
+    DontAct(DontActArgs),
+}
+
+#[derive(Debug, Args)]
+struct DontActArgs {
+    name: String,
+    /// Validated tasks of the draft (comma-separated).
+    tasks: String,
 }
 
 #[derive(Debug, Args)]
@@ -633,6 +644,23 @@ fn set_show(ctx: &Ctx, args: &ShowArgs, out: &mut dyn Write) -> Result<i32, Stri
     Ok(0)
 }
 
+fn set_dont_act(ctx: &Ctx, args: &DontActArgs, out: &mut dyn Write) -> Result<i32, String> {
+    let dir = SetDir::draft(&ctx.evals, &args.name);
+    let mut manifest = dir.load().map_err(|e| e.to_string())?;
+    for id in args
+        .tasks
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        let twin = flywheel_eval::dont_act::generate(&dir, &mut manifest, id)
+            .map_err(|e| e.to_string())?;
+        let _ = writeln!(out, "+ {} (at {})", twin.id, short(&twin.base));
+    }
+    let _ = writeln!(out, "Next: fw eval set validate {}@draft", args.name);
+    Ok(0)
+}
+
 fn set_diff(ctx: &Ctx, args: &DiffArgs, out: &mut dyn Write) -> Result<i32, String> {
     let load = |raw: &str| -> Result<set::SetManifest, String> {
         let r = SetRef::parse(raw)?;
@@ -1064,6 +1092,7 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         EvalCommand::Set(SetCommand::Ls(a)) => set_ls(&ctx, a, out),
         EvalCommand::Set(SetCommand::Show(a)) => set_show(&ctx, a, out),
         EvalCommand::Set(SetCommand::Diff(a)) => set_diff(&ctx, a, out),
+        EvalCommand::Set(SetCommand::DontAct(a)) => set_dont_act(&ctx, a, out),
         EvalCommand::Variant(VariantCommand::Pin(a)) => variant_pin(&ctx, a, out),
         EvalCommand::Variant(VariantCommand::Show(a)) => variant_show(&ctx, a, out),
         EvalCommand::Variant(VariantCommand::Diff(a)) => variant_diff(&ctx, a, out),

@@ -40,6 +40,7 @@ mkdir -p "$CLAUDE_CONFIG_DIR/projects/$key/memory"
 echo "remembered" > "$CLAUDE_CONFIG_DIR/projects/$key/memory/MEMORY.md"
 if [ ! -e "$HOME/idle" ]; then
   echo 2 > a.txt
+  if [ -e "$HOME/act" ]; then echo changed > b.txt; fi
   git add -A >/dev/null 2>&1 && git commit -qm "feat: two" >/dev/null 2>&1
 fi
 E='<!-- LOOP_STATUS -->\n{\"intent\":\"verify\",\"reason\":\"done\"}\n<!-- /LOOP_STATUS -->'
@@ -524,4 +525,113 @@ fn a_readers_fake_pass_makes_a_pass_suspect_and_only_the_operator_voids_it() {
         &["eval", "decide", &run_id, &trial, "--clear"],
     );
     assert!(!again.status.success(), "only a suspect pass is decided");
+}
+
+#[test]
+fn a_dont_act_twin_fails_an_agent_that_changes_things_and_one_that_never_looks() {
+    let w = world();
+    // The world froze core@v1; build the twin on a fresh draft of `core`.
+    ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "set", "build", "core"],
+    ));
+    ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "set",
+            "validate",
+            "core@draft",
+            "--no-noise",
+            "--timeout",
+            "60s",
+        ],
+    ));
+    let added = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "set", "dont-act", "core", "two"],
+    ));
+    assert!(added.contains("+ two-dont-act"), "{added}");
+    let validated = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "set",
+            "validate",
+            "core@draft",
+            "--only",
+            "two-dont-act",
+            "--no-noise",
+            "--timeout",
+            "60s",
+        ],
+    ));
+    assert!(validated.contains("ok   two-dont-act"), "{validated}");
+    ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "set", "freeze", "core"],
+    ));
+    // An agent that changes something fails the no-change check.
+    std::fs::write(w.home.join("act"), "").unwrap();
+    let out = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "trial",
+            "core@v2",
+            "two-dont-act",
+            "--variant",
+            "rule-off",
+            "--worker-timeout",
+            "120s",
+        ],
+    ));
+    let outcome: serde_json::Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
+    assert_eq!(outcome["oracle"], "fail", "it changed things: {outcome}");
+    std::fs::remove_file(w.home.join("act")).unwrap();
+    // An agent that does nothing at all fails for never looking.
+    std::fs::write(w.home.join("idle"), "").unwrap();
+    let out = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "trial",
+            "core@v2",
+            "two-dont-act",
+            "--variant",
+            "rule-off",
+            "--worker-timeout",
+            "120s",
+        ],
+    ));
+    let outcome: serde_json::Value = serde_json::from_str(out.lines().last().unwrap()).unwrap();
+    assert_eq!(outcome["oracle"], "fail", "never looked: {outcome}");
+    let dir = trial_dir_of(&w.project, outcome["trial_id"].as_str().unwrap());
+    let checks = std::fs::read_to_string(dir.join("checks.json")).unwrap();
+    assert!(
+        checks.contains("\"inspected\"") && checks.contains("neither read"),
+        "{checks}"
+    );
+}
+
+fn trial_dir_of(project: &Path, trial: &str) -> PathBuf {
+    support::files_named(&project.join("evals/runs"), "trial.json")
+        .into_iter()
+        .map(|p| p.parent().unwrap().to_path_buf())
+        .find(|d| d.file_name().unwrap().to_string_lossy() == trial)
+        .unwrap()
 }

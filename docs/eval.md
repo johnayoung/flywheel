@@ -49,7 +49,7 @@ Standing-verify parks, and parks that re-landed unchanged, are flakes and are no
 
 | Check | Proves |
 | --- | --- |
-| V1 / V2 | The oracle fails at the base and passes at the reference, twice each. It runs with `CARGO_TARGET_DIR` outside the tree and an empty `FLYWHEEL_HOME`. |
+| V1 / V2 | The oracle fails at the base and passes at the reference, twice each. It runs with `CARGO_TARGET_DIR` outside the tree, an empty `FLYWHEEL_HOME`, and the repo's default branch (and `origin/` twin) at the task's base. |
 | V3 | Every prerequisite's landed commit is in the base. If not, the base moves to the reference's parent. |
 | V4 | The base mirror holds no later commit. |
 | V5 | Two copies of the oracle pass at once. If it fails while `fw` processes run beside it, it is kept but graded alone. |
@@ -102,7 +102,7 @@ A trial runs one set task under one variant, starting from the task's historical
 2. **Overlay.** Commit the variant's overlay as branch `eval/trial`.
 3. **Fresh home.** Create a fresh `FLYWHEEL_HOME` holding the task, its specs, and a held-out registration that points at the run's oracle, which lives outside that home.
 4. **Run the worker.** Run `fw worker --task ID --base eval/trial --setting-sources project,local --permission-mode M [--model M]` with the variant's `fw` and env, and `FLYWHEEL_BATCH=eval:<run>:<trial>`.
-5. **Grade.** Run the oracle out of band on the final commit, in a clean checkout, under the machine's test-suite lock. The final commit is the landed one if there is one, else the parked work branch, else the base.
+5. **Grade.** Run the oracle out of band on the final commit, in a clean checkout, under the machine's test-suite lock. The final commit is the landed one if there is one, else the parked work branch, else the base. The trial's clone and the grading checkout both point the default branch at the base, so a fork-point check (`git merge-base HEAD main`) sees what the original run saw.
 6. **Clean up.** Copy Claude Code's per-path state for the trial's directories (`~/.claude/projects/<key>/`: transcripts, auto-memory) into the artifacts, then remove it. Delete the work dir. Keep the final commit in `evals/runs/<run>/results.git`.
 
 ```bash

@@ -280,6 +280,10 @@ reviewer = "other"         # other (claude <-> codex) | same | claude | codex
 [queue]
 typing_quiet = "8s"        # no typing this long before a queue delivers
 
+[leases]                   # stuck: held past max(3x p90, p90 + margin) while one waits
+stuck_margin = "10m"
+stuck_after = "1h"         # with no history (under 5 released holds)
+
 [agent_starts]             # agents starting agent sessions
 policy = "ask"             # ask | allowed | off
 max_running = 10           # per starter; max_total: ever
@@ -328,6 +332,8 @@ upstream = "collector"     # the machine that takes this hub's session events
 | `shares.max_expiry` | `--share-max-expiry` | `"30d"` | live |
 | `review.reviewer` | - | `"other"` | live |
 | `queue.typing_quiet` | - | `"8s"` (1s-10m) | live |
+| `leases.stuck_margin` | - | `"10m"` (1s-24h) | restart |
+| `leases.stuck_after` | - | `"1h"` (1s-24h) | restart |
 | `agent_starts.policy` | - | `"ask"` | live |
 | `agent_starts.max_running` | - | `10` (1-1000) | live |
 | `agent_starts.max_total` | - | `40` (1-1000) | live |

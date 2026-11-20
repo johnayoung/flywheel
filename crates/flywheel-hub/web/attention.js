@@ -1143,7 +1143,7 @@ window.FwHubAttention = function (ctx) {
     const groups = holdGroups;
     shown = new Set(list.map((e) => e.session.id));
     for (const g of groups) for (const h of g.holds) if (h.session && !/^(start|end):/.test(h.id)) shown.add(h.session);
-    pendingCount = passed.length + starts.length + ends.length + groups.reduce((n, g) => n + g.holds.filter((h) => /^(start|end):/.test(h.id)).length, 0);
+    pendingCount = leaseHolds.length + passed.length + starts.length + ends.length + groups.reduce((n, g) => n + g.holds.filter((h) => /^(start|end):/.test(h.id)).length, 0);
     const loop = flywheel ? flywheel.attention() : [];
     const graded = fanout ? fanout.attention() : [];
     const queues = ctx.queue ? ctx.queue().attention() : [];

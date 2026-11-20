@@ -73,6 +73,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub queue: QueueSection,
     #[serde(default)]
+    pub leases: LeasesSection,
+    #[serde(default)]
     pub agent_starts: AgentStartsSection,
     /// Scheduled digests (see [`crate::digest`]).
     #[serde(default)]
@@ -195,6 +197,17 @@ pub struct QueueSection {
     /// How long a session must go without typed input before its queue
     /// delivers: seconds, or `"8s"` / `"1m"`.
     pub typing_quiet: Option<DurationSetting>,
+}
+
+/// Leases (see [`crate::leases`]): when a holder reads as stuck.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeasesSection {
+    /// A lease held past `max(3 x p90, p90 + stuck_margin)` of its
+    /// resource's typical hold while someone waits is stuck.
+    pub stuck_margin: Option<DurationSetting>,
+    /// With no history (fewer than 5 released holds), past this.
+    pub stuck_after: Option<DurationSetting>,
 }
 
 /// Agent sessions starting agent sessions (the `start_session` tool, `fw
@@ -451,6 +464,9 @@ pub struct Effective {
     pub share_policy: crate::share::SharePolicy,
     pub reviewer: ReviewerChoice,
     pub queue_typing_quiet: Duration,
+    /// A lease is stuck past `max(3 x p90, p90 + .0)`, or `.1` with no
+    /// history.
+    pub lease_stuck: (Duration, Duration),
     pub login_days: u32,
     pub agent_starts: AgentStarts,
     pub digest: crate::digest::DigestConfig,
@@ -499,6 +515,8 @@ pub const KEYS: &[(&str, Apply)] = &[
     ("shares.max_expiry", Apply::Live),
     ("review.reviewer", Apply::Live),
     ("queue.typing_quiet", Apply::Live),
+    ("leases.stuck_margin", Apply::Restart),
+    ("leases.stuck_after", Apply::Restart),
     ("agent_starts.policy", Apply::Live),
     ("agent_starts.max_running", Apply::Live),
     ("agent_starts.max_total", Apply::Live),
@@ -598,6 +616,8 @@ impl Effective {
             "shares.max_expiry" => json!(crate::share::format_ttl(self.share_policy.max_ttl)),
             "review.reviewer" => json!(self.reviewer.as_str()),
             "queue.typing_quiet" => json!(crate::share::format_ttl(self.queue_typing_quiet)),
+            "leases.stuck_margin" => json!(crate::share::format_ttl(self.lease_stuck.0)),
+            "leases.stuck_after" => json!(crate::share::format_ttl(self.lease_stuck.1)),
             "agent_starts.policy" => json!(self.agent_starts.policy.as_str()),
             "agent_starts.max_running" => json!(self.agent_starts.max_running),
             "agent_starts.max_total" => json!(self.agent_starts.max_total),
@@ -1009,6 +1029,44 @@ pub fn resolve(
         file_quiet,
         crate::queue::DEFAULT_TYPING_QUIET
     );
+    // 1s-24h each: short for a test hub, long for slow suites.
+    let lease_span = |key: &str, setting: &Option<DurationSetting>, errors: &mut Vec<String>| {
+        let raw = match setting.as_ref()? {
+            DurationSetting::Seconds(n) => n.to_string(),
+            DurationSetting::Text(text) => text.clone(),
+        };
+        match crate::lease_cli::parse_span(&raw) {
+            Ok(secs) if (1..=86_400).contains(&secs) => Some(Duration::from_secs(u64::from(secs))),
+            Ok(_) => {
+                errors.push(format!("{key}: {raw:?} is out of range (1s-24h)"));
+                None
+            }
+            Err(message) => {
+                errors.push(format!("{key}: {message}"));
+                None
+            }
+        }
+    };
+    let file_margin = lease_span(
+        "leases.stuck_margin",
+        &file.leases.stuck_margin,
+        &mut errors,
+    );
+    let file_after = lease_span("leases.stuck_after", &file.leases.stuck_after, &mut errors);
+    let lease_stuck = (
+        pick!(
+            "leases.stuck_margin",
+            None::<Duration>,
+            file_margin,
+            Duration::from_millis(crate::leases::STUCK_MARGIN_MS.unsigned_abs())
+        ),
+        pick!(
+            "leases.stuck_after",
+            None::<Duration>,
+            file_after,
+            Duration::from_millis(crate::leases::DEFAULT_STUCK_MS.unsigned_abs())
+        ),
+    );
     let agent_starts = resolve_agent_starts(&file.agent_starts, &mut sources, &mut errors);
     let days_in = |key: &str, days: u32, errors: &mut Vec<String>| {
         use crate::auth::{MAX_LOGIN_DAYS, MIN_LOGIN_DAYS};
@@ -1091,6 +1149,7 @@ pub fn resolve(
         share_policy,
         reviewer,
         queue_typing_quiet,
+        lease_stuck,
         login_days,
         agent_starts,
         digest,
@@ -1686,6 +1745,10 @@ reviewer = "other"         # other (claude <-> codex) | same | claude | codex
 [queue]
 typing_quiet = "8s"        # no typing this long before a queue delivers
 
+[leases]                   # stuck: held past max(3x p90, p90 + margin) while one waits
+stuck_margin = "10m"
+stuck_after = "1h"         # with no history (under 5 released holds)
+
 [agent_starts]             # agents starting agent sessions
 policy = "ask"             # ask | allowed | off
 max_running = 10           # per starter; max_total: ever
@@ -1836,6 +1899,30 @@ mod tests {
         };
         let e = resolve(&file, &flags, home()).unwrap();
         assert_eq!(e.public_urls, vec!["https://c.example".to_owned()]);
+    }
+
+    #[test]
+    fn the_stuck_lease_thresholds_come_from_the_file_within_bounds() {
+        let file = parse("[leases]\nstuck_margin = \"5s\"\nstuck_after = 3\n").unwrap();
+        let e = resolve(&file, &Flags::default(), home()).unwrap();
+        assert_eq!(
+            e.lease_stuck,
+            (Duration::from_secs(5), Duration::from_secs(3))
+        );
+        assert_eq!(e.source("leases.stuck_after"), Source::File);
+        let e = resolve(&parse("").unwrap(), &Flags::default(), home()).unwrap();
+        assert_eq!(
+            e.lease_stuck,
+            (Duration::from_secs(600), Duration::from_secs(3600))
+        );
+        let bad = parse("[leases]\nstuck_margin = \"2d\"\nstuck_after = \"x\"\n").unwrap();
+        let errors = resolve(&bad, &Flags::default(), home()).unwrap_err();
+        for key in ["leases.stuck_margin", "leases.stuck_after"] {
+            assert!(
+                errors.iter().any(|e| e.starts_with(key)),
+                "{key}: {errors:?}"
+            );
+        }
     }
 
     #[test]

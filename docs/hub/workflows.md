@@ -126,6 +126,7 @@ Repos flywheel knows (project id) get the verified loop, read-only (`--no-flywhe
 - **Start worker here**: `fw worker` in a split; a task's **run**: `fw worker --task <id>` (offers unmet prereqs); a second gets 409; `queued in <session>`: a scoped worker runs it. Outcome: `verified`, `not verified`, `refused`, `worker exit N`. **Output**: `fw show` summary, redacted transcript.
 - **Autopilot** (`fw hub autopilot`): **Start** (confirmed: lands unattended) = `fw autopilot` in a session; stop = Ctrl-C; pause/resume = its `--pause|--resume`.
 - Shown (ledger): tier verdicts, newest deciding cycle (emitted, dropped + why), 20 newest decisions, parked gates. **Approve** / **Deny** = `fw approve` / `fw reject` pinned to the gate (one per gate; deny takes feedback), each an audit row.
+- **Evals** (`fw eval`): runs with progress and spend; **open** shows each variant vs the baseline (interval, MDE, verdict), the task x variant grid, a trial (verdict, trace, diff, oracle log). Read-only.
 - A linked worktree reads its own store; `github*` sources: unlisted; no SQLite store made. Per-folder watcher (stat 2s, re-read 15s). Seam: `FlywheelProvider` (`hub_flywheel.rs`).
 - **Audit**: session start/end (exit, last reply), merge, review, PR, handoff, fan-out grades, approvals: `hub.*` rows in the folder's project store (`fw audit --project`), if any. Seam: `AuditSink` (`hub_audit.rs`).
 

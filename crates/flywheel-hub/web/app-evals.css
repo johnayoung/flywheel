@@ -1,0 +1,120 @@
+/* flywheel hub -- fw eval (evals.js): the Flywheel drawer's Evals rows and
+ * the run board. Built on the fan-out sheet (.fo-*) and the drawer's run
+ * rows and lights (.fw-*); the marks reuse the lifecycle colors: pass =
+ * the loop's green, fail = alert, suspect = brass, contaminated / voided
+ * = alert outlined, infra = muted, pending = an empty ring. */
+
+.ev-run .ev-bar { margin: .35rem 0 0 7.2rem; height: 4px; }
+
+.ev-sheet {
+  width: min(78rem, calc(100vw - 2rem));
+  height: calc(100dvh - 4rem);
+  display: none;
+  overflow: hidden;
+}
+.ev-sheet[open] { display: flex; flex-direction: column; }
+/* One column that never grows past the sheet: wide tables scroll inside. */
+.ev-body { grid-template-columns: minmax(0, 1fr); }
+.ev-scroll { overflow-x: auto; scrollbar-width: thin; }
+.ev-block h3 { margin: 0 0 .4rem; color: var(--ink-2); font-size: 10.5px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; }
+
+.ev-cmps { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.ev-cmp {
+  display: grid;
+  grid-template-columns: 6rem minmax(0, 1.4fr) minmax(8rem, 1fr) 7.5rem;
+  align-items: center;
+  gap: .7rem;
+  padding: .35rem .6rem;
+  border: 1px solid var(--rule-2);
+  background: var(--bg);
+}
+.ev-cmp.primary { border-left: 3px solid var(--signal); }
+.ev-cmp b { font-weight: 600; }
+.ev-cmp-text { font: 400 11px var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); overflow-wrap: anywhere; }
+.ev-ci { position: relative; height: 12px; }
+.ev-ci i { position: absolute; top: 0; bottom: 0; display: block; }
+.ev-ci-mde { background: var(--bg-4); }
+.ev-ci-zero { left: 50%; width: 1px; background: var(--ink-3); }
+.ev-ci-bar { top: 5px; bottom: 5px; background: var(--ink-2); }
+.ev-ci-dot { top: 2px; bottom: 2px; width: 3px; margin-left: -1px; background: var(--ink); }
+.ev-cmp[data-ev-verdict="better"] .ev-ci-bar, .ev-cmp[data-ev-verdict="better"] .ev-ci-dot { background: var(--fw-ok); }
+.ev-cmp[data-ev-verdict="worse"] .ev-ci-bar, .ev-cmp[data-ev-verdict="worse"] .ev-ci-dot { background: var(--alert); }
+
+.ev-verdict {
+  justify-self: end;
+  padding: .1rem .38rem;
+  border-radius: 2px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  box-shadow: inset 0 0 0 1px var(--rule-2);
+  color: var(--ink-2);
+}
+.ev-verdict.better { background: var(--fw-ok); color: var(--fw-ok-ink); box-shadow: none; }
+.ev-verdict.worse { background: var(--alert); color: #fff; box-shadow: none; }
+.ev-verdict.tie { color: var(--ink); }
+
+.ev-table, .ev-grid { width: 100%; border-collapse: collapse; font-size: 11px; }
+.ev-table th, .ev-table td, .ev-grid th, .ev-grid td { padding: .3rem .5rem; border-bottom: 1px solid var(--rule); text-align: left; vertical-align: middle; }
+.ev-table thead th, .ev-grid thead th { color: var(--ink-3); font-size: 9.5px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; }
+.ev-table td { font-variant-numeric: tabular-nums; }
+.ev-grid tbody th { width: 34%; font-weight: 600; }
+.ev-task-cell { display: grid; gap: .1rem; max-width: 22rem; }
+.ev-task { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.ev-tier { color: var(--ink-3); font-size: 9.5px; font-weight: 400; letter-spacing: .08em; text-transform: uppercase; }
+.ev-tier.discriminating { color: var(--signal); }
+.ev-tier.frontier { color: var(--alert); }
+.ev-grid td small { display: block; color: var(--ink-3); font-size: 10px; font-variant-numeric: tabular-nums; }
+
+.ev-marks { display: inline-flex; flex-wrap: wrap; gap: 3px; }
+.ev-mark {
+  width: .95rem;
+  height: .95rem;
+  padding: 0;
+  border: 0;
+  border-radius: 2px;
+  cursor: pointer;
+  background: var(--rule-2);
+}
+.ev-mark.pass { background: var(--fw-ok); }
+.ev-mark.fail { background: var(--alert); }
+.ev-mark.suspect { background: var(--brass); }
+.ev-mark.contaminated, .ev-mark.voided { background: none; box-shadow: inset 0 0 0 2px var(--alert); }
+.ev-mark.infra { background: var(--ink-3); }
+.ev-mark.pending { background: none; box-shadow: inset 0 0 0 1px var(--rule-2); }
+.ev-mark.open { outline: 2px solid var(--ink); outline-offset: 1px; }
+.ev-mark:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+
+.ev-trial { padding: .7rem .8rem; border: 1px solid var(--rule-2); border-left: 4px solid var(--signal); background: var(--bg-2); display: grid; gap: .55rem; }
+.ev-trial h3 { margin: 0; font: 600 12px var(--mono); overflow-wrap: anywhere; }
+.ev-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr)); gap: .25rem .9rem; margin: 0; }
+.ev-facts dt { color: var(--ink-3); font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; }
+.ev-facts dd { margin: 0 0 .2rem; font: 400 11.5px var(--mono); overflow-wrap: anywhere; }
+.ev-checks { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.ev-checks li { display: grid; grid-template-columns: minmax(8rem, auto) minmax(0, 1fr); gap: .6rem; padding: .2rem .45rem; border-left: 3px solid var(--fw-ok); background: var(--bg); font-size: 11px; }
+.ev-checks li.fail { border-left-color: var(--alert); }
+.ev-checks span { color: var(--ink-2); overflow-wrap: anywhere; }
+.ev-review { padding: .45rem .6rem; border-left: 3px solid var(--rule-2); background: var(--bg); font-size: 11.5px; }
+.ev-review.fake_pass { border-left-color: var(--brass); }
+.ev-review p { margin: .25rem 0 0; color: var(--ink-2); }
+.ev-more > summary { cursor: pointer; color: var(--ink-3); font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; }
+.ev-pre {
+  max-height: 24rem;
+  margin: .35rem 0 0;
+  padding: .5rem .6rem;
+  overflow: auto;
+  border: 1px solid var(--rule);
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 11px/1.45 var(--term);
+  white-space: pre;
+}
+
+@media (max-width: 720px) {
+  .ev-cmp { grid-template-columns: minmax(0, 1fr) auto; row-gap: .2rem; }
+  .ev-cmp .ev-cmp-text { grid-column: 1 / -1; order: 3; }
+  .ev-cmp .ev-ci { display: none; }
+  .ev-run .ev-bar { margin-left: 0; }
+}

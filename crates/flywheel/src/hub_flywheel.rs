@@ -160,6 +160,26 @@ impl HubFlywheel {
     }
 
     /// The home projects resolve under.
+    /// `folder`'s eval store and evals dir (refused before any eval ran).
+    fn eval_store(
+        &self,
+        folder: &Path,
+    ) -> Result<(flywheel_eval::store::EvalStore, PathBuf), String> {
+        let state = self.folder(folder);
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        let resolved = state.resolve(&self.home(), folder)?;
+        let policy = resolved.policy.clone();
+        let db_path = resolved.db_path.clone();
+        drop(state);
+        let evals = crate::hub_eval::evals_dir(policy.as_ref())
+            .filter(|d| d.join("runs").is_dir())
+            .ok_or("this repo has no eval runs")?;
+        Ok((
+            crate::hub_eval::open_store(policy.as_ref(), &db_path)?,
+            evals,
+        ))
+    }
+
     fn home(&self) -> Result<Home, String> {
         match &self.home {
             Some(root) => Ok(Home::at(root)),
@@ -1565,6 +1585,18 @@ impl FlywheelProvider for HubFlywheel {
             panel.autopilot = autopilot_state(activity.as_deref(), false);
         }
         panel.intake = Some(intake);
+        // fw eval runs, once the project has any (opening the eval store
+        // would otherwise create its tables from a read).
+        if let Some(evals) =
+            crate::hub_eval::evals_dir(policy.as_ref()).filter(|d| d.join("runs").is_dir())
+        {
+            match crate::hub_eval::open_store(policy.as_ref(), &db_path)
+                .and_then(|store| crate::hub_eval::runs(&store))
+            {
+                Ok(rows) => panel.evals = rows,
+                Err(e) => problems.push(format!("reading eval runs in {}: {e}", evals.display())),
+            }
+        }
         if problems.len() > opened {
             // A store read failed (a restarted database, a dropped
             // connection): reopen on the next read rather than keep a dead
@@ -1575,6 +1607,22 @@ impl FlywheelProvider for HubFlywheel {
             panel.problem = Some(problems.join("; "));
         }
         panel
+    }
+
+    fn eval_report(&self, folder: &Path, run_id: &str) -> Result<serde_json::Value, String> {
+        let (store, evals) = self.eval_store(folder)?;
+        let report = crate::hub_eval::report(&store, &evals, run_id, &Default::default())?;
+        serde_json::to_value(report).map_err(|e| e.to_string())
+    }
+
+    fn eval_trial(
+        &self,
+        folder: &Path,
+        run_id: &str,
+        trial_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let (store, evals) = self.eval_store(folder)?;
+        crate::hub_eval::trial(&store, &evals, run_id, trial_id)
     }
 
     fn run_output(&self, folder: &Path, run_id: &str, since: usize) -> Result<RunOutput, String> {

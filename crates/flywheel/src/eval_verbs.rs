@@ -17,7 +17,7 @@ use flywheel_eval::variant;
 use flywheel_orchestrator::config::Access;
 use flywheel_orchestrator::home::{Project, resolve_cwd_project};
 use flywheel_orchestrator::policy::WorkPolicy;
-use flywheel_orchestrator::workflow::{load_effective_policy, resolve_db_path, store_partition};
+use flywheel_orchestrator::workflow::{load_effective_policy, resolve_db_path};
 
 pub const EVAL_VERB: &str = "eval";
 
@@ -257,32 +257,10 @@ impl Ctx {
 
     /// The eval tables of the project store.
     pub(crate) fn store(&self) -> Result<EvalStore, String> {
-        let partition = store_partition(self.policy.as_ref());
-        let backend = self.policy.as_ref().map(|p| p.store_backend.as_str());
-        if backend == Some("postgres") {
-            let dsn = self
-                .policy
-                .as_ref()
-                .and_then(|p| p.store_dsn.as_ref())
-                .map(|d| d.expose().to_owned())
-                .or_else(|| {
-                    flywheel_orchestrator::store_factory::resolve_postgres_dsn(
-                        &crate::tui::process_environ(),
-                    )
-                })
-                .ok_or("store backend is postgres but no DSN is configured")?;
-            return EvalStore::connect_postgres(
-                &dsn,
-                flywheel_core::store_postgres::DEFAULT_SCHEMA,
-                &partition,
-            )
-            .map_err(|e| e.to_string());
-        }
-        let db = resolve_db_path(None, self.policy.as_ref());
-        if let Some(parent) = db.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
-        EvalStore::open_sqlite(&db, &partition).map_err(|e| e.to_string())
+        crate::hub_eval::open_store(
+            self.policy.as_ref(),
+            &resolve_db_path(None, self.policy.as_ref()),
+        )
     }
 
     fn core(&self) -> Result<std::sync::Arc<dyn flywheel_core::store::HarnessStore>, String> {

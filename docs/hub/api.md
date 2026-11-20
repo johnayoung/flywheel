@@ -117,6 +117,7 @@ A session lists `agent` (`state`, `detail`, `since`, AskUserQuestion's `question
 | GET | `/api/flywheel/panel?folder=` | `queued_in`, `relandable`, `waiting_on`, `landing` (`fw status --json`), `pauses` (`fw pauses --json`), `last_tool`, `plans[].tasks`; 404 unadopted |
 | GET | `/api/flywheel/run?folder=&run=&since=N` | `{"status","active","entries","next","attempts"}` (poll `since=next`); 503 read waits |
 | GET | `/api/flywheel/history?folder=&task=` | every run; attempts' `outcome`/`error`/`checks`; task `goal`, `checks` (held-out: names) |
+| GET | `/api/flywheel/eval?folder=&run=[&trial=]` | `fw eval report --json`; with `trial`: its row, checks, review, diff, oracle log |
 | GET | `/api/flywheel/task?folder=&task=` | as a fan-out seed |
 | POST | `/api/flywheel/tasks` | `{"folder","task_id","goal","phase"?,"prerequisites"?,"checks":[{"run","name"?}]}`, two-step; 400 invalid |
 | GET | `/api/flywheel/autopilot?folder=` | `intake` (+ 20 newest decisions), its sessions here |

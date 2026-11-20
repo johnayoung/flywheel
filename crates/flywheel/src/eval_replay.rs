@@ -623,28 +623,7 @@ fn hostname() -> String {
 /// `fw eval runs`.
 pub(crate) fn runs(ctx: &Ctx, json: bool, out: &mut dyn Write) -> Result<i32, String> {
     let store = ctx.store()?;
-    let runs = store.runs().map_err(|e| e.to_string())?;
-    let mut rows = Vec::new();
-    for r in &runs {
-        let trials = store.trials(&r.run_id).map_err(|e| e.to_string())?;
-        let variants = store.run_variants(&r.run_id).map_err(|e| e.to_string())?;
-        let done = trials
-            .iter()
-            .filter(|t| {
-                !matches!(
-                    t.status(),
-                    flywheel_eval::store::TrialStatus::Pending
-                        | flywheel_eval::store::TrialStatus::Running
-                )
-            })
-            .count();
-        rows.push(serde_json::json!({
-            "run_id": r.run_id, "set": format!("{}@v{}", r.set_name, r.set_version), "k": r.k,
-            "status": r.status.as_str(), "variants": variants.iter().map(|v| v.label.clone()).collect::<Vec<_>>(),
-            "done": done, "total": trials.len(), "spent_usd": trials.iter().map(|t| t.cost_usd).sum::<f64>(),
-            "budget_usd": r.budget_usd, "started_at": r.started_at,
-        }));
-    }
+    let rows = crate::hub_eval::runs(&store)?;
     if json {
         let _ = writeln!(out, "{}", serde_json::json!({"runs": rows}));
         return Ok(0);
@@ -699,25 +678,6 @@ pub struct ReportArgs {
     pub json: bool,
 }
 
-/// The report of `run_id` (shared with the hub's view).
-pub fn build_report(
-    store: &EvalStore,
-    evals: &Path,
-    run_id: &str,
-    filter: &flywheel_eval::report::Filter,
-) -> Result<flywheel_eval::report::EvalReport, String> {
-    let run = store.run(run_id).map_err(|e| e.to_string())?;
-    let variants = store.run_variants(run_id).map_err(|e| e.to_string())?;
-    let trials = store.trials(run_id).map_err(|e| e.to_string())?;
-    let set_dir = if run.set_version == 0 {
-        SetDir::draft(evals, &run.set_name)
-    } else {
-        SetDir::frozen(evals, &run.set_name, run.set_version)
-    };
-    let manifest = set_dir.load().map_err(|e| e.to_string())?;
-    flywheel_eval::report::build(&run, &variants, &trials, &manifest, filter)
-}
-
 /// `fw eval report`.
 pub(crate) fn report(ctx: &Ctx, a: &ReportArgs, out: &mut dyn Write) -> Result<i32, String> {
     let tiers = a
@@ -745,7 +705,7 @@ pub(crate) fn report(ctx: &Ctx, a: &ReportArgs, out: &mut dyn Write) -> Result<i
         baseline: a.baseline.clone(),
     };
     let store = ctx.store()?;
-    let r = build_report(&store, &ctx.evals, &a.run, &filter)?;
+    let r = crate::hub_eval::report(&store, &ctx.evals, &a.run, &filter)?;
     if a.json {
         let _ = writeln!(
             out,

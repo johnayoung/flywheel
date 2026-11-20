@@ -775,3 +775,62 @@ pub(super) fn event_message(relay: Relay) -> Message {
     };
     Message::Text(value.to_string().into())
 }
+
+#[derive(Deserialize)]
+pub(super) struct EvalQuery {
+    folder: String,
+    run: String,
+    #[serde(default)]
+    trial: Option<String>,
+}
+
+fn eval_id_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 200
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
+/// `GET /api/flywheel/eval?folder&run[&trial]`: an eval run's report, or
+/// one of its trials.
+pub(super) async fn eval(
+    State(app): State<AppState>,
+    ApiQuery(query): ApiQuery<EvalQuery>,
+) -> Response {
+    let monitor = match monitor(&app) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let run = query.run.trim().to_owned();
+    let trial = query.trial.as_deref().map(str::trim).map(str::to_owned);
+    if !eval_id_ok(&run) || trial.as_deref().is_some_and(|t| !eval_id_ok(t)) {
+        return error_response(StatusCode::BAD_REQUEST, "run and trial are eval ids");
+    }
+    let (path, _) = match adopted_folder(&app, &monitor, query.folder).await {
+        Ok(found) => found,
+        Err(refusal) => return refusal.into_response(),
+    };
+    let Some(guard) = monitor.begin_read(format!(
+        "eval\0{}\0{run}\0{}",
+        path.display(),
+        trial.as_deref().unwrap_or("")
+    )) else {
+        return still_reading("read of this eval run");
+    };
+    let provider = Arc::clone(monitor.provider());
+    let read = off_runtime(RUN_OUTPUT_TIMEOUT, "reading the eval run", move || {
+        let value = match &trial {
+            Some(trial) => provider.eval_trial(&path, &run, trial),
+            None => provider.eval_report(&path, &run),
+        };
+        drop(guard);
+        value
+    })
+    .await;
+    match read {
+        Ok(Ok(value)) => Json(value).into_response(),
+        Ok(Err(message)) => error_response(StatusCode::NOT_FOUND, &message),
+        Err(refusal) => refusal.into_response(),
+    }
+}

@@ -446,6 +446,9 @@ pub struct FlywheelPanel {
     /// --json`), newest first.
     #[serde(default)]
     pub pauses: Vec<PanelPause>,
+    /// `fw eval` runs, newest first (each `fw eval runs --json` row).
+    #[serde(default)]
+    pub evals: Vec<serde_json::Value>,
 }
 
 impl FlywheelPanel {
@@ -476,6 +479,7 @@ impl FlywheelPanel {
             alerts: Vec::new(),
             intake: None,
             pauses: Vec::new(),
+            evals: Vec::new(),
         }
     }
 
@@ -759,6 +763,24 @@ pub trait FlywheelProvider: Send + Sync + 'static {
     /// seed, with its held-out graders (failing closed: a configured
     /// held-out registry that cannot be read is an error, never "none").
     fn task_seed(&self, folder: &Path, task_id: &str) -> Result<TaskSeed, String>;
+
+    /// `fw eval report RUN --json` for `folder`'s run `run_id`.
+    fn eval_report(&self, folder: &Path, run_id: &str) -> Result<serde_json::Value, String> {
+        let _ = (folder, run_id);
+        Err("this hub reads no eval runs".into())
+    }
+
+    /// One eval trial of `folder`'s run `run_id`: its row, checks, review,
+    /// record, final diff, and oracle log.
+    fn eval_trial(
+        &self,
+        folder: &Path,
+        run_id: &str,
+        trial_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (folder, run_id, trial_id);
+        Err("this hub reads no eval runs".into())
+    }
 
     /// The argv that runs the autopilot daemon for `folder` (run there),
     /// e.g. `[/path/to/fw, autopilot]`: never `--once`.

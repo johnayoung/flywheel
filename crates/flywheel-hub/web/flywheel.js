@@ -5,7 +5,7 @@
 // beside the terminals. Actions: start `fw worker` in a hub shell session
 // there (the whole queue, or one task: `fw worker --task ID`, which runs
 // only it and exits once it settles), open a run's output (its `fw show` summary and redacted
-// agent transcript), and drive autopilot (autopilot.js). app-base.js creates it with its helpers; protocol:
+// agent transcript), drive autopilot (autopilot.js), and read fw eval runs (evals.js). app-base.js creates it with its helpers; protocol:
 // GET /api/flywheel, /api/flywheel/panel, /api/flywheel/run,
 // /api/claude-accounts (the start-worker account picker, launcher.js's
 // FwHubAccounts), POST /api/flywheel/worker, /api/flywheel/pauses/clear
@@ -594,6 +594,12 @@ window.FwHubFlywheel = function (ctx) {
     render: () => renderDrawer(),
   });
 
+  // fw eval runs: the Evals section and its run board (evals.js).
+  const evals = window.FwHubEvals({
+    el, icon, api, ago, section, via, pathOf, toast,
+    focusTerminal: () => (ctx.focusTerminal ? ctx.focusTerminal() : undefined),
+  });
+
   // A panel task's prerequisites not verified yet (one the panel does not
   // list is archived, so done).
   // The prerequisites a scoped run would pull in, transitively: the ones
@@ -1005,6 +1011,8 @@ window.FwHubFlywheel = function (ctx) {
     if (panel.alerts.length) children.push(alertsSection(folder, panel.alerts));
     const autopilot = pilot.section(folder, panel);
     if (autopilot) children.push(autopilot);
+    const evalRuns = evals.section(folder, panel);
+    if (evalRuns) children.push(evalRuns);
     if (panel.live.length) {
       children.push(section("In flight", panel.live.length, el("ul", { className: "fw-list" }, panel.live.map(liveRow))));
     }

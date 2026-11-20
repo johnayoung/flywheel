@@ -57,6 +57,17 @@ fn check(name: &str, passed: bool, detail: impl Into<String>) -> ProofCheck {
     }
 }
 
+/// Whether prerequisite `id` is in the history of `at`: its landed commit
+/// is an ancestor, or -- when the store recorded no landing (it landed out
+/// of band) -- a commit carrying its `Flywheel-Task: <id>` trailer is.
+fn prerequisite_in(repo: &Path, id: &str, landed: &str, at: &str) -> bool {
+    if !landed.is_empty() {
+        return git::is_ancestor(repo, landed, at);
+    }
+    let grep = format!("--grep=^Flywheel-Task: {}$", regex::escape(id));
+    git::run(repo, &["log", "-1", "--format=%H", &grep, at]).is_ok_and(|found| !found.is_empty())
+}
+
 fn short(sha: &str) -> &str {
     &sha[..12.min(sha.len())]
 }
@@ -230,7 +241,7 @@ pub fn validate_task(
     let missing: Vec<String> = task
         .prerequisites
         .iter()
-        .filter(|(_, sha)| sha.is_empty() || !git::is_ancestor(&repo, sha, &task.base))
+        .filter(|(id, sha)| !prerequisite_in(&repo, id, sha, &task.base))
         .map(|(id, _)| id.clone())
         .collect();
     if missing.is_empty() {
@@ -243,8 +254,8 @@ pub fn validate_task(
         let parent = git::rev_parse(&repo, &format!("{}^", task.reference)).ok();
         let holds = parent.as_ref().is_some_and(|p| {
             task.prerequisites
-                .values()
-                .all(|sha| !sha.is_empty() && git::is_ancestor(&repo, sha, p))
+                .iter()
+                .all(|(id, sha)| prerequisite_in(&repo, id, sha, p))
         });
         match (holds, parent) {
             (true, Some(parent)) => {

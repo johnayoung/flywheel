@@ -166,6 +166,27 @@ fn a_base_missing_a_prerequisite_moves_to_the_references_parent() {
     assert_eq!(f.manifest.tasks[0].base, prereq);
     assert!(get(&proof, "V3").detail.contains("p-task"));
 
+    // One the store never saw land counts when a commit with its trailer
+    // is in the base.
+    f.manifest.tasks[0]
+        .prerequisites
+        .insert("out-of-band".into(), String::new());
+    f.set.save(&f.manifest).unwrap();
+    assert!(!f.validate("dependent", None).passed, "no trailer yet");
+    f.repo.git(&["checkout", "-q", "-b", "side", &prereq]);
+    let oob = f.repo.commit(
+        "feat: landed by hand\n\nFlywheel-Task: out-of-band",
+        &[("o", "1")],
+    );
+    f.repo.git(&["checkout", "-q", "main"]);
+    f.manifest.tasks[0].base = oob.clone();
+    f.set.save(&f.manifest).unwrap();
+    let proof = f.validate("dependent", None);
+    assert!(get(&proof, "V3").passed, "{proof:#?}");
+    f.manifest.tasks[0].prerequisites.remove("out-of-band");
+    f.manifest.tasks[0].base = prereq.clone();
+    f.set.save(&f.manifest).unwrap();
+
     // A prerequisite that never landed cannot be satisfied.
     f.manifest.tasks[0]
         .prerequisites

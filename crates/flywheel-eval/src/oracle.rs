@@ -350,7 +350,19 @@ mod tests {
         git::run(&clone, &["branch", "-q", "-D", "main"]).unwrap();
         git::run(&clone, &["remote", "remove", "origin"]).unwrap();
         std::fs::write(clone.join("a.txt"), "2").unwrap();
-        git::run(&clone, &["commit", "-qam", "agent"]).unwrap();
+        git::run(
+            &clone,
+            &[
+                "-c",
+                "user.name=eval",
+                "-c",
+                "user.email=eval@test.invalid",
+                "commit",
+                "-qam",
+                "agent",
+            ],
+        )
+        .unwrap();
         let fin = git::rev_parse(&clone, "HEAD").unwrap();
 
         let bare = GradeTree::open(&clone, &dir.path().join("bare")).unwrap();

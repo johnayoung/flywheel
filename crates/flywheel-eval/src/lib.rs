@@ -19,8 +19,12 @@
 pub mod db;
 pub mod git;
 pub mod mine;
+pub mod mirror;
+pub mod oracle;
+pub mod proc;
 pub mod set;
 pub mod store;
+pub mod validate;
 
 #[cfg(test)]
 mod testutil;

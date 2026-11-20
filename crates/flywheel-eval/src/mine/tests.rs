@@ -88,7 +88,8 @@ impl Fixture {
         lc.transition_to(Status::Ready, "", Some(t0())).unwrap();
         lc.transition_to(Status::Running, "", Some(t0())).unwrap();
         if status == Status::Done {
-            lc.transition_to(Status::Validating, "", Some(t0())).unwrap();
+            lc.transition_to(Status::Validating, "", Some(t0()))
+                .unwrap();
         }
         let error = if status == Status::Done { "" } else { "boom" };
         lc.transition_to(status, error, Some(t0() + Duration::hours(5)))

@@ -26,7 +26,6 @@ rusqlite.workspace = true
 postgres.workspace = true
 toml.workspace = true
 regex.workspace = true
+tempfile.workspace = true
 libc = "0.2"
 
-[dev-dependencies]
-tempfile.workspace = true

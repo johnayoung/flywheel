@@ -501,6 +501,37 @@ pub fn set_task_json(raw: &str, home: &str) -> Result<String, MineError> {
     Ok(tokenize(&text, home))
 }
 
+/// Every file under `dir`, symlinks followed (a symlinked node_modules is
+/// part of an oracle's package), as sorted relative paths; at most 64
+/// levels deep, so a symlink cycle ends.
+fn files_following(dir: &Path) -> Result<Vec<PathBuf>, SetError> {
+    fn walk(root: &Path, at: &Path, depth: u32, out: &mut Vec<PathBuf>) -> Result<(), SetError> {
+        if depth > 64 {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(at).map_err(io(at))?.flatten() {
+            let path = entry.path();
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue; // a dangling symlink
+            };
+            if meta.is_dir() {
+                walk(root, &path, depth + 1, out)?;
+            } else if meta.is_file() {
+                out.push(
+                    path.strip_prefix(root)
+                        .expect("walked under root")
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, 0, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
 /// Write one candidate's files into the draft: the task (tokenized), the
 /// spec files it names under the project home (not `held-out/` or
 /// `verification/`, which an agent must not see), and the oracle: its
@@ -526,33 +557,43 @@ pub fn write_candidate(dir: &SetDir, paths: &ProjectPaths, c: &Candidate) -> Res
     let registration = paths.held_out().join(format!("{id}.json"));
     let reg_text = std::fs::read_to_string(&registration).map_err(io(&registration))?;
     let oracle_home = dir.oracle_dir(id).join("home");
-    // The registration, then (breadth-first) every file it reaches.
-    let mut queue: Vec<String> = home_paths(&reg_text, &home).into_iter().collect();
+    // The registration, then every file it reaches: each file a path names
+    // (and every project-home path inside those files), and the whole
+    // directory of each oracle under verification/ -- an oracle's directory
+    // is its package (helpers it imports, its node_modules), symlinks
+    // followed.
+    let mut queue: Vec<(String, bool)> = home_paths(&reg_text, &home)
+        .into_iter()
+        .map(|p| (p, true))
+        .collect();
     let mut seen = BTreeSet::new();
-    while let Some(path) = queue.pop() {
+    let mut packaged = BTreeSet::new();
+    while let Some((path, named)) = queue.pop() {
         if !seen.insert(path.clone()) {
             continue;
         }
         let rel = path.trim_start_matches(&home).to_owned();
         let from = paths.root().join(&rel);
         if from.is_dir() {
-            for file in crate::set::files_under(&from)? {
-                queue.push(format!("{path}/{}", file.display()).replace("//", "/"));
+            for file in files_following(&from)? {
+                queue.push((
+                    format!("{path}/{}", file.display()).replace("//", "/"),
+                    false,
+                ));
             }
             continue;
         }
         if !from.is_file() {
             continue;
         }
-        // Sibling files of an oracle come along (helpers it imports).
-        if let Some(parent) = from.parent()
+        if named
+            && let Some(parent) = from.parent()
             && parent != paths.root()
             && parent.starts_with(paths.root().join("verification"))
+            && packaged.insert(parent.to_owned())
         {
-            for sib in std::fs::read_dir(parent).map_err(io(parent))?.flatten() {
-                if sib.path().is_file() {
-                    queue.push(format!("{}", sib.path().display()));
-                }
+            for file in files_following(parent)? {
+                queue.push((format!("{}/{}", parent.display(), file.display()), false));
             }
         }
         let bytes = std::fs::read(&from).map_err(io(&from))?;
@@ -563,7 +604,7 @@ pub fn write_candidate(dir: &SetDir, paths: &ProjectPaths, c: &Candidate) -> Res
         match String::from_utf8(bytes) {
             Ok(text) => {
                 for more in home_paths(&text, &home) {
-                    queue.push(more);
+                    queue.push((more, true));
                 }
                 std::fs::write(&to, tokenize(&text, &home)).map_err(io(&to))?;
             }

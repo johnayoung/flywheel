@@ -65,6 +65,18 @@ impl Fixture {
             )
             .unwrap();
             std::fs::write(dir.join("helper.sh"), "true\n").unwrap();
+            // Its package: a symlinked node_modules beside it.
+            let modules = self.home.path().join("verification/shared_modules/lib");
+            std::fs::create_dir_all(&modules).unwrap();
+            std::fs::write(modules.join("index.js"), "module.exports = 1;\n").unwrap();
+            let link = dir.join("node_modules");
+            if !link.exists() {
+                std::os::unix::fs::symlink(
+                    self.home.path().join("verification/shared_modules"),
+                    &link,
+                )
+                .unwrap();
+            }
             std::fs::write(self.home.path().join("verification/caps.sh"), "true\n").unwrap();
             let reg = serde_json::json!({"graders": [{"type": "command",
                 "run": format!("sh {home}verification/0001/oracle-{id}.sh"), "name": "oracle"}]});
@@ -304,6 +316,7 @@ fn the_draft_keeps_the_task_tokenized_its_specs_and_its_oracle_closure() {
         "verification/0001/oracle-plain.sh",
         "verification/0001/helper.sh",
         "verification/caps.sh",
+        "verification/0001/node_modules/lib/index.js",
     ] {
         assert!(home.join(rel).is_file(), "{rel}");
     }

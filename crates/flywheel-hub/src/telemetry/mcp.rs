@@ -604,7 +604,8 @@ fn watch_tool() -> Value {
                         waits, arrive together in it. filter: space-separated terms, all of \
                         which must hold: children (sessions you started), session=NAME, \
                         state=done|blocked|failed|asking (a session moving there), \
-                        kind=review|pr|queue (event kinds or families), or labels (team=web). \
+                        kind=review|pr|queue|lease (event kinds or families; children \
+                        kind=lease catches a stuck lease they wait on), or labels (team=web). \
                         Example: \"children state=done|blocked|failed\". Your own events never \
                         match. By time instead of filter: at (\"2026-11-23T12:00Z\" or \
                         \"+36h\") wakes you once; every (\"6h\", at least 5m) wakes you \

@@ -2309,6 +2309,7 @@ fn an_eval_labelled_session_outlives_the_retention_window() {
         let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
         for (session, labels) in [
             ("trial", vec![("eval", Some("nf-1"))]),
+            ("hub-trial", vec![("fw.eval", Some("r7"))]),
             ("other", vec![("team", Some("web"))]),
         ] {
             telemetry.record(session, vec![labels_changed(&labels, old)]);
@@ -2321,10 +2322,13 @@ fn an_eval_labelled_session_outlives_the_retention_window() {
     }
     // Reopening prunes what is older than the window.
     let telemetry = Telemetry::open(dir.path(), HOST).unwrap();
-    assert_eq!(
-        telemetry.events(None, "trial", 0, 10, false).unwrap().len(),
-        2
-    );
+    for kept in ["trial", "hub-trial"] {
+        assert_eq!(
+            telemetry.events(None, kept, 0, 10, false).unwrap().len(),
+            2,
+            "{kept}"
+        );
+    }
     assert!(
         telemetry
             .events(None, "other", 0, 10, false)

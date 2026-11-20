@@ -12,8 +12,10 @@
 //!   also a label change.
 //! * A set may be conditional ([`Cond`]): only if the key now holds a
 //!   value, or holds none (a claim: the first `--if-unset` wins).
-//! * A session labelled [`EVAL`] (`eval=<run>`, an eval trial) is exempt
-//!   from telemetry pruning: its trace outlives the retention window.
+//! * A session labelled [`EVAL`] (`eval=<run>`, set by anyone) or
+//!   [`EVAL_RUN`] (`fw.eval=<run>`, set by the hub on a captured run whose
+//!   batch is `eval:<run>:<trial>`) is an eval trial, exempt from telemetry
+//!   pruning: its trace outlives the retention window.
 //! * Every change is recorded in the session's telemetry log
 //!   (`labels.changed`), so a collector's fleet and the event log filter
 //!   by labels too.
@@ -28,6 +30,19 @@ pub type Change = BTreeMap<String, Option<String>>;
 /// The label that pins a session's telemetry past the retention window
 /// (`eval=<run>`): an eval trial's trace is its evidence.
 pub const EVAL: &str = "eval";
+/// The hub's own eval label: the run a captured `fw eval` trial belongs
+/// to, from its batch ([`eval_run_of_batch`]); no agent can unset it.
+pub const EVAL_RUN: &str = "fw.eval";
+/// The batch prefix an `fw eval` trial's launcher uses.
+pub const EVAL_BATCH_PREFIX: &str = "eval:";
+
+/// The eval run a batch label names (`eval:<run>:<trial>` or
+/// `eval:<run>`), when it is one and the run is a valid label value.
+pub fn eval_run_of_batch(batch: &str) -> Option<&str> {
+    let rest = batch.strip_prefix(EVAL_BATCH_PREFIX)?;
+    let run = rest.split(':').next()?;
+    (validate_value(EVAL_RUN, run).is_ok()).then_some(run)
+}
 
 /// Most labels on one session.
 pub const MAX_LABELS: usize = 32;

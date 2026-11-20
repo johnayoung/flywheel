@@ -130,6 +130,26 @@ impl Hub {
             .snapshot(&id)
             .is_none_or(|s| s.harness.is_none())
         {
+            // An `fw eval` trial: the hub labels it with its run, so its
+            // trace is kept and filtered by run, and nothing the agent does
+            // can take the label off.
+            if let Some(run) = from
+                .batch
+                .as_deref()
+                .and_then(crate::labels::eval_run_of_batch)
+            {
+                let set = [(crate::labels::EVAL_RUN.to_owned(), Some(run.to_owned()))].into();
+                drafts.insert(
+                    0,
+                    Draft::new(
+                        now,
+                        What::LabelsChanged {
+                            set,
+                            before: crate::labels::Change::new(),
+                        },
+                    ),
+                );
+            }
             let cwd = str_of("cwd");
             let links = SessionLinks {
                 opened_by: parent,
@@ -328,6 +348,13 @@ mod tests {
             BATCH_MAX_CHARS
         );
         assert_eq!(budget_of("$20"), Some(20.0));
+        assert_eq!(crate::labels::eval_run_of_batch("eval:r7:t3"), Some("r7"));
+        assert_eq!(crate::labels::eval_run_of_batch("eval:r7"), Some("r7"));
+        assert_eq!(crate::labels::eval_run_of_batch("eval::t3"), None);
+        assert_eq!(
+            crate::labels::eval_run_of_batch("post-trade analysts"),
+            None
+        );
         assert_eq!(budget_of("2.5"), Some(2.5));
         assert_eq!(budget_of("-1"), None);
         assert_eq!(budget_of("NaN"), None);

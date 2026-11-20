@@ -711,13 +711,14 @@ impl Store {
     /// Forget events and sessions with nothing since `before` (unix ms).
     pub fn prune(&mut self, before: i64) -> Result<usize, StoreError> {
         let tx = self.conn.transaction()?;
-        // A session labelled `eval` (an eval run's trial) is kept past the
-        // window: its trace is the eval's evidence.
+        // A session labelled `eval` or `fw.eval` (an eval run's trial) is
+        // kept past the window: its trace is the eval's evidence.
         let pinned = |table: &str| {
             format!(
-                "NOT EXISTS (SELECT 1 FROM session_labels p WHERE p.key = '{key}'
+                "NOT EXISTS (SELECT 1 FROM session_labels p WHERE p.key IN ('{key}', '{run}')
                      AND p.host = {table}.host AND p.session = {table}.session)",
-                key = crate::labels::EVAL
+                key = crate::labels::EVAL,
+                run = crate::labels::EVAL_RUN,
             )
         };
         let events = tx.execute(

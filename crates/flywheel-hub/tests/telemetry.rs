@@ -1164,6 +1164,40 @@ async fn captured_runs_report_under_their_parent_and_batch_and_are_priced() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_eval_trials_captured_run_carries_the_hub_owned_eval_label() {
+    let hub = TestHub::start(None).await;
+    let installed = hub.get("/api/telemetry/capture/hooks").await;
+    let hook = installed["hooks"]["UserPromptSubmit"][0]["hooks"][0].clone();
+    let mut trial_env = HashMap::new();
+    trial_env.insert("FLYWHEEL_BATCH".to_owned(), "eval:r7:t1".to_owned());
+    let mut other_env = HashMap::new();
+    other_env.insert("FLYWHEEL_BATCH".to_owned(), "nightly".to_owned());
+    for (env, conversation) in [(&trial_env, "trial-1"), (&other_env, "run-2")] {
+        let sent = as_captured(
+            &hub,
+            &hook,
+            env,
+            &json!({"hook_event_name": "UserPromptSubmit", "session_id": conversation, "prompt": "go"}),
+        )
+        .await;
+        assert_eq!(sent.status(), StatusCode::OK);
+    }
+    let listed = |page: &Value| -> Vec<String> {
+        page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["session"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let page = hub.get("/api/telemetry/fleet?label=fw.eval%3Dr7").await;
+    assert_eq!(listed(&page), ["cc-trial-1"], "{page}");
+    let page = hub.get("/api/telemetry/fleet?label=fw.eval%3Dother").await;
+    assert!(listed(&page).is_empty(), "{page}");
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn lanes_place_sessions_by_what_they_need_grouped_by_workspace() {
     let hub = TestHub::start(None).await;
     let (sid, args, env) = hub.claude().await;

@@ -11,7 +11,7 @@ Measure whether a change to the agent setup (CLAUDE.md, skills, MCP config, prom
 
 ```bash
 fw eval set build core               # mine past runs into core@draft (--include landed,hard; --since; --max; --tasks)
-fw eval set validate core@draft      # V1-V7 per task (holds the machine's test-suite lock)
+fw eval set validate core@draft      # V1-V7 per task, holding the test-suite lock (see below)
 fw eval set freeze core              # -> core@v1: hashed, refs pinned, read-only (--split dev=.6,val=.2,test=.2)
 fw eval set ls | show core@v1 | diff core@v1 core@v2
 ```
@@ -36,6 +36,11 @@ Standing-verify parks, and parks that re-landed unchanged, are flakes and are no
 | V4 | The base mirror holds no later commit. |
 | V5 | Two copies of the oracle pass at once. If it fails while `fw` processes run beside it, it is kept but graded alone. |
 | V6 / V7 | No oracle file or task names a live flywheel home. The task loads and has no prerequisites. |
+
+**Test-suite lock:** oracle runs take turns with every other test suite on the machine through `scripts/check.sh`'s flock (`$XDG_RUNTIME_DIR/flywheel-check.lock`).
+- `FLYWHEEL_EVAL_LOCK=PATH` names a different lock; `FLYWHEEL_EVAL_LOCK=0` takes none.
+- No lock is taken inside a check.sh test phase (`FLYWHEEL_CHECK_PHASE=tests`) or with `FLYWHEEL_CHECK_LOCK=0`.
+- Waiting for the lock counts against `--timeout`.
 
 Layout: `$FLYWHEEL_HOME/projects/<id>/evals/sets/<name>/{draft,vN}/` holds `set.json`, `tasks/`, `oracles/<task>/`, `specs/<task>/`, and `proofs/`. Project-home paths appear as `@EVAL_PROJECT_HOME@`. Index: the `eval_*` tables ([persistence-tables.md](persistence-tables.md#eval-tables)).
 

@@ -252,35 +252,91 @@ pub fn parse_span(raw: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs))
 }
 
-/// The machine's test-suite lock (`scripts/check.sh`'s), held for the rest
-/// of the process: oracle runs take turns with every test suite here.
-pub fn hold_test_suite_lock(err: &mut dyn Write) -> Result<std::fs::File, String> {
-    let dir =
-        std::env::var_os("XDG_RUNTIME_DIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-    let path = dir.join("flywheel-check.lock");
+/// The variable naming the lock eval's oracle runs take turns on: a path,
+/// or `0` for none.
+pub const EVAL_LOCK_ENV: &str = "FLYWHEEL_EVAL_LOCK";
+
+/// The lock oracle runs take turns on, from the environment:
+/// `FLYWHEEL_EVAL_LOCK` (a path, or `0`/`off` for none) wins; else none
+/// when this process already runs inside a `scripts/check.sh` test phase
+/// (`FLYWHEEL_CHECK_PHASE=tests`, whose lock its caller holds: taking it
+/// again would wait on ourselves) or the check lock is off
+/// (`FLYWHEEL_CHECK_LOCK=0`); else the machine's test-suite lock,
+/// `scripts/check.sh`'s, so oracle runs take turns with every test suite.
+pub fn test_suite_lock_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    match env(EVAL_LOCK_ENV).as_deref().map(str::trim) {
+        Some("0" | "off") => return None,
+        Some(path) if !path.is_empty() => return Some(PathBuf::from(path)),
+        _ => {}
+    }
+    if env("FLYWHEEL_CHECK_PHASE").as_deref() == Some("tests")
+        || env("FLYWHEEL_CHECK_LOCK").as_deref() == Some("0")
+    {
+        return None;
+    }
+    Some(
+        env("XDG_RUNTIME_DIR")
+            .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+            .join("flywheel-check.lock"),
+    )
+}
+
+pub(crate) fn test_suite_lock() -> Option<PathBuf> {
+    test_suite_lock_from(&|k| std::env::var(k).ok())
+}
+
+/// Take the test-suite lock (see [`test_suite_lock`]) for the rest of the
+/// process, waiting at most `wait`; `None` when there is no lock to take.
+pub fn hold_test_suite_lock(
+    wait: Duration,
+    err: &mut dyn Write,
+) -> Result<Option<std::fs::File>, String> {
+    match test_suite_lock() {
+        None => Ok(None),
+        Some(path) => hold_lock(&path, wait, err).map(Some),
+    }
+}
+
+/// Take `path`'s exclusive flock, waiting at most `wait`.
+fn hold_lock(path: &Path, wait: Duration, err: &mut dyn Write) -> Result<std::fs::File, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(&path)
+        .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     use std::os::fd::AsRawFd;
-    // SAFETY: flock on a descriptor this function owns.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let _ = writeln!(
-            err,
-            "fw eval: waiting for another test suite on this machine ({})",
-            path.display()
-        );
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    let deadline = std::time::Instant::now() + wait;
+    let mut told = false;
+    loop {
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(format!("flock {}: {e}", path.display()));
+        }
+        if std::time::Instant::now() >= deadline {
             return Err(format!(
-                "flock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
+                "waited {}s for the test-suite lock {} (another suite holds it; set {EVAL_LOCK_ENV}=0 to skip it when you already hold it)",
+                wait.as_secs(),
+                path.display()
             ));
         }
+        if !told {
+            let _ = writeln!(
+                err,
+                "fw eval: waiting for another test suite on this machine ({})",
+                path.display()
+            );
+            told = true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
-    Ok(file)
 }
 
 fn short(sha: &str) -> &str {
@@ -375,7 +431,7 @@ fn set_validate(
         noise: (!args.no_noise).then(|| vec![exe.display().to_string(), "--version".to_owned()]),
         search_head: "HEAD".to_owned(),
     };
-    let _lock = hold_test_suite_lock(err)?;
+    let _lock = hold_test_suite_lock(options.timeout, err)?;
     let mut failed = 0;
     let proofs = validate::validate_set(
         &dir,
@@ -770,13 +826,6 @@ fn variant_ls(ctx: &Ctx, args: &JsonArg, out: &mut dyn Write) -> Result<i32, Str
     Ok(0)
 }
 
-/// The machine's test-suite lock path (`scripts/check.sh`'s).
-pub(crate) fn test_suite_lock() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
-        .join("flywheel-check.lock")
-}
-
 /// Claude Code's config dir: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
 pub(crate) fn claude_dir() -> PathBuf {
     std::env::var_os("CLAUDE_CONFIG_DIR").map_or_else(
@@ -903,7 +952,10 @@ fn one_trial(ctx: &Ctx, args: &TrialArgs, out: &mut dyn Write) -> Result<i32, St
         worker_timeout_secs: parse_span(&args.worker_timeout)?.as_secs(),
         oracle_timeout_secs: parse_span(&args.oracle_timeout)?.as_secs(),
         worker_locking: flywheel_eval::proc::Locking::None,
-        grade_locking: flywheel_eval::proc::Locking::Flock(test_suite_lock()),
+        grade_locking: test_suite_lock().map_or(
+            flywheel_eval::proc::Locking::None,
+            flywheel_eval::proc::Locking::Flock,
+        ),
         capture: None,
         batch_budget: None,
         claude_dir: claude_dir(),
@@ -990,6 +1042,55 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_test_suite_lock_follows_the_environment() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        assert_eq!(
+            test_suite_lock_from(&env(&[("XDG_RUNTIME_DIR", "/run/u")])),
+            Some(PathBuf::from("/run/u/flywheel-check.lock"))
+        );
+        assert_eq!(
+            test_suite_lock_from(&env(&[("FLYWHEEL_CHECK_PHASE", "tests")])),
+            None
+        );
+        assert_eq!(
+            test_suite_lock_from(&env(&[("FLYWHEEL_CHECK_LOCK", "0")])),
+            None
+        );
+        assert_eq!(
+            test_suite_lock_from(&env(&[(EVAL_LOCK_ENV, "0"), ("XDG_RUNTIME_DIR", "/r")])),
+            None
+        );
+        assert_eq!(
+            test_suite_lock_from(&env(&[
+                (EVAL_LOCK_ENV, "/t/l"),
+                ("FLYWHEEL_CHECK_PHASE", "tests")
+            ])),
+            Some(PathBuf::from("/t/l"))
+        );
+    }
+
+    #[test]
+    fn a_held_lock_is_waited_for_only_as_long_as_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub/lock");
+        let mut err = Vec::new();
+        let held = hold_lock(&path, Duration::from_secs(1), &mut err).unwrap();
+        let started = std::time::Instant::now();
+        let e = hold_lock(&path, Duration::from_secs(1), &mut err).unwrap_err();
+        assert!(e.contains("waited 1s"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(held);
+        hold_lock(&path, Duration::from_secs(1), &mut err).unwrap();
+    }
 
     #[test]
     fn spans_parse() {

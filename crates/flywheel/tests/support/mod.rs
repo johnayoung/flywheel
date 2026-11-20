@@ -454,6 +454,9 @@ pub fn confine(command: &mut Command, home: &Path, flywheel_home: &Path, extra_p
     command
         .env("HOME", home)
         .env("FLYWHEEL_HOME", flywheel_home)
+        // `fw eval` oracle runs take turns on a lock of the test's own,
+        // never the machine's test-suite lock this suite may already hold.
+        .env("FLYWHEEL_EVAL_LOCK", home.join("eval-test-suite.lock"))
         .env("XDG_STATE_HOME", home.join("xdg-state"))
         .env("XDG_CONFIG_HOME", home.join("xdg-config"))
         .env("CLAUDE_CONFIG_DIR", home.join("claude-config"))

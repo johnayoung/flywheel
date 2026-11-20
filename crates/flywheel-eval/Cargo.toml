@@ -27,5 +27,6 @@ postgres.workspace = true
 toml.workspace = true
 regex.workspace = true
 tempfile.workspace = true
+tokio.workspace = true
 libc = "0.2"
 

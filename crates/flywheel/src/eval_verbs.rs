@@ -56,6 +56,11 @@ enum EvalCommand {
     /// The deterministic trace checks over a transcript dir (a trial's
     /// `transcripts/`), as JSON.
     Trace(TraceArgs),
+    /// Read RUN's transcripts with a cheap reader agent per trial
+    /// (failures and passes), then group the findings.
+    Review(crate::eval_replay::ReviewArgs),
+    /// Decide on a suspect pass: --confirm voids it, --clear keeps it.
+    Decide(crate::eval_replay::DecideArgs),
 }
 
 #[derive(Debug, Args)]
@@ -1068,6 +1073,8 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         EvalCommand::Replay(a) => crate::eval_replay::replay(&ctx, a, out, err),
         EvalCommand::Runs(a) => crate::eval_replay::runs(&ctx, a.json, out),
         EvalCommand::Report(a) => crate::eval_replay::report(&ctx, a, out),
+        EvalCommand::Review(a) => crate::eval_replay::review(&ctx, a, out),
+        EvalCommand::Decide(a) => crate::eval_replay::decide(&ctx, a, out),
         EvalCommand::Trace(a) => flywheel_eval::trace::read_dir(
             &a.dir,
             &flywheel_eval::trace::Bounds {

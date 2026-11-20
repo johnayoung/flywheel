@@ -19,6 +19,12 @@ use support::{fw_confined, git, project_id_of, project_repo};
 /// a.txt say 2 unless told to idle, commits, and ends with `verify`.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo '2.1.0 (Claude Code)'; exit 0; fi
+case "$*" in *--tools*)
+  T='<!-- EVAL_REVIEW -->{\"verdict\":\"fake_pass\",\"confidence\":\"high\",\"evidence\":[{\"at\":\"final.diff\",\"quote\":\"+2\"}],\"notes\":\"hard-coded\"}<!-- /EVAL_REVIEW -->'
+  printf '%s\n' '{"type":"system","subtype":"init","session_id":"r","model":"claude-haiku-fake"}'
+  printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"'"$T"'","num_turns":1,"total_cost_usd":0.01,"usage":{"input_tokens":1,"output_tokens":1}}'
+  exit 0 ;;
+esac
 if [ "$2" = "canary" ]; then
   case "$*" in
     *setting-sources=user*)
@@ -430,4 +436,92 @@ fn an_agent_that_reads_the_held_out_oracle_is_contaminated_and_fails() {
             .unwrap()
             .contains("held-out/two.json")
     );
+}
+
+/// `fw` with the scripted agent first on PATH (the reader runs `claude`).
+fn fw_with_agent(w: &World, args: &[&str]) -> std::process::Output {
+    let mut command = std::process::Command::new(support::fw_under_test());
+    command
+        .args(args)
+        .current_dir(&w.repo)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    support::confine(&mut command, &w.home, &w.fly, &[&w.home.join("bin")]);
+    command.output().unwrap()
+}
+
+#[test]
+fn a_readers_fake_pass_makes_a_pass_suspect_and_only_the_operator_voids_it() {
+    let w = world();
+    let out = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &[
+            "eval",
+            "trial",
+            "core@v1",
+            "two",
+            "--variant",
+            "rule-off",
+            "--worker-timeout",
+            "120s",
+        ],
+    ));
+    let run_id = out
+        .split(" of run ")
+        .nth(1)
+        .unwrap()
+        .split(':')
+        .next()
+        .unwrap()
+        .to_owned();
+    let trial = out
+        .split("trial ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let reviewed = ok(&fw_with_agent(&w, &["eval", "review", &run_id]));
+    assert!(
+        reviewed.contains("fake_pass") && reviewed.contains("suspect"),
+        "{reviewed}"
+    );
+    let report = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "report", &run_id, "--json"],
+    ));
+    let r: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(r["tasks"][0]["marks"]["rule-off"][0]["mark"], "suspect");
+    assert_eq!(
+        r["overall"][0]["success"], 1.0,
+        "a suspect pass counts until decided"
+    );
+    ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "decide", &run_id, &trial, "--confirm"],
+    ));
+    let report = ok(&fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "report", &run_id, "--json"],
+    ));
+    let r: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(r["tasks"][0]["marks"]["rule-off"][0]["mark"], "voided");
+    assert_eq!(r["overall"][0]["success"], 0.0);
+    let again = fw_confined(
+        &w.repo,
+        &w.home,
+        &w.fly,
+        &["eval", "decide", &run_id, &trial, "--clear"],
+    );
+    assert!(!again.status.success(), "only a suspect pass is decided");
 }

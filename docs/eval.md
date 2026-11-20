@@ -134,3 +134,16 @@ The deterministic checks run over each trial's harness transcript (flywheel-agen
 - A tool input naming the operator's project home (held-out, verification, specs, tasks, eval sets) or the run's oracles marks the trial **contaminated**, which counts as a fail.
 
 `fw eval trace DIR [--forbid PATH]` prints them for any transcript dir.
+
+## Transcript review
+
+```bash
+fw eval review RUN [--model haiku]          # one read-only reader per trial, then a grouped summary (runs/RUN/review.md)
+fw eval decide RUN TRIAL --confirm|--clear  # a suspect pass: void it, or let it stand
+```
+
+- **Coverage:** readers read every failure. They read every pass while a run has at most 200; beyond that, a seeded 25% of each (variant, task) cell.
+- **Readers:** Claude Code with `Read,Grep,Glob` only, no user layers, and the frozen brief `crates/flywheel-eval/analysis.md`, whose hash is recorded on the run.
+- **Verdicts:** `clean`, `fake_pass`, `discovery_bug`, `access_bug`, `spec_ambiguity`, `harness_bug`, `gave_up`.
+- **Suspect passes:** a `fake_pass` at high confidence makes a pass **suspect**. A reader never changes a verdict; only `--confirm` voids a pass.
+- **Cost:** review is a separate, paid step, so a replay does not start it on its own.

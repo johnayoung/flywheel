@@ -730,3 +730,174 @@ pub(crate) fn report(ctx: &Ctx, a: &ReportArgs, out: &mut dyn Write) -> Result<i
     }
     Ok(0)
 }
+
+#[derive(Debug, Args)]
+pub struct ReviewArgs {
+    pub run: String,
+    /// The reader model.
+    #[arg(long, default_value = "haiku")]
+    pub model: String,
+    #[arg(long, default_value_t = 40)]
+    pub max_turns: u32,
+    /// Seed of the pass sample (runs with more than 200 passes).
+    #[arg(long, default_value_t = 1)]
+    pub seed: u64,
+    /// Skip the coordinator's grouped summary.
+    #[arg(long)]
+    pub no_coordinator: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct DecideArgs {
+    pub run: String,
+    pub trial: String,
+    /// The reader was right: the pass is voided (counts as a fail).
+    #[arg(long, conflicts_with = "clear", required_unless_present = "clear")]
+    pub confirm: bool,
+    /// The reader was wrong: the pass stands.
+    #[arg(long)]
+    pub clear: bool,
+}
+
+/// `fw eval review`.
+pub(crate) fn review(ctx: &Ctx, a: &ReviewArgs, out: &mut dyn Write) -> Result<i32, String> {
+    use flywheel_eval::review;
+    let store = ctx.store()?;
+    let run = store.run(&a.run).map_err(|e| e.to_string())?;
+    let trials = store.trials(&a.run).map_err(|e| e.to_string())?;
+    let run_dir = ctx.evals.join("runs").join(&a.run);
+    let set_dir = if run.set_version == 0 {
+        SetDir::draft(&ctx.evals, &run.set_name)
+    } else {
+        SetDir::frozen(&ctx.evals, &run.set_name, run.set_version)
+    };
+    let reader = review::AgentReader::new(&a.model, a.max_turns, None);
+    let picked = review::pick(&trials, a.seed);
+    let _ = writeln!(
+        out,
+        "reading {} of {} trials with {}",
+        picked.len(),
+        trials.len(),
+        a.model
+    );
+    store
+        .set_analysis_hash(&a.run, &review::analysis_hash())
+        .map_err(|e| e.to_string())?;
+    let mut findings = Vec::new();
+    let mut suspects = 0;
+    for id in &picked {
+        let trial = store.trial(&a.run, id).map_err(|e| e.to_string())?;
+        let dir = run_dir.join("trials").join(id);
+        let goal = std::fs::read_to_string(set_dir.task_file(&trial.task_id))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| v["goal"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let (verdict, confidence, evidence, notes) =
+            match review::review_one(&reader, &trial, &dir, &goal) {
+                Ok(v) => {
+                    if review::suspect(&trial, &v) {
+                        suspects += 1;
+                        store
+                            .set_validity(&a.run, id, "suspect", &format!("reader: {}", v.notes))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    findings.push((id.clone(), v.clone()));
+                    (
+                        v.verdict,
+                        v.confidence,
+                        serde_json::to_string(&v.evidence).unwrap_or_else(|_| "[]".into()),
+                        v.notes,
+                    )
+                }
+                Err(e) => (
+                    "reader_error".to_owned(),
+                    "low".to_owned(),
+                    "[]".to_owned(),
+                    e,
+                ),
+            };
+        let _ = writeln!(
+            out,
+            "  {id:<44} {verdict:<16} {confidence:<6} {}",
+            notes
+                .replace('\n', " ")
+                .chars()
+                .take(100)
+                .collect::<String>()
+        );
+        store
+            .put_review(
+                &a.run,
+                &flywheel_eval::store::ReviewRow {
+                    trial_id: id.clone(),
+                    reader_model: reader_model_name(&reader),
+                    verdict,
+                    confidence,
+                    evidence_json: evidence,
+                    notes,
+                    operator_decision: None,
+                    decided_at: None,
+                    reviewed_at: Utc::now(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+    }
+    if !a.no_coordinator && !findings.is_empty() {
+        use flywheel_eval::review::Reader;
+        match reader.read(&review::coordinator_prompt(&findings), &run_dir) {
+            Ok(summary) => {
+                let path = review::summary_path(&run_dir);
+                std::fs::write(&path, summary).map_err(|e| format!("{}: {e}", path.display()))?;
+                let _ = writeln!(out, "grouped findings: {}", path.display());
+            }
+            Err(e) => {
+                let _ = writeln!(out, "the coordinator failed: {e}");
+            }
+        }
+    }
+    if suspects > 0 {
+        let _ = writeln!(
+            out,
+            "{suspects} pass(es) are suspect: decide each with fw eval decide {} TRIAL --confirm|--clear",
+            a.run
+        );
+    }
+    Ok(0)
+}
+
+fn reader_model_name(reader: &flywheel_eval::review::AgentReader) -> String {
+    use flywheel_eval::review::Reader;
+    reader.model()
+}
+
+/// `fw eval decide`.
+pub(crate) fn decide(ctx: &Ctx, a: &DecideArgs, out: &mut dyn Write) -> Result<i32, String> {
+    let store = ctx.store()?;
+    let trial = store.trial(&a.run, &a.trial).map_err(|e| e.to_string())?;
+    if trial.validity.as_deref() != Some("suspect") {
+        return Err(format!(
+            "trial {} is {}, not suspect: only a reader's suspect pass is decided",
+            a.trial,
+            trial.validity.as_deref().unwrap_or("unchecked")
+        ));
+    }
+    let (validity, decision) = if a.confirm {
+        ("voided", "confirmed")
+    } else {
+        ("valid", "cleared")
+    };
+    store
+        .set_validity(
+            &a.run,
+            &a.trial,
+            validity,
+            &format!("operator {decision} the reader"),
+        )
+        .map_err(|e| e.to_string())?;
+    store
+        .decide_review(&a.run, &a.trial, decision, Utc::now())
+        .map_err(|e| e.to_string())?;
+    let _ = writeln!(out, "trial {}: {validity}", a.trial);
+    Ok(0)
+}

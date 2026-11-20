@@ -651,6 +651,15 @@ impl EvalStore {
         Ok(())
     }
 
+    /// Record the review brief's hash a run was read with.
+    pub fn set_analysis_hash(&self, run_id: &str, hash: &str) -> Result<(), EvalStoreError> {
+        self.db().execute(
+            "UPDATE eval_runs SET analysis_md_hash = ?3 WHERE project_id = ?1 AND run_id = ?2",
+            &[self.p(), Value::text(run_id), Value::text(hash)],
+        )?;
+        Ok(())
+    }
+
     /// Raise (or set) a run's budget cap.
     pub fn set_run_budget(
         &self,

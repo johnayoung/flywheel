@@ -72,9 +72,11 @@ fn short(sha: &str) -> &str {
     &sha[..12.min(sha.len())]
 }
 
-/// Strings that name a live flywheel home.
+/// Strings that name a live flywheel project's files. A bare mention of
+/// `~/.flywheel` (a comment saying a test keeps out of it) is not one; the
+/// oracle runs with an empty `FLYWHEEL_HOME` either way.
 fn names_live_home(text: &str) -> bool {
-    text.contains("/.flywheel/projects/") || text.contains("~/.flywheel")
+    text.contains("/.flywheel/projects/") || text.contains("~/.flywheel/projects")
 }
 
 struct Grader<'a> {

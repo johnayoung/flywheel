@@ -230,6 +230,13 @@ fn live_home_paths_fail_v6_and_v7() {
     .unwrap();
     let proof = f.validate("leaky", None);
     assert!(!proof.passed);
+    // A comment naming ~/.flywheel is prose, not a dependency.
+    assert!(!names_live_home(
+        "// nothing reaches the real ~/.flywheel, ~/.claude"
+    ));
+    assert!(names_live_home(
+        "cat ~/.flywheel/projects/p/held-out/x.json"
+    ));
     assert!(!get(&proof, "V6").passed);
     assert!(!get(&proof, "V7").passed);
     let _ = &f.evals;

@@ -33,6 +33,7 @@ sha2.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+uuid.workspace = true
 tokio.workspace = true
 # `backup`: the online-backup API self-update restores a store with.
 rusqlite = { workspace = true, features = ["backup"] }

@@ -163,7 +163,8 @@ pub struct RunVariantRow {
 }
 
 /// Where a trial stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TrialStatus {
     Pending,
     Running,
@@ -195,7 +196,7 @@ impl TrialStatus {
 }
 
 /// One trial: a cell of variants x tasks x k, and what it produced.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TrialRow {
     pub trial_id: String,
     pub ordinal: u32,
@@ -255,7 +256,7 @@ impl TrialRow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CheckRow {
     pub trial_id: String,
     /// `oracle` or `rubric`.
@@ -278,7 +279,7 @@ pub struct ReviewRow {
     pub reviewed_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ArtifactRow {
     pub name: String,
     pub sha256: String,

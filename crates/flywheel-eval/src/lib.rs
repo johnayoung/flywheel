@@ -25,6 +25,7 @@ pub mod oracle;
 pub mod proc;
 pub mod set;
 pub mod store;
+pub mod trial;
 pub mod validate;
 pub mod variant;
 

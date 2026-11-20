@@ -1050,3 +1050,62 @@ impl Drop for HubCleanup {
         }
     }
 }
+
+// --- fw eval fixtures -----------------------------------------------------------
+
+/// A store at `db` (partition `project_id`) with run `run_id` of `task_id`
+/// done on its first attempt and landed as `landed` (a merge).
+pub fn seed_landed_run(db: &Path, project_id: &str, task_id: &str, run_id: &str, landed: &str) {
+    use chrono::{Duration, TimeZone, Utc};
+    use flywheel_core::events::{DomainEvent, DomainEventPayload, Landed};
+    use flywheel_core::lifecycle::{Attempt, Lifecycle, Outcome, Status};
+    use flywheel_core::store::{AttemptStore, DomainEventStore, LifecycleStore};
+    let store = flywheel_core::store_sqlite::SqliteStore::open_partition(db, project_id).unwrap();
+    let t0 = Utc.with_ymd_and_hms(2026, 11, 10, 9, 0, 0).unwrap();
+    let mut lc = Lifecycle::new(task_id).with_run_id(run_id);
+    for status in [
+        Status::Ready,
+        Status::Running,
+        Status::Validating,
+        Status::Done,
+    ] {
+        lc.transition_to(status, "", Some(t0)).unwrap();
+    }
+    store.create_lifecycle(&lc).unwrap();
+    let mut attempt = Attempt::new(1, t0, run_id);
+    attempt.outcome = Some(Outcome::Succeeded);
+    attempt.total_cost_usd = 2.25;
+    store.save_attempt(run_id, &attempt, None).unwrap();
+    let version = store.load_lifecycle(run_id).unwrap().unwrap().version;
+    store
+        .append_domain_event(
+            &DomainEvent::new(
+                run_id,
+                t0 + Duration::minutes(10),
+                DomainEventPayload::Landed(Landed {
+                    strategy: "merge".into(),
+                    landed_ref: landed.to_owned(),
+                    ..Landed::default()
+                }),
+            ),
+            version,
+        )
+        .unwrap();
+}
+
+/// Every file named `name` under `dir`.
+pub fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if entry.file_name() == name {
+                out.push(path);
+            }
+        }
+    }
+    out
+}

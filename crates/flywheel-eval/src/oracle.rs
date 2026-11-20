@@ -41,7 +41,7 @@ pub const SCRUBBED_ENV: &[&str] = &[
 ];
 
 /// A materialized oracle: where its files are and what to run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
 pub struct Oracle {
     pub root: PathBuf,
     /// `(name, command)` in registration order.

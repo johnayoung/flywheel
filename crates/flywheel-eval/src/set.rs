@@ -344,7 +344,7 @@ pub fn validate_name(name: &str) -> Result<(), String> {
 }
 
 /// The files of one set version.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetDir {
     root: PathBuf,
 }

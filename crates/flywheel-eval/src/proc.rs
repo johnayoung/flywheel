@@ -40,7 +40,8 @@ impl Ran {
 }
 
 /// The turn-taking a command runs under.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Locking {
     /// Run as is.
     #[default]
@@ -60,6 +61,8 @@ pub enum Locking {
         note: String,
         flock: Option<PathBuf>,
     },
+    /// Each in turn, outermost first.
+    Chain(Vec<Locking>),
 }
 
 impl Locking {
@@ -102,6 +105,7 @@ impl Locking {
                 argv.push("--".into());
                 argv
             }
+            Self::Chain(all) => all.iter().flat_map(Self::prefix).collect(),
         }
     }
 }

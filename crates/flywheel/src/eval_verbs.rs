@@ -40,6 +40,24 @@ enum EvalCommand {
     /// Resolve, pin, and compare agent-setup variants.
     #[command(subcommand)]
     Variant(VariantCommand),
+    /// Run one trial: TASK of a frozen SET under --variant, recorded as a
+    /// one-cell run (prints the trial's row as JSON last).
+    Trial(TrialArgs),
+}
+
+#[derive(Debug, Args)]
+struct TrialArgs {
+    /// NAME@vN (or NAME: its latest version).
+    set: String,
+    task: String,
+    #[arg(long, value_name = "NAME")]
+    variant: String,
+    /// The worker's wall-clock bound.
+    #[arg(long, default_value = "2h", value_name = "SPAN")]
+    worker_timeout: String,
+    /// One oracle run's bound.
+    #[arg(long, default_value = "30m", value_name = "SPAN")]
+    oracle_timeout: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -752,6 +770,178 @@ fn variant_ls(ctx: &Ctx, args: &JsonArg, out: &mut dyn Write) -> Result<i32, Str
     Ok(0)
 }
 
+/// The machine's test-suite lock path (`scripts/check.sh`'s).
+pub(crate) fn test_suite_lock() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+        .join("flywheel-check.lock")
+}
+
+/// Claude Code's config dir: `$CLAUDE_CONFIG_DIR`, else `~/.claude`.
+pub(crate) fn claude_dir() -> PathBuf {
+    std::env::var_os("CLAUDE_CONFIG_DIR").map_or_else(
+        || {
+            std::env::var_os("HOME")
+                .map_or_else(|| PathBuf::from("."), PathBuf::from)
+                .join(".claude")
+        },
+        PathBuf::from,
+    )
+}
+
+/// Prove the variant's Claude Code leaves out user layers (see
+/// `flywheel_eval::canary`), with the variant's own PATH.
+fn run_canary(ctx: &Ctx, v: &variant::ResolvedVariant) -> Result<(), String> {
+    if !v.is_claude() {
+        return Ok(());
+    }
+    let env: Vec<(String, String)> = v
+        .env
+        .iter()
+        .filter(|(k, _)| *k == "PATH")
+        .map(|(k, val)| (k.clone(), val.clone()))
+        .collect();
+    let scratch = ctx.cache().join("canary").join(v.short_hash());
+    let _ = std::fs::remove_dir_all(&scratch);
+    let result =
+        flywheel_eval::canary::check(Path::new("claude"), &v.setting_sources, &scratch, &env);
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+fn new_run_id(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}-{}",
+        Utc::now().format("%Y%m%d%H%M%S"),
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    )
+}
+
+fn one_trial(ctx: &Ctx, args: &TrialArgs, out: &mut dyn Write) -> Result<i32, String> {
+    use flywheel_eval::store::{RunRow, RunStatus, RunVariantRow, TrialRow};
+    let set_ref = SetRef::parse(&args.set)?;
+    if set_ref.version == Some(VersionRef::Draft) {
+        return Err("trials run on a frozen set: fw eval set freeze NAME".into());
+    }
+    let set_dir = set::resolve(&ctx.evals, &set_ref).map_err(|e| e.to_string())?;
+    let manifest = set_dir.load().map_err(|e| e.to_string())?;
+    let task = manifest
+        .task(&args.task)
+        .cloned()
+        .ok_or_else(|| format!("no task {} in {}", args.task, manifest.label()))?;
+    let v = resolve_variant(&ctx.evals, &args.variant, None)?;
+    run_canary(ctx, &v)?;
+    let store = ctx.store()?;
+    store
+        .put_variant(&flywheel_eval::store::VariantRow {
+            hash: v.hash.clone(),
+            name: v.name.clone(),
+            resolved_json: serde_json::to_string(&v).map_err(|e| e.to_string())?,
+            created_at: Utc::now(),
+        })
+        .map_err(|e| e.to_string())?;
+    let run_id = new_run_id("trial");
+    let trial_id = format!("{}-{}-k0", task.id, v.short_hash());
+    store
+        .create_run(
+            &RunRow {
+                run_id: run_id.clone(),
+                set_name: manifest.name.clone(),
+                set_version: manifest.version.unwrap_or(0),
+                set_hash: manifest.hash.clone().unwrap_or_default(),
+                k: 1,
+                seed: 0,
+                primary_metrics: String::new(),
+                budget_usd: None,
+                pipeline: "full".into(),
+                parallel: 1,
+                status: RunStatus::Running,
+                started_at: Utc::now(),
+                ended_at: None,
+                analysis_md_hash: None,
+                options_json: serde_json::json!({"kind": "single-trial"}).to_string(),
+            },
+            &[RunVariantRow {
+                ordinal: 0,
+                variant_hash: v.hash.clone(),
+                label: v.name.clone(),
+            }],
+            &[TrialRow::planned(
+                trial_id.clone(),
+                0,
+                v.hash.clone(),
+                task.id.clone(),
+                0,
+            )],
+        )
+        .map_err(|e| e.to_string())?;
+    let worker = format!("fw-eval-{}", std::process::id());
+    let none = |_: &TrialRow| false;
+    let lease = Utc::now() + chrono::Duration::hours(24);
+    store
+        .claim_next(&run_id, &worker, Utc::now(), lease, &none)
+        .map_err(|e| e.to_string())?
+        .ok_or("the trial could not be claimed")?;
+    let run_dir = ctx.evals.join("runs").join(&run_id);
+    let oracle = flywheel_eval::oracle::materialize(
+        &set_dir,
+        &task.id,
+        &flywheel_eval::trial::run_oracle_dir(&run_dir, &task.id),
+    )
+    .map_err(|e| e.to_string())?;
+    let plan = flywheel_eval::trial::TrialPlan {
+        run_id: run_id.clone(),
+        trial_id: trial_id.clone(),
+        set: set_dir,
+        manifest: manifest.clone(),
+        task,
+        variant: v,
+        blobs: ctx.evals.join("blobs"),
+        run_dir: run_dir.clone(),
+        cache: ctx.cache(),
+        oracle,
+        worker_timeout_secs: parse_span(&args.worker_timeout)?.as_secs(),
+        oracle_timeout_secs: parse_span(&args.oracle_timeout)?.as_secs(),
+        worker_locking: flywheel_eval::proc::Locking::None,
+        grade_locking: flywheel_eval::proc::Locking::Flock(test_suite_lock()),
+        capture: None,
+        batch_budget: None,
+        claude_dir: claude_dir(),
+    };
+    let outcome = flywheel_eval::trial::run_trial(&plan, &Utc::now).map_err(|e| e.to_string())?;
+    let mut row = outcome.row.clone();
+    row.ordinal = 0;
+    store
+        .finish(&run_id, &worker, &row)
+        .map_err(|e| e.to_string())?;
+    store
+        .put_checks(&run_id, &trial_id, "oracle", &outcome.checks)
+        .map_err(|e| e.to_string())?;
+    store
+        .put_artifacts(&run_id, &trial_id, &outcome.artifacts)
+        .map_err(|e| e.to_string())?;
+    store
+        .set_run_status(&run_id, RunStatus::Done, Some(Utc::now()))
+        .map_err(|e| e.to_string())?;
+    let _ = writeln!(
+        out,
+        "trial {trial_id} of run {run_id}: {} ({}), {} turns, ${:.2}; artifacts in {}",
+        row.oracle.as_deref().unwrap_or("no verdict"),
+        row.final_where.as_deref().unwrap_or("-"),
+        row.turns,
+        row.cost_usd,
+        outcome.dir.display()
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        serde_json::to_string(&row).map_err(|e| e.to_string())?
+    );
+    Ok(i32::from(
+        row.status() != flywheel_eval::store::TrialStatus::Done,
+    ))
+}
+
 /// `fw eval ...`.
 pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let argv = std::iter::once("fw eval".to_owned()).chain(args.iter().cloned());
@@ -786,6 +976,7 @@ pub fn run_eval(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i3
         EvalCommand::Variant(VariantCommand::Show(a)) => variant_show(&ctx, a, out),
         EvalCommand::Variant(VariantCommand::Diff(a)) => variant_diff(&ctx, a, out),
         EvalCommand::Variant(VariantCommand::Ls(a)) => variant_ls(&ctx, a, out),
+        EvalCommand::Trial(a) => one_trial(&ctx, a, out),
     };
     match result {
         Ok(code) => code,

@@ -78,7 +78,13 @@ fn plant(scratch: &Path) -> std::io::Result<PathBuf> {
     Ok(cfg)
 }
 
-fn run_once(claude: &Path, scratch: &Path, cfg: &Path, sources: &str) -> Result<Seen, String> {
+fn run_once(
+    claude: &Path,
+    scratch: &Path,
+    cfg: &Path,
+    sources: &str,
+    env: &[(String, String)],
+) -> Result<Seen, String> {
     let fired = scratch.join("hook-fired");
     let _ = std::fs::remove_file(&fired);
     let mut child = Command::new(claude)
@@ -93,6 +99,7 @@ fn run_once(claude: &Path, scratch: &Path, cfg: &Path, sources: &str) -> Result<
             &format!("--setting-sources={sources}"),
         ])
         .current_dir(scratch.join("work"))
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .env("CLAUDE_CONFIG_DIR", cfg)
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
@@ -143,8 +150,14 @@ fn run_once(claude: &Path, scratch: &Path, cfg: &Path, sources: &str) -> Result<
 }
 
 /// Prove `claude` leaves out user-level layers under `sources`
-/// (comma-joined), in `scratch` (created). `Err` names what failed.
-pub fn check(claude: &Path, sources: &[String], scratch: &Path) -> Result<(), String> {
+/// (comma-joined), in `scratch` (created), with `env` set the way the
+/// trial's worker sets it (a variant's `PATH`). `Err` names what failed.
+pub fn check(
+    claude: &Path,
+    sources: &[String],
+    scratch: &Path,
+    env: &[(String, String)],
+) -> Result<(), String> {
     if sources.iter().any(|s| s == "user") {
         return Err("the canary checks sources without \"user\"".into());
     }
@@ -153,7 +166,7 @@ pub fn check(claude: &Path, sources: &[String], scratch: &Path) -> Result<(), St
         .chain(sources.iter().cloned())
         .collect::<Vec<_>>()
         .join(",");
-    let control = run_once(claude, scratch, &cfg, &control_sources)?;
+    let control = run_once(claude, scratch, &cfg, &control_sources, env)?;
     if !control.all() {
         return Err(format!(
             "setting-sources canary inconclusive: with \"user\" included this Claude Code \
@@ -162,7 +175,7 @@ pub fn check(claude: &Path, sources: &[String], scratch: &Path) -> Result<(), St
             control.names()
         ));
     }
-    let trial = run_once(claude, scratch, &cfg, &sources.join(","))?;
+    let trial = run_once(claude, scratch, &cfg, &sources.join(","), env)?;
     if trial.any() {
         return Err(format!(
             "setting-sources canary FAILED: under --setting-sources={} this Claude Code still \
@@ -209,9 +222,9 @@ mod tests {
     fn a_cli_that_honors_the_flag_passes_and_one_that_ignores_it_fails_loudly() {
         let dir = tempfile::tempdir().unwrap();
         let good = fake_claude(dir.path(), true);
-        check(&good, &sources(), &dir.path().join("s1")).unwrap();
+        check(&good, &sources(), &dir.path().join("s1"), &[]).unwrap();
         let bad = fake_claude(dir.path(), false);
-        let err = check(&bad, &sources(), &dir.path().join("s2")).unwrap_err();
+        let err = check(&bad, &sources(), &dir.path().join("s2"), &[]).unwrap_err();
         assert!(
             err.contains("canary FAILED") && err.contains("user skill"),
             "{err}"
@@ -228,7 +241,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let err = check(&path, &sources(), &dir.path().join("s")).unwrap_err();
+        let err = check(&path, &sources(), &dir.path().join("s"), &[]).unwrap_err();
         assert!(err.contains("inconclusive"), "{err}");
     }
 
@@ -247,6 +260,6 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        check(Path::new("claude"), &sources(), dir.path()).unwrap();
+        check(Path::new("claude"), &sources(), dir.path(), &[]).unwrap();
     }
 }

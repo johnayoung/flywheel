@@ -70,3 +70,20 @@ mcp_servers = ["context7"]           # from ~/.claude.json -> .mcp.json
 ```bash
 fw eval variant ls | show NAME | diff A B | pin NAME
 ```
+
+## Trials
+
+A trial runs one set task under one variant, starting from the task's historical base. Steps:
+
+1. **Clone.** Clone a base mirror (the base and its past only, no remote) into `evals/runs/<run>/trials/<trial>/work/`.
+2. **Overlay.** Commit the variant's overlay as branch `eval/trial`.
+3. **Fresh home.** Create a fresh `FLYWHEEL_HOME` holding the task, its specs, and a held-out registration that points at the run's oracle, which lives outside that home.
+4. **Run the worker.** Run `fw worker --task ID --base eval/trial --setting-sources project,local --permission-mode M [--model M]` with the variant's `fw` and env, and `FLYWHEEL_BATCH=eval:<run>:<trial>`.
+5. **Grade.** Run the oracle out of band on the final commit, in a clean checkout, under the machine's test-suite lock. The final commit is the landed one if there is one, else the parked work branch, else the base.
+6. **Clean up.** Copy Claude Code's per-path state for the trial's directories (`~/.claude/projects/<key>/`: transcripts, auto-memory) into the artifacts, then remove it. Delete the work dir. Keep the final commit in `evals/runs/<run>/results.git`.
+
+```bash
+fw eval trial core@v1 TASK --variant rule-off    # one trial, recorded as a one-cell run
+```
+
+Artifacts in each trial dir: `worker.log`, `attempts.json`, `transcripts/`, `overlay.json`, `final.diff`, `oracle.log`, `checks.json`, `trial.json`, `claude-projects/`.

@@ -32,7 +32,7 @@ use serde::Serialize;
 use crate::git;
 use crate::mine::PROJECT_HOME_TOKEN;
 use crate::mirror;
-use crate::oracle::{self, Oracle, RunOptions, SCRUBBED_ENV};
+use crate::oracle::{self, GradeTree, Oracle, RunOptions, SCRUBBED_ENV};
 use crate::proc::{self, Locking, Spec};
 use crate::set::{SetDir, SetError, SetManifest, SetTask, file_sha256, files_under, io, pin_ref};
 use crate::store::{ArtifactRow, CheckRow, TrialRow, TrialStatus};
@@ -448,43 +448,48 @@ fn execute(
     let diff = git::run(&clone, &["diff", &overlay.commit, &final_commit]).unwrap_or_default();
     std::fs::write(dir.join("final.diff"), diff).map_err(|e| e.to_string())?;
 
-    // Keep the final commit in the run's results repository.
-    let results = plan.run_dir.join("results.git");
-    if !results.join("HEAD").exists() {
-        std::fs::create_dir_all(&results).map_err(|e| e.to_string())?;
-        git::run(&results, &["init", "--quiet", "--bare"]).map_err(|e| e.to_string())?;
+    // Keep the final commit in the run's results repository (trials of a
+    // run finish in parallel processes: one at a time here).
+    {
+        let results = plan.run_dir.join("results.git");
+        let _results = crate::proc::FileLock::exclusive(&plan.run_dir.join("results.lock"))
+            .map_err(|e| format!("the results lock: {e}"))?;
+        if !results.join("HEAD").exists() {
+            std::fs::create_dir_all(&results).map_err(|e| e.to_string())?;
+            git::run(&results, &["init", "--quiet", "--bare"]).map_err(|e| e.to_string())?;
+        }
+        git::run(
+            &clone,
+            &[
+                "push",
+                "--quiet",
+                "--force",
+                &results.display().to_string(),
+                &format!("{final_commit}:refs/trials/{}", plan.trial_id),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
     }
-    git::run(
-        &clone,
-        &[
-            "push",
-            "--quiet",
-            "--force",
-            &results.display().to_string(),
-            &format!("{final_commit}:refs/trials/{}", plan.trial_id),
-        ],
-    )
-    .map_err(|e| e.to_string())?;
 
-    // 6. Grade the final commit out of band, in a clean checkout.
-    let grade_tree = work.join("grade");
-    git::run(
-        &clone,
-        &[
-            "worktree",
-            "add",
-            "--quiet",
-            "--detach",
-            &grade_tree.display().to_string(),
-            &final_commit,
-        ],
-    )
-    .map_err(|e| e.to_string())?;
+    // 6. Grade the final commit out of band, in a clean checkout: the
+    // task's one grading tree, moved to this commit under the task's grading
+    // lock (trials of a task grade one at a time there). One tree per
+    // build cache is what keeps the cache honest: cargo keys a workspace's
+    // artifacts by paths relative to its root and judges freshness by
+    // mtime, so two trees at different commits sharing one target dir can
+    // each take the other's stale build for their own.
+    let grade_root = plan.cache.join("grade").join(&task.id);
+    std::fs::create_dir_all(&grade_root).map_err(|e| e.to_string())?;
+    let _grading = crate::proc::FileLock::exclusive(&grade_root.join("lock"))
+        .map_err(|e| format!("the grading lock: {e}"))?;
+    let tree = GradeTree::open(&clone, &grade_root.join("tree")).map_err(|e| e.to_string())?;
+    tree.checkout_from(&clone, &final_commit)
+        .map_err(|e| e.to_string())?;
     let verdict = oracle::run(
         &plan.oracle,
-        &grade_tree,
+        &tree.path,
         &RunOptions {
-            target_dir: Some(plan.cache.join("target-grade").join(&task.id)),
+            target_dir: Some(grade_root.join("target")),
             timeout: Some(Duration::from_secs(plan.oracle_timeout_secs)),
             locking: plan.grade_locking.clone(),
             log: Some(dir.join("oracle.log")),

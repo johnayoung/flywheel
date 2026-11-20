@@ -203,7 +203,9 @@ pub fn validate_task(
     let log = work.join("oracle.log");
     let _ = std::fs::remove_file(&log);
     let run_options = RunOptions {
-        target_dir: Some(options.target_dir.clone()),
+        // A cache per task: see `trial`'s grading for why trees at
+        // different commits must not share one.
+        target_dir: Some(options.target_dir.join(id)),
         timeout: Some(options.timeout),
         log: Some(log.clone()),
         ..RunOptions::default()

@@ -256,11 +256,28 @@ impl GradeTree {
     /// Move to `sha` with nothing left over from the last grading (fetching
     /// it from the source repo when the clone predates it).
     pub fn checkout(&self, sha: &str) -> Result<(), SetError> {
+        self.checkout_from(&self.repo.clone(), sha)
+    }
+
+    /// [`Self::checkout`], fetching `sha` from `source` when it is missing
+    /// (a trial's commit lives in the trial's own repository).
+    pub fn checkout_from(&self, source: &Path, sha: &str) -> Result<(), SetError> {
         if git::rev_parse(&self.path, sha).is_err() {
-            git::run(
+            let tmp = format!("refs/flywheel/eval-grade/{}", &sha[..sha.len().min(12)]);
+            // A bare sha is fetched through a temporary ref in the source.
+            git::update_ref(source, &tmp, sha)?;
+            let fetched = git::run(
                 &self.path,
-                &["fetch", "--quiet", &self.repo.display().to_string(), sha],
-            )?;
+                &[
+                    "fetch",
+                    "--quiet",
+                    "--no-tags",
+                    &source.display().to_string(),
+                    &tmp,
+                ],
+            );
+            let _ = git::run(source, &["update-ref", "-d", &tmp]);
+            fetched?;
         }
         git::run(
             &self.path,

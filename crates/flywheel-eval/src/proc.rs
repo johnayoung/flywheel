@@ -110,6 +110,31 @@ impl Locking {
     }
 }
 
+/// An exclusive `flock` on a file, held until dropped (the file is
+/// created).
+pub struct FileLock {
+    _file: std::fs::File,
+}
+
+impl FileLock {
+    pub fn exclusive(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { _file: file })
+    }
+}
+
 /// What to run.
 #[derive(Debug, Clone, Default)]
 pub struct Spec<'a> {

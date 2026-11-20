@@ -54,7 +54,7 @@ Either way the work itself is never trusted blind: agent claims feed verificatio
 
 ## Crates
 
-A Cargo workspace of seven crates under `crates/`. Dependencies point one way only — core imports nothing downstream.
+A Cargo workspace of eight crates under `crates/`. Dependencies point one way only — core imports nothing downstream.
 
 | Crate | Role |
 | --- | --- |
@@ -63,6 +63,7 @@ A Cargo workspace of seven crates under `crates/`. Dependencies point one way on
 | `flywheel-orchestrator` | Drives many tasks on top of core: prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon, and the `SubmitStrategy` landing seam. |
 | `flywheel-worktree` | Git-worktree landing strategies — FF-merge (default) or pull request — plus the worker daemon. |
 | `flywheel-container` | Docker sandbox execution backend: runs the agent CLI inside a container against a bind-mounted worktree. Activated via `fw worker --sandbox container --image IMAGE`. |
+| `flywheel-eval` | `fw eval`: frozen task sets replayed under pinned agent-setup variants, judged by held-out oracles, reported with the measured noise. |
 | `flywheel-hub` | `fw hub`: web workspace of server-owned agent terminals (axum server, REST + WebSocket API, embedded web UI). Depends on no other flywheel crate. |
 | `flywheel` | The `flywheel` / `fw` binaries: verb router and operator console. Bundles the container backend. |
 

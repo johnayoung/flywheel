@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use flywheel_core::store::{CURRENT_SCHEMA_VERSION, SchemaUpgrade};
 use flywheel_core::store_postgres::{DEFAULT_SCHEMA, PostgresStore};
 use flywheel_core::store_sqlite::{Recorded, SqliteStore, VERSION_TABLE, recorded_version};
+use flywheel_eval::store::EvalStore;
 use flywheel_orchestrator::claims::{
     CURRENT_ORCH_SCHEMA_VERSION, ORCH_VERSION_TABLE, SqliteClaimStore,
 };
@@ -49,8 +50,8 @@ pub const DB_USAGE: &str = "usage: fw db upgrade [--project ID | --db PATH]
 
 Migrate the store in place to this flywheel's schema version. Store verbs
 refuse a store whose schema is behind and name this command; nothing is
-migrated implicitly. Both the run tables and the orchestrator tables are
-upgraded, each in one transaction; existing rows are assigned the store's
+migrated implicitly. The run, orchestrator, and eval tables are each
+upgraded in one transaction; existing rows are assigned the store's
 project id (the project_id partition column). Safe to re-run.
 
 Default: the store of the project at the working directory (sqlite under
@@ -289,11 +290,13 @@ fn upgrade_sqlite(db_path: &Path, partition: &str) -> Result<Vec<String>, String
     }
     let core = SqliteStore::upgrade(db_path, partition).map_err(|e| e.to_string())?;
     let claims = SqliteClaimStore::upgrade(db_path, partition).map_err(|e| e.to_string())?;
+    let eval = EvalStore::upgrade_sqlite(db_path).map_err(|e| e.to_string())?;
     Ok(report(
         &format!("sqlite {}", PathBuf::from(db_path).display()),
         partition,
         &core,
         &claims,
+        &eval,
     ))
 }
 
@@ -301,11 +304,13 @@ fn upgrade_postgres(dsn: &str, partition: &str) -> Result<Vec<String>, String> {
     let schema = DEFAULT_SCHEMA.to_owned();
     let core = PostgresStore::upgrade(dsn, &schema, partition).map_err(|e| e.to_string())?;
     let claims = PostgresClaimStore::upgrade(dsn, &schema, partition).map_err(|e| e.to_string())?;
+    let eval = EvalStore::upgrade_postgres(dsn, &schema).map_err(|e| e.to_string())?;
     Ok(report(
         &format!("postgres schema '{schema}'"),
         partition,
         &core,
         &claims,
+        &eval,
     ))
 }
 
@@ -447,11 +452,13 @@ fn report(
     partition: &str,
     core: &SchemaUpgrade,
     claims: &SchemaUpgrade,
+    eval: &SchemaUpgrade,
 ) -> Vec<String> {
     vec![
         format!("upgraded {target} (project {partition})"),
         format!("  {}", describe("run store", core)),
         format!("  {}", describe("orchestrator store", claims)),
+        format!("  {}", describe("eval store", eval)),
     ]
 }
 

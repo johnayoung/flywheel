@@ -167,10 +167,15 @@ fn a_fresh_store_is_partitioned_and_a_behind_one_is_refused_until_upgraded() {
 
     let report = sandbox.ok(&repo, &["db", "upgrade"]);
     assert!(report.contains(&id), "{report}");
+    assert!(
+        report.contains("eval store: created at schema 1"),
+        "{report}"
+    );
     sandbox.ok(&repo, &["status", "--json"]);
     // Idempotent.
     let again = sandbox.ok(&repo, &["db", "upgrade"]);
     assert!(again.contains("already at schema"), "{again}");
+    assert!(again.contains("eval store: already at schema 1"), "{again}");
     sandbox.ok(&repo, &["status", "--json"]);
     assert!(!repo.join(".flywheel").exists());
 }

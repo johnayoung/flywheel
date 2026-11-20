@@ -6,13 +6,14 @@ Flywheel is a Rust orchestration loop for AI coding agents — it owns the execu
 
 ## Workspace layout (the hard line)
 
-A Cargo workspace of seven crates under `crates/`, each with its source in `crates/<name>/src/`. The dependency arrow points one way only — core imports nothing downstream:
+A Cargo workspace of eight crates under `crates/`, each with its source in `crates/<name>/src/`. The dependency arrow points one way only — core imports nothing downstream:
 
 - **`flywheel-agents`** — bottom of the stack, below core: the multi-agent execution layer (adapters, normalized events, execution hosts; Claude Code and Codex adapters shipped). Depends on no other flywheel crate. Design doc: `docs/agent-harness.md`.
 - **`flywheel-core`** — the lifecycle of a **single task**. Knows nothing about who calls it. Its workflow entry points are hidden verbs on the binary (`flywheel workflow run|is-done|set-model`). This is the only crate most contributors touch.
 - **`flywheel-orchestrator`** — built on core: drives **many** tasks (selection over a prerequisite DAG, work sources, claims/leases, multi-worker, phases, the autopilot intake daemon). Owns its own store (`task_claims`). Library only.
 - **`flywheel-worktree`** — built on the orchestrator: the git-worktree submit strategy + daemon, one worked example of a consumer. Library only; spawned via `flywheel worker`.
 - **`flywheel-container`** — built on the orchestrator: the Docker sandbox execution backend (the agent CLI in headless stream-json via `docker exec` against a bind-mounted worktree, driven through the `flywheel-agents` claude-code adapter under `DockerExecHost`). A sibling consumer of the orchestrator like `flywheel-worktree`. Library only; activated via `fw worker --sandbox container --image IMAGE`.
+- **`flywheel-eval`** — built on the orchestrator: `fw eval` (frozen task sets from past work, replayed under pinned agent-setup variants as `fw worker` subprocesses in throwaway clones, judged by held-out oracles, reported with the measured noise). Owns its own store tables (`eval_*`). Library only.
 - **`flywheel-hub`** — `fw hub`: the web workspace for AI coding agents (axum server owning one PTY per session, workspaces of git repos, token auth, REST + WebSocket API, the embedded plain-JS web UI under `crates/flywheel-hub/web/`, and session telemetry under `src/telemetry/`: every agent session's tool calls, turns, plan, context, and cost as events in `telemetry.db`, folded into the fleet board and forwarded to a collector hub). Depends on no other flywheel crate; nothing below `flywheel` depends on it. Docs: `docs/hub.md` (front door: security, quickstart, feature map) + `docs/hub/{reference,api,security,workflows,internals}.md`; `crates/flywheel-hub/src/docs_drift.rs` fails the build when they drift from the CLI, `hub.toml` keys, keymap, routes, or plugin events.
 - **`flywheel`** — top of stack: the unified product shell. Binaries `flywheel` and `fw` (one implementation, two entries) route every operator verb and own the operator console.
 

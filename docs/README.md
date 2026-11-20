@@ -50,4 +50,4 @@ Driving many tasks over a prerequisite DAG, landing the results, and isolating t
 
 ---
 
-The seven workspace crates under `crates/` (`flywheel-agents`, `flywheel-core`, `flywheel-orchestrator`, `flywheel-worktree`, `flywheel-container`, `flywheel-hub`, `flywheel`) form a one-way dependency arrow: core depends on nothing downstream, and `flywheel-agents` and `flywheel-hub` depend on no other flywheel crate. See the root [README.md](../README.md) for the crate map and quickstart.
+The eight workspace crates under `crates/` (`flywheel-agents`, `flywheel-core`, `flywheel-orchestrator`, `flywheel-worktree`, `flywheel-container`, `flywheel-eval`, `flywheel-hub`, `flywheel`) form a one-way dependency arrow: core depends on nothing downstream, and `flywheel-agents` and `flywheel-hub` depend on no other flywheel crate. See the root [README.md](../README.md) for the crate map and quickstart.

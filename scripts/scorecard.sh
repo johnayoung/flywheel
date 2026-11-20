@@ -74,7 +74,7 @@ for arg in "$@"; do
   esac
 done
 
-WORKSPACE_CRATES=(flywheel-agents flywheel-core flywheel-orchestrator flywheel-worktree flywheel-container flywheel-hub flywheel)
+WORKSPACE_CRATES=(flywheel-agents flywheel-core flywheel-orchestrator flywheel-worktree flywheel-container flywheel-eval flywheel-hub flywheel)
 BENCH_TARGETS=(core_hot_paths orchestrator_hot_paths worktree_hot_paths)
 
 log() { echo "[scorecard] $*" >&2; }

@@ -98,7 +98,7 @@ Every table carries a `project_id` partition column, so one store (one Postgres 
 
 | Verb | What it does |
 |---|---|
-| `db upgrade` | Migrate the cwd project's store (sqlite under the project dir, or the configured Postgres DSN) in place: run tables and orchestrator tables, each in one transaction, from any supported older version; existing rows get the project id. Idempotent (a second run, or a store already partitioned whose version row is behind, only fixes the version). Exit 1 on a newer or unrecognized store. |
+| `db upgrade` | Migrate the cwd project's store (sqlite under the project dir, or the configured Postgres DSN) in place: run, orchestrator, and eval tables, each in one transaction, from any supported older version; existing rows get the project id. Idempotent (a second run, or a store already partitioned whose version row is behind, only fixes the version). Exit 1 on a newer or unrecognized store. |
 | `db upgrade --db PATH` | Upgrade that sqlite file (partition `default`). |
 | `db upgrade --project ID` | Upgrade that known project's store (`fw project ls`), resolved from the home without the cwd; partition `ID`, same result as `fw db upgrade` in its repo. |
 | `db status [--project ID \| --db PATH] [--json]` | Read the store's recorded and this build's target versions; creates and changes nothing. JSON: `{project_id, store:"sqlite"\|"postgres", location, current:{run, orchestrator}\|null, target:{run, orchestrator}}` (`current` null: no store yet; the DSN password prints as `***`). Exit 1 when the store cannot be read or reached. |

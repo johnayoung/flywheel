@@ -40,6 +40,19 @@ Flywheel core owns the lifecycle of a **single task**. The catalog therefore rec
 | `orchestrator_events`, `orchestrator_stop_events`, `orchestrator_session_pauses`, `orchestrator_session_pause_clears` | `id` | Claim ledger, stop/strand ledger, rate-limit pauses and their clears. |
 | `orchestrator_schema_version` | `id = 1` | Sentinel `(version, id)`; no `project_id`. |
 
+## Eval tables
+
+`flywheel-eval`'s own (`crates/flywheel-eval/schema/eval-schema{,-postgres}.sql`), created on first `fw eval` use or by `fw db upgrade`. Timestamps are fixed-width UTC text.
+
+| Table | Key | Purpose |
+| --- | --- | --- |
+| `eval_sets` | `(project_id, name, version)` | Index of frozen sets (content on disk). |
+| `eval_variants` | `(project_id, hash)` | Resolved variant manifests. |
+| `eval_runs` / `eval_run_variants` | `(project_id, run_id)` / `+ ordinal` | Replays and the variants they compare. |
+| `eval_trials` | `(project_id, run_id, trial_id)` | One cell (variant x task x k): lease, outcome, cost, trace; `version` for optimistic claims. |
+| `eval_trial_checks`, `eval_trial_reviews`, `eval_trial_artifacts` | `+ trial_id ...` | Per-constraint scores, transcript reviews, kept-file digests. |
+| `eval_schema_version` | `id = 1` | Sentinel. |
+
 ## Schema versions and upgrade
 
 - A store is checked before any DDL runs: a brand-new store is created at the current version; **a store behind it is refused with an error naming `fw db upgrade`** (no implicit migration on open); a store ahead of it is refused as written by a newer flywheel.

@@ -1071,6 +1071,61 @@ async fn a_process_asking_for_a_lease_its_ancestor_holds_fails_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_wait_that_runs_out_names_who_holds_it() {
+    let hub = TestHub::start().await;
+    let mut holder = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let (status, got) = hub
+        .call(
+            reqwest::Method::POST,
+            "/api/leases",
+            Some(
+                json!({"resource": "cpu:test-suite", "ttl_secs": 600, "holder": {
+                "host": flywheel_hub::machines::host_name(), "pid": holder.id(),
+                "label": "scripts/check.sh in /x"}}),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    let args: Vec<String> = [
+        "lease",
+        "acquire",
+        "cpu:test-suite",
+        "--wait",
+        "2s",
+        "--url",
+        &format!("http://{}", hub.addr),
+        "--token",
+        hub.hub.token().expose(),
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    let started = Instant::now();
+    let (code, err) = tokio::task::spawn_blocking(move || {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = flywheel_hub::cli::run(&args, &mut out, &mut err);
+        (code, String::from_utf8_lossy(&err).into_owned())
+    })
+    .await
+    .unwrap();
+    let _ = holder.kill();
+    let _ = holder.wait();
+    assert_ne!(code, 0, "{err}");
+    assert!(started.elapsed() < Duration::from_secs(30), "{err}");
+    assert!(
+        err.contains("no lease on cpu:test-suite within")
+            && err.contains(&format!(
+                "held by scripts/check.sh in /x (pid {}",
+                holder.id()
+            )),
+        "{err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn leases_and_waits_outlive_a_restart() {
     let hub = TestHub::start().await;
     let me = json!({"host": flywheel_hub::machines::host_name(), "pid": std::process::id(),

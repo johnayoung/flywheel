@@ -229,9 +229,34 @@ fn take(
             Ok(got) if got["state"] == "granted" => return Ok(got["lease"].clone()),
             Ok(_) => continue,
             Err(e) => {
+                // Say who kept it: the wait's end is the holder's to answer.
+                let held = conn
+                    .blocking_call(
+                        "GET",
+                        &format!("/api/leases?resource={}", query_escape(resource)),
+                        None,
+                    )
+                    .ok()
+                    .and_then(|v| v["leases"].as_array().cloned())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "{} ({}, {})",
+                            holder_text(&l["holder"]),
+                            str_field(l, "id"),
+                            str_field(l, "mode")
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 return Err(format!(
-                    "no lease on {resource} within {}: {e}",
-                    crate::share::format_ttl(Duration::from_secs(u64::from(wait)))
+                    "no lease on {resource} within {}, held by {}: {e}",
+                    crate::share::format_ttl(Duration::from_secs(u64::from(wait))),
+                    if held.is_empty() {
+                        "no one now".to_owned()
+                    } else {
+                        held.join("; ")
+                    }
                 ));
             }
         }

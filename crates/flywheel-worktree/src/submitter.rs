@@ -55,7 +55,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Fixed, deterministic commit identity established on every worktree the
 /// worker provisions, so the agent's own in-sandbox `git commit` resolves an
@@ -262,28 +262,166 @@ impl Drop for MergeLock {
     }
 }
 
+/// How long a merge waits for the merge lock before it gives up naming
+/// the holder: `FLYWHEEL_MERGE_LOCK_WAIT` seconds, else
+/// [`MERGE_LOCK_WAIT`]. A holder may run the standing verify (a whole test
+/// suite, itself waiting its turn on the machine), so the default is long.
+pub const MERGE_LOCK_WAIT: Duration = Duration::from_secs(6 * 3600);
+
+fn merge_lock_wait() -> Duration {
+    std::env::var("FLYWHEEL_MERGE_LOCK_WAIT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(MERGE_LOCK_WAIT, Duration::from_secs)
+}
+
 /// Acquire the exclusive merge lock at `lock_path` (created on demand,
-/// parent directories included), blocking until it is free.
+/// parent directories included), waiting for it at most
+/// `FLYWHEEL_MERGE_LOCK_WAIT` (see [`merge_lock_within`]).
 pub fn merge_lock(lock_path: &Path) -> std::io::Result<MergeLock> {
+    merge_lock_within(lock_path, merge_lock_wait())
+}
+
+/// [`merge_lock`], waiting at most `wait`. Running out, or asking from
+/// inside a process that holds it (an ancestor: waiting would wait on
+/// itself), is an error naming the lock and its holder. The holder notes
+/// `PID COMMAND` in the file for waiters to name.
+pub fn merge_lock_within(lock_path: &Path, wait: Duration) -> std::io::Result<MergeLock> {
+    use std::io::{Seek as _, Write as _};
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .open(lock_path)?;
-    // SAFETY: `flock` on a descriptor this function owns; the call blocks
-    // until the lock is granted and touches no memory.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
+    let deadline = Instant::now() + wait;
+    loop {
+        // SAFETY: `flock` on a descriptor this function owns; it touches
+        // no memory.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(e);
+        }
+        let holders = lock_holders(lock_path);
+        let me = std::process::id();
+        let ups = ancestors(me);
+        if let Some(up) = holders.iter().find(|p| ups.contains(p)) {
+            return Err(std::io::Error::other(format!(
+                "the merge lock {} is already held by your ancestor {}: waiting for it would \
+                 wait on itself",
+                lock_path.display(),
+                describe(*up)
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "waited {}s for the merge lock {}, held by {} (FLYWHEEL_MERGE_LOCK_WAIT sets \
+                     the wait)",
+                    wait.as_secs(),
+                    lock_path.display(),
+                    holder_text(lock_path, &holders)
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(200).min(deadline - Instant::now()));
     }
+    let _ = file.set_len(0);
+    let _ = file.rewind();
+    let me = std::process::id();
+    let _ = writeln!(file, "{me} {}", command_of(me).unwrap_or_default());
     Ok(MergeLock {
         file,
         path: lock_path.to_path_buf(),
     })
+}
+
+/// Live pids `/proc/locks` lists as holding a `flock` on `path` (Linux).
+fn lock_holders(path: &Path) -> Vec<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::metadata(path) else {
+        return Vec::new();
+    };
+    let want = format!(
+        "{:02x}:{:02x}:{}",
+        libc::major(meta.dev()),
+        libc::minor(meta.dev()),
+        meta.ino()
+    );
+    fs::read_to_string("/proc/locks")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.contains("->"))
+        .filter_map(|l| {
+            let fields: Vec<&str> = l.split_whitespace().collect();
+            let at = fields.iter().position(|f| *f == "FLOCK")?;
+            let pid = fields.get(at + 3)?.parse().ok()?;
+            (*fields.get(at + 4)? == want).then_some(pid)
+        })
+        .collect()
+}
+
+/// `pid`'s ancestors (Linux `/proc/<pid>/stat`), nearest first.
+fn ancestors(pid: u32) -> Vec<u32> {
+    let parent = |pid: u32| -> Option<u32> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat[stat.rfind(')')? + 2..]
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    };
+    let mut found = Vec::new();
+    let mut at = pid;
+    while let Some(up) = parent(at) {
+        if up == 0 || found.contains(&up) || found.len() >= 256 {
+            break;
+        }
+        found.push(up);
+        at = up;
+    }
+    found
+}
+
+fn command_of(pid: u32) -> Option<String> {
+    let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let text: String = raw
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(160)
+        .collect();
+    (!text.is_empty()).then_some(text)
+}
+
+fn describe(pid: u32) -> String {
+    match command_of(pid) {
+        Some(cmd) => format!("pid {pid} ({cmd})"),
+        None => format!("pid {pid}"),
+    }
+}
+
+/// The merge lock's holder in words: a live taker, else what the file
+/// says the last holder was.
+fn holder_text(path: &Path, holders: &[u32]) -> String {
+    if let Some(pid) = holders.iter().find(|p| command_of(**p).is_some()) {
+        return describe(*pid);
+    }
+    let note = fs::read_to_string(path).unwrap_or_default();
+    match note.lines().next().map(str::trim).filter(|l| !l.is_empty()) {
+        Some(line) => format!("{line} (as the lock file says)"),
+        None => "an unknown process".to_owned(),
+    }
 }
 
 // --- bounded excerpts and the re-verify recorder --------------------------------------------
@@ -2832,6 +2970,46 @@ mod tests {
         drop(first);
         waiter.join().unwrap();
         assert_eq!(acquired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_merge_lock_wait_is_bounded_and_names_its_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".merge.lock");
+        // Held by a process beside this one (flock(1) while it sleeps).
+        use std::os::unix::process::CommandExt;
+        let mut other = std::process::Command::new("flock")
+            .arg(&path)
+            .args(["sleep", "60"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock_holders(&path).is_empty() {
+            assert!(Instant::now() < deadline, "flock(1) never took it");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let started = Instant::now();
+        let waited = merge_lock_within(&path, Duration::from_secs(1));
+        // SAFETY: signals the process group this test started.
+        unsafe { libc::kill(-(other.id() as i32), libc::SIGKILL) };
+        let _ = other.wait();
+        let e = waited.unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        let text = e.to_string();
+        assert!(
+            text.contains("waited 1s for the merge lock")
+                && text.contains(&format!("pid {}", other.id())),
+            "{text}"
+        );
+        let held = merge_lock_within(&path, Duration::from_secs(5)).unwrap();
+        let note = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            note.starts_with(&format!("{} ", std::process::id())),
+            "{note}"
+        );
+        drop(held);
     }
 
     #[test]

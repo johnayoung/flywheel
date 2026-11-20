@@ -83,16 +83,29 @@ pub fn hold(
             crate::procs::describe(ancestor)
         ));
     }
+    wait_for(&file, path, wait, waiting)?;
+    note_holder(&file, label);
+    Ok(Held {
+        file,
+        path: path.to_path_buf(),
+    })
+}
+
+/// Take `file`'s (`path`'s) exclusive lock, waiting at most `wait`;
+/// running out names the holder. For a lock held only briefly (no note,
+/// no re-entrancy check); [`hold`] for the rest.
+pub fn wait_for(
+    file: &File,
+    path: &Path,
+    wait: Duration,
+    waiting: &mut dyn FnMut(&str),
+) -> Result<(), String> {
     let deadline = Instant::now() + wait;
     let mut told = false;
     loop {
-        // SAFETY: flock on a descriptor this function owns.
+        // SAFETY: flock on a descriptor the caller owns.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            note_holder(&file, label);
-            return Ok(Held {
-                file,
-                path: path.to_path_buf(),
-            });
+            return Ok(());
         }
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EWOULDBLOCK) {

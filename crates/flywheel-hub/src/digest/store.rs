@@ -20,6 +20,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Longest a read-modify-write waits for `digest.lock`.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A send claimed and not yet finished.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pending {
@@ -94,8 +97,9 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&self.lock, std::fs::Permissions::from_mode(0o600));
         }
-        lock.lock()
-            .map_err(|e| format!("{}: {e}", self.lock.display()))?;
+        // Held only for a read-modify-write: a longer wait is a stuck
+        // holder, named rather than waited on forever.
+        crate::flock::wait_for(&lock, &self.lock, LOCK_WAIT, &mut |_| {})?;
         let mut marker = self.read();
         let (out, write) = change(&mut marker);
         if write {

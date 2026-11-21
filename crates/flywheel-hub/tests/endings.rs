@@ -2261,7 +2261,18 @@ async fn a_successor_that_does_not_start_leaves_the_old_one_running() {
     assert!(view["ending"].is_null(), "{view}");
     assert!(view["ended"].is_null(), "{view}");
     assert!(hub.named("new").await.is_none());
-    assert_eq!(waiting(&hub.queue(&old.id).await), ["keep me"]);
+    // The set-aside message is back: waiting, or already typed in (old
+    // rests, so the queue may deliver it before this looks).
+    let queue = hub.queue(&old.id).await;
+    let kept: Vec<&str> = queue["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["text"].as_str())
+        .filter(|t| t.ends_with("keep me"))
+        .collect();
+    assert_eq!(kept.len(), 1, "{queue}");
+    assert!(!waiting(&queue).iter().any(|t| t == "Stop."), "{queue}");
     assert!(
         hub.kinds(&old.id)
             .await

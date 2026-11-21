@@ -804,6 +804,8 @@ impl SessionState {
                 hold,
                 cause,
                 recommendation,
+                context,
+                about,
             } => {
                 event.work = self.turn.clone();
                 // A subagent's ask does not end the session's turn: its
@@ -818,6 +820,8 @@ impl SessionState {
                         hold: *hold,
                         cause: cause.clone(),
                         recommendation: recommendation.clone(),
+                        context: context.clone(),
+                        about: about.clone(),
                         source: "declared".to_owned(),
                         since: ts,
                     });
@@ -1030,8 +1034,14 @@ impl SessionState {
             .as_ref()
             .filter(|a| started.is_none_or(|s| a.since >= s))
         {
+            // No context of its own: the turn's closing message is it.
+            let context = declared
+                .context
+                .clone()
+                .or_else(|| ending.map(str::to_owned));
             return Some(Ask {
                 since: ts,
+                context,
                 ..declared.clone()
             });
         }
@@ -1044,6 +1054,8 @@ impl SessionState {
             hold: None,
             cause: None,
             recommendation: None,
+            context: ending.map(str::to_owned),
+            about: None,
             source: "inferred".to_owned(),
             since: ts,
         })

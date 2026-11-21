@@ -395,6 +395,12 @@ pub enum What {
         /// The answer the agent recommends.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recommendation: Option<String>,
+        /// What the operator needs to answer it (the agent's words).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<String>,
+        /// The session it concerns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        about: Option<String>,
     },
     /// The session started waiting on a person.
     #[serde(rename = "wait.started")]

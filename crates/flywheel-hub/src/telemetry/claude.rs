@@ -289,6 +289,10 @@ fn declared(tool: &str, input: &Value) -> Option<What> {
             recommendation: str_of(input, "recommendation")
                 .map(summary::text)
                 .filter(|r| !r.is_empty()),
+            context: str_of(input, "context").and_then(summary::ending),
+            about: str_of(input, "about")
+                .map(summary::text)
+                .filter(|a| !a.is_empty()),
         }),
         "TodoWrite" => Some(What::PlanSet {
             source: "todo".to_owned(),

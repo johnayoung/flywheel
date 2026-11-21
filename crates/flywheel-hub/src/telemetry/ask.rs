@@ -37,6 +37,15 @@ pub struct Ask {
     /// The answer the agent recommends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommendation: Option<String>,
+    /// What the operator needs to answer it without the conversation:
+    /// the agent's (`ask_operator`'s `context`), else the closing message
+    /// of the turn that asked (bounded at capture).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// The session the ask concerns (one the asker works with), as the
+    /// agent named it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub about: Option<String>,
     /// `declared` (the agent's tool) or `inferred` (its closing message).
     pub source: String,
     /// When the turn that asked ended (or, while it runs, when it asked).

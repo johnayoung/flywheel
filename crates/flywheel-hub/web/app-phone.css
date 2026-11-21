@@ -418,6 +418,22 @@ body.kb-open .compose textarea { min-height: 3rem; max-height: 30vh; }
   overflow-wrap: anywhere;
 }
 .attn-options { display: flex; flex-wrap: wrap; gap: .3rem; }
+.attn-question { margin: 0; color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.attn-about, .attn-rec { margin: 0; color: var(--ink-3); font-size: 11px; }
+.attn-rec b { color: var(--ink); }
+.attn-about-link { padding: 0; border: 0; background: none; color: var(--ink); font: inherit; font-weight: 600; text-decoration: underline; cursor: pointer; }
+.attn-context {
+  max-height: 12rem;
+  overflow: auto;
+  padding: .35rem .5rem;
+  border-left: 2px solid var(--rule);
+  color: var(--ink-2);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.attn-option.recommended { border-color: var(--ink); font-weight: 600; }
 .attn-option { font-size: 10.5px; }
 .attn-reply { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .35rem; }
 .attn-reply.busy { opacity: .6; pointer-events: none; }

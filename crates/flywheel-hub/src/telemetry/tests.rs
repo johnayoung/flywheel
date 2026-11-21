@@ -818,6 +818,8 @@ fn every_kind_is_listed_and_round_trips_through_the_store() {
             hold: None,
             cause: None,
             recommendation: None,
+            context: None,
+            about: None,
         },
         What::WaitStarted {
             reason: WaitReason::Permission,
@@ -2334,5 +2336,83 @@ fn an_eval_labelled_session_outlives_the_retention_window() {
             .events(None, "other", 0, 10, false)
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn an_ask_carries_the_context_to_answer_it_from_the_card() {
+    let (_dir, telemetry) = open();
+    let declared = |id: &str, input: serde_json::Value| json!({"tool_name": claude::ASK_TOOL, "tool_use_id": id, "tool_input": input});
+    // Its own context and the session it is about.
+    hooks(
+        &telemetry,
+        "s",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "lead"})),
+            (
+                "PreToolUse",
+                declared(
+                    "a1",
+                    json!({"kind": "decide", "text": "Ship c11 as four commits?",
+                           "options": ["yes", "split"], "recommendation": "yes",
+                           "context": "exec-1b-3 proposes c11 in four commits.\nEach passes alone.",
+                           "about": "exec-1b-3"}),
+                ),
+            ),
+            (
+                "Stop",
+                json!({"last_assistant_message": "Waiting on your call."}),
+            ),
+        ],
+    );
+    let ask = telemetry.snapshot("s").unwrap().ask.unwrap();
+    assert_eq!(
+        ask.context.as_deref(),
+        Some("exec-1b-3 proposes c11 in four commits.\nEach passes alone.")
+    );
+    assert_eq!(ask.about.as_deref(), Some("exec-1b-3"));
+    // None given: the closing message of the turn that asked is it.
+    hooks(
+        &telemetry,
+        "t",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "lead"})),
+            (
+                "PreToolUse",
+                declared("a2", json!({"kind": "answer", "text": "Which region?"})),
+            ),
+            (
+                "Stop",
+                json!({"last_assistant_message": "us-east-1 is cheaper; eu-west-1 is nearer the users.\n\nWhich region?"}),
+            ),
+        ],
+    );
+    let ask = telemetry.snapshot("t").unwrap().ask.unwrap();
+    assert_eq!(
+        ask.context.as_deref(),
+        Some("us-east-1 is cheaper; eu-west-1 is nearer the users.\n\nWhich region?")
+    );
+    // An inferred question carries its closing message too.
+    hooks(
+        &telemetry,
+        "u",
+        0,
+        &[
+            ("UserPromptSubmit", json!({"prompt": "go"})),
+            (
+                "Stop",
+                json!({"last_assistant_message": "Two ways: A keeps the cache, B drops it.\n\nShould I take A?"}),
+            ),
+        ],
+    );
+    let ask = telemetry.snapshot("u").unwrap().ask.unwrap();
+    assert_eq!(ask.source, "inferred");
+    assert!(
+        ask.context
+            .as_deref()
+            .is_some_and(|c| c.starts_with("Two ways: A keeps the cache")),
+        "{ask:?}"
     );
 }

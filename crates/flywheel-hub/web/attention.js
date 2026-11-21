@@ -940,9 +940,35 @@ window.FwHubAttention = function (ctx) {
       field,
       el("button", { type: "submit", className: "slab attn-send", textContent: "Send" }),
     );
+    // What it concerns, said on the card itself: the question in full,
+    // the session it is about, the context it gave (else the closing
+    // message of the turn that asked), and what it recommends.
+    const aboutSession = ask.about
+      ? state.sessions.find((s) => s.id === ask.about || s.name === ask.about)
+      : null;
+    const recommended = (ask.recommendation || "").trim();
     return el(
       "div",
       { className: "attn-ask" },
+      el("p", { className: "attn-question", textContent: ask.text }),
+      ask.about
+        ? el(
+            "p",
+            { className: "attn-about" },
+            "about ",
+            aboutSession
+              ? el("button", {
+                  type: "button",
+                  className: "attn-about-link",
+                  textContent: aboutSession.name,
+                  title: `Open ${aboutSession.name}`,
+                  onclick: () => openSession(aboutSession.id),
+                })
+              : el("b", { textContent: ask.about }),
+          )
+        : null,
+      ask.context ? el("div", { className: "attn-context", tabIndex: 0, textContent: ask.context }) : null,
+      recommended ? el("p", { className: "attn-rec" }, "Recommended: ", el("b", { textContent: recommended })) : null,
       ask.command
         ? el(
             "div",
@@ -966,7 +992,13 @@ window.FwHubAttention = function (ctx) {
             "div",
             { className: "attn-options" },
             ask.options.map((option) =>
-              el("button", { type: "button", className: "chip attn-option", textContent: option, title: `Reply "${option}"`, onclick: () => reply(session, option) }),
+              el("button", {
+                type: "button",
+                className: `chip attn-option${recommended && option.trim() === recommended ? " recommended" : ""}`,
+                textContent: option,
+                title: `Reply "${option}"`,
+                onclick: () => reply(session, option),
+              }),
             ),
           )
         : null,

@@ -256,7 +256,9 @@ fn ask_tool() -> Value {
                         one of options), run (a command only they can run; they send its output \
                         back). Optional: hold (needs_input, the default, or awaiting_approval: a \
                         yes or no on something you want to do), cause (a short key shared by asks \
-                        the operator can answer together), recommendation (your answer).",
+                        the operator can answer together), recommendation (your answer). Give \
+                        context: by the time they read it the conversation has moved on, so \
+                        say what they need to answer from the card alone.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -282,6 +284,14 @@ fn ask_tool() -> Value {
                 "recommendation": {
                     "type": "string",
                     "description": "The answer you recommend (decide: default the first option)."
+                },
+                "context": {
+                    "type": "string",
+                    "description": "What the operator needs to answer without reading the conversation: the situation, what each option means and what follows from it, why you recommend yours. 2-8 sentences."
+                },
+                "about": {
+                    "type": "string",
+                    "description": "Optional: the session the ask concerns (a child's name), when it is about that session's work."
                 }
             },
             "required": ["kind", "text"]

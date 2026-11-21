@@ -436,7 +436,7 @@ async fn events_pump(
                 // rollup afresh after it.
                 let fanout = !batch.lagged
                     && batch.events.iter().any(|e| matches!(e, HubEvent::Fanout { .. }));
-                for event in batch.events {
+                for event in hub.with_parent_statuses(batch.events) {
                     if !sent {
                         break;
                     }

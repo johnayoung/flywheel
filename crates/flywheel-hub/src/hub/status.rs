@@ -570,7 +570,13 @@ impl Hub {
     /// What a push notification about session `id` would say, and the
     /// facts deciding whether to send it (`None` once it is not tracked).
     pub fn alert_subject(&self, id: &str) -> Option<crate::notify::Subject> {
-        let alert = self.board().alert(id)?;
+        let mut alert = self.board().alert(id)?;
+        if alert.status == AgentStatus::Done {
+            alert.held = self
+                .refinements(Some(id))
+                .get(id)
+                .is_some_and(|r| r.status == "background");
+        }
         let store = self.store();
         let session = store.session(id).ok()?;
         let workspace = store
@@ -611,6 +617,45 @@ impl Hub {
         self.board().alert(id).map(|a| (a.status, a.spell))
     }
 
+    /// `events` with a status push for every session above each one whose
+    /// status moved: a parent's shown state reads its children's
+    /// ([`crate::status::hold_for_children`]), so a child's move can
+    /// change it. Each added push follows the last event it was added
+    /// for, once.
+    pub fn with_parent_statuses(&self, events: Vec<HubEvent>) -> Vec<HubEvent> {
+        if !events.iter().any(|e| matches!(e, HubEvent::Status { .. })) {
+            return events;
+        }
+        let store = self.store();
+        let sessions = store.sessions();
+        let mut out: Vec<HubEvent> = Vec::with_capacity(events.len());
+        for event in events {
+            let moved = match &event {
+                HubEvent::Status { session_id } => Some(session_id.clone()),
+                _ => None,
+            };
+            out.push(event);
+            let Some(mut at) = moved else { continue };
+            let mut seen = std::collections::HashSet::from([at.clone()]);
+            while let Some(parent) = sessions
+                .iter()
+                .find(|s| s.id == at)
+                .and_then(|s| super::endings::effective_parent(s, sessions))
+            {
+                if !seen.insert(parent.clone()) {
+                    break;
+                }
+                let push = HubEvent::Status {
+                    session_id: parent.clone(),
+                };
+                out.retain(|e| *e != push);
+                out.push(push);
+                at = parent;
+            }
+        }
+        out
+    }
+
     /// An agent session's status, a finished turn counted as seen once
     /// any client viewed it (`None` once untracked).
     pub fn agent_status(&self, id: &str) -> Option<StatusView> {
@@ -621,21 +666,46 @@ impl Hub {
     /// What telemetry adds to the state each session shows (`only`: just
     /// that one); see [`crate::status::shown_state`]. A compaction whose
     /// end never came stops counting after [`COMPACT_STALE_MS`].
+    ///
+    /// A finished turn while a running session it started still moves
+    /// shows `background` ([`crate::status::hold_for_children`]): a lead
+    /// waiting on its children is not done, so every child report that
+    /// wakes it does not flash it done again. Children are read for that
+    /// even when `only` is given.
     pub(crate) fn refinements(&self, only: Option<&str>) -> Refinements {
         let now = crate::telemetry::now_ms();
-        let ids = match only {
-            Some(id) => vec![id.to_owned()],
-            None => self.board().tracked(),
-        };
+        let ids = self.board().tracked();
         let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
-        self.telemetry
+        let mut refine: Refinements = self
+            .telemetry
             .refinements(&ids)
             .into_iter()
             .filter(|(_, (status, since, _))| {
                 *status != "compacting" || now - since < COMPACT_STALE_MS
             })
             .map(|(id, (status, _, declared))| (id, Refinement { status, declared }))
-            .collect()
+            .collect();
+        let parents: Vec<(String, String)> = {
+            let store = self.store();
+            let sessions = store.sessions();
+            sessions
+                .iter()
+                .filter(|s| s.state == crate::state::SessionState::Running)
+                .filter_map(|s| {
+                    super::endings::effective_parent(s, sessions).map(|p| (s.id.clone(), p))
+                })
+                .collect()
+        };
+        if !parents.is_empty() {
+            let board = self.board();
+            crate::status::hold_for_children(&mut refine, &parents, |id| {
+                board.alert(id).map(|a| a.status)
+            });
+        }
+        if let Some(id) = only {
+            refine.retain(|key, _| key == id);
+        }
+        refine
     }
 
     /// What the hub grades itself (see [`Graded`]).

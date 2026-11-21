@@ -210,7 +210,7 @@ impl NotifyConfig {
 
     /// Whether `alert` deserves a push now.
     pub fn wants(&self, alert: &Alert) -> bool {
-        self.enabled_for(alert.status) && !alert.watched && !alert.seen
+        self.enabled_for(alert.status) && !alert.watched && !alert.seen && !alert.held
     }
 }
 
@@ -766,6 +766,7 @@ mod tests {
                 spell: 1,
                 watched: false,
                 seen: false,
+                held: false,
             },
             ask: None,
         }
@@ -956,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn wants_skips_watched_seen_and_disabled_statuses() {
+    fn wants_skips_watched_seen_held_and_disabled_statuses() {
         let mut config = NotifyConfig::new("https://ntfy.sh/t").unwrap();
         let mut alert = subject(AgentStatus::Blocked, None).alert;
         assert!(config.wants(&alert));
@@ -966,6 +967,10 @@ mod tests {
         assert!(config.wants(&done));
         done.seen = true;
         assert!(!config.wants(&done));
+        // A lead's turn held while its children move waits on nobody.
+        let mut held = subject(AgentStatus::Done, None).alert;
+        held.held = true;
+        assert!(!config.wants(&held));
         config.blocked = false;
         assert!(!config.wants(&subject(AgentStatus::Blocked, None).alert));
         assert!(!config.wants(&subject(AgentStatus::Working, None).alert));

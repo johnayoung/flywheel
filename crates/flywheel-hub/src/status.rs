@@ -151,6 +151,87 @@ pub fn shown_state(status: AgentStatus, screen: bool, telemetry: Option<Refineme
     }
 }
 
+/// Telemetry statuses of a session still moving: its work is not over.
+const MOVING: [&str; 5] = ["working", "compacting", "background", "blocked", "asking"];
+
+/// Hold a finished turn as `background` while a session it started still
+/// moves. `parents` pairs each running session with its parent; `board`
+/// gives a session's board status. A session moves when its board says
+/// working or blocked, its telemetry says one of [`MOVING`], or a child of
+/// its own moves (a lead over a lead over a worker waits on the worker).
+/// Only a `done` refinement is held: an ask, a failure, or a compaction
+/// still says what it says.
+pub fn hold_for_children(
+    refine: &mut Refinements,
+    parents: &[(String, String)],
+    board: impl Fn(&str) -> Option<AgentStatus>,
+) {
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (child, parent) in parents {
+        if child != parent {
+            children
+                .entry(parent.as_str())
+                .or_default()
+                .push(child.as_str());
+        }
+    }
+    let mut memo: HashMap<String, bool> = HashMap::new();
+    let mut held = Vec::new();
+    for (id, r) in refine.iter() {
+        if r.status != "done" {
+            continue;
+        }
+        let waiting = children.get(id.as_str()).is_some_and(|kids| {
+            kids.iter().any(|kid| {
+                moves(
+                    kid,
+                    &children,
+                    refine,
+                    &board,
+                    &mut memo,
+                    &mut HashSet::new(),
+                )
+            })
+        });
+        if waiting {
+            held.push(id.clone());
+        }
+    }
+    for id in held {
+        if let Some(r) = refine.get_mut(&id) {
+            r.status = "background";
+        }
+    }
+}
+
+/// Whether session `id` (or any session under it) still moves; `path`
+/// guards against a parent loop.
+fn moves(
+    id: &str,
+    children: &HashMap<&str, Vec<&str>>,
+    refine: &Refinements,
+    board: &impl Fn(&str) -> Option<AgentStatus>,
+    memo: &mut HashMap<String, bool>,
+    path: &mut HashSet<String>,
+) -> bool {
+    if let Some(known) = memo.get(id) {
+        return *known;
+    }
+    if !path.insert(id.to_owned()) {
+        return false;
+    }
+    let own = matches!(board(id), Some(AgentStatus::Working | AgentStatus::Blocked))
+        || refine.get(id).is_some_and(|r| MOVING.contains(&r.status));
+    let moving = own
+        || children.get(id).is_some_and(|kids| {
+            kids.iter()
+                .any(|kid| moves(kid, children, refine, board, memo, path))
+        });
+    path.remove(id);
+    memo.insert(id.to_owned(), moving);
+    moving
+}
+
 /// The most urgent of `statuses` (`None` when there are none).
 pub fn rollup(statuses: impl IntoIterator<Item = AgentStatus>) -> Option<AgentStatus> {
     statuses.into_iter().max_by_key(|s| s.urgency())
@@ -429,6 +510,10 @@ pub struct Alert {
     pub watched: bool,
     /// A finished turn some client has already seen.
     pub seen: bool,
+    /// A finished turn held while sessions it started still move
+    /// ([`hold_for_children`]): nobody is waited on yet. The board never
+    /// knows; the hub sets it.
+    pub held: bool,
 }
 
 /// Every session's status and every workspace's rollup, as one client
@@ -720,6 +805,7 @@ impl StatusBoard {
             spell: entry.changes,
             watched: self.is_watched(session_id),
             seen: entry.raw.status == AgentStatus::Done && !entry.seen_by.is_empty(),
+            held: false,
         })
     }
 
@@ -816,6 +902,82 @@ fn bounded_detail(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refined(pairs: &[(&str, &'static str)]) -> Refinements {
+        pairs
+            .iter()
+            .map(|(id, status)| {
+                (
+                    (*id).to_owned(),
+                    Refinement {
+                        status,
+                        declared: false,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn tree(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(c, p)| ((*c).to_owned(), (*p).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn a_lead_waiting_on_a_moving_child_is_held_not_done() {
+        let parents = tree(&[("kid", "lead")]);
+        let mut refine = refined(&[("lead", "done"), ("kid", "working")]);
+        hold_for_children(&mut refine, &parents, |_| None);
+        assert_eq!(refine["lead"].status, "background");
+        // The child's board alone says it moves (no telemetry yet).
+        let mut refine = refined(&[("lead", "done")]);
+        hold_for_children(&mut refine, &parents, |id| {
+            (id == "kid").then_some(AgentStatus::Blocked)
+        });
+        assert_eq!(refine["lead"].status, "background");
+        // An asking child: the operator, not the lead, is waited on.
+        let mut refine = refined(&[("lead", "done"), ("kid", "asking")]);
+        hold_for_children(&mut refine, &parents, |_| None);
+        assert_eq!(refine["lead"].status, "background");
+    }
+
+    #[test]
+    fn a_lead_whose_children_rest_is_done() {
+        let parents = tree(&[("a", "lead"), ("b", "lead")]);
+        let mut refine = refined(&[("lead", "done"), ("a", "done"), ("b", "idle")]);
+        hold_for_children(&mut refine, &parents, |id| {
+            (id == "a").then_some(AgentStatus::Done)
+        });
+        assert_eq!(refine["lead"].status, "done");
+    }
+
+    #[test]
+    fn only_a_done_refinement_is_held_and_grandchildren_count() {
+        let parents = tree(&[("mid", "top"), ("leaf", "mid"), ("kid", "asker")]);
+        let mut refine = refined(&[
+            ("top", "done"),
+            ("mid", "done"),
+            ("leaf", "working"),
+            ("asker", "asking"),
+            ("kid", "working"),
+        ]);
+        hold_for_children(&mut refine, &parents, |_| None);
+        assert_eq!(refine["top"].status, "background");
+        assert_eq!(refine["mid"].status, "background");
+        assert_eq!(refine["asker"].status, "asking");
+    }
+
+    #[test]
+    fn a_parent_loop_does_not_hold_or_hang() {
+        let parents = tree(&[("a", "b"), ("b", "a"), ("s", "s")]);
+        let mut refine = refined(&[("a", "done"), ("b", "done"), ("s", "done")]);
+        hold_for_children(&mut refine, &parents, |_| None);
+        assert_eq!(refine["a"].status, "done");
+        assert_eq!(refine["b"].status, "done");
+        assert_eq!(refine["s"].status, "done");
+    }
 
     fn board_with(session: &str, workspace: &str) -> (StatusBoard, u64) {
         let mut board = StatusBoard::default();

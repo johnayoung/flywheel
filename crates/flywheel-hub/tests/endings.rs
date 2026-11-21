@@ -2051,7 +2051,8 @@ async fn ownership_passes_on_and_everything_else_asks_the_operator() {
             .is_none_or(Vec::is_empty)
     );
 
-    // The owner's handoff successor inherits once the owner has ended.
+    // The handoff's successor takes over at once (the old lead stays on
+    // the hub): its children, its watches, and a brief of them.
     let next = hub
         .post(
             &format!("/api/sessions/{}/continue", lead.id),
@@ -2062,12 +2063,31 @@ async fn ownership_passes_on_and_everything_else_asks_the_operator() {
     lead2.env(None).await;
     hub.policy(&lead2, "allowed").await;
     lead2.turn().await;
-    let said = lead2
-        .ok("end_session", json!({"to": "worker", "mode": "at_rest"}))
-        .await;
+    assert_eq!(hub.session(&worker.id).await["owner"], lead2.id.as_str());
+    assert_eq!(
+        hub.session(&worker.id).await["labels"]["fw.parent"],
+        lead2.id.as_str()
+    );
+    let argv = std::fs::read_to_string(
+        hub.root
+            .join("log")
+            .join(format!("claude-{}.argv", lead2.id)),
+    )
+    .unwrap();
+    assert!(argv.contains("Goal: carry on."), "{argv}");
     assert!(
-        said.starts_with("Waiting for the operator"),
-        "lead still runs: {said}"
+        argv.contains("--- Handed over by the hub from lead ---"),
+        "{argv}"
+    );
+    assert!(
+        argv.contains(&format!("- worker (id {}), ", worker.id)),
+        "{argv}"
+    );
+    let watches = hub.get(&format!("/api/watches?session={}", lead2.id)).await;
+    assert_eq!(
+        watches["watches"][0]["filter"]["children"],
+        lead2.id.as_str(),
+        "{watches}"
     );
     let (status, _) = hub
         .call(

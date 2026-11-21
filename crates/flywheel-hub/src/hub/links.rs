@@ -169,6 +169,11 @@ impl Hub {
                 ))
             })?,
         };
+        // What it takes over, said by the hub: its children and open ask.
+        let prompt = match self.handover_brief(&from.id) {
+            Some(brief) => format!("{}\n\n{brief}", prompt.trim_end()),
+            None => prompt,
+        };
         let prompt = agent::validate_prompt(Some(&prompt))
             .map_err(StateError::Invalid)?
             .ok_or_else(|| StateError::Invalid("the prompt is empty".into()))?;
@@ -257,6 +262,8 @@ impl Hub {
                 },
             )],
         );
+        // Its children and watches go on with the work.
+        self.hand_over(&from.id, &view.record.id);
         Ok(view)
     }
 

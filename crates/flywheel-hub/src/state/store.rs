@@ -1194,6 +1194,56 @@ impl HubStore {
         Ok(moved)
     }
 
+    /// Pass every watch of `from` to `to` (at most `per_owner` in all): a
+    /// watch on `from`'s children then watches `to`'s, and one whose
+    /// filter `to` already has is dropped instead. The ones passed on.
+    pub fn move_watches(
+        &mut self,
+        from: &str,
+        to: &str,
+        per_owner: usize,
+    ) -> Result<Vec<crate::watch::Watch>, StateError> {
+        let previous = self.doc.watches.clone();
+        let mut room =
+            per_owner.saturating_sub(self.doc.watches.iter().filter(|w| w.owner == to).count());
+        let mut moved = Vec::new();
+        let mut kept = Vec::with_capacity(self.doc.watches.len());
+        for mut watch in std::mem::take(&mut self.doc.watches) {
+            if watch.owner != from {
+                kept.push(watch);
+                continue;
+            }
+            if watch.filter.children.as_deref() == Some(from) {
+                watch.filter.children = Some(to.to_owned());
+            }
+            let duplicate = watch.time.is_none()
+                && kept
+                    .iter()
+                    .chain(previous.iter())
+                    .any(|w: &crate::watch::Watch| {
+                        w.owner == to && w.time.is_none() && w.filter == watch.filter
+                    });
+            if duplicate || room == 0 {
+                if !duplicate {
+                    kept.push(watch);
+                }
+                continue;
+            }
+            room -= 1;
+            watch.owner = to.to_owned();
+            watch.by = Some(to.to_owned());
+            watch.batch = None;
+            moved.push(watch.clone());
+            kept.push(watch);
+        }
+        self.doc.watches = kept;
+        if self.doc.watches == previous {
+            return Ok(moved);
+        }
+        self.save_or_rollback(|doc| doc.watches = previous)?;
+        Ok(moved)
+    }
+
     /// Save how far quiet watches have looked (`(id, row)`); a watch gone
     /// meanwhile is skipped.
     pub fn set_watch_cursors(&mut self, cursors: &[(String, i64)]) -> Result<(), StateError> {

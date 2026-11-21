@@ -1513,7 +1513,12 @@ impl Hub {
             .session()
             .ok_or_else(|| refused("only an agent's end starts a successor"))?
             .to_owned();
-        let request = self.start_request(record, &successor_start(record, successor))?;
+        let mut request = self.start_request(record, &successor_start(record, successor))?;
+        // What it takes over, said by the hub (its children pass to it as
+        // the old one ends).
+        if let (Some(prompt), Some(brief)) = (&request.prompt, self.handover_brief(&record.id)) {
+            request.prompt = Some(format!("{}\n\n{brief}", prompt.trim_end()));
+        }
         let view = self.start_for(&by, request)?;
         let new_id = view.record.id.clone();
         let (owner, continues) = (by.clone(), record.id.clone());
